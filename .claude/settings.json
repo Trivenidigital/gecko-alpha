@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write(*.py)",
+        "command": "uv run python -m py_compile $file"
+      },
+      {
+        "matcher": "Write(*.py)",
+        "command": "uv run black --check --quiet $file"
+      },
+      {
+        "matcher": "Write(tests/*.py)",
+        "command": "uv run pytest $file --tb=short -q"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash(*rm -rf*)",
+        "exitCode": 2
+      },
+      {
+        "matcher": "Bash(*git push --force*)",
+        "exitCode": 2
+      },
+      {
+        "matcher": "Write(.env)",
+        "exitCode": 2
+      }
+    ],
+    "Stop": [
+      {
+        "command": "uv run pytest --tb=short -q 2>&1 | tail -5"
+      }
+    ]
+  }
+}
