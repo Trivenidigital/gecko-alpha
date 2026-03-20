@@ -57,11 +57,16 @@ def format_alert_message(token: CandidateToken, signals: list[str]) -> str:
         for flag in cg_flags:
             lines.append(f"  {flag}")
 
-    # DEXScreener link
+    # Source link — CoinGecko tokens use CG URL, others use DEXScreener
     lines.append("")
-    lines.append(
-        f"https://dexscreener.com/{token.chain}/{token.contract_address}"
-    )
+    if token.chain == "coingecko":
+        lines.append(
+            f"https://www.coingecko.com/en/coins/{token.contract_address}"
+        )
+    else:
+        lines.append(
+            f"https://dexscreener.com/{token.chain}/{token.contract_address}"
+        )
 
     return "\n".join(lines)
 

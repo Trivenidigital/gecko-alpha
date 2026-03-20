@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from typing import TYPE_CHECKING
 
 import structlog
@@ -18,21 +19,26 @@ logger = structlog.get_logger()
 
 CG_BASE = "https://api.coingecko.com/api/v3"
 MAX_RETRIES = 3
-_call_timestamps: list[float] = []
+_call_timestamps: deque[float] = deque()
+_rate_lock = asyncio.Lock()
 
 
 async def _throttle() -> None:
-    """Enforce 30 calls/min rate limit for CoinGecko free Demo tier."""
-    now = time.monotonic()
-    # Remove timestamps older than 60 seconds
-    while _call_timestamps and _call_timestamps[0] < now - 60:
-        _call_timestamps.pop(0)
-    if len(_call_timestamps) >= 30:
-        sleep_time = 60 - (now - _call_timestamps[0])
-        if sleep_time > 0:
-            logger.warning("cg_rate_limit_hit", sleep_seconds=round(sleep_time, 1))
-            await asyncio.sleep(sleep_time)
-    _call_timestamps.append(time.monotonic())
+    """Enforce 30 calls/min rate limit for CoinGecko free Demo tier.
+
+    Uses asyncio.Lock to prevent concurrent coroutines from exceeding the cap.
+    """
+    async with _rate_lock:
+        now = time.monotonic()
+        # Remove timestamps older than 60 seconds
+        while _call_timestamps and _call_timestamps[0] < now - 60:
+            _call_timestamps.popleft()
+        if len(_call_timestamps) >= 30:
+            sleep_time = 60 - (now - _call_timestamps[0])
+            if sleep_time > 0:
+                logger.warning("cg_rate_limit_hit", sleep_seconds=round(sleep_time, 1))
+                await asyncio.sleep(sleep_time)
+        _call_timestamps.append(time.monotonic())
 
 
 async def _get_with_backoff(
@@ -71,12 +77,14 @@ async def fetch_top_movers(
     """Poll /coins/markets sorted by 1h change. Returns filtered CandidateTokens."""
     params = {
         "vs_currency": "usd",
-        "order": "percent_change_1h_desc",
+        "order": "volume_desc",  # Free tier: volume_desc is valid; we sort by 1h change client-side
         "per_page": "50",
         "page": "1",
         "sparkline": "false",
         "price_change_percentage": "1h,24h",
     }
+    if settings.COINGECKO_API_KEY:
+        params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
     data = await _get_with_backoff(session, f"{CG_BASE}/coins/markets", params)
     if not data or not isinstance(data, list):
         logger.warning("cg_no_data", endpoint="coins/markets")
@@ -92,15 +100,24 @@ async def fetch_top_movers(
             continue
         tokens.append(token)
 
+    # Sort by 1h price change descending (client-side since free API may not support this order)
+    tokens.sort(key=lambda t: t.price_change_1h or 0, reverse=True)
+
     logger.info("cg_candidates_fetched", count=len(tokens), source="coins/markets")
     return tokens
 
 
 async def fetch_trending(
     session: aiohttp.ClientSession,
-    settings: Settings,
+    settings: Settings,  # kept for interface consistency with other ingestion sources
 ) -> list[CandidateToken]:
-    """Poll /search/trending. Returns tokens with cg_trending_rank set."""
+    """Poll /search/trending. Returns tokens with cg_trending_rank set.
+
+    NOTE: No market cap filter is applied here. The trending endpoint does not
+    return market cap data, and these tokens are valuable for the cg_trending_rank
+    signal regardless of cap. The scorer's market_cap_range signal naturally
+    handles filtering at the scoring stage.
+    """
     data = await _get_with_backoff(session, f"{CG_BASE}/search/trending")
     if not data or not isinstance(data, dict):
         logger.warning("cg_no_data", endpoint="search/trending")

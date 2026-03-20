@@ -27,9 +27,10 @@ class Settings(BaseSettings):
     MIN_VOL_LIQ_RATIO: float = 5.0
     CHAINS: list[str] = ["solana", "base", "ethereum"]
 
-    # CoinGecko signal thresholds
+    # CoinGecko
     MOMENTUM_RATIO_THRESHOLD: float = 0.6
     MIN_VOL_ACCEL_RATIO: float = 5.0
+    COINGECKO_API_KEY: str = ""
 
     # MiroFish
     MIROFISH_URL: str = "http://localhost:5001"

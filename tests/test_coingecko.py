@@ -7,7 +7,7 @@ import aiohttp
 from aioresponses import aioresponses
 
 from scout.config import Settings
-from scout.ingestion.coingecko import fetch_top_movers, fetch_trending, _call_timestamps
+from scout.ingestion.coingecko import fetch_top_movers, fetch_trending, _call_timestamps, _rate_lock
 
 
 # -- Fixtures --
@@ -162,5 +162,21 @@ async def test_coingecko_outage_does_not_crash_pipeline():
         mocked.get(MARKETS_PATTERN, status=500)
         async with aiohttp.ClientSession() as session:
             tokens = await fetch_top_movers(session, settings)
+
+    assert tokens == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_trending_outage_returns_empty():
+    """NFR: fetch_trending with 500 returns empty list, does not raise."""
+    settings = Settings(
+        TELEGRAM_BOT_TOKEN="test",
+        TELEGRAM_CHAT_ID="test",
+        ANTHROPIC_API_KEY="test",
+    )
+    with aioresponses() as mocked:
+        mocked.get(TRENDING_PATTERN, status=500)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_trending(session, settings)
 
     assert tokens == []

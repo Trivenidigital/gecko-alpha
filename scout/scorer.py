@@ -68,10 +68,12 @@ def score(token: CandidateToken, settings: Settings) -> tuple[int, list[str]]:
 
     # Signal 6: Momentum ratio (CoinGecko) -- 20 points
     # Move is accelerating: most of 24h gain happened in the last 1h
+    # Both values must be positive — negative/negative ratios are crashes, not pumps
     if (
         token.price_change_1h is not None
         and token.price_change_24h is not None
-        and token.price_change_24h != 0
+        and token.price_change_1h > 0
+        and token.price_change_24h > 0
     ):
         ratio = token.price_change_1h / token.price_change_24h
         if ratio > settings.MOMENTUM_RATIO_THRESHOLD:

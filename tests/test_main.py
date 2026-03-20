@@ -48,6 +48,8 @@ async def test_run_cycle_dry_run(mock_db, mock_session, mock_settings):
 
     with patch("scout.main.fetch_trending", new_callable=AsyncMock, return_value=[token]), \
          patch("scout.main.fetch_trending_pools", new_callable=AsyncMock, return_value=[]), \
+         patch("scout.main.cg_fetch_top_movers", new_callable=AsyncMock, return_value=[]), \
+         patch("scout.main.cg_fetch_trending", new_callable=AsyncMock, return_value=[]), \
          patch("scout.main.enrich_holders", new_callable=AsyncMock, side_effect=lambda t, s, st: t), \
          patch("scout.main.aggregate", return_value=[token]), \
          patch("scout.main.score", return_value=(75, ["vol_liq_ratio", "holder_growth"])), \
@@ -75,6 +77,8 @@ async def test_run_cycle_sends_alert(mock_db, mock_session, mock_settings):
 
     with patch("scout.main.fetch_trending", new_callable=AsyncMock, return_value=[token]), \
          patch("scout.main.fetch_trending_pools", new_callable=AsyncMock, return_value=[]), \
+         patch("scout.main.cg_fetch_top_movers", new_callable=AsyncMock, return_value=[]), \
+         patch("scout.main.cg_fetch_trending", new_callable=AsyncMock, return_value=[]), \
          patch("scout.main.enrich_holders", new_callable=AsyncMock, side_effect=lambda t, s, st: t), \
          patch("scout.main.aggregate", return_value=[token]), \
          patch("scout.main.score", return_value=(75, ["vol_liq_ratio"])), \
@@ -101,6 +105,8 @@ async def test_run_cycle_skips_unsafe_token(mock_db, mock_session, mock_settings
 
     with patch("scout.main.fetch_trending", new_callable=AsyncMock, return_value=[token]), \
          patch("scout.main.fetch_trending_pools", new_callable=AsyncMock, return_value=[]), \
+         patch("scout.main.cg_fetch_top_movers", new_callable=AsyncMock, return_value=[]), \
+         patch("scout.main.cg_fetch_trending", new_callable=AsyncMock, return_value=[]), \
          patch("scout.main.enrich_holders", new_callable=AsyncMock, side_effect=lambda t, s, st: t), \
          patch("scout.main.aggregate", return_value=[token]), \
          patch("scout.main.score", return_value=(75, ["vol_liq_ratio"])), \

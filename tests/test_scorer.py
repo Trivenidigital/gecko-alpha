@@ -243,3 +243,32 @@ class TestCoinGeckoSignals:
         )
         points, signals = score(token, _settings())
         assert "cg_trending_rank" not in signals
+
+    def test_momentum_ratio_negative_prices_no_fire(self):
+        """Both negative prices: ratio > 0.6 but this is a crash, not a pump."""
+        token = _make_token(
+            price_change_1h=-8.0, price_change_24h=-10.0,
+            volume_24h_usd=1000, liquidity_usd=10000,
+            market_cap_usd=999999, holder_growth_1h=0,
+            token_age_days=30, social_mentions_24h=0,
+        )
+        # ratio = -8/-10 = 0.8 > 0.6, but both negative = crash
+        points, signals = score(token, _settings())
+        assert "momentum_ratio" not in signals
+
+    def test_score_capped_at_100(self):
+        """Raw score exceeding 100 is capped to 100."""
+        # Fire all 8 signals: raw = 30+20+25+10+15+20+25+15 = 160
+        token = _make_token(
+            volume_24h_usd=80000, liquidity_usd=10000,  # vol_liq_ratio: +30
+            market_cap_usd=50000,                        # market_cap_range: +20
+            holder_growth_1h=25,                         # holder_growth: +25
+            token_age_days=3,                            # token_age: +10
+            social_mentions_24h=60,                      # social_mentions: +15
+            price_change_1h=8.0, price_change_24h=12.0,  # momentum_ratio: +20
+            vol_7d_avg=10000,                            # vol_acceleration: +25 (80k/10k=8>5)
+            cg_trending_rank=5,                          # cg_trending_rank: +15
+        )
+        points, signals = score(token, _settings())
+        assert points == 100
+        assert len(signals) == 8
