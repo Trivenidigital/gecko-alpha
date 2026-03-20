@@ -43,6 +43,20 @@ def format_alert_message(token: CandidateToken, signals: list[str]) -> str:
     if token.mirofish_report is not None:
         lines.append(f"Narrative: {token.mirofish_report}")
 
+    # CoinGecko signal flags
+    cg_flags = []
+    if "momentum_ratio" in signals:
+        cg_flags.append("Momentum: 1h gain accelerating vs 24h")
+    if "vol_acceleration" in signals:
+        cg_flags.append("Volume Spike: current vol >> 7d average")
+    if "cg_trending_rank" in signals:
+        cg_flags.append(f"CG Trending: rank #{token.cg_trending_rank or '?'}")
+    if cg_flags:
+        lines.append("")
+        lines.append("CoinGecko Signals:")
+        for flag in cg_flags:
+            lines.append(f"  {flag}")
+
     # DEXScreener link
     lines.append("")
     lines.append(

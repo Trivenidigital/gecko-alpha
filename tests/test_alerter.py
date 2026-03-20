@@ -79,6 +79,24 @@ async def test_send_alert_telegram(mock_aiohttp):
         await send_alert(token, signals, session, settings)
 
 
+def test_alert_message_includes_momentum_flag():
+    """AC-08: Momentum flag appears in alert message when signal fired."""
+    token = _make_token()
+    signals = ["vol_liq_ratio", "momentum_ratio", "vol_acceleration"]
+    msg = format_alert_message(token, signals)
+    assert "CoinGecko Signals" in msg
+    assert "1h gain accelerating" in msg.lower() or "momentum" in msg.lower()
+
+
+def test_alert_message_includes_vol_spike_flag():
+    """Vol spike flag appears in alert message when signal fired."""
+    token = _make_token()
+    signals = ["vol_acceleration"]
+    msg = format_alert_message(token, signals)
+    assert "CoinGecko Signals" in msg
+    assert "volume spike" in msg.lower() or "vol >>" in msg.lower()
+
+
 async def test_send_alert_telegram_and_discord(mock_aiohttp):
     telegram_url = "https://api.telegram.org/bottest-bot-token/sendMessage"
     discord_url = "https://discord.com/api/webhooks/test"
