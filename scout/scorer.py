@@ -7,7 +7,12 @@ Scoring weights (must always document rationale):
 - token_age (<MAX_TOKEN_AGE_DAYS): 10 points -- Early stage
 - social_mentions (>50 in 24h): 15 points -- CT discovery signal (optional)
 
-Total possible: 100 points
+CoinGecko signals:
+- momentum_ratio (1h/24h > MOMENTUM_RATIO_THRESHOLD): 20 points -- Accelerating
+- vol_acceleration (vol/7d_avg > MIN_VOL_ACCEL_RATIO): 25 points -- Volume spike
+- cg_trending_rank (rank <= 10): 15 points -- Social discovery
+
+Total possible: 160 raw points, capped at 100
 """
 
 from scout.config import Settings
@@ -15,7 +20,7 @@ from scout.models import CandidateToken
 
 
 def score(token: CandidateToken, settings: Settings) -> tuple[int, list[str]]:
-    """Score a candidate token based on 5 quantitative signals.
+    """Score a candidate token based on 8 quantitative signals.
 
     Pure function -- no I/O.
 
@@ -61,4 +66,35 @@ def score(token: CandidateToken, settings: Settings) -> tuple[int, list[str]]:
         points += 15
         signals.append("social_mentions")
 
+    # Signal 6: Momentum ratio (CoinGecko) -- 20 points
+    # Move is accelerating: most of 24h gain happened in the last 1h
+    if (
+        token.price_change_1h is not None
+        and token.price_change_24h is not None
+        and token.price_change_24h != 0
+    ):
+        ratio = token.price_change_1h / token.price_change_24h
+        if ratio > settings.MOMENTUM_RATIO_THRESHOLD:
+            points += 20
+            signals.append("momentum_ratio")
+
+    # Signal 7: Volume acceleration (CoinGecko) -- 25 points
+    # Volume spike vs baseline: primary pump precursor
+    if (
+        token.volume_24h_usd is not None
+        and token.vol_7d_avg is not None
+        and token.vol_7d_avg > 0
+    ):
+        vol_ratio = token.volume_24h_usd / token.vol_7d_avg
+        if vol_ratio > settings.MIN_VOL_ACCEL_RATIO:
+            points += 25
+            signals.append("vol_acceleration")
+
+    # Signal 8: CG trending rank -- 15 points
+    # Entry into CG trending list = social discovery inflection point
+    if token.cg_trending_rank is not None and token.cg_trending_rank <= 10:
+        points += 15
+        signals.append("cg_trending_rank")
+
+    points = min(points, 100)
     return (points, signals)

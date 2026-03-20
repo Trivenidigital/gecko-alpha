@@ -182,3 +182,64 @@ class TestEdgeCases:
         points, signals = score(token, settings)
         assert "vol_liq_ratio" not in signals  # 8x < 10x threshold
         assert "token_age" in signals  # 2 < 3
+
+
+class TestCoinGeckoSignals:
+    """Test CoinGecko-specific scoring signals."""
+
+    def test_momentum_ratio_signal_fires(self):
+        """1h/24h ratio > 0.6 -> +20 pts."""
+        token = _make_token(
+            price_change_1h=8.0, price_change_24h=12.0,
+            volume_24h_usd=1000, liquidity_usd=10000,
+            market_cap_usd=999999, holder_growth_1h=0,
+            token_age_days=30, social_mentions_24h=0,
+        )
+        # ratio = 8/12 = 0.67 > 0.6
+        points, signals = score(token, _settings())
+        assert "momentum_ratio" in signals
+
+    def test_momentum_ratio_none_safe(self):
+        """price_change_1h=None -> 0 pts, no exception."""
+        token = _make_token(
+            price_change_1h=None, price_change_24h=10.0,
+            volume_24h_usd=1000, liquidity_usd=10000,
+            market_cap_usd=999999, holder_growth_1h=0,
+            token_age_days=30, social_mentions_24h=0,
+        )
+        points, signals = score(token, _settings())
+        assert "momentum_ratio" not in signals
+
+    def test_vol_acceleration_signal_fires(self):
+        """volume/7d_avg > 5.0 -> +25 pts."""
+        token = _make_token(
+            volume_24h_usd=500_000, vol_7d_avg=80_000,
+            liquidity_usd=10000,
+            market_cap_usd=999999, holder_growth_1h=0,
+            token_age_days=30, social_mentions_24h=0,
+        )
+        # ratio = 500k/80k = 6.25 > 5.0
+        points, signals = score(token, _settings())
+        assert "vol_acceleration" in signals
+
+    def test_cg_trending_rank_signal_fires(self):
+        """cg_trending_rank=5 (<=10) -> +15 pts."""
+        token = _make_token(
+            cg_trending_rank=5,
+            volume_24h_usd=1000, liquidity_usd=10000,
+            market_cap_usd=999999, holder_growth_1h=0,
+            token_age_days=30, social_mentions_24h=0,
+        )
+        points, signals = score(token, _settings())
+        assert "cg_trending_rank" in signals
+
+    def test_cg_trending_rank_over_10(self):
+        """cg_trending_rank=11 (>10) -> 0 pts."""
+        token = _make_token(
+            cg_trending_rank=11,
+            volume_24h_usd=1000, liquidity_usd=10000,
+            market_cap_usd=999999, holder_growth_1h=0,
+            token_age_days=30, social_mentions_24h=0,
+        )
+        points, signals = score(token, _settings())
+        assert "cg_trending_rank" not in signals
