@@ -69,6 +69,17 @@ def test_settings_custom_overrides():
     assert s.MAX_MIROFISH_JOBS_PER_DAY == 100
 
 
+def test_coingecko_config_defaults():
+    """CoinGecko config knobs have correct defaults."""
+    s = Settings(
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.MOMENTUM_RATIO_THRESHOLD == 0.6
+    assert s.MIN_VOL_ACCEL_RATIO == 5.0
+
+
 def test_settings_weight_sum_validation():
     with pytest.raises(ValueError, match="must sum to 1.0"):
         Settings(
