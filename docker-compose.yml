@@ -1,0 +1,44 @@
+# NOTE: The mirofish service expects the MiroFish repo to be cloned into ./mirofish/
+# Clone it before running: git clone <mirofish-repo-url> ./mirofish
+
+services:
+  mirofish:
+    build:
+      context: ./mirofish
+      dockerfile: Dockerfile
+    ports:
+      - "5001:5001"
+    environment:
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - ZEP_API_KEY=${ZEP_API_KEY:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - scout-net
+
+  scout:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      mirofish:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - MIROFISH_URL=http://mirofish:5001
+      - DB_PATH=/app/data/scout.db
+    volumes:
+      - scout-data:/app/data
+    networks:
+      - scout-net
+
+networks:
+  scout-net:
+    driver: bridge
+
+volumes:
+  scout-data:

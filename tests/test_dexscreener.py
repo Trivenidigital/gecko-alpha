@@ -1,0 +1,98 @@
+"""Tests for DexScreener ingestion."""
+
+import pytest
+import aiohttp
+from aioresponses import aioresponses
+
+from scout.config import Settings
+from scout.ingestion.dexscreener import fetch_trending
+
+
+def _settings(**overrides) -> Settings:
+    defaults = dict(
+        TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k",
+        MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000, MAX_TOKEN_AGE_DAYS=7,
+    )
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
+@pytest.fixture
+def mock_aiohttp():
+    with aioresponses() as m:
+        yield m
+
+
+DEXSCREENER_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
+DEXSCREENER_TRENDING_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
+
+SAMPLE_PAIR = {
+    "baseToken": {"address": "0xabc", "name": "TestCoin", "symbol": "TC"},
+    "chainId": "solana",
+    "pairCreatedAt": 1710720000000,
+    "fdv": 50000,
+    "liquidity": {"usd": 10000},
+    "volume": {"h24": 80000},
+}
+
+
+async def test_fetch_trending_returns_candidates(mock_aiohttp):
+    mock_aiohttp.get(DEXSCREENER_TRENDING_URL, payload=[
+        {"tokenAddress": "0xabc", "chainId": "solana"},
+    ])
+    mock_aiohttp.get(
+        "https://api.dexscreener.com/tokens/v1/solana/0xabc",
+        payload=[SAMPLE_PAIR],
+    )
+
+    settings = _settings()
+    async with aiohttp.ClientSession() as session:
+        tokens = await fetch_trending(session, settings)
+
+    assert len(tokens) >= 1
+    assert tokens[0].contract_address == "0xabc"
+    assert tokens[0].chain == "solana"
+
+
+async def test_fetch_trending_filters_by_market_cap(mock_aiohttp):
+    too_big = {**SAMPLE_PAIR, "fdv": 1_000_000}
+    mock_aiohttp.get(DEXSCREENER_TRENDING_URL, payload=[
+        {"tokenAddress": "0xbig", "chainId": "solana"},
+    ])
+    mock_aiohttp.get(
+        "https://api.dexscreener.com/tokens/v1/solana/0xbig",
+        payload=[{**too_big, "baseToken": {"address": "0xbig", "name": "Big", "symbol": "BIG"}}],
+    )
+
+    settings = _settings()
+    async with aiohttp.ClientSession() as session:
+        tokens = await fetch_trending(session, settings)
+
+    assert len(tokens) == 0
+
+
+async def test_fetch_trending_handles_empty_response(mock_aiohttp):
+    mock_aiohttp.get(DEXSCREENER_TRENDING_URL, payload=[])
+
+    settings = _settings()
+    async with aiohttp.ClientSession() as session:
+        tokens = await fetch_trending(session, settings)
+
+    assert tokens == []
+
+
+async def test_fetch_trending_handles_429_with_backoff(mock_aiohttp):
+    mock_aiohttp.get(DEXSCREENER_TRENDING_URL, status=429)
+    mock_aiohttp.get(DEXSCREENER_TRENDING_URL, payload=[
+        {"tokenAddress": "0xretry", "chainId": "solana"},
+    ])
+    mock_aiohttp.get(
+        "https://api.dexscreener.com/tokens/v1/solana/0xretry",
+        payload=[{**SAMPLE_PAIR, "baseToken": {"address": "0xretry", "name": "Retry", "symbol": "RTR"}}],
+    )
+
+    settings = _settings()
+    async with aiohttp.ClientSession() as session:
+        tokens = await fetch_trending(session, settings)
+
+    assert len(tokens) >= 1

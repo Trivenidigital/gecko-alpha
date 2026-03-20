@@ -1,0 +1,63 @@
+"""Application configuration via Pydantic BaseSettings."""
+
+from pathlib import Path
+
+from pydantic import field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Scanner
+    SCAN_INTERVAL_SECONDS: int = 60
+    MIN_SCORE: int = 60
+    CONVICTION_THRESHOLD: int = 70
+    QUANT_WEIGHT: float = 0.6
+    NARRATIVE_WEIGHT: float = 0.4
+
+    # Token filters
+    MIN_MARKET_CAP: float = 10_000
+    MAX_MARKET_CAP: float = 500_000
+    MAX_TOKEN_AGE_DAYS: int = 7
+    MIN_VOL_LIQ_RATIO: float = 5.0
+    CHAINS: list[str] = ["solana", "base", "ethereum"]
+
+    # MiroFish
+    MIROFISH_URL: str = "http://localhost:5001"
+    MIROFISH_TIMEOUT_SEC: int = 180
+    MAX_MIROFISH_JOBS_PER_DAY: int = 50
+
+    # Alerts
+    TELEGRAM_BOT_TOKEN: str
+    TELEGRAM_CHAT_ID: str
+    DISCORD_WEBHOOK_URL: str = ""
+
+    # Holder enrichment (optional)
+    HELIUS_API_KEY: str = ""
+    MORALIS_API_KEY: str = ""
+
+    # Database
+    DB_PATH: Path = Path("scout.db")
+
+    # Claude fallback
+    ANTHROPIC_API_KEY: str
+
+    @field_validator("CHAINS", mode="before")
+    @classmethod
+    def parse_chains(cls, v: str | list[str]) -> list[str]:
+        if isinstance(v, str):
+            return [c.strip() for c in v.split(",") if c.strip()]
+        return v
+
+    @model_validator(mode="after")
+    def validate_weights_sum(self) -> "Settings":
+        total = self.QUANT_WEIGHT + self.NARRATIVE_WEIGHT
+        if abs(total - 1.0) > 1e-9:
+            msg = f"QUANT_WEIGHT ({self.QUANT_WEIGHT}) + NARRATIVE_WEIGHT ({self.NARRATIVE_WEIGHT}) = {total}, must sum to 1.0"
+            raise ValueError(msg)
+        return self
