@@ -32,6 +32,12 @@ class CandidateToken(BaseModel):
     holder_growth_1h: int = 0
     social_mentions_24h: int = 0
 
+    # CoinGecko-specific fields
+    price_change_1h: float | None = None
+    price_change_24h: float | None = None
+    vol_7d_avg: float | None = None
+    cg_trending_rank: int | None = None
+
     # Populated by pipeline stages
     quant_score: int | None = None
     narrative_score: int | None = None
@@ -40,6 +46,25 @@ class CandidateToken(BaseModel):
     virality_class: str | None = None
     alerted_at: datetime | None = None
     first_seen_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @classmethod
+    def from_coingecko(cls, raw: dict) -> "CandidateToken":
+        """Create a CandidateToken from a CoinGecko /coins/markets response item."""
+        cg_id = raw.get("id", "unknown")
+        return cls(
+            contract_address=cg_id,
+            chain="coingecko",
+            token_name=raw.get("name", "Unknown"),
+            ticker=raw.get("symbol", "???"),
+            market_cap_usd=float(raw.get("market_cap") or 0),
+            volume_24h_usd=float(raw.get("total_volume") or 0),
+            price_change_1h=raw.get("price_change_percentage_1h_in_currency"),
+            price_change_24h=raw.get("price_change_percentage_24h"),
+            liquidity_usd=0.0,
+            token_age_days=0.0,
+            holder_count=0,
+            holder_growth_1h=0,
+        )
 
     @classmethod
     def from_dexscreener(cls, data: dict) -> "CandidateToken":

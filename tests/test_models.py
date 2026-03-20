@@ -95,6 +95,57 @@ def test_candidate_token_from_dexscreener_missing_optional_fields():
     assert token.volume_24h_usd == 0
 
 
+def test_candidate_token_cg_fields_default_none():
+    """New CG fields default to None."""
+    token = CandidateToken(
+        contract_address="0xabc",
+        chain="eth",
+        token_name="TestCoin",
+        ticker="TEST",
+    )
+    assert token.price_change_1h is None
+    assert token.price_change_24h is None
+    assert token.vol_7d_avg is None
+    assert token.cg_trending_rank is None
+
+
+def test_from_coingecko_parses_fields():
+    """from_coingecko() maps CoinGecko API response to CandidateToken."""
+    raw = {
+        "id": "bitcoin",
+        "symbol": "btc",
+        "name": "Bitcoin",
+        "market_cap": 1_000_000_000,
+        "total_volume": 50_000_000,
+        "price_change_percentage_1h_in_currency": 5.2,
+        "price_change_percentage_24h": 12.1,
+    }
+    token = CandidateToken.from_coingecko(raw)
+    assert token.ticker == "btc"
+    assert token.token_name == "Bitcoin"
+    assert token.market_cap_usd == 1_000_000_000
+    assert token.volume_24h_usd == 50_000_000
+    assert token.price_change_1h == 5.2
+    assert token.price_change_24h == 12.1
+    assert token.holder_count == 0
+    assert token.holder_growth_1h == 0
+    assert token.token_age_days == 0.0
+
+
+def test_from_coingecko_missing_optional_fields():
+    """from_coingecko() handles missing optional fields gracefully."""
+    raw = {
+        "id": "somecoin",
+        "symbol": "some",
+        "name": "SomeCoin",
+        "market_cap": 100_000,
+        "total_volume": 5_000,
+    }
+    token = CandidateToken.from_coingecko(raw)
+    assert token.price_change_1h is None
+    assert token.price_change_24h is None
+
+
 def test_mirofish_result():
     result = MiroFishResult(
         narrative_score=85,
