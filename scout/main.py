@@ -14,6 +14,8 @@ from scout.alerter import send_alert
 from scout.config import Settings
 from scout.db import Database
 from scout.gate import evaluate
+from scout.ingestion.coingecko import fetch_top_movers as cg_fetch_top_movers
+from scout.ingestion.coingecko import fetch_trending as cg_fetch_trending
 from scout.ingestion.dexscreener import fetch_trending
 from scout.ingestion.geckoterminal import fetch_trending_pools
 from scout.ingestion.holder_enricher import enrich_holders
@@ -36,9 +38,11 @@ async def run_cycle(
     stats = {"tokens_scanned": 0, "candidates_promoted": 0, "alerts_fired": 0}
 
     # Stage 1: Parallel ingestion
-    dex_tokens, gecko_tokens = await asyncio.gather(
+    dex_tokens, gecko_tokens, cg_movers, cg_trending = await asyncio.gather(
         fetch_trending(session, settings),
         fetch_trending_pools(session, settings),
+        cg_fetch_top_movers(session, settings),
+        cg_fetch_trending(session, settings),
         return_exceptions=True,
     )
     # Handle exceptions from gather
@@ -48,9 +52,17 @@ async def run_cycle(
     if isinstance(gecko_tokens, Exception):
         logger.warning("GeckoTerminal ingestion failed", error=str(gecko_tokens))
         gecko_tokens = []
+    if isinstance(cg_movers, Exception):
+        logger.warning("CoinGecko markets ingestion failed", error=str(cg_movers))
+        cg_movers = []
+    if isinstance(cg_trending, Exception):
+        logger.warning("CoinGecko trending ingestion failed", error=str(cg_trending))
+        cg_trending = []
 
     # Stage 2: Aggregate
-    all_candidates = aggregate(list(dex_tokens) + list(gecko_tokens))
+    all_candidates = aggregate(
+        list(dex_tokens) + list(gecko_tokens) + list(cg_movers) + list(cg_trending)
+    )
     stats["tokens_scanned"] = len(all_candidates)
 
     # Enrich holders (concurrently)
