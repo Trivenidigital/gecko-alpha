@@ -8,7 +8,7 @@ Scaffold was copied from `C:\projects\coinpump-scout` — that project must NEVE
 6-stage async pipeline:
 1. **Ingestion** — CoinGecko (primary) + DexScreener + GeckoTerminal in parallel via `asyncio.gather()`
 2. **Aggregation** — Dedup by contract_address
-3. **Scoring** — 8 quantitative signals (0-100, capped)
+3. **Scoring** — 11 quantitative signals (normalized 178→100, co-occurrence multiplier)
 4. **MiroFish** — Narrative simulation with Claude haiku-4-5 fallback
 5. **Gate** — Conviction threshold: `quant * 0.6 + narrative * 0.4`
 6. **Alert** — Telegram (required) + Discord (optional)

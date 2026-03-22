@@ -38,6 +38,10 @@ async def _throttle() -> None:
             if sleep_time > 0:
                 logger.warning("cg_rate_limit_hit", sleep_seconds=round(sleep_time, 1))
                 await asyncio.sleep(sleep_time)
+                # Re-prune after sleep so the window is recalculated accurately
+                post_sleep = time.monotonic()
+                while _call_timestamps and _call_timestamps[0] < post_sleep - 60:
+                    _call_timestamps.popleft()
         _call_timestamps.append(time.monotonic())
 
 
@@ -133,7 +137,7 @@ async def fetch_trending(
             chain="coingecko",
             token_name=item.get("name", "Unknown"),
             ticker=item.get("symbol", "???"),
-            cg_trending_rank=rank,
+            cg_trending_rank=rank + 1,  # 1-indexed: position 1 = most trending
             holder_count=0,
             holder_growth_1h=0,
         )

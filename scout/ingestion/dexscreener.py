@@ -7,7 +7,6 @@ import aiohttp
 import structlog
 
 from scout.config import Settings
-from scout.exceptions import IngestionError
 from scout.models import CandidateToken
 
 logger = structlog.get_logger()

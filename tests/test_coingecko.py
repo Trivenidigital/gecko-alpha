@@ -104,8 +104,8 @@ async def test_fetch_trending_populates_rank():
             tokens = await fetch_trending(session, settings)
 
     assert len(tokens) > 0
-    assert tokens[0].cg_trending_rank == 0
-    assert tokens[1].cg_trending_rank == 1
+    assert tokens[0].cg_trending_rank == 1  # 1-indexed
+    assert tokens[1].cg_trending_rank == 2
 
 
 @pytest.mark.asyncio
