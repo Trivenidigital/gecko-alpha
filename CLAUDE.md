@@ -85,7 +85,7 @@ scout/
     seed_builder.py     # Build simulation seed
   models.py             # CandidateToken + MiroFishResult
   config.py             # Pydantic BaseSettings
-  scorer.py             # 8-signal quantitative scorer
+  scorer.py             # 11-signal quantitative scorer
   aggregator.py         # Dedup
   gate.py               # Conviction gate
   alerter.py            # Telegram + Discord delivery
