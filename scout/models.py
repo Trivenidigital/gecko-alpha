@@ -48,6 +48,7 @@ class CandidateToken(BaseModel):
     conviction_score: float | None = None
     mirofish_report: str | None = None
     virality_class: str | None = None
+    signals_fired: list[str] | None = None
     alerted_at: datetime | None = None
     first_seen_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

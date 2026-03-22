@@ -1,5 +1,6 @@
 """Async SQLite database layer for CoinPump Scout."""
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +26,7 @@ _CANDIDATE_COLUMNS = [
     "conviction_score",
     "mirofish_report",
     "virality_class",
+    "signals_fired",
     "alerted_at",
     "first_seen_at",
 ]
@@ -80,6 +82,7 @@ class Database:
                 conviction_score REAL,
                 mirofish_report  TEXT,
                 virality_class   TEXT,
+                signals_fired    TEXT,
                 alerted_at       TEXT,
                 first_seen_at    TEXT NOT NULL
             );
@@ -139,6 +142,9 @@ class Database:
             # Serialize datetimes to ISO strings
             if isinstance(v, datetime):
                 v = v.isoformat()
+            # Serialize lists to JSON strings
+            elif isinstance(v, list):
+                v = json.dumps(v)
             values.append(v)
         await self._conn.execute(
             f"INSERT OR REPLACE INTO candidates ({cols}) VALUES ({placeholders})",

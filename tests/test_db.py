@@ -81,6 +81,28 @@ async def test_get_recent_alerts(db):
     assert alerts[0]["contract_address"] == "0xrecent"
 
 
+async def test_signals_fired_persisted(db):
+    """signals_fired list is stored as JSON and retrievable."""
+    token = _make_token(
+        quant_score=75,
+        signals_fired=["vol_liq_ratio", "holder_growth", "market_cap_range"],
+    )
+    await db.upsert_candidate(token)
+    candidates = await db.get_candidates_above_score(0)
+    assert len(candidates) == 1
+    import json
+    signals = json.loads(candidates[0]["signals_fired"])
+    assert signals == ["vol_liq_ratio", "holder_growth", "market_cap_range"]
+
+
+async def test_signals_fired_none(db):
+    """signals_fired=None stores as NULL."""
+    token = _make_token(quant_score=50)
+    await db.upsert_candidate(token)
+    candidates = await db.get_candidates_above_score(0)
+    assert candidates[0]["signals_fired"] is None
+
+
 async def test_holder_snapshots(db):
     """Log and retrieve holder count snapshots."""
     await db.log_holder_snapshot("0xtoken", 100)

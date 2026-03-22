@@ -84,7 +84,7 @@ async def run_cycle(
     for token in enriched:
         historical_scores = await db.get_recent_scores(token.contract_address, limit=3)
         points, signals = score(token, settings, historical_scores=historical_scores)
-        updated = token.model_copy(update={"quant_score": points})
+        updated = token.model_copy(update={"quant_score": points, "signals_fired": signals})
         await db.upsert_candidate(updated)
         await db.log_score(token.contract_address, points)
         if points >= settings.MIN_SCORE:
