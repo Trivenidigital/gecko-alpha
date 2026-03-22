@@ -1,4 +1,4 @@
-"""Claude API fallback for narrative scoring when MiroFish is unavailable."""
+"""Anthropic fallback for narrative scoring when MiroFish is unavailable."""
 
 import json
 import structlog
@@ -17,6 +17,10 @@ SYSTEM_PROMPT = (
     '"summary": "<2-3 sentence analysis>"}\n'
     "No other text. JSON only."
 )
+
+
+class FallbackScoringError(Exception):
+    """Raised when the fallback LLM returns unparseable or invalid output."""
 
 
 async def score_narrative_fallback(
@@ -40,13 +44,18 @@ async def score_narrative_fallback(
     )
 
     text = message.content[0].text
-    data = _extract_json(text)
 
-    return MiroFishResult(
-        narrative_score=int(data["narrative_score"]),
-        virality_class=str(data["virality_class"]),
-        summary=str(data["summary"]),
-    )
+    try:
+        data = _extract_json(text)
+        return MiroFishResult(
+            narrative_score=int(data["narrative_score"]),
+            virality_class=str(data["virality_class"]),
+            summary=str(data["summary"]),
+        )
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+        raise FallbackScoringError(
+            f"Failed to parse LLM response: {e}. Raw text: {text[:200]}"
+        ) from e
 
 
 def _extract_json(text: str) -> dict:

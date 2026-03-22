@@ -27,6 +27,10 @@ def mock_db():
     db.log_alert = AsyncMock()
     db.get_daily_mirofish_count = AsyncMock(return_value=0)
     db.get_daily_alert_count = AsyncMock(return_value=0)
+    db.get_previous_holder_count = AsyncMock(return_value=None)
+    db.log_holder_snapshot = AsyncMock()
+    db.log_score = AsyncMock()
+    db.get_recent_scores = AsyncMock(return_value=[])
     return db
 
 

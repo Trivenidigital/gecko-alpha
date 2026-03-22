@@ -3,7 +3,11 @@
 from scout.models import CandidateToken
 
 
-def build_seed(token: CandidateToken) -> dict:
+def build_seed(
+    token: CandidateToken,
+    signals_fired: list[str] | None = None,
+    signal_confidence: str | None = None,
+) -> dict:
     """Build a simulation seed document for MiroFish.
 
     Returns a structured dict with token metadata and a formatted prompt
@@ -23,7 +27,7 @@ def build_seed(token: CandidateToken) -> dict:
         f"and Telegram communities over the next 24 hours?"
     )
 
-    return {
+    seed = {
         "token_name": token.token_name,
         "ticker": token.ticker,
         "chain": token.chain,
@@ -33,3 +37,10 @@ def build_seed(token: CandidateToken) -> dict:
         "social_snippets": social,
         "prompt": prompt,
     }
+
+    if signals_fired is not None:
+        seed["signals_fired"] = signals_fired
+    if signal_confidence is not None:
+        seed["signal_confidence"] = signal_confidence
+
+    return seed

@@ -97,6 +97,20 @@ class Database:
                 created_at        TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS holder_snapshots (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                contract_address  TEXT NOT NULL,
+                holder_count      INTEGER NOT NULL,
+                scanned_at        TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS score_history (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                contract_address  TEXT NOT NULL,
+                score             REAL NOT NULL,
+                scanned_at        TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS outcomes (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
                 contract_address  TEXT NOT NULL,
@@ -196,6 +210,58 @@ class Database:
             (contract_address, now),
         )
         await self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Holder snapshots
+    # ------------------------------------------------------------------
+
+    async def log_holder_snapshot(self, contract_address: str, holder_count: int) -> None:
+        """Log a holder count snapshot for growth tracking."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            "INSERT INTO holder_snapshots (contract_address, holder_count, scanned_at) VALUES (?, ?, ?)",
+            (contract_address, holder_count, now),
+        )
+        await self._conn.commit()
+
+    async def get_previous_holder_count(self, contract_address: str) -> int | None:
+        """Get the most recent holder count for a contract, or None if no history."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cursor = await self._conn.execute(
+            "SELECT holder_count FROM holder_snapshots WHERE contract_address = ? ORDER BY scanned_at DESC LIMIT 1",
+            (contract_address,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+    # ------------------------------------------------------------------
+    # Score history
+    # ------------------------------------------------------------------
+
+    async def log_score(self, contract_address: str, score: float) -> None:
+        """Log a quant score for velocity tracking."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            "INSERT INTO score_history (contract_address, score, scanned_at) VALUES (?, ?, ?)",
+            (contract_address, score, now),
+        )
+        await self._conn.commit()
+
+    async def get_recent_scores(self, contract_address: str, limit: int = 3) -> list[float]:
+        """Get the most recent scores for a contract, newest first."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cursor = await self._conn.execute(
+            "SELECT score FROM score_history WHERE contract_address = ? ORDER BY scanned_at DESC LIMIT ?",
+            (contract_address, limit),
+        )
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
 
     async def get_daily_mirofish_count(self) -> int:
         """Count MiroFish jobs run today (UTC)."""

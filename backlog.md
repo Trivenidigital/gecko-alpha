@@ -50,11 +50,9 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Files:** .env
 **Why:** Pipeline has never been tested against real APIs. Need to verify DexScreener/GeckoTerminal response parsing, Telegram delivery, and end-to-end flow.
 **Keys needed:**
-- TELEGRAM_BOT_TOKEN: `8663588845:AAHadbRGWEkriisxcViJC8IWQbRm_-cq4pM`
-- TELEGRAM_CHAT_ID: `407861656`
-- LLM_API_KEY: (pending from user)
-- LLM_BASE_URL: `https://dashscope.aliyuncs.com/compatible-mode/v1`
-- LLM_MODEL_NAME: `qwen-plus`
+- TELEGRAM_BOT_TOKEN: (stored in .env)
+- TELEGRAM_CHAT_ID: (stored in .env)
+- ANTHROPIC_API_KEY: (stored in .env)
 **Acceptance:** `uv run python -m scout.main --dry-run --cycles 1` completes with real tokens fetched, scored, and logged
 
 ---

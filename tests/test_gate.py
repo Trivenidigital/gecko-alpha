@@ -121,7 +121,7 @@ async def test_gate_below_min_score_skips_mirofish(mock_db, mock_session):
 
 
 async def test_gate_mirofish_fallback_on_timeout(mock_db, mock_session):
-    """MiroFish timeout -> fallback to Claude haiku."""
+    """MiroFish timeout -> fallback to Anthropic."""
     from scout.exceptions import MiroFishTimeoutError
 
     token = _make_token(quant_score=80)

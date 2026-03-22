@@ -79,3 +79,35 @@ async def test_get_recent_alerts(db):
     alerts = await db.get_recent_alerts(days=30)
     assert len(alerts) == 1
     assert alerts[0]["contract_address"] == "0xrecent"
+
+
+async def test_holder_snapshots(db):
+    """Log and retrieve holder count snapshots."""
+    await db.log_holder_snapshot("0xtoken", 100)
+    await db.log_holder_snapshot("0xtoken", 150)
+
+    prev = await db.get_previous_holder_count("0xtoken")
+    assert prev == 150  # most recent
+
+    # Unknown contract returns None
+    unknown = await db.get_previous_holder_count("0xunknown")
+    assert unknown is None
+
+
+async def test_score_history(db):
+    """Log and retrieve score history (newest first)."""
+    await db.log_score("0xtoken", 40.0)
+    await db.log_score("0xtoken", 55.0)
+    await db.log_score("0xtoken", 70.0)
+
+    scores = await db.get_recent_scores("0xtoken", limit=3)
+    assert scores == [70.0, 55.0, 40.0]  # newest first
+
+    # Limit works
+    scores_2 = await db.get_recent_scores("0xtoken", limit=2)
+    assert len(scores_2) == 2
+    assert scores_2 == [70.0, 55.0]
+
+    # Unknown contract returns empty
+    empty = await db.get_recent_scores("0xunknown")
+    assert empty == []

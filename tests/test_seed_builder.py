@@ -65,3 +65,22 @@ def test_build_seed_no_social_mentions():
     token = _make_token(social_mentions_24h=0)
     seed = build_seed(token)
     assert seed["social_snippets"] == "None detected"
+
+
+def test_build_seed_includes_signals_and_confidence():
+    """Seed includes signals_fired and signal_confidence when provided."""
+    token = _make_token()
+    signals = ["vol_liq_ratio", "holder_growth", "market_cap_range"]
+    seed = build_seed(token, signals_fired=signals, signal_confidence="HIGH")
+
+    assert seed["signals_fired"] == signals
+    assert seed["signal_confidence"] == "HIGH"
+
+
+def test_build_seed_omits_signals_when_not_provided():
+    """Seed omits signals fields when not provided."""
+    token = _make_token()
+    seed = build_seed(token)
+
+    assert "signals_fired" not in seed
+    assert "signal_confidence" not in seed

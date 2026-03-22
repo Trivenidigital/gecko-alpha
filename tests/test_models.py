@@ -78,6 +78,37 @@ def test_candidate_token_from_geckoterminal():
     assert token.holder_growth_1h == 0
 
 
+def test_candidate_token_from_dexscreener_parses_txns():
+    """DexScreener txns.h1 fields are parsed into CandidateToken."""
+    raw = {
+        "baseToken": {"address": "0xtxn", "name": "TxnToken", "symbol": "TXN"},
+        "chainId": "solana",
+        "pairCreatedAt": 1710720000000,
+        "fdv": 100000,
+        "liquidity": {"usd": 20000},
+        "volume": {"h24": 150000},
+        "txns": {"h1": {"buys": 120, "sells": 40}},
+    }
+    token = CandidateToken.from_dexscreener(raw)
+    assert token.txns_h1_buys == 120
+    assert token.txns_h1_sells == 40
+
+
+def test_candidate_token_from_dexscreener_no_txns():
+    """Missing txns field defaults to None."""
+    raw = {
+        "baseToken": {"address": "0xno", "name": "NoTxn", "symbol": "NT"},
+        "chainId": "solana",
+        "pairCreatedAt": 1710720000000,
+        "fdv": 100000,
+        "liquidity": {"usd": 20000},
+        "volume": {"h24": 150000},
+    }
+    token = CandidateToken.from_dexscreener(raw)
+    assert token.txns_h1_buys is None
+    assert token.txns_h1_sells is None
+
+
 def test_candidate_token_from_dexscreener_missing_optional_fields():
     """DexScreener sometimes returns null/missing fields."""
     raw = {

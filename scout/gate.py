@@ -11,6 +11,7 @@ from scout.mirofish.client import simulate
 from scout.mirofish.fallback import score_narrative_fallback
 from scout.mirofish.seed_builder import build_seed
 from scout.models import CandidateToken
+from scout.scorer import signal_confidence
 
 logger = structlog.get_logger()
 
@@ -20,6 +21,7 @@ async def evaluate(
     db: Database,
     session: aiohttp.ClientSession,
     settings: Settings,
+    signals_fired: list[str] | None = None,
 ) -> tuple[bool, float, CandidateToken]:
     """Evaluate a candidate token through the conviction gate.
 
@@ -33,7 +35,9 @@ async def evaluate(
     if quant_score >= settings.MIN_SCORE:
         daily_count = await db.get_daily_mirofish_count()
         if daily_count < settings.MAX_MIROFISH_JOBS_PER_DAY:
-            narrative_score = await _get_narrative_score(token, session, db, settings)
+            narrative_score = await _get_narrative_score(
+                token, session, db, settings, signals_fired=signals_fired,
+            )
 
     # Compute conviction score
     if narrative_score is not None:
@@ -57,20 +61,22 @@ async def _get_narrative_score(
     session: aiohttp.ClientSession,
     db: Database,
     settings: Settings,
+    signals_fired: list[str] | None = None,
 ) -> int | None:
-    """Run MiroFish simulation with Claude fallback."""
-    seed = build_seed(token)
+    """Run MiroFish simulation with LLM fallback."""
+    confidence = signal_confidence(signals_fired or [])
+    seed = build_seed(token, signals_fired=signals_fired, signal_confidence=confidence)
 
     try:
         result = await simulate(seed, session, settings)
         await db.log_mirofish_job(token.contract_address)
         return result.narrative_score
     except (MiroFishTimeoutError, MiroFishConnectionError) as e:
-        logger.warning("MiroFish failed, falling back to Claude", contract_address=token.contract_address, error=str(e))
+        logger.warning("MiroFish failed, falling back to Anthropic", contract_address=token.contract_address, error=str(e))
         try:
             result = await score_narrative_fallback(seed, settings.ANTHROPIC_API_KEY)
             await db.log_mirofish_job(token.contract_address)
             return result.narrative_score
         except Exception as e:
-            logger.error("Claude fallback also failed", contract_address=token.contract_address, error=str(e))
+            logger.error("Anthropic fallback also failed", contract_address=token.contract_address, error=str(e))
             return None

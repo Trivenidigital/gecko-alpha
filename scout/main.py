@@ -5,6 +5,7 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 
 import aiohttp
 import structlog
@@ -70,12 +71,23 @@ async def run_cycle(
         *[enrich_holders(token, session, settings) for token in all_candidates]
     ))
 
+    # Compute holder_growth_1h from previous snapshots
+    for i, token in enumerate(enriched):
+        if token.holder_count > 0:
+            prev = await db.get_previous_holder_count(token.contract_address)
+            if prev is not None:
+                growth = token.holder_count - prev
+                enriched[i] = token.model_copy(update={"holder_growth_1h": max(0, growth)})
+            await db.log_holder_snapshot(token.contract_address, token.holder_count)
+
     # Stage 3: Score
     scored = []
     for token in enriched:
-        points, signals = score(token, settings)
+        historical_scores = await db.get_recent_scores(token.contract_address, limit=3)
+        points, signals = score(token, settings, historical_scores=historical_scores)
         updated = token.model_copy(update={"quant_score": points})
         await db.upsert_candidate(updated)
+        await db.log_score(token.contract_address, points)
         if points >= settings.MIN_SCORE:
             scored.append((updated, signals))
             stats["candidates_promoted"] += 1
@@ -83,7 +95,7 @@ async def run_cycle(
     # Stages 4-5: Gate (MiroFish + conviction)
     for token, signals in scored:
         should_alert, conviction, gated_token = await evaluate(
-            token, db, session, settings
+            token, db, session, settings, signals_fired=signals,
         )
 
         if not should_alert:
@@ -156,6 +168,10 @@ async def main() -> None:
         pass  # SIGTERM not supported on Windows
 
     cycle_count = 0
+    cumulative = {"tokens_scanned": 0, "candidates_promoted": 0, "alerts_fired": 0}
+    last_heartbeat = time.monotonic()
+    heartbeat_interval = 300  # 5 minutes
+
     try:
         async with aiohttp.ClientSession() as session:
             while not shutdown_event.is_set():
@@ -164,10 +180,27 @@ async def main() -> None:
                         settings, db, session, dry_run=args.dry_run
                     )
                     logger.info("Cycle complete", **stats)
+                    for k in cumulative:
+                        cumulative[k] += stats.get(k, 0)
                 except Exception as e:
                     logger.error("Cycle failed", error=str(e))
 
                 cycle_count += 1
+
+                # Heartbeat logging every 5 minutes
+                now = time.monotonic()
+                if now - last_heartbeat >= heartbeat_interval:
+                    mirofish_today = await db.get_daily_mirofish_count()
+                    logger.info(
+                        "Heartbeat",
+                        cycles=cycle_count,
+                        cumulative_tokens_scanned=cumulative["tokens_scanned"],
+                        cumulative_candidates_promoted=cumulative["candidates_promoted"],
+                        cumulative_alerts_fired=cumulative["alerts_fired"],
+                        mirofish_jobs_today=mirofish_today,
+                    )
+                    last_heartbeat = now
+
                 if args.cycles > 0 and cycle_count >= args.cycles:
                     break
 

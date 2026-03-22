@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     MIN_MARKET_CAP: float = 10_000
     MAX_MARKET_CAP: float = 500_000
     MAX_TOKEN_AGE_DAYS: int = 7
+    MIN_LIQUIDITY_USD: float = 15_000
     MIN_VOL_LIQ_RATIO: float = 5.0
     CHAINS: list[str] = ["solana", "base", "ethereum"]
 
@@ -49,7 +50,7 @@ class Settings(BaseSettings):
     # Database
     DB_PATH: Path = Path("scout.db")
 
-    # Claude fallback
+    # Anthropic fallback
     ANTHROPIC_API_KEY: str
 
     @field_validator("CHAINS", mode="before")

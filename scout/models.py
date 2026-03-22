@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class MiroFishResult(BaseModel):
-    """Result from MiroFish narrative simulation or Claude fallback."""
+    """Result from MiroFish narrative simulation or Anthropic fallback."""
 
     narrative_score: int
     virality_class: str
@@ -31,6 +31,10 @@ class CandidateToken(BaseModel):
     holder_count: int = 0
     holder_growth_1h: int = 0
     social_mentions_24h: int = 0
+
+    # DexScreener transaction fields
+    txns_h1_buys: int | None = None
+    txns_h1_sells: int | None = None
 
     # CoinGecko-specific fields
     price_change_1h: float | None = None
@@ -79,6 +83,11 @@ class CandidateToken(BaseModel):
             age_delta = datetime.now(timezone.utc) - created_at
             token_age_days = age_delta.total_seconds() / 86400
 
+        # Parse h1 transaction counts
+        txns = data.get("txns", {}).get("h1", {})
+        txns_h1_buys = txns.get("buys") if txns else None
+        txns_h1_sells = txns.get("sells") if txns else None
+
         return cls(
             contract_address=base_token.get("address", ""),
             chain=data.get("chainId", ""),
@@ -88,6 +97,8 @@ class CandidateToken(BaseModel):
             market_cap_usd=float(data.get("fdv") or 0),
             liquidity_usd=float((data.get("liquidity") or {}).get("usd") or 0),
             volume_24h_usd=float((data.get("volume") or {}).get("h24") or 0),
+            txns_h1_buys=txns_h1_buys,
+            txns_h1_sells=txns_h1_sells,
             holder_count=0,
             holder_growth_1h=0,
         )
