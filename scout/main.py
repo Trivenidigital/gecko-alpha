@@ -105,6 +105,9 @@ async def run_cycle(
             token, db, session, settings, signals_fired=signals,
         )
 
+        # Persist narrative + conviction scores back to DB
+        await db.upsert_candidate(gated_token)
+
         if not should_alert:
             continue
 
@@ -143,6 +146,10 @@ async def main() -> None:
     parser.add_argument(
         "--cycles", type=int, default=0, help="Number of cycles (0=infinite)"
     )
+    parser.add_argument(
+        "--min-score-override", type=int, default=None,
+        help="Override MIN_SCORE threshold (for testing)",
+    )
     args = parser.parse_args()
 
     # Configure structlog
@@ -158,6 +165,9 @@ async def main() -> None:
     )
 
     settings = Settings()
+    if args.min_score_override is not None:
+        settings.MIN_SCORE = args.min_score_override
+        logger.info("MIN_SCORE overridden", min_score=settings.MIN_SCORE)
     db = Database(settings.DB_PATH)
     await db.initialize()
 

@@ -109,11 +109,20 @@ async def get_status(db_path: str) -> dict:
     """Pipeline status summary."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     async with _ro_db(db_path) as db:
+        # All tokens seen today
         cursor = await db.execute(
             "SELECT COUNT(*) FROM candidates WHERE date(first_seen_at) = ?",
             (today,),
         )
         tokens_scanned = (await cursor.fetchone())[0]
+
+        # Candidates promoted (quant_score >= 25 today)
+        cursor = await db.execute(
+            """SELECT COUNT(*) FROM candidates
+               WHERE date(first_seen_at) = ? AND quant_score IS NOT NULL AND quant_score >= 25""",
+            (today,),
+        )
+        candidates_today = (await cursor.fetchone())[0]
 
         cursor = await db.execute(
             "SELECT COUNT(*) FROM mirofish_jobs WHERE date(created_at) = ?",
@@ -130,6 +139,7 @@ async def get_status(db_path: str) -> dict:
     return {
         "pipeline_status": "running",
         "tokens_scanned_session": tokens_scanned,
+        "candidates_today": candidates_today,
         "mirofish_jobs_today": mirofish_jobs,
         "mirofish_cap": 50,
         "alerts_today": alerts_today,

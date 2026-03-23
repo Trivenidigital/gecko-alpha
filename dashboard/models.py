@@ -38,6 +38,7 @@ class SignalHitRate(BaseModel):
 class StatusResponse(BaseModel):
     pipeline_status: str = "running"
     tokens_scanned_session: int = 0
+    candidates_today: int = 0
     mirofish_jobs_today: int = 0
     mirofish_cap: int = 50
     alerts_today: int = 0

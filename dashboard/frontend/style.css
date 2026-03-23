@@ -208,12 +208,14 @@ body {
   font-weight: 600;
   margin-right: 3px;
   background: var(--color-bar-bg);
-  color: var(--color-text-secondary);
+  color: #484f58;
+  border: 1px solid transparent;
 }
 
 .signal-badge.fired {
-  background: rgba(29, 158, 117, 0.2);
-  color: var(--color-accent-green);
+  background: rgba(29, 158, 117, 0.35);
+  color: #2ee8a5;
+  border: 1px solid rgba(29, 158, 117, 0.5);
 }
 
 /* Score bar */

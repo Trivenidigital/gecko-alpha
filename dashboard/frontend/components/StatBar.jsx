@@ -10,7 +10,7 @@ export default function StatBar({ status }) {
       </div>
       <div className="stat-card">
         <div className="label">Candidates Today</div>
-        <div className="value">{status.tokens_scanned_session}</div>
+        <div className="value">{status.candidates_today ?? 0}</div>
       </div>
       <div className="stat-card">
         <div className="label">Alerts Fired</div>
