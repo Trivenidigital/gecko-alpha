@@ -48,8 +48,8 @@ def score(
     points = 0
     signals: list[str] = []
 
-    # Hard disqualifier: liquidity floor
-    if token.liquidity_usd < settings.MIN_LIQUIDITY_USD:
+    # Hard disqualifier: liquidity floor (exempt CG trending tokens)
+    if token.liquidity_usd < settings.MIN_LIQUIDITY_USD and token.cg_trending_rank is None:
         return (0, [])
 
     # Signal 1: Volume/Liquidity Ratio -- 30 points

@@ -108,6 +108,13 @@ class Database:
                 scanned_at        TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS volume_snapshots (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                contract_address  TEXT NOT NULL,
+                volume_24h_usd    REAL NOT NULL,
+                scanned_at        TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS score_history (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
                 contract_address  TEXT NOT NULL,
@@ -269,6 +276,35 @@ class Database:
         )
         rows = await cursor.fetchall()
         return [row[0] for row in rows]
+
+    async def get_vol_7d_avg(self, contract_address: str) -> float | None:
+        """Compute rolling 7-day average of volume_24h_usd for a contract.
+
+        Returns None if fewer than 3 historical rows exist (insufficient data).
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cursor = await self._conn.execute(
+            """SELECT volume_24h_usd FROM volume_snapshots
+               WHERE contract_address = ? AND scanned_at >= datetime('now', '-7 days')
+               ORDER BY scanned_at DESC""",
+            (contract_address,),
+        )
+        rows = await cursor.fetchall()
+        if len(rows) < 3:
+            return None
+        return sum(r[0] for r in rows) / len(rows)
+
+    async def log_volume_snapshot(self, contract_address: str, volume: float) -> None:
+        """Log a volume snapshot for 7-day average computation."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            "INSERT INTO volume_snapshots (contract_address, volume_24h_usd, scanned_at) VALUES (?, ?, ?)",
+            (contract_address, volume, now),
+        )
+        await self._conn.commit()
 
     async def get_daily_mirofish_count(self) -> int:
         """Count MiroFish jobs run today (UTC)."""

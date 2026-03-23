@@ -89,6 +89,11 @@ class CandidateToken(BaseModel):
         txns_h1_buys = txns.get("buys") if txns else None
         txns_h1_sells = txns.get("sells") if txns else None
 
+        # Parse price change fields
+        price_change = data.get("priceChange") or {}
+        price_change_1h = price_change.get("h1")
+        price_change_24h = price_change.get("h24")
+
         return cls(
             contract_address=base_token.get("address", ""),
             chain=data.get("chainId", ""),
@@ -98,6 +103,8 @@ class CandidateToken(BaseModel):
             market_cap_usd=float(data.get("fdv") or 0),
             liquidity_usd=float((data.get("liquidity") or {}).get("usd") or 0),
             volume_24h_usd=float((data.get("volume") or {}).get("h24") or 0),
+            price_change_1h=float(price_change_1h) if price_change_1h is not None else None,
+            price_change_24h=float(price_change_24h) if price_change_24h is not None else None,
             txns_h1_buys=txns_h1_buys,
             txns_h1_sells=txns_h1_sells,
             holder_count=0,

@@ -79,6 +79,14 @@ async def run_cycle(
                 enriched[i] = token.model_copy(update={"holder_growth_1h": max(0, growth)})
             await db.log_holder_snapshot(token.contract_address, token.holder_count)
 
+    # Compute vol_7d_avg from historical volume snapshots + log current volume
+    for i, token in enumerate(enriched):
+        if token.volume_24h_usd > 0:
+            vol_avg = await db.get_vol_7d_avg(token.contract_address)
+            if vol_avg is not None:
+                enriched[i] = enriched[i].model_copy(update={"vol_7d_avg": vol_avg})
+            await db.log_volume_snapshot(token.contract_address, token.volume_24h_usd)
+
     # Stage 3: Score
     scored = []
     for token in enriched:

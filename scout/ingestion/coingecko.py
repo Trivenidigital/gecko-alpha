@@ -78,36 +78,61 @@ async def fetch_top_movers(
     session: aiohttp.ClientSession,
     settings: Settings,
 ) -> list[CandidateToken]:
-    """Poll /coins/markets sorted by 1h change. Returns filtered CandidateTokens."""
-    params = {
+    """Poll /coins/markets with two strategies to find micro-cap movers.
+
+    Strategy 1: market_cap_asc — smallest listed coins (micro-cap fringe)
+    Strategy 2: volume_desc — highest volume (catches pumps in progress)
+    Union both lists before applying market cap filter.
+    """
+    logger.info("cg_fetch_attempted", endpoint="coins/markets")
+
+    base_params = {
         "vs_currency": "usd",
-        "order": "volume_desc",  # Free tier: volume_desc is valid; we sort by 1h change client-side
         "per_page": "50",
         "page": "1",
         "sparkline": "false",
         "price_change_percentage": "1h,24h",
     }
     if settings.COINGECKO_API_KEY:
-        params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
-    data = await _get_with_backoff(session, f"{CG_BASE}/coins/markets", params)
-    if not data or not isinstance(data, list):
+        base_params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
+
+    # Two parallel queries: smallest coins + highest volume
+    params_small = {**base_params, "order": "market_cap_asc"}
+    params_volume = {**base_params, "order": "volume_desc"}
+
+    data_small, data_volume = await asyncio.gather(
+        _get_with_backoff(session, f"{CG_BASE}/coins/markets", params_small),
+        _get_with_backoff(session, f"{CG_BASE}/coins/markets", params_volume),
+        return_exceptions=True,
+    )
+
+    # Union both result sets, dedup by CG id
+    raw_by_id: dict[str, dict] = {}
+    for data in [data_small, data_volume]:
+        if isinstance(data, Exception) or not data or not isinstance(data, list):
+            continue
+        for raw in data:
+            cg_id = raw.get("id", "")
+            if cg_id and cg_id not in raw_by_id:
+                raw_by_id[cg_id] = raw
+
+    if not raw_by_id:
         logger.warning("cg_no_data", endpoint="coins/markets")
         return []
 
     tokens: list[CandidateToken] = []
-    for raw in data:
+    for raw in raw_by_id.values():
         token = CandidateToken.from_coingecko(raw)
-        # Apply market cap filter
         if token.market_cap_usd < settings.MIN_MARKET_CAP:
             continue
         if token.market_cap_usd > settings.MAX_MARKET_CAP:
             continue
         tokens.append(token)
 
-    # Sort by 1h price change descending (client-side since free API may not support this order)
     tokens.sort(key=lambda t: t.price_change_1h or 0, reverse=True)
 
-    logger.info("cg_candidates_fetched", count=len(tokens), source="coins/markets")
+    logger.info("cg_candidates_returned", count=len(tokens), source="coins/markets",
+                 raw_fetched=len(raw_by_id), has_api_key=bool(settings.COINGECKO_API_KEY))
     return tokens
 
 
