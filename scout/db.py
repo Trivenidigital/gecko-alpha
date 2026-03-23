@@ -92,6 +92,7 @@ class Database:
                 contract_address  TEXT NOT NULL,
                 chain             TEXT NOT NULL,
                 conviction_score  REAL NOT NULL,
+                alert_market_cap  REAL,
                 alerted_at        TEXT NOT NULL
             );
 
@@ -175,15 +176,45 @@ class Database:
     # ------------------------------------------------------------------
 
     async def log_alert(
-        self, contract_address: str, chain: str, conviction_score: float
+        self, contract_address: str, chain: str, conviction_score: float,
+        alert_market_cap: float | None = None,
     ) -> None:
-        """Log a fired alert."""
+        """Log a fired alert with market cap at alert time."""
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         now = datetime.now(timezone.utc).isoformat()
         await self._conn.execute(
-            "INSERT INTO alerts (contract_address, chain, conviction_score, alerted_at) VALUES (?, ?, ?, ?)",
-            (contract_address, chain, conviction_score, now),
+            "INSERT INTO alerts (contract_address, chain, conviction_score, alert_market_cap, alerted_at) VALUES (?, ?, ?, ?, ?)",
+            (contract_address, chain, conviction_score, alert_market_cap, now),
+        )
+        await self._conn.commit()
+
+    async def get_unchecked_alerts(self) -> list[dict]:
+        """Get alerts that don't have an outcome recorded yet."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cursor = await self._conn.execute(
+            """SELECT a.id, a.contract_address, a.chain, a.alert_market_cap, a.alerted_at
+               FROM alerts a
+               LEFT JOIN outcomes o ON a.id = o.id
+               WHERE o.id IS NULL AND a.alert_market_cap IS NOT NULL""",
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def log_outcome(
+        self, alert_id: int, contract_address: str,
+        alert_price: float, check_price: float, price_change_pct: float,
+    ) -> None:
+        """Record an outcome for an alert."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            """INSERT OR REPLACE INTO outcomes
+               (id, contract_address, alert_price, check_price, check_time, price_change_pct)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (alert_id, contract_address, alert_price, check_price, now, price_change_pct),
         )
         await self._conn.commit()
 

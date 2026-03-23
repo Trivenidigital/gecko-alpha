@@ -27,6 +27,17 @@ class AlertResponse(BaseModel):
     conviction_score: float | None = None
     alerted_at: str | None = None
     market_cap_usd: float | None = None
+    alert_market_cap: float | None = None
+    price_change_pct: float | None = None
+    check_price: float | None = None
+    check_time: str | None = None
+
+
+class WinRateResponse(BaseModel):
+    total_outcomes: int = 0
+    wins: int = 0
+    win_rate_pct: float = 0
+    avg_return_pct: float = 0
 
 
 class SignalHitRate(BaseModel):

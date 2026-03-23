@@ -17,6 +17,12 @@ function formatMcap(val) {
   return `$${val}`
 }
 
+function formatPct(val) {
+  if (val == null) return null
+  const sign = val >= 0 ? '+' : ''
+  return `${sign}${val.toFixed(1)}%`
+}
+
 export default function AlertFeed({ alerts }) {
   if (!alerts.length) {
     return (
@@ -31,19 +37,27 @@ export default function AlertFeed({ alerts }) {
     <div className="panel">
       <div className="panel-header">Alert Feed</div>
       <div className="alert-feed">
-        {alerts.map((a, i) => (
-          <div className="alert-item" key={`${a.contract_address}-${i}`}>
-            <span className="alert-time">{formatTime(a.alerted_at)}</span>
-            <span className="alert-token">{a.token_name || a.contract_address}</span>
-            <span className={`conviction-badge high`}>
-              {a.conviction_score != null ? Math.round(a.conviction_score) : '–'}
-            </span>
-            <span className={`chain-badge ${a.chain}`}>{a.chain}</span>
-            <span style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>
-              {formatMcap(a.market_cap_usd)}
-            </span>
-          </div>
-        ))}
+        {alerts.map((a, i) => {
+          const pctStr = formatPct(a.price_change_pct)
+          return (
+            <div className="alert-item" key={`${a.contract_address}-${i}`}>
+              <span className="alert-time">{formatTime(a.alerted_at)}</span>
+              <span className="alert-token">{a.token_name || a.contract_address}</span>
+              <span className="conviction-badge high">
+                {a.conviction_score != null ? Math.round(a.conviction_score) : '–'}
+              </span>
+              <span className={`chain-badge ${a.chain}`}>{a.chain}</span>
+              <span style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>
+                {formatMcap(a.market_cap_usd)}
+              </span>
+              {pctStr && (
+                <span className={`outcome-badge ${a.price_change_pct >= 0 ? 'win' : 'loss'}`}>
+                  {pctStr}
+                </span>
+              )}
+            </div>
+          )
+        })}
       </div>
     </div>
   )

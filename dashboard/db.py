@@ -56,19 +56,49 @@ async def get_candidates(db_path: str, limit: int = 20) -> list[dict]:
 
 
 async def get_recent_alerts(db_path: str, limit: int = 20) -> list[dict]:
-    """Recent alerts ordered by alerted_at DESC."""
+    """Recent alerts ordered by alerted_at DESC, with outcome data if available."""
     async with _ro_db(db_path) as db:
         cursor = await db.execute(
             """SELECT a.contract_address, a.chain, a.conviction_score, a.alerted_at,
-                      c.token_name, c.ticker, c.market_cap_usd
+                      a.alert_market_cap,
+                      c.token_name, c.ticker, c.market_cap_usd,
+                      o.price_change_pct, o.check_price, o.check_time
                FROM alerts a
                LEFT JOIN candidates c ON a.contract_address = c.contract_address
+               LEFT JOIN outcomes o ON a.id = o.id
                ORDER BY a.alerted_at DESC
                LIMIT ?""",
             (limit,),
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+
+async def get_win_rate(db_path: str) -> dict:
+    """Compute win rate from outcomes table."""
+    async with _ro_db(db_path) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM outcomes WHERE price_change_pct IS NOT NULL",
+        )
+        total = (await cursor.fetchone())[0]
+
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM outcomes WHERE price_change_pct > 0",
+        )
+        wins = (await cursor.fetchone())[0]
+
+        cursor = await db.execute(
+            "SELECT AVG(price_change_pct) FROM outcomes WHERE price_change_pct IS NOT NULL",
+        )
+        avg_row = await cursor.fetchone()
+        avg_pct = avg_row[0] if avg_row and avg_row[0] is not None else 0
+
+    return {
+        "total_outcomes": total,
+        "wins": wins,
+        "win_rate_pct": round((wins / total * 100) if total > 0 else 0, 1),
+        "avg_return_pct": round(avg_pct, 1),
+    }
 
 
 async def get_signal_hit_rates(db_path: str) -> list[dict]:

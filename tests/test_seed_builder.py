@@ -51,8 +51,8 @@ def test_build_seed_prompt_format():
 
     prompt = seed["prompt"]
     assert "Token: TestCoin (TST) on solana" in prompt
-    assert "Market cap: $50000" in prompt
-    assert "Predict: will this narrative spread organically" in prompt
+    assert "Market cap: $50,000" in prompt
+    assert "Score the viral narrative potential" in prompt
 
 
 def test_build_seed_age_hours():

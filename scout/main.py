@@ -130,11 +130,70 @@ async def run_cycle(
 
         await send_alert(gated_token, signals, session, settings)
         await db.log_alert(
-            gated_token.contract_address, gated_token.chain, conviction
+            gated_token.contract_address, gated_token.chain, conviction,
+            alert_market_cap=gated_token.market_cap_usd,
         )
         stats["alerts_fired"] += 1
 
     return stats
+
+
+async def check_outcomes(
+    db: Database,
+    session: aiohttp.ClientSession,
+) -> int:
+    """Check current prices for alerted tokens and record outcomes.
+
+    Uses DexScreener tokens API to fetch current market cap.
+    Returns count of outcomes recorded.
+    """
+    unchecked = await db.get_unchecked_alerts()
+    if not unchecked:
+        return 0
+
+    recorded = 0
+    for alert in unchecked:
+        contract = alert["contract_address"]
+        chain = alert["chain"]
+        alert_mcap = alert["alert_market_cap"]
+        if not alert_mcap or alert_mcap <= 0:
+            continue
+
+        try:
+            url = f"https://api.dexscreener.com/tokens/v1/{chain}/{contract}"
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    continue
+                pairs = await resp.json()
+
+            if not pairs or not isinstance(pairs, list):
+                continue
+
+            # Use first pair's FDV as current market cap
+            current_mcap = float(pairs[0].get("fdv") or 0)
+            if current_mcap <= 0:
+                continue
+
+            pct_change = ((current_mcap - alert_mcap) / alert_mcap) * 100
+            await db.log_outcome(
+                alert_id=alert["id"],
+                contract_address=contract,
+                alert_price=alert_mcap,
+                check_price=current_mcap,
+                price_change_pct=pct_change,
+            )
+            logger.info(
+                "Outcome recorded",
+                token=contract,
+                alert_mcap=alert_mcap,
+                current_mcap=current_mcap,
+                pct_change=round(pct_change, 1),
+            )
+            recorded += 1
+        except Exception as e:
+            logger.warning("Outcome check failed", token=contract, error=str(e))
+
+    return recorded
 
 
 async def main() -> None:
@@ -187,7 +246,9 @@ async def main() -> None:
     cycle_count = 0
     cumulative = {"tokens_scanned": 0, "candidates_promoted": 0, "alerts_fired": 0}
     last_heartbeat = time.monotonic()
+    last_outcome_check = time.monotonic()
     heartbeat_interval = 300  # 5 minutes
+    outcome_check_interval = 3600  # 1 hour
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -217,6 +278,16 @@ async def main() -> None:
                         mirofish_jobs_today=mirofish_today,
                     )
                     last_heartbeat = now
+
+                # Outcome check every hour
+                if now - last_outcome_check >= outcome_check_interval:
+                    try:
+                        outcomes_recorded = await check_outcomes(db, session)
+                        if outcomes_recorded:
+                            logger.info("Outcomes checked", recorded=outcomes_recorded)
+                    except Exception as e:
+                        logger.warning("Outcome check error", error=str(e))
+                    last_outcome_check = now
 
                 if args.cycles > 0 and cycle_count >= args.cycles:
                     break

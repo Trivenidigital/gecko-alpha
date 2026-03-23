@@ -17,14 +17,34 @@ def build_seed(
     social = f"{token.social_mentions_24h} mentions in 24h" if token.social_mentions_24h > 0 else "None detected"
     concept_description = f"{token.token_name} ({token.ticker}) is a {token.chain} token"
 
+    # Build quantitative context
+    quant_lines = []
+    if token.volume_24h_usd > 0:
+        quant_lines.append(f"24h volume: ${token.volume_24h_usd:,.0f}")
+    if token.liquidity_usd > 0:
+        quant_lines.append(f"Liquidity: ${token.liquidity_usd:,.0f}")
+    if token.price_change_1h is not None:
+        quant_lines.append(f"1h price change: {token.price_change_1h:+.1f}%")
+    if token.price_change_24h is not None:
+        quant_lines.append(f"24h price change: {token.price_change_24h:+.1f}%")
+    if token.holder_count > 0:
+        quant_lines.append(f"Holders: {token.holder_count}")
+    quant_context = " | ".join(quant_lines) if quant_lines else "No quantitative data"
+
     prompt = (
         f"Token: {token.token_name} ({token.ticker}) on {token.chain}. "
-        f"Concept: {concept_description}. "
-        f"Market cap: ${token.market_cap_usd}. "
+        f"Market cap: ${token.market_cap_usd:,.0f}. "
         f"First seen: {age_hours}h ago. "
-        f"Early social signals: {social}. "
-        f"Predict: will this narrative spread organically through crypto Twitter "
-        f"and Telegram communities over the next 24 hours?"
+        f"Quantitative signals: {quant_context}. "
+        f"Social signals: {social}. "
+    )
+    if signals_fired:
+        prompt += f"Fired quantitative signals: {', '.join(signals_fired)}. "
+    if signal_confidence:
+        prompt += f"Signal confidence: {signal_confidence}. "
+    prompt += (
+        "Score the viral narrative potential of this token for crypto Twitter "
+        "and Telegram communities over the next 24 hours."
     )
 
     seed = {

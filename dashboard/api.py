@@ -14,6 +14,7 @@ from dashboard.models import (
     FunnelResponse,
     SignalHitRate,
     StatusResponse,
+    WinRateResponse,
 )
 
 # Default DB path — can be overridden via create_app()
@@ -49,6 +50,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/funnel/latest", response_model=FunnelResponse)
     async def get_funnel():
         return await db.get_funnel(_db_path)
+
+    @app.get("/api/win-rate", response_model=WinRateResponse)
+    async def get_win_rate():
+        return await db.get_win_rate(_db_path)
 
     # --- WebSocket ---
 

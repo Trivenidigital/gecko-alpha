@@ -338,6 +338,24 @@ body {
   gap: 16px;
 }
 
+.outcome-badge {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.outcome-badge.win {
+  background: rgba(29, 158, 117, 0.2);
+  color: var(--color-accent-green);
+}
+
+.outcome-badge.loss {
+  background: rgba(248, 81, 73, 0.2);
+  color: var(--color-accent-red);
+}
+
 .empty-state {
   padding: 24px 16px;
   text-align: center;

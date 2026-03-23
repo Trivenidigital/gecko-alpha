@@ -49,7 +49,17 @@ async def seeded_db(tmp_path):
                 contract_address  TEXT NOT NULL,
                 chain             TEXT NOT NULL,
                 conviction_score  REAL NOT NULL,
+                alert_market_cap  REAL,
                 alerted_at        TEXT NOT NULL
+            );
+
+            CREATE TABLE outcomes (
+                id                INTEGER PRIMARY KEY,
+                contract_address  TEXT NOT NULL,
+                alert_price       REAL,
+                check_price       REAL,
+                check_time        TEXT,
+                price_change_pct  REAL
             );
 
             CREATE TABLE mirofish_jobs (
@@ -128,7 +138,13 @@ async def empty_db(tmp_path):
             CREATE TABLE alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 contract_address TEXT NOT NULL, chain TEXT NOT NULL,
-                conviction_score REAL NOT NULL, alerted_at TEXT NOT NULL
+                conviction_score REAL NOT NULL, alert_market_cap REAL,
+                alerted_at TEXT NOT NULL
+            );
+            CREATE TABLE outcomes (
+                id INTEGER PRIMARY KEY,
+                contract_address TEXT NOT NULL, alert_price REAL,
+                check_price REAL, check_time TEXT, price_change_pct REAL
             );
             CREATE TABLE mirofish_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
