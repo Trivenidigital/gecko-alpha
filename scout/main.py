@@ -110,6 +110,14 @@ async def run_cycle(
         # Persist narrative + conviction scores back to DB
         await db.upsert_candidate(gated_token)
 
+        logger.info(
+            "gate_decision",
+            token=gated_token.token_name,
+            should_alert=should_alert,
+            conviction_score=round(conviction, 1),
+            threshold=settings.CONVICTION_THRESHOLD,
+        )
+
         if not should_alert:
             continue
 
@@ -130,7 +138,13 @@ async def run_cycle(
             )
             continue
 
-        await send_alert(gated_token, signals, session, settings)
+        logger.info("alert_attempted", token=gated_token.token_name, platform="telegram")
+        try:
+            await send_alert(gated_token, signals, session, settings)
+            logger.info("alert_delivered", token=gated_token.token_name, status="success")
+        except Exception as e:
+            logger.error("alert_delivery_failed", token=gated_token.token_name, error=str(e))
+
         await db.log_alert(
             gated_token.contract_address, gated_token.chain, conviction,
             alert_market_cap=gated_token.market_cap_usd,
