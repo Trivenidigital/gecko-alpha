@@ -1,5 +1,6 @@
 """Alert delivery to Telegram and Discord."""
 
+import json
 import structlog
 
 import aiohttp
@@ -69,6 +70,73 @@ def format_alert_message(token: CandidateToken, signals: list[str]) -> str:
         )
 
     return "\n".join(lines)
+
+
+def format_daily_summary(data: dict) -> str:
+    """Format the daily summary for Telegram."""
+    lines: list[str] = []
+    lines.append("📊 *Gecko-Alpha Daily Summary*")
+    lines.append("")
+
+    # Alerts
+    lines.append(f"Alerts fired today: *{data['alerts_today']}*")
+
+    # Win rate
+    if data["outcomes_total"] > 0:
+        lines.append(
+            f"Win rate (4h+): *{data['win_rate_pct']}%* "
+            f"({data['outcomes_wins']}/{data['outcomes_total']})"
+        )
+    else:
+        lines.append("Win rate: No outcomes to measure yet")
+
+    # Top signal combo
+    if data["top_signal_combo"]:
+        try:
+            combo = json.loads(data["top_signal_combo"])
+            lines.append(f"Top signal combo: {', '.join(combo)}")
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Top 3 tokens
+    top = data.get("top_tokens", [])
+    if top:
+        lines.append("")
+        lines.append("*Top 3 Conviction Tokens:*")
+        for i, t in enumerate(top, 1):
+            conv = t.get("conviction_score")
+            conv_str = f"{conv:.1f}" if conv is not None else "–"
+            narr = t.get("narrative_score")
+            narr_str = str(narr) if narr is not None else "–"
+            lines.append(
+                f"{i}. *{t['token_name']}* ({t['ticker']}) — "
+                f"conv: {conv_str} | quant: {t.get('quant_score', '–')} | narr: {narr_str}"
+            )
+    else:
+        lines.append("\nNo tokens scored today.")
+
+    return "\n".join(lines)
+
+
+async def send_telegram_message(
+    text: str,
+    session: aiohttp.ClientSession,
+    settings: Settings,
+) -> None:
+    """Send a plain text message to Telegram."""
+    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": settings.TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+    }
+    try:
+        async with session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning("Telegram daily summary failed", status=resp.status, body=body[:200])
+    except Exception as e:
+        logger.warning("Telegram daily summary error", error=str(e))
 
 
 async def send_alert(

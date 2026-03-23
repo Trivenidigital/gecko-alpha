@@ -9,8 +9,10 @@ import time
 import aiohttp
 import structlog
 
+from datetime import datetime, timezone
+
 from scout.aggregator import aggregate
-from scout.alerter import send_alert
+from scout.alerter import format_daily_summary, send_alert, send_telegram_message
 from scout.config import Settings
 from scout.db import Database
 from scout.gate import evaluate
@@ -247,6 +249,7 @@ async def main() -> None:
     cumulative = {"tokens_scanned": 0, "candidates_promoted": 0, "alerts_fired": 0}
     last_heartbeat = time.monotonic()
     last_outcome_check = time.monotonic()
+    last_summary_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     heartbeat_interval = 300  # 5 minutes
     outcome_check_interval = 3600  # 1 hour
 
@@ -288,6 +291,20 @@ async def main() -> None:
                     except Exception as e:
                         logger.warning("Outcome check error", error=str(e))
                     last_outcome_check = now
+
+                # Daily summary at midnight UTC
+                current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                if current_date != last_summary_date:
+                    try:
+                        summary_data = await db.get_daily_summary_data()
+                        summary_text = format_daily_summary(summary_data)
+                        if not args.dry_run:
+                            await send_telegram_message(summary_text, session, settings)
+                        logger.info("Daily summary sent", alerts=summary_data["alerts_today"],
+                                    win_rate=summary_data["win_rate_pct"])
+                    except Exception as e:
+                        logger.warning("Daily summary failed", error=str(e))
+                    last_summary_date = current_date
 
                 if args.cycles > 0 and cycle_count >= args.cycles:
                     break

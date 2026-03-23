@@ -337,6 +337,69 @@ class Database:
         )
         await self._conn.commit()
 
+    async def get_daily_summary_data(self) -> dict:
+        """Gather data for the daily Telegram summary."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        # Alerts fired today
+        cursor = await self._conn.execute(
+            "SELECT COUNT(*) FROM alerts WHERE date(alerted_at) = ?", (today,),
+        )
+        alerts_today = (await cursor.fetchone())[0]
+
+        # Win rate for alerts older than 4 hours
+        cursor = await self._conn.execute(
+            """SELECT COUNT(*) FROM outcomes o
+               JOIN alerts a ON o.id = a.id
+               WHERE date(a.alerted_at) = ?
+               AND a.alerted_at <= datetime('now', '-4 hours')""",
+            (today,),
+        )
+        outcomes_total = (await cursor.fetchone())[0]
+
+        cursor = await self._conn.execute(
+            """SELECT COUNT(*) FROM outcomes o
+               JOIN alerts a ON o.id = a.id
+               WHERE date(a.alerted_at) = ?
+               AND a.alerted_at <= datetime('now', '-4 hours')
+               AND o.price_change_pct > 0""",
+            (today,),
+        )
+        outcomes_wins = (await cursor.fetchone())[0]
+
+        # Top signal combination (most common non-empty signals_fired pattern today)
+        cursor = await self._conn.execute(
+            """SELECT signals_fired, COUNT(*) as cnt FROM candidates
+               WHERE date(first_seen_at) = ? AND signals_fired IS NOT NULL
+               AND signals_fired != '[]' AND signals_fired != 'null'
+               GROUP BY signals_fired ORDER BY cnt DESC LIMIT 1""",
+            (today,),
+        )
+        top_combo_row = await cursor.fetchone()
+        top_signal_combo = top_combo_row[0] if top_combo_row else None
+
+        # Top 3 highest conviction tokens today
+        cursor = await self._conn.execute(
+            """SELECT token_name, ticker, chain, quant_score, narrative_score,
+                      conviction_score, signals_fired
+               FROM candidates
+               WHERE date(first_seen_at) = ? AND conviction_score IS NOT NULL
+               ORDER BY conviction_score DESC LIMIT 3""",
+            (today,),
+        )
+        top_tokens = [dict(row) for row in await cursor.fetchall()]
+
+        return {
+            "alerts_today": alerts_today,
+            "outcomes_total": outcomes_total,
+            "outcomes_wins": outcomes_wins,
+            "win_rate_pct": round((outcomes_wins / outcomes_total * 100) if outcomes_total > 0 else 0, 1),
+            "top_signal_combo": top_signal_combo,
+            "top_tokens": top_tokens,
+        }
+
     async def get_daily_mirofish_count(self) -> int:
         """Count MiroFish jobs run today (UTC)."""
         if self._conn is None:
