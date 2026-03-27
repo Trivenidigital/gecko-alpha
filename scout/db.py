@@ -218,6 +218,17 @@ class Database:
         )
         await self._conn.commit()
 
+    async def was_recently_alerted(self, contract_address: str, hours: int = 4) -> bool:
+        """Check if a token was alerted within the last N hours."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cursor = await self._conn.execute(
+            "SELECT COUNT(*) FROM alerts WHERE contract_address = ? AND alerted_at >= datetime('now', ?)",
+            (contract_address, f"-{hours} hours"),
+        )
+        row = await cursor.fetchone()
+        return row[0] > 0 if row else False
+
     async def get_daily_alert_count(self) -> int:
         """Count alerts fired today (UTC)."""
         if self._conn is None:
@@ -399,6 +410,17 @@ class Database:
             "top_signal_combo": top_signal_combo,
             "top_tokens": top_tokens,
         }
+
+    async def prune_old_candidates(self, keep_days: int = 7) -> int:
+        """Delete candidates older than keep_days. Returns rows deleted."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cursor = await self._conn.execute(
+            "DELETE FROM candidates WHERE first_seen_at < datetime('now', ?)",
+            (f"-{keep_days} days",),
+        )
+        await self._conn.commit()
+        return cursor.rowcount
 
     async def get_daily_mirofish_count(self) -> int:
         """Count MiroFish jobs run today (UTC)."""

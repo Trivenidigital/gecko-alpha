@@ -55,6 +55,34 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def get_win_rate():
         return await db.get_win_rate(_db_path)
 
+    @app.get("/health")
+    async def health_check():
+        """Health check endpoint for uptime monitoring."""
+        db_ok = False
+        last_cycle = None
+        pipeline_running = False
+        try:
+            async with db._ro_db(_db_path) as conn:
+                db_ok = True
+                cursor = await conn.execute(
+                    "SELECT MAX(first_seen_at) FROM candidates"
+                )
+                row = await cursor.fetchone()
+                last_cycle = row[0] if row and row[0] else None
+                if last_cycle:
+                    from datetime import datetime, timezone
+                    last_dt = datetime.fromisoformat(last_cycle.replace("Z", "+00:00"))
+                    age = (datetime.now(timezone.utc) - last_dt).total_seconds()
+                    pipeline_running = age < 180  # 3x 60s scan interval
+        except Exception:
+            pass
+        return {
+            "status": "ok" if db_ok else "degraded",
+            "pipeline_running": pipeline_running,
+            "last_cycle_at": last_cycle,
+            "db_reachable": db_ok,
+        }
+
     # --- WebSocket ---
 
     _ws_clients: set[WebSocket] = set()

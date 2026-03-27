@@ -33,6 +33,7 @@ def mock_db():
     db.get_recent_scores = AsyncMock(return_value=[])
     db.get_vol_7d_avg = AsyncMock(return_value=None)
     db.log_volume_snapshot = AsyncMock()
+    db.was_recently_alerted = AsyncMock(return_value=False)
     return db
 
 

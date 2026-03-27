@@ -130,6 +130,13 @@ async def run_cycle(
             )
             continue
 
+        # Duplicate suppression: skip if alerted in last 4 hours
+        if await db.was_recently_alerted(gated_token.contract_address):
+            logger.info("alert_suppressed_duplicate",
+                        token=gated_token.token_name,
+                        contract_address=gated_token.contract_address)
+            continue
+
         if dry_run:
             logger.info(
                 "DRY RUN: would alert",
@@ -296,7 +303,7 @@ async def main() -> None:
                     )
                     last_heartbeat = now
 
-                # Outcome check every hour
+                # Hourly tasks: outcome check + DB prune
                 if now - last_outcome_check >= outcome_check_interval:
                     try:
                         outcomes_recorded = await check_outcomes(db, session)
@@ -304,6 +311,16 @@ async def main() -> None:
                             logger.info("Outcomes checked", recorded=outcomes_recorded)
                     except Exception as e:
                         logger.warning("Outcome check error", error=str(e))
+
+                    # Prune old candidates if DB > 500MB
+                    try:
+                        db_size = settings.DB_PATH.stat().st_size if settings.DB_PATH.exists() else 0
+                        if db_size > 500_000_000:
+                            pruned = await db.prune_old_candidates(keep_days=7)
+                            logger.info("db_pruned", rows_deleted=pruned, db_size_mb=round(db_size / 1e6, 1))
+                    except Exception as e:
+                        logger.warning("DB prune error", error=str(e))
+
                     last_outcome_check = now
 
                 # Daily summary at midnight UTC
