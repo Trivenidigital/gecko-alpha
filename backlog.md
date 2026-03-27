@@ -12,13 +12,13 @@
 
 These decisions were reviewed and approved. Reference them when implementing P1 items.
 
-**D1 — Scoring normalization:** Keep MIN_SCORE at 60 for initial launch (meaning "60% of max possible"). After enhanced scorer ships, let it run loose for the first week to collect data on what scores real tokens actually produce, then recalibrate MIN_SCORE to 75 (roughly equivalent to old 60 on the 125-point normalized scale). Do not change the gate value during implementation.
+**D1 — Scoring normalization (UPDATED):** MIN_SCORE lowered to 25 and CONVICTION_THRESHOLD to 22 after observing that the CoinGecko micro-cap universe produces lower raw scores than originally modelled. The 178-point normalization base compresses scores: typical top tokens score 25-35 quant. The original target of MIN_SCORE=60 would require 4+ signals firing simultaneously which rarely happens in current market conditions. Thresholds will be raised as vol_acceleration signal accumulates history (requires 3+ scan cycles) and more data sources come online.
 
 **D2 — Buy pressure fields:** Add `txns_h1_buys: int | None = None` and `txns_h1_sells: int | None = None` to CandidateToken as Optional fields. Parser populates where available (DexScreener `txns.h1.buys` / `txns.h1.sells`). Scorer treats `None` as 0 points for buy pressure — graceful degradation if the field is missing from the API response.
 
 **D3 — Score velocity parameter injection:** Pass `historical_scores: list[float] | None = None` into the scorer as a parameter. Keeps scorer a pure function — no DB access, fully testable. The caller (main.py) does the DB read and passes historical scores in. This is the correct pattern: I/O at the edges, pure logic in the core.
 
-**D4 — Qwen migration order:** Do Qwen migration first as an isolated change (BL-001) before the enhanced scorer. Clean swap: replace `anthropic.AsyncAnthropic` with `openai.AsyncOpenAI(base_url="https://dashscope.aliyuncs.com/compatible-mode/v1", api_key=...)`, change model string to `qwen-plus`. One file change, fully testable, zero risk to other modules. Pause for review between Qwen migration and enhanced scorer.
+**D4 — Qwen migration order (SUPERSEDED):** BL-001 (Qwen migration) was cancelled — Claude haiku-4-5 via Anthropic SDK retained as fallback scorer. Rationale: user has $200/month Anthropic plan, no need for additional DashScope account. The narrative scoring prompt has been calibrated with a detailed rubric and quantitative context for Claude haiku-4-5 specifically.
 
 **D5 — Implementation order for enhanced scorer:** Execute P1 items in this sequence:
 1. BL-011 (buy pressure) — new CandidateToken fields + parser + signal
@@ -34,7 +34,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 ## P0 — Blocking
 
 ### BL-001: Migrate fallback scorer from Anthropic to Qwen (OpenAI-compatible)
-**Status:** Not started
+**Status:** CANCELLED — see D4 (SUPERSEDED)
 **Files:** scout/mirofish/fallback.py, scout/config.py, .env.example, tests/test_fallback.py, pyproject.toml
 **Why:** User wants Qwen (qwen-plus via DashScope) instead of Claude haiku for the narrative fallback scorer. DashScope uses OpenAI-compatible API.
 **Changes needed:**
