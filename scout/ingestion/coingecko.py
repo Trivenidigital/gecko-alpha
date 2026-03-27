@@ -7,18 +7,19 @@ import time
 from collections import deque
 from typing import TYPE_CHECKING
 
+import aiohttp
 import structlog
 
 from scout.models import CandidateToken
 
 if TYPE_CHECKING:
-    import aiohttp
     from scout.config import Settings
 
 logger = structlog.get_logger()
 
 CG_BASE = "https://api.coingecko.com/api/v3"
 MAX_RETRIES = 3
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 _call_timestamps: deque[float] = deque()
 _rate_lock = asyncio.Lock()
 
@@ -54,7 +55,7 @@ async def _get_with_backoff(
     for attempt in range(MAX_RETRIES + 1):
         await _throttle()
         try:
-            async with session.get(url, params=params) as resp:
+            async with session.get(url, params=params, timeout=REQUEST_TIMEOUT) as resp:
                 if resp.status == 429:
                     backoff = 2 ** (attempt + 1)
                     logger.warning(

@@ -11,6 +11,7 @@ from scout.models import CandidateToken
 logger = structlog.get_logger()
 
 GECKO_BASE = "https://api.geckoterminal.com/api/v2"
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
 
 async def fetch_trending_pools(
@@ -22,7 +23,7 @@ async def fetch_trending_pools(
     for chain in settings.CHAINS:
         url = f"{GECKO_BASE}/networks/{chain}/trending_pools"
         try:
-            async with session.get(url) as resp:
+            async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                 if resp.status != 200:
                     logger.warning("GeckoTerminal returned error", chain=chain, status=resp.status)
                     continue

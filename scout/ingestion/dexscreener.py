@@ -16,6 +16,7 @@ TOKEN_URL = "https://api.dexscreener.com/tokens/v1"
 
 MAX_RETRIES = 3
 MAX_CONCURRENT = 5
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
 
 async def _get_json(
@@ -27,7 +28,7 @@ async def _get_json(
     """GET a URL with exponential backoff on 429 / 5xx."""
     for attempt in range(retries):
         try:
-            async with session.get(url) as resp:
+            async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                 if resp.status == 429 or resp.status >= 500:
                     wait = 2 ** attempt
                     logger.warning(

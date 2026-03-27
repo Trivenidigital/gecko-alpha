@@ -124,6 +124,7 @@ async def send_telegram_message(
     settings: Settings,
 ) -> None:
     """Send a plain text message to Telegram."""
+    text = _truncate(text)
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": settings.TELEGRAM_CHAT_ID,
@@ -139,6 +140,16 @@ async def send_telegram_message(
         logger.warning("Telegram daily summary error", error=str(e))
 
 
+TELEGRAM_MAX_LENGTH = 4096
+
+
+def _truncate(text: str, max_len: int = TELEGRAM_MAX_LENGTH) -> str:
+    """Truncate text to max_len, appending ... if truncated."""
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
 async def send_alert(
     token: CandidateToken,
     signals: list[str],
@@ -150,7 +161,7 @@ async def send_alert(
     Raises ``AlertDeliveryError`` if Telegram delivery fails.
     Discord failures are logged as warnings but do not raise.
     """
-    message = format_alert_message(token, signals)
+    message = _truncate(format_alert_message(token, signals))
 
     # --- Telegram (required) ---
     telegram_url = (

@@ -4,8 +4,12 @@ __pycache__/
 .venv/
 .env
 scout.db
+*.db-shm
+*.db-wal
 .pytest_cache/
 dist/
 build/
 *.egg
 .mypy_cache/
+dashboard/frontend/node_modules/
+dashboard/frontend/dist/
