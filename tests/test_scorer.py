@@ -35,11 +35,11 @@ class TestIndividualSignals:
         token = _make_token(volume_24h_usd=120000, liquidity_usd=20000,
                             market_cap_usd=999999, holder_growth_1h=0,
                             token_age_days=30, social_mentions_24h=0,
-                            chain="ethereum")  # no solana bonus
+                            chain="ethereum")
         points, signals = score(token, _settings())
         assert "vol_liq_ratio" in signals
-        # raw=30, normalized=int(30*100/178)=16, *0.8=12
-        assert points == 12
+        # raw=30, normalized=int(30*100/183)=16, no multiplier (1 signal)
+        assert points == 16
 
     def test_vol_liq_ratio_does_not_fire(self):
         # volume/liquidity = 20000/20000 = 1× (< 5×)
@@ -97,8 +97,8 @@ class TestIndividualSignals:
                             chain="ethereum")
         points, signals = score(token, _settings())
         assert "holder_growth" in signals
-        # raw=25, normalized=int(25*100/178)=14
-        assert points == 14
+        # raw=25, normalized=int(25*100/183)=13
+        assert points == 13
 
     def test_holder_growth_exactly_20(self):
         # > 20, not >= 20
@@ -109,51 +109,53 @@ class TestIndividualSignals:
         assert "holder_growth" not in signals
 
     def test_token_age_peak_window(self):
-        """1-3 days -> 10 pts raw."""
+        """12-48h -> 15 pts raw (peak)."""
         token = _make_token(volume_24h_usd=1000, liquidity_usd=20000,
                             market_cap_usd=999999, holder_growth_1h=0,
-                            token_age_days=2.0, social_mentions_24h=0,
-                            chain="ethereum")
+                            token_age_days=1.0, social_mentions_24h=0,
+                            chain="ethereum")  # 24h = peak
         points, signals = score(token, _settings())
         assert "token_age" in signals
-        # raw=10, normalized=int(10*100/178)=5
-        assert points == 5
+        # raw=15, normalized=int(15*100/183)=8
+        assert points == 8
 
     def test_token_age_early(self):
-        """12-24h -> 5 pts raw."""
+        """3-12h -> 8 pts raw."""
         token = _make_token(volume_24h_usd=1000, liquidity_usd=20000,
                             market_cap_usd=999999, holder_growth_1h=0,
-                            token_age_days=0.6, social_mentions_24h=0,
-                            chain="ethereum")
+                            token_age_days=0.25, social_mentions_24h=0,
+                            chain="ethereum")  # 6h
         points, signals = score(token, _settings())
         assert "token_age" in signals
-        # raw=5, normalized=int(5*100/178)=2
-        assert points == 2
+        # raw=8, normalized=int(8*100/183)=4
+        assert points == 4
 
     def test_token_age_declining(self):
-        """3-5 days -> 5 pts raw."""
+        """48h-7d -> 5 pts raw."""
         token = _make_token(volume_24h_usd=1000, liquidity_usd=20000,
                             market_cap_usd=999999, holder_growth_1h=0,
                             token_age_days=4.0, social_mentions_24h=0,
                             chain="ethereum")
         points, signals = score(token, _settings())
         assert "token_age" in signals
-        # raw=5, normalized=int(5*100/178)=2
+        # raw=5, normalized=int(5*100/183)=2
         assert points == 2
 
     def test_token_age_too_new(self):
-        """< 12h -> 0 pts."""
+        """< 3h -> 0 pts."""
         token = _make_token(volume_24h_usd=1000, liquidity_usd=20000,
                             market_cap_usd=999999, holder_growth_1h=0,
-                            token_age_days=0.3, social_mentions_24h=0)
+                            token_age_days=0.05, social_mentions_24h=0,
+                            chain="ethereum")  # ~1.2h
         points, signals = score(token, _settings())
         assert "token_age" not in signals
 
     def test_token_age_too_old(self):
-        """> 5 days -> 0 pts."""
+        """> 7 days -> 0 pts."""
         token = _make_token(volume_24h_usd=1000, liquidity_usd=20000,
                             market_cap_usd=999999, holder_growth_1h=0,
-                            token_age_days=7.0, social_mentions_24h=0)
+                            token_age_days=8.0, social_mentions_24h=0,
+                            chain="ethereum")
         points, signals = score(token, _settings())
         assert "token_age" not in signals
 
@@ -214,7 +216,7 @@ class TestHardDisqualifiers:
     """Test hard disqualifier pre-filters."""
 
     def test_liquidity_below_floor_returns_zero(self):
-        """Liquidity < $15K -> score 0, no signals."""
+        """Liquidity < $15K -> score 0, disqualified."""
         token = _make_token(
             liquidity_usd=10000,  # below 15K default
             volume_24h_usd=80000, market_cap_usd=50000,
@@ -222,7 +224,7 @@ class TestHardDisqualifiers:
         )
         points, signals = score(token, _settings())
         assert points == 0
-        assert signals == []
+        assert "DISQUALIFIED_LOW_LIQUIDITY" in signals
 
     def test_liquidity_at_floor_passes(self):
         """Liquidity >= $15K -> normal scoring."""
@@ -256,15 +258,15 @@ class TestScoreVelocity:
         token = _make_token(
             volume_24h_usd=1000, liquidity_usd=20000,
             market_cap_usd=50000, holder_growth_1h=0,
-            token_age_days=2, social_mentions_24h=0,
+            token_age_days=1.0, social_mentions_24h=0,
             chain="ethereum",
         )
         # newest first: [70, 60, 50] -> reversed = [50, 60, 70] strictly increasing
         points, signals = score(token, _settings(), historical_scores=[70, 60, 50])
         assert "score_velocity" in signals
-        # raw = market_cap(8) + token_age(10) + velocity(10) = 28
-        # normalized = int(28*100/178) = 15
-        assert points == 15
+        # raw = market_cap(8) + token_age(15) + velocity(10) = 33
+        # normalized = int(33*100/183) = 18, 3 signals -> *1.15 = int(20.7) = 20
+        assert points == 20
 
     def test_velocity_no_fire_flat(self):
         """Flat scores -> no bonus."""
@@ -308,48 +310,47 @@ class TestScoreVelocity:
 
 
 class TestCoOccurrence:
-    """Test co-occurrence multiplier."""
+    """Test co-occurrence multiplier (3+ signals -> 1.15x)."""
 
-    def test_vol_liq_plus_holder_growth_bonus(self):
-        """Both vol_liq_ratio + holder_growth -> 1.2x multiplier."""
+    def test_three_signals_gets_multiplier(self):
+        """3+ signals -> 1.15x multiplier."""
         token = _make_token(
-            volume_24h_usd=120000, liquidity_usd=20000,
-            holder_growth_1h=25,
-            market_cap_usd=999999, token_age_days=30,
+            volume_24h_usd=120000, liquidity_usd=20000,  # vol_liq: +30
+            holder_growth_1h=25,                          # holder: +25
+            market_cap_usd=50000, token_age_days=1.0,     # cap: +8, age: +15
             social_mentions_24h=0, chain="ethereum",
         )
         points, signals = score(token, _settings())
-        # raw=55, normalized=int(55*100/178)=30, *1.2=int(36)=36
-        assert points == 36
-        assert "vol_liq_ratio" in signals
-        assert "holder_growth" in signals
+        assert len(signals) >= 3
+        # raw=78, normalized=int(78*100/183)=42, *1.15=int(48.3)=48
+        assert points == 48
 
-    def test_vol_liq_alone_penalty(self):
-        """vol_liq_ratio without holder_growth -> 0.8x multiplier."""
+    def test_two_signals_no_multiplier(self):
+        """2 signals -> no multiplier."""
         token = _make_token(
-            volume_24h_usd=120000, liquidity_usd=20000,
+            volume_24h_usd=120000, liquidity_usd=20000,  # vol_liq: +30
             holder_growth_1h=0,
             market_cap_usd=999999, token_age_days=30,
             social_mentions_24h=0, chain="ethereum",
         )
         points, signals = score(token, _settings())
-        # raw=30, normalized=int(30*100/178)=16, *0.8=int(12.8)=12
-        assert points == 12
-        assert "vol_liq_ratio" in signals
-        assert "holder_growth" not in signals
+        assert len(signals) == 1  # only vol_liq
+        # raw=30, normalized=int(30*100/183)=16, no multiplier
+        assert points == 16
 
-    def test_no_vol_liq_no_multiplier(self):
-        """No vol_liq_ratio -> no multiplier applied."""
+    def test_multiplier_capped_at_100(self):
+        """Multiplier cannot push score above 100."""
         token = _make_token(
-            volume_24h_usd=1000, liquidity_usd=20000,
-            holder_growth_1h=25,
-            market_cap_usd=50000, token_age_days=2,
-            social_mentions_24h=0, chain="ethereum",
+            volume_24h_usd=120000, liquidity_usd=20000,
+            market_cap_usd=50000, holder_growth_1h=25,
+            token_age_days=1.0, social_mentions_24h=60,
+            txns_h1_buys=70, txns_h1_sells=30,
+            price_change_1h=8.0, price_change_24h=12.0,
+            vol_7d_avg=10000, cg_trending_rank=5,
+            chain="solana",
         )
         points, signals = score(token, _settings())
-        # raw=25+8+10=43, normalized=int(43*100/178)=24, no multiplier
-        assert points == 24
-        assert "vol_liq_ratio" not in signals
+        assert points <= 100
 
 
 class TestEdgeCases:

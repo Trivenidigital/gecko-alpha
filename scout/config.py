@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     MAX_TOKEN_AGE_DAYS: int = 7
     MIN_LIQUIDITY_USD: float = 15_000
     MIN_VOL_LIQ_RATIO: float = 5.0
+    BUY_PRESSURE_THRESHOLD: float = 0.65
+    CO_OCCURRENCE_MIN_SIGNALS: int = 3
+    CO_OCCURRENCE_MULTIPLIER: float = 1.15
     CHAINS: list[str] = ["solana", "base", "ethereum"]
 
     # CoinGecko
