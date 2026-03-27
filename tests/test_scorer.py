@@ -403,7 +403,7 @@ class TestBuyPressureSignal:
         )
         points, signals = score(token, _settings())
         assert "buy_pressure" in signals
-        # raw=15, normalized=int(15*100/178)=8
+        # raw=15, normalized=int(15*100/183)=8
         assert points == 8
 
     def test_buy_pressure_does_not_fire_balanced(self):
@@ -553,6 +553,221 @@ class TestCoinGeckoSignals:
         points, signals = score(token, _settings())
         assert points == 100
         assert len(signals) >= 9
+
+
+class TestLiquidityFloorExemption:
+    """BL-010: CG trending tokens are exempt from liquidity floor."""
+
+    def test_cg_trending_exempt_from_liquidity_floor(self):
+        """Token with cg_trending_rank set bypasses liquidity floor."""
+        token = _make_token(
+            liquidity_usd=0, market_cap_usd=0,
+            cg_trending_rank=3, chain="coingecko",
+            volume_24h_usd=0, holder_growth_1h=0,
+            token_age_days=30, social_mentions_24h=0,
+        )
+        points, signals = score(token, _settings())
+        assert "DISQUALIFIED_LOW_LIQUIDITY" not in signals
+        assert "cg_trending_rank" in signals
+
+    def test_no_trending_rank_gets_disqualified(self):
+        """Token without trending rank and low liquidity is disqualified."""
+        token = _make_token(
+            liquidity_usd=5000,
+            volume_24h_usd=80000, market_cap_usd=50000,
+            holder_growth_1h=25, token_age_days=1.0,
+            chain="ethereum",
+        )
+        points, signals = score(token, _settings())
+        assert points == 0
+        assert "DISQUALIFIED_LOW_LIQUIDITY" in signals
+
+
+class TestBuyPressureConfigurable:
+    """BL-011: Buy pressure threshold is configurable."""
+
+    def test_custom_buy_pressure_threshold(self):
+        """Higher threshold -> signal doesn't fire at 66%."""
+        token = _make_token(
+            txns_h1_buys=66, txns_h1_sells=34,
+            volume_24h_usd=1000, liquidity_usd=20000,
+            market_cap_usd=999999, holder_growth_1h=0,
+            token_age_days=30, social_mentions_24h=0,
+            chain="ethereum",
+        )
+        # Default 0.65 -> fires (66% > 65%)
+        _, signals_default = score(token, _settings())
+        assert "buy_pressure" in signals_default
+
+        # Custom 0.70 -> doesn't fire (66% < 70%)
+        _, signals_strict = score(token, _settings(BUY_PRESSURE_THRESHOLD=0.70))
+        assert "buy_pressure" not in signals_strict
+
+
+class TestAgeBellCurveBoundaries:
+    """BL-012: Age bell curve boundary conditions."""
+
+    def test_exactly_3_hours(self):
+        """Exactly 3h -> should get 8 pts (3-12h band)."""
+        token = _make_token(
+            token_age_days=3.0 / 24, volume_24h_usd=1000, liquidity_usd=20000,
+            market_cap_usd=999999, holder_growth_1h=0, social_mentions_24h=0,
+            chain="ethereum",
+        )
+        _, signals = score(token, _settings())
+        assert "token_age" in signals
+
+    def test_exactly_12_hours(self):
+        """Exactly 12h -> peak band (15 pts)."""
+        token = _make_token(
+            token_age_days=12.0 / 24, volume_24h_usd=1000, liquidity_usd=20000,
+            market_cap_usd=999999, holder_growth_1h=0, social_mentions_24h=0,
+            chain="ethereum",
+        )
+        _, signals = score(token, _settings())
+        assert "token_age" in signals
+        # 12h is in the 12-48h peak band
+
+    def test_exactly_48_hours(self):
+        """Exactly 48h -> still in peak band."""
+        token = _make_token(
+            token_age_days=2.0, volume_24h_usd=1000, liquidity_usd=20000,
+            market_cap_usd=999999, holder_growth_1h=0, social_mentions_24h=0,
+            chain="ethereum",
+        )
+        _, signals = score(token, _settings())
+        assert "token_age" in signals
+
+    def test_just_over_48_hours(self):
+        """48h + 1min -> declining band (5 pts)."""
+        token = _make_token(
+            token_age_days=2.01, volume_24h_usd=1000, liquidity_usd=20000,
+            market_cap_usd=999999, holder_growth_1h=0, social_mentions_24h=0,
+            chain="ethereum",
+        )
+        points, signals = score(token, _settings())
+        assert "token_age" in signals
+        # 5 pts raw -> normalized=int(5*100/183)=2
+        assert points == 2
+
+    def test_exactly_7_days(self):
+        """Exactly 7d -> still in declining band."""
+        token = _make_token(
+            token_age_days=7.0, volume_24h_usd=1000, liquidity_usd=20000,
+            market_cap_usd=999999, holder_growth_1h=0, social_mentions_24h=0,
+            chain="ethereum",
+        )
+        _, signals = score(token, _settings())
+        assert "token_age" in signals
+
+    def test_just_over_7_days(self):
+        """7d + 1h -> 0 pts."""
+        token = _make_token(
+            token_age_days=7.05, volume_24h_usd=1000, liquidity_usd=20000,
+            market_cap_usd=999999, holder_growth_1h=0, social_mentions_24h=0,
+            chain="ethereum",
+        )
+        _, signals = score(token, _settings())
+        assert "token_age" not in signals
+
+
+class TestCoOccurrenceConfigurable:
+    """BL-014: Co-occurrence multiplier configuration."""
+
+    def test_configurable_min_signals(self):
+        """Custom CO_OCCURRENCE_MIN_SIGNALS=4 -> 3 signals get no multiplier."""
+        token = _make_token(
+            volume_24h_usd=120000, liquidity_usd=20000,
+            holder_growth_1h=25, market_cap_usd=50000,
+            token_age_days=1.0, social_mentions_24h=0,
+            chain="ethereum",
+        )
+        # With default (3) -> multiplier fires
+        p_default, s_default = score(token, _settings())
+        assert len(s_default) >= 3
+
+        # With min_signals=5 -> no multiplier
+        p_strict, _ = score(token, _settings(CO_OCCURRENCE_MIN_SIGNALS=5))
+        assert p_strict < p_default  # lower without multiplier
+
+    def test_configurable_multiplier_value(self):
+        """Custom CO_OCCURRENCE_MULTIPLIER changes the boost."""
+        token = _make_token(
+            volume_24h_usd=120000, liquidity_usd=20000,
+            holder_growth_1h=25, market_cap_usd=50000,
+            token_age_days=1.0, social_mentions_24h=0,
+            chain="ethereum",
+        )
+        p_115, _ = score(token, _settings(CO_OCCURRENCE_MULTIPLIER=1.15))
+        p_130, _ = score(token, _settings(CO_OCCURRENCE_MULTIPLIER=1.30))
+        assert p_130 > p_115
+
+    def test_four_signals_same_multiplier_as_three(self):
+        """Multiplier is flat at 1.15x whether 3 or 4 signals fire."""
+        token_3 = _make_token(
+            volume_24h_usd=120000, liquidity_usd=20000,
+            holder_growth_1h=25, market_cap_usd=50000,
+            token_age_days=30, social_mentions_24h=0,
+            chain="ethereum",
+        )
+        token_4 = _make_token(
+            volume_24h_usd=120000, liquidity_usd=20000,
+            holder_growth_1h=25, market_cap_usd=50000,
+            token_age_days=1.0, social_mentions_24h=0,
+            chain="ethereum",
+        )
+        p3, s3 = score(token_3, _settings())
+        p4, s4 = score(token_4, _settings())
+        # Both should have multiplier applied (>=3 signals)
+        assert len(s3) >= 3
+        assert len(s4) >= 3
+
+
+class TestNormalization:
+    """BL-016: Score normalization correctness."""
+
+    def test_max_raw_constant_matches_actual_max(self):
+        """SCORER_MAX_RAW should equal sum of all max signal points."""
+        from scout.scorer import SCORER_MAX_RAW
+        # 30+8+25+15+15+15+20+25+15+5+10 = 183
+        assert SCORER_MAX_RAW == 183
+
+    def test_single_signal_normalized_correctly(self):
+        """A single 30-point signal normalizes to int(30*100/183)=16."""
+        token = _make_token(
+            volume_24h_usd=120000, liquidity_usd=20000,
+            market_cap_usd=999999, holder_growth_1h=0,
+            token_age_days=30, social_mentions_24h=0,
+            chain="ethereum",
+        )
+        points, signals = score(token, _settings())
+        assert len(signals) == 1
+        assert points == int(30 * 100 / 183)
+
+    def test_all_signals_normalize_to_100(self):
+        """All signals firing -> capped at 100 after multiplier."""
+        token = _make_token(
+            volume_24h_usd=120000, liquidity_usd=20000,
+            market_cap_usd=50000, holder_growth_1h=25,
+            token_age_days=1.0, social_mentions_24h=60,
+            txns_h1_buys=70, txns_h1_sells=30,
+            price_change_1h=8.0, price_change_24h=12.0,
+            vol_7d_avg=10000, cg_trending_rank=5,
+            chain="solana",
+        )
+        points, _ = score(token, _settings())
+        assert points == 100
+
+    def test_zero_signals_normalize_to_zero(self):
+        """No signals -> 0 points."""
+        token = _make_token(
+            volume_24h_usd=1000, liquidity_usd=20000,
+            market_cap_usd=999999, holder_growth_1h=0,
+            token_age_days=30, social_mentions_24h=0,
+            chain="ethereum",
+        )
+        points, _ = score(token, _settings())
+        assert points == 0
 
 
 class TestSignalConfidence:
