@@ -178,6 +178,154 @@ async def get_status(db_path: str) -> dict:
     }
 
 
+@asynccontextmanager
+async def _rw_db(db_path: str):
+    """Open a read-write connection to the database."""
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        yield conn
+    finally:
+        await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Narrative rotation queries
+# ---------------------------------------------------------------------------
+
+
+async def get_narrative_heating(db_path: str, limit: int = 20) -> list[dict]:
+    """Most recent category snapshots with acceleration."""
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute(
+            """SELECT cs1.category_id, cs1.name, cs1.market_cap,
+                      cs1.market_cap_change_24h, cs1.volume_24h,
+                      cs1.market_regime, cs1.snapshot_at
+               FROM category_snapshots cs1
+               WHERE cs1.snapshot_at = (SELECT MAX(snapshot_at) FROM category_snapshots)
+               ORDER BY cs1.market_cap_change_24h DESC
+               LIMIT ?""",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def get_narrative_predictions(
+    db_path: str, limit: int = 50, outcome: str | None = None
+) -> list[dict]:
+    """Paginated predictions with optional outcome filter."""
+    async with _ro_db(db_path) as conn:
+        if outcome:
+            cursor = await conn.execute(
+                """SELECT * FROM predictions
+                   WHERE outcome_class = ?
+                   ORDER BY predicted_at DESC LIMIT ?""",
+                (outcome, limit),
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT * FROM predictions ORDER BY predicted_at DESC LIMIT ?",
+                (limit,),
+            )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def get_narrative_metrics(db_path: str) -> dict:
+    """Hit rate and true alpha metrics for narrative predictions."""
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute(
+            """SELECT
+                SUM(CASE WHEN outcome_class='HIT' AND is_control=0 THEN 1 ELSE 0 END) as agent_hits,
+                SUM(CASE WHEN is_control=0 AND outcome_class IS NOT NULL
+                     AND outcome_class != 'UNRESOLVED' THEN 1 ELSE 0 END) as agent_total,
+                SUM(CASE WHEN outcome_class='HIT' AND is_control=1 THEN 1 ELSE 0 END) as ctrl_hits,
+                SUM(CASE WHEN is_control=1 AND outcome_class IS NOT NULL
+                     AND outcome_class != 'UNRESOLVED' THEN 1 ELSE 0 END) as ctrl_total,
+                COUNT(*) as total_predictions,
+                SUM(CASE WHEN outcome_class IS NOT NULL
+                     AND outcome_class != 'UNRESOLVED' THEN 1 ELSE 0 END) as resolved
+               FROM predictions"""
+        )
+        row = await cursor.fetchone()
+        d = dict(row) if row else {}
+
+        agent_hits = d.get("agent_hits") or 0
+        agent_total = d.get("agent_total") or 0
+        ctrl_hits = d.get("ctrl_hits") or 0
+        ctrl_total = d.get("ctrl_total") or 0
+        total_predictions = d.get("total_predictions") or 0
+        resolved = d.get("resolved") or 0
+
+        agent_rate = round((agent_hits / agent_total * 100) if agent_total > 0 else 0, 1)
+        ctrl_rate = round((ctrl_hits / ctrl_total * 100) if ctrl_total > 0 else 0, 1)
+        true_alpha = round(agent_rate - ctrl_rate, 1)
+
+    return {
+        "agent_hit_rate": agent_rate,
+        "ctrl_hit_rate": ctrl_rate,
+        "true_alpha": true_alpha,
+        "total_predictions": total_predictions,
+        "active_predictions": total_predictions - resolved,
+    }
+
+
+async def get_narrative_strategy(db_path: str) -> list[dict]:
+    """All rows from agent_strategy table."""
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute("SELECT * FROM agent_strategy ORDER BY key")
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def update_narrative_strategy(db_path: str, key: str, value: str) -> dict | None:
+    """Update a strategy row: set value, locked=1, updated_by='manual'."""
+    async with _rw_db(db_path) as conn:
+        now = datetime.now(timezone.utc).isoformat()
+        await conn.execute(
+            """UPDATE agent_strategy
+               SET value = ?, locked = 1, updated_by = 'manual', updated_at = ?
+               WHERE key = ?""",
+            (value, now, key),
+        )
+        await conn.commit()
+        cursor = await conn.execute(
+            "SELECT * FROM agent_strategy WHERE key = ?", (key,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_narrative_learn_logs(db_path: str, limit: int = 20) -> list[dict]:
+    """Recent learn_logs entries."""
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute(
+            "SELECT * FROM learn_logs ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def get_narrative_category_history(
+    db_path: str, category_id: str, hours: int = 48
+) -> list[dict]:
+    """Timeline data for a specific category."""
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute(
+            """SELECT category_id, name, market_cap, market_cap_change_24h,
+                      volume_24h, market_regime, snapshot_at
+               FROM category_snapshots
+               WHERE category_id = ?
+                 AND snapshot_at >= datetime('now', ?)
+               ORDER BY snapshot_at ASC""",
+            (category_id, f"-{hours} hours"),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
 async def get_funnel(db_path: str) -> dict:
     """Pipeline funnel counts derived from current DB state."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")

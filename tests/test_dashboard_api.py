@@ -22,6 +22,46 @@ async def seeded_db(tmp_path):
     db_path = str(tmp_path / "test_dashboard.db")
     async with aiosqlite.connect(db_path) as db:
         await db.executescript("""
+            CREATE TABLE category_snapshots (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id   TEXT NOT NULL,
+                name          TEXT NOT NULL,
+                market_cap    REAL,
+                market_cap_change_24h REAL,
+                volume_24h    REAL,
+                market_regime TEXT,
+                snapshot_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE predictions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol          TEXT,
+                category_id     TEXT,
+                fit_score       REAL,
+                confidence      REAL,
+                price_change_6h REAL,
+                price_change_24h REAL,
+                price_change_48h REAL,
+                peak_change_pct REAL,
+                outcome_class   TEXT,
+                is_control      INTEGER DEFAULT 0,
+                predicted_at    TEXT NOT NULL
+            );
+
+            CREATE TABLE agent_strategy (
+                key         TEXT PRIMARY KEY,
+                value       TEXT NOT NULL,
+                locked      INTEGER DEFAULT 0,
+                updated_by  TEXT,
+                updated_at  TEXT
+            );
+
+            CREATE TABLE learn_logs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                message     TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );
+
             CREATE TABLE candidates (
                 contract_address TEXT PRIMARY KEY,
                 chain            TEXT NOT NULL,
@@ -113,6 +153,58 @@ async def seeded_db(tmp_path):
             ("0xhigh", now),
         )
 
+        # Seed category snapshots
+        await db.execute(
+            """INSERT INTO category_snapshots
+            (category_id, name, market_cap, market_cap_change_24h, volume_24h, market_regime, snapshot_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("ai", "AI & Big Data", 5e9, 12.5, 8e8, "HEATING", now),
+        )
+        await db.execute(
+            """INSERT INTO category_snapshots
+            (category_id, name, market_cap, market_cap_change_24h, volume_24h, market_regime, snapshot_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("defi", "DeFi", 20e9, -3.2, 2e9, "COOLING", now),
+        )
+
+        # Seed predictions
+        await db.execute(
+            """INSERT INTO predictions
+            (symbol, category_id, fit_score, confidence, price_change_6h, price_change_24h,
+             price_change_48h, peak_change_pct, outcome_class, is_control, predicted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("AGIXT", "ai", 82, 75, 5.2, 12.1, 18.3, 22.5, "HIT", 0, now),
+        )
+        await db.execute(
+            """INSERT INTO predictions
+            (symbol, category_id, fit_score, confidence, price_change_6h, price_change_24h,
+             price_change_48h, peak_change_pct, outcome_class, is_control, predicted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("CTRLTOKEN", "ai", 60, 50, -1.0, -5.0, -8.0, 2.0, "MISS", 1, now),
+        )
+        await db.execute(
+            """INSERT INTO predictions
+            (symbol, category_id, fit_score, confidence, outcome_class, is_control, predicted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("PENDING", "defi", 70, 65, None, 0, now),
+        )
+
+        # Seed agent_strategy
+        await db.execute(
+            "INSERT INTO agent_strategy (key, value, locked, updated_by) VALUES (?, ?, ?, ?)",
+            ("top_n", "5", 0, "agent"),
+        )
+        await db.execute(
+            "INSERT INTO agent_strategy (key, value, locked, updated_by) VALUES (?, ?, ?, ?)",
+            ("lookback_hours", "48", 0, "agent"),
+        )
+
+        # Seed learn_logs
+        await db.execute(
+            "INSERT INTO learn_logs (message, created_at) VALUES (?, ?)",
+            ("Learned that AI category outperforms in bull markets", now),
+        )
+
         await db.commit()
 
     return db_path
@@ -124,6 +216,42 @@ async def empty_db(tmp_path):
     db_path = str(tmp_path / "empty_dashboard.db")
     async with aiosqlite.connect(db_path) as db:
         await db.executescript("""
+            CREATE TABLE category_snapshots (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id   TEXT NOT NULL,
+                name          TEXT NOT NULL,
+                market_cap    REAL,
+                market_cap_change_24h REAL,
+                volume_24h    REAL,
+                market_regime TEXT,
+                snapshot_at   TEXT NOT NULL
+            );
+            CREATE TABLE predictions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol          TEXT,
+                category_id     TEXT,
+                fit_score       REAL,
+                confidence      REAL,
+                price_change_6h REAL,
+                price_change_24h REAL,
+                price_change_48h REAL,
+                peak_change_pct REAL,
+                outcome_class   TEXT,
+                is_control      INTEGER DEFAULT 0,
+                predicted_at    TEXT NOT NULL
+            );
+            CREATE TABLE agent_strategy (
+                key         TEXT PRIMARY KEY,
+                value       TEXT NOT NULL,
+                locked      INTEGER DEFAULT 0,
+                updated_by  TEXT,
+                updated_at  TEXT
+            );
+            CREATE TABLE learn_logs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                message     TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );
             CREATE TABLE candidates (
                 contract_address TEXT PRIMARY KEY,
                 chain TEXT NOT NULL, token_name TEXT NOT NULL, ticker TEXT NOT NULL,
@@ -299,3 +427,164 @@ class TestFunnel:
         assert resp.status_code == 200
         data = resp.json()
         assert data["alerted"] == 0
+
+
+# ---------------------------------------------------------------------------
+# GET /api/narrative/heating
+# ---------------------------------------------------------------------------
+
+class TestNarrativeHeating:
+
+    async def test_returns_heating_categories(self, client):
+        resp = await client.get("/api/narrative/heating")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 2
+        # Ordered by market_cap_change_24h DESC
+        assert data[0]["category_id"] == "ai"
+        assert data[0]["market_cap_change_24h"] == 12.5
+
+    async def test_empty_db_returns_empty(self, empty_client):
+        resp = await empty_client.get("/api/narrative/heating")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+
+# ---------------------------------------------------------------------------
+# GET /api/narrative/predictions
+# ---------------------------------------------------------------------------
+
+class TestNarrativePredictions:
+
+    async def test_returns_predictions(self, client):
+        resp = await client.get("/api/narrative/predictions")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 3
+
+    async def test_filter_by_outcome(self, client):
+        resp = await client.get("/api/narrative/predictions?outcome=HIT")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["symbol"] == "AGIXT"
+
+    async def test_limit_param(self, client):
+        resp = await client.get("/api/narrative/predictions?limit=1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+
+    async def test_empty_db_returns_empty(self, empty_client):
+        resp = await empty_client.get("/api/narrative/predictions")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+
+# ---------------------------------------------------------------------------
+# GET /api/narrative/metrics
+# ---------------------------------------------------------------------------
+
+class TestNarrativeMetrics:
+
+    async def test_returns_metrics(self, client):
+        resp = await client.get("/api/narrative/metrics")
+        assert resp.status_code == 200
+        data = resp.json()
+        # 1 agent HIT out of 1 resolved agent prediction = 100%
+        assert data["agent_hit_rate"] == 100.0
+        # 0 ctrl HITs out of 1 resolved ctrl prediction = 0%
+        assert data["ctrl_hit_rate"] == 0.0
+        assert data["true_alpha"] == 100.0
+        assert data["total_predictions"] == 3
+        # 1 unresolved (PENDING has outcome_class=None)
+        assert data["active_predictions"] == 1
+
+    async def test_empty_db_returns_zeros(self, empty_client):
+        resp = await empty_client.get("/api/narrative/metrics")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["agent_hit_rate"] == 0
+        assert data["true_alpha"] == 0
+        assert data["total_predictions"] == 0
+
+
+# ---------------------------------------------------------------------------
+# GET /api/narrative/strategy + PUT
+# ---------------------------------------------------------------------------
+
+class TestNarrativeStrategy:
+
+    async def test_returns_strategy_rows(self, client):
+        resp = await client.get("/api/narrative/strategy")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 2
+        keys = [r["key"] for r in data]
+        assert "top_n" in keys
+
+    async def test_update_strategy(self, client):
+        resp = await client.put(
+            "/api/narrative/strategy/top_n",
+            json={"value": "10"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["value"] == "10"
+        assert data["locked"] == 1
+        assert data["updated_by"] == "manual"
+
+    async def test_update_nonexistent_key_returns_404(self, client):
+        resp = await client.put(
+            "/api/narrative/strategy/nonexistent",
+            json={"value": "x"},
+        )
+        assert resp.status_code == 404
+
+    async def test_empty_db_returns_empty(self, empty_client):
+        resp = await empty_client.get("/api/narrative/strategy")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+
+# ---------------------------------------------------------------------------
+# GET /api/narrative/learn-logs
+# ---------------------------------------------------------------------------
+
+class TestNarrativeLearnLogs:
+
+    async def test_returns_learn_logs(self, client):
+        resp = await client.get("/api/narrative/learn-logs")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert "AI category" in data[0]["message"]
+
+    async def test_empty_db_returns_empty(self, empty_client):
+        resp = await empty_client.get("/api/narrative/learn-logs")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+
+# ---------------------------------------------------------------------------
+# GET /api/narrative/categories/history
+# ---------------------------------------------------------------------------
+
+class TestNarrativeCategoryHistory:
+
+    async def test_returns_history(self, client):
+        resp = await client.get("/api/narrative/categories/history?category_id=ai")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["category_id"] == "ai"
+
+    async def test_unknown_category_returns_empty(self, client):
+        resp = await client.get("/api/narrative/categories/history?category_id=unknown")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    async def test_empty_db_returns_empty(self, empty_client):
+        resp = await empty_client.get("/api/narrative/categories/history?category_id=ai")
+        assert resp.status_code == 200
+        assert resp.json() == []

@@ -4,6 +4,7 @@ import PipelineFunnel from './components/PipelineFunnel.jsx'
 import CandidatesTable from './components/CandidatesTable.jsx'
 import SignalHitRate from './components/SignalHitRate.jsx'
 import AlertFeed from './components/AlertFeed.jsx'
+import NarrativeTab from './components/NarrativeTab.jsx'
 
 const DEFAULT_STATUS = {
   pipeline_status: 'connecting',
@@ -26,6 +27,7 @@ export default function App() {
   const [funnel, setFunnel] = useState(DEFAULT_FUNNEL)
   const [signals, setSignals] = useState([])
   const [alerts, setAlerts] = useState([])
+  const [activeTab, setActiveTab] = useState('pipeline')
   const [connected, setConnected] = useState(false)
   const wsRef = useRef(null)
   const reconnectTimer = useRef(null)
@@ -111,16 +113,37 @@ export default function App() {
         </div>
       </div>
 
-      <StatBar status={status} />
-      <PipelineFunnel funnel={funnel} />
-
-      <div className="main-grid">
-        <CandidatesTable candidates={candidates} />
-        <div className="right-panels">
-          <SignalHitRate signals={signals} />
-          <AlertFeed alerts={alerts} />
-        </div>
+      <div className="tab-bar">
+        <button
+          className={`tab-btn ${activeTab === 'pipeline' ? 'active' : ''}`}
+          onClick={() => setActiveTab('pipeline')}
+        >
+          Pipeline
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'narrative' ? 'active' : ''}`}
+          onClick={() => setActiveTab('narrative')}
+        >
+          Narrative Rotation
+        </button>
       </div>
+
+      {activeTab === 'pipeline' && (
+        <>
+          <StatBar status={status} />
+          <PipelineFunnel funnel={funnel} />
+
+          <div className="main-grid">
+            <CandidatesTable candidates={candidates} />
+            <div className="right-panels">
+              <SignalHitRate signals={signals} />
+              <AlertFeed alerts={alerts} />
+            </div>
+          </div>
+        </>
+      )}
+
+      {activeTab === 'narrative' && <NarrativeTab />}
     </div>
   )
 }

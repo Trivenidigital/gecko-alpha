@@ -56,6 +56,17 @@ class Settings(BaseSettings):
     # Anthropic fallback
     ANTHROPIC_API_KEY: str
 
+    # Narrative Rotation Agent
+    NARRATIVE_POLL_INTERVAL: int = 1800
+    NARRATIVE_EVAL_INTERVAL: int = 21600
+    NARRATIVE_DIGEST_HOUR_UTC: int = 0
+    NARRATIVE_LEARN_HOUR_UTC: int = 1
+    NARRATIVE_WEEKLY_LEARN_DAY: int = 6
+    NARRATIVE_ENABLED: bool = False
+    NARRATIVE_SNAPSHOT_RETENTION_DAYS: int = 7
+    NARRATIVE_SCORING_MODEL: str = "claude-haiku-4-5"
+    NARRATIVE_LEARN_MODEL: str = "claude-sonnet-4-6"
+
     @field_validator("CHAINS", mode="before")
     @classmethod
     def parse_chains(cls, v: str | list[str]) -> list[str]:

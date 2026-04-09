@@ -2,35 +2,66 @@
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Write(*.py)",
-        "command": "uv run python -m py_compile $file"
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo $CLAUDE_FILE_PATH | grep -q '\\.py$' && uv run python -m py_compile $CLAUDE_FILE_PATH"
+          },
+          {
+            "type": "command",
+            "command": "echo $CLAUDE_FILE_PATH | grep -q '\\.py$' && uv run black --check --quiet $CLAUDE_FILE_PATH"
+          }
+        ]
       },
       {
-        "matcher": "Write(*.py)",
-        "command": "uv run black --check --quiet $file"
-      },
-      {
-        "matcher": "Write(tests/*.py)",
-        "command": "uv run pytest $file --tb=short -q"
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo $CLAUDE_FILE_PATH | grep -q '^tests/.*\\.py$' && uv run pytest $CLAUDE_FILE_PATH --tb=short -q"
+          }
+        ]
       }
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash(*rm -rf*)",
-        "exitCode": 2
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"$CLAUDE_TOOL_INPUT\" | grep -q 'rm -rf' && exit 2 || exit 0"
+          }
+        ]
       },
       {
-        "matcher": "Bash(*git push --force*)",
-        "exitCode": 2
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"$CLAUDE_TOOL_INPUT\" | grep -q 'git push --force' && exit 2 || exit 0"
+          }
+        ]
       },
       {
-        "matcher": "Write(.env)",
-        "exitCode": 2
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"$CLAUDE_FILE_PATH\" | grep -q '^\\.env$' && exit 2 || exit 0"
+          }
+        ]
       }
     ],
     "Stop": [
       {
-        "command": "uv run pytest --tb=short -q 2>&1 | tail -5"
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run pytest --tb=short -q 2>&1 | tail -5"
+          }
+        ]
       }
     ]
   }

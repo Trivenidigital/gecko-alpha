@@ -239,6 +239,53 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Why:** Production observability. Export scan rates, alert rates, MiroFish latency as metrics.
 
 ### BL-044: VPS deployment with systemd service
-**Status:** Not started
+**Status:** DONE — deployed to Srilu VPS (89.167.116.187)
 **Why:** Production deployment. Run scanner as a persistent service with auto-restart.
-**Depends on:** All P0 items complete, at least one successful live dry-run
+**Services:** `gecko-pipeline.service`, `gecko-dashboard.service` (systemd, enabled on boot)
+**Dashboard:** http://89.167.116.187:8000
+
+---
+
+## Early Detection Roadmap — Phased Approach
+
+**Goal:** Detect tokens that will appear on [CoinGecko Highlights](https://www.coingecko.com/en/highlights) (Trending Coins + Top Gainers) 1-2 hours before they appear, for manual research and informed buy decisions.
+
+**Architecture:** Parallel early detection layer running alongside existing pipeline in shadow mode. Logs predictions with timestamps, compares against CoinGecko trending snapshots. Existing pipeline unchanged.
+
+**Success metrics:** Hit rate (% of flagged tokens that appeared on Highlights), average lead time (minutes before CoinGecko), misses (tokens that trended without our flag).
+
+### Phase 1: LunarCrush Social Velocity ($24/mo) — CURRENT
+**Status:** In design
+**Rationale:** Social mention velocity is the #1 input to CoinGecko's trending algorithm. LunarCrush aggregates Twitter + Reddit + Telegram into a single API. Cheapest way to validate the thesis.
+**Modules:**
+- `scout/early/lunarcrush.py` — API client, fetch Galaxy Score + social volume
+- `scout/early/tracker.py` — Spike detection, comparison vs CoinGecko trending
+- `scout/early/models.py` — EarlySignal, TrendingSnapshot models
+- DB tables: `early_signals`, `trending_snapshots`
+- Dashboard: "Early Detection" tab with live signals, hit rate, lead time
+**Config:** `LUNARCRUSH_API_KEY`, `LUNARCRUSH_POLL_INTERVAL=300`, `SOCIAL_VOLUME_SPIKE_RATIO=2.0`, `GALAXY_SCORE_JUMP_THRESHOLD=10`
+**Validation:** After 2-4 weeks of shadow data, measure hit rate + lead time. If >50% hit rate with >30 min avg lead time, thesis is validated.
+
+### Phase 2: Santiment Cross-Validation ($49/mo)
+**Status:** Future — contingent on Phase 1 validation
+**Rationale:** Second independent social signal source. Santiment's "emerging trends" and social volume divergence metric provides cross-validation against LunarCrush. Reduces false positives.
+**Integration:** GraphQL API via `sanpy` Python client. Add as second signal source in `scout/early/`. Boost confidence when both LunarCrush AND Santiment flag the same token.
+**Trigger:** Proceed if Phase 1 hit rate is promising but false positive rate is >40%.
+
+### Phase 3: Nansen Smart Money ($49/mo + API credits)
+**Status:** Future — strongest signal but most expensive
+**Rationale:** Smart money (whale/fund wallets) accumulating a token typically precedes social buzz by hours. This catches a different phase of the pump lifecycle — accumulation before attention.
+**Integration:** REST API. Track labeled wallet inflows for tokens in our candidate pool. When smart money + social spike align, highest confidence signal.
+**Trigger:** Proceed if Phases 1-2 show social signals alone miss tokens that pump from whale accumulation without initial social buzz.
+
+### Alternative Sources (if LunarCrush doesn't validate)
+- **Dune Analytics** — Custom SQL queries on on-chain social/volume data
+- **Defined.fi** — Real-time new pair discovery across 40+ chains (free tier)
+- **Birdeye** — Solana-specific trending (free-$49/mo)
+- **CoinGecko unused endpoints** — `watchlist_portfolio_users` spikes, category momentum, `is_anomaly` flags (free, but may be circular)
+- **CoinMarketCap** — Cross-reference trending from different algorithm (free 333 req/day)
+
+### Reviewer Notes (preserved for context)
+> The lead time numbers from social APIs mean "before CoinGecko page updates", not "before price moves." For automated trading this is insufficient edge. However, for manual research (our use case), even minutes of lead time is valuable for investigating WHY a token is gaining attention before the retail crowd sees it on Highlights.
+>
+> If pivoting to automated trading in the future, the architecture changes significantly: need execution engine, risk management, MEV awareness, and sub-second latency. That is a separate project.
