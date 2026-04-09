@@ -372,7 +372,11 @@ async def narrative_agent_loop(
                     prediction_rows: list[dict] = []
                     prediction_models: list[NarrativePrediction] = []
 
+                    consecutive_failures = 0
                     for token in scored_laggards:
+                        if consecutive_failures >= 3:
+                            logger.warning("narrative_scoring_3_failures", category=accel.category_id)
+                            break
                         result = await score_token(
                             token=token,
                             accel=accel,
@@ -383,7 +387,9 @@ async def narrative_agent_loop(
                             model=settings.NARRATIVE_SCORING_MODEL,
                         )
                         if result is None:
+                            consecutive_failures += 1
                             continue
+                        consecutive_failures = 0  # reset on success
 
                         pred_row = {
                             "category_id": accel.category_id,

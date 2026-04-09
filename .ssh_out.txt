@@ -1,0 +1,15 @@
+● gecko-pipeline.service - Gecko Alpha Pipeline
+     Loaded: loaded (/etc/systemd/system/gecko-pipeline.service; enabled; preset: enabled)
+     Active: active (running) since Thu 2026-04-09 02:55:17 UTC; 3s ago
+   Main PID: 382657 (uv)
+      Tasks: 8 (limit: 4531)
+     Memory: 56.2M (peak: 56.5M)
+        CPU: 604ms
+     CGroup: /system.slice/gecko-pipeline.service
+             ├─382657 /root/.local/bin/uv run python -m scout.main
+             └─382661 /root/gecko-alpha/.venv/bin/python3 -m scout.main
+
+Apr 09 02:55:17 ubuntu-4gb-hel1-1 systemd[1]: Started gecko-pipeline.service - Gecko Alpha Pipeline.
+Apr 09 02:55:17 ubuntu-4gb-hel1-1 uv[382661]: {"endpoint": "coins/markets", "event": "cg_fetch_attempted", "timestamp": "2026-04-09T02:55:17.630338Z", "level": "info"}
+Apr 09 02:55:17 ubuntu-4gb-hel1-1 uv[382661]: {"count": 15, "source": "search/trending", "event": "cg_candidates_fetched", "timestamp": "2026-04-09T02:55:17.713337Z", "level": "info"}
+Apr 09 02:55:17 ubuntu-4gb-hel1-1 uv[382661]: {"chain": "ethereum", "status": 404, "event": "GeckoTerminal returned error", "timestamp": "2026-04-09T02:55:17.783495Z", "level": "warning"}

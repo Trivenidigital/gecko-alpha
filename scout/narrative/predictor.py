@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import re
@@ -55,7 +56,9 @@ async def fetch_laggards(
                 )
                 return []
             data = await resp.json()
-            return data if isinstance(data, list) else []
+            result = data if isinstance(data, list) else []
+            await asyncio.sleep(1)  # rate-limit: space out CoinGecko calls
+            return result
     except Exception:
         log.exception("fetch_laggards_exception", category_id=category_id)
         return []

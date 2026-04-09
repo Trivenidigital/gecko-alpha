@@ -171,6 +171,10 @@ async def evaluate_pending(
 
         current_price = prices.get(coin_id)
 
+        # --- Guard against division by zero ---
+        if price_at_pred <= 0:
+            continue
+
         # --- Price unavailable handling ---
         if current_price is None:
             retry_count += 1

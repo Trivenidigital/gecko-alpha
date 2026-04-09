@@ -264,3 +264,66 @@ async def test_store_predictions(db: Database):
     # Verify JSON serialization
     assert json.loads(row[2]) == {"key": "value"}
     assert json.loads(row[3]) == {"ab_key": "ab_value"}
+
+
+# ------------------------------------------------------------------
+# score_token
+# ------------------------------------------------------------------
+
+
+async def test_score_token_success():
+    """Test score_token with mocked Anthropic client."""
+    from unittest.mock import MagicMock
+    from scout.narrative.predictor import score_token
+    from scout.narrative.models import LaggardToken, CategoryAcceleration
+
+    token = LaggardToken(
+        coin_id="test", symbol="TST", name="Test Token",
+        market_cap=50e6, price=1.0, price_change_24h=2.0,
+        volume_24h=500_000, category_id="ai", category_name="AI",
+    )
+    accel = CategoryAcceleration(
+        category_id="ai", name="AI", current_velocity=12.0,
+        previous_velocity=5.0, acceleration=7.0, volume_24h=2e9,
+        volume_growth_pct=15.0, coin_count_change=-2, is_heating=True,
+    )
+
+    mock_client = MagicMock()
+    mock_message = MagicMock()
+    mock_message.content = [MagicMock(text='{"narrative_fit": 75, "staying_power": "High", "confidence": "Medium", "reasoning": "Strong fit"}')]
+    mock_client.messages.create = MagicMock(return_value=mock_message)
+
+    result = await score_token(
+        token, accel, "BULL", "fetch-ai, render", "",
+        "fake-key", "claude-haiku-4-5", client=mock_client,
+    )
+    assert result is not None
+    assert result["narrative_fit"] == 75
+    assert result["confidence"] == "Medium"
+
+
+async def test_score_token_api_failure():
+    """Test score_token returns None on API error."""
+    from unittest.mock import MagicMock
+    from scout.narrative.predictor import score_token
+    from scout.narrative.models import LaggardToken, CategoryAcceleration
+
+    token = LaggardToken(
+        coin_id="test", symbol="TST", name="Test",
+        market_cap=50e6, price=1.0, price_change_24h=2.0,
+        volume_24h=500_000, category_id="ai", category_name="AI",
+    )
+    accel = CategoryAcceleration(
+        category_id="ai", name="AI", current_velocity=12.0,
+        previous_velocity=5.0, acceleration=7.0, volume_24h=2e9,
+        volume_growth_pct=15.0, coin_count_change=0, is_heating=True,
+    )
+
+    mock_client = MagicMock()
+    mock_client.messages.create = MagicMock(side_effect=Exception("API error"))
+
+    result = await score_token(
+        token, accel, "BULL", "fetch-ai", "",
+        "fake-key", "claude-haiku-4-5", client=mock_client,
+    )
+    assert result is None

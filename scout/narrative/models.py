@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class CategorySnapshot(BaseModel):
@@ -76,7 +76,13 @@ class NarrativePrediction(BaseModel):
     peak_at: datetime | None = None
     outcome_class: str | None = None
     outcome_reason: str | None = None
+    eval_retry_count: int = 0
     evaluated_at: datetime | None = None
+
+    @field_validator("narrative_fit_score")
+    @classmethod
+    def clamp_score(cls, v: int) -> int:
+        return max(0, min(100, v))
 
 
 class NarrativeSignal(BaseModel):

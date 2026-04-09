@@ -80,11 +80,52 @@ def create_app(db_path: str | None = None) -> FastAPI:
     class StrategyUpdate(BaseModel):
         value: str
 
+    STRATEGY_BOUNDS = {
+        "category_accel_threshold": (2.0, 15.0),
+        "category_volume_growth_min": (5.0, 50.0),
+        "laggard_max_mcap": (50_000_000, 1_000_000_000),
+        "laggard_max_change": (5.0, 30.0),
+        "laggard_min_change": (-50.0, 0.0),
+        "laggard_min_volume": (10_000, 1_000_000),
+        "hit_threshold_pct": (5.0, 50.0),
+        "miss_threshold_pct": (-30.0, -5.0),
+        "max_picks_per_category": (3, 10),
+        "max_heating_per_cycle": (1, 10),
+        "signal_cooldown_hours": (1, 12),
+        "min_learn_sample": (50, 500),
+        "min_trigger_count": (1, 10),
+    }
+
     @app.put("/api/narrative/strategy/{key}")
     async def update_narrative_strategy(key: str, body: StrategyUpdate):
+        from fastapi.responses import JSONResponse
+
+        # Check if key is locked
+        strategy_rows = await db.get_narrative_strategy(_db_path)
+        row_map = {r["key"]: r for r in strategy_rows}
+        if key not in row_map:
+            return JSONResponse(status_code=404, content={"detail": f"Key '{key}' not found"})
+        if row_map[key].get("locked"):
+            return JSONResponse(status_code=403, content={"detail": f"Key '{key}' is locked"})
+
+        # Bounds validation
+        if key in STRATEGY_BOUNDS:
+            lo, hi = STRATEGY_BOUNDS[key]
+            try:
+                numeric_val = float(body.value)
+            except (ValueError, TypeError):
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Value for '{key}' must be numeric"},
+                )
+            if numeric_val < lo or numeric_val > hi:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"Value for '{key}' must be between {lo} and {hi}"},
+                )
+
         result = await db.update_narrative_strategy(_db_path, key, body.value)
         if result is None:
-            from fastapi.responses import JSONResponse
             return JSONResponse(status_code=404, content={"detail": f"Key '{key}' not found"})
         return result
 

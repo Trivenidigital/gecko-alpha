@@ -38,7 +38,9 @@ async def fetch_categories(
                     logger.error("coingecko_categories_error", status=resp.status)
                     return []
                 data = await resp.json()
-                return data if isinstance(data, list) else []
+                result = data if isinstance(data, list) else []
+                await asyncio.sleep(1)  # rate-limit: space out CoinGecko calls
+                return result
         except Exception:
             logger.exception("coingecko_categories_exception", attempt=attempt)
             return []

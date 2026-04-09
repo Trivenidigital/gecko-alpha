@@ -141,11 +141,11 @@ export default function NarrativeTab() {
                     <tr key={p.id || i}>
                       <td style={{ fontWeight: 600 }}>{p.symbol || '-'}</td>
                       <td>{p.category_id || '-'}</td>
-                      <td>{p.fit_score != null ? Number(p.fit_score).toFixed(0) : '-'}</td>
+                      <td>{p.narrative_fit_score != null ? Number(p.narrative_fit_score).toFixed(0) : '-'}</td>
                       <td>{p.confidence != null ? Number(p.confidence).toFixed(0) : '-'}</td>
-                      <td>{fmtPct(p.price_change_6h)}</td>
-                      <td>{fmtPct(p.price_change_24h)}</td>
-                      <td>{fmtPct(p.price_change_48h)}</td>
+                      <td>{fmtPct(p.outcome_6h_change_pct)}</td>
+                      <td>{fmtPct(p.outcome_24h_change_pct)}</td>
+                      <td>{fmtPct(p.outcome_48h_change_pct)}</td>
                       <td>
                         <span className={`outcome-badge ${outcomeClass(p.outcome_class)}`}>
                           {p.outcome_class || 'PENDING'}
