@@ -4,8 +4,9 @@ import asyncio
 import json
 import os
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from dashboard import db
 from dashboard.models import (
@@ -54,6 +55,51 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/win-rate", response_model=WinRateResponse)
     async def get_win_rate():
         return await db.get_win_rate(_db_path)
+
+    # --- Narrative rotation endpoints ---
+
+    @app.get("/api/narrative/heating")
+    async def get_narrative_heating():
+        return await db.get_narrative_heating(_db_path)
+
+    @app.get("/api/narrative/predictions")
+    async def get_narrative_predictions(
+        limit: int = Query(50, ge=1, le=500),
+        outcome: str | None = Query(None),
+    ):
+        return await db.get_narrative_predictions(_db_path, limit=limit, outcome=outcome)
+
+    @app.get("/api/narrative/metrics")
+    async def get_narrative_metrics():
+        return await db.get_narrative_metrics(_db_path)
+
+    @app.get("/api/narrative/strategy")
+    async def get_narrative_strategy():
+        return await db.get_narrative_strategy(_db_path)
+
+    class StrategyUpdate(BaseModel):
+        value: str
+
+    @app.put("/api/narrative/strategy/{key}")
+    async def update_narrative_strategy(key: str, body: StrategyUpdate):
+        result = await db.update_narrative_strategy(_db_path, key, body.value)
+        if result is None:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=404, content={"detail": f"Key '{key}' not found"})
+        return result
+
+    @app.get("/api/narrative/learn-logs")
+    async def get_narrative_learn_logs(limit: int = Query(20, ge=1, le=200)):
+        return await db.get_narrative_learn_logs(_db_path, limit=limit)
+
+    @app.get("/api/narrative/categories/history")
+    async def get_narrative_category_history(
+        category_id: str = Query(...),
+        hours: int = Query(48, ge=1, le=720),
+    ):
+        return await db.get_narrative_category_history(
+            _db_path, category_id=category_id, hours=hours
+        )
 
     @app.get("/health")
     async def health_check():
