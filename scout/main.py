@@ -240,9 +240,10 @@ async def run_cycle(
 
         # Counter-score follow-up (async, non-blocking)
         if settings.COUNTER_ENABLED:
-            asyncio.create_task(
+            task = asyncio.create_task(
                 _safe_counter_followup(gated_token, session, settings)
             )
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
     return stats
 
@@ -481,7 +482,7 @@ async def narrative_agent_loop(
                                 commits_4w=cdata["commits_4w"],
                                 reddit_subs=cdata["reddit_subscribers"],
                                 sentiment_up_pct=cdata["sentiment_up_pct"],
-                                narrative_fit_score=result.get("narrative_fit", result.get("narrative_fit_score", 50)),
+                                narrative_fit_score=result.get("narrative_fit", 50),
                                 token_vol_change_24h=0.0,
                                 category_vol_growth_pct=accel.volume_growth_pct,
                             )
@@ -493,7 +494,7 @@ async def narrative_agent_loop(
                                 price_change_24h=token.price_change_24h,
                                 category_name=accel.name,
                                 acceleration=accel.acceleration,
-                                narrative_fit_score=result.get("narrative_fit", result.get("narrative_fit_score", 50)),
+                                narrative_fit_score=result.get("narrative_fit", 50),
                                 flags=narrative_flags,
                                 data_completeness=data_comp,
                                 api_key=settings.ANTHROPIC_API_KEY,

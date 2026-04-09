@@ -93,6 +93,40 @@ class TestNarrativeMismatch:
         assert f.severity == "medium"
 
 
+def test_overvalued_vs_leaders_medium():
+    flags = compute_narrative_flags(
+        price_change_30d=10.0, commits_4w=50, reddit_subs=5000,
+        sentiment_up_pct=60.0, narrative_fit_score=75,
+        token_vol_change_24h=10.0, category_vol_growth_pct=15.0,
+        market_cap=60e6, category_leader_mcap=100e6,
+    )
+    over = [f for f in flags if f.flag == "overvalued_vs_leaders"]
+    assert len(over) == 1
+    assert over[0].severity == "medium"
+
+
+def test_overvalued_not_triggered():
+    flags = compute_narrative_flags(
+        price_change_30d=10.0, commits_4w=50, reddit_subs=5000,
+        sentiment_up_pct=60.0, narrative_fit_score=75,
+        token_vol_change_24h=10.0, category_vol_growth_pct=15.0,
+        market_cap=20e6, category_leader_mcap=100e6,
+    )
+    over = [f for f in flags if f.flag == "overvalued_vs_leaders"]
+    assert len(over) == 0
+
+
+def test_volume_divergence_exact_boundary_no_trigger():
+    """Exact -10 and +10 should NOT trigger (needs strictly < and >)."""
+    flags = compute_narrative_flags(
+        price_change_30d=10.0, commits_4w=50, reddit_subs=5000,
+        sentiment_up_pct=60.0, narrative_fit_score=75,
+        token_vol_change_24h=-10.0, category_vol_growth_pct=10.0,
+    )
+    div = [f for f in flags if f.flag == "volume_divergence"]
+    assert len(div) == 0
+
+
 def test_clean_token_no_flags():
     flags = compute_narrative_flags(
         price_change_30d=20,

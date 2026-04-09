@@ -13,6 +13,8 @@ def compute_narrative_flags(
     narrative_fit_score: float,
     token_vol_change_24h: float,
     category_vol_growth_pct: float,
+    market_cap: float = 0.0,
+    category_leader_mcap: float = 0.0,
 ) -> list[RedFlag]:
     """Compute deterministic red flags for narrative-driven tokens.
 
@@ -24,6 +26,8 @@ def compute_narrative_flags(
         narrative_fit_score: How well the token fits its narrative (0-100).
         token_vol_change_24h: Token volume change in last 24h (percentage).
         category_vol_growth_pct: Category volume growth (percentage).
+        market_cap: Token market cap in USD (default 0.0).
+        category_leader_mcap: Market cap of the category leader in USD (default 0.0).
 
     Returns:
         List of RedFlag instances for every triggered condition.
@@ -114,6 +118,17 @@ def compute_narrative_flags(
                 ),
             )
         )
+
+    # overvalued_vs_leaders
+    if category_leader_mcap > 0 and market_cap > 0:
+        if market_cap > category_leader_mcap * 0.5:
+            flags.append(
+                RedFlag(
+                    flag="overvalued_vs_leaders",
+                    severity="medium",
+                    detail=f"Token mcap ${market_cap:,.0f} is >{50}% of leader ${category_leader_mcap:,.0f}",
+                )
+            )
 
     # narrative_mismatch
     if narrative_fit_score < 40:

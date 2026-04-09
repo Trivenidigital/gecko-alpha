@@ -29,6 +29,11 @@ _CANDIDATE_COLUMNS = [
     "signals_fired",
     "alerted_at",
     "first_seen_at",
+    "counter_risk_score",
+    "counter_flags",
+    "counter_argument",
+    "counter_data_completeness",
+    "counter_scored_at",
 ]
 
 

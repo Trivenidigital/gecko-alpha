@@ -44,12 +44,13 @@ async def fetch_coin_detail(
         "developer_data": "true",
         "sparkline": "false",
     }
+    headers: dict[str, str] = {}
     if api_key:
-        params["x_cg_demo_api_key"] = api_key
+        headers["x-cg-demo-api-key"] = api_key
 
     url = CG_DETAIL_URL.format(coin_id=coin_id)
     try:
-        async with session.get(url, params=params) as resp:
+        async with session.get(url, params=params, headers=headers) as resp:
             if resp.status == 429:
                 logger.warning("cg_detail_rate_limited", coin_id=coin_id)
                 return None

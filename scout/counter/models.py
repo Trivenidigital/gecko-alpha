@@ -29,6 +29,14 @@ class CounterScore(BaseModel):
     data_completeness: str = ""
     counter_scored_at: datetime = datetime(1970, 1, 1)
 
+    @field_validator("data_completeness")
+    @classmethod
+    def validate_completeness(cls, v: str) -> str:
+        valid = ("full", "partial", "pipeline_only")
+        if v not in valid:
+            return "pipeline_only"
+        return v
+
     @field_validator("risk_score", mode="before")
     @classmethod
     def _clamp_risk_score(cls, v: int | None) -> int | None:
