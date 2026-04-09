@@ -9,7 +9,7 @@ import time
 import aiohttp
 import structlog
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from scout.aggregator import aggregate
 from scout.alerter import format_daily_summary, send_alert, send_telegram_message
@@ -21,6 +21,29 @@ from scout.ingestion.coingecko import fetch_trending as cg_fetch_trending
 from scout.ingestion.dexscreener import fetch_trending
 from scout.ingestion.geckoterminal import fetch_trending_pools
 from scout.ingestion.holder_enricher import enrich_holders
+from scout.narrative.digest import format_heating_alert
+from scout.narrative.evaluator import evaluate_pending
+from scout.narrative.learner import daily_learn, weekly_consolidate
+from scout.narrative.models import NarrativePrediction
+from scout.narrative.observer import (
+    compute_acceleration,
+    detect_market_regime,
+    fetch_categories,
+    load_snapshots_at,
+    parse_category_response,
+    prune_old_snapshots,
+    store_snapshot,
+)
+from scout.narrative.predictor import (
+    fetch_laggards,
+    filter_laggards,
+    is_cooling_down,
+    partition_and_select,
+    record_signal,
+    score_token,
+    store_predictions,
+)
+from scout.narrative.strategy import Strategy
 from scout.safety import is_safe
 from scout.scorer import score
 
@@ -219,6 +242,299 @@ async def check_outcomes(
     return recorded
 
 
+async def narrative_agent_loop(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    db: Database,
+) -> None:
+    """Run the narrative rotation agent as a long-lived background loop.
+
+    Phases per cycle: OBSERVE -> PREDICT -> EVALUATE -> LEARN (daily/weekly).
+    """
+    strategy = Strategy(db)
+    await strategy.load_or_init()
+
+    # Load scheduling timestamps from strategy
+    last_eval_at = strategy.get_timestamp("last_eval_at")
+    last_daily_learn_at = strategy.get_timestamp("last_daily_learn_at")
+    last_weekly_learn_at = strategy.get_timestamp("last_weekly_learn_at")
+
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+
+            # ----------------------------------------------------------
+            # OBSERVE
+            # ----------------------------------------------------------
+            raw_categories = await fetch_categories(
+                session, api_key=settings.COINGECKO_API_KEY
+            )
+            if not raw_categories:
+                logger.warning("narrative.observe_empty")
+                await asyncio.sleep(settings.NARRATIVE_POLL_INTERVAL)
+                continue
+
+            # Compute weighted 24h change for regime detection
+            total_mcap = sum(float(c.get("market_cap") or 0) for c in raw_categories)
+            if total_mcap > 0:
+                weighted_change = sum(
+                    float(c.get("market_cap_change_24h") or 0) * float(c.get("market_cap") or 0)
+                    for c in raw_categories
+                ) / total_mcap
+            else:
+                weighted_change = 0.0
+
+            market_regime = detect_market_regime(weighted_change)
+            snapshots = parse_category_response(raw_categories, market_regime)
+            await store_snapshot(db, snapshots)
+
+            # Load 6-hour-ago snapshots for acceleration comparison
+            six_hours_ago = now - timedelta(hours=6)
+            prev_snapshots = await load_snapshots_at(db, six_hours_ago)
+
+            accel_threshold = float(strategy.get("category_accel_threshold"))  # type: ignore[arg-type]
+            vol_growth_min = float(strategy.get("category_volume_growth_min"))  # type: ignore[arg-type]
+            accelerations = compute_acceleration(
+                snapshots, prev_snapshots, accel_threshold, vol_growth_min
+            )
+
+            # ----------------------------------------------------------
+            # PREDICT
+            # ----------------------------------------------------------
+            heating = [a for a in accelerations if a.is_heating]
+            heating.sort(key=lambda a: a.acceleration, reverse=True)
+            max_heating = int(strategy.get("max_heating_per_cycle"))  # type: ignore[arg-type]
+            heating = heating[:max_heating]
+
+            cooldown_hours = int(strategy.get("signal_cooldown_hours"))  # type: ignore[arg-type]
+            min_trigger = int(strategy.get("min_trigger_count"))  # type: ignore[arg-type]
+            max_picks = int(strategy.get("max_picks_per_category"))  # type: ignore[arg-type]
+            narrative_alert_enabled = bool(strategy.get("narrative_alert_enabled"))
+            lessons = str(strategy.get("lessons_learned"))
+
+            for accel in heating:
+                try:
+                    if await is_cooling_down(db, accel.category_id):
+                        logger.info("narrative.category_cooling_down", category=accel.name)
+                        continue
+
+                    trigger_count = await record_signal(
+                        db,
+                        category_id=accel.category_id,
+                        category_name=accel.name,
+                        acceleration=accel.acceleration,
+                        volume_growth_pct=accel.volume_growth_pct,
+                        coin_count_change=accel.coin_count_change,
+                        cooldown_hours=cooldown_hours,
+                    )
+
+                    if trigger_count < min_trigger:
+                        logger.info(
+                            "narrative.below_min_trigger",
+                            category=accel.name,
+                            trigger_count=trigger_count,
+                            min_trigger=min_trigger,
+                        )
+                        continue
+
+                    # Fetch and filter laggards
+                    raw_laggards = await fetch_laggards(
+                        session, accel.category_id, api_key=settings.COINGECKO_API_KEY
+                    )
+                    laggards = filter_laggards(
+                        raw_laggards,
+                        category_id=accel.category_id,
+                        category_name=accel.name,
+                        max_mcap=float(strategy.get("laggard_max_mcap")),  # type: ignore[arg-type]
+                        max_change=float(strategy.get("laggard_max_change")),  # type: ignore[arg-type]
+                        min_change=float(strategy.get("laggard_min_change")),  # type: ignore[arg-type]
+                        min_volume=float(strategy.get("laggard_min_volume")),  # type: ignore[arg-type]
+                    )
+
+                    if not laggards:
+                        logger.info("narrative.no_laggards", category=accel.name)
+                        continue
+
+                    scored_laggards, control_laggards = partition_and_select(
+                        laggards, max_picks
+                    )
+
+                    # Build top-3 coins string for prompt context
+                    top_3 = raw_laggards[:3]
+                    top_3_coins = ", ".join(
+                        f"{c.get('name', '?')} ({c.get('symbol', '?').upper()})"
+                        for c in top_3
+                    )
+
+                    strategy_snap = strategy.get_all()
+
+                    # Score each scored laggard with Claude
+                    prediction_rows: list[dict] = []
+                    prediction_models: list[NarrativePrediction] = []
+
+                    for token in scored_laggards:
+                        result = await score_token(
+                            token=token,
+                            accel=accel,
+                            market_regime=market_regime,
+                            top_3_coins=top_3_coins,
+                            lessons=lessons,
+                            api_key=settings.ANTHROPIC_API_KEY,
+                            model=settings.NARRATIVE_SCORING_MODEL,
+                        )
+                        if result is None:
+                            continue
+
+                        pred_row = {
+                            "category_id": accel.category_id,
+                            "category_name": accel.name,
+                            "coin_id": token.coin_id,
+                            "symbol": token.symbol,
+                            "name": token.name,
+                            "market_cap_at_prediction": token.market_cap,
+                            "price_at_prediction": token.price,
+                            "narrative_fit_score": result.get("narrative_fit_score", 0),
+                            "staying_power": result.get("staying_power", "unknown"),
+                            "confidence": result.get("confidence", "low"),
+                            "reasoning": result.get("reasoning", ""),
+                            "market_regime": market_regime,
+                            "trigger_count": trigger_count,
+                            "is_control": False,
+                            "is_holdout": False,
+                            "strategy_snapshot": strategy_snap,
+                            "strategy_snapshot_ab": None,
+                            "predicted_at": now.isoformat(),
+                        }
+                        prediction_rows.append(pred_row)
+                        prediction_models.append(
+                            NarrativePrediction(
+                                category_id=accel.category_id,
+                                category_name=accel.name,
+                                coin_id=token.coin_id,
+                                symbol=token.symbol,
+                                name=token.name,
+                                market_cap_at_prediction=token.market_cap,
+                                price_at_prediction=token.price,
+                                narrative_fit_score=result.get("narrative_fit_score", 0),
+                                staying_power=result.get("staying_power", "unknown"),
+                                confidence=result.get("confidence", "low"),
+                                reasoning=result.get("reasoning", ""),
+                                market_regime=market_regime,
+                                trigger_count=trigger_count,
+                                is_control=False,
+                                strategy_snapshot=strategy_snap,
+                                predicted_at=now,
+                            )
+                        )
+
+                    # Add control predictions (no Claude scoring)
+                    for token in control_laggards:
+                        prediction_rows.append({
+                            "category_id": accel.category_id,
+                            "category_name": accel.name,
+                            "coin_id": token.coin_id,
+                            "symbol": token.symbol,
+                            "name": token.name,
+                            "market_cap_at_prediction": token.market_cap,
+                            "price_at_prediction": token.price,
+                            "narrative_fit_score": 0,
+                            "staying_power": "unknown",
+                            "confidence": "low",
+                            "reasoning": "control pick — no Claude scoring",
+                            "market_regime": market_regime,
+                            "trigger_count": trigger_count,
+                            "is_control": True,
+                            "is_holdout": False,
+                            "strategy_snapshot": strategy_snap,
+                            "strategy_snapshot_ab": None,
+                            "predicted_at": now.isoformat(),
+                        })
+
+                    if prediction_rows:
+                        await store_predictions(db, prediction_rows)
+                        logger.info(
+                            "narrative.predictions_stored",
+                            category=accel.name,
+                            scored=len(prediction_models),
+                            control=len(control_laggards),
+                        )
+
+                    # Send alert if enabled
+                    if narrative_alert_enabled and prediction_models:
+                        try:
+                            alert_text = format_heating_alert(
+                                accel, prediction_models, top_3_coins
+                            )
+                            await send_telegram_message(alert_text, session, settings)
+                            logger.info("narrative.alert_sent", category=accel.name)
+                        except Exception:
+                            logger.exception("narrative.alert_error", category=accel.name)
+
+                except Exception:
+                    logger.exception("narrative.predict_category_error", category=accel.name)
+
+            # ----------------------------------------------------------
+            # EVALUATE (gated by NARRATIVE_EVAL_INTERVAL)
+            # ----------------------------------------------------------
+            if (now - last_eval_at).total_seconds() >= settings.NARRATIVE_EVAL_INTERVAL:
+                try:
+                    await evaluate_pending(
+                        session, db, strategy, api_key=settings.COINGECKO_API_KEY
+                    )
+                    last_eval_at = now
+                    await strategy.set_timestamp("last_eval_at", now)
+                    logger.info("narrative.eval_complete")
+                except Exception:
+                    logger.exception("narrative.eval_error")
+
+            # ----------------------------------------------------------
+            # LEARN daily (gated by hour + 23h gap)
+            # ----------------------------------------------------------
+            if (
+                now.hour == settings.NARRATIVE_LEARN_HOUR_UTC
+                and (now - last_daily_learn_at).total_seconds() >= 23 * 3600
+            ):
+                try:
+                    await daily_learn(
+                        db,
+                        strategy,
+                        api_key=settings.ANTHROPIC_API_KEY,
+                        model=settings.NARRATIVE_LEARN_MODEL,
+                    )
+                    await prune_old_snapshots(db, settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS)
+                    last_daily_learn_at = now
+                    await strategy.set_timestamp("last_daily_learn_at", now)
+                    logger.info("narrative.daily_learn_complete")
+                except Exception:
+                    logger.exception("narrative.daily_learn_error")
+
+            # ----------------------------------------------------------
+            # LEARN weekly (gated by weekday + hour + 6.9-day gap)
+            # ----------------------------------------------------------
+            if (
+                now.weekday() == settings.NARRATIVE_WEEKLY_LEARN_DAY
+                and now.hour == (settings.NARRATIVE_LEARN_HOUR_UTC + 1) % 24
+                and (now - last_weekly_learn_at).total_seconds() >= 6.9 * 86400
+            ):
+                try:
+                    await weekly_consolidate(
+                        db,
+                        strategy,
+                        api_key=settings.ANTHROPIC_API_KEY,
+                        model=settings.NARRATIVE_LEARN_MODEL,
+                    )
+                    last_weekly_learn_at = now
+                    await strategy.set_timestamp("last_weekly_learn_at", now)
+                    logger.info("narrative.weekly_learn_complete")
+                except Exception:
+                    logger.exception("narrative.weekly_learn_error")
+
+        except Exception:
+            logger.exception("narrative.loop_error")
+
+        await asyncio.sleep(settings.NARRATIVE_POLL_INTERVAL)
+
+
 async def main() -> None:
     """Main entry point with CLI arg parsing and graceful shutdown."""
     parser = argparse.ArgumentParser(description="CoinPump Scout scanner")
@@ -276,78 +592,95 @@ async def main() -> None:
 
     try:
         async with aiohttp.ClientSession() as session:
-            while not shutdown_event.is_set():
-                try:
-                    stats = await run_cycle(
-                        settings, db, session, dry_run=args.dry_run
-                    )
-                    logger.info("Cycle complete", **stats)
-                    for k in cumulative:
-                        cumulative[k] += stats.get(k, 0)
-                except Exception as e:
-                    logger.error("Cycle failed", error=str(e))
 
-                cycle_count += 1
+            async def _pipeline_loop() -> None:
+                nonlocal cycle_count, cumulative, last_heartbeat
+                nonlocal last_outcome_check, last_summary_date
 
-                # Heartbeat logging every 5 minutes
-                now = time.monotonic()
-                if now - last_heartbeat >= heartbeat_interval:
-                    mirofish_today = await db.get_daily_mirofish_count()
-                    logger.info(
-                        "Heartbeat",
-                        cycles=cycle_count,
-                        cumulative_tokens_scanned=cumulative["tokens_scanned"],
-                        cumulative_candidates_promoted=cumulative["candidates_promoted"],
-                        cumulative_alerts_fired=cumulative["alerts_fired"],
-                        mirofish_jobs_today=mirofish_today,
-                    )
-                    last_heartbeat = now
-
-                # Hourly tasks: outcome check + DB prune
-                if now - last_outcome_check >= outcome_check_interval:
+                while not shutdown_event.is_set():
                     try:
-                        outcomes_recorded = await check_outcomes(db, session)
-                        if outcomes_recorded:
-                            logger.info("Outcomes checked", recorded=outcomes_recorded)
+                        stats = await run_cycle(
+                            settings, db, session, dry_run=args.dry_run
+                        )
+                        logger.info("Cycle complete", **stats)
+                        for k in cumulative:
+                            cumulative[k] += stats.get(k, 0)
                     except Exception as e:
-                        logger.warning("Outcome check error", error=str(e))
+                        logger.error("Cycle failed", error=str(e))
 
-                    # Prune old candidates if DB > 500MB
+                    cycle_count += 1
+
+                    # Heartbeat logging every 5 minutes
+                    now = time.monotonic()
+                    if now - last_heartbeat >= heartbeat_interval:
+                        mirofish_today = await db.get_daily_mirofish_count()
+                        logger.info(
+                            "Heartbeat",
+                            cycles=cycle_count,
+                            cumulative_tokens_scanned=cumulative["tokens_scanned"],
+                            cumulative_candidates_promoted=cumulative["candidates_promoted"],
+                            cumulative_alerts_fired=cumulative["alerts_fired"],
+                            mirofish_jobs_today=mirofish_today,
+                        )
+                        last_heartbeat = now
+
+                    # Hourly tasks: outcome check + DB prune
+                    if now - last_outcome_check >= outcome_check_interval:
+                        try:
+                            outcomes_recorded = await check_outcomes(db, session)
+                            if outcomes_recorded:
+                                logger.info("Outcomes checked", recorded=outcomes_recorded)
+                        except Exception as e:
+                            logger.warning("Outcome check error", error=str(e))
+
+                        # Prune old candidates if DB > 500MB
+                        try:
+                            db_size = settings.DB_PATH.stat().st_size if settings.DB_PATH.exists() else 0
+                            if db_size > 500_000_000:
+                                pruned = await db.prune_old_candidates(keep_days=7)
+                                logger.info("db_pruned", rows_deleted=pruned, db_size_mb=round(db_size / 1e6, 1))
+                        except Exception as e:
+                            logger.warning("DB prune error", error=str(e))
+
+                        last_outcome_check = now
+
+                    # Daily summary at midnight UTC
+                    current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    if current_date != last_summary_date:
+                        try:
+                            summary_data = await db.get_daily_summary_data()
+                            summary_text = format_daily_summary(summary_data)
+                            if not args.dry_run:
+                                await send_telegram_message(summary_text, session, settings)
+                            logger.info("Daily summary sent", alerts=summary_data["alerts_today"],
+                                        win_rate=summary_data["win_rate_pct"])
+                        except Exception as e:
+                            logger.warning("Daily summary failed", error=str(e))
+                        last_summary_date = current_date
+
+                    if args.cycles > 0 and cycle_count >= args.cycles:
+                        break
+
+                    # Wait for next cycle or shutdown
                     try:
-                        db_size = settings.DB_PATH.stat().st_size if settings.DB_PATH.exists() else 0
-                        if db_size > 500_000_000:
-                            pruned = await db.prune_old_candidates(keep_days=7)
-                            logger.info("db_pruned", rows_deleted=pruned, db_size_mb=round(db_size / 1e6, 1))
-                    except Exception as e:
-                        logger.warning("DB prune error", error=str(e))
+                        await asyncio.wait_for(
+                            shutdown_event.wait(),
+                            timeout=settings.SCAN_INTERVAL_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        pass  # Normal -- interval elapsed
 
-                    last_outcome_check = now
-
-                # Daily summary at midnight UTC
-                current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                if current_date != last_summary_date:
-                    try:
-                        summary_data = await db.get_daily_summary_data()
-                        summary_text = format_daily_summary(summary_data)
-                        if not args.dry_run:
-                            await send_telegram_message(summary_text, session, settings)
-                        logger.info("Daily summary sent", alerts=summary_data["alerts_today"],
-                                    win_rate=summary_data["win_rate_pct"])
-                    except Exception as e:
-                        logger.warning("Daily summary failed", error=str(e))
-                    last_summary_date = current_date
-
-                if args.cycles > 0 and cycle_count >= args.cycles:
-                    break
-
-                # Wait for next cycle or shutdown
-                try:
-                    await asyncio.wait_for(
-                        shutdown_event.wait(),
-                        timeout=settings.SCAN_INTERVAL_SECONDS,
+            tasks: list[asyncio.Task] = [
+                asyncio.create_task(_pipeline_loop()),
+            ]
+            if settings.NARRATIVE_ENABLED:
+                tasks.append(
+                    asyncio.create_task(
+                        narrative_agent_loop(session, settings, db)
                     )
-                except asyncio.TimeoutError:
-                    pass  # Normal -- interval elapsed
+                )
+
+            await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         await db.close()
         logger.info("Scanner stopped", cycles_completed=cycle_count)
