@@ -131,6 +131,104 @@ class Database:
                 check_time        TEXT,
                 price_change_pct  REAL
             );
+
+            CREATE TABLE IF NOT EXISTS category_snapshots (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id           TEXT NOT NULL,
+                name                  TEXT NOT NULL,
+                market_cap            REAL,
+                market_cap_change_24h REAL,
+                volume_24h            REAL,
+                coin_count            INTEGER,
+                market_regime         TEXT,
+                snapshot_at           TEXT NOT NULL,
+                created_at            TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_cat_snap_category
+                ON category_snapshots(category_id, snapshot_at);
+
+            CREATE TABLE IF NOT EXISTS narrative_signals (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id       TEXT NOT NULL,
+                category_name     TEXT NOT NULL,
+                acceleration      REAL NOT NULL,
+                volume_growth_pct REAL NOT NULL,
+                coin_count_change INTEGER,
+                trigger_count     INTEGER DEFAULT 1,
+                detected_at       TEXT NOT NULL,
+                cooling_down_until TEXT NOT NULL,
+                created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_narr_sig_category
+                ON narrative_signals(category_id, cooling_down_until);
+
+            CREATE TABLE IF NOT EXISTS predictions (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id             TEXT NOT NULL,
+                category_name           TEXT NOT NULL,
+                coin_id                 TEXT NOT NULL,
+                symbol                  TEXT NOT NULL,
+                name                    TEXT NOT NULL,
+                market_cap_at_prediction REAL NOT NULL,
+                price_at_prediction     REAL NOT NULL,
+                narrative_fit_score     INTEGER NOT NULL,
+                staying_power           TEXT NOT NULL,
+                confidence              TEXT NOT NULL,
+                reasoning               TEXT NOT NULL,
+                market_regime           TEXT,
+                trigger_count           INTEGER,
+                is_control              INTEGER DEFAULT 0,
+                is_holdout              INTEGER DEFAULT 0,
+                strategy_snapshot       TEXT NOT NULL,
+                strategy_snapshot_ab    TEXT,
+                predicted_at            TEXT NOT NULL,
+                outcome_6h_price        REAL,
+                outcome_6h_change_pct   REAL,
+                outcome_6h_class        TEXT,
+                outcome_24h_price       REAL,
+                outcome_24h_change_pct  REAL,
+                outcome_24h_class       TEXT,
+                outcome_48h_price       REAL,
+                outcome_48h_change_pct  REAL,
+                outcome_48h_class       TEXT,
+                peak_price              REAL,
+                peak_change_pct         REAL,
+                peak_at                 TEXT,
+                outcome_class           TEXT,
+                outcome_reason          TEXT,
+                eval_retry_count        INTEGER DEFAULT 0,
+                evaluated_at            TEXT,
+                created_at              TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(category_id, coin_id, predicted_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pred_category
+                ON predictions(category_id);
+            CREATE INDEX IF NOT EXISTS idx_pred_predicted
+                ON predictions(predicted_at);
+            CREATE INDEX IF NOT EXISTS idx_pred_outcome
+                ON predictions(outcome_class);
+
+            CREATE TABLE IF NOT EXISTS agent_strategy (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL,
+                reason     TEXT,
+                locked     INTEGER DEFAULT 0,
+                min_bound  REAL,
+                max_bound  REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS learn_logs (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_number     INTEGER NOT NULL,
+                cycle_type       TEXT NOT NULL,
+                reflection_text  TEXT NOT NULL,
+                changes_made     TEXT NOT NULL,
+                hit_rate_before  REAL,
+                hit_rate_after   REAL,
+                created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             """
         )
 
