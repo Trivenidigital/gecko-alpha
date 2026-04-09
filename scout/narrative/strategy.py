@@ -26,6 +26,7 @@ STRATEGY_DEFAULTS: dict[str, object] = {
     "lessons_learned": "",
     "lessons_version": 0,
     "narrative_alert_enabled": True,
+    "counter_suppress_threshold": 100,
 }
 
 STRATEGY_BOUNDS: dict[str, tuple[float, float]] = {
@@ -42,6 +43,7 @@ STRATEGY_BOUNDS: dict[str, tuple[float, float]] = {
     "signal_cooldown_hours": (1, 12),
     "min_learn_sample": (50, 500),
     "min_trigger_count": (1, 10),
+    "counter_suppress_threshold": (0, 100),
 }
 
 

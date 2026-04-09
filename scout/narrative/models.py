@@ -78,6 +78,11 @@ class NarrativePrediction(BaseModel):
     outcome_reason: str | None = None
     eval_retry_count: int = 0
     evaluated_at: datetime | None = None
+    counter_risk_score: int | None = None
+    counter_flags: list[dict] | None = None
+    counter_argument: str | None = None
+    counter_data_completeness: str | None = None
+    counter_scored_at: datetime | None = None
 
     @field_validator("narrative_fit_score")
     @classmethod
