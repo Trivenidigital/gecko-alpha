@@ -39,7 +39,7 @@ async def fetch_categories(
                     return []
                 data = await resp.json()
                 result = data if isinstance(data, list) else []
-                await asyncio.sleep(1)  # rate-limit: space out CoinGecko calls
+                await asyncio.sleep(1)  # call spacing, not shared rate limiter (see GH issue #2)
                 return result
         except Exception:
             logger.exception("coingecko_categories_exception", attempt=attempt)
