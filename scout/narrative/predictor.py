@@ -353,8 +353,11 @@ async def store_predictions(
                 market_cap_at_prediction, price_at_prediction,
                 narrative_fit_score, staying_power, confidence, reasoning,
                 market_regime, trigger_count, is_control, is_holdout,
-                strategy_snapshot, strategy_snapshot_ab, predicted_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                strategy_snapshot, strategy_snapshot_ab, predicted_at,
+                counter_risk_score, counter_flags, counter_argument,
+                counter_data_completeness, counter_scored_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?)""",
             (
                 p["category_id"],
                 p["category_name"],
@@ -374,6 +377,11 @@ async def store_predictions(
                 strategy_snap,
                 strategy_snap_ab,
                 p["predicted_at"],
+                p.get("counter_risk_score"),
+                p.get("counter_flags"),
+                p.get("counter_argument"),
+                p.get("counter_data_completeness"),
+                p.get("counter_scored_at"),
             ),
         )
     await conn.commit()

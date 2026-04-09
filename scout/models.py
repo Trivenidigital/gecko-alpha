@@ -52,6 +52,13 @@ class CandidateToken(BaseModel):
     alerted_at: datetime | None = None
     first_seen_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+    # Counter-narrative fields
+    counter_risk_score: int | None = None
+    counter_flags: str | None = None  # JSON string (matches DB TEXT column)
+    counter_argument: str | None = None
+    counter_data_completeness: str | None = None
+    counter_scored_at: str | None = None  # ISO timestamp string
+
     @classmethod
     def from_coingecko(cls, raw: dict) -> "CandidateToken":
         """Create a CandidateToken from a CoinGecko /coins/markets response item."""

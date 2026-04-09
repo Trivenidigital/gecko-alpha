@@ -67,6 +67,11 @@ class Settings(BaseSettings):
     NARRATIVE_SCORING_MODEL: str = "claude-haiku-4-5"
     NARRATIVE_LEARN_MODEL: str = "claude-sonnet-4-6"
 
+    # Counter-Narrative Scoring
+    COUNTER_ENABLED: bool = True
+    COUNTER_MODEL: str = "claude-haiku-4-5"
+    COUNTER_SUPPRESS_THRESHOLD: int = 100
+
     @field_validator("CHAINS", mode="before")
     @classmethod
     def parse_chains(cls, v: str | list[str]) -> list[str]:

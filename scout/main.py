@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import json
 import signal
 import sys
 import time
@@ -44,10 +45,66 @@ from scout.narrative.predictor import (
     store_predictions,
 )
 from scout.narrative.strategy import Strategy
+from scout.counter.detail import fetch_coin_detail, extract_counter_data
+from scout.counter.flags import compute_narrative_flags, compute_memecoin_flags
+from scout.counter.scorer import score_counter_narrative, score_counter_memecoin
 from scout.safety import is_safe
 from scout.scorer import score
 
 logger = structlog.get_logger()
+
+
+async def _safe_counter_followup(token, session, settings):
+    """Run counter-score and send follow-up Telegram message. Never raises."""
+    try:
+        buy_pressure = 0.5
+        if getattr(token, 'txns_h1_buys', None) and getattr(token, 'txns_h1_sells', None):
+            total = token.txns_h1_buys + token.txns_h1_sells
+            if total > 0:
+                buy_pressure = token.txns_h1_buys / total
+
+        vol_liq = token.volume_24h_usd / max(token.liquidity_usd, 1)
+
+        flags = compute_memecoin_flags(
+            buy_pressure=buy_pressure,
+            liquidity_usd=token.liquidity_usd,
+            token_age_days=token.token_age_days,
+            vol_liq_ratio=vol_liq,
+            holder_count=token.holder_count,
+            goplus_creator_pct=0.0,
+            goplus_is_honeypot=False,
+        )
+
+        counter = await score_counter_memecoin(
+            token_name=token.token_name,
+            symbol=token.ticker,
+            chain=token.chain,
+            token_age_days=token.token_age_days,
+            liquidity_usd=token.liquidity_usd,
+            vol_liq_ratio=vol_liq,
+            buy_pressure=buy_pressure,
+            holder_count=token.holder_count,
+            flags=flags,
+            data_completeness="pipeline_only",
+            api_key=settings.ANTHROPIC_API_KEY,
+            model=settings.COUNTER_MODEL,
+        )
+
+        if counter.risk_score is not None:
+            flag_lines = "\n".join(
+                f"- [{f.severity.upper()}] {f.flag}: {f.detail}" for f in counter.red_flags
+            )
+            msg = (
+                f"Risk assessment for {token.ticker}:\n"
+                f"Risk: {counter.risk_score}/100 | {counter.data_completeness} data\n"
+                f"{flag_lines}\n"
+                f'"{counter.counter_argument}"'
+            )
+            await send_telegram_message(msg, session, settings)
+
+        logger.info("counter_followup_sent", symbol=token.ticker, risk_score=counter.risk_score)
+    except Exception as e:
+        logger.error("counter_followup_error", symbol=getattr(token, 'ticker', '?'), error=str(e))
 
 
 async def run_cycle(
@@ -180,6 +237,13 @@ async def run_cycle(
             alert_market_cap=gated_token.market_cap_usd,
         )
         stats["alerts_fired"] += 1
+
+        # Counter-score follow-up (async, non-blocking)
+        if settings.COUNTER_ENABLED:
+            task = asyncio.create_task(
+                _safe_counter_followup(gated_token, session, settings)
+            )
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
     return stats
 
@@ -391,6 +455,58 @@ async def narrative_agent_loop(
                             continue
                         consecutive_failures = 0  # reset on success
 
+                        # Counter-score for narrative picks
+                        counter_risk = None
+                        counter_flags_json = None
+                        counter_arg = None
+                        counter_completeness = None
+                        counter_scored = None
+
+                        if settings.COUNTER_ENABLED:
+                            detail = await fetch_coin_detail(
+                                session, token.coin_id, settings.COINGECKO_API_KEY
+                            )
+                            if detail:
+                                cdata = extract_counter_data(detail)
+                                data_comp = "full"
+                            else:
+                                cdata = {
+                                    "commits_4w": 0, "reddit_subscribers": 0,
+                                    "telegram_users": 0, "sentiment_up_pct": 50.0,
+                                    "price_change_7d": 0, "price_change_30d": 0,
+                                }
+                                data_comp = "partial"
+
+                            narrative_flags = compute_narrative_flags(
+                                price_change_30d=cdata["price_change_30d"],
+                                commits_4w=cdata["commits_4w"],
+                                reddit_subs=cdata["reddit_subscribers"],
+                                sentiment_up_pct=cdata["sentiment_up_pct"],
+                                narrative_fit_score=result.get("narrative_fit", 50),
+                                token_vol_change_24h=0.0,
+                                category_vol_growth_pct=accel.volume_growth_pct,
+                            )
+
+                            counter_result = await score_counter_narrative(
+                                token_name=token.name,
+                                symbol=token.symbol,
+                                market_cap=token.market_cap,
+                                price_change_24h=token.price_change_24h,
+                                category_name=accel.name,
+                                acceleration=accel.acceleration,
+                                narrative_fit_score=result.get("narrative_fit", 50),
+                                flags=narrative_flags,
+                                data_completeness=data_comp,
+                                api_key=settings.ANTHROPIC_API_KEY,
+                                model=settings.COUNTER_MODEL,
+                            )
+
+                            counter_risk = counter_result.risk_score
+                            counter_flags_json = json.dumps([f.model_dump() for f in counter_result.red_flags]) if counter_result.red_flags else None
+                            counter_arg = counter_result.counter_argument
+                            counter_completeness = counter_result.data_completeness
+                            counter_scored = counter_result.counter_scored_at.isoformat()
+
                         pred_row = {
                             "category_id": accel.category_id,
                             "category_name": accel.name,
@@ -411,6 +527,11 @@ async def narrative_agent_loop(
                             "strategy_snapshot_ab": None,
                             "predicted_at": now.isoformat(),
                         }
+                        pred_row["counter_risk_score"] = counter_risk
+                        pred_row["counter_flags"] = counter_flags_json
+                        pred_row["counter_argument"] = counter_arg
+                        pred_row["counter_data_completeness"] = counter_completeness
+                        pred_row["counter_scored_at"] = counter_scored
                         prediction_rows.append(pred_row)
                         prediction_models.append(
                             NarrativePrediction(
