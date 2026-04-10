@@ -316,10 +316,13 @@ async def run_cycle(
             )
 
         await db.log_alert(
-            gated_token.contract_address,
-            gated_token.chain,
-            conviction,
+            contract_address=gated_token.contract_address,
+            chain=gated_token.chain,
+            conviction_score=conviction,
             alert_market_cap=gated_token.market_cap_usd,
+            price_usd=getattr(gated_token, "price_usd", None),
+            token_name=getattr(gated_token, "token_name", None),
+            ticker=getattr(gated_token, "ticker", None),
         )
         stats["alerts_fired"] += 1
 
@@ -935,6 +938,11 @@ async def main() -> None:
             if settings.NARRATIVE_ENABLED:
                 tasks.append(
                     asyncio.create_task(narrative_agent_loop(session, settings, db))
+                )
+            if settings.SECONDWAVE_ENABLED:
+                from scout.secondwave.detector import secondwave_loop
+                tasks.append(
+                    asyncio.create_task(secondwave_loop(session, settings))
                 )
 
             await asyncio.gather(*tasks, return_exceptions=True)

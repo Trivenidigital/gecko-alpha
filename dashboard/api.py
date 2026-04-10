@@ -142,6 +142,34 @@ def create_app(db_path: str | None = None) -> FastAPI:
             _db_path, category_id=category_id, hours=hours
         )
 
+    # --- Second-Wave Detection endpoints ---
+
+    @app.get("/api/secondwave/candidates")
+    async def secondwave_candidates(days: int = 7, limit: int = 50):
+        from scout.db import Database as ScoutDatabase
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            rows = await sdb.get_recent_secondwave_candidates(days=days)
+            return rows[:limit]
+        finally:
+            await sdb.close()
+
+    @app.get("/api/secondwave/stats")
+    async def secondwave_stats(days: int = 7):
+        from scout.db import Database as ScoutDatabase
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            rows = await sdb.get_recent_secondwave_candidates(days=days)
+            count = len(rows)
+            avg_score = (
+                sum(r["reaccumulation_score"] for r in rows) / count if count else 0.0
+            )
+            return {"count": count, "avg_score": round(avg_score, 1), "days": days}
+        finally:
+            await sdb.close()
+
     @app.get("/health")
     async def health_check():
         """Health check endpoint for uptime monitoring."""
