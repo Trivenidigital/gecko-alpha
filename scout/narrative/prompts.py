@@ -15,6 +15,7 @@ Category leaders: {top_3_coins}.
 Evaluate {token_name} ({symbol}, ${market_cap:,.0f} mcap, {price_change_24h:+.1f}% 24h):
 Objective data: market regime: {market_regime}, \
 category coin count change: {coin_count_change}, token volume/mcap ratio: {vol_mcap_ratio:.2f}.
+CoinGecko watchlist: {watchlist_users:,} users tracking this coin (>10k = mainstream, >100k = high interest, >1M = viral)
 
 1. Does this token genuinely belong to the {category_name} narrative?
 2. Given the objective data above, is the volume/price trend consistent with genuine accumulation?

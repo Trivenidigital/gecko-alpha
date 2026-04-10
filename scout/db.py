@@ -212,6 +212,7 @@ class Database:
                 counter_argument         TEXT,
                 counter_data_completeness TEXT,
                 counter_scored_at        TEXT,
+                watchlist_users         INTEGER,
                 evaluated_at            TEXT,
                 created_at              TEXT NOT NULL DEFAULT (datetime('now')),
                 UNIQUE(category_id, coin_id, predicted_at)

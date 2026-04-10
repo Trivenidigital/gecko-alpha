@@ -18,6 +18,7 @@ from scout.counter.detail import (
 SAMPLE_DETAIL = {
     "id": "bitcoin",
     "sentiment_votes_up_percentage": 72.5,
+    "watchlist_portfolio_users": 1_234_567,
     "developer_data": {"commit_count_4_weeks": 120},
     "community_data": {
         "reddit_subscribers": 5_000_000,
@@ -43,6 +44,7 @@ def test_extract_counter_data_full():
     assert result["sentiment_up_pct"] == 72.5
     assert result["price_change_7d"] == 3.5
     assert result["price_change_30d"] == -8.2
+    assert result["watchlist_portfolio_users"] == 1_234_567
 
 
 def test_extract_counter_data_missing_fields():
@@ -53,6 +55,7 @@ def test_extract_counter_data_missing_fields():
     assert result["sentiment_up_pct"] == 50.0
     assert result["price_change_7d"] == 0
     assert result["price_change_30d"] == 0
+    assert result["watchlist_portfolio_users"] == 0
 
 
 # ---- fetch_coin_detail tests ----
