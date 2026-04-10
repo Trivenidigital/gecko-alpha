@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import time
-from collections import deque
 from typing import TYPE_CHECKING
 
 import aiohttp
 import structlog
 
 from scout.models import CandidateToken
+from scout.ratelimit import coingecko_limiter
 
 if TYPE_CHECKING:
     from scout.config import Settings
@@ -20,30 +19,6 @@ logger = structlog.get_logger()
 CG_BASE = "https://api.coingecko.com/api/v3"
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
-_call_timestamps: deque[float] = deque()
-_rate_lock = asyncio.Lock()
-
-
-async def _throttle() -> None:
-    """Enforce 30 calls/min rate limit for CoinGecko free Demo tier.
-
-    Uses asyncio.Lock to prevent concurrent coroutines from exceeding the cap.
-    """
-    async with _rate_lock:
-        now = time.monotonic()
-        # Remove timestamps older than 60 seconds
-        while _call_timestamps and _call_timestamps[0] < now - 60:
-            _call_timestamps.popleft()
-        if len(_call_timestamps) >= 30:
-            sleep_time = 60 - (now - _call_timestamps[0])
-            if sleep_time > 0:
-                logger.warning("cg_rate_limit_hit", sleep_seconds=round(sleep_time, 1))
-                await asyncio.sleep(sleep_time)
-                # Re-prune after sleep so the window is recalculated accurately
-                post_sleep = time.monotonic()
-                while _call_timestamps and _call_timestamps[0] < post_sleep - 60:
-                    _call_timestamps.popleft()
-        _call_timestamps.append(time.monotonic())
 
 
 async def _get_with_backoff(
@@ -53,14 +28,13 @@ async def _get_with_backoff(
 ) -> dict | list | None:
     """GET with exponential backoff on 429. Returns parsed JSON or None."""
     for attempt in range(MAX_RETRIES + 1):
-        await _throttle()
+        await coingecko_limiter.acquire()
         try:
             async with session.get(url, params=params, timeout=REQUEST_TIMEOUT) as resp:
                 if resp.status == 429:
                     backoff = 2 ** (attempt + 1)
-                    logger.warning(
-                        "cg_429_backoff", attempt=attempt, backoff_s=backoff
-                    )
+                    logger.warning("cg_429_backoff", attempt=attempt, backoff_s=backoff)
+                    await coingecko_limiter.report_429(backoff_seconds=float(backoff))
                     if attempt < MAX_RETRIES:
                         await asyncio.sleep(backoff)
                         continue
@@ -132,8 +106,13 @@ async def fetch_top_movers(
 
     tokens.sort(key=lambda t: t.price_change_1h or 0, reverse=True)
 
-    logger.info("cg_candidates_returned", count=len(tokens), source="coins/markets",
-                 raw_fetched=len(raw_by_id), has_api_key=bool(settings.COINGECKO_API_KEY))
+    logger.info(
+        "cg_candidates_returned",
+        count=len(tokens),
+        source="coins/markets",
+        raw_fetched=len(raw_by_id),
+        has_api_key=bool(settings.COINGECKO_API_KEY),
+    )
     return tokens
 
 

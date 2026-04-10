@@ -12,6 +12,7 @@ import structlog
 
 from scout.db import Database
 from scout.narrative.strategy import Strategy
+from scout.ratelimit import coingecko_limiter
 
 log = structlog.get_logger()
 
@@ -83,6 +84,7 @@ async def fetch_prices_batch(
             "ids": ids_param,
             "per_page": str(_BATCH_SIZE),
         }
+        await coingecko_limiter.acquire()
         try:
             async with session.get(url, params=params, headers=headers) as resp:
                 if resp.status == 429:
@@ -91,6 +93,7 @@ async def fetch_prices_batch(
                         batch_start=i,
                         batch_size=len(batch),
                     )
+                    await coingecko_limiter.report_429()
                     continue
                 if resp.status != 200:
                     log.warning(
