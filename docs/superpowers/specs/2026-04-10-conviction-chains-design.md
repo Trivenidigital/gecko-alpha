@@ -79,6 +79,7 @@ class ChainEvent(BaseModel):
     """A single signal event emitted by any module."""
     id: int | None = None
     token_id: str                      # contract_address or coin_id
+    pipeline: str                      # "narrative" or "memecoin"
     event_type: str                    # e.g. "category_heating", "counter_scored"
     event_data: dict                   # signal-specific payload (JSON)
     source_module: str                 # e.g. "narrative.observer", "scorer"
@@ -116,6 +117,7 @@ class ActiveChain(BaseModel):
     """Tracks an in-progress chain for a specific token."""
     id: int | None = None
     token_id: str
+    pipeline: str                      # "narrative" or "memecoin"
     pattern_id: int
     pattern_name: str
     steps_matched: list[int]           # step_numbers that have matched
@@ -124,14 +126,14 @@ class ActiveChain(BaseModel):
     last_step_time: datetime           # timestamp of most recent matched step
     is_complete: bool = False
     completed_at: datetime | None = None
-    conviction_boost_applied: bool = False
     created_at: datetime
 
 
 class ChainMatch(BaseModel):
-    """A completed chain — stored for LEARN phase analysis."""
+    """A completed chain — stored for LEARN phase analysis and boost application."""
     id: int | None = None
     token_id: str
+    pipeline: str                      # "narrative" or "memecoin"
     pattern_id: int
     pattern_name: str
     steps_matched: int                 # count of steps that fired
@@ -139,7 +141,7 @@ class ChainMatch(BaseModel):
     anchor_time: datetime
     completed_at: datetime
     chain_duration_hours: float        # completed_at - anchor_time
-    conviction_boost: int
+    conviction_boost: int              # boost stored here; applied at scoring time
     outcome_class: str | None = None   # HIT | MISS | NEUTRAL (filled by LEARN)
     outcome_change_pct: float | None = None
     evaluated_at: datetime | None = None
@@ -157,6 +159,7 @@ Every module that produces a meaningful signal calls a single function:
 async def emit_event(
     db: Database,
     token_id: str,
+    pipeline: str,               # "narrative" or "memecoin"
     event_type: str,
     event_data: dict,
     source_module: str,
@@ -165,6 +168,8 @@ async def emit_event(
 ```
 
 This is a thin INSERT into `signal_events`. No business logic — just timestamped append.
+
+> **Note:** Callers must emit events exactly once per decision point. The event store does not deduplicate.
 
 ### Event types
 
@@ -183,11 +188,11 @@ Each existing module emits events at natural decision points. The emitter is a s
 
 ### Token ID resolution
 
-Events use `token_id` which maps to:
-- For memecoin pipeline tokens: `contract_address` (already the primary key in `candidates`)
-- For narrative pipeline tokens: `coin_id` (CoinGecko coin ID, primary key in `predictions`)
+Events use `token_id` plus a mandatory `pipeline` field:
+- For memecoin pipeline tokens: `pipeline="memecoin"`, `token_id=contract_address` (primary key in `candidates`)
+- For narrative pipeline tokens: `pipeline="narrative"`, `token_id=coin_id` (CoinGecko coin ID, primary key in `predictions`)
 
-Since both pipelines can reference the same token (a CoinGecko coin that also appears on DexScreener), the chain tracker must handle both ID formats. The `event_data` payload includes both IDs when available, and the tracker matches on either.
+The `pipeline` column eliminates any namespace collision between contract addresses and coin IDs. The chain tracker only matches events within the same pipeline. Cross-pipeline matching (linking a CoinGecko coin to its on-chain contract) is explicitly out of scope for v1 — see Open Questions.
 
 ### Retention
 
@@ -249,6 +254,9 @@ Steps:
      condition: signal_count >= 2
   2. candidate_scored            within 4h of step 1
      condition: signal_count >= 3 (score improved)
+     NOTE: This must be a DIFFERENT candidate_scored event than the anchor.
+     The tracker's event consumption rule ensures the anchor event cannot
+     also satisfy this step.
   3. counter_scored              within 6h of step 1
      condition: risk_score < 50
   4. conviction_gated            within 8h of step 1
@@ -258,7 +266,7 @@ Conviction boost: +20
 Alert priority: medium
 ```
 
-Rationale: When a token's quant score improves across successive scans (score velocity) and passes the conviction gate with a clean safety profile, it indicates genuine accumulation rather than a one-time spike.
+Rationale: When a token's quant score improves across successive scans (score velocity) and passes the conviction gate with a clean safety profile, it indicates genuine accumulation rather than a one-time spike. The event consumption rule is critical here: step 2 must be satisfied by a later `candidate_scored` event, not the same anchor event with the looser step-1 condition.
 
 ### Pattern storage
 
@@ -269,15 +277,37 @@ Patterns are stored in the `chain_patterns` table (see Section 9) as JSON-serial
 Step conditions are simple comparisons evaluated against `event_data`:
 
 ```python
-def evaluate_condition(condition: str, event_data: dict) -> bool:
+import operator
+import re
+
+_OPERATORS = {
+    ">=": operator.ge,
+    "<=": operator.le,
+    "==": operator.eq,
+    ">":  operator.gt,
+    "<":  operator.lt,
+}
+_CONDITION_RE = re.compile(r"^\s*(\w+)\s*(>=|<=|==|>|<)\s*(-?\d+(?:\.\d+)?)\s*$")
+
+
+def evaluate_condition(condition: str | None, event_data: dict) -> bool:
     """Evaluate a simple condition against event data.
-    
+
     Supported: "field < N", "field > N", "field >= N", "field <= N", "field == N"
     Returns True if condition is None (unconditional step).
     """
+    if condition is None:
+        return True
+    m = _CONDITION_RE.match(condition)
+    if not m:
+        raise ValueError(f"Invalid condition: {condition!r}")
+    field, op_str, value_str = m.groups()
+    if field not in event_data:
+        return False
+    return _OPERATORS[op_str](event_data[field], float(value_str))
 ```
 
-Only simple field comparisons are supported — no complex expressions, no nesting. This keeps the evaluator deterministic and easy to audit. If more complex conditions are needed in the future, extend with explicit named condition functions rather than a mini-language.
+The operator dict makes the evaluator trivially auditable — no string splitting, no eval, no mini-language. If more complex conditions are needed in the future, extend with explicit named condition functions rather than growing the grammar.
 
 ---
 
@@ -304,24 +334,24 @@ Each cycle:
 
 1. **Load active patterns** from `chain_patterns` where `is_active = True`
 2. **Load recent events** from `signal_events` where `created_at > now - max_chain_window` (default: 24h)
-3. **Group events by token_id**
-4. **For each token with events:**
-   a. Load any `active_chains` for this token
+3. **Group events by (token_id, pipeline)** — events are only matched within the same pipeline
+4. **For each (token_id, pipeline) group with events:**
+   a. Load any `active_chains` for this token and pipeline
    b. For each active pattern not yet started for this token:
       - Check if any event matches step 1 (anchor). If so, create an `ActiveChain`.
    c. For each active chain (including newly created):
       - Check unmatched steps against new events
       - Validate time windows (hours since anchor, hours since previous step)
       - Evaluate step conditions against event_data
+      - **Event consumption rule:** When advancing steps, an event that was used as the anchor or a previous step cannot also satisfy a later step. Each event is consumed exactly once per chain. When a step's `event_type` matches an earlier step's `event_type`, the tracker must skip events already consumed by prior steps (matched by `signal_event_id`).
       - If a step matches, add to `steps_matched`
    d. **Check expiry:** If anchor_time + max_chain_window has passed and chain is incomplete, mark expired and delete
    e. **Check completion:** If `len(steps_matched) >= pattern.min_steps_to_trigger`, mark complete
 
 5. **For each newly completed chain:**
-   a. Store a `ChainMatch` record
-   b. Apply conviction boost to the token's score (update `candidates` or `predictions` table)
-   c. Emit a `chain_complete` event
-   d. If `alert_priority` is "high" or "medium", format and send a high-conviction alert
+   a. Store a `ChainMatch` record (includes `conviction_boost` — read by scoring pipeline via `get_active_boosts`)
+   b. Emit a `chain_complete` event
+   c. If `alert_priority` is "high" or "medium", format and send a high-conviction alert
 
 ### Deduplication
 
@@ -402,7 +432,12 @@ Results stored back on `chain_patterns.historical_hit_rate`, `total_triggers`, `
 3. **Graduation**: If hit_rate > 50% after 50+ triggers, promote to `alert_priority: "high"`.
 4. **Retirement**: If hit_rate < baseline after 30+ triggers, set `is_active = False`. Keep data for analysis.
 
-The baseline is the overall pipeline hit rate (alerts without chain completion). This ensures chains add value beyond what the existing pipeline already achieves.
+The baseline is computed **per-pipeline**:
+
+- **Narrative pipeline patterns** (steps sourced from `pipeline="narrative"` events): baseline = narrative prediction hit rate (from `predictions.outcome_class`).
+- **Memecoin pipeline patterns** (steps sourced from `pipeline="memecoin"` events): baseline = existing memecoin pipeline hit rate (alerts without chain completion, from `outcomes`).
+
+Pattern retirement compares a pattern's hit rate against the **same-pipeline** baseline. A pattern is only retired if it underperforms against tokens of the same type — narrative patterns are never compared to memecoin baselines or vice versa. This ensures chains add value beyond what the existing same-pipeline scoring already achieves.
 
 ### Future: LEARN-generated patterns
 
@@ -418,14 +453,17 @@ Once enough signal_events data accumulates (60+ days), the LEARN phase could ana
 CREATE TABLE IF NOT EXISTS signal_events (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     token_id       TEXT NOT NULL,
+    pipeline       TEXT NOT NULL,            -- "narrative" or "memecoin"
     event_type     TEXT NOT NULL,
-    event_data     TEXT NOT NULL,          -- JSON
+    event_data     TEXT NOT NULL,            -- JSON
     source_module  TEXT NOT NULL,
-    created_at     TEXT NOT NULL,
-    UNIQUE(token_id, event_type, created_at)  -- prevent duplicate emissions
+    created_at     TEXT NOT NULL
+    -- No UNIQUE constraint. Events are append-only.
+    -- Callers must emit events exactly once per decision point.
+    -- The event store does not deduplicate.
 );
 CREATE INDEX IF NOT EXISTS idx_sig_events_token
-    ON signal_events(token_id, created_at);
+    ON signal_events(token_id, pipeline, created_at);
 CREATE INDEX IF NOT EXISTS idx_sig_events_type
     ON signal_events(event_type, created_at);
 ```
@@ -458,6 +496,7 @@ CREATE TABLE IF NOT EXISTS chain_patterns (
 CREATE TABLE IF NOT EXISTS active_chains (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     token_id       TEXT NOT NULL,
+    pipeline       TEXT NOT NULL,           -- "narrative" or "memecoin"
     pattern_id     INTEGER NOT NULL REFERENCES chain_patterns(id),
     pattern_name   TEXT NOT NULL,
     steps_matched  TEXT NOT NULL,           -- JSON array of step numbers
@@ -466,12 +505,11 @@ CREATE TABLE IF NOT EXISTS active_chains (
     last_step_time TEXT NOT NULL,
     is_complete    INTEGER DEFAULT 0,
     completed_at   TEXT,
-    conviction_boost_applied INTEGER DEFAULT 0,
     created_at     TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(token_id, pattern_id, anchor_time)
+    UNIQUE(token_id, pipeline, pattern_id, anchor_time)
 );
 CREATE INDEX IF NOT EXISTS idx_active_chains_token
-    ON active_chains(token_id, is_complete);
+    ON active_chains(token_id, pipeline, is_complete);
 ```
 
 Cleanup: Expired and completed chains older than 7 days are pruned from `active_chains`. Completed chains are preserved in `chain_matches`.
@@ -482,6 +520,7 @@ Cleanup: Expired and completed chains older than 7 days are pruned from `active_
 CREATE TABLE IF NOT EXISTS chain_matches (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     token_id             TEXT NOT NULL,
+    pipeline             TEXT NOT NULL,      -- "narrative" or "memecoin"
     pattern_id           INTEGER NOT NULL REFERENCES chain_patterns(id),
     pattern_name         TEXT NOT NULL,
     steps_matched        INTEGER NOT NULL,
@@ -498,7 +537,25 @@ CREATE TABLE IF NOT EXISTS chain_matches (
 CREATE INDEX IF NOT EXISTS idx_chain_matches_pattern
     ON chain_matches(pattern_id, outcome_class);
 CREATE INDEX IF NOT EXISTS idx_chain_matches_token
-    ON chain_matches(token_id, completed_at);
+    ON chain_matches(token_id, pipeline, completed_at);
+```
+
+### Boost query: `get_active_boosts`
+
+The existing pipeline reads from `chain_matches` at scoring time to apply boosts. The chain tracker is read-only on all other tables.
+
+```python
+async def get_active_boosts(db: Database, token_id: str, pipeline: str) -> int:
+    """Return the total conviction boost for a token, capped at total_boost_cap.
+
+    Sums conviction_boost from chain_matches completed within CHAIN_COOLDOWN_HOURS.
+    """
+    # SQL:
+    # SELECT MIN(SUM(conviction_boost), :total_boost_cap)
+    # FROM chain_matches
+    # WHERE token_id = :token_id
+    #   AND pipeline = :pipeline
+    #   AND completed_at > datetime('now', '-' || :cooldown || ' hours')
 ```
 
 ---
@@ -517,6 +574,7 @@ CHAIN_PROMOTION_THRESHOLD: float = 0.10      # hit_rate must exceed baseline by 
 CHAIN_GRADUATION_MIN_TRIGGERS: int = 50      # min triggers for "high" priority
 CHAIN_GRADUATION_HIT_RATE: float = 0.50      # min hit rate for "high" priority
 CHAIN_ALERT_ON_COMPLETE: bool = True         # send Telegram on high-priority chain completion
+CHAIN_TOTAL_BOOST_CAP: int = 30              # max combined boost applied to a single token
 ```
 
 All values from Settings (Pydantic BaseSettings), overridable via `.env`.
@@ -531,41 +589,47 @@ Each existing module gets ONE new line at its natural decision point:
 
 ```python
 # In narrative/observer.py, after detecting heating:
-await emit_event(db, category_id, "category_heating", {
-    "category_id": cat.category_id, "name": cat.name,
-    "acceleration": cat.acceleration, "volume_growth_pct": cat.volume_growth_pct,
-    "market_regime": market_regime,
-}, source_module="narrative.observer")
+await emit_event(db, category_id, pipeline="narrative", event_type="category_heating",
+    event_data={
+        "category_id": cat.category_id, "name": cat.name,
+        "acceleration": cat.acceleration, "volume_growth_pct": cat.volume_growth_pct,
+        "market_regime": market_regime,
+    }, source_module="narrative.observer")
 
 # In narrative/predictor.py, after selecting a laggard:
-await emit_event(db, token.coin_id, "laggard_picked", {
-    "category_id": accel.category_id, "category_name": accel.name,
-    "narrative_fit_score": score_result["narrative_fit"],
-    "confidence": score_result["confidence"],
-    "trigger_count": trigger_count,
-}, source_module="narrative.predictor")
+await emit_event(db, token.coin_id, pipeline="narrative", event_type="laggard_picked",
+    event_data={
+        "category_id": accel.category_id, "category_name": accel.name,
+        "narrative_fit_score": score_result["narrative_fit"],
+        "confidence": score_result["confidence"],
+        "trigger_count": trigger_count,
+    }, source_module="narrative.predictor")
 
 # In scorer.py, after scoring:
-await emit_event(db, token.contract_address, "candidate_scored", {
-    "quant_score": score, "signals_fired": signals, "signal_count": len(signals),
-}, source_module="scorer")
+await emit_event(db, token.contract_address, pipeline="memecoin",
+    event_type="candidate_scored", event_data={
+        "quant_score": score, "signals_fired": signals, "signal_count": len(signals),
+    }, source_module="scorer")
 
 # In counter/scorer.py, after scoring:
-await emit_event(db, token_id, "counter_scored", {
-    "risk_score": result.risk_score, "flag_count": len(result.flags),
-    "high_severity_count": sum(1 for f in result.flags if f.severity == "high"),
-    "data_completeness": result.data_completeness,
-}, source_module="counter.scorer")
+await emit_event(db, token_id, pipeline="memecoin", event_type="counter_scored",
+    event_data={
+        "risk_score": result.risk_score, "flag_count": len(result.flags),
+        "high_severity_count": sum(1 for f in result.flags if f.severity == "high"),
+        "data_completeness": result.data_completeness,
+    }, source_module="counter.scorer")
 
 # In gate.py, after gating:
-await emit_event(db, token.contract_address, "conviction_gated", {
-    "conviction_score": conviction, "quant_score": quant, "narrative_score": narrative,
-}, source_module="gate")
+await emit_event(db, token.contract_address, pipeline="memecoin",
+    event_type="conviction_gated", event_data={
+        "conviction_score": conviction, "quant_score": quant, "narrative_score": narrative,
+    }, source_module="gate")
 
 # In alerter.py, after sending alert:
-await emit_event(db, token.contract_address, "alert_fired", {
-    "conviction_score": conviction, "alert_type": "telegram",
-}, source_module="alerter")
+await emit_event(db, token.contract_address, pipeline="memecoin",
+    event_type="alert_fired", event_data={
+        "conviction_score": conviction, "alert_type": "telegram",
+    }, source_module="alerter")
 ```
 
 ### main.py integration
@@ -582,15 +646,19 @@ await asyncio.gather(
 
 ### Conviction score boost
 
-When a chain completes for a candidate token, the tracker updates the token's conviction score:
+When a chain completes, the tracker stores the boost in the `chain_matches` table. The chain tracker does **not** directly update conviction scores in other tables — it remains read-only on `candidates` and `predictions`.
+
+The existing scoring pipeline reads active boosts at scoring time via `get_active_boosts(token_id, pipeline)` and applies them additively:
 
 ```python
-# In tracker.py, on chain completion:
-boosted_score = min(100, current_conviction + pattern.conviction_boost)
-await db.update_conviction_score(token_id, boosted_score)
+# In scorer.py or gate.py, at scoring time:
+chain_boost = await get_active_boosts(db, token_id, pipeline)
+boosted_score = min(100, current_conviction + chain_boost)
 ```
 
-This is a simple score addition, not a re-run of the full scoring pipeline. The boost is additive and capped at 100.
+This keeps the chain tracker decoupled from the scoring pipeline and ensures boosts are always fresh.
+
+> **Note:** Chain boosts are retrospective — they affect future scoring cycles, not the cycle in which the chain completed. This is by design: the chain needs time to form, so the boost rewards the next opportunity.
 
 ---
 
@@ -600,8 +668,8 @@ This is a simple score addition, not a re-run of the full scoring pipeline. The 
 
 | Test | What it verifies |
 |------|-----------------|
-| `test_emit_event` | Event is stored in signal_events with correct fields |
-| `test_emit_event_dedup` | Duplicate events (same token+type+timestamp) are rejected |
+| `test_emit_event` | Event is stored in signal_events with correct fields including `pipeline` |
+| `test_emit_event_append_only` | Two calls with identical args produce two rows (no dedup in store) |
 | `test_evaluate_condition_lt` | `"risk_score < 30"` evaluates correctly |
 | `test_evaluate_condition_gt` | `"signal_count >= 3"` evaluates correctly |
 | `test_evaluate_condition_none` | `None` condition always returns True |
@@ -614,6 +682,11 @@ This is a simple score addition, not a re-run of the full scoring pipeline. The 
 | `test_chain_completion_fires_event` | Completed chain emits chain_complete event |
 | `test_chain_cooldown` | Same pattern+token cannot re-trigger within cooldown |
 | `test_chain_expiry` | Chain past max_window is cleaned up |
+| `test_pipeline_isolation` | `narrative` events never match a `memecoin` chain and vice versa, even with identical `token_id` strings |
+| `test_event_consumption_rule` | `volume_breakout` pattern: a single `candidate_scored` event cannot satisfy both anchor and step 2; step 2 requires a distinct event |
+| `test_out_of_order_steps` | Step 3 event arrives before step 2. Chain should still match if both events fall within the time window, regardless of arrival order. Steps are matched by time window, not arrival sequence |
+| `test_get_active_boosts_caps_total` | Two completed chains (+25, +15) produce `get_active_boosts = 30`, not 40 |
+| `test_pattern_hit_rate_per_pipeline_baseline` | Narrative patterns compared to narrative baseline; memecoin patterns to memecoin baseline |
 | `test_pattern_hit_rate` | Hit rate computed correctly from chain_matches |
 | `test_alert_formatting` | Chain completion alert has correct format |
 
@@ -713,6 +786,6 @@ Conviction Chains (24h):
 
 1. **Cross-pipeline token matching:** When a token appears in both the narrative pipeline (coin_id) and memecoin pipeline (contract_address), how do we reliably link them? CoinGecko coin detail has `platforms` with contract addresses, but we'd need an extra API call. For v1, chains are pipeline-scoped (narrative events only match narrative chains, memecoin events only match memecoin chains). Cross-pipeline matching is a v2 feature.
 
-2. **Conviction boost stacking:** Can multiple completed chains boost the same token? For v1, yes — but total boost is capped at +30 points. A token that completes both `full_conviction` (+25) and `narrative_momentum` (+15) gets +30, not +40.
+2. **Conviction boost stacking:** Can multiple completed chains boost the same token? For v1, yes — but total boost is capped at `CHAIN_TOTAL_BOOST_CAP` (default: 30). The cap is enforced centrally in `get_active_boosts()` via `SELECT MIN(SUM(conviction_boost), :total_boost_cap) FROM chain_matches WHERE ...`. A token that completes both `full_conviction` (+25) and `narrative_momentum` (+15) receives +30, not +40. There is exactly one cap source of truth — the config key — and both the pattern definitions and the query honor it.
 
 3. **Real-time vs. batch:** The 5-minute check interval means chains complete with up to 5 minutes of latency. This is fine for the current pipeline (30-min scan cycles). If the pipeline moves to real-time event streaming, the tracker could switch to event-driven processing.
