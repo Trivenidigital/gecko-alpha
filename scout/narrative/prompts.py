@@ -43,6 +43,9 @@ CURRENT STRATEGY:
 MARKET REGIME BREAKDOWN:
 {regime_breakdown}
 
+COUNTER-RISK HIT RATES (pre-aggregated):
+{counter_summary}
+
 Analyze:
 1. Which categories produced the most HITs vs MISSes?
 2. Did narrative_fit_score correlate with outcomes?
@@ -51,6 +54,7 @@ Analyze:
 5. Does trigger_count correlate with better outcomes?
 6. Market regime: should thresholds differ in BULL vs BEAR vs CRAB?
 7. Survivorship: did categories with negative coin_count_change produce more MISSes?
+8. Does counter_risk_score correlate with outcomes? Do high counter scores produce more MISSes?
 
 Suggest 0-3 strategy adjustments:
 {{"key": "<strategy_key>", "new_value": <value>, "reason": "<citing data>"}}

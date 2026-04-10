@@ -15,6 +15,7 @@ class Settings(BaseSettings):
 
     # Scanner
     SCAN_INTERVAL_SECONDS: int = 60
+    HEARTBEAT_INTERVAL_SECONDS: int = 300  # BL-033: periodic heartbeat summary
     MIN_SCORE: int = 60
     CONVICTION_THRESHOLD: int = 70
     QUANT_WEIGHT: float = 0.6
@@ -78,6 +79,13 @@ class Settings(BaseSettings):
     def parse_chains(cls, v: str | list[str]) -> list[str]:
         if isinstance(v, str):
             return [c.strip() for c in v.split(",") if c.strip()]
+        return v
+
+    @field_validator("HEARTBEAT_INTERVAL_SECONDS")
+    @classmethod
+    def _validate_heartbeat(cls, v: int) -> int:
+        if v <= 0:
+            return 300  # default fallback
         return v
 
     @model_validator(mode="after")
