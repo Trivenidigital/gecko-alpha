@@ -17,7 +17,7 @@ from scout.alerter import format_daily_summary, send_alert, send_telegram_messag
 from scout.chains.events import safe_emit
 from scout.chains.patterns import seed_built_in_patterns
 from scout.chains.tracker import run_chain_tracker
-from scout.config import Settings
+from scout.config import Settings, configure_cache
 from scout.db import Database
 from scout.gate import evaluate
 from scout.ingestion.coingecko import fetch_top_movers as cg_fetch_top_movers
@@ -792,6 +792,9 @@ async def main() -> None:
     )
 
     settings = Settings()
+    # Pre-populate the module-level settings cache to avoid async race
+    # on first lazy get_settings() call during startup.
+    configure_cache(settings)
     if args.min_score_override is not None:
         settings.MIN_SCORE = args.min_score_override
         logger.info("MIN_SCORE overridden", min_score=settings.MIN_SCORE)

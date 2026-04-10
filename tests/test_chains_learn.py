@@ -1,5 +1,5 @@
 """Tests for chain pattern LEARN phase: hit rate, promotion, retirement."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -8,6 +8,7 @@ from scout.chains.patterns import (
     run_pattern_lifecycle,
     seed_built_in_patterns,
 )
+from scout.chains.tracker import update_chain_outcomes
 from scout.config import Settings
 from scout.db import Database
 
@@ -123,3 +124,77 @@ async def test_pattern_retirement(db, settings):
     ) as cur:
         active = (await cur.fetchone())[0]
     assert active == 0
+
+
+async def test_update_chain_outcomes_from_predictions(db, settings):
+    """Chain outcomes (narrative pipeline) are hydrated from predictions."""
+    async with db._conn.execute(
+        "SELECT id FROM chain_patterns WHERE name='full_conviction'"
+    ) as cur:
+        pid = (await cur.fetchone())[0]
+
+    coin_id = "hydrated-coin-1"
+    old_ts = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Insert a prediction with a realized HIT outcome for this coin.
+    await db._conn.execute(
+        """INSERT INTO predictions
+           (category_id, category_name, coin_id, symbol, name,
+            market_cap_at_prediction, price_at_prediction,
+            narrative_fit_score, staying_power, confidence, reasoning,
+            strategy_snapshot, predicted_at, outcome_class, evaluated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "cat-1", "Cat One", coin_id, "HYD", "Hydrated",
+            1_000_000.0, 0.01, 80, "STRONG", "HIGH", "reason",
+            "{}", old_ts, "HIT", now_iso,
+        ),
+    )
+    # Insert a stale (>48h) chain_match for the same coin with NULL outcome.
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            coin_id, "narrative", pid, "full_conviction", 3, 4,
+            old_ts, old_ts, 2.0, 25,
+        ),
+    )
+    await db._conn.commit()
+
+    updated = await update_chain_outcomes(db)
+    assert updated == 1
+
+    async with db._conn.execute(
+        "SELECT outcome_class FROM chain_matches WHERE token_id = ?",
+        (coin_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    assert row[0] == "hit"
+
+
+async def test_update_chain_outcomes_skips_recent(db, settings):
+    """Chain matches younger than 48h are not hydrated yet."""
+    async with db._conn.execute(
+        "SELECT id FROM chain_patterns WHERE name='full_conviction'"
+    ) as cur:
+        pid = (await cur.fetchone())[0]
+
+    recent_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "recent-coin", "narrative", pid, "full_conviction", 3, 4,
+            recent_ts, recent_ts, 1.0, 25,
+        ),
+    )
+    await db._conn.commit()
+    updated = await update_chain_outcomes(db)
+    assert updated == 0

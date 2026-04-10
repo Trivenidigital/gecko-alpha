@@ -25,6 +25,22 @@ from scout.db import Database
 logger = structlog.get_logger()
 
 
+def _parse_time(value) -> datetime:
+    """Coerce a value to a timezone-aware datetime.
+
+    Accepts either ISO-formatted strings or datetime instances. Naive
+    datetimes are assumed to be UTC. Avoids fragile string comparison
+    of timestamps across the tracker.
+    """
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        dt = datetime.fromisoformat(str(value))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -55,70 +71,91 @@ async def run_chain_tracker(db: Database, settings: Settings) -> None:
 
 
 async def check_chains(db: Database, settings: Settings) -> None:
-    """One pass of the pattern matching engine."""
+    """One pass of the pattern matching engine, wrapped in a single
+    transaction so that writes across helpers commit atomically."""
     patterns = await load_active_patterns(db)
     if not patterns:
         return
 
     events = await load_recent_events(db, max_hours=settings.CHAIN_MAX_WINDOW_HOURS)
-    if not events:
+
+    conn = db._conn
+    try:
+        await conn.execute("BEGIN")
+    except Exception:
+        # Another BEGIN may already be in flight (test harness); fall back
+        # to the existing transaction.
+        pass
+
+    try:
+        if not events:
+            await _prune_stale(db, settings)
+            await conn.commit()
+            return
+
+        # Deterministic order: timestamp then id
+        events.sort(key=lambda e: (e.created_at, e.id or 0))
+
+        # Group by (token_id, pipeline)
+        groups: dict[tuple[str, str], list[ChainEvent]] = {}
+        for ev in events:
+            groups.setdefault((ev.token_id, ev.pipeline), []).append(ev)
+
+        active_by_key = await _load_active_chains(db)
+
+        now = datetime.now(timezone.utc)
+        completed_chains: list[tuple[ActiveChain, ChainPattern]] = []
+
+        for (token_id, pipeline), token_events in groups.items():
+            for pattern in patterns:
+                key = (token_id, pipeline, pattern.id)
+                chain = active_by_key.get(key)
+
+                # Expiry check for pre-existing chain
+                if chain is not None and not chain.is_complete:
+                    age_h = (now - chain.anchor_time).total_seconds() / 3600.0
+                    if age_h > settings.CHAIN_MAX_WINDOW_HOURS:
+                        await _record_expired_chain(db, chain, pattern, now)
+                        await _delete_active_chain(db, chain)
+                        active_by_key.pop(key, None)
+                        chain = None
+                        logger.info(
+                            "chain_expired",
+                            token_id=token_id,
+                            pattern=pattern.name,
+                        )
+
+                # Skip entirely if a recent completion exists (cooldown)
+                if chain is None and await _in_cooldown(
+                    db, token_id, pipeline, pattern, settings
+                ):
+                    continue
+
+                # Advance or create
+                chain, newly_complete = _advance_chain(
+                    chain, pattern, token_id, pipeline, token_events, now
+                )
+                if chain is None:
+                    continue
+
+                active_by_key[key] = chain
+                await _persist_active_chain(db, chain)
+
+                if newly_complete:
+                    completed_chains.append((chain, pattern))
+
+        for chain, pattern in completed_chains:
+            await _record_completion(db, chain, pattern, settings)
+
         await _prune_stale(db, settings)
-        return
-
-    # Deterministic order: timestamp then id
-    events.sort(key=lambda e: (e.created_at, e.id or 0))
-
-    # Group by (token_id, pipeline)
-    groups: dict[tuple[str, str], list[ChainEvent]] = {}
-    for ev in events:
-        groups.setdefault((ev.token_id, ev.pipeline), []).append(ev)
-
-    active_by_key = await _load_active_chains(db)
-
-    now = datetime.now(timezone.utc)
-    completed_chains: list[tuple[ActiveChain, ChainPattern]] = []
-
-    for (token_id, pipeline), token_events in groups.items():
-        for pattern in patterns:
-            key = (token_id, pipeline, pattern.id)
-            chain = active_by_key.get(key)
-
-            # Expiry check for pre-existing chain
-            if chain is not None and not chain.is_complete:
-                age_h = (now - chain.anchor_time).total_seconds() / 3600.0
-                if age_h > settings.CHAIN_MAX_WINDOW_HOURS:
-                    await _delete_active_chain(db, chain)
-                    active_by_key.pop(key, None)
-                    chain = None
-                    logger.info(
-                        "chain_expired",
-                        token_id=token_id,
-                        pattern=pattern.name,
-                    )
-
-            # Skip entirely if a recent completion exists (cooldown)
-            if chain is None and await _in_cooldown(
-                db, token_id, pipeline, pattern, settings
-            ):
-                continue
-
-            # Advance or create
-            chain, newly_complete = _advance_chain(
-                chain, pattern, token_id, pipeline, token_events, now
-            )
-            if chain is None:
-                continue
-
-            active_by_key[key] = chain
-            await _persist_active_chain(db, chain)
-
-            if newly_complete:
-                completed_chains.append((chain, pattern))
-
-    for chain, pattern in completed_chains:
-        await _record_completion(db, chain, pattern, settings)
-
-    await _prune_stale(db, settings)
+        await conn.commit()
+    except Exception:
+        try:
+            await conn.rollback()
+        except Exception:
+            pass
+        logger.exception("chain_check_failed")
+        raise
 
 
 def _advance_chain(
@@ -328,7 +365,52 @@ async def _persist_active_chain(db: Database, chain: ActiveChain) -> None:
                 chain.completed_at.isoformat() if chain.completed_at else None,
             ),
         )
-        chain.id = cursor.lastrowid
+        if cursor.lastrowid:
+            chain.id = cursor.lastrowid
+        else:
+            # Conflict on UNIQUE(token_id, pipeline, pattern_id, anchor_time)
+            # — fetch the existing row so subsequent updates apply correctly.
+            async with conn.execute(
+                """SELECT id FROM active_chains
+                   WHERE token_id = ? AND pipeline = ? AND pattern_id = ?
+                     AND anchor_time = ?""",
+                (
+                    chain.token_id,
+                    chain.pipeline,
+                    chain.pattern_id,
+                    chain.anchor_time.isoformat(),
+                ),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is not None:
+                chain.id = row["id"]
+                # Update the row we just discovered so new fields are persisted.
+                await conn.execute(
+                    """UPDATE active_chains
+                       SET steps_matched = ?, step_events = ?,
+                           last_step_time = ?, is_complete = ?,
+                           completed_at = ?
+                       WHERE id = ?""",
+                    (
+                        steps_json,
+                        events_json,
+                        chain.last_step_time.isoformat(),
+                        1 if chain.is_complete else 0,
+                        (
+                            chain.completed_at.isoformat()
+                            if chain.completed_at
+                            else None
+                        ),
+                        chain.id,
+                    ),
+                )
+            else:
+                logger.warning(
+                    "chain_insert_conflict_no_row",
+                    token_id=chain.token_id,
+                    pattern=chain.pattern_name,
+                )
+                return
     else:
         await conn.execute(
             """UPDATE active_chains
@@ -344,14 +426,12 @@ async def _persist_active_chain(db: Database, chain: ActiveChain) -> None:
                 chain.id,
             ),
         )
-    await conn.commit()
 
 
 async def _delete_active_chain(db: Database, chain: ActiveChain) -> None:
     if chain.id is None:
         return
     await db._conn.execute("DELETE FROM active_chains WHERE id = ?", (chain.id,))
-    await db._conn.commit()
 
 
 async def _in_cooldown(
@@ -409,7 +489,6 @@ async def _record_completion(
         "UPDATE chain_patterns SET total_triggers = total_triggers + 1 WHERE id = ?",
         (pattern.id,),
     )
-    await db._conn.commit()
 
     await safe_emit(
         db,
@@ -438,6 +517,121 @@ async def _record_completion(
             logger.exception("chain_alert_failed", pattern=pattern.name)
 
 
+async def _record_expired_chain(
+    db: Database,
+    chain: ActiveChain,
+    pattern: ChainPattern,
+    now: datetime,
+) -> None:
+    """Record an expired (unresolved) chain as a miss in chain_matches.
+
+    Only records if at least one step was matched — otherwise there is
+    nothing meaningful for the LEARN phase to learn from.
+    """
+    steps_matched = len(chain.steps_matched)
+    if steps_matched <= 0:
+        return
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'EXPIRED')""",
+        (
+            chain.token_id,
+            chain.pipeline,
+            pattern.id,
+            pattern.name,
+            steps_matched,
+            len(pattern.steps),
+            chain.anchor_time.isoformat(),
+            now.isoformat(),
+            round(
+                (chain.last_step_time - chain.anchor_time).total_seconds()
+                / 3600.0,
+                3,
+            ),
+            0,
+        ),
+    )
+
+
+async def update_chain_outcomes(db: Database) -> int:
+    """Hydrate chain_matches.outcome_class from downstream outcome tables.
+
+    For each completed chain_match that is older than 48h and still has
+    outcome_class NULL, look up the token's realized outcome:
+
+    * narrative pipeline  -> predictions.outcome_class (HIT / MISS / etc.)
+    * memecoin pipeline   -> outcomes.price_change_pct (positive => hit)
+
+    Returns the number of rows updated. Designed to be invoked once per
+    daily LEARN cycle before compute_pattern_stats.
+    """
+    conn = db._conn
+    if conn is None:
+        raise RuntimeError("Database not initialized")
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+    async with conn.execute(
+        """SELECT id, token_id, pipeline FROM chain_matches
+           WHERE outcome_class IS NULL AND completed_at < ?""",
+        (cutoff,),
+    ) as cur:
+        pending = await cur.fetchall()
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    updated = 0
+    for row in pending:
+        match_id = row["id"]
+        token_id = row["token_id"]
+        pipeline = row["pipeline"]
+        outcome: str | None = None
+
+        if pipeline == "narrative":
+            async with conn.execute(
+                """SELECT outcome_class FROM predictions
+                   WHERE coin_id = ?
+                     AND outcome_class IS NOT NULL
+                     AND outcome_class != 'UNRESOLVED'
+                   ORDER BY predicted_at DESC LIMIT 1""",
+                (token_id,),
+            ) as cur2:
+                prow = await cur2.fetchone()
+            if prow is not None and prow[0]:
+                outcome = str(prow[0]).lower()
+                # Normalize to hit/miss so it matches compute_pattern_stats
+                # which compares against 'hit'.
+                if outcome not in ("hit", "miss"):
+                    outcome = "hit" if outcome == "hit" else "miss"
+        elif pipeline == "memecoin":
+            async with conn.execute(
+                """SELECT price_change_pct FROM outcomes
+                   WHERE contract_address = ? AND price_change_pct IS NOT NULL
+                   ORDER BY id DESC LIMIT 1""",
+                (token_id,),
+            ) as cur2:
+                orow = await cur2.fetchone()
+            if orow is not None and orow[0] is not None:
+                outcome = "hit" if float(orow[0]) > 0 else "miss"
+
+        if outcome is None:
+            continue
+
+        await conn.execute(
+            """UPDATE chain_matches
+               SET outcome_class = ?, evaluated_at = ?
+               WHERE id = ?""",
+            (outcome, now_iso, match_id),
+        )
+        updated += 1
+
+    await conn.commit()
+    if updated:
+        logger.info("chain_outcomes_hydrated", count=updated)
+    return updated
+
+
 async def _prune_stale(db: Database, settings: Settings) -> None:
     """Prune old signal_events and stale/completed active_chains."""
     deleted_events = await prune_old_events(
@@ -456,7 +650,6 @@ async def _prune_stale(db: Database, settings: Settings) -> None:
               OR (is_complete = 0 AND anchor_time < ?)""",
         (cutoff, cutoff),
     )
-    await db._conn.commit()
     if cursor.rowcount:
         logger.debug("chain_active_pruned", count=cursor.rowcount)
 

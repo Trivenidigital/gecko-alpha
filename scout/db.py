@@ -292,6 +292,8 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_active_chains_token
                 ON active_chains(token_id, pipeline, is_complete);
+            CREATE INDEX IF NOT EXISTS idx_active_chains_prune
+                ON active_chains(is_complete, completed_at, anchor_time);
 
             CREATE TABLE IF NOT EXISTS chain_matches (
                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
