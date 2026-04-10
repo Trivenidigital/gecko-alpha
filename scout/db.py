@@ -523,7 +523,7 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         cursor = await self._conn.execute(
-            "SELECT holder_count FROM holder_snapshots WHERE contract_address = ? ORDER BY scanned_at DESC LIMIT 1",
+            "SELECT holder_count FROM holder_snapshots WHERE contract_address = ? ORDER BY scanned_at DESC, id DESC LIMIT 1",
             (contract_address,),
         )
         row = await cursor.fetchone()
