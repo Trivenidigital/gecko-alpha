@@ -9,11 +9,12 @@ import structlog
 
 from scout.config import Settings
 from scout.db import Database
+from scout.ratelimit import coingecko_limiter
 from scout.secondwave.alerts import format_secondwave_alert
 
 logger = structlog.get_logger(__name__)
 
-# Hardcoded to avoid fragile imports across ingestion modules.
+# Hardcoded here to avoid a fragile import dependency on scout.ingestion.coingecko.
 CG_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 
 
@@ -26,11 +27,17 @@ def score_reaccumulation(
     alert_price: float,
     volume_history: list[float],
     settings: Settings,
+    price_is_stale: bool = False,
 ) -> tuple[int, list[str]]:
     """Compute re-accumulation score (0-100) and fired signals.
 
     4 signals: sufficient_drawdown (30), price_recovery (35),
     volume_pickup (20), strong_prior_signal (15).
+
+    When ``price_is_stale`` is True the ``price_recovery`` signal is
+    suppressed entirely: the "current price" is just the alert price echoed
+    back, so a recovery signal would fire unconditionally and create a
+    systemic bias toward stale-price tokens.
     """
     points = 0
     signals: list[str] = []
@@ -42,15 +49,23 @@ def score_reaccumulation(
             points += 30
             signals.append("sufficient_drawdown")
 
-    # Signal 2: Price recovery vs alert price (35 pts)
-    if current_price is not None and alert_price and alert_price > 0:
+    # Signal 2: Price recovery vs alert price (35 pts) — SKIP if stale.
+    # A stale price is just alert_price echoed back, which would always satisfy
+    # the recovery threshold and bias the score toward stale tokens.
+    if (
+        not price_is_stale
+        and current_price is not None
+        and alert_price
+        and alert_price > 0
+    ):
         price_vs_alert_pct = (current_price / alert_price) * 100
         if price_vs_alert_pct >= settings.SECONDWAVE_MIN_RECOVERY_PCT:
             points += 35
             signals.append("price_recovery")
 
     # Signal 3: Volume pickup vs cooldown average (20 pts)
-    if current_volume is not None and len(volume_history) >= 3:
+    min_vol_points = max(2, int(getattr(settings, "SECONDWAVE_MIN_VOLUME_POINTS", 2)))
+    if current_volume is not None and len(volume_history) >= min_vol_points:
         cooldown_avg = sum(volume_history) / len(volume_history)
         if cooldown_avg > 0:
             vol_ratio = current_volume / cooldown_avg
@@ -144,11 +159,23 @@ async def fetch_current_prices(
         headers["x-cg-demo-api-key"] = settings.COINGECKO_API_KEY
     params = {"vs_currency": "usd", "ids": ids_param, "per_page": 250}
     try:
+        # Honor the shared CoinGecko rate limit (25/min token bucket) so the
+        # second-wave detector never bypasses the global budget.
+        await coingecko_limiter.acquire()
         async with session.get(
             CG_MARKETS_URL,
             params=params,
             headers=headers,
         ) as resp:
+            if resp.status == 429:
+                # The shared limiter does not yet expose a report_429()
+                # hook, so log loudly and abort this cycle — the next cycle
+                # will naturally back off via the token bucket.
+                logger.warning(
+                    "secondwave_cg_markets_429",
+                    message="CoinGecko 429 — backing off until next cycle",
+                )
+                return {}
             if resp.status != 200:
                 logger.warning("secondwave_cg_markets_error", status=resp.status)
                 return {}
@@ -186,6 +213,9 @@ async def run_once(
 
     # Resolve CoinGecko coin_id for each candidate via symbol lookup against
     # the predictions table (narrative-agent tokens).
+    # NOTE: this mapping is only populated when NARRATIVE_ENABLED=true. When
+    # the narrative agent is disabled, every candidate will fall through to
+    # the stale-price path below and be skipped by the alerter.
     for scan_row in scan_candidates:
         cg_id = await db.get_coingecko_id_by_symbol(scan_row.get("ticker") or "")
         scan_row["coingecko_id"] = cg_id
@@ -222,6 +252,7 @@ async def run_once(
             alert_price=scan_row.get("alert_price") or 0.0,
             volume_history=volume_history,
             settings=settings,
+            price_is_stale=price_is_stale,
         )
 
         if score < settings.SECONDWAVE_ALERT_THRESHOLD:
@@ -238,6 +269,20 @@ async def run_once(
             price_is_stale=price_is_stale,
         )
         await db.insert_secondwave_candidate(sw)
+
+        # Never emit alerts for candidates whose "current price" is just the
+        # alert price echoed back — that path cannot contribute recovery
+        # evidence and would be a systemic false-positive source. Candidate
+        # is still persisted above so the dashboard can surface it.
+        if price_is_stale:
+            logger.info(
+                "secondwave_stale_price_skipped",
+                symbol=scan_row.get("ticker"),
+                contract_address=scan_row.get("contract_address"),
+                score=score,
+            )
+            continue
+
         await send_telegram_message(format_secondwave_alert(sw), session, settings)
         alerts_fired += 1
 
@@ -252,6 +297,18 @@ async def secondwave_loop(
     db = Database(settings.DB_PATH)
     await db.initialize()
     logger.info("secondwave_loop_started", interval=settings.SECONDWAVE_POLL_INTERVAL)
+    if not getattr(settings, "NARRATIVE_ENABLED", False):
+        # Symbol-to-coingecko_id lookup lives in the narrative predictions
+        # table; without the narrative agent populating it, every candidate
+        # falls through to the stale-price path and is skipped by run_once.
+        logger.warning(
+            "secondwave_narrative_disabled",
+            message=(
+                "NARRATIVE_ENABLED=false — all second-wave tokens will fall "
+                "back to stale price mode and be skipped by the alerter, "
+                "reducing detection quality"
+            ),
+        )
     try:
         while True:
             try:

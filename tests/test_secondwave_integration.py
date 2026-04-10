@@ -61,15 +61,15 @@ async def test_end_to_end_dex_token_detection(db, tmp_path):
         async with aiohttp.ClientSession() as session:
             fired = await run_once(session, db, settings)
 
-    # DEX token with stale price == alert_price: price_recovery fires (100% >= 70%),
-    # sufficient_drawdown does NOT (no drawdown because current_mcap = alert_mcap),
-    # strong_prior_signal fires (80 >= 75). Score = 35 + 15 = 50 -> exactly at threshold.
-    assert fired == 1
+    # DEX token with no CG mapping falls through to the stale-price path.
+    # price_recovery is suppressed (systemic bias fix), sufficient_drawdown
+    # does NOT fire (no drawdown because current_mcap == alert_mcap), and
+    # strong_prior_signal (15) alone is below the 50-pt threshold, so the
+    # candidate is filtered out entirely — no alert, no DB row.
+    assert fired == 0
 
     rows = await db.get_recent_secondwave_candidates(days=7)
-    assert len(rows) == 1
-    assert rows[0]["contract_address"] == "0xdex"
-    assert rows[0]["price_is_stale"] is True
+    assert rows == []
 
 
 async def test_end_to_end_narrative_token_live_price(db, tmp_path):

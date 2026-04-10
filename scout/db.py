@@ -639,7 +639,14 @@ class Database:
         return [dict(r) for r in rows]
 
     async def get_coingecko_id_by_symbol(self, symbol: str) -> str | None:
-        """Look up a CoinGecko coin_id from the predictions table by ticker symbol."""
+        """Look up a CoinGecko coin_id from the predictions table by ticker symbol.
+
+        Symbol-to-coin_id mapping requires the narrative agent to be enabled
+        (``NARRATIVE_ENABLED=true``). When disabled, the predictions table is
+        empty and every caller will receive ``None``. In the second-wave
+        detector this causes tokens to fall back to the stale-price path,
+        where alerts are suppressed entirely.
+        """
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         if not symbol:
