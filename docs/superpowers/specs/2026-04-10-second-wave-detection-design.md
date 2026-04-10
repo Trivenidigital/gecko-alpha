@@ -14,9 +14,9 @@
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │                   SCAN (every 30 min)                           │
-│  Query candidates + score_history for tokens that:              │
-│    - Had quant_score >= 60 at some prior point                  │
-│    - Were first_seen_at between 3-14 days ago                   │
+│  Query alerts + score_history for tokens that:                  │
+│    - Were alerted 3-14 days ago (from alerts.alerted_at)        │
+│    - Had peak quant_score >= 60 (from score_history)            │
 │    - Haven't already been alerted as second-wave                │
 │  Pure DB queries — zero API calls                               │
 └──────────────────────┬─────────────────────────────────────────┘
@@ -65,13 +65,14 @@ class SecondWaveCandidate(BaseModel):
     token_name: str
     ticker: str
 
-    # Prior pump data (from candidates + score_history)
+    # Prior pump data (from alerts + score_history)
+    coingecko_id: str | None = None     # CoinGecko slug (from predictions.coin_id for narrative tokens)
     peak_quant_score: int               # highest quant_score ever recorded
     peak_signals_fired: list[str]       # signals at peak score
     first_seen_at: datetime             # when pipeline first detected it
     original_alert_at: datetime | None  # when it was first alerted (if ever)
     original_market_cap: float          # market_cap at first detection
-    peak_market_cap: float              # highest market_cap seen
+    alert_market_cap: float             # market_cap at alert time (from alerts table, approximate peak)
 
     # Cooldown data
     days_since_first_seen: float        # age in days
@@ -81,7 +82,7 @@ class SecondWaveCandidate(BaseModel):
     current_price: float
     current_market_cap: float
     current_volume_24h: float
-    recovery_from_trough_pct: float     # how much price recovered from lowest point
+    price_vs_alert_pct: float           # current_price / alert_price as % (>70% = recovery)
     volume_vs_cooldown_avg: float       # current volume / avg volume during cooldown
 
     # Scoring
@@ -99,43 +100,44 @@ class SecondWaveCandidate(BaseModel):
 
 ### Phase 1: DB Scan (zero API calls)
 
-Query existing tables to find second-wave candidates:
+Query `alerts` table (persists beyond the 7-day `candidates` prune window) joined with `score_history` to find second-wave candidates in the full 3-14 day cooldown window:
 
 ```sql
-SELECT c.contract_address, c.chain, c.token_name, c.ticker,
-       c.quant_score, c.market_cap_usd, c.first_seen_at,
-       c.signals_fired, c.alerted_at, c.volume_24h_usd
-FROM candidates c
-WHERE c.quant_score IS NOT NULL
-  AND c.first_seen_at <= datetime('now', '-3 days')
-  AND c.first_seen_at >= datetime('now', '-14 days')
-  AND c.contract_address NOT IN (
+SELECT a.contract_address, a.chain, a.token_name, a.ticker,
+       a.market_cap_usd AS alert_market_cap, a.alerted_at,
+       a.price_usd AS alert_price,
+       p.coin_id AS coingecko_id,
+       MAX(sh.score) AS peak_score
+FROM alerts a
+LEFT JOIN score_history sh ON sh.contract_address = a.contract_address
+LEFT JOIN predictions p ON p.contract_address = a.contract_address
+WHERE a.alerted_at <= datetime('now', '-3 days')
+  AND a.alerted_at >= datetime('now', '-14 days')
+  AND a.contract_address NOT IN (
       SELECT contract_address FROM second_wave_candidates
       WHERE detected_at >= datetime('now', '-7 days')
   )
+GROUP BY a.contract_address
+HAVING peak_score >= 60   -- SECONDWAVE_MIN_PRIOR_SCORE
 ```
 
-Additionally, check `score_history` for each candidate to find their peak score:
+The `alerts` table has `alerted_at` and `contract_address` and is not subject to the 7-day candidate pruning, giving us the full 3-14 day window. The `LEFT JOIN predictions` provides `coin_id` (CoinGecko slug) for narrative agent tokens; DEX-sourced tokens will have `coingecko_id = NULL`.
 
-```sql
-SELECT MAX(score) as peak_score
-FROM score_history
-WHERE contract_address = ?
-```
-
-Filter: only proceed with candidates where `peak_score >= SECONDWAVE_MIN_PRIOR_SCORE` (default: 60).
+Filter: only proceed with candidates where `peak_score >= SECONDWAVE_MIN_PRIOR_SCORE` (default: 60). The peak score filter is applied directly in the SQL `HAVING` clause (M1).
 
 ### Phase 2: Fresh Price Confirmation (1-2 API calls)
 
-For candidates passing the DB scan (typically 0-20 tokens), batch-fetch current prices from CoinGecko:
+For candidates passing the DB scan (typically 0-20 tokens), batch-fetch current prices from CoinGecko.
+
+**Narrative agent tokens** (have `coingecko_id` from `predictions.coin_id`): fetch live prices via:
 
 ```
-GET /coins/markets?vs_currency=usd&ids={comma_separated_ids}&per_page=250
+GET /coins/markets?vs_currency=usd&ids={comma_separated_coingecko_ids}&per_page=250
 ```
 
 This reuses the existing rate limiter from `scout/ingestion/coingecko.py`. Maximum 1-2 API calls per 30-min cycle (well within budget).
 
-**Note:** Only tokens with `chain == "coingecko"` can be price-confirmed via CoinGecko. For DEX tokens (DexScreener/GeckoTerminal sourced), use the `outcomes` table `alert_price` and `check_price` as the price reference, and skip live price confirmation (the DB data is sufficient for detection).
+**DEX-sourced tokens** (have `coingecko_id = NULL`): contract_address cannot be reliably mapped to a CoinGecko slug. For these tokens, use `alert_price` from the `alerts` table as the last known price reference, marked as `"stale_price"` in the result. The `price_vs_alert_pct` field is computed as `stale_price / alert_price * 100` (which will be ~100% and thus not trigger recovery signals — this is intentional; DEX tokens rely on `sufficient_drawdown` and `strong_prior_signal` only).
 
 ### Phase 3: Re-accumulation Scoring
 
@@ -144,54 +146,60 @@ For each candidate with fresh price data, compute a re-accumulation score:
 ```python
 def score_reaccumulation(
     candidate: dict,
-    current_price: float,
-    current_volume: float,
-    current_market_cap: float,
-    peak_market_cap: float,
-    volume_history: list[float],   # from volume_snapshots
+    current_price: float | None,     # None for DEX tokens with stale price
+    current_volume: float | None,
+    current_market_cap: float | None,
+    alert_market_cap: float,          # from alerts table (approximate peak)
+    alert_price: float,               # from alerts table
+    volume_history: list[float],      # from volume_snapshots (may be empty)
     settings: Settings,
 ) -> tuple[int, list[str]]:
     points = 0
     signals: list[str] = []
 
-    # Signal 1: Drawdown from peak (must have dropped significantly)
-    # Price must have dropped >30% from peak to qualify as "cooled down"
-    if peak_market_cap > 0:
-        drawdown_pct = ((current_market_cap - peak_market_cap) / peak_market_cap) * 100
+    # Signal 1: Drawdown from peak (must have dropped significantly)  [30 pts]
+    # Price must have dropped >30% from alert-time market cap to qualify as "cooled down"
+    if alert_market_cap > 0 and current_market_cap is not None:
+        drawdown_pct = ((current_market_cap - alert_market_cap) / alert_market_cap) * 100
         if drawdown_pct <= -settings.SECONDWAVE_MIN_DRAWDOWN_PCT:  # default: -30
-            points += 25
+            points += 30
             signals.append("sufficient_drawdown")
 
-    # Signal 2: Recovery from trough (price stabilizing/recovering)
-    # Must be up >5% from the lowest point during cooldown
-    # Trough estimated from volume_snapshots correlation or min market_cap
-    if recovery_from_trough_pct >= settings.SECONDWAVE_MIN_RECOVERY_PCT:  # default: 5.0
-        points += 30
-        signals.append("price_recovery")
+    # Signal 2: Price recovery vs alert price  [35 pts]
+    # Concrete formula: if current_price > alert_price * 0.7 (within 30% of alert price),
+    # the token has recovered from its trough. This replaces the undefined
+    # recovery_from_trough_pct variable with a direct current_price vs alert_price check.
+    # price_vs_alert_pct = (current_price / alert_price) * 100
+    if current_price is not None and alert_price > 0:
+        price_vs_alert_pct = (current_price / alert_price) * 100
+        if price_vs_alert_pct >= settings.SECONDWAVE_MIN_RECOVERY_PCT:  # default: 70.0
+            points += 35
+            signals.append("price_recovery")
 
-    # Signal 3: Volume pickup vs cooldown average
-    # Current volume must exceed average cooldown volume by threshold
-    if len(volume_history) >= 3:
+    # Signal 3: Volume pickup vs cooldown average  [20 pts]
+    # Current volume must exceed average cooldown volume by threshold.
+    # NOTE: volume_snapshots will often be empty during cooldown because the main
+    # pipeline stops scanning tokens after they age out. When data is unavailable
+    # (< 3 snapshots), this signal scores 0 — it does not crash.
+    if current_volume is not None and len(volume_history) >= 3:
         cooldown_avg = sum(volume_history) / len(volume_history)
         if cooldown_avg > 0:
             vol_ratio = current_volume / cooldown_avg
             if vol_ratio >= settings.SECONDWAVE_VOL_PICKUP_RATIO:  # default: 2.0
-                points += 25
+                points += 20
                 signals.append("volume_pickup")
 
-    # Signal 4: Prior signal quality (strong first pump = stronger second wave)
+    # Signal 4: Prior signal quality (strong first pump = stronger second wave)  [15 pts]
     if candidate["peak_quant_score"] >= 75:
-        points += 10
+        points += 15
         signals.append("strong_prior_signal")
 
-    # Signal 5: Holder retention (if holder snapshots available)
-    # Holders staying flat or growing during cooldown = accumulation
-    # Checked from holder_snapshots table
-    if holder_retained:
-        points += 10
-        signals.append("holder_retention")
+    # NOTE: Holder retention signal removed from v1. Holder data (from Helius/Moralis)
+    # is not reliably available during the cooldown window. This can be added in v2
+    # when Helius/Moralis integration lands, at which point it would be worth ~10 pts
+    # (deducted proportionally from the other 4 signals).
 
-    # Normalize to 0-100
+    # Signals sum to 100: 30 + 35 + 20 + 15 = 100
     points = min(100, points)
     return (points, signals)
 ```
@@ -204,7 +212,7 @@ A candidate becomes a second-wave alert if:
 reaccumulation_score >= settings.SECONDWAVE_ALERT_THRESHOLD  # default: 50
 ```
 
-This requires at least 2 of the 5 signals to fire (drawdown + recovery is the minimum viable pattern).
+With 4 signals (drawdown=30, recovery=35, volume=20, prior_quality=15), this requires at least 2 of the 4 signals to fire. The minimum viable pattern is `sufficient_drawdown` (30) + `strong_prior_signal` (15) = 45, which is below threshold, so `price_recovery` (35) must be one of the two signals fired. Note: `volume_pickup` may score 0 when volume snapshot data is unavailable during cooldown — this is expected and does not block detection.
 
 ---
 
@@ -219,19 +227,21 @@ CREATE TABLE IF NOT EXISTS second_wave_candidates (
     chain                   TEXT NOT NULL,
     token_name              TEXT NOT NULL,
     ticker                  TEXT NOT NULL,
+    coingecko_id            TEXT,              -- CoinGecko slug (NULL for DEX tokens)
     peak_quant_score        INTEGER NOT NULL,
     peak_signals_fired      TEXT,              -- JSON array
     first_seen_at           TEXT NOT NULL,
     original_alert_at       TEXT,
     original_market_cap     REAL,
-    peak_market_cap         REAL,
+    alert_market_cap        REAL,              -- from alerts.market_cap_usd (approximate peak)
     days_since_first_seen   REAL,
     price_drop_from_peak_pct REAL,
     current_price           REAL,
     current_market_cap      REAL,
     current_volume_24h      REAL,
-    recovery_from_trough_pct REAL,
+    price_vs_alert_pct      REAL,              -- current_price / alert_price * 100
     volume_vs_cooldown_avg  REAL,
+    price_is_stale          INTEGER NOT NULL DEFAULT 0,  -- 1 if DEX token w/ no live price
     reaccumulation_score    INTEGER NOT NULL,
     reaccumulation_signals  TEXT NOT NULL,      -- JSON array
     detected_at             TEXT NOT NULL,
@@ -248,12 +258,14 @@ CREATE INDEX IF NOT EXISTS idx_sw_score
 
 ```python
 async def get_secondwave_scan_candidates(
-    self, min_age_days: int = 3, max_age_days: int = 14
+    self, min_age_days: int = 3, max_age_days: int = 14,
+    min_peak_score: int = 60,
 ) -> list[dict]:
-    """Get candidates in the cooldown window that haven't been second-wave alerted."""
-
-async def get_peak_score(self, contract_address: str) -> int | None:
-    """Get the highest score ever recorded for a contract."""
+    """Get alerted tokens in the cooldown window that haven't been second-wave
+    alerted. Queries the `alerts` table (persists beyond candidates prune window)
+    joined with `score_history` (peak score) and `predictions` (coingecko_id).
+    The peak score filter is applied in the SQL HAVING clause — no separate
+    get_peak_score() call is needed (M1)."""
 
 async def was_secondwave_alerted(
     self, contract_address: str, days: int = 7
@@ -286,7 +298,7 @@ SECONDWAVE_MIN_PRIOR_SCORE: int = 60                 # min peak quant_score to c
 SECONDWAVE_COOLDOWN_MIN_DAYS: int = 3                # min days since first detection
 SECONDWAVE_COOLDOWN_MAX_DAYS: int = 14               # max days (older = stale)
 SECONDWAVE_MIN_DRAWDOWN_PCT: float = 30.0            # min % drop from peak to qualify
-SECONDWAVE_MIN_RECOVERY_PCT: float = 5.0             # min % recovery from trough
+SECONDWAVE_MIN_RECOVERY_PCT: float = 70.0             # min price_vs_alert_pct (current/alert * 100) to count as recovery
 SECONDWAVE_VOL_PICKUP_RATIO: float = 2.0             # current vol / cooldown avg vol
 SECONDWAVE_ALERT_THRESHOLD: int = 50                 # min reaccumulation_score to alert
 SECONDWAVE_DEDUP_DAYS: int = 7                       # don't re-alert same token within N days
@@ -306,14 +318,14 @@ Feature is disabled by default. Enable with `SECONDWAVE_ENABLED=true` in `.env`.
 Prior pump (first seen {days_since_first_seen}d ago):
   Peak score: {peak_quant_score}/100
   Signals: {peak_signals_fired}
-  Peak market cap: ${peak_market_cap:,.0f}
+  Alert market cap: ${alert_market_cap:,.0f}  (approximate peak)
 
 Cooldown:
   Drawdown from peak: {price_drop_from_peak_pct:.1f}%
   Days cooling: {days_since_first_seen:.0f}
 
 Re-accumulation:
-  Recovery from trough: +{recovery_from_trough_pct:.1f}%
+  Price vs alert: {price_vs_alert_pct:.1f}% {stale_marker}
   Volume vs cooldown avg: {volume_vs_cooldown_avg:.1f}x
   Re-accumulation score: {reaccumulation_score}/100
   Signals: {reaccumulation_signals}
@@ -359,44 +371,71 @@ async def secondwave_loop(session: aiohttp.ClientSession, settings: Settings):
 
     while True:
         try:
-            # Phase 1: DB scan
+            # Phase 1: DB scan — peak_score is computed in-SQL via MAX(sh.score)
+            # and filtered via HAVING, so no separate get_peak_score() call (M1).
             scan_candidates = await db.get_secondwave_scan_candidates(
                 min_age_days=settings.SECONDWAVE_COOLDOWN_MIN_DAYS,
                 max_age_days=settings.SECONDWAVE_COOLDOWN_MAX_DAYS,
+                min_peak_score=settings.SECONDWAVE_MIN_PRIOR_SCORE,
             )
 
             if scan_candidates:
-                # Phase 2: Fetch fresh prices (batch)
-                cg_ids = [c["contract_address"] for c in scan_candidates
-                          if c["chain"] == "coingecko"]
-                fresh_prices = await fetch_current_prices(session, cg_ids, settings)
+                # Phase 2: Fetch fresh prices (batch) — only for tokens with
+                # a resolved coingecko_id (H1). DEX tokens fall back to
+                # alert_price as a stale reference.
+                cg_ids = [c["coingecko_id"] for c in scan_candidates
+                          if c.get("coingecko_id")]
+                fresh_prices = (
+                    await fetch_current_prices(session, cg_ids, settings)
+                    if cg_ids else {}
+                )
 
                 # Phase 3: Score each candidate
                 for candidate in scan_candidates:
-                    peak_score = await db.get_peak_score(candidate["contract_address"])
-                    if peak_score is None or peak_score < settings.SECONDWAVE_MIN_PRIOR_SCORE:
-                        continue
-
                     volume_history = await db.get_volume_history(
                         candidate["contract_address"],
                         days=settings.SECONDWAVE_COOLDOWN_MAX_DAYS,
                     )
 
+                    cg_id = candidate.get("coingecko_id")
+                    if cg_id and cg_id in fresh_prices:
+                        price_data = fresh_prices[cg_id]
+                        current_price = price_data["current_price"]
+                        current_volume = price_data["total_volume"]
+                        current_market_cap = price_data["market_cap"]
+                        price_is_stale = False
+                    else:
+                        # DEX token: no live price, use alert_price as stale reference
+                        current_price = candidate["alert_price"]
+                        current_volume = None
+                        current_market_cap = candidate["alert_market_cap"]
+                        price_is_stale = True
+
                     score, signals = score_reaccumulation(
-                        candidate, fresh_prices, volume_history, settings
+                        candidate,
+                        current_price=current_price,
+                        current_volume=current_volume,
+                        current_market_cap=current_market_cap,
+                        alert_market_cap=candidate["alert_market_cap"],
+                        alert_price=candidate["alert_price"],
+                        volume_history=volume_history,
+                        settings=settings,
                     )
 
                     # Phase 4: Gate + alert
                     if score >= settings.SECONDWAVE_ALERT_THRESHOLD:
                         sw_candidate = build_secondwave_candidate(
-                            candidate, peak_score, score, signals, fresh_prices
+                            candidate, score, signals,
+                            current_price, current_volume, current_market_cap,
+                            price_is_stale,
                         )
                         await db.insert_secondwave_candidate(sw_candidate)
                         alert_msg = format_secondwave_alert(sw_candidate)
                         await send_telegram_message(alert_msg, session, settings)
 
-        except Exception as e:
-            logger.error("secondwave_loop_error", error=str(e))
+        except Exception:
+            # Use logger.exception to capture full traceback (m1)
+            logger.exception("secondwave_loop_error")
 
         await asyncio.sleep(settings.SECONDWAVE_POLL_INTERVAL)
 ```
@@ -453,14 +492,15 @@ For DEX-sourced tokens (DexScreener, GeckoTerminal), no API calls are made. Dete
 
 ### Key test scenarios
 
-- **Happy path:** Token with quant_score=75 seen 5 days ago, market cap dropped 40% from peak, now recovering 8% with 3x volume pickup. Should score >= 50 and trigger alert.
+- **Happy path (narrative token):** Token with peak quant_score=75, alerted 5 days ago, market cap dropped 40% from alert_market_cap, current price = 80% of alert_price (price_recovery fires), 3x volume pickup. Scores 30+35+20+15=100 and triggers alert.
+- **DEX token (stale price):** Token with no coingecko_id, peak quant_score=78, alerted 6 days ago, alert_market_cap=$2M, current DB price data shows $1.2M. Scores sufficient_drawdown (30) + strong_prior_signal (15) = 45, below threshold — correctly filtered.
 - **Too fresh:** Token first_seen_at 1 day ago. Should be excluded by cooldown window.
 - **Too stale:** Token first_seen_at 20 days ago. Should be excluded.
 - **No drawdown:** Token never dropped significantly. Should not qualify (no `sufficient_drawdown` signal).
 - **Weak prior signal:** Token peak_quant_score=30. Should be excluded by `SECONDWAVE_MIN_PRIOR_SCORE`.
 - **Already alerted:** Token was second-wave alerted 3 days ago. Should be deduped.
-- **No volume history:** Token has < 3 volume snapshots. `volume_pickup` signal should not fire but other signals can still qualify the candidate.
-- **DEX token (no CoinGecko ID):** Should use DB-only data, skip live price confirmation.
+- **No volume history:** Token has < 3 volume snapshots. `volume_pickup` signal should score 0 (not crash); other signals can still qualify the candidate.
+- **DEX token (no CoinGecko ID):** Should skip live price confirmation, use `alerts.price_usd` as stale reference, mark `price_is_stale=True`.
 
 Mock strategy: `aioresponses` for CoinGecko HTTP mocks, `tmp_path` for DB fixtures. Same patterns as existing test suite.
 
@@ -481,12 +521,14 @@ Mock strategy: `aioresponses` for CoinGecko HTTP mocks, `tmp_path` for DB fixtur
 
 1. **Price history resolution:** The detector relies on `volume_snapshots` and `score_history` for historical data. If the main pipeline didn't scan a token during its cooldown (it wouldn't, since it aged out), the volume history during cooldown will be sparse. The `volume_pickup` signal may not fire for many candidates. This is acceptable for v1 — the `sufficient_drawdown` + `price_recovery` signals from the fresh CoinGecko fetch are the primary indicators.
 
-2. **Peak market cap estimation:** The `candidates` table stores `market_cap_usd` at the most recent scan, not the historical peak. For peak estimation, use the `outcomes` table `alert_price` (if alerted) or the `score_history` peak score timestamp to approximate when the token was hottest. A future enhancement could add a `market_cap_snapshots` table.
+2. **Peak market cap estimation (H2):** The `alerts` table stores `market_cap_usd` at alert time, which is used as the approximate peak in the `alert_market_cap` field. This is explicitly an approximation — the token may have pumped further after the alert, but we do not currently snapshot the post-alert peak. If `alert_market_cap` is NULL for a given alert row, `price_drop_from_peak_pct` is reported as `None` and the `sufficient_drawdown` signal simply does not fire. A future enhancement could add a `market_cap_snapshots` table to capture true post-alert peaks.
 
-3. **CoinGecko ID mapping:** Tokens sourced from DexScreener/GeckoTerminal use contract addresses, not CoinGecko IDs. The `/coins/markets?ids=` endpoint requires CoinGecko IDs. For DEX tokens, skip live price confirmation and rely on DB data only. This is documented in the detection logic.
+3. **CoinGecko ID mapping (H1):** Tokens sourced from DexScreener/GeckoTerminal use contract addresses, not CoinGecko IDs. The `/coins/markets?ids=` endpoint requires CoinGecko IDs (slugs). Narrative agent tokens have `coin_id` in the `predictions` table and can be price-confirmed live. DEX tokens without a mapped slug fall back to the `alerts.price_usd` as a stale reference, flagged `price_is_stale=True` in the output row and the alert message. For these tokens, `price_recovery` will not fire (stale price ratio is ~100%), so they must qualify via `sufficient_drawdown` + `strong_prior_signal` + (optionally) `volume_pickup`.
 
-4. **Cooldown window vs pruning:** The `candidates` table is pruned at 7 days by default (`prune_old_candidates`). To detect second waves in the 7-14 day window, either increase `keep_days` or query `score_history` and `alerts` tables which are not pruned. The implementation should primarily use `score_history` + `alerts` for the scan query, not the `candidates` table directly.
+4. **Cooldown window vs pruning (B1):** The `candidates` table is pruned at 7 days by default (`prune_old_candidates`), which would delete rows before they enter the 7-14 day cooldown window. The scan query therefore uses the `alerts` table (which has `alerted_at` + `contract_address` and is not pruned) joined with `score_history` (historical peak scores, also not pruned). Implementation must ensure `alerts`, `score_history`, and `volume_snapshots` data persists for at least `SECONDWAVE_COOLDOWN_MAX_DAYS` (14 days). The `candidates` table can continue pruning at 7 days since it is no longer the primary data source.
 
-5. **False positives from dead coins:** A coin that dropped 90% and bounced 5% off the bottom is technically meeting the drawdown + recovery criteria but may be a dead cat bounce. The `volume_pickup` and `holder_retention` signals help filter these, but some false positives are expected. The 50-point alert threshold requiring 2+ signals mitigates this.
+5. **False positives from dead coins:** A coin that dropped 90% and bounced slightly off the bottom is technically meeting the drawdown + recovery criteria but may be a dead cat bounce. The `volume_pickup` and `strong_prior_signal` signals help filter these, but some false positives are expected. The 50-point alert threshold requiring 2+ signals mitigates this.
 
-6. **Candidate pruning retention adjustment:** The default `prune_old_candidates(keep_days=7)` would delete candidates before they enter the 7-14 day cooldown window. Implementation must ensure `score_history`, `alerts`, and `volume_snapshots` data persists for at least `SECONDWAVE_COOLDOWN_MAX_DAYS` (14 days). The candidates table can still prune at 7 days since the scan should query `score_history` and `alerts` as primary data sources.
+6. **Holder retention deferred to v2 (B3):** The initial design included a `holder_retention` signal, but holder data (from Helius/Moralis) is not reliably available during the cooldown window in v1. That signal has been removed; the remaining 4 signals (drawdown 30, recovery 35, volume 20, prior quality 15) sum to 100. Holder retention can be re-added in v2 when the Helius/Moralis integration lands.
+
+7. **Volume snapshots sparse during cooldown (H3):** The main pipeline stops scanning tokens after they age out, so `volume_snapshots` will typically have few or zero entries during the 3-14 day cooldown window. The `volume_pickup` signal gracefully scores 0 when fewer than 3 snapshots are available (it does not raise). Detection still proceeds on the other 3 signals. The threshold analysis assumes `volume_pickup` frequently does not fire.
