@@ -56,12 +56,15 @@ async def fetch_coin_detail(
         async with session.get(url, params=params, headers=headers) as resp:
             if resp.status == 429:
                 logger.warning("cg_detail_rate_limited", coin_id=coin_id)
+                await coingecko_limiter.report_429()
                 return None
             if resp.status == 404:
                 logger.info("cg_detail_not_found", coin_id=coin_id)
                 return None
             if resp.status >= 400:
-                logger.warning("cg_detail_http_error", coin_id=coin_id, status=resp.status)
+                logger.warning(
+                    "cg_detail_http_error", coin_id=coin_id, status=resp.status
+                )
                 return None
 
             data: dict = await resp.json()

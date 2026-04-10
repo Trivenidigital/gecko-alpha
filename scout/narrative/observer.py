@@ -34,6 +34,7 @@ async def fetch_categories(
                 if resp.status == 429:
                     wait = 2 ** (attempt + 1)
                     logger.warning("coingecko_429_retry", attempt=attempt, wait=wait)
+                    await coingecko_limiter.report_429(backoff_seconds=float(wait))
                     await asyncio.sleep(wait)
                     continue
                 if resp.status != 200:
@@ -64,7 +65,11 @@ def parse_category_response(
             market_cap_change_24h = entry.get("market_cap_change_24h")
             volume_24h = entry.get("volume_24h")
 
-            if market_cap is None or market_cap_change_24h is None or volume_24h is None:
+            if (
+                market_cap is None
+                or market_cap_change_24h is None
+                or volume_24h is None
+            ):
                 continue
 
             snapshots.append(
@@ -115,13 +120,17 @@ def compute_acceleration(
         if prev.volume_24h == 0:
             volume_growth_pct = 0.0
         else:
-            volume_growth_pct = ((cur.volume_24h - prev.volume_24h) / prev.volume_24h) * 100
+            volume_growth_pct = (
+                (cur.volume_24h - prev.volume_24h) / prev.volume_24h
+            ) * 100
 
         coin_count_change: int | None = None
         if cur.coin_count is not None and prev.coin_count is not None:
             coin_count_change = cur.coin_count - prev.coin_count
 
-        is_heating = acceleration > accel_threshold and volume_growth_pct > vol_threshold
+        is_heating = (
+            acceleration > accel_threshold and volume_growth_pct > vol_threshold
+        )
 
         results.append(
             CategoryAcceleration(
@@ -219,5 +228,7 @@ async def prune_old_snapshots(db: Database, retention_days: int) -> int:
         (cutoff,),
     )
     await db._conn.commit()
-    logger.info("pruned_old_snapshots", deleted=cursor.rowcount, retention_days=retention_days)
+    logger.info(
+        "pruned_old_snapshots", deleted=cursor.rowcount, retention_days=retention_days
+    )
     return cursor.rowcount

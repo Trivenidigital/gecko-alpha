@@ -10,7 +10,6 @@ from scout.config import Settings
 from scout.ingestion.coingecko import fetch_top_movers, fetch_trending
 from scout.ratelimit import coingecko_limiter
 
-
 # -- Fixtures --
 
 COINS_MARKETS_RESPONSE = [
@@ -55,11 +54,11 @@ TRENDING_PATTERN = re.compile(r"https://api\.coingecko\.com/api/v3/search/trendi
 
 
 @pytest.fixture(autouse=True)
-def _clear_rate_limit():
-    """Clear shared rate limiter timestamps between tests."""
-    coingecko_limiter._timestamps.clear()
+async def _clear_rate_limit():
+    """Clear shared rate limiter state between tests."""
+    await coingecko_limiter.reset()
     yield
-    coingecko_limiter._timestamps.clear()
+    await coingecko_limiter.reset()
 
 
 # -- Tests --

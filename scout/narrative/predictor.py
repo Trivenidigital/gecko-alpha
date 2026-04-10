@@ -47,9 +47,14 @@ async def fetch_laggards(
         headers["x-cg-demo-api-key"] = api_key
     await coingecko_limiter.acquire()
     try:
-        async with session.get(
-            CG_MARKETS_URL, params=params, headers=headers
-        ) as resp:
+        async with session.get(CG_MARKETS_URL, params=params, headers=headers) as resp:
+            if resp.status == 429:
+                log.warning(
+                    "fetch_laggards_rate_limited",
+                    category_id=category_id,
+                )
+                await coingecko_limiter.report_429()
+                return []
             if resp.status != 200:
                 log.warning(
                     "fetch_laggards_error",
@@ -234,9 +239,7 @@ async def score_token(
         raw = response.content[0].text  # type: ignore[index]
         return parse_scoring_response(raw)
     except Exception:
-        log.exception(
-            "score_token_error", coin_id=token.coin_id, symbol=token.symbol
-        )
+        log.exception("score_token_error", coin_id=token.coin_id, symbol=token.symbol)
         return None
 
 
@@ -330,9 +333,7 @@ async def record_signal(
 # ------------------------------------------------------------------
 
 
-async def store_predictions(
-    db: Database, predictions: list[dict]
-) -> None:
+async def store_predictions(db: Database, predictions: list[dict]) -> None:
     """INSERT OR IGNORE each prediction into the predictions table.
 
     Serialises strategy_snapshot and strategy_snapshot_ab as JSON strings.

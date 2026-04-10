@@ -33,9 +33,8 @@ async def _get_with_backoff(
             async with session.get(url, params=params, timeout=REQUEST_TIMEOUT) as resp:
                 if resp.status == 429:
                     backoff = 2 ** (attempt + 1)
-                    logger.warning(
-                        "cg_429_backoff", attempt=attempt, backoff_s=backoff
-                    )
+                    logger.warning("cg_429_backoff", attempt=attempt, backoff_s=backoff)
+                    await coingecko_limiter.report_429(backoff_seconds=float(backoff))
                     if attempt < MAX_RETRIES:
                         await asyncio.sleep(backoff)
                         continue
@@ -107,8 +106,13 @@ async def fetch_top_movers(
 
     tokens.sort(key=lambda t: t.price_change_1h or 0, reverse=True)
 
-    logger.info("cg_candidates_returned", count=len(tokens), source="coins/markets",
-                 raw_fetched=len(raw_by_id), has_api_key=bool(settings.COINGECKO_API_KEY))
+    logger.info(
+        "cg_candidates_returned",
+        count=len(tokens),
+        source="coins/markets",
+        raw_fetched=len(raw_by_id),
+        has_api_key=bool(settings.COINGECKO_API_KEY),
+    )
     return tokens
 
 
