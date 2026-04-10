@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     MOMENTUM_RATIO_THRESHOLD: float = 0.6
     MIN_VOL_ACCEL_RATIO: float = 5.0
     COINGECKO_API_KEY: str = ""
+    COINGECKO_RATE_LIMIT_PER_MIN: int = 25  # buffer under 30/min free tier
 
     # MiroFish
     MIROFISH_URL: str = "http://localhost:5001"
