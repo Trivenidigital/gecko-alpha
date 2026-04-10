@@ -15,6 +15,7 @@ class Settings(BaseSettings):
 
     # Scanner
     SCAN_INTERVAL_SECONDS: int = 60
+    HEARTBEAT_INTERVAL_SECONDS: int = 300  # BL-033: periodic heartbeat summary
     MIN_SCORE: int = 60
     CONVICTION_THRESHOLD: int = 70
     QUANT_WEIGHT: float = 0.6
@@ -35,6 +36,7 @@ class Settings(BaseSettings):
     MOMENTUM_RATIO_THRESHOLD: float = 0.6
     MIN_VOL_ACCEL_RATIO: float = 5.0
     COINGECKO_API_KEY: str = ""
+    COINGECKO_RATE_LIMIT_PER_MIN: int = 25  # buffer under 30/min free tier
 
     # MiroFish
     MIROFISH_URL: str = "http://localhost:5001"
@@ -103,6 +105,13 @@ class Settings(BaseSettings):
     def _validate_secondwave_min_vol_points(cls, v: int) -> int:
         """Enforce a minimum of 2 volume snapshots before firing volume_pickup."""
         return max(2, int(v))
+
+    @field_validator("HEARTBEAT_INTERVAL_SECONDS")
+    @classmethod
+    def _validate_heartbeat(cls, v: int) -> int:
+        if v <= 0:
+            return 300  # default fallback
+        return v
 
     @model_validator(mode="after")
     def validate_weights_sum(self) -> "Settings":

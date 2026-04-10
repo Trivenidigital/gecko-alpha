@@ -54,11 +54,72 @@ from scout.scorer import score
 logger = structlog.get_logger()
 
 
+# BL-033: Module-level heartbeat state. Tracks cumulative pipeline stats
+# across cycles and emits a structured "heartbeat" log every
+# HEARTBEAT_INTERVAL_SECONDS so operators can see the pipeline is alive.
+_heartbeat_stats: dict = {
+    "started_at": None,
+    "tokens_scanned": 0,
+    "candidates_promoted": 0,
+    "alerts_fired": 0,
+    "narrative_predictions": 0,
+    "counter_scores_memecoin": 0,
+    "counter_scores_narrative": 0,
+    "last_heartbeat_at": None,
+}
+
+
+def _reset_heartbeat_stats() -> None:
+    """Reset module-level heartbeat state (test helper)."""
+    _heartbeat_stats.update(
+        started_at=None,
+        tokens_scanned=0,
+        candidates_promoted=0,
+        alerts_fired=0,
+        narrative_predictions=0,
+        counter_scores_memecoin=0,
+        counter_scores_narrative=0,
+        last_heartbeat_at=None,
+    )
+
+
+def _maybe_emit_heartbeat(settings) -> bool:
+    """Log heartbeat every HEARTBEAT_INTERVAL_SECONDS.
+
+    On first call, seeds started_at/last_heartbeat_at without logging.
+    Returns True if a heartbeat log was emitted.
+    """
+    now = datetime.now(timezone.utc)
+    if _heartbeat_stats["last_heartbeat_at"] is None:
+        _heartbeat_stats["last_heartbeat_at"] = now
+        _heartbeat_stats["started_at"] = now
+        return False
+    elapsed = (now - _heartbeat_stats["last_heartbeat_at"]).total_seconds()
+    if elapsed < settings.HEARTBEAT_INTERVAL_SECONDS:
+        return False
+    uptime_minutes = (now - _heartbeat_stats["started_at"]).total_seconds() / 60
+    logger.info(
+        "heartbeat",
+        uptime_minutes=round(uptime_minutes, 1),
+        tokens_scanned=_heartbeat_stats["tokens_scanned"],
+        candidates_promoted=_heartbeat_stats["candidates_promoted"],
+        alerts_fired=_heartbeat_stats["alerts_fired"],
+        narrative_predictions=_heartbeat_stats["narrative_predictions"],
+        counter_scores_memecoin=_heartbeat_stats["counter_scores_memecoin"],
+        counter_scores_narrative=_heartbeat_stats["counter_scores_narrative"],
+        last_heartbeat_at=_heartbeat_stats["last_heartbeat_at"].isoformat(),
+    )
+    _heartbeat_stats["last_heartbeat_at"] = now
+    return True
+
+
 async def _safe_counter_followup(token, session, settings):
     """Run counter-score and send follow-up Telegram message. Never raises."""
     try:
         buy_pressure = 0.5
-        if getattr(token, 'txns_h1_buys', None) and getattr(token, 'txns_h1_sells', None):
+        if getattr(token, "txns_h1_buys", None) and getattr(
+            token, "txns_h1_sells", None
+        ):
             total = token.txns_h1_buys + token.txns_h1_sells
             if total > 0:
                 buy_pressure = token.txns_h1_buys / total
@@ -92,7 +153,8 @@ async def _safe_counter_followup(token, session, settings):
 
         if counter.risk_score is not None:
             flag_lines = "\n".join(
-                f"- [{f.severity.upper()}] {f.flag}: {f.detail}" for f in counter.red_flags
+                f"- [{f.severity.upper()}] {f.flag}: {f.detail}"
+                for f in counter.red_flags
             )
             msg = (
                 f"Risk assessment for {token.ticker}:\n"
@@ -102,9 +164,14 @@ async def _safe_counter_followup(token, session, settings):
             )
             await send_telegram_message(msg, session, settings)
 
-        logger.info("counter_followup_sent", symbol=token.ticker, risk_score=counter.risk_score)
+        _heartbeat_stats["counter_scores_memecoin"] += 1
+        logger.info(
+            "counter_followup_sent", symbol=token.ticker, risk_score=counter.risk_score
+        )
     except Exception as e:
-        logger.error("counter_followup_error", symbol=getattr(token, 'ticker', '?'), error=str(e))
+        logger.error(
+            "counter_followup_error", symbol=getattr(token, "ticker", "?"), error=str(e)
+        )
 
 
 async def run_cycle(
@@ -148,9 +215,11 @@ async def run_cycle(
     stats["tokens_scanned"] = len(all_candidates)
 
     # Enrich holders (concurrently)
-    enriched = list(await asyncio.gather(
-        *[enrich_holders(token, session, settings) for token in all_candidates]
-    ))
+    enriched = list(
+        await asyncio.gather(
+            *[enrich_holders(token, session, settings) for token in all_candidates]
+        )
+    )
 
     # Compute holder_growth_1h from previous snapshots
     for i, token in enumerate(enriched):
@@ -158,7 +227,9 @@ async def run_cycle(
             prev = await db.get_previous_holder_count(token.contract_address)
             if prev is not None:
                 growth = token.holder_count - prev
-                enriched[i] = token.model_copy(update={"holder_growth_1h": max(0, growth)})
+                enriched[i] = token.model_copy(
+                    update={"holder_growth_1h": max(0, growth)}
+                )
             await db.log_holder_snapshot(token.contract_address, token.holder_count)
 
     # Compute vol_7d_avg from historical volume snapshots + log current volume
@@ -174,7 +245,9 @@ async def run_cycle(
     for token in enriched:
         historical_scores = await db.get_recent_scores(token.contract_address, limit=3)
         points, signals = score(token, settings, historical_scores=historical_scores)
-        updated = token.model_copy(update={"quant_score": points, "signals_fired": signals})
+        updated = token.model_copy(
+            update={"quant_score": points, "signals_fired": signals}
+        )
         await db.upsert_candidate(updated)
         await db.log_score(token.contract_address, points)
         if points >= settings.MIN_SCORE:
@@ -184,7 +257,11 @@ async def run_cycle(
     # Stages 4-5: Gate (MiroFish + conviction)
     for token, signals in scored:
         should_alert, conviction, gated_token = await evaluate(
-            token, db, session, settings, signals_fired=signals,
+            token,
+            db,
+            session,
+            settings,
+            signals_fired=signals,
         )
 
         # Persist narrative + conviction scores back to DB
@@ -202,9 +279,7 @@ async def run_cycle(
             continue
 
         # Stage 6: Safety check + alert
-        if not await is_safe(
-            gated_token.contract_address, gated_token.chain, session
-        ):
+        if not await is_safe(gated_token.contract_address, gated_token.chain, session):
             logger.warning(
                 "Token failed safety check", token=gated_token.contract_address
             )
@@ -212,9 +287,11 @@ async def run_cycle(
 
         # Duplicate suppression: skip if alerted in last 4 hours
         if await db.was_recently_alerted(gated_token.contract_address):
-            logger.info("alert_suppressed_duplicate",
-                        token=gated_token.token_name,
-                        contract_address=gated_token.contract_address)
+            logger.info(
+                "alert_suppressed_duplicate",
+                token=gated_token.token_name,
+                contract_address=gated_token.contract_address,
+            )
             continue
 
         if dry_run:
@@ -225,12 +302,18 @@ async def run_cycle(
             )
             continue
 
-        logger.info("alert_attempted", token=gated_token.token_name, platform="telegram")
+        logger.info(
+            "alert_attempted", token=gated_token.token_name, platform="telegram"
+        )
         try:
             await send_alert(gated_token, signals, session, settings)
-            logger.info("alert_delivered", token=gated_token.token_name, status="success")
+            logger.info(
+                "alert_delivered", token=gated_token.token_name, status="success"
+            )
         except Exception as e:
-            logger.error("alert_delivery_failed", token=gated_token.token_name, error=str(e))
+            logger.error(
+                "alert_delivery_failed", token=gated_token.token_name, error=str(e)
+            )
 
         await db.log_alert(
             contract_address=gated_token.contract_address,
@@ -248,7 +331,9 @@ async def run_cycle(
             task = asyncio.create_task(
                 _safe_counter_followup(gated_token, session, settings)
             )
-            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            task.add_done_callback(
+                lambda t: t.exception() if not t.cancelled() else None
+            )
 
     return stats
 
@@ -346,10 +431,14 @@ async def narrative_agent_loop(
             # Compute weighted 24h change for regime detection
             total_mcap = sum(float(c.get("market_cap") or 0) for c in raw_categories)
             if total_mcap > 0:
-                weighted_change = sum(
-                    float(c.get("market_cap_change_24h") or 0) * float(c.get("market_cap") or 0)
-                    for c in raw_categories
-                ) / total_mcap
+                weighted_change = (
+                    sum(
+                        float(c.get("market_cap_change_24h") or 0)
+                        * float(c.get("market_cap") or 0)
+                        for c in raw_categories
+                    )
+                    / total_mcap
+                )
             else:
                 weighted_change = 0.0
 
@@ -384,7 +473,9 @@ async def narrative_agent_loop(
             for accel in heating:
                 try:
                     if await is_cooling_down(db, accel.category_id):
-                        logger.info("narrative.category_cooling_down", category=accel.name)
+                        logger.info(
+                            "narrative.category_cooling_down", category=accel.name
+                        )
                         continue
 
                     trigger_count = await record_signal(
@@ -444,7 +535,10 @@ async def narrative_agent_loop(
                     consecutive_failures = 0
                     for token in scored_laggards:
                         if consecutive_failures >= 3:
-                            logger.warning("narrative_scoring_3_failures", category=accel.category_id)
+                            logger.warning(
+                                "narrative_scoring_3_failures",
+                                category=accel.category_id,
+                            )
                             break
                         result = await score_token(
                             token=token,
@@ -476,9 +570,12 @@ async def narrative_agent_loop(
                                 data_comp = "full"
                             else:
                                 cdata = {
-                                    "commits_4w": 0, "reddit_subscribers": 0,
-                                    "telegram_users": 0, "sentiment_up_pct": 50.0,
-                                    "price_change_7d": 0, "price_change_30d": 0,
+                                    "commits_4w": 0,
+                                    "reddit_subscribers": 0,
+                                    "telegram_users": 0,
+                                    "sentiment_up_pct": 50.0,
+                                    "price_change_7d": 0,
+                                    "price_change_30d": 0,
                                 }
                                 data_comp = "partial"
 
@@ -507,10 +604,18 @@ async def narrative_agent_loop(
                             )
 
                             counter_risk = counter_result.risk_score
-                            counter_flags_json = json.dumps([f.model_dump() for f in counter_result.red_flags]) if counter_result.red_flags else None
+                            counter_flags_json = (
+                                json.dumps(
+                                    [f.model_dump() for f in counter_result.red_flags]
+                                )
+                                if counter_result.red_flags
+                                else None
+                            )
                             counter_arg = counter_result.counter_argument
                             counter_completeness = counter_result.data_completeness
-                            counter_scored = counter_result.counter_scored_at.isoformat()
+                            counter_scored = (
+                                counter_result.counter_scored_at.isoformat()
+                            )
 
                         pred_row = {
                             "category_id": accel.category_id,
@@ -547,7 +652,9 @@ async def narrative_agent_loop(
                                 name=token.name,
                                 market_cap_at_prediction=token.market_cap,
                                 price_at_prediction=token.price,
-                                narrative_fit_score=result.get("narrative_fit_score", 0),
+                                narrative_fit_score=result.get(
+                                    "narrative_fit_score", 0
+                                ),
                                 staying_power=result.get("staying_power", "unknown"),
                                 confidence=result.get("confidence", "low"),
                                 reasoning=result.get("reasoning", ""),
@@ -561,29 +668,34 @@ async def narrative_agent_loop(
 
                     # Add control predictions (no Claude scoring)
                     for token in control_laggards:
-                        prediction_rows.append({
-                            "category_id": accel.category_id,
-                            "category_name": accel.name,
-                            "coin_id": token.coin_id,
-                            "symbol": token.symbol,
-                            "name": token.name,
-                            "market_cap_at_prediction": token.market_cap,
-                            "price_at_prediction": token.price,
-                            "narrative_fit_score": 0,
-                            "staying_power": "unknown",
-                            "confidence": "low",
-                            "reasoning": "control pick — no Claude scoring",
-                            "market_regime": market_regime,
-                            "trigger_count": trigger_count,
-                            "is_control": True,
-                            "is_holdout": False,
-                            "strategy_snapshot": strategy_snap,
-                            "strategy_snapshot_ab": None,
-                            "predicted_at": now.isoformat(),
-                        })
+                        prediction_rows.append(
+                            {
+                                "category_id": accel.category_id,
+                                "category_name": accel.name,
+                                "coin_id": token.coin_id,
+                                "symbol": token.symbol,
+                                "name": token.name,
+                                "market_cap_at_prediction": token.market_cap,
+                                "price_at_prediction": token.price,
+                                "narrative_fit_score": 0,
+                                "staying_power": "unknown",
+                                "confidence": "low",
+                                "reasoning": "control pick — no Claude scoring",
+                                "market_regime": market_regime,
+                                "trigger_count": trigger_count,
+                                "is_control": True,
+                                "is_holdout": False,
+                                "strategy_snapshot": strategy_snap,
+                                "strategy_snapshot_ab": None,
+                                "predicted_at": now.isoformat(),
+                            }
+                        )
 
                     if prediction_rows:
                         await store_predictions(db, prediction_rows)
+                        _heartbeat_stats["narrative_predictions"] += len(prediction_models)
+                        if settings.COUNTER_ENABLED:
+                            _heartbeat_stats["counter_scores_narrative"] += len(prediction_models)
                         logger.info(
                             "narrative.predictions_stored",
                             category=accel.name,
@@ -600,10 +712,14 @@ async def narrative_agent_loop(
                             await send_telegram_message(alert_text, session, settings)
                             logger.info("narrative.alert_sent", category=accel.name)
                         except Exception:
-                            logger.exception("narrative.alert_error", category=accel.name)
+                            logger.exception(
+                                "narrative.alert_error", category=accel.name
+                            )
 
                 except Exception:
-                    logger.exception("narrative.predict_category_error", category=accel.name)
+                    logger.exception(
+                        "narrative.predict_category_error", category=accel.name
+                    )
 
             # ----------------------------------------------------------
             # EVALUATE (gated by NARRATIVE_EVAL_INTERVAL)
@@ -633,7 +749,9 @@ async def narrative_agent_loop(
                         api_key=settings.ANTHROPIC_API_KEY,
                         model=settings.NARRATIVE_LEARN_MODEL,
                     )
-                    await prune_old_snapshots(db, settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS)
+                    await prune_old_snapshots(
+                        db, settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS
+                    )
                     last_daily_learn_at = now
                     await strategy.set_timestamp("last_daily_learn_at", now)
                     logger.info("narrative.daily_learn_complete")
@@ -677,7 +795,9 @@ async def main() -> None:
         "--cycles", type=int, default=0, help="Number of cycles (0=infinite)"
     )
     parser.add_argument(
-        "--min-score-override", type=int, default=None,
+        "--min-score-override",
+        type=int,
+        default=None,
         help="Override MIN_SCORE threshold (for testing)",
     )
     args = parser.parse_args()
@@ -698,6 +818,12 @@ async def main() -> None:
     if args.min_score_override is not None:
         settings.MIN_SCORE = args.min_score_override
         logger.info("MIN_SCORE overridden", min_score=settings.MIN_SCORE)
+
+    # Honour COINGECKO_RATE_LIMIT_PER_MIN from config.
+    from scout.ratelimit import configure_from_settings as _cg_ratelimit_configure
+
+    _cg_ratelimit_configure(settings)
+
     db = Database(settings.DB_PATH)
     await db.initialize()
 
@@ -715,18 +841,16 @@ async def main() -> None:
         pass  # SIGTERM not supported on Windows
 
     cycle_count = 0
-    cumulative = {"tokens_scanned": 0, "candidates_promoted": 0, "alerts_fired": 0}
-    last_heartbeat = time.monotonic()
     last_outcome_check = time.monotonic()
     last_summary_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    heartbeat_interval = 300  # 5 minutes
     outcome_check_interval = 3600  # 1 hour
+    _reset_heartbeat_stats()
 
     try:
         async with aiohttp.ClientSession() as session:
 
             async def _pipeline_loop() -> None:
-                nonlocal cycle_count, cumulative, last_heartbeat
+                nonlocal cycle_count
                 nonlocal last_outcome_check, last_summary_date
 
                 while not shutdown_event.is_set():
@@ -735,42 +859,43 @@ async def main() -> None:
                             settings, db, session, dry_run=args.dry_run
                         )
                         logger.info("Cycle complete", **stats)
-                        for k in cumulative:
-                            cumulative[k] += stats.get(k, 0)
+                        _heartbeat_stats["tokens_scanned"] += stats.get("tokens_scanned", 0)
+                        _heartbeat_stats["candidates_promoted"] += stats.get("candidates_promoted", 0)
+                        _heartbeat_stats["alerts_fired"] += stats.get("alerts_fired", 0)
                     except Exception as e:
                         logger.error("Cycle failed", error=str(e))
 
                     cycle_count += 1
 
-                    # Heartbeat logging every 5 minutes
+                    # BL-033: periodic heartbeat summary
+                    _maybe_emit_heartbeat(settings)
                     now = time.monotonic()
-                    if now - last_heartbeat >= heartbeat_interval:
-                        mirofish_today = await db.get_daily_mirofish_count()
-                        logger.info(
-                            "Heartbeat",
-                            cycles=cycle_count,
-                            cumulative_tokens_scanned=cumulative["tokens_scanned"],
-                            cumulative_candidates_promoted=cumulative["candidates_promoted"],
-                            cumulative_alerts_fired=cumulative["alerts_fired"],
-                            mirofish_jobs_today=mirofish_today,
-                        )
-                        last_heartbeat = now
 
                     # Hourly tasks: outcome check + DB prune
                     if now - last_outcome_check >= outcome_check_interval:
                         try:
                             outcomes_recorded = await check_outcomes(db, session)
                             if outcomes_recorded:
-                                logger.info("Outcomes checked", recorded=outcomes_recorded)
+                                logger.info(
+                                    "Outcomes checked", recorded=outcomes_recorded
+                                )
                         except Exception as e:
                             logger.warning("Outcome check error", error=str(e))
 
                         # Prune old candidates if DB > 500MB
                         try:
-                            db_size = settings.DB_PATH.stat().st_size if settings.DB_PATH.exists() else 0
+                            db_size = (
+                                settings.DB_PATH.stat().st_size
+                                if settings.DB_PATH.exists()
+                                else 0
+                            )
                             if db_size > 500_000_000:
                                 pruned = await db.prune_old_candidates(keep_days=7)
-                                logger.info("db_pruned", rows_deleted=pruned, db_size_mb=round(db_size / 1e6, 1))
+                                logger.info(
+                                    "db_pruned",
+                                    rows_deleted=pruned,
+                                    db_size_mb=round(db_size / 1e6, 1),
+                                )
                         except Exception as e:
                             logger.warning("DB prune error", error=str(e))
 
@@ -783,9 +908,14 @@ async def main() -> None:
                             summary_data = await db.get_daily_summary_data()
                             summary_text = format_daily_summary(summary_data)
                             if not args.dry_run:
-                                await send_telegram_message(summary_text, session, settings)
-                            logger.info("Daily summary sent", alerts=summary_data["alerts_today"],
-                                        win_rate=summary_data["win_rate_pct"])
+                                await send_telegram_message(
+                                    summary_text, session, settings
+                                )
+                            logger.info(
+                                "Daily summary sent",
+                                alerts=summary_data["alerts_today"],
+                                win_rate=summary_data["win_rate_pct"],
+                            )
                         except Exception as e:
                             logger.warning("Daily summary failed", error=str(e))
                         last_summary_date = current_date
@@ -807,9 +937,7 @@ async def main() -> None:
             ]
             if settings.NARRATIVE_ENABLED:
                 tasks.append(
-                    asyncio.create_task(
-                        narrative_agent_loop(session, settings, db)
-                    )
+                    asyncio.create_task(narrative_agent_loop(session, settings, db))
                 )
             if settings.SECONDWAVE_ENABLED:
                 from scout.secondwave.detector import secondwave_loop
