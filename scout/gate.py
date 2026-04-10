@@ -4,6 +4,8 @@ import structlog
 
 import aiohttp
 
+from scout.chains.events import safe_emit
+from scout.chains.tracker import get_active_boosts
 from scout.config import Settings
 from scout.db import Database
 from scout.exceptions import MiroFishConnectionError, MiroFishTimeoutError
@@ -45,6 +47,21 @@ async def evaluate(
     else:
         conviction = float(quant_score)
 
+    # Apply active chain boosts (best-effort; never breaks the gate).
+    chain_boost = 0
+    if getattr(settings, "CHAINS_ENABLED", False):
+        try:
+            chain_boost = await get_active_boosts(
+                db, token.contract_address, "memecoin", settings
+            )
+        except Exception:
+            logger.exception(
+                "chain_boost_lookup_failed",
+                contract_address=token.contract_address,
+            )
+            chain_boost = 0
+
+    conviction = min(100.0, float(conviction) + float(chain_boost))
     should_alert = conviction >= settings.CONVICTION_THRESHOLD
 
     # Update token with scores
@@ -52,6 +69,21 @@ async def evaluate(
         "narrative_score": narrative_score,
         "conviction_score": conviction,
     })
+
+    # Emit conviction_gated chain event (unconditional — not gated by should_alert).
+    await safe_emit(
+        db,
+        token_id=token.contract_address,
+        pipeline="memecoin",
+        event_type="conviction_gated",
+        event_data={
+            "conviction_score": float(conviction),
+            "quant_score": int(quant_score),
+            "narrative_score": int(narrative_score) if narrative_score is not None else None,
+            "should_alert": bool(should_alert),
+        },
+        source_module="gate",
+    )
 
     return (should_alert, conviction, updated)
 

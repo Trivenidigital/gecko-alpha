@@ -307,6 +307,26 @@ async def daily_learn(
             adjustments_applied=applied,
             true_alpha=rates["true_alpha"],
         )
+
+        # Chain patterns share the narrative agent's daily cadence — piggyback
+        # the LEARN lifecycle (hydrate outcomes → promote/graduate/retire) on
+        # this same tick.
+        try:
+            from scout.config import get_settings
+
+            settings = get_settings()
+            if getattr(settings, "CHAINS_ENABLED", False):
+                from scout.chains.patterns import run_pattern_lifecycle
+                from scout.chains.tracker import update_chain_outcomes
+
+                # Hydrate chain_matches.outcome_class from realized
+                # prediction / outcomes tables BEFORE computing stats.
+                await update_chain_outcomes(db)
+                await run_pattern_lifecycle(db, settings)
+        except Exception:
+            # Full traceback — don't silently str(e) a bug away.
+            log.exception("chain_learn_failed")
+
         return parsed
 
     except Exception:

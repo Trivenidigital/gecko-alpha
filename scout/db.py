@@ -246,6 +246,77 @@ class Database:
                 created_at       TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS signal_events (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id       TEXT NOT NULL,
+                pipeline       TEXT NOT NULL,
+                event_type     TEXT NOT NULL,
+                event_data     TEXT NOT NULL,
+                source_module  TEXT NOT NULL,
+                created_at     TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sig_events_token
+                ON signal_events(token_id, pipeline, created_at);
+            CREATE INDEX IF NOT EXISTS idx_sig_events_type
+                ON signal_events(event_type, created_at);
+
+            CREATE TABLE IF NOT EXISTS chain_patterns (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                name                 TEXT NOT NULL UNIQUE,
+                description          TEXT NOT NULL,
+                steps_json           TEXT NOT NULL,
+                min_steps_to_trigger INTEGER NOT NULL,
+                conviction_boost     INTEGER NOT NULL DEFAULT 0,
+                alert_priority       TEXT NOT NULL DEFAULT 'low',
+                is_active            INTEGER NOT NULL DEFAULT 1,
+                historical_hit_rate  REAL,
+                total_triggers       INTEGER DEFAULT 0,
+                total_hits           INTEGER DEFAULT 0,
+                created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS active_chains (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id       TEXT NOT NULL,
+                pipeline       TEXT NOT NULL,
+                pattern_id     INTEGER NOT NULL REFERENCES chain_patterns(id),
+                pattern_name   TEXT NOT NULL,
+                steps_matched  TEXT NOT NULL,
+                step_events    TEXT NOT NULL,
+                anchor_time    TEXT NOT NULL,
+                last_step_time TEXT NOT NULL,
+                is_complete    INTEGER DEFAULT 0,
+                completed_at   TEXT,
+                created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(token_id, pipeline, pattern_id, anchor_time)
+            );
+            CREATE INDEX IF NOT EXISTS idx_active_chains_token
+                ON active_chains(token_id, pipeline, is_complete);
+            CREATE INDEX IF NOT EXISTS idx_active_chains_prune
+                ON active_chains(is_complete, completed_at, anchor_time);
+
+            CREATE TABLE IF NOT EXISTS chain_matches (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id             TEXT NOT NULL,
+                pipeline             TEXT NOT NULL,
+                pattern_id           INTEGER NOT NULL REFERENCES chain_patterns(id),
+                pattern_name         TEXT NOT NULL,
+                steps_matched        INTEGER NOT NULL,
+                total_steps          INTEGER NOT NULL,
+                anchor_time          TEXT NOT NULL,
+                completed_at         TEXT NOT NULL,
+                chain_duration_hours REAL NOT NULL,
+                conviction_boost     INTEGER NOT NULL,
+                outcome_class        TEXT,
+                outcome_change_pct   REAL,
+                evaluated_at         TEXT,
+                created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_chain_matches_pattern
+                ON chain_matches(pattern_id, outcome_class);
+            CREATE INDEX IF NOT EXISTS idx_chain_matches_token
+                ON chain_matches(token_id, pipeline, completed_at);
             CREATE TABLE IF NOT EXISTS second_wave_candidates (
                 id                       INTEGER PRIMARY KEY AUTOINCREMENT,
                 contract_address         TEXT NOT NULL,
@@ -478,7 +549,7 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         cursor = await self._conn.execute(
-            "SELECT score FROM score_history WHERE contract_address = ? ORDER BY scanned_at DESC LIMIT ?",
+            "SELECT score FROM score_history WHERE contract_address = ? ORDER BY scanned_at DESC, id DESC LIMIT ?",
             (contract_address, limit),
         )
         rows = await cursor.fetchall()

@@ -14,7 +14,10 @@ from datetime import datetime, timedelta, timezone
 
 from scout.aggregator import aggregate
 from scout.alerter import format_daily_summary, send_alert, send_telegram_message
-from scout.config import Settings
+from scout.chains.events import safe_emit
+from scout.chains.patterns import seed_built_in_patterns
+from scout.chains.tracker import run_chain_tracker
+from scout.config import Settings, configure_cache
 from scout.db import Database
 from scout.gate import evaluate
 from scout.ingestion.coingecko import fetch_top_movers as cg_fetch_top_movers
@@ -113,7 +116,7 @@ def _maybe_emit_heartbeat(settings) -> bool:
     return True
 
 
-async def _safe_counter_followup(token, session, settings):
+async def _safe_counter_followup(token, session, settings, db=None):
     """Run counter-score and send follow-up Telegram message. Never raises."""
     try:
         buy_pressure = 0.5
@@ -150,6 +153,23 @@ async def _safe_counter_followup(token, session, settings):
             api_key=settings.ANTHROPIC_API_KEY,
             model=settings.COUNTER_MODEL,
         )
+
+        if db is not None:
+            await safe_emit(
+                db,
+                token_id=token.contract_address,
+                pipeline="memecoin",
+                event_type="counter_scored",
+                event_data={
+                    "risk_score": counter.risk_score if counter.risk_score is not None else 0,
+                    "flag_count": len(counter.red_flags or []),
+                    "high_severity_count": sum(
+                        1 for f in (counter.red_flags or []) if f.severity == "high"
+                    ),
+                    "data_completeness": counter.data_completeness,
+                },
+                source_module="counter.scorer",
+            )
 
         if counter.risk_score is not None:
             flag_lines = "\n".join(
@@ -250,6 +270,18 @@ async def run_cycle(
         )
         await db.upsert_candidate(updated)
         await db.log_score(token.contract_address, points)
+        await safe_emit(
+            db,
+            token_id=token.contract_address,
+            pipeline="memecoin",
+            event_type="candidate_scored",
+            event_data={
+                "quant_score": int(points),
+                "signals_fired": list(signals),
+                "signal_count": len(signals),
+            },
+            source_module="scorer",
+        )
         if points >= settings.MIN_SCORE:
             scored.append((updated, signals))
             stats["candidates_promoted"] += 1
@@ -310,6 +342,17 @@ async def run_cycle(
             logger.info(
                 "alert_delivered", token=gated_token.token_name, status="success"
             )
+            await safe_emit(
+                db,
+                token_id=gated_token.contract_address,
+                pipeline="memecoin",
+                event_type="alert_fired",
+                event_data={
+                    "conviction_score": float(gated_token.conviction_score or 0),
+                    "alert_type": "telegram",
+                },
+                source_module="alerter",
+            )
         except Exception as e:
             logger.error(
                 "alert_delivery_failed", token=gated_token.token_name, error=str(e)
@@ -329,7 +372,7 @@ async def run_cycle(
         # Counter-score follow-up (async, non-blocking)
         if settings.COUNTER_ENABLED:
             task = asyncio.create_task(
-                _safe_counter_followup(gated_token, session, settings)
+                _safe_counter_followup(gated_token, session, settings, db=db)
             )
             task.add_done_callback(
                 lambda t: t.exception() if not t.cancelled() else None
@@ -472,6 +515,20 @@ async def narrative_agent_loop(
 
             for accel in heating:
                 try:
+                    await safe_emit(
+                        db,
+                        token_id=accel.category_id,
+                        pipeline="narrative",
+                        event_type="category_heating",
+                        event_data={
+                            "category_id": accel.category_id,
+                            "name": accel.name,
+                            "acceleration": accel.acceleration,
+                            "volume_growth_pct": accel.volume_growth_pct,
+                            "market_regime": market_regime,
+                        },
+                        source_module="narrative.observer",
+                    )
                     if await is_cooling_down(db, accel.category_id):
                         logger.info(
                             "narrative.category_cooling_down", category=accel.name
@@ -570,6 +627,34 @@ async def narrative_agent_loop(
                             continue
                         consecutive_failures = 0  # reset on success
 
+                        # Chain events: laggard was selected and narrative scored
+                        await safe_emit(
+                            db,
+                            token_id=token.coin_id,
+                            pipeline="narrative",
+                            event_type="laggard_picked",
+                            event_data={
+                                "category_id": accel.category_id,
+                                "category_name": accel.name,
+                                "narrative_fit_score": int(result.get("narrative_fit_score", 0)),
+                                "confidence": result.get("confidence", ""),
+                                "trigger_count": trigger_count,
+                            },
+                            source_module="narrative.predictor",
+                        )
+                        await safe_emit(
+                            db,
+                            token_id=token.coin_id,
+                            pipeline="narrative",
+                            event_type="narrative_scored",
+                            event_data={
+                                "narrative_fit_score": int(result.get("narrative_fit_score", 0)),
+                                "staying_power": result.get("staying_power", ""),
+                                "confidence": result.get("confidence", ""),
+                            },
+                            source_module="narrative.predictor",
+                        )
+
                         # Counter-score for narrative picks
                         counter_risk = None
                         counter_flags_json = None
@@ -629,6 +714,23 @@ async def narrative_agent_loop(
                             counter_completeness = counter_result.data_completeness
                             counter_scored = (
                                 counter_result.counter_scored_at.isoformat()
+                            )
+
+                            await safe_emit(
+                                db,
+                                token_id=token.coin_id,
+                                pipeline="narrative",
+                                event_type="counter_scored",
+                                event_data={
+                                    "risk_score": counter_risk if counter_risk is not None else 0,
+                                    "flag_count": len(counter_result.red_flags or []),
+                                    "high_severity_count": sum(
+                                        1 for f in (counter_result.red_flags or [])
+                                        if f.severity == "high"
+                                    ),
+                                    "data_completeness": counter_completeness,
+                                },
+                                source_module="counter.scorer",
                             )
 
                         pred_row = {
@@ -846,6 +948,9 @@ async def main() -> None:
     )
 
     settings = Settings()
+    # Pre-populate the module-level settings cache to avoid async race
+    # on first lazy get_settings() call during startup.
+    configure_cache(settings)
     if args.min_score_override is not None:
         settings.MIN_SCORE = args.min_score_override
         logger.info("MIN_SCORE overridden", min_score=settings.MIN_SCORE)
@@ -963,6 +1068,10 @@ async def main() -> None:
                     except asyncio.TimeoutError:
                         pass  # Normal -- interval elapsed
 
+            # Seed chain patterns once at startup (idempotent)
+            if settings.CHAINS_ENABLED:
+                await seed_built_in_patterns(db)
+
             tasks: list[asyncio.Task] = [
                 asyncio.create_task(_pipeline_loop()),
             ]
@@ -974,6 +1083,10 @@ async def main() -> None:
                 from scout.secondwave.detector import secondwave_loop
                 tasks.append(
                     asyncio.create_task(secondwave_loop(session, settings))
+                )
+            if settings.CHAINS_ENABLED:
+                tasks.append(
+                    asyncio.create_task(run_chain_tracker(db, settings))
                 )
 
             await asyncio.gather(*tasks, return_exceptions=True)

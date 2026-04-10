@@ -74,6 +74,23 @@ class Settings(BaseSettings):
     COUNTER_MODEL: str = "claude-haiku-4-5"
     COUNTER_SUPPRESS_THRESHOLD: int = 100
 
+    # Conviction Chains
+    CHAIN_CHECK_INTERVAL_SEC: int = 300  # 5 minutes
+    CHAIN_MAX_WINDOW_HOURS: float = 24.0
+    CHAIN_COOLDOWN_HOURS: float = 12.0
+    CHAIN_EVENT_RETENTION_DAYS: int = 14
+    CHAIN_ACTIVE_RETENTION_DAYS: int = 7
+    CHAIN_ALERT_ON_COMPLETE: bool = True
+    CHAIN_TOTAL_BOOST_CAP: int = 30
+    # CHAINS_ENABLED is a bool kill-switch. Pydantic v2 coerces env strings
+    # ("true"/"1"/"yes") to bool automatically.
+    CHAINS_ENABLED: bool = False
+    # LEARN phase lifecycle knobs
+    CHAIN_MIN_TRIGGERS_FOR_STATS: int = 10
+    CHAIN_PROMOTION_THRESHOLD: float = 0.45
+    CHAIN_GRADUATION_MIN_TRIGGERS: int = 30
+    CHAIN_GRADUATION_HIT_RATE: float = 0.55
+
     # -------- Second-Wave Detection --------
     SECONDWAVE_ENABLED: bool = False
     SECONDWAVE_POLL_INTERVAL: int = 1800
@@ -86,6 +103,20 @@ class Settings(BaseSettings):
     SECONDWAVE_ALERT_THRESHOLD: int = 50
     SECONDWAVE_DEDUP_DAYS: int = 7
     SECONDWAVE_MIN_VOLUME_POINTS: int = 2
+
+    @field_validator(
+        "CHAIN_PROMOTION_THRESHOLD", "CHAIN_GRADUATION_HIT_RATE"
+    )
+    @classmethod
+    def _validate_hit_rate_thresholds(cls, v: float) -> float:
+        return max(0.0, min(1.0, v))
+
+    @field_validator(
+        "CHAIN_MIN_TRIGGERS_FOR_STATS", "CHAIN_GRADUATION_MIN_TRIGGERS"
+    )
+    @classmethod
+    def _validate_min_triggers(cls, v: int) -> int:
+        return max(1, v)
 
     @field_validator("CHAINS", mode="before")
     @classmethod
@@ -120,3 +151,26 @@ class Settings(BaseSettings):
             msg = f"QUANT_WEIGHT ({self.QUANT_WEIGHT}) + NARRATIVE_WEIGHT ({self.NARRATIVE_WEIGHT}) = {total}, must sum to 1.0"
             raise ValueError(msg)
         return self
+
+
+_CACHED_SETTINGS: "Settings | None" = None
+
+
+def get_settings() -> "Settings":
+    """Return a cached Settings instance (lazy-init).
+
+    Not async-safe for the very first call during startup races. Call
+    :func:`configure_cache` once at app startup to pre-populate the cache
+    and avoid any race. Tests may monkeypatch this function to override
+    the returned instance.
+    """
+    global _CACHED_SETTINGS
+    if _CACHED_SETTINGS is None:
+        _CACHED_SETTINGS = Settings()  # type: ignore[call-arg]
+    return _CACHED_SETTINGS
+
+
+def configure_cache(settings: "Settings") -> None:
+    """Pre-populate the settings cache at startup to avoid races."""
+    global _CACHED_SETTINGS
+    _CACHED_SETTINGS = settings
