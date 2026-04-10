@@ -14,6 +14,7 @@ import structlog
 from scout.db import Database
 from scout.narrative.models import CategoryAcceleration, LaggardToken
 from scout.narrative.prompts import NARRATIVE_FIT_SYSTEM, NARRATIVE_FIT_TEMPLATE
+from scout.ratelimit import coingecko_limiter
 
 log = structlog.get_logger()
 
@@ -44,6 +45,7 @@ async def fetch_laggards(
     headers: dict[str, str] = {}
     if api_key:
         headers["x-cg-demo-api-key"] = api_key
+    await coingecko_limiter.acquire()
     try:
         async with session.get(
             CG_MARKETS_URL, params=params, headers=headers
@@ -57,7 +59,6 @@ async def fetch_laggards(
                 return []
             data = await resp.json()
             result = data if isinstance(data, list) else []
-            await asyncio.sleep(1)  # call spacing, not shared rate limiter (see GH issue #2)
             return result
     except Exception:
         log.exception("fetch_laggards_exception", category_id=category_id)

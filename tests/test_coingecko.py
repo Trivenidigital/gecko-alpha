@@ -7,7 +7,8 @@ import aiohttp
 from aioresponses import aioresponses
 
 from scout.config import Settings
-from scout.ingestion.coingecko import fetch_top_movers, fetch_trending, _call_timestamps, _rate_lock
+from scout.ingestion.coingecko import fetch_top_movers, fetch_trending
+from scout.ratelimit import coingecko_limiter
 
 
 # -- Fixtures --
@@ -55,10 +56,10 @@ TRENDING_PATTERN = re.compile(r"https://api\.coingecko\.com/api/v3/search/trendi
 
 @pytest.fixture(autouse=True)
 def _clear_rate_limit():
-    """Clear module-level rate limit timestamps between tests."""
-    _call_timestamps.clear()
+    """Clear shared rate limiter timestamps between tests."""
+    coingecko_limiter._timestamps.clear()
     yield
-    _call_timestamps.clear()
+    coingecko_limiter._timestamps.clear()
 
 
 # -- Tests --

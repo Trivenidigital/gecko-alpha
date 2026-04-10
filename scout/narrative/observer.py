@@ -10,6 +10,7 @@ import structlog
 
 from scout.db import Database
 from scout.narrative.models import CategoryAcceleration, CategorySnapshot
+from scout.ratelimit import coingecko_limiter
 
 logger = structlog.get_logger(__name__)
 
@@ -27,6 +28,7 @@ async def fetch_categories(
         headers["x-cg-demo-api-key"] = api_key
 
     for attempt in range(max_retries):
+        await coingecko_limiter.acquire()
         try:
             async with session.get(CATEGORIES_URL, headers=headers) as resp:
                 if resp.status == 429:
@@ -39,7 +41,6 @@ async def fetch_categories(
                     return []
                 data = await resp.json()
                 result = data if isinstance(data, list) else []
-                await asyncio.sleep(1)  # call spacing, not shared rate limiter (see GH issue #2)
                 return result
         except Exception:
             logger.exception("coingecko_categories_exception", attempt=attempt)
