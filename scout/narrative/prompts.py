@@ -43,6 +43,9 @@ CURRENT STRATEGY:
 MARKET REGIME BREAKDOWN:
 {regime_breakdown}
 
+COUNTER-RISK HIT RATES (pre-aggregated):
+{counter_summary}
+
 Analyze:
 1. Which categories produced the most HITs vs MISSes?
 2. Did narrative_fit_score correlate with outcomes?

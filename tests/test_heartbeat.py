@@ -70,7 +70,8 @@ def test_emits_heartbeat_after_interval(monkeypatch):
     _heartbeat_stats["candidates_promoted"] = 7
     _heartbeat_stats["alerts_fired"] = 2
     _heartbeat_stats["narrative_predictions"] = 5
-    _heartbeat_stats["counter_scores"] = 3
+    _heartbeat_stats["counter_scores_memecoin"] = 3
+    _heartbeat_stats["counter_scores_narrative"] = 4
 
     emitted = _maybe_emit_heartbeat(_FakeSettings())
 
@@ -82,7 +83,8 @@ def test_emits_heartbeat_after_interval(monkeypatch):
     assert payload["candidates_promoted"] == 7
     assert payload["alerts_fired"] == 2
     assert payload["narrative_predictions"] == 5
-    assert payload["counter_scores"] == 3
+    assert payload["counter_scores_memecoin"] == 3
+    assert payload["counter_scores_narrative"] == 4
     assert payload["uptime_minutes"] >= 9.0
     # last_heartbeat_at is advanced
     assert _heartbeat_stats["last_heartbeat_at"] > past
@@ -116,3 +118,22 @@ def test_custom_interval_respected(monkeypatch):
     emitted = _maybe_emit_heartbeat(_FastSettings())
     assert emitted is True
     assert captured[0][0] == "heartbeat"
+
+
+
+def test_memecoin_and_narrative_counters_independent(monkeypatch):
+    """Incrementing one counter must not affect the other."""
+    _reset_heartbeat_stats()
+    _capture_logs(monkeypatch)
+
+    _heartbeat_stats["counter_scores_memecoin"] += 1
+    _heartbeat_stats["counter_scores_memecoin"] += 1
+    _heartbeat_stats["counter_scores_narrative"] += 5
+
+    assert _heartbeat_stats["counter_scores_memecoin"] == 2
+    assert _heartbeat_stats["counter_scores_narrative"] == 5
+
+    # Reset clears both
+    _reset_heartbeat_stats()
+    assert _heartbeat_stats["counter_scores_memecoin"] == 0
+    assert _heartbeat_stats["counter_scores_narrative"] == 0

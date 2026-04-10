@@ -80,6 +80,13 @@ class Settings(BaseSettings):
             return [c.strip() for c in v.split(",") if c.strip()]
         return v
 
+    @field_validator("HEARTBEAT_INTERVAL_SECONDS")
+    @classmethod
+    def _validate_heartbeat(cls, v: int) -> int:
+        if v <= 0:
+            return 300  # default fallback
+        return v
+
     @model_validator(mode="after")
     def validate_weights_sum(self) -> "Settings":
         total = self.QUANT_WEIGHT + self.NARRATIVE_WEIGHT

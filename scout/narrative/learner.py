@@ -234,6 +234,26 @@ async def daily_learn(
         row = await cursor.fetchone()
         cycle_number = (row[0] or 0) + 1
 
+        # Pre-aggregate counter-risk correlation stats so Claude does not
+        # have to infer them from raw rows.
+        counter_stats = {
+            "low_risk_hits": 0, "low_risk_total": 0,
+            "mid_risk_hits": 0, "mid_risk_total": 0,
+            "high_risk_hits": 0, "high_risk_total": 0,
+        }
+        for _p in predictions:
+            if _p.get("is_control") or _p.get("counter_risk_score") is None:
+                continue
+            risk = _p["counter_risk_score"]
+            band = "low" if risk < 30 else ("high" if risk >= 60 else "mid")
+            counter_stats[f"{band}_risk_total"] += 1
+            if _p.get("outcome_class") == "HIT":
+                counter_stats[f"{band}_risk_hits"] += 1
+        counter_summary = " | ".join(
+            f"{band}_risk: {counter_stats[f'{band}_risk_hits']}/{counter_stats[f'{band}_risk_total']}"
+            for band in ("low", "mid", "high")
+        )
+
         # Format prompt
         prompt = DAILY_REFLECTION_TEMPLATE.format(
             sample_size=len(predictions),
@@ -243,6 +263,7 @@ async def daily_learn(
             true_alpha=rates["true_alpha"],
             strategy_json=json.dumps(strategy.get_all(), indent=2, default=str),
             regime_breakdown=regime_breakdown,
+            counter_summary=counter_summary,
         )
 
         # Call Claude

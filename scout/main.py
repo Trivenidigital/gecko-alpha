@@ -63,7 +63,8 @@ _heartbeat_stats: dict = {
     "candidates_promoted": 0,
     "alerts_fired": 0,
     "narrative_predictions": 0,
-    "counter_scores": 0,
+    "counter_scores_memecoin": 0,
+    "counter_scores_narrative": 0,
     "last_heartbeat_at": None,
 }
 
@@ -76,7 +77,8 @@ def _reset_heartbeat_stats() -> None:
         candidates_promoted=0,
         alerts_fired=0,
         narrative_predictions=0,
-        counter_scores=0,
+        counter_scores_memecoin=0,
+        counter_scores_narrative=0,
         last_heartbeat_at=None,
     )
 
@@ -103,7 +105,8 @@ def _maybe_emit_heartbeat(settings) -> bool:
         candidates_promoted=_heartbeat_stats["candidates_promoted"],
         alerts_fired=_heartbeat_stats["alerts_fired"],
         narrative_predictions=_heartbeat_stats["narrative_predictions"],
-        counter_scores=_heartbeat_stats["counter_scores"],
+        counter_scores_memecoin=_heartbeat_stats["counter_scores_memecoin"],
+        counter_scores_narrative=_heartbeat_stats["counter_scores_narrative"],
         last_heartbeat_at=_heartbeat_stats["last_heartbeat_at"].isoformat(),
     )
     _heartbeat_stats["last_heartbeat_at"] = now
@@ -158,7 +161,7 @@ async def _safe_counter_followup(token, session, settings):
             )
             await send_telegram_message(msg, session, settings)
 
-        _heartbeat_stats["counter_scores"] += 1
+        _heartbeat_stats["counter_scores_memecoin"] += 1
         logger.info("counter_followup_sent", symbol=token.ticker, risk_score=counter.risk_score)
     except Exception as e:
         logger.error("counter_followup_error", symbol=getattr(token, 'ticker', '?'), error=str(e))
@@ -638,7 +641,7 @@ async def narrative_agent_loop(
                         await store_predictions(db, prediction_rows)
                         _heartbeat_stats["narrative_predictions"] += len(prediction_models)
                         if settings.COUNTER_ENABLED:
-                            _heartbeat_stats["counter_scores"] += len(prediction_models)
+                            _heartbeat_stats["counter_scores_narrative"] += len(prediction_models)
                         logger.info(
                             "narrative.predictions_stored",
                             category=accel.name,
