@@ -9,6 +9,8 @@ from typing import Any
 import aiohttp
 import structlog
 
+from scout.ratelimit import coingecko_limiter
+
 logger = structlog.get_logger()
 
 CG_DETAIL_URL = "https://api.coingecko.com/api/v3/coins/{coin_id}"
@@ -49,16 +51,20 @@ async def fetch_coin_detail(
         headers["x-cg-demo-api-key"] = api_key
 
     url = CG_DETAIL_URL.format(coin_id=coin_id)
+    await coingecko_limiter.acquire()
     try:
         async with session.get(url, params=params, headers=headers) as resp:
             if resp.status == 429:
                 logger.warning("cg_detail_rate_limited", coin_id=coin_id)
+                await coingecko_limiter.report_429()
                 return None
             if resp.status == 404:
                 logger.info("cg_detail_not_found", coin_id=coin_id)
                 return None
             if resp.status >= 400:
-                logger.warning("cg_detail_http_error", coin_id=coin_id, status=resp.status)
+                logger.warning(
+                    "cg_detail_http_error", coin_id=coin_id, status=resp.status
+                )
                 return None
 
             data: dict = await resp.json()
@@ -69,9 +75,6 @@ async def fetch_coin_detail(
     # Cache and return
     _detail_cache[coin_id] = (now, data)
     logger.debug("cg_detail_fetched", coin_id=coin_id)
-
-    # Spacing between calls to stay under rate limits
-    await asyncio.sleep(1)
 
     return data
 
@@ -92,4 +95,5 @@ def extract_counter_data(detail: dict) -> dict:
         "sentiment_up_pct": detail.get("sentiment_votes_up_percentage", 50.0) or 50.0,
         "price_change_7d": market_data.get("price_change_percentage_7d", 0) or 0,
         "price_change_30d": market_data.get("price_change_percentage_30d", 0) or 0,
+        "watchlist_portfolio_users": detail.get("watchlist_portfolio_users", 0) or 0,
     }

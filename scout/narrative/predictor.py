@@ -14,6 +14,7 @@ import structlog
 from scout.db import Database
 from scout.narrative.models import CategoryAcceleration, LaggardToken
 from scout.narrative.prompts import NARRATIVE_FIT_SYSTEM, NARRATIVE_FIT_TEMPLATE
+from scout.ratelimit import coingecko_limiter
 
 log = structlog.get_logger()
 
@@ -44,10 +45,16 @@ async def fetch_laggards(
     headers: dict[str, str] = {}
     if api_key:
         headers["x-cg-demo-api-key"] = api_key
+    await coingecko_limiter.acquire()
     try:
-        async with session.get(
-            CG_MARKETS_URL, params=params, headers=headers
-        ) as resp:
+        async with session.get(CG_MARKETS_URL, params=params, headers=headers) as resp:
+            if resp.status == 429:
+                log.warning(
+                    "fetch_laggards_rate_limited",
+                    category_id=category_id,
+                )
+                await coingecko_limiter.report_429()
+                return []
             if resp.status != 200:
                 log.warning(
                     "fetch_laggards_error",
@@ -57,7 +64,6 @@ async def fetch_laggards(
                 return []
             data = await resp.json()
             result = data if isinstance(data, list) else []
-            await asyncio.sleep(1)  # call spacing, not shared rate limiter (see GH issue #2)
             return result
     except Exception:
         log.exception("fetch_laggards_exception", category_id=category_id)
@@ -162,6 +168,7 @@ def build_scoring_prompt(
     market_regime: str,
     top_3_coins: str,
     lessons_appendix: str,
+    watchlist_users: int = 0,
 ) -> str:
     """Build the user prompt for Claude narrative-fit scoring."""
     vol_mcap_ratio = token.volume_24h / max(token.market_cap, 1)
@@ -179,6 +186,7 @@ def build_scoring_prompt(
         market_regime=market_regime,
         coin_count_change=accel.coin_count_change,
         vol_mcap_ratio=vol_mcap_ratio,
+        watchlist_users=watchlist_users,
         lessons_appendix=lessons_appendix,
     )
 
@@ -211,6 +219,7 @@ async def score_token(
     api_key: str,
     model: str,
     client: object | None = None,
+    watchlist_users: int = 0,
 ) -> dict | None:
     """Call Claude to score a single token's narrative fit.
 
@@ -222,7 +231,10 @@ async def score_token(
         if client is None:
             client = anthropic.Anthropic(api_key=api_key)
 
-        prompt = build_scoring_prompt(token, accel, market_regime, top_3_coins, lessons)
+        prompt = build_scoring_prompt(
+            token, accel, market_regime, top_3_coins, lessons,
+            watchlist_users=watchlist_users,
+        )
         response = client.messages.create(  # type: ignore[union-attr]
             model=model,
             max_tokens=300,
@@ -233,9 +245,7 @@ async def score_token(
         raw = response.content[0].text  # type: ignore[index]
         return parse_scoring_response(raw)
     except Exception:
-        log.exception(
-            "score_token_error", coin_id=token.coin_id, symbol=token.symbol
-        )
+        log.exception("score_token_error", coin_id=token.coin_id, symbol=token.symbol)
         return None
 
 
@@ -329,9 +339,7 @@ async def record_signal(
 # ------------------------------------------------------------------
 
 
-async def store_predictions(
-    db: Database, predictions: list[dict]
-) -> None:
+async def store_predictions(db: Database, predictions: list[dict]) -> None:
     """INSERT OR IGNORE each prediction into the predictions table.
 
     Serialises strategy_snapshot and strategy_snapshot_ab as JSON strings.
@@ -355,9 +363,9 @@ async def store_predictions(
                 market_regime, trigger_count, is_control, is_holdout,
                 strategy_snapshot, strategy_snapshot_ab, predicted_at,
                 counter_risk_score, counter_flags, counter_argument,
-                counter_data_completeness, counter_scored_at)
+                counter_data_completeness, counter_scored_at, watchlist_users)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?)""",
             (
                 p["category_id"],
                 p["category_name"],
@@ -382,6 +390,7 @@ async def store_predictions(
                 p.get("counter_argument"),
                 p.get("counter_data_completeness"),
                 p.get("counter_scored_at"),
+                p.get("watchlist_users"),
             ),
         )
     await conn.commit()

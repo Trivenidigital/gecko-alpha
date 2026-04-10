@@ -212,6 +212,7 @@ class Database:
                 counter_argument         TEXT,
                 counter_data_completeness TEXT,
                 counter_scored_at        TEXT,
+                watchlist_users         INTEGER,
                 evaluated_at            TEXT,
                 created_at              TEXT NOT NULL DEFAULT (datetime('now')),
                 UNIQUE(category_id, coin_id, predicted_at)
@@ -316,8 +317,51 @@ class Database:
                 ON chain_matches(pattern_id, outcome_class);
             CREATE INDEX IF NOT EXISTS idx_chain_matches_token
                 ON chain_matches(token_id, pipeline, completed_at);
+            CREATE TABLE IF NOT EXISTS second_wave_candidates (
+                id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                contract_address         TEXT NOT NULL,
+                chain                    TEXT NOT NULL,
+                token_name               TEXT NOT NULL,
+                ticker                   TEXT NOT NULL,
+                coingecko_id             TEXT,
+                peak_quant_score         INTEGER NOT NULL,
+                peak_signals_fired       TEXT,
+                first_seen_at            TEXT NOT NULL,
+                original_alert_at        TEXT,
+                original_market_cap      REAL,
+                alert_market_cap         REAL,
+                days_since_first_seen    REAL,
+                price_drop_from_peak_pct REAL,
+                current_price            REAL,
+                current_market_cap       REAL,
+                current_volume_24h       REAL,
+                price_vs_alert_pct       REAL,
+                volume_vs_cooldown_avg   REAL,
+                price_is_stale           INTEGER NOT NULL DEFAULT 0,
+                reaccumulation_score     INTEGER NOT NULL,
+                reaccumulation_signals   TEXT NOT NULL,
+                detected_at              TEXT NOT NULL,
+                alerted_at               TEXT,
+                created_at               TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_sw_contract
+                ON second_wave_candidates(contract_address, detected_at);
+            CREATE INDEX IF NOT EXISTS idx_sw_score
+                ON second_wave_candidates(reaccumulation_score);
             """
         )
+
+        # Migrate alerts table: add price_usd, token_name, ticker if missing
+        cursor = await self._conn.execute("PRAGMA table_info(alerts)")
+        existing_cols = {row[1] for row in await cursor.fetchall()}
+        for col, ddl in (
+            ("price_usd", "ALTER TABLE alerts ADD COLUMN price_usd REAL"),
+            ("token_name", "ALTER TABLE alerts ADD COLUMN token_name TEXT"),
+            ("ticker", "ALTER TABLE alerts ADD COLUMN ticker TEXT"),
+        ):
+            if col not in existing_cols:
+                await self._conn.execute(ddl)
+        await self._conn.commit()
 
     # ------------------------------------------------------------------
     # Candidates
@@ -363,14 +407,21 @@ class Database:
     async def log_alert(
         self, contract_address: str, chain: str, conviction_score: float,
         alert_market_cap: float | None = None,
+        price_usd: float | None = None,
+        token_name: str | None = None,
+        ticker: str | None = None,
     ) -> None:
-        """Log a fired alert with market cap at alert time."""
+        """Log a fired alert with market cap, price, and token identity."""
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         now = datetime.now(timezone.utc).isoformat()
         await self._conn.execute(
-            "INSERT INTO alerts (contract_address, chain, conviction_score, alert_market_cap, alerted_at) VALUES (?, ?, ?, ?, ?)",
-            (contract_address, chain, conviction_score, alert_market_cap, now),
+            """INSERT INTO alerts
+               (contract_address, chain, conviction_score, alert_market_cap,
+                price_usd, token_name, ticker, alerted_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (contract_address, chain, conviction_score, alert_market_cap,
+             price_usd, token_name, ticker, now),
         )
         await self._conn.commit()
 
@@ -498,7 +549,7 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         cursor = await self._conn.execute(
-            "SELECT score FROM score_history WHERE contract_address = ? ORDER BY scanned_at DESC LIMIT ?",
+            "SELECT score FROM score_history WHERE contract_address = ? ORDER BY scanned_at DESC, id DESC LIMIT ?",
             (contract_address, limit),
         )
         rows = await cursor.fetchall()
@@ -618,3 +669,153 @@ class Database:
         )
         row = await cursor.fetchone()
         return row[0] if row else 0
+
+    # ------------------------------------------------------------------
+    # Second-Wave Detection
+    # ------------------------------------------------------------------
+
+    async def get_secondwave_scan_candidates(
+        self,
+        min_age_days: int = 3,
+        max_age_days: int = 14,
+        min_peak_score: int = 60,
+        dedup_days: int = 7,
+    ) -> list[dict]:
+        """Get alerted tokens in the cooldown window whose peak quant_score
+        exceeded min_peak_score and that haven't been second-wave alerted recently.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cursor = await self._conn.execute(
+            """SELECT a.contract_address,
+                      a.chain,
+                      COALESCE(a.token_name, '') AS token_name,
+                      COALESCE(a.ticker, '')     AS ticker,
+                      a.alert_market_cap,
+                      a.price_usd                AS alert_price,
+                      a.alerted_at,
+                      MAX(sh.score)              AS peak_quant_score
+               FROM alerts a
+               LEFT JOIN score_history sh ON sh.contract_address = a.contract_address
+               WHERE a.alerted_at <= datetime('now', '-' || ? || ' days')
+                 AND a.alerted_at >= datetime('now', '-' || ? || ' days')
+                 AND a.contract_address NOT IN (
+                     SELECT contract_address FROM second_wave_candidates
+                     WHERE detected_at >= datetime('now', '-' || ? || ' days')
+                 )
+               GROUP BY a.contract_address
+               HAVING peak_quant_score >= ?""",
+            (int(min_age_days), int(max_age_days), int(dedup_days), int(min_peak_score)),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_coingecko_id_by_symbol(self, symbol: str) -> str | None:
+        """Look up a CoinGecko coin_id from the predictions table by ticker symbol.
+
+        Symbol-to-coin_id mapping requires the narrative agent to be enabled
+        (``NARRATIVE_ENABLED=true``). When disabled, the predictions table is
+        empty and every caller will receive ``None``. In the second-wave
+        detector this causes tokens to fall back to the stale-price path,
+        where alerts are suppressed entirely.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not symbol:
+            return None
+        cursor = await self._conn.execute(
+            """SELECT coin_id FROM predictions
+               WHERE symbol = ?
+               ORDER BY predicted_at DESC
+               LIMIT 1""",
+            (symbol,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def was_secondwave_alerted(
+        self, contract_address: str, days: int = 7
+    ) -> bool:
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cursor = await self._conn.execute(
+            """SELECT COUNT(*) FROM second_wave_candidates
+               WHERE contract_address = ?
+                 AND detected_at >= datetime('now', '-' || ? || ' days')""",
+            (contract_address, int(days)),
+        )
+        row = await cursor.fetchone()
+        return row[0] > 0 if row else False
+
+    async def insert_secondwave_candidate(self, candidate: dict) -> None:
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        await self._conn.execute(
+            """INSERT INTO second_wave_candidates
+               (contract_address, chain, token_name, ticker, coingecko_id,
+                peak_quant_score, peak_signals_fired, first_seen_at,
+                original_alert_at, original_market_cap, alert_market_cap,
+                days_since_first_seen, price_drop_from_peak_pct,
+                current_price, current_market_cap, current_volume_24h,
+                price_vs_alert_pct, volume_vs_cooldown_avg, price_is_stale,
+                reaccumulation_score, reaccumulation_signals,
+                detected_at, alerted_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                candidate["contract_address"],
+                candidate["chain"],
+                candidate["token_name"],
+                candidate["ticker"],
+                candidate.get("coingecko_id"),
+                candidate["peak_quant_score"],
+                json.dumps(candidate.get("peak_signals_fired") or []),
+                candidate["first_seen_at"],
+                candidate.get("original_alert_at"),
+                candidate.get("original_market_cap"),
+                candidate.get("alert_market_cap"),
+                candidate.get("days_since_first_seen"),
+                candidate.get("price_drop_from_peak_pct"),
+                candidate.get("current_price"),
+                candidate.get("current_market_cap"),
+                candidate.get("current_volume_24h"),
+                candidate.get("price_vs_alert_pct"),
+                candidate.get("volume_vs_cooldown_avg"),
+                1 if candidate.get("price_is_stale") else 0,
+                candidate["reaccumulation_score"],
+                json.dumps(candidate.get("reaccumulation_signals") or []),
+                candidate["detected_at"],
+                candidate.get("alerted_at"),
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_recent_secondwave_candidates(self, days: int = 7) -> list[dict]:
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cursor = await self._conn.execute(
+            """SELECT * FROM second_wave_candidates
+               WHERE detected_at >= datetime('now', '-' || ? || ' days')
+               ORDER BY reaccumulation_score DESC""",
+            (int(days),),
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+        for r in rows:
+            r["peak_signals_fired"] = json.loads(r.get("peak_signals_fired") or "[]")
+            r["reaccumulation_signals"] = json.loads(r.get("reaccumulation_signals") or "[]")
+            r["price_is_stale"] = bool(r.get("price_is_stale", 0))
+        return rows
+
+    async def get_volume_history(
+        self, contract_address: str, days: int = 14
+    ) -> list[float]:
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cursor = await self._conn.execute(
+            """SELECT volume_24h_usd FROM volume_snapshots
+               WHERE contract_address = ?
+                 AND scanned_at >= datetime('now', '-' || ? || ' days')
+               ORDER BY scanned_at DESC""",
+            (contract_address, int(days)),
+        )
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]

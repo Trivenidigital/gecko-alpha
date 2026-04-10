@@ -18,6 +18,12 @@ def compute_narrative_flags(
 ) -> list[RedFlag]:
     """Compute deterministic red flags for narrative-driven tokens.
 
+    Note: watchlist_portfolio_users is intentionally NOT considered here.
+    Watchlist growth is a POSITIVE signal used by the bullish narrative
+    scoring pass (see scout/narrative/prompts.py), not a counter-indicator.
+    High watchlist = bullish interest, not risk-reducing, so it belongs
+    in the scoring prompt rather than the red-flag detector.
+
     Args:
         price_change_30d: Percentage price change over the last 30 days.
         commits_4w: Number of GitHub commits in the last 4 weeks.

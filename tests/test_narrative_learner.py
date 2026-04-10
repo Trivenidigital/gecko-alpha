@@ -155,3 +155,52 @@ async def test_should_pause_not_enough_data():
     """Only 2 rates — not enough data → False."""
     rates = [5.0, 6.0]
     assert should_pause(rates, threshold=10.0, consecutive_days=7) is False
+
+
+
+async def test_daily_learn_includes_counter_risk_score_in_prompt(tmp_path):
+    """Verify pre-aggregated counter_risk stats flow into the LEARN prompt."""
+    from unittest.mock import MagicMock, patch
+    from scout.narrative.learner import daily_learn
+
+    database = Database(tmp_path / "learn_counter.db")
+    await database.initialize()
+    s = Strategy(database)
+    await s.load_or_init()
+
+    conn = database._conn
+    assert conn is not None
+    # Insert an evaluated prediction with counter data using the real schema.
+    await conn.execute(
+        """INSERT INTO predictions
+           (category_id, category_name, coin_id, symbol, name,
+            market_cap_at_prediction, price_at_prediction,
+            narrative_fit_score, staying_power, confidence, reasoning,
+            market_regime, trigger_count, is_control, is_holdout,
+            strategy_snapshot, predicted_at, outcome_class, evaluated_at,
+            counter_risk_score, counter_flags, counter_data_completeness)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ("ai", "AI", "coin-1", "TKN", "Token", 50e6, 1.0, 75,
+         "High", "Medium", "test", "BULL", 1, 0, 0,
+         "{}", _NOW, "HIT", _NOW,
+         55, '[{"flag": "already_peaked"}]', "full"),
+    )
+    await conn.commit()
+
+    # Mock the synchronous anthropic client used by the learner.
+    mock_client = MagicMock()
+    mock_msg = MagicMock()
+    mock_msg.content = [MagicMock(text='{"adjustments": [], "reflection": "test", "true_alpha": 0}')]
+    mock_client.messages.create = MagicMock(return_value=mock_msg)
+
+    with patch("scout.narrative.learner.anthropic.Anthropic", return_value=mock_client):
+        await daily_learn(database, s, "fake-key", "claude-sonnet-4-6")
+
+    assert mock_client.messages.create.called
+    call_kwargs = mock_client.messages.create.call_args.kwargs
+    prompt_text = call_kwargs["messages"][0]["content"]
+    # Risk=55 -> mid band, HIT -> mid_risk: 1/1
+    assert "mid_risk: 1/1" in prompt_text
+    assert "COUNTER-RISK HIT RATES" in prompt_text
+
+    await database.close()

@@ -327,3 +327,61 @@ async def test_score_token_api_failure():
         "fake-key", "claude-haiku-4-5", client=mock_client,
     )
     assert result is None
+
+
+async def test_build_scoring_prompt_includes_watchlist():
+    """build_scoring_prompt should embed watchlist_users in the prompt text."""
+    from scout.narrative.predictor import build_scoring_prompt
+    from scout.narrative.models import LaggardToken, CategoryAcceleration
+
+    token = LaggardToken(
+        coin_id="test", symbol="TST", name="Test Token",
+        market_cap=50e6, price=1.0, price_change_24h=2.0,
+        volume_24h=500_000, category_id="ai", category_name="AI",
+    )
+    accel = CategoryAcceleration(
+        category_id="ai", name="AI", current_velocity=12.0,
+        previous_velocity=5.0, acceleration=7.0, volume_24h=2e9,
+        volume_growth_pct=15.0, coin_count_change=-2, is_heating=True,
+    )
+
+    prompt = build_scoring_prompt(
+        token, accel, "BULL", "fetch-ai, render", "",
+        watchlist_users=42_500,
+    )
+    assert "CoinGecko watchlist" in prompt
+    assert "42,500 users tracking this coin" in prompt
+
+
+async def test_score_token_passes_watchlist_to_prompt():
+    """score_token should pass watchlist_users through to the built prompt."""
+    from unittest.mock import MagicMock
+    from scout.narrative.predictor import score_token
+    from scout.narrative.models import LaggardToken, CategoryAcceleration
+
+    token = LaggardToken(
+        coin_id="test", symbol="TST", name="Test Token",
+        market_cap=50e6, price=1.0, price_change_24h=2.0,
+        volume_24h=500_000, category_id="ai", category_name="AI",
+    )
+    accel = CategoryAcceleration(
+        category_id="ai", name="AI", current_velocity=12.0,
+        previous_velocity=5.0, acceleration=7.0, volume_24h=2e9,
+        volume_growth_pct=15.0, coin_count_change=-2, is_heating=True,
+    )
+
+    mock_client = MagicMock()
+    mock_message = MagicMock()
+    mock_message.content = [MagicMock(text='{"narrative_fit": 60, "staying_power": "Medium", "confidence": "Low", "reasoning": "x"}')]
+    mock_client.messages.create = MagicMock(return_value=mock_message)
+
+    await score_token(
+        token, accel, "BULL", "fetch-ai", "",
+        "fake-key", "claude-haiku-4-5", client=mock_client,
+        watchlist_users=7_777,
+    )
+
+    called_kwargs = mock_client.messages.create.call_args.kwargs
+    user_prompt = called_kwargs["messages"][0]["content"]
+    assert "CoinGecko watchlist" in user_prompt
+    assert "7,777 users tracking this coin" in user_prompt

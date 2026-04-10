@@ -15,6 +15,7 @@ Category leaders: {top_3_coins}.
 Evaluate {token_name} ({symbol}, ${market_cap:,.0f} mcap, {price_change_24h:+.1f}% 24h):
 Objective data: market regime: {market_regime}, \
 category coin count change: {coin_count_change}, token volume/mcap ratio: {vol_mcap_ratio:.2f}.
+CoinGecko watchlist: {watchlist_users:,} users tracking this coin (>10k = mainstream, >100k = high interest, >1M = viral)
 
 1. Does this token genuinely belong to the {category_name} narrative?
 2. Given the objective data above, is the volume/price trend consistent with genuine accumulation?
@@ -43,6 +44,9 @@ CURRENT STRATEGY:
 MARKET REGIME BREAKDOWN:
 {regime_breakdown}
 
+COUNTER-RISK HIT RATES (pre-aggregated):
+{counter_summary}
+
 Analyze:
 1. Which categories produced the most HITs vs MISSes?
 2. Did narrative_fit_score correlate with outcomes?
@@ -51,6 +55,7 @@ Analyze:
 5. Does trigger_count correlate with better outcomes?
 6. Market regime: should thresholds differ in BULL vs BEAR vs CRAB?
 7. Survivorship: did categories with negative coin_count_change produce more MISSes?
+8. Does counter_risk_score correlate with outcomes? Do high counter scores produce more MISSes?
 
 Suggest 0-3 strategy adjustments:
 {{"key": "<strategy_key>", "new_value": <value>, "reason": "<citing data>"}}

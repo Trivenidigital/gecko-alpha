@@ -83,6 +83,7 @@ class NarrativePrediction(BaseModel):
     counter_argument: str | None = None
     counter_data_completeness: str | None = None
     counter_scored_at: datetime | None = None
+    watchlist_users: int | None = None
 
     @field_validator("narrative_fit_score")
     @classmethod
