@@ -546,6 +546,7 @@ async def narrative_agent_loop(
                         pred_row["counter_argument"] = counter_arg
                         pred_row["counter_data_completeness"] = counter_completeness
                         pred_row["counter_scored_at"] = counter_scored
+                        pred_row["watchlist_users"] = watchlist_users
                         prediction_rows.append(pred_row)
                         prediction_models.append(
                             NarrativePrediction(
@@ -565,11 +566,26 @@ async def narrative_agent_loop(
                                 is_control=False,
                                 strategy_snapshot=strategy_snap,
                                 predicted_at=now,
+                                watchlist_users=watchlist_users,
                             )
                         )
 
-                    # Add control predictions (no Claude scoring)
+                    # Add control predictions (no Claude scoring).
+                    # Fetch watchlist the same way as agent picks so that
+                    # backtest comparisons between agent and control are fair
+                    # — both groups have the same data captured at prediction
+                    # time. The detail fetcher has a 30-min cache so this is
+                    # essentially free when a token also appeared in scoring.
                     for token in control_laggards:
+                        control_detail = await fetch_coin_detail(
+                            session, token.coin_id, settings.COINGECKO_API_KEY
+                        )
+                        control_watchlist = 0
+                        if control_detail:
+                            ccdata = extract_counter_data(control_detail)
+                            control_watchlist = int(
+                                ccdata.get("watchlist_portfolio_users", 0) or 0
+                            )
                         prediction_rows.append({
                             "category_id": accel.category_id,
                             "category_name": accel.name,
@@ -589,6 +605,7 @@ async def narrative_agent_loop(
                             "strategy_snapshot": strategy_snap,
                             "strategy_snapshot_ab": None,
                             "predicted_at": now.isoformat(),
+                            "watchlist_users": control_watchlist,
                         })
 
                     if prediction_rows:

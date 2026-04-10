@@ -121,8 +121,8 @@ async def run_backtest(db_path: str, days: int) -> None:
             row = await cur.fetchone()
         if row:
             print(f"\nExisting Pipeline Alerts: {row['total'] or 0}")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  (error querying alerts: {e})")
 
     # --- Alert-to-outcome analysis (existing pipeline) --------------------
     try:
@@ -137,8 +137,8 @@ async def run_backtest(db_path: str, days: int) -> None:
             print("\nAlert outcome distribution:")
             for r in outcome_rows:
                 print(f"  {r['outcome_class']}: {r['total']}")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  (error querying outcomes: {e})")
 
     # --- Second-wave candidates -------------------------------------------
     try:
@@ -149,8 +149,8 @@ async def run_backtest(db_path: str, days: int) -> None:
             row = await cur.fetchone()
         if row and row["total"]:
             print(f"\nSecond-Wave Detections: {row['total']}")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  (error querying second_wave_candidates: {e})")
 
     # --- Conviction chains ------------------------------------------------
     try:
@@ -165,8 +165,8 @@ async def run_backtest(db_path: str, days: int) -> None:
             print("\nConviction Chains:")
             for r in rows:
                 print(f"  {r['pattern_id']}: {r['total']}")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  (error querying chain_matches: {e})")
 
     await db.close()
 
