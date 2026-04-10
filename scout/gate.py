@@ -4,6 +4,7 @@ import structlog
 
 import aiohttp
 
+from scout.chains.events import safe_emit
 from scout.config import Settings
 from scout.db import Database
 from scout.exceptions import MiroFishConnectionError, MiroFishTimeoutError
@@ -52,6 +53,21 @@ async def evaluate(
         "narrative_score": narrative_score,
         "conviction_score": conviction,
     })
+
+    # Emit conviction_gated chain event (unconditional — not gated by should_alert).
+    await safe_emit(
+        db,
+        token_id=token.contract_address,
+        pipeline="memecoin",
+        event_type="conviction_gated",
+        event_data={
+            "conviction_score": float(conviction),
+            "quant_score": int(quant_score),
+            "narrative_score": int(narrative_score) if narrative_score is not None else None,
+            "should_alert": bool(should_alert),
+        },
+        source_module="gate",
+    )
 
     return (should_alert, conviction, updated)
 
