@@ -72,6 +72,18 @@ class Settings(BaseSettings):
     COUNTER_MODEL: str = "claude-haiku-4-5"
     COUNTER_SUPPRESS_THRESHOLD: int = 100
 
+    # -------- Second-Wave Detection --------
+    SECONDWAVE_ENABLED: bool = False
+    SECONDWAVE_POLL_INTERVAL: int = 1800
+    SECONDWAVE_MIN_PRIOR_SCORE: int = 60
+    SECONDWAVE_COOLDOWN_MIN_DAYS: int = 3
+    SECONDWAVE_COOLDOWN_MAX_DAYS: int = 14
+    SECONDWAVE_MIN_DRAWDOWN_PCT: float = 30.0
+    SECONDWAVE_MIN_RECOVERY_PCT: float = 70.0
+    SECONDWAVE_VOL_PICKUP_RATIO: float = 2.0
+    SECONDWAVE_ALERT_THRESHOLD: int = 50
+    SECONDWAVE_DEDUP_DAYS: int = 7
+
     @field_validator("CHAINS", mode="before")
     @classmethod
     def parse_chains(cls, v: str | list[str]) -> list[str]:
