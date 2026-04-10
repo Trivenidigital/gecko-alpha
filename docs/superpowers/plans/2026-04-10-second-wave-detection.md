@@ -37,8 +37,7 @@ The spec references `alerts.market_cap_usd`, `alerts.price_usd`, and `alerts.tok
 |------|---------|
 | `scout/config.py` | Add 10 `SECONDWAVE_*` config fields |
 | `scout/db.py` | Add `second_wave_candidates` table, migrate `alerts`, add 5 new methods |
-| `scout/main.py` | Add `secondwave_loop` to `asyncio.gather()` |
-| `scout/alerter.py` | Extend `log_alert` callers to persist `price_usd`/`token_name`/`ticker` (minimal wiring) |
+| `scout/main.py` | Add `secondwave_loop` to `asyncio.gather()`; extend the `db.log_alert(...)` call at line 235 to persist `price_usd`/`token_name`/`ticker` |
 | `.env.example` | Add `SECONDWAVE_*` env vars |
 | `dashboard/api.py` | (Phase 2) Add `/api/secondwave/candidates` + `/api/secondwave/stats` |
 
@@ -115,6 +114,34 @@ def test_secondwave_candidate_with_coingecko_id():
         detected_at=datetime.now(timezone.utc),
     )
     assert cand.coingecko_id == "cg-token"
+
+
+def test_secondwave_candidate_stale_price():
+    """price_is_stale=True must round-trip through the model."""
+    cand = SecondWaveCandidate(
+        contract_address="0xstale",
+        chain="ethereum",
+        token_name="Stale Token",
+        ticker="STL",
+        peak_quant_score=70,
+        peak_signals_fired=["momentum_ratio"],
+        first_seen_at=datetime.now(timezone.utc),
+        original_market_cap=1_000_000.0,
+        alert_market_cap=2_000_000.0,
+        days_since_first_seen=6.0,
+        price_drop_from_peak_pct=0.0,
+        current_price=1.0,
+        current_market_cap=2_000_000.0,
+        current_volume_24h=None,
+        price_vs_alert_pct=100.0,
+        volume_vs_cooldown_avg=0.0,
+        price_is_stale=True,
+        reaccumulation_score=50,
+        reaccumulation_signals=["price_recovery", "strong_prior_signal"],
+        detected_at=datetime.now(timezone.utc),
+    )
+    assert cand.price_is_stale is True
+    assert cand.current_volume_24h is None
 ```
 
 - [ ] **Step 2: Verify tests fail**
@@ -301,7 +328,7 @@ async def test_get_secondwave_scan_candidates_filters_by_window(db):
     await _insert_score_history(db, "0xweak", score=40.0, days_ago=5)
 
     rows = await db.get_secondwave_scan_candidates(
-        min_age_days=3, max_age_days=14, min_peak_score=60
+        min_age_days=3, max_age_days=14, min_peak_score=60, dedup_days=7
     )
     addrs = {r["contract_address"] for r in rows}
     assert "0xin" in addrs
@@ -328,7 +355,7 @@ async def test_get_secondwave_scan_candidates_excludes_already_detected(db):
         "reaccumulation_signals": ["sufficient_drawdown", "price_recovery"],
         "detected_at": now, "alerted_at": now,
     })
-    rows = await db.get_secondwave_scan_candidates(3, 14, 60)
+    rows = await db.get_secondwave_scan_candidates(3, 14, 60, 7)
     assert all(r["contract_address"] != "0xdup" for r in rows)
 
 
@@ -385,6 +412,34 @@ async def test_get_recent_secondwave_candidates(db):
     assert rows[0]["reaccumulation_score"] == 77
     assert rows[0]["reaccumulation_signals"] == ["price_recovery"]
     assert rows[0]["peak_signals_fired"] == ["x"]
+
+
+async def test_log_alert_persists_new_columns(db):
+    """Ensure log_alert's extended signature round-trips price_usd/token_name/ticker."""
+    await db.log_alert(
+        contract_address="0xnewcols",
+        chain="ethereum",
+        conviction_score=72.5,
+        alert_market_cap=1_500_000.0,
+        price_usd=0.42,
+        token_name="NewCol Token",
+        ticker="NCT",
+    )
+    cursor = await db._conn.execute(
+        """SELECT contract_address, chain, conviction_score, alert_market_cap,
+                  price_usd, token_name, ticker
+           FROM alerts WHERE contract_address = ?""",
+        ("0xnewcols",),
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    assert row["contract_address"] == "0xnewcols"
+    assert row["chain"] == "ethereum"
+    assert row["conviction_score"] == 72.5
+    assert row["alert_market_cap"] == 1_500_000.0
+    assert row["price_usd"] == 0.42
+    assert row["token_name"] == "NewCol Token"
+    assert row["ticker"] == "NCT"
 ```
 
 - [ ] **Step 2: Verify tests fail**
@@ -462,41 +517,68 @@ Append to `scout/db.py`:
         min_age_days: int = 3,
         max_age_days: int = 14,
         min_peak_score: int = 60,
+        dedup_days: int = 7,
     ) -> list[dict]:
         """Get alerted tokens in the cooldown window whose peak quant_score
         exceeded min_peak_score and that haven't been second-wave alerted recently.
 
         Joins `alerts` (persists beyond candidates prune) with `score_history`
-        (peak score via MAX aggregate) and `predictions` (coingecko_id for
-        narrative agent tokens). Peak score is filtered in SQL HAVING clause.
+        (peak score via MAX aggregate). Note: the `predictions` table has
+        `coin_id` / `symbol` but no `contract_address` column, so we do NOT
+        JOIN it here — callers must do a follow-up lookup by symbol to resolve
+        a CoinGecko id (see `run_once` in `scout/secondwave/detector.py`).
+        Peak score is filtered in SQL HAVING clause. All time-window integers
+        are passed as bound parameters (never f-string interpolated) to
+        eliminate any SQL injection risk.
         """
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         cursor = await self._conn.execute(
-            f"""SELECT a.contract_address,
-                       a.chain,
-                       COALESCE(a.token_name, '') AS token_name,
-                       COALESCE(a.ticker, '')     AS ticker,
-                       a.alert_market_cap,
-                       a.price_usd                AS alert_price,
-                       a.alerted_at,
-                       p.coin_id                  AS coingecko_id,
-                       MAX(sh.score)              AS peak_score
-                FROM alerts a
-                LEFT JOIN score_history sh ON sh.contract_address = a.contract_address
-                LEFT JOIN predictions p    ON p.contract_address = a.contract_address
-                WHERE a.alerted_at <= datetime('now', '-{int(min_age_days)} days')
-                  AND a.alerted_at >= datetime('now', '-{int(max_age_days)} days')
-                  AND a.contract_address NOT IN (
-                      SELECT contract_address FROM second_wave_candidates
-                      WHERE detected_at >= datetime('now', '-7 days')
-                  )
-                GROUP BY a.contract_address
-                HAVING peak_score >= ?""",
-            (min_peak_score,),
+            """SELECT a.contract_address,
+                      a.chain,
+                      COALESCE(a.token_name, '') AS token_name,
+                      COALESCE(a.ticker, '')     AS ticker,
+                      a.alert_market_cap,
+                      a.price_usd                AS alert_price,
+                      a.alerted_at,
+                      MAX(sh.score)              AS peak_quant_score
+               FROM alerts a
+               LEFT JOIN score_history sh ON sh.contract_address = a.contract_address
+               WHERE a.alerted_at <= datetime('now', '-' || ? || ' days')
+                 AND a.alerted_at >= datetime('now', '-' || ? || ' days')
+                 AND a.contract_address NOT IN (
+                     SELECT contract_address FROM second_wave_candidates
+                     WHERE detected_at >= datetime('now', '-' || ? || ' days')
+                 )
+               GROUP BY a.contract_address
+               HAVING peak_quant_score >= ?""",
+            (int(min_age_days), int(max_age_days), int(dedup_days), int(min_peak_score)),
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+    async def get_coingecko_id_by_symbol(self, symbol: str) -> str | None:
+        """Look up a CoinGecko coin_id from the predictions table by ticker symbol.
+
+        Used by second-wave detection to resolve live-price lookups for tokens
+        that were also tracked by the narrative agent. Returns the most-recent
+        matching coin_id, or None if no narrative prediction has been made for
+        this symbol (in which case the token is treated as DEX-only and its
+        price is marked stale).
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not symbol:
+            return None
+        cursor = await self._conn.execute(
+            """SELECT coin_id FROM predictions
+               WHERE symbol = ?
+               ORDER BY predicted_at DESC
+               LIMIT 1""",
+            (symbol,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
 
     async def was_secondwave_alerted(
         self, contract_address: str, days: int = 7
@@ -504,10 +586,10 @@ Append to `scout/db.py`:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         cursor = await self._conn.execute(
-            f"""SELECT COUNT(*) FROM second_wave_candidates
-                WHERE contract_address = ?
-                  AND detected_at >= datetime('now', '-{int(days)} days')""",
-            (contract_address,),
+            """SELECT COUNT(*) FROM second_wave_candidates
+               WHERE contract_address = ?
+                 AND detected_at >= datetime('now', '-' || ? || ' days')""",
+            (contract_address, int(days)),
         )
         row = await cursor.fetchone()
         return row[0] > 0 if row else False
@@ -558,9 +640,10 @@ Append to `scout/db.py`:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         cursor = await self._conn.execute(
-            f"""SELECT * FROM second_wave_candidates
-                WHERE detected_at >= datetime('now', '-{int(days)} days')
-                ORDER BY reaccumulation_score DESC""",
+            """SELECT * FROM second_wave_candidates
+               WHERE detected_at >= datetime('now', '-' || ? || ' days')
+               ORDER BY reaccumulation_score DESC""",
+            (int(days),),
         )
         rows = [dict(r) for r in await cursor.fetchall()]
         for r in rows:
@@ -575,11 +658,11 @@ Append to `scout/db.py`:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         cursor = await self._conn.execute(
-            f"""SELECT volume_24h_usd FROM volume_snapshots
-                WHERE contract_address = ?
-                  AND scanned_at >= datetime('now', '-{int(days)} days')
-                ORDER BY scanned_at DESC""",
-            (contract_address,),
+            """SELECT volume_24h_usd FROM volume_snapshots
+               WHERE contract_address = ?
+                 AND scanned_at >= datetime('now', '-' || ? || ' days')
+               ORDER BY scanned_at DESC""",
+            (contract_address, int(days)),
         )
         rows = await cursor.fetchall()
         return [r[0] for r in rows]
@@ -778,12 +861,12 @@ import structlog
 
 from scout.config import Settings
 from scout.db import Database
-from scout.ingestion.coingecko import CG_BASE_URL  # reuse existing CG base URL
 from scout.secondwave.alerts import format_secondwave_alert
 
 logger = structlog.get_logger(__name__)
 
-MARKETS_URL = f"{CG_BASE_URL}/coins/markets" if hasattr(__import__("scout.ingestion.coingecko", fromlist=["CG_BASE_URL"]), "CG_BASE_URL") else "https://api.coingecko.com/api/v3/coins/markets"
+# Hardcoded to avoid fragile imports across ingestion modules.
+CG_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 
 
 def score_reaccumulation(
@@ -914,7 +997,7 @@ async def fetch_current_prices(
     params = {"vs_currency": "usd", "ids": ids_param, "per_page": 250}
     try:
         async with session.get(
-            "https://api.coingecko.com/api/v3/coins/markets",
+            CG_MARKETS_URL,
             params=params,
             headers=headers,
         ) as resp:
@@ -948,9 +1031,18 @@ async def run_once(
         min_age_days=settings.SECONDWAVE_COOLDOWN_MIN_DAYS,
         max_age_days=settings.SECONDWAVE_COOLDOWN_MAX_DAYS,
         min_peak_score=settings.SECONDWAVE_MIN_PRIOR_SCORE,
+        dedup_days=settings.SECONDWAVE_DEDUP_DAYS,
     )
     if not scan_candidates:
         return 0
+
+    # Resolve a CoinGecko coin_id for each candidate via a symbol lookup
+    # against the `predictions` table (narrative-agent tokens). The scan
+    # query no longer JOINs predictions because that table has no
+    # contract_address column — we must lookup by symbol here instead.
+    for scan_row in scan_candidates:
+        cg_id = await db.get_coingecko_id_by_symbol(scan_row.get("ticker") or "")
+        scan_row["coingecko_id"] = cg_id
 
     cg_ids = [c["coingecko_id"] for c in scan_candidates if c.get("coingecko_id")]
     fresh_prices = await fetch_current_prices(session, cg_ids, settings) if cg_ids else {}
@@ -989,8 +1081,6 @@ async def run_once(
         if score < settings.SECONDWAVE_ALERT_THRESHOLD:
             continue
 
-        # Scoring key for build expects peak_quant_score
-        scan_row["peak_quant_score"] = scan_row.get("peak_score") or scan_row.get("peak_quant_score") or 0
         sw = build_secondwave_candidate(
             scan_row=scan_row,
             score=score,
@@ -1028,7 +1118,7 @@ async def secondwave_loop(
         await db.close()
 ```
 
-Note: The `score_reaccumulation` function reads `candidate["peak_quant_score"]`. The SQL scan query exposes `peak_score` (from `MAX(sh.score)`). In `run_once` we normalize with `scan_row["peak_quant_score"] = scan_row.get("peak_score") ...`. Tests already pass `peak_quant_score` directly.
+Note: The `score_reaccumulation` function reads `candidate["peak_quant_score"]`. The SQL scan query exposes that column directly via `MAX(sh.score) AS peak_quant_score`, so no normalization is required. Tests pass `peak_quant_score` directly.
 
 - [ ] **Step 4: Verify tests pass**
 
@@ -1036,7 +1126,7 @@ Note: The `score_reaccumulation` function reads `candidate["peak_quant_score"]`.
 uv run pytest tests/test_secondwave_detector.py -v
 ```
 
-Note: if `scout/ingestion/coingecko.py` does not expose `CG_BASE_URL`, simplify the import to `# no-op` and leave the hardcoded URL in `fetch_current_prices`.
+Note: `CG_MARKETS_URL` is hardcoded in this module to avoid a fragile cross-module import from `scout/ingestion/coingecko.py`.
 
 - [ ] **Step 5: Commit**
 
@@ -1093,6 +1183,7 @@ def _base_candidate() -> dict:
 
 def test_format_basic_alert_contains_all_sections():
     msg = format_secondwave_alert(_base_candidate())
+    assert "\U0001F504" in msg  # refresh emoji
     assert "Second Wave" in msg
     assert "Test Token" in msg
     assert "TEST" in msg
@@ -1153,7 +1244,7 @@ def format_secondwave_alert(candidate: dict) -> str:
     stale_marker = "(stale)" if candidate.get("price_is_stale") else ""
 
     lines = [
-        f"Second Wave Detected: {candidate.get('token_name', 'Unknown')} ({candidate.get('ticker', '')})",
+        f"\U0001F504 Second Wave Detected: {candidate.get('token_name', 'Unknown')} ({candidate.get('ticker', '')})",
         "",
         f"Prior pump (first seen {candidate.get('days_since_first_seen', 0):.1f}d ago):",
         f"  Peak score: {candidate.get('peak_quant_score', 0)}/100",
@@ -1197,8 +1288,7 @@ git commit -m "feat(secondwave): add Telegram alert formatter"
 ## Task 5: Main Loop Integration
 
 **Files:**
-- Modify: `scout/main.py`
-- Modify: `scout/alerter.py` (persist token_name/ticker/price_usd on alert)
+- Modify: `scout/main.py` (wire loop into `asyncio.gather()` AND extend the `db.log_alert(...)` call at line 235 to persist `token_name`/`ticker`/`price_usd`)
 
 - [ ] **Step 1: Wire `secondwave_loop` into `main()`**
 
@@ -1252,21 +1342,30 @@ In `scout/db.py`, update `log_alert` signature and INSERT:
         await self._conn.commit()
 ```
 
-In `scout/alerter.py`, update `send_alert` (or wherever `log_alert` is called) to pass the new fields from `CandidateToken`:
+**Call site:** The only `db.log_alert(...)` invocation lives in `scout/main.py` around **line 235** inside the pipeline loop's alert-delivery block (right after `send_alert(gated_token, ...)`). Current form:
 
 ```python
-    await db.log_alert(
-        contract_address=token.contract_address,
-        chain=token.chain,
-        conviction_score=token.conviction_score or 0.0,
-        alert_market_cap=token.market_cap_usd,
-        price_usd=getattr(token, "price_usd", None),
-        token_name=token.token_name,
-        ticker=token.ticker,
-    )
+        await db.log_alert(
+            gated_token.contract_address, gated_token.chain, conviction,
+            alert_market_cap=gated_token.market_cap_usd,
+        )
 ```
 
-(If `CandidateToken` has no `price_usd` field, derive it from `market_cap_usd / circulating_supply` if available, or pass `None` — the scan query tolerates NULL `alert_price`.)
+Update that call site to pass the three new fields from `CandidateToken`:
+
+```python
+        await db.log_alert(
+            contract_address=gated_token.contract_address,
+            chain=gated_token.chain,
+            conviction_score=conviction,
+            alert_market_cap=gated_token.market_cap_usd,
+            price_usd=getattr(gated_token, "price_usd", None),
+            token_name=getattr(gated_token, "token_name", None),
+            ticker=getattr(gated_token, "ticker", None),
+        )
+```
+
+(If `CandidateToken` has no `price_usd` field, derive it from `market_cap_usd / circulating_supply` if available, or pass `None` — the scan query tolerates NULL `alert_price`. `scout/alerter.py` does not itself call `log_alert`, so no change is needed there.)
 
 - [ ] **Step 3: Smoke test**
 
@@ -1284,7 +1383,7 @@ Temporarily set `SECONDWAVE_ENABLED=true` in a local `.env` and rerun `--dry-run
 - [ ] **Step 5: Commit**
 
 ```bash
-git add scout/main.py scout/db.py scout/alerter.py
+git add scout/main.py scout/db.py
 git commit -m "feat(secondwave): wire detector loop into main pipeline"
 ```
 
@@ -1594,3 +1693,27 @@ If detection is noisy or buggy in production:
 1. Set `SECONDWAVE_ENABLED=false` in `.env` and restart the process. The feature is opt-in, so disabling it removes the loop from `asyncio.gather()`.
 2. To purge stored detections: `sqlite3 scout.db "DELETE FROM second_wave_candidates"`.
 3. The `alerts` column migration (`price_usd`, `token_name`, `ticker`) is additive and safe to leave in place.
+
+---
+
+## Known Limitations (v1)
+
+- **`original_market_cap` approximation.** The spec distinguishes "first-seen
+  market cap" from "alert market cap" (the peak), but v1 only persists one
+  market-cap value per alert in `alerts.alert_market_cap`. Both
+  `original_market_cap` and `alert_market_cap` on the `SecondWaveCandidate`
+  are populated from the same `alerts.alert_market_cap` source — the true
+  first-seen value is not yet tracked. This is acceptable for v1 because
+  downstream scoring only uses `alert_market_cap` as the drawdown reference.
+  A follow-up PR can backfill `original_market_cap` by joining against
+  `candidates.first_seen_market_cap` (or equivalent) once that is wired.
+- **Narrative coin_id resolution is symbol-based.** Because `predictions` has
+  no `contract_address` column, we look up the CoinGecko slug via
+  `symbol = ticker`. Collisions (multiple coins sharing a ticker) resolve to
+  the most-recent prediction, which may be wrong. A contract_address FK on
+  `predictions` would eliminate this ambiguity and is tracked as a follow-up.
+- **Dashboard frontend is deferred to Phase 2.** Task 7 in this plan ships
+  only the `/api/secondwave/candidates` and `/api/secondwave/stats` JSON
+  endpoints. The matching `NarrativeTab`-style React component (charts,
+  filtering, live refresh) is **out of scope for this PR** and will land in
+  a follow-up Phase 2 PR.
