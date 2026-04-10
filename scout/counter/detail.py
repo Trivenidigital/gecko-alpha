@@ -92,4 +92,5 @@ def extract_counter_data(detail: dict) -> dict:
         "sentiment_up_pct": detail.get("sentiment_votes_up_percentage", 50.0) or 50.0,
         "price_change_7d": market_data.get("price_change_percentage_7d", 0) or 0,
         "price_change_30d": market_data.get("price_change_percentage_30d", 0) or 0,
+        "watchlist_portfolio_users": detail.get("watchlist_portfolio_users", 0) or 0,
     }

@@ -441,6 +441,21 @@ async def narrative_agent_loop(
                         if consecutive_failures >= 3:
                             logger.warning("narrative_scoring_3_failures", category=accel.category_id)
                             break
+
+                        # Fetch detail up-front to get watchlist_portfolio_users
+                        # for the narrative scoring prompt. Reused below for
+                        # counter-narrative scoring (cache makes this cheap).
+                        token_detail = await fetch_coin_detail(
+                            session, token.coin_id, settings.COINGECKO_API_KEY
+                        )
+                        token_cdata = (
+                            extract_counter_data(token_detail) if token_detail else None
+                        )
+                        watchlist_users = (
+                            int(token_cdata["watchlist_portfolio_users"])
+                            if token_cdata else 0
+                        )
+
                         result = await score_token(
                             token=token,
                             accel=accel,
@@ -449,6 +464,7 @@ async def narrative_agent_loop(
                             lessons=lessons,
                             api_key=settings.ANTHROPIC_API_KEY,
                             model=settings.NARRATIVE_SCORING_MODEL,
+                            watchlist_users=watchlist_users,
                         )
                         if result is None:
                             consecutive_failures += 1
@@ -463,17 +479,15 @@ async def narrative_agent_loop(
                         counter_scored = None
 
                         if settings.COUNTER_ENABLED:
-                            detail = await fetch_coin_detail(
-                                session, token.coin_id, settings.COINGECKO_API_KEY
-                            )
-                            if detail:
-                                cdata = extract_counter_data(detail)
+                            if token_cdata is not None:
+                                cdata = token_cdata
                                 data_comp = "full"
                             else:
                                 cdata = {
                                     "commits_4w": 0, "reddit_subscribers": 0,
                                     "telegram_users": 0, "sentiment_up_pct": 50.0,
                                     "price_change_7d": 0, "price_change_30d": 0,
+                                    "watchlist_portfolio_users": 0,
                                 }
                                 data_comp = "partial"
 

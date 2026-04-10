@@ -162,6 +162,7 @@ def build_scoring_prompt(
     market_regime: str,
     top_3_coins: str,
     lessons_appendix: str,
+    watchlist_users: int = 0,
 ) -> str:
     """Build the user prompt for Claude narrative-fit scoring."""
     vol_mcap_ratio = token.volume_24h / max(token.market_cap, 1)
@@ -179,6 +180,7 @@ def build_scoring_prompt(
         market_regime=market_regime,
         coin_count_change=accel.coin_count_change,
         vol_mcap_ratio=vol_mcap_ratio,
+        watchlist_users=watchlist_users,
         lessons_appendix=lessons_appendix,
     )
 
@@ -211,6 +213,7 @@ async def score_token(
     api_key: str,
     model: str,
     client: object | None = None,
+    watchlist_users: int = 0,
 ) -> dict | None:
     """Call Claude to score a single token's narrative fit.
 
@@ -222,7 +225,10 @@ async def score_token(
         if client is None:
             client = anthropic.Anthropic(api_key=api_key)
 
-        prompt = build_scoring_prompt(token, accel, market_regime, top_3_coins, lessons)
+        prompt = build_scoring_prompt(
+            token, accel, market_regime, top_3_coins, lessons,
+            watchlist_users=watchlist_users,
+        )
         response = client.messages.create(  # type: ignore[union-attr]
             model=model,
             max_tokens=300,
