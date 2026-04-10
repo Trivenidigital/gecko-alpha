@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 from scout.aggregator import aggregate
 from scout.alerter import format_daily_summary, send_alert, send_telegram_message
 from scout.chains.events import safe_emit
+from scout.chains.patterns import seed_built_in_patterns
+from scout.chains.tracker import run_chain_tracker
 from scout.config import Settings
 from scout.db import Database
 from scout.gate import evaluate
@@ -897,6 +899,10 @@ async def main() -> None:
                     except asyncio.TimeoutError:
                         pass  # Normal -- interval elapsed
 
+            # Seed chain patterns once at startup (idempotent)
+            if settings.CHAINS_ENABLED:
+                await seed_built_in_patterns(db)
+
             tasks: list[asyncio.Task] = [
                 asyncio.create_task(_pipeline_loop()),
             ]
@@ -905,6 +911,10 @@ async def main() -> None:
                     asyncio.create_task(
                         narrative_agent_loop(session, settings, db)
                     )
+                )
+            if settings.CHAINS_ENABLED:
+                tasks.append(
+                    asyncio.create_task(run_chain_tracker(db, settings))
                 )
 
             await asyncio.gather(*tasks, return_exceptions=True)
