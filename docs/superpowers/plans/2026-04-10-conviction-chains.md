@@ -30,12 +30,14 @@
 | `tests/test_chains_patterns.py` | Condition evaluator + built-in seeding |
 | `tests/test_chains_tracker.py` | Pattern matching engine (core algorithm correctness) |
 | `tests/test_chains_integration.py` | Full end-to-end chain scenario |
+| `tests/test_chains_learn.py` | LEARN phase: hit-rate stats + lifecycle |
 
 ### Modified files
 
 | File | Changes |
 |------|---------|
-| `scout/config.py` | Add 8 `CHAIN_*` config fields |
+| `scout/config.py` | Add 12 `CHAIN_*` config fields (incl. 4 LEARN knobs) |
+| `scout/narrative/learn.py` | Invoke `run_pattern_lifecycle` on daily LEARN tick |
 | `scout/db.py` | Add 4 new tables to `_create_tables()` |
 | `scout/narrative/observer.py` | Add 1 `emit_event()` call on category heating detection |
 | `scout/narrative/predictor.py` | Add 2 `emit_event()` calls (laggard_picked + narrative_scored) |
@@ -264,6 +266,11 @@ Add to `scout/config.py` inside the `Settings` class, after existing chain-adjac
     CHAIN_ALERT_ON_COMPLETE: bool = True
     CHAIN_TOTAL_BOOST_CAP: int = 30
     CHAINS_ENABLED: bool = False
+    # LEARN phase lifecycle knobs (Task 9)
+    CHAIN_MIN_TRIGGERS_FOR_STATS: int = 10
+    CHAIN_PROMOTION_THRESHOLD: float = 0.45  # 45% hit rate for promotion from low to medium
+    CHAIN_GRADUATION_MIN_TRIGGERS: int = 30
+    CHAIN_GRADUATION_HIT_RATE: float = 0.55  # 55% hit rate for graduation to high alert
 ```
 
 Add to `.env.example` at the bottom:
@@ -278,6 +285,11 @@ CHAIN_EVENT_RETENTION_DAYS=14
 CHAIN_ACTIVE_RETENTION_DAYS=7
 CHAIN_ALERT_ON_COMPLETE=true
 CHAIN_TOTAL_BOOST_CAP=30
+# LEARN phase lifecycle
+CHAIN_MIN_TRIGGERS_FOR_STATS=10
+CHAIN_PROMOTION_THRESHOLD=0.45
+CHAIN_GRADUATION_MIN_TRIGGERS=30
+CHAIN_GRADUATION_HIT_RATE=0.55
 ```
 
 - [ ] **Step 6: Run full suite**
@@ -769,6 +781,14 @@ Append to `tests/test_chains_events.py`:
 async def test_emit_event_swallows_errors_via_safe_emit(db, monkeypatch):
     """safe_emit wraps emit_event and never raises."""
     from scout.chains.events import safe_emit
+    from scout.config import Settings
+
+    # Enable chains so safe_emit reaches emit_event (we're testing the
+    # exception-swallow branch, not the kill-switch).
+    monkeypatch.setattr(
+        "scout.config.get_settings",
+        lambda: Settings(CHAINS_ENABLED=True),
+    )
 
     async def _boom(*args, **kwargs):
         raise RuntimeError("boom")
@@ -776,6 +796,31 @@ async def test_emit_event_swallows_errors_via_safe_emit(db, monkeypatch):
     monkeypatch.setattr("scout.chains.events.emit_event", _boom)
     # Should NOT raise
     await safe_emit(db, "0xabc", "memecoin", "candidate_scored", {}, "scorer")
+
+
+async def test_safe_emit_noop_when_disabled(db, monkeypatch):
+    """CHAINS_ENABLED=False: safe_emit must insert ZERO rows."""
+    from scout.chains.events import safe_emit
+    from scout.config import Settings
+
+    monkeypatch.setattr(
+        "scout.config.get_settings",
+        lambda: Settings(CHAINS_ENABLED=False),
+    )
+
+    # Count before
+    async with db._conn.execute("SELECT COUNT(*) FROM signal_events") as cur:
+        before = (await cur.fetchone())[0]
+
+    result = await safe_emit(
+        db, "0xabc", "memecoin", "candidate_scored",
+        {"quant_score": 72}, "scorer",
+    )
+    assert result is None
+
+    async with db._conn.execute("SELECT COUNT(*) FROM signal_events") as cur:
+        after = (await cur.fetchone())[0]
+    assert before == after, "safe_emit must be a total no-op when CHAINS_ENABLED=False"
 ```
 
 - [ ] **Step 2: Add `safe_emit` to `scout/chains/events.py`**
@@ -794,8 +839,18 @@ async def safe_emit(
     """Call emit_event, log and swallow any exception.
 
     Use this from existing pipeline modules so chain tracking failures
-    never break the main pipeline.
+    never break the main pipeline. When `CHAINS_ENABLED=False` this is a
+    total no-op — no DB row is inserted.
     """
+    # Hard kill-switch — CHAINS_ENABLED=false must produce zero writes.
+    try:
+        from scout.config import get_settings  # lazy import to avoid cycle
+        settings = get_settings()
+        if not getattr(settings, "CHAINS_ENABLED", False):
+            return None
+    except Exception:
+        # If settings cannot be read, fail closed (no emission).
+        return None
     try:
         return await emit_event(
             db, token_id, pipeline, event_type, event_data, source_module
@@ -920,19 +975,23 @@ In `scout/gate.py`, at the end of `evaluate()`, just before `return (should_aler
 ```python
 from scout.chains.events import safe_emit
 
-if should_alert:
-    await safe_emit(
-        db,
-        token_id=token.contract_address,
-        pipeline="memecoin",
-        event_type="conviction_gated",
-        event_data={
-            "conviction_score": float(conviction),
-            "quant_score": int(quant_score),
-            "narrative_score": int(narrative_score) if narrative_score is not None else None,
-        },
-        source_module="gate",
-    )
+# Emit UNCONDITIONALLY on every evaluate() call — NOT gated by should_alert.
+# The volume_breakout pattern needs conviction_gated events to fire regardless
+# of alert outcome so the chain tracker can match sequences that include
+# borderline-score tokens that didn't quite trip the alert threshold.
+await safe_emit(
+    db,
+    token_id=token.contract_address,
+    pipeline="memecoin",
+    event_type="conviction_gated",
+    event_data={
+        "conviction_score": float(conviction),
+        "quant_score": int(quant_score),
+        "narrative_score": int(narrative_score) if narrative_score is not None else None,
+        "should_alert": bool(should_alert),
+    },
+    source_module="gate",
+)
 ```
 
 In `scout/alerter.py`, at the end of a successful Telegram send, add:
@@ -1105,6 +1164,12 @@ _OPERATORS = {
 }
 
 # Order matters: longer tokens first so `>=` matches before `>`.
+# NOTE: This regex is intentionally TIGHTER than the spec grammar.
+# The spec allows free-form `field OP NUMBER`, but we anchor the entire
+# string (^...$), require an identifier field, forbid whitespace inside
+# the number, and restrict to a fixed operator set. This rejects injection
+# attempts and pathological patterns like `1 < 2` or multi-clause expressions
+# while still covering every condition used by the built-in patterns.
 _CONDITION_RE = re.compile(
     r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(>=|<=|==|>|<)\s*(-?\d+(?:\.\d+)?)\s*$"
 )
@@ -1433,18 +1498,24 @@ async def test_chain_rejects_late_step(db, settings):
 
 async def test_chain_rejects_failed_condition(db, settings):
     now = datetime.now(timezone.utc)
+    # Step 1: category_heating (anchor)
     await _insert_event_at(db, "cat-ai", "narrative", "category_heating",
                            {"acceleration": 8.0}, now, "narrative.observer")
-    # narrative_scored with fit=50 fails the ">70" condition on narrative_momentum
+    # Step 2: a valid laggard_picked so the chain can reach step 3
+    await _insert_event_at(db, "cat-ai", "narrative", "laggard_picked",
+                           {"narrative_fit_score": 80, "confidence": "High"},
+                           now + timedelta(hours=1), "narrative.predictor")
+    # Step 3: narrative_scored with fit=50 must FAIL the ">70" condition
+    # on narrative_momentum — so the chain stalls at steps_matched == [1, 2].
     await _insert_event_at(db, "cat-ai", "narrative", "narrative_scored",
                            {"narrative_fit_score": 50},
-                           now + timedelta(hours=1), "narrative.predictor")
+                           now + timedelta(hours=2), "narrative.predictor")
     await check_chains(db, settings)
     async with db._conn.execute(
         "SELECT steps_matched FROM active_chains WHERE pattern_name='narrative_momentum'"
     ) as cur:
         row = await cur.fetchone()
-    assert json.loads(row[0]) == [1]
+    assert json.loads(row[0]) == [1, 2]
 
 
 async def test_chain_completes_and_emits(db, settings):
@@ -1521,7 +1592,12 @@ async def test_volume_breakout_completes_with_two_candidate_events(db, settings)
 
 
 async def test_out_of_order_step_arrival(db, settings):
-    """Events inserted in non-chronological order must still match by timestamp."""
+    """Events inserted in non-chronological order must still match by timestamp.
+
+    Narrative-pipeline scenario: in production the narrative agent can emit
+    counter_scored before category_heating if the observer tick hasn't run
+    yet, but the tracker sorts by `created_at` so the sequence still matches.
+    """
     now = datetime.now(timezone.utc)
     # Insert step 3 first (3h after anchor), then step 1 (anchor at t=0),
     # then step 2 (t+1h). All within windows.
@@ -1879,11 +1955,25 @@ def _advance_chain(
                 if hours_from_anchor > step.max_hours_after_anchor:
                     continue
 
-                # Previous-step window check (optional, against the latest
-                # matched step time — i.e. whatever anchor-time-ordering put last)
+                # Previous-step window check. Must be measured against the
+                # PRIOR STEP's event timestamp (step_num - 1), NOT
+                # chain.last_step_time. Out-of-order arrivals can push
+                # last_step_time ahead of the immediately-prior step, which
+                # would incorrectly reject valid events.
                 if step.max_hours_after_previous is not None:
+                    prior_event_id = chain.step_events.get(step_num - 1)
+                    prior_ts: datetime | None = None
+                    if prior_event_id is not None:
+                        for prior_ev in events:
+                            if prior_ev.id == prior_event_id:
+                                prior_ts = prior_ev.created_at
+                                break
+                    if prior_ts is None:
+                        # Prior step not yet matched — skip; we'll retry after
+                        # it is advanced on a subsequent scan pass.
+                        continue
                     hours_from_prev = (
-                        ev.created_at - chain.last_step_time
+                        ev.created_at - prior_ts
                     ).total_seconds() / 3600.0
                     if hours_from_prev < 0 or hours_from_prev > step.max_hours_after_previous:
                         continue
@@ -2565,6 +2655,333 @@ Expected: Clean exit, structured log lines `chain_tracker_started` visible, no t
 ```bash
 git add scout/main.py scout/gate.py tests/test_chains_integration.py
 git commit -m "feat(chains): wire tracker into main.py and apply get_active_boosts in gate"
+```
+
+---
+
+## Task 9: LEARN Phase Integration
+
+> **Purpose:** Close the feedback loop. Compute per-pattern hit rates from
+> `chain_matches.outcome_class`, promote patterns that are proving themselves
+> (low → medium → high), and retire patterns that underperform the
+> per-pipeline baseline. Runs daily alongside the narrative agent's existing
+> LEARN phase on the same schedule — no new scheduler.
+
+**Files:**
+- Modify: `scout/chains/patterns.py` (add `compute_pattern_stats` + lifecycle logic)
+- Modify: `scout/narrative/learn.py` (invoke chain learn step on its daily tick)
+- Test: `tests/test_chains_learn.py`
+
+- [ ] **Step 1: Write failing tests**
+
+```python
+# tests/test_chains_learn.py
+"""Tests for chain pattern LEARN phase: hit rate, promotion, retirement."""
+from datetime import datetime, timezone
+
+import pytest
+
+from scout.chains.patterns import (
+    compute_pattern_stats,
+    run_pattern_lifecycle,
+    seed_built_in_patterns,
+)
+from scout.config import Settings
+from scout.db import Database
+
+
+@pytest.fixture
+async def db(tmp_path):
+    d = Database(tmp_path / "test.db")
+    await d.initialize()
+    await seed_built_in_patterns(d)
+    yield d
+    await d.close()
+
+
+@pytest.fixture
+def settings():
+    return Settings(
+        CHAINS_ENABLED=True,
+        CHAIN_MIN_TRIGGERS_FOR_STATS=10,
+        CHAIN_PROMOTION_THRESHOLD=0.45,
+        CHAIN_GRADUATION_MIN_TRIGGERS=30,
+        CHAIN_GRADUATION_HIT_RATE=0.55,
+    )
+
+
+async def _seed_matches(db, pattern_name, pipeline, n_hits, n_misses):
+    async with db._conn.execute(
+        "SELECT id FROM chain_patterns WHERE name = ?", (pattern_name,)
+    ) as cur:
+        pid = (await cur.fetchone())[0]
+    now = datetime.now(timezone.utc).isoformat()
+    for i in range(n_hits):
+        await db._conn.execute(
+            """INSERT INTO chain_matches
+               (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+                total_steps, anchor_time, completed_at, chain_duration_hours,
+                conviction_boost, outcome_class, evaluated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (f"tok-h{i}", pipeline, pid, pattern_name, 3, 4, now, now, 2.0, 25,
+             "hit", now),
+        )
+    for i in range(n_misses):
+        await db._conn.execute(
+            """INSERT INTO chain_matches
+               (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+                total_steps, anchor_time, completed_at, chain_duration_hours,
+                conviction_boost, outcome_class, evaluated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (f"tok-m{i}", pipeline, pid, pattern_name, 3, 4, now, now, 2.0, 25,
+             "miss", now),
+        )
+    await db._conn.commit()
+
+
+async def test_pattern_hit_rate(db, settings):
+    """compute_pattern_stats returns hit_rate = hits / (hits + misses)."""
+    await _seed_matches(db, "full_conviction", "memecoin", n_hits=6, n_misses=4)
+    stats = await compute_pattern_stats(db, settings)
+    # Find the memecoin-pipeline entry for full_conviction
+    fc = [s for s in stats if s["pattern_name"] == "full_conviction"
+          and s["pipeline"] == "memecoin"][0]
+    assert fc["total_evaluated"] == 10
+    assert fc["hit_rate"] == pytest.approx(0.6, abs=1e-6)
+
+
+async def test_pattern_hit_rate_per_pipeline_baseline(db, settings):
+    """Hit rates must be computed independently per pipeline."""
+    await _seed_matches(db, "full_conviction", "memecoin", n_hits=6, n_misses=4)
+    await _seed_matches(db, "full_conviction", "narrative", n_hits=2, n_misses=8)
+    stats = await compute_pattern_stats(db, settings)
+    memes = [s for s in stats if s["pattern_name"] == "full_conviction"
+             and s["pipeline"] == "memecoin"][0]
+    narr = [s for s in stats if s["pattern_name"] == "full_conviction"
+            and s["pipeline"] == "narrative"][0]
+    assert memes["hit_rate"] == pytest.approx(0.6, abs=1e-6)
+    assert narr["hit_rate"] == pytest.approx(0.2, abs=1e-6)
+
+
+async def test_pattern_promotion(db, settings):
+    """>=10 triggers AND >=45% hit rate promotes low → medium."""
+    await _seed_matches(db, "full_conviction", "memecoin", n_hits=5, n_misses=5)
+    await run_pattern_lifecycle(db, settings)
+    async with db._conn.execute(
+        "SELECT alert_priority FROM chain_patterns WHERE name='full_conviction'"
+    ) as cur:
+        prio = (await cur.fetchone())[0]
+    assert prio == "medium"
+
+
+async def test_pattern_graduation(db, settings):
+    """>=30 triggers AND >=55% hit rate graduates medium → high."""
+    # Start the pattern at medium
+    await db._conn.execute(
+        "UPDATE chain_patterns SET alert_priority='medium' WHERE name='full_conviction'"
+    )
+    await db._conn.commit()
+    await _seed_matches(db, "full_conviction", "memecoin", n_hits=20, n_misses=15)
+    await run_pattern_lifecycle(db, settings)
+    async with db._conn.execute(
+        "SELECT alert_priority FROM chain_patterns WHERE name='full_conviction'"
+    ) as cur:
+        prio = (await cur.fetchone())[0]
+    assert prio == "high"
+
+
+async def test_pattern_retirement(db, settings):
+    """A pattern with >=MIN_TRIGGERS and hit rate <20% is marked inactive."""
+    await _seed_matches(db, "full_conviction", "memecoin", n_hits=1, n_misses=14)
+    await run_pattern_lifecycle(db, settings)
+    async with db._conn.execute(
+        "SELECT is_active FROM chain_patterns WHERE name='full_conviction'"
+    ) as cur:
+        active = (await cur.fetchone())[0]
+    assert active == 0
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `uv run pytest tests/test_chains_learn.py -v`
+Expected: FAIL — `compute_pattern_stats` / `run_pattern_lifecycle` do not exist.
+
+- [ ] **Step 3: Implement LEARN helpers in `scout/chains/patterns.py`**
+
+Append:
+
+```python
+# ---------------------------------------------------------------------------
+# LEARN phase: hit-rate computation + pattern lifecycle
+# ---------------------------------------------------------------------------
+
+# Baseline thresholds (below these a pattern is retired once it has enough data)
+_RETIREMENT_HIT_RATE = 0.20
+
+
+async def compute_pattern_stats(db: Database, settings: Settings) -> list[dict]:
+    """Compute hit rate per (pattern, pipeline) over evaluated chain_matches.
+
+    A match is considered evaluated iff `outcome_class` is non-null.
+    Hit rate = count(outcome_class='hit') / count(evaluated).
+    Patterns with fewer than CHAIN_MIN_TRIGGERS_FOR_STATS evaluated rows
+    are still returned but flagged with `sufficient=False`.
+    """
+    conn = db._conn
+    rows: list[dict] = []
+    async with conn.execute(
+        """SELECT pattern_id, pattern_name, pipeline,
+                  COUNT(*) AS total_evaluated,
+                  SUM(CASE WHEN outcome_class='hit' THEN 1 ELSE 0 END) AS hits
+           FROM chain_matches
+           WHERE outcome_class IS NOT NULL
+           GROUP BY pattern_id, pattern_name, pipeline"""
+    ) as cur:
+        for row in await cur.fetchall():
+            total = row["total_evaluated"] or 0
+            hits = row["hits"] or 0
+            rate = (hits / total) if total > 0 else 0.0
+            rows.append({
+                "pattern_id": row["pattern_id"],
+                "pattern_name": row["pattern_name"],
+                "pipeline": row["pipeline"],
+                "total_evaluated": total,
+                "hits": hits,
+                "hit_rate": rate,
+                "sufficient": total >= settings.CHAIN_MIN_TRIGGERS_FOR_STATS,
+            })
+    return rows
+
+
+async def run_pattern_lifecycle(db: Database, settings: Settings) -> None:
+    """Promote / graduate / retire chain patterns based on rolling stats.
+
+    Lifecycle transitions (per pattern, aggregated across pipelines by
+    taking the BEST performing pipeline as the promotion candidate):
+
+      incubation (low)  →  medium   when triggers >= CHAIN_MIN_TRIGGERS_FOR_STATS
+                                     AND hit_rate  >= CHAIN_PROMOTION_THRESHOLD
+      medium            →  high     when triggers >= CHAIN_GRADUATION_MIN_TRIGGERS
+                                     AND hit_rate  >= CHAIN_GRADUATION_HIT_RATE
+      any               →  inactive when triggers >= CHAIN_MIN_TRIGGERS_FOR_STATS
+                                     AND hit_rate  <  _RETIREMENT_HIT_RATE
+
+    Also refreshes `historical_hit_rate`, `total_triggers`, `total_hits`
+    on each pattern row from the aggregate stats.
+    """
+    stats = await compute_pattern_stats(db, settings)
+    if not stats:
+        return
+
+    # Aggregate per pattern (best pipeline wins for promotion purposes)
+    by_pattern: dict[int, dict] = {}
+    for s in stats:
+        pid = s["pattern_id"]
+        cur_best = by_pattern.get(pid)
+        if cur_best is None or s["hit_rate"] > cur_best["hit_rate"]:
+            by_pattern[pid] = s
+
+    conn = db._conn
+    for pid, s in by_pattern.items():
+        async with conn.execute(
+            "SELECT alert_priority, is_active FROM chain_patterns WHERE id = ?",
+            (pid,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            continue
+        prio = row["alert_priority"]
+        is_active = bool(row["is_active"])
+        new_prio = prio
+        new_active = is_active
+
+        if s["total_evaluated"] >= settings.CHAIN_MIN_TRIGGERS_FOR_STATS:
+            if s["hit_rate"] < _RETIREMENT_HIT_RATE:
+                new_active = False
+                logger.info(
+                    "chain_pattern_retired",
+                    pattern=s["pattern_name"],
+                    hit_rate=s["hit_rate"],
+                )
+            elif prio == "low" and s["hit_rate"] >= settings.CHAIN_PROMOTION_THRESHOLD:
+                new_prio = "medium"
+                logger.info(
+                    "chain_pattern_promoted",
+                    pattern=s["pattern_name"],
+                    from_priority="low",
+                    to_priority="medium",
+                    hit_rate=s["hit_rate"],
+                )
+
+        if (
+            prio == "medium"
+            and s["total_evaluated"] >= settings.CHAIN_GRADUATION_MIN_TRIGGERS
+            and s["hit_rate"] >= settings.CHAIN_GRADUATION_HIT_RATE
+        ):
+            new_prio = "high"
+            logger.info(
+                "chain_pattern_graduated",
+                pattern=s["pattern_name"],
+                hit_rate=s["hit_rate"],
+            )
+
+        await conn.execute(
+            """UPDATE chain_patterns
+               SET alert_priority = ?,
+                   is_active      = ?,
+                   historical_hit_rate = ?,
+                   total_triggers = ?,
+                   total_hits     = ?,
+                   updated_at     = datetime('now')
+               WHERE id = ?""",
+            (
+                new_prio,
+                1 if new_active else 0,
+                s["hit_rate"],
+                s["total_evaluated"],
+                s["hits"],
+                pid,
+            ),
+        )
+    await conn.commit()
+```
+
+- [ ] **Step 4: Invoke `run_pattern_lifecycle` from the narrative LEARN tick**
+
+In `scout/narrative/learn.py`, at the end of the daily LEARN phase function
+(the same scheduled task that already recomputes narrative weights), add:
+
+```python
+# Chain patterns share the narrative agent's daily cadence — one scheduler
+# already runs at this interval, so just piggyback here.
+if getattr(settings, "CHAINS_ENABLED", False):
+    try:
+        from scout.chains.patterns import run_pattern_lifecycle
+        await run_pattern_lifecycle(db, settings)
+    except Exception:
+        logger.exception("chain_learn_cycle_failed")
+```
+
+> If `scout/narrative/learn.py` does not exist yet (narrative agent is still
+> rolling out), instead call `run_pattern_lifecycle` from `scout/main.py` on
+> the same daily cadence as the narrative agent's LEARN tick — the goal is
+> ONE scheduler, not two.
+
+- [ ] **Step 5: Run tests**
+
+Run: `uv run pytest tests/test_chains_learn.py --tb=short -q`
+Expected: All 5 tests PASS.
+
+- [ ] **Step 6: Run full suite**
+
+Run: `uv run pytest --tb=short -q`
+Expected: No regressions.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add scout/chains/patterns.py scout/narrative/learn.py tests/test_chains_learn.py
+git commit -m "feat(chains): LEARN phase — hit-rate stats and pattern lifecycle (promote/graduate/retire)"
 ```
 
 ---
