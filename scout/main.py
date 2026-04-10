@@ -54,6 +54,62 @@ from scout.scorer import score
 logger = structlog.get_logger()
 
 
+# BL-033: Module-level heartbeat state. Tracks cumulative pipeline stats
+# across cycles and emits a structured "heartbeat" log every
+# HEARTBEAT_INTERVAL_SECONDS so operators can see the pipeline is alive.
+_heartbeat_stats: dict = {
+    "started_at": None,
+    "tokens_scanned": 0,
+    "candidates_promoted": 0,
+    "alerts_fired": 0,
+    "narrative_predictions": 0,
+    "counter_scores": 0,
+    "last_heartbeat_at": None,
+}
+
+
+def _reset_heartbeat_stats() -> None:
+    """Reset module-level heartbeat state (test helper)."""
+    _heartbeat_stats.update(
+        started_at=None,
+        tokens_scanned=0,
+        candidates_promoted=0,
+        alerts_fired=0,
+        narrative_predictions=0,
+        counter_scores=0,
+        last_heartbeat_at=None,
+    )
+
+
+def _maybe_emit_heartbeat(settings) -> bool:
+    """Log heartbeat every HEARTBEAT_INTERVAL_SECONDS.
+
+    On first call, seeds started_at/last_heartbeat_at without logging.
+    Returns True if a heartbeat log was emitted.
+    """
+    now = datetime.now(timezone.utc)
+    if _heartbeat_stats["last_heartbeat_at"] is None:
+        _heartbeat_stats["last_heartbeat_at"] = now
+        _heartbeat_stats["started_at"] = now
+        return False
+    elapsed = (now - _heartbeat_stats["last_heartbeat_at"]).total_seconds()
+    if elapsed < settings.HEARTBEAT_INTERVAL_SECONDS:
+        return False
+    uptime_minutes = (now - _heartbeat_stats["started_at"]).total_seconds() / 60
+    logger.info(
+        "heartbeat",
+        uptime_minutes=round(uptime_minutes, 1),
+        tokens_scanned=_heartbeat_stats["tokens_scanned"],
+        candidates_promoted=_heartbeat_stats["candidates_promoted"],
+        alerts_fired=_heartbeat_stats["alerts_fired"],
+        narrative_predictions=_heartbeat_stats["narrative_predictions"],
+        counter_scores=_heartbeat_stats["counter_scores"],
+        last_heartbeat_at=_heartbeat_stats["last_heartbeat_at"].isoformat(),
+    )
+    _heartbeat_stats["last_heartbeat_at"] = now
+    return True
+
+
 async def _safe_counter_followup(token, session, settings):
     """Run counter-score and send follow-up Telegram message. Never raises."""
     try:
@@ -102,6 +158,7 @@ async def _safe_counter_followup(token, session, settings):
             )
             await send_telegram_message(msg, session, settings)
 
+        _heartbeat_stats["counter_scores"] += 1
         logger.info("counter_followup_sent", symbol=token.ticker, risk_score=counter.risk_score)
     except Exception as e:
         logger.error("counter_followup_error", symbol=getattr(token, 'ticker', '?'), error=str(e))
@@ -579,6 +636,9 @@ async def narrative_agent_loop(
 
                     if prediction_rows:
                         await store_predictions(db, prediction_rows)
+                        _heartbeat_stats["narrative_predictions"] += len(prediction_models)
+                        if settings.COUNTER_ENABLED:
+                            _heartbeat_stats["counter_scores"] += len(prediction_models)
                         logger.info(
                             "narrative.predictions_stored",
                             category=accel.name,
@@ -710,18 +770,16 @@ async def main() -> None:
         pass  # SIGTERM not supported on Windows
 
     cycle_count = 0
-    cumulative = {"tokens_scanned": 0, "candidates_promoted": 0, "alerts_fired": 0}
-    last_heartbeat = time.monotonic()
     last_outcome_check = time.monotonic()
     last_summary_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    heartbeat_interval = 300  # 5 minutes
     outcome_check_interval = 3600  # 1 hour
+    _reset_heartbeat_stats()
 
     try:
         async with aiohttp.ClientSession() as session:
 
             async def _pipeline_loop() -> None:
-                nonlocal cycle_count, cumulative, last_heartbeat
+                nonlocal cycle_count
                 nonlocal last_outcome_check, last_summary_date
 
                 while not shutdown_event.is_set():
@@ -730,26 +788,17 @@ async def main() -> None:
                             settings, db, session, dry_run=args.dry_run
                         )
                         logger.info("Cycle complete", **stats)
-                        for k in cumulative:
-                            cumulative[k] += stats.get(k, 0)
+                        _heartbeat_stats["tokens_scanned"] += stats.get("tokens_scanned", 0)
+                        _heartbeat_stats["candidates_promoted"] += stats.get("candidates_promoted", 0)
+                        _heartbeat_stats["alerts_fired"] += stats.get("alerts_fired", 0)
                     except Exception as e:
                         logger.error("Cycle failed", error=str(e))
 
                     cycle_count += 1
 
-                    # Heartbeat logging every 5 minutes
+                    # BL-033: periodic heartbeat summary
+                    _maybe_emit_heartbeat(settings)
                     now = time.monotonic()
-                    if now - last_heartbeat >= heartbeat_interval:
-                        mirofish_today = await db.get_daily_mirofish_count()
-                        logger.info(
-                            "Heartbeat",
-                            cycles=cycle_count,
-                            cumulative_tokens_scanned=cumulative["tokens_scanned"],
-                            cumulative_candidates_promoted=cumulative["candidates_promoted"],
-                            cumulative_alerts_fired=cumulative["alerts_fired"],
-                            mirofish_jobs_today=mirofish_today,
-                        )
-                        last_heartbeat = now
 
                     # Hourly tasks: outcome check + DB prune
                     if now - last_outcome_check >= outcome_check_interval:

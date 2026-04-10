@@ -15,6 +15,7 @@ class Settings(BaseSettings):
 
     # Scanner
     SCAN_INTERVAL_SECONDS: int = 60
+    HEARTBEAT_INTERVAL_SECONDS: int = 300  # BL-033: periodic heartbeat summary
     MIN_SCORE: int = 60
     CONVICTION_THRESHOLD: int = 70
     QUANT_WEIGHT: float = 0.6
