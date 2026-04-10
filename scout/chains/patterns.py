@@ -243,3 +243,122 @@ async def load_active_patterns(db: Database) -> list[ChainPattern]:
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_pattern(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# LEARN phase: hit-rate computation + pattern lifecycle
+# ---------------------------------------------------------------------------
+
+_RETIREMENT_HIT_RATE = 0.20
+
+
+async def compute_pattern_stats(db: Database, settings: Settings) -> list[dict]:
+    """Compute hit rate per (pattern, pipeline) over evaluated chain_matches."""
+    conn = db._conn
+    rows: list[dict] = []
+    async with conn.execute(
+        """SELECT pattern_id, pattern_name, pipeline,
+                  COUNT(*) AS total_evaluated,
+                  SUM(CASE WHEN outcome_class='hit' THEN 1 ELSE 0 END) AS hits
+           FROM chain_matches
+           WHERE outcome_class IS NOT NULL
+           GROUP BY pattern_id, pattern_name, pipeline"""
+    ) as cur:
+        for row in await cur.fetchall():
+            total = row["total_evaluated"] or 0
+            hits = row["hits"] or 0
+            rate = (hits / total) if total > 0 else 0.0
+            rows.append(
+                {
+                    "pattern_id": row["pattern_id"],
+                    "pattern_name": row["pattern_name"],
+                    "pipeline": row["pipeline"],
+                    "total_evaluated": total,
+                    "hits": hits,
+                    "hit_rate": rate,
+                    "sufficient": total >= settings.CHAIN_MIN_TRIGGERS_FOR_STATS,
+                }
+            )
+    return rows
+
+
+async def run_pattern_lifecycle(db: Database, settings: Settings) -> None:
+    """Promote / graduate / retire chain patterns based on rolling stats."""
+    stats = await compute_pattern_stats(db, settings)
+    if not stats:
+        return
+
+    # Aggregate per pattern (best pipeline wins for promotion purposes)
+    by_pattern: dict[int, dict] = {}
+    for s in stats:
+        pid = s["pattern_id"]
+        cur_best = by_pattern.get(pid)
+        if cur_best is None or s["hit_rate"] > cur_best["hit_rate"]:
+            by_pattern[pid] = s
+
+    conn = db._conn
+    for pid, s in by_pattern.items():
+        async with conn.execute(
+            "SELECT alert_priority, is_active FROM chain_patterns WHERE id = ?",
+            (pid,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            continue
+        prio = row["alert_priority"]
+        is_active = bool(row["is_active"])
+        new_prio = prio
+        new_active = is_active
+
+        if s["total_evaluated"] >= settings.CHAIN_MIN_TRIGGERS_FOR_STATS:
+            if s["hit_rate"] < _RETIREMENT_HIT_RATE:
+                new_active = False
+                logger.info(
+                    "chain_pattern_retired",
+                    pattern=s["pattern_name"],
+                    hit_rate=s["hit_rate"],
+                )
+            elif (
+                prio == "low"
+                and s["hit_rate"] >= settings.CHAIN_PROMOTION_THRESHOLD
+            ):
+                new_prio = "medium"
+                logger.info(
+                    "chain_pattern_promoted",
+                    pattern=s["pattern_name"],
+                    from_priority="low",
+                    to_priority="medium",
+                    hit_rate=s["hit_rate"],
+                )
+
+        if (
+            prio == "medium"
+            and s["total_evaluated"] >= settings.CHAIN_GRADUATION_MIN_TRIGGERS
+            and s["hit_rate"] >= settings.CHAIN_GRADUATION_HIT_RATE
+        ):
+            new_prio = "high"
+            logger.info(
+                "chain_pattern_graduated",
+                pattern=s["pattern_name"],
+                hit_rate=s["hit_rate"],
+            )
+
+        await conn.execute(
+            """UPDATE chain_patterns
+               SET alert_priority = ?,
+                   is_active      = ?,
+                   historical_hit_rate = ?,
+                   total_triggers = ?,
+                   total_hits     = ?,
+                   updated_at     = datetime('now')
+               WHERE id = ?""",
+            (
+                new_prio,
+                1 if new_active else 0,
+                s["hit_rate"],
+                s["total_evaluated"],
+                s["hits"],
+                pid,
+            ),
+        )
+    await conn.commit()
