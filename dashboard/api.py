@@ -170,6 +170,34 @@ def create_app(db_path: str | None = None) -> FastAPI:
         finally:
             await sdb.close()
 
+    # --- Chains endpoints ---
+
+    @app.get("/api/chains/active")
+    async def chains_active(limit: int = Query(50, ge=1, le=500)):
+        return await db.get_chains_active(_db_path, limit=limit)
+
+    @app.get("/api/chains/matches")
+    async def chains_matches(limit: int = Query(30, ge=1, le=500)):
+        return await db.get_chains_matches(_db_path, limit=limit)
+
+    @app.get("/api/chains/patterns")
+    async def chains_patterns():
+        return await db.get_chains_patterns(_db_path)
+
+    @app.get("/api/chains/events/recent")
+    async def chains_events_recent(limit: int = Query(50, ge=1, le=500)):
+        return await db.get_chains_events_recent(_db_path, limit=limit)
+
+    @app.get("/api/chains/stats")
+    async def chains_stats():
+        return await db.get_chains_stats(_db_path)
+
+    # --- System health endpoint ---
+
+    @app.get("/api/system/health")
+    async def system_health():
+        return await db.get_system_health(_db_path)
+
     @app.get("/health")
     async def health_check():
         """Health check endpoint for uptime monitoring."""

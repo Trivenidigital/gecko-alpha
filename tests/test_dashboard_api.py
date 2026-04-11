@@ -107,6 +107,77 @@ async def seeded_db(tmp_path):
                 contract_address  TEXT NOT NULL,
                 created_at        TEXT NOT NULL
             );
+
+            CREATE TABLE signal_events (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id       TEXT NOT NULL,
+                pipeline       TEXT NOT NULL,
+                event_type     TEXT NOT NULL,
+                event_data     TEXT NOT NULL,
+                source_module  TEXT NOT NULL,
+                created_at     TEXT NOT NULL
+            );
+
+            CREATE TABLE chain_patterns (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                name                 TEXT NOT NULL UNIQUE,
+                description          TEXT NOT NULL,
+                steps_json           TEXT NOT NULL,
+                min_steps_to_trigger INTEGER NOT NULL,
+                conviction_boost     INTEGER NOT NULL DEFAULT 0,
+                alert_priority       TEXT NOT NULL DEFAULT 'low',
+                is_active            INTEGER NOT NULL DEFAULT 1,
+                historical_hit_rate  REAL,
+                total_triggers       INTEGER DEFAULT 0,
+                total_hits           INTEGER DEFAULT 0,
+                created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE active_chains (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id       TEXT NOT NULL,
+                pipeline       TEXT NOT NULL,
+                pattern_id     INTEGER NOT NULL,
+                pattern_name   TEXT NOT NULL,
+                steps_matched  TEXT NOT NULL,
+                step_events    TEXT NOT NULL,
+                anchor_time    TEXT NOT NULL,
+                last_step_time TEXT NOT NULL,
+                is_complete    INTEGER DEFAULT 0,
+                completed_at   TEXT,
+                created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE chain_matches (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id             TEXT NOT NULL,
+                pipeline             TEXT NOT NULL,
+                pattern_id           INTEGER NOT NULL,
+                pattern_name         TEXT NOT NULL,
+                steps_matched        INTEGER NOT NULL,
+                total_steps          INTEGER NOT NULL,
+                anchor_time          TEXT NOT NULL,
+                completed_at         TEXT NOT NULL,
+                chain_duration_hours REAL NOT NULL,
+                conviction_boost     INTEGER NOT NULL,
+                outcome_class        TEXT,
+                outcome_change_pct   REAL,
+                evaluated_at         TEXT,
+                created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE narrative_signals (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE second_wave_candidates (
+                id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                contract_address         TEXT NOT NULL,
+                detected_at              TEXT NOT NULL,
+                reaccumulation_score     INTEGER NOT NULL
+            );
         """)
 
         now = datetime.now(timezone.utc).isoformat()
@@ -205,6 +276,59 @@ async def seeded_db(tmp_path):
             ("Learned that AI category outperforms in bull markets", now),
         )
 
+        # Seed chain_patterns
+        await db.execute(
+            """INSERT INTO chain_patterns
+            (id, name, description, steps_json, min_steps_to_trigger,
+             conviction_boost, alert_priority, is_active, total_triggers, total_hits)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (1, "test_pattern", "Test chain pattern",
+             json.dumps(["step_a", "step_b"]), 2, 15, "medium", 1, 10, 4),
+        )
+
+        # Seed active_chains
+        await db.execute(
+            """INSERT INTO active_chains
+            (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+             step_events, anchor_time, last_step_time, is_complete)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("0xhigh", "narrative", 1, "test_pattern",
+             json.dumps(["step_a"]), json.dumps([{"t": now, "step": "step_a"}]),
+             now, now, 0),
+        )
+
+        # Seed signal_events
+        await db.execute(
+            """INSERT INTO signal_events
+            (token_id, pipeline, event_type, event_data, source_module, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            ("0xhigh", "narrative", "momentum_spike", "{}", "scorer", now),
+        )
+
+        # Seed chain_matches
+        await db.execute(
+            """INSERT INTO chain_matches
+            (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+             total_steps, anchor_time, completed_at, chain_duration_hours,
+             conviction_boost, outcome_class)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("0xhigh", "narrative", 1, "test_pattern", 2, 2, now, now, 1.5, 15, "HIT"),
+        )
+
+        # Seed second_wave_candidates
+        await db.execute(
+            """INSERT INTO second_wave_candidates
+            (contract_address, detected_at, reaccumulation_score)
+            VALUES (?, ?, ?)""",
+            ("0xsw", now, 72),
+        )
+
+        # Seed narrative_signals
+        await db.execute(
+            "INSERT INTO narrative_signals (created_at) VALUES (?)",
+            (now,),
+        )
+
         await db.commit()
 
     return db_path
@@ -277,6 +401,51 @@ async def empty_db(tmp_path):
             CREATE TABLE mirofish_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 contract_address TEXT NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE TABLE signal_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id TEXT NOT NULL, pipeline TEXT NOT NULL,
+                event_type TEXT NOT NULL, event_data TEXT NOT NULL,
+                source_module TEXT NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE TABLE chain_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE, description TEXT NOT NULL,
+                steps_json TEXT NOT NULL, min_steps_to_trigger INTEGER NOT NULL,
+                conviction_boost INTEGER NOT NULL DEFAULT 0,
+                alert_priority TEXT NOT NULL DEFAULT 'low',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                historical_hit_rate REAL,
+                total_triggers INTEGER DEFAULT 0, total_hits INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE active_chains (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id TEXT NOT NULL, pipeline TEXT NOT NULL,
+                pattern_id INTEGER NOT NULL, pattern_name TEXT NOT NULL,
+                steps_matched TEXT NOT NULL, step_events TEXT NOT NULL,
+                anchor_time TEXT NOT NULL, last_step_time TEXT NOT NULL,
+                is_complete INTEGER DEFAULT 0, completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE chain_matches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id TEXT NOT NULL, pipeline TEXT NOT NULL,
+                pattern_id INTEGER NOT NULL, pattern_name TEXT NOT NULL,
+                steps_matched INTEGER NOT NULL, total_steps INTEGER NOT NULL,
+                anchor_time TEXT NOT NULL, completed_at TEXT NOT NULL,
+                chain_duration_hours REAL NOT NULL, conviction_boost INTEGER NOT NULL,
+                outcome_class TEXT, outcome_change_pct REAL, evaluated_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE narrative_signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL
+            );
+            CREATE TABLE second_wave_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                contract_address TEXT NOT NULL, detected_at TEXT NOT NULL,
+                reaccumulation_score INTEGER NOT NULL
             );
         """)
     return db_path
@@ -588,3 +757,93 @@ class TestNarrativeCategoryHistory:
         resp = await empty_client.get("/api/narrative/categories/history?category_id=ai")
         assert resp.status_code == 200
         assert resp.json() == []
+
+
+# ---------------------------------------------------------------------------
+# GET /api/chains/*
+# ---------------------------------------------------------------------------
+
+class TestChains:
+
+    async def test_chains_active_endpoint(self, client):
+        resp = await client.get("/api/chains/active")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["token_id"] == "0xhigh"
+        assert data[0]["pipeline"] == "narrative"
+        assert isinstance(data[0]["steps_matched"], list)
+        assert isinstance(data[0]["step_events"], list)
+
+    async def test_chains_active_empty_db(self, empty_client):
+        resp = await empty_client.get("/api/chains/active")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    async def test_chains_patterns_endpoint(self, client):
+        resp = await client.get("/api/chains/patterns")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["name"] == "test_pattern"
+        # hit_rate computed: 4/10 = 40%
+        assert data[0]["hit_rate"] == 40.0
+        assert isinstance(data[0]["steps_json"], list)
+
+    async def test_chains_patterns_empty_db(self, empty_client):
+        resp = await empty_client.get("/api/chains/patterns")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    async def test_chains_matches_endpoint(self, client):
+        resp = await client.get("/api/chains/matches")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["pattern_name"] == "test_pattern"
+
+    async def test_chains_events_recent_endpoint(self, client):
+        resp = await client.get("/api/chains/events/recent")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["event_type"] == "momentum_spike"
+
+    async def test_chains_stats_endpoint(self, client):
+        resp = await client.get("/api/chains/stats")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["active_chains"] == 1
+        assert data["completed_matches"] == 1
+        assert data["total_events"] == 1
+
+
+# ---------------------------------------------------------------------------
+# GET /api/system/health
+# ---------------------------------------------------------------------------
+
+
+class TestSystemHealth:
+
+    async def test_system_health_endpoint(self, client):
+        resp = await client.get("/api/system/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "candidates" in data
+        assert "active_chains" in data
+        assert "chain_matches" in data
+        assert "signal_events" in data
+        assert "predictions" in data
+        assert "second_wave_candidates" in data
+        assert "learn_logs" in data
+        assert "agent_strategy" in data
+        assert data["candidates"]["count"] == 3
+        assert data["active_chains"]["count"] == 1
+        assert data["chain_matches"]["count"] == 1
+
+    async def test_system_health_empty_db(self, empty_client):
+        resp = await empty_client.get("/api/system/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["candidates"]["count"] == 0
+        assert data["candidates"]["latest"] is None
