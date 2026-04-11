@@ -5,6 +5,9 @@ import CandidatesTable from './components/CandidatesTable.jsx'
 import SignalHitRate from './components/SignalHitRate.jsx'
 import AlertFeed from './components/AlertFeed.jsx'
 import NarrativeTab from './components/NarrativeTab.jsx'
+import ChainsTab from './components/ChainsTab.jsx'
+import SecondWaveTab from './components/SecondWaveTab.jsx'
+import HealthTab from './components/HealthTab.jsx'
 
 const DEFAULT_STATUS = {
   pipeline_status: 'connecting',
@@ -126,6 +129,24 @@ export default function App() {
         >
           Narrative Rotation
         </button>
+        <button
+          className={`tab-btn ${activeTab === 'chains' ? 'active' : ''}`}
+          onClick={() => setActiveTab('chains')}
+        >
+          Chains
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'secondwave' ? 'active' : ''}`}
+          onClick={() => setActiveTab('secondwave')}
+        >
+          Second Wave
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'health' ? 'active' : ''}`}
+          onClick={() => setActiveTab('health')}
+        >
+          Health
+        </button>
       </div>
 
       {activeTab === 'pipeline' && (
@@ -144,6 +165,9 @@ export default function App() {
       )}
 
       {activeTab === 'narrative' && <NarrativeTab />}
+      {activeTab === 'chains' && <ChainsTab />}
+      {activeTab === 'secondwave' && <SecondWaveTab />}
+      {activeTab === 'health' && <HealthTab />}
     </div>
   )
 }

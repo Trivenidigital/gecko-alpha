@@ -326,6 +326,161 @@ async def get_narrative_category_history(
         return [dict(row) for row in rows]
 
 
+# ---------------------------------------------------------------------------
+# Chains queries
+# ---------------------------------------------------------------------------
+
+
+async def get_chains_active(db_path: str, limit: int = 50) -> list[dict]:
+    """Incomplete chains ordered by last_step_time desc."""
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute(
+            """SELECT id, token_id, pipeline, pattern_id, pattern_name,
+                      steps_matched, step_events, anchor_time,
+                      last_step_time, is_complete, completed_at, created_at
+               FROM active_chains
+               WHERE is_complete = 0
+               ORDER BY last_step_time DESC
+               LIMIT ?""",
+            (limit,),
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+        for r in rows:
+            try:
+                r["steps_matched"] = json.loads(r.get("steps_matched") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                r["steps_matched"] = []
+            try:
+                r["step_events"] = json.loads(r.get("step_events") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                r["step_events"] = []
+        return rows
+
+
+async def get_chains_matches(db_path: str, limit: int = 30) -> list[dict]:
+    """Recent completed chain matches."""
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute(
+            "SELECT * FROM chain_matches ORDER BY completed_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_chains_patterns(db_path: str) -> list[dict]:
+    """Chain pattern definitions with stats."""
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute(
+            """SELECT id, name, description, min_steps_to_trigger,
+                      conviction_boost, alert_priority, is_active,
+                      historical_hit_rate, total_triggers, total_hits,
+                      steps_json
+               FROM chain_patterns
+               ORDER BY id"""
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+        for r in rows:
+            triggers = r.get("total_triggers") or 0
+            hits = r.get("total_hits") or 0
+            r["hit_rate"] = round((hits / triggers * 100) if triggers > 0 else 0, 1)
+            try:
+                r["steps_json"] = json.loads(r.get("steps_json") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                r["steps_json"] = []
+        return rows
+
+
+async def get_chains_events_recent(db_path: str, limit: int = 50) -> list[dict]:
+    """Most recent signal events."""
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute(
+            """SELECT id, token_id, pipeline, event_type, event_data,
+                      source_module, created_at
+               FROM signal_events
+               ORDER BY created_at DESC
+               LIMIT ?""",
+            (limit,),
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_chains_stats(db_path: str) -> dict:
+    """Aggregate chain stats."""
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM signal_events "
+            "WHERE created_at >= datetime('now', '-24 hours')"
+        )
+        events_24h = (await cursor.fetchone())[0]
+
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM active_chains WHERE is_complete = 0"
+        )
+        active_count = (await cursor.fetchone())[0]
+
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM active_chains WHERE is_complete = 1"
+        )
+        completed_active_count = (await cursor.fetchone())[0]
+
+        cursor = await conn.execute("SELECT COUNT(*) FROM chain_matches")
+        matches_count = (await cursor.fetchone())[0]
+
+        # Expired = is_complete but no chain_matches linkage (best-effort)
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM signal_events"
+        )
+        total_events = (await cursor.fetchone())[0]
+
+    return {
+        "active_chains": active_count,
+        "completed_matches": matches_count,
+        "completed_active": completed_active_count,
+        "events_24h": events_24h,
+        "total_events": total_events,
+    }
+
+
+# ---------------------------------------------------------------------------
+# System health query
+# ---------------------------------------------------------------------------
+
+
+async def _table_stats(conn, table: str, time_col: str) -> dict:
+    """Return count and latest timestamp for a table; tolerate missing tables."""
+    try:
+        cursor = await conn.execute(f"SELECT COUNT(*) FROM {table}")
+        count = (await cursor.fetchone())[0]
+        cursor = await conn.execute(f"SELECT MAX({time_col}) FROM {table}")
+        latest = (await cursor.fetchone())[0]
+        return {"count": count, "latest": latest}
+    except Exception:
+        return {"count": 0, "latest": None}
+
+
+async def get_system_health(db_path: str) -> dict:
+    """Row counts + last activity for major tables."""
+    tables = [
+        ("category_snapshots", "snapshot_at"),
+        ("narrative_signals", "created_at"),
+        ("predictions", "predicted_at"),
+        ("second_wave_candidates", "detected_at"),
+        ("signal_events", "created_at"),
+        ("active_chains", "last_step_time"),
+        ("chain_matches", "completed_at"),
+        ("chain_patterns", "created_at"),
+        ("candidates", "first_seen_at"),
+        ("alerts", "alerted_at"),
+        ("learn_logs", "created_at"),
+        ("agent_strategy", "updated_at"),
+    ]
+    result = {}
+    async with _ro_db(db_path) as conn:
+        for table, time_col in tables:
+            result[table] = await _table_stats(conn, table, time_col)
+    return result
+
+
 async def get_funnel(db_path: str) -> dict:
     """Pipeline funnel counts derived from current DB state."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
