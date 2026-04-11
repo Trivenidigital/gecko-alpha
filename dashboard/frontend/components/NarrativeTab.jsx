@@ -31,6 +31,7 @@ export default function NarrativeTab() {
   const [metrics, setMetrics] = useState(null)
   const [heating, setHeating] = useState([])
   const [predictions, setPredictions] = useState([])
+  const [expandedPred, setExpandedPred] = useState(null)
 
   const fetchData = useCallback(async () => {
     try {
@@ -129,6 +130,10 @@ export default function NarrativeTab() {
                     <th>Category</th>
                     <th>Fit</th>
                     <th>Conf</th>
+                    <th>Counter</th>
+                    <th>Flags</th>
+                    <th>Watch</th>
+                    <th>Regime</th>
                     <th>6h</th>
                     <th>24h</th>
                     <th>48h</th>
@@ -137,23 +142,86 @@ export default function NarrativeTab() {
                   </tr>
                 </thead>
                 <tbody>
-                  {predictions.map((p, i) => (
-                    <tr key={p.id || i}>
-                      <td style={{ fontWeight: 600 }}>{p.symbol || '-'}</td>
-                      <td>{p.category_id || '-'}</td>
-                      <td>{p.narrative_fit_score != null ? Number(p.narrative_fit_score).toFixed(0) : '-'}</td>
-                      <td>{p.confidence != null ? Number(p.confidence).toFixed(0) : '-'}</td>
-                      <td>{fmtPct(p.outcome_6h_change_pct)}</td>
-                      <td>{fmtPct(p.outcome_24h_change_pct)}</td>
-                      <td>{fmtPct(p.outcome_48h_change_pct)}</td>
-                      <td>
-                        <span className={`outcome-badge ${outcomeClass(p.outcome_class)}`}>
-                          {p.outcome_class || 'PENDING'}
-                        </span>
-                      </td>
-                      <td>{fmtPct(p.peak_change_pct)}</td>
-                    </tr>
-                  ))}
+                  {predictions.map((p, i) => {
+                    let flags = []
+                    try {
+                      if (typeof p.counter_flags === 'string') {
+                        flags = JSON.parse(p.counter_flags)
+                      } else if (Array.isArray(p.counter_flags)) {
+                        flags = p.counter_flags
+                      }
+                    } catch { /* ignore */ }
+                    const counter = p.counter_risk_score
+                    const counterColor =
+                      counter == null ? 'var(--color-text-secondary)'
+                      : counter < 30 ? 'var(--color-accent-green)'
+                      : counter <= 60 ? 'var(--color-accent-amber)'
+                      : 'var(--color-accent-red)'
+                    const expanded = expandedPred === (p.id || i)
+                    return (
+                      <React.Fragment key={p.id || i}>
+                        <tr>
+                          <td
+                            style={{ fontWeight: 600, cursor: 'pointer' }}
+                            onClick={() => setExpandedPred(expanded ? null : (p.id || i))}
+                            title="Click to toggle details"
+                          >
+                            {expanded ? '▼ ' : '▶ '}{p.symbol || '-'}
+                          </td>
+                          <td>{p.category_id || '-'}</td>
+                          <td>{p.narrative_fit_score != null ? Number(p.narrative_fit_score).toFixed(0) : (p.fit_score != null ? Number(p.fit_score).toFixed(0) : '-')}</td>
+                          <td>{p.confidence != null ? (typeof p.confidence === 'string' ? p.confidence : Number(p.confidence).toFixed(0)) : '-'}</td>
+                          <td>
+                            <span style={{ color: counterColor, fontWeight: 600 }}>
+                              {counter != null ? `${counter}/100` : '-'}
+                            </span>
+                          </td>
+                          <td>
+                            {flags.slice(0, 3).map((f, idx) => (
+                              <span key={idx} className="signal-badge fired">{f}</span>
+                            ))}
+                            {flags.length > 3 && (
+                              <span className="signal-badge">+{flags.length - 3}</span>
+                            )}
+                          </td>
+                          <td>{p.watchlist_users != null ? p.watchlist_users : '-'}</td>
+                          <td>
+                            <span className={`outcome-badge ${regimeClass(p.market_regime)}`}>
+                              {p.market_regime || '-'}
+                            </span>
+                          </td>
+                          <td>{fmtPct(p.outcome_6h_change_pct || p.price_change_6h)}</td>
+                          <td>{fmtPct(p.outcome_24h_change_pct || p.price_change_24h)}</td>
+                          <td>{fmtPct(p.outcome_48h_change_pct || p.price_change_48h)}</td>
+                          <td>
+                            <span className={`outcome-badge ${outcomeClass(p.outcome_class)}`}>
+                              {p.outcome_class || 'PENDING'}
+                            </span>
+                          </td>
+                          <td>{fmtPct(p.peak_change_pct)}</td>
+                        </tr>
+                        {expanded && (
+                          <tr>
+                            <td colSpan={13} style={{ background: 'var(--color-bar-bg)', padding: 12, fontSize: 12 }}>
+                              <div style={{ marginBottom: 6 }}>
+                                <strong>Reasoning:</strong> {p.reasoning || '-'}
+                              </div>
+                              {p.counter_argument && (
+                                <div style={{ marginBottom: 6 }}>
+                                  <strong>Counter:</strong> {p.counter_argument}
+                                </div>
+                              )}
+                              {p.outcome_reason && (
+                                <div>
+                                  <strong>Outcome reason:</strong> {p.outcome_reason}
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
