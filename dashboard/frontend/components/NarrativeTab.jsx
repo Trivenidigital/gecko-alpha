@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react'
+import TokenLink from './TokenLink'
 
 function fmtNum(n) {
   if (n == null) return '-'
@@ -162,11 +163,12 @@ export default function NarrativeTab() {
                       <React.Fragment key={p.id || i}>
                         <tr>
                           <td
-                            style={{ fontWeight: 600, cursor: 'pointer' }}
+                            style={{ cursor: 'pointer' }}
                             onClick={() => setExpandedPred(expanded ? null : (p.id || i))}
                             title="Click to toggle details"
                           >
-                            {expanded ? '▼ ' : '▶ '}{p.symbol || '-'}
+                            {expanded ? '▼ ' : '▶ '}
+                            <TokenLink tokenId={p.coin_id} symbol={p.symbol} pipeline="narrative" />
                           </td>
                           <td>{p.category_id || '-'}</td>
                           <td>{p.narrative_fit_score != null ? Number(p.narrative_fit_score).toFixed(0) : (p.fit_score != null ? Number(p.fit_score).toFixed(0) : '-')}</td>

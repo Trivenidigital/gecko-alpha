@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react'
+import TokenLink from './TokenLink'
 
 function fmtNum(n) {
   if (n == null) return '-'
@@ -98,7 +99,9 @@ export default function SecondWaveTab() {
               <tbody>
                 {candidates.map((c) => (
                   <tr key={c.id}>
-                    <td style={{ fontWeight: 600 }}>{c.ticker || c.token_name || '-'}</td>
+                    <td>
+                      <TokenLink tokenId={c.contract_address} symbol={c.ticker || c.token_name} pipeline="memecoin" chain={c.chain} />
+                    </td>
                     <td>
                       <span className={`chain-badge ${c.chain}`}>{c.chain}</span>
                     </td>
