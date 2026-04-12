@@ -89,7 +89,13 @@ export default function ChainsTab() {
                 {active.map((c) => (
                   <tr key={c.id}>
                     <td>
-                      <TokenLink tokenId={c.token_id} pipeline={c.pipeline} />
+                      <TokenLink
+                        tokenId={c.token_id}
+                        symbol={c.ticker || c.token_name || undefined}
+                        pipeline={c.pipeline}
+                        chain={c.chain}
+                      />
+                      {c.token_name && <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>{c.token_name}</div>}
                     </td>
                     <td>
                       <span className={`pipeline-badge pipeline-badge-${c.pipeline}`}>
@@ -173,7 +179,13 @@ export default function ChainsTab() {
                     <tr key={e.id}>
                       <td>{relTime(e.created_at)}</td>
                       <td>
-                        <TokenLink tokenId={e.token_id} pipeline={e.pipeline} maxLen={10} />
+                        <TokenLink
+                          tokenId={e.token_id}
+                          symbol={e.ticker || e.token_name || undefined}
+                          pipeline={e.pipeline}
+                          chain={e.chain}
+                          maxLen={10}
+                        />
                       </td>
                       <td>
                         <span className={`pipeline-badge pipeline-badge-${e.pipeline}`}>
