@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react'
+import TokenLink from './TokenLink'
 
 function relTime(iso) {
   if (!iso) return '-'
@@ -87,8 +88,8 @@ export default function ChainsTab() {
               <tbody>
                 {active.map((c) => (
                   <tr key={c.id}>
-                    <td style={{ fontWeight: 600, fontFamily: 'monospace', fontSize: 11 }}>
-                      {(c.token_id || '').slice(0, 14)}...
+                    <td>
+                      <TokenLink tokenId={c.token_id} pipeline={c.pipeline} />
                     </td>
                     <td>
                       <span className={`pipeline-badge pipeline-badge-${c.pipeline}`}>
@@ -171,8 +172,8 @@ export default function ChainsTab() {
                   {events.map((e) => (
                     <tr key={e.id}>
                       <td>{relTime(e.created_at)}</td>
-                      <td style={{ fontFamily: 'monospace', fontSize: 11 }}>
-                        {(e.token_id || '').slice(0, 10)}...
+                      <td>
+                        <TokenLink tokenId={e.token_id} pipeline={e.pipeline} maxLen={10} />
                       </td>
                       <td>
                         <span className={`pipeline-badge pipeline-badge-${e.pipeline}`}>

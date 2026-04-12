@@ -1,4 +1,5 @@
 import React from 'react'
+import TokenLink from './TokenLink'
 
 const SIGNAL_LABELS = {
   vol_liq_ratio: 'VOL',
@@ -61,7 +62,7 @@ export default function CandidatesTable({ candidates }) {
             return (
               <tr key={c.contract_address}>
                 <td>
-                  <div style={{ fontWeight: 600 }}>{c.token_name}</div>
+                  <TokenLink tokenId={c.contract_address} symbol={c.token_name} pipeline="memecoin" chain={c.chain} />
                   <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>{c.ticker}</div>
                 </td>
                 <td>

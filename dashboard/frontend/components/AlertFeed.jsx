@@ -1,4 +1,5 @@
 import React from 'react'
+import TokenLink from './TokenLink'
 
 function formatTime(iso) {
   if (!iso) return '–'
@@ -42,7 +43,9 @@ export default function AlertFeed({ alerts }) {
           return (
             <div className="alert-item" key={`${a.contract_address}-${i}`}>
               <span className="alert-time">{formatTime(a.alerted_at)}</span>
-              <span className="alert-token">{a.token_name || a.contract_address}</span>
+              <span className="alert-token">
+                <TokenLink tokenId={a.contract_address} symbol={a.token_name} pipeline="memecoin" chain={a.chain} />
+              </span>
               <span className="conviction-badge high">
                 {a.conviction_score != null ? Math.round(a.conviction_score) : '–'}
               </span>
