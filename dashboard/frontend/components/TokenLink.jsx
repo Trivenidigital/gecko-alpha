@@ -4,13 +4,14 @@ import React from 'react'
  * Renders a token identifier as a clickable link to DexScreener or CoinGecko.
  *
  * Props:
- *   tokenId: string — contract address or CoinGecko slug
+ *   tokenId: string — contract address, CoinGecko coin slug, or category slug
  *   symbol: string (optional) — ticker symbol for display
  *   pipeline: string (optional) — "memecoin" or "narrative"
  *   chain: string (optional) — "solana", "ethereum", "base" etc
+ *   type: string (optional) — "coin" (default), "category", or "auto"
  *   maxLen: number (optional) — truncate display to this length (default 16)
  */
-export default function TokenLink({ tokenId, symbol, pipeline, chain, maxLen = 16 }) {
+export default function TokenLink({ tokenId, symbol, pipeline, chain, type = 'auto', maxLen = 16 }) {
   if (!tokenId) return <span>-</span>
 
   // Determine if this looks like a contract address (hex or base58)
@@ -24,8 +25,11 @@ export default function TokenLink({ tokenId, symbol, pipeline, chain, maxLen = 1
     } else {
       href = `https://dexscreener.com/search?q=${tokenId}`
     }
+  } else if (type === 'category') {
+    // CoinGecko category page
+    href = `https://www.coingecko.com/en/categories/${tokenId}`
   } else {
-    // CoinGecko link (narrative pipeline uses slugs)
+    // CoinGecko coin page
     href = `https://www.coingecko.com/en/coins/${tokenId}`
   }
 

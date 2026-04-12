@@ -98,7 +98,9 @@ export default function NarrativeTab() {
               <tbody>
                 {heating.map((c, i) => (
                   <tr key={c.category_id || i}>
-                    <td style={{ fontWeight: 600 }}>{c.name || c.category_id}</td>
+                    <td style={{ fontWeight: 600 }}>
+                      <TokenLink tokenId={c.category_id} symbol={c.name || c.category_id} type="category" pipeline="narrative" />
+                    </td>
                     <td>
                       <span style={{ color: c.market_cap_change_24h > 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red)' }}>
                         {fmtPct(c.market_cap_change_24h)}
@@ -170,7 +172,9 @@ export default function NarrativeTab() {
                             {expanded ? '▼ ' : '▶ '}
                             <TokenLink tokenId={p.coin_id} symbol={p.symbol} pipeline="narrative" />
                           </td>
-                          <td>{p.category_id || '-'}</td>
+                          <td>
+                            <TokenLink tokenId={p.category_id} symbol={p.category_name || p.category_id} type="category" pipeline="narrative" />
+                          </td>
                           <td>{p.narrative_fit_score != null ? Number(p.narrative_fit_score).toFixed(0) : (p.fit_score != null ? Number(p.fit_score).toFixed(0) : '-')}</td>
                           <td>{p.confidence != null ? (typeof p.confidence === 'string' ? p.confidence : Number(p.confidence).toFixed(0)) : '-'}</td>
                           <td>

@@ -94,6 +94,7 @@ export default function ChainsTab() {
                         symbol={c.ticker || c.token_name || undefined}
                         pipeline={c.pipeline}
                         chain={c.chain}
+                        type={c.pipeline === 'narrative' ? 'category' : 'auto'}
                       />
                       {c.token_name && <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>{c.token_name}</div>}
                     </td>
@@ -184,6 +185,7 @@ export default function ChainsTab() {
                           symbol={e.ticker || e.token_name || undefined}
                           pipeline={e.pipeline}
                           chain={e.chain}
+                          type={e.pipeline === 'narrative' ? 'category' : 'auto'}
                           maxLen={10}
                         />
                       </td>
