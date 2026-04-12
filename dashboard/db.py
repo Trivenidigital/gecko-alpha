@@ -335,12 +335,14 @@ async def get_chains_active(db_path: str, limit: int = 50) -> list[dict]:
     """Incomplete chains ordered by last_step_time desc."""
     async with _ro_db(db_path) as conn:
         cursor = await conn.execute(
-            """SELECT id, token_id, pipeline, pattern_id, pattern_name,
-                      steps_matched, step_events, anchor_time,
-                      last_step_time, is_complete, completed_at, created_at
-               FROM active_chains
-               WHERE is_complete = 0
-               ORDER BY last_step_time DESC
+            """SELECT ac.id, ac.token_id, ac.pipeline, ac.pattern_id, ac.pattern_name,
+                      ac.steps_matched, ac.step_events, ac.anchor_time,
+                      ac.last_step_time, ac.is_complete, ac.completed_at, ac.created_at,
+                      c.token_name, c.ticker, c.chain
+               FROM active_chains ac
+               LEFT JOIN candidates c ON ac.token_id = c.contract_address
+               WHERE ac.is_complete = 0
+               ORDER BY ac.last_step_time DESC
                LIMIT ?""",
             (limit,),
         )
@@ -361,7 +363,10 @@ async def get_chains_matches(db_path: str, limit: int = 30) -> list[dict]:
     """Recent completed chain matches."""
     async with _ro_db(db_path) as conn:
         cursor = await conn.execute(
-            "SELECT * FROM chain_matches ORDER BY completed_at DESC LIMIT ?",
+            """SELECT cm.*, c.token_name, c.ticker, c.chain
+               FROM chain_matches cm
+               LEFT JOIN candidates c ON cm.token_id = c.contract_address
+               ORDER BY cm.completed_at DESC LIMIT ?""",
             (limit,),
         )
         return [dict(r) for r in await cursor.fetchall()]
@@ -394,10 +399,12 @@ async def get_chains_events_recent(db_path: str, limit: int = 50) -> list[dict]:
     """Most recent signal events."""
     async with _ro_db(db_path) as conn:
         cursor = await conn.execute(
-            """SELECT id, token_id, pipeline, event_type, event_data,
-                      source_module, created_at
-               FROM signal_events
-               ORDER BY created_at DESC
+            """SELECT se.id, se.token_id, se.pipeline, se.event_type, se.event_data,
+                      se.source_module, se.created_at,
+                      c.token_name, c.ticker, c.chain
+               FROM signal_events se
+               LEFT JOIN candidates c ON se.token_id = c.contract_address
+               ORDER BY se.created_at DESC
                LIMIT ?""",
             (limit,),
         )
