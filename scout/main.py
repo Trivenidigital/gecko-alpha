@@ -452,9 +452,10 @@ async def narrative_agent_loop(
     await strategy.load_or_init()
 
     # Load scheduling timestamps from strategy
-    last_eval_at = strategy.get_timestamp("last_eval_at")
-    last_daily_learn_at = strategy.get_timestamp("last_daily_learn_at")
-    last_weekly_learn_at = strategy.get_timestamp("last_weekly_learn_at")
+    _epoch = datetime.min.replace(tzinfo=timezone.utc)
+    last_eval_at = strategy.get_timestamp("last_eval_at", default=_epoch)
+    last_daily_learn_at = strategy.get_timestamp("last_daily_learn_at", default=_epoch)
+    last_weekly_learn_at = strategy.get_timestamp("last_weekly_learn_at", default=_epoch)
 
     while True:
         try:
