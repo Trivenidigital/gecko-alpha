@@ -913,6 +913,8 @@ async def narrative_agent_loop(
                     logger.exception("narrative.weekly_learn_error")
 
         except Exception:
+            import traceback
+            traceback.print_exc()
             logger.exception("narrative.loop_error")
 
         await asyncio.sleep(settings.NARRATIVE_POLL_INTERVAL)
