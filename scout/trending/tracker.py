@@ -363,7 +363,7 @@ async def get_recent_comparisons(
                   detected_by_chains, chains_detected_at, chains_lead_minutes,
                   is_gap, created_at
            FROM trending_comparisons
-           ORDER BY appeared_on_trending_at DESC
+           ORDER BY COALESCE(chains_detected_at, narrative_detected_at, pipeline_detected_at, appeared_on_trending_at) DESC
            LIMIT ?""",
         (limit,),
     )
