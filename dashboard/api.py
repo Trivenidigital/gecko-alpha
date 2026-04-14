@@ -203,6 +203,42 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def chains_stats():
         return await db.get_chains_stats(_db_path)
 
+    # --- Trending Tracker endpoints ---
+
+    @app.get("/api/trending/snapshots")
+    async def trending_snapshots(hours: int = Query(24, ge=1, le=168), limit: int = Query(100, ge=1, le=500)):
+        from scout.db import Database as ScoutDatabase
+        from scout.trending.tracker import get_recent_snapshots
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            return await get_recent_snapshots(sdb, hours=hours, limit=limit)
+        finally:
+            await sdb.close()
+
+    @app.get("/api/trending/stats")
+    async def trending_stats():
+        from scout.db import Database as ScoutDatabase
+        from scout.trending.tracker import get_trending_stats
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            stats = await get_trending_stats(sdb)
+            return stats.model_dump()
+        finally:
+            await sdb.close()
+
+    @app.get("/api/trending/comparisons")
+    async def trending_comparisons(limit: int = Query(100, ge=1, le=500)):
+        from scout.db import Database as ScoutDatabase
+        from scout.trending.tracker import get_recent_comparisons
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            return await get_recent_comparisons(sdb, limit=limit)
+        finally:
+            await sdb.close()
+
     # --- System health endpoint ---
 
     @app.get("/api/system/health")

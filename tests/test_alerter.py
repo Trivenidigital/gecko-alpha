@@ -5,32 +5,6 @@ import aiohttp
 from aioresponses import aioresponses
 
 from scout.alerter import send_alert, format_alert_message
-from scout.config import Settings
-from scout.models import CandidateToken
-
-
-def _settings(**overrides) -> Settings:
-    defaults = dict(
-        TELEGRAM_BOT_TOKEN="test-bot-token",
-        TELEGRAM_CHAT_ID="test-chat-id",
-        ANTHROPIC_API_KEY="k",
-        DISCORD_WEBHOOK_URL="",
-    )
-    defaults.update(overrides)
-    return Settings(**defaults)
-
-
-def _make_token(**overrides) -> CandidateToken:
-    defaults = dict(
-        contract_address="0xabc123", chain="solana", token_name="MoonCoin",
-        ticker="MOON", token_age_days=2, market_cap_usd=75000,
-        liquidity_usd=15000, volume_24h_usd=120000,
-        holder_count=350, holder_growth_1h=30,
-        quant_score=80, narrative_score=75, conviction_score=78,
-        virality_class="High", mirofish_report="Strong viral narrative.",
-    )
-    defaults.update(overrides)
-    return CandidateToken(**defaults)
 
 
 @pytest.fixture
@@ -39,8 +13,15 @@ def mock_aiohttp():
         yield m
 
 
-def test_format_alert_message_contains_required_fields():
-    token = _make_token()
+def test_format_alert_message_contains_required_fields(token_factory):
+    token = token_factory(
+        contract_address="0xabc123", chain="solana", token_name="MoonCoin",
+        ticker="MOON", token_age_days=2, market_cap_usd=75000,
+        liquidity_usd=15000, volume_24h_usd=120000,
+        holder_count=350, holder_growth_1h=30,
+        quant_score=80, narrative_score=75, conviction_score=78,
+        virality_class="High", mirofish_report="Strong viral narrative.",
+    )
     signals = ["vol_liq_ratio", "holder_growth", "market_cap_range"]
     msg = format_alert_message(token, signals)
 
@@ -58,8 +39,15 @@ def test_format_alert_message_contains_required_fields():
     assert "0xabc123" in msg
 
 
-def test_format_alert_message_without_narrative():
-    token = _make_token(narrative_score=None, virality_class=None, mirofish_report=None, conviction_score=80)
+def test_format_alert_message_without_narrative(token_factory):
+    token = token_factory(
+        contract_address="0xabc123", chain="solana", token_name="MoonCoin",
+        ticker="MOON", token_age_days=2, market_cap_usd=75000,
+        liquidity_usd=15000, volume_24h_usd=120000,
+        holder_count=350, holder_growth_1h=30,
+        quant_score=80, narrative_score=None, virality_class=None,
+        mirofish_report=None, conviction_score=80,
+    )
     signals = ["vol_liq_ratio"]
     msg = format_alert_message(token, signals)
 
@@ -67,45 +55,69 @@ def test_format_alert_message_without_narrative():
     assert "MoonCoin" in msg
 
 
-async def test_send_alert_telegram(mock_aiohttp):
+async def test_send_alert_telegram(mock_aiohttp, token_factory, settings_factory):
     telegram_url = "https://api.telegram.org/bottest-bot-token/sendMessage"
     mock_aiohttp.post(telegram_url, payload={"ok": True})
 
-    token = _make_token()
-    settings = _settings()
+    token = token_factory(
+        contract_address="0xabc123", chain="solana", token_name="MoonCoin",
+        ticker="MOON", quant_score=80, narrative_score=75, conviction_score=78,
+        virality_class="High", mirofish_report="Strong viral narrative.",
+    )
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-bot-token",
+        TELEGRAM_CHAT_ID="test-chat-id",
+        DISCORD_WEBHOOK_URL="",
+    )
     signals = ["vol_liq_ratio", "holder_growth"]
 
     async with aiohttp.ClientSession() as session:
         await send_alert(token, signals, session, settings)
 
 
-def test_alert_message_includes_momentum_flag():
+def test_alert_message_includes_momentum_flag(token_factory):
     """AC-08: Momentum flag appears in alert message when signal fired."""
-    token = _make_token()
+    token = token_factory(
+        contract_address="0xabc123", chain="solana", token_name="MoonCoin",
+        ticker="MOON", quant_score=80, narrative_score=75, conviction_score=78,
+        virality_class="High", mirofish_report="Strong viral narrative.",
+    )
     signals = ["vol_liq_ratio", "momentum_ratio", "vol_acceleration"]
     msg = format_alert_message(token, signals)
     assert "CoinGecko Signals" in msg
     assert "1h gain accelerating" in msg.lower() or "momentum" in msg.lower()
 
 
-def test_alert_message_includes_vol_spike_flag():
+def test_alert_message_includes_vol_spike_flag(token_factory):
     """Vol spike flag appears in alert message when signal fired."""
-    token = _make_token()
+    token = token_factory(
+        contract_address="0xabc123", chain="solana", token_name="MoonCoin",
+        ticker="MOON", quant_score=80, narrative_score=75, conviction_score=78,
+        virality_class="High", mirofish_report="Strong viral narrative.",
+    )
     signals = ["vol_acceleration"]
     msg = format_alert_message(token, signals)
     assert "CoinGecko Signals" in msg
     assert "volume spike" in msg.lower() or "vol >>" in msg.lower()
 
 
-async def test_send_alert_telegram_and_discord(mock_aiohttp):
+async def test_send_alert_telegram_and_discord(mock_aiohttp, token_factory, settings_factory):
     telegram_url = "https://api.telegram.org/bottest-bot-token/sendMessage"
     discord_url = "https://discord.com/api/webhooks/test"
 
     mock_aiohttp.post(telegram_url, payload={"ok": True})
     mock_aiohttp.post(discord_url, payload={}, status=204)
 
-    token = _make_token()
-    settings = _settings(DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/test")
+    token = token_factory(
+        contract_address="0xabc123", chain="solana", token_name="MoonCoin",
+        ticker="MOON", quant_score=80, narrative_score=75, conviction_score=78,
+        virality_class="High", mirofish_report="Strong viral narrative.",
+    )
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-bot-token",
+        TELEGRAM_CHAT_ID="test-chat-id",
+        DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/test",
+    )
     signals = ["vol_liq_ratio"]
 
     async with aiohttp.ClientSession() as session:

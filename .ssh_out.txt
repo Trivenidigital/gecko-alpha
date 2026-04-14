@@ -1,3 +1,4 @@
-{"count":0,"avg_score":0.0,"days":7}---
-[{"key":"category_accel_threshold","value":"5.0","updated_at":"2026-04-09T13:48:38.619431+00:00","updated_by":"init","reason":"seeded default","locked":0,"min_bound":2.0,"max_bound":15.0},{"key":"cate---
-{"category_snapshots":{"count":80290,"latest":"2026-04-14T00:40:37.451115+00:00"},"narrative_signals":{"count":189,"latest":"2026-04-14 00:40:37"},"predictions":{"count":26,"latest":"2026-04-13T23:10:
+HEAD is now at 5fb058c fix(dashboard): filter out zero-score candidate_scored noise from Recent Signals
+From https://github.com/Trivenidigital/gecko-alpha
+   81d430a..5fb058c  master     -> origin/master
+OK

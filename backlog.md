@@ -46,7 +46,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Acceptance:** `uv run pytest tests/test_fallback.py -v` passes, dry-run produces narrative scores
 
 ### BL-002: Create .env with real API keys and run first live dry-run
-**Status:** Blocked by BL-001
+**Status:** DONE — live dry-run completed, real API keys configured on VPS
 **Files:** .env
 **Why:** Pipeline has never been tested against real APIs. Need to verify DexScreener/GeckoTerminal response parsing, Telegram delivery, and end-to-end flow.
 **Keys needed:**
@@ -60,7 +60,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 ## P1 — Enhanced Scorer (Phase 1: DexScreener-only data)
 
 ### BL-010: Add hard disqualifiers (Tier 1 pre-filter)
-**Status:** Not started
+**Status:** DONE — implemented by offshore devs (liquidity floor in scorer.py:55-57)
 **Files:** scout/scorer.py, scout/models.py, tests/test_scorer.py
 **Why:** Current scorer has no fraud filter. Wash-traded tokens pass easily.
 **Changes:**
@@ -71,7 +71,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Acceptance:** Tokens with < $15K liquidity get score 0 and never reach MiroFish
 
 ### BL-011: Add buy pressure ratio signal (Tier 3)
-**Status:** Not started
+**Status:** DONE — implemented by offshore devs (buy pressure in scorer.py:104-114)
 **Files:** scout/models.py, scout/ingestion/dexscreener.py, scout/scorer.py, tests/
 **Why:** Best wash-trade discriminator available from existing API data. DexScreener returns `txns.h1.buys` and `txns.h1.sells` — currently unused.
 **Changes:**
@@ -81,7 +81,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Acceptance:** Tokens with skewed buy pressure score higher than balanced volume tokens
 
 ### BL-012: Replace binary token age with bell curve (Tier 4)
-**Status:** Not started
+**Status:** DONE — implemented by offshore devs (age bell curve in scorer.py:83-97)
 **Files:** scout/scorer.py, tests/test_scorer.py
 **Why:** Current binary `< 7 days = 10 pts` misses the optimal 1-3 day window.
 **Changes:**
@@ -93,7 +93,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Acceptance:** Scoring curve matches spec, existing tests updated
 
 ### BL-013: Add score velocity bonus (Tier 2)
-**Status:** Not started
+**Status:** DONE — implemented by offshore devs (score velocity in scorer.py:149-154)
 **Files:** scout/scorer.py, scout/db.py, scout/main.py, tests/
 **Why:** A token whose score is rising across consecutive scans indicates active accumulation in progress — the velocity itself is a signal.
 **Changes:**
@@ -104,7 +104,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Acceptance:** Tokens with rising scores get bonus, flat/declining scores get nothing
 
 ### BL-014: Add co-occurrence multiplier
-**Status:** Not started
+**Status:** DONE — implemented by offshore devs (co-occurrence multiplier in scorer.py:159-161)
 **Files:** scout/scorer.py, tests/test_scorer.py
 **Why:** Vol/liq ratio alone is the most commonly gamed signal. Penalize isolated vol/liq without holder growth; bonus when both fire together.
 **Changes:**
@@ -116,7 +116,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Acceptance:** Wash-traded tokens (high vol, no holder growth) score 20% lower
 
 ### BL-015: Add signal confidence tag to MiroFish seed
-**Status:** Not started
+**Status:** DONE — implemented by offshore devs (signal_confidence function in scorer.py:167-177)
 **Files:** scout/mirofish/seed_builder.py, scout/scorer.py, tests/
 **Why:** Enriching the MiroFish seed with signal context improves narrative simulation quality.
 **Changes:**
@@ -126,7 +126,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Acceptance:** MiroFish seed contains signal context, tests verify format
 
 ### BL-016: Normalize scoring to 125 base → 100 scale
-**Status:** Not started
+**Status:** DONE — implemented by offshore devs (normalization in scorer.py:156-157, SCORER_MAX_RAW=183)
 **Files:** scout/scorer.py, scout/config.py, tests/test_scorer.py
 **Why:** New signals (buy pressure +15, velocity +10, revised age curve) push max above 100. Need normalization.
 **Changes:**
@@ -188,13 +188,13 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 ## P2 — Infrastructure & Reliability
 
 ### BL-030: Add Solana chain bonus to scorer (Tier 4)
-**Status:** Not started
+**Status:** DONE — implemented by offshore devs (Solana bonus in scorer.py)
 **Files:** scout/scorer.py, tests/test_scorer.py
 **Why:** Diagram shows +5 pts for Solana chain (meme premium). Solana has disproportionate meme coin activity.
 **Changes:** Simple conditional: `if chain == "solana": +5 pts`
 
 ### BL-031: Add market cap tier curve (Tier 4)
-**Status:** Not started
+**Status:** DONE — implemented by offshore devs (mcap tier curve in scorer.py)
 **Files:** scout/scorer.py, tests/test_scorer.py
 **Why:** Current binary $10K-$500K gate misses the sweet spot. Diagram shows $10K-$100K as peak score, tapering to $500K.
 **Changes:** Graduated scoring: 8 pts for $10K-$100K, 5 pts for $100K-$250K, 2 pts for $250K-$500K
@@ -204,10 +204,10 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Files:** scout/ingestion/, scout/models.py
 **Why:** Code review found social_mentions_24h is never populated.
 **Note:** PRD defers Twitter/X integration to Phase 5. Could use free Telegram channel monitoring or LunarCrush API as interim source.
-**Blocked by:** Social data source decision
+**Blocked by:** Social data source decision (LunarCrush is an option at $24/mo)
 
 ### BL-033: Add heartbeat logging every 5 minutes
-**Status:** Not started
+**Status:** DONE — heartbeat logging implemented (PR #7)
 **Files:** scout/main.py
 **Why:** PRD requires heartbeat log showing: tokens scanned, candidates promoted, alerts fired, MiroFish jobs today.
 **Changes:** Track cumulative stats, log summary every 5 min (or every N cycles)
@@ -223,7 +223,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 ## P3 — Future / Nice-to-have
 
 ### BL-040: Add backtesting framework
-**Status:** Not started
+**Status:** DONE — backtest CLI implemented (PR #8, `python -m scout.backtest`)
 **Why:** PRD Phase 4 (weeks 4-6). Need 30 days of outcome data first. /backtest slash command exists but needs real data.
 
 ### BL-041: Add X/Twitter social monitoring
@@ -231,7 +231,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Why:** PRD Phase 5. Requires Twitter API or scraping infrastructure.
 
 ### BL-042: Refactor test helpers to use conftest.py fixtures
-**Status:** Not started
+**Status:** DONE — 17 test files migrated to shared conftest.py fixtures
 **Why:** Code review M5 — shared fixtures added to conftest.py but existing tests still use local helpers. Low priority cleanup.
 
 ### BL-043: Add Prometheus/Grafana monitoring
@@ -289,3 +289,47 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 > The lead time numbers from social APIs mean "before CoinGecko page updates", not "before price moves." For automated trading this is insufficient edge. However, for manual research (our use case), even minutes of lead time is valuable for investigating WHY a token is gaining attention before the retail crowd sees it on Highlights.
 >
 > If pivoting to automated trading in the future, the architecture changes significantly: need execution engine, risk management, MEV awareness, and sub-second latency. That is a separate project.
+
+---
+
+## Completed Features (April 2026 Session)
+
+### Narrative Rotation Agent (PR #1)
+**Status:** DONE — live on VPS
+Autonomous 5-phase agent: OBSERVE → PREDICT → ALERT → EVALUATE → LEARN
+Self-improving via agent_strategy table. 26+ predictions, LEARN phase active.
+
+### Counter-Narrative Scoring (PR #3)
+**Status:** DONE — live on VPS
+Adversarial risk analysis for both pipelines. Deterministic flags + LLM synthesis.
+
+### Shared CoinGecko Rate Limiter (PR #4)
+**Status:** DONE — live on VPS
+Token bucket limiter (25/min) shared across all CoinGecko callers. Closes issue #2.
+
+### Second-Wave Detection (PR #5)
+**Status:** DONE — live on VPS
+Detects tokens that pumped 3-14 days ago and are re-accumulating.
+
+### Multi-Signal Conviction Chains (PR #6)
+**Status:** DONE — live on VPS
+Event store + temporal pattern matching. 3 built-in patterns with LEARN lifecycle.
+
+### Heartbeat + LEARN Counter Integration (PR #7)
+**Status:** DONE — live on VPS
+
+### CoinGecko Watchlist Signal + Backtest CLI (PR #8)
+**Status:** DONE — live on VPS
+
+### Dashboard Expansion (PRs #9-11 + fixes)
+**Status:** DONE — live on VPS
+5 tabs: Pipeline, Narrative Rotation, Chains, Second Wave, Health
+TokenLink component with CoinGecko/DexScreener routing.
+
+### CoinGecko Trending Snapshot Tracker (PR #12)
+**Status:** IN REVIEW
+Validates core goal — snapshots trending page, measures if we caught tokens before they trended.
+
+### Personalized Narrative Matching (PR #13)
+**Status:** IN REVIEW
+Category + mcap preferences for alert filtering. 3 modes: all/whitelist/blacklist.

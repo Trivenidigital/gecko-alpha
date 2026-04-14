@@ -6,26 +6,19 @@ import pytest
 from scout.chains.events import emit_event
 from scout.chains.patterns import seed_built_in_patterns
 from scout.chains.tracker import check_chains, get_active_boosts
-from scout.config import Settings
 from scout.db import Database
 
 
-def _settings(**overrides) -> Settings:
-    defaults = dict(
-        TELEGRAM_BOT_TOKEN="t",
-        TELEGRAM_CHAT_ID="c",
-        ANTHROPIC_API_KEY="k",
-        CHAIN_CHECK_INTERVAL_SEC=300,
-        CHAIN_MAX_WINDOW_HOURS=24.0,
-        CHAIN_COOLDOWN_HOURS=12.0,
-        CHAIN_EVENT_RETENTION_DAYS=14,
-        CHAIN_ACTIVE_RETENTION_DAYS=7,
-        CHAIN_ALERT_ON_COMPLETE=False,
-        CHAIN_TOTAL_BOOST_CAP=30,
-        CHAINS_ENABLED=True,
-    )
-    defaults.update(overrides)
-    return Settings(**defaults)
+_CHAIN_DEFAULTS = dict(
+    CHAIN_CHECK_INTERVAL_SEC=300,
+    CHAIN_MAX_WINDOW_HOURS=24.0,
+    CHAIN_COOLDOWN_HOURS=12.0,
+    CHAIN_EVENT_RETENTION_DAYS=14,
+    CHAIN_ACTIVE_RETENTION_DAYS=7,
+    CHAIN_ALERT_ON_COMPLETE=False,
+    CHAIN_TOTAL_BOOST_CAP=30,
+    CHAINS_ENABLED=True,
+)
 
 
 @pytest.fixture
@@ -38,13 +31,14 @@ async def db(tmp_path):
 
 
 @pytest.fixture
-def settings():
-    return _settings()
+def settings(settings_factory):
+    return settings_factory(**_CHAIN_DEFAULTS)
 
 
 @pytest.fixture(autouse=True)
-def _patch_get_settings(monkeypatch):
-    monkeypatch.setattr("scout.config.get_settings", lambda: _settings())
+def _patch_get_settings(monkeypatch, settings_factory):
+    s = settings_factory(**_CHAIN_DEFAULTS)
+    monkeypatch.setattr("scout.config.get_settings", lambda: s)
 
 
 async def test_full_conviction_e2e(db, settings):
@@ -76,7 +70,7 @@ async def test_full_conviction_e2e(db, settings):
     assert boost >= 15
 
 
-async def test_gate_applies_chain_boost(db, settings, monkeypatch):
+async def test_gate_applies_chain_boost(db, settings_factory, monkeypatch):
     """gate.evaluate adds get_active_boosts to the conviction score."""
     import scout.gate as gate_mod
     from scout.models import CandidateToken
@@ -110,8 +104,8 @@ async def test_gate_applies_chain_boost(db, settings, monkeypatch):
 
     monkeypatch.setattr(gate_mod, "_get_narrative_score", _no_narrative)
 
-    local_settings = _settings(
-        CHAINS_ENABLED=True, CONVICTION_THRESHOLD=70, MIN_SCORE=999,
+    local_settings = settings_factory(
+        **_CHAIN_DEFAULTS, CONVICTION_THRESHOLD=70, MIN_SCORE=999,
     )
 
     import aiohttp

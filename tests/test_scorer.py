@@ -2,29 +2,32 @@
 
 import pytest
 
-from scout.config import Settings
-from scout.models import CandidateToken
 from scout.scorer import score, signal_confidence
 
 
-def _settings(**overrides) -> Settings:
-    defaults = dict(
-        TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k",
-    )
-    defaults.update(overrides)
-    return Settings(**defaults)
+# Scorer tests need liquidity_usd=20000 (above floor) and social_mentions_24h=0
+# as defaults. These module-level helpers wrap conftest fixtures with scorer defaults.
+_settings = None
+_make_token = None
 
 
-def _make_token(**overrides) -> CandidateToken:
-    defaults = dict(
-        contract_address="0xtest", chain="solana", token_name="Test",
-        ticker="TST", token_age_days=1.0, market_cap_usd=50000.0,
-        liquidity_usd=20000.0, volume_24h_usd=80000.0,
-        holder_count=100, holder_growth_1h=25,
-        social_mentions_24h=0,
-    )
-    defaults.update(overrides)
-    return CandidateToken(**defaults)
+@pytest.fixture(autouse=True)
+def _scorer_helpers(settings_factory, token_factory):
+    """Wire conftest fixtures into module-level helpers for all tests."""
+    global _settings, _make_token
+
+    def _s(**overrides):
+        return settings_factory(**overrides)
+
+    def _mt(**overrides):
+        defaults = dict(
+            liquidity_usd=20000.0, social_mentions_24h=0,
+        )
+        defaults.update(overrides)
+        return token_factory(**defaults)
+
+    _settings = _s
+    _make_token = _mt
 
 
 class TestIndividualSignals:

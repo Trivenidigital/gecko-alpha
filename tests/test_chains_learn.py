@@ -9,23 +9,16 @@ from scout.chains.patterns import (
     seed_built_in_patterns,
 )
 from scout.chains.tracker import update_chain_outcomes
-from scout.config import Settings
 from scout.db import Database
 
 
-def _settings(**overrides) -> Settings:
-    defaults = dict(
-        TELEGRAM_BOT_TOKEN="t",
-        TELEGRAM_CHAT_ID="c",
-        ANTHROPIC_API_KEY="k",
-        CHAINS_ENABLED=True,
-        CHAIN_MIN_TRIGGERS_FOR_STATS=10,
-        CHAIN_PROMOTION_THRESHOLD=0.45,
-        CHAIN_GRADUATION_MIN_TRIGGERS=30,
-        CHAIN_GRADUATION_HIT_RATE=0.55,
-    )
-    defaults.update(overrides)
-    return Settings(**defaults)
+_LEARN_DEFAULTS = dict(
+    CHAINS_ENABLED=True,
+    CHAIN_MIN_TRIGGERS_FOR_STATS=10,
+    CHAIN_PROMOTION_THRESHOLD=0.45,
+    CHAIN_GRADUATION_MIN_TRIGGERS=30,
+    CHAIN_GRADUATION_HIT_RATE=0.55,
+)
 
 
 @pytest.fixture
@@ -38,8 +31,8 @@ async def db(tmp_path):
 
 
 @pytest.fixture
-def settings():
-    return _settings()
+def settings(settings_factory):
+    return settings_factory(**_LEARN_DEFAULTS)
 
 
 async def _seed_matches(db, pattern_name, pipeline, n_hits, n_misses):

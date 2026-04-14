@@ -6,26 +6,19 @@ import pytest
 
 from scout.chains.patterns import seed_built_in_patterns
 from scout.chains.tracker import check_chains, get_active_boosts
-from scout.config import Settings
 from scout.db import Database
 
 
-def _settings(**overrides) -> Settings:
-    defaults = dict(
-        TELEGRAM_BOT_TOKEN="t",
-        TELEGRAM_CHAT_ID="c",
-        ANTHROPIC_API_KEY="k",
-        CHAIN_CHECK_INTERVAL_SEC=300,
-        CHAIN_MAX_WINDOW_HOURS=24.0,
-        CHAIN_COOLDOWN_HOURS=12.0,
-        CHAIN_EVENT_RETENTION_DAYS=14,
-        CHAIN_ACTIVE_RETENTION_DAYS=7,
-        CHAIN_ALERT_ON_COMPLETE=False,
-        CHAIN_TOTAL_BOOST_CAP=30,
-        CHAINS_ENABLED=True,
-    )
-    defaults.update(overrides)
-    return Settings(**defaults)
+_TRACKER_DEFAULTS = dict(
+    CHAIN_CHECK_INTERVAL_SEC=300,
+    CHAIN_MAX_WINDOW_HOURS=24.0,
+    CHAIN_COOLDOWN_HOURS=12.0,
+    CHAIN_EVENT_RETENTION_DAYS=14,
+    CHAIN_ACTIVE_RETENTION_DAYS=7,
+    CHAIN_ALERT_ON_COMPLETE=False,
+    CHAIN_TOTAL_BOOST_CAP=30,
+    CHAINS_ENABLED=True,
+)
 
 
 @pytest.fixture
@@ -38,14 +31,15 @@ async def db(tmp_path):
 
 
 @pytest.fixture
-def settings():
-    return _settings()
+def settings(settings_factory):
+    return settings_factory(**_TRACKER_DEFAULTS)
 
 
 @pytest.fixture(autouse=True)
-def _patch_get_settings(monkeypatch):
+def _patch_get_settings(monkeypatch, settings_factory):
     """Ensure safe_emit sees CHAINS_ENABLED=True so chain_complete events fire."""
-    monkeypatch.setattr("scout.config.get_settings", lambda: _settings())
+    s = settings_factory(**_TRACKER_DEFAULTS)
+    monkeypatch.setattr("scout.config.get_settings", lambda: s)
 
 
 async def _insert_event_at(db, token_id, pipeline, event_type, data, when, source):
