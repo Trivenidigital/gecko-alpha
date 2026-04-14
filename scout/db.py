@@ -348,6 +348,40 @@ class Database:
                 ON second_wave_candidates(contract_address, detected_at);
             CREATE INDEX IF NOT EXISTS idx_sw_score
                 ON second_wave_candidates(reaccumulation_score);
+
+            CREATE TABLE IF NOT EXISTS trending_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                market_cap_rank INTEGER,
+                trending_score REAL,
+                snapshot_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_trending_snap
+                ON trending_snapshots(coin_id, snapshot_at);
+
+            CREATE TABLE IF NOT EXISTS trending_comparisons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                appeared_on_trending_at TEXT NOT NULL,
+                detected_by_narrative INTEGER DEFAULT 0,
+                narrative_detected_at TEXT,
+                narrative_lead_minutes REAL,
+                detected_by_pipeline INTEGER DEFAULT 0,
+                pipeline_detected_at TEXT,
+                pipeline_lead_minutes REAL,
+                detected_by_chains INTEGER DEFAULT 0,
+                chains_detected_at TEXT,
+                chains_lead_minutes REAL,
+                is_gap INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_trending_comp
+                ON trending_comparisons(coin_id);
             """
         )
 
