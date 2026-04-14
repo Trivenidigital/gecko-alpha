@@ -27,6 +27,12 @@ STRATEGY_DEFAULTS: dict[str, object] = {
     "lessons_version": 0,
     "narrative_alert_enabled": True,
     "counter_suppress_threshold": 100,
+    # Personalized narrative matching preferences
+    "user_preferred_categories": [],
+    "user_excluded_categories": [],
+    "user_min_market_cap": 0,
+    "user_max_market_cap": 0,
+    "user_alert_mode": "all",
 }
 
 STRATEGY_BOUNDS: dict[str, tuple[float, float]] = {

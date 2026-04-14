@@ -48,6 +48,7 @@ from scout.narrative.predictor import (
     store_predictions,
 )
 from scout.narrative.strategy import Strategy
+from scout.preferences.matcher import should_alert_category, should_alert_token
 from scout.trending.tracker import (
     compare_with_signals as trending_compare,
     fetch_and_store_trending,
@@ -850,17 +851,34 @@ async def narrative_agent_loop(
                             control=len(control_laggards),
                         )
 
-                    # Send alert if enabled
+                    # Send alert if enabled and matches user preferences
                     if narrative_alert_enabled and prediction_models:
-                        try:
-                            alert_text = format_heating_alert(
-                                accel, prediction_models, top_3_coins
-                            )
-                            await send_telegram_message(alert_text, session, settings)
-                            logger.info("narrative.alert_sent", category=accel.name)
-                        except Exception:
-                            logger.exception(
-                                "narrative.alert_error", category=accel.name
+                        if should_alert_category(accel.category_id, strategy):
+                            alertable = [
+                                p for p in prediction_models
+                                if should_alert_token(p.market_cap_at_prediction, strategy)
+                            ]
+                            if alertable:
+                                try:
+                                    alert_text = format_heating_alert(
+                                        accel, alertable, top_3_coins
+                                    )
+                                    await send_telegram_message(alert_text, session, settings)
+                                    logger.info("narrative.alert_sent", category=accel.name)
+                                except Exception:
+                                    logger.exception(
+                                        "narrative.alert_error", category=accel.name
+                                    )
+                            else:
+                                logger.info(
+                                    "narrative.alert_skipped_mcap_filter",
+                                    category=accel.name,
+                                    total_predictions=len(prediction_models),
+                                )
+                        else:
+                            logger.info(
+                                "narrative.alert_skipped_preference",
+                                category=accel.name,
                             )
 
                 except Exception:

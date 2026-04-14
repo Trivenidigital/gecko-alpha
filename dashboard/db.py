@@ -591,3 +591,16 @@ async def get_funnel(db_path: str) -> dict:
         "mirofish_run": mirofish_run,
         "alerted": alerted,
     }
+
+
+async def get_available_categories(db_path: str) -> list[dict]:
+    """Return distinct categories from recent snapshots (last 24h)."""
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute(
+            """SELECT DISTINCT category_id, name
+               FROM category_snapshots
+               WHERE snapshot_at > datetime('now', '-1 day')
+               ORDER BY name""",
+        )
+        rows = await cursor.fetchall()
+        return [{"category_id": row[0], "name": row[1]} for row in rows]

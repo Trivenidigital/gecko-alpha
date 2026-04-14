@@ -142,6 +142,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
             _db_path, category_id=category_id, hours=hours
         )
 
+    # --- Preferences endpoints ---
+
+    @app.get("/api/preferences/categories")
+    async def list_available_categories():
+        """List all category IDs from recent snapshots for preference selection."""
+        return await db.get_available_categories(_db_path)
+
     # --- Second-Wave Detection endpoints ---
 
     @app.get("/api/secondwave/candidates")
