@@ -71,7 +71,10 @@ export default function TradingTab() {
         fetch('/api/trading/history?limit=20'),
       ])
       if (statsRes.ok) setStats(await statsRes.json())
-      if (sigRes.ok) setBySignal(await sigRes.json())
+      if (sigRes.ok) {
+        const sig = await sigRes.json()
+        setBySignal(Array.isArray(sig) ? sig : Object.entries(sig).map(([k, v]) => ({ signal_type: k, ...v })))
+      }
       if (posRes.ok) setPositions(await posRes.json())
       if (histRes.ok) setHistory(await histRes.json())
     } catch {
