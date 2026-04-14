@@ -6,6 +6,7 @@ import SignalHitRate from './components/SignalHitRate.jsx'
 import AlertFeed from './components/AlertFeed.jsx'
 import QualitySignals from './components/QualitySignals.jsx'
 import SignalsTab from './components/SignalsTab.jsx'
+import TradingTab from './components/TradingTab.jsx'
 import HealthTab from './components/HealthTab.jsx'
 
 const DEFAULT_STATUS = {
@@ -123,6 +124,12 @@ export default function App() {
           Signals
         </button>
         <button
+          className={`tab-btn ${activeTab === 'trading' ? 'active' : ''}`}
+          onClick={() => setActiveTab('trading')}
+        >
+          Trading
+        </button>
+        <button
           className={`tab-btn ${activeTab === 'pipeline' ? 'active' : ''}`}
           onClick={() => setActiveTab('pipeline')}
         >
@@ -137,6 +144,8 @@ export default function App() {
       </div>
 
       {activeTab === 'signals' && <SignalsTab />}
+
+      {activeTab === 'trading' && <TradingTab />}
 
       {activeTab === 'pipeline' && (
         <>
