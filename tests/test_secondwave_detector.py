@@ -1,27 +1,24 @@
 """Tests for second-wave scoring and detection."""
 from datetime import datetime, timezone
 
-from scout.config import Settings
+import pytest
+
 from scout.secondwave.detector import (
     build_secondwave_candidate,
     score_reaccumulation,
 )
 
 
-def _settings() -> Settings:
-    return Settings(
-        TELEGRAM_BOT_TOKEN="x",
-        TELEGRAM_CHAT_ID="x",
-        ANTHROPIC_API_KEY="x",
-        SECONDWAVE_MIN_DRAWDOWN_PCT=30.0,
-        SECONDWAVE_MIN_RECOVERY_PCT=70.0,
-        SECONDWAVE_VOL_PICKUP_RATIO=2.0,
-        SECONDWAVE_ALERT_THRESHOLD=50,
-    )
+_SW_DEFAULTS = dict(
+    SECONDWAVE_MIN_DRAWDOWN_PCT=30.0,
+    SECONDWAVE_MIN_RECOVERY_PCT=70.0,
+    SECONDWAVE_VOL_PICKUP_RATIO=2.0,
+    SECONDWAVE_ALERT_THRESHOLD=50,
+)
 
 
-def test_score_full_house():
-    settings = _settings()
+def test_score_full_house(settings_factory):
+    settings = settings_factory(**_SW_DEFAULTS)
     candidate = {"peak_quant_score": 80}
     score, signals = score_reaccumulation(
         candidate,
@@ -42,8 +39,8 @@ def test_score_full_house():
     }
 
 
-def test_score_below_threshold_dex_token():
-    settings = _settings()
+def test_score_below_threshold_dex_token(settings_factory):
+    settings = settings_factory(**_SW_DEFAULTS)
     candidate = {"peak_quant_score": 78}
     score, signals = score_reaccumulation(
         candidate,
@@ -62,8 +59,8 @@ def test_score_below_threshold_dex_token():
     assert score == 50
 
 
-def test_score_insufficient_volume_history():
-    settings = _settings()
+def test_score_insufficient_volume_history(settings_factory):
+    settings = settings_factory(**_SW_DEFAULTS)
     candidate = {"peak_quant_score": 80}
     score, signals = score_reaccumulation(
         candidate,
@@ -79,8 +76,8 @@ def test_score_insufficient_volume_history():
     assert score == 80  # 30 + 35 + 15
 
 
-def test_score_weak_drawdown_no_recovery():
-    settings = _settings()
+def test_score_weak_drawdown_no_recovery(settings_factory):
+    settings = settings_factory(**_SW_DEFAULTS)
     candidate = {"peak_quant_score": 50}  # too weak for strong_prior
     score, signals = score_reaccumulation(
         candidate,
@@ -96,8 +93,8 @@ def test_score_weak_drawdown_no_recovery():
     assert signals == []
 
 
-def test_score_zero_alert_price_safe():
-    settings = _settings()
+def test_score_zero_alert_price_safe(settings_factory):
+    settings = settings_factory(**_SW_DEFAULTS)
     candidate = {"peak_quant_score": 80}
     score, signals = score_reaccumulation(
         candidate,
