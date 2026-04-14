@@ -188,6 +188,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def chains_events_recent(limit: int = Query(50, ge=1, le=500)):
         return await db.get_chains_events_recent(_db_path, limit=limit)
 
+    @app.get("/api/chains/top-movers")
+    async def chains_top_movers(limit: int = Query(5, ge=1, le=20)):
+        return await db.get_chains_top_movers(_db_path, limit=limit)
+
     @app.get("/api/chains/stats")
     async def chains_stats():
         return await db.get_chains_stats(_db_path)

@@ -338,7 +338,8 @@ async def get_chains_active(db_path: str, limit: int = 50) -> list[dict]:
             """SELECT ac.id, ac.token_id, ac.pipeline, ac.pattern_id, ac.pattern_name,
                       ac.steps_matched, ac.step_events, ac.anchor_time,
                       ac.last_step_time, ac.is_complete, ac.completed_at, ac.created_at,
-                      c.token_name, c.ticker, c.chain
+                      c.token_name, c.ticker, c.chain,
+                      c.market_cap_usd, c.volume_24h_usd, c.quant_score
                FROM active_chains ac
                LEFT JOIN candidates c ON ac.token_id = c.contract_address
                WHERE ac.is_complete = 0
@@ -396,19 +397,78 @@ async def get_chains_patterns(db_path: str) -> list[dict]:
 
 
 async def get_chains_events_recent(db_path: str, limit: int = 50) -> list[dict]:
-    """Most recent signal events."""
+    """Most recent signal events with enriched market data."""
     async with _ro_db(db_path) as conn:
         cursor = await conn.execute(
             """SELECT se.id, se.token_id, se.pipeline, se.event_type, se.event_data,
                       se.source_module, se.created_at,
-                      c.token_name, c.ticker, c.chain
+                      c.token_name, c.ticker, c.chain,
+                      c.market_cap_usd, c.volume_24h_usd, c.quant_score
                FROM signal_events se
                LEFT JOIN candidates c ON se.token_id = c.contract_address
                ORDER BY se.created_at DESC
                LIMIT ?""",
             (limit,),
         )
-        return [dict(r) for r in await cursor.fetchall()]
+        rows = [dict(r) for r in await cursor.fetchall()]
+        # Parse event_data JSON and extract useful fields
+        for r in rows:
+            ed = {}
+            try:
+                ed = json.loads(r.get("event_data") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                pass
+            r["event_data_parsed"] = ed
+            # Promote key fields for frontend convenience
+            r["ed_quant_score"] = ed.get("quant_score") or r.get("quant_score") or 0
+            r["ed_signal_count"] = ed.get("signal_count") or 0
+            r["ed_signals_fired"] = ed.get("signals_fired") or []
+            r["ed_price_change_1h"] = ed.get("price_change_1h")
+            r["ed_price_change_24h"] = ed.get("price_change_24h")
+        return rows
+
+
+async def get_chains_top_movers(db_path: str, limit: int = 5) -> list[dict]:
+    """Top tokens by quant_score from recent signal events (last 24h).
+
+    Since price_change columns are not persisted in the candidates table,
+    we rank by quant_score and extract price data from event_data JSON.
+    """
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute(
+            """SELECT DISTINCT se.token_id,
+                      c.token_name, c.ticker, c.chain,
+                      c.market_cap_usd, c.volume_24h_usd, c.quant_score,
+                      se.event_data, se.created_at
+               FROM signal_events se
+               LEFT JOIN candidates c ON se.token_id = c.contract_address
+               WHERE se.created_at >= datetime('now', '-24 hours')
+               ORDER BY COALESCE(c.quant_score, 0) DESC
+               LIMIT ?""",
+            (limit * 3,),  # fetch extra to dedup
+        )
+        rows = [dict(r) for r in await cursor.fetchall()]
+
+    # Dedup by token_id, keep best score, extract price data from event_data
+    seen: set[str] = set()
+    results: list[dict] = []
+    for r in rows:
+        tid = r["token_id"]
+        if tid in seen:
+            continue
+        seen.add(tid)
+        ed = {}
+        try:
+            ed = json.loads(r.get("event_data") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            pass
+        r["price_change_1h"] = ed.get("price_change_1h")
+        r["price_change_24h"] = ed.get("price_change_24h")
+        del r["event_data"]
+        results.append(r)
+        if len(results) >= limit:
+            break
+    return results
 
 
 async def get_chains_stats(db_path: str) -> dict:
