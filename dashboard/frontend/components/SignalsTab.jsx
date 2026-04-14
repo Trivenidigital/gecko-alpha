@@ -102,10 +102,11 @@ export default function SignalsTab() {
   const filteredComparisons = comparisons.filter(c => !isMegaCap(c))
 
   // Stats
-  const caught = trendingStats?.caught ?? trendingStats?.hits ?? 0
-  const total = trendingStats?.total ?? trendingStats?.tracked ?? 0
-  const hitRate = total > 0 ? Math.round((caught / total) * 100) : 0
-  const avgLead = trendingStats?.avg_lead_hours ?? trendingStats?.avg_lead_h
+  const caught = trendingStats?.caught_before_trending ?? 0
+  const total = trendingStats?.total_tracked ?? 0
+  const hitRate = trendingStats?.hit_rate_pct ?? (total > 0 ? Math.round((caught / total) * 100) : 0)
+  const avgLeadMin = trendingStats?.avg_lead_minutes ?? 0
+  const avgLead = avgLeadMin > 0 ? (avgLeadMin / 60).toFixed(1) : null
 
   return (
     <div>
@@ -168,12 +169,20 @@ export default function SignalsTab() {
               </thead>
               <tbody>
                 {filteredComparisons.map((c, i) => {
-                  const leadMin = c.lead_minutes ?? c.lead_time_minutes
+                  // Pick best lead time from available detection methods
+                  const leadMin = c.narrative_lead_minutes || c.pipeline_lead_minutes || c.chains_lead_minutes || null
+                  // Build detected-by label
+                  const methods = []
+                  if (c.detected_by_narrative) methods.push('Narrative')
+                  if (c.detected_by_pipeline) methods.push('Pipeline')
+                  if (c.detected_by_chains) methods.push('Chains')
+                  const detectedBy = methods.length > 0 ? methods.join(' + ') : (c.is_gap ? 'MISSED' : '-')
+
                   return (
                     <tr key={c.coin_id || i}>
                       <td>
                         <TokenLink
-                          tokenId={c.coin_id || c.token_id}
+                          tokenId={c.coin_id}
                           symbol={c.symbol || c.name}
                           chain="coingecko"
                         />
@@ -187,10 +196,10 @@ export default function SignalsTab() {
                         </span>
                       </td>
                       <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
-                        {fmtDate(c.trended_at || c.trending_at)}
+                        {fmtDate(c.appeared_on_trending_at)}
                       </td>
                       <td style={{ fontSize: 12 }}>
-                        {c.detected_by || c.source || (leadMin != null ? `(${Math.round(leadMin)} min)` : '-')}
+                        {detectedBy}
                       </td>
                     </tr>
                   )
