@@ -118,6 +118,36 @@ class Settings(BaseSettings):
     SECONDWAVE_DEDUP_DAYS: int = 7
     SECONDWAVE_MIN_VOLUME_POINTS: int = 2
 
+    # -------- Paper Trading Engine --------
+    TRADING_ENABLED: bool = False                  # master switch
+    TRADING_MODE: str = "paper"                    # "paper" or "live"
+    PAPER_TRADE_AMOUNT_USD: float = 1000.0         # per trade (paper)
+    PAPER_MAX_EXPOSURE_USD: float = 10000.0        # max total open (paper)
+    PAPER_TP_PCT: float = 20.0                     # take profit %
+    PAPER_SL_PCT: float = 10.0                     # stop loss % (positive: 10.0 = 10%)
+    PAPER_MAX_DURATION_HOURS: int = 48             # auto-expire
+    PAPER_SLIPPAGE_BPS: int = 50                   # 0.5% slippage simulation
+    TRADING_DIGEST_HOUR_UTC: int = 0               # midnight digest
+    TRADING_EVAL_INTERVAL: int = 1800              # 30 min eval cycle
+
+    @field_validator("PAPER_SL_PCT")
+    @classmethod
+    def _validate_paper_sl_pct(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError(
+                "sl_pct must be positive, e.g. 10.0 for 10% stop loss"
+            )
+        return v
+
+    @field_validator("PAPER_TP_PCT")
+    @classmethod
+    def _validate_paper_tp_pct(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError(
+                "tp_pct must be positive, e.g. 20.0 for 20% take profit"
+            )
+        return v
+
     @field_validator(
         "CHAIN_PROMOTION_THRESHOLD", "CHAIN_GRADUATION_HIT_RATE"
     )
