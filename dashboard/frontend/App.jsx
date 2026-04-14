@@ -4,10 +4,8 @@ import PipelineFunnel from './components/PipelineFunnel.jsx'
 import CandidatesTable from './components/CandidatesTable.jsx'
 import SignalHitRate from './components/SignalHitRate.jsx'
 import AlertFeed from './components/AlertFeed.jsx'
-import NarrativeTab from './components/NarrativeTab.jsx'
-import ChainsTab from './components/ChainsTab.jsx'
 import QualitySignals from './components/QualitySignals.jsx'
-import SecondWaveTab from './components/SecondWaveTab.jsx'
+import SignalsTab from './components/SignalsTab.jsx'
 import HealthTab from './components/HealthTab.jsx'
 
 const DEFAULT_STATUS = {
@@ -31,7 +29,7 @@ export default function App() {
   const [funnel, setFunnel] = useState(DEFAULT_FUNNEL)
   const [signals, setSignals] = useState([])
   const [alerts, setAlerts] = useState([])
-  const [activeTab, setActiveTab] = useState('pipeline')
+  const [activeTab, setActiveTab] = useState('signals')
   const [connected, setConnected] = useState(false)
   const wsRef = useRef(null)
   const reconnectTimer = useRef(null)
@@ -119,28 +117,16 @@ export default function App() {
 
       <div className="tab-bar">
         <button
+          className={`tab-btn ${activeTab === 'signals' ? 'active' : ''}`}
+          onClick={() => setActiveTab('signals')}
+        >
+          Signals
+        </button>
+        <button
           className={`tab-btn ${activeTab === 'pipeline' ? 'active' : ''}`}
           onClick={() => setActiveTab('pipeline')}
         >
           Pipeline
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'narrative' ? 'active' : ''}`}
-          onClick={() => setActiveTab('narrative')}
-        >
-          Narrative Rotation
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'chains' ? 'active' : ''}`}
-          onClick={() => setActiveTab('chains')}
-        >
-          Research
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'secondwave' ? 'active' : ''}`}
-          onClick={() => setActiveTab('secondwave')}
-        >
-          Second Wave
         </button>
         <button
           className={`tab-btn ${activeTab === 'health' ? 'active' : ''}`}
@@ -149,6 +135,8 @@ export default function App() {
           Health
         </button>
       </div>
+
+      {activeTab === 'signals' && <SignalsTab />}
 
       {activeTab === 'pipeline' && (
         <>
@@ -167,9 +155,6 @@ export default function App() {
         </>
       )}
 
-      {activeTab === 'narrative' && <NarrativeTab />}
-      {activeTab === 'chains' && <ChainsTab />}
-      {activeTab === 'secondwave' && <SecondWaveTab />}
       {activeTab === 'health' && <HealthTab />}
     </div>
   )
