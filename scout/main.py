@@ -236,9 +236,12 @@ async def run_cycle(
         cg_trending = []
 
     # Cache raw CoinGecko prices for dashboard (zero extra API calls)
-    if _cg_module.last_raw_markets:
+    all_raw = list(_cg_module.last_raw_markets)
+    if _cg_module.last_raw_trending:
+        all_raw.extend(_cg_module.last_raw_trending)
+    if all_raw:
         try:
-            cached = await db.cache_prices(_cg_module.last_raw_markets)
+            cached = await db.cache_prices(all_raw)
             logger.info("price_cache_updated", count=cached)
         except Exception:
             logger.exception("price_cache_error")

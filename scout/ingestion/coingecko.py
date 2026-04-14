@@ -23,6 +23,8 @@ REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 # Module-level store for raw /coins/markets responses.
 # Populated by fetch_top_movers(); consumed by main.py for price caching.
 last_raw_markets: list[dict] = []
+# Populated by fetch_trending(); consumed by main.py for price caching.
+last_raw_trending: list[dict] = []
 
 
 async def _get_with_backoff(
@@ -142,6 +144,8 @@ async def fetch_trending(
 
     coins = data.get("coins", [])
     tokens: list[CandidateToken] = []
+    # Also extract raw price data for price_cache enrichment
+    last_raw_trending.clear()
     for rank, entry in enumerate(coins[:15]):
         item = entry.get("item", {})
         cg_id = item.get("id", "unknown")
@@ -155,6 +159,15 @@ async def fetch_trending(
             holder_growth_1h=0,
         )
         tokens.append(token)
+        # Extract price data from item.data for price_cache
+        item_data = item.get("data", {})
+        if item_data:
+            last_raw_trending.append({
+                "id": cg_id,
+                "current_price": item_data.get("price"),
+                "price_change_percentage_24h": item_data.get("price_change_percentage_24h", {}).get("usd"),
+                "market_cap": item.get("market_cap_rank"),
+            })
 
     logger.info("cg_candidates_fetched", count=len(tokens), source="search/trending")
     return tokens
