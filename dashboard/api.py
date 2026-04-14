@@ -282,6 +282,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                         "ids": ids_param,
                         "vs_currencies": "usd",
                         "include_24hr_change": "true",
+                        "include_7d_change": "true",
                     },
                 ) as resp:
                     if resp.status == 200:
@@ -294,9 +295,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
             if cid in prices:
                 c["price_current"] = prices[cid].get("usd")
                 c["price_change_24h"] = prices[cid].get("usd_24h_change")
+                c["price_change_7d"] = prices[cid].get("usd_7d_change")
             else:
                 c["price_current"] = None
                 c["price_change_24h"] = None
+                c["price_change_7d"] = None
 
         return comparisons
 

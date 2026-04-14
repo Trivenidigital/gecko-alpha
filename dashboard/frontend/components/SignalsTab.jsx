@@ -163,6 +163,7 @@ export default function SignalsTab() {
                 <tr>
                   <th>Token</th>
                   <th>24h %</th>
+                  <th>7d %</th>
                   <th>Lead Time</th>
                   <th>Trended At</th>
                   <th>Detected By</th>
@@ -192,6 +193,13 @@ export default function SignalsTab() {
                         {c.price_change_24h != null ? (
                           <span style={{ color: c.price_change_24h > 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
                             {c.price_change_24h > 0 ? '+' : ''}{Number(c.price_change_24h).toFixed(1)}%
+                          </span>
+                        ) : '-'}
+                      </td>
+                      <td style={{ fontWeight: 700 }}>
+                        {c.price_change_7d != null ? (
+                          <span style={{ color: c.price_change_7d > 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
+                            {c.price_change_7d > 0 ? '+' : ''}{Number(c.price_change_7d).toFixed(1)}%
                           </span>
                         ) : '-'}
                       </td>
