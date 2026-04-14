@@ -728,3 +728,118 @@ async def get_available_categories(db_path: str) -> list[dict]:
         )
         rows = await cursor.fetchall()
         return [{"category_id": row[0], "name": row[1]} for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Paper trading queries
+# ---------------------------------------------------------------------------
+
+
+async def get_trading_positions(db_path: str) -> list[dict]:
+    """Open paper trades."""
+    async with _ro_db(db_path) as db:
+        cursor = await db.execute(
+            """SELECT id, token_id, symbol, name, chain, signal_type,
+                      entry_price, amount_usd, quantity,
+                      tp_price, sl_price, tp_pct, sl_pct,
+                      peak_price, peak_pct,
+                      checkpoint_1h_pct, checkpoint_6h_pct,
+                      checkpoint_24h_pct, checkpoint_48h_pct,
+                      opened_at
+               FROM paper_trades
+               WHERE status = 'open'
+               ORDER BY opened_at DESC"""
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def get_trading_history(
+    db_path: str, limit: int = 50, offset: int = 0
+) -> list[dict]:
+    """Closed paper trades, paginated."""
+    async with _ro_db(db_path) as db:
+        cursor = await db.execute(
+            """SELECT id, token_id, symbol, name, chain, signal_type,
+                      entry_price, exit_price, amount_usd,
+                      pnl_usd, pnl_pct, exit_reason, status,
+                      peak_price, peak_pct,
+                      checkpoint_1h_pct, checkpoint_6h_pct,
+                      checkpoint_24h_pct, checkpoint_48h_pct,
+                      opened_at, closed_at
+               FROM paper_trades
+               WHERE status != 'open'
+               ORDER BY closed_at DESC
+               LIMIT ? OFFSET ?""",
+            (limit, offset),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def get_trading_stats(db_path: str, days: int = 7) -> dict:
+    """Aggregate paper trading PnL stats."""
+    async with _ro_db(db_path) as db:
+        cursor = await db.execute(
+            """SELECT
+                 COUNT(*) as total_trades,
+                 SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins,
+                 SUM(CASE WHEN pnl_usd <= 0 THEN 1 ELSE 0 END) as losses,
+                 COALESCE(SUM(pnl_usd), 0) as total_pnl_usd,
+                 COALESCE(AVG(pnl_pct), 0) as avg_pnl_pct,
+                 MAX(pnl_usd) as best_trade,
+                 MIN(pnl_usd) as worst_trade
+               FROM paper_trades
+               WHERE status != 'open'
+                 AND closed_at >= datetime('now', ?)""",
+            (f"-{days} days",),
+        )
+        row = await cursor.fetchone()
+        total = row[0] or 0
+        wins = row[1] or 0
+
+        # Open positions count
+        cursor2 = await db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(amount_usd), 0) FROM paper_trades WHERE status = 'open'"
+        )
+        open_row = await cursor2.fetchone()
+
+        return {
+            "total_trades": total,
+            "wins": wins,
+            "losses": row[2] or 0,
+            "total_pnl_usd": round(row[3] or 0, 2),
+            "avg_pnl_pct": round(row[4] or 0, 2),
+            "best_trade": row[5],
+            "worst_trade": row[6],
+            "win_rate_pct": round((wins / total) * 100, 1) if total > 0 else 0,
+            "open_positions": open_row[0] or 0,
+            "open_exposure": round(open_row[1] or 0, 2),
+        }
+
+
+async def get_trading_stats_by_signal(db_path: str, days: int = 7) -> dict:
+    """Paper trading PnL breakdown by signal type."""
+    async with _ro_db(db_path) as db:
+        cursor = await db.execute(
+            """SELECT signal_type,
+                 COUNT(*) as trades,
+                 COALESCE(SUM(pnl_usd), 0) as pnl,
+                 SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins
+               FROM paper_trades
+               WHERE status != 'open'
+                 AND closed_at >= datetime('now', ?)
+               GROUP BY signal_type""",
+            (f"-{days} days",),
+        )
+        rows = await cursor.fetchall()
+        result = {}
+        for row in rows:
+            total = row[1]
+            w = row[3] or 0
+            result[row[0]] = {
+                "trades": total,
+                "pnl": round(row[2], 2),
+                "win_rate": round((w / total) * 100, 1) if total > 0 else 0,
+            }
+        return result

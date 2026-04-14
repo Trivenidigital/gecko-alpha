@@ -457,6 +457,69 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_gainers_comp
                 ON gainers_comparisons(coin_id);
+
+            CREATE TABLE IF NOT EXISTS paper_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                chain TEXT NOT NULL,
+                signal_type TEXT NOT NULL,
+                signal_data TEXT NOT NULL,
+
+                entry_price REAL NOT NULL,
+                amount_usd REAL NOT NULL,
+                quantity REAL NOT NULL,
+
+                tp_pct REAL NOT NULL DEFAULT 20.0,
+                sl_pct REAL NOT NULL DEFAULT 10.0,
+                tp_price REAL NOT NULL,
+                sl_price REAL NOT NULL,
+
+                status TEXT NOT NULL DEFAULT 'open',
+
+                exit_price REAL,
+                exit_reason TEXT,
+                pnl_usd REAL,
+                pnl_pct REAL,
+
+                checkpoint_1h_price REAL,
+                checkpoint_1h_pct REAL,
+                checkpoint_6h_price REAL,
+                checkpoint_6h_pct REAL,
+                checkpoint_24h_price REAL,
+                checkpoint_24h_pct REAL,
+                checkpoint_48h_price REAL,
+                checkpoint_48h_pct REAL,
+
+                peak_price REAL,
+                peak_pct REAL,
+
+                opened_at TEXT NOT NULL,
+                closed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+                UNIQUE(token_id, signal_type, opened_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status);
+            CREATE INDEX IF NOT EXISTS idx_paper_trades_opened ON paper_trades(opened_at);
+            CREATE INDEX IF NOT EXISTS idx_paper_trades_signal ON paper_trades(signal_type);
+
+            CREATE TABLE IF NOT EXISTS paper_daily_summary (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL UNIQUE,
+                trades_opened INTEGER NOT NULL DEFAULT 0,
+                trades_closed INTEGER NOT NULL DEFAULT 0,
+                wins INTEGER NOT NULL DEFAULT 0,
+                losses INTEGER NOT NULL DEFAULT 0,
+                total_pnl_usd REAL NOT NULL DEFAULT 0,
+                best_trade_pnl REAL,
+                worst_trade_pnl REAL,
+                avg_pnl_pct REAL,
+                win_rate_pct REAL,
+                by_signal_type TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             """
         )
 

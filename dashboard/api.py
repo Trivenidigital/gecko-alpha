@@ -152,6 +152,31 @@ def create_app(db_path: str | None = None) -> FastAPI:
         """High-quality signals -- curated, enriched, filtered."""
         return await db.get_quality_signals(_db_path, max_mcap=max_mcap, limit=limit)
 
+    # --- Paper trading endpoints ---
+
+    @app.get("/api/trading/positions")
+    async def get_trading_positions_endpoint():
+        return await db.get_trading_positions(_db_path)
+
+    @app.get("/api/trading/history")
+    async def get_trading_history_endpoint(
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ):
+        return await db.get_trading_history(_db_path, limit=limit, offset=offset)
+
+    @app.get("/api/trading/stats")
+    async def get_trading_stats_endpoint(
+        days: int = Query(7, ge=1, le=365),
+    ):
+        return await db.get_trading_stats(_db_path, days=days)
+
+    @app.get("/api/trading/stats/by-signal")
+    async def get_trading_stats_by_signal_endpoint(
+        days: int = Query(7, ge=1, le=365),
+    ):
+        return await db.get_trading_stats_by_signal(_db_path, days=days)
+
     # --- Preferences endpoints ---
 
     @app.get("/api/preferences/categories")

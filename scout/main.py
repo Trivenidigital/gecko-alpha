@@ -211,6 +211,7 @@ async def run_cycle(
     db: Database,
     session: aiohttp.ClientSession,
     dry_run: bool = False,
+    trading_engine=None,
 ) -> dict:
     """Run one full pipeline cycle.
 
@@ -260,6 +261,22 @@ async def run_cycle(
             )
             if spikes:
                 logger.info("volume_spikes_detected", count=len(spikes))
+                if trading_engine:
+                    for spike in spikes:
+                        try:
+                            await trading_engine.open_trade(
+                                token_id=spike["coin_id"],
+                                chain="coingecko",
+                                signal_type="volume_spike",
+                                signal_data={
+                                    "spike_ratio": spike.get("spike_ratio", 0)
+                                },
+                            )
+                        except Exception:
+                            logger.exception(
+                                "trading_open_spike_error",
+                                coin_id=spike.get("coin_id"),
+                            )
         except Exception:
             logger.exception("volume_spike_error")
 
@@ -489,6 +506,7 @@ async def narrative_agent_loop(
     session: aiohttp.ClientSession,
     settings: Settings,
     db: Database,
+    trading_engine=None,
 ) -> None:
     """Run the narrative rotation agent as a long-lived background loop.
 
@@ -900,6 +918,26 @@ async def narrative_agent_loop(
                             control=len(control_laggards),
                         )
 
+                        # Open paper trades for narrative predictions
+                        if trading_engine and prediction_models:
+                            for pred in prediction_models:
+                                if not pred.is_control:
+                                    try:
+                                        await trading_engine.open_trade(
+                                            token_id=pred.coin_id,
+                                            chain="coingecko",
+                                            signal_type="narrative_prediction",
+                                            signal_data={
+                                                "fit": pred.narrative_fit_score,
+                                                "category": pred.category_name,
+                                            },
+                                        )
+                                    except Exception:
+                                        logger.exception(
+                                            "trading_open_narrative_error",
+                                            coin_id=pred.coin_id,
+                                        )
+
                     # Send alert if enabled and matches user preferences
                     if narrative_alert_enabled and prediction_models:
                         if should_alert_category(accel.category_id, strategy):
@@ -949,6 +987,16 @@ async def narrative_agent_loop(
                 except Exception:
                     logger.exception("narrative.eval_error")
 
+                # Evaluate paper trades (TP/SL/checkpoints)
+                if trading_engine:
+                    try:
+                        from scout.trading.evaluator import evaluate_paper_trades
+
+                        await evaluate_paper_trades(db, settings)
+                        logger.info("trading.eval_complete")
+                    except Exception:
+                        logger.exception("trading.eval_error")
+
                 # Trending comparison (piggybacks on EVALUATE interval)
                 if settings.TRENDING_SNAPSHOT_ENABLED:
                     try:
@@ -987,6 +1035,24 @@ async def narrative_agent_loop(
                     logger.info("narrative.daily_learn_complete")
                 except Exception:
                     logger.exception("narrative.daily_learn_error")
+
+                # Paper trading daily digest
+                if trading_engine:
+                    try:
+                        from scout.trading.digest import build_paper_digest
+
+                        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                        digest_text = await build_paper_digest(db, today)
+                        if digest_text:
+                            try:
+                                await send_telegram_message(
+                                    digest_text, session, settings
+                                )
+                            except Exception:
+                                logger.exception("trading_digest_send_error")
+                        logger.info("trading.digest_complete", date=today)
+                    except Exception:
+                        logger.exception("trading_digest_error")
 
             # ----------------------------------------------------------
             # LEARN weekly (gated by weekday + hour + 6.9-day gap)
@@ -1062,6 +1128,19 @@ async def main() -> None:
     db = Database(settings.DB_PATH)
     await db.initialize()
 
+    # Paper trading engine
+    from scout.trading.engine import TradingEngine
+
+    trading_engine = None
+    if settings.TRADING_ENABLED:
+        trading_engine = TradingEngine(
+            mode=settings.TRADING_MODE, db=db, settings=settings
+        )
+        logger.info(
+            "trading_engine_initialized",
+            mode=settings.TRADING_MODE,
+        )
+
     shutdown_event = asyncio.Event()
 
     def _shutdown(sig, frame):
@@ -1091,7 +1170,8 @@ async def main() -> None:
                 while not shutdown_event.is_set():
                     try:
                         stats = await run_cycle(
-                            settings, db, session, dry_run=args.dry_run
+                            settings, db, session, dry_run=args.dry_run,
+                            trading_engine=trading_engine,
                         )
                         logger.info("Cycle complete", **stats)
                         _heartbeat_stats["tokens_scanned"] += stats.get("tokens_scanned", 0)
@@ -1176,7 +1256,9 @@ async def main() -> None:
             ]
             if settings.NARRATIVE_ENABLED:
                 tasks.append(
-                    asyncio.create_task(narrative_agent_loop(session, settings, db))
+                    asyncio.create_task(
+                        narrative_agent_loop(session, settings, db, trading_engine)
+                    )
                 )
             if settings.SECONDWAVE_ENABLED:
                 from scout.secondwave.detector import secondwave_loop
