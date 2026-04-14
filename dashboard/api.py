@@ -142,6 +142,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
             _db_path, category_id=category_id, hours=hours
         )
 
+    # --- Quality signals endpoint ---
+
+    @app.get("/api/signals/quality")
+    async def get_quality_signals(
+        max_mcap: float = Query(200_000_000, ge=0),
+        limit: int = Query(30, ge=1, le=200),
+    ):
+        """High-quality signals -- curated, enriched, filtered."""
+        return await db.get_quality_signals(_db_path, max_mcap=max_mcap, limit=limit)
+
     # --- Preferences endpoints ---
 
     @app.get("/api/preferences/categories")

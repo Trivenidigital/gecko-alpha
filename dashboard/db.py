@@ -593,6 +593,121 @@ async def get_funnel(db_path: str) -> dict:
     }
 
 
+async def get_quality_signals(
+    db_path: str, max_mcap: float = 200_000_000, limit: int = 30
+) -> list[dict]:
+    """Curated, enriched signals from narrative predictions + pipeline candidates + category heating."""
+    per_source = max(limit // 2, 10)
+
+    async with _ro_db(db_path) as conn:
+        # 1. Narrative predictions (highest quality -- Claude scored)
+        narrative = []
+        try:
+            cursor = await conn.execute(
+                """SELECT
+                       'narrative_prediction' as signal_type,
+                       p.coin_id              as token_id,
+                       p.symbol,
+                       p.name                 as token_name,
+                       p.category_name,
+                       p.market_cap_at_prediction as market_cap,
+                       p.narrative_fit_score,
+                       p.counter_risk_score,
+                       p.counter_argument,
+                       p.confidence,
+                       p.market_regime,
+                       p.watchlist_users,
+                       p.predicted_at         as detected_at,
+                       p.outcome_class,
+                       COALESCE(p.narrative_fit_score, 0)
+                           - COALESCE(p.counter_risk_score, 0) * 0.5
+                           as quality_score
+                   FROM predictions p
+                   WHERE p.is_control = 0
+                     AND p.market_cap_at_prediction < ?
+                   ORDER BY p.predicted_at DESC
+                   LIMIT ?""",
+                (max_mcap, per_source),
+            )
+            narrative = [dict(r) for r in await cursor.fetchall()]
+        except Exception:
+            pass
+
+        # 2. Pipeline candidates with real signals (quant_score > 15, mcap > 0)
+        pipeline = []
+        try:
+            cursor = await conn.execute(
+                """SELECT
+                       'pipeline_candidate' as signal_type,
+                       c.contract_address    as token_id,
+                       c.ticker              as symbol,
+                       c.token_name,
+                       NULL                  as category_name,
+                       c.market_cap_usd      as market_cap,
+                       NULL                  as narrative_fit_score,
+                       c.counter_risk_score,
+                       c.counter_argument,
+                       NULL                  as confidence,
+                       NULL                  as market_regime,
+                       NULL                  as watchlist_users,
+                       c.first_seen_at       as detected_at,
+                       NULL                  as outcome_class,
+                       c.quant_score         as quality_score
+                   FROM candidates c
+                   WHERE c.quant_score > 15
+                     AND c.market_cap_usd > 0
+                     AND c.market_cap_usd < ?
+                   ORDER BY c.first_seen_at DESC
+                   LIMIT ?""",
+                (max_mcap, per_source),
+            )
+            pipeline = [dict(r) for r in await cursor.fetchall()]
+        except Exception:
+            pass
+
+        # 3. Category heating signals
+        heating = []
+        try:
+            cursor = await conn.execute(
+                """SELECT
+                       'category_heating'    as signal_type,
+                       ns.category_id        as token_id,
+                       NULL                  as symbol,
+                       ns.category_name      as token_name,
+                       ns.category_name      as category_name,
+                       NULL                  as market_cap,
+                       NULL                  as narrative_fit_score,
+                       NULL                  as counter_risk_score,
+                       NULL                  as counter_argument,
+                       NULL                  as confidence,
+                       NULL                  as market_regime,
+                       NULL                  as watchlist_users,
+                       ns.detected_at,
+                       NULL                  as outcome_class,
+                       ns.acceleration        as quality_score
+                   FROM narrative_signals ns
+                   ORDER BY ns.detected_at DESC
+                   LIMIT 10"""
+            )
+            heating = [dict(r) for r in await cursor.fetchall()]
+        except Exception:
+            pass
+
+    # Merge, compute tiers, sort by quality_score desc
+    merged = narrative + pipeline + heating
+    for row in merged:
+        qs = row.get("quality_score") or 0
+        if qs > 60:
+            row["quality_tier"] = "high"
+        elif qs > 30:
+            row["quality_tier"] = "medium"
+        else:
+            row["quality_tier"] = "low"
+
+    merged.sort(key=lambda r: (r.get("quality_score") or 0), reverse=True)
+    return merged[:limit]
+
+
 async def get_available_categories(db_path: str) -> list[dict]:
     """Return distinct categories from recent snapshots (last 24h)."""
     async with _ro_db(db_path) as conn:
