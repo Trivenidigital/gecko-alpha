@@ -594,7 +594,7 @@ async def get_funnel(db_path: str) -> dict:
 
 
 async def get_quality_signals(
-    db_path: str, max_mcap: float = 200_000_000, limit: int = 30
+    db_path: str, max_mcap: float = 500_000_000, limit: int = 30
 ) -> list[dict]:
     """Curated, enriched signals from narrative predictions + pipeline candidates + category heating."""
     per_source = max(limit // 2, 10)
