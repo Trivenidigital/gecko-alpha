@@ -1,4 +1,1 @@
-HEAD is now at 5fb058c fix(dashboard): filter out zero-score candidate_scored noise from Recent Signals
-From https://github.com/Trivenidigital/gecko-alpha
-   81d430a..5fb058c  master     -> origin/master
-OK
+TABLES CREATED

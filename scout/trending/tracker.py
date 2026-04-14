@@ -13,8 +13,17 @@ from scout.trending.models import TrendingComparison, TrendingSnapshot, Trending
 
 if TYPE_CHECKING:
     from scout.db import Database
+    from scout.models import CandidateToken
 
 logger = structlog.get_logger(__name__)
+
+
+def _parse_dt(s: str) -> datetime:
+    """Parse ISO datetime string, ensure timezone-aware (UTC default)."""
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 async def fetch_and_store_trending(
@@ -77,6 +86,53 @@ async def fetch_and_store_trending(
     return snapshots
 
 
+async def store_trending_from_candidates(
+    db: "Database",
+    candidates: "list[CandidateToken]",
+) -> list[TrendingSnapshot]:
+    """Store trending snapshots from already-fetched CandidateToken list.
+
+    This avoids a duplicate /search/trending API call when the main pipeline
+    has already fetched trending data via ``cg_fetch_trending``.
+    """
+    now = datetime.now(timezone.utc)
+    snapshots: list[TrendingSnapshot] = []
+
+    for token in candidates:
+        if not token.contract_address or token.contract_address == "unknown":
+            continue
+
+        snap = TrendingSnapshot(
+            coin_id=token.contract_address,  # CoinGecko slug stored here
+            symbol=token.ticker,
+            name=token.token_name,
+            market_cap_rank=None,
+            trending_score=float(token.cg_trending_rank) if token.cg_trending_rank else None,
+            snapshot_at=now,
+        )
+        snapshots.append(snap)
+
+    if snapshots and db._conn is not None:
+        for snap in snapshots:
+            await db._conn.execute(
+                """INSERT INTO trending_snapshots
+                   (coin_id, symbol, name, market_cap_rank, trending_score, snapshot_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    snap.coin_id,
+                    snap.symbol,
+                    snap.name,
+                    snap.market_cap_rank,
+                    snap.trending_score,
+                    snap.snapshot_at.isoformat(),
+                ),
+            )
+        await db._conn.commit()
+        logger.info("trending_tracker.stored_from_candidates", count=len(snapshots))
+
+    return snapshots
+
+
 async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
     """For each token that appeared on trending in the last 24h, check if
     our system detected it earlier.
@@ -105,7 +161,7 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
         symbol = row[1]
         name = row[2]
         first_trending_at_str = row[3]
-        first_trending_at = datetime.fromisoformat(first_trending_at_str)
+        first_trending_at = _parse_dt(first_trending_at_str)
 
         comp = TrendingComparison(
             coin_id=coin_id,
@@ -123,7 +179,7 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
         )
         pred_row = await cursor.fetchone()
         if pred_row and pred_row[0]:
-            pred_at = datetime.fromisoformat(pred_row[0])
+            pred_at = _parse_dt(pred_row[0])
             lead = (first_trending_at - pred_at).total_seconds() / 60.0
             comp.detected_by_narrative = True
             comp.narrative_detected_at = pred_at
@@ -139,7 +195,7 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
         )
         cand_row = await cursor.fetchone()
         if cand_row and cand_row[0]:
-            cand_at = datetime.fromisoformat(cand_row[0])
+            cand_at = _parse_dt(cand_row[0])
             lead = (first_trending_at - cand_at).total_seconds() / 60.0
             comp.detected_by_pipeline = True
             comp.pipeline_detected_at = cand_at
@@ -147,15 +203,19 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
             comp.is_gap = False
 
         # 2c. Check signal_events table (chain signals)
+        # Match on coin_id (CoinGecko slug) exactly, or symbol via LIKE prefix
+        # to handle cases like token_id="bless" matching coin_id="bless-network"
         cursor = await db._conn.execute(
             """SELECT MIN(created_at) FROM signal_events
-               WHERE (token_id = ? OR LOWER(token_id) = LOWER(?))
+               WHERE (token_id = ? OR LOWER(token_id) = LOWER(?)
+                      OR LOWER(token_id) LIKE LOWER(? || '%')
+                      OR LOWER(?) LIKE LOWER(token_id || '%'))
                  AND created_at < ?""",
-            (coin_id, symbol, first_trending_at_str),
+            (coin_id, symbol, symbol, coin_id, first_trending_at_str),
         )
         sig_row = await cursor.fetchone()
         if sig_row and sig_row[0]:
-            sig_at = datetime.fromisoformat(sig_row[0])
+            sig_at = _parse_dt(sig_row[0])
             lead = (first_trending_at - sig_at).total_seconds() / 60.0
             comp.detected_by_chains = True
             comp.chains_detected_at = sig_at

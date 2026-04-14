@@ -52,6 +52,7 @@ from scout.preferences.matcher import should_alert_category, should_alert_token
 from scout.trending.tracker import (
     compare_with_signals as trending_compare,
     fetch_and_store_trending,
+    store_trending_from_candidates,
 )
 from scout.counter.detail import fetch_coin_detail, extract_counter_data
 from scout.counter.flags import compute_narrative_flags, compute_memecoin_flags
@@ -496,11 +497,11 @@ async def narrative_agent_loop(
             await store_snapshot(db, snapshots)
 
             # Trending snapshot (gated by TRENDING_SNAPSHOT_ENABLED)
+            # Reuse cg_trending data already fetched in Stage 1 ingestion
+            # to avoid a duplicate /search/trending API call.
             if settings.TRENDING_SNAPSHOT_ENABLED:
                 try:
-                    await fetch_and_store_trending(
-                        session, db, api_key=settings.COINGECKO_API_KEY
-                    )
+                    await store_trending_from_candidates(db, cg_trending)
                 except Exception:
                     logger.exception("trending_tracker.snapshot_error")
 

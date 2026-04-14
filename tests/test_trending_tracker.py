@@ -9,12 +9,15 @@ from aioresponses import aioresponses
 
 from scout.db import Database
 from scout.ratelimit import coingecko_limiter
+from scout.models import CandidateToken
 from scout.trending.tracker import (
+    _parse_dt,
     compare_with_signals,
     fetch_and_store_trending,
     get_recent_comparisons,
     get_recent_snapshots,
     get_trending_stats,
+    store_trending_from_candidates,
 )
 
 CG_TRENDING_URL = re.compile(r"https://api\.coingecko\.com/api/v3/search/trending")
@@ -373,3 +376,103 @@ async def test_recent_comparisons(db):
     results = await get_recent_comparisons(db, limit=10)
     assert len(results) == 2
     assert results[0]["coin_id"] == "coin-0"
+
+
+# ---------------------------------------------------------------------------
+# store_trending_from_candidates
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_store_trending_from_candidates(db):
+    """Stores snapshots from CandidateToken list without an API call."""
+    candidates = [
+        CandidateToken(
+            contract_address="bless-network",
+            chain="coingecko",
+            token_name="Bless Network",
+            ticker="BLESS",
+            cg_trending_rank=1,
+            holder_count=0,
+            holder_growth_1h=0,
+        ),
+        CandidateToken(
+            contract_address="pepe-coin",
+            chain="coingecko",
+            token_name="Pepe",
+            ticker="PEPE",
+            cg_trending_rank=2,
+            holder_count=0,
+            holder_growth_1h=0,
+        ),
+    ]
+
+    snapshots = await store_trending_from_candidates(db, candidates)
+    assert len(snapshots) == 2
+    assert snapshots[0].coin_id == "bless-network"
+    assert snapshots[0].symbol == "BLESS"
+    assert snapshots[0].trending_score == 1.0
+    assert snapshots[1].trending_score == 2.0
+
+    cursor = await db._conn.execute("SELECT COUNT(*) FROM trending_snapshots")
+    count = (await cursor.fetchone())[0]
+    assert count == 2
+
+
+@pytest.mark.asyncio
+async def test_store_trending_from_candidates_empty(db):
+    """Empty candidate list stores nothing."""
+    snapshots = await store_trending_from_candidates(db, [])
+    assert snapshots == []
+
+
+# ---------------------------------------------------------------------------
+# _parse_dt timezone handling
+# ---------------------------------------------------------------------------
+
+
+def test_parse_dt_naive_gets_utc():
+    """Naive datetime string gets UTC timezone."""
+    dt = _parse_dt("2024-01-15T10:30:00")
+    assert dt.tzinfo is not None
+    assert dt.tzinfo == timezone.utc
+
+
+def test_parse_dt_aware_preserved():
+    """Aware datetime string keeps its timezone."""
+    dt = _parse_dt("2024-01-15T10:30:00+00:00")
+    assert dt.tzinfo is not None
+
+
+# ---------------------------------------------------------------------------
+# compare_with_signals: LIKE prefix matching for signal_events
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compare_signal_events_like_matching(db):
+    """Signal event with symbol 'bless' matches trending coin 'bless-network'."""
+    now = datetime.now(timezone.utc)
+    earlier = now - timedelta(hours=1)
+
+    # Signal event stored with symbol (short form)
+    await db._conn.execute(
+        """INSERT INTO signal_events
+           (token_id, pipeline, event_type, event_data, source_module, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        ("bless", "memecoin", "candidate_scored", '{}', "scorer", earlier.isoformat()),
+    )
+
+    # Trending snapshot uses CoinGecko slug (long form)
+    await db._conn.execute(
+        "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
+        ("bless-network", "BLESS", "Bless Network", now.isoformat()),
+    )
+    await db._conn.commit()
+
+    comparisons = await compare_with_signals(db)
+    assert len(comparisons) == 1
+    comp = comparisons[0]
+    assert comp.detected_by_chains is True
+    assert comp.chains_lead_minutes > 0
+    assert comp.is_gap is False
