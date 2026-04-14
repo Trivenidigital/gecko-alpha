@@ -48,6 +48,10 @@ from scout.narrative.predictor import (
     store_predictions,
 )
 from scout.narrative.strategy import Strategy
+from scout.trending.tracker import (
+    compare_with_signals as trending_compare,
+    fetch_and_store_trending,
+)
 from scout.counter.detail import fetch_coin_detail, extract_counter_data
 from scout.counter.flags import compute_narrative_flags, compute_memecoin_flags
 from scout.counter.scorer import score_counter_narrative, score_counter_memecoin
@@ -490,6 +494,15 @@ async def narrative_agent_loop(
             snapshots = parse_category_response(raw_categories, market_regime)
             await store_snapshot(db, snapshots)
 
+            # Trending snapshot (gated by TRENDING_SNAPSHOT_ENABLED)
+            if settings.TRENDING_SNAPSHOT_ENABLED:
+                try:
+                    await fetch_and_store_trending(
+                        session, db, api_key=settings.COINGECKO_API_KEY
+                    )
+                except Exception:
+                    logger.exception("trending_tracker.snapshot_error")
+
             # Load 6-hour-ago snapshots for acceleration comparison
             six_hours_ago = now - timedelta(hours=6)
             prev_snapshots = await load_snapshots_at(db, six_hours_ago)
@@ -868,6 +881,14 @@ async def narrative_agent_loop(
                     logger.info("narrative.eval_complete")
                 except Exception:
                     logger.exception("narrative.eval_error")
+
+                # Trending comparison (piggybacks on EVALUATE interval)
+                if settings.TRENDING_SNAPSHOT_ENABLED:
+                    try:
+                        await trending_compare(db)
+                        logger.info("trending_tracker.compare_complete")
+                    except Exception:
+                        logger.exception("trending_tracker.compare_error")
 
             # ----------------------------------------------------------
             # LEARN daily (gated by hour + 23h gap)

@@ -540,6 +540,8 @@ async def get_system_health(db_path: str) -> dict:
         ("active_chains", "last_step_time"),
         ("chain_matches", "completed_at"),
         ("chain_patterns", "created_at"),
+        ("trending_snapshots", "snapshot_at"),
+        ("trending_comparisons", "created_at"),
         ("candidates", "first_seen_at"),
         ("alerts", "alerted_at"),
         ("learn_logs", "created_at"),
