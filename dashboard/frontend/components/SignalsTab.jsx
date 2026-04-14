@@ -74,19 +74,31 @@ export default function SignalsTab() {
   const [heating, setHeating] = useState([])
   const [predictions, setPredictions] = useState([])
   const [expandedPred, setExpandedPred] = useState(null)
+  const [spikes, setSpikes] = useState([])
+  const [spikeStats, setSpikeStats] = useState(null)
+  const [gainersComps, setGainersComps] = useState([])
+  const [gainersStats, setGainersStats] = useState(null)
 
   const fetchAll = useCallback(async () => {
     try {
-      const [compRes, statsRes, heatRes, predRes] = await Promise.all([
+      const [compRes, statsRes, heatRes, predRes, spkRes, spkStatsRes, gnrRes, gnrStatsRes] = await Promise.all([
         fetch('/api/trending/comparisons-enriched?limit=30'),
         fetch('/api/trending/stats'),
         fetch('/api/narrative/heating'),
         fetch('/api/narrative/predictions?limit=20'),
+        fetch('/api/spikes/recent?limit=15'),
+        fetch('/api/spikes/stats'),
+        fetch('/api/gainers/comparisons?limit=30'),
+        fetch('/api/gainers/stats'),
       ])
       if (compRes.ok) setComparisons(await compRes.json())
       if (statsRes.ok) setTrendingStats(await statsRes.json())
       if (heatRes.ok) setHeating(await heatRes.json())
       if (predRes.ok) setPredictions((await predRes.json()).filter(p => !p.is_control))
+      if (spkRes.ok) setSpikes(await spkRes.json())
+      if (spkStatsRes.ok) setSpikeStats(await spkStatsRes.json())
+      if (gnrRes.ok) setGainersComps(await gnrRes.json())
+      if (gnrStatsRes.ok) setGainersStats(await gnrStatsRes.json())
     } catch {
       // API not available yet
     }
@@ -283,7 +295,173 @@ export default function SignalsTab() {
         )}
       </div>
 
-      {/* ── Section C: Latest Predictions ── */}
+      {/* ── Section C: Volume Spikes ── */}
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
+            Volume Spikes
+          </span>
+          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
+            Tokens with volume surges vs 7-day average
+          </span>
+        </div>
+
+        {spikeStats && (
+          <div style={{
+            display: 'flex', gap: 24, padding: '12px 16px',
+            borderBottom: '1px solid var(--color-border)', flexWrap: 'wrap',
+          }}>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Today</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--color-accent-amber)' }}>{spikeStats.spikes_today}</div>
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>This Week</div>
+              <div style={{ fontSize: 22, fontWeight: 700 }}>{spikeStats.spikes_this_week}</div>
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Avg Ratio</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--color-accent-green)' }}>{spikeStats.avg_spike_ratio}x</div>
+            </div>
+          </div>
+        )}
+
+        {spikes.length === 0 ? (
+          <div className="empty-state">No volume spikes detected yet. The detector runs every cycle.</div>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table className="candidates-table">
+              <thead>
+                <tr>
+                  <th>Token</th>
+                  <th>Spike Ratio</th>
+                  <th>Volume</th>
+                  <th>Avg 7d</th>
+                  <th>MCap</th>
+                  <th>24h %</th>
+                  <th>Detected</th>
+                </tr>
+              </thead>
+              <tbody>
+                {spikes.map((s, i) => (
+                  <tr key={s.coin_id + '-' + i}>
+                    <td>
+                      <TokenLink tokenId={s.coin_id} symbol={s.symbol || s.name} chain="coingecko" />
+                    </td>
+                    <td style={{ fontWeight: 700, color: s.spike_ratio > 10 ? 'var(--color-accent-green)' : 'var(--color-accent-amber)' }}>
+                      {Number(s.spike_ratio).toFixed(1)}x
+                    </td>
+                    <td>{fmtNum(s.current_volume)}</td>
+                    <td>{fmtNum(s.avg_volume_7d)}</td>
+                    <td>{fmtNum(s.market_cap)}</td>
+                    <td style={{ fontWeight: 700 }}>
+                      {s.price_change_24h != null ? (
+                        <span style={{ color: s.price_change_24h > 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
+                          {s.price_change_24h > 0 ? '+' : ''}{Number(s.price_change_24h).toFixed(1)}%
+                        </span>
+                      ) : '-'}
+                    </td>
+                    <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>{fmtDate(s.detected_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* ── Section D: Top Gainers Tracker ── */}
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
+            Top Gainers Tracker
+          </span>
+          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
+            Tokens with 20%+ 24h gain -- did we catch them early?
+          </span>
+        </div>
+
+        {gainersStats && (
+          <div style={{
+            display: 'flex', gap: 24, padding: '12px 16px',
+            borderBottom: '1px solid var(--color-border)', flexWrap: 'wrap',
+          }}>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Gainers Hit Rate</div>
+              <div style={{
+                fontSize: 22, fontWeight: 700,
+                color: gainersStats.hit_rate_pct >= 50 ? 'var(--color-accent-green)' : 'var(--color-accent-amber)',
+              }}>
+                {gainersStats.caught}/{gainersStats.total_tracked} ({gainersStats.hit_rate_pct}%)
+              </div>
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Avg Lead</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--color-accent-green)' }}>
+                {gainersStats.avg_lead_minutes != null ? (gainersStats.avg_lead_minutes / 60).toFixed(1) + 'h' : '-'}
+              </div>
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Missed</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--color-accent-red, #ef5350)' }}>{gainersStats.missed}</div>
+            </div>
+          </div>
+        )}
+
+        {gainersComps.length === 0 ? (
+          <div className="empty-state">No gainers data yet. The tracker runs every cycle.</div>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table className="candidates-table">
+              <thead>
+                <tr>
+                  <th>Token</th>
+                  <th>24h %</th>
+                  <th>Lead Time</th>
+                  <th>Gained At</th>
+                  <th>Detected By</th>
+                </tr>
+              </thead>
+              <tbody>
+                {gainersComps.filter(c => !isMegaCap(c)).map((c, i) => {
+                  const leadMin = c.narrative_lead_minutes || c.pipeline_lead_minutes || c.chains_lead_minutes || c.spikes_lead_minutes || null
+                  const methods = []
+                  if (c.detected_by_narrative) methods.push('Narrative')
+                  if (c.detected_by_pipeline) methods.push('Pipeline')
+                  if (c.detected_by_chains) methods.push('Chains')
+                  if (c.detected_by_spikes) methods.push('Spikes')
+                  const detectedBy = methods.length > 0 ? methods.join(' + ') : (c.is_gap ? 'MISSED' : '-')
+                  return (
+                    <tr key={c.coin_id || i}>
+                      <td>
+                        <TokenLink tokenId={c.coin_id} symbol={c.symbol || c.name} chain="coingecko" />
+                      </td>
+                      <td style={{ fontWeight: 700 }}>
+                        {c.price_change_24h != null ? (
+                          <span style={{ color: 'var(--color-accent-green)' }}>
+                            +{Number(c.price_change_24h).toFixed(1)}%
+                          </span>
+                        ) : '-'}
+                      </td>
+                      <td>
+                        <span style={{ fontWeight: 700, color: leadTimeColor(leadMin) }}>
+                          {fmtLeadTime(leadMin)}
+                        </span>
+                      </td>
+                      <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
+                        {fmtDate(c.appeared_on_gainers_at)}
+                      </td>
+                      <td style={{ fontSize: 12 }}>{detectedBy}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* ── Section E: Latest Predictions ── */}
       <div className="panel" style={{ marginBottom: 16 }}>
         <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>

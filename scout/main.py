@@ -55,6 +55,11 @@ from scout.trending.tracker import (
     fetch_and_store_trending,
     store_trending_from_candidates,
 )
+from scout.spikes.detector import record_volume, detect_spikes
+from scout.gainers.tracker import (
+    store_top_gainers,
+    compare_gainers_with_signals,
+)
 from scout.counter.detail import fetch_coin_detail, extract_counter_data
 from scout.counter.flags import compute_narrative_flags, compute_memecoin_flags
 from scout.counter.scorer import score_counter_narrative, score_counter_memecoin
@@ -245,6 +250,29 @@ async def run_cycle(
             logger.info("price_cache_updated", count=cached)
         except Exception:
             logger.exception("price_cache_error")
+
+    # Volume Spike Detection (zero extra API calls -- uses cached data)
+    if settings.VOLUME_SPIKE_ENABLED and _cg_module.last_raw_markets:
+        try:
+            await record_volume(db, _cg_module.last_raw_markets)
+            spikes = await detect_spikes(
+                db, settings.VOLUME_SPIKE_RATIO, settings.VOLUME_SPIKE_MAX_MCAP
+            )
+            if spikes:
+                logger.info("volume_spikes_detected", count=len(spikes))
+        except Exception:
+            logger.exception("volume_spike_error")
+
+    # Top Gainers Tracker (zero extra API calls -- uses cached data)
+    if settings.GAINERS_TRACKER_ENABLED and _cg_module.last_raw_markets:
+        try:
+            await store_top_gainers(
+                db, _cg_module.last_raw_markets,
+                min_change=settings.GAINERS_MIN_CHANGE,
+                max_mcap=settings.GAINERS_MAX_MCAP,
+            )
+        except Exception:
+            logger.exception("gainers_tracker_error")
 
     # Stage 2: Aggregate
     all_candidates = aggregate(
@@ -928,6 +956,14 @@ async def narrative_agent_loop(
                         logger.info("trending_tracker.compare_complete")
                     except Exception:
                         logger.exception("trending_tracker.compare_error")
+
+                # Gainers comparison (piggybacks on EVALUATE interval)
+                if settings.GAINERS_TRACKER_ENABLED:
+                    try:
+                        await compare_gainers_with_signals(db)
+                        logger.info("gainers_tracker.compare_complete")
+                    except Exception:
+                        logger.exception("gainers_tracker.compare_error")
 
             # ----------------------------------------------------------
             # LEARN daily (gated by hour + 23h gap)

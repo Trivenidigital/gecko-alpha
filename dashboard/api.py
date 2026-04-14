@@ -316,6 +316,70 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         return comparisons
 
+    # --- Volume Spikes endpoints ---
+
+    @app.get("/api/spikes/recent")
+    async def spikes_recent(limit: int = Query(20, ge=1, le=200)):
+        """Recent volume spikes."""
+        from scout.db import Database as ScoutDatabase
+        from scout.spikes.detector import get_recent_spikes
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            return await get_recent_spikes(sdb, limit=limit)
+        finally:
+            await sdb.close()
+
+    @app.get("/api/spikes/stats")
+    async def spikes_stats():
+        """Spike detection stats."""
+        from scout.db import Database as ScoutDatabase
+        from scout.spikes.detector import get_spike_stats
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            return await get_spike_stats(sdb)
+        finally:
+            await sdb.close()
+
+    # --- Top Gainers Tracker endpoints ---
+
+    @app.get("/api/gainers/snapshots")
+    async def gainers_snapshots(limit: int = Query(20, ge=1, le=200)):
+        """Recent top gainers snapshots."""
+        from scout.db import Database as ScoutDatabase
+        from scout.gainers.tracker import get_recent_gainers
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            return await get_recent_gainers(sdb, limit=limit)
+        finally:
+            await sdb.close()
+
+    @app.get("/api/gainers/comparisons")
+    async def gainers_comparisons(limit: int = Query(50, ge=1, le=500)):
+        """Gainers comparisons with signal detection."""
+        from scout.db import Database as ScoutDatabase
+        from scout.gainers.tracker import get_gainers_comparisons
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            return await get_gainers_comparisons(sdb, limit=limit)
+        finally:
+            await sdb.close()
+
+    @app.get("/api/gainers/stats")
+    async def gainers_stats():
+        """Gainers tracker hit rate stats."""
+        from scout.db import Database as ScoutDatabase
+        from scout.gainers.tracker import get_gainers_stats
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            return await get_gainers_stats(sdb)
+        finally:
+            await sdb.close()
+
     # --- System health endpoint ---
 
     @app.get("/api/system/health")

@@ -391,6 +391,72 @@ class Database:
                 market_cap       REAL,
                 updated_at       TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS volume_history_cg (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                volume_24h REAL NOT NULL,
+                market_cap REAL,
+                price REAL,
+                recorded_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_vol_hist_cg
+                ON volume_history_cg(coin_id, recorded_at);
+
+            CREATE TABLE IF NOT EXISTS volume_spikes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                current_volume REAL NOT NULL,
+                avg_volume_7d REAL NOT NULL,
+                spike_ratio REAL NOT NULL,
+                market_cap REAL,
+                price REAL,
+                price_change_24h REAL,
+                detected_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_vol_spikes
+                ON volume_spikes(coin_id, detected_at);
+
+            CREATE TABLE IF NOT EXISTS gainers_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                price_change_24h REAL NOT NULL,
+                market_cap REAL,
+                volume_24h REAL,
+                snapshot_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_gainers_snap
+                ON gainers_snapshots(coin_id, snapshot_at);
+
+            CREATE TABLE IF NOT EXISTS gainers_comparisons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                price_change_24h REAL,
+                appeared_on_gainers_at TEXT NOT NULL,
+                detected_by_narrative INTEGER DEFAULT 0,
+                narrative_lead_minutes REAL,
+                detected_by_pipeline INTEGER DEFAULT 0,
+                pipeline_lead_minutes REAL,
+                detected_by_chains INTEGER DEFAULT 0,
+                chains_lead_minutes REAL,
+                detected_by_spikes INTEGER DEFAULT 0,
+                spikes_lead_minutes REAL,
+                is_gap INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_gainers_comp
+                ON gainers_comparisons(coin_id);
             """
         )
 
