@@ -78,7 +78,7 @@ export default function SignalsTab() {
   const fetchAll = useCallback(async () => {
     try {
       const [compRes, statsRes, heatRes, predRes] = await Promise.all([
-        fetch('/api/trending/comparisons?limit=30'),
+        fetch('/api/trending/comparisons-enriched?limit=30'),
         fetch('/api/trending/stats'),
         fetch('/api/narrative/heating'),
         fetch('/api/narrative/predictions?limit=20'),
@@ -162,6 +162,7 @@ export default function SignalsTab() {
               <thead>
                 <tr>
                   <th>Token</th>
+                  <th>24h %</th>
                   <th>Lead Time</th>
                   <th>Trended At</th>
                   <th>Detected By</th>
@@ -186,6 +187,13 @@ export default function SignalsTab() {
                           symbol={c.symbol || c.name}
                           chain="coingecko"
                         />
+                      </td>
+                      <td style={{ fontWeight: 700 }}>
+                        {c.price_change_24h != null ? (
+                          <span style={{ color: c.price_change_24h > 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
+                            {c.price_change_24h > 0 ? '+' : ''}{Number(c.price_change_24h).toFixed(1)}%
+                          </span>
+                        ) : '-'}
                       </td>
                       <td>
                         <span style={{

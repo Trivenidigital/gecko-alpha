@@ -249,6 +249,57 @@ def create_app(db_path: str | None = None) -> FastAPI:
         finally:
             await sdb.close()
 
+    @app.get("/api/trending/comparisons-enriched")
+    async def trending_comparisons_enriched(limit: int = Query(30, ge=1, le=500)):
+        """Trending comparisons enriched with current CoinGecko prices."""
+        import aiohttp as _aiohttp
+
+        from scout.db import Database as ScoutDatabase
+        from scout.trending.tracker import get_recent_comparisons
+
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            comparisons = await get_recent_comparisons(sdb, limit=limit)
+        finally:
+            await sdb.close()
+
+        if not comparisons:
+            return comparisons
+
+        # Collect CoinGecko coin IDs
+        coin_ids = [c["coin_id"] for c in comparisons if c.get("coin_id")]
+        if not coin_ids:
+            return comparisons
+
+        ids_param = ",".join(coin_ids)
+        prices: dict = {}
+        try:
+            async with _aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://api.coingecko.com/api/v3/simple/price",
+                    params={
+                        "ids": ids_param,
+                        "vs_currencies": "usd",
+                        "include_24hr_change": "true",
+                    },
+                ) as resp:
+                    if resp.status == 200:
+                        prices = await resp.json()
+        except Exception:
+            pass  # Degrade gracefully — columns will show '-'
+
+        for c in comparisons:
+            cid = c.get("coin_id", "")
+            if cid in prices:
+                c["price_current"] = prices[cid].get("usd")
+                c["price_change_24h"] = prices[cid].get("usd_24h_change")
+            else:
+                c["price_current"] = None
+                c["price_change_24h"] = None
+
+        return comparisons
+
     # --- System health endpoint ---
 
     @app.get("/api/system/health")
