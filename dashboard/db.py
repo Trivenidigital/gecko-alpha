@@ -652,7 +652,8 @@ async def get_quality_signals(
                        NULL                  as watchlist_users,
                        c.first_seen_at       as detected_at,
                        NULL                  as outcome_class,
-                       c.quant_score         as quality_score
+                       c.quant_score         as quality_score,
+                       c.chain
                    FROM candidates c
                    WHERE c.quant_score > 15
                      AND c.market_cap_usd > 0
@@ -703,6 +704,15 @@ async def get_quality_signals(
             row["quality_tier"] = "medium"
         else:
             row["quality_tier"] = "low"
+
+    # Classify signals as narrative vs meme/DEX
+    for s in merged:
+        if s["signal_type"] == "narrative_prediction" or s["signal_type"] == "category_heating":
+            s["is_meme"] = False
+        elif s.get("chain") and s["chain"] not in ("coingecko", None, ""):
+            s["is_meme"] = True
+        else:
+            s["is_meme"] = False
 
     merged.sort(key=lambda r: (r.get("quality_score") or 0), reverse=True)
     return merged[:limit]

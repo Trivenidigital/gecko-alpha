@@ -205,6 +205,7 @@ function SignalCard({ signal }) {
 export default function QualitySignals() {
   const [signals, setSignals] = useState([])
   const [loading, setLoading] = useState(true)
+  const [showMemes, setShowMemes] = useState(false)
 
   const fetchSignals = useCallback(async () => {
     try {
@@ -225,34 +226,67 @@ export default function QualitySignals() {
     return () => clearInterval(poll)
   }, [fetchSignals])
 
-  const highCount = signals.filter(s => s.quality_tier === 'high').length
-  const medCount = signals.filter(s => s.quality_tier === 'medium').length
-  const lowCount = signals.filter(s => s.quality_tier === 'low').length
+  const narrativeSignals = signals.filter(s => !s.is_meme)
+  const memeSignals = signals.filter(s => s.is_meme)
+
+  if (loading) {
+    return (
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-header">Quality Signals</div>
+        <div className="empty-state">Loading signals...</div>
+      </div>
+    )
+  }
 
   return (
-    <div className="panel" style={{ marginBottom: 16 }}>
-      <div className="panel-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <span>Quality Signals</span>
-        {signals.length > 0 && (
-          <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--color-text-secondary)' }}>
-            {signals.length} signals
-            {highCount > 0 && <span style={{ color: '#4caf50', marginLeft: 6 }}>{highCount} high</span>}
-            {medCount > 0 && <span style={{ color: '#ffc107', marginLeft: 6 }}>{medCount} med</span>}
-            {lowCount > 0 && <span style={{ color: '#aaa', marginLeft: 6 }}>{lowCount} low</span>}
+    <>
+      {/* Summary bar */}
+      <div style={{ display: 'flex', gap: 16, marginBottom: 12, fontSize: 12 }}>
+        <span>Narrative: <strong>{narrativeSignals.length}</strong> ({narrativeSignals.filter(s => s.quality_tier === 'high').length} high)</span>
+        <span style={{ color: 'var(--color-text-secondary)' }}>DEX/Meme: {memeSignals.length}</span>
+      </div>
+
+      {/* Section 1: Narrative Signals (always visible, prominent) */}
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-header">
+          Narrative Signals
+          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginLeft: 8 }}>
+            {narrativeSignals.length} signals
           </span>
+        </div>
+        {narrativeSignals.length === 0 ? (
+          <div className="empty-state">No narrative signals yet. Agent predictions will appear here.</div>
+        ) : (
+          <div style={{ maxHeight: 600, overflowY: 'auto', padding: '4px 0' }}>
+            {narrativeSignals.map((s, i) => (
+              <SignalCard key={`${s.signal_type}-${s.token_id}-${i}`} signal={s} />
+            ))}
+          </div>
         )}
       </div>
-      {loading ? (
-        <div className="empty-state">Loading signals...</div>
-      ) : signals.length === 0 ? (
-        <div className="empty-state">No quality signals found (mcap &lt; $200M, score &gt; 0)</div>
-      ) : (
-        <div style={{ maxHeight: 600, overflowY: 'auto', padding: '4px 0' }}>
-          {signals.map((s, i) => (
-            <SignalCard key={`${s.signal_type}-${s.token_id}-${i}`} signal={s} />
-          ))}
+
+      {/* Section 2: DEX / Meme Signals (collapsed by default) */}
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-header"
+             style={{ cursor: 'pointer' }}
+             onClick={() => setShowMemes(!showMemes)}>
+          {showMemes ? '\u25BC' : '\u25B6'} DEX / Meme Signals
+          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginLeft: 8 }}>
+            {memeSignals.length} signals
+          </span>
         </div>
-      )}
-    </div>
+        {showMemes && (
+          memeSignals.length === 0 ? (
+            <div className="empty-state">No DEX signals with score &gt; 15</div>
+          ) : (
+            <div style={{ maxHeight: 400, overflowY: 'auto', padding: '4px 0' }}>
+              {memeSignals.map((s, i) => (
+                <SignalCard key={`${s.signal_type}-${s.token_id}-${i}`} signal={s} />
+              ))}
+            </div>
+          )
+        )}
+      </div>
+    </>
   )
 }
