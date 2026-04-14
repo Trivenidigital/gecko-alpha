@@ -18,18 +18,21 @@ export default function TokenLink({ tokenId, symbol, pipeline, chain, type = 'au
   const isContractAddress = tokenId.startsWith('0x') || /^[1-9A-HJ-NP-Za-km-z]{32,}$/.test(tokenId)
 
   let href
-  if (isContractAddress || pipeline === 'memecoin') {
-    // DexScreener link
-    if (chain) {
+  if (type === 'category') {
+    // CoinGecko category page
+    href = `https://www.coingecko.com/en/categories/${tokenId}`
+  } else if (chain === 'coingecko' || (!isContractAddress && pipeline !== 'memecoin')) {
+    // CoinGecko coin page — for chain="coingecko" or slug-like IDs
+    href = `https://www.coingecko.com/en/coins/${tokenId}`
+  } else if (isContractAddress || pipeline === 'memecoin') {
+    // DexScreener link — only for actual contract addresses
+    if (chain && chain !== 'coingecko') {
       href = `https://dexscreener.com/${chain}/${tokenId}`
     } else {
       href = `https://dexscreener.com/search?q=${tokenId}`
     }
-  } else if (type === 'category') {
-    // CoinGecko category page
-    href = `https://www.coingecko.com/en/categories/${tokenId}`
   } else {
-    // CoinGecko coin page
+    // Fallback: CoinGecko coin page
     href = `https://www.coingecko.com/en/coins/${tokenId}`
   }
 

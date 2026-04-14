@@ -1,15 +1,3 @@
-● gecko-pipeline.service - Gecko Alpha Pipeline
-     Loaded: loaded (/etc/systemd/system/gecko-pipeline.service; enabled; preset: enabled)
-     Active: active (running) since Thu 2026-04-09 02:55:17 UTC; 3s ago
-   Main PID: 382657 (uv)
-      Tasks: 8 (limit: 4531)
-     Memory: 56.2M (peak: 56.5M)
-        CPU: 604ms
-     CGroup: /system.slice/gecko-pipeline.service
-             ├─382657 /root/.local/bin/uv run python -m scout.main
-             └─382661 /root/gecko-alpha/.venv/bin/python3 -m scout.main
-
-Apr 09 02:55:17 ubuntu-4gb-hel1-1 systemd[1]: Started gecko-pipeline.service - Gecko Alpha Pipeline.
-Apr 09 02:55:17 ubuntu-4gb-hel1-1 uv[382661]: {"endpoint": "coins/markets", "event": "cg_fetch_attempted", "timestamp": "2026-04-09T02:55:17.630338Z", "level": "info"}
-Apr 09 02:55:17 ubuntu-4gb-hel1-1 uv[382661]: {"count": 15, "source": "search/trending", "event": "cg_candidates_fetched", "timestamp": "2026-04-09T02:55:17.713337Z", "level": "info"}
-Apr 09 02:55:17 ubuntu-4gb-hel1-1 uv[382661]: {"chain": "ethereum", "status": 404, "event": "GeckoTerminal returned error", "timestamp": "2026-04-09T02:55:17.783495Z", "level": "warning"}
+{"count":0,"avg_score":0.0,"days":7}---
+[{"key":"category_accel_threshold","value":"5.0","updated_at":"2026-04-09T13:48:38.619431+00:00","updated_by":"init","reason":"seeded default","locked":0,"min_bound":2.0,"max_bound":15.0},{"key":"cate---
+{"category_snapshots":{"count":80290,"latest":"2026-04-14T00:40:37.451115+00:00"},"narrative_signals":{"count":189,"latest":"2026-04-14 00:40:37"},"predictions":{"count":26,"latest":"2026-04-13T23:10:

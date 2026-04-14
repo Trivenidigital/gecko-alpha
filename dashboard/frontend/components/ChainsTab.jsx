@@ -184,6 +184,103 @@ export default function ChainsTab() {
         </div>
       )}
 
+      {/* Recent Signal Events — most important, shown first */}
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-header">Recent Signals</div>
+        {events.length === 0 ? (
+          <div className="empty-state">No signal events yet</div>
+        ) : (
+          <div style={{ maxHeight: 500, overflowY: 'auto' }}>
+            <table className="candidates-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Token</th>
+                  <th>24h Change</th>
+                  <th>Score</th>
+                  <th>Event</th>
+                  <th>Pipeline</th>
+                </tr>
+              </thead>
+              <tbody>
+                {events.map((e) => {
+                  const pct24 = e.ed_price_change_24h
+                  const score = e.ed_quant_score || 0
+                  const pl = pipelineLabel(e.pipeline, e.chain)
+                  const bg = rowBg(pct24)
+
+                  return (
+                    <tr key={e.id} style={bg ? { background: bg } : undefined}>
+                      <td style={{ whiteSpace: 'nowrap', fontSize: 11 }}>
+                        {relTime(e.created_at)}
+                      </td>
+                      <td>
+                        <TokenLink
+                          tokenId={e.token_id}
+                          symbol={e.ticker || e.token_name || undefined}
+                          pipeline={e.pipeline}
+                          chain={e.chain}
+                          type={e.pipeline === 'narrative' ? 'category' : 'auto'}
+                          maxLen={10}
+                        />
+                        {e.token_name && (
+                          <div style={{ fontSize: 10, color: 'var(--color-text-secondary)' }}>
+                            {e.token_name}
+                          </div>
+                        )}
+                      </td>
+                      <td style={{ fontWeight: 600 }}>
+                        {pct24 != null ? (
+                          <span style={{ color: pctColor(pct24) }}>
+                            {pct24 > 0 ? '+' : ''}{formatPct(pct24)}
+                          </span>
+                        ) : (
+                          <span style={{ color: '#555', fontSize: 11 }}>--</span>
+                        )}
+                      </td>
+                      <td>
+                        {score > 0 ? (
+                          <span style={{
+                            display: 'inline-block',
+                            padding: '1px 6px',
+                            borderRadius: 4,
+                            fontSize: 11,
+                            fontWeight: 700,
+                            background: scoreBadgeColor(score).bg,
+                            color: scoreBadgeColor(score).color,
+                          }}>
+                            {score}
+                          </span>
+                        ) : (
+                          <span style={{ color: '#666', fontSize: 11 }}>0</span>
+                        )}
+                      </td>
+                      <td>
+                        <span style={{
+                          display: 'inline-block',
+                          padding: '1px 6px',
+                          borderRadius: 4,
+                          fontSize: 10,
+                          background: '#2a2a2a',
+                          color: '#aaa',
+                        }}>
+                          {e.event_type}
+                        </span>
+                      </td>
+                      <td>
+                        <span className={`pipeline-badge pipeline-badge-${pl.cls}`}>
+                          {pl.text}
+                        </span>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
       {/* Active Chains */}
       <div className="panel" style={{ marginBottom: 16 }}>
         <div className="panel-header">Active Chains</div>
@@ -298,102 +395,7 @@ export default function ChainsTab() {
           )}
         </div>
 
-        {/* Recent Events - Redesigned */}
-        <div className="panel">
-          <div className="panel-header">Recent Signal Events</div>
-          {events.length === 0 ? (
-            <div className="empty-state">No signal events yet</div>
-          ) : (
-            <div style={{ maxHeight: 500, overflowY: 'auto' }}>
-              <table className="candidates-table">
-                <thead>
-                  <tr>
-                    <th>Time</th>
-                    <th>Token</th>
-                    <th>24h Change</th>
-                    <th>Score</th>
-                    <th>Event</th>
-                    <th>Pipeline</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {events.map((e) => {
-                    const pct24 = e.ed_price_change_24h
-                    const score = e.ed_quant_score || 0
-                    const pl = pipelineLabel(e.pipeline, e.chain)
-                    const bg = rowBg(pct24)
-
-                    return (
-                      <tr key={e.id} style={bg ? { background: bg } : undefined}>
-                        <td style={{ whiteSpace: 'nowrap', fontSize: 11 }}>
-                          {relTime(e.created_at)}
-                        </td>
-                        <td>
-                          <TokenLink
-                            tokenId={e.token_id}
-                            symbol={e.ticker || e.token_name || undefined}
-                            pipeline={e.pipeline}
-                            chain={e.chain}
-                            type={e.pipeline === 'narrative' ? 'category' : 'auto'}
-                            maxLen={10}
-                          />
-                          {e.token_name && (
-                            <div style={{ fontSize: 10, color: 'var(--color-text-secondary)' }}>
-                              {e.token_name}
-                            </div>
-                          )}
-                        </td>
-                        <td style={{ fontWeight: 600 }}>
-                          {pct24 != null ? (
-                            <span style={{ color: pctColor(pct24) }}>
-                              {pct24 > 0 ? '+' : ''}{formatPct(pct24)}
-                            </span>
-                          ) : (
-                            <span style={{ color: '#555', fontSize: 11 }}>--</span>
-                          )}
-                        </td>
-                        <td>
-                          {score > 0 ? (
-                            <span style={{
-                              display: 'inline-block',
-                              padding: '1px 6px',
-                              borderRadius: 4,
-                              fontSize: 11,
-                              fontWeight: 700,
-                              background: scoreBadgeColor(score).bg,
-                              color: scoreBadgeColor(score).color,
-                            }}>
-                              {score}
-                            </span>
-                          ) : (
-                            <span style={{ color: '#666', fontSize: 11 }}>0</span>
-                          )}
-                        </td>
-                        <td>
-                          <span style={{
-                            display: 'inline-block',
-                            padding: '1px 6px',
-                            borderRadius: 4,
-                            fontSize: 10,
-                            background: '#2a2a2a',
-                            color: '#aaa',
-                          }}>
-                            {e.event_type}
-                          </span>
-                        </td>
-                        <td>
-                          <span className={`pipeline-badge pipeline-badge-${pl.cls}`}>
-                            {pl.text}
-                          </span>
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
+        {/* Events moved above — this slot intentionally left empty */}
       </div>
     </div>
   )
