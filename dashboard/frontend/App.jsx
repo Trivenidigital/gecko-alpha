@@ -6,6 +6,7 @@ import SignalHitRate from './components/SignalHitRate.jsx'
 import AlertFeed from './components/AlertFeed.jsx'
 import NarrativeTab from './components/NarrativeTab.jsx'
 import ChainsTab from './components/ChainsTab.jsx'
+import QualitySignals from './components/QualitySignals.jsx'
 import SecondWaveTab from './components/SecondWaveTab.jsx'
 import HealthTab from './components/HealthTab.jsx'
 
@@ -133,7 +134,7 @@ export default function App() {
           className={`tab-btn ${activeTab === 'chains' ? 'active' : ''}`}
           onClick={() => setActiveTab('chains')}
         >
-          Chains
+          Research
         </button>
         <button
           className={`tab-btn ${activeTab === 'secondwave' ? 'active' : ''}`}
@@ -161,6 +162,8 @@ export default function App() {
               <AlertFeed alerts={alerts} />
             </div>
           </div>
+
+          <QualitySignals showNarrative={false} showMemes={true} />
         </>
       )}
 

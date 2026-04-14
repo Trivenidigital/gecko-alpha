@@ -125,19 +125,21 @@ function SignalCard({ signal }) {
 
         {signal.signal_type === 'narrative_prediction' && (
           <>
-            {signal.narrative_fit_score != null && (
-              <span style={{ fontSize: 11, color: '#81c784' }}>
-                Fit: {signal.narrative_fit_score}
-              </span>
-            )}
+            <span style={{ fontSize: 11, fontWeight: 700, color: tier.badge }}>
+              Quality: {qs}
+            </span>
             {signal.counter_risk_score != null && (
-              <span style={{ fontSize: 11, color: '#ef9a9a' }}>
+              <span style={{
+                fontSize: 10,
+                padding: '1px 6px',
+                borderRadius: 4,
+                fontWeight: 600,
+                background: signal.counter_risk_score > 50 ? '#5e1b1b' : '#4a3800',
+                color: signal.counter_risk_score > 50 ? '#ef9a9a' : '#ffd54f',
+              }}>
                 Risk: {signal.counter_risk_score}
               </span>
             )}
-            <span style={{ fontSize: 11, fontWeight: 700, color: tier.badge }}>
-              Net: {qs > 0 ? '+' : ''}{qs}
-            </span>
           </>
         )}
 
@@ -202,10 +204,10 @@ function SignalCard({ signal }) {
   )
 }
 
-export default function QualitySignals() {
+export default function QualitySignals({ showNarrative = true, showMemes: showMemeProp = true }) {
   const [signals, setSignals] = useState([])
   const [loading, setLoading] = useState(true)
-  const [showMemes, setShowMemes] = useState(false)
+  const [memesExpanded, setMemesExpanded] = useState(false)
 
   const fetchSignals = useCallback(async () => {
     try {
@@ -241,52 +243,58 @@ export default function QualitySignals() {
   return (
     <>
       {/* Summary bar */}
-      <div style={{ display: 'flex', gap: 16, marginBottom: 12, fontSize: 12 }}>
-        <span>Narrative: <strong>{narrativeSignals.length}</strong> ({narrativeSignals.filter(s => s.quality_tier === 'high').length} high)</span>
-        <span style={{ color: 'var(--color-text-secondary)' }}>DEX/Meme: {memeSignals.length}</span>
-      </div>
-
-      {/* Section 1: Narrative Signals (always visible, prominent) */}
-      <div className="panel" style={{ marginBottom: 16 }}>
-        <div className="panel-header">
-          Narrative Signals
-          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginLeft: 8 }}>
-            {narrativeSignals.length} signals
-          </span>
+      {showNarrative && showMemeProp && (
+        <div style={{ display: 'flex', gap: 16, marginBottom: 12, fontSize: 12 }}>
+          <span>Narrative: <strong>{narrativeSignals.length}</strong> ({narrativeSignals.filter(s => s.quality_tier === 'high').length} high)</span>
+          <span style={{ color: 'var(--color-text-secondary)' }}>DEX/Meme: {memeSignals.length}</span>
         </div>
-        {narrativeSignals.length === 0 ? (
-          <div className="empty-state">No narrative signals yet. Agent predictions will appear here.</div>
-        ) : (
-          <div style={{ maxHeight: 600, overflowY: 'auto', padding: '4px 0' }}>
-            {narrativeSignals.map((s, i) => (
-              <SignalCard key={`${s.signal_type}-${s.token_id}-${i}`} signal={s} />
-            ))}
+      )}
+
+      {/* Narrative Signals */}
+      {showNarrative && (
+        <div className="panel" style={{ marginBottom: 16 }}>
+          <div className="panel-header">
+            Narrative Signals
+            <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginLeft: 8 }}>
+              {narrativeSignals.length} signals
+            </span>
           </div>
-        )}
-      </div>
-
-      {/* Section 2: DEX / Meme Signals (collapsed by default) */}
-      <div className="panel" style={{ marginBottom: 16 }}>
-        <div className="panel-header"
-             style={{ cursor: 'pointer' }}
-             onClick={() => setShowMemes(!showMemes)}>
-          {showMemes ? '\u25BC' : '\u25B6'} DEX / Meme Signals
-          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginLeft: 8 }}>
-            {memeSignals.length} signals
-          </span>
-        </div>
-        {showMemes && (
-          memeSignals.length === 0 ? (
-            <div className="empty-state">No DEX signals with score &gt; 15</div>
+          {narrativeSignals.length === 0 ? (
+            <div className="empty-state">No narrative signals yet. Agent predictions will appear here.</div>
           ) : (
-            <div style={{ maxHeight: 400, overflowY: 'auto', padding: '4px 0' }}>
-              {memeSignals.map((s, i) => (
+            <div style={{ maxHeight: 600, overflowY: 'auto', padding: '4px 0' }}>
+              {narrativeSignals.map((s, i) => (
                 <SignalCard key={`${s.signal_type}-${s.token_id}-${i}`} signal={s} />
               ))}
             </div>
-          )
-        )}
-      </div>
+          )}
+        </div>
+      )}
+
+      {/* DEX / Meme Signals */}
+      {showMemeProp && (
+        <div className="panel" style={{ marginBottom: 16 }}>
+          <div className="panel-header"
+               style={{ cursor: 'pointer' }}
+               onClick={() => setMemesExpanded(!memesExpanded)}>
+            {memesExpanded ? '\u25BC' : '\u25B6'} DEX / Meme Signals
+            <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginLeft: 8 }}>
+              {memeSignals.length} signals
+            </span>
+          </div>
+          {memesExpanded && (
+            memeSignals.length === 0 ? (
+              <div className="empty-state">No DEX signals with score &gt; 15</div>
+            ) : (
+              <div style={{ maxHeight: 400, overflowY: 'auto', padding: '4px 0' }}>
+                {memeSignals.map((s, i) => (
+                  <SignalCard key={`${s.signal_type}-${s.token_id}-${i}`} signal={s} />
+                ))}
+              </div>
+            )
+          )}
+        </div>
+      )}
     </>
   )
 }

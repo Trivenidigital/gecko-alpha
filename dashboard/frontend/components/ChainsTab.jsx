@@ -17,29 +17,13 @@ function relTime(iso) {
   }
 }
 
-function formatPct(v) {
-  if (v == null || v === undefined) return null
+function formatMcap(v) {
+  if (!v) return '-'
   const n = Number(v)
-  if (isNaN(n)) return null
-  return n.toFixed(1) + '%'
-}
-
-function pctColor(v) {
-  if (v == null) return 'var(--color-text-secondary)'
-  const n = Number(v)
-  if (n > 10) return '#4caf50'
-  if (n > 0) return '#ffc107'
-  if (n < 0) return '#ef5350'
-  return 'var(--color-text-secondary)'
-}
-
-function rowBg(priceChange24h) {
-  if (priceChange24h == null) return undefined
-  const n = Number(priceChange24h)
-  if (n > 50) return 'rgba(76, 175, 80, 0.18)'
-  if (n > 20) return 'rgba(76, 175, 80, 0.08)'
-  if (n < -10) return 'rgba(239, 83, 80, 0.08)'
-  return undefined
+  if (n >= 1e9) return '$' + (n / 1e9).toFixed(1) + 'B'
+  if (n >= 1e6) return '$' + (n / 1e6).toFixed(1) + 'M'
+  if (n >= 1e3) return '$' + (n / 1e3).toFixed(0) + 'K'
+  return '$' + n.toFixed(0)
 }
 
 function scoreBadgeColor(score) {
@@ -59,34 +43,69 @@ function pipelineLabel(pipeline, chain) {
   return { text: 'DEX', cls: 'memecoin' }
 }
 
-function formatMcap(v) {
-  if (!v) return '-'
-  const n = Number(v)
-  if (n >= 1e9) return '$' + (n / 1e9).toFixed(1) + 'B'
-  if (n >= 1e6) return '$' + (n / 1e6).toFixed(1) + 'M'
-  if (n >= 1e3) return '$' + (n / 1e3).toFixed(0) + 'K'
-  return '$' + n.toFixed(0)
+function TrendingStats() {
+  const [stats, setStats] = useState(null)
+
+  useEffect(() => {
+    async function fetchStats() {
+      try {
+        const res = await fetch('/api/trending/stats')
+        if (res.ok) setStats(await res.json())
+      } catch {
+        // ignore
+      }
+    }
+    fetchStats()
+    const poll = setInterval(fetchStats, 60000)
+    return () => clearInterval(poll)
+  }, [])
+
+  if (!stats) return null
+
+  const caught = stats.caught ?? stats.hits ?? 0
+  const total = stats.total ?? stats.tracked ?? 0
+  const rate = total > 0 ? Math.round((caught / total) * 100) : 0
+  const avgLead = stats.avg_lead_hours ?? stats.avg_lead_h
+
+  return (
+    <div className="panel" style={{ marginBottom: 16 }}>
+      <div className="panel-header">Trending Tracker</div>
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 16,
+        padding: '12px 16px',
+        fontSize: 14,
+      }}>
+        <span style={{
+          display: 'inline-block',
+          padding: '4px 12px',
+          borderRadius: 6,
+          fontWeight: 700,
+          background: rate >= 80 ? '#1b5e20' : rate >= 50 ? '#4a3800' : '#333',
+          color: rate >= 80 ? '#a5d6a7' : rate >= 50 ? '#ffd54f' : '#aaa',
+        }}>
+          {caught}/{total} caught ({rate}% hit rate)
+        </span>
+        {avgLead != null && (
+          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
+            Avg lead: {Number(avgLead).toFixed(1)}h
+          </span>
+        )}
+      </div>
+    </div>
+  )
 }
 
 export default function ChainsTab() {
-  const [stats, setStats] = useState(null)
   const [active, setActive] = useState([])
-  const [patterns, setPatterns] = useState([])
-  const [topMovers, setTopMovers] = useState([])
+  const [chainsOpen, setChainsOpen] = useState(false)
 
   const fetchAll = useCallback(async () => {
     try {
-      const [sRes, aRes, pRes, tmRes] = await Promise.all([
-        fetch('/api/chains/stats'),
-        fetch('/api/chains/active'),
-        fetch('/api/chains/patterns'),
-        fetch('/api/chains/top-movers?limit=5'),
-      ])
-      if (sRes.ok) setStats(await sRes.json())
+      const aRes = await fetch('/api/chains/active')
       if (aRes.ok) setActive(await aRes.json())
-      if (pRes.ok) setPatterns(await pRes.json())
-      if (tmRes.ok) setTopMovers(await tmRes.json())
-    } catch (e) {
+    } catch {
       // ignore
     }
   }, [])
@@ -99,207 +118,92 @@ export default function ChainsTab() {
 
   return (
     <div>
-      {/* Stats row */}
-      <div className="stat-bar">
-        <div className="stat-card">
-          <div className="label">Active Chains</div>
-          <div className="value">{stats ? stats.active_chains : '-'}</div>
-        </div>
-        <div className="stat-card">
-          <div className="label">Completed Matches</div>
-          <div className="value">{stats ? stats.completed_matches : '-'}</div>
-        </div>
-        <div className="stat-card">
-          <div className="label">Events (24h)</div>
-          <div className="value">{stats ? stats.events_24h : '-'}</div>
-        </div>
-        <div className="stat-card">
-          <div className="label">Total Events</div>
-          <div className="value">{stats ? stats.total_events : '-'}</div>
-        </div>
-      </div>
+      {/* Section 1: Narrative Predictions (no memes) */}
+      <QualitySignals showNarrative={true} showMemes={false} />
 
-      {/* Top Movers */}
-      {topMovers.length > 0 && (
-        <div className="panel" style={{ marginBottom: 16 }}>
-          <div className="panel-header">Top Movers (24h)</div>
-          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', padding: '8px 0' }}>
-            {topMovers.map((m) => {
-              const pl = pipelineLabel(null, m.chain)
-              const pct24 = formatPct(m.price_change_24h)
-              const pct1h = formatPct(m.price_change_1h)
-              return (
-                <div
-                  key={m.token_id}
-                  style={{
-                    background: 'var(--color-surface)',
-                    border: '1px solid var(--color-border)',
-                    borderRadius: 8,
-                    padding: '10px 14px',
-                    minWidth: 160,
-                    flex: '1 1 160px',
-                  }}
-                >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                    <TokenLink
-                      tokenId={m.token_id}
-                      symbol={m.ticker || m.token_name || undefined}
-                      chain={m.chain}
-                      type={m.chain === 'coingecko' ? 'coin' : 'auto'}
-                    />
-                    <span
-                      className={`pipeline-badge pipeline-badge-${pl.cls}`}
-                      style={{ fontSize: 10, padding: '1px 6px' }}
-                    >
-                      {pl.text}
-                    </span>
-                  </div>
-                  <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginBottom: 4 }}>
-                    {m.token_name}
-                  </div>
-                  <div style={{ display: 'flex', gap: 12, fontSize: 12 }}>
-                    {pct24 && (
-                      <span style={{ color: pctColor(m.price_change_24h), fontWeight: 700 }}>
-                        24h: {m.price_change_24h > 0 ? '+' : ''}{pct24}
-                      </span>
-                    )}
-                    {pct1h && (
-                      <span style={{ color: pctColor(m.price_change_1h), fontWeight: 600 }}>
-                        1h: {m.price_change_1h > 0 ? '+' : ''}{pct1h}
-                      </span>
-                    )}
-                  </div>
-                  <div style={{ display: 'flex', gap: 12, fontSize: 11, color: 'var(--color-text-secondary)', marginTop: 4 }}>
-                    <span>MCap: {formatMcap(m.market_cap_usd)}</span>
-                    {m.quant_score > 0 && (
-                      <span>Score: <strong style={{ color: m.quant_score >= 60 ? '#4caf50' : '#ffc107' }}>{m.quant_score}</strong></span>
-                    )}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      )}
+      {/* Section 2: Trending validation stats */}
+      <TrendingStats />
 
-      {/* Quality Signals — curated, enriched, filtered by mcap + quality score */}
-      <QualitySignals />
-
-      {/* Active Chains */}
+      {/* Section 3: Active Chains (collapsible, collapsed by default) */}
       <div className="panel" style={{ marginBottom: 16 }}>
-        <div className="panel-header">Active Chains</div>
-        {active.length === 0 ? (
-          <div className="empty-state">No active chains in progress</div>
-        ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table className="candidates-table">
-              <thead>
-                <tr>
-                  <th>Token</th>
-                  <th>Pipeline</th>
-                  <th>Pattern</th>
-                  <th>Steps</th>
-                  <th>MCap</th>
-                  <th>Score</th>
-                  <th>Last Step</th>
-                  <th>Anchor</th>
-                </tr>
-              </thead>
-              <tbody>
-                {active.map((c) => {
-                  const pl = pipelineLabel(c.pipeline, c.chain)
-                  return (
-                    <tr key={c.id}>
-                      <td>
-                        <TokenLink
-                          tokenId={c.token_id}
-                          symbol={c.ticker || c.token_name || undefined}
-                          pipeline={c.pipeline}
-                          chain={c.chain}
-                          type={c.pipeline === 'narrative' ? 'category' : 'auto'}
-                        />
-                        {c.token_name && <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>{c.token_name}</div>}
-                      </td>
-                      <td>
-                        <span className={`pipeline-badge pipeline-badge-${pl.cls}`}>
-                          {pl.text}
-                        </span>
-                      </td>
-                      <td>{c.pattern_name}</td>
-                      <td>{Array.isArray(c.steps_matched) ? c.steps_matched.length : '?'}</td>
-                      <td style={{ fontSize: 11 }}>{formatMcap(c.market_cap_usd)}</td>
-                      <td>
-                        {c.quant_score > 0 ? (
-                          <span style={{
-                            display: 'inline-block',
-                            padding: '1px 6px',
-                            borderRadius: 4,
-                            fontSize: 11,
-                            fontWeight: 700,
-                            background: scoreBadgeColor(c.quant_score).bg,
-                            color: scoreBadgeColor(c.quant_score).color,
-                          }}>
-                            {c.quant_score}
-                          </span>
-                        ) : (
-                          <span style={{ color: '#666', fontSize: 11 }}>-</span>
-                        )}
-                      </td>
-                      <td>{relTime(c.last_step_time)}</td>
-                      <td>{relTime(c.anchor_time)}</td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-
-      <div className="main-grid">
-        {/* Pattern Summary */}
-        <div className="panel">
-          <div className="panel-header">Chain Patterns</div>
-          {patterns.length === 0 ? (
-            <div className="empty-state">No chain patterns defined</div>
-          ) : (
-            <table className="candidates-table">
-              <thead>
-                <tr>
-                  <th>Pattern</th>
-                  <th>Priority</th>
-                  <th>Triggers</th>
-                  <th>Hit Rate</th>
-                  <th>Boost</th>
-                </tr>
-              </thead>
-              <tbody>
-                {patterns.map((p) => (
-                  <tr key={p.id}>
-                    <td style={{ fontWeight: 600 }}>{p.name}</td>
-                    <td>
-                      <span className={`outcome-badge ${
-                        p.alert_priority === 'high' ? 'win' :
-                        p.alert_priority === 'medium' ? '' : ''
-                      }`}>
-                        {p.alert_priority}
-                      </span>
-                    </td>
-                    <td>{p.total_triggers}</td>
-                    <td>
-                      <span style={{ color: p.hit_rate >= 50 ? 'var(--color-accent-green)' : 'var(--color-text-secondary)' }}>
-                        {p.hit_rate}%
-                      </span>
-                    </td>
-                    <td>+{p.conviction_boost}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
+        <div
+          className="panel-header"
+          style={{ cursor: 'pointer', userSelect: 'none' }}
+          onClick={() => setChainsOpen(!chainsOpen)}
+        >
+          {chainsOpen ? '\u25BC' : '\u25B6'} Active Chains
+          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginLeft: 8 }}>
+            {active.length} chains
+          </span>
         </div>
-
-        {/* Events moved above — this slot intentionally left empty */}
+        {chainsOpen && (
+          active.length === 0 ? (
+            <div className="empty-state">No active chains in progress</div>
+          ) : (
+            <div style={{ overflowX: 'auto' }}>
+              <table className="candidates-table">
+                <thead>
+                  <tr>
+                    <th>Token</th>
+                    <th>Pipeline</th>
+                    <th>Pattern</th>
+                    <th>Steps</th>
+                    <th>MCap</th>
+                    <th>Score</th>
+                    <th>Last Step</th>
+                    <th>Anchor</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {active.map((c) => {
+                    const pl = pipelineLabel(c.pipeline, c.chain)
+                    return (
+                      <tr key={c.id}>
+                        <td>
+                          <TokenLink
+                            tokenId={c.token_id}
+                            symbol={c.ticker || c.token_name || undefined}
+                            pipeline={c.pipeline}
+                            chain={c.chain}
+                            type={c.pipeline === 'narrative' ? 'category' : 'auto'}
+                          />
+                          {c.token_name && <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>{c.token_name}</div>}
+                        </td>
+                        <td>
+                          <span className={`pipeline-badge pipeline-badge-${pl.cls}`}>
+                            {pl.text}
+                          </span>
+                        </td>
+                        <td>{c.pattern_name}</td>
+                        <td>{Array.isArray(c.steps_matched) ? c.steps_matched.length : '?'}</td>
+                        <td style={{ fontSize: 11 }}>{formatMcap(c.market_cap_usd)}</td>
+                        <td>
+                          {c.quant_score > 0 ? (
+                            <span style={{
+                              display: 'inline-block',
+                              padding: '1px 6px',
+                              borderRadius: 4,
+                              fontSize: 11,
+                              fontWeight: 700,
+                              background: scoreBadgeColor(c.quant_score).bg,
+                              color: scoreBadgeColor(c.quant_score).color,
+                            }}>
+                              {c.quant_score}
+                            </span>
+                          ) : (
+                            <span style={{ color: '#666', fontSize: 11 }}>-</span>
+                          )}
+                        </td>
+                        <td>{relTime(c.last_step_time)}</td>
+                        <td>{relTime(c.anchor_time)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )
+        )}
       </div>
     </div>
   )

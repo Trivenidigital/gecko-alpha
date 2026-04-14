@@ -620,7 +620,6 @@ async def get_quality_signals(
                        p.predicted_at         as detected_at,
                        p.outcome_class,
                        COALESCE(p.narrative_fit_score, 0)
-                           - COALESCE(p.counter_risk_score, 0) * 0.5
                            as quality_score
                    FROM predictions p
                    WHERE p.is_control = 0
