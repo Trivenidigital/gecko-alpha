@@ -91,6 +91,16 @@ class Settings(BaseSettings):
     CHAIN_GRADUATION_MIN_TRIGGERS: int = 30
     CHAIN_GRADUATION_HIT_RATE: float = 0.55
 
+    # -------- Volume Spike Detector --------
+    VOLUME_SPIKE_ENABLED: bool = True
+    VOLUME_SPIKE_RATIO: float = 5.0
+    VOLUME_SPIKE_MAX_MCAP: float = 500_000_000
+
+    # -------- Top Gainers Tracker --------
+    GAINERS_TRACKER_ENABLED: bool = True
+    GAINERS_MIN_CHANGE: float = 20.0
+    GAINERS_MAX_MCAP: float = 500_000_000
+
     # -------- Trending Snapshot Tracker --------
     TRENDING_SNAPSHOT_ENABLED: bool = True
     TRENDING_COMPARISON_INTERVAL: int = 21600  # 6 hours in seconds
