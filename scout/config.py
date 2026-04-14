@@ -91,6 +91,10 @@ class Settings(BaseSettings):
     CHAIN_GRADUATION_MIN_TRIGGERS: int = 30
     CHAIN_GRADUATION_HIT_RATE: float = 0.55
 
+    # -------- Trending Snapshot Tracker --------
+    TRENDING_SNAPSHOT_ENABLED: bool = True
+    TRENDING_COMPARISON_INTERVAL: int = 21600  # 6 hours in seconds
+
     # -------- Second-Wave Detection --------
     SECONDWAVE_ENABLED: bool = False
     SECONDWAVE_POLL_INTERVAL: int = 1800
