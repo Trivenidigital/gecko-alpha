@@ -184,7 +184,7 @@ export default function NarrativeTab() {
                           </td>
                           <td>
                             {flags.slice(0, 3).map((f, idx) => (
-                              <span key={idx} className="signal-badge fired">{f}</span>
+                              <span key={idx} className="signal-badge fired">{typeof f === 'object' ? f.flag : f}</span>
                             ))}
                             {flags.length > 3 && (
                               <span className="signal-badge">+{flags.length - 3}</span>
