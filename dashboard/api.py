@@ -288,6 +288,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
             prices_map = {}
             try:
                 ids_param = ",".join(coin_ids)
+                # Use API key if available + rate limiter
+                _headers = {}
+                _cg_key = os.environ.get("COINGECKO_API_KEY", "")
+                if _cg_key:
+                    _headers["x-cg-demo-api-key"] = _cg_key
+                try:
+                    from scout.ratelimit import coingecko_limiter
+                    await coingecko_limiter.acquire()
+                except Exception:
+                    pass
                 async with _aiohttp.ClientSession() as session:
                     async with session.get(
                         "https://api.coingecko.com/api/v3/coins/markets",
@@ -297,6 +307,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                             "sparkline": "false",
                             "price_change_percentage": "24h,7d",
                         },
+                        headers=_headers,
                     ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
