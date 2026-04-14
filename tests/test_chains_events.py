@@ -10,18 +10,7 @@ from scout.chains.events import (
     prune_old_events,
     safe_emit,
 )
-from scout.config import Settings
 from scout.db import Database
-
-
-def _settings(**overrides) -> Settings:
-    defaults = dict(
-        TELEGRAM_BOT_TOKEN="t",
-        TELEGRAM_CHAT_ID="c",
-        ANTHROPIC_API_KEY="k",
-    )
-    defaults.update(overrides)
-    return Settings(**defaults)
 
 
 @pytest.fixture
@@ -101,11 +90,12 @@ async def test_prune_old_events(db):
     assert row[0] == 1
 
 
-async def test_emit_event_swallows_errors_via_safe_emit(db, monkeypatch):
+async def test_emit_event_swallows_errors_via_safe_emit(db, monkeypatch, settings_factory):
     """safe_emit wraps emit_event and never raises."""
+    enabled_settings = settings_factory(CHAINS_ENABLED=True)
     monkeypatch.setattr(
         "scout.config.get_settings",
-        lambda: _settings(CHAINS_ENABLED=True),
+        lambda: enabled_settings,
     )
 
     async def _boom(*args, **kwargs):
@@ -116,11 +106,12 @@ async def test_emit_event_swallows_errors_via_safe_emit(db, monkeypatch):
     await safe_emit(db, "0xabc", "memecoin", "candidate_scored", {}, "scorer")
 
 
-async def test_safe_emit_noop_when_disabled(db, monkeypatch):
+async def test_safe_emit_noop_when_disabled(db, monkeypatch, settings_factory):
     """CHAINS_ENABLED=False: safe_emit must insert ZERO rows."""
+    disabled_settings = settings_factory(CHAINS_ENABLED=False)
     monkeypatch.setattr(
         "scout.config.get_settings",
-        lambda: _settings(CHAINS_ENABLED=False),
+        lambda: disabled_settings,
     )
 
     async with db._conn.execute("SELECT COUNT(*) FROM signal_events") as cur:

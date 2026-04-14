@@ -6,7 +6,6 @@ import pytest
 import aiohttp
 from aioresponses import aioresponses
 
-from scout.config import Settings
 from scout.ingestion.coingecko import fetch_top_movers, fetch_trending
 from scout.ratelimit import coingecko_limiter
 
@@ -65,15 +64,9 @@ async def _clear_rate_limit():
 
 
 @pytest.mark.asyncio
-async def test_fetch_top_movers_parses_correctly():
+async def test_fetch_top_movers_parses_correctly(settings_factory):
     """FR-01: /coins/markets response parsed into CandidateToken with correct fields."""
-    settings = Settings(
-        TELEGRAM_BOT_TOKEN="test",
-        TELEGRAM_CHAT_ID="test",
-        ANTHROPIC_API_KEY="test",
-        MIN_MARKET_CAP=1000,
-        MAX_MARKET_CAP=1_000_000,
-    )
+    settings = settings_factory(MIN_MARKET_CAP=1000, MAX_MARKET_CAP=1_000_000)
     with aioresponses() as mocked:
         mocked.get(MARKETS_PATTERN, payload=COINS_MARKETS_RESPONSE)
         async with aiohttp.ClientSession() as session:
@@ -91,13 +84,9 @@ async def test_fetch_top_movers_parses_correctly():
 
 
 @pytest.mark.asyncio
-async def test_fetch_trending_populates_rank():
+async def test_fetch_trending_populates_rank(settings_factory):
     """FR-02: /search/trending populates cg_trending_rank on returned tokens."""
-    settings = Settings(
-        TELEGRAM_BOT_TOKEN="test",
-        TELEGRAM_CHAT_ID="test",
-        ANTHROPIC_API_KEY="test",
-    )
+    settings = settings_factory()
     with aioresponses() as mocked:
         mocked.get(TRENDING_PATTERN, payload=TRENDING_RESPONSE)
         async with aiohttp.ClientSession() as session:
@@ -109,15 +98,9 @@ async def test_fetch_trending_populates_rank():
 
 
 @pytest.mark.asyncio
-async def test_429_triggers_backoff():
+async def test_429_triggers_backoff(settings_factory):
     """FR-03: HTTP 429 triggers exponential backoff, retries, and eventually succeeds."""
-    settings = Settings(
-        TELEGRAM_BOT_TOKEN="test",
-        TELEGRAM_CHAT_ID="test",
-        ANTHROPIC_API_KEY="test",
-        MIN_MARKET_CAP=1000,
-        MAX_MARKET_CAP=1_000_000,
-    )
+    settings = settings_factory(MIN_MARKET_CAP=1000, MAX_MARKET_CAP=1_000_000)
     with aioresponses() as mocked:
         # First call: 429, second call: 200
         mocked.get(MARKETS_PATTERN, status=429)
@@ -130,15 +113,9 @@ async def test_429_triggers_backoff():
 
 
 @pytest.mark.asyncio
-async def test_market_cap_filter_applied():
+async def test_market_cap_filter_applied(settings_factory):
     """FR-01: Tokens outside MIN/MAX_MARKET_CAP are excluded."""
-    settings = Settings(
-        TELEGRAM_BOT_TOKEN="test",
-        TELEGRAM_CHAT_ID="test",
-        ANTHROPIC_API_KEY="test",
-        MIN_MARKET_CAP=100_000,
-        MAX_MARKET_CAP=300_000,
-    )
+    settings = settings_factory(MIN_MARKET_CAP=100_000, MAX_MARKET_CAP=300_000)
     with aioresponses() as mocked:
         mocked.get(MARKETS_PATTERN, payload=COINS_MARKETS_RESPONSE)
         async with aiohttp.ClientSession() as session:
@@ -150,13 +127,9 @@ async def test_market_cap_filter_applied():
 
 
 @pytest.mark.asyncio
-async def test_coingecko_outage_does_not_crash_pipeline():
+async def test_coingecko_outage_does_not_crash_pipeline(settings_factory):
     """NFR: CoinGecko API outage returns empty list, does not raise."""
-    settings = Settings(
-        TELEGRAM_BOT_TOKEN="test",
-        TELEGRAM_CHAT_ID="test",
-        ANTHROPIC_API_KEY="test",
-    )
+    settings = settings_factory()
     with aioresponses() as mocked:
         # Non-429 errors return None immediately on first attempt
         mocked.get(MARKETS_PATTERN, status=500)
@@ -167,13 +140,9 @@ async def test_coingecko_outage_does_not_crash_pipeline():
 
 
 @pytest.mark.asyncio
-async def test_fetch_trending_outage_returns_empty():
+async def test_fetch_trending_outage_returns_empty(settings_factory):
     """NFR: fetch_trending with 500 returns empty list, does not raise."""
-    settings = Settings(
-        TELEGRAM_BOT_TOKEN="test",
-        TELEGRAM_CHAT_ID="test",
-        ANTHROPIC_API_KEY="test",
-    )
+    settings = settings_factory()
     with aioresponses() as mocked:
         mocked.get(TRENDING_PATTERN, status=500)
         async with aiohttp.ClientSession() as session:

@@ -6,20 +6,9 @@ import pytest
 import aiohttp
 from aioresponses import aioresponses
 
-from scout.config import Settings
 from scout.exceptions import MiroFishConnectionError, MiroFishTimeoutError
 from scout.mirofish.client import simulate
 from scout.models import MiroFishResult
-
-
-def _settings(**overrides) -> Settings:
-    defaults = dict(
-        TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k",
-        MIROFISH_URL="http://localhost:5001",
-        MIROFISH_TIMEOUT_SEC=5,
-    )
-    defaults.update(overrides)
-    return Settings(**defaults)
 
 
 SAMPLE_SEED = {
@@ -40,7 +29,7 @@ def mock_aiohttp():
         yield m
 
 
-async def test_simulate_success(mock_aiohttp):
+async def test_simulate_success(mock_aiohttp, settings_factory):
     mock_aiohttp.post(
         "http://localhost:5001/simulate",
         payload={
@@ -50,7 +39,7 @@ async def test_simulate_success(mock_aiohttp):
         },
     )
 
-    settings = _settings()
+    settings = settings_factory(MIROFISH_URL="http://localhost:5001", MIROFISH_TIMEOUT_SEC=5)
     async with aiohttp.ClientSession() as session:
         result = await simulate(SAMPLE_SEED, session, settings)
 
@@ -60,49 +49,49 @@ async def test_simulate_success(mock_aiohttp):
     assert result.summary == "Strong viral potential with self-referential narrative."
 
 
-async def test_simulate_timeout_raises(mock_aiohttp):
+async def test_simulate_timeout_raises(mock_aiohttp, settings_factory):
     mock_aiohttp.post(
         "http://localhost:5001/simulate",
         exception=asyncio.TimeoutError(),
     )
 
-    settings = _settings()
+    settings = settings_factory(MIROFISH_URL="http://localhost:5001", MIROFISH_TIMEOUT_SEC=5)
     async with aiohttp.ClientSession() as session:
         with pytest.raises(MiroFishTimeoutError):
             await simulate(SAMPLE_SEED, session, settings)
 
 
-async def test_simulate_connection_error_raises(mock_aiohttp):
+async def test_simulate_connection_error_raises(mock_aiohttp, settings_factory):
     mock_aiohttp.post(
         "http://localhost:5001/simulate",
         exception=aiohttp.ClientError("Connection refused"),
     )
 
-    settings = _settings()
+    settings = settings_factory(MIROFISH_URL="http://localhost:5001", MIROFISH_TIMEOUT_SEC=5)
     async with aiohttp.ClientSession() as session:
         with pytest.raises(MiroFishConnectionError):
             await simulate(SAMPLE_SEED, session, settings)
 
 
-async def test_simulate_malformed_response_raises(mock_aiohttp):
+async def test_simulate_malformed_response_raises(mock_aiohttp, settings_factory):
     mock_aiohttp.post(
         "http://localhost:5001/simulate",
         payload={"invalid": "response"},
     )
 
-    settings = _settings()
+    settings = settings_factory(MIROFISH_URL="http://localhost:5001", MIROFISH_TIMEOUT_SEC=5)
     async with aiohttp.ClientSession() as session:
         with pytest.raises(MiroFishConnectionError):
             await simulate(SAMPLE_SEED, session, settings)
 
 
-async def test_simulate_http_error_raises(mock_aiohttp):
+async def test_simulate_http_error_raises(mock_aiohttp, settings_factory):
     mock_aiohttp.post(
         "http://localhost:5001/simulate",
         status=500,
     )
 
-    settings = _settings()
+    settings = settings_factory(MIROFISH_URL="http://localhost:5001", MIROFISH_TIMEOUT_SEC=5)
     async with aiohttp.ClientSession() as session:
         with pytest.raises(MiroFishConnectionError):
             await simulate(SAMPLE_SEED, session, settings)

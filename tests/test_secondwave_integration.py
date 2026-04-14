@@ -5,9 +5,20 @@ import aiohttp
 import pytest
 from aioresponses import aioresponses
 
-from scout.config import Settings
 from scout.db import Database
 from scout.secondwave.detector import run_once
+
+
+_SW_INT_DEFAULTS = dict(
+    SECONDWAVE_ENABLED=True,
+    SECONDWAVE_MIN_PRIOR_SCORE=60,
+    SECONDWAVE_COOLDOWN_MIN_DAYS=3,
+    SECONDWAVE_COOLDOWN_MAX_DAYS=14,
+    SECONDWAVE_MIN_DRAWDOWN_PCT=30.0,
+    SECONDWAVE_MIN_RECOVERY_PCT=70.0,
+    SECONDWAVE_VOL_PICKUP_RATIO=2.0,
+    SECONDWAVE_ALERT_THRESHOLD=50,
+)
 
 
 @pytest.fixture
@@ -18,24 +29,7 @@ async def db(tmp_path):
     await d.close()
 
 
-def _settings(db_path) -> Settings:
-    return Settings(
-        TELEGRAM_BOT_TOKEN="t",
-        TELEGRAM_CHAT_ID="c",
-        ANTHROPIC_API_KEY="x",
-        DB_PATH=str(db_path),
-        SECONDWAVE_ENABLED=True,
-        SECONDWAVE_MIN_PRIOR_SCORE=60,
-        SECONDWAVE_COOLDOWN_MIN_DAYS=3,
-        SECONDWAVE_COOLDOWN_MAX_DAYS=14,
-        SECONDWAVE_MIN_DRAWDOWN_PCT=30.0,
-        SECONDWAVE_MIN_RECOVERY_PCT=70.0,
-        SECONDWAVE_VOL_PICKUP_RATIO=2.0,
-        SECONDWAVE_ALERT_THRESHOLD=50,
-    )
-
-
-async def test_end_to_end_dex_token_detection(db, tmp_path):
+async def test_end_to_end_dex_token_detection(db, tmp_path, settings_factory):
     # Seed alerts + score_history for an in-window token with peak 80
     alerted_at = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
     await db._conn.execute(
@@ -50,7 +44,7 @@ async def test_end_to_end_dex_token_detection(db, tmp_path):
     )
     await db._conn.commit()
 
-    settings = _settings(tmp_path / "int.db")
+    settings = settings_factory(**_SW_INT_DEFAULTS, DB_PATH=str(tmp_path / "int.db"))
 
     with aioresponses() as m:
         m.post(
@@ -72,7 +66,7 @@ async def test_end_to_end_dex_token_detection(db, tmp_path):
     assert rows == []
 
 
-async def test_end_to_end_narrative_token_live_price(db, tmp_path):
+async def test_end_to_end_narrative_token_live_price(db, tmp_path, settings_factory):
     alerted_at = (datetime.now(timezone.utc) - timedelta(days=6)).isoformat()
     await db._conn.execute(
         """INSERT INTO alerts
@@ -96,7 +90,7 @@ async def test_end_to_end_narrative_token_live_price(db, tmp_path):
     )
     await db._conn.commit()
 
-    settings = _settings(tmp_path / "int.db")
+    settings = settings_factory(**_SW_INT_DEFAULTS, DB_PATH=str(tmp_path / "int.db"))
 
     with aioresponses() as m:
         m.get(

@@ -4,18 +4,7 @@ import pytest
 import aiohttp
 from aioresponses import aioresponses
 
-from scout.config import Settings
 from scout.ingestion.geckoterminal import fetch_trending_pools
-
-
-def _settings(**overrides) -> Settings:
-    defaults = dict(
-        TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k",
-        CHAINS=["solana"],
-        MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000,
-    )
-    defaults.update(overrides)
-    return Settings(**defaults)
 
 
 @pytest.fixture
@@ -42,11 +31,11 @@ SAMPLE_POOL = {
 }
 
 
-async def test_fetch_trending_pools_returns_candidates(mock_aiohttp):
+async def test_fetch_trending_pools_returns_candidates(mock_aiohttp, settings_factory):
     url = f"{GECKO_BASE}/networks/solana/trending_pools"
     mock_aiohttp.get(url, payload={"data": [SAMPLE_POOL]})
 
-    settings = _settings()
+    settings = settings_factory(CHAINS=["solana"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000)
     async with aiohttp.ClientSession() as session:
         tokens = await fetch_trending_pools(session, settings)
 
@@ -56,8 +45,8 @@ async def test_fetch_trending_pools_returns_candidates(mock_aiohttp):
     assert tokens[0].market_cap_usd == 75000
 
 
-async def test_fetch_trending_pools_multiple_chains(mock_aiohttp):
-    settings = _settings(CHAINS=["solana", "eth"])
+async def test_fetch_trending_pools_multiple_chains(mock_aiohttp, settings_factory):
+    settings = settings_factory(CHAINS=["solana", "eth"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000)
 
     sol_url = f"{GECKO_BASE}/networks/solana/trending_pools"
     eth_url = f"{GECKO_BASE}/networks/eth/trending_pools"
@@ -71,7 +60,7 @@ async def test_fetch_trending_pools_multiple_chains(mock_aiohttp):
     assert len(tokens) == 1
 
 
-async def test_fetch_trending_pools_filters_market_cap(mock_aiohttp):
+async def test_fetch_trending_pools_filters_market_cap(mock_aiohttp, settings_factory):
     big_pool = {
         **SAMPLE_POOL,
         "attributes": {**SAMPLE_POOL["attributes"], "fdv_usd": "1000000"},
@@ -79,18 +68,18 @@ async def test_fetch_trending_pools_filters_market_cap(mock_aiohttp):
     url = f"{GECKO_BASE}/networks/solana/trending_pools"
     mock_aiohttp.get(url, payload={"data": [big_pool]})
 
-    settings = _settings()
+    settings = settings_factory(CHAINS=["solana"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000)
     async with aiohttp.ClientSession() as session:
         tokens = await fetch_trending_pools(session, settings)
 
     assert len(tokens) == 0
 
 
-async def test_fetch_trending_pools_handles_api_error(mock_aiohttp):
+async def test_fetch_trending_pools_handles_api_error(mock_aiohttp, settings_factory):
     url = f"{GECKO_BASE}/networks/solana/trending_pools"
     mock_aiohttp.get(url, status=500)
 
-    settings = _settings()
+    settings = settings_factory(CHAINS=["solana"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000)
     async with aiohttp.ClientSession() as session:
         tokens = await fetch_trending_pools(session, settings)
 

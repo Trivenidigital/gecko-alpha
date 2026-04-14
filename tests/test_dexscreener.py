@@ -4,17 +4,7 @@ import pytest
 import aiohttp
 from aioresponses import aioresponses
 
-from scout.config import Settings
 from scout.ingestion.dexscreener import fetch_trending
-
-
-def _settings(**overrides) -> Settings:
-    defaults = dict(
-        TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k",
-        MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000, MAX_TOKEN_AGE_DAYS=7,
-    )
-    defaults.update(overrides)
-    return Settings(**defaults)
 
 
 @pytest.fixture
@@ -36,7 +26,7 @@ SAMPLE_PAIR = {
 }
 
 
-async def test_fetch_trending_returns_candidates(mock_aiohttp):
+async def test_fetch_trending_returns_candidates(mock_aiohttp, settings_factory):
     mock_aiohttp.get(DEXSCREENER_TRENDING_URL, payload=[
         {"tokenAddress": "0xabc", "chainId": "solana"},
     ])
@@ -45,7 +35,9 @@ async def test_fetch_trending_returns_candidates(mock_aiohttp):
         payload=[SAMPLE_PAIR],
     )
 
-    settings = _settings()
+    settings = settings_factory(
+        MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000, MAX_TOKEN_AGE_DAYS=7,
+    )
     async with aiohttp.ClientSession() as session:
         tokens = await fetch_trending(session, settings)
 
@@ -54,7 +46,7 @@ async def test_fetch_trending_returns_candidates(mock_aiohttp):
     assert tokens[0].chain == "solana"
 
 
-async def test_fetch_trending_filters_by_market_cap(mock_aiohttp):
+async def test_fetch_trending_filters_by_market_cap(mock_aiohttp, settings_factory):
     too_big = {**SAMPLE_PAIR, "fdv": 1_000_000}
     mock_aiohttp.get(DEXSCREENER_TRENDING_URL, payload=[
         {"tokenAddress": "0xbig", "chainId": "solana"},
@@ -64,24 +56,28 @@ async def test_fetch_trending_filters_by_market_cap(mock_aiohttp):
         payload=[{**too_big, "baseToken": {"address": "0xbig", "name": "Big", "symbol": "BIG"}}],
     )
 
-    settings = _settings()
+    settings = settings_factory(
+        MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000, MAX_TOKEN_AGE_DAYS=7,
+    )
     async with aiohttp.ClientSession() as session:
         tokens = await fetch_trending(session, settings)
 
     assert len(tokens) == 0
 
 
-async def test_fetch_trending_handles_empty_response(mock_aiohttp):
+async def test_fetch_trending_handles_empty_response(mock_aiohttp, settings_factory):
     mock_aiohttp.get(DEXSCREENER_TRENDING_URL, payload=[])
 
-    settings = _settings()
+    settings = settings_factory(
+        MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000, MAX_TOKEN_AGE_DAYS=7,
+    )
     async with aiohttp.ClientSession() as session:
         tokens = await fetch_trending(session, settings)
 
     assert tokens == []
 
 
-async def test_fetch_trending_handles_429_with_backoff(mock_aiohttp):
+async def test_fetch_trending_handles_429_with_backoff(mock_aiohttp, settings_factory):
     mock_aiohttp.get(DEXSCREENER_TRENDING_URL, status=429)
     mock_aiohttp.get(DEXSCREENER_TRENDING_URL, payload=[
         {"tokenAddress": "0xretry", "chainId": "solana"},
@@ -91,7 +87,9 @@ async def test_fetch_trending_handles_429_with_backoff(mock_aiohttp):
         payload=[{**SAMPLE_PAIR, "baseToken": {"address": "0xretry", "name": "Retry", "symbol": "RTR"}}],
     )
 
-    settings = _settings()
+    settings = settings_factory(
+        MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000, MAX_TOKEN_AGE_DAYS=7,
+    )
     async with aiohttp.ClientSession() as session:
         tokens = await fetch_trending(session, settings)
 
