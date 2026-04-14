@@ -397,7 +397,7 @@ async def get_chains_patterns(db_path: str) -> list[dict]:
 
 
 async def get_chains_events_recent(db_path: str, limit: int = 50) -> list[dict]:
-    """Most recent signal events with enriched market data."""
+    """Most recent INTERESTING signal events (filters out routine zero-score noise)."""
     async with _ro_db(db_path) as conn:
         cursor = await conn.execute(
             """SELECT se.id, se.token_id, se.pipeline, se.event_type, se.event_data,
@@ -406,6 +406,10 @@ async def get_chains_events_recent(db_path: str, limit: int = 50) -> list[dict]:
                       c.market_cap_usd, c.volume_24h_usd, c.quant_score
                FROM signal_events se
                LEFT JOIN candidates c ON se.token_id = c.contract_address
+               WHERE NOT (
+                   se.event_type = 'candidate_scored'
+                   AND (se.event_data LIKE '%"signal_count": 0%' OR se.event_data LIKE '%"quant_score": 0%')
+               )
                ORDER BY se.created_at DESC
                LIMIT ?""",
             (limit,),
