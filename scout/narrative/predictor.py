@@ -41,6 +41,7 @@ async def fetch_laggards(
         "order": "market_cap_desc",
         "per_page": "100",
         "sparkline": "false",
+        "price_change_percentage": "24h,7d",
     }
     headers: dict[str, str] = {}
     if api_key:

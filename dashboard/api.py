@@ -4,11 +4,6 @@ import asyncio
 import json
 import os
 
-import aiohttp as _aiohttp
-
-# 5-minute cache for CoinGecko price enrichment (avoids hammering API on every poll)
-_price_cache: dict = {}
-
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -256,7 +251,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/api/trending/comparisons-enriched")
     async def trending_comparisons_enriched(limit: int = Query(30, ge=1, le=500)):
-        """Trending comparisons enriched with current CoinGecko prices."""
+        """Trending comparisons enriched with cached price data from the pipeline.
+
+        Reads from the price_cache table (populated during pipeline ingestion)
+        instead of calling CoinGecko directly, avoiding 429 rate-limit errors.
+        """
         from scout.db import Database as ScoutDatabase
         from scout.trending.tracker import get_recent_comparisons
 
@@ -264,64 +263,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
         await sdb.initialize()
         try:
             comparisons = await get_recent_comparisons(sdb, limit=limit)
+            if not comparisons:
+                return comparisons
+
+            # Collect CoinGecko coin IDs
+            coin_ids = [c["coin_id"] for c in comparisons if c.get("coin_id")]
+            if not coin_ids:
+                return comparisons
+
+            # Read from price_cache table (populated by pipeline)
+            prices_map = await sdb.get_cached_prices(coin_ids)
         finally:
             await sdb.close()
-
-        if not comparisons:
-            return comparisons
-
-        # Collect CoinGecko coin IDs
-        coin_ids = [c["coin_id"] for c in comparisons if c.get("coin_id")]
-        if not coin_ids:
-            return comparisons
-
-        # Use /coins/markets (returns 24h + 7d changes) with 5-min cache
-        import time as _time
-        _now = _time.monotonic()
-        if (
-            _price_cache.get("_ts") is not None
-            and _now - _price_cache["_ts"] < 300
-            and _price_cache.get("_ids") == set(coin_ids)
-        ):
-            prices_map = _price_cache.get("_data", {})
-        else:
-            prices_map = {}
-            try:
-                ids_param = ",".join(coin_ids)
-                # Use API key if available + rate limiter
-                _headers = {}
-                _cg_key = os.environ.get("COINGECKO_API_KEY", "")
-                if _cg_key:
-                    _headers["x-cg-demo-api-key"] = _cg_key
-                try:
-                    from scout.ratelimit import coingecko_limiter
-                    await coingecko_limiter.acquire()
-                except Exception:
-                    pass
-                async with _aiohttp.ClientSession() as session:
-                    async with session.get(
-                        "https://api.coingecko.com/api/v3/coins/markets",
-                        params={
-                            "vs_currency": "usd",
-                            "ids": ids_param,
-                            "sparkline": "false",
-                            "price_change_percentage": "24h,7d",
-                        },
-                        headers=_headers,
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            for coin in data:
-                                prices_map[coin["id"]] = {
-                                    "usd": coin.get("current_price"),
-                                    "change_24h": coin.get("price_change_percentage_24h"),
-                                    "change_7d": coin.get("price_change_percentage_7d_in_currency"),
-                                }
-                _price_cache["_ts"] = _now
-                _price_cache["_ids"] = set(coin_ids)
-                _price_cache["_data"] = prices_map
-            except Exception:
-                pass  # Degrade gracefully
 
         for c in comparisons:
             cid = c.get("coin_id", "")

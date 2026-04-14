@@ -382,6 +382,15 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_trending_comp
                 ON trending_comparisons(coin_id);
+
+            CREATE TABLE IF NOT EXISTS price_cache (
+                coin_id          TEXT PRIMARY KEY,
+                current_price    REAL,
+                price_change_24h REAL,
+                price_change_7d  REAL,
+                market_cap       REAL,
+                updated_at       TEXT NOT NULL
+            );
             """
         )
 
@@ -838,6 +847,67 @@ class Database:
             r["reaccumulation_signals"] = json.loads(r.get("reaccumulation_signals") or "[]")
             r["price_is_stale"] = bool(r.get("price_is_stale", 0))
         return rows
+
+    # ------------------------------------------------------------------
+    # Price cache (for dashboard enrichment)
+    # ------------------------------------------------------------------
+
+    async def cache_prices(self, raw_coins: list[dict]) -> int:
+        """Bulk-upsert price data from a CoinGecko /coins/markets response.
+
+        Returns the number of rows upserted.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        now = datetime.now(timezone.utc).isoformat()
+        count = 0
+        for coin in raw_coins:
+            cid = coin.get("id")
+            if not cid:
+                continue
+            await self._conn.execute(
+                """INSERT OR REPLACE INTO price_cache
+                   (coin_id, current_price, price_change_24h, price_change_7d,
+                    market_cap, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    cid,
+                    coin.get("current_price"),
+                    coin.get("price_change_percentage_24h"),
+                    coin.get("price_change_percentage_7d_in_currency"),
+                    coin.get("market_cap"),
+                    now,
+                ),
+            )
+            count += 1
+        if count:
+            await self._conn.commit()
+        return count
+
+    async def get_cached_prices(self, coin_ids: list[str]) -> dict[str, dict]:
+        """Read price cache rows for the given coin IDs.
+
+        Returns {coin_id: {usd, change_24h, change_7d}} mapping.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not coin_ids:
+            return {}
+        placeholders = ",".join("?" * len(coin_ids))
+        cursor = await self._conn.execute(
+            f"SELECT coin_id, current_price, price_change_24h, price_change_7d "
+            f"FROM price_cache WHERE coin_id IN ({placeholders})",
+            coin_ids,
+        )
+        rows = await cursor.fetchall()
+        return {
+            row[0]: {
+                "usd": row[1],
+                "change_24h": row[2],
+                "change_7d": row[3],
+            }
+            for row in rows
+        }
 
     async def get_volume_history(
         self, contract_address: str, days: int = 14

@@ -20,6 +20,10 @@ CG_BASE = "https://api.coingecko.com/api/v3"
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
+# Module-level store for raw /coins/markets responses.
+# Populated by fetch_top_movers(); consumed by main.py for price caching.
+last_raw_markets: list[dict] = []
+
 
 async def _get_with_backoff(
     session: aiohttp.ClientSession,
@@ -66,7 +70,7 @@ async def fetch_top_movers(
         "per_page": "50",
         "page": "1",
         "sparkline": "false",
-        "price_change_percentage": "1h,24h",
+        "price_change_percentage": "1h,24h,7d",
     }
     if settings.COINGECKO_API_KEY:
         base_params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
@@ -94,6 +98,10 @@ async def fetch_top_movers(
     if not raw_by_id:
         logger.warning("cg_no_data", endpoint="coins/markets")
         return []
+
+    # Store raw response for price cache consumption by main.py
+    global last_raw_markets
+    last_raw_markets = list(raw_by_id.values())
 
     tokens: list[CandidateToken] = []
     for raw in raw_by_id.values():

@@ -22,6 +22,7 @@ from scout.db import Database
 from scout.gate import evaluate
 from scout.ingestion.coingecko import fetch_top_movers as cg_fetch_top_movers
 from scout.ingestion.coingecko import fetch_trending as cg_fetch_trending
+from scout.ingestion import coingecko as _cg_module
 from scout.ingestion.dexscreener import fetch_trending
 from scout.ingestion.geckoterminal import fetch_trending_pools
 from scout.ingestion.holder_enricher import enrich_holders
@@ -233,6 +234,14 @@ async def run_cycle(
     if isinstance(cg_trending, Exception):
         logger.warning("CoinGecko trending ingestion failed", error=str(cg_trending))
         cg_trending = []
+
+    # Cache raw CoinGecko prices for dashboard (zero extra API calls)
+    if _cg_module.last_raw_markets:
+        try:
+            cached = await db.cache_prices(_cg_module.last_raw_markets)
+            logger.info("price_cache_updated", count=cached)
+        except Exception:
+            logger.exception("price_cache_error")
 
     # Stage 2: Aggregate
     all_candidates = aggregate(
@@ -574,6 +583,14 @@ async def narrative_agent_loop(
                     raw_laggards = await fetch_laggards(
                         session, accel.category_id, api_key=settings.COINGECKO_API_KEY
                     )
+
+                    # Cache laggard prices for dashboard (zero extra API calls)
+                    if raw_laggards:
+                        try:
+                            await db.cache_prices(raw_laggards)
+                        except Exception:
+                            logger.exception("price_cache_laggard_error")
+
                     laggards = filter_laggards(
                         raw_laggards,
                         category_id=accel.category_id,
