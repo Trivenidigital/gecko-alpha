@@ -254,6 +254,8 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 **Success metrics:** Hit rate (% of flagged tokens that appeared on Highlights), average lead time (minutes before CoinGecko), misses (tokens that trended without our flag).
 
+> **NOTE (Apr 2026):** The CoinGecko Trending Tracker (PR #12) + Volume Spike Detector (PR #15) now serve as the primary early detection layer, using FREE CoinGecko data. LunarCrush/Santiment/Nansen phases are DEFERRED — the free approach achieved 100% trending hit rate and 86% highlights catch rate.
+
 ### Phase 1: LunarCrush Social Velocity ($24/mo) — CURRENT
 **Status:** In design
 **Rationale:** Social mention velocity is the #1 input to CoinGecko's trending algorithm. LunarCrush aggregates Twitter + Reddit + Telegram into a single API. Cheapest way to validate the thesis.
@@ -327,9 +329,97 @@ Event store + temporal pattern matching. 3 built-in patterns with LEARN lifecycl
 TokenLink component with CoinGecko/DexScreener routing.
 
 ### CoinGecko Trending Snapshot Tracker (PR #12)
-**Status:** IN REVIEW
+**Status:** DONE — live on VPS. 15/15 trending tokens caught (100% hit rate), avg 25.6h lead time.
 Validates core goal — snapshots trending page, measures if we caught tokens before they trended.
 
 ### Personalized Narrative Matching (PR #13)
-**Status:** IN REVIEW
+**Status:** DONE — live on VPS. 3 alert modes: all/whitelist/blacklist.
 Category + mcap preferences for alert filtering. 3 modes: all/whitelist/blacklist.
+
+### Test Fixture Refactor + Backlog Cleanup (PR #14)
+**Status:** DONE
+Test fixture refactor (BL-042) + backlog cleanup.
+
+### Volume Spike Detector + Top Gainers Tracker (PR #15)
+**Status:** DONE — live on VPS. Detects individual token breakouts via 5x+ volume surges. Top gainers validation same pattern as trending tracker.
+
+### Dashboard Redesign
+**Status:** DONE
+3-tab layout (Signals/Pipeline/Health), Early Catches validation, quality signals, price cache, Narrative vs Meme separation.
+
+### Price Cache System
+**Status:** DONE
+Stores prices from pipeline fetches, dashboard reads from DB (zero extra CoinGecko calls).
+
+---
+
+## Trading Engine Roadmap
+
+**Goal:** Autonomous DEX trading — detect signals, execute trades on-chain, manage positions.
+
+**Approach:** Paper trading first (2 weeks) to prove edge with PnL data, then graduate to live trading with small positions ($50-100/trade).
+
+### Architecture Decisions (Locked In)
+
+**D1 — Pluggable engine:** The trading engine is an independent common component (`scout/trading/`) that any signal source can call. Interface: `engine.buy(token_id, chain, amount_usd)` / `engine.sell(...)`. Mode switchable: paper or live.
+
+**D2 — Signal triggering:** Paper mode trades ALL signals (Option C) — volume spikes, narrative picks, trending catches, chain completions. Maximizes data collection. Live mode will use multi-signal confirmation (multi-layer agreement before executing).
+
+**D3 — Chain support:** Chain-agnostic paper trading with chain metadata stored. Live execution targets BSC (PancakeSwap), Solana (Raydium/Jupiter), Ethereum/Base (Uniswap).
+
+**D4 — Exit strategy:** Multi-checkpoint tracking (1h, 6h, 24h, 48h) for analysis + simulated take-profit (+20%) and stop-loss (-10%) for realistic PnL. Both run in parallel per trade.
+
+**D5 — Libraries chosen:**
+- EVM chains: `web3-ethereum-defi` (MIT, pip install, pure Python, 800+ stars)
+- Solana: `raydium_py` or solana-py based library
+- Paper trading shim: custom (~50 lines)
+- NOT using Hummingbot (too heavy) or Freqtrade (no DEX support)
+
+### Phase A: Paper Trading Engine (Current — build next)
+**Status:** In design
+**Module:** `scout/trading/`
+```
+scout/trading/
+  engine.py        # Pluggable interface — buy/sell/get_positions/get_pnl
+  paper.py         # Paper trading — simulate fills at current price, log to DB
+  models.py        # PaperTrade, Position, PnL models
+```
+**DB tables:** `paper_trades`, `paper_positions`
+**Dashboard:** Paper PnL section on Signals tab — per-signal-type performance
+**Config:** `TRADING_ENABLED=false`, `TRADING_MODE=paper`, `PAPER_TRADE_AMOUNT_USD=50`
+**Success criteria:** 2 weeks of paper trades with positive PnL after simulated fees → graduate to Phase B
+
+### Phase B: Live Execution Engine (Future — after paper validates)
+**Status:** Not started — blocked by Phase A validation
+**Module extensions:**
+```
+scout/trading/
+  live_evm.py      # web3-ethereum-defi — PancakeSwap, Uniswap swaps
+  live_solana.py   # raydium_py — Raydium, Jupiter swaps
+  risk.py          # Position sizing, max exposure, stop-loss enforcement
+  wallet.py        # Encrypted private key management (NEVER in .env)
+```
+**Requirements before going live:**
+- [ ] 2+ weeks of paper trading data showing positive PnL
+- [ ] Risk management: max $50/trade, max $500 total exposure, automatic stop-loss
+- [ ] Kill switch: `TRADING_KILL_SWITCH=true` instantly stops all trading
+- [ ] Private key encryption (keyring or encrypted file, never plaintext)
+- [ ] Manual approval for first 10 live trades (dashboard queue)
+- [ ] Gas estimation + slippage protection per chain
+- [ ] MEV protection (private RPC for Ethereum, Jito for Solana)
+
+### Phase C: Advanced Trading (Future)
+- Partial position scaling (enter 50%, add if signal strengthens)
+- Dynamic position sizing based on signal quality score
+- Cross-chain arbitrage (same token on multiple DEXes)
+- Portfolio rebalancing
+- PnL-based signal weighting (auto-increase position size for profitable signal types)
+
+### RCA Results (Apr 19, 2026) — Validates the Trading Thesis
+- 12/14 CoinGecko Highlights tokens caught (86%)
+- 15/15 CoinGecko Trending tokens caught (100% hit rate)
+- BLESS: caught 16h early, currently +216% 7d
+- GENIUS: caught 10.5h early
+- MEZO: caught 8h early
+- RaveDAO: caught 33h early, +5333% 7d
+- Gap: 2 tokens missed (aPriori, Bedrock) — individual breakouts without category momentum. Volume Spike Detector (PR #15) designed to catch these going forward.
