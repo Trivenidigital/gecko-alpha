@@ -273,15 +273,42 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
             # Read from price_cache table (populated by pipeline)
             prices_map = await sdb.get_cached_prices(coin_ids)
+
+            # Also build a symbol-based lookup for ID mismatches (e.g. bless-network vs bless-2)
+            symbols = [c.get("symbol", "").lower() for c in comparisons if c.get("symbol")]
+            if symbols:
+                try:
+                    cursor = await sdb._conn.execute(
+                        "SELECT coin_id, current_price, price_change_24h, price_change_7d FROM price_cache"
+                    )
+                    all_prices = await cursor.fetchall()
+                    symbol_map = {}
+                    for row in all_prices:
+                        # Extract likely symbol from coin_id (e.g. "genius-3" -> match by prefix)
+                        symbol_map[row["coin_id"]] = {
+                            "usd": row["current_price"],
+                            "change_24h": row["price_change_24h"],
+                            "change_7d": row["price_change_7d"],
+                        }
+                except Exception:
+                    symbol_map = {}
         finally:
             await sdb.close()
 
         for c in comparisons:
             cid = c.get("coin_id", "")
-            if cid in prices_map:
-                c["price_current"] = prices_map[cid].get("usd")
-                c["price_change_24h"] = prices_map[cid].get("change_24h")
-                c["price_change_7d"] = prices_map[cid].get("change_7d")
+            sym = (c.get("symbol") or "").lower()
+            matched = prices_map.get(cid)
+            # Fallback: search price_cache by coin_id containing the symbol
+            if not matched and sym:
+                for pcid, pdata in symbol_map.items():
+                    if pcid.startswith(sym) or sym in pcid:
+                        matched = pdata
+                        break
+            if matched:
+                c["price_current"] = matched.get("usd")
+                c["price_change_24h"] = matched.get("change_24h")
+                c["price_change_7d"] = matched.get("change_7d")
             else:
                 c["price_current"] = None
                 c["price_change_24h"] = None
