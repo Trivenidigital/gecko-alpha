@@ -101,6 +101,11 @@ class Settings(BaseSettings):
     GAINERS_MIN_CHANGE: float = 20.0
     GAINERS_MAX_MCAP: float = 500_000_000
 
+    # -------- Top Losers Tracker --------
+    LOSERS_TRACKER_ENABLED: bool = True
+    LOSERS_MIN_DROP: float = -15.0
+    LOSERS_MAX_MCAP: float = 500_000_000
+
     # -------- Trending Snapshot Tracker --------
     TRENDING_SNAPSHOT_ENABLED: bool = True
     TRENDING_COMPARISON_INTERVAL: int = 21600  # 6 hours in seconds

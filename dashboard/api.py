@@ -405,6 +405,32 @@ def create_app(db_path: str | None = None) -> FastAPI:
         finally:
             await sdb.close()
 
+    # --- Losers Tracker ---
+
+    @app.get("/api/losers/comparisons")
+    async def losers_comparisons(limit: int = Query(50, ge=1, le=500)):
+        """Losers comparisons with signal detection."""
+        from scout.db import Database as ScoutDatabase
+        from scout.losers.tracker import get_losers_comparisons
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            return await get_losers_comparisons(sdb, limit=limit)
+        finally:
+            await sdb.close()
+
+    @app.get("/api/losers/stats")
+    async def losers_stats():
+        """Losers tracker hit rate stats."""
+        from scout.db import Database as ScoutDatabase
+        from scout.losers.tracker import get_losers_stats
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            return await get_losers_stats(sdb)
+        finally:
+            await sdb.close()
+
     # --- System health endpoint ---
 
     @app.get("/api/system/health")

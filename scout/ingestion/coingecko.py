@@ -25,6 +25,8 @@ REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 last_raw_markets: list[dict] = []
 # Populated by fetch_trending(); consumed by main.py for price caching.
 last_raw_trending: list[dict] = []
+# Populated by fetch_by_volume(); consumed by main.py for price caching.
+last_raw_by_volume: list[dict] = []
 
 
 async def _get_with_backoff(
@@ -170,4 +172,58 @@ async def fetch_trending(
             })
 
     logger.info("cg_candidates_fetched", count=len(tokens), source="search/trending")
+    return tokens
+
+
+async def fetch_by_volume(
+    session: aiohttp.ClientSession,
+    settings: "Settings",
+) -> list[CandidateToken]:
+    """Fetch tokens sorted by volume (catches tokens with activity spike regardless of price change).
+
+    Uses a wider market cap range than fetch_top_movers to catch mid-cap tokens
+    like CommonWealth that have high volume but aren't in the micro-cap fringe.
+    The upper bound is the LOSERS/GAINERS tracker max (500M) rather than the
+    strict MAX_MARKET_CAP used for the main pipeline.
+    """
+    logger.info("cg_fetch_attempted", endpoint="coins/markets:volume_desc")
+
+    params = {
+        "vs_currency": "usd",
+        "order": "volume_desc",
+        "per_page": "50",
+        "page": "1",
+        "sparkline": "false",
+        "price_change_percentage": "1h,24h,7d",
+    }
+    if settings.COINGECKO_API_KEY:
+        params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
+
+    data = await _get_with_backoff(session, f"{CG_BASE}/coins/markets", params)
+    if not data or not isinstance(data, list):
+        logger.warning("cg_no_data", endpoint="coins/markets:volume_desc")
+        return []
+
+    # Store raw response for price cache & losers/gainers tracker
+    global last_raw_by_volume
+    last_raw_by_volume = list(data)
+
+    tokens: list[CandidateToken] = []
+    for raw in data:
+        token = CandidateToken.from_coingecko(raw)
+        # Use wider cap range: keep anything with mcap > MIN_MARKET_CAP
+        # (upper bound filtering is done at scoring/gate stage)
+        if token.market_cap_usd < settings.MIN_MARKET_CAP:
+            continue
+        tokens.append(token)
+
+    # Sort by volume descending
+    tokens.sort(key=lambda t: t.volume_24h_usd or 0, reverse=True)
+
+    logger.info(
+        "cg_volume_scan_returned",
+        count=len(tokens),
+        source="coins/markets:volume_desc",
+        raw_fetched=len(data),
+    )
     return tokens

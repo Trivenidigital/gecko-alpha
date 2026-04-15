@@ -458,6 +458,41 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_gainers_comp
                 ON gainers_comparisons(coin_id);
 
+            CREATE TABLE IF NOT EXISTS losers_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                price_change_24h REAL NOT NULL,
+                market_cap REAL,
+                volume_24h REAL,
+                snapshot_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_losers_snap
+                ON losers_snapshots(coin_id, snapshot_at);
+
+            CREATE TABLE IF NOT EXISTS losers_comparisons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                price_change_24h REAL,
+                appeared_on_losers_at TEXT NOT NULL,
+                detected_by_narrative INTEGER DEFAULT 0,
+                narrative_lead_minutes REAL,
+                detected_by_pipeline INTEGER DEFAULT 0,
+                pipeline_lead_minutes REAL,
+                detected_by_chains INTEGER DEFAULT 0,
+                chains_lead_minutes REAL,
+                detected_by_spikes INTEGER DEFAULT 0,
+                spikes_lead_minutes REAL,
+                is_gap INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_losers_comp
+                ON losers_comparisons(coin_id);
+
             CREATE TABLE IF NOT EXISTS paper_trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 token_id TEXT NOT NULL,
