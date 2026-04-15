@@ -12,7 +12,9 @@ from scout.trading.paper import PaperTrader
 log = structlog.get_logger()
 
 # Maximum age (seconds) for a price_cache entry to be considered fresh.
-_MAX_PRICE_AGE_SECONDS = 300
+# Paper trading uses a generous window since signals fire infrequently
+# and laggard tokens may only be cached once per narrative cycle (30 min+).
+_MAX_PRICE_AGE_SECONDS = 3600  # 1 hour for paper; tighten for live
 
 
 class TradingEngine:
@@ -224,6 +226,13 @@ class TradingEngine:
             (token_id,),
         )
         row = await cursor.fetchone()
+        if row is None or row[0] is None:
+            # Fallback: try fuzzy match by prefix (handles ID mismatches like bless-2 vs bless-network)
+            cursor = await conn.execute(
+                "SELECT current_price, updated_at FROM price_cache WHERE coin_id LIKE ? LIMIT 1",
+                (token_id.split("-")[0] + "%",),
+            )
+            row = await cursor.fetchone()
         if row is None or row[0] is None:
             return None
 
