@@ -60,6 +60,10 @@ from scout.gainers.tracker import (
     store_top_gainers,
     compare_gainers_with_signals,
 )
+from scout.losers.tracker import (
+    store_top_losers,
+    compare_losers_with_signals,
+)
 from scout.counter.detail import fetch_coin_detail, extract_counter_data
 from scout.counter.flags import compute_narrative_flags, compute_memecoin_flags
 from scout.counter.scorer import score_counter_narrative, score_counter_memecoin
@@ -290,6 +294,17 @@ async def run_cycle(
             )
         except Exception:
             logger.exception("gainers_tracker_error")
+
+    # Top Losers Tracker (zero extra API calls -- uses cached data)
+    if settings.LOSERS_TRACKER_ENABLED and _cg_module.last_raw_markets:
+        try:
+            await store_top_losers(
+                db, _cg_module.last_raw_markets,
+                max_drop=settings.LOSERS_MIN_DROP,
+                max_mcap=settings.LOSERS_MAX_MCAP,
+            )
+        except Exception:
+            logger.exception("losers_tracker_error")
 
     # Stage 2: Aggregate
     all_candidates = aggregate(
@@ -1012,6 +1027,14 @@ async def narrative_agent_loop(
                         logger.info("gainers_tracker.compare_complete")
                     except Exception:
                         logger.exception("gainers_tracker.compare_error")
+
+                # Losers comparison (piggybacks on EVALUATE interval)
+                if settings.LOSERS_TRACKER_ENABLED:
+                    try:
+                        await compare_losers_with_signals(db)
+                        logger.info("losers_tracker.compare_complete")
+                    except Exception:
+                        logger.exception("losers_tracker.compare_error")
 
             # ----------------------------------------------------------
             # LEARN daily (gated by hour + 23h gap)

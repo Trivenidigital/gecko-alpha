@@ -78,10 +78,12 @@ export default function SignalsTab() {
   const [spikeStats, setSpikeStats] = useState(null)
   const [gainersComps, setGainersComps] = useState([])
   const [gainersStats, setGainersStats] = useState(null)
+  const [losersComps, setLosersComps] = useState([])
+  const [losersStats, setLosersStats] = useState(null)
 
   const fetchAll = useCallback(async () => {
     try {
-      const [compRes, statsRes, heatRes, predRes, spkRes, spkStatsRes, gnrRes, gnrStatsRes] = await Promise.all([
+      const [compRes, statsRes, heatRes, predRes, spkRes, spkStatsRes, gnrRes, gnrStatsRes, lsrRes, lsrStatsRes] = await Promise.all([
         fetch('/api/trending/comparisons-enriched?limit=30'),
         fetch('/api/trending/stats'),
         fetch('/api/narrative/heating'),
@@ -90,6 +92,8 @@ export default function SignalsTab() {
         fetch('/api/spikes/stats'),
         fetch('/api/gainers/comparisons?limit=30'),
         fetch('/api/gainers/stats'),
+        fetch('/api/losers/comparisons?limit=30'),
+        fetch('/api/losers/stats'),
       ])
       if (compRes.ok) setComparisons(await compRes.json())
       if (statsRes.ok) setTrendingStats(await statsRes.json())
@@ -99,6 +103,8 @@ export default function SignalsTab() {
       if (spkStatsRes.ok) setSpikeStats(await spkStatsRes.json())
       if (gnrRes.ok) setGainersComps(await gnrRes.json())
       if (gnrStatsRes.ok) setGainersStats(await gnrStatsRes.json())
+      if (lsrRes.ok) setLosersComps(await lsrRes.json())
+      if (lsrStatsRes.ok) setLosersStats(await lsrStatsRes.json())
     } catch {
       // API not available yet
     }
@@ -461,7 +467,98 @@ export default function SignalsTab() {
         )}
       </div>
 
-      {/* ── Section E: Latest Predictions ── */}
+      {/* ── Section E: Top Losers Tracker ── */}
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
+            Top Losers Tracker
+          </span>
+          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
+            Tokens dropping 15%+ in 24h -- did we see activity before the crash?
+          </span>
+        </div>
+
+        {losersStats && (
+          <div style={{
+            display: 'flex', gap: 24, padding: '12px 16px',
+            borderBottom: '1px solid var(--color-border)', flexWrap: 'wrap',
+          }}>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Losers Hit Rate</div>
+              <div style={{
+                fontSize: 22, fontWeight: 700,
+                color: losersStats.hit_rate_pct >= 50 ? 'var(--color-accent-green)' : 'var(--color-accent-amber)',
+              }}>
+                {losersStats.caught}/{losersStats.total_tracked} ({losersStats.hit_rate_pct}%)
+              </div>
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Avg Lead</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--color-accent-green)' }}>
+                {losersStats.avg_lead_minutes != null ? (losersStats.avg_lead_minutes / 60).toFixed(1) + 'h' : '-'}
+              </div>
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Missed</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--color-accent-red, #ef5350)' }}>{losersStats.missed}</div>
+            </div>
+          </div>
+        )}
+
+        {losersComps.length === 0 ? (
+          <div className="empty-state">No losers data yet. The tracker runs every cycle.</div>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table className="candidates-table">
+              <thead>
+                <tr>
+                  <th>Token</th>
+                  <th>24h %</th>
+                  <th>Lead Time</th>
+                  <th>Crashed At</th>
+                  <th>Detected By</th>
+                </tr>
+              </thead>
+              <tbody>
+                {losersComps.filter(c => !isMegaCap(c)).map((c, i) => {
+                  const leadMin = c.narrative_lead_minutes || c.pipeline_lead_minutes || c.chains_lead_minutes || c.spikes_lead_minutes || null
+                  const methods = []
+                  if (c.detected_by_narrative) methods.push('Narrative')
+                  if (c.detected_by_pipeline) methods.push('Pipeline')
+                  if (c.detected_by_chains) methods.push('Chains')
+                  if (c.detected_by_spikes) methods.push('Spikes')
+                  const detectedBy = methods.length > 0 ? methods.join(' + ') : (c.is_gap ? 'MISSED' : '-')
+                  return (
+                    <tr key={c.coin_id || i}>
+                      <td>
+                        <TokenLink tokenId={c.coin_id} symbol={c.symbol || c.name} chain="coingecko" />
+                      </td>
+                      <td style={{ fontWeight: 700 }}>
+                        {c.price_change_24h != null ? (
+                          <span style={{ color: 'var(--color-accent-red, #ef5350)' }}>
+                            {Number(c.price_change_24h).toFixed(1)}%
+                          </span>
+                        ) : '-'}
+                      </td>
+                      <td>
+                        <span style={{ fontWeight: 700, color: leadTimeColor(leadMin) }}>
+                          {fmtLeadTime(leadMin)}
+                        </span>
+                      </td>
+                      <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
+                        {fmtDate(c.appeared_on_losers_at)}
+                      </td>
+                      <td style={{ fontSize: 12 }}>{detectedBy}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* ── Section F: Latest Predictions ── */}
       <div className="panel" style={{ marginBottom: 16 }}>
         <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
