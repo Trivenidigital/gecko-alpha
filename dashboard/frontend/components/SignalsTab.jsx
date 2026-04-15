@@ -14,6 +14,16 @@ function fmtPct(n) {
   return Number(n).toFixed(1) + '%'
 }
 
+function fmtPrice(n) {
+  if (n == null) return '-'
+  const v = Number(n)
+  if (v === 0) return '$0'
+  if (v >= 1) return '$' + v.toFixed(2)
+  if (v >= 0.01) return '$' + v.toFixed(4)
+  if (v >= 0.0001) return '$' + v.toFixed(6)
+  return '$' + v.toPrecision(3)
+}
+
 function fmtLeadTime(minutes) {
   if (minutes == null) return '-'
   const m = Number(minutes)
@@ -188,6 +198,10 @@ export default function SignalsTab() {
                   <th>Token</th>
                   <th>24h %</th>
                   <th>7d %</th>
+                  <th>Detected Price</th>
+                  <th>Current Price</th>
+                  <th>Gain Since Detection</th>
+                  <th>MCap</th>
                   <th>Lead Time</th>
                   <th>Trended At</th>
                   <th>Detected By</th>
@@ -203,6 +217,9 @@ export default function SignalsTab() {
                   if (c.detected_by_pipeline) methods.push('Pipeline')
                   if (c.detected_by_chains) methods.push('Chains')
                   const detectedBy = methods.length > 0 ? methods.join(' + ') : (c.is_gap ? 'MISSED' : '-')
+                  const gainSinceDetection = (c.price_current && c.price_at_detection && c.price_at_detection > 0)
+                    ? ((c.price_current - c.price_at_detection) / c.price_at_detection * 100)
+                    : null
 
                   return (
                     <tr key={c.coin_id || i}>
@@ -227,6 +244,16 @@ export default function SignalsTab() {
                           </span>
                         ) : '-'}
                       </td>
+                      <td style={{ fontSize: 12 }}>{fmtPrice(c.price_at_detection)}</td>
+                      <td style={{ fontSize: 12 }}>{fmtPrice(c.price_current)}</td>
+                      <td style={{ fontWeight: 700 }}>
+                        {gainSinceDetection != null ? (
+                          <span style={{ color: gainSinceDetection >= 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
+                            {gainSinceDetection >= 0 ? '+' : ''}{gainSinceDetection.toFixed(1)}%
+                          </span>
+                        ) : '-'}
+                      </td>
+                      <td style={{ fontSize: 12 }}>{fmtNum(c.market_cap)}</td>
                       <td>
                         <span style={{
                           fontWeight: 700,
@@ -504,6 +531,11 @@ export default function SignalsTab() {
                 <tr>
                   <th>Token</th>
                   <th>24h %</th>
+                  <th>7d %</th>
+                  <th>Detected Price</th>
+                  <th>Current Price</th>
+                  <th>Gain Since Detection</th>
+                  <th>MCap</th>
                   <th>Lead Time</th>
                   <th>Gained At</th>
                   <th>Detected By</th>
@@ -518,6 +550,9 @@ export default function SignalsTab() {
                   if (c.detected_by_chains) methods.push('Chains')
                   if (c.detected_by_spikes) methods.push('Spikes')
                   const detectedBy = methods.length > 0 ? methods.join(' + ') : (c.is_gap ? 'MISSED' : '-')
+                  const gainSinceDetection = (c.price_current && c.price_at_detection && c.price_at_detection > 0)
+                    ? ((c.price_current - c.price_at_detection) / c.price_at_detection * 100)
+                    : null
                   return (
                     <tr key={c.coin_id || i}>
                       <td>
@@ -530,6 +565,23 @@ export default function SignalsTab() {
                           </span>
                         ) : '-'}
                       </td>
+                      <td style={{ fontWeight: 700 }}>
+                        {c.price_change_7d != null ? (
+                          <span style={{ color: c.price_change_7d > 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
+                            {c.price_change_7d > 0 ? '+' : ''}{Number(c.price_change_7d).toFixed(1)}%
+                          </span>
+                        ) : '-'}
+                      </td>
+                      <td style={{ fontSize: 12 }}>{fmtPrice(c.price_at_detection)}</td>
+                      <td style={{ fontSize: 12 }}>{fmtPrice(c.price_current)}</td>
+                      <td style={{ fontWeight: 700 }}>
+                        {gainSinceDetection != null ? (
+                          <span style={{ color: gainSinceDetection >= 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
+                            {gainSinceDetection >= 0 ? '+' : ''}{gainSinceDetection.toFixed(1)}%
+                          </span>
+                        ) : '-'}
+                      </td>
+                      <td style={{ fontSize: 12 }}>{fmtNum(c.market_cap)}</td>
                       <td>
                         <span style={{ fontWeight: 700, color: leadTimeColor(leadMin) }}>
                           {fmtLeadTime(leadMin)}

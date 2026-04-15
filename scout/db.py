@@ -447,6 +447,7 @@ class Database:
                 price_change_24h REAL NOT NULL,
                 market_cap REAL,
                 volume_24h REAL,
+                price_at_snapshot REAL,
                 snapshot_at TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -584,6 +585,15 @@ class Database:
         ):
             if col not in existing_cols:
                 await self._conn.execute(ddl)
+
+        # Migrate gainers_snapshots: add price_at_snapshot if missing
+        cursor = await self._conn.execute("PRAGMA table_info(gainers_snapshots)")
+        gs_cols = {row[1] for row in await cursor.fetchall()}
+        if "price_at_snapshot" not in gs_cols:
+            await self._conn.execute(
+                "ALTER TABLE gainers_snapshots ADD COLUMN price_at_snapshot REAL"
+            )
+
         await self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -1067,7 +1077,7 @@ class Database:
     async def get_cached_prices(self, coin_ids: list[str]) -> dict[str, dict]:
         """Read price cache rows for the given coin IDs.
 
-        Returns {coin_id: {usd, change_24h, change_7d}} mapping.
+        Returns {coin_id: {usd, change_24h, change_7d, market_cap}} mapping.
         """
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
@@ -1075,7 +1085,7 @@ class Database:
             return {}
         placeholders = ",".join("?" * len(coin_ids))
         cursor = await self._conn.execute(
-            f"SELECT coin_id, current_price, price_change_24h, price_change_7d "
+            f"SELECT coin_id, current_price, price_change_24h, price_change_7d, market_cap "
             f"FROM price_cache WHERE coin_id IN ({placeholders})",
             coin_ids,
         )
@@ -1085,6 +1095,7 @@ class Database:
                 "usd": row[1],
                 "change_24h": row[2],
                 "change_7d": row[3],
+                "market_cap": row[4],
             }
             for row in rows
         }

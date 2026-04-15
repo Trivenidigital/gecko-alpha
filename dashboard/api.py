@@ -304,19 +304,38 @@ def create_app(db_path: str | None = None) -> FastAPI:
             if symbols:
                 try:
                     cursor = await sdb._conn.execute(
-                        "SELECT coin_id, current_price, price_change_24h, price_change_7d FROM price_cache"
+                        "SELECT coin_id, current_price, price_change_24h, price_change_7d, market_cap FROM price_cache"
                     )
                     all_prices = await cursor.fetchall()
                     symbol_map = {}
                     for row in all_prices:
-                        # Extract likely symbol from coin_id (e.g. "genius-3" -> match by prefix)
                         symbol_map[row["coin_id"]] = {
                             "usd": row["current_price"],
                             "change_24h": row["price_change_24h"],
                             "change_7d": row["price_change_7d"],
+                            "market_cap": row["market_cap"],
                         }
                 except Exception:
                     symbol_map = {}
+
+            # Look up earliest detection price for each coin from predictions/candidates
+            detection_prices: dict = {}
+            for c in comparisons:
+                cid = c.get("coin_id", "")
+                sym = (c.get("symbol") or "").upper()
+                # Try predictions table first (has entry_price or market_cap_at_prediction)
+                try:
+                    cursor = await sdb._conn.execute(
+                        """SELECT market_cap_at_prediction FROM predictions
+                           WHERE (coin_id = ? OR UPPER(symbol) = ?)
+                           ORDER BY predicted_at ASC LIMIT 1""",
+                        (cid, sym),
+                    )
+                    prow = await cursor.fetchone()
+                    if prow and prow[0]:
+                        detection_prices[cid] = {"mcap": prow[0]}
+                except Exception:
+                    pass
         finally:
             await sdb.close()
 
@@ -334,10 +353,22 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 c["price_current"] = matched.get("usd")
                 c["price_change_24h"] = matched.get("change_24h")
                 c["price_change_7d"] = matched.get("change_7d")
+                c["market_cap"] = matched.get("market_cap")
             else:
                 c["price_current"] = None
                 c["price_change_24h"] = None
                 c["price_change_7d"] = None
+                c["market_cap"] = None
+
+            # Estimate price_at_detection from current price and 24h change at trending time
+            if c.get("price_current") and c.get("price_change_24h"):
+                change = c["price_change_24h"]
+                if change > -100:
+                    c["price_at_detection"] = c["price_current"] / (1 + change / 100)
+                else:
+                    c["price_at_detection"] = None
+            else:
+                c["price_at_detection"] = None
 
         return comparisons
 
@@ -409,15 +440,93 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/api/gainers/comparisons")
     async def gainers_comparisons(limit: int = Query(50, ge=1, le=500)):
-        """Gainers comparisons with signal detection."""
+        """Gainers comparisons enriched with price_cache data."""
         from scout.db import Database as ScoutDatabase
         from scout.gainers.tracker import get_gainers_comparisons
         sdb = ScoutDatabase(_db_path)
         await sdb.initialize()
         try:
-            return await get_gainers_comparisons(sdb, limit=limit)
+            comparisons = await get_gainers_comparisons(sdb, limit=limit)
+            if not comparisons:
+                return comparisons
+
+            # Collect coin IDs for price_cache lookup
+            coin_ids = [c["coin_id"] for c in comparisons if c.get("coin_id")]
+            prices_map = await sdb.get_cached_prices(coin_ids) if coin_ids else {}
+
+            # Build symbol fallback map
+            symbol_map: dict = {}
+            try:
+                cursor = await sdb._conn.execute(
+                    "SELECT coin_id, current_price, price_change_24h, price_change_7d, market_cap FROM price_cache"
+                )
+                all_prices = await cursor.fetchall()
+                for row in all_prices:
+                    symbol_map[row["coin_id"]] = {
+                        "usd": row["current_price"],
+                        "change_24h": row["price_change_24h"],
+                        "change_7d": row["price_change_7d"],
+                        "market_cap": row["market_cap"],
+                    }
+            except Exception:
+                pass
+
+            # Look up price_at_snapshot from gainers_snapshots for each coin
+            price_at_snap: dict = {}
+            for c in comparisons:
+                cid = c.get("coin_id", "")
+                try:
+                    cursor = await sdb._conn.execute(
+                        """SELECT price_at_snapshot, price_change_24h
+                           FROM gainers_snapshots
+                           WHERE coin_id = ?
+                           ORDER BY snapshot_at ASC LIMIT 1""",
+                        (cid,),
+                    )
+                    row = await cursor.fetchone()
+                    if row and row["price_at_snapshot"]:
+                        price_at_snap[cid] = row["price_at_snapshot"]
+                    elif row:
+                        # Estimate: no price_at_snapshot stored yet, back-calculate
+                        # from current price and the 24h change at time of snapshot
+                        pass
+                except Exception:
+                    pass
         finally:
             await sdb.close()
+
+        for c in comparisons:
+            cid = c.get("coin_id", "")
+            sym = (c.get("symbol") or "").lower()
+            matched = prices_map.get(cid)
+            if not matched and sym:
+                for pcid, pdata in symbol_map.items():
+                    if pcid.startswith(sym) or sym in pcid:
+                        matched = pdata
+                        break
+            if matched:
+                c["price_current"] = matched.get("usd")
+                c["price_change_7d"] = matched.get("change_7d")
+                c["market_cap"] = matched.get("market_cap") or c.get("market_cap")
+            else:
+                c["price_current"] = None
+                c["price_change_7d"] = None
+
+            # price_at_detection: use stored snapshot price, or estimate
+            snap_price = price_at_snap.get(cid)
+            if snap_price:
+                c["price_at_detection"] = snap_price
+            elif c.get("price_current") and c.get("price_change_24h"):
+                # Back-calculate: price_at_detection ~= current / (1 + change/100)
+                change = c["price_change_24h"]
+                if change > -100:
+                    c["price_at_detection"] = c["price_current"] / (1 + change / 100)
+                else:
+                    c["price_at_detection"] = None
+            else:
+                c["price_at_detection"] = None
+
+        return comparisons
 
     @app.get("/api/gainers/stats")
     async def gainers_stats():

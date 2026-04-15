@@ -58,8 +58,8 @@ async def store_top_gainers(
         await db._conn.execute(
             """INSERT INTO gainers_snapshots
                (coin_id, symbol, name, price_change_24h, market_cap,
-                volume_24h, snapshot_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                volume_24h, price_at_snapshot, snapshot_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 coin["id"],
                 (coin.get("symbol") or "???").upper(),
@@ -67,6 +67,7 @@ async def store_top_gainers(
                 coin.get("price_change_percentage_24h") or 0,
                 coin.get("market_cap"),
                 coin.get("total_volume"),
+                coin.get("current_price"),
                 now,
             ),
         )
