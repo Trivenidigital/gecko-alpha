@@ -312,6 +312,26 @@ async def run_cycle(
         except Exception:
             logger.exception("gainers_tracker_error")
 
+    # Paper trade new gainers
+    if trading_engine and settings.GAINERS_TRACKER_ENABLED:
+        try:
+            cursor = await db._conn.execute(
+                """SELECT DISTINCT coin_id, symbol, name, price_change_24h FROM gainers_snapshots
+                   WHERE snapshot_at >= datetime('now', '-2 minutes')
+                   AND coin_id NOT IN (
+                       SELECT token_id FROM paper_trades WHERE signal_type = 'gainers_early' AND status = 'open'
+                   )"""
+            )
+            new_gainers = await cursor.fetchall()
+            for g in new_gainers:
+                await trading_engine.open_trade(
+                    token_id=g["coin_id"], symbol=g["symbol"], name=g["name"],
+                    chain="coingecko", signal_type="gainers_early",
+                    signal_data={"price_change_24h": g["price_change_24h"]},
+                )
+        except Exception:
+            logger.exception("trading_gainers_error")
+
     # Top Losers Tracker (zero extra API calls -- uses cached data)
     if settings.LOSERS_TRACKER_ENABLED and _raw_markets_combined:
         try:
@@ -322,6 +342,26 @@ async def run_cycle(
             )
         except Exception:
             logger.exception("losers_tracker_error")
+
+    # Paper trade new losers (contrarian play)
+    if trading_engine and settings.LOSERS_TRACKER_ENABLED:
+        try:
+            cursor = await db._conn.execute(
+                """SELECT DISTINCT coin_id, symbol, name, price_change_24h FROM losers_snapshots
+                   WHERE snapshot_at >= datetime('now', '-2 minutes')
+                   AND coin_id NOT IN (
+                       SELECT token_id FROM paper_trades WHERE signal_type = 'losers_contrarian' AND status = 'open'
+                   )"""
+            )
+            new_losers = await cursor.fetchall()
+            for l in new_losers:
+                await trading_engine.open_trade(
+                    token_id=l["coin_id"], symbol=l["symbol"], name=l["name"],
+                    chain="coingecko", signal_type="losers_contrarian",
+                    signal_data={"price_change_24h": l["price_change_24h"]},
+                )
+        except Exception:
+            logger.exception("trading_losers_error")
 
     # Stage 2: Aggregate
     all_candidates = aggregate(
@@ -594,6 +634,26 @@ async def narrative_agent_loop(
                     await store_trending_from_candidates(db, cg_trending)
                 except Exception:
                     logger.exception("trending_tracker.snapshot_error")
+
+            # Paper trade new trending tokens
+            if trading_engine and settings.TRENDING_SNAPSHOT_ENABLED:
+                try:
+                    cursor = await db._conn.execute(
+                        """SELECT DISTINCT coin_id, symbol, name FROM trending_snapshots
+                           WHERE snapshot_at >= datetime('now', '-2 minutes')
+                           AND coin_id NOT IN (
+                               SELECT token_id FROM paper_trades WHERE signal_type = 'trending_catch' AND status = 'open'
+                           )"""
+                    )
+                    new_trending = await cursor.fetchall()
+                    for t in new_trending:
+                        await trading_engine.open_trade(
+                            token_id=t["coin_id"], symbol=t["symbol"], name=t["name"],
+                            chain="coingecko", signal_type="trending_catch",
+                            signal_data={"source": "trending_snapshot"},
+                        )
+                except Exception:
+                    logger.exception("trading_trending_catch_error")
 
             # Load 6-hour-ago snapshots for acceleration comparison
             six_hours_ago = now - timedelta(hours=6)
@@ -1052,6 +1112,28 @@ async def narrative_agent_loop(
                         logger.info("losers_tracker.compare_complete")
                     except Exception:
                         logger.exception("losers_tracker.compare_error")
+
+                # Paper trade completed chains
+                if trading_engine and settings.CHAINS_ENABLED:
+                    try:
+                        cursor = await db._conn.execute(
+                            """SELECT DISTINCT token_id, pattern_id, pattern_name, conviction_boost, pipeline
+                               FROM chain_matches
+                               WHERE completed_at >= datetime('now', '-2 minutes')
+                               AND token_id NOT IN (
+                                   SELECT token_id FROM paper_trades WHERE signal_type = 'chain_completed' AND status = 'open'
+                               )"""
+                        )
+                        new_chains = await cursor.fetchall()
+                        for c in new_chains:
+                            await trading_engine.open_trade(
+                                token_id=c["token_id"],
+                                chain="coingecko",
+                                signal_type="chain_completed",
+                                signal_data={"pattern": c["pattern_name"], "boost": c["conviction_boost"]},
+                            )
+                    except Exception:
+                        logger.exception("trading_chain_complete_error")
 
             # ----------------------------------------------------------
             # LEARN daily (gated by hour + 23h gap)
