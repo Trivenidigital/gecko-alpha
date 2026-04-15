@@ -71,7 +71,7 @@ async def fetch_top_movers(
 
     base_params = {
         "vs_currency": "usd",
-        "per_page": "50",
+        "per_page": "250",
         "page": "1",
         "sparkline": "false",
         "price_change_percentage": "1h,24h,7d",
@@ -191,7 +191,7 @@ async def fetch_by_volume(
     params = {
         "vs_currency": "usd",
         "order": "volume_desc",
-        "per_page": "50",
+        "per_page": "250",
         "page": "1",
         "sparkline": "false",
         "price_change_percentage": "1h,24h,7d",
