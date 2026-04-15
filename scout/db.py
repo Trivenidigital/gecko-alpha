@@ -423,6 +423,22 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_vol_spikes
                 ON volume_spikes(coin_id, detected_at);
 
+            CREATE TABLE IF NOT EXISTS momentum_7d (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                price_change_7d REAL NOT NULL,
+                price_change_24h REAL,
+                market_cap REAL,
+                current_price REAL,
+                volume_24h REAL,
+                detected_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_momentum_7d
+                ON momentum_7d(coin_id, detected_at);
+
             CREATE TABLE IF NOT EXISTS gainers_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 coin_id TEXT NOT NULL,

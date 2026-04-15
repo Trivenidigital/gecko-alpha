@@ -3,7 +3,15 @@
 import pytest
 
 from scout.db import Database
-from scout.spikes.detector import detect_spikes, get_recent_spikes, get_spike_stats, record_volume
+from scout.spikes.detector import (
+    detect_7d_momentum,
+    detect_spikes,
+    get_momentum_7d_stats,
+    get_recent_momentum_7d,
+    get_recent_spikes,
+    get_spike_stats,
+    record_volume,
+)
 
 
 @pytest.fixture
@@ -178,3 +186,110 @@ async def test_record_volume_prunes_old_data(db):
     )
     row = await cursor.fetchone()
     assert row[0] == 0
+
+
+# -- 7-Day Momentum Scanner Tests --
+
+
+def _make_7d_coin(
+    coin_id: str,
+    change_7d: float,
+    mcap: float = 100_000_000,
+    change_24h: float = 5.0,
+    volume: float = 1_000_000,
+    price: float = 1.0,
+):
+    return {
+        "id": coin_id,
+        "symbol": coin_id[:3],
+        "name": coin_id.title(),
+        "price_change_percentage_7d_in_currency": change_7d,
+        "price_change_percentage_24h": change_24h,
+        "market_cap": mcap,
+        "current_price": price,
+        "total_volume": volume,
+    }
+
+
+async def test_detect_7d_momentum_finds_runner(db):
+    raw = [_make_7d_coin("pandora", 438.0, mcap=200_000_000)]
+    results = await detect_7d_momentum(db, raw, min_7d_change=100.0, max_mcap=500_000_000)
+    assert len(results) == 1
+    assert results[0]["coin_id"] == "pandora"
+    assert results[0]["price_change_7d"] == 438.0
+    assert results[0]["symbol"] == "PAN"
+
+
+async def test_detect_7d_momentum_skips_below_threshold(db):
+    raw = [_make_7d_coin("slow-mover", 50.0)]
+    results = await detect_7d_momentum(db, raw, min_7d_change=100.0)
+    assert len(results) == 0
+
+
+async def test_detect_7d_momentum_skips_mega_cap(db):
+    raw = [_make_7d_coin("bitcoin", 150.0, mcap=1_000_000_000)]
+    results = await detect_7d_momentum(db, raw, min_7d_change=100.0, max_mcap=500_000_000)
+    assert len(results) == 0
+
+
+async def test_detect_7d_momentum_skips_zero_mcap(db):
+    raw = [_make_7d_coin("no-cap", 200.0, mcap=0)]
+    results = await detect_7d_momentum(db, raw, min_7d_change=100.0)
+    assert len(results) == 0
+
+
+async def test_detect_7d_momentum_dedup_same_day(db):
+    raw = [_make_7d_coin("pandora", 438.0)]
+    results1 = await detect_7d_momentum(db, raw, min_7d_change=100.0)
+    assert len(results1) == 1
+
+    # Second call same day should not duplicate
+    results2 = await detect_7d_momentum(db, raw, min_7d_change=100.0)
+    assert len(results2) == 0
+
+
+async def test_detect_7d_momentum_persists_to_db(db):
+    raw = [_make_7d_coin("pandora", 438.0)]
+    await detect_7d_momentum(db, raw, min_7d_change=100.0)
+
+    cursor = await db._conn.execute("SELECT COUNT(*) FROM momentum_7d")
+    row = await cursor.fetchone()
+    assert row[0] == 1
+
+
+async def test_get_recent_momentum_7d(db):
+    await db._conn.execute(
+        """INSERT INTO momentum_7d
+           (coin_id, symbol, name, price_change_7d, price_change_24h,
+            market_cap, current_price, volume_24h, detected_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+        ("pandora", "PANDORA", "Pandora", 438.0, 25.0, 200_000_000, 30.0, 5_000_000),
+    )
+    await db._conn.commit()
+
+    recent = await get_recent_momentum_7d(db, limit=10)
+    assert len(recent) == 1
+    assert recent[0]["coin_id"] == "pandora"
+    assert recent[0]["price_change_7d"] == 438.0
+
+
+async def test_get_momentum_7d_stats(db):
+    await db._conn.execute(
+        """INSERT INTO momentum_7d
+           (coin_id, symbol, name, price_change_7d, price_change_24h,
+            market_cap, current_price, volume_24h, detected_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+        ("pandora", "PANDORA", "Pandora", 438.0, 25.0, 200_000_000, 30.0, 5_000_000),
+    )
+    await db._conn.commit()
+
+    stats = await get_momentum_7d_stats(db)
+    assert stats["detections_today"] == 1
+    assert stats["detections_this_week"] == 1
+    assert stats["avg_7d_change"] == 438.0
+
+
+async def test_detect_7d_momentum_skips_missing_id(db):
+    raw = [{"symbol": "x", "price_change_percentage_7d_in_currency": 200.0, "market_cap": 100_000}]
+    results = await detect_7d_momentum(db, raw, min_7d_change=100.0)
+    assert len(results) == 0

@@ -56,7 +56,7 @@ from scout.trending.tracker import (
     fetch_and_store_trending,
     store_trending_from_candidates,
 )
-from scout.spikes.detector import record_volume, detect_spikes
+from scout.spikes.detector import record_volume, detect_spikes, detect_7d_momentum
 from scout.gainers.tracker import (
     store_top_gainers,
     compare_gainers_with_signals,
@@ -362,6 +362,42 @@ async def run_cycle(
                 )
         except Exception:
             logger.exception("trading_losers_error")
+
+    # 7-Day Momentum Scanner (zero extra API calls -- filters existing data)
+    if settings.MOMENTUM_7D_ENABLED and _raw_markets_combined:
+        try:
+            momentum_7d = await detect_7d_momentum(
+                db, _raw_markets_combined,
+                min_7d_change=settings.MOMENTUM_7D_MIN_CHANGE,
+                max_mcap=settings.MOMENTUM_7D_MAX_MCAP,
+            )
+            if momentum_7d:
+                logger.info(
+                    "momentum_7d_tokens",
+                    count=len(momentum_7d),
+                    tokens=[m["symbol"] for m in momentum_7d],
+                )
+                if trading_engine:
+                    for m in momentum_7d:
+                        try:
+                            await trading_engine.open_trade(
+                                token_id=m["coin_id"],
+                                symbol=m["symbol"],
+                                name=m["name"],
+                                chain="coingecko",
+                                signal_type="momentum_7d",
+                                signal_data={
+                                    "change_7d": m["price_change_7d"],
+                                    "change_24h": m["price_change_24h"],
+                                },
+                            )
+                        except Exception:
+                            logger.exception(
+                                "trading_momentum_7d_error",
+                                coin_id=m.get("coin_id"),
+                            )
+        except Exception:
+            logger.exception("momentum_7d_error")
 
     # Stage 2: Aggregate
     all_candidates = aggregate(

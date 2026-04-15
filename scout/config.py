@@ -91,6 +91,11 @@ class Settings(BaseSettings):
     CHAIN_GRADUATION_MIN_TRIGGERS: int = 30
     CHAIN_GRADUATION_HIT_RATE: float = 0.55
 
+    # -------- 7-Day Momentum Scanner --------
+    MOMENTUM_7D_ENABLED: bool = True
+    MOMENTUM_7D_MIN_CHANGE: float = 100.0       # min 7d change % to flag (100% = doubled)
+    MOMENTUM_7D_MAX_MCAP: float = 500_000_000   # filter out mega caps
+
     # -------- Volume Spike Detector --------
     VOLUME_SPIKE_ENABLED: bool = True
     VOLUME_SPIKE_RATIO: float = 5.0

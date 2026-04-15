@@ -186,6 +186,129 @@ async def detect_spikes(
     return spikes
 
 
+async def detect_7d_momentum(
+    db: "Database",
+    raw_coins: list[dict],
+    min_7d_change: float = 100.0,
+    max_mcap: float = 500_000_000,
+) -> list[dict]:
+    """Find tokens with extreme 7-day returns from already-fetched data.
+
+    Pandora-type catches: +438% 7d that slip under the daily radar.
+    No extra API calls -- filters the raw /coins/markets data we already have.
+    """
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+
+    now = datetime.now(timezone.utc).isoformat()
+    results: list[dict] = []
+
+    for coin in raw_coins:
+        cid = coin.get("id")
+        if not cid:
+            continue
+        change_7d = coin.get("price_change_percentage_7d_in_currency") or 0
+        mcap = coin.get("market_cap") or 0
+
+        if change_7d < min_7d_change or mcap <= 0 or mcap > max_mcap:
+            continue
+
+        # Dedup: skip if already detected today for this coin
+        cursor = await db._conn.execute(
+            "SELECT id FROM momentum_7d WHERE coin_id = ? AND date(detected_at) = date('now')",
+            (cid,),
+        )
+        if await cursor.fetchone():
+            continue
+
+        row_data = {
+            "coin_id": cid,
+            "symbol": (coin.get("symbol") or "").upper(),
+            "name": coin.get("name") or "",
+            "price_change_7d": change_7d,
+            "price_change_24h": coin.get("price_change_percentage_24h") or 0,
+            "market_cap": mcap,
+            "current_price": coin.get("current_price"),
+            "volume_24h": coin.get("total_volume") or 0,
+        }
+
+        # Persist to momentum_7d table
+        await db._conn.execute(
+            """INSERT INTO momentum_7d
+               (coin_id, symbol, name, price_change_7d, price_change_24h,
+                market_cap, current_price, volume_24h, detected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                row_data["coin_id"],
+                row_data["symbol"],
+                row_data["name"],
+                row_data["price_change_7d"],
+                row_data["price_change_24h"],
+                row_data["market_cap"],
+                row_data["current_price"],
+                row_data["volume_24h"],
+                now,
+            ),
+        )
+
+        results.append(row_data)
+
+    if results:
+        await db._conn.commit()
+        logger.info("momentum_7d_detected", count=len(results))
+
+    return results
+
+
+async def get_recent_momentum_7d(
+    db: "Database", limit: int = 20
+) -> list[dict]:
+    """Get recent 7d momentum detections for the dashboard."""
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+
+    cursor = await db._conn.execute(
+        """SELECT coin_id, symbol, name, price_change_7d, price_change_24h,
+                  market_cap, current_price, volume_24h,
+                  detected_at, created_at
+           FROM momentum_7d
+           ORDER BY detected_at DESC
+           LIMIT ?""",
+        (limit,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(row) for row in rows]
+
+
+async def get_momentum_7d_stats(db: "Database") -> dict:
+    """Momentum 7d stats: counts for today and this week."""
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+
+    cursor = await db._conn.execute(
+        "SELECT COUNT(*) FROM momentum_7d WHERE date(detected_at) = date('now')"
+    )
+    today_count = (await cursor.fetchone())[0]
+
+    cursor = await db._conn.execute(
+        "SELECT COUNT(*) FROM momentum_7d WHERE detected_at >= datetime('now', '-7 days')"
+    )
+    week_count = (await cursor.fetchone())[0]
+
+    cursor = await db._conn.execute(
+        """SELECT AVG(price_change_7d) FROM momentum_7d
+           WHERE detected_at >= datetime('now', '-7 days')"""
+    )
+    row = await cursor.fetchone()
+    avg_change = round(row[0], 1) if row and row[0] else 0.0
+
+    return {
+        "detections_today": today_count,
+        "detections_this_week": week_count,
+        "avg_7d_change": avg_change,
+    }
+
+
 async def get_recent_spikes(
     db: "Database", limit: int = 20
 ) -> list[dict]:

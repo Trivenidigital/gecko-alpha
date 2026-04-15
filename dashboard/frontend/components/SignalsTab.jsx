@@ -80,10 +80,12 @@ export default function SignalsTab() {
   const [gainersStats, setGainersStats] = useState(null)
   const [losersComps, setLosersComps] = useState([])
   const [losersStats, setLosersStats] = useState(null)
+  const [momentum7d, setMomentum7d] = useState([])
+  const [momentum7dStats, setMomentum7dStats] = useState(null)
 
   const fetchAll = useCallback(async () => {
     try {
-      const [compRes, statsRes, heatRes, predRes, spkRes, spkStatsRes, gnrRes, gnrStatsRes, lsrRes, lsrStatsRes] = await Promise.all([
+      const [compRes, statsRes, heatRes, predRes, spkRes, spkStatsRes, gnrRes, gnrStatsRes, lsrRes, lsrStatsRes, m7dRes, m7dStatsRes] = await Promise.all([
         fetch('/api/trending/comparisons-enriched?limit=30'),
         fetch('/api/trending/stats'),
         fetch('/api/narrative/heating'),
@@ -94,6 +96,8 @@ export default function SignalsTab() {
         fetch('/api/gainers/stats'),
         fetch('/api/losers/comparisons?limit=30'),
         fetch('/api/losers/stats'),
+        fetch('/api/momentum/7d?limit=15'),
+        fetch('/api/momentum/7d/stats'),
       ])
       if (compRes.ok) setComparisons(await compRes.json())
       if (statsRes.ok) setTrendingStats(await statsRes.json())
@@ -105,6 +109,8 @@ export default function SignalsTab() {
       if (gnrStatsRes.ok) setGainersStats(await gnrStatsRes.json())
       if (lsrRes.ok) setLosersComps(await lsrRes.json())
       if (lsrStatsRes.ok) setLosersStats(await lsrStatsRes.json())
+      if (m7dRes.ok) setMomentum7d(await m7dRes.json())
+      if (m7dStatsRes.ok) setMomentum7dStats(await m7dStatsRes.json())
     } catch {
       // API not available yet
     }
@@ -368,6 +374,81 @@ export default function SignalsTab() {
                       ) : '-'}
                     </td>
                     <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>{fmtDate(s.detected_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* ── Section C2: 7-Day Momentum ── */}
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
+            7-Day Momentum
+          </span>
+          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
+            Mid-term runners with extreme weekly returns (Pandora-type catches)
+          </span>
+        </div>
+
+        {momentum7dStats && (
+          <div style={{
+            display: 'flex', gap: 24, padding: '12px 16px',
+            borderBottom: '1px solid var(--color-border)', flexWrap: 'wrap',
+          }}>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Today</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--color-accent-amber)' }}>{momentum7dStats.detections_today}</div>
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>This Week</div>
+              <div style={{ fontSize: 22, fontWeight: 700 }}>{momentum7dStats.detections_this_week}</div>
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Avg 7d Change</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--color-accent-green)' }}>+{momentum7dStats.avg_7d_change}%</div>
+            </div>
+          </div>
+        )}
+
+        {momentum7d.length === 0 ? (
+          <div className="empty-state">No 7d momentum tokens detected yet. The scanner runs every cycle.</div>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table className="candidates-table">
+              <thead>
+                <tr>
+                  <th>Token</th>
+                  <th>7d %</th>
+                  <th>24h %</th>
+                  <th>MCap</th>
+                  <th>Volume</th>
+                  <th>Price</th>
+                  <th>Detected</th>
+                </tr>
+              </thead>
+              <tbody>
+                {momentum7d.map((m, i) => (
+                  <tr key={m.coin_id + '-' + i}>
+                    <td>
+                      <TokenLink tokenId={m.coin_id} symbol={m.symbol || m.name} chain="coingecko" />
+                    </td>
+                    <td style={{ fontWeight: 700, color: 'var(--color-accent-green)' }}>
+                      +{Number(m.price_change_7d).toFixed(1)}%
+                    </td>
+                    <td style={{ fontWeight: 700 }}>
+                      {m.price_change_24h != null ? (
+                        <span style={{ color: m.price_change_24h > 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
+                          {m.price_change_24h > 0 ? '+' : ''}{Number(m.price_change_24h).toFixed(1)}%
+                        </span>
+                      ) : '-'}
+                    </td>
+                    <td>{fmtNum(m.market_cap)}</td>
+                    <td>{fmtNum(m.volume_24h)}</td>
+                    <td>{m.current_price != null ? '$' + Number(m.current_price).toPrecision(4) : '-'}</td>
+                    <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>{fmtDate(m.detected_at)}</td>
                   </tr>
                 ))}
               </tbody>

@@ -367,6 +367,32 @@ def create_app(db_path: str | None = None) -> FastAPI:
         finally:
             await sdb.close()
 
+    # --- 7-Day Momentum Scanner endpoints ---
+
+    @app.get("/api/momentum/7d")
+    async def momentum_7d_recent(limit: int = Query(20, ge=1, le=200)):
+        """Tokens with extreme 7d returns detected by the momentum scanner."""
+        from scout.db import Database as ScoutDatabase
+        from scout.spikes.detector import get_recent_momentum_7d
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            return await get_recent_momentum_7d(sdb, limit=limit)
+        finally:
+            await sdb.close()
+
+    @app.get("/api/momentum/7d/stats")
+    async def momentum_7d_stats():
+        """7d momentum scanner stats."""
+        from scout.db import Database as ScoutDatabase
+        from scout.spikes.detector import get_momentum_7d_stats
+        sdb = ScoutDatabase(_db_path)
+        await sdb.initialize()
+        try:
+            return await get_momentum_7d_stats(sdb)
+        finally:
+            await sdb.close()
+
     # --- Top Gainers Tracker endpoints ---
 
     @app.get("/api/gainers/snapshots")
