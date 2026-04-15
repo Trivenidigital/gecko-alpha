@@ -141,7 +141,10 @@ class TradingEngine:
 
         token_id = row[0]
         price_row = await self._get_current_price_with_age(token_id)
-        current_price = price_row[0] if price_row else 0.0
+        if price_row is None:
+            log.warning("close_trade_no_price", trade_id=trade_id, token_id=token_id)
+            return
+        current_price = price_row[0]
 
         await self._paper_trader.execute_sell(
             db=self.db,

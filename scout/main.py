@@ -326,14 +326,17 @@ async def run_cycle(
             )
             new_gainers = await cursor.fetchall()
             for g in new_gainers:
-                await trading_engine.open_trade(
-                    token_id=g["coin_id"], symbol=g["symbol"], name=g["name"],
-                    chain="coingecko", signal_type="gainers_early",
-                    signal_data={"price_change_24h": g["price_change_24h"]},
-                    entry_price=g["price_at_snapshot"],
-                )
+                try:
+                    await trading_engine.open_trade(
+                        token_id=g["coin_id"], symbol=g["symbol"], name=g["name"],
+                        chain="coingecko", signal_type="gainers_early",
+                        signal_data={"price_change_24h": g["price_change_24h"]},
+                        entry_price=g["price_at_snapshot"],
+                    )
+                except Exception:
+                    logger.exception("trading_gainers_error", coin_id=g["coin_id"])
         except Exception:
-            logger.exception("trading_gainers_error")
+            logger.exception("trading_gainers_query_error")
 
     # Top Losers Tracker (zero extra API calls -- uses cached data)
     if settings.LOSERS_TRACKER_ENABLED and _raw_markets_combined:
@@ -358,21 +361,24 @@ async def run_cycle(
             )
             new_losers = await cursor.fetchall()
             for l in new_losers:
-                # Look up price from price_cache (updated in same cycle)
-                pc = await db._conn.execute(
-                    "SELECT current_price FROM price_cache WHERE coin_id = ?",
-                    (l["coin_id"],),
-                )
-                price_row = await pc.fetchone()
-                loser_price = price_row[0] if price_row else None
-                await trading_engine.open_trade(
-                    token_id=l["coin_id"], symbol=l["symbol"], name=l["name"],
-                    chain="coingecko", signal_type="losers_contrarian",
-                    signal_data={"price_change_24h": l["price_change_24h"]},
-                    entry_price=loser_price,
-                )
+                try:
+                    # Look up price from price_cache (updated in same cycle)
+                    pc = await db._conn.execute(
+                        "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                        (l["coin_id"],),
+                    )
+                    price_row = await pc.fetchone()
+                    loser_price = price_row[0] if price_row else None
+                    await trading_engine.open_trade(
+                        token_id=l["coin_id"], symbol=l["symbol"], name=l["name"],
+                        chain="coingecko", signal_type="losers_contrarian",
+                        signal_data={"price_change_24h": l["price_change_24h"]},
+                        entry_price=loser_price,
+                    )
+                except Exception:
+                    logger.exception("trading_losers_error", coin_id=l["coin_id"])
         except Exception:
-            logger.exception("trading_losers_error")
+            logger.exception("trading_losers_query_error")
 
     # 7-Day Momentum Scanner (zero extra API calls -- filters existing data)
     if settings.MOMENTUM_7D_ENABLED and _raw_markets_combined:
@@ -676,11 +682,12 @@ async def narrative_agent_loop(
             await store_snapshot(db, snapshots)
 
             # Trending snapshot (gated by TRENDING_SNAPSHOT_ENABLED)
-            # Reuse cg_trending data already fetched in Stage 1 ingestion
-            # to avoid a duplicate /search/trending API call.
+            # narrative_agent_loop does NOT have access to cg_trending
+            # (which is local to run_cycle).  Use fetch_and_store_trending
+            # which fetches fresh data from /search/trending.
             if settings.TRENDING_SNAPSHOT_ENABLED:
                 try:
-                    await store_trending_from_candidates(db, cg_trending)
+                    await fetch_and_store_trending(db, session, settings)
                 except Exception:
                     logger.exception("trending_tracker.snapshot_error")
 

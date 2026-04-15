@@ -65,7 +65,7 @@ async def get_recent_alerts(db_path: str, limit: int = 20) -> list[dict]:
                       o.price_change_pct, o.check_price, o.check_time
                FROM alerts a
                LEFT JOIN candidates c ON a.contract_address = c.contract_address
-               LEFT JOIN outcomes o ON a.id = o.id
+               LEFT JOIN outcomes o ON a.contract_address = o.contract_address
                ORDER BY a.alerted_at DESC
                LIMIT ?""",
             (limit,),

@@ -119,13 +119,16 @@ class PaperTrader:
         }
         status = status_map.get(reason, "closed_manual")
 
-        await conn.execute(
+        cursor_upd = await conn.execute(
             """UPDATE paper_trades
                SET status = ?, exit_price = ?, exit_reason = ?,
                    pnl_usd = ?, pnl_pct = ?, closed_at = ?
-               WHERE id = ?""",
+               WHERE id = ? AND status = 'open'""",
             (status, effective_exit, reason, pnl_usd, round(pnl_pct, 4), now, trade_id),
         )
+        if cursor_upd.rowcount == 0:
+            log.warning("trade_already_closed", trade_id=trade_id)
+            return
         await conn.commit()
 
         log.info(
