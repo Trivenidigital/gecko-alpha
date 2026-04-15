@@ -6,7 +6,7 @@ import pytest
 import aiohttp
 from aioresponses import aioresponses
 
-from scout.ingestion.coingecko import fetch_top_movers, fetch_trending
+from scout.ingestion.coingecko import fetch_top_movers, fetch_trending, fetch_by_volume
 from scout.ratelimit import coingecko_limiter
 
 # -- Fixtures --
@@ -135,6 +135,72 @@ async def test_coingecko_outage_does_not_crash_pipeline(settings_factory):
         mocked.get(MARKETS_PATTERN, status=500)
         async with aiohttp.ClientSession() as session:
             tokens = await fetch_top_movers(session, settings)
+
+    assert tokens == []
+
+
+# -- Volume scan tests --
+
+VOLUME_RESPONSE = [
+    {
+        "id": "high-vol-token",
+        "symbol": "hvt",
+        "name": "HighVolToken",
+        "market_cap": 50_000_000,
+        "total_volume": 10_000_000,
+        "price_change_percentage_1h_in_currency": 2.0,
+        "price_change_percentage_24h": 5.0,
+    },
+    {
+        "id": "low-vol-token",
+        "symbol": "lvt",
+        "name": "LowVolToken",
+        "market_cap": 100_000,
+        "total_volume": 50_000,
+        "price_change_percentage_1h_in_currency": 1.0,
+        "price_change_percentage_24h": 3.0,
+    },
+]
+
+
+@pytest.mark.asyncio
+async def test_fetch_by_volume_returns_tokens(settings_factory):
+    """Volume scan returns tokens sorted by volume, wider cap range."""
+    settings = settings_factory(MIN_MARKET_CAP=1000, MAX_MARKET_CAP=1_000_000)
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, payload=VOLUME_RESPONSE)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_by_volume(session, settings)
+
+    # Both tokens pass MIN_MARKET_CAP (1000); no MAX filter in fetch_by_volume
+    assert len(tokens) == 2
+    # Sorted by volume descending
+    assert tokens[0].volume_24h_usd >= tokens[1].volume_24h_usd
+    assert tokens[0].ticker == "hvt"
+
+
+@pytest.mark.asyncio
+async def test_fetch_by_volume_filters_below_min_mcap(settings_factory):
+    """Volume scan filters out tokens below MIN_MARKET_CAP."""
+    settings = settings_factory(MIN_MARKET_CAP=1_000_000)
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, payload=VOLUME_RESPONSE)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_by_volume(session, settings)
+
+    # Only high-vol-token (50M mcap) passes the 1M threshold
+    assert len(tokens) == 1
+    assert tokens[0].ticker == "hvt"
+
+
+@pytest.mark.asyncio
+async def test_fetch_by_volume_outage_returns_empty(settings_factory):
+    """Volume scan returns empty list on API failure."""
+    settings = settings_factory()
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, status=500)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_by_volume(session, settings)
 
     assert tokens == []
 

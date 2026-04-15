@@ -22,6 +22,7 @@ from scout.db import Database
 from scout.gate import evaluate
 from scout.ingestion.coingecko import fetch_top_movers as cg_fetch_top_movers
 from scout.ingestion.coingecko import fetch_trending as cg_fetch_trending
+from scout.ingestion.coingecko import fetch_by_volume as cg_fetch_by_volume
 from scout.ingestion import coingecko as _cg_module
 from scout.ingestion.dexscreener import fetch_trending
 from scout.ingestion.geckoterminal import fetch_trending_pools
@@ -224,11 +225,12 @@ async def run_cycle(
     stats = {"tokens_scanned": 0, "candidates_promoted": 0, "alerts_fired": 0}
 
     # Stage 1: Parallel ingestion
-    dex_tokens, gecko_tokens, cg_movers, cg_trending = await asyncio.gather(
+    dex_tokens, gecko_tokens, cg_movers, cg_trending, cg_by_volume = await asyncio.gather(
         fetch_trending(session, settings),
         fetch_trending_pools(session, settings),
         cg_fetch_top_movers(session, settings),
         cg_fetch_trending(session, settings),
+        cg_fetch_by_volume(session, settings),
         return_exceptions=True,
     )
     # Handle exceptions from gather
@@ -244,11 +246,16 @@ async def run_cycle(
     if isinstance(cg_trending, Exception):
         logger.warning("CoinGecko trending ingestion failed", error=str(cg_trending))
         cg_trending = []
+    if isinstance(cg_by_volume, Exception):
+        logger.warning("CoinGecko volume scan failed", error=str(cg_by_volume))
+        cg_by_volume = []
 
     # Cache raw CoinGecko prices for dashboard (zero extra API calls)
     all_raw = list(_cg_module.last_raw_markets)
     if _cg_module.last_raw_trending:
         all_raw.extend(_cg_module.last_raw_trending)
+    if _cg_module.last_raw_by_volume:
+        all_raw.extend(_cg_module.last_raw_by_volume)
     if all_raw:
         try:
             cached = await db.cache_prices(all_raw)
@@ -256,10 +263,20 @@ async def run_cycle(
         except Exception:
             logger.exception("price_cache_error")
 
+    # Combine raw market data from both movers and volume scans (dedup by id)
+    _raw_markets_combined: list[dict] = []
+    _seen_ids: set[str] = set()
+    for raw_list in [_cg_module.last_raw_markets, _cg_module.last_raw_by_volume]:
+        for coin in raw_list:
+            cid = coin.get("id", "")
+            if cid and cid not in _seen_ids:
+                _seen_ids.add(cid)
+                _raw_markets_combined.append(coin)
+
     # Volume Spike Detection (zero extra API calls -- uses cached data)
-    if settings.VOLUME_SPIKE_ENABLED and _cg_module.last_raw_markets:
+    if settings.VOLUME_SPIKE_ENABLED and _raw_markets_combined:
         try:
-            await record_volume(db, _cg_module.last_raw_markets)
+            await record_volume(db, _raw_markets_combined)
             spikes = await detect_spikes(
                 db, settings.VOLUME_SPIKE_RATIO, settings.VOLUME_SPIKE_MAX_MCAP
             )
@@ -285,10 +302,10 @@ async def run_cycle(
             logger.exception("volume_spike_error")
 
     # Top Gainers Tracker (zero extra API calls -- uses cached data)
-    if settings.GAINERS_TRACKER_ENABLED and _cg_module.last_raw_markets:
+    if settings.GAINERS_TRACKER_ENABLED and _raw_markets_combined:
         try:
             await store_top_gainers(
-                db, _cg_module.last_raw_markets,
+                db, _raw_markets_combined,
                 min_change=settings.GAINERS_MIN_CHANGE,
                 max_mcap=settings.GAINERS_MAX_MCAP,
             )
@@ -296,10 +313,10 @@ async def run_cycle(
             logger.exception("gainers_tracker_error")
 
     # Top Losers Tracker (zero extra API calls -- uses cached data)
-    if settings.LOSERS_TRACKER_ENABLED and _cg_module.last_raw_markets:
+    if settings.LOSERS_TRACKER_ENABLED and _raw_markets_combined:
         try:
             await store_top_losers(
-                db, _cg_module.last_raw_markets,
+                db, _raw_markets_combined,
                 max_drop=settings.LOSERS_MIN_DROP,
                 max_mcap=settings.LOSERS_MAX_MCAP,
             )
@@ -308,7 +325,7 @@ async def run_cycle(
 
     # Stage 2: Aggregate
     all_candidates = aggregate(
-        list(dex_tokens) + list(gecko_tokens) + list(cg_movers) + list(cg_trending)
+        list(dex_tokens) + list(gecko_tokens) + list(cg_movers) + list(cg_trending) + list(cg_by_volume)
     )
     stats["tokens_scanned"] = len(all_candidates)
 
