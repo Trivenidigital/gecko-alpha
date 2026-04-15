@@ -80,8 +80,8 @@ async def test_open_trade_skips_no_price(engine, db):
 
 
 async def test_open_trade_skips_stale_price(engine, db):
-    """Engine skips trade when price_cache.updated_at is older than 300 seconds."""
-    await _seed_price_cache(db, "bitcoin", 50000.0, age_seconds=400)
+    """Engine skips trade when price_cache.updated_at is older than _MAX_PRICE_AGE_SECONDS."""
+    await _seed_price_cache(db, "bitcoin", 50000.0, age_seconds=7200)
     trade_id = await engine.open_trade(
         token_id="bitcoin",
         symbol="BTC",
@@ -178,6 +178,56 @@ async def test_get_open_positions(engine, db):
     )
     positions = await engine.get_open_positions()
     assert len(positions) == 2
+
+
+async def test_open_trade_with_entry_price_skips_cache(engine, db):
+    """Engine uses entry_price directly, bypassing price_cache lookup."""
+    # No price_cache entry exists -- would normally be skipped
+    trade_id = await engine.open_trade(
+        token_id="trending-coin",
+        symbol="TREND",
+        name="TrendCoin",
+        chain="coingecko",
+        signal_type="trending_catch",
+        signal_data={"source": "trending_snapshot"},
+        entry_price=0.0042,
+    )
+    assert trade_id is not None
+    cursor = await db._conn.execute(
+        "SELECT entry_price FROM paper_trades WHERE id = ?", (trade_id,),
+    )
+    row = await cursor.fetchone()
+    assert row[0] == pytest.approx(0.0042, rel=0.01)
+
+
+async def test_open_trade_entry_price_zero_falls_back_to_cache(engine, db):
+    """entry_price=0 is treated as missing and falls back to price_cache."""
+    # No cache entry -> should be skipped
+    trade_id = await engine.open_trade(
+        token_id="no-cache-coin",
+        symbol="NC",
+        name="NoCache",
+        chain="coingecko",
+        signal_type="gainers_early",
+        signal_data={},
+        entry_price=0.0,
+    )
+    assert trade_id is None
+
+
+async def test_open_trade_entry_price_none_falls_back_to_cache(engine, db):
+    """entry_price=None falls back to price_cache lookup (existing behaviour)."""
+    await _seed_price_cache(db, "bitcoin", 50000.0, age_seconds=0)
+    trade_id = await engine.open_trade(
+        token_id="bitcoin",
+        symbol="BTC",
+        name="Bitcoin",
+        chain="coingecko",
+        signal_type="volume_spike",
+        signal_data={},
+        entry_price=None,
+    )
+    assert trade_id is not None
 
 
 async def test_uses_custom_amount(engine, db):

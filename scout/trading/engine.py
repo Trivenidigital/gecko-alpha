@@ -44,8 +44,14 @@ class TradingEngine:
         signal_type: str = "",
         signal_data: dict | None = None,
         amount_usd: float | None = None,
+        entry_price: float | None = None,
     ) -> int | None:
-        """Open a new trade. Returns trade_id or None if rejected."""
+        """Open a new trade. Returns trade_id or None if rejected.
+
+        If *entry_price* is provided (and > 0), it is used directly instead of
+        looking up price_cache.  This is essential for trending/gainers/losers
+        signals where the snapshot already contains a fresh price.
+        """
         if signal_data is None:
             signal_data = {}
 
@@ -53,20 +59,23 @@ class TradingEngine:
         if conn is None:
             raise RuntimeError("Database not initialized.")
 
-        # 1. Get current price from price_cache with staleness check
-        price_row = await self._get_current_price_with_age(token_id)
-        if price_row is None:
-            log.info("trade_skipped_no_price", token_id=token_id)
-            return None
+        # 1. Resolve current price -- prefer caller-supplied entry_price
+        if entry_price is not None and entry_price > 0:
+            current_price = entry_price
+        else:
+            price_row = await self._get_current_price_with_age(token_id)
+            if price_row is None:
+                log.info("trade_skipped_no_price", token_id=token_id)
+                return None
 
-        current_price, price_age_seconds = price_row
-        if price_age_seconds > _MAX_PRICE_AGE_SECONDS:
-            log.info(
-                "trade_skipped_stale_price",
-                token_id=token_id,
-                price_age_seconds=round(price_age_seconds, 1),
-            )
-            return None
+            current_price, price_age_seconds = price_row
+            if price_age_seconds > _MAX_PRICE_AGE_SECONDS:
+                log.info(
+                    "trade_skipped_stale_price",
+                    token_id=token_id,
+                    price_age_seconds=round(price_age_seconds, 1),
+                )
+                return None
 
         # 2. Check duplicate open position
         cursor = await conn.execute(

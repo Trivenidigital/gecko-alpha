@@ -292,6 +292,7 @@ async def run_cycle(
                                 signal_data={
                                     "spike_ratio": spike.get("spike_ratio", 0)
                                 },
+                                entry_price=spike.get("current_price"),
                             )
                         except Exception:
                             logger.exception(
@@ -316,7 +317,8 @@ async def run_cycle(
     if trading_engine and settings.GAINERS_TRACKER_ENABLED:
         try:
             cursor = await db._conn.execute(
-                """SELECT DISTINCT coin_id, symbol, name, price_change_24h FROM gainers_snapshots
+                """SELECT DISTINCT coin_id, symbol, name, price_change_24h, price_at_snapshot
+                   FROM gainers_snapshots
                    WHERE snapshot_at >= datetime('now', '-2 minutes')
                    AND coin_id NOT IN (
                        SELECT token_id FROM paper_trades WHERE signal_type = 'gainers_early' AND status = 'open'
@@ -328,6 +330,7 @@ async def run_cycle(
                     token_id=g["coin_id"], symbol=g["symbol"], name=g["name"],
                     chain="coingecko", signal_type="gainers_early",
                     signal_data={"price_change_24h": g["price_change_24h"]},
+                    entry_price=g["price_at_snapshot"],
                 )
         except Exception:
             logger.exception("trading_gainers_error")
@@ -355,10 +358,18 @@ async def run_cycle(
             )
             new_losers = await cursor.fetchall()
             for l in new_losers:
+                # Look up price from price_cache (updated in same cycle)
+                pc = await db._conn.execute(
+                    "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                    (l["coin_id"],),
+                )
+                price_row = await pc.fetchone()
+                loser_price = price_row[0] if price_row else None
                 await trading_engine.open_trade(
                     token_id=l["coin_id"], symbol=l["symbol"], name=l["name"],
                     chain="coingecko", signal_type="losers_contrarian",
                     signal_data={"price_change_24h": l["price_change_24h"]},
+                    entry_price=loser_price,
                 )
         except Exception:
             logger.exception("trading_losers_error")
@@ -391,6 +402,7 @@ async def run_cycle(
                                     "change_7d": m["price_change_7d"],
                                     "change_24h": m["price_change_24h"],
                                 },
+                                entry_price=m.get("current_price"),
                             )
                         except Exception:
                             logger.exception(
@@ -684,10 +696,18 @@ async def narrative_agent_loop(
                     )
                     new_trending = await cursor.fetchall()
                     for t in new_trending:
+                        # Look up price from price_cache (updated in same cycle)
+                        pc = await db._conn.execute(
+                            "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                            (t["coin_id"],),
+                        )
+                        price_row = await pc.fetchone()
+                        trending_price = price_row[0] if price_row else None
                         await trading_engine.open_trade(
                             token_id=t["coin_id"], symbol=t["symbol"], name=t["name"],
                             chain="coingecko", signal_type="trending_catch",
                             signal_data={"source": "trending_snapshot"},
+                            entry_price=trending_price,
                         )
                 except Exception:
                     logger.exception("trading_trending_catch_error")
@@ -1052,6 +1072,13 @@ async def narrative_agent_loop(
                             for pred in prediction_models:
                                 if not pred.is_control:
                                     try:
+                                        # Resolve price from cache for narrative predictions too
+                                        pc = await db._conn.execute(
+                                            "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                                            (pred.coin_id,),
+                                        )
+                                        pr = await pc.fetchone()
+                                        pred_price = pr[0] if pr else None
                                         await trading_engine.open_trade(
                                             token_id=pred.coin_id,
                                             chain="coingecko",
@@ -1060,6 +1087,7 @@ async def narrative_agent_loop(
                                                 "fit": pred.narrative_fit_score,
                                                 "category": pred.category_name,
                                             },
+                                            entry_price=pred_price,
                                         )
                                     except Exception:
                                         logger.exception(
@@ -1163,11 +1191,18 @@ async def narrative_agent_loop(
                         )
                         new_chains = await cursor.fetchall()
                         for c in new_chains:
+                            pc = await db._conn.execute(
+                                "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                                (c["token_id"],),
+                            )
+                            price_row = await pc.fetchone()
+                            chain_price = price_row[0] if price_row else None
                             await trading_engine.open_trade(
                                 token_id=c["token_id"],
                                 chain="coingecko",
                                 signal_type="chain_completed",
                                 signal_data={"pattern": c["pattern_name"], "boost": c["conviction_boost"]},
+                                entry_price=chain_price,
                             )
                     except Exception:
                         logger.exception("trading_chain_complete_error")
