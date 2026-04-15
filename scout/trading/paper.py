@@ -106,8 +106,13 @@ class PaperTrader:
         quantity = float(row[2])
 
         effective_exit = current_price * (1 - slippage_bps / 10000)
-        pnl_pct = ((effective_exit - entry_price) / entry_price) * 100
-        pnl_usd = quantity * (effective_exit - entry_price)
+        if entry_price <= 0:
+            log.warning("paper_trade_zero_entry_price", trade_id=trade_id)
+            pnl_pct = 0.0
+            pnl_usd = 0.0
+        else:
+            pnl_pct = ((effective_exit - entry_price) / entry_price) * 100
+            pnl_usd = quantity * (effective_exit - entry_price)
         now = datetime.now(timezone.utc).isoformat()
 
         # Map reason to status

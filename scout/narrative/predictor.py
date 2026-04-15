@@ -46,29 +46,35 @@ async def fetch_laggards(
     headers: dict[str, str] = {}
     if api_key:
         headers["x-cg-demo-api-key"] = api_key
-    await coingecko_limiter.acquire()
-    try:
-        async with session.get(CG_MARKETS_URL, params=params, headers=headers) as resp:
-            if resp.status == 429:
-                log.warning(
-                    "fetch_laggards_rate_limited",
-                    category_id=category_id,
-                )
-                await coingecko_limiter.report_429()
-                return []
-            if resp.status != 200:
-                log.warning(
-                    "fetch_laggards_error",
-                    category_id=category_id,
-                    status=resp.status,
-                )
-                return []
-            data = await resp.json()
-            result = data if isinstance(data, list) else []
-            return result
-    except Exception:
-        log.exception("fetch_laggards_exception", category_id=category_id)
-        return []
+    for attempt in range(2):  # 1 retry on 429
+        await coingecko_limiter.acquire()
+        try:
+            async with session.get(CG_MARKETS_URL, params=params, headers=headers) as resp:
+                if resp.status == 429:
+                    log.warning(
+                        "fetch_laggards_rate_limited",
+                        category_id=category_id,
+                        attempt=attempt,
+                    )
+                    await coingecko_limiter.report_429()
+                    if attempt == 0:
+                        await asyncio.sleep(2)
+                        continue
+                    return []
+                if resp.status != 200:
+                    log.warning(
+                        "fetch_laggards_error",
+                        category_id=category_id,
+                        status=resp.status,
+                    )
+                    return []
+                data = await resp.json()
+                result = data if isinstance(data, list) else []
+                return result
+        except Exception:
+            log.exception("fetch_laggards_exception", category_id=category_id)
+            return []
+    return []  # pragma: no cover
 
 
 # ------------------------------------------------------------------

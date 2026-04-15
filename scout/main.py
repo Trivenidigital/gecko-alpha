@@ -135,6 +135,8 @@ def _maybe_emit_heartbeat(settings) -> bool:
 
 async def _safe_counter_followup(token, session, settings, db=None):
     """Run counter-score and send follow-up Telegram message. Never raises."""
+    if session.closed:
+        return
     try:
         buy_pressure = 0.5
         if getattr(token, "txns_h1_buys", None) and getattr(
@@ -1277,8 +1279,6 @@ async def narrative_agent_loop(
                     logger.exception("narrative.weekly_learn_error")
 
         except Exception:
-            import traceback
-            traceback.print_exc()
             logger.exception("narrative.loop_error")
 
         await asyncio.sleep(settings.NARRATIVE_POLL_INTERVAL)
@@ -1471,6 +1471,9 @@ async def main() -> None:
                     asyncio.create_task(run_chain_tracker(db, settings))
                 )
 
+            # Both loops share the same session and rate limiter intentionally.
+            # The coingecko_limiter (25 req/min) coordinates access; that IS
+            # the back-pressure mechanism.
             await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         await db.close()

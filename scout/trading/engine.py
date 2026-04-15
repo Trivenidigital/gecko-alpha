@@ -238,17 +238,24 @@ class TradingEngine:
             (token_id,),
         )
         row = await cursor.fetchone()
-        if row is None or row[0] is None:
-            # Fallback: try fuzzy match by prefix (handles ID mismatches like bless-2 vs bless-network)
-            cursor = await conn.execute(
-                "SELECT current_price, updated_at FROM price_cache WHERE coin_id LIKE ? LIMIT 1",
-                (token_id.split("-")[0] + "%",),
-            )
-            row = await cursor.fetchone()
-        if row is None or row[0] is None:
+        if row is not None and row[0] is not None:
+            price = float(row[0])
+            updated_at = datetime.fromisoformat(str(row[1])).replace(tzinfo=timezone.utc)
+            age_seconds = (datetime.now(timezone.utc) - updated_at).total_seconds()
+            return (price, age_seconds)
+
+        # Fallback: try fuzzy match by exact prefix (handles ID mismatches like bless-2 vs bless-network)
+        cursor = await conn.execute(
+            "SELECT coin_id, current_price, updated_at FROM price_cache WHERE coin_id LIKE ? LIMIT 1",
+            (token_id + "%",),
+        )
+        row = await cursor.fetchone()
+        if row is None or row[1] is None:
             return None
 
-        price = float(row[0])
-        updated_at = datetime.fromisoformat(str(row[1])).replace(tzinfo=timezone.utc)
+        matched_id = row[0]
+        log.warning("price_fuzzy_match", requested=token_id, matched=matched_id)
+        price = float(row[1])
+        updated_at = datetime.fromisoformat(str(row[2])).replace(tzinfo=timezone.utc)
         age_seconds = (datetime.now(timezone.utc) - updated_at).total_seconds()
         return (price, age_seconds)

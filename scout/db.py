@@ -106,6 +106,9 @@ class Database:
                 alerted_at        TEXT NOT NULL
             );
 
+            CREATE INDEX IF NOT EXISTS idx_alerts_alerted_at ON alerts(alerted_at);
+            CREATE INDEX IF NOT EXISTS idx_candidates_first_seen ON candidates(first_seen_at);
+
             CREATE TABLE IF NOT EXISTS mirofish_jobs (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
                 contract_address  TEXT NOT NULL,
