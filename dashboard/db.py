@@ -736,10 +736,10 @@ async def get_available_categories(db_path: str) -> list[dict]:
 
 
 async def get_trading_positions(db_path: str) -> list[dict]:
-    """Open paper trades."""
+    """Open paper trades enriched with current prices from price_cache."""
     async with _ro_db(db_path) as db:
         cursor = await db.execute(
-            """SELECT id, token_id, symbol, name, chain, signal_type,
+            """SELECT id, token_id, symbol, name, chain, signal_type, signal_data,
                       entry_price, amount_usd, quantity,
                       tp_price, sl_price, tp_pct, sl_pct,
                       peak_price, peak_pct,
@@ -750,8 +750,34 @@ async def get_trading_positions(db_path: str) -> list[dict]:
                WHERE status = 'open'
                ORDER BY opened_at DESC"""
         )
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        rows = [dict(r) for r in await cursor.fetchall()]
+
+        # Enrich with current prices from price_cache
+        token_ids = [r["token_id"] for r in rows]
+        if token_ids:
+            placeholders = ",".join("?" * len(token_ids))
+            pcursor = await db.execute(
+                f"SELECT coin_id, current_price FROM price_cache WHERE coin_id IN ({placeholders})",
+                token_ids,
+            )
+            prices = {r["coin_id"]: r["current_price"] for r in await pcursor.fetchall()}
+
+            for r in rows:
+                cp = prices.get(r["token_id"])
+                if cp and r["entry_price"]:
+                    r["current_price"] = cp
+                    r["unrealized_pnl_pct"] = round(
+                        ((cp - r["entry_price"]) / r["entry_price"]) * 100, 2
+                    )
+                    r["unrealized_pnl_usd"] = round(
+                        (cp - r["entry_price"]) * r["quantity"], 2
+                    )
+                else:
+                    r["current_price"] = None
+                    r["unrealized_pnl_pct"] = None
+                    r["unrealized_pnl_usd"] = None
+
+        return rows
 
 
 async def get_trading_history(
@@ -760,8 +786,8 @@ async def get_trading_history(
     """Closed paper trades, paginated."""
     async with _ro_db(db_path) as db:
         cursor = await db.execute(
-            """SELECT id, token_id, symbol, name, chain, signal_type,
-                      entry_price, exit_price, amount_usd,
+            """SELECT id, token_id, symbol, name, chain, signal_type, signal_data,
+                      entry_price, exit_price, amount_usd, quantity,
                       pnl_usd, pnl_pct, exit_reason, status,
                       peak_price, peak_pct,
                       checkpoint_1h_pct, checkpoint_6h_pct,

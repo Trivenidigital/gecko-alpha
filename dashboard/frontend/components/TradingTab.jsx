@@ -10,6 +10,17 @@ function fmtUsd(n) {
   return sign + '$' + abs.toFixed(2)
 }
 
+function fmtPrice(v) {
+  if (v == null) return '-'
+  const n = Number(v)
+  if (isNaN(n)) return '-'
+  if (n === 0) return '$0'
+  if (n >= 1) return '$' + n.toFixed(2)
+  if (n >= 0.01) return '$' + n.toFixed(4)
+  if (n >= 0.0001) return '$' + n.toFixed(6)
+  return '$' + n.toFixed(8)
+}
+
 function fmtPct(n) {
   if (n == null) return '-'
   return Number(n).toFixed(2) + '%'
@@ -21,6 +32,22 @@ function fmtDate(iso) {
     const d = new Date(iso)
     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) +
       ' ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })
+  } catch {
+    return iso
+  }
+}
+
+function fmtRelative(iso) {
+  if (!iso) return '-'
+  try {
+    const ms = Date.now() - new Date(iso).getTime()
+    const mins = Math.floor(ms / 60000)
+    if (mins < 1) return 'just now'
+    if (mins < 60) return mins + 'm ago'
+    const hrs = Math.floor(mins / 60)
+    if (hrs < 24) return hrs + 'h ago'
+    const days = Math.floor(hrs / 24)
+    return days + 'd ago'
   } catch {
     return iso
   }
@@ -46,6 +73,21 @@ function pnlColor(val) {
   return val > 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)'
 }
 
+function getCategory(p) {
+  try {
+    const sd = typeof p.signal_data === 'string' ? JSON.parse(p.signal_data) : p.signal_data
+    return sd?.category || p.signal_type || '-'
+  } catch {
+    return p.signal_type || '-'
+  }
+}
+
+function getTokenLabel(p) {
+  if (p.symbol && p.symbol.trim()) return p.symbol.toUpperCase()
+  if (p.name && p.name.trim()) return p.name
+  return p.token_id || '-'
+}
+
 function reasonBadge(reason) {
   if (!reason) return <span className="outcome-badge">-</span>
   const r = reason.toUpperCase()
@@ -54,6 +96,33 @@ function reasonBadge(reason) {
   if (r === 'EXPIRED' || r === 'TIMEOUT') return <span className="outcome-badge" style={{ background: 'var(--color-bar-bg)', color: 'var(--color-text-secondary)' }}>Expired</span>
   if (r === 'MANUAL') return <span className="outcome-badge" style={{ background: 'rgba(255, 183, 77, 0.15)', color: 'var(--color-accent-amber)' }}>Manual</span>
   return <span className="outcome-badge">{reason}</span>
+}
+
+function checkpointBadges(p) {
+  const checks = [
+    { label: '1h', val: p.checkpoint_1h_pct },
+    { label: '6h', val: p.checkpoint_6h_pct },
+    { label: '24h', val: p.checkpoint_24h_pct },
+    { label: '48h', val: p.checkpoint_48h_pct },
+  ].filter(c => c.val != null)
+  if (checks.length === 0) return <span style={{ color: 'var(--color-text-secondary)', fontSize: 11 }}>-</span>
+  return (
+    <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+      {checks.map(c => (
+        <span key={c.label} style={{
+          fontSize: 10,
+          padding: '1px 5px',
+          borderRadius: 3,
+          background: c.val > 0 ? 'rgba(76, 175, 80, 0.12)' : 'rgba(239, 83, 80, 0.12)',
+          color: c.val > 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)',
+          fontWeight: 600,
+          whiteSpace: 'nowrap',
+        }}>
+          {c.label}: {c.val > 0 ? '+' : ''}{Number(c.val).toFixed(1)}%
+        </span>
+      ))}
+    </div>
+  )
 }
 
 export default function TradingTab() {
@@ -88,10 +157,11 @@ export default function TradingTab() {
     return () => clearInterval(poll)
   }, [fetchAll])
 
-  const totalPnl = stats?.total_pnl ?? 0
+  const totalPnl = stats?.total_pnl_usd ?? stats?.total_pnl ?? 0
   const winRate = stats?.win_rate_pct ?? 0
   const openCount = positions.length
-  const totalExposure = positions.reduce((sum, p) => sum + (p.amount ?? 0) * (p.entry_price ?? 0), 0)
+  const totalExposure = positions.reduce((sum, p) => sum + (p.amount_usd ?? 0), 0)
+  const totalUnrealizedPnl = positions.reduce((sum, p) => sum + (p.unrealized_pnl_usd ?? 0), 0)
   const totalTrades = stats?.total_trades ?? 0
 
   return (
@@ -99,14 +169,20 @@ export default function TradingTab() {
       {/* Section 1: Stats Cards */}
       <div style={{
         display: 'grid',
-        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
         gap: 12,
         marginBottom: 16,
       }}>
         <div className="panel" style={{ padding: '16px 20px', textAlign: 'center' }}>
-          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Total PnL</div>
+          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Realized PnL</div>
           <div style={{ fontSize: 28, fontWeight: 700, color: pnlColor(totalPnl) }}>
             {fmtUsd(totalPnl)}
+          </div>
+        </div>
+        <div className="panel" style={{ padding: '16px 20px', textAlign: 'center' }}>
+          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Unrealized PnL</div>
+          <div style={{ fontSize: 28, fontWeight: 700, color: pnlColor(totalUnrealizedPnl) }}>
+            {fmtUsd(totalUnrealizedPnl)}
           </div>
         </div>
         <div className="panel" style={{ padding: '16px 20px', textAlign: 'center' }}>
@@ -154,7 +230,7 @@ export default function TradingTab() {
               <tbody>
                 {bySignal.map((s, i) => {
                   const pnl = s.total_pnl ?? s.pnl ?? 0
-                  const wr = s.win_rate_pct ?? (s.trades > 0 ? ((s.wins / s.trades) * 100) : 0)
+                  const wr = s.win_rate_pct ?? s.win_rate ?? (s.trades > 0 ? ((s.wins / s.trades) * 100) : 0)
                   const rowBg = pnl > 0
                     ? 'rgba(76, 175, 80, 0.07)'
                     : pnl < 0
@@ -195,39 +271,67 @@ export default function TradingTab() {
               <thead>
                 <tr>
                   <th>Token</th>
-                  <th>Signal</th>
-                  <th>Entry Price</th>
+                  <th>Category</th>
+                  <th>Entry</th>
                   <th>Amount</th>
+                  <th>Current</th>
+                  <th>PnL $</th>
+                  <th>PnL %</th>
                   <th>TP / SL</th>
+                  <th>Checkpoints</th>
                   <th>Opened</th>
-                  <th>Status</th>
                 </tr>
               </thead>
               <tbody>
-                {positions.map((p, i) => (
-                  <tr key={p.id || i}>
-                    <td>
-                      <TokenLink
-                        tokenId={p.coin_id || p.token_id}
-                        symbol={p.symbol || p.name}
-                        chain="coingecko"
-                      />
-                    </td>
-                    <td style={{ fontSize: 12 }}>{p.signal_type || '-'}</td>
-                    <td>{p.entry_price != null ? '$' + Number(p.entry_price).toFixed(4) : '-'}</td>
-                    <td>{p.amount != null ? Number(p.amount).toFixed(2) : '-'}</td>
-                    <td style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>
-                      <div>TP: {p.take_profit != null ? '$' + Number(p.take_profit).toFixed(4) : '-'}</div>
-                      <div>SL: {p.stop_loss != null ? '$' + Number(p.stop_loss).toFixed(4) : '-'}</div>
-                    </td>
-                    <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>{fmtDate(p.opened_at || p.created_at)}</td>
-                    <td>
-                      <span className="outcome-badge" style={{ background: 'rgba(33, 150, 243, 0.15)', color: '#42a5f5' }}>
-                        {p.status || 'OPEN'}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
+                {positions.map((p, i) => {
+                  const pnlUsd = p.unrealized_pnl_usd
+                  const pnlPct = p.unrealized_pnl_pct
+                  return (
+                    <tr key={p.id || i}>
+                      <td>
+                        <TokenLink
+                          tokenId={p.coin_id || p.token_id}
+                          symbol={getTokenLabel(p)}
+                          chain="coingecko"
+                        />
+                      </td>
+                      <td style={{ fontSize: 11, maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {getCategory(p)}
+                      </td>
+                      <td style={{ whiteSpace: 'nowrap' }}>{fmtPrice(p.entry_price)}</td>
+                      <td style={{ whiteSpace: 'nowrap' }}>{fmtUsd(p.amount_usd)}</td>
+                      <td style={{ whiteSpace: 'nowrap' }}>
+                        {p.current_price != null
+                          ? fmtPrice(p.current_price)
+                          : <span style={{ color: 'var(--color-text-secondary)' }}>-</span>}
+                      </td>
+                      <td style={{ fontWeight: 700, color: pnlColor(pnlUsd), whiteSpace: 'nowrap' }}>
+                        {pnlUsd != null ? fmtUsd(pnlUsd) : '-'}
+                      </td>
+                      <td style={{ fontWeight: 600, color: pnlColor(pnlPct), whiteSpace: 'nowrap' }}>
+                        {pnlPct != null ? (pnlPct > 0 ? '+' : '') + Number(pnlPct).toFixed(2) + '%' : '-'}
+                      </td>
+                      <td style={{ fontSize: 11, color: 'var(--color-text-secondary)', whiteSpace: 'nowrap' }}>
+                        <div>
+                          <span style={{ color: 'var(--color-accent-green)' }}>
+                            +{p.tp_pct != null ? Number(p.tp_pct).toFixed(0) : '?'}%
+                          </span>
+                          {' / '}
+                          <span style={{ color: 'var(--color-accent-red, #ef5350)' }}>
+                            -{p.sl_pct != null ? Number(p.sl_pct).toFixed(0) : '?'}%
+                          </span>
+                        </div>
+                        <div style={{ fontSize: 10, color: 'var(--color-text-secondary)', opacity: 0.7 }}>
+                          {fmtPrice(p.tp_price)} / {fmtPrice(p.sl_price)}
+                        </div>
+                      </td>
+                      <td>{checkpointBadges(p)}</td>
+                      <td style={{ fontSize: 12, color: 'var(--color-text-secondary)', whiteSpace: 'nowrap' }}>
+                        {fmtRelative(p.opened_at)}
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
@@ -252,9 +356,10 @@ export default function TradingTab() {
               <thead>
                 <tr>
                   <th>Token</th>
-                  <th>Signal</th>
+                  <th>Category</th>
                   <th>Entry / Exit</th>
-                  <th>PnL ($)</th>
+                  <th>Amount</th>
+                  <th>PnL $</th>
                   <th>PnL %</th>
                   <th>Reason</th>
                   <th>Duration</th>
@@ -262,27 +367,37 @@ export default function TradingTab() {
               </thead>
               <tbody>
                 {history.map((h, i) => {
-                  const pnl = h.pnl ?? h.realized_pnl ?? 0
+                  const pnl = h.pnl_usd ?? h.pnl ?? h.realized_pnl ?? 0
                   const pnlPct = h.pnl_pct ?? h.realized_pnl_pct ?? null
+                  const rowBg = pnl > 0
+                    ? 'rgba(76, 175, 80, 0.05)'
+                    : pnl < 0
+                      ? 'rgba(239, 83, 80, 0.05)'
+                      : 'transparent'
                   return (
-                    <tr key={h.id || i}>
+                    <tr key={h.id || i} style={{ background: rowBg }}>
                       <td>
                         <TokenLink
                           tokenId={h.coin_id || h.token_id}
-                          symbol={h.symbol || h.name}
+                          symbol={getTokenLabel(h)}
                           chain="coingecko"
                         />
                       </td>
-                      <td style={{ fontSize: 12 }}>{h.signal_type || '-'}</td>
-                      <td style={{ fontSize: 12 }}>
-                        ${Number(h.entry_price || 0).toFixed(4)} {'  '}
-                        <span style={{ color: 'var(--color-text-secondary)' }}>{' -> '}</span>
-                        {' '}${Number(h.exit_price || 0).toFixed(4)}
+                      <td style={{ fontSize: 11, maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {getCategory(h)}
                       </td>
-                      <td style={{ fontWeight: 700, color: pnlColor(pnl) }}>{fmtUsd(pnl)}</td>
-                      <td style={{ color: pnlColor(pnlPct) }}>{fmtPct(pnlPct)}</td>
-                      <td>{reasonBadge(h.close_reason || h.reason)}</td>
-                      <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
+                      <td style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                        {fmtPrice(h.entry_price)}
+                        <span style={{ color: 'var(--color-text-secondary)', margin: '0 3px' }}>&rarr;</span>
+                        {fmtPrice(h.exit_price)}
+                      </td>
+                      <td style={{ whiteSpace: 'nowrap' }}>{fmtUsd(h.amount_usd)}</td>
+                      <td style={{ fontWeight: 700, color: pnlColor(pnl), whiteSpace: 'nowrap' }}>{fmtUsd(pnl)}</td>
+                      <td style={{ fontWeight: 600, color: pnlColor(pnlPct), whiteSpace: 'nowrap' }}>
+                        {pnlPct != null ? (pnlPct > 0 ? '+' : '') + Number(pnlPct).toFixed(2) + '%' : '-'}
+                      </td>
+                      <td>{reasonBadge(h.exit_reason || h.close_reason || h.reason)}</td>
+                      <td style={{ fontSize: 12, color: 'var(--color-text-secondary)', whiteSpace: 'nowrap' }}>
                         {fmtDuration(h.opened_at || h.created_at, h.closed_at)}
                       </td>
                     </tr>
