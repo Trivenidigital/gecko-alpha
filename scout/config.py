@@ -95,6 +95,7 @@ class Settings(BaseSettings):
     MOMENTUM_7D_ENABLED: bool = True
     MOMENTUM_7D_MIN_CHANGE: float = 100.0       # min 7d change % to flag (100% = doubled)
     MOMENTUM_7D_MAX_MCAP: float = 500_000_000   # filter out mega caps
+    MOMENTUM_7D_MIN_VOLUME: float = 100_000     # min $100K 24h volume — weeds out illiquid junk
 
     # -------- Volume Spike Detector --------
     VOLUME_SPIKE_ENABLED: bool = True

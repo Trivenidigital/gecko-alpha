@@ -370,6 +370,7 @@ async def run_cycle(
                 db, _raw_markets_combined,
                 min_7d_change=settings.MOMENTUM_7D_MIN_CHANGE,
                 max_mcap=settings.MOMENTUM_7D_MAX_MCAP,
+                min_volume_24h=settings.MOMENTUM_7D_MIN_VOLUME,
             )
             if momentum_7d:
                 logger.info(

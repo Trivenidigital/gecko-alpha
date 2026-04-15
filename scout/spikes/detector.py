@@ -191,11 +191,13 @@ async def detect_7d_momentum(
     raw_coins: list[dict],
     min_7d_change: float = 100.0,
     max_mcap: float = 500_000_000,
+    min_volume_24h: float = 100_000,
 ) -> list[dict]:
     """Find tokens with extreme 7-day returns from already-fetched data.
 
     Pandora-type catches: +438% 7d that slip under the daily radar.
     No extra API calls -- filters the raw /coins/markets data we already have.
+    Requires minimum $100K 24h volume to filter out illiquid junk.
     """
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
@@ -209,8 +211,11 @@ async def detect_7d_momentum(
             continue
         change_7d = coin.get("price_change_percentage_7d_in_currency") or 0
         mcap = coin.get("market_cap") or 0
+        volume = coin.get("total_volume") or 0
 
         if change_7d < min_7d_change or mcap <= 0 or mcap > max_mcap:
+            continue
+        if volume < min_volume_24h:
             continue
 
         # Dedup: skip if already detected today for this coin
