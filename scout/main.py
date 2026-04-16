@@ -565,6 +565,15 @@ async def main() -> None:
                     except Exception as e:
                         logger.error("Cycle failed", error=str(e))
 
+                    # Evaluate paper trades EVERY cycle (TP/SL/checkpoints)
+                    # Must run frequently so TP triggers within minutes, not hours.
+                    if trading_engine:
+                        try:
+                            from scout.trading.evaluator import evaluate_paper_trades
+                            await evaluate_paper_trades(db, settings)
+                        except Exception:
+                            logger.exception("trading.pipeline_eval_error")
+
                     cycle_count += 1
 
                     # BL-033: periodic heartbeat summary

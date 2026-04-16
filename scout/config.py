@@ -137,6 +137,7 @@ class Settings(BaseSettings):
     PAPER_TP_PCT: float = 20.0                     # take profit %
     PAPER_SL_PCT: float = 10.0                     # stop loss % (positive: 10.0 = 10%)
     PAPER_MAX_DURATION_HOURS: int = 48             # auto-expire
+    PAPER_TP_SELL_PCT: float = 70.0               # sell 70% at TP, keep 30% as long_hold
     PAPER_SLIPPAGE_BPS: int = 50                   # 0.5% slippage simulation
     TRADING_DIGEST_HOUR_UTC: int = 0               # midnight digest
     TRADING_EVAL_INTERVAL: int = 1800              # 30 min eval cycle
