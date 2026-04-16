@@ -13,3 +13,5 @@ build/
 .mypy_cache/
 dashboard/frontend/node_modules/
 dashboard/frontend/dist/
+*.ssh_out*
+_*.py

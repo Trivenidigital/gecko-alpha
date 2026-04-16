@@ -701,7 +701,7 @@ async def narrative_agent_loop(
             # which fetches fresh data from /search/trending.
             if settings.TRENDING_SNAPSHOT_ENABLED:
                 try:
-                    await fetch_and_store_trending(db, session, settings)
+                    await fetch_and_store_trending(session, db, settings.COINGECKO_API_KEY)
                 except Exception:
                     logger.exception("trending_tracker.snapshot_error")
 
@@ -1249,8 +1249,8 @@ async def narrative_agent_loop(
                     try:
                         from scout.gainers.tracker import prune_old_snapshots as prune_gainers
                         from scout.losers.tracker import prune_old_snapshots as prune_losers
-                        await prune_gainers(db, retention_days=7)
-                        await prune_losers(db, retention_days=7)
+                        await prune_gainers(db, retention_days=settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS)
+                        await prune_losers(db, retention_days=settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS)
                     except Exception:
                         logger.exception("tracker_prune_error")
                     last_daily_learn_at = now
