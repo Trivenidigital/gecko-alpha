@@ -149,7 +149,7 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
         cursor = await db._conn.execute(
             """SELECT MIN(predicted_at) FROM predictions
                WHERE (coin_id = ? OR LOWER(symbol) = LOWER(?))
-                 AND predicted_at < ?""",
+                 AND predicted_at < datetime(?, '+5 minutes')""",
             (coin_id, symbol, first_gainer_at_str),
         )
         pred_row = await cursor.fetchone()
@@ -164,7 +164,7 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
         cursor = await db._conn.execute(
             """SELECT MIN(first_seen_at) FROM candidates
                WHERE (contract_address = ? OR LOWER(ticker) = LOWER(?))
-                 AND first_seen_at < ?""",
+                 AND first_seen_at < datetime(?, '+5 minutes')""",
             (coin_id, symbol, first_gainer_at_str),
         )
         cand_row = await cursor.fetchone()
@@ -183,14 +183,14 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
                    WHERE (token_id = ? OR LOWER(token_id) = LOWER(?)
                           OR LOWER(token_id) LIKE LOWER(? || '%')
                           OR LOWER(?) LIKE LOWER(token_id || '%'))
-                     AND created_at < ?""",
+                     AND created_at < datetime(?, '+5 minutes')""",
                 (coin_id, symbol, symbol, coin_id, first_gainer_at_str),
             )
         else:
             cursor = await db._conn.execute(
                 """SELECT MIN(created_at) FROM signal_events
                    WHERE (token_id = ? OR LOWER(token_id) = LOWER(?))
-                     AND created_at < ?""",
+                     AND created_at < datetime(?, '+5 minutes')""",
                 (coin_id, symbol, first_gainer_at_str),
             )
         sig_row = await cursor.fetchone()
@@ -204,7 +204,7 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
         # Check volume_spikes table
         cursor = await db._conn.execute(
             """SELECT MIN(detected_at) FROM volume_spikes
-               WHERE coin_id = ? AND detected_at < ?""",
+               WHERE coin_id = ? AND detected_at < datetime(?, '+5 minutes')""",
             (coin_id, first_gainer_at_str),
         )
         spike_row = await cursor.fetchone()
