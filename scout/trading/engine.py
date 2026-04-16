@@ -36,6 +36,7 @@ class TradingEngine:
         losers_contrarian:    {"price_change_24h": float}
         momentum_7d:          {"change_7d": float, "change_24h": float}
         chain_completed:      {"pattern": str, "boost": int}
+        first_signal:         {"quant_score": int, "signals": list[str]}
     """
 
     def __init__(self, mode: str, db: Database, settings) -> None:

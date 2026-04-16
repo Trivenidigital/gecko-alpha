@@ -100,30 +100,49 @@ async def trade_losers(engine, db: Database) -> None:
         logger.exception("trading_losers_query_error")
 
 
-async def trade_momentum(engine, momentum_7d: list[dict], min_mcap: float = 5_000_000) -> None:
-    """Open paper trades for 7-day momentum tokens. Filters micro-cap junk."""
-    for m in momentum_7d:
-        if (m.get("market_cap") or 0) < min_mcap:
+async def trade_first_signals(
+    engine, db: Database, scored_candidates: list, min_mcap: float = 5_000_000
+) -> None:
+    """Open paper trades on first meaningful signal for each token.
+
+    This catches tokens at the EARLIEST detection point -- when they first
+    show any scoring signal (quant > 0). This is the 'Early Catches' moment.
+
+    The engine's duplicate check prevents re-opening for the same token.
+
+    Args:
+        scored_candidates: list of (CandidateToken, quant_score, signals_fired)
+    """
+    for token, quant_score, signals_fired in scored_candidates:
+        if quant_score <= 0 or not signals_fired:
+            continue
+        if (token.market_cap_usd or 0) < min_mcap:
+            continue
+        # Focus on CoinGecko-listed tokens, skip DEX memecoins
+        if token.chain not in ("coingecko",):
             continue
         try:
+            pc = await db._conn.execute(
+                "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                (token.contract_address,),
+            )
+            pr = await pc.fetchone()
+            price = pr[0] if pr else None
+
             await engine.open_trade(
-                token_id=m["coin_id"],
-                symbol=m["symbol"],
-                name=m["name"],
-                chain="coingecko",
-                signal_type="momentum_7d",
+                token_id=token.contract_address,
+                symbol=token.ticker,
+                name=token.token_name,
+                chain=token.chain,
+                signal_type="first_signal",
                 signal_data={
-                    "change_7d": m["price_change_7d"],
-                    "change_24h": m["price_change_24h"],
-                    "mcap": m.get("market_cap"),
+                    "quant_score": quant_score,
+                    "signals": signals_fired,
                 },
-                entry_price=m.get("current_price"),
+                entry_price=price,
             )
         except Exception:
-            logger.exception(
-                "trading_momentum_7d_error",
-                coin_id=m.get("coin_id"),
-            )
+            logger.exception("trading_first_signal_error", token=token.ticker)
 
 
 async def trade_trending(engine, db: Database) -> None:

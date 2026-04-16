@@ -41,7 +41,7 @@ from scout.spikes.detector import record_volume, detect_spikes, detect_7d_moment
 from scout.gainers.tracker import store_top_gainers
 from scout.losers.tracker import store_top_losers
 from scout.trading.signals import (
-    trade_momentum,
+    trade_first_signals,
     trade_volume_spikes,
 )
 from scout.briefing.collector import collect_briefing_data
@@ -325,8 +325,6 @@ async def run_cycle(
                     count=len(momentum_7d),
                     tokens=[m["symbol"] for m in momentum_7d],
                 )
-                if trading_engine:
-                    await trade_momentum(trading_engine, momentum_7d, min_mcap=settings.PAPER_MIN_MCAP)
         except Exception:
             logger.exception("momentum_7d_error")
 
@@ -364,12 +362,14 @@ async def run_cycle(
 
     # Stage 3: Score
     scored = []
+    all_scored_tokens = []  # All tokens with updated quant_score/signals_fired
     for token in enriched:
         historical_scores = await db.get_recent_scores(token.contract_address, limit=3)
         points, signals = score(token, settings, historical_scores=historical_scores)
         updated = token.model_copy(
             update={"quant_score": points, "signals_fired": signals}
         )
+        all_scored_tokens.append(updated)
         await db.upsert_candidate(updated)
         await db.log_score(token.contract_address, points)
         await safe_emit(
@@ -387,6 +387,19 @@ async def run_cycle(
         if points >= settings.MIN_SCORE:
             scored.append((updated, signals))
             stats["candidates_promoted"] += 1
+
+    # Paper trade on first meaningful signal (earliest detection point)
+    if trading_engine:
+        scored_for_trading = [
+            (t, t.quant_score, t.signals_fired)
+            for t in all_scored_tokens
+            if (t.quant_score or 0) > 0 and t.signals_fired
+        ]
+        if scored_for_trading:
+            await trade_first_signals(
+                trading_engine, db, scored_for_trading,
+                min_mcap=settings.PAPER_MIN_MCAP,
+            )
 
     # Stages 4-5: Gate (MiroFish + conviction)
     for token, signals in scored:
