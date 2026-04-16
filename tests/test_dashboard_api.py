@@ -451,6 +451,14 @@ async def empty_db(tmp_path):
     return db_path
 
 
+async def _reset_scout_db_cache():
+    """Reset the cached ScoutDatabase instance between tests."""
+    import dashboard.api as api_mod
+    if api_mod._scout_db is not None:
+        await api_mod._scout_db.close()
+        api_mod._scout_db = None
+
+
 @pytest.fixture
 def make_app():
     """Factory that creates a FastAPI app pointing at a given DB path."""
@@ -462,18 +470,22 @@ def make_app():
 
 @pytest.fixture
 async def client(seeded_db, make_app):
+    await _reset_scout_db_cache()
     app = make_app(seeded_db)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+    await _reset_scout_db_cache()
 
 
 @pytest.fixture
 async def empty_client(empty_db, make_app):
+    await _reset_scout_db_cache()
     app = make_app(empty_db)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+    await _reset_scout_db_cache()
 
 
 # ---------------------------------------------------------------------------

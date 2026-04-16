@@ -288,10 +288,12 @@ async def test_score_token_success():
         volume_growth_pct=15.0, coin_count_change=-2, is_heating=True,
     )
 
+    from unittest.mock import AsyncMock
+
     mock_client = MagicMock()
     mock_message = MagicMock()
     mock_message.content = [MagicMock(text='{"narrative_fit": 75, "staying_power": "High", "confidence": "Medium", "reasoning": "Strong fit"}')]
-    mock_client.messages.create = MagicMock(return_value=mock_message)
+    mock_client.messages.create = AsyncMock(return_value=mock_message)
 
     result = await score_token(
         token, accel, "BULL", "fetch-ai, render", "",

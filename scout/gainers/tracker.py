@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 import structlog
@@ -19,6 +19,21 @@ def _parse_dt(s: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+async def prune_old_snapshots(db: "Database", retention_days: int = 7) -> int:
+    """Delete gainers_snapshots older than retention_days. Returns rows deleted."""
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+    cursor = await db._conn.execute(
+        "DELETE FROM gainers_snapshots WHERE snapshot_at < ?", (cutoff,)
+    )
+    await db._conn.commit()
+    deleted = cursor.rowcount
+    if deleted:
+        logger.info("gainers_snapshots_pruned", deleted=deleted, retention_days=retention_days)
+    return deleted
 
 
 async def store_top_gainers(

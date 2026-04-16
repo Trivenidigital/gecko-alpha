@@ -20,11 +20,18 @@ async def db(tmp_path):
 
 @pytest.fixture
 async def client(db):
+    import dashboard.api as api_mod
+    if api_mod._scout_db is not None:
+        await api_mod._scout_db.close()
+        api_mod._scout_db = None
     d, db_path = db
     app = create_app(db_path=db_path)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c, d
+    if api_mod._scout_db is not None:
+        await api_mod._scout_db.close()
+        api_mod._scout_db = None
 
 
 async def _insert_trade(conn, token_id, symbol, signal_type, status, pnl_usd=None, pnl_pct=None):

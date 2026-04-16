@@ -189,7 +189,7 @@ async def load_snapshots_at(
            FROM category_snapshots
            WHERE snapshot_at <= ?
            ORDER BY snapshot_at DESC
-           LIMIT 500""",
+           LIMIT 1000""",
         (target_time.isoformat(),),
     )
     rows = await cursor.fetchall()

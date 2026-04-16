@@ -236,13 +236,13 @@ async def score_token(
         import anthropic
 
         if client is None:
-            client = anthropic.Anthropic(api_key=api_key)
+            client = anthropic.AsyncAnthropic(api_key=api_key)
 
         prompt = build_scoring_prompt(
             token, accel, market_regime, top_3_coins, lessons,
             watchlist_users=watchlist_users,
         )
-        response = client.messages.create(  # type: ignore[union-attr]
+        response = await client.messages.create(  # type: ignore[union-attr]
             model=model,
             max_tokens=300,
             temperature=0,
@@ -303,6 +303,8 @@ async def record_signal(
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
 
+    # Note: check-then-insert is not strictly atomic, but asyncio's single-threaded
+    # event loop prevents true concurrent execution, making TOCTOU a non-issue here.
     # Check for existing active signal
     cursor = await conn.execute(
         """SELECT id, trigger_count FROM narrative_signals

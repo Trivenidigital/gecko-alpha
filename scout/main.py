@@ -1,5 +1,9 @@
 """CoinPump Scout -- main pipeline entry point."""
 
+# TODO: Extract narrative_agent_loop (~650 lines) to scout/narrative/agent.py
+# TODO: Extract trading signal dispatch (~100 lines) to scout/trading/signals.py
+# This would reduce main.py to ~400 lines of pure orchestration.
+
 import argparse
 import asyncio
 import json
@@ -90,7 +94,11 @@ _heartbeat_stats: dict = {
 
 
 def _reset_heartbeat_stats() -> None:
-    """Reset module-level heartbeat state (test helper)."""
+    """Reset module-level heartbeat state (test helper).
+
+    Note: _heartbeat_stats is a module-level global. Tests MUST call this
+    function (or the pipeline's own reset path) to avoid cross-test pollution.
+    """
     _heartbeat_stats.update(
         started_at=None,
         tokens_scanned=0,
@@ -321,7 +329,7 @@ async def run_cycle(
             cursor = await db._conn.execute(
                 """SELECT DISTINCT coin_id, symbol, name, price_change_24h, price_at_snapshot
                    FROM gainers_snapshots
-                   WHERE snapshot_at >= datetime('now', '-2 minutes')
+                   WHERE snapshot_at >= datetime('now', '-5 minutes')
                    AND coin_id NOT IN (
                        SELECT token_id FROM paper_trades WHERE signal_type = 'gainers_early' AND status = 'open'
                    )"""
@@ -355,8 +363,9 @@ async def run_cycle(
     if trading_engine and settings.LOSERS_TRACKER_ENABLED:
         try:
             cursor = await db._conn.execute(
-                """SELECT DISTINCT coin_id, symbol, name, price_change_24h FROM losers_snapshots
-                   WHERE snapshot_at >= datetime('now', '-2 minutes')
+                """SELECT DISTINCT coin_id, symbol, name, price_change_24h, price_at_snapshot
+                   FROM losers_snapshots
+                   WHERE snapshot_at >= datetime('now', '-5 minutes')
                    AND coin_id NOT IN (
                        SELECT token_id FROM paper_trades WHERE signal_type = 'losers_contrarian' AND status = 'open'
                    )"""
@@ -364,13 +373,15 @@ async def run_cycle(
             new_losers = await cursor.fetchall()
             for l in new_losers:
                 try:
-                    # Look up price from price_cache (updated in same cycle)
-                    pc = await db._conn.execute(
-                        "SELECT current_price FROM price_cache WHERE coin_id = ?",
-                        (l["coin_id"],),
-                    )
-                    price_row = await pc.fetchone()
-                    loser_price = price_row[0] if price_row else None
+                    # Use snapshot price if available, else fall back to price_cache
+                    loser_price = l["price_at_snapshot"]
+                    if not loser_price:
+                        pc = await db._conn.execute(
+                            "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                            (l["coin_id"],),
+                        )
+                        price_row = await pc.fetchone()
+                        loser_price = price_row[0] if price_row else None
                     await trading_engine.open_trade(
                         token_id=l["coin_id"], symbol=l["symbol"], name=l["name"],
                         chain="coingecko", signal_type="losers_contrarian",
@@ -596,7 +607,8 @@ async def check_outcomes(
 
         try:
             url = f"https://api.dexscreener.com/tokens/v1/{chain}/{contract}"
-            async with session.get(url) as resp:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with session.get(url, timeout=timeout) as resp:
                 if resp.status != 200:
                     continue
                 pairs = await resp.json()
@@ -698,7 +710,7 @@ async def narrative_agent_loop(
                 try:
                     cursor = await db._conn.execute(
                         """SELECT DISTINCT coin_id, symbol, name FROM trending_snapshots
-                           WHERE snapshot_at >= datetime('now', '-2 minutes')
+                           WHERE snapshot_at >= datetime('now', '-5 minutes')
                            AND coin_id NOT IN (
                                SELECT token_id FROM paper_trades WHERE signal_type = 'trending_catch' AND status = 'open'
                            )"""
@@ -1193,7 +1205,7 @@ async def narrative_agent_loop(
                         cursor = await db._conn.execute(
                             """SELECT DISTINCT token_id, pattern_id, pattern_name, conviction_boost, pipeline
                                FROM chain_matches
-                               WHERE completed_at >= datetime('now', '-2 minutes')
+                               WHERE completed_at >= datetime('now', '-5 minutes')
                                AND token_id NOT IN (
                                    SELECT token_id FROM paper_trades WHERE signal_type = 'chain_completed' AND status = 'open'
                                )"""
@@ -1233,6 +1245,14 @@ async def narrative_agent_loop(
                     await prune_old_snapshots(
                         db, settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS
                     )
+                    # Prune gainers/losers snapshots (M9 -- unbounded growth)
+                    try:
+                        from scout.gainers.tracker import prune_old_snapshots as prune_gainers
+                        from scout.losers.tracker import prune_old_snapshots as prune_losers
+                        await prune_gainers(db, retention_days=7)
+                        await prune_losers(db, retention_days=7)
+                    except Exception:
+                        logger.exception("tracker_prune_error")
                     last_daily_learn_at = now
                     await strategy.set_timestamp("last_daily_learn_at", now)
                     logger.info("narrative.daily_learn_complete")

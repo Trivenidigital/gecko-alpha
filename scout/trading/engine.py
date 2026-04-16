@@ -27,6 +27,15 @@ class TradingEngine:
             signal_type="volume_spike",
             signal_data={"spike_ratio": 12.3},
         )
+
+    signal_data schema per signal_type:
+        volume_spike:         {"spike_ratio": float, "current_price": float}
+        narrative_prediction: {"fit": int, "category": str}
+        trending_catch:       {"source": str}
+        gainers_early:        {"price_change_24h": float}
+        losers_contrarian:    {"price_change_24h": float}
+        momentum_7d:          {"change_7d": float, "change_24h": float}
+        chain_completed:      {"pattern": str, "boost": int}
     """
 
     def __init__(self, mode: str, db: Database, settings) -> None:
@@ -76,6 +85,10 @@ class TradingEngine:
                     price_age_seconds=round(price_age_seconds, 1),
                 )
                 return None
+
+        # Note: TOCTOU gap between duplicate/exposure check and insert is mitigated
+        # by asyncio's single-threaded event loop — only one coroutine runs at a time.
+        # For true concurrency (multi-process), wrap in BEGIN IMMEDIATE.
 
         # 2. Check duplicate open position
         cursor = await conn.execute(
@@ -174,7 +187,7 @@ class TradingEngine:
             """SELECT
                  COUNT(*) as total_trades,
                  SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins,
-                 SUM(CASE WHEN pnl_usd <= 0 THEN 1 ELSE 0 END) as losses,
+                 SUM(CASE WHEN pnl_usd < 0 THEN 1 ELSE 0 END) as losses,
                  COALESCE(SUM(pnl_usd), 0) as total_pnl_usd,
                  COALESCE(AVG(pnl_pct), 0) as avg_pnl_pct,
                  MAX(pnl_usd) as best_trade,

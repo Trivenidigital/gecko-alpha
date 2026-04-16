@@ -34,10 +34,17 @@ async def seeded_db(tmp_path):
 
 @pytest.fixture
 async def client(seeded_db):
+    import dashboard.api as api_mod
+    if api_mod._scout_db is not None:
+        await api_mod._scout_db.close()
+        api_mod._scout_db = None
     app = create_app(seeded_db)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+    if api_mod._scout_db is not None:
+        await api_mod._scout_db.close()
+        api_mod._scout_db = None
 
 
 async def test_secondwave_candidates_endpoint(client):

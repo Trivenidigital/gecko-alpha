@@ -40,7 +40,14 @@ class PaperTrader:
             raise RuntimeError("Database not initialized.")
 
         effective_entry = current_price * (1 + slippage_bps / 10000)
+        if effective_entry <= 0:
+            log.warning("paper_trade_zero_price", token_id=token_id, current_price=current_price)
+            return -1  # type: ignore[return-value]
         quantity = amount_usd / effective_entry
+        # Sanity check: quantity must be positive and finite
+        if quantity <= 0 or not (quantity == quantity):  # NaN check
+            log.warning("paper_trade_invalid_quantity", token_id=token_id, quantity=quantity)
+            return -1  # type: ignore[return-value]
         tp_price = effective_entry * (1 + tp_pct / 100)
         sl_price = effective_entry * (1 - sl_pct / 100)
         now = datetime.now(timezone.utc).isoformat()
