@@ -208,7 +208,32 @@ async def get_narrative_heating(db_path: str, limit: int = 20) -> list[dict]:
             (limit,),
         )
         rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        result = [dict(row) for row in rows]
+
+        # Enrich with first detection time from narrative_signals
+        if result:
+            try:
+                category_ids = [r["category_id"] for r in result]
+                placeholders = ",".join("?" * len(category_ids))
+                cursor = await conn.execute(
+                    f"""SELECT category_id, MIN(detected_at) as first_detected
+                        FROM narrative_signals
+                        WHERE category_id IN ({placeholders})
+                        GROUP BY category_id""",
+                    category_ids,
+                )
+                first_detected = {
+                    r["category_id"]: r["first_detected"]
+                    for r in await cursor.fetchall()
+                }
+                for r in result:
+                    r["first_detected_at"] = first_detected.get(r["category_id"])
+            except Exception:
+                # narrative_signals table may not exist in older DBs
+                for r in result:
+                    r["first_detected_at"] = None
+
+        return result
 
 
 async def get_narrative_predictions(

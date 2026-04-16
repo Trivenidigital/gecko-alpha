@@ -40,6 +40,17 @@ function leadTimeColor(minutes) {
   return 'var(--color-text-secondary)'
 }
 
+function fmtRelative(iso) {
+  if (!iso) return '-'
+  const ms = Date.now() - new Date(iso).getTime()
+  const mins = Math.floor(ms / 60000)
+  if (mins < 60) return mins + 'm ago'
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return hrs + 'h ago'
+  const days = Math.floor(hrs / 24)
+  return days + 'd ago'
+}
+
 function fmtDate(iso) {
   if (!iso) return '-'
   try {
@@ -150,10 +161,17 @@ export default function SignalsTab() {
   const caughtGainers = useMemo(() => enrichedGainers.filter(c => !c.is_gap), [enrichedGainers])
   const missedGainers = useMemo(() => enrichedGainers.filter(c => c.is_gap), [enrichedGainers])
 
+  // Enrich heating with first-detected lead minutes for sorting
+  const enrichedHeating = useMemo(() => heating.map(c => {
+    const fd = c.first_detected_at ? new Date(c.first_detected_at) : null
+    const fdMin = fd ? (Date.now() - fd.getTime()) / 60000 : null
+    return { ...c, _first_detected_minutes: fdMin }
+  }), [heating])
+
   // Sort hooks for each table
   const earlyCatchSort = useSort(enrichedComparisons, '_lead_minutes', 'desc')
   const gainersSort = useSort(caughtGainers, '_gain_since', 'desc')
-  const heatingSort = useSort(heating, 'market_cap_change_24h', 'desc')
+  const heatingSort = useSort(enrichedHeating, 'market_cap_change_24h', 'desc')
   const predictionsSort = useSort(predictions, 'narrative_fit_score', 'desc')
   const spikesSort = useSort(spikes, 'spike_ratio', 'desc')
   const momentum7dSort = useSort(momentum7d, 'price_change_7d', 'desc')
@@ -323,6 +341,7 @@ export default function SignalsTab() {
                 <SortHeader col="market_cap_change_24h" label="Acceleration" sortCol={heatingSort.sortCol} sortDir={heatingSort.sortDir} onSort={heatingSort.handleSort} />
                 <SortHeader col="volume_24h" label="Volume 24h" sortCol={heatingSort.sortCol} sortDir={heatingSort.sortDir} onSort={heatingSort.handleSort} />
                 <SortHeader col="market_regime" label="Regime" sortCol={heatingSort.sortCol} sortDir={heatingSort.sortDir} onSort={heatingSort.handleSort} />
+                <SortHeader col="_first_detected_minutes" label="First Detected" sortCol={heatingSort.sortCol} sortDir={heatingSort.sortDir} onSort={heatingSort.handleSort} />
               </tr>
             </thead>
             <tbody>
@@ -351,6 +370,9 @@ export default function SignalsTab() {
                       <span className={`outcome-badge ${regimeClass(c.market_regime)}`}>
                         {c.market_regime || '-'}
                       </span>
+                    </td>
+                    <td style={{ fontWeight: 600, color: leadTimeColor(c._first_detected_minutes) }}>
+                      {c.first_detected_at ? fmtRelative(c.first_detected_at) : '-'}
                     </td>
                   </tr>
                 )
