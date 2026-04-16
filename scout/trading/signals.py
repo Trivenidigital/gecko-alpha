@@ -194,11 +194,11 @@ async def trade_predictions(
                 },
                 entry_price=pred_price,
             )
-            except Exception:
-                logger.exception(
-                    "trading_open_narrative_error",
-                    coin_id=pred.coin_id,
-                )
+        except Exception:
+            logger.exception(
+                "trading_open_narrative_error",
+                coin_id=pred.coin_id,
+            )
 
 
 async def trade_chain_completions(engine, db: Database, settings) -> None:
