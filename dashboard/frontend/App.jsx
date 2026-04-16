@@ -8,6 +8,7 @@ import QualitySignals from './components/QualitySignals.jsx'
 import SignalsTab from './components/SignalsTab.jsx'
 import TradingTab from './components/TradingTab.jsx'
 import HealthTab from './components/HealthTab.jsx'
+import BriefingTab from './components/BriefingTab.jsx'
 
 const DEFAULT_STATUS = {
   pipeline_status: 'connecting',
@@ -136,6 +137,12 @@ export default function App() {
           Pipeline
         </button>
         <button
+          className={`tab-btn ${activeTab === 'briefing' ? 'active' : ''}`}
+          onClick={() => setActiveTab('briefing')}
+        >
+          Briefing
+        </button>
+        <button
           className={`tab-btn ${activeTab === 'health' ? 'active' : ''}`}
           onClick={() => setActiveTab('health')}
         >
@@ -163,6 +170,8 @@ export default function App() {
           <QualitySignals showNarrative={false} showMemes={true} />
         </>
       )}
+
+      {activeTab === 'briefing' && <BriefingTab />}
 
       {activeTab === 'health' && <HealthTab />}
     </div>
