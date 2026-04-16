@@ -157,6 +157,29 @@ async def evaluate_pending(
     unique_ids = list({row[1] for row in rows})
     prices = await fetch_prices_batch(session, unique_ids, api_key=api_key)
 
+    # Tokens missing from batch fetch — try direct CoinGecko /simple/price
+    missing_ids = [cid for cid in unique_ids if cid not in prices]
+    if missing_ids:
+        try:
+            await coingecko_limiter.acquire()
+            ids_param = ",".join(missing_ids[:20])  # max 20 at a time
+            headers: dict[str, str] = {}
+            if api_key:
+                headers["x-cg-demo-api-key"] = api_key
+            async with session.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": ids_param, "vs_currencies": "usd"},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for cid, pdata in data.items():
+                        if pdata.get("usd"):
+                            prices[cid] = float(pdata["usd"])
+        except Exception:
+            log.warning("eval_direct_price_fetch_failed")
+
     now = datetime.now(timezone.utc)
 
     for row in rows:
