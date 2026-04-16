@@ -141,47 +141,47 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 ## P2 — Phase 2 Enhancements (Helius/Moralis required)
 
 ### BL-020: Populate holder_growth_1h from enricher
-**Status:** Not started — currently dead signal (25 pts never fire)
+**Status:** DROPPED — user confirmed system is not meme-concentrated, on-chain holder data is for DEX memes which is not the focus
 **Files:** scout/ingestion/holder_enricher.py
 **Why:** Code review found holder_growth_1h is never populated. The 25-point holder growth signal is dead in production without this.
 **Changes:**
 - Store previous holder_count in DB per contract_address
 - On next scan, compute delta as holder_growth_1h
 - Requires at least 2 scan cycles to produce data
-**Blocked by:** Helius/Moralis API key
+~~**Blocked by:** Helius/Moralis API key~~
 
 ### BL-021: Add unique buyer wallet count signal (Tier 3)
-**Status:** Not started
+**Status:** DROPPED — user confirmed system is not meme-concentrated, on-chain holder data is for DEX memes which is not the focus
 **Files:** scout/ingestion/holder_enricher.py, scout/models.py, scout/scorer.py
 **Why:** Distinguishes organic community buying from bot accumulation.
 **Changes:**
 - Add `unique_buyers_1h: int = 0` to CandidateToken
 - Fetch from Helius (Solana) / Moralis (EVM) transfer history
 - Score: high unique_buyers relative to total_txns → +15 pts
-**Blocked by:** Helius/Moralis API key
+~~**Blocked by:** Helius/Moralis API key~~
 
 ### BL-022: Add wash trade detection (top-3 wallet volume concentration)
-**Status:** Not started
+**Status:** DROPPED — user confirmed system is not meme-concentrated, on-chain holder data is for DEX memes which is not the focus
 **Files:** scout/scorer.py, scout/ingestion/holder_enricher.py
 **Why:** Hard disqualifier — if top 3 wallets account for > 40% of volume, it's almost certainly wash trading.
 **Changes:**
 - Fetch top wallet transaction data from Helius/Moralis
 - Compute concentration ratio
 - Disqualify (score 0) if > 40%
-**Blocked by:** Helius/Moralis API key
+~~**Blocked by:** Helius/Moralis API key~~
 
 ### BL-023: Add deployer wallet supply concentration check
-**Status:** Not started
+**Status:** DROPPED — user confirmed system is not meme-concentrated, on-chain holder data is for DEX memes which is not the focus
 **Files:** scout/safety.py or scout/scorer.py
 **Why:** Classic rug setup — deployer holds > 20% of supply.
 **Note:** Partially covered by GoPlus already. Evaluate overlap before implementing.
-**Blocked by:** Helius/Moralis API key
+~~**Blocked by:** Helius/Moralis API key~~
 
 ### BL-024: Add transaction size distribution signal
-**Status:** Not started
+**Status:** DROPPED — user confirmed system is not meme-concentrated, on-chain holder data is for DEX memes which is not the focus
 **Files:** scout/ingestion/holder_enricher.py, scout/scorer.py
 **Why:** Organic pre-pump = many small txns ($50-$500). Bot wash = fewer large uniform txns.
-**Blocked by:** Helius/Moralis API key
+~~**Blocked by:** Helius/Moralis API key~~
 
 ---
 
@@ -213,7 +213,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Changes:** Track cumulative stats, log summary every 5 min (or every N cycles)
 
 ### BL-034: Set up MiroFish Docker integration
-**Status:** Not started
+**Status:** DROPPED — Claude Haiku fallback is sufficient, gate lowered to MIN_SCORE=25
 **Files:** docker-compose.yml, scout/mirofish/client.py
 **Why:** MiroFish is the key differentiator but hasn't been tested locally yet. Currently all narrative scoring goes through the fallback.
 **Changes:** Clone MiroFish repo, configure LLM keys, test /simulate endpoint, verify seed format compatibility
@@ -254,7 +254,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 **Success metrics:** Hit rate (% of flagged tokens that appeared on Highlights), average lead time (minutes before CoinGecko), misses (tokens that trended without our flag).
 
-> **NOTE (Apr 2026):** The CoinGecko Trending Tracker (PR #12) + Volume Spike Detector (PR #15) now serve as the primary early detection layer, using FREE CoinGecko data. LunarCrush/Santiment/Nansen phases are DEFERRED — the free approach achieved 100% trending hit rate and 86% highlights catch rate.
+> **NOTE (Apr 2026):** The CoinGecko Trending Tracker (PR #12) + Volume Spike Detector (PR #15) now serve as the primary early detection layer, using FREE CoinGecko data. LunarCrush/Santiment/Nansen phases are DEFERRED — the free approach achieved 56/61 (91.8%) trending hit rate with 62.4h avg lead time.
 
 ### Phase 1: LunarCrush Social Velocity ($24/mo) — CURRENT
 **Status:** In design
@@ -343,6 +343,30 @@ Test fixture refactor (BL-042) + backlog cleanup.
 ### Volume Spike Detector + Top Gainers Tracker (PR #15)
 **Status:** DONE — live on VPS. Detects individual token breakouts via 5x+ volume surges. Top gainers validation same pattern as trending tracker.
 
+### Top Losers Tracker + Volume-Sorted Scan (PR #17)
+**Status:** DONE — live on VPS
+
+### Comprehensive Code Review — 26 Fixes (PR #18)
+**Status:** DONE
+
+### Peak Gain Tracking (PR #19)
+**Status:** DONE — live on VPS
+
+### main.py Refactoring + UNRESOLVED Fix (PR #20)
+**Status:** DONE — 1513 to 668 lines
+
+### Market Briefing Agent (PR #21)
+**Status:** DONE — live on VPS
+
+### Dashboard Improvements
+**Status:** DONE — sortable columns, missed gainers section, heating lead time
+
+### 7d Momentum Scanner
+**Status:** DONE — live on VPS
+
+### Volume Spike Detector Broadened
+**Status:** DONE — expanded to 250 tokens
+
 ### Dashboard Redesign
 **Status:** DONE
 3-tab layout (Signals/Pipeline/Health), Early Catches validation, quality signals, price cache, Narrative vs Meme separation.
@@ -375,8 +399,8 @@ Stores prices from pipeline fetches, dashboard reads from DB (zero extra CoinGec
 - Paper trading shim: custom (~50 lines)
 - NOT using Hummingbot (too heavy) or Freqtrade (no DEX support)
 
-### Phase A: Paper Trading Engine (Current — build next)
-**Status:** In design
+### Phase A: Paper Trading Engine (Current)
+**Status:** LIVE — running on VPS since Apr 15. Currently on Iteration 4 (first_signal + narrative_prediction). Collecting data for 48h undisturbed.
 **Module:** `scout/trading/`
 ```
 scout/trading/
@@ -386,8 +410,17 @@ scout/trading/
 ```
 **DB tables:** `paper_trades`, `paper_positions`
 **Dashboard:** Paper PnL section on Signals tab — per-signal-type performance
-**Config:** `TRADING_ENABLED=false`, `TRADING_MODE=paper`, `PAPER_TRADE_AMOUNT_USD=50`
+**Config:** `TRADING_ENABLED=true`, `TRADING_MODE=paper`, `PAPER_TRADE_AMOUNT_USD=50`
 **Success criteria:** 2 weeks of paper trades with positive PnL after simulated fees → graduate to Phase B
+
+#### Paper Trading Iterations
+
+| Iteration | Signals Used | Result |
+|-----------|-------------|--------|
+| 1 | All 7 signals | All losing — bought at the top every time |
+| 2 | Removed lagging signals | Still micro-cap junk |
+| 3 | Added $5M mcap filter | momentum_7d still producing late entries |
+| **4 (current)** | **first_signal + narrative_prediction only** | **Collecting data — 48h undisturbed run** |
 
 ### Phase B: Live Execution Engine (Future — after paper validates)
 **Status:** Not started — blocked by Phase A validation
