@@ -130,6 +130,8 @@ export default function TradingTab() {
   const [bySignal, setBySignal] = useState([])
   const [positions, setPositions] = useState([])
   const [history, setHistory] = useState([])
+  const [sortCol, setSortCol] = useState('pnl_pct')
+  const [sortDir, setSortDir] = useState('desc')
 
   const fetchAll = useCallback(async () => {
     try {
@@ -156,6 +158,46 @@ export default function TradingTab() {
     const poll = setInterval(fetchAll, 30000)
     return () => clearInterval(poll)
   }, [fetchAll])
+
+  function handleSort(col) {
+    if (sortCol === col) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortCol(col)
+      setSortDir('desc')
+    }
+  }
+
+  const sortedPositions = [...positions].sort((a, b) => {
+    let va, vb
+    switch (sortCol) {
+      case 'token': va = (a.symbol || a.token_id || '').toLowerCase(); vb = (b.symbol || b.token_id || '').toLowerCase(); break
+      case 'category': va = getCategory(a).toLowerCase(); vb = getCategory(b).toLowerCase(); break
+      case 'entry': va = a.entry_price || 0; vb = b.entry_price || 0; break
+      case 'amount': va = a.amount_usd || 0; vb = b.amount_usd || 0; break
+      case 'current': va = a.current_price || 0; vb = b.current_price || 0; break
+      case 'pnl_usd': va = a.unrealized_pnl_usd || 0; vb = b.unrealized_pnl_usd || 0; break
+      case 'pnl_pct': va = a.unrealized_pnl_pct || 0; vb = b.unrealized_pnl_pct || 0; break
+      case 'opened': va = a.opened_at || ''; vb = b.opened_at || ''; break
+      default: va = 0; vb = 0
+    }
+    if (typeof va === 'string') {
+      return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va)
+    }
+    return sortDir === 'asc' ? va - vb : vb - va
+  })
+
+  function SortHeader({ col, label }) {
+    const active = sortCol === col
+    return (
+      <th
+        style={{ cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' }}
+        onClick={() => handleSort(col)}
+      >
+        {label} {active ? (sortDir === 'asc' ? '▲' : '▼') : ''}
+      </th>
+    )
+  }
 
   const totalPnl = stats?.total_pnl_usd ?? stats?.total_pnl ?? 0
   const winRate = stats?.win_rate_pct ?? 0
@@ -270,20 +312,20 @@ export default function TradingTab() {
             <table className="candidates-table">
               <thead>
                 <tr>
-                  <th>Token</th>
-                  <th>Category</th>
-                  <th>Entry</th>
-                  <th>Amount</th>
-                  <th>Current</th>
-                  <th>PnL $</th>
-                  <th>PnL %</th>
+                  <SortHeader col="token" label="Token" />
+                  <SortHeader col="category" label="Category" />
+                  <SortHeader col="entry" label="Entry" />
+                  <SortHeader col="amount" label="Amount" />
+                  <SortHeader col="current" label="Current" />
+                  <SortHeader col="pnl_usd" label="PnL $" />
+                  <SortHeader col="pnl_pct" label="PnL %" />
                   <th>TP / SL</th>
                   <th>Checkpoints</th>
-                  <th>Opened</th>
+                  <SortHeader col="opened" label="Opened" />
                 </tr>
               </thead>
               <tbody>
-                {positions.map((p, i) => {
+                {sortedPositions.map((p, i) => {
                   const pnlUsd = p.unrealized_pnl_usd
                   const pnlPct = p.unrealized_pnl_pct
                   return (
