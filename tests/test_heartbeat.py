@@ -4,8 +4,8 @@ from datetime import datetime, timedelta, timezone
 
 import structlog
 
-from scout import main as main_module
-from scout.main import _heartbeat_stats, _maybe_emit_heartbeat, _reset_heartbeat_stats
+from scout import heartbeat as heartbeat_module
+from scout.heartbeat import _heartbeat_stats, _maybe_emit_heartbeat, _reset_heartbeat_stats
 
 
 class _FakeSettings:
@@ -29,7 +29,7 @@ def _capture_logs(monkeypatch):
         def exception(self, event, **kwargs):
             captured.append((event, kwargs))
 
-    monkeypatch.setattr(main_module, "logger", _CapLogger())
+    monkeypatch.setattr(heartbeat_module, "logger", _CapLogger())
     return captured
 
 
