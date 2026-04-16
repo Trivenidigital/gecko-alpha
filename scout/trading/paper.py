@@ -49,7 +49,7 @@ class PaperTrader:
             log.warning("paper_trade_invalid_quantity", token_id=token_id, quantity=quantity)
             return -1  # type: ignore[return-value]
         tp_price = effective_entry * (1 + tp_pct / 100)
-        sl_price = effective_entry * (1 - sl_pct / 100)
+        sl_price = effective_entry * (1 - sl_pct / 100) if sl_pct > 0 else 0.0
         now = datetime.now(timezone.utc).isoformat()
 
         cursor = await conn.execute(
