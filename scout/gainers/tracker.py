@@ -217,6 +217,27 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
 
         comparisons.append(comp)
 
+    # Look up detected_price from price_cache and preserve existing peaks
+    for comp in comparisons:
+        cid = comp["coin_id"]
+        old_cursor = await db._conn.execute(
+            "SELECT detected_price, peak_price, peak_gain_pct FROM gainers_comparisons WHERE coin_id = ?",
+            (cid,),
+        )
+        old_row = await old_cursor.fetchone()
+        if old_row and old_row[0]:
+            comp["detected_price"] = old_row[0]
+            comp["peak_price"] = old_row[1]
+            comp["peak_gain_pct"] = old_row[2]
+        else:
+            pc = await db._conn.execute(
+                "SELECT current_price FROM price_cache WHERE coin_id = ?", (cid,)
+            )
+            price_row = await pc.fetchone()
+            comp["detected_price"] = price_row[0] if price_row and price_row[0] else None
+            comp["peak_price"] = None
+            comp["peak_gain_pct"] = None
+
     # Store comparisons (delete old for same coin_id then insert)
     for comp in comparisons:
         await db._conn.execute(
@@ -231,8 +252,8 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
                 detected_by_pipeline, pipeline_lead_minutes,
                 detected_by_chains, chains_lead_minutes,
                 detected_by_spikes, spikes_lead_minutes,
-                is_gap)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                is_gap, detected_price, peak_price, peak_gain_pct)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 comp["coin_id"],
                 comp["symbol"],
@@ -248,6 +269,9 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
                 comp["detected_by_spikes"],
                 comp["spikes_lead_minutes"],
                 comp["is_gap"],
+                comp["detected_price"],
+                comp["peak_price"],
+                comp["peak_gain_pct"],
             ),
         )
     await db._conn.commit()
@@ -295,7 +319,7 @@ async def get_gainers_comparisons(
                   detected_by_pipeline, pipeline_lead_minutes,
                   detected_by_chains, chains_lead_minutes,
                   detected_by_spikes, spikes_lead_minutes,
-                  is_gap, created_at
+                  is_gap, detected_price, peak_price, peak_gain_pct, created_at
            FROM gainers_comparisons
            ORDER BY appeared_on_gainers_at DESC
            LIMIT ?""",
@@ -350,3 +374,46 @@ async def get_gainers_stats(db: "Database") -> dict:
         "hit_rate_pct": hit_rate,
         "avg_lead_minutes": avg_lead,
     }
+
+
+async def update_gainers_peaks(db: "Database") -> int:
+    """Update peak prices for all gainers comparisons using current price_cache data.
+
+    Uses a single JOIN query instead of N+1 per-row lookups.
+    Only uses prices updated within the last hour to avoid stale peaks.
+    Returns the number of rows updated.
+    """
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+
+    conn = db._conn
+    cursor = await conn.execute(
+        """SELECT gc.id, gc.coin_id, gc.detected_price, gc.peak_price,
+                  pc.current_price, pc.updated_at
+           FROM gainers_comparisons gc
+           JOIN price_cache pc ON gc.coin_id = pc.coin_id
+           WHERE gc.detected_price IS NOT NULL
+             AND gc.detected_price > 0
+             AND pc.current_price IS NOT NULL
+             AND pc.updated_at >= datetime('now', '-1 hour')"""
+    )
+    rows = await cursor.fetchall()
+    updated = 0
+
+    for row in rows:
+        current_price = row["current_price"]
+        old_peak = row["peak_price"] or row["detected_price"] or 0
+
+        if current_price > old_peak:
+            peak_gain = ((current_price - row["detected_price"]) / row["detected_price"]) * 100
+            await conn.execute(
+                "UPDATE gainers_comparisons SET peak_price = ?, peak_gain_pct = ? WHERE id = ?",
+                (current_price, peak_gain, row["id"]),
+            )
+            updated += 1
+
+    if updated:
+        await conn.commit()
+        logger.info("gainers_tracker.peaks_updated", count=updated)
+
+    return updated
