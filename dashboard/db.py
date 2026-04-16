@@ -228,10 +228,56 @@ async def get_narrative_heating(db_path: str, limit: int = 20) -> list[dict]:
                 }
                 for r in result:
                     r["first_detected_at"] = first_detected.get(r["category_id"])
+
+                # Enrich with gain since detection & peak gain
+                for r in result:
+                    cid = r["category_id"]
+                    first_det = first_detected.get(cid)
+                    if not first_det:
+                        r["gain_since_detection"] = None
+                        r["peak_gain"] = None
+                        continue
+
+                    # Market cap at detection
+                    cur = await conn.execute(
+                        """SELECT market_cap FROM category_snapshots
+                           WHERE category_id = ? AND snapshot_at <= ?
+                           ORDER BY snapshot_at DESC LIMIT 1""",
+                        (cid, first_det),
+                    )
+                    det_row = await cur.fetchone()
+                    mcap_at_det = (det_row[0] if det_row else None) or 0
+                    current_mcap = r.get("market_cap") or 0
+
+                    if mcap_at_det > 0 and current_mcap > 0:
+                        r["gain_since_detection"] = round(
+                            ((current_mcap - mcap_at_det) / mcap_at_det) * 100, 2
+                        )
+                    else:
+                        r["gain_since_detection"] = None
+
+                    # Peak market cap since detection
+                    cur = await conn.execute(
+                        """SELECT MAX(market_cap) FROM category_snapshots
+                           WHERE category_id = ? AND snapshot_at >= ?""",
+                        (cid, first_det),
+                    )
+                    peak_row = await cur.fetchone()
+                    peak_mcap = (peak_row[0] if peak_row else None) or 0
+
+                    if mcap_at_det > 0 and peak_mcap > 0:
+                        r["peak_gain"] = round(
+                            ((peak_mcap - mcap_at_det) / mcap_at_det) * 100, 2
+                        )
+                    else:
+                        r["peak_gain"] = None
+
             except Exception:
                 # narrative_signals table may not exist in older DBs
                 for r in result:
                     r["first_detected_at"] = None
+                    r["gain_since_detection"] = None
+                    r["peak_gain"] = None
 
         return result
 

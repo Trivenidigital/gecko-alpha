@@ -165,7 +165,7 @@ export default function SignalsTab() {
   const enrichedHeating = useMemo(() => heating.map(c => {
     const fd = c.first_detected_at ? new Date(c.first_detected_at) : null
     const fdMin = fd ? (Date.now() - fd.getTime()) / 60000 : null
-    return { ...c, _first_detected_minutes: fdMin }
+    return { ...c, _first_detected_minutes: fdMin, gain_since_detection: c.gain_since_detection ?? null, peak_gain: c.peak_gain ?? null }
   }), [heating])
 
   // Sort hooks for each table
@@ -342,6 +342,8 @@ export default function SignalsTab() {
                 <SortHeader col="volume_24h" label="Volume 24h" sortCol={heatingSort.sortCol} sortDir={heatingSort.sortDir} onSort={heatingSort.handleSort} />
                 <SortHeader col="market_regime" label="Regime" sortCol={heatingSort.sortCol} sortDir={heatingSort.sortDir} onSort={heatingSort.handleSort} />
                 <SortHeader col="_first_detected_minutes" label="First Detected" sortCol={heatingSort.sortCol} sortDir={heatingSort.sortDir} onSort={heatingSort.handleSort} />
+                <SortHeader col="gain_since_detection" label="Gain" sortCol={heatingSort.sortCol} sortDir={heatingSort.sortDir} onSort={heatingSort.handleSort} />
+                <SortHeader col="peak_gain" label="Peak Gain" sortCol={heatingSort.sortCol} sortDir={heatingSort.sortDir} onSort={heatingSort.handleSort} />
               </tr>
             </thead>
             <tbody>
@@ -373,6 +375,12 @@ export default function SignalsTab() {
                     </td>
                     <td style={{ fontWeight: 600, color: leadTimeColor(c._first_detected_minutes) }}>
                       {c.first_detected_at ? fmtRelative(c.first_detected_at) : '-'}
+                    </td>
+                    <td style={{ fontWeight: 700, color: c.gain_since_detection != null ? (c.gain_since_detection >= 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red)') : 'var(--color-text-secondary)' }}>
+                      {c.gain_since_detection != null ? (c.gain_since_detection > 0 ? '+' : '') + Number(c.gain_since_detection).toFixed(1) + '%' : '-'}
+                    </td>
+                    <td style={{ fontWeight: 700, color: 'var(--color-accent-green)' }}>
+                      {c.peak_gain != null ? '+' + Number(c.peak_gain).toFixed(1) + '%' : '-'}
                     </td>
                   </tr>
                 )
