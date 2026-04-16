@@ -108,7 +108,7 @@ class Settings(BaseSettings):
     GAINERS_MAX_MCAP: float = 500_000_000
 
     # -------- Top Losers Tracker --------
-    LOSERS_TRACKER_ENABLED: bool = True
+    LOSERS_TRACKER_ENABLED: bool = False
     LOSERS_MIN_DROP: float = -15.0
     LOSERS_MAX_MCAP: float = 500_000_000
 

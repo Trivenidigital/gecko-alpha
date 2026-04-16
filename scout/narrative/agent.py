@@ -53,7 +53,6 @@ from scout.preferences.matcher import should_alert_category, should_alert_token
 from scout.trading.signals import (
     trade_chain_completions,
     trade_predictions,
-    trade_trending,
 )
 from scout.trending.tracker import (
     compare_with_signals as trending_compare,
@@ -125,10 +124,6 @@ async def narrative_agent_loop(
                     await fetch_and_store_trending(session, db, settings.COINGECKO_API_KEY)
                 except Exception:
                     logger.exception("trending_tracker.snapshot_error")
-
-            # Paper trade new trending tokens
-            if trading_engine and settings.TRENDING_SNAPSHOT_ENABLED:
-                await trade_trending(trading_engine, db)
 
             # Load 6-hour-ago snapshots for acceleration comparison
             six_hours_ago = now - timedelta(hours=6)
