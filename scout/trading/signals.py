@@ -2,6 +2,11 @@
 
 Each function wraps a query + for-loop + try/except + open_trade pattern
 that was previously inlined in main.py and narrative/agent.py.
+
+Note: These functions access db._conn directly for read queries.
+This is consistent with the rest of the codebase (evaluator, tracker,
+observer all use the same pattern). Adding public Database methods for
+one-off signal queries would add complexity without benefit.
 """
 
 import structlog

@@ -158,27 +158,35 @@ async def evaluate_pending(
     prices = await fetch_prices_batch(session, unique_ids, api_key=api_key)
 
     # Tokens missing from batch fetch — try direct CoinGecko /simple/price
+    # Process in chunks of 20 (API limit per call)
     missing_ids = [cid for cid in unique_ids if cid not in prices]
     if missing_ids:
-        try:
-            await coingecko_limiter.acquire()
-            ids_param = ",".join(missing_ids[:20])  # max 20 at a time
-            headers: dict[str, str] = {}
-            if api_key:
-                headers["x-cg-demo-api-key"] = api_key
-            async with session.get(
-                "https://api.coingecko.com/api/v3/simple/price",
-                params={"ids": ids_param, "vs_currencies": "usd"},
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for cid, pdata in data.items():
-                        if pdata.get("usd"):
-                            prices[cid] = float(pdata["usd"])
-        except Exception:
-            log.warning("eval_direct_price_fetch_failed")
+        if len(missing_ids) > 20:
+            log.info("eval_price_fallback", total_missing=len(missing_ids), fetching=min(len(missing_ids), 60))
+        for chunk_start in range(0, min(len(missing_ids), 60), 20):
+            chunk = missing_ids[chunk_start:chunk_start + 20]
+            try:
+                await coingecko_limiter.acquire()
+                ids_param = ",".join(chunk)
+                headers: dict[str, str] = {}
+                if api_key:
+                    headers["x-cg-demo-api-key"] = api_key
+                async with session.get(
+                    "https://api.coingecko.com/api/v3/simple/price",
+                    params={"ids": ids_param, "vs_currencies": "usd"},
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 429:
+                        await coingecko_limiter.report_429()
+                        break  # stop fetching more chunks
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for cid, pdata in data.items():
+                            if pdata.get("usd"):
+                                prices[cid] = float(pdata["usd"])
+            except Exception:
+                log.warning("eval_direct_price_fetch_failed", chunk_start=chunk_start)
 
     now = datetime.now(timezone.utc)
 
