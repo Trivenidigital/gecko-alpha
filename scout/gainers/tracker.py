@@ -379,6 +379,8 @@ async def get_gainers_stats(db: "Database") -> dict:
 async def update_gainers_peaks(db: "Database") -> int:
     """Update peak prices for all gainers comparisons using current price_cache data.
 
+    Uses a single JOIN query instead of N+1 per-row lookups.
+    Only uses prices updated within the last hour to avoid stale peaks.
     Returns the number of rows updated.
     """
     if db._conn is None:
@@ -386,24 +388,23 @@ async def update_gainers_peaks(db: "Database") -> int:
 
     conn = db._conn
     cursor = await conn.execute(
-        "SELECT id, coin_id, detected_price, peak_price FROM gainers_comparisons WHERE detected_price IS NOT NULL"
+        """SELECT gc.id, gc.coin_id, gc.detected_price, gc.peak_price,
+                  pc.current_price, pc.updated_at
+           FROM gainers_comparisons gc
+           JOIN price_cache pc ON gc.coin_id = pc.coin_id
+           WHERE gc.detected_price IS NOT NULL
+             AND gc.detected_price > 0
+             AND pc.current_price IS NOT NULL
+             AND pc.updated_at >= datetime('now', '-1 hour')"""
     )
     rows = await cursor.fetchall()
     updated = 0
 
     for row in rows:
-        pc = await conn.execute(
-            "SELECT current_price FROM price_cache WHERE coin_id = ?",
-            (row["coin_id"],),
-        )
-        price_row = await pc.fetchone()
-        if not price_row or not price_row[0]:
-            continue
-
-        current_price = price_row[0]
+        current_price = row["current_price"]
         old_peak = row["peak_price"] or row["detected_price"] or 0
 
-        if current_price > old_peak and row["detected_price"] > 0:
+        if current_price > old_peak:
             peak_gain = ((current_price - row["detected_price"]) / row["detected_price"]) * 100
             await conn.execute(
                 "UPDATE gainers_comparisons SET peak_price = ?, peak_gain_pct = ? WHERE id = ?",

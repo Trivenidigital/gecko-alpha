@@ -411,31 +411,33 @@ async def get_recent_comparisons(
 async def update_trending_peaks(db: "Database") -> int:
     """Update peak prices for all trending comparisons using current price_cache data.
 
+    Uses a single JOIN query instead of N+1 per-row lookups.
+    Only uses prices updated within the last hour to avoid stale peaks.
     Returns the number of rows updated.
     """
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
 
     conn = db._conn
+    # Batch: JOIN comparisons with price_cache, filter fresh prices only
     cursor = await conn.execute(
-        "SELECT id, coin_id, detected_price, peak_price FROM trending_comparisons WHERE detected_price IS NOT NULL"
+        """SELECT tc.id, tc.coin_id, tc.detected_price, tc.peak_price,
+                  pc.current_price, pc.updated_at
+           FROM trending_comparisons tc
+           JOIN price_cache pc ON tc.coin_id = pc.coin_id
+           WHERE tc.detected_price IS NOT NULL
+             AND tc.detected_price > 0
+             AND pc.current_price IS NOT NULL
+             AND pc.updated_at >= datetime('now', '-1 hour')"""
     )
     rows = await cursor.fetchall()
     updated = 0
 
     for row in rows:
-        pc = await conn.execute(
-            "SELECT current_price FROM price_cache WHERE coin_id = ?",
-            (row["coin_id"],),
-        )
-        price_row = await pc.fetchone()
-        if not price_row or not price_row[0]:
-            continue
-
-        current_price = price_row[0]
+        current_price = row["current_price"]
         old_peak = row["peak_price"] or row["detected_price"] or 0
 
-        if current_price > old_peak and row["detected_price"] > 0:
+        if current_price > old_peak:
             peak_gain = ((current_price - row["detected_price"]) / row["detected_price"]) * 100
             await conn.execute(
                 "UPDATE trending_comparisons SET peak_price = ?, peak_gain_pct = ? WHERE id = ?",
