@@ -564,6 +564,15 @@ async def main() -> None:
                         except Exception:
                             logger.exception("trading.pipeline_eval_error")
 
+                    # Update peak prices for Early Catches + Top Gainers (every cycle)
+                    try:
+                        from scout.trending.tracker import update_trending_peaks
+                        from scout.gainers.tracker import update_gainers_peaks
+                        await update_trending_peaks(db)
+                        await update_gainers_peaks(db)
+                    except Exception:
+                        logger.exception("peak_update_error")
+
                     cycle_count += 1
 
                     # BL-033: periodic heartbeat summary
