@@ -233,21 +233,46 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
 
         comparisons.append(comp)
 
-    # 3. Store comparisons (INSERT OR REPLACE by coin_id)
+    # 3. Look up detected_price from price_cache and preserve existing peaks
+    detected_prices: dict[str, float | None] = {}
+    existing_peaks: dict[str, tuple[float | None, float | None]] = {}
+    for comp in comparisons:
+        # Preserve peak from previous row (if it was already tracked)
+        old_cursor = await db._conn.execute(
+            "SELECT detected_price, peak_price, peak_gain_pct FROM trending_comparisons WHERE coin_id = ?",
+            (comp.coin_id,),
+        )
+        old_row = await old_cursor.fetchone()
+        if old_row and old_row[0]:
+            detected_prices[comp.coin_id] = old_row[0]
+            existing_peaks[comp.coin_id] = (old_row[1], old_row[2])
+        else:
+            # First time: look up current price from price_cache as detected_price
+            pc = await db._conn.execute(
+                "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                (comp.coin_id,),
+            )
+            price_row = await pc.fetchone()
+            detected_prices[comp.coin_id] = price_row[0] if price_row and price_row[0] else None
+            existing_peaks[comp.coin_id] = (None, None)
+
+    # 4. Store comparisons (INSERT OR REPLACE by coin_id)
     for comp in comparisons:
         # Delete old comparison for this coin_id to avoid duplicates
         await db._conn.execute(
             "DELETE FROM trending_comparisons WHERE coin_id = ?",
             (comp.coin_id,),
         )
+        det_price = detected_prices.get(comp.coin_id)
+        old_peak, old_peak_pct = existing_peaks.get(comp.coin_id, (None, None))
         await db._conn.execute(
             """INSERT INTO trending_comparisons
                (coin_id, symbol, name, appeared_on_trending_at,
                 detected_by_narrative, narrative_detected_at, narrative_lead_minutes,
                 detected_by_pipeline, pipeline_detected_at, pipeline_lead_minutes,
                 detected_by_chains, chains_detected_at, chains_lead_minutes,
-                is_gap)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                is_gap, detected_price, peak_price, peak_gain_pct)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 comp.coin_id,
                 comp.symbol,
@@ -263,6 +288,9 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
                 comp.chains_detected_at.isoformat() if comp.chains_detected_at else None,
                 comp.chains_lead_minutes,
                 1 if comp.is_gap else 0,
+                det_price,
+                old_peak,
+                old_peak_pct,
             ),
         )
     await db._conn.commit()
@@ -370,7 +398,7 @@ async def get_recent_comparisons(
                   detected_by_narrative, narrative_detected_at, narrative_lead_minutes,
                   detected_by_pipeline, pipeline_detected_at, pipeline_lead_minutes,
                   detected_by_chains, chains_detected_at, chains_lead_minutes,
-                  is_gap, created_at
+                  is_gap, detected_price, peak_price, peak_gain_pct, created_at
            FROM trending_comparisons
            ORDER BY COALESCE(chains_detected_at, narrative_detected_at, pipeline_detected_at, appeared_on_trending_at) DESC
            LIMIT ?""",
@@ -378,3 +406,45 @@ async def get_recent_comparisons(
     )
     rows = await cursor.fetchall()
     return [dict(row) for row in rows]
+
+
+async def update_trending_peaks(db: "Database") -> int:
+    """Update peak prices for all trending comparisons using current price_cache data.
+
+    Returns the number of rows updated.
+    """
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+
+    conn = db._conn
+    cursor = await conn.execute(
+        "SELECT id, coin_id, detected_price, peak_price FROM trending_comparisons WHERE detected_price IS NOT NULL"
+    )
+    rows = await cursor.fetchall()
+    updated = 0
+
+    for row in rows:
+        pc = await conn.execute(
+            "SELECT current_price FROM price_cache WHERE coin_id = ?",
+            (row["coin_id"],),
+        )
+        price_row = await pc.fetchone()
+        if not price_row or not price_row[0]:
+            continue
+
+        current_price = price_row[0]
+        old_peak = row["peak_price"] or row["detected_price"] or 0
+
+        if current_price > old_peak and row["detected_price"] > 0:
+            peak_gain = ((current_price - row["detected_price"]) / row["detected_price"]) * 100
+            await conn.execute(
+                "UPDATE trending_comparisons SET peak_price = ?, peak_gain_pct = ? WHERE id = ?",
+                (current_price, peak_gain, row["id"]),
+            )
+            updated += 1
+
+    if updated:
+        await conn.commit()
+        logger.info("trending_tracker.peaks_updated", count=updated)
+
+    return updated

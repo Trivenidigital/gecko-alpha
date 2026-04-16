@@ -59,11 +59,13 @@ from scout.trending.tracker import (
     compare_with_signals as trending_compare,
     fetch_and_store_trending,
     store_trending_from_candidates,
+    update_trending_peaks,
 )
 from scout.spikes.detector import record_volume, detect_spikes, detect_7d_momentum
 from scout.gainers.tracker import (
     store_top_gainers,
     compare_gainers_with_signals,
+    update_gainers_peaks,
 )
 from scout.losers.tracker import (
     store_top_losers,
@@ -1190,6 +1192,13 @@ async def narrative_agent_loop(
                         logger.info("gainers_tracker.compare_complete")
                     except Exception:
                         logger.exception("gainers_tracker.compare_error")
+
+                # Update peak prices for trending + gainers comparisons
+                try:
+                    await update_trending_peaks(db)
+                    await update_gainers_peaks(db)
+                except Exception:
+                    logger.exception("peak_tracker.update_error")
 
                 # Losers comparison (piggybacks on EVALUATE interval)
                 if settings.LOSERS_TRACKER_ENABLED:

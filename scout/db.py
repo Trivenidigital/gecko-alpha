@@ -383,6 +383,9 @@ class Database:
                 chains_detected_at TEXT,
                 chains_lead_minutes REAL,
                 is_gap INTEGER DEFAULT 1,
+                detected_price REAL,
+                peak_price REAL,
+                peak_gain_pct REAL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_trending_comp
@@ -475,6 +478,9 @@ class Database:
                 detected_by_spikes INTEGER DEFAULT 0,
                 spikes_lead_minutes REAL,
                 is_gap INTEGER DEFAULT 1,
+                detected_price REAL,
+                peak_price REAL,
+                peak_gain_pct REAL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_gainers_comp
@@ -611,6 +617,28 @@ class Database:
             await self._conn.execute(
                 "ALTER TABLE losers_snapshots ADD COLUMN price_at_snapshot REAL"
             )
+
+        # Migrate trending_comparisons: add peak tracking columns
+        cursor = await self._conn.execute("PRAGMA table_info(trending_comparisons)")
+        tc_cols = {row[1] for row in await cursor.fetchall()}
+        for col, ddl in (
+            ("detected_price", "ALTER TABLE trending_comparisons ADD COLUMN detected_price REAL"),
+            ("peak_price", "ALTER TABLE trending_comparisons ADD COLUMN peak_price REAL"),
+            ("peak_gain_pct", "ALTER TABLE trending_comparisons ADD COLUMN peak_gain_pct REAL"),
+        ):
+            if col not in tc_cols:
+                await self._conn.execute(ddl)
+
+        # Migrate gainers_comparisons: add peak tracking columns
+        cursor = await self._conn.execute("PRAGMA table_info(gainers_comparisons)")
+        gc_cols = {row[1] for row in await cursor.fetchall()}
+        for col, ddl in (
+            ("detected_price", "ALTER TABLE gainers_comparisons ADD COLUMN detected_price REAL"),
+            ("peak_price", "ALTER TABLE gainers_comparisons ADD COLUMN peak_price REAL"),
+            ("peak_gain_pct", "ALTER TABLE gainers_comparisons ADD COLUMN peak_gain_pct REAL"),
+        ):
+            if col not in gc_cols:
+                await self._conn.execute(ddl)
 
         await self._conn.commit()
 

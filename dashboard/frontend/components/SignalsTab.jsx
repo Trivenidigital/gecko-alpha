@@ -201,6 +201,7 @@ export default function SignalsTab() {
                   <th>Detected Price</th>
                   <th>Current Price</th>
                   <th>Gain Since Detection</th>
+                  <th>Peak Gain</th>
                   <th>MCap</th>
                   <th>Lead Time</th>
                   <th>Trended At</th>
@@ -250,6 +251,13 @@ export default function SignalsTab() {
                         {gainSinceDetection != null ? (
                           <span style={{ color: gainSinceDetection >= 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
                             {gainSinceDetection >= 0 ? '+' : ''}{gainSinceDetection.toFixed(1)}%
+                          </span>
+                        ) : '-'}
+                      </td>
+                      <td style={{ fontWeight: 700 }}>
+                        {c.peak_gain_pct != null ? (
+                          <span style={{ color: 'var(--color-accent-green)' }}>
+                            +{Number(c.peak_gain_pct).toFixed(1)}%
                           </span>
                         ) : '-'}
                       </td>
@@ -535,6 +543,7 @@ export default function SignalsTab() {
                   <th>Detected Price</th>
                   <th>Current Price</th>
                   <th>Gain Since Detection</th>
+                  <th>Peak Gain</th>
                   <th>MCap</th>
                   <th>Lead Time</th>
                   <th>Gained At</th>
@@ -578,6 +587,13 @@ export default function SignalsTab() {
                         {gainSinceDetection != null ? (
                           <span style={{ color: gainSinceDetection >= 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
                             {gainSinceDetection >= 0 ? '+' : ''}{gainSinceDetection.toFixed(1)}%
+                          </span>
+                        ) : '-'}
+                      </td>
+                      <td style={{ fontWeight: 700 }}>
+                        {c.peak_gain_pct != null ? (
+                          <span style={{ color: 'var(--color-accent-green)' }}>
+                            +{Number(c.peak_gain_pct).toFixed(1)}%
                           </span>
                         ) : '-'}
                       </td>

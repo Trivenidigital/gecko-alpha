@@ -344,8 +344,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 c["price_change_7d"] = None
                 c["market_cap"] = None
 
-            # Estimate price_at_detection from current price and 24h change at trending time
-            if c.get("price_current") and c.get("price_change_24h"):
+            # Use stored detected_price if available, otherwise estimate
+            if c.get("detected_price"):
+                c["price_at_detection"] = c["detected_price"]
+            elif c.get("price_current") and c.get("price_change_24h"):
                 change = c["price_change_24h"]
                 if change > -100:
                     c["price_at_detection"] = c["price_current"] / (1 + change / 100)
@@ -466,12 +468,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 c["price_current"] = None
                 c["price_change_7d"] = None
 
-            # price_at_detection: use stored snapshot price, or estimate
-            snap_price = price_at_snap.get(cid)
-            if snap_price:
-                c["price_at_detection"] = snap_price
+            # price_at_detection: prefer stored detected_price, then snapshot price, then estimate
+            if c.get("detected_price"):
+                c["price_at_detection"] = c["detected_price"]
+            elif price_at_snap.get(cid):
+                c["price_at_detection"] = price_at_snap[cid]
             elif c.get("price_current") and c.get("price_change_24h"):
-                # Back-calculate: price_at_detection ~= current / (1 + change/100)
                 change = c["price_change_24h"]
                 if change > -100:
                     c["price_at_detection"] = c["price_current"] / (1 + change / 100)
