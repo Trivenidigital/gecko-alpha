@@ -91,6 +91,13 @@ class Settings(BaseSettings):
     CHAIN_GRADUATION_MIN_TRIGGERS: int = 30
     CHAIN_GRADUATION_HIT_RATE: float = 0.55
 
+    # -------- Market Briefing Agent --------
+    BRIEFING_ENABLED: bool = False              # opt-in, not default-on
+    BRIEFING_HOURS_UTC: str = "6,18"            # comma-separated hours (6am + 6pm)
+    BRIEFING_MODEL: str = "claude-sonnet-4-6"
+    BRIEFING_TELEGRAM_ENABLED: bool = True
+    COINGLASS_API_KEY: str = ""                 # free tier, register at coinglass.com
+
     # -------- 7-Day Momentum Scanner --------
     MOMENTUM_7D_ENABLED: bool = True
     MOMENTUM_7D_MIN_CHANGE: float = 100.0       # min 7d change % to flag (100% = doubled)
