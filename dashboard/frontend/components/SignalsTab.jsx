@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useMemo } from 'react'
 import TokenLink from './TokenLink'
+import { useSort, SortHeader } from './useSort.jsx'
 
 function fmtNum(n) {
   if (n == null) return '-'
@@ -129,6 +130,30 @@ export default function SignalsTab() {
   // Filter out mega-cap from comparisons
   const filteredComparisons = comparisons.filter(c => !isMegaCap(c))
 
+  // Enrich early catches with computed sort keys
+  const enrichedComparisons = useMemo(() => filteredComparisons.map(c => {
+    const leadMin = c.narrative_lead_minutes || c.pipeline_lead_minutes || c.chains_lead_minutes || null
+    const gainSince = (c.price_current && c.price_at_detection && c.price_at_detection > 0)
+      ? ((c.price_current - c.price_at_detection) / c.price_at_detection * 100) : null
+    return { ...c, _lead_minutes: leadMin, _gain_since: gainSince }
+  }), [filteredComparisons])
+
+  // Enrich gainers with computed sort keys
+  const enrichedGainers = useMemo(() => gainersComps.filter(c => !isMegaCap(c)).map(c => {
+    const leadMin = c.narrative_lead_minutes || c.pipeline_lead_minutes || c.chains_lead_minutes || c.spikes_lead_minutes || null
+    const gainSince = (c.price_current && c.price_at_detection && c.price_at_detection > 0)
+      ? ((c.price_current - c.price_at_detection) / c.price_at_detection * 100) : null
+    return { ...c, _lead_minutes: leadMin, _gain_since: gainSince }
+  }), [gainersComps])
+
+  // Sort hooks for each table
+  const earlyCatchSort = useSort(enrichedComparisons, '_lead_minutes', 'desc')
+  const gainersSort = useSort(enrichedGainers, '_gain_since', 'desc')
+  const heatingSort = useSort(heating, 'market_cap_change_24h', 'desc')
+  const predictionsSort = useSort(predictions, 'narrative_fit_score', 'desc')
+  const spikesSort = useSort(spikes, 'spike_ratio', 'desc')
+  const momentum7dSort = useSort(momentum7d, 'price_change_7d', 'desc')
+
   // Stats
   const caught = trendingStats?.caught_before_trending ?? 0
   const total = trendingStats?.total_tracked ?? 0
@@ -189,32 +214,27 @@ export default function SignalsTab() {
             <table className="candidates-table">
               <thead>
                 <tr>
-                  <th>Token</th>
-                  <th>24h %</th>
-                  <th>7d %</th>
-                  <th>Detected Price</th>
-                  <th>Current Price</th>
-                  <th>Gain Since Detection</th>
-                  <th>Peak Gain</th>
-                  <th>MCap</th>
-                  <th>Lead Time</th>
-                  <th>Trended At</th>
+                  <SortHeader col="symbol" label="Token" sortCol={earlyCatchSort.sortCol} sortDir={earlyCatchSort.sortDir} onSort={earlyCatchSort.handleSort} />
+                  <SortHeader col="price_change_24h" label="24h %" sortCol={earlyCatchSort.sortCol} sortDir={earlyCatchSort.sortDir} onSort={earlyCatchSort.handleSort} />
+                  <SortHeader col="price_change_7d" label="7d %" sortCol={earlyCatchSort.sortCol} sortDir={earlyCatchSort.sortDir} onSort={earlyCatchSort.handleSort} />
+                  <SortHeader col="price_at_detection" label="Detected Price" sortCol={earlyCatchSort.sortCol} sortDir={earlyCatchSort.sortDir} onSort={earlyCatchSort.handleSort} />
+                  <SortHeader col="price_current" label="Current Price" sortCol={earlyCatchSort.sortCol} sortDir={earlyCatchSort.sortDir} onSort={earlyCatchSort.handleSort} />
+                  <SortHeader col="_gain_since" label="Gain Since Detection" sortCol={earlyCatchSort.sortCol} sortDir={earlyCatchSort.sortDir} onSort={earlyCatchSort.handleSort} />
+                  <SortHeader col="peak_gain_pct" label="Peak Gain" sortCol={earlyCatchSort.sortCol} sortDir={earlyCatchSort.sortDir} onSort={earlyCatchSort.handleSort} />
+                  <SortHeader col="market_cap" label="MCap" sortCol={earlyCatchSort.sortCol} sortDir={earlyCatchSort.sortDir} onSort={earlyCatchSort.handleSort} />
+                  <SortHeader col="_lead_minutes" label="Lead Time" sortCol={earlyCatchSort.sortCol} sortDir={earlyCatchSort.sortDir} onSort={earlyCatchSort.handleSort} />
+                  <SortHeader col="appeared_on_trending_at" label="Trended At" sortCol={earlyCatchSort.sortCol} sortDir={earlyCatchSort.sortDir} onSort={earlyCatchSort.handleSort} />
                   <th>Detected By</th>
                 </tr>
               </thead>
               <tbody>
-                {filteredComparisons.map((c, i) => {
-                  // Pick best lead time from available detection methods
-                  const leadMin = c.narrative_lead_minutes || c.pipeline_lead_minutes || c.chains_lead_minutes || null
+                {earlyCatchSort.sorted.map((c, i) => {
                   // Build detected-by label
                   const methods = []
                   if (c.detected_by_narrative) methods.push('Narrative')
                   if (c.detected_by_pipeline) methods.push('Pipeline')
                   if (c.detected_by_chains) methods.push('Chains')
                   const detectedBy = methods.length > 0 ? methods.join(' + ') : (c.is_gap ? 'MISSED' : '-')
-                  const gainSinceDetection = (c.price_current && c.price_at_detection && c.price_at_detection > 0)
-                    ? ((c.price_current - c.price_at_detection) / c.price_at_detection * 100)
-                    : null
 
                   return (
                     <tr key={c.coin_id || i}>
@@ -242,9 +262,9 @@ export default function SignalsTab() {
                       <td style={{ fontSize: 12 }}>{fmtPrice(c.price_at_detection)}</td>
                       <td style={{ fontSize: 12 }}>{fmtPrice(c.price_current)}</td>
                       <td style={{ fontWeight: 700 }}>
-                        {gainSinceDetection != null ? (
-                          <span style={{ color: gainSinceDetection >= 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
-                            {gainSinceDetection >= 0 ? '+' : ''}{gainSinceDetection.toFixed(1)}%
+                        {c._gain_since != null ? (
+                          <span style={{ color: c._gain_since >= 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
+                            {c._gain_since >= 0 ? '+' : ''}{c._gain_since.toFixed(1)}%
                           </span>
                         ) : '-'}
                       </td>
@@ -259,9 +279,9 @@ export default function SignalsTab() {
                       <td>
                         <span style={{
                           fontWeight: 700,
-                          color: leadTimeColor(leadMin),
+                          color: leadTimeColor(c._lead_minutes),
                         }}>
-                          {fmtLeadTime(leadMin)}
+                          {fmtLeadTime(c._lead_minutes)}
                         </span>
                       </td>
                       <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
@@ -295,14 +315,14 @@ export default function SignalsTab() {
           <table className="candidates-table">
             <thead>
               <tr>
-                <th>Category</th>
-                <th>Acceleration</th>
-                <th>Volume 24h</th>
-                <th>Regime</th>
+                <SortHeader col="name" label="Category" sortCol={heatingSort.sortCol} sortDir={heatingSort.sortDir} onSort={heatingSort.handleSort} />
+                <SortHeader col="market_cap_change_24h" label="Acceleration" sortCol={heatingSort.sortCol} sortDir={heatingSort.sortDir} onSort={heatingSort.handleSort} />
+                <SortHeader col="volume_24h" label="Volume 24h" sortCol={heatingSort.sortCol} sortDir={heatingSort.sortDir} onSort={heatingSort.handleSort} />
+                <SortHeader col="market_regime" label="Regime" sortCol={heatingSort.sortCol} sortDir={heatingSort.sortDir} onSort={heatingSort.handleSort} />
               </tr>
             </thead>
             <tbody>
-              {heating.slice(0, 10).map((c, i) => {
+              {heatingSort.sorted.slice(0, 10).map((c, i) => {
                 const accel = c.market_cap_change_24h
                 const accelColor = accel > 20 ? 'var(--color-accent-green)'
                   : accel > 10 ? 'var(--color-accent-amber)'
@@ -374,17 +394,17 @@ export default function SignalsTab() {
             <table className="candidates-table">
               <thead>
                 <tr>
-                  <th>Token</th>
-                  <th>Spike Ratio</th>
-                  <th>Volume</th>
-                  <th>Avg 7d</th>
-                  <th>MCap</th>
-                  <th>24h %</th>
-                  <th>Detected</th>
+                  <SortHeader col="symbol" label="Token" sortCol={spikesSort.sortCol} sortDir={spikesSort.sortDir} onSort={spikesSort.handleSort} />
+                  <SortHeader col="spike_ratio" label="Spike Ratio" sortCol={spikesSort.sortCol} sortDir={spikesSort.sortDir} onSort={spikesSort.handleSort} />
+                  <SortHeader col="current_volume" label="Volume" sortCol={spikesSort.sortCol} sortDir={spikesSort.sortDir} onSort={spikesSort.handleSort} />
+                  <SortHeader col="avg_volume_7d" label="Avg 7d" sortCol={spikesSort.sortCol} sortDir={spikesSort.sortDir} onSort={spikesSort.handleSort} />
+                  <SortHeader col="market_cap" label="MCap" sortCol={spikesSort.sortCol} sortDir={spikesSort.sortDir} onSort={spikesSort.handleSort} />
+                  <SortHeader col="price_change_24h" label="24h %" sortCol={spikesSort.sortCol} sortDir={spikesSort.sortDir} onSort={spikesSort.handleSort} />
+                  <SortHeader col="detected_at" label="Detected" sortCol={spikesSort.sortCol} sortDir={spikesSort.sortDir} onSort={spikesSort.handleSort} />
                 </tr>
               </thead>
               <tbody>
-                {spikes.map((s, i) => (
+                {spikesSort.sorted.map((s, i) => (
                   <tr key={s.coin_id + '-' + i}>
                     <td>
                       <TokenLink tokenId={s.coin_id} symbol={s.symbol || s.name} chain="coingecko" />
@@ -449,17 +469,17 @@ export default function SignalsTab() {
             <table className="candidates-table">
               <thead>
                 <tr>
-                  <th>Token</th>
-                  <th>7d %</th>
-                  <th>24h %</th>
-                  <th>MCap</th>
-                  <th>Volume</th>
-                  <th>Price</th>
-                  <th>Detected</th>
+                  <SortHeader col="symbol" label="Token" sortCol={momentum7dSort.sortCol} sortDir={momentum7dSort.sortDir} onSort={momentum7dSort.handleSort} />
+                  <SortHeader col="price_change_7d" label="7d %" sortCol={momentum7dSort.sortCol} sortDir={momentum7dSort.sortDir} onSort={momentum7dSort.handleSort} />
+                  <SortHeader col="price_change_24h" label="24h %" sortCol={momentum7dSort.sortCol} sortDir={momentum7dSort.sortDir} onSort={momentum7dSort.handleSort} />
+                  <SortHeader col="market_cap" label="MCap" sortCol={momentum7dSort.sortCol} sortDir={momentum7dSort.sortDir} onSort={momentum7dSort.handleSort} />
+                  <SortHeader col="volume_24h" label="Volume" sortCol={momentum7dSort.sortCol} sortDir={momentum7dSort.sortDir} onSort={momentum7dSort.handleSort} />
+                  <SortHeader col="current_price" label="Price" sortCol={momentum7dSort.sortCol} sortDir={momentum7dSort.sortDir} onSort={momentum7dSort.handleSort} />
+                  <SortHeader col="detected_at" label="Detected" sortCol={momentum7dSort.sortCol} sortDir={momentum7dSort.sortDir} onSort={momentum7dSort.handleSort} />
                 </tr>
               </thead>
               <tbody>
-                {momentum7d.map((m, i) => (
+                {momentum7dSort.sorted.map((m, i) => (
                   <tr key={m.coin_id + '-' + i}>
                     <td>
                       <TokenLink tokenId={m.coin_id} symbol={m.symbol || m.name} chain="coingecko" />
@@ -531,31 +551,27 @@ export default function SignalsTab() {
             <table className="candidates-table">
               <thead>
                 <tr>
-                  <th>Token</th>
-                  <th>24h %</th>
-                  <th>7d %</th>
-                  <th>Detected Price</th>
-                  <th>Current Price</th>
-                  <th>Gain Since Detection</th>
-                  <th>Peak Gain</th>
-                  <th>MCap</th>
-                  <th>Lead Time</th>
-                  <th>Gained At</th>
+                  <SortHeader col="symbol" label="Token" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="price_change_24h" label="24h %" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="price_change_7d" label="7d %" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="price_at_detection" label="Detected Price" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="price_current" label="Current Price" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="_gain_since" label="Gain Since Detection" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="peak_gain_pct" label="Peak Gain" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="market_cap" label="MCap" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="_lead_minutes" label="Lead Time" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="appeared_on_gainers_at" label="Gained At" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
                   <th>Detected By</th>
                 </tr>
               </thead>
               <tbody>
-                {gainersComps.filter(c => !isMegaCap(c)).map((c, i) => {
-                  const leadMin = c.narrative_lead_minutes || c.pipeline_lead_minutes || c.chains_lead_minutes || c.spikes_lead_minutes || null
+                {gainersSort.sorted.map((c, i) => {
                   const methods = []
                   if (c.detected_by_narrative) methods.push('Narrative')
                   if (c.detected_by_pipeline) methods.push('Pipeline')
                   if (c.detected_by_chains) methods.push('Chains')
                   if (c.detected_by_spikes) methods.push('Spikes')
                   const detectedBy = methods.length > 0 ? methods.join(' + ') : (c.is_gap ? 'MISSED' : '-')
-                  const gainSinceDetection = (c.price_current && c.price_at_detection && c.price_at_detection > 0)
-                    ? ((c.price_current - c.price_at_detection) / c.price_at_detection * 100)
-                    : null
                   return (
                     <tr key={c.coin_id || i}>
                       <td>
@@ -578,9 +594,9 @@ export default function SignalsTab() {
                       <td style={{ fontSize: 12 }}>{fmtPrice(c.price_at_detection)}</td>
                       <td style={{ fontSize: 12 }}>{fmtPrice(c.price_current)}</td>
                       <td style={{ fontWeight: 700 }}>
-                        {gainSinceDetection != null ? (
-                          <span style={{ color: gainSinceDetection >= 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
-                            {gainSinceDetection >= 0 ? '+' : ''}{gainSinceDetection.toFixed(1)}%
+                        {c._gain_since != null ? (
+                          <span style={{ color: c._gain_since >= 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
+                            {c._gain_since >= 0 ? '+' : ''}{c._gain_since.toFixed(1)}%
                           </span>
                         ) : '-'}
                       </td>
@@ -593,8 +609,8 @@ export default function SignalsTab() {
                       </td>
                       <td style={{ fontSize: 12 }}>{fmtNum(c.market_cap)}</td>
                       <td>
-                        <span style={{ fontWeight: 700, color: leadTimeColor(leadMin) }}>
-                          {fmtLeadTime(leadMin)}
+                        <span style={{ fontWeight: 700, color: leadTimeColor(c._lead_minutes) }}>
+                          {fmtLeadTime(c._lead_minutes)}
                         </span>
                       </td>
                       <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
@@ -627,18 +643,18 @@ export default function SignalsTab() {
             <table className="candidates-table">
               <thead>
                 <tr>
-                  <th>Token</th>
-                  <th>Category</th>
-                  <th>Fit</th>
-                  <th>Risk</th>
-                  <th>Conf</th>
-                  <th>Regime</th>
-                  <th>Watch</th>
-                  <th>Outcome</th>
+                  <SortHeader col="symbol" label="Token" sortCol={predictionsSort.sortCol} sortDir={predictionsSort.sortDir} onSort={predictionsSort.handleSort} />
+                  <SortHeader col="category_name" label="Category" sortCol={predictionsSort.sortCol} sortDir={predictionsSort.sortDir} onSort={predictionsSort.handleSort} />
+                  <SortHeader col="narrative_fit_score" label="Fit" sortCol={predictionsSort.sortCol} sortDir={predictionsSort.sortDir} onSort={predictionsSort.handleSort} />
+                  <SortHeader col="counter_risk_score" label="Risk" sortCol={predictionsSort.sortCol} sortDir={predictionsSort.sortDir} onSort={predictionsSort.handleSort} />
+                  <SortHeader col="confidence" label="Conf" sortCol={predictionsSort.sortCol} sortDir={predictionsSort.sortDir} onSort={predictionsSort.handleSort} />
+                  <SortHeader col="market_regime" label="Regime" sortCol={predictionsSort.sortCol} sortDir={predictionsSort.sortDir} onSort={predictionsSort.handleSort} />
+                  <SortHeader col="watchlist_users" label="Watch" sortCol={predictionsSort.sortCol} sortDir={predictionsSort.sortDir} onSort={predictionsSort.handleSort} />
+                  <SortHeader col="outcome_class" label="Outcome" sortCol={predictionsSort.sortCol} sortDir={predictionsSort.sortDir} onSort={predictionsSort.handleSort} />
                 </tr>
               </thead>
               <tbody>
-                {predictions.map((p, i) => {
+                {predictionsSort.sorted.map((p, i) => {
                   const fit = p.narrative_fit_score ?? p.fit_score
                   const fitColor = fit > 60 ? 'var(--color-accent-green)'
                     : fit > 30 ? 'var(--color-accent-amber)'

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import TokenLink from './TokenLink'
+import { useSort, SortHeader as SharedSortHeader } from './useSort.jsx'
 
 function fmtUsd(n) {
   if (n == null) return '-'
@@ -199,6 +200,17 @@ export default function TradingTab() {
     )
   }
 
+  // Enrich closed trades with computed sort keys
+  const enrichedHistory = React.useMemo(() => history.map(h => ({
+    ...h,
+    _pnl: h.pnl_usd ?? h.pnl ?? h.realized_pnl ?? 0,
+    _pnl_pct: h.pnl_pct ?? h.realized_pnl_pct ?? null,
+    _category: getCategory(h),
+    _token: (h.symbol || h.name || h.token_id || '').toLowerCase(),
+  })), [history])
+
+  const closedSort = useSort(enrichedHistory, 'closed_at', 'desc')
+
   const totalPnl = stats?.total_pnl_usd ?? stats?.total_pnl ?? 0
   const winRate = stats?.win_rate_pct ?? 0
   const openCount = positions.length
@@ -397,20 +409,20 @@ export default function TradingTab() {
             <table className="candidates-table">
               <thead>
                 <tr>
-                  <th>Token</th>
-                  <th>Category</th>
-                  <th>Entry / Exit</th>
-                  <th>Amount</th>
-                  <th>PnL $</th>
-                  <th>PnL %</th>
-                  <th>Reason</th>
-                  <th>Duration</th>
+                  <SharedSortHeader col="_token" label="Token" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
+                  <SharedSortHeader col="_category" label="Category" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
+                  <SharedSortHeader col="entry_price" label="Entry / Exit" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
+                  <SharedSortHeader col="amount_usd" label="Amount" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
+                  <SharedSortHeader col="_pnl" label="PnL $" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
+                  <SharedSortHeader col="_pnl_pct" label="PnL %" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
+                  <SharedSortHeader col="exit_reason" label="Reason" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
+                  <SharedSortHeader col="closed_at" label="Duration" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
                 </tr>
               </thead>
               <tbody>
-                {history.map((h, i) => {
-                  const pnl = h.pnl_usd ?? h.pnl ?? h.realized_pnl ?? 0
-                  const pnlPct = h.pnl_pct ?? h.realized_pnl_pct ?? null
+                {closedSort.sorted.map((h, i) => {
+                  const pnl = h._pnl
+                  const pnlPct = h._pnl_pct
                   const rowBg = pnl > 0
                     ? 'rgba(76, 175, 80, 0.05)'
                     : pnl < 0
