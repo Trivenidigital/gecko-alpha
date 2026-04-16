@@ -482,7 +482,10 @@ async def narrative_agent_loop(
 
                         # Open paper trades for narrative predictions
                         if trading_engine and prediction_models:
-                            await trade_predictions(trading_engine, db, prediction_models)
+                            await trade_predictions(
+                                trading_engine, db, prediction_models,
+                                min_mcap=settings.PAPER_MIN_MCAP,
+                            )
 
                     # Send alert if enabled and matches user preferences
                     if narrative_alert_enabled and prediction_models:

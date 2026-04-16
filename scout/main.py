@@ -326,7 +326,7 @@ async def run_cycle(
                     tokens=[m["symbol"] for m in momentum_7d],
                 )
                 if trading_engine:
-                    await trade_momentum(trading_engine, momentum_7d)
+                    await trade_momentum(trading_engine, momentum_7d, min_mcap=settings.PAPER_MIN_MCAP)
         except Exception:
             logger.exception("momentum_7d_error")
 

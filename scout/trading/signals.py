@@ -100,9 +100,11 @@ async def trade_losers(engine, db: Database) -> None:
         logger.exception("trading_losers_query_error")
 
 
-async def trade_momentum(engine, momentum_7d: list[dict]) -> None:
-    """Open paper trades for 7-day momentum tokens."""
+async def trade_momentum(engine, momentum_7d: list[dict], min_mcap: float = 5_000_000) -> None:
+    """Open paper trades for 7-day momentum tokens. Filters micro-cap junk."""
     for m in momentum_7d:
+        if (m.get("market_cap") or 0) < min_mcap:
+            continue
         try:
             await engine.open_trade(
                 token_id=m["coin_id"],
@@ -113,6 +115,7 @@ async def trade_momentum(engine, momentum_7d: list[dict]) -> None:
                 signal_data={
                     "change_7d": m["price_change_7d"],
                     "change_24h": m["price_change_24h"],
+                    "mcap": m.get("market_cap"),
                 },
                 entry_price=m.get("current_price"),
             )
@@ -154,27 +157,43 @@ async def trade_trending(engine, db: Database) -> None:
         logger.exception("trading_trending_catch_error")
 
 
-async def trade_predictions(engine, db: Database, prediction_models: list) -> None:
-    """Open paper trades for narrative prediction picks."""
+async def trade_predictions(
+    engine, db: Database, prediction_models: list,
+    min_mcap: float = 5_000_000,
+    min_fit_score: int = 0,
+) -> None:
+    """Open paper trades for narrative prediction picks.
+
+    Filters: only trade tokens with mcap >= min_mcap to avoid micro-cap junk
+    from niche categories (Zoo-Themed, Trading Bots, Arcade Games, etc).
+    """
     for pred in prediction_models:
-        if not pred.is_control:
-            try:
-                pc = await db._conn.execute(
-                    "SELECT current_price FROM price_cache WHERE coin_id = ?",
-                    (pred.coin_id,),
-                )
-                pr = await pc.fetchone()
-                pred_price = pr[0] if pr else None
-                await engine.open_trade(
-                    token_id=pred.coin_id,
-                    chain="coingecko",
-                    signal_type="narrative_prediction",
-                    signal_data={
-                        "fit": pred.narrative_fit_score,
-                        "category": pred.category_name,
-                    },
-                    entry_price=pred_price,
-                )
+        if pred.is_control:
+            continue
+        # Quality gate: skip micro-cap junk
+        if pred.market_cap_at_prediction < min_mcap:
+            continue
+        # Quality gate: skip low-confidence picks
+        if min_fit_score > 0 and (pred.narrative_fit_score or 0) < min_fit_score:
+            continue
+        try:
+            pc = await db._conn.execute(
+                "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                (pred.coin_id,),
+            )
+            pr = await pc.fetchone()
+            pred_price = pr[0] if pr else None
+            await engine.open_trade(
+                token_id=pred.coin_id,
+                chain="coingecko",
+                signal_type="narrative_prediction",
+                signal_data={
+                    "fit": pred.narrative_fit_score,
+                    "category": pred.category_name,
+                    "mcap": pred.market_cap_at_prediction,
+                },
+                entry_price=pred_price,
+            )
             except Exception:
                 logger.exception(
                     "trading_open_narrative_error",
