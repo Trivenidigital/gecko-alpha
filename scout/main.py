@@ -44,8 +44,92 @@ from scout.trading.signals import (
     trade_momentum,
     trade_volume_spikes,
 )
+from scout.briefing.collector import collect_briefing_data
+from scout.briefing.synthesizer import split_message, synthesize_briefing
 
 logger = structlog.get_logger()
+
+
+async def briefing_loop(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    db: Database,
+) -> None:
+    """Time-gated briefing generation loop.
+
+    Runs every 60s, checks if a briefing is due based on BRIEFING_HOURS_UTC
+    and an 11-hour minimum gap. Persists last_briefing_at to DB so it
+    survives restarts.
+    """
+    import json as _json
+
+    briefing_hours = [int(h.strip()) for h in settings.BRIEFING_HOURS_UTC.split(",")]
+
+    # Load last briefing time from DB (persist across restarts)
+    last_briefing_at: datetime | None = None
+    last_str = await db.get_last_briefing_time()
+    if last_str:
+        try:
+            last_briefing_at = datetime.fromisoformat(
+                last_str.replace("Z", "+00:00")
+            )
+            if last_briefing_at.tzinfo is None:
+                last_briefing_at = last_briefing_at.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            pass
+
+    logger.info(
+        "briefing_loop_started",
+        hours=briefing_hours,
+        last_briefing_at=str(last_briefing_at),
+    )
+
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            should_run = (
+                now.hour in briefing_hours
+                and (
+                    last_briefing_at is None
+                    or (now - last_briefing_at).total_seconds() > 39600  # >11h
+                )
+            )
+
+            if should_run:
+                briefing_type = "morning" if now.hour < 12 else "evening"
+                logger.info("briefing_starting", type=briefing_type)
+
+                try:
+                    raw = await collect_briefing_data(session, db, settings)
+                    synthesis = await synthesize_briefing(
+                        raw,
+                        settings.ANTHROPIC_API_KEY,
+                        settings.BRIEFING_MODEL,
+                    )
+
+                    # Store in DB
+                    await db.store_briefing(
+                        briefing_type=briefing_type,
+                        raw_data=_json.dumps(raw, default=str),
+                        synthesis=synthesis,
+                        model_used=settings.BRIEFING_MODEL,
+                        created_at=now.isoformat(),
+                    )
+
+                    # Send to Telegram
+                    if settings.BRIEFING_TELEGRAM_ENABLED:
+                        for chunk in split_message(synthesis, 4096):
+                            await send_telegram_message(chunk, session, settings)
+
+                    last_briefing_at = now
+                    logger.info("briefing_delivered", type=briefing_type)
+                except Exception:
+                    logger.exception("briefing_error")
+
+        except Exception:
+            logger.exception("briefing_loop_tick_error")
+
+        await asyncio.sleep(60)
 
 
 async def _safe_counter_followup(token, session, settings, db=None):
@@ -657,6 +741,10 @@ async def main() -> None:
                 from scout.secondwave.detector import secondwave_loop
                 tasks.append(
                     asyncio.create_task(secondwave_loop(session, settings))
+                )
+            if settings.BRIEFING_ENABLED:
+                tasks.append(
+                    asyncio.create_task(briefing_loop(session, settings, db))
                 )
             if settings.CHAINS_ENABLED:
                 tasks.append(
