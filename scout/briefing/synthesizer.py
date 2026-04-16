@@ -104,7 +104,7 @@ async def synthesize_briefing(
     """
     import anthropic
 
-    client = anthropic.AsyncAnthropic(api_key=api_key)
+    client = anthropic.AsyncAnthropic(api_key=api_key, timeout=90.0)
     message = await client.messages.create(
         model=model,
         max_tokens=2000,
@@ -124,6 +124,8 @@ async def synthesize_briefing(
 
 def split_message(text: str, max_len: int = 4096) -> list[str]:
     """Split long briefing into Telegram-safe chunks, breaking at newlines."""
+    if not text:
+        return []
     if len(text) <= max_len:
         return [text]
     chunks: list[str] = []
