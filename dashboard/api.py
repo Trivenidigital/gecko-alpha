@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+from datetime import timedelta
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -506,6 +507,111 @@ def create_app(db_path: str | None = None) -> FastAPI:
         from scout.losers.tracker import get_losers_stats
         sdb = await _get_scout_db(_db_path)
         return await get_losers_stats(sdb)
+
+    # --- Briefing endpoints ---
+
+    # Manual briefing cooldown tracking (5-minute cooldown)
+    _last_manual_briefing_at: dict = {"ts": None}
+
+    @app.get("/api/briefing/latest")
+    async def briefing_latest():
+        """Most recent briefing text + metadata."""
+        result = await db.get_briefing_latest(_db_path)
+        if result is None:
+            return {"briefing": None}
+        return result
+
+    @app.get("/api/briefing/history")
+    async def briefing_history(limit: int = Query(10, ge=1, le=50)):
+        """Past briefings."""
+        return await db.get_briefing_history(_db_path, limit=limit)
+
+    @app.post("/api/briefing/generate")
+    async def briefing_generate():
+        """Manually trigger a briefing (5-minute cooldown)."""
+        from fastapi.responses import JSONResponse
+        from datetime import datetime, timezone as tz
+
+        now = datetime.now(tz.utc)
+
+        # 5-minute cooldown
+        if _last_manual_briefing_at["ts"] is not None:
+            elapsed = (now - _last_manual_briefing_at["ts"]).total_seconds()
+            if elapsed < 300:
+                remaining = int(300 - elapsed)
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": f"Cooldown: wait {remaining}s before next manual briefing"},
+                )
+
+        try:
+            sdb = await _get_scout_db(_db_path)
+            from scout.config import get_settings
+            settings = get_settings()
+
+            if not settings.ANTHROPIC_API_KEY:
+                return JSONResponse(status_code=400, content={"detail": "ANTHROPIC_API_KEY not configured"})
+
+            import aiohttp as _aio
+            from scout.briefing.collector import collect_briefing_data
+            from scout.briefing.synthesizer import synthesize_briefing
+            import json as _json
+
+            async with _aio.ClientSession() as session:
+                raw = await collect_briefing_data(session, sdb, settings)
+                synthesis = await synthesize_briefing(
+                    raw, settings.ANTHROPIC_API_KEY, settings.BRIEFING_MODEL
+                )
+
+            bid = await db.store_briefing(
+                _db_path,
+                briefing_type="manual",
+                raw_data=_json.dumps(raw, default=str),
+                synthesis=synthesis,
+                model_used=settings.BRIEFING_MODEL,
+                created_at=now.isoformat(),
+            )
+            _last_manual_briefing_at["ts"] = now
+            return {"id": bid, "synthesis": synthesis, "created_at": now.isoformat()}
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"detail": str(e)})
+
+    @app.get("/api/briefing/schedule")
+    async def briefing_schedule():
+        """Next scheduled briefing time."""
+        from datetime import datetime, timezone as tz
+        from scout.config import get_settings
+
+        settings = get_settings()
+        now = datetime.now(tz.utc)
+        hours = [int(h.strip()) for h in settings.BRIEFING_HOURS_UTC.split(",")]
+        hours.sort()
+
+        # Find next scheduled hour
+        next_hour = None
+        for h in hours:
+            if h > now.hour:
+                next_hour = h
+                break
+        if next_hour is None:
+            next_hour = hours[0]  # wrap to tomorrow
+
+        if next_hour > now.hour:
+            next_time = now.replace(hour=next_hour, minute=0, second=0, microsecond=0)
+        else:
+            next_time = (now + timedelta(days=1)).replace(
+                hour=next_hour, minute=0, second=0, microsecond=0
+            )
+
+        last_time = await db.get_last_briefing_time(_db_path)
+
+        return {
+            "enabled": settings.BRIEFING_ENABLED,
+            "hours_utc": hours,
+            "next_scheduled": next_time.isoformat(),
+            "last_briefing_at": last_time,
+            "model": settings.BRIEFING_MODEL,
+        }
 
     # --- System health endpoint ---
 

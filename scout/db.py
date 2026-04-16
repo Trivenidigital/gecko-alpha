@@ -588,6 +588,17 @@ class Database:
                 by_signal_type TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS briefings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                briefing_type TEXT NOT NULL,
+                raw_data TEXT NOT NULL,
+                synthesis TEXT NOT NULL,
+                model_used TEXT,
+                tokens_used INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_briefings_created ON briefings(created_at);
             """
         )
 
@@ -1160,3 +1171,60 @@ class Database:
         )
         rows = await cursor.fetchall()
         return [r[0] for r in rows]
+
+    # ------------------------------------------------------------------
+    # Briefings
+    # ------------------------------------------------------------------
+
+    async def store_briefing(
+        self,
+        briefing_type: str,
+        raw_data: str,
+        synthesis: str,
+        model_used: str,
+        tokens_used: int | None = None,
+        created_at: str | None = None,
+    ) -> int:
+        """Insert a briefing row and return its id."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if created_at is None:
+            created_at = datetime.now(timezone.utc).isoformat()
+        cursor = await self._conn.execute(
+            """INSERT INTO briefings (briefing_type, raw_data, synthesis, model_used, tokens_used, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (briefing_type, raw_data, synthesis, model_used, tokens_used, created_at),
+        )
+        await self._conn.commit()
+        return cursor.lastrowid  # type: ignore[return-value]
+
+    async def get_latest_briefing(self) -> dict | None:
+        """Return the most recent briefing row, or None."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cursor = await self._conn.execute(
+            "SELECT * FROM briefings ORDER BY created_at DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_briefing_history(self, limit: int = 10) -> list[dict]:
+        """Return recent briefings (most recent first)."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cursor = await self._conn.execute(
+            "SELECT id, briefing_type, synthesis, model_used, tokens_used, created_at FROM briefings ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_last_briefing_time(self) -> str | None:
+        """Return the created_at of the most recent briefing, or None."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cursor = await self._conn.execute(
+            "SELECT MAX(created_at) FROM briefings"
+        )
+        row = await cursor.fetchone()
+        return row[0] if row and row[0] else None

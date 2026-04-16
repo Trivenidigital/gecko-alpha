@@ -540,6 +540,7 @@ async def get_system_health(db_path: str) -> dict:
         ("active_chains", "last_step_time"),
         ("chain_matches", "completed_at"),
         ("chain_patterns", "created_at"),
+        ("briefings", "created_at"),
         ("trending_snapshots", "snapshot_at"),
         ("trending_comparisons", "created_at"),
         ("candidates", "first_seen_at"),
@@ -715,6 +716,63 @@ async def get_quality_signals(
 
     merged.sort(key=lambda r: (r.get("quality_score") or 0), reverse=True)
     return merged[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Briefing queries
+# ---------------------------------------------------------------------------
+
+
+async def get_briefing_latest(db_path: str) -> dict | None:
+    """Return the most recent briefing."""
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute(
+            "SELECT * FROM briefings ORDER BY created_at DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_briefing_history(db_path: str, limit: int = 10) -> list[dict]:
+    """Return past briefings (most recent first)."""
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute(
+            """SELECT id, briefing_type, synthesis, model_used, tokens_used, created_at
+               FROM briefings ORDER BY created_at DESC LIMIT ?""",
+            (limit,),
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_last_briefing_time(db_path: str) -> str | None:
+    """Return the created_at of the most recent briefing."""
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute("SELECT MAX(created_at) FROM briefings")
+        row = await cursor.fetchone()
+        return row[0] if row and row[0] else None
+
+
+async def store_briefing(
+    db_path: str,
+    briefing_type: str,
+    raw_data: str,
+    synthesis: str,
+    model_used: str,
+    tokens_used: int | None = None,
+    created_at: str | None = None,
+) -> int:
+    """Insert a briefing and return its id."""
+    from datetime import datetime, timezone as tz
+    if created_at is None:
+        created_at = datetime.now(tz.utc).isoformat()
+    async with _rw_db(db_path) as conn:
+        cursor = await conn.execute(
+            """INSERT INTO briefings (briefing_type, raw_data, synthesis, model_used, tokens_used, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (briefing_type, raw_data, synthesis, model_used, tokens_used, created_at),
+        )
+        await conn.commit()
+        return cursor.lastrowid
 
 
 async def get_available_categories(db_path: str) -> list[dict]:
