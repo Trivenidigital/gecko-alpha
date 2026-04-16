@@ -91,6 +91,7 @@ export default function SignalsTab() {
   const [gainersStats, setGainersStats] = useState(null)
   const [momentum7d, setMomentum7d] = useState([])
   const [momentum7dStats, setMomentum7dStats] = useState(null)
+  const [showMissed, setShowMissed] = useState(false)
 
   const fetchAll = useCallback(async () => {
     try {
@@ -146,9 +147,12 @@ export default function SignalsTab() {
     return { ...c, _lead_minutes: leadMin, _gain_since: gainSince }
   }), [gainersComps])
 
+  const caughtGainers = useMemo(() => enrichedGainers.filter(c => !c.is_gap), [enrichedGainers])
+  const missedGainers = useMemo(() => enrichedGainers.filter(c => c.is_gap), [enrichedGainers])
+
   // Sort hooks for each table
   const earlyCatchSort = useSort(enrichedComparisons, '_lead_minutes', 'desc')
-  const gainersSort = useSort(enrichedGainers, '_gain_since', 'desc')
+  const gainersSort = useSort(caughtGainers, '_gain_since', 'desc')
   const heatingSort = useSort(heating, 'market_cap_change_24h', 'desc')
   const predictionsSort = useSort(predictions, 'narrative_fit_score', 'desc')
   const spikesSort = useSort(spikes, 'spike_ratio', 'desc')
@@ -622,6 +626,49 @@ export default function SignalsTab() {
                 })}
               </tbody>
             </table>
+          </div>
+        )}
+
+        {missedGainers.length > 0 && (
+          <div style={{ marginTop: 8 }}>
+            <div
+              style={{
+                cursor: 'pointer', padding: '8px 12px',
+                fontSize: 12, color: 'var(--color-accent-red, #ef5350)',
+                display: 'flex', alignItems: 'center', gap: 8,
+              }}
+              onClick={() => setShowMissed(!showMissed)}
+            >
+              {showMissed ? '\u25BC' : '\u25B6'} Missed ({missedGainers.length})
+            </div>
+            {showMissed && (
+              <div style={{ overflowX: 'auto' }}>
+                <table className="candidates-table">
+                  <thead>
+                    <tr>
+                      <th>Token</th>
+                      <th>24h % (at time)</th>
+                      <th>Gained At</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {missedGainers.map((c, i) => (
+                      <tr key={c.coin_id || i} style={{ opacity: 0.7 }}>
+                        <td>
+                          <TokenLink tokenId={c.coin_id} symbol={c.symbol || c.name} chain="coingecko" />
+                        </td>
+                        <td style={{ fontWeight: 600, color: 'var(--color-accent-green)' }}>
+                          +{Number(c.price_change_24h).toFixed(1)}%
+                        </td>
+                        <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
+                          {fmtDate(c.appeared_on_gainers_at)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         )}
       </div>
