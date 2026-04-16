@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 import structlog
@@ -19,6 +19,21 @@ def _parse_dt(s: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+async def prune_old_snapshots(db: "Database", retention_days: int = 7) -> int:
+    """Delete losers_snapshots older than retention_days. Returns rows deleted."""
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+    cursor = await db._conn.execute(
+        "DELETE FROM losers_snapshots WHERE snapshot_at < ?", (cutoff,)
+    )
+    await db._conn.commit()
+    deleted = cursor.rowcount
+    if deleted:
+        logger.info("losers_snapshots_pruned", deleted=deleted, retention_days=retention_days)
+    return deleted
 
 
 async def store_top_losers(
@@ -57,8 +72,8 @@ async def store_top_losers(
         await db._conn.execute(
             """INSERT INTO losers_snapshots
                (coin_id, symbol, name, price_change_24h, market_cap,
-                volume_24h, snapshot_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                volume_24h, price_at_snapshot, snapshot_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 coin["id"],
                 (coin.get("symbol") or "???").upper(),
@@ -66,6 +81,7 @@ async def store_top_losers(
                 coin.get("price_change_percentage_24h") or 0,
                 coin.get("market_cap"),
                 coin.get("total_volume"),
+                coin.get("current_price"),
                 now,
             ),
         )
@@ -159,14 +175,23 @@ async def compare_losers_with_signals(db: "Database") -> list[dict]:
             comp["is_gap"] = 0
 
         # Check signal_events table (chain signals)
-        cursor = await db._conn.execute(
-            """SELECT MIN(created_at) FROM signal_events
-               WHERE (token_id = ? OR LOWER(token_id) = LOWER(?)
-                      OR LOWER(token_id) LIKE LOWER(? || '%')
-                      OR LOWER(?) LIKE LOWER(token_id || '%'))
-                 AND created_at < ?""",
-            (coin_id, symbol, symbol, coin_id, first_loser_at_str),
-        )
+        # Only use LIKE for symbols >= 4 chars to avoid short-symbol false positives.
+        if len(symbol) >= 4:
+            cursor = await db._conn.execute(
+                """SELECT MIN(created_at) FROM signal_events
+                   WHERE (token_id = ? OR LOWER(token_id) = LOWER(?)
+                          OR LOWER(token_id) LIKE LOWER(? || '%')
+                          OR LOWER(?) LIKE LOWER(token_id || '%'))
+                     AND created_at < ?""",
+                (coin_id, symbol, symbol, coin_id, first_loser_at_str),
+            )
+        else:
+            cursor = await db._conn.execute(
+                """SELECT MIN(created_at) FROM signal_events
+                   WHERE (token_id = ? OR LOWER(token_id) = LOWER(?))
+                     AND created_at < ?""",
+                (coin_id, symbol, first_loser_at_str),
+            )
         sig_row = await cursor.fetchone()
         if sig_row and sig_row[0]:
             sig_at = _parse_dt(sig_row[0])

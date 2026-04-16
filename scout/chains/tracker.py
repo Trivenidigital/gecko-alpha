@@ -327,15 +327,15 @@ async def _load_active_chains(
             step_events={
                 int(k): v for k, v in json.loads(row["step_events"]).items()
             },
-            anchor_time=datetime.fromisoformat(row["anchor_time"]),
-            last_step_time=datetime.fromisoformat(row["last_step_time"]),
+            anchor_time=_parse_time(row["anchor_time"]),
+            last_step_time=_parse_time(row["last_step_time"]),
             is_complete=bool(row["is_complete"]),
             completed_at=(
-                datetime.fromisoformat(row["completed_at"])
+                _parse_time(row["completed_at"])
                 if row["completed_at"]
                 else None
             ),
-            created_at=datetime.fromisoformat(row["created_at"]),
+            created_at=_parse_time(row["created_at"]),
         )
         out[(chain.token_id, chain.pipeline, chain.pattern_id)] = chain
     return out

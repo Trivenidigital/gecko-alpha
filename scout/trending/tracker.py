@@ -204,15 +204,24 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
 
         # 2c. Check signal_events table (chain signals)
         # Match on coin_id (CoinGecko slug) exactly, or symbol via LIKE prefix
-        # to handle cases like token_id="bless" matching coin_id="bless-network"
-        cursor = await db._conn.execute(
-            """SELECT MIN(created_at) FROM signal_events
-               WHERE (token_id = ? OR LOWER(token_id) = LOWER(?)
-                      OR LOWER(token_id) LIKE LOWER(? || '%')
-                      OR LOWER(?) LIKE LOWER(token_id || '%'))
-                 AND created_at < ?""",
-            (coin_id, symbol, symbol, coin_id, first_trending_at_str),
-        )
+        # to handle cases like token_id="bless" matching coin_id="bless-network".
+        # Only use LIKE for symbols >= 4 chars to avoid short-symbol false positives.
+        if len(symbol) >= 4:
+            cursor = await db._conn.execute(
+                """SELECT MIN(created_at) FROM signal_events
+                   WHERE (token_id = ? OR LOWER(token_id) = LOWER(?)
+                          OR LOWER(token_id) LIKE LOWER(? || '%')
+                          OR LOWER(?) LIKE LOWER(token_id || '%'))
+                     AND created_at < ?""",
+                (coin_id, symbol, symbol, coin_id, first_trending_at_str),
+            )
+        else:
+            cursor = await db._conn.execute(
+                """SELECT MIN(created_at) FROM signal_events
+                   WHERE (token_id = ? OR LOWER(token_id) = LOWER(?))
+                     AND created_at < ?""",
+                (coin_id, symbol, first_trending_at_str),
+            )
         sig_row = await cursor.fetchone()
         if sig_row and sig_row[0]:
             sig_at = _parse_dt(sig_row[0])

@@ -46,29 +46,35 @@ async def fetch_laggards(
     headers: dict[str, str] = {}
     if api_key:
         headers["x-cg-demo-api-key"] = api_key
-    await coingecko_limiter.acquire()
-    try:
-        async with session.get(CG_MARKETS_URL, params=params, headers=headers) as resp:
-            if resp.status == 429:
-                log.warning(
-                    "fetch_laggards_rate_limited",
-                    category_id=category_id,
-                )
-                await coingecko_limiter.report_429()
-                return []
-            if resp.status != 200:
-                log.warning(
-                    "fetch_laggards_error",
-                    category_id=category_id,
-                    status=resp.status,
-                )
-                return []
-            data = await resp.json()
-            result = data if isinstance(data, list) else []
-            return result
-    except Exception:
-        log.exception("fetch_laggards_exception", category_id=category_id)
-        return []
+    for attempt in range(2):  # 1 retry on 429
+        await coingecko_limiter.acquire()
+        try:
+            async with session.get(CG_MARKETS_URL, params=params, headers=headers) as resp:
+                if resp.status == 429:
+                    log.warning(
+                        "fetch_laggards_rate_limited",
+                        category_id=category_id,
+                        attempt=attempt,
+                    )
+                    await coingecko_limiter.report_429()
+                    if attempt == 0:
+                        await asyncio.sleep(2)
+                        continue
+                    return []
+                if resp.status != 200:
+                    log.warning(
+                        "fetch_laggards_error",
+                        category_id=category_id,
+                        status=resp.status,
+                    )
+                    return []
+                data = await resp.json()
+                result = data if isinstance(data, list) else []
+                return result
+        except Exception:
+            log.exception("fetch_laggards_exception", category_id=category_id)
+            return []
+    return []  # pragma: no cover
 
 
 # ------------------------------------------------------------------
@@ -230,13 +236,13 @@ async def score_token(
         import anthropic
 
         if client is None:
-            client = anthropic.Anthropic(api_key=api_key)
+            client = anthropic.AsyncAnthropic(api_key=api_key)
 
         prompt = build_scoring_prompt(
             token, accel, market_regime, top_3_coins, lessons,
             watchlist_users=watchlist_users,
         )
-        response = client.messages.create(  # type: ignore[union-attr]
+        response = await client.messages.create(  # type: ignore[union-attr]
             model=model,
             max_tokens=300,
             temperature=0,
@@ -297,6 +303,8 @@ async def record_signal(
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
 
+    # Note: check-then-insert is not strictly atomic, but asyncio's single-threaded
+    # event loop prevents true concurrent execution, making TOCTOU a non-issue here.
     # Check for existing active signal
     cursor = await conn.execute(
         """SELECT id, trigger_count FROM narrative_signals

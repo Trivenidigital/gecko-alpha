@@ -106,6 +106,9 @@ class Database:
                 alerted_at        TEXT NOT NULL
             );
 
+            CREATE INDEX IF NOT EXISTS idx_alerts_alerted_at ON alerts(alerted_at);
+            CREATE INDEX IF NOT EXISTS idx_candidates_first_seen ON candidates(first_seen_at);
+
             CREATE TABLE IF NOT EXISTS mirofish_jobs (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
                 contract_address  TEXT NOT NULL,
@@ -156,6 +159,8 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_cat_snap_category
                 ON category_snapshots(category_id, snapshot_at);
+            CREATE INDEX IF NOT EXISTS idx_cat_snap_at
+                ON category_snapshots(snapshot_at);
 
             CREATE TABLE IF NOT EXISTS narrative_signals (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -483,6 +488,7 @@ class Database:
                 price_change_24h REAL NOT NULL,
                 market_cap REAL,
                 volume_24h REAL,
+                price_at_snapshot REAL,
                 snapshot_at TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -510,6 +516,10 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_losers_comp
                 ON losers_comparisons(coin_id);
 
+            -- Note: paper_trades.token_id references candidates.contract_address or
+            -- price_cache.coin_id logically, but FK constraints are intentionally
+            -- omitted because tokens may appear in trades before being fully
+            -- ingested into the candidates pipeline.
             CREATE TABLE IF NOT EXISTS paper_trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 token_id TEXT NOT NULL,
@@ -592,6 +602,14 @@ class Database:
         if "price_at_snapshot" not in gs_cols:
             await self._conn.execute(
                 "ALTER TABLE gainers_snapshots ADD COLUMN price_at_snapshot REAL"
+            )
+
+        # Migrate losers_snapshots: add price_at_snapshot if missing (L2)
+        cursor = await self._conn.execute("PRAGMA table_info(losers_snapshots)")
+        ls_cols = {row[1] for row in await cursor.fetchall()}
+        if "price_at_snapshot" not in ls_cols:
+            await self._conn.execute(
+                "ALTER TABLE losers_snapshots ADD COLUMN price_at_snapshot REAL"
             )
 
         await self._conn.commit()

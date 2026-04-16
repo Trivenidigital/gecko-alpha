@@ -113,7 +113,7 @@ async def detect_spikes(
     rows = await cursor.fetchall()
 
     spikes: list[VolumeSpike] = []
-    today = now.strftime("%Y-%m-%d")
+    today = now.strftime("%Y-%m-%d")  # UTC date -- avoids local timezone drift
 
     for row in rows:
         coin_id = row[0]
@@ -202,7 +202,9 @@ async def detect_7d_momentum(
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
 
-    now = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    today_utc = now_dt.strftime("%Y-%m-%d")  # UTC date -- avoids local timezone drift
     results: list[dict] = []
 
     for coin in raw_coins:
@@ -218,10 +220,10 @@ async def detect_7d_momentum(
         if volume < min_volume_24h:
             continue
 
-        # Dedup: skip if already detected today for this coin
+        # Dedup: skip if already detected today for this coin (UTC)
         cursor = await db._conn.execute(
-            "SELECT id FROM momentum_7d WHERE coin_id = ? AND date(detected_at) = date('now')",
-            (cid,),
+            "SELECT id FROM momentum_7d WHERE coin_id = ? AND date(detected_at) = ?",
+            (cid, today_utc),
         )
         if await cursor.fetchone():
             continue

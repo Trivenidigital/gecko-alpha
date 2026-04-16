@@ -27,6 +27,15 @@ class TradingEngine:
             signal_type="volume_spike",
             signal_data={"spike_ratio": 12.3},
         )
+
+    signal_data schema per signal_type:
+        volume_spike:         {"spike_ratio": float, "current_price": float}
+        narrative_prediction: {"fit": int, "category": str}
+        trending_catch:       {"source": str}
+        gainers_early:        {"price_change_24h": float}
+        losers_contrarian:    {"price_change_24h": float}
+        momentum_7d:          {"change_7d": float, "change_24h": float}
+        chain_completed:      {"pattern": str, "boost": int}
     """
 
     def __init__(self, mode: str, db: Database, settings) -> None:
@@ -76,6 +85,10 @@ class TradingEngine:
                     price_age_seconds=round(price_age_seconds, 1),
                 )
                 return None
+
+        # Note: TOCTOU gap between duplicate/exposure check and insert is mitigated
+        # by asyncio's single-threaded event loop — only one coroutine runs at a time.
+        # For true concurrency (multi-process), wrap in BEGIN IMMEDIATE.
 
         # 2. Check duplicate open position
         cursor = await conn.execute(
@@ -141,7 +154,10 @@ class TradingEngine:
 
         token_id = row[0]
         price_row = await self._get_current_price_with_age(token_id)
-        current_price = price_row[0] if price_row else 0.0
+        if price_row is None:
+            log.warning("close_trade_no_price", trade_id=trade_id, token_id=token_id)
+            return
+        current_price = price_row[0]
 
         await self._paper_trader.execute_sell(
             db=self.db,
@@ -171,7 +187,7 @@ class TradingEngine:
             """SELECT
                  COUNT(*) as total_trades,
                  SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins,
-                 SUM(CASE WHEN pnl_usd <= 0 THEN 1 ELSE 0 END) as losses,
+                 SUM(CASE WHEN pnl_usd < 0 THEN 1 ELSE 0 END) as losses,
                  COALESCE(SUM(pnl_usd), 0) as total_pnl_usd,
                  COALESCE(AVG(pnl_pct), 0) as avg_pnl_pct,
                  MAX(pnl_usd) as best_trade,
@@ -235,17 +251,24 @@ class TradingEngine:
             (token_id,),
         )
         row = await cursor.fetchone()
-        if row is None or row[0] is None:
-            # Fallback: try fuzzy match by prefix (handles ID mismatches like bless-2 vs bless-network)
-            cursor = await conn.execute(
-                "SELECT current_price, updated_at FROM price_cache WHERE coin_id LIKE ? LIMIT 1",
-                (token_id.split("-")[0] + "%",),
-            )
-            row = await cursor.fetchone()
-        if row is None or row[0] is None:
+        if row is not None and row[0] is not None:
+            price = float(row[0])
+            updated_at = datetime.fromisoformat(str(row[1])).replace(tzinfo=timezone.utc)
+            age_seconds = (datetime.now(timezone.utc) - updated_at).total_seconds()
+            return (price, age_seconds)
+
+        # Fallback: try fuzzy match by exact prefix (handles ID mismatches like bless-2 vs bless-network)
+        cursor = await conn.execute(
+            "SELECT coin_id, current_price, updated_at FROM price_cache WHERE coin_id LIKE ? LIMIT 1",
+            (token_id + "%",),
+        )
+        row = await cursor.fetchone()
+        if row is None or row[1] is None:
             return None
 
-        price = float(row[0])
-        updated_at = datetime.fromisoformat(str(row[1])).replace(tzinfo=timezone.utc)
+        matched_id = row[0]
+        log.warning("price_fuzzy_match", requested=token_id, matched=matched_id)
+        price = float(row[1])
+        updated_at = datetime.fromisoformat(str(row[2])).replace(tzinfo=timezone.utc)
         age_seconds = (datetime.now(timezone.utc) - updated_at).total_seconds()
         return (price, age_seconds)

@@ -1,5 +1,9 @@
 """CoinPump Scout -- main pipeline entry point."""
 
+# TODO: Extract narrative_agent_loop (~650 lines) to scout/narrative/agent.py
+# TODO: Extract trading signal dispatch (~100 lines) to scout/trading/signals.py
+# This would reduce main.py to ~400 lines of pure orchestration.
+
 import argparse
 import asyncio
 import json
@@ -90,7 +94,11 @@ _heartbeat_stats: dict = {
 
 
 def _reset_heartbeat_stats() -> None:
-    """Reset module-level heartbeat state (test helper)."""
+    """Reset module-level heartbeat state (test helper).
+
+    Note: _heartbeat_stats is a module-level global. Tests MUST call this
+    function (or the pipeline's own reset path) to avoid cross-test pollution.
+    """
     _heartbeat_stats.update(
         started_at=None,
         tokens_scanned=0,
@@ -135,6 +143,8 @@ def _maybe_emit_heartbeat(settings) -> bool:
 
 async def _safe_counter_followup(token, session, settings, db=None):
     """Run counter-score and send follow-up Telegram message. Never raises."""
+    if session.closed:
+        return
     try:
         buy_pressure = 0.5
         if getattr(token, "txns_h1_buys", None) and getattr(
@@ -319,21 +329,24 @@ async def run_cycle(
             cursor = await db._conn.execute(
                 """SELECT DISTINCT coin_id, symbol, name, price_change_24h, price_at_snapshot
                    FROM gainers_snapshots
-                   WHERE snapshot_at >= datetime('now', '-2 minutes')
+                   WHERE snapshot_at >= datetime('now', '-5 minutes')
                    AND coin_id NOT IN (
                        SELECT token_id FROM paper_trades WHERE signal_type = 'gainers_early' AND status = 'open'
                    )"""
             )
             new_gainers = await cursor.fetchall()
             for g in new_gainers:
-                await trading_engine.open_trade(
-                    token_id=g["coin_id"], symbol=g["symbol"], name=g["name"],
-                    chain="coingecko", signal_type="gainers_early",
-                    signal_data={"price_change_24h": g["price_change_24h"]},
-                    entry_price=g["price_at_snapshot"],
-                )
+                try:
+                    await trading_engine.open_trade(
+                        token_id=g["coin_id"], symbol=g["symbol"], name=g["name"],
+                        chain="coingecko", signal_type="gainers_early",
+                        signal_data={"price_change_24h": g["price_change_24h"]},
+                        entry_price=g["price_at_snapshot"],
+                    )
+                except Exception:
+                    logger.exception("trading_gainers_error", coin_id=g["coin_id"])
         except Exception:
-            logger.exception("trading_gainers_error")
+            logger.exception("trading_gainers_query_error")
 
     # Top Losers Tracker (zero extra API calls -- uses cached data)
     if settings.LOSERS_TRACKER_ENABLED and _raw_markets_combined:
@@ -350,29 +363,35 @@ async def run_cycle(
     if trading_engine and settings.LOSERS_TRACKER_ENABLED:
         try:
             cursor = await db._conn.execute(
-                """SELECT DISTINCT coin_id, symbol, name, price_change_24h FROM losers_snapshots
-                   WHERE snapshot_at >= datetime('now', '-2 minutes')
+                """SELECT DISTINCT coin_id, symbol, name, price_change_24h, price_at_snapshot
+                   FROM losers_snapshots
+                   WHERE snapshot_at >= datetime('now', '-5 minutes')
                    AND coin_id NOT IN (
                        SELECT token_id FROM paper_trades WHERE signal_type = 'losers_contrarian' AND status = 'open'
                    )"""
             )
             new_losers = await cursor.fetchall()
             for l in new_losers:
-                # Look up price from price_cache (updated in same cycle)
-                pc = await db._conn.execute(
-                    "SELECT current_price FROM price_cache WHERE coin_id = ?",
-                    (l["coin_id"],),
-                )
-                price_row = await pc.fetchone()
-                loser_price = price_row[0] if price_row else None
-                await trading_engine.open_trade(
-                    token_id=l["coin_id"], symbol=l["symbol"], name=l["name"],
-                    chain="coingecko", signal_type="losers_contrarian",
-                    signal_data={"price_change_24h": l["price_change_24h"]},
-                    entry_price=loser_price,
-                )
+                try:
+                    # Use snapshot price if available, else fall back to price_cache
+                    loser_price = l["price_at_snapshot"]
+                    if not loser_price:
+                        pc = await db._conn.execute(
+                            "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                            (l["coin_id"],),
+                        )
+                        price_row = await pc.fetchone()
+                        loser_price = price_row[0] if price_row else None
+                    await trading_engine.open_trade(
+                        token_id=l["coin_id"], symbol=l["symbol"], name=l["name"],
+                        chain="coingecko", signal_type="losers_contrarian",
+                        signal_data={"price_change_24h": l["price_change_24h"]},
+                        entry_price=loser_price,
+                    )
+                except Exception:
+                    logger.exception("trading_losers_error", coin_id=l["coin_id"])
         except Exception:
-            logger.exception("trading_losers_error")
+            logger.exception("trading_losers_query_error")
 
     # 7-Day Momentum Scanner (zero extra API calls -- filters existing data)
     if settings.MOMENTUM_7D_ENABLED and _raw_markets_combined:
@@ -588,7 +607,8 @@ async def check_outcomes(
 
         try:
             url = f"https://api.dexscreener.com/tokens/v1/{chain}/{contract}"
-            async with session.get(url) as resp:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with session.get(url, timeout=timeout) as resp:
                 if resp.status != 200:
                     continue
                 pairs = await resp.json()
@@ -676,11 +696,12 @@ async def narrative_agent_loop(
             await store_snapshot(db, snapshots)
 
             # Trending snapshot (gated by TRENDING_SNAPSHOT_ENABLED)
-            # Reuse cg_trending data already fetched in Stage 1 ingestion
-            # to avoid a duplicate /search/trending API call.
+            # narrative_agent_loop does NOT have access to cg_trending
+            # (which is local to run_cycle).  Use fetch_and_store_trending
+            # which fetches fresh data from /search/trending.
             if settings.TRENDING_SNAPSHOT_ENABLED:
                 try:
-                    await store_trending_from_candidates(db, cg_trending)
+                    await fetch_and_store_trending(session, db, settings.COINGECKO_API_KEY)
                 except Exception:
                     logger.exception("trending_tracker.snapshot_error")
 
@@ -689,7 +710,7 @@ async def narrative_agent_loop(
                 try:
                     cursor = await db._conn.execute(
                         """SELECT DISTINCT coin_id, symbol, name FROM trending_snapshots
-                           WHERE snapshot_at >= datetime('now', '-2 minutes')
+                           WHERE snapshot_at >= datetime('now', '-5 minutes')
                            AND coin_id NOT IN (
                                SELECT token_id FROM paper_trades WHERE signal_type = 'trending_catch' AND status = 'open'
                            )"""
@@ -1184,7 +1205,7 @@ async def narrative_agent_loop(
                         cursor = await db._conn.execute(
                             """SELECT DISTINCT token_id, pattern_id, pattern_name, conviction_boost, pipeline
                                FROM chain_matches
-                               WHERE completed_at >= datetime('now', '-2 minutes')
+                               WHERE completed_at >= datetime('now', '-5 minutes')
                                AND token_id NOT IN (
                                    SELECT token_id FROM paper_trades WHERE signal_type = 'chain_completed' AND status = 'open'
                                )"""
@@ -1224,6 +1245,14 @@ async def narrative_agent_loop(
                     await prune_old_snapshots(
                         db, settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS
                     )
+                    # Prune gainers/losers snapshots (M9 -- unbounded growth)
+                    try:
+                        from scout.gainers.tracker import prune_old_snapshots as prune_gainers
+                        from scout.losers.tracker import prune_old_snapshots as prune_losers
+                        await prune_gainers(db, retention_days=settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS)
+                        await prune_losers(db, retention_days=settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS)
+                    except Exception:
+                        logger.exception("tracker_prune_error")
                     last_daily_learn_at = now
                     await strategy.set_timestamp("last_daily_learn_at", now)
                     logger.info("narrative.daily_learn_complete")
@@ -1270,8 +1299,6 @@ async def narrative_agent_loop(
                     logger.exception("narrative.weekly_learn_error")
 
         except Exception:
-            import traceback
-            traceback.print_exc()
             logger.exception("narrative.loop_error")
 
         await asyncio.sleep(settings.NARRATIVE_POLL_INTERVAL)
@@ -1464,6 +1491,9 @@ async def main() -> None:
                     asyncio.create_task(run_chain_tracker(db, settings))
                 )
 
+            # Both loops share the same session and rate limiter intentionally.
+            # The coingecko_limiter (25 req/min) coordinates access; that IS
+            # the back-pressure mechanism.
             await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         await db.close()

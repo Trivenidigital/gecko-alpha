@@ -19,7 +19,21 @@ from dashboard.models import (
 )
 
 # Default DB path — can be overridden via create_app()
+# Note: _db_path is closure-captured via create_app() and safe for single-process use (L5).
 _db_path: str = "scout.db"
+
+# Cached ScoutDatabase instance — avoids re-creating + re-migrating on every request.
+_scout_db = None
+
+
+async def _get_scout_db(db_path: str):
+    """Return a cached, initialized ScoutDatabase instance."""
+    global _scout_db
+    if _scout_db is None:
+        from scout.db import Database as ScoutDatabase
+        _scout_db = ScoutDatabase(db_path)
+        await _scout_db.initialize()
+    return _scout_db
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -188,29 +202,19 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/api/secondwave/candidates")
     async def secondwave_candidates(days: int = 7, limit: int = 50):
-        from scout.db import Database as ScoutDatabase
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
-        try:
-            rows = await sdb.get_recent_secondwave_candidates(days=days)
-            return rows[:limit]
-        finally:
-            await sdb.close()
+        sdb = await _get_scout_db(_db_path)
+        rows = await sdb.get_recent_secondwave_candidates(days=days)
+        return rows[:limit]
 
     @app.get("/api/secondwave/stats")
     async def secondwave_stats(days: int = 7):
-        from scout.db import Database as ScoutDatabase
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
-        try:
-            rows = await sdb.get_recent_secondwave_candidates(days=days)
-            count = len(rows)
-            avg_score = (
-                sum(r["reaccumulation_score"] for r in rows) / count if count else 0.0
-            )
-            return {"count": count, "avg_score": round(avg_score, 1), "days": days}
-        finally:
-            await sdb.close()
+        sdb = await _get_scout_db(_db_path)
+        rows = await sdb.get_recent_secondwave_candidates(days=days)
+        count = len(rows)
+        avg_score = (
+            sum(r["reaccumulation_score"] for r in rows) / count if count else 0.0
+        )
+        return {"count": count, "avg_score": round(avg_score, 1), "days": days}
 
     # --- Chains endpoints ---
 
@@ -242,37 +246,22 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/api/trending/snapshots")
     async def trending_snapshots(hours: int = Query(24, ge=1, le=168), limit: int = Query(100, ge=1, le=500)):
-        from scout.db import Database as ScoutDatabase
         from scout.trending.tracker import get_recent_snapshots
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
-        try:
-            return await get_recent_snapshots(sdb, hours=hours, limit=limit)
-        finally:
-            await sdb.close()
+        sdb = await _get_scout_db(_db_path)
+        return await get_recent_snapshots(sdb, hours=hours, limit=limit)
 
     @app.get("/api/trending/stats")
     async def trending_stats():
-        from scout.db import Database as ScoutDatabase
         from scout.trending.tracker import get_trending_stats
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
-        try:
-            stats = await get_trending_stats(sdb)
-            return stats.model_dump()
-        finally:
-            await sdb.close()
+        sdb = await _get_scout_db(_db_path)
+        stats = await get_trending_stats(sdb)
+        return stats.model_dump()
 
     @app.get("/api/trending/comparisons")
     async def trending_comparisons(limit: int = Query(100, ge=1, le=500)):
-        from scout.db import Database as ScoutDatabase
         from scout.trending.tracker import get_recent_comparisons
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
-        try:
-            return await get_recent_comparisons(sdb, limit=limit)
-        finally:
-            await sdb.close()
+        sdb = await _get_scout_db(_db_path)
+        return await get_recent_comparisons(sdb, limit=limit)
 
     @app.get("/api/trending/comparisons-enriched")
     async def trending_comparisons_enriched(limit: int = Query(30, ge=1, le=500)):
@@ -281,63 +270,58 @@ def create_app(db_path: str | None = None) -> FastAPI:
         Reads from the price_cache table (populated during pipeline ingestion)
         instead of calling CoinGecko directly, avoiding 429 rate-limit errors.
         """
-        from scout.db import Database as ScoutDatabase
         from scout.trending.tracker import get_recent_comparisons
 
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
-        try:
-            comparisons = await get_recent_comparisons(sdb, limit=limit)
-            if not comparisons:
-                return comparisons
+        sdb = await _get_scout_db(_db_path)
+        comparisons = await get_recent_comparisons(sdb, limit=limit)
+        if not comparisons:
+            return comparisons
 
-            # Collect CoinGecko coin IDs
-            coin_ids = [c["coin_id"] for c in comparisons if c.get("coin_id")]
-            if not coin_ids:
-                return comparisons
+        # Collect CoinGecko coin IDs
+        coin_ids = [c["coin_id"] for c in comparisons if c.get("coin_id")]
+        if not coin_ids:
+            return comparisons
 
-            # Read from price_cache table (populated by pipeline)
-            prices_map = await sdb.get_cached_prices(coin_ids)
+        # Read from price_cache table (populated by pipeline)
+        prices_map = await sdb.get_cached_prices(coin_ids)
 
-            # Also build a symbol-based lookup for ID mismatches (e.g. bless-network vs bless-2)
-            symbols = [c.get("symbol", "").lower() for c in comparisons if c.get("symbol")]
-            if symbols:
-                try:
-                    cursor = await sdb._conn.execute(
-                        "SELECT coin_id, current_price, price_change_24h, price_change_7d, market_cap FROM price_cache"
-                    )
-                    all_prices = await cursor.fetchall()
-                    symbol_map = {}
-                    for row in all_prices:
-                        symbol_map[row["coin_id"]] = {
-                            "usd": row["current_price"],
-                            "change_24h": row["price_change_24h"],
-                            "change_7d": row["price_change_7d"],
-                            "market_cap": row["market_cap"],
-                        }
-                except Exception:
-                    symbol_map = {}
+        # Also build a symbol-based lookup for ID mismatches (e.g. bless-network vs bless-2)
+        symbols = [c.get("symbol", "").lower() for c in comparisons if c.get("symbol")]
+        if symbols:
+            try:
+                cursor = await sdb._conn.execute(
+                    "SELECT coin_id, current_price, price_change_24h, price_change_7d, market_cap FROM price_cache"
+                )
+                all_prices = await cursor.fetchall()
+                symbol_map = {}
+                for row in all_prices:
+                    symbol_map[row["coin_id"]] = {
+                        "usd": row["current_price"],
+                        "change_24h": row["price_change_24h"],
+                        "change_7d": row["price_change_7d"],
+                        "market_cap": row["market_cap"],
+                    }
+            except Exception:
+                symbol_map = {}
 
-            # Look up earliest detection price for each coin from predictions/candidates
-            detection_prices: dict = {}
-            for c in comparisons:
-                cid = c.get("coin_id", "")
-                sym = (c.get("symbol") or "").upper()
-                # Try predictions table first (has entry_price or market_cap_at_prediction)
-                try:
-                    cursor = await sdb._conn.execute(
-                        """SELECT market_cap_at_prediction FROM predictions
-                           WHERE (coin_id = ? OR UPPER(symbol) = ?)
-                           ORDER BY predicted_at ASC LIMIT 1""",
-                        (cid, sym),
-                    )
-                    prow = await cursor.fetchone()
-                    if prow and prow[0]:
-                        detection_prices[cid] = {"mcap": prow[0]}
-                except Exception:
-                    pass
-        finally:
-            await sdb.close()
+        # Look up earliest detection price for each coin from predictions/candidates
+        detection_prices: dict = {}
+        for c in comparisons:
+            cid = c.get("coin_id", "")
+            sym = (c.get("symbol") or "").upper()
+            # Try predictions table first (has entry_price or market_cap_at_prediction)
+            try:
+                cursor = await sdb._conn.execute(
+                    """SELECT market_cap_at_prediction FROM predictions
+                       WHERE (coin_id = ? OR UPPER(symbol) = ?)
+                       ORDER BY predicted_at ASC LIMIT 1""",
+                    (cid, sym),
+                )
+                prow = await cursor.fetchone()
+                if prow and prow[0]:
+                    detection_prices[cid] = {"mcap": prow[0]}
+            except Exception:
+                pass
 
         for c in comparisons:
             cid = c.get("coin_id", "")
@@ -377,123 +361,93 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/spikes/recent")
     async def spikes_recent(limit: int = Query(20, ge=1, le=200)):
         """Recent volume spikes."""
-        from scout.db import Database as ScoutDatabase
         from scout.spikes.detector import get_recent_spikes
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
-        try:
-            return await get_recent_spikes(sdb, limit=limit)
-        finally:
-            await sdb.close()
+        sdb = await _get_scout_db(_db_path)
+        return await get_recent_spikes(sdb, limit=limit)
 
     @app.get("/api/spikes/stats")
     async def spikes_stats():
         """Spike detection stats."""
-        from scout.db import Database as ScoutDatabase
         from scout.spikes.detector import get_spike_stats
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
-        try:
-            return await get_spike_stats(sdb)
-        finally:
-            await sdb.close()
+        sdb = await _get_scout_db(_db_path)
+        return await get_spike_stats(sdb)
 
     # --- 7-Day Momentum Scanner endpoints ---
 
     @app.get("/api/momentum/7d")
     async def momentum_7d_recent(limit: int = Query(20, ge=1, le=200)):
         """Tokens with extreme 7d returns detected by the momentum scanner."""
-        from scout.db import Database as ScoutDatabase
         from scout.spikes.detector import get_recent_momentum_7d
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
-        try:
-            return await get_recent_momentum_7d(sdb, limit=limit)
-        finally:
-            await sdb.close()
+        sdb = await _get_scout_db(_db_path)
+        return await get_recent_momentum_7d(sdb, limit=limit)
 
     @app.get("/api/momentum/7d/stats")
     async def momentum_7d_stats():
         """7d momentum scanner stats."""
-        from scout.db import Database as ScoutDatabase
         from scout.spikes.detector import get_momentum_7d_stats
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
-        try:
-            return await get_momentum_7d_stats(sdb)
-        finally:
-            await sdb.close()
+        sdb = await _get_scout_db(_db_path)
+        return await get_momentum_7d_stats(sdb)
 
     # --- Top Gainers Tracker endpoints ---
 
     @app.get("/api/gainers/snapshots")
     async def gainers_snapshots(limit: int = Query(20, ge=1, le=200)):
         """Recent top gainers snapshots."""
-        from scout.db import Database as ScoutDatabase
         from scout.gainers.tracker import get_recent_gainers
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
-        try:
-            return await get_recent_gainers(sdb, limit=limit)
-        finally:
-            await sdb.close()
+        sdb = await _get_scout_db(_db_path)
+        return await get_recent_gainers(sdb, limit=limit)
 
     @app.get("/api/gainers/comparisons")
     async def gainers_comparisons(limit: int = Query(50, ge=1, le=500)):
         """Gainers comparisons enriched with price_cache data."""
-        from scout.db import Database as ScoutDatabase
         from scout.gainers.tracker import get_gainers_comparisons
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
+        sdb = await _get_scout_db(_db_path)
+        comparisons = await get_gainers_comparisons(sdb, limit=limit)
+        if not comparisons:
+            return comparisons
+
+        # Collect coin IDs for price_cache lookup
+        coin_ids = [c["coin_id"] for c in comparisons if c.get("coin_id")]
+        prices_map = await sdb.get_cached_prices(coin_ids) if coin_ids else {}
+
+        # Build symbol fallback map
+        symbol_map: dict = {}
         try:
-            comparisons = await get_gainers_comparisons(sdb, limit=limit)
-            if not comparisons:
-                return comparisons
+            cursor = await sdb._conn.execute(
+                "SELECT coin_id, current_price, price_change_24h, price_change_7d, market_cap FROM price_cache"
+            )
+            all_prices = await cursor.fetchall()
+            for row in all_prices:
+                symbol_map[row["coin_id"]] = {
+                    "usd": row["current_price"],
+                    "change_24h": row["price_change_24h"],
+                    "change_7d": row["price_change_7d"],
+                    "market_cap": row["market_cap"],
+                }
+        except Exception:
+            pass
 
-            # Collect coin IDs for price_cache lookup
-            coin_ids = [c["coin_id"] for c in comparisons if c.get("coin_id")]
-            prices_map = await sdb.get_cached_prices(coin_ids) if coin_ids else {}
-
-            # Build symbol fallback map
-            symbol_map: dict = {}
+        # Look up price_at_snapshot from gainers_snapshots for each coin
+        price_at_snap: dict = {}
+        for c in comparisons:
+            cid = c.get("coin_id", "")
             try:
                 cursor = await sdb._conn.execute(
-                    "SELECT coin_id, current_price, price_change_24h, price_change_7d, market_cap FROM price_cache"
+                    """SELECT price_at_snapshot, price_change_24h
+                       FROM gainers_snapshots
+                       WHERE coin_id = ?
+                       ORDER BY snapshot_at ASC LIMIT 1""",
+                    (cid,),
                 )
-                all_prices = await cursor.fetchall()
-                for row in all_prices:
-                    symbol_map[row["coin_id"]] = {
-                        "usd": row["current_price"],
-                        "change_24h": row["price_change_24h"],
-                        "change_7d": row["price_change_7d"],
-                        "market_cap": row["market_cap"],
-                    }
+                row = await cursor.fetchone()
+                if row and row["price_at_snapshot"]:
+                    price_at_snap[cid] = row["price_at_snapshot"]
+                elif row:
+                    # Estimate: no price_at_snapshot stored yet, back-calculate
+                    # from current price and the 24h change at time of snapshot
+                    pass
             except Exception:
                 pass
-
-            # Look up price_at_snapshot from gainers_snapshots for each coin
-            price_at_snap: dict = {}
-            for c in comparisons:
-                cid = c.get("coin_id", "")
-                try:
-                    cursor = await sdb._conn.execute(
-                        """SELECT price_at_snapshot, price_change_24h
-                           FROM gainers_snapshots
-                           WHERE coin_id = ?
-                           ORDER BY snapshot_at ASC LIMIT 1""",
-                        (cid,),
-                    )
-                    row = await cursor.fetchone()
-                    if row and row["price_at_snapshot"]:
-                        price_at_snap[cid] = row["price_at_snapshot"]
-                    elif row:
-                        # Estimate: no price_at_snapshot stored yet, back-calculate
-                        # from current price and the 24h change at time of snapshot
-                        pass
-                except Exception:
-                    pass
-        finally:
-            await sdb.close()
 
         for c in comparisons:
             cid = c.get("coin_id", "")
@@ -531,40 +485,25 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/gainers/stats")
     async def gainers_stats():
         """Gainers tracker hit rate stats."""
-        from scout.db import Database as ScoutDatabase
         from scout.gainers.tracker import get_gainers_stats
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
-        try:
-            return await get_gainers_stats(sdb)
-        finally:
-            await sdb.close()
+        sdb = await _get_scout_db(_db_path)
+        return await get_gainers_stats(sdb)
 
     # --- Losers Tracker ---
 
     @app.get("/api/losers/comparisons")
     async def losers_comparisons(limit: int = Query(50, ge=1, le=500)):
         """Losers comparisons with signal detection."""
-        from scout.db import Database as ScoutDatabase
         from scout.losers.tracker import get_losers_comparisons
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
-        try:
-            return await get_losers_comparisons(sdb, limit=limit)
-        finally:
-            await sdb.close()
+        sdb = await _get_scout_db(_db_path)
+        return await get_losers_comparisons(sdb, limit=limit)
 
     @app.get("/api/losers/stats")
     async def losers_stats():
         """Losers tracker hit rate stats."""
-        from scout.db import Database as ScoutDatabase
         from scout.losers.tracker import get_losers_stats
-        sdb = ScoutDatabase(_db_path)
-        await sdb.initialize()
-        try:
-            return await get_losers_stats(sdb)
-        finally:
-            await sdb.close()
+        sdb = await _get_scout_db(_db_path)
+        return await get_losers_stats(sdb)
 
     # --- System health endpoint ---
 

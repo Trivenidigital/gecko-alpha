@@ -50,11 +50,19 @@ async def seeded_db(tmp_path):
 
 @pytest.fixture
 async def client(seeded_db):
-    from dashboard.api import create_app
-    app = create_app(db_path=seeded_db)
+    import dashboard.api as api_mod
+    # Reset cached ScoutDatabase so each test gets a fresh instance
+    if api_mod._scout_db is not None:
+        await api_mod._scout_db.close()
+        api_mod._scout_db = None
+    app = api_mod.create_app(db_path=seeded_db)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+    # Clean up after test
+    if api_mod._scout_db is not None:
+        await api_mod._scout_db.close()
+        api_mod._scout_db = None
 
 
 @pytest.mark.asyncio

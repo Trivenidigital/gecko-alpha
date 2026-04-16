@@ -40,7 +40,14 @@ class PaperTrader:
             raise RuntimeError("Database not initialized.")
 
         effective_entry = current_price * (1 + slippage_bps / 10000)
+        if effective_entry <= 0:
+            log.warning("paper_trade_zero_price", token_id=token_id, current_price=current_price)
+            return -1  # type: ignore[return-value]
         quantity = amount_usd / effective_entry
+        # Sanity check: quantity must be positive and finite
+        if quantity <= 0 or not (quantity == quantity):  # NaN check
+            log.warning("paper_trade_invalid_quantity", token_id=token_id, quantity=quantity)
+            return -1  # type: ignore[return-value]
         tp_price = effective_entry * (1 + tp_pct / 100)
         sl_price = effective_entry * (1 - sl_pct / 100)
         now = datetime.now(timezone.utc).isoformat()
@@ -106,8 +113,13 @@ class PaperTrader:
         quantity = float(row[2])
 
         effective_exit = current_price * (1 - slippage_bps / 10000)
-        pnl_pct = ((effective_exit - entry_price) / entry_price) * 100
-        pnl_usd = quantity * (effective_exit - entry_price)
+        if entry_price <= 0:
+            log.warning("paper_trade_zero_entry_price", trade_id=trade_id)
+            pnl_pct = 0.0
+            pnl_usd = 0.0
+        else:
+            pnl_pct = ((effective_exit - entry_price) / entry_price) * 100
+            pnl_usd = quantity * (effective_exit - entry_price)
         now = datetime.now(timezone.utc).isoformat()
 
         # Map reason to status
@@ -119,13 +131,16 @@ class PaperTrader:
         }
         status = status_map.get(reason, "closed_manual")
 
-        await conn.execute(
+        cursor_upd = await conn.execute(
             """UPDATE paper_trades
                SET status = ?, exit_price = ?, exit_reason = ?,
                    pnl_usd = ?, pnl_pct = ?, closed_at = ?
-               WHERE id = ?""",
+               WHERE id = ? AND status = 'open'""",
             (status, effective_exit, reason, pnl_usd, round(pnl_pct, 4), now, trade_id),
         )
+        if cursor_upd.rowcount == 0:
+            log.warning("trade_already_closed", trade_id=trade_id)
+            return
         await conn.commit()
 
         log.info(
