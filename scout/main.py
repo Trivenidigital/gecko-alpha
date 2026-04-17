@@ -42,6 +42,9 @@ from scout.gainers.tracker import store_top_gainers
 from scout.losers.tracker import store_top_losers
 from scout.trading.signals import (
     trade_first_signals,
+    trade_gainers,
+    trade_losers,
+    trade_trending,
     trade_volume_spikes,
 )
 from scout.briefing.collector import collect_briefing_data
@@ -296,10 +299,12 @@ async def run_cycle(
                 min_change=settings.GAINERS_MIN_CHANGE,
                 max_mcap=settings.GAINERS_MAX_MCAP,
             )
+            if trading_engine:
+                await trade_gainers(trading_engine, db, min_mcap=settings.PAPER_MIN_MCAP)
         except Exception:
             logger.exception("gainers_tracker_error")
 
-    # Top Losers Tracker -- validation-only (no paper trades, data collection for comparison)
+    # Top Losers Tracker (contrarian dip-catch paper trades)
     if settings.LOSERS_TRACKER_ENABLED and _raw_markets_combined:
         try:
             await store_top_losers(
@@ -307,6 +312,8 @@ async def run_cycle(
                 max_drop=settings.LOSERS_MIN_DROP,
                 max_mcap=settings.LOSERS_MAX_MCAP,
             )
+            if trading_engine:
+                await trade_losers(trading_engine, db, min_mcap=settings.PAPER_MIN_MCAP)
         except Exception:
             logger.exception("losers_tracker_error")
 

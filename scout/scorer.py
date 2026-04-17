@@ -52,8 +52,15 @@ def score(
     points = 0
     signals: list[str] = []
 
-    # Hard disqualifier: liquidity floor (exempt CG trending tokens)
-    if token.liquidity_usd < settings.MIN_LIQUIDITY_USD and token.cg_trending_rank is None:
+    # Hard disqualifier: liquidity floor.
+    # Exempt CoinGecko-listed tokens — they have no on-chain pool
+    # liquidity data (liquidity_usd=0) but are listed on major exchanges
+    # with real order-book liquidity. The liquidity floor is meant for
+    # DEX memecoins where a thin pool means un-tradable.
+    if (
+        token.liquidity_usd < settings.MIN_LIQUIDITY_USD
+        and token.chain != "coingecko"
+    ):
         return (0, ["DISQUALIFIED_LOW_LIQUIDITY"])
 
     # Signal 1: Volume/Liquidity Ratio -- 30 points

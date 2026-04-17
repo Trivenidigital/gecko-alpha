@@ -34,11 +34,15 @@ async def trade_volume_spikes(engine, db: Database, spikes: list[dict]) -> None:
             )
 
 
-async def trade_gainers(engine, db: Database) -> None:
-    """Open paper trades for newly detected top gainers."""
+async def trade_gainers(engine, db: Database, min_mcap: float = 5_000_000) -> None:
+    """Open paper trades for newly detected top gainers.
+
+    Filter: market_cap >= min_mcap to skip micro-cap junk.
+    """
     try:
         cursor = await db._conn.execute(
-            """SELECT DISTINCT coin_id, symbol, name, price_change_24h, price_at_snapshot
+            """SELECT DISTINCT coin_id, symbol, name, price_change_24h,
+                               price_at_snapshot, market_cap
                FROM gainers_snapshots
                WHERE snapshot_at >= datetime('now', '-5 minutes')
                AND coin_id NOT IN (
@@ -47,6 +51,8 @@ async def trade_gainers(engine, db: Database) -> None:
         )
         new_gainers = await cursor.fetchall()
         for g in new_gainers:
+            if (g["market_cap"] or 0) < min_mcap:
+                continue
             try:
                 await engine.open_trade(
                     token_id=g["coin_id"],
@@ -54,7 +60,10 @@ async def trade_gainers(engine, db: Database) -> None:
                     name=g["name"],
                     chain="coingecko",
                     signal_type="gainers_early",
-                    signal_data={"price_change_24h": g["price_change_24h"]},
+                    signal_data={
+                        "price_change_24h": g["price_change_24h"],
+                        "mcap": g["market_cap"],
+                    },
                     entry_price=g["price_at_snapshot"],
                 )
             except Exception:
@@ -63,11 +72,15 @@ async def trade_gainers(engine, db: Database) -> None:
         logger.exception("trading_gainers_query_error")
 
 
-async def trade_losers(engine, db: Database) -> None:
-    """Open paper trades for newly detected top losers (contrarian play)."""
+async def trade_losers(engine, db: Database, min_mcap: float = 5_000_000) -> None:
+    """Open paper trades for newly detected top losers (contrarian play).
+
+    Filter: market_cap >= min_mcap to skip micro-cap junk.
+    """
     try:
         cursor = await db._conn.execute(
-            """SELECT DISTINCT coin_id, symbol, name, price_change_24h, price_at_snapshot
+            """SELECT DISTINCT coin_id, symbol, name, price_change_24h,
+                               price_at_snapshot, market_cap
                FROM losers_snapshots
                WHERE snapshot_at >= datetime('now', '-5 minutes')
                AND coin_id NOT IN (
@@ -76,6 +89,8 @@ async def trade_losers(engine, db: Database) -> None:
         )
         new_losers = await cursor.fetchall()
         for l in new_losers:
+            if (l["market_cap"] or 0) < min_mcap:
+                continue
             try:
                 loser_price = l["price_at_snapshot"]
                 if not loser_price:
@@ -91,7 +106,10 @@ async def trade_losers(engine, db: Database) -> None:
                     name=l["name"],
                     chain="coingecko",
                     signal_type="losers_contrarian",
-                    signal_data={"price_change_24h": l["price_change_24h"]},
+                    signal_data={
+                        "price_change_24h": l["price_change_24h"],
+                        "mcap": l["market_cap"],
+                    },
                     entry_price=loser_price,
                 )
             except Exception:
@@ -145,11 +163,18 @@ async def trade_first_signals(
             logger.exception("trading_first_signal_error", token=token.ticker)
 
 
-async def trade_trending(engine, db: Database) -> None:
-    """Open paper trades for newly trending tokens."""
+async def trade_trending(engine, db: Database, max_mcap_rank: int = 1500) -> None:
+    """Open paper trades for newly trending tokens.
+
+    Filter: market_cap_rank <= max_mcap_rank. CoinGecko rank is a rough
+    liquidity proxy — rank 1500 corresponds to roughly the last legitimately
+    tradable tokens; anything below tends to be illiquid micro-caps.
+    Tokens without a rank (rank IS NULL) are skipped.
+    """
     try:
         cursor = await db._conn.execute(
-            """SELECT DISTINCT coin_id, symbol, name FROM trending_snapshots
+            """SELECT DISTINCT coin_id, symbol, name, market_cap_rank
+               FROM trending_snapshots
                WHERE snapshot_at >= datetime('now', '-5 minutes')
                AND coin_id NOT IN (
                    SELECT token_id FROM paper_trades WHERE signal_type = 'trending_catch' AND status = 'open'
@@ -157,6 +182,9 @@ async def trade_trending(engine, db: Database) -> None:
         )
         new_trending = await cursor.fetchall()
         for t in new_trending:
+            rank = t["market_cap_rank"]
+            if rank is None or rank > max_mcap_rank:
+                continue
             try:
                 pc = await db._conn.execute(
                     "SELECT current_price FROM price_cache WHERE coin_id = ?",
@@ -170,7 +198,10 @@ async def trade_trending(engine, db: Database) -> None:
                     name=t["name"],
                     chain="coingecko",
                     signal_type="trending_catch",
-                    signal_data={"source": "trending_snapshot"},
+                    signal_data={
+                        "source": "trending_snapshot",
+                        "mcap_rank": rank,
+                    },
                     entry_price=trending_price,
                 )
             except Exception:

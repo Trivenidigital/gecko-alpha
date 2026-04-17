@@ -1,6 +1,12 @@
 # scout/narrative/prompts.py
 """Static base prompts for narrative rotation agent. Never modified by the agent."""
 
+# JSON key Claude returns in the narrative scoring response.
+# Must match the key in NARRATIVE_FIT_TEMPLATE below. Any reader
+# (agent.py, counter, analytics) MUST import this constant so the
+# key name stays consistent — a mismatch silently defaults to 0.
+NARRATIVE_FIT_KEY = "narrative_fit"
+
 NARRATIVE_FIT_SYSTEM = (
     "You are a crypto narrative analyst evaluating whether specific tokens "
     "fit an accelerating category trend. Score objectively based on data provided. "

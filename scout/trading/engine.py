@@ -91,15 +91,30 @@ class TradingEngine:
         # by asyncio's single-threaded event loop — only one coroutine runs at a time.
         # For true concurrency (multi-process), wrap in BEGIN IMMEDIATE.
 
-        # 2. Check duplicate — skip if token was traded (open OR closed) in last 48h
+        # 2a. Block if there's an open trade on this token (any signal_type) —
+        # prevents doubled exposure on the same asset.
         cursor = await conn.execute(
-            """SELECT COUNT(*) FROM paper_trades
-               WHERE token_id = ? AND (status = 'open' OR opened_at >= datetime('now', '-48 hours'))""",
+            "SELECT COUNT(*) FROM paper_trades WHERE token_id = ? AND status = 'open'",
             (token_id,),
         )
         row = await cursor.fetchone()
         if row[0] > 0:
-            log.info("trade_skipped_duplicate", token_id=token_id)
+            log.info("trade_skipped_open_position", token_id=token_id, signal_type=signal_type)
+            return None
+
+        # 2b. Per-signal-type cooldown — block re-entry within 48h for the
+        # same (token, signal_type) pair. Different signal types (e.g.
+        # narrative_prediction on a token that had a first_signal yesterday)
+        # are allowed through to diversify signal coverage.
+        cursor = await conn.execute(
+            """SELECT COUNT(*) FROM paper_trades
+               WHERE token_id = ? AND signal_type = ?
+                 AND opened_at >= datetime('now', '-48 hours')""",
+            (token_id, signal_type),
+        )
+        row = await cursor.fetchone()
+        if row[0] > 0:
+            log.info("trade_skipped_cooldown", token_id=token_id, signal_type=signal_type)
             return None
 
         # 3. Check max exposure

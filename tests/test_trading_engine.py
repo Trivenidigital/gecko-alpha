@@ -145,6 +145,60 @@ async def test_open_trade_rejects_duplicate(engine, db):
     assert trade_id_2 is None
 
 
+async def test_open_position_blocks_other_signal_types(engine, db):
+    """Open position on token blocks ANY signal_type (exposure guard)."""
+    await _seed_price_cache(db, "bitcoin", 50000.0, age_seconds=0)
+    trade_id_1 = await engine.open_trade(
+        token_id="bitcoin", symbol="BTC", chain="coingecko",
+        signal_type="first_signal", signal_data={},
+    )
+    assert trade_id_1 is not None
+
+    # Different signal_type — still blocked because first_signal is OPEN
+    trade_id_2 = await engine.open_trade(
+        token_id="bitcoin", symbol="BTC", chain="coingecko",
+        signal_type="narrative_prediction", signal_data={},
+    )
+    assert trade_id_2 is None
+
+
+async def test_closed_trade_allows_different_signal_type(engine, db):
+    """Closed trade in last 48h does NOT block a different signal_type."""
+    await _seed_price_cache(db, "bitcoin", 50000.0, age_seconds=0)
+    trade_id_1 = await engine.open_trade(
+        token_id="bitcoin", symbol="BTC", chain="coingecko",
+        signal_type="first_signal", signal_data={},
+    )
+    assert trade_id_1 is not None
+    # Force-close so no open position remains
+    await engine.close_trade(trade_id_1, reason="test")
+
+    # Different signal_type on same token — should succeed
+    trade_id_2 = await engine.open_trade(
+        token_id="bitcoin", symbol="BTC", chain="coingecko",
+        signal_type="narrative_prediction", signal_data={},
+    )
+    assert trade_id_2 is not None
+
+
+async def test_closed_trade_blocks_same_signal_type_within_48h(engine, db):
+    """Same signal_type within 48h is still blocked (per-type cooldown)."""
+    await _seed_price_cache(db, "bitcoin", 50000.0, age_seconds=0)
+    trade_id_1 = await engine.open_trade(
+        token_id="bitcoin", symbol="BTC", chain="coingecko",
+        signal_type="first_signal", signal_data={},
+    )
+    assert trade_id_1 is not None
+    await engine.close_trade(trade_id_1, reason="test")
+
+    # Re-entry on same signal_type within cooldown — blocked
+    trade_id_2 = await engine.open_trade(
+        token_id="bitcoin", symbol="BTC", chain="coingecko",
+        signal_type="first_signal", signal_data={},
+    )
+    assert trade_id_2 is None
+
+
 async def test_close_trade(engine, db):
     """Engine can force-close a trade."""
     await _seed_price_cache(db, "bitcoin", 50000.0, age_seconds=0)
