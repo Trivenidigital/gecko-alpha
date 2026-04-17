@@ -271,7 +271,7 @@ async def _get_heating_categories(conn, hours: int = 12) -> list[dict]:
         cursor = await conn.execute(
             """SELECT category_name, acceleration, volume_growth_pct
                FROM narrative_signals
-               WHERE detected_at >= datetime('now', ?)
+               WHERE datetime(detected_at) >= datetime('now', ?)
                  AND acceleration > 0
                ORDER BY acceleration DESC LIMIT 5""",
             (f"-{hours} hours",),
@@ -286,7 +286,7 @@ async def _get_cooling_categories(conn, hours: int = 12) -> list[dict]:
         cursor = await conn.execute(
             """SELECT category_name, acceleration, volume_growth_pct
                FROM narrative_signals
-               WHERE detected_at >= datetime('now', ?)
+               WHERE datetime(detected_at) >= datetime('now', ?)
                  AND acceleration < 0
                ORDER BY acceleration ASC LIMIT 5""",
             (f"-{hours} hours",),
@@ -302,7 +302,7 @@ async def _get_recent_catches(conn, hours: int = 12) -> list[dict]:
             """SELECT coin_id, symbol, name, narrative_lead_minutes,
                       pipeline_lead_minutes, peak_gain_pct
                FROM trending_comparisons
-               WHERE created_at >= datetime('now', ?)
+               WHERE datetime(created_at) >= datetime('now', ?)
                  AND (narrative_lead_minutes > 0 OR pipeline_lead_minutes > 0)
                ORDER BY created_at DESC LIMIT 10""",
             (f"-{hours} hours",),
@@ -319,7 +319,7 @@ async def _get_recent_predictions(conn, hours: int = 12) -> list[dict]:
                       outcome_class, confidence
                FROM predictions
                WHERE is_control = 0
-                 AND predicted_at >= datetime('now', ?)
+                 AND datetime(predicted_at) >= datetime('now', ?)
                ORDER BY predicted_at DESC LIMIT 10""",
             (f"-{hours} hours",),
         )
@@ -346,7 +346,7 @@ async def _get_paper_summary(conn) -> dict | None:
                  COALESCE(SUM(pnl_usd), 0) as pnl
                FROM paper_trades
                WHERE status != 'open'
-                 AND closed_at >= datetime('now', '-24 hours')
+                 AND datetime(closed_at) >= datetime('now', '-24 hours')
                GROUP BY signal_type"""
         )
         by_signal = [dict(r) for r in await cursor2.fetchall()]
@@ -365,7 +365,7 @@ async def _get_recent_spikes(conn, hours: int = 12) -> list[dict]:
         cursor = await conn.execute(
             """SELECT coin_id, symbol, name, spike_ratio, market_cap
                FROM volume_spikes
-               WHERE detected_at >= datetime('now', ?)
+               WHERE datetime(detected_at) >= datetime('now', ?)
                ORDER BY spike_ratio DESC LIMIT 5""",
             (f"-{hours} hours",),
         )
@@ -380,7 +380,7 @@ async def _get_recent_chains(conn, hours: int = 12) -> list[dict]:
             """SELECT token_id, pattern_name, steps_matched, total_steps,
                       conviction_boost, completed_at
                FROM chain_matches
-               WHERE completed_at >= datetime('now', ?)
+               WHERE datetime(completed_at) >= datetime('now', ?)
                ORDER BY completed_at DESC LIMIT 5""",
             (f"-{hours} hours",),
         )

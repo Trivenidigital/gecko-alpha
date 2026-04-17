@@ -631,7 +631,7 @@ async def narrative_agent_loop(
                         ]:
                             try:
                                 await db._conn.execute(
-                                    f"DELETE FROM {table} WHERE {col} < datetime('now', '-{days} days')"
+                                    f"DELETE FROM {table} WHERE datetime({col}) < datetime('now', '-{days} days')"
                                 )
                             except Exception:
                                 pass

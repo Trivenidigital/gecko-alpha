@@ -109,7 +109,7 @@ async def compare_losers_with_signals(db: "Database") -> list[dict]:
                   MIN(price_change_24h) as price_change_24h,
                   MIN(snapshot_at) as first_loser_at
            FROM losers_snapshots
-           WHERE snapshot_at >= datetime('now', '-24 hours')
+           WHERE datetime(snapshot_at) >= datetime('now', '-24 hours')
            GROUP BY coin_id""",
     )
     loser_rows = await cursor.fetchall()

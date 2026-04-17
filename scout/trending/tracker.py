@@ -146,7 +146,7 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
     cursor = await db._conn.execute(
         """SELECT coin_id, symbol, name, MIN(snapshot_at) as first_trending_at
            FROM trending_snapshots
-           WHERE snapshot_at >= datetime('now', '-24 hours')
+           WHERE datetime(snapshot_at) >= datetime('now', '-24 hours')
            GROUP BY coin_id""",
     )
     trending_rows = await cursor.fetchall()
@@ -383,7 +383,7 @@ async def get_recent_snapshots(
         """SELECT coin_id, symbol, name, market_cap_rank, trending_score,
                   snapshot_at, created_at
            FROM trending_snapshots
-           WHERE snapshot_at >= datetime('now', ?)
+           WHERE datetime(snapshot_at) >= datetime('now', ?)
            ORDER BY snapshot_at DESC, trending_score ASC
            LIMIT ?""",
         (f"-{hours} hours", limit),
@@ -434,7 +434,7 @@ async def update_trending_peaks(db: "Database") -> int:
            WHERE tc.detected_price IS NOT NULL
              AND tc.detected_price > 0
              AND pc.current_price IS NOT NULL
-             AND pc.updated_at >= datetime('now', '-1 hour')"""
+             AND datetime(pc.updated_at) >= datetime('now', '-1 hour')"""
     )
     rows = await cursor.fetchall()
     updated = 0
