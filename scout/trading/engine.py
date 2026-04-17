@@ -159,7 +159,10 @@ class TradingEngine:
         if price_row is None:
             log.warning("close_trade_no_price", trade_id=trade_id, token_id=token_id)
             return
-        current_price = price_row[0]
+        current_price, age = price_row
+        if age > 3600:
+            log.warning("close_trade_stale_price", trade_id=trade_id, age=round(age, 1))
+            return  # don't close at stale price
 
         await self._paper_trader.execute_sell(
             db=self.db,

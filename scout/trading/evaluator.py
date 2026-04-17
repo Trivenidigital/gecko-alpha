@@ -35,7 +35,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                   checkpoint_1h_price, checkpoint_6h_price,
                   checkpoint_24h_price, checkpoint_48h_price,
                   peak_price, peak_pct, signal_data, symbol, name, chain,
-                  amount_usd, quantity
+                  amount_usd, quantity, signal_type
            FROM paper_trades
            WHERE status = 'open'"""
     )
@@ -85,6 +85,10 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
         current_price, updated_at_str = price_data
         updated_at = datetime.fromisoformat(updated_at_str).replace(tzinfo=timezone.utc)
         price_age_seconds = (now - updated_at).total_seconds()
+
+        if price_age_seconds > 3600:  # 1 hour max for evaluator
+            log.debug("trade_eval_stale_price", trade_id=trade_id, age=round(price_age_seconds, 1))
+            continue
 
         if entry_price <= 0:
             continue
@@ -139,7 +143,8 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             close_reason = "expired"
 
         if close_reason is not None:
-            if close_reason == "take_profit":
+            row_signal_type = row[20] if len(row) > 20 else ""
+            if close_reason == "take_profit" and row_signal_type != "long_hold":
                 # Partial TP: sell 70%, keep 30% as long-term hold
                 tp_sell_pct = getattr(settings, "PAPER_TP_SELL_PCT", 70.0) / 100.0
                 original_amount = float(row[18])  # amount_usd
@@ -163,7 +168,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                 # Open a new "long_hold" trade for the remaining 30%
                 if keep_amount > 0:
                     signal_data_raw = row[14] if len(row) > 14 else "{}"
-                    await _trader.execute_buy(
+                    new_id = await _trader.execute_buy(
                         db=db, token_id=token_id,
                         symbol=row[15] if len(row) > 15 else "",
                         name=row[16] if len(row) > 16 else "",
@@ -176,28 +181,35 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                         sl_pct=0.0,    # no stop loss
                         slippage_bps=0, # no additional slippage on the hold portion
                     )
-                    log.info(
-                        "paper_trade_partial_tp",
-                        trade_id=trade_id, token_id=token_id,
-                        sold_pct=tp_sell_pct * 100,
-                        keep_amount=round(keep_amount, 2),
-                    )
+                    if new_id is None:
+                        log.warning("long_hold_creation_failed", trade_id=trade_id, token_id=token_id)
+                    else:
+                        log.info(
+                            "paper_trade_partial_tp",
+                            trade_id=trade_id, token_id=token_id,
+                            sold_pct=tp_sell_pct * 100,
+                            keep_amount=round(keep_amount, 2),
+                        )
             else:
-                # SL or expiry: close the full position
-                await _trader.execute_sell(
+                # SL, expiry, or long_hold TP: close the full position
+                closed = await _trader.execute_sell(
                     db=db, trade_id=trade_id,
                     current_price=current_price, reason=close_reason,
                     slippage_bps=slippage_bps,
                 )
 
-            log.info(
-                "paper_trade_eval_closed",
-                trade_id=trade_id, token_id=token_id,
-                reason=close_reason,
-                price_age_seconds=round(price_age_seconds, 1),
-                current_price=current_price,
-                change_pct=round(change_pct, 2),
-            )
+            # For partial TP path, execute_sell was called inline above
+            if close_reason == "take_profit" and row_signal_type != "long_hold":
+                closed = True
+            if closed:
+                log.info(
+                    "paper_trade_eval_closed",
+                    trade_id=trade_id, token_id=token_id,
+                    reason=close_reason,
+                    price_age_seconds=round(price_age_seconds, 1),
+                    current_price=current_price,
+                    change_pct=round(change_pct, 2),
+                )
         else:
             log.debug(
                 "paper_trade_eval_ok",

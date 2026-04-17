@@ -24,6 +24,9 @@ KNOWN_SIGNALS = [
 @asynccontextmanager
 async def _ro_db(db_path: str):
     """Open a read-only connection to the database."""
+    import os
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"Database file not found: {db_path}")
     db = await aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True)
     db.row_factory = aiosqlite.Row
     try:

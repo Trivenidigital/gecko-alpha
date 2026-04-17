@@ -322,15 +322,19 @@ async def narrative_agent_loop(
                                 }
                                 data_comp = "partial"
 
-                            narrative_flags = compute_narrative_flags(
-                                price_change_30d=cdata["price_change_30d"],
-                                commits_4w=cdata["commits_4w"],
-                                reddit_subs=cdata["reddit_subscribers"],
-                                sentiment_up_pct=cdata["sentiment_up_pct"],
-                                narrative_fit_score=result.get("narrative_fit", 50),
-                                token_vol_change_24h=0.0,
-                                category_vol_growth_pct=accel.volume_growth_pct,
-                            )
+                            if data_comp == "partial":
+                                # Don't compute flags from missing data -- they'd all be HIGH severity
+                                narrative_flags = []
+                            else:
+                                narrative_flags = compute_narrative_flags(
+                                    price_change_30d=cdata["price_change_30d"],
+                                    commits_4w=cdata["commits_4w"],
+                                    reddit_subs=cdata["reddit_subscribers"],
+                                    sentiment_up_pct=cdata["sentiment_up_pct"],
+                                    narrative_fit_score=result.get("narrative_fit", 50),
+                                    token_vol_change_24h=0.0,
+                                    category_vol_growth_pct=accel.volume_growth_pct,
+                                )
 
                             counter_result = await score_counter_narrative(
                                 token_name=token.name,
@@ -606,6 +610,24 @@ async def narrative_agent_loop(
                         await prune_losers(db, retention_days=settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS)
                     except Exception:
                         logger.exception("tracker_prune_error")
+                    # Prune old data from tables that had no pruning (H6)
+                    try:
+                        for table, days in [
+                            ("volume_spikes", 30),
+                            ("momentum_7d", 30),
+                            ("trending_snapshots", 7),
+                            ("learn_logs", 90),
+                            ("chain_matches", 30),
+                        ]:
+                            try:
+                                await db._conn.execute(
+                                    f"DELETE FROM {table} WHERE created_at < datetime('now', '-{days} days')"
+                                )
+                            except Exception:
+                                pass
+                        await db._conn.commit()
+                    except Exception:
+                        logger.exception("extra_prune_error")
                     last_daily_learn_at = now
                     await strategy.set_timestamp("last_daily_learn_at", now)
                     logger.info("narrative.daily_learn_complete")

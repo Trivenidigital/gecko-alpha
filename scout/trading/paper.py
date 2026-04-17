@@ -29,8 +29,8 @@ class PaperTrader:
         tp_pct: float,
         sl_pct: float,
         slippage_bps: int = 0,
-    ) -> int:
-        """Record a paper buy. Returns trade ID.
+    ) -> int | None:
+        """Record a paper buy. Returns trade ID or None if rejected.
 
         Applies slippage to entry price: effective_entry = price * (1 + bps/10000).
         sl_pct is positive: sl_price = entry * (1 - sl_pct/100).
@@ -42,12 +42,12 @@ class PaperTrader:
         effective_entry = current_price * (1 + slippage_bps / 10000)
         if effective_entry <= 0:
             log.warning("paper_trade_zero_price", token_id=token_id, current_price=current_price)
-            return -1  # type: ignore[return-value]
+            return None
         quantity = amount_usd / effective_entry
         # Sanity check: quantity must be positive and finite
         if quantity <= 0 or not (quantity == quantity):  # NaN check
             log.warning("paper_trade_invalid_quantity", token_id=token_id, quantity=quantity)
-            return -1  # type: ignore[return-value]
+            return None
         tp_price = effective_entry * (1 + tp_pct / 100)
         sl_price = effective_entry * (1 - sl_pct / 100) if sl_pct > 0 else 0.0
         now = datetime.now(timezone.utc).isoformat()
@@ -90,8 +90,8 @@ class PaperTrader:
         current_price: float,
         reason: str,
         slippage_bps: int = 0,
-    ) -> None:
-        """Close a paper trade. Applies exit slippage.
+    ) -> bool:
+        """Close a paper trade. Applies exit slippage. Returns True if closed.
 
         effective_exit = price * (1 - bps/10000).
         """
@@ -106,7 +106,7 @@ class PaperTrader:
         row = await cursor.fetchone()
         if row is None:
             log.warning("paper_trade_not_found", trade_id=trade_id)
-            return
+            return False
 
         entry_price = float(row[0])
         amount_usd = float(row[1])
@@ -140,7 +140,7 @@ class PaperTrader:
         )
         if cursor_upd.rowcount == 0:
             log.warning("trade_already_closed", trade_id=trade_id)
-            return
+            return False
         await conn.commit()
 
         log.info(
@@ -151,3 +151,4 @@ class PaperTrader:
             pnl_usd=round(pnl_usd, 2),
             pnl_pct=round(pnl_pct, 2),
         )
+        return True

@@ -181,6 +181,8 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
         if pred_row and pred_row[0]:
             pred_at = _parse_dt(pred_row[0])
             lead = (first_trending_at - pred_at).total_seconds() / 60.0
+            if lead < 0:
+                lead = 0  # detected after, but within tolerance window
             comp.detected_by_narrative = True
             comp.narrative_detected_at = pred_at
             comp.narrative_lead_minutes = lead
@@ -197,6 +199,8 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
         if cand_row and cand_row[0]:
             cand_at = _parse_dt(cand_row[0])
             lead = (first_trending_at - cand_at).total_seconds() / 60.0
+            if lead < 0:
+                lead = 0  # detected after, but within tolerance window
             comp.detected_by_pipeline = True
             comp.pipeline_detected_at = cand_at
             comp.pipeline_lead_minutes = lead
@@ -226,6 +230,8 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
         if sig_row and sig_row[0]:
             sig_at = _parse_dt(sig_row[0])
             lead = (first_trending_at - sig_at).total_seconds() / 60.0
+            if lead < 0:
+                lead = 0  # detected after, but within tolerance window
             comp.detected_by_chains = True
             comp.chains_detected_at = sig_at
             comp.chains_lead_minutes = lead

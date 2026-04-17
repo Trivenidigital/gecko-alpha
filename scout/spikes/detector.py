@@ -102,7 +102,8 @@ async def detect_spikes(
             WHERE coin_id = latest.coin_id
         )
         GROUP BY latest.coin_id
-        HAVING avg_vol > 0
+        HAVING COUNT(hist.id) >= 3
+            AND avg_vol > 0
             AND current_vol / avg_vol > ?
             AND COALESCE(latest.market_cap, 0) < ?
             AND COALESCE(latest.market_cap, 0) > 0

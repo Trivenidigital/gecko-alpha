@@ -188,13 +188,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.post("/api/trading/close/{trade_id}")
     async def close_trade(trade_id: int):
-        """Manually close a paper trade."""
+        """Manually close a paper trade.
+
+        No auth required -- paper trading uses simulated money.
+        Double-click protection: checks trade is still open before processing.
+        """
         from fastapi.responses import JSONResponse
-        from scout.db import Database as ScoutDatabase
         from scout.trading.paper import PaperTrader
 
         sdb = await _get_scout_db(_db_path)
-        # Get current price
+        # Double-click protection: verify trade exists and is still open
         cursor = await sdb._conn.execute(
             "SELECT token_id, status FROM paper_trades WHERE id = ?", (trade_id,)
         )
