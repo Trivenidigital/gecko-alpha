@@ -188,13 +188,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.post("/api/trading/close/{trade_id}")
     async def close_trade(trade_id: int):
-        """Manually close a paper trade."""
+        """Manually close a paper trade.
+
+        No auth required -- paper trading uses simulated money.
+        Double-click protection: checks trade is still open before processing.
+        """
         from fastapi.responses import JSONResponse
-        from scout.db import Database as ScoutDatabase
         from scout.trading.paper import PaperTrader
 
         sdb = await _get_scout_db(_db_path)
-        # Get current price
+        # Double-click protection: verify trade exists and is still open
         cursor = await sdb._conn.execute(
             "SELECT token_id, status FROM paper_trades WHERE id = ?", (trade_id,)
         )
@@ -607,8 +610,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
             _last_manual_briefing_at["ts"] = now
             return {"id": bid, "synthesis": synthesis, "created_at": now.isoformat()}
-        except Exception as e:
-            return JSONResponse(status_code=500, content={"detail": str(e)})
+        except Exception:
+            return JSONResponse(status_code=500, content={"detail": "Briefing generation failed"})
 
     @app.get("/api/briefing/schedule")
     async def briefing_schedule():
@@ -710,7 +713,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
                     await ws.send_text(payload)
                 except Exception:
-                    pass  # DB may not exist yet — keep connection alive
+                    pass  # DB may not exist yet -- keep connection alive
 
                 await asyncio.sleep(5)
         except WebSocketDisconnect:

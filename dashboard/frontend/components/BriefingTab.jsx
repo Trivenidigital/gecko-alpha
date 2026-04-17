@@ -88,7 +88,7 @@ export default function BriefingTab() {
     }
   }
 
-  const synthesis = latest?.synthesis || (latest?.briefing === null ? null : latest?.synthesis)
+  const synthesis = latest?.synthesis ?? null
 
   return (
     <div className="briefing-tab">
@@ -116,6 +116,7 @@ export default function BriefingTab() {
         >
           {generating ? 'Generating...' : 'Generate Now'}
         </button>
+        {generating && <div style={{ color: '#a0a0b0', fontSize: '0.8rem' }}>This may take up to 60 seconds...</div>}
         {error && <div className="briefing-error">{error}</div>}
       </div>
 

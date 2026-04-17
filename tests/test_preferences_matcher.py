@@ -41,14 +41,15 @@ class TestShouldAlertCategory:
         assert should_alert_category("depin", strategy) is True
         assert should_alert_category("meme-token", strategy) is False
 
-    def test_preferred_only_empty_list_blocks_all(self) -> None:
+    def test_preferred_only_empty_list_fallback_allows_all(self) -> None:
+        """Empty preferred list falls back to allowing all (H5 fix)."""
         strategy = _FakeStrategy(
             {
                 "user_alert_mode": "preferred_only",
                 "user_preferred_categories": [],
             }
         )
-        assert should_alert_category("anything", strategy) is False
+        assert should_alert_category("anything", strategy) is True
 
     def test_exclude_only_blocks_excluded(self) -> None:
         strategy = _FakeStrategy(

@@ -22,9 +22,9 @@ async def build_paper_digest(db: Database, date_str: str) -> str | None:
     if conn is None:
         raise RuntimeError("Database not initialized.")
 
-    # Trades opened on the date
+    # Trades opened on the date (M4: exclude long_hold to avoid double-counting)
     cursor = await conn.execute(
-        "SELECT COUNT(*) FROM paper_trades WHERE date(opened_at) = ?",
+        "SELECT COUNT(*) FROM paper_trades WHERE date(opened_at) = ? AND signal_type != 'long_hold'",
         (date_str,),
     )
     row = await cursor.fetchone()
@@ -136,14 +136,15 @@ async def build_paper_digest(db: Database, date_str: str) -> str | None:
         lines.append(
             f"Best: {best_symbol} {best_sign}{best_pct:.1f}% ({best_pnl_sign}${best_pnl:.2f})"
         )
+        # L3: If worst trade is still positive, note all trades were profitable
         if worst_pnl >= 0:
-            worst_pnl_fmt = f"+${worst_pnl:.2f}"
+            lines.append("Worst: (all trades profitable)")
         else:
             worst_pnl_fmt = f"-${abs(worst_pnl):.2f}"
-        worst_sign = "+" if worst_pct >= 0 else ""
-        lines.append(
-            f"Worst: {worst_symbol} {worst_sign}{worst_pct:.1f}% ({worst_pnl_fmt})"
-        )
+            worst_sign = "+" if worst_pct >= 0 else ""
+            lines.append(
+                f"Worst: {worst_symbol} {worst_sign}{worst_pct:.1f}% ({worst_pnl_fmt})"
+            )
 
     if by_signal_with_wr:
         lines.append("")

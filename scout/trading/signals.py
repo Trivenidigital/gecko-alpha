@@ -157,21 +157,24 @@ async def trade_trending(engine, db: Database) -> None:
         )
         new_trending = await cursor.fetchall()
         for t in new_trending:
-            pc = await db._conn.execute(
-                "SELECT current_price FROM price_cache WHERE coin_id = ?",
-                (t["coin_id"],),
-            )
-            price_row = await pc.fetchone()
-            trending_price = price_row[0] if price_row else None
-            await engine.open_trade(
-                token_id=t["coin_id"],
-                symbol=t["symbol"],
-                name=t["name"],
-                chain="coingecko",
-                signal_type="trending_catch",
-                signal_data={"source": "trending_snapshot"},
-                entry_price=trending_price,
-            )
+            try:
+                pc = await db._conn.execute(
+                    "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                    (t["coin_id"],),
+                )
+                price_row = await pc.fetchone()
+                trending_price = price_row[0] if price_row else None
+                await engine.open_trade(
+                    token_id=t["coin_id"],
+                    symbol=t["symbol"],
+                    name=t["name"],
+                    chain="coingecko",
+                    signal_type="trending_catch",
+                    signal_data={"source": "trending_snapshot"},
+                    entry_price=trending_price,
+                )
+            except Exception:
+                logger.exception("trading_trending_error", coin_id=t["coin_id"])
     except Exception:
         logger.exception("trading_trending_catch_error")
 
@@ -183,6 +186,10 @@ _JUNK_CATEGORIES = {
     "sticker-themed coins", "gotchiverse", "drc-20",
     "four.meme ecosystem (bnb memes)", "bonk.fun ecosystem",
     "pump.fun creator", "pump fund portfolio",
+    "meme-token", "dog-themed", "cat-themed", "frog-themed",
+    "solana-meme-coins", "base-meme-coins", "pump.fun ecosystem",
+    "bnb-meme-coins", "ethereum-meme-coins", "trx-meme-coins",
+    "avax-meme-coins", "fan-tokens",
 }
 
 
@@ -208,7 +215,7 @@ async def trade_predictions(
         if (pred.narrative_fit_score or 0) < min_fit_score:
             continue
         # Quality gate: skip junk categories
-        if pred.category_name and pred.category_name.lower() in _JUNK_CATEGORIES:
+        if pred.category_name and pred.category_name.lower().strip() in _JUNK_CATEGORIES:
             continue
         try:
             pc = await db._conn.execute(
@@ -248,21 +255,24 @@ async def trade_chain_completions(engine, db: Database, settings) -> None:
         )
         new_chains = await cursor.fetchall()
         for c in new_chains:
-            pc = await db._conn.execute(
-                "SELECT current_price FROM price_cache WHERE coin_id = ?",
-                (c["token_id"],),
-            )
-            price_row = await pc.fetchone()
-            chain_price = price_row[0] if price_row else None
-            await engine.open_trade(
-                token_id=c["token_id"],
-                chain="coingecko",
-                signal_type="chain_completed",
-                signal_data={
-                    "pattern": c["pattern_name"],
-                    "boost": c["conviction_boost"],
-                },
-                entry_price=chain_price,
-            )
+            try:
+                pc = await db._conn.execute(
+                    "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                    (c["token_id"],),
+                )
+                price_row = await pc.fetchone()
+                chain_price = price_row[0] if price_row else None
+                await engine.open_trade(
+                    token_id=c["token_id"],
+                    chain="coingecko",
+                    signal_type="chain_completed",
+                    signal_data={
+                        "pattern": c["pattern_name"],
+                        "boost": c["conviction_boost"],
+                    },
+                    entry_price=chain_price,
+                )
+            except Exception:
+                logger.exception("trading_chain_error", token_id=c["token_id"])
     except Exception:
         logger.exception("trading_chain_complete_error")

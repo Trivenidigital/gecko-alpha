@@ -23,7 +23,7 @@ class PaperTrade(BaseModel):
     quantity: float
 
     tp_pct: float = 20.0
-    sl_pct: float = 10.0  # positive: 10.0 means 10% stop loss
+    sl_pct: float = 10.0  # positive: 10.0 means 10% stop loss; 0 means no stop loss (used for long_hold trades)
     tp_price: float
     sl_price: float
 

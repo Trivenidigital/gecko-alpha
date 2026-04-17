@@ -24,6 +24,9 @@ KNOWN_SIGNALS = [
 @asynccontextmanager
 async def _ro_db(db_path: str):
     """Open a read-only connection to the database."""
+    import os
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"Database file not found: {db_path}")
     db = await aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True)
     db.row_factory = aiosqlite.Row
     try:
@@ -797,30 +800,39 @@ async def get_quality_signals(
 async def get_briefing_latest(db_path: str) -> dict | None:
     """Return the most recent briefing."""
     async with _ro_db(db_path) as conn:
-        cursor = await conn.execute(
-            "SELECT * FROM briefings ORDER BY created_at DESC LIMIT 1"
-        )
-        row = await cursor.fetchone()
-        return dict(row) if row else None
+        try:
+            cursor = await conn.execute(
+                "SELECT * FROM briefings ORDER BY created_at DESC LIMIT 1"
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+        except Exception:
+            return None  # table doesn't exist yet
 
 
 async def get_briefing_history(db_path: str, limit: int = 10) -> list[dict]:
     """Return past briefings (most recent first)."""
     async with _ro_db(db_path) as conn:
-        cursor = await conn.execute(
-            """SELECT id, briefing_type, synthesis, model_used, tokens_used, created_at
-               FROM briefings ORDER BY created_at DESC LIMIT ?""",
-            (limit,),
-        )
-        return [dict(r) for r in await cursor.fetchall()]
+        try:
+            cursor = await conn.execute(
+                """SELECT id, briefing_type, synthesis, model_used, tokens_used, created_at
+                   FROM briefings ORDER BY created_at DESC LIMIT ?""",
+                (limit,),
+            )
+            return [dict(r) for r in await cursor.fetchall()]
+        except Exception:
+            return []  # table doesn't exist yet
 
 
 async def get_last_briefing_time(db_path: str) -> str | None:
     """Return the created_at of the most recent briefing."""
     async with _ro_db(db_path) as conn:
-        cursor = await conn.execute("SELECT MAX(created_at) FROM briefings")
-        row = await cursor.fetchone()
-        return row[0] if row and row[0] else None
+        try:
+            cursor = await conn.execute("SELECT MAX(created_at) FROM briefings")
+            row = await cursor.fetchone()
+            return row[0] if row and row[0] else None
+        except Exception:
+            return None  # table doesn't exist yet
 
 
 async def store_briefing(
@@ -867,46 +879,54 @@ async def get_available_categories(db_path: str) -> list[dict]:
 async def get_trading_positions(db_path: str) -> list[dict]:
     """Open paper trades enriched with current prices from price_cache."""
     async with _ro_db(db_path) as db:
-        cursor = await db.execute(
-            """SELECT id, token_id, symbol, name, chain, signal_type, signal_data,
-                      entry_price, amount_usd, quantity,
-                      tp_price, sl_price, tp_pct, sl_pct,
-                      peak_price, peak_pct,
-                      checkpoint_1h_pct, checkpoint_6h_pct,
-                      checkpoint_24h_pct, checkpoint_48h_pct,
-                      opened_at
-               FROM paper_trades
-               WHERE status = 'open'
-               ORDER BY opened_at DESC"""
+        try:
+            return await _get_trading_positions_inner(db)
+        except Exception:
+            return []  # table doesn't exist yet
+
+
+async def _get_trading_positions_inner(db) -> list[dict]:
+    """Inner implementation split out for M11 try/except wrapper."""
+    cursor = await db.execute(
+        """SELECT id, token_id, symbol, name, chain, signal_type, signal_data,
+                  entry_price, amount_usd, quantity,
+                  tp_price, sl_price, tp_pct, sl_pct,
+                  peak_price, peak_pct,
+                  checkpoint_1h_pct, checkpoint_6h_pct,
+                  checkpoint_24h_pct, checkpoint_48h_pct,
+                  opened_at
+           FROM paper_trades
+           WHERE status = 'open'
+           ORDER BY opened_at DESC"""
+    )
+    rows = [dict(r) for r in await cursor.fetchall()]
+
+    # Enrich with current prices from price_cache
+    token_ids = [r["token_id"] for r in rows]
+    if token_ids:
+        placeholders = ",".join("?" * len(token_ids))
+        pcursor = await db.execute(
+            f"SELECT coin_id, current_price FROM price_cache WHERE coin_id IN ({placeholders})",
+            token_ids,
         )
-        rows = [dict(r) for r in await cursor.fetchall()]
+        prices = {r["coin_id"]: r["current_price"] for r in await pcursor.fetchall()}
 
-        # Enrich with current prices from price_cache
-        token_ids = [r["token_id"] for r in rows]
-        if token_ids:
-            placeholders = ",".join("?" * len(token_ids))
-            pcursor = await db.execute(
-                f"SELECT coin_id, current_price FROM price_cache WHERE coin_id IN ({placeholders})",
-                token_ids,
-            )
-            prices = {r["coin_id"]: r["current_price"] for r in await pcursor.fetchall()}
+        for r in rows:
+            cp = prices.get(r["token_id"])
+            if cp and r["entry_price"]:
+                r["current_price"] = cp
+                r["unrealized_pnl_pct"] = round(
+                    ((cp - r["entry_price"]) / r["entry_price"]) * 100, 2
+                )
+                r["unrealized_pnl_usd"] = round(
+                    (cp - r["entry_price"]) * r["quantity"], 2
+                )
+            else:
+                r["current_price"] = None
+                r["unrealized_pnl_pct"] = None
+                r["unrealized_pnl_usd"] = None
 
-            for r in rows:
-                cp = prices.get(r["token_id"])
-                if cp and r["entry_price"]:
-                    r["current_price"] = cp
-                    r["unrealized_pnl_pct"] = round(
-                        ((cp - r["entry_price"]) / r["entry_price"]) * 100, 2
-                    )
-                    r["unrealized_pnl_usd"] = round(
-                        (cp - r["entry_price"]) * r["quantity"], 2
-                    )
-                else:
-                    r["current_price"] = None
-                    r["unrealized_pnl_pct"] = None
-                    r["unrealized_pnl_usd"] = None
-
-        return rows
+    return rows
 
 
 async def get_trading_history(
@@ -914,42 +934,54 @@ async def get_trading_history(
 ) -> list[dict]:
     """Closed paper trades, paginated."""
     async with _ro_db(db_path) as db:
-        cursor = await db.execute(
-            """SELECT id, token_id, symbol, name, chain, signal_type, signal_data,
-                      entry_price, exit_price, amount_usd, quantity,
-                      pnl_usd, pnl_pct, exit_reason, status,
-                      peak_price, peak_pct,
-                      checkpoint_1h_pct, checkpoint_6h_pct,
-                      checkpoint_24h_pct, checkpoint_48h_pct,
-                      opened_at, closed_at
-               FROM paper_trades
-               WHERE status != 'open'
-               ORDER BY closed_at DESC
-               LIMIT ? OFFSET ?""",
-            (limit, offset),
-        )
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        try:
+            cursor = await db.execute(
+                """SELECT id, token_id, symbol, name, chain, signal_type, signal_data,
+                          entry_price, exit_price, amount_usd, quantity,
+                          pnl_usd, pnl_pct, exit_reason, status,
+                          peak_price, peak_pct,
+                          checkpoint_1h_pct, checkpoint_6h_pct,
+                          checkpoint_24h_pct, checkpoint_48h_pct,
+                          opened_at, closed_at
+                   FROM paper_trades
+                   WHERE status != 'open'
+                   ORDER BY closed_at DESC
+                   LIMIT ? OFFSET ?""",
+                (limit, offset),
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+        except Exception:
+            return []  # table doesn't exist yet
 
 
 async def get_trading_stats(db_path: str, days: int = 7) -> dict:
     """Aggregate paper trading PnL stats."""
+    _empty_stats = {
+        "total_trades": 0, "wins": 0, "losses": 0,
+        "total_pnl_usd": 0, "avg_pnl_pct": 0,
+        "best_trade": None, "worst_trade": None,
+        "win_rate_pct": 0, "open_positions": 0, "open_exposure": 0,
+    }
     async with _ro_db(db_path) as db:
-        cursor = await db.execute(
-            """SELECT
-                 COUNT(*) as total_trades,
-                 SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins,
-                 SUM(CASE WHEN pnl_usd <= 0 THEN 1 ELSE 0 END) as losses,
-                 COALESCE(SUM(pnl_usd), 0) as total_pnl_usd,
-                 COALESCE(AVG(pnl_pct), 0) as avg_pnl_pct,
-                 MAX(pnl_usd) as best_trade,
-                 MIN(pnl_usd) as worst_trade
-               FROM paper_trades
-               WHERE status != 'open'
-                 AND closed_at >= datetime('now', ?)""",
-            (f"-{days} days",),
-        )
-        row = await cursor.fetchone()
+        try:
+            cursor = await db.execute(
+                """SELECT
+                     COUNT(*) as total_trades,
+                     SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins,
+                     SUM(CASE WHEN pnl_usd <= 0 THEN 1 ELSE 0 END) as losses,
+                     COALESCE(SUM(pnl_usd), 0) as total_pnl_usd,
+                     COALESCE(AVG(pnl_pct), 0) as avg_pnl_pct,
+                     MAX(pnl_usd) as best_trade,
+                     MIN(pnl_usd) as worst_trade
+                   FROM paper_trades
+                   WHERE status != 'open'
+                     AND closed_at >= datetime('now', ?)""",
+                (f"-{days} days",),
+            )
+            row = await cursor.fetchone()
+        except Exception:
+            return _empty_stats  # table doesn't exist yet
         total = row[0] or 0
         wins = row[1] or 0
 
@@ -976,18 +1008,21 @@ async def get_trading_stats(db_path: str, days: int = 7) -> dict:
 async def get_trading_stats_by_signal(db_path: str, days: int = 7) -> dict:
     """Paper trading PnL breakdown by signal type."""
     async with _ro_db(db_path) as db:
-        cursor = await db.execute(
-            """SELECT signal_type,
-                 COUNT(*) as trades,
-                 COALESCE(SUM(pnl_usd), 0) as pnl,
-                 SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins
-               FROM paper_trades
-               WHERE status != 'open'
-                 AND closed_at >= datetime('now', ?)
-               GROUP BY signal_type""",
-            (f"-{days} days",),
-        )
-        rows = await cursor.fetchall()
+        try:
+            cursor = await db.execute(
+                """SELECT signal_type,
+                     COUNT(*) as trades,
+                     COALESCE(SUM(pnl_usd), 0) as pnl,
+                     SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins
+                   FROM paper_trades
+                   WHERE status != 'open'
+                     AND closed_at >= datetime('now', ?)
+                   GROUP BY signal_type""",
+                (f"-{days} days",),
+            )
+            rows = await cursor.fetchall()
+        except Exception:
+            return {}  # table doesn't exist yet
         result = {}
         for row in rows:
             total = row[1]

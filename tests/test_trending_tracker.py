@@ -3,6 +3,11 @@
 import re
 from datetime import datetime, timedelta, timezone
 
+
+def _sqlite_ts(dt: datetime) -> str:
+    """Format datetime as SQLite-compatible string (space separator, no tz)."""
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
 import aiohttp
 import pytest
 from aioresponses import aioresponses
@@ -149,13 +154,13 @@ async def test_compare_detects_pipeline_candidate(db):
     await db._conn.execute(
         """INSERT INTO candidates (contract_address, chain, token_name, ticker, first_seen_at)
            VALUES (?, ?, ?, ?, ?)""",
-        ("coin-a", "solana", "Coin A", "CA", earlier.isoformat()),
+        ("coin-a", "solana", "Coin A", "CA", _sqlite_ts(earlier)),
     )
 
     # Insert trending snapshot for now
     await db._conn.execute(
         "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
-        ("coin-a", "CA", "Coin A", now.isoformat()),
+        ("coin-a", "CA", "Coin A", _sqlite_ts(now)),
     )
     await db._conn.commit()
 
@@ -184,13 +189,13 @@ async def test_compare_detects_narrative_prediction(db):
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         ("cat1", "Meme", "coin-b", "CB", "Coin B",
          100000, 0.5, 80, "strong", "high", "good fit",
-         "BULL", 2, "{}", earlier.isoformat()),
+         "BULL", 2, "{}", _sqlite_ts(earlier)),
     )
 
     # Insert trending snapshot
     await db._conn.execute(
         "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
-        ("coin-b", "CB", "Coin B", now.isoformat()),
+        ("coin-b", "CB", "Coin B", _sqlite_ts(now)),
     )
     await db._conn.commit()
 
@@ -214,13 +219,13 @@ async def test_compare_detects_chain_signal(db):
            (token_id, pipeline, event_type, event_data, source_module, created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
         ("coin-c", "memecoin", "candidate_scored", '{"quant_score": 75}',
-         "scorer", earlier.isoformat()),
+         "scorer", _sqlite_ts(earlier)),
     )
 
     # Insert trending snapshot
     await db._conn.execute(
         "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
-        ("coin-c", "CC", "Coin C", now.isoformat()),
+        ("coin-c", "CC", "Coin C", _sqlite_ts(now)),
     )
     await db._conn.commit()
 
@@ -242,17 +247,17 @@ async def test_compare_multiple_detections(db):
     await db._conn.execute(
         """INSERT INTO candidates (contract_address, chain, token_name, ticker, first_seen_at)
            VALUES (?, ?, ?, ?, ?)""",
-        ("coin-d", "solana", "Coin D", "CD", earlier_pipeline.isoformat()),
+        ("coin-d", "solana", "Coin D", "CD", _sqlite_ts(earlier_pipeline)),
     )
     await db._conn.execute(
         """INSERT INTO signal_events
            (token_id, pipeline, event_type, event_data, source_module, created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
-        ("coin-d", "memecoin", "candidate_scored", '{}', "scorer", earlier_chain.isoformat()),
+        ("coin-d", "memecoin", "candidate_scored", '{}', "scorer", _sqlite_ts(earlier_chain)),
     )
     await db._conn.execute(
         "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
-        ("coin-d", "CD", "Coin D", now.isoformat()),
+        ("coin-d", "CD", "Coin D", _sqlite_ts(now)),
     )
     await db._conn.commit()
 
@@ -460,13 +465,13 @@ async def test_compare_signal_events_like_matching(db):
         """INSERT INTO signal_events
            (token_id, pipeline, event_type, event_data, source_module, created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
-        ("bless", "memecoin", "candidate_scored", '{}', "scorer", earlier.isoformat()),
+        ("bless", "memecoin", "candidate_scored", '{}', "scorer", _sqlite_ts(earlier)),
     )
 
     # Trending snapshot uses CoinGecko slug (long form)
     await db._conn.execute(
         "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
-        ("bless-network", "BLESS", "Bless Network", now.isoformat()),
+        ("bless-network", "BLESS", "Bless Network", _sqlite_ts(now)),
     )
     await db._conn.commit()
 
