@@ -82,6 +82,7 @@ async def get_recent_predictions(db: Database, limit: int = 100) -> list[dict]:
     cursor = await conn.execute(
         """SELECT * FROM predictions
            WHERE outcome_class IS NOT NULL
+             AND outcome_class != 'UNRESOLVED'
            ORDER BY evaluated_at DESC
            LIMIT ?""",
         (limit,),

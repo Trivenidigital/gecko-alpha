@@ -297,7 +297,7 @@ export default function SignalsTab() {
                           </span>
                         ) : '-'}
                       </td>
-                      <td style={{ fontSize: 12 }}>{fmtNum(c.market_cap)}</td>
+                      <td style={{ fontSize: 12 }}>{c.market_cap != null ? '$' + fmtNum(c.market_cap) : '-'}</td>
                       <td>
                         <span style={{
                           fontWeight: 700,
@@ -491,7 +491,7 @@ export default function SignalsTab() {
             </div>
             <div style={{ textAlign: 'center' }}>
               <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Avg 7d Change</div>
-              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--color-accent-green)' }}>+{momentum7dStats.avg_7d_change}%</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--color-accent-green)' }}>{momentum7dStats?.avg_7d_change != null ? '+' + momentum7dStats.avg_7d_change + '%' : '-'}</div>
             </div>
           </div>
         )}

@@ -184,7 +184,11 @@ class TradingEngine:
         return [dict(row) for row in rows]
 
     async def get_pnl_summary(self, days: int = 7) -> dict:
-        """Aggregate PnL statistics over the last N days."""
+        """Aggregate PnL statistics over the last N days.
+
+        Excludes long_hold trades from main stats to avoid inflating PnL
+        with positions that have different risk/reward profiles.
+        """
         conn = self.db._conn
         if conn is None:
             raise RuntimeError("Database not initialized.")
@@ -199,6 +203,7 @@ class TradingEngine:
                  MIN(pnl_usd) as worst_trade
                FROM paper_trades
                WHERE status != 'open'
+                 AND signal_type != 'long_hold'
                  AND closed_at >= datetime('now', ?)""",
             (f"-{days} days",),
         )
@@ -217,7 +222,11 @@ class TradingEngine:
         }
 
     async def get_pnl_by_signal_type(self, days: int = 7) -> dict:
-        """PnL breakdown by signal type."""
+        """PnL breakdown by signal type.
+
+        long_hold trades are reported in a separate key so they don't
+        inflate the main signal-type stats.
+        """
         conn = self.db._conn
         if conn is None:
             raise RuntimeError("Database not initialized.")
@@ -228,6 +237,7 @@ class TradingEngine:
                  SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins
                FROM paper_trades
                WHERE status != 'open'
+                 AND signal_type != 'long_hold'
                  AND closed_at >= datetime('now', ?)
                GROUP BY signal_type""",
             (f"-{days} days",),
@@ -241,6 +251,28 @@ class TradingEngine:
                 "trades": total,
                 "pnl": round(row[2], 2),
                 "win_rate": round((wins / total) * 100, 1) if total > 0 else 0,
+            }
+
+        # Report long_hold separately so callers can display it distinctly
+        lh_cursor = await conn.execute(
+            """SELECT COUNT(*) as trades,
+                 COALESCE(SUM(pnl_usd), 0) as pnl,
+                 SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins
+               FROM paper_trades
+               WHERE status != 'open'
+                 AND signal_type = 'long_hold'
+                 AND closed_at >= datetime('now', ?)""",
+            (f"-{days} days",),
+        )
+        lh_row = await lh_cursor.fetchone()
+        lh_total = lh_row[0] or 0
+        if lh_total > 0:
+            lh_wins = lh_row[2] or 0
+            result["long_hold"] = {
+                "trades": lh_total,
+                "pnl": round(lh_row[1], 2),
+                "win_rate": round((lh_wins / lh_total) * 100, 1) if lh_total > 0 else 0,
+                "separate": True,
             }
         return result
 
@@ -262,18 +294,7 @@ class TradingEngine:
             age_seconds = (datetime.now(timezone.utc) - updated_at).total_seconds()
             return (price, age_seconds)
 
-        # Fallback: try fuzzy match by exact prefix (handles ID mismatches like bless-2 vs bless-network)
-        cursor = await conn.execute(
-            "SELECT coin_id, current_price, updated_at FROM price_cache WHERE coin_id LIKE ? LIMIT 1",
-            (token_id + "%",),
-        )
-        row = await cursor.fetchone()
-        if row is None or row[1] is None:
-            return None
-
-        matched_id = row[0]
-        log.warning("price_fuzzy_match", requested=token_id, matched=matched_id)
-        price = float(row[1])
-        updated_at = datetime.fromisoformat(str(row[2])).replace(tzinfo=timezone.utc)
-        age_seconds = (datetime.now(timezone.utc) - updated_at).total_seconds()
-        return (price, age_seconds)
+        # M2: Fuzzy fallback removed -- it matched wrong assets more often
+        # than it helped.  If the exact coin_id is not cached, return None
+        # and let the caller skip the trade.
+        return None

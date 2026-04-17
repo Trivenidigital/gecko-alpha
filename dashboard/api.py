@@ -610,8 +610,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
             _last_manual_briefing_at["ts"] = now
             return {"id": bid, "synthesis": synthesis, "created_at": now.isoformat()}
-        except Exception as e:
-            return JSONResponse(status_code=500, content={"detail": str(e)})
+        except Exception:
+            return JSONResponse(status_code=500, content={"detail": "Briefing generation failed"})
 
     @app.get("/api/briefing/schedule")
     async def briefing_schedule():
@@ -713,7 +713,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
                     await ws.send_text(payload)
                 except Exception:
-                    pass  # DB may not exist yet — keep connection alive
+                    pass  # DB may not exist yet -- keep connection alive
 
                 await asyncio.sleep(5)
         except WebSocketDisconnect:

@@ -16,8 +16,12 @@ export function useSort(data, defaultCol, defaultDir = 'desc') {
   const sorted = useMemo(() => {
     if (!Array.isArray(data) || data.length === 0) return data || []
     return [...data].sort((a, b) => {
-      const va = a[sortCol] ?? ''
-      const vb = b[sortCol] ?? ''
+      const va = a[sortCol]
+      const vb = b[sortCol]
+      // L4: Sort nulls/undefined to bottom regardless of direction
+      if (va == null && vb == null) return 0
+      if (va == null) return 1
+      if (vb == null) return -1
       if (typeof va === 'string' && typeof vb === 'string') {
         return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va)
       }

@@ -122,6 +122,16 @@ class PaperTrader:
             pnl_usd = quantity * (effective_exit - entry_price)
         now = datetime.now(timezone.utc).isoformat()
 
+        # L2: Warn if TP close produces negative PnL (high slippage scenario)
+        if reason == "take_profit" and pnl_usd < 0:
+            log.warning(
+                "tp_negative_pnl",
+                trade_id=trade_id,
+                pnl_usd=round(pnl_usd, 2),
+                pnl_pct=round(pnl_pct, 2),
+                slippage_bps=slippage_bps,
+            )
+
         # Map reason to status
         status_map = {
             "take_profit": "closed_tp",

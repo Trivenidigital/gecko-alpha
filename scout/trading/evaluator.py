@@ -15,9 +15,6 @@ from scout.trading.paper import PaperTrader
 
 log = structlog.get_logger()
 
-_trader = PaperTrader()
-
-
 async def evaluate_paper_trades(db: Database, settings) -> None:
     """Check all open paper trades: update checkpoints, check TP/SL, expire old.
 
@@ -57,6 +54,9 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
     for pr in price_rows:
         if pr[1] is not None:
             price_map[pr[0]] = (float(pr[1]), str(pr[2]))
+
+    # M5: Instantiate inside function instead of module-level singleton
+    _trader = PaperTrader()
 
     now = datetime.now(timezone.utc)
     max_duration = timedelta(hours=settings.PAPER_MAX_DURATION_HOURS)
@@ -143,6 +143,17 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             close_reason = "expired"
 
         if close_reason is not None:
+            # M3: Log how long ago expiry was actually due (useful after offline gaps)
+            if close_reason == "expired":
+                delay_seconds = (elapsed - max_duration).total_seconds()
+                if delay_seconds > 0:
+                    log.info(
+                        "trade_expired_delayed",
+                        trade_id=trade_id,
+                        token_id=token_id,
+                        delay_hours=round(delay_seconds / 3600, 1),
+                    )
+
             row_signal_type = row[20] if len(row) > 20 else ""
             if close_reason == "take_profit" and row_signal_type != "long_hold":
                 # Partial TP: sell 70%, keep 30% as long-term hold

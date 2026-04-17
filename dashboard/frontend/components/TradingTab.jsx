@@ -133,6 +133,7 @@ export default function TradingTab() {
   const [history, setHistory] = useState([])
   const [sortCol, setSortCol] = useState('pnl_pct')
   const [sortDir, setSortDir] = useState('desc')
+  const [closingId, setClosingId] = useState(null)
 
   const fetchAll = useCallback(async () => {
     try {
@@ -386,8 +387,10 @@ export default function TradingTab() {
                       </td>
                       <td>
                         <button
+                          disabled={closingId === p.id}
                           onClick={async () => {
                             if (!confirm('Close this position?')) return
+                            setClosingId(p.id)
                             try {
                               const res = await fetch(`/api/trading/close/${p.id}`, { method: 'POST' })
                               if (res.ok) {
@@ -398,19 +401,21 @@ export default function TradingTab() {
                               }
                             } catch {
                               alert('Network error')
+                            } finally {
+                              setClosingId(null)
                             }
                           }}
                           style={{
                             padding: '4px 10px',
                             fontSize: 11,
-                            background: 'rgba(239, 83, 80, 0.15)',
-                            color: '#ef5350',
+                            background: closingId === p.id ? 'rgba(150, 150, 150, 0.15)' : 'rgba(239, 83, 80, 0.15)',
+                            color: closingId === p.id ? '#999' : '#ef5350',
                             border: '1px solid rgba(239, 83, 80, 0.3)',
                             borderRadius: 4,
-                            cursor: 'pointer',
+                            cursor: closingId === p.id ? 'not-allowed' : 'pointer',
                           }}
                         >
-                          Close
+                          {closingId === p.id ? 'Closing...' : 'Close'}
                         </button>
                       </td>
                     </tr>
