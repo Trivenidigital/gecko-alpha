@@ -606,6 +606,23 @@ class Database:
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_briefings_created ON briefings(created_at);
+
+            CREATE TABLE IF NOT EXISTS velocity_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                price_change_1h REAL NOT NULL,
+                price_change_24h REAL,
+                market_cap REAL,
+                volume_24h REAL,
+                vol_mcap_ratio REAL,
+                current_price REAL,
+                detected_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_velocity_alerts
+                ON velocity_alerts(coin_id, detected_at);
             """
         )
 

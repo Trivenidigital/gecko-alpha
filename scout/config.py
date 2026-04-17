@@ -112,6 +112,17 @@ class Settings(BaseSettings):
     VOLUME_SPIKE_RATIO: float = 5.0
     VOLUME_SPIKE_MAX_MCAP: float = 500_000_000
 
+    # -------- Velocity Alerter (CoinGecko 1h early-pump detection) --------
+    # Research-only alerts for tokens pumping hard in the last hour.
+    # No paper trade dispatch -- Telegram plain-text only.
+    VELOCITY_ALERTS_ENABLED: bool = False
+    VELOCITY_MIN_1H_PCT: float = 30.0          # minimum 1h % change to flag
+    VELOCITY_MIN_MCAP: float = 500_000         # skip dust
+    VELOCITY_MAX_MCAP: float = 50_000_000      # skip mega-caps
+    VELOCITY_MIN_VOL_MCAP_RATIO: float = 0.2   # vol_24h / mcap -- liquidity sanity
+    VELOCITY_DEDUP_HOURS: int = 4              # re-alert cooldown per coin
+    VELOCITY_TOP_N: int = 10                   # max alerts per cycle
+
     # -------- Top Gainers Tracker --------
     GAINERS_TRACKER_ENABLED: bool = True
     GAINERS_MIN_CHANGE: float = 20.0
