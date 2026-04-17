@@ -121,11 +121,13 @@ def score(
                 signals.append("buy_pressure")
 
     # Signal 7: Momentum ratio (CoinGecko/DexScreener) -- 20 points
+    # Requires 24h change >= MOMENTUM_MIN_24H_CHANGE_PCT so stablecoin peg
+    # wobble (e.g. 0.05%/0.08% -> ratio 0.625) doesn't trigger the signal.
     if (
         token.price_change_1h is not None
         and token.price_change_24h is not None
         and token.price_change_1h > 0
-        and token.price_change_24h > 0
+        and token.price_change_24h >= settings.MOMENTUM_MIN_24H_CHANGE_PCT
     ):
         ratio = token.price_change_1h / token.price_change_24h
         if ratio > settings.MOMENTUM_RATIO_THRESHOLD:
