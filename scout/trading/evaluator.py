@@ -170,11 +170,14 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     "UPDATE paper_trades SET amount_usd = ?, quantity = ? WHERE id = ? AND status = 'open'",
                     (sell_amount, original_qty * tp_sell_pct, trade_id),
                 )
-                await _trader.execute_sell(
+                sold = await _trader.execute_sell(
                     db=db, trade_id=trade_id,
                     current_price=current_price, reason=close_reason,
                     slippage_bps=slippage_bps,
                 )
+                if not sold:
+                    log.warning("partial_tp_sell_failed", trade_id=trade_id)
+                    continue  # don't create long_hold if sell failed
 
                 # Open a new "long_hold" trade for the remaining 30%
                 if keep_amount > 0:

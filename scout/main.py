@@ -364,29 +364,32 @@ async def run_cycle(
     scored = []
     all_scored_tokens = []  # All tokens with updated quant_score/signals_fired
     for token in enriched:
-        historical_scores = await db.get_recent_scores(token.contract_address, limit=3)
-        points, signals = score(token, settings, historical_scores=historical_scores)
-        updated = token.model_copy(
-            update={"quant_score": points, "signals_fired": signals}
-        )
-        all_scored_tokens.append(updated)
-        await db.upsert_candidate(updated)
-        await db.log_score(token.contract_address, points)
-        await safe_emit(
-            db,
-            token_id=token.contract_address,
-            pipeline="memecoin",
-            event_type="candidate_scored",
-            event_data={
-                "quant_score": int(points),
-                "signals_fired": list(signals),
-                "signal_count": len(signals),
-            },
-            source_module="scorer",
-        )
-        if points >= settings.MIN_SCORE:
-            scored.append((updated, signals))
-            stats["candidates_promoted"] += 1
+        try:
+            historical_scores = await db.get_recent_scores(token.contract_address, limit=3)
+            points, signals = score(token, settings, historical_scores=historical_scores)
+            updated = token.model_copy(
+                update={"quant_score": points, "signals_fired": signals}
+            )
+            all_scored_tokens.append(updated)
+            await db.upsert_candidate(updated)
+            await db.log_score(token.contract_address, points)
+            await safe_emit(
+                db,
+                token_id=token.contract_address,
+                pipeline="memecoin",
+                event_type="candidate_scored",
+                event_data={
+                    "quant_score": int(points),
+                    "signals_fired": list(signals),
+                    "signal_count": len(signals),
+                },
+                source_module="scorer",
+            )
+            if points >= settings.MIN_SCORE:
+                scored.append((updated, signals))
+                stats["candidates_promoted"] += 1
+        except Exception:
+            logger.exception("scoring_error", token=getattr(token, "contract_address", "?"))
 
     # Paper trade on first meaningful signal (earliest detection point)
     if trading_engine:

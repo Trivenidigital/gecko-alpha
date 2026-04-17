@@ -136,6 +136,13 @@ class Database:
                 scanned_at        TEXT NOT NULL
             );
 
+            CREATE INDEX IF NOT EXISTS idx_holder_snap_addr
+                ON holder_snapshots(contract_address, scanned_at);
+            CREATE INDEX IF NOT EXISTS idx_volume_snap_addr
+                ON volume_snapshots(contract_address, scanned_at);
+            CREATE INDEX IF NOT EXISTS idx_score_hist_addr
+                ON score_history(contract_address, scanned_at);
+
             CREATE TABLE IF NOT EXISTS outcomes (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
                 contract_address  TEXT NOT NULL,

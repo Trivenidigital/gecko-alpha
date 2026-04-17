@@ -30,11 +30,14 @@ async def is_safe(contract_address: str, chain: str, session: aiohttp.ClientSess
 
     On API failure: log warning, return True (fail open — don't block alerts).
     """
+    if chain == "coingecko":
+        return True  # CG tokens don't need GoPlus safety check
+
     chain_id = CHAIN_ID_MAP.get(chain, chain)
     url = f"{GOPLUS_BASE}/{chain_id}"
 
     try:
-        async with session.get(url, params={"contract_addresses": contract_address}) as resp:
+        async with session.get(url, params={"contract_addresses": contract_address}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
                 logger.warning("GoPlus API returned error", status=resp.status, contract_address=contract_address)
                 return True

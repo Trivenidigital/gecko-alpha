@@ -188,6 +188,8 @@ _JUNK_CATEGORIES = {
     "pump.fun creator", "pump fund portfolio",
     "meme-token", "dog-themed", "cat-themed", "frog-themed",
     "solana-meme-coins", "base-meme-coins", "pump.fun ecosystem",
+    "bnb-meme-coins", "ethereum-meme-coins", "trx-meme-coins",
+    "avax-meme-coins", "fan-tokens",
 }
 
 

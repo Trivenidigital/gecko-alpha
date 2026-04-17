@@ -612,16 +612,19 @@ async def narrative_agent_loop(
                         logger.exception("tracker_prune_error")
                     # Prune old data from tables that had no pruning (H6)
                     try:
-                        for table, days in [
-                            ("volume_spikes", 30),
-                            ("momentum_7d", 30),
-                            ("trending_snapshots", 7),
-                            ("learn_logs", 90),
-                            ("chain_matches", 30),
+                        for table, col, days in [
+                            ("volume_spikes", "detected_at", 30),
+                            ("momentum_7d", "detected_at", 30),
+                            ("trending_snapshots", "snapshot_at", 7),
+                            ("learn_logs", "created_at", 90),
+                            ("chain_matches", "completed_at", 30),
+                            ("holder_snapshots", "scanned_at", 14),
+                            ("volume_snapshots", "scanned_at", 14),
+                            ("score_history", "scanned_at", 14),
                         ]:
                             try:
                                 await db._conn.execute(
-                                    f"DELETE FROM {table} WHERE created_at < datetime('now', '-{days} days')"
+                                    f"DELETE FROM {table} WHERE {col} < datetime('now', '-{days} days')"
                                 )
                             except Exception:
                                 pass
