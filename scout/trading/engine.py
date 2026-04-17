@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
 import structlog
@@ -44,6 +45,8 @@ class TradingEngine:
         self.db = db
         self.settings = settings
         self._paper_trader = PaperTrader()
+        # Monotonic start marker for the warmup window
+        self._started_at = time.monotonic()
 
     async def open_trade(
         self,
@@ -68,6 +71,20 @@ class TradingEngine:
         conn = self.db._conn
         if conn is None:
             raise RuntimeError("Database not initialized.")
+
+        # 0. Startup warmup: a real trader doesn't bulk-enter on boot.
+        warmup = getattr(self.settings, "PAPER_STARTUP_WARMUP_SECONDS", 0) or 0
+        if warmup > 0:
+            elapsed = time.monotonic() - self._started_at
+            if elapsed < warmup:
+                log.info(
+                    "trade_skipped_warmup",
+                    token_id=token_id,
+                    signal_type=signal_type,
+                    elapsed=round(elapsed, 1),
+                    warmup=warmup,
+                )
+                return None
 
         # 1. Resolve current price -- prefer caller-supplied entry_price
         if entry_price is not None and entry_price > 0:
@@ -116,6 +133,23 @@ class TradingEngine:
         if row[0] > 0:
             log.info("trade_skipped_cooldown", token_id=token_id, signal_type=signal_type)
             return None
+
+        # 2c. Hard cap on concurrent open positions — prevents restart-bursts.
+        max_open = getattr(self.settings, "PAPER_MAX_OPEN_TRADES", 0) or 0
+        if max_open > 0:
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM paper_trades WHERE status = 'open'"
+            )
+            row = await cursor.fetchone()
+            if row[0] >= max_open:
+                log.info(
+                    "trade_skipped_max_open_trades",
+                    token_id=token_id,
+                    signal_type=signal_type,
+                    open_count=row[0],
+                    max_open=max_open,
+                )
+                return None
 
         # 3. Check max exposure
         trade_amount = amount_usd or self.settings.PAPER_TRADE_AMOUNT_USD

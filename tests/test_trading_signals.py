@@ -47,6 +47,8 @@ def settings(tmp_path):
         PAPER_MAX_DURATION_HOURS=48,
         PAPER_MIN_MCAP=5_000_000,
         PAPER_MAX_MCAP_RANK=1500,
+        PAPER_MAX_OPEN_TRADES=1000,
+        PAPER_STARTUP_WARMUP_SECONDS=0,
     )
 
 

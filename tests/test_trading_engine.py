@@ -32,6 +32,8 @@ def settings(tmp_path):
         PAPER_SL_PCT=10.0,
         PAPER_SLIPPAGE_BPS=50,
         PAPER_MAX_DURATION_HOURS=48,
+        PAPER_MAX_OPEN_TRADES=1000,          # effectively off for most tests
+        PAPER_STARTUP_WARMUP_SECONDS=0,      # off by default in tests
     )
 
 
@@ -119,6 +121,67 @@ async def test_open_trade_rejects_max_exposure(engine, db, settings):
         signal_data={},
     )
     assert trade_id is None
+
+
+async def test_open_trade_rejects_when_max_open_trades_hit(engine, db, settings):
+    """Hard position-count cap: reject new trade when already at PAPER_MAX_OPEN_TRADES."""
+    settings.PAPER_MAX_OPEN_TRADES = 3
+    settings.PAPER_MAX_EXPOSURE_USD = 1_000_000  # take exposure cap out of the way
+
+    await _seed_price_cache(db, "bitcoin", 50000.0, age_seconds=0)
+    for i in range(3):
+        ts = (datetime.now(timezone.utc) + timedelta(seconds=i)).isoformat()
+        await db._conn.execute(
+            """INSERT INTO paper_trades
+               (token_id, symbol, name, chain, signal_type, signal_data,
+                entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, sl_price,
+                status, opened_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)""",
+            (f"coin-{i}", "X", "X", "coingecko", "test", "{}",
+             100.0, 1000.0, 10.0, 20.0, 10.0, 120.0, 90.0, ts),
+        )
+    await db._conn.commit()
+
+    trade_id = await engine.open_trade(
+        token_id="bitcoin", symbol="BTC", chain="coingecko",
+        signal_type="volume_spike", signal_data={},
+    )
+    assert trade_id is None
+
+
+async def test_open_trade_warmup_blocks_initial_burst(db, settings):
+    """During warmup, engine refuses to open trades (prevents restart-burst)."""
+    import time
+
+    settings.PAPER_STARTUP_WARMUP_SECONDS = 60
+    settings.PAPER_MAX_OPEN_TRADES = 50
+
+    engine = TradingEngine(mode="paper", db=db, settings=settings)
+    # Engine records its start time on construction; freeze-less check:
+    # with warmup=60s and start just now, a trade should be rejected.
+    await _seed_price_cache(db, "bitcoin", 50000.0, age_seconds=0)
+    trade_id = await engine.open_trade(
+        token_id="bitcoin", symbol="BTC", chain="coingecko",
+        signal_type="volume_spike", signal_data={},
+    )
+    assert trade_id is None
+
+
+async def test_open_trade_after_warmup_proceeds(db, settings, monkeypatch):
+    """After warmup elapses, trades open normally."""
+    settings.PAPER_STARTUP_WARMUP_SECONDS = 1
+    settings.PAPER_MAX_OPEN_TRADES = 50
+
+    engine = TradingEngine(mode="paper", db=db, settings=settings)
+    # Rewind engine start by more than warmup window
+    engine._started_at = engine._started_at - 5
+
+    await _seed_price_cache(db, "bitcoin", 50000.0, age_seconds=0)
+    trade_id = await engine.open_trade(
+        token_id="bitcoin", symbol="BTC", chain="coingecko",
+        signal_type="volume_spike", signal_data={},
+    )
+    assert trade_id is not None
 
 
 async def test_open_trade_rejects_duplicate(engine, db):

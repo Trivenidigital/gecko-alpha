@@ -151,6 +151,13 @@ class Settings(BaseSettings):
     PAPER_SLIPPAGE_BPS: int = 50                   # 0.5% slippage simulation
     PAPER_MIN_MCAP: float = 5_000_000             # min $5M mcap to paper trade (filters junk)
     PAPER_MAX_MCAP_RANK: int = 1500                # skip trending coins below rank 1500 (illiquid)
+    # Hard cap on concurrent open positions. Prevents restart-bursts and
+    # survives env changes to PAPER_MAX_EXPOSURE_USD / PAPER_TRADE_AMOUNT_USD.
+    PAPER_MAX_OPEN_TRADES: int = 10
+    # Cooldown after service start: refuse to open new paper trades during
+    # this window so a restart doesn't replay every currently-qualifying
+    # candidate as a fresh signal. A live trader doesn't bulk-enter on reboot.
+    PAPER_STARTUP_WARMUP_SECONDS: int = 180
     TRADING_DIGEST_HOUR_UTC: int = 0               # midnight digest
     TRADING_EVAL_INTERVAL: int = 1800              # 30 min eval cycle
 
