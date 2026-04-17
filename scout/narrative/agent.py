@@ -48,11 +48,13 @@ from scout.narrative.predictor import (
     score_token,
     store_predictions,
 )
+from scout.narrative.prompts import parse_fit_score
 from scout.narrative.strategy import Strategy
 from scout.preferences.matcher import should_alert_category, should_alert_token
 from scout.trading.signals import (
     trade_chain_completions,
     trade_predictions,
+    trade_trending,
 )
 from scout.trending.tracker import (
     compare_with_signals as trending_compare,
@@ -122,6 +124,11 @@ async def narrative_agent_loop(
             if settings.TRENDING_SNAPSHOT_ENABLED:
                 try:
                     await fetch_and_store_trending(session, db, settings.COINGECKO_API_KEY)
+                    if trading_engine:
+                        await trade_trending(
+                            trading_engine, db,
+                            max_mcap_rank=settings.PAPER_MAX_MCAP_RANK,
+                        )
                 except Exception:
                     logger.exception("trending_tracker.snapshot_error")
 
@@ -271,6 +278,8 @@ async def narrative_agent_loop(
                             continue
                         consecutive_failures = 0  # reset on success
 
+                        fit_score = parse_fit_score(result, default=0)
+
                         # Chain events: laggard was selected and narrative scored
                         await safe_emit(
                             db,
@@ -280,7 +289,7 @@ async def narrative_agent_loop(
                             event_data={
                                 "category_id": accel.category_id,
                                 "category_name": accel.name,
-                                "narrative_fit_score": int(result.get("narrative_fit_score", 0)),
+                                "narrative_fit_score": fit_score,
                                 "confidence": result.get("confidence", ""),
                                 "trigger_count": trigger_count,
                             },
@@ -292,7 +301,7 @@ async def narrative_agent_loop(
                             pipeline="narrative",
                             event_type="narrative_scored",
                             event_data={
-                                "narrative_fit_score": int(result.get("narrative_fit_score", 0)),
+                                "narrative_fit_score": fit_score,
                                 "staying_power": result.get("staying_power", ""),
                                 "confidence": result.get("confidence", ""),
                             },
@@ -331,7 +340,7 @@ async def narrative_agent_loop(
                                     commits_4w=cdata["commits_4w"],
                                     reddit_subs=cdata["reddit_subscribers"],
                                     sentiment_up_pct=cdata["sentiment_up_pct"],
-                                    narrative_fit_score=result.get("narrative_fit", 50),
+                                    narrative_fit_score=parse_fit_score(result, default=50),
                                     token_vol_change_24h=0.0,
                                     category_vol_growth_pct=accel.volume_growth_pct,
                                 )
@@ -343,7 +352,7 @@ async def narrative_agent_loop(
                                 price_change_24h=token.price_change_24h,
                                 category_name=accel.name,
                                 acceleration=accel.acceleration,
-                                narrative_fit_score=result.get("narrative_fit", 50),
+                                narrative_fit_score=parse_fit_score(result, default=50),
                                 flags=narrative_flags,
                                 data_completeness=data_comp,
                                 api_key=settings.ANTHROPIC_API_KEY,
@@ -389,7 +398,7 @@ async def narrative_agent_loop(
                             "name": token.name,
                             "market_cap_at_prediction": token.market_cap,
                             "price_at_prediction": token.price,
-                            "narrative_fit_score": result.get("narrative_fit_score", 0),
+                            "narrative_fit_score": fit_score,
                             "staying_power": result.get("staying_power", "unknown"),
                             "confidence": result.get("confidence", "low"),
                             "reasoning": result.get("reasoning", ""),
@@ -417,9 +426,7 @@ async def narrative_agent_loop(
                                 name=token.name,
                                 market_cap_at_prediction=token.market_cap,
                                 price_at_prediction=token.price,
-                                narrative_fit_score=result.get(
-                                    "narrative_fit_score", 0
-                                ),
+                                narrative_fit_score=fit_score,
                                 staying_power=result.get("staying_power", "unknown"),
                                 confidence=result.get("confidence", "low"),
                                 reasoning=result.get("reasoning", ""),
