@@ -44,7 +44,7 @@ async def trade_gainers(engine, db: Database, min_mcap: float = 5_000_000) -> No
             """SELECT DISTINCT coin_id, symbol, name, price_change_24h,
                                price_at_snapshot, market_cap
                FROM gainers_snapshots
-               WHERE snapshot_at >= datetime('now', '-5 minutes')
+               WHERE datetime(snapshot_at) >= datetime('now', '-5 minutes')
                AND coin_id NOT IN (
                    SELECT token_id FROM paper_trades WHERE signal_type = 'gainers_early' AND status = 'open'
                )"""
@@ -95,7 +95,7 @@ async def trade_losers(engine, db: Database, min_mcap: float = 5_000_000) -> Non
             """SELECT DISTINCT coin_id, symbol, name, price_change_24h,
                                price_at_snapshot, market_cap
                FROM losers_snapshots
-               WHERE snapshot_at >= datetime('now', '-5 minutes')
+               WHERE datetime(snapshot_at) >= datetime('now', '-5 minutes')
                AND coin_id NOT IN (
                    SELECT token_id FROM paper_trades WHERE signal_type = 'losers_contrarian' AND status = 'open'
                )"""
@@ -201,7 +201,7 @@ async def trade_trending(engine, db: Database, max_mcap_rank: int = 1500) -> Non
         cursor = await db._conn.execute(
             """SELECT DISTINCT coin_id, symbol, name, market_cap_rank
                FROM trending_snapshots
-               WHERE snapshot_at >= datetime('now', '-5 minutes')
+               WHERE datetime(snapshot_at) >= datetime('now', '-5 minutes')
                AND coin_id NOT IN (
                    SELECT token_id FROM paper_trades WHERE signal_type = 'trending_catch' AND status = 'open'
                )"""
@@ -318,7 +318,7 @@ async def trade_chain_completions(engine, db: Database, settings) -> None:
         cursor = await db._conn.execute(
             """SELECT DISTINCT token_id, pattern_id, pattern_name, conviction_boost, pipeline
                FROM chain_matches
-               WHERE completed_at >= datetime('now', '-5 minutes')
+               WHERE datetime(completed_at) >= datetime('now', '-5 minutes')
                AND token_id NOT IN (
                    SELECT token_id FROM paper_trades WHERE signal_type = 'chain_completed' AND status = 'open'
                )"""

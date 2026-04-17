@@ -756,7 +756,7 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         cursor = await self._conn.execute(
-            "SELECT COUNT(*) FROM alerts WHERE contract_address = ? AND alerted_at >= datetime('now', ?)",
+            "SELECT COUNT(*) FROM alerts WHERE contract_address = ? AND datetime(alerted_at) >= datetime('now', ?)",
             (contract_address, f"-{hours} hours"),
         )
         row = await cursor.fetchone()
@@ -861,7 +861,7 @@ class Database:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         cursor = await self._conn.execute(
             """SELECT volume_24h_usd FROM volume_snapshots
-               WHERE contract_address = ? AND scanned_at >= datetime('now', '-7 days')
+               WHERE contract_address = ? AND datetime(scanned_at) >= datetime('now', '-7 days')
                ORDER BY scanned_at DESC""",
             (contract_address,),
         )
@@ -898,7 +898,7 @@ class Database:
             """SELECT COUNT(*) FROM outcomes o
                JOIN alerts a ON o.id = a.id
                WHERE date(a.alerted_at) = ?
-               AND a.alerted_at <= datetime('now', '-4 hours')""",
+               AND datetime(a.alerted_at) <= datetime('now', '-4 hours')""",
             (today,),
         )
         outcomes_total = (await cursor.fetchone())[0]
@@ -907,7 +907,7 @@ class Database:
             """SELECT COUNT(*) FROM outcomes o
                JOIN alerts a ON o.id = a.id
                WHERE date(a.alerted_at) = ?
-               AND a.alerted_at <= datetime('now', '-4 hours')
+               AND datetime(a.alerted_at) <= datetime('now', '-4 hours')
                AND o.price_change_pct > 0""",
             (today,),
         )
@@ -949,7 +949,7 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         cursor = await self._conn.execute(
-            "DELETE FROM candidates WHERE first_seen_at < datetime('now', ?)",
+            "DELETE FROM candidates WHERE datetime(first_seen_at) < datetime('now', ?)",
             (f"-{keep_days} days",),
         )
         await self._conn.commit()
@@ -994,11 +994,11 @@ class Database:
                       MAX(sh.score)              AS peak_quant_score
                FROM alerts a
                LEFT JOIN score_history sh ON sh.contract_address = a.contract_address
-               WHERE a.alerted_at <= datetime('now', '-' || ? || ' days')
-                 AND a.alerted_at >= datetime('now', '-' || ? || ' days')
+               WHERE datetime(a.alerted_at) <= datetime('now', '-' || ? || ' days')
+                 AND datetime(a.alerted_at) >= datetime('now', '-' || ? || ' days')
                  AND a.contract_address NOT IN (
                      SELECT contract_address FROM second_wave_candidates
-                     WHERE detected_at >= datetime('now', '-' || ? || ' days')
+                     WHERE datetime(detected_at) >= datetime('now', '-' || ? || ' days')
                  )
                GROUP BY a.contract_address
                HAVING peak_quant_score >= ?""",
@@ -1038,7 +1038,7 @@ class Database:
         cursor = await self._conn.execute(
             """SELECT COUNT(*) FROM second_wave_candidates
                WHERE contract_address = ?
-                 AND detected_at >= datetime('now', '-' || ? || ' days')""",
+                 AND datetime(detected_at) >= datetime('now', '-' || ? || ' days')""",
             (contract_address, int(days)),
         )
         row = await cursor.fetchone()
@@ -1091,7 +1091,7 @@ class Database:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         cursor = await self._conn.execute(
             """SELECT * FROM second_wave_candidates
-               WHERE detected_at >= datetime('now', '-' || ? || ' days')
+               WHERE datetime(detected_at) >= datetime('now', '-' || ? || ' days')
                ORDER BY reaccumulation_score DESC""",
             (int(days),),
         )
@@ -1172,7 +1172,7 @@ class Database:
         cursor = await self._conn.execute(
             """SELECT volume_24h_usd FROM volume_snapshots
                WHERE contract_address = ?
-                 AND scanned_at >= datetime('now', '-' || ? || ' days')
+                 AND datetime(scanned_at) >= datetime('now', '-' || ? || ' days')
                ORDER BY scanned_at DESC""",
             (contract_address, int(days)),
         )

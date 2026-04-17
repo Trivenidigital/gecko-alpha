@@ -8,7 +8,7 @@ mcap/rank must skip cleanly without raising.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -204,3 +204,92 @@ async def test_trade_trending_respects_threshold_override(db, engine):
     # Tighter ceiling — should reject
     await trade_trending(engine, db, max_mcap_rank=1000)
     assert await _open_count(db) == 0
+
+
+# ---------------- Datetime-window regression --------------------------------
+# Bug: Stored timestamps use ISO format ('2026-04-17T06:07:17.297281+00:00')
+# while SQLite's datetime('now', ...) returns space-separated form
+# ('2026-04-17 06:07:17'). Raw string comparison treats 'T' (0x54) > ' ' (0x20),
+# so `snapshot_at >= datetime('now', '-5 minutes')` matches ANY same-day
+# snapshot, not just the last 5 minutes. This caused gainers_early to open
+# with entry prices taken from early-morning peak snapshots.
+
+
+async def _insert_gainer_at(db, coin_id, market_cap, price, snapshot_at):
+    await db._conn.execute(
+        """INSERT INTO gainers_snapshots
+           (coin_id, symbol, name, price_change_24h, market_cap, volume_24h,
+            price_at_snapshot, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (coin_id, coin_id.upper(), coin_id, 25.0, market_cap, 100_000.0, price, snapshot_at),
+    )
+    await db._conn.commit()
+
+
+async def _insert_loser_at(db, coin_id, market_cap, price, snapshot_at):
+    await db._conn.execute(
+        """INSERT INTO losers_snapshots
+           (coin_id, symbol, name, price_change_24h, market_cap, volume_24h,
+            price_at_snapshot, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (coin_id, coin_id.upper(), coin_id, -25.0, market_cap, 100_000.0, price, snapshot_at),
+    )
+    await db._conn.commit()
+
+
+async def _insert_trending_at(db, coin_id, market_cap_rank, snapshot_at):
+    await db._conn.execute(
+        """INSERT INTO trending_snapshots
+           (coin_id, symbol, name, market_cap_rank, trending_score, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (coin_id, coin_id.upper(), coin_id, market_cap_rank, 1.0, snapshot_at),
+    )
+    await db._conn.commit()
+
+
+async def test_trade_gainers_skips_snapshots_older_than_5min_same_day(db, engine):
+    """A snapshot stored 2 hours ago (same day) must NOT be picked up."""
+    stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    await _insert_gainer_at(db, "stale-gainer", 10_000_000, price=1.0, snapshot_at=stale)
+    await trade_gainers(engine, db, min_mcap=5_000_000)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_losers_skips_snapshots_older_than_5min_same_day(db, engine):
+    stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    await _insert_loser_at(db, "stale-loser", 10_000_000, price=1.0, snapshot_at=stale)
+    await trade_losers(engine, db, min_mcap=5_000_000)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_trending_skips_snapshots_older_than_5min_same_day(db, engine):
+    stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    await _insert_trending_at(db, "stale-trend", market_cap_rank=100, snapshot_at=stale)
+    await _seed_price(db, "stale-trend", price=1.0)
+    await trade_trending(engine, db, max_mcap_rank=1500)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_gainers_uses_fresh_snapshot_price_not_earlier_peak(db, engine):
+    """When both a stale and a fresh snapshot exist, entry must come from fresh one.
+
+    Reproduces the production bug where entries were sourced from the day's
+    earliest peak snapshot because DISTINCT + broken time filter returned the
+    full day's rows, and the first iterated row won via engine dedup.
+    """
+    peak_earlier = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat()
+    fresh = datetime.now(timezone.utc).isoformat()
+    # Earlier peak at $1.75 (would be the stale-entry bug value)
+    await _insert_gainer_at(db, "two-snap", 10_000_000, price=1.75, snapshot_at=peak_earlier)
+    # Current snapshot at $1.44
+    await _insert_gainer_at(db, "two-snap", 10_000_000, price=1.44, snapshot_at=fresh)
+    await trade_gainers(engine, db, min_mcap=5_000_000)
+    assert await _open_count(db) == 1
+    cur = await db._conn.execute(
+        "SELECT entry_price FROM paper_trades WHERE token_id='two-snap' AND status='open'"
+    )
+    row = await cur.fetchone()
+    entry = row[0]
+    # Entry must derive from fresh $1.44 (with default 50bps slippage = $1.4472),
+    # NOT from the stale $1.75 peak (which would yield ~$1.75875).
+    assert entry < 1.60, f"entry {entry} came from stale snapshot, not fresh"

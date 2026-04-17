@@ -110,7 +110,7 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
                   MAX(price_change_24h) as price_change_24h,
                   MIN(snapshot_at) as first_gainer_at
            FROM gainers_snapshots
-           WHERE snapshot_at >= datetime('now', '-24 hours')
+           WHERE datetime(snapshot_at) >= datetime('now', '-24 hours')
            GROUP BY coin_id""",
     )
     gainer_rows = await cursor.fetchall()
@@ -403,7 +403,7 @@ async def update_gainers_peaks(db: "Database") -> int:
            WHERE gc.detected_price IS NOT NULL
              AND gc.detected_price > 0
              AND pc.current_price IS NOT NULL
-             AND pc.updated_at >= datetime('now', '-1 hour')"""
+             AND datetime(pc.updated_at) >= datetime('now', '-1 hour')"""
     )
     rows = await cursor.fetchall()
     updated = 0

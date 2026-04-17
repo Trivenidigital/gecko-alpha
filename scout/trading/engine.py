@@ -109,7 +109,7 @@ class TradingEngine:
         cursor = await conn.execute(
             """SELECT COUNT(*) FROM paper_trades
                WHERE token_id = ? AND signal_type = ?
-                 AND opened_at >= datetime('now', '-48 hours')""",
+                 AND datetime(opened_at) >= datetime('now', '-48 hours')""",
             (token_id, signal_type),
         )
         row = await cursor.fetchone()
@@ -219,7 +219,7 @@ class TradingEngine:
                FROM paper_trades
                WHERE status != 'open'
                  AND signal_type != 'long_hold'
-                 AND closed_at >= datetime('now', ?)""",
+                 AND datetime(closed_at) >= datetime('now', ?)""",
             (f"-{days} days",),
         )
         row = await cursor.fetchone()
@@ -253,7 +253,7 @@ class TradingEngine:
                FROM paper_trades
                WHERE status != 'open'
                  AND signal_type != 'long_hold'
-                 AND closed_at >= datetime('now', ?)
+                 AND datetime(closed_at) >= datetime('now', ?)
                GROUP BY signal_type""",
             (f"-{days} days",),
         )
@@ -276,7 +276,7 @@ class TradingEngine:
                FROM paper_trades
                WHERE status != 'open'
                  AND signal_type = 'long_hold'
-                 AND closed_at >= datetime('now', ?)""",
+                 AND datetime(closed_at) >= datetime('now', ?)""",
             (f"-{days} days",),
         )
         lh_row = await lh_cursor.fetchone()

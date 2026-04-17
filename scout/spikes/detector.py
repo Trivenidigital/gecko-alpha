@@ -53,7 +53,7 @@ async def record_volume(db: "Database", raw_coins: list[dict]) -> int:
 
     # Prune records older than 7 days
     await db._conn.execute(
-        "DELETE FROM volume_history_cg WHERE recorded_at < datetime('now', '-7 days')"
+        "DELETE FROM volume_history_cg WHERE datetime(recorded_at) < datetime('now', '-7 days')"
     )
     await db._conn.commit()
 
@@ -94,7 +94,7 @@ async def detect_spikes(
         FROM volume_history_cg latest
         JOIN volume_history_cg hist
             ON hist.coin_id = latest.coin_id
-            AND hist.recorded_at >= datetime('now', '-7 days')
+            AND datetime(hist.recorded_at) >= datetime('now', '-7 days')
             AND hist.id != latest.id
         WHERE latest.recorded_at = (
             SELECT MAX(recorded_at)
@@ -299,13 +299,13 @@ async def get_momentum_7d_stats(db: "Database") -> dict:
     today_count = (await cursor.fetchone())[0]
 
     cursor = await db._conn.execute(
-        "SELECT COUNT(*) FROM momentum_7d WHERE detected_at >= datetime('now', '-7 days')"
+        "SELECT COUNT(*) FROM momentum_7d WHERE datetime(detected_at) >= datetime('now', '-7 days')"
     )
     week_count = (await cursor.fetchone())[0]
 
     cursor = await db._conn.execute(
         """SELECT AVG(price_change_7d) FROM momentum_7d
-           WHERE detected_at >= datetime('now', '-7 days')"""
+           WHERE datetime(detected_at) >= datetime('now', '-7 days')"""
     )
     row = await cursor.fetchone()
     avg_change = round(row[0], 1) if row and row[0] else 0.0
@@ -348,13 +348,13 @@ async def get_spike_stats(db: "Database") -> dict:
     today_count = (await cursor.fetchone())[0]
 
     cursor = await db._conn.execute(
-        "SELECT COUNT(*) FROM volume_spikes WHERE detected_at >= datetime('now', '-7 days')"
+        "SELECT COUNT(*) FROM volume_spikes WHERE datetime(detected_at) >= datetime('now', '-7 days')"
     )
     week_count = (await cursor.fetchone())[0]
 
     cursor = await db._conn.execute(
         """SELECT AVG(spike_ratio) FROM volume_spikes
-           WHERE detected_at >= datetime('now', '-7 days')"""
+           WHERE datetime(detected_at) >= datetime('now', '-7 days')"""
     )
     row = await cursor.fetchone()
     avg_ratio = round(row[0], 2) if row and row[0] else 0.0
