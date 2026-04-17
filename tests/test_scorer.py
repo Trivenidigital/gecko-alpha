@@ -559,7 +559,13 @@ class TestCoinGeckoSignals:
 
 
 class TestLiquidityFloorExemption:
-    """BL-010: CG trending tokens are exempt from liquidity floor."""
+    """CoinGecko-chain tokens are exempt from the liquidity floor.
+
+    The exemption keys off ``chain == 'coingecko'`` — not trending rank.
+    CG-listed tokens have ``liquidity_usd=0`` because there is no on-chain
+    pool; their real liquidity lives on CEX order books. The liquidity
+    floor is meant for DEX memecoins only.
+    """
 
     def test_cg_trending_exempt_from_liquidity_floor(self):
         """Token with cg_trending_rank set bypasses liquidity floor."""

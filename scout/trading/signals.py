@@ -50,6 +50,19 @@ async def trade_gainers(engine, db: Database, min_mcap: float = 5_000_000) -> No
                )"""
         )
         new_gainers = await cursor.fetchall()
+        skipped_null_mcap = sum(1 for g in new_gainers if g["market_cap"] is None)
+        skipped_low_mcap = sum(
+            1 for g in new_gainers
+            if g["market_cap"] is not None and g["market_cap"] < min_mcap
+        )
+        if skipped_null_mcap or skipped_low_mcap:
+            logger.info(
+                "trade_gainers_filtered",
+                total=len(new_gainers),
+                skipped_null_mcap=skipped_null_mcap,
+                skipped_low_mcap=skipped_low_mcap,
+                min_mcap=min_mcap,
+            )
         for g in new_gainers:
             if (g["market_cap"] or 0) < min_mcap:
                 continue
@@ -88,6 +101,19 @@ async def trade_losers(engine, db: Database, min_mcap: float = 5_000_000) -> Non
                )"""
         )
         new_losers = await cursor.fetchall()
+        skipped_null_mcap = sum(1 for l in new_losers if l["market_cap"] is None)
+        skipped_low_mcap = sum(
+            1 for l in new_losers
+            if l["market_cap"] is not None and l["market_cap"] < min_mcap
+        )
+        if skipped_null_mcap or skipped_low_mcap:
+            logger.info(
+                "trade_losers_filtered",
+                total=len(new_losers),
+                skipped_null_mcap=skipped_null_mcap,
+                skipped_low_mcap=skipped_low_mcap,
+                min_mcap=min_mcap,
+            )
         for l in new_losers:
             if (l["market_cap"] or 0) < min_mcap:
                 continue
@@ -181,6 +207,19 @@ async def trade_trending(engine, db: Database, max_mcap_rank: int = 1500) -> Non
                )"""
         )
         new_trending = await cursor.fetchall()
+        skipped_null_rank = sum(1 for t in new_trending if t["market_cap_rank"] is None)
+        skipped_low_rank = sum(
+            1 for t in new_trending
+            if t["market_cap_rank"] is not None and t["market_cap_rank"] > max_mcap_rank
+        )
+        if skipped_null_rank or skipped_low_rank:
+            logger.info(
+                "trade_trending_filtered",
+                total=len(new_trending),
+                skipped_null_rank=skipped_null_rank,
+                skipped_low_rank=skipped_low_rank,
+                max_mcap_rank=max_mcap_rank,
+            )
         for t in new_trending:
             rank = t["market_cap_rank"]
             if rank is None or rank > max_mcap_rank:

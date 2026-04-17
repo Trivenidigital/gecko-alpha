@@ -7,6 +7,20 @@
 # key name stays consistent — a mismatch silently defaults to 0.
 NARRATIVE_FIT_KEY = "narrative_fit"
 
+
+def parse_fit_score(raw: dict, default: int = 0) -> int:
+    """Extract the narrative_fit score, tolerating None / non-numeric values.
+
+    Claude occasionally returns the key missing, null, or as a string.
+    A naïve ``int(raw.get(...))`` raises TypeError on None; this helper
+    returns the default instead so prediction storage never crashes.
+    """
+    value = raw.get(NARRATIVE_FIT_KEY, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 NARRATIVE_FIT_SYSTEM = (
     "You are a crypto narrative analyst evaluating whether specific tokens "
     "fit an accelerating category trend. Score objectively based on data provided. "

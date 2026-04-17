@@ -147,6 +147,7 @@ class Settings(BaseSettings):
     PAPER_TP_SELL_PCT: float = 70.0               # sell 70% at TP, keep 30% as long_hold
     PAPER_SLIPPAGE_BPS: int = 50                   # 0.5% slippage simulation
     PAPER_MIN_MCAP: float = 5_000_000             # min $5M mcap to paper trade (filters junk)
+    PAPER_MAX_MCAP_RANK: int = 1500                # skip trending coins below rank 1500 (illiquid)
     TRADING_DIGEST_HOUR_UTC: int = 0               # midnight digest
     TRADING_EVAL_INTERVAL: int = 1800              # 30 min eval cycle
 

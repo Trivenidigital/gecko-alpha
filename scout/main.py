@@ -292,6 +292,7 @@ async def run_cycle(
             logger.exception("volume_spike_error")
 
     # Top Gainers Tracker (zero extra API calls -- uses cached data)
+    # Store + dispatch are split so dispatch errors don't hide storage errors.
     if settings.GAINERS_TRACKER_ENABLED and _raw_markets_combined:
         try:
             await store_top_gainers(
@@ -299,10 +300,13 @@ async def run_cycle(
                 min_change=settings.GAINERS_MIN_CHANGE,
                 max_mcap=settings.GAINERS_MAX_MCAP,
             )
-            if trading_engine:
-                await trade_gainers(trading_engine, db, min_mcap=settings.PAPER_MIN_MCAP)
         except Exception:
             logger.exception("gainers_tracker_error")
+        if trading_engine:
+            try:
+                await trade_gainers(trading_engine, db, min_mcap=settings.PAPER_MIN_MCAP)
+            except Exception:
+                logger.exception("gainers_trade_dispatch_error")
 
     # Top Losers Tracker (contrarian dip-catch paper trades)
     if settings.LOSERS_TRACKER_ENABLED and _raw_markets_combined:
@@ -312,10 +316,13 @@ async def run_cycle(
                 max_drop=settings.LOSERS_MIN_DROP,
                 max_mcap=settings.LOSERS_MAX_MCAP,
             )
-            if trading_engine:
-                await trade_losers(trading_engine, db, min_mcap=settings.PAPER_MIN_MCAP)
         except Exception:
             logger.exception("losers_tracker_error")
+        if trading_engine:
+            try:
+                await trade_losers(trading_engine, db, min_mcap=settings.PAPER_MIN_MCAP)
+            except Exception:
+                logger.exception("losers_trade_dispatch_error")
 
     # 7-Day Momentum Scanner (zero extra API calls -- filters existing data)
     if settings.MOMENTUM_7D_ENABLED and _raw_markets_combined:
