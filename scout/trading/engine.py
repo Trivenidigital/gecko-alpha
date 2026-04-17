@@ -91,9 +91,10 @@ class TradingEngine:
         # by asyncio's single-threaded event loop — only one coroutine runs at a time.
         # For true concurrency (multi-process), wrap in BEGIN IMMEDIATE.
 
-        # 2. Check duplicate open position
+        # 2. Check duplicate — skip if token was traded (open OR closed) in last 48h
         cursor = await conn.execute(
-            "SELECT COUNT(*) FROM paper_trades WHERE token_id = ? AND status = 'open'",
+            """SELECT COUNT(*) FROM paper_trades
+               WHERE token_id = ? AND (status = 'open' OR opened_at >= datetime('now', '-48 hours'))""",
             (token_id,),
         )
         row = await cursor.fetchone()
