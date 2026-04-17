@@ -186,6 +186,40 @@ def create_app(db_path: str | None = None) -> FastAPI:
     ):
         return await db.get_trading_stats(_db_path, days=days)
 
+    @app.post("/api/trading/close/{trade_id}")
+    async def close_trade(trade_id: int):
+        """Manually close a paper trade."""
+        from fastapi.responses import JSONResponse
+        from scout.db import Database as ScoutDatabase
+        from scout.trading.paper import PaperTrader
+
+        sdb = await _get_scout_db(_db_path)
+        # Get current price
+        cursor = await sdb._conn.execute(
+            "SELECT token_id, status FROM paper_trades WHERE id = ?", (trade_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "Trade not found"})
+        if row["status"] != "open":
+            return JSONResponse(status_code=400, content={"error": "Trade already closed"})
+
+        token_id = row["token_id"]
+        pc = await sdb._conn.execute(
+            "SELECT current_price FROM price_cache WHERE coin_id = ?", (token_id,)
+        )
+        price_row = await pc.fetchone()
+        current_price = price_row[0] if price_row else 0
+
+        trader = PaperTrader()
+        await trader.execute_sell(
+            db=sdb, trade_id=trade_id,
+            current_price=current_price,
+            reason="manual",
+            slippage_bps=50,
+        )
+        return {"ok": True, "trade_id": trade_id}
+
     @app.get("/api/trading/stats/by-signal")
     async def get_trading_stats_by_signal_endpoint(
         days: int = Query(7, ge=1, le=365),

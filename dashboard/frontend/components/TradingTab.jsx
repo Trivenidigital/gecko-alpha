@@ -334,6 +334,7 @@ export default function TradingTab() {
                   <th>TP / SL</th>
                   <th>Checkpoints</th>
                   <SortHeader col="opened" label="Opened" />
+                  <th>Action</th>
                 </tr>
               </thead>
               <tbody>
@@ -382,6 +383,35 @@ export default function TradingTab() {
                       <td>{checkpointBadges(p)}</td>
                       <td style={{ fontSize: 12, color: 'var(--color-text-secondary)', whiteSpace: 'nowrap' }}>
                         {fmtRelative(p.opened_at)}
+                      </td>
+                      <td>
+                        <button
+                          onClick={async () => {
+                            if (!confirm('Close this position?')) return
+                            try {
+                              const res = await fetch(`/api/trading/close/${p.id}`, { method: 'POST' })
+                              if (res.ok) {
+                                fetchAll()
+                              } else {
+                                const err = await res.json()
+                                alert(err.error || 'Failed to close')
+                              }
+                            } catch {
+                              alert('Network error')
+                            }
+                          }}
+                          style={{
+                            padding: '4px 10px',
+                            fontSize: 11,
+                            background: 'rgba(239, 83, 80, 0.15)',
+                            color: '#ef5350',
+                            border: '1px solid rgba(239, 83, 80, 0.3)',
+                            borderRadius: 4,
+                            cursor: 'pointer',
+                          }}
+                        >
+                          Close
+                        </button>
                       </td>
                     </tr>
                   )
