@@ -176,15 +176,27 @@ async def trade_trending(engine, db: Database) -> None:
         logger.exception("trading_trending_catch_error")
 
 
+_JUNK_CATEGORIES = {
+    "zoo-themed", "trading bots", "arcade games", "runes",
+    "bridged stablecoin", "bridged tokens", "stablecoins",
+    "wrapped tokens", "lp tokens", "memorial themed",
+    "sticker-themed coins", "gotchiverse", "drc-20",
+    "four.meme ecosystem (bnb memes)", "bonk.fun ecosystem",
+    "pump.fun creator", "pump fund portfolio",
+}
+
+
 async def trade_predictions(
     engine, db: Database, prediction_models: list,
     min_mcap: float = 5_000_000,
-    min_fit_score: int = 0,
+    min_fit_score: int = 1,
 ) -> None:
     """Open paper trades for narrative prediction picks.
 
-    Filters: only trade tokens with mcap >= min_mcap to avoid micro-cap junk
-    from niche categories (Zoo-Themed, Trading Bots, Arcade Games, etc).
+    Filters:
+    - mcap >= min_mcap (skip micro-cap junk)
+    - narrative_fit_score > 0 (Claude must have actually scored it)
+    - category not in junk blacklist (Zoo-Themed, Trading Bots, etc)
     """
     for pred in prediction_models:
         if pred.is_control:
@@ -192,8 +204,11 @@ async def trade_predictions(
         # Quality gate: skip micro-cap junk
         if pred.market_cap_at_prediction < min_mcap:
             continue
-        # Quality gate: skip low-confidence picks
-        if min_fit_score > 0 and (pred.narrative_fit_score or 0) < min_fit_score:
+        # Quality gate: Claude must have scored it (fit > 0)
+        if (pred.narrative_fit_score or 0) < min_fit_score:
+            continue
+        # Quality gate: skip junk categories
+        if pred.category_name and pred.category_name.lower() in _JUNK_CATEGORIES:
             continue
         try:
             pc = await db._conn.execute(
