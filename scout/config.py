@@ -34,6 +34,9 @@ class Settings(BaseSettings):
 
     # CoinGecko
     MOMENTUM_RATIO_THRESHOLD: float = 0.6
+    # Minimum absolute 24h price change (%) required for momentum_ratio to fire.
+    # Prevents stablecoin peg-wobble (0.05%/0.08% -> ratio 0.625 > 0.6) from triggering.
+    MOMENTUM_MIN_24H_CHANGE_PCT: float = 3.0
     MIN_VOL_ACCEL_RATIO: float = 5.0
     COINGECKO_API_KEY: str = ""
     COINGECKO_RATE_LIMIT_PER_MIN: int = 25  # buffer under 30/min free tier

@@ -503,6 +503,41 @@ class TestCoinGeckoSignals:
         points, signals = score(token, _settings())
         assert "cg_trending_rank" not in signals
 
+    def test_momentum_ratio_skips_stablecoin_wobble(self):
+        """Stablecoin with tiny moves (0.05% / 0.08%) has ratio 0.625 > 0.6 but
+        shouldn't fire -- 24h change < MOMENTUM_MIN_24H_CHANGE_PCT (3%)."""
+        token = _make_token(
+            price_change_1h=0.05, price_change_24h=0.08,
+            volume_24h_usd=1000, liquidity_usd=20000,
+            market_cap_usd=999999, holder_growth_1h=0,
+            token_age_days=30, social_mentions_24h=0,
+        )
+        points, signals = score(token, _settings())
+        assert "momentum_ratio" not in signals
+
+    def test_momentum_ratio_fires_when_24h_exceeds_min_change(self):
+        """Real pump (5% 24h, 4% 1h) -> ratio 0.8 > 0.6 AND 24h >= 3%, fires."""
+        token = _make_token(
+            price_change_1h=4.0, price_change_24h=5.0,
+            volume_24h_usd=1000, liquidity_usd=20000,
+            market_cap_usd=999999, holder_growth_1h=0,
+            token_age_days=30, social_mentions_24h=0,
+        )
+        points, signals = score(token, _settings())
+        assert "momentum_ratio" in signals
+
+    def test_momentum_ratio_threshold_respects_override(self):
+        """Lowering MOMENTUM_MIN_24H_CHANGE_PCT lets smaller moves qualify."""
+        token = _make_token(
+            price_change_1h=1.0, price_change_24h=1.5,
+            volume_24h_usd=1000, liquidity_usd=20000,
+            market_cap_usd=999999, holder_growth_1h=0,
+            token_age_days=30, social_mentions_24h=0,
+        )
+        s = _settings(MOMENTUM_MIN_24H_CHANGE_PCT=1.0)
+        points, signals = score(token, s)
+        assert "momentum_ratio" in signals
+
     def test_momentum_ratio_negative_prices_no_fire(self):
         """Both negative prices: ratio > 0.6 but this is a crash, not a pump."""
         token = _make_token(
