@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import aiohttp
 import structlog
@@ -24,6 +24,54 @@ def _parse_dt(s: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+async def _check_detector(
+    db: "Database",
+    table_name: str,
+    id_col: str,
+    coin_id: str,
+    symbol: str,
+    first_trending_at: str,
+    timestamp_col: str = "",
+    symbol_col: str = "symbol",
+) -> tuple[bool, Optional[datetime], Optional[float]]:
+    """Check whether a given detector table has detected the coin before trending.
+
+    Looks up ``MIN(timestamp_col)`` for rows matching ``id_col`` or (LOWER)
+    ``symbol_col`` that occurred before ``first_trending_at`` (+5m tolerance).
+    Returns a ``(detected, detected_at, lead_minutes)`` triple. Lead minutes
+    floors at 0 so very-small-negative detections (within the 5 minute
+    tolerance window) do not produce spurious negative leads.
+    """
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+
+    # Default the timestamp column per-table if not supplied.
+    if not timestamp_col:
+        defaults = {
+            "predictions": "predicted_at",
+            "candidates": "first_seen_at",
+            "signal_events": "created_at",
+            "social_signals": "detected_at",
+        }
+        timestamp_col = defaults.get(table_name, "detected_at")
+
+    query = (
+        f"SELECT MIN({timestamp_col}) FROM {table_name} "
+        f"WHERE ({id_col} = ? OR LOWER({symbol_col}) = LOWER(?)) "
+        f"AND {timestamp_col} < datetime(?, '+5 minutes')"
+    )
+    cursor = await db._conn.execute(query, (coin_id, symbol, first_trending_at))
+    row = await cursor.fetchone()
+    if not row or not row[0]:
+        return False, None, None
+    detected_at = _parse_dt(row[0])
+    first_trending_dt = _parse_dt(first_trending_at)
+    lead = (first_trending_dt - detected_at).total_seconds() / 60.0
+    if lead < 0:
+        lead = 0  # detected after, but within tolerance window
+    return True, detected_at, lead
 
 
 async def fetch_and_store_trending(
@@ -171,38 +219,23 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
         )
 
         # 2a. Check predictions table (narrative agent)
-        cursor = await db._conn.execute(
-            """SELECT MIN(predicted_at) FROM predictions
-               WHERE (coin_id = ? OR LOWER(symbol) = LOWER(?))
-                 AND predicted_at < datetime(?, '+5 minutes')""",
-            (coin_id, symbol, first_trending_at_str),
+        detected, detected_at, lead = await _check_detector(
+            db, "predictions", "coin_id", coin_id, symbol, first_trending_at_str,
         )
-        pred_row = await cursor.fetchone()
-        if pred_row and pred_row[0]:
-            pred_at = _parse_dt(pred_row[0])
-            lead = (first_trending_at - pred_at).total_seconds() / 60.0
-            if lead < 0:
-                lead = 0  # detected after, but within tolerance window
+        if detected:
             comp.detected_by_narrative = True
-            comp.narrative_detected_at = pred_at
+            comp.narrative_detected_at = detected_at
             comp.narrative_lead_minutes = lead
             comp.is_gap = False
 
         # 2b. Check candidates table (pipeline)
-        cursor = await db._conn.execute(
-            """SELECT MIN(first_seen_at) FROM candidates
-               WHERE (contract_address = ? OR LOWER(ticker) = LOWER(?))
-                 AND first_seen_at < datetime(?, '+5 minutes')""",
-            (coin_id, symbol, first_trending_at_str),
+        detected, detected_at, lead = await _check_detector(
+            db, "candidates", "contract_address", coin_id, symbol,
+            first_trending_at_str, symbol_col="ticker",
         )
-        cand_row = await cursor.fetchone()
-        if cand_row and cand_row[0]:
-            cand_at = _parse_dt(cand_row[0])
-            lead = (first_trending_at - cand_at).total_seconds() / 60.0
-            if lead < 0:
-                lead = 0  # detected after, but within tolerance window
+        if detected:
             comp.detected_by_pipeline = True
-            comp.pipeline_detected_at = cand_at
+            comp.pipeline_detected_at = detected_at
             comp.pipeline_lead_minutes = lead
             comp.is_gap = False
 
@@ -219,22 +252,36 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
                      AND created_at < datetime(?, '+5 minutes')""",
                 (coin_id, symbol, symbol, coin_id, first_trending_at_str),
             )
+            sig_row = await cursor.fetchone()
+            if sig_row and sig_row[0]:
+                sig_at = _parse_dt(sig_row[0])
+                lead_ = (first_trending_at - sig_at).total_seconds() / 60.0
+                if lead_ < 0:
+                    lead_ = 0
+                comp.detected_by_chains = True
+                comp.chains_detected_at = sig_at
+                comp.chains_lead_minutes = lead_
+                comp.is_gap = False
         else:
-            cursor = await db._conn.execute(
-                """SELECT MIN(created_at) FROM signal_events
-                   WHERE (token_id = ? OR LOWER(token_id) = LOWER(?))
-                     AND created_at < datetime(?, '+5 minutes')""",
-                (coin_id, symbol, first_trending_at_str),
+            detected, detected_at, lead = await _check_detector(
+                db, "signal_events", "token_id", coin_id, symbol,
+                first_trending_at_str, symbol_col="token_id",
             )
-        sig_row = await cursor.fetchone()
-        if sig_row and sig_row[0]:
-            sig_at = _parse_dt(sig_row[0])
-            lead = (first_trending_at - sig_at).total_seconds() / 60.0
-            if lead < 0:
-                lead = 0  # detected after, but within tolerance window
-            comp.detected_by_chains = True
-            comp.chains_detected_at = sig_at
-            comp.chains_lead_minutes = lead
+            if detected:
+                comp.detected_by_chains = True
+                comp.chains_detected_at = detected_at
+                comp.chains_lead_minutes = lead
+                comp.is_gap = False
+
+        # 2d. Check social_signals table (LunarCrush 4th tier)
+        detected, detected_at, lead = await _check_detector(
+            db, "social_signals", "coin_id", coin_id, symbol,
+            first_trending_at_str,
+        )
+        if detected:
+            comp.detected_by_social = True
+            comp.social_detected_at = detected_at
+            comp.social_lead_minutes = lead
             comp.is_gap = False
 
         comparisons.append(comp)
@@ -277,8 +324,9 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
                 detected_by_narrative, narrative_detected_at, narrative_lead_minutes,
                 detected_by_pipeline, pipeline_detected_at, pipeline_lead_minutes,
                 detected_by_chains, chains_detected_at, chains_lead_minutes,
+                detected_by_social, social_detected_at, social_lead_minutes,
                 is_gap, detected_price, peak_price, peak_gain_pct)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 comp.coin_id,
                 comp.symbol,
@@ -293,6 +341,9 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
                 1 if comp.detected_by_chains else 0,
                 comp.chains_detected_at.isoformat() if comp.chains_detected_at else None,
                 comp.chains_lead_minutes,
+                1 if comp.detected_by_social else 0,
+                comp.social_detected_at.isoformat() if comp.social_detected_at else None,
+                comp.social_lead_minutes,
                 1 if comp.is_gap else 0,
                 det_price,
                 old_peak,
@@ -335,6 +386,9 @@ async def get_trending_stats(db: "Database") -> TrendingStats:
              UNION ALL
              SELECT chains_lead_minutes FROM trending_comparisons
                WHERE detected_by_chains = 1 AND chains_lead_minutes IS NOT NULL
+             UNION ALL
+             SELECT social_lead_minutes FROM trending_comparisons
+               WHERE detected_by_social = 1 AND social_lead_minutes IS NOT NULL
            )"""
     )
     lead_row = await cursor.fetchone()
@@ -357,6 +411,11 @@ async def get_trending_stats(db: "Database") -> TrendingStats:
     )
     by_chains = (await cursor.fetchone())[0]
 
+    cursor = await db._conn.execute(
+        "SELECT COUNT(*) FROM trending_comparisons WHERE detected_by_social = 1"
+    )
+    by_social = (await cursor.fetchone())[0]
+
     hit_rate = round((caught / total * 100) if total > 0 else 0, 1)
 
     return TrendingStats(
@@ -369,6 +428,7 @@ async def get_trending_stats(db: "Database") -> TrendingStats:
         by_narrative=by_narrative,
         by_pipeline=by_pipeline,
         by_chains=by_chains,
+        by_social=by_social,
     )
 
 
@@ -404,9 +464,10 @@ async def get_recent_comparisons(
                   detected_by_narrative, narrative_detected_at, narrative_lead_minutes,
                   detected_by_pipeline, pipeline_detected_at, pipeline_lead_minutes,
                   detected_by_chains, chains_detected_at, chains_lead_minutes,
+                  detected_by_social, social_detected_at, social_lead_minutes,
                   is_gap, detected_price, peak_price, peak_gain_pct, created_at
            FROM trending_comparisons
-           ORDER BY COALESCE(chains_detected_at, narrative_detected_at, pipeline_detected_at, appeared_on_trending_at) DESC
+           ORDER BY COALESCE(social_detected_at, chains_detected_at, narrative_detected_at, pipeline_detected_at, appeared_on_trending_at) DESC
            LIMIT ?""",
         (limit,),
     )

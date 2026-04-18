@@ -607,6 +607,53 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_briefings_created ON briefings(created_at);
 
+            CREATE TABLE IF NOT EXISTS social_signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                fired_social_volume_24h  INTEGER NOT NULL DEFAULT 0,
+                fired_galaxy_jump        INTEGER NOT NULL DEFAULT 0,
+                fired_interactions_accel INTEGER NOT NULL DEFAULT 0,
+                galaxy_score REAL,
+                social_volume_24h REAL,
+                social_volume_baseline REAL,
+                social_spike_ratio REAL,
+                interactions_24h REAL,
+                sentiment REAL,
+                social_dominance REAL,
+                price_change_1h REAL,
+                price_change_24h REAL,
+                market_cap REAL,
+                current_price REAL,
+                detected_at TEXT NOT NULL,
+                alerted_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(coin_id, detected_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_social_signals_coin_detected
+                ON social_signals(coin_id, detected_at);
+            CREATE INDEX IF NOT EXISTS idx_social_signals_symbol
+                ON social_signals(symbol);
+
+            CREATE TABLE IF NOT EXISTS social_baselines (
+                coin_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                avg_social_volume_24h REAL NOT NULL,
+                avg_galaxy_score REAL NOT NULL,
+                last_galaxy_score REAL,
+                interactions_ring TEXT NOT NULL DEFAULT '[]',
+                sample_count INTEGER NOT NULL,
+                last_poll_at TEXT,
+                last_updated TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS social_credit_ledger (
+                utc_date TEXT PRIMARY KEY,
+                credits_used INTEGER NOT NULL,
+                last_updated TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS velocity_alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 coin_id TEXT NOT NULL,
@@ -637,6 +684,15 @@ class Database:
             if col not in existing_cols:
                 await self._conn.execute(ddl)
 
+        # Migrate social_signals: add alerted_at if missing (Telegram-dispatch
+        # gating column; dedup treats NULL as "not yet delivered" so we retry).
+        cursor = await self._conn.execute("PRAGMA table_info(social_signals)")
+        ss_cols = {row[1] for row in await cursor.fetchall()}
+        if "alerted_at" not in ss_cols:
+            await self._conn.execute(
+                "ALTER TABLE social_signals ADD COLUMN alerted_at TEXT"
+            )
+
         # Migrate gainers_snapshots: add price_at_snapshot if missing
         cursor = await self._conn.execute("PRAGMA table_info(gainers_snapshots)")
         gs_cols = {row[1] for row in await cursor.fetchall()}
@@ -653,13 +709,25 @@ class Database:
                 "ALTER TABLE losers_snapshots ADD COLUMN price_at_snapshot REAL"
             )
 
-        # Migrate trending_comparisons: add peak tracking columns
+        # Migrate trending_comparisons: add peak tracking + social tier columns
         cursor = await self._conn.execute("PRAGMA table_info(trending_comparisons)")
         tc_cols = {row[1] for row in await cursor.fetchall()}
         for col, ddl in (
             ("detected_price", "ALTER TABLE trending_comparisons ADD COLUMN detected_price REAL"),
             ("peak_price", "ALTER TABLE trending_comparisons ADD COLUMN peak_price REAL"),
             ("peak_gain_pct", "ALTER TABLE trending_comparisons ADD COLUMN peak_gain_pct REAL"),
+            (
+                "detected_by_social",
+                "ALTER TABLE trending_comparisons ADD COLUMN detected_by_social INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "social_detected_at",
+                "ALTER TABLE trending_comparisons ADD COLUMN social_detected_at TEXT",
+            ),
+            (
+                "social_lead_minutes",
+                "ALTER TABLE trending_comparisons ADD COLUMN social_lead_minutes REAL",
+            ),
         ):
             if col not in tc_cols:
                 await self._conn.execute(ddl)
