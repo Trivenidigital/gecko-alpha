@@ -235,18 +235,28 @@ async def detect_spikes(
     if not detections:
         return [], buffered_states
 
-    # Dedup against recent social_signals rows.
+    # Dedup against recently-ALERTED social_signals rows only. Rows with
+    # ``alerted_at IS NULL`` represent a stored detection whose Telegram
+    # dispatch failed -- we WANT those to re-enter detection so the user
+    # eventually gets the alert (spec §8).
+    # SQLite's default SQLITE_LIMIT_VARIABLE_NUMBER is 999; chunk the coin
+    # list into batches of 500 to stay well clear.
     if db._conn is not None and dedup_hours > 0:
         coin_ids = list({a.coin_id for a, _ in detections})
-        placeholders = ",".join("?" * len(coin_ids))
-        cursor = await db._conn.execute(
-            f"""SELECT DISTINCT coin_id FROM social_signals
-                WHERE coin_id IN ({placeholders})
-                  AND datetime(detected_at) >= datetime('now', '-' || ? || ' hours')""",
-            (*coin_ids, dedup_hours),
-        )
-        rows = await cursor.fetchall()
-        recent = {r[0] for r in rows}
+        recent: set[str] = set()
+        CHUNK = 500
+        for i in range(0, len(coin_ids), CHUNK):
+            chunk = coin_ids[i : i + CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            cursor = await db._conn.execute(
+                f"""SELECT DISTINCT coin_id FROM social_signals
+                    WHERE coin_id IN ({placeholders})
+                      AND alerted_at IS NOT NULL
+                      AND datetime(detected_at) >= datetime('now', '-' || ? || ' hours')""",
+                (*chunk, dedup_hours),
+            )
+            rows = await cursor.fetchall()
+            recent.update(r[0] for r in rows)
         detections = [(a, r) for a, r in detections if a.coin_id not in recent]
 
     # Sort descending by rank_key + take top-N.

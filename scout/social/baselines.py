@@ -8,6 +8,7 @@ loop owns the schedule for hydrate/checkpoint calls.
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
@@ -59,7 +60,7 @@ def update_state(
       but still increment ``sample_count`` so warmup progresses uniformly.
     * Otherwise apply EWMA with ``alpha = 1 / min_samples``.
     """
-    if new_value is None or new_value <= 0:
+    if new_value is None or math.isnan(new_value) or new_value <= 0:
         return state
 
     # After warmup: exclude extreme samples in EITHER direction.

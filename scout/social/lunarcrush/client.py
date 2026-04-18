@@ -25,6 +25,10 @@ logger = structlog.get_logger(__name__)
 
 _BACKOFF_SEQUENCE = [5.0, 10.0, 20.0, 40.0]
 _BACKOFF_CAP = 60.0
+_REQUEST_TIMEOUT_SEC = 30
+# Max 5xx retries per cycle — total wall clock with the 5/10/20 ladder is
+# ~35s, well under the 5 min default poll interval.
+_5XX_MAX_RETRIES = 2
 
 
 class LunarCrushClient:
@@ -39,9 +43,16 @@ class LunarCrushClient:
         self._settings = settings
         # Vendor isolation: own session unless the caller hands one in
         # (tests sometimes pass a shared mock session, but production uses
-        # the client-owned one).
-        self._session = session or aiohttp.ClientSession()
-        self._owns_session = session is None
+        # the client-owned one). Owned sessions carry a 30s total timeout
+        # so a hanging endpoint cannot block the loop forever.
+        if session is None:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=_REQUEST_TIMEOUT_SEC)
+            )
+            self._owns_session = True
+        else:
+            self._session = session
+            self._owns_session = False
         self._rate_limit_per_min = int(
             getattr(settings, "LUNARCRUSH_RATE_LIMIT_PER_MIN", 9)
         )
@@ -75,16 +86,22 @@ class LunarCrushClient:
         base = str(self._settings.LUNARCRUSH_BASE_URL).rstrip("/")
         url = f"{base}/coins/list/v2"
 
+        server_retries = 0
         for attempt, backoff in enumerate(_BACKOFF_SEQUENCE + [_BACKOFF_CAP]):
             await self._respect_rate_limit()
             self._call_times.append(time.monotonic())
             try:
-                async with self._session.get(url, headers=self._auth_headers()) as resp:
+                async with self._session.get(
+                    url,
+                    headers=self._auth_headers(),
+                    timeout=aiohttp.ClientTimeout(total=_REQUEST_TIMEOUT_SEC),
+                ) as resp:
                     status = resp.status
                     if status == 401 or status == 403:
+                        # Auth failure is never billable -- return 0 credit.
                         logger.warning("lunarcrush_auth_failed", status=status)
                         self.disabled = True
-                        return [], 1
+                        return [], 0
                     if status == 429:
                         delay = min(backoff, _BACKOFF_CAP)
                         logger.warning(
@@ -95,8 +112,30 @@ class LunarCrushClient:
                         await asyncio.sleep(delay)
                         continue
                     if status >= 500:
-                        logger.warning("lunarcrush_server_error", status=status)
-                        return [], 1
+                        # 5xx is never billable. Retry up to _5XX_MAX_RETRIES
+                        # with the same backoff ladder, then give up cleanly.
+                        if server_retries >= _5XX_MAX_RETRIES:
+                            logger.warning(
+                                "lunarcrush_server_error_giveup",
+                                status=status,
+                                retries=server_retries,
+                            )
+                            return [], 0
+                        delay = min(
+                            _BACKOFF_SEQUENCE[
+                                min(server_retries, len(_BACKOFF_SEQUENCE) - 1)
+                            ],
+                            _BACKOFF_CAP,
+                        )
+                        logger.warning(
+                            "lunarcrush_server_error",
+                            status=status,
+                            retry_in_s=delay,
+                            attempt=server_retries,
+                        )
+                        server_retries += 1
+                        await asyncio.sleep(delay)
+                        continue
                     text = await resp.text()
                     try:
                         payload = _json.loads(text)
@@ -111,12 +150,18 @@ class LunarCrushClient:
                     return coins, 1
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("lunarcrush_request_error")
-                return [], 1
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                # Transport error: no credit was charged by the server --
+                # return 0 cost and let the loop retry next cycle.
+                logger.warning(
+                    "lunarcrush_transport_error",
+                    error=str(exc),
+                    attempt=attempt,
+                )
+                return [], 0
         # Ran out of retries.
         logger.warning("lunarcrush_giving_up_after_retries")
-        return [], 1
+        return [], 0
 
     async def close(self) -> None:
         if self._owns_session and not self._session.closed:

@@ -106,7 +106,12 @@ class CreditLedger:
     # ------------------------------------------------------------------
 
     async def hydrate(self, db: "Database") -> None:
-        """Load today's row (if any) from ``social_credit_ledger``."""
+        """Load today's row (if any) from ``social_credit_ledger``.
+
+        Robust against corrupt rows: on parse failure we log a WARNING with
+        the bad payload and overwrite with ``credits_used=0`` so a restart
+        does NOT re-charge the budget based on garbage data.
+        """
         if db._conn is None:
             return
         today_str = self._clock().strftime("%Y-%m-%d")
@@ -116,9 +121,54 @@ class CreditLedger:
         )
         row = await cursor.fetchone()
         if row is not None:
-            self.credits_used = int(row[0])
+            try:
+                self.credits_used = int(row[0])
+            except (TypeError, ValueError):
+                logger.warning(
+                    "social_credit_ledger_corrupt_row",
+                    raw_value=repr(row[0]),
+                    utc_date=today_str,
+                )
+                self.credits_used = 0
+                # Overwrite in place so we do not keep logging the corruption.
+                try:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    await db._conn.execute(
+                        """INSERT OR REPLACE INTO social_credit_ledger
+                           (utc_date, credits_used, last_updated)
+                           VALUES (?, 0, ?)""",
+                        (today_str, now_iso),
+                    )
+                    await db._conn.commit()
+                except Exception:
+                    logger.exception("social_credit_ledger_overwrite_failed")
             self._utc_date = self._clock().date()
             self._dirty = False
+
+    async def persist(self, db: "Database") -> None:
+        """Lightweight INSERT OR REPLACE of today's counter.
+
+        Cheaper than full ``flush_credit_ledger`` because it is idempotent
+        and safe to call after every ``consume()`` that actually increments
+        the counter. Survives SIGKILL between checkpoints.
+        """
+        if db._conn is None:
+            return
+        if not self._dirty:
+            return
+        today_str = self._utc_date.strftime("%Y-%m-%d")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await db._conn.execute(
+                """INSERT OR REPLACE INTO social_credit_ledger
+                   (utc_date, credits_used, last_updated)
+                   VALUES (?, ?, ?)""",
+                (today_str, self.credits_used, now_iso),
+            )
+            await db._conn.commit()
+            self._dirty = False
+        except Exception:
+            logger.exception("social_credit_ledger_persist_error")
 
 
 async def flush_credit_ledger(db: "Database", ledger: CreditLedger) -> None:

@@ -627,6 +627,7 @@ class Database:
                 market_cap REAL,
                 current_price REAL,
                 detected_at TEXT NOT NULL,
+                alerted_at TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 UNIQUE(coin_id, detected_at)
             );
@@ -682,6 +683,15 @@ class Database:
         ):
             if col not in existing_cols:
                 await self._conn.execute(ddl)
+
+        # Migrate social_signals: add alerted_at if missing (Telegram-dispatch
+        # gating column; dedup treats NULL as "not yet delivered" so we retry).
+        cursor = await self._conn.execute("PRAGMA table_info(social_signals)")
+        ss_cols = {row[1] for row in await cursor.fetchall()}
+        if "alerted_at" not in ss_cols:
+            await self._conn.execute(
+                "ALTER TABLE social_signals ADD COLUMN alerted_at TEXT"
+            )
 
         # Migrate gainers_snapshots: add price_at_snapshot if missing
         cursor = await self._conn.execute("PRAGMA table_info(gainers_snapshots)")

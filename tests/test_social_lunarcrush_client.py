@@ -54,7 +54,11 @@ async def test_auth_header_bearer():
 
 @pytest.mark.asyncio
 async def test_401_sets_disabled_flag():
-    """A 401 response exits the client cleanly and flips disabled=True."""
+    """A 401 response exits the client cleanly and flips disabled=True.
+
+    Zero credit is charged on auth failure (the server didn't process a
+    billable request).
+    """
     s = _settings()
     with aioresponses() as m:
         m.get(LC_URL, status=401, body="")
@@ -65,6 +69,7 @@ async def test_401_sets_disabled_flag():
             await client.close()
     assert client.disabled is True
     assert coins == []
+    assert cost == 0
 
 
 @pytest.mark.asyncio
@@ -160,3 +165,114 @@ async def test_owns_its_own_session():
     assert not client._session.closed
     await client.close()
     assert client._session.closed
+
+
+@pytest.mark.asyncio
+async def test_request_timeout_on_hanging_endpoint():
+    """A hanging endpoint surfaces as an asyncio.TimeoutError -> transport
+    error branch -> empty coins, 0 credit."""
+    s = _settings()
+
+    with aioresponses() as m:
+        # aioresponses' ``timeout=True`` flag raises asyncio.TimeoutError
+        # on the call, exactly like a network timeout.
+        m.get(LC_URL, timeout=True)
+        client = LunarCrushClient(s)
+        try:
+            coins, cost = await client.fetch_coins_list()
+        finally:
+            await client.close()
+    assert coins == []
+    assert cost == 0
+
+
+@pytest.mark.asyncio
+async def test_429_capped_at_60s(monkeypatch):
+    """Five consecutive 429s: delays[3]==40, delays[4]==60, max <= 60."""
+    s = _settings()
+    client = LunarCrushClient(s)
+
+    delays: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr("scout.social.lunarcrush.client.asyncio.sleep", _fake_sleep)
+    with aioresponses() as m:
+        for _ in range(6):
+            m.get(LC_URL, status=429, body="rate limited")
+        try:
+            coins, cost = await client.fetch_coins_list()
+        finally:
+            await client.close()
+    # 5 slots in the sequence + cap: [5,10,20,40,60].
+    assert delays[:5] == [5.0, 10.0, 20.0, 40.0, 60.0]
+    assert max(delays) <= 60.0
+
+
+@pytest.mark.asyncio
+async def test_5xx_retries_then_succeeds(monkeypatch):
+    """503 twice then 200 succeeds on retry; backoff applied."""
+    s = _settings()
+    client = LunarCrushClient(s)
+    delays: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr("scout.social.lunarcrush.client.asyncio.sleep", _fake_sleep)
+    with aioresponses() as m:
+        m.get(LC_URL, status=503, body="bad")
+        m.get(LC_URL, status=503, body="bad")
+        m.get(LC_URL, status=200, payload={"data": [{"id": 1, "symbol": "FOO"}]})
+        try:
+            coins, cost = await client.fetch_coins_list()
+        finally:
+            await client.close()
+    assert len(coins) == 1
+    assert cost == 1
+    assert delays  # at least one 5xx backoff happened
+
+
+@pytest.mark.asyncio
+async def test_5xx_gives_up_after_max_retries_zero_credit(monkeypatch):
+    """After 3 503s the client gives up cleanly with 0 credits charged."""
+    s = _settings()
+    client = LunarCrushClient(s)
+
+    async def _fake_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("scout.social.lunarcrush.client.asyncio.sleep", _fake_sleep)
+    with aioresponses() as m:
+        for _ in range(5):
+            m.get(LC_URL, status=503, body="bad")
+        try:
+            coins, cost = await client.fetch_coins_list()
+        finally:
+            await client.close()
+    assert coins == []
+    assert cost == 0
+
+
+@pytest.mark.asyncio
+async def test_auth_header_bearer_sent_on_wire():
+    """Inspect the actual wire headers: Authorization: Bearer <key>."""
+    s = _settings()
+    captured: dict[str, str] = {}
+
+    def _callback(url, **kwargs):
+        for k, v in (kwargs.get("headers") or {}).items():
+            captured[k] = v
+        from aioresponses import CallbackResult
+
+        return CallbackResult(status=200, payload={"data": []})
+
+    with aioresponses() as m:
+        m.get(LC_URL, callback=_callback)
+        client = LunarCrushClient(s)
+        try:
+            await client.fetch_coins_list()
+        finally:
+            await client.close()
+    assert captured.get("Authorization") == "Bearer lc_key"

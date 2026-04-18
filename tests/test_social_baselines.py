@@ -75,6 +75,24 @@ def test_update_state_null_value_skips_entirely():
     assert update_state(state, 0.0, min_samples=288, spike_ratio=2.0).sample_count == 10
 
 
+def test_update_state_nan_skips_entirely():
+    """NaN is treated like None — does NOT poison the EWMA."""
+    state = _state(avg_social_volume_24h=100.0, sample_count=288)
+    result = update_state(
+        state, float("nan"), min_samples=288, spike_ratio=2.0
+    )
+    assert result.avg_social_volume_24h == 100.0
+    assert result.sample_count == 288  # no increment per §5.4 null rule
+
+
+def test_update_state_negative_value_skips_entirely():
+    """Negative values do not update avg or sample_count."""
+    state = _state(avg_social_volume_24h=100.0, sample_count=288)
+    result = update_state(state, -50.0, min_samples=288, spike_ratio=2.0)
+    assert result.avg_social_volume_24h == 100.0
+    assert result.sample_count == 288
+
+
 def test_update_state_during_warmup_always_ewma():
     """Before warmup, spike-exclusion does not apply -- everything goes into avg."""
     state = _state(avg_social_volume_24h=100.0, sample_count=10)

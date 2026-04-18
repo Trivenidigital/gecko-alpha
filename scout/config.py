@@ -172,6 +172,9 @@ class Settings(BaseSettings):
     LUNARCRUSH_BASELINE_MIN_SAMPLES: int = 288          # EWMA alpha denominator
     LUNARCRUSH_CHECKPOINT_EVERY_N_POLLS: int = 12       # 60 min
     LUNARCRUSH_RETENTION_DAYS: int = 30
+    # After N consecutive uncaught-crash-then-restart cycles, leave the
+    # social tier down rather than thrash against a broken environment.
+    LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS: int = 5
 
     # -------- Paper Trading Engine --------
     TRADING_ENABLED: bool = False                  # master switch

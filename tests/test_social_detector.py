@@ -193,10 +193,13 @@ async def test_detect_spikes_dedup_boundary_exactly_4h(db):
         _state(coin_id="foo", symbol="FOO", avg_social_volume_24h=100.0, sample_count=300),
     )
 
-    # Insert a row 3h 59m ago -- should dedup.
+    # Insert a row 3h 59m ago -- should dedup. alerted_at must be non-NULL
+    # because dedup only suppresses rows that were actually delivered.
     await db._conn.execute(
-        """INSERT INTO social_signals (coin_id, symbol, name, detected_at)
-           VALUES ('foo', 'FOO', 'Foo', datetime('now', '-3 hours', '-59 minutes'))"""
+        """INSERT INTO social_signals (coin_id, symbol, name, detected_at, alerted_at)
+           VALUES ('foo', 'FOO', 'Foo',
+                   datetime('now', '-3 hours', '-59 minutes'),
+                   datetime('now', '-3 hours', '-59 minutes'))"""
     )
     await db._conn.commit()
     coins = [{"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}]

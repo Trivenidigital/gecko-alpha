@@ -52,6 +52,7 @@ async def test_social_signals_table_created(db):
     assert "market_cap" in cols
     assert "current_price" in cols
     assert "detected_at" in cols
+    assert "alerted_at" in cols
     assert "created_at" in cols
 
 

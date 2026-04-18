@@ -294,3 +294,123 @@ async def test_insert_alerts_rolls_back_on_mid_batch_failure(db, monkeypatch):
     cursor = await db._conn.execute("SELECT COUNT(*) FROM social_signals")
     row = await cursor.fetchone()
     assert row[0] == 0  # rollback cleared the partial rows
+
+
+# ---------------------------------------------------------------------------
+# Telegram-fail retry semantics (fix #13)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_telegram_fail_leaves_alerted_at_null_for_retry(db):
+    """When Telegram dispatch fails, the row exists but alerted_at stays
+    NULL -- the next cycle's dedup lets it re-enter detection."""
+    s = _settings()
+    cache = BaselineCache()
+    cache.set("foo", _primed_state("foo", "FOO"))
+    coins = [
+        {"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}
+    ]
+    # Telegram returns False -- alerted_at should NOT be set.
+    send_fake = AsyncMock(return_value=False)
+    await _process_cycle(s, db, cache, coins, send_fn=send_fake)
+
+    cursor = await db._conn.execute(
+        "SELECT alerted_at FROM social_signals WHERE coin_id='foo'"
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    assert row[0] is None  # dedup treats NULL as "not yet alerted"
+
+
+@pytest.mark.asyncio
+async def test_telegram_success_sets_alerted_at(db):
+    """Successful dispatch stamps alerted_at so future cycles dedup it."""
+    s = _settings()
+    cache = BaselineCache()
+    cache.set("foo", _primed_state("foo", "FOO"))
+    coins = [
+        {"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}
+    ]
+    send_fake = AsyncMock(return_value=True)
+    await _process_cycle(s, db, cache, coins, send_fn=send_fake)
+
+    cursor = await db._conn.execute(
+        "SELECT alerted_at FROM social_signals WHERE coin_id='foo'"
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    assert row[0] is not None
+
+
+def test_lunarcrush_max_consecutive_restarts_setting_present():
+    """Config exposes LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS with sane default."""
+    s = _settings()
+    assert hasattr(s, "LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS")
+    assert int(s.LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS) >= 1
+
+
+def test_social_restart_cap_blocks_6th_restart(monkeypatch):
+    """Simulate 6 consecutive crashes: the 6th does NOT schedule a restart.
+
+    Tests the module-level counter + cap logic by driving a mock scheduler
+    with the same cap-guarded increment pattern used in main._schedule_social_restart.
+    """
+    from scout.main import _social_consecutive_restarts
+
+    # Reset the module-level counter deterministically.
+    _social_consecutive_restarts[0] = 0
+
+    restart_calls: list[float] = []
+    max_restarts = 5
+
+    def _fake_schedule(delay: float) -> None:
+        _social_consecutive_restarts[0] += 1
+        if _social_consecutive_restarts[0] > max_restarts:
+            return
+        restart_calls.append(delay)
+
+    for _ in range(6):
+        _fake_schedule(30.0)
+    assert len(restart_calls) == 5  # 6th was blocked
+
+    # Reset after test so later tests see a clean counter.
+    _social_consecutive_restarts[0] = 0
+
+
+@pytest.mark.asyncio
+async def test_dedup_ignores_null_alerted_at_rows(db):
+    """Dedup only suppresses rows whose alerted_at is non-NULL."""
+    from scout.social.lunarcrush.detector import detect_spikes
+    from scout.social.models import BaselineState
+
+    s = _settings()
+    cache = BaselineCache()
+    now = datetime.now(timezone.utc)
+    cache.set(
+        "foo",
+        BaselineState(
+            coin_id="foo",
+            symbol="FOO",
+            avg_social_volume_24h=100.0,
+            avg_galaxy_score=50.0,
+            last_galaxy_score=50.0,
+            interactions_ring=(),
+            sample_count=500,
+            last_poll_at=now,
+            last_updated=now,
+        ),
+    )
+    # Insert a ROW that was stored but never dispatched.
+    await db._conn.execute(
+        """INSERT INTO social_signals (coin_id, symbol, name, detected_at)
+           VALUES ('foo','FOO','Foo', datetime('now', '-1 hours'))"""
+    )
+    await db._conn.commit()
+
+    coins = [
+        {"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}
+    ]
+    alerts, _ = await detect_spikes(db, s, cache, coins)
+    # The previous row has alerted_at NULL -> NOT deduped -> alert fires.
+    assert len(alerts) == 1

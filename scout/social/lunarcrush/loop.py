@@ -188,14 +188,43 @@ async def _process_cycle(
         cache.mark_dirty(coin_id)
 
     # Telegram dispatch (best-effort -- baseline stays committed even on fail).
+    dispatch_ok = False
     try:
-        ok = await send_fn(enriched)
-        if not ok:
+        dispatch_ok = await send_fn(enriched)
+        if not dispatch_ok:
             logger.warning("social_alert_send_returned_false", count=len(enriched))
     except Exception:
         logger.exception("social_alert_send_error", count=len(enriched))
 
+    # On Telegram success, mark alerted_at so the next cycle's dedup knows
+    # the user was actually notified. On failure, rows keep alerted_at=NULL
+    # and re-enter detection next cycle (user never silently drops alerts).
+    if dispatch_ok:
+        await _mark_alerts_dispatched(db, enriched)
+
     return len(enriched)
+
+
+async def _mark_alerts_dispatched(
+    db: "Database", alerts: list[ResearchAlert]
+) -> None:
+    """Set ``alerted_at=now`` for the rows we just successfully sent."""
+    if db._conn is None or not alerts:
+        return
+    from datetime import datetime as _dt, timezone as _tz
+
+    now_iso = _dt.now(_tz.utc).isoformat()
+    try:
+        for a in alerts:
+            await db._conn.execute(
+                """UPDATE social_signals
+                   SET alerted_at = ?
+                   WHERE coin_id = ? AND detected_at = ?""",
+                (now_iso, a.coin_id, a.detected_at.isoformat()),
+            )
+        await db._conn.commit()
+    except Exception:
+        logger.exception("social_mark_alerted_error", count=len(alerts))
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +244,9 @@ def _make_done_callback(
             return
         exc = task.exception()
         if exc is not None:
-            logger.exception("social_loop_task_crashed", exc_info=exc)
+            # logger.error(..., exc_info=exc) is portable across structlog and
+            # stdlib; logger.exception requires a live except-block on stdlib.
+            logger.error("social_loop_task_crashed", exc_info=exc)
             restarter(backoff_seconds)
 
     return _cb
@@ -333,6 +364,10 @@ async def _run_one_cycle(
 
     coins, credit_cost = await client.fetch_coins_list()
     ledger.consume(credit_cost)
+    # Persist after every actual increment so SIGKILL cannot silently
+    # reset the counter between checkpoints.
+    if credit_cost > 0:
+        await ledger.persist(db)
     if client.disabled:
         # 401 / 403 path: shut the loop down cleanly.
         logger.warning("social_loop_auth_disabled_exiting")
