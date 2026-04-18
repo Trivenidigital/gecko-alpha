@@ -33,7 +33,7 @@ def _state(**overrides) -> BaselineState:
         avg_social_volume_24h=100.0,
         avg_galaxy_score=50.0,
         last_galaxy_score=50.0,
-        interactions_ring=[],
+        interactions_ring=(),
         sample_count=288,
         last_poll_at=None,
         last_updated=datetime(2026, 4, 18, tzinfo=timezone.utc),
@@ -116,13 +116,30 @@ def test_interactions_ring_rotates_on_overflow():
     """A 6-slot ring truncates the oldest value on the 7th write."""
     from scout.social.baselines import push_interactions
 
-    ring: list[float] = []
+    ring: tuple[float, ...] = ()
     for v in [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]:
         ring = push_interactions(ring, v)
-    assert ring == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert ring == (1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
     ring = push_interactions(ring, 7.0)
     assert len(ring) == 6
-    assert ring == [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    assert ring == (2.0, 3.0, 4.0, 5.0, 6.0, 7.0)
+
+
+def test_interactions_ring_is_immutable():
+    """interactions_ring is a tuple — .append raises AttributeError."""
+    state = BaselineState(
+        coin_id="foo",
+        symbol="FOO",
+        avg_social_volume_24h=1.0,
+        avg_galaxy_score=50.0,
+        last_galaxy_score=50.0,
+        interactions_ring=(1.0, 2.0),
+        sample_count=1,
+        last_poll_at=None,
+        last_updated=datetime(2026, 4, 18, tzinfo=timezone.utc),
+    )
+    with pytest.raises(AttributeError):
+        state.interactions_ring.append(3.0)  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -143,6 +160,41 @@ async def test_flush_baselines_serializes_interactions_ring(db):
     assert row is not None
     parsed = json.loads(row[0])
     assert parsed == [1.0, 2.0, 3.0]
+
+
+@pytest.mark.asyncio
+async def test_flush_rolls_back_and_remarks_dirty_on_mid_batch_failure(
+    db, monkeypatch
+):
+    """If an INSERT raises partway through, the whole batch is rolled back
+    and EVERY originally-dirty coin is re-marked so the next flush retries."""
+    cache = BaselineCache()
+    for cid in ("a", "b", "c"):
+        cache.set(cid, _state(coin_id=cid, symbol=cid.upper()))
+        cache.mark_dirty(cid)
+
+    original_execute = db._conn.execute
+    call_count = [0]
+
+    async def _maybe_fail(*args, **kwargs):
+        sql = args[0] if args else ""
+        if isinstance(sql, str) and "INSERT OR REPLACE INTO social_baselines" in sql:
+            call_count[0] += 1
+            if call_count[0] == 2:
+                raise RuntimeError("simulated insert failure")
+        return await original_execute(*args, **kwargs)
+
+    monkeypatch.setattr(db._conn, "execute", _maybe_fail)
+    with pytest.raises(RuntimeError):
+        await flush_baselines(db, cache)
+
+    # After rollback + re-mark, the dirty set must again hold all 3 coins.
+    assert cache.pop_dirty() == {"a", "b", "c"}
+
+    # The rollback means no social_baselines rows actually persisted.
+    cursor = await db._conn.execute("SELECT COUNT(*) FROM social_baselines")
+    row = await cursor.fetchone()
+    assert row[0] == 0
 
 
 @pytest.mark.asyncio

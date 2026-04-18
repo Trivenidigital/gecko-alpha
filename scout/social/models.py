@@ -79,7 +79,7 @@ class BaselineState(NamedTuple):
     avg_social_volume_24h: float
     avg_galaxy_score: float
     last_galaxy_score: Optional[float]
-    interactions_ring: list[float]
+    interactions_ring: tuple[float, ...]
     sample_count: int
     last_poll_at: Optional[datetime]
     last_updated: datetime

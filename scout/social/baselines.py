@@ -27,14 +27,15 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def push_interactions(ring: list[float], value: float) -> list[float]:
+def push_interactions(
+    ring: tuple[float, ...] | list[float], value: float
+) -> tuple[float, ...]:
     """Append ``value`` to the ring, truncating the oldest entry on overflow.
 
-    Returns a NEW list; the caller replaces the stored ring via
+    Returns a NEW immutable tuple; the caller replaces the stored ring via
     ``state._replace(interactions_ring=...)``.
     """
-    next_ring = list(ring)
-    next_ring.append(value)
+    next_ring = (*ring, value)
     if len(next_ring) > INTERACTIONS_RING_SIZE:
         next_ring = next_ring[-INTERACTIONS_RING_SIZE:]
     return next_ring
@@ -122,7 +123,7 @@ class BaselineCache:
             avg_social_volume_24h=0.0,
             avg_galaxy_score=0.0,
             last_galaxy_score=None,
-            interactions_ring=[],
+            interactions_ring=(),
             sample_count=0,
             last_poll_at=None,
             last_updated=_utcnow(),
@@ -170,7 +171,7 @@ async def hydrate_baselines(db: "Database", cache: BaselineCache) -> int:
             avg_social_volume_24h=float(r[2]),
             avg_galaxy_score=float(r[3]),
             last_galaxy_score=float(r[4]) if r[4] is not None else None,
-            interactions_ring=[float(x) for x in ring],
+            interactions_ring=tuple(float(x) for x in ring),
             sample_count=int(r[6]),
             last_poll_at=last_poll,
             last_updated=last_updated,
@@ -187,6 +188,11 @@ async def flush_baselines(db: "Database", cache: BaselineCache) -> int:
     On first write for a coin the row is INSERTed; subsequent writes hit the
     UPSERT branch via ``INSERT OR REPLACE``. Returns the number of rows
     written.
+
+    Atomicity: if any INSERT OR a final commit fails, the failed-row and
+    all not-yet-attempted coin_ids are re-marked dirty so the next flush
+    retries them. The DB transaction is rolled back so partial writes do
+    not leak into a later commit from a different code path.
     """
     if db._conn is None:
         return 0
@@ -195,29 +201,48 @@ async def flush_baselines(db: "Database", cache: BaselineCache) -> int:
         return 0
     now = _utcnow().isoformat()
     written = 0
-    for coin_id in dirty:
-        state = cache.get(coin_id)
-        if state is None:
-            continue
-        await db._conn.execute(
-            """INSERT OR REPLACE INTO social_baselines
-               (coin_id, symbol, avg_social_volume_24h, avg_galaxy_score,
-                last_galaxy_score, interactions_ring, sample_count,
-                last_poll_at, last_updated)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                state.coin_id,
-                state.symbol,
-                state.avg_social_volume_24h,
-                state.avg_galaxy_score,
-                state.last_galaxy_score,
-                json.dumps(list(state.interactions_ring)),
-                state.sample_count,
-                state.last_poll_at.isoformat() if state.last_poll_at else None,
-                now,
-            ),
-        )
-        written += 1
-    await db._conn.commit()
+    remaining = list(dirty)  # iteration order used for retry-bookkeeping
+    attempted: set[str] = set()
+    try:
+        for coin_id in remaining:
+            attempted.add(coin_id)
+            state = cache.get(coin_id)
+            if state is None:
+                continue
+            await db._conn.execute(
+                """INSERT OR REPLACE INTO social_baselines
+                   (coin_id, symbol, avg_social_volume_24h, avg_galaxy_score,
+                    last_galaxy_score, interactions_ring, sample_count,
+                    last_poll_at, last_updated)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    state.coin_id,
+                    state.symbol,
+                    state.avg_social_volume_24h,
+                    state.avg_galaxy_score,
+                    state.last_galaxy_score,
+                    json.dumps(list(state.interactions_ring)),
+                    state.sample_count,
+                    state.last_poll_at.isoformat() if state.last_poll_at else None,
+                    now,
+                ),
+            )
+            written += 1
+        await db._conn.commit()
+    except Exception:
+        # Roll back any partial rows in the open transaction so a later
+        # unrelated commit does NOT flush them silently.
+        try:
+            await db._conn.rollback()
+        except Exception:
+            logger.exception("social_baselines_rollback_error")
+        # Re-mark: the failing coin + everyone not yet attempted must be
+        # flushed again next cycle. Successfully-written coins (attempted
+        # but not the current failing one) are also re-marked because the
+        # rollback wiped them from the DB.
+        for cid in dirty:
+            cache.mark_dirty(cid)
+        logger.exception("social_baselines_flush_error")
+        raise
     logger.info("social_baselines_flushed", count=written)
     return written

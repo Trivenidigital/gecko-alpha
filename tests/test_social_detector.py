@@ -46,11 +46,16 @@ def _state(**overrides) -> BaselineState:
         avg_social_volume_24h=100.0,
         avg_galaxy_score=50.0,
         last_galaxy_score=50.0,
-        interactions_ring=[],
+        interactions_ring=(),
         sample_count=300,
         last_poll_at=now,
         last_updated=now,
     )
+    # Auto-coerce list -> tuple for callers that still pass a list literal.
+    if "interactions_ring" in overrides and isinstance(
+        overrides["interactions_ring"], list
+    ):
+        overrides["interactions_ring"] = tuple(overrides["interactions_ring"])
     defaults.update(overrides)
     return BaselineState(**defaults)
 

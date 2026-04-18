@@ -62,13 +62,13 @@ def test_baseline_state_defaults():
         avg_social_volume_24h=0.0,
         avg_galaxy_score=0.0,
         last_galaxy_score=None,
-        interactions_ring=[],
+        interactions_ring=(),
         sample_count=0,
         last_poll_at=None,
         last_updated=datetime(2026, 4, 18, tzinfo=timezone.utc),
     )
     assert state.sample_count == 0
-    assert state.interactions_ring == []
+    assert state.interactions_ring == ()
 
 
 def test_baseline_state_is_immutable_via_replace():
@@ -80,7 +80,7 @@ def test_baseline_state_is_immutable_via_replace():
         avg_social_volume_24h=1.0,
         avg_galaxy_score=50.0,
         last_galaxy_score=50.0,
-        interactions_ring=[1.0, 2.0],
+        interactions_ring=(1.0, 2.0),
         sample_count=1,
         last_poll_at=now,
         last_updated=now,

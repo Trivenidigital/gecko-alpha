@@ -15,7 +15,6 @@ Runs independently of the main scan cycle. Lifecycle:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 import aiohttp
@@ -40,6 +39,10 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
+class _AuthDisabled(Exception):
+    """Raised internally to break out of the loop on 401/403."""
+
+
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
@@ -52,42 +55,54 @@ async def _insert_alerts(
 
     UNIQUE(coin_id, detected_at) provides TOCTOU-safe dedup even if the
     detector orchestrator somehow queued two detections for the same coin.
+
+    Atomicity: if any INSERT raises mid-batch, rollback the open
+    transaction so partial rows do not leak into a later commit from a
+    different code path, then re-raise. Alerts stay un-persisted; the
+    caller treats the batch as failed and re-enters detection next cycle.
     """
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
-    for a in alerts:
-        kinds = {k.value for k in a.spike_kinds}
-        await db._conn.execute(
-            """INSERT OR IGNORE INTO social_signals (
-                coin_id, symbol, name,
-                fired_social_volume_24h, fired_galaxy_jump, fired_interactions_accel,
-                galaxy_score, social_volume_24h, social_volume_baseline,
-                social_spike_ratio, interactions_24h, sentiment,
-                social_dominance, price_change_1h, price_change_24h,
-                market_cap, current_price, detected_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                a.coin_id,
-                a.symbol,
-                a.name,
-                1 if "social_volume_24h" in kinds else 0,
-                1 if "galaxy_jump" in kinds else 0,
-                1 if "interactions_accel" in kinds else 0,
-                a.galaxy_score,
-                a.social_volume_24h,
-                a.social_volume_baseline,
-                a.social_spike_ratio,
-                a.interactions_24h,
-                a.sentiment,
-                a.social_dominance,
-                a.price_change_1h,
-                a.price_change_24h,
-                a.market_cap,
-                a.current_price,
-                a.detected_at.isoformat(),
-            ),
-        )
-    await db._conn.commit()
+    try:
+        for a in alerts:
+            kinds = {k.value for k in a.spike_kinds}
+            await db._conn.execute(
+                """INSERT OR IGNORE INTO social_signals (
+                    coin_id, symbol, name,
+                    fired_social_volume_24h, fired_galaxy_jump, fired_interactions_accel,
+                    galaxy_score, social_volume_24h, social_volume_baseline,
+                    social_spike_ratio, interactions_24h, sentiment,
+                    social_dominance, price_change_1h, price_change_24h,
+                    market_cap, current_price, detected_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    a.coin_id,
+                    a.symbol,
+                    a.name,
+                    1 if "social_volume_24h" in kinds else 0,
+                    1 if "galaxy_jump" in kinds else 0,
+                    1 if "interactions_accel" in kinds else 0,
+                    a.galaxy_score,
+                    a.social_volume_24h,
+                    a.social_volume_baseline,
+                    a.social_spike_ratio,
+                    a.interactions_24h,
+                    a.sentiment,
+                    a.social_dominance,
+                    a.price_change_1h,
+                    a.price_change_24h,
+                    a.market_cap,
+                    a.current_price,
+                    a.detected_at.isoformat(),
+                ),
+            )
+        await db._conn.commit()
+    except Exception:
+        try:
+            await db._conn.rollback()
+        except Exception:
+            logger.exception("social_insert_rollback_error")
+        raise
 
 
 async def _prune_old_rows(db: "Database", retention_days: int) -> int:
@@ -161,8 +176,14 @@ async def _process_cycle(
         # in-memory cache in sync with the DB row that was NOT inserted.
         return 0
 
-    # DB succeeded -- commit buffered baseline updates to the cache.
+    # DB succeeded -- commit buffered baseline updates ONLY for coins
+    # whose alerts actually survived dedup + top-N truncation. A firing
+    # coin that got dropped by either filter leaves its pre-state in the
+    # cache (spec §8 step 10: cache-consistency invariant with DB rows).
+    surviving_ids = {a.coin_id for a in enriched}
     for coin_id, state in buffered_states.items():
+        if coin_id not in surviving_ids:
+            continue
         cache.set(coin_id, state)
         cache.mark_dirty(coin_id)
 
@@ -247,6 +268,9 @@ async def run_social_loop(
                 await _run_one_cycle(settings, db, client, cache, ledger)
             except asyncio.CancelledError:
                 raise
+            except _AuthDisabled:
+                logger.warning("social_loop_auth_disabled_exiting")
+                break
             except Exception:
                 logger.exception("social_loop_cycle_error")
 
@@ -330,7 +354,3 @@ async def _run_one_cycle(
         current_poll_interval=ledger.current_poll_interval(),
         send_fn=_dispatch,
     )
-
-
-class _AuthDisabled(Exception):
-    """Raised internally to break out of the loop on 401/403."""
