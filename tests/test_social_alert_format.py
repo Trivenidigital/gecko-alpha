@@ -66,8 +66,24 @@ def test_markdown_escape_of_underscore_symbol():
 def test_missing_price_renders_em_dash():
     alert = _alert(current_price=None, price_change_1h=None, price_change_24h=None)
     msg = format_social_alert([alert])
-    # Renders an em dash for the missing price line rather than blowing up.
-    assert "\u2014" in msg or "—" in msg
+    # Asserts the SPECIFIC "price: —" substring so a future change that
+    # renders the em-dash elsewhere (e.g. a None-sentiment field) cannot
+    # false-positive this test. The price line is the regression we care
+    # about: partial price data used to crash the formatter.
+    assert "price: \u2014" in msg or "price: —" in msg
+
+
+def test_format_social_alert_empty_list_returns_header_only():
+    """An empty alerts list must not crash -- returns just the header line.
+
+    format_social_alert is sometimes called speculatively before the
+    detector result count is checked; a defensive return beats a crash.
+    """
+    msg = format_social_alert([])
+    assert "*Social Velocity*" in msg
+    # No per-alert blocks mean no em-dashes, no symbol lines.
+    assert "kinds:" not in msg
+    assert "mcap:" not in msg
 
 
 def test_truncation_at_4096():

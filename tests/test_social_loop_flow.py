@@ -258,6 +258,91 @@ async def test_401_exits_loop_cleanly(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_prune_old_rows_zero_retention_is_noop(db):
+    """retention_days <= 0 short-circuits the DELETE so a misconfigured
+    setting cannot accidentally wipe the whole social_signals table.
+    """
+    from scout.social.lunarcrush.loop import _prune_old_rows
+
+    # Seed an ancient row.
+    await db._conn.execute(
+        """INSERT INTO social_signals (coin_id, symbol, name, detected_at)
+           VALUES ('foo', 'FOO', 'Foo', '2020-01-01T00:00:00+00:00')"""
+    )
+    await db._conn.commit()
+
+    # retention_days == 0 -- must NOT delete.
+    pruned = await _prune_old_rows(db, 0)
+    assert pruned == 0
+
+    pruned = await _prune_old_rows(db, -5)
+    assert pruned == 0
+
+    cursor = await db._conn.execute("SELECT COUNT(*) FROM social_signals")
+    assert (await cursor.fetchone())[0] == 1  # ancient row still there
+
+    # Sanity: retention_days == 1 DOES delete.
+    pruned = await _prune_old_rows(db, 1)
+    assert pruned == 1
+
+
+@pytest.mark.asyncio
+async def test_insert_alerts_skips_existing_duplicate_commits_rest(db):
+    """INSERT OR IGNORE: when one row in the batch collides on the
+    UNIQUE(coin_id, detected_at) pair, that row is silently skipped and the
+    remaining rows commit. Proves the INSERT OR IGNORE clause isn't
+    turning duplicates into batch-killing exceptions.
+    """
+    from scout.social.lunarcrush.loop import _insert_alerts
+    from scout.social.models import ResearchAlert, SpikeKind
+
+    shared_ts = datetime.now(timezone.utc)
+    # Pre-seed a row that will collide with alerts[1].
+    await db._conn.execute(
+        """INSERT INTO social_signals (coin_id, symbol, name,
+            fired_social_volume_24h, fired_galaxy_jump, fired_interactions_accel,
+            detected_at)
+           VALUES ('dup', 'DUP', 'Dup Coin', 1, 0, 0, ?)""",
+        (shared_ts.isoformat(),),
+    )
+    await db._conn.commit()
+
+    alerts = [
+        ResearchAlert(
+            coin_id="new1",
+            symbol="N1",
+            name="New 1",
+            spike_kinds=[SpikeKind.SOCIAL_VOLUME_24H],
+            detected_at=shared_ts,
+        ),
+        ResearchAlert(
+            coin_id="dup",
+            symbol="DUP",
+            name="Dup Coin",
+            spike_kinds=[SpikeKind.SOCIAL_VOLUME_24H],
+            detected_at=shared_ts,  # same (coin_id, detected_at) -- UNIQUE collision
+        ),
+        ResearchAlert(
+            coin_id="new2",
+            symbol="N2",
+            name="New 2",
+            spike_kinds=[SpikeKind.SOCIAL_VOLUME_24H],
+            detected_at=shared_ts,
+        ),
+    ]
+    # Must NOT raise -- INSERT OR IGNORE silently skips the duplicate.
+    await _insert_alerts(db, alerts)
+
+    cursor = await db._conn.execute(
+        "SELECT coin_id FROM social_signals ORDER BY coin_id"
+    )
+    rows = await cursor.fetchall()
+    coin_ids = [r[0] for r in rows]
+    # dup (pre-existing) + new1 + new2 -- dup appears exactly once.
+    assert sorted(coin_ids) == ["dup", "new1", "new2"]
+
+
+@pytest.mark.asyncio
 async def test_insert_alerts_rolls_back_on_mid_batch_failure(db, monkeypatch):
     """When the 3rd INSERT raises, the batch rolls back (0 rows persist)
     and the exception propagates out of _insert_alerts."""

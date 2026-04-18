@@ -115,6 +115,63 @@ def test_update_state_during_warmup_always_ewma():
 
 
 @pytest.mark.asyncio
+async def test_hydrate_handles_malformed_ring_json(db):
+    """A row with unparseable interactions_ring JSON hydrates with ring=()
+    rather than crashing the whole social loop.
+    """
+    # Directly insert a row with an intentionally broken ring.
+    await db._conn.execute(
+        """INSERT INTO social_baselines (
+            coin_id, symbol, avg_social_volume_24h, avg_galaxy_score,
+            last_galaxy_score, interactions_ring, sample_count,
+            last_poll_at, last_updated
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "foo", "FOO", 100.0, 50.0, 50.0,
+            "{not-json",  # unparseable
+            42,
+            None,
+            "2026-04-18T00:00:00+00:00",
+        ),
+    )
+    await db._conn.commit()
+
+    cache = BaselineCache()
+    loaded = await hydrate_baselines(db, cache)
+    assert loaded == 1
+    state = cache.get("foo")
+    assert state is not None
+    assert state.interactions_ring == ()  # safe default on corrupt JSON
+    assert state.sample_count == 42  # non-ring fields still hydrated
+
+
+@pytest.mark.asyncio
+async def test_hydrate_handles_ring_wrong_type(db):
+    """interactions_ring persisted as a JSON object (not a list) -> ring=()."""
+    await db._conn.execute(
+        """INSERT INTO social_baselines (
+            coin_id, symbol, avg_social_volume_24h, avg_galaxy_score,
+            last_galaxy_score, interactions_ring, sample_count,
+            last_poll_at, last_updated
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "foo", "FOO", 100.0, 50.0, 50.0,
+            json.dumps({"not": "a list"}),
+            42,
+            None,
+            "2026-04-18T00:00:00+00:00",
+        ),
+    )
+    await db._conn.commit()
+
+    cache = BaselineCache()
+    await hydrate_baselines(db, cache)
+    state = cache.get("foo")
+    assert state is not None
+    assert state.interactions_ring == ()
+
+
+@pytest.mark.asyncio
 async def test_hydrate_and_flush_survives_restart(db, tmp_path):
     """Flushing, closing, re-opening a DB preserves baseline rows."""
     cache = BaselineCache()

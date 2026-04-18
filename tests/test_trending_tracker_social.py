@@ -12,6 +12,7 @@ import pytest
 
 from scout.db import Database
 from scout.trending.tracker import (
+    _check_detector,
     compare_with_signals,
     get_recent_comparisons,
     get_trending_stats,
@@ -59,6 +60,86 @@ async def _insert_social_signal(
 # ---------------------------------------------------------------------------
 # Detection + lead-minutes
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# _check_detector helper regression guard (design spec §12 refactor)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_check_detector_direct_social_tier_match(db):
+    """Directly exercise _check_detector against social_signals to pin down
+    the regression surface. If the helper ever stops honouring either
+    ``coin_id`` or LOWER(symbol), this asserts first -- before the tier
+    integration tests go red in a noisier way.
+    """
+    trending_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    social_at = trending_at - timedelta(minutes=30)
+    await _insert_social_signal(db, "foo", "FOO", social_at)
+
+    # Exact coin_id match path.
+    detected, detected_at, lead = await _check_detector(
+        db,
+        table_name="social_signals",
+        id_col="coin_id",
+        coin_id="foo",
+        symbol="DOES_NOT_MATCH",
+        first_trending_at=_sqlite_ts(trending_at),
+    )
+    assert detected is True
+    assert detected_at is not None
+    assert 29.0 <= (lead or 0) <= 31.0
+
+    # Case-insensitive symbol-fallback path.
+    detected, detected_at, lead = await _check_detector(
+        db,
+        table_name="social_signals",
+        id_col="coin_id",
+        coin_id="UNMATCHED_ID",
+        symbol="foo",  # stored row has symbol='FOO'
+        first_trending_at=_sqlite_ts(trending_at),
+    )
+    assert detected is True
+    assert lead is not None
+
+
+@pytest.mark.asyncio
+async def test_check_detector_lead_floors_at_zero_within_tolerance(db):
+    """A detection AFTER trending but within the 5-minute tolerance window
+    still returns detected=True with lead=0 (not a negative number).
+    """
+    trending_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    social_at = trending_at + timedelta(minutes=2)  # 2m AFTER trending
+    await _insert_social_signal(db, "foo", "FOO", social_at)
+
+    detected, _, lead = await _check_detector(
+        db,
+        table_name="social_signals",
+        id_col="coin_id",
+        coin_id="foo",
+        symbol="FOO",
+        first_trending_at=_sqlite_ts(trending_at),
+    )
+    assert detected is True
+    assert lead == 0
+
+
+@pytest.mark.asyncio
+async def test_check_detector_no_match_returns_false_triple(db):
+    """A coin with no row in the given table returns (False, None, None)."""
+    trending_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    detected, detected_at, lead = await _check_detector(
+        db,
+        table_name="social_signals",
+        id_col="coin_id",
+        coin_id="never-seen",
+        symbol="NOPE",
+        first_trending_at=_sqlite_ts(trending_at),
+    )
+    assert detected is False
+    assert detected_at is None
+    assert lead is None
 
 
 @pytest.mark.asyncio

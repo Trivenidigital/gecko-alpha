@@ -208,6 +208,32 @@ async def test_detect_spikes_dedup_boundary_exactly_4h(db):
 
 
 @pytest.mark.asyncio
+async def test_detect_spikes_dedup_just_past_cutoff_re_fires(db):
+    """A row 4h 1m old is past the cutoff -- detection MUST be allowed again.
+
+    Pins down the off-by-one surface on the SQL cutoff. The sibling test
+    above verifies a row 3h 59m ago suppresses. Together they bracket the
+    4h dedup boundary from both sides.
+    """
+    s = _settings(LUNARCRUSH_DEDUP_HOURS=4)
+    cache = BaselineCache()
+    cache.set(
+        "foo",
+        _state(coin_id="foo", symbol="FOO", avg_social_volume_24h=100.0, sample_count=300),
+    )
+    await db._conn.execute(
+        """INSERT INTO social_signals (coin_id, symbol, name, detected_at, alerted_at)
+           VALUES ('foo', 'FOO', 'Foo',
+                   datetime('now', '-4 hours', '-1 minutes'),
+                   datetime('now', '-4 hours', '-1 minutes'))"""
+    )
+    await db._conn.commit()
+    coins = [{"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}]
+    alerts, _ = await detect_spikes(db, s, cache, coins)
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
 async def test_detect_spikes_top_n(db):
     """With many qualifying coins, only TOP_N are returned."""
     s = _settings(LUNARCRUSH_TOP_N=3)
@@ -252,3 +278,15 @@ async def test_detect_spikes_increments_sample_count_for_all_coins(db):
     state = cache.get("foo")
     assert state is not None
     assert state.sample_count == 51
+
+
+@pytest.mark.asyncio
+async def test_detect_spikes_empty_coins_returns_empty(db):
+    """Empty coins list returns ([], {}) without touching the DB or cache."""
+    s = _settings()
+    cache = BaselineCache()
+    alerts, buffered = await detect_spikes(db, s, cache, [])
+    assert alerts == []
+    assert buffered == {}
+    # Cache untouched.
+    assert len(cache) == 0
