@@ -4,7 +4,7 @@ import pytest
 import aiohttp
 from aioresponses import aioresponses
 
-from scout.alerter import send_alert, format_alert_message
+from scout.alerter import _escape_md, send_alert, format_alert_message
 
 
 @pytest.fixture
@@ -99,6 +99,31 @@ def test_alert_message_includes_vol_spike_flag(token_factory):
     msg = format_alert_message(token, signals)
     assert "CoinGecko Signals" in msg
     assert "volume spike" in msg.lower() or "vol >>" in msg.lower()
+
+
+def test_escape_md_backslash_escaped_first():
+    """A literal backslash in input must be escaped once, not re-escaped
+    after an underscore is prefixed with its own backslash. The ordering of
+    _MD_ESCAPE_CHARS puts backslash first so we never double-escape.
+    """
+    # A literal backslash becomes '\\' (escaped backslash), not '\\\\' (double).
+    assert _escape_md("a\\b") == "a\\\\b"
+    # Literal backslash AND underscore: each gets ONE preceding backslash.
+    assert _escape_md("a\\_b") == "a\\\\\\_b"
+
+
+def test_escape_md_protects_underscore_star_bracket_tick():
+    """All Markdown-v1 metachars are escaped."""
+    assert _escape_md("AS_ROID") == r"AS\_ROID"
+    assert _escape_md("*bold*") == r"\*bold\*"
+    assert _escape_md("[link]") == r"\[link\]"
+    assert _escape_md("`code`") == r"\`code\`"
+
+
+def test_escape_md_handles_none_and_non_string():
+    """None returns empty string; ints/floats are coerced via str()."""
+    assert _escape_md(None) == ""
+    assert _escape_md(42) == "42"
 
 
 async def test_send_alert_telegram_and_discord(mock_aiohttp, token_factory, settings_factory):

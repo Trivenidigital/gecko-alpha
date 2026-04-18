@@ -63,6 +63,11 @@ class ResearchAlert(BaseModel):
     market_cap: Optional[float] = None
     current_price: Optional[float] = None
 
+    # Matched CoinGecko slug from the price-enrichment cache (see spec §9).
+    # When set, the alerter renders a CG chart link; when None, the link is
+    # omitted rather than constructed from a numeric LunarCrush coin_id.
+    cg_slug: Optional[str] = None
+
     detected_at: datetime
 
 

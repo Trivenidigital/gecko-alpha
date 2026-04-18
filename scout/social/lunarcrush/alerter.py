@@ -89,8 +89,17 @@ def _render_alert(alert: ResearchAlert) -> str:
         f"{alert.sentiment:.2f}" if alert.sentiment is not None else "—"
     )
 
+    # LunarCrush link uses the LC-native coin_id which may be numeric.
     lc_url = f"https://lunarcrush.com/coins/{alert.coin_id}"
-    cg_url = f"https://www.coingecko.com/en/coins/{alert.coin_id}"
+
+    # CoinGecko chart link is only emitted when we have a real CG slug
+    # matched via the price-enrichment cache. Constructing it from a
+    # numeric LunarCrush coin_id (e.g. 12345) produces a 404 page.
+    if alert.cg_slug:
+        cg_url = f"https://www.coingecko.com/en/coins/{alert.cg_slug}"
+        links_line = f"[LunarCrush]({lc_url}) · [chart]({cg_url})"
+    else:
+        links_line = f"[LunarCrush]({lc_url})"
 
     return (
         f"\n*{symbol}* — {name}\n"
@@ -98,7 +107,7 @@ def _render_alert(alert: ResearchAlert) -> str:
         f"galaxy: {galaxy}{jump} | social vol: {sv_ratio} | interactions: {interactions}\n"
         f"{price_line}\n"
         f"mcap: {_fmt_usd(alert.market_cap)} | sentiment: {sentiment}\n"
-        f"[LunarCrush]({lc_url}) · [chart]({cg_url})"
+        f"{links_line}"
     )
 
 
@@ -114,16 +123,22 @@ async def send_social_alert(
     alerts: list[ResearchAlert],
     session: aiohttp.ClientSession,
     settings: "Settings",
-) -> bool:
-    """Dispatch a batched social-velocity message. Returns True on success."""
+) -> tuple[bool, Optional[str]]:
+    """Dispatch a batched social-velocity message.
+
+    Returns ``(ok, reason)``: ``ok`` is True on success, in which case
+    ``reason`` is ``None``. On failure ``ok`` is False and ``reason`` is a
+    short string (e.g. ``"Telegram send failed: 401 Unauthorized"``) so the
+    caller can log the actual cause at the dispatch site.
+    """
     if not alerts:
-        return False
+        return False, "no alerts"
     from scout.alerter import send_telegram_message
 
     text = format_social_alert(alerts)
     try:
         await send_telegram_message(text, session, settings)
-        return True
-    except Exception:
+        return True, None
+    except Exception as exc:
         logger.exception("social_alert_send_failed", count=len(alerts))
-        return False
+        return False, f"{type(exc).__name__}: {exc}"

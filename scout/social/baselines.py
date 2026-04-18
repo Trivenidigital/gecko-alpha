@@ -74,8 +74,15 @@ def update_state(
                 last_updated=_utcnow(),
             )
 
-    alpha = 1.0 / max(min_samples, 1)
-    new_avg = alpha * new_value + (1.0 - alpha) * state.avg_social_volume_24h
+    # First-sample bootstrap: the bootstrap path seeds avg=0.0 so the very
+    # first real sample must replace the zero directly, not EWMA-average
+    # against it (which would poison the baseline at ``new_value / min_samples``
+    # and make the coin look perpetually "spiking" during warmup).
+    if state.sample_count == 0 and state.avg_social_volume_24h == 0.0:
+        new_avg = new_value
+    else:
+        alpha = 1.0 / max(min_samples, 1)
+        new_avg = alpha * new_value + (1.0 - alpha) * state.avg_social_volume_24h
     return state._replace(
         avg_social_volume_24h=new_avg,
         sample_count=state.sample_count + 1,
@@ -149,8 +156,20 @@ async def hydrate_baselines(db: "Database", cache: BaselineCache) -> int:
         try:
             ring = json.loads(r[5] or "[]")
             if not isinstance(ring, list):
+                logger.warning(
+                    "social_baseline_corrupt_field",
+                    coin_id=r[0],
+                    field="interactions_ring",
+                    reason="not a list",
+                )
                 ring = []
         except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                "social_baseline_corrupt_field",
+                coin_id=r[0],
+                field="interactions_ring",
+                reason="unparseable JSON",
+            )
             ring = []
         last_poll = None
         if r[7]:
@@ -159,20 +178,42 @@ async def hydrate_baselines(db: "Database", cache: BaselineCache) -> int:
                 if last_poll.tzinfo is None:
                     last_poll = last_poll.replace(tzinfo=timezone.utc)
             except ValueError:
+                logger.warning(
+                    "social_baseline_corrupt_field",
+                    coin_id=r[0],
+                    field="last_poll_at",
+                    reason="unparseable ISO datetime",
+                )
                 last_poll = None
         try:
             last_updated = datetime.fromisoformat(r[8])
             if last_updated.tzinfo is None:
                 last_updated = last_updated.replace(tzinfo=timezone.utc)
         except (ValueError, TypeError):
+            logger.warning(
+                "social_baseline_corrupt_field",
+                coin_id=r[0],
+                field="last_updated",
+                reason="unparseable ISO datetime",
+            )
             last_updated = _utcnow()
+        try:
+            ring_tuple = tuple(float(x) for x in ring)
+        except (TypeError, ValueError):
+            logger.warning(
+                "social_baseline_corrupt_field",
+                coin_id=r[0],
+                field="interactions_ring_values",
+                reason="non-numeric element",
+            )
+            ring_tuple = ()
         state = BaselineState(
             coin_id=r[0],
             symbol=r[1],
             avg_social_volume_24h=float(r[2]),
             avg_galaxy_score=float(r[3]),
             last_galaxy_score=float(r[4]) if r[4] is not None else None,
-            interactions_ring=tuple(float(x) for x in ring),
+            interactions_ring=ring_tuple,
             sample_count=int(r[6]),
             last_poll_at=last_poll,
             last_updated=last_updated,

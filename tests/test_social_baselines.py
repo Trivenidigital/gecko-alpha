@@ -93,6 +93,17 @@ def test_update_state_negative_value_skips_entirely():
     assert result.sample_count == 288
 
 
+def test_update_state_first_sample_bootstraps_avg_directly():
+    """A fresh baseline (sample_count=0, avg=0) seeds avg from the first
+    real value -- EWMA-averaging against zero would poison the baseline at
+    ``new_value / min_samples`` and make the coin look perpetually spiking.
+    """
+    state = _state(avg_social_volume_24h=0.0, sample_count=0)
+    new = update_state(state, new_value=500.0, min_samples=288, spike_ratio=2.0)
+    assert new.avg_social_volume_24h == 500.0
+    assert new.sample_count == 1
+
+
 def test_update_state_during_warmup_always_ewma():
     """Before warmup, spike-exclusion does not apply -- everything goes into avg."""
     state = _state(avg_social_volume_24h=100.0, sample_count=10)
@@ -216,33 +227,88 @@ async def test_flush_rolls_back_and_remarks_dirty_on_mid_batch_failure(
 
 
 @pytest.mark.asyncio
-async def test_flush_on_cancelled_error(db):
-    """A CancelledError in the surrounding loop triggers finally-flush.
+async def test_flush_on_cancelled_error(tmp_path, monkeypatch):
+    """Driving the REAL run_social_loop: a cancellation propagates out and
+    the ``finally`` clause still flushes dirty baselines to the DB.
 
-    We simulate by running a task that writes, then gets cancelled; the
-    finally block flushes to DB before letting the cancellation propagate.
+    Replaces the earlier fake-worker tautology (test gap #6 / fix #21).
     """
-    cache = BaselineCache()
-    cache.set("foo", _state(coin_id="foo", sample_count=999))
-    cache.mark_dirty("foo")
+    from scout.config import Settings
+    from scout.db import Database
+    from scout.social.lunarcrush import loop as loop_mod
 
-    async def worker() -> None:
-        try:
-            await asyncio.sleep(3600)  # would be cancelled
-        except asyncio.CancelledError:
-            raise
-        finally:
-            await flush_baselines(db, cache)
-
-    task = asyncio.create_task(worker())
-    await asyncio.sleep(0.01)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    cursor = await db._conn.execute(
-        "SELECT sample_count FROM social_baselines WHERE coin_id = 'foo'"
+    s = Settings(
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        LUNARCRUSH_ENABLED=True,
+        LUNARCRUSH_API_KEY="lc_key",
+        LUNARCRUSH_POLL_INTERVAL=60,
+        LUNARCRUSH_CHECKPOINT_EVERY_N_POLLS=0,  # no checkpoint during test
     )
-    row = await cursor.fetchone()
-    assert row is not None
-    assert row[0] == 999
+    d = Database(tmp_path / "cancel.db")
+    await d.initialize()
+
+    try:
+        # Pre-populate the cache via hydrate so a dirty entry exists.
+        cache_seed = BaselineCache()
+        cache_seed.set(
+            "foo",
+            _state(coin_id="foo", sample_count=999, avg_social_volume_24h=250.0),
+        )
+        cache_seed.mark_dirty("foo")
+        await flush_baselines(d, cache_seed)
+
+        class _StubClient:
+            disabled = False
+
+            def __init__(self, *a, **k):
+                pass
+
+            async def fetch_coins_list(self):
+                # Park forever so cancellation is the only way out.
+                await asyncio.sleep(3600)
+                return [], 0
+
+            async def close(self):
+                pass
+
+            _session = None
+
+        # Force detect_spikes to also mark something dirty so the finally
+        # flush has work. Easiest: pre-seed dirty before the loop starts.
+        monkeypatch.setattr(loop_mod, "LunarCrushClient", _StubClient)
+
+        shutdown = asyncio.Event()
+        # We reach into the loop's internal cache via a side-channel: seed
+        # the DB, then the loop's hydrate will load it; we pre-populate
+        # dirty through a monkeypatch of hydrate_baselines that marks it.
+        real_hydrate = loop_mod.hydrate_baselines
+
+        async def _hydrate_and_dirty(db, cache):
+            n = await real_hydrate(db, cache)
+            # Mark foo dirty right after hydrate so the finally-flush has work.
+            state = cache.get("foo")
+            if state is not None:
+                cache.set("foo", state._replace(sample_count=1234))
+                cache.mark_dirty("foo")
+            return n
+
+        monkeypatch.setattr(loop_mod, "hydrate_baselines", _hydrate_and_dirty)
+
+        task = asyncio.create_task(loop_mod.run_social_loop(s, d, shutdown))
+        await asyncio.sleep(0.1)  # give loop a chance to enter fetch
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        cursor = await d._conn.execute(
+            "SELECT sample_count FROM social_baselines WHERE coin_id = 'foo'"
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        # finally-flush committed the dirty post-state (1234), proving the
+        # flush ran on the cancel path.
+        assert row[0] == 1234
+    finally:
+        await d.close()

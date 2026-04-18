@@ -75,3 +75,22 @@ def test_truncation_at_4096():
     alerts = [_alert(name="X" * 200) for _ in range(50)]
     msg = format_social_alert(alerts)
     assert len(msg) <= 4096
+
+
+def test_cg_chart_link_omitted_when_slug_missing():
+    """Numeric LunarCrush coin_ids must NOT build a coingecko.com URL that 404s."""
+    alert = _alert(coin_id="12345", cg_slug=None)
+    msg = format_social_alert([alert])
+    # LunarCrush link still renders using the LC-native coin_id.
+    assert "lunarcrush.com/coins/12345" in msg
+    # No fake CoinGecko chart link is emitted.
+    assert "coingecko.com/en/coins/12345" not in msg
+    assert "[chart]" not in msg
+
+
+def test_cg_chart_link_uses_slug_when_present():
+    """When cg_slug is set, the chart link uses the CG slug, not the coin_id."""
+    alert = _alert(coin_id="12345", cg_slug="asteroid-shiba")
+    msg = format_social_alert([alert])
+    assert "coingecko.com/en/coins/asteroid-shiba" in msg
+    assert "coingecko.com/en/coins/12345" not in msg

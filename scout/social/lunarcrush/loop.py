@@ -123,7 +123,10 @@ async def _prune_old_rows(db: "Database", retention_days: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-SendFn = Callable[[list[ResearchAlert]], Awaitable[bool]]
+SendFn = Callable[
+    [list[ResearchAlert]],
+    Awaitable["bool | tuple[bool, Optional[str]]"],
+]
 
 
 async def _process_cycle(
@@ -157,7 +160,7 @@ async def _process_cycle(
     # Enrich price_change_1h from the CoinGecko raw-markets cache.
     enriched: list[ResearchAlert] = []
     for a in alerts:
-        ch_1h, ch_24h = get_price_change_1h(a.symbol, a.coin_id)
+        ch_1h, ch_24h, cg_slug = get_price_change_1h(a.symbol, a.coin_id)
         # Only override when we actually found something -- detector may
         # already have copied across values from the LC payload.
         updates: dict = {}
@@ -165,6 +168,8 @@ async def _process_cycle(
             updates["price_change_1h"] = ch_1h
         if ch_24h is not None and a.price_change_24h is None:
             updates["price_change_24h"] = ch_24h
+        if cg_slug and not a.cg_slug:
+            updates["cg_slug"] = cg_slug
         enriched.append(a.model_copy(update=updates) if updates else a)
 
     # Transactional commit: DB first, then Telegram, then cache.
@@ -190,9 +195,17 @@ async def _process_cycle(
     # Telegram dispatch (best-effort -- baseline stays committed even on fail).
     dispatch_ok = False
     try:
-        dispatch_ok = await send_fn(enriched)
+        result = await send_fn(enriched)
+        if isinstance(result, tuple):
+            dispatch_ok, reason = result
+        else:  # back-compat for the bool-only test doubles
+            dispatch_ok, reason = bool(result), None
         if not dispatch_ok:
-            logger.warning("social_alert_send_returned_false", count=len(enriched))
+            logger.warning(
+                "social_alert_send_returned_false",
+                count=len(enriched),
+                reason=reason,
+            )
     except Exception:
         logger.exception("social_alert_send_error", count=len(enriched))
 
@@ -280,14 +293,26 @@ async def run_social_loop(
     poll_counter = 0
 
     try:
-        # Startup: hydrate + prune.
-        await hydrate_baselines(db, cache)
-        await ledger.hydrate(db)
-        pruned = await _prune_old_rows(
-            db, int(settings.LUNARCRUSH_RETENTION_DAYS)
-        )
-        if pruned:
-            logger.info("social_retention_pruned", rows_deleted=pruned)
+        # Startup: hydrate + prune. Each step is isolated -- a failure in
+        # one must not crash the whole loop into the done-callback restart
+        # storm. Fall back to degraded state (empty cache / zero credits /
+        # skipped prune) so the loop still starts.
+        try:
+            await hydrate_baselines(db, cache)
+        except Exception:
+            logger.exception("social_hydrate_baselines_error")
+        try:
+            await ledger.hydrate(db)
+        except Exception:
+            logger.exception("social_hydrate_credits_error")
+        try:
+            pruned = await _prune_old_rows(
+                db, int(settings.LUNARCRUSH_RETENTION_DAYS)
+            )
+            if pruned:
+                logger.info("social_retention_pruned", rows_deleted=pruned)
+        except Exception:
+            logger.exception("social_prune_error")
         logger.info(
             "social_loop_started",
             baseline_coins=len(cache),
@@ -326,8 +351,6 @@ async def run_social_loop(
             except asyncio.TimeoutError:
                 pass  # normal -- interval elapsed
 
-    except asyncio.CancelledError:
-        pass
     finally:
         try:
             await flush_baselines(db, cache)
@@ -375,11 +398,14 @@ async def _run_one_cycle(
     if not coins:
         return
 
-    # Use a per-cycle Telegram session for the alerter so errors don't
-    # spill into the LunarCrush client session.
-    async def _dispatch(alerts: list[ResearchAlert]) -> bool:
-        async with aiohttp.ClientSession() as session:
-            return await send_social_alert(alerts, session, settings)
+    # Reuse the LunarCrush client's already-open aiohttp session for the
+    # Telegram dispatch instead of churning a fresh ClientSession per alert
+    # (previous behaviour: one ClientSession per dispatch, leaked a TCP
+    # connection per alert cycle).
+    async def _dispatch(
+        alerts: list[ResearchAlert],
+    ) -> tuple[bool, Optional[str]]:
+        return await send_social_alert(alerts, client._session, settings)
 
     await _process_cycle(
         settings,
