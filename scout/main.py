@@ -40,6 +40,7 @@ from scout.scorer import score
 from scout.spikes.detector import record_volume, detect_spikes, detect_7d_momentum
 from scout.gainers.tracker import store_top_gainers
 from scout.losers.tracker import store_top_losers
+from scout.velocity.detector import alert_velocity_detections, detect_velocity
 from scout.trading.signals import (
     trade_first_signals,
     trade_gainers,
@@ -341,6 +342,15 @@ async def run_cycle(
                 )
         except Exception:
             logger.exception("momentum_7d_error")
+
+    # Velocity Alerter (1h extreme-pump research alert, no paper trade)
+    if settings.VELOCITY_ALERTS_ENABLED and _raw_markets_combined:
+        try:
+            velocity = await detect_velocity(db, _raw_markets_combined, settings)
+            if velocity:
+                await alert_velocity_detections(velocity, session, settings)
+        except Exception:
+            logger.exception("velocity_alert_error")
 
     # Stage 2: Aggregate
     all_candidates = aggregate(
