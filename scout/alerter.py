@@ -142,6 +142,27 @@ async def send_telegram_message(
 
 TELEGRAM_MAX_LENGTH = 4096
 
+# Characters that must be escaped for Telegram's legacy Markdown parse mode.
+# We deliberately do NOT escape hyphen / dot / paren because Markdown-v1 treats
+# them literally; the intent here is to protect tokens named like AS_ROID from
+# being interpreted as italics markers.
+_MD_ESCAPE_CHARS = ("_", "*", "[", "]", "`")
+
+
+def _escape_md(value: str) -> str:
+    """Escape Markdown special characters for Telegram parse_mode='Markdown'.
+
+    Safe to call with any value coerced to ``str`` -- returns an empty string
+    for None. This helper is shared by the main alerter, the velocity
+    alerter, and the social-velocity alerter.
+    """
+    if value is None:
+        return ""
+    out = str(value)
+    for ch in _MD_ESCAPE_CHARS:
+        out = out.replace(ch, f"\\{ch}")
+    return out
+
 
 def _truncate(text: str, max_len: int = TELEGRAM_MAX_LENGTH) -> str:
     """Truncate text to max_len, appending ... if truncated."""
