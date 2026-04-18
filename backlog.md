@@ -246,6 +246,64 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 ---
 
+## Virality Detection Roadmap — Multi-Source (Apr 2026)
+
+**Context:** ASTEROID (+114775% / +50036.5%) exposed the limit of CoinGecko-only detection. Price/volume is the *symptom* of virality, not the cause. No amount of ML on price history predicts a Musk tweet. Detection scales with **data sources**, not with model training. Each new source unlocks a distinct virality trigger class.
+
+**Trigger taxonomy → data source → lead time:**
+
+| Trigger class | Example | Source | Lead time |
+|---|---|---|---|
+| Celebrity/influencer endorsement | Musk reply | Twitter/X API + LunarCrush influencer list | seconds–minutes |
+| Exchange listing / rumor | Binance, Coinbase | Twitter CEX accounts + announcement bots | minutes (rumor) / same-second (official) |
+| News / macro event | ETF approval, SEC ruling | CryptoPanic / CoinDesk / Bloomberg | minutes |
+| Cultural moment | Polaris Dawn, elections, viral TikTok | Twitter trending + Google Trends + Reddit | hours–days |
+| Coordinated degen campaigns | Telegram pumps, CT thread waves | Telegram/Discord scraping + X reply-velocity | minutes |
+| Copycat mania | ASTEROID → instant SHIBA-2 / ORBIT | pump.fun new-deploy watcher + fuzzy-match | seconds |
+| Whale / smart money | Labeled wallet accumulation | Nansen / Arkham / Dune | minutes |
+| Narrative rotation | AI / RWA / DePIN sector pumps | Our category_snapshots + LunarCrush topics | tens of minutes |
+| Perp / funding anomaly | Funding flip, OI spike on perps | Binance / Bybit / OKX WebSockets | seconds |
+| Developer / project news | GitHub teasers, team posts | GitHub webhook + project Twitter | hours |
+
+**Ranked rollout (ROI = coverage × lead-time ÷ effort × cost):**
+
+| # | Source | Classes covered | Lead time | Effort | Cost |
+|---|---|---|---|---|---|
+| 1 | DexScreener `/token-boosts/top` + GeckoTerminal per-chain trending | paid-promo, copycat, rotation | seconds–min | 1–2 d | free |
+| 2 | CryptoPanic news feed | news/macro | min (free) / sec (paid) | 2 d | free basic |
+| 3 | Binance/Bybit perp WebSocket (funding + OI anomaly) | perp/funding | seconds | 2–3 d | free |
+| 4 | LunarCrush Discover | influencer, cultural, rotation | minutes | 4–5 d | $24/mo |
+| 5 | pump.fun new-deploy watcher (Solana) | copycat | seconds | 5–6 d | $0–49/mo (Helius) |
+| 6 | Dune Analytics smart-money queries | whale accumulation | minutes | 3–4 d | free–$390/mo |
+| 7 | Nansen Smart Money API (upgrade from #6) | whale | sec–min | 4–5 d | $150–1,500/mo |
+| 8 | Twitter/X API direct (only if LunarCrush insufficient) | influencer | seconds | 5–7 d | $200–5,000/mo |
+
+**Skip list (negative ROI):** Telegram/Discord scraping (legal gray, noisy), GitHub webhooks (too niche), Reddit velocity (hours of lag), Arkham scraping (TOS risk).
+
+**Sprint plan:**
+
+- **Sprint 1 — free sources, quick wins (1 week):**
+  - PR #28 — DexScreener boosts + GeckoTerminal trending → `velocity_boost` tier
+  - PR #29 — CryptoPanic news-tag watcher → `news_watch` tier
+  - PR #30 — Binance/Bybit perp WebSocket anomaly detector → `perp_anomaly` tier
+- **Sprint 2 — paid social, Musk-class catch:**
+  - PR #31 — LunarCrush Discover integration → `social_velocity` tier ($24/mo)
+- **Sprint 3 — on-chain upstream signal:**
+  - PR #32 — Dune smart-money queries, cron-scheduled → `smart_money` tier
+  - PR #33 — pump.fun new-deploy watcher with fuzzy-match → `copycat_launch` tier
+- **Sprint 4 — meta-layer:**
+  - PR #34 — Ensemble virality classifier. Requires ≥3 tiers live + ~2 weeks of labeled data. Tags each alert: `influencer-driven | whale-accumulation | rotation | copycat | news | perp-driven`. Telegram messages gain virality-class badges; exit logic diverges by class (influencer dies in hours, whale runs for days).
+
+**First action:** PR #28 (DexScreener boosts + GeckoTerminal trending) — free, 2 days, proves the paid-promo hypothesis before committing to LunarCrush subscription. Execute after PR #27 velocity alerter stabilizes with ~48h of live Telegram traffic.
+
+**What learning CAN do on existing data (no new sources):**
+- Retrospective virality classifier: label past alerts (virality vs organic) using already-collected features — wallet concentration, holder_growth_1h curve, vol/mcap slope across 3+ cycles. Virality has narrow wallet sets + vertical-then-vertical curves; organic has broader accumulation.
+- Ensemble on existing signals: velocity alert + extreme holder growth + rising vol/mcap for 3 cycles → "suspected virality" tag even before Sprint 4.
+
+**Realistic expectation:** LunarCrush + DexScreener boosts gets us 5–15 minutes faster on narrative-driven pumps. We will never beat Musk-timed institutional trades (they have co-located Twitter feeds). Target: beat retail discovery by a meaningful window.
+
+---
+
 ## Early Detection Roadmap — Phased Approach
 
 **Goal:** Detect tokens that will appear on [CoinGecko Highlights](https://www.coingecko.com/en/highlights) (Trending Coins + Top Gainers) 1-2 hours before they appear, for manual research and informed buy decisions.
@@ -374,6 +432,26 @@ Test fixture refactor (BL-042) + backlog cleanup.
 ### Price Cache System
 **Status:** DONE
 Stores prices from pipeline fetches, dashboard reads from DB (zero extra CoinGecko calls).
+
+### SQLite datetime string-comparison fix (PR #24)
+**Status:** DONE — live on VPS
+38 queries across 10 modules wrap stored columns with `datetime()` to force parsing on both sides. `datetime.isoformat()` writes `T`-separator; SQLite `datetime('now')` returns space-separator; `'T' > ' '` produced false-stale comparisons. Max price-divergence dropped from 16.99% to 4.07%, avg to 0.71%. VANA 1.75 stale-peak entries cleared.
+
+### Momentum_ratio 24h floor (PR #25)
+**Status:** DONE — live on VPS
+`momentum_ratio` signal now requires 24h change ≥ `MOMENTUM_MIN_24H_CHANGE_PCT` (default 3.0%). Previously stablecoin peg wobble (0.05% / 0.08% = ratio 0.625 > 0.6) was triggering the +20-point signal, polluting paper trades with USDC/DAI/PYUSD showing uniform -0.5% losses. Zero stablecoins in paper book post-deploy.
+
+### Paper trade hard cap + startup warmup (PR #26)
+**Status:** DONE — live on VPS
+Two gates on `scout/trading/engine.py`: Step 0 warmup (`PAPER_STARTUP_WARMUP_SECONDS=180`, `time.monotonic()`-based, immune to wall-clock jumps) refuses new trades for 3 min after startup. Step 2c cap (`PAPER_MAX_OPEN_TRADES=10`) caps concurrent opens. Fixes restart-burst behavior: every process restart was replaying every currently-qualifying token as a fresh signal, filling the book with 45+ positions. Verified: exactly 10 open post-restart, warmup skip logs fire at elapsed=138.6s, max-open skip logs fire at overflow.
+
+### CoinGecko velocity alerter (PR #27)
+**Status:** DONE — live on VPS (`VELOCITY_ALERTS_ENABLED=true`)
+New `scout/velocity/detector.py` tier for catching asteroid-class pumps (ASTEROID +60087%) earlier than gainers / 7d-momentum trackers. Filters: 1h ≥ 30%, mcap $500K–$50M, vol/mcap ≥ 0.2, top-10 by 1h change, dedup 4h per coin-id via new `velocity_alerts` table. **Research-only — no paper trade dispatch.** Zero extra CoinGecko API calls (reuses `_raw_markets_combined` cache). 616 tests passing. Planned: meta-tier in Sprint 4 of Virality Roadmap.
+
+### Open follow-ups noted during session
+- **Edge detection for paper trades:** only open on *transition* into qualifier set, not current-state membership (prevents restart-bursts at root). Requires persisting previous cycle's qualifier set per signal type. Noted in PR #26 body.
+- **DexScreener boosts + GeckoTerminal per-chain trending** as additional velocity sources. See Virality Roadmap PR #28.
 
 ---
 
