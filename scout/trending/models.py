@@ -41,6 +41,11 @@ class TrendingComparison(BaseModel):
     chains_detected_at: datetime | None = None
     chains_lead_minutes: float | None = None
 
+    # LunarCrush social-velocity detection (4th tier)
+    detected_by_social: bool = False
+    social_detected_at: datetime | None = None
+    social_lead_minutes: float | None = None
+
     # Overall miss flag
     is_gap: bool = True  # True = we missed it entirely
 
@@ -57,3 +62,4 @@ class TrendingStats(BaseModel):
     by_narrative: int = 0
     by_pipeline: int = 0
     by_chains: int = 0
+    by_social: int = 0

@@ -273,6 +273,17 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
                 comp.chains_lead_minutes = lead
                 comp.is_gap = False
 
+        # 2d. Check social_signals table (LunarCrush 4th tier)
+        detected, detected_at, lead = await _check_detector(
+            db, "social_signals", "coin_id", coin_id, symbol,
+            first_trending_at_str,
+        )
+        if detected:
+            comp.detected_by_social = True
+            comp.social_detected_at = detected_at
+            comp.social_lead_minutes = lead
+            comp.is_gap = False
+
         comparisons.append(comp)
 
     # 3. Look up detected_price from price_cache and preserve existing peaks
@@ -313,8 +324,9 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
                 detected_by_narrative, narrative_detected_at, narrative_lead_minutes,
                 detected_by_pipeline, pipeline_detected_at, pipeline_lead_minutes,
                 detected_by_chains, chains_detected_at, chains_lead_minutes,
+                detected_by_social, social_detected_at, social_lead_minutes,
                 is_gap, detected_price, peak_price, peak_gain_pct)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 comp.coin_id,
                 comp.symbol,
@@ -329,6 +341,9 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
                 1 if comp.detected_by_chains else 0,
                 comp.chains_detected_at.isoformat() if comp.chains_detected_at else None,
                 comp.chains_lead_minutes,
+                1 if comp.detected_by_social else 0,
+                comp.social_detected_at.isoformat() if comp.social_detected_at else None,
+                comp.social_lead_minutes,
                 1 if comp.is_gap else 0,
                 det_price,
                 old_peak,
@@ -371,6 +386,9 @@ async def get_trending_stats(db: "Database") -> TrendingStats:
              UNION ALL
              SELECT chains_lead_minutes FROM trending_comparisons
                WHERE detected_by_chains = 1 AND chains_lead_minutes IS NOT NULL
+             UNION ALL
+             SELECT social_lead_minutes FROM trending_comparisons
+               WHERE detected_by_social = 1 AND social_lead_minutes IS NOT NULL
            )"""
     )
     lead_row = await cursor.fetchone()
@@ -393,6 +411,11 @@ async def get_trending_stats(db: "Database") -> TrendingStats:
     )
     by_chains = (await cursor.fetchone())[0]
 
+    cursor = await db._conn.execute(
+        "SELECT COUNT(*) FROM trending_comparisons WHERE detected_by_social = 1"
+    )
+    by_social = (await cursor.fetchone())[0]
+
     hit_rate = round((caught / total * 100) if total > 0 else 0, 1)
 
     return TrendingStats(
@@ -405,6 +428,7 @@ async def get_trending_stats(db: "Database") -> TrendingStats:
         by_narrative=by_narrative,
         by_pipeline=by_pipeline,
         by_chains=by_chains,
+        by_social=by_social,
     )
 
 
@@ -440,9 +464,10 @@ async def get_recent_comparisons(
                   detected_by_narrative, narrative_detected_at, narrative_lead_minutes,
                   detected_by_pipeline, pipeline_detected_at, pipeline_lead_minutes,
                   detected_by_chains, chains_detected_at, chains_lead_minutes,
+                  detected_by_social, social_detected_at, social_lead_minutes,
                   is_gap, detected_price, peak_price, peak_gain_pct, created_at
            FROM trending_comparisons
-           ORDER BY COALESCE(chains_detected_at, narrative_detected_at, pipeline_detected_at, appeared_on_trending_at) DESC
+           ORDER BY COALESCE(social_detected_at, chains_detected_at, narrative_detected_at, pipeline_detected_at, appeared_on_trending_at) DESC
            LIMIT ?""",
         (limit,),
     )
