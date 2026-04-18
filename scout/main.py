@@ -791,10 +791,59 @@ async def main() -> None:
                     asyncio.create_task(run_chain_tracker(db, settings))
                 )
 
+            # LunarCrush social-velocity loop runs OUTSIDE asyncio.gather --
+            # a social crash must never take down the main pipeline. The
+            # done-callback re-creates the task with a 30s back-off.
+            social_task: asyncio.Task | None = None
+            if getattr(settings, "LUNARCRUSH_ENABLED", False) and getattr(
+                settings, "LUNARCRUSH_API_KEY", ""
+            ):
+                from scout.social.lunarcrush.loop import (
+                    _make_done_callback,
+                    run_social_loop,
+                )
+
+                def _spawn_social_task() -> asyncio.Task:
+                    t = asyncio.create_task(
+                        run_social_loop(settings, db, shutdown_event)
+                    )
+                    t.add_done_callback(
+                        _make_done_callback(
+                            restarter=_schedule_social_restart,
+                            backoff_seconds=30.0,
+                        )
+                    )
+                    return t
+
+                def _schedule_social_restart(delay: float) -> None:
+                    async def _restart() -> None:
+                        try:
+                            await asyncio.sleep(delay)
+                        except asyncio.CancelledError:
+                            return
+                        if shutdown_event.is_set():
+                            return
+                        logger.info("social_loop_restarting", after_seconds=delay)
+                        _spawn_social_task()
+
+                    asyncio.create_task(_restart())
+
+                social_task = _spawn_social_task()
+                logger.info("social_loop_task_spawned")
+
             # Both loops share the same session and rate limiter intentionally.
             # The coingecko_limiter (25 req/min) coordinates access; that IS
             # the back-pressure mechanism.
             await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Ensure the social task winds down cleanly after the main loops exit.
+            if social_task is not None and not social_task.done():
+                try:
+                    await asyncio.wait_for(social_task, timeout=5.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    social_task.cancel()
+                except Exception:
+                    logger.exception("social_loop_shutdown_error")
     finally:
         await db.close()
         logger.info("Scanner stopped", cycles_completed=cycle_count)
