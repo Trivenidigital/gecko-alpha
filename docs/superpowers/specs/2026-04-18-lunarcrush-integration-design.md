@@ -1,11 +1,13 @@
 # LunarCrush Social-Velocity Alerter — Design
 
 **Date:** 2026-04-18
-**Status:** Draft (pending design-review agents)
+**Status:** v2 — design-review round 1 incorporated
 **Supersedes:** `2026-04-09-early-detection-lunarcrush-design.md` (pre-dated PR #12 and PR #27)
 **Input plan:** `docs/superpowers/plans/2026-04-18-lunarcrush-plan.md`
 **Sprint / PR:** Virality Roadmap Sprint 2 — PR #28
-**Reviewers consulted:** code-architect, feature-dev:code-reviewer, general-purpose (LunarCrush API reality check)
+**Reviewers consulted:** code-architect, feature-dev:code-reviewer (×2), superpowers:code-reviewer, general-purpose (LunarCrush API reality check)
+
+**v2 delta from v1:** schema normalized (CSV→boolean flags), baseline update is symmetric (handles collapses + EWMA formula explicit), shutdown pattern moved from `atexit` to `asyncio.CancelledError` in `finally` block, retention prune moved out of `Database.initialize()` into loop startup, trending-tracker extension enumerates all four touch-points including a prerequisite helper-extraction refactor, credit ledger persisted across restarts, own `aiohttp.ClientSession` for vendor isolation, `price_change_1h` sourced from CoinGecko raw-markets cache (not `price_cache` — confirmed `price_cache` lacks 1h column), `interactions_accel` redefined as 5-min ring-buffer delta to match poll cadence, `social_signals` gains `UNIQUE(coin_id, detected_at)` + `INSERT OR IGNORE` for TOCTOU safety.
 
 ---
 
@@ -24,23 +26,28 @@ Surface tokens with **social** velocity — influencer endorsement, cultural-mom
 │ Main pipeline (unchanged) — 60s scan cycle                       │
 │   CoinGecko → aggregator → scorer → gate → alerter               │
 └──────────────────────────────────────────────────────────────────┘
-           │  shares aiohttp.ClientSession, DB, Settings
+           │  shares DB + Settings; does NOT share aiohttp.ClientSession
            ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │ Social loop (NEW) — 5-minute cadence, own asyncio.Task           │
 │   LunarCrush client → spike detector → ResearchAlert dispatch    │
+│     │ (own aiohttp.ClientSession — vendor-isolated)               │
 │     │                     │                  │                    │
 │     │                     └── baseline cache (in-process dict)    │
 │     │                              ↕ DB checkpoint every 12 polls │
 │     ▼                                                             │
-│   credit-budget watcher (abort poll if >80% daily credits)        │
+│   credit-budget watcher (DB-persisted ledger, survives restart)   │
 └──────────────────────────────────────────────────────────────────┘
            │
            ▼
    Telegram `*Social Velocity*` message (plain-text, research-only)
 ```
 
-**Key property:** complete error isolation. LunarCrush outage, rate limit, credit exhaustion, or DB write failure **cannot** propagate into the main pipeline. The social loop runs in its own task with its own exception boundary.
+**Key property:** complete error isolation. LunarCrush outage, rate limit, credit exhaustion, or DB write failure **cannot** propagate into the main pipeline. The social loop runs in its own task with its own exception boundary and its own `aiohttp.ClientSession` (Reviewer #2 finding: shared session would cause `RuntimeError: Session is closed` if main pipeline shut down first).
+
+**Task wiring in `main.py`:**
+- `social_task = asyncio.create_task(run_social_loop(settings, db, shutdown_event))`
+- Register a done-callback that logs the exception and re-creates the task with a 30s back-off. **Never** `await asyncio.gather(main_task, social_task)` — a social crash must not take down the pipeline.
 
 ---
 
@@ -106,38 +113,74 @@ Three pure functions in `detector.py`, each takes `(coin_dict, BaselineState) �
 
 ### 5.1 Three spike kinds
 
-| Kind | Condition | Setting | Baseline window |
+| Kind | Condition | Setting | Baseline field |
 |---|---|---|---|
-| `social_volume_24h` | `current / baseline_7d_avg ≥ ratio` | `LUNARCRUSH_SOCIAL_SPIKE_RATIO=2.0` | 7-day rolling avg of `social_volume_24h` |
-| `galaxy_jump` | `current − previous_value ≥ jump` (last 1h) | `LUNARCRUSH_GALAXY_JUMP=10.0` | last known `galaxy_score` from previous poll |
-| `interactions_accel` | `current_30min / previous_30min ≥ ratio` | `LUNARCRUSH_INTERACTIONS_ACCEL=3.0` | 30-min snapshot delta of `interactions_24h` |
+| `social_volume_24h` | `current / avg_social_volume_24h ≥ ratio` | `LUNARCRUSH_SOCIAL_SPIKE_RATIO=2.0` | `avg_social_volume_24h` — EWMA (α=1/288) |
+| `galaxy_jump` | `current − last_galaxy_score ≥ jump` | `LUNARCRUSH_GALAXY_JUMP=10.0` | `last_galaxy_score` — previous poll |
+| `interactions_accel` | `current / interactions_6poll_ago ≥ ratio` | `LUNARCRUSH_INTERACTIONS_ACCEL=3.0` | 6-slot ring buffer of `interactions_24h` (6 × 5min = 30min nominal) |
+
+**EWMA formula (closes Reviewer #2 BLOCKING #4):**
+```
+new_avg = α · new_value + (1 − α) · old_avg        where α = 1/LUNARCRUSH_BASELINE_MIN_SAMPLES
+```
+Chosen over a literal 288-sample ring buffer: O(1) space per coin, no boundary artifacts, matches the warmup count intuitively (one `MIN_SAMPLES` window to converge).
+
+**`interactions_accel` redefined (closes Reviewer #1 NON-BLOCKING §5.1):** the original "30-min snapshot delta" was ambiguous vs a 5-min poll cadence. v2 uses a fixed 6-slot ring buffer (oldest = 30 min nominal ago). If fewer than 6 slots are populated (warmup / skipped cycles due to 429), skip the check for that poll — do NOT compare against a missing slot.
 
 ### 5.2 Multi-hit collapse (closes Risk-Reviewer finding #2)
 
-**A coin firing multiple spike kinds in the same cycle produces ONE `ResearchAlert`, not one per kind.** The alert's `spike_kinds: list[SpikeKind]` field carries all triggered kinds. The Telegram message lists them. DB dedup is per `coin_id` only. This is why `social_signals.spike_kind` in the schema is a comma-separated string, not a FK-style single value.
+**A coin firing multiple spike kinds in the same cycle produces ONE `ResearchAlert`, not one per kind.** The alert's `spike_kinds: list[SpikeKind]` field carries all triggered kinds. The Telegram message lists them. DB dedup is per `coin_id` only.
+
+**Storage format (revised — closes Reviewer #2 BLOCKING #5):** `social_signals` carries three boolean columns `fired_social_volume_24h`, `fired_galaxy_jump`, `fired_interactions_accel` — NOT a CSV `spike_kinds` column. This matches the existing `trending_comparisons.detected_by_*` pattern (consistency), supports `GROUP BY` aggregations for the future ensemble classifier (PR #34), and avoids substring-match false positives like `LIKE '%galaxy_jump%'` when a future kind is a substring of an existing one.
 
 ### 5.3 Cold-start suppression
 
 An alert fires only when `BaselineState.sample_count >= LUNARCRUSH_BASELINE_MIN_SAMPLES` (default 288 = 24h at 5-min polls). Baselines **persist across restarts via DB checkpoint** (§6), so a service restart does NOT reset the warmup counter — closes Risk-Reviewer finding #1.
 
+**Every coin returned by `/coins/list/v2` increments its `sample_count` on every poll**, regardless of whether it fires or passes dedup — closes Reviewer #1 NON-BLOCKING §5.3. Warmup progresses uniformly.
+
+**Interval-aware warmup (closes Reviewer #2 MINOR §5.3):** if the credit-budget watcher has downshifted `LUNARCRUSH_POLL_INTERVAL` to 600s, `MIN_SAMPLES=288` now covers 48h rather than 24h. To keep the warmup intuitive, the check uses:
+```python
+required = settings.LUNARCRUSH_BASELINE_MIN_HOURS * 3600 // current_poll_interval
+if state.sample_count < required: skip
+```
+with `LUNARCRUSH_BASELINE_MIN_HOURS=24`. `LUNARCRUSH_BASELINE_MIN_SAMPLES` is retained as a derived constant used only in EWMA α for stability reasons.
+
 **First deployment** on a clean DB pays a 24h warmup once. Acceptable per the API-reality review (backfill impossible on Individual tier).
 
-### 5.4 Baseline poisoning mitigation (closes Risk-Reviewer finding #4)
+### 5.4 Baseline poisoning mitigation (closes Risk-Reviewer finding #4 + Reviewer #2 BLOCKING #4)
 
-Baseline update in `baselines.update()`:
+Baseline update in `baselines.update()` must handle spikes AND collapses symmetrically:
 
 ```python
-def update(state: BaselineState, new_value: float) -> BaselineState:
-    # Spike-exclusion: if this sample would itself be a 2× spike above
-    # current baseline and we already have >= min_samples data, skip the
-    # update so extreme events don't inflate the reference window.
-    if (state.sample_count >= MIN_SAMPLES_FOR_EXCLUSION
-            and new_value >= state.avg_social_volume_24h * 2.0):
-        return state  # unchanged — spike detected but baseline not moved
-    ...  # else rolling-avg update
+def update(state: BaselineState, new_value: Optional[float]) -> BaselineState:
+    # 1. None / 0 / missing → skip update entirely; return state unchanged.
+    if new_value is None or new_value <= 0:
+        return state  # do not drag the avg to zero on API hiccups
+
+    # 2. After warmup, skip updates on extreme samples in EITHER direction.
+    if state.sample_count >= settings.LUNARCRUSH_BASELINE_MIN_SAMPLES:
+        ratio = new_value / max(state.avg_social_volume_24h, 1e-9)
+        spike_hi = settings.LUNARCRUSH_SOCIAL_SPIKE_RATIO   # 2.0
+        spike_lo = 1.0 / spike_hi                            # 0.5
+        if ratio >= spike_hi or ratio <= spike_lo:
+            return state._replace(sample_count=state.sample_count + 1)
+            # sample_count still progresses (progress invariant), avg does not
+            # absorb the outlier.
+
+    # 3. Normal case — EWMA update.
+    α = 1.0 / settings.LUNARCRUSH_BASELINE_MIN_SAMPLES
+    new_avg = α * new_value + (1 - α) * state.avg_social_volume_24h
+    return state._replace(
+        avg_social_volume_24h=new_avg,
+        sample_count=state.sample_count + 1,
+        last_updated=utcnow(),
+    )
 ```
 
-This prevents the sustained-pump lockout the risk reviewer called out. `MIN_SAMPLES_FOR_EXCLUSION=288` — we only activate exclusion after warmup so legitimate early samples still build the baseline.
+This prevents BOTH the sustained-pump lockout (risk reviewer) AND the coin-drops-off-API zero-poisoning (Reviewer #2).
+
+**All thresholds settings-driven (closes Reviewer #1 NON-BLOCKING):** no hardcoded `2.0` or `288` literals in code. `LUNARCRUSH_SOCIAL_SPIKE_RATIO` and `LUNARCRUSH_BASELINE_MIN_SAMPLES` are the only sources of truth.
 
 ### 5.5 Dedup
 
@@ -156,22 +199,53 @@ After dedup, sort remaining detections by the highest triggered spike_ratio and 
 
 ---
 
-## 6. Baseline persistence (closes Risk-Reviewer finding #1)
+## 6. Baseline persistence (closes Risk-Reviewer finding #1 + Reviewer #2 BLOCKING #2)
 
 In-process `BaselineCache: dict[str, BaselineState]` + periodic DB checkpoint.
 
 ### Flow:
-1. **On loop startup**: `SELECT * FROM social_baselines` → hydrate cache. Never reset existing `sample_count` to 0.
+1. **On loop startup**:
+   - Wait on a DB-ready barrier (`await db.initialized.wait()` — gated after `_create_tables` finishes) to avoid the hydration race Reviewer #2 flagged.
+   - `SELECT * FROM social_baselines` → hydrate cache. Never reset existing `sample_count` to 0.
+   - Run retention prune: `DELETE FROM social_signals WHERE datetime(detected_at) < datetime('now', '-' || ? || ' days')` using `settings.LUNARCRUSH_RETENTION_DAYS`. This lives in `loop.py` startup, **not** `Database.initialize()` — keeps the generic DB class vendor-agnostic (closes Reviewer #1 BLOCKING #3).
 2. **Per poll cycle**: read baselines from cache (O(1) dict lookup, no DB I/O in hot path). Update in-memory after spike checks.
-3. **Every 12 polls (60 min) OR on graceful shutdown**: flush dirty baseline rows to DB in a single transaction.
+3. **Every `LUNARCRUSH_CHECKPOINT_EVERY_N_POLLS` polls (default 12 = 60 min) OR on graceful shutdown**: flush dirty baseline rows to DB in a single transaction.
+
+The checkpoint interval is read from `settings.LUNARCRUSH_CHECKPOINT_EVERY_N_POLLS` at each cycle, not hardcoded.
 
 This resolves Architect-Reviewer finding #1 (avoid per-cycle per-coin SQLite writes at scale) AND Risk-Reviewer finding #1 (baselines survive restart).
 
 ### Crash safety:
 Between checkpoints, up to 60 min of baseline updates can be lost. Impact: slight regression to older average; detector self-heals over the next 12 cycles. Acceptable — the alerter is research-only, not mission-critical.
 
-### Graceful shutdown:
-The `loop.py` task registers an `atexit` / `signal` handler to flush the cache before process exit.
+### Graceful shutdown (closes Reviewer #1 BLOCKING #2):
+**No `atexit` handler** — `atexit` callbacks run synchronously after the event loop closes, so any `await db._conn.execute(...)` inside them fails. Instead, the `social_loop(...)` task body is structured as:
+
+```python
+async def run_social_loop(settings, db, shutdown_event: asyncio.Event) -> None:
+    try:
+        while not shutdown_event.is_set():
+            try:
+                await _poll_cycle(settings, db, cache)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("social_loop_cycle_error")
+            # wait-or-cancel
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=current_interval)
+            except asyncio.TimeoutError:
+                pass
+    except asyncio.CancelledError:
+        pass  # fall through to finally
+    finally:
+        # Flush baselines + credit ledger before exit. DB is still open here
+        # because main.py awaits this task before closing the DB.
+        await _flush_baselines(db, cache)
+        await _flush_credit_ledger(db, ledger)
+```
+
+`main.py` sets `shutdown_event` on `SIGINT`/`SIGTERM` (matches the existing pipeline shutdown pattern at `main.py:643-654`), then awaits the social task with a 10s timeout before cancelling.
 
 ---
 
@@ -181,28 +255,35 @@ The `loop.py` task registers an `atexit` / `signal` handler to flush the cache b
 -- Spike events that produced a Telegram alert
 CREATE TABLE IF NOT EXISTS social_signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    coin_id TEXT NOT NULL,               -- LunarCrush id
+    coin_id TEXT NOT NULL,                  -- LunarCrush id (string form)
     symbol TEXT NOT NULL,
     name TEXT NOT NULL,
-    spike_kinds TEXT NOT NULL,           -- CSV: 'social_volume_24h,galaxy_jump'
+    -- Kind flags (replaces v1 CSV — see §5.2)
+    fired_social_volume_24h INTEGER NOT NULL DEFAULT 0,
+    fired_galaxy_jump       INTEGER NOT NULL DEFAULT 0,
+    fired_interactions_accel INTEGER NOT NULL DEFAULT 0,
     galaxy_score REAL,
     social_volume_24h REAL,
     social_volume_baseline REAL,
-    social_spike_ratio REAL,             -- max across triggered kinds
+    social_spike_ratio REAL,                -- max across triggered kinds
     interactions_24h REAL,
     sentiment REAL,
     social_dominance REAL,
-    price_change_1h REAL,                -- sourced from price_cache at alert time
+    price_change_1h REAL,                   -- sourced from raw CoinGecko markets cache
     price_change_24h REAL,
     market_cap REAL,
     current_price REAL,
     detected_at TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(coin_id, detected_at)            -- TOCTOU belt-and-braces
 );
 CREATE INDEX IF NOT EXISTS idx_social_signals_coin_detected
     ON social_signals(coin_id, detected_at);
 CREATE INDEX IF NOT EXISTS idx_social_signals_symbol
     ON social_signals(symbol);
+-- Note: 30-day retention prune's WHERE detected_at < ... scan is covered by
+--       the composite (coin_id, detected_at) index via its second key-part;
+--       no dedicated idx_social_signals_detected_at needed.
 
 -- Persistent baseline state (checkpointed, survives restart)
 CREATE TABLE IF NOT EXISTS social_baselines (
@@ -210,43 +291,74 @@ CREATE TABLE IF NOT EXISTS social_baselines (
     symbol TEXT NOT NULL,
     avg_social_volume_24h REAL NOT NULL,
     avg_galaxy_score REAL NOT NULL,
-    last_galaxy_score REAL,              -- for galaxy_jump detection
-    last_interactions_24h REAL,          -- for interactions_accel detection
+    last_galaxy_score REAL,                 -- for galaxy_jump detection
+    interactions_ring TEXT NOT NULL DEFAULT '[]',  -- JSON list, 6-slot ring buffer of interactions_24h
     sample_count INTEGER NOT NULL,
+    last_poll_at TEXT,                      -- absolute timestamp of last update
     last_updated TEXT NOT NULL
 );
 
--- Retention: nightly prune at pipeline startup
--- DELETE FROM social_signals WHERE detected_at < datetime('now', '-30 days')
+-- Credit budget ledger (survives restart — closes Reviewer #2 MAJOR §4/§10)
+CREATE TABLE IF NOT EXISTS social_credit_ledger (
+    utc_date TEXT PRIMARY KEY,              -- 'YYYY-MM-DD' UTC
+    credits_used INTEGER NOT NULL,
+    last_updated TEXT NOT NULL
+);
 ```
+
+**INSERT pattern for `social_signals`:** `INSERT OR IGNORE INTO social_signals (...) VALUES (...)` — the `UNIQUE(coin_id, detected_at)` constraint gives atomic dedup even against a detector bug that queues two detections for the same coin in one cycle (closes Reviewer #2 MAJOR §7).
+
+**`interactions_ring` as JSON:** a 6-element JSON array (`'[120.5, 134.1, ...]'`) persisted in the baseline row. On cache hydration it's parsed with `json.loads`. Write-load is minimal (1 value added every 5 min per coin, ring overflow via `[-6:]` slice). Queryability is not a concern — this column is never read by ad-hoc SQL.
 
 **Orthogonality from `candidates`:** no FK. Ensemble classifier (PR #34) will join across `social_signals`, `velocity_alerts`, `candidates` by `coin_id` / `LOWER(symbol)` — consistent with how `trending_comparisons` already joins today.
 
-**Retention:** `_prune_social_signals(db, days=30)` called once on `Database.initialize()`. Keeps index small forever.
+**Retention:** pruned on loop startup via `loop.py` using `settings.LUNARCRUSH_RETENTION_DAYS` (default 30) — NOT inside `Database.initialize()`. Rationale in §6.
 
 ---
 
-## 8. Alert flow (corrected — closes Risk-Reviewer finding #3)
+## 8. Alert flow (closes Risk-Reviewer #3 + Reviewer #2 BLOCKING #6)
 
 ```
-every LUNARCRUSH_POLL_INTERVAL seconds:
-  1. check credit budget; if exhausted → log + skip cycle
-  2. fetch /coins/list/v2
-  3. for each coin:
-       load baseline from cache (hydrate from DB on first run)
-       run 3 spike checks → collect triggered SpikeKinds
-       update baseline (with spike-exclusion rule §5.4)
+every current_poll_interval seconds:
+  1. check credit budget (DB-persisted ledger); if exhausted → log + skip
+  2. fetch /coins/list/v2 (own aiohttp.ClientSession)
+  3. for each coin, capture (pre-update BaselineState, triggered kinds):
+       pre_state = cache[coin_id] or bootstrap
+       kinds = run 3 spike checks against pre_state + current values
+       post_state = baselines.update(pre_state, current_values)  # §5.4
+       (do NOT commit post_state to cache yet — buffer it)
   4. build ResearchAlert list from coins with ≥1 triggered kind
-  5. filter out coins in social_signals within LUNARCRUSH_DEDUP_HOURS
-  6. filter out coins where baseline.sample_count < MIN_SAMPLES
+  5. filter out coins with row in social_signals within DEDUP_HOURS
+  6. filter out coins where pre_state.sample_count < required (§5.3)
   7. sort by highest spike_ratio; take top-N
-  8. enrich with price_change_1h from price_cache (simple SELECT)
-  9. **INSERT into social_signals first** (persist dedup state)
-  10. **THEN** dispatch single batched Telegram message
-  11. every 12 polls: checkpoint baseline cache → social_baselines
+  8. enrich price_change_1h from CoinGecko raw-markets cache (§8.1).
+     Default to None for coins not present — never block the alert.
+  9. **BEGIN TRANSACTION**
+       INSERT OR IGNORE into social_signals for each alert
+       (TOCTOU-safe via UNIQUE(coin_id, detected_at))
+     **COMMIT**
+ 10. If tx succeeded: commit buffered post_state updates into cache;
+     **then** dispatch single batched Telegram message.
+     If tx failed: drop buffered baseline updates (closes Reviewer #2
+     BLOCKING #6 — in-memory baseline stays in sync with the row that
+     actually exists in the DB). Next cycle retries naturally.
+ 11. Always commit post_state for coins that did NOT fire (baseline
+     progresses independently of alert persistence — progress invariant).
+ 12. Every CHECKPOINT_EVERY_N_POLLS polls: flush dirty baselines +
+     credit ledger snapshot to DB in one transaction.
 ```
 
-**Step-order rationale:** Reversed from initial plan so a DB-write failure cannot be followed by a successful Telegram send (which would have bypassed dedup and produced a message flood). If the INSERT fails, the send is skipped this cycle; the alert will be considered "fresh" again next cycle when DB recovers.
+**Rationale for the buffered-commit pattern:** if we update the cache before the DB INSERT and the INSERT fails, the in-memory baseline has already absorbed the sample but no alert was persisted. Next cycle's dedup check passes (no DB row), but the spike-exclusion rule now says "this looks like a spike, skip update" — meaning the baseline is frozen in a bad state. The buffered commit (step 10) keeps the baseline consistent with the DB.
+
+**Firing coins vs non-firing coins:** non-firing coins' baseline updates are committed unconditionally in step 11 — they can't poison the DB→cache consistency because they're not being inserted anywhere.
+
+### 8.1 `price_change_1h` enrichment source
+
+`scout/ingestion/coingecko.py` already exposes a module-level `last_raw_markets: list[dict]` updated each scan cycle (60s cadence, contains `price_change_percentage_1h_in_currency` and `24h`). The social loop calls a small helper `get_price_change_1h(symbol, coin_id) -> tuple[Optional[float], Optional[float]]` that matches either by `LOWER(symbol)` or exact `coin_id` into `last_raw_markets`. No DB read, no extra HTTP call.
+
+**Why NOT `price_cache` (closes Reviewer #1 NON-BLOCKING):** `scout/db.py:401-409` confirmed `price_cache` schema has only `price_change_24h` and `price_change_7d` — no 1h column. Piping through `price_cache` would require a schema migration for a single optional field. The CoinGecko raw-markets cache (updated every 60s, in-process) is zero-cost.
+
+**Enrichment hit rate:** ~30-50% realistically (CoinGecko markets top-N overlaps partially with LunarCrush universe). `None` default is explicitly allowed — the alert message renders `price: —` when both price values are None, rather than omitting or blocking.
 
 ---
 
@@ -267,6 +379,10 @@ mcap: $24.3M | sentiment: 0.82
 - Batched: single message for all top-N detections in the cycle. Truncates at Telegram 4096 limit via `_truncate` helper.
 - Distinct header `*Social Velocity* (LunarCrush)` separates visually from `*Velocity Alerts* (1h pump)` so the user knows which tier fired.
 
+**LunarCrush URL construction (closes Reviewer #1 NON-BLOCKING §9):** the `/coins/list/v2` response is confirmed to include a `symbol` field but NOT a guaranteed `slug` matching CoinGecko. The Telegram LunarCrush link is built as `https://lunarcrush.com/coins/{lc_coin_id}` using LunarCrush's own id (string form of the integer id if numeric) — this is the canonical URL form and avoids a broken link from slug-mismatch. CoinGecko chart link uses the CoinGecko slug if we successfully matched one in §8.1, else omitted.
+
+**Markdown escape (closes Reviewer #2 MINOR §9):** reuse the existing `_escape_md()` helper from `scout/alerter.py` (or `scout/velocity/detector.py` — whichever carries it) to escape `_`, `*`, `[`, `]`, `` ` `` in `name` and `symbol` before interpolation. A token named `AS_ROID` must render correctly without breaking parse mode.
+
 ---
 
 ## 10. Settings (`scout/config.py`)
@@ -276,7 +392,8 @@ mcap: $24.3M | sentiment: 0.82
 LUNARCRUSH_ENABLED: bool = False                    # master flag
 LUNARCRUSH_API_KEY: str = ""                        # empty → loop never starts
 LUNARCRUSH_BASE_URL: str = "https://lunarcrush.com/api4/public"
-LUNARCRUSH_POLL_INTERVAL: int = 300                 # 5 min
+LUNARCRUSH_POLL_INTERVAL: int = 300                 # 5 min (default / normal)
+LUNARCRUSH_POLL_INTERVAL_SOFT: int = 600            # 10 min (used after 80% credits)
 LUNARCRUSH_RATE_LIMIT_PER_MIN: int = 9              # under hard 10/min
 LUNARCRUSH_DAILY_CREDIT_BUDGET: int = 2000          # free tier cap
 LUNARCRUSH_CREDIT_SOFT_PCT: float = 0.80            # downshift at 80%
@@ -286,12 +403,15 @@ LUNARCRUSH_GALAXY_JUMP: float = 10.0
 LUNARCRUSH_INTERACTIONS_ACCEL: float = 3.0
 LUNARCRUSH_DEDUP_HOURS: int = 4
 LUNARCRUSH_TOP_N: int = 10
-LUNARCRUSH_BASELINE_MIN_SAMPLES: int = 288          # 24h warmup
+LUNARCRUSH_BASELINE_MIN_HOURS: int = 24             # warmup wall-clock, interval-aware
+LUNARCRUSH_BASELINE_MIN_SAMPLES: int = 288          # EWMA alpha denominator
 LUNARCRUSH_CHECKPOINT_EVERY_N_POLLS: int = 12       # 60 min
 LUNARCRUSH_RETENTION_DAYS: int = 30
 ```
 
 Double kill-switch: `LUNARCRUSH_ENABLED=false` **or** empty `LUNARCRUSH_API_KEY` disables the loop.
+
+**Hot knob for alert rate (closes Reviewer #2 MAJOR):** rather than requiring a redeploy to quiet a noisy first day, `LUNARCRUSH_TOP_N` and `LUNARCRUSH_SOCIAL_SPIKE_RATIO` are read **from settings at each cycle start** (not cached at boot). Operator can `systemctl restart gecko-pipeline` after editing `.env` — 5s downtime, no code change. The explicit runbook is added to §14. (Deferred: a `kv_settings` DB-backed override table was considered; punted as over-engineered until we have evidence the 5s restart window is painful.)
 
 ---
 
@@ -311,48 +431,75 @@ Double kill-switch: `LUNARCRUSH_ENABLED=false` **or** empty `LUNARCRUSH_API_KEY`
 
 ---
 
-## 12. Trending-tracker hit-rate integration
+## 12. Trending-tracker hit-rate integration (closes Reviewer #1 BLOCKING #1 + Reviewer #2 MAJOR)
 
-Extend `scout/trending/tracker.compare_with_signals()` to count `social_signals` as a 4th detector tier (alongside narrative, pipeline, chains, spikes). Schema change: add columns `detected_by_social INTEGER DEFAULT 0, social_lead_minutes REAL` to `trending_comparisons`. Populate in the compare pass by joining on `coin_id` with a 4h window before the token appeared on trending.
+Extend `scout/trending/tracker.compare_with_signals()` to count `social_signals` as a 4th detector tier alongside narrative, pipeline, and chains. This requires coordinated edits to **four** files:
 
-This closes the Architect-Reviewer finding #4 — the trending tracker gets full tier coverage rather than silently ignoring social signals in its hit-rate numbers.
+| # | File | Change |
+|---|---|---|
+| 1 | `scout/db.py` `_create_tables()` | Add columns `detected_by_social INTEGER NOT NULL DEFAULT 0`, `social_detected_at TEXT`, `social_lead_minutes REAL` to the `CREATE TABLE IF NOT EXISTS trending_comparisons` statement. Because the table may already exist from PR #12 deploys, add a migration block that `ALTER TABLE trending_comparisons ADD COLUMN ... IF NOT EXISTS` via a wrapped `try/except` — follow the pattern already used elsewhere in `db.py` for additive migrations. |
+| 2 | `scout/trending/models.py` | Add `detected_by_social: bool = False`, `social_detected_at: datetime \| None = None`, `social_lead_minutes: float \| None = None` to `TrendingComparison`. Add `by_social: int = 0` to `TrendingStats`. |
+| 3 | `scout/trending/tracker.py` `compare_with_signals()` | Current function writes 17 fixed columns to `trending_comparisons` (lines 275-301, confirmed). Three required changes: **(a)** add a pre-requisite helper `_check_detector(db, table, id_col, coin_id, symbol, first_trending_at_str) -> tuple[bool, Optional[datetime], Optional[float]]` — extract the repeated SELECT pattern used for narrative/pipeline/chains so adding a 4th tier is a single call, not a copy-paste. **(b)** call `_check_detector(db, 'social_signals', 'coin_id', ...)` (or a symbol-join variant if LunarCrush `coin_id` does not match existing tables). **(c)** extend the INSERT column list from 17 to 20 and the VALUES placeholder list to match. |
+| 4 | `scout/trending/tracker.py` `get_trending_stats()` | Add a 4th UNION arm to the lead-time query (`SELECT social_lead_minutes FROM trending_comparisons WHERE detected_by_social=1`) and a `SELECT COUNT(*) WHERE detected_by_social=1` for `by_social`. |
+
+**Prerequisite refactor commit:** step 3(a) lands first as a pure refactor (`refactor(trending): extract _check_detector helper`) with no behavior change. Green tests confirm the extraction is clean. Then the additive changes for the social tier land in a second commit. This keeps the diff reviewable and the blast radius contained to the trending module (closes Reviewer #2 MAJOR §12).
+
+This closes Architect-Reviewer finding #4 — the trending tracker gets full tier coverage rather than silently ignoring social signals in its hit-rate numbers.
 
 ---
 
 ## 13. Testing strategy
 
-TDD order. `aioresponses` for HTTP mocks, `tmp_path` for DB fixtures (same as existing tests).
+TDD order. `aioresponses` for HTTP mocks, `tmp_path` for DB fixtures (same as existing tests). Time-travel: inject a `clock: Callable[[], datetime]` parameter into `BaselineCache`, `CreditLedger`, and the loop body — tests pass a fake callable and advance wall-clock without pulling in `freezegun` / `time_machine` as a new dependency (closes Reviewer #1 NON-BLOCKING §13).
 
 | Test file | Coverage |
 |---|---|
-| `tests/test_social_lunarcrush_client.py` | auth header correct, 429 backoff sequence (5/10/20/60s cap), **401 sets disabled flag**, malformed-JSON resilience, missing-field handling, field rename drift (`social_volume_24h` / `interactions_24h`) |
-| `tests/test_social_detector.py` | each of 3 spike kinds fires independently, **multi-kind coin produces ONE alert with multiple kinds**, **dedup boundary exactly at 4h (≥ not >)**, **cold-start suppression at 287 vs fires at 288**, top-N limit, coin list with 500 entries / 50% qualifying produces ≤ TOP_N alerts |
-| `tests/test_social_baselines.py` | rolling avg correctness, **spike-day value does NOT poison baseline**, sample_count increments, **survives restart** (close DB, reopen, confirm sample_count preserved), graceful shutdown flush |
-| `tests/test_social_alert_format.py` | Telegram message structure, Markdown escaping, URL inclusion, >4096 char truncation, multi-kind message format, missing price_cache enrichment |
-| `tests/test_social_credit_budget.py` | 80% soft shift, 95% hard stop, midnight-UTC rollover, concurrent credit counting under multiple requests |
-| `tests/test_social_db.py` | tables created, indexes present, 30-day prune deletes correctly, dedup query uses `datetime()` wrap |
-| `tests/test_trending_tracker_social.py` (extend) | social_lead_minutes computed when social fires before trending appearance |
+| `tests/test_social_lunarcrush_client.py` | auth header correct; 429 backoff sequence (5/10/20/60s cap); **401 sets disabled flag + exits loop cleanly**; malformed-JSON resilience; missing-field handling; field name drift (`social_volume_24h` / `interactions_24h` / `social_dominance`); own ClientSession isolation (main pipeline closing its session does not break this client) |
+| `tests/test_social_detector.py` | each of 3 spike kinds fires independently; **multi-kind coin produces ONE alert with multiple fired_* flags set**; **dedup boundary exactly at 4h (≥ not >)**; **cold-start suppression at 287 vs fires at 288**; top-N limit; coin list with 500 entries / 50% qualifying produces ≤ TOP_N alerts; **interactions_accel with <6 ring slots skips check silently** |
+| `tests/test_social_baselines.py` | EWMA rolling avg correctness; **upward spike (2x) skips avg update but increments sample_count**; **downward collapse (0.5x) skips avg update but increments sample_count**; **null / zero value skips update entirely (no sample_count increment)**; **survives restart** (checkpoint, close DB, reopen, confirm sample_count + avg preserved); **graceful shutdown flushes cache via finally block (not atexit)**; interactions ring buffer rotates correctly on 7+ writes; `asyncio.CancelledError` during a poll triggers finally flush, not data loss |
+| `tests/test_social_alert_format.py` | Telegram message structure; **Markdown escaping of `AS_ROID`-style names via `_escape_md`**; URL inclusion (LunarCrush + CoinGecko when slug known); **>4096 char truncation**; **multi-kind message lists all 3 kinds correctly**; missing `price_change_1h` renders `—` not None/error |
+| `tests/test_social_credit_budget.py` | 80% soft downshift to `LUNARCRUSH_POLL_INTERVAL_SOFT`; 95% hard stop; **midnight-UTC rollover resets counter (via injected fake clock)**; **ledger persists across simulated restart**; soft→hard transition mid-cycle stops fetch immediately |
+| `tests/test_social_db.py` | tables created with all columns including `fired_*` booleans; **UNIQUE(coin_id, detected_at) constraint enforced** (second INSERT for same pair is no-op); 30-day prune deletes correctly; dedup query uses `datetime()` wrap; composite index covers prune scan |
+| `tests/test_social_loop_flow.py` | **DB INSERT succeeds, Telegram succeeds → baseline cache updated**; **DB INSERT fails, Telegram NOT called, baseline cache NOT updated (buffered-commit pattern)**; **DB INSERT succeeds, Telegram fails → baseline cache IS updated (alert considered sent from dedup's perspective)**; non-firing coins' baseline updates commit regardless of tx outcome; done-callback re-creates task with 30s back-off on uncaught exception |
+| `tests/test_social_price_enrichment.py` | matches `last_raw_markets` by `LOWER(symbol)`; matches by `coin_id` slug; returns `(None, None)` when no match; never raises |
+| `tests/test_trending_tracker_social.py` (extend) | `_check_detector` helper refactor preserves existing behavior for narrative/pipeline/chains (regression guard); social tier computed when social fires before trending appearance; `TrendingStats.by_social` counted correctly; additive migration (`ALTER TABLE ADD COLUMN`) runs idempotently on an existing DB |
 
-Target: +~40 new tests, full suite passing with no regressions to existing 616.
+Target: **+45 new tests** (slight upward revision after BLOCKING fixes), full suite passing with no regressions to existing 616.
 
 ---
 
 ## 14. Rollout plan
 
-1. Branch `feat/lunarcrush-integration` off current master (`07d4d58`).
-2. TDD loop per test file above. Commit per green milestone.
-3. Full pytest green → open PR #28.
-4. Design-review agents (2) dispatched on spec before coding, PR-review agents (3) dispatched on final diff.
-5. Deploy: on VPS, pull + append to `.env`:
+1. Branch `feat/lunarcrush-integration` off current master (HEAD after spec commit).
+2. **Commit 1** — prerequisite refactor: extract `_check_detector()` helper in `scout/trending/tracker.py`. Green tests for existing tiers, zero behavior change.
+3. **Commit 2+** — TDD loop per test file in §13. Commit per green milestone.
+4. Full pytest green → open PR #28.
+5. PR-review agents (3) dispatched on final diff.
+6. Deploy: on VPS, pull + append to `.env`:
    ```
    LUNARCRUSH_ENABLED=true
    LUNARCRUSH_API_KEY=<purchased>
    ```
    Restart `gecko-pipeline.service`.
-6. Watch for 30h:
+7. Watch for 30h:
    - Day 1: baseline_warmup events expected; no alerts yet.
    - Day 2 hour 0 onward: alerts begin firing.
    - Metrics: no 401/403, no credit_budget_exhausted, alert rate within 0–10/day.
+
+### Operational runbook — tuning noisy first day
+
+If alert rate exceeds expectations on day 2:
+```
+# Edit VPS .env
+LUNARCRUSH_TOP_N=5                         # halve output volume
+LUNARCRUSH_SOCIAL_SPIKE_RATIO=3.0          # tighten threshold
+sudo systemctl restart gecko-pipeline.service
+```
+Values are re-read at each cycle start (§10), so restart is the fastest knob. Kill-switch:
+```
+LUNARCRUSH_ENABLED=false
+sudo systemctl restart gecko-pipeline.service
+```
 
 ---
 
@@ -379,17 +526,19 @@ Target: +~40 new tests, full suite passing with no regressions to existing 616.
 
 ## 17. Summary of reviewer findings incorporated
 
+### Round 1 (plan reviewers)
+
 | Reviewer | Finding | Incorporated in |
 |---|---|---|
 | Architect | Per-cycle SQLite writes at scale | §6 in-process cache + 60-min checkpoint |
 | Architect | 3 spike types → god function | §5 three pure functions |
 | Architect | Naming collision for future vendors | §3 nested `scout/social/lunarcrush/` |
-| Architect | Price context from `price_cache` (not HTTP) | §8 step 8 |
-| Architect | Trending tracker integration gap | §12 |
+| Architect | Price context in-process (not HTTP) | §8.1 `last_raw_markets` |
+| Architect | Trending tracker integration gap | §12 four-file plan |
 | Risk | Baseline lockout on restart | §6 DB persistence |
 | Risk | Multi-kind spam | §5.2 collapse to one alert |
 | Risk | DB-write-before-Telegram | §8 flow step order |
-| Risk | Baseline poisoning | §5.4 spike-exclusion rule |
+| Risk | Baseline poisoning | §5.4 symmetric spike-exclusion rule |
 | Risk | Research-only via convention | §3 `ResearchAlert` type |
 | Risk | No retention | §7 30-day prune |
 | Risk | Multiple test gaps | §13 full test matrix |
@@ -397,3 +546,31 @@ Target: +~40 new tests, full suite passing with no regressions to existing 616.
 | API reality | Field name drift | §4 table + §7 schema |
 | API reality | Credits budget, not just req/min | §4 + §10 settings |
 | API reality | Hard 10/min rate limit | §10 `LUNARCRUSH_RATE_LIMIT_PER_MIN=9` |
+
+### Round 2 (design reviewers — v2 delta)
+
+| Reviewer | Severity | Finding | Incorporated in |
+|---|---|---|---|
+| Reviewer #1 | BLOCKING | `compare_with_signals()` extension needs 4 touch-points | §12 table enumerating all four files |
+| Reviewer #1 | BLOCKING | `atexit` incompatible with `asyncio.Task` | §6 shutdown via `asyncio.CancelledError` in `finally` |
+| Reviewer #1 | BLOCKING | Retention prune in `Database.initialize()` is wrong | §6/§7 moved to `loop.py` startup |
+| Reviewer #1 | NON-BLOCKING | Cold-start baseline `sample_count` increment ambiguity | §5.3 explicit progress invariant |
+| Reviewer #1 | NON-BLOCKING | `interactions_accel` window undefined vs 5-min poll | §5.1 6-slot ring buffer with explicit skip-when-short |
+| Reviewer #1 | NON-BLOCKING | Hardcoded `2.0` / `288` literals | §5.4 all settings-driven |
+| Reviewer #1 | NON-BLOCKING | LunarCrush URL slug assumption | §9 use `coin_id` form |
+| Reviewer #1 | NON-BLOCKING | `freezegun` dependency for midnight test | §13 injected `clock` parameter |
+| Reviewer #1 | NON-BLOCKING | `price_cache` has no `price_change_1h` column | §8.1 source from `last_raw_markets` |
+| Reviewer #1 | NON-BLOCKING | `LUNARCRUSH_CHECKPOINT_EVERY_N_POLLS` setting coherence | §6 explicit read from settings |
+| Reviewer #2 | BLOCKING | Asymmetric spike-exclusion (upward only) | §5.4 handles nulls + collapses |
+| Reviewer #2 | BLOCKING | CSV `spike_kinds` breaks queryability | §7 three boolean `fired_*` columns |
+| Reviewer #2 | BLOCKING | Baseline + insert transactionality | §8 buffered-commit pattern |
+| Reviewer #2 | MAJOR | No `UNIQUE(coin_id, detected_at)` | §7 UNIQUE constraint + `INSERT OR IGNORE` |
+| Reviewer #2 | MAJOR | Credit ledger in-memory only | §7 `social_credit_ledger` table |
+| Reviewer #2 | MAJOR | No hot knob for alert rate | §10 settings re-read per cycle + §14 runbook |
+| Reviewer #2 | MAJOR | Missing specific tests | §13 added loop-flow and price-enrichment test files |
+| Reviewer #2 | MAJOR | Tracker extension invasive without prior refactor | §12 `_check_detector` extraction as prereq commit |
+| Reviewer #2 | MAJOR | Hydration race on startup | §6 `db.initialized.wait()` barrier |
+| Reviewer #2 | MAJOR | Shared `aiohttp.ClientSession` coupling | §2 own session for vendor isolation |
+| Reviewer #2 | MINOR | Interval-aware warmup (soft downshift → 48h) | §5.3 hours-based with `LUNARCRUSH_BASELINE_MIN_HOURS` |
+| Reviewer #2 | MINOR | Markdown escape for `AS_ROID` names | §9 reuse `_escape_md` |
+| Reviewer #2 | MINOR | Done-callback + no `gather()` for social task | §2 `main.py` wiring description |
