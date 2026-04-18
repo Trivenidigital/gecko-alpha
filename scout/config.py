@@ -150,6 +150,29 @@ class Settings(BaseSettings):
     SECONDWAVE_DEDUP_DAYS: int = 7
     SECONDWAVE_MIN_VOLUME_POINTS: int = 2
 
+    # -------- LunarCrush Social-Velocity Alerter --------
+    # Research-only social-velocity signals (Telegram plain-text, no paper
+    # trade dispatch). Double kill-switch: either LUNARCRUSH_ENABLED=false or
+    # empty LUNARCRUSH_API_KEY disables the loop entirely.
+    LUNARCRUSH_ENABLED: bool = False
+    LUNARCRUSH_API_KEY: str = ""
+    LUNARCRUSH_BASE_URL: str = "https://lunarcrush.com/api4/public"
+    LUNARCRUSH_POLL_INTERVAL: int = 300                 # 5 min (default / normal)
+    LUNARCRUSH_POLL_INTERVAL_SOFT: int = 600            # 10 min (used after 80% credits)
+    LUNARCRUSH_RATE_LIMIT_PER_MIN: int = 9              # under hard 10/min
+    LUNARCRUSH_DAILY_CREDIT_BUDGET: int = 2000          # free tier cap
+    LUNARCRUSH_CREDIT_SOFT_PCT: float = 0.80            # downshift at 80%
+    LUNARCRUSH_CREDIT_HARD_PCT: float = 0.95            # stop at 95%
+    LUNARCRUSH_SOCIAL_SPIKE_RATIO: float = 2.0
+    LUNARCRUSH_GALAXY_JUMP: float = 10.0
+    LUNARCRUSH_INTERACTIONS_ACCEL: float = 3.0
+    LUNARCRUSH_DEDUP_HOURS: int = 4
+    LUNARCRUSH_TOP_N: int = 10
+    LUNARCRUSH_BASELINE_MIN_HOURS: int = 24             # warmup wall-clock, interval-aware
+    LUNARCRUSH_BASELINE_MIN_SAMPLES: int = 288          # EWMA alpha denominator
+    LUNARCRUSH_CHECKPOINT_EVERY_N_POLLS: int = 12       # 60 min
+    LUNARCRUSH_RETENTION_DAYS: int = 30
+
     # -------- Paper Trading Engine --------
     TRADING_ENABLED: bool = False                  # master switch
     TRADING_MODE: str = "paper"                    # "paper" or "live"
