@@ -1,9 +1,26 @@
 """Shared test fixtures for CoinPump Scout."""
 
+import os
+
 import pytest
 
 from scout.config import Settings
 from scout.models import CandidateToken
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Force-exit the process once pytest is done.
+
+    aiosqlite's worker threads occasionally keep the Python interpreter
+    alive on Linux after all tests pass — the threads try to signal a
+    closed event loop, raise, and something in the shutdown path blocks
+    indefinitely (observed as a 9-minute hang after "812 passed" on CI).
+    Tests themselves are green; this hook just prevents shutdown from
+    eating the CI job timeout. Local developers are unaffected because
+    the same hang doesn't reproduce on Windows.
+    """
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        os._exit(exitstatus)
 
 
 @pytest.fixture
