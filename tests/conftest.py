@@ -9,15 +9,18 @@ from scout.models import CandidateToken
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """Force-exit the process once pytest is done.
+    """Force-exit on CI once pytest finishes.
 
-    aiosqlite's worker threads occasionally keep the Python interpreter
-    alive on Linux after all tests pass — the threads try to signal a
-    closed event loop, raise, and something in the shutdown path blocks
-    indefinitely (observed as a 9-minute hang after "812 passed" on CI).
-    Tests themselves are green; this hook just prevents shutdown from
-    eating the CI job timeout. Local developers are unaffected because
-    the same hang doesn't reproduce on Windows.
+    aiosqlite opens a non-daemon worker thread per Connection. Any test that
+    forgets `await db.close()` leaks that thread, which blocks the interpreter
+    from exiting. On Linux CI this manifested as a 9-minute hang after all
+    tests passed; on Windows (local dev) the same leak was historically
+    benign because Python's thread shutdown path is different there.
+
+    Known remaining explicit leakers are fixed test-by-test (see commits
+    touching `await db.close()`). This hook is belt-and-braces: if a future
+    test leaks, CI still exits on time rather than burning the job timeout.
+    Local developers don't hit this path because it only fires on GHA.
     """
     if os.environ.get("GITHUB_ACTIONS") == "true":
         os._exit(exitstatus)

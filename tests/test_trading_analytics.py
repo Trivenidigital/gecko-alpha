@@ -296,6 +296,7 @@ async def test_lead_time_breakdown_filters_status_ok(tmp_path):
     assert row["count_error"] == 1
     # D21 percentile-in-Python: for n=2 sorted [-20, -10], median = values[n//2] = values[1] = -10.
     assert row["median_min"] == -10.0
+    await db.close()
 
 
 async def test_lead_time_breakdown_exact_percentiles(tmp_path):
