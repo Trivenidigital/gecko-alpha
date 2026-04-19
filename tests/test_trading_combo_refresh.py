@@ -230,6 +230,43 @@ async def test_window_cutoff_30d_excludes_very_old_trades(tmp_path, settings_fac
     await db.close()
 
 
+async def test_closed_manual_excluded_from_wr(tmp_path, settings_factory):
+    """closed_manual trades must NOT count in win-rate aggregation.
+
+    Pre-fix: 10 closed_tp wins + 10 closed_manual (0 pnl) → WR=50% (50% diluted).
+    Post-fix: only closed_tp / closed_sl / closed_expired count → WR=100%.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+    combo = "manual_test_combo"
+
+    # 10 proper TP wins.
+    for _ in range(10):
+        await _insert_trade(
+            db, combo, 10.0, 5.0, now - timedelta(days=2), status="closed_tp"
+        )
+    # 10 force-close manual exits (zero pnl_usd — counts as a loss in naïve query).
+    for _ in range(10):
+        await _insert_trade(
+            db, combo, 0.0, 0.0, now - timedelta(days=2), status="closed_manual"
+        )
+
+    ok = await combo_refresh.refresh_combo(db, combo, s)
+    assert ok is True
+
+    row = await _get_combo_row(db, combo, "30d")
+    # Only the 10 closed_tp rows should count.
+    assert (
+        row["trades"] == 10
+    ), f"Expected 10 trades (closed_manual excluded), got {row['trades']}"
+    assert (
+        abs(row["win_rate_pct"] - 100.0) < 0.01
+    ), f"Expected 100% WR (all closed_tp wins), got {row['win_rate_pct']}"
+    await db.close()
+
+
 async def test_zero_trade_combo_writes_empty_row(tmp_path, settings_factory):
     """A combo with no closed trades in window — no error, trades=0, not suppressed."""
     db = Database(tmp_path / "t.db")
@@ -307,15 +344,12 @@ async def test_refresh_failures_resets_to_zero_on_success(tmp_path, settings_fac
 
 
 async def test_chronic_failure_threshold_detected(tmp_path, settings_factory):
-    """refresh_all returns combos whose refresh_failures >= threshold."""
+    """refresh_all returns combos whose 30d window refresh_failures >= threshold."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     s = settings_factory()
     now = datetime.now(timezone.utc)
-    # Seed a combo with refresh_failures=3 (== default threshold) and no trades
-    # in last 30d, so it won't be picked up by the DISTINCT scan — manually
-    # include it via refresh_all's second SELECT which queries combo_performance
-    # directly for chronic failures.
+    # Seed a combo with refresh_failures=3 (== default threshold) in 30d window.
     await db._conn.execute(
         "INSERT INTO combo_performance "
         "(combo_key, window, trades, wins, losses, total_pnl_usd, "
@@ -327,6 +361,66 @@ async def test_chronic_failure_threshold_detected(tmp_path, settings_factory):
 
     summary = await combo_refresh.refresh_all(db, s)
     assert "stuck" in summary["chronic_failures"]
+    await db.close()
+
+
+async def test_failure_counter_scoped_to_window(
+    tmp_path, settings_factory, monkeypatch
+):
+    """A single refresh_combo failure must only increment the 30d row, not the 7d row."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+    combo = "scope_test"
+
+    # Pre-seed both windows with refresh_failures=0.
+    for window in ("7d", "30d"):
+        await db._conn.execute(
+            "INSERT INTO combo_performance "
+            "(combo_key, window, trades, wins, losses, total_pnl_usd, "
+            " avg_pnl_pct, win_rate_pct, suppressed, refresh_failures, last_refreshed) "
+            "VALUES (?, ?, 0, 0, 0, 0, 0, 0, 0, 0, ?)",
+            (combo, window, now.isoformat()),
+        )
+    await db._conn.commit()
+
+    # Seed one closed_tp trade so the SELECT query runs.
+    await _insert_trade(db, combo, 10.0, 5.0, now - timedelta(days=1))
+
+    original_execute = db._conn.execute
+    import aiosqlite
+
+    async def _fail_on_upsert(sql, *args, **kwargs):
+        if "INSERT INTO combo_performance" in str(sql) and "'7d'" in str(sql):
+            raise aiosqlite.OperationalError("forced 7d upsert failure")
+        return await original_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(db._conn, "execute", _fail_on_upsert)
+    ok = await combo_refresh.refresh_combo(db, combo, s)
+    assert ok is False
+
+    monkeypatch.setattr(db._conn, "execute", original_execute)
+
+    # 30d window: refresh_failures must have incremented.
+    cur = await db._conn.execute(
+        "SELECT refresh_failures FROM combo_performance WHERE combo_key=? AND window='30d'",
+        (combo,),
+    )
+    row_30d = await cur.fetchone()
+    assert (
+        row_30d["refresh_failures"] >= 1
+    ), "30d refresh_failures must increment on error"
+
+    # 7d window: refresh_failures must still be 0 (scoped update).
+    cur = await db._conn.execute(
+        "SELECT refresh_failures FROM combo_performance WHERE combo_key=? AND window='7d'",
+        (combo,),
+    )
+    row_7d = await cur.fetchone()
+    assert (
+        row_7d["refresh_failures"] == 0
+    ), f"7d refresh_failures must stay at 0, got {row_7d['refresh_failures']}"
     await db.close()
 
 
@@ -376,7 +470,7 @@ async def test_mid_parole_refresh_preserves_parole_at(tmp_path, settings_factory
         "SELECT parole_at FROM combo_performance WHERE combo_key='midpar' AND window='30d'"
     )
     row = await cur.fetchone()
-    assert row["parole_at"] == original_parole, (
-        f"parole_at was overwritten: expected {original_parole!r}, got {row['parole_at']!r}"
-    )
+    assert (
+        row["parole_at"] == original_parole
+    ), f"parole_at was overwritten: expected {original_parole!r}, got {row['parole_at']!r}"
     await db.close()
