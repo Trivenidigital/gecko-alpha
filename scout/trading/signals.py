@@ -26,6 +26,7 @@ async def trade_volume_spikes(engine, db: Database, spikes: list[dict]) -> None:
                 signal_type="volume_spike",
                 signal_data={"spike_ratio": spike.get("spike_ratio", 0)},
                 entry_price=spike.get("current_price"),
+                signal_combo="volume_spike",
             )
         except Exception:
             logger.exception(
@@ -52,7 +53,8 @@ async def trade_gainers(engine, db: Database, min_mcap: float = 5_000_000) -> No
         new_gainers = await cursor.fetchall()
         skipped_null_mcap = sum(1 for g in new_gainers if g["market_cap"] is None)
         skipped_low_mcap = sum(
-            1 for g in new_gainers
+            1
+            for g in new_gainers
             if g["market_cap"] is not None and g["market_cap"] < min_mcap
         )
         if skipped_null_mcap or skipped_low_mcap:
@@ -78,6 +80,7 @@ async def trade_gainers(engine, db: Database, min_mcap: float = 5_000_000) -> No
                         "mcap": g["market_cap"],
                     },
                     entry_price=g["price_at_snapshot"],
+                    signal_combo="gainers_early",
                 )
             except Exception:
                 logger.exception("trading_gainers_error", coin_id=g["coin_id"])
@@ -103,7 +106,8 @@ async def trade_losers(engine, db: Database, min_mcap: float = 5_000_000) -> Non
         new_losers = await cursor.fetchall()
         skipped_null_mcap = sum(1 for l in new_losers if l["market_cap"] is None)
         skipped_low_mcap = sum(
-            1 for l in new_losers
+            1
+            for l in new_losers
             if l["market_cap"] is not None and l["market_cap"] < min_mcap
         )
         if skipped_null_mcap or skipped_low_mcap:
@@ -137,6 +141,7 @@ async def trade_losers(engine, db: Database, min_mcap: float = 5_000_000) -> Non
                         "mcap": l["market_cap"],
                     },
                     entry_price=loser_price,
+                    signal_combo="losers_contrarian",
                 )
             except Exception:
                 logger.exception("trading_losers_error", coin_id=l["coin_id"])
@@ -184,6 +189,7 @@ async def trade_first_signals(
                     "signals": signals_fired,
                 },
                 entry_price=price,
+                signal_combo="first_signal",
             )
         except Exception:
             logger.exception("trading_first_signal_error", token=token.ticker)
@@ -209,7 +215,8 @@ async def trade_trending(engine, db: Database, max_mcap_rank: int = 1500) -> Non
         new_trending = await cursor.fetchall()
         skipped_null_rank = sum(1 for t in new_trending if t["market_cap_rank"] is None)
         skipped_low_rank = sum(
-            1 for t in new_trending
+            1
+            for t in new_trending
             if t["market_cap_rank"] is not None and t["market_cap_rank"] > max_mcap_rank
         )
         if skipped_null_rank or skipped_low_rank:
@@ -242,6 +249,7 @@ async def trade_trending(engine, db: Database, max_mcap_rank: int = 1500) -> Non
                         "mcap_rank": rank,
                     },
                     entry_price=trending_price,
+                    signal_combo="trending_catch",
                 )
             except Exception:
                 logger.exception("trading_trending_error", coin_id=t["coin_id"])
@@ -250,21 +258,42 @@ async def trade_trending(engine, db: Database, max_mcap_rank: int = 1500) -> Non
 
 
 _JUNK_CATEGORIES = {
-    "zoo-themed", "trading bots", "arcade games", "runes",
-    "bridged stablecoin", "bridged tokens", "stablecoins",
-    "wrapped tokens", "lp tokens", "memorial themed",
-    "sticker-themed coins", "gotchiverse", "drc-20",
-    "four.meme ecosystem (bnb memes)", "bonk.fun ecosystem",
-    "pump.fun creator", "pump fund portfolio",
-    "meme-token", "dog-themed", "cat-themed", "frog-themed",
-    "solana-meme-coins", "base-meme-coins", "pump.fun ecosystem",
-    "bnb-meme-coins", "ethereum-meme-coins", "trx-meme-coins",
-    "avax-meme-coins", "fan-tokens",
+    "zoo-themed",
+    "trading bots",
+    "arcade games",
+    "runes",
+    "bridged stablecoin",
+    "bridged tokens",
+    "stablecoins",
+    "wrapped tokens",
+    "lp tokens",
+    "memorial themed",
+    "sticker-themed coins",
+    "gotchiverse",
+    "drc-20",
+    "four.meme ecosystem (bnb memes)",
+    "bonk.fun ecosystem",
+    "pump.fun creator",
+    "pump fund portfolio",
+    "meme-token",
+    "dog-themed",
+    "cat-themed",
+    "frog-themed",
+    "solana-meme-coins",
+    "base-meme-coins",
+    "pump.fun ecosystem",
+    "bnb-meme-coins",
+    "ethereum-meme-coins",
+    "trx-meme-coins",
+    "avax-meme-coins",
+    "fan-tokens",
 }
 
 
 async def trade_predictions(
-    engine, db: Database, prediction_models: list,
+    engine,
+    db: Database,
+    prediction_models: list,
     min_mcap: float = 5_000_000,
     min_fit_score: int = 1,
 ) -> None:
@@ -285,7 +314,10 @@ async def trade_predictions(
         if (pred.narrative_fit_score or 0) < min_fit_score:
             continue
         # Quality gate: skip junk categories
-        if pred.category_name and pred.category_name.lower().strip() in _JUNK_CATEGORIES:
+        if (
+            pred.category_name
+            and pred.category_name.lower().strip() in _JUNK_CATEGORIES
+        ):
             continue
         try:
             pc = await db._conn.execute(
@@ -304,6 +336,7 @@ async def trade_predictions(
                     "mcap": pred.market_cap_at_prediction,
                 },
                 entry_price=pred_price,
+                signal_combo="narrative_prediction",
             )
         except Exception:
             logger.exception(
@@ -341,6 +374,7 @@ async def trade_chain_completions(engine, db: Database, settings) -> None:
                         "boost": c["conviction_boost"],
                     },
                     entry_price=chain_price,
+                    signal_combo="chain_completed",
                 )
             except Exception:
                 logger.exception("trading_chain_error", token_id=c["token_id"])
