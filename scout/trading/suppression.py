@@ -90,10 +90,13 @@ async def should_open(db: Database, combo_key: str, *, settings) -> tuple[bool, 
     # interleave their BEGIN...COMMIT blocks across asyncio suspend points.
     # SQLite's per-file locking still protects against separate Connection
     # objects (see test_concurrent_decrement_grants_only_one).
-    lock = db._txn_lock
-    if lock is None:
-        lock = asyncio.Lock()
-    async with lock:
+    if db._txn_lock is None:
+        raise RuntimeError(
+            "Database._txn_lock is None — Database.initialize() was not awaited "
+            "before should_open(). A fresh ephemeral Lock here would silently "
+            "break mutual exclusion across concurrent callers."
+        )
+    async with db._txn_lock:
         try:
             await db._conn.execute("BEGIN IMMEDIATE")
             cur = await db._conn.execute(

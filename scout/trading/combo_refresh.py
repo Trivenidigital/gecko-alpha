@@ -20,10 +20,13 @@ async def refresh_combo(db: Database, combo_key: str, settings) -> bool:
     # Acquire the shared asyncio.Lock so the multi-statement read→write
     # sequence here cannot interleave with should_open's BEGIN...COMMIT block
     # across asyncio suspend points within the same event loop.
-    lock = db._txn_lock
-    if lock is None:
-        lock = asyncio.Lock()
-    async with lock:
+    if db._txn_lock is None:
+        raise RuntimeError(
+            "Database._txn_lock is None — Database.initialize() was not awaited "
+            "before refresh_combo(). A fresh ephemeral Lock here would silently "
+            "break mutual exclusion across concurrent callers."
+        )
+    async with db._txn_lock:
         return await _refresh_combo_locked(db, combo_key, settings)
 
 
