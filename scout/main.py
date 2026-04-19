@@ -64,7 +64,8 @@ _social_restart_tasks: set[asyncio.Task] = set()
 # signal. Used by the done-callback to enforce LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS.
 _social_consecutive_restarts = [0]
 
-# Consecutive combo_refresh failure counter (resets on success).
+# Consecutive combo_refresh failure counter; incremented on failure, reset to 0 on success.
+# Used to trigger streak-alert when >= 3 consecutive failures occur.
 _combo_refresh_failure_streak = 0
 
 
@@ -79,10 +80,9 @@ async def _run_feedback_schedulers(
 
     Pure side-effecting helper (no loop state) — the caller passes
     last-run sentinels + a clock, and gets the updated sentinels back.
-    Using local time is a deliberate choice to match the daily-summary
-    scheduling already in _pipeline_loop; operators set cron-style hours
-    in server-local wall-clock (documented in settings docstrings).
-    Cron drift across DST is accepted as a spec §6 Flow C constraint.
+    Takes a naive-local datetime (server wall-clock) deliberately so operators
+    can set FEEDBACK_COMBO_REFRESH_HOUR / FEEDBACK_WEEKLY_DIGEST_HOUR in
+    familiar local time, not UTC. Cron drift across DST is an accepted constraint.
     """
     global _combo_refresh_failure_streak
     today_iso = now_local.strftime("%Y-%m-%d")
