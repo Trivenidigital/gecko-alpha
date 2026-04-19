@@ -50,6 +50,9 @@ from scout.trading.signals import (
 )
 from scout.briefing.collector import collect_briefing_data
 from scout.briefing.synthesizer import split_message, synthesize_briefing
+from scout import alerter
+from scout.trading import combo_refresh as _combo_refresh
+from scout.trading import weekly_digest as _weekly_digest
 
 logger = structlog.get_logger()
 
@@ -60,6 +63,72 @@ _social_restart_tasks: set[asyncio.Task] = set()
 # Shared counter for consecutive social-loop restarts; resets on any success
 # signal. Used by the done-callback to enforce LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS.
 _social_consecutive_restarts = [0]
+
+# Consecutive combo_refresh failure counter (resets on success).
+_combo_refresh_failure_streak = 0
+
+
+async def _run_feedback_schedulers(
+    db,
+    settings,
+    last_refresh_date: str,
+    last_digest_date: str,
+    now_local: datetime,
+) -> tuple[str, str]:
+    """Run the nightly combo refresh and weekly digest if their windows fire.
+
+    Pure side-effecting helper (no loop state) — the caller passes
+    last-run sentinels + a clock, and gets the updated sentinels back.
+    Using local time is a deliberate choice to match the daily-summary
+    scheduling already in _pipeline_loop; operators set cron-style hours
+    in server-local wall-clock (documented in settings docstrings).
+    Cron drift across DST is accepted as a spec §6 Flow C constraint.
+    """
+    global _combo_refresh_failure_streak
+    today_iso = now_local.strftime("%Y-%m-%d")
+
+    # Nightly combo refresh (FEEDBACK_COMBO_REFRESH_HOUR, local)
+    if (
+        now_local.hour == settings.FEEDBACK_COMBO_REFRESH_HOUR
+        and last_refresh_date != today_iso
+    ):
+        try:
+            summary = await _combo_refresh.refresh_all(db, settings)
+            logger.info("combo_refresh_done", **summary)
+            _combo_refresh_failure_streak = 0
+        except Exception:
+            _combo_refresh_failure_streak += 1
+            logger.exception(
+                "combo_refresh_loop_error",
+                consecutive_failures=_combo_refresh_failure_streak,
+            )
+            if _combo_refresh_failure_streak >= 3:
+                # Fire once per streak (reset when refresh succeeds).
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        await alerter.send_telegram_message(
+                            f"⚠ combo_refresh failed {_combo_refresh_failure_streak}× "
+                            f"in a row — check logs.",
+                            session,
+                            settings,
+                        )
+                except Exception:
+                    logger.exception("combo_refresh_streak_alert_dispatch_error")
+        last_refresh_date = today_iso
+
+    # Weekly digest (FEEDBACK_WEEKLY_DIGEST_WEEKDAY, _HOUR local)
+    if (
+        now_local.weekday() == settings.FEEDBACK_WEEKLY_DIGEST_WEEKDAY
+        and now_local.hour == settings.FEEDBACK_WEEKLY_DIGEST_HOUR
+        and last_digest_date != today_iso
+    ):
+        try:
+            await _weekly_digest.send_weekly_digest(db, settings)
+        except Exception:
+            logger.exception("weekly_digest_loop_error")
+        last_digest_date = today_iso
+
+    return last_refresh_date, last_digest_date
 
 
 async def briefing_loop(
@@ -82,9 +151,7 @@ async def briefing_loop(
     last_str = await db.get_last_briefing_time()
     if last_str:
         try:
-            last_briefing_at = datetime.fromisoformat(
-                last_str.replace("Z", "+00:00")
-            )
+            last_briefing_at = datetime.fromisoformat(last_str.replace("Z", "+00:00"))
             if last_briefing_at.tzinfo is None:
                 last_briefing_at = last_briefing_at.replace(tzinfo=timezone.utc)
         except (ValueError, TypeError):
@@ -99,12 +166,9 @@ async def briefing_loop(
     while True:
         try:
             now = datetime.now(timezone.utc)
-            should_run = (
-                now.hour in briefing_hours
-                and (
-                    last_briefing_at is None
-                    or (now - last_briefing_at).total_seconds() > 39600  # >11h
-                )
+            should_run = now.hour in briefing_hours and (
+                last_briefing_at is None
+                or (now - last_briefing_at).total_seconds() > 39600  # >11h
             )
 
             if should_run:
@@ -191,7 +255,9 @@ async def _safe_counter_followup(token, session, settings, db=None):
                 pipeline="memecoin",
                 event_type="counter_scored",
                 event_data={
-                    "risk_score": counter.risk_score if counter.risk_score is not None else 0,
+                    "risk_score": (
+                        counter.risk_score if counter.risk_score is not None else 0
+                    ),
                     "flag_count": len(counter.red_flags or []),
                     "high_severity_count": sum(
                         1 for f in (counter.red_flags or []) if f.severity == "high"
@@ -238,13 +304,15 @@ async def run_cycle(
     stats = {"tokens_scanned": 0, "candidates_promoted": 0, "alerts_fired": 0}
 
     # Stage 1: Parallel ingestion
-    dex_tokens, gecko_tokens, cg_movers, cg_trending, cg_by_volume = await asyncio.gather(
-        fetch_trending(session, settings),
-        fetch_trending_pools(session, settings),
-        cg_fetch_top_movers(session, settings),
-        cg_fetch_trending(session, settings),
-        cg_fetch_by_volume(session, settings),
-        return_exceptions=True,
+    dex_tokens, gecko_tokens, cg_movers, cg_trending, cg_by_volume = (
+        await asyncio.gather(
+            fetch_trending(session, settings),
+            fetch_trending_pools(session, settings),
+            cg_fetch_top_movers(session, settings),
+            cg_fetch_trending(session, settings),
+            cg_fetch_by_volume(session, settings),
+            return_exceptions=True,
+        )
     )
     # Handle exceptions from gather
     if isinstance(dex_tokens, Exception):
@@ -296,7 +364,9 @@ async def run_cycle(
             if spikes:
                 logger.info("volume_spikes_detected", count=len(spikes))
                 if trading_engine:
-                    await trade_volume_spikes(trading_engine, db, spikes, settings=settings)
+                    await trade_volume_spikes(
+                        trading_engine, db, spikes, settings=settings
+                    )
         except Exception:
             logger.exception("volume_spike_error")
 
@@ -305,7 +375,8 @@ async def run_cycle(
     if settings.GAINERS_TRACKER_ENABLED and _raw_markets_combined:
         try:
             await store_top_gainers(
-                db, _raw_markets_combined,
+                db,
+                _raw_markets_combined,
                 min_change=settings.GAINERS_MIN_CHANGE,
                 max_mcap=settings.GAINERS_MAX_MCAP,
             )
@@ -313,7 +384,12 @@ async def run_cycle(
             logger.exception("gainers_tracker_error")
         if trading_engine:
             try:
-                await trade_gainers(trading_engine, db, min_mcap=settings.PAPER_MIN_MCAP, settings=settings)
+                await trade_gainers(
+                    trading_engine,
+                    db,
+                    min_mcap=settings.PAPER_MIN_MCAP,
+                    settings=settings,
+                )
             except Exception:
                 logger.exception("gainers_trade_dispatch_error")
 
@@ -321,7 +397,8 @@ async def run_cycle(
     if settings.LOSERS_TRACKER_ENABLED and _raw_markets_combined:
         try:
             await store_top_losers(
-                db, _raw_markets_combined,
+                db,
+                _raw_markets_combined,
                 max_drop=settings.LOSERS_MIN_DROP,
                 max_mcap=settings.LOSERS_MAX_MCAP,
             )
@@ -329,7 +406,12 @@ async def run_cycle(
             logger.exception("losers_tracker_error")
         if trading_engine:
             try:
-                await trade_losers(trading_engine, db, min_mcap=settings.PAPER_MIN_MCAP, settings=settings)
+                await trade_losers(
+                    trading_engine,
+                    db,
+                    min_mcap=settings.PAPER_MIN_MCAP,
+                    settings=settings,
+                )
             except Exception:
                 logger.exception("losers_trade_dispatch_error")
 
@@ -337,7 +419,8 @@ async def run_cycle(
     if settings.MOMENTUM_7D_ENABLED and _raw_markets_combined:
         try:
             momentum_7d = await detect_7d_momentum(
-                db, _raw_markets_combined,
+                db,
+                _raw_markets_combined,
                 min_7d_change=settings.MOMENTUM_7D_MIN_CHANGE,
                 max_mcap=settings.MOMENTUM_7D_MAX_MCAP,
                 min_volume_24h=settings.MOMENTUM_7D_MIN_VOLUME,
@@ -362,7 +445,11 @@ async def run_cycle(
 
     # Stage 2: Aggregate
     all_candidates = aggregate(
-        list(dex_tokens) + list(gecko_tokens) + list(cg_movers) + list(cg_trending) + list(cg_by_volume)
+        list(dex_tokens)
+        + list(gecko_tokens)
+        + list(cg_movers)
+        + list(cg_trending)
+        + list(cg_by_volume)
     )
     stats["tokens_scanned"] = len(all_candidates)
 
@@ -397,8 +484,12 @@ async def run_cycle(
     all_scored_tokens = []  # All tokens with updated quant_score/signals_fired
     for token in enriched:
         try:
-            historical_scores = await db.get_recent_scores(token.contract_address, limit=3)
-            points, signals = score(token, settings, historical_scores=historical_scores)
+            historical_scores = await db.get_recent_scores(
+                token.contract_address, limit=3
+            )
+            points, signals = score(
+                token, settings, historical_scores=historical_scores
+            )
             updated = token.model_copy(
                 update={"quant_score": points, "signals_fired": signals}
             )
@@ -421,7 +512,9 @@ async def run_cycle(
                 scored.append((updated, signals))
                 stats["candidates_promoted"] += 1
         except Exception:
-            logger.exception("scoring_error", token=getattr(token, "contract_address", "?"))
+            logger.exception(
+                "scoring_error", token=getattr(token, "contract_address", "?")
+            )
 
     # Paper trade on first meaningful signal (earliest detection point)
     if trading_engine:
@@ -432,7 +525,9 @@ async def run_cycle(
         ]
         if scored_for_trading:
             await trade_first_signals(
-                trading_engine, db, scored_for_trading,
+                trading_engine,
+                db,
+                scored_for_trading,
                 min_mcap=settings.PAPER_MIN_MCAP,
                 settings=settings,
             )
@@ -665,6 +760,8 @@ async def main() -> None:
     cycle_count = 0
     last_outcome_check = time.monotonic()
     last_summary_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    last_combo_refresh_date = ""  # empty so the first eligible hour fires
+    last_weekly_digest_date = ""
     outcome_check_interval = 3600  # 1 hour
     _reset_heartbeat_stats()
 
@@ -674,16 +771,24 @@ async def main() -> None:
             async def _pipeline_loop() -> None:
                 nonlocal cycle_count
                 nonlocal last_outcome_check, last_summary_date
+                nonlocal last_combo_refresh_date, last_weekly_digest_date
 
                 while not shutdown_event.is_set():
                     try:
                         stats = await run_cycle(
-                            settings, db, session, dry_run=args.dry_run,
+                            settings,
+                            db,
+                            session,
+                            dry_run=args.dry_run,
                             trading_engine=trading_engine,
                         )
                         logger.info("Cycle complete", **stats)
-                        _heartbeat_stats["tokens_scanned"] += stats.get("tokens_scanned", 0)
-                        _heartbeat_stats["candidates_promoted"] += stats.get("candidates_promoted", 0)
+                        _heartbeat_stats["tokens_scanned"] += stats.get(
+                            "tokens_scanned", 0
+                        )
+                        _heartbeat_stats["candidates_promoted"] += stats.get(
+                            "candidates_promoted", 0
+                        )
                         _heartbeat_stats["alerts_fired"] += stats.get("alerts_fired", 0)
                     except Exception as e:
                         logger.error("Cycle failed", error=str(e))
@@ -693,6 +798,7 @@ async def main() -> None:
                     if trading_engine:
                         try:
                             from scout.trading.evaluator import evaluate_paper_trades
+
                             await evaluate_paper_trades(db, settings)
                         except Exception:
                             logger.exception("trading.pipeline_eval_error")
@@ -701,6 +807,7 @@ async def main() -> None:
                     try:
                         from scout.trending.tracker import update_trending_peaks
                         from scout.gainers.tracker import update_gainers_peaks
+
                         await update_trending_peaks(db)
                         await update_gainers_peaks(db)
                     except Exception:
@@ -761,6 +868,17 @@ async def main() -> None:
                             logger.warning("Daily summary failed", error=str(e))
                         last_summary_date = current_date
 
+                    # Nightly combo refresh + weekly digest scheduling
+                    last_combo_refresh_date, last_weekly_digest_date = (
+                        await _run_feedback_schedulers(
+                            db,
+                            settings,
+                            last_combo_refresh_date,
+                            last_weekly_digest_date,
+                            datetime.now(),
+                        )
+                    )
+
                     if args.cycles > 0 and cycle_count >= args.cycles:
                         break
 
@@ -788,17 +906,12 @@ async def main() -> None:
                 )
             if settings.SECONDWAVE_ENABLED:
                 from scout.secondwave.detector import secondwave_loop
-                tasks.append(
-                    asyncio.create_task(secondwave_loop(session, settings))
-                )
+
+                tasks.append(asyncio.create_task(secondwave_loop(session, settings)))
             if settings.BRIEFING_ENABLED:
-                tasks.append(
-                    asyncio.create_task(briefing_loop(session, settings, db))
-                )
+                tasks.append(asyncio.create_task(briefing_loop(session, settings, db)))
             if settings.CHAINS_ENABLED:
-                tasks.append(
-                    asyncio.create_task(run_chain_tracker(db, settings))
-                )
+                tasks.append(asyncio.create_task(run_chain_tracker(db, settings)))
 
             # LunarCrush social-velocity loop runs OUTSIDE asyncio.gather --
             # a social crash must never take down the main pipeline. The
