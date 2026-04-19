@@ -221,6 +221,36 @@ async def test_telegram_split_hard_truncates_long_lines(tmp_path, settings_facto
     assert "footer" in joined
 
 
+def test_split_never_emits_empty_chunks():
+    """Trailing newline past the limit must not produce an empty chunk.
+
+    Telegram's sendMessage rejects empty text with HTTP 400; producing an empty
+    string chunk would poison the whole weekly digest dispatch. A trailing
+    newline (or any sequence of empty lines at a boundary) must be silently
+    dropped, not flushed as a standalone chunk."""
+    # Case A: content exactly at limit followed by a trailing newline.
+    text = "a" * 10 + "\n"
+    chunks = weekly_digest._split_for_telegram(text, 10)
+    assert chunks, "expected at least one chunk"
+    for c in chunks:
+        assert c.strip() != "", f"empty chunk emitted: {chunks!r}"
+        assert len(c) <= 10
+
+    # Case B: leading + trailing newlines around content at the limit.
+    text = "\n" + "b" * 10 + "\n"
+    chunks = weekly_digest._split_for_telegram(text, 10)
+    for c in chunks:
+        assert c.strip() != "", f"empty chunk emitted: {chunks!r}"
+        assert len(c) <= 10
+
+    # Case C: run of blank lines that collectively cross the boundary.
+    text = "c" * 10 + "\n\n\n"
+    chunks = weekly_digest._split_for_telegram(text, 10)
+    for c in chunks:
+        assert c.strip() != "", f"empty chunk emitted: {chunks!r}"
+        assert len(c) <= 10
+
+
 async def test_send_weekly_digest_empty_skips_telegram(
     tmp_path,
     settings_factory,

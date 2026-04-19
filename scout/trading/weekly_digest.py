@@ -290,4 +290,7 @@ def _split_for_telegram(text: str, limit: int) -> list[str]:
             size += len(line) + (1 if len(buf) > 1 else 0)
     if buf:
         chunks.append("\n".join(buf))
-    return chunks
+    # Drop empty/whitespace-only chunks. A trailing newline past the limit would
+    # otherwise produce a '' chunk and Telegram sendMessage rejects empty text
+    # with HTTP 400, which would poison the whole digest dispatch.
+    return [c for c in chunks if c.strip()]
