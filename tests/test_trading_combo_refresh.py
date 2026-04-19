@@ -328,3 +328,55 @@ async def test_chronic_failure_threshold_detected(tmp_path, settings_factory):
     summary = await combo_refresh.refresh_all(db, s)
     assert "stuck" in summary["chronic_failures"]
     await db.close()
+
+
+async def test_mid_parole_refresh_preserves_parole_at(tmp_path, settings_factory):
+    """If a combo is actively mid-parole (remaining > 0) and WR hasn't recovered,
+    refresh_combo must NOT overwrite parole_at — otherwise parole timing resets
+    every nightly refresh and the combo never exits the parole window."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT=30)
+    now = datetime.now(timezone.utc)
+    # Seed a combo: suppressed=1, parole set 2 days ago, remaining=2, WR=10%
+    original_parole = (now - timedelta(days=2)).isoformat()
+    await db._conn.execute(
+        "INSERT INTO combo_performance (combo_key, window, trades, wins, losses, "
+        " total_pnl_usd, avg_pnl_pct, win_rate_pct, suppressed, suppressed_at, "
+        " parole_at, parole_trades_remaining, refresh_failures, last_refreshed) "
+        "VALUES ('midpar', '30d', 20, 2, 18, -200, -10, 10.0, 1, ?, ?, 2, 0, ?)",
+        (original_parole, original_parole, original_parole),
+    )
+    await db._conn.commit()
+    # Seed 20 closed trades: 2 wins, 18 losses → WR=10% (still poor < 30%)
+    for i in range(20):
+        status = "closed_tp" if i < 2 else "closed_sl"
+        pnl_usd = 10 if i < 2 else -10
+        pnl_pct = 10.0 if i < 2 else -10.0
+        token_id = f"tm_{i}"
+        await db._conn.execute(
+            "INSERT INTO paper_trades (token_id, symbol, name, chain, signal_type, "
+            " signal_data, entry_price, amount_usd, quantity, tp_pct, sl_pct, "
+            " tp_price, sl_price, status, pnl_usd, pnl_pct, opened_at, closed_at, "
+            " signal_combo) "
+            "VALUES (?, 'S', 'N', 'cg', 'gainers_early', '{}', 1, 100, 100, 20, 10, "
+            " 1.2, 0.9, ?, ?, ?, ?, ?, 'midpar')",
+            (
+                token_id,
+                status,
+                pnl_usd,
+                pnl_pct,
+                (now - timedelta(days=3, hours=i)).isoformat(),
+                (now - timedelta(days=2, hours=i)).isoformat(),
+            ),
+        )
+    await db._conn.commit()
+    await combo_refresh.refresh_combo(db, "midpar", s)
+    cur = await db._conn.execute(
+        "SELECT parole_at FROM combo_performance WHERE combo_key='midpar' AND window='30d'"
+    )
+    row = await cur.fetchone()
+    assert row["parole_at"] == original_parole, (
+        f"parole_at was overwritten: expected {original_parole!r}, got {row['parole_at']!r}"
+    )
+    await db.close()
