@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import structlog
 
+from scout.config import Settings
 from scout.db import Database
 
 log = structlog.get_logger()
@@ -31,7 +32,7 @@ async def audit_missed_winners(
     db: Database,
     start: datetime,
     end: datetime,
-    settings,
+    settings: Settings,
 ) -> dict:
     """CG winners we did not paper-trade. LEFT JOIN per spec §7."""
     min_pct = settings.FEEDBACK_MISSED_WINNER_MIN_PCT
@@ -62,7 +63,7 @@ async def audit_missed_winners(
     # crossed_at = MIN(snapshot_at) so the catch-window aligns with
     # the FIRST moment this coin crossed the winner threshold.
     cur = await db._conn.execute(
-        f"""
+        """
         WITH winners AS (
             SELECT coin_id,
                    MIN(symbol) AS symbol,
@@ -129,7 +130,15 @@ async def audit_missed_winners(
     uncovered_window: list[dict] = []
     for r in missed_rows:
         row_dict = dict(r)
-        crossed_dt = datetime.fromisoformat(row_dict["crossed_at"])
+        try:
+            crossed_dt = datetime.fromisoformat(row_dict["crossed_at"])
+        except ValueError:
+            log.warning(
+                "audit_crossed_at_parse_error",
+                coin_id=row_dict.get("coin_id"),
+                raw=row_dict.get("crossed_at"),
+            )
+            continue
         if crossed_dt.tzinfo is None:
             crossed_dt = crossed_dt.replace(tzinfo=timezone.utc)
         is_uncovered = any(a <= crossed_dt <= b for a, b in gap_ranges)
@@ -231,7 +240,11 @@ async def detect_pipeline_gaps(
     gaps: list[tuple[str, str]] = []
     prev = None
     for r in rows:
-        cur_ts = datetime.fromisoformat(r[0])
+        try:
+            cur_ts = datetime.fromisoformat(r[0])
+        except ValueError:
+            log.warning("pipeline_gap_parse_error", raw=r[0])
+            continue
         if cur_ts.tzinfo is None:
             cur_ts = cur_ts.replace(tzinfo=timezone.utc)
         if prev is not None:
