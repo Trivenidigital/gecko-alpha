@@ -246,7 +246,17 @@ async def send_weekly_digest(db: Database, settings: Settings) -> None:
                 log.info("weekly_digest_skipped_empty")
                 return
 
-            for chunk in _split_for_telegram(text, _TG_SPLIT_LIMIT):
+            chunks = _split_for_telegram(text, _TG_SPLIT_LIMIT)
+            if not chunks:
+                # build_weekly_digest returned a non-None string but every
+                # chunk was whitespace-only. Should not reach here in practice
+                # (digest content is never all-whitespace), but if it does we
+                # would log "weekly_digest_sent" with non-zero bytes while
+                # dispatching nothing — surface the anomaly loudly instead.
+                log.error("weekly_digest_produced_no_chunks", text_len=len(text))
+                return
+
+            for chunk in chunks:
                 await alerter.send_telegram_message(chunk, session, settings)
             log.info("weekly_digest_sent", bytes=len(text))
         except Exception as e:
@@ -264,9 +274,11 @@ async def send_weekly_digest(db: Database, settings: Settings) -> None:
 def _split_for_telegram(text: str, limit: int) -> list[str]:
     """Split on newline boundaries. Never splits mid-line.
 
-    If a single line exceeds limit, hard-truncate it to prevent Telegram 400s."""
+    If a single line exceeds limit, hard-truncate it to prevent Telegram 400s.
+    Always drops empty/whitespace-only chunks — Telegram sendMessage rejects
+    empty text with HTTP 400, which would poison the whole digest dispatch."""
     if len(text) <= limit:
-        return [text]
+        return [text] if text.strip() else []
     lines = text.split("\n")
     chunks: list[str] = []
     buf: list[str] = []

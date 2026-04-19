@@ -250,6 +250,16 @@ def test_split_never_emits_empty_chunks():
         assert c.strip() != "", f"empty chunk emitted: {chunks!r}"
         assert len(c) <= 10
 
+    # Case D: short-circuit path (len(text) <= limit) — empty string must
+    # return []; the prior fix only applied on the splitting path.
+    assert weekly_digest._split_for_telegram("", 4000) == []
+
+    # Case E: short-circuit whitespace-only input — also returns [].
+    assert weekly_digest._split_for_telegram("   \n\n  ", 4000) == []
+
+    # Case F: short non-empty input goes through unchanged.
+    assert weekly_digest._split_for_telegram("hello", 4000) == ["hello"]
+
 
 async def test_send_weekly_digest_empty_skips_telegram(
     tmp_path,

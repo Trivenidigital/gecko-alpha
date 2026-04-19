@@ -246,6 +246,13 @@ async def test_streak_alert_counter_resets_after_success(
         last_refresh, last_digest = await main_mod._run_feedback_schedulers(
             db, s, last_refresh, last_digest, now,
         )
+        # After the day-4 success, both counters must be zero so that the
+        # next 3-failure streak can re-alert. Checking streak alone isn't
+        # enough — a regression that zeros streak but leaves last_alerted
+        # non-zero would suppress all future streak alerts forever.
+        if day == 4:
+            assert main_mod._combo_refresh_failure_streak == 0
+            assert main_mod._combo_refresh_streak_last_alerted == 0
 
     # Exactly two alerts: one at end of day 3, one at end of day 7.
     assert len(sent) == 2, (
@@ -266,8 +273,11 @@ async def test_dst_fall_back_does_not_double_fire(
     last_refresh_date guard must prevent the refresh from firing twice.
 
     Real-world example: US "fall back" 2026-11-01 — 02:00 → 01:00. An hourly
-    cron seeing local time would observe 01:xx twice. We rely on the sentinel,
-    not on timezone-aware arithmetic, to dedupe."""
+    cron seeing local time would observe distinct wall-clock moments inside
+    hour 1 twice (once pre-shift, once post-shift). We rely on the date
+    sentinel, not on tz arithmetic, to dedupe. Use distinct-but-same-hour
+    timestamps so the test proves dedup works against genuinely different
+    clock reads, not an accidental identity match."""
     from scout.db import Database
     from scout import main as main_mod
 
@@ -281,7 +291,7 @@ async def test_dst_fall_back_does_not_double_fire(
     last_refresh = ""
     last_digest = ""
 
-    # First 01:30 (pre-DST shift).
+    # First 01:30:00 (pre-fall-back instant — EDT on the wall clock).
     now = datetime(2026, 11, 1, 1, 30, 0)
     last_refresh, last_digest = await main_mod._run_feedback_schedulers(
         db, s, last_refresh, last_digest, now,
@@ -289,8 +299,10 @@ async def test_dst_fall_back_does_not_double_fire(
     assert refresh_mock.call_count == 1
     assert last_refresh == "2026-11-01"
 
-    # Second 01:30 after fall-back (same wall-clock hour, same date).
-    now = datetime(2026, 11, 1, 1, 30, 0)
+    # Second read inside the repeated hour-1 wall-clock window — distinct
+    # instant (01:45:15, post-fall-back EST), same local date and same hour.
+    # Must be deduped despite being a genuinely later clock observation.
+    now = datetime(2026, 11, 1, 1, 45, 15)
     last_refresh, last_digest = await main_mod._run_feedback_schedulers(
         db, s, last_refresh, last_digest, now,
     )
@@ -337,6 +349,11 @@ async def test_dst_spring_forward_gapped_hour_skips_silently(
     assert refresh_mock.call_count == 0, (
         "spring-forward gapped hour: refresh must not fire when the loop "
         "never observes hour == target"
+    )
+    # Sentinel must remain unstamped for the skipped day — a future bug that
+    # stamps last_refresh_date on gap-skip would also break next-day behavior.
+    assert last_refresh == "", (
+        f"sentinel must not advance on gap-skip, got {last_refresh!r}"
     )
     # Next day at the configured hour — fires normally.
     now = datetime(2026, 3, 9, 2, 0, 0)
