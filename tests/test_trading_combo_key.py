@@ -60,3 +60,50 @@ def test_signal_type_always_included():
     result = build_combo_key("zzz", ["aaa"])
     assert "zzz" in result
     assert "aaa" in result
+
+
+# ── Normalization tests (Fix 7) ──────────────────────────────────────────────
+
+
+def test_case_insensitive_signal_type():
+    """VOLUME_SPIKE and volume_spike must produce the same key."""
+    assert build_combo_key("VOLUME_SPIKE", None) == build_combo_key(
+        "volume_spike", None
+    )
+
+
+def test_case_insensitive_signals_list():
+    """Mixed-case entries in signals list must normalize to the same key."""
+    assert build_combo_key("first_signal", ["MOMENTUM_RATIO"]) == build_combo_key(
+        "first_signal", ["momentum_ratio"]
+    )
+
+
+def test_mixed_case_both():
+    """Both signal_type and signals entries are normalized."""
+    assert build_combo_key("FIRST_SIGNAL", ["Momentum_Ratio"]) == build_combo_key(
+        "first_signal", ["momentum_ratio"]
+    )
+
+
+def test_whitespace_stripped_from_signal_type():
+    """Leading/trailing whitespace in signal_type is stripped."""
+    assert build_combo_key("  volume_spike  ", None) == "volume_spike"
+
+
+def test_whitespace_stripped_from_signals_list():
+    """Whitespace-padded entries in signals list are stripped."""
+    assert build_combo_key("first_signal", ["  momentum_ratio  "]) == build_combo_key(
+        "first_signal", ["momentum_ratio"]
+    )
+
+
+def test_empty_string_signals_dropped():
+    """Empty strings in signals list are silently dropped."""
+    assert build_combo_key("volume_spike", ["", ""]) == "volume_spike"
+
+
+def test_whitespace_only_signals_dropped():
+    """Whitespace-only signals list entries are dropped."""
+    result = build_combo_key("trending_catch", ["   "])
+    assert result == "trending_catch"

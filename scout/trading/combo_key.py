@@ -15,11 +15,20 @@ def build_combo_key(signal_type: str, signals: list[str] | None) -> str:
 
     Extras beyond the first are dropped and logged for Sprint 2 analysis.
     Output is 'sorted(parts)' joined by '+', so keys are order-insensitive.
+
+    Normalization: signal_type and each signal entry are stripped and
+    lower-cased so that 'VOLUME_SPIKE' and 'volume_spike' produce the same key.
+    Empty / whitespace-only entries in signals are silently dropped.
     """
+    signal_type = signal_type.strip().lower()
     parts = {signal_type}
     dropped: list[str] = []
     if signals:
-        extras = sorted(s for s in signals if s and s != signal_type)
+        extras = sorted(
+            s.strip().lower()
+            for s in signals
+            if s and s.strip() and s.strip().lower() != signal_type
+        )
         if extras:
             parts.add(extras[0])
             dropped = extras[1:]
