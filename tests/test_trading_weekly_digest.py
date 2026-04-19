@@ -150,6 +150,46 @@ async def test_section_failure_does_not_kill_entire_digest(
     await db.close()
 
 
+async def test_section_failure_logs_err_id(tmp_path, settings_factory, monkeypatch):
+    """Section failures must emit err_id='WEEKLY_DIGEST_SECTION' so they can
+    be grepped in production logs (Fix 8 regression gate)."""
+    import structlog.testing
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+    await db._conn.execute(
+        "INSERT INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, "
+        " avg_pnl_pct, win_rate_pct, suppressed, refresh_failures, last_refreshed) "
+        "VALUES ('y', '30d', 10, 5, 5, 0, 0, 50.0, 0, 0, ?)",
+        (now.isoformat(),),
+    )
+    await db._conn.commit()
+
+    from scout.trading import analytics as _analytics
+
+    async def _boom(*a, **k):
+        raise RuntimeError("section error test")
+
+    monkeypatch.setattr(_analytics, "lead_time_breakdown", _boom)
+
+    with structlog.testing.capture_logs() as entries:
+        await weekly_digest.build_weekly_digest(db, end_date=date.today(), settings=s)
+
+    matching = [
+        e
+        for e in entries
+        if e.get("err_id") == "WEEKLY_DIGEST_SECTION"
+        and e.get("section") == "lead_time"
+    ]
+    assert (
+        matching
+    ), f"Expected err_id='WEEKLY_DIGEST_SECTION' log entry, got: {entries}"
+    await db.close()
+
+
 async def test_telegram_split_at_4096_preserves_line_integrity(
     tmp_path,
     settings_factory,

@@ -26,7 +26,11 @@ async def _try_section(section_name: str, coro):
     try:
         return (await coro, True)
     except Exception as e:
-        log.exception("weekly_digest_section_failed", section=section_name)
+        log.exception(
+            "weekly_digest_section_failed",
+            section=section_name,
+            err_id="WEEKLY_DIGEST_SECTION",
+        )
         return ([f"  (error: {type(e).__name__})"], False)
 
 
