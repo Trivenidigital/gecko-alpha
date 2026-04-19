@@ -53,10 +53,10 @@ async def _seed_combo(
 @pytest.fixture(autouse=True)
 def _reset_fallback_state():
     suppression._fallback_timestamps.clear()
-    suppression._last_alerted_ts = 0.0
+    suppression._last_alerted_ts = float("-inf")
     yield
     suppression._fallback_timestamps.clear()
-    suppression._last_alerted_ts = 0.0
+    suppression._last_alerted_ts = float("-inf")
 
 
 async def test_cold_start_allows(tmp_path, settings_factory):

@@ -22,7 +22,11 @@ log = structlog.get_logger()
 
 _FALLBACK_WINDOW_SEC = 3600
 _fallback_timestamps: "deque[float]" = deque()
-_last_alerted_ts: float = 0.0
+# Initialize to -inf so the very first alert always passes the cooldown check.
+# Using 0.0 is wrong on Linux where time.monotonic() can be small near boot
+# (CI runners) — `now_ts - 0.0 >= cooldown` fails until the process has been
+# alive for `cooldown` seconds. -inf removes that OS-dependence.
+_last_alerted_ts: float = float("-inf")
 
 
 def get_fallback_count() -> int:
