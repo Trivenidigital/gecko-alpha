@@ -112,12 +112,10 @@ async def apply_adjustments(
         raise RuntimeError("Database not initialized.")
 
     # Check total evaluated non-control, non-UNRESOLVED predictions
-    cursor = await conn.execute(
-        """SELECT COUNT(*) FROM predictions
+    cursor = await conn.execute("""SELECT COUNT(*) FROM predictions
            WHERE is_control = 0
            AND outcome_class IS NOT NULL
-           AND outcome_class != 'UNRESOLVED'"""
-    )
+           AND outcome_class != 'UNRESOLVED'""")
     total = (await cursor.fetchone())[0]
 
     if total < min_sample:
@@ -141,7 +139,9 @@ async def apply_adjustments(
                 reason,
             )
             applied += 1
-            log.info("learn.adjustment_applied", key=key, new_val=new_val, reason=reason)
+            log.info(
+                "learn.adjustment_applied", key=key, new_val=new_val, reason=reason
+            )
         except (ValueError, KeyError) as exc:
             log.warning("learn.adjustment_failed", adj=adj, error=str(exc))
     return applied
@@ -229,18 +229,19 @@ async def daily_learn(
         regime_breakdown = json.dumps(regime_counts, indent=2)
 
         # Determine cycle number
-        cursor = await conn.execute(
-            "SELECT MAX(cycle_number) FROM learn_logs"
-        )
+        cursor = await conn.execute("SELECT MAX(cycle_number) FROM learn_logs")
         row = await cursor.fetchone()
         cycle_number = (row[0] or 0) + 1
 
         # Pre-aggregate counter-risk correlation stats so Claude does not
         # have to infer them from raw rows.
         counter_stats = {
-            "low_risk_hits": 0, "low_risk_total": 0,
-            "mid_risk_hits": 0, "mid_risk_total": 0,
-            "high_risk_hits": 0, "high_risk_total": 0,
+            "low_risk_hits": 0,
+            "low_risk_total": 0,
+            "mid_risk_hits": 0,
+            "mid_risk_total": 0,
+            "high_risk_hits": 0,
+            "high_risk_total": 0,
         }
         for _p in predictions:
             if _p.get("is_control") or _p.get("counter_risk_score") is None:
@@ -366,24 +367,18 @@ async def weekly_consolidate(
         next_version = lessons_version + 1
 
         # Last 7 daily reflections
-        cursor = await conn.execute(
-            """SELECT reflection_text FROM learn_logs
+        cursor = await conn.execute("""SELECT reflection_text FROM learn_logs
                WHERE cycle_type = 'daily'
-               ORDER BY created_at DESC LIMIT 7"""
-        )
+               ORDER BY created_at DESC LIMIT 7""")
         rows = await cursor.fetchall()
-        weekly_reflections = "\n---\n".join(
-            row[0] for row in rows if row[0]
-        )
+        weekly_reflections = "\n---\n".join(row[0] for row in rows if row[0])
 
         if not weekly_reflections:
             log.info("learn.weekly_skip", reason="no daily reflections")
             return None
 
         # Determine cycle number
-        cursor = await conn.execute(
-            "SELECT MAX(cycle_number) FROM learn_logs"
-        )
+        cursor = await conn.execute("SELECT MAX(cycle_number) FROM learn_logs")
         row = await cursor.fetchone()
         cycle_number = (row[0] or 0) + 1
 

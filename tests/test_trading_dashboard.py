@@ -1,4 +1,5 @@
 """Tests for paper trading dashboard API endpoints."""
+
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -21,6 +22,7 @@ async def db(tmp_path):
 @pytest.fixture
 async def client(db):
     import dashboard.api as api_mod
+
     if api_mod._scout_db is not None:
         await api_mod._scout_db.close()
         api_mod._scout_db = None
@@ -34,7 +36,9 @@ async def client(db):
         api_mod._scout_db = None
 
 
-async def _insert_trade(conn, token_id, symbol, signal_type, status, pnl_usd=None, pnl_pct=None):
+async def _insert_trade(
+    conn, token_id, symbol, signal_type, status, pnl_usd=None, pnl_pct=None
+):
     now = datetime.now(timezone.utc)
     opened = (now - timedelta(hours=2)).isoformat()
     closed = now.isoformat() if status != "open" else None
@@ -45,10 +49,24 @@ async def _insert_trade(conn, token_id, symbol, signal_type, status, pnl_usd=Non
             status, pnl_usd, pnl_pct, opened_at, closed_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            token_id, symbol, token_id.title(), "coingecko", signal_type,
+            token_id,
+            symbol,
+            token_id.title(),
+            "coingecko",
+            signal_type,
             json.dumps({}),
-            100.0, 1000.0, 10.0, 20.0, 10.0, 120.0, 90.0,
-            status, pnl_usd, pnl_pct, opened, closed,
+            100.0,
+            1000.0,
+            10.0,
+            20.0,
+            10.0,
+            120.0,
+            90.0,
+            status,
+            pnl_usd,
+            pnl_pct,
+            opened,
+            closed,
         ),
     )
     await conn.commit()
@@ -66,7 +84,9 @@ async def test_get_positions(client):
 
 async def test_get_history(client):
     c, db = client
-    await _insert_trade(db._conn, "bitcoin", "BTC", "volume_spike", "closed_tp", 200.0, 20.0)
+    await _insert_trade(
+        db._conn, "bitcoin", "BTC", "volume_spike", "closed_tp", 200.0, 20.0
+    )
     resp = await c.get("/api/trading/history")
     assert resp.status_code == 200
     data = resp.json()
@@ -75,8 +95,12 @@ async def test_get_history(client):
 
 async def test_get_stats(client):
     c, db = client
-    await _insert_trade(db._conn, "bitcoin", "BTC", "volume_spike", "closed_tp", 200.0, 20.0)
-    await _insert_trade(db._conn, "ethereum", "ETH", "narrative_prediction", "closed_sl", -50.0, -5.0)
+    await _insert_trade(
+        db._conn, "bitcoin", "BTC", "volume_spike", "closed_tp", 200.0, 20.0
+    )
+    await _insert_trade(
+        db._conn, "ethereum", "ETH", "narrative_prediction", "closed_sl", -50.0, -5.0
+    )
     resp = await c.get("/api/trading/stats")
     assert resp.status_code == 200
     data = resp.json()
@@ -86,8 +110,12 @@ async def test_get_stats(client):
 
 async def test_get_stats_by_signal(client):
     c, db = client
-    await _insert_trade(db._conn, "bitcoin", "BTC", "volume_spike", "closed_tp", 200.0, 20.0)
-    await _insert_trade(db._conn, "ethereum", "ETH", "volume_spike", "closed_sl", -50.0, -5.0)
+    await _insert_trade(
+        db._conn, "bitcoin", "BTC", "volume_spike", "closed_tp", 200.0, 20.0
+    )
+    await _insert_trade(
+        db._conn, "ethereum", "ETH", "volume_spike", "closed_sl", -50.0, -5.0
+    )
     resp = await c.get("/api/trading/stats/by-signal")
     assert resp.status_code == 200
     data = resp.json()

@@ -223,7 +223,16 @@ async def _insert_gainer_at(db, coin_id, market_cap, price, snapshot_at):
            (coin_id, symbol, name, price_change_24h, market_cap, volume_24h,
             price_at_snapshot, snapshot_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (coin_id, coin_id.upper(), coin_id, 25.0, market_cap, 100_000.0, price, snapshot_at),
+        (
+            coin_id,
+            coin_id.upper(),
+            coin_id,
+            25.0,
+            market_cap,
+            100_000.0,
+            price,
+            snapshot_at,
+        ),
     )
     await db._conn.commit()
 
@@ -234,7 +243,16 @@ async def _insert_loser_at(db, coin_id, market_cap, price, snapshot_at):
            (coin_id, symbol, name, price_change_24h, market_cap, volume_24h,
             price_at_snapshot, snapshot_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (coin_id, coin_id.upper(), coin_id, -25.0, market_cap, 100_000.0, price, snapshot_at),
+        (
+            coin_id,
+            coin_id.upper(),
+            coin_id,
+            -25.0,
+            market_cap,
+            100_000.0,
+            price,
+            snapshot_at,
+        ),
     )
     await db._conn.commit()
 
@@ -252,7 +270,9 @@ async def _insert_trending_at(db, coin_id, market_cap_rank, snapshot_at):
 async def test_trade_gainers_skips_snapshots_older_than_5min_same_day(db, engine):
     """A snapshot stored 2 hours ago (same day) must NOT be picked up."""
     stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-    await _insert_gainer_at(db, "stale-gainer", 10_000_000, price=1.0, snapshot_at=stale)
+    await _insert_gainer_at(
+        db, "stale-gainer", 10_000_000, price=1.0, snapshot_at=stale
+    )
     await trade_gainers(engine, db, min_mcap=5_000_000)
     assert await _open_count(db) == 0
 
@@ -282,7 +302,9 @@ async def test_trade_gainers_uses_fresh_snapshot_price_not_earlier_peak(db, engi
     peak_earlier = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat()
     fresh = datetime.now(timezone.utc).isoformat()
     # Earlier peak at $1.75 (would be the stale-entry bug value)
-    await _insert_gainer_at(db, "two-snap", 10_000_000, price=1.75, snapshot_at=peak_earlier)
+    await _insert_gainer_at(
+        db, "two-snap", 10_000_000, price=1.75, snapshot_at=peak_earlier
+    )
     # Current snapshot at $1.44
     await _insert_gainer_at(db, "two-snap", 10_000_000, price=1.44, snapshot_at=fresh)
     await trade_gainers(engine, db, min_mcap=5_000_000)

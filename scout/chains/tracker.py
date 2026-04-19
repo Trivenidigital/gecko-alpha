@@ -307,13 +307,11 @@ async def _load_active_chains(
     db: Database,
 ) -> dict[tuple[str, str, int], ActiveChain]:
     conn = db._conn
-    async with conn.execute(
-        """SELECT id, token_id, pipeline, pattern_id, pattern_name,
+    async with conn.execute("""SELECT id, token_id, pipeline, pattern_id, pattern_name,
                   steps_matched, step_events, anchor_time, last_step_time,
                   is_complete, completed_at, created_at
            FROM active_chains
-           WHERE is_complete = 0"""
-    ) as cur:
+           WHERE is_complete = 0""") as cur:
         rows = await cur.fetchall()
     out: dict[tuple[str, str, int], ActiveChain] = {}
     for row in rows:
@@ -324,16 +322,12 @@ async def _load_active_chains(
             pattern_id=row["pattern_id"],
             pattern_name=row["pattern_name"],
             steps_matched=json.loads(row["steps_matched"]),
-            step_events={
-                int(k): v for k, v in json.loads(row["step_events"]).items()
-            },
+            step_events={int(k): v for k, v in json.loads(row["step_events"]).items()},
             anchor_time=_parse_time(row["anchor_time"]),
             last_step_time=_parse_time(row["last_step_time"]),
             is_complete=bool(row["is_complete"]),
             completed_at=(
-                _parse_time(row["completed_at"])
-                if row["completed_at"]
-                else None
+                _parse_time(row["completed_at"]) if row["completed_at"] else None
             ),
             created_at=_parse_time(row["created_at"]),
         )
@@ -463,9 +457,7 @@ async def _record_completion(
     settings: Settings,
 ) -> None:
     """Write chain_matches row + emit chain_complete event + optional alert."""
-    duration_h = (
-        (chain.last_step_time - chain.anchor_time).total_seconds() / 3600.0
-    )
+    duration_h = (chain.last_step_time - chain.anchor_time).total_seconds() / 3600.0
     await db._conn.execute(
         """INSERT INTO chain_matches
            (token_id, pipeline, pattern_id, pattern_name, steps_matched,
@@ -547,8 +539,7 @@ async def _record_expired_chain(
             chain.anchor_time.isoformat(),
             now.isoformat(),
             round(
-                (chain.last_step_time - chain.anchor_time).total_seconds()
-                / 3600.0,
+                (chain.last_step_time - chain.anchor_time).total_seconds() / 3600.0,
                 3,
             ),
             0,

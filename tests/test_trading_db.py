@@ -1,4 +1,5 @@
 """Tests for paper trading database tables."""
+
 import json
 from datetime import datetime, timezone
 
@@ -42,12 +43,28 @@ async def test_paper_trades_insert_and_read(db):
             entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, sl_price,
             status, opened_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        ("bitcoin", "BTC", "Bitcoin", "coingecko", "volume_spike",
-         json.dumps({"spike_ratio": 12.3}),
-         50000.0, 1000.0, 0.02, 20.0, 10.0, 60000.0, 45000.0, "open", now),
+        (
+            "bitcoin",
+            "BTC",
+            "Bitcoin",
+            "coingecko",
+            "volume_spike",
+            json.dumps({"spike_ratio": 12.3}),
+            50000.0,
+            1000.0,
+            0.02,
+            20.0,
+            10.0,
+            60000.0,
+            45000.0,
+            "open",
+            now,
+        ),
     )
     await db._conn.commit()
-    cursor = await db._conn.execute("SELECT * FROM paper_trades WHERE token_id='bitcoin'")
+    cursor = await db._conn.execute(
+        "SELECT * FROM paper_trades WHERE token_id='bitcoin'"
+    )
     row = await cursor.fetchone()
     assert row is not None
     assert dict(row)["entry_price"] == 50000.0
@@ -56,9 +73,23 @@ async def test_paper_trades_insert_and_read(db):
 async def test_paper_trades_unique_constraint(db):
     """Duplicate (token_id, signal_type, opened_at) is rejected."""
     now = datetime.now(timezone.utc).isoformat()
-    args = ("bitcoin", "BTC", "Bitcoin", "coingecko", "volume_spike",
-            json.dumps({}), 50000.0, 1000.0, 0.02, 20.0, 10.0,
-            60000.0, 45000.0, "open", now)
+    args = (
+        "bitcoin",
+        "BTC",
+        "Bitcoin",
+        "coingecko",
+        "volume_spike",
+        json.dumps({}),
+        50000.0,
+        1000.0,
+        0.02,
+        20.0,
+        10.0,
+        60000.0,
+        45000.0,
+        "open",
+        now,
+    )
     sql = """INSERT INTO paper_trades
              (token_id, symbol, name, chain, signal_type, signal_data,
               entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, sl_price,

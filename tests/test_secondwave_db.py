@@ -1,4 +1,5 @@
 """Tests for second-wave DB schema and query methods."""
+
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -14,7 +15,16 @@ async def db(tmp_path):
     await d.close()
 
 
-async def _insert_alert(db, contract, alerted_days_ago, market_cap, price, name="Tok", ticker="TK", chain="eth"):
+async def _insert_alert(
+    db,
+    contract,
+    alerted_days_ago,
+    market_cap,
+    price,
+    name="Tok",
+    ticker="TK",
+    chain="eth",
+):
     ts = (datetime.now(timezone.utc) - timedelta(days=alerted_days_ago)).isoformat()
     await db._conn.execute(
         """INSERT INTO alerts
@@ -75,20 +85,33 @@ async def test_get_secondwave_scan_candidates_excludes_already_detected(db):
     await _insert_alert(db, "0xdup", alerted_days_ago=5, market_cap=2e6, price=1.0)
     await _insert_score_history(db, "0xdup", score=80.0, days_ago=5)
     now = datetime.now(timezone.utc).isoformat()
-    await db.insert_secondwave_candidate({
-        "contract_address": "0xdup", "chain": "eth",
-        "token_name": "Dup", "ticker": "DUP", "coingecko_id": None,
-        "peak_quant_score": 80, "peak_signals_fired": [],
-        "first_seen_at": now, "original_alert_at": None,
-        "original_market_cap": 1e6, "alert_market_cap": 2e6,
-        "days_since_first_seen": 5.0, "price_drop_from_peak_pct": -40.0,
-        "current_price": 0.8, "current_market_cap": 1.2e6,
-        "current_volume_24h": 5e5, "price_vs_alert_pct": 80.0,
-        "volume_vs_cooldown_avg": 2.5, "price_is_stale": False,
-        "reaccumulation_score": 85,
-        "reaccumulation_signals": ["sufficient_drawdown", "price_recovery"],
-        "detected_at": now, "alerted_at": now,
-    })
+    await db.insert_secondwave_candidate(
+        {
+            "contract_address": "0xdup",
+            "chain": "eth",
+            "token_name": "Dup",
+            "ticker": "DUP",
+            "coingecko_id": None,
+            "peak_quant_score": 80,
+            "peak_signals_fired": [],
+            "first_seen_at": now,
+            "original_alert_at": None,
+            "original_market_cap": 1e6,
+            "alert_market_cap": 2e6,
+            "days_since_first_seen": 5.0,
+            "price_drop_from_peak_pct": -40.0,
+            "current_price": 0.8,
+            "current_market_cap": 1.2e6,
+            "current_volume_24h": 5e5,
+            "price_vs_alert_pct": 80.0,
+            "volume_vs_cooldown_avg": 2.5,
+            "price_is_stale": False,
+            "reaccumulation_score": 85,
+            "reaccumulation_signals": ["sufficient_drawdown", "price_recovery"],
+            "detected_at": now,
+            "alerted_at": now,
+        }
+    )
     rows = await db.get_secondwave_scan_candidates(3, 14, 60, 7)
     assert all(r["contract_address"] != "0xdup" for r in rows)
 
@@ -96,19 +119,33 @@ async def test_get_secondwave_scan_candidates_excludes_already_detected(db):
 async def test_was_secondwave_alerted(db):
     assert await db.was_secondwave_alerted("0xnew") is False
     now = datetime.now(timezone.utc).isoformat()
-    await db.insert_secondwave_candidate({
-        "contract_address": "0xnew", "chain": "eth",
-        "token_name": "X", "ticker": "X", "coingecko_id": None,
-        "peak_quant_score": 70, "peak_signals_fired": [],
-        "first_seen_at": now, "original_alert_at": None,
-        "original_market_cap": 1e6, "alert_market_cap": 2e6,
-        "days_since_first_seen": 5.0, "price_drop_from_peak_pct": -40.0,
-        "current_price": 0.8, "current_market_cap": 1.2e6,
-        "current_volume_24h": 5e5, "price_vs_alert_pct": 80.0,
-        "volume_vs_cooldown_avg": 2.5, "price_is_stale": False,
-        "reaccumulation_score": 60, "reaccumulation_signals": [],
-        "detected_at": now, "alerted_at": now,
-    })
+    await db.insert_secondwave_candidate(
+        {
+            "contract_address": "0xnew",
+            "chain": "eth",
+            "token_name": "X",
+            "ticker": "X",
+            "coingecko_id": None,
+            "peak_quant_score": 70,
+            "peak_signals_fired": [],
+            "first_seen_at": now,
+            "original_alert_at": None,
+            "original_market_cap": 1e6,
+            "alert_market_cap": 2e6,
+            "days_since_first_seen": 5.0,
+            "price_drop_from_peak_pct": -40.0,
+            "current_price": 0.8,
+            "current_market_cap": 1.2e6,
+            "current_volume_24h": 5e5,
+            "price_vs_alert_pct": 80.0,
+            "volume_vs_cooldown_avg": 2.5,
+            "price_is_stale": False,
+            "reaccumulation_score": 60,
+            "reaccumulation_signals": [],
+            "detected_at": now,
+            "alerted_at": now,
+        }
+    )
     assert await db.was_secondwave_alerted("0xnew") is True
 
 
@@ -128,19 +165,33 @@ async def test_get_volume_history(db):
 
 async def test_get_recent_secondwave_candidates(db):
     now = datetime.now(timezone.utc).isoformat()
-    await db.insert_secondwave_candidate({
-        "contract_address": "0xr", "chain": "eth",
-        "token_name": "R", "ticker": "R", "coingecko_id": None,
-        "peak_quant_score": 70, "peak_signals_fired": ["x"],
-        "first_seen_at": now, "original_alert_at": None,
-        "original_market_cap": 1e6, "alert_market_cap": 2e6,
-        "days_since_first_seen": 5.0, "price_drop_from_peak_pct": -40.0,
-        "current_price": 0.8, "current_market_cap": 1.2e6,
-        "current_volume_24h": 5e5, "price_vs_alert_pct": 80.0,
-        "volume_vs_cooldown_avg": 2.5, "price_is_stale": False,
-        "reaccumulation_score": 77, "reaccumulation_signals": ["price_recovery"],
-        "detected_at": now, "alerted_at": now,
-    })
+    await db.insert_secondwave_candidate(
+        {
+            "contract_address": "0xr",
+            "chain": "eth",
+            "token_name": "R",
+            "ticker": "R",
+            "coingecko_id": None,
+            "peak_quant_score": 70,
+            "peak_signals_fired": ["x"],
+            "first_seen_at": now,
+            "original_alert_at": None,
+            "original_market_cap": 1e6,
+            "alert_market_cap": 2e6,
+            "days_since_first_seen": 5.0,
+            "price_drop_from_peak_pct": -40.0,
+            "current_price": 0.8,
+            "current_market_cap": 1.2e6,
+            "current_volume_24h": 5e5,
+            "price_vs_alert_pct": 80.0,
+            "volume_vs_cooldown_avg": 2.5,
+            "price_is_stale": False,
+            "reaccumulation_score": 77,
+            "reaccumulation_signals": ["price_recovery"],
+            "detected_at": now,
+            "alerted_at": now,
+        }
+    )
     rows = await db.get_recent_secondwave_candidates(days=7)
     assert len(rows) == 1
     assert rows[0]["reaccumulation_score"] == 77

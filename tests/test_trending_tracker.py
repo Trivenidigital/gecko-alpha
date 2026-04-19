@@ -8,6 +8,7 @@ def _sqlite_ts(dt: datetime) -> str:
     """Format datetime as SQLite-compatible string (space separator, no tz)."""
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
+
 import aiohttp
 import pytest
 from aioresponses import aioresponses
@@ -187,9 +188,23 @@ async def test_compare_detects_narrative_prediction(db):
             narrative_fit_score, staying_power, confidence, reasoning,
             market_regime, trigger_count, strategy_snapshot, predicted_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        ("cat1", "Meme", "coin-b", "CB", "Coin B",
-         100000, 0.5, 80, "strong", "high", "good fit",
-         "BULL", 2, "{}", _sqlite_ts(earlier)),
+        (
+            "cat1",
+            "Meme",
+            "coin-b",
+            "CB",
+            "Coin B",
+            100000,
+            0.5,
+            80,
+            "strong",
+            "high",
+            "good fit",
+            "BULL",
+            2,
+            "{}",
+            _sqlite_ts(earlier),
+        ),
     )
 
     # Insert trending snapshot
@@ -218,8 +233,14 @@ async def test_compare_detects_chain_signal(db):
         """INSERT INTO signal_events
            (token_id, pipeline, event_type, event_data, source_module, created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
-        ("coin-c", "memecoin", "candidate_scored", '{"quant_score": 75}',
-         "scorer", _sqlite_ts(earlier)),
+        (
+            "coin-c",
+            "memecoin",
+            "candidate_scored",
+            '{"quant_score": 75}',
+            "scorer",
+            _sqlite_ts(earlier),
+        ),
     )
 
     # Insert trending snapshot
@@ -253,7 +274,14 @@ async def test_compare_multiple_detections(db):
         """INSERT INTO signal_events
            (token_id, pipeline, event_type, event_data, source_module, created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
-        ("coin-d", "memecoin", "candidate_scored", '{}', "scorer", _sqlite_ts(earlier_chain)),
+        (
+            "coin-d",
+            "memecoin",
+            "candidate_scored",
+            "{}",
+            "scorer",
+            _sqlite_ts(earlier_chain),
+        ),
     )
     await db._conn.execute(
         "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
@@ -324,11 +352,18 @@ async def test_stats_with_data(db):
                 detected_by_pipeline, pipeline_lead_minutes,
                 detected_by_chains)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (coin_id, coin_id.upper(), f"Coin {coin_id}",
-             now.isoformat(), is_gap,
-             narrative, lead,
-             pipeline, pipeline_lead,
-             0),
+            (
+                coin_id,
+                coin_id.upper(),
+                f"Coin {coin_id}",
+                now.isoformat(),
+                is_gap,
+                narrative,
+                lead,
+                pipeline,
+                pipeline_lead,
+                0,
+            ),
         )
     await db._conn.commit()
 
@@ -373,8 +408,13 @@ async def test_recent_comparisons(db):
             """INSERT INTO trending_comparisons
                (coin_id, symbol, name, appeared_on_trending_at, is_gap)
                VALUES (?, ?, ?, ?, ?)""",
-            (f"coin-{i}", f"C{i}", f"Coin {i}",
-             (now - timedelta(hours=i)).isoformat(), 1),
+            (
+                f"coin-{i}",
+                f"C{i}",
+                f"Coin {i}",
+                (now - timedelta(hours=i)).isoformat(),
+                1,
+            ),
         )
     await db._conn.commit()
 
@@ -465,7 +505,7 @@ async def test_compare_signal_events_like_matching(db):
         """INSERT INTO signal_events
            (token_id, pipeline, event_type, event_data, source_module, created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
-        ("bless", "memecoin", "candidate_scored", '{}', "scorer", _sqlite_ts(earlier)),
+        ("bless", "memecoin", "candidate_scored", "{}", "scorer", _sqlite_ts(earlier)),
     )
 
     # Trending snapshot uses CoinGecko slug (long form)

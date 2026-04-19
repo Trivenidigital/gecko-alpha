@@ -141,10 +141,20 @@ async def _insert_prediction(
             strategy_snapshot, predicted_at, eval_retry_count)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            "cat1", "Test Category", coin_id, "BTC", "Bitcoin",
-            1_000_000, price_at_prediction,
-            80, "strong", "high", "test reasoning",
-            json.dumps({}), predicted_at.isoformat(), eval_retry_count,
+            "cat1",
+            "Test Category",
+            coin_id,
+            "BTC",
+            "Bitcoin",
+            1_000_000,
+            price_at_prediction,
+            80,
+            "strong",
+            "high",
+            "test reasoning",
+            json.dumps({}),
+            predicted_at.isoformat(),
+            eval_retry_count,
         ),
     )
     await conn.commit()
@@ -172,10 +182,10 @@ async def test_evaluate_pending_48h_hit(db: Database, strategy: Strategy):
     )
     row = await cursor.fetchone()
     assert row is not None
-    assert row[0] == "HIT"     # outcome_class
-    assert row[1] == "HIT"     # 6h
-    assert row[2] == "HIT"     # 24h
-    assert row[3] == "HIT"     # 48h
+    assert row[0] == "HIT"  # outcome_class
+    assert row[1] == "HIT"  # 6h
+    assert row[2] == "HIT"  # 24h
+    assert row[3] == "HIT"  # 48h
 
 
 async def test_evaluate_pending_miss(db: Database, strategy: Strategy):
@@ -200,11 +210,11 @@ async def test_evaluate_pending_miss(db: Database, strategy: Strategy):
     assert row[0] == "MISS"
 
 
-async def test_evaluate_pending_price_unavailable_retries(db: Database, strategy: Strategy):
+async def test_evaluate_pending_price_unavailable_retries(
+    db: Database, strategy: Strategy
+):
     """Missing price increments retry count; third retry marks UNRESOLVED."""
-    pred_id = await _insert_prediction(
-        db, coin_id="unknowncoin", eval_retry_count=2
-    )
+    pred_id = await _insert_prediction(db, coin_id="unknowncoin", eval_retry_count=2)
 
     async with aiohttp.ClientSession() as session:
         with aioresponses() as mocked:
@@ -277,7 +287,7 @@ async def test_evaluate_pending_only_6h_elapsed(db: Database, strategy: Strategy
     )
     row = await cursor.fetchone()
     assert row is not None
-    assert row[0] is None      # outcome_class not set (48h not reached)
-    assert row[1] == "HIT"     # 6h evaluated
-    assert row[2] is None      # 24h not reached
-    assert row[3] is None      # 48h not reached
+    assert row[0] is None  # outcome_class not set (48h not reached)
+    assert row[1] == "HIT"  # 6h evaluated
+    assert row[2] is None  # 24h not reached
+    assert row[3] is None  # 48h not reached

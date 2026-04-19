@@ -1,4 +1,5 @@
 """Tests for second-wave scoring and detection."""
+
 from datetime import datetime, timezone
 
 import pytest
@@ -7,7 +8,6 @@ from scout.secondwave.detector import (
     build_secondwave_candidate,
     score_reaccumulation,
 )
-
 
 _SW_DEFAULTS = dict(
     SECONDWAVE_MIN_DRAWDOWN_PCT=30.0,
@@ -26,7 +26,7 @@ def test_score_full_house(settings_factory):
         current_volume=5000.0,
         current_market_cap=1_200_000.0,
         alert_market_cap=2_000_000.0,  # 40% drawdown
-        alert_price=1.0,                # 80% recovery
+        alert_price=1.0,  # 80% recovery
         volume_history=[1000.0, 1000.0, 1000.0],  # 5x pickup
         settings=settings,
     )
@@ -81,7 +81,7 @@ def test_score_weak_drawdown_no_recovery(settings_factory):
     candidate = {"peak_quant_score": 50}  # too weak for strong_prior
     score, signals = score_reaccumulation(
         candidate,
-        current_price=0.5,   # 50% of alert — below recovery threshold
+        current_price=0.5,  # 50% of alert — below recovery threshold
         current_volume=None,
         current_market_cap=1_900_000.0,  # 5% drawdown — below
         alert_market_cap=2_000_000.0,

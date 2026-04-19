@@ -102,9 +102,7 @@ async def test_detect_velocity_limits_to_top_n(db):
     class Cfg(_Settings):
         VELOCITY_TOP_N = 3
 
-    coins = [
-        _coin(f"c{i}", price_change_1h=30.0 + i) for i in range(10)
-    ]
+    coins = [_coin(f"c{i}", price_change_1h=30.0 + i) for i in range(10)]
     detections = await detect_velocity(db, coins, Cfg())
     assert len(detections) == 3
     # highest 1h change first
@@ -134,7 +132,18 @@ async def test_detect_velocity_allows_after_dedup_window(db):
            (coin_id, symbol, name, price_change_1h, price_change_24h,
             market_cap, volume_24h, vol_mcap_ratio, current_price, detected_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        ("old-alert", "OLD", "Old", 50.0, 80.0, 10_000_000, 5_000_000, 0.5, 0.001, stale),
+        (
+            "old-alert",
+            "OLD",
+            "Old",
+            50.0,
+            80.0,
+            10_000_000,
+            5_000_000,
+            0.5,
+            0.001,
+            stale,
+        ),
     )
     await db._conn.commit()
     detections = await detect_velocity(db, coins, _Settings())

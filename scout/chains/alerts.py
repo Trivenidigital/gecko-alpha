@@ -13,9 +13,7 @@ logger = structlog.get_logger()
 
 def format_chain_alert(chain: ActiveChain, pattern: ChainPattern) -> str:
     """Build a Telegram-ready chain completion message."""
-    duration_h = (
-        (chain.last_step_time - chain.anchor_time).total_seconds() / 3600.0
-    )
+    duration_h = (chain.last_step_time - chain.anchor_time).total_seconds() / 3600.0
     hit_rate_str = (
         f"{pattern.historical_hit_rate * 100:.1f}%"
         if pattern.historical_hit_rate is not None
@@ -29,9 +27,7 @@ def format_chain_alert(chain: ActiveChain, pattern: ChainPattern) -> str:
         "Timeline:",
     ]
     for step_num in sorted(chain.steps_matched):
-        step = next(
-            (s for s in pattern.steps if s.step_number == step_num), None
-        )
+        step = next((s for s in pattern.steps if s.step_number == step_num), None)
         if step is None:
             continue
         lines.append(f"  step {step_num}: {step.event_type}")

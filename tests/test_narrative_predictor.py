@@ -16,7 +16,6 @@ from scout.narrative.predictor import (
     store_predictions,
 )
 
-
 # ------------------------------------------------------------------
 # Fixtures
 # ------------------------------------------------------------------
@@ -77,12 +76,20 @@ def _make_laggard(
 def test_filter_laggards_applies_thresholds():
     """4 tokens, only 2 pass the threshold filters."""
     tokens = [
-        _make_raw_token(coin_id="ok1", market_cap=50_000_000, change_24h=-3.0, volume=200_000),
-        _make_raw_token(coin_id="ok2", market_cap=100_000_000, change_24h=5.0, volume=150_000),
+        _make_raw_token(
+            coin_id="ok1", market_cap=50_000_000, change_24h=-3.0, volume=200_000
+        ),
+        _make_raw_token(
+            coin_id="ok2", market_cap=100_000_000, change_24h=5.0, volume=150_000
+        ),
         # Fails: mcap too high
-        _make_raw_token(coin_id="big", market_cap=500_000_000, change_24h=-2.0, volume=300_000),
+        _make_raw_token(
+            coin_id="big", market_cap=500_000_000, change_24h=-2.0, volume=300_000
+        ),
         # Fails: volume too low
-        _make_raw_token(coin_id="low", market_cap=10_000_000, change_24h=-1.0, volume=5_000),
+        _make_raw_token(
+            coin_id="low", market_cap=10_000_000, change_24h=-1.0, volume=5_000
+        ),
     ]
     result = filter_laggards(
         tokens,
@@ -278,26 +285,48 @@ async def test_score_token_success():
     from scout.narrative.models import LaggardToken, CategoryAcceleration
 
     token = LaggardToken(
-        coin_id="test", symbol="TST", name="Test Token",
-        market_cap=50e6, price=1.0, price_change_24h=2.0,
-        volume_24h=500_000, category_id="ai", category_name="AI",
+        coin_id="test",
+        symbol="TST",
+        name="Test Token",
+        market_cap=50e6,
+        price=1.0,
+        price_change_24h=2.0,
+        volume_24h=500_000,
+        category_id="ai",
+        category_name="AI",
     )
     accel = CategoryAcceleration(
-        category_id="ai", name="AI", current_velocity=12.0,
-        previous_velocity=5.0, acceleration=7.0, volume_24h=2e9,
-        volume_growth_pct=15.0, coin_count_change=-2, is_heating=True,
+        category_id="ai",
+        name="AI",
+        current_velocity=12.0,
+        previous_velocity=5.0,
+        acceleration=7.0,
+        volume_24h=2e9,
+        volume_growth_pct=15.0,
+        coin_count_change=-2,
+        is_heating=True,
     )
 
     from unittest.mock import AsyncMock
 
     mock_client = MagicMock()
     mock_message = MagicMock()
-    mock_message.content = [MagicMock(text='{"narrative_fit": 75, "staying_power": "High", "confidence": "Medium", "reasoning": "Strong fit"}')]
+    mock_message.content = [
+        MagicMock(
+            text='{"narrative_fit": 75, "staying_power": "High", "confidence": "Medium", "reasoning": "Strong fit"}'
+        )
+    ]
     mock_client.messages.create = AsyncMock(return_value=mock_message)
 
     result = await score_token(
-        token, accel, "BULL", "fetch-ai, render", "",
-        "fake-key", "claude-haiku-4-5", client=mock_client,
+        token,
+        accel,
+        "BULL",
+        "fetch-ai, render",
+        "",
+        "fake-key",
+        "claude-haiku-4-5",
+        client=mock_client,
     )
     assert result is not None
     assert result["narrative_fit"] == 75
@@ -311,22 +340,40 @@ async def test_score_token_api_failure():
     from scout.narrative.models import LaggardToken, CategoryAcceleration
 
     token = LaggardToken(
-        coin_id="test", symbol="TST", name="Test",
-        market_cap=50e6, price=1.0, price_change_24h=2.0,
-        volume_24h=500_000, category_id="ai", category_name="AI",
+        coin_id="test",
+        symbol="TST",
+        name="Test",
+        market_cap=50e6,
+        price=1.0,
+        price_change_24h=2.0,
+        volume_24h=500_000,
+        category_id="ai",
+        category_name="AI",
     )
     accel = CategoryAcceleration(
-        category_id="ai", name="AI", current_velocity=12.0,
-        previous_velocity=5.0, acceleration=7.0, volume_24h=2e9,
-        volume_growth_pct=15.0, coin_count_change=0, is_heating=True,
+        category_id="ai",
+        name="AI",
+        current_velocity=12.0,
+        previous_velocity=5.0,
+        acceleration=7.0,
+        volume_24h=2e9,
+        volume_growth_pct=15.0,
+        coin_count_change=0,
+        is_heating=True,
     )
 
     mock_client = MagicMock()
     mock_client.messages.create = MagicMock(side_effect=Exception("API error"))
 
     result = await score_token(
-        token, accel, "BULL", "fetch-ai", "",
-        "fake-key", "claude-haiku-4-5", client=mock_client,
+        token,
+        accel,
+        "BULL",
+        "fetch-ai",
+        "",
+        "fake-key",
+        "claude-haiku-4-5",
+        client=mock_client,
     )
     assert result is None
 
@@ -337,18 +384,34 @@ async def test_build_scoring_prompt_includes_watchlist():
     from scout.narrative.models import LaggardToken, CategoryAcceleration
 
     token = LaggardToken(
-        coin_id="test", symbol="TST", name="Test Token",
-        market_cap=50e6, price=1.0, price_change_24h=2.0,
-        volume_24h=500_000, category_id="ai", category_name="AI",
+        coin_id="test",
+        symbol="TST",
+        name="Test Token",
+        market_cap=50e6,
+        price=1.0,
+        price_change_24h=2.0,
+        volume_24h=500_000,
+        category_id="ai",
+        category_name="AI",
     )
     accel = CategoryAcceleration(
-        category_id="ai", name="AI", current_velocity=12.0,
-        previous_velocity=5.0, acceleration=7.0, volume_24h=2e9,
-        volume_growth_pct=15.0, coin_count_change=-2, is_heating=True,
+        category_id="ai",
+        name="AI",
+        current_velocity=12.0,
+        previous_velocity=5.0,
+        acceleration=7.0,
+        volume_24h=2e9,
+        volume_growth_pct=15.0,
+        coin_count_change=-2,
+        is_heating=True,
     )
 
     prompt = build_scoring_prompt(
-        token, accel, "BULL", "fetch-ai, render", "",
+        token,
+        accel,
+        "BULL",
+        "fetch-ai, render",
+        "",
         watchlist_users=42_500,
     )
     assert "CoinGecko watchlist" in prompt
@@ -362,24 +425,46 @@ async def test_score_token_passes_watchlist_to_prompt():
     from scout.narrative.models import LaggardToken, CategoryAcceleration
 
     token = LaggardToken(
-        coin_id="test", symbol="TST", name="Test Token",
-        market_cap=50e6, price=1.0, price_change_24h=2.0,
-        volume_24h=500_000, category_id="ai", category_name="AI",
+        coin_id="test",
+        symbol="TST",
+        name="Test Token",
+        market_cap=50e6,
+        price=1.0,
+        price_change_24h=2.0,
+        volume_24h=500_000,
+        category_id="ai",
+        category_name="AI",
     )
     accel = CategoryAcceleration(
-        category_id="ai", name="AI", current_velocity=12.0,
-        previous_velocity=5.0, acceleration=7.0, volume_24h=2e9,
-        volume_growth_pct=15.0, coin_count_change=-2, is_heating=True,
+        category_id="ai",
+        name="AI",
+        current_velocity=12.0,
+        previous_velocity=5.0,
+        acceleration=7.0,
+        volume_24h=2e9,
+        volume_growth_pct=15.0,
+        coin_count_change=-2,
+        is_heating=True,
     )
 
     mock_client = MagicMock()
     mock_message = MagicMock()
-    mock_message.content = [MagicMock(text='{"narrative_fit": 60, "staying_power": "Medium", "confidence": "Low", "reasoning": "x"}')]
+    mock_message.content = [
+        MagicMock(
+            text='{"narrative_fit": 60, "staying_power": "Medium", "confidence": "Low", "reasoning": "x"}'
+        )
+    ]
     mock_client.messages.create = MagicMock(return_value=mock_message)
 
     await score_token(
-        token, accel, "BULL", "fetch-ai", "",
-        "fake-key", "claude-haiku-4-5", client=mock_client,
+        token,
+        accel,
+        "BULL",
+        "fetch-ai",
+        "",
+        "fake-key",
+        "claude-haiku-4-5",
+        client=mock_client,
         watchlist_users=7_777,
     )
 

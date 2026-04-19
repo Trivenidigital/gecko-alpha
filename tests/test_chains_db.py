@@ -1,4 +1,5 @@
 """Tests for conviction chain database tables."""
+
 import json
 from datetime import datetime, timezone
 
@@ -33,7 +34,14 @@ async def test_signal_events_append_only(db):
             """INSERT INTO signal_events
                (token_id, pipeline, event_type, event_data, source_module, created_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            ("0xabc", "memecoin", "candidate_scored", json.dumps({"x": 1}), "scorer", now),
+            (
+                "0xabc",
+                "memecoin",
+                "candidate_scored",
+                json.dumps({"x": 1}),
+                "scorer",
+                now,
+            ),
         )
     await db._conn.commit()
     async with db._conn.execute(

@@ -27,16 +27,21 @@ SAMPLE_PAIR = {
 
 
 async def test_fetch_trending_returns_candidates(mock_aiohttp, settings_factory):
-    mock_aiohttp.get(DEXSCREENER_TRENDING_URL, payload=[
-        {"tokenAddress": "0xabc", "chainId": "solana"},
-    ])
+    mock_aiohttp.get(
+        DEXSCREENER_TRENDING_URL,
+        payload=[
+            {"tokenAddress": "0xabc", "chainId": "solana"},
+        ],
+    )
     mock_aiohttp.get(
         "https://api.dexscreener.com/tokens/v1/solana/0xabc",
         payload=[SAMPLE_PAIR],
     )
 
     settings = settings_factory(
-        MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000, MAX_TOKEN_AGE_DAYS=7,
+        MIN_MARKET_CAP=10000,
+        MAX_MARKET_CAP=500000,
+        MAX_TOKEN_AGE_DAYS=7,
     )
     async with aiohttp.ClientSession() as session:
         tokens = await fetch_trending(session, settings)
@@ -48,16 +53,26 @@ async def test_fetch_trending_returns_candidates(mock_aiohttp, settings_factory)
 
 async def test_fetch_trending_filters_by_market_cap(mock_aiohttp, settings_factory):
     too_big = {**SAMPLE_PAIR, "fdv": 1_000_000}
-    mock_aiohttp.get(DEXSCREENER_TRENDING_URL, payload=[
-        {"tokenAddress": "0xbig", "chainId": "solana"},
-    ])
+    mock_aiohttp.get(
+        DEXSCREENER_TRENDING_URL,
+        payload=[
+            {"tokenAddress": "0xbig", "chainId": "solana"},
+        ],
+    )
     mock_aiohttp.get(
         "https://api.dexscreener.com/tokens/v1/solana/0xbig",
-        payload=[{**too_big, "baseToken": {"address": "0xbig", "name": "Big", "symbol": "BIG"}}],
+        payload=[
+            {
+                **too_big,
+                "baseToken": {"address": "0xbig", "name": "Big", "symbol": "BIG"},
+            }
+        ],
     )
 
     settings = settings_factory(
-        MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000, MAX_TOKEN_AGE_DAYS=7,
+        MIN_MARKET_CAP=10000,
+        MAX_MARKET_CAP=500000,
+        MAX_TOKEN_AGE_DAYS=7,
     )
     async with aiohttp.ClientSession() as session:
         tokens = await fetch_trending(session, settings)
@@ -69,7 +84,9 @@ async def test_fetch_trending_handles_empty_response(mock_aiohttp, settings_fact
     mock_aiohttp.get(DEXSCREENER_TRENDING_URL, payload=[])
 
     settings = settings_factory(
-        MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000, MAX_TOKEN_AGE_DAYS=7,
+        MIN_MARKET_CAP=10000,
+        MAX_MARKET_CAP=500000,
+        MAX_TOKEN_AGE_DAYS=7,
     )
     async with aiohttp.ClientSession() as session:
         tokens = await fetch_trending(session, settings)
@@ -79,16 +96,26 @@ async def test_fetch_trending_handles_empty_response(mock_aiohttp, settings_fact
 
 async def test_fetch_trending_handles_429_with_backoff(mock_aiohttp, settings_factory):
     mock_aiohttp.get(DEXSCREENER_TRENDING_URL, status=429)
-    mock_aiohttp.get(DEXSCREENER_TRENDING_URL, payload=[
-        {"tokenAddress": "0xretry", "chainId": "solana"},
-    ])
+    mock_aiohttp.get(
+        DEXSCREENER_TRENDING_URL,
+        payload=[
+            {"tokenAddress": "0xretry", "chainId": "solana"},
+        ],
+    )
     mock_aiohttp.get(
         "https://api.dexscreener.com/tokens/v1/solana/0xretry",
-        payload=[{**SAMPLE_PAIR, "baseToken": {"address": "0xretry", "name": "Retry", "symbol": "RTR"}}],
+        payload=[
+            {
+                **SAMPLE_PAIR,
+                "baseToken": {"address": "0xretry", "name": "Retry", "symbol": "RTR"},
+            }
+        ],
     )
 
     settings = settings_factory(
-        MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000, MAX_TOKEN_AGE_DAYS=7,
+        MIN_MARKET_CAP=10000,
+        MAX_MARKET_CAP=500000,
+        MAX_TOKEN_AGE_DAYS=7,
     )
     async with aiohttp.ClientSession() as session:
         tokens = await fetch_trending(session, settings)

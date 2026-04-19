@@ -210,7 +210,9 @@ async def fetch_defi_tvl(session: aiohttp.ClientSession) -> dict | None:
 async def fetch_crypto_news(session: aiohttp.ClientSession) -> list[dict] | None:
     """Fetch top 10 crypto headlines from CryptoCompare."""
     try:
-        url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&sortOrder=popular"
+        url = (
+            "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&sortOrder=popular"
+        )
         async with session.get(url, timeout=_TIMEOUT) as resp:
             if resp.status != 200:
                 logger.warning("crypto_news_fetch_failed", status=resp.status)
@@ -256,10 +258,8 @@ async def collect_internal_data(db) -> dict:
 
 async def _get_current_regime(conn) -> str | None:
     try:
-        cursor = await conn.execute(
-            """SELECT market_regime FROM category_snapshots
-               ORDER BY snapshot_at DESC LIMIT 1"""
-        )
+        cursor = await conn.execute("""SELECT market_regime FROM category_snapshots
+               ORDER BY snapshot_at DESC LIMIT 1""")
         row = await cursor.fetchone()
         return row[0] if row else None
     except Exception:
@@ -330,25 +330,21 @@ async def _get_recent_predictions(conn, hours: int = 12) -> list[dict]:
 
 async def _get_paper_summary(conn) -> dict | None:
     try:
-        cursor = await conn.execute(
-            """SELECT
+        cursor = await conn.execute("""SELECT
                  COUNT(*) as open_count,
                  COALESCE(SUM(amount_usd), 0) as total_exposure
-               FROM paper_trades WHERE status = 'open'"""
-        )
+               FROM paper_trades WHERE status = 'open'""")
         row = await cursor.fetchone()
         if not row:
             return None
 
-        cursor2 = await conn.execute(
-            """SELECT signal_type,
+        cursor2 = await conn.execute("""SELECT signal_type,
                  COUNT(*) as trades,
                  COALESCE(SUM(pnl_usd), 0) as pnl
                FROM paper_trades
                WHERE status != 'open'
                  AND datetime(closed_at) >= datetime('now', '-24 hours')
-               GROUP BY signal_type"""
-        )
+               GROUP BY signal_type""")
         by_signal = [dict(r) for r in await cursor2.fetchall()]
 
         return {

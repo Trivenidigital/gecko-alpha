@@ -15,6 +15,7 @@ from scout.trading.paper import PaperTrader
 
 log = structlog.get_logger()
 
+
 async def evaluate_paper_trades(db: Database, settings) -> None:
     """Check all open paper trades: update checkpoints, check TP/SL, expire old.
 
@@ -26,16 +27,14 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
         raise RuntimeError("Database not initialized.")
 
     # 1. Get all open trades
-    cursor = await conn.execute(
-        """SELECT id, token_id, entry_price, opened_at,
+    cursor = await conn.execute("""SELECT id, token_id, entry_price, opened_at,
                   tp_price, sl_price, tp_pct, sl_pct,
                   checkpoint_1h_price, checkpoint_6h_price,
                   checkpoint_24h_price, checkpoint_48h_price,
                   peak_price, peak_pct, signal_data, symbol, name, chain,
                   amount_usd, quantity, signal_type
            FROM paper_trades
-           WHERE status = 'open'"""
-    )
+           WHERE status = 'open'""")
     rows = await cursor.fetchall()
     if not rows:
         return
@@ -87,7 +86,11 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
         price_age_seconds = (now - updated_at).total_seconds()
 
         if price_age_seconds > 3600:  # 1 hour max for evaluator
-            log.debug("trade_eval_stale_price", trade_id=trade_id, age=round(price_age_seconds, 1))
+            log.debug(
+                "trade_eval_stale_price",
+                trade_id=trade_id,
+                age=round(price_age_seconds, 1),
+            )
             continue
 
         if entry_price <= 0:
@@ -159,7 +162,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                 # Partial TP: sell 70%, keep 30% as long-term hold
                 tp_sell_pct = getattr(settings, "PAPER_TP_SELL_PCT", 70.0) / 100.0
                 original_amount = float(row[18])  # amount_usd
-                original_qty = float(row[19])      # quantity
+                original_qty = float(row[19])  # quantity
                 sell_amount = original_amount * tp_sell_pct
                 keep_amount = original_amount * (1 - tp_sell_pct)
                 keep_qty = original_qty * (1 - tp_sell_pct)
@@ -171,8 +174,10 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     (sell_amount, original_qty * tp_sell_pct, trade_id),
                 )
                 sold = await _trader.execute_sell(
-                    db=db, trade_id=trade_id,
-                    current_price=current_price, reason=close_reason,
+                    db=db,
+                    trade_id=trade_id,
+                    current_price=current_price,
+                    reason=close_reason,
                     slippage_bps=slippage_bps,
                 )
                 if not sold:
@@ -183,33 +188,44 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                 if keep_amount > 0:
                     signal_data_raw = row[14] if len(row) > 14 else "{}"
                     new_id = await _trader.execute_buy(
-                        db=db, token_id=token_id,
+                        db=db,
+                        token_id=token_id,
                         symbol=row[15] if len(row) > 15 else "",
                         name=row[16] if len(row) > 16 else "",
                         chain=row[17] if len(row) > 17 else "coingecko",
                         signal_type="long_hold",
-                        signal_data={"origin_trade_id": trade_id, "origin_signal": str(signal_data_raw)},
+                        signal_data={
+                            "origin_trade_id": trade_id,
+                            "origin_signal": str(signal_data_raw),
+                        },
                         current_price=current_price,
                         amount_usd=keep_amount,
                         tp_pct=100.0,  # very high TP for long hold
-                        sl_pct=0.0,    # no stop loss
-                        slippage_bps=0, # no additional slippage on the hold portion
+                        sl_pct=0.0,  # no stop loss
+                        slippage_bps=0,  # no additional slippage on the hold portion
                         signal_combo="long_hold",
                     )
                     if new_id is None:
-                        log.warning("long_hold_creation_failed", trade_id=trade_id, token_id=token_id)
+                        log.warning(
+                            "long_hold_creation_failed",
+                            trade_id=trade_id,
+                            token_id=token_id,
+                        )
                     else:
                         log.info(
                             "paper_trade_partial_tp",
-                            trade_id=trade_id, token_id=token_id,
+                            trade_id=trade_id,
+                            token_id=token_id,
                             sold_pct=tp_sell_pct * 100,
                             keep_amount=round(keep_amount, 2),
                         )
             else:
                 # SL, expiry, or long_hold TP: close the full position
                 closed = await _trader.execute_sell(
-                    db=db, trade_id=trade_id,
-                    current_price=current_price, reason=close_reason,
+                    db=db,
+                    trade_id=trade_id,
+                    current_price=current_price,
+                    reason=close_reason,
                     slippage_bps=slippage_bps,
                 )
 
@@ -219,7 +235,8 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             if closed:
                 log.info(
                     "paper_trade_eval_closed",
-                    trade_id=trade_id, token_id=token_id,
+                    trade_id=trade_id,
+                    token_id=token_id,
                     reason=close_reason,
                     price_age_seconds=round(price_age_seconds, 1),
                     current_price=current_price,

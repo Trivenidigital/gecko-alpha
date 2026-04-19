@@ -34,3 +34,8 @@ packages = ["scout", "dashboard"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "black>=26.3.1",
+]

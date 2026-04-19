@@ -13,14 +13,16 @@ from scout.counter.scorer import (
     score_counter_narrative,
 )
 
-
 # --- _parse_counter_response tests ---
 
 
 def test_parse_counter_response_valid():
     raw = '{"risk_score": 55, "counter_argument": "High risk due to low liquidity."}'
     result = _parse_counter_response(raw)
-    assert result == {"risk_score": 55, "counter_argument": "High risk due to low liquidity."}
+    assert result == {
+        "risk_score": 55,
+        "counter_argument": "High risk due to low liquidity.",
+    }
 
 
 def test_parse_counter_response_markdown():

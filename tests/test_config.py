@@ -113,6 +113,7 @@ def test_feedback_loop_defaults(monkeypatch):
     monkeypatch.delenv("FEEDBACK_CHRONIC_FAILURE_THRESHOLD", raising=False)
 
     from scout.config import Settings
+
     s = Settings(
         TELEGRAM_BOT_TOKEN="test",
         TELEGRAM_CHAT_ID="test",

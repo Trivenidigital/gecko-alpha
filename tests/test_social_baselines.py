@@ -71,16 +71,16 @@ def test_update_state_collapse_downward_skips_avg_keeps_count():
 def test_update_state_null_value_skips_entirely():
     """None / zero does not drag the avg or bump sample_count."""
     state = _state(sample_count=10)
-    assert update_state(state, None, min_samples=288, spike_ratio=2.0).sample_count == 10
+    assert (
+        update_state(state, None, min_samples=288, spike_ratio=2.0).sample_count == 10
+    )
     assert update_state(state, 0.0, min_samples=288, spike_ratio=2.0).sample_count == 10
 
 
 def test_update_state_nan_skips_entirely():
     """NaN is treated like None — does NOT poison the EWMA."""
     state = _state(avg_social_volume_24h=100.0, sample_count=288)
-    result = update_state(
-        state, float("nan"), min_samples=288, spike_ratio=2.0
-    )
+    result = update_state(state, float("nan"), min_samples=288, spike_ratio=2.0)
     assert result.avg_social_volume_24h == 100.0
     assert result.sample_count == 288  # no increment per §5.4 null rule
 
@@ -127,7 +127,11 @@ async def test_hydrate_handles_malformed_ring_json(db):
             last_poll_at, last_updated
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            "foo", "FOO", 100.0, 50.0, 50.0,
+            "foo",
+            "FOO",
+            100.0,
+            50.0,
+            50.0,
             "{not-json",  # unparseable
             42,
             None,
@@ -155,7 +159,11 @@ async def test_hydrate_handles_ring_wrong_type(db):
             last_poll_at, last_updated
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            "foo", "FOO", 100.0, 50.0, 50.0,
+            "foo",
+            "FOO",
+            100.0,
+            50.0,
+            50.0,
             json.dumps({"not": "a list"}),
             42,
             None,
@@ -249,9 +257,7 @@ async def test_flush_baselines_serializes_interactions_ring(db):
 
 
 @pytest.mark.asyncio
-async def test_flush_rolls_back_and_remarks_dirty_on_mid_batch_failure(
-    db, monkeypatch
-):
+async def test_flush_rolls_back_and_remarks_dirty_on_mid_batch_failure(db, monkeypatch):
     """If an INSERT raises partway through, the whole batch is rolled back
     and EVERY originally-dirty coin is re-marked so the next flush retries."""
     cache = BaselineCache()

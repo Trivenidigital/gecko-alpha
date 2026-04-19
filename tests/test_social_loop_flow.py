@@ -65,9 +65,7 @@ async def test_db_success_telegram_success_cache_updated(db):
     s = _settings()
     cache = BaselineCache()
     cache.set("foo", _primed_state("foo", "FOO"))
-    coins = [
-        {"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}
-    ]
+    coins = [{"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}]
     send_fake = AsyncMock(return_value=True)
     await _process_cycle(s, db, cache, coins, send_fn=send_fake)
     state = cache.get("foo")
@@ -87,9 +85,7 @@ async def test_db_failure_no_telegram_and_cache_not_updated(db, monkeypatch):
     cache = BaselineCache()
     original_state = _primed_state("foo", "FOO")
     cache.set("foo", original_state)
-    coins = [
-        {"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}
-    ]
+    coins = [{"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}]
     send_fake = AsyncMock(return_value=True)
 
     # Force the insert helper to raise.
@@ -114,9 +110,7 @@ async def test_db_success_telegram_fail_cache_still_updated(db):
     s = _settings()
     cache = BaselineCache()
     cache.set("foo", _primed_state("foo", "FOO"))
-    coins = [
-        {"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}
-    ]
+    coins = [{"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}]
     send_fake = AsyncMock(return_value=False)
     await _process_cycle(s, db, cache, coins, send_fn=send_fake)
     state = cache.get("foo")
@@ -131,9 +125,7 @@ async def test_non_firing_cache_updated_regardless(db):
     s = _settings()
     cache = BaselineCache()
     cache.set("foo", _primed_state("foo", "FOO", sample_count=42))
-    coins = [
-        {"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 110.0}
-    ]
+    coins = [{"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 110.0}]
     send_fake = AsyncMock(return_value=True)
     await _process_cycle(s, db, cache, coins, send_fn=send_fake)
     state = cache.get("foo")
@@ -239,9 +231,7 @@ async def test_401_exits_loop_cleanly(tmp_path, monkeypatch):
 
         monkeypatch.setattr(loop_mod, "LunarCrushClient", _FakeClient)
 
-        task = asyncio.create_task(
-            loop_mod.run_social_loop(s, d, shutdown)
-        )
+        task = asyncio.create_task(loop_mod.run_social_loop(s, d, shutdown))
         # Should exit on its own within a short window -- _AuthDisabled breaks.
         await asyncio.wait_for(task, timeout=2.0)
         assert task.done()
@@ -393,9 +383,7 @@ async def test_telegram_fail_leaves_alerted_at_null_for_retry(db):
     s = _settings()
     cache = BaselineCache()
     cache.set("foo", _primed_state("foo", "FOO"))
-    coins = [
-        {"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}
-    ]
+    coins = [{"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}]
     # Telegram returns False -- alerted_at should NOT be set.
     send_fake = AsyncMock(return_value=False)
     await _process_cycle(s, db, cache, coins, send_fn=send_fake)
@@ -414,9 +402,7 @@ async def test_telegram_success_sets_alerted_at(db):
     s = _settings()
     cache = BaselineCache()
     cache.set("foo", _primed_state("foo", "FOO"))
-    coins = [
-        {"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}
-    ]
+    coins = [{"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}]
     send_fake = AsyncMock(return_value=True)
     await _process_cycle(s, db, cache, coins, send_fn=send_fake)
 
@@ -493,9 +479,7 @@ async def test_dedup_ignores_null_alerted_at_rows(db):
     )
     await db._conn.commit()
 
-    coins = [
-        {"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}
-    ]
+    coins = [{"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 500.0}]
     alerts, _ = await detect_spikes(db, s, cache, coins)
     # The previous row has alerted_at NULL -> NOT deduped -> alert fires.
     assert len(alerts) == 1

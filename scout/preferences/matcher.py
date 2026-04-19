@@ -36,7 +36,9 @@ def should_alert_category(category_id: str, strategy: object) -> bool:
 
     if mode == "preferred_only":
         if not preferred:
-            logger.warning("preferences.preferred_only_empty_list — all categories allowed as fallback")
+            logger.warning(
+                "preferences.preferred_only_empty_list — all categories allowed as fallback"
+            )
             return True  # fallback: don't silently block everything
         return category_id in preferred
 

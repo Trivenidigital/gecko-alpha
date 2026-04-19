@@ -86,9 +86,7 @@ class TestShouldAlertCategory:
 
 class TestShouldAlertToken:
     def test_no_filters_allows_all(self) -> None:
-        strategy = _FakeStrategy(
-            {"user_min_market_cap": 0, "user_max_market_cap": 0}
-        )
+        strategy = _FakeStrategy({"user_min_market_cap": 0, "user_max_market_cap": 0})
         assert should_alert_token(100.0, strategy) is True
         assert should_alert_token(1_000_000_000.0, strategy) is True
 

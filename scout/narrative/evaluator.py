@@ -162,9 +162,13 @@ async def evaluate_pending(
     missing_ids = [cid for cid in unique_ids if cid not in prices]
     if missing_ids:
         if len(missing_ids) > 20:
-            log.info("eval_price_fallback", total_missing=len(missing_ids), fetching=min(len(missing_ids), 60))
+            log.info(
+                "eval_price_fallback",
+                total_missing=len(missing_ids),
+                fetching=min(len(missing_ids), 60),
+            )
         for chunk_start in range(0, min(len(missing_ids), 60), 20):
-            chunk = missing_ids[chunk_start:chunk_start + 20]
+            chunk = missing_ids[chunk_start : chunk_start + 20]
             try:
                 await coingecko_limiter.acquire()
                 ids_param = ",".join(chunk)

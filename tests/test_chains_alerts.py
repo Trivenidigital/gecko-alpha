@@ -1,4 +1,5 @@
 """Tests for chain alert formatting."""
+
 from datetime import datetime, timedelta, timezone
 
 from scout.chains.alerts import format_chain_alert
@@ -11,14 +12,20 @@ def _make_pattern() -> ChainPattern:
         name="full_conviction",
         description="test",
         steps=[
-            ChainStep(step_number=1, event_type="category_heating",
-                      max_hours_after_anchor=0.0),
-            ChainStep(step_number=2, event_type="laggard_picked",
-                      max_hours_after_anchor=6.0),
-            ChainStep(step_number=3, event_type="counter_scored",
-                      max_hours_after_anchor=8.0),
-            ChainStep(step_number=4, event_type="candidate_scored",
-                      max_hours_after_anchor=12.0),
+            ChainStep(
+                step_number=1, event_type="category_heating", max_hours_after_anchor=0.0
+            ),
+            ChainStep(
+                step_number=2, event_type="laggard_picked", max_hours_after_anchor=6.0
+            ),
+            ChainStep(
+                step_number=3, event_type="counter_scored", max_hours_after_anchor=8.0
+            ),
+            ChainStep(
+                step_number=4,
+                event_type="candidate_scored",
+                max_hours_after_anchor=12.0,
+            ),
         ],
         min_steps_to_trigger=3,
         conviction_boost=25,

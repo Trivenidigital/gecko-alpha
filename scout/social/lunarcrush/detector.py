@@ -179,7 +179,9 @@ async def detect_spikes(
         new_gx = _f(coin.get("galaxy_score"))
         new_ia = _f(coin.get("interactions_24h"))
 
-        post = update_state(pre_state, new_sv, min_samples=min_samples, spike_ratio=ratio)
+        post = update_state(
+            pre_state, new_sv, min_samples=min_samples, spike_ratio=ratio
+        )
         # Always record last_galaxy_score and push to the interactions ring.
         ring = post.interactions_ring
         if new_ia is not None and new_ia > 0:

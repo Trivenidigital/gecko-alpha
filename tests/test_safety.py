@@ -13,7 +13,9 @@ def mock_aiohttp():
         yield m
 
 
-GOPLUS_URL = "https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses=0xtest"
+GOPLUS_URL = (
+    "https://api.gopluslabs.io/api/v1/token_security/1?contract_addresses=0xtest"
+)
 
 
 def _goplus_response(honeypot="0", is_blacklisted="0", buy_tax="0.01", sell_tax="0.01"):
@@ -26,7 +28,7 @@ def _goplus_response(honeypot="0", is_blacklisted="0", buy_tax="0.01", sell_tax=
                 "buy_tax": buy_tax,
                 "sell_tax": sell_tax,
             }
-        }
+        },
     }
 
 

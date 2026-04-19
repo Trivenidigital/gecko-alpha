@@ -19,7 +19,9 @@ CHAIN_ID_MAP = {
 GOPLUS_BASE = "https://api.gopluslabs.io/api/v1/token_security"
 
 
-async def is_safe(contract_address: str, chain: str, session: aiohttp.ClientSession) -> bool:
+async def is_safe(
+    contract_address: str, chain: str, session: aiohttp.ClientSession
+) -> bool:
     """Check if a token is safe via GoPlus Security API.
 
     Returns True if:
@@ -37,13 +39,23 @@ async def is_safe(contract_address: str, chain: str, session: aiohttp.ClientSess
     url = f"{GOPLUS_BASE}/{chain_id}"
 
     try:
-        async with session.get(url, params={"contract_addresses": contract_address}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with session.get(
+            url,
+            params={"contract_addresses": contract_address},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
             if resp.status != 200:
-                logger.warning("GoPlus API returned error", status=resp.status, contract_address=contract_address)
+                logger.warning(
+                    "GoPlus API returned error",
+                    status=resp.status,
+                    contract_address=contract_address,
+                )
                 return True
             data = await resp.json()
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.warning("GoPlus API error", contract_address=contract_address, error=str(e))
+        logger.warning(
+            "GoPlus API error", contract_address=contract_address, error=str(e)
+        )
         return True
 
     results = data.get("result") or {}

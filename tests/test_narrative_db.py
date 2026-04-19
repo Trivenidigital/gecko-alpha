@@ -25,9 +25,7 @@ NARRATIVE_TABLES = [
 
 async def test_narrative_tables_created(db: Database):
     """All 5 narrative tables exist after initialize()."""
-    cursor = await db._conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    )
+    cursor = await db._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     rows = await cursor.fetchall()
     table_names = {row[0] for row in rows}
     for table in NARRATIVE_TABLES:
@@ -59,9 +57,24 @@ async def test_insert_category_snapshot(db: Database):
 async def test_insert_prediction_unique_constraint(db: Database):
     """Inserting duplicate (category_id, coin_id, predicted_at) raises IntegrityError."""
     params = (
-        "defi", "DeFi", "bitcoin", "BTC", "Bitcoin",
-        50000.0, 50000.0, 80, "high", "high", "reason",
-        "bull", 1, 0, 0, "{}", None, "2026-04-09T00:00:00Z",
+        "defi",
+        "DeFi",
+        "bitcoin",
+        "BTC",
+        "Bitcoin",
+        50000.0,
+        50000.0,
+        80,
+        "high",
+        "high",
+        "reason",
+        "bull",
+        1,
+        0,
+        0,
+        "{}",
+        None,
+        "2026-04-09T00:00:00Z",
     )
     sql = """INSERT INTO predictions
              (category_id, category_name, coin_id, symbol, name,

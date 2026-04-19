@@ -5,7 +5,9 @@ from scout.aggregator import aggregate
 
 def test_aggregate_dedup_by_contract_address(token_factory):
     t1 = token_factory(contract_address="0xabc", volume_24h_usd=50000)
-    t2 = token_factory(contract_address="0xabc", volume_24h_usd=99999)  # same addr, newer data
+    t2 = token_factory(
+        contract_address="0xabc", volume_24h_usd=99999
+    )  # same addr, newer data
     t3 = token_factory(contract_address="0xdef", volume_24h_usd=30000)
 
     result = aggregate([t1, t2, t3])

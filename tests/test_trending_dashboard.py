@@ -51,6 +51,7 @@ async def seeded_db(tmp_path):
 @pytest.fixture
 async def client(seeded_db):
     import dashboard.api as api_mod
+
     # Reset cached ScoutDatabase so each test gets a fresh instance
     if api_mod._scout_db is not None:
         await api_mod._scout_db.close()

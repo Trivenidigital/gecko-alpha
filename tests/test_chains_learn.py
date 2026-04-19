@@ -1,4 +1,5 @@
 """Tests for chain pattern LEARN phase: hit rate, promotion, retirement."""
+
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -10,7 +11,6 @@ from scout.chains.patterns import (
 )
 from scout.chains.tracker import update_chain_outcomes
 from scout.db import Database
-
 
 _LEARN_DEFAULTS = dict(
     CHAINS_ENABLED=True,
@@ -48,8 +48,20 @@ async def _seed_matches(db, pattern_name, pipeline, n_hits, n_misses):
                 total_steps, anchor_time, completed_at, chain_duration_hours,
                 conviction_boost, outcome_class, evaluated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (f"tok-h{i}", pipeline, pid, pattern_name, 3, 4, now, now, 2.0, 25,
-             "hit", now),
+            (
+                f"tok-h{i}",
+                pipeline,
+                pid,
+                pattern_name,
+                3,
+                4,
+                now,
+                now,
+                2.0,
+                25,
+                "hit",
+                now,
+            ),
         )
     for i in range(n_misses):
         await db._conn.execute(
@@ -58,8 +70,20 @@ async def _seed_matches(db, pattern_name, pipeline, n_hits, n_misses):
                 total_steps, anchor_time, completed_at, chain_duration_hours,
                 conviction_boost, outcome_class, evaluated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (f"tok-m{i}", pipeline, pid, pattern_name, 3, 4, now, now, 2.0, 25,
-             "miss", now),
+            (
+                f"tok-m{i}",
+                pipeline,
+                pid,
+                pattern_name,
+                3,
+                4,
+                now,
+                now,
+                2.0,
+                25,
+                "miss",
+                now,
+            ),
         )
     await db._conn.commit()
 
@@ -67,8 +91,11 @@ async def _seed_matches(db, pattern_name, pipeline, n_hits, n_misses):
 async def test_pattern_hit_rate(db, settings):
     await _seed_matches(db, "full_conviction", "memecoin", n_hits=6, n_misses=4)
     stats = await compute_pattern_stats(db, settings)
-    fc = [s for s in stats if s["pattern_name"] == "full_conviction"
-          and s["pipeline"] == "memecoin"][0]
+    fc = [
+        s
+        for s in stats
+        if s["pattern_name"] == "full_conviction" and s["pipeline"] == "memecoin"
+    ][0]
     assert fc["total_evaluated"] == 10
     assert fc["hit_rate"] == pytest.approx(0.6, abs=1e-6)
 
@@ -77,10 +104,16 @@ async def test_pattern_hit_rate_per_pipeline_baseline(db, settings):
     await _seed_matches(db, "full_conviction", "memecoin", n_hits=6, n_misses=4)
     await _seed_matches(db, "full_conviction", "narrative", n_hits=2, n_misses=8)
     stats = await compute_pattern_stats(db, settings)
-    memes = [s for s in stats if s["pattern_name"] == "full_conviction"
-             and s["pipeline"] == "memecoin"][0]
-    narr = [s for s in stats if s["pattern_name"] == "full_conviction"
-            and s["pipeline"] == "narrative"][0]
+    memes = [
+        s
+        for s in stats
+        if s["pattern_name"] == "full_conviction" and s["pipeline"] == "memecoin"
+    ][0]
+    narr = [
+        s
+        for s in stats
+        if s["pattern_name"] == "full_conviction" and s["pipeline"] == "narrative"
+    ][0]
     assert memes["hit_rate"] == pytest.approx(0.6, abs=1e-6)
     assert narr["hit_rate"] == pytest.approx(0.2, abs=1e-6)
 
@@ -139,9 +172,21 @@ async def test_update_chain_outcomes_from_predictions(db, settings):
             strategy_snapshot, predicted_at, outcome_class, evaluated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            "cat-1", "Cat One", coin_id, "HYD", "Hydrated",
-            1_000_000.0, 0.01, 80, "STRONG", "HIGH", "reason",
-            "{}", old_ts, "HIT", now_iso,
+            "cat-1",
+            "Cat One",
+            coin_id,
+            "HYD",
+            "Hydrated",
+            1_000_000.0,
+            0.01,
+            80,
+            "STRONG",
+            "HIGH",
+            "reason",
+            "{}",
+            old_ts,
+            "HIT",
+            now_iso,
         ),
     )
     # Insert a stale (>48h) chain_match for the same coin with NULL outcome.
@@ -152,8 +197,16 @@ async def test_update_chain_outcomes_from_predictions(db, settings):
             conviction_boost)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            coin_id, "narrative", pid, "full_conviction", 3, 4,
-            old_ts, old_ts, 2.0, 25,
+            coin_id,
+            "narrative",
+            pid,
+            "full_conviction",
+            3,
+            4,
+            old_ts,
+            old_ts,
+            2.0,
+            25,
         ),
     )
     await db._conn.commit()
@@ -184,8 +237,16 @@ async def test_update_chain_outcomes_skips_recent(db, settings):
             conviction_boost)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            "recent-coin", "narrative", pid, "full_conviction", 3, 4,
-            recent_ts, recent_ts, 1.0, 25,
+            "recent-coin",
+            "narrative",
+            pid,
+            "full_conviction",
+            3,
+            4,
+            recent_ts,
+            recent_ts,
+            1.0,
+            25,
         ),
     )
     await db._conn.commit()
