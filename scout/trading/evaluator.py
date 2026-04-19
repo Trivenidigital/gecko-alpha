@@ -194,6 +194,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                         tp_pct=100.0,  # very high TP for long hold
                         sl_pct=0.0,    # no stop loss
                         slippage_bps=0, # no additional slippage on the hold portion
+                        signal_combo="long_hold",
                     )
                     if new_id is None:
                         log.warning("long_hold_creation_failed", trade_id=trade_id, token_id=token_id)
