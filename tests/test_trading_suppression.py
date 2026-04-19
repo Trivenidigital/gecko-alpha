@@ -228,13 +228,14 @@ async def test_concurrent_decrement_grants_only_one(tmp_path, settings_factory):
     await db_b.close()
 
 
-async def test_db_error_fallback_allows(tmp_path, monkeypatch, settings_factory):
+async def test_db_locked_error_fallback_allows(tmp_path, monkeypatch, settings_factory):
+    """A 'database is locked' OperationalError must fail-open (legacy behaviour)."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     import aiosqlite
 
     async def _boom(*a, **k):
-        raise aiosqlite.OperationalError("simulated db failure")
+        raise aiosqlite.OperationalError("database is locked")
 
     monkeypatch.setattr(db._conn, "execute", _boom)
     allow, reason = await suppression.should_open(
@@ -245,9 +246,72 @@ async def test_db_error_fallback_allows(tmp_path, monkeypatch, settings_factory)
     await db.close()
 
 
+async def test_db_busy_error_fallback_allows(tmp_path, monkeypatch, settings_factory):
+    """A 'database is busy' OperationalError must also fail-open."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    import aiosqlite
+
+    async def _boom(*a, **k):
+        raise aiosqlite.OperationalError("database is busy")
+
+    monkeypatch.setattr(db._conn, "execute", _boom)
+    allow, reason = await suppression.should_open(
+        db, "whatever", settings=settings_factory()
+    )
+    assert allow is True
+    assert reason == "db_error_fallback_allow"
+    await db.close()
+
+
+async def test_non_lock_operational_error_blocks(
+    tmp_path, monkeypatch, settings_factory
+):
+    """A non-lock OperationalError (e.g. 'no such table') must BLOCK, not fail-open.
+
+    Previously the broad except aiosqlite.Error treated all DB errors as lock
+    contention and failed open — a schema-drift bug would silently ungated
+    all combos. Now such errors return (False, 'error') to block the trade.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    import aiosqlite
+
+    async def _boom(*a, **k):
+        raise aiosqlite.OperationalError("no such table: combo_performance")
+
+    monkeypatch.setattr(db._conn, "execute", _boom)
+    allow, reason = await suppression.should_open(
+        db, "whatever", settings=settings_factory()
+    )
+    assert allow is False, "Non-lock DB error must block, not fail-open"
+    assert reason == "error"
+    await db.close()
+
+
+async def test_generic_db_error_blocks(tmp_path, monkeypatch, settings_factory):
+    """A generic aiosqlite.Error (non-OperationalError) must also BLOCK."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    import aiosqlite
+
+    async def _boom(*a, **k):
+        raise aiosqlite.DatabaseError("corruption detected")
+
+    monkeypatch.setattr(db._conn, "execute", _boom)
+    allow, reason = await suppression.should_open(
+        db, "whatever", settings=settings_factory()
+    )
+    assert allow is False, "Generic DB error must block, not fail-open"
+    assert reason == "error"
+    await db.close()
+
+
 async def test_fallback_counter_alerts_at_threshold(
     tmp_path, monkeypatch, settings_factory
 ):
+    """Lock-contention errors (message contains 'locked') must fail-open and
+    trigger Telegram alerts once the fallback counter hits the threshold."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     s = settings_factory()  # threshold=5, cooldown=900 from defaults
@@ -265,7 +329,8 @@ async def test_fallback_counter_alerts_at_threshold(
     import aiosqlite
 
     async def _boom(*a, **k):
-        raise aiosqlite.OperationalError("boom")
+        # Must contain "locked" so the narrow check routes to fail-open path.
+        raise aiosqlite.OperationalError("database is locked")
 
     monkeypatch.setattr(db._conn, "execute", _boom)
 
