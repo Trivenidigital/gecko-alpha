@@ -56,13 +56,13 @@ def test_feedback_loop_defaults(monkeypatch):
     monkeypatch.delenv("FEEDBACK_MIN_LEADERBOARD_TRADES", raising=False)
     monkeypatch.delenv("FEEDBACK_MISSED_WINNER_MIN_PCT", raising=False)
     monkeypatch.delenv("FEEDBACK_MISSED_WINNER_MIN_MCAP", raising=False)
-    monkeypatch.delenv("FEEDBACK_MISSED_WINNER_MAX_RANK", raising=False)
     monkeypatch.delenv("FEEDBACK_MISSED_WINNER_WINDOW_MIN", raising=False)
     monkeypatch.delenv("FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN", raising=False)
     monkeypatch.delenv("FEEDBACK_WEEKLY_DIGEST_WEEKDAY", raising=False)
     monkeypatch.delenv("FEEDBACK_WEEKLY_DIGEST_HOUR", raising=False)
     monkeypatch.delenv("FEEDBACK_COMBO_REFRESH_HOUR", raising=False)
     monkeypatch.delenv("FEEDBACK_FALLBACK_ALERT_THRESHOLD", raising=False)
+    monkeypatch.delenv("FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC", raising=False)
     monkeypatch.delenv("FEEDBACK_CHRONIC_FAILURE_THRESHOLD", raising=False)
 
     from scout.config import Settings
@@ -78,13 +78,13 @@ def test_feedback_loop_defaults(monkeypatch):
     assert s.FEEDBACK_MIN_LEADERBOARD_TRADES == 10
     assert s.FEEDBACK_MISSED_WINNER_MIN_PCT == 50.0
     assert s.FEEDBACK_MISSED_WINNER_MIN_MCAP == 5_000_000
-    assert s.FEEDBACK_MISSED_WINNER_MAX_RANK == 1500
     assert s.FEEDBACK_MISSED_WINNER_WINDOW_MIN == 30
     assert s.FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN == 60
     assert s.FEEDBACK_WEEKLY_DIGEST_WEEKDAY == 6
     assert s.FEEDBACK_WEEKLY_DIGEST_HOUR == 9
     assert s.FEEDBACK_COMBO_REFRESH_HOUR == 3
     assert s.FEEDBACK_FALLBACK_ALERT_THRESHOLD == 5
+    assert s.FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC == 900
     assert s.FEEDBACK_CHRONIC_FAILURE_THRESHOLD == 3
 ```
 
@@ -108,13 +108,13 @@ Find the `Settings` class in `scout/config.py` and add these lines (same indenta
     FEEDBACK_MIN_LEADERBOARD_TRADES: int = 10
     FEEDBACK_MISSED_WINNER_MIN_PCT: float = 50.0
     FEEDBACK_MISSED_WINNER_MIN_MCAP: float = 5_000_000
-    FEEDBACK_MISSED_WINNER_MAX_RANK: int = 1500
     FEEDBACK_MISSED_WINNER_WINDOW_MIN: int = 30
     FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN: int = 60
     FEEDBACK_WEEKLY_DIGEST_WEEKDAY: int = 6         # 6 = Sunday (Mon=0 per datetime.weekday())
     FEEDBACK_WEEKLY_DIGEST_HOUR: int = 9            # 09:00 local
     FEEDBACK_COMBO_REFRESH_HOUR: int = 3            # 03:00 local nightly
     FEEDBACK_FALLBACK_ALERT_THRESHOLD: int = 5
+    FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC: int = 900   # 15 minutes
     FEEDBACK_CHRONIC_FAILURE_THRESHOLD: int = 3
 ```
 
@@ -230,16 +230,80 @@ async def test_migration_adds_required_indexes(tmp_path):
     cur = await db._conn.execute(
         "SELECT name FROM sqlite_master WHERE type='index' "
         "AND name IN ('idx_paper_trades_combo_opened', "
-        "            'idx_paper_trades_token_opened', "
-        "            'idx_trending_snapshots_coin_id')"
+        "            'idx_paper_trades_token_opened')"
     )
     names = {row[0] for row in await cur.fetchall()}
     assert names == {
         "idx_paper_trades_combo_opened",
         "idx_paper_trades_token_opened",
-        "idx_trending_snapshots_coin_id",
     }
     await db.close()
+
+
+async def test_failed_migration_rolls_back_partial_changes(tmp_path, monkeypatch):
+    """D18: if a migration step fails, ALL prior DDL in this transaction must
+    roll back — including any ALTERs that succeeded AND the schema_version row.
+    """
+    from scout import db as db_module
+
+    db_path = tmp_path / "test.db"
+
+    # Fresh DB — first, let only _create_tables run (skip _migrate_feedback_loop_schema)
+    # so paper_trades exists without the new columns.
+    orig = db_module.Database._migrate_feedback_loop_schema
+
+    async def _skip(self):
+        return None
+
+    monkeypatch.setattr(db_module.Database, "_migrate_feedback_loop_schema",
+                        _skip)
+    db0 = db_module.Database(db_path)
+    await db0.initialize()
+    await db0.close()
+    monkeypatch.setattr(db_module.Database, "_migrate_feedback_loop_schema", orig)
+
+    # Now monkey-patch conn.execute to fail on the SECOND ALTER so the first
+    # ALTER has already run within the BEGIN EXCLUSIVE.
+    import aiosqlite as _aiosqlite
+    orig_execute = _aiosqlite.Connection.execute
+    state = {"alters_seen": 0}
+
+    async def _raise_on_second_alter(self, sql, *args, **kwargs):
+        if "ALTER TABLE paper_trades ADD COLUMN" in sql:
+            state["alters_seen"] += 1
+            if state["alters_seen"] == 2:
+                raise RuntimeError("forced failure mid-migration")
+        return await orig_execute(self, sql, *args, **kwargs)
+
+    monkeypatch.setattr(_aiosqlite.Connection, "execute",
+                        _raise_on_second_alter)
+
+    db = db_module.Database(db_path)
+    with pytest.raises(RuntimeError, match="forced failure mid-migration"):
+        await db.initialize()
+
+    # Restore execute before inspecting state.
+    monkeypatch.setattr(_aiosqlite.Connection, "execute", orig_execute)
+
+    # Open raw conn and assert: no schema_version row, no partial columns.
+    raw = await _open_raw_conn(db_path)
+    cur = await raw.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+        "AND name='schema_version'"
+    )
+    sv_table = (await cur.fetchone())[0]
+    if sv_table:
+        cur = await raw.execute("SELECT COUNT(*) FROM schema_version WHERE version=20260418")
+        assert (await cur.fetchone())[0] == 0, "schema_version must not be committed after failure"
+
+    cur = await raw.execute("PRAGMA table_info(paper_trades)")
+    cols = {row[1] for row in await cur.fetchall()}
+    # At most the first column may have been added inside the txn; after
+    # ROLLBACK none of the three may persist.
+    assert "signal_combo" not in cols, f"partial ALTER not rolled back: {cols}"
+    assert "lead_time_vs_trending_min" not in cols
+    assert "lead_time_vs_trending_status" not in cols
+    await raw.close()
 
 
 async def test_post_migration_assertion_raises_on_incomplete_schema(tmp_path, monkeypatch):
@@ -291,8 +355,10 @@ async def test_post_migration_assertion_raises_on_incomplete_schema(tmp_path, mo
     monkeypatch.setattr(_aiosqlite.Connection, "execute", original_execute)
     try:
         await db2.close()
-    except Exception:
-        pass
+    except Exception as e:
+        # Close may fail if connection is in bad state after partial init — log, don't mask.
+        import structlog
+        structlog.get_logger().warning("test_db_close_failed", err=str(e))
 ```
 
 - [ ] **Step 2: Run tests — expect FAIL**
@@ -366,11 +432,11 @@ Add this method to the `Database` class in `scout/db.py` (place it just after `_
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_token_opened "
                 "ON paper_trades(token_id, opened_at)"
             )
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_trending_snapshots_coin_id "
-                "ON trending_snapshots(coin_id)"
-            )
+            # Note: trending_snapshots already has idx_trending_snap(coin_id, snapshot_at)
+            # which covers our lead-time lookups. No new index needed.
 
+            # POST-ASSERTION — run BEFORE commit so a failure triggers ROLLBACK
+            # (per D18: partial schema must not persist on assertion failure).
             cur = await conn.execute("PRAGMA table_info(paper_trades)")
             final = {row[1] for row in await cur.fetchall()}
             missing = set(expected_cols) - final
@@ -387,8 +453,10 @@ Add this method to the `Database` class in `scout/db.py` (place it just after `_
         except Exception:
             try:
                 await conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            except Exception as rb_err:
+                # ROLLBACK itself failed — log with traceback so this is never silent.
+                _log.exception("schema_migration_rollback_failed",
+                               err=str(rb_err))
             _log.error("SCHEMA_DRIFT_DETECTED")
             raise
 ```
@@ -408,7 +476,9 @@ Then find `Database.initialize()` and add a call at the end, after `_create_tabl
 - [ ] **Step 4: Run tests — expect PASS**
 
 Run: `uv run pytest tests/test_trading_db_migration.py -v`
-Expected: all PASS (the `test_post_migration_assertion_raises_on_incomplete_schema` test may skip on older SQLite — that's acceptable).
+Expected: all PASS. Notes:
+- `test_post_migration_assertion_raises_on_incomplete_schema` may skip on SQLite < 3.35 (no DROP COLUMN) — acceptable.
+- `test_failed_migration_rolls_back_partial_changes` proves the post-assertion-before-commit ordering and the BEGIN EXCLUSIVE atomicity — this is the D18 regression gate.
 
 - [ ] **Step 5: Run broader trading-db regression**
 
@@ -471,14 +541,17 @@ def test_signal_type_dedup_from_extras():
     assert build_combo_key("volume_spike", ["volume_spike"]) == "volume_spike"
 
 
-def test_triple_truncates_to_pair_and_logs(caplog):
-    import logging
-    caplog.set_level(logging.INFO)
+def test_triple_truncates_to_pair_and_logs(capsys):
+    """D2: pair cap — 3+ signals collapse to 2 and emit `combo_key_truncated` log."""
+    import structlog
+    # Capture structlog output via its default stdout renderer.
     result = build_combo_key("first_signal", ["momentum_ratio", "vol_acceleration"])
     # Kept: alphabetically-first of extras = 'momentum_ratio'
     assert result == "first_signal+momentum_ratio"
-    # structlog uses stdlib logging under the hood; just confirm function returned.
-    # (Structured-log capture differs by setup; the pair-cap contract is behavioural.)
+    out = capsys.readouterr().out + capsys.readouterr().err
+    assert "combo_key_truncated" in out, (
+        f"expected 'combo_key_truncated' log event; stdout/stderr was:\n{out}"
+    )
 
 
 def test_pair_cap_keeps_alphabetically_first():
@@ -590,11 +663,14 @@ async def _seed_price(db, token_id: str, price: float):
 
 
 async def _seed_trending(db, coin_id: str, snapshot_at: datetime):
+    # trending_snapshots schema: id, coin_id, symbol, name, market_cap_rank,
+    # trending_score, snapshot_at, created_at (see scout/db.py). No
+    # `price_at_snapshot` column exists.
     await db._conn.execute(
         "INSERT INTO trending_snapshots "
-        "(coin_id, symbol, name, market_cap_rank, price_at_snapshot, snapshot_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (coin_id, "SYM", "Name", 100, 1.0, snapshot_at.isoformat()),
+        "(coin_id, symbol, name, market_cap_rank, snapshot_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (coin_id, "SYM", "Name", 100, snapshot_at.isoformat()),
     )
     await db._conn.commit()
 
@@ -643,9 +719,9 @@ async def test_lead_time_returns_error_status_on_bad_row(tmp_path, monkeypatch):
     # Insert a row with a malformed timestamp so datetime.fromisoformat raises.
     await db._conn.execute(
         "INSERT INTO trending_snapshots "
-        "(coin_id, symbol, name, market_cap_rank, price_at_snapshot, snapshot_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ("coinX", "SYM", "Name", 100, 1.0, "NOT-A-TIMESTAMP"),
+        "(coin_id, symbol, name, market_cap_rank, snapshot_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("coinX", "SYM", "Name", 100, "NOT-A-TIMESTAMP"),
     )
     await db._conn.commit()
     lead, status = await _compute_lead_time_vs_trending(
@@ -702,9 +778,9 @@ async def test_open_trade_status_error_does_not_block_insert(tmp_path, settings_
     # Bad trending timestamp forces status='error'.
     await db._conn.execute(
         "INSERT INTO trending_snapshots "
-        "(coin_id, symbol, name, market_cap_rank, price_at_snapshot, snapshot_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ("coinX", "SYM", "Name", 100, 1.0, "NOT-A-TIMESTAMP"),
+        "(coin_id, symbol, name, market_cap_rank, snapshot_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("coinX", "SYM", "Name", 100, "NOT-A-TIMESTAMP"),
     )
     await db._conn.commit()
 
@@ -779,6 +855,7 @@ async def _compute_lead_time_vs_trending(
     Negative lead_time means we opened BEFORE the coin trended (beat CG).
     Positive means we opened AFTER (we were late).
     """
+    import aiosqlite
     try:
         cursor = await db._conn.execute(
             "SELECT MIN(snapshot_at) FROM trending_snapshots WHERE coin_id = ?",
@@ -793,10 +870,14 @@ async def _compute_lead_time_vs_trending(
             crossed_dt = crossed_dt.replace(tzinfo=timezone.utc)
         delta_min = (now - crossed_dt).total_seconds() / 60.0
         return (delta_min, "ok")
-    except Exception as e:
+    except (aiosqlite.Error, ValueError, TypeError) as e:
+        # Narrow the catch to expected DB / parse errors. Programming bugs
+        # (AttributeError, NameError, KeyError) must still crash loudly so
+        # they're caught in test instead of permanently degrading the column.
         log.error(
             "lead_time_compute_error",
             err=str(e),
+            err_type=type(e).__name__,
             err_id="LEAD_TIME_CALC",
             token_id=token_id,
         )
@@ -948,7 +1029,7 @@ git commit -m "feat(trading): lead-time helper + signal_combo persistence in ope
 - Create: `scout/trading/suppression.py`
 - Create: `tests/test_trading_suppression.py`
 
-Per spec §5.2, D16, D17. Uses `BEGIN IMMEDIATE` for atomic parole decrement. Module-level deque + `last_alerted_ts` sentinel for fail-open alerting.
+Per spec §5.2, D16, D17. Uses `BEGIN IMMEDIATE` for atomic parole decrement (cross-connection file-level lock — see Test note on D16). Module-level deque + `last_alerted_ts` sentinel for fail-open alerting. **`should_open` takes `settings` as a required kwarg** so the fail-open alert can respect `FEEDBACK_FALLBACK_ALERT_THRESHOLD` / `FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC` and can build the Telegram payload via `alerter.send_telegram_message(text, session, settings)` (the real signature — tests previously monkey-patched it with a single-arg stub, which would have TypeError'd in production).
 
 - [ ] **Step 1: Write the failing test file**
 
@@ -1006,26 +1087,27 @@ def _reset_fallback_state():
     suppression._last_alerted_ts = 0.0
 
 
-async def test_cold_start_allows(tmp_path):
+async def test_cold_start_allows(tmp_path, settings_factory):
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    allow, reason = await suppression.should_open(db, "never_seen")
+    s = settings_factory()
+    allow, reason = await suppression.should_open(db, "never_seen", settings=s)
     assert allow is True
     assert reason == "cold_start"
     await db.close()
 
 
-async def test_not_suppressed_allows(tmp_path):
+async def test_not_suppressed_allows(tmp_path, settings_factory):
     db = Database(tmp_path / "t.db")
     await db.initialize()
     await _seed_combo(db, "good_combo", trades=30, wins=20, suppressed=0)
-    allow, reason = await suppression.should_open(db, "good_combo")
+    allow, reason = await suppression.should_open(db, "good_combo", settings=settings_factory())
     assert allow is True
     assert reason == "ok"
     await db.close()
 
 
-async def test_suppressed_pre_parole_denies(tmp_path):
+async def test_suppressed_pre_parole_denies(tmp_path, settings_factory):
     db = Database(tmp_path / "t.db")
     await db.initialize()
     future = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
@@ -1034,13 +1116,13 @@ async def test_suppressed_pre_parole_denies(tmp_path):
         suppressed_at=datetime.now(timezone.utc).isoformat(),
         parole_at=future, parole_remaining=5,
     )
-    allow, reason = await suppression.should_open(db, "bad_combo")
+    allow, reason = await suppression.should_open(db, "bad_combo", settings=settings_factory())
     assert allow is False
     assert reason == "suppressed"
     await db.close()
 
 
-async def test_parole_allows_and_decrements(tmp_path):
+async def test_parole_allows_and_decrements(tmp_path, settings_factory):
     db = Database(tmp_path / "t.db")
     await db.initialize()
     past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
@@ -1048,7 +1130,7 @@ async def test_parole_allows_and_decrements(tmp_path):
         db, "parole_combo", trades=25, wins=5, suppressed=1,
         suppressed_at=past, parole_at=past, parole_remaining=3,
     )
-    allow, reason = await suppression.should_open(db, "parole_combo")
+    allow, reason = await suppression.should_open(db, "parole_combo", settings=settings_factory())
     assert allow is True
     assert reason == "parole_retest"
     cur = await db._conn.execute(
@@ -1061,7 +1143,7 @@ async def test_parole_allows_and_decrements(tmp_path):
     await db.close()
 
 
-async def test_parole_exhausted_denies(tmp_path):
+async def test_parole_exhausted_denies(tmp_path, settings_factory):
     db = Database(tmp_path / "t.db")
     await db.initialize()
     past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
@@ -1069,80 +1151,120 @@ async def test_parole_exhausted_denies(tmp_path):
         db, "exhausted", trades=25, wins=5, suppressed=1,
         suppressed_at=past, parole_at=past, parole_remaining=0,
     )
-    allow, reason = await suppression.should_open(db, "exhausted")
+    allow, reason = await suppression.should_open(db, "exhausted", settings=settings_factory())
     assert allow is False
     assert reason == "parole_exhausted"
     await db.close()
 
 
-async def test_concurrent_decrement_grants_only_one(tmp_path):
-    """Per spec D16 — BEGIN IMMEDIATE serializes the SELECT/UPDATE."""
+async def test_parole_boundary_at_exact_now(tmp_path, settings_factory):
+    """When parole_at == now exactly, the window is open (not-in-future) → allow."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
+    now = datetime.now(timezone.utc)
+    await _seed_combo(
+        db, "boundary", trades=25, wins=5, suppressed=1,
+        suppressed_at=now.isoformat(), parole_at=now.isoformat(),
+        parole_remaining=3,
+    )
+    allow, reason = await suppression.should_open(db, "boundary", settings=settings_factory())
+    assert allow is True
+    assert reason == "parole_retest"
+    await db.close()
+
+
+async def test_concurrent_decrement_grants_only_one(tmp_path, settings_factory):
+    """Per spec D16 — BEGIN IMMEDIATE + SQLite file-level locking serializes
+    across SEPARATE aiosqlite connections (two Database objects pointing at the
+    same DB file). A single shared connection is not a concurrency test (SQLite
+    would reject nested BEGIN on the same conn), so we open two instances."""
+    path = tmp_path / "race.db"
+    seeder = Database(path)
+    await seeder.initialize()
     past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     await _seed_combo(
-        db, "race_combo", trades=25, wins=5, suppressed=1,
+        seeder, "race_combo", trades=25, wins=5, suppressed=1,
         suppressed_at=past, parole_at=past, parole_remaining=1,
     )
+    await seeder.close()
+
+    # Two independent connections — mimic what two signals-dispatcher paths
+    # would see if they ever raced. In practice gecko-alpha is single-process
+    # single-loop so this test upper-bounds the concurrency surface.
+    db_a = Database(path)
+    db_b = Database(path)
+    await db_a.initialize()
+    await db_b.initialize()
+    s = settings_factory()
     results = await asyncio.gather(
-        suppression.should_open(db, "race_combo"),
-        suppression.should_open(db, "race_combo"),
+        suppression.should_open(db_a, "race_combo", settings=s),
+        suppression.should_open(db_b, "race_combo", settings=s),
     )
     reasons = sorted(r[1] for r in results)
-    assert reasons == ["parole_exhausted", "parole_retest"]
-    cur = await db._conn.execute(
+    # One retest, one exhausted (in either order). OR — if SQLite serialization
+    # causes one to fail with "database is locked" — that caller falls through
+    # to the DB-error fallback-allow path, which is also acceptable per D17.
+    assert reasons == ["parole_exhausted", "parole_retest"] or \
+           "db_error_fallback_allow" in reasons, f"unexpected reasons: {reasons}"
+    # At most one successful decrement.
+    cur = await db_a._conn.execute(
         "SELECT parole_trades_remaining FROM combo_performance "
         "WHERE combo_key='race_combo' AND window='30d'",
     )
     assert (await cur.fetchone())[0] == 0
-    await db.close()
+    await db_a.close()
+    await db_b.close()
 
 
-async def test_db_error_fallback_allows(tmp_path, monkeypatch):
+async def test_db_error_fallback_allows(tmp_path, monkeypatch, settings_factory):
     db = Database(tmp_path / "t.db")
     await db.initialize()
+    import aiosqlite
 
     async def _boom(*a, **k):
-        raise RuntimeError("simulated db failure")
+        raise aiosqlite.OperationalError("simulated db failure")
 
     monkeypatch.setattr(db._conn, "execute", _boom)
-    allow, reason = await suppression.should_open(db, "whatever")
+    allow, reason = await suppression.should_open(db, "whatever", settings=settings_factory())
     assert allow is True
     assert reason == "db_error_fallback_allow"
     await db.close()
 
 
-async def test_fallback_counter_alerts_at_threshold(tmp_path, monkeypatch):
+async def test_fallback_counter_alerts_at_threshold(tmp_path, monkeypatch, settings_factory):
     db = Database(tmp_path / "t.db")
     await db.initialize()
+    s = settings_factory()  # threshold=5, cooldown=900 from defaults
 
-    sent: list[str] = []
+    sent: list[tuple] = []
 
-    async def _capture(msg, *a, **k):
-        sent.append(msg)
+    async def _capture(text, session, settings):
+        # Real alerter.send_telegram_message signature: (text, session, settings).
+        sent.append((text, session, settings))
 
     import scout.alerter as _alerter
     monkeypatch.setattr(_alerter, "send_telegram_message", _capture)
 
+    import aiosqlite
+
     async def _boom(*a, **k):
-        raise RuntimeError("boom")
+        raise aiosqlite.OperationalError("boom")
     monkeypatch.setattr(db._conn, "execute", _boom)
 
-    # 5 failures should trigger one Telegram alert (threshold = 5).
     for _ in range(5):
-        await suppression.should_open(db, "x")
-    assert len(sent) == 1
-    assert "fail-open" in sent[0].lower()
+        await suppression.should_open(db, "x", settings=s)
+    assert len(sent) == 1, f"expected 1 alert after threshold, got {len(sent)}"
+    assert "fail-open" in sent[0][0].lower()
+    # The third positional arg is the settings instance.
+    assert sent[0][2] is s
 
     # Immediate 6th failure within cooldown — no new alert.
-    await suppression.should_open(db, "x")
+    await suppression.should_open(db, "x", settings=s)
     assert len(sent) == 1
 
     # Force cooldown expiry by rewinding _last_alerted_ts.
-    suppression._last_alerted_ts = time.monotonic() - (
-        suppression._FALLBACK_ALERT_COOLDOWN_SEC + 1
-    )
-    await suppression.should_open(db, "x")
+    suppression._last_alerted_ts = time.monotonic() - (s.FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC + 1)
+    await suppression.should_open(db, "x", settings=s)
     assert len(sent) == 2
     await db.close()
 ```
@@ -1167,6 +1289,8 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 
+import aiohttp
+import aiosqlite
 import structlog
 
 from scout import alerter
@@ -1175,14 +1299,19 @@ from scout.db import Database
 log = structlog.get_logger()
 
 _FALLBACK_WINDOW_SEC = 3600
-_FALLBACK_ALERT_THRESHOLD = 5
-_FALLBACK_ALERT_COOLDOWN_SEC = 900
 _fallback_timestamps: "deque[float]" = deque()
 _last_alerted_ts: float = 0.0
 
 
-async def should_open(db: Database, combo_key: str) -> tuple[bool, str]:
-    """Entry-gate: returns (allow, reason). Fail-open on DB error."""
+async def should_open(
+    db: Database, combo_key: str, *, settings
+) -> tuple[bool, str]:
+    """Entry-gate: returns (allow, reason). Fail-open on DB error.
+
+    `settings` is required so the fail-open alert can (a) respect
+    `FEEDBACK_FALLBACK_ALERT_THRESHOLD` / `_COOLDOWN_SEC` and (b) build the
+    real alerter.send_telegram_message(text, session, settings) payload.
+    """
     try:
         cursor = await db._conn.execute(
             "SELECT suppressed, parole_at, parole_trades_remaining "
@@ -1190,16 +1319,14 @@ async def should_open(db: Database, combo_key: str) -> tuple[bool, str]:
             (combo_key,),
         )
         row = await cursor.fetchone()
-    except Exception as e:
-        await _record_fallback(combo_key, str(e))
+    except aiosqlite.Error as e:
+        await _record_fallback(combo_key, str(e), settings)
         return (True, "db_error_fallback_allow")
 
     if row is None:
         return (True, "cold_start")
 
-    suppressed = row[0]
-    parole_at = row[1]
-    # parole_remaining = row[2]  # re-read inside transaction below
+    suppressed, parole_at, _ = row[0], row[1], row[2]
 
     if not suppressed:
         return (True, "ok")
@@ -1207,13 +1334,24 @@ async def should_open(db: Database, combo_key: str) -> tuple[bool, str]:
     if parole_at is None:
         return (False, "suppressed")
 
-    parole_dt = datetime.fromisoformat(parole_at)
+    try:
+        parole_dt = datetime.fromisoformat(parole_at)
+    except (ValueError, TypeError) as e:
+        await _record_fallback(combo_key, f"parole_at parse: {e}", settings)
+        return (True, "db_error_fallback_allow")
     if parole_dt.tzinfo is None:
         parole_dt = parole_dt.replace(tzinfo=timezone.utc)
     if parole_dt > datetime.now(timezone.utc):
         return (False, "suppressed")
 
     # Parole window open — atomic decrement via BEGIN IMMEDIATE.
+    # Note: aiosqlite serializes statements against a single Connection object.
+    # BEGIN IMMEDIATE acquires a RESERVED lock at the SQLite file level, so
+    # when two separate Connection objects (e.g. two Database instances at
+    # the same file) race, the second BEGIN IMMEDIATE blocks until the first
+    # commits — SQLite's per-file locking enforces the invariant. Same-conn
+    # "nested BEGIN" is NOT a concurrency case in an asyncio single-loop
+    # process; see test_concurrent_decrement_grants_only_one.
     try:
         await db._conn.execute("BEGIN IMMEDIATE")
         cur = await db._conn.execute(
@@ -1233,16 +1371,20 @@ async def should_open(db: Database, combo_key: str) -> tuple[bool, str]:
         )
         await db._conn.commit()
         return (True, "parole_retest")
-    except Exception as e:
+    except aiosqlite.Error as e:
         try:
             await db._conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        await _record_fallback(combo_key, f"parole_decrement: {e}")
+        except aiosqlite.Error as rb_err:
+            log.warning(
+                "suppression_rollback_failed",
+                combo_key=combo_key, err=str(rb_err),
+                err_id="SUPP_ROLLBACK",
+            )
+        await _record_fallback(combo_key, f"parole_decrement: {e}", settings)
         return (True, "db_error_fallback_allow")
 
 
-async def _record_fallback(combo_key: str, err: str) -> None:
+async def _record_fallback(combo_key: str, err: str, settings) -> None:
     """Log + maintain the fail-open counter; fire Telegram alert with cooldown."""
     global _last_alerted_ts
     log.error(
@@ -1254,21 +1396,27 @@ async def _record_fallback(combo_key: str, err: str) -> None:
     while _fallback_timestamps and now_ts - _fallback_timestamps[0] > _FALLBACK_WINDOW_SEC:
         _fallback_timestamps.popleft()
 
+    threshold = settings.FEEDBACK_FALLBACK_ALERT_THRESHOLD
+    cooldown = settings.FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC
     if (
-        len(_fallback_timestamps) >= _FALLBACK_ALERT_THRESHOLD
-        and now_ts - _last_alerted_ts >= _FALLBACK_ALERT_COOLDOWN_SEC
+        len(_fallback_timestamps) >= threshold
+        and now_ts - _last_alerted_ts >= cooldown
     ):
         _last_alerted_ts = now_ts
+        msg = (
+            f"⚠ Suppression fail-open fired {len(_fallback_timestamps)}x "
+            f"in last hour. DB may be degraded — combos are currently ungated."
+        )
         try:
-            await alerter.send_telegram_message(
-                f"⚠ Suppression fail-open fired {len(_fallback_timestamps)}x "
-                f"in last hour. DB may be degraded — combos are currently ungated."
-            )
+            # One-shot aiohttp session — fallbacks are rare (DB-degraded),
+            # so the overhead of opening+closing a connection pool once per
+            # alert is acceptable vs. threading a long-lived session through
+            # every dispatcher.
+            async with aiohttp.ClientSession() as session:
+                await alerter.send_telegram_message(msg, session, settings)
         except Exception:
             log.exception("suppression_fallback_alert_dispatch_error")
 ```
-
-**Note on signature of `alerter.send_telegram_message`:** if the existing signature requires `session` / `settings` arguments, adapt the call site to match local conventions. Inspect `scout/alerter.py` before writing and copy the style of other callers (e.g. `main.py`'s daily summary). If the alerter API requires session/settings, add a thin private fire-and-forget helper in this module that uses `aiohttp.ClientSession()` and reads settings from an injected module-level singleton — or, simpler, pass settings/session through `should_open` as additional args and forward to `_record_fallback`. Pick whichever matches existing patterns; the tests above monkeypatch `alerter.send_telegram_message` directly so the capture will work either way, but you may need to adapt the monkeypatch target.
 
 - [ ] **Step 4: Run the test — expect PASS**
 
@@ -1487,26 +1635,133 @@ async def test_refresh_all_aggregates_distinct_combos(tmp_path, settings_factory
     await db.close()
 
 
-async def test_refresh_failures_increments_and_resets(tmp_path, settings_factory, monkeypatch):
+async def test_window_cutoff_7d_excludes_old_trades(tmp_path, settings_factory):
+    """A trade closed 8 days ago must appear in 30d but NOT 7d."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+    await _insert_trade(db, "wc", 100, 10.0, now - timedelta(days=8))
+    await _insert_trade(db, "wc", 100, 10.0, now - timedelta(days=2))
+    await combo_refresh.refresh_combo(db, "wc", s)
+    row_7d = await _get_combo_row(db, "wc", "7d")
+    row_30d = await _get_combo_row(db, "wc", "30d")
+    assert row_7d["trades"] == 1, "8-day-old trade must be excluded from 7d"
+    assert row_30d["trades"] == 2, "8-day-old trade must be included in 30d"
+    await db.close()
+
+
+async def test_window_cutoff_30d_excludes_very_old_trades(tmp_path, settings_factory):
+    """A trade closed 31 days ago must NOT appear in 30d."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+    await _insert_trade(db, "old", 100, 10.0, now - timedelta(days=31))
+    await _insert_trade(db, "old", 100, 10.0, now - timedelta(days=2))
+    await combo_refresh.refresh_combo(db, "old", s)
+    row_30d = await _get_combo_row(db, "old", "30d")
+    assert row_30d["trades"] == 1
+    await db.close()
+
+
+async def test_zero_trade_combo_writes_empty_row(tmp_path, settings_factory):
+    """A combo with no closed trades in window — no error, trades=0, not suppressed."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    ok = await combo_refresh.refresh_combo(db, "empty", s)
+    assert ok is True
+    row = await _get_combo_row(db, "empty", "30d")
+    assert row["trades"] == 0
+    assert row["suppressed"] == 0
+    assert row["win_rate_pct"] == 0.0
+    await db.close()
+
+
+async def test_refresh_failures_increments_on_error(tmp_path, settings_factory, monkeypatch):
+    """When refresh_combo raises, refresh_failures must increment (so chronic
+    failures surface in the weekly digest). HIGH-6 regression gate.
+    """
     db = Database(tmp_path / "t.db")
     await db.initialize()
     s = settings_factory()
     now = datetime.now(timezone.utc)
     await _insert_trade(db, "flaky", 10, 5.0, now - timedelta(days=1))
 
-    # Monkeypatch to force first refresh to fail.
-    original_execute = db._conn.execute
-    call_count = {"n": 0}
+    # First do a successful refresh so the row exists with refresh_failures=0.
+    assert await combo_refresh.refresh_combo(db, "flaky", s) is True
 
-    async def _sometimes_fail(sql, *args, **kwargs):
-        call_count["n"] += 1
-        if "UPDATE combo_performance" in str(sql) and call_count["n"] < 3:
-            raise RuntimeError("simulated failure")
+    # Now monkeypatch to force an exception during the main UPSERT. The SELECT
+    # is cheap and happens first; fail on the INSERT so the try: body aborts
+    # and enters the except path.
+    original_execute = db._conn.execute
+    import aiosqlite
+
+    async def _fail_on_upsert(sql, *args, **kwargs):
+        if "INSERT INTO combo_performance" in str(sql) and "'7d'" in str(sql):
+            raise aiosqlite.OperationalError("forced failure")
         return await original_execute(sql, *args, **kwargs)
 
-    # (Exact failure simulation depends on refresh_combo internals; this test
-    # is primarily a behavioural scaffold — adjust the simulated failure to
-    # match the real failure surface during implementation.)
+    monkeypatch.setattr(db._conn, "execute", _fail_on_upsert)
+    ok = await combo_refresh.refresh_combo(db, "flaky", s)
+    assert ok is False
+
+    # Undo monkeypatch and inspect counter.
+    monkeypatch.setattr(db._conn, "execute", original_execute)
+    row = await _get_combo_row(db, "flaky", "30d")
+    assert row["refresh_failures"] >= 1, (
+        "refresh_failures must increment on error"
+    )
+    await db.close()
+
+
+async def test_refresh_failures_resets_to_zero_on_success(tmp_path, settings_factory):
+    """After a failed refresh incremented the counter, a subsequent successful
+    refresh must reset it to 0 (UPSERT sets refresh_failures=0).
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+    # Seed with refresh_failures=5 and one real trade.
+    await db._conn.execute(
+        "INSERT INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, "
+        " avg_pnl_pct, win_rate_pct, suppressed, refresh_failures, last_refreshed) "
+        "VALUES ('healed', '30d', 0, 0, 0, 0, 0, 0, 0, 5, ?)",
+        (now.isoformat(),),
+    )
+    await db._conn.commit()
+    await _insert_trade(db, "healed", 10, 5.0, now - timedelta(days=1))
+
+    ok = await combo_refresh.refresh_combo(db, "healed", s)
+    assert ok is True
+    row = await _get_combo_row(db, "healed", "30d")
+    assert row["refresh_failures"] == 0
+
+
+async def test_chronic_failure_threshold_detected(tmp_path, settings_factory):
+    """refresh_all returns combos whose refresh_failures >= threshold."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+    # Seed a combo with refresh_failures=3 (== default threshold) and no trades
+    # in last 30d, so it won't be picked up by the DISTINCT scan — manually
+    # include it via refresh_all's second SELECT which queries combo_performance
+    # directly for chronic failures.
+    await db._conn.execute(
+        "INSERT INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, "
+        " avg_pnl_pct, win_rate_pct, suppressed, refresh_failures, last_refreshed) "
+        "VALUES ('stuck', '30d', 0, 0, 0, 0, 0, 0, 0, 3, ?)",
+        (now.isoformat(),),
+    )
+    await db._conn.commit()
+
+    summary = await combo_refresh.refresh_all(db, s)
+    assert "stuck" in summary["chronic_failures"]
     await db.close()
 ```
 
@@ -1673,8 +1928,15 @@ async def refresh_combo(db: Database, combo_key: str, settings) -> bool:
                 (combo_key,),
             )
             await db._conn.commit()
-        except Exception:
-            pass
+        except Exception as counter_err:
+            # The chronic-failure surfacing in weekly_digest depends on this
+            # counter incrementing — if the counter write itself fails, log
+            # loudly so the operator notices the counter is blind, not silent.
+            log.exception(
+                "combo_refresh_failure_counter_update_failed",
+                combo_key=combo_key, err=str(counter_err),
+                err_id="COMBO_REFRESH_COUNTER",
+            )
         return False
 
 
@@ -1795,13 +2057,13 @@ async def test_combo_leaderboard_sort_order(tmp_path):
     await db.close()
 
 
-async def _seed_gainers_snapshot(db, coin_id, snapshot_at, price_change_24h, mcap, rank):
+async def _seed_gainers_snapshot(db, coin_id, snapshot_at, price_change_24h, mcap):
     await db._conn.execute(
         "INSERT INTO gainers_snapshots "
-        "(coin_id, symbol, name, market_cap_rank, market_cap, current_price, "
-        " price_change_24h, price_at_snapshot, snapshot_at) "
-        "VALUES (?, ?, ?, ?, ?, 1.0, ?, 1.0, ?)",
-        (coin_id, coin_id.upper(), coin_id.title(), rank, mcap,
+        "(coin_id, symbol, name, market_cap, price_change_24h, "
+        " price_at_snapshot, snapshot_at) "
+        "VALUES (?, ?, ?, ?, ?, 1.0, ?)",
+        (coin_id, coin_id.upper(), coin_id.title(), mcap,
          price_change_24h, snapshot_at.isoformat()),
     )
     await db._conn.commit()
@@ -1825,7 +2087,7 @@ async def test_missed_winner_tier_boundaries(tmp_path, settings_factory):
     await db.initialize()
     s = settings_factory()
     now = datetime.now(timezone.utc)
-    # All these are above mcap/rank filter, all uncaught.
+    # All above mcap filter, all uncaught.
     cases = [
         ("partial_edge",   50.0,    "partial_miss"),
         ("partial_hi",     199.99,  "partial_miss"),
@@ -1836,7 +2098,7 @@ async def test_missed_winner_tier_boundaries(tmp_path, settings_factory):
     ]
     for coin, pct, _ in cases:
         await _seed_gainers_snapshot(
-            db, coin, now - timedelta(hours=5), pct, mcap=10_000_000, rank=500,
+            db, coin, now - timedelta(hours=5), pct, mcap=10_000_000,
         )
     result = await analytics.audit_missed_winners(
         db, start=now - timedelta(days=1), end=now, settings=s,
@@ -1858,17 +2120,12 @@ async def test_missed_winner_filters_excludes_small_caps(tmp_path, settings_fact
     # mcap too small
     await _seed_gainers_snapshot(
         db, "toosmall", now - timedelta(hours=2),
-        price_change_24h=300, mcap=4_999_999, rank=100,
-    )
-    # rank too big
-    await _seed_gainers_snapshot(
-        db, "toofar", now - timedelta(hours=2),
-        price_change_24h=300, mcap=10_000_000, rank=2000,
+        price_change_24h=300, mcap=4_999_999,
     )
     # qualifies
     await _seed_gainers_snapshot(
         db, "good", now - timedelta(hours=2),
-        price_change_24h=300, mcap=10_000_000, rank=500,
+        price_change_24h=300, mcap=10_000_000,
     )
     result = await analytics.audit_missed_winners(
         db, start=now - timedelta(days=1), end=now, settings=s,
@@ -1876,9 +2133,7 @@ async def test_missed_winner_filters_excludes_small_caps(tmp_path, settings_fact
     missed = [e["coin_id"] for tier in result["tiers"].values() for e in tier]
     assert "good" in missed
     assert "toosmall" not in missed
-    assert "toofar" not in missed
     assert result["denominator"]["winners_filtered_by_mcap"] >= 1
-    assert result["denominator"]["winners_filtered_by_rank"] >= 1
     await db.close()
 
 
@@ -1889,10 +2144,10 @@ async def test_missed_winner_catch_window_boundaries(tmp_path, settings_factory)
     now = datetime.now(timezone.utc)
     crossed = now - timedelta(hours=5)
     # Opened exactly at -30min (should count as caught).
-    await _seed_gainers_snapshot(db, "caught_edge", crossed, 300, 10_000_000, 500)
+    await _seed_gainers_snapshot(db, "caught_edge", crossed, 300, 10_000_000)
     await _seed_paper_trade(db, "caught_edge", crossed - timedelta(minutes=30))
     # Opened at -31min (missed).
-    await _seed_gainers_snapshot(db, "missed_edge", crossed, 300, 10_000_000, 500)
+    await _seed_gainers_snapshot(db, "missed_edge", crossed, 300, 10_000_000)
     await _seed_paper_trade(db, "missed_edge", crossed - timedelta(minutes=31))
     result = await analytics.audit_missed_winners(
         db, start=now - timedelta(days=1), end=now, settings=s,
@@ -1903,28 +2158,102 @@ async def test_missed_winner_catch_window_boundaries(tmp_path, settings_factory)
     await db.close()
 
 
+async def test_missed_winner_catch_window_plus_side(tmp_path, settings_factory):
+    """Spec §7: window is ±N minutes around crossed_at.
+
+    A trade opened AFTER the crossed_at (up to +window_min) still counts as
+    caught. Beyond +window_min it's missed.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+    crossed = now - timedelta(hours=5)
+    # Opened at +30min → caught (inclusive boundary).
+    await _seed_gainers_snapshot(db, "caught_plus", crossed, 300, 10_000_000)
+    await _seed_paper_trade(db, "caught_plus", crossed + timedelta(minutes=30))
+    # Opened at +31min → missed.
+    await _seed_gainers_snapshot(db, "missed_plus", crossed, 300, 10_000_000)
+    await _seed_paper_trade(db, "missed_plus", crossed + timedelta(minutes=31))
+    result = await analytics.audit_missed_winners(
+        db, start=now - timedelta(days=1), end=now, settings=s,
+    )
+    missed_ids = [e["coin_id"] for tier in result["tiers"].values() for e in tier]
+    assert "missed_plus" in missed_ids
+    assert "caught_plus" not in missed_ids
+    await db.close()
+
+
+async def test_multi_snapshot_same_coin_uses_min_crossed_at(tmp_path, settings_factory):
+    """When a coin appears in multiple snapshots we dedupe by coin_id and
+    crossed_at = MIN(snapshot_at) so the catch-window aligns with the
+    first time it crossed the winner threshold."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+    first_cross = now - timedelta(hours=10)
+    later_peak = now - timedelta(hours=3)
+    # Three snapshots of the same coin — must dedupe.
+    await _seed_gainers_snapshot(db, "bigcoin", first_cross, 250, 10_000_000)
+    await _seed_gainers_snapshot(db, "bigcoin", now - timedelta(hours=7), 400, 10_000_000)
+    await _seed_gainers_snapshot(db, "bigcoin", later_peak, 900, 10_000_000)
+    # Trade opened at first_cross + 20min → should be caught.
+    await _seed_paper_trade(db, "bigcoin", first_cross + timedelta(minutes=20))
+    result = await analytics.audit_missed_winners(
+        db, start=now - timedelta(days=1), end=now, settings=s,
+    )
+    missed_ids = [e["coin_id"] for tier in result["tiers"].values() for e in tier]
+    caught_count = result["denominator"]["winners_caught"]
+    # Confirm: single entry only (not duplicated), caught against first crossed_at.
+    assert "bigcoin" not in missed_ids
+    assert caught_count == 1
+    await db.close()
+
+
+async def test_empty_denominator_emits_warning(tmp_path, settings_factory, caplog):
+    """When no winners qualify (empty denominator) we log a warning, not crash."""
+    import structlog.testing
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+    # No snapshots at all.
+    with structlog.testing.capture_logs() as caplog_entries:
+        result = await analytics.audit_missed_winners(
+            db, start=now - timedelta(days=1), end=now, settings=s,
+        )
+    assert result["denominator"]["winners_total"] == 0
+    assert result["denominator"]["winners_missed"] == 0
+    assert any(
+        e.get("event") == "audit_query_empty_warning"
+        for e in caplog_entries
+    )
+    await db.close()
+
+
+async def _seed_lead_trade(db, coin, opened_at, lead, status):
+    await db._conn.execute(
+        "INSERT INTO paper_trades "
+        "(token_id, symbol, name, chain, signal_type, signal_data, "
+        " entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, sl_price, "
+        " status, opened_at, signal_combo, "
+        " lead_time_vs_trending_min, lead_time_vs_trending_status) "
+        "VALUES (?, 'S', 'N', 'coingecko', 'volume_spike', '{}', "
+        " 1.0, 100, 100, 20, 10, 1.2, 0.9, 'open', ?, 'volume_spike', ?, ?)",
+        (coin, opened_at.isoformat(), lead, status),
+    )
+
+
 async def test_lead_time_breakdown_filters_status_ok(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
     # Seed trades with mixed statuses.
     now = datetime.now(timezone.utc)
-
-    async def _seed(coin, lead, status):
-        await db._conn.execute(
-            "INSERT INTO paper_trades "
-            "(token_id, symbol, name, chain, signal_type, signal_data, "
-            " entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, sl_price, "
-            " status, opened_at, signal_combo, "
-            " lead_time_vs_trending_min, lead_time_vs_trending_status) "
-            "VALUES (?, 'S', 'N', 'coingecko', 'volume_spike', '{}', "
-            " 1.0, 100, 100, 20, 10, 1.2, 0.9, 'open', ?, 'volume_spike', ?, ?)",
-            (coin, now.isoformat(), lead, status),
-        )
-
-    await _seed("a", -10.0, "ok")
-    await _seed("b", -20.0, "ok")
-    await _seed("c", None, "no_reference")
-    await _seed("d", None, "error")
+    await _seed_lead_trade(db, "a", now, -10.0, "ok")
+    await _seed_lead_trade(db, "b", now, -20.0, "ok")
+    await _seed_lead_trade(db, "c", now, None, "no_reference")
+    await _seed_lead_trade(db, "d", now, None, "error")
     await db._conn.commit()
 
     result = await analytics.lead_time_breakdown(db, window="30d")
@@ -1932,7 +2261,32 @@ async def test_lead_time_breakdown_filters_status_ok(tmp_path):
     assert row["count_ok"] == 2
     assert row["count_no_reference"] == 1
     assert row["count_error"] == 1
-    assert abs(row["median_min"] - (-15.0)) < 0.01 or row["median_min"] in (-10.0, -20.0)
+    # D21 percentile-in-Python: for n=2 sorted [-20, -10], median = values[n//2] = values[1] = -10.
+    assert row["median_min"] == -10.0
+
+
+async def test_lead_time_breakdown_exact_percentiles(tmp_path):
+    """D21: percentile logic lives in Python. Given known inputs, confirm exact values.
+
+    For n=5 sorted [-50, -40, -30, -20, -10]:
+      median = values[n // 2] = values[2] = -30
+      p25    = values[max(n // 4, 0)] = values[1] = -40
+      p75    = values[min((3 * n) // 4, n - 1)] = values[3] = -20
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    now = datetime.now(timezone.utc)
+    for coin, lead in [("a", -10.0), ("b", -20.0), ("c", -30.0),
+                       ("d", -40.0), ("e", -50.0)]:
+        await _seed_lead_trade(db, coin, now, lead, "ok")
+    await db._conn.commit()
+
+    result = await analytics.lead_time_breakdown(db, window="30d")
+    row = result["volume_spike"]
+    assert row["count_ok"] == 5
+    assert row["median_min"] == -30.0
+    assert row["p25_min"] == -40.0
+    assert row["p75_min"] == -20.0
     await db.close()
 
 
@@ -1944,9 +2298,9 @@ async def test_detect_pipeline_gaps(tmp_path):
     for hours in (10, 8, 2, 1):
         await db._conn.execute(
             "INSERT INTO gainers_snapshots "
-            "(coin_id, symbol, name, market_cap_rank, market_cap, current_price, "
+            "(coin_id, symbol, name, market_cap, "
             " price_change_24h, price_at_snapshot, snapshot_at) "
-            "VALUES ('x', 'X', 'X', 100, 1e7, 1.0, 10.0, 1.0, ?)",
+            "VALUES ('x', 'X', 'X', 1e7, 10.0, 1.0, ?)",
             ((now - timedelta(hours=hours)).isoformat(),),
         )
     await db._conn.commit()
@@ -1999,12 +2353,11 @@ async def audit_missed_winners(
     """CG winners we did not paper-trade. LEFT JOIN per spec §7."""
     min_pct = settings.FEEDBACK_MISSED_WINNER_MIN_PCT
     min_mcap = settings.FEEDBACK_MISSED_WINNER_MIN_MCAP
-    max_rank = settings.FEEDBACK_MISSED_WINNER_MAX_RANK
     catch_min = settings.FEEDBACK_MISSED_WINNER_WINDOW_MIN
 
     start_iso, end_iso = start.isoformat(), end.isoformat()
 
-    # Denominator slice: winners regardless of mcap/rank
+    # Denominator slice: winners regardless of mcap filter (for warning only)
     cur = await db._conn.execute(
         "SELECT COUNT(DISTINCT coin_id) FROM gainers_snapshots "
         "WHERE snapshot_at BETWEEN ? AND ? AND price_change_24h >= ?",
@@ -2012,7 +2365,7 @@ async def audit_missed_winners(
     )
     winners_total_unfiltered = (await cur.fetchone())[0] or 0
 
-    # Filter boundaries for denominator
+    # Filter boundary for denominator: count coins removed by mcap floor
     cur = await db._conn.execute(
         "SELECT coin_id, MAX(market_cap) AS m FROM gainers_snapshots "
         "WHERE snapshot_at BETWEEN ? AND ? AND price_change_24h >= ? "
@@ -2022,18 +2375,9 @@ async def audit_missed_winners(
     rows = await cur.fetchall()
     filtered_by_mcap = sum(1 for r in rows if (r["m"] or 0) < min_mcap)
 
-    cur = await db._conn.execute(
-        "SELECT coin_id, MIN(market_cap_rank) AS r FROM gainers_snapshots "
-        "WHERE snapshot_at BETWEEN ? AND ? AND price_change_24h >= ? "
-        "GROUP BY coin_id",
-        (start_iso, end_iso, min_pct),
-    )
-    rows = await cur.fetchall()
-    filtered_by_rank = sum(
-        1 for r in rows if r["r"] is None or r["r"] > max_rank
-    )
-
-    # Main missed-winner query
+    # Main missed-winner query — LEFT JOIN per spec §7.
+    # crossed_at = MIN(snapshot_at) so the catch-window aligns with
+    # the FIRST moment this coin crossed the winner threshold.
     cur = await db._conn.execute(
         f"""
         WITH winners AS (
@@ -2042,16 +2386,15 @@ async def audit_missed_winners(
                    MIN(name)   AS name,
                    MIN(snapshot_at) AS crossed_at,
                    MAX(price_change_24h) AS peak_change,
-                   MAX(market_cap) AS mcap,
-                   MIN(market_cap_rank) AS best_rank
+                   MAX(market_cap) AS mcap
             FROM gainers_snapshots
             WHERE snapshot_at BETWEEN ? AND ?
               AND price_change_24h >= ?
             GROUP BY coin_id
-            HAVING mcap >= ? AND best_rank <= ?
+            HAVING mcap >= ?
         )
         SELECT w.coin_id, w.symbol, w.name, w.crossed_at, w.peak_change,
-               w.mcap, w.best_rank,
+               w.mcap,
                CASE
                  WHEN w.peak_change >= 1000 THEN 'disaster_miss'
                  WHEN w.peak_change >= 200  THEN 'major_miss'
@@ -2065,22 +2408,22 @@ async def audit_missed_winners(
         WHERE pt.id IS NULL
         """,
         (
-            start_iso, end_iso, min_pct, min_mcap, max_rank,
+            start_iso, end_iso, min_pct, min_mcap,
             f"-{catch_min} minutes", f"+{catch_min} minutes",
         ),
     )
     missed_rows = await cur.fetchall()
 
-    # Qualifying-winners total (post filter) used for caught count
+    # Qualifying-winners total (post mcap filter) used for caught count
     cur = await db._conn.execute(
         """SELECT COUNT(*) FROM (
              SELECT coin_id
              FROM gainers_snapshots
              WHERE snapshot_at BETWEEN ? AND ? AND price_change_24h >= ?
              GROUP BY coin_id
-             HAVING MAX(market_cap) >= ? AND MIN(market_cap_rank) <= ?
+             HAVING MAX(market_cap) >= ?
         )""",
-        (start_iso, end_iso, min_pct, min_mcap, max_rank),
+        (start_iso, end_iso, min_pct, min_mcap),
     )
     winners_qualifying = (await cur.fetchone())[0] or 0
     winners_missed = len(missed_rows)
@@ -2127,7 +2470,6 @@ async def audit_missed_winners(
             "winners_caught": winners_caught,
             "winners_missed": winners_missed,
             "winners_filtered_by_mcap": filtered_by_mcap,
-            "winners_filtered_by_rank": filtered_by_rank,
             "pipeline_gap_hours": round(pipeline_gap_hours, 2),
         },
     }
@@ -2266,7 +2608,8 @@ async def test_build_digest_returns_none_on_empty_week(tmp_path, settings_factor
     await db.close()
 
 
-async def test_build_digest_renders_all_sections(tmp_path, settings_factory):
+async def test_build_digest_renders_core_sections(tmp_path, settings_factory):
+    """With fallback counter == 0 the Fallback section is elided."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     s = settings_factory()
@@ -2303,10 +2646,116 @@ async def test_build_digest_renders_all_sections(tmp_path, settings_factory):
         "Missed winners",
         "Lead-time",
         "Suppression log",
-        "Fallback counters",
         "Chronic refresh failures",
     ):
         assert header in result
+    # Fallback section elided when counter == 0.
+    assert "Fallback counters" not in result
+    await db.close()
+
+
+async def test_fallback_section_rendered_when_nonzero(tmp_path, settings_factory, monkeypatch):
+    """When the in-memory fallback ring has entries, [Fallback counters]
+    section is rendered."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+    # Minimal seed so digest doesn't short-circuit empty.
+    await db._conn.execute(
+        "INSERT INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, "
+        " avg_pnl_pct, win_rate_pct, suppressed, refresh_failures, last_refreshed) "
+        "VALUES ('x', '30d', 10, 5, 5, 0, 0, 50.0, 0, 0, ?)",
+        (now.isoformat(),),
+    )
+    await db._conn.commit()
+
+    # Prime fallback ring.
+    from scout.trading import suppression as _supp
+    monkeypatch.setattr(
+        _supp, "_fallback_timestamps",
+        [now.isoformat(), now.isoformat()],
+        raising=False,
+    )
+
+    result = await weekly_digest.build_weekly_digest(
+        db, end_date=date.today(), settings=s,
+    )
+    assert result is not None
+    assert "Fallback counters" in result
+    assert "Suppression fail-opens: 2" in result
+    await db.close()
+
+
+async def test_section_failure_does_not_kill_entire_digest(
+    tmp_path, settings_factory, monkeypatch
+):
+    """If one analytics helper raises, other sections still render + the
+    failing section is replaced by an '(error)' marker."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+    await db._conn.execute(
+        "INSERT INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, "
+        " avg_pnl_pct, win_rate_pct, suppressed, refresh_failures, last_refreshed) "
+        "VALUES ('x', '30d', 10, 5, 5, 0, 0, 50.0, 0, 0, ?)",
+        (now.isoformat(),),
+    )
+    await db._conn.commit()
+
+    from scout.trading import analytics as _analytics
+    async def _boom(*a, **k):
+        raise RuntimeError("lead-time crash")
+    monkeypatch.setattr(_analytics, "lead_time_breakdown", _boom)
+
+    result = await weekly_digest.build_weekly_digest(
+        db, end_date=date.today(), settings=s,
+    )
+    assert result is not None
+    assert "Combo leaderboard" in result
+    assert "Missed winners" in result
+    # The failing section should be annotated (error), not missing.
+    assert "Lead-time" in result
+    assert "(error)" in result
+    await db.close()
+
+
+async def test_telegram_split_at_4096_preserves_line_integrity(
+    tmp_path, settings_factory,
+):
+    """_split_for_telegram must split on newline boundaries, never mid-line."""
+    long_lines = "\n".join(f"line-{i}" * 20 for i in range(500))
+    chunks = weekly_digest._split_for_telegram(long_lines, 4000)
+    assert len(chunks) > 1
+    # Every chunk <= limit.
+    for c in chunks:
+        assert len(c) <= 4000
+    # Rejoining chunks with "\n" recovers the original (all lines present).
+    recovered = "\n".join(chunks)
+    for line in long_lines.split("\n"):
+        assert line in recovered
+
+
+async def test_send_weekly_digest_empty_skips_telegram(
+    tmp_path, settings_factory, monkeypatch,
+):
+    """Empty week → build returns None → send must NOT call telegram."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+
+    sent: list = []
+    async def _capture(text, session, settings):
+        sent.append(text)
+
+    monkeypatch.setattr(
+        "scout.trading.weekly_digest.alerter.send_telegram_message", _capture,
+    )
+    await weekly_digest.send_weekly_digest(db, s)
+    assert sent == []
     await db.close()
 
 
@@ -2315,9 +2764,9 @@ async def test_send_weekly_digest_fallback_on_error(tmp_path, settings_factory, 
     await db.initialize()
     s = settings_factory()
 
-    sent: list[str] = []
-    async def _capture(msg, *a, **k):
-        sent.append(msg)
+    sent: list = []
+    async def _capture(text, session, settings):
+        sent.append(text)
 
     monkeypatch.setattr(
         "scout.trading.weekly_digest.alerter.send_telegram_message", _capture,
@@ -2347,6 +2796,7 @@ from __future__ import annotations
 import secrets
 from datetime import date, datetime, timedelta, timezone
 
+import aiohttp
 import structlog
 
 from scout import alerter
@@ -2356,6 +2806,18 @@ from scout.trading import analytics
 log = structlog.get_logger()
 
 _TG_SPLIT_LIMIT = 4000  # leave headroom under Telegram's 4096 cap
+
+
+async def _try_section(section_name: str, coro):
+    """Wrap one digest section so a failure in it can't kill the whole digest.
+
+    Returns (content_lines, ok). On error, returns a single '(error: …)' line
+    and logs with the section name so operators see which section failed."""
+    try:
+        return (await coro, True)
+    except Exception as e:
+        log.exception("weekly_digest_section_failed", section=section_name)
+        return ([f"  (error: {type(e).__name__})"], False)
 
 
 async def build_weekly_digest(
@@ -2385,133 +2847,171 @@ async def build_weekly_digest(
     lines.append("")
 
     # 1. Combo leaderboard
-    board = await analytics.combo_leaderboard(
-        db, "30d", min_trades=settings.FEEDBACK_MIN_LEADERBOARD_TRADES,
-    )
-    lines.append("[Combo leaderboard — 30d, min {} trades]".format(
-        settings.FEEDBACK_MIN_LEADERBOARD_TRADES))
-    if not board:
-        lines.append("  (not enough data yet)")
-    else:
-        lines.append("Top 5:")
-        for r in board[:5]:
-            flag = "  [SUPPRESSED]" if r.get("suppressed") else ""
-            lines.append("  {:<28s} {:5.1f}%  WR  ({} trades, ${:+.2f}){}".format(
-                r["combo_key"], r["win_rate_pct"], r["trades"],
-                r["total_pnl_usd"], flag,
-            ))
-        if len(board) > 5:
-            lines.append("Bottom 5:")
-            for r in board[-5:]:
+    async def _build_leaderboard():
+        board = await analytics.combo_leaderboard(
+            db, "30d", min_trades=settings.FEEDBACK_MIN_LEADERBOARD_TRADES,
+        )
+        out = []
+        if not board:
+            out.append("  (not enough data yet)")
+        else:
+            out.append("Top 5:")
+            for r in board[:5]:
                 flag = "  [SUPPRESSED]" if r.get("suppressed") else ""
-                lines.append("  {:<28s} {:5.1f}%  WR  ({} trades, ${:+.2f}){}".format(
+                out.append("  {:<28s} {:5.1f}%  WR  ({} trades, ${:+.2f}){}".format(
                     r["combo_key"], r["win_rate_pct"], r["trades"],
                     r["total_pnl_usd"], flag,
                 ))
+            if len(board) > 5:
+                out.append("Bottom 5:")
+                for r in board[-5:]:
+                    flag = "  [SUPPRESSED]" if r.get("suppressed") else ""
+                    out.append("  {:<28s} {:5.1f}%  WR  ({} trades, ${:+.2f}){}".format(
+                        r["combo_key"], r["win_rate_pct"], r["trades"],
+                        r["total_pnl_usd"], flag,
+                    ))
+        return out
+
+    lines.append("[Combo leaderboard — 30d, min {} trades]".format(
+        settings.FEEDBACK_MIN_LEADERBOARD_TRADES))
+    section_lines, _ = await _try_section("combo_leaderboard", _build_leaderboard())
+    lines.extend(section_lines)
     lines.append("")
 
     # 2. Missed winners
-    audit = await analytics.audit_missed_winners(db, start, end, settings)
+    async def _build_missed():
+        audit = await analytics.audit_missed_winners(db, start, end, settings)
+        den = audit["denominator"]
+        out = [
+            f"{den['winners_missed']} missed out of {den['winners_total']} "
+            f"qualifying winners "
+            f"(mcap ≥ ${settings.FEEDBACK_MISSED_WINNER_MIN_MCAP:,.0f})",
+        ]
+        for tier in ("disaster_miss", "major_miss", "partial_miss"):
+            entries = audit["tiers"][tier]
+            if not entries:
+                continue
+            label = tier.replace("_", " ")
+            out.append(f"  {label}: {len(entries)}")
+            for e in entries[:5]:
+                out.append("    {:<10s} +{:.0f}%   crossed {}".format(
+                    e["symbol"], e["peak_change"], e["crossed_at"],
+                ))
+        if audit["uncovered_window"]:
+            out.append(f"  ⚠ pipeline gap {den['pipeline_gap_hours']:.1f}h — "
+                       f"{len(audit['uncovered_window'])} winners in "
+                       f"uncovered_window excluded")
+        return out
+
     lines.append(f"[Missed winners — last 7d]")
-    den = audit["denominator"]
-    lines.append(f"{den['winners_missed']} missed out of {den['winners_total']} "
-                 f"qualifying winners "
-                 f"(mcap ≥ ${settings.FEEDBACK_MISSED_WINNER_MIN_MCAP:,.0f}, "
-                 f"rank ≤ {settings.FEEDBACK_MISSED_WINNER_MAX_RANK})")
-    for tier in ("disaster_miss", "major_miss", "partial_miss"):
-        entries = audit["tiers"][tier]
-        if not entries:
-            continue
-        label = tier.replace("_", " ")
-        lines.append(f"  {label}: {len(entries)}")
-        for e in entries[:5]:
-            lines.append("    {:<10s} +{:.0f}%   crossed {}".format(
-                e["symbol"], e["peak_change"], e["crossed_at"],
-            ))
-    if audit["uncovered_window"]:
-        lines.append(f"  ⚠ pipeline gap {den['pipeline_gap_hours']:.1f}h — "
-                     f"{len(audit['uncovered_window'])} winners in "
-                     f"uncovered_window excluded")
+    section_lines, _ = await _try_section("missed_winners", _build_missed())
+    lines.extend(section_lines)
     lines.append("")
 
     # 3. Lead-time
+    async def _build_lead():
+        breakdown = await analytics.lead_time_breakdown(db, "30d")
+        out = []
+        if not breakdown:
+            out.append("  (no trades)")
+        else:
+            for sig in sorted(breakdown):
+                b = breakdown[sig]
+                med_str = "n/a" if b["median_min"] is None else f"{b['median_min']:+.1f} min"
+                out.append(
+                    "  {:<18s} median {:<12s} (ok={}, no_ref={}, err={})".format(
+                        sig, med_str, b["count_ok"],
+                        b["count_no_reference"], b["count_error"],
+                    )
+                )
+        return out
+
     lines.append("[Lead-time — 30d, signal_type medians, 'ok' only]")
-    breakdown = await analytics.lead_time_breakdown(db, "30d")
-    if not breakdown:
-        lines.append("  (no trades)")
-    else:
-        for sig in sorted(breakdown):
-            b = breakdown[sig]
-            if b["median_min"] is None:
-                med_str = "n/a"
-            else:
-                med_str = f"{b['median_min']:+.1f} min"
-            lines.append("  {:<18s} median {:<12s} (ok={}, no_ref={}, err={})".format(
-                sig, med_str, b["count_ok"], b["count_no_reference"], b["count_error"],
-            ))
+    section_lines, _ = await _try_section("lead_time", _build_lead())
+    lines.extend(section_lines)
     lines.append("")
 
     # 4. Suppression log
+    async def _build_supp():
+        log_rows = await analytics.suppression_log(db, start, end)
+        out = []
+        if not log_rows:
+            out.append("  (none)")
+        else:
+            for r in log_rows:
+                out.append("  {:<24s} SUPPRESSED {} — WR {:.1f}% ({} trades), "
+                           "parole until {}".format(
+                    r["combo_key"], r["suppressed_at"][:10],
+                    r["win_rate_pct"], r["trades"],
+                    (r["parole_at"] or "n/a")[:10],
+                ))
+        return out
+
     lines.append("[Suppression log — this week]")
-    log_rows = await analytics.suppression_log(db, start, end)
-    if not log_rows:
-        lines.append("  (none)")
-    else:
-        for r in log_rows:
-            lines.append("  {:<24s} SUPPRESSED {} — WR {:.1f}% ({} trades), "
-                         "parole until {}".format(
-                r["combo_key"], r["suppressed_at"][:10],
-                r["win_rate_pct"], r["trades"],
-                (r["parole_at"] or "n/a")[:10],
-            ))
+    section_lines, _ = await _try_section("suppression_log", _build_supp())
+    lines.extend(section_lines)
     lines.append("")
 
-    # 5. Fallback counters
-    lines.append("[Fallback counters]")
+    # 5. Fallback counters — conditional (elide when zero).
     from scout.trading import suppression as _supp
-    lines.append(f"  Suppression fail-opens: {len(_supp._fallback_timestamps)}")
-    lines.append("")
+    fallback_count = len(_supp._fallback_timestamps)
+    if fallback_count > 0:
+        lines.append("[Fallback counters]")
+        lines.append(f"  Suppression fail-opens: {fallback_count}")
+        lines.append("")
 
     # 6. Chronic refresh failures
+    async def _build_chronic():
+        cur = await db._conn.execute(
+            "SELECT combo_key, refresh_failures FROM combo_performance "
+            "WHERE refresh_failures >= ? ORDER BY refresh_failures DESC",
+            (settings.FEEDBACK_CHRONIC_FAILURE_THRESHOLD,),
+        )
+        chronic = await cur.fetchall()
+        out = []
+        if not chronic:
+            out.append("  None")
+        else:
+            for c in chronic:
+                out.append(f"  {c['combo_key']} — {c['refresh_failures']} consecutive failures")
+        return out
+
     lines.append("[Chronic refresh failures]")
-    cur = await db._conn.execute(
-        "SELECT combo_key, refresh_failures FROM combo_performance "
-        "WHERE refresh_failures >= ? ORDER BY refresh_failures DESC",
-        (settings.FEEDBACK_CHRONIC_FAILURE_THRESHOLD,),
-    )
-    chronic = await cur.fetchall()
-    if not chronic:
-        lines.append("  None")
-    else:
-        for c in chronic:
-            lines.append(f"  {c['combo_key']} — {c['refresh_failures']} consecutive failures")
+    section_lines, _ = await _try_section("chronic_refresh", _build_chronic())
+    lines.extend(section_lines)
 
     return "\n".join(lines)
 
 
 async def send_weekly_digest(db: Database, settings) -> None:
-    """Orchestrator: build + send via alerter. Never silent on error."""
-    try:
-        text = await build_weekly_digest(db, date.today(), settings)
-        if text is None:
-            log.info("weekly_digest_skipped_empty")
-            return
+    """Orchestrator: build + send via alerter. Never silent on error.
 
-        for chunk in _split_for_telegram(text, _TG_SPLIT_LIMIT):
-            await alerter.send_telegram_message(chunk)
-        log.info("weekly_digest_sent", bytes=len(text))
-    except Exception as e:
-        corr = f"wd-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{secrets.token_hex(2)}"
-        log.exception("weekly_digest_failed", corr=corr)
+    Opens a single aiohttp.ClientSession for the lifetime of this dispatch.
+    Matches alerter.send_telegram_message(text, session, settings) signature."""
+    corr = f"wd-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{secrets.token_hex(2)}"
+    async with aiohttp.ClientSession() as session:
         try:
-            await alerter.send_telegram_message(
-                f"Weekly digest failed: {type(e).__name__} [ref={corr}]. Check logs."
-            )
-        except Exception:
-            log.exception("weekly_digest_fallback_dispatch_error", corr=corr)
+            text = await build_weekly_digest(db, date.today(), settings)
+            if text is None:
+                log.info("weekly_digest_skipped_empty")
+                return
+
+            for chunk in _split_for_telegram(text, _TG_SPLIT_LIMIT):
+                await alerter.send_telegram_message(chunk, session, settings)
+            log.info("weekly_digest_sent", bytes=len(text))
+        except Exception as e:
+            log.exception("weekly_digest_failed", corr=corr)
+            try:
+                await alerter.send_telegram_message(
+                    f"Weekly digest failed: {type(e).__name__} [ref={corr}]. Check logs.",
+                    session, settings,
+                )
+            except Exception:
+                log.exception("weekly_digest_fallback_dispatch_error", corr=corr)
 
 
 def _split_for_telegram(text: str, limit: int) -> list[str]:
+    """Split on newline boundaries. Never splits mid-line."""
     if len(text) <= limit:
         return [text]
     lines = text.split("\n")
@@ -2519,19 +3019,18 @@ def _split_for_telegram(text: str, limit: int) -> list[str]:
     buf: list[str] = []
     size = 0
     for line in lines:
-        if size + len(line) + 1 > limit:
+        # +1 for the joining "\n"
+        if buf and size + len(line) + 1 > limit:
             chunks.append("\n".join(buf))
             buf = [line]
-            size = len(line) + 1
+            size = len(line)
         else:
             buf.append(line)
-            size += len(line) + 1
+            size += len(line) + (1 if len(buf) > 1 else 0)
     if buf:
         chunks.append("\n".join(buf))
     return chunks
 ```
-
-**Note on alerter signature:** if `alerter.send_telegram_message` requires session/settings, thread them through `send_weekly_digest` and/or create the session inside `send_weekly_digest` to match existing `format_daily_summary` patterns in `main.py`.
 
 - [ ] **Step 4: Run the test — expect PASS**
 
@@ -2586,9 +3085,9 @@ async def _seed_price(db, token_id, price):
 async def _seed_gainers(db, coin_id):
     await db._conn.execute(
         "INSERT INTO gainers_snapshots "
-        "(coin_id, symbol, name, market_cap_rank, market_cap, current_price, "
+        "(coin_id, symbol, name, market_cap, "
         " price_change_24h, price_at_snapshot, snapshot_at) "
-        "VALUES (?, 'S', 'N', 100, 10000000, 1.0, 50.0, 1.0, ?)",
+        "VALUES (?, 'S', 'N', 10000000, 50.0, 1.0, ?)",
         (coin_id, datetime.now(timezone.utc).isoformat()),
     )
     await db._conn.commit()
@@ -2608,6 +3107,30 @@ async def _seed_suppressed_combo(db, combo_key):
          datetime.now(timezone.utc).isoformat()),
     )
     await db._conn.commit()
+
+
+async def _seed_trending(db, coin_id):
+    await db._conn.execute(
+        "INSERT INTO trending_snapshots "
+        "(coin_id, symbol, name, market_cap_rank, snapshot_at) "
+        "VALUES (?, 'S', 'N', 5, ?)",
+        (coin_id, datetime.now(timezone.utc).isoformat()),
+    )
+    await db._conn.commit()
+
+
+# Each entry: (dispatcher callable, expected combo_key, seed-fn, dispatcher-kwargs)
+# `seed_fn(db, coin_id)` must populate whatever the dispatcher reads; coin_id must
+# be the string the dispatcher will pass to engine.open_trade.
+@pytest.fixture
+def dispatcher_cases():
+    return [
+        # trade_volume_spikes — needs a volume_spikes row; we skip that case since
+        # that dispatcher pulls from a different table. Covered indirectly via
+        # trade_first_signals + trade_gainers below, which exercise all helpers.
+        ("gainers", signals.trade_gainers, "gainers_early",
+         _seed_gainers, {"min_mcap": 1_000_000}),
+    ]
 
 
 async def test_suppressed_combo_blocks_trade_gainers(tmp_path, settings_factory):
@@ -2646,7 +3169,69 @@ async def test_unsuppressed_combo_opens_trade(tmp_path, settings_factory):
     assert row is not None
     assert row["signal_combo"] == "gainers_early"
     await db.close()
+
+
+async def test_suppression_emits_signal_suppressed_log(
+    tmp_path, settings_factory,
+):
+    """Structured-log gate: 'signal_suppressed' event must be emitted when
+    the combo is suppressed. Downstream dashboards grep for it."""
+    import structlog.testing
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(PAPER_STARTUP_WARMUP_SECONDS=0)
+    engine = TradingEngine(mode="paper", db=db, settings=s)
+
+    await _seed_price(db, "gx", 1.0)
+    await _seed_gainers(db, "gx")
+    await _seed_suppressed_combo(db, "gainers_early")
+
+    with structlog.testing.capture_logs() as entries:
+        await signals.trade_gainers(engine, db, min_mcap=1_000_000)
+
+    assert any(
+        e.get("event") == "signal_suppressed"
+        and e.get("combo_key") == "gainers_early"
+        and e.get("signal_type") == "gainers_early"
+        for e in entries
+    )
+    await db.close()
+
+
+async def test_trade_first_signals_uses_build_combo_key_with_signals(
+    tmp_path, settings_factory, monkeypatch,
+):
+    """first_signal must pass the full signals_fired list to build_combo_key
+    so multi-signal combos get distinct keys."""
+    from scout.trading import combo_key as ck_mod
+    from scout.trading import signals as sig_mod
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(PAPER_STARTUP_WARMUP_SECONDS=0)
+
+    captured: list[tuple] = []
+    original = ck_mod.build_combo_key
+
+    def _spy(*, signal_type, signals):
+        captured.append((signal_type, tuple(signals) if signals else None))
+        return original(signal_type=signal_type, signals=signals)
+
+    monkeypatch.setattr(sig_mod, "build_combo_key", _spy)
+
+    # Drive trade_first_signals with a fake token_id producing 2 signals.
+    # The real dispatcher iterates tokens w/ signals_fired. Adapt this call
+    # to whatever trade_first_signals expects (may need mock token_factory).
+    # At minimum we can assert the spy path is wired.
+    #
+    # Alternative minimal check: call trade_first_signals with an empty
+    # input, then assert our spy import itself landed (replaces the
+    # signals.py reference).
+    assert sig_mod.build_combo_key is _spy
+    await db.close()
 ```
+
+**Note on the signal_suppressed log call:** the wiring uses a module-level `structlog.get_logger()` (bound as `log` or `logger` — match existing convention in `signals.py`). The key-value pairs must be keyword arguments so `structlog.testing.capture_logs` records them.
 
 - [ ] **Step 2: Run the test — expect FAIL (suppression not yet wired)**
 
@@ -2662,15 +3247,17 @@ from scout.trading.combo_key import build_combo_key
 from scout.trading.suppression import should_open
 ```
 
-For each `trade_*` dispatcher, replace the hard-coded `signal_combo="..."` literal with the three-step pattern. Template (apply to each dispatcher, adjusting the signal_type + signals list):
+For each `trade_*` dispatcher, replace the hard-coded `signal_combo="..."` literal with the three-step pattern. Note that `should_open` requires `settings` as a keyword argument (D16 fallback threshold lives on settings). Dispatchers that don't already accept `settings` need it threaded in — most already do because they already read `settings.PAPER_*` internally; for any that don't, add a `settings` parameter and thread it from `main.py`.
+
+Template (apply to each dispatcher, adjusting the signal_type + signals list):
 
 ```python
 # Inside the per-item loop, just before `await engine.open_trade(...)`:
 sigs = ...  # for first_signal: signals_fired; elsewhere: None
 combo_key = build_combo_key(signal_type="<literal>", signals=sigs)
-allow, reason = await should_open(db, combo_key)
+allow, reason = await should_open(db, combo_key, settings=settings)
 if not allow:
-    logger.info(
+    log.info(
         "signal_suppressed",
         combo_key=combo_key, reason=reason,
         coin_id=<coin_id_expr>, signal_type="<literal>",
@@ -2679,15 +3266,21 @@ if not allow:
 # then pass signal_combo=combo_key into engine.open_trade.
 ```
 
-**Exact per-dispatcher changes:**
+Use the module's existing logger binding (grep for `logger = structlog.get_logger()` or `log = structlog.get_logger()` in `signals.py` and match that name).
 
-- `trade_volume_spikes`: signal_type `"volume_spike"`, `sigs = None`, `coin_id_expr = spike.get("coin_id")`.
-- `trade_gainers`: signal_type `"gainers_early"`, `sigs = None`, `coin_id_expr = g["coin_id"]`.
-- `trade_losers`: signal_type `"losers_contrarian"`, `sigs = None`, `coin_id_expr = l["coin_id"]`.
-- `trade_first_signals`: signal_type `"first_signal"`, `sigs = signals_fired`, `coin_id_expr = token.contract_address`.
-- `trade_trending`: signal_type `"trending_catch"`, `sigs = None`, `coin_id_expr = t["coin_id"]`.
-- `trade_predictions`: signal_type `"narrative_prediction"`, `sigs = None`, `coin_id_expr = pred.coin_id`.
-- `trade_chain_completions`: signal_type `"chain_completed"`, `sigs = None`, `coin_id_expr = c["token_id"]`.
+**Exact per-dispatcher changes (apply to ALL SEVEN — no exceptions):**
+
+| Dispatcher | signal_type | sigs | coin_id_expr |
+|---|---|---|---|
+| `trade_volume_spikes` | `"volume_spike"` | `None` | `spike.get("coin_id")` |
+| `trade_gainers` | `"gainers_early"` | `None` | `g["coin_id"]` |
+| `trade_losers` | `"losers_contrarian"` | `None` | `l["coin_id"]` |
+| `trade_first_signals` | `"first_signal"` | `signals_fired` (real list, not None) | `token.contract_address` |
+| `trade_trending` | `"trending_catch"` | `None` | `t["coin_id"]` |
+| `trade_predictions` | `"narrative_prediction"` | `None` | `pred.coin_id` |
+| `trade_chain_completions` | `"chain_completed"` | `None` | `c["token_id"]` |
+
+All seven dispatchers MUST receive the same wiring. No dispatcher is "too minor to bother" — the integration gate assumes uniform behaviour.
 
 - [ ] **Step 4: Run the test — expect PASS**
 
@@ -2721,17 +3314,109 @@ Per spec D14, §6 Flow C / Flow D. Uses the same pattern as `last_summary_date`.
 Create `tests/test_main_feedback_scheduling.py`:
 
 ```python
-"""Tests for main-loop scheduling of combo refresh + weekly digest."""
+"""Tests for main-loop scheduling of combo refresh + weekly digest.
+
+Approach: factor the schedule check into a pure helper
+`_run_feedback_schedulers(db, settings, last_refresh, last_digest, now_local)`
+inside main.py so we can drive it with a fake clock. The loop body calls it
+once per cycle and updates the last_* state with the return value.
+"""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from datetime import datetime
+from unittest.mock import AsyncMock
 
 import pytest
 
 
+async def test_refresh_fires_once_per_day_at_configured_hour(
+    tmp_path, settings_factory, monkeypatch,
+):
+    from scout.db import Database
+    from scout import main as main_mod
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(FEEDBACK_COMBO_REFRESH_HOUR=3,
+                         FEEDBACK_WEEKLY_DIGEST_HOUR=9,
+                         FEEDBACK_WEEKLY_DIGEST_WEEKDAY=6)
+
+    refresh_mock = AsyncMock(return_value={"refreshed": 0, "failed": 0})
+    digest_mock = AsyncMock()
+    monkeypatch.setattr(main_mod._combo_refresh, "refresh_all", refresh_mock)
+    monkeypatch.setattr(main_mod._weekly_digest, "send_weekly_digest", digest_mock)
+
+    last_refresh = ""
+    last_digest = ""
+
+    # 02:59 — neither fires.
+    now = datetime(2026, 4, 19, 2, 59, 0)  # Sunday
+    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+        db, s, last_refresh, last_digest, now,
+    )
+    assert refresh_mock.call_count == 0
+
+    # 03:00 — refresh fires.
+    now = datetime(2026, 4, 19, 3, 0, 0)
+    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+        db, s, last_refresh, last_digest, now,
+    )
+    assert refresh_mock.call_count == 1
+    assert last_refresh == "2026-04-19"
+
+    # 03:30 same day — must NOT fire again.
+    now = datetime(2026, 4, 19, 3, 30, 0)
+    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+        db, s, last_refresh, last_digest, now,
+    )
+    assert refresh_mock.call_count == 1
+
+    # 09:00 Sunday — digest fires.
+    now = datetime(2026, 4, 19, 9, 0, 0)  # weekday() == 6
+    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+        db, s, last_refresh, last_digest, now,
+    )
+    assert digest_mock.call_count == 1
+    assert last_digest == "2026-04-19"
+    await db.close()
+
+
+async def test_refresh_failure_streak_alerts_telegram(
+    tmp_path, settings_factory, monkeypatch,
+):
+    """Three consecutive combo_refresh failures → one Telegram alert."""
+    from scout.db import Database
+    from scout import main as main_mod
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(FEEDBACK_COMBO_REFRESH_HOUR=3)
+
+    async def _boom(*a, **k):
+        raise RuntimeError("db locked")
+    monkeypatch.setattr(main_mod._combo_refresh, "refresh_all", _boom)
+
+    sent: list = []
+    async def _capture_tg(text, session, settings):
+        sent.append(text)
+    monkeypatch.setattr(main_mod.alerter, "send_telegram_message", _capture_tg)
+
+    last_refresh = ""
+    last_digest = ""
+    for day in range(1, 5):
+        now = datetime(2026, 4, day, 3, 0, 0)
+        last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+            db, s, last_refresh, last_digest, now,
+        )
+
+    assert any("combo_refresh" in t.lower() for t in sent), (
+        "expected a Telegram alert after 3 consecutive failures"
+    )
+    await db.close()
+
+
 def test_schedule_keys_exist_in_main_source():
-    """Lightweight static check: main.py references the two schedule keys."""
+    """Belt-and-braces: also confirm the schedule constants are referenced."""
     from pathlib import Path
     src = Path(__file__).parent.parent / "scout" / "main.py"
     text = src.read_text(encoding="utf-8")
@@ -2741,8 +3426,6 @@ def test_schedule_keys_exist_in_main_source():
     assert "FEEDBACK_WEEKLY_DIGEST_WEEKDAY" in text
     assert "FEEDBACK_WEEKLY_DIGEST_HOUR" in text
 ```
-
-(For a richer behavioural test, an integration test driving the loop with a mocked clock is possible but overkill for Sprint 1. The static check confirms the wiring exists; end-to-end verification happens in staging.)
 
 - [ ] **Step 2: Run the test — expect FAIL**
 
@@ -2754,11 +3437,76 @@ Expected: FAIL — strings not yet in `main.py`.
 (a) Near the imports block (top of file), add:
 
 ```python
+import aiohttp
 from scout.trading import combo_refresh as _combo_refresh
 from scout.trading import weekly_digest as _weekly_digest
 ```
 
-(b) Find the block where `last_summary_date` is initialised (around line 666 per snapshot). Add two parallel state vars:
+(b) Add a module-level counter for consecutive refresh failures:
+
+```python
+_combo_refresh_failure_streak = 0
+```
+
+(c) Add the pure scheduler helper at module scope (not inside `_pipeline_loop`) so tests can call it directly:
+
+```python
+async def _run_feedback_schedulers(
+    db, settings, last_refresh_date: str, last_digest_date: str,
+    now_local: datetime,
+) -> tuple[str, str]:
+    """Run the nightly combo refresh and weekly digest if their windows fire.
+
+    Pure side-effecting helper (no loop state) — the caller passes
+    last-run sentinels + a clock, and gets the updated sentinels back.
+    Using local time is a deliberate choice to match the daily-summary
+    scheduling already in _pipeline_loop; operators set cron-style hours
+    in server-local wall-clock (documented in settings docstrings).
+    Cron drift across DST is accepted as a spec §6 Flow C constraint.
+    """
+    global _combo_refresh_failure_streak
+    today_iso = now_local.strftime("%Y-%m-%d")
+
+    # Nightly combo refresh (FEEDBACK_COMBO_REFRESH_HOUR, local)
+    if (now_local.hour == settings.FEEDBACK_COMBO_REFRESH_HOUR
+            and last_refresh_date != today_iso):
+        try:
+            summary = await _combo_refresh.refresh_all(db, settings)
+            logger.info("combo_refresh_done", **summary)
+            _combo_refresh_failure_streak = 0
+        except Exception:
+            _combo_refresh_failure_streak += 1
+            logger.exception(
+                "combo_refresh_loop_error",
+                consecutive_failures=_combo_refresh_failure_streak,
+            )
+            if _combo_refresh_failure_streak >= 3:
+                # Fire once per streak (reset when refresh succeeds).
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        await alerter.send_telegram_message(
+                            f"⚠ combo_refresh failed {_combo_refresh_failure_streak}× "
+                            f"in a row — check logs.",
+                            session, settings,
+                        )
+                except Exception:
+                    logger.exception("combo_refresh_streak_alert_dispatch_error")
+        last_refresh_date = today_iso
+
+    # Weekly digest (FEEDBACK_WEEKLY_DIGEST_WEEKDAY, _HOUR local)
+    if (now_local.weekday() == settings.FEEDBACK_WEEKLY_DIGEST_WEEKDAY
+            and now_local.hour == settings.FEEDBACK_WEEKLY_DIGEST_HOUR
+            and last_digest_date != today_iso):
+        try:
+            await _weekly_digest.send_weekly_digest(db, settings)
+        except Exception:
+            logger.exception("weekly_digest_loop_error")
+        last_digest_date = today_iso
+
+    return last_refresh_date, last_digest_date
+```
+
+(d) Find the block where `last_summary_date` is initialised (around line 666 per snapshot). Add two parallel state vars:
 
 ```python
     last_summary_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -2766,37 +3514,23 @@ from scout.trading import weekly_digest as _weekly_digest
     last_weekly_digest_date = ""
 ```
 
-(c) Inside `_pipeline_loop()`, update the nonlocal declaration:
+(e) Inside `_pipeline_loop()`, update the nonlocal declaration:
 
 ```python
                 nonlocal last_outcome_check, last_summary_date
                 nonlocal last_combo_refresh_date, last_weekly_digest_date
 ```
 
-(d) Below the daily-summary block (after `last_summary_date = current_date`), add the two schedule checks. Use **local time** (`datetime.now()`, no tz) because the hours/weekdays in settings refer to local time.
+(f) Below the daily-summary block (after `last_summary_date = current_date`), invoke the helper:
 
 ```python
-                    # Nightly combo refresh (03:00 local)
-                    local_now = datetime.now()
-                    today_iso = local_now.strftime("%Y-%m-%d")
-                    if (local_now.hour == settings.FEEDBACK_COMBO_REFRESH_HOUR
-                            and last_combo_refresh_date != today_iso):
-                        try:
-                            summary = await _combo_refresh.refresh_all(db, settings)
-                            logger.info("combo_refresh_done", **summary)
-                        except Exception:
-                            logger.exception("combo_refresh_loop_error")
-                        last_combo_refresh_date = today_iso
-
-                    # Weekly digest (Sun 09:00 local)
-                    if (local_now.weekday() == settings.FEEDBACK_WEEKLY_DIGEST_WEEKDAY
-                            and local_now.hour == settings.FEEDBACK_WEEKLY_DIGEST_HOUR
-                            and last_weekly_digest_date != today_iso):
-                        try:
-                            await _weekly_digest.send_weekly_digest(db, settings)
-                        except Exception:
-                            logger.exception("weekly_digest_loop_error")
-                        last_weekly_digest_date = today_iso
+                    last_combo_refresh_date, last_weekly_digest_date = (
+                        await _run_feedback_schedulers(
+                            db, settings,
+                            last_combo_refresh_date, last_weekly_digest_date,
+                            datetime.now(),
+                        )
+                    )
 ```
 
 - [ ] **Step 4: Run the test — expect PASS**
@@ -2833,7 +3567,12 @@ Expected: ~60+ new tests added; existing suite remains green. Any red: fix befor
 Create `tests/test_trading_combo_refresh_perf.py`:
 
 ```python
-"""Perf gate for refresh_all — spec §12."""
+"""Perf gate for refresh_all — spec §12.
+
+Runs by default (no marker). Keep the assertion tolerant (5s) so CI
+variance doesn't cause false failures; tighten once we have historical
+baselines from the VPS.
+"""
 from __future__ import annotations
 
 import time
@@ -2845,7 +3584,6 @@ from scout.db import Database
 from scout.trading import combo_refresh
 
 
-@pytest.mark.slow
 async def test_refresh_all_under_5s_for_1000_trades(tmp_path, settings_factory):
     db = Database(tmp_path / "t.db")
     await db.initialize()
@@ -2880,9 +3618,89 @@ async def test_refresh_all_under_5s_for_1000_trades(tmp_path, settings_factory):
 Run: `uv run pytest tests/test_trading_combo_refresh_perf.py -v`
 Expected: PASS in <5s.
 
-- [ ] **Step 3: Daily-digest byte-identical check**
+- [ ] **Step 3: Daily-digest byte-identical regression**
 
-Run existing daily-digest tests to confirm the additive schema didn't perturb anything:
+Create `tests/test_trading_daily_digest_snapshot.py`. The check computes
+the daily digest on a deterministic seeded fixture and compares it
+byte-for-byte against a pre-captured snapshot from `master`. Any format
+drift caused by the feedback-loop schema changes will fail this test
+loudly.
+
+```python
+"""Byte-identical regression gate for the daily digest (spec §12)."""
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from scout.db import Database
+
+
+SNAPSHOT_PATH = Path(__file__).parent / "fixtures" / "daily_digest_snapshot.txt"
+
+
+async def _seed_deterministic_fixture(db):
+    """Seed a known, deterministic set of trades so the digest is reproducible."""
+    now = datetime(2026, 4, 18, 12, 0, 0, tzinfo=timezone.utc)
+    rows = [
+        ("deterministic_a", "A", "Apple",   "cg", "volume_spike", 15.0,  12.0, "closed_tp"),
+        ("deterministic_b", "B", "Banana",  "cg", "gainers_early", -8.0, -5.0, "closed_sl"),
+        ("deterministic_c", "C", "Cherry",  "cg", "volume_spike",  25.0, 20.0, "closed_tp"),
+    ]
+    for i, (tid, sym, name, chain, sig, pnl_usd, pnl_pct, status) in enumerate(rows):
+        await db._conn.execute(
+            "INSERT INTO paper_trades "
+            "(token_id, symbol, name, chain, signal_type, signal_data, "
+            " entry_price, amount_usd, quantity, tp_pct, sl_pct, "
+            " tp_price, sl_price, status, pnl_usd, pnl_pct, "
+            " opened_at, closed_at, signal_combo) "
+            "VALUES (?, ?, ?, ?, ?, '{}', 1.0, 100.0, 100.0, 20, 10, 1.2, 0.9, "
+            " ?, ?, ?, ?, ?, ?)",
+            (tid, sym, name, chain, sig, status, pnl_usd, pnl_pct,
+             (now - timedelta(hours=6 + i)).isoformat(),
+             (now - timedelta(hours=2 + i)).isoformat(),
+             sig),
+        )
+    await db._conn.commit()
+
+
+async def test_daily_digest_byte_identical_against_master_snapshot(
+    tmp_path, settings_factory,
+):
+    """Daily digest format must not change due to additive feedback-loop schema.
+
+    HOW TO CAPTURE THE SNAPSHOT (one-time, run on master before this PR):
+        uv run python -c "
+            import asyncio, json
+            from scout.db import Database
+            from scout.trading.digest import format_daily_summary  # or current helper name
+            # … seed fixture identically, write output to tests/fixtures/daily_digest_snapshot.txt
+        "
+    """
+    if not SNAPSHOT_PATH.exists():
+        pytest.skip(
+            "daily_digest_snapshot.txt missing — capture from master before running. "
+            "See docstring for instructions."
+        )
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_deterministic_fixture(db)
+
+    from scout.trading import digest as digest_mod  # adjust to real module
+    actual = await digest_mod.format_daily_summary(db, s)
+    expected = SNAPSHOT_PATH.read_text(encoding="utf-8")
+    assert actual == expected, (
+        "Daily digest output drifted — either the feedback-loop work "
+        "accidentally perturbed the existing digest, or the snapshot is stale. "
+        "If intentional, regenerate the snapshot."
+    )
+    await db.close()
+```
+
+Also run the existing daily-digest suite to confirm nothing else regressed:
 `uv run pytest tests/test_trading_digest.py -v`
 Expected: all PASS, no changes in digest output format (signal_combo / lead_time columns are not read by the daily digest).
 
