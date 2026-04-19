@@ -19,23 +19,22 @@ logger = structlog.get_logger()
 
 
 async def trade_volume_spikes(
-    engine, db: Database, spikes: list[dict], settings=None
+    engine, db: Database, spikes: list[dict], settings
 ) -> None:
     """Open paper trades for detected volume spikes."""
     for spike in spikes:
         try:
             combo_key = build_combo_key(signal_type="volume_spike", signals=None)
-            if settings is not None:
-                allow, reason = await should_open(db, combo_key, settings=settings)
-                if not allow:
-                    logger.info(
-                        "signal_suppressed",
-                        combo_key=combo_key,
-                        reason=reason,
-                        coin_id=spike.get("coin_id"),
-                        signal_type="volume_spike",
-                    )
-                    continue
+            allow, reason = await should_open(db, combo_key, settings=settings)
+            if not allow:
+                logger.info(
+                    "signal_suppressed",
+                    combo_key=combo_key,
+                    reason=reason,
+                    coin_id=spike.get("coin_id"),
+                    signal_type="volume_spike",
+                )
+                continue
             await engine.open_trade(
                 token_id=spike["coin_id"],
                 chain="coingecko",
@@ -52,7 +51,7 @@ async def trade_volume_spikes(
 
 
 async def trade_gainers(
-    engine, db: Database, min_mcap: float = 5_000_000, settings=None
+    engine, db: Database, min_mcap: float = 5_000_000, *, settings
 ) -> None:
     """Open paper trades for newly detected top gainers.
 
@@ -88,17 +87,16 @@ async def trade_gainers(
                 continue
             try:
                 combo_key = build_combo_key(signal_type="gainers_early", signals=None)
-                if settings is not None:
-                    allow, reason = await should_open(db, combo_key, settings=settings)
-                    if not allow:
-                        logger.info(
-                            "signal_suppressed",
-                            combo_key=combo_key,
-                            reason=reason,
-                            coin_id=g["coin_id"],
-                            signal_type="gainers_early",
-                        )
-                        continue
+                allow, reason = await should_open(db, combo_key, settings=settings)
+                if not allow:
+                    logger.info(
+                        "signal_suppressed",
+                        combo_key=combo_key,
+                        reason=reason,
+                        coin_id=g["coin_id"],
+                        signal_type="gainers_early",
+                    )
+                    continue
                 await engine.open_trade(
                     token_id=g["coin_id"],
                     symbol=g["symbol"],
@@ -119,7 +117,7 @@ async def trade_gainers(
 
 
 async def trade_losers(
-    engine, db: Database, min_mcap: float = 5_000_000, settings=None
+    engine, db: Database, min_mcap: float = 5_000_000, *, settings
 ) -> None:
     """Open paper trades for newly detected top losers (contrarian play).
 
@@ -157,17 +155,16 @@ async def trade_losers(
                 combo_key = build_combo_key(
                     signal_type="losers_contrarian", signals=None
                 )
-                if settings is not None:
-                    allow, reason = await should_open(db, combo_key, settings=settings)
-                    if not allow:
-                        logger.info(
-                            "signal_suppressed",
-                            combo_key=combo_key,
-                            reason=reason,
-                            coin_id=l["coin_id"],
-                            signal_type="losers_contrarian",
-                        )
-                        continue
+                allow, reason = await should_open(db, combo_key, settings=settings)
+                if not allow:
+                    logger.info(
+                        "signal_suppressed",
+                        combo_key=combo_key,
+                        reason=reason,
+                        coin_id=l["coin_id"],
+                        signal_type="losers_contrarian",
+                    )
+                    continue
                 loser_price = l["price_at_snapshot"]
                 if not loser_price:
                     pc = await db._conn.execute(
@@ -200,7 +197,8 @@ async def trade_first_signals(
     db: Database,
     scored_candidates: list,
     min_mcap: float = 5_000_000,
-    settings=None,
+    *,
+    settings,
 ) -> None:
     """Open paper trades on first meaningful signal for each token.
 
@@ -223,17 +221,16 @@ async def trade_first_signals(
         try:
             sigs = signals_fired
             combo_key = build_combo_key(signal_type="first_signal", signals=sigs)
-            if settings is not None:
-                allow, reason = await should_open(db, combo_key, settings=settings)
-                if not allow:
-                    logger.info(
-                        "signal_suppressed",
-                        combo_key=combo_key,
-                        reason=reason,
-                        coin_id=token.contract_address,
-                        signal_type="first_signal",
-                    )
-                    continue
+            allow, reason = await should_open(db, combo_key, settings=settings)
+            if not allow:
+                logger.info(
+                    "signal_suppressed",
+                    combo_key=combo_key,
+                    reason=reason,
+                    coin_id=token.contract_address,
+                    signal_type="first_signal",
+                )
+                continue
             pc = await db._conn.execute(
                 "SELECT current_price FROM price_cache WHERE coin_id = ?",
                 (token.contract_address,),
@@ -259,7 +256,7 @@ async def trade_first_signals(
 
 
 async def trade_trending(
-    engine, db: Database, max_mcap_rank: int = 1500, settings=None
+    engine, db: Database, max_mcap_rank: int = 1500, *, settings
 ) -> None:
     """Open paper trades for newly trending tokens.
 
@@ -298,17 +295,16 @@ async def trade_trending(
                 continue
             try:
                 combo_key = build_combo_key(signal_type="trending_catch", signals=None)
-                if settings is not None:
-                    allow, reason = await should_open(db, combo_key, settings=settings)
-                    if not allow:
-                        logger.info(
-                            "signal_suppressed",
-                            combo_key=combo_key,
-                            reason=reason,
-                            coin_id=t["coin_id"],
-                            signal_type="trending_catch",
-                        )
-                        continue
+                allow, reason = await should_open(db, combo_key, settings=settings)
+                if not allow:
+                    logger.info(
+                        "signal_suppressed",
+                        combo_key=combo_key,
+                        reason=reason,
+                        coin_id=t["coin_id"],
+                        signal_type="trending_catch",
+                    )
+                    continue
                 pc = await db._conn.execute(
                     "SELECT current_price FROM price_cache WHERE coin_id = ?",
                     (t["coin_id"],),
@@ -373,7 +369,8 @@ async def trade_predictions(
     prediction_models: list,
     min_mcap: float = 5_000_000,
     min_fit_score: int = 1,
-    settings=None,
+    *,
+    settings,
 ) -> None:
     """Open paper trades for narrative prediction picks.
 
@@ -401,17 +398,16 @@ async def trade_predictions(
             combo_key = build_combo_key(
                 signal_type="narrative_prediction", signals=None
             )
-            if settings is not None:
-                allow, reason = await should_open(db, combo_key, settings=settings)
-                if not allow:
-                    logger.info(
-                        "signal_suppressed",
-                        combo_key=combo_key,
-                        reason=reason,
-                        coin_id=pred.coin_id,
-                        signal_type="narrative_prediction",
-                    )
-                    continue
+            allow, reason = await should_open(db, combo_key, settings=settings)
+            if not allow:
+                logger.info(
+                    "signal_suppressed",
+                    combo_key=combo_key,
+                    reason=reason,
+                    coin_id=pred.coin_id,
+                    signal_type="narrative_prediction",
+                )
+                continue
             pc = await db._conn.execute(
                 "SELECT current_price FROM price_cache WHERE coin_id = ?",
                 (pred.coin_id,),
@@ -437,7 +433,7 @@ async def trade_predictions(
             )
 
 
-async def trade_chain_completions(engine, db: Database, settings=None) -> None:
+async def trade_chain_completions(engine, db: Database, *, settings) -> None:
     """Open paper trades for completed chain pattern matches."""
     try:
         cursor = await db._conn.execute(
@@ -452,17 +448,16 @@ async def trade_chain_completions(engine, db: Database, settings=None) -> None:
         for c in new_chains:
             try:
                 combo_key = build_combo_key(signal_type="chain_completed", signals=None)
-                if settings is not None:
-                    allow, reason = await should_open(db, combo_key, settings=settings)
-                    if not allow:
-                        logger.info(
-                            "signal_suppressed",
-                            combo_key=combo_key,
-                            reason=reason,
-                            coin_id=c["token_id"],
-                            signal_type="chain_completed",
-                        )
-                        continue
+                allow, reason = await should_open(db, combo_key, settings=settings)
+                if not allow:
+                    logger.info(
+                        "signal_suppressed",
+                        combo_key=combo_key,
+                        reason=reason,
+                        coin_id=c["token_id"],
+                        signal_type="chain_completed",
+                    )
+                    continue
                 pc = await db._conn.execute(
                     "SELECT current_price FROM price_cache WHERE coin_id = ?",
                     (c["token_id"],),
