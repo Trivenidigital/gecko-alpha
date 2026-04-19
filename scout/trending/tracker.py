@@ -87,7 +87,9 @@ async def fetch_and_store_trending(
     if api_key:
         params["x_cg_demo_api_key"] = api_key
 
-    data = await _get_with_backoff(session, f"{CG_BASE}/search/trending", params or None)
+    data = await _get_with_backoff(
+        session, f"{CG_BASE}/search/trending", params or None
+    )
     if not data or not isinstance(data, dict):
         logger.warning("trending_tracker.fetch_empty")
         return []
@@ -155,7 +157,9 @@ async def store_trending_from_candidates(
             symbol=token.ticker,
             name=token.token_name,
             market_cap_rank=None,
-            trending_score=float(token.cg_trending_rank) if token.cg_trending_rank else None,
+            trending_score=(
+                float(token.cg_trending_rank) if token.cg_trending_rank else None
+            ),
             snapshot_at=now,
         )
         snapshots.append(snap)
@@ -220,7 +224,12 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
 
         # 2a. Check predictions table (narrative agent)
         detected, detected_at, lead = await _check_detector(
-            db, "predictions", "coin_id", coin_id, symbol, first_trending_at_str,
+            db,
+            "predictions",
+            "coin_id",
+            coin_id,
+            symbol,
+            first_trending_at_str,
         )
         if detected:
             comp.detected_by_narrative = True
@@ -230,8 +239,13 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
 
         # 2b. Check candidates table (pipeline)
         detected, detected_at, lead = await _check_detector(
-            db, "candidates", "contract_address", coin_id, symbol,
-            first_trending_at_str, symbol_col="ticker",
+            db,
+            "candidates",
+            "contract_address",
+            coin_id,
+            symbol,
+            first_trending_at_str,
+            symbol_col="ticker",
         )
         if detected:
             comp.detected_by_pipeline = True
@@ -264,8 +278,13 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
                 comp.is_gap = False
         else:
             detected, detected_at, lead = await _check_detector(
-                db, "signal_events", "token_id", coin_id, symbol,
-                first_trending_at_str, symbol_col="token_id",
+                db,
+                "signal_events",
+                "token_id",
+                coin_id,
+                symbol,
+                first_trending_at_str,
+                symbol_col="token_id",
             )
             if detected:
                 comp.detected_by_chains = True
@@ -275,7 +294,11 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
 
         # 2d. Check social_signals table (LunarCrush 4th tier)
         detected, detected_at, lead = await _check_detector(
-            db, "social_signals", "coin_id", coin_id, symbol,
+            db,
+            "social_signals",
+            "coin_id",
+            coin_id,
+            symbol,
             first_trending_at_str,
         )
         if detected:
@@ -306,7 +329,9 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
                 (comp.coin_id,),
             )
             price_row = await pc.fetchone()
-            detected_prices[comp.coin_id] = price_row[0] if price_row and price_row[0] else None
+            detected_prices[comp.coin_id] = (
+                price_row[0] if price_row and price_row[0] else None
+            )
             existing_peaks[comp.coin_id] = (None, None)
 
     # 4. Store comparisons (INSERT OR REPLACE by coin_id)
@@ -333,16 +358,32 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
                 comp.name,
                 comp.appeared_on_trending_at.isoformat(),
                 1 if comp.detected_by_narrative else 0,
-                comp.narrative_detected_at.isoformat() if comp.narrative_detected_at else None,
+                (
+                    comp.narrative_detected_at.isoformat()
+                    if comp.narrative_detected_at
+                    else None
+                ),
                 comp.narrative_lead_minutes,
                 1 if comp.detected_by_pipeline else 0,
-                comp.pipeline_detected_at.isoformat() if comp.pipeline_detected_at else None,
+                (
+                    comp.pipeline_detected_at.isoformat()
+                    if comp.pipeline_detected_at
+                    else None
+                ),
                 comp.pipeline_lead_minutes,
                 1 if comp.detected_by_chains else 0,
-                comp.chains_detected_at.isoformat() if comp.chains_detected_at else None,
+                (
+                    comp.chains_detected_at.isoformat()
+                    if comp.chains_detected_at
+                    else None
+                ),
                 comp.chains_lead_minutes,
                 1 if comp.detected_by_social else 0,
-                comp.social_detected_at.isoformat() if comp.social_detected_at else None,
+                (
+                    comp.social_detected_at.isoformat()
+                    if comp.social_detected_at
+                    else None
+                ),
                 comp.social_lead_minutes,
                 1 if comp.is_gap else 0,
                 det_price,
@@ -376,8 +417,7 @@ async def get_trending_stats(db: "Database") -> TrendingStats:
     missed = total - caught
 
     # Average and best lead time across all detection methods
-    cursor = await db._conn.execute(
-        """SELECT AVG(lead), MIN(lead) FROM (
+    cursor = await db._conn.execute("""SELECT AVG(lead), MIN(lead) FROM (
              SELECT narrative_lead_minutes as lead FROM trending_comparisons
                WHERE detected_by_narrative = 1 AND narrative_lead_minutes IS NOT NULL
              UNION ALL
@@ -389,8 +429,7 @@ async def get_trending_stats(db: "Database") -> TrendingStats:
              UNION ALL
              SELECT social_lead_minutes FROM trending_comparisons
                WHERE detected_by_social = 1 AND social_lead_minutes IS NOT NULL
-           )"""
-    )
+           )""")
     lead_row = await cursor.fetchone()
     avg_lead = round(lead_row[0], 1) if lead_row and lead_row[0] is not None else None
     best_lead = round(lead_row[1], 1) if lead_row and lead_row[1] is not None else None
@@ -452,9 +491,7 @@ async def get_recent_snapshots(
     return [dict(row) for row in rows]
 
 
-async def get_recent_comparisons(
-    db: "Database", limit: int = 100
-) -> list[dict]:
+async def get_recent_comparisons(db: "Database", limit: int = 100) -> list[dict]:
     """Get recent trending comparisons for the dashboard."""
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
@@ -505,7 +542,9 @@ async def update_trending_peaks(db: "Database") -> int:
         old_peak = row["peak_price"] or row["detected_price"] or 0
 
         if current_price > old_peak:
-            peak_gain = ((current_price - row["detected_price"]) / row["detected_price"]) * 100
+            peak_gain = (
+                (current_price - row["detected_price"]) / row["detected_price"]
+            ) * 100
             await conn.execute(
                 "UPDATE trending_comparisons SET peak_price = ?, peak_gain_pct = ? WHERE id = ?",
                 (current_price, peak_gain, row["id"]),

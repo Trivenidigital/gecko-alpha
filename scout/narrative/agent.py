@@ -82,7 +82,9 @@ async def narrative_agent_loop(
     _epoch = datetime.min.replace(tzinfo=timezone.utc)
     last_eval_at = strategy.get_timestamp("last_eval_at", default=_epoch)
     last_daily_learn_at = strategy.get_timestamp("last_daily_learn_at", default=_epoch)
-    last_weekly_learn_at = strategy.get_timestamp("last_weekly_learn_at", default=_epoch)
+    last_weekly_learn_at = strategy.get_timestamp(
+        "last_weekly_learn_at", default=_epoch
+    )
 
     while True:
         try:
@@ -123,11 +125,15 @@ async def narrative_agent_loop(
             # which fetches fresh data from /search/trending.
             if settings.TRENDING_SNAPSHOT_ENABLED:
                 try:
-                    await fetch_and_store_trending(session, db, settings.COINGECKO_API_KEY)
+                    await fetch_and_store_trending(
+                        session, db, settings.COINGECKO_API_KEY
+                    )
                     if trading_engine:
                         await trade_trending(
-                            trading_engine, db,
+                            trading_engine,
+                            db,
                             max_mcap_rank=settings.PAPER_MAX_MCAP_RANK,
+                            settings=settings,
                         )
                 except Exception:
                     logger.exception("trending_tracker.snapshot_error")
@@ -260,7 +266,8 @@ async def narrative_agent_loop(
                         )
                         watchlist_users = (
                             int(token_cdata["watchlist_portfolio_users"])
-                            if token_cdata else 0
+                            if token_cdata
+                            else 0
                         )
 
                         result = await score_token(
@@ -340,7 +347,9 @@ async def narrative_agent_loop(
                                     commits_4w=cdata["commits_4w"],
                                     reddit_subs=cdata["reddit_subscribers"],
                                     sentiment_up_pct=cdata["sentiment_up_pct"],
-                                    narrative_fit_score=parse_fit_score(result, default=50),
+                                    narrative_fit_score=parse_fit_score(
+                                        result, default=50
+                                    ),
                                     token_vol_change_24h=0.0,
                                     category_vol_growth_pct=accel.volume_growth_pct,
                                 )
@@ -379,10 +388,13 @@ async def narrative_agent_loop(
                                 pipeline="narrative",
                                 event_type="counter_scored",
                                 event_data={
-                                    "risk_score": counter_risk if counter_risk is not None else 0,
+                                    "risk_score": (
+                                        counter_risk if counter_risk is not None else 0
+                                    ),
                                     "flag_count": len(counter_result.red_flags or []),
                                     "high_severity_count": sum(
-                                        1 for f in (counter_result.red_flags or [])
+                                        1
+                                        for f in (counter_result.red_flags or [])
                                         if f.severity == "high"
                                     ),
                                     "data_completeness": counter_completeness,
@@ -481,9 +493,13 @@ async def narrative_agent_loop(
 
                     if prediction_rows:
                         await store_predictions(db, prediction_rows)
-                        _heartbeat_stats["narrative_predictions"] += len(prediction_models)
+                        _heartbeat_stats["narrative_predictions"] += len(
+                            prediction_models
+                        )
                         if settings.COUNTER_ENABLED:
-                            _heartbeat_stats["counter_scores_narrative"] += len(prediction_models)
+                            _heartbeat_stats["counter_scores_narrative"] += len(
+                                prediction_models
+                            )
                         logger.info(
                             "narrative.predictions_stored",
                             category=accel.name,
@@ -494,24 +510,34 @@ async def narrative_agent_loop(
                         # Open paper trades for narrative predictions
                         if trading_engine and prediction_models:
                             await trade_predictions(
-                                trading_engine, db, prediction_models,
+                                trading_engine,
+                                db,
+                                prediction_models,
                                 min_mcap=settings.PAPER_MIN_MCAP,
+                                settings=settings,
                             )
 
                     # Send alert if enabled and matches user preferences
                     if narrative_alert_enabled and prediction_models:
                         if should_alert_category(accel.category_id, strategy):
                             alertable = [
-                                p for p in prediction_models
-                                if should_alert_token(p.market_cap_at_prediction, strategy)
+                                p
+                                for p in prediction_models
+                                if should_alert_token(
+                                    p.market_cap_at_prediction, strategy
+                                )
                             ]
                             if alertable:
                                 try:
                                     alert_text = format_heating_alert(
                                         accel, alertable, top_3_coins
                                     )
-                                    await send_telegram_message(alert_text, session, settings)
-                                    logger.info("narrative.alert_sent", category=accel.name)
+                                    await send_telegram_message(
+                                        alert_text, session, settings
+                                    )
+                                    logger.info(
+                                        "narrative.alert_sent", category=accel.name
+                                    )
                                 except Exception:
                                     logger.exception(
                                         "narrative.alert_error", category=accel.name
@@ -611,10 +637,21 @@ async def narrative_agent_loop(
                     )
                     # Prune gainers/losers snapshots (M9 -- unbounded growth)
                     try:
-                        from scout.gainers.tracker import prune_old_snapshots as prune_gainers
-                        from scout.losers.tracker import prune_old_snapshots as prune_losers
-                        await prune_gainers(db, retention_days=settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS)
-                        await prune_losers(db, retention_days=settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS)
+                        from scout.gainers.tracker import (
+                            prune_old_snapshots as prune_gainers,
+                        )
+                        from scout.losers.tracker import (
+                            prune_old_snapshots as prune_losers,
+                        )
+
+                        await prune_gainers(
+                            db,
+                            retention_days=settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS,
+                        )
+                        await prune_losers(
+                            db,
+                            retention_days=settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS,
+                        )
                     except Exception:
                         logger.exception("tracker_prune_error")
                     # Prune old data from tables that had no pruning (H6)

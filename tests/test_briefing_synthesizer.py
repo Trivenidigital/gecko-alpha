@@ -88,7 +88,9 @@ class TestSynthesizeBriefing:
         mock_client.messages.create = AsyncMock(return_value=mock_message)
 
         with patch("anthropic.AsyncAnthropic", return_value=mock_client):
-            result = await synthesize_briefing(raw, api_key="test-key", model="claude-sonnet-4-6")
+            result = await synthesize_briefing(
+                raw, api_key="test-key", model="claude-sonnet-4-6"
+            )
 
         assert result == "Market briefing text here"
         mock_client.messages.create.assert_called_once()

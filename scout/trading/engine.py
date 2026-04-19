@@ -18,6 +18,44 @@ log = structlog.get_logger()
 _MAX_PRICE_AGE_SECONDS = 3600  # 1 hour for paper; tighten for live
 
 
+async def _compute_lead_time_vs_trending(
+    db: Database, token_id: str, now: datetime
+) -> tuple[float | None, str]:
+    """Returns (lead_time_min, status). status in {'ok', 'no_reference', 'error'}.
+
+    Negative lead_time means we opened BEFORE the coin trended (beat CG).
+    Positive means we opened AFTER (we were late).
+    """
+    import aiosqlite
+
+    try:
+        cursor = await db._conn.execute(
+            "SELECT MIN(snapshot_at) FROM trending_snapshots WHERE coin_id = ?",
+            (token_id,),
+        )
+        row = await cursor.fetchone()
+        crossed_at = row[0] if row else None
+        if crossed_at is None:
+            return (None, "no_reference")
+        crossed_dt = datetime.fromisoformat(crossed_at)
+        if crossed_dt.tzinfo is None:
+            crossed_dt = crossed_dt.replace(tzinfo=timezone.utc)
+        delta_min = (now - crossed_dt).total_seconds() / 60.0
+        return (delta_min, "ok")
+    except (aiosqlite.Error, ValueError, TypeError) as e:
+        # Narrow the catch to expected DB / parse errors. Programming bugs
+        # (AttributeError, NameError, KeyError) must still crash loudly so
+        # they're caught in test instead of permanently degrading the column.
+        log.error(
+            "lead_time_compute_error",
+            err=str(e),
+            err_type=type(e).__name__,
+            err_id="LEAD_TIME_CALC",
+            token_id=token_id,
+        )
+        return (None, "error")
+
+
 class TradingEngine:
     """Pluggable trading engine. Call from any signal source.
 
@@ -58,6 +96,8 @@ class TradingEngine:
         signal_data: dict | None = None,
         amount_usd: float | None = None,
         entry_price: float | None = None,
+        *,
+        signal_combo: str,
     ) -> int | None:
         """Open a new trade. Returns trade_id or None if rejected.
 
@@ -116,7 +156,11 @@ class TradingEngine:
         )
         row = await cursor.fetchone()
         if row[0] > 0:
-            log.info("trade_skipped_open_position", token_id=token_id, signal_type=signal_type)
+            log.info(
+                "trade_skipped_open_position",
+                token_id=token_id,
+                signal_type=signal_type,
+            )
             return None
 
         # 2b. Per-signal-type cooldown — block re-entry within 48h for the
@@ -131,7 +175,9 @@ class TradingEngine:
         )
         row = await cursor.fetchone()
         if row[0] > 0:
-            log.info("trade_skipped_cooldown", token_id=token_id, signal_type=signal_type)
+            log.info(
+                "trade_skipped_cooldown", token_id=token_id, signal_type=signal_type
+            )
             return None
 
         # 2c. Hard cap on concurrent open positions — prevents restart-bursts.
@@ -168,7 +214,13 @@ class TradingEngine:
             )
             return None
 
-        # 4. Execute via paper trader
+        # 4. Compute lead-time vs trending before executing
+        now_utc = datetime.now(timezone.utc)
+        lead_time_min, lead_time_status = await _compute_lead_time_vs_trending(
+            self.db, token_id, now_utc
+        )
+
+        # 5. Execute via paper trader
         if self.mode == "paper":
             trade_id = await self._paper_trader.execute_buy(
                 db=self.db,
@@ -183,6 +235,9 @@ class TradingEngine:
                 tp_pct=self.settings.PAPER_TP_PCT,
                 sl_pct=self.settings.PAPER_SL_PCT,
                 slippage_bps=self.settings.PAPER_SLIPPAGE_BPS,
+                signal_combo=signal_combo,
+                lead_time_vs_trending_min=lead_time_min,
+                lead_time_vs_trending_status=lead_time_status,
             )
             return trade_id
 
@@ -339,7 +394,9 @@ class TradingEngine:
         row = await cursor.fetchone()
         if row is not None and row[0] is not None:
             price = float(row[0])
-            updated_at = datetime.fromisoformat(str(row[1])).replace(tzinfo=timezone.utc)
+            updated_at = datetime.fromisoformat(str(row[1])).replace(
+                tzinfo=timezone.utc
+            )
             age_seconds = (datetime.now(timezone.utc) - updated_at).total_seconds()
             return (price, age_seconds)
 

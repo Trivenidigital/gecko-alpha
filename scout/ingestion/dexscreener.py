@@ -30,23 +30,30 @@ async def _get_json(
         try:
             async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                 if resp.status == 429 or resp.status >= 500:
-                    wait = 2 ** attempt
+                    wait = 2**attempt
                     logger.warning(
                         "DexScreener returned error, retrying",
-                        url=url, status=resp.status, wait=wait,
-                        attempt=attempt + 1, retries=retries,
+                        url=url,
+                        status=resp.status,
+                        wait=wait,
+                        attempt=attempt + 1,
+                        retries=retries,
                     )
                     await asyncio.sleep(wait)
                     continue
                 if resp.status != 200:
-                    logger.warning("DexScreener returned error", url=url, status=resp.status)
+                    logger.warning(
+                        "DexScreener returned error", url=url, status=resp.status
+                    )
                     return None
                 return await resp.json()
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            wait = 2 ** attempt
+            wait = 2**attempt
             logger.warning(
                 "DexScreener request failed, retrying",
-                url=url, error=str(exc), wait=wait,
+                url=url,
+                error=str(exc),
+                wait=wait,
             )
             await asyncio.sleep(wait)
     logger.warning("DexScreener failed after retries", url=url, retries=retries)
@@ -114,5 +121,9 @@ async def fetch_trending(
             continue
         candidates.extend(result)
 
-    logger.info("DexScreener: found candidates", candidate_count=len(candidates), boost_count=len(boosts))
+    logger.info(
+        "DexScreener: found candidates",
+        candidate_count=len(candidates),
+        boost_count=len(boosts),
+    )
     return candidates

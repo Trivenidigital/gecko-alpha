@@ -1,4 +1,5 @@
 """Tests for chain pattern definitions, condition evaluator, and seeding."""
+
 import pytest
 
 from scout.chains.patterns import (
@@ -33,8 +34,14 @@ def test_condition_gte_matches():
 
 
 def test_condition_gt_matches():
-    assert evaluate_condition("narrative_fit_score > 70", {"narrative_fit_score": 71}) is True
-    assert evaluate_condition("narrative_fit_score > 70", {"narrative_fit_score": 70}) is False
+    assert (
+        evaluate_condition("narrative_fit_score > 70", {"narrative_fit_score": 71})
+        is True
+    )
+    assert (
+        evaluate_condition("narrative_fit_score > 70", {"narrative_fit_score": 70})
+        is False
+    )
 
 
 def test_condition_missing_field_returns_false():

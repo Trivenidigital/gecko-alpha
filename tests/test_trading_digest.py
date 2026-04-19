@@ -170,11 +170,17 @@ async def test_digest_stores_summary_in_db(db):
 async def test_digest_open_positions_exposure(db):
     # 2 open trades
     await _insert_trade(
-        db, token_id="a", amount_usd=500.0, status="open",
+        db,
+        token_id="a",
+        amount_usd=500.0,
+        status="open",
         opened_at="2026-04-09T08:00:00+00:00",
     )
     await _insert_trade(
-        db, token_id="b", amount_usd=700.0, status="open",
+        db,
+        token_id="b",
+        amount_usd=700.0,
+        status="open",
         opened_at="2026-04-09T09:00:00+00:00",
     )
 

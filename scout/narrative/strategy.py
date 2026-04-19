@@ -83,7 +83,15 @@ class Strategy:
                     """INSERT INTO agent_strategy
                        (key, value, updated_at, updated_by, reason, min_bound, max_bound)
                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (key, json.dumps(default), now, "init", "seeded default", min_b, max_b),
+                    (
+                        key,
+                        json.dumps(default),
+                        now,
+                        "init",
+                        "seeded default",
+                        min_b,
+                        max_b,
+                    ),
                 )
                 self._cache[key] = default
         await conn.commit()
@@ -138,9 +146,7 @@ class Strategy:
         conn = self._db._conn
         if conn is None:
             raise RuntimeError("Database not initialized.")
-        await conn.execute(
-            "UPDATE agent_strategy SET locked = 1 WHERE key = ?", (key,)
-        )
+        await conn.execute("UPDATE agent_strategy SET locked = 1 WHERE key = ?", (key,))
         await conn.commit()
 
     async def unlock(self, key: str) -> None:
@@ -148,9 +154,7 @@ class Strategy:
         conn = self._db._conn
         if conn is None:
             raise RuntimeError("Database not initialized.")
-        await conn.execute(
-            "UPDATE agent_strategy SET locked = 0 WHERE key = ?", (key,)
-        )
+        await conn.execute("UPDATE agent_strategy SET locked = 0 WHERE key = ?", (key,))
         await conn.commit()
 
     def get_timestamp(self, key: str, default: datetime | None = None) -> datetime:
@@ -167,7 +171,9 @@ class Strategy:
 
     async def set_timestamp(self, key: str, value: datetime) -> None:
         """Set a timestamp value."""
-        await self.set(key, value.isoformat(), updated_by="system", reason="timestamp update")
+        await self.set(
+            key, value.isoformat(), updated_by="system", reason="timestamp update"
+        )
 
     def get_all(self) -> dict[str, object]:
         """Return a dict of all strategy key-value pairs."""

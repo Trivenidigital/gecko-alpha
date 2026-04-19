@@ -164,12 +164,16 @@ async def fetch_trending(
         # Extract price data from item.data for price_cache
         item_data = item.get("data", {})
         if item_data:
-            last_raw_trending.append({
-                "id": cg_id,
-                "current_price": item_data.get("price"),
-                "price_change_percentage_24h": item_data.get("price_change_percentage_24h", {}).get("usd"),
-                "market_cap": item.get("market_cap_rank"),
-            })
+            last_raw_trending.append(
+                {
+                    "id": cg_id,
+                    "current_price": item_data.get("price"),
+                    "price_change_percentage_24h": item_data.get(
+                        "price_change_percentage_24h", {}
+                    ).get("usd"),
+                    "market_cap": item.get("market_cap_rank"),
+                }
+            )
 
     logger.info("cg_candidates_fetched", count=len(tokens), source="search/trending")
     return tokens

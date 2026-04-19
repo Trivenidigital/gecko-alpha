@@ -1,4 +1,5 @@
 """Tests for SecondWaveCandidate model."""
+
 from datetime import datetime, timezone
 
 from scout.secondwave.models import SecondWaveCandidate
@@ -23,7 +24,12 @@ def test_secondwave_candidate_minimal():
         price_vs_alert_pct=75.0,
         volume_vs_cooldown_avg=3.1,
         reaccumulation_score=85,
-        reaccumulation_signals=["sufficient_drawdown", "price_recovery", "volume_pickup", "strong_prior_signal"],
+        reaccumulation_signals=[
+            "sufficient_drawdown",
+            "price_recovery",
+            "volume_pickup",
+            "strong_prior_signal",
+        ],
         detected_at=datetime.now(timezone.utc),
     )
     assert cand.coingecko_id is None

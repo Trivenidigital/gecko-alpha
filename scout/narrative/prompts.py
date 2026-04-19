@@ -21,6 +21,7 @@ def parse_fit_score(raw: dict, default: int = 0) -> int:
     except (TypeError, ValueError):
         return default
 
+
 NARRATIVE_FIT_SYSTEM = (
     "You are a crypto narrative analyst evaluating whether specific tokens "
     "fit an accelerating category trend. Score objectively based on data provided. "

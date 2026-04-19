@@ -1,5 +1,6 @@
 """Async SQLite database layer for CoinPump Scout."""
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,7 @@ class Database:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
         self._conn: aiosqlite.Connection | None = None
+        self._txn_lock: asyncio.Lock | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -52,8 +54,10 @@ class Database:
         """Open connection and create tables."""
         self._conn = await aiosqlite.connect(self._db_path)
         self._conn.row_factory = aiosqlite.Row
+        self._txn_lock = asyncio.Lock()
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._create_tables()
+        await self._migrate_feedback_loop_schema()
 
     async def close(self) -> None:
         """Close the database connection."""
@@ -68,8 +72,7 @@ class Database:
     async def _create_tables(self) -> None:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
-        await self._conn.executescript(
-            """
+        await self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS candidates (
                 contract_address TEXT PRIMARY KEY,
                 chain            TEXT NOT NULL,
@@ -670,8 +673,7 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_velocity_alerts
                 ON velocity_alerts(coin_id, detected_at);
-            """
-        )
+            """)
 
         # Migrate alerts table: add price_usd, token_name, ticker if missing
         cursor = await self._conn.execute("PRAGMA table_info(alerts)")
@@ -713,9 +715,18 @@ class Database:
         cursor = await self._conn.execute("PRAGMA table_info(trending_comparisons)")
         tc_cols = {row[1] for row in await cursor.fetchall()}
         for col, ddl in (
-            ("detected_price", "ALTER TABLE trending_comparisons ADD COLUMN detected_price REAL"),
-            ("peak_price", "ALTER TABLE trending_comparisons ADD COLUMN peak_price REAL"),
-            ("peak_gain_pct", "ALTER TABLE trending_comparisons ADD COLUMN peak_gain_pct REAL"),
+            (
+                "detected_price",
+                "ALTER TABLE trending_comparisons ADD COLUMN detected_price REAL",
+            ),
+            (
+                "peak_price",
+                "ALTER TABLE trending_comparisons ADD COLUMN peak_price REAL",
+            ),
+            (
+                "peak_gain_pct",
+                "ALTER TABLE trending_comparisons ADD COLUMN peak_gain_pct REAL",
+            ),
             (
                 "detected_by_social",
                 "ALTER TABLE trending_comparisons ADD COLUMN detected_by_social INTEGER NOT NULL DEFAULT 0",
@@ -736,14 +747,110 @@ class Database:
         cursor = await self._conn.execute("PRAGMA table_info(gainers_comparisons)")
         gc_cols = {row[1] for row in await cursor.fetchall()}
         for col, ddl in (
-            ("detected_price", "ALTER TABLE gainers_comparisons ADD COLUMN detected_price REAL"),
-            ("peak_price", "ALTER TABLE gainers_comparisons ADD COLUMN peak_price REAL"),
-            ("peak_gain_pct", "ALTER TABLE gainers_comparisons ADD COLUMN peak_gain_pct REAL"),
+            (
+                "detected_price",
+                "ALTER TABLE gainers_comparisons ADD COLUMN detected_price REAL",
+            ),
+            (
+                "peak_price",
+                "ALTER TABLE gainers_comparisons ADD COLUMN peak_price REAL",
+            ),
+            (
+                "peak_gain_pct",
+                "ALTER TABLE gainers_comparisons ADD COLUMN peak_gain_pct REAL",
+            ),
         ):
             if col not in gc_cols:
                 await self._conn.execute(ddl)
 
         await self._conn.commit()
+
+    async def _migrate_feedback_loop_schema(self) -> None:
+        """Per-column additive migration for feedback loop. Idempotent. Atomic."""
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS combo_performance (
+                    combo_key TEXT NOT NULL,
+                    window TEXT NOT NULL,
+                    trades INTEGER NOT NULL,
+                    wins INTEGER NOT NULL,
+                    losses INTEGER NOT NULL,
+                    total_pnl_usd REAL NOT NULL,
+                    avg_pnl_pct REAL NOT NULL,
+                    win_rate_pct REAL NOT NULL,
+                    suppressed INTEGER NOT NULL DEFAULT 0,
+                    suppressed_at TEXT,
+                    parole_at TEXT,
+                    parole_trades_remaining INTEGER,
+                    refresh_failures INTEGER NOT NULL DEFAULT 0,
+                    last_refreshed TEXT NOT NULL,
+                    PRIMARY KEY (combo_key, window)
+                )
+            """)
+
+            expected_cols = {
+                "signal_combo": "TEXT",
+                "lead_time_vs_trending_min": "REAL",
+                "lead_time_vs_trending_status": "TEXT",
+            }
+            cur = await conn.execute("PRAGMA table_info(paper_trades)")
+            existing = {row[1] for row in await cur.fetchall()}
+            for col, coltype in expected_cols.items():
+                if col in existing:
+                    _log.info(
+                        "schema_migration_column_action", col=col, action="skip_exists"
+                    )
+                else:
+                    await conn.execute(
+                        f"ALTER TABLE paper_trades ADD COLUMN {col} {coltype}"
+                    )
+                    _log.info("schema_migration_column_action", col=col, action="added")
+
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_paper_trades_combo_opened "
+                "ON paper_trades(signal_combo, opened_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_paper_trades_token_opened "
+                "ON paper_trades(token_id, opened_at)"
+            )
+
+            # POST-ASSERTION — run BEFORE commit so a failure triggers ROLLBACK
+            # (per D18: partial schema must not persist on assertion failure).
+            cur = await conn.execute("PRAGMA table_info(paper_trades)")
+            final = {row[1] for row in await cur.fetchall()}
+            missing = set(expected_cols) - final
+            if missing:
+                raise RuntimeError(f"Schema migration incomplete: missing {missing}")
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at, description) "
+                "VALUES (?, ?, ?)",
+                (20260418, datetime.now(timezone.utc).isoformat(), "feedback_loop_v1"),
+            )
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error("SCHEMA_DRIFT_DETECTED")
+            raise
 
     # ------------------------------------------------------------------
     # Candidates
@@ -787,7 +894,10 @@ class Database:
     # ------------------------------------------------------------------
 
     async def log_alert(
-        self, contract_address: str, chain: str, conviction_score: float,
+        self,
+        contract_address: str,
+        chain: str,
+        conviction_score: float,
         alert_market_cap: float | None = None,
         price_usd: float | None = None,
         token_name: str | None = None,
@@ -802,8 +912,16 @@ class Database:
                (contract_address, chain, conviction_score, alert_market_cap,
                 price_usd, token_name, ticker, alerted_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (contract_address, chain, conviction_score, alert_market_cap,
-             price_usd, token_name, ticker, now),
+            (
+                contract_address,
+                chain,
+                conviction_score,
+                alert_market_cap,
+                price_usd,
+                token_name,
+                ticker,
+                now,
+            ),
         )
         await self._conn.commit()
 
@@ -821,8 +939,12 @@ class Database:
         return [dict(row) for row in rows]
 
     async def log_outcome(
-        self, alert_id: int, contract_address: str,
-        alert_price: float, check_price: float, price_change_pct: float,
+        self,
+        alert_id: int,
+        contract_address: str,
+        alert_price: float,
+        check_price: float,
+        price_change_pct: float,
     ) -> None:
         """Record an outcome for an alert."""
         if self._conn is None:
@@ -832,7 +954,14 @@ class Database:
             """INSERT OR REPLACE INTO outcomes
                (id, contract_address, alert_price, check_price, check_time, price_change_pct)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (alert_id, contract_address, alert_price, check_price, now, price_change_pct),
+            (
+                alert_id,
+                contract_address,
+                alert_price,
+                check_price,
+                now,
+                price_change_pct,
+            ),
         )
         await self._conn.commit()
 
@@ -889,7 +1018,9 @@ class Database:
     # Holder snapshots
     # ------------------------------------------------------------------
 
-    async def log_holder_snapshot(self, contract_address: str, holder_count: int) -> None:
+    async def log_holder_snapshot(
+        self, contract_address: str, holder_count: int
+    ) -> None:
         """Log a holder count snapshot for growth tracking."""
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
@@ -926,7 +1057,9 @@ class Database:
         )
         await self._conn.commit()
 
-    async def get_recent_scores(self, contract_address: str, limit: int = 3) -> list[float]:
+    async def get_recent_scores(
+        self, contract_address: str, limit: int = 3
+    ) -> list[float]:
         """Get the most recent scores for a contract, newest first."""
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
@@ -974,7 +1107,8 @@ class Database:
 
         # Alerts fired today
         cursor = await self._conn.execute(
-            "SELECT COUNT(*) FROM alerts WHERE date(alerted_at) = ?", (today,),
+            "SELECT COUNT(*) FROM alerts WHERE date(alerted_at) = ?",
+            (today,),
         )
         alerts_today = (await cursor.fetchone())[0]
 
@@ -1024,7 +1158,9 @@ class Database:
             "alerts_today": alerts_today,
             "outcomes_total": outcomes_total,
             "outcomes_wins": outcomes_wins,
-            "win_rate_pct": round((outcomes_wins / outcomes_total * 100) if outcomes_total > 0 else 0, 1),
+            "win_rate_pct": round(
+                (outcomes_wins / outcomes_total * 100) if outcomes_total > 0 else 0, 1
+            ),
             "top_signal_combo": top_signal_combo,
             "top_tokens": top_tokens,
         }
@@ -1087,7 +1223,12 @@ class Database:
                  )
                GROUP BY a.contract_address
                HAVING peak_quant_score >= ?""",
-            (int(min_age_days), int(max_age_days), int(dedup_days), int(min_peak_score)),
+            (
+                int(min_age_days),
+                int(max_age_days),
+                int(dedup_days),
+                int(min_peak_score),
+            ),
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
@@ -1183,7 +1324,9 @@ class Database:
         rows = [dict(r) for r in await cursor.fetchall()]
         for r in rows:
             r["peak_signals_fired"] = json.loads(r.get("peak_signals_fired") or "[]")
-            r["reaccumulation_signals"] = json.loads(r.get("reaccumulation_signals") or "[]")
+            r["reaccumulation_signals"] = json.loads(
+                r.get("reaccumulation_signals") or "[]"
+            )
             r["price_is_stale"] = bool(r.get("price_is_stale", 0))
         return rows
 
@@ -1315,8 +1458,6 @@ class Database:
         """Return the created_at of the most recent briefing, or None."""
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
-        cursor = await self._conn.execute(
-            "SELECT MAX(created_at) FROM briefings"
-        )
+        cursor = await self._conn.execute("SELECT MAX(created_at) FROM briefings")
         row = await cursor.fetchone()
         return row[0] if row and row[0] else None

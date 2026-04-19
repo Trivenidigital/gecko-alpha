@@ -1,4 +1,5 @@
 """Pydantic models for Second-Wave Detection."""
+
 from __future__ import annotations
 
 from datetime import datetime

@@ -59,17 +59,13 @@ async def test_social_signals_table_created(db):
 @pytest.mark.asyncio
 async def test_social_signals_unique_coin_detected_at(db):
     """The UNIQUE(coin_id, detected_at) constraint deduplicates."""
-    await db._conn.execute(
-        """INSERT INTO social_signals
+    await db._conn.execute("""INSERT INTO social_signals
            (coin_id, symbol, name, detected_at)
-           VALUES ('foo', 'FOO', 'Foo', '2026-04-18T12:00:00+00:00')"""
-    )
+           VALUES ('foo', 'FOO', 'Foo', '2026-04-18T12:00:00+00:00')""")
     # Second INSERT OR IGNORE with the same pair should be a no-op.
-    await db._conn.execute(
-        """INSERT OR IGNORE INTO social_signals
+    await db._conn.execute("""INSERT OR IGNORE INTO social_signals
            (coin_id, symbol, name, detected_at)
-           VALUES ('foo', 'FOO', 'Foo', '2026-04-18T12:00:00+00:00')"""
-    )
+           VALUES ('foo', 'FOO', 'Foo', '2026-04-18T12:00:00+00:00')""")
     await db._conn.commit()
     cursor = await db._conn.execute(
         "SELECT COUNT(*) FROM social_signals WHERE coin_id = 'foo'"

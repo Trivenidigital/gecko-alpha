@@ -32,7 +32,9 @@ async def prune_old_snapshots(db: "Database", retention_days: int = 7) -> int:
     await db._conn.commit()
     deleted = cursor.rowcount
     if deleted:
-        logger.info("gainers_snapshots_pruned", deleted=deleted, retention_days=retention_days)
+        logger.info(
+            "gainers_snapshots_pruned", deleted=deleted, retention_days=retention_days
+        )
     return deleted
 
 
@@ -64,9 +66,7 @@ async def store_top_gainers(
         if change >= min_change and 0 < mcap < max_mcap:
             gainers.append(coin)
 
-    gainers.sort(
-        key=lambda c: c.get("price_change_percentage_24h") or 0, reverse=True
-    )
+    gainers.sort(key=lambda c: c.get("price_change_percentage_24h") or 0, reverse=True)
 
     # Take top 20
     for coin in gainers[:20]:
@@ -242,7 +242,9 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
                 "SELECT current_price FROM price_cache WHERE coin_id = ?", (cid,)
             )
             price_row = await pc.fetchone()
-            comp["detected_price"] = price_row[0] if price_row and price_row[0] else None
+            comp["detected_price"] = (
+                price_row[0] if price_row and price_row[0] else None
+            )
             comp["peak_price"] = None
             comp["peak_gain_pct"] = None
 
@@ -294,9 +296,7 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
     return comparisons
 
 
-async def get_recent_gainers(
-    db: "Database", limit: int = 20
-) -> list[dict]:
+async def get_recent_gainers(db: "Database", limit: int = 20) -> list[dict]:
     """Get recent gainers snapshots for the dashboard."""
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
@@ -313,9 +313,7 @@ async def get_recent_gainers(
     return [dict(row) for row in rows]
 
 
-async def get_gainers_comparisons(
-    db: "Database", limit: int = 50
-) -> list[dict]:
+async def get_gainers_comparisons(db: "Database", limit: int = 50) -> list[dict]:
     """Get gainers comparisons for the dashboard."""
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
@@ -342,9 +340,7 @@ async def get_gainers_stats(db: "Database") -> dict:
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
 
-    cursor = await db._conn.execute(
-        "SELECT COUNT(*) FROM gainers_comparisons"
-    )
+    cursor = await db._conn.execute("SELECT COUNT(*) FROM gainers_comparisons")
     total = (await cursor.fetchone())[0]
 
     cursor = await db._conn.execute(
@@ -355,8 +351,7 @@ async def get_gainers_stats(db: "Database") -> dict:
     missed = total - caught
 
     # Average lead time across all detection methods
-    cursor = await db._conn.execute(
-        """SELECT AVG(lead) FROM (
+    cursor = await db._conn.execute("""SELECT AVG(lead) FROM (
              SELECT narrative_lead_minutes as lead FROM gainers_comparisons
                WHERE detected_by_narrative = 1 AND narrative_lead_minutes IS NOT NULL
              UNION ALL
@@ -368,8 +363,7 @@ async def get_gainers_stats(db: "Database") -> dict:
              UNION ALL
              SELECT spikes_lead_minutes FROM gainers_comparisons
                WHERE detected_by_spikes = 1 AND spikes_lead_minutes IS NOT NULL
-           )"""
-    )
+           )""")
     lead_row = await cursor.fetchone()
     avg_lead = round(lead_row[0], 1) if lead_row and lead_row[0] is not None else None
 
@@ -413,7 +407,9 @@ async def update_gainers_peaks(db: "Database") -> int:
         old_peak = row["peak_price"] or row["detected_price"] or 0
 
         if current_price > old_peak:
-            peak_gain = ((current_price - row["detected_price"]) / row["detected_price"]) * 100
+            peak_gain = (
+                (current_price - row["detected_price"]) / row["detected_price"]
+            ) * 100
             await conn.execute(
                 "UPDATE gainers_comparisons SET peak_price = ?, peak_gain_pct = ? WHERE id = ?",
                 (current_price, peak_gain, row["id"]),

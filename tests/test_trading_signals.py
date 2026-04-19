@@ -114,53 +114,53 @@ async def _open_count(db):
 # ---------------- trade_gainers --------------------------------------------
 
 
-async def test_trade_gainers_opens_trade_when_mcap_above_min(db, engine):
+async def test_trade_gainers_opens_trade_when_mcap_above_min(db, engine, settings):
     await _insert_gainer(db, "btc-like", market_cap=10_000_000)
-    await trade_gainers(engine, db, min_mcap=5_000_000)
+    await trade_gainers(engine, db, min_mcap=5_000_000, settings=settings)
     assert await _open_count(db) == 1
 
 
-async def test_trade_gainers_skips_below_min_mcap(db, engine):
+async def test_trade_gainers_skips_below_min_mcap(db, engine, settings):
     await _insert_gainer(db, "micro-cap", market_cap=1_000_000)  # below 5M floor
-    await trade_gainers(engine, db, min_mcap=5_000_000)
+    await trade_gainers(engine, db, min_mcap=5_000_000, settings=settings)
     assert await _open_count(db) == 0
 
 
-async def test_trade_gainers_skips_null_mcap(db, engine):
+async def test_trade_gainers_skips_null_mcap(db, engine, settings):
     await _insert_gainer(db, "null-mcap", market_cap=None)
-    await trade_gainers(engine, db, min_mcap=5_000_000)
+    await trade_gainers(engine, db, min_mcap=5_000_000, settings=settings)
     assert await _open_count(db) == 0
 
 
-async def test_trade_gainers_respects_threshold_override(db, engine):
+async def test_trade_gainers_respects_threshold_override(db, engine, settings):
     await _insert_gainer(db, "mid-cap", market_cap=2_000_000)
     # Override to $1M — should now open
-    await trade_gainers(engine, db, min_mcap=1_000_000)
+    await trade_gainers(engine, db, min_mcap=1_000_000, settings=settings)
     assert await _open_count(db) == 1
 
 
 # ---------------- trade_losers ---------------------------------------------
 
 
-async def test_trade_losers_opens_trade_when_mcap_above_min(db, engine):
+async def test_trade_losers_opens_trade_when_mcap_above_min(db, engine, settings):
     await _insert_loser(db, "btc-dip", market_cap=10_000_000)
-    await trade_losers(engine, db, min_mcap=5_000_000)
+    await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
     assert await _open_count(db) == 1
 
 
-async def test_trade_losers_skips_below_min_mcap(db, engine):
+async def test_trade_losers_skips_below_min_mcap(db, engine, settings):
     await _insert_loser(db, "micro-dip", market_cap=500_000)
-    await trade_losers(engine, db, min_mcap=5_000_000)
+    await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
     assert await _open_count(db) == 0
 
 
-async def test_trade_losers_skips_null_mcap(db, engine):
+async def test_trade_losers_skips_null_mcap(db, engine, settings):
     await _insert_loser(db, "null-dip", market_cap=None)
-    await trade_losers(engine, db, min_mcap=5_000_000)
+    await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
     assert await _open_count(db) == 0
 
 
-async def test_trade_losers_falls_back_to_price_cache(db, engine):
+async def test_trade_losers_falls_back_to_price_cache(db, engine, settings):
     """When price_at_snapshot is NULL, loader reads from price_cache."""
     now = datetime.now(timezone.utc).isoformat()
     await db._conn.execute(
@@ -172,39 +172,39 @@ async def test_trade_losers_falls_back_to_price_cache(db, engine):
     )
     await db._conn.commit()
     await _seed_price(db, "null-price", price=0.042)
-    await trade_losers(engine, db, min_mcap=5_000_000)
+    await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
     assert await _open_count(db) == 1
 
 
 # ---------------- trade_trending -------------------------------------------
 
 
-async def test_trade_trending_opens_when_rank_under_threshold(db, engine):
+async def test_trade_trending_opens_when_rank_under_threshold(db, engine, settings):
     await _insert_trending(db, "top-100", market_cap_rank=50)
     await _seed_price(db, "top-100", price=1.0)
-    await trade_trending(engine, db, max_mcap_rank=1500)
+    await trade_trending(engine, db, max_mcap_rank=1500, settings=settings)
     assert await _open_count(db) == 1
 
 
-async def test_trade_trending_skips_above_rank_threshold(db, engine):
+async def test_trade_trending_skips_above_rank_threshold(db, engine, settings):
     await _insert_trending(db, "rank-2000", market_cap_rank=2000)
     await _seed_price(db, "rank-2000", price=1.0)
-    await trade_trending(engine, db, max_mcap_rank=1500)
+    await trade_trending(engine, db, max_mcap_rank=1500, settings=settings)
     assert await _open_count(db) == 0
 
 
-async def test_trade_trending_skips_null_rank(db, engine):
+async def test_trade_trending_skips_null_rank(db, engine, settings):
     await _insert_trending(db, "no-rank", market_cap_rank=None)
     await _seed_price(db, "no-rank", price=1.0)
-    await trade_trending(engine, db, max_mcap_rank=1500)
+    await trade_trending(engine, db, max_mcap_rank=1500, settings=settings)
     assert await _open_count(db) == 0
 
 
-async def test_trade_trending_respects_threshold_override(db, engine):
+async def test_trade_trending_respects_threshold_override(db, engine, settings):
     await _insert_trending(db, "rank-1200", market_cap_rank=1200)
     await _seed_price(db, "rank-1200", price=1.0)
     # Tighter ceiling — should reject
-    await trade_trending(engine, db, max_mcap_rank=1000)
+    await trade_trending(engine, db, max_mcap_rank=1000, settings=settings)
     assert await _open_count(db) == 0
 
 
@@ -223,7 +223,16 @@ async def _insert_gainer_at(db, coin_id, market_cap, price, snapshot_at):
            (coin_id, symbol, name, price_change_24h, market_cap, volume_24h,
             price_at_snapshot, snapshot_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (coin_id, coin_id.upper(), coin_id, 25.0, market_cap, 100_000.0, price, snapshot_at),
+        (
+            coin_id,
+            coin_id.upper(),
+            coin_id,
+            25.0,
+            market_cap,
+            100_000.0,
+            price,
+            snapshot_at,
+        ),
     )
     await db._conn.commit()
 
@@ -234,7 +243,16 @@ async def _insert_loser_at(db, coin_id, market_cap, price, snapshot_at):
            (coin_id, symbol, name, price_change_24h, market_cap, volume_24h,
             price_at_snapshot, snapshot_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (coin_id, coin_id.upper(), coin_id, -25.0, market_cap, 100_000.0, price, snapshot_at),
+        (
+            coin_id,
+            coin_id.upper(),
+            coin_id,
+            -25.0,
+            market_cap,
+            100_000.0,
+            price,
+            snapshot_at,
+        ),
     )
     await db._conn.commit()
 
@@ -249,30 +267,32 @@ async def _insert_trending_at(db, coin_id, market_cap_rank, snapshot_at):
     await db._conn.commit()
 
 
-async def test_trade_gainers_skips_snapshots_older_than_5min_same_day(db, engine):
+async def test_trade_gainers_skips_snapshots_older_than_5min_same_day(db, engine, settings):
     """A snapshot stored 2 hours ago (same day) must NOT be picked up."""
     stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-    await _insert_gainer_at(db, "stale-gainer", 10_000_000, price=1.0, snapshot_at=stale)
-    await trade_gainers(engine, db, min_mcap=5_000_000)
+    await _insert_gainer_at(
+        db, "stale-gainer", 10_000_000, price=1.0, snapshot_at=stale
+    )
+    await trade_gainers(engine, db, min_mcap=5_000_000, settings=settings)
     assert await _open_count(db) == 0
 
 
-async def test_trade_losers_skips_snapshots_older_than_5min_same_day(db, engine):
+async def test_trade_losers_skips_snapshots_older_than_5min_same_day(db, engine, settings):
     stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     await _insert_loser_at(db, "stale-loser", 10_000_000, price=1.0, snapshot_at=stale)
-    await trade_losers(engine, db, min_mcap=5_000_000)
+    await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
     assert await _open_count(db) == 0
 
 
-async def test_trade_trending_skips_snapshots_older_than_5min_same_day(db, engine):
+async def test_trade_trending_skips_snapshots_older_than_5min_same_day(db, engine, settings):
     stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     await _insert_trending_at(db, "stale-trend", market_cap_rank=100, snapshot_at=stale)
     await _seed_price(db, "stale-trend", price=1.0)
-    await trade_trending(engine, db, max_mcap_rank=1500)
+    await trade_trending(engine, db, max_mcap_rank=1500, settings=settings)
     assert await _open_count(db) == 0
 
 
-async def test_trade_gainers_uses_fresh_snapshot_price_not_earlier_peak(db, engine):
+async def test_trade_gainers_uses_fresh_snapshot_price_not_earlier_peak(db, engine, settings):
     """When both a stale and a fresh snapshot exist, entry must come from fresh one.
 
     Reproduces the production bug where entries were sourced from the day's
@@ -282,10 +302,12 @@ async def test_trade_gainers_uses_fresh_snapshot_price_not_earlier_peak(db, engi
     peak_earlier = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat()
     fresh = datetime.now(timezone.utc).isoformat()
     # Earlier peak at $1.75 (would be the stale-entry bug value)
-    await _insert_gainer_at(db, "two-snap", 10_000_000, price=1.75, snapshot_at=peak_earlier)
+    await _insert_gainer_at(
+        db, "two-snap", 10_000_000, price=1.75, snapshot_at=peak_earlier
+    )
     # Current snapshot at $1.44
     await _insert_gainer_at(db, "two-snap", 10_000_000, price=1.44, snapshot_at=fresh)
-    await trade_gainers(engine, db, min_mcap=5_000_000)
+    await trade_gainers(engine, db, min_mcap=5_000_000, settings=settings)
     assert await _open_count(db) == 1
     cur = await db._conn.execute(
         "SELECT entry_price FROM paper_trades WHERE token_id='two-snap' AND status='open'"

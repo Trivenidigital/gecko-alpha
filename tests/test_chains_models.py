@@ -1,4 +1,5 @@
 """Tests for conviction chain Pydantic models."""
+
 from datetime import datetime, timezone
 
 from scout.chains.models import (

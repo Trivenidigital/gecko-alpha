@@ -1,4 +1,5 @@
 """Telegram alert formatter for Second-Wave Detection."""
+
 from __future__ import annotations
 
 
@@ -21,7 +22,7 @@ def format_secondwave_alert(candidate: dict) -> str:
     stale_marker = "(stale)" if candidate.get("price_is_stale") else ""
 
     lines = [
-        f"\U0001F504 Second Wave Detected: {candidate.get('token_name', 'Unknown')} ({candidate.get('ticker', '')})",
+        f"\U0001f504 Second Wave Detected: {candidate.get('token_name', 'Unknown')} ({candidate.get('ticker', '')})",
         "",
         f"Prior pump (first seen {candidate.get('days_since_first_seen', 0):.1f}d ago):",
         f"  Peak score: {candidate.get('peak_quant_score', 0)}/100",

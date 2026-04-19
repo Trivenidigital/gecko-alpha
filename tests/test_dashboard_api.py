@@ -11,10 +11,10 @@ import aiosqlite
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 async def seeded_db(tmp_path):
@@ -188,24 +188,57 @@ async def seeded_db(tmp_path):
             (contract_address, chain, token_name, ticker, market_cap_usd, liquidity_usd,
              volume_24h_usd, quant_score, conviction_score, signals_fired, first_seen_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("0xhigh", "solana", "HighToken", "HIGH", 50000, 20000,
-             120000, 85, 82.0, json.dumps(["vol_liq_ratio", "holder_growth", "market_cap_range"]), now),
+            (
+                "0xhigh",
+                "solana",
+                "HighToken",
+                "HIGH",
+                50000,
+                20000,
+                120000,
+                85,
+                82.0,
+                json.dumps(["vol_liq_ratio", "holder_growth", "market_cap_range"]),
+                now,
+            ),
         )
         await db.execute(
             """INSERT INTO candidates
             (contract_address, chain, token_name, ticker, market_cap_usd, liquidity_usd,
              volume_24h_usd, quant_score, conviction_score, signals_fired, first_seen_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("0xlow", "ethereum", "LowToken", "LOW", 30000, 15000,
-             40000, 25, 25.0, json.dumps(["market_cap_range"]), now),
+            (
+                "0xlow",
+                "ethereum",
+                "LowToken",
+                "LOW",
+                30000,
+                15000,
+                40000,
+                25,
+                25.0,
+                json.dumps(["market_cap_range"]),
+                now,
+            ),
         )
         await db.execute(
             """INSERT INTO candidates
             (contract_address, chain, token_name, ticker, market_cap_usd, liquidity_usd,
              volume_24h_usd, quant_score, conviction_score, signals_fired, first_seen_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("0xnone", "solana", "NoSignals", "NONE", 10000, 16000,
-             5000, 5, None, None, now),
+            (
+                "0xnone",
+                "solana",
+                "NoSignals",
+                "NONE",
+                10000,
+                16000,
+                5000,
+                5,
+                None,
+                None,
+                now,
+            ),
         )
 
         # Seed alerts
@@ -282,8 +315,18 @@ async def seeded_db(tmp_path):
             (id, name, description, steps_json, min_steps_to_trigger,
              conviction_boost, alert_priority, is_active, total_triggers, total_hits)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (1, "test_pattern", "Test chain pattern",
-             json.dumps(["step_a", "step_b"]), 2, 15, "medium", 1, 10, 4),
+            (
+                1,
+                "test_pattern",
+                "Test chain pattern",
+                json.dumps(["step_a", "step_b"]),
+                2,
+                15,
+                "medium",
+                1,
+                10,
+                4,
+            ),
         )
 
         # Seed active_chains
@@ -292,9 +335,17 @@ async def seeded_db(tmp_path):
             (token_id, pipeline, pattern_id, pattern_name, steps_matched,
              step_events, anchor_time, last_step_time, is_complete)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("0xhigh", "narrative", 1, "test_pattern",
-             json.dumps(["step_a"]), json.dumps([{"t": now, "step": "step_a"}]),
-             now, now, 0),
+            (
+                "0xhigh",
+                "narrative",
+                1,
+                "test_pattern",
+                json.dumps(["step_a"]),
+                json.dumps([{"t": now, "step": "step_a"}]),
+                now,
+                now,
+                0,
+            ),
         )
 
         # Seed signal_events
@@ -454,6 +505,7 @@ async def empty_db(tmp_path):
 async def _reset_scout_db_cache():
     """Reset the cached ScoutDatabase instance between tests."""
     import dashboard.api as api_mod
+
     if api_mod._scout_db is not None:
         await api_mod._scout_db.close()
         api_mod._scout_db = None
@@ -462,9 +514,12 @@ async def _reset_scout_db_cache():
 @pytest.fixture
 def make_app():
     """Factory that creates a FastAPI app pointing at a given DB path."""
+
     def _make(db_path: str):
         from dashboard.api import create_app
+
         return create_app(db_path)
+
     return _make
 
 
@@ -491,6 +546,7 @@ async def empty_client(empty_db, make_app):
 # ---------------------------------------------------------------------------
 # GET /api/candidates
 # ---------------------------------------------------------------------------
+
 
 class TestCandidates:
 
@@ -527,6 +583,7 @@ class TestCandidates:
 # GET /api/alerts/recent
 # ---------------------------------------------------------------------------
 
+
 class TestAlerts:
 
     async def test_returns_alerts_ordered_by_time(self, client):
@@ -546,6 +603,7 @@ class TestAlerts:
 # ---------------------------------------------------------------------------
 # GET /api/signals/today
 # ---------------------------------------------------------------------------
+
 
 class TestSignals:
 
@@ -573,6 +631,7 @@ class TestSignals:
 # GET /api/status
 # ---------------------------------------------------------------------------
 
+
 class TestStatus:
 
     async def test_returns_status(self, client):
@@ -594,6 +653,7 @@ class TestStatus:
 # GET /api/funnel/latest
 # ---------------------------------------------------------------------------
 
+
 class TestFunnel:
 
     async def test_returns_funnel_counts(self, client):
@@ -613,6 +673,7 @@ class TestFunnel:
 # ---------------------------------------------------------------------------
 # GET /api/narrative/heating
 # ---------------------------------------------------------------------------
+
 
 class TestNarrativeHeating:
 
@@ -634,6 +695,7 @@ class TestNarrativeHeating:
 # ---------------------------------------------------------------------------
 # GET /api/narrative/predictions
 # ---------------------------------------------------------------------------
+
 
 class TestNarrativePredictions:
 
@@ -666,6 +728,7 @@ class TestNarrativePredictions:
 # GET /api/narrative/metrics
 # ---------------------------------------------------------------------------
 
+
 class TestNarrativeMetrics:
 
     async def test_returns_metrics(self, client):
@@ -693,6 +756,7 @@ class TestNarrativeMetrics:
 # ---------------------------------------------------------------------------
 # GET /api/narrative/strategy + PUT
 # ---------------------------------------------------------------------------
+
 
 class TestNarrativeStrategy:
 
@@ -732,6 +796,7 @@ class TestNarrativeStrategy:
 # GET /api/narrative/learn-logs
 # ---------------------------------------------------------------------------
 
+
 class TestNarrativeLearnLogs:
 
     async def test_returns_learn_logs(self, client):
@@ -751,6 +816,7 @@ class TestNarrativeLearnLogs:
 # GET /api/narrative/categories/history
 # ---------------------------------------------------------------------------
 
+
 class TestNarrativeCategoryHistory:
 
     async def test_returns_history(self, client):
@@ -766,7 +832,9 @@ class TestNarrativeCategoryHistory:
         assert resp.json() == []
 
     async def test_empty_db_returns_empty(self, empty_client):
-        resp = await empty_client.get("/api/narrative/categories/history?category_id=ai")
+        resp = await empty_client.get(
+            "/api/narrative/categories/history?category_id=ai"
+        )
         assert resp.status_code == 200
         assert resp.json() == []
 
@@ -774,6 +842,7 @@ class TestNarrativeCategoryHistory:
 # ---------------------------------------------------------------------------
 # GET /api/chains/*
 # ---------------------------------------------------------------------------
+
 
 class TestChains:
 

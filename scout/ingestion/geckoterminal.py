@@ -25,7 +25,9 @@ async def fetch_trending_pools(
         try:
             async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                 if resp.status != 200:
-                    logger.warning("GeckoTerminal returned error", chain=chain, status=resp.status)
+                    logger.warning(
+                        "GeckoTerminal returned error", chain=chain, status=resp.status
+                    )
                     continue
                 data = await resp.json()
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -35,7 +37,11 @@ async def fetch_trending_pools(
         for pool in data.get("data", []):
             try:
                 token = CandidateToken.from_geckoterminal(pool, chain=chain)
-                if settings.MIN_MARKET_CAP <= token.market_cap_usd <= settings.MAX_MARKET_CAP:
+                if (
+                    settings.MIN_MARKET_CAP
+                    <= token.market_cap_usd
+                    <= settings.MAX_MARKET_CAP
+                ):
                     candidates.append(token)
             except Exception as e:
                 logger.warning("Failed to parse GeckoTerminal pool", error=str(e))

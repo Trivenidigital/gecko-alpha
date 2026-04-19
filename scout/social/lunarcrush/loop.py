@@ -48,9 +48,7 @@ class _AuthDisabled(Exception):
 # ---------------------------------------------------------------------------
 
 
-async def _insert_alerts(
-    db: "Database", alerts: list[ResearchAlert]
-) -> None:
+async def _insert_alerts(db: "Database", alerts: list[ResearchAlert]) -> None:
     """INSERT OR IGNORE each alert; commit once. Raises on DB errors.
 
     UNIQUE(coin_id, detected_at) provides TOCTOU-safe dedup even if the
@@ -218,9 +216,7 @@ async def _process_cycle(
     return len(enriched)
 
 
-async def _mark_alerts_dispatched(
-    db: "Database", alerts: list[ResearchAlert]
-) -> None:
+async def _mark_alerts_dispatched(db: "Database", alerts: list[ResearchAlert]) -> None:
     """Set ``alerted_at=now`` for the rows we just successfully sent."""
     if db._conn is None or not alerts:
         return
@@ -306,9 +302,7 @@ async def run_social_loop(
         except Exception:
             logger.exception("social_hydrate_credits_error")
         try:
-            pruned = await _prune_old_rows(
-                db, int(settings.LUNARCRUSH_RETENTION_DAYS)
-            )
+            pruned = await _prune_old_rows(db, int(settings.LUNARCRUSH_RETENTION_DAYS))
             if pruned:
                 logger.info("social_retention_pruned", rows_deleted=pruned)
         except Exception:
@@ -332,9 +326,7 @@ async def run_social_loop(
 
             poll_counter += 1
             # Periodic checkpoint.
-            checkpoint_every = int(
-                settings.LUNARCRUSH_CHECKPOINT_EVERY_N_POLLS
-            )
+            checkpoint_every = int(settings.LUNARCRUSH_CHECKPOINT_EVERY_N_POLLS)
             if checkpoint_every > 0 and poll_counter % checkpoint_every == 0:
                 try:
                     await flush_baselines(db, cache)

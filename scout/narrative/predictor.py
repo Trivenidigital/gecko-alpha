@@ -49,7 +49,9 @@ async def fetch_laggards(
     for attempt in range(2):  # 1 retry on 429
         await coingecko_limiter.acquire()
         try:
-            async with session.get(CG_MARKETS_URL, params=params, headers=headers) as resp:
+            async with session.get(
+                CG_MARKETS_URL, params=params, headers=headers
+            ) as resp:
                 if resp.status == 429:
                     log.warning(
                         "fetch_laggards_rate_limited",
@@ -239,7 +241,11 @@ async def score_token(
             client = anthropic.AsyncAnthropic(api_key=api_key)
 
         prompt = build_scoring_prompt(
-            token, accel, market_regime, top_3_coins, lessons,
+            token,
+            accel,
+            market_regime,
+            top_3_coins,
+            lessons,
             watchlist_users=watchlist_users,
         )
         response = await client.messages.create(  # type: ignore[union-attr]

@@ -1,4 +1,5 @@
 """End-to-end test: scan DB -> score -> alert via mocked Telegram + CoinGecko."""
+
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -7,7 +8,6 @@ from aioresponses import aioresponses
 
 from scout.db import Database
 from scout.secondwave.detector import run_once
-
 
 _SW_INT_DEFAULTS = dict(
     SECONDWAVE_ENABLED=True,
@@ -96,12 +96,14 @@ async def test_end_to_end_narrative_token_live_price(db, tmp_path, settings_fact
         m.get(
             "https://api.coingecko.com/api/v3/coins/markets",
             status=200,
-            payload=[{
-                "id": "narr-token",
-                "current_price": 0.8,
-                "total_volume": 500_000.0,
-                "market_cap": 1_200_000.0,
-            }],
+            payload=[
+                {
+                    "id": "narr-token",
+                    "current_price": 0.8,
+                    "total_volume": 500_000.0,
+                    "market_cap": 1_200_000.0,
+                }
+            ],
         )
         m.post(
             f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage",

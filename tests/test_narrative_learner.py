@@ -46,22 +46,22 @@ def _prediction_row(
 ) -> tuple:
     """Build a full prediction row tuple for INSERT."""
     return (
-        "cat1",          # category_id
-        "DeFi",          # category_name
-        coin_id,         # coin_id
-        coin_id.upper(), # symbol
+        "cat1",  # category_id
+        "DeFi",  # category_name
+        coin_id,  # coin_id
+        coin_id.upper(),  # symbol
         f"Token {coin_id}",  # name
-        1_000_000.0,     # market_cap_at_prediction
-        1.0,             # price_at_prediction
-        80,              # narrative_fit_score
-        "Medium",        # staying_power
-        "High",          # confidence
+        1_000_000.0,  # market_cap_at_prediction
+        1.0,  # price_at_prediction
+        80,  # narrative_fit_score
+        "Medium",  # staying_power
+        "High",  # confidence
         "test reasoning",  # reasoning
         json.dumps({}),  # strategy_snapshot
-        _NOW,            # predicted_at
-        is_control,      # is_control
-        outcome_class,   # outcome_class
-        evaluated_at,    # evaluated_at
+        _NOW,  # predicted_at
+        is_control,  # is_control
+        outcome_class,  # outcome_class
+        evaluated_at,  # evaluated_at
     )
 
 
@@ -97,19 +97,43 @@ async def test_compute_hit_rates_with_data(db: Database):
     assert conn is not None
 
     # Agent predictions
-    await conn.execute(_INSERT_SQL, _prediction_row(
-        coin_id="a1", is_control=0, outcome_class="HIT", evaluated_at=_NOW,
-    ))
-    await conn.execute(_INSERT_SQL, _prediction_row(
-        coin_id="a2", is_control=0, outcome_class="MISS", evaluated_at=_NOW,
-    ))
+    await conn.execute(
+        _INSERT_SQL,
+        _prediction_row(
+            coin_id="a1",
+            is_control=0,
+            outcome_class="HIT",
+            evaluated_at=_NOW,
+        ),
+    )
+    await conn.execute(
+        _INSERT_SQL,
+        _prediction_row(
+            coin_id="a2",
+            is_control=0,
+            outcome_class="MISS",
+            evaluated_at=_NOW,
+        ),
+    )
     # Control predictions
-    await conn.execute(_INSERT_SQL, _prediction_row(
-        coin_id="c1", is_control=1, outcome_class="HIT", evaluated_at=_NOW,
-    ))
-    await conn.execute(_INSERT_SQL, _prediction_row(
-        coin_id="c2", is_control=1, outcome_class="HIT", evaluated_at=_NOW,
-    ))
+    await conn.execute(
+        _INSERT_SQL,
+        _prediction_row(
+            coin_id="c1",
+            is_control=1,
+            outcome_class="HIT",
+            evaluated_at=_NOW,
+        ),
+    )
+    await conn.execute(
+        _INSERT_SQL,
+        _prediction_row(
+            coin_id="c2",
+            is_control=1,
+            outcome_class="HIT",
+            evaluated_at=_NOW,
+        ),
+    )
     await conn.commit()
 
     result = await compute_hit_rates(db)
@@ -123,9 +147,7 @@ async def test_compute_hit_rates_with_data(db: Database):
 # ------------------------------------------------------------------
 
 
-async def test_apply_adjustments_respects_min_sample(
-    db: Database, strategy: Strategy
-):
+async def test_apply_adjustments_respects_min_sample(db: Database, strategy: Strategy):
     """With 0 predictions, adjustments should not be applied."""
     adjustments = [{"key": "hit_threshold_pct", "new_value": 20.0, "reason": "test"}]
     applied = await apply_adjustments(adjustments, strategy, db, min_sample=100)
@@ -157,7 +179,6 @@ async def test_should_pause_not_enough_data():
     assert should_pause(rates, threshold=10.0, consecutive_days=7) is False
 
 
-
 async def test_daily_learn_includes_counter_risk_score_in_prompt(tmp_path):
     """Verify pre-aggregated counter_risk stats flow into the LEARN prompt."""
     from unittest.mock import MagicMock, patch
@@ -180,17 +201,39 @@ async def test_daily_learn_includes_counter_risk_score_in_prompt(tmp_path):
             strategy_snapshot, predicted_at, outcome_class, evaluated_at,
             counter_risk_score, counter_flags, counter_data_completeness)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        ("ai", "AI", "coin-1", "TKN", "Token", 50e6, 1.0, 75,
-         "High", "Medium", "test", "BULL", 1, 0, 0,
-         "{}", _NOW, "HIT", _NOW,
-         55, '[{"flag": "already_peaked"}]', "full"),
+        (
+            "ai",
+            "AI",
+            "coin-1",
+            "TKN",
+            "Token",
+            50e6,
+            1.0,
+            75,
+            "High",
+            "Medium",
+            "test",
+            "BULL",
+            1,
+            0,
+            0,
+            "{}",
+            _NOW,
+            "HIT",
+            _NOW,
+            55,
+            '[{"flag": "already_peaked"}]',
+            "full",
+        ),
     )
     await conn.commit()
 
     # Mock the synchronous anthropic client used by the learner.
     mock_client = MagicMock()
     mock_msg = MagicMock()
-    mock_msg.content = [MagicMock(text='{"adjustments": [], "reflection": "test", "true_alpha": 0}')]
+    mock_msg.content = [
+        MagicMock(text='{"adjustments": [], "reflection": "test", "true_alpha": 0}')
+    ]
     mock_client.messages.create = MagicMock(return_value=mock_msg)
 
     with patch("scout.narrative.learner.anthropic.Anthropic", return_value=mock_client):

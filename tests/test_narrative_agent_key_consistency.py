@@ -27,7 +27,9 @@ def test_narrative_fit_key_matches_prompt():
 
 def test_agent_uses_constant_not_literal():
     """agent.py must not hardcode 'narrative_fit_score' when parsing Claude results."""
-    agent_path = pathlib.Path(__file__).parent.parent / "scout" / "narrative" / "agent.py"
+    agent_path = (
+        pathlib.Path(__file__).parent.parent / "scout" / "narrative" / "agent.py"
+    )
     source = agent_path.read_text(encoding="utf-8")
     # Regex allows for single or double quotes, extra whitespace, keyword args.
     pattern = re.compile(r"""\.get\s*\(\s*['"]narrative_fit_score['"]""")

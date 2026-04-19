@@ -35,7 +35,9 @@ async def test_fetch_trending_pools_returns_candidates(mock_aiohttp, settings_fa
     url = f"{GECKO_BASE}/networks/solana/trending_pools"
     mock_aiohttp.get(url, payload={"data": [SAMPLE_POOL]})
 
-    settings = settings_factory(CHAINS=["solana"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000)
+    settings = settings_factory(
+        CHAINS=["solana"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000
+    )
     async with aiohttp.ClientSession() as session:
         tokens = await fetch_trending_pools(session, settings)
 
@@ -46,7 +48,9 @@ async def test_fetch_trending_pools_returns_candidates(mock_aiohttp, settings_fa
 
 
 async def test_fetch_trending_pools_multiple_chains(mock_aiohttp, settings_factory):
-    settings = settings_factory(CHAINS=["solana", "eth"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000)
+    settings = settings_factory(
+        CHAINS=["solana", "eth"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000
+    )
 
     sol_url = f"{GECKO_BASE}/networks/solana/trending_pools"
     eth_url = f"{GECKO_BASE}/networks/eth/trending_pools"
@@ -68,7 +72,9 @@ async def test_fetch_trending_pools_filters_market_cap(mock_aiohttp, settings_fa
     url = f"{GECKO_BASE}/networks/solana/trending_pools"
     mock_aiohttp.get(url, payload={"data": [big_pool]})
 
-    settings = settings_factory(CHAINS=["solana"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000)
+    settings = settings_factory(
+        CHAINS=["solana"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000
+    )
     async with aiohttp.ClientSession() as session:
         tokens = await fetch_trending_pools(session, settings)
 
@@ -79,7 +85,9 @@ async def test_fetch_trending_pools_handles_api_error(mock_aiohttp, settings_fac
     url = f"{GECKO_BASE}/networks/solana/trending_pools"
     mock_aiohttp.get(url, status=500)
 
-    settings = settings_factory(CHAINS=["solana"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000)
+    settings = settings_factory(
+        CHAINS=["solana"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000
+    )
     async with aiohttp.ClientSession() as session:
         tokens = await fetch_trending_pools(session, settings)
 

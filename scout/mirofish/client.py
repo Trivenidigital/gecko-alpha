@@ -32,9 +32,7 @@ async def simulate(
     try:
         async with session.post(url, json=seed, timeout=timeout) as resp:
             if resp.status != 200:
-                raise MiroFishConnectionError(
-                    f"MiroFish returned HTTP {resp.status}"
-                )
+                raise MiroFishConnectionError(f"MiroFish returned HTTP {resp.status}")
             data = await resp.json()
     except asyncio.TimeoutError:
         raise MiroFishTimeoutError(

@@ -193,12 +193,12 @@ def _row_to_pattern(row) -> ChainPattern:
         historical_hit_rate=row["historical_hit_rate"],
         total_triggers=row["total_triggers"] or 0,
         total_hits=row["total_hits"] or 0,
-        created_at=datetime.fromisoformat(row["created_at"])
-        if row["created_at"]
-        else None,
-        updated_at=datetime.fromisoformat(row["updated_at"])
-        if row["updated_at"]
-        else None,
+        created_at=(
+            datetime.fromisoformat(row["created_at"]) if row["created_at"] else None
+        ),
+        updated_at=(
+            datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else None
+        ),
     )
 
 
@@ -256,14 +256,12 @@ async def compute_pattern_stats(db: Database, settings: Settings) -> list[dict]:
     """Compute hit rate per (pattern, pipeline) over evaluated chain_matches."""
     conn = db._conn
     rows: list[dict] = []
-    async with conn.execute(
-        """SELECT pattern_id, pattern_name, pipeline,
+    async with conn.execute("""SELECT pattern_id, pattern_name, pipeline,
                   COUNT(*) AS total_evaluated,
                   SUM(CASE WHEN outcome_class='hit' THEN 1 ELSE 0 END) AS hits
            FROM chain_matches
            WHERE outcome_class IS NOT NULL
-           GROUP BY pattern_id, pattern_name, pipeline"""
-    ) as cur:
+           GROUP BY pattern_id, pattern_name, pipeline""") as cur:
         for row in await cur.fetchall():
             total = row["total_evaluated"] or 0
             hits = row["hits"] or 0
@@ -318,10 +316,7 @@ async def run_pattern_lifecycle(db: Database, settings: Settings) -> None:
                     pattern=s["pattern_name"],
                     hit_rate=s["hit_rate"],
                 )
-            elif (
-                prio == "low"
-                and s["hit_rate"] >= settings.CHAIN_PROMOTION_THRESHOLD
-            ):
+            elif prio == "low" and s["hit_rate"] >= settings.CHAIN_PROMOTION_THRESHOLD:
                 new_prio = "medium"
                 logger.info(
                     "chain_pattern_promoted",

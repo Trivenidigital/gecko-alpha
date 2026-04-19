@@ -62,7 +62,8 @@ async def _enrich_solana(
     except Exception:
         logger.warning(
             "Helius holder lookup failed",
-            contract_address=token.contract_address, exc_info=True,
+            contract_address=token.contract_address,
+            exc_info=True,
         )
         return token
 
@@ -88,6 +89,7 @@ async def _enrich_evm(
     except Exception:
         logger.warning(
             "Moralis holder lookup failed",
-            contract_address=token.contract_address, exc_info=True,
+            contract_address=token.contract_address,
+            exc_info=True,
         )
         return token

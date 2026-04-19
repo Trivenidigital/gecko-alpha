@@ -7,7 +7,8 @@ from scout.mirofish.seed_builder import build_seed
 
 def test_build_seed_returns_required_keys(token_factory):
     token = token_factory(
-        token_name="TestCoin", social_mentions_24h=45,
+        token_name="TestCoin",
+        social_mentions_24h=45,
         first_seen_at=datetime.now(timezone.utc) - timedelta(hours=3),
     )
     seed = build_seed(token)
@@ -23,8 +24,9 @@ def test_build_seed_returns_required_keys(token_factory):
 
 
 def test_build_seed_values(token_factory):
-    token = token_factory(token_name="MoonCoin", ticker="MOON", chain="ethereum",
-                         market_cap_usd=100000)
+    token = token_factory(
+        token_name="MoonCoin", ticker="MOON", chain="ethereum", market_cap_usd=100000
+    )
     seed = build_seed(token)
 
     assert seed["token_name"] == "MoonCoin"
@@ -34,8 +36,9 @@ def test_build_seed_values(token_factory):
 
 
 def test_build_seed_prompt_format(token_factory):
-    token = token_factory(token_name="TestCoin", ticker="TST", chain="solana",
-                         market_cap_usd=50000)
+    token = token_factory(
+        token_name="TestCoin", ticker="TST", chain="solana", market_cap_usd=50000
+    )
     seed = build_seed(token)
 
     prompt = seed["prompt"]

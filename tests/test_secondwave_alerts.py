@@ -1,4 +1,5 @@
 """Tests for second-wave Telegram alert formatting."""
+
 from datetime import datetime, timezone
 
 from scout.secondwave.alerts import format_secondwave_alert
@@ -26,7 +27,11 @@ def _base_candidate() -> dict:
         "volume_vs_cooldown_avg": 3.1,
         "price_is_stale": False,
         "reaccumulation_score": 85,
-        "reaccumulation_signals": ["sufficient_drawdown", "price_recovery", "strong_prior_signal"],
+        "reaccumulation_signals": [
+            "sufficient_drawdown",
+            "price_recovery",
+            "strong_prior_signal",
+        ],
         "detected_at": datetime.now(timezone.utc).isoformat(),
         "alerted_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -34,7 +39,7 @@ def _base_candidate() -> dict:
 
 def test_format_basic_alert_contains_all_sections():
     msg = format_secondwave_alert(_base_candidate())
-    assert "\U0001F504" in msg  # refresh emoji
+    assert "\U0001f504" in msg  # refresh emoji
     assert "Second Wave" in msg
     assert "Test Token" in msg
     assert "TEST" in msg

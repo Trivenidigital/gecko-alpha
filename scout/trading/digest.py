@@ -83,7 +83,9 @@ async def build_paper_digest(db: Database, date_str: str) -> str | None:
     # Compute win rate per signal type
     by_signal_with_wr: dict[str, dict] = {}
     for sig, data in by_signal.items():
-        wr = round((data["wins"] / data["trades"]) * 100, 1) if data["trades"] > 0 else 0
+        wr = (
+            round((data["wins"] / data["trades"]) * 100, 1) if data["trades"] > 0 else 0
+        )
         by_signal_with_wr[sig] = {
             "trades": data["trades"],
             "pnl": round(data["pnl"], 2),
