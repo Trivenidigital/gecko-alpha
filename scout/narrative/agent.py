@@ -128,6 +128,7 @@ async def narrative_agent_loop(
                         await trade_trending(
                             trading_engine, db,
                             max_mcap_rank=settings.PAPER_MAX_MCAP_RANK,
+                            settings=settings,
                         )
                 except Exception:
                     logger.exception("trending_tracker.snapshot_error")
@@ -496,6 +497,7 @@ async def narrative_agent_loop(
                             await trade_predictions(
                                 trading_engine, db, prediction_models,
                                 min_mcap=settings.PAPER_MIN_MCAP,
+                                settings=settings,
                             )
 
                     # Send alert if enabled and matches user preferences

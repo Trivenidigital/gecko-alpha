@@ -296,7 +296,7 @@ async def run_cycle(
             if spikes:
                 logger.info("volume_spikes_detected", count=len(spikes))
                 if trading_engine:
-                    await trade_volume_spikes(trading_engine, db, spikes)
+                    await trade_volume_spikes(trading_engine, db, spikes, settings=settings)
         except Exception:
             logger.exception("volume_spike_error")
 
@@ -313,7 +313,7 @@ async def run_cycle(
             logger.exception("gainers_tracker_error")
         if trading_engine:
             try:
-                await trade_gainers(trading_engine, db, min_mcap=settings.PAPER_MIN_MCAP)
+                await trade_gainers(trading_engine, db, min_mcap=settings.PAPER_MIN_MCAP, settings=settings)
             except Exception:
                 logger.exception("gainers_trade_dispatch_error")
 
@@ -329,7 +329,7 @@ async def run_cycle(
             logger.exception("losers_tracker_error")
         if trading_engine:
             try:
-                await trade_losers(trading_engine, db, min_mcap=settings.PAPER_MIN_MCAP)
+                await trade_losers(trading_engine, db, min_mcap=settings.PAPER_MIN_MCAP, settings=settings)
             except Exception:
                 logger.exception("losers_trade_dispatch_error")
 
@@ -434,6 +434,7 @@ async def run_cycle(
             await trade_first_signals(
                 trading_engine, db, scored_for_trading,
                 min_mcap=settings.PAPER_MIN_MCAP,
+                settings=settings,
             )
 
     # Stages 4-5: Gate (MiroFish + conviction)
