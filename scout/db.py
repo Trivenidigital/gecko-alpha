@@ -1,5 +1,6 @@
 """Async SQLite database layer for CoinPump Scout."""
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,7 @@ class Database:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
         self._conn: aiosqlite.Connection | None = None
+        self._txn_lock: asyncio.Lock | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -52,6 +54,7 @@ class Database:
         """Open connection and create tables."""
         self._conn = await aiosqlite.connect(self._db_path)
         self._conn.row_factory = aiosqlite.Row
+        self._txn_lock = asyncio.Lock()
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._create_tables()
         await self._migrate_feedback_loop_schema()

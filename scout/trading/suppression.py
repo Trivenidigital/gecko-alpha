@@ -44,9 +44,24 @@ async def should_open(db: Database, combo_key: str, *, settings) -> tuple[bool, 
             (combo_key,),
         )
         row = await cursor.fetchone()
-    except aiosqlite.Error as e:
-        await _record_fallback(combo_key, str(e), settings)
-        return (True, "db_error_fallback_allow")
+    except aiosqlite.OperationalError as e:
+        msg = str(e).lower()
+        if "locked" in msg or "busy" in msg:
+            await _record_fallback(combo_key, str(e), settings)
+            return (True, "db_error_fallback_allow")
+        log.exception(
+            "suppression_db_operational_error",
+            err_id="SUPP_DB_OP",
+            combo_key=combo_key,
+        )
+        return (False, "error")
+    except aiosqlite.Error:
+        log.exception(
+            "suppression_db_error",
+            err_id="SUPP_DB_CORRUPT",
+            combo_key=combo_key,
+        )
+        return (False, "error")
 
     if row is None:
         return (True, "cold_start")
@@ -69,45 +84,66 @@ async def should_open(db: Database, combo_key: str, *, settings) -> tuple[bool, 
     if parole_dt > datetime.now(timezone.utc):
         return (False, "suppressed")
 
-    # Parole window open — atomic decrement via BEGIN IMMEDIATE.
-    # Note: aiosqlite serializes statements against a single Connection object.
-    # BEGIN IMMEDIATE acquires a RESERVED lock at the SQLite file level, so
-    # when two separate Connection objects (e.g. two Database instances at
-    # the same file) race, the second BEGIN IMMEDIATE blocks until the first
-    # commits — SQLite's per-file locking enforces the invariant. Same-conn
-    # "nested BEGIN" is NOT a concurrency case in an asyncio single-loop
-    # process; see test_concurrent_decrement_grants_only_one.
-    try:
-        await db._conn.execute("BEGIN IMMEDIATE")
-        cur = await db._conn.execute(
-            "SELECT parole_trades_remaining FROM combo_performance "
-            "WHERE combo_key = ? AND window = '30d'",
-            (combo_key,),
-        )
-        reread = await cur.fetchone()
-        remaining = reread[0] if reread else 0
-        if remaining is None or remaining <= 0:
-            await db._conn.execute("COMMIT")
-            return (False, "parole_exhausted")
-        await db._conn.execute(
-            "UPDATE combo_performance SET parole_trades_remaining = ? "
-            "WHERE combo_key = ? AND window = '30d'",
-            (remaining - 1, combo_key),
-        )
-        await db._conn.commit()
-        return (True, "parole_retest")
-    except aiosqlite.Error as e:
+    # Parole window open — atomic decrement via BEGIN IMMEDIATE + asyncio.Lock.
+    # The asyncio.Lock ensures that two coroutines within the same event loop
+    # (e.g. suppression.should_open and combo_refresh.refresh_combo) cannot
+    # interleave their BEGIN...COMMIT blocks across asyncio suspend points.
+    # SQLite's per-file locking still protects against separate Connection
+    # objects (see test_concurrent_decrement_grants_only_one).
+    lock = db._txn_lock
+    if lock is None:
+        lock = asyncio.Lock()
+    async with lock:
         try:
-            await db._conn.execute("ROLLBACK")
-        except aiosqlite.Error as rb_err:
-            log.warning(
-                "suppression_rollback_failed",
-                combo_key=combo_key,
-                err=str(rb_err),
-                err_id="SUPP_ROLLBACK",
+            await db._conn.execute("BEGIN IMMEDIATE")
+            cur = await db._conn.execute(
+                "SELECT parole_trades_remaining FROM combo_performance "
+                "WHERE combo_key = ? AND window = '30d'",
+                (combo_key,),
             )
-        await _record_fallback(combo_key, f"parole_decrement: {e}", settings)
-        return (True, "db_error_fallback_allow")
+            reread = await cur.fetchone()
+            remaining = reread[0] if reread else 0
+            if remaining is None or remaining <= 0:
+                await db._conn.execute("COMMIT")
+                return (False, "parole_exhausted")
+            await db._conn.execute(
+                "UPDATE combo_performance SET parole_trades_remaining = ? "
+                "WHERE combo_key = ? AND window = '30d'",
+                (remaining - 1, combo_key),
+            )
+            await db._conn.commit()
+            return (True, "parole_retest")
+        except aiosqlite.OperationalError as e:
+            try:
+                await db._conn.execute("ROLLBACK")
+            except aiosqlite.Error as rb_err:
+                log.warning(
+                    "suppression_rollback_failed",
+                    combo_key=combo_key,
+                    err=str(rb_err),
+                    err_id="SUPP_ROLLBACK",
+                )
+            msg = str(e).lower()
+            if "locked" in msg or "busy" in msg:
+                await _record_fallback(combo_key, f"parole_decrement: {e}", settings)
+                return (True, "db_error_fallback_allow")
+            log.exception(
+                "suppression_db_operational_error",
+                err_id="SUPP_DB_OP",
+                combo_key=combo_key,
+            )
+            return (False, "error")
+        except aiosqlite.Error:
+            try:
+                await db._conn.execute("ROLLBACK")
+            except aiosqlite.Error:
+                pass
+            log.exception(
+                "suppression_db_error",
+                err_id="SUPP_DB_CORRUPT",
+                combo_key=combo_key,
+            )
+            return (False, "error")
 
 
 async def _record_fallback(combo_key: str, err: str, settings) -> None:

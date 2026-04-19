@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
+import aiosqlite
 import structlog
 
 from scout.db import Database
@@ -15,6 +17,18 @@ async def refresh_combo(db: Database, combo_key: str, settings) -> bool:
     """Recompute 7d + 30d rows for `combo_key`. Apply suppression rule to 30d.
     Returns True on success, False otherwise.
     """
+    # Acquire the shared asyncio.Lock so the multi-statement read→write
+    # sequence here cannot interleave with should_open's BEGIN...COMMIT block
+    # across asyncio suspend points within the same event loop.
+    lock = db._txn_lock
+    if lock is None:
+        lock = asyncio.Lock()
+    async with lock:
+        return await _refresh_combo_locked(db, combo_key, settings)
+
+
+async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
+    """Inner implementation — called with db._txn_lock already held."""
     try:
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
@@ -30,7 +44,7 @@ async def refresh_combo(db: Database, combo_key: str, settings) -> bool:
                      COALESCE(AVG(pnl_pct), 0) AS avg_pnl_pct
                    FROM paper_trades
                    WHERE signal_combo = ?
-                     AND status != 'open'
+                     AND status IN ('closed_tp', 'closed_sl', 'closed_expired')
                      AND closed_at >= ?""",
                 (combo_key, (now - timedelta(days=days)).isoformat()),
             )
@@ -164,7 +178,7 @@ async def refresh_combo(db: Database, combo_key: str, settings) -> bool:
         )
         await db._conn.commit()
         return True
-    except Exception as e:
+    except (aiosqlite.Error, ValueError) as e:
         log.error(
             "combo_refresh_error",
             combo_key=combo_key,
@@ -172,9 +186,14 @@ async def refresh_combo(db: Database, combo_key: str, settings) -> bool:
             err_id="COMBO_REFRESH",
         )
         try:
+            # Scope failure increment to the 30d window only: the 30d row drives
+            # suppression decisions and the chronic-failure alert. Incrementing
+            # both windows caused the alert to fire at half the expected day count
+            # (each single refresh failure would increment two rows, so the
+            # chronic threshold appeared reached after threshold/2 days).
             await db._conn.execute(
                 "UPDATE combo_performance SET refresh_failures = refresh_failures + 1 "
-                "WHERE combo_key = ?",
+                "WHERE combo_key = ? AND window = '30d'",
                 (combo_key,),
             )
             await db._conn.commit()
@@ -214,7 +233,8 @@ async def refresh_all(db: Database, settings) -> dict:
             failed += 1
 
     cur = await db._conn.execute(
-        "SELECT combo_key FROM combo_performance " "WHERE refresh_failures >= ?",
+        "SELECT combo_key FROM combo_performance "
+        "WHERE window = '30d' AND refresh_failures >= ?",
         (settings.FEEDBACK_CHRONIC_FAILURE_THRESHOLD,),
     )
     chronic = [r[0] for r in await cur.fetchall()]
