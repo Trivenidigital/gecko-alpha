@@ -14,8 +14,14 @@ def build_seed(
     string matching PRD Section 8.2 seed format.
     """
     age_hours = int(token.token_age_days * 24)
-    social = f"{token.social_mentions_24h} mentions in 24h" if token.social_mentions_24h > 0 else "None detected"
-    concept_description = f"{token.token_name} ({token.ticker}) is a {token.chain} token"
+    social = (
+        f"{token.social_mentions_24h} mentions in 24h"
+        if token.social_mentions_24h > 0
+        else "None detected"
+    )
+    concept_description = (
+        f"{token.token_name} ({token.ticker}) is a {token.chain} token"
+    )
 
     # Build quantitative context
     quant_lines = []

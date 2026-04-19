@@ -73,6 +73,7 @@ async def test_signals_fired_persisted(db, token_factory):
     candidates = await db.get_candidates_above_score(0)
     assert len(candidates) == 1
     import json
+
     signals = json.loads(candidates[0]["signals_fired"])
     assert signals == ["vol_liq_ratio", "holder_growth", "market_cap_range"]
 

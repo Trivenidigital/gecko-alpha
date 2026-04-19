@@ -1,4 +1,5 @@
 """End-to-end conviction chain integration test."""
+
 from datetime import datetime, timezone
 
 import pytest
@@ -7,7 +8,6 @@ from scout.chains.events import emit_event
 from scout.chains.patterns import seed_built_in_patterns
 from scout.chains.tracker import check_chains, get_active_boosts
 from scout.db import Database
-
 
 _CHAIN_DEFAULTS = dict(
     CHAIN_CHECK_INTERVAL_SEC=300,
@@ -43,19 +43,32 @@ def _patch_get_settings(monkeypatch, settings_factory):
 
 async def test_full_conviction_e2e(db, settings):
     await emit_event(
-        db, "cat-ai", "narrative", "category_heating",
+        db,
+        "cat-ai",
+        "narrative",
+        "category_heating",
         {"acceleration": 8.0, "volume_growth_pct": 40.0, "market_regime": "BULL"},
         "narrative.observer",
     )
     await emit_event(
-        db, "cat-ai", "narrative", "laggard_picked",
+        db,
+        "cat-ai",
+        "narrative",
+        "laggard_picked",
         {"narrative_fit_score": 80, "confidence": "High", "trigger_count": 2},
         "narrative.predictor",
     )
     await emit_event(
-        db, "cat-ai", "narrative", "counter_scored",
-        {"risk_score": 20, "flag_count": 0, "high_severity_count": 0,
-         "data_completeness": "full"},
+        db,
+        "cat-ai",
+        "narrative",
+        "counter_scored",
+        {
+            "risk_score": 20,
+            "flag_count": 0,
+            "high_severity_count": 0,
+            "data_completeness": "full",
+        },
         "counter.scorer",
     )
     await check_chains(db, settings)
@@ -105,7 +118,9 @@ async def test_gate_applies_chain_boost(db, settings_factory, monkeypatch):
     monkeypatch.setattr(gate_mod, "_get_narrative_score", _no_narrative)
 
     local_settings = settings_factory(
-        **_CHAIN_DEFAULTS, CONVICTION_THRESHOLD=70, MIN_SCORE=999,
+        **_CHAIN_DEFAULTS,
+        CONVICTION_THRESHOLD=70,
+        MIN_SCORE=999,
     )
 
     import aiohttp

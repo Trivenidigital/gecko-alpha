@@ -110,8 +110,12 @@ class CandidateToken(BaseModel):
             market_cap_usd=float(data.get("fdv") or 0),
             liquidity_usd=float((data.get("liquidity") or {}).get("usd") or 0),
             volume_24h_usd=float((data.get("volume") or {}).get("h24") or 0),
-            price_change_1h=float(price_change_1h) if price_change_1h is not None else None,
-            price_change_24h=float(price_change_24h) if price_change_24h is not None else None,
+            price_change_1h=(
+                float(price_change_1h) if price_change_1h is not None else None
+            ),
+            price_change_24h=(
+                float(price_change_24h) if price_change_24h is not None else None
+            ),
             txns_h1_buys=txns_h1_buys,
             txns_h1_sells=txns_h1_sells,
             holder_count=0,

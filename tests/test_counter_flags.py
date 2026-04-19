@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from scout.counter.flags import compute_memecoin_flags, compute_narrative_flags
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _flag_names(flags):
     return {f.flag for f in flags}
@@ -95,10 +95,15 @@ class TestNarrativeMismatch:
 
 def test_overvalued_vs_leaders_medium():
     flags = compute_narrative_flags(
-        price_change_30d=10.0, commits_4w=50, reddit_subs=5000,
-        sentiment_up_pct=60.0, narrative_fit_score=75,
-        token_vol_change_24h=10.0, category_vol_growth_pct=15.0,
-        market_cap=60e6, category_leader_mcap=100e6,
+        price_change_30d=10.0,
+        commits_4w=50,
+        reddit_subs=5000,
+        sentiment_up_pct=60.0,
+        narrative_fit_score=75,
+        token_vol_change_24h=10.0,
+        category_vol_growth_pct=15.0,
+        market_cap=60e6,
+        category_leader_mcap=100e6,
     )
     over = [f for f in flags if f.flag == "overvalued_vs_leaders"]
     assert len(over) == 1
@@ -107,10 +112,15 @@ def test_overvalued_vs_leaders_medium():
 
 def test_overvalued_not_triggered():
     flags = compute_narrative_flags(
-        price_change_30d=10.0, commits_4w=50, reddit_subs=5000,
-        sentiment_up_pct=60.0, narrative_fit_score=75,
-        token_vol_change_24h=10.0, category_vol_growth_pct=15.0,
-        market_cap=20e6, category_leader_mcap=100e6,
+        price_change_30d=10.0,
+        commits_4w=50,
+        reddit_subs=5000,
+        sentiment_up_pct=60.0,
+        narrative_fit_score=75,
+        token_vol_change_24h=10.0,
+        category_vol_growth_pct=15.0,
+        market_cap=20e6,
+        category_leader_mcap=100e6,
     )
     over = [f for f in flags if f.flag == "overvalued_vs_leaders"]
     assert len(over) == 0
@@ -119,9 +129,13 @@ def test_overvalued_not_triggered():
 def test_volume_divergence_exact_boundary_no_trigger():
     """Exact -10 and +10 should NOT trigger (needs strictly < and >)."""
     flags = compute_narrative_flags(
-        price_change_30d=10.0, commits_4w=50, reddit_subs=5000,
-        sentiment_up_pct=60.0, narrative_fit_score=75,
-        token_vol_change_24h=-10.0, category_vol_growth_pct=10.0,
+        price_change_30d=10.0,
+        commits_4w=50,
+        reddit_subs=5000,
+        sentiment_up_pct=60.0,
+        narrative_fit_score=75,
+        token_vol_change_24h=-10.0,
+        category_vol_growth_pct=10.0,
     )
     div = [f for f in flags if f.flag == "volume_divergence"]
     assert len(div) == 0

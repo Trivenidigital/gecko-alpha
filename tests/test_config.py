@@ -92,3 +92,45 @@ def test_settings_weight_sum_validation():
             QUANT_WEIGHT=0.7,
             NARRATIVE_WEIGHT=0.4,
         )
+
+
+def test_feedback_loop_defaults(monkeypatch):
+    """All feedback-loop settings have sensible defaults per spec §8."""
+    monkeypatch.delenv("FEEDBACK_SUPPRESSION_MIN_TRADES", raising=False)
+    monkeypatch.delenv("FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT", raising=False)
+    monkeypatch.delenv("FEEDBACK_PAROLE_DAYS", raising=False)
+    monkeypatch.delenv("FEEDBACK_PAROLE_RETEST_TRADES", raising=False)
+    monkeypatch.delenv("FEEDBACK_MIN_LEADERBOARD_TRADES", raising=False)
+    monkeypatch.delenv("FEEDBACK_MISSED_WINNER_MIN_PCT", raising=False)
+    monkeypatch.delenv("FEEDBACK_MISSED_WINNER_MIN_MCAP", raising=False)
+    monkeypatch.delenv("FEEDBACK_MISSED_WINNER_WINDOW_MIN", raising=False)
+    monkeypatch.delenv("FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN", raising=False)
+    monkeypatch.delenv("FEEDBACK_WEEKLY_DIGEST_WEEKDAY", raising=False)
+    monkeypatch.delenv("FEEDBACK_WEEKLY_DIGEST_HOUR", raising=False)
+    monkeypatch.delenv("FEEDBACK_COMBO_REFRESH_HOUR", raising=False)
+    monkeypatch.delenv("FEEDBACK_FALLBACK_ALERT_THRESHOLD", raising=False)
+    monkeypatch.delenv("FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC", raising=False)
+    monkeypatch.delenv("FEEDBACK_CHRONIC_FAILURE_THRESHOLD", raising=False)
+
+    from scout.config import Settings
+
+    s = Settings(
+        TELEGRAM_BOT_TOKEN="test",
+        TELEGRAM_CHAT_ID="test",
+        ANTHROPIC_API_KEY="test",
+    )
+    assert s.FEEDBACK_SUPPRESSION_MIN_TRADES == 20
+    assert s.FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT == 30.0
+    assert s.FEEDBACK_PAROLE_DAYS == 14
+    assert s.FEEDBACK_PAROLE_RETEST_TRADES == 5
+    assert s.FEEDBACK_MIN_LEADERBOARD_TRADES == 10
+    assert s.FEEDBACK_MISSED_WINNER_MIN_PCT == 50.0
+    assert s.FEEDBACK_MISSED_WINNER_MIN_MCAP == 5_000_000
+    assert s.FEEDBACK_MISSED_WINNER_WINDOW_MIN == 30
+    assert s.FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN == 60
+    assert s.FEEDBACK_WEEKLY_DIGEST_WEEKDAY == 6
+    assert s.FEEDBACK_WEEKLY_DIGEST_HOUR == 9
+    assert s.FEEDBACK_COMBO_REFRESH_HOUR == 3
+    assert s.FEEDBACK_FALLBACK_ALERT_THRESHOLD == 5
+    assert s.FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC == 900
+    assert s.FEEDBACK_CHRONIC_FAILURE_THRESHOLD == 3

@@ -22,6 +22,7 @@ async def db(tmp_path):
 
 # -- Helpers --
 
+
 def _make_raw_coin(
     coin_id: str,
     change_24h: float = -20.0,
@@ -40,6 +41,7 @@ def _make_raw_coin(
 
 
 # -- Tests --
+
 
 async def test_store_top_losers_basic(db):
     raw = [
@@ -139,7 +141,17 @@ async def test_compare_losers_detects_spikes(db):
            (coin_id, symbol, name, current_volume, avg_volume_7d,
             spike_ratio, market_cap, price, price_change_24h, detected_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '-3 hours'))""",
-        ("spiked-coin", "SPK", "Spiked", 2_000_000, 200_000, 10.0, 50_000_000, 1.0, -20.0),
+        (
+            "spiked-coin",
+            "SPK",
+            "Spiked",
+            2_000_000,
+            200_000,
+            10.0,
+            50_000_000,
+            1.0,
+            -20.0,
+        ),
     )
     await db._conn.commit()
 
@@ -191,10 +203,15 @@ async def test_get_losers_stats(db):
                (coin_id, symbol, name, price_change_24h, appeared_on_losers_at,
                 detected_by_pipeline, pipeline_lead_minutes, is_gap)
                VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?)""",
-            (coin_id, coin_id[:3].upper(), coin_id.title(), -25.0,
-             1 if not is_gap else 0,
-             60.0 if not is_gap else None,
-             is_gap),
+            (
+                coin_id,
+                coin_id[:3].upper(),
+                coin_id.title(),
+                -25.0,
+                1 if not is_gap else 0,
+                60.0 if not is_gap else None,
+                is_gap,
+            ),
         )
     await db._conn.commit()
 

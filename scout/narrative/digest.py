@@ -31,7 +31,9 @@ def format_heating_alert(
     if predictions:
         lines.append(f"Market regime: {predictions[0].market_regime}")
     if accel.coin_count_change is not None and accel.coin_count_change < -5:
-        lines.append(f"Warning: coin count dropped by {abs(accel.coin_count_change)} (survivorship risk)")
+        lines.append(
+            f"Warning: coin count dropped by {abs(accel.coin_count_change)} (survivorship risk)"
+        )
     return "\n".join(lines)
 
 
@@ -74,7 +76,9 @@ def format_daily_digest(
     if changes:
         lines.append(f"Strategy changes: {len(changes)}")
         for c in changes[:3]:
-            lines.append(f"  {c.get('key', '?')}: {c.get('new_value', '?')} — {c.get('reason', '')[:80]}")
+            lines.append(
+                f"  {c.get('key', '?')}: {c.get('new_value', '?')} — {c.get('reason', '')[:80]}"
+            )
     else:
         lines.append("Strategy changes: None")
 

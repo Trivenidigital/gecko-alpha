@@ -1,4 +1,5 @@
 """Tests for PaperTrader -- simulated trade execution with slippage."""
+
 import json
 from datetime import datetime, timezone
 
@@ -36,6 +37,7 @@ async def test_execute_buy_inserts_trade(db, trader):
         tp_pct=20.0,
         sl_pct=10.0,
         slippage_bps=50,
+        signal_combo="volume_spike",
     )
     assert trade_id is not None
     cursor = await db._conn.execute(
@@ -61,6 +63,7 @@ async def test_execute_buy_applies_slippage(db, trader):
         tp_pct=20.0,
         sl_pct=10.0,
         slippage_bps=100,  # 1%
+        signal_combo="volume_spike",
     )
     cursor = await db._conn.execute(
         "SELECT entry_price, quantity FROM paper_trades WHERE id = ?", (trade_id,)
@@ -87,6 +90,7 @@ async def test_execute_buy_computes_tp_sl_prices(db, trader):
         tp_pct=20.0,
         sl_pct=10.0,
         slippage_bps=0,  # no slippage
+        signal_combo="narrative_prediction",
     )
     cursor = await db._conn.execute(
         "SELECT tp_price, sl_price FROM paper_trades WHERE id = ?", (trade_id,)
@@ -113,6 +117,7 @@ async def test_execute_sell_closes_trade(db, trader):
         tp_pct=20.0,
         sl_pct=10.0,
         slippage_bps=0,
+        signal_combo="volume_spike",
     )
     await trader.execute_sell(
         db=db,
@@ -147,6 +152,7 @@ async def test_execute_sell_applies_exit_slippage(db, trader):
         tp_pct=20.0,
         sl_pct=10.0,
         slippage_bps=0,
+        signal_combo="volume_spike",
     )
     await trader.execute_sell(
         db=db,
@@ -156,7 +162,8 @@ async def test_execute_sell_applies_exit_slippage(db, trader):
         slippage_bps=100,  # 1% exit slippage
     )
     cursor = await db._conn.execute(
-        "SELECT exit_price FROM paper_trades WHERE id = ?", (trade_id,),
+        "SELECT exit_price FROM paper_trades WHERE id = ?",
+        (trade_id,),
     )
     row = dict(await cursor.fetchone())
     # effective_exit = 12000 * (1 - 100/10000) = 11880
@@ -178,6 +185,7 @@ async def test_execute_sell_stop_loss_pnl(db, trader):
         tp_pct=20.0,
         sl_pct=10.0,
         slippage_bps=0,
+        signal_combo="volume_spike",
     )
     await trader.execute_sell(
         db=db,
@@ -187,7 +195,8 @@ async def test_execute_sell_stop_loss_pnl(db, trader):
         slippage_bps=0,
     )
     cursor = await db._conn.execute(
-        "SELECT pnl_usd, pnl_pct FROM paper_trades WHERE id = ?", (trade_id,),
+        "SELECT pnl_usd, pnl_pct FROM paper_trades WHERE id = ?",
+        (trade_id,),
     )
     row = dict(await cursor.fetchone())
     assert row["pnl_pct"] == pytest.approx(-10.0)

@@ -38,12 +38,18 @@ async def evaluate(
         daily_count = await db.get_daily_mirofish_count()
         if daily_count < settings.MAX_MIROFISH_JOBS_PER_DAY:
             narrative_score = await _get_narrative_score(
-                token, session, db, settings, signals_fired=signals_fired,
+                token,
+                session,
+                db,
+                settings,
+                signals_fired=signals_fired,
             )
 
     # Compute conviction score
     if narrative_score is not None:
-        conviction = (quant_score * settings.QUANT_WEIGHT) + (narrative_score * settings.NARRATIVE_WEIGHT)
+        conviction = (quant_score * settings.QUANT_WEIGHT) + (
+            narrative_score * settings.NARRATIVE_WEIGHT
+        )
     else:
         conviction = float(quant_score)
 
@@ -65,10 +71,12 @@ async def evaluate(
     should_alert = conviction >= settings.CONVICTION_THRESHOLD
 
     # Update token with scores
-    updated = token.model_copy(update={
-        "narrative_score": narrative_score,
-        "conviction_score": conviction,
-    })
+    updated = token.model_copy(
+        update={
+            "narrative_score": narrative_score,
+            "conviction_score": conviction,
+        }
+    )
 
     # Emit conviction_gated chain event (unconditional — not gated by should_alert).
     await safe_emit(
@@ -79,7 +87,9 @@ async def evaluate(
         event_data={
             "conviction_score": float(conviction),
             "quant_score": int(quant_score),
-            "narrative_score": int(narrative_score) if narrative_score is not None else None,
+            "narrative_score": (
+                int(narrative_score) if narrative_score is not None else None
+            ),
             "should_alert": bool(should_alert),
         },
         source_module="gate",
@@ -104,11 +114,19 @@ async def _get_narrative_score(
         await db.log_mirofish_job(token.contract_address)
         return result.narrative_score
     except (MiroFishTimeoutError, MiroFishConnectionError) as e:
-        logger.warning("MiroFish failed, falling back to Anthropic", contract_address=token.contract_address, error=str(e))
+        logger.warning(
+            "MiroFish failed, falling back to Anthropic",
+            contract_address=token.contract_address,
+            error=str(e),
+        )
         try:
             result = await score_narrative_fallback(seed, settings.ANTHROPIC_API_KEY)
             await db.log_mirofish_job(token.contract_address)
             return result.narrative_score
         except Exception as e:
-            logger.error("Anthropic fallback also failed", contract_address=token.contract_address, error=str(e))
+            logger.error(
+                "Anthropic fallback also failed",
+                contract_address=token.contract_address,
+                error=str(e),
+            )
             return None

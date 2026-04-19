@@ -5,7 +5,11 @@ from datetime import datetime, timedelta, timezone
 import structlog
 
 from scout import heartbeat as heartbeat_module
-from scout.heartbeat import _heartbeat_stats, _maybe_emit_heartbeat, _reset_heartbeat_stats
+from scout.heartbeat import (
+    _heartbeat_stats,
+    _maybe_emit_heartbeat,
+    _reset_heartbeat_stats,
+)
 
 
 class _FakeSettings:
@@ -118,7 +122,6 @@ def test_custom_interval_respected(monkeypatch):
     emitted = _maybe_emit_heartbeat(_FastSettings())
     assert emitted is True
     assert captured[0][0] == "heartbeat"
-
 
 
 def test_memecoin_and_narrative_counters_independent(monkeypatch):

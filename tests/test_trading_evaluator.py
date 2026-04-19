@@ -1,4 +1,5 @@
 """Tests for paper trade evaluator -- checkpoints, TP/SL, expiry, batch lookup."""
+
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -18,6 +19,7 @@ async def db(tmp_path):
 
 def _settings_factory(tmp_path, **overrides):
     from scout.config import Settings
+
     defaults = dict(
         TELEGRAM_BOT_TOKEN="test",
         TELEGRAM_CHAT_ID="test",
@@ -56,12 +58,21 @@ async def _insert_trade(db, token_id, entry_price, opened_at, **kwargs):
             status, opened_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            token_id, defaults["symbol"], defaults["name"], defaults["chain"],
-            defaults["signal_type"], defaults["signal_data"],
-            entry_price, defaults["amount_usd"], defaults["quantity"],
-            defaults["tp_pct"], defaults["sl_pct"],
-            defaults["tp_price"], defaults["sl_price"],
-            defaults["status"], opened_at.isoformat(),
+            token_id,
+            defaults["symbol"],
+            defaults["name"],
+            defaults["chain"],
+            defaults["signal_type"],
+            defaults["signal_data"],
+            entry_price,
+            defaults["amount_usd"],
+            defaults["quantity"],
+            defaults["tp_pct"],
+            defaults["sl_pct"],
+            defaults["tp_price"],
+            defaults["sl_price"],
+            defaults["status"],
+            opened_at.isoformat(),
         ),
     )
     await db._conn.commit()
@@ -109,7 +120,8 @@ async def test_tp_closure(db, tmp_path):
     await evaluate_paper_trades(db, settings)
 
     cursor = await db._conn.execute(
-        "SELECT status, exit_reason FROM paper_trades WHERE id = ?", (trade_id,),
+        "SELECT status, exit_reason FROM paper_trades WHERE id = ?",
+        (trade_id,),
     )
     row = await cursor.fetchone()
     assert row[0] == "closed_tp"
@@ -127,7 +139,8 @@ async def test_sl_closure(db, tmp_path):
     await evaluate_paper_trades(db, settings)
 
     cursor = await db._conn.execute(
-        "SELECT status, exit_reason FROM paper_trades WHERE id = ?", (trade_id,),
+        "SELECT status, exit_reason FROM paper_trades WHERE id = ?",
+        (trade_id,),
     )
     row = await cursor.fetchone()
     assert row[0] == "closed_sl"
@@ -144,7 +157,8 @@ async def test_expiry_closure(db, tmp_path):
     await evaluate_paper_trades(db, settings)
 
     cursor = await db._conn.execute(
-        "SELECT status, exit_reason FROM paper_trades WHERE id = ?", (trade_id,),
+        "SELECT status, exit_reason FROM paper_trades WHERE id = ?",
+        (trade_id,),
     )
     row = await cursor.fetchone()
     assert row[0] == "closed_expired"
@@ -162,7 +176,8 @@ async def test_peak_tracking(db, tmp_path):
     await evaluate_paper_trades(db, settings)
 
     cursor = await db._conn.execute(
-        "SELECT peak_price, peak_pct FROM paper_trades WHERE id = ?", (trade_id,),
+        "SELECT peak_price, peak_pct FROM paper_trades WHERE id = ?",
+        (trade_id,),
     )
     row = await cursor.fetchone()
     assert row[0] == pytest.approx(55000.0)
@@ -219,7 +234,8 @@ async def test_skips_trade_with_no_price(db, tmp_path):
 
     # Trade should remain open, unchanged
     cursor = await db._conn.execute(
-        "SELECT status, peak_price FROM paper_trades WHERE id = ?", (trade_id,),
+        "SELECT status, peak_price FROM paper_trades WHERE id = ?",
+        (trade_id,),
     )
     row = await cursor.fetchone()
     assert row[0] == "open"

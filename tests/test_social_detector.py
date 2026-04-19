@@ -101,7 +101,9 @@ def test_check_interactions_accel_requires_full_ring():
 
 def test_check_interactions_accel_fires():
     """Full 6-slot ring with 3x oldest value fires."""
-    state = _state(interactions_ring=[1_000.0, 1_100.0, 1_200.0, 1_300.0, 1_400.0, 1_500.0])
+    state = _state(
+        interactions_ring=[1_000.0, 1_100.0, 1_200.0, 1_300.0, 1_400.0, 1_500.0]
+    )
     coin = {"interactions_24h": 5_000.0}  # 5x oldest (1000)
     ratio = check_interactions_accel(coin, state, ratio=3.0)
     assert ratio is not None
@@ -177,7 +179,9 @@ async def test_detect_spikes_cold_start_suppression(db):
     # Bump to 288 -> should fire
     cache.set(
         "foo",
-        _state(coin_id="foo", symbol="FOO", avg_social_volume_24h=100.0, sample_count=288),
+        _state(
+            coin_id="foo", symbol="FOO", avg_social_volume_24h=100.0, sample_count=288
+        ),
     )
     alerts, _ = await detect_spikes(db, s, cache, coins)
     assert len(alerts) == 1
@@ -190,7 +194,9 @@ async def test_detect_spikes_dedup_boundary_exactly_4h(db):
     cache = BaselineCache()
     cache.set(
         "foo",
-        _state(coin_id="foo", symbol="FOO", avg_social_volume_24h=100.0, sample_count=300),
+        _state(
+            coin_id="foo", symbol="FOO", avg_social_volume_24h=100.0, sample_count=300
+        ),
     )
 
     # Insert a row 3h 59m ago -- should dedup. alerted_at must be non-NULL
@@ -219,7 +225,9 @@ async def test_detect_spikes_dedup_just_past_cutoff_re_fires(db):
     cache = BaselineCache()
     cache.set(
         "foo",
-        _state(coin_id="foo", symbol="FOO", avg_social_volume_24h=100.0, sample_count=300),
+        _state(
+            coin_id="foo", symbol="FOO", avg_social_volume_24h=100.0, sample_count=300
+        ),
     )
     await db._conn.execute(
         """INSERT INTO social_signals (coin_id, symbol, name, detected_at, alerted_at)
@@ -271,7 +279,9 @@ async def test_detect_spikes_increments_sample_count_for_all_coins(db):
     cache = BaselineCache()
     cache.set(
         "foo",
-        _state(coin_id="foo", symbol="FOO", avg_social_volume_24h=100.0, sample_count=50),
+        _state(
+            coin_id="foo", symbol="FOO", avg_social_volume_24h=100.0, sample_count=50
+        ),
     )
     coins = [{"id": "foo", "symbol": "FOO", "name": "Foo", "social_volume_24h": 110.0}]
     await detect_spikes(db, s, cache, coins)

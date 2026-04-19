@@ -268,9 +268,7 @@ async def detect_7d_momentum(
     return results
 
 
-async def get_recent_momentum_7d(
-    db: "Database", limit: int = 20
-) -> list[dict]:
+async def get_recent_momentum_7d(db: "Database", limit: int = 20) -> list[dict]:
     """Get recent 7d momentum detections for the dashboard."""
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
@@ -303,10 +301,8 @@ async def get_momentum_7d_stats(db: "Database") -> dict:
     )
     week_count = (await cursor.fetchone())[0]
 
-    cursor = await db._conn.execute(
-        """SELECT AVG(price_change_7d) FROM momentum_7d
-           WHERE datetime(detected_at) >= datetime('now', '-7 days')"""
-    )
+    cursor = await db._conn.execute("""SELECT AVG(price_change_7d) FROM momentum_7d
+           WHERE datetime(detected_at) >= datetime('now', '-7 days')""")
     row = await cursor.fetchone()
     avg_change = round(row[0], 1) if row and row[0] else 0.0
 
@@ -317,9 +313,7 @@ async def get_momentum_7d_stats(db: "Database") -> dict:
     }
 
 
-async def get_recent_spikes(
-    db: "Database", limit: int = 20
-) -> list[dict]:
+async def get_recent_spikes(db: "Database", limit: int = 20) -> list[dict]:
     """Get recent volume spikes for the dashboard."""
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
@@ -352,10 +346,8 @@ async def get_spike_stats(db: "Database") -> dict:
     )
     week_count = (await cursor.fetchone())[0]
 
-    cursor = await db._conn.execute(
-        """SELECT AVG(spike_ratio) FROM volume_spikes
-           WHERE datetime(detected_at) >= datetime('now', '-7 days')"""
-    )
+    cursor = await db._conn.execute("""SELECT AVG(spike_ratio) FROM volume_spikes
+           WHERE datetime(detected_at) >= datetime('now', '-7 days')""")
     row = await cursor.fetchone()
     avg_ratio = round(row[0], 2) if row and row[0] else 0.0
 

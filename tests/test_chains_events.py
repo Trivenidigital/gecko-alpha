@@ -1,4 +1,5 @@
 """Tests for chain event emission + retention."""
+
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -90,7 +91,9 @@ async def test_prune_old_events(db):
     assert row[0] == 1
 
 
-async def test_emit_event_swallows_errors_via_safe_emit(db, monkeypatch, settings_factory):
+async def test_emit_event_swallows_errors_via_safe_emit(
+    db, monkeypatch, settings_factory
+):
     """safe_emit wraps emit_event and never raises."""
     enabled_settings = settings_factory(CHAINS_ENABLED=True)
     monkeypatch.setattr(
@@ -118,8 +121,12 @@ async def test_safe_emit_noop_when_disabled(db, monkeypatch, settings_factory):
         before = (await cur.fetchone())[0]
 
     result = await safe_emit(
-        db, "0xabc", "memecoin", "candidate_scored",
-        {"quant_score": 72}, "scorer",
+        db,
+        "0xabc",
+        "memecoin",
+        "candidate_scored",
+        {"quant_score": 72},
+        "scorer",
     )
     assert result is None
 

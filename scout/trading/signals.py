@@ -12,20 +12,36 @@ one-off signal queries would add complexity without benefit.
 import structlog
 
 from scout.db import Database
+from scout.trading.combo_key import build_combo_key
+from scout.trading.suppression import should_open
 
 logger = structlog.get_logger()
 
 
-async def trade_volume_spikes(engine, db: Database, spikes: list[dict]) -> None:
+async def trade_volume_spikes(
+    engine, db: Database, spikes: list[dict], settings
+) -> None:
     """Open paper trades for detected volume spikes."""
     for spike in spikes:
         try:
+            combo_key = build_combo_key(signal_type="volume_spike", signals=None)
+            allow, reason = await should_open(db, combo_key, settings=settings)
+            if not allow:
+                logger.info(
+                    "signal_suppressed",
+                    combo_key=combo_key,
+                    reason=reason,
+                    coin_id=spike.get("coin_id"),
+                    signal_type="volume_spike",
+                )
+                continue
             await engine.open_trade(
                 token_id=spike["coin_id"],
                 chain="coingecko",
                 signal_type="volume_spike",
                 signal_data={"spike_ratio": spike.get("spike_ratio", 0)},
                 entry_price=spike.get("current_price"),
+                signal_combo=combo_key,
             )
         except Exception:
             logger.exception(
@@ -34,7 +50,9 @@ async def trade_volume_spikes(engine, db: Database, spikes: list[dict]) -> None:
             )
 
 
-async def trade_gainers(engine, db: Database, min_mcap: float = 5_000_000) -> None:
+async def trade_gainers(
+    engine, db: Database, min_mcap: float = 5_000_000, *, settings
+) -> None:
     """Open paper trades for newly detected top gainers.
 
     Filter: market_cap >= min_mcap to skip micro-cap junk.
@@ -52,7 +70,8 @@ async def trade_gainers(engine, db: Database, min_mcap: float = 5_000_000) -> No
         new_gainers = await cursor.fetchall()
         skipped_null_mcap = sum(1 for g in new_gainers if g["market_cap"] is None)
         skipped_low_mcap = sum(
-            1 for g in new_gainers
+            1
+            for g in new_gainers
             if g["market_cap"] is not None and g["market_cap"] < min_mcap
         )
         if skipped_null_mcap or skipped_low_mcap:
@@ -67,6 +86,17 @@ async def trade_gainers(engine, db: Database, min_mcap: float = 5_000_000) -> No
             if (g["market_cap"] or 0) < min_mcap:
                 continue
             try:
+                combo_key = build_combo_key(signal_type="gainers_early", signals=None)
+                allow, reason = await should_open(db, combo_key, settings=settings)
+                if not allow:
+                    logger.info(
+                        "signal_suppressed",
+                        combo_key=combo_key,
+                        reason=reason,
+                        coin_id=g["coin_id"],
+                        signal_type="gainers_early",
+                    )
+                    continue
                 await engine.open_trade(
                     token_id=g["coin_id"],
                     symbol=g["symbol"],
@@ -78,6 +108,7 @@ async def trade_gainers(engine, db: Database, min_mcap: float = 5_000_000) -> No
                         "mcap": g["market_cap"],
                     },
                     entry_price=g["price_at_snapshot"],
+                    signal_combo=combo_key,
                 )
             except Exception:
                 logger.exception("trading_gainers_error", coin_id=g["coin_id"])
@@ -85,7 +116,9 @@ async def trade_gainers(engine, db: Database, min_mcap: float = 5_000_000) -> No
         logger.exception("trading_gainers_query_error")
 
 
-async def trade_losers(engine, db: Database, min_mcap: float = 5_000_000) -> None:
+async def trade_losers(
+    engine, db: Database, min_mcap: float = 5_000_000, *, settings
+) -> None:
     """Open paper trades for newly detected top losers (contrarian play).
 
     Filter: market_cap >= min_mcap to skip micro-cap junk.
@@ -103,7 +136,8 @@ async def trade_losers(engine, db: Database, min_mcap: float = 5_000_000) -> Non
         new_losers = await cursor.fetchall()
         skipped_null_mcap = sum(1 for l in new_losers if l["market_cap"] is None)
         skipped_low_mcap = sum(
-            1 for l in new_losers
+            1
+            for l in new_losers
             if l["market_cap"] is not None and l["market_cap"] < min_mcap
         )
         if skipped_null_mcap or skipped_low_mcap:
@@ -118,6 +152,19 @@ async def trade_losers(engine, db: Database, min_mcap: float = 5_000_000) -> Non
             if (l["market_cap"] or 0) < min_mcap:
                 continue
             try:
+                combo_key = build_combo_key(
+                    signal_type="losers_contrarian", signals=None
+                )
+                allow, reason = await should_open(db, combo_key, settings=settings)
+                if not allow:
+                    logger.info(
+                        "signal_suppressed",
+                        combo_key=combo_key,
+                        reason=reason,
+                        coin_id=l["coin_id"],
+                        signal_type="losers_contrarian",
+                    )
+                    continue
                 loser_price = l["price_at_snapshot"]
                 if not loser_price:
                     pc = await db._conn.execute(
@@ -137,6 +184,7 @@ async def trade_losers(engine, db: Database, min_mcap: float = 5_000_000) -> Non
                         "mcap": l["market_cap"],
                     },
                     entry_price=loser_price,
+                    signal_combo=combo_key,
                 )
             except Exception:
                 logger.exception("trading_losers_error", coin_id=l["coin_id"])
@@ -145,7 +193,12 @@ async def trade_losers(engine, db: Database, min_mcap: float = 5_000_000) -> Non
 
 
 async def trade_first_signals(
-    engine, db: Database, scored_candidates: list, min_mcap: float = 5_000_000
+    engine,
+    db: Database,
+    scored_candidates: list,
+    min_mcap: float = 5_000_000,
+    *,
+    settings,
 ) -> None:
     """Open paper trades on first meaningful signal for each token.
 
@@ -166,6 +219,18 @@ async def trade_first_signals(
         if token.chain not in ("coingecko",):
             continue
         try:
+            sigs = signals_fired
+            combo_key = build_combo_key(signal_type="first_signal", signals=sigs)
+            allow, reason = await should_open(db, combo_key, settings=settings)
+            if not allow:
+                logger.info(
+                    "signal_suppressed",
+                    combo_key=combo_key,
+                    reason=reason,
+                    coin_id=token.contract_address,
+                    signal_type="first_signal",
+                )
+                continue
             pc = await db._conn.execute(
                 "SELECT current_price FROM price_cache WHERE coin_id = ?",
                 (token.contract_address,),
@@ -184,12 +249,15 @@ async def trade_first_signals(
                     "signals": signals_fired,
                 },
                 entry_price=price,
+                signal_combo=combo_key,
             )
         except Exception:
             logger.exception("trading_first_signal_error", token=token.ticker)
 
 
-async def trade_trending(engine, db: Database, max_mcap_rank: int = 1500) -> None:
+async def trade_trending(
+    engine, db: Database, max_mcap_rank: int = 1500, *, settings
+) -> None:
     """Open paper trades for newly trending tokens.
 
     Filter: market_cap_rank <= max_mcap_rank. CoinGecko rank is a rough
@@ -209,7 +277,8 @@ async def trade_trending(engine, db: Database, max_mcap_rank: int = 1500) -> Non
         new_trending = await cursor.fetchall()
         skipped_null_rank = sum(1 for t in new_trending if t["market_cap_rank"] is None)
         skipped_low_rank = sum(
-            1 for t in new_trending
+            1
+            for t in new_trending
             if t["market_cap_rank"] is not None and t["market_cap_rank"] > max_mcap_rank
         )
         if skipped_null_rank or skipped_low_rank:
@@ -225,6 +294,17 @@ async def trade_trending(engine, db: Database, max_mcap_rank: int = 1500) -> Non
             if rank is None or rank > max_mcap_rank:
                 continue
             try:
+                combo_key = build_combo_key(signal_type="trending_catch", signals=None)
+                allow, reason = await should_open(db, combo_key, settings=settings)
+                if not allow:
+                    logger.info(
+                        "signal_suppressed",
+                        combo_key=combo_key,
+                        reason=reason,
+                        coin_id=t["coin_id"],
+                        signal_type="trending_catch",
+                    )
+                    continue
                 pc = await db._conn.execute(
                     "SELECT current_price FROM price_cache WHERE coin_id = ?",
                     (t["coin_id"],),
@@ -242,6 +322,7 @@ async def trade_trending(engine, db: Database, max_mcap_rank: int = 1500) -> Non
                         "mcap_rank": rank,
                     },
                     entry_price=trending_price,
+                    signal_combo=combo_key,
                 )
             except Exception:
                 logger.exception("trading_trending_error", coin_id=t["coin_id"])
@@ -250,23 +331,46 @@ async def trade_trending(engine, db: Database, max_mcap_rank: int = 1500) -> Non
 
 
 _JUNK_CATEGORIES = {
-    "zoo-themed", "trading bots", "arcade games", "runes",
-    "bridged stablecoin", "bridged tokens", "stablecoins",
-    "wrapped tokens", "lp tokens", "memorial themed",
-    "sticker-themed coins", "gotchiverse", "drc-20",
-    "four.meme ecosystem (bnb memes)", "bonk.fun ecosystem",
-    "pump.fun creator", "pump fund portfolio",
-    "meme-token", "dog-themed", "cat-themed", "frog-themed",
-    "solana-meme-coins", "base-meme-coins", "pump.fun ecosystem",
-    "bnb-meme-coins", "ethereum-meme-coins", "trx-meme-coins",
-    "avax-meme-coins", "fan-tokens",
+    "zoo-themed",
+    "trading bots",
+    "arcade games",
+    "runes",
+    "bridged stablecoin",
+    "bridged tokens",
+    "stablecoins",
+    "wrapped tokens",
+    "lp tokens",
+    "memorial themed",
+    "sticker-themed coins",
+    "gotchiverse",
+    "drc-20",
+    "four.meme ecosystem (bnb memes)",
+    "bonk.fun ecosystem",
+    "pump.fun creator",
+    "pump fund portfolio",
+    "meme-token",
+    "dog-themed",
+    "cat-themed",
+    "frog-themed",
+    "solana-meme-coins",
+    "base-meme-coins",
+    "pump.fun ecosystem",
+    "bnb-meme-coins",
+    "ethereum-meme-coins",
+    "trx-meme-coins",
+    "avax-meme-coins",
+    "fan-tokens",
 }
 
 
 async def trade_predictions(
-    engine, db: Database, prediction_models: list,
+    engine,
+    db: Database,
+    prediction_models: list,
     min_mcap: float = 5_000_000,
     min_fit_score: int = 1,
+    *,
+    settings,
 ) -> None:
     """Open paper trades for narrative prediction picks.
 
@@ -285,9 +389,25 @@ async def trade_predictions(
         if (pred.narrative_fit_score or 0) < min_fit_score:
             continue
         # Quality gate: skip junk categories
-        if pred.category_name and pred.category_name.lower().strip() in _JUNK_CATEGORIES:
+        if (
+            pred.category_name
+            and pred.category_name.lower().strip() in _JUNK_CATEGORIES
+        ):
             continue
         try:
+            combo_key = build_combo_key(
+                signal_type="narrative_prediction", signals=None
+            )
+            allow, reason = await should_open(db, combo_key, settings=settings)
+            if not allow:
+                logger.info(
+                    "signal_suppressed",
+                    combo_key=combo_key,
+                    reason=reason,
+                    coin_id=pred.coin_id,
+                    signal_type="narrative_prediction",
+                )
+                continue
             pc = await db._conn.execute(
                 "SELECT current_price FROM price_cache WHERE coin_id = ?",
                 (pred.coin_id,),
@@ -304,6 +424,7 @@ async def trade_predictions(
                     "mcap": pred.market_cap_at_prediction,
                 },
                 entry_price=pred_price,
+                signal_combo=combo_key,
             )
         except Exception:
             logger.exception(
@@ -312,7 +433,7 @@ async def trade_predictions(
             )
 
 
-async def trade_chain_completions(engine, db: Database, settings) -> None:
+async def trade_chain_completions(engine, db: Database, *, settings) -> None:
     """Open paper trades for completed chain pattern matches."""
     try:
         cursor = await db._conn.execute(
@@ -326,6 +447,17 @@ async def trade_chain_completions(engine, db: Database, settings) -> None:
         new_chains = await cursor.fetchall()
         for c in new_chains:
             try:
+                combo_key = build_combo_key(signal_type="chain_completed", signals=None)
+                allow, reason = await should_open(db, combo_key, settings=settings)
+                if not allow:
+                    logger.info(
+                        "signal_suppressed",
+                        combo_key=combo_key,
+                        reason=reason,
+                        coin_id=c["token_id"],
+                        signal_type="chain_completed",
+                    )
+                    continue
                 pc = await db._conn.execute(
                     "SELECT current_price FROM price_cache WHERE coin_id = ?",
                     (c["token_id"],),
@@ -341,6 +473,7 @@ async def trade_chain_completions(engine, db: Database, settings) -> None:
                         "boost": c["conviction_boost"],
                     },
                     entry_price=chain_price,
+                    signal_combo=combo_key,
                 )
             except Exception:
                 logger.exception("trading_chain_error", token_id=c["token_id"])

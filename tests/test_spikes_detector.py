@@ -24,7 +24,10 @@ async def db(tmp_path):
 
 # -- Helpers --
 
-def _make_raw_coin(coin_id: str, volume: float, mcap: float = 100_000_000, price: float = 1.0):
+
+def _make_raw_coin(
+    coin_id: str, volume: float, mcap: float = 100_000_000, price: float = 1.0
+):
     return {
         "id": coin_id,
         "symbol": coin_id[:3],
@@ -36,6 +39,7 @@ def _make_raw_coin(coin_id: str, volume: float, mcap: float = 100_000_000, price
 
 
 # -- Tests --
+
 
 async def test_record_volume_inserts_rows(db):
     raw = [_make_raw_coin("alpha", 1_000_000), _make_raw_coin("beta", 2_000_000)]
@@ -213,7 +217,9 @@ def _make_7d_coin(
 
 async def test_detect_7d_momentum_finds_runner(db):
     raw = [_make_7d_coin("pandora", 438.0, mcap=200_000_000)]
-    results = await detect_7d_momentum(db, raw, min_7d_change=100.0, max_mcap=500_000_000)
+    results = await detect_7d_momentum(
+        db, raw, min_7d_change=100.0, max_mcap=500_000_000
+    )
     assert len(results) == 1
     assert results[0]["coin_id"] == "pandora"
     assert results[0]["price_change_7d"] == 438.0
@@ -228,7 +234,9 @@ async def test_detect_7d_momentum_skips_below_threshold(db):
 
 async def test_detect_7d_momentum_skips_mega_cap(db):
     raw = [_make_7d_coin("bitcoin", 150.0, mcap=1_000_000_000)]
-    results = await detect_7d_momentum(db, raw, min_7d_change=100.0, max_mcap=500_000_000)
+    results = await detect_7d_momentum(
+        db, raw, min_7d_change=100.0, max_mcap=500_000_000
+    )
     assert len(results) == 0
 
 
@@ -290,6 +298,12 @@ async def test_get_momentum_7d_stats(db):
 
 
 async def test_detect_7d_momentum_skips_missing_id(db):
-    raw = [{"symbol": "x", "price_change_percentage_7d_in_currency": 200.0, "market_cap": 100_000}]
+    raw = [
+        {
+            "symbol": "x",
+            "price_change_percentage_7d_in_currency": 200.0,
+            "market_cap": 100_000,
+        }
+    ]
     results = await detect_7d_momentum(db, raw, min_7d_change=100.0)
     assert len(results) == 0

@@ -52,9 +52,7 @@ async def emit_event(
     return int(eid)
 
 
-async def load_recent_events(
-    db: Database, max_hours: float
-) -> list[ChainEvent]:
+async def load_recent_events(db: Database, max_hours: float) -> list[ChainEvent]:
     """Load events from the last `max_hours`, oldest first."""
     conn = db._conn
     if conn is None:
@@ -88,9 +86,7 @@ async def prune_old_events(db: Database, retention_days: int) -> int:
     conn = db._conn
     if conn is None:
         raise RuntimeError("Database not initialized")
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(days=retention_days)
-    ).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
     cursor = await conn.execute(
         "DELETE FROM signal_events WHERE created_at < ?", (cutoff,)
     )

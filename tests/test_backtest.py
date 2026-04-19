@@ -1,4 +1,5 @@
 """Tests for scout/backtest.py CLI."""
+
 import sys
 from io import StringIO
 from contextlib import redirect_stdout
@@ -14,6 +15,7 @@ async def test_backtest_empty_db(tmp_path, monkeypatch):
     await db.close()
 
     from scout import backtest
+
     monkeypatch.setattr(sys, "argv", ["backtest", "--db", str(db_path), "--days", "30"])
 
     buf = StringIO()
@@ -34,7 +36,9 @@ async def test_backtest_with_predictions(tmp_path, monkeypatch):
     assert conn is not None
 
     # Insert sample predictions: 2 agent HITs, 1 agent MISS, 1 control HIT
-    for i, (cls, is_ctrl) in enumerate([("HIT", 0), ("HIT", 0), ("MISS", 0), ("HIT", 1)]):
+    for i, (cls, is_ctrl) in enumerate(
+        [("HIT", 0), ("HIT", 0), ("MISS", 0), ("HIT", 1)]
+    ):
         await conn.execute(
             """INSERT INTO predictions
                (category_id, category_name, coin_id, symbol, name,
@@ -43,15 +47,36 @@ async def test_backtest_with_predictions(tmp_path, monkeypatch):
                 market_regime, trigger_count, is_control, is_holdout,
                 strategy_snapshot, predicted_at, outcome_class, evaluated_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            ("ai", "AI", f"coin-{i}", f"S{i}", f"N{i}", 50e6, 1.0,
-             75, "High", "Med", "r", "BULL", 1, is_ctrl, 0,
-             "{}", "2026-04-09T00:00:00Z", cls, "2026-04-09T12:00:00Z"),
+            (
+                "ai",
+                "AI",
+                f"coin-{i}",
+                f"S{i}",
+                f"N{i}",
+                50e6,
+                1.0,
+                75,
+                "High",
+                "Med",
+                "r",
+                "BULL",
+                1,
+                is_ctrl,
+                0,
+                "{}",
+                "2026-04-09T00:00:00Z",
+                cls,
+                "2026-04-09T12:00:00Z",
+            ),
         )
     await conn.commit()
     await db.close()
 
     from scout import backtest
-    monkeypatch.setattr(sys, "argv", ["backtest", "--db", str(db_path), "--days", "3650"])
+
+    monkeypatch.setattr(
+        sys, "argv", ["backtest", "--db", str(db_path), "--days", "3650"]
+    )
 
     buf = StringIO()
     with redirect_stdout(buf):

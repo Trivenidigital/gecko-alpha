@@ -1,4 +1,5 @@
 """Tests for paper trading Pydantic models."""
+
 from datetime import datetime, timezone
 
 import pytest

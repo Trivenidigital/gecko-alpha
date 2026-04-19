@@ -45,7 +45,9 @@ async def test_enrich_evm_with_moralis(mock_aiohttp, token_factory, settings_fac
     assert enriched.holder_count == 2
 
 
-async def test_enrich_no_api_key_returns_unenriched(mock_aiohttp, token_factory, settings_factory):
+async def test_enrich_no_api_key_returns_unenriched(
+    mock_aiohttp, token_factory, settings_factory
+):
     """Graceful degradation: no API key -> return token unchanged."""
     token = token_factory(chain="solana", holder_count=0, holder_growth_1h=0)
     settings = settings_factory()  # No HELIUS_API_KEY set
@@ -57,9 +59,13 @@ async def test_enrich_no_api_key_returns_unenriched(mock_aiohttp, token_factory,
     assert enriched.holder_growth_1h == 0
 
 
-async def test_enrich_api_failure_returns_unenriched(mock_aiohttp, token_factory, settings_factory):
+async def test_enrich_api_failure_returns_unenriched(
+    mock_aiohttp, token_factory, settings_factory
+):
     """API failure -> return token unchanged, don't crash."""
-    token = token_factory(chain="solana", contract_address="SoLAddr", holder_count=0, holder_growth_1h=0)
+    token = token_factory(
+        chain="solana", contract_address="SoLAddr", holder_count=0, holder_growth_1h=0
+    )
     settings = settings_factory(HELIUS_API_KEY="bad-key")
 
     mock_aiohttp.post(

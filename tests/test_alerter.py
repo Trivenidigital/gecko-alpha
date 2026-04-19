@@ -15,12 +15,21 @@ def mock_aiohttp():
 
 def test_format_alert_message_contains_required_fields(token_factory):
     token = token_factory(
-        contract_address="0xabc123", chain="solana", token_name="MoonCoin",
-        ticker="MOON", token_age_days=2, market_cap_usd=75000,
-        liquidity_usd=15000, volume_24h_usd=120000,
-        holder_count=350, holder_growth_1h=30,
-        quant_score=80, narrative_score=75, conviction_score=78,
-        virality_class="High", mirofish_report="Strong viral narrative.",
+        contract_address="0xabc123",
+        chain="solana",
+        token_name="MoonCoin",
+        ticker="MOON",
+        token_age_days=2,
+        market_cap_usd=75000,
+        liquidity_usd=15000,
+        volume_24h_usd=120000,
+        holder_count=350,
+        holder_growth_1h=30,
+        quant_score=80,
+        narrative_score=75,
+        conviction_score=78,
+        virality_class="High",
+        mirofish_report="Strong viral narrative.",
     )
     signals = ["vol_liq_ratio", "holder_growth", "market_cap_range"]
     msg = format_alert_message(token, signals)
@@ -41,12 +50,21 @@ def test_format_alert_message_contains_required_fields(token_factory):
 
 def test_format_alert_message_without_narrative(token_factory):
     token = token_factory(
-        contract_address="0xabc123", chain="solana", token_name="MoonCoin",
-        ticker="MOON", token_age_days=2, market_cap_usd=75000,
-        liquidity_usd=15000, volume_24h_usd=120000,
-        holder_count=350, holder_growth_1h=30,
-        quant_score=80, narrative_score=None, virality_class=None,
-        mirofish_report=None, conviction_score=80,
+        contract_address="0xabc123",
+        chain="solana",
+        token_name="MoonCoin",
+        ticker="MOON",
+        token_age_days=2,
+        market_cap_usd=75000,
+        liquidity_usd=15000,
+        volume_24h_usd=120000,
+        holder_count=350,
+        holder_growth_1h=30,
+        quant_score=80,
+        narrative_score=None,
+        virality_class=None,
+        mirofish_report=None,
+        conviction_score=80,
     )
     signals = ["vol_liq_ratio"]
     msg = format_alert_message(token, signals)
@@ -60,9 +78,15 @@ async def test_send_alert_telegram(mock_aiohttp, token_factory, settings_factory
     mock_aiohttp.post(telegram_url, payload={"ok": True})
 
     token = token_factory(
-        contract_address="0xabc123", chain="solana", token_name="MoonCoin",
-        ticker="MOON", quant_score=80, narrative_score=75, conviction_score=78,
-        virality_class="High", mirofish_report="Strong viral narrative.",
+        contract_address="0xabc123",
+        chain="solana",
+        token_name="MoonCoin",
+        ticker="MOON",
+        quant_score=80,
+        narrative_score=75,
+        conviction_score=78,
+        virality_class="High",
+        mirofish_report="Strong viral narrative.",
     )
     settings = settings_factory(
         TELEGRAM_BOT_TOKEN="test-bot-token",
@@ -78,9 +102,15 @@ async def test_send_alert_telegram(mock_aiohttp, token_factory, settings_factory
 def test_alert_message_includes_momentum_flag(token_factory):
     """AC-08: Momentum flag appears in alert message when signal fired."""
     token = token_factory(
-        contract_address="0xabc123", chain="solana", token_name="MoonCoin",
-        ticker="MOON", quant_score=80, narrative_score=75, conviction_score=78,
-        virality_class="High", mirofish_report="Strong viral narrative.",
+        contract_address="0xabc123",
+        chain="solana",
+        token_name="MoonCoin",
+        ticker="MOON",
+        quant_score=80,
+        narrative_score=75,
+        conviction_score=78,
+        virality_class="High",
+        mirofish_report="Strong viral narrative.",
     )
     signals = ["vol_liq_ratio", "momentum_ratio", "vol_acceleration"]
     msg = format_alert_message(token, signals)
@@ -91,9 +121,15 @@ def test_alert_message_includes_momentum_flag(token_factory):
 def test_alert_message_includes_vol_spike_flag(token_factory):
     """Vol spike flag appears in alert message when signal fired."""
     token = token_factory(
-        contract_address="0xabc123", chain="solana", token_name="MoonCoin",
-        ticker="MOON", quant_score=80, narrative_score=75, conviction_score=78,
-        virality_class="High", mirofish_report="Strong viral narrative.",
+        contract_address="0xabc123",
+        chain="solana",
+        token_name="MoonCoin",
+        ticker="MOON",
+        quant_score=80,
+        narrative_score=75,
+        conviction_score=78,
+        virality_class="High",
+        mirofish_report="Strong viral narrative.",
     )
     signals = ["vol_acceleration"]
     msg = format_alert_message(token, signals)
@@ -126,7 +162,9 @@ def test_escape_md_handles_none_and_non_string():
     assert _escape_md(42) == "42"
 
 
-async def test_send_alert_telegram_and_discord(mock_aiohttp, token_factory, settings_factory):
+async def test_send_alert_telegram_and_discord(
+    mock_aiohttp, token_factory, settings_factory
+):
     telegram_url = "https://api.telegram.org/bottest-bot-token/sendMessage"
     discord_url = "https://discord.com/api/webhooks/test"
 
@@ -134,9 +172,15 @@ async def test_send_alert_telegram_and_discord(mock_aiohttp, token_factory, sett
     mock_aiohttp.post(discord_url, payload={}, status=204)
 
     token = token_factory(
-        contract_address="0xabc123", chain="solana", token_name="MoonCoin",
-        ticker="MOON", quant_score=80, narrative_score=75, conviction_score=78,
-        virality_class="High", mirofish_report="Strong viral narrative.",
+        contract_address="0xabc123",
+        chain="solana",
+        token_name="MoonCoin",
+        ticker="MOON",
+        quant_score=80,
+        narrative_score=75,
+        conviction_score=78,
+        virality_class="High",
+        mirofish_report="Strong viral narrative.",
     )
     settings = settings_factory(
         TELEGRAM_BOT_TOKEN="test-bot-token",

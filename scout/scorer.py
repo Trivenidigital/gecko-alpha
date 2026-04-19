@@ -57,10 +57,7 @@ def score(
     # liquidity data (liquidity_usd=0) but are listed on major exchanges
     # with real order-book liquidity. The liquidity floor is meant for
     # DEX memecoins where a thin pool means un-tradable.
-    if (
-        token.liquidity_usd < settings.MIN_LIQUIDITY_USD
-        and token.chain != "coingecko"
-    ):
+    if token.liquidity_usd < settings.MIN_LIQUIDITY_USD and token.chain != "coingecko":
         return (0, ["DISQUALIFIED_LOW_LIQUIDITY"])
 
     # Signal 1: Volume/Liquidity Ratio -- 30 points
@@ -109,10 +106,7 @@ def score(
         signals.append("social_mentions")
 
     # Signal 6: Buy pressure ratio (DexScreener) -- 15 points
-    if (
-        token.txns_h1_buys is not None
-        and token.txns_h1_sells is not None
-    ):
+    if token.txns_h1_buys is not None and token.txns_h1_sells is not None:
         total_txns = token.txns_h1_buys + token.txns_h1_sells
         if total_txns > 0:
             buy_ratio = token.txns_h1_buys / total_txns

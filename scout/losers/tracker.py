@@ -32,7 +32,9 @@ async def prune_old_snapshots(db: "Database", retention_days: int = 7) -> int:
     await db._conn.commit()
     deleted = cursor.rowcount
     if deleted:
-        logger.info("losers_snapshots_pruned", deleted=deleted, retention_days=retention_days)
+        logger.info(
+            "losers_snapshots_pruned", deleted=deleted, retention_days=retention_days
+        )
     return deleted
 
 
@@ -261,9 +263,7 @@ async def compare_losers_with_signals(db: "Database") -> list[dict]:
     return comparisons
 
 
-async def get_recent_losers(
-    db: "Database", limit: int = 20
-) -> list[dict]:
+async def get_recent_losers(db: "Database", limit: int = 20) -> list[dict]:
     """Get recent losers snapshots for the dashboard."""
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
@@ -280,9 +280,7 @@ async def get_recent_losers(
     return [dict(row) for row in rows]
 
 
-async def get_losers_comparisons(
-    db: "Database", limit: int = 50
-) -> list[dict]:
+async def get_losers_comparisons(db: "Database", limit: int = 50) -> list[dict]:
     """Get losers comparisons for the dashboard."""
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
@@ -309,9 +307,7 @@ async def get_losers_stats(db: "Database") -> dict:
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
 
-    cursor = await db._conn.execute(
-        "SELECT COUNT(*) FROM losers_comparisons"
-    )
+    cursor = await db._conn.execute("SELECT COUNT(*) FROM losers_comparisons")
     total = (await cursor.fetchone())[0]
 
     cursor = await db._conn.execute(
@@ -322,8 +318,7 @@ async def get_losers_stats(db: "Database") -> dict:
     missed = total - caught
 
     # Average lead time across all detection methods
-    cursor = await db._conn.execute(
-        """SELECT AVG(lead) FROM (
+    cursor = await db._conn.execute("""SELECT AVG(lead) FROM (
              SELECT narrative_lead_minutes as lead FROM losers_comparisons
                WHERE detected_by_narrative = 1 AND narrative_lead_minutes IS NOT NULL
              UNION ALL
@@ -335,8 +330,7 @@ async def get_losers_stats(db: "Database") -> dict:
              UNION ALL
              SELECT spikes_lead_minutes FROM losers_comparisons
                WHERE detected_by_spikes = 1 AND spikes_lead_minutes IS NOT NULL
-           )"""
-    )
+           )""")
     lead_row = await cursor.fetchone()
     avg_lead = round(lead_row[0], 1) if lead_row and lead_row[0] is not None else None
 

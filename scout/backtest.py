@@ -110,7 +110,9 @@ async def run_backtest(db_path: str, days: int) -> None:
         for r in risk_rows:
             if r["total"]:
                 rate = (r["hits"] or 0) / r["total"] * 100
-                print(f"  {r['risk_band']} risk: {rate:.0f}% hit rate ({r['hits']}/{r['total']})")
+                print(
+                    f"  {r['risk_band']} risk: {rate:.0f}% hit rate ({r['hits']}/{r['total']})"
+                )
 
     # --- Existing pipeline alerts -----------------------------------------
     try:

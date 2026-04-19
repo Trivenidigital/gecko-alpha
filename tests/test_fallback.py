@@ -8,7 +8,6 @@ import pytest
 from scout.mirofish.fallback import score_narrative_fallback, FallbackScoringError
 from scout.models import MiroFishResult
 
-
 SAMPLE_SEED = {
     "token_name": "TestCoin",
     "ticker": "TST",
@@ -32,16 +31,20 @@ def _mock_anthropic_response(content: str):
 
 @pytest.mark.asyncio
 async def test_fallback_parses_json_response():
-    response_json = json.dumps({
-        "narrative_score": 65,
-        "virality_class": "Medium",
-        "summary": "Moderate viral potential.",
-    })
+    response_json = json.dumps(
+        {
+            "narrative_score": 65,
+            "virality_class": "Medium",
+            "summary": "Moderate viral potential.",
+        }
+    )
 
     mock_client = AsyncMock()
     mock_client.messages.create.return_value = _mock_anthropic_response(response_json)
 
-    result = await score_narrative_fallback(SAMPLE_SEED, "test-api-key", client=mock_client)
+    result = await score_narrative_fallback(
+        SAMPLE_SEED, "test-api-key", client=mock_client
+    )
 
     assert isinstance(result, MiroFishResult)
     assert result.narrative_score == 65
@@ -57,7 +60,9 @@ async def test_fallback_extracts_json_from_markdown():
     mock_client = AsyncMock()
     mock_client.messages.create.return_value = _mock_anthropic_response(content)
 
-    result = await score_narrative_fallback(SAMPLE_SEED, "test-api-key", client=mock_client)
+    result = await score_narrative_fallback(
+        SAMPLE_SEED, "test-api-key", client=mock_client
+    )
 
     assert result.narrative_score == 80
     assert result.virality_class == "High"
@@ -65,11 +70,13 @@ async def test_fallback_extracts_json_from_markdown():
 
 @pytest.mark.asyncio
 async def test_fallback_uses_correct_model():
-    response_json = json.dumps({
-        "narrative_score": 50,
-        "virality_class": "Low",
-        "summary": "Weak narrative.",
-    })
+    response_json = json.dumps(
+        {
+            "narrative_score": 50,
+            "virality_class": "Low",
+            "summary": "Weak narrative.",
+        }
+    )
 
     mock_client = AsyncMock()
     mock_client.messages.create.return_value = _mock_anthropic_response(response_json)
@@ -85,7 +92,9 @@ async def test_fallback_uses_correct_model():
 async def test_fallback_raises_on_invalid_json():
     """Invalid JSON from LLM raises FallbackScoringError."""
     mock_client = AsyncMock()
-    mock_client.messages.create.return_value = _mock_anthropic_response("not json at all")
+    mock_client.messages.create.return_value = _mock_anthropic_response(
+        "not json at all"
+    )
 
     with pytest.raises(FallbackScoringError):
         await score_narrative_fallback(SAMPLE_SEED, "test-api-key", client=mock_client)
@@ -95,7 +104,9 @@ async def test_fallback_raises_on_invalid_json():
 async def test_fallback_raises_on_missing_keys():
     """JSON missing required keys raises FallbackScoringError."""
     mock_client = AsyncMock()
-    mock_client.messages.create.return_value = _mock_anthropic_response('{"foo": "bar"}')
+    mock_client.messages.create.return_value = _mock_anthropic_response(
+        '{"foo": "bar"}'
+    )
 
     with pytest.raises(FallbackScoringError):
         await score_narrative_fallback(SAMPLE_SEED, "test-api-key", client=mock_client)

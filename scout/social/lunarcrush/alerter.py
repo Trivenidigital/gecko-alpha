@@ -71,12 +71,18 @@ def _render_alert(alert: ResearchAlert) -> str:
         else ""
     )
     sv_ratio = (
-        f"{alert.social_spike_ratio:.1f}x" if alert.social_spike_ratio is not None else "—"
+        f"{alert.social_spike_ratio:.1f}x"
+        if alert.social_spike_ratio is not None
+        else "—"
     )
     interactions = _fmt_compact_number(alert.interactions_24h)
 
     # Price line
-    if alert.current_price is None and alert.price_change_1h is None and alert.price_change_24h is None:
+    if (
+        alert.current_price is None
+        and alert.price_change_1h is None
+        and alert.price_change_24h is None
+    ):
         price_line = "price: —"
     else:
         price_line = (
@@ -85,9 +91,7 @@ def _render_alert(alert: ResearchAlert) -> str:
         )
 
     # mcap / sentiment
-    sentiment = (
-        f"{alert.sentiment:.2f}" if alert.sentiment is not None else "—"
-    )
+    sentiment = f"{alert.sentiment:.2f}" if alert.sentiment is not None else "—"
 
     # LunarCrush link uses the LC-native coin_id which may be numeric.
     lc_url = f"https://lunarcrush.com/coins/{alert.coin_id}"

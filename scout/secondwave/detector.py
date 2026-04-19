@@ -1,4 +1,5 @@
 """Second-Wave Detection — scan DB, score re-accumulation, orchestrate loop."""
+
 from __future__ import annotations
 
 import asyncio
@@ -44,7 +45,9 @@ def score_reaccumulation(
 
     # Signal 1: Drawdown from peak (30 pts)
     if alert_market_cap and alert_market_cap > 0 and current_market_cap is not None:
-        drawdown_pct = ((current_market_cap - alert_market_cap) / alert_market_cap) * 100
+        drawdown_pct = (
+            (current_market_cap - alert_market_cap) / alert_market_cap
+        ) * 100
         if drawdown_pct <= -settings.SECONDWAVE_MIN_DRAWDOWN_PCT:
             points += 30
             signals.append("sufficient_drawdown")
@@ -95,9 +98,7 @@ def build_secondwave_candidate(
     alert_market_cap = scan_row.get("alert_market_cap") or 0.0
     alert_price = scan_row.get("alert_price") or 0.0
     alerted_at_str = scan_row.get("alerted_at")
-    alerted_at = (
-        datetime.fromisoformat(alerted_at_str) if alerted_at_str else None
-    )
+    alerted_at = datetime.fromisoformat(alerted_at_str) if alerted_at_str else None
     now = datetime.now(timezone.utc)
     days_since = (now - alerted_at).total_seconds() / 86400.0 if alerted_at else 0.0
 
@@ -106,12 +107,8 @@ def build_secondwave_candidate(
         if alert_market_cap
         else 0.0
     )
-    price_vs_alert_pct = (
-        (current_price / alert_price) * 100 if alert_price else 0.0
-    )
-    cooldown_avg = (
-        sum(volume_history) / len(volume_history) if volume_history else 0.0
-    )
+    price_vs_alert_pct = (current_price / alert_price) * 100 if alert_price else 0.0
+    cooldown_avg = sum(volume_history) / len(volume_history) if volume_history else 0.0
     volume_vs_cooldown_avg = (
         (current_volume / cooldown_avg)
         if (current_volume is not None and cooldown_avg > 0)
@@ -221,7 +218,9 @@ async def run_once(
         scan_row["coingecko_id"] = cg_id
 
     cg_ids = [c["coingecko_id"] for c in scan_candidates if c.get("coingecko_id")]
-    fresh_prices = await fetch_current_prices(session, cg_ids, settings) if cg_ids else {}
+    fresh_prices = (
+        await fetch_current_prices(session, cg_ids, settings) if cg_ids else {}
+    )
 
     alerts_fired = 0
     for scan_row in scan_candidates:

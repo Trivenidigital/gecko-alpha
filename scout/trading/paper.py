@@ -29,6 +29,10 @@ class PaperTrader:
         tp_pct: float,
         sl_pct: float,
         slippage_bps: int = 0,
+        *,
+        signal_combo: str,
+        lead_time_vs_trending_min: float | None = None,
+        lead_time_vs_trending_status: str | None = None,
     ) -> int | None:
         """Record a paper buy. Returns trade ID or None if rejected.
 
@@ -41,12 +45,16 @@ class PaperTrader:
 
         effective_entry = current_price * (1 + slippage_bps / 10000)
         if effective_entry <= 0:
-            log.warning("paper_trade_zero_price", token_id=token_id, current_price=current_price)
+            log.warning(
+                "paper_trade_zero_price", token_id=token_id, current_price=current_price
+            )
             return None
         quantity = amount_usd / effective_entry
         # Sanity check: quantity must be positive and finite
         if quantity <= 0 or not (quantity == quantity):  # NaN check
-            log.warning("paper_trade_invalid_quantity", token_id=token_id, quantity=quantity)
+            log.warning(
+                "paper_trade_invalid_quantity", token_id=token_id, quantity=quantity
+            )
             return None
         tp_price = effective_entry * (1 + tp_pct / 100)
         sl_price = effective_entry * (1 - sl_pct / 100) if sl_pct > 0 else 0.0
@@ -57,14 +65,27 @@ class PaperTrader:
                (token_id, symbol, name, chain, signal_type, signal_data,
                 entry_price, amount_usd, quantity,
                 tp_pct, sl_pct, tp_price, sl_price,
-                status, opened_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)""",
+                status, opened_at,
+                signal_combo, lead_time_vs_trending_min, lead_time_vs_trending_status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)""",
             (
-                token_id, symbol, name, chain, signal_type,
+                token_id,
+                symbol,
+                name,
+                chain,
+                signal_type,
                 json.dumps(signal_data),
-                effective_entry, amount_usd, quantity,
-                tp_pct, sl_pct, tp_price, sl_price,
+                effective_entry,
+                amount_usd,
+                quantity,
+                tp_pct,
+                sl_pct,
+                tp_price,
+                sl_price,
                 now,
+                signal_combo,
+                lead_time_vs_trending_min,
+                lead_time_vs_trending_status,
             ),
         )
         await conn.commit()

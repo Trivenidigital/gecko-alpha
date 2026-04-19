@@ -23,9 +23,13 @@ def format_alert_message(token: CandidateToken, signals: list[str]) -> str:
     lines.append("")
 
     # Conviction breakdown
-    conviction_display = f"{token.conviction_score:.1f}" if token.conviction_score is not None else "N/A"
+    conviction_display = (
+        f"{token.conviction_score:.1f}" if token.conviction_score is not None else "N/A"
+    )
     quant_display = str(token.quant_score) if token.quant_score is not None else "N/A"
-    narrative_display = str(token.narrative_score) if token.narrative_score is not None else "N/A"
+    narrative_display = (
+        str(token.narrative_score) if token.narrative_score is not None else "N/A"
+    )
 
     lines.append(f"Conviction Score: {conviction_display}")
     lines.append(f"  Quant: {quant_display}")
@@ -61,13 +65,9 @@ def format_alert_message(token: CandidateToken, signals: list[str]) -> str:
     # Source link — CoinGecko tokens use CG URL, others use DEXScreener
     lines.append("")
     if token.chain == "coingecko":
-        lines.append(
-            f"https://www.coingecko.com/en/coins/{token.contract_address}"
-        )
+        lines.append(f"https://www.coingecko.com/en/coins/{token.contract_address}")
     else:
-        lines.append(
-            f"https://dexscreener.com/{token.chain}/{token.contract_address}"
-        )
+        lines.append(f"https://dexscreener.com/{token.chain}/{token.contract_address}")
 
     return "\n".join(lines)
 
@@ -135,7 +135,9 @@ async def send_telegram_message(
         async with session.post(url, json=payload) as resp:
             if resp.status != 200:
                 body = await resp.text()
-                logger.warning("Telegram daily summary failed", status=resp.status, body=body[:200])
+                logger.warning(
+                    "Telegram daily summary failed", status=resp.status, body=body[:200]
+                )
     except Exception as e:
         logger.warning("Telegram daily summary error", error=str(e))
 
@@ -200,9 +202,7 @@ async def send_alert(
         async with session.post(telegram_url, json=payload) as resp:
             if resp.status != 200:
                 body = await resp.text()
-                raise AlertDeliveryError(
-                    f"Telegram returned {resp.status}: {body}"
-                )
+                raise AlertDeliveryError(f"Telegram returned {resp.status}: {body}")
     except AlertDeliveryError:
         raise
     except Exception as exc:
@@ -216,8 +216,6 @@ async def send_alert(
                 json={"content": message},
             ) as resp:
                 if resp.status not in (200, 204):
-                    logger.warning(
-                        "Discord webhook returned error", status=resp.status
-                    )
+                    logger.warning("Discord webhook returned error", status=resp.status)
         except Exception:
             logger.warning("Discord webhook delivery failed", exc_info=True)

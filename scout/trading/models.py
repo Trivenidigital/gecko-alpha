@@ -23,7 +23,9 @@ class PaperTrade(BaseModel):
     quantity: float
 
     tp_pct: float = 20.0
-    sl_pct: float = 10.0  # positive: 10.0 means 10% stop loss; 0 means no stop loss (used for long_hold trades)
+    sl_pct: float = (
+        10.0  # positive: 10.0 means 10% stop loss; 0 means no stop loss (used for long_hold trades)
+    )
     tp_price: float
     sl_price: float
 
@@ -53,18 +55,14 @@ class PaperTrade(BaseModel):
     @classmethod
     def _validate_sl_pct_positive(cls, v: float) -> float:
         if v < 0:
-            raise ValueError(
-                "sl_pct must be positive, e.g. 10.0 for 10% stop loss"
-            )
+            raise ValueError("sl_pct must be positive, e.g. 10.0 for 10% stop loss")
         return v
 
     @field_validator("tp_pct")
     @classmethod
     def _validate_tp_pct_positive(cls, v: float) -> float:
         if v < 0:
-            raise ValueError(
-                "tp_pct must be positive, e.g. 20.0 for 20% take profit"
-            )
+            raise ValueError("tp_pct must be positive, e.g. 20.0 for 20% take profit")
         return v
 
 

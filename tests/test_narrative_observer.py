@@ -19,7 +19,6 @@ from scout.narrative.observer import (
     store_snapshot,
 )
 
-
 # ------------------------------------------------------------------
 # parse_category_response
 # ------------------------------------------------------------------
@@ -95,7 +94,9 @@ def test_compute_acceleration_heating():
             snapshot_at=now,
         ),
     ]
-    result = compute_acceleration(current, previous, accel_threshold=5.0, vol_threshold=10.0)
+    result = compute_acceleration(
+        current, previous, accel_threshold=5.0, vol_threshold=10.0
+    )
     assert len(result) == 1
     acc = result[0]
     assert acc.acceleration == pytest.approx(8.0)
@@ -126,7 +127,9 @@ def test_compute_acceleration_not_heating():
             snapshot_at=now,
         ),
     ]
-    result = compute_acceleration(current, previous, accel_threshold=5.0, vol_threshold=10.0)
+    result = compute_acceleration(
+        current, previous, accel_threshold=5.0, vol_threshold=10.0
+    )
     assert len(result) == 1
     assert result[0].acceleration == pytest.approx(1.0)
     assert result[0].is_heating is False

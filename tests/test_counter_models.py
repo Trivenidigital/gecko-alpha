@@ -21,7 +21,9 @@ def test_counter_score_full():
     now = datetime.now(tz=timezone.utc)
     cs = CounterScore(
         risk_score=75,
-        red_flags=[RedFlag(flag="whale_dump", severity="high", detail="Top holder sold 50%")],
+        red_flags=[
+            RedFlag(flag="whale_dump", severity="high", detail="Top holder sold 50%")
+        ],
         counter_argument="Token has weak fundamentals.",
         data_completeness="full",
         counter_scored_at=now,

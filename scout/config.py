@@ -95,17 +95,19 @@ class Settings(BaseSettings):
     CHAIN_GRADUATION_HIT_RATE: float = 0.55
 
     # -------- Market Briefing Agent --------
-    BRIEFING_ENABLED: bool = False              # opt-in, not default-on
-    BRIEFING_HOURS_UTC: str = "6,18"            # comma-separated hours (6am + 6pm)
+    BRIEFING_ENABLED: bool = False  # opt-in, not default-on
+    BRIEFING_HOURS_UTC: str = "6,18"  # comma-separated hours (6am + 6pm)
     BRIEFING_MODEL: str = "claude-sonnet-4-6"
     BRIEFING_TELEGRAM_ENABLED: bool = True
-    COINGLASS_API_KEY: str = ""                 # free tier, register at coinglass.com
+    COINGLASS_API_KEY: str = ""  # free tier, register at coinglass.com
 
     # -------- 7-Day Momentum Scanner --------
     MOMENTUM_7D_ENABLED: bool = True
-    MOMENTUM_7D_MIN_CHANGE: float = 100.0       # min 7d change % to flag (100% = doubled)
-    MOMENTUM_7D_MAX_MCAP: float = 500_000_000   # filter out mega caps
-    MOMENTUM_7D_MIN_VOLUME: float = 100_000     # min $100K 24h volume — weeds out illiquid junk
+    MOMENTUM_7D_MIN_CHANGE: float = 100.0  # min 7d change % to flag (100% = doubled)
+    MOMENTUM_7D_MAX_MCAP: float = 500_000_000  # filter out mega caps
+    MOMENTUM_7D_MIN_VOLUME: float = (
+        100_000  # min $100K 24h volume — weeds out illiquid junk
+    )
 
     # -------- Volume Spike Detector --------
     VOLUME_SPIKE_ENABLED: bool = True
@@ -116,12 +118,12 @@ class Settings(BaseSettings):
     # Research-only alerts for tokens pumping hard in the last hour.
     # No paper trade dispatch -- Telegram plain-text only.
     VELOCITY_ALERTS_ENABLED: bool = False
-    VELOCITY_MIN_1H_PCT: float = 30.0          # minimum 1h % change to flag
-    VELOCITY_MIN_MCAP: float = 500_000         # skip dust
-    VELOCITY_MAX_MCAP: float = 50_000_000      # skip mega-caps
-    VELOCITY_MIN_VOL_MCAP_RATIO: float = 0.2   # vol_24h / mcap -- liquidity sanity
-    VELOCITY_DEDUP_HOURS: int = 4              # re-alert cooldown per coin
-    VELOCITY_TOP_N: int = 10                   # max alerts per cycle
+    VELOCITY_MIN_1H_PCT: float = 30.0  # minimum 1h % change to flag
+    VELOCITY_MIN_MCAP: float = 500_000  # skip dust
+    VELOCITY_MAX_MCAP: float = 50_000_000  # skip mega-caps
+    VELOCITY_MIN_VOL_MCAP_RATIO: float = 0.2  # vol_24h / mcap -- liquidity sanity
+    VELOCITY_DEDUP_HOURS: int = 4  # re-alert cooldown per coin
+    VELOCITY_TOP_N: int = 10  # max alerts per cycle
 
     # -------- Top Gainers Tracker --------
     GAINERS_TRACKER_ENABLED: bool = True
@@ -157,37 +159,37 @@ class Settings(BaseSettings):
     LUNARCRUSH_ENABLED: bool = False
     LUNARCRUSH_API_KEY: str = ""
     LUNARCRUSH_BASE_URL: str = "https://lunarcrush.com/api4/public"
-    LUNARCRUSH_POLL_INTERVAL: int = 300                 # 5 min (default / normal)
-    LUNARCRUSH_POLL_INTERVAL_SOFT: int = 600            # 10 min (used after 80% credits)
-    LUNARCRUSH_RATE_LIMIT_PER_MIN: int = 9              # under hard 10/min
-    LUNARCRUSH_DAILY_CREDIT_BUDGET: int = 2000          # free tier cap
-    LUNARCRUSH_CREDIT_SOFT_PCT: float = 0.80            # downshift at 80%
-    LUNARCRUSH_CREDIT_HARD_PCT: float = 0.95            # stop at 95%
+    LUNARCRUSH_POLL_INTERVAL: int = 300  # 5 min (default / normal)
+    LUNARCRUSH_POLL_INTERVAL_SOFT: int = 600  # 10 min (used after 80% credits)
+    LUNARCRUSH_RATE_LIMIT_PER_MIN: int = 9  # under hard 10/min
+    LUNARCRUSH_DAILY_CREDIT_BUDGET: int = 2000  # free tier cap
+    LUNARCRUSH_CREDIT_SOFT_PCT: float = 0.80  # downshift at 80%
+    LUNARCRUSH_CREDIT_HARD_PCT: float = 0.95  # stop at 95%
     LUNARCRUSH_SOCIAL_SPIKE_RATIO: float = 2.0
     LUNARCRUSH_GALAXY_JUMP: float = 10.0
     LUNARCRUSH_INTERACTIONS_ACCEL: float = 3.0
     LUNARCRUSH_DEDUP_HOURS: int = 4
     LUNARCRUSH_TOP_N: int = 10
-    LUNARCRUSH_BASELINE_MIN_HOURS: int = 24             # warmup wall-clock, interval-aware
-    LUNARCRUSH_BASELINE_MIN_SAMPLES: int = 288          # EWMA alpha denominator
-    LUNARCRUSH_CHECKPOINT_EVERY_N_POLLS: int = 12       # 60 min
+    LUNARCRUSH_BASELINE_MIN_HOURS: int = 24  # warmup wall-clock, interval-aware
+    LUNARCRUSH_BASELINE_MIN_SAMPLES: int = 288  # EWMA alpha denominator
+    LUNARCRUSH_CHECKPOINT_EVERY_N_POLLS: int = 12  # 60 min
     LUNARCRUSH_RETENTION_DAYS: int = 30
     # After N consecutive uncaught-crash-then-restart cycles, leave the
     # social tier down rather than thrash against a broken environment.
     LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS: int = 5
 
     # -------- Paper Trading Engine --------
-    TRADING_ENABLED: bool = False                  # master switch
-    TRADING_MODE: str = "paper"                    # "paper" or "live"
-    PAPER_TRADE_AMOUNT_USD: float = 1000.0         # per trade (paper)
-    PAPER_MAX_EXPOSURE_USD: float = 10000.0        # max total open (paper)
-    PAPER_TP_PCT: float = 20.0                     # take profit %
-    PAPER_SL_PCT: float = 10.0                     # stop loss % (positive: 10.0 = 10%)
-    PAPER_MAX_DURATION_HOURS: int = 48             # auto-expire
-    PAPER_TP_SELL_PCT: float = 70.0               # sell 70% at TP, keep 30% as long_hold
-    PAPER_SLIPPAGE_BPS: int = 50                   # 0.5% slippage simulation
-    PAPER_MIN_MCAP: float = 5_000_000             # min $5M mcap to paper trade (filters junk)
-    PAPER_MAX_MCAP_RANK: int = 1500                # skip trending coins below rank 1500 (illiquid)
+    TRADING_ENABLED: bool = False  # master switch
+    TRADING_MODE: str = "paper"  # "paper" or "live"
+    PAPER_TRADE_AMOUNT_USD: float = 1000.0  # per trade (paper)
+    PAPER_MAX_EXPOSURE_USD: float = 10000.0  # max total open (paper)
+    PAPER_TP_PCT: float = 20.0  # take profit %
+    PAPER_SL_PCT: float = 10.0  # stop loss % (positive: 10.0 = 10%)
+    PAPER_MAX_DURATION_HOURS: int = 48  # auto-expire
+    PAPER_TP_SELL_PCT: float = 70.0  # sell 70% at TP, keep 30% as long_hold
+    PAPER_SLIPPAGE_BPS: int = 50  # 0.5% slippage simulation
+    PAPER_MIN_MCAP: float = 5_000_000  # min $5M mcap to paper trade (filters junk)
+    PAPER_MAX_MCAP_RANK: int = 1500  # skip trending coins below rank 1500 (illiquid)
     # Hard cap on concurrent open positions. Prevents restart-bursts and
     # survives env changes to PAPER_MAX_EXPOSURE_USD / PAPER_TRADE_AMOUNT_USD.
     PAPER_MAX_OPEN_TRADES: int = 10
@@ -195,37 +197,46 @@ class Settings(BaseSettings):
     # this window so a restart doesn't replay every currently-qualifying
     # candidate as a fresh signal. A live trader doesn't bulk-enter on reboot.
     PAPER_STARTUP_WARMUP_SECONDS: int = 180
-    TRADING_DIGEST_HOUR_UTC: int = 0               # midnight digest
-    TRADING_EVAL_INTERVAL: int = 1800              # 30 min eval cycle
+    TRADING_DIGEST_HOUR_UTC: int = 0  # midnight digest
+    TRADING_EVAL_INTERVAL: int = 1800  # 30 min eval cycle
+
+    # Feedback-loop (Sprint 1, spec 2026-04-18)
+    FEEDBACK_SUPPRESSION_MIN_TRADES: int = 20
+    FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT: float = 30.0
+    FEEDBACK_PAROLE_DAYS: int = 14
+    FEEDBACK_PAROLE_RETEST_TRADES: int = 5
+    FEEDBACK_MIN_LEADERBOARD_TRADES: int = 10
+    FEEDBACK_MISSED_WINNER_MIN_PCT: float = 50.0
+    FEEDBACK_MISSED_WINNER_MIN_MCAP: float = 5_000_000
+    FEEDBACK_MISSED_WINNER_WINDOW_MIN: int = 30
+    FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN: int = 60
+    FEEDBACK_WEEKLY_DIGEST_WEEKDAY: int = 6
+    FEEDBACK_WEEKLY_DIGEST_HOUR: int = 9
+    FEEDBACK_COMBO_REFRESH_HOUR: int = 3
+    FEEDBACK_FALLBACK_ALERT_THRESHOLD: int = 5
+    FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC: int = 900
+    FEEDBACK_CHRONIC_FAILURE_THRESHOLD: int = 3
 
     @field_validator("PAPER_SL_PCT")
     @classmethod
     def _validate_paper_sl_pct(cls, v: float) -> float:
         if v < 0:
-            raise ValueError(
-                "sl_pct must be positive, e.g. 10.0 for 10% stop loss"
-            )
+            raise ValueError("sl_pct must be positive, e.g. 10.0 for 10% stop loss")
         return v
 
     @field_validator("PAPER_TP_PCT")
     @classmethod
     def _validate_paper_tp_pct(cls, v: float) -> float:
         if v < 0:
-            raise ValueError(
-                "tp_pct must be positive, e.g. 20.0 for 20% take profit"
-            )
+            raise ValueError("tp_pct must be positive, e.g. 20.0 for 20% take profit")
         return v
 
-    @field_validator(
-        "CHAIN_PROMOTION_THRESHOLD", "CHAIN_GRADUATION_HIT_RATE"
-    )
+    @field_validator("CHAIN_PROMOTION_THRESHOLD", "CHAIN_GRADUATION_HIT_RATE")
     @classmethod
     def _validate_hit_rate_thresholds(cls, v: float) -> float:
         return max(0.0, min(1.0, v))
 
-    @field_validator(
-        "CHAIN_MIN_TRIGGERS_FOR_STATS", "CHAIN_GRADUATION_MIN_TRIGGERS"
-    )
+    @field_validator("CHAIN_MIN_TRIGGERS_FOR_STATS", "CHAIN_GRADUATION_MIN_TRIGGERS")
     @classmethod
     def _validate_min_triggers(cls, v: int) -> int:
         return max(1, v)
