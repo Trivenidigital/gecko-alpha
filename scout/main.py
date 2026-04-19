@@ -100,6 +100,7 @@ async def _run_feedback_schedulers(
             logger.info("combo_refresh_done", **summary)
             _combo_refresh_failure_streak = 0
             _combo_refresh_streak_last_alerted = 0
+            last_refresh_date = today_iso
         except Exception:
             _combo_refresh_failure_streak += 1
             logger.exception(
@@ -122,7 +123,6 @@ async def _run_feedback_schedulers(
                         )
                 except Exception:
                     logger.exception("combo_refresh_streak_alert_dispatch_error")
-        last_refresh_date = today_iso
 
     # Weekly digest (FEEDBACK_WEEKLY_DIGEST_WEEKDAY, _HOUR local)
     if (
@@ -132,9 +132,9 @@ async def _run_feedback_schedulers(
     ):
         try:
             await _weekly_digest.send_weekly_digest(db, settings)
+            last_digest_date = today_iso
         except Exception:
             logger.exception("weekly_digest_loop_error")
-        last_digest_date = today_iso
 
     return last_refresh_date, last_digest_date
 

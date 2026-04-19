@@ -129,6 +129,10 @@ async def test_refresh_failure_streak_alerts_telegram(
             last_digest,
             now,
         )
+        # Fix 3: last_refresh_date must NOT advance when refresh_all fails.
+        assert (
+            last_refresh == ""
+        ), f"last_refresh_date advanced to {last_refresh!r} on day {day} despite failure"
 
     assert any(
         "combo_refresh" in t.lower() for t in sent
@@ -136,9 +140,64 @@ async def test_refresh_failure_streak_alerts_telegram(
 
     # Dedup guard: 5 consecutive failures should produce exactly one alert,
     # not one per loop iteration after the streak crosses 3.
-    assert len(sent) == 1, (
-        f"expected exactly 1 alert across 5 failing days, got {len(sent)}: {sent}"
+    assert (
+        len(sent) == 1
+    ), f"expected exactly 1 alert across 5 failing days, got {len(sent)}: {sent}"
+    await db.close()
+
+
+async def test_transient_failure_allows_same_hour_retry(
+    tmp_path,
+    settings_factory,
+    monkeypatch,
+):
+    """Day 1 03:00 — refresh fails → sentinel stays '' → same-hour retry at 03:01 succeeds."""
+    from scout.db import Database
+    from scout import main as main_mod
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(FEEDBACK_COMBO_REFRESH_HOUR=3)
+
+    call_results: list[bool] = []
+
+    async def _first_fails_second_succeeds(*a, **k):
+        if len(call_results) == 0:
+            call_results.append(False)
+            raise RuntimeError("transient failure")
+        call_results.append(True)
+        return {"refreshed": 1, "failed": 0}
+
+    monkeypatch.setattr(
+        main_mod._combo_refresh, "refresh_all", _first_fails_second_succeeds
     )
+    monkeypatch.setattr(main_mod.alerter, "send_telegram_message", lambda *a, **k: None)
+
+    main_mod._combo_refresh_failure_streak = 0
+    main_mod._combo_refresh_streak_last_alerted = 0
+
+    last_refresh = ""
+    last_digest = ""
+
+    # 03:00 — fails → sentinel stays ''
+    now = datetime(2026, 4, 19, 3, 0, 0)
+    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+        db, s, last_refresh, last_digest, now
+    )
+    assert (
+        last_refresh == ""
+    ), f"Sentinel must not advance on failure, got {last_refresh!r}"
+    assert len(call_results) == 1
+
+    # 03:01 — same hour, sentinel still '' → scheduler fires again → succeeds
+    now = datetime(2026, 4, 19, 3, 1, 0)
+    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+        db, s, last_refresh, last_digest, now
+    )
+    assert (
+        last_refresh == "2026-04-19"
+    ), f"Sentinel must advance on success, got {last_refresh!r}"
+    assert len(call_results) == 2, "refresh_all must have been called twice"
     await db.close()
 
 
