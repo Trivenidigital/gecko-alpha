@@ -351,3 +351,27 @@ async def test_detect_pipeline_gaps(tmp_path):
     )
     assert len(gaps) == 1
     await db.close()
+
+
+async def test_lead_time_breakdown_unknown_status_counted_as_error(tmp_path):
+    """Rows with unexpected status values must land in the error bucket, not be silently
+    dropped. This ensures corrupted data is visible in the weekly digest."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    now = datetime.now(timezone.utc)
+
+    # 1 valid ok, 1 valid error, 1 with nonsense status.
+    await _seed_lead_trade(db, "a", now, -5.0, "ok")
+    await _seed_lead_trade(db, "b", now, None, "error")
+    await _seed_lead_trade(db, "c", now, None, "GARBAGE_STATUS_XYZ_UNKNOWN")
+    await db._conn.commit()
+
+    result = await analytics.lead_time_breakdown(db, window="30d")
+    row = result["volume_spike"]
+
+    assert row["count_ok"] == 1
+    # Both the explicit 'error' and the unknown status must contribute to error bucket.
+    assert (
+        row["count_error"] == 2
+    ), f"Expected count_error=2 (explicit + unknown), got {row['count_error']}"
+    await db.close()

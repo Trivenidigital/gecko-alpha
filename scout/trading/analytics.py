@@ -191,6 +191,10 @@ async def lead_time_breakdown(db: Database, window: str) -> dict[str, dict]:
             bucket["no_reference"] += 1
         elif status == "error":
             bucket["error"] += 1
+        else:
+            # Unexpected status (NULL, corrupted value, schema drift) —
+            # count in error bucket so they're visible rather than silent drops.
+            bucket["error"] += 1
 
     result: dict[str, dict] = {}
     for sig, bucket in groups.items():
