@@ -198,6 +198,23 @@ class Settings(BaseSettings):
     TRADING_DIGEST_HOUR_UTC: int = 0               # midnight digest
     TRADING_EVAL_INTERVAL: int = 1800              # 30 min eval cycle
 
+    # Feedback-loop (Sprint 1, spec 2026-04-18)
+    FEEDBACK_SUPPRESSION_MIN_TRADES: int = 20
+    FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT: float = 30.0
+    FEEDBACK_PAROLE_DAYS: int = 14
+    FEEDBACK_PAROLE_RETEST_TRADES: int = 5
+    FEEDBACK_MIN_LEADERBOARD_TRADES: int = 10
+    FEEDBACK_MISSED_WINNER_MIN_PCT: float = 50.0
+    FEEDBACK_MISSED_WINNER_MIN_MCAP: float = 5_000_000
+    FEEDBACK_MISSED_WINNER_WINDOW_MIN: int = 30
+    FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN: int = 60
+    FEEDBACK_WEEKLY_DIGEST_WEEKDAY: int = 6
+    FEEDBACK_WEEKLY_DIGEST_HOUR: int = 9
+    FEEDBACK_COMBO_REFRESH_HOUR: int = 3
+    FEEDBACK_FALLBACK_ALERT_THRESHOLD: int = 5
+    FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC: int = 900
+    FEEDBACK_CHRONIC_FAILURE_THRESHOLD: int = 3
+
     @field_validator("PAPER_SL_PCT")
     @classmethod
     def _validate_paper_sl_pct(cls, v: float) -> float:
