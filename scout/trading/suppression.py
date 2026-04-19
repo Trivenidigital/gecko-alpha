@@ -25,6 +25,11 @@ _fallback_timestamps: "deque[float]" = deque()
 _last_alerted_ts: float = 0.0
 
 
+def get_fallback_count() -> int:
+    """Return current fallback-counter size. Public accessor for weekly digest."""
+    return len(_fallback_timestamps)
+
+
 async def should_open(db: Database, combo_key: str, *, settings) -> tuple[bool, str]:
     """Entry-gate: returns (allow, reason). Fail-open on DB error.
 

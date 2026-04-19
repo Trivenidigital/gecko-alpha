@@ -9,6 +9,7 @@ import aiohttp
 import structlog
 
 from scout import alerter
+from scout.config import Settings
 from scout.db import Database
 from scout.trading import analytics
 
@@ -26,13 +27,13 @@ async def _try_section(section_name: str, coro):
         return (await coro, True)
     except Exception as e:
         log.exception("weekly_digest_section_failed", section=section_name)
-        return ([f"  (error)"], False)
+        return ([f"  (error: {type(e).__name__})"], False)
 
 
 async def build_weekly_digest(
     db: Database,
     end_date: date,
-    settings,
+    settings: Settings,
 ) -> str | None:
     """Build the weekly digest text. Returns None if zero activity last 7d."""
     start = datetime.combine(
@@ -197,7 +198,7 @@ async def build_weekly_digest(
     # 5. Fallback counters — conditional (elide when zero).
     from scout.trading import suppression as _supp
 
-    fallback_count = len(_supp._fallback_timestamps)
+    fallback_count = _supp.get_fallback_count()
     if fallback_count > 0:
         lines.append("[Fallback counters]")
         lines.append(f"  Suppression fail-opens: {fallback_count}")
@@ -228,7 +229,7 @@ async def build_weekly_digest(
     return "\n".join(lines)
 
 
-async def send_weekly_digest(db: Database, settings) -> None:
+async def send_weekly_digest(db: Database, settings: Settings) -> None:
     """Orchestrator: build + send via alerter. Never silent on error.
 
     Opens a single aiohttp.ClientSession for the lifetime of this dispatch.
@@ -257,7 +258,9 @@ async def send_weekly_digest(db: Database, settings) -> None:
 
 
 def _split_for_telegram(text: str, limit: int) -> list[str]:
-    """Split on newline boundaries. Never splits mid-line."""
+    """Split on newline boundaries. Never splits mid-line.
+
+    If a single line exceeds limit, hard-truncate it to prevent Telegram 400s."""
     if len(text) <= limit:
         return [text]
     lines = text.split("\n")
@@ -265,6 +268,14 @@ def _split_for_telegram(text: str, limit: int) -> list[str]:
     buf: list[str] = []
     size = 0
     for line in lines:
+        # If a line exceeds limit on its own, hard-truncate it.
+        if len(line) > limit:
+            log.warning(
+                "weekly_digest_line_hard_truncated",
+                original_len=len(line),
+                limit=limit,
+            )
+            line = line[:limit]
         # +1 for the joining "\n"
         if buf and size + len(line) + 1 > limit:
             chunks.append("\n".join(buf))

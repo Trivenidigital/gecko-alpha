@@ -144,9 +144,9 @@ async def test_section_failure_does_not_kill_entire_digest(
     assert result is not None
     assert "Combo leaderboard" in result
     assert "Missed winners" in result
-    # The failing section should be annotated (error), not missing.
+    # The failing section should be annotated (error: RuntimeError), not missing.
     assert "Lead-time" in result
-    assert "(error)" in result
+    assert "(error: RuntimeError)" in result
     await db.close()
 
 
@@ -165,6 +165,18 @@ async def test_telegram_split_at_4096_preserves_line_integrity(
     recovered = "\n".join(chunks)
     for line in long_lines.split("\n"):
         assert line in recovered
+
+
+async def test_telegram_split_hard_truncates_long_lines(tmp_path, settings_factory):
+    """A single line > limit is hard-truncated to the limit so Telegram accepts it."""
+    monster = "X" * 5000
+    text = "header\n" + monster + "\nfooter"
+    chunks = weekly_digest._split_for_telegram(text, 4000)
+    for c in chunks:
+        assert len(c) <= 4000, f"chunk {len(c)}B exceeds 4000"
+    joined = "".join(chunks)
+    assert "header" in joined
+    assert "footer" in joined
 
 
 async def test_send_weekly_digest_empty_skips_telegram(
