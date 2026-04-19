@@ -67,6 +67,9 @@ _social_consecutive_restarts = [0]
 # Consecutive combo_refresh failure counter; incremented on failure, reset to 0 on success.
 # Used to trigger streak-alert when >= 3 consecutive failures occur.
 _combo_refresh_failure_streak = 0
+# Last streak value for which we sent an alert; prevents duplicate alerts on every loop
+# iteration once the streak stays at or above 3. Reset to 0 when streak clears.
+_combo_refresh_streak_last_alerted = 0
 
 
 async def _run_feedback_schedulers(
@@ -84,7 +87,7 @@ async def _run_feedback_schedulers(
     can set FEEDBACK_COMBO_REFRESH_HOUR / FEEDBACK_WEEKLY_DIGEST_HOUR in
     familiar local time, not UTC. Cron drift across DST is an accepted constraint.
     """
-    global _combo_refresh_failure_streak
+    global _combo_refresh_failure_streak, _combo_refresh_streak_last_alerted
     today_iso = now_local.strftime("%Y-%m-%d")
 
     # Nightly combo refresh (FEEDBACK_COMBO_REFRESH_HOUR, local)
@@ -96,13 +99,18 @@ async def _run_feedback_schedulers(
             summary = await _combo_refresh.refresh_all(db, settings)
             logger.info("combo_refresh_done", **summary)
             _combo_refresh_failure_streak = 0
+            _combo_refresh_streak_last_alerted = 0
         except Exception:
             _combo_refresh_failure_streak += 1
             logger.exception(
                 "combo_refresh_loop_error",
                 consecutive_failures=_combo_refresh_failure_streak,
             )
-            if _combo_refresh_failure_streak >= 3:
+            if (
+                _combo_refresh_failure_streak >= 3
+                and _combo_refresh_streak_last_alerted == 0
+            ):
+                _combo_refresh_streak_last_alerted = _combo_refresh_failure_streak
                 # Fire once per streak (reset when refresh succeeds).
                 try:
                     async with aiohttp.ClientSession() as session:

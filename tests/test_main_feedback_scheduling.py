@@ -91,7 +91,10 @@ async def test_refresh_failure_streak_alerts_telegram(
     settings_factory,
     monkeypatch,
 ):
-    """Three consecutive combo_refresh failures → one Telegram alert."""
+    """Three consecutive combo_refresh failures → exactly one Telegram alert.
+
+    A 4th consecutive failure must NOT send a duplicate alert (dedup guard).
+    """
     from scout.db import Database
     from scout import main as main_mod
 
@@ -111,9 +114,13 @@ async def test_refresh_failure_streak_alerts_telegram(
 
     monkeypatch.setattr(main_mod.alerter, "send_telegram_message", _capture_tg)
 
+    # Reset module-level dedup state so each test run is independent.
+    main_mod._combo_refresh_failure_streak = 0
+    main_mod._combo_refresh_streak_last_alerted = 0
+
     last_refresh = ""
     last_digest = ""
-    for day in range(1, 5):
+    for day in range(1, 6):  # 5 days: failures on days 1-5 → streak hits 3 on day 3
         now = datetime(2026, 4, day, 3, 0, 0)
         last_refresh, last_digest = await main_mod._run_feedback_schedulers(
             db,
@@ -126,6 +133,12 @@ async def test_refresh_failure_streak_alerts_telegram(
     assert any(
         "combo_refresh" in t.lower() for t in sent
     ), "expected a Telegram alert after 3 consecutive failures"
+
+    # Dedup guard: 5 consecutive failures should produce exactly one alert,
+    # not one per loop iteration after the streak crosses 3.
+    assert len(sent) == 1, (
+        f"expected exactly 1 alert across 5 failing days, got {len(sent)}: {sent}"
+    )
     await db.close()
 
 
