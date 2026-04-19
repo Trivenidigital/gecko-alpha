@@ -95,12 +95,16 @@ async def test_concurrent_decrement_deterministic_final_value(
         *[suppression.should_open(db, combo_key, settings=s) for _ in range(N)]
     )
 
-    # All should succeed (parole_retest) since the lock serializes them.
+    # All N should succeed with parole_retest — the asyncio.Lock must serialize
+    # the BEGIN IMMEDIATE blocks so no caller hits the fail-open path. Accepting
+    # 'db_error_fallback_allow' here would mask the exact bug this test guards:
+    # if serialization breaks, a "cannot start a transaction" error would surface
+    # as a fallback-allow and the test would still pass.
     reasons = [r[1] for r in results]
-    assert all(
-        r in ("parole_retest", "parole_exhausted", "db_error_fallback_allow")
-        for r in reasons
-    ), f"Unexpected reasons: {reasons}"
+    assert all(r == "parole_retest" for r in reasons), (
+        f"Expected all 'parole_retest' (proves lock serialization worked). "
+        f"Got: {reasons}"
+    )
 
     # Final remaining must be 0 (all N decremented from N).
     cur = await db._conn.execute(

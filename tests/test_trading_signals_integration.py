@@ -77,44 +77,6 @@ async def _seed_volume_spike(db, coin_id):
     pass  # The spikes list is provided directly to the dispatcher.
 
 
-# Parametrize table for suppression E2E tests.
-# Format: (test_id, combo_key, seed_fn, dispatcher_call_fn)
-# dispatcher_call_fn receives (engine, db, settings) and calls the dispatcher.
-
-_SUPPRESSION_CASES = [
-    pytest.param(
-        "gainers_early",
-        _seed_gainers,
-        lambda engine, db, s: signals.trade_gainers(
-            engine, db, min_mcap=1_000_000, settings=s
-        ),
-        id="gainers",
-    ),
-    pytest.param(
-        "losers_contrarian",
-        _seed_losers,
-        lambda engine, db, s: signals.trade_losers(
-            engine, db, min_mcap=1_000_000, settings=s
-        ),
-        id="losers",
-    ),
-    pytest.param(
-        "trending_catch",
-        _seed_trending,
-        lambda engine, db, s: signals.trade_trending(
-            engine, db, max_mcap_rank=1500, settings=s
-        ),
-        id="trending",
-    ),
-    pytest.param(
-        "volume_spike",
-        None,  # No DB seed — spikes passed directly
-        None,  # dispatcher_fn set below (needs closure over coin_id)
-        id="volume_spike",
-    ),
-]
-
-
 @pytest.mark.parametrize(
     "combo_key,seed_fn,dispatcher_fn",
     [

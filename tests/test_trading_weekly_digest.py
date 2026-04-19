@@ -183,10 +183,12 @@ async def test_section_failure_logs_err_id(tmp_path, settings_factory, monkeypat
         for e in entries
         if e.get("err_id") == "WEEKLY_DIGEST_SECTION"
         and e.get("section") == "lead_time"
+        and e.get("log_level") == "error"
     ]
-    assert (
-        matching
-    ), f"Expected err_id='WEEKLY_DIGEST_SECTION' log entry, got: {entries}"
+    assert matching, (
+        "Expected err_id='WEEKLY_DIGEST_SECTION' ERROR-level log entry "
+        f"(guards against silent downgrade to INFO). Got: {entries}"
+    )
     await db.close()
 
 
