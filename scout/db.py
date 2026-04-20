@@ -673,6 +673,16 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_velocity_alerts
                 ON velocity_alerts(coin_id, detected_at);
+
+            CREATE TABLE IF NOT EXISTS signal_qualifier_state (
+                signal_type         TEXT NOT NULL,
+                token_id            TEXT NOT NULL,
+                first_qualified_at  TEXT NOT NULL,
+                last_qualified_at   TEXT NOT NULL,
+                PRIMARY KEY (signal_type, token_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sqs_last_qualified_at
+                ON signal_qualifier_state (last_qualified_at);
             """)
 
         # Migrate alerts table: add price_usd, token_name, ticker if missing

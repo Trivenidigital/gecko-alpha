@@ -267,7 +267,9 @@ async def _insert_trending_at(db, coin_id, market_cap_rank, snapshot_at):
     await db._conn.commit()
 
 
-async def test_trade_gainers_skips_snapshots_older_than_5min_same_day(db, engine, settings):
+async def test_trade_gainers_skips_snapshots_older_than_5min_same_day(
+    db, engine, settings
+):
     """A snapshot stored 2 hours ago (same day) must NOT be picked up."""
     stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     await _insert_gainer_at(
@@ -277,14 +279,18 @@ async def test_trade_gainers_skips_snapshots_older_than_5min_same_day(db, engine
     assert await _open_count(db) == 0
 
 
-async def test_trade_losers_skips_snapshots_older_than_5min_same_day(db, engine, settings):
+async def test_trade_losers_skips_snapshots_older_than_5min_same_day(
+    db, engine, settings
+):
     stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     await _insert_loser_at(db, "stale-loser", 10_000_000, price=1.0, snapshot_at=stale)
     await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
     assert await _open_count(db) == 0
 
 
-async def test_trade_trending_skips_snapshots_older_than_5min_same_day(db, engine, settings):
+async def test_trade_trending_skips_snapshots_older_than_5min_same_day(
+    db, engine, settings
+):
     stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     await _insert_trending_at(db, "stale-trend", market_cap_rank=100, snapshot_at=stale)
     await _seed_price(db, "stale-trend", price=1.0)
@@ -292,7 +298,9 @@ async def test_trade_trending_skips_snapshots_older_than_5min_same_day(db, engin
     assert await _open_count(db) == 0
 
 
-async def test_trade_gainers_uses_fresh_snapshot_price_not_earlier_peak(db, engine, settings):
+async def test_trade_gainers_uses_fresh_snapshot_price_not_earlier_peak(
+    db, engine, settings
+):
     """When both a stale and a fresh snapshot exist, entry must come from fresh one.
 
     Reproduces the production bug where entries were sourced from the day's

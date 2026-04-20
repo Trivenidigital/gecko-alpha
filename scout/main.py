@@ -823,6 +823,32 @@ async def main() -> None:
 
                     cycle_count += 1
 
+                    # BL-050: periodic pruning of stale signal_qualifier_state rows
+                    if (
+                        cycle_count % settings.QUALIFIER_PRUNE_EVERY_CYCLES == 0
+                        and cycle_count > 0
+                    ):
+                        try:
+                            from scout.trading.qualifier_state import (
+                                prune_stale_qualifiers,
+                            )
+
+                            pruned = await prune_stale_qualifiers(
+                                db,
+                                now=datetime.now(timezone.utc),
+                                retention_hours=settings.QUALIFIER_PRUNE_RETENTION_HOURS,
+                            )
+                            logger.info("qualifier_pruned", rows_deleted=pruned)
+                            _heartbeat_stats["qualifier_prune_consecutive_failures"] = 0
+                        except Exception:
+                            logger.exception(
+                                "qualifier_prune_failed",
+                                err_id="QUALIFIER_PRUNE_FAIL",
+                            )
+                            _heartbeat_stats[
+                                "qualifier_prune_consecutive_failures"
+                            ] += 1
+
                     # BL-033: periodic heartbeat summary
                     _maybe_emit_heartbeat(settings)
                     now = time.monotonic()
