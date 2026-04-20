@@ -52,9 +52,7 @@ async def test_restart_does_not_replay_qualifying_tokens(
     engine = AsyncMock()
     engine.open_trade = AsyncMock(return_value=1)
 
-    candidates = [
-        _scored(token_factory, f"addr_{i}") for i in range(5)
-    ]
+    candidates = [_scored(token_factory, f"addr_{i}") for i in range(5)]
 
     # Cycle N
     await trade_first_signals(engine, db, candidates, settings=settings)
@@ -139,4 +137,81 @@ async def test_restart_with_re_entry_during_downtime(
         engine, db, [_scored(token_factory, "addr_re")], settings=settings
     )
     assert engine.open_trade.await_count == 0
+    await db.close()
+
+
+async def test_transition_blocked_by_cooldown_still_upserts(
+    tmp_path, token_factory, settings_factory
+):
+    """Seed paper_trades row for token within 48h → open_trade returns None
+    (the real engine's cooldown). classify_transitions must STILL upsert the
+    qualifier row so next scan treats it as a continuation, not another
+    transition.
+
+    To avoid dependence on the real engine's cooldown implementation, we
+    simulate open_trade returning None and then assert that a second call
+    with the same token is NOT a transition (no second open_trade call).
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+
+    settings = settings_factory(PAPER_MIN_MCAP=5_000_000)
+    engine = AsyncMock()
+    engine.open_trade = AsyncMock(return_value=None)  # simulate cooldown block
+
+    candidates = [_scored(token_factory, "addr_block")]
+
+    # First scan: transition classified, open_trade called, returns None
+    await trade_first_signals(engine, db, candidates, settings=settings)
+    assert engine.open_trade.await_count == 1
+
+    # Row was upserted despite open_trade returning None
+    cur = await db._conn.execute(
+        "SELECT token_id FROM signal_qualifier_state "
+        "WHERE signal_type = ? AND token_id = ?",
+        ("first_signal", "addr_block"),
+    )
+    assert await cur.fetchone() is not None
+
+    # Second scan: continuation, open_trade must NOT be called again
+    engine.open_trade.reset_mock()
+    await trade_first_signals(engine, db, candidates, settings=settings)
+    assert engine.open_trade.await_count == 0
+    await db.close()
+
+
+async def test_transition_blocked_by_max_open_still_upserts(
+    tmp_path, token_factory, settings_factory
+):
+    """Same contract as the cooldown test but with a different reason —
+    open_trade returns None simulating the max-open cap being hit.
+    Qualifier row must still be upserted; heartbeat skip counter increments.
+    """
+    from scout.heartbeat import _heartbeat_stats
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+
+    settings = settings_factory(PAPER_MIN_MCAP=5_000_000)
+    engine = AsyncMock()
+    engine.open_trade = AsyncMock(return_value=None)  # simulate max-open block
+
+    candidates = [_scored(token_factory, "addr_maxopen")]
+
+    assert _heartbeat_stats["qualifier_transitions"] == 0
+    assert _heartbeat_stats["qualifier_skips"] == 0
+
+    await trade_first_signals(engine, db, candidates, settings=settings)
+
+    assert engine.open_trade.await_count == 1
+    assert _heartbeat_stats["qualifier_transitions"] == 1
+    assert _heartbeat_stats["qualifier_skips"] == 1
+
+    # Qualifier row upserted
+    cur = await db._conn.execute(
+        "SELECT token_id FROM signal_qualifier_state "
+        "WHERE signal_type = ? AND token_id = ?",
+        ("first_signal", "addr_maxopen"),
+    )
+    assert await cur.fetchone() is not None
     await db.close()
