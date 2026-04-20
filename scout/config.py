@@ -217,6 +217,11 @@ class Settings(BaseSettings):
     FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC: int = 900
     FEEDBACK_CHRONIC_FAILURE_THRESHOLD: int = 3
 
+    # -------- BL-050: Paper-trade Edge-Detection (qualifier transition gate) --------
+    QUALIFIER_EXIT_GRACE_HOURS: int = 48
+    QUALIFIER_PRUNE_RETENTION_HOURS: int = 168
+    QUALIFIER_PRUNE_EVERY_CYCLES: int = 100
+
     @field_validator("PAPER_SL_PCT")
     @classmethod
     def _validate_paper_sl_pct(cls, v: float) -> float:
@@ -273,6 +278,16 @@ class Settings(BaseSettings):
         if abs(total - 1.0) > 1e-9:
             msg = f"QUANT_WEIGHT ({self.QUANT_WEIGHT}) + NARRATIVE_WEIGHT ({self.NARRATIVE_WEIGHT}) = {total}, must sum to 1.0"
             raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _check_retention_gt_grace(self) -> "Settings":
+        if self.QUALIFIER_PRUNE_RETENTION_HOURS <= self.QUALIFIER_EXIT_GRACE_HOURS:
+            raise ValueError(
+                "QUALIFIER_PRUNE_RETENTION_HOURS must be strictly greater than "
+                "QUALIFIER_EXIT_GRACE_HOURS to prevent pruning rows that classify "
+                "still needs for re-entry detection."
+            )
         return self
 
 

@@ -32,3 +32,23 @@ async def test_schema_creates_signal_qualifier_state_table(tmp_path):
     )
     assert await cursor.fetchone() is not None
     await db.close()
+
+
+def test_config_defaults_for_qualifier_settings(settings_factory):
+    s = settings_factory()
+    assert s.QUALIFIER_EXIT_GRACE_HOURS == 48
+    assert s.QUALIFIER_PRUNE_RETENTION_HOURS == 168
+    assert s.QUALIFIER_PRUNE_EVERY_CYCLES == 100
+
+
+def test_config_rejects_retention_le_grace(settings_factory):
+    with pytest.raises(ValueError, match="QUALIFIER_PRUNE_RETENTION_HOURS"):
+        settings_factory(
+            QUALIFIER_EXIT_GRACE_HOURS=48,
+            QUALIFIER_PRUNE_RETENTION_HOURS=48,
+        )
+    with pytest.raises(ValueError, match="QUALIFIER_PRUNE_RETENTION_HOURS"):
+        settings_factory(
+            QUALIFIER_EXIT_GRACE_HOURS=48,
+            QUALIFIER_PRUNE_RETENTION_HOURS=24,
+        )
