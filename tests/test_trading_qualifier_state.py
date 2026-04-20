@@ -233,3 +233,87 @@ async def test_re_entry_one_second_past_grace_is_transition(tmp_path):
     assert set(result.keys()) == {"a"}
     assert result["a"] == stale.isoformat()
     await db.close()
+
+
+import aiosqlite
+
+
+async def test_empty_current_ids_returns_empty_without_transaction(tmp_path, monkeypatch):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+
+    async def _boom(*args, **kwargs):
+        raise AssertionError("txn lock must not be acquired for empty input")
+
+    # Patch the lock's acquire method to raise if called
+    monkeypatch.setattr(db._txn_lock, "acquire", _boom)
+
+    result = await classify_transitions(
+        db,
+        signal_type="first_signal",
+        current_token_ids=set(),
+        now=datetime(2026, 4, 19, 12, 0, 0, tzinfo=timezone.utc),
+        exit_grace_hours=48,
+    )
+    assert result == {}
+    await db.close()
+
+
+async def test_classify_raises_on_aiosqlite_error(tmp_path, monkeypatch):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+
+    original_execute = db._conn.execute
+    call_count = {"n": 0}
+
+    async def _execute_then_fail(sql, *args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] >= 2:
+            raise aiosqlite.OperationalError("simulated failure")
+        return await original_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(db._conn, "execute", _execute_then_fail)
+
+    with pytest.raises(aiosqlite.OperationalError, match="simulated failure"):
+        await classify_transitions(
+            db,
+            signal_type="first_signal",
+            current_token_ids={"a"},
+            now=datetime(2026, 4, 19, 12, 0, 0, tzinfo=timezone.utc),
+            exit_grace_hours=48,
+        )
+    await db.close()
+
+
+async def test_different_signal_types_do_not_interfere(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    now = datetime(2026, 4, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+    first_result = await classify_transitions(
+        db,
+        signal_type="first_signal",
+        current_token_ids={"shared_token"},
+        now=now,
+        exit_grace_hours=48,
+    )
+    assert first_result == {"shared_token": None}
+
+    # Same token under a different signal_type is a fresh transition
+    other_result = await classify_transitions(
+        db,
+        signal_type="other_signal",
+        current_token_ids={"shared_token"},
+        now=now,
+        exit_grace_hours=48,
+    )
+    assert other_result == {"shared_token": None}
+
+    # Two independent rows exist
+    cur = await db._conn.execute(
+        "SELECT signal_type FROM signal_qualifier_state WHERE token_id = ?",
+        ("shared_token",),
+    )
+    rows = {r[0] for r in await cur.fetchall()}
+    assert rows == {"first_signal", "other_signal"}
+    await db.close()
