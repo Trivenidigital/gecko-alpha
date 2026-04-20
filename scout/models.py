@@ -42,6 +42,10 @@ class CandidateToken(BaseModel):
     vol_7d_avg: float | None = None
     cg_trending_rank: int | None = None
 
+    # Populated by DexScreener top-boosts decorator (BL-051)
+    boost_total_amount: float | None = None
+    boost_rank: int | None = None
+
     # Populated by pipeline stages
     quant_score: int | None = None
     narrative_score: int | None = None
