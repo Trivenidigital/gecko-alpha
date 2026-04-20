@@ -19,6 +19,9 @@ _heartbeat_stats: dict = {
     "narrative_predictions": 0,
     "counter_scores_memecoin": 0,
     "counter_scores_narrative": 0,
+    "qualifier_transitions": 0,
+    "qualifier_skips": 0,
+    "qualifier_prune_consecutive_failures": 0,
     "last_heartbeat_at": None,
 }
 
@@ -37,6 +40,9 @@ def _reset_heartbeat_stats() -> None:
         narrative_predictions=0,
         counter_scores_memecoin=0,
         counter_scores_narrative=0,
+        qualifier_transitions=0,
+        qualifier_skips=0,
+        qualifier_prune_consecutive_failures=0,
         last_heartbeat_at=None,
     )
 
@@ -65,6 +71,9 @@ def _maybe_emit_heartbeat(settings) -> bool:
         narrative_predictions=_heartbeat_stats["narrative_predictions"],
         counter_scores_memecoin=_heartbeat_stats["counter_scores_memecoin"],
         counter_scores_narrative=_heartbeat_stats["counter_scores_narrative"],
+        qualifier_transitions=_heartbeat_stats["qualifier_transitions"],
+        qualifier_skips=_heartbeat_stats["qualifier_skips"],
+        qualifier_prune_consecutive_failures=_heartbeat_stats["qualifier_prune_consecutive_failures"],
         last_heartbeat_at=_heartbeat_stats["last_heartbeat_at"].isoformat(),
     )
     _heartbeat_stats["last_heartbeat_at"] = now

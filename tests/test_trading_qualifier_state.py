@@ -371,3 +371,16 @@ async def test_prune_returns_zero_when_no_stale_rows(tmp_path):
     assert await _qualifier_row(db, "first_signal", "a") is not None
     assert await _qualifier_row(db, "first_signal", "b") is not None
     await db.close()
+
+
+def test_heartbeat_stats_has_qualifier_counters():
+    from scout.heartbeat import _heartbeat_stats, _reset_heartbeat_stats
+
+    _reset_heartbeat_stats()
+    assert _heartbeat_stats["qualifier_transitions"] == 0
+    assert _heartbeat_stats["qualifier_skips"] == 0
+    assert _heartbeat_stats["qualifier_prune_consecutive_failures"] == 0
+
+    _heartbeat_stats["qualifier_transitions"] += 3
+    _reset_heartbeat_stats()
+    assert _heartbeat_stats["qualifier_transitions"] == 0
