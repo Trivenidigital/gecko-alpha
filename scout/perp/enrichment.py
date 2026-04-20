@@ -54,6 +54,7 @@ async def enrich_candidates_with_perp_anomalies(
         enriched.append(
             token.model_copy(
                 update={
+                    # None = no anomaly in window; True = flip detected (False never used)
                     "perp_funding_flip": funding_flip or None,
                     "perp_oi_spike_ratio": oi_spike_ratio,
                     "perp_last_anomaly_at": latest.observed_at,
