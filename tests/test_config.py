@@ -134,3 +134,27 @@ def test_feedback_loop_defaults(monkeypatch):
     assert s.FEEDBACK_FALLBACK_ALERT_THRESHOLD == 5
     assert s.FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC == 900
     assert s.FEEDBACK_CHRONIC_FAILURE_THRESHOLD == 3
+
+
+def test_parse_perp_symbols_normalizes_list_input():
+    from scout.config import Settings
+    s = Settings(
+        TELEGRAM_BOT_TOKEN="test",
+        TELEGRAM_CHAT_ID="test",
+        ANTHROPIC_API_KEY="test",
+        PERP_SYMBOLS=["btcusdt", " ethusdt ", "SOLUSDT"],
+    )
+    assert s.PERP_SYMBOLS == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+
+def test_parse_perp_symbols_rejects_over_200_items_from_list():
+    import pytest
+    from pydantic import ValidationError
+    from scout.config import Settings
+    with pytest.raises(ValidationError):
+        Settings(
+            TELEGRAM_BOT_TOKEN="test",
+            TELEGRAM_CHAT_ID="test",
+            ANTHROPIC_API_KEY="test",
+            PERP_SYMBOLS=[f"SYM{i}" for i in range(201)],
+        )
