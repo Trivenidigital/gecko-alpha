@@ -158,6 +158,7 @@ class PaperTrader:
             "take_profit": "closed_tp",
             "stop_loss": "closed_sl",
             "expired": "closed_expired",
+            "trailing_stop": "closed_trailing_stop",
             "manual": "closed_manual",
         }
         status = status_map.get(reason, "closed_manual")

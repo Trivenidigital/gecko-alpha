@@ -22,6 +22,7 @@ async def trade_volume_spikes(
     engine, db: Database, spikes: list[dict], settings
 ) -> None:
     """Open paper trades for detected volume spikes."""
+    logger.info("trade_volume_spikes_filtered", total=len(spikes))
     for spike in spikes:
         try:
             combo_key = build_combo_key(signal_type="volume_spike", signals=None)
@@ -56,7 +57,10 @@ async def trade_gainers(
     """Open paper trades for newly detected top gainers.
 
     Filter: market_cap >= min_mcap to skip micro-cap junk.
+    Late-pump filter: skip tokens whose 24h change already exceeds
+    PAPER_GAINERS_MAX_24H_PCT (likely near pump exhaustion).
     """
+    max_24h = getattr(settings, "PAPER_GAINERS_MAX_24H_PCT", 0.0) or 0.0
     try:
         cursor = await db._conn.execute(
             """SELECT DISTINCT coin_id, symbol, name, price_change_24h,
@@ -74,16 +78,27 @@ async def trade_gainers(
             for g in new_gainers
             if g["market_cap"] is not None and g["market_cap"] < min_mcap
         )
-        if skipped_null_mcap or skipped_low_mcap:
+        skipped_late_pump = sum(
+            1
+            for g in new_gainers
+            if max_24h > 0
+            and g["price_change_24h"] is not None
+            and g["price_change_24h"] > max_24h
+        )
+        if skipped_null_mcap or skipped_low_mcap or skipped_late_pump:
             logger.info(
                 "trade_gainers_filtered",
                 total=len(new_gainers),
                 skipped_null_mcap=skipped_null_mcap,
                 skipped_low_mcap=skipped_low_mcap,
+                skipped_late_pump=skipped_late_pump,
                 min_mcap=min_mcap,
+                max_24h_pct=max_24h,
             )
         for g in new_gainers:
             if (g["market_cap"] or 0) < min_mcap:
+                continue
+            if max_24h > 0 and (g["price_change_24h"] or 0) > max_24h:
                 continue
             try:
                 combo_key = build_combo_key(signal_type="gainers_early", signals=None)
@@ -379,6 +394,38 @@ async def trade_predictions(
     - narrative_fit_score > 0 (Claude must have actually scored it)
     - category not in junk blacklist (Zoo-Themed, Trading Bots, etc)
     """
+    skipped_control = sum(1 for p in prediction_models if p.is_control)
+    skipped_low_mcap = sum(
+        1
+        for p in prediction_models
+        if not p.is_control and p.market_cap_at_prediction < min_mcap
+    )
+    skipped_low_fit = sum(
+        1
+        for p in prediction_models
+        if not p.is_control
+        and p.market_cap_at_prediction >= min_mcap
+        and (p.narrative_fit_score or 0) < min_fit_score
+    )
+    skipped_junk = sum(
+        1
+        for p in prediction_models
+        if not p.is_control
+        and p.market_cap_at_prediction >= min_mcap
+        and (p.narrative_fit_score or 0) >= min_fit_score
+        and p.category_name
+        and p.category_name.lower().strip() in _JUNK_CATEGORIES
+    )
+    logger.info(
+        "trade_predictions_filtered",
+        total=len(prediction_models),
+        skipped_control=skipped_control,
+        skipped_low_mcap=skipped_low_mcap,
+        skipped_low_fit=skipped_low_fit,
+        skipped_junk=skipped_junk,
+        min_mcap=min_mcap,
+        min_fit_score=min_fit_score,
+    )
     for pred in prediction_models:
         if pred.is_control:
             continue

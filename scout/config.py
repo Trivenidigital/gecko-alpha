@@ -213,6 +213,16 @@ class Settings(BaseSettings):
     # this window so a restart doesn't replay every currently-qualifying
     # candidate as a fresh signal. A live trader doesn't bulk-enter on reboot.
     PAPER_STARTUP_WARMUP_SECONDS: int = 180
+    # Trailing stop: once peak_pct >= activation, close if price drops
+    # drawdown% from peak AND is still above entry*(1+floor/100). Prevents
+    # giveback on tokens that briefly pump then bleed toward SL.
+    PAPER_TRAILING_ENABLED: bool = True
+    PAPER_TRAILING_ACTIVATION_PCT: float = 10.0
+    PAPER_TRAILING_DRAWDOWN_PCT: float = 10.0
+    PAPER_TRAILING_FLOOR_PCT: float = 3.0
+    # Late-pump rejection for trade_gainers: skip candidates whose 24h change
+    # already exceeds this threshold (they're near exhaustion).
+    PAPER_GAINERS_MAX_24H_PCT: float = 50.0
     TRADING_DIGEST_HOUR_UTC: int = 0  # midnight digest
     TRADING_EVAL_INTERVAL: int = 1800  # 30 min eval cycle
 

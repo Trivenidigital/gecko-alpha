@@ -136,7 +136,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                 values,
             )
 
-        # --- TP/SL/Expiry checks (takes priority, but checkpoints still recorded above) ---
+        # --- TP/SL/Expiry/Trailing-stop checks (takes priority, but checkpoints still recorded above) ---
         close_reason = None
         if current_price >= tp_price:
             close_reason = "take_profit"
@@ -144,6 +144,18 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             close_reason = "stop_loss"
         elif elapsed >= max_duration:
             close_reason = "expired"
+        elif (
+            getattr(settings, "PAPER_TRAILING_ENABLED", False)
+            and peak_price is not None
+            and peak_pct is not None
+            and peak_pct >= settings.PAPER_TRAILING_ACTIVATION_PCT
+        ):
+            drawdown_threshold = peak_price * (
+                1 - settings.PAPER_TRAILING_DRAWDOWN_PCT / 100.0
+            )
+            floor_price = entry_price * (1 + settings.PAPER_TRAILING_FLOOR_PCT / 100.0)
+            if current_price < drawdown_threshold and current_price >= floor_price:
+                close_reason = "trailing_stop"
 
         if close_reason is not None:
             # M3: Log how long ago expiry was actually due (useful after offline gaps)
