@@ -2,12 +2,16 @@
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 from pathlib import Path
 
 import aiosqlite
 
 from scout.models import CandidateToken
+
+if TYPE_CHECKING:
+    from scout.perp.schemas import PerpAnomaly
 
 # Columns that map 1:1 from CandidateToken to the candidates table.
 _CANDIDATE_COLUMNS = [
@@ -58,6 +62,10 @@ class Database:
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._create_tables()
         await self._migrate_feedback_loop_schema()
+
+    async def connect(self) -> None:
+        """Alias for :meth:`initialize` — preferred in tests and async context managers."""
+        await self.initialize()
 
     async def close(self) -> None:
         """Close the database connection."""
@@ -674,6 +682,28 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_velocity_alerts
                 ON velocity_alerts(coin_id, detected_at);
             """)
+
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS perp_anomalies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exchange TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                magnitude REAL NOT NULL,
+                baseline REAL,
+                observed_at TEXT NOT NULL,
+                UNIQUE(exchange, symbol, kind, observed_at)
+            )
+        """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_perp_anomalies_ticker_observed "
+            "ON perp_anomalies (ticker, observed_at DESC)"
+        )
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_perp_anomalies_observed "
+            "ON perp_anomalies (observed_at)"
+        )
 
         # Migrate alerts table: add price_usd, token_name, ticker if missing
         cursor = await self._conn.execute("PRAGMA table_info(alerts)")
@@ -1461,3 +1491,109 @@ class Database:
         cursor = await self._conn.execute("SELECT MAX(created_at) FROM briefings")
         row = await cursor.fetchone()
         return row[0] if row and row[0] else None
+
+    # ------------------------------------------------------------------
+    # Perp anomalies
+    # ------------------------------------------------------------------
+
+    async def insert_perp_anomaly(self, anomaly: "PerpAnomaly") -> None:
+        """Insert a single anomaly. Kept for tests; prefer batch in hot path.
+
+        Uses INSERT OR IGNORE to preserve idempotency across reconnect/replay
+        -- the UNIQUE(exchange, symbol, kind, observed_at) constraint prevents
+        duplicate rows.
+        """
+        await self._conn.execute(
+            "INSERT OR IGNORE INTO perp_anomalies "
+            "(exchange, symbol, ticker, kind, magnitude, baseline, observed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                anomaly.exchange,
+                anomaly.symbol,
+                anomaly.ticker,
+                anomaly.kind,
+                anomaly.magnitude,
+                anomaly.baseline,
+                anomaly.observed_at.isoformat(),
+            ),
+        )
+        await self._conn.commit()
+
+    async def insert_perp_anomalies_batch(self, rows: list["PerpAnomaly"]) -> int:
+        """Primary write path. Single transaction, returns row count.
+
+        Uses INSERT OR IGNORE against the UNIQUE constraint on
+        (exchange, symbol, kind, observed_at) so replays after a WS reconnect
+        do not create duplicate rows.
+        """
+        if not rows:
+            return 0
+        payload = [
+            (
+                a.exchange,
+                a.symbol,
+                a.ticker,
+                a.kind,
+                a.magnitude,
+                a.baseline,
+                a.observed_at.isoformat(),
+            )
+            for a in rows
+        ]
+        await self._conn.executemany(
+            "INSERT OR IGNORE INTO perp_anomalies "
+            "(exchange, symbol, ticker, kind, magnitude, baseline, observed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            payload,
+        )
+        await self._conn.commit()
+        return len(rows)
+
+    async def fetch_recent_perp_anomalies(
+        self,
+        *,
+        tickers: list[str],
+        since: datetime,
+        limit: int = 100,
+    ) -> list["PerpAnomaly"]:
+        """Fetch recent anomalies for ``tickers`` after ``since``.
+
+        ``limit`` caps row count to protect against pathological lookups on
+        a tickers list that unexpectedly matches tens of thousands of rows.
+        Callers that need an exhaustive read should pass an explicit value.
+        """
+        from scout.perp.schemas import PerpAnomaly
+
+        if not tickers:
+            return []
+        placeholders = ",".join(["?"] * len(tickers))
+        cur = await self._conn.execute(
+            f"SELECT exchange, symbol, ticker, kind, magnitude, baseline, observed_at "
+            f"FROM perp_anomalies "
+            f"WHERE ticker IN ({placeholders}) AND observed_at >= ? "
+            f"ORDER BY observed_at DESC "
+            f"LIMIT ?",
+            (*tickers, since.isoformat(), limit),
+        )
+        fetched = await cur.fetchall()
+        return [
+            PerpAnomaly(
+                exchange=r[0],
+                symbol=r[1],
+                ticker=r[2],
+                kind=r[3],
+                magnitude=r[4],
+                baseline=r[5],
+                observed_at=datetime.fromisoformat(r[6]),
+            )
+            for r in fetched
+        ]
+
+    async def prune_perp_anomalies(self, *, keep_days: int) -> int:
+        """Delete anomaly rows older than ``keep_days``. Returns rows deleted."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM perp_anomalies WHERE observed_at <= ?", (cutoff,)
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
