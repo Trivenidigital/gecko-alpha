@@ -685,6 +685,23 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_velocity_alerts
                 ON velocity_alerts(coin_id, detected_at);
+
+            CREATE TABLE IF NOT EXISTS cryptopanic_posts (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_id         INTEGER UNIQUE NOT NULL,
+                title           TEXT NOT NULL,
+                url             TEXT NOT NULL,
+                published_at    TEXT NOT NULL,
+                currencies_json TEXT NOT NULL,
+                is_macro        INTEGER NOT NULL,
+                sentiment       TEXT NOT NULL,
+                votes_positive  INTEGER NOT NULL DEFAULT 0,
+                votes_negative  INTEGER NOT NULL DEFAULT 0,
+                fetched_at      TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS ix_cryptopanic_published_at
+                ON cryptopanic_posts(published_at DESC);
             """)
 
         await self._conn.execute("""
@@ -1625,6 +1642,69 @@ class Database:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
         cur = await self._conn.execute(
             "DELETE FROM perp_anomalies WHERE observed_at <= ?", (cutoff,)
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    # ------------------------------------------------------------------
+    # CryptoPanic posts
+    # ------------------------------------------------------------------
+
+    async def insert_cryptopanic_post(
+        self,
+        post,
+        *,
+        is_macro: bool,
+        sentiment: str,
+    ) -> int:
+        """INSERT OR IGNORE a CryptoPanic post. Returns rowcount (0 or 1)."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        cur = await self._conn.execute(
+            """
+            INSERT OR IGNORE INTO cryptopanic_posts (
+                post_id, title, url, published_at, currencies_json,
+                is_macro, sentiment, votes_positive, votes_negative, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                post.post_id,
+                post.title,
+                post.url,
+                post.published_at,
+                json.dumps(post.currencies),
+                1 if is_macro else 0,
+                sentiment,
+                post.votes_positive,
+                post.votes_negative,
+                fetched_at,
+            ),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def fetch_all_cryptopanic_posts(self) -> list[dict]:
+        """Return all rows (test helper)."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cur = await self._conn.execute(
+            "SELECT * FROM cryptopanic_posts ORDER BY published_at DESC"
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def prune_cryptopanic_posts(self, *, keep_days: int) -> int:
+        """Delete rows with published_at older than keep_days. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        # Using <= (not <) so that keep_days=0 reliably deletes all rows on
+        # low-resolution clocks (Windows): datetime.now() may return identical
+        # strings back-to-back, so strict < would fail to delete "fresh" rows.
+        cur = await self._conn.execute(
+            "DELETE FROM cryptopanic_posts WHERE published_at <= ?",
+            (cutoff,),
         )
         await self._conn.commit()
         return cur.rowcount or 0
