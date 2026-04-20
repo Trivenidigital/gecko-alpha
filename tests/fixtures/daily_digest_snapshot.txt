@@ -1,0 +1,12 @@
+Paper Trading — 2026-04-18
+
+Trades: 3 opened, 3 closed
+PnL: +$32.00 (win rate: 66.7%)
+Best: C +20.0% (+$25.00)
+Worst: B -5.0% (-$8.00)
+
+By signal type:
+  gainers_early: 1 trades, -$8.00 (0.0% WR)
+  volume_spike: 2 trades, +$40.00 (100.0% WR)
+
+Open: 0 positions ($0.00 exposure)

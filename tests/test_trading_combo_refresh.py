@@ -341,6 +341,7 @@ async def test_refresh_failures_resets_to_zero_on_success(tmp_path, settings_fac
     assert ok is True
     row = await _get_combo_row(db, "healed", "30d")
     assert row["refresh_failures"] == 0
+    await db.close()
 
 
 async def test_chronic_failure_threshold_detected(tmp_path, settings_factory):
