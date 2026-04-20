@@ -1048,6 +1048,12 @@ async def main() -> None:
             # Cancel the perp watcher task (if running) on graceful shutdown.
             if perp_task is not None:
                 perp_task.cancel()
+                try:
+                    await asyncio.wait_for(perp_task, timeout=5.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+                except Exception:
+                    logger.exception("perp_loop_shutdown_error")
 
             # Ensure the social task winds down cleanly after the main loops exit.
             if social_task is not None and not social_task.done():

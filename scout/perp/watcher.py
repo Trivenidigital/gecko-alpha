@@ -196,7 +196,12 @@ async def _run_exchange_with_supervision(
             continue
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "perp_exchange_stream_error",
+                exchange=name,
+                error=repr(exc),
+            )
             state.exchange_errors[name] = state.exchange_errors.get(name, 0) + 1
             consecutive_failures += 1
             attempts += 1
