@@ -1,6 +1,7 @@
 """DexScreener API poller for trending tokens."""
 
 import asyncio
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -169,6 +170,16 @@ async def fetch_top_boosts(
         except (TypeError, ValueError):
             if not warned:
                 logger.warning("top_boosts_bad_total_amount", entry=entry)
+                warned = True
+            continue
+
+        # Guard against NaN / Infinity leaking through: json.loads accepts
+        # non-standard "NaN"/"Infinity" tokens by default, and float("inf")
+        # would make boost_total_amount >= MIN_BOOST_TOTAL_AMOUNT always
+        # true in the scorer, granting a permanent +20 velocity_boost.
+        if not math.isfinite(total_amount) or total_amount < 0:
+            if not warned:
+                logger.warning("top_boosts_non_finite_total", entry=entry)
                 warned = True
             continue
 

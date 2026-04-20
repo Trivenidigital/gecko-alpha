@@ -254,3 +254,48 @@ async def test_fetch_top_boosts_cache_preserved_on_failure(
     # Cache must not be cleared on failure
     assert len(_dex_module.last_raw_top_boosts) == 1
     assert _dex_module.last_raw_top_boosts[0]["tokenAddress"] == "STALE"
+
+
+async def test_fetch_top_boosts_skips_non_finite_total_amount(
+    mock_aiohttp, settings_factory, monkeypatch
+):
+    """NaN / Infinity / -Infinity totalAmount values must be dropped.
+
+    `float("inf")` doesn't raise from `float()` conversion, so without an
+    explicit `math.isfinite` guard an Inf leak would grant a permanent
+    velocity_boost signal in the scorer.
+    """
+    import json
+    import structlog.testing
+
+    monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
+
+    payload = [
+        {"chainId": "solana", "tokenAddress": "INF_ADDR", "totalAmount": float("inf")},
+        {"chainId": "base", "tokenAddress": "NAN_ADDR", "totalAmount": float("nan")},
+        {
+            "chainId": "ethereum",
+            "tokenAddress": "NEG_INF_ADDR",
+            "totalAmount": float("-inf"),
+        },
+        {"chainId": "solana", "tokenAddress": "GOOD_ADDR", "totalAmount": 1500.0},
+    ]
+    # Python's json module emits `Infinity` / `NaN` as non-standard tokens
+    # and json.loads accepts them by default (allow_nan=True).
+    body = json.dumps(payload)
+    mock_aiohttp.get(TOP_BOOSTS_URL, body=body, content_type="application/json")
+
+    settings = settings_factory()
+    with structlog.testing.capture_logs() as entries:
+        async with aiohttp.ClientSession() as session:
+            result = await fetch_top_boosts(session, settings)
+
+    assert len(result) == 1
+    assert result[0].address == "GOOD_ADDR"
+    assert result[0].total_amount == 1500.0
+    # A warning was logged for at least one non-finite entry
+    assert any(
+        e.get("event") == "top_boosts_non_finite_total"
+        and e.get("log_level") == "warning"
+        for e in entries
+    )

@@ -72,3 +72,51 @@ def test_velocity_boost_isolated_score_is_9(token_factory, settings_factory):
     assert sig_yes == ["velocity_boost"]
     assert pts_no == 0
     assert pts_yes == int(20 * 100 / 203)  # == 9
+
+
+def test_velocity_boost_emits_structlog_event_when_firing(
+    token_factory, settings_factory
+):
+    """Spec §10: `velocity_boost_signal_fired` event must be emitted each
+    time the signal triggers, carrying token/contract/chain/boost context."""
+    import structlog.testing
+
+    settings = settings_factory(MIN_BOOST_TOTAL_AMOUNT=500.0)
+    token = token_factory(
+        contract_address="0xFIRE",
+        chain="ethereum",
+        ticker="FIRE",
+        liquidity_usd=20_000,
+        boost_total_amount=1500.0,
+        boost_rank=3,
+    )
+
+    with structlog.testing.capture_logs() as entries:
+        score(token, settings)
+
+    fired = [e for e in entries if e.get("event") == "velocity_boost_signal_fired"]
+    assert len(fired) == 1
+    evt = fired[0]
+    assert evt["token"] == "FIRE"
+    assert evt["contract_address"] == "0xFIRE"
+    assert evt["chain"] == "ethereum"
+    assert evt["boost_total"] == 1500.0
+    assert evt["boost_rank"] == 3
+
+
+def test_velocity_boost_silent_structlog_when_below_threshold(
+    token_factory, settings_factory
+):
+    """No event when the signal doesn't fire."""
+    import structlog.testing
+
+    settings = settings_factory(MIN_BOOST_TOTAL_AMOUNT=500.0)
+    token = token_factory(
+        liquidity_usd=20_000,
+        boost_total_amount=100.0,
+    )
+
+    with structlog.testing.capture_logs() as entries:
+        score(token, settings)
+
+    assert not any(e.get("event") == "velocity_boost_signal_fired" for e in entries)

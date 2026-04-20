@@ -42,7 +42,6 @@ class Settings(BaseSettings):
     COINGECKO_RATE_LIMIT_PER_MIN: int = 25  # buffer under 30/min free tier
 
     # -------- DexScreener Top Boosts (BL-051) --------
-    DEXSCREENER_TOP_BOOSTS_POLL_EVERY_CYCLES: int = 1
     MIN_BOOST_TOTAL_AMOUNT: float = 500.0
 
     # MiroFish

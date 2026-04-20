@@ -9,7 +9,7 @@ Scoring weights (must always document rationale):
 
 DexScreener signals:
 - buy_pressure (buy_ratio > BUY_PRESSURE_THRESHOLD): 15 points -- Organic buying vs wash trade
-- velocity_boost (boost_amount rising): 20 points -- DexScreener boost momentum
+- velocity_boost (boost_total_amount >= MIN_BOOST_TOTAL_AMOUNT): 20 points -- Paid-promo momentum (BL-051)
 
 CoinGecko signals:
 - momentum_ratio (1h/24h > MOMENTUM_RATIO_THRESHOLD): 20 points -- Accelerating
@@ -26,8 +26,12 @@ Max raw: 30+8+25+15+15+15+20+25+15+20+5+10 = 203 points
 Normalized to 0-100 scale, then co-occurrence multiplier (1.15x if 3+ signals) applied.
 """
 
+import structlog
+
 from scout.config import Settings
 from scout.models import CandidateToken
+
+logger = structlog.get_logger(__name__)
 
 # Theoretical maximum raw score — update if signal weights change
 SCORER_MAX_RAW = 203
@@ -152,6 +156,14 @@ def score(
     ):
         points += 20
         signals.append("velocity_boost")
+        logger.info(
+            "velocity_boost_signal_fired",
+            token=token.ticker,
+            contract_address=token.contract_address,
+            chain=token.chain,
+            boost_total=token.boost_total_amount,
+            boost_rank=token.boost_rank,
+        )
 
     # Signal 11: Solana chain bonus -- 5 points
     if token.chain == "solana":

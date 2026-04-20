@@ -105,8 +105,9 @@ File: `scout/config.py`. Add to a new block labeled `# -------- DexScreener Top 
 
 | Key | Default | Rationale |
 |---|---|---|
-| `DEXSCREENER_TOP_BOOSTS_POLL_EVERY_CYCLES` | `1` | Endpoint is free, no auth, no documented rate cap. Poll every cycle (≈60s) for freshest rank data. Knob exists so we can throttle if we see 429s in production. |
 | `MIN_BOOST_TOTAL_AMOUNT` | `500.0` | Minimum cumulative `totalAmount` (USD-equivalent) to trigger the signal. $500 ≈ 5 stacked $100 boosts — enough to clearly exceed accidental/test spend while remaining below typical pump-team commitment (often $2k–$10k). Tunable via env var. |
+
+**Follow-up (deferred):** Poll-every-cycles throttle was originally speced as `DEXSCREENER_TOP_BOOSTS_POLL_EVERY_CYCLES` but dropped from v1 — `main.py` has no cycle counter to read it against, and introducing one just for this knob is scope creep. Reintroduce honoring it in a follow-up when 429s actually appear.
 
 No other config changes. No kill-switch — the feature is gated by threshold. If we need to fully disable the poller we can set `MIN_BOOST_TOTAL_AMOUNT` to a very large number (e.g. `1_000_000`), which blocks signal firing but still pulls data for observability.
 
@@ -279,7 +280,7 @@ A PR implementing this spec is complete when all of the following are verifiable
 6. **Integration.** An end-to-end test driving `run_cycle()` with all 6 ingestion sources mocked produces a candidate whose `signals_fired` contains `velocity_boost` and whose stored quant score reflects the decoration.
 7. **Regression.** `uv run pytest --tb=short -q` passes with zero regressions. Any golden-value test impacted by the `SCORER_MAX_RAW` shift is updated with an accompanying comment noting the BL-051 normalization change.
 8. **Observability.** Grepping logs from a dry-run cycle shows at least one `dex_top_boosts_fetched` event and (when the fixture triggers it) at least one `velocity_boost_signal_fired` event.
-9. **No `.env` / secrets leak.** No new env vars require credentials. `.env.example` updated with `MIN_BOOST_TOTAL_AMOUNT=500` and `DEXSCREENER_TOP_BOOSTS_POLL_EVERY_CYCLES=1` documented.
+9. **No `.env` / secrets leak.** No new env vars require credentials. `.env.example` updated with `MIN_BOOST_TOTAL_AMOUNT=500` documented.
 
 ## 14. Risks / Open Questions
 
@@ -287,7 +288,7 @@ A PR implementing this spec is complete when all of the following are verifiable
 - **`totalAmount` currency unit.** DexScreener does not document the unit of `totalAmount`. From observation in-market the value tracks the USD-equivalent cost of the booster's purchased promo credit (boost packages are priced in USD). *Decision:* treat as USD. If this later proves to be SOL/ETH-denominated in some response variant, we update the docstring and threshold in a follow-up — the code is unaffected because the threshold is a float.
 - **Boost spam / wash-boosting.** Nothing prevents a coordinated team from self-boosting to cross the $500 threshold cheaply. *Mitigation:* the signal is +20 of a possible 203 raw points, and the co-occurrence gate requires ≥3 signals for the multiplier. Boosts alone cannot alert; they must combine with real on-chain momentum. Revisit if we see false-positive clusters in production.
 - **Persistence of boost history.** v1 does NOT store history; only point-in-time decorations. *Decision:* ship without history. If the signal proves valuable, a follow-up spec can add `boost_history_cg` (analogous to `volume_history_cg`) for slope/rank-delta signals.
-- **Interaction with existing `fetch_trending`.** Both pollers hit DexScreener. Combined they are ≤~60 requests/cycle (top-boosts is 1 call; existing boosts-latest is 1 + N hydration calls). No documented rate cap exists for `/token-boosts/*`; the paid docs mention "reasonable rate limits" without numbers. *Mitigation:* reuse `_get_json` backoff; monitor 429 log volume after deploy and tighten `MAX_CONCURRENT` or `DEXSCREENER_TOP_BOOSTS_POLL_EVERY_CYCLES` if needed.
+- **Interaction with existing `fetch_trending`.** Both pollers hit DexScreener. Combined they are ≤~60 requests/cycle (top-boosts is 1 call; existing boosts-latest is 1 + N hydration calls). No documented rate cap exists for `/token-boosts/*`; the paid docs mention "reasonable rate limits" without numbers. *Mitigation:* reuse `_get_json` backoff; monitor 429 log volume after deploy and tighten `MAX_CONCURRENT` or reintroduce a poll-every-N-cycles throttle (see follow-ups) if needed.
 
 ## 15. Rollout / Ops
 
