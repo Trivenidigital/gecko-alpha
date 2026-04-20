@@ -1,42 +1,39 @@
 """Shared test fixtures for CoinPump Scout."""
 
-import os
-import sys
-
+import aiosqlite.core
 import pytest
 
 from scout.config import Settings
 from scout.models import CandidateToken
 
+# Fix for issue #31 — aiosqlite interpreter-shutdown hang.
+#
+# aiosqlite.Connection spawns a worker Thread that is NOT a daemon. On
+# interpreter shutdown Python waits for all non-daemon threads to exit.
+# In tests (pytest-asyncio auto mode) each test gets its own event loop;
+# when a Connection is closed, the worker thread tries to post a result
+# via call_soon_threadsafe to a loop that pytest-asyncio has since
+# closed, raising RuntimeError('Event loop is closed') from inside the
+# thread's try/except. That exception propagates out of the worker and
+# the thread dies — but the underlying sqlite3 file is still unclosed
+# on some paths, and other aiosqlite internals have left pending work
+# that keeps the interpreter alive on shutdown for ~9 minutes on CI.
+#
+# Force the worker thread to be a daemon in tests only. Production code
+# still uses the non-daemon default so a clean shutdown path for real
+# data writes is preserved. This must run before any aiosqlite.Connection
+# is instantiated; conftest.py module-level is early enough because
+# scout.db only creates Connections lazily inside test bodies.
+_OrigThread = aiosqlite.core.Thread
 
-@pytest.hookimpl(trylast=True)
-def pytest_sessionfinish(session, exitstatus):
-    """Force-exit on CI once pytest finishes.
 
-    aiosqlite opens a non-daemon worker thread per Connection. Any test that
-    forgets `await db.close()` leaks that thread, which blocks the interpreter
-    from exiting. On Linux CI this manifested as a 9-minute hang after all
-    tests passed; on Windows (local dev) the same leak also reproduces.
+class _DaemonThread(_OrigThread):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.daemon = True
 
-    Known remaining explicit leakers are fixed test-by-test (see commits
-    touching `await db.close()`). Two leakers in tests were patched; a
-    third leak source still lives somewhere in aiosqlite shutdown paths —
-    tracked in https://github.com/Trivenidigital/gecko-alpha/issues/31.
-    This hook is belt-and-braces: if a future test leaks, CI still exits
-    on time rather than burning the job timeout. Local developers don't
-    hit this path because it only fires on GHA.
 
-    `trylast=True` lets other sessionfinish plugins (coverage thresholds,
-    xdist worker reporting, pytest-html) run their hooks and mutate
-    `exitstatus` first; we read the post-mutation value. We also flush
-    stdout/stderr before `os._exit` so any late teardown traceback or
-    captured output reaches the CI log — `os._exit` bypasses the normal
-    threading-shutdown and stream-flush paths.
-    """
-    if os.environ.get("GITHUB_ACTIONS") == "true":
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(exitstatus)
+aiosqlite.core.Thread = _DaemonThread
 
 
 @pytest.fixture
