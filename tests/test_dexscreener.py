@@ -153,7 +153,9 @@ async def test_fetch_top_boosts_happy_path(mock_aiohttp, settings_factory, monke
     assert result[1] == BoostInfo(chain="base", address="0xABCDEF", total_amount=800.0)
 
 
-async def test_fetch_top_boosts_empty_response(mock_aiohttp, settings_factory, monkeypatch):
+async def test_fetch_top_boosts_empty_response(
+    mock_aiohttp, settings_factory, monkeypatch
+):
     monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
     mock_aiohttp.get(TOP_BOOSTS_URL, payload=[])
 
@@ -164,7 +166,9 @@ async def test_fetch_top_boosts_empty_response(mock_aiohttp, settings_factory, m
     assert result == []
 
 
-async def test_fetch_top_boosts_skips_missing_total_amount(mock_aiohttp, settings_factory, monkeypatch):
+async def test_fetch_top_boosts_skips_missing_total_amount(
+    mock_aiohttp, settings_factory, monkeypatch
+):
     monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
     payload = [
         {"chainId": "solana", "tokenAddress": "ADDR1"},  # no totalAmount
@@ -180,11 +184,13 @@ async def test_fetch_top_boosts_skips_missing_total_amount(mock_aiohttp, setting
     assert result[0].address == "0xABC"
 
 
-async def test_fetch_top_boosts_skips_missing_chain_or_address(mock_aiohttp, settings_factory, monkeypatch):
+async def test_fetch_top_boosts_skips_missing_chain_or_address(
+    mock_aiohttp, settings_factory, monkeypatch
+):
     monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
     payload = [
-        {"tokenAddress": "ADDR1", "totalAmount": 1000.0},          # no chainId
-        {"chainId": "solana", "totalAmount": 1000.0},               # no tokenAddress
+        {"tokenAddress": "ADDR1", "totalAmount": 1000.0},  # no chainId
+        {"chainId": "solana", "totalAmount": 1000.0},  # no tokenAddress
         {"chainId": "base", "tokenAddress": "0xGOOD", "totalAmount": 300.0},
     ]
     mock_aiohttp.get(TOP_BOOSTS_URL, payload=payload)
@@ -197,7 +203,9 @@ async def test_fetch_top_boosts_skips_missing_chain_or_address(mock_aiohttp, set
     assert result[0].address == "0xGOOD"
 
 
-async def test_fetch_top_boosts_upstream_error_returns_empty(mock_aiohttp, settings_factory, monkeypatch):
+async def test_fetch_top_boosts_upstream_error_returns_empty(
+    mock_aiohttp, settings_factory, monkeypatch
+):
     monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
     mock_aiohttp.get(TOP_BOOSTS_URL, status=500)
     mock_aiohttp.get(TOP_BOOSTS_URL, status=500)
@@ -210,7 +218,9 @@ async def test_fetch_top_boosts_upstream_error_returns_empty(mock_aiohttp, setti
     assert result == []
 
 
-async def test_fetch_top_boosts_populates_module_cache(mock_aiohttp, settings_factory, monkeypatch):
+async def test_fetch_top_boosts_populates_module_cache(
+    mock_aiohttp, settings_factory, monkeypatch
+):
     monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
     _dex_module.last_raw_top_boosts.clear()
     mock_aiohttp.get(TOP_BOOSTS_URL, payload=SAMPLE_TOP_BOOSTS_PAYLOAD)
@@ -223,7 +233,9 @@ async def test_fetch_top_boosts_populates_module_cache(mock_aiohttp, settings_fa
     assert _dex_module.last_raw_top_boosts[0]["tokenAddress"] == "ADDR1"
 
 
-async def test_fetch_top_boosts_cache_preserved_on_failure(mock_aiohttp, settings_factory, monkeypatch):
+async def test_fetch_top_boosts_cache_preserved_on_failure(
+    mock_aiohttp, settings_factory, monkeypatch
+):
     monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
     # Pre-populate cache with stale data
     stale = [{"chainId": "solana", "tokenAddress": "STALE", "totalAmount": 999.0}]

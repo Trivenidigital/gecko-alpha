@@ -20,21 +20,27 @@ async def test_run_cycle_invokes_fetch_top_boosts_and_wires_decorator(
     db = Database(settings.DB_PATH)
     await db.initialize()
 
-    with patch.object(main_module, "fetch_trending", new=AsyncMock(return_value=[])), \
-         patch.object(main_module, "fetch_trending_pools", new=AsyncMock(return_value=[])), \
-         patch.object(main_module, "cg_fetch_top_movers", new=AsyncMock(return_value=[])), \
-         patch.object(main_module, "cg_fetch_trending", new=AsyncMock(return_value=[])), \
-         patch.object(main_module, "cg_fetch_by_volume", new=AsyncMock(return_value=[])), \
-         patch.object(
-             main_module,
-             "fetch_top_boosts",
-             new=AsyncMock(return_value=[BoostInfo("ethereum", "0xfeed", 1500.0)]),
-         ) as mock_top_boosts, \
-         patch.object(
-             main_module,
-             "apply_boost_decorations",
-             wraps=main_module.apply_boost_decorations,
-         ) as mock_apply:
+    with (
+        patch.object(main_module, "fetch_trending", new=AsyncMock(return_value=[])),
+        patch.object(
+            main_module, "fetch_trending_pools", new=AsyncMock(return_value=[])
+        ),
+        patch.object(
+            main_module, "cg_fetch_top_movers", new=AsyncMock(return_value=[])
+        ),
+        patch.object(main_module, "cg_fetch_trending", new=AsyncMock(return_value=[])),
+        patch.object(main_module, "cg_fetch_by_volume", new=AsyncMock(return_value=[])),
+        patch.object(
+            main_module,
+            "fetch_top_boosts",
+            new=AsyncMock(return_value=[BoostInfo("ethereum", "0xfeed", 1500.0)]),
+        ) as mock_top_boosts,
+        patch.object(
+            main_module,
+            "apply_boost_decorations",
+            wraps=main_module.apply_boost_decorations,
+        ) as mock_apply,
+    ):
         async with aiohttp.ClientSession() as session:
             await main_module.run_cycle(settings, db, session, dry_run=True)
 
@@ -47,9 +53,7 @@ async def test_run_cycle_invokes_fetch_top_boosts_and_wires_decorator(
     # The wired-through boost list must reach the decorator unchanged.
     call_args = mock_apply.call_args
     passed_boosts = (
-        call_args.args[1]
-        if len(call_args.args) > 1
-        else call_args.kwargs["boosts"]
+        call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs["boosts"]
     )
     assert len(passed_boosts) == 1
     assert passed_boosts[0].address == "0xfeed"

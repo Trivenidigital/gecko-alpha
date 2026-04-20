@@ -39,11 +39,12 @@ def test_aggregate_preserves_all_fields(token_factory):
 from scout.aggregator import apply_boost_decorations
 from scout.ingestion.dexscreener import BoostInfo
 
-
 EVM_ADDR_UPPER = "0xAbC0000000000000000000000000000000000001"
 EVM_ADDR_LOWER = EVM_ADDR_UPPER.lower()
 SOL_ADDR_A = "7GAGFk8aJMbNSRtCh8bB9x6eVpKZwxzMnB3UsNYukgmo"
-SOL_ADDR_B = "7GAGFk8aJMbNSRtCh8bB9x6eVpKZwxzMnB3UsNYukgMO"  # differs in last two chars' case
+SOL_ADDR_B = (
+    "7GAGFk8aJMbNSRtCh8bB9x6eVpKZwxzMnB3UsNYukgMO"  # differs in last two chars' case
+)
 
 
 def test_apply_boost_decorations_match_evm_case_insensitive(token_factory):

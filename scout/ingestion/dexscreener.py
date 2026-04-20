@@ -54,7 +54,16 @@ _CHAIN_ID_MAP = {
 # EVM-family chains where addresses are case-insensitive hex. All other
 # chains (solana, sui, aptos, tron, ...) keep their native case.
 _EVM_CHAINS = frozenset(
-    {"ethereum", "base", "arbitrum", "bsc", "polygon", "avalanche", "optimism", "fantom"}
+    {
+        "ethereum",
+        "base",
+        "arbitrum",
+        "bsc",
+        "polygon",
+        "avalanche",
+        "optimism",
+        "fantom",
+    }
 )
 
 
@@ -164,7 +173,9 @@ async def fetch_top_boosts(
             continue
 
         chain = _normalize_chain_id(chain_id)
-        results.append(BoostInfo(chain=chain, address=address, total_amount=total_amount))
+        results.append(
+            BoostInfo(chain=chain, address=address, total_amount=total_amount)
+        )
 
     logger.info(
         "dex_top_boosts_fetched",
