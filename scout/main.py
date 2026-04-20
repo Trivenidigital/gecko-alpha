@@ -35,6 +35,11 @@ from scout.ingestion.dexscreener import fetch_trending
 from scout.ingestion.geckoterminal import fetch_trending_pools
 from scout.ingestion.holder_enricher import enrich_holders
 from scout.narrative.agent import narrative_agent_loop
+from scout.news.cryptopanic import (
+    enrich_candidates_with_news,
+    fetch_cryptopanic_posts,
+)
+from scout.news.schemas import classify_macro, classify_sentiment
 from scout.safety import is_safe
 from scout.scorer import score
 from scout.spikes.detector import record_volume, detect_spikes, detect_7d_momentum
@@ -483,6 +488,14 @@ async def run_cycle(
     )
     stats["tokens_scanned"] = len(all_candidates)
 
+    # Kick off CryptoPanic fetch concurrently with enrichment (if enabled).
+    # Never raises — short-circuits to [] on any failure.
+    cryptopanic_task = None
+    if settings.CRYPTOPANIC_ENABLED:
+        cryptopanic_task = asyncio.create_task(
+            fetch_cryptopanic_posts(session, settings)
+        )
+
     # Enrich holders (concurrently)
     enriched = list(
         await asyncio.gather(
@@ -511,6 +524,33 @@ async def run_cycle(
 
     # Stage 2.5: Perp enrichment (OI/funding anomalies from perp watcher)
     enriched = await _maybe_enrich_perp(enriched, db=db, settings=settings)
+
+    # Await CryptoPanic fetch (launched before enrichment) with a 10s cap
+    # so a stalled third-party call cannot extend the cycle indefinitely.
+    if cryptopanic_task is not None:
+        try:
+            cp_posts = await asyncio.wait_for(cryptopanic_task, timeout=10.0)
+        except Exception as e:
+            logger.warning("cryptopanic_fetch_failed", error=str(e))
+            cp_posts = []
+        if cp_posts:
+            # Persist posts (idempotent INSERT OR IGNORE).
+            for post in cp_posts:
+                try:
+                    sentiment = classify_sentiment(
+                        post.votes_positive, post.votes_negative
+                    )
+                    is_macro = classify_macro(
+                        post.currencies,
+                        threshold=settings.CRYPTOPANIC_MACRO_MIN_CURRENCIES,
+                    )
+                    await db.insert_cryptopanic_post(
+                        post, is_macro=is_macro, sentiment=sentiment
+                    )
+                except Exception:
+                    logger.exception("cryptopanic_persist_error", post_id=post.post_id)
+            # Tag candidates
+            enriched = enrich_candidates_with_news(enriched, cp_posts, settings)
 
     # Stage 3: Score
     scored = []
