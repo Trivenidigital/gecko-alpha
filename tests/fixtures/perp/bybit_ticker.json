@@ -1,0 +1,12 @@
+{
+  "topic": "tickers.BTCUSDT",
+  "ts": 1713600000000,
+  "type": "snapshot",
+  "data": {
+    "symbol": "BTCUSDT",
+    "markPrice": "50000.00",
+    "fundingRate": "0.0001",
+    "openInterest": "12345.678",
+    "openInterestValue": "617283900.00"
+  }
+}
