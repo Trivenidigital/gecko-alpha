@@ -26,6 +26,7 @@
 - `_txn_lock` is an `asyncio.Lock` on `Database` initialized in `initialize()`. Use it via `async with db._txn_lock:` — never construct a fresh Lock.
 - `trade_first_signals` receives tuples `(token, quant_score, signals_fired)`. The token's identifier field is `token.contract_address` (NOT `token.token_id`) — the spec's `token_id` is the abstraction; the concrete field in `CandidateToken` is `contract_address`.
 - The new `signal_type` string is exactly `"first_signal"`.
+- **`classify_transitions` returns `dict[str, str | None]`** mapping transitioned token_id → prior `last_qualified_at` ISO string (or `None` if the token had no prior row). Callers iterate keys for membership, read values for observability. This shape is required by the spec's Observability section, which mandates `prior_last_qualified_at` and `elapsed_since_prior_hours` on the `qualifier_transition_fired` log event.
 
 ---
 
@@ -150,7 +151,7 @@ def test_config_rejects_retention_le_grace(settings_factory):
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/test_trading_qualifier_state.py::test_config_defaults_for_qualifier_settings tests/test_trading_qualifier_state.py::test_config_rejects_retention_le_grace -v`
-Expected: FAIL. `test_config_defaults_for_qualifier_settings` fails with `AttributeError: 'Settings' object has no attribute 'QUALIFIER_EXIT_GRACE_HOURS'`. `test_config_rejects_retention_le_grace` fails because `settings_factory(QUALIFIER_...)` raises for an unknown field under `extra="ignore"` it's ignored — the `pytest.raises(ValueError)` won't trigger.
+Expected: FAIL. `test_config_defaults_for_qualifier_settings` fails with `AttributeError: 'Settings' object has no attribute 'QUALIFIER_EXIT_GRACE_HOURS'`. `test_config_rejects_retention_le_grace` fails with `pytest.raises` reporting `DID NOT RAISE ValueError` — `SettingsConfigDict(extra="ignore")` silently drops the unknown `QUALIFIER_*` kwargs, so construction succeeds where the test expected a failure.
 
 - [ ] **Step 3: Add the settings + validator**
 
@@ -242,7 +243,8 @@ async def test_classify_returns_all_tokens_on_first_call(tmp_path):
         now=now,
         exit_grace_hours=48,
     )
-    assert result == {"a", "b", "c"}
+    # Returns dict[token_id -> prior_last_qualified_at]; None = no prior row.
+    assert result == {"a": None, "b": None, "c": None}
 
     for tid in ("a", "b", "c"):
         row = await _qualifier_row(db, "first_signal", tid)
@@ -268,7 +270,7 @@ async def test_classify_returns_empty_when_all_tokens_already_present(tmp_path):
         now=now,
         exit_grace_hours=48,
     )
-    assert result == set()
+    assert result == {}
 
     # last_qualified_at bumped to now; first_qualified_at preserved
     for tid in ("a", "b"):
@@ -293,7 +295,8 @@ async def test_classify_returns_only_new_token(tmp_path):
         now=now,
         exit_grace_hours=48,
     )
-    assert result == {"b"}
+    # Only "b" transitioned; "b" has no prior row → prior is None.
+    assert result == {"b": None}
     await db.close()
 
 
@@ -312,7 +315,9 @@ async def test_re_entry_outside_grace_counts_as_transition(tmp_path):
         now=now,
         exit_grace_hours=48,
     )
-    assert result == {"a"}
+    # Re-entry transition; prior last_qualified_at is reported for observability.
+    assert set(result.keys()) == {"a"}
+    assert result["a"] == stale.isoformat()
 
     # first_qualified_at RESETS to now on re-entry
     row = await _qualifier_row(db, "first_signal", "a")
@@ -336,7 +341,7 @@ async def test_re_entry_inside_grace_is_not_transition(tmp_path):
         now=now,
         exit_grace_hours=48,
     )
-    assert result == set()
+    assert result == {}
 
     row = await _qualifier_row(db, "first_signal", "a")
     assert row["first_qualified_at"] == recent.isoformat()  # preserved
@@ -360,7 +365,7 @@ async def test_re_entry_exactly_at_grace_boundary_is_not_transition(tmp_path):
         now=now,
         exit_grace_hours=48,
     )
-    assert result == set()
+    assert result == {}
     await db.close()
 
 
@@ -379,7 +384,8 @@ async def test_re_entry_one_second_past_grace_is_transition(tmp_path):
         now=now,
         exit_grace_hours=48,
     )
-    assert result == {"a"}
+    assert set(result.keys()) == {"a"}
+    assert result["a"] == stale.isoformat()
     await db.close()
 ```
 
@@ -419,22 +425,27 @@ async def classify_transitions(
     current_token_ids: set[str],
     now: datetime,
     exit_grace_hours: int,
-) -> set[str]:
+) -> dict[str, str | None]:
     """Classify current_token_ids into transitions (returned) and continuations (not).
 
-    Upserts ALL current_token_ids unconditionally. Returns the subset that did
-    NOT have a row with last_qualified_at strictly newer than (now - grace).
+    Upserts ALL current_token_ids unconditionally. Returns a mapping of transitioned
+    token_id → prior `last_qualified_at` ISO string (or None for tokens with no
+    prior row). Callers iterate keys for membership and read values for
+    observability (`prior_last_qualified_at`, `elapsed_since_prior_hours`).
+
+    A token is a transition iff it had NO prior row, OR its prior
+    `last_qualified_at` is strictly older than `now - exit_grace_hours`.
 
     Boundary convention: prior last_qualified_at == (now - exit_grace_hours)
     counts as continuation (inclusive).
 
-    Empty input early-returns set() without touching the DB or the txn lock.
+    Empty input early-returns {} without touching the DB or the txn lock.
 
     Error policy: aiosqlite errors propagate. Caller is REQUIRED to wrap
     invocation in try/except and fail-closed for the cycle.
     """
     if not current_token_ids:
-        return set()
+        return {}
 
     if db._conn is None or db._txn_lock is None:
         raise RuntimeError(
@@ -456,11 +467,11 @@ async def classify_transitions(
         )
         existing = {row[0]: row[1] for row in await cur.fetchall()}
 
-        transitions: set[str] = set()
+        transitions: dict[str, str | None] = {}
         for tid in current_token_ids:
             prior_last = existing.get(tid)
             if prior_last is None:
-                transitions.add(tid)
+                transitions[tid] = None
                 continue
             # Compare ISO-8601 strings via datetime() wrapper — per PR #24,
             # raw string comparison breaks on any format drift (timezone
@@ -471,15 +482,14 @@ async def classify_transitions(
             )
             cmp_row = await cmp.fetchone()
             if cmp_row and cmp_row[0]:
-                # threshold is strictly greater than prior_last → transition
-                transitions.add(tid)
+                # threshold is strictly greater than prior_last → transition.
+                # Record prior for observability.
+                transitions[tid] = prior_last
 
         # Upsert every token. first_qualified_at:
         #   - new row: now
         #   - transition (prior outside grace): now (reset)
-        #   - continuation: preserved via INSERT OR REPLACE with COALESCE
-        # Use ON CONFLICT UPDATE to preserve first_qualified_at for continuations
-        # while resetting it for transitions.
+        #   - continuation: preserved via UPDATE of last_qualified_at only
         for tid in current_token_ids:
             if tid in transitions:
                 # transition or brand-new: first = now, last = now
@@ -565,7 +575,7 @@ async def test_empty_current_ids_returns_empty_without_transaction(tmp_path, mon
         now=datetime(2026, 4, 19, 12, 0, 0, tzinfo=timezone.utc),
         exit_grace_hours=48,
     )
-    assert result == set()
+    assert result == {}
     await db.close()
 
 
@@ -607,7 +617,7 @@ async def test_different_signal_types_do_not_interfere(tmp_path):
         now=now,
         exit_grace_hours=48,
     )
-    assert first_result == {"shared_token"}
+    assert first_result == {"shared_token": None}
 
     # Same token under a different signal_type is a fresh transition
     other_result = await classify_transitions(
@@ -617,7 +627,7 @@ async def test_different_signal_types_do_not_interfere(tmp_path):
         now=now,
         exit_grace_hours=48,
     )
-    assert other_result == {"shared_token"}
+    assert other_result == {"shared_token": None}
 
     # Two independent rows exist
     cur = await db._conn.execute(
@@ -817,17 +827,37 @@ Expected: FAIL with `KeyError: 'qualifier_transitions'`.
 
 - [ ] **Step 3: Modify `scout/heartbeat.py`**
 
-In `_heartbeat_stats` dict, add three new keys (before `"last_heartbeat_at": None`):
+(a) In the module-level `_heartbeat_stats` dict, add three new keys immediately before the existing `"last_heartbeat_at": None,` line:
 
 ```python
     "qualifier_transitions": 0,
     "qualifier_skips": 0,
     "qualifier_prune_consecutive_failures": 0,
+    "last_heartbeat_at": None,
 ```
 
-In `_reset_heartbeat_stats`, add the same three keys with `0` values inside the `update(...)` call.
+(b) In `_reset_heartbeat_stats`, add the same three keys with value `0` inside the `_heartbeat_stats.update(...)` keyword-args call. The resulting function body should look like:
 
-In `_maybe_emit_heartbeat`, add to the `logger.info("heartbeat", ...)` call — before `last_heartbeat_at=...`:
+```python
+def _reset_heartbeat_stats() -> None:
+    _heartbeat_stats.update(
+        started_at=None,
+        tokens_scanned=0,
+        candidates_promoted=0,
+        alerts_fired=0,
+        narrative_predictions=0,
+        counter_scores_memecoin=0,
+        counter_scores_narrative=0,
+        qualifier_transitions=0,
+        qualifier_skips=0,
+        qualifier_prune_consecutive_failures=0,
+        last_heartbeat_at=None,
+    )
+```
+
+(If the live file has additional keys not shown above — e.g., it has evolved since this plan was written — preserve them; only ADD the three `qualifier_*` entries.)
+
+(c) In `_maybe_emit_heartbeat`, add three new keyword arguments to the `logger.info("heartbeat", ...)` call, inserted immediately before the existing `last_heartbeat_at=...` argument:
 
 ```python
         qualifier_transitions=_heartbeat_stats["qualifier_transitions"],
@@ -876,9 +906,18 @@ async def trade_first_signals(
 
 The tuples in `scored_candidates` are `(token, quant_score, signals_fired)` where `token` is a `CandidateToken` with `.contract_address`, `.ticker`, `.token_name`, `.chain`, `.market_cap_usd`.
 
+**CRITICAL — PRESERVE MODULE-LEVEL IMPORTS:** At the top of `scout/trading/signals.py` (around lines 15-16) there are two module-level imports that the new body continues to use:
+
+```python
+from scout.trading.combo_key import build_combo_key
+from scout.trading.suppression import should_open
+```
+
+Leave them untouched. Only the BODY of `trade_first_signals` is being replaced; do NOT delete imports at the top of the module and do NOT re-import `build_combo_key` or `should_open` inside the function. The `logger` at module scope must also remain.
+
 - [ ] **Step 2: Replace the function body**
 
-In `scout/trading/signals.py`, replace the full body of `trade_first_signals` (everything inside the function after the docstring) with:
+In `scout/trading/signals.py`, replace the full body of `trade_first_signals` (everything inside the function after the docstring — but NOT the module-level imports above the function) with:
 
 ```python
     from datetime import datetime, timezone
@@ -927,10 +966,27 @@ In `scout/trading/signals.py`, replace the full body of `trade_first_signals` (e
             continue  # multi-ingestor dedup
         seen.add(token.contract_address)
 
+        prior_last = transitions[token.contract_address]  # str | None
+        # Compute elapsed_since_prior_hours for observability. None on first-ever
+        # qualification; parse ISO-8601 (fromisoformat handles UTC offsets).
+        if prior_last is None:
+            first_seen = True
+            elapsed_hours: float | None = None
+        else:
+            first_seen = False
+            try:
+                prior_dt = datetime.fromisoformat(prior_last)
+                elapsed_hours = (now - prior_dt).total_seconds() / 3600.0
+            except ValueError:
+                elapsed_hours = None
+
         logger.info(
             "qualifier_transition_fired",
             signal_type="first_signal",
             token_id=token.contract_address,
+            first_seen=first_seen,
+            prior_last_qualified_at=prior_last,
+            elapsed_since_prior_hours=elapsed_hours,
         )
         _heartbeat_stats["qualifier_transitions"] += 1
 
@@ -968,6 +1024,14 @@ In `scout/trading/signals.py`, replace the full body of `trade_first_signals` (e
                 signal_combo=combo_key,
             )
             if trade_id is None:
+                # NOTE (spec divergence): the spec's Observability section lists
+                # possible reasons including `max_open_hit`, `cooldown`, etc.
+                # engine.open_trade returns `int | None` without an accompanying
+                # reason, so we cannot distinguish here. We log a single generic
+                # reason `open_trade_returned_none`; downstream operators can
+                # correlate with engine-side logs (warmup/dedup/cooldown/cap)
+                # using `token_id` + timestamp. If finer-grained reasons are
+                # required later, extend engine.open_trade to return (id, reason).
                 logger.info(
                     "qualifier_transition_skipped",
                     signal_type="first_signal",
@@ -1120,10 +1184,10 @@ async def test_restart_does_not_replay_qualifying_tokens(
     db = Database(db_path)
     await db.initialize()
 
-    settings = settings_factory(
-        PAPER_MIN_MCAP=5_000_000,
-        PAPER_STARTUP_WARMUP_SECONDS=0,
-    )
+    # NOTE: `engine` is a full AsyncMock; engine-side gates (warmup, dedup,
+    # cooldown, max-open) are bypassed entirely. We deliberately do NOT pass
+    # PAPER_STARTUP_WARMUP_SECONDS here — trade_first_signals does not read it.
+    settings = settings_factory(PAPER_MIN_MCAP=5_000_000)
     engine = AsyncMock()
     engine.open_trade = AsyncMock(return_value=1)
 
@@ -1156,10 +1220,7 @@ async def test_fresh_transition_opens_exactly_one_trade(
     db = Database(tmp_path / "t.db")
     await db.initialize()
 
-    settings = settings_factory(
-        PAPER_MIN_MCAP=5_000_000,
-        PAPER_STARTUP_WARMUP_SECONDS=0,
-    )
+    settings = settings_factory(PAPER_MIN_MCAP=5_000_000)
     engine = AsyncMock()
     engine.open_trade = AsyncMock(return_value=1)
 
@@ -1201,7 +1262,6 @@ async def test_restart_with_re_entry_during_downtime(
 
     settings = settings_factory(
         PAPER_MIN_MCAP=5_000_000,
-        PAPER_STARTUP_WARMUP_SECONDS=0,
         QUALIFIER_EXIT_GRACE_HOURS=48,
     )
     engine = AsyncMock()
@@ -1265,10 +1325,7 @@ async def test_transition_blocked_by_cooldown_still_upserts(
     db = Database(tmp_path / "t.db")
     await db.initialize()
 
-    settings = settings_factory(
-        PAPER_MIN_MCAP=5_000_000,
-        PAPER_STARTUP_WARMUP_SECONDS=0,
-    )
+    settings = settings_factory(PAPER_MIN_MCAP=5_000_000)
     engine = AsyncMock()
     engine.open_trade = AsyncMock(return_value=None)  # simulate cooldown block
 
@@ -1305,10 +1362,7 @@ async def test_transition_blocked_by_max_open_still_upserts(
     db = Database(tmp_path / "t.db")
     await db.initialize()
 
-    settings = settings_factory(
-        PAPER_MIN_MCAP=5_000_000,
-        PAPER_STARTUP_WARMUP_SECONDS=0,
-    )
+    settings = settings_factory(PAPER_MIN_MCAP=5_000_000)
     engine = AsyncMock()
     engine.open_trade = AsyncMock(return_value=None)  # simulate max-open block
 
