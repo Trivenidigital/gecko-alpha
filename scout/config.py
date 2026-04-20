@@ -139,6 +139,9 @@ class Settings(BaseSettings):
     TRENDING_SNAPSHOT_ENABLED: bool = True
     TRENDING_COMPARISON_INTERVAL: int = 21600  # 6 hours in seconds
 
+    # -------- GeckoTerminal Per-Chain Trending (BL-052) --------
+    GT_TRENDING_TOP_N: int = 10
+
     # -------- Second-Wave Detection --------
     SECONDWAVE_ENABLED: bool = False
     SECONDWAVE_POLL_INTERVAL: int = 1800
