@@ -87,6 +87,8 @@ for idx, pool in enumerate(data.get("data", [])):
 
 **Semantics:** `idx + 1` yields a 1-based rank so that "rank 1" reads naturally as "top of the trending list". This matches the existing `cg_trending_rank` convention (`cg_trending_rank <= 10` in scorer.py:143).
 
+**GT API ordering contract:** GeckoTerminal's `/networks/{chain}/trending_pools` endpoint returns pools ordered by trading activity (descending 24h volume / trade count — stable since the v2 API launch, documented at https://www.geckoterminal.com/dex-api). The entire validity of the `gt_trending` signal rides on this ordering. Implementation MUST include a one-line comment near `enumerate` pointing at this assumption so future maintainers see it: `# NB: GT returns trending_pools in rank order; idx 0 = most-traded.`. If the ordering changes silently, the signal degrades to "token appears anywhere in top-N pools" which is weaker but still non-destructive.
+
 **Edge cases:**
 - Empty `data` list → no candidates emitted, no rank writes. Unchanged behavior.
 - Malformed pool entry → existing `except Exception` catches and continues. Unchanged behavior.
@@ -110,7 +112,13 @@ _PRESERVE_FIELDS = [
 ]
 ```
 
-**Semantics:** When DexScreener emits token X (rank None) and GeckoTerminal emits same token X (rank 3), the existing last-write-wins merge would clobber the rank if DexScreener arrived second. `_PRESERVE_FIELDS` lifts non-None values from the earlier entry onto the winner. Matches how `cg_trending_rank` is already protected.
+**Semantics:** Preserve triggers only when the **new** arrival has `None` and the **old** has a value (see `aggregator.py:37` — `if new_val is None and old_val is not None`). This covers both arrival orders correctly:
+- **GT first, DEX second:** old rank=3, new rank=None → preserve condition fires → rank=3 retained on merged token.
+- **DEX first, GT second:** old rank=None, new rank=3 → preserve condition does NOT fire (new is non-None) → new token wins trivially, rank=3 retained.
+
+Either way, rank=3 survives. Matches how `cg_trending_rank` is already protected.
+
+**`_PRESERVE_FIELDS` contract (documented explicitly in this PR):** Add a one-line comment above the list: `# Preserve first non-None value on merge. Changing this semantics breaks all rank and enrichment signals.` This hardens an existing implicit contract.
 
 **Join key:** `contract_address` — existing aggregator behavior, no change.
 
@@ -145,7 +153,13 @@ if (
 
 **SCORER_MAX_RAW bump:** 183 → 198.
 
-**Logger import:** `scorer.py` on master currently has no logger. This spec adds `import structlog` and `logger = structlog.get_logger(__name__)` at module top, mirroring `scout/main.py` style. The same logger will be available to BL-051 when that PR merges (natural convergence).
+**Logger import:** `scorer.py` on master currently has no logger. This spec adds `import structlog` and `logger = structlog.get_logger(__name__)` at module top, mirroring `scout/main.py` style.
+
+**Merge-ordering instruction for the implementer:** BL-051 (PR #34, branch `feat/bl-051-dexscreener-boosts-poller`) also adds `import structlog` and `logger = structlog.get_logger(__name__)` to `scorer.py`. At branch-cut time for BL-052:
+- **If PR #34 is already merged into master** → `scorer.py` already has both lines; omit them from BL-052's diff to avoid duplicate imports. Verify with `grep -n "import structlog\\|logger = structlog" scout/scorer.py` on master before editing.
+- **If PR #34 is NOT yet merged** → add both lines as described. When PR #34 merges later, expect a trivial conflict on these two lines; resolver keeps one copy.
+
+Also: if PR #34 merges first, `SCORER_MAX_RAW` on master will be 203 (not 183), and BL-052's bump target becomes 203→218 (not 183→198). The plan should read `SCORER_MAX_RAW` on the current master at branch-cut time and compute the target as `current + 15`. The pin test should assert the computed target, not a hardcoded literal.
 
 ## 9. Settings additions
 
@@ -158,7 +172,7 @@ GT_TRENDING_TOP_N: int = 10
 
 File: `.env.example`
 
-Append at the end:
+**Placement:** `.env.example` has NO existing GeckoTerminal section (verified — GT is unauthenticated and needed no prior config entries). Do NOT append at the end (that lands inside the paper-trading block). Create a new section placed just before the `# === Paper Trading Engine ===` header (or equivalent last section):
 
 ```bash
 # -------- GeckoTerminal Per-Chain Trending (BL-052) --------
@@ -204,6 +218,7 @@ Appends to existing test files:
 - **Existing golden-value tests touching `SCORER_MAX_RAW`-dependent normalizations** (there were 2 such test files in BL-051 — list the exact files during plan phase; same treatment: supply `gt_trending_rank=1` to setups that previously asserted "raw = 183 cap-at-100").
 
 Integration test (append to `tests/test_main.py` or new `tests/test_main_pipeline_gt_trending.py`):
+- Mock via `aioresponses` at the HTTP layer — NO changes to `run_cycle` signature or any injectable-fetcher plumbing. The existing `run_cycle` already flows through `aiohttp.ClientSession.get`, which aioresponses intercepts.
 - `asyncio.gather` returns a `fetch_trending_pools` result that includes ranks; after aggregate → scorer, assert `gt_trending` in `signals_fired` for the emitted token.
 
 ## 12. Files created / modified
@@ -236,7 +251,9 @@ Integration test (append to `tests/test_main.py` or new `tests/test_main_pipelin
 6. `gt_trending_signal_fired` structlog event emitted exactly once with required fields when signal fires; not emitted below threshold.
 7. Integration test: full `run_cycle` with mocked GT/DEX/CG responses produces `gt_trending` in `signals_fired` for the expected token.
 8. Full test suite passes (`uv run pytest --tb=short -q`). No regressions in existing BL-051 tests (if PR #34 is merged into master before PR #35 lands) or any other module.
-9. `.env.example` contains `GT_TRENDING_TOP_N` entry.
+9. `.env.example` contains `GT_TRENDING_TOP_N` entry in its own `# -------- GeckoTerminal Per-Chain Trending (BL-052) --------` section (NOT appended inside the paper-trading block).
+10. Scorer module docstring (`scout/scorer.py` top) lists `gt_trending (+15)` in its signals table and the "Max raw:" summation line reads `...+15 = 198` (or `...+15 = 218` if BL-051 has already merged). Implementation pin test asserts this value coherently.
+11. `_PRESERVE_FIELDS` in `aggregator.py` has an explicit contract comment above it: `# Preserve first non-None value on merge. Changing this semantics breaks all rank and enrichment signals.`
 
 ## 14. Risk & mitigation
 
@@ -244,7 +261,7 @@ Integration test (append to `tests/test_main.py` or new `tests/test_main_pipelin
 |------|-----------|------------|
 | New signal inflates scores for tokens that were already emitted as candidates by GT (they all get rank ≤ 10 by construction for small trending_pools responses) | Medium | Default `GT_TRENDING_TOP_N=10` restricts to upper half of GT's ~20 response. Tunable down to 3 or 5 if live observation shows grade inflation. |
 | Duplicate scoring overlap with `cg_trending_rank` for tokens trending on both platforms | Low | Intentional — that's the confluence signal the spec explicitly targets. The co-occurrence multiplier already exists to reward multi-signal agreement. |
-| Changing `SCORER_MAX_RAW` shifts the normalized-score distribution, affecting `MIN_SCORE` and `CONVICTION_THRESHOLD` thresholds | Medium | Same pattern as BL-051 (183→203). Existing live thresholds (`MIN_SCORE=60`, `CONVICTION_THRESHOLD=70`) are already tuned under the compressed normalization; bumping by 15 pts shifts a 100-raw-pt score by ~1 normalized pt (100/183 → 100/198). Below observation threshold. |
+| Changing `SCORER_MAX_RAW` shifts the normalized-score distribution, affecting `MIN_SCORE` and `CONVICTION_THRESHOLD` thresholds | Medium-High | **Actual arithmetic (not "below observation threshold"):** `int(raw*100/183)` vs `int(raw*100/198)` loses ~2 pts mid-range and up to 8 pts at the cap. Examples: raw=100 → 54→50 (-4); raw=150 → 81→75 (-6); raw=180 → 98→90 (-8); raw=183 → 100→92 (-8). **Impact on live thresholds:** Project's live `MIN_SCORE` and `CONVICTION_THRESHOLD` live at 25 and 22 (see backlog.md D1), far below where this shift bites. A token scoring 71 normalized pre-bump now scores 65 — still well above both gates. **Philosophical framing:** Making room for a new signal correctly tightens the threshold for tokens that DON'T fire the new signal; tokens that DO fire `gt_trending` earn back +~8 normalized pts, netting near-zero change at the cap. This is intentional, not a regression. Document this in the scorer docstring comment for future maintainers. |
 | Missing rank info due to GT API schema change (order not guaranteed?) | Very low | GT explicitly sorts trending_pools by 24h trade count; docs are stable. If they change, top-N bonus quietly stops firing — fail-open degradation, no pipeline break. |
 | `from_geckoterminal` consumers in tests break if the classmethod signature changed | N/A | Classmethod signature is unchanged. Rank is set post-construction via `model_copy`. |
 
