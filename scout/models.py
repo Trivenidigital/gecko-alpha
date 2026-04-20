@@ -1,8 +1,11 @@
 """Data models for CoinPump Scout."""
 
 from datetime import datetime, timezone
+from typing import Literal
 
 from pydantic import BaseModel, Field
+
+from scout.news.schemas import Sentiment
 
 
 class MiroFishResult(BaseModel):
@@ -47,6 +50,12 @@ class CandidateToken(BaseModel):
     # (position 1 = most-traded). None if the token was not sourced from
     # GT trending or the rank info was unavailable.
     gt_trending_rank: int | None = None
+
+    # CryptoPanic news tags (BL-053)
+    news_count_24h: int | None = None
+    latest_news_sentiment: Sentiment | None = None
+    macro_news_flag: bool | None = None
+    news_tag_confidence: Literal["ticker_only"] | None = None
 
     # Populated by pipeline stages
     quant_score: int | None = None

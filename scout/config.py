@@ -181,6 +181,19 @@ class Settings(BaseSettings):
     # social tier down rather than thrash against a broken environment.
     LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS: int = 5
 
+    # -------- CryptoPanic News Feed (BL-053) --------
+    # Research-only news tagging for candidate tokens. Free CryptoPanic v1 tier
+    # requires a free API token; if empty, fetch short-circuits to [] without
+    # hitting the network. Scoring signal exists but is gated by
+    # CRYPTOPANIC_SCORING_ENABLED (off by default); flipping it on in a future
+    # PR will require a SCORER_MAX_RAW bump from 183 to 193.
+    CRYPTOPANIC_ENABLED: bool = False
+    CRYPTOPANIC_API_TOKEN: str = ""
+    CRYPTOPANIC_FETCH_FILTER: str = "hot"  # hot|rising|bullish|bearish|important
+    CRYPTOPANIC_MACRO_MIN_CURRENCIES: int = 4
+    CRYPTOPANIC_SCORING_ENABLED: bool = False
+    CRYPTOPANIC_RETENTION_DAYS: int = 7
+
     # -------- Paper Trading Engine --------
     TRADING_ENABLED: bool = False  # master switch
     TRADING_MODE: str = "paper"  # "paper" or "live"
