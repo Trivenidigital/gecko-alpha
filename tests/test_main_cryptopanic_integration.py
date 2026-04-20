@@ -68,6 +68,7 @@ def _mk_settings(**overrides) -> MagicMock:
     s.VELOCITY_ALERTS_ENABLED = False
     s.CONVICTION_THRESHOLD = 60
     s.COUNTER_ENABLED = False
+    s.PERP_ENABLED = False
     for k, v in overrides.items():
         setattr(s, k, v)
     return s
