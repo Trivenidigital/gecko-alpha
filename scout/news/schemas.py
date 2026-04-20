@@ -48,10 +48,17 @@ def classify_macro(currencies: list[str], *, threshold: int) -> bool:
 def parse_post(raw: dict) -> CryptoPanicPost | None:
     """Parse a raw CryptoPanic post dict into a CryptoPanicPost.
 
-    Returns None when required fields (id / title / url / published_at) are
-    missing. `currencies: null` is coerced to []. Currency entries with
-    empty or missing `code` are dropped.
+    Returns None when `raw` is not a dict or required fields
+    (id / title / url / published_at) are missing. All nested
+    fields are defensively coerced: `currencies` must be a list
+    (otherwise treated as empty), `votes` must be a dict
+    (otherwise treated as {}), and vote counts must coerce to int
+    (otherwise default to 0). Currency entries with empty or
+    missing `code` are dropped.
     """
+    if not isinstance(raw, dict):
+        return None
+
     post_id = raw.get("id")
     title = raw.get("title")
     url = raw.get("url")
@@ -64,22 +71,32 @@ def parse_post(raw: dict) -> CryptoPanicPost | None:
     ):
         return None
 
-    raw_currencies = raw.get("currencies") or []
+    raw_currencies = raw.get("currencies")
     codes: list[str] = []
-    for c in raw_currencies:
-        if not isinstance(c, dict):
-            continue
-        code = c.get("code")
-        if isinstance(code, str) and code:
-            codes.append(code)
+    if isinstance(raw_currencies, list):
+        for c in raw_currencies:
+            if not isinstance(c, dict):
+                continue
+            code = c.get("code")
+            if isinstance(code, str) and code:
+                codes.append(code)
 
-    votes = raw.get("votes") or {}
+    votes = raw.get("votes")
+    if not isinstance(votes, dict):
+        votes = {}
+
+    def _as_int(v: object) -> int:
+        try:
+            return int(v) if v is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
     return CryptoPanicPost(
         post_id=post_id,
         title=title,
         url=url,
         published_at=published_at,
         currencies=codes,
-        votes_positive=int(votes.get("positive") or 0),
-        votes_negative=int(votes.get("negative") or 0),
+        votes_positive=_as_int(votes.get("positive")),
+        votes_negative=_as_int(votes.get("negative")),
     )

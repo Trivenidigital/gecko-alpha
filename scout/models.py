@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from scout.news.schemas import Sentiment
+
 
 class MiroFishResult(BaseModel):
     """Result from MiroFish narrative simulation or Anthropic fallback."""
@@ -51,7 +53,7 @@ class CandidateToken(BaseModel):
 
     # CryptoPanic news tags (BL-053)
     news_count_24h: int | None = None
-    latest_news_sentiment: Literal["bullish", "bearish", "neutral"] | None = None
+    latest_news_sentiment: Sentiment | None = None
     macro_news_flag: bool | None = None
     news_tag_confidence: Literal["ticker_only"] | None = None
 

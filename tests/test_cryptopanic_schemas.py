@@ -90,3 +90,61 @@ def test_macro_below_threshold_not_macro():
 
 def test_macro_at_threshold_is_macro():
     assert classify_macro(["BTC", "ETH", "SOL", "AVAX"], threshold=4) is True
+
+
+def test_parse_post_none_returns_none():
+    """parse_post(None) must not raise; contract is 'or None'."""
+    assert parse_post(None) is None
+
+
+def test_parse_post_non_dict_returns_none():
+    """parse_post('not a dict') must not raise."""
+    assert parse_post("not a dict") is None
+    assert parse_post(42) is None
+    assert parse_post([1, 2, 3]) is None
+
+
+def test_parse_post_non_dict_votes_treated_as_zero():
+    """votes=[1,2,3] (wrong type) → votes default to 0, not a crash."""
+    raw = {
+        "id": 1,
+        "title": "t",
+        "url": "u",
+        "published_at": "2026-04-20T00:00:00Z",
+        "currencies": [],
+        "votes": [1, 2, 3],
+    }
+    post = parse_post(raw)
+    assert post is not None
+    assert post.votes_positive == 0
+    assert post.votes_negative == 0
+
+
+def test_parse_post_non_int_vote_values_default_to_zero():
+    """votes={'positive': 'NaN'} must not raise; default to 0."""
+    raw = {
+        "id": 1,
+        "title": "t",
+        "url": "u",
+        "published_at": "2026-04-20T00:00:00Z",
+        "currencies": [],
+        "votes": {"positive": "NaN", "negative": None},
+    }
+    post = parse_post(raw)
+    assert post is not None
+    assert post.votes_positive == 0
+    assert post.votes_negative == 0
+
+
+def test_parse_post_string_currencies_treated_as_empty():
+    """currencies='BTC' (string, not list) → empty, not char-iterated."""
+    raw = {
+        "id": 1,
+        "title": "t",
+        "url": "u",
+        "published_at": "2026-04-20T00:00:00Z",
+        "currencies": "BTC",
+        "votes": {},
+    }
+    post = parse_post(raw)
+    assert post.currencies == []
