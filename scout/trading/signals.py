@@ -210,14 +210,76 @@ async def trade_first_signals(
     Args:
         scored_candidates: list of (CandidateToken, quant_score, signals_fired)
     """
+    from datetime import datetime, timezone
+    from scout.heartbeat import _heartbeat_stats
+    from scout.trading.qualifier_state import classify_transitions
+
+    # Filter to the qualifying set using the exact same predicate as before.
+    qualifying: list[tuple] = []
     for token, quant_score, signals_fired in scored_candidates:
         if quant_score <= 0 or not signals_fired:
             continue
         if (token.market_cap_usd or 0) < min_mcap:
             continue
-        # Focus on CoinGecko-listed tokens, skip DEX memecoins
         if token.chain not in ("coingecko",):
             continue
+        qualifying.append((token, quant_score, signals_fired))
+
+    if not qualifying:
+        return
+
+    current_ids = {t.contract_address for t, _, _ in qualifying}
+    now = datetime.now(timezone.utc)
+
+    try:
+        transitions = await classify_transitions(
+            db,
+            signal_type="first_signal",
+            current_token_ids=current_ids,
+            now=now,
+            exit_grace_hours=settings.QUALIFIER_EXIT_GRACE_HOURS,
+        )
+    except Exception as exc:
+        logger.error(
+            "qualifier_classify_failed",
+            err_id="QUALIFIER_CLASSIFY_FAIL",
+            exc_type=type(exc).__name__,
+            exc_info=True,
+        )
+        return  # fail-closed: skip all first_signal trades this cycle
+
+    seen: set[str] = set()
+    for token, quant_score, signals_fired in qualifying:
+        if token.contract_address not in transitions:
+            continue
+        if token.contract_address in seen:
+            continue  # multi-ingestor dedup
+        seen.add(token.contract_address)
+
+        prior_last = transitions[token.contract_address]  # str | None
+        # Compute elapsed_since_prior_hours for observability. None on first-ever
+        # qualification; parse ISO-8601 (fromisoformat handles UTC offsets).
+        if prior_last is None:
+            first_seen = True
+            elapsed_hours: float | None = None
+        else:
+            first_seen = False
+            try:
+                prior_dt = datetime.fromisoformat(prior_last)
+                elapsed_hours = (now - prior_dt).total_seconds() / 3600.0
+            except ValueError:
+                elapsed_hours = None
+
+        logger.info(
+            "qualifier_transition_fired",
+            signal_type="first_signal",
+            token_id=token.contract_address,
+            first_seen=first_seen,
+            prior_last_qualified_at=prior_last,
+            elapsed_since_prior_hours=elapsed_hours,
+        )
+        _heartbeat_stats["qualifier_transitions"] += 1
+
         try:
             sigs = signals_fired
             combo_key = build_combo_key(signal_type="first_signal", signals=sigs)
@@ -238,7 +300,7 @@ async def trade_first_signals(
             pr = await pc.fetchone()
             price = pr[0] if pr else None
 
-            await engine.open_trade(
+            trade_id = await engine.open_trade(
                 token_id=token.contract_address,
                 symbol=token.ticker,
                 name=token.token_name,
@@ -251,8 +313,25 @@ async def trade_first_signals(
                 entry_price=price,
                 signal_combo=combo_key,
             )
+            if trade_id is None:
+                # NOTE (spec divergence): the spec's Observability section lists
+                # possible reasons including `max_open_hit`, `cooldown`, etc.
+                # engine.open_trade returns `int | None` without an accompanying
+                # reason, so we cannot distinguish here. We log a single generic
+                # reason `open_trade_returned_none`; downstream operators can
+                # correlate with engine-side logs (warmup/dedup/cooldown/cap)
+                # using `token_id` + timestamp. If finer-grained reasons are
+                # required later, extend engine.open_trade to return (id, reason).
+                logger.info(
+                    "qualifier_transition_skipped",
+                    signal_type="first_signal",
+                    token_id=token.contract_address,
+                    reason="open_trade_returned_none",
+                )
+                _heartbeat_stats["qualifier_skips"] += 1
         except Exception:
             logger.exception("trading_first_signal_error", token=token.ticker)
+            _heartbeat_stats["qualifier_skips"] += 1
 
 
 async def trade_trending(
