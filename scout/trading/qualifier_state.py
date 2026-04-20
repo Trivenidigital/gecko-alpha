@@ -120,5 +120,44 @@ async def prune_stale_qualifiers(
     now: datetime,
     retention_hours: int,
 ) -> int:
-    """Placeholder — implemented in Task 5."""
-    raise NotImplementedError
+    """Delete rows where datetime(last_qualified_at) < datetime(now - retention).
+
+    Returns the number of rows deleted. Acquires db._txn_lock.
+
+    retention_hours must be > 0; callers pass settings.QUALIFIER_PRUNE_RETENTION_HOURS
+    which is enforced > 0 by the Settings model_validator. A defensive check here
+    catches programming errors (zero/negative literal in a caller).
+
+    Read-only SELECT COUNT first so a clean table doesn't open a write transaction.
+    """
+    if retention_hours <= 0:
+        raise ValueError(
+            f"retention_hours must be > 0, got {retention_hours}"
+        )
+
+    if db._conn is None or db._txn_lock is None:
+        raise RuntimeError(
+            "Database not initialized — prune_stale_qualifiers() called before "
+            "Database.initialize()."
+        )
+
+    threshold = (now - timedelta(hours=retention_hours)).isoformat()
+
+    async with db._txn_lock:
+        cur = await db._conn.execute(
+            "SELECT COUNT(*) FROM signal_qualifier_state "
+            "WHERE datetime(last_qualified_at) < datetime(?)",
+            (threshold,),
+        )
+        count_row = await cur.fetchone()
+        count = count_row[0] if count_row else 0
+        if count == 0:
+            return 0
+
+        cursor = await db._conn.execute(
+            "DELETE FROM signal_qualifier_state "
+            "WHERE datetime(last_qualified_at) < datetime(?)",
+            (threshold,),
+        )
+        await db._conn.commit()
+        return cursor.rowcount

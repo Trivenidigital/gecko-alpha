@@ -317,3 +317,57 @@ async def test_different_signal_types_do_not_interfere(tmp_path):
     rows = {r[0] for r in await cur.fetchall()}
     assert rows == {"first_signal", "other_signal"}
     await db.close()
+
+
+from scout.trading.qualifier_state import prune_stale_qualifiers
+
+
+async def test_prune_stale_removes_old_rows_only(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    now = datetime(2026, 4, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+    # Row A: last_qualified_at = 8 days ago → stale (retention 168h = 7 days)
+    stale = now - timedelta(days=8)
+    await _seed_qualifier(db, "first_signal", "stale_a", stale, stale)
+    # Row B: last_qualified_at = 3 days ago → fresh
+    fresh = now - timedelta(days=3)
+    await _seed_qualifier(db, "first_signal", "fresh_b", fresh, fresh)
+
+    deleted = await prune_stale_qualifiers(db, now=now, retention_hours=168)
+    assert deleted == 1
+
+    assert await _qualifier_row(db, "first_signal", "stale_a") is None
+    assert await _qualifier_row(db, "first_signal", "fresh_b") is not None
+    await db.close()
+
+
+async def test_prune_retention_zero_raises_value_error(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    now = datetime(2026, 4, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(ValueError, match="retention_hours"):
+        await prune_stale_qualifiers(db, now=now, retention_hours=0)
+    with pytest.raises(ValueError, match="retention_hours"):
+        await prune_stale_qualifiers(db, now=now, retention_hours=-1)
+    await db.close()
+
+
+async def test_prune_returns_zero_when_no_stale_rows(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    now = datetime(2026, 4, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+    # All rows fresh
+    fresh = now - timedelta(days=2)
+    await _seed_qualifier(db, "first_signal", "a", fresh, fresh)
+    await _seed_qualifier(db, "first_signal", "b", fresh, fresh)
+
+    deleted = await prune_stale_qualifiers(db, now=now, retention_hours=168)
+    assert deleted == 0
+
+    # Rows still present
+    assert await _qualifier_row(db, "first_signal", "a") is not None
+    assert await _qualifier_row(db, "first_signal", "b") is not None
+    await db.close()
