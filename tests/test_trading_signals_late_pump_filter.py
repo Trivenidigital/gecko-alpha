@@ -70,6 +70,11 @@ async def _insert_gainer_with_change(
     await db._conn.commit()
 
 
+def _combined_logs(capsys):
+    captured = capsys.readouterr()
+    return captured.out + captured.err
+
+
 async def _open_count(db):
     cursor = await db._conn.execute(
         "SELECT COUNT(*) FROM paper_trades WHERE status = 'open'"
@@ -93,16 +98,16 @@ async def test_trade_gainers_opens_below_threshold(db, engine, settings):
 
 
 async def test_trade_gainers_filter_log_counts_late_pumps(db, engine, settings, capsys):
-    """The filter summary log must include skipped_late_pump count."""
+    """The filter summary log must include skipped_late_pump count with correct value."""
     await _insert_gainer_with_change(db, "late-1", price_change_24h=60.0)
     await _insert_gainer_with_change(db, "late-2", price_change_24h=75.0)
     await _insert_gainer_with_change(db, "fresh", price_change_24h=20.0)
     await trade_gainers(engine, db, settings=settings)
 
-    captured = capsys.readouterr()
-    combined = captured.out + captured.err
+    combined = _combined_logs(capsys)
     assert "trade_gainers_filtered" in combined
-    assert "skipped_late_pump" in combined
+    # Pin the count so a regression that emits skipped_late_pump=0 still fails.
+    assert "skipped_late_pump=2" in combined
     assert await _open_count(db) == 1  # only 'fresh' opened
 
 

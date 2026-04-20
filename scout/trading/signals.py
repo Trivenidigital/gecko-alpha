@@ -22,12 +22,15 @@ async def trade_volume_spikes(
     engine, db: Database, spikes: list[dict], settings
 ) -> None:
     """Open paper trades for detected volume spikes."""
-    logger.info("trade_volume_spikes_filtered", total=len(spikes))
+    skipped_suppressed = 0
+    errors = 0
+    opened = 0
     for spike in spikes:
         try:
             combo_key = build_combo_key(signal_type="volume_spike", signals=None)
             allow, reason = await should_open(db, combo_key, settings=settings)
             if not allow:
+                skipped_suppressed += 1
                 logger.info(
                     "signal_suppressed",
                     combo_key=combo_key,
@@ -44,11 +47,20 @@ async def trade_volume_spikes(
                 entry_price=spike.get("current_price"),
                 signal_combo=combo_key,
             )
+            opened += 1
         except Exception:
+            errors += 1
             logger.exception(
                 "trading_open_spike_error",
                 coin_id=spike.get("coin_id"),
             )
+    logger.info(
+        "trade_volume_spikes_filtered",
+        total=len(spikes),
+        skipped_suppressed=skipped_suppressed,
+        errors=errors,
+        opened=opened,
+    )
 
 
 async def trade_gainers(
@@ -57,10 +69,10 @@ async def trade_gainers(
     """Open paper trades for newly detected top gainers.
 
     Filter: market_cap >= min_mcap to skip micro-cap junk.
-    Late-pump filter: skip tokens whose 24h change already exceeds
-    PAPER_GAINERS_MAX_24H_PCT (likely near pump exhaustion).
+    Late-pump filter: when PAPER_GAINERS_MAX_24H_PCT > 0, skip tokens whose
+    24h change exceeds the threshold. Set the knob to 0 to disable the filter.
     """
-    max_24h = getattr(settings, "PAPER_GAINERS_MAX_24H_PCT", 0.0) or 0.0
+    max_24h = settings.PAPER_GAINERS_MAX_24H_PCT
     try:
         cursor = await db._conn.execute(
             """SELECT DISTINCT coin_id, symbol, name, price_change_24h,
@@ -85,21 +97,26 @@ async def trade_gainers(
             and g["price_change_24h"] is not None
             and g["price_change_24h"] > max_24h
         )
-        if skipped_null_mcap or skipped_low_mcap or skipped_late_pump:
-            logger.info(
-                "trade_gainers_filtered",
-                total=len(new_gainers),
-                skipped_null_mcap=skipped_null_mcap,
-                skipped_low_mcap=skipped_low_mcap,
-                skipped_late_pump=skipped_late_pump,
-                min_mcap=min_mcap,
-                max_24h_pct=max_24h,
-            )
+        logger.info(
+            "trade_gainers_filtered",
+            total=len(new_gainers),
+            skipped_null_mcap=skipped_null_mcap,
+            skipped_low_mcap=skipped_low_mcap,
+            skipped_late_pump=skipped_late_pump,
+            min_mcap=min_mcap,
+            max_24h_pct=max_24h,
+        )
         for g in new_gainers:
             if (g["market_cap"] or 0) < min_mcap:
                 continue
-            if max_24h > 0 and (g["price_change_24h"] or 0) > max_24h:
-                continue
+            change_24h = g["price_change_24h"]
+            if max_24h > 0:
+                # Reject rows with no 24h change when the late-pump filter is
+                # active. gainers_snapshots.price_change_24h is NOT NULL in the
+                # current schema; this guard is cheap defense-in-depth against a
+                # future schema change that nullifies the column.
+                if change_24h is None or change_24h > max_24h:
+                    continue
             try:
                 combo_key = build_combo_key(signal_type="gainers_early", signals=None)
                 allow, reason = await should_open(db, combo_key, settings=settings)
@@ -155,14 +172,13 @@ async def trade_losers(
             for l in new_losers
             if l["market_cap"] is not None and l["market_cap"] < min_mcap
         )
-        if skipped_null_mcap or skipped_low_mcap:
-            logger.info(
-                "trade_losers_filtered",
-                total=len(new_losers),
-                skipped_null_mcap=skipped_null_mcap,
-                skipped_low_mcap=skipped_low_mcap,
-                min_mcap=min_mcap,
-            )
+        logger.info(
+            "trade_losers_filtered",
+            total=len(new_losers),
+            skipped_null_mcap=skipped_null_mcap,
+            skipped_low_mcap=skipped_low_mcap,
+            min_mcap=min_mcap,
+        )
         for l in new_losers:
             if (l["market_cap"] or 0) < min_mcap:
                 continue

@@ -12,6 +12,14 @@ from scout.db import Database
 log = structlog.get_logger()
 
 
+CLOSED_COUNTABLE_STATUSES: tuple[str, ...] = (
+    "closed_tp",
+    "closed_sl",
+    "closed_expired",
+    "closed_trailing_stop",
+)
+
+
 class PaperTrader:
     """Simulates trade execution with slippage simulation."""
 
@@ -143,7 +151,6 @@ class PaperTrader:
             pnl_usd = quantity * (effective_exit - entry_price)
         now = datetime.now(timezone.utc).isoformat()
 
-        # L2: Warn if TP close produces negative PnL (high slippage scenario)
         if reason == "take_profit" and pnl_usd < 0:
             log.warning(
                 "tp_negative_pnl",
@@ -153,7 +160,6 @@ class PaperTrader:
                 slippage_bps=slippage_bps,
             )
 
-        # Map reason to status
         status_map = {
             "take_profit": "closed_tp",
             "stop_loss": "closed_sl",

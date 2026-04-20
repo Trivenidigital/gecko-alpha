@@ -829,6 +829,26 @@ async def main() -> None:
             "trading_engine_initialized",
             mode=settings.TRADING_MODE,
         )
+        # Audit log of resolved paper-trading knobs. Settings uses extra="ignore"
+        # so an env-var typo (e.g. PAPER_TRAILING_ACTIVATION_PC missing the T)
+        # silently falls back to the default. Logging the resolved values once
+        # at boot lets the operator spot typos by diffing expected vs. actual.
+        logger.info(
+            "paper_trading_config_resolved",
+            trade_amount_usd=settings.PAPER_TRADE_AMOUNT_USD,
+            max_open_trades=settings.PAPER_MAX_OPEN_TRADES,
+            max_exposure_usd=settings.PAPER_MAX_EXPOSURE_USD,
+            tp_pct=settings.PAPER_TP_PCT,
+            sl_pct=settings.PAPER_SL_PCT,
+            tp_sell_pct=settings.PAPER_TP_SELL_PCT,
+            max_duration_hours=settings.PAPER_MAX_DURATION_HOURS,
+            slippage_bps=settings.PAPER_SLIPPAGE_BPS,
+            trailing_enabled=settings.PAPER_TRAILING_ENABLED,
+            trailing_activation_pct=settings.PAPER_TRAILING_ACTIVATION_PCT,
+            trailing_drawdown_pct=settings.PAPER_TRAILING_DRAWDOWN_PCT,
+            trailing_floor_pct=settings.PAPER_TRAILING_FLOOR_PCT,
+            gainers_max_24h_pct=settings.PAPER_GAINERS_MAX_24H_PCT,
+        )
 
     shutdown_event = asyncio.Event()
 

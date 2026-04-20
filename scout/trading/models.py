@@ -29,7 +29,9 @@ class PaperTrade(BaseModel):
     tp_price: float
     sl_price: float
 
-    status: str = "open"  # open, closed_tp, closed_sl, closed_expired, closed_manual
+    status: str = (
+        "open"  # open, closed_tp, closed_sl, closed_expired, closed_trailing_stop, closed_manual
+    )
 
     exit_price: float | None = None
     exit_reason: str | None = None

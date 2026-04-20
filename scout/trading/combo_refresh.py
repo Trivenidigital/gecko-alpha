@@ -9,6 +9,7 @@ import aiosqlite
 import structlog
 
 from scout.db import Database
+from scout.trading.paper import CLOSED_COUNTABLE_STATUSES
 
 log = structlog.get_logger()
 
@@ -37,9 +38,10 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
         now_iso = now.isoformat()
 
         stats = {}
+        status_placeholders = ",".join("?" * len(CLOSED_COUNTABLE_STATUSES))
         for window, days in (("7d", 7), ("30d", 30)):
             cur = await db._conn.execute(
-                """SELECT
+                f"""SELECT
                      COUNT(*) AS trades,
                      SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
                      SUM(CASE WHEN pnl_usd <= 0 THEN 1 ELSE 0 END) AS losses,
@@ -47,9 +49,13 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                      COALESCE(AVG(pnl_pct), 0) AS avg_pnl_pct
                    FROM paper_trades
                    WHERE signal_combo = ?
-                     AND status IN ('closed_tp', 'closed_sl', 'closed_expired')
+                     AND status IN ({status_placeholders})
                      AND closed_at >= ?""",
-                (combo_key, (now - timedelta(days=days)).isoformat()),
+                (
+                    combo_key,
+                    *CLOSED_COUNTABLE_STATUSES,
+                    (now - timedelta(days=days)).isoformat(),
+                ),
             )
             row = await cur.fetchone()
             trades = row["trades"] or 0

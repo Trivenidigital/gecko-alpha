@@ -475,3 +475,52 @@ async def test_mid_parole_refresh_preserves_parole_at(tmp_path, settings_factory
         row["parole_at"] == original_parole
     ), f"parole_at was overwritten: expected {original_parole!r}, got {row['parole_at']!r}"
     await db.close()
+
+
+async def test_refresh_counts_closed_trailing_stop_in_rollup(
+    tmp_path, settings_factory
+):
+    """closed_trailing_stop must be included in 7d/30d trade counts and win-rate.
+
+    Trailing stops book profit by design; excluding them from the feedback loop
+    would make combos that benefit most from trailing look worse in stats and
+    trigger spurious suppression.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+
+    # 2 trailing-stop wins + 1 TP win + 1 SL loss = 4 trades, 3 wins
+    await _insert_trade(
+        db,
+        "trail_combo",
+        15.0,
+        10.0,
+        now - timedelta(days=1),
+        status="closed_trailing_stop",
+    )
+    await _insert_trade(
+        db,
+        "trail_combo",
+        12.0,
+        8.0,
+        now - timedelta(days=1),
+        status="closed_trailing_stop",
+    )
+    await _insert_trade(
+        db, "trail_combo", 20.0, 15.0, now - timedelta(days=1), status="closed_tp"
+    )
+    await _insert_trade(
+        db, "trail_combo", -10.0, -8.0, now - timedelta(days=1), status="closed_sl"
+    )
+
+    ok = await combo_refresh.refresh_combo(db, "trail_combo", s)
+    assert ok
+
+    row = await _get_combo_row(db, "trail_combo", "7d")
+    assert row["trades"] == 4
+    assert row["wins"] == 3
+    assert row["losses"] == 1
+    assert abs(row["win_rate_pct"] - 75.0) < 0.01
+    await db.close()
