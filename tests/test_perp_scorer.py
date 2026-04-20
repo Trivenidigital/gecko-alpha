@@ -1,4 +1,5 @@
 # tests/test_perp_scorer.py
+import pytest
 from datetime import datetime, timezone
 from unittest.mock import patch
 from scout import scorer as scorer_mod
@@ -73,3 +74,45 @@ def test_perp_signal_skips_when_no_anomaly_timestamp(token_factory, settings_fac
     ):
         points, signals = score(token, settings)
     assert "perp_anomaly" not in signals
+
+
+@pytest.mark.parametrize(
+    "perp_scoring_enabled, max_raw, ready, should_fire",
+    [
+        # SCORING=True but SCORER_MAX_RAW=202: denominator guard closed
+        (True, 202, False, False),
+        # SCORING=True + SCORER_MAX_RAW=203: guard open — signal fires
+        (True, 203, True, True),
+        # SCORING=False: must NOT fire regardless of denominator
+        (False, 203, True, False),
+        # SCORING=True + guard ready, but no anomaly timestamp (token has None)
+        (True, 203, True, None),  # None means: use token with no anomaly
+    ],
+)
+def test_perp_signal_flag_matrix(
+    token_factory,
+    settings_factory,
+    perp_scoring_enabled,
+    max_raw,
+    ready,
+    should_fire,
+):
+    settings = settings_factory(PERP_SCORING_ENABLED=perp_scoring_enabled)
+    if should_fire is None:
+        # Use a token with no anomaly data to test the no-fire path
+        token = _tagged(
+            token_factory, perp_last_anomaly_at=None, perp_oi_spike_ratio=None
+        )
+        expected_fire = False
+    else:
+        token = _tagged(token_factory)
+        expected_fire = should_fire
+    with (
+        patch.object(scorer_mod, "SCORER_MAX_RAW", max_raw),
+        patch.object(scorer_mod, "_PERP_SCORING_DENOMINATOR_READY", ready),
+    ):
+        _, signals = score(token, settings)
+    if expected_fire:
+        assert "perp_anomaly" in signals, f"Expected signal to fire: {signals}"
+    else:
+        assert "perp_anomaly" not in signals, f"Expected signal NOT to fire: {signals}"

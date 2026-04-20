@@ -1,5 +1,24 @@
-# scout/perp/enrichment.py
-"""Enrich CandidateTokens with perp anomaly tags from the DB."""
+"""Enrich CandidateTokens with perp anomaly tags from the DB.
+
+Tri-state semantics for perp_* fields on CandidateToken
+---------------------------------------------------------
+These four fields are populated together (or not at all):
+
+  perp_funding_flip:    True if a funding_flip anomaly was seen in the lookback
+                        window; None if no anomaly was found (False is never used).
+  perp_oi_spike_ratio:  The max OI ratio observed across oi_spike anomalies in the
+                        window; None if no oi_spike was found.
+  perp_last_anomaly_at: Timestamp of the most-recent anomaly (any kind); None if
+                        no anomaly found.
+  perp_exchange:        Exchange that produced the most-recent anomaly; None if no
+                        anomaly found.
+
+All four fields are None when PERP_ENABLED=False OR when no anomaly for that ticker
+was found in the lookback window. The scorer (scorer.py Signal 14) uses
+perp_last_anomaly_at as the primary gate and field presence (not None) as the
+secondary gate — the DB is authoritative; no threshold re-check is needed in the
+scorer. See also: scout/models.py perp_* field comments.
+"""
 
 from __future__ import annotations
 

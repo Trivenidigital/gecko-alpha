@@ -64,3 +64,13 @@ class PerpAnomaly(BaseModel):
         if v.tzinfo is None:
             raise ValueError("observed_at must be timezone-aware")
         return v
+
+    @property
+    def magnitude_pct(self) -> float | None:
+        """Funding-flip magnitude as a percentage. None if kind != 'funding_flip'."""
+        return self.magnitude if self.kind == "funding_flip" else None
+
+    @property
+    def ratio(self) -> float | None:
+        """OI spike ratio. None if kind != 'oi_spike'."""
+        return self.magnitude if self.kind == "oi_spike" else None

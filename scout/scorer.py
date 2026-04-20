@@ -162,21 +162,22 @@ def score(
             points += 10
             signals.append("score_velocity")
 
-    # Signal 12 -> rename to 14 at BL-053 merge (label only; points/logic unchanged). Perp futures anomaly --
-    # 10 points (GATED: PERP_SCORING_ENABLED + runtime denominator guard).
+    # Signal 14 (was 12 pre-BL-053). Perp futures anomaly — 10 points
+    # (GATED: PERP_SCORING_ENABLED + runtime denominator guard).
     # Double-gate: PERP_SCORING_ENABLED + SCORER_MAX_RAW >= 203. The second
     # gate is the runtime guard that prevents the scoring flag from silently
     # inflating scores before the recalibration PR lands. Tests monkeypatch
     # both. See design spec docs/superpowers/specs/
     # 2026-04-20-bl054-perp-ws-anomaly-detector-design.md §3.9.
+    #
+    # Enrichment truth = scorer truth: the DB is authoritative. We only check
+    # whether the field is set (not None), not the ratio threshold — that was
+    # already enforced by the anomaly classifier when writing to DB.
     if (
         settings.PERP_SCORING_ENABLED
         and _PERP_SCORING_DENOMINATOR_READY
         and token.perp_last_anomaly_at is not None
-        and (
-            token.perp_funding_flip
-            or (token.perp_oi_spike_ratio or 0) >= settings.PERP_OI_SPIKE_RATIO
-        )
+        and (token.perp_funding_flip or token.perp_oi_spike_ratio is not None)
     ):
         points += 10
         signals.append("perp_anomaly")

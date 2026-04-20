@@ -223,7 +223,7 @@ async def run_perp_watcher(session, db, settings) -> None:
 
 **Debounce caveat (ack).** In-memory cooldown is reset on process restart; a restart within `PERP_ANOMALY_DEDUP_MIN` of an anomaly could double-write. Given 5-min granularity and rare restarts, this is acceptable — but it's an acknowledged failure mode, not an oversight.
 
-**Supervisor + circuit-breaker.** The supervisor catches every exception on an inner exchange task and restarts after a 5-second sleep. If `PERP_MAX_CONSECUTIVE_RESTARTS` is breached **for a given exchange**, that exchange's inner task enters a **cooldown circuit-break** for `PERP_CIRCUIT_BREAK_SEC` (default 3600 s = 1 h) before retrying; it does NOT require a process restart to recover. The OTHER exchange's task is unaffected. The pipeline's main loop is unaffected in all cases (same isolation precedent as `LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS`).
+**Supervisor + circuit-breaker.** The supervisor catches every exception on an inner exchange task and restarts after a full-jitter exponential backoff (floor 0.5s, cap 60s). If `PERP_MAX_CONSECUTIVE_RESTARTS` is breached **for a given exchange**, that exchange's inner task enters a **cooldown circuit-break** for `PERP_CIRCUIT_BREAK_SEC` (default 3600 s = 1 h) before retrying; it does NOT require a process restart to recover. The OTHER exchange's task is unaffected. The pipeline's main loop is unaffected in all cases (same isolation precedent as `LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS`).
 
 ### 3.6 `scout/models.py` additions
 

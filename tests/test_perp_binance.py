@@ -80,3 +80,29 @@ async def test_stream_ticks_increments_counter_on_malformed_json(settings_factor
     ticks = [t async for t in stream_ticks(session, settings, state=state)]
     assert ticks == []
     assert state.malformed_frames == 1
+
+
+def test_markprice_frame_missing_funding_rate_passes_through():
+    """A markPriceUpdate frame without 'r' must yield a tick with funding_rate=None."""
+    frame = {
+        "stream": "!markPrice@arr@1s",
+        "data": [
+            {"e": "markPriceUpdate", "s": "BTCUSDT", "p": "50000", "E": "1713600000000"}
+        ],
+    }
+    ticks = list(parse_frame(frame))
+    assert len(ticks) == 1
+    assert ticks[0].funding_rate is None
+    assert ticks[0].mark_price == 50000.0
+
+
+def test_markprice_frame_missing_both_p_and_r_passes_through():
+    """A markPriceUpdate frame without 'p' or 'r' must yield a tick with both None."""
+    frame = {
+        "stream": "!markPrice@arr@1s",
+        "data": [{"e": "markPriceUpdate", "s": "BTCUSDT", "E": "1713600000000"}],
+    }
+    ticks = list(parse_frame(frame))
+    assert len(ticks) == 1
+    assert ticks[0].funding_rate is None
+    assert ticks[0].mark_price is None

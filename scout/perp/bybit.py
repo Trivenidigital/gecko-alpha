@@ -7,7 +7,7 @@ import contextlib
 import json
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 import structlog
@@ -15,6 +15,9 @@ import structlog
 from scout.config import Settings
 from scout.perp.normalize import normalize_ticker
 from scout.perp.schemas import PerpTick
+
+if TYPE_CHECKING:
+    from scout.perp.watcher import ClassifierState
 
 log = structlog.get_logger(__name__)
 
@@ -25,7 +28,14 @@ _TICKER_TOPIC_PREFIX = "tickers."
 _SUBSCRIBE_ACK_TIMEOUT_SEC = 5.0
 
 
-def parse_frame(frame: dict[str, Any]) -> list[PerpTick]:
+def parse_frame(
+    frame: dict[str, Any],
+    state: "ClassifierState | None" = None,
+) -> list[PerpTick]:
+    """Parse a single Bybit WS frame into PerpTicks.
+
+    Per-item parse failures increment state.parse_rejects if state is provided.
+    """
     if not isinstance(frame, dict):
         return []
     topic = frame.get("topic", "")
@@ -61,6 +71,8 @@ def parse_frame(frame: dict[str, Any]) -> list[PerpTick]:
         return [tick]
     except (KeyError, TypeError, ValueError) as exc:
         log.warning("perp.bybit.parse_failed", error=repr(exc), symbol=symbol)
+        if state is not None:
+            state.parse_rejects += 1
         return []
 
 
@@ -115,7 +127,7 @@ async def stream_ticks(
                     if state is not None:
                         state.malformed_frames += 1
                     continue
-                for tick in parse_frame(frame):
+                for tick in parse_frame(frame, state=state):
                     yield tick
         finally:
             ping_task.cancel()

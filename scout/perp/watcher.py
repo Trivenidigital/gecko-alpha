@@ -53,6 +53,7 @@ class ClassifierState:
     exchange_errors: dict[str, int] = field(default_factory=dict)
     flush_failures: int = 0
     rows_lost_to_flush_failure: int = 0
+    parse_rejects: int = 0  # per-item schema failures (distinct from frame-level)
 
 
 async def classifier_loop(
@@ -253,6 +254,7 @@ async def _run_exchange_with_supervision(
             consecutive_failures = 0
             attempts = 0
         else:
+            # Full-jitter backoff (floor 0.5s, cap 60s) — see design spec §3.5.
             backoff = rand() * min(60.0, float(2**attempts))
             backoff = max(0.5, backoff)
             await sleep(backoff)
@@ -340,6 +342,7 @@ async def _shadow_stats_loop(state: ClassifierState, settings: "Settings") -> No
                 state.baseline.rejected_values,
                 0,
             )
+            parse_rejects, state.parse_rejects = state.parse_rejects, 0
             logger.info(
                 "perp_watcher_stats",
                 dropped_ticks_last_min=dropped,
@@ -350,6 +353,7 @@ async def _shadow_stats_loop(state: ClassifierState, settings: "Settings") -> No
                 flush_failures_last_min=flush_failures,
                 rows_lost_to_flush_failure_last_min=rows_lost,
                 baseline_rejected_values_last_min=rejected_values,
+                parse_rejects_last_min=parse_rejects,
             )
         except asyncio.CancelledError:
             raise

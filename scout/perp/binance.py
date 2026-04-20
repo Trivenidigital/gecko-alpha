@@ -15,7 +15,7 @@ from scout.perp.normalize import normalize_ticker
 from scout.perp.schemas import PerpTick
 
 if TYPE_CHECKING:
-    pass  # ClassifierState imported only as a string annotation (Task 9)
+    from scout.perp.watcher import ClassifierState
 
 log = structlog.get_logger(__name__)
 
@@ -26,7 +26,10 @@ _MARK_STREAM_MATCH = "markPrice@arr"  # matches "!markPrice@arr@1s" frames
 _OI_STREAM_MATCH = "openInterest"
 
 
-def parse_frame(frame: dict[str, Any]) -> list[PerpTick]:
+def parse_frame(
+    frame: dict[str, Any],
+    state: "ClassifierState | None" = None,
+) -> list[PerpTick]:
     """Yield PerpTicks from a single Binance WS frame.
 
     Supports:
@@ -34,6 +37,7 @@ def parse_frame(frame: dict[str, Any]) -> list[PerpTick]:
       * ``<symbol>@openInterest`` — single OI update.
 
     Malformed or unknown streams silently yield empty. Never raises.
+    Per-item parse failures increment state.parse_rejects if state is provided.
     """
     ticks: list[PerpTick] = []
     stream = frame.get("stream") if isinstance(frame, dict) else None
@@ -44,12 +48,16 @@ def parse_frame(frame: dict[str, Any]) -> list[PerpTick]:
                 tick = _parse_mark(item)
                 if tick is not None:
                     ticks.append(tick)
+                elif state is not None:
+                    state.parse_rejects += 1
     elif stream and _OI_STREAM_MATCH in stream:
         data = frame.get("data")
         if isinstance(data, dict):
             tick = _parse_oi(data)
             if tick is not None:
                 ticks.append(tick)
+            elif state is not None:
+                state.parse_rejects += 1
     # OI and markPrice frames are snapshots of current value, not deltas;
     # drop-oldest in the queue is safe for both stream types.
     return ticks
@@ -61,12 +69,14 @@ def _parse_mark(item: dict[str, Any]) -> PerpTick | None:
         ticker = normalize_ticker(symbol)
         if ticker is None:
             return None
+        raw_p = item.get("p")
+        raw_r = item.get("r")
         return PerpTick(
             exchange="binance",
             symbol=symbol,
             ticker=ticker,
-            mark_price=float(item["p"]),
-            funding_rate=float(item["r"]),
+            mark_price=(float(raw_p) if raw_p is not None else None),
+            funding_rate=(float(raw_r) if raw_r is not None else None),
             timestamp=datetime.fromtimestamp(
                 float(item.get("E", 0)) / 1000, tz=timezone.utc
             ),
@@ -100,7 +110,7 @@ async def stream_ticks(
     session: aiohttp.ClientSession,
     settings: Settings,
     state: "ClassifierState | None" = None,
-) -> AsyncIterator[PerpTick]:
+) -> AsyncIterator[PerpTick]:  # type: ignore[return]
     """Open ONE Binance WS connection and yield PerpTicks until EOF/exception.
 
     Binance's server sends ping frames; aiohttp auto-replies pong. No
@@ -136,5 +146,5 @@ async def stream_ticks(
                 if state is not None:
                     state.malformed_frames += 1
                 continue
-            for tick in parse_frame(frame):
+            for tick in parse_frame(frame, state=state):
                 yield tick

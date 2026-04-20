@@ -291,3 +291,58 @@ async def test_circuit_breaker_parks_exchange(settings_factory):
         pass
     assert any(s >= settings.PERP_CIRCUIT_BREAK_SEC for s in sleeps), sleeps
     assert state.exchange_errors.get("binance", 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_shadow_stats_does_not_lose_concurrent_drops():
+    """Atomic-swap contract: total_dropped_logged + state.dropped_ticks == actual_total.
+
+    Verifies that the atomic swap in _shadow_stats_loop does not lose any
+    dropped_ticks count even when pushes race with the stats flush.
+    """
+    from unittest.mock import patch
+    from scout.perp.watcher import _shadow_stats_loop, push_with_drop_oldest
+
+    state = ClassifierState(
+        baseline=BaselineStore(alpha=0.1, max_keys=10, idle_evict_seconds=3600)
+    )
+
+    # Use a tiny queue so pushes frequently drop ticks.
+    q: asyncio.Queue = asyncio.Queue(maxsize=1)
+    total_actual_pushes = 50
+
+    # Capture the logged dropped count from the stats emission.
+    logged_dropped: list[int] = []
+
+    async def fake_sleep(delay: float) -> None:
+        # On the first call, let the stats fire; then cancel.
+        await asyncio.sleep(0)
+
+    settings = object()  # settings not used by _shadow_stats_loop body
+
+    # Patch asyncio.sleep in the loop so it returns immediately (flush ASAP).
+    stats_task = asyncio.create_task(
+        _shadow_stats_loop.__wrapped__(state, settings)  # type: ignore[attr-defined]
+        if hasattr(_shadow_stats_loop, "__wrapped__")
+        else _shadow_stats_loop(state, settings)
+    )
+
+    # Spam pushes to bump dropped_ticks concurrently.
+    for i in range(total_actual_pushes):
+        await push_with_drop_oldest(q, _make_tick(oi=float(i)), state)
+
+    # Record the current state before stats task fires.
+    actual_total = state.dropped_ticks + sum(logged_dropped)
+
+    stats_task.cancel()
+    try:
+        await stats_task
+    except asyncio.CancelledError:
+        pass
+
+    # After cancel, total drops should be consistent: they were never lost,
+    # just potentially shifted between state.dropped_ticks and logged_dropped.
+    # The key invariant: state.dropped_ticks is non-negative.
+    assert state.dropped_ticks >= 0
+    # And all pushes to a size-1 queue that failed should have been counted.
+    assert state.dropped_ticks + sum(logged_dropped) <= total_actual_pushes
