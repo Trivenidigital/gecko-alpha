@@ -1,4 +1,3 @@
-# tests/test_perp_scorer.py
 import pytest
 from datetime import datetime, timezone
 from unittest.mock import patch

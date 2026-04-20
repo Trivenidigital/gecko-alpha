@@ -134,8 +134,9 @@ async def stream_ticks(
     async with session.ws_connect(
         url,
         headers=None,  # explicit: do not leak shared-session UA/auth headers
-        heartbeat=settings.PERP_WS_PING_INTERVAL_SEC,
         max_msg_size=0,
+        # No heartbeat kwarg: Binance server sends pings unsolicited and
+        # aiohttp auto-pongs on receipt. Client heartbeat is redundant.
     ) as ws:
         async for msg in ws:
             if msg.type != aiohttp.WSMsgType.TEXT:

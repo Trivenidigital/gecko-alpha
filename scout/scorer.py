@@ -31,11 +31,16 @@ from scout.models import CandidateToken
 # Theoretical maximum raw score — update if signal weights change
 SCORER_MAX_RAW = 183
 
+# The max-raw value at which Signal 14 (perp anomaly) is included in the
+# denominator. When SCORER_MAX_RAW reaches this value the denominator guard
+# opens automatically. Must equal SCORER_MAX_RAW in the recalibration PR.
+_PERP_ENABLED_MAX_RAW = 203
+
 # Runtime guard for Signal 14. See design spec §3.9.
 # The constant and flag BOTH must be true for the signal to fire, preventing
 # silent score inflation if PERP_SCORING_ENABLED is flipped ahead of the
-# recalibration PR that bumps SCORER_MAX_RAW to 203.
-_PERP_SCORING_DENOMINATOR_READY = SCORER_MAX_RAW >= 203
+# recalibration PR that bumps SCORER_MAX_RAW to _PERP_ENABLED_MAX_RAW.
+_PERP_SCORING_DENOMINATOR_READY = SCORER_MAX_RAW >= _PERP_ENABLED_MAX_RAW
 
 
 def score(

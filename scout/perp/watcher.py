@@ -206,7 +206,11 @@ async def push_with_drop_oldest(
         queue.put_nowait(tick)
     except asyncio.QueueFull:
         state.dropped_ticks += 1
-        logger.debug("perp_queue_put_race_dropped")
+        logger.debug(
+            "perp_queue_put_race_dropped",
+            exchange=tick.exchange,
+            symbol=tick.symbol,
+        )
         return
 
 

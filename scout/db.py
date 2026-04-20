@@ -2,11 +2,15 @@
 
 import asyncio
 import json
+import math
+import structlog
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 from pathlib import Path
 
 import aiosqlite
+
+_db_log = structlog.get_logger(__name__)
 
 from scout.models import CandidateToken
 
@@ -1533,18 +1537,40 @@ class Database:
         """
         if not rows:
             return 0
-        payload = [
-            (
-                a.exchange,
-                a.symbol,
-                a.ticker,
-                a.kind,
-                a.magnitude,
-                a.baseline,
-                a.observed_at.isoformat(),
+        # Pre-validate rows: skip any with non-finite magnitude or naive observed_at
+        # to prevent one bad row from nuking the whole executemany transaction.
+        payload = []
+        for a in rows:
+            if not math.isfinite(a.magnitude):
+                _db_log.warning(
+                    "perp_anomaly_batch_skip_bad_row",
+                    reason="non_finite_magnitude",
+                    exchange=a.exchange,
+                    symbol=a.symbol,
+                    magnitude=a.magnitude,
+                )
+                continue
+            if a.observed_at.tzinfo is None:
+                _db_log.warning(
+                    "perp_anomaly_batch_skip_bad_row",
+                    reason="naive_observed_at",
+                    exchange=a.exchange,
+                    symbol=a.symbol,
+                )
+                continue
+            payload.append(
+                (
+                    a.exchange,
+                    a.symbol,
+                    a.ticker,
+                    a.kind,
+                    a.magnitude,
+                    a.baseline,
+                    a.observed_at.isoformat(),
+                )
             )
-            for a in rows
-        ]
+        if not payload:
+            return 0
         await self._conn.executemany(
             "INSERT OR IGNORE INTO perp_anomalies "
             "(exchange, symbol, ticker, kind, magnitude, baseline, observed_at) "

@@ -89,7 +89,7 @@ async def stream_ticks(
     Reconnect/backoff is handled by the supervisor in
     scout/perp/watcher.py (single-owner, injectable clock). On empty
     PERP_SYMBOLS this returns early -- NEVER open a connection to a
-    no-op subscription (previous hot-loop bug BLOCKER-2).
+    no-op subscription (would create an infinite hot-loop on an empty subscription).
     """
     symbols = settings.PERP_SYMBOLS
     if not symbols:
