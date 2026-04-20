@@ -108,8 +108,11 @@ async def stream_ticks(
 
 async def _ping_loop(ws: aiohttp.ClientWebSocketResponse, settings: Settings) -> None:
     while not ws.closed:
+        await asyncio.sleep(settings.PERP_WS_PING_INTERVAL_SEC)
+        if ws.closed:
+            return
         try:
             await ws.send_json({"op": "ping"})
-        except ConnectionResetError:
+        except (ConnectionResetError, RuntimeError) as exc:
+            log.warning("perp.bybit.ping_failed", error=repr(exc))
             return
-        await asyncio.sleep(settings.PERP_WS_PING_INTERVAL_SEC)
