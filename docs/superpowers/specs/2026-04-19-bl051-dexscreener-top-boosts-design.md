@@ -91,7 +91,7 @@ File: `scout/scorer.py`.
 
 Condition: `token.boost_total_amount is not None and token.boost_total_amount >= settings.MIN_BOOST_TOTAL_AMOUNT`.
 
-Placement: inserted as Signal 10 (before `solana_bonus`, so the chain bonus and velocity bonus remain at the end of the scorer). The signal counter `SCORER_MAX_RAW` is updated from **183** to **203** (30 + 8 + 25 + 15 + 15 + 15 + 20 + 25 + 15 + **20** + 5 + 10 = 203).
+Placement: inserted as new Signal 10 between `cg_trending_rank` (currently Signal 9, line ~143 of `scout/scorer.py`) and `solana_bonus`. The existing `solana_bonus` renumbers from Signal 10 → Signal 11 and `score_velocity` renumbers from Signal 11 → Signal 12. Comment-header numbering (lines 4–25) must be updated accordingly. `SCORER_MAX_RAW` is updated from **183** to **203** (30 + 8 + 25 + 15 + 15 + 15 + 20 + 25 + 15 + **20** + 5 + 10 = 203).
 
 Docstring header updated to list the new signal alongside the other DexScreener signals.
 
@@ -154,6 +154,13 @@ File: `scout/aggregator.py`.
 **New function:** `apply_boost_decorations(candidates: list[CandidateToken], boosts: list[BoostInfo]) -> list[CandidateToken]`.
 
 Called from `main.py::run_cycle` after the existing `aggregate()` call and before scoring. Returns a new list (or mutates via `model_copy`, consistent with the preservation pattern already in use).
+
+**Main-loop wiring (explicit).** `main.py::run_cycle` is extended to:
+1. Add `fetch_top_boosts(session, settings)` as a new positional arg to the existing `asyncio.gather(..., return_exceptions=True)` at lines 315–324. Capture its return value into a local `top_boosts` variable.
+2. Add an `isinstance(top_boosts, Exception)` branch that logs a warning (pattern matches the 4 existing branches at lines 326–340) and falls back to `top_boosts = []`.
+3. After the existing `aggregate(...)` call, invoke `candidates = apply_boost_decorations(candidates, top_boosts)` and proceed to scoring.
+
+This threading is explicit in the plan to prevent a common pitfall: dropping the boost data because the new `gather` arg is captured but never passed downstream.
 
 **Join key: normalized `contract_address`.**
 
