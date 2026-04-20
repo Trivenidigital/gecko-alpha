@@ -80,7 +80,7 @@ async def test_run_cycle_enriches_before_scoring(
     from scout.scorer import score
 
     # Bump denominator guard to the ready state for the duration of the test.
-    monkeypatch.setattr(scorer_mod, "SCORER_MAX_RAW", 203)
+    monkeypatch.setattr(scorer_mod, "SCORER_MAX_RAW", 208)
     monkeypatch.setattr(scorer_mod, "_PERP_SCORING_DENOMINATOR_READY", True)
 
     db = Database(db_path=tmp_path / "t.db")

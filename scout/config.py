@@ -238,7 +238,8 @@ class Settings(BaseSettings):
     # PERP_SCORING_ENABLED gates scorer signal separately. Flipping
     # PERP_SCORING_ENABLED alone does NOT affect scoring -- the scorer
     # also requires SCORER_MAX_RAW >= _PERP_ENABLED_MAX_RAW (runtime guard
-    # in scorer.py), which ships as 183 in this PR (guard threshold: 203).
+    # in scorer.py), which after the BL-054 recalibration PR ships as 208
+    # (equal to _PERP_ENABLED_MAX_RAW=208, so the guard opens by default).
     # Full design in
     # docs/superpowers/specs/2026-04-20-bl054-perp-ws-anomaly-detector-design.md.
     PERP_ENABLED: bool = False
