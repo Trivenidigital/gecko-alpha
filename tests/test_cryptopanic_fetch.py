@@ -197,3 +197,33 @@ async def test_fetch_connection_error_returns_empty():
         async with aiohttp.ClientSession() as session:
             result = await fetch_cryptopanic_posts(session, s)
     assert result == []
+
+
+async def test_ticker_collision_same_ticker_multiple_chains_gets_same_tag(token_factory):
+    """Documents the v0 ticker-only matching limitation: a single PEPE post
+    tags every PEPE token regardless of chain. news_tag_confidence must be
+    set to 'ticker_only' so downstream consumers can filter if needed.
+
+    Lives here (fetch/integration tests) because it is a behavioural contract,
+    not a pure-enrichment implementation detail.
+    """
+    from scout.news.cryptopanic import enrich_candidates_with_news
+    from scout.news.schemas import CryptoPanicPost
+
+    pepe_eth = token_factory(ticker="PEPE", chain="ethereum")
+    pepe_sol = token_factory(ticker="PEPE", chain="solana")
+    pepe_base = token_factory(ticker="PEPE", chain="base")
+    post = CryptoPanicPost(
+        post_id=99,
+        title="PEPE pumps",
+        url="u",
+        published_at="2026-04-20T00:00:00Z",
+        currencies=["PEPE"],
+        votes_positive=10,
+        votes_negative=0,
+    )
+    s = _settings()
+    enriched = enrich_candidates_with_news([pepe_eth, pepe_sol, pepe_base], [post], s)
+    assert all(t.news_count_24h == 1 for t in enriched)
+    assert all(t.news_tag_confidence == "ticker_only" for t in enriched)
+    assert all(t.latest_news_sentiment == "bullish" for t in enriched)
