@@ -285,8 +285,8 @@ class Settings(BaseSettings):
         if self.QUALIFIER_PRUNE_RETENTION_HOURS <= self.QUALIFIER_EXIT_GRACE_HOURS:
             raise ValueError(
                 "QUALIFIER_PRUNE_RETENTION_HOURS must be strictly greater than "
-                "QUALIFIER_EXIT_GRACE_HOURS to prevent pruning rows that classify "
-                "still needs for re-entry detection."
+                "QUALIFIER_EXIT_GRACE_HOURS to prevent pruning rows that are "
+                "still needed for re-entry detection."
             )
         return self
 
