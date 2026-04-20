@@ -244,7 +244,11 @@ async def test_streak_alert_counter_resets_after_success(
     for day in range(1, 8):
         now = datetime(2026, 4, day, 3, 0, 0)
         last_refresh, last_digest = await main_mod._run_feedback_schedulers(
-            db, s, last_refresh, last_digest, now,
+            db,
+            s,
+            last_refresh,
+            last_digest,
+            now,
         )
         # After the day-4 success, both counters must be zero so that the
         # next 3-failure streak can re-alert. Checking streak alone isn't
@@ -294,7 +298,11 @@ async def test_dst_fall_back_does_not_double_fire(
     # First 01:30:00 (pre-fall-back instant — EDT on the wall clock).
     now = datetime(2026, 11, 1, 1, 30, 0)
     last_refresh, last_digest = await main_mod._run_feedback_schedulers(
-        db, s, last_refresh, last_digest, now,
+        db,
+        s,
+        last_refresh,
+        last_digest,
+        now,
     )
     assert refresh_mock.call_count == 1
     assert last_refresh == "2026-11-01"
@@ -304,11 +312,15 @@ async def test_dst_fall_back_does_not_double_fire(
     # Must be deduped despite being a genuinely later clock observation.
     now = datetime(2026, 11, 1, 1, 45, 15)
     last_refresh, last_digest = await main_mod._run_feedback_schedulers(
-        db, s, last_refresh, last_digest, now,
+        db,
+        s,
+        last_refresh,
+        last_digest,
+        now,
     )
-    assert refresh_mock.call_count == 1, (
-        "refresh_all must not fire a second time during the repeated DST hour"
-    )
+    assert (
+        refresh_mock.call_count == 1
+    ), "refresh_all must not fire a second time during the repeated DST hour"
     await db.close()
 
 
@@ -339,12 +351,20 @@ async def test_dst_spring_forward_gapped_hour_skips_silently(
     # 01:59 — below target hour.
     now = datetime(2026, 3, 8, 1, 59, 0)  # US spring-forward
     last_refresh, last_digest = await main_mod._run_feedback_schedulers(
-        db, s, last_refresh, last_digest, now,
+        db,
+        s,
+        last_refresh,
+        last_digest,
+        now,
     )
     # 03:00 — clock jumped past the target hour.
     now = datetime(2026, 3, 8, 3, 0, 0)
     last_refresh, last_digest = await main_mod._run_feedback_schedulers(
-        db, s, last_refresh, last_digest, now,
+        db,
+        s,
+        last_refresh,
+        last_digest,
+        now,
     )
     assert refresh_mock.call_count == 0, (
         "spring-forward gapped hour: refresh must not fire when the loop "
@@ -352,13 +372,17 @@ async def test_dst_spring_forward_gapped_hour_skips_silently(
     )
     # Sentinel must remain unstamped for the skipped day — a future bug that
     # stamps last_refresh_date on gap-skip would also break next-day behavior.
-    assert last_refresh == "", (
-        f"sentinel must not advance on gap-skip, got {last_refresh!r}"
-    )
+    assert (
+        last_refresh == ""
+    ), f"sentinel must not advance on gap-skip, got {last_refresh!r}"
     # Next day at the configured hour — fires normally.
     now = datetime(2026, 3, 9, 2, 0, 0)
     last_refresh, last_digest = await main_mod._run_feedback_schedulers(
-        db, s, last_refresh, last_digest, now,
+        db,
+        s,
+        last_refresh,
+        last_digest,
+        now,
     )
     assert refresh_mock.call_count == 1
     assert last_refresh == "2026-03-09"

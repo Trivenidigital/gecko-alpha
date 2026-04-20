@@ -16,9 +16,7 @@ def _pool(addr, name="TestPool / SOL", fdv=100_000.0, liq=20_000.0, vol=80_000.0
             "reserve_in_usd": liq,
             "volume_usd": {"h24": vol},
         },
-        "relationships": {
-            "base_token": {"data": {"id": f"solana_{addr}"}}
-        },
+        "relationships": {"base_token": {"data": {"id": f"solana_{addr}"}}},
     }
 
 
