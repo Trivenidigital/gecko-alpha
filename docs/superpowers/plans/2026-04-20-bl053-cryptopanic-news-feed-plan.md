@@ -95,7 +95,7 @@ In `scout/config.py`, insert immediately after the `LUNARCRUSH_*` block (around 
     # requires a free API token; if empty, fetch short-circuits to [] without
     # hitting the network. Scoring signal exists but is gated by
     # CRYPTOPANIC_SCORING_ENABLED (off by default); flipping it on in a future
-    # PR will require a SCORER_MAX_RAW bump from 198 to 208.
+    # PR will require a SCORER_MAX_RAW bump from 183 to 193.
     CRYPTOPANIC_ENABLED: bool = False
     CRYPTOPANIC_API_TOKEN: str = ""
     CRYPTOPANIC_FETCH_FILTER: str = "hot"  # hot|rising|bullish|bearish|important
@@ -650,6 +650,56 @@ async def test_fetch_dedups_duplicate_post_ids_in_batch():
         async with aiohttp.ClientSession() as session:
             result = await fetch_cryptopanic_posts(session, s)
     assert [p.post_id for p in result] == [5, 6]
+
+
+async def test_fetch_timeout_returns_empty():
+    """Spec §12: asyncio.TimeoutError / aiohttp.ClientError fall through to []."""
+    s = _settings()
+    with aioresponses() as m:
+        m.get(BASE, exception=asyncio.TimeoutError(), repeat=True)
+        async with aiohttp.ClientSession() as session:
+            result = await fetch_cryptopanic_posts(session, s)
+    assert result == []
+
+
+async def test_fetch_connection_error_returns_empty():
+    """Spec §12: aiohttp.ClientConnectorError also falls through cleanly."""
+    s = _settings()
+    with aioresponses() as m:
+        m.get(BASE, exception=aiohttp.ClientError("boom"), repeat=True)
+        async with aiohttp.ClientSession() as session:
+            result = await fetch_cryptopanic_posts(session, s)
+    assert result == []
+
+
+async def test_ticker_collision_same_ticker_multiple_chains_gets_same_tag(token_factory):
+    """Documents the v0 ticker-only matching limitation: a single PEPE post
+    tags every PEPE token regardless of chain. news_tag_confidence must be
+    set to 'ticker_only' so downstream consumers can filter if needed.
+
+    This test lives here (in the fetch/integration tests) rather than in the
+    pure enrichment tests because it is a behavioural contract, not an
+    implementation detail."""
+    from scout.news.cryptopanic import enrich_candidates_with_news
+    from scout.news.schemas import CryptoPanicPost
+
+    pepe_eth = token_factory(ticker="PEPE", chain="ethereum")
+    pepe_sol = token_factory(ticker="PEPE", chain="solana")
+    pepe_base = token_factory(ticker="PEPE", chain="base")
+    post = CryptoPanicPost(
+        post_id=99,
+        title="PEPE pumps",
+        url="u",
+        published_at="2026-04-20T00:00:00Z",
+        currencies=["PEPE"],
+        votes_positive=10,
+        votes_negative=0,
+    )
+    s = _settings()
+    enriched = enrich_candidates_with_news([pepe_eth, pepe_sol, pepe_base], [post], s)
+    assert all(t.news_count_24h == 1 for t in enriched)
+    assert all(t.news_tag_confidence == "ticker_only" for t in enriched)
+    assert all(t.latest_news_sentiment == "bullish" for t in enriched)
 ```
 
 - [ ] **Step 4.2: Verify test fails**
@@ -864,6 +914,23 @@ async def test_prune_cryptopanic_posts_keeps_recent(db):
     rows = await db.fetch_all_cryptopanic_posts()
     assert len(rows) == 1
     assert rows[0]["post_id"] == 1
+
+
+async def test_prune_cryptopanic_posts_empty_table_returns_zero(db):
+    """Prune on an empty table must return 0, not error."""
+    pruned = await db.prune_cryptopanic_posts(keep_days=7)
+    assert pruned == 0
+
+
+async def test_prune_cryptopanic_posts_keep_days_zero_deletes_all(db):
+    """keep_days=0 means 'keep nothing older than now' — all rows delete."""
+    fresh = datetime.now(timezone.utc).isoformat()
+    await db.insert_cryptopanic_post(_post(1, fresh), is_macro=False, sentiment="neutral")
+    await db.insert_cryptopanic_post(_post(2, fresh), is_macro=False, sentiment="neutral")
+    pruned = await db.prune_cryptopanic_posts(keep_days=0)
+    assert pruned == 2
+    rows = await db.fetch_all_cryptopanic_posts()
+    assert rows == []
 ```
 
 - [ ] **Step 5.2: Verify test fails**
@@ -1294,23 +1361,23 @@ Expected: FAIL — `test_signal_fires_when_flag_true_and_conditions_met` fails b
 
 - [ ] **Step 7.3: Append signal to scorer**
 
-In `scout/scorer.py`, locate the "Signal 12: Score velocity bonus" block (around line 172-177) and insert the new block **before** the velocity signal (so "Signal 12" becomes "Signal 13" in spirit, though we keep them as code comments only — signal order doesn't affect scoring correctness because points are summed):
+In `scout/scorer.py`, insert Signal 13 **between** the Solana bonus (Signal 10) and the Score-velocity bonus (Signal 11) sections. This keeps the existing signal order intact so historical scores remain comparable. The scorer is a pure function with no logger — log emission happens at the call-site in `main.py` (Task 8), not inside `score()`.
 
-Actually, to preserve deterministic test output and keep signal-count semantics consistent, add Signal 13 **between** the solana bonus (Signal 11) and the score_velocity (Signal 12) sections. Find:
+Find the anchor comment in `scout/scorer.py`:
 
 ```python
-    # Signal 12: Score velocity bonus -- 10 points
+    # Signal 11: Score velocity bonus -- 10 points
 ```
 
 And insert immediately before it:
 
 ```python
     # Signal 13: CryptoPanic bullish news (BL-053) -- 10 points, gated.
-    # SCORER_MAX_RAW is NOT bumped in this PR — the ceiling-clamp
+    # SCORER_MAX_RAW is NOT bumped in this PR (stays at 183) — the ceiling-clamp
     # `min(points, 100)` at the end of score() keeps outputs well-formed
     # while the flag is off. Flipping CRYPTOPANIC_SCORING_ENABLED to True
     # is an operator-visible distribution shift and should ship with
-    # SCORER_MAX_RAW=208 + recalibrated tests in a follow-up PR.
+    # SCORER_MAX_RAW=193 + recalibrated tests in a follow-up PR.
     if (
         settings.CRYPTOPANIC_SCORING_ENABLED
         and token.latest_news_sentiment == "bullish"
@@ -1319,13 +1386,6 @@ And insert immediately before it:
     ):
         points += 10
         signals.append("cryptopanic_bullish")
-        logger.info(
-            "cryptopanic_sigfire",
-            token=token.ticker,
-            contract_address=token.contract_address,
-            sentiment=token.latest_news_sentiment,
-            news_count_24h=token.news_count_24h,
-        )
 
 ```
 
@@ -1478,7 +1538,7 @@ async def test_run_cycle_no_ops_when_disabled(settings_factory, db):
 Run: `uv run pytest tests/test_main_cryptopanic_integration.py -v`
 Expected: FAIL — `AttributeError: module 'scout.main' has no attribute 'fetch_cryptopanic_posts'`.
 
-- [ ] **Step 8.3: Add import to main.py**
+- [ ] **Step 8.3: Add imports to main.py**
 
 In `scout/main.py`, near the other `from scout.ingestion...` imports (around line 34-36), add:
 
@@ -1487,7 +1547,10 @@ from scout.news.cryptopanic import (
     enrich_candidates_with_news,
     fetch_cryptopanic_posts,
 )
+from scout.news.schemas import classify_macro, classify_sentiment
 ```
+
+Both schema helpers are imported at module top so the persistence loop in Step 8.4 does not do per-iteration imports.
 
 - [ ] **Step 8.4: Wire fetch + enrich + persist**
 
@@ -1531,16 +1594,17 @@ Then, AFTER the existing vol_7d enrichment loop (the `for i, token in enumerate(
 
     # Await CryptoPanic fetch (launched before enrichment) with a 10s cap
     # so a stalled third-party call cannot extend the cycle indefinitely.
+    # `Exception` already covers asyncio.TimeoutError — keep the except
+    # bare-Exception-only so static analysers don't flag the redundancy.
     if cryptopanic_task is not None:
         try:
             cp_posts = await asyncio.wait_for(cryptopanic_task, timeout=10.0)
-        except (asyncio.TimeoutError, Exception) as e:
+        except Exception as e:
             logger.warning("cryptopanic_fetch_failed", error=str(e))
             cp_posts = []
         if cp_posts:
-            # Persist posts (idempotent INSERT OR IGNORE)
-            from scout.news.schemas import classify_macro, classify_sentiment
-
+            # Persist posts (idempotent INSERT OR IGNORE). Imports stay module-top
+            # (added in Step 8.3) — do not import inside the loop.
             for post in cp_posts:
                 try:
                     sentiment = classify_sentiment(
@@ -1559,10 +1623,116 @@ Then, AFTER the existing vol_7d enrichment loop (the `for i, token in enumerate(
             enriched = enrich_candidates_with_news(enriched, cp_posts, settings)
 ```
 
+- [ ] **Step 8.4a: Add real-aioresponses integration test**
+
+The two tests written in Step 8.1 mock `fetch_cryptopanic_posts` itself, proving the call-site is wired but NOT that the real fetch module behaves correctly when invoked from `main.py`. Append a third test that mocks at the HTTP layer via aioresponses so the real `fetch_cryptopanic_posts` executes end-to-end.
+
+Append to `tests/test_main_cryptopanic_integration.py`:
+
+```python
+from aioresponses import aioresponses
+
+
+async def test_run_cycle_real_fetch_path_via_aioresponses(settings_factory, db):
+    """Exercises the actual fetch module (not mocked) through the HTTP layer.
+    Catches wiring bugs that would be invisible when the function under test
+    is replaced with AsyncMock."""
+    settings = settings_factory(
+        MIN_SCORE=1,
+        CRYPTOPANIC_ENABLED=True,
+        CRYPTOPANIC_API_TOKEN="tok",
+        CRYPTOPANIC_FETCH_FILTER="hot",
+    )
+    body = {
+        "results": [
+            {
+                "id": 77,
+                "title": "BTC rally",
+                "url": "https://cryptopanic.com/news/77",
+                "published_at": "2026-04-20T10:00:00Z",
+                "currencies": [{"code": "BTC"}],
+                "votes": {"positive": 15, "negative": 1},
+            }
+        ]
+    }
+
+    import aiohttp
+
+    async with aiohttp.ClientSession() as session:
+        with aioresponses() as m:
+            m.get(
+                "https://cryptopanic.com/api/v1/posts/",
+                payload=body,
+                status=200,
+                repeat=True,
+            )
+            with (
+                patch("scout.main.fetch_trending", new=AsyncMock(return_value=[_btc_candidate()])),
+                patch("scout.main.fetch_trending_pools", new=AsyncMock(return_value=[])),
+                patch("scout.main.cg_fetch_top_movers", new=AsyncMock(return_value=[])),
+                patch("scout.main.cg_fetch_trending", new=AsyncMock(return_value=[])),
+                patch("scout.main.cg_fetch_by_volume", new=AsyncMock(return_value=[])),
+                patch("scout.main.enrich_holders", new=AsyncMock(side_effect=lambda tok, s, st: tok)),
+                patch("scout.main.evaluate", new=AsyncMock(return_value=(False, 0.0, _btc_candidate()))),
+            ):
+                await run_cycle(settings, db, session, dry_run=True)
+
+    rows = await db.fetch_all_cryptopanic_posts()
+    assert len(rows) == 1
+    assert rows[0]["post_id"] == 77
+
+
+async def test_run_cycle_survives_cryptopanic_timeout(settings_factory, db):
+    """If the fetch hangs past the 10s cap, pipeline must fall through with
+    cp_posts=[] and not block subsequent stages."""
+    settings = settings_factory(
+        MIN_SCORE=1,
+        CRYPTOPANIC_ENABLED=True,
+        CRYPTOPANIC_API_TOKEN="tok",
+    )
+
+    async def _hang(*_args, **_kwargs):
+        # Simulate a fetch that vastly exceeds the 10s wait_for cap.
+        import asyncio as _aio
+
+        await _aio.sleep(30)
+        return []
+
+    import aiohttp
+
+    async with aiohttp.ClientSession() as session:
+        with (
+            patch("scout.main.fetch_trending", new=AsyncMock(return_value=[_btc_candidate()])),
+            patch("scout.main.fetch_trending_pools", new=AsyncMock(return_value=[])),
+            patch("scout.main.cg_fetch_top_movers", new=AsyncMock(return_value=[])),
+            patch("scout.main.cg_fetch_trending", new=AsyncMock(return_value=[])),
+            patch("scout.main.cg_fetch_by_volume", new=AsyncMock(return_value=[])),
+            patch("scout.main.enrich_holders", new=AsyncMock(side_effect=lambda tok, s, st: tok)),
+            patch("scout.main.fetch_cryptopanic_posts", new=_hang),
+            patch("scout.main.evaluate", new=AsyncMock(return_value=(False, 0.0, _btc_candidate()))),
+        ):
+            # Must complete without raising even though the inner fetch hangs.
+            # (Test will itself timeout at pytest's default if the 10s cap is
+            # broken — so no explicit wait_for here.)
+            await run_cycle(settings, db, session, dry_run=True)
+
+    rows = await db.fetch_all_cryptopanic_posts()
+    assert rows == []
+```
+
+Mark the hang test as slow (it burns the full 10s wait_for):
+
+```python
+# Add this decorator to test_run_cycle_survives_cryptopanic_timeout
+@pytest.mark.slow
+async def test_run_cycle_survives_cryptopanic_timeout(...):
+    ...
+```
+
 - [ ] **Step 8.5: Verify integration tests pass**
 
 Run: `uv run pytest tests/test_main_cryptopanic_integration.py -v`
-Expected: PASS (2 tests).
+Expected: PASS (4 tests — 2 from 8.1 + 2 from 8.4a). The hang test will take ~10s; this is intentional.
 
 - [ ] **Step 8.6: Verify no regression across the suite**
 
@@ -1591,7 +1761,30 @@ Open `scout/main.py` and find the `# Hourly tasks: outcome check + DB prune` sec
 
 - [ ] **Step 9.2: Add prune call**
 
-After the existing `db.prune_old_candidates` try/except block, inside the same `if now - last_outcome_check >= outcome_check_interval:` guard, append:
+Locate the exact structure in `scout/main.py`:
+
+```python
+                    if now - last_outcome_check >= outcome_check_interval:   # <-- outer hourly guard
+                        try:
+                            outcomes_recorded = await check_outcomes(db, session)
+                            ...
+                        # existing 500MB-guarded prune block:
+                        try:
+                            db_size = ...
+                            if db_size > 500_000_000:
+                                pruned = await db.prune_old_candidates(keep_days=7)
+                                ...
+                        except Exception as e:
+                            logger.warning("DB prune error", error=str(e))
+
+                        # <-- INSERT BL-053 PRUNE HERE: still inside the outer
+                        #     hourly guard, but OUTSIDE the 500MB if-check so
+                        #     it runs every hour regardless of DB size.
+
+                        last_outcome_check = now
+```
+
+Insert immediately before `last_outcome_check = now`:
 
 ```python
 

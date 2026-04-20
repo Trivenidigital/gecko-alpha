@@ -211,11 +211,14 @@ if (
     signals.append("cryptopanic_bullish")
 ```
 
-**Important:** SCORER_MAX_RAW remains **198** in this PR. When
+**Important:** SCORER_MAX_RAW remains **183** in this PR (current value in
+`scout/scorer.py`, asserted by `tests/test_scorer.py`). When
 `CRYPTOPANIC_SCORING_ENABLED=False` (default) the signal never fires, so raw
 score distribution and all 11 normalization thresholds are unchanged. Flipping
-the flag to True in a future PR will require bumping SCORER_MAX_RAW to 208 and
-updating tests in that PR; that is explicitly out of scope here.
+the flag to True in a future PR will require bumping SCORER_MAX_RAW to 193 and
+updating tests in that PR; that is explicitly out of scope here. A guard test
+in this PR confirms the `min(points, 100)` ceiling keeps normalized scores
+bounded even if the flag is flipped without a recalibration.
 
 ## 12. Error Handling
 
@@ -295,7 +298,7 @@ Existing baseline ~836 tests must remain passing.
 
 ## 17. Out of Scope / Follow-Ups
 
-1. Activate scoring signal (bump SCORER_MAX_RAW 198→208, update scorer tests).
+1. Activate scoring signal (bump SCORER_MAX_RAW 183→193, update scorer tests).
 2. Dashboard section: recent news-tagged alerts.
 3. Paper-trading filter: block trades during bearish macro posts.
 4. Sentiment calibration via labelled outcome data.
