@@ -8,9 +8,9 @@ enrichment path with a populated DB, so a regression where enrichment
 writes different CandidateToken fields under PERP_ENABLED=true would be
 caught here (BLOCKER-7).
 
-Parameterized over (SCORER_MAX_RAW, denominator_guard_open) so the future
-recalibration PR that bumps SCORER_MAX_RAW to 203 doesn't have to add new
-coverage retroactively — both regimes are tested now.
+Parameterized over (SCORER_MAX_RAW, denominator_guard_open) so the
+BL-054 recalibration PR that bumped SCORER_MAX_RAW to 208 is tested
+alongside the pre-recalibration regime (198, guard closed).
 """
 
 import pytest
@@ -35,8 +35,8 @@ def _corpus(token_factory):
 @pytest.mark.parametrize(
     "max_raw,expected_guard",
     [
-        (183, False),  # current ship value — denominator guard closed
-        (203, True),  # future recalibration value — guard open
+        (198, False),  # pre-recalibration value — denominator guard closed
+        (208, True),  # post-BL-054-recalibration value — guard open
     ],
 )
 async def test_shadow_mode_scorer_is_byte_identical_to_disabled(

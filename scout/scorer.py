@@ -22,7 +22,7 @@ Velocity signal:
 Chain bonus:
 - solana_bonus (chain == solana): 5 points -- Meme premium
 
-Max raw: 30+8+25+15+15+15+20+25+15+15+5+10 = 198 points
+Max raw: 30+8+25+15+15+15+20+25+15+15+5+10+10 = 208 points
 Normalized to 0-100 scale, then co-occurrence multiplier (1.15x if 3+ signals) applied.
 """
 
@@ -34,12 +34,13 @@ from scout.models import CandidateToken
 logger = structlog.get_logger(__name__)
 
 # Theoretical maximum raw score — update if signal weights change
-SCORER_MAX_RAW = 198
+SCORER_MAX_RAW = 208
 
 # The max-raw value at which Signal 14 (perp anomaly) is included in the
-# denominator. When SCORER_MAX_RAW reaches this value the denominator guard
-# opens automatically. Must equal SCORER_MAX_RAW in the recalibration PR.
-_PERP_ENABLED_MAX_RAW = 203
+# denominator. When SCORER_MAX_RAW equals this value the denominator guard
+# opens automatically. Recalibrated in BL-054 recalibration PR: both
+# constants now 208 (198 pre-recalibration + 10 for Signal 14 perp_anomaly).
+_PERP_ENABLED_MAX_RAW = 208
 
 # Runtime guard for Signal 14. See design spec §3.9.
 # The constant and flag BOTH must be true for the signal to fire, preventing
@@ -181,7 +182,7 @@ def score(
         signals.append("solana_bonus")
 
     # Signal 13: CryptoPanic bullish news (BL-053) -- 10 points, gated.
-    # SCORER_MAX_RAW is NOT bumped in this PR (stays at 198) — the ceiling-clamp
+    # SCORER_MAX_RAW does NOT include CryptoPanic's +10 — the ceiling-clamp
     # `min(points, 100)` at the end of score() keeps outputs well-formed
     # while the flag is off. Flipping CRYPTOPANIC_SCORING_ENABLED to True
     # is an operator-visible distribution shift and should ship with
@@ -204,7 +205,7 @@ def score(
 
     # Signal 14 (was 12 pre-BL-053). Perp futures anomaly — 10 points
     # (GATED: PERP_SCORING_ENABLED + runtime denominator guard).
-    # Double-gate: PERP_SCORING_ENABLED + SCORER_MAX_RAW >= 203. The second
+    # Double-gate: PERP_SCORING_ENABLED + SCORER_MAX_RAW >= 208. The second
     # gate is the runtime guard that prevents the scoring flag from silently
     # inflating scores before the recalibration PR lands. Tests monkeypatch
     # both. See design spec docs/superpowers/specs/

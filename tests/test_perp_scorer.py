@@ -28,14 +28,14 @@ def test_perp_signal_does_not_fire_when_denominator_not_ready(
 ):
     settings = settings_factory(PERP_SCORING_ENABLED=True)
     token = _tagged(token_factory)
-    # SCORER_MAX_RAW ships at 183, so denominator-not-ready — signal must NOT fire.
-    # Canary: if a future PR bumps SCORER_MAX_RAW without updating the guard,
-    # this assert fails LOUDLY before we reach the behavioral check.
-    assert scorer_mod.SCORER_MAX_RAW < 203
-    assert scorer_mod._PERP_SCORING_DENOMINATOR_READY is False
-    points, signals = score(token, settings)
-    # Runtime guard: with SCORER_MAX_RAW < 203 we want points contributed by
-    # the perp signal to be 0 and "perp_anomaly" NOT in signals_fired.
+    # Post-BL-054-recalibration the default denominator guard is OPEN
+    # (SCORER_MAX_RAW=208 == _PERP_ENABLED_MAX_RAW=208). To verify the
+    # guard itself still gates scoring, patch it closed for this test.
+    with (
+        patch.object(scorer_mod, "SCORER_MAX_RAW", 198),
+        patch.object(scorer_mod, "_PERP_SCORING_DENOMINATOR_READY", False),
+    ):
+        points, signals = score(token, settings)
     assert "perp_anomaly" not in signals
 
 
@@ -46,7 +46,7 @@ def test_perp_signal_fires_when_both_flag_and_denominator_ready(
     settings = settings_factory(PERP_SCORING_ENABLED=True, PERP_OI_SPIKE_RATIO=3.0)
     token = _tagged(token_factory)
     with (
-        patch.object(scorer_mod, "SCORER_MAX_RAW", 203),
+        patch.object(scorer_mod, "SCORER_MAX_RAW", 208),
         patch.object(scorer_mod, "_PERP_SCORING_DENOMINATOR_READY", True),
     ):
         points, signals = score(token, settings)
@@ -57,7 +57,7 @@ def test_perp_signal_funding_flip_path(token_factory, settings_factory):
     settings = settings_factory(PERP_SCORING_ENABLED=True)
     token = _tagged(token_factory, perp_funding_flip=True, perp_oi_spike_ratio=None)
     with (
-        patch.object(scorer_mod, "SCORER_MAX_RAW", 203),
+        patch.object(scorer_mod, "SCORER_MAX_RAW", 208),
         patch.object(scorer_mod, "_PERP_SCORING_DENOMINATOR_READY", True),
     ):
         points, signals = score(token, settings)
@@ -68,7 +68,7 @@ def test_perp_signal_skips_when_no_anomaly_timestamp(token_factory, settings_fac
     settings = settings_factory(PERP_SCORING_ENABLED=True)
     token = _tagged(token_factory, perp_last_anomaly_at=None)
     with (
-        patch.object(scorer_mod, "SCORER_MAX_RAW", 203),
+        patch.object(scorer_mod, "SCORER_MAX_RAW", 208),
         patch.object(scorer_mod, "_PERP_SCORING_DENOMINATOR_READY", True),
     ):
         points, signals = score(token, settings)
@@ -78,14 +78,14 @@ def test_perp_signal_skips_when_no_anomaly_timestamp(token_factory, settings_fac
 @pytest.mark.parametrize(
     "perp_scoring_enabled, max_raw, ready, should_fire",
     [
-        # SCORING=True but SCORER_MAX_RAW=202: denominator guard closed
-        (True, 202, False, False),
-        # SCORING=True + SCORER_MAX_RAW=203: guard open — signal fires
-        (True, 203, True, True),
+        # SCORING=True but SCORER_MAX_RAW=207: denominator guard closed
+        (True, 207, False, False),
+        # SCORING=True + SCORER_MAX_RAW=208: guard open — signal fires
+        (True, 208, True, True),
         # SCORING=False: must NOT fire regardless of denominator
-        (False, 203, True, False),
+        (False, 208, True, False),
         # SCORING=True + guard ready, but no anomaly timestamp (token has None)
-        (True, 203, True, None),  # None means: use token with no anomaly
+        (True, 208, True, None),  # None means: use token with no anomaly
     ],
 )
 def test_perp_signal_flag_matrix(
