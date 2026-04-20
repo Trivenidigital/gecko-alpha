@@ -17,7 +17,13 @@ from scout.perp.schemas import PerpTick
 if TYPE_CHECKING:
     pass  # ClassifierState imported only as a string annotation (Task 9)
 
-logger = structlog.get_logger()
+log = structlog.get_logger(__name__)
+
+# Stream name constants
+_MARK_STREAM = "!markPrice@arr@1s"
+_OI_STREAM_SUFFIX = "@openInterest"
+_MARK_STREAM_MATCH = "markPrice@arr"  # matches "!markPrice@arr@1s" frames
+_OI_STREAM_MATCH = "openInterest"
 
 
 def parse_frame(frame: dict[str, Any]) -> list[PerpTick]:
@@ -31,15 +37,15 @@ def parse_frame(frame: dict[str, Any]) -> list[PerpTick]:
     """
     ticks: list[PerpTick] = []
     stream = frame.get("stream") if isinstance(frame, dict) else None
-    if stream and "markPrice@arr" in stream:
-        data = frame.get("data") or []
+    if stream and _MARK_STREAM_MATCH in stream:
+        data = frame.get("data")
         if isinstance(data, list):
             for item in data:
                 tick = _parse_mark(item)
                 if tick is not None:
                     ticks.append(tick)
-    elif stream and "openInterest" in stream:
-        data = frame.get("data") or {}
+    elif stream and _OI_STREAM_MATCH in stream:
+        data = frame.get("data")
         if isinstance(data, dict):
             tick = _parse_oi(data)
             if tick is not None:
@@ -65,7 +71,8 @@ def _parse_mark(item: dict[str, Any]) -> PerpTick | None:
                 float(item.get("E", 0)) / 1000, tz=timezone.utc
             ),
         )
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError) as exc:
+        log.warning("perp.binance.parse_failed", kind="markPrice", error=repr(exc))
         return None
 
 
@@ -84,7 +91,8 @@ def _parse_oi(item: dict[str, Any]) -> PerpTick | None:
                 float(item.get("E", 0)) / 1000, tz=timezone.utc
             ),
         )
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError) as exc:
+        log.warning("perp.binance.parse_failed", kind="openInterest", error=repr(exc))
         return None
 
 
@@ -110,7 +118,7 @@ async def stream_ticks(
     if not symbols:
         return
     streams = "/".join(
-        ["!markPrice@arr@1s"] + [f"{s.lower()}@openInterest" for s in symbols]
+        [_MARK_STREAM] + [f"{s.lower()}{_OI_STREAM_SUFFIX}" for s in symbols]
     )
     url = f"{settings.PERP_BINANCE_WS_URL}?streams={streams}"
     async with session.ws_connect(
@@ -124,7 +132,7 @@ async def stream_ticks(
                 continue
             try:
                 frame = json.loads(msg.data)
-            except (ValueError, TypeError):
+            except (json.JSONDecodeError, ValueError, TypeError):
                 if state is not None:
                     state.malformed_frames += 1
                 continue
