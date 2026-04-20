@@ -150,7 +150,7 @@ async def test_fetch_top_boosts_happy_path(mock_aiohttp, settings_factory, monke
 
     assert len(result) == 2
     assert result[0] == BoostInfo(chain="solana", address="ADDR1", total_amount=1500.0)
-    assert result[1] == BoostInfo(chain="base", address="0xabcdef", total_amount=800.0)
+    assert result[1] == BoostInfo(chain="base", address="0xABCDEF", total_amount=800.0)
 
 
 async def test_fetch_top_boosts_empty_response(mock_aiohttp, settings_factory, monkeypatch):
@@ -177,7 +177,7 @@ async def test_fetch_top_boosts_skips_missing_total_amount(mock_aiohttp, setting
         result = await fetch_top_boosts(session, settings)
 
     assert len(result) == 1
-    assert result[0].address == "0xabc"
+    assert result[0].address == "0xABC"
 
 
 async def test_fetch_top_boosts_skips_missing_chain_or_address(mock_aiohttp, settings_factory, monkeypatch):
@@ -194,7 +194,7 @@ async def test_fetch_top_boosts_skips_missing_chain_or_address(mock_aiohttp, set
         result = await fetch_top_boosts(session, settings)
 
     assert len(result) == 1
-    assert result[0].address == "0xgood"
+    assert result[0].address == "0xGOOD"
 
 
 async def test_fetch_top_boosts_upstream_error_returns_empty(mock_aiohttp, settings_factory, monkeypatch):
