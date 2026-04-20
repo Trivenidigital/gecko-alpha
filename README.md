@@ -82,6 +82,16 @@ uv run pytest tests/test_scorer.py -v    # Scorer only
 uv run pytest tests/test_dashboard_api.py # Dashboard API only
 ```
 
+### Perp Anomaly Detector (BL-054)
+
+Research-only watcher for Binance/Bybit perpetual-futures anomalies:
+funding-rate flips + OI spikes. Default OFF. Two independent
+kill-switches (`PERP_ENABLED` for data collection, `PERP_SCORING_ENABLED`
+for scorer impact). Scoring path is runtime-gated by `SCORER_MAX_RAW`
+— flipping the scoring flag alone cannot affect pipeline output until
+a follow-up recalibration PR lands. See
+`docs/superpowers/specs/2026-04-20-bl054-perp-ws-anomaly-detector-design.md`.
+
 ## Configuration
 
 All settings via environment variables — see `.env.example` for the full list.
