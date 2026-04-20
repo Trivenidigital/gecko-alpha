@@ -62,8 +62,12 @@ async def test_insert_dup_post_id_is_idempotent(db):
 async def test_prune_cryptopanic_posts_keeps_recent(db):
     fresh = datetime.now(timezone.utc).isoformat()
     stale = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
-    await db.insert_cryptopanic_post(_post(1, fresh), is_macro=False, sentiment="neutral")
-    await db.insert_cryptopanic_post(_post(2, stale), is_macro=False, sentiment="neutral")
+    await db.insert_cryptopanic_post(
+        _post(1, fresh), is_macro=False, sentiment="neutral"
+    )
+    await db.insert_cryptopanic_post(
+        _post(2, stale), is_macro=False, sentiment="neutral"
+    )
     pruned = await db.prune_cryptopanic_posts(keep_days=7)
     assert pruned == 1
     rows = await db.fetch_all_cryptopanic_posts()
@@ -80,8 +84,12 @@ async def test_prune_cryptopanic_posts_empty_table_returns_zero(db):
 async def test_prune_cryptopanic_posts_keep_days_zero_deletes_all(db):
     """keep_days=0 means 'keep nothing older than now' — all rows delete."""
     fresh = datetime.now(timezone.utc).isoformat()
-    await db.insert_cryptopanic_post(_post(1, fresh), is_macro=False, sentiment="neutral")
-    await db.insert_cryptopanic_post(_post(2, fresh), is_macro=False, sentiment="neutral")
+    await db.insert_cryptopanic_post(
+        _post(1, fresh), is_macro=False, sentiment="neutral"
+    )
+    await db.insert_cryptopanic_post(
+        _post(2, fresh), is_macro=False, sentiment="neutral"
+    )
     pruned = await db.prune_cryptopanic_posts(keep_days=0)
     assert pruned == 2
     rows = await db.fetch_all_cryptopanic_posts()

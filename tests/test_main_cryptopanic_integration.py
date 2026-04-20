@@ -14,7 +14,6 @@ from scout.main import run_cycle
 from scout.models import CandidateToken
 from scout.news.schemas import CryptoPanicPost
 
-
 # aioresponses matches full URL including querystring unless given a regex.
 _CP_URL = re.compile(r"https://cryptopanic\.com/api/v1/posts/.*")
 

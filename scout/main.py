@@ -521,7 +521,9 @@ async def run_cycle(
                 vol_avg = await db.get_vol_7d_avg(token.contract_address)
                 if vol_avg is not None:
                     enriched[i] = enriched[i].model_copy(update={"vol_7d_avg": vol_avg})
-                await db.log_volume_snapshot(token.contract_address, token.volume_24h_usd)
+                await db.log_volume_snapshot(
+                    token.contract_address, token.volume_24h_usd
+                )
 
         # Stage 2.5: Perp enrichment (OI/funding anomalies from perp watcher)
         enriched = await _maybe_enrich_perp(enriched, db=db, settings=settings)
@@ -549,7 +551,9 @@ async def run_cycle(
                             post, is_macro=is_macro, sentiment=sentiment
                         )
                     except Exception:
-                        logger.exception("cryptopanic_persist_error", post_id=post.post_id)
+                        logger.exception(
+                            "cryptopanic_persist_error", post_id=post.post_id
+                        )
                 # Tag candidates
                 enriched = enrich_candidates_with_news(enriched, cp_posts, settings)
     finally:

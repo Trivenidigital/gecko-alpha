@@ -199,7 +199,9 @@ async def test_fetch_connection_error_returns_empty():
     assert result == []
 
 
-async def test_ticker_collision_same_ticker_multiple_chains_gets_same_tag(token_factory):
+async def test_ticker_collision_same_ticker_multiple_chains_gets_same_tag(
+    token_factory,
+):
     """Documents the v0 ticker-only matching limitation: a single PEPE post
     tags every PEPE token regardless of chain. news_tag_confidence must be
     set to 'ticker_only' so downstream consumers can filter if needed.

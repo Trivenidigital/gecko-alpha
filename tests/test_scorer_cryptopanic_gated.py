@@ -23,7 +23,9 @@ def test_signal_silent_when_flag_false(settings_factory, token_factory):
     assert "cryptopanic_bullish" not in signals
 
 
-def test_signal_fires_when_flag_true_and_conditions_met(settings_factory, token_factory):
+def test_signal_fires_when_flag_true_and_conditions_met(
+    settings_factory, token_factory
+):
     s = settings_factory(CRYPTOPANIC_SCORING_ENABLED=True)
     token = _tagged_token(token_factory)
     _, signals = score(token, s)
