@@ -34,9 +34,11 @@ async def fetch_trending_pools(
             logger.warning("GeckoTerminal request error", chain=chain, error=str(e))
             continue
 
-        for pool in data.get("data", []):
+        # NB: GT returns trending_pools in rank order; idx 0 = most-traded.
+        for idx, pool in enumerate(data.get("data", [])):
             try:
                 token = CandidateToken.from_geckoterminal(pool, chain=chain)
+                token = token.model_copy(update={"gt_trending_rank": idx + 1})
                 if (
                     settings.MIN_MARKET_CAP
                     <= token.market_cap_usd
