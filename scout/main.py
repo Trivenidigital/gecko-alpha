@@ -11,7 +11,7 @@ import structlog
 
 from datetime import datetime, timedelta, timezone
 
-from scout.aggregator import aggregate
+from scout.aggregator import aggregate, apply_boost_decorations
 from scout.alerter import format_daily_summary, send_alert, send_telegram_message
 from scout.chains.events import safe_emit
 from scout.chains.patterns import seed_built_in_patterns
@@ -31,7 +31,7 @@ from scout.ingestion.coingecko import fetch_top_movers as cg_fetch_top_movers
 from scout.ingestion.coingecko import fetch_trending as cg_fetch_trending
 from scout.ingestion.coingecko import fetch_by_volume as cg_fetch_by_volume
 from scout.ingestion import coingecko as _cg_module
-from scout.ingestion.dexscreener import fetch_trending
+from scout.ingestion.dexscreener import fetch_trending, fetch_top_boosts
 from scout.ingestion.geckoterminal import fetch_trending_pools
 from scout.ingestion.holder_enricher import enrich_holders
 from scout.narrative.agent import narrative_agent_loop
@@ -312,15 +312,21 @@ async def run_cycle(
     stats = {"tokens_scanned": 0, "candidates_promoted": 0, "alerts_fired": 0}
 
     # Stage 1: Parallel ingestion
-    dex_tokens, gecko_tokens, cg_movers, cg_trending, cg_by_volume = (
-        await asyncio.gather(
-            fetch_trending(session, settings),
-            fetch_trending_pools(session, settings),
-            cg_fetch_top_movers(session, settings),
-            cg_fetch_trending(session, settings),
-            cg_fetch_by_volume(session, settings),
-            return_exceptions=True,
-        )
+    (
+        dex_tokens,
+        gecko_tokens,
+        cg_movers,
+        cg_trending,
+        cg_by_volume,
+        top_boosts,
+    ) = await asyncio.gather(
+        fetch_trending(session, settings),
+        fetch_trending_pools(session, settings),
+        cg_fetch_top_movers(session, settings),
+        cg_fetch_trending(session, settings),
+        cg_fetch_by_volume(session, settings),
+        fetch_top_boosts(session, settings),
+        return_exceptions=True,
     )
     # Handle exceptions from gather
     if isinstance(dex_tokens, Exception):
@@ -338,6 +344,9 @@ async def run_cycle(
     if isinstance(cg_by_volume, Exception):
         logger.warning("CoinGecko volume scan failed", error=str(cg_by_volume))
         cg_by_volume = []
+    if isinstance(top_boosts, Exception):
+        logger.warning("DexScreener top-boosts ingestion failed", error=str(top_boosts))
+        top_boosts = []
 
     # Cache raw CoinGecko prices for dashboard (zero extra API calls)
     all_raw = list(_cg_module.last_raw_markets)
@@ -451,7 +460,7 @@ async def run_cycle(
         except Exception:
             logger.exception("velocity_alert_error")
 
-    # Stage 2: Aggregate
+    # Stage 2a: Aggregate (dedup by contract_address)
     all_candidates = aggregate(
         list(dex_tokens)
         + list(gecko_tokens)
@@ -459,6 +468,9 @@ async def run_cycle(
         + list(cg_trending)
         + list(cg_by_volume)
     )
+    # Stage 2b: Decorate with DexScreener top-boosts data (BL-051).
+    # top_boosts is a list[BoostInfo] (possibly empty); harmless no-op when empty.
+    all_candidates = apply_boost_decorations(all_candidates, list(top_boosts))
     stats["tokens_scanned"] = len(all_candidates)
 
     # Enrich holders (concurrently)

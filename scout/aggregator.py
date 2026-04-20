@@ -2,6 +2,7 @@
 
 import structlog
 
+from scout.ingestion.dexscreener import BoostInfo, _normalize_address
 from scout.models import CandidateToken
 
 logger = structlog.get_logger()
@@ -46,3 +47,39 @@ def aggregate(candidates: list[CandidateToken]) -> list[CandidateToken]:
         logger.info("aggregator_trending_preserved", ranked_tokens=ranked)
 
     return list(seen.values())
+
+
+def apply_boost_decorations(
+    candidates: list[CandidateToken],
+    boosts: list[BoostInfo],
+) -> list[CandidateToken]:
+    """Decorate deduped candidates with DexScreener top-boost data (BL-051).
+
+    Rank is derived positionally from the incoming `boosts` list order
+    (index+1 = rank), reflecting the API's own totalAmount-desc ordering.
+    Join key is (chain, normalized_address); EVM addresses are matched
+    case-insensitive, non-EVM chains preserve case.
+
+    Unmatched boost entries are silently dropped; unmatched candidates are
+    returned unchanged (their `boost_total_amount` / `boost_rank` remain None).
+    """
+    if not boosts:
+        return candidates
+
+    boost_map: dict[tuple[str, str], tuple[float, int]] = {}
+    for idx, b in enumerate(boosts):
+        key = (b.chain, _normalize_address(b.chain, b.address))
+        boost_map[key] = (b.total_amount, idx + 1)
+
+    result: list[CandidateToken] = []
+    for cand in candidates:
+        key = (cand.chain, _normalize_address(cand.chain, cand.contract_address))
+        hit = boost_map.get(key)
+        if hit is None:
+            result.append(cand)
+            continue
+        total, rank = hit
+        result.append(
+            cand.model_copy(update={"boost_total_amount": total, "boost_rank": rank})
+        )
+    return result

@@ -46,8 +46,8 @@ class TestIndividualSignals:
         )
         points, signals = score(token, _settings())
         assert "vol_liq_ratio" in signals
-        # raw=30, normalized=int(30*100/183)=16, no multiplier (1 signal)
-        assert points == 16
+        # raw=30, normalized=int(30*100/203)=14, no multiplier (1 signal)
+        assert points == 14
 
     def test_vol_liq_ratio_does_not_fire(self):
         # volume/liquidity = 20000/20000 = 1× (< 5×)
@@ -140,8 +140,8 @@ class TestIndividualSignals:
         )
         points, signals = score(token, _settings())
         assert "holder_growth" in signals
-        # raw=25, normalized=int(25*100/183)=13
-        assert points == 13
+        # raw=25, normalized=int(25*100/203)=12
+        assert points == 12
 
     def test_holder_growth_exactly_20(self):
         # > 20, not >= 20
@@ -169,8 +169,8 @@ class TestIndividualSignals:
         )  # 24h = peak
         points, signals = score(token, _settings())
         assert "token_age" in signals
-        # raw=15, normalized=int(15*100/183)=8
-        assert points == 8
+        # raw=15, normalized=int(15*100/203)=7
+        assert points == 7
 
     def test_token_age_early(self):
         """3-12h -> 8 pts raw."""
@@ -185,8 +185,8 @@ class TestIndividualSignals:
         )  # 6h
         points, signals = score(token, _settings())
         assert "token_age" in signals
-        # raw=8, normalized=int(8*100/183)=4
-        assert points == 4
+        # raw=8, normalized=int(8*100/203)=3
+        assert points == 3
 
     def test_token_age_declining(self):
         """48h-7d -> 5 pts raw."""
@@ -201,7 +201,7 @@ class TestIndividualSignals:
         )
         points, signals = score(token, _settings())
         assert "token_age" in signals
-        # raw=5, normalized=int(5*100/183)=2
+        # raw=5, normalized=int(5*100/203)=2
         assert points == 2
 
     def test_token_age_too_new(self):
@@ -244,8 +244,8 @@ class TestIndividualSignals:
         )
         points, signals = score(token, _settings())
         assert "social_mentions" in signals
-        # raw=15, normalized=int(15*100/178)=8
-        assert points == 8
+        # raw=15, normalized=int(15*100/203)=7
+        assert points == 7
 
     def test_social_mentions_zero(self):
         token = _make_token(
@@ -364,8 +364,8 @@ class TestScoreVelocity:
         points, signals = score(token, _settings(), historical_scores=[70, 60, 50])
         assert "score_velocity" in signals
         # raw = market_cap(8) + token_age(15) + velocity(10) = 33
-        # normalized = int(33*100/183) = 18, 3 signals -> *1.15 = int(20.7) = 20
-        assert points == 20
+        # normalized = int(33*100/203) = 16, 3 signals -> *1.15 = int(18.4) = 18
+        assert points == 18
 
     def test_velocity_no_fire_flat(self):
         """Flat scores -> no bonus."""
@@ -436,8 +436,8 @@ class TestCoOccurrence:
         )
         points, signals = score(token, _settings())
         assert len(signals) >= 3
-        # raw=78, normalized=int(78*100/183)=42, *1.15=int(48.3)=48
-        assert points == 48
+        # raw=78, normalized=int(78*100/203)=38, *1.15=int(43.7)=43
+        assert points == 43
 
     def test_two_signals_no_multiplier(self):
         """2 signals -> no multiplier."""
@@ -452,8 +452,8 @@ class TestCoOccurrence:
         )
         points, signals = score(token, _settings())
         assert len(signals) == 1  # only vol_liq
-        # raw=30, normalized=int(30*100/183)=16, no multiplier
-        assert points == 16
+        # raw=30, normalized=int(30*100/203)=14, no multiplier
+        assert points == 14
 
     def test_multiplier_capped_at_100(self):
         """Multiplier cannot push score above 100."""
@@ -539,8 +539,8 @@ class TestBuyPressureSignal:
         )
         points, signals = score(token, _settings())
         assert "buy_pressure" in signals
-        # raw=15, normalized=int(15*100/183)=8
-        assert points == 8
+        # raw=15, normalized=int(15*100/203)=7
+        assert points == 7
 
     def test_buy_pressure_does_not_fire_balanced(self):
         """buy_ratio = 50% -> no points."""
@@ -741,7 +741,7 @@ class TestCoinGeckoSignals:
         )
         points, signals = score(token, _settings())
         assert "solana_bonus" in signals
-        # raw=5, normalized=int(5*100/178)=2
+        # raw=5, normalized=int(5*100/203)=2
         assert points == 2
 
     def test_no_solana_bonus_for_ethereum(self):
@@ -775,7 +775,7 @@ class TestCoinGeckoSignals:
             cg_trending_rank=5,
             chain="solana",  # +5 solana bonus
         )
-        points, signals = score(token, _settings())
+        points, signals = score(token, _settings(), historical_scores=[80, 70, 60])
         assert points == 100
         assert len(signals) >= 9
 
@@ -924,7 +924,7 @@ class TestAgeBellCurveBoundaries:
         )
         points, signals = score(token, _settings())
         assert "token_age" in signals
-        # 5 pts raw -> normalized=int(5*100/183)=2
+        # 5 pts raw -> normalized=int(5*100/203)=2
         assert points == 2
 
     def test_exactly_7_days(self):
@@ -1027,11 +1027,11 @@ class TestNormalization:
         """SCORER_MAX_RAW should equal sum of all max signal points."""
         from scout.scorer import SCORER_MAX_RAW
 
-        # 30+8+25+15+15+15+20+25+15+5+10 = 183
-        assert SCORER_MAX_RAW == 183
+        # 30+8+25+15+15+15+20+25+15+20+5+10 = 203
+        assert SCORER_MAX_RAW == 203
 
     def test_single_signal_normalized_correctly(self):
-        """A single 30-point signal normalizes to int(30*100/183)=16."""
+        """A single 30-point signal normalizes to int(30*100/203)=14."""
         token = _make_token(
             volume_24h_usd=120000,
             liquidity_usd=20000,
@@ -1043,7 +1043,7 @@ class TestNormalization:
         )
         points, signals = score(token, _settings())
         assert len(signals) == 1
-        assert points == int(30 * 100 / 183)
+        assert points == int(30 * 100 / 203)
 
     def test_all_signals_normalize_to_100(self):
         """All signals firing -> capped at 100 after multiplier."""
@@ -1062,7 +1062,7 @@ class TestNormalization:
             cg_trending_rank=5,
             chain="solana",
         )
-        points, _ = score(token, _settings())
+        points, _ = score(token, _settings(), historical_scores=[80, 70, 60])
         assert points == 100
 
     def test_zero_signals_normalize_to_zero(self):

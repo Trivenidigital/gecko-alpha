@@ -1,7 +1,9 @@
 """DexScreener API poller for trending tokens."""
 
 import asyncio
+import math
 from collections import defaultdict
+from dataclasses import dataclass
 
 import aiohttp
 import structlog
@@ -17,6 +19,75 @@ TOKEN_URL = "https://api.dexscreener.com/tokens/v1"
 MAX_RETRIES = 3
 MAX_CONCURRENT = 5
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
+
+TOP_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/top/v1"
+
+# Last-raw top-boosts payload, kept for optional future dashboard surfacing.
+# Not consumed by the pipeline. Parity with `last_raw_markets` in coingecko.py.
+last_raw_top_boosts: list[dict] = []
+
+
+@dataclass(frozen=True, slots=True)
+class BoostInfo:
+    """Lightweight internal container for one top-boost entry.
+
+    Not persisted, not serialized. Kept in memory between fetch and
+    `apply_boost_decorations` in aggregator.py.
+    """
+
+    chain: str
+    address: str
+    total_amount: float
+
+
+_CHAIN_ID_MAP = {
+    "solana": "solana",
+    "base": "base",
+    "ethereum": "ethereum",
+    "arbitrum": "arbitrum",
+    "bsc": "bsc",
+    "polygon": "polygon",
+    "avalanche": "avalanche",
+    "optimism": "optimism",
+    "fantom": "fantom",
+}
+
+# EVM-family chains where addresses are case-insensitive hex. All other
+# chains (solana, sui, aptos, tron, ...) keep their native case.
+_EVM_CHAINS = frozenset(
+    {
+        "ethereum",
+        "base",
+        "arbitrum",
+        "bsc",
+        "polygon",
+        "avalanche",
+        "optimism",
+        "fantom",
+    }
+)
+
+
+def _normalize_chain_id(chain_id: str) -> str:
+    """Map DexScreener chainId to our internal chain slug.
+
+    Unknown chainIds are lower-cased and passed through; the aggregator
+    join will simply fail to match a candidate, which is the correct no-op.
+    """
+    key = (chain_id or "").lower()
+    return _CHAIN_ID_MAP.get(key, key)
+
+
+def _normalize_address(chain: str, address: str) -> str:
+    """Normalize an address for join comparison.
+
+    EVM chains: lower-case (EIP-55 checksum must match canonical lower form).
+    Non-EVM chains (solana/sui/aptos/tron): preserve case — base58 and
+    similar encodings are case-sensitive.
+    """
+    if chain in _EVM_CHAINS:
+        return address.lower()
+    return address
 
 
 async def _get_json(
@@ -58,6 +129,71 @@ async def _get_json(
             await asyncio.sleep(wait)
     logger.warning("DexScreener failed after retries", url=url, retries=retries)
     return None
+
+
+async def fetch_top_boosts(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+) -> list[BoostInfo]:
+    """Fetch the top-boosted tokens from DexScreener's /token-boosts/top/v1.
+
+    Returns a list of BoostInfo sorted by totalAmount descending (as returned
+    by the API). On any upstream failure the module-level cache
+    ``last_raw_top_boosts`` is preserved so callers can use stale data.
+    On success the cache is refreshed.
+    """
+    global last_raw_top_boosts
+
+    raw = await _get_json(session, TOP_BOOSTS_URL)
+    if not raw or not isinstance(raw, list):
+        return []
+
+    # Refresh the module-level cache only on success
+    last_raw_top_boosts.clear()
+    last_raw_top_boosts.extend(raw)
+
+    results: list[BoostInfo] = []
+    warned = False
+    for entry in raw:
+        chain_id = entry.get("chainId", "")
+        address = entry.get("tokenAddress", "")
+        total_amount_raw = entry.get("totalAmount")
+
+        if not chain_id or not address:
+            continue
+
+        if total_amount_raw is None:
+            continue
+
+        try:
+            total_amount = float(total_amount_raw)
+        except (TypeError, ValueError):
+            if not warned:
+                logger.warning("top_boosts_bad_total_amount", entry=entry)
+                warned = True
+            continue
+
+        # Guard against NaN / Infinity leaking through: json.loads accepts
+        # non-standard "NaN"/"Infinity" tokens by default, and float("inf")
+        # would make boost_total_amount >= MIN_BOOST_TOTAL_AMOUNT always
+        # true in the scorer, granting a permanent +20 velocity_boost.
+        if not math.isfinite(total_amount) or total_amount < 0:
+            if not warned:
+                logger.warning("top_boosts_non_finite_total", entry=entry)
+                warned = True
+            continue
+
+        chain = _normalize_chain_id(chain_id)
+        results.append(
+            BoostInfo(chain=chain, address=address, total_amount=total_amount)
+        )
+
+    logger.info(
+        "dex_top_boosts_fetched",
+        count=len(results),
+        top_amount=results[0].total_amount if results else 0,
+    )
+    return results
 
 
 async def fetch_trending(

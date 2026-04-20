@@ -3,8 +3,15 @@
 import pytest
 import aiohttp
 from aioresponses import aioresponses
+from unittest.mock import AsyncMock
 
 from scout.ingestion.dexscreener import fetch_trending
+from scout.ingestion.dexscreener import (
+    fetch_top_boosts,
+    TOP_BOOSTS_URL,
+    BoostInfo,
+)
+from scout.ingestion import dexscreener as _dex_module
 
 
 @pytest.fixture
@@ -121,3 +128,174 @@ async def test_fetch_trending_handles_429_with_backoff(mock_aiohttp, settings_fa
         tokens = await fetch_trending(session, settings)
 
     assert len(tokens) >= 1
+
+
+# ---------------------------------------------------------------------------
+# fetch_top_boosts tests (BL-051 Task 4)
+# ---------------------------------------------------------------------------
+
+SAMPLE_TOP_BOOSTS_PAYLOAD = [
+    {"chainId": "solana", "tokenAddress": "ADDR1", "totalAmount": 1500.0},
+    {"chainId": "base", "tokenAddress": "0xABCDEF", "totalAmount": 800.0},
+]
+
+
+async def test_fetch_top_boosts_happy_path(mock_aiohttp, settings_factory, monkeypatch):
+    monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
+    mock_aiohttp.get(TOP_BOOSTS_URL, payload=SAMPLE_TOP_BOOSTS_PAYLOAD)
+
+    settings = settings_factory()
+    async with aiohttp.ClientSession() as session:
+        result = await fetch_top_boosts(session, settings)
+
+    assert len(result) == 2
+    assert result[0] == BoostInfo(chain="solana", address="ADDR1", total_amount=1500.0)
+    assert result[1] == BoostInfo(chain="base", address="0xABCDEF", total_amount=800.0)
+
+
+async def test_fetch_top_boosts_empty_response(
+    mock_aiohttp, settings_factory, monkeypatch
+):
+    monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
+    mock_aiohttp.get(TOP_BOOSTS_URL, payload=[])
+
+    settings = settings_factory()
+    async with aiohttp.ClientSession() as session:
+        result = await fetch_top_boosts(session, settings)
+
+    assert result == []
+
+
+async def test_fetch_top_boosts_skips_missing_total_amount(
+    mock_aiohttp, settings_factory, monkeypatch
+):
+    monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
+    payload = [
+        {"chainId": "solana", "tokenAddress": "ADDR1"},  # no totalAmount
+        {"chainId": "base", "tokenAddress": "0xABC", "totalAmount": 500.0},
+    ]
+    mock_aiohttp.get(TOP_BOOSTS_URL, payload=payload)
+
+    settings = settings_factory()
+    async with aiohttp.ClientSession() as session:
+        result = await fetch_top_boosts(session, settings)
+
+    assert len(result) == 1
+    assert result[0].address == "0xABC"
+
+
+async def test_fetch_top_boosts_skips_missing_chain_or_address(
+    mock_aiohttp, settings_factory, monkeypatch
+):
+    monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
+    payload = [
+        {"tokenAddress": "ADDR1", "totalAmount": 1000.0},  # no chainId
+        {"chainId": "solana", "totalAmount": 1000.0},  # no tokenAddress
+        {"chainId": "base", "tokenAddress": "0xGOOD", "totalAmount": 300.0},
+    ]
+    mock_aiohttp.get(TOP_BOOSTS_URL, payload=payload)
+
+    settings = settings_factory()
+    async with aiohttp.ClientSession() as session:
+        result = await fetch_top_boosts(session, settings)
+
+    assert len(result) == 1
+    assert result[0].address == "0xGOOD"
+
+
+async def test_fetch_top_boosts_upstream_error_returns_empty(
+    mock_aiohttp, settings_factory, monkeypatch
+):
+    monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
+    mock_aiohttp.get(TOP_BOOSTS_URL, status=500)
+    mock_aiohttp.get(TOP_BOOSTS_URL, status=500)
+    mock_aiohttp.get(TOP_BOOSTS_URL, status=500)
+
+    settings = settings_factory()
+    async with aiohttp.ClientSession() as session:
+        result = await fetch_top_boosts(session, settings)
+
+    assert result == []
+
+
+async def test_fetch_top_boosts_populates_module_cache(
+    mock_aiohttp, settings_factory, monkeypatch
+):
+    monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
+    _dex_module.last_raw_top_boosts.clear()
+    mock_aiohttp.get(TOP_BOOSTS_URL, payload=SAMPLE_TOP_BOOSTS_PAYLOAD)
+
+    settings = settings_factory()
+    async with aiohttp.ClientSession() as session:
+        await fetch_top_boosts(session, settings)
+
+    assert len(_dex_module.last_raw_top_boosts) == 2
+    assert _dex_module.last_raw_top_boosts[0]["tokenAddress"] == "ADDR1"
+
+
+async def test_fetch_top_boosts_cache_preserved_on_failure(
+    mock_aiohttp, settings_factory, monkeypatch
+):
+    monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
+    # Pre-populate cache with stale data
+    stale = [{"chainId": "solana", "tokenAddress": "STALE", "totalAmount": 999.0}]
+    _dex_module.last_raw_top_boosts.clear()
+    _dex_module.last_raw_top_boosts.extend(stale)
+
+    mock_aiohttp.get(TOP_BOOSTS_URL, status=500)
+    mock_aiohttp.get(TOP_BOOSTS_URL, status=500)
+    mock_aiohttp.get(TOP_BOOSTS_URL, status=500)
+
+    settings = settings_factory()
+    async with aiohttp.ClientSession() as session:
+        result = await fetch_top_boosts(session, settings)
+
+    assert result == []
+    # Cache must not be cleared on failure
+    assert len(_dex_module.last_raw_top_boosts) == 1
+    assert _dex_module.last_raw_top_boosts[0]["tokenAddress"] == "STALE"
+
+
+async def test_fetch_top_boosts_skips_non_finite_total_amount(
+    mock_aiohttp, settings_factory, monkeypatch
+):
+    """NaN / Infinity / -Infinity totalAmount values must be dropped.
+
+    `float("inf")` doesn't raise from `float()` conversion, so without an
+    explicit `math.isfinite` guard an Inf leak would grant a permanent
+    velocity_boost signal in the scorer.
+    """
+    import json
+    import structlog.testing
+
+    monkeypatch.setattr(_dex_module.asyncio, "sleep", AsyncMock())
+
+    payload = [
+        {"chainId": "solana", "tokenAddress": "INF_ADDR", "totalAmount": float("inf")},
+        {"chainId": "base", "tokenAddress": "NAN_ADDR", "totalAmount": float("nan")},
+        {
+            "chainId": "ethereum",
+            "tokenAddress": "NEG_INF_ADDR",
+            "totalAmount": float("-inf"),
+        },
+        {"chainId": "solana", "tokenAddress": "GOOD_ADDR", "totalAmount": 1500.0},
+    ]
+    # Python's json module emits `Infinity` / `NaN` as non-standard tokens
+    # and json.loads accepts them by default (allow_nan=True).
+    body = json.dumps(payload)
+    mock_aiohttp.get(TOP_BOOSTS_URL, body=body, content_type="application/json")
+
+    settings = settings_factory()
+    with structlog.testing.capture_logs() as entries:
+        async with aiohttp.ClientSession() as session:
+            result = await fetch_top_boosts(session, settings)
+
+    assert len(result) == 1
+    assert result[0].address == "GOOD_ADDR"
+    assert result[0].total_amount == 1500.0
+    # A warning was logged for at least one non-finite entry
+    assert any(
+        e.get("event") == "top_boosts_non_finite_total"
+        and e.get("log_level") == "warning"
+        for e in entries
+    )
