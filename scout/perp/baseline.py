@@ -1,5 +1,6 @@
 """Per-(exchange,symbol) EWMA baseline store with LRU + idle eviction."""
 
+import math
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
@@ -35,9 +36,13 @@ class BaselineStore:
         self._alpha = alpha
         self._max_keys = max_keys
         if idle_evict_seconds < 0:
-            raise ValueError(f"idle_evict_seconds must be >= 0, got {idle_evict_seconds}")
+            raise ValueError(
+                f"idle_evict_seconds must be >= 0, got {idle_evict_seconds}"
+            )
         self._idle = idle_evict_seconds
         self._entries: "OrderedDict[tuple[str, str], _Entry]" = OrderedDict()
+        # Count of values rejected due to NaN/Inf (defense-in-depth layer 2).
+        self.rejected_values: int = 0
 
     def update(
         self,
@@ -47,6 +52,13 @@ class BaselineStore:
         funding: float | None,
         now: datetime,
     ) -> None:
+        # Defense-in-depth layer 2: reject NaN/Inf even if schema layer missed them.
+        if oi is not None and not math.isfinite(oi):
+            self.rejected_values += 1
+            oi = None
+        if funding is not None and not math.isfinite(funding):
+            self.rejected_values += 1
+            funding = None
         if oi is None and funding is None:
             return
         entry = self._entries.get(key)
@@ -58,12 +70,14 @@ class BaselineStore:
             return
         if oi is not None:
             entry.oi_ewma = (
-                oi if entry.oi_ewma is None
+                oi
+                if entry.oi_ewma is None
                 else self._alpha * oi + (1 - self._alpha) * entry.oi_ewma
             )
         if funding is not None:
             entry.funding_ewma = (
-                funding if entry.funding_ewma is None
+                funding
+                if entry.funding_ewma is None
                 else self._alpha * funding + (1 - self._alpha) * entry.funding_ewma
             )
         entry.sample_count += 1
@@ -87,8 +101,7 @@ class BaselineStore:
             return 0  # idle_evict_seconds=0 disables this pass entirely
         cutoff = now.timestamp() - self._idle
         victims = [
-            k for k, e in self._entries.items()
-            if e.last_seen.timestamp() < cutoff
+            k for k, e in self._entries.items() if e.last_seen.timestamp() < cutoff
         ]
         for k in victims:
             self._entries.pop(k)

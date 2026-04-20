@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from scout.perp import TICKER_PATTERN
 
@@ -12,13 +12,17 @@ Exchange = Literal["binance", "bybit"]
 
 
 class PerpTick(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     exchange: Exchange
     symbol: str
     ticker: str
-    funding_rate: float | None = None
-    mark_price: float | None = None
-    open_interest: float | None = None
-    open_interest_usd: float | None = None
+    # allow_inf_nan=False rejects NaN/Inf at schema level (defense layer 1).
+    # BaselineStore.update has a second math.isfinite guard (defense layer 2).
+    funding_rate: float | None = Field(default=None, allow_inf_nan=False)
+    mark_price: float | None = Field(default=None, allow_inf_nan=False)
+    open_interest: float | None = Field(default=None, allow_inf_nan=False)
+    open_interest_usd: float | None = Field(default=None, allow_inf_nan=False)
     timestamp: datetime
 
     @field_validator("ticker")
@@ -44,6 +48,8 @@ class PerpTick(BaseModel):
 
 
 class PerpAnomaly(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     exchange: Exchange
     symbol: str
     ticker: str

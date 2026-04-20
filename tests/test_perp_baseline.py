@@ -30,8 +30,12 @@ def test_baseline_lru_evicts_oldest_touched():
     now = datetime.now(timezone.utc)
     s.update(_key("A"), oi=1.0, funding=0.0, now=now)
     s.update(_key("B"), oi=2.0, funding=0.0, now=now + timedelta(seconds=1))
-    s.update(_key("A"), oi=1.5, funding=0.0, now=now + timedelta(seconds=2))  # A touched last
-    s.update(_key("C"), oi=3.0, funding=0.0, now=now + timedelta(seconds=3))  # should evict B
+    s.update(
+        _key("A"), oi=1.5, funding=0.0, now=now + timedelta(seconds=2)
+    )  # A touched last
+    s.update(
+        _key("C"), oi=3.0, funding=0.0, now=now + timedelta(seconds=3)
+    )  # should evict B
     assert s.oi_baseline(_key("A")) is not None
     assert s.oi_baseline(_key("B")) is None
     assert s.oi_baseline(_key("C")) is not None
@@ -59,6 +63,7 @@ def test_baseline_ignores_none_inputs():
 
 def test_baseline_idle_evict_seconds_disabled_when_zero():
     import pytest
+
     s = BaselineStore(alpha=0.5, max_keys=10, idle_evict_seconds=0)
     t0 = datetime.now(timezone.utc)
     s.update(_key("A"), oi=1.0, funding=0.0, now=t0)
@@ -69,13 +74,44 @@ def test_baseline_idle_evict_seconds_disabled_when_zero():
 
 def test_baseline_rejects_negative_idle_evict_seconds():
     import pytest
+
     with pytest.raises(ValueError, match="idle_evict_seconds"):
         BaselineStore(alpha=0.5, max_keys=10, idle_evict_seconds=-1)
 
 
 def test_baseline_rejects_out_of_range_alpha():
     import pytest
+
     with pytest.raises(ValueError, match="alpha"):
         BaselineStore(alpha=0.0, max_keys=10, idle_evict_seconds=60)
     with pytest.raises(ValueError, match="alpha"):
         BaselineStore(alpha=1.5, max_keys=10, idle_evict_seconds=60)
+
+
+def test_baseline_rejects_nan_oi():
+    """NaN OI must not update the EWMA; rejected_values counter must increment."""
+    import math
+
+    s = BaselineStore(alpha=0.5, max_keys=10, idle_evict_seconds=3600)
+    k = _key("BTCUSDT")
+    # Warm up baseline with valid value first
+    s.update(k, oi=100.0, funding=None, now=datetime.now(timezone.utc))
+    baseline_before = s.oi_baseline(k)
+    assert s.rejected_values == 0
+
+    s.update(k, oi=float("nan"), funding=None, now=datetime.now(timezone.utc))
+    assert s.oi_baseline(k) == baseline_before, "NaN must not change the baseline"
+    assert s.rejected_values == 1
+
+
+def test_baseline_rejects_inf_funding():
+    """Inf funding must not update the EWMA; rejected_values counter must increment."""
+    s = BaselineStore(alpha=0.5, max_keys=10, idle_evict_seconds=3600)
+    k = _key("ETHUSDT")
+    s.update(k, oi=None, funding=0.0001, now=datetime.now(timezone.utc))
+    funding_before = s.funding_baseline(k)
+    assert s.rejected_values == 0
+
+    s.update(k, oi=None, funding=float("inf"), now=datetime.now(timezone.utc))
+    assert s.funding_baseline(k) == funding_before, "Inf must not change the baseline"
+    assert s.rejected_values == 1

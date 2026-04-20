@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import random
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import aiohttp
+import aiosqlite
 import structlog
 
 from scout.perp.anomaly import classify_funding_flip, classify_oi_spike
@@ -49,6 +51,8 @@ class ClassifierState:
     queue_high_water: int = 0
     malformed_frames: int = 0
     exchange_errors: dict[str, int] = field(default_factory=dict)
+    flush_failures: int = 0
+    rows_lost_to_flush_failure: int = 0
 
 
 async def classifier_loop(
@@ -86,20 +90,36 @@ async def classifier_loop(
             state.queue_high_water = max(state.queue_high_water, queue.qsize())
             _process_tick(tick, state, batch, settings, now_mono(), dedup_sec)
 
-        if batch and (
+        _should_flush = (
             len(batch) >= max_rows or now_mono() - last_flush >= flush_interval
-        ):
+        )
+        if batch and _should_flush:
+            # Retry once on transient DB errors before giving up.
             try:
                 await db.insert_perp_anomalies_batch(list(batch))
-            except Exception as exc:  # noqa: BLE001
+            except (aiosqlite.Error, sqlite3.Error, OSError) as exc:
+                state.flush_failures += 1
                 logger.warning(
-                    "perp_anomaly_flush_failed",
+                    "perp_anomaly_flush_failed_retrying",
                     error=repr(exc),
                     rows=len(batch),
                 )
+                await asyncio.sleep(0.5)
+                try:
+                    await db.insert_perp_anomalies_batch(list(batch))
+                except (aiosqlite.Error, sqlite3.Error, OSError) as exc2:
+                    state.rows_lost_to_flush_failure += len(batch)
+                    logger.error(
+                        "perp_anomaly_flush_failed_final",
+                        error=repr(exc2),
+                        rows_lost=len(batch),
+                    )
             finally:
                 batch.clear()
-                last_flush = now_mono()
+        # Always update last_flush after the flush-check block, regardless of whether
+        # batch was non-empty, to prevent timer drift on sparse traffic (item 8).
+        if _should_flush:
+            last_flush = now_mono()
 
 
 def _process_tick(
@@ -305,24 +325,46 @@ async def run_perp_watcher(
 
 async def _shadow_stats_loop(state: ClassifierState, settings: "Settings") -> None:
     while True:
-        await asyncio.sleep(60)
-        dropped, state.dropped_ticks = state.dropped_ticks, 0
-        high_water, state.queue_high_water = state.queue_high_water, 0
-        malformed, state.malformed_frames = state.malformed_frames, 0
-        errors, state.exchange_errors = state.exchange_errors, {}
-        logger.info(
-            "perp_watcher_stats",
-            dropped_ticks_last_min=dropped,
-            queue_high_water=high_water,
-            malformed_frames_last_min=malformed,
-            exchange_errors_last_min=errors,
-            baseline_keys=len(state.baseline),
-        )
+        try:
+            await asyncio.sleep(60)
+            dropped, state.dropped_ticks = state.dropped_ticks, 0
+            high_water, state.queue_high_water = state.queue_high_water, 0
+            malformed, state.malformed_frames = state.malformed_frames, 0
+            errors, state.exchange_errors = state.exchange_errors, {}
+            flush_failures, state.flush_failures = state.flush_failures, 0
+            rows_lost, state.rows_lost_to_flush_failure = (
+                state.rows_lost_to_flush_failure,
+                0,
+            )
+            rejected_values, state.baseline.rejected_values = (
+                state.baseline.rejected_values,
+                0,
+            )
+            logger.info(
+                "perp_watcher_stats",
+                dropped_ticks_last_min=dropped,
+                queue_high_water=high_water,
+                malformed_frames_last_min=malformed,
+                exchange_errors_last_min=errors,
+                baseline_keys=len(state.baseline),
+                flush_failures_last_min=flush_failures,
+                rows_lost_to_flush_failure_last_min=rows_lost,
+                baseline_rejected_values_last_min=rejected_values,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("perp_shadow_stats_loop_iteration_failed")
 
 
 async def _baseline_evict_loop(state: ClassifierState, settings: "Settings") -> None:
     while True:
-        await asyncio.sleep(300)
-        evicted = state.baseline.evict_idle(now=datetime.now(timezone.utc))
-        if evicted:
-            logger.info("perp_baseline_evicted_idle", count=evicted)
+        try:
+            await asyncio.sleep(300)
+            evicted = state.baseline.evict_idle(now=datetime.now(timezone.utc))
+            if evicted:
+                logger.info("perp_baseline_evicted_idle", count=evicted)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("perp_baseline_evict_loop_iteration_failed")

@@ -177,6 +177,73 @@ async def test_classifier_db_flush_failure_does_not_crash(settings_factory):
 
 
 @pytest.mark.asyncio
+async def test_clean_eof_resets_consecutive_failures(settings_factory):
+    """A clean EOF (generator returns) must reset consecutive_failures so the
+    circuit-breaker is not tripped by a later burst of failures.
+
+    Scenario: stream raises N-1 times, then yields one tick + returns cleanly,
+    then raises once more. With PERP_MAX_CONSECUTIVE_RESTARTS=N the circuit-break
+    MUST NOT fire (consecutive_failures was reset on clean EOF).
+    """
+    from scout.perp.watcher import _run_exchange_with_supervision
+
+    N = 3
+    settings = settings_factory(
+        PERP_MAX_CONSECUTIVE_RESTARTS=N,
+        PERP_CIRCUIT_BREAK_SEC=9999,  # sentinel: any sleep >= this means circuit broke
+    )
+
+    call_count = {"n": 0}
+
+    async def sometimes_clean(*a, **kw):
+        call_count["n"] += 1
+        n = call_count["n"]
+        if n <= N - 1:
+            raise RuntimeError("transient error")
+        if n == N:
+            yield _make_tick(oi=1.0)
+            return  # clean EOF — resets consecutive_failures
+        # After the clean EOF we fail once more (consecutive_failures == 1, < N)
+        raise RuntimeError("transient error after reset")
+        yield  # pragma: no cover
+
+    sleeps: list[float] = []
+    task_ref: list[asyncio.Task] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        # Cancel after enough attempts have completed (clean EOF happened + one more fail)
+        if call_count["n"] >= N + 1 and task_ref:
+            task_ref[0].cancel()
+        await asyncio.sleep(0)
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+    state = ClassifierState(
+        baseline=BaselineStore(alpha=0.1, max_keys=10, idle_evict_seconds=3600)
+    )
+    task = asyncio.create_task(
+        _run_exchange_with_supervision(
+            "binance",
+            sometimes_clean,
+            None,
+            settings,
+            queue,
+            state,
+            sleep=fake_sleep,
+        )
+    )
+    task_ref.append(task)
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    # The circuit-break sleep (9999) must NOT appear — consecutive_failures was reset
+    assert not any(
+        s >= settings.PERP_CIRCUIT_BREAK_SEC for s in sleeps
+    ), f"Circuit-break sleep appeared unexpectedly: {sleeps}"
+
+
+@pytest.mark.asyncio
 async def test_circuit_breaker_parks_exchange(settings_factory):
     from scout.perp.watcher import _run_exchange_with_supervision
 

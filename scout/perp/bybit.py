@@ -20,6 +20,9 @@ log = structlog.get_logger(__name__)
 
 WS_URL = "wss://stream.bybit.com/v5/public/linear"
 _TICKER_TOPIC_PREFIX = "tickers."
+# Bybit REQUIRES explicit JSON {"op": "ping"} every 20s. Different from
+# Binance's server-sent ping; each client owns its own keepalive.
+_SUBSCRIBE_ACK_TIMEOUT_SEC = 5.0
 
 
 def parse_frame(frame: dict[str, Any]) -> list[PerpTick]:
@@ -87,6 +90,20 @@ async def stream_ticks(
     ) as ws:
         topics = [f"{_TICKER_TOPIC_PREFIX}{s}" for s in symbols]
         await ws.send_json({"op": "subscribe", "args": topics})
+        try:
+            ack_msg = await asyncio.wait_for(
+                ws.receive_json(), timeout=_SUBSCRIBE_ACK_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            log.warning("perp.bybit.subscribe_ack_timeout", topics=topics)
+            raise
+        if not ack_msg.get("success", False):
+            log.error(
+                "perp.bybit.subscribe_rejected",
+                ret_msg=ack_msg.get("ret_msg"),
+                topics=topics,
+            )
+            raise RuntimeError(f"bybit subscribe rejected: {ack_msg.get('ret_msg')}")
         ping_task = asyncio.create_task(_ping_loop(ws, settings))
         try:
             async for msg in ws:
@@ -113,6 +130,10 @@ async def _ping_loop(ws: aiohttp.ClientWebSocketResponse, settings: Settings) ->
             return
         try:
             await ws.send_json({"op": "ping"})
-        except (ConnectionResetError, RuntimeError) as exc:
+        except (
+            ConnectionResetError,
+            RuntimeError,
+            aiohttp.ClientConnectionError,
+        ) as exc:
             log.warning("perp.bybit.ping_failed", error=repr(exc))
             return

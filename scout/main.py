@@ -1050,8 +1050,15 @@ async def main() -> None:
                 perp_task.cancel()
                 try:
                     await asyncio.wait_for(perp_task, timeout=5.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
+                except asyncio.CancelledError:
                     pass
+                except asyncio.TimeoutError:
+                    logger.warning("perp_task_shutdown_timeout_first_pass")
+                    perp_task.cancel()
+                    try:
+                        await asyncio.wait_for(perp_task, timeout=2.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        logger.error("perp_task_shutdown_hard_timeout")
                 except Exception:
                     logger.exception("perp_loop_shutdown_error")
 

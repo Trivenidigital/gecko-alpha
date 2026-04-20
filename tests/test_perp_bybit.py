@@ -36,10 +36,13 @@ class MockWSMessage:
 
 
 class MockWS:
-    def __init__(self, messages):
+    def __init__(self, messages, ack_response=None):
         self._messages = messages
         self.closed = False
         self.sent_json = []
+        self._ack_response = (
+            ack_response if ack_response is not None else {"success": True}
+        )
 
     def __aiter__(self):
         return self
@@ -52,6 +55,9 @@ class MockWS:
 
     async def send_json(self, data):
         self.sent_json.append(data)
+
+    async def receive_json(self):
+        return self._ack_response
 
 
 class MockWSContext:
@@ -106,3 +112,19 @@ async def test_stream_ticks_subscribes_and_yields_tick(settings_factory):
     assert ticks[0].ticker == "BTC"
     # Verify subscribe message was sent
     assert ws.sent_json == [{"op": "subscribe", "args": ["tickers.BTCUSDT"]}]
+
+
+async def test_stream_ticks_raises_on_subscribe_rejected(settings_factory):
+    """Bybit returning success=false on subscribe must raise RuntimeError with ret_msg."""
+    from scout.perp.bybit import stream_ticks
+
+    ack = {"success": False, "ret_msg": "Invalid symbol"}
+    ws = MockWS([], ack_response=ack)
+    session = MockSession(ws)
+    settings = settings_factory(PERP_SYMBOLS=["FAKEUSDT"], PERP_WS_PING_INTERVAL_SEC=1)
+    with pytest.raises(RuntimeError, match="Invalid symbol"):
+        async for _ in stream_ticks(session, settings):
+            pass  # pragma: no cover
+
+
+import pytest
