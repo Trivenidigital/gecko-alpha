@@ -55,3 +55,27 @@ def test_baseline_ignores_none_inputs():
     assert s.oi_baseline(k) is None
     assert s.funding_baseline(k) is None
     assert s.sample_count(k) == 0
+
+
+def test_baseline_idle_evict_seconds_disabled_when_zero():
+    import pytest
+    s = BaselineStore(alpha=0.5, max_keys=10, idle_evict_seconds=0)
+    t0 = datetime.now(timezone.utc)
+    s.update(_key("A"), oi=1.0, funding=0.0, now=t0)
+    # Even after a long interval, zero-seconds disables the pass.
+    assert s.evict_idle(now=t0 + timedelta(seconds=10_000)) == 0
+    assert s.oi_baseline(_key("A")) == 1.0
+
+
+def test_baseline_rejects_negative_idle_evict_seconds():
+    import pytest
+    with pytest.raises(ValueError, match="idle_evict_seconds"):
+        BaselineStore(alpha=0.5, max_keys=10, idle_evict_seconds=-1)
+
+
+def test_baseline_rejects_out_of_range_alpha():
+    import pytest
+    with pytest.raises(ValueError, match="alpha"):
+        BaselineStore(alpha=0.0, max_keys=10, idle_evict_seconds=60)
+    with pytest.raises(ValueError, match="alpha"):
+        BaselineStore(alpha=1.5, max_keys=10, idle_evict_seconds=60)

@@ -19,6 +19,8 @@ class BaselineStore:
     Bounded: ``max_keys`` LRU cap on insert, plus an opt-in ``evict_idle``
     pass that drops keys untouched for ``idle_evict_seconds``. Both
     paths are intentionally lightweight -- no background threads.
+
+    Not thread-safe. Designed for single-asyncio-task use only.
     """
 
     def __init__(
@@ -29,9 +31,11 @@ class BaselineStore:
         idle_evict_seconds: int = 3600,
     ):
         if not 0 < alpha <= 1:
-            raise ValueError("alpha must be in (0, 1]")
+            raise ValueError(f"alpha must be in (0, 1], got {alpha}")
         self._alpha = alpha
         self._max_keys = max_keys
+        if idle_evict_seconds < 0:
+            raise ValueError(f"idle_evict_seconds must be >= 0, got {idle_evict_seconds}")
         self._idle = idle_evict_seconds
         self._entries: "OrderedDict[tuple[str, str], _Entry]" = OrderedDict()
 
@@ -79,13 +83,15 @@ class BaselineStore:
         return 0 if entry is None else entry.sample_count
 
     def evict_idle(self, *, now: datetime) -> int:
+        if self._idle == 0:
+            return 0  # idle_evict_seconds=0 disables this pass entirely
         cutoff = now.timestamp() - self._idle
         victims = [
             k for k, e in self._entries.items()
             if e.last_seen.timestamp() < cutoff
         ]
         for k in victims:
-            self._entries.pop(k, None)
+            self._entries.pop(k)
         return len(victims)
 
     def __len__(self) -> int:
