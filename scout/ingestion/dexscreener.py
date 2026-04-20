@@ -2,6 +2,7 @@
 
 import asyncio
 from collections import defaultdict
+from dataclasses import dataclass
 
 import aiohttp
 import structlog
@@ -17,6 +18,66 @@ TOKEN_URL = "https://api.dexscreener.com/tokens/v1"
 MAX_RETRIES = 3
 MAX_CONCURRENT = 5
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
+
+TOP_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/top/v1"
+
+# Last-raw top-boosts payload, kept for optional future dashboard surfacing.
+# Not consumed by the pipeline. Parity with `last_raw_markets` in coingecko.py.
+last_raw_top_boosts: list[dict] = []
+
+
+@dataclass(frozen=True, slots=True)
+class BoostInfo:
+    """Lightweight internal container for one top-boost entry.
+
+    Not persisted, not serialized. Kept in memory between fetch and
+    `apply_boost_decorations` in aggregator.py.
+    """
+
+    chain: str
+    address: str
+    total_amount: float
+
+
+_CHAIN_ID_MAP = {
+    "solana": "solana",
+    "base": "base",
+    "ethereum": "ethereum",
+    "arbitrum": "arbitrum",
+    "bsc": "bsc",
+    "polygon": "polygon",
+    "avalanche": "avalanche",
+    "optimism": "optimism",
+    "fantom": "fantom",
+}
+
+# EVM-family chains where addresses are case-insensitive hex. All other
+# chains (solana, sui, aptos, tron, ...) keep their native case.
+_EVM_CHAINS = frozenset(
+    {"ethereum", "base", "arbitrum", "bsc", "polygon", "avalanche", "optimism", "fantom"}
+)
+
+
+def _normalize_chain_id(chain_id: str) -> str:
+    """Map DexScreener chainId to our internal chain slug.
+
+    Unknown chainIds are lower-cased and passed through; the aggregator
+    join will simply fail to match a candidate, which is the correct no-op.
+    """
+    key = (chain_id or "").lower()
+    return _CHAIN_ID_MAP.get(key, key)
+
+
+def _normalize_address(chain: str, address: str) -> str:
+    """Normalize an address for join comparison.
+
+    EVM chains: lower-case (EIP-55 checksum must match canonical lower form).
+    Non-EVM chains (solana/sui/aptos/tron): preserve case — base58 and
+    similar encodings are case-sensitive.
+    """
+    if chain in _EVM_CHAINS:
+        return address.lower()
+    return address
 
 
 async def _get_json(
