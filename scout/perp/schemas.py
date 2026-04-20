@@ -1,15 +1,14 @@
 """Pydantic models for perp WebSocket ticks and anomaly events."""
 
-import re
 from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, field_validator
 
+from scout.perp import TICKER_PATTERN
+
 AnomalyKind = Literal["funding_flip", "oi_spike"]
 Exchange = Literal["binance", "bybit"]
-
-_TICKER_RE = re.compile(r"^[A-Z0-9]{1,20}$")
 
 
 class PerpTick(BaseModel):
@@ -25,7 +24,7 @@ class PerpTick(BaseModel):
     @field_validator("ticker")
     @classmethod
     def _ticker_charset(cls, v: str) -> str:
-        if not _TICKER_RE.match(v):
+        if not TICKER_PATTERN.match(v):
             raise ValueError(f"invalid ticker: {v!r}")
         return v
 
@@ -33,7 +32,7 @@ class PerpTick(BaseModel):
     @classmethod
     def _symbol_len(cls, v: str) -> str:
         if not (1 <= len(v) <= 32):
-            raise ValueError("symbol length out of bounds")
+            raise ValueError(f"symbol {v!r} length {len(v)} out of bounds (max 32)")
         return v
 
 

@@ -40,3 +40,13 @@ def test_perp_anomaly_happy_path():
         observed_at=datetime.now(timezone.utc),
     )
     assert a.kind == "oi_spike"
+
+
+def test_perp_tick_rejects_unknown_exchange():
+    from datetime import datetime, timezone
+    import pytest
+    from pydantic import ValidationError
+    from scout.perp.schemas import PerpTick
+    with pytest.raises(ValidationError):
+        PerpTick(exchange="okx", symbol="BTCUSDT", ticker="BTC",
+                 timestamp=datetime.now(timezone.utc))

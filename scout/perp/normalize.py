@@ -1,10 +1,9 @@
 """Ticker normalization from exchange-native symbol to base-asset ticker."""
 
-import re
+from scout.perp import TICKER_PATTERN
 
 _SUFFIXES = ("USDT", "USDC", "BUSD", "USD", "-PERP")
 _QUOTE_ASSETS = frozenset({"USDT", "USDC", "BUSD", "USD"})
-_VALID = re.compile(r"^[A-Z0-9]{1,20}$")
 
 
 def normalize_ticker(symbol: str) -> str | None:
@@ -26,11 +25,11 @@ def normalize_ticker(symbol: str) -> str | None:
             up = up[: -len(suffix)]
             break
     # Strip leading Binance cosmetic 1000-multiplier prefix.
-    if up.startswith("1000") and len(up) >= 4:
+    if up.startswith("1000"):
         up = up[4:]
     # Reject empty, pure quote assets, or pure-numeric leftovers.
     if not up or up in _QUOTE_ASSETS or up.isdigit():
         return None
-    if not _VALID.match(up):
+    if not TICKER_PATTERN.match(up):
         return None
     return up

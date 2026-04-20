@@ -283,7 +283,9 @@ class Settings(BaseSettings):
     def parse_perp_symbols(cls, v: str | list[str]) -> list[str]:
         if isinstance(v, str):
             v = [s.strip().upper() for s in v.split(",") if s.strip()]
-        if isinstance(v, list) and len(v) > 200:
+        elif isinstance(v, list):
+            v = [str(s).strip().upper() for s in v if str(s).strip()]
+        if len(v) > 200:
             # Binance URL-length + subscription-rate safety (design spec §3.4).
             raise ValueError("PERP_SYMBOLS exceeds max length 200")
         return v
