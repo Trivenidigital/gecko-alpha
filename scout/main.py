@@ -51,6 +51,8 @@ from scout.trading.signals import (
 from scout.briefing.collector import collect_briefing_data
 from scout.briefing.synthesizer import split_message, synthesize_briefing
 from scout import alerter
+from scout.perp.enrichment import enrich_candidates_with_perp_anomalies
+from scout.perp.watcher import run_perp_watcher
 from scout.trading import combo_refresh as _combo_refresh
 from scout.trading import weekly_digest as _weekly_digest
 
@@ -298,6 +300,26 @@ async def _safe_counter_followup(token, session, settings, db=None):
         )
 
 
+async def _maybe_start_perp_watcher(settings, *, db, session) -> asyncio.Task | None:
+    """Launch the perp watcher iff PERP_ENABLED. Returns the task or None."""
+    if not settings.PERP_ENABLED:
+        return None
+    if not (settings.PERP_BINANCE_ENABLED or settings.PERP_BYBIT_ENABLED):
+        logger.warning("perp_watcher_no_exchanges_enabled_noop")
+        return None
+    return asyncio.create_task(
+        run_perp_watcher(session, db, settings),
+        name="perp-watcher",
+    )
+
+
+async def _maybe_enrich_perp(tokens, *, db, settings):
+    """Run perp enrichment iff PERP_ENABLED. Return tokens unchanged otherwise."""
+    if not settings.PERP_ENABLED or db is None:
+        return tokens
+    return await enrich_candidates_with_perp_anomalies(tokens, db, settings)
+
+
 async def run_cycle(
     settings: Settings,
     db: Database,
@@ -486,6 +508,9 @@ async def run_cycle(
             if vol_avg is not None:
                 enriched[i] = enriched[i].model_copy(update={"vol_7d_avg": vol_avg})
             await db.log_volume_snapshot(token.contract_address, token.volume_24h_usd)
+
+    # Stage 2.5: Perp enrichment (OI/funding anomalies from perp watcher)
+    enriched = await _maybe_enrich_perp(enriched, db=db, settings=settings)
 
     # Stage 3: Score
     scored = []
@@ -855,6 +880,13 @@ async def main() -> None:
                         except Exception as e:
                             logger.warning("DB prune error", error=str(e))
 
+                        try:
+                            await db.prune_perp_anomalies(
+                                keep_days=settings.PERP_ANOMALY_RETENTION_DAYS
+                            )
+                        except Exception as e:
+                            logger.warning("perp_anomaly_prune_error", error=str(e))
+
                         last_outcome_check = now
 
                     # Daily summary at midnight UTC
@@ -902,6 +934,10 @@ async def main() -> None:
             # Seed chain patterns once at startup (idempotent)
             if settings.CHAINS_ENABLED:
                 await seed_built_in_patterns(db)
+
+            perp_task = await _maybe_start_perp_watcher(
+                settings, db=db, session=session
+            )
 
             tasks: list[asyncio.Task] = [
                 asyncio.create_task(_pipeline_loop()),
@@ -1008,6 +1044,10 @@ async def main() -> None:
             # social loop against the DB we're about to close.
             for t in list(_social_restart_tasks):
                 t.cancel()
+
+            # Cancel the perp watcher task (if running) on graceful shutdown.
+            if perp_task is not None:
+                perp_task.cancel()
 
             # Ensure the social task winds down cleanly after the main loops exit.
             if social_task is not None and not social_task.done():

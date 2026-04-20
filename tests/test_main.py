@@ -14,6 +14,7 @@ def mock_settings():
         settings.SCAN_INTERVAL_SECONDS = 60
         settings.MIN_SCORE = 60
         settings.DB_PATH = ":memory:"
+        settings.PERP_ENABLED = False
         MockSettings.return_value = settings
         yield settings
 
