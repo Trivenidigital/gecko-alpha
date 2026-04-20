@@ -6,6 +6,7 @@ Runs every 30 minutes. Uses batch price lookup from price_cache
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 
 import structlog
@@ -54,7 +55,6 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
         if pr[1] is not None:
             price_map[pr[0]] = (float(pr[1]), str(pr[2]))
 
-    # M5: Instantiate inside function instead of module-level singleton
     _trader = PaperTrader()
 
     now = datetime.now(timezone.utc)
@@ -63,193 +63,222 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
 
     for row in rows:
         trade_id = row[0]
-        token_id = row[1]
-        entry_price = float(row[2])
-        opened_at = datetime.fromisoformat(str(row[3])).replace(tzinfo=timezone.utc)
-        tp_price = float(row[4])
-        sl_price = float(row[5])
-        cp_1h = row[8]
-        cp_6h = row[9]
-        cp_24h = row[10]
-        cp_48h = row[11]
-        peak_price = float(row[12]) if row[12] is not None else None
-        peak_pct = float(row[13]) if row[13] is not None else None
+        try:
+            token_id = row[1]
+            entry_price = float(row[2])
+            opened_at = datetime.fromisoformat(str(row[3])).replace(tzinfo=timezone.utc)
+            tp_price = float(row[4])
+            sl_price = float(row[5])
+            cp_1h = row[8]
+            cp_6h = row[9]
+            cp_24h = row[10]
+            cp_48h = row[11]
+            peak_price = float(row[12]) if row[12] is not None else None
+            peak_pct = float(row[13]) if row[13] is not None else None
 
-        # Price lookup
-        price_data = price_map.get(token_id)
-        if price_data is None:
-            log.debug("trade_eval_no_price", trade_id=trade_id, token_id=token_id)
-            continue
+            price_data = price_map.get(token_id)
+            if price_data is None:
+                log.info("trade_eval_no_price", trade_id=trade_id, token_id=token_id)
+                continue
 
-        current_price, updated_at_str = price_data
-        updated_at = datetime.fromisoformat(updated_at_str).replace(tzinfo=timezone.utc)
-        price_age_seconds = (now - updated_at).total_seconds()
-
-        if price_age_seconds > 3600:  # 1 hour max for evaluator
-            log.debug(
-                "trade_eval_stale_price",
-                trade_id=trade_id,
-                age=round(price_age_seconds, 1),
+            current_price, updated_at_str = price_data
+            updated_at = datetime.fromisoformat(updated_at_str).replace(
+                tzinfo=timezone.utc
             )
-            continue
+            price_age_seconds = (now - updated_at).total_seconds()
 
-        if entry_price <= 0:
-            continue
-
-        elapsed = now - opened_at
-        change_pct = ((current_price - entry_price) / entry_price) * 100
-
-        # --- Peak tracking ---
-        reference = peak_price if peak_price is not None else entry_price
-        if current_price > reference:
-            peak_price = current_price
-            peak_pct = ((current_price - entry_price) / entry_price) * 100
-            await conn.execute(
-                "UPDATE paper_trades SET peak_price = ?, peak_pct = ? WHERE id = ?",
-                (peak_price, round(peak_pct, 4), trade_id),
-            )
-
-        # --- Checkpoint updates ---
-        updates: dict[str, object] = {}
-
-        if cp_1h is None and elapsed >= timedelta(hours=1):
-            updates["checkpoint_1h_price"] = current_price
-            updates["checkpoint_1h_pct"] = round(change_pct, 4)
-
-        if cp_6h is None and elapsed >= timedelta(hours=6):
-            updates["checkpoint_6h_price"] = current_price
-            updates["checkpoint_6h_pct"] = round(change_pct, 4)
-
-        if cp_24h is None and elapsed >= timedelta(hours=24):
-            updates["checkpoint_24h_price"] = current_price
-            updates["checkpoint_24h_pct"] = round(change_pct, 4)
-
-        if cp_48h is None and elapsed >= timedelta(hours=48):
-            updates["checkpoint_48h_price"] = current_price
-            updates["checkpoint_48h_pct"] = round(change_pct, 4)
-
-        if updates:
-            set_clause = ", ".join(f"{k} = ?" for k in updates)
-            values = list(updates.values()) + [trade_id]
-            await conn.execute(
-                f"UPDATE paper_trades SET {set_clause} WHERE id = ?",
-                values,
-            )
-
-        # --- TP/SL/Expiry checks (takes priority, but checkpoints still recorded above) ---
-        close_reason = None
-        if current_price >= tp_price:
-            close_reason = "take_profit"
-        elif sl_price > 0 and current_price <= sl_price:
-            close_reason = "stop_loss"
-        elif elapsed >= max_duration:
-            close_reason = "expired"
-
-        if close_reason is not None:
-            # M3: Log how long ago expiry was actually due (useful after offline gaps)
-            if close_reason == "expired":
-                delay_seconds = (elapsed - max_duration).total_seconds()
-                if delay_seconds > 0:
-                    log.info(
-                        "trade_expired_delayed",
-                        trade_id=trade_id,
-                        token_id=token_id,
-                        delay_hours=round(delay_seconds / 3600, 1),
-                    )
-
-            row_signal_type = row[20] if len(row) > 20 else ""
-            if close_reason == "take_profit" and row_signal_type != "long_hold":
-                # Partial TP: sell 70%, keep 30% as long-term hold
-                tp_sell_pct = getattr(settings, "PAPER_TP_SELL_PCT", 70.0) / 100.0
-                original_amount = float(row[18])  # amount_usd
-                original_qty = float(row[19])  # quantity
-                sell_amount = original_amount * tp_sell_pct
-                keep_amount = original_amount * (1 - tp_sell_pct)
-                keep_qty = original_qty * (1 - tp_sell_pct)
-
-                # Close the original trade (records PnL on the 70% sold)
-                # First update amount to reflect only the sold portion
-                await conn.execute(
-                    "UPDATE paper_trades SET amount_usd = ?, quantity = ? WHERE id = ? AND status = 'open'",
-                    (sell_amount, original_qty * tp_sell_pct, trade_id),
-                )
-                sold = await _trader.execute_sell(
-                    db=db,
-                    trade_id=trade_id,
-                    current_price=current_price,
-                    reason=close_reason,
-                    slippage_bps=slippage_bps,
-                )
-                if not sold:
-                    log.warning("partial_tp_sell_failed", trade_id=trade_id)
-                    continue  # don't create long_hold if sell failed
-
-                # Open a new "long_hold" trade for the remaining 30%
-                if keep_amount > 0:
-                    signal_data_raw = row[14] if len(row) > 14 else "{}"
-                    new_id = await _trader.execute_buy(
-                        db=db,
-                        token_id=token_id,
-                        symbol=row[15] if len(row) > 15 else "",
-                        name=row[16] if len(row) > 16 else "",
-                        chain=row[17] if len(row) > 17 else "coingecko",
-                        signal_type="long_hold",
-                        signal_data={
-                            "origin_trade_id": trade_id,
-                            "origin_signal": str(signal_data_raw),
-                        },
-                        current_price=current_price,
-                        amount_usd=keep_amount,
-                        tp_pct=100.0,  # very high TP for long hold
-                        sl_pct=0.0,  # no stop loss
-                        slippage_bps=0,  # no additional slippage on the hold portion
-                        signal_combo="long_hold",
-                    )
-                    if new_id is None:
-                        log.warning(
-                            "long_hold_creation_failed",
-                            trade_id=trade_id,
-                            token_id=token_id,
-                        )
-                    else:
-                        log.info(
-                            "paper_trade_partial_tp",
-                            trade_id=trade_id,
-                            token_id=token_id,
-                            sold_pct=tp_sell_pct * 100,
-                            keep_amount=round(keep_amount, 2),
-                        )
-            else:
-                # SL, expiry, or long_hold TP: close the full position
-                closed = await _trader.execute_sell(
-                    db=db,
-                    trade_id=trade_id,
-                    current_price=current_price,
-                    reason=close_reason,
-                    slippage_bps=slippage_bps,
-                )
-
-            # For partial TP path, execute_sell was called inline above
-            if close_reason == "take_profit" and row_signal_type != "long_hold":
-                closed = True
-            if closed:
+            if price_age_seconds > 3600:  # 1 hour max for evaluator
                 log.info(
-                    "paper_trade_eval_closed",
+                    "trade_eval_stale_price",
                     trade_id=trade_id,
                     token_id=token_id,
-                    reason=close_reason,
+                    age=round(price_age_seconds, 1),
+                )
+                continue
+
+            if not math.isfinite(entry_price) or entry_price <= 0:
+                log.warning(
+                    "trade_eval_bad_entry_price",
+                    trade_id=trade_id,
+                    token_id=token_id,
+                    entry_price=entry_price,
+                )
+                continue
+
+            elapsed = now - opened_at
+            change_pct = ((current_price - entry_price) / entry_price) * 100
+
+            reference = peak_price if peak_price is not None else entry_price
+            if current_price > reference:
+                peak_price = current_price
+                peak_pct = ((current_price - entry_price) / entry_price) * 100
+                await conn.execute(
+                    "UPDATE paper_trades SET peak_price = ?, peak_pct = ? WHERE id = ?",
+                    (peak_price, round(peak_pct, 4), trade_id),
+                )
+
+            updates: dict[str, object] = {}
+
+            if cp_1h is None and elapsed >= timedelta(hours=1):
+                updates["checkpoint_1h_price"] = current_price
+                updates["checkpoint_1h_pct"] = round(change_pct, 4)
+
+            if cp_6h is None and elapsed >= timedelta(hours=6):
+                updates["checkpoint_6h_price"] = current_price
+                updates["checkpoint_6h_pct"] = round(change_pct, 4)
+
+            if cp_24h is None and elapsed >= timedelta(hours=24):
+                updates["checkpoint_24h_price"] = current_price
+                updates["checkpoint_24h_pct"] = round(change_pct, 4)
+
+            if cp_48h is None and elapsed >= timedelta(hours=48):
+                updates["checkpoint_48h_price"] = current_price
+                updates["checkpoint_48h_pct"] = round(change_pct, 4)
+
+            if updates:
+                set_clause = ", ".join(f"{k} = ?" for k in updates)
+                values = list(updates.values()) + [trade_id]
+                await conn.execute(
+                    f"UPDATE paper_trades SET {set_clause} WHERE id = ?",
+                    values,
+                )
+
+            close_reason = None
+            if current_price >= tp_price:
+                close_reason = "take_profit"
+            elif sl_price > 0 and current_price <= sl_price:
+                close_reason = "stop_loss"
+            elif elapsed >= max_duration:
+                close_reason = "expired"
+            elif (
+                settings.PAPER_TRAILING_ENABLED
+                and peak_price is not None
+                and peak_pct is not None
+                and peak_pct >= settings.PAPER_TRAILING_ACTIVATION_PCT
+            ):
+                drawdown_threshold = peak_price * (
+                    1 - settings.PAPER_TRAILING_DRAWDOWN_PCT / 100.0
+                )
+                # long_hold positions have sl_price=0 (no SL safety net), so
+                # the floor gate would leave them unprotected during giveback.
+                # Skip the floor for long_hold; still honor it for normal trades
+                # where the regular SL at entry*(1-sl_pct/100) is the fallback.
+                is_long_hold = sl_price == 0
+                floor_price = entry_price * (
+                    1 + settings.PAPER_TRAILING_FLOOR_PCT / 100.0
+                )
+                if current_price < drawdown_threshold:
+                    if is_long_hold or current_price >= floor_price:
+                        close_reason = "trailing_stop"
+                    else:
+                        log.info(
+                            "trailing_stop_floor_blocked",
+                            trade_id=trade_id,
+                            token_id=token_id,
+                            peak_pct=round(peak_pct, 2),
+                            current_price=current_price,
+                            floor_price=round(floor_price, 6),
+                            drawdown_threshold=round(drawdown_threshold, 6),
+                        )
+            if close_reason is not None:
+                if close_reason == "expired":
+                    delay_seconds = (elapsed - max_duration).total_seconds()
+                    if delay_seconds > 0:
+                        log.info(
+                            "trade_expired_delayed",
+                            trade_id=trade_id,
+                            token_id=token_id,
+                            delay_hours=round(delay_seconds / 3600, 1),
+                        )
+
+                row_signal_type = row[20] if len(row) > 20 else ""
+                if close_reason == "take_profit" and row_signal_type != "long_hold":
+                    tp_sell_pct = settings.PAPER_TP_SELL_PCT / 100.0
+                    original_amount = float(row[18])
+                    original_qty = float(row[19])
+                    sell_amount = original_amount * tp_sell_pct
+                    keep_amount = original_amount * (1 - tp_sell_pct)
+
+                    await conn.execute(
+                        "UPDATE paper_trades SET amount_usd = ?, quantity = ? WHERE id = ? AND status = 'open'",
+                        (sell_amount, original_qty * tp_sell_pct, trade_id),
+                    )
+                    sold = await _trader.execute_sell(
+                        db=db,
+                        trade_id=trade_id,
+                        current_price=current_price,
+                        reason=close_reason,
+                        slippage_bps=slippage_bps,
+                    )
+                    if not sold:
+                        log.warning("partial_tp_sell_failed", trade_id=trade_id)
+                        continue
+
+                    if keep_amount > 0:
+                        signal_data_raw = row[14] if len(row) > 14 else "{}"
+                        new_id = await _trader.execute_buy(
+                            db=db,
+                            token_id=token_id,
+                            symbol=row[15] if len(row) > 15 else "",
+                            name=row[16] if len(row) > 16 else "",
+                            chain=row[17] if len(row) > 17 else "coingecko",
+                            signal_type="long_hold",
+                            signal_data={
+                                "origin_trade_id": trade_id,
+                                "origin_signal": str(signal_data_raw),
+                            },
+                            current_price=current_price,
+                            amount_usd=keep_amount,
+                            tp_pct=100.0,
+                            sl_pct=0.0,
+                            slippage_bps=0,
+                            signal_combo="long_hold",
+                        )
+                        if new_id is None:
+                            log.warning(
+                                "long_hold_creation_failed",
+                                trade_id=trade_id,
+                                token_id=token_id,
+                            )
+                        else:
+                            log.info(
+                                "paper_trade_partial_tp",
+                                trade_id=trade_id,
+                                token_id=token_id,
+                                sold_pct=tp_sell_pct * 100,
+                                keep_amount=round(keep_amount, 2),
+                            )
+                    closed = True
+                else:
+                    closed = await _trader.execute_sell(
+                        db=db,
+                        trade_id=trade_id,
+                        current_price=current_price,
+                        reason=close_reason,
+                        slippage_bps=slippage_bps,
+                    )
+
+                if closed:
+                    log.info(
+                        "paper_trade_eval_closed",
+                        trade_id=trade_id,
+                        token_id=token_id,
+                        reason=close_reason,
+                        price_age_seconds=round(price_age_seconds, 1),
+                        current_price=current_price,
+                        change_pct=round(change_pct, 2),
+                    )
+            else:
+                log.debug(
+                    "paper_trade_eval_ok",
+                    trade_id=trade_id,
+                    token_id=token_id,
                     price_age_seconds=round(price_age_seconds, 1),
                     current_price=current_price,
                     change_pct=round(change_pct, 2),
                 )
-        else:
-            log.debug(
-                "paper_trade_eval_ok",
-                trade_id=trade_id,
-                token_id=token_id,
-                price_age_seconds=round(price_age_seconds, 1),
-                current_price=current_price,
-                change_pct=round(change_pct, 2),
-            )
+        except Exception:
+            log.exception("trade_eval_row_error", trade_id=trade_id)
+            continue
 
     await conn.commit()
