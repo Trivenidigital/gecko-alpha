@@ -204,12 +204,15 @@ def _pool(addr, name="TestPool / SOL", fdv=100_000.0, liq=20_000.0, vol=80_000.0
 
 
 @pytest.fixture
-def settings():
-    return Settings(
-        TELEGRAM_BOT_TOKEN="t",
-        TELEGRAM_CHAT_ID="c",
-        ANTHROPIC_API_KEY="k",
+def settings(settings_factory):
+    # Use the shared settings_factory fixture from tests/conftest.py for
+    # consistency with tests/test_geckoterminal.py. This avoids hand-rolling
+    # required kwargs and keeps the test's config surface aligned with sibling
+    # tests.
+    return settings_factory(
         CHAINS=["solana"],
+        MIN_MARKET_CAP=10_000,
+        MAX_MARKET_CAP=500_000,
     )
 
 
@@ -241,10 +244,14 @@ async def test_fetch_trending_pools_empty_data_emits_nothing(settings):
 
 
 async def test_fetch_trending_pools_skips_malformed_but_preserves_rank_order(settings):
-    # idx 0 = valid, idx 1 = malformed (missing relationships), idx 2 = valid
+    # idx 0 = valid, idx 1 = malformed (fdv_usd raises ValueError on float()), idx 2 = valid.
+    # NB: a truly empty {"attributes": {}, "relationships": {}} does NOT raise in
+    # from_geckoterminal (it produces contract_address="" + mcap=0 which is then
+    # filtered by the mcap floor, NOT the except path). Using a non-numeric fdv
+    # triggers the intended exception path.
     pools = [
         _pool("good1"),
-        {"attributes": {}, "relationships": {}},  # will throw when parsed
+        {"attributes": {"fdv_usd": "KABOOM"}, "relationships": {}},
         _pool("good3"),
     ]
     with aioresponses() as m:
@@ -396,6 +403,31 @@ _PRESERVE_FIELDS = [
 ]
 ```
 
+- [ ] **Step 3b: Update the aggregator observability log**
+
+The existing `aggregator.py:44` line counts only `cg_trending_rank`. Update it to also count `gt_trending_rank` so the log reflects both sources:
+
+Replace:
+```python
+    # Log how many tokens have trending rank after aggregation
+    ranked = sum(1 for t in seen.values() if t.cg_trending_rank is not None)
+    if ranked > 0:
+        logger.info("aggregator_trending_preserved", ranked_tokens=ranked)
+```
+
+With:
+```python
+    # Log how many tokens have any trending rank (CG or GT) after aggregation
+    cg_ranked = sum(1 for t in seen.values() if t.cg_trending_rank is not None)
+    gt_ranked = sum(1 for t in seen.values() if t.gt_trending_rank is not None)
+    if cg_ranked > 0 or gt_ranked > 0:
+        logger.info(
+            "aggregator_trending_preserved",
+            cg_ranked=cg_ranked,
+            gt_ranked=gt_ranked,
+        )
+```
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_aggregator_gt_rank.py -v`
@@ -432,18 +464,31 @@ Let `TARGET = current + 15`. Use this literal integer in Step 2 and Step 4 below
 
 - [ ] **Step 2: Write the failing pin test**
 
-Create `tests/test_scorer_max_raw_bumped_gt.py`:
+Create `tests/test_scorer_max_raw_bumped_gt.py`. Pick ONE of the two variants below based on Step 1's reading:
+
+**Variant A — `SCORER_MAX_RAW` on master is currently 183 (BL-051 NOT merged) → TARGET=198:**
 ```python
-"""Pin SCORER_MAX_RAW after BL-052 velocity (gt_trending +15)."""
+"""Pin SCORER_MAX_RAW after BL-052 gt_trending signal (+15)."""
 
 from scout import scorer
 
 
 def test_scorer_max_raw_bumped_for_gt_trending():
-    assert scorer.SCORER_MAX_RAW == TARGET_VALUE  # replace with 198 or 218
+    assert scorer.SCORER_MAX_RAW == 198
 ```
 
-Remember to replace `TARGET_VALUE` with the actual literal.
+**Variant B — `SCORER_MAX_RAW` on master is currently 203 (BL-051 already merged) → TARGET=218:**
+```python
+"""Pin SCORER_MAX_RAW after BL-052 gt_trending signal (+15)."""
+
+from scout import scorer
+
+
+def test_scorer_max_raw_bumped_for_gt_trending():
+    assert scorer.SCORER_MAX_RAW == 218
+```
+
+Do NOT leave a placeholder token in the committed file — the integer literal must be present. If unsure which variant applies, re-run `grep -n "^SCORER_MAX_RAW" scout/scorer.py` and pick accordingly.
 
 - [ ] **Step 3: Run test to verify it fails**
 
@@ -482,10 +527,11 @@ Note any tests that fail with "assert 85 == 100" or similar normalization-relate
 
 - [ ] **Step 1: Check whether structlog is already imported in scorer.py**
 
-Run: `grep -n "import structlog\|logger = structlog" scout/scorer.py`
-- If BOTH present → skip Step 3a's import addition.
-- If NEITHER present → perform Step 3a.
-- If only one present → report to controller; this is a corrupted state.
+Run: `grep -n "^import structlog\|^logger = structlog" scout/scorer.py`
+- Count distinct lines matched. Desired end-state: exactly one `import structlog` line AND exactly one `logger = structlog.get_logger(__name__)` line at module scope.
+- If both are already present → skip Step 3a.
+- If either or both are missing → perform Step 3a, adding ONLY the missing line(s). Do not duplicate.
+- Idempotency wins over gatekeeping — ensure the end state matches, regardless of starting state.
 
 - [ ] **Step 2: Write failing tests**
 
@@ -620,14 +666,35 @@ Renumber the trailing comment lines:
 Run: `uv run pytest tests/test_scorer_gt_trending.py -v`
 Expected: PASS (6 tests).
 
-- [ ] **Step 6: Address any "cap-at-100" regressions from Task 5's bump**
+- [ ] **Step 6: Update `/183` literal references in existing tests (MANDATORY, not optional)**
 
-Run: `uv run pytest tests/ -k scorer --tb=short -q 2>&1 | tail -30`
-Look for tests asserting a specific normalized score against a fixture that previously yielded `raw == MAX_PRE_BUMP → normalized = 100`. These tests now see `raw == MAX_PRE_BUMP → normalized = ~92`.
+`tests/test_scorer.py` contains 12 hardcoded `183` references (exact-normalized-integer assertions and comments). After bumping `SCORER_MAX_RAW` from 183 to 198 (Variant A) or 203 to 218 (Variant B), ALL of these break.
 
-**Fix strategy:** For each such failing test, add `gt_trending_rank=1` (or any ≤10) to the fixture setup. This pushes raw from `MAX_PRE_BUMP` to `MAX_PRE_BUMP+15 = TARGET`, restoring the cap-at-100 behavior.
+**Exact list (line numbers from current master; run `grep -n "183" tests/test_scorer.py` if unsure):**
+- L49: comment `int(30*100/183)=16` → update divisor.
+- L143: comment `int(25*100/183)=13` → update divisor.
+- L172: comment `int(15*100/183)=8` → update divisor.
+- L188: comment `int(8*100/183)=4` → update divisor.
+- L204: comment `int(5*100/183)=2` → update divisor.
+- L367: comment `int(33*100/183) = 18, 3 signals -> *1.15 = int(20.7) = 20` → update divisor; recompute the integer values.
+- L439: comment `int(78*100/183)=42, *1.15=int(48.3)=48` → update divisor; recompute.
+- L455: comment `int(30*100/183)=16` → update divisor.
+- L542: comment `int(15*100/183)=8` → update divisor.
+- L927: comment `5 pts raw -> normalized=int(5*100/183)=2` → update divisor.
+- L1030: comment `30+8+25+15+15+15+20+25+15+5+10 = 183` → update to include `+15` and new sum.
+- **L1031: assertion `assert SCORER_MAX_RAW == 183` → UPDATE the literal to the new target (198 or 218).** This was a pin test; after the bump, it must assert the new value. This overlaps with the new pin test in `test_scorer_max_raw_bumped_gt.py` — that is fine, two pin tests of the same invariant are acceptable.
+- L1034: docstring `int(30*100/183)=16` → update.
+- L1046: assertion `assert points == int(30 * 100 / 183)` → update the literal divisor.
 
-This is the same pattern used in BL-051 Task 6b (check `git log feat/bl-051-dexscreener-boosts-poster --oneline` if it exists for precedent). If no tests fail, skip this step.
+**Method — for each affected line, change the literal divisor from `183` to the target:**
+- Variant A (target=198): replace `183` → `198`. Recompute integer comments (e.g. `int(30*100/198)=15`, not 16).
+- Variant B (target=218): replace `183` → `218`. Recompute integer comments (e.g. `int(30*100/218)=13`).
+
+For L367, L439 specifically: both the first integer AND the multiplied integer in the trailing comment need recomputation.
+
+**Automation hint:** Use `sed -i 's/\b183\b/198/g' tests/test_scorer.py` (or `218` for Variant B) as a FIRST pass, then manually re-verify each comment's computed integer matches the new math. Do NOT commit until the full suite passes.
+
+If additional test files (other than `test_scorer.py`) also hardcode `183` as a divisor, update them with the same process: `grep -rn "100 */ *183\|/ *183" tests/` before proceeding.
 
 - [ ] **Step 7: Run full suite**
 
@@ -655,34 +722,80 @@ git commit -m "feat(bl-052): add gt_trending scoring signal (+15 pts) and bump S
 
 - [ ] **Step 1: Read the existing main pipeline test for patterns**
 
-Read `tests/test_main.py` (or similar integration-test file in the repo) to understand the existing pattern for mocking `run_cycle` via aioresponses. Match the fixture/setup style used there.
+Read `tests/test_main.py` to understand the existing pattern for exercising `run_cycle`. Look at how it:
+- Instantiates `Settings` (likely via `settings_factory` from conftest).
+- Opens / closes DB and `aiohttp.ClientSession`.
+- Patches or mocks the ingestion layer.
 
-- [ ] **Step 2: Write the integration test**
+`tests/test_main.py` is the sole reference — the BL-051 sibling file (`test_main_pipeline_top_boosts.py`) is NOT on master. Do not fetch from other branches; derive the pattern from master alone.
 
-Create `tests/test_main_pipeline_gt_trending.py` modeled on the existing pattern. Skeleton:
+- [ ] **Step 2: Decide on mocking approach**
+
+Two viable approaches (pick whichever test_main.py already uses):
+
+**(a) `aioresponses` HTTP-layer mock** — intercepts `aiohttp.ClientSession.get/post` at the URL level. No signature change to `run_cycle`. Mock each URL the pipeline hits; extras return 404 by default (handled by existing error paths).
+
+**(b) `monkeypatch.setattr` on the ingestion functions themselves** — simpler, less brittle, but requires knowing the function names (`scout.ingestion.geckoterminal.fetch_trending_pools`, etc.). Existing test_main.py is likely using this approach based on BL-051's pattern; verify before writing.
+
+- [ ] **Step 3: Write the integration test**
+
+Create `tests/test_main_pipeline_gt_trending.py`. Minimum assertions:
+- One fake GT pool at rank 1 with contract `0xtarget` on chain `solana`, mcap in range.
+- All other ingestion sources (DexScreener, CoinGecko markets, CoinGecko trending, DexScreener top-boosts if present) return empty lists / empty responses.
+- After `run_cycle` (dry-run), the pipeline produces candidates. Locate the one for `0xtarget` and assert `"gt_trending" in candidate.signals_fired`.
+
+Example skeleton (adapt to whatever mocking test_main.py uses):
 
 ```python
 """Integration test: gt_trending signal propagates through run_cycle (BL-052)."""
 
-import pytest
-from aioresponses import aioresponses
-# ... match imports from tests/test_main.py
+from unittest.mock import AsyncMock, patch
 
-# Mock fixtures at minimum:
-#   - GT /networks/solana/trending_pools returns 1 pool with contract 0xtarget
-#   - DexScreener search returns same contract 0xtarget (minimal fields)
-#   - CoinGecko /coins/markets returns []
-#   - /search/trending returns []
-#   - GoPlus / DexScreener /token-boosts/top: return whatever the default harness expects
-#
-# Call run_cycle with dry_run=True.
-# Assert: the emitted candidate for 0xtarget has "gt_trending" in signals_fired.
-#
-# If existing tests patch fetch_top_boosts / fetch_X directly, do the same here;
-# otherwise stick to aioresponses HTTP-layer mocking.
+import pytest
+
+from scout.models import CandidateToken
+# plus whatever imports test_main.py uses for run_cycle
+
+
+@pytest.mark.asyncio
+async def test_gt_trending_signal_propagates_through_run_cycle(
+    settings_factory, tmp_path, <other fixtures from test_main.py>
+):
+    trending_token = CandidateToken(
+        contract_address="0xtarget",
+        chain="solana",
+        token_name="Target",
+        ticker="TGT",
+        market_cap_usd=50_000.0,
+        liquidity_usd=20_000.0,
+        volume_24h_usd=10_000.0,
+        gt_trending_rank=1,
+    )
+
+    with patch(
+        "scout.ingestion.geckoterminal.fetch_trending_pools",
+        new=AsyncMock(return_value=[trending_token]),
+    ), patch(
+        "scout.ingestion.dexscreener.fetch_trending",
+        new=AsyncMock(return_value=[]),
+    ), patch(
+        "scout.ingestion.coingecko.fetch_markets",
+        new=AsyncMock(return_value=[]),
+    ), patch(
+        "scout.ingestion.coingecko.fetch_trending",
+        new=AsyncMock(return_value=[]),
+    ):
+        # call run_cycle here matching test_main.py's pattern
+        # inspect DB or capture produced candidates
+        ...
+
+    # assert: the candidate for 0xtarget includes "gt_trending" in signals_fired
+    ...
 ```
 
-Look at `tests/test_main_pipeline_top_boosts.py` (added by BL-051) if it exists on any branch — it is the nearest-sibling test and the cleanest template. If the BL-051 branch is still un-merged, checkout-and-diff is acceptable for reference (do not copy, use the pattern only).
+Replace the `...` blocks and patched names with whatever `test_main.py` uses. If `run_cycle` persists to DB, query the DB. If it returns a list, capture the return value. **Match the existing pattern — do not invent a new one.**
+
+If the existing test_main.py patches additional sources not listed here (e.g. `fetch_top_boosts` from BL-051 if it has merged), add patches for those too (all returning empty) so our new source is the only positive signal.
 
 - [ ] **Step 3: Run the integration test**
 
@@ -718,8 +831,24 @@ Expected: all previously-passing tests plus all new tests green. Record the fina
 
 - [ ] **Step 2: Dry-run the pipeline locally**
 
-Run: `uv run python -m scout.main --dry-run --cycles 1 2>&1 | tail -40`
-Expected: no exceptions. Look for either `gt_trending_signal_fired` log entry (good — real data produced a match) OR complete silence on that event (acceptable — live data didn't produce a trending match this cycle). Look for zero NEW error-level logs vs. baseline.
+Run: `uv run python -m scout.main --dry-run --cycles 1 2>&1 | tee /tmp/bl052_dryrun.log | tail -40`
+Expected: no exceptions and zero NEW error-level logs vs. baseline.
+
+Then verify the GT trending path actually executed by running these greps against the captured log:
+
+```bash
+# Primary success signal — a trending token cleared the scorer
+grep -c "gt_trending_signal_fired" /tmp/bl052_dryrun.log || true
+
+# Fallback evidence — the aggregator observed gt-ranked tokens even if none
+# scored high enough for the signal to fire (stablecoin dust, mcap filter, etc.)
+grep -E "aggregator_trending_preserved" /tmp/bl052_dryrun.log || true
+```
+
+Acceptance:
+- If `gt_trending_signal_fired` appears ≥1 time → ✅ end-to-end path verified.
+- Else if `aggregator_trending_preserved` shows `gt_ranked>0` → ✅ ingestion + aggregation verified (signal didn't fire this cycle because no trending token hit the mcap/liquidity gates, which is acceptable).
+- If **neither** appears → ❌ something is wired wrong. Inspect the log for a GeckoTerminal fetch error or a silent exception in the trending loop before proceeding. Do not push.
 
 - [ ] **Step 3: Verify `.env.example` formatting**
 
