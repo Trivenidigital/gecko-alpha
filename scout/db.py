@@ -3,18 +3,19 @@
 import asyncio
 import json
 import math
-import structlog
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import aiosqlite
+import structlog
 
 _db_log = structlog.get_logger(__name__)
 
 from scout.models import CandidateToken
 
 if TYPE_CHECKING:
+    from scout.news.schemas import CryptoPanicPost
     from scout.perp.schemas import PerpAnomaly
 
 # Columns that map 1:1 from CandidateToken to the candidates table.
@@ -1652,7 +1653,7 @@ class Database:
 
     async def insert_cryptopanic_post(
         self,
-        post,
+        post: "CryptoPanicPost",
         *,
         is_macro: bool,
         sentiment: str,
@@ -1682,7 +1683,7 @@ class Database:
             ),
         )
         await self._conn.commit()
-        return cur.rowcount or 0
+        return cur.rowcount
 
     async def fetch_all_cryptopanic_posts(self) -> list[dict]:
         """Return all rows (test helper)."""
@@ -1695,16 +1696,18 @@ class Database:
         return [dict(r) for r in rows]
 
     async def prune_cryptopanic_posts(self, *, keep_days: int) -> int:
-        """Delete rows with published_at older than keep_days. Returns rowcount."""
+        """Delete rows with published_at at or older than keep_days. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        # Using <= (not <) so that keep_days=0 reliably deletes all rows on
-        # low-resolution clocks (Windows): datetime.now() may return identical
-        # strings back-to-back, so strict < would fail to delete "fresh" rows.
+        # Use <= so that published_at == cutoff (boundary) prunes.
+        # Rationale: keep_days=0 means "retain nothing as old as now",
+        # and ISO-string comparisons can tie on low-resolution clocks
+        # (observed on Windows). Semantics: "prune rows at or older
+        # than keep_days."
         cur = await self._conn.execute(
             "DELETE FROM cryptopanic_posts WHERE published_at <= ?",
             (cutoff,),
         )
         await self._conn.commit()
-        return cur.rowcount or 0
+        return cur.rowcount
