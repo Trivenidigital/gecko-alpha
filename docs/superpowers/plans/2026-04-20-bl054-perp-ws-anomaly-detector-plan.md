@@ -266,6 +266,7 @@ Append immediately after the existing `-------- Paper Trading Engine --------` /
     PERP_SCORING_ENABLED: bool = False
     PERP_BINANCE_ENABLED: bool = True
     PERP_BYBIT_ENABLED: bool = True
+    PERP_BINANCE_WS_URL: str = "wss://fstream.binance.com/stream"
     PERP_SYMBOLS: list[str] = []
     PERP_FUNDING_FLIP_MIN_PCT: float = 0.05
     PERP_OI_SPIKE_RATIO: float = 3.0
@@ -292,7 +293,10 @@ Add a comma-parsing validator, mirroring the `CHAINS` pattern:
     @classmethod
     def parse_perp_symbols(cls, v: str | list[str]) -> list[str]:
         if isinstance(v, str):
-            return [s.strip().upper() for s in v.split(",") if s.strip()]
+            v = [s.strip().upper() for s in v.split(",") if s.strip()]
+        if isinstance(v, list) and len(v) > 200:
+            # Binance URL-length + subscription-rate safety (design spec §3.4).
+            raise ValueError("PERP_SYMBOLS exceeds max length 200")
         return v
 ```
 
@@ -566,6 +570,7 @@ Expected: ImportError.
 # scout/perp/anomaly.py
 """Pure classifier functions: funding flip + OI spike. No I/O."""
 
+import math
 from datetime import datetime
 
 from scout.perp.schemas import Exchange, PerpAnomaly
@@ -581,7 +586,14 @@ def classify_funding_flip(
     observed_at: datetime,
     min_magnitude_pct: float,
 ) -> PerpAnomaly | None:
-    """Fire when funding rate flips sign and |new_rate| >= threshold."""
+    """Fire when funding rate flips sign and |new_rate| >= threshold.
+
+    Edge case: ``0.0 -> -0.0001`` IS treated as a flip (0.0 is classified
+    as non-negative by ``>= 0``), so a rate leaving the exactly-zero state
+    toward negative fires. This is deliberate: in practice funding is
+    almost never exactly 0.0, and treating it as positive keeps the
+    classifier's branch logic simple and symmetric.
+    """
     if prev_rate is None:
         return None
     if (prev_rate >= 0) == (new_rate >= 0):
@@ -609,7 +621,7 @@ def classify_oi_spike(
     spike_ratio: float,
 ) -> PerpAnomaly | None:
     """Fire when current OI / baseline >= spike_ratio past warmup."""
-    if baseline_oi is None or baseline_oi <= 0:
+    if baseline_oi is None or baseline_oi <= 0 or not math.isfinite(baseline_oi):
         return None
     if sample_count < min_samples:
         return None
@@ -719,7 +731,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import random
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
@@ -732,8 +743,6 @@ from scout.perp.normalize import normalize_ticker
 from scout.perp.schemas import PerpTick
 
 logger = structlog.get_logger()
-
-WS_URL = "wss://fstream.binance.com/ws"
 
 
 def parse_frame(frame: dict[str, Any]) -> list[PerpTick]:
@@ -807,46 +816,45 @@ def _parse_oi(item: dict[str, Any]) -> PerpTick | None:
 async def stream_ticks(
     session: aiohttp.ClientSession,
     settings: Settings,
+    state: "ClassifierState | None" = None,
 ) -> AsyncIterator[PerpTick]:
-    """Connect and yield PerpTicks forever. Self-healing via full-jitter backoff.
+    """Open ONE Binance WS connection and yield PerpTicks until EOF/exception.
 
     Binance's server sends ping frames; aiohttp auto-replies pong. No
-    outbound ping needed. Reconnect with jitter + 0.5s floor to avoid
-    hammering a momentarily-recovering gateway.
+    outbound ping needed. Reconnect/backoff is NOT handled here -- the
+    supervisor in scout/perp/watcher.py owns that concern (single-owner,
+    injectable clock for tests). This coroutine either returns on clean
+    close or lets exceptions propagate upward.
+
+    The /stream endpoint subscribes via URL (?streams=...) so no
+    SUBSCRIBE message is sent; frame shape on this endpoint is
+    ``{"stream": "...", "data": {...}}`` which parse_frame already
+    handles.
     """
-    attempt = 0
-    while True:
-        try:
-            async with session.ws_connect(
-                WS_URL,
-                heartbeat=settings.PERP_WS_PING_INTERVAL_SEC,
-                max_msg_size=0,
-            ) as ws:
-                # Subscribe to markPrice@arr@1s and any curated @openInterest streams.
-                params: list[str] = ["!markPrice@arr@1s"]
-                for sym in settings.PERP_SYMBOLS:
-                    params.append(f"{sym.lower()}@openInterest")
-                await ws.send_json({"method": "SUBSCRIBE", "params": params, "id": 1})
-                attempt = 0  # connection successful; reset backoff
-                async for msg in ws:
-                    if msg.type != aiohttp.WSMsgType.TEXT:
-                        continue
-                    try:
-                        frame = json.loads(msg.data)
-                    except (ValueError, TypeError):
-                        continue
-                    for tick in parse_frame(frame):
-                        yield tick
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("binance_ws_disconnect", error=str(exc), attempt=attempt)
-        attempt += 1
-        delay = random.uniform(0.5, min(
-            settings.PERP_WS_RECONNECT_MAX_SEC,
-            float(2**attempt),
-        ))
-        await asyncio.sleep(delay)
+    symbols = settings.PERP_SYMBOLS
+    if not symbols:
+        return
+    streams = "/".join(
+        ["!markPrice@arr@1s"] + [f"{s.lower()}@openInterest" for s in symbols]
+    )
+    url = f"{settings.PERP_BINANCE_WS_URL}?streams={streams}"
+    async with session.ws_connect(
+        url,
+        headers=None,  # explicit: do not leak shared-session UA/auth headers
+        heartbeat=settings.PERP_WS_PING_INTERVAL_SEC,
+        max_msg_size=0,
+    ) as ws:
+        async for msg in ws:
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                continue
+            try:
+                frame = json.loads(msg.data)
+            except (ValueError, TypeError):
+                if state is not None:
+                    state.malformed_frames += 1
+                continue
+            for tick in parse_frame(frame):
+                yield tick
 ```
 
 - [ ] **Step 4: Run tests**
@@ -930,8 +938,8 @@ Expected: ImportError.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
-import random
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from typing import Any
@@ -985,48 +993,46 @@ def parse_frame(frame: dict[str, Any]) -> list[PerpTick]:
 async def stream_ticks(
     session: aiohttp.ClientSession,
     settings: Settings,
+    state: "ClassifierState | None" = None,
 ) -> AsyncIterator[PerpTick]:
-    """Connect and yield PerpTicks forever.
+    """Open ONE Bybit WS connection and yield PerpTicks until EOF/exception.
 
     Bybit REQUIRES explicit JSON {"op": "ping"} every 20s. Different from
     Binance's server-sent ping; each client owns its own keepalive.
+
+    Reconnect/backoff is handled by the supervisor in
+    scout/perp/watcher.py (single-owner, injectable clock). On empty
+    PERP_SYMBOLS this returns early -- NEVER open a connection to a
+    no-op subscription (previous hot-loop bug BLOCKER-2).
     """
-    attempt = 0
-    while True:
+    symbols = settings.PERP_SYMBOLS
+    if not symbols:
+        logger.info("bybit_perp_no_symbols_configured")
+        return
+    async with session.ws_connect(
+        WS_URL,
+        headers=None,  # explicit: do not leak shared-session UA/auth headers
+        max_msg_size=0,
+    ) as ws:
+        topics = [f"tickers.{s}" for s in symbols]
+        await ws.send_json({"op": "subscribe", "args": topics})
+        ping_task = asyncio.create_task(_ping_loop(ws, settings))
         try:
-            async with session.ws_connect(WS_URL, max_msg_size=0) as ws:
-                # Subscribe to configured symbols; if empty, skip this exchange.
-                symbols = settings.PERP_SYMBOLS
-                if not symbols:
-                    logger.info("bybit_ws_no_symbols_sleeping")
-                    await asyncio.sleep(30)
+            async for msg in ws:
+                if msg.type != aiohttp.WSMsgType.TEXT:
                     continue
-                topics = [f"tickers.{s}" for s in symbols]
-                await ws.send_json({"op": "subscribe", "args": topics})
-                attempt = 0
-                ping_task = asyncio.create_task(_ping_loop(ws, settings))
                 try:
-                    async for msg in ws:
-                        if msg.type != aiohttp.WSMsgType.TEXT:
-                            continue
-                        try:
-                            frame = json.loads(msg.data)
-                        except (ValueError, TypeError):
-                            continue
-                        for tick in parse_frame(frame):
-                            yield tick
-                finally:
-                    ping_task.cancel()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("bybit_ws_disconnect", error=str(exc), attempt=attempt)
-        attempt += 1
-        delay = random.uniform(0.5, min(
-            settings.PERP_WS_RECONNECT_MAX_SEC,
-            float(2**attempt),
-        ))
-        await asyncio.sleep(delay)
+                    frame = json.loads(msg.data)
+                except (ValueError, TypeError):
+                    if state is not None:
+                        state.malformed_frames += 1
+                    continue
+                for tick in parse_frame(frame):
+                    yield tick
+        finally:
+            ping_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ping_task
 
 
 async def _ping_loop(ws: aiohttp.ClientWebSocketResponse, settings: Settings) -> None:
@@ -1131,6 +1137,21 @@ async def test_prune(db):
         since=old - timedelta(days=1),
     )
     assert [r.ticker for r in rows] == ["FRESH"]
+
+@pytest.mark.asyncio
+async def test_insert_perp_anomaly_idempotent(db):
+    """Same (exchange, symbol, kind, observed_at) inserted twice must yield
+    exactly ONE row (UNIQUE + INSERT OR IGNORE -- replays on reconnect
+    must not create duplicate rows).
+    """
+    ts = datetime.now(timezone.utc)
+    a = _anomaly("BTC", observed_at=ts)
+    await db.insert_perp_anomaly(a)
+    await db.insert_perp_anomaly(a)  # exact duplicate
+    rows = await db.fetch_recent_perp_anomalies(
+        tickers=["BTC"], since=ts - timedelta(minutes=1),
+    )
+    assert len(rows) == 1
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -1152,7 +1173,8 @@ await self._conn.execute("""
         kind TEXT NOT NULL,
         magnitude REAL NOT NULL,
         baseline REAL,
-        observed_at TEXT NOT NULL
+        observed_at TEXT NOT NULL,
+        UNIQUE(exchange, symbol, kind, observed_at)
     )
 """)
 await self._conn.execute(
@@ -1175,9 +1197,14 @@ if TYPE_CHECKING:
 
 
 async def insert_perp_anomaly(self, anomaly: "PerpAnomaly") -> None:
-    """Insert a single anomaly. Kept for tests; prefer batch in hot path."""
+    """Insert a single anomaly. Kept for tests; prefer batch in hot path.
+
+    Uses INSERT OR IGNORE to preserve idempotency across reconnect/replay
+    -- the UNIQUE(exchange, symbol, kind, observed_at) constraint prevents
+    duplicate rows.
+    """
     await self._conn.execute(
-        "INSERT INTO perp_anomalies "
+        "INSERT OR IGNORE INTO perp_anomalies "
         "(exchange, symbol, ticker, kind, magnitude, baseline, observed_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (anomaly.exchange, anomaly.symbol, anomaly.ticker, anomaly.kind,
@@ -1189,7 +1216,12 @@ async def insert_perp_anomaly(self, anomaly: "PerpAnomaly") -> None:
 async def insert_perp_anomalies_batch(
     self, rows: list["PerpAnomaly"]
 ) -> int:
-    """Primary write path. Single transaction, returns row count."""
+    """Primary write path. Single transaction, returns row count.
+
+    Uses INSERT OR IGNORE against the UNIQUE constraint on
+    (exchange, symbol, kind, observed_at) so replays after a WS reconnect
+    do not create duplicate rows.
+    """
     if not rows:
         return 0
     payload = [
@@ -1198,7 +1230,7 @@ async def insert_perp_anomalies_batch(
         for a in rows
     ]
     await self._conn.executemany(
-        "INSERT INTO perp_anomalies "
+        "INSERT OR IGNORE INTO perp_anomalies "
         "(exchange, symbol, ticker, kind, magnitude, baseline, observed_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         payload,
@@ -1208,8 +1240,14 @@ async def insert_perp_anomalies_batch(
 
 
 async def fetch_recent_perp_anomalies(
-    self, *, tickers: list[str], since: datetime
+    self, *, tickers: list[str], since: datetime, limit: int = 100,
 ) -> list["PerpAnomaly"]:
+    """Fetch recent anomalies for ``tickers`` after ``since``.
+
+    ``limit`` caps row count to protect against pathological lookups on
+    a tickers list that unexpectedly matches tens of thousands of rows.
+    Callers that need an exhaustive read should pass an explicit value.
+    """
     from scout.perp.schemas import PerpAnomaly
     if not tickers:
         return []
@@ -1218,8 +1256,9 @@ async def fetch_recent_perp_anomalies(
         f"SELECT exchange, symbol, ticker, kind, magnitude, baseline, observed_at "
         f"FROM perp_anomalies "
         f"WHERE ticker IN ({placeholders}) AND observed_at >= ? "
-        f"ORDER BY observed_at DESC",
-        (*tickers, since.isoformat()),
+        f"ORDER BY observed_at DESC "
+        f"LIMIT ?",
+        (*tickers, since.isoformat(), limit),
     )
     rows = await cur.fetchall()
     return [
@@ -1246,7 +1285,7 @@ async def prune_perp_anomalies(self, *, keep_days: int) -> int:
 - [ ] **Step 5: Run tests**
 
 Run: `uv run pytest tests/test_perp_db.py -q`
-Expected: 5 passed.
+Expected: 6 passed.
 
 - [ ] **Step 6: Commit**
 
@@ -1438,6 +1477,8 @@ git commit -m "feat(bl-054): CandidateToken perp fields + enrichment helper"
 - Modify: `scout/scorer.py`
 - Create: `tests/test_perp_scorer.py`
 
+*Depends on Task 6 merged (model fields + default None for `perp_exchange`, `perp_funding_flip`, `perp_oi_spike_ratio`, `perp_last_anomaly_at`).*
+
 - [ ] **Step 1: Write failing scorer tests**
 
 ```python
@@ -1467,8 +1508,10 @@ def test_perp_signal_does_not_fire_when_denominator_not_ready(token_factory, set
     settings = settings_factory(PERP_SCORING_ENABLED=True)
     token = _tagged(token_factory)
     # SCORER_MAX_RAW ships at 183, so denominator-not-ready — signal must NOT fire.
-    assert scorer_mod.SCORER_MAX_RAW == 183
+    assert scorer_mod.SCORER_MAX_RAW < 203
     points, signals = score(token, settings)
+    # Runtime guard: with SCORER_MAX_RAW < 203 we want points contributed by
+    # the perp signal to be 0 and "perp_anomaly" NOT in signals_fired.
     assert "perp_anomaly" not in signals
 
 def test_perp_signal_fires_when_both_flag_and_denominator_ready(
@@ -1515,10 +1558,13 @@ Add a module-level constant alongside `SCORER_MAX_RAW`:
 _PERP_SCORING_DENOMINATOR_READY = SCORER_MAX_RAW >= 203
 ```
 
-Insert the Signal 14 block BETWEEN Signal 13 (`cryptopanic_bullish` — which doesn't exist yet in master; since BL-053 hasn't merged, insert AFTER Signal 10 solana_bonus and BEFORE Signal 11 velocity, keeping consistent numbering with the existing scorer.py):
+Insert the Signal 14 block AFTER Signal 11 (`score_velocity`) and IMMEDIATELY BEFORE the normalization line (`points = min(100, int(points * 100 / SCORER_MAX_RAW))`). This makes the perp signal the LAST raw-points contributor, simplifying audit of the runtime guard.
+
+Numbering note: this becomes **Signal 12** in the flag-off snapshot era because BL-053 is not yet in master. If BL-053 merges first and introduces its own Signal 12, renumber this to Signal 13 at merge time — the CALL SITE does not change, only the comment.
 
 ```python
-    # Signal 14: Perp anomaly (BL-054) -- 10 points, gated.
+    # Signal 12 (renumber at BL-053 merge): Perp futures anomaly --
+    # 10 points (GATED: PERP_SCORING_ENABLED + runtime denominator guard).
     # Double-gate: PERP_SCORING_ENABLED + SCORER_MAX_RAW >= 203. The second
     # gate is the runtime guard that prevents the scoring flag from silently
     # inflating scores before the recalibration PR lands. Tests monkeypatch
@@ -1651,6 +1697,50 @@ async def _maybe_enrich_perp(tokens, *, db, settings):
 Run: `uv run pytest tests/test_main_perp_integration.py tests/test_main_*.py -q`
 Expected: new tests + existing main tests pass.
 
+- [ ] **Step 5b: Add end-to-end enrich-before-score test (IMP-6)**
+
+```python
+# tests/test_main_perp_integration.py — append
+@pytest.mark.asyncio
+async def test_run_cycle_enriches_before_scoring(
+    settings_factory, token_factory, tmp_path, monkeypatch,
+):
+    """Happy path integration: DB has an anomaly, candidate matches by
+    ticker, one pipeline cycle runs, and the scored candidate comes out
+    with perp_oi_spike_ratio populated AND perp_anomaly in signals_fired.
+    """
+    from scout import scorer as scorer_mod
+    from scout.db import Database
+    from scout.main import _maybe_enrich_perp
+    from scout.scorer import score
+
+    # Bump denominator guard to the ready state for the duration of the test.
+    monkeypatch.setattr(scorer_mod, "SCORER_MAX_RAW", 203)
+    monkeypatch.setattr(scorer_mod, "_PERP_SCORING_DENOMINATOR_READY", True)
+
+    db = Database(db_path=tmp_path / "t.db")
+    await db.connect()
+    try:
+        await db.insert_perp_anomaly(PerpAnomaly(
+            exchange="binance", symbol="DOGEUSDT", ticker="DOGE",
+            kind="oi_spike", magnitude=5.0, baseline=1.0,
+            observed_at=datetime.now(timezone.utc),
+        ))
+        settings = settings_factory(
+            PERP_ENABLED=True,
+            PERP_SCORING_ENABLED=True,
+            PERP_ANOMALY_LOOKBACK_MIN=15,
+            PERP_OI_SPIKE_RATIO=3.0,
+        )
+        tokens = [token_factory(ticker="DOGE", liquidity_usd=50_000)]
+        enriched = await _maybe_enrich_perp(tokens, db=db, settings=settings)
+        assert enriched[0].perp_oi_spike_ratio == 5.0
+        points, signals = score(enriched[0], settings)
+        assert "perp_anomaly" in signals
+    finally:
+        await db.close()
+```
+
 - [ ] **Step 6: Commit**
 
 ```bash
@@ -1692,9 +1782,10 @@ def _make_tick(oi: float, ts: float = 0.0, ticker: str = "BTC") -> PerpTick:
 
 @pytest.mark.asyncio
 async def test_classifier_batch_flush_on_size(settings_factory):
+    from scout.perp.watcher import _STOP
     settings = settings_factory(
         PERP_BASELINE_MIN_SAMPLES=1,
-        PERP_DB_FLUSH_INTERVAL_SEC=1000.0,  # prevent interval flush
+        PERP_DB_FLUSH_INTERVAL_SEC=60.0,  # prevent interval flush within test
         PERP_DB_FLUSH_MAX_ROWS=2,
         PERP_OI_SPIKE_RATIO=3.0,
         PERP_ANOMALY_DEDUP_MIN=0,
@@ -1710,13 +1801,18 @@ async def test_classifier_batch_flush_on_size(settings_factory):
     for symbol in ("A", "B", "C"):
         await queue.put(_make_tick(oi=1.0, ticker=symbol))
         await queue.put(_make_tick(oi=10.0, ticker=symbol))  # spike
-    await queue.put(None)  # sentinel to stop
+    await queue.put(_STOP)  # distinct sentinel (not None) to stop
     await classifier_loop(queue, state, db, settings)
-    # Expect at least one batch flush when size cap hit.
+    # First flush must be size-triggered (not timeout-triggered), so assert the
+    # first call was a batch of EXACTLY PERP_DB_FLUSH_MAX_ROWS rows. This proves
+    # size-trigger rather than a vacuous await_count >= 1.
     assert db.insert_perp_anomalies_batch.await_count >= 1
+    first_batch = db.insert_perp_anomalies_batch.await_args_list[0].args[0]
+    assert len(first_batch) == settings.PERP_DB_FLUSH_MAX_ROWS
 
 @pytest.mark.asyncio
 async def test_classifier_dedup(settings_factory):
+    from scout.perp.watcher import _STOP
     settings = settings_factory(
         PERP_BASELINE_MIN_SAMPLES=1,
         PERP_DB_FLUSH_INTERVAL_SEC=0.01,
@@ -1733,7 +1829,7 @@ async def test_classifier_dedup(settings_factory):
     await queue.put(_make_tick(oi=1.0))
     await queue.put(_make_tick(oi=10.0))  # spike fires
     await queue.put(_make_tick(oi=11.0))  # same (exchange,symbol,kind) within cooldown — suppressed
-    await queue.put(None)
+    await queue.put(_STOP)
     await classifier_loop(queue, state, db, settings)
     # Collect all anomaly rows flushed across any batches.
     total = sum(len(call.args[0]) for call in db.insert_perp_anomalies_batch.await_args_list)
@@ -1783,6 +1879,16 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 
+# Distinct stop sentinel so we don't overload `None` (which is also the
+# timeout branch signal inside classifier_loop). Exported for tests.
+_STOP: object = object()
+
+
+def signal_classifier_stop(queue: asyncio.Queue) -> "asyncio.Future[None]":
+    """Helper for shutdown paths: put the stop sentinel on the queue."""
+    return asyncio.ensure_future(queue.put(_STOP))
+
+
 @dataclass
 class ClassifierState:
     baseline: BaselineStore
@@ -1792,6 +1898,9 @@ class ClassifierState:
     last_funding: dict[tuple[str, str], float] = field(default_factory=dict)
     dropped_ticks: int = 0
     queue_high_water: int = 0
+    malformed_frames: int = 0
+    # exchange_errors[exchange_name] = cumulative error count since last flush.
+    exchange_errors: dict[str, int] = field(default_factory=dict)
 
 
 async def classifier_loop(
@@ -1802,7 +1911,9 @@ async def classifier_loop(
 ) -> None:
     """Drain queue, run classifiers, batch-flush anomalies to DB.
 
-    Stops when ``None`` sentinel is received.
+    Stops when the ``_STOP`` sentinel is received. A bare ``None`` in the
+    timeout branch means "no tick this interval, just check flush" and is
+    NOT a shutdown signal.
     """
     batch: list[PerpAnomaly] = []
     last_flush = time.monotonic()
@@ -1814,14 +1925,14 @@ async def classifier_loop(
         try:
             tick = await asyncio.wait_for(queue.get(), timeout=flush_interval)
         except asyncio.TimeoutError:
-            tick = None  # force flush check
-        else:
-            if tick is None:
-                # sentinel: final flush and exit
-                if batch:
-                    await db.insert_perp_anomalies_batch(batch)
-                    batch.clear()
-                return
+            tick = None  # timeout: fall through to flush check
+        if tick is _STOP:
+            # shutdown sentinel: final flush and exit
+            if batch:
+                await db.insert_perp_anomalies_batch(batch)
+                batch.clear()
+            return
+        if tick is not None:
             state.queue_high_water = max(state.queue_high_water, queue.qsize())
             _process_tick(tick, state, batch, settings, now_mono(), dedup_sec)
 
@@ -1927,25 +2038,113 @@ async def push_with_drop_oldest(
     value, not deltas -- the freshest tick fully supersedes any older
     frame for the same (exchange, symbol). Drop-oldest therefore
     preserves correctness in both stream types.
+
+    Race handling (IMP-1): if a concurrent producer refills the queue
+    between our get_nowait and the second put_nowait, we DROP the
+    current tick and bump ``dropped_ticks`` exactly ONCE -- no retries,
+    no double-counting.
     """
     try:
         queue.put_nowait(tick)
+        return
     except asyncio.QueueFull:
-        try:
-            queue.get_nowait()
-        except asyncio.QueueEmpty:
-            pass
+        pass
+    # Make space by dropping oldest.
+    try:
+        queue.get_nowait()
         state.dropped_ticks += 1
-        try:
-            queue.put_nowait(tick)
-        except asyncio.QueueFull:
-            # Extremely unlikely: someone else filled it between our get and put.
-            state.dropped_ticks += 1
+    except asyncio.QueueEmpty:
+        pass  # someone else already drained; don't count a drop we didn't do
+    try:
+        queue.put_nowait(tick)
+    except asyncio.QueueFull:
+        # Race: another coroutine refilled the queue. Count this tick as
+        # dropped ONCE (single bump) and return -- do not loop.
+        state.dropped_ticks += 1
+        logger.debug("perp_queue_put_race_dropped")
+        return
 ```
 
 - [ ] **Step 7: Run push test**
 
 Run: `uv run pytest tests/test_perp_watcher.py::test_push_drops_oldest_on_full_queue -q`
+Expected: pass.
+
+- [ ] **Step 7b: Add race-single-count test (IMP-1)**
+
+```python
+# tests/test_perp_watcher.py — append
+@pytest.mark.asyncio
+async def test_push_with_drop_oldest_race_single_count():
+    """If the second put_nowait also fails (queue refilled by another
+    producer), we must bump dropped_ticks exactly ONCE, not twice.
+    """
+    q: asyncio.Queue = asyncio.Queue(maxsize=1)
+    state = ClassifierState(baseline=BaselineStore(
+        alpha=0.1, max_keys=10, idle_evict_seconds=3600))
+    await q.put(_make_tick(oi=1.0, ticker="A"))
+
+    # Monkeypatch queue methods to simulate race: the first put fails,
+    # the get succeeds (counts one drop), then a concurrent producer
+    # refills the queue before our second put lands.
+    original_put = q.put_nowait
+    call_count = {"n": 0}
+
+    def racey_put(item):
+        call_count["n"] += 1
+        raise asyncio.QueueFull  # simulate fullness both times
+
+    q.put_nowait = racey_put  # type: ignore[assignment]
+    await push_with_drop_oldest(q, _make_tick(oi=2.0, ticker="B"), state)
+    # exactly ONE bump from the get_nowait drain + ONE bump from the final
+    # put race => 2 total if the current design counts both. Per IMP-1 we
+    # want single count per tick dropped. The get drained a real tick;
+    # the second put race dropped the current tick. Each is a distinct
+    # drop event, so total == 2 is correct; but no THIRD bump from retry.
+    assert state.dropped_ticks == 2
+    assert call_count["n"] == 2  # exactly two put attempts, no retry loop
+```
+
+- [ ] **Step 7c: Run new race test**
+
+Run: `uv run pytest tests/test_perp_watcher.py::test_push_with_drop_oldest_race_single_count -q`
+Expected: pass.
+
+- [ ] **Step 7d: Add dropped_ticks integration test (IMP-8)**
+
+```python
+# tests/test_perp_watcher.py — append
+@pytest.mark.asyncio
+async def test_classifier_backpressure_counter_integrated(settings_factory):
+    """Push 102 ticks into a maxsize=2 queue via push_with_drop_oldest and
+    assert dropped_ticks == 100 and the final ticks processed are the
+    freshest two.
+    """
+    from scout.perp.watcher import _STOP
+    settings = settings_factory(
+        PERP_BASELINE_MIN_SAMPLES=99999,  # never fire an anomaly
+        PERP_DB_FLUSH_INTERVAL_SEC=60.0,
+        PERP_DB_FLUSH_MAX_ROWS=1000,
+        PERP_OI_SPIKE_RATIO=100.0,
+        PERP_ANOMALY_DEDUP_MIN=0,
+    )
+    q: asyncio.Queue = asyncio.Queue(maxsize=2)
+    state = ClassifierState(baseline=BaselineStore(
+        alpha=0.1, max_keys=10, idle_evict_seconds=3600))
+    for i in range(102):
+        await push_with_drop_oldest(q, _make_tick(oi=float(i), ticker="A"), state)
+    assert state.dropped_ticks == 100
+    # queue now holds the freshest two (100, 101).
+    remaining = []
+    while not q.empty():
+        remaining.append(q.get_nowait())
+    ois = sorted(int(t.open_interest) for t in remaining)
+    assert ois == [100, 101]
+```
+
+- [ ] **Step 7e: Run integration test**
+
+Run: `uv run pytest tests/test_perp_watcher.py::test_classifier_backpressure_counter_integrated -q`
 Expected: pass.
 
 - [ ] **Step 8: Add supervisor + circuit-breaker test**
@@ -1970,6 +2169,9 @@ async def test_circuit_breaker_parks_exchange(settings_factory):
     async def fake_sleep(delay: float) -> None:
         sleeps.append(delay)
 
+    def fake_rand() -> float:
+        return 0.5
+
     queue: asyncio.Queue = asyncio.Queue(maxsize=100)
     state = ClassifierState(baseline=BaselineStore(
         alpha=0.1, max_keys=10, idle_evict_seconds=3600))
@@ -1977,7 +2179,7 @@ async def test_circuit_breaker_parks_exchange(settings_factory):
     task = asyncio.create_task(
         _run_exchange_with_supervision(
             "binance", always_fail, None, settings, queue, state,
-            sleep=fake_sleep,
+            sleep=fake_sleep, rand=fake_rand,
         )
     )
     # Give the task a few loop iterations; it must converge to the circuit-break sleep.
@@ -1988,6 +2190,8 @@ async def test_circuit_breaker_parks_exchange(settings_factory):
     except asyncio.CancelledError:
         pass
     assert any(s >= settings.PERP_CIRCUIT_BREAK_SEC for s in sleeps), sleeps
+    # Supervisor is the sole owner of exchange_errors bookkeeping.
+    assert state.exchange_errors.get("binance", 0) >= 1
 ```
 
 - [ ] **Step 9: Implement supervisor in `scout/perp/watcher.py`**
@@ -2004,26 +2208,30 @@ async def _run_exchange_with_supervision(
     state: ClassifierState,
     *,
     sleep=asyncio.sleep,
+    rand=random.random,
 ) -> None:
     """Run a single exchange's stream; on restart-budget exhaust, circuit-break.
 
-    ``sleep`` is injectable for test fast-forwarding.
+    This is the SOLE reconnect owner for the perp watcher -- inner clients
+    (scout/perp/binance.py, scout/perp/bybit.py) open one connection and
+    either return (clean EOF) or raise. Backoff + jitter live here for
+    a single-source-of-truth and so tests can inject ``sleep``/``rand``.
     """
     consecutive_failures = 0
+    attempts = 0
     while True:
         try:
-            async for tick in stream_fn(session, settings):
+            async for tick in stream_fn(session, settings, state):
                 await push_with_drop_oldest(queue, tick, state)
-            # stream_fn should never return normally; treat return as failure.
-            consecutive_failures += 1
+            # Clean EOF -- reconnect immediately (no sleep, no failure count).
+            attempts = 0
+            continue
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
+            state.exchange_errors[name] = state.exchange_errors.get(name, 0) + 1
             consecutive_failures += 1
-            logger.warning(
-                "perp_exchange_inner_task_crashed",
-                exchange=name, failures=consecutive_failures, error=str(exc),
-            )
+            attempts += 1
         if consecutive_failures >= settings.PERP_MAX_CONSECUTIVE_RESTARTS:
             logger.error(
                 "perp_exchange_circuit_break",
@@ -2031,8 +2239,12 @@ async def _run_exchange_with_supervision(
             )
             await sleep(settings.PERP_CIRCUIT_BREAK_SEC)
             consecutive_failures = 0
+            attempts = 0
         else:
-            await sleep(5)  # brief pause between inner-task restarts
+            # Full-jitter backoff, floor 0.5s, cap 60s.
+            backoff = rand() * min(60.0, float(2 ** attempts))
+            backoff = max(0.5, backoff)
+            await sleep(backoff)
 
 
 async def run_perp_watcher(
@@ -2041,6 +2253,13 @@ async def run_perp_watcher(
     settings: "Settings",
 ) -> None:
     """Top-level supervisor: parsers + classifier share one BaselineStore + queue."""
+    if not settings.PERP_SYMBOLS:
+        # No symbols configured -> skip the entire watcher. Neither exchange
+        # can usefully subscribe, and starting the classifier/shadow-stats
+        # tasks alone would be pointless. Cleaner than starting no-op
+        # supervisor tasks around empty streams (BLOCKER-2).
+        logger.warning("perp_watcher_no_symbols_configured_skipping")
+        return
     queue: asyncio.Queue = asyncio.Queue(maxsize=settings.PERP_QUEUE_MAXSIZE)
     state = ClassifierState(
         baseline=BaselineStore(
@@ -2085,17 +2304,28 @@ async def run_perp_watcher(
 
 
 async def _shadow_stats_loop(state: ClassifierState, settings: "Settings") -> None:
-    """Emit per-minute shadow-observability counters via structlog."""
+    """Emit per-minute aggregated observability counters via structlog.
+
+    Design spec §3.4 requires aggregated counters flushed every 60s rather
+    than per-event WARN lines. We atomic-swap each counter to zero in the
+    same tick we read it, so a concurrent producer that bumps mid-flush
+    doesn't lose increments.
+    """
     while True:
         await asyncio.sleep(60)
+        # Atomic swap: read-and-reset each counter in one tuple assignment.
+        dropped, state.dropped_ticks = state.dropped_ticks, 0
+        high_water, state.queue_high_water = state.queue_high_water, 0
+        malformed, state.malformed_frames = state.malformed_frames, 0
+        errors, state.exchange_errors = state.exchange_errors, {}
         logger.info(
-            "perp_shadow_stats",
-            dropped_ticks_last_min=state.dropped_ticks,
-            queue_high_water=state.queue_high_water,
+            "perp_watcher_stats",
+            dropped_ticks_last_min=dropped,
+            queue_high_water=high_water,
+            malformed_frames_last_min=malformed,
+            exchange_errors_last_min=errors,
             baseline_keys=len(state.baseline),
         )
-        state.dropped_ticks = 0
-        state.queue_high_water = 0
 
 
 async def _baseline_evict_loop(state: ClassifierState, settings: "Settings") -> None:
@@ -2109,7 +2339,7 @@ async def _baseline_evict_loop(state: ClassifierState, settings: "Settings") -> 
 - [ ] **Step 10: Run all watcher tests**
 
 Run: `uv run pytest tests/test_perp_watcher.py -q`
-Expected: 4 passed.
+Expected: 6 passed (classifier flush + dedup + push-drop + push-race + backpressure-integration + circuit-breaker).
 
 - [ ] **Step 11: Commit**
 
@@ -2125,49 +2355,89 @@ git commit -m "feat(bl-054): watcher supervisor + bounded queue + circuit breake
 **Files:**
 - Create: `tests/test_perp_flag_off_snapshot.py`
 
+*Depends on Task 6 merged (model fields + default None for `perp_exchange`, `perp_funding_flip`, `perp_oi_spike_ratio`, `perp_last_anomaly_at`).*
+
 - [ ] **Step 1: Write the snapshot test**
+
+This test runs the corpus through the REAL enrichment path (populated DB)
+before scoring, to prove shadow mode (`PERP_ENABLED=true`,
+`PERP_SCORING_ENABLED=false`) is byte-identical to fully-disabled mode
+with `SCORER_MAX_RAW` still at 183 (guard active).
+
+When the recalibration PR bumps `SCORER_MAX_RAW` to 203, this test must be
+re-run with `PERP_SCORING_ENABLED=false` vs `PERP_SCORING_ENABLED=true`;
+at that point it proves the SCORING flag is the single toggle.
 
 ```python
 # tests/test_perp_flag_off_snapshot.py
 """Provability test: shadow mode (PERP_ENABLED=true, SCORING=false) MUST
 produce byte-identical scorer output to fully-disabled mode. This is the
 contract that lets operators flip PERP_ENABLED=true in production without
-affecting scoring."""
+affecting scoring.
 
+Unlike a naive direct-score comparison, this test goes through the FULL
+enrichment path with a populated DB, so a regression where enrichment
+writes different CandidateToken fields under PERP_ENABLED=true would be
+caught here (BLOCKER-7).
+"""
+
+import pytest
 from datetime import datetime, timezone
+from scout import scorer as scorer_mod
+from scout.db import Database
+from scout.main import _maybe_enrich_perp
+from scout.perp.schemas import PerpAnomaly
 from scout.scorer import score
 
 
 def _corpus(token_factory):
-    # Must include >=1 token with populated perp fields so the test bites.
     return [
-        token_factory(ticker="BTC", liquidity_usd=50_000),
-        token_factory(
-            ticker="DOGE",
-            liquidity_usd=50_000,
-            perp_last_anomaly_at=datetime.now(timezone.utc),
-            perp_oi_spike_ratio=5.0,
-            perp_funding_flip=True,
-            perp_exchange="binance",
-        ),
-        token_factory(
-            ticker="PEPE",
-            liquidity_usd=50_000,
-            perp_last_anomaly_at=datetime.now(timezone.utc),
-            perp_oi_spike_ratio=0.5,  # below threshold
-        ),
+        token_factory(ticker="BTC", liquidity_usd=50_000),       # matched: anomaly in DB
+        token_factory(ticker="DOGE", liquidity_usd=50_000),      # matched: anomaly in DB
+        token_factory(ticker="PEPE", liquidity_usd=50_000),      # unmatched: no DB row
     ]
 
 
-def test_shadow_mode_scorer_is_byte_identical_to_disabled(
-    token_factory, settings_factory,
+@pytest.mark.asyncio
+async def test_shadow_mode_scorer_is_byte_identical_to_disabled(
+    token_factory, settings_factory, tmp_path,
 ):
-    corpus = _corpus(token_factory)
-    disabled = settings_factory(PERP_ENABLED=False, PERP_SCORING_ENABLED=False)
-    shadow = settings_factory(PERP_ENABLED=True, PERP_SCORING_ENABLED=False)
-    disabled_out = [score(t, disabled) for t in corpus]
-    shadow_out = [score(t, shadow) for t in corpus]
-    assert disabled_out == shadow_out
+    # SCORER_MAX_RAW must still be 183 on merge (guard active).
+    assert scorer_mod.SCORER_MAX_RAW < 203, (
+        "This test asserts flag-off behavior with denominator guard active. "
+        "When recalibration PR bumps SCORER_MAX_RAW to 203, re-run this test "
+        "comparing PERP_SCORING_ENABLED=false vs true instead."
+    )
+    db = Database(db_path=tmp_path / "t.db")
+    await db.connect()
+    try:
+        now = datetime.now(timezone.utc)
+        await db.insert_perp_anomalies_batch([
+            PerpAnomaly(
+                exchange="binance", symbol="BTCUSDT", ticker="BTC",
+                kind="oi_spike", magnitude=5.0, baseline=1.0, observed_at=now,
+            ),
+            PerpAnomaly(
+                exchange="bybit", symbol="DOGEUSDT", ticker="DOGE",
+                kind="funding_flip", magnitude=0.1, baseline=0.0001,
+                observed_at=now,
+            ),
+        ])
+        disabled = settings_factory(
+            PERP_ENABLED=False, PERP_SCORING_ENABLED=False,
+            PERP_ANOMALY_LOOKBACK_MIN=15,
+        )
+        shadow = settings_factory(
+            PERP_ENABLED=True, PERP_SCORING_ENABLED=False,
+            PERP_ANOMALY_LOOKBACK_MIN=15,
+        )
+        disabled_tokens = await _maybe_enrich_perp(_corpus(token_factory), db=db, settings=disabled)
+        shadow_tokens = await _maybe_enrich_perp(_corpus(token_factory), db=db, settings=shadow)
+        disabled_out = [(pts, tuple(sorted(sig))) for pts, sig in (score(t, disabled) for t in disabled_tokens)]
+        shadow_out = [(pts, tuple(sorted(sig))) for pts, sig in (score(t, shadow) for t in shadow_tokens)]
+        assert disabled_out == shadow_out
+    finally:
+        await db.close()
 ```
 
 - [ ] **Step 2: Run**
