@@ -1,6 +1,6 @@
 """Pydantic models for perp WebSocket ticks and anomaly events."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, field_validator
@@ -35,6 +35,13 @@ class PerpTick(BaseModel):
             raise ValueError(f"symbol {v!r} length {len(v)} out of bounds (max 32)")
         return v
 
+    @field_validator("timestamp")
+    @classmethod
+    def _timestamp_tz_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("timestamp must be timezone-aware")
+        return v
+
 
 class PerpAnomaly(BaseModel):
     exchange: Exchange
@@ -44,3 +51,10 @@ class PerpAnomaly(BaseModel):
     magnitude: float
     baseline: float | None = None
     observed_at: datetime
+
+    @field_validator("observed_at")
+    @classmethod
+    def _observed_at_tz_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("observed_at must be timezone-aware")
+        return v

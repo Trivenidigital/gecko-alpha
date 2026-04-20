@@ -1520,7 +1520,12 @@ class Database:
         await self._conn.commit()
 
     async def insert_perp_anomalies_batch(self, rows: list["PerpAnomaly"]) -> int:
-        """Primary write path. Single transaction, returns row count.
+        """Primary write path. Single transaction via executemany.
+
+        Returns the count of input rows, NOT the count of rows actually written
+        (INSERT OR IGNORE silently de-dupes against the UNIQUE constraint, so
+        some input rows may be skipped). Callers that need exact write counts
+        should query the table afterwards.
 
         Uses INSERT OR IGNORE against the UNIQUE constraint on
         (exchange, symbol, kind, observed_at) so replays after a WS reconnect
