@@ -164,9 +164,13 @@ async def test_circuit_breaker_parks_exchange(settings_factory):
         yield  # pragma: no cover
 
     sleeps: list[float] = []
+    task_ref: list[asyncio.Task] = []
 
     async def fake_sleep(delay: float) -> None:
         sleeps.append(delay)
+        if delay >= settings.PERP_CIRCUIT_BREAK_SEC and task_ref:
+            task_ref[0].cancel()
+        await asyncio.sleep(0)  # yield so cancellation can propagate
 
     def fake_rand() -> float:
         return 0.5
@@ -187,8 +191,7 @@ async def test_circuit_breaker_parks_exchange(settings_factory):
             rand=fake_rand,
         )
     )
-    await asyncio.sleep(0.01)
-    task.cancel()
+    task_ref.append(task)
     try:
         await task
     except asyncio.CancelledError:

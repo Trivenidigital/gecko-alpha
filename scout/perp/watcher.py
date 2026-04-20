@@ -191,6 +191,7 @@ async def _run_exchange_with_supervision(
         try:
             async for tick in stream_fn(session, settings, state):
                 await push_with_drop_oldest(queue, tick, state)
+            consecutive_failures = 0
             attempts = 0
             continue
         except asyncio.CancelledError:
