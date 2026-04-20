@@ -111,11 +111,11 @@ class PerpAnomaly(BaseModel):
 ```
 
 **Ticker-normalization rules** (MUST be test-covered in `tests/perp/test_normalize.py`):
-- Strip `USDT` / `USD` / `BUSD` / `-PERP` suffix (case-sensitive).
+- Strip `USDT` / `USDC` / `USD` / `BUSD` / `-PERP` suffix (case-sensitive). Linear (`USDT`/`USDC`) and inverse (`USD`) perps both collapse to the base asset — enrichment is a ticker match, and the base asset is what matters. Inverse perps have distinct funding mechanics, but for candidate-token enrichment the base-asset collapse is the correct decision.
 - Strip leading `1000` (Binance convention for `1000PEPEUSDT` etc.) and remember the multiplier is NOT applied to the ticker — it's a display-only cosmetic.
 - Upper-case.
 - If the normalized result fails `_TICKER_RE`, drop the tick (log + counter increment, do NOT raise).
-- Fixture-driven table test: at least `BTCUSDT → BTC`, `1000PEPEUSDT → PEPE`, `DOGEUSD → DOGE`, `ETH-PERP → ETH`, malformed input → dropped.
+- Fixture-driven table test: at least `BTCUSDT → BTC`, `BTCUSDC → BTC`, `1000PEPEUSDT → PEPE`, `DOGEUSD → DOGE` (inverse collapse), `ETH-PERP → ETH`, malformed input (`"../etc"`, `"SPACE SYM"`, 33-char string) → dropped.
 
 ### 3.2 `scout/perp/baseline.py`
 
@@ -187,7 +187,7 @@ Each client handles:
 - Connection + subscribe handshake
 - JSON parse + validate (malformed frames drop with a rate-limited warning — see "Log-volume contract" below)
 - **Ping format is exchange-specific.** Binance: the server sends ping frames; we MUST reply with pong — no outbound ping needed. Bybit: client MUST send JSON `{"op":"ping"}` every 20s and verify `{"op":"pong"}` echo. These are NOT a shared helper; each client owns its own keepalive.
-- Reconnect with **full-jitter exponential backoff**: `delay = random.uniform(0, min(60, 2**attempt))`. This prevents lockstep reconnect storms between the two exchanges after a shared network blip. Unlimited retries are bounded by the supervisor's `PERP_MAX_CONSECUTIVE_RESTARTS` budget (see §3.5).
+- Reconnect with **full-jitter exponential backoff with floor**: `delay = random.uniform(0.5, min(60, 2**attempt))`. This prevents lockstep reconnect storms between the two exchanges after a shared network blip; the 0.5s floor prevents a sub-ms reconnect from hammering a momentarily-recovering gateway. Unlimited retries are bounded by the supervisor's `PERP_MAX_CONSECUTIVE_RESTARTS` budget (see §3.5).
 - Yield normalized `PerpTick` objects. Raw message errors are logged + dropped; never raise.
 
 **Log-volume contract.** Reconnect-log storms and malformed-frame bursts are real risks. Each client maintains a per-event-class counter flushed every 60 s via structlog: `"perp_client: dropped N frames in last 60s"`, `"perp_client: reconnected N times in last 60s"`. Individual events below the aggregation threshold are NOT logged. This matches the existing heartbeat convention.
@@ -209,7 +209,7 @@ async def run_perp_watcher(session, db, settings) -> None:
 **Backpressure contract (required).** `!markPrice@arr@1s` ships the entire Binance perp universe (~400 symbols) every second. Without backpressure, a classifier slowdown would pile ticks into unbounded parser buffers until the exchange force-closes the connection.
 
 - A single `asyncio.Queue(maxsize=PERP_QUEUE_MAXSIZE)` (default 2048) sits between parser and classifier.
-- Parser uses `queue.put_nowait()` with a drop-oldest policy on `QueueFull`: pop one and retry-put; increment a `dropped_ticks` counter. This is the right call because mark-price ticks are replacement-latest, not cumulative — dropping the oldest preserves the freshest state.
+- Parser uses `queue.put_nowait()` with a drop-oldest policy on `QueueFull`: pop one and retry-put; increment a `dropped_ticks` counter. Drop-oldest is correct for BOTH stream types we consume: `!markPrice@arr` frames are replacement-snapshots (newer frame supersedes older for the same symbol), and `@openInterest` frames report the current-value OI (again a snapshot — not a delta). Dropping oldest preserves the freshest baseline/comparison input in both cases; dropping newest would leave the classifier processing stale state while fresh data sits unread. The parser MUST include an inline comment stating "OI and markPrice frames are snapshots of current value, not deltas; drop-oldest is safe."
 - Dropped counter flushed to a structlog aggregate every 60 s along with queue-depth high-water-mark.
 - A classifier coroutine drains continuously; it is the ONLY writer to BaselineStore.
 
@@ -377,11 +377,11 @@ Every public surface gets a corresponding test. Test categories:
 5. **WS client tests** using a hand-rolled async mock (aioresponses does NOT mock WebSockets): subscribe handshake, pings (Binance pong-on-ping, Bybit outbound `{"op":"ping"}`), reconnect-after-close with jitter; max one dedicated slow test marked `@pytest.mark.slow`.
 6. **Watcher integration test**: feed synthetic `PerpTick` stream into classifier pipeline, assert DB row count, cooldown enforcement, batched-write flush behavior (flush-on-interval AND flush-on-batch-size).
 7. **Backpressure test**: push `PERP_QUEUE_MAXSIZE + 100` ticks before the classifier task can consume, assert `dropped_ticks` counter == 100 AND the freshest tick is NOT dropped.
-8. **Circuit-breaker test**: force `PERP_MAX_CONSECUTIVE_RESTARTS + 1` exceptions on one exchange's inner task, assert that exchange parks in circuit-break AND the other exchange continues AND the pipeline's main loop is unaffected AND recovery after `PERP_CIRCUIT_BREAK_SEC` (time-mocked).
+8. **Circuit-breaker test**: force `PERP_MAX_CONSECUTIVE_RESTARTS + 1` exceptions on one exchange's inner task, assert that exchange parks in circuit-break AND the other exchange continues AND the pipeline's main loop is unaffected AND recovery after `PERP_CIRCUIT_BREAK_SEC` (time-mocked). The supervisor MUST read its sleep duration via an injectable clock (default `asyncio.sleep`) so the test can fast-forward without real 3600s waits.
 9. **DB tests**: insert/fetch/prune round-trip, batch insert, index presence, cross-ticker query correctness.
 10. **`main.py` integration tests** mirroring `test_main_cryptopanic_integration.py` shape: enabled path, disabled path, enrichment fields populated, scoring signal fires only when both flags set AND `SCORER_MAX_RAW` bumped (monkeypatch), watcher-task-never-launched-when-disabled.
 11. **Scorer tests**: signal fires on both funding_flip and oi_spike conditions **when monkeypatched `SCORER_MAX_RAW >= 203`**; does NOT fire when `PERP_SCORING_ENABLED=false`; does NOT fire when `_PERP_SCORING_DENOMINATOR_READY=False`; does NOT fire when `perp_last_anomaly_at` is None; fires correctly under co-occurrence counting.
-12. **Flag-off provability snapshot** (explicit contract from Section 9 success criteria): fixed candidate-token corpus (fixture), run scorer with `PERP_ENABLED=true, PERP_SCORING_ENABLED=false` vs fully-disabled, assert `(raw_score, signals_fired)` tuple is byte-identical across both runs. This is the test that proves the shadow path cannot contaminate scoring.
+12. **Flag-off provability snapshot** (explicit contract from Section 9 success criteria): fixed candidate-token corpus (fixture) that MUST include ≥ 1 token with `perp_last_anomaly_at` populated and a `perp_oi_spike_ratio` above threshold so the assertion actually bites (an all-None corpus makes the test vacuous). Run scorer with `PERP_ENABLED=true, PERP_SCORING_ENABLED=false` vs fully-disabled, assert `(raw_score, signals_fired)` tuple is byte-identical across both runs. This is the test that proves the shadow path cannot contaminate scoring.
 13. **Regression**: full suite continues to pass. Target: `881 passed, 1 skipped` plus BL-054 additions.
 
 ## 6. Delivery milestones (map to plan tasks)
