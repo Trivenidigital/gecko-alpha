@@ -29,7 +29,10 @@ def test_perp_signal_does_not_fire_when_denominator_not_ready(
     settings = settings_factory(PERP_SCORING_ENABLED=True)
     token = _tagged(token_factory)
     # SCORER_MAX_RAW ships at 183, so denominator-not-ready — signal must NOT fire.
+    # Canary: if a future PR bumps SCORER_MAX_RAW without updating the guard,
+    # this assert fails LOUDLY before we reach the behavioral check.
     assert scorer_mod.SCORER_MAX_RAW < 203
+    assert scorer_mod._PERP_SCORING_DENOMINATOR_READY is False
     points, signals = score(token, settings)
     # Runtime guard: with SCORER_MAX_RAW < 203 we want points contributed by
     # the perp signal to be 0 and "perp_anomaly" NOT in signals_fired.

@@ -162,7 +162,7 @@ def score(
             points += 10
             signals.append("score_velocity")
 
-    # Signal 12 (renumber at BL-053 merge): Perp futures anomaly --
+    # Signal 12 -> rename to 14 at BL-053 merge (label only; points/logic unchanged). Perp futures anomaly --
     # 10 points (GATED: PERP_SCORING_ENABLED + runtime denominator guard).
     # Double-gate: PERP_SCORING_ENABLED + SCORER_MAX_RAW >= 203. The second
     # gate is the runtime guard that prevents the scoring flag from silently
