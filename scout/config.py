@@ -217,6 +217,36 @@ class Settings(BaseSettings):
     FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC: int = 900
     FEEDBACK_CHRONIC_FAILURE_THRESHOLD: int = 3
 
+    # -------- Perp WebSocket Anomaly Detector (BL-054) --------
+    # Research-only, default-off. PERP_ENABLED gates data collection;
+    # PERP_SCORING_ENABLED gates scorer signal separately. Flipping
+    # PERP_SCORING_ENABLED alone does NOT affect scoring -- the scorer
+    # also requires SCORER_MAX_RAW >= 203 (runtime guard in scorer.py),
+    # which ships as 183 in this PR. Full design in
+    # docs/superpowers/specs/2026-04-20-bl054-perp-ws-anomaly-detector-design.md.
+    PERP_ENABLED: bool = False
+    PERP_SCORING_ENABLED: bool = False
+    PERP_BINANCE_ENABLED: bool = True
+    PERP_BYBIT_ENABLED: bool = True
+    PERP_BINANCE_WS_URL: str = "wss://fstream.binance.com/stream"
+    PERP_SYMBOLS: list[str] = []
+    PERP_FUNDING_FLIP_MIN_PCT: float = 0.05
+    PERP_OI_SPIKE_RATIO: float = 3.0
+    PERP_BASELINE_ALPHA: float = 0.1
+    PERP_BASELINE_MIN_SAMPLES: int = 30
+    PERP_BASELINE_MAX_KEYS: int = 1000
+    PERP_BASELINE_IDLE_EVICT_SEC: int = 3600
+    PERP_ANOMALY_LOOKBACK_MIN: int = 15
+    PERP_ANOMALY_DEDUP_MIN: int = 5
+    PERP_ANOMALY_RETENTION_DAYS: int = 7
+    PERP_MAX_CONSECUTIVE_RESTARTS: int = 5
+    PERP_CIRCUIT_BREAK_SEC: int = 3600
+    PERP_WS_PING_INTERVAL_SEC: int = 20
+    PERP_WS_RECONNECT_MAX_SEC: int = 60
+    PERP_QUEUE_MAXSIZE: int = 2048
+    PERP_DB_FLUSH_INTERVAL_SEC: float = 2.0
+    PERP_DB_FLUSH_MAX_ROWS: int = 100
+
     @field_validator("PAPER_SL_PCT")
     @classmethod
     def _validate_paper_sl_pct(cls, v: float) -> float:
@@ -246,6 +276,16 @@ class Settings(BaseSettings):
     def parse_chains(cls, v: str | list[str]) -> list[str]:
         if isinstance(v, str):
             return [c.strip() for c in v.split(",") if c.strip()]
+        return v
+
+    @field_validator("PERP_SYMBOLS", mode="before")
+    @classmethod
+    def parse_perp_symbols(cls, v: str | list[str]) -> list[str]:
+        if isinstance(v, str):
+            v = [s.strip().upper() for s in v.split(",") if s.strip()]
+        if isinstance(v, list) and len(v) > 200:
+            # Binance URL-length + subscription-rate safety (design spec §3.4).
+            raise ValueError("PERP_SYMBOLS exceeds max length 200")
         return v
 
     @field_validator("SECONDWAVE_ALERT_THRESHOLD")
