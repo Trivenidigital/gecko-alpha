@@ -496,61 +496,70 @@ async def run_cycle(
             fetch_cryptopanic_posts(session, settings)
         )
 
-    # Enrich holders (concurrently)
-    enriched = list(
-        await asyncio.gather(
-            *[enrich_holders(token, session, settings) for token in all_candidates]
+    try:
+        # Enrich holders (concurrently)
+        enriched = list(
+            await asyncio.gather(
+                *[enrich_holders(token, session, settings) for token in all_candidates]
+            )
         )
-    )
 
-    # Compute holder_growth_1h from previous snapshots
-    for i, token in enumerate(enriched):
-        if token.holder_count > 0:
-            prev = await db.get_previous_holder_count(token.contract_address)
-            if prev is not None:
-                growth = token.holder_count - prev
-                enriched[i] = token.model_copy(
-                    update={"holder_growth_1h": max(0, growth)}
-                )
-            await db.log_holder_snapshot(token.contract_address, token.holder_count)
-
-    # Compute vol_7d_avg from historical volume snapshots + log current volume
-    for i, token in enumerate(enriched):
-        if token.volume_24h_usd > 0:
-            vol_avg = await db.get_vol_7d_avg(token.contract_address)
-            if vol_avg is not None:
-                enriched[i] = enriched[i].model_copy(update={"vol_7d_avg": vol_avg})
-            await db.log_volume_snapshot(token.contract_address, token.volume_24h_usd)
-
-    # Stage 2.5: Perp enrichment (OI/funding anomalies from perp watcher)
-    enriched = await _maybe_enrich_perp(enriched, db=db, settings=settings)
-
-    # Await CryptoPanic fetch (launched before enrichment) with a 10s cap
-    # so a stalled third-party call cannot extend the cycle indefinitely.
-    if cryptopanic_task is not None:
-        try:
-            cp_posts = await asyncio.wait_for(cryptopanic_task, timeout=10.0)
-        except Exception as e:
-            logger.warning("cryptopanic_fetch_failed", error=str(e))
-            cp_posts = []
-        if cp_posts:
-            # Persist posts (idempotent INSERT OR IGNORE).
-            for post in cp_posts:
-                try:
-                    sentiment = classify_sentiment(
-                        post.votes_positive, post.votes_negative
+        # Compute holder_growth_1h from previous snapshots
+        for i, token in enumerate(enriched):
+            if token.holder_count > 0:
+                prev = await db.get_previous_holder_count(token.contract_address)
+                if prev is not None:
+                    growth = token.holder_count - prev
+                    enriched[i] = token.model_copy(
+                        update={"holder_growth_1h": max(0, growth)}
                     )
-                    is_macro = classify_macro(
-                        post.currencies,
-                        threshold=settings.CRYPTOPANIC_MACRO_MIN_CURRENCIES,
-                    )
-                    await db.insert_cryptopanic_post(
-                        post, is_macro=is_macro, sentiment=sentiment
-                    )
-                except Exception:
-                    logger.exception("cryptopanic_persist_error", post_id=post.post_id)
-            # Tag candidates
-            enriched = enrich_candidates_with_news(enriched, cp_posts, settings)
+                await db.log_holder_snapshot(token.contract_address, token.holder_count)
+
+        # Compute vol_7d_avg from historical volume snapshots + log current volume
+        for i, token in enumerate(enriched):
+            if token.volume_24h_usd > 0:
+                vol_avg = await db.get_vol_7d_avg(token.contract_address)
+                if vol_avg is not None:
+                    enriched[i] = enriched[i].model_copy(update={"vol_7d_avg": vol_avg})
+                await db.log_volume_snapshot(token.contract_address, token.volume_24h_usd)
+
+        # Stage 2.5: Perp enrichment (OI/funding anomalies from perp watcher)
+        enriched = await _maybe_enrich_perp(enriched, db=db, settings=settings)
+
+        # Await CryptoPanic fetch (launched before enrichment) with a 10s cap
+        # so a stalled third-party call cannot extend the cycle indefinitely.
+        if cryptopanic_task is not None:
+            try:
+                cp_posts = await asyncio.wait_for(cryptopanic_task, timeout=10.0)
+            except Exception as e:
+                logger.warning("cryptopanic_fetch_failed", error=str(e))
+                cp_posts = []
+            if cp_posts:
+                # Persist posts (idempotent INSERT OR IGNORE).
+                for post in cp_posts:
+                    try:
+                        sentiment = classify_sentiment(
+                            post.votes_positive, post.votes_negative
+                        )
+                        is_macro = classify_macro(
+                            post.currencies,
+                            threshold=settings.CRYPTOPANIC_MACRO_MIN_CURRENCIES,
+                        )
+                        await db.insert_cryptopanic_post(
+                            post, is_macro=is_macro, sentiment=sentiment
+                        )
+                    except Exception:
+                        logger.exception("cryptopanic_persist_error", post_id=post.post_id)
+                # Tag candidates
+                enriched = enrich_candidates_with_news(enriched, cp_posts, settings)
+    finally:
+        # Guarantee the task is not left pending if any exception in the
+        # enrichment block unwinds run_cycle before wait_for is reached.
+        # On the happy path the task is already .done() and cancel() is a no-op.
+        # Fire-and-forget — do NOT await here; we don't care about the value
+        # at this point and we don't want to block cleanup.
+        if cryptopanic_task is not None and not cryptopanic_task.done():
+            cryptopanic_task.cancel()
 
     # Stage 3: Score
     scored = []

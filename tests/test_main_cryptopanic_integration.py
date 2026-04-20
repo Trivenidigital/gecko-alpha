@@ -307,3 +307,5 @@ async def test_run_cycle_cryptopanic_fetch_hang_does_not_stall_cycle():
 
     db.insert_cryptopanic_post.assert_not_awaited()
     assert stats["tokens_scanned"] == 1
+    # Candidates still flow through despite the CryptoPanic hang.
+    assert db.upsert_candidate.await_count >= 1
