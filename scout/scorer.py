@@ -145,12 +145,20 @@ def score(
         points += 15
         signals.append("cg_trending_rank")
 
-    # Signal 10: Solana chain bonus -- 5 points
+    # Signal 10: Velocity boost (DexScreener top-boosts cumulative) -- 20 points (BL-051)
+    if (
+        token.boost_total_amount is not None
+        and token.boost_total_amount >= settings.MIN_BOOST_TOTAL_AMOUNT
+    ):
+        points += 20
+        signals.append("velocity_boost")
+
+    # Signal 11: Solana chain bonus -- 5 points
     if token.chain == "solana":
         points += 5
         signals.append("solana_bonus")
 
-    # Signal 11: Score velocity bonus -- 10 points
+    # Signal 12: Score velocity bonus -- 10 points
     if historical_scores and len(historical_scores) >= 3:
         recent = list(reversed(historical_scores[:3]))
         if recent[0] < recent[1] < recent[2]:
