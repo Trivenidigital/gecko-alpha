@@ -121,6 +121,63 @@ async def _get_json(
     return None
 
 
+async def fetch_top_boosts(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+) -> list[BoostInfo]:
+    """Fetch the top-boosted tokens from DexScreener's /token-boosts/top/v1.
+
+    Returns a list of BoostInfo sorted by totalAmount descending (as returned
+    by the API). On any upstream failure the module-level cache
+    ``last_raw_top_boosts`` is preserved so callers can use stale data.
+    On success the cache is refreshed.
+    """
+    global last_raw_top_boosts
+
+    raw = await _get_json(session, TOP_BOOSTS_URL)
+    if not isinstance(raw, list):
+        logger.warning("dex_top_boosts_bad_payload", payload_type=type(raw).__name__)
+        return []
+
+    # Refresh the module-level cache only on success
+    last_raw_top_boosts.clear()
+    last_raw_top_boosts.extend(raw)
+
+    results: list[BoostInfo] = []
+    for entry in raw:
+        chain_id = entry.get("chainId", "")
+        address = entry.get("tokenAddress", "")
+        total_amount_raw = entry.get("totalAmount")
+
+        if not chain_id or not address:
+            continue
+
+        if total_amount_raw is None:
+            continue
+
+        try:
+            total_amount = float(total_amount_raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "top_boosts_bad_total_amount",
+                chain=chain_id,
+                address=address,
+                value=total_amount_raw,
+            )
+            continue
+
+        chain = _normalize_chain_id(chain_id)
+        norm_address = _normalize_address(chain, address)
+        results.append(BoostInfo(chain=chain, address=norm_address, total_amount=total_amount))
+
+    logger.info(
+        "dex_top_boosts_fetched",
+        count=len(results),
+        top_amount=results[0].total_amount if results else 0,
+    )
+    return results
+
+
 async def fetch_trending(
     session: aiohttp.ClientSession,
     settings: Settings,
