@@ -24,6 +24,10 @@ def classify_funding_flip(
     almost never exactly 0.0, and treating it as positive keeps the
     classifier's branch logic simple and symmetric.
     """
+    if not math.isfinite(new_rate):
+        return None
+    if prev_rate is not None and not math.isfinite(prev_rate):
+        return None
     if prev_rate is None:
         return None
     if (prev_rate >= 0) == (new_rate >= 0):
@@ -32,8 +36,12 @@ def classify_funding_flip(
     if magnitude < min_magnitude_pct:
         return None
     return PerpAnomaly(
-        exchange=exchange, symbol=symbol, ticker=ticker,
-        kind="funding_flip", magnitude=magnitude, baseline=prev_rate,
+        exchange=exchange,
+        symbol=symbol,
+        ticker=ticker,
+        kind="funding_flip",
+        magnitude=magnitude,
+        baseline=prev_rate,
         observed_at=observed_at,
     )
 
@@ -53,13 +61,19 @@ def classify_oi_spike(
     """Fire when current OI / baseline >= spike_ratio past warmup."""
     if baseline_oi is None or baseline_oi <= 0 or not math.isfinite(baseline_oi):
         return None
+    if not math.isfinite(current_oi):
+        return None
     if sample_count < min_samples:
         return None
     ratio = current_oi / baseline_oi
     if ratio < spike_ratio:
         return None
     return PerpAnomaly(
-        exchange=exchange, symbol=symbol, ticker=ticker,
-        kind="oi_spike", magnitude=ratio, baseline=baseline_oi,
+        exchange=exchange,
+        symbol=symbol,
+        ticker=ticker,
+        kind="oi_spike",
+        magnitude=ratio,
+        baseline=baseline_oi,
         observed_at=observed_at,
     )

@@ -71,8 +71,16 @@ async def classifier_loop(
             tick = None
         if tick is _STOP:
             if batch:
-                await db.insert_perp_anomalies_batch(list(batch))
-                batch.clear()
+                try:
+                    await db.insert_perp_anomalies_batch(list(batch))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "perp_anomaly_flush_failed",
+                        error=repr(exc),
+                        rows=len(batch),
+                    )
+                finally:
+                    batch.clear()
             return
         if tick is not None:
             state.queue_high_water = max(state.queue_high_water, queue.qsize())
@@ -81,9 +89,17 @@ async def classifier_loop(
         if batch and (
             len(batch) >= max_rows or now_mono() - last_flush >= flush_interval
         ):
-            await db.insert_perp_anomalies_batch(list(batch))
-            batch.clear()
-            last_flush = now_mono()
+            try:
+                await db.insert_perp_anomalies_batch(list(batch))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "perp_anomaly_flush_failed",
+                    error=repr(exc),
+                    rows=len(batch),
+                )
+            finally:
+                batch.clear()
+                last_flush = now_mono()
 
 
 def _process_tick(
@@ -191,8 +207,10 @@ async def _run_exchange_with_supervision(
         try:
             async for tick in stream_fn(session, settings, state):
                 await push_with_drop_oldest(queue, tick, state)
+            # Clean EOF -- reconnect after brief sleep (don't tight-loop during exchange restarts).
             consecutive_failures = 0
             attempts = 0
+            await sleep(0.5)
             continue
         except asyncio.CancelledError:
             raise

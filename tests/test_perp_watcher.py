@@ -151,6 +151,32 @@ async def test_classifier_backpressure_counter_integrated(settings_factory):
 
 
 @pytest.mark.asyncio
+async def test_classifier_db_flush_failure_does_not_crash(settings_factory):
+    """DB flush errors must be swallowed; classifier_loop must still return on _STOP."""
+    from scout.perp.watcher import _STOP
+
+    settings = settings_factory(
+        PERP_BASELINE_MIN_SAMPLES=1,
+        PERP_DB_FLUSH_INTERVAL_SEC=60.0,
+        PERP_DB_FLUSH_MAX_ROWS=1000,
+        PERP_OI_SPIKE_RATIO=3.0,
+        PERP_ANOMALY_DEDUP_MIN=0,
+    )
+    queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+    db = AsyncMock()
+    db.insert_perp_anomalies_batch = AsyncMock(side_effect=RuntimeError("db down"))
+    state = ClassifierState(
+        baseline=BaselineStore(alpha=0.5, max_keys=10, idle_evict_seconds=3600)
+    )
+    # Push a spike pair to populate the batch, then stop.
+    await queue.put(_make_tick(oi=1.0))
+    await queue.put(_make_tick(oi=10.0))
+    await queue.put(_STOP)
+    # Must not raise despite db failure on the _STOP flush path.
+    await classifier_loop(queue, state, db, settings)
+
+
+@pytest.mark.asyncio
 async def test_circuit_breaker_parks_exchange(settings_factory):
     from scout.perp.watcher import _run_exchange_with_supervision
 
