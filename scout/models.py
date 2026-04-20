@@ -42,6 +42,12 @@ class CandidateToken(BaseModel):
     vol_7d_avg: float | None = None
     cg_trending_rank: int | None = None
 
+    # Populated by GeckoTerminal trending_pools parser (BL-052).
+    # 1-based rank within the emitting chain's trending_pools list
+    # (position 1 = most-traded). None if the token was not sourced from
+    # GT trending or the rank info was unavailable.
+    gt_trending_rank: int | None = None
+
     # Populated by pipeline stages
     quant_score: int | None = None
     narrative_score: int | None = None
