@@ -59,6 +59,12 @@ class CandidateToken(BaseModel):
     counter_data_completeness: str | None = None
     counter_scored_at: str | None = None  # ISO timestamp string
 
+    # Perp anomaly fields (BL-054)
+    perp_funding_flip: bool | None = None
+    perp_oi_spike_ratio: float | None = None
+    perp_last_anomaly_at: datetime | None = None
+    perp_exchange: str | None = None
+
     @classmethod
     def from_coingecko(cls, raw: dict) -> "CandidateToken":
         """Create a CandidateToken from a CoinGecko /coins/markets response item."""
