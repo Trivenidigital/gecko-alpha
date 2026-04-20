@@ -180,6 +180,21 @@ def score(
         points += 5
         signals.append("solana_bonus")
 
+    # Signal 13: CryptoPanic bullish news (BL-053) -- 10 points, gated.
+    # SCORER_MAX_RAW is NOT bumped in this PR (stays at 198) — the ceiling-clamp
+    # `min(points, 100)` at the end of score() keeps outputs well-formed
+    # while the flag is off. Flipping CRYPTOPANIC_SCORING_ENABLED to True
+    # is an operator-visible distribution shift and should ship with
+    # a recalibration PR (SCORER_MAX_RAW bump + recalibrated tests).
+    if (
+        settings.CRYPTOPANIC_SCORING_ENABLED
+        and token.latest_news_sentiment == "bullish"
+        and (token.news_count_24h or 0) >= 1
+        and not token.macro_news_flag
+    ):
+        points += 10
+        signals.append("cryptopanic_bullish")
+
     # Signal 12: Score velocity bonus -- 10 points
     if historical_scores and len(historical_scores) >= 3:
         recent = list(reversed(historical_scores[:3]))
