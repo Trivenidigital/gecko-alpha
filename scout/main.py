@@ -936,6 +936,20 @@ async def main() -> None:
                         except Exception as e:
                             logger.warning("perp_anomaly_prune_error", error=str(e))
 
+                        # BL-053: prune CryptoPanic posts older than retention cap
+                        if settings.CRYPTOPANIC_ENABLED:
+                            try:
+                                pruned_cp = await db.prune_cryptopanic_posts(
+                                    keep_days=settings.CRYPTOPANIC_RETENTION_DAYS
+                                )
+                                if pruned_cp:
+                                    logger.info(
+                                        "cryptopanic_pruned",
+                                        rows_deleted=pruned_cp,
+                                    )
+                            except Exception:
+                                logger.exception("cryptopanic_prune_failed")
+
                         last_outcome_check = now
 
                     # Daily summary at midnight UTC
