@@ -839,9 +839,7 @@ async def main() -> None:
                                 retention_hours=settings.QUALIFIER_PRUNE_RETENTION_HOURS,
                             )
                             logger.info("qualifier_pruned", rows_deleted=pruned)
-                            _heartbeat_stats[
-                                "qualifier_prune_consecutive_failures"
-                            ] = 0
+                            _heartbeat_stats["qualifier_prune_consecutive_failures"] = 0
                         except Exception:
                             logger.exception(
                                 "qualifier_prune_failed",

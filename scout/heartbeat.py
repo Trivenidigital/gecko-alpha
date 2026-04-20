@@ -73,7 +73,9 @@ def _maybe_emit_heartbeat(settings) -> bool:
         counter_scores_narrative=_heartbeat_stats["counter_scores_narrative"],
         qualifier_transitions=_heartbeat_stats["qualifier_transitions"],
         qualifier_skips=_heartbeat_stats["qualifier_skips"],
-        qualifier_prune_consecutive_failures=_heartbeat_stats["qualifier_prune_consecutive_failures"],
+        qualifier_prune_consecutive_failures=_heartbeat_stats[
+            "qualifier_prune_consecutive_failures"
+        ],
         last_heartbeat_at=_heartbeat_stats["last_heartbeat_at"].isoformat(),
     )
     _heartbeat_stats["last_heartbeat_at"] = now

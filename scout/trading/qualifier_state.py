@@ -131,9 +131,7 @@ async def prune_stale_qualifiers(
     Read-only SELECT COUNT first so a clean table doesn't open a write transaction.
     """
     if retention_hours <= 0:
-        raise ValueError(
-            f"retention_hours must be > 0, got {retention_hours}"
-        )
+        raise ValueError(f"retention_hours must be > 0, got {retention_hours}")
 
     if db._conn is None or db._txn_lock is None:
         raise RuntimeError(

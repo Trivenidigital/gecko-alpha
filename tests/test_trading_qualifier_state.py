@@ -191,7 +191,7 @@ async def test_re_entry_inside_grace_is_not_transition(tmp_path):
 
     row = await _qualifier_row(db, "first_signal", "a")
     assert row["first_qualified_at"] == recent.isoformat()  # preserved
-    assert row["last_qualified_at"] == now.isoformat()       # bumped
+    assert row["last_qualified_at"] == now.isoformat()  # bumped
     await db.close()
 
 
@@ -238,7 +238,9 @@ async def test_re_entry_one_second_past_grace_is_transition(tmp_path):
 import aiosqlite
 
 
-async def test_empty_current_ids_returns_empty_without_transaction(tmp_path, monkeypatch):
+async def test_empty_current_ids_returns_empty_without_transaction(
+    tmp_path, monkeypatch
+):
     db = Database(tmp_path / "t.db")
     await db.initialize()
 
