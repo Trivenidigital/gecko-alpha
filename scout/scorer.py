@@ -31,6 +31,12 @@ from scout.models import CandidateToken
 # Theoretical maximum raw score — update if signal weights change
 SCORER_MAX_RAW = 183
 
+# Runtime guard for Signal 14. See design spec §3.9.
+# The constant and flag BOTH must be true for the signal to fire, preventing
+# silent score inflation if PERP_SCORING_ENABLED is flipped ahead of the
+# recalibration PR that bumps SCORER_MAX_RAW to 203.
+_PERP_SCORING_DENOMINATOR_READY = SCORER_MAX_RAW >= 203
+
 
 def score(
     token: CandidateToken,
@@ -155,6 +161,25 @@ def score(
         if recent[0] < recent[1] < recent[2]:
             points += 10
             signals.append("score_velocity")
+
+    # Signal 12 (renumber at BL-053 merge): Perp futures anomaly --
+    # 10 points (GATED: PERP_SCORING_ENABLED + runtime denominator guard).
+    # Double-gate: PERP_SCORING_ENABLED + SCORER_MAX_RAW >= 203. The second
+    # gate is the runtime guard that prevents the scoring flag from silently
+    # inflating scores before the recalibration PR lands. Tests monkeypatch
+    # both. See design spec docs/superpowers/specs/
+    # 2026-04-20-bl054-perp-ws-anomaly-detector-design.md §3.9.
+    if (
+        settings.PERP_SCORING_ENABLED
+        and _PERP_SCORING_DENOMINATOR_READY
+        and token.perp_last_anomaly_at is not None
+        and (
+            token.perp_funding_flip
+            or (token.perp_oi_spike_ratio or 0) >= settings.PERP_OI_SPIKE_RATIO
+        )
+    ):
+        points += 10
+        signals.append("perp_anomaly")
 
     # Normalize to 0-100 scale
     points = min(100, int(points * 100 / SCORER_MAX_RAW))
