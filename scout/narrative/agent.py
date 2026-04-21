@@ -133,6 +133,7 @@ async def narrative_agent_loop(
                             trading_engine,
                             db,
                             max_mcap_rank=settings.PAPER_MAX_MCAP_RANK,
+                            min_mcap_rank=settings.PAPER_MIN_MCAP_RANK,
                             settings=settings,
                         )
                 except Exception:
@@ -514,6 +515,7 @@ async def narrative_agent_loop(
                                 db,
                                 prediction_models,
                                 min_mcap=settings.PAPER_MIN_MCAP,
+                                max_mcap=settings.PAPER_MAX_MCAP,
                                 settings=settings,
                             )
 

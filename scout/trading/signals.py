@@ -64,11 +64,19 @@ async def trade_volume_spikes(
 
 
 async def trade_gainers(
-    engine, db: Database, min_mcap: float = 5_000_000, *, settings
+    engine,
+    db: Database,
+    min_mcap: float = 5_000_000,
+    max_mcap: float | None = None,
+    *,
+    settings,
 ) -> None:
     """Open paper trades for newly detected top gainers.
 
-    Filter: market_cap >= min_mcap to skip micro-cap junk.
+    Filter: market_cap in [min_mcap, max_mcap] to skip micro-cap junk and
+    majors that rarely pump fast enough to hit PAPER_TP_PCT within the
+    holding window. Signals/alerts for large caps still fire elsewhere —
+    only paper-trade admission is gated.
     Late-pump filter: when PAPER_GAINERS_MAX_24H_PCT > 0, skip tokens whose
     24h change exceeds the threshold. Set the knob to 0 to disable the filter.
     """
@@ -90,6 +98,13 @@ async def trade_gainers(
             for g in new_gainers
             if g["market_cap"] is not None and g["market_cap"] < min_mcap
         )
+        skipped_large_mcap = sum(
+            1
+            for g in new_gainers
+            if max_mcap is not None
+            and g["market_cap"] is not None
+            and g["market_cap"] > max_mcap
+        )
         skipped_late_pump = sum(
             1
             for g in new_gainers
@@ -102,12 +117,16 @@ async def trade_gainers(
             total=len(new_gainers),
             skipped_null_mcap=skipped_null_mcap,
             skipped_low_mcap=skipped_low_mcap,
+            skipped_large_mcap=skipped_large_mcap,
             skipped_late_pump=skipped_late_pump,
             min_mcap=min_mcap,
+            max_mcap=max_mcap,
             max_24h_pct=max_24h,
         )
         for g in new_gainers:
             if (g["market_cap"] or 0) < min_mcap:
+                continue
+            if max_mcap is not None and (g["market_cap"] or 0) > max_mcap:
                 continue
             change_24h = g["price_change_24h"]
             if max_24h > 0:
@@ -149,11 +168,19 @@ async def trade_gainers(
 
 
 async def trade_losers(
-    engine, db: Database, min_mcap: float = 5_000_000, *, settings
+    engine,
+    db: Database,
+    min_mcap: float = 5_000_000,
+    max_mcap: float | None = None,
+    *,
+    settings,
 ) -> None:
     """Open paper trades for newly detected top losers (contrarian play).
 
-    Filter: market_cap >= min_mcap to skip micro-cap junk.
+    Filter: market_cap in [min_mcap, max_mcap] to skip micro-cap junk and
+    majors that rarely snap back fast enough for a contrarian paper trade.
+    Signals/alerts for large caps still fire elsewhere — only paper-trade
+    admission is gated.
     """
     try:
         cursor = await db._conn.execute(
@@ -172,15 +199,26 @@ async def trade_losers(
             for l in new_losers
             if l["market_cap"] is not None and l["market_cap"] < min_mcap
         )
+        skipped_large_mcap = sum(
+            1
+            for l in new_losers
+            if max_mcap is not None
+            and l["market_cap"] is not None
+            and l["market_cap"] > max_mcap
+        )
         logger.info(
             "trade_losers_filtered",
             total=len(new_losers),
             skipped_null_mcap=skipped_null_mcap,
             skipped_low_mcap=skipped_low_mcap,
+            skipped_large_mcap=skipped_large_mcap,
             min_mcap=min_mcap,
+            max_mcap=max_mcap,
         )
         for l in new_losers:
             if (l["market_cap"] or 0) < min_mcap:
+                continue
+            if max_mcap is not None and (l["market_cap"] or 0) > max_mcap:
                 continue
             try:
                 combo_key = build_combo_key(
@@ -228,6 +266,7 @@ async def trade_first_signals(
     db: Database,
     scored_candidates: list,
     min_mcap: float = 5_000_000,
+    max_mcap: float | None = None,
     *,
     settings,
 ) -> None:
@@ -240,11 +279,18 @@ async def trade_first_signals(
 
     Args:
         scored_candidates: list of (CandidateToken, quant_score, signals_fired)
+        max_mcap: optional upper mcap cap — tokens with market_cap_usd above
+            this are skipped from paper-trade admission; signals/alerts are
+            unaffected.
     """
+    skipped_large = 0
     for token, quant_score, signals_fired in scored_candidates:
         if quant_score <= 0 or not signals_fired:
             continue
         if (token.market_cap_usd or 0) < min_mcap:
+            continue
+        if max_mcap is not None and (token.market_cap_usd or 0) > max_mcap:
+            skipped_large += 1
             continue
         # Focus on CoinGecko-listed tokens, skip DEX memecoins
         if token.chain not in ("coingecko",):
@@ -284,16 +330,31 @@ async def trade_first_signals(
             )
         except Exception:
             logger.exception("trading_first_signal_error", token=token.ticker)
+    if skipped_large:
+        logger.info(
+            "trade_first_signals_filtered",
+            skipped_large_mcap=skipped_large,
+            max_mcap=max_mcap,
+        )
 
 
 async def trade_trending(
-    engine, db: Database, max_mcap_rank: int = 1500, *, settings
+    engine,
+    db: Database,
+    max_mcap_rank: int = 1500,
+    min_mcap_rank: int | None = None,
+    *,
+    settings,
 ) -> None:
     """Open paper trades for newly trending tokens.
 
-    Filter: market_cap_rank <= max_mcap_rank. CoinGecko rank is a rough
-    liquidity proxy — rank 1500 corresponds to roughly the last legitimately
-    tradable tokens; anything below tends to be illiquid micro-caps.
+    Filter: market_cap_rank in [min_mcap_rank, max_mcap_rank]. CoinGecko rank
+    is a rough liquidity proxy — rank 1500 corresponds to roughly the last
+    legitimately tradable tokens; anything below tends to be illiquid
+    micro-caps. The min_mcap_rank floor mirrors PAPER_MAX_MCAP for the
+    trending signal, since trending_snapshots stores rank but not mcap:
+    rank ~100 corresponds to roughly $500M mcap, so trending_catch skips
+    majors that rarely pump fast enough to hit PAPER_TP_PCT.
     Tokens without a rank (rank IS NULL) are skipped.
     """
     try:
@@ -312,17 +373,28 @@ async def trade_trending(
             for t in new_trending
             if t["market_cap_rank"] is not None and t["market_cap_rank"] > max_mcap_rank
         )
-        if skipped_null_rank or skipped_low_rank:
+        skipped_major_rank = sum(
+            1
+            for t in new_trending
+            if min_mcap_rank is not None
+            and t["market_cap_rank"] is not None
+            and t["market_cap_rank"] < min_mcap_rank
+        )
+        if skipped_null_rank or skipped_low_rank or skipped_major_rank:
             logger.info(
                 "trade_trending_filtered",
                 total=len(new_trending),
                 skipped_null_rank=skipped_null_rank,
                 skipped_low_rank=skipped_low_rank,
+                skipped_major_rank=skipped_major_rank,
                 max_mcap_rank=max_mcap_rank,
+                min_mcap_rank=min_mcap_rank,
             )
         for t in new_trending:
             rank = t["market_cap_rank"]
             if rank is None or rank > max_mcap_rank:
+                continue
+            if min_mcap_rank is not None and rank < min_mcap_rank:
                 continue
             try:
                 combo_key = build_combo_key(signal_type="trending_catch", signals=None)
@@ -399,6 +471,7 @@ async def trade_predictions(
     db: Database,
     prediction_models: list,
     min_mcap: float = 5_000_000,
+    max_mcap: float | None = None,
     min_fit_score: int = 1,
     *,
     settings,
@@ -406,7 +479,9 @@ async def trade_predictions(
     """Open paper trades for narrative prediction picks.
 
     Filters:
-    - mcap >= min_mcap (skip micro-cap junk)
+    - mcap in [min_mcap, max_mcap] (skip micro-cap junk + majors that rarely
+      pump fast enough to hit PAPER_TP_PCT within the holding window;
+      signals/alerts still fire for large caps)
     - narrative_fit_score > 0 (Claude must have actually scored it)
     - category not in junk blacklist (Zoo-Themed, Trading Bots, etc)
     """
@@ -416,11 +491,19 @@ async def trade_predictions(
         for p in prediction_models
         if not p.is_control and p.market_cap_at_prediction < min_mcap
     )
+    skipped_large_mcap = sum(
+        1
+        for p in prediction_models
+        if not p.is_control
+        and max_mcap is not None
+        and p.market_cap_at_prediction > max_mcap
+    )
     skipped_low_fit = sum(
         1
         for p in prediction_models
         if not p.is_control
         and p.market_cap_at_prediction >= min_mcap
+        and (max_mcap is None or p.market_cap_at_prediction <= max_mcap)
         and (p.narrative_fit_score or 0) < min_fit_score
     )
     skipped_junk = sum(
@@ -428,6 +511,7 @@ async def trade_predictions(
         for p in prediction_models
         if not p.is_control
         and p.market_cap_at_prediction >= min_mcap
+        and (max_mcap is None or p.market_cap_at_prediction <= max_mcap)
         and (p.narrative_fit_score or 0) >= min_fit_score
         and p.category_name
         and p.category_name.lower().strip() in _JUNK_CATEGORIES
@@ -437,9 +521,11 @@ async def trade_predictions(
         total=len(prediction_models),
         skipped_control=skipped_control,
         skipped_low_mcap=skipped_low_mcap,
+        skipped_large_mcap=skipped_large_mcap,
         skipped_low_fit=skipped_low_fit,
         skipped_junk=skipped_junk,
         min_mcap=min_mcap,
+        max_mcap=max_mcap,
         min_fit_score=min_fit_score,
     )
     for pred in prediction_models:
@@ -447,6 +533,9 @@ async def trade_predictions(
             continue
         # Quality gate: skip micro-cap junk
         if pred.market_cap_at_prediction < min_mcap:
+            continue
+        # Quality gate: skip majors (consume slots without producing wins)
+        if max_mcap is not None and pred.market_cap_at_prediction > max_mcap:
             continue
         # Quality gate: Claude must have scored it (fit > 0)
         if (pred.narrative_fit_score or 0) < min_fit_score:
