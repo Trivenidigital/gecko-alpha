@@ -94,13 +94,15 @@ async def _insert_trending(db, coin_id, market_cap_rank):
     await db._conn.commit()
 
 
-async def _seed_price(db, coin_id, price=1.0):
+async def _seed_price(db, coin_id, price=1.0, market_cap=10_000_000):
+    """Seed price_cache. Default mcap ($10M) keeps existing trending tests in-range
+    after the shift from rank-proxy to real-mcap filtering in trade_trending."""
     now = datetime.now(timezone.utc).isoformat()
     await db._conn.execute(
         """INSERT OR REPLACE INTO price_cache
            (coin_id, current_price, price_change_24h, price_change_7d, market_cap, updated_at)
-           VALUES (?, ?, 0, 0, 0, ?)""",
-        (coin_id, price, now),
+           VALUES (?, ?, 0, 0, ?, ?)""",
+        (coin_id, price, market_cap, now),
     )
     await db._conn.commit()
 
@@ -385,18 +387,79 @@ async def test_trade_first_signals_skips_above_max_mcap(db, engine, settings):
     assert await _open_count(db) == 0
 
 
-async def test_trade_trending_skips_below_min_rank(db, engine, settings):
-    """Rank 50 is a major (≈large cap); trending_catch must skip ranks < floor."""
-    await _insert_trending(db, "rank-50-major", market_cap_rank=50)
-    await _seed_price(db, "rank-50-major", price=1.0)
+async def test_trade_trending_skips_above_max_mcap(db, engine, settings):
+    """Major with mcap >500M must not open trending_catch paper trade.
+
+    Uses price_cache.market_cap rather than rank proxy — same gate as the
+    other 4 signal types, for consistency. The ~$5M floor and ~$500M ceiling
+    apply to trending the same way they apply to gainers/losers/predictions.
+    """
+    await _insert_trending(db, "big-cap-trend", market_cap_rank=50)
+    # price_cache.market_cap = 800M (above 500M ceiling)
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT OR REPLACE INTO price_cache
+           (coin_id, current_price, price_change_24h, price_change_7d,
+            market_cap, updated_at)
+           VALUES (?, 1.0, 0, 0, 800000000, ?)""",
+        ("big-cap-trend", now),
+    )
+    await db._conn.commit()
     await trade_trending(
         engine,
         db,
         max_mcap_rank=1500,
-        min_mcap_rank=100,
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
         settings=settings,
     )
     assert await _open_count(db) == 0
+
+
+async def test_trade_trending_skips_below_min_mcap(db, engine, settings):
+    """Trending token with mcap <5M must not open (micro-cap junk floor)."""
+    await _insert_trending(db, "tiny-trend", market_cap_rank=800)
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT OR REPLACE INTO price_cache
+           (coin_id, current_price, price_change_24h, price_change_7d,
+            market_cap, updated_at)
+           VALUES (?, 1.0, 0, 0, 1000000, ?)""",
+        ("tiny-trend", now),
+    )
+    await db._conn.commit()
+    await trade_trending(
+        engine,
+        db,
+        max_mcap_rank=1500,
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0
+
+
+async def test_trade_trending_opens_when_mcap_in_range(db, engine, settings):
+    """Mid-cap trending token (mcap ~50M, rank ~500) must open the trade."""
+    await _insert_trending(db, "mid-trend", market_cap_rank=500)
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT OR REPLACE INTO price_cache
+           (coin_id, current_price, price_change_24h, price_change_7d,
+            market_cap, updated_at)
+           VALUES (?, 1.0, 0, 0, 50000000, ?)""",
+        ("mid-trend", now),
+    )
+    await db._conn.commit()
+    await trade_trending(
+        engine,
+        db,
+        max_mcap_rank=1500,
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 1
 
 
 async def test_trade_predictions_skips_above_max_mcap(db, engine, settings):

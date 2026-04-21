@@ -854,7 +854,6 @@ async def main() -> None:
             min_mcap=settings.PAPER_MIN_MCAP,
             max_mcap=settings.PAPER_MAX_MCAP,
             max_mcap_rank=settings.PAPER_MAX_MCAP_RANK,
-            min_mcap_rank=settings.PAPER_MIN_MCAP_RANK,
         )
 
     shutdown_event = asyncio.Event()
