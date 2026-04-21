@@ -185,6 +185,11 @@ async def fetch_by_volume(
 ) -> list[CandidateToken]:
     """Fetch tokens sorted by volume (catches tokens with activity spike regardless of price change).
 
+    Fetches page 1 + page 2 in parallel (top 500 by volume) and unions the
+    results. This broadens the universe so the gainers tracker (which sorts
+    the combined raw markets by 24h change and takes top 20) can surface
+    mid-cap gainers that fall outside the top 250.
+
     Uses a wider market cap range than fetch_top_movers to catch mid-cap tokens
     like CommonWealth that have high volume but aren't in the micro-cap fringe.
     The upper bound is the LOSERS/GAINERS tracker max (500M) rather than the
@@ -192,28 +197,45 @@ async def fetch_by_volume(
     """
     logger.info("cg_fetch_attempted", endpoint="coins/markets:volume_desc")
 
-    params = {
+    base_params = {
         "vs_currency": "usd",
         "order": "volume_desc",
         "per_page": "250",
-        "page": "1",
         "sparkline": "false",
         "price_change_percentage": "1h,24h,7d",
     }
     if settings.COINGECKO_API_KEY:
-        params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
+        base_params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
 
-    data = await _get_with_backoff(session, f"{CG_BASE}/coins/markets", params)
-    if not data or not isinstance(data, list):
+    data_p1, data_p2 = await asyncio.gather(
+        _get_with_backoff(
+            session, f"{CG_BASE}/coins/markets", {**base_params, "page": "1"}
+        ),
+        _get_with_backoff(
+            session, f"{CG_BASE}/coins/markets", {**base_params, "page": "2"}
+        ),
+        return_exceptions=True,
+    )
+
+    raw_by_id: dict[str, dict] = {}
+    for data in (data_p1, data_p2):
+        if isinstance(data, Exception) or not data or not isinstance(data, list):
+            continue
+        for raw in data:
+            cg_id = raw.get("id", "")
+            if cg_id and cg_id not in raw_by_id:
+                raw_by_id[cg_id] = raw
+
+    if not raw_by_id:
         logger.warning("cg_no_data", endpoint="coins/markets:volume_desc")
         return []
 
     # Store raw response for price cache & losers/gainers tracker
     global last_raw_by_volume
-    last_raw_by_volume = list(data)
+    last_raw_by_volume = list(raw_by_id.values())
 
     tokens: list[CandidateToken] = []
-    for raw in data:
+    for raw in raw_by_id.values():
         token = CandidateToken.from_coingecko(raw)
         # Use wider cap range: keep anything with mcap > MIN_MARKET_CAP
         # (upper bound filtering is done at scoring/gate stage)
@@ -228,6 +250,6 @@ async def fetch_by_volume(
         "cg_volume_scan_returned",
         count=len(tokens),
         source="coins/markets:volume_desc",
-        raw_fetched=len(data),
+        raw_fetched=len(raw_by_id),
     )
     return tokens
