@@ -194,6 +194,72 @@ async def test_fetch_by_volume_filters_below_min_mcap(settings_factory):
 
 
 @pytest.mark.asyncio
+async def test_fetch_by_volume_unions_page1_and_page2(settings_factory):
+    """Page 1 + page 2 results are unioned and deduped.
+
+    Broadens coverage from top-250 to top-500 by volume so mid-cap
+    gainers outside the top-250 (e.g. Arcblock-class tokens) still
+    reach the gainers tracker and scorer.
+    """
+    page1 = [
+        {
+            "id": "p1-token",
+            "symbol": "p1",
+            "name": "Page1Token",
+            "market_cap": 50_000_000,
+            "total_volume": 10_000_000,
+            "price_change_percentage_1h_in_currency": 2.0,
+            "price_change_percentage_24h": 5.0,
+        }
+    ]
+    page2 = [
+        {
+            "id": "p2-token",
+            "symbol": "p2",
+            "name": "Page2Token",
+            "market_cap": 30_000_000,
+            "total_volume": 3_000_000,
+            "price_change_percentage_1h_in_currency": 4.0,
+            "price_change_percentage_24h": 25.0,
+        }
+    ]
+    settings = settings_factory(MIN_MARKET_CAP=1_000_000)
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, payload=page1)
+        mocked.get(MARKETS_PATTERN, payload=page2)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_by_volume(session, settings)
+
+    tickers = {t.ticker for t in tokens}
+    assert tickers == {"p1", "p2"}, f"expected both pages unioned, got {tickers}"
+
+
+@pytest.mark.asyncio
+async def test_fetch_by_volume_page2_failure_still_returns_page1(settings_factory):
+    """If page 2 errors, page 1 results are still returned (graceful degradation)."""
+    page1 = [
+        {
+            "id": "p1-token",
+            "symbol": "p1",
+            "name": "Page1Token",
+            "market_cap": 50_000_000,
+            "total_volume": 10_000_000,
+            "price_change_percentage_1h_in_currency": 2.0,
+            "price_change_percentage_24h": 5.0,
+        }
+    ]
+    settings = settings_factory(MIN_MARKET_CAP=1_000_000)
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, payload=page1)
+        mocked.get(MARKETS_PATTERN, status=500)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_by_volume(session, settings)
+
+    assert len(tokens) == 1
+    assert tokens[0].ticker == "p1"
+
+
+@pytest.mark.asyncio
 async def test_fetch_by_volume_outage_returns_empty(settings_factory):
     """Volume scan returns empty list on API failure."""
     settings = settings_factory()
