@@ -342,27 +342,34 @@ async def trade_trending(
     engine,
     db: Database,
     max_mcap_rank: int = 1500,
-    min_mcap_rank: int | None = None,
+    min_mcap: float = 5_000_000,
+    max_mcap: float | None = None,
     *,
     settings,
 ) -> None:
     """Open paper trades for newly trending tokens.
 
-    Filter: market_cap_rank in [min_mcap_rank, max_mcap_rank]. CoinGecko rank
-    is a rough liquidity proxy — rank 1500 corresponds to roughly the last
-    legitimately tradable tokens; anything below tends to be illiquid
-    micro-caps. The min_mcap_rank floor mirrors PAPER_MAX_MCAP for the
-    trending signal, since trending_snapshots stores rank but not mcap:
-    rank ~100 corresponds to roughly $500M mcap, so trending_catch skips
-    majors that rarely pump fast enough to hit PAPER_TP_PCT.
-    Tokens without a rank (rank IS NULL) are skipped.
+    Two orthogonal gates:
+    - market_cap in [min_mcap, max_mcap] — same floor/ceiling the other
+      paper-trade signals use. Large caps rarely pump fast enough to hit
+      PAPER_TP_PCT; micro-caps are junk. Signals/alerts still fire for
+      out-of-range tokens — only paper-trade admission is gated.
+    - market_cap_rank <= max_mcap_rank — illiquidity defense-in-depth.
+      Tokens below rank ~1500 are typically too thin to trade reliably even
+      when mcap looks fine (e.g. from unlock schedules).
+
+    mcap is read from price_cache (trending_snapshots stores only rank),
+    LEFT JOIN so tokens with no price row surface as NULL mcap and are
+    skipped — we shouldn't open a trade without a fresh reference price.
     """
     try:
         cursor = await db._conn.execute(
-            """SELECT DISTINCT coin_id, symbol, name, market_cap_rank
-               FROM trending_snapshots
-               WHERE datetime(snapshot_at) >= datetime('now', '-5 minutes')
-               AND coin_id NOT IN (
+            """SELECT DISTINCT ts.coin_id, ts.symbol, ts.name, ts.market_cap_rank,
+                               pc.current_price, pc.market_cap
+               FROM trending_snapshots ts
+               LEFT JOIN price_cache pc ON pc.coin_id = ts.coin_id
+               WHERE datetime(ts.snapshot_at) >= datetime('now', '-5 minutes')
+               AND ts.coin_id NOT IN (
                    SELECT token_id FROM paper_trades WHERE signal_type = 'trending_catch' AND status = 'open'
                )"""
         )
@@ -373,28 +380,46 @@ async def trade_trending(
             for t in new_trending
             if t["market_cap_rank"] is not None and t["market_cap_rank"] > max_mcap_rank
         )
-        skipped_major_rank = sum(
+        skipped_null_mcap = sum(1 for t in new_trending if t["market_cap"] is None)
+        skipped_low_mcap = sum(
             1
             for t in new_trending
-            if min_mcap_rank is not None
-            and t["market_cap_rank"] is not None
-            and t["market_cap_rank"] < min_mcap_rank
+            if t["market_cap"] is not None and t["market_cap"] < min_mcap
         )
-        if skipped_null_rank or skipped_low_rank or skipped_major_rank:
+        skipped_large_mcap = sum(
+            1
+            for t in new_trending
+            if max_mcap is not None
+            and t["market_cap"] is not None
+            and t["market_cap"] > max_mcap
+        )
+        if (
+            skipped_null_rank
+            or skipped_low_rank
+            or skipped_null_mcap
+            or skipped_low_mcap
+            or skipped_large_mcap
+        ):
             logger.info(
                 "trade_trending_filtered",
                 total=len(new_trending),
                 skipped_null_rank=skipped_null_rank,
                 skipped_low_rank=skipped_low_rank,
-                skipped_major_rank=skipped_major_rank,
+                skipped_null_mcap=skipped_null_mcap,
+                skipped_low_mcap=skipped_low_mcap,
+                skipped_large_mcap=skipped_large_mcap,
                 max_mcap_rank=max_mcap_rank,
-                min_mcap_rank=min_mcap_rank,
+                min_mcap=min_mcap,
+                max_mcap=max_mcap,
             )
         for t in new_trending:
             rank = t["market_cap_rank"]
             if rank is None or rank > max_mcap_rank:
                 continue
-            if min_mcap_rank is not None and rank < min_mcap_rank:
+            mcap = t["market_cap"]
+            if mcap is None or mcap < min_mcap:
+                continue
+            if max_mcap is not None and mcap > max_mcap:
                 continue
             try:
                 combo_key = build_combo_key(signal_type="trending_catch", signals=None)
@@ -408,12 +433,7 @@ async def trade_trending(
                         signal_type="trending_catch",
                     )
                     continue
-                pc = await db._conn.execute(
-                    "SELECT current_price FROM price_cache WHERE coin_id = ?",
-                    (t["coin_id"],),
-                )
-                price_row = await pc.fetchone()
-                trending_price = price_row[0] if price_row else None
+                trending_price = t["current_price"]
                 await engine.open_trade(
                     token_id=t["coin_id"],
                     symbol=t["symbol"],
