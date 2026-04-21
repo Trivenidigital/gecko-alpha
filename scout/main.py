@@ -423,6 +423,7 @@ async def run_cycle(
                     trading_engine,
                     db,
                     min_mcap=settings.PAPER_MIN_MCAP,
+                    max_mcap=settings.PAPER_MAX_MCAP,
                     settings=settings,
                 )
             except Exception:
@@ -445,6 +446,7 @@ async def run_cycle(
                     trading_engine,
                     db,
                     min_mcap=settings.PAPER_MIN_MCAP,
+                    max_mcap=settings.PAPER_MAX_MCAP,
                     settings=settings,
                 )
             except Exception:
@@ -615,6 +617,7 @@ async def run_cycle(
                 db,
                 scored_for_trading,
                 min_mcap=settings.PAPER_MIN_MCAP,
+                max_mcap=settings.PAPER_MAX_MCAP,
                 settings=settings,
             )
 
@@ -848,6 +851,10 @@ async def main() -> None:
             trailing_drawdown_pct=settings.PAPER_TRAILING_DRAWDOWN_PCT,
             trailing_floor_pct=settings.PAPER_TRAILING_FLOOR_PCT,
             gainers_max_24h_pct=settings.PAPER_GAINERS_MAX_24H_PCT,
+            min_mcap=settings.PAPER_MIN_MCAP,
+            max_mcap=settings.PAPER_MAX_MCAP,
+            max_mcap_rank=settings.PAPER_MAX_MCAP_RANK,
+            min_mcap_rank=settings.PAPER_MIN_MCAP_RANK,
         )
 
     shutdown_event = asyncio.Event()

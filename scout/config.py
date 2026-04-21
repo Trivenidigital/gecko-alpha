@@ -205,7 +205,15 @@ class Settings(BaseSettings):
     PAPER_TP_SELL_PCT: float = 70.0  # sell 70% at TP, keep 30% as long_hold
     PAPER_SLIPPAGE_BPS: int = 50  # 0.5% slippage simulation
     PAPER_MIN_MCAP: float = 5_000_000  # min $5M mcap to paper trade (filters junk)
+    # Upper mcap cap for paper trades. Large caps (BTC, ETH, SOL, AAVE...) rarely
+    # pump fast enough to hit PAPER_TP_PCT within PAPER_MAX_DURATION_HOURS, so
+    # they consume slots without producing wins. Signals/alerts still fire —
+    # this knob only gates the paper-trade entry path.
+    PAPER_MAX_MCAP: float = 500_000_000
     PAPER_MAX_MCAP_RANK: int = 1500  # skip trending coins below rank 1500 (illiquid)
+    # Rank floor mirror of PAPER_MAX_MCAP for trending_catch (trending_snapshots
+    # stores rank only, not mcap). Rank ~100 corresponds to roughly $500M mcap.
+    PAPER_MIN_MCAP_RANK: int = 100
     # Hard cap on concurrent open positions. Prevents restart-bursts and
     # survives env changes to PAPER_MAX_EXPOSURE_USD / PAPER_TRADE_AMOUNT_USD.
     PAPER_MAX_OPEN_TRADES: int = 10
@@ -308,6 +316,24 @@ class Settings(BaseSettings):
     def _validate_paper_tp_pct(cls, v: float) -> float:
         if v < 0:
             raise ValueError("tp_pct must be positive, e.g. 20.0 for 20% take profit")
+        return v
+
+    @field_validator("PAPER_MAX_MCAP")
+    @classmethod
+    def _validate_paper_max_mcap(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(
+                "PAPER_MAX_MCAP must be > 0 (paper-trade large-cap filter)"
+            )
+        return v
+
+    @field_validator("PAPER_MIN_MCAP_RANK")
+    @classmethod
+    def _validate_paper_min_mcap_rank(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(
+                "PAPER_MIN_MCAP_RANK must be >= 1 (rank 1 = highest market cap)"
+            )
         return v
 
     @field_validator("CHAIN_PROMOTION_THRESHOLD", "CHAIN_GRADUATION_HIT_RATE")

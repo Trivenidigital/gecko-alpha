@@ -16,8 +16,10 @@ from scout.config import Settings
 from scout.db import Database
 from scout.trading.engine import TradingEngine
 from scout.trading.signals import (
+    trade_first_signals,
     trade_gainers,
     trade_losers,
+    trade_predictions,
     trade_trending,
 )
 
@@ -325,3 +327,108 @@ async def test_trade_gainers_uses_fresh_snapshot_price_not_earlier_peak(
     # Entry must derive from fresh $1.44 (with default 50bps slippage = $1.4472),
     # NOT from the stale $1.75 peak (which would yield ~$1.75875).
     assert entry < 1.60, f"entry {entry} came from stale snapshot, not fresh"
+
+
+# ---------------- Large-cap (upper bound) paper-trade filter ---------------
+# Majors (BTC, ETH, SOL, AAVE, UNI…) rarely pump fast enough to hit PAPER_TP_PCT
+# within PAPER_MAX_DURATION_HOURS, so they consume slots without producing
+# wins. Paper-trade admission must be gated on an upper cap, but signals/alerts
+# must keep firing for these tokens — that's handled outside signals.py.
+
+
+async def test_trade_gainers_skips_above_max_mcap(db, engine, settings):
+    """>500M mcap must NOT open a paper trade even when above min_mcap floor."""
+    await _insert_gainer(db, "big-cap-gainer", market_cap=750_000_000)
+    await trade_gainers(
+        engine,
+        db,
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0
+
+
+async def test_trade_losers_skips_above_max_mcap(db, engine, settings):
+    """>500M mcap losers are also skipped from contrarian paper trades."""
+    await _insert_loser(db, "big-cap-loser", market_cap=900_000_000)
+    await trade_losers(
+        engine,
+        db,
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0
+
+
+async def test_trade_first_signals_skips_above_max_mcap(db, engine, settings):
+    """CandidateToken with mcap >500M must not open first_signal paper trade."""
+    from scout.models import CandidateToken
+
+    await _seed_price(db, "big-cap-first", price=1.0)
+    token = CandidateToken(
+        contract_address="big-cap-first",
+        chain="coingecko",
+        token_name="BigCapFirst",
+        ticker="BCF",
+        market_cap_usd=700_000_000,
+    )
+    await trade_first_signals(
+        engine,
+        db,
+        [(token, 30, ["cg_trending_rank"])],
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0
+
+
+async def test_trade_trending_skips_below_min_rank(db, engine, settings):
+    """Rank 50 is a major (≈large cap); trending_catch must skip ranks < floor."""
+    await _insert_trending(db, "rank-50-major", market_cap_rank=50)
+    await _seed_price(db, "rank-50-major", price=1.0)
+    await trade_trending(
+        engine,
+        db,
+        max_mcap_rank=1500,
+        min_mcap_rank=100,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0
+
+
+async def test_trade_predictions_skips_above_max_mcap(db, engine, settings):
+    """NarrativePrediction with mcap >500M must not open paper trade."""
+    from datetime import datetime, timezone
+
+    from scout.narrative.models import NarrativePrediction
+
+    await _seed_price(db, "big-cap-pred", price=1.0)
+    pred = NarrativePrediction(
+        category_id="cat",
+        category_name="Layer 1 (L1)",
+        coin_id="big-cap-pred",
+        symbol="BCP",
+        name="BigCapPred",
+        market_cap_at_prediction=800_000_000,
+        price_at_prediction=1.0,
+        narrative_fit_score=80,
+        staying_power="high",
+        confidence="high",
+        reasoning="r",
+        market_regime="bull",
+        trigger_count=3,
+        strategy_snapshot={},
+        predicted_at=datetime.now(timezone.utc),
+    )
+    await trade_predictions(
+        engine,
+        db,
+        prediction_models=[pred],
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0
