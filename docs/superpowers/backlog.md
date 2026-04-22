@@ -8,7 +8,8 @@ so future sessions can pick up context.
 
 ## BL-055 — Live Trading: Execution Core + Binance Spot + Venue Registry
 
-**Status:** Brainstorming (in progress 2026-04-22)
+**Status:** Spec approved 2026-04-22 — ready for implementation plan
+**Spec:** `docs/superpowers/specs/2026-04-22-bl055-live-trading-execution-core-design.md`
 **Depends on:** nothing
 **Blocks:** BL-056, BL-057, BL-058
 
