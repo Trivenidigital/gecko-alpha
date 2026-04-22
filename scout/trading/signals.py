@@ -454,7 +454,7 @@ async def trade_trending(
 
 
 _JUNK_CATEGORIES = {
-    "zoo-themed",
+    "zoo themed",
     "trading bots",
     "arcade games",
     "runes",
@@ -464,26 +464,63 @@ _JUNK_CATEGORIES = {
     "wrapped tokens",
     "lp tokens",
     "memorial themed",
-    "sticker-themed coins",
+    "sticker themed coins",
     "gotchiverse",
-    "drc-20",
+    "drc 20",
     "four.meme ecosystem (bnb memes)",
     "bonk.fun ecosystem",
     "pump.fun creator",
     "pump fund portfolio",
-    "meme-token",
-    "dog-themed",
-    "cat-themed",
-    "frog-themed",
-    "solana-meme-coins",
-    "base-meme-coins",
+    "meme token",
+    "dog themed",
+    "cat themed",
+    "frog themed",
+    "solana meme coins",
+    "base meme coins",
     "pump.fun ecosystem",
-    "bnb-meme-coins",
-    "ethereum-meme-coins",
-    "trx-meme-coins",
-    "avax-meme-coins",
-    "fan-tokens",
+    "bnb meme coins",
+    "ethereum meme coins",
+    "trx meme coins",
+    "avax meme coins",
+    "fan tokens",
+    "stock market themed",
+    "metadao launchpad",
+    "desci meme",
+    "music",
+    "airdropped tokens by nft projects",
+    "trading card rwa platform",
+    "murad picks",
 }
+
+
+def _normalize_category(name: str) -> str:
+    """Lowercase + collapse hyphens/underscores to spaces for blacklist match.
+
+    CoinGecko returns the same category as 'Bridged-Tokens' on some endpoints
+    and 'Bridged Tokens' on others; this normalizes both to 'bridged tokens'."""
+    return name.lower().strip().replace("-", " ").replace("_", " ")
+
+
+# coin_id substrings that identify wrapped/bridged assets. These pump rarely
+# (price tracks the underlying) and consume paper-trade slots.
+_JUNK_COINID_SUBSTRINGS = (
+    "-bridged-",
+    "-wrapped-",
+)
+_JUNK_COINID_PREFIXES = (
+    "bridged-",
+    "wrapped-",
+    "superbridge-",
+)
+
+
+def _is_junk_coinid(coin_id: str) -> bool:
+    if not coin_id:
+        return False
+    cid = coin_id.lower()
+    if cid.startswith(_JUNK_COINID_PREFIXES):
+        return True
+    return any(s in cid for s in _JUNK_COINID_SUBSTRINGS)
 
 
 async def trade_predictions(
@@ -526,7 +563,7 @@ async def trade_predictions(
         and (max_mcap is None or p.market_cap_at_prediction <= max_mcap)
         and (p.narrative_fit_score or 0) < min_fit_score
     )
-    skipped_junk = sum(
+    skipped_junk_category = sum(
         1
         for p in prediction_models
         if not p.is_control
@@ -534,7 +571,20 @@ async def trade_predictions(
         and (max_mcap is None or p.market_cap_at_prediction <= max_mcap)
         and (p.narrative_fit_score or 0) >= min_fit_score
         and p.category_name
-        and p.category_name.lower().strip() in _JUNK_CATEGORIES
+        and _normalize_category(p.category_name) in _JUNK_CATEGORIES
+    )
+    skipped_junk_coinid = sum(
+        1
+        for p in prediction_models
+        if not p.is_control
+        and p.market_cap_at_prediction >= min_mcap
+        and (max_mcap is None or p.market_cap_at_prediction <= max_mcap)
+        and (p.narrative_fit_score or 0) >= min_fit_score
+        and not (
+            p.category_name
+            and _normalize_category(p.category_name) in _JUNK_CATEGORIES
+        )
+        and _is_junk_coinid(p.coin_id)
     )
     logger.info(
         "trade_predictions_filtered",
@@ -543,7 +593,8 @@ async def trade_predictions(
         skipped_low_mcap=skipped_low_mcap,
         skipped_large_mcap=skipped_large_mcap,
         skipped_low_fit=skipped_low_fit,
-        skipped_junk=skipped_junk,
+        skipped_junk_category=skipped_junk_category,
+        skipped_junk_coinid=skipped_junk_coinid,
         min_mcap=min_mcap,
         max_mcap=max_mcap,
         min_fit_score=min_fit_score,
@@ -563,8 +614,11 @@ async def trade_predictions(
         # Quality gate: skip junk categories
         if (
             pred.category_name
-            and pred.category_name.lower().strip() in _JUNK_CATEGORIES
+            and _normalize_category(pred.category_name) in _JUNK_CATEGORIES
         ):
+            continue
+        # Quality gate: skip wrapped/bridged coin_id patterns regardless of category
+        if _is_junk_coinid(pred.coin_id):
             continue
         try:
             combo_key = build_combo_key(

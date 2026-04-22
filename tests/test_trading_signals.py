@@ -495,3 +495,113 @@ async def test_trade_predictions_skips_above_max_mcap(db, engine, settings):
         settings=settings,
     )
     assert await _open_count(db) == 0
+
+
+# ---------------- trade_predictions junk filters ---------------------------
+
+
+def _make_pred(
+    coin_id: str,
+    category_name: str,
+    *,
+    mcap: float = 50_000_000,
+    fit: int = 80,
+):
+    from scout.narrative.models import NarrativePrediction
+
+    return NarrativePrediction(
+        category_id="cat",
+        category_name=category_name,
+        coin_id=coin_id,
+        symbol=coin_id.upper(),
+        name=coin_id,
+        market_cap_at_prediction=mcap,
+        price_at_prediction=1.0,
+        narrative_fit_score=fit,
+        staying_power="high",
+        confidence="high",
+        reasoning="r",
+        market_regime="bull",
+        trigger_count=3,
+        strategy_snapshot={},
+        predicted_at=datetime.now(timezone.utc),
+    )
+
+
+@pytest.mark.parametrize(
+    "category_name",
+    [
+        "Bridged-Tokens",
+        "bridged-tokens",
+        "Bridged Tokens",
+        "Bridged Stablecoin",
+        "Wrapped-Tokens",
+        "Stock market-themed",
+        "MetaDAO Launchpad",
+        "Desci Meme",
+        "Music",
+        "Airdropped Tokens by NFT Projects",
+        "Trading Card RWA Platform",
+        "Murad Picks",
+    ],
+)
+async def test_trade_predictions_skips_junk_category(
+    db, engine, settings, category_name
+):
+    """Junk CoinGecko categories (hyphenated or spaced) must not open trades."""
+    await _seed_price(db, "junk-cat-coin", price=1.0)
+    pred = _make_pred("junk-cat-coin", category_name)
+    await trade_predictions(
+        engine,
+        db,
+        prediction_models=[pred],
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0, (
+        f"Junk category {category_name!r} opened a trade"
+    )
+
+
+@pytest.mark.parametrize(
+    "coin_id",
+    [
+        "bridged-usd-coin-starkgate",
+        "sui-bridged-wbtc-sui",
+        "superbridge-bridged-wsteth-optimism",
+        "wrapped-bitcoin",
+        "arbitrum-bridged-usdc",
+        "optimism-bridged-weth",
+    ],
+)
+async def test_trade_predictions_skips_junk_coinid(db, engine, settings, coin_id):
+    """Wrapped/bridged tokens must be blocked by coin_id pattern regardless of category."""
+    await _seed_price(db, coin_id, price=1.0)
+    pred = _make_pred(coin_id, category_name="Layer 1 (L1)")
+    await trade_predictions(
+        engine,
+        db,
+        prediction_models=[pred],
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0, f"Bridged/wrapped coin_id {coin_id!r} passed"
+
+
+async def test_trade_predictions_allows_legit_coinid_with_bridge_substring(
+    db, engine, settings
+):
+    """Coin IDs that merely contain 'bridge' but aren't bridged/wrapped assets pass."""
+    await _seed_price(db, "bridgelink", price=1.0)
+    pred = _make_pred("bridgelink", category_name="AI")
+    await trade_predictions(
+        engine,
+        db,
+        prediction_models=[pred],
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 1
