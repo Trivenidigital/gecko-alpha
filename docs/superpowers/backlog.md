@@ -174,6 +174,55 @@ Non-goals:
 
 ---
 
+## BL-061 — Propagate category_name to snapshot tables for full PR #44 gate
+
+**Status:** Deferred (split out of BL-059 on 2026-04-22)
+**Depends on:** nothing
+**Blocks:** nothing directly; strengthens filters applied by BL-059
+
+BL-059 could only apply `_is_junk_coinid()` + non-ASCII ticker to the 6
+non-prediction paper-trade paths, because the intermediate snapshot tables
+those paths query (`gainers_snapshots`, `losers_snapshots`, `trending_snapshots`,
+volume-spike source, `first_signals` source, `chain_matches`) carry no
+`category_name` column. Only the `predictions` table has it — which is why
+PR #44's `_normalize_category()` gate works there.
+
+Result: narrative-prediction has a stronger junk filter than the other 6 paper
+paths. Any category-matched junk that doesn't look wrapped/bridged by coin_id
+AND has an ASCII ticker can still leak via volume_spike / gainers / losers /
+first_signal / trending / chain_completed.
+
+Scope:
+- Schema: add `category_name TEXT` column to each of the 6 snapshot/source
+  tables (one migration per table or one combined migration — decided during plan)
+- Ingestion: backfill category_name at write time — category comes from
+  CoinGecko `/coins/markets` response (primary) or from a join against
+  `category_snapshots` (fallback when markets call missed it)
+- Signals: replace the `_is_junk_coinid()` + non-ASCII `ticker` filter in the
+  6 `trade_*` functions with the full `_normalize_category()` + `_is_junk_coinid()`
+  gate that `trade_predictions` uses
+- `CandidateToken.category_name: str | None` field + factory-method population
+  (from_coingecko, from_dexscreener, from_geckoterminal) — DexScreener and
+  GeckoTerminal may not carry category; document the None fallback
+- Tests: ingestion-side tests that category populates correctly per source;
+  signals-side tests that category-matched junk is now filtered on all 6 paths
+
+Non-goals:
+- Retroactively backfilling `category_name` on historical rows (only new writes
+  need to carry it — the filter applies to newly-opened trades)
+- Removing `_is_junk_coinid()` + non-ASCII filter (they catch cases category
+  alone would miss — all three filters should coexist)
+- Category propagation to trade logs / paper_trades rows (not needed for gating;
+  only needed at open-time decision)
+
+**Why deferred:** BL-059 shipped with coin_id + non-ASCII only (closes observed
+leaks: wrapped tokens, Chinese memes). This BL-061 upgrade is "nice to have"
+unless category-matched junk (e.g. "stock market themed", "music", "murad picks")
+starts leaking through the weaker filter. Monitor paper_trades for junk-category
+entries; if they appear, prioritize BL-061.
+
+---
+
 ## Previously shipped (historical)
 
 - **BL-052** — GeckoTerminal per-chain trending (PR #35, merged 2026-04-20)
