@@ -83,6 +83,97 @@ Scope:
 
 ---
 
+## BL-059 — Paper-Trading Quality: Close first_signal Category + Non-ASCII Leak
+
+**Status:** Ready — next to implement (un-deferred 2026-04-22)
+**Depends on:** nothing
+**Blocks:** BL-060 (clean paper input is a prerequisite for live-mirror accuracy)
+
+The `first_signal` pipeline has no category filter — PR #44 added `_JUNK_CATEGORIES`
++ `_is_junk_coinid()` gates to the narrative-prediction path, but `first_signal`
+never touches them. Two Chinese-meme tokens (`我踏马来了`, `币安人生`) slipped
+through 2026-04-22 and bled -$57 combined in open paper positions.
+
+Scope:
+- Route `first_signal` predictions through the same `_normalize_category()` +
+  `_is_junk_coinid()` filters that narrative-prediction already uses
+- Add non-ASCII symbol filter to catch Chinese-meme / cyrillic / other
+  non-Latin token symbols that currently pass every existing gate
+- Backfill-close any open paper trades matching the new filters (preserve
+  closed-trade history for combo_performance training)
+- 19-test parametrized coverage matching PR #44 pattern
+
+Non-goals:
+- Broader symbol-blacklist UI (just code-level filters for v1)
+- Retroactive deletion of historical closed trades (learning data is valuable)
+
+---
+
+## BL-060 — Paper-Mirrors-Live: Score Threshold + `would_be_live` Oracle + Dashboard Numbering
+
+**Status:** Ready — implement after BL-059
+**Depends on:** BL-059 (clean paper input), ideally before BL-055 shadow soak so
+  the soak's `would_be_live` subset is representative
+**Blocks:** nothing directly; feeds BL-055 shadow-soak quality
+
+**Core principle (locked 2026-04-22):** paper-trading must mimic the capital
+constraints of live trading. $2000 capital supports ~20 concurrent positions in
+live. Paper currently runs at 139 concurrent. Without constraint, `combo_performance`
+trains on marginal signals that would never execute live, biasing the learning
+signal toward what-we-can-detect instead of what-we-can-trade.
+
+**Approach — Combined B + C (decided after considering A=hard-cap, B=dual-track,
+C=score-threshold alone):**
+
+- **C (input pool cleanup):** Raise quant-score threshold to target
+  **40-60 concurrent open trades** (down from ~139). Strips bottom-half-by-score
+  signals that never should have entered. Threshold is a .env knob, operator-tunable.
+- **B (live-eligible oracle):** Within the cleaner pool, mark trades at open-time
+  with `would_be_live: bool`. Stamping logic: if currently-open `would_be_live=true`
+  count < 20 → flag true, else false. **FCFS within slots — no dynamic re-ranking,
+  no closing an in-profit slot to chase a higher-score signal** (that would
+  introduce the signal-churn trap we already know hurts). Flag is immutable once
+  set at open.
+
+**Dashboard UX (bundled in same PR):**
+- Number each open paper trade 1-N by **P&L rank** (1 = strongest gainer, current
+  sort order). Renumbering happens on each sort/refresh — not a persistent ID.
+- Visual badge / emoji for `would_be_live=true` rows so operator can eyeball
+  "which 20 we'd actually have traded live."
+- Summary line: "N open (M live-eligible, K beyond-cap)"
+
+**A/B evaluation (the payoff):**
+Once enough closed trades accumulate, compare the two populations:
+- Win-rate, avg P&L, Sharpe of `would_be_live=true` subset
+- Same metrics for `would_be_live=false` subset
+- If the top-20 genuinely outperforms, the constraint is validated and BL-055
+  shadow soak uses `would_be_live=true` rows as its oracle. If not, the score
+  threshold needs re-tuning OR the ranking logic is wrong — either way, we
+  learn it before real money is on the line.
+
+**Why considered and NOT chosen:**
+- **A (hard cap at 20, refuse trade 21+):** throws away learning data. We'd
+  never find out whether signals 21-100 would have been winners. Blunt.
+- **B alone (keep volume, add flag):** doesn't address the garbage-in-garbage-out
+  problem for combo_performance — it still trains on marginal signals.
+- **C alone (raise threshold only):** gives cleaner data but no A/B mechanism
+  to validate that the top-20 actually outperforms the rest. You'd flip to
+  live blind.
+
+Scope:
+- Schema: `paper_trades.would_be_live INTEGER NOT NULL DEFAULT 0 CHECK (would_be_live IN (0,1))`
+- Config: `PAPER_MIN_SCORE_THRESHOLD` (existing knob — retune) + `PAPER_LIVE_ELIGIBLE_CAP` (new, default 20)
+- Logic: `PaperTrader.open_trade()` computes `would_be_live` flag at commit time
+- Dashboard: P&L rank numbering + live-eligible badge in `open_positions` component
+- Metrics surface: rolling win-rate / P&L for each subset (updates in existing weekly digest)
+
+Non-goals:
+- Dynamic re-flagging mid-life (FCFS is the point — mimics live's "don't churn")
+- Variable `PAPER_LIVE_ELIGIBLE_CAP` per signal type (one global cap for v1)
+- Auto-tuning the score threshold (operator picks it based on target volume)
+
+---
+
 ## Previously shipped (historical)
 
 - **BL-052** — GeckoTerminal per-chain trending (PR #35, merged 2026-04-20)
