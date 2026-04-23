@@ -78,11 +78,20 @@ class TradingEngine:
         first_signal:         {"quant_score": int, "signals": list[str]}
     """
 
-    def __init__(self, mode: str, db: Database, settings) -> None:
+    def __init__(
+        self,
+        mode: str,
+        db: Database,
+        settings,
+        *,
+        live_engine=None,
+    ) -> None:
         self.mode = mode
         self.db = db
         self.settings = settings
-        self._paper_trader = PaperTrader()
+        # BL-055: when a LiveEngine is wired in (shadow mode), PaperTrader
+        # fires a fire-and-forget handoff per trade open. See scout/main.py.
+        self._paper_trader = PaperTrader(live_engine=live_engine)
         # Monotonic start marker for the warmup window
         self._started_at = time.monotonic()
 
