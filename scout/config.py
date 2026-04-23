@@ -202,7 +202,7 @@ class Settings(BaseSettings):
     PAPER_TRADE_AMOUNT_USD: float = 1000.0  # per trade (paper)
     PAPER_MAX_EXPOSURE_USD: float = 10000.0  # max total open (paper)
     PAPER_TP_PCT: float = 20.0  # take profit %
-    PAPER_SL_PCT: float = 10.0  # stop loss % (positive: 10.0 = 10%)
+    PAPER_SL_PCT: float = 15.0  # BL-061: widened from 10.0
     PAPER_MAX_DURATION_HOURS: int = 48  # auto-expire
     PAPER_TP_SELL_PCT: float = 70.0  # sell 70% at TP, keep 30% as long_hold
     PAPER_SLIPPAGE_BPS: int = 50  # 0.5% slippage simulation
@@ -220,9 +220,8 @@ class Settings(BaseSettings):
     # this window so a restart doesn't replay every currently-qualifying
     # candidate as a fresh signal. A live trader doesn't bulk-enter on reboot.
     PAPER_STARTUP_WARMUP_SECONDS: int = 180
-    # Trailing stop: once peak_pct >= activation, close if price drops
-    # drawdown% from peak AND is still above entry*(1+floor/100). Prevents
-    # giveback on tokens that briefly pump then bleed toward SL.
+    # Trailing stop (legacy — still used for pre-BL-061 rows; BL-061 ladder
+    # uses PAPER_LADDER_TRAIL_PCT on the runner slice).
     PAPER_TRAILING_ENABLED: bool = True
     PAPER_TRAILING_ACTIVATION_PCT: float = 10.0
     PAPER_TRAILING_DRAWDOWN_PCT: float = 10.0
@@ -230,12 +229,13 @@ class Settings(BaseSettings):
     # Late-pump rejection for trade_gainers: skip candidates whose 24h change
     # already exceeds this threshold (they're near exhaustion).
     PAPER_GAINERS_MAX_24H_PCT: float = 50.0
-    # BL-060: admission threshold scoped to trade_first_signals. 0 disables the
-    # gate AND NULL-stamps would_be_live (pre-threshold regime excluded from A/B).
-    PAPER_MIN_QUANT_SCORE: int = 0
-    # BL-060: concurrent live-eligible slot cap. First N trades with status='open'
-    # AND would_be_live=1 win slots FCFS; subsequent opens stamp would_be_live=0.
-    PAPER_LIVE_ELIGIBLE_CAP: int = 20
+    # BL-061 ladder: replaces flat TP/SL for post-cutover rows.
+    PAPER_LADDER_LEG_1_PCT: float = 25.0
+    PAPER_LADDER_LEG_1_QTY_FRAC: float = 0.30
+    PAPER_LADDER_LEG_2_PCT: float = 50.0
+    PAPER_LADDER_LEG_2_QTY_FRAC: float = 0.30
+    PAPER_LADDER_TRAIL_PCT: float = 12.0
+    PAPER_LADDER_FLOOR_ARM_ON_LEG_1: bool = True
     TRADING_DIGEST_HOUR_UTC: int = 0  # midnight digest
     TRADING_EVAL_INTERVAL: int = 1800  # 30 min eval cycle
 
@@ -389,30 +389,22 @@ class Settings(BaseSettings):
             raise ValueError("tp_pct must be positive, e.g. 20.0 for 20% take profit")
         return v
 
+    @field_validator("PAPER_LADDER_LEG_1_QTY_FRAC", "PAPER_LADDER_LEG_2_QTY_FRAC")
+    @classmethod
+    def _validate_ladder_qty_frac(cls, v: float) -> float:
+        if not (0.0 < v <= 1.0):
+            raise ValueError(
+                "PAPER_LADDER_*_QTY_FRAC must be in (0, 1]; "
+                f"got={v} — fractions > 1 would oversell the position"
+            )
+        return v
+
     @field_validator("PAPER_MAX_MCAP")
     @classmethod
     def _validate_paper_max_mcap(cls, v: float) -> float:
         if v <= 0:
             raise ValueError(
                 "PAPER_MAX_MCAP must be > 0 (paper-trade large-cap filter)"
-            )
-        return v
-
-    @field_validator("PAPER_MIN_QUANT_SCORE")
-    @classmethod
-    def _validate_paper_min_quant_score(cls, v: int) -> int:
-        if v < 0:
-            raise ValueError(
-                "PAPER_MIN_QUANT_SCORE must be >= 0 (0 disables the gate and NULL-stamps would_be_live)"
-            )
-        return v
-
-    @field_validator("PAPER_LIVE_ELIGIBLE_CAP")
-    @classmethod
-    def _validate_paper_live_eligible_cap(cls, v: int) -> int:
-        if v < 0:
-            raise ValueError(
-                "PAPER_LIVE_ELIGIBLE_CAP must be >= 0 (0 stamps every row beyond-cap)"
             )
         return v
 

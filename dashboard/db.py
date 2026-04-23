@@ -895,7 +895,11 @@ async def _get_trading_positions_inner(db) -> list[dict]:
                   checkpoint_1h_pct, checkpoint_6h_pct,
                   checkpoint_24h_pct, checkpoint_48h_pct,
                   opened_at,
-                  would_be_live
+                  leg_1_filled_at,
+                  leg_2_filled_at,
+                  remaining_qty,
+                  realized_pnl_usd,
+                  floor_armed
            FROM paper_trades
            WHERE status = 'open'
            ORDER BY opened_at DESC"""

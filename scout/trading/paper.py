@@ -61,13 +61,8 @@ class PaperTrader:
         signal_combo: str,
         lead_time_vs_trending_min: float | None = None,
         lead_time_vs_trending_status: str | None = None,
-        live_eligible_cap: int,
-        min_quant_score: int,
     ) -> int | None:
-        """Record a paper buy. Returns trade ID, or None if the INSERT was
-        rejected (either by the UNIQUE(token_id,status='open') constraint or
-        by a pre-INSERT guard: non-positive effective entry, non-finite
-        quantity).
+        """Record a paper buy. Returns trade ID, or None if rejected by guards.
 
         Applies slippage to entry price: effective_entry = price * (1 + bps/10000).
         sl_pct is positive: sl_price = entry * (1 - sl_pct/100).
@@ -93,12 +88,6 @@ class PaperTrader:
         sl_price = effective_entry * (1 - sl_pct / 100) if sl_pct > 0 else 0.0
         now = datetime.now(timezone.utc).isoformat()
 
-        # The inline subquery makes would_be_live stamping race-free at the SQL
-        # layer. Today, Database._conn is single-writer (aiosqlite serializes all
-        # ops on one connection), so the race cannot surface. The subquery is
-        # defensive against a future per-writer refactor. Load-bearing invariant:
-        # one of {single-writer connection, atomic subquery} must hold — don't
-        # remove both at once.
         INSERT_SQL = """
 INSERT INTO paper_trades
   (token_id, symbol, name, chain, signal_type, signal_data,
@@ -106,16 +95,9 @@ INSERT INTO paper_trades
    tp_pct, sl_pct, tp_price, sl_price,
    status, opened_at,
    signal_combo, lead_time_vs_trending_min, lead_time_vs_trending_status,
-   would_be_live)
+   remaining_qty, floor_armed, realized_pnl_usd)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
-  (SELECT CASE
-     WHEN ? = 0 THEN NULL
-     WHEN COUNT(*) < ? THEN 1
-     ELSE 0
-   END
-   FROM paper_trades
-   WHERE status='open' AND would_be_live=1))
-RETURNING would_be_live
+        ?, 0, 0.0)
 """
         cursor = await conn.execute(
             INSERT_SQL,
@@ -137,23 +119,11 @@ RETURNING would_be_live
                 signal_combo,
                 lead_time_vs_trending_min,
                 lead_time_vs_trending_status,
-                min_quant_score,
-                live_eligible_cap,
+                quantity,  # remaining_qty = full qty at open
             ),
         )
-        row = await cursor.fetchone()
-        would_be_live_stamped = row[0] if row else None
         trade_id = cursor.lastrowid
         await conn.commit()
-
-        if would_be_live_stamped == 0:
-            log.info(
-                "paper_live_slot_cap_reached",
-                cap=live_eligible_cap,
-                signal_type=signal_type,
-                signal_combo=signal_combo,
-                token_id=token_id,
-            )
 
         log.info(
             "paper_trade_opened",
@@ -196,6 +166,84 @@ RETURNING would_be_live
 
         return trade_id
 
+    async def execute_partial_sell(
+        self,
+        db: Database,
+        trade_id: int,
+        *,
+        leg: int,
+        sell_qty_frac: float,
+        current_price: float,
+        slippage_bps: int = 0,
+    ) -> bool:
+        """Sell a fraction of original quantity for a ladder leg fill.
+
+        Updates remaining_qty, sets leg_N_filled_at/leg_N_exit_price, increments
+        realized_pnl_usd, and (on leg 1) arms the floor. Returns True on success.
+
+        Idempotent: re-calling for the same leg is a no-op when leg_N_filled_at
+        is already set (guard against concurrent evaluator ticks).
+        """
+        if leg not in (1, 2):
+            raise ValueError(f"leg must be 1 or 2, got {leg}")
+        leg = int(leg)
+        conn = db._conn
+        if conn is None:
+            raise RuntimeError("Database not initialized.")
+
+        cur = await conn.execute(
+            f"SELECT entry_price, quantity, remaining_qty, realized_pnl_usd, "
+            f"leg_{leg}_filled_at FROM paper_trades WHERE id = ?",
+            (trade_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            log.warning("partial_sell_trade_not_found", trade_id=trade_id, leg=leg)
+            return False
+        entry_price, initial_qty, remaining_qty, realized, already_filled = row
+        if already_filled is not None:
+            log.info("partial_sell_already_filled", trade_id=trade_id, leg=leg)
+            return False
+
+        effective_exit = current_price * (1 - slippage_bps / 10000)
+        if effective_exit <= 0:
+            log.warning("partial_sell_zero_price", trade_id=trade_id, leg=leg)
+            return False
+
+        leg_qty = float(initial_qty) * sell_qty_frac
+        proceeds = leg_qty * effective_exit
+        cost = leg_qty * float(entry_price)
+        leg_realized = proceeds - cost
+        new_remaining = float(remaining_qty) - leg_qty
+        new_realized = float(realized) + leg_realized
+        now = datetime.now(timezone.utc).isoformat()
+
+        updates = (
+            f"UPDATE paper_trades SET remaining_qty = ?, realized_pnl_usd = ?, "
+            f"leg_{leg}_filled_at = ?, leg_{leg}_exit_price = ?"
+        )
+        params: list = [new_remaining, new_realized, now, effective_exit]
+        if leg == 1:
+            updates += ", floor_armed = 1"
+        updates += f" WHERE id = ? AND leg_{leg}_filled_at IS NULL"
+        params.append(trade_id)
+
+        cursor_upd = await conn.execute(updates, params)
+        if cursor_upd.rowcount == 0:
+            log.warning("partial_sell_race_lost", trade_id=trade_id, leg=leg)
+            return False
+        await conn.commit()
+
+        log.info(
+            "ladder_leg_fired",
+            trade_id=trade_id, leg=leg, fill_price=effective_exit,
+            leg_qty=leg_qty, leg_realized_usd=leg_realized,
+            remaining_qty=new_remaining, realized_pnl_usd=new_realized,
+        )
+        if leg == 1:
+            log.info("floor_activated", trade_id=trade_id)
+        return True
+
     async def execute_sell(
         self,
         db: Database,
@@ -203,6 +251,8 @@ RETURNING would_be_live
         current_price: float,
         reason: str,
         slippage_bps: int = 0,
+        *,
+        status_override: str | None = None,
     ) -> bool:
         """Close a paper trade. Applies exit slippage. Returns True if closed.
 
@@ -251,7 +301,11 @@ RETURNING would_be_live
             "trailing_stop": "closed_trailing_stop",
             "manual": "closed_manual",
         }
-        status = status_map.get(reason, "closed_manual")
+        status = (
+            status_override
+            if status_override is not None
+            else status_map.get(reason, "closed_manual")
+        )
 
         cursor_upd = await conn.execute(
             """UPDATE paper_trades

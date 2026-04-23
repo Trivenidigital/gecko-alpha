@@ -351,3 +351,46 @@ async def test_initialize_upgrades_pre_bl060_db(tmp_path):
     assert row is not None, "composite index missing after upgrade"
 
     await db.close()
+
+
+# ---------------------------------------------------------------------------
+# BL-061: ladder state columns + paper_migrations cutover table
+# ---------------------------------------------------------------------------
+
+
+async def test_paper_migrations_table_created(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    conn = db._conn
+    cur = await conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+    )
+    row = await cur.fetchone()
+    assert row is not None, "paper_migrations table must exist after initialize()"
+
+    cur = await conn.execute(
+        "SELECT cutover_ts FROM paper_migrations WHERE name='bl061_ladder'"
+    )
+    row = await cur.fetchone()
+    assert row is not None, "bl061_ladder cutover row must be created on first init"
+    assert row[0] is not None
+    await db.close()
+
+
+async def test_bl061_ladder_columns_added(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    cur = await db._conn.execute("PRAGMA table_info(paper_trades)")
+    cols = {row[1] for row in await cur.fetchall()}
+    required = {
+        "leg_1_filled_at",
+        "leg_1_exit_price",
+        "leg_2_filled_at",
+        "leg_2_exit_price",
+        "remaining_qty",
+        "floor_armed",
+        "realized_pnl_usd",
+    }
+    missing = required - cols
+    assert not missing, f"missing ladder columns: {missing}"
+    await db.close()

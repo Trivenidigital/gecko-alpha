@@ -1,14 +1,19 @@
 """Tests for PaperTrader -- simulated trade execution with slippage."""
 
-import asyncio
-import json
-from datetime import datetime, timezone
+import inspect
 
 import pytest
-from structlog.testing import capture_logs
 
 from scout.db import Database
 from scout.trading.paper import PaperTrader
+
+
+def test_execute_buy_signature_no_bl060_kwargs():
+    """BL-061: execute_buy must no longer accept the BL-060 stamping kwargs."""
+    sig = inspect.signature(PaperTrader.execute_buy)
+    params = set(sig.parameters.keys())
+    assert "live_eligible_cap" not in params
+    assert "min_quant_score" not in params
 
 
 @pytest.fixture
@@ -40,8 +45,6 @@ async def test_execute_buy_inserts_trade(db, trader):
         sl_pct=10.0,
         slippage_bps=50,
         signal_combo="volume_spike",
-        live_eligible_cap=20,
-        min_quant_score=0,
     )
     assert trade_id is not None
     cursor = await db._conn.execute(
@@ -68,8 +71,6 @@ async def test_execute_buy_applies_slippage(db, trader):
         sl_pct=10.0,
         slippage_bps=100,  # 1%
         signal_combo="volume_spike",
-        live_eligible_cap=20,
-        min_quant_score=0,
     )
     cursor = await db._conn.execute(
         "SELECT entry_price, quantity FROM paper_trades WHERE id = ?", (trade_id,)
@@ -97,8 +98,6 @@ async def test_execute_buy_computes_tp_sl_prices(db, trader):
         sl_pct=10.0,
         slippage_bps=0,  # no slippage
         signal_combo="narrative_prediction",
-        live_eligible_cap=20,
-        min_quant_score=0,
     )
     cursor = await db._conn.execute(
         "SELECT tp_price, sl_price FROM paper_trades WHERE id = ?", (trade_id,)
@@ -126,8 +125,6 @@ async def test_execute_sell_closes_trade(db, trader):
         sl_pct=10.0,
         slippage_bps=0,
         signal_combo="volume_spike",
-        live_eligible_cap=20,
-        min_quant_score=0,
     )
     await trader.execute_sell(
         db=db,
@@ -163,8 +160,6 @@ async def test_execute_sell_applies_exit_slippage(db, trader):
         sl_pct=10.0,
         slippage_bps=0,
         signal_combo="volume_spike",
-        live_eligible_cap=20,
-        min_quant_score=0,
     )
     await trader.execute_sell(
         db=db,
@@ -198,8 +193,6 @@ async def test_execute_sell_stop_loss_pnl(db, trader):
         sl_pct=10.0,
         slippage_bps=0,
         signal_combo="volume_spike",
-        live_eligible_cap=20,
-        min_quant_score=0,
     )
     await trader.execute_sell(
         db=db,
@@ -217,364 +210,68 @@ async def test_execute_sell_stop_loss_pnl(db, trader):
     assert row["pnl_usd"] == pytest.approx(-100.0)
 
 
-# ---------------------------------------------------------------------------
-# BL-060: would_be_live stamp tests
-# ---------------------------------------------------------------------------
-
-
-async def _stamp_of(db, trade_id: int) -> int | None:
-    cur = await db._conn.execute(
-        "SELECT would_be_live FROM paper_trades WHERE id=?", (trade_id,)
-    )
-    row = await cur.fetchone()
-    return row[0] if row else None
-
-
-@pytest.mark.asyncio
-async def test_stamp_fresh_db_first_n_up_to_cap_are_live_eligible(tmp_path):
-    """First cap inserts stamp =1; the (cap+1)th stamps =0."""
-    db = Database(str(tmp_path / "gecko.db"))
+async def test_execute_partial_sell_updates_remaining_qty(tmp_path):
+    from scout.db import Database
+    from scout.trading.paper import PaperTrader
+    db = Database(tmp_path / "t.db")
     await db.initialize()
     trader = PaperTrader()
-
-    results = []
-    for i in range(21):  # cap=20; 21st should stamp =0
-        trade_id = await trader.execute_buy(
-            db=db,
-            token_id=f"tok{i}",
-            symbol=f"S{i}",
-            name=f"Name{i}",
-            chain="eth",
-            signal_type="first_signal",
-            signal_data={"quant_score": 50},
-            current_price=1.0,
-            amount_usd=100.0,
-            tp_pct=40.0,
-            sl_pct=20.0,
-            slippage_bps=0,
-            signal_combo="first_signal",
-            lead_time_vs_trending_min=None,
-            lead_time_vs_trending_status=None,
-            live_eligible_cap=20,
-            min_quant_score=1,  # non-zero: stamps real 0/1
-        )
-        assert trade_id > 0, "trade_id must be populated"
-        results.append(trade_id)
-
-    async with db._conn.execute(
-        "SELECT id, would_be_live FROM paper_trades ORDER BY id"
-    ) as cur:
-        rows = await cur.fetchall()
-    stamps = [r[1] for r in rows]
-    assert sum(s == 1 for s in stamps) == 20, f"first 20 must stamp =1; got {stamps}"
-    assert stamps[20] == 0, f"21st must stamp =0; got {stamps[20]}"
-    await db.close()
-
-
-@pytest.mark.asyncio
-async def test_closing_live_eligible_trade_frees_slot(tmp_path):
-    """Closing a =1 trade frees its slot; next open gets =1."""
-    db = Database(str(tmp_path / "gecko.db"))
-    await db.initialize()
-    trader = PaperTrader()
-
-    async def open_one(i: int):
-        return await trader.execute_buy(
-            db=db,
-            token_id=f"tok{i}",
-            symbol=f"S{i}",
-            name=f"N{i}",
-            chain="eth",
-            signal_type="first_signal",
-            signal_data={"quant_score": 50},
-            current_price=1.0,
-            amount_usd=100.0,
-            tp_pct=40.0,
-            sl_pct=20.0,
-            slippage_bps=0,
-            signal_combo="first_signal",
-            lead_time_vs_trending_min=None,
-            lead_time_vs_trending_status=None,
-            live_eligible_cap=2,
-            min_quant_score=1,
-        )
-
-    id1 = await open_one(0)
-    id2 = await open_one(1)
-    id3 = await open_one(2)
-    assert (
-        await _stamp_of(db, id1),
-        await _stamp_of(db, id2),
-        await _stamp_of(db, id3),
-    ) == (1, 1, 0)
-
-    await db._conn.execute(
-        "UPDATE paper_trades SET status='closed_tp' WHERE id=?", (id1,)
-    )
-    await db._conn.commit()
-
-    id4 = await open_one(99)
-    assert await _stamp_of(db, id4) == 1, "slot freed by close; new open must be =1"
-    await db.close()
-
-
-@pytest.mark.asyncio
-async def test_stamp_zero_fires_cap_reached_log(tmp_path):
-    """Stamping =0 fires a paper_live_slot_cap_reached log with correct fields."""
-    db = Database(str(tmp_path / "gecko.db"))
-    await db.initialize()
-    trader = PaperTrader()
-
-    async def open_one(i: int):
-        return await trader.execute_buy(
-            db=db,
-            token_id=f"tok{i}",
-            symbol=f"S{i}",
-            name=f"N{i}",
-            chain="eth",
-            signal_type="first_signal",
-            signal_data={"quant_score": 50},
-            current_price=1.0,
-            amount_usd=100.0,
-            tp_pct=40.0,
-            sl_pct=20.0,
-            slippage_bps=0,
-            signal_combo="first_signal",
-            lead_time_vs_trending_min=None,
-            lead_time_vs_trending_status=None,
-            live_eligible_cap=1,
-            min_quant_score=1,
-        )
-
-    await open_one(0)  # stamps =1, no log
-    with capture_logs() as logs:
-        await open_one(1)  # stamps =0, log fires
-    events = [e for e in logs if e.get("event") == "paper_live_slot_cap_reached"]
-    assert len(events) == 1, f"expected 1 cap log; got {events}"
-    assert events[0]["cap"] == 1
-    assert events[0]["signal_type"] == "first_signal"
-    assert events[0]["signal_combo"] == "first_signal"
-    assert events[0]["token_id"] == "tok1"
-    await db.close()
-
-
-@pytest.mark.asyncio
-async def test_cap_zero_stamps_all_zero(tmp_path):
-    """cap=0 means COUNT(*) < 0 is always False → ELSE branch → stamp=0."""
-    db = Database(str(tmp_path / "gecko.db"))
-    await db.initialize()
-    trader = PaperTrader()
-
-    for i in range(5):
-        await trader.execute_buy(
-            db=db,
-            token_id=f"tok{i}",
-            symbol=f"S{i}",
-            name=f"N{i}",
-            chain="eth",
-            signal_type="first_signal",
-            signal_data={"quant_score": 50},
-            current_price=1.0,
-            amount_usd=100.0,
-            tp_pct=40.0,
-            sl_pct=20.0,
-            slippage_bps=0,
-            signal_combo="first_signal",
-            lead_time_vs_trending_min=None,
-            lead_time_vs_trending_status=None,
-            live_eligible_cap=0,
-            min_quant_score=1,
-        )
-
-    async with db._conn.execute("SELECT would_be_live FROM paper_trades") as cur:
-        rows = await cur.fetchall()
-    assert all(r[0] == 0 for r in rows), [r[0] for r in rows]
-    await db.close()
-
-
-@pytest.mark.asyncio
-async def test_closed_live_eligible_excluded_from_cap_count(tmp_path):
-    """Closed =1 trades do not count toward the cap (subquery filters status='open')."""
-    db = Database(str(tmp_path / "gecko.db"))
-    await db.initialize()
-    trader = PaperTrader()
-
-    # Seed 5 closed =1 rows directly
-    for i in range(5):
-        await db._conn.execute(
-            "INSERT INTO paper_trades "
-            "(token_id, symbol, name, chain, signal_type, signal_data, "
-            "entry_price, amount_usd, quantity, tp_pct, sl_pct, "
-            "tp_price, sl_price, status, opened_at, signal_combo, "
-            "lead_time_vs_trending_min, lead_time_vs_trending_status, "
-            "would_be_live) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                f"seeded{i}",
-                "S",
-                "N",
-                "eth",
-                "first_signal",
-                "{}",
-                1.0,
-                100.0,
-                100.0,
-                40.0,
-                20.0,
-                1.4,
-                0.8,
-                "closed_tp",
-                "2026-04-22T00:00:00",
-                "first_signal",
-                None,
-                None,
-                1,
-            ),
-        )
-    await db._conn.commit()
-
     trade_id = await trader.execute_buy(
-        db=db,
-        token_id="fresh",
-        symbol="F",
-        name="Fresh",
-        chain="eth",
-        signal_type="first_signal",
-        signal_data={"quant_score": 50},
-        current_price=1.0,
-        amount_usd=100.0,
-        tp_pct=40.0,
-        sl_pct=20.0,
-        slippage_bps=0,
-        signal_combo="first_signal",
-        lead_time_vs_trending_min=None,
-        lead_time_vs_trending_status=None,
-        live_eligible_cap=2,
-        min_quant_score=1,
+        db=db, token_id="tok", symbol="TOK", name="Token", chain="coingecko",
+        signal_type="gainers_early", signal_data={}, current_price=1.0,
+        amount_usd=300.0, tp_pct=40.0, sl_pct=15.0, slippage_bps=0,
+        signal_combo="gainers_early",
     )
+    # Sell 30% of position at $1.25 (leg 1 at +25%)
+    ok = await trader.execute_partial_sell(
+        db=db, trade_id=trade_id, leg=1, sell_qty_frac=0.30,
+        current_price=1.25, slippage_bps=0,
+    )
+    assert ok
     cur = await db._conn.execute(
-        "SELECT would_be_live FROM paper_trades WHERE id=?", (trade_id,)
+        "SELECT remaining_qty, floor_armed, realized_pnl_usd, leg_1_filled_at, leg_1_exit_price "
+        "FROM paper_trades WHERE id = ?", (trade_id,)
     )
     row = await cur.fetchone()
-    assert row[0] == 1, f"closed =1s should not block cap; got {row[0]}"
+    remaining_qty, floor_armed, realized, leg1_filled, leg1_exit = row
+    assert remaining_qty == pytest.approx(300.0 * 0.70, rel=1e-6)  # 210 units at $1.0 entry
+    assert floor_armed == 1
+    assert realized == pytest.approx(300.0 * 0.30 * 0.25, rel=1e-6)  # 30% of 300 * 25% = 22.50
+    assert leg1_filled is not None
+    assert leg1_exit == pytest.approx(1.25, rel=1e-6)
     await db.close()
 
 
-@pytest.mark.asyncio
-async def test_min_quant_score_zero_null_stamps(tmp_path):
-    """min_quant_score=0 triggers the WHEN ? = 0 THEN NULL branch — all rows NULL."""
-    db = Database(str(tmp_path / "gecko.db"))
+async def test_execute_partial_sell_idempotent_on_double_call(tmp_path):
+    """Second call for the same leg returns False; DB is only updated once."""
+    from scout.db import Database
+    from scout.trading.paper import PaperTrader
+    db = Database(tmp_path / "t.db")
     await db.initialize()
     trader = PaperTrader()
-
-    for i in range(3):
-        await trader.execute_buy(
-            db=db,
-            token_id=f"tok{i}",
-            symbol=f"S{i}",
-            name=f"N{i}",
-            chain="eth",
-            signal_type="first_signal",
-            signal_data={"quant_score": 50},
-            current_price=1.0,
-            amount_usd=100.0,
-            tp_pct=40.0,
-            sl_pct=20.0,
-            slippage_bps=0,
-            signal_combo="first_signal",
-            lead_time_vs_trending_min=None,
-            lead_time_vs_trending_status=None,
-            live_eligible_cap=20,
-            min_quant_score=0,
-        )
-    async with db._conn.execute("SELECT would_be_live FROM paper_trades") as cur:
-        rows = await cur.fetchall()
-    assert all(
-        r[0] is None for r in rows
-    ), f"regime-null stamps expected; got {[r[0] for r in rows]}"
-    await db.close()
-
-
-@pytest.mark.asyncio
-async def test_stamped_rows_immutable_across_migrations(tmp_path):
-    """Running _migrate_feedback_loop_schema twice must not alter open stamped rows."""
-    db = Database(str(tmp_path / "gecko.db"))
-    await db.initialize()
-    trader = PaperTrader()
-
     trade_id = await trader.execute_buy(
-        db=db,
-        token_id="stable",
-        symbol="S",
-        name="N",
-        chain="eth",
-        signal_type="first_signal",
-        signal_data={"quant_score": 50},
-        current_price=1.0,
-        amount_usd=100.0,
-        tp_pct=40.0,
-        sl_pct=20.0,
-        slippage_bps=0,
-        signal_combo="first_signal",
-        lead_time_vs_trending_min=None,
-        lead_time_vs_trending_status=None,
-        live_eligible_cap=20,
-        min_quant_score=1,
+        db=db, token_id="tok", symbol="TOK", name="Token", chain="coingecko",
+        signal_type="gainers_early", signal_data={}, current_price=1.0,
+        amount_usd=300.0, tp_pct=40.0, sl_pct=15.0, slippage_bps=0,
+        signal_combo="gainers_early",
     )
-    cur = await db._conn.execute(
-        "SELECT would_be_live FROM paper_trades WHERE id=?", (trade_id,)
+    first = await trader.execute_partial_sell(
+        db=db, trade_id=trade_id, leg=1, sell_qty_frac=0.30,
+        current_price=1.25, slippage_bps=0,
     )
-    assert (await cur.fetchone())[0] == 1
-
-    await db._migrate_feedback_loop_schema()
-    await db._migrate_feedback_loop_schema()
-
+    second = await trader.execute_partial_sell(
+        db=db, trade_id=trade_id, leg=1, sell_qty_frac=0.30,
+        current_price=1.25, slippage_bps=0,
+    )
+    assert first is True
+    assert second is False
     cur = await db._conn.execute(
-        "SELECT status, would_be_live FROM paper_trades WHERE id=?", (trade_id,)
+        "SELECT remaining_qty, realized_pnl_usd FROM paper_trades WHERE id = ?",
+        (trade_id,),
     )
     row = await cur.fetchone()
-    assert row[0] == "open", f"status must stay open; got {row[0]}"
-    assert row[1] == 1, f"stamped value must stay 1; got {row[1]}"
-    await db.close()
-
-
-@pytest.mark.asyncio
-async def test_stamp_subquery_correctness_under_shared_conn(tmp_path):
-    """40 asyncio.gather inserts on shared conn → exactly 20 =1 and 20 =0."""
-    db = Database(str(tmp_path / "gecko.db"))
-    await db.initialize()
-    trader = PaperTrader()
-
-    async def one(i: int):
-        return await trader.execute_buy(
-            db=db,
-            token_id=f"tok{i}",
-            symbol=f"S{i}",
-            name=f"N{i}",
-            chain="eth",
-            signal_type="first_signal",
-            signal_data={"quant_score": 50},
-            current_price=1.0,
-            amount_usd=100.0,
-            tp_pct=40.0,
-            sl_pct=20.0,
-            slippage_bps=0,
-            signal_combo="first_signal",
-            lead_time_vs_trending_min=None,
-            lead_time_vs_trending_status=None,
-            live_eligible_cap=20,
-            min_quant_score=1,
-        )
-
-    await asyncio.gather(*[one(i) for i in range(40)])
-    async with db._conn.execute("SELECT would_be_live FROM paper_trades") as cur:
-        stamps = [r[0] for r in await cur.fetchall()]
-    ones = sum(1 for s in stamps if s == 1)
-    zeros = sum(1 for s in stamps if s == 0)
-    assert ones == 20 and zeros == 20, (
-        f"expected 20/20 split; got ones={ones} zeros={zeros}. "
-        "Note: aiosqlite serializes shared-conn ops at worker-thread level; "
-        "this test proves subquery COUNT/CASE arithmetic is correct, NOT "
-        "atomicity under true parallelism (see test_paper_trader_concurrency.py)"
-    )
+    # remaining_qty decremented only once: 300 * 0.70 = 210
+    assert row[0] == pytest.approx(210.0, rel=1e-6)
+    # realized_pnl_usd accumulated only once: 300 * 0.30 * 0.25 = 22.50
+    assert row[1] == pytest.approx(22.50, rel=1e-6)
     await db.close()

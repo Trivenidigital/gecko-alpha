@@ -334,7 +334,7 @@ async def test_partial_tp_creates_long_hold_via_real_split(db, tmp_path):
 
     # A child long_hold row must have been created for the same token
     cur = await db._conn.execute(
-        "SELECT id, signal_type, peak_price, peak_pct, status, would_be_live "
+        "SELECT id, signal_type, peak_price, peak_pct, status "
         "FROM paper_trades "
         "WHERE token_id = ? AND signal_type = 'long_hold'",
         ("bitcoin",),
@@ -345,9 +345,3 @@ async def test_partial_tp_creates_long_hold_via_real_split(db, tmp_path):
     assert child[2] is None  # peak_price starts NULL
     assert child[3] is None  # peak_pct starts NULL
     assert child[4] == "open"
-    # BL-060: rollover must stamp would_be_live=NULL (continuation, not a new
-    # admission) so it is excluded from the A/B cohort at the SQL layer.
-    # evaluator.py passes min_quant_score=0 for this reason.
-    assert (
-        child[5] is None
-    ), f"long_hold rollover must stamp would_be_live=NULL; got {child[5]}"

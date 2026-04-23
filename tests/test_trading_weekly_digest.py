@@ -285,6 +285,39 @@ async def test_send_weekly_digest_empty_skips_telegram(
     await db.close()
 
 
+async def test_ladder_performance_section(tmp_path, settings_factory):
+    from scout.trading.paper import PaperTrader
+    from datetime import date, datetime, timezone
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    trader = PaperTrader()
+    s = settings_factory()
+
+    # Open + partial-fill a post-cutover trade (remaining_qty is non-null
+    # for post-cutover rows; execute_buy sets it to full qty).
+    tid = await trader.execute_buy(
+        db=db, token_id="lp1", symbol="LP1", name="LP1", chain="coingecko",
+        signal_type="gainers_early", signal_data={}, current_price=1.0,
+        amount_usd=300.0, tp_pct=40.0, sl_pct=15.0, slippage_bps=0,
+        signal_combo="gainers_early",
+    )
+    await trader.execute_partial_sell(
+        db=db, trade_id=tid, leg=1, sell_qty_frac=0.30, current_price=1.25,
+    )
+    # Close the trade so it matches the SELECT filter (status LIKE 'closed%').
+    await trader.execute_sell(
+        db=db, trade_id=tid, current_price=1.5, reason="take_profit", slippage_bps=0,
+    )
+    end_date = date.today()
+    out_lines = await weekly_digest._build_ladder_performance(db, end_date, s)
+    out = "\n".join(out_lines)
+    assert "Ladder performance" in out
+    assert "gainers_early" in out
+    assert ("leg 1" in out.lower()) or ("l1" in out.lower())
+    await db.close()
+
+
 async def test_send_weekly_digest_fallback_on_error(
     tmp_path, settings_factory, monkeypatch
 ):
