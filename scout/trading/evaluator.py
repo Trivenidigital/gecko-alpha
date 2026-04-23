@@ -31,6 +31,25 @@ async def _load_bl061_cutover_ts(conn) -> str | None:
     return row[0] if row else None
 
 
+def _parse_ts(s: str | None) -> datetime | None:
+    """Parse SQLite datetime('now') (space, no tz) or ISO-with-tz into a UTC datetime.
+
+    paper_trades.created_at uses SQLite's default space-separated, tz-less
+    format; paper_migrations.cutover_ts uses Python's isoformat with +00:00.
+    Both need to compare apples-to-apples — normalize via fromisoformat and
+    attach UTC when naive.
+    """
+    if s is None:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
 async def evaluate_paper_trades(db: Database, settings) -> None:
     """Check all open paper trades: update checkpoints, check TP/SL, expire old.
 
@@ -167,23 +186,9 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             remaining_qty = float(row[24]) if len(row) > 24 and row[24] is not None else None
             floor_armed = bool(row[25]) if len(row) > 25 and row[25] is not None else False
 
-            # Determine BL-061 eligibility: use datetime comparison to handle
-            # format mismatch between SQLite datetime('now') space format and
-            # ISO-with-tz format stored in paper_migrations.cutover_ts.
-            # SQLite datetime('now') has second precision; cutover_ts has
-            # microsecond precision. Truncate cutover to the second so that
-            # trades inserted in the same second as the migration are included.
-            def _parse_ts(s: str | None) -> datetime | None:
-                if s is None:
-                    return None
-                try:
-                    dt = datetime.fromisoformat(s)
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    return dt
-                except ValueError:
-                    return None
-
+            # BL-061 eligibility via datetime compare: SQLite datetime('now')
+            # has second precision; cutover_ts has microsecond. Truncate cutover
+            # so trades inserted in the same second as the migration are included.
             created_at_dt = _parse_ts(created_at_str)
             cutover_dt = _parse_ts(cutover_ts)
             if cutover_dt is not None:
