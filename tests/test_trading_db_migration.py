@@ -196,3 +196,97 @@ async def test_post_migration_assertion_raises_on_incomplete_schema(
         import structlog
 
         structlog.get_logger().warning("test_db_close_failed", err=str(e))
+
+
+# ---------------------------------------------------------------------------
+# BL-060: would_be_live column + composite index
+# ---------------------------------------------------------------------------
+
+
+async def test_migration_adds_would_be_live_column(tmp_path):
+    db_path = tmp_path / "gecko.db"
+    db = Database(str(db_path))
+    await db.initialize()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        cur = await conn.execute("PRAGMA table_info(paper_trades)")
+        rows = await cur.fetchall()
+        cols = {
+            row[1]: {"type": row[2], "notnull": row[3], "dflt": row[4]} for row in rows
+        }
+
+    assert "would_be_live" in cols, f"column missing; got {list(cols)}"
+    assert cols["would_be_live"]["type"] == "INTEGER"
+    assert cols["would_be_live"]["notnull"] == 0, "must be nullable"
+    assert cols["would_be_live"]["dflt"] is None, "must not have default"
+    await db.close()
+
+
+async def test_migration_adds_would_be_live_index(tmp_path):
+    db_path = tmp_path / "gecko.db"
+    db = Database(str(db_path))
+    await db.initialize()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        cur = await conn.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type='index' AND tbl_name='paper_trades'"
+        )
+        idx_rows = await cur.fetchall()
+
+    names = {row[0] for row in idx_rows}
+    assert (
+        "idx_paper_trades_would_be_live_status" in names
+    ), f"index missing; got {names}"
+    sql = next(
+        row[1] for row in idx_rows if row[0] == "idx_paper_trades_would_be_live_status"
+    )
+    assert "would_be_live" in sql and "status" in sql
+    assert sql.find("would_be_live") < sql.find(
+        "status"
+    ), "would_be_live must be the leading column for digest index-only scan"
+    await db.close()
+
+
+async def test_migration_preserves_pre_cutover_nulls(tmp_path):
+    db_path = tmp_path / "gecko.db"
+    db = Database(str(db_path))
+    await db.initialize()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        await conn.execute(
+            "INSERT INTO paper_trades "
+            "(token_id, symbol, name, chain, signal_type, signal_data, "
+            "entry_price, amount_usd, quantity, tp_pct, sl_pct, "
+            "tp_price, sl_price, status, opened_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "tok1",
+                "SYM",
+                "Name",
+                "eth",
+                "first_signal",
+                "{}",
+                1.0,
+                100.0,
+                100.0,
+                40.0,
+                20.0,
+                1.4,
+                0.8,
+                "open",
+                "2026-04-22T00:00:00",
+            ),
+        )
+        await conn.commit()
+
+    await db._migrate_feedback_loop_schema()
+    await db._migrate_feedback_loop_schema()
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        cur = await conn.execute(
+            "SELECT would_be_live FROM paper_trades WHERE token_id='tok1'"
+        )
+        row = await cur.fetchone()
+    assert row[0] is None, f"pre-cutover row must stay NULL; got {row[0]}"
+    await db.close()

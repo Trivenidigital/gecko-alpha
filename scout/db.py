@@ -590,11 +590,15 @@ class Database:
                 closed_at TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
 
+                would_be_live INTEGER,
+
                 UNIQUE(token_id, signal_type, opened_at)
             );
             CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status);
             CREATE INDEX IF NOT EXISTS idx_paper_trades_opened ON paper_trades(opened_at);
             CREATE INDEX IF NOT EXISTS idx_paper_trades_signal ON paper_trades(signal_type);
+            CREATE INDEX IF NOT EXISTS idx_paper_trades_would_be_live_status
+                ON paper_trades(would_be_live, status);
 
             CREATE TABLE IF NOT EXISTS paper_daily_summary (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -859,6 +863,7 @@ class Database:
                 "signal_combo": "TEXT",
                 "lead_time_vs_trending_min": "REAL",
                 "lead_time_vs_trending_status": "TEXT",
+                "would_be_live": "INTEGER",
             }
             cur = await conn.execute("PRAGMA table_info(paper_trades)")
             existing = {row[1] for row in await cur.fetchall()}
@@ -880,6 +885,10 @@ class Database:
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_token_opened "
                 "ON paper_trades(token_id, opened_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_paper_trades_would_be_live_status "
+                "ON paper_trades(would_be_live, status)"
             )
 
             # POST-ASSERTION — run BEFORE commit so a failure triggers ROLLBACK
