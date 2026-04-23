@@ -290,6 +290,13 @@ async def test_partial_sell_race_lost_when_another_writer_fills_first(
     # Inject a race: after the SELECT inside execute_partial_sell reads
     # already_filled=None, another writer stamps leg_1_filled_at before our
     # UPDATE runs. The UPDATE's WHERE clause then filters it out.
+    #
+    # Sentinel "SELECT entry_price" matches the first SELECT in
+    # execute_partial_sell (scout/trading/paper.py — the one that reads
+    # entry_price, quantity, remaining_qty, realized_pnl_usd, leg_N_filled_at,
+    # peak_pct). If that SELECT's leading column changes or gets split across
+    # subqueries, this match stops firing and the race never gets injected —
+    # update the sentinel in lockstep with the paper.py SELECT.
     orig_execute = db._conn.execute
     state = {"select_seen": False}
 
