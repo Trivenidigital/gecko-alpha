@@ -17,6 +17,20 @@ from scout.trading.paper import PaperTrader
 log = structlog.get_logger()
 
 
+async def _load_bl061_cutover_ts(conn) -> str | None:
+    """Load BL-061 cutover timestamp from paper_migrations.
+
+    Returns None if the row is missing (fresh DB before initialize() ran,
+    shouldn't happen in practice). Callers should treat None as "no cutover
+    — all rows use new ladder policy."
+    """
+    cur = await conn.execute(
+        "SELECT cutover_ts FROM paper_migrations WHERE name = 'bl061_ladder'"
+    )
+    row = await cur.fetchone()
+    return row[0] if row else None
+
+
 async def evaluate_paper_trades(db: Database, settings) -> None:
     """Check all open paper trades: update checkpoints, check TP/SL, expire old.
 
