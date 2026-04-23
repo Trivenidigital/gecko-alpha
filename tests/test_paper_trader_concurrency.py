@@ -46,11 +46,25 @@ async def test_stamp_subquery_race_free_under_multi_writer_stress(tmp_path):
         while True:
             try:
                 params = (
-                    token_id, "S", "N", "eth", "first_signal", "{}",
-                    1.0, 100.0, 100.0, 40.0, 20.0, 1.4, 0.8,
+                    token_id,
+                    "S",
+                    "N",
+                    "eth",
+                    "first_signal",
+                    "{}",
+                    1.0,
+                    100.0,
+                    100.0,
+                    40.0,
+                    20.0,
+                    1.4,
+                    0.8,
                     "2026-04-22T00:00:00",
-                    "first_signal", None, None,
-                    1, 20,  # min_quant_score, live_eligible_cap
+                    "first_signal",
+                    None,
+                    None,
+                    1,
+                    20,  # min_quant_score, live_eligible_cap
                 )
                 cur = await conn.execute(INSERT_SQL, params)
                 row = await cur.fetchone()
@@ -84,9 +98,9 @@ async def test_stamp_subquery_race_free_under_multi_writer_stress(tmp_path):
 
     ones = sum(1 for s in flat if s == 1)
     zeros = sum(1 for s in flat if s == 0)
-    assert ones == 20 and zeros == 20, (
-        f"WAL multi-writer must preserve exact cap; got ones={ones} zeros={zeros}"
-    )
+    assert (
+        ones == 20 and zeros == 20
+    ), f"WAL multi-writer must preserve exact cap; got ones={ones} zeros={zeros}"
     # WAL permits one writer at a time; this test proves SQL correctness
     # under contention, not true parallelism. Prod's safety comes from the
     # single-writer connection (Database._conn).
@@ -99,6 +113,7 @@ async def test_stamp_subquery_race_free_under_multi_writer_stress(tmp_path):
     # signal that is suppressed by the Windows SQLite VFS layer.
     # The assertion below is intentionally skipped on Windows.
     import sys
+
     if sys.platform != "win32":
         assert busy_retries >= 1, (
             f"expected contention; got {busy_retries} retries — "

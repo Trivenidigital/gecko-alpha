@@ -138,6 +138,7 @@ def test_feedback_loop_defaults(monkeypatch):
 
 def test_parse_perp_symbols_normalizes_list_input():
     from scout.config import Settings
+
     s = Settings(
         TELEGRAM_BOT_TOKEN="test",
         TELEGRAM_CHAT_ID="test",
@@ -151,6 +152,7 @@ def test_parse_perp_symbols_rejects_over_200_items_from_list():
     import pytest
     from pydantic import ValidationError
     from scout.config import Settings
+
     with pytest.raises(ValidationError):
         Settings(
             TELEGRAM_BOT_TOKEN="test",

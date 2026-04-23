@@ -206,10 +206,26 @@ _CLOSED_INSERT = (
 )
 
 _CLOSED_VALS = lambda tid, wbl, pnl, opened="2026-04-25T00:00:00": (
-    tid, "S", "N", "eth", "first_signal", "{}",
-    1.0, 100.0, 100.0, 40.0, 20.0, 1.4, 0.8,
-    "closed_tp", opened,
-    pnl, "first_signal", None, None, wbl,
+    tid,
+    "S",
+    "N",
+    "eth",
+    "first_signal",
+    "{}",
+    1.0,
+    100.0,
+    100.0,
+    40.0,
+    20.0,
+    1.4,
+    0.8,
+    "closed_tp",
+    opened,
+    pnl,
+    "first_signal",
+    None,
+    None,
+    wbl,
 )
 
 
@@ -226,7 +242,9 @@ async def test_digest_ab_cohort_excludes_nulls(tmp_path, settings_factory):
     await db._conn.commit()
 
     section = await _build_bl060_ab(
-        db, end_date=datetime(2026, 5, 2), settings=settings_factory(),
+        db,
+        end_date=datetime(2026, 5, 2),
+        settings=settings_factory(),
     )
     assert "live-eligible" in section.lower()
     assert "n_closed=3" in section
@@ -240,13 +258,21 @@ async def test_digest_ab_excludes_both_null_regimes(tmp_path, settings_factory):
     await db.initialize()
 
     for i in range(2):
-        await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS(f"NULL{i}", None, 3.0, "2026-04-27T00:00:00"))
-        await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS(f"LIVE{i}", 1, 5.0, "2026-04-27T00:00:00"))
-        await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS(f"CAP{i}", 0, -2.0, "2026-04-27T00:00:00"))
+        await db._conn.execute(
+            _CLOSED_INSERT, _CLOSED_VALS(f"NULL{i}", None, 3.0, "2026-04-27T00:00:00")
+        )
+        await db._conn.execute(
+            _CLOSED_INSERT, _CLOSED_VALS(f"LIVE{i}", 1, 5.0, "2026-04-27T00:00:00")
+        )
+        await db._conn.execute(
+            _CLOSED_INSERT, _CLOSED_VALS(f"CAP{i}", 0, -2.0, "2026-04-27T00:00:00")
+        )
     await db._conn.commit()
 
     section = await _build_bl060_ab(
-        db, end_date=datetime(2026, 5, 2), settings=settings_factory(),
+        db,
+        end_date=datetime(2026, 5, 2),
+        settings=settings_factory(),
     )
     assert "n_closed=2 | " in section
     assert section.count("n_closed=2") >= 4
@@ -278,12 +304,18 @@ async def test_first_week_post_cutover_zero_n_guard(tmp_path, settings_factory):
     await db.initialize()
 
     # Only seed current-week trades (no previous-week data)
-    await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS("cur1", 1, 5.0, "2026-04-27T00:00:00"))
-    await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS("cur2", 0, 5.0, "2026-04-27T00:00:00"))
+    await db._conn.execute(
+        _CLOSED_INSERT, _CLOSED_VALS("cur1", 1, 5.0, "2026-04-27T00:00:00")
+    )
+    await db._conn.execute(
+        _CLOSED_INSERT, _CLOSED_VALS("cur2", 0, 5.0, "2026-04-27T00:00:00")
+    )
     await db._conn.commit()
 
     section = await _build_bl060_ab(
-        db, end_date=datetime(2026, 5, 2), settings=settings_factory(),
+        db,
+        end_date=datetime(2026, 5, 2),
+        settings=settings_factory(),
     )
     assert "| -" in section or "| - " in section, (
         "last-week zero-n must render '-'; section:\n" + section
@@ -311,7 +343,9 @@ async def test_delta_excludes_sharpe_under_small_n(tmp_path, settings_factory):
     await db._conn.commit()
 
     section = await _build_bl060_ab(
-        db, end_date=datetime(2026, 5, 2), settings=settings_factory(),
+        db,
+        end_date=datetime(2026, 5, 2),
+        settings=settings_factory(),
     )
     delta_block = section.split("Delta (live-eligible minus beyond-cap):")[1].split(
         "Per-path"

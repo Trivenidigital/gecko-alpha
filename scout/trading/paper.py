@@ -94,27 +94,30 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
    WHERE status='open' AND would_be_live=1))
 RETURNING would_be_live
 """
-        cursor = await conn.execute(INSERT_SQL, (
-            token_id,
-            symbol,
-            name,
-            chain,
-            signal_type,
-            json.dumps(signal_data),
-            effective_entry,
-            amount_usd,
-            quantity,
-            tp_pct,
-            sl_pct,
-            tp_price,
-            sl_price,
-            now,
-            signal_combo,
-            lead_time_vs_trending_min,
-            lead_time_vs_trending_status,
-            min_quant_score,
-            live_eligible_cap,
-        ))
+        cursor = await conn.execute(
+            INSERT_SQL,
+            (
+                token_id,
+                symbol,
+                name,
+                chain,
+                signal_type,
+                json.dumps(signal_data),
+                effective_entry,
+                amount_usd,
+                quantity,
+                tp_pct,
+                sl_pct,
+                tp_price,
+                sl_price,
+                now,
+                signal_combo,
+                lead_time_vs_trending_min,
+                lead_time_vs_trending_status,
+                min_quant_score,
+                live_eligible_cap,
+            ),
+        )
         row = await cursor.fetchone()
         would_be_live_stamped = row[0] if row else None
         trade_id = cursor.lastrowid

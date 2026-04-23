@@ -692,8 +692,7 @@ async def trade_predictions(
         and (max_mcap is None or p.market_cap_at_prediction <= max_mcap)
         and (p.narrative_fit_score or 0) >= min_fit_score
         and not (
-            p.category_name
-            and _normalize_category(p.category_name) in _JUNK_CATEGORIES
+            p.category_name and _normalize_category(p.category_name) in _JUNK_CATEGORIES
         )
         and _is_junk_coinid(p.coin_id)
     )

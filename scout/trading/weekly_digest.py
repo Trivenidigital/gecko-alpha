@@ -85,8 +85,7 @@ def _render_delta(live_t, live_p, beyond_t, beyond_p) -> str:
     # Delta excludes Sharpe when either side has n_closed < 30 (BL-060 test #18)
     if live_t["n"] >= 30 and beyond_t["n"] >= 30:
         lines.append(
-            f"  Sharpe:    "
-            f"{live_t['sharpe'] - beyond_t['sharpe']:+.2f} this week"
+            f"  Sharpe:    " f"{live_t['sharpe'] - beyond_t['sharpe']:+.2f} this week"
         )
     return "\n".join(lines)
 
@@ -187,6 +186,7 @@ async def _build_bl060_ab(db, end_date, settings) -> str:
     out = []
     out.append("BL-060 A/B - live-eligible vs beyond-cap")
     out.append("=" * 41)
+
     def _as_date(d):
         return d.date() if isinstance(d, datetime) else d
 

@@ -161,11 +161,15 @@ async def test_dashboard_returns_would_be_live(tmp_path):
         )
 
     await open_one("live_tok", 1, 1)  # First trade: cap=1 → would_be_live=1
-    await open_one("cap_tok", 1, 1)   # Second trade: cap already hit → would_be_live=0
+    await open_one("cap_tok", 1, 1)  # Second trade: cap already hit → would_be_live=0
     await db.close()
 
     positions = await get_trading_positions(str(db_path))
     by_tok = {p["token_id"]: p for p in positions}
-    assert "would_be_live" in by_tok["live_tok"], "would_be_live key missing from response"
-    assert by_tok["live_tok"]["would_be_live"] == 1, "first trade should be live-eligible"
+    assert (
+        "would_be_live" in by_tok["live_tok"]
+    ), "would_be_live key missing from response"
+    assert (
+        by_tok["live_tok"]["would_be_live"] == 1
+    ), "first trade should be live-eligible"
     assert by_tok["cap_tok"]["would_be_live"] == 0, "second trade should be beyond-cap"

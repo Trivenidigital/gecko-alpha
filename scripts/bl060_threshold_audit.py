@@ -18,7 +18,6 @@ from collections import Counter
 
 import aiosqlite
 
-
 WINDOW_DAYS = 7
 THRESHOLDS = [10, 20, 25, 30, 35, 40, 45, 50, 60]
 

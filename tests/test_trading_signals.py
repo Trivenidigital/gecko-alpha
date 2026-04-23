@@ -559,9 +559,7 @@ async def test_trade_predictions_skips_junk_category(
         max_mcap=500_000_000,
         settings=settings,
     )
-    assert await _open_count(db) == 0, (
-        f"Junk category {category_name!r} opened a trade"
-    )
+    assert await _open_count(db) == 0, f"Junk category {category_name!r} opened a trade"
 
 
 @pytest.mark.parametrize(
@@ -677,7 +675,16 @@ async def test_trade_gainers_skips_non_ascii_ticker(db, engine, settings):
            (coin_id, symbol, name, price_change_24h, market_cap, volume_24h,
             price_at_snapshot, snapshot_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        ("wo-ta-ma-laile", "我踏马来了", "我踏马来了", 25.0, 10_000_000, 100.0, 1.0, now),
+        (
+            "wo-ta-ma-laile",
+            "我踏马来了",
+            "我踏马来了",
+            25.0,
+            10_000_000,
+            100.0,
+            1.0,
+            now,
+        ),
     )
     await db._conn.commit()
     await trade_gainers(engine, db, min_mcap=5_000_000, settings=settings)
@@ -850,9 +857,7 @@ async def test_trade_volume_spikes_skips_non_ascii_ticker(db, engine, settings):
 # ---------------- BL-059 review: C1 positive path + S3 happy path -----------
 
 
-async def test_trade_volume_spikes_opens_trade_for_clean_spike(
-    db, engine, settings
-):
+async def test_trade_volume_spikes_opens_trade_for_clean_spike(db, engine, settings):
     """C1: clean VolumeSpike must open a trade.
 
     This test fails against PR #45 as first committed because the body of
@@ -956,9 +961,7 @@ async def test_trade_trending_logs_signal_skipped_junk(db, engine, settings):
     assert events[0]["signal_type"] == "trending_catch"
 
 
-async def test_trade_first_signals_logs_signal_skipped_junk(
-    db, engine, settings
-):
+async def test_trade_first_signals_logs_signal_skipped_junk(db, engine, settings):
     import structlog.testing
 
     from scout.models import CandidateToken
@@ -983,9 +986,7 @@ async def test_trade_first_signals_logs_signal_skipped_junk(
     assert events[0]["signal_type"] == "first_signal"
 
 
-async def test_trade_chain_completions_logs_signal_skipped_junk(
-    db, engine, settings
-):
+async def test_trade_chain_completions_logs_signal_skipped_junk(db, engine, settings):
     import structlog.testing
 
     from scout.trading.signals import trade_chain_completions
@@ -1012,9 +1013,7 @@ async def test_trade_chain_completions_logs_signal_skipped_junk(
     assert events[0]["signal_type"] == "chain_completed"
 
 
-async def test_trade_volume_spikes_logs_signal_skipped_junk(
-    db, engine, settings
-):
+async def test_trade_volume_spikes_logs_signal_skipped_junk(db, engine, settings):
     import structlog.testing
     from datetime import datetime as _dt
     from datetime import timezone as _tz
@@ -1084,7 +1083,7 @@ async def test_candidate_below_min_quant_score_skipped(db, tmp_path):
             eng,
             db,
             scored_candidates=[
-                (low, 30, ["momentum_ratio"]),   # below threshold — expect skip
+                (low, 30, ["momentum_ratio"]),  # below threshold — expect skip
                 (high, 50, ["momentum_ratio"]),  # above threshold — expect admit
             ],
             min_mcap=5_000_000,
@@ -1096,17 +1095,17 @@ async def test_candidate_below_min_quant_score_skipped(db, tmp_path):
         (e for e in cap if e.get("event") == "trade_first_signals_filtered"),
         None,
     )
-    assert summary is not None, (
-        f"missing summary log; got events: {[e.get('event') for e in cap]}"
-    )
+    assert (
+        summary is not None
+    ), f"missing summary log; got events: {[e.get('event') for e in cap]}"
     assert summary.get("skipped_below_threshold") == 1, summary
 
     # Per-token gate log must be debug, not info
     gated = [e for e in cap if e.get("event") == "signal_gated_below_threshold"]
     assert len(gated) == 1, f"expected 1 gated event, got {gated}"
-    assert gated[0].get("log_level") == "debug", (
-        f"per-token gate must be debug, not info; got {gated[0].get('log_level')}"
-    )
+    assert (
+        gated[0].get("log_level") == "debug"
+    ), f"per-token gate must be debug, not info; got {gated[0].get('log_level')}"
     assert gated[0].get("symbol") == "LOW"
 
     # High-score token must have opened a trade
@@ -1183,7 +1182,9 @@ async def test_other_dispatchers_ignore_threshold(db, tmp_path):
         detected_at=_dt.now(_tz.utc),
     )
     await trade_volume_spikes(eng, db, [spike], settings=s)
-    assert await _open_count(db) == 4, "trade_volume_spikes blocked by threshold (must not)"
+    assert (
+        await _open_count(db) == 4
+    ), "trade_volume_spikes blocked by threshold (must not)"
 
     # trade_chain_completions — reads chain_matches
     now = datetime.now(timezone.utc).isoformat()
@@ -1203,7 +1204,9 @@ async def test_other_dispatchers_ignore_threshold(db, tmp_path):
     await db._conn.commit()
     await _seed_price(db, "chain-coin", price=1.0)
     await trade_chain_completions(eng, db, settings=s)
-    assert await _open_count(db) == 5, "trade_chain_completions blocked by threshold (must not)"
+    assert (
+        await _open_count(db) == 5
+    ), "trade_chain_completions blocked by threshold (must not)"
 
     # trade_predictions — takes NarrativePrediction list
     pred = _make_pred("pred-coin", category_name="AI", mcap=20_000_000)
@@ -1216,4 +1219,6 @@ async def test_other_dispatchers_ignore_threshold(db, tmp_path):
         max_mcap=500_000_000,
         settings=s,
     )
-    assert await _open_count(db) == 6, "trade_predictions blocked by threshold (must not)"
+    assert (
+        await _open_count(db) == 6
+    ), "trade_predictions blocked by threshold (must not)"

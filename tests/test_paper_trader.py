@@ -266,9 +266,7 @@ async def test_stamp_fresh_db_first_n_up_to_cap_are_live_eligible(tmp_path):
     ) as cur:
         rows = await cur.fetchall()
     stamps = [r[1] for r in rows]
-    assert sum(s == 1 for s in stamps) == 20, (
-        f"first 20 must stamp =1; got {stamps}"
-    )
+    assert sum(s == 1 for s in stamps) == 20, f"first 20 must stamp =1; got {stamps}"
     assert stamps[20] == 0, f"21st must stamp =0; got {stamps[20]}"
     await db.close()
 
@@ -283,21 +281,32 @@ async def test_closing_live_eligible_trade_frees_slot(tmp_path):
     async def open_one(i: int):
         return await trader.execute_buy(
             db=db,
-            token_id=f"tok{i}", symbol=f"S{i}", name=f"N{i}", chain="eth",
-            signal_type="first_signal", signal_data={"quant_score": 50},
-            current_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            token_id=f"tok{i}",
+            symbol=f"S{i}",
+            name=f"N{i}",
+            chain="eth",
+            signal_type="first_signal",
+            signal_data={"quant_score": 50},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=40.0,
+            sl_pct=20.0,
             slippage_bps=0,
             signal_combo="first_signal",
-            lead_time_vs_trending_min=None, lead_time_vs_trending_status=None,
-            live_eligible_cap=2, min_quant_score=1,
+            lead_time_vs_trending_min=None,
+            lead_time_vs_trending_status=None,
+            live_eligible_cap=2,
+            min_quant_score=1,
         )
 
     id1 = await open_one(0)
     id2 = await open_one(1)
     id3 = await open_one(2)
-    assert (await _stamp_of(db, id1),
-            await _stamp_of(db, id2),
-            await _stamp_of(db, id3)) == (1, 1, 0)
+    assert (
+        await _stamp_of(db, id1),
+        await _stamp_of(db, id2),
+        await _stamp_of(db, id3),
+    ) == (1, 1, 0)
 
     await db._conn.execute(
         "UPDATE paper_trades SET status='closed_tp' WHERE id=?", (id1,)
@@ -319,13 +328,22 @@ async def test_stamp_zero_fires_cap_reached_log(tmp_path):
     async def open_one(i: int):
         return await trader.execute_buy(
             db=db,
-            token_id=f"tok{i}", symbol=f"S{i}", name=f"N{i}", chain="eth",
-            signal_type="first_signal", signal_data={"quant_score": 50},
-            current_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            token_id=f"tok{i}",
+            symbol=f"S{i}",
+            name=f"N{i}",
+            chain="eth",
+            signal_type="first_signal",
+            signal_data={"quant_score": 50},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=40.0,
+            sl_pct=20.0,
             slippage_bps=0,
             signal_combo="first_signal",
-            lead_time_vs_trending_min=None, lead_time_vs_trending_status=None,
-            live_eligible_cap=1, min_quant_score=1,
+            lead_time_vs_trending_min=None,
+            lead_time_vs_trending_status=None,
+            live_eligible_cap=1,
+            min_quant_score=1,
         )
 
     await open_one(0)  # stamps =1, no log
@@ -350,18 +368,25 @@ async def test_cap_zero_stamps_all_zero(tmp_path):
     for i in range(5):
         await trader.execute_buy(
             db=db,
-            token_id=f"tok{i}", symbol=f"S{i}", name=f"N{i}", chain="eth",
-            signal_type="first_signal", signal_data={"quant_score": 50},
-            current_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            token_id=f"tok{i}",
+            symbol=f"S{i}",
+            name=f"N{i}",
+            chain="eth",
+            signal_type="first_signal",
+            signal_data={"quant_score": 50},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=40.0,
+            sl_pct=20.0,
             slippage_bps=0,
             signal_combo="first_signal",
-            lead_time_vs_trending_min=None, lead_time_vs_trending_status=None,
-            live_eligible_cap=0, min_quant_score=1,
+            lead_time_vs_trending_min=None,
+            lead_time_vs_trending_status=None,
+            live_eligible_cap=0,
+            min_quant_score=1,
         )
 
-    async with db._conn.execute(
-        "SELECT would_be_live FROM paper_trades"
-    ) as cur:
+    async with db._conn.execute("SELECT would_be_live FROM paper_trades") as cur:
         rows = await cur.fetchall()
     assert all(r[0] == 0 for r in rows), [r[0] for r in rows]
     await db.close()
@@ -384,22 +409,48 @@ async def test_closed_live_eligible_excluded_from_cap_count(tmp_path):
             "lead_time_vs_trending_min, lead_time_vs_trending_status, "
             "would_be_live) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (f"seeded{i}", "S", "N", "eth", "first_signal", "{}",
-             1.0, 100.0, 100.0, 40.0, 20.0, 1.4, 0.8,
-             "closed_tp", "2026-04-22T00:00:00",
-             "first_signal", None, None, 1),
+            (
+                f"seeded{i}",
+                "S",
+                "N",
+                "eth",
+                "first_signal",
+                "{}",
+                1.0,
+                100.0,
+                100.0,
+                40.0,
+                20.0,
+                1.4,
+                0.8,
+                "closed_tp",
+                "2026-04-22T00:00:00",
+                "first_signal",
+                None,
+                None,
+                1,
+            ),
         )
     await db._conn.commit()
 
     trade_id = await trader.execute_buy(
         db=db,
-        token_id="fresh", symbol="F", name="Fresh", chain="eth",
-        signal_type="first_signal", signal_data={"quant_score": 50},
-        current_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+        token_id="fresh",
+        symbol="F",
+        name="Fresh",
+        chain="eth",
+        signal_type="first_signal",
+        signal_data={"quant_score": 50},
+        current_price=1.0,
+        amount_usd=100.0,
+        tp_pct=40.0,
+        sl_pct=20.0,
         slippage_bps=0,
         signal_combo="first_signal",
-        lead_time_vs_trending_min=None, lead_time_vs_trending_status=None,
-        live_eligible_cap=2, min_quant_score=1,
+        lead_time_vs_trending_min=None,
+        lead_time_vs_trending_status=None,
+        live_eligible_cap=2,
+        min_quant_score=1,
     )
     cur = await db._conn.execute(
         "SELECT would_be_live FROM paper_trades WHERE id=?", (trade_id,)
@@ -419,21 +470,28 @@ async def test_min_quant_score_zero_null_stamps(tmp_path):
     for i in range(3):
         await trader.execute_buy(
             db=db,
-            token_id=f"tok{i}", symbol=f"S{i}", name=f"N{i}", chain="eth",
-            signal_type="first_signal", signal_data={"quant_score": 50},
-            current_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            token_id=f"tok{i}",
+            symbol=f"S{i}",
+            name=f"N{i}",
+            chain="eth",
+            signal_type="first_signal",
+            signal_data={"quant_score": 50},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=40.0,
+            sl_pct=20.0,
             slippage_bps=0,
             signal_combo="first_signal",
-            lead_time_vs_trending_min=None, lead_time_vs_trending_status=None,
-            live_eligible_cap=20, min_quant_score=0,
+            lead_time_vs_trending_min=None,
+            lead_time_vs_trending_status=None,
+            live_eligible_cap=20,
+            min_quant_score=0,
         )
-    async with db._conn.execute(
-        "SELECT would_be_live FROM paper_trades"
-    ) as cur:
+    async with db._conn.execute("SELECT would_be_live FROM paper_trades") as cur:
         rows = await cur.fetchall()
-    assert all(r[0] is None for r in rows), (
-        f"regime-null stamps expected; got {[r[0] for r in rows]}"
-    )
+    assert all(
+        r[0] is None for r in rows
+    ), f"regime-null stamps expected; got {[r[0] for r in rows]}"
     await db.close()
 
 
@@ -446,13 +504,22 @@ async def test_stamped_rows_immutable_across_migrations(tmp_path):
 
     trade_id = await trader.execute_buy(
         db=db,
-        token_id="stable", symbol="S", name="N", chain="eth",
-        signal_type="first_signal", signal_data={"quant_score": 50},
-        current_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+        token_id="stable",
+        symbol="S",
+        name="N",
+        chain="eth",
+        signal_type="first_signal",
+        signal_data={"quant_score": 50},
+        current_price=1.0,
+        amount_usd=100.0,
+        tp_pct=40.0,
+        sl_pct=20.0,
         slippage_bps=0,
         signal_combo="first_signal",
-        lead_time_vs_trending_min=None, lead_time_vs_trending_status=None,
-        live_eligible_cap=20, min_quant_score=1,
+        lead_time_vs_trending_min=None,
+        lead_time_vs_trending_status=None,
+        live_eligible_cap=20,
+        min_quant_score=1,
     )
     cur = await db._conn.execute(
         "SELECT would_be_live FROM paper_trades WHERE id=?", (trade_id,)
@@ -481,19 +548,26 @@ async def test_stamp_subquery_correctness_under_shared_conn(tmp_path):
     async def one(i: int):
         return await trader.execute_buy(
             db=db,
-            token_id=f"tok{i}", symbol=f"S{i}", name=f"N{i}", chain="eth",
-            signal_type="first_signal", signal_data={"quant_score": 50},
-            current_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            token_id=f"tok{i}",
+            symbol=f"S{i}",
+            name=f"N{i}",
+            chain="eth",
+            signal_type="first_signal",
+            signal_data={"quant_score": 50},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=40.0,
+            sl_pct=20.0,
             slippage_bps=0,
             signal_combo="first_signal",
-            lead_time_vs_trending_min=None, lead_time_vs_trending_status=None,
-            live_eligible_cap=20, min_quant_score=1,
+            lead_time_vs_trending_min=None,
+            lead_time_vs_trending_status=None,
+            live_eligible_cap=20,
+            min_quant_score=1,
         )
 
     await asyncio.gather(*[one(i) for i in range(40)])
-    async with db._conn.execute(
-        "SELECT would_be_live FROM paper_trades"
-    ) as cur:
+    async with db._conn.execute("SELECT would_be_live FROM paper_trades") as cur:
         stamps = [r[0] for r in await cur.fetchall()]
     ones = sum(1 for s in stamps if s == 1)
     zeros = sum(1 for s in stamps if s == 0)
