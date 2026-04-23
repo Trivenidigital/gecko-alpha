@@ -94,7 +94,10 @@ async def test_fetch_trending_handles_empty_response(mock_aiohttp, settings_fact
     assert tokens == []
 
 
-async def test_fetch_trending_handles_429_with_backoff(mock_aiohttp, settings_factory):
+async def test_fetch_trending_handles_429_with_backoff(
+    mock_aiohttp, settings_factory, patch_module_sleep
+):
+    patch_module_sleep("scout.ingestion.dexscreener")
     mock_aiohttp.get(DEXSCREENER_TRENDING_URL, status=429)
     mock_aiohttp.get(
         DEXSCREENER_TRENDING_URL,

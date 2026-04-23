@@ -101,7 +101,8 @@ async def test_fetch_401_returns_empty():
     assert result == []
 
 
-async def test_fetch_429_retries_then_empty():
+async def test_fetch_429_retries_then_empty(patch_module_sleep):
+    patch_module_sleep("scout.news.cryptopanic")
     s = _settings()
     with aioresponses() as m:
         m.get(BASE, status=429, repeat=True)
@@ -110,7 +111,8 @@ async def test_fetch_429_retries_then_empty():
     assert result == []
 
 
-async def test_fetch_5xx_retries_then_empty():
+async def test_fetch_5xx_retries_then_empty(patch_module_sleep):
+    patch_module_sleep("scout.news.cryptopanic")
     s = _settings()
     with aioresponses() as m:
         m.get(BASE, status=503, repeat=True)
@@ -119,7 +121,8 @@ async def test_fetch_5xx_retries_then_empty():
     assert result == []
 
 
-async def test_fetch_200_after_429_succeeds():
+async def test_fetch_200_after_429_succeeds(patch_module_sleep):
+    patch_module_sleep("scout.news.cryptopanic")
     s = _settings()
     body = {
         "results": [
@@ -179,8 +182,9 @@ async def test_fetch_dedups_duplicate_post_ids_in_batch():
     assert [p.post_id for p in result] == [5, 6]
 
 
-async def test_fetch_timeout_returns_empty():
+async def test_fetch_timeout_returns_empty(patch_module_sleep):
     """Spec §12: asyncio.TimeoutError / aiohttp.ClientError fall through to []."""
+    patch_module_sleep("scout.news.cryptopanic")
     s = _settings()
     with aioresponses() as m:
         m.get(BASE, exception=asyncio.TimeoutError(), repeat=True)
@@ -189,8 +193,9 @@ async def test_fetch_timeout_returns_empty():
     assert result == []
 
 
-async def test_fetch_connection_error_returns_empty():
+async def test_fetch_connection_error_returns_empty(patch_module_sleep):
     """Spec §12: aiohttp.ClientConnectorError also falls through cleanly."""
+    patch_module_sleep("scout.news.cryptopanic")
     s = _settings()
     with aioresponses() as m:
         m.get(BASE, exception=aiohttp.ClientError("boom"), repeat=True)

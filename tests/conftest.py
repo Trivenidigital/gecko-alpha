@@ -49,6 +49,42 @@ def settings_factory():
 
 
 @pytest.fixture
+def patch_module_sleep(monkeypatch):
+    """Return a helper that short-circuits ``asyncio.sleep`` in specific modules.
+
+    Usage::
+
+        def test_x(patch_module_sleep):
+            patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
+            ...
+
+    Builds a ``types.SimpleNamespace`` clone of the real ``asyncio`` module with
+    ``sleep`` replaced by an instant no-op, then monkey-patches the target
+    modules' ``asyncio`` attribute to that clone. The real ``asyncio`` module is
+    untouched — aiohttp, pytest-asyncio, and other libs keep working normally.
+    """
+    import asyncio as _asyncio_mod
+    import importlib
+    import types
+
+    fake_asyncio = types.SimpleNamespace(
+        **{n: getattr(_asyncio_mod, n) for n in dir(_asyncio_mod) if not n.startswith("_")}
+    )
+
+    async def _instant(_):
+        return None
+
+    fake_asyncio.sleep = _instant
+
+    def _apply(*module_paths):
+        for path in module_paths:
+            mod = importlib.import_module(path)
+            monkeypatch.setattr(mod, "asyncio", fake_asyncio)
+
+    return _apply
+
+
+@pytest.fixture
 def token_factory():
     def _make(**overrides):
         defaults = dict(
