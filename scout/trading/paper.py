@@ -166,6 +166,80 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
 
         return trade_id
 
+    async def execute_partial_sell(
+        self,
+        db: Database,
+        trade_id: int,
+        *,
+        leg: int,
+        sell_qty_frac: float,
+        current_price: float,
+        slippage_bps: int = 0,
+    ) -> bool:
+        """Sell a fraction of original quantity for a ladder leg fill.
+
+        Updates remaining_qty, sets leg_N_filled_at/leg_N_exit_price, increments
+        realized_pnl_usd, and (on leg 1) arms the floor. Returns True on success.
+
+        Idempotent: re-calling for the same leg is a no-op when leg_N_filled_at
+        is already set (guard against concurrent evaluator ticks).
+        """
+        if leg not in (1, 2):
+            raise ValueError(f"leg must be 1 or 2, got {leg}")
+        conn = db._conn
+        if conn is None:
+            raise RuntimeError("Database not initialized.")
+
+        cur = await conn.execute(
+            f"SELECT entry_price, quantity, remaining_qty, realized_pnl_usd, "
+            f"leg_{leg}_filled_at FROM paper_trades WHERE id = ?",
+            (trade_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            log.warning("partial_sell_trade_not_found", trade_id=trade_id, leg=leg)
+            return False
+        entry_price, initial_qty, remaining_qty, realized, already_filled = row
+        if already_filled is not None:
+            log.info("partial_sell_already_filled", trade_id=trade_id, leg=leg)
+            return False
+
+        effective_exit = current_price * (1 - slippage_bps / 10000)
+        if effective_exit <= 0:
+            log.warning("partial_sell_zero_price", trade_id=trade_id, leg=leg)
+            return False
+
+        leg_qty = float(initial_qty) * sell_qty_frac
+        proceeds = leg_qty * effective_exit
+        cost = leg_qty * float(entry_price)
+        leg_realized = proceeds - cost
+        new_remaining = float(remaining_qty) - leg_qty
+        new_realized = float(realized) + leg_realized
+        now = datetime.now(timezone.utc).isoformat()
+
+        updates = (
+            f"UPDATE paper_trades SET remaining_qty = ?, realized_pnl_usd = ?, "
+            f"leg_{leg}_filled_at = ?, leg_{leg}_exit_price = ?"
+        )
+        params: list = [new_remaining, new_realized, now, effective_exit]
+        if leg == 1:
+            updates += ", floor_armed = 1"
+        updates += f" WHERE id = ? AND leg_{leg}_filled_at IS NULL"
+        params.append(trade_id)
+
+        await conn.execute(updates, params)
+        await conn.commit()
+
+        log.info(
+            "ladder_leg_fired",
+            trade_id=trade_id, leg=leg, fill_price=effective_exit,
+            leg_qty=leg_qty, leg_realized_usd=leg_realized,
+            remaining_qty=new_remaining, realized_pnl_usd=new_realized,
+        )
+        if leg == 1:
+            log.info("floor_activated", trade_id=trade_id)
+        return True
+
     async def execute_sell(
         self,
         db: Database,

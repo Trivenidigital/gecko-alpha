@@ -208,3 +208,35 @@ async def test_execute_sell_stop_loss_pnl(db, trader):
     row = dict(await cursor.fetchone())
     assert row["pnl_pct"] == pytest.approx(-10.0)
     assert row["pnl_usd"] == pytest.approx(-100.0)
+
+
+async def test_execute_partial_sell_updates_remaining_qty(tmp_path):
+    from scout.db import Database
+    from scout.trading.paper import PaperTrader
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    trader = PaperTrader()
+    trade_id = await trader.execute_buy(
+        db=db, token_id="tok", symbol="TOK", name="Token", chain="coingecko",
+        signal_type="gainers_early", signal_data={}, current_price=1.0,
+        amount_usd=300.0, tp_pct=40.0, sl_pct=15.0, slippage_bps=0,
+        signal_combo="gainers_early",
+    )
+    # Sell 30% of position at $1.25 (leg 1 at +25%)
+    ok = await trader.execute_partial_sell(
+        db=db, trade_id=trade_id, leg=1, sell_qty_frac=0.30,
+        current_price=1.25, slippage_bps=0,
+    )
+    assert ok
+    cur = await db._conn.execute(
+        "SELECT remaining_qty, floor_armed, realized_pnl_usd, leg_1_filled_at, leg_1_exit_price "
+        "FROM paper_trades WHERE id = ?", (trade_id,)
+    )
+    row = await cur.fetchone()
+    remaining_qty, floor_armed, realized, leg1_filled, leg1_exit = row
+    assert remaining_qty == pytest.approx(300.0 * 0.70, rel=1e-6)  # 210 units at $1.0 entry
+    assert floor_armed == 1
+    assert realized == pytest.approx(300.0 * 0.30 * 0.25, rel=1e-6)  # 30% of 300 * 25% = 22.50
+    assert leg1_filled is not None
+    assert leg1_exit == pytest.approx(1.25, rel=1e-6)
+    await db.close()
