@@ -327,17 +327,6 @@ export default function TradingTab() {
           {positions.length > 0 && (
             <div className="summary-line" style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
               {positions.length} active
-              {positions.every(p => 'would_be_live' in p) && (
-                <>
-                  {' ('}
-                  <span>{positions.filter(p => p.would_be_live === 1).length} live-eligible ⚡</span>
-                  {' · '}
-                  <span>{positions.filter(p => p.would_be_live === 0).length} beyond-cap</span>
-                  {' · '}
-                  <span>{positions.filter(p => p.would_be_live === null).length} unscoped</span>
-                  {')'}
-                </>
-              )}
             </div>
           )}
         </div>
@@ -357,6 +346,7 @@ export default function TradingTab() {
                   <SortHeader col="pnl_usd" label="PnL $" />
                   <SortHeader col="pnl_pct" label="PnL %" />
                   <th>TP / SL</th>
+                  <th>Legs</th>
                   <th>Checkpoints</th>
                   <SortHeader col="opened" label="Opened" />
                   <th>Action</th>
@@ -369,15 +359,7 @@ export default function TradingTab() {
                   return (
                     <tr key={p.id || i}>
                       <td className="rank-cell" style={{ whiteSpace: 'nowrap', textAlign: 'center', fontWeight: 600, fontSize: 13 }}>
-                        {p.unrealized_pnl_pct == null ? (
-                          '—'
-                        ) : (
-                          <>
-                            {pnlRankMap.get(p.id) ?? '—'}
-                            {p.would_be_live === 1 && <span className="badge-live" title="live-eligible" style={{ marginLeft: 3, fontSize: 11 }}>⚡</span>}
-                            {p.would_be_live === null && <span className="badge-unscoped" title="unscoped — excluded from A/B" style={{ marginLeft: 3, fontSize: 11, color: 'var(--color-text-secondary)' }}>·</span>}
-                          </>
-                        )}
+                        {p.unrealized_pnl_pct == null ? '—' : (pnlRankMap.get(p.id) ?? '—')}
                       </td>
                       <td>
                         <TokenLink
@@ -415,6 +397,18 @@ export default function TradingTab() {
                         <div style={{ fontSize: 10, color: 'var(--color-text-secondary)', opacity: 0.7 }}>
                           {fmtPrice(p.tp_price)} / {fmtPrice(p.sl_price)}
                         </div>
+                      </td>
+                      <td style={{ fontSize: 12, textAlign: 'center', whiteSpace: 'nowrap' }}>
+                        <span title={p.leg_1_filled_at ? `leg 1 filled ${p.leg_1_filled_at}` : 'leg 1 pending (+25%)'}>
+                          {p.leg_1_filled_at ? '▣' : '○'}
+                        </span>
+                        {' '}
+                        <span title={p.leg_2_filled_at ? `leg 2 filled ${p.leg_2_filled_at}` : 'leg 2 pending (+50%)'}>
+                          {p.leg_2_filled_at ? '▣' : '○'}
+                        </span>
+                        {p.floor_armed === 1 && (
+                          <span title="floor armed" style={{ marginLeft: 4, color: 'var(--color-text-secondary)' }}>🛡</span>
+                        )}
                       </td>
                       <td>{checkpointBadges(p)}</td>
                       <td style={{ fontSize: 12, color: 'var(--color-text-secondary)', whiteSpace: 'nowrap' }}>
