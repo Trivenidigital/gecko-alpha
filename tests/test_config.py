@@ -196,3 +196,24 @@ def test_bl060_rejects_negative_values():
             ANTHROPIC_API_KEY="k",
             PAPER_LIVE_ELIGIBLE_CAP=-1,
         )
+
+
+def test_bl061_ladder_config_defaults(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    from scout.config import Settings
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="x",
+        TELEGRAM_CHAT_ID="1",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.PAPER_LADDER_LEG_1_PCT == 25.0
+    assert s.PAPER_LADDER_LEG_1_QTY_FRAC == 0.30
+    assert s.PAPER_LADDER_LEG_2_PCT == 50.0
+    assert s.PAPER_LADDER_LEG_2_QTY_FRAC == 0.30
+    assert s.PAPER_LADDER_TRAIL_PCT == 12.0
+    assert s.PAPER_LADDER_FLOOR_ARM_ON_LEG_1 is True
+    assert s.PAPER_SL_PCT == 15.0
+    # BL-060 fields removed
+    assert not hasattr(s, "PAPER_MIN_QUANT_SCORE")
+    assert not hasattr(s, "PAPER_LIVE_ELIGIBLE_CAP")
