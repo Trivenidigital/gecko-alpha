@@ -194,3 +194,12 @@ async def test_initialize_upgrades_pre_bl055_db(tmp_path):
     cur = await db._conn.execute("SELECT COUNT(*) FROM paper_trades")
     assert (await cur.fetchone())[0] == 1
     await db.close()
+
+
+async def test_connect_sets_foreign_keys_pragma(tmp_path):
+    db = Database(tmp_path / "gecko.db")
+    await db.initialize()
+    cur = await db._conn.execute("PRAGMA foreign_keys")
+    row = await cur.fetchone()
+    assert row[0] == 1, "foreign_keys must be ON after initialize()"
+    await db.close()
