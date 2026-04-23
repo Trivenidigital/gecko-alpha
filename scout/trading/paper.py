@@ -251,6 +251,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         current_price: float,
         reason: str,
         slippage_bps: int = 0,
+        *,
+        status_override: str | None = None,
     ) -> bool:
         """Close a paper trade. Applies exit slippage. Returns True if closed.
 
@@ -299,7 +301,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             "trailing_stop": "closed_trailing_stop",
             "manual": "closed_manual",
         }
-        status = status_map.get(reason, "closed_manual")
+        status = (
+            status_override
+            if status_override is not None
+            else status_map.get(reason, "closed_manual")
+        )
 
         cursor_upd = await conn.execute(
             """UPDATE paper_trades

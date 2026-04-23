@@ -47,7 +47,9 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                   checkpoint_1h_price, checkpoint_6h_price,
                   checkpoint_24h_price, checkpoint_48h_price,
                   peak_price, peak_pct, signal_data, symbol, name, chain,
-                  amount_usd, quantity, signal_type
+                  amount_usd, quantity, signal_type,
+                  created_at, leg_1_filled_at, leg_2_filled_at,
+                  remaining_qty, floor_armed, realized_pnl_usd
            FROM paper_trades
            WHERE status = 'open'""")
     rows = await cursor.fetchall()
@@ -70,6 +72,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             price_map[pr[0]] = (float(pr[1]), str(pr[2]))
 
     _trader = PaperTrader()
+    cutover_ts = await _load_bl061_cutover_ts(conn)
 
     now = datetime.now(timezone.utc)
     max_duration = timedelta(hours=settings.PAPER_MAX_DURATION_HOURS)
@@ -157,6 +160,115 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     values,
                 )
 
+            # BL-061 ladder state
+            created_at_str = row[21] if len(row) > 21 else None
+            leg_1_filled = row[22] if len(row) > 22 else None
+            leg_2_filled = row[23] if len(row) > 23 else None
+            remaining_qty = float(row[24]) if len(row) > 24 and row[24] is not None else None
+            floor_armed = bool(row[25]) if len(row) > 25 and row[25] is not None else False
+
+            # Determine BL-061 eligibility: use datetime comparison to handle
+            # format mismatch between SQLite datetime('now') space format and
+            # ISO-with-tz format stored in paper_migrations.cutover_ts.
+            # SQLite datetime('now') has second precision; cutover_ts has
+            # microsecond precision. Truncate cutover to the second so that
+            # trades inserted in the same second as the migration are included.
+            def _parse_ts(s: str | None) -> datetime | None:
+                if s is None:
+                    return None
+                try:
+                    dt = datetime.fromisoformat(s)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return dt
+                except ValueError:
+                    return None
+
+            created_at_dt = _parse_ts(created_at_str)
+            cutover_dt = _parse_ts(cutover_ts)
+            if cutover_dt is not None:
+                cutover_dt = cutover_dt.replace(microsecond=0)
+
+            is_bl061 = (
+                remaining_qty is not None
+                and created_at_dt is not None
+                and cutover_dt is not None
+                and created_at_dt >= cutover_dt
+            )
+
+            if is_bl061:
+                close_reason = None
+                close_status: str | None = None
+                # SL applies only before leg 1 arms the floor
+                if not floor_armed and sl_price > 0 and current_price <= sl_price:
+                    close_reason = "stop_loss"
+                    close_status = "closed_sl"
+                # Leg 1
+                elif leg_1_filled is None and change_pct >= settings.PAPER_LADDER_LEG_1_PCT:
+                    await _trader.execute_partial_sell(
+                        db=db, trade_id=trade_id, leg=1,
+                        sell_qty_frac=settings.PAPER_LADDER_LEG_1_QTY_FRAC,
+                        current_price=current_price, slippage_bps=slippage_bps,
+                    )
+                    continue
+                # Leg 2
+                elif (
+                    leg_1_filled is not None
+                    and leg_2_filled is None
+                    and change_pct >= settings.PAPER_LADDER_LEG_2_PCT
+                ):
+                    await _trader.execute_partial_sell(
+                        db=db, trade_id=trade_id, leg=2,
+                        sell_qty_frac=settings.PAPER_LADDER_LEG_2_QTY_FRAC,
+                        current_price=current_price, slippage_bps=slippage_bps,
+                    )
+                    continue
+                # Floor exit — once armed, don't let the runner slice close below entry
+                elif floor_armed and current_price <= entry_price:
+                    close_reason = "floor"
+                    close_status = "closed_floor"
+                    log.info(
+                        "floor_exit",
+                        trade_id=trade_id, peak_pct=round(peak_pct or 0, 2),
+                        current_price=current_price,
+                    )
+                # Trailing stop on runner (post-leg-1 only)
+                elif (
+                    floor_armed
+                    and peak_price is not None
+                    and peak_pct is not None
+                    and peak_pct >= settings.PAPER_LADDER_LEG_1_PCT
+                ):
+                    trail_threshold = peak_price * (
+                        1 - settings.PAPER_LADDER_TRAIL_PCT / 100.0
+                    )
+                    if current_price < trail_threshold:
+                        close_reason = "trailing_stop"
+                        close_status = "closed_trailing_stop"
+                # Expiry
+                elif elapsed >= max_duration:
+                    close_reason = "expired"
+                    close_status = "closed_expired"
+
+                if close_reason is not None:
+                    closed = await _trader.execute_sell(
+                        db=db, trade_id=trade_id,
+                        current_price=current_price,
+                        reason=close_reason,
+                        slippage_bps=slippage_bps,
+                        status_override=close_status,
+                    )
+                    if closed:
+                        log.info(
+                            "paper_trade_eval_closed",
+                            trade_id=trade_id, token_id=token_id,
+                            reason=close_reason,
+                            current_price=current_price,
+                            change_pct=round(change_pct, 2),
+                        )
+                continue  # skip old cascade entirely for BL-061 rows
+
+            # ---- pre-cutover cascade (existing code, unchanged) ----
             close_reason = None
             if current_price >= tp_price:
                 close_reason = "take_profit"
