@@ -1,4 +1,4 @@
-"""Tests for paper trading daily digest."""
+"""Tests for paper trading daily digest and BL-060 weekly A/B digest."""
 
 import json
 from datetime import datetime, timezone
@@ -7,6 +7,7 @@ import pytest
 
 from scout.db import Database
 from scout.trading.digest import build_paper_digest
+from scout.trading.weekly_digest import _build_bl060_ab, _fmt_sharpe
 
 
 @pytest.fixture
@@ -187,3 +188,138 @@ async def test_digest_open_positions_exposure(db):
     result = await build_paper_digest(db, "2026-04-09")
     assert result is not None
     assert "Open: 2 positions ($1200.00 exposure)" in result
+
+
+# ---------------------------------------------------------------------------
+# BL-060 weekly digest A/B tests
+# ---------------------------------------------------------------------------
+
+_CLOSED_INSERT = (
+    "INSERT INTO paper_trades "
+    "(token_id, symbol, name, chain, signal_type, signal_data, "
+    " entry_price, amount_usd, quantity, tp_pct, sl_pct, "
+    " tp_price, sl_price, status, opened_at, "
+    " pnl_pct, signal_combo, "
+    " lead_time_vs_trending_min, lead_time_vs_trending_status, "
+    " would_be_live) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+
+_CLOSED_VALS = lambda tid, wbl, pnl, opened="2026-04-25T00:00:00": (
+    tid, "S", "N", "eth", "first_signal", "{}",
+    1.0, 100.0, 100.0, 40.0, 20.0, 1.4, 0.8,
+    "closed_tp", opened,
+    pnl, "first_signal", None, None, wbl,
+)
+
+
+@pytest.mark.asyncio
+async def test_digest_ab_cohort_excludes_nulls(tmp_path, settings_factory):
+    """Test #9 — cohort query filters would_be_live IS NOT NULL."""
+    db = Database(str(tmp_path / "gecko.db"))
+    await db.initialize()
+
+    for i in range(3):
+        await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS(f"L{i}", 1, 5.0))
+        await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS(f"B{i}", 0, -2.0))
+        await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS(f"N{i}", None, 10.0))
+    await db._conn.commit()
+
+    section = await _build_bl060_ab(
+        db, end_date=datetime(2026, 5, 2), settings=settings_factory(),
+    )
+    assert "live-eligible" in section.lower()
+    assert "n_closed=3" in section
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_digest_ab_excludes_both_null_regimes(tmp_path, settings_factory):
+    """Test #14 — both NULL regimes excluded; only wbl=1 and wbl=0 count."""
+    db = Database(str(tmp_path / "gecko.db"))
+    await db.initialize()
+
+    for i in range(2):
+        await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS(f"NULL{i}", None, 3.0, "2026-04-27T00:00:00"))
+        await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS(f"LIVE{i}", 1, 5.0, "2026-04-27T00:00:00"))
+        await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS(f"CAP{i}", 0, -2.0, "2026-04-27T00:00:00"))
+    await db._conn.commit()
+
+    section = await _build_bl060_ab(
+        db, end_date=datetime(2026, 5, 2), settings=settings_factory(),
+    )
+    assert "n_closed=2 | " in section
+    assert section.count("n_closed=2") >= 4
+    await db.close()
+
+
+def test_sharpe_noisy_below_30():
+    """Test #15a — noisy annotation for n < 30."""
+    assert "(n_closed=22, noisy)" in _fmt_sharpe(0.42, 22)
+    assert "(n_closed=29, noisy)" in _fmt_sharpe(0.42, 29)
+
+
+def test_sharpe_plain_at_30_and_above():
+    """Test #15b — plain value at n >= 30."""
+    assert _fmt_sharpe(0.42, 30) == "0.42"
+    assert _fmt_sharpe(0.42, 31) == "0.42"
+
+
+def test_sharpe_dash_on_zero_n():
+    """Test #15c — dash when n == 0 or x is None."""
+    assert _fmt_sharpe(None, 0) == "-"
+    assert _fmt_sharpe(0.42, 0) == "-"
+
+
+@pytest.mark.asyncio
+async def test_first_week_post_cutover_zero_n_guard(tmp_path, settings_factory):
+    """Test #16 — previous week zero-n renders '-' not crash."""
+    db = Database(str(tmp_path / "gecko.db"))
+    await db.initialize()
+
+    # Only seed current-week trades (no previous-week data)
+    await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS("cur1", 1, 5.0, "2026-04-27T00:00:00"))
+    await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS("cur2", 0, 5.0, "2026-04-27T00:00:00"))
+    await db._conn.commit()
+
+    section = await _build_bl060_ab(
+        db, end_date=datetime(2026, 5, 2), settings=settings_factory(),
+    )
+    assert "| -" in section or "| - " in section, (
+        "last-week zero-n must render '-'; section:\n" + section
+    )
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_delta_excludes_sharpe_under_small_n(tmp_path, settings_factory):
+    """Test #18 — delta omits Sharpe row when either side has n_closed < 30."""
+    db = Database(str(tmp_path / "gecko.db"))
+    await db.initialize()
+
+    # live side: 25 trades (< 30), beyond side: 60 trades (>= 30)
+    for i in range(25):
+        await db._conn.execute(
+            _CLOSED_INSERT,
+            _CLOSED_VALS(f"L{i}", 1, 5.0 + i * 0.1, "2026-04-27T00:00:00"),
+        )
+    for i in range(60):
+        await db._conn.execute(
+            _CLOSED_INSERT,
+            _CLOSED_VALS(f"C{i}", 0, -1.0 + i * 0.05, "2026-04-27T00:00:00"),
+        )
+    await db._conn.commit()
+
+    section = await _build_bl060_ab(
+        db, end_date=datetime(2026, 5, 2), settings=settings_factory(),
+    )
+    delta_block = section.split("Delta (live-eligible minus beyond-cap):")[1].split(
+        "Per-path"
+    )[0]
+    assert "Win-rate:" in delta_block
+    assert "Avg P&L:" in delta_block
+    assert "Sharpe:" not in delta_block, (
+        "delta must omit Sharpe row when either side has n_closed<30; got:\n"
+        + delta_block
+    )
+    await db.close()
