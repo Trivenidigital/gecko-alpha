@@ -923,8 +923,14 @@ async def _get_trading_positions_inner(db) -> list[dict]:
                 r["unrealized_pnl_pct"] = round(
                     ((cp - r["entry_price"]) / r["entry_price"]) * 100, 2
                 )
+                # Post-leg-1 ladder trades hold only remaining_qty at current price;
+                # quantity is the initial size and overstates the open slice.
+                open_qty = (
+                    r["remaining_qty"] if r.get("remaining_qty") is not None
+                    else r["quantity"]
+                )
                 r["unrealized_pnl_usd"] = round(
-                    (cp - r["entry_price"]) * r["quantity"], 2
+                    (cp - r["entry_price"]) * open_qty, 2
                 )
             else:
                 r["current_price"] = None
