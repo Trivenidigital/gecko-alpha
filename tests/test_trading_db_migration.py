@@ -290,3 +290,64 @@ async def test_migration_preserves_pre_cutover_nulls(tmp_path):
         row = await cur.fetchone()
     assert row[0] is None, f"pre-cutover row must stay NULL; got {row[0]}"
     await db.close()
+
+
+async def test_initialize_upgrades_pre_bl060_db(tmp_path):
+    """Regression: _create_tables must not reference would_be_live on an
+    existing paper_trades table that predates BL-060. The index creation
+    belongs in the migration step AFTER ALTER TABLE adds the column.
+
+    Reproduces the production failure where Database.initialize() raised
+    `sqlite3.OperationalError: no such column: would_be_live` during
+    _create_tables' executescript block on an upgrade from a DB that
+    already had paper_trades without the BL-060 column.
+    """
+    db_path = tmp_path / "gecko.db"
+    async with aiosqlite.connect(str(db_path)) as conn:
+        await conn.executescript(
+            """
+            CREATE TABLE paper_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                chain TEXT NOT NULL,
+                signal_type TEXT NOT NULL,
+                signal_data TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                amount_usd REAL NOT NULL,
+                quantity REAL NOT NULL,
+                tp_pct REAL NOT NULL DEFAULT 20.0,
+                sl_pct REAL NOT NULL DEFAULT 10.0,
+                tp_price REAL NOT NULL,
+                sl_price REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                exit_price REAL,
+                exit_reason TEXT,
+                pnl_usd REAL,
+                pnl_pct REAL,
+                peak_price REAL,
+                peak_pct REAL,
+                opened_at TEXT NOT NULL,
+                closed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(token_id, signal_type, opened_at)
+            );
+            """
+        )
+        await conn.commit()
+
+    db = Database(str(db_path))
+    await db.initialize()
+
+    cols = await _existing_paper_trades_columns(db._conn)
+    assert "would_be_live" in cols, f"migration failed to add column; got {cols}"
+
+    cur = await db._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' "
+        "AND name='idx_paper_trades_would_be_live_status'"
+    )
+    row = await cur.fetchone()
+    assert row is not None, "composite index missing after upgrade"
+
+    await db.close()

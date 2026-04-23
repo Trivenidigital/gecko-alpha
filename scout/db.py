@@ -597,8 +597,9 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status);
             CREATE INDEX IF NOT EXISTS idx_paper_trades_opened ON paper_trades(opened_at);
             CREATE INDEX IF NOT EXISTS idx_paper_trades_signal ON paper_trades(signal_type);
-            CREATE INDEX IF NOT EXISTS idx_paper_trades_would_be_live_status
-                ON paper_trades(would_be_live, status);
+            -- NOTE: idx_paper_trades_would_be_live_status is created in _migrate_feedback_loop_schema
+            -- AFTER the ALTER TABLE adds the would_be_live column. Keeping it here would break
+            -- upgrade from a pre-BL-060 DB where paper_trades exists without would_be_live.
 
             CREATE TABLE IF NOT EXISTS paper_daily_summary (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
