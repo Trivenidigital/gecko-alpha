@@ -230,7 +230,82 @@ async def build_weekly_digest(
     section_lines, _ = await _try_section("chronic_refresh", _build_chronic())
     lines.extend(section_lines)
 
+    # 7. BL-061 ladder performance — post-cutover only
+    lines.append("")
+    lines.append("[Ladder performance — 7d, post-cutover only]")
+    section_lines, _ = await _try_section(
+        "ladder_performance",
+        _build_ladder_performance(db, end_date, settings),
+    )
+    lines.extend(section_lines)
+
     return "\n".join(lines)
+
+
+async def _build_ladder_performance(
+    db: Database,
+    end_date: date,
+    settings: Settings,
+) -> list[str]:
+    """Return ladder performance stats per signal_type for the last 7 days.
+
+    Only counts post-cutover rows (remaining_qty IS NOT NULL) with
+    status LIKE 'closed%'. Returns list[str] for use with _try_section."""
+    start = datetime.combine(
+        end_date - timedelta(days=7), datetime.min.time(), tzinfo=timezone.utc
+    )
+    end = datetime.combine(end_date, datetime.max.time(), tzinfo=timezone.utc)
+
+    cur = await db._conn.execute(
+        """
+        SELECT signal_type,
+               COUNT(*) AS n,
+               SUM(CASE WHEN leg_1_filled_at IS NOT NULL THEN 1 ELSE 0 END) AS leg1,
+               SUM(CASE WHEN leg_2_filled_at IS NOT NULL THEN 1 ELSE 0 END) AS leg2,
+               ROUND(AVG(peak_pct), 1) AS avg_peak,
+               ROUND(AVG(pnl_pct), 1) AS avg_pnl
+        FROM paper_trades
+        WHERE status LIKE 'closed%'
+          AND opened_at >= ?
+          AND opened_at < ?
+          AND remaining_qty IS NOT NULL
+        GROUP BY signal_type
+        ORDER BY n DESC
+        """,
+        (start.isoformat(), end.isoformat()),
+    )
+    rows = await cur.fetchall()
+
+    out: list[str] = []
+    out.append("Ladder performance (post-cutover, last 7d)")
+    out.append("=" * 42)
+
+    if not rows:
+        out.append("  (no post-cutover closed trades yet)")
+        return out
+
+    out.append(
+        "{:<24s} {:>4s} {:>6s} {:>6s} {:>9s} {:>8s}".format(
+            "signal", "n", "l1%", "l2%", "avg_peak", "avg_pnl"
+        )
+    )
+    for row in rows:
+        signal = row["signal_type"] or "unknown"
+        n = row["n"]
+        leg1 = row["leg1"] or 0
+        leg2 = row["leg2"] or 0
+        avg_peak = row["avg_peak"]
+        avg_pnl = row["avg_pnl"]
+        l1_rate = 100.0 * leg1 / n if n else 0.0
+        l2_rate = 100.0 * leg2 / n if n else 0.0
+        peak_str = "n/a" if avg_peak is None else f"{avg_peak:.1f}%"
+        pnl_str = "n/a" if avg_pnl is None else f"{avg_pnl:.1f}%"
+        out.append(
+            "{:<24s} {:>4d} {:>5.1f}% {:>5.1f}% {:>9s} {:>8s}".format(
+                signal, n, l1_rate, l2_rate, peak_str, pnl_str
+            )
+        )
+    return out
 
 
 async def send_weekly_digest(db: Database, settings: Settings) -> None:
