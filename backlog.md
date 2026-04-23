@@ -200,11 +200,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Changes:** Graduated scoring: 8 pts for $10K-$100K, 5 pts for $100K-$250K, 2 pts for $250K-$500K
 
 ### BL-032: Populate social_mentions_24h signal
-**Status:** Not started — currently dead signal (15 pts never fire)
-**Files:** scout/ingestion/, scout/models.py
-**Why:** Code review found social_mentions_24h is never populated.
-**Note:** PRD defers Twitter/X integration to Phase 5. Could use free Telegram channel monitoring or LunarCrush API as interim source.
-**Blocked by:** Social data source decision (LunarCrush is an option at $24/mo)
+**Status:** DROPPED (2026-04-19) — LunarCrush cancelled on cost + low marginal value over free CoinGecko layer. The +15-pt scorer signal at `scout/scorer.py:104` stays permanently dead. Revisit only if a zero-cost source (Telegram channel scraping, unused CoinGecko endpoints) becomes viable.
 
 ### BL-033: Add heartbeat logging every 5 minutes
 **Status:** DONE — heartbeat logging implemented (PR #7)
@@ -280,21 +276,23 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 **Skip list (negative ROI):** Telegram/Discord scraping (legal gray, noisy), GitHub webhooks (too niche), Reddit velocity (hours of lag), Arkham scraping (TOS risk).
 
-**Sprint plan:**
+**Sprint plan (updated 2026-04-19):**
 
-- **Sprint 1 — free sources, quick wins (1 week):**
-  - PR #28 — DexScreener boosts + GeckoTerminal trending → `velocity_boost` tier
-  - PR #29 — CryptoPanic news-tag watcher → `news_watch` tier
-  - PR #30 — Binance/Bybit perp WebSocket anomaly detector → `perp_anomaly` tier
-- **Sprint 2 — paid social, Musk-class catch:**
-  - PR #31 — LunarCrush Discover integration → `social_velocity` tier ($24/mo)
-- **Sprint 3 — on-chain upstream signal:**
-  - PR #32 — Dune smart-money queries, cron-scheduled → `smart_money` tier
-  - PR #33 — pump.fun new-deploy watcher with fuzzy-match → `copycat_launch` tier
-- **Sprint 4 — meta-layer:**
-  - PR #34 — Ensemble virality classifier. Requires ≥3 tiers live + ~2 weeks of labeled data. Tags each alert: `influencer-driven | whale-accumulation | rotation | copycat | news | perp-driven`. Telegram messages gain virality-class badges; exit logic diverges by class (influencer dies in hours, whale runs for days).
+The original PR #28–#30 slots were consumed by unrelated work (LunarCrush scaffolding, paper-trading feedback loop, Sprint-1 cleanup bundle). The four Sprint 1 items remain unstarted and have been promoted to BL-051 through BL-054 below. Sprint 2 (LunarCrush) is DROPPED.
 
-**First action:** PR #28 (DexScreener boosts + GeckoTerminal trending) — free, 2 days, proves the paid-promo hypothesis before committing to LunarCrush subscription. Execute after PR #27 velocity alerter stabilizes with ~48h of live Telegram traffic.
+- **Sprint 1 — free sources, quick wins** *(still pending, tracked as BL-051..BL-054)*:
+  - BL-051 — DexScreener `/token-boosts/top` poller → `velocity_boost` tier
+  - BL-052 — GeckoTerminal per-chain trending poller → rotation signal
+  - BL-053 — CryptoPanic news-tag watcher → `news_watch` tier
+  - BL-054 — Binance/Bybit perp WebSocket anomaly detector → `perp_anomaly` tier
+- **Sprint 2 — ~~paid social, Musk-class catch~~:** **DROPPED 2026-04-19.** LunarCrush subscription cancelled on cost + low marginal value over existing free CoinGecko layer.
+- **Sprint 3 — on-chain upstream signal** *(future)*:
+  - Dune smart-money queries, cron-scheduled → `smart_money` tier
+  - pump.fun new-deploy watcher with fuzzy-match → `copycat_launch` tier
+- **Sprint 4 — meta-layer** *(future, blocked on ≥3 tiers live + ~2 weeks labeled data)*:
+  - Ensemble virality classifier. Tags each alert: `influencer-driven | whale-accumulation | rotation | copycat | news | perp-driven`. Telegram messages gain virality-class badges; exit logic diverges by class (influencer dies in hours, whale runs for days).
+
+**First action:** BL-050 (paper-trade edge-detection, closes PR #26 follow-up), then BL-051..BL-054 in order.
 
 **What learning CAN do on existing data (no new sources):**
 - Retrospective virality classifier: label past alerts (virality vs organic) using already-collected features — wallet concentration, holder_growth_1h curve, vol/mcap slope across 3+ cycles. Virality has narrow wallet sets + vertical-then-vertical curves; organic has broader accumulation.
@@ -314,29 +312,14 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 > **NOTE (Apr 2026):** The CoinGecko Trending Tracker (PR #12) + Volume Spike Detector (PR #15) now serve as the primary early detection layer, using FREE CoinGecko data. LunarCrush/Santiment/Nansen phases are DEFERRED — the free approach achieved 56/61 (91.8%) trending hit rate with 62.4h avg lead time.
 
-### Phase 1: LunarCrush Social Velocity ($24/mo) — CURRENT
-**Status:** In design
-**Rationale:** Social mention velocity is the #1 input to CoinGecko's trending algorithm. LunarCrush aggregates Twitter + Reddit + Telegram into a single API. Cheapest way to validate the thesis.
-**Modules:**
-- `scout/early/lunarcrush.py` — API client, fetch Galaxy Score + social volume
-- `scout/early/tracker.py` — Spike detection, comparison vs CoinGecko trending
-- `scout/early/models.py` — EarlySignal, TrendingSnapshot models
-- DB tables: `early_signals`, `trending_snapshots`
-- Dashboard: "Early Detection" tab with live signals, hit rate, lead time
-**Config:** `LUNARCRUSH_API_KEY`, `LUNARCRUSH_POLL_INTERVAL=300`, `SOCIAL_VOLUME_SPIKE_RATIO=2.0`, `GALAXY_SCORE_JUMP_THRESHOLD=10`
-**Validation:** After 2-4 weeks of shadow data, measure hit rate + lead time. If >50% hit rate with >30 min avg lead time, thesis is validated.
+### Phase 1: LunarCrush Social Velocity ($24/mo)
+**Status:** DROPPED 2026-04-19 — user cancelled on cost + low marginal value. Free CoinGecko trending tracker (PR #12) + volume spike detector (PR #15) already reach 91.8% trending hit rate with 62.4h avg lead time, which saturates the manual-research use case.
 
 ### Phase 2: Santiment Cross-Validation ($49/mo)
-**Status:** Future — contingent on Phase 1 validation
-**Rationale:** Second independent social signal source. Santiment's "emerging trends" and social volume divergence metric provides cross-validation against LunarCrush. Reduces false positives.
-**Integration:** GraphQL API via `sanpy` Python client. Add as second signal source in `scout/early/`. Boost confidence when both LunarCrush AND Santiment flag the same token.
-**Trigger:** Proceed if Phase 1 hit rate is promising but false positive rate is >40%.
+**Status:** DROPPED 2026-04-19 — was contingent on Phase 1 validation, which will never happen.
 
 ### Phase 3: Nansen Smart Money ($49/mo + API credits)
-**Status:** Future — strongest signal but most expensive
-**Rationale:** Smart money (whale/fund wallets) accumulating a token typically precedes social buzz by hours. This catches a different phase of the pump lifecycle — accumulation before attention.
-**Integration:** REST API. Track labeled wallet inflows for tokens in our candidate pool. When smart money + social spike align, highest confidence signal.
-**Trigger:** Proceed if Phases 1-2 show social signals alone miss tokens that pump from whale accumulation without initial social buzz.
+**Status:** DROPPED 2026-04-19 — was contingent on Phases 1-2. Revisit only as a standalone proposal for a different use case (e.g., live trading whale-following).
 
 ### Alternative Sources (if LunarCrush doesn't validate)
 - **Dune Analytics** — Custom SQL queries on on-chain social/volume data
@@ -450,8 +433,75 @@ Two gates on `scout/trading/engine.py`: Step 0 warmup (`PAPER_STARTUP_WARMUP_SEC
 New `scout/velocity/detector.py` tier for catching asteroid-class pumps (ASTEROID +60087%) earlier than gainers / 7d-momentum trackers. Filters: 1h ≥ 30%, mcap $500K–$50M, vol/mcap ≥ 0.2, top-10 by 1h change, dedup 4h per coin-id via new `velocity_alerts` table. **Research-only — no paper trade dispatch.** Zero extra CoinGecko API calls (reuses `_raw_markets_combined` cache). 616 tests passing. Planned: meta-tier in Sprint 4 of Virality Roadmap.
 
 ### Open follow-ups noted during session
-- **Edge detection for paper trades:** only open on *transition* into qualifier set, not current-state membership (prevents restart-bursts at root). Requires persisting previous cycle's qualifier set per signal type. Noted in PR #26 body.
-- **DexScreener boosts + GeckoTerminal per-chain trending** as additional velocity sources. See Virality Roadmap PR #28.
+- Promoted to BL-050..BL-054 below. See "Pending Initiatives" section.
+
+---
+
+## Pending Initiatives (2026-04-19)
+
+### BL-050: Paper-trade edge-detection (root-cause fix for restart-bursts)
+**Status:** Not started — P1 (highest leverage pending item)
+**Files:** scout/trading/engine.py, scout/main.py, scout/db.py, tests/
+**Why:** PR #26 patched the symptom of restart-bursts (10-position cap + 3-min warmup) but the root cause is unfixed. Every process restart replays every currently-qualifying token as a fresh signal because the engine opens on *current-state* qualifier membership, not *transition into* the set.
+**Changes:**
+- New table `signal_qualifier_state` (signal_type, token_id, first_seen_at, last_seen_at) — records which tokens are currently in each signal's qualifier set.
+- On each scan cycle: compute current qualifier set per signal; diff against previous cycle's persisted set; open paper trades only on the *entering* diff.
+- Tokens that exit-and-re-enter (`last_seen_at` older than 48h) are treated as fresh transitions.
+- Remove the warmup band from being load-bearing — the edge-detection alone should prevent restart-bursts, warmup becomes defense-in-depth.
+**Acceptance:**
+- Restart test: after a restart with 20 tokens currently qualifying, zero new paper trades open (they were already in the set at shutdown).
+- Transition test: a new token entering the qualifier set opens exactly one trade.
+- Re-entry test: a token that was in the set, dropped out for >48h, and re-entered opens exactly one trade.
+
+### BL-051: DexScreener /token-boosts/top poller → velocity_boost tier
+**Status:** Not started — P2 (Sprint 1 of Virality Roadmap)
+**Files:** scout/velocity/dexscreener_boosts.py (new), scout/velocity/__init__.py, scout/config.py, scout/main.py, tests/
+**Why:** Paid-promo boosts on DexScreener are a leading indicator for coordinated pump campaigns. Free endpoint, no API key.
+**Changes:**
+- Poll `https://api.dexscreener.com/token-boosts/top` on a configurable interval (default 5 min).
+- New table `velocity_boost_alerts` for dedup (coin_id, first_seen_at, boost_amount).
+- Dedup window: 4h per coin (matches PR #27 velocity alerter).
+- Research-only — logs a new `velocity_boost` tier alert; does NOT dispatch paper trades.
+- Config: `DEXSCREENER_BOOSTS_ENABLED`, `DEXSCREENER_BOOSTS_INTERVAL_SEC=300`, `DEXSCREENER_BOOSTS_MIN_AMOUNT=100`.
+**Acceptance:** Alert fires once per new boosted token, dedupes within 4h, zero extra CoinGecko API calls.
+
+### BL-052: GeckoTerminal per-chain trending poller → rotation signal
+**Status:** Not started — P2 (Sprint 1 of Virality Roadmap)
+**Files:** scout/ingestion/geckoterminal.py (extend), scout/velocity/, scout/config.py, tests/
+**Why:** GeckoTerminal exposes per-chain trending pools. Chain-level rotation (Solana → Base → BSC momentum shifts) is detectable hours before it shows on CoinGecko cross-chain trending.
+**Changes:**
+- Extend existing GeckoTerminal client with `/networks/{chain}/trending_pools` endpoint.
+- Poll top 10 chains (solana, eth, base, bsc, arbitrum, polygon_pos, optimism, avax, zksync, blast).
+- New table `chain_trending_snapshots` for historical diff.
+- Alert tier: `rotation_boost` — fires when a pool appears in per-chain top-10 but not yet on cross-chain trending.
+- Dedup: 6h per pool.
+**Acceptance:** Per-chain trending poll runs, cross-chain diff detected, alerts dedup.
+
+### BL-053: CryptoPanic news feed watcher → news_watch tier
+**Status:** Not started — P2 (Sprint 1 of Virality Roadmap)
+**Files:** scout/news/cryptopanic.py (new), scout/news/__init__.py, scout/config.py, scout/main.py, tests/
+**Why:** News/macro events (ETF approval, exchange listings, SEC rulings) drive pump cycles. CryptoPanic aggregates and auto-tags.
+**Changes:**
+- Poll `https://cryptopanic.com/api/v1/posts/?public=true` (free tier, no key required).
+- Filter for `hot`, `rising`, `bullish` labels on tokens currently in candidate pool.
+- New table `news_alerts` for dedup by post ID.
+- Alert tier: `news_watch`.
+- Config: `CRYPTOPANIC_ENABLED`, `CRYPTOPANIC_INTERVAL_SEC=300`, `CRYPTOPANIC_LABELS=hot,rising,bullish`.
+**Acceptance:** News poll runs, candidate-pool tokens with bullish labels trigger alerts, dedup by post_id.
+
+### BL-054: Binance/Bybit perp WebSocket anomaly detector → perp_anomaly tier
+**Status:** Not started — P2 (Sprint 1 of Virality Roadmap)
+**Files:** scout/perp/ (new module), scout/config.py, scout/main.py, tests/
+**Why:** Funding rate flips and OI (open interest) spikes on perpetual futures are seconds-lead indicators of pump entry. Both Binance and Bybit expose these over public WebSockets (no auth).
+**Changes:**
+- New module `scout/perp/` with `binance.py` and `bybit.py` WebSocket clients.
+- Subscribe to funding rate + OI streams for all actively-traded perps.
+- Detect: funding rate flip (negative → positive or vice versa) OR 1h OI delta > 50%.
+- New table `perp_anomaly_alerts` for dedup (symbol, anomaly_type, detected_at).
+- Dedup: 2h per symbol/anomaly-type.
+- Alert tier: `perp_anomaly`.
+- Research-only, not a paper-trade trigger. If WebSocket complexity exceeds budget, fall back to REST polling.
+**Acceptance:** Both WebSockets connect, anomalies detected on historical replay, dedup works. If blocked by TOS or connection stability, ship as REST-polling fallback.
 
 ---
 
