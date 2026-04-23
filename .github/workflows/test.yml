@@ -28,3 +28,17 @@ jobs:
           TELEGRAM_BOT_TOKEN: test
           TELEGRAM_CHAT_ID: test
           ANTHROPIC_API_KEY: test
+
+      - name: Regression protection — test count baseline (spec §11.9)
+        run: |
+          BASELINE_COUNT=1232
+          ACTUAL_COUNT=$(uv run pytest --collect-only -q 2>/dev/null | tail -1 | awk '{print $1}')
+          echo "baseline=$BASELINE_COUNT actual=$ACTUAL_COUNT"
+          test "$ACTUAL_COUNT" -ge "$BASELINE_COUNT" || {
+            echo "ERROR: test count dropped from $BASELINE_COUNT to $ACTUAL_COUNT — did you delete tests?"
+            exit 1
+          }
+        env:
+          TELEGRAM_BOT_TOKEN: test
+          TELEGRAM_CHAT_ID: test
+          ANTHROPIC_API_KEY: test
