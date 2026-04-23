@@ -85,7 +85,6 @@ async def test_override_disabled_returns_none_with_disabled_flag(tmp_path):
     await db.close()
 
 
-@freeze_time("2026-04-23 00:00:00")
 async def test_negative_cache_ttl_expires_at_60s(tmp_path):
     db = Database(tmp_path / "t.db"); await db.initialize()
     adapter = AsyncMock()
@@ -95,13 +94,13 @@ async def test_negative_cache_ttl_expires_at_60s(tmp_path):
         positive_ttl=timedelta(hours=1), negative_ttl=timedelta(seconds=60),
         db=db,
     )
-    assert await resolver.resolve("UNKNOWN") is None
-    assert adapter.resolve_pair_for_symbol.call_count == 1
+    with freeze_time("2026-04-23 00:00:00") as frozen:
+        assert await resolver.resolve("UNKNOWN") is None
+        assert adapter.resolve_pair_for_symbol.call_count == 1
 
-    from freezegun import api
-    api.freeze_time("2026-04-23 00:01:01").start()  # +61s
-    assert await resolver.resolve("UNKNOWN") is None
-    assert adapter.resolve_pair_for_symbol.call_count == 2
+        frozen.move_to("2026-04-23 00:01:01")  # +61s
+        assert await resolver.resolve("UNKNOWN") is None
+        assert adapter.resolve_pair_for_symbol.call_count == 2
     await db.close()
 
 

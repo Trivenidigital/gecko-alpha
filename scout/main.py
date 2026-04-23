@@ -900,11 +900,13 @@ async def main(argv: list[str] | None = None) -> int:
     if live_config.mode in ("shadow", "live"):
         if live_config.mode == "live":
             if not settings.BINANCE_API_KEY or not settings.BINANCE_API_SECRET:
+                await db.close()
                 raise RuntimeError(
                     "LIVE_MODE=live requires BINANCE_API_KEY/SECRET"
                 )
             # Balance gate is not yet implemented — fail closed at boot so
             # shadow traffic cannot accidentally leak to real funds.
+            await db.close()
             raise NotImplementedError(
                 "balance gate not wired for live mode — cannot start live "
                 "trading until scout/live/balance_gate.py is implemented"

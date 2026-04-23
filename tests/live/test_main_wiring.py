@@ -3,9 +3,19 @@
 import asyncio
 
 import pytest
+import structlog
 
 from scout.db import Database
 from scout.trading.paper import PaperTrader
+
+
+@pytest.fixture(autouse=True)
+def _restore_structlog_after_main_invocation():
+    """scout.main() calls structlog.configure() with JSONRenderer. That state
+    is global; without reset, downstream tests that assert on console-format
+    log output (`key=value`) fail because structlog now emits JSON."""
+    yield
+    structlog.reset_defaults()
 
 
 async def test_live_mode_live_raises_not_implemented_at_startup(
