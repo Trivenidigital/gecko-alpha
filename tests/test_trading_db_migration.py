@@ -358,7 +358,6 @@ async def test_initialize_upgrades_pre_bl060_db(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_paper_migrations_table_created(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
@@ -378,7 +377,6 @@ async def test_paper_migrations_table_created(tmp_path):
     await db.close()
 
 
-@pytest.mark.asyncio
 async def test_bl061_ladder_columns_added(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
