@@ -216,3 +216,45 @@ def test_bl061_qty_frac_rejects_oversell(monkeypatch, tmp_path):
             ANTHROPIC_API_KEY="k",
             PAPER_LADDER_LEG_2_QTY_FRAC=0.0,
         )
+
+
+def test_ladder_qty_fracs_reject_no_runner(monkeypatch, tmp_path):
+    """leg_1 + leg_2 >= 1.0 leaves no runner slice — reject at settings load."""
+    import pytest
+    from pydantic import ValidationError
+    monkeypatch.chdir(tmp_path)
+    from scout.config import Settings
+
+    with pytest.raises(ValidationError, match="must be < 1.0 to leave a runner slice"):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            PAPER_LADDER_LEG_1_QTY_FRAC=0.5,
+            PAPER_LADDER_LEG_2_QTY_FRAC=0.5,
+        )
+    with pytest.raises(ValidationError, match="must be < 1.0 to leave a runner slice"):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            PAPER_LADDER_LEG_1_QTY_FRAC=0.6,
+            PAPER_LADDER_LEG_2_QTY_FRAC=0.5,
+        )
+
+
+def test_ladder_qty_fracs_defaults_leave_runner(monkeypatch, tmp_path):
+    """Defaults 0.30 + 0.30 = 0.60 → runner = 0.40, valid."""
+    monkeypatch.chdir(tmp_path)
+    from scout.config import Settings
+
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    total = s.PAPER_LADDER_LEG_1_QTY_FRAC + s.PAPER_LADDER_LEG_2_QTY_FRAC
+    assert total < 1.0

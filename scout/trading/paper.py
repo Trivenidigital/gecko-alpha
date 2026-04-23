@@ -193,14 +193,14 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
 
         cur = await conn.execute(
             f"SELECT entry_price, quantity, remaining_qty, realized_pnl_usd, "
-            f"leg_{leg}_filled_at FROM paper_trades WHERE id = ?",
+            f"leg_{leg}_filled_at, peak_pct FROM paper_trades WHERE id = ?",
             (trade_id,),
         )
         row = await cur.fetchone()
         if row is None:
             log.warning("partial_sell_trade_not_found", trade_id=trade_id, leg=leg)
             return False
-        entry_price, initial_qty, remaining_qty, realized, already_filled = row
+        entry_price, initial_qty, remaining_qty, realized, already_filled, peak_pct = row
         if already_filled is not None:
             log.info("partial_sell_already_filled", trade_id=trade_id, leg=leg)
             return False
@@ -234,14 +234,20 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             return False
         await conn.commit()
 
+        peak_pct_rounded = round(float(peak_pct), 2) if peak_pct is not None else None
         log.info(
             "ladder_leg_fired",
             trade_id=trade_id, leg=leg, fill_price=effective_exit,
             leg_qty=leg_qty, leg_realized_usd=leg_realized,
             remaining_qty=new_remaining, realized_pnl_usd=new_realized,
+            peak_pct_at_fire=peak_pct_rounded,
         )
         if leg == 1:
-            log.info("floor_activated", trade_id=trade_id)
+            log.info(
+                "floor_activated",
+                trade_id=trade_id,
+                peak_pct_at_activation=peak_pct_rounded,
+            )
         return True
 
     async def execute_sell(

@@ -129,3 +129,46 @@ async def test_positions_empty(client):
     assert resp.json() == []
 
 
+async def _seed_price(conn, token_id, current_price):
+    await conn.execute(
+        "INSERT OR REPLACE INTO price_cache (coin_id, current_price, updated_at) "
+        "VALUES (?, ?, ?)",
+        (token_id, current_price, datetime.now(timezone.utc).isoformat()),
+    )
+    await conn.commit()
+
+
+async def test_unrealized_pnl_uses_remaining_qty_post_leg_1(client):
+    """Post-leg-1 unrealized P&L must be computed on remaining_qty, not initial quantity."""
+    c, db = client
+    await _insert_trade(db._conn, "ladder-coin", "LDR", "first_signal", "open")
+    await db._conn.execute(
+        "UPDATE paper_trades SET remaining_qty = 7.0, leg_1_filled_at = ? "
+        "WHERE token_id = 'ladder-coin'",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    await db._conn.commit()
+    await _seed_price(db._conn, "ladder-coin", 110.0)
+
+    resp = await c.get("/api/trading/positions")
+    assert resp.status_code == 200
+    pos = [p for p in resp.json() if p["token_id"] == "ladder-coin"][0]
+    # entry=100, cp=110, remaining_qty=7 → (110-100)*7 = 70.00
+    assert pos["unrealized_pnl_usd"] == 70.00
+    assert pos["remaining_qty"] == 7.0
+
+
+async def test_unrealized_pnl_falls_back_to_quantity_pre_cutover(client):
+    """Pre-cutover trades have remaining_qty=NULL and must use initial quantity."""
+    c, db = client
+    await _insert_trade(db._conn, "legacy-coin", "LGC", "first_signal", "open")
+    await _seed_price(db._conn, "legacy-coin", 110.0)
+
+    resp = await c.get("/api/trading/positions")
+    assert resp.status_code == 200
+    pos = [p for p in resp.json() if p["token_id"] == "legacy-coin"][0]
+    # remaining_qty is NULL, quantity=10 → (110-100)*10 = 100.00
+    assert pos["unrealized_pnl_usd"] == 100.00
+    assert pos["remaining_qty"] is None
+
+

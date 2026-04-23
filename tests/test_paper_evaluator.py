@@ -1,4 +1,5 @@
 import pytest
+import structlog
 from datetime import datetime, timezone
 from scout.db import Database
 from scout.trading.evaluator import _load_bl061_cutover_ts
@@ -234,4 +235,84 @@ async def test_pre_cutover_rows_use_old_policy(tmp_path, settings_factory):
     leg1, status = await cur.fetchone()
     assert leg1 is None, "pre-cutover row must not fire ladder legs"
     assert status == "open", "pre-cutover row still open (old policy TP at +40%, not +25%)"
+    await db.close()
+
+
+async def test_ladder_leg_fired_log_includes_peak_pct(tmp_path, settings_factory):
+    """ladder_leg_fired and floor_activated logs must carry peak_pct for later calibration."""
+    from scout.trading.paper import PaperTrader
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    trader = PaperTrader()
+    settings_factory()  # normalize knobs; not used here
+    trade_id = await trader.execute_buy(
+        db=db, token_id="pk", symbol="PK", name="Peak", chain="coingecko",
+        signal_type="gainers_early", signal_data={}, current_price=1.00,
+        amount_usd=300.0, tp_pct=40.0, sl_pct=15.0, slippage_bps=0,
+        signal_combo="gainers_early",
+    )
+    # Seed a peak of +28% before firing leg 1 at +26% current
+    await db._conn.execute(
+        "UPDATE paper_trades SET peak_price = 1.28, peak_pct = 28.0 WHERE id = ?",
+        (trade_id,),
+    )
+    await db._conn.commit()
+
+    with structlog.testing.capture_logs() as logs:
+        ok = await trader.execute_partial_sell(
+            db=db, trade_id=trade_id, leg=1, sell_qty_frac=0.30,
+            current_price=1.26, slippage_bps=0,
+        )
+    assert ok is True
+    fired = [e for e in logs if e["event"] == "ladder_leg_fired"]
+    activated = [e for e in logs if e["event"] == "floor_activated"]
+    assert fired and fired[0]["peak_pct_at_fire"] == 28.0
+    assert activated and activated[0]["peak_pct_at_activation"] == 28.0
+    await db.close()
+
+
+async def test_partial_sell_race_lost_when_another_writer_fills_first(
+    tmp_path, settings_factory
+):
+    """If WHERE leg_N_filled_at IS NULL filters the row out, log partial_sell_race_lost."""
+    from scout.trading.paper import PaperTrader
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    trader = PaperTrader()
+    settings_factory()
+    trade_id = await trader.execute_buy(
+        db=db, token_id="rc", symbol="RC", name="Race", chain="coingecko",
+        signal_type="gainers_early", signal_data={}, current_price=1.00,
+        amount_usd=300.0, tp_pct=40.0, sl_pct=15.0, slippage_bps=0,
+        signal_combo="gainers_early",
+    )
+
+    # Inject a race: after the SELECT inside execute_partial_sell reads
+    # already_filled=None, another writer stamps leg_1_filled_at before our
+    # UPDATE runs. The UPDATE's WHERE clause then filters it out.
+    orig_execute = db._conn.execute
+    state = {"select_seen": False}
+
+    async def racing_execute(sql, *args, **kwargs):
+        result = await orig_execute(sql, *args, **kwargs)
+        if (not state["select_seen"]) and "SELECT entry_price" in str(sql):
+            state["select_seen"] = True
+            await orig_execute(
+                "UPDATE paper_trades SET leg_1_filled_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), trade_id),
+            )
+        return result
+
+    db._conn.execute = racing_execute  # type: ignore[assignment]
+    try:
+        with structlog.testing.capture_logs() as logs:
+            ok = await trader.execute_partial_sell(
+                db=db, trade_id=trade_id, leg=1, sell_qty_frac=0.30,
+                current_price=1.25, slippage_bps=0,
+            )
+    finally:
+        db._conn.execute = orig_execute  # type: ignore[assignment]
+
+    assert ok is False
+    assert any(e["event"] == "partial_sell_race_lost" for e in logs)
     await db.close()

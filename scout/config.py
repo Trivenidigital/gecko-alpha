@@ -464,6 +464,22 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         return self
 
+    @model_validator(mode="after")
+    def validate_ladder_qty_fracs_leave_runner(self) -> "Settings":
+        """leg_1 + leg_2 must be < 1.0 so a runner slice remains for trail/floor.
+
+        Runner is implicit: 1.0 - leg_1_frac - leg_2_frac. If it's 0, the ladder
+        degenerates (trail/floor have no qty to close) — reject before runtime.
+        """
+        total = self.PAPER_LADDER_LEG_1_QTY_FRAC + self.PAPER_LADDER_LEG_2_QTY_FRAC
+        if total >= 1.0:
+            raise ValueError(
+                f"PAPER_LADDER_LEG_1_QTY_FRAC ({self.PAPER_LADDER_LEG_1_QTY_FRAC}) + "
+                f"PAPER_LADDER_LEG_2_QTY_FRAC ({self.PAPER_LADDER_LEG_2_QTY_FRAC}) "
+                f"= {total}, must be < 1.0 to leave a runner slice"
+            )
+        return self
+
 
 _CACHED_SETTINGS: "Settings | None" = None
 
