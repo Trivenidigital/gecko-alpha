@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Awaitable
 
@@ -58,10 +57,15 @@ class VenueResolver:
         self._positive_ttl = positive_ttl
         self._negative_ttl = negative_ttl
         self._db = db
-        # defaultdict(asyncio.Lock): safe in CPython because dict.setdefault
-        # (used internally by defaultdict.__getitem__) is atomic under the GIL.
-        # Trio / other runtimes would need an explicit guard.
-        self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # Per-symbol single-flight locks. Reviewer 2: using defaultdict here
+        # leaked memory because entries were never evicted. Instead, each
+        # resolve() creates-or-reuses the lock via dict.setdefault (atomic
+        # under the CPython GIL), acquires it, and evicts the entry after
+        # release — subsequent resolvers for the same symbol will hit the
+        # positive/negative cache so no lock is needed. Concurrent tasks on
+        # the same symbol all see the same Lock object because setdefault
+        # returns the existing value if one is present.
+        self._locks: dict[str, asyncio.Lock] = {}
 
     async def resolve(self, symbol: str) -> ResolvedVenue | None:
         sym = symbol.upper()
@@ -85,47 +89,61 @@ class VenueResolver:
             await _METRIC_INC(self._db, "resolver_cache_misses")
         log.debug("live_resolver_cache_miss", symbol=sym, outcome="miss")
 
-        # 2. Single-flight per-symbol
-        async with self._locks[sym]:
-            cached, ttl_remaining_sec = await self._cache_get_with_ttl(sym)
-            if cached is not False:
-                # Another waiter populated cache — treat this as a hit too.
-                outcome = "positive" if cached is not None else "negative"
-                if _METRIC_INC is not None:
-                    await _METRIC_INC(self._db, "resolver_cache_hits")
-                log.debug(
-                    "live_resolver_cache_hit",
-                    symbol=sym,
-                    outcome=outcome,
-                    ttl_remaining_sec=ttl_remaining_sec,
-                )
-                return cached if cached is not None else None
+        # 2. Single-flight per-symbol. setdefault is atomic under the CPython
+        # GIL so concurrent resolve() calls share one Lock per symbol. After
+        # the lock releases, the result is cached, so subsequent resolvers
+        # hit the positive/negative cache without needing the per-symbol
+        # lock again — safe to evict.
+        lock = self._locks.setdefault(sym, asyncio.Lock())
+        try:
+            async with lock:
+                cached, ttl_remaining_sec = await self._cache_get_with_ttl(sym)
+                if cached is not False:
+                    # Another waiter populated cache — treat this as a hit too.
+                    outcome = "positive" if cached is not None else "negative"
+                    if _METRIC_INC is not None:
+                        await _METRIC_INC(self._db, "resolver_cache_hits")
+                    log.debug(
+                        "live_resolver_cache_hit",
+                        symbol=sym,
+                        outcome=outcome,
+                        ttl_remaining_sec=ttl_remaining_sec,
+                    )
+                    return cached if cached is not None else None
 
-            # 3. Override
-            ov = await self._overrides.lookup(sym)
-            if ov is not None:
-                pair, disabled = ov
-                if disabled:
-                    # Spec §5 gate 4: disabled override SHORT-CIRCUITS.
-                    # Do NOT fall through to exchangeInfo.
+                # 3. Override
+                ov = await self._overrides.lookup(sym)
+                if ov is not None:
+                    pair, disabled = ov
+                    if disabled:
+                        # Spec §5 gate 4: disabled override SHORT-CIRCUITS.
+                        # Do NOT fall through to exchangeInfo.
+                        return None
+                    resolved = ResolvedVenue(
+                        symbol=sym, venue="binance", pair=pair, source="override_table"
+                    )
+                    await self._cache_put_positive(sym, resolved)
+                    return resolved
+
+                # 4. Binance exchangeInfo
+                pair = await self._adapter.resolve_pair_for_symbol(sym)
+                if pair is None:
+                    await self._cache_put_negative(sym)
                     return None
                 resolved = ResolvedVenue(
-                    symbol=sym, venue="binance", pair=pair, source="override_table"
+                    symbol=sym, venue="binance", pair=pair,
+                    source="binance_exchangeinfo",
                 )
                 await self._cache_put_positive(sym, resolved)
                 return resolved
-
-            # 4. Binance exchangeInfo
-            pair = await self._adapter.resolve_pair_for_symbol(sym)
-            if pair is None:
-                await self._cache_put_negative(sym)
-                return None
-            resolved = ResolvedVenue(
-                symbol=sym, venue="binance", pair=pair,
-                source="binance_exchangeinfo",
-            )
-            await self._cache_put_positive(sym, resolved)
-            return resolved
+        finally:
+            # Evict per-symbol lock once no one else is holding/waiting on it
+            # so self._locks does not grow unboundedly. If another task is
+            # still inside `async with lock:` (lock.locked() == True) or is
+            # queued waiting, leave the lock in place — that task's finally
+            # will handle eviction.
+            if not lock.locked():
+                self._locks.pop(sym, None)
 
     # --- cache helpers -----------------------------------------------------
 

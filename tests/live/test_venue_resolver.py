@@ -105,6 +105,36 @@ async def test_negative_cache_ttl_expires_at_60s(tmp_path):
     await db.close()
 
 
+async def test_locks_dict_is_bounded_after_resolutions(tmp_path):
+    """Reviewer 2: the per-symbol _locks dict must not grow unboundedly.
+    After N symbols resolve and no task is waiting on them, _locks should
+    be empty (locks get evicted in the finally block once lock.locked()
+    is False)."""
+    db = Database(tmp_path / "t.db"); await db.initialize()
+    adapter = AsyncMock()
+    adapter.resolve_pair_for_symbol = AsyncMock(
+        side_effect=lambda sym: f"{sym}USDT"
+    )
+    resolver = VenueResolver(
+        binance_adapter=adapter, override_store=OverrideStore(db),
+        positive_ttl=timedelta(hours=1), negative_ttl=timedelta(seconds=60),
+        db=db,
+    )
+    # Sequential resolutions — each frees its lock on exit.
+    for sym in ["AAA", "BBB", "CCC", "DDD", "EEE"]:
+        await resolver.resolve(sym)
+    assert resolver._locks == {}, (
+        f"_locks leaked after sequential resolves: {list(resolver._locks)}"
+    )
+
+    # Concurrent single-flight on one symbol: all waiters share one Lock,
+    # and after the last one exits the lock is evicted.
+    await asyncio.gather(*[resolver.resolve("FFF") for _ in range(10)])
+    assert "FFF" not in resolver._locks
+    assert resolver._locks == {}
+    await db.close()
+
+
 async def test_resolver_increments_cache_hit_and_miss_metrics(tmp_path):
     """Spec §10.2: resolver reports resolver_cache_hits / resolver_cache_misses
     so operators can see whether the cache is actually saving Binance calls."""
