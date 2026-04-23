@@ -869,6 +869,14 @@ class Database:
                 "lead_time_vs_trending_min": "REAL",
                 "lead_time_vs_trending_status": "TEXT",
                 "would_be_live": "INTEGER",
+                # BL-061 ladder state
+                "leg_1_filled_at": "TEXT",
+                "leg_1_exit_price": "REAL",
+                "leg_2_filled_at": "TEXT",
+                "leg_2_exit_price": "REAL",
+                "remaining_qty": "REAL",
+                "floor_armed": "INTEGER",
+                "realized_pnl_usd": "REAL",
             }
             cur = await conn.execute("PRAGMA table_info(paper_trades)")
             existing = {row[1] for row in await cur.fetchall()}
@@ -882,6 +890,19 @@ class Database:
                         f"ALTER TABLE paper_trades ADD COLUMN {col} {coltype}"
                     )
                     _log.info("schema_migration_column_action", col=col, action="added")
+
+            # BL-061: cutover timestamp captured once per schema version
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY,
+                    cutover_ts TEXT NOT NULL
+                )
+            """)
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl061_ladder", datetime.now(timezone.utc).isoformat()),
+            )
 
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_combo_opened "
