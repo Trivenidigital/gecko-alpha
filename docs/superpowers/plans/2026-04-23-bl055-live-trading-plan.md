@@ -22,7 +22,8 @@ New files in `scout/live/`:
 | `config.py` | `LiveConfig` wrapper — reads typed values from `Settings`, computes fallbacks. |
 | `types.py` | Dataclasses/TypedDicts: `ResolvedVenue`, `WalkResult`, `Depth`, `KillState`, `GateResult`. |
 | `adapter_base.py` | `ExchangeAdapter` ABC: `resolve_pair`, `fetch_depth`, `fetch_price`, `send_order`, `fetch_exchange_info_row`. |
-| `binance_adapter.py` | Concrete `BinanceSpotAdapter`: aiohttp, weight-header governor, retry taxonomy. |
+| `exceptions.py` | Typed hierarchy: `LiveError`, `VenueTransientError`, `VenueNotResolved`, `DepthInsufficient`, `RateLimitError`, `KillSwitchActive`. |
+| `binance_adapter.py` | Concrete `BinanceSpotAdapter`: aiohttp, weight-header governor, retry taxonomy, rate-limit gate. |
 | `orderbook.py` | Pure: `walk_asks(depth, size_usd)` and `walk_bids(depth, qty)`. |
 | `resolver.py` | `VenueResolver` + `OverrideStore` — single-flight per-symbol locks, TTL cache, override/exchange-info fallback. |
 | `kill_switch.py` | `KillSwitch`: trigger/clear/auto-expired, `compute_kill_duration`. |
@@ -50,7 +51,9 @@ Test files:
 | File | Targets |
 |---|---|
 | `tests/live/test_config.py` | LiveConfig fallback logic, size map parse, allowlist set, `extra="forbid"` rejection. |
-| `tests/live/test_binance_adapter.py` | exchangeInfo happy/404, depth, ticker, `X-MBX-USED-WEIGHT-1M` header → semaphore shrink, 429 Retry-After. |
+| `tests/live/test_exceptions.py` | Hierarchy shape + subclass relationships. |
+| `tests/live/test_binance_adapter.py` | exchangeInfo happy/404, depth, ticker, weight-header governor (semaphore shrink + rate-limit gate), 429 metric + RateLimitError, 5xx/4xx/-1121 retry taxonomy, `send_order` NotImplementedError. |
+| `tests/live/test_main_wiring.py` | Startup guard: `LIVE_MODE=live` raises `NotImplementedError`; shutdown drains `_pending_live_tasks`. |
 | `tests/live/test_orderbook.py` | `walk_asks` VWAP, insufficient-liquidity, slippage bps math; symmetrical `walk_bids`. |
 | `tests/live/test_venue_resolver.py` | Single-flight (N=10 concurrent resolve → 1 HTTP call), positive/negative TTL with freezegun, override lookup with `disabled=1` respected. |
 | `tests/live/test_kill_switch.py` | trigger persists kill_events + flips live_control; clear/auto-expired transitions; `compute_kill_duration` 4 parametrized cases. |
@@ -217,6 +220,84 @@ async def test_paper_trades_fk_restrict(tmp_path):
         )
         await db._conn.commit()
     await db.close()
+
+
+async def test_initialize_upgrades_pre_bl055_db(tmp_path):
+    """Regression test — spec §3.1 upgrade path.
+
+    Simulates an existing production DB that has everything up through BL-060
+    (paper_trades with would_be_live column) but NONE of the 7 BL-055 tables.
+    Database.initialize() on that DB must add every BL-055 table + index + seed
+    live_control without touching the pre-existing paper_trades rows. Mirrors
+    the failure mode from BL-060 (feedback_ddl_before_alter.md): index-in-
+    _create_tables silently skipped on upgrade because CREATE TABLE IF NOT EXISTS
+    is a no-op for already-present tables.
+    """
+    db_path = tmp_path / "preexisting.db"
+    # 1. Build a pre-BL-055 schema directly via raw aiosqlite.
+    raw = await aiosqlite.connect(db_path)
+    await raw.execute("PRAGMA foreign_keys=ON")
+    # Minimal pre-BL-055 paper_trades (include all prior columns + BL-060's
+    # would_be_live). Use whatever CREATE TABLE matches current master BEFORE
+    # the BL-055 migration runs — the point is no shadow_trades/live_trades/etc.
+    await raw.execute("""
+        CREATE TABLE IF NOT EXISTS paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_id TEXT, symbol TEXT, name TEXT, chain TEXT,
+            signal_type TEXT, signal_data TEXT,
+            entry_price REAL, amount_usd REAL, quantity REAL,
+            tp_pct REAL, sl_pct REAL, tp_price REAL, sl_price REAL,
+            status TEXT, opened_at TEXT,
+            would_be_live INTEGER   -- BL-060 column
+        )
+    """)
+    await raw.execute("""
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT,
+            description TEXT
+        )
+    """)
+    # Seed a paper_trades row so the FK RESTRICT path has data to guard.
+    await raw.execute(
+        "INSERT INTO paper_trades "
+        "(token_id, symbol, name, chain, signal_type, signal_data, "
+        " entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, "
+        " sl_price, status, opened_at, would_be_live) "
+        "VALUES ('c','S','N','eth','first_signal','{}',1,100,100,40,20,"
+        "1.4,0.8,'open','2026-04-22T00:00:00Z',1)"
+    )
+    await raw.commit()
+    await raw.close()
+
+    # 2. Now run Database.initialize() against that pre-existing DB.
+    db = Database(db_path)
+    await db.initialize()
+
+    # 3. All 7 new tables exist.
+    tables = await _tables(db._conn)
+    assert {
+        "shadow_trades", "live_trades", "kill_events", "live_control",
+        "venue_overrides", "resolver_cache", "live_metrics_daily",
+    } <= tables
+
+    # 4. live_control seed row exists with id=1.
+    cur = await db._conn.execute(
+        "SELECT id, active_kill_event_id FROM live_control"
+    )
+    rows = await cur.fetchall()
+    assert len(rows) == 1 and rows[0][0] == 1 and rows[0][1] is None
+
+    # 5. Indexes per spec §3.1 exist.
+    idx = await _indexes(db._conn)
+    assert "idx_shadow_status_evaluated" in idx
+    assert "idx_shadow_closed_at_utc" in idx
+    assert "idx_kill_events_active" in idx
+
+    # Sanity: the pre-existing paper_trades row is intact.
+    cur = await db._conn.execute("SELECT COUNT(*) FROM paper_trades")
+    assert (await cur.fetchone())[0] == 1
+    await db.close()
 ```
 
 - [ ] **Step 3: Run tests — expect failure**
@@ -228,7 +309,9 @@ Expected: all tests fail with `sqlite3.OperationalError: no such table: shadow_t
 
 - [ ] **Step 4: Implement the migration**
 
-Append a new migration method. Add exactly the tables from spec §3.1. Paste each `CREATE TABLE` block from the spec verbatim into `await self._conn.executescript(...)` inside `_migrate_live_trading_schema`. Wire the call from `initialize()` AFTER `_migrate_feedback_loop_schema`.
+Append a new migration method. Add exactly the tables from spec §3.1. Wire the call from `initialize()` AFTER `_migrate_feedback_loop_schema`.
+
+**CRITICAL — do NOT use `executescript`.** `aiosqlite.Connection.executescript` issues an implicit COMMIT before executing the script, which breaks rollback semantics — a mid-script failure cannot be rolled back. Mirror the existing `_migrate_feedback_loop_schema` pattern: use `await conn.execute("BEGIN EXCLUSIVE")`, then loop over each DDL statement with individual `await conn.execute(stmt)` calls, then `await conn.commit()`, with `await conn.execute("ROLLBACK")` in the except block.
 
 ```python
 # scout/db.py — inside class Database
@@ -249,25 +332,47 @@ async def _migrate_live_trading_schema(self) -> None:
 
     Note: paper_trades becomes append-only by contract (FK RESTRICT). Existing
     rows are untouched; only new DELETE attempts are blocked.
+
+    Implementation pattern mirrors _migrate_feedback_loop_schema: BEGIN EXCLUSIVE
+    + per-statement execute + explicit commit/rollback. Do NOT use executescript
+    (auto-commits, defeats rollback — caused BL-060 crash pattern).
     """
     if self._conn is None:
         raise RuntimeError("Database not initialized.")
     assert self._txn_lock is not None
+
+    # List of DDL statements — each CREATE TABLE + CREATE INDEX from spec §3.1.
+    # All tables use CREATE TABLE IF NOT EXISTS; all indexes use
+    # CREATE INDEX IF NOT EXISTS so re-runs are no-ops.
+    ddl_statements: list[str] = [
+        # Paste §3.1 verbatim, one statement per list entry, in order:
+        #   1. CREATE TABLE IF NOT EXISTS shadow_trades (...)
+        #   2. CREATE TABLE IF NOT EXISTS live_trades (...)
+        #   3. CREATE TABLE IF NOT EXISTS kill_events (...)
+        #   4. CREATE TABLE IF NOT EXISTS live_control (...)
+        #   5. CREATE TABLE IF NOT EXISTS venue_overrides (...)
+        #   6. CREATE TABLE IF NOT EXISTS resolver_cache (...)
+        #   7. CREATE TABLE IF NOT EXISTS live_metrics_daily (...)
+        #   8. CREATE INDEX IF NOT EXISTS idx_shadow_status_evaluated ...
+        #   9. CREATE INDEX IF NOT EXISTS idx_shadow_closed_at_utc ...
+        #  10. CREATE INDEX IF NOT EXISTS idx_kill_events_active ...
+        # NOTE: indexes MUST be in this list (not in _create_tables) — see
+        # feedback_ddl_before_alter.md: CREATE TABLE IF NOT EXISTS is a no-op
+        # for pre-existing tables, so any index declared alongside must live
+        # in the migration step to apply on upgrades.
+    ]
+
     async with self._txn_lock:
         try:
-            await self._conn.executescript(
-                # Paste §3.1 blocks verbatim here — shadow_trades, live_trades,
-                # kill_events, live_control, venue_overrides, resolver_cache,
-                # live_metrics_daily, plus the three indexes.
-                # Wrap every table with CREATE TABLE IF NOT EXISTS and every
-                # index with CREATE INDEX IF NOT EXISTS so re-runs are no-ops.
-                """<<< paste spec §3.1 CREATE TABLE + CREATE INDEX blocks, s/CREATE TABLE /CREATE TABLE IF NOT EXISTS /g, s/CREATE INDEX /CREATE INDEX IF NOT EXISTS /g >>>"""
-            )
+            await self._conn.execute("BEGIN EXCLUSIVE")
+            for stmt in ddl_statements:
+                await self._conn.execute(stmt)
             # Seed live_control with id=1 ONLY if not already present (idempotent).
             await self._conn.execute(
                 "INSERT OR IGNORE INTO live_control (id, active_kill_event_id) "
                 "VALUES (1, NULL)"
             )
+            # Bump schema_version inside the same transaction.
             await self._conn.execute(
                 "INSERT OR IGNORE INTO schema_version "
                 "(version, applied_at, description) VALUES (?, ?, ?)",
@@ -277,20 +382,22 @@ async def _migrate_live_trading_schema(self) -> None:
             await self._conn.commit()
         except Exception:
             try:
-                await self._conn.rollback()
+                await self._conn.execute("ROLLBACK")
             except Exception:
                 pass
             raise
 ```
 
-**CRITICAL — learned from BL-060 (commit a422ef7):** When a new column references are involved, index creation on that column must live in the migration step, never in `_create_tables`. For BL-055 all new tables are added in this single migration — no index contamination risk.
+**CRITICAL — learned from BL-060 (commit a422ef7, `feedback_ddl_before_alter.md`):**
+1. Index creation on migrated columns must live in the migration step, never in `_create_tables` — `CREATE TABLE IF NOT EXISTS` is a no-op on pre-existing tables, so any paired index declaration in `_create_tables` silently skips on upgrade paths.
+2. Do NOT use `executescript` here — it issues an implicit COMMIT and cannot be rolled back. Use `BEGIN EXCLUSIVE` + per-statement `execute` + explicit `ROLLBACK` in the except block (mirror `_migrate_feedback_loop_schema`).
 
 - [ ] **Step 5: Run tests — expect pass**
 
 ```bash
 uv run pytest tests/live/test_db_migration.py -v
 ```
-Expected: all 6 tests pass.
+Expected: all 7 tests pass (6 fresh-DB cases + the upgrade-path regression).
 
 - [ ] **Step 6: Commit**
 
@@ -798,6 +905,101 @@ git commit -m "feat(bl055): ExchangeAdapter ABC + live package types"
 
 ---
 
+### Task 6b: `scout/live/exceptions.py` — domain exception hierarchy
+
+**Files:**
+- Create: `scout/live/exceptions.py`
+- Create: `tests/live/test_exceptions.py`
+
+Typed exceptions for the live-trading pipeline. Used by the Binance adapter (Task 7), resolver (Task 9), gates (Task 12), and engine (Task 14) so the caller can `except VenueTransientError:` vs `except VenueNotResolved:` without string-matching. Keeping this in its own module avoids circular imports and makes the taxonomy explicit.
+
+- [ ] **Step 1: Write failing test for hierarchy shape**
+
+```python
+# tests/live/test_exceptions.py
+"""Spec §10.1 error taxonomy — typed exceptions for live pipeline."""
+
+from scout.live.exceptions import (
+    DepthInsufficient,
+    KillSwitchActive,
+    LiveError,
+    RateLimitError,
+    VenueNotResolved,
+    VenueTransientError,
+)
+
+
+def test_exception_hierarchy():
+    # All live exceptions derive from LiveError.
+    assert issubclass(VenueTransientError, LiveError)
+    assert issubclass(VenueNotResolved, LiveError)
+    assert issubclass(DepthInsufficient, LiveError)
+    assert issubclass(RateLimitError, LiveError)
+    assert issubclass(KillSwitchActive, LiveError)
+    # RateLimitError is a VenueTransientError (429 / weight>95%).
+    assert issubclass(RateLimitError, VenueTransientError)
+    # VenueNotResolved is NOT transient (do not retry).
+    assert not issubclass(VenueNotResolved, VenueTransientError)
+
+
+def test_instances_carry_messages():
+    e = VenueTransientError("binance 502 — 3x retry exhausted")
+    assert "502" in str(e)
+    assert isinstance(e, LiveError)
+```
+
+- [ ] **Step 2: Run — expect import error**
+
+```bash
+uv run pytest tests/live/test_exceptions.py -v
+```
+
+- [ ] **Step 3: Implement**
+
+```python
+# scout/live/exceptions.py
+"""Typed exception hierarchy for the live-trading pipeline (spec §10.1).
+
+Raised by Binance adapter, resolver, gates, engine. Callers (shadow evaluator,
+reconciliation, LiveEngine) discriminate on type rather than message string.
+"""
+from __future__ import annotations
+
+
+class LiveError(Exception):
+    """Root of the live-trading exception hierarchy."""
+
+
+class VenueTransientError(LiveError):
+    """5xx, network error, or exhausted retry. Caller may retry later."""
+
+
+class VenueNotResolved(LiveError):
+    """Symbol cannot be mapped to a Binance pair. Terminal for this trade."""
+
+
+class DepthInsufficient(LiveError):
+    """Orderbook too shallow to fill requested size at any slippage."""
+
+
+class RateLimitError(VenueTransientError):
+    """429 response or used-weight >= 95%. Subclass of transient."""
+
+
+class KillSwitchActive(LiveError):
+    """Kill switch was active at gate check — trade must not proceed."""
+```
+
+- [ ] **Step 4: Run + commit**
+
+```bash
+uv run pytest tests/live/test_exceptions.py -v
+git add scout/live/exceptions.py tests/live/test_exceptions.py
+git commit -m "feat(bl055): typed exception hierarchy for live pipeline"
+```
+
+---
+
 ### Task 7: `scout/live/binance_adapter.py` with weight-header governor
 
 **Files:**
@@ -808,9 +1010,10 @@ git commit -m "feat(bl055): ExchangeAdapter ABC + live package types"
 
 ```python
 # tests/live/test_binance_adapter.py
-"""Tests for BinanceSpotAdapter (spec §7, §8, §9)."""
+"""Tests for BinanceSpotAdapter (spec §7, §8, §9, §10.1)."""
 
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import aiohttp
 import pytest
@@ -910,6 +1113,157 @@ async def test_429_respects_retry_after():
         with pytest.raises(aiohttp.ClientResponseError):
             await adapter.fetch_price("X")
         await adapter.close()
+
+
+async def test_send_order_raises_not_implemented_in_shadow():
+    """Spec §1.3: BL-055 never sends real orders. Even constructed in shadow
+    mode, send_order must raise NotImplementedError so an accidental call
+    path cannot escape to Binance."""
+    adapter = BinanceSpotAdapter(_settings())
+    try:
+        with pytest.raises(NotImplementedError):
+            await adapter.send_order(pair="WBTCUSDT", side="BUY",
+                                     size_usd=Decimal("100"))
+    finally:
+        await adapter.close()
+
+
+# --- Retry taxonomy (spec §10.1) -----------------------------------------
+
+async def test_http_get_retries_5xx_three_times():
+    """5xx → up to 3 retries with backoff [1.0, 2.0, 4.0] then raise
+    VenueTransientError."""
+    from scout.live.exceptions import VenueTransientError
+    with aioresponses() as m:
+        for _ in range(3):
+            m.get(
+                "https://api.binance.com/api/v3/ticker/price?symbol=X",
+                status=502,
+            )
+        adapter = BinanceSpotAdapter(_settings())
+        # Patch the backoff sleep so the test doesn't actually wait 1+2+4s.
+        adapter._retry_sleep = AsyncMock()
+        with pytest.raises(VenueTransientError):
+            await adapter.fetch_price("X")
+        # Three retry sleeps should have fired (one per 5xx).
+        assert adapter._retry_sleep.await_count == 3
+        await adapter.close()
+
+
+async def test_http_get_no_retry_on_4xx():
+    """400/401/403 (other than -1121) → raise immediately, no retry."""
+    from scout.live.exceptions import LiveError
+    with aioresponses() as m:
+        m.get(
+            "https://api.binance.com/api/v3/ticker/price?symbol=X",
+            status=400,
+            payload={"code": -9999, "msg": "bad request"},
+        )
+        adapter = BinanceSpotAdapter(_settings())
+        adapter._retry_sleep = AsyncMock()
+        with pytest.raises((aiohttp.ClientResponseError, LiveError)):
+            await adapter.fetch_price("X")
+        assert adapter._retry_sleep.await_count == 0
+        await adapter.close()
+
+
+async def test_fetch_exchange_info_returns_none_on_1121():
+    """Binance body {code: -1121, msg: "Invalid symbol."} on 400 →
+    fetch_exchange_info_row returns None, no retry, no raise."""
+    with aioresponses() as m:
+        m.get(
+            "https://api.binance.com/api/v3/exchangeInfo?symbol=NOPEUSDT",
+            status=400,
+            payload={"code": -1121, "msg": "Invalid symbol."},
+        )
+        adapter = BinanceSpotAdapter(_settings())
+        adapter._retry_sleep = AsyncMock()
+        assert await adapter.fetch_exchange_info_row("NOPEUSDT") is None
+        assert adapter._retry_sleep.await_count == 0
+        await adapter.close()
+
+
+async def test_http_get_raises_rate_limit_on_429():
+    """429 → raise RateLimitError on first occurrence (no in-call retry;
+    governor opens the gate at next call)."""
+    from scout.live.exceptions import RateLimitError
+    with aioresponses() as m:
+        m.get(
+            "https://api.binance.com/api/v3/ticker/price?symbol=X",
+            status=429,
+            headers={"Retry-After": "5"},
+        )
+        adapter = BinanceSpotAdapter(_settings())
+        with pytest.raises(RateLimitError):
+            await adapter.fetch_price("X")
+        await adapter.close()
+
+
+async def test_429_increments_binance_rate_limit_hits_metric(tmp_path):
+    """On 429, adapter increments live_metrics_daily binance_rate_limit_hits
+    before raising RateLimitError."""
+    from scout.db import Database
+    from scout.live.exceptions import RateLimitError
+    db = Database(tmp_path / "t.db"); await db.initialize()
+    with aioresponses() as m:
+        m.get(
+            "https://api.binance.com/api/v3/ticker/price?symbol=X",
+            status=429,
+            headers={"Retry-After": "2"},
+        )
+        adapter = BinanceSpotAdapter(_settings(), db=db)
+        with pytest.raises(RateLimitError):
+            await adapter.fetch_price("X")
+        cur = await db._conn.execute(
+            "SELECT value FROM live_metrics_daily "
+            "WHERE metric='binance_rate_limit_hits'"
+        )
+        row = await cur.fetchone()
+        assert row is not None and row[0] >= 1
+        await adapter.close()
+    await db.close()
+
+
+async def test_http_get_retries_network_error():
+    """aiohttp.ClientConnectorError / asyncio.TimeoutError → retry 3x then
+    raise VenueTransientError."""
+    from scout.live.exceptions import VenueTransientError
+    with aioresponses() as m:
+        for _ in range(3):
+            m.get(
+                "https://api.binance.com/api/v3/ticker/price?symbol=X",
+                exception=aiohttp.ClientConnectorError(
+                    connection_key=None, os_error=OSError()
+                ),
+            )
+        adapter = BinanceSpotAdapter(_settings())
+        adapter._retry_sleep = AsyncMock()
+        with pytest.raises(VenueTransientError):
+            await adapter.fetch_price("X")
+        assert adapter._retry_sleep.await_count == 3
+        await adapter.close()
+
+
+async def test_rate_governor_opens_gate_after_10s():
+    """Spec §9.1: weight >= 1140 (95%) → gate closes, then reopens ~10s later
+    so concurrent requests resume in parallel (not 10s-serial). Asserts the
+    asyncio.Event-based backpressure pattern."""
+    import asyncio
+    with aioresponses() as m:
+        m.get(
+            "https://api.binance.com/api/v3/ticker/price?symbol=Y",
+            payload={"symbol": "Y", "price": "1.0"},
+            headers={"X-MBX-USED-WEIGHT-1M": "1145"},
+        )
+        adapter = BinanceSpotAdapter(_settings())
+        # Patch the 10s pause into a fast tick for the test.
+        adapter._RATE_LIMIT_PAUSE_SEC = 0.05
+        await adapter.fetch_price("Y")  # triggers gate close + reopen task
+        assert not adapter._rate_limit_gate.is_set()
+        # Wait long enough for the reopen task to fire.
+        await asyncio.sleep(0.1)
+        assert adapter._rate_limit_gate.is_set()
+        await adapter.close()
 ```
 
 - [ ] **Step 2: Run — expect import error**
@@ -921,17 +1275,77 @@ uv run pytest tests/live/test_binance_adapter.py -v
 - [ ] **Step 3: Implement `BinanceSpotAdapter`**
 
 Scope is large — implement methods in this order, committing between major ones if useful:
-1. `__init__(settings)` — create shared `aiohttp.ClientSession` with 10s timeout.
-2. `_http_get(path, params)` — reads `X-MBX-USED-WEIGHT-1M`, calls `_update_weight_governor`.
-3. `_update_weight_governor(weight)` — updates `self._current_semaphore_cap` per §9.1 thresholds.
-4. `fetch_exchange_info_row(pair)` — GET /api/v3/exchangeInfo?symbol=…; parse single-item `symbols` array; None on 400/-1121.
+1. `__init__(settings, db=None)` — create shared `aiohttp.ClientSession` with 10s timeout. Also initialize:
+   - `self._rate_limit_gate = asyncio.Event()` and call `self._rate_limit_gate.set()` so requests are allowed by default.
+   - `self._RATE_LIMIT_PAUSE_SEC = 10.0` (overridable in tests).
+   - `self._db = db` — optional, used for `binance_rate_limit_hits` metric increments. Adapter works without a db for pure unit tests.
+   - `self._retry_sleep = asyncio.sleep` — swappable in tests to skip backoff delays.
+2. `_http_get(path, params)` — the central request method. Pseudocode:
+   ```python
+   await self._rate_limit_gate.wait()   # no-op if set
+   backoffs = [1.0, 2.0, 4.0]
+   last_exc: Exception | None = None
+   for attempt in range(len(backoffs) + 1):
+       try:
+           async with self._session.get(url, params=params) as resp:
+               weight = int(resp.headers.get("X-MBX-USED-WEIGHT-1M", 0))
+               await self._update_weight_governor(weight)
+               if resp.status == 429:
+                   if self._db is not None:
+                       from scout.live.metrics import inc
+                       await inc(self._db, "binance_rate_limit_hits")
+                   raise RateLimitError(f"binance 429 weight={weight}")
+               if 500 <= resp.status < 600:
+                   last_exc = VenueTransientError(
+                       f"binance {resp.status} attempt={attempt+1}"
+                   )
+                   if attempt < len(backoffs):
+                       await self._retry_sleep(backoffs[attempt])
+                       continue
+                   raise last_exc
+               if resp.status == 400:
+                   body = await resp.json(content_type=None)
+                   if body.get("code") == -1121:
+                       # Signal "symbol unknown" to callers via a sentinel the
+                       # caller (fetch_exchange_info_row) translates to None.
+                       return {"__code": -1121}
+                   resp.raise_for_status()   # raises ClientResponseError
+               if resp.status >= 400:
+                   resp.raise_for_status()
+               return await resp.json()
+       except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as exc:
+           last_exc = VenueTransientError(f"network error: {exc}")
+           if attempt < len(backoffs):
+               await self._retry_sleep(backoffs[attempt])
+               continue
+           raise last_exc
+   ```
+   Import `RateLimitError`, `VenueTransientError` from `scout.live.exceptions`.
+3. `_update_weight_governor(weight)` — updates `self._current_semaphore_cap` per §9.1 thresholds. Additionally, when `weight >= 1140` (≈95% of 1200), CLOSE the rate-limit gate with `self._rate_limit_gate.clear()` and spawn a one-shot background task:
+   ```python
+   async def _reopen_gate_later():
+       await asyncio.sleep(self._RATE_LIMIT_PAUSE_SEC)
+       self._rate_limit_gate.set()
+   asyncio.create_task(_reopen_gate_later())
+   ```
+   Concurrent in-flight requests await the single Event instead of each doing a serial 10s `sleep` inside `_http_get`, so they all resume together when the gate reopens.
+4. `fetch_exchange_info_row(pair)` — GET `/api/v3/exchangeInfo?symbol=…`. If `_http_get` returns the `{"__code": -1121}` sentinel, return `None`. Otherwise parse the single-item `symbols` array. No retries on -1121 (terminal).
 5. `resolve_pair_for_symbol(symbol)` — probe `{symbol}USDT`; if exchangeInfo returns a row with `status=TRADING` and `quoteAsset=USDT`, return pair; else None.
 6. `fetch_depth(pair, limit=100)` — parse bids/asks, compute mid = (best_bid + best_ask) / 2.
-7. `fetch_price(pair)` — GET /api/v3/ticker/price.
-8. `send_order(…)` — BL-055 raises NotImplementedError.
+7. `fetch_price(pair)` — GET `/api/v3/ticker/price`.
+8. `send_order(…)` — BL-055 raises `NotImplementedError("BL-055 shadow mode — send_order blocked; wire in BL-058")`. Must raise unconditionally regardless of `LIVE_MODE` (defense in depth; the startup guard in scout/main.py is the primary gate, this is secondary).
 9. `close()` — close the ClientSession.
 
-Use `Decimal` everywhere — never `float`. The 429 handling can initially just surface the `aiohttp.ClientResponseError` (let caller decide retry). Retry policy lives in the caller per spec §10.1.
+Use `Decimal` everywhere — never `float`. Retry taxonomy summary (spec §10.1):
+
+| Condition | Behavior |
+|---|---|
+| 5xx response | Retry up to 3× with backoff [1.0, 2.0, 4.0]s; then raise `VenueTransientError`. |
+| 4xx other than -1121 | Raise immediately (no retry). |
+| 400 body `code=-1121` | `fetch_exchange_info_row` returns `None`. No retry, no raise. |
+| 429 response | `inc(db, "binance_rate_limit_hits")` then raise `RateLimitError` (subclass of `VenueTransientError`). No in-call retry; governor handles backoff before next call. |
+| Network errors (ClientConnectorError, TimeoutError) | Retry up to 3× then raise `VenueTransientError`. |
+| Weight ≥ 1140 (95%) | Close `_rate_limit_gate`; spawn reopen-after-10s task. Future requests await the gate. |
 
 - [ ] **Step 4: Run tests**
 
@@ -1202,6 +1616,33 @@ async def test_negative_cache_ttl_expires_at_60s(tmp_path):
     assert await resolver.resolve("UNKNOWN") is None
     assert adapter.resolve_pair_for_symbol.call_count == 2
     await db.close()
+
+
+async def test_resolver_increments_cache_hit_and_miss_metrics(tmp_path):
+    """Spec §10.2: resolver reports resolver_cache_hits / resolver_cache_misses
+    so operators can see whether the cache is actually saving Binance calls."""
+    db = Database(tmp_path / "t.db"); await db.initialize()
+    adapter = AsyncMock()
+    adapter.resolve_pair_for_symbol = AsyncMock(return_value="WBTCUSDT")
+    resolver = VenueResolver(
+        binance_adapter=adapter, override_store=OverrideStore(db),
+        positive_ttl=timedelta(hours=1), negative_ttl=timedelta(seconds=60),
+        db=db,
+    )
+    await resolver.resolve("WBTC")   # miss → Binance call + positive cache
+    await resolver.resolve("WBTC")   # hit  → no Binance call
+
+    async def _val(metric):
+        cur = await db._conn.execute(
+            "SELECT value FROM live_metrics_daily WHERE metric = ?", (metric,)
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+    assert await _val("resolver_cache_misses") == 1
+    assert await _val("resolver_cache_hits") == 1
+    assert adapter.resolve_pair_for_symbol.call_count == 1
+    await db.close()
 ```
 
 - [ ] **Step 2: Run — expect import error**
@@ -1266,14 +1707,23 @@ class VenueResolver:
         sym = symbol.upper()
         # 1. Cache
         cached = await self._cache_get(sym)
-        if cached is not None:
-            return cached  # may be None from negative cache sentinel
+        if cached is not False:
+            # Positive hit OR cached-negative. Either way the cache served it.
+            from scout.live.metrics import inc
+            await inc(self._db, "resolver_cache_hits")
+            return cached if cached is not None else None
+
+        # Cache miss — count it once, before single-flight.
+        from scout.live.metrics import inc
+        await inc(self._db, "resolver_cache_misses")
 
         # 2. Single-flight per-symbol
         async with self._locks[sym]:
             cached = await self._cache_get(sym)
-            if cached is not None:
-                return cached
+            if cached is not False:
+                # Another waiter populated cache — treat this as a hit too.
+                await inc(self._db, "resolver_cache_hits")
+                return cached if cached is not None else None
 
             # 3. Override
             ov = await self._overrides.lookup(sym)
@@ -1453,11 +1903,88 @@ async def test_auto_clear_if_expired_fires_when_past_killed_until(tmp_path):
     )
     assert (await cur.fetchone())[0] == "auto_expired"
     await db.close()
+
+
+async def test_two_concurrent_closes_trigger_exactly_once(tmp_path):
+    """Spec §11.5 TOCTOU: two concurrent trigger() calls (as would happen if
+    two close paths each detect the daily loss cap breach simultaneously) must
+    produce exactly one active kill_event. The loser's speculative row is
+    cleaned up; live_control.active_kill_event_id points to the winner."""
+    import asyncio
+    db = Database(tmp_path / "t.db"); await db.initialize()
+    ks = KillSwitch(db)
+    results = await asyncio.gather(
+        ks.trigger(triggered_by="daily_loss_cap", reason="A",
+                   duration=timedelta(hours=4)),
+        ks.trigger(triggered_by="daily_loss_cap", reason="B",
+                   duration=timedelta(hours=4)),
+    )
+    # Both calls return an id — but they return the SAME id (the winner).
+    assert results[0] == results[1]
+    # Exactly one kill_events row exists.
+    cur = await db._conn.execute("SELECT COUNT(*) FROM kill_events")
+    assert (await cur.fetchone())[0] == 1
+    # live_control points to that row.
+    cur = await db._conn.execute(
+        "SELECT active_kill_event_id FROM live_control WHERE id = 1"
+    )
+    assert (await cur.fetchone())[0] == results[0]
+    await db.close()
 ```
 
 - [ ] **Step 2: Implement**
 
 Implement `KillSwitch` class and top-level `compute_kill_duration` verbatim from spec §6.3. Class methods per §6.1 signature. Use a transaction for trigger() to ensure kill_events INSERT + live_control UPDATE are atomic.
+
+**TOCTOU idempotency — concurrent triggers must collapse to one winner.** Two callers can each pass `is_active() is None` and both call `trigger()`. Without a guard both will insert a kill_events row. Fix: use a conditional `UPDATE ... WHERE active_kill_event_id IS NULL` as the serialization point.
+
+```python
+async def trigger(self, *, triggered_by: str, reason: str,
+                  duration: timedelta) -> int:
+    """Insert kill_events row and atomically claim live_control.
+    Concurrent triggers collapse: only the one that flips
+    live_control.active_kill_event_id from NULL wins."""
+    assert self._db._conn is not None
+    now = datetime.now(timezone.utc)
+    killed_until = now + duration
+    async with self._db._txn_lock:
+        # Insert the row first — speculative.
+        await self._db._conn.execute(
+            "INSERT INTO kill_events "
+            "(triggered_by, reason, triggered_at, killed_until) "
+            "VALUES (?, ?, ?, ?)",
+            (triggered_by, reason, now.isoformat(), killed_until.isoformat()),
+        )
+        new_id = (await (await self._db._conn.execute(
+            "SELECT last_insert_rowid()"
+        )).fetchone())[0]
+
+        # Conditional claim — only succeeds if no other trigger has won.
+        cur = await self._db._conn.execute(
+            "UPDATE live_control SET active_kill_event_id = ? "
+            "WHERE id = 1 AND active_kill_event_id IS NULL",
+            (new_id,),
+        )
+        claimed = cur.rowcount == 1
+
+        if claimed:
+            await self._db._conn.commit()
+            return new_id
+
+        # Lost the race — a concurrent trigger already claimed. Mark our
+        # speculative row as superseded and return the winner's id.
+        await self._db._conn.execute(
+            "DELETE FROM kill_events WHERE id = ?", (new_id,)
+        )
+        cur = await self._db._conn.execute(
+            "SELECT active_kill_event_id FROM live_control WHERE id = 1"
+        )
+        winner_id = (await cur.fetchone())[0]
+        await self._db._conn.commit()
+        return winner_id
+```
+
+The `WHERE active_kill_event_id IS NULL` predicate is the durable guarantee. aiosqlite serializes writes on its single connection, so the two UPDATEs execute sequentially; the second one observes a non-NULL value and affects 0 rows.
 
 - [ ] **Step 3: Run tests + commit**
 
@@ -1719,18 +2246,24 @@ async def test_two_concurrent_closes_trigger_exactly_once(tmp_path):
 
 - [ ] **Step 2: Implement the helper**
 
+**Concurrency note.** The `SUM(realized_pnl) <= -cap` read and the `is_active()` read below are a classic TOCTOU: two concurrent close paths can each observe a breach and both call `trigger()`. The durable guarantee is in `KillSwitch.trigger()` itself, which uses `UPDATE live_control SET active_kill_event_id = ? WHERE active_kill_event_id IS NULL` as the serialization point (see Task 10 Step 2). SQLite's single-connection write serialization via aiosqlite is an implicit assumption — the UPDATE's conditional predicate is what makes this durable across any write-path contention.
+
 ```python
 # scout/live/kill_switch.py — append
 from decimal import Decimal
+import structlog
 from scout.config import Settings
 from scout.db import Database
+
+log = structlog.get_logger(__name__)
 
 
 async def maybe_trigger_from_daily_loss(
     db: Database, ks: KillSwitch, settings: Settings
 ) -> bool:
     """Compute today-UTC closed-trade SUM(realized_pnl_usd); trigger kill if
-    breached and no kill currently active. Idempotent.
+    breached and no kill currently active. Idempotent via KillSwitch.trigger's
+    UPDATE-WHERE-NULL serialization (Task 10 Step 2).
     Returns True if this call triggered a kill."""
     assert db._conn is not None
     cur = await db._conn.execute(
@@ -1742,14 +2275,50 @@ async def maybe_trigger_from_daily_loss(
     daily_sum = (await cur.fetchone())[0]
     if daily_sum > -float(settings.LIVE_DAILY_LOSS_CAP_USD):
         return False
+    # Cheap pre-check — not a guarantee, the real guard is in trigger().
     if await ks.is_active() is not None:
         return False
-    await ks.trigger(
-        triggered_by="daily_loss_cap",
-        reason=f"daily_sum={daily_sum:.2f} cap=-{settings.LIVE_DAILY_LOSS_CAP_USD}",
-        duration=compute_kill_duration(datetime.now(timezone.utc)),
+    try:
+        await ks.trigger(
+            triggered_by="daily_loss_cap",
+            reason=(
+                f"daily_sum={daily_sum:.2f} "
+                f"cap=-{settings.LIVE_DAILY_LOSS_CAP_USD}"
+            ),
+            duration=compute_kill_duration(datetime.now(timezone.utc)),
+        )
+        return True
+    except Exception as exc:
+        from scout.live.metrics import inc
+        await inc(db, "kill_trigger_errors")
+        log.error("live_kill_trigger_failed", exception=str(exc),
+                  daily_sum=daily_sum)
+        raise
+```
+
+- [ ] **Step 2b: Add test for kill_trigger_errors metric path**
+
+Append to `tests/live/test_daily_cap.py`:
+
+```python
+async def test_kill_trigger_errors_metric_on_failure(tmp_path, monkeypatch):
+    """If ks.trigger() raises, maybe_trigger_from_daily_loss must increment
+    kill_trigger_errors and log live_kill_trigger_failed at ERROR before
+    re-raising."""
+    db = Database(tmp_path / "t.db"); await db.initialize()
+    await _seed_closed(db, -60.0)
+    ks = KillSwitch(db)
+    async def _boom(**_kw):
+        raise RuntimeError("simulated kill store failure")
+    monkeypatch.setattr(ks, "trigger", _boom)
+    with pytest.raises(RuntimeError):
+        await maybe_trigger_from_daily_loss(db, ks, _s(50))
+    cur = await db._conn.execute(
+        "SELECT value FROM live_metrics_daily WHERE metric='kill_trigger_errors'"
     )
-    return True
+    row = await cur.fetchone()
+    assert row is not None and row[0] == 1
+    await db.close()
 ```
 
 - [ ] **Step 3: Run + commit**
@@ -1823,6 +2392,13 @@ class LiveEngine:
     async def on_paper_trade_opened(self, paper_trade) -> None:
         """Single entry point from PaperTrader chokepoint. Fire-and-forget.
         paper_trade must have .id, .signal_type, .symbol, .coin_id."""
+        # Belt-and-suspenders: the main.py NotImplementedError guard should
+        # have prevented LIVE_MODE=live from reaching here. If it didn't,
+        # refuse to write any shadow/live row.
+        assert self._config.mode != "live", (
+            "LiveEngine reached in LIVE_MODE=live — startup guard in "
+            "scout/main.py failed; refusing to write any row"
+        )
         trade_id = paper_trade.id
         log.info("live_handoff_started",
                  paper_trade_id=trade_id, signal_type=paper_trade.signal_type,
@@ -1907,11 +2483,77 @@ git commit -m "feat(bl055): shadow evaluator with TP/SL/duration + review-retry"
 - Zero-row boot: `live_boot_reconciliation_done` still fires (`rows_inspected=0`). Verified via structlog `capture_logs`.
 - Open shadow row that crossed TP mid-restart: close as `closed_via_reconciliation` with WARN.
 - Drift window log: `live_boot_reconciliation_drift_window` fires with earliest open `created_at` and restart timestamp.
+- `live_startup_status` event fires once at boot (from `scout/main.py` after reconciliation returns) with fields `live_mode`, `active_kill_event_id` (nullable), `shadow_trades_open` (int), `binance_reachable` (bool — one `fetch_price("BTCUSDT")` probe with 5s timeout).
+
+```python
+# tests/live/test_reconciliation.py — append
+from decimal import Decimal
+from unittest.mock import AsyncMock
+
+import structlog
+
+from scout.config import Settings
+from scout.db import Database
+from scout.live.config import LiveConfig
+from scout.live.kill_switch import KillSwitch
+
+
+def _shadow_cfg():
+    return LiveConfig(Settings(
+        TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k",
+        LIVE_MODE="shadow",
+    ))
+
+
+async def test_live_startup_status_event_fires_at_boot(tmp_path):
+    """Spec §10.2: scout/main.py emits live_startup_status exactly once
+    after boot reconciliation, separate from live_boot_reconciliation_done."""
+    from scout.live.reconciliation import emit_live_startup_status
+    db = Database(tmp_path / "t.db"); await db.initialize()
+    adapter = AsyncMock()
+    adapter.fetch_price = AsyncMock(return_value=Decimal("60000"))
+    ks = KillSwitch(db)
+    with structlog.testing.capture_logs() as cap:
+        await emit_live_startup_status(
+            db=db, adapter=adapter, config=_shadow_cfg(), ks=ks,
+        )
+    events = [e["event"] for e in cap]
+    assert "live_startup_status" in events
+    rec = next(e for e in cap if e["event"] == "live_startup_status")
+    assert rec["live_mode"] == "shadow"
+    assert rec["active_kill_event_id"] is None
+    assert rec["shadow_trades_open"] == 0
+    assert rec["binance_reachable"] is True
+    await db.close()
+
+
+async def test_live_startup_status_binance_unreachable(tmp_path):
+    """fetch_price raises → binance_reachable=False, no crash."""
+    from scout.live.reconciliation import emit_live_startup_status
+    from scout.live.exceptions import VenueTransientError
+    db = Database(tmp_path / "t.db"); await db.initialize()
+    adapter = AsyncMock()
+    adapter.fetch_price = AsyncMock(side_effect=VenueTransientError("down"))
+    ks = KillSwitch(db)
+    with structlog.testing.capture_logs() as cap:
+        await emit_live_startup_status(
+            db=db, adapter=adapter, config=_shadow_cfg(), ks=ks,
+        )
+    rec = next(e for e in cap if e["event"] == "live_startup_status")
+    assert rec["binance_reachable"] is False
+    await db.close()
+```
 
 - [ ] **Step 2: Implement**
 
 ```python
 # scout/live/reconciliation.py
+import asyncio
+import structlog
+
+log = structlog.get_logger(__name__)
+
+
 async def reconcile_open_shadow_trades(
     *, db, adapter, config, ks, settings
 ) -> None:
@@ -1923,7 +2565,44 @@ async def reconcile_open_shadow_trades(
     )
     # ... implementation: drift-window log, per-row TP/SL/duration check,
     # terminal log always fires.
+
+
+async def emit_live_startup_status(*, db, adapter, config, ks) -> None:
+    """Emit a single `live_startup_status` event after reconciliation.
+    Distinct from `live_boot_reconciliation_done` (which is about shadow-row
+    inspection) — this summarizes the overall live subsystem at boot so
+    operators have one grep target for health.
+
+    Fields: live_mode, active_kill_event_id, shadow_trades_open,
+    binance_reachable.
+    """
+    # active_kill_event_id
+    active = await ks.is_active()
+    active_id = active.kill_event_id if active is not None else None
+
+    # shadow_trades_open
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM shadow_trades WHERE status='open'"
+    )
+    shadow_open = (await cur.fetchone())[0]
+
+    # binance_reachable — cheap 5s probe
+    binance_reachable = True
+    try:
+        await asyncio.wait_for(adapter.fetch_price("BTCUSDT"), timeout=5.0)
+    except Exception:
+        binance_reachable = False
+
+    log.info(
+        "live_startup_status",
+        live_mode=config.mode,
+        active_kill_event_id=active_id,
+        shadow_trades_open=shadow_open,
+        binance_reachable=binance_reachable,
+    )
 ```
+
+Call from `scout/main.py` immediately after `reconcile_open_shadow_trades(...)` returns (wired in Task 21).
 
 - [ ] **Step 3: Run + commit**
 
@@ -2196,9 +2875,78 @@ if live_config.mode in ("shadow", "live"):
         live_metrics_rollup_loop(db, alerter, settings)))
 ```
 
-- [ ] **Step 3: Ensure shutdown closes `_live_owned`**
+- [ ] **Step 3: Ensure shutdown closes `_live_owned` AND drains `_pending_live_tasks`**
 
-On graceful shutdown (ctrl-C / SIGTERM), iterate `_live_owned` and `await adapter.close()`.
+On graceful shutdown (ctrl-C / SIGTERM), the shutdown teardown block must:
+
+1. Drain any in-flight `PaperTrader._pending_live_tasks` so a shadow-row write that was mid-flight isn't lost.
+2. Close each adapter in `_live_owned`.
+3. `db.close()`.
+
+Order matters — drain pending tasks BEFORE `db.close()` or the tasks will hit closed-connection errors.
+
+```python
+# scout/main.py — in the shutdown / teardown block, BEFORE db.close()
+if paper_trader._pending_live_tasks:
+    logger.info("live_shutdown_drain_begin",
+                pending=len(paper_trader._pending_live_tasks))
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                *paper_trader._pending_live_tasks,
+                return_exceptions=True,
+            ),
+            timeout=5.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "live_shutdown_drain_timeout",
+            remaining=len(paper_trader._pending_live_tasks),
+        )
+    logger.info("live_shutdown_drain_done")
+
+for adapter in _live_owned:
+    await adapter.close()
+await db.close()
+```
+
+- [ ] **Step 3b: Write failing test for drain-on-shutdown**
+
+```python
+# tests/live/test_main_wiring.py — append
+async def test_shutdown_drains_pending_live_tasks(tmp_path, monkeypatch):
+    """Spec §10.3: shutdown path awaits PaperTrader._pending_live_tasks so
+    an in-flight shadow-write is not orphaned. Simulate by registering a
+    slow fake task on PaperTrader and asserting it runs to completion
+    before db.close() returns."""
+    import asyncio
+    from scout.db import Database
+    from scout.trading.paper import PaperTrader
+
+    db = Database(tmp_path / "t.db"); await db.initialize()
+    pt = PaperTrader()
+
+    completed = asyncio.Event()
+
+    async def _slow_handoff():
+        await asyncio.sleep(0.25)
+        completed.set()
+
+    task = asyncio.create_task(_slow_handoff())
+    pt._pending_live_tasks.add(task)
+    task.add_done_callback(pt._pending_live_tasks.discard)
+
+    # Directly invoke the drain helper — extracted so it's testable without
+    # booting the full pipeline. The implementation in scout/main.py delegates
+    # to this helper.
+    from scout.main import _drain_pending_live_tasks
+    await _drain_pending_live_tasks(pt, timeout_sec=5.0)
+    assert completed.is_set()
+    assert len(pt._pending_live_tasks) == 0
+    await db.close()
+```
+
+Extract the drain logic into a small helper `_drain_pending_live_tasks(paper_trader, timeout_sec)` in `scout/main.py` so the test can exercise it in isolation. The shutdown block calls the helper.
 
 - [ ] **Step 4: Smoke-run**
 
@@ -2208,11 +2956,88 @@ uv run python -m scout.main --dry-run --cycles 1
 
 Expected: process starts and exits cleanly with `LIVE_MODE=paper` (default). No Binance traffic.
 
+- [ ] **Step 4b: Write failing safety test — LIVE_MODE=live raises NotImplementedError at startup**
+
+This is the single most important safety test in BL-055. It guarantees that even if someone sets `LIVE_MODE=live` in `.env`, the process refuses to start and therefore cannot place real orders. It is the outer ring of the defense-in-depth assert added to `LiveEngine.on_paper_trade_opened` (Task 14) and the `send_order` NotImplementedError in the adapter (Task 7).
+
+Create `tests/live/test_main_wiring.py`:
+
+```python
+# tests/live/test_main_wiring.py
+"""Safety tests for the scout/main.py live-mode startup guard (spec §1.3)."""
+
+import pytest
+
+
+async def test_live_mode_live_raises_not_implemented_at_startup(
+    monkeypatch, tmp_path
+):
+    """LIVE_MODE=live must raise NotImplementedError at startup — not just
+    Pydantic validation. This prevents an operator who (a) has valid Binance
+    credentials in .env AND (b) flips LIVE_MODE=live from ever reaching the
+    Binance API in BL-055."""
+    # Shove in the minimum required env for Settings.
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "c")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("LIVE_MODE", "live")
+    monkeypatch.setenv("BINANCE_API_KEY", "fake-key")
+    monkeypatch.setenv("BINANCE_API_SECRET", "fake-secret")
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "guard.db"))
+
+    from scout.main import main as scout_main
+
+    with pytest.raises(NotImplementedError, match="balance gate"):
+        await scout_main(["--dry-run", "--cycles", "1"])
+
+
+async def test_live_mode_live_without_credentials_raises_runtime_error(
+    monkeypatch, tmp_path
+):
+    """LIVE_MODE=live without BINANCE_API_KEY/SECRET raises RuntimeError
+    BEFORE the NotImplementedError balance-gate guard — the credential check
+    runs first."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "c")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("LIVE_MODE", "live")
+    monkeypatch.delenv("BINANCE_API_KEY", raising=False)
+    monkeypatch.delenv("BINANCE_API_SECRET", raising=False)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "guard.db"))
+
+    from scout.main import main as scout_main
+
+    with pytest.raises(RuntimeError, match="BINANCE_API_KEY"):
+        await scout_main(["--dry-run", "--cycles", "1"])
+
+
+async def test_live_mode_shadow_does_not_raise(monkeypatch, tmp_path):
+    """Control — shadow mode does NOT trip the guard. Process must start."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "c")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("LIVE_MODE", "shadow")
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "shadow.db"))
+
+    from scout.main import main as scout_main
+    # --cycles 1 so we exit cleanly after one pipeline tick.
+    rc = await scout_main(["--dry-run", "--cycles", "1"])
+    assert rc == 0
+```
+
+Run the guard test:
+
+```bash
+uv run pytest tests/live/test_main_wiring.py -v
+```
+
+Expected: `test_live_mode_live_raises_not_implemented_at_startup` passes because the `raise NotImplementedError(...)` guard was added in Step 2. If it fails, the guard is not wired correctly — fix before continuing.
+
 - [ ] **Step 5: Commit**
 
 ```bash
-git add scout/main.py
-git commit -m "feat(bl055): wire LiveEngine + loops into main (paper default unchanged)"
+git add scout/main.py tests/live/test_main_wiring.py
+git commit -m "feat(bl055): wire LiveEngine + loops into main + LIVE_MODE=live guard"
 ```
 
 ---
@@ -2274,9 +3099,18 @@ if args.check_config:
 After LiveEngine is constructed but before loops start:
 
 ```python
-from scout.live.reconciliation import reconcile_open_shadow_trades
+from scout.live.reconciliation import (
+    reconcile_open_shadow_trades,
+    emit_live_startup_status,
+)
 await reconcile_open_shadow_trades(
     db=db, adapter=adapter, config=live_config, ks=ks, settings=settings,
+)
+# Immediately after, emit the one-shot startup health summary (spec §10.2).
+# Separate event so operators have a single grep target for live subsystem
+# health even on a zero-row boot.
+await emit_live_startup_status(
+    db=db, adapter=adapter, config=live_config, ks=ks,
 )
 ```
 
@@ -2445,16 +3279,16 @@ Per the user's directive. Reviewers focus on:
 
 **Spec coverage map:**
 
-- §1 (goals, non-goals, three modes): Task 20 (startup guardrails), Task 3 (LIVE_MODE enum).
+- §1 (goals, non-goals, three modes): Task 20 (startup guardrails + `LIVE_MODE=live` NotImplementedError test), Task 3 (LIVE_MODE enum), Task 14 (engine `assert mode != 'live'` belt-and-suspenders).
 - §2 (architecture, chokepoint): Task 19 (chokepoint), Task 14 (engine).
-- §3 (data model): Task 1 (migration) + Task 2 (pragmas).
+- §3 (data model): Task 1 (migration, BEGIN EXCLUSIVE pattern + upgrade-path regression test) + Task 2 (pragmas).
 - §4 (config surface, LiveConfig, .env.example, F1 pre-flight): Tasks 3, 4, 5, 21, 25.
 - §5 (pre-trade gates): Task 12.
-- §6 (kill switch + daily loss cap): Tasks 10, 13.
-- §7 (venue resolver): Task 9.
+- §6 (kill switch + daily loss cap): Tasks 10 (UPDATE-WHERE-NULL idempotency), 13 (TOCTOU comment + `kill_trigger_errors` metric).
+- §7 (venue resolver): Task 9 (+ `resolver_cache_hits`/`misses` metrics).
 - §8 (orderbook walker): Task 8.
-- §9 (rate limiting): Task 7.
-- §10 (error handling + observability): spread across Tasks 14, 15, 16 (logging events + metrics).
+- §9 (rate limiting): Task 7 (asyncio.Event gate + retry taxonomy).
+- §10 (error handling + observability): Task 6b (exception hierarchy), Tasks 14, 15, 16 (logging events + metrics + `live_startup_status`).
 - §11 (testing strategy): Tasks 22 (integration), 23 (CI baseline), 24 (coverage).
 - §12 (rollout): Task 28.
 - §13 I1-I5 tickets: I1 Task 2, I2 Task 25, I3 Task 5, I4 (manual systemd audit — included in soak checklist), I5 (post-soak memory entry — out of scope for this plan).
