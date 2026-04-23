@@ -18,10 +18,14 @@ Single unified exit policy for all six signal types. The `PaperEvaluator` loop a
 2. Leg 1 TP (at +25%, sells 30% of original quantity, records leg_1_filled_at)
 3. Leg 2 TP (at +50%, sells 30% of original quantity, records leg_2_filled_at)
 4. Floor exit (if floor_armed and current price ≤ entry, sells remaining runner slice)
-5. Trailing stop (12% below peak, active on runner slice only, cancelled by floor if it would exit below entry)
+5. Trailing stop (12% below peak, active post-leg-1 on all unsold qty, cancelled by floor if it would exit below entry)
 6. Expiry (existing 48h timeout, sells remaining qty at current price)
 
 Partial fills record individual `paper_trade_fills` rows; the parent `paper_trades` row aggregates realized_pnl incrementally. Close status becomes one of: `closed_sl`, `closed_ladder_complete`, `closed_floor`, `closed_trailing_stop`, `closed_expired`.
+
+### Why SL=15% (widened from -10%)
+
+Under the ladder, SL is disabled once leg 1 fires — the floor (current price ≤ entry → exit) supersedes it as the sole risk cap for runners. Pre-leg-1, SL is a pure downside cap, and widening from -10% to -15% gives trades 1.5× more drawdown tolerance to reach the +25% leg-1 threshold, at which point the floor locks in at-worst-zero-giveback. Tail risk is unchanged: trades that keep bleeding past -15% are stopped the same way -10% stops them, and post-leg-1 the floor (not SL) is the operative cap. Only trades in the -10% to -15% drawdown band that would have been stopped under the old policy are affected — they now get to test whether they can recover to +25% and arm the floor. Like the leg thresholds, this number is speculative: if post-cutover data shows the widening is net-negative, the 2026-05-23 calibration review can revert it.
 
 ## Tech Stack
 
@@ -126,10 +130,10 @@ admit → open (remaining_qty=Q, floor_armed=0, SL=-15%)
    ↓ price climbs past +25%
 leg 1 fires → sell 0.3Q at +25%, remaining_qty=0.7Q, floor_armed=1, realized=+7.5% notional
    ↓ price continues to +45% peak
-   ↓ price retraces past 12% trail from +45% peak (i.e. price at +33.0% from entry)
-trailing stop fires → sell 0.7Q at +33.0%, realized += 0.7 * 33.0% = +23.1% notional
+   ↓ price retraces 12% from peak (trail_threshold = peak × 0.88 = entry × 1.45 × 0.88 ≈ +27.6% from entry)
+trailing stop fires → sell 0.7Q at +27.6%, realized += 0.7 × 27.6% ≈ +19.3% notional
    ↓
-final realized_pnl_pct ≈ (0.3 * 25 + 0.7 * 33) / 1.0 = 30.6%
+final realized_pnl_pct ≈ (0.3 × 25) + (0.7 × 27.6) ≈ 26.8%
 close status: closed_trailing_stop
 ```
 
@@ -138,6 +142,7 @@ Compare to old policy: would have closed entire position at +20% TP for +20% fin
 ## Error handling
 
 - Slippage failures on partial sells: retry once with fresh price; if second attempt also fails, log `ladder_leg_sell_failed` and leave remaining_qty unchanged (skip to next tick)
+- Trail exit target: when the trail threshold is crossed, the evaluator closes **all unsold qty** post-leg-1 — this is the runner (0.4Q) if leg 2 already fired, or the runner plus the unfilled leg-2 slice (0.7Q) if price skipped over +50% between ticks. Trail is not "runner-only."
 - Floor + trailing stop race (both want to exit below entry simultaneously): floor wins (exit at entry, not below)
 - Database write failure during partial sell: rollback the fill; re-attempt next tick (idempotent via `leg_N_filled_at IS NULL` guard)
 
