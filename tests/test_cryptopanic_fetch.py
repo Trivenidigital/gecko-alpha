@@ -101,7 +101,12 @@ async def test_fetch_401_returns_empty():
     assert result == []
 
 
-async def test_fetch_429_retries_then_empty():
+async def test_fetch_429_retries_then_empty(monkeypatch):
+    import scout.news.cryptopanic as _cp
+    async def _no_sleep(_s):
+        return None
+    monkeypatch.setattr(_cp.asyncio, "sleep", _no_sleep)
+
     s = _settings()
     with aioresponses() as m:
         m.get(BASE, status=429, repeat=True)
@@ -110,7 +115,12 @@ async def test_fetch_429_retries_then_empty():
     assert result == []
 
 
-async def test_fetch_5xx_retries_then_empty():
+async def test_fetch_5xx_retries_then_empty(monkeypatch):
+    import scout.news.cryptopanic as _cp
+    async def _no_sleep(_s):
+        return None
+    monkeypatch.setattr(_cp.asyncio, "sleep", _no_sleep)
+
     s = _settings()
     with aioresponses() as m:
         m.get(BASE, status=503, repeat=True)
