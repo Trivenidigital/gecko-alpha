@@ -317,23 +317,10 @@ async def trade_first_signals(
             this are skipped from paper-trade admission; signals/alerts are
             unaffected.
     """
-    min_quant = settings.PAPER_MIN_QUANT_SCORE
     skipped_large = 0
     skipped_junk = 0
-    skipped_below_threshold = 0
     for token, quant_score, signals_fired in scored_candidates:
         if quant_score <= 0 or not signals_fired:
-            continue
-        if quant_score < min_quant:
-            skipped_below_threshold += 1
-            logger.info(
-                "signal_gated_below_threshold",
-                coin_id=token.contract_address,
-                symbol=token.ticker,
-                quant_score=quant_score,
-                min_quant=min_quant,
-                signal_type="first_signal",
-            )
             continue
         if not _is_tradeable_candidate(token.contract_address, token.ticker):
             skipped_junk += 1
@@ -387,12 +374,11 @@ async def trade_first_signals(
             )
         except Exception:
             logger.exception("trading_first_signal_error", token=token.ticker)
-    if skipped_large or skipped_junk or skipped_below_threshold:
+    if skipped_large or skipped_junk:
         logger.info(
             "trade_first_signals_filtered",
             skipped_large_mcap=skipped_large,
             skipped_junk=skipped_junk,
-            skipped_below_threshold=skipped_below_threshold,
             max_mcap=max_mcap,
         )
 

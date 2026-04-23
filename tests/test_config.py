@@ -162,42 +162,6 @@ def test_parse_perp_symbols_rejects_over_200_items_from_list():
         )
 
 
-def test_bl060_defaults():
-    """BL-060 paper-mirrors-live knobs default to gate-off + 20-slot cap.
-
-    Changing these defaults is a behavioral change — pin them here so the
-    `would_be_live` NULL-stamp regime stays the out-of-box mode.
-    """
-    s = Settings(
-        TELEGRAM_BOT_TOKEN="t",
-        TELEGRAM_CHAT_ID="c",
-        ANTHROPIC_API_KEY="k",
-    )
-    assert s.PAPER_MIN_QUANT_SCORE == 0, "gate off by default (NULL-stamp)"
-    assert s.PAPER_LIVE_ELIGIBLE_CAP == 20, "FCFS 20-slot cap by default"
-
-
-def test_bl060_rejects_negative_values():
-    import pytest
-    from pydantic import ValidationError
-    from scout.config import Settings
-
-    with pytest.raises(ValidationError):
-        Settings(
-            TELEGRAM_BOT_TOKEN="t",
-            TELEGRAM_CHAT_ID="c",
-            ANTHROPIC_API_KEY="k",
-            PAPER_MIN_QUANT_SCORE=-1,
-        )
-    with pytest.raises(ValidationError):
-        Settings(
-            TELEGRAM_BOT_TOKEN="t",
-            TELEGRAM_CHAT_ID="c",
-            ANTHROPIC_API_KEY="k",
-            PAPER_LIVE_ELIGIBLE_CAP=-1,
-        )
-
-
 def test_bl061_ladder_config_defaults(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     for var in (

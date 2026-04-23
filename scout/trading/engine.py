@@ -247,8 +247,6 @@ class TradingEngine:
                 signal_combo=signal_combo,
                 lead_time_vs_trending_min=lead_time_min,
                 lead_time_vs_trending_status=lead_time_status,
-                live_eligible_cap=self.settings.PAPER_LIVE_ELIGIBLE_CAP,
-                min_quant_score=self.settings.PAPER_MIN_QUANT_SCORE,
             )
             return trade_id
 

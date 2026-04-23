@@ -26,8 +26,6 @@ async def test_paper_trader_no_live_engine_unchanged(tmp_path):
         signal_combo="",
         lead_time_vs_trending_min=None,
         lead_time_vs_trending_status=None,
-        live_eligible_cap=20,
-        min_quant_score=0,
     )
     assert trade_id is not None
     await db.close()
@@ -54,8 +52,6 @@ async def test_paper_trader_dispatches_to_live_engine_when_allowlisted(tmp_path)
         signal_combo="",
         lead_time_vs_trending_min=None,
         lead_time_vs_trending_status=None,
-        live_eligible_cap=20,
-        min_quant_score=0,
     )
     # Task is scheduled — allow the event loop to run it.
     await asyncio.sleep(0)
@@ -89,8 +85,6 @@ async def test_paper_trader_skips_dispatch_when_not_eligible(tmp_path):
         signal_combo="",
         lead_time_vs_trending_min=None,
         lead_time_vs_trending_status=None,
-        live_eligible_cap=20,
-        min_quant_score=0,
     )
     le.on_paper_trade_opened.assert_not_called()
     await db.close()
