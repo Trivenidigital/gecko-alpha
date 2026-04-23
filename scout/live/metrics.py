@@ -34,10 +34,18 @@ async def inc(
         Increment amount (default 1).
     """
     assert db._conn is not None, "Database must be initialized before inc()"
+    assert db._txn_lock is not None, "Database must be initialized before inc()"
     d = date_utc or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    await db._conn.execute(
-        "INSERT INTO live_metrics_daily (date, metric, value) VALUES (?, ?, ?) "
-        "ON CONFLICT(date, metric) DO UPDATE SET value = value + excluded.value",
-        (d, metric, by),
-    )
-    await db._conn.commit()
+    # Reviewer 2: every commit on the shared connection must hold _txn_lock so
+    # concurrent writers cannot interleave executes and a half-open
+    # transaction. Callers MUST NOT already hold _txn_lock (asyncio.Lock is
+    # non-reentrant on the same task); the four callsites (engine.py L143/
+    # L180/L216, kill_switch.py L285) all release the lock before calling
+    # inc(), verified.
+    async with db._txn_lock:
+        await db._conn.execute(
+            "INSERT INTO live_metrics_daily (date, metric, value) VALUES (?, ?, ?) "
+            "ON CONFLICT(date, metric) DO UPDATE SET value = value + excluded.value",
+            (d, metric, by),
+        )
+        await db._conn.commit()

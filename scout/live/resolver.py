@@ -168,30 +168,38 @@ class VenueResolver:
 
     async def _cache_put_positive(self, sym: str, rv: ResolvedVenue) -> None:
         assert self._db._conn is not None
+        assert self._db._txn_lock is not None
         now = datetime.now(timezone.utc)
         expires_at = now + self._positive_ttl
-        await self._db._conn.execute(
-            "INSERT INTO resolver_cache "
-            "(symbol, outcome, venue, pair, resolved_at, expires_at) "
-            "VALUES (?, 'positive', ?, ?, ?, ?) "
-            "ON CONFLICT(symbol) DO UPDATE SET "
-            "  outcome=excluded.outcome, venue=excluded.venue, pair=excluded.pair, "
-            "  resolved_at=excluded.resolved_at, expires_at=excluded.expires_at",
-            (sym, rv.venue, rv.pair, now.isoformat(), expires_at.isoformat()),
-        )
-        await self._db._conn.commit()
+        # Reviewer 2: commits on the shared connection must hold _txn_lock.
+        # Callers of _cache_put_* (resolve() at L115/L121/L127) are already
+        # inside the per-symbol single-flight lock but NOT inside _txn_lock,
+        # so nesting here is safe.
+        async with self._db._txn_lock:
+            await self._db._conn.execute(
+                "INSERT INTO resolver_cache "
+                "(symbol, outcome, venue, pair, resolved_at, expires_at) "
+                "VALUES (?, 'positive', ?, ?, ?, ?) "
+                "ON CONFLICT(symbol) DO UPDATE SET "
+                "  outcome=excluded.outcome, venue=excluded.venue, pair=excluded.pair, "
+                "  resolved_at=excluded.resolved_at, expires_at=excluded.expires_at",
+                (sym, rv.venue, rv.pair, now.isoformat(), expires_at.isoformat()),
+            )
+            await self._db._conn.commit()
 
     async def _cache_put_negative(self, sym: str) -> None:
         assert self._db._conn is not None
+        assert self._db._txn_lock is not None
         now = datetime.now(timezone.utc)
         expires_at = now + self._negative_ttl
-        await self._db._conn.execute(
-            "INSERT INTO resolver_cache "
-            "(symbol, outcome, venue, pair, resolved_at, expires_at) "
-            "VALUES (?, 'negative', NULL, NULL, ?, ?) "
-            "ON CONFLICT(symbol) DO UPDATE SET "
-            "  outcome=excluded.outcome, venue=NULL, pair=NULL, "
-            "  resolved_at=excluded.resolved_at, expires_at=excluded.expires_at",
-            (sym, now.isoformat(), expires_at.isoformat()),
-        )
-        await self._db._conn.commit()
+        async with self._db._txn_lock:
+            await self._db._conn.execute(
+                "INSERT INTO resolver_cache "
+                "(symbol, outcome, venue, pair, resolved_at, expires_at) "
+                "VALUES (?, 'negative', NULL, NULL, ?, ?) "
+                "ON CONFLICT(symbol) DO UPDATE SET "
+                "  outcome=excluded.outcome, venue=NULL, pair=NULL, "
+                "  resolved_at=excluded.resolved_at, expires_at=excluded.expires_at",
+                (sym, now.isoformat(), expires_at.isoformat()),
+            )
+            await self._db._conn.commit()
