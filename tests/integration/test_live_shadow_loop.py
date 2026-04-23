@@ -367,7 +367,7 @@ async def test_flow_4_venue_transient_rejects_venue_unavailable(tmp_path):
     """Gate 5 calls ``adapter.fetch_depth`` which retries on 5xx up to 3x then
     raises :class:`VenueTransientError`. Gates catches that and rejects with
     ``venue_unavailable``. The engine writes a rejected row and a WARN-level
-    log event (``live_handoff_rejected``) is emitted."""
+    log event (``live_pretrade_gate_failed``) is emitted."""
     db = Database(tmp_path / "f4.db")
     await db.initialize()
     settings = _settings()
@@ -394,10 +394,10 @@ async def test_flow_4_venue_transient_rejects_venue_unavailable(tmp_path):
         status, reject_reason, _vwap, _pair = row
         assert status == "rejected"
         assert reject_reason == "venue_unavailable"
-        # Engine logs `live_handoff_rejected` at info level for any reject;
+        # Engine logs `live_pretrade_gate_failed` at info level for any reject;
         # spec §11.6 calls for the operator-visible event to exist.
         events = [le.get("event") for le in logs]
-        assert "live_handoff_rejected" in events
+        assert "live_pretrade_gate_failed" in events
     finally:
         await adapter.close()
         await db.close()

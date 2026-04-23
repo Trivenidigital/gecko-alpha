@@ -66,24 +66,39 @@ class VenueResolver:
     async def resolve(self, symbol: str) -> ResolvedVenue | None:
         sym = symbol.upper()
         # 1. Cache
-        cached = await self._cache_get(sym)
+        cached, ttl_remaining_sec = await self._cache_get_with_ttl(sym)
         if cached is not False:
             # Positive hit OR cached-negative. Either way the cache served it.
+            outcome = "positive" if cached is not None else "negative"
             if _METRIC_INC is not None:
                 await _METRIC_INC(self._db, "resolver_cache_hits")
+            log.debug(
+                "live_resolver_cache_hit",
+                symbol=sym,
+                outcome=outcome,
+                ttl_remaining_sec=ttl_remaining_sec,
+            )
             return cached if cached is not None else None
 
         # Cache miss — count it once, before single-flight.
         if _METRIC_INC is not None:
             await _METRIC_INC(self._db, "resolver_cache_misses")
+        log.debug("live_resolver_cache_miss", symbol=sym, outcome="miss")
 
         # 2. Single-flight per-symbol
         async with self._locks[sym]:
-            cached = await self._cache_get(sym)
+            cached, ttl_remaining_sec = await self._cache_get_with_ttl(sym)
             if cached is not False:
                 # Another waiter populated cache — treat this as a hit too.
+                outcome = "positive" if cached is not None else "negative"
                 if _METRIC_INC is not None:
                     await _METRIC_INC(self._db, "resolver_cache_hits")
+                log.debug(
+                    "live_resolver_cache_hit",
+                    symbol=sym,
+                    outcome=outcome,
+                    ttl_remaining_sec=ttl_remaining_sec,
+                )
                 return cached if cached is not None else None
 
             # 3. Override
@@ -118,6 +133,16 @@ class VenueResolver:
         """Return ResolvedVenue for positive hit, None for negative hit,
         False for cache miss. (Three-valued to distinguish 'not-cached' from
         'cached-as-negative'.)"""
+        result, _ttl = await self._cache_get_with_ttl(sym)
+        return result
+
+    async def _cache_get_with_ttl(
+        self, sym: str
+    ) -> tuple[ResolvedVenue | None | bool, int | None]:
+        """Variant of :meth:`_cache_get` that also returns the remaining TTL
+        (in seconds, rounded down) so the resolve() log event can include it.
+        Returns ``(False, None)`` on miss, ``(None, ttl)`` on cached-negative,
+        ``(ResolvedVenue, ttl)`` on positive hit."""
         assert self._db._conn is not None
         now = datetime.now(timezone.utc)
         cur = await self._db._conn.execute(
@@ -127,15 +152,19 @@ class VenueResolver:
         )
         row = await cur.fetchone()
         if row is None:
-            return False
+            return False, None
         expires_at = datetime.fromisoformat(row[3].replace("Z", "+00:00"))
         if expires_at <= now:
-            return False
+            return False, None
+        ttl_remaining_sec = int((expires_at - now).total_seconds())
         if row[0] == "positive":
-            return ResolvedVenue(
-                symbol=sym, venue=row[1], pair=row[2], source="cache",
+            return (
+                ResolvedVenue(
+                    symbol=sym, venue=row[1], pair=row[2], source="cache",
+                ),
+                ttl_remaining_sec,
             )
-        return None  # cached-negative
+        return None, ttl_remaining_sec  # cached-negative
 
     async def _cache_put_positive(self, sym: str, rv: ResolvedVenue) -> None:
         assert self._db._conn is not None

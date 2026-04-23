@@ -142,7 +142,7 @@ class LiveEngine:
                 await self._db._conn.commit()
             await inc(self._db, f"shadow_rejects_{reason}")
             log.info(
-                "live_handoff_rejected",
+                "live_pretrade_gate_failed",
                 paper_trade_id=trade_id,
                 reject_reason=reason,
                 detail=result.detail,
@@ -215,7 +215,7 @@ class LiveEngine:
             await self._db._conn.commit()
         await inc(self._db, "shadow_orders_opened")
         log.info(
-            "live_handoff_opened",
+            "live_shadow_order_opened",
             paper_trade_id=trade_id,
             venue=venue.venue,
             pair=venue.pair,

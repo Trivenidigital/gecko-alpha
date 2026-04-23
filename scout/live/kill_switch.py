@@ -141,7 +141,7 @@ class KillSwitch:
             if claimed:
                 await self._db._conn.commit()
                 log.warning(
-                    "kill_switch.triggered",
+                    "live_kill_event_triggered",
                     kill_event_id=new_id,
                     triggered_by=triggered_by,
                     reason=reason,
@@ -160,7 +160,7 @@ class KillSwitch:
             winner_id = (await cur.fetchone())[0]
             await self._db._conn.commit()
             log.info(
-                "kill_switch.trigger_lost_race",
+                "live_kill_event_trigger_lost_race",
                 losing_speculative_id=new_id,
                 winner_id=winner_id,
             )
@@ -196,7 +196,7 @@ class KillSwitch:
             )
             await self._db._conn.commit()
             log.info(
-                "kill_switch.cleared",
+                "live_kill_event_cleared",
                 kill_event_id=active_id,
                 cleared_by=cleared_by,
             )

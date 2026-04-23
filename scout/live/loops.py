@@ -143,7 +143,7 @@ async def _run_override_staleness_audit(
         if row is None:
             stale.append(symbol)
             log.warning(
-                "override_stale_pair_not_listed",
+                "live_override_stale_detected",
                 symbol=symbol,
                 pair=pair,
                 venue=venue,
