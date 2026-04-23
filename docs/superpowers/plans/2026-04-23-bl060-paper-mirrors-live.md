@@ -6,7 +6,7 @@
 
 **Architecture:** One additive schema migration (nullable column + composite index) drives everything. INSERT stamps `would_be_live` via an inline SQL subquery (`CASE WHEN min_quant_score=0 THEN NULL WHEN COUNT(open=1) < cap THEN 1 ELSE 0 END`) returning the value via `RETURNING`. Two NULL-producing regimes (pre-cutover, pre-threshold) both filter out of A/B via `WHERE would_be_live IS NOT NULL`. Score gate is local to `trade_first_signals`; other dispatchers untouched.
 
-**Tech Stack:** Python 3.11, aiosqlite, aiohttp, Pydantic v2, pytest-asyncio, structlog, React (dashboard).
+**Tech Stack:** Python 3.12+, aiosqlite 0.20+, aiohttp, Pydantic v2, pytest-asyncio, structlog, React (dashboard).
 
 **Spec:** `docs/superpowers/specs/2026-04-23-bl060-paper-mirrors-live-design.md`
 
@@ -279,7 +279,29 @@ git commit -m "feat(bl060): add PAPER_MIN_QUANT_SCORE and PAPER_LIVE_ELIGIBLE_CA
 
 This task implements spec tests #1, #2, #3a, #5, #6, #7, #12, #17.
 
-- [ ] **Step 1: Write failing test #1 — baseline subquery correctness + RETURNING/lastrowid**
+**Signature design decision** (resolving reviewer blocker): the existing `PaperTrader.execute_buy` signature at `scout/trading/paper.py:26-44` takes `db` as first positional, `current_price: float`, `slippage_bps: int = 0`, and returns `int | None` (None on zero-price / bad quantity early exit). The slippage math (`effective_entry = current_price * (1 + slippage_bps/10000)`) lives inside `execute_buy`.
+
+**Preserve all existing params and the `int | None` return.** ADD two new **required keyword-only** args: `live_eligible_cap: int` and `min_quant_score: int`. Do NOT return a tuple — callers (engine.py, evaluator.py, many tests) consume `int | None`. The stamped `would_be_live` value is surfaced only via the cap-hit log (when =0); not returned to callers.
+
+- [ ] **Step 1: Update 6 pre-existing callers in `tests/test_paper_trader.py`**
+
+Task 3 makes `live_eligible_cap` and `min_quant_score` required kwargs on `execute_buy`. The file already has 6 call sites at lines 27, 53, 80, 107, 142, 175 that do NOT pass them. Each call would raise `TypeError` on collection. Before adding any new tests, update each pre-existing call to add:
+
+```python
+live_eligible_cap=20,
+min_quant_score=0,  # 0 = NULL-stamp, preserves pre-BL-060 semantics
+```
+
+Place these alongside the existing keyword args (`signal_combo=...`, `lead_time_vs_trending_min=...`, etc.). Do this mechanically — same two kwargs, same values, in all 6 callers. The commit for this step keeps those tests passing (because the hardcoded `0` matches pre-BL-060 NULL behavior).
+
+Commit after this step BEFORE changing production code:
+
+```bash
+git add tests/test_paper_trader.py
+git commit -m "test(bl060): thread live_eligible_cap and min_quant_score through pre-existing callers"
+```
+
+- [ ] **Step 2: Write failing test #1 — baseline subquery correctness + RETURNING/lastrowid**
 
 Add to `tests/test_paper_trader.py`:
 
@@ -293,21 +315,23 @@ from scout.trading.paper import PaperTrader
 async def test_stamp_fresh_db_first_n_up_to_cap_are_live_eligible(tmp_path):
     db = Database(str(tmp_path / "gecko.db"))
     await db.initialize()
-    trader = PaperTrader(db)
+    trader = PaperTrader()
 
     results = []
     for i in range(21):  # cap=20; 21st should stamp =0
-        trade_id, stamped = await trader.execute_buy(
+        trade_id = await trader.execute_buy(
+            db=db,
             token_id=f"tok{i}",
             symbol=f"S{i}",
             name=f"Name{i}",
             chain="eth",
             signal_type="first_signal",
             signal_data={"quant_score": 50},
-            entry_price=1.0,
+            current_price=1.0,
             amount_usd=100.0,
             tp_pct=40.0,
             sl_pct=20.0,
+            slippage_bps=0,
             signal_combo="first_signal",
             lead_time_vs_trending_min=None,
             lead_time_vs_trending_status=None,
@@ -315,53 +339,59 @@ async def test_stamp_fresh_db_first_n_up_to_cap_are_live_eligible(tmp_path):
             min_quant_score=1,  # non-zero: stamps real 0/1
         )
         assert trade_id > 0, "trade_id must be populated"
-        assert stamped in (0, 1), f"stamped must be 0 or 1; got {stamped}"
-        results.append(stamped)
+        results.append(trade_id)
 
-    assert sum(r == 1 for r in results) == 20, (
-        f"first 20 must be =1; got {results}"
+    async with db._conn.execute(
+        "SELECT id, would_be_live FROM paper_trades ORDER BY id"
+    ) as cur:
+        rows = await cur.fetchall()
+    stamps = [r[1] for r in rows]
+    assert sum(s == 1 for s in stamps) == 20, (
+        f"first 20 must stamp =1; got {stamps}"
     )
-    assert results[20] == 0, f"21st must be =0; got {results[20]}"
+    assert stamps[20] == 0, f"21st must stamp =0; got {stamps[20]}"
     await db.close()
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 3: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_paper_trader.py::test_stamp_fresh_db_first_n_up_to_cap_are_live_eligible -v`
 
-Expected: FAIL — `execute_buy` signature does not yet accept `live_eligible_cap` / `min_quant_score` kwargs.
+Expected: FAIL — `execute_buy` signature does not yet accept `live_eligible_cap` / `min_quant_score` kwargs; raises `TypeError: unexpected keyword argument 'live_eligible_cap'`.
 
-- [ ] **Step 3: Update `PaperTrader.execute_buy` signature to require the two kwargs**
+- [ ] **Step 4: Update `PaperTrader.execute_buy` signature — ADD two required keyword-only args**
 
-In `scout/trading/paper.py`, change `execute_buy` signature to include required kwargs (no defaults):
+In `scout/trading/paper.py`, preserve the existing signature and append the two new required keyword-only args. Final signature:
 
 ```python
 async def execute_buy(
     self,
+    db: Database,
     token_id: str,
     symbol: str,
     name: str,
     chain: str,
     signal_type: str,
     signal_data: dict,
-    entry_price: float,
+    current_price: float,
     amount_usd: float,
     tp_pct: float,
     sl_pct: float,
-    signal_combo: str,
-    lead_time_vs_trending_min: float | None,
-    lead_time_vs_trending_status: str | None,
+    slippage_bps: int = 0,
     *,
+    signal_combo: str,
+    lead_time_vs_trending_min: float | None = None,
+    lead_time_vs_trending_status: str | None = None,
     live_eligible_cap: int,
     min_quant_score: int,
-) -> tuple[int, int | None]:
+) -> int | None:
 ```
 
-Return signature changes from `int` (trade_id) to `tuple[int, int | None]` (trade_id, stamped value).
+Return stays `int | None` (preserves `None` early-exit contract for zero-price / bad-quantity paths at lines 54-66). No tuple return — callers `engine.open_trade`, `evaluator._trader.execute_buy(...)`, and all dashboards consume `int | None`.
 
-- [ ] **Step 4: Replace the INSERT inside `execute_buy` with subquery + RETURNING pattern**
+- [ ] **Step 5: Replace the INSERT inside `execute_buy` with subquery + RETURNING pattern**
 
-Final INSERT SQL (single statement, 18 positional `?` + 2 subquery `?`):
+Final INSERT SQL (single statement, 17 positional `?` + `'open'` literal + 2 subquery `?` = 19 binds total):
 
 ```python
 INSERT_SQL = """
@@ -384,33 +414,42 @@ RETURNING would_be_live
 """
 ```
 
-Python body:
+Python body — preserve existing slippage math and None early-exits; replace ONLY the INSERT call:
 
 ```python
-import json
-import structlog
+# ... existing code (unchanged):
+#   effective_entry = current_price * (1 + slippage_bps / 10000)
+#   if effective_entry <= 0: ... return None
+#   quantity = amount_usd / effective_entry
+#   if quantity <= 0 or not (quantity == quantity): ... return None
+#   tp_price, sl_price, now computed as before
+# ... replace the INSERT block (lines 71-100) with:
 
-log = structlog.get_logger(__name__)
-
-quantity = amount_usd / entry_price
-tp_price = entry_price * (1 + tp_pct / 100)
-sl_price = entry_price * (1 - sl_pct / 100)
-opened_at = self._now_iso()
-
-params = (
-    token_id, symbol, name, chain, signal_type, json.dumps(signal_data),
-    entry_price, amount_usd, quantity,
-    tp_pct, sl_pct, tp_price, sl_price,
-    opened_at,
-    signal_combo, lead_time_vs_trending_min, lead_time_vs_trending_status,
-    min_quant_score, live_eligible_cap,
-)
-
-cur = await self._db._conn.execute(INSERT_SQL, params)
-row = await cur.fetchone()
+cursor = await conn.execute(INSERT_SQL, (
+    token_id,
+    symbol,
+    name,
+    chain,
+    signal_type,
+    json.dumps(signal_data),
+    effective_entry,
+    amount_usd,
+    quantity,
+    tp_pct,
+    sl_pct,
+    tp_price,
+    sl_price,
+    now,
+    signal_combo,
+    lead_time_vs_trending_min,
+    lead_time_vs_trending_status,
+    min_quant_score,
+    live_eligible_cap,
+))
+row = await cursor.fetchone()
 would_be_live_stamped = row[0] if row else None
-trade_id = cur.lastrowid or 0
-await self._db._conn.commit()
+trade_id = cursor.lastrowid
+await conn.commit()
 
 if would_be_live_stamped == 0:
     log.info(
@@ -421,7 +460,8 @@ if would_be_live_stamped == 0:
         token_id=token_id,
     )
 
-return trade_id, would_be_live_stamped
+# existing "paper_trade_opened" log stays unchanged — runs after cap-hit log.
+return trade_id
 ```
 
 **In-code comment above the SQL** (required — non-obvious WHY):
@@ -438,102 +478,136 @@ return trade_id, would_be_live_stamped
 **If Task 0 probe failed**: swap the stamped/trade_id reads:
 
 ```python
-cur = await self._db._conn.execute(INSERT_SQL, params)
-row = await cur.fetchone()
+cursor = await conn.execute(INSERT_SQL, params)
+row = await cursor.fetchone()
 would_be_live_stamped = row[0] if row else None
-id_cur = await self._db._conn.execute("SELECT last_insert_rowid()")
+id_cur = await conn.execute("SELECT last_insert_rowid()")
 id_row = await id_cur.fetchone()
-trade_id = id_row[0] if id_row else 0
-await self._db._conn.commit()
+trade_id = id_row[0] if id_row else None
+await conn.commit()
 ```
 
-- [ ] **Step 5: Run test #1 — must now pass**
+- [ ] **Step 6: Update `TradingEngine.open_trade` to thread the two new kwargs (engine.py:225-241)**
 
-Run: `uv run pytest tests/test_paper_trader.py::test_stamp_fresh_db_first_n_up_to_cap_are_live_eligible -v`
-
-Expected: PASS.
-
-- [ ] **Step 6: Update `TradingEngine.open_trade` to thread settings**
-
-In `scout/trading/engine.py`, find `open_trade` and update the `execute_buy` call to pass the two required kwargs:
+In `scout/trading/engine.py`, the call at line 225 already passes `db=self.db, current_price=current_price, slippage_bps=self.settings.PAPER_SLIPPAGE_BPS, ...`. Attribute is `self.settings` (NOT `self._settings`). ADD the two new kwargs alongside the existing ones:
 
 ```python
-trade_id, would_be_live_stamped = await self._paper_trader.execute_buy(
-    token_id=token.contract_address,
-    symbol=token.ticker,
-    name=token.name,
-    chain=token.chain,
+trade_id = await self._paper_trader.execute_buy(
+    db=self.db,
+    token_id=token_id,
+    symbol=symbol,
+    name=name,
+    chain=chain,
     signal_type=signal_type,
     signal_data=signal_data,
-    entry_price=entry_price,
-    amount_usd=self._settings.PAPER_TRADE_AMOUNT_USD,
-    tp_pct=self._settings.PAPER_TP_PCT,
-    sl_pct=self._settings.PAPER_SL_PCT,
+    current_price=current_price,
+    amount_usd=trade_amount,
+    tp_pct=self.settings.PAPER_TP_PCT,
+    sl_pct=self.settings.PAPER_SL_PCT,
+    slippage_bps=self.settings.PAPER_SLIPPAGE_BPS,
     signal_combo=signal_combo,
     lead_time_vs_trending_min=lead_time_min,
     lead_time_vs_trending_status=lead_time_status,
-    live_eligible_cap=self._settings.PAPER_LIVE_ELIGIBLE_CAP,
-    min_quant_score=self._settings.PAPER_MIN_QUANT_SCORE,
+    live_eligible_cap=self.settings.PAPER_LIVE_ELIGIBLE_CAP,
+    min_quant_score=self.settings.PAPER_MIN_QUANT_SCORE,
 )
+return trade_id
 ```
 
-If `open_trade` currently only returns `trade_id`, adjust the unpack to drop the stamped value (not used downstream at this site).
+Return type unchanged (`int | None`). Downstream consumers at `signals.py:53,162,269,362,473,740,813` keep working.
 
 - [ ] **Step 7: Update `scout/trading/evaluator.py:219` `long_hold` rollover caller**
 
-Locate the direct `execute_buy` call for `long_hold` rollovers. Add the two kwargs:
+`evaluator.py` is a module with a module-level `_trader = PaperTrader()` and an `evaluate_paper_trades(db, settings)` entry point — **NOT a class**. The call at line 219 uses `_trader.execute_buy(db=db, ...)` with `settings` available as a parameter of the enclosing function. Add the two kwargs at the existing call (preserving every existing kwarg):
 
 ```python
-await self._paper_trader.execute_buy(
-    # ...existing args unchanged...
-    live_eligible_cap=self._settings.PAPER_LIVE_ELIGIBLE_CAP,
-    min_quant_score=0,  # rollovers are continuations, not new admissions — NULL-stamp
+new_id = await _trader.execute_buy(
+    db=db,
+    token_id=token_id,
+    symbol=row[15] if len(row) > 15 else "",
+    name=row[16] if len(row) > 16 else "",
+    chain=row[17] if len(row) > 17 else "coingecko",
+    signal_type="long_hold",
+    signal_data={
+        "origin_trade_id": trade_id,
+        "origin_signal": str(signal_data_raw),
+    },
+    current_price=current_price,
+    amount_usd=keep_amount,
+    tp_pct=100.0,
+    sl_pct=0.0,
+    slippage_bps=0,
+    signal_combo="long_hold",
+    live_eligible_cap=settings.PAPER_LIVE_ELIGIBLE_CAP,
+    min_quant_score=0,  # rollover = continuation, NULL-stamp (not a new admission)
 )
 ```
 
 **Why `min_quant_score=0`**: rollovers carry forward an existing position; they are not a new admission decision and must be excluded from the A/B. NULL-stamp is semantically correct.
 
-- [ ] **Step 8: Write failing test #2 — closing a =1 trade frees a slot**
+**Verify sole caller**: `grep -n "_trader.execute_buy\|_trader\.execute_buy" scout/trading/evaluator.py` must return ONE hit (line 219). If more hits appear, update each.
+
+- [ ] **Step 8: Run test #1 — must now pass**
+
+Run: `uv run pytest tests/test_paper_trader.py::test_stamp_fresh_db_first_n_up_to_cap_are_live_eligible -v`
+
+Expected: PASS.
+
+- [ ] **Step 9: Write test #2 — closing a =1 trade frees a slot**
+
+Helper reads back the stamped value via a SELECT since `execute_buy` returns `int | None` (trade_id), not a tuple:
 
 ```python
+async def _stamp_of(db, trade_id: int) -> int | None:
+    cur = await db._conn.execute(
+        "SELECT would_be_live FROM paper_trades WHERE id=?", (trade_id,)
+    )
+    row = await cur.fetchone()
+    return row[0] if row else None
+
+
 @pytest.mark.asyncio
 async def test_closing_live_eligible_trade_frees_slot(tmp_path):
     db = Database(str(tmp_path / "gecko.db"))
     await db.initialize()
-    trader = PaperTrader(db)
+    trader = PaperTrader()
 
     async def open_one(i: int):
         return await trader.execute_buy(
+            db=db,
             token_id=f"tok{i}", symbol=f"S{i}", name=f"N{i}", chain="eth",
             signal_type="first_signal", signal_data={"quant_score": 50},
-            entry_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            current_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            slippage_bps=0,
             signal_combo="first_signal",
             lead_time_vs_trending_min=None, lead_time_vs_trending_status=None,
             live_eligible_cap=2, min_quant_score=1,
         )
 
-    (id1, s1), (id2, s2), (id3, s3) = [await open_one(i) for i in range(3)]
-    assert (s1, s2, s3) == (1, 1, 0)
+    id1 = await open_one(0)
+    id2 = await open_one(1)
+    id3 = await open_one(2)
+    assert (await _stamp_of(db, id1),
+            await _stamp_of(db, id2),
+            await _stamp_of(db, id3)) == (1, 1, 0)
 
-    async with db._conn.execute(
+    await db._conn.execute(
         "UPDATE paper_trades SET status='closed_tp' WHERE id=?", (id1,)
-    ):
-        pass
+    )
     await db._conn.commit()
 
-    _, s4 = await open_one(99)
-    assert s4 == 1, f"slot freed by close; new open must be =1; got {s4}"
+    id4 = await open_one(99)
+    assert await _stamp_of(db, id4) == 1, "slot freed by close; new open must be =1"
     await db.close()
 ```
 
 Run: `uv run pytest tests/test_paper_trader.py::test_closing_live_eligible_trade_frees_slot -v`
 
-Expected: PASS (subquery counts `status='open' AND would_be_live=1` so closed trades are excluded automatically).
+Expected: PASS (subquery counts `status='open' AND would_be_live=1` so closed trades are excluded).
 
-- [ ] **Step 9: Write failing test #5 — cap-hit log on stamp=0**
+- [ ] **Step 10: Write test #5 — cap-hit log on stamp=0**
 
 ```python
-import structlog
 from structlog.testing import capture_logs
 
 
@@ -541,13 +615,15 @@ from structlog.testing import capture_logs
 async def test_stamp_zero_fires_cap_reached_log(tmp_path):
     db = Database(str(tmp_path / "gecko.db"))
     await db.initialize()
-    trader = PaperTrader(db)
+    trader = PaperTrader()
 
     async def open_one(i: int):
         return await trader.execute_buy(
+            db=db,
             token_id=f"tok{i}", symbol=f"S{i}", name=f"N{i}", chain="eth",
             signal_type="first_signal", signal_data={"quant_score": 50},
-            entry_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            current_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            slippage_bps=0,
             signal_combo="first_signal",
             lead_time_vs_trending_min=None, lead_time_vs_trending_status=None,
             live_eligible_cap=1, min_quant_score=1,
@@ -569,27 +645,32 @@ Run: `uv run pytest tests/test_paper_trader.py::test_stamp_zero_fires_cap_reache
 
 Expected: PASS.
 
-- [ ] **Step 10: Write failing test #6 — cap=0 stamps all =0 (when threshold active)**
+- [ ] **Step 11: Write test #6 — cap=0 stamps all =0 (when threshold active)**
 
 ```python
 @pytest.mark.asyncio
 async def test_cap_zero_stamps_all_zero(tmp_path):
     db = Database(str(tmp_path / "gecko.db"))
     await db.initialize()
-    trader = PaperTrader(db)
+    trader = PaperTrader()
 
-    results = []
     for i in range(5):
-        _, stamped = await trader.execute_buy(
+        await trader.execute_buy(
+            db=db,
             token_id=f"tok{i}", symbol=f"S{i}", name=f"N{i}", chain="eth",
             signal_type="first_signal", signal_data={"quant_score": 50},
-            entry_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            current_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            slippage_bps=0,
             signal_combo="first_signal",
             lead_time_vs_trending_min=None, lead_time_vs_trending_status=None,
             live_eligible_cap=0, min_quant_score=1,
         )
-        results.append(stamped)
-    assert all(r == 0 for r in results), results
+
+    async with db._conn.execute(
+        "SELECT would_be_live FROM paper_trades"
+    ) as cur:
+        rows = await cur.fetchall()
+    assert all(r[0] == 0 for r in rows), [r[0] for r in rows]
     await db.close()
 ```
 
@@ -597,14 +678,14 @@ Run: `uv run pytest tests/test_paper_trader.py::test_cap_zero_stamps_all_zero -v
 
 Expected: PASS (subquery `COUNT(*) < 0` is always False → ELSE branch → 0).
 
-- [ ] **Step 11: Write failing test #7 — closed =1 trades do not count toward cap**
+- [ ] **Step 12: Write test #7 — closed =1 trades do not count toward cap**
 
 ```python
 @pytest.mark.asyncio
 async def test_closed_live_eligible_excluded_from_cap_count(tmp_path):
     db = Database(str(tmp_path / "gecko.db"))
     await db.initialize()
-    trader = PaperTrader(db)
+    trader = PaperTrader()
 
     # Seed 5 closed =1 rows directly
     for i in range(5):
@@ -623,15 +704,21 @@ async def test_closed_live_eligible_excluded_from_cap_count(tmp_path):
         )
     await db._conn.commit()
 
-    _, stamped = await trader.execute_buy(
+    trade_id = await trader.execute_buy(
+        db=db,
         token_id="fresh", symbol="F", name="Fresh", chain="eth",
         signal_type="first_signal", signal_data={"quant_score": 50},
-        entry_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+        current_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+        slippage_bps=0,
         signal_combo="first_signal",
         lead_time_vs_trending_min=None, lead_time_vs_trending_status=None,
         live_eligible_cap=2, min_quant_score=1,
     )
-    assert stamped == 1, f"closed =1s should not block cap; got {stamped}"
+    cur = await db._conn.execute(
+        "SELECT would_be_live FROM paper_trades WHERE id=?", (trade_id,)
+    )
+    row = await cur.fetchone()
+    assert row[0] == 1, f"closed =1s should not block cap; got {row[0]}"
     await db.close()
 ```
 
@@ -639,28 +726,32 @@ Run: `uv run pytest tests/test_paper_trader.py::test_closed_live_eligible_exclud
 
 Expected: PASS.
 
-- [ ] **Step 12: Write failing test #12 — `min_quant_score=0` admits and NULL-stamps**
+- [ ] **Step 13: Write test #12 — `min_quant_score=0` admits and NULL-stamps**
 
 ```python
 @pytest.mark.asyncio
 async def test_min_quant_score_zero_null_stamps(tmp_path):
     db = Database(str(tmp_path / "gecko.db"))
     await db.initialize()
-    trader = PaperTrader(db)
+    trader = PaperTrader()
 
-    results = []
     for i in range(3):
-        _, stamped = await trader.execute_buy(
+        await trader.execute_buy(
+            db=db,
             token_id=f"tok{i}", symbol=f"S{i}", name=f"N{i}", chain="eth",
             signal_type="first_signal", signal_data={"quant_score": 50},
-            entry_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            current_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            slippage_bps=0,
             signal_combo="first_signal",
             lead_time_vs_trending_min=None, lead_time_vs_trending_status=None,
             live_eligible_cap=20, min_quant_score=0,
         )
-        results.append(stamped)
-    assert all(r is None for r in results), (
-        f"regime-null stamps expected; got {results}"
+    async with db._conn.execute(
+        "SELECT would_be_live FROM paper_trades"
+    ) as cur:
+        rows = await cur.fetchall()
+    assert all(r[0] is None for r in rows), (
+        f"regime-null stamps expected; got {[r[0] for r in rows]}"
     )
     await db.close()
 ```
@@ -669,24 +760,29 @@ Run: `uv run pytest tests/test_paper_trader.py::test_min_quant_score_zero_null_s
 
 Expected: PASS (subquery `WHEN ? = 0 THEN NULL`).
 
-- [ ] **Step 13: Write failing test #17 — no-force-close regression guard**
+- [ ] **Step 14: Write test #17 — no-force-close regression guard**
 
 ```python
 @pytest.mark.asyncio
 async def test_stamped_rows_immutable_across_migrations(tmp_path):
     db = Database(str(tmp_path / "gecko.db"))
     await db.initialize()
-    trader = PaperTrader(db)
+    trader = PaperTrader()
 
-    trade_id, stamped = await trader.execute_buy(
+    trade_id = await trader.execute_buy(
+        db=db,
         token_id="stable", symbol="S", name="N", chain="eth",
         signal_type="first_signal", signal_data={"quant_score": 50},
-        entry_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+        current_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+        slippage_bps=0,
         signal_combo="first_signal",
         lead_time_vs_trending_min=None, lead_time_vs_trending_status=None,
         live_eligible_cap=20, min_quant_score=1,
     )
-    assert stamped == 1
+    cur = await db._conn.execute(
+        "SELECT would_be_live FROM paper_trades WHERE id=?", (trade_id,)
+    )
+    assert (await cur.fetchone())[0] == 1
 
     await db._migrate_feedback_loop_schema()
     await db._migrate_feedback_loop_schema()
@@ -704,7 +800,7 @@ Run: `uv run pytest tests/test_paper_trader.py::test_stamped_rows_immutable_acro
 
 Expected: PASS.
 
-- [ ] **Step 14: Write failing test #3a — 40 sequential-on-shared-conn inserts → exactly 20 `=1`**
+- [ ] **Step 15: Write test #3a — 40 gather-on-shared-conn inserts → exactly 20 `=1`**
 
 ```python
 import asyncio
@@ -714,20 +810,25 @@ import asyncio
 async def test_stamp_subquery_correctness_under_shared_conn(tmp_path):
     db = Database(str(tmp_path / "gecko.db"))
     await db.initialize()
-    trader = PaperTrader(db)
+    trader = PaperTrader()
 
     async def one(i: int):
         return await trader.execute_buy(
+            db=db,
             token_id=f"tok{i}", symbol=f"S{i}", name=f"N{i}", chain="eth",
             signal_type="first_signal", signal_data={"quant_score": 50},
-            entry_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            current_price=1.0, amount_usd=100.0, tp_pct=40.0, sl_pct=20.0,
+            slippage_bps=0,
             signal_combo="first_signal",
             lead_time_vs_trending_min=None, lead_time_vs_trending_status=None,
             live_eligible_cap=20, min_quant_score=1,
         )
 
-    results = await asyncio.gather(*[one(i) for i in range(40)])
-    stamps = [s for _, s in results]
+    await asyncio.gather(*[one(i) for i in range(40)])
+    async with db._conn.execute(
+        "SELECT would_be_live FROM paper_trades"
+    ) as cur:
+        stamps = [r[0] for r in await cur.fetchall()]
     ones = sum(1 for s in stamps if s == 1)
     zeros = sum(1 for s in stamps if s == 0)
     assert ones == 20 and zeros == 20, (
@@ -743,19 +844,19 @@ Run: `uv run pytest tests/test_paper_trader.py::test_stamp_subquery_correctness_
 
 Expected: PASS.
 
-- [ ] **Step 15: Delete the probe script**
+- [ ] **Step 16: Delete the probe script**
 
 ```bash
 rm scripts/bl060_returning_probe.py
 ```
 
-- [ ] **Step 16: Run the full paper_trader test file**
+- [ ] **Step 17: Run the full paper_trader test file**
 
 Run: `uv run pytest tests/test_paper_trader.py -v`
 
-Expected: all new tests PASS; no regressions on pre-existing tests.
+Expected: all new tests PASS; the 6 pre-existing tests updated in Step 1 also PASS.
 
-- [ ] **Step 17: Commit**
+- [ ] **Step 18: Commit**
 
 ```bash
 git add scout/trading/paper.py scout/trading/engine.py scout/trading/evaluator.py tests/test_paper_trader.py
@@ -790,7 +891,7 @@ async def test_stamp_subquery_race_free_under_multi_writer_stress(tmp_path):
 
     busy_retries = 0
 
-    async def make_conn() -> aiosqlite.Connection:
+    async def make_conn():
         conn = await aiosqlite.connect(str(db_path))
         await conn.execute("PRAGMA journal_mode=WAL")
         await conn.execute("PRAGMA synchronous=NORMAL")
@@ -1483,7 +1584,7 @@ async def _build_bl060_ab(db, end_date, settings) -> str:
             SELECT pnl_pct FROM paper_trades
             WHERE signal_type IN ('first_signal','trending_catch','volume_spike',
                                   'losers_contrarian','gainers_early',
-                                  'narrative_prediction','chain_completion','long_hold')
+                                  'narrative_prediction','chain_completed','long_hold')
               AND status IN ({placeholders})
               AND would_be_live = ?
               AND opened_at >= ?
@@ -1589,25 +1690,31 @@ def _render_cohort(label, this_w, prev_w) -> str:
 
 def _render_delta(live_t, live_p, beyond_t, beyond_p) -> str:
     lines = ["Delta (live-eligible minus beyond-cap):"]
-    if live_t["n"] > 0 and beyond_t["n"] > 0:
-        lines.append(
-            f"  Win-rate:  "
-            f"{live_t['win_rate'] - beyond_t['win_rate']:+.1f}pp this week "
-            f"| {('-' if (not live_p['n'] or not beyond_p['n']) else f\"{live_p['win_rate'] - beyond_p['win_rate']:+.1f}pp\")} last week"
-        )
-        lines.append(
-            f"  Avg P&L:   "
-            f"{live_t['avg_pnl'] - beyond_t['avg_pnl']:+.1f}pp this week "
-            f"| {('-' if (not live_p['n'] or not beyond_p['n']) else f\"{live_p['avg_pnl'] - beyond_p['avg_pnl']:+.1f}pp\")} last week"
-        )
-        # Delta excludes Sharpe when either side has n_closed < 30
-        if live_t["n"] >= 30 and beyond_t["n"] >= 30:
-            lines.append(
-                f"  Sharpe:    "
-                f"{live_t['sharpe'] - beyond_t['sharpe']:+.2f} this week"
-            )
-    else:
+    if live_t["n"] == 0 or beyond_t["n"] == 0:
         lines.append("  - insufficient data for delta")
+        return "\n".join(lines)
+
+    def _prev_delta(live_p, beyond_p, key):
+        if not live_p["n"] or not beyond_p["n"]:
+            return "-"
+        return f"{live_p[key] - beyond_p[key]:+.1f}pp"
+
+    lines.append(
+        f"  Win-rate:  "
+        f"{live_t['win_rate'] - beyond_t['win_rate']:+.1f}pp this week "
+        f"| {_prev_delta(live_p, beyond_p, 'win_rate')} last week"
+    )
+    lines.append(
+        f"  Avg P&L:   "
+        f"{live_t['avg_pnl'] - beyond_t['avg_pnl']:+.1f}pp this week "
+        f"| {_prev_delta(live_p, beyond_p, 'avg_pnl')} last week"
+    )
+    # Delta excludes Sharpe when either side has n_closed < 30 (test #18)
+    if live_t["n"] >= 30 and beyond_t["n"] >= 30:
+        lines.append(
+            f"  Sharpe:    "
+            f"{live_t['sharpe'] - beyond_t['sharpe']:+.2f} this week"
+        )
     return "\n".join(lines)
 
 
@@ -1660,58 +1767,155 @@ Run: `uv run pytest tests/test_trading_digest.py::test_digest_ab_cohort_excludes
 
 Expected: PASS.
 
-- [ ] **Step 6: Write failing test #14 — pre-cutover + pre-threshold NULLs both excluded**
+- [ ] **Step 6: Write test #14 — pre-cutover + pre-threshold NULLs both excluded**
+
+Reuse the `seed_closed` helper from Step 1 (closure inside the test). Seed 2 NULL + 2 =1 + 2 =0 within window; assert cohort sizes ignore NULLs:
 
 ```python
 @pytest.mark.asyncio
 async def test_digest_ab_excludes_both_null_regimes(tmp_path, settings_factory):
-    # Seed 2 pre-cutover NULLs (old rows, NULL for migration reason)
-    # + 2 pre-threshold NULLs (new rows stamped NULL when min_quant_score=0)
-    # + 2 live-eligible =1
-    # + 2 beyond-cap =0
-    # All within window.
-    # Assert: live cohort n_closed=2, beyond cohort n_closed=2, NULLs vanish.
+    db = Database(str(tmp_path / "gecko.db"))
+    await db.initialize()
+
+    async def seed_closed(tid, wbl, pnl):
+        await db._conn.execute(
+            "INSERT INTO paper_trades "
+            "(token_id, symbol, name, chain, signal_type, signal_data, "
+            " entry_price, amount_usd, quantity, tp_pct, sl_pct, "
+            " tp_price, sl_price, status, opened_at, pnl_pct, signal_combo, "
+            " lead_time_vs_trending_min, lead_time_vs_trending_status, would_be_live) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (tid, "S", "N", "eth", "first_signal", "{}",
+             1.0, 100.0, 100.0, 40.0, 20.0, 1.4, 0.8, "closed_tp",
+             "2026-04-27T00:00:00", pnl, "first_signal", None, None, wbl),
+        )
+
+    for i in range(2):
+        await seed_closed(f"NULL{i}", None, 3.0)   # pre-cutover / pre-threshold
+        await seed_closed(f"LIVE{i}", 1, 5.0)      # live-eligible
+        await seed_closed(f"CAP{i}", 0, -2.0)      # beyond-cap
+    await db._conn.commit()
+
+    section = await _build_bl060_ab(
+        db, end_date=datetime(2026, 5, 2), settings=settings_factory(),
+    )
+    assert "n_closed=2 | " in section  # both cohorts have exactly 2
+    # NULLs must not leak into either cohort count
+    assert section.count("n_closed=2") >= 4  # win-rate + avg for both cohorts
+    await db.close()
 ```
 
-Run + verify.
+Run: `uv run pytest tests/test_trading_digest.py::test_digest_ab_excludes_both_null_regimes -v`
 
-- [ ] **Step 7: Write failing test #15 — Sharpe noisy boundary at n_closed < 30**
+Expected: PASS.
+
+- [ ] **Step 7: Write test #15 — Sharpe noisy boundary at n_closed < 30**
+
+```python
+from scout.trading.weekly_digest import _fmt_sharpe
+
+
+def test_sharpe_noisy_below_30():
+    assert "(n_closed=22, noisy)" in _fmt_sharpe(0.42, 22)
+    assert "(n_closed=29, noisy)" in _fmt_sharpe(0.42, 29)
+
+
+def test_sharpe_plain_at_30_and_above():
+    assert _fmt_sharpe(0.42, 30) == "0.42"
+    assert _fmt_sharpe(0.42, 31) == "0.42"
+
+
+def test_sharpe_dash_on_zero_n():
+    assert _fmt_sharpe(None, 0) == "-"
+    assert _fmt_sharpe(0.42, 0) == "-"
+```
+
+Run: `uv run pytest tests/test_trading_digest.py::test_sharpe_noisy_below_30 tests/test_trading_digest.py::test_sharpe_plain_at_30_and_above tests/test_trading_digest.py::test_sharpe_dash_on_zero_n -v`
+
+Expected: all 3 PASS.
+
+- [ ] **Step 8: Write test #16 — first-week post-cutover + zero-n_closed guard**
 
 ```python
 @pytest.mark.asyncio
-async def test_sharpe_noisy_boundary(...):
-    # Case A: seed n_closed=22 live-eligible -> rendered contains "(n_closed=22, noisy)"
-    # Case B: seed n_closed=30 live-eligible -> rendered is plain (non-noisy)
-    # Case C: seed n_closed=31 live-eligible -> rendered is plain
-    # Uses _fmt_sharpe directly for unit-purity.
+async def test_first_week_post_cutover_zero_n_guard(tmp_path, settings_factory):
+    db = Database(str(tmp_path / "gecko.db"))
+    await db.initialize()
+
+    async def seed_closed(tid, wbl, opened):
+        await db._conn.execute(
+            "INSERT INTO paper_trades "
+            "(token_id, symbol, name, chain, signal_type, signal_data, "
+            " entry_price, amount_usd, quantity, tp_pct, sl_pct, "
+            " tp_price, sl_price, status, opened_at, pnl_pct, signal_combo, "
+            " lead_time_vs_trending_min, lead_time_vs_trending_status, would_be_live) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (tid, "S", "N", "eth", "first_signal", "{}",
+             1.0, 100.0, 100.0, 40.0, 20.0, 1.4, 0.8, "closed_tp",
+             opened, 5.0, "first_signal", None, None, wbl),
+        )
+
+    # Case A: current week only — last-week cohort is empty
+    await seed_closed("cur1", 1, "2026-04-27T00:00:00")
+    await seed_closed("cur2", 0, "2026-04-27T00:00:00")
+    await db._conn.commit()
+
+    section = await _build_bl060_ab(
+        db, end_date=datetime(2026, 5, 2), settings=settings_factory(),
+    )
+    # Last-week column must render "-" for n and for any metric
+    assert "| -" in section or "| - " in section, (
+        "last-week zero-n must render '-'; section:\n" + section
+    )
+    await db.close()
 ```
 
-Run + verify.
+Run + verify PASS.
 
-- [ ] **Step 8: Write failing test #16 — first-week post-cutover + zero-n_closed guard**
+- [ ] **Step 9: Write test #18 — delta excludes Sharpe under small-n**
 
 ```python
 @pytest.mark.asyncio
-async def test_first_week_post_cutover_and_zero_n_guard(...):
-    # Case A: seed rows only in current week (prev_start->this_start empty)
-    #   -> last-week column renders "-", no crash, no divide-by-zero.
-    # Case B: seed current week with non-empty cohort but 0 closed rows
-    #   (all still status='open') -> metric renders "-" too.
+async def test_delta_excludes_sharpe_under_small_n(tmp_path, settings_factory):
+    db = Database(str(tmp_path / "gecko.db"))
+    await db.initialize()
+
+    async def seed_closed(tid, wbl, pnl):
+        await db._conn.execute(
+            "INSERT INTO paper_trades "
+            "(token_id, symbol, name, chain, signal_type, signal_data, "
+            " entry_price, amount_usd, quantity, tp_pct, sl_pct, "
+            " tp_price, sl_price, status, opened_at, pnl_pct, signal_combo, "
+            " lead_time_vs_trending_min, lead_time_vs_trending_status, would_be_live) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (tid, "S", "N", "eth", "first_signal", "{}",
+             1.0, 100.0, 100.0, 40.0, 20.0, 1.4, 0.8, "closed_tp",
+             "2026-04-27T00:00:00", pnl, "first_signal", None, None, wbl),
+        )
+
+    # live-eligible n_closed=25 (below 30); beyond-cap n_closed=60
+    for i in range(25):
+        await seed_closed(f"L{i}", 1, 5.0 + i * 0.1)
+    for i in range(60):
+        await seed_closed(f"C{i}", 0, -1.0 + i * 0.05)
+    await db._conn.commit()
+
+    section = await _build_bl060_ab(
+        db, end_date=datetime(2026, 5, 2), settings=settings_factory(),
+    )
+    delta_block = section.split("Delta (live-eligible minus beyond-cap):")[1].split(
+        "Per-path"
+    )[0]
+    assert "Win-rate:" in delta_block
+    assert "Avg P&L:" in delta_block
+    assert "Sharpe:" not in delta_block, (
+        "delta must omit Sharpe row when either side has n_closed<30; got:\n"
+        + delta_block
+    )
+    await db.close()
 ```
 
-Run + verify.
-
-- [ ] **Step 9: Write failing test #18 — delta excludes Sharpe under small-n**
-
-```python
-@pytest.mark.asyncio
-async def test_delta_excludes_sharpe_under_small_n(...):
-    # Seed live-eligible n_closed=25, beyond-cap n_closed=60.
-    # Digest delta line contains "Win-rate: +Xpp" and "Avg P&L: +Xpp"
-    # but NOT any "Sharpe:" line.
-```
-
-Run + verify.
+Run + verify PASS.
 
 - [ ] **Step 10: Run the full digest test file**
 
