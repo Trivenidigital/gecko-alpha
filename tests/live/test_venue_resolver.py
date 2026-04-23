@@ -105,7 +105,6 @@ async def test_negative_cache_ttl_expires_at_60s(tmp_path):
     await db.close()
 
 
-@pytest.mark.skip(reason="enabled after Task 11 metrics.inc + live_metrics_daily UPSERT")
 async def test_resolver_increments_cache_hit_and_miss_metrics(tmp_path):
     """Spec §10.2: resolver reports resolver_cache_hits / resolver_cache_misses
     so operators can see whether the cache is actually saving Binance calls."""

@@ -193,7 +193,6 @@ async def test_http_get_raises_rate_limit_on_429():
         await adapter.close()
 
 
-@pytest.mark.skip(reason="enabled after Task 11 metrics.inc helper")
 async def test_429_increments_binance_rate_limit_hits_metric(tmp_path):
     """On 429, adapter increments live_metrics_daily binance_rate_limit_hits
     before raising RateLimitError.
