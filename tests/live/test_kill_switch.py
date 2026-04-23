@@ -29,11 +29,12 @@ def test_compute_kill_duration_maxes_midnight_vs_4h(
 async def test_trigger_inserts_row_and_sets_control(tmp_path):
     db = Database(tmp_path / "t.db"); await db.initialize()
     ks = KillSwitch(db)
-    kid = await ks.trigger(
+    kid, won = await ks.trigger(
         triggered_by="manual",
         reason="test",
         duration=timedelta(hours=1),
     )
+    assert won is True
     cur = await db._conn.execute(
         "SELECT id, triggered_by, cleared_at FROM kill_events"
     )
@@ -54,8 +55,9 @@ async def test_is_active_returns_none_when_cleared(tmp_path):
     db = Database(tmp_path / "t.db"); await db.initialize()
     ks = KillSwitch(db)
     assert await ks.is_active() is None
-    kid = await ks.trigger(triggered_by="manual", reason="x",
-                           duration=timedelta(hours=1))
+    kid, won = await ks.trigger(triggered_by="manual", reason="x",
+                                duration=timedelta(hours=1))
+    assert won is True
     assert (await ks.is_active()).kill_event_id == kid
     await ks.clear(cleared_by="manual")
     assert await ks.is_active() is None
@@ -90,8 +92,11 @@ async def test_two_concurrent_closes_trigger_exactly_once(tmp_path):
         ks.trigger(triggered_by="daily_loss_cap", reason="B",
                    duration=timedelta(hours=4)),
     )
-    # Both calls return an id — but they return the SAME id (the winner).
-    assert results[0] == results[1]
+    # Both calls return the SAME winner id, but only one has i_am_winner=True.
+    ids = [r[0] for r in results]
+    winners = [r[1] for r in results]
+    assert ids[0] == ids[1]
+    assert sum(winners) == 1
     # Exactly one kill_events row exists.
     cur = await db._conn.execute("SELECT COUNT(*) FROM kill_events")
     assert (await cur.fetchone())[0] == 1
@@ -99,5 +104,5 @@ async def test_two_concurrent_closes_trigger_exactly_once(tmp_path):
     cur = await db._conn.execute(
         "SELECT active_kill_event_id FROM live_control WHERE id = 1"
     )
-    assert (await cur.fetchone())[0] == results[0]
+    assert (await cur.fetchone())[0] == ids[0]
     await db.close()

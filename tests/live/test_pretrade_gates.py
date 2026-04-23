@@ -178,7 +178,7 @@ async def test_gate_kill_switch_rejects(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
     ks = KillSwitch(db)
-    kid = await ks.trigger(
+    kid, _won = await ks.trigger(
         triggered_by="manual",
         reason="test",
         duration=timedelta(hours=1),
