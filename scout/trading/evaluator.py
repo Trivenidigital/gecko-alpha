@@ -233,6 +233,8 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                             sl_pct=0.0,
                             slippage_bps=0,
                             signal_combo="long_hold",
+                            live_eligible_cap=settings.PAPER_LIVE_ELIGIBLE_CAP,
+                            min_quant_score=0,  # rollover = continuation, NULL-stamp (not a new admission)
                         )
                         if new_id is None:
                             log.warning(

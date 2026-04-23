@@ -127,3 +127,49 @@ async def test_positions_empty(client):
     resp = await c.get("/api/trading/positions")
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+async def test_dashboard_returns_would_be_live(tmp_path):
+    """Task 6: dashboard positions endpoint must surface would_be_live column."""
+    from scout.trading.paper import PaperTrader
+    from dashboard.db import get_trading_positions
+
+    db_path = tmp_path / "gecko.db"
+    db = Database(str(db_path))
+    await db.initialize()
+    trader = PaperTrader()
+
+    async def open_one(tok: str, live_cap: int, min_quant: int):
+        return await trader.execute_buy(
+            db=db,
+            token_id=tok,
+            symbol=tok[:2].upper(),
+            name=tok,
+            chain="eth",
+            signal_type="first_signal",
+            signal_data={"quant_score": 50},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=40.0,
+            sl_pct=20.0,
+            slippage_bps=0,
+            signal_combo="first_signal",
+            lead_time_vs_trending_min=None,
+            lead_time_vs_trending_status=None,
+            live_eligible_cap=live_cap,
+            min_quant_score=min_quant,
+        )
+
+    await open_one("live_tok", 1, 1)  # First trade: cap=1 → would_be_live=1
+    await open_one("cap_tok", 1, 1)  # Second trade: cap already hit → would_be_live=0
+    await db.close()
+
+    positions = await get_trading_positions(str(db_path))
+    by_tok = {p["token_id"]: p for p in positions}
+    assert (
+        "would_be_live" in by_tok["live_tok"]
+    ), "would_be_live key missing from response"
+    assert (
+        by_tok["live_tok"]["would_be_live"] == 1
+    ), "first trade should be live-eligible"
+    assert by_tok["cap_tok"]["would_be_live"] == 0, "second trade should be beyond-cap"

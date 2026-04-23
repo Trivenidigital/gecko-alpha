@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useMemo } from 'react'
 import TokenLink from './TokenLink'
 import { useSort, SortHeader as SharedSortHeader } from './useSort.jsx'
 
@@ -201,6 +201,16 @@ export default function TradingTab() {
     )
   }
 
+  // Rank map: persistent P&L rank regardless of current sort order
+  const pnlRankMap = useMemo(() => {
+    const byPnl = [...positions].sort(
+      (a, b) => (b.unrealized_pnl_pct ?? -Infinity) - (a.unrealized_pnl_pct ?? -Infinity)
+    )
+    const m = new Map()
+    byPnl.forEach((p, idx) => m.set(p.id, idx + 1))
+    return m
+  }, [positions])
+
   // Enrich closed trades with computed sort keys
   const enrichedHistory = React.useMemo(() => history.map(h => ({
     ...h,
@@ -314,9 +324,22 @@ export default function TradingTab() {
           <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
             Open Positions
           </span>
-          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
-            {openCount} active paper trade{openCount !== 1 ? 's' : ''}
-          </span>
+          {positions.length > 0 && (
+            <div className="summary-line" style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
+              {positions.length} active
+              {positions.every(p => 'would_be_live' in p) && (
+                <>
+                  {' ('}
+                  <span>{positions.filter(p => p.would_be_live === 1).length} live-eligible ⚡</span>
+                  {' · '}
+                  <span>{positions.filter(p => p.would_be_live === 0).length} beyond-cap</span>
+                  {' · '}
+                  <span>{positions.filter(p => p.would_be_live === null).length} unscoped</span>
+                  {')'}
+                </>
+              )}
+            </div>
+          )}
         </div>
         {positions.length === 0 ? (
           <div className="empty-state">No open positions.</div>
@@ -325,6 +348,7 @@ export default function TradingTab() {
             <table className="candidates-table">
               <thead>
                 <tr>
+                  <SortHeader col="pnl_pct" label="Rank" />
                   <SortHeader col="token" label="Token" />
                   <SortHeader col="category" label="Category" />
                   <SortHeader col="entry" label="Entry" />
@@ -344,6 +368,17 @@ export default function TradingTab() {
                   const pnlPct = p.unrealized_pnl_pct
                   return (
                     <tr key={p.id || i}>
+                      <td className="rank-cell" style={{ whiteSpace: 'nowrap', textAlign: 'center', fontWeight: 600, fontSize: 13 }}>
+                        {p.unrealized_pnl_pct == null ? (
+                          '—'
+                        ) : (
+                          <>
+                            {pnlRankMap.get(p.id) ?? '—'}
+                            {p.would_be_live === 1 && <span className="badge-live" title="live-eligible" style={{ marginLeft: 3, fontSize: 11 }}>⚡</span>}
+                            {p.would_be_live === null && <span className="badge-unscoped" title="unscoped — excluded from A/B" style={{ marginLeft: 3, fontSize: 11, color: 'var(--color-text-secondary)' }}>·</span>}
+                          </>
+                        )}
+                      </td>
                       <td>
                         <TokenLink
                           tokenId={p.coin_id || p.token_id}
