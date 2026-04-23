@@ -389,6 +389,16 @@ class Settings(BaseSettings):
             raise ValueError("tp_pct must be positive, e.g. 20.0 for 20% take profit")
         return v
 
+    @field_validator("PAPER_LADDER_LEG_1_QTY_FRAC", "PAPER_LADDER_LEG_2_QTY_FRAC")
+    @classmethod
+    def _validate_ladder_qty_frac(cls, v: float) -> float:
+        if not (0.0 < v <= 1.0):
+            raise ValueError(
+                "PAPER_LADDER_*_QTY_FRAC must be in (0, 1]; "
+                f"got={v} — fractions > 1 would oversell the position"
+            )
+        return v
+
     @field_validator("PAPER_MAX_MCAP")
     @classmethod
     def _validate_paper_max_mcap(cls, v: float) -> float:

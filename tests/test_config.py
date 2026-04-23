@@ -200,6 +200,16 @@ def test_bl060_rejects_negative_values():
 
 def test_bl061_ladder_config_defaults(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
+    for var in (
+        "PAPER_LADDER_LEG_1_PCT",
+        "PAPER_LADDER_LEG_1_QTY_FRAC",
+        "PAPER_LADDER_LEG_2_PCT",
+        "PAPER_LADDER_LEG_2_QTY_FRAC",
+        "PAPER_LADDER_TRAIL_PCT",
+        "PAPER_LADDER_FLOOR_ARM_ON_LEG_1",
+        "PAPER_SL_PCT",
+    ):
+        monkeypatch.delenv(var, raising=False)
     from scout.config import Settings
     s = Settings(
         _env_file=None,
@@ -217,3 +227,28 @@ def test_bl061_ladder_config_defaults(monkeypatch, tmp_path):
     # BL-060 fields removed
     assert not hasattr(s, "PAPER_MIN_QUANT_SCORE")
     assert not hasattr(s, "PAPER_LIVE_ELIGIBLE_CAP")
+
+
+def test_bl061_qty_frac_rejects_oversell(monkeypatch, tmp_path):
+    """Fractions > 1.0 would oversell the position — must raise."""
+    import pytest
+    from pydantic import ValidationError
+    monkeypatch.chdir(tmp_path)
+    from scout.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="x",
+            TELEGRAM_CHAT_ID="1",
+            ANTHROPIC_API_KEY="k",
+            PAPER_LADDER_LEG_1_QTY_FRAC=1.5,
+        )
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="x",
+            TELEGRAM_CHAT_ID="1",
+            ANTHROPIC_API_KEY="k",
+            PAPER_LADDER_LEG_2_QTY_FRAC=0.0,
+        )
