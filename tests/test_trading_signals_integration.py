@@ -259,8 +259,14 @@ async def test_suppression_blocks_chain_completions(tmp_path, settings_factory):
     await _seed_suppressed_combo(db, "chain_completed")
 
     # Seed a chain_match row (within last 5 minutes) so the dispatcher picks it up.
-    # We need chain_patterns to satisfy the FK if enforced — but FK is off in SQLite
-    # by default. We'll seed chain_matches directly.
+    # BL-055 enabled PRAGMA foreign_keys=ON globally, so we must seed a
+    # chain_patterns parent row before inserting chain_matches (FK pattern_id).
+    await db._conn.execute(
+        "INSERT INTO chain_patterns "
+        "(id, name, description, steps_json, min_steps_to_trigger, "
+        " conviction_boost, alert_priority, is_active) "
+        "VALUES (1, 'test_pattern', 'd', '[]', 3, 10, 'low', 1)"
+    )
     await db._conn.execute(
         "INSERT INTO chain_matches "
         "(token_id, pipeline, pattern_id, pattern_name, steps_matched, "
