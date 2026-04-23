@@ -330,6 +330,24 @@ class Settings(BaseSettings):
             )
         return v
 
+    @field_validator("PAPER_MIN_QUANT_SCORE")
+    @classmethod
+    def _validate_paper_min_quant_score(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(
+                "PAPER_MIN_QUANT_SCORE must be >= 0 (0 disables the gate and NULL-stamps would_be_live)"
+            )
+        return v
+
+    @field_validator("PAPER_LIVE_ELIGIBLE_CAP")
+    @classmethod
+    def _validate_paper_live_eligible_cap(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(
+                "PAPER_LIVE_ELIGIBLE_CAP must be >= 0 (0 stamps every row beyond-cap)"
+            )
+        return v
+
     @field_validator("CHAIN_PROMOTION_THRESHOLD", "CHAIN_GRADUATION_HIT_RATE")
     @classmethod
     def _validate_hit_rate_thresholds(cls, v: float) -> float:

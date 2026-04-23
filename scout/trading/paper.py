@@ -44,7 +44,10 @@ class PaperTrader:
         live_eligible_cap: int,
         min_quant_score: int,
     ) -> int | None:
-        """Record a paper buy. Returns trade ID or None if rejected.
+        """Record a paper buy. Returns trade ID, or None if the INSERT was
+        rejected (either by the UNIQUE(token_id,status='open') constraint or
+        by a pre-INSERT guard: non-positive effective entry, non-finite
+        quantity).
 
         Applies slippage to entry price: effective_entry = price * (1 + bps/10000).
         sl_pct is positive: sl_price = entry * (1 - sl_pct/100).

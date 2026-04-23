@@ -1100,16 +1100,42 @@ async def test_candidate_below_min_quant_score_skipped(db, tmp_path):
     ), f"missing summary log; got events: {[e.get('event') for e in cap]}"
     assert summary.get("skipped_below_threshold") == 1, summary
 
-    # Per-token gate log must be debug, not info
+    # Per-token gate log must be info so operators can see threshold effects in prod.
     gated = [e for e in cap if e.get("event") == "signal_gated_below_threshold"]
     assert len(gated) == 1, f"expected 1 gated event, got {gated}"
     assert (
-        gated[0].get("log_level") == "debug"
-    ), f"per-token gate must be debug, not info; got {gated[0].get('log_level')}"
+        gated[0].get("log_level") == "info"
+    ), f"per-token gate must be info; got {gated[0].get('log_level')}"
     assert gated[0].get("symbol") == "LOW"
 
     # High-score token must have opened a trade
     assert await _open_count(db) == 1
+
+
+# Test #11b — exact-equality boundary: quant_score == min_quant is admitted.
+# The gate uses strict `<`, so equal scores pass. Regression test for a future
+# refactor accidentally flipping the comparison to `<=`.
+async def test_candidate_at_exact_threshold_admitted(db, tmp_path):
+    s = _make_settings(tmp_path, PAPER_MIN_QUANT_SCORE=40)
+    eng = TradingEngine(mode="paper", db=db, settings=s)
+
+    equal = _make_candidate("equal-score-coin", "EQU", mcap=50_000_000)
+    below = _make_candidate("below-score-coin", "BEL", mcap=50_000_000)
+    await _seed_price(db, "equal-score-coin", price=1.0)
+    await _seed_price(db, "below-score-coin", price=1.0)
+
+    await trade_first_signals(
+        eng,
+        db,
+        scored_candidates=[
+            (equal, 40, ["momentum_ratio"]),  # == threshold — must admit
+            (below, 39, ["momentum_ratio"]),  # one below — must skip
+        ],
+        min_mcap=5_000_000,
+        settings=s,
+    )
+
+    assert await _open_count(db) == 1, "only equal-score should have opened a trade"
 
 
 # Test #12-signals — PAPER_MIN_QUANT_SCORE=0 admits all (gate off).

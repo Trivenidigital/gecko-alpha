@@ -231,10 +231,18 @@ _CLOSED_VALS = lambda tid, wbl, pnl, opened="2026-04-25T00:00:00": (
 
 @pytest.mark.asyncio
 async def test_digest_ab_cohort_excludes_nulls(tmp_path, settings_factory):
-    """Test #9 — cohort query filters would_be_live IS NOT NULL."""
+    """Test #9 — cohort query filters would_be_live IS NOT NULL.
+
+    The NULL rows carry a pnl (10.0) that would distort avg_pnl if included.
+    Asserting the numeric avg value proves the WHERE clause actually scopes
+    to non-NULL rows; a substring-only check (e.g. 'n_closed=3') would pass
+    even if NULLs leaked into the cohort.
+    """
     db = Database(str(tmp_path / "gecko.db"))
     await db.initialize()
 
+    # live: 3 rows at +5.0   beyond: 3 rows at -2.0   NULL: 3 rows at +10.0
+    # If NULLs leaked in, live avg would shift toward +7.5 and beyond toward +4.0
     for i in range(3):
         await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS(f"L{i}", 1, 5.0))
         await db._conn.execute(_CLOSED_INSERT, _CLOSED_VALS(f"B{i}", 0, -2.0))
@@ -246,8 +254,17 @@ async def test_digest_ab_cohort_excludes_nulls(tmp_path, settings_factory):
         end_date=datetime(2026, 5, 2),
         settings=settings_factory(),
     )
-    assert "live-eligible" in section.lower()
-    assert "n_closed=3" in section
+    # Each cohort must contain exactly 3 rows (not 6 — which would include NULLs)
+    live_block = section.split("LIVE-ELIGIBLE")[1].split("BEYOND-CAP")[0]
+    beyond_block = section.split("BEYOND-CAP")[1].split("Delta")[0]
+    assert "n_closed=3" in live_block
+    assert "n_closed=3" in beyond_block
+    # Avg P&L proves NULL rows (which have pnl=10.0) did not contaminate cohorts
+    assert "+5.0%" in live_block, f"live avg should be +5.0%, got:\n{live_block}"
+    assert "-2.0%" in beyond_block, f"beyond avg should be -2.0%, got:\n{beyond_block}"
+    # Context line must report the 3 NULL open rows separately (we inserted them
+    # as closed, so open-count is 0 — verify the 'unscoped' bucket is addressed)
+    assert "unscoped" in section
     await db.close()
 
 

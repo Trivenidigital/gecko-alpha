@@ -25,6 +25,21 @@ CLOSED_COUNTABLE_STATUSES = (
     "closed_trailing_stop",
 )
 
+# BL-060 A/B scope: signal types that participate in the live-eligible vs
+# beyond-cap comparison. Must stay in sync with `execute_buy` call sites that
+# pass a non-zero min_quant_score; add new signal types here when they start
+# stamping would_be_live (rather than NULL).
+BL060_AB_SIGNAL_TYPES = (
+    "first_signal",
+    "trending_catch",
+    "volume_spike",
+    "losers_contrarian",
+    "gainers_early",
+    "narrative_prediction",
+    "chain_completed",
+    "long_hold",
+)
+
 
 def _fmt_pct(x):
     return f"{x:+.1f}%" if x is not None else "-"
@@ -124,21 +139,22 @@ async def _build_bl060_ab(db, end_date, settings) -> str:
     """Two-week side-by-side A/B for BL-060 live-eligible cohort."""
     this_start = end_date - timedelta(days=7)
     prev_start = end_date - timedelta(days=14)
+    live_eligible_cap = settings.PAPER_LIVE_ELIGIBLE_CAP
 
     async def cohort_stats(wbl: int, start, end):
-        placeholders = ",".join("?" * len(CLOSED_COUNTABLE_STATUSES))
+        status_placeholders = ",".join("?" * len(CLOSED_COUNTABLE_STATUSES))
+        signal_placeholders = ",".join("?" * len(BL060_AB_SIGNAL_TYPES))
         cur = await db._conn.execute(
             f"""
             SELECT pnl_pct FROM paper_trades
-            WHERE signal_type IN ('first_signal','trending_catch','volume_spike',
-                                  'losers_contrarian','gainers_early',
-                                  'narrative_prediction','chain_completed','long_hold')
-              AND status IN ({placeholders})
+            WHERE signal_type IN ({signal_placeholders})
+              AND status IN ({status_placeholders})
               AND would_be_live = ?
               AND opened_at >= ?
               AND opened_at < ?
             """,
             (
+                *BL060_AB_SIGNAL_TYPES,
                 *CLOSED_COUNTABLE_STATUSES,
                 wbl,
                 start.isoformat(),
@@ -195,7 +211,7 @@ async def _build_bl060_ab(db, end_date, settings) -> str:
         f"vs last week ({_as_date(prev_start)} -> {_as_date(this_start)})"
     )
     out.append(
-        f"Context: {live_open} live-eligible open "
+        f"Context: {live_open}/{live_eligible_cap} live-eligible open "
         f"| {beyond_open} beyond-cap open | {null_open} unscoped"
     )
     out.append("")

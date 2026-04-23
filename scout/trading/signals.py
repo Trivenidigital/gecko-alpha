@@ -326,7 +326,7 @@ async def trade_first_signals(
             continue
         if quant_score < min_quant:
             skipped_below_threshold += 1
-            logger.debug(
+            logger.info(
                 "signal_gated_below_threshold",
                 coin_id=token.contract_address,
                 symbol=token.ticker,
