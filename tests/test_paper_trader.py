@@ -38,6 +38,8 @@ async def test_execute_buy_inserts_trade(db, trader):
         sl_pct=10.0,
         slippage_bps=50,
         signal_combo="volume_spike",
+        live_eligible_cap=20,
+        min_quant_score=0,
     )
     assert trade_id is not None
     cursor = await db._conn.execute(
@@ -64,6 +66,8 @@ async def test_execute_buy_applies_slippage(db, trader):
         sl_pct=10.0,
         slippage_bps=100,  # 1%
         signal_combo="volume_spike",
+        live_eligible_cap=20,
+        min_quant_score=0,
     )
     cursor = await db._conn.execute(
         "SELECT entry_price, quantity FROM paper_trades WHERE id = ?", (trade_id,)
@@ -91,6 +95,8 @@ async def test_execute_buy_computes_tp_sl_prices(db, trader):
         sl_pct=10.0,
         slippage_bps=0,  # no slippage
         signal_combo="narrative_prediction",
+        live_eligible_cap=20,
+        min_quant_score=0,
     )
     cursor = await db._conn.execute(
         "SELECT tp_price, sl_price FROM paper_trades WHERE id = ?", (trade_id,)
@@ -118,6 +124,8 @@ async def test_execute_sell_closes_trade(db, trader):
         sl_pct=10.0,
         slippage_bps=0,
         signal_combo="volume_spike",
+        live_eligible_cap=20,
+        min_quant_score=0,
     )
     await trader.execute_sell(
         db=db,
@@ -153,6 +161,8 @@ async def test_execute_sell_applies_exit_slippage(db, trader):
         sl_pct=10.0,
         slippage_bps=0,
         signal_combo="volume_spike",
+        live_eligible_cap=20,
+        min_quant_score=0,
     )
     await trader.execute_sell(
         db=db,
@@ -186,6 +196,8 @@ async def test_execute_sell_stop_loss_pnl(db, trader):
         sl_pct=10.0,
         slippage_bps=0,
         signal_combo="volume_spike",
+        live_eligible_cap=20,
+        min_quant_score=0,
     )
     await trader.execute_sell(
         db=db,
