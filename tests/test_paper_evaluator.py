@@ -183,3 +183,55 @@ async def test_trailing_stop_on_runner_only_after_leg_1(tmp_path, settings_facto
     (status,) = await cur.fetchone()
     assert status == "closed_trailing_stop"
     await db.close()
+
+
+async def test_pre_cutover_rows_use_old_policy(tmp_path, settings_factory):
+    from scout.trading.paper import PaperTrader
+    from scout.trading.evaluator import evaluate_paper_trades
+    from datetime import timedelta
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    trader = PaperTrader()
+    settings = settings_factory()
+    trade_id = await trader.execute_buy(
+        db=db, token_id="old", symbol="OLD", name="Old", chain="coingecko",
+        signal_type="gainers_early", signal_data={}, current_price=1.00,
+        amount_usd=300.0, tp_pct=40.0, sl_pct=10.0, slippage_bps=0,
+        signal_combo="gainers_early",
+    )
+    # Backdate created_at to 1 day ago and null-out ladder state to simulate
+    # a pre-BL-061 row that pre-dates the migration.
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    await db._conn.execute(
+        "UPDATE paper_trades SET created_at = ?, "
+        "remaining_qty = NULL, floor_armed = NULL, realized_pnl_usd = NULL "
+        "WHERE id = ?",
+        (old_ts, trade_id),
+    )
+    # Move the cutover_ts forward so the backdated row is definitively pre-cutover
+    now_ts = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        "UPDATE paper_migrations SET cutover_ts = ? WHERE name = 'bl061_ladder'",
+        (now_ts,),
+    )
+    await db._conn.commit()
+
+    # Price at +26% — new policy would fire leg 1; old policy should NOT partial-sell
+    await db._conn.execute(
+        "INSERT OR REPLACE INTO price_cache (coin_id, current_price, updated_at) "
+        "VALUES (?, ?, ?)",
+        ("old", 1.26, datetime.now(timezone.utc).isoformat()),
+    )
+    await db._conn.commit()
+
+    await evaluate_paper_trades(db, settings)
+
+    cur = await db._conn.execute(
+        "SELECT leg_1_filled_at, status FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    leg1, status = await cur.fetchone()
+    assert leg1 is None, "pre-cutover row must not fire ladder legs"
+    assert status == "open", "pre-cutover row still open (old policy TP at +40%, not +25%)"
+    await db.close()
