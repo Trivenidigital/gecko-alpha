@@ -98,14 +98,8 @@ async def test_fetch_trending_populates_rank(settings_factory):
 
 
 @pytest.mark.asyncio
-async def test_429_triggers_backoff(settings_factory, monkeypatch):
+async def test_429_triggers_backoff(settings_factory):
     """FR-03: HTTP 429 triggers exponential backoff, retries, and eventually succeeds."""
-    import asyncio as _asyncio
-    import scout.ingestion.coingecko as _cg
-    async def _no_sleep(_s):
-        return None
-    monkeypatch.setattr(_cg.asyncio, "sleep", _no_sleep)
-
     settings = settings_factory(MIN_MARKET_CAP=1000, MAX_MARKET_CAP=1_000_000)
     with aioresponses() as mocked:
         # First call: 429, second call: 200

@@ -28,22 +28,6 @@ def _settings(**overrides):
     return Settings(**defaults)
 
 
-@pytest.fixture(autouse=True)
-def _no_backoff_sleep(monkeypatch):
-    """Zero out exponential backoff sleeps so retry tests run instantly.
-
-    CI timeouts kicked in on runners under load when real 2+4+8s sleeps
-    plus mock overhead exceeded pytest's 60s timeout. Behavior is
-    unchanged — we still verify retry logs and final returns.
-    """
-    import scout.news.cryptopanic as _cp
-
-    async def _instant(_s):
-        return None
-
-    monkeypatch.setattr(_cp.asyncio, "sleep", _instant)
-
-
 async def test_disabled_flag_short_circuits():
     s = _settings(CRYPTOPANIC_ENABLED=False)
     async with aiohttp.ClientSession() as session:
