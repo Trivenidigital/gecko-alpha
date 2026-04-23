@@ -169,7 +169,9 @@ async def test_live_metrics_rollup_loop_posts_summary_when_fired(tmp_path, monke
     await db.initialize()
     try:
         # Seed a metric row so the summary is non-empty.
-        await inc(db, "gate_rejections_exposure_cap", by=3)
+        # Spec §10.3: engine emits shadow_rejects_<reason>; use a
+        # production-realistic key so tests assert real behavior.
+        await inc(db, "shadow_rejects_exposure_cap", by=3)
 
         settings = _make_settings()
         session = MagicMock()  # aiohttp-like, not actually hit
@@ -191,7 +193,7 @@ async def test_live_metrics_rollup_loop_posts_summary_when_fired(tmp_path, monke
         # At least one send call happened, with the metric in the payload.
         assert send_mock.await_count >= 1
         text_arg = send_mock.await_args_list[0].args[0]
-        assert "gate_rejections_exposure_cap" in text_arg
+        assert "shadow_rejects_exposure_cap" in text_arg
     finally:
         await db.close()
 
