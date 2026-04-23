@@ -142,13 +142,23 @@ async def test_suppression_blocks_volume_spikes(tmp_path, settings_factory):
     await _seed_price(db, coin_id, 2.0)
     await _seed_suppressed_combo(db, "volume_spike")
 
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    from scout.spikes.models import VolumeSpike
+
     spikes = [
-        {
-            "coin_id": coin_id,
-            "symbol": "SC",
-            "spike_ratio": 10.0,
-            "current_price": 2.0,
-        }
+        VolumeSpike(
+            coin_id=coin_id,
+            symbol="SC",
+            name="spike_coin",
+            current_volume=100.0,
+            avg_volume_7d=10.0,
+            spike_ratio=10.0,
+            market_cap=10_000_000,
+            price=2.0,
+            detected_at=_dt.now(_tz.utc),
+        )
     ]
     await signals.trade_volume_spikes(engine, db, spikes, settings=s)
 

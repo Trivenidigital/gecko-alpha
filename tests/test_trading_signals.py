@@ -605,3 +605,436 @@ async def test_trade_predictions_allows_legit_coinid_with_bridge_substring(
         settings=settings,
     )
     assert await _open_count(db) == 1
+
+
+# ---------------- BL-059: _is_tradeable_candidate helper -------------------
+
+
+@pytest.mark.parametrize(
+    "coin_id,ticker,expected",
+    [
+        # Clean ASCII cases pass
+        ("some-alt", "ALT", True),
+        ("bridgelink", "BRL", True),  # 'bridge' substring that isn't a bridged asset
+        ("airbender", "AIR", True),
+        # Wrapped/bridged coin_id patterns fail
+        ("wrapped-bitcoin", "WBTC", False),
+        ("bridged-usd-coin", "USDC", False),
+        ("superbridge-weth", "WETH", False),
+        ("arbitrum-bridged-usdc", "USDC", False),
+        ("sui-bridged-wbtc", "WBTC", False),
+        # Non-ASCII ticker fails (Chinese memes — the observed leak)
+        ("woo-ta-ma", "我踏马来了", False),
+        ("bianrensheng", "币安人生", False),
+        # Cyrillic and emoji tickers fail too
+        ("some-russ", "РУБЛЬ", False),
+        ("emoji-coin", "🚀", False),
+        # Non-ASCII coin_id fails too (ASCII-ticker bypass — C3)
+        ("我踏马来了", "BTC", False),
+        ("币安人生", "ALT", False),
+        ("РУБЛЬ", "RUB", False),
+        ("🚀coin", "MOON", False),
+        # Empty/None safe — should not crash, treat as not-tradeable
+        ("", "ABC", False),
+        ("some-alt", "", False),
+        ("some-alt", None, False),
+        (None, "ABC", False),
+        # Non-str types must not crash (S4 defense-in-depth)
+        (123, "ABC", False),
+        ("some-alt", 456, False),
+    ],
+)
+def test_is_tradeable_candidate(coin_id, ticker, expected):
+    from scout.trading.signals import _is_tradeable_candidate
+
+    assert _is_tradeable_candidate(coin_id, ticker) is expected
+
+
+def test_is_junk_coinid_safe_on_non_str():
+    """S4: non-str input must return False rather than crash."""
+    from scout.trading.signals import _is_junk_coinid
+
+    assert _is_junk_coinid(None) is False
+    assert _is_junk_coinid(123) is False
+    assert _is_junk_coinid("") is False
+    assert _is_junk_coinid("wrapped-btc") is True
+
+
+# ---------------- BL-059: filter applied to 6 trade_* entry points ---------
+
+
+async def test_trade_gainers_skips_wrapped_coinid(db, engine, settings):
+    await _insert_gainer(db, "wrapped-bitcoin", market_cap=10_000_000)
+    await trade_gainers(engine, db, min_mcap=5_000_000, settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_gainers_skips_non_ascii_ticker(db, engine, settings):
+    """Non-ASCII ticker (Chinese meme) must not open a trade."""
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO gainers_snapshots
+           (coin_id, symbol, name, price_change_24h, market_cap, volume_24h,
+            price_at_snapshot, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("wo-ta-ma-laile", "我踏马来了", "我踏马来了", 25.0, 10_000_000, 100.0, 1.0, now),
+    )
+    await db._conn.commit()
+    await trade_gainers(engine, db, min_mcap=5_000_000, settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_losers_skips_wrapped_coinid(db, engine, settings):
+    await _insert_loser(db, "wrapped-bitcoin", market_cap=10_000_000)
+    await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_losers_skips_non_ascii_ticker(db, engine, settings):
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO losers_snapshots
+           (coin_id, symbol, name, price_change_24h, market_cap, volume_24h,
+            price_at_snapshot, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("bianrensheng", "币安人生", "币安人生", -25.0, 10_000_000, 100.0, 1.0, now),
+    )
+    await db._conn.commit()
+    await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_trending_skips_wrapped_coinid(db, engine, settings):
+    await _insert_trending(db, "wrapped-bitcoin", market_cap_rank=100)
+    await _seed_price(db, "wrapped-bitcoin", price=1.0, market_cap=50_000_000)
+    await trade_trending(
+        engine,
+        db,
+        max_mcap_rank=1500,
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0
+
+
+async def test_trade_trending_skips_non_ascii_ticker(db, engine, settings):
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO trending_snapshots
+           (coin_id, symbol, name, market_cap_rank, trending_score, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        ("meme-cn", "我踏马来了", "我踏马来了", 100, 1.0, now),
+    )
+    await db._conn.commit()
+    await _seed_price(db, "meme-cn", price=1.0, market_cap=50_000_000)
+    await trade_trending(
+        engine,
+        db,
+        max_mcap_rank=1500,
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0
+
+
+def _make_candidate(contract_address: str, ticker: str, *, mcap: float = 50_000_000):
+    from scout.models import CandidateToken
+
+    return CandidateToken(
+        contract_address=contract_address,
+        chain="coingecko",
+        token_name=contract_address,
+        ticker=ticker,
+        market_cap_usd=mcap,
+    )
+
+
+async def test_trade_first_signals_skips_wrapped_coinid(db, engine, settings):
+    token = _make_candidate("wrapped-bitcoin", "WBTC")
+    await _seed_price(db, "wrapped-bitcoin", price=1.0)
+    await trade_first_signals(
+        engine,
+        db,
+        scored_candidates=[(token, 50, ["momentum_ratio"])],
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0
+
+
+async def test_trade_first_signals_skips_non_ascii_ticker(db, engine, settings):
+    token = _make_candidate("wo-ta-ma-laile", "我踏马来了")
+    await _seed_price(db, "wo-ta-ma-laile", price=1.0)
+    await trade_first_signals(
+        engine,
+        db,
+        scored_candidates=[(token, 50, ["momentum_ratio"])],
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0
+
+
+async def test_trade_chain_completions_skips_wrapped_coinid(db, engine, settings):
+    """chain_matches has no symbol column — only coin_id filter applies here."""
+    from scout.trading.signals import trade_chain_completions
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO chain_patterns
+           (id, name, description, steps_json, min_steps_to_trigger)
+           VALUES (1, 'p', 'd', '[]', 1)""",
+    )
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost)
+           VALUES (?, 'coingecko', 1, 'p', 3, 3, ?, ?, 1.0, 10)""",
+        ("wrapped-bitcoin", now, now),
+    )
+    await db._conn.commit()
+    await _seed_price(db, "wrapped-bitcoin", price=1.0)
+    await trade_chain_completions(engine, db, settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_volume_spikes_skips_wrapped_coinid(db, engine, settings):
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    from scout.spikes.models import VolumeSpike
+    from scout.trading.signals import trade_volume_spikes
+
+    spike = VolumeSpike(
+        coin_id="wrapped-bitcoin",
+        symbol="WBTC",
+        name="Wrapped Bitcoin",
+        current_volume=100.0,
+        avg_volume_7d=10.0,
+        spike_ratio=10.0,
+        market_cap=10_000_000,
+        price=1.0,
+        detected_at=_dt.now(_tz.utc),
+    )
+    await trade_volume_spikes(engine, db, [spike], settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_volume_spikes_skips_non_ascii_ticker(db, engine, settings):
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    from scout.spikes.models import VolumeSpike
+    from scout.trading.signals import trade_volume_spikes
+
+    spike = VolumeSpike(
+        coin_id="bianrensheng",
+        symbol="币安人生",
+        name="币安人生",
+        current_volume=100.0,
+        avg_volume_7d=10.0,
+        spike_ratio=10.0,
+        market_cap=10_000_000,
+        price=1.0,
+        detected_at=_dt.now(_tz.utc),
+    )
+    await trade_volume_spikes(engine, db, [spike], settings=settings)
+    assert await _open_count(db) == 0
+
+
+# ---------------- BL-059 review: C1 positive path + S3 happy path -----------
+
+
+async def test_trade_volume_spikes_opens_trade_for_clean_spike(
+    db, engine, settings
+):
+    """C1: clean VolumeSpike must open a trade.
+
+    This test fails against PR #45 as first committed because the body of
+    ``trade_volume_spikes`` used dict subscript/``.get`` access on the Pydantic
+    ``VolumeSpike``, which raises ``TypeError`` on the first iteration. The
+    broad ``except Exception`` swallowed the crash, so no trade was opened and
+    no test caught the regression.
+    """
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    from scout.spikes.models import VolumeSpike
+    from scout.trading.signals import trade_volume_spikes
+
+    spike = VolumeSpike(
+        coin_id="clean-alt",
+        symbol="CALT",
+        name="Clean Alt",
+        current_volume=500.0,
+        avg_volume_7d=50.0,
+        spike_ratio=10.0,
+        market_cap=10_000_000,
+        price=1.25,
+        detected_at=_dt.now(_tz.utc),
+    )
+    await trade_volume_spikes(engine, db, [spike], settings=settings)
+    assert await _open_count(db) == 1
+
+
+async def test_trade_chain_completions_opens_trade_for_clean_token(
+    db, engine, settings
+):
+    """S3: a clean (ASCII, non-wrapped) token_id must open a chain trade."""
+    from scout.trading.signals import trade_chain_completions
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO chain_patterns
+           (id, name, description, steps_json, min_steps_to_trigger)
+           VALUES (1, 'p', 'd', '[]', 1)""",
+    )
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost)
+           VALUES (?, 'coingecko', 1, 'p', 3, 3, ?, ?, 1.0, 10)""",
+        ("clean-alt", now, now),
+    )
+    await db._conn.commit()
+    await _seed_price(db, "clean-alt", price=1.0)
+    await trade_chain_completions(engine, db, settings=settings)
+    assert await _open_count(db) == 1
+
+
+# ---------------- BL-059 review: S1 log-fire assertions --------------------
+#
+# Each dispatcher must emit a ``signal_skipped_junk`` event when it rejects a
+# candidate, so an operator watching logs can see paper-trade admission is
+# working. These tests use ``structlog.testing.capture_logs`` to prove the
+# event fires with the right ``signal_type`` — a silent filter is a broken
+# filter, even if _open_count stays at 0 for the right reason.
+
+
+def _junk_events(cap):
+    return [e for e in cap if e.get("event") == "signal_skipped_junk"]
+
+
+async def test_trade_gainers_logs_signal_skipped_junk(db, engine, settings):
+    import structlog.testing
+
+    await _insert_gainer(db, "wrapped-bitcoin", market_cap=10_000_000)
+    with structlog.testing.capture_logs() as cap:
+        await trade_gainers(engine, db, min_mcap=5_000_000, settings=settings)
+    events = _junk_events(cap)
+    assert len(events) == 1
+    assert events[0]["signal_type"] == "gainers_early"
+    assert events[0]["coin_id"] == "wrapped-bitcoin"
+
+
+async def test_trade_losers_logs_signal_skipped_junk(db, engine, settings):
+    import structlog.testing
+
+    await _insert_loser(db, "wrapped-bitcoin", market_cap=10_000_000)
+    with structlog.testing.capture_logs() as cap:
+        await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
+    events = _junk_events(cap)
+    assert len(events) == 1
+    assert events[0]["signal_type"] == "losers_contrarian"
+
+
+async def test_trade_trending_logs_signal_skipped_junk(db, engine, settings):
+    import structlog.testing
+
+    await _insert_trending(db, "wrapped-bitcoin", market_cap_rank=100)
+    await _seed_price(db, "wrapped-bitcoin", price=1.0, market_cap=10_000_000)
+    with structlog.testing.capture_logs() as cap:
+        await trade_trending(engine, db, settings=settings)
+    events = _junk_events(cap)
+    assert len(events) == 1
+    assert events[0]["signal_type"] == "trending_catch"
+
+
+async def test_trade_first_signals_logs_signal_skipped_junk(
+    db, engine, settings
+):
+    import structlog.testing
+
+    from scout.models import CandidateToken
+
+    token = CandidateToken(
+        chain="coingecko",
+        contract_address="wrapped-bitcoin",
+        ticker="WBTC",
+        token_name="Wrapped Bitcoin",
+        market_cap_usd=10_000_000,
+    )
+    with structlog.testing.capture_logs() as cap:
+        await trade_first_signals(
+            engine,
+            db,
+            [(token, 50, ["momentum_ratio"])],
+            min_mcap=5_000_000,
+            settings=settings,
+        )
+    events = _junk_events(cap)
+    assert len(events) == 1
+    assert events[0]["signal_type"] == "first_signal"
+
+
+async def test_trade_chain_completions_logs_signal_skipped_junk(
+    db, engine, settings
+):
+    import structlog.testing
+
+    from scout.trading.signals import trade_chain_completions
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO chain_patterns
+           (id, name, description, steps_json, min_steps_to_trigger)
+           VALUES (1, 'p', 'd', '[]', 1)""",
+    )
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost)
+           VALUES (?, 'coingecko', 1, 'p', 3, 3, ?, ?, 1.0, 10)""",
+        ("wrapped-bitcoin", now, now),
+    )
+    await db._conn.commit()
+    with structlog.testing.capture_logs() as cap:
+        await trade_chain_completions(engine, db, settings=settings)
+    events = _junk_events(cap)
+    assert len(events) == 1
+    assert events[0]["signal_type"] == "chain_completed"
+
+
+async def test_trade_volume_spikes_logs_signal_skipped_junk(
+    db, engine, settings
+):
+    import structlog.testing
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    from scout.spikes.models import VolumeSpike
+    from scout.trading.signals import trade_volume_spikes
+
+    spike = VolumeSpike(
+        coin_id="wrapped-bitcoin",
+        symbol="WBTC",
+        name="Wrapped Bitcoin",
+        current_volume=100.0,
+        avg_volume_7d=10.0,
+        spike_ratio=10.0,
+        market_cap=10_000_000,
+        price=1.0,
+        detected_at=_dt.now(_tz.utc),
+    )
+    with structlog.testing.capture_logs() as cap:
+        await trade_volume_spikes(engine, db, [spike], settings=settings)
+    events = _junk_events(cap)
+    assert len(events) == 1
+    assert events[0]["signal_type"] == "volume_spike"

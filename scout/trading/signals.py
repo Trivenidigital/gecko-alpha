@@ -12,6 +12,7 @@ one-off signal queries would add complexity without benefit.
 import structlog
 
 from scout.db import Database
+from scout.spikes.models import VolumeSpike
 from scout.trading.combo_key import build_combo_key
 from scout.trading.suppression import should_open
 
@@ -19,13 +20,23 @@ logger = structlog.get_logger()
 
 
 async def trade_volume_spikes(
-    engine, db: Database, spikes: list[dict], settings
+    engine, db: Database, spikes: list[VolumeSpike], settings
 ) -> None:
     """Open paper trades for detected volume spikes."""
     skipped_suppressed = 0
+    skipped_junk = 0
     errors = 0
     opened = 0
     for spike in spikes:
+        if not _is_tradeable_candidate(spike.coin_id, spike.symbol):
+            skipped_junk += 1
+            logger.warning(
+                "signal_skipped_junk",
+                coin_id=spike.coin_id,
+                symbol=spike.symbol,
+                signal_type="volume_spike",
+            )
+            continue
         try:
             combo_key = build_combo_key(signal_type="volume_spike", signals=None)
             allow, reason = await should_open(db, combo_key, settings=settings)
@@ -35,16 +46,16 @@ async def trade_volume_spikes(
                     "signal_suppressed",
                     combo_key=combo_key,
                     reason=reason,
-                    coin_id=spike.get("coin_id"),
+                    coin_id=spike.coin_id,
                     signal_type="volume_spike",
                 )
                 continue
             await engine.open_trade(
-                token_id=spike["coin_id"],
+                token_id=spike.coin_id,
                 chain="coingecko",
                 signal_type="volume_spike",
-                signal_data={"spike_ratio": spike.get("spike_ratio", 0)},
-                entry_price=spike.get("current_price"),
+                signal_data={"spike_ratio": spike.spike_ratio},
+                entry_price=spike.price,
                 signal_combo=combo_key,
             )
             opened += 1
@@ -52,12 +63,13 @@ async def trade_volume_spikes(
             errors += 1
             logger.exception(
                 "trading_open_spike_error",
-                coin_id=spike.get("coin_id"),
+                coin_id=spike.coin_id,
             )
     logger.info(
         "trade_volume_spikes_filtered",
         total=len(spikes),
         skipped_suppressed=skipped_suppressed,
+        skipped_junk=skipped_junk,
         errors=errors,
         opened=opened,
     )
@@ -112,18 +124,17 @@ async def trade_gainers(
             and g["price_change_24h"] is not None
             and g["price_change_24h"] > max_24h
         )
-        logger.info(
-            "trade_gainers_filtered",
-            total=len(new_gainers),
-            skipped_null_mcap=skipped_null_mcap,
-            skipped_low_mcap=skipped_low_mcap,
-            skipped_large_mcap=skipped_large_mcap,
-            skipped_late_pump=skipped_late_pump,
-            min_mcap=min_mcap,
-            max_mcap=max_mcap,
-            max_24h_pct=max_24h,
-        )
+        skipped_junk = 0
         for g in new_gainers:
+            if not _is_tradeable_candidate(g["coin_id"], g["symbol"]):
+                skipped_junk += 1
+                logger.warning(
+                    "signal_skipped_junk",
+                    coin_id=g["coin_id"],
+                    symbol=g["symbol"],
+                    signal_type="gainers_early",
+                )
+                continue
             if (g["market_cap"] or 0) < min_mcap:
                 continue
             if max_mcap is not None and (g["market_cap"] or 0) > max_mcap:
@@ -163,6 +174,18 @@ async def trade_gainers(
                 )
             except Exception:
                 logger.exception("trading_gainers_error", coin_id=g["coin_id"])
+        logger.info(
+            "trade_gainers_filtered",
+            total=len(new_gainers),
+            skipped_null_mcap=skipped_null_mcap,
+            skipped_low_mcap=skipped_low_mcap,
+            skipped_large_mcap=skipped_large_mcap,
+            skipped_late_pump=skipped_late_pump,
+            skipped_junk=skipped_junk,
+            min_mcap=min_mcap,
+            max_mcap=max_mcap,
+            max_24h_pct=max_24h,
+        )
     except Exception:
         logger.exception("trading_gainers_query_error")
 
@@ -206,16 +229,17 @@ async def trade_losers(
             and l["market_cap"] is not None
             and l["market_cap"] > max_mcap
         )
-        logger.info(
-            "trade_losers_filtered",
-            total=len(new_losers),
-            skipped_null_mcap=skipped_null_mcap,
-            skipped_low_mcap=skipped_low_mcap,
-            skipped_large_mcap=skipped_large_mcap,
-            min_mcap=min_mcap,
-            max_mcap=max_mcap,
-        )
+        skipped_junk = 0
         for l in new_losers:
+            if not _is_tradeable_candidate(l["coin_id"], l["symbol"]):
+                skipped_junk += 1
+                logger.warning(
+                    "signal_skipped_junk",
+                    coin_id=l["coin_id"],
+                    symbol=l["symbol"],
+                    signal_type="losers_contrarian",
+                )
+                continue
             if (l["market_cap"] or 0) < min_mcap:
                 continue
             if max_mcap is not None and (l["market_cap"] or 0) > max_mcap:
@@ -257,6 +281,16 @@ async def trade_losers(
                 )
             except Exception:
                 logger.exception("trading_losers_error", coin_id=l["coin_id"])
+        logger.info(
+            "trade_losers_filtered",
+            total=len(new_losers),
+            skipped_null_mcap=skipped_null_mcap,
+            skipped_low_mcap=skipped_low_mcap,
+            skipped_large_mcap=skipped_large_mcap,
+            skipped_junk=skipped_junk,
+            min_mcap=min_mcap,
+            max_mcap=max_mcap,
+        )
     except Exception:
         logger.exception("trading_losers_query_error")
 
@@ -284,8 +318,18 @@ async def trade_first_signals(
             unaffected.
     """
     skipped_large = 0
+    skipped_junk = 0
     for token, quant_score, signals_fired in scored_candidates:
         if quant_score <= 0 or not signals_fired:
+            continue
+        if not _is_tradeable_candidate(token.contract_address, token.ticker):
+            skipped_junk += 1
+            logger.warning(
+                "signal_skipped_junk",
+                coin_id=token.contract_address,
+                symbol=token.ticker,
+                signal_type="first_signal",
+            )
             continue
         if (token.market_cap_usd or 0) < min_mcap:
             continue
@@ -330,10 +374,11 @@ async def trade_first_signals(
             )
         except Exception:
             logger.exception("trading_first_signal_error", token=token.ticker)
-    if skipped_large:
+    if skipped_large or skipped_junk:
         logger.info(
             "trade_first_signals_filtered",
             skipped_large_mcap=skipped_large,
+            skipped_junk=skipped_junk,
             max_mcap=max_mcap,
         )
 
@@ -393,26 +438,17 @@ async def trade_trending(
             and t["market_cap"] is not None
             and t["market_cap"] > max_mcap
         )
-        if (
-            skipped_null_rank
-            or skipped_low_rank
-            or skipped_null_mcap
-            or skipped_low_mcap
-            or skipped_large_mcap
-        ):
-            logger.info(
-                "trade_trending_filtered",
-                total=len(new_trending),
-                skipped_null_rank=skipped_null_rank,
-                skipped_low_rank=skipped_low_rank,
-                skipped_null_mcap=skipped_null_mcap,
-                skipped_low_mcap=skipped_low_mcap,
-                skipped_large_mcap=skipped_large_mcap,
-                max_mcap_rank=max_mcap_rank,
-                min_mcap=min_mcap,
-                max_mcap=max_mcap,
-            )
+        skipped_junk = 0
         for t in new_trending:
+            if not _is_tradeable_candidate(t["coin_id"], t["symbol"]):
+                skipped_junk += 1
+                logger.warning(
+                    "signal_skipped_junk",
+                    coin_id=t["coin_id"],
+                    symbol=t["symbol"],
+                    signal_type="trending_catch",
+                )
+                continue
             rank = t["market_cap_rank"]
             if rank is None or rank > max_mcap_rank:
                 continue
@@ -449,6 +485,27 @@ async def trade_trending(
                 )
             except Exception:
                 logger.exception("trading_trending_error", coin_id=t["coin_id"])
+        if (
+            skipped_null_rank
+            or skipped_low_rank
+            or skipped_null_mcap
+            or skipped_low_mcap
+            or skipped_large_mcap
+            or skipped_junk
+        ):
+            logger.info(
+                "trade_trending_filtered",
+                total=len(new_trending),
+                skipped_null_rank=skipped_null_rank,
+                skipped_low_rank=skipped_low_rank,
+                skipped_null_mcap=skipped_null_mcap,
+                skipped_low_mcap=skipped_low_mcap,
+                skipped_large_mcap=skipped_large_mcap,
+                skipped_junk=skipped_junk,
+                max_mcap_rank=max_mcap_rank,
+                min_mcap=min_mcap,
+                max_mcap=max_mcap,
+            )
     except Exception:
         logger.exception("trading_trending_catch_error")
 
@@ -514,13 +571,53 @@ _JUNK_COINID_PREFIXES = (
 )
 
 
-def _is_junk_coinid(coin_id: str) -> bool:
-    if not coin_id:
+def _is_junk_coinid(coin_id: object) -> bool:
+    """True when coin_id matches a wrapped/bridged/superbridge slug pattern.
+
+    Defensive on type: non-str or empty inputs return False (no match). A
+    caller that cares about missing/invalid input should check separately —
+    here we just report "not a known junk pattern."
+    """
+    if not isinstance(coin_id, str) or not coin_id:
         return False
     cid = coin_id.lower()
     if cid.startswith(_JUNK_COINID_PREFIXES):
         return True
     return any(s in cid for s in _JUNK_COINID_SUBSTRINGS)
+
+
+def _is_tradeable_candidate(coin_id: object, ticker: object) -> bool:
+    """Paper-trade admission filter shared across the non-prediction signal paths.
+
+    Mirrors the PR #44 gates used by trade_predictions, minus the category
+    check — the 6 non-prediction paths query intermediate snapshot tables
+    that carry no category column (see BL-061 for the follow-up).
+
+    Returns False when the token is an obvious junk asset:
+    - wrapped/bridged/superbridge coin_id (price tracks the underlying)
+    - non-ASCII coin_id (Chinese-meme / cyrillic / emoji slug)
+    - non-ASCII ticker (same classes on the symbol side — surfaced post-wipe
+      on 2026-04-22 with tokens like 我踏马来了 and 币安人生)
+    - missing / non-str coin_id or ticker (can't safely trade it)
+
+    Scope note — DEX-origin tokens: the coin_id prefix and ASCII checks are
+    designed for CoinGecko slugs (e.g. "wrapped-bitcoin"). For DexScreener
+    and GeckoTerminal inputs, `contract_address` is an EVM hex or Solana
+    mint. Hex passes the prefix check by construction (never starts with
+    "wrapped-" / "bridged-") and is always ASCII — so on DEX paths this
+    filter degenerates to "reject only on non-ASCII ticker." That is the
+    intended behavior for BL-059; separate DEX-specific junk guards belong
+    in their own backlog item.
+    """
+    if not isinstance(coin_id, str) or not coin_id:
+        return False
+    if not isinstance(ticker, str) or not ticker:
+        return False
+    if _is_junk_coinid(coin_id):
+        return False
+    if not coin_id.isascii() or not ticker.isascii():
+        return False
+    return True
 
 
 async def trade_predictions(
@@ -671,7 +768,30 @@ async def trade_chain_completions(engine, db: Database, *, settings) -> None:
                )"""
         )
         new_chains = await cursor.fetchall()
+        skipped_junk = 0
         for c in new_chains:
+            # chain_matches has no symbol column, so the ticker half of
+            # _is_tradeable_candidate can't run here. We apply the two
+            # coin_id-side checks (wrapped/bridged prefix + non-ASCII slug);
+            # ASCII-coin_id tokens that carry a non-ASCII ticker will still
+            # leak through this path until BL-061 propagates symbol into
+            # chain_matches. Do not claim upstream filters close this gap —
+            # chain_matches is populated from many event sources, not just
+            # the 6 now-filtered dispatchers.
+            token_id = c["token_id"]
+            if (
+                not isinstance(token_id, str)
+                or not token_id
+                or _is_junk_coinid(token_id)
+                or not token_id.isascii()
+            ):
+                skipped_junk += 1
+                logger.warning(
+                    "signal_skipped_junk",
+                    coin_id=token_id,
+                    signal_type="chain_completed",
+                )
+                continue
             try:
                 combo_key = build_combo_key(signal_type="chain_completed", signals=None)
                 allow, reason = await should_open(db, combo_key, settings=settings)
@@ -703,5 +823,11 @@ async def trade_chain_completions(engine, db: Database, *, settings) -> None:
                 )
             except Exception:
                 logger.exception("trading_chain_error", token_id=c["token_id"])
+        if new_chains:
+            logger.info(
+                "trade_chain_completions_filtered",
+                total=len(new_chains),
+                skipped_junk=skipped_junk,
+            )
     except Exception:
         logger.exception("trading_chain_complete_error")
