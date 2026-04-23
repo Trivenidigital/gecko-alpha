@@ -1,8 +1,10 @@
 """Application configuration via Pydantic BaseSettings."""
 
+from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
-from pydantic import field_validator, model_validator
+from pydantic import SecretStr, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,7 +12,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore",
+        extra="forbid",
     )
 
     # Scanner
@@ -237,6 +239,36 @@ class Settings(BaseSettings):
     TRADING_DIGEST_HOUR_UTC: int = 0  # midnight digest
     TRADING_EVAL_INTERVAL: int = 1800  # 30 min eval cycle
 
+    # -------- Live Trading (BL-055, spec 2026-04-22) --------
+    # Default LIVE_MODE=paper leaves the paper path untouched. See spec §4.
+    LIVE_MODE: Literal["paper", "shadow", "live"] = "paper"
+
+    # Sizing (CSV map overrides default per-signal; spec §4 M1)
+    LIVE_TRADE_AMOUNT_USD: Decimal = Decimal("100")
+    LIVE_SIGNAL_SIZES: str = ""  # e.g. "first_signal=50,gainers_early=75"
+
+    # Exit rules (None = inherit PAPER_* via LiveConfig resolver)
+    LIVE_TP_PCT: Decimal | None = None
+    LIVE_SL_PCT: Decimal | None = None
+    LIVE_MAX_DURATION_HOURS: int | None = None
+
+    # Execution quality
+    LIVE_SLIPPAGE_BPS_CAP: int = 50
+    LIVE_DEPTH_HEALTH_MULTIPLIER: Decimal = Decimal("3")
+    LIVE_VENUE_PREFERENCE: str = "binance"  # CSV in v2; v1 is Binance-only
+
+    # Risk gates
+    LIVE_DAILY_LOSS_CAP_USD: Decimal = Decimal("50")
+    LIVE_MAX_EXPOSURE_USD: Decimal = Decimal("500")
+    LIVE_MAX_OPEN_POSITIONS: int = 5
+
+    # Signal allowlist — CSV, lowercased, trimmed; empty = no signals eligible
+    LIVE_SIGNAL_ALLOWLIST: str = ""
+
+    # Credentials (live mode only; never in .env.example — see spec §4.4)
+    BINANCE_API_KEY: SecretStr | None = None
+    BINANCE_API_SECRET: SecretStr | None = None
+
     # Feedback-loop (Sprint 1, spec 2026-04-18)
     FEEDBACK_SUPPRESSION_MIN_TRADES: int = 20
     FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT: float = 30.0
@@ -285,6 +317,42 @@ class Settings(BaseSettings):
     PERP_QUEUE_MAXSIZE: int = 2048
     PERP_DB_FLUSH_INTERVAL_SEC: float = 2.0
     PERP_DB_FLUSH_MAX_ROWS: int = 100
+
+    # -------- BL-055 computed fields (spec §4.1) --------
+    @computed_field
+    @property
+    def live_signal_allowlist_set(self) -> frozenset[str]:
+        """Parse LIVE_SIGNAL_ALLOWLIST CSV into a lowercased, trimmed frozenset."""
+        if not self.LIVE_SIGNAL_ALLOWLIST:
+            return frozenset()
+        return frozenset(
+            s.strip().lower()
+            for s in self.LIVE_SIGNAL_ALLOWLIST.split(",")
+            if s.strip()
+        )
+
+    @computed_field
+    @property
+    def live_signal_sizes_map(self) -> dict[str, Decimal]:
+        """Parse LIVE_SIGNAL_SIZES CSV of name=amount pairs.
+
+        Raises ValueError on any malformed entry (missing '=' or empty key/value).
+        """
+        if not self.LIVE_SIGNAL_SIZES:
+            return {}
+        out: dict[str, Decimal] = {}
+        for pair in self.LIVE_SIGNAL_SIZES.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            k, sep, v = pair.partition("=")
+            k = k.strip().lower()
+            if not sep or not k or not v.strip():
+                raise ValueError(
+                    f"LIVE_SIGNAL_SIZES malformed entry: {pair!r}"
+                )
+            out[k] = Decimal(v.strip())
+        return out
 
     @field_validator(
         "PAPER_TRAILING_ACTIVATION_PCT",

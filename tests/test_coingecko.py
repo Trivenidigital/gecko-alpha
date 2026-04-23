@@ -98,8 +98,16 @@ async def test_fetch_trending_populates_rank(settings_factory):
 
 
 @pytest.mark.asyncio
-async def test_429_triggers_backoff(settings_factory):
-    """FR-03: HTTP 429 triggers exponential backoff, retries, and eventually succeeds."""
+async def test_429_triggers_backoff(settings_factory, patch_module_sleep):
+    """FR-03: HTTP 429 triggers exponential backoff, retries, and eventually succeeds.
+
+    Sleep is short-circuited locally via ``patch_module_sleep`` so this test
+    does not rely on real 2s backoffs — CI runners under load can stretch the
+    combined (per-module backoff + rate-limiter global backoff) sleeps past
+    the per-test timeout.
+    """
+    patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
+
     settings = settings_factory(MIN_MARKET_CAP=1000, MAX_MARKET_CAP=1_000_000)
     with aioresponses() as mocked:
         # First call: 429, second call: 200

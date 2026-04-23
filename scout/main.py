@@ -61,6 +61,22 @@ from scout.perp.watcher import run_perp_watcher
 from scout.trading import combo_refresh as _combo_refresh
 from scout.trading import weekly_digest as _weekly_digest
 
+# BL-055 live-trading subsystem — wired into scout/main.py per spec §10.
+from scout.live.binance_adapter import BinanceSpotAdapter
+from scout.live.config import LiveConfig
+from scout.live.engine import LiveEngine
+from scout.live.kill_switch import KillSwitch
+from scout.live.loops import (
+    live_metrics_rollup_loop,
+    override_staleness_loop,
+    shadow_evaluator_loop,
+)
+from scout.live.reconciliation import (
+    emit_live_startup_status,
+    reconcile_open_shadow_trades,
+)
+from scout.live.resolver import OverrideStore, VenueResolver
+
 logger = structlog.get_logger()
 
 # Module-level tracking of pending social-loop restart tasks so the shutdown
@@ -775,8 +791,39 @@ async def check_outcomes(
     return recorded
 
 
-async def main() -> None:
-    """Main entry point with CLI arg parsing and graceful shutdown."""
+async def _drain_pending_live_tasks(
+    paper_trader, timeout_sec: float = 5.0
+) -> None:
+    """Drain any in-flight PaperTrader live-handoff tasks before DB close.
+
+    Spec §10.3 — orphaned shadow-row writes are a data-loss risk, so we wait
+    for outstanding ``_pending_live_tasks`` to complete (or time out) before
+    the DB connection is torn down. Never re-raises; a timeout logs WARN.
+    """
+    pending = getattr(paper_trader, "_pending_live_tasks", None)
+    if not pending:
+        return
+    logger.info("live_shutdown_drain_begin", pending=len(pending))
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*list(pending), return_exceptions=True),
+            timeout=timeout_sec,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "live_shutdown_drain_timeout",
+            remaining=len(pending),
+        )
+    logger.info("live_shutdown_drain_done")
+
+
+async def main(argv: list[str] | None = None) -> int:
+    """Main entry point with CLI arg parsing and graceful shutdown.
+
+    ``argv`` defaults to ``None`` so the CLI (``python -m scout.main``) reads
+    ``sys.argv``. Tests pass an explicit list to drive the startup guard (spec
+    §1.3) without invoking the shell.
+    """
     parser = argparse.ArgumentParser(description="CoinPump Scout scanner")
     parser.add_argument(
         "--dry-run", action="store_true", help="Run without sending alerts"
@@ -790,7 +837,28 @@ async def main() -> None:
         default=None,
         help="Override MIN_SCORE threshold (for testing)",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="Print resolved config and exit (no DB or HTTP init)",
+    )
+    args = parser.parse_args(argv)
+
+    # --check-config runs BEFORE any DB / HTTP / live subsystem wiring so
+    # operators can introspect resolved live-trading knobs on a stopped host.
+    if args.check_config:
+        s = Settings()
+        lc = LiveConfig(s)
+        print(f"LIVE_MODE={lc.mode}")
+        print(f"live_signal_allowlist_set={sorted(s.live_signal_allowlist_set)}")
+        print(f"live_signal_sizes_map={dict(s.live_signal_sizes_map)}")
+        print(f"resolve_tp_pct={lc.resolve_tp_pct()}")
+        print(f"resolve_sl_pct={lc.resolve_sl_pct()}")
+        print(f"resolve_max_duration_hours={lc.resolve_max_duration_hours()}")
+        print(f"LIVE_DAILY_LOSS_CAP_USD={s.LIVE_DAILY_LOSS_CAP_USD}")
+        print(f"LIVE_MAX_EXPOSURE_USD={s.LIVE_MAX_EXPOSURE_USD}")
+        print(f"LIVE_MAX_OPEN_POSITIONS={s.LIVE_MAX_OPEN_POSITIONS}")
+        return 0
 
     # Configure structlog
     structlog.configure(
@@ -820,13 +888,72 @@ async def main() -> None:
     db = Database(settings.DB_PATH)
     await db.initialize()
 
+    # --- BL-055 live-trading wiring (spec §10) --------------------------------
+    # Built BEFORE the TradingEngine so we can inject the LiveEngine into
+    # PaperTrader via the engine constructor. In paper mode this is a no-op.
+    live_config = LiveConfig(settings)
+    live_engine: LiveEngine | None = None
+    live_adapter: BinanceSpotAdapter | None = None
+    live_kill_switch: KillSwitch | None = None
+    _live_owned: list = []  # adapters to close() on graceful shutdown
+
+    if live_config.mode in ("shadow", "live"):
+        if live_config.mode == "live":
+            if not settings.BINANCE_API_KEY or not settings.BINANCE_API_SECRET:
+                await db.close()
+                raise RuntimeError(
+                    "LIVE_MODE=live requires BINANCE_API_KEY/SECRET"
+                )
+            # Balance gate is not yet implemented — fail closed at boot so
+            # shadow traffic cannot accidentally leak to real funds.
+            await db.close()
+            raise NotImplementedError(
+                "balance gate not wired for live mode — cannot start live "
+                "trading until scout/live/balance_gate.py is implemented"
+            )
+        live_adapter = BinanceSpotAdapter(settings, db=db)
+        _live_owned.append(live_adapter)
+        resolver = VenueResolver(
+            binance_adapter=live_adapter,
+            override_store=OverrideStore(db),
+            positive_ttl=timedelta(hours=1),
+            negative_ttl=timedelta(seconds=60),
+            db=db,
+        )
+        live_kill_switch = KillSwitch(db)
+        live_engine = LiveEngine(
+            config=live_config,
+            resolver=resolver,
+            adapter=live_adapter,
+            db=db,
+            kill_switch=live_kill_switch,
+        )
+        # Boot-time drift reconciliation + startup status (Task 16).
+        await reconcile_open_shadow_trades(
+            db=db,
+            adapter=live_adapter,
+            config=live_config,
+            ks=live_kill_switch,
+            settings=settings,
+        )
+        await emit_live_startup_status(
+            db=db,
+            adapter=live_adapter,
+            config=live_config,
+            ks=live_kill_switch,
+        )
+    # --------------------------------------------------------------------------
+
     # Paper trading engine
     from scout.trading.engine import TradingEngine
 
     trading_engine = None
     if settings.TRADING_ENABLED:
         trading_engine = TradingEngine(
-            mode=settings.TRADING_MODE, db=db, settings=settings
+            mode=settings.TRADING_MODE,
+            db=db,
+            settings=settings,
+            live_engine=live_engine,
         )
         logger.info(
             "trading_engine_initialized",
@@ -1050,6 +1177,41 @@ async def main() -> None:
             if settings.CHAINS_ENABLED:
                 tasks.append(asyncio.create_task(run_chain_tracker(db, settings)))
 
+            # BL-055 live-subsystem loops (spec §10) — only spawned when a
+            # LiveEngine was constructed above. Each loop is independently
+            # cancellable; failures inside iterations are logged and swallowed.
+            if live_engine is not None:
+                assert live_adapter is not None and live_kill_switch is not None
+                tasks.append(
+                    asyncio.create_task(
+                        shadow_evaluator_loop(
+                            db=db,
+                            adapter=live_adapter,
+                            config=live_config,
+                            ks=live_kill_switch,
+                            settings=settings,
+                        )
+                    )
+                )
+                tasks.append(
+                    asyncio.create_task(
+                        override_staleness_loop(
+                            adapter=live_adapter,
+                            db=db,
+                            settings=settings,
+                        )
+                    )
+                )
+                tasks.append(
+                    asyncio.create_task(
+                        live_metrics_rollup_loop(
+                            db=db,
+                            session=session,
+                            settings=settings,
+                        )
+                    )
+                )
+
             # LunarCrush social-velocity loop runs OUTSIDE asyncio.gather --
             # a social crash must never take down the main pipeline. The
             # done-callback re-creates the task with a 30s back-off.
@@ -1164,9 +1326,25 @@ async def main() -> None:
                 except Exception:
                     logger.exception("social_loop_shutdown_error")
     finally:
+        # BL-055 §10.3 — drain any in-flight PaperTrader → LiveEngine handoff
+        # tasks before tearing down the DB connection. Orphaned writes against
+        # a closed connection corrupt shadow_trades accounting.
+        if trading_engine is not None:
+            try:
+                await _drain_pending_live_tasks(trading_engine._paper_trader)
+            except Exception:
+                logger.exception("live_shutdown_drain_error")
+        # Close any live adapters we own (Binance HTTP session, etc.).
+        for adapter in _live_owned:
+            if hasattr(adapter, "close"):
+                try:
+                    await adapter.close()
+                except Exception:
+                    logger.exception("live_adapter_close_error")
         await db.close()
         logger.info("Scanner stopped", cycles_completed=cycle_count)
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))

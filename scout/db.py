@@ -65,8 +65,12 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         self._txn_lock = asyncio.Lock()
         await self._conn.execute("PRAGMA journal_mode=WAL")
+        # BL-055 spec §3.2: foreign_keys=ON is REQUIRED on every connection.
+        # Default is OFF in SQLite; without it, ON DELETE RESTRICT is a no-op.
+        await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._create_tables()
         await self._migrate_feedback_loop_schema()
+        await self._migrate_live_trading_schema()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -904,6 +908,219 @@ class Database:
                 "INSERT OR IGNORE INTO schema_version (version, applied_at, description) "
                 "VALUES (?, ?, ?)",
                 (20260418, datetime.now(timezone.utc).isoformat(), "feedback_loop_v1"),
+            )
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error("SCHEMA_DRIFT_DETECTED")
+            raise
+
+    async def _migrate_live_trading_schema(self) -> None:
+        """BL-055: shadow/live ledgers, kill events, venue overrides, resolver
+        cache, daily metrics. One atomic migration. Idempotent via IF NOT EXISTS.
+
+        Note: ``paper_trades`` becomes append-only by contract — the two new
+        ledger tables reference it via ``ON DELETE RESTRICT``. Existing rows are
+        untouched; only new DELETE attempts from foreign-key-bearing children
+        are blocked.
+
+        Implementation pattern mirrors :meth:`_migrate_feedback_loop_schema`:
+        ``BEGIN EXCLUSIVE`` + per-statement ``execute`` + explicit
+        ``commit``/``ROLLBACK``. Do NOT use ``executescript`` —
+        ``aiosqlite.Connection.executescript`` issues an implicit COMMIT before
+        running the script, which defeats rollback semantics. See
+        ``feedback_ddl_before_alter.md`` for the BL-060 crash pattern this
+        migration style avoids.
+
+        All indexes MUST live in this migration (never in ``_create_tables``)
+        because ``CREATE TABLE IF NOT EXISTS`` is a no-op on pre-existing
+        tables, so any paired index declaration would silently skip on the
+        upgrade path.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+
+        # Spec §3.1 — one statement per list entry, in the order shown in the
+        # spec. CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS throughout
+        # for idempotency. CHECK constraints are mandatory (status enum,
+        # live_control singleton, venue_overrides.disabled, resolver_cache outcome,
+        # kill_events.triggered_by / cleared_by).
+        ddl_statements: list[str] = [
+            # 0. schema_version — normally created by _migrate_feedback_loop_schema,
+            #    but defensively ensure it exists so this migration is self-
+            #    contained (needed for tests that skip the feedback migration).
+            """
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL,
+                description TEXT
+            )
+            """,
+            # 1. shadow_trades — append-only shadow ledger.
+            """
+            CREATE TABLE IF NOT EXISTS shadow_trades (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                paper_trade_id      INTEGER NOT NULL REFERENCES paper_trades(id) ON DELETE RESTRICT,
+                coin_id             TEXT NOT NULL,
+                symbol              TEXT NOT NULL,
+                venue               TEXT NOT NULL,
+                pair                TEXT NOT NULL,
+                signal_type         TEXT NOT NULL,
+                size_usd            TEXT NOT NULL,
+                entry_walked_vwap   TEXT,
+                mid_at_entry        TEXT,
+                entry_slippage_bps  INTEGER,
+                status              TEXT NOT NULL CHECK (status IN (
+                    'open','closed_tp','closed_sl','closed_duration','closed_via_reconciliation',
+                    'rejected','needs_manual_review'
+                )),
+                reject_reason       TEXT CHECK (reject_reason IS NULL OR reject_reason IN (
+                    'no_venue','insufficient_depth','slippage_exceeds_cap','insufficient_balance',
+                    'daily_cap_hit','kill_switch','exposure_cap','override_disabled',
+                    'venue_unavailable'
+                )),
+                exit_walked_vwap    TEXT,
+                realized_pnl_usd    TEXT,
+                realized_pnl_pct    TEXT,
+                review_retries      INTEGER NOT NULL DEFAULT 0,
+                next_review_at      TEXT,
+                kill_event_id       INTEGER REFERENCES kill_events(id),
+                created_at          TEXT NOT NULL,
+                closed_at           TEXT
+            )
+            """,
+            # 2. live_trades — append-only live ledger (same shape, separate table
+            #    per spec Q3=C three-table isolation).
+            """
+            CREATE TABLE IF NOT EXISTS live_trades (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                paper_trade_id      INTEGER NOT NULL REFERENCES paper_trades(id) ON DELETE RESTRICT,
+                coin_id             TEXT NOT NULL,
+                symbol              TEXT NOT NULL,
+                venue               TEXT NOT NULL,
+                pair                TEXT NOT NULL,
+                signal_type         TEXT NOT NULL,
+                size_usd            TEXT NOT NULL,
+                entry_order_id      TEXT,
+                entry_fill_price    TEXT,
+                entry_fill_qty      TEXT,
+                mid_at_entry        TEXT,
+                entry_slippage_bps  INTEGER,
+                status              TEXT NOT NULL CHECK (status IN (
+                    'open','closed_tp','closed_sl','closed_duration','closed_via_reconciliation',
+                    'rejected','needs_manual_review'
+                )),
+                reject_reason       TEXT CHECK (reject_reason IS NULL OR reject_reason IN (
+                    'no_venue','insufficient_depth','slippage_exceeds_cap','insufficient_balance',
+                    'daily_cap_hit','kill_switch','exposure_cap','override_disabled',
+                    'venue_unavailable'
+                )),
+                exit_order_id       TEXT,
+                exit_fill_price     TEXT,
+                realized_pnl_usd    TEXT,
+                realized_pnl_pct    TEXT,
+                kill_event_id       INTEGER REFERENCES kill_events(id),
+                created_at          TEXT NOT NULL,
+                closed_at           TEXT
+            )
+            """,
+            # 3. kill_events — append-only audit log of daily-loss-cap trips etc.
+            """
+            CREATE TABLE IF NOT EXISTS kill_events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                triggered_at    TEXT NOT NULL,
+                triggered_by    TEXT NOT NULL CHECK (triggered_by IN ('daily_loss_cap','manual','ops_maintenance')),
+                reason          TEXT,
+                killed_until    TEXT NOT NULL,
+                cleared_at      TEXT,
+                cleared_by      TEXT CHECK (cleared_by IS NULL OR cleared_by IN ('manual','auto_expired'))
+            )
+            """,
+            # 4. live_control — single-row pointer (id=1 always exists after
+            #    migration; singleton enforced by CHECK (id=1)).
+            """
+            CREATE TABLE IF NOT EXISTS live_control (
+                id                          INTEGER PRIMARY KEY CHECK (id = 1),
+                active_kill_event_id        INTEGER REFERENCES kill_events(id)
+            )
+            """,
+            # 5. venue_overrides — operator-controlled fallback for resolver.
+            """
+            CREATE TABLE IF NOT EXISTS venue_overrides (
+                symbol          TEXT PRIMARY KEY,
+                venue           TEXT NOT NULL,
+                pair            TEXT NOT NULL,
+                note            TEXT,
+                disabled        INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0,1)),
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL
+            )
+            """,
+            # 6. resolver_cache — persistent resolver cache (1h positive / 60s
+            #    negative, managed by caller).
+            """
+            CREATE TABLE IF NOT EXISTS resolver_cache (
+                symbol          TEXT PRIMARY KEY,
+                outcome         TEXT NOT NULL CHECK (outcome IN ('positive','negative')),
+                venue           TEXT,
+                pair            TEXT,
+                resolved_at     TEXT NOT NULL,
+                expires_at      TEXT NOT NULL
+            )
+            """,
+            # 7. live_metrics_daily — UPSERT-friendly daily counters.
+            """
+            CREATE TABLE IF NOT EXISTS live_metrics_daily (
+                date    TEXT NOT NULL,
+                metric  TEXT NOT NULL,
+                value   INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (date, metric)
+            )
+            """,
+            # 8-10. Indexes per spec §3.1. MUST live in this migration — see
+            # feedback_ddl_before_alter.md.
+            (
+                "CREATE INDEX IF NOT EXISTS idx_shadow_status_evaluated "
+                "ON shadow_trades(status, next_review_at) "
+                "WHERE status IN ('open','needs_manual_review')"
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS idx_shadow_closed_at_utc "
+                "ON shadow_trades(closed_at) WHERE closed_at IS NOT NULL"
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS idx_kill_events_active "
+                "ON kill_events(cleared_at) WHERE cleared_at IS NULL"
+            ),
+        ]
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            for stmt in ddl_statements:
+                await conn.execute(stmt)
+            # Seed live_control with id=1 ONLY if not already present (idempotent
+            # via INSERT OR IGNORE — safe to re-run on every startup).
+            await conn.execute(
+                "INSERT OR IGNORE INTO live_control (id, active_kill_event_id) "
+                "VALUES (1, NULL)"
+            )
+            # Bump schema_version inside the same transaction so migration +
+            # version stamp commit atomically.
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (
+                    20260423,
+                    datetime.now(timezone.utc).isoformat(),
+                    "bl055_live_trading_v1",
+                ),
             )
             await conn.commit()
         except Exception:
