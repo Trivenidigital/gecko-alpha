@@ -240,3 +240,38 @@ async def test_execute_partial_sell_updates_remaining_qty(tmp_path):
     assert leg1_filled is not None
     assert leg1_exit == pytest.approx(1.25, rel=1e-6)
     await db.close()
+
+
+async def test_execute_partial_sell_idempotent_on_double_call(tmp_path):
+    """Second call for the same leg returns False; DB is only updated once."""
+    from scout.db import Database
+    from scout.trading.paper import PaperTrader
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    trader = PaperTrader()
+    trade_id = await trader.execute_buy(
+        db=db, token_id="tok", symbol="TOK", name="Token", chain="coingecko",
+        signal_type="gainers_early", signal_data={}, current_price=1.0,
+        amount_usd=300.0, tp_pct=40.0, sl_pct=15.0, slippage_bps=0,
+        signal_combo="gainers_early",
+    )
+    first = await trader.execute_partial_sell(
+        db=db, trade_id=trade_id, leg=1, sell_qty_frac=0.30,
+        current_price=1.25, slippage_bps=0,
+    )
+    second = await trader.execute_partial_sell(
+        db=db, trade_id=trade_id, leg=1, sell_qty_frac=0.30,
+        current_price=1.25, slippage_bps=0,
+    )
+    assert first is True
+    assert second is False
+    cur = await db._conn.execute(
+        "SELECT remaining_qty, realized_pnl_usd FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    row = await cur.fetchone()
+    # remaining_qty decremented only once: 300 * 0.70 = 210
+    assert row[0] == pytest.approx(210.0, rel=1e-6)
+    # realized_pnl_usd accumulated only once: 300 * 0.30 * 0.25 = 22.50
+    assert row[1] == pytest.approx(22.50, rel=1e-6)
+    await db.close()

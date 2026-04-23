@@ -186,6 +186,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         """
         if leg not in (1, 2):
             raise ValueError(f"leg must be 1 or 2, got {leg}")
+        leg = int(leg)
         conn = db._conn
         if conn is None:
             raise RuntimeError("Database not initialized.")
@@ -227,7 +228,10 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         updates += f" WHERE id = ? AND leg_{leg}_filled_at IS NULL"
         params.append(trade_id)
 
-        await conn.execute(updates, params)
+        cursor_upd = await conn.execute(updates, params)
+        if cursor_upd.rowcount == 0:
+            log.warning("partial_sell_race_lost", trade_id=trade_id, leg=leg)
+            return False
         await conn.commit()
 
         log.info(
