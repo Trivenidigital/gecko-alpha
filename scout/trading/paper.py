@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 import structlog
 
 from scout.db import Database
+
+if TYPE_CHECKING:
+    from scout.live.engine import LiveEngine
 
 log = structlog.get_logger()
 
@@ -20,8 +26,22 @@ CLOSED_COUNTABLE_STATUSES: tuple[str, ...] = (
 )
 
 
+@dataclass
+class _PaperTradeHandoff:
+    """Minimal handoff payload passed to LiveEngine.on_paper_trade_opened."""
+
+    id: int
+    signal_type: str
+    symbol: str
+    coin_id: str
+
+
 class PaperTrader:
     """Simulates trade execution with slippage simulation."""
+
+    def __init__(self, *, live_engine: "LiveEngine | None" = None) -> None:
+        self._live_engine = live_engine
+        self._pending_live_tasks: set[asyncio.Task] = set()
 
     async def execute_buy(
         self,
@@ -146,6 +166,34 @@ RETURNING would_be_live
             tp_price=tp_price,
             sl_price=sl_price,
         )
+
+        # BL-055 chokepoint: fire-and-forget handoff to LiveEngine when injected
+        # and the signal is allowlisted. Never await — paper trade flow must not
+        # block on live dispatch.
+        if (
+            trade_id is not None
+            and self._live_engine is not None
+            and self._live_engine.is_eligible(signal_type)
+        ):
+            if len(self._pending_live_tasks) > 50:
+                log.warning(
+                    "live_handoff_backpressure",
+                    pending=len(self._pending_live_tasks),
+                    trade_id=trade_id,
+                )
+            task = asyncio.create_task(
+                self._live_engine.on_paper_trade_opened(
+                    _PaperTradeHandoff(
+                        id=trade_id,
+                        signal_type=signal_type,
+                        symbol=symbol,
+                        coin_id=token_id,
+                    )
+                )
+            )
+            self._pending_live_tasks.add(task)
+            task.add_done_callback(self._pending_live_tasks.discard)
+
         return trade_id
 
     async def execute_sell(
