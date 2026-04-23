@@ -837,7 +837,28 @@ async def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Override MIN_SCORE threshold (for testing)",
     )
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="Print resolved config and exit (no DB or HTTP init)",
+    )
     args = parser.parse_args(argv)
+
+    # --check-config runs BEFORE any DB / HTTP / live subsystem wiring so
+    # operators can introspect resolved live-trading knobs on a stopped host.
+    if args.check_config:
+        s = Settings()
+        lc = LiveConfig(s)
+        print(f"LIVE_MODE={lc.mode}")
+        print(f"live_signal_allowlist_set={sorted(s.live_signal_allowlist_set)}")
+        print(f"live_signal_sizes_map={dict(s.live_signal_sizes_map)}")
+        print(f"resolve_tp_pct={lc.resolve_tp_pct()}")
+        print(f"resolve_sl_pct={lc.resolve_sl_pct()}")
+        print(f"resolve_max_duration_hours={lc.resolve_max_duration_hours()}")
+        print(f"LIVE_DAILY_LOSS_CAP_USD={s.LIVE_DAILY_LOSS_CAP_USD}")
+        print(f"LIVE_MAX_EXPOSURE_USD={s.LIVE_MAX_EXPOSURE_USD}")
+        print(f"LIVE_MAX_OPEN_POSITIONS={s.LIVE_MAX_OPEN_POSITIONS}")
+        return 0
 
     # Configure structlog
     structlog.configure(
