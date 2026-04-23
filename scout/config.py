@@ -228,6 +228,12 @@ class Settings(BaseSettings):
     # Late-pump rejection for trade_gainers: skip candidates whose 24h change
     # already exceeds this threshold (they're near exhaustion).
     PAPER_GAINERS_MAX_24H_PCT: float = 50.0
+    # BL-060: admission threshold scoped to trade_first_signals. 0 disables the
+    # gate AND NULL-stamps would_be_live (pre-threshold regime excluded from A/B).
+    PAPER_MIN_QUANT_SCORE: int = 0
+    # BL-060: concurrent live-eligible slot cap. First N trades with status='open'
+    # AND would_be_live=1 win slots FCFS; subsequent opens stamp would_be_live=0.
+    PAPER_LIVE_ELIGIBLE_CAP: int = 20
     TRADING_DIGEST_HOUR_UTC: int = 0  # midnight digest
     TRADING_EVAL_INTERVAL: int = 1800  # 30 min eval cycle
 
