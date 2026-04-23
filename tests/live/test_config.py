@@ -85,3 +85,49 @@ def test_settings_extra_forbid_rejects_typo():
     """Spec §4.5: extra='forbid' catches LIVE_* typos at startup."""
     with pytest.raises(ValidationError):
         Settings(**_base_kwargs(LIVE_MDOE="shadow"))  # typo: MDOE
+
+
+# -------- BL-055 LiveConfig wrapper tests (spec §4.2) --------
+from scout.live.config import LiveConfig  # noqa: E402
+
+
+def _make(**over):
+    return LiveConfig(Settings(**{
+        "TELEGRAM_BOT_TOKEN": "t",
+        "TELEGRAM_CHAT_ID": "c",
+        "ANTHROPIC_API_KEY": "k",
+        **over,
+    }))
+
+
+def test_live_config_mode_passthrough():
+    lc = _make(LIVE_MODE="shadow")
+    assert lc.mode == "shadow"
+
+
+def test_live_config_is_signal_enabled_is_case_insensitive():
+    lc = _make(LIVE_SIGNAL_ALLOWLIST="first_signal,gainers_early")
+    assert lc.is_signal_enabled("FIRST_SIGNAL") is True
+    assert lc.is_signal_enabled("first_signal") is True
+    assert lc.is_signal_enabled("volume_spike") is False
+
+
+def test_resolve_size_usd_falls_back_to_default():
+    lc = _make(LIVE_TRADE_AMOUNT_USD=Decimal("100"),
+               LIVE_SIGNAL_SIZES="first_signal=50")
+    assert lc.resolve_size_usd("first_signal") == Decimal("50")
+    assert lc.resolve_size_usd("volume_spike") == Decimal("100")
+
+
+def test_resolve_tp_sl_duration_fall_back_to_paper_values():
+    lc = _make(
+        PAPER_TP_PCT=Decimal("40"),
+        PAPER_SL_PCT=Decimal("20"),
+        PAPER_MAX_DURATION_HOURS=24,
+        LIVE_TP_PCT=None,
+        LIVE_SL_PCT=Decimal("15"),
+        LIVE_MAX_DURATION_HOURS=None,
+    )
+    assert lc.resolve_tp_pct() == Decimal("40")
+    assert lc.resolve_sl_pct() == Decimal("15")
+    assert lc.resolve_max_duration_hours() == 24
