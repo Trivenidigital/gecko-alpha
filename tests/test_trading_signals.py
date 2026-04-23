@@ -605,3 +605,225 @@ async def test_trade_predictions_allows_legit_coinid_with_bridge_substring(
         settings=settings,
     )
     assert await _open_count(db) == 1
+
+
+# ---------------- BL-059: _is_tradeable_candidate helper -------------------
+
+
+@pytest.mark.parametrize(
+    "coin_id,ticker,expected",
+    [
+        # Clean ASCII cases pass
+        ("some-alt", "ALT", True),
+        ("bridgelink", "BRL", True),  # 'bridge' substring that isn't a bridged asset
+        ("airbender", "AIR", True),
+        # Wrapped/bridged coin_id patterns fail
+        ("wrapped-bitcoin", "WBTC", False),
+        ("bridged-usd-coin", "USDC", False),
+        ("superbridge-weth", "WETH", False),
+        ("arbitrum-bridged-usdc", "USDC", False),
+        ("sui-bridged-wbtc", "WBTC", False),
+        # Non-ASCII ticker fails (Chinese memes — the observed leak)
+        ("woo-ta-ma", "我踏马来了", False),
+        ("bianrensheng", "币安人生", False),
+        # Cyrillic and emoji tickers fail too
+        ("some-russ", "РУБЛЬ", False),
+        ("emoji-coin", "🚀", False),
+        # Empty/None safe — should not crash, treat as not-tradeable
+        ("", "ABC", False),
+        ("some-alt", "", False),
+        ("some-alt", None, False),
+        (None, "ABC", False),
+    ],
+)
+def test_is_tradeable_candidate(coin_id, ticker, expected):
+    from scout.trading.signals import _is_tradeable_candidate
+
+    assert _is_tradeable_candidate(coin_id, ticker) is expected
+
+
+# ---------------- BL-059: filter applied to 6 trade_* entry points ---------
+
+
+async def test_trade_gainers_skips_wrapped_coinid(db, engine, settings):
+    await _insert_gainer(db, "wrapped-bitcoin", market_cap=10_000_000)
+    await trade_gainers(engine, db, min_mcap=5_000_000, settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_gainers_skips_non_ascii_ticker(db, engine, settings):
+    """Non-ASCII ticker (Chinese meme) must not open a trade."""
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO gainers_snapshots
+           (coin_id, symbol, name, price_change_24h, market_cap, volume_24h,
+            price_at_snapshot, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("wo-ta-ma-laile", "我踏马来了", "我踏马来了", 25.0, 10_000_000, 100.0, 1.0, now),
+    )
+    await db._conn.commit()
+    await trade_gainers(engine, db, min_mcap=5_000_000, settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_losers_skips_wrapped_coinid(db, engine, settings):
+    await _insert_loser(db, "wrapped-bitcoin", market_cap=10_000_000)
+    await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_losers_skips_non_ascii_ticker(db, engine, settings):
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO losers_snapshots
+           (coin_id, symbol, name, price_change_24h, market_cap, volume_24h,
+            price_at_snapshot, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("bianrensheng", "币安人生", "币安人生", -25.0, 10_000_000, 100.0, 1.0, now),
+    )
+    await db._conn.commit()
+    await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_trending_skips_wrapped_coinid(db, engine, settings):
+    await _insert_trending(db, "wrapped-bitcoin", market_cap_rank=100)
+    await _seed_price(db, "wrapped-bitcoin", price=1.0, market_cap=50_000_000)
+    await trade_trending(
+        engine,
+        db,
+        max_mcap_rank=1500,
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0
+
+
+async def test_trade_trending_skips_non_ascii_ticker(db, engine, settings):
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO trending_snapshots
+           (coin_id, symbol, name, market_cap_rank, trending_score, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        ("meme-cn", "我踏马来了", "我踏马来了", 100, 1.0, now),
+    )
+    await db._conn.commit()
+    await _seed_price(db, "meme-cn", price=1.0, market_cap=50_000_000)
+    await trade_trending(
+        engine,
+        db,
+        max_mcap_rank=1500,
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0
+
+
+def _make_candidate(contract_address: str, ticker: str, *, mcap: float = 50_000_000):
+    from scout.models import CandidateToken
+
+    return CandidateToken(
+        contract_address=contract_address,
+        chain="coingecko",
+        token_name=contract_address,
+        ticker=ticker,
+        market_cap_usd=mcap,
+    )
+
+
+async def test_trade_first_signals_skips_wrapped_coinid(db, engine, settings):
+    token = _make_candidate("wrapped-bitcoin", "WBTC")
+    await _seed_price(db, "wrapped-bitcoin", price=1.0)
+    await trade_first_signals(
+        engine,
+        db,
+        scored_candidates=[(token, 50, ["momentum_ratio"])],
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0
+
+
+async def test_trade_first_signals_skips_non_ascii_ticker(db, engine, settings):
+    token = _make_candidate("wo-ta-ma-laile", "我踏马来了")
+    await _seed_price(db, "wo-ta-ma-laile", price=1.0)
+    await trade_first_signals(
+        engine,
+        db,
+        scored_candidates=[(token, 50, ["momentum_ratio"])],
+        min_mcap=5_000_000,
+        max_mcap=500_000_000,
+        settings=settings,
+    )
+    assert await _open_count(db) == 0
+
+
+async def test_trade_chain_completions_skips_wrapped_coinid(db, engine, settings):
+    """chain_matches has no symbol column — only coin_id filter applies here."""
+    from scout.trading.signals import trade_chain_completions
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO chain_patterns
+           (id, name, description, steps_json, min_steps_to_trigger)
+           VALUES (1, 'p', 'd', '[]', 1)""",
+    )
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost)
+           VALUES (?, 'coingecko', 1, 'p', 3, 3, ?, ?, 1.0, 10)""",
+        ("wrapped-bitcoin", now, now),
+    )
+    await db._conn.commit()
+    await _seed_price(db, "wrapped-bitcoin", price=1.0)
+    await trade_chain_completions(engine, db, settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_volume_spikes_skips_wrapped_coinid(db, engine, settings):
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    from scout.spikes.models import VolumeSpike
+    from scout.trading.signals import trade_volume_spikes
+
+    spike = VolumeSpike(
+        coin_id="wrapped-bitcoin",
+        symbol="WBTC",
+        name="Wrapped Bitcoin",
+        current_volume=100.0,
+        avg_volume_7d=10.0,
+        spike_ratio=10.0,
+        market_cap=10_000_000,
+        price=1.0,
+        detected_at=_dt.now(_tz.utc),
+    )
+    await trade_volume_spikes(engine, db, [spike], settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_volume_spikes_skips_non_ascii_ticker(db, engine, settings):
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    from scout.spikes.models import VolumeSpike
+    from scout.trading.signals import trade_volume_spikes
+
+    spike = VolumeSpike(
+        coin_id="bianrensheng",
+        symbol="币安人生",
+        name="币安人生",
+        current_volume=100.0,
+        avg_volume_7d=10.0,
+        spike_ratio=10.0,
+        market_cap=10_000_000,
+        price=1.0,
+        detected_at=_dt.now(_tz.utc),
+    )
+    await trade_volume_spikes(engine, db, [spike], settings=settings)
+    assert await _open_count(db) == 0
