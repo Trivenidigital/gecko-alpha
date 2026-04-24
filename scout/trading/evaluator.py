@@ -31,6 +31,20 @@ async def _load_bl061_cutover_ts(conn) -> str | None:
     return row[0] if row else None
 
 
+async def _load_bl062_cutover_ts(conn) -> str | None:
+    """Load BL-062 peak-fade cutover timestamp from paper_migrations.
+
+    Returns None if the row is missing. Callers treat None as 'no
+    cutover recorded' and should not use this value to filter fires —
+    it exists for the 30-day calibration review query.
+    """
+    cur = await conn.execute(
+        "SELECT cutover_ts FROM paper_migrations WHERE name = 'bl062_peak_fade'"
+    )
+    row = await cur.fetchone()
+    return row[0] if row else None
+
+
 def _parse_ts(s: str | None) -> datetime | None:
     """Parse SQLite datetime('now') (space, no tz) or ISO-with-tz into a UTC datetime.
 

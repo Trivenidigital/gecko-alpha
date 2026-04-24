@@ -323,3 +323,33 @@ async def test_partial_sell_race_lost_when_another_writer_fills_first(
     assert ok is False
     assert any(e["event"] == "partial_sell_race_lost" for e in logs)
     await db.close()
+
+
+async def test_bl062_cutover_ts_returns_iso_timestamp(tmp_path):
+    from scout.db import Database
+    from scout.trading.evaluator import _load_bl062_cutover_ts
+    from datetime import datetime
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ts = await _load_bl062_cutover_ts(db._conn)
+    assert ts is not None, "loader must return the cutover_ts written by migration"
+    parsed = datetime.fromisoformat(ts)
+    assert parsed.tzinfo is not None
+    await db.close()
+
+
+async def test_bl062_cutover_ts_returns_none_when_missing(tmp_path):
+    from scout.db import Database
+    from scout.trading.evaluator import _load_bl062_cutover_ts
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    # Simulate a corrupted DB where the row was manually deleted
+    await db._conn.execute(
+        "DELETE FROM paper_migrations WHERE name = 'bl062_peak_fade'"
+    )
+    await db._conn.commit()
+    ts = await _load_bl062_cutover_ts(db._conn)
+    assert ts is None
+    await db.close()
