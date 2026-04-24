@@ -394,3 +394,72 @@ async def test_bl061_ladder_columns_added(tmp_path):
     missing = required - cols
     assert not missing, f"missing ladder columns: {missing}"
     await db.close()
+
+
+# ---------------------------------------------------------------------------
+# BL-062: peak_fade_fired_at column + paper_migrations cutover row + index
+# ---------------------------------------------------------------------------
+
+
+async def test_bl062_peak_fade_column_added(tmp_path):
+    from scout.db import Database
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    cur = await db._conn.execute("PRAGMA table_info(paper_trades)")
+    cols = {row[1] for row in await cur.fetchall()}
+    assert "peak_fade_fired_at" in cols, (
+        f"peak_fade_fired_at column missing from paper_trades; have {sorted(cols)}"
+    )
+    await db.close()
+
+
+async def test_bl062_cutover_row_written(tmp_path):
+    from scout.db import Database
+    from datetime import datetime
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT cutover_ts FROM paper_migrations WHERE name='bl062_peak_fade'"
+    )
+    row = await cur.fetchone()
+    assert row is not None, "bl062_peak_fade row must exist after initialize()"
+    parsed = datetime.fromisoformat(row[0])
+    assert parsed.tzinfo is not None, "cutover_ts must be ISO with tz"
+    await db.close()
+
+
+async def test_bl062_index_created(tmp_path):
+    from scout.db import Database
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='index' AND name='idx_paper_trades_peak_fade_fired_at'"
+    )
+    row = await cur.fetchone()
+    assert row is not None, "idx_paper_trades_peak_fade_fired_at must exist"
+    await db.close()
+
+
+async def test_bl062_migration_idempotent_re_run(tmp_path):
+    """Re-initialize an existing DB: no errors, cutover_ts preserved."""
+    from scout.db import Database
+    db_path = tmp_path / "t.db"
+    db = Database(db_path)
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT cutover_ts FROM paper_migrations WHERE name='bl062_peak_fade'"
+    )
+    (first_ts,) = await cur.fetchone()
+    await db.close()
+
+    db2 = Database(db_path)
+    await db2.initialize()
+    cur = await db2._conn.execute(
+        "SELECT cutover_ts FROM paper_migrations WHERE name='bl062_peak_fade'"
+    )
+    (second_ts,) = await cur.fetchone()
+    assert second_ts == first_ts, (
+        f"cutover_ts must be preserved across re-init; first={first_ts} second={second_ts}"
+    )
+    await db2.close()

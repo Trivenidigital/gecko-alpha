@@ -877,6 +877,8 @@ class Database:
                 "remaining_qty": "REAL",
                 "floor_armed": "INTEGER",
                 "realized_pnl_usd": "REAL",
+                # BL-062 peak-fade exit marker (NULL until fire)
+                "peak_fade_fired_at": "TEXT",
             }
             cur = await conn.execute("PRAGMA table_info(paper_trades)")
             existing = {row[1] for row in await cur.fetchall()}
@@ -902,6 +904,18 @@ class Database:
                 "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
                 "VALUES (?, ?)",
                 ("bl061_ladder", datetime.now(timezone.utc).isoformat()),
+            )
+
+            # BL-062: peak-fade cutover row + index on fire-time column
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl062_peak_fade", datetime.now(timezone.utc).isoformat()),
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_paper_trades_peak_fade_fired_at "
+                "ON paper_trades(peak_fade_fired_at) "
+                "WHERE peak_fade_fired_at IS NOT NULL"
             )
 
             await conn.execute(
