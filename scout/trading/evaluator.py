@@ -272,7 +272,10 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     if current_price < trail_threshold:
                         close_reason = "trailing_stop"
                         close_status = "closed_trailing_stop"
-                # BL-062 peak-fade — sustained fade at 6h AND 24h checkpoints
+                # BL-062 peak-fade — sustained fade at 6h AND 24h checkpoints.
+                # NB: fires on any pass with cp_24h present, not only the pass
+                # that records it. The expiry bound caps the window to 1-2
+                # eval cycles in practice.
                 if (
                     close_reason is None
                     and settings.PEAK_FADE_ENABLED
@@ -282,6 +285,8 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     and cp_24h_pct is not None
                     and cp_6h_pct < peak_pct * settings.PEAK_FADE_RETRACE_RATIO
                     and cp_24h_pct < peak_pct * settings.PEAK_FADE_RETRACE_RATIO
+                    and remaining_qty is not None
+                    and remaining_qty > 0
                 ):
                     close_reason = "peak_fade"
                     close_status = "closed_peak_fade"

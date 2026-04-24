@@ -807,3 +807,37 @@ async def test_peak_fade_does_not_refire_once_closed(
     (second_fire,) = await cur.fetchone()
     assert second_fire == first_fire, "peak_fade_fired_at must not be rewritten"
     await db.close()
+
+
+async def test_peak_fade_no_fire_when_remaining_qty_is_zero(
+    tmp_path, settings_factory
+):
+    """Belt-and-suspenders: a legacy inconsistent row with status='open'
+    but remaining_qty=0 must not trigger a zero-qty peak-fade close."""
+    from scout.db import Database
+    from scout.trading.evaluator import evaluate_paper_trades
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = settings_factory()
+    trade_id = await _seed_post_leg1_trade(db, "tok-pf12", settings)
+    await _set_checkpoints_and_peak(
+        db, trade_id, peak_pct=20.0, cp_6h_pct=8.0, cp_24h_pct=8.0
+    )
+    await _seed_current_price(db, "tok-pf12", 1.08)
+    # Force the degenerate state the guard defends against
+    await db._conn.execute(
+        "UPDATE paper_trades SET remaining_qty = 0 WHERE id = ?", (trade_id,)
+    )
+    await db._conn.commit()
+
+    await evaluate_paper_trades(db, settings)
+
+    cur = await db._conn.execute(
+        "SELECT status, peak_fade_fired_at FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    status, fired_at = await cur.fetchone()
+    assert fired_at is None, "remaining_qty=0 must block peak-fade fire"
+    assert status == "open"
+    await db.close()
