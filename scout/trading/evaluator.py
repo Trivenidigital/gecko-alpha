@@ -82,7 +82,8 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                   peak_price, peak_pct, signal_data, symbol, name, chain,
                   amount_usd, quantity, signal_type,
                   created_at, leg_1_filled_at, leg_2_filled_at,
-                  remaining_qty, floor_armed, realized_pnl_usd
+                  remaining_qty, floor_armed, realized_pnl_usd,
+                  checkpoint_6h_pct, checkpoint_24h_pct
            FROM paper_trades
            WHERE status = 'open'""")
     rows = await cursor.fetchall()
@@ -216,6 +217,10 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             )
 
             if is_bl061:
+                # BL-062 peak-fade checkpoint pct values (may be NULL)
+                cp_6h_pct = row[27] if len(row) > 27 and row[27] is not None else None
+                cp_24h_pct = row[28] if len(row) > 28 and row[28] is not None else None
+
                 close_reason = None
                 close_status: str | None = None
                 # SL applies only before leg 1 arms the floor
@@ -264,8 +269,25 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     if current_price < trail_threshold:
                         close_reason = "trailing_stop"
                         close_status = "closed_trailing_stop"
-                # Expiry
-                elif elapsed >= max_duration:
+                # BL-062 peak-fade — sustained fade at 6h AND 24h checkpoints
+                if (
+                    close_reason is None
+                    and settings.PEAK_FADE_ENABLED
+                    and peak_pct is not None
+                    and peak_pct >= settings.PEAK_FADE_MIN_PEAK_PCT
+                    and cp_6h_pct is not None
+                    and cp_24h_pct is not None
+                    and cp_6h_pct < peak_pct * settings.PEAK_FADE_RETRACE_RATIO
+                    and cp_24h_pct < peak_pct * settings.PEAK_FADE_RETRACE_RATIO
+                ):
+                    close_reason = "peak_fade"
+                    close_status = "closed_peak_fade"
+                    await conn.execute(
+                        "UPDATE paper_trades SET peak_fade_fired_at = ? WHERE id = ?",
+                        (datetime.now(timezone.utc).isoformat(), trade_id),
+                    )
+                # Expiry — last resort
+                if close_reason is None and elapsed >= max_duration:
                     close_reason = "expired"
                     close_status = "closed_expired"
 
