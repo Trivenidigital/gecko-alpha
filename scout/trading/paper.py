@@ -305,6 +305,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             "stop_loss": "closed_sl",
             "expired": "closed_expired",
             "trailing_stop": "closed_trailing_stop",
+            "peak_fade": "closed_peak_fade",
             "manual": "closed_manual",
         }
         status = (
