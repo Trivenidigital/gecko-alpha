@@ -368,6 +368,9 @@ async def test_trade_first_signals_skips_above_max_mcap(db, engine, settings):
     """CandidateToken with mcap >500M must not open first_signal paper trade."""
     from scout.models import CandidateToken
 
+    # BL-062: pass FIRST_SIGNAL_MIN_SIGNAL_COUNT=1 so the max_mcap filter
+    # (under test) runs BEFORE the admission gate short-circuits.
+    settings = settings.model_copy(update={"FIRST_SIGNAL_MIN_SIGNAL_COUNT": 1})
     await _seed_price(db, "big-cap-first", price=1.0)
     token = CandidateToken(
         contract_address="big-cap-first",
@@ -759,6 +762,9 @@ def _make_candidate(contract_address: str, ticker: str, *, mcap: float = 50_000_
 
 
 async def test_trade_first_signals_skips_wrapped_coinid(db, engine, settings):
+    # BL-062: pass FIRST_SIGNAL_MIN_SIGNAL_COUNT=1 so the junk filter
+    # (under test) runs BEFORE the admission gate short-circuits.
+    settings = settings.model_copy(update={"FIRST_SIGNAL_MIN_SIGNAL_COUNT": 1})
     token = _make_candidate("wrapped-bitcoin", "WBTC")
     await _seed_price(db, "wrapped-bitcoin", price=1.0)
     await trade_first_signals(
@@ -773,6 +779,9 @@ async def test_trade_first_signals_skips_wrapped_coinid(db, engine, settings):
 
 
 async def test_trade_first_signals_skips_non_ascii_ticker(db, engine, settings):
+    # BL-062: pass FIRST_SIGNAL_MIN_SIGNAL_COUNT=1 so the junk filter
+    # (under test) runs BEFORE the admission gate short-circuits.
+    settings = settings.model_copy(update={"FIRST_SIGNAL_MIN_SIGNAL_COUNT": 1})
     token = _make_candidate("wo-ta-ma-laile", "我踏马来了")
     await _seed_price(db, "wo-ta-ma-laile", price=1.0)
     await trade_first_signals(
@@ -966,6 +975,9 @@ async def test_trade_first_signals_logs_signal_skipped_junk(db, engine, settings
 
     from scout.models import CandidateToken
 
+    # BL-062: pass FIRST_SIGNAL_MIN_SIGNAL_COUNT=1 so the junk filter
+    # (under test) runs BEFORE the admission gate short-circuits.
+    settings = settings.model_copy(update={"FIRST_SIGNAL_MIN_SIGNAL_COUNT": 1})
     token = CandidateToken(
         chain="coingecko",
         contract_address="wrapped-bitcoin",
@@ -1037,3 +1049,125 @@ async def test_trade_volume_spikes_logs_signal_skipped_junk(db, engine, settings
     events = _junk_events(cap)
     assert len(events) == 1
     assert events[0]["signal_type"] == "volume_spike"
+
+
+# ---------------------------------------------------------------------------
+# BL-062 admission gate — trade_first_signals requires len(signals_fired) >= N
+# ---------------------------------------------------------------------------
+
+
+class _FakeEngine:
+    def __init__(self):
+        self.opens = []
+
+    async def open_trade(self, **kwargs):
+        self.opens.append(kwargs)
+
+
+def _bl062_make_candidate(contract_address="tok-a"):
+    from scout.models import CandidateToken
+    return CandidateToken(
+        contract_address=contract_address,
+        ticker="TOK",
+        token_name="Token",
+        chain="coingecko",
+        market_cap_usd=10_000_000,
+        price_usd=1.0,
+    )
+
+
+async def test_first_signal_admission_blocks_single_scoring_signal(
+    tmp_path, settings_factory
+):
+    from scout.db import Database
+    from scout.trading.signals import trade_first_signals
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+        "VALUES ('tok-a', 1.0, '2026-04-23T00:00:00+00:00')"
+    )
+    await db._conn.commit()
+    engine = _FakeEngine()
+    settings = settings_factory(FIRST_SIGNAL_MIN_SIGNAL_COUNT=2)
+    candidate = _bl062_make_candidate()
+    scored = [(candidate, 50.0, ["momentum_ratio"])]
+    await trade_first_signals(engine, db, scored, settings=settings)
+    assert engine.opens == [], "single-signal admission must be blocked"
+    await db.close()
+
+
+async def test_first_signal_admission_accepts_two_scoring_signals(
+    tmp_path, settings_factory
+):
+    from scout.db import Database
+    from scout.trading.signals import trade_first_signals
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+        "VALUES ('tok-b', 1.0, '2026-04-23T00:00:00+00:00')"
+    )
+    await db._conn.commit()
+    engine = _FakeEngine()
+    settings = settings_factory(FIRST_SIGNAL_MIN_SIGNAL_COUNT=2)
+    candidate = _bl062_make_candidate(contract_address="tok-b")
+    scored = [(candidate, 70.0, ["momentum_ratio", "vol_acceleration"])]
+    await trade_first_signals(engine, db, scored, settings=settings)
+    assert len(engine.opens) == 1
+    assert engine.opens[0]["signal_type"] == "first_signal"
+    await db.close()
+
+
+async def test_first_signal_admission_override_to_one_admits_single(
+    tmp_path, settings_factory
+):
+    from scout.db import Database
+    from scout.trading.signals import trade_first_signals
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+        "VALUES ('tok-c', 1.0, '2026-04-23T00:00:00+00:00')"
+    )
+    await db._conn.commit()
+    engine = _FakeEngine()
+    settings = settings_factory(FIRST_SIGNAL_MIN_SIGNAL_COUNT=1)
+    candidate = _bl062_make_candidate(contract_address="tok-c")
+    scored = [(candidate, 50.0, ["momentum_ratio"])]
+    await trade_first_signals(engine, db, scored, settings=settings)
+    assert len(engine.opens) == 1, "MIN=1 must admit single-signal"
+    await db.close()
+
+
+async def test_first_signal_admission_trigger_family_not_counted(
+    tmp_path, settings_factory
+):
+    """Guard against future refactor that accidentally counts 'first_signal'
+    trigger identifier into signals_fired. Passing ['momentum_ratio'] plus
+    default MIN=2 must block — the 'first_signal' string is the signal_type
+    argument to build_combo_key, NOT a scoring signal.
+    """
+    from scout.db import Database
+    from scout.trading.signals import trade_first_signals
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+        "VALUES ('tok-d', 1.0, '2026-04-23T00:00:00+00:00')"
+    )
+    await db._conn.commit()
+    engine = _FakeEngine()
+    settings = settings_factory(FIRST_SIGNAL_MIN_SIGNAL_COUNT=2)
+    candidate = _bl062_make_candidate(contract_address="tok-d")
+    scored = [(candidate, 50.0, ["momentum_ratio"])]  # NOT including "first_signal"
+    await trade_first_signals(engine, db, scored, settings=settings)
+    assert engine.opens == [], (
+        "The trigger-family identifier 'first_signal' must not be counted "
+        "in signals_fired; the gate must see len=1 and block."
+    )
+    await db.close()
