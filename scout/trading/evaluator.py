@@ -107,6 +107,9 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
 
     _trader = PaperTrader()
     cutover_ts = await _load_bl061_cutover_ts(conn)
+    # BL-062 peak-fade is gated by is_bl061 + PEAK_FADE_ENABLED only; its
+    # own cutover row exists solely for the 30-day review query (see
+    # _load_bl062_cutover_ts), so we intentionally do NOT load it here.
 
     now = datetime.now(timezone.utc)
     max_duration = timedelta(hours=settings.PAPER_MAX_DURATION_HOURS)
