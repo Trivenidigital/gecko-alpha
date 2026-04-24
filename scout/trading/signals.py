@@ -322,6 +322,8 @@ async def trade_first_signals(
     for token, quant_score, signals_fired in scored_candidates:
         if quant_score <= 0 or not signals_fired:
             continue
+        if len(signals_fired) < settings.FIRST_SIGNAL_MIN_SIGNAL_COUNT:
+            continue
         if not _is_tradeable_candidate(token.contract_address, token.ticker):
             skipped_junk += 1
             logger.warning(

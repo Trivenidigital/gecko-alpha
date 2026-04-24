@@ -174,9 +174,9 @@ Non-goals:
 
 ---
 
-## BL-061 — Propagate category_name to snapshot tables for full PR #44 gate
+## BL-065 — Propagate category_name to snapshot tables for full PR #44 gate
 
-**Status:** Deferred (split out of BL-059 on 2026-04-22)
+**Status:** Deferred (split out of BL-059 on 2026-04-22; renumbered from BL-061 on 2026-04-23 to resolve naming collision with shipped ladder ticket)
 **Depends on:** nothing
 **Blocks:** nothing directly; strengthens filters applied by BL-059
 
@@ -216,10 +216,211 @@ Non-goals:
   only needed at open-time decision)
 
 **Why deferred:** BL-059 shipped with coin_id + non-ASCII only (closes observed
-leaks: wrapped tokens, Chinese memes). This BL-061 upgrade is "nice to have"
+leaks: wrapped tokens, Chinese memes). This BL-065 upgrade is "nice to have"
 unless category-matched junk (e.g. "stock market themed", "music", "murad picks")
 starts leaking through the weaker filter. Monitor paper_trades for junk-category
-entries; if they appear, prioritize BL-061.
+entries; if they appear, prioritize BL-065.
+
+---
+
+## BL-062 — Signal Stacking + Peak-Fade Early Kill (E1 sustained)
+
+**Status:** Ready — write spec next (retro complete, variant chosen 2026-04-23)
+**Depends on:** nothing
+**Blocks:** nothing
+**Motivation:** 281-trade retrospective (2026-04-24) showed two structural leaks:
+  1. `first_signal+momentum_ratio` is 49% of volume (138 trades) at +0.15% avg
+     P&L — 109 of 138 expire at the 24h timer. Signal bar is too liberal.
+  2. 188 of 281 closed trades (67%) expire. Avg peak during hold is +6% but
+     avg realized is -1.83% — no exit-on-peak-fade logic before the timer.
+
+**Retro outcomes (2026-04-23):**
+- **Q1 answer = A:** require `len(signals_fired) >= 2` for `first_signal`
+  admission (any two independent signals, not momentum-specific).
+- **Q2 variant chosen = E1 sustained-fade, threshold=10%** after pre-registered
+  test of three variants (E1 sustained, E2 deeper, E3 retrace+decay). Pre-reg
+  pass criteria: clip ≤ 30%, fires ≥ 15, sign-weighted avg delta ≥ +1.0pp.
+  E1 @ thresh=10 posted: 25 fires, 0 clips (structurally — two-observation rule
+  makes clip-only-on-last-observation impossible), +1.04pp avg delta. E2 was
+  strictly worse (52-92% clip ratios). E3 was untestable on the expired cohort
+  (0/201 had gainers_snapshots at T+0 and T+6h — the complement problem;
+  see BL-066 for re-scoping).
+- **Framing:** E1 is a *temporal* two-signal rule (fade at 6h AND 24h, 18h
+  apart) — validates the Q1 intuition that stacking across any independent
+  axis beats tuning a single-axis threshold.
+
+Ship scope:
+- **Signal stacking (Q1):** `trade_first_signals` admission guard —
+  `if len(signals_fired) < 2: continue`. Simple count gate; no per-signal
+  allowlist. Combo keys still encode the full signal set (no change).
+- **Peak-fade E1 (Q2):** new exit branch — fire when
+  `peak_pct >= 10` AND `cp_6h IS NOT NULL` AND `cp_24h IS NOT NULL` AND
+  `cp_6h < 0.7 * peak_pct` AND `cp_24h < 0.7 * peak_pct`. Close at market at
+  the 24h-observation tick.
+- **Pre-ship items (mirror BL-061 cohort discipline):**
+  1. **A/B flag column:** `peak_fade_fired_at TIMESTAMP NULL` on `paper_trades`.
+     Pre-cutover rows = NULL. Forward A/B scoped to `peak_fade_fired_at IS NOT NULL`
+     opened-after-cutover rows (same pattern as `would_be_live`).
+  2. **Data-availability precondition:** rule only fires when BOTH checkpoints
+     exist — no half-firing on `cp_6h` alone. Prevents naive-retrace HARKing.
+  3. **Fire-time semantics:** rule is evaluated at the 24h-observation tick,
+     not a continuous poll. Closes on the evaluator pass that records `cp_24h`.
+  4. **Exit precedence (hard-coded order):**
+     SL > ladder leg 1 > ladder leg 2 > trail-stop > peak_fade > expiry.
+     - Ladder legs fire on their own triggers first; peak_fade only applies to
+       `remaining_qty` after legs fill.
+     - If trail-stop is armed AND eligible on the same evaluator pass as
+       peak_fade, trail wins.
+     - Peak_fade applies to `remaining_qty` only (can coexist with partial
+       ladder fills).
+  5. **30-day calibration review:** add checkpoint to the 2026-05-23 BL-061
+     review (or file a parallel review). **Stop rule: if forward clip% > 15%
+     over ≥20 fires, revert the feature flag.**
+- Config knobs under `.env`:
+  `PEAK_FADE_ENABLED` (bool, default true),
+  `PEAK_FADE_MIN_PEAK_PCT` (default 10),
+  `PEAK_FADE_RETRACE_RATIO` (default 0.7 — dual-observation),
+  `FIRST_SIGNAL_MIN_SIGNAL_COUNT` (default 2)
+- Parametrized tests covering: admission gate (1 vs 2+ signals), E1 fire
+  conditions (both checkpoints present, both below ratio), E1 no-fire paths
+  (missing checkpoint, only one below ratio), exit precedence ordering,
+  remaining_qty handling with ladder legs.
+
+Non-goals:
+- Retroactively closing open trades (new rules apply to new opens + forward
+  evaluation of existing opens but no forced-close on legacy positions).
+- Touching the BL-061 ladder cascade itself (peak_fade is additive).
+- Tightening other combos (first_signal+momentum_ratio is the 49%-volume
+  culprit; others average better — leave them alone).
+- E2 / E3 exit variants (retro rejected E2; E3 moved to BL-066).
+
+---
+
+## BL-066 — Rank-Decay Exit Research on Gainers-List Cohort
+
+**Status:** Deferred — research ticket, queue after BL-062 ships
+**Depends on:** nothing (BL-062 is the sister exit rule; BL-066 is independent)
+**Blocks:** nothing
+**Motivation:** BL-062's E3 variant (retrace + gainers-rank-decay confirmation)
+  tested at 0/201 coverage on the expired cohort — because expired-to-noise
+  trades are the complement set of trades that reach the gainers list. Rank-decay
+  mechanically cannot exist for trades that never had a rank. The axis is real
+  but the cohort was wrong.
+
+Scope:
+- **Cohort:** trades that DID reach the gainers list (non-NULL rank in
+  `gainers_snapshots` at some point during the hold), then faded back.
+  *Complement* of BL-062's cohort by construction.
+- **Rule candidates to test:** peak_rank crossed → current_rank degraded by X
+  places OR dropped off list entirely; combined with a price retrace guard.
+- **Pre-registered methodology:** same discipline as BL-062 retro — declare
+  pass criteria (clip ratio, fires, sign-weighted avg delta) before running
+  any simulation. Exact thresholds TBD based on gainers-list sub-population
+  distribution.
+
+Non-goals:
+- Running on the expired cohort (E3 already proved that's a dry hole).
+- Replacing E1 peak_fade (BL-066 is additive; it targets a different cohort
+  and can coexist).
+- Adaptive ranking thresholds per signal combo (single global rule for v1).
+
+---
+
+## BL-067 — Score-Decay Exit Research on Expired Cohort (contingent)
+
+**Status:** Contingent — viability confirmed 2026-04-23, empirical coverage TBD
+**Depends on:** nothing
+**Blocks:** nothing
+**Motivation:** If rank-decay cannot target the expired cohort (BL-066 handles
+  the complement), score-decay is the next candidate axis for the expired
+  population. Score IS written mid-hold for any token that re-appears in
+  ingestion (`scout/main.py:602` logs `score_history` per cycle for every
+  enriched token). Axis exists mechanically — but empirical coverage is
+  gated on how often expired tokens re-surface through ingestion during the
+  hold window.
+
+**Viability gate (completed 2026-04-23):**
+- `log_score` fires in the per-cycle scoring loop at `scout/main.py:602` for
+  every enriched candidate. Not entry-only. ✅ Axis mechanically viable.
+- Outstanding: empirical check — of the 201 expired trades, how many have
+  `score_history` rows recorded DURING hold (between `opened_at` and
+  `closed_at`)? If < ~30% have any mid-hold score updates, axis is
+  empirically dead on this cohort.
+
+Scope (if empirical gate passes):
+- Define score-decay rule (TBD in brainstorm): e.g. `score_at_entry - current_score >= N`
+  over hold window ≥ X hours.
+- Pre-registered simulation against expired cohort with same discipline as
+  BL-062 (clip, fires, avg delta thresholds declared first).
+
+Non-goals:
+- Running if mid-hold coverage < 30% of cohort (stop at viability gate).
+- Replacing E1 peak_fade (BL-067 is additive; targets expired cohort alongside).
+
+**Post-hoc axis-swap risk noted:** BL-067 is a separate ticket specifically to
+avoid HARKing from BL-062's failed E3 test. Don't merge scope across tickets.
+
+---
+
+## BL-063 — Adaptive Ladder: ATR-Scaled + Narrative-Gated Exit Legs
+
+**Status:** Deferred — revisit after BL-061 ladder has 30+ post-cutover trades
+**Depends on:** BL-061 (shipped 2026-04-23), ideally post-cutover calibration data
+**Blocks:** nothing
+**Motivation:** 281-trade retro showed fixed 25%/50%/trail under-captures on
+  trending majors (Katana ran to +140%, we trail-stopped each of 3 waves at
+  ~12-16%). Fixed ladder fits meme-cycle tokens (Wojak +40-47% TP fires clean)
+  but leaves money on trending-coin runs that genuinely deserve a wider trail
+  while the thesis holds.
+
+Scope (TBD in brainstorm):
+- **ATR-scaled legs:** replace fixed 25%/50% with legs tied to recent volatility
+  (e.g. ATR-14 from score_history price series). Low-vol tokens get tighter
+  legs; high-vol trending gets wider.
+- **Narrative-gated extensions:** if `category_heating` or `cg_trending_rank`
+  is still active when leg 2 fires, push trailing-floor from -12% to -20% OR
+  add a leg 3 at +75-100%. Thesis intact → hold longer.
+- **Signal-decay hard kill:** mirror of above — if thesis decays (trending
+  rank falls, category cools), accelerate exit regardless of price.
+
+Key open questions for brainstorm:
+- How do we detect "thesis still intact" at runtime without expensive lookups?
+  (Cache category_heating + trending rank on the trade row at open-time,
+  refresh every N minutes?)
+- Should adaptive legs replace fixed legs or coexist with a config toggle?
+- Does ATR-14 compute sensibly for tokens with <14 hours of history?
+
+Non-goals:
+- Full machine-learning exit model (rules-based adaptive is enough for current
+  data scale — see `feedback_ml_not_yet` memory)
+- Adaptive entry logic (this is exit-only; entry is BL-062's territory)
+
+---
+
+## BL-064 — Investigate long_hold Combo: Why So Few Trades?
+
+**Status:** Deferred — investigate after BL-062 ships
+**Depends on:** nothing
+**Blocks:** nothing
+**Motivation:** 281-trade retro showed `long_hold` combo has the best avg PnL
+  (+16.76%) across all paper combos — but only 8 trades total. 0 expired, 0 SL,
+  0 TP, 8 trailing_stop (avg peak +32%, decent capture). Either the gate is too
+  strict (leaving alpha on the floor) or the signal is genuinely rare. Worth
+  investigating before we assume it's pure alpha.
+
+Investigation scope:
+- Read `scout/trading/paper.py` to understand `long_hold` trigger conditions
+- Query `candidates` / `signal_events` for tokens that *nearly* qualified for
+  long_hold but were rejected — compare their subsequent price action to the
+  8 that did qualify
+- If the 8 qualifiers outperform the near-misses by a wide margin → gate is
+  correctly tight, leave alone
+- If near-misses performed comparably → gate threshold is too strict, propose
+  a relaxed variant and A/B via a new signal combo
+
+Non-goals:
+- Immediate implementation — this is a research ticket to inform whether
+  BL-06X is justified. Produces findings + recommendation, not code.
 
 ---
 
@@ -228,3 +429,7 @@ entries; if they appear, prioritize BL-061.
 - **BL-052** — GeckoTerminal per-chain trending (PR #35, merged 2026-04-20)
 - **BL-053** — CryptoPanic news feed (PR #36, merged 2026-04-20)
 - **BL-054** — Perp WS anomaly detector (PR #37, merged 2026-04-20)
+- **BL-055** — Live trading execution core (PR #47, merged 2026-04-23, shadow mode)
+- **BL-059** — Paper-trading quality: first_signal junk filter (PR #44, merged 2026-04-22)
+- **BL-060** — Paper-mirrors-live + would_be_live oracle (PR #48, merged 2026-04-23)
+- **BL-061** — Paper-trading ladder redesign (PR #48, merged 2026-04-23; PR #49 hardening merged 2026-04-23)

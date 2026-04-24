@@ -236,6 +236,12 @@ class Settings(BaseSettings):
     PAPER_LADDER_LEG_2_QTY_FRAC: float = 0.30
     PAPER_LADDER_TRAIL_PCT: float = 12.0
     PAPER_LADDER_FLOOR_ARM_ON_LEG_1: bool = True
+    # BL-062 signal-stacking: require >=N scoring signals for first_signal admission
+    FIRST_SIGNAL_MIN_SIGNAL_COUNT: int = 2
+    # BL-062 peak-fade early-kill: sustained-fade exit between trail and expiry
+    PEAK_FADE_ENABLED: bool = True
+    PEAK_FADE_MIN_PEAK_PCT: float = 10.0
+    PEAK_FADE_RETRACE_RATIO: float = 0.7
     TRADING_DIGEST_HOUR_UTC: int = 0  # midnight digest
     TRADING_EVAL_INTERVAL: int = 1800  # 30 min eval cycle
 
@@ -396,6 +402,33 @@ class Settings(BaseSettings):
             raise ValueError(
                 "PAPER_LADDER_*_QTY_FRAC must be in (0, 1]; "
                 f"got={v} — fractions > 1 would oversell the position"
+            )
+        return v
+
+    @field_validator("FIRST_SIGNAL_MIN_SIGNAL_COUNT")
+    @classmethod
+    def _validate_first_signal_min_count(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(
+                f"FIRST_SIGNAL_MIN_SIGNAL_COUNT must be >= 1; got={v}"
+            )
+        return v
+
+    @field_validator("PEAK_FADE_MIN_PEAK_PCT")
+    @classmethod
+    def _validate_peak_fade_min_peak_pct(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(
+                f"PEAK_FADE_MIN_PEAK_PCT must be > 0; got={v}"
+            )
+        return v
+
+    @field_validator("PEAK_FADE_RETRACE_RATIO")
+    @classmethod
+    def _validate_peak_fade_retrace_ratio(cls, v: float) -> float:
+        if not (0.0 < v < 1.0):
+            raise ValueError(
+                f"PEAK_FADE_RETRACE_RATIO must be in (0, 1); got={v}"
             )
         return v
 

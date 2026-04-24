@@ -275,3 +275,33 @@ async def test_execute_partial_sell_idempotent_on_double_call(tmp_path):
     # realized_pnl_usd accumulated only once: 300 * 0.30 * 0.25 = 22.50
     assert row[1] == pytest.approx(22.50, rel=1e-6)
     await db.close()
+
+
+async def test_execute_sell_peak_fade_sets_closed_peak_fade_status(
+    tmp_path,
+):
+    from scout.db import Database
+    from scout.trading.paper import PaperTrader
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    trader = PaperTrader()
+    trade_id = await trader.execute_buy(
+        db=db, token_id="tok-pf", symbol="PF", name="PeakFade",
+        chain="coingecko", signal_type="first_signal", signal_data={},
+        current_price=1.00, amount_usd=100.0, tp_pct=20.0, sl_pct=15.0,
+        slippage_bps=0, signal_combo="first_signal+momentum_ratio",
+    )
+    closed = await trader.execute_sell(
+        db=db, trade_id=trade_id, current_price=1.05,
+        reason="peak_fade", slippage_bps=0,
+    )
+    assert closed is True
+    cur = await db._conn.execute(
+        "SELECT status, exit_reason FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    status, reason = await cur.fetchone()
+    assert status == "closed_peak_fade"
+    assert reason == "peak_fade"
+    await db.close()

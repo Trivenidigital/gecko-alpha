@@ -31,6 +31,20 @@ async def _load_bl061_cutover_ts(conn) -> str | None:
     return row[0] if row else None
 
 
+async def _load_bl062_cutover_ts(conn) -> str | None:
+    """Load BL-062 peak-fade cutover timestamp from paper_migrations.
+
+    Returns None if the row is missing. Callers treat None as 'no
+    cutover recorded' and should not use this value to filter fires —
+    it exists for the 30-day calibration review query.
+    """
+    cur = await conn.execute(
+        "SELECT cutover_ts FROM paper_migrations WHERE name = 'bl062_peak_fade'"
+    )
+    row = await cur.fetchone()
+    return row[0] if row else None
+
+
 def _parse_ts(s: str | None) -> datetime | None:
     """Parse SQLite datetime('now') (space, no tz) or ISO-with-tz into a UTC datetime.
 
@@ -68,7 +82,8 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                   peak_price, peak_pct, signal_data, symbol, name, chain,
                   amount_usd, quantity, signal_type,
                   created_at, leg_1_filled_at, leg_2_filled_at,
-                  remaining_qty, floor_armed, realized_pnl_usd
+                  remaining_qty, floor_armed, realized_pnl_usd,
+                  checkpoint_6h_pct, checkpoint_24h_pct
            FROM paper_trades
            WHERE status = 'open'""")
     rows = await cursor.fetchall()
@@ -92,6 +107,9 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
 
     _trader = PaperTrader()
     cutover_ts = await _load_bl061_cutover_ts(conn)
+    # BL-062 peak-fade is gated by is_bl061 + PEAK_FADE_ENABLED only; its
+    # own cutover row exists solely for the 30-day review query (see
+    # _load_bl062_cutover_ts), so we intentionally do NOT load it here.
 
     now = datetime.now(timezone.utc)
     max_duration = timedelta(hours=settings.PAPER_MAX_DURATION_HOURS)
@@ -202,6 +220,10 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             )
 
             if is_bl061:
+                # BL-062 peak-fade checkpoint pct values (may be NULL)
+                cp_6h_pct = row[27] if len(row) > 27 and row[27] is not None else None
+                cp_24h_pct = row[28] if len(row) > 28 and row[28] is not None else None
+
                 close_reason = None
                 close_status: str | None = None
                 # SL applies only before leg 1 arms the floor
@@ -250,8 +272,30 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     if current_price < trail_threshold:
                         close_reason = "trailing_stop"
                         close_status = "closed_trailing_stop"
-                # Expiry
-                elif elapsed >= max_duration:
+                # BL-062 peak-fade — sustained fade at 6h AND 24h checkpoints.
+                # NB: fires on any pass with cp_24h present, not only the pass
+                # that records it. The expiry bound caps the window to 1-2
+                # eval cycles in practice.
+                if (
+                    close_reason is None
+                    and settings.PEAK_FADE_ENABLED
+                    and peak_pct is not None
+                    and peak_pct >= settings.PEAK_FADE_MIN_PEAK_PCT
+                    and cp_6h_pct is not None
+                    and cp_24h_pct is not None
+                    and cp_6h_pct < peak_pct * settings.PEAK_FADE_RETRACE_RATIO
+                    and cp_24h_pct < peak_pct * settings.PEAK_FADE_RETRACE_RATIO
+                    and remaining_qty is not None
+                    and remaining_qty > 0
+                ):
+                    close_reason = "peak_fade"
+                    close_status = "closed_peak_fade"
+                    await conn.execute(
+                        "UPDATE paper_trades SET peak_fade_fired_at = ? WHERE id = ?",
+                        (datetime.now(timezone.utc).isoformat(), trade_id),
+                    )
+                # Expiry — last resort
+                if close_reason is None and elapsed >= max_duration:
                     close_reason = "expired"
                     close_status = "closed_expired"
 

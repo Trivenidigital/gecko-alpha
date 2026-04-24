@@ -95,6 +95,7 @@ function reasonBadge(reason) {
   if (r === 'TP' || r === 'TAKE_PROFIT') return <span className="outcome-badge win">TP</span>
   if (r === 'SL' || r === 'STOP_LOSS') return <span className="outcome-badge loss">SL</span>
   if (r === 'EXPIRED' || r === 'TIMEOUT') return <span className="outcome-badge" style={{ background: 'var(--color-bar-bg)', color: 'var(--color-text-secondary)' }}>Expired</span>
+  if (r === 'PEAK_FADE') return <span className="outcome-badge" style={{ background: 'rgba(255, 183, 77, 0.15)', color: 'var(--color-accent-amber)' }}>Peak Fade</span>
   if (r === 'MANUAL') return <span className="outcome-badge" style={{ background: 'rgba(255, 183, 77, 0.15)', color: 'var(--color-accent-amber)' }}>Manual</span>
   return <span className="outcome-badge">{reason}</span>
 }
