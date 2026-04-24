@@ -258,3 +258,111 @@ def test_ladder_qty_fracs_defaults_leave_runner(monkeypatch, tmp_path):
     )
     total = s.PAPER_LADDER_LEG_1_QTY_FRAC + s.PAPER_LADDER_LEG_2_QTY_FRAC
     assert total < 1.0
+
+
+# ---------------------------------------------------------------------------
+# BL-062 signal-stacking + peak-fade validators
+# ---------------------------------------------------------------------------
+
+
+def test_first_signal_min_signal_count_default_is_two(tmp_path, monkeypatch):
+    from scout.config import Settings
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FIRST_SIGNAL_MIN_SIGNAL_COUNT", raising=False)
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.FIRST_SIGNAL_MIN_SIGNAL_COUNT == 2
+
+
+def test_first_signal_min_signal_count_rejects_zero(monkeypatch):
+    from pydantic import ValidationError
+    from scout.config import Settings
+    monkeypatch.setenv("FIRST_SIGNAL_MIN_SIGNAL_COUNT", "0")
+    with pytest.raises(ValidationError, match="FIRST_SIGNAL_MIN_SIGNAL_COUNT"):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+        )
+
+
+def test_peak_fade_enabled_default_true(tmp_path, monkeypatch):
+    from scout.config import Settings
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PEAK_FADE_ENABLED", raising=False)
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.PEAK_FADE_ENABLED is True
+
+
+def test_peak_fade_min_peak_pct_rejects_zero(monkeypatch):
+    from pydantic import ValidationError
+    from scout.config import Settings
+    monkeypatch.setenv("PEAK_FADE_MIN_PEAK_PCT", "0")
+    with pytest.raises(ValidationError, match="PEAK_FADE_MIN_PEAK_PCT"):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+        )
+
+
+def test_peak_fade_min_peak_pct_rejects_negative(monkeypatch):
+    from pydantic import ValidationError
+    from scout.config import Settings
+    monkeypatch.setenv("PEAK_FADE_MIN_PEAK_PCT", "-5")
+    with pytest.raises(ValidationError, match="PEAK_FADE_MIN_PEAK_PCT"):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+        )
+
+
+def test_peak_fade_retrace_ratio_rejects_one(monkeypatch):
+    from pydantic import ValidationError
+    from scout.config import Settings
+    monkeypatch.setenv("PEAK_FADE_RETRACE_RATIO", "1.0")
+    with pytest.raises(ValidationError, match="PEAK_FADE_RETRACE_RATIO"):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+        )
+
+
+def test_peak_fade_retrace_ratio_rejects_zero(monkeypatch):
+    from pydantic import ValidationError
+    from scout.config import Settings
+    monkeypatch.setenv("PEAK_FADE_RETRACE_RATIO", "0")
+    with pytest.raises(ValidationError, match="PEAK_FADE_RETRACE_RATIO"):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+        )
+
+
+def test_peak_fade_retrace_ratio_accepts_half(monkeypatch):
+    from scout.config import Settings
+    monkeypatch.setenv("PEAK_FADE_RETRACE_RATIO", "0.5")
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.PEAK_FADE_RETRACE_RATIO == 0.5
