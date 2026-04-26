@@ -236,6 +236,12 @@ class Settings(BaseSettings):
     PAPER_LADDER_LEG_2_QTY_FRAC: float = 0.30
     PAPER_LADDER_TRAIL_PCT: float = 12.0
     PAPER_LADDER_FLOOR_ARM_ON_LEG_1: bool = True
+    # BL-063 moonshot exit upgrade: when peak_pct crosses MOONSHOT_THRESHOLD_PCT,
+    # widen the BL-061 ladder trail from PAPER_LADDER_TRAIL_PCT to
+    # PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT so big runners aren't clipped early.
+    PAPER_MOONSHOT_ENABLED: bool = False
+    PAPER_MOONSHOT_THRESHOLD_PCT: float = 40.0
+    PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT: float = 30.0
     # BL-062 signal-stacking: require >=N scoring signals for first_signal admission
     FIRST_SIGNAL_MIN_SIGNAL_COUNT: int = 2
     # BL-062 peak-fade early-kill: sustained-fade exit between trail and expiry
@@ -354,9 +360,7 @@ class Settings(BaseSettings):
             k, sep, v = pair.partition("=")
             k = k.strip().lower()
             if not sep or not k or not v.strip():
-                raise ValueError(
-                    f"LIVE_SIGNAL_SIZES malformed entry: {pair!r}"
-                )
+                raise ValueError(f"LIVE_SIGNAL_SIZES malformed entry: {pair!r}")
             out[k] = Decimal(v.strip())
         return out
 
@@ -409,27 +413,21 @@ class Settings(BaseSettings):
     @classmethod
     def _validate_first_signal_min_count(cls, v: int) -> int:
         if v < 1:
-            raise ValueError(
-                f"FIRST_SIGNAL_MIN_SIGNAL_COUNT must be >= 1; got={v}"
-            )
+            raise ValueError(f"FIRST_SIGNAL_MIN_SIGNAL_COUNT must be >= 1; got={v}")
         return v
 
     @field_validator("PEAK_FADE_MIN_PEAK_PCT")
     @classmethod
     def _validate_peak_fade_min_peak_pct(cls, v: float) -> float:
         if v <= 0:
-            raise ValueError(
-                f"PEAK_FADE_MIN_PEAK_PCT must be > 0; got={v}"
-            )
+            raise ValueError(f"PEAK_FADE_MIN_PEAK_PCT must be > 0; got={v}")
         return v
 
     @field_validator("PEAK_FADE_RETRACE_RATIO")
     @classmethod
     def _validate_peak_fade_retrace_ratio(cls, v: float) -> float:
         if not (0.0 < v < 1.0):
-            raise ValueError(
-                f"PEAK_FADE_RETRACE_RATIO must be in (0, 1); got={v}"
-            )
+            raise ValueError(f"PEAK_FADE_RETRACE_RATIO must be in (0, 1); got={v}")
         return v
 
     @field_validator("PAPER_MAX_MCAP")
@@ -495,6 +493,35 @@ class Settings(BaseSettings):
         if abs(total - 1.0) > 1e-9:
             msg = f"QUANT_WEIGHT ({self.QUANT_WEIGHT}) + NARRATIVE_WEIGHT ({self.NARRATIVE_WEIGHT}) = {total}, must sum to 1.0"
             raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_moonshot(self) -> "Settings":
+        # Threshold must be positive — a non-positive threshold would arm every
+        # trade at open, defeating the purpose.
+        if self.PAPER_MOONSHOT_THRESHOLD_PCT <= 0:
+            raise ValueError(
+                "PAPER_MOONSHOT_THRESHOLD_PCT must be > 0; "
+                f"got={self.PAPER_MOONSHOT_THRESHOLD_PCT}"
+            )
+        # Drawdown in (0, 100). >= 100 would silently disable trailing
+        # entirely (trail price <= 0 never triggers); <= 0 would fire on any
+        # tick.
+        if not (0 < self.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT < 100):
+            raise ValueError(
+                "PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT must be in (0, 100); "
+                f"got={self.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT}"
+            )
+        # Cross-field guard: moonshot must WIDEN the ladder trail, never
+        # tighten it. A misconfig that tightens at the threshold would clip
+        # runners harder than baseline — silent regression.
+        if self.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT <= self.PAPER_LADDER_TRAIL_PCT:
+            raise ValueError(
+                "PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT must be > "
+                "PAPER_LADDER_TRAIL_PCT (moonshot widens the trail); "
+                f"got moonshot={self.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT}, "
+                f"ladder={self.PAPER_LADDER_TRAIL_PCT}"
+            )
         return self
 
     @model_validator(mode="after")

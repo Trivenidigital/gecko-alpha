@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import structlog
 
 from scout.db import Database
+from scout.exceptions import MoonshotArmFailed
 
 if TYPE_CHECKING:
     from scout.live.engine import LiveEngine
@@ -23,6 +24,7 @@ CLOSED_COUNTABLE_STATUSES: tuple[str, ...] = (
     "closed_sl",
     "closed_expired",
     "closed_trailing_stop",
+    "closed_moonshot_trail",
 )
 
 
@@ -166,6 +168,62 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
 
         return trade_id
 
+    async def arm_moonshot(
+        self,
+        db: Database,
+        trade_id: int,
+        *,
+        peak_pct_at_arm: float,
+        original_trail_drawdown_pct: float,
+    ) -> bool:
+        """Atomically arm moonshot exit on a trade.
+
+        Single conditional UPDATE WHERE moonshot_armed_at IS NULL with a
+        rowcount check — mirrors the proven `execute_partial_sell` pattern
+        for race-safety against concurrent evaluator ticks.
+
+        Returns True if the trade was armed by this call, False if it was
+        already armed (race lost or repeat call).
+
+        Raises MoonshotArmFailed when the UPDATE matches zero rows AND the
+        trade row genuinely doesn't exist (vs the normal already-armed
+        case). This distinction prevents silently treating "trade missing"
+        as "trade already armed" — a real bug would never surface.
+        """
+        conn = db._conn
+        if conn is None:
+            raise RuntimeError("Database not initialized.")
+
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = await conn.execute(
+            "UPDATE paper_trades "
+            "SET moonshot_armed_at = ?, original_trail_drawdown_pct = ? "
+            "WHERE id = ? AND moonshot_armed_at IS NULL",
+            (now, original_trail_drawdown_pct, trade_id),
+        )
+        if cursor.rowcount == 1:
+            await conn.commit()
+            log.info(
+                "moonshot_armed",
+                trade_id=trade_id,
+                peak_pct_at_arm=round(float(peak_pct_at_arm), 2),
+                original_trail_drawdown_pct=original_trail_drawdown_pct,
+            )
+            return True
+
+        # rowcount == 0: distinguish "already armed" (normal) from "trade
+        # doesn't exist" (bug). One extra round-trip on the cold path; the
+        # hot path took the rowcount==1 branch above.
+        verify = await conn.execute(
+            "SELECT moonshot_armed_at FROM paper_trades WHERE id = ?",
+            (trade_id,),
+        )
+        row = await verify.fetchone()
+        if row is None:
+            raise MoonshotArmFailed(f"arm_moonshot: trade_id={trade_id} not found")
+        log.info("moonshot_arm_skipped_already_armed", trade_id=trade_id)
+        return False
+
     async def execute_partial_sell(
         self,
         db: Database,
@@ -200,7 +258,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         if row is None:
             log.warning("partial_sell_trade_not_found", trade_id=trade_id, leg=leg)
             return False
-        entry_price, initial_qty, remaining_qty, realized, already_filled, peak_pct = row
+        entry_price, initial_qty, remaining_qty, realized, already_filled, peak_pct = (
+            row
+        )
         if already_filled is not None:
             log.info("partial_sell_already_filled", trade_id=trade_id, leg=leg)
             return False
@@ -237,9 +297,13 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         peak_pct_rounded = round(float(peak_pct), 2) if peak_pct is not None else None
         log.info(
             "ladder_leg_fired",
-            trade_id=trade_id, leg=leg, fill_price=effective_exit,
-            leg_qty=leg_qty, leg_realized_usd=leg_realized,
-            remaining_qty=new_remaining, realized_pnl_usd=new_realized,
+            trade_id=trade_id,
+            leg=leg,
+            fill_price=effective_exit,
+            leg_qty=leg_qty,
+            leg_realized_usd=leg_realized,
+            remaining_qty=new_remaining,
+            realized_pnl_usd=new_realized,
             peak_pct_at_fire=peak_pct_rounded,
         )
         if leg == 1:

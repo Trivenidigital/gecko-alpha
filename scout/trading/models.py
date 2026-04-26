@@ -30,7 +30,8 @@ class PaperTrade(BaseModel):
     sl_price: float
 
     status: str = (
-        "open"  # open, closed_tp, closed_sl, closed_expired, closed_trailing_stop, closed_manual
+        "open"  # open, closed_tp, closed_sl, closed_expired, closed_trailing_stop,
+        # closed_moonshot_trail (BL-063), closed_manual
     )
 
     exit_price: float | None = None
@@ -52,6 +53,12 @@ class PaperTrade(BaseModel):
 
     opened_at: datetime
     closed_at: datetime | None = None
+
+    # BL-063 moonshot exit upgrade — NULL until peak_pct crosses the
+    # moonshot threshold; original_trail snapshot is preserved at arm
+    # time for post-mortem analysis.
+    moonshot_armed_at: datetime | None = None
+    original_trail_drawdown_pct: float | None = None
 
     @field_validator("sl_pct")
     @classmethod

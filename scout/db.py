@@ -879,6 +879,11 @@ class Database:
                 "realized_pnl_usd": "REAL",
                 # BL-062 peak-fade exit marker (NULL until fire)
                 "peak_fade_fired_at": "TEXT",
+                # BL-063 moonshot exit upgrade — NULL until armed when peak_pct
+                # crosses the moonshot threshold; original_trail snapshot at
+                # arm time for post-mortem analysis.
+                "moonshot_armed_at": "TEXT",
+                "original_trail_drawdown_pct": "REAL",
             }
             cur = await conn.execute("PRAGMA table_info(paper_trades)")
             existing = {row[1] for row in await cur.fetchall()}
@@ -916,6 +921,20 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_peak_fade_fired_at "
                 "ON paper_trades(peak_fade_fired_at) "
                 "WHERE peak_fade_fired_at IS NOT NULL"
+            )
+
+            # BL-063: moonshot cutover row + partial index on arm time.
+            # Per BL-060 lesson: CREATE INDEX lives in this migration step,
+            # NOT in _create_tables (which is a no-op for existing tables).
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl063_moonshot", datetime.now(timezone.utc).isoformat()),
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_paper_trades_moonshot_armed_at "
+                "ON paper_trades(moonshot_armed_at) "
+                "WHERE moonshot_armed_at IS NOT NULL"
             )
 
             await conn.execute(
