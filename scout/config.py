@@ -399,6 +399,19 @@ class Settings(BaseSettings):
             raise ValueError("tp_pct must be positive, e.g. 20.0 for 20% take profit")
         return v
 
+    @field_validator("PAPER_LADDER_TRAIL_PCT")
+    @classmethod
+    def _validate_paper_ladder_trail_pct(cls, v: float) -> float:
+        # Must be strictly positive: a 0 override would make trail_threshold
+        # equal to peak_price, firing on every tick after peak. The cross-field
+        # moonshot validator below assumes this is also a meaningful baseline.
+        if not (0 < v < 100):
+            raise ValueError(
+                "PAPER_LADDER_TRAIL_PCT must be in (0, 100); "
+                f"got={v} (0 fires on every tick after peak; >=100 yields negative trail price)"
+            )
+        return v
+
     @field_validator("PAPER_LADDER_LEG_1_QTY_FRAC", "PAPER_LADDER_LEG_2_QTY_FRAC")
     @classmethod
     def _validate_ladder_qty_frac(cls, v: float) -> float:

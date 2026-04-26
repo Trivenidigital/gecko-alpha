@@ -35,33 +35,35 @@ async def _open_trade(db: Database, trader: PaperTrader, *, token_id: str) -> in
 
 @pytest.mark.asyncio
 async def test_arm_moonshot_writes_fields(tmp_path):
-    """First call sets moonshot_armed_at + original_trail_drawdown_pct."""
+    """First call returns the timestamp it wrote and stores the fields."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     trader = PaperTrader()
     trade_id = await _open_trade(db, trader, token_id="t1")
 
-    armed = await trader.arm_moonshot(
+    returned = await trader.arm_moonshot(
         db, trade_id, peak_pct_at_arm=42.0, original_trail_drawdown_pct=12.0
     )
 
-    assert armed is True
+    # Returns the ISO timestamp written to the row — callers use it directly
+    # rather than re-stamping a microsecond-drifted datetime.now().
+    assert isinstance(returned, str)
+    parsed = datetime.fromisoformat(returned)
+    assert parsed.tzinfo is not None
     cur = await db._conn.execute(
         "SELECT moonshot_armed_at, original_trail_drawdown_pct "
         "FROM paper_trades WHERE id = ?",
         (trade_id,),
     )
     armed_at, original_trail = await cur.fetchone()
-    assert armed_at is not None
-    parsed = datetime.fromisoformat(armed_at)
-    assert parsed.tzinfo is not None  # tz-aware ISO format
+    assert armed_at == returned  # exact match — no drift
     assert original_trail == pytest.approx(12.0)
     await db.close()
 
 
 @pytest.mark.asyncio
 async def test_arm_moonshot_idempotent(tmp_path):
-    """Second call returns False without overwriting fields."""
+    """Second call returns None without overwriting fields."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     trader = PaperTrader()
@@ -86,8 +88,8 @@ async def test_arm_moonshot_idempotent(tmp_path):
     )
     second_armed_at, second_trail = await cur.fetchone()
 
-    assert first is True
-    assert second is False
+    assert isinstance(first, str)
+    assert second is None
     # Original timestamp + trail preserved — not overwritten by the second call.
     assert second_armed_at == first_armed_at
     assert second_trail == pytest.approx(12.0)
@@ -95,8 +97,14 @@ async def test_arm_moonshot_idempotent(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_arm_moonshot_race_only_one_wins(tmp_path):
-    """Two concurrent arm_moonshot calls on the same trade — exactly one wins."""
+async def test_arm_moonshot_serialized_idempotency(tmp_path):
+    """Two concurrent arm_moonshot calls — exactly one returns a timestamp,
+    the other returns None.
+
+    Note: aiosqlite serialises queries through a single writer thread, so
+    this test verifies SQL-level WHERE-clause atomicity rather than true
+    OS-thread concurrency. That's still the only guarantee we depend on.
+    """
     db = Database(tmp_path / "t.db")
     await db.initialize()
     trader = PaperTrader()
@@ -111,8 +119,10 @@ async def test_arm_moonshot_race_only_one_wins(tmp_path):
         ),
     )
 
-    assert results.count(True) == 1
-    assert results.count(False) == 1
+    timestamps = [r for r in results if isinstance(r, str)]
+    nones = [r for r in results if r is None]
+    assert len(timestamps) == 1
+    assert len(nones) == 1
     await db.close()
 
 

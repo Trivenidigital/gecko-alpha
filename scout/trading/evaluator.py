@@ -45,6 +45,20 @@ async def _load_bl062_cutover_ts(conn) -> str | None:
     return row[0] if row else None
 
 
+def compute_trail_threshold(peak_price: float, drawdown_pct: float) -> float:
+    """Pure helper: trailing-stop trigger price for a given peak + drawdown.
+
+    Extracted so the formula can be exercised by deterministic table-driven
+    tests independent of the evaluator state machine.
+
+    Invariants (asserted by tests):
+    - Result is always > 0 when peak > 0 and 0 < drawdown < 100.
+    - Result is always < peak_price (trail must trigger below peak).
+    - Widening drawdown monotonically lowers the threshold.
+    """
+    return peak_price * (1 - drawdown_pct / 100.0)
+
+
 def _parse_ts(s: str | None) -> datetime | None:
     """Parse SQLite datetime('now') (space, no tz) or ISO-with-tz into a UTC datetime.
 
@@ -226,30 +240,39 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
 
             if is_bl061:
                 # BL-062 peak-fade checkpoint pct values (may be NULL)
-                cp_6h_pct = row[27] if len(row) > 27 and row[27] is not None else None
-                cp_24h_pct = row[28] if len(row) > 28 and row[28] is not None else None
-                # BL-063 moonshot state (NULL on pre-cutover or not-yet-armed rows).
-                moonshot_armed_at = row[29] if len(row) > 29 else None
+                cp_6h_pct = row[27] if row[27] is not None else None
+                cp_24h_pct = row[28] if row[28] is not None else None
+                # BL-063 moonshot state (NULL on pre-cutover or not-yet-armed
+                # rows). Indexed directly — schema migration guarantees the
+                # column exists; a `len(row)` guard would silently mask schema
+                # drift as "unarmed forever".
+                moonshot_armed_at = row[29]
 
                 # BL-063 moonshot arm — fires once when peak_pct crosses the
                 # threshold. Atomic UPDATE inside arm_moonshot guards against
                 # concurrent ticks. Order matters: arm BEFORE the trail-stop
                 # check below, so the same eval pass that crosses the threshold
-                # uses the widened trail.
+                # uses the widened trail. Note: `tp_disabled` from the spec
+                # was unnecessary because BL-061 ladder rows reach the
+                # `continue` at the end of this block before the legacy
+                # cascade ever consults `tp_price` — the fixed-TP exit path
+                # is structurally unreachable for moonshot-eligible trades.
                 if (
                     settings.PAPER_MOONSHOT_ENABLED
                     and moonshot_armed_at is None
                     and peak_pct is not None
                     and peak_pct >= settings.PAPER_MOONSHOT_THRESHOLD_PCT
                 ):
-                    armed_now = await _trader.arm_moonshot(
+                    armed_ts = await _trader.arm_moonshot(
                         db=db,
                         trade_id=trade_id,
-                        peak_pct_at_arm=peak_pct,
+                        peak_pct_at_arm=float(peak_pct),
                         original_trail_drawdown_pct=settings.PAPER_LADDER_TRAIL_PCT,
                     )
-                    if armed_now:
-                        moonshot_armed_at = datetime.now(timezone.utc).isoformat()
+                    if armed_ts is not None:
+                        # Use the exact DB-written timestamp — avoids the
+                        # microsecond drift of a fresh datetime.now() here.
+                        moonshot_armed_at = armed_ts
 
                 # Effective trail width for this trade: widened if moonshot armed.
                 effective_trail_pct = (
@@ -313,7 +336,9 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     and peak_pct is not None
                     and peak_pct >= settings.PAPER_LADDER_LEG_1_PCT
                 ):
-                    trail_threshold = peak_price * (1 - effective_trail_pct / 100.0)
+                    trail_threshold = compute_trail_threshold(
+                        peak_price, effective_trail_pct
+                    )
                     if current_price < trail_threshold:
                         close_reason = "trailing_stop"
                         close_status = (

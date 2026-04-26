@@ -3,8 +3,25 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, field_validator
+
+# Canonical set of trade status strings accepted by the evaluator + dashboard.
+# Mirrors `scout.trading.paper.CLOSED_COUNTABLE_STATUSES` for the closed set
+# but adds the runtime-only `open` and `closed_manual` / `closed_floor` /
+# `closed_peak_fade` variants that aren't counted in standard rollups.
+TradeStatus = Literal[
+    "open",
+    "closed_tp",
+    "closed_sl",
+    "closed_expired",
+    "closed_trailing_stop",
+    "closed_moonshot_trail",  # BL-063
+    "closed_floor",
+    "closed_peak_fade",
+    "closed_manual",
+]
 
 
 class PaperTrade(BaseModel):
@@ -29,10 +46,7 @@ class PaperTrade(BaseModel):
     tp_price: float
     sl_price: float
 
-    status: str = (
-        "open"  # open, closed_tp, closed_sl, closed_expired, closed_trailing_stop,
-        # closed_moonshot_trail (BL-063), closed_manual
-    )
+    status: TradeStatus = "open"
 
     exit_price: float | None = None
     exit_reason: str | None = None
@@ -56,8 +70,11 @@ class PaperTrade(BaseModel):
 
     # BL-063 moonshot exit upgrade — NULL until peak_pct crosses the
     # moonshot threshold; original_trail snapshot is preserved at arm
-    # time for post-mortem analysis.
-    moonshot_armed_at: datetime | None = None
+    # time for post-mortem analysis. Stored as an ISO-string TEXT in
+    # SQLite and read back as a string by the evaluator (it never
+    # constructs a PaperTrade from the row), so the type matches the
+    # wire shape rather than promising a parsed datetime.
+    moonshot_armed_at: str | None = None
     original_trail_drawdown_pct: float | None = None
 
     @field_validator("sl_pct")

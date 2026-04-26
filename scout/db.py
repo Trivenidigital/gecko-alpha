@@ -958,6 +958,24 @@ class Database:
             if missing:
                 raise RuntimeError(f"Schema migration incomplete: missing {missing}")
 
+            # BL-063 defense-in-depth: confirm the cutover rows are present.
+            # INSERT OR IGNORE above is unconditional, but a future refactor
+            # could regress this; the assertion catches that before commit.
+            cur = await conn.execute(
+                "SELECT name FROM paper_migrations WHERE name IN "
+                "('bl061_ladder', 'bl062_peak_fade', 'bl063_moonshot')"
+            )
+            recorded = {row[0] for row in await cur.fetchall()}
+            missing_migrations = {
+                "bl061_ladder",
+                "bl062_peak_fade",
+                "bl063_moonshot",
+            } - recorded
+            if missing_migrations:
+                raise RuntimeError(
+                    f"paper_migrations missing rows: {missing_migrations}"
+                )
+
             await conn.execute(
                 "INSERT OR IGNORE INTO schema_version (version, applied_at, description) "
                 "VALUES (?, ?, ?)",

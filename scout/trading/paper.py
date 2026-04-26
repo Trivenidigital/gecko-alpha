@@ -175,20 +175,28 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         *,
         peak_pct_at_arm: float,
         original_trail_drawdown_pct: float,
-    ) -> bool:
+    ) -> str | None:
         """Atomically arm moonshot exit on a trade.
 
         Single conditional UPDATE WHERE moonshot_armed_at IS NULL with a
         rowcount check — mirrors the proven `execute_partial_sell` pattern
         for race-safety against concurrent evaluator ticks.
 
-        Returns True if the trade was armed by this call, False if it was
-        already armed (race lost or repeat call).
+        Returns the ISO timestamp written to `moonshot_armed_at` on success
+        so callers use the exact DB value rather than re-stamping a
+        microsecond-drifted `datetime.now()`. Returns None when the trade
+        was already armed (repeat call or race-lost — both look the same
+        after serialization through aiosqlite).
 
         Raises MoonshotArmFailed when the UPDATE matches zero rows AND the
         trade row genuinely doesn't exist (vs the normal already-armed
         case). This distinction prevents silently treating "trade missing"
         as "trade already armed" — a real bug would never surface.
+
+        Race-safety against the verify SELECT relies on paper_trades being
+        append-only (BL-055 enforces this via ON DELETE RESTRICT on
+        live_trades.paper_trade_id). Without the contract a delete between
+        UPDATE and verify could falsely raise MoonshotArmFailed.
         """
         conn = db._conn
         if conn is None:
@@ -209,7 +217,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
                 peak_pct_at_arm=round(float(peak_pct_at_arm), 2),
                 original_trail_drawdown_pct=original_trail_drawdown_pct,
             )
-            return True
+            return now
 
         # rowcount == 0: distinguish "already armed" (normal) from "trade
         # doesn't exist" (bug). One extra round-trip on the cold path; the
@@ -218,11 +226,14 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             "SELECT moonshot_armed_at FROM paper_trades WHERE id = ?",
             (trade_id,),
         )
-        row = await verify.fetchone()
+        try:
+            row = await verify.fetchone()
+        finally:
+            await verify.close()
         if row is None:
             raise MoonshotArmFailed(f"arm_moonshot: trade_id={trade_id} not found")
         log.info("moonshot_arm_skipped_already_armed", trade_id=trade_id)
-        return False
+        return None
 
     async def execute_partial_sell(
         self,
