@@ -21,12 +21,20 @@ from scout.social.telegram.models import (
 log = structlog.get_logger()
 
 
-_SAFETY_BADGE = {
-    (True, True): "✅ verified (GoPlus)",
-    (False, True): "❌ FAILED safety check",
-    (True, False): "⚠️ safety unknown (GoPlus unreachable)",
-    (False, False): "⚠️ safety unknown (GoPlus unreachable)",
-}
+_SAFETY_BADGE_VERIFIED = "✅ verified (GoPlus)"
+_SAFETY_BADGE_FAILED = "❌ FAILED safety check"
+_SAFETY_BADGE_UNKNOWN = "⚠️ safety unknown (GoPlus unreachable)"
+_SAFETY_BADGE_NO_CA = "⊘ no CA — safety check skipped"
+
+
+def _safety_badge(token) -> str:
+    """Pick the right badge so cashtag-only posts don't masquerade as
+    'FAILED safety check' (devil's advocate IMPORTANT #4)."""
+    if getattr(token, "safety_skipped_no_ca", False):
+        return _SAFETY_BADGE_NO_CA
+    if not token.safety_check_completed:
+        return _SAFETY_BADGE_UNKNOWN
+    return _SAFETY_BADGE_VERIFIED if token.safety_pass else _SAFETY_BADGE_FAILED
 
 
 def _fmt_money(v: float | None) -> str:
@@ -71,7 +79,7 @@ def format_resolved_alert(
     Always opens with the [CURATOR SIGNAL — VERIFY BEFORE MANUAL ACTION]
     banner. Closes with an explicit reminder that this is single-source.
     """
-    safety = _SAFETY_BADGE[(token.safety_pass, token.safety_check_completed)]
+    safety = _safety_badge(token)
     cashtag_str = ", ".join(f"${t}" for t in cashtags) if cashtags else "—"
     ca_str = (
         f"{token.chain}, CA: {_shorten_ca(token.contract_address)}"

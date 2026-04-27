@@ -26,6 +26,7 @@ from pathlib import Path
 import structlog
 import yaml
 from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
 
 from scout.config import Settings
 from scout.db import Database
@@ -57,11 +58,33 @@ async def cmd_bootstrap(args, settings: Settings) -> int:
         )
         return 2
 
+    # No-TTY guard — bootstrap is interactive; on a headless VPS it would
+    # silently hang on the first input() (devil's advocate IMPORTANT #7).
+    if not sys.stdin.isatty():
+        print(
+            "ERROR: bootstrap requires an interactive TTY (phone + code + 2FA prompts). "
+            "Run from an interactive shell — e.g. `ssh -t srilu-vps 'cd /root/gecko-alpha && "
+            "uv run python -m scout.social.telegram.cli bootstrap'`.",
+            file=sys.stderr,
+        )
+        return 2
+
     session_path = Path(settings.TG_SOCIAL_SESSION_PATH)
     session_arg = str(session_path).removesuffix(".session")
 
     client = TelegramClient(session_arg, api_id, api_hash)
-    await client.connect()
+    try:
+        await client.connect()
+    except Exception as e:
+        # Corrupt session file produces sqlite3.DatabaseError from Telethon's
+        # session storage. Give the operator a concrete remediation.
+        print(
+            f"ERROR: failed to connect ({type(e).__name__}: {e}). "
+            f"Common cause: corrupt session at {session_path}. "
+            f"Try: rm {session_path} && re-run this command.",
+            file=sys.stderr,
+        )
+        return 3
 
     if await client.is_user_authorized():
         me = await client.get_me()
@@ -82,13 +105,12 @@ async def cmd_bootstrap(args, settings: Settings) -> int:
     code = input("Code from Telegram: ").strip()
     try:
         await client.sign_in(phone=phone, code=code)
-    except Exception as e:
-        # 2FA path
-        if "password" in str(e).lower() or "two-step" in str(e).lower():
-            password = input("2FA password: ").strip()
-            await client.sign_in(password=password)
-        else:
-            raise
+    except SessionPasswordNeededError:
+        # Explicit exception type — locale-independent (Telethon localizes
+        # error messages but this class is constant). Replaces v1's fragile
+        # substring match per silent-failure MEDIUM #9.
+        password = input("2FA password: ").strip()
+        await client.sign_in(password=password)
 
     me = await client.get_me()
     print(
@@ -219,36 +241,67 @@ async def cmd_sync_channels(args, settings: Settings) -> int:
 
 
 async def cmd_replay_dlq(args, settings: Settings) -> int:
-    """Stub for now — implementation deferred to a follow-up; prints DLQ contents."""
+    """Mark DLQ entries as retried (clear them from the unhandled queue).
+
+    The original messages are gone from the live stream — Telethon won't
+    re-deliver them — so "replay" is best-effort cleanup: it lists each
+    pending row and stamps `retried_at` so it disappears from the
+    unhandled-queue view. Operators inspect via `--id N --dry-run` first
+    to see what the error was, then run without `--dry-run` to mark it
+    handled.
+
+    Exit codes:
+      0  — nothing to do (queue empty for the requested filter)
+      1  — N rows were listed/marked
+      2  — error
+    """
     db = Database(settings.DB_PATH)
     await db.initialize()
     try:
         if args.id:
             cur = await db._conn.execute(
-                "SELECT id, channel_handle, msg_id, error_class, error_text, failed_at "
+                "SELECT id, channel_handle, msg_id, error_class, error_text, failed_at, retried_at "
                 "FROM tg_social_dlq WHERE id = ?",
                 (args.id,),
             )
         else:
             cur = await db._conn.execute(
-                "SELECT id, channel_handle, msg_id, error_class, error_text, failed_at "
+                "SELECT id, channel_handle, msg_id, error_class, error_text, failed_at, retried_at "
                 "FROM tg_social_dlq WHERE retried_at IS NULL ORDER BY failed_at"
             )
         rows = await cur.fetchall()
         if not rows:
-            print("(DLQ empty)")
+            print("(DLQ empty for the requested filter)")
             return 0
+
         for row in rows:
+            mark = "retried" if row[6] else "PENDING"
             print(
-                f"id={row[0]} channel={row[1]} msg={row[2]} err={row[3]}: {row[4]} ({row[5]})"
+                f"id={row[0]} [{mark}] channel={row[1]} msg={row[2]} "
+                f"err={row[3]}: {row[4]} ({row[5]})"
             )
-        print(
-            "\n(replay-dlq is currently read-only; the listener auto-recovers most "
-            "errors via UNIQUE constraint on the next live message)"
+
+        if args.dry_run:
+            print(
+                f"\n(dry-run; pass without --dry-run to mark these {len(rows)} as retried)"
+            )
+            return 1
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        ids_to_mark = [row[0] for row in rows if row[6] is None]
+        if not ids_to_mark:
+            print("\n(no PENDING rows to mark)")
+            return 1
+        placeholders = ",".join("?" * len(ids_to_mark))
+        await db._conn.execute(
+            f"UPDATE tg_social_dlq SET retried_at = ? WHERE id IN ({placeholders})",
+            (now_iso, *ids_to_mark),
         )
+        await db._conn.commit()
+        print(f"\n✅ Marked {len(ids_to_mark)} rows as retried_at={now_iso}")
+        return 1
     finally:
         await db.close()
-    return 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -275,8 +328,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("sync-channels", help="Reconcile channels.yml → DB")
 
-    p_dlq = sub.add_parser("replay-dlq", help="Show DLQ entries (replay TBD)")
+    p_dlq = sub.add_parser(
+        "replay-dlq",
+        help="List + mark DLQ entries as retried (best-effort cleanup)",
+    )
     p_dlq.add_argument("--id", type=int, default=None)
+    p_dlq.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List PENDING rows without marking them retried",
+    )
 
     return p
 

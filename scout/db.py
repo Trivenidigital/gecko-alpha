@@ -984,7 +984,12 @@ class Database:
                     alert_sent_at          TEXT,
                     paper_trade_id         INTEGER,
                     created_at             TEXT NOT NULL,
-                    FOREIGN KEY (message_pk) REFERENCES tg_social_messages(id)
+                    FOREIGN KEY (message_pk) REFERENCES tg_social_messages(id),
+                    -- BL-055 contract: paper_trades is append-only; mirror the
+                    -- ON DELETE RESTRICT pattern from live_trades.paper_trade_id
+                    -- so an accidental DELETE on paper_trades cannot orphan
+                    -- tg_social_signals references.
+                    FOREIGN KEY (paper_trade_id) REFERENCES paper_trades(id) ON DELETE RESTRICT
                 )
                 """)
             await conn.execute("""

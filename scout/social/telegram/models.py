@@ -49,9 +49,17 @@ class ParsedMessage(BaseModel):
 
 
 class ResolvedToken(BaseModel):
-    """Output of resolver — token resolved + enriched + safety verdict."""
+    """Output of resolver — token resolved + enriched + safety verdict.
 
-    token_id: str  # CG coin_id when available, else DEX-pair-derived id
+    Safety state is encoded by THREE booleans rather than a 2-bit pair so
+    cashtag-only resolutions don't masquerade as "failed safety check":
+      safety_skipped_no_ca=True → no CA available; gate 2 (no_ca) handles it
+      safety_check_completed=True, safety_pass=True  → verified safe
+      safety_check_completed=True, safety_pass=False → GoPlus said unsafe
+      safety_check_completed=False                   → GoPlus 5xx/timeout
+    """
+
+    token_id: str
     symbol: str
     chain: str | None = None
     contract_address: str | None = None
@@ -61,6 +69,7 @@ class ResolvedToken(BaseModel):
     age_days: float | None = None
     safety_pass: bool = False
     safety_check_completed: bool = False  # FAIL-CLOSED discriminator (BL-063 lesson)
+    safety_skipped_no_ca: bool = False  # cashtag-only — no CA to check
 
 
 class ResolutionResult(BaseModel):

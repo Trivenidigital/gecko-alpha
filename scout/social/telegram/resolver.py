@@ -42,105 +42,127 @@ _CG_PLATFORM = {
 }
 
 
+class _Outcome:
+    """Discriminated resolver-fetch outcome.
+
+    NOT_FOUND     404 — the entity doesn't exist; retry is wasted.
+    TRANSIENT     429/5xx/timeout/network — retry might help.
+    AUTH_ERROR    401/403 — operator action required (revoked key / IP block).
+    OK            2xx with parsed JSON body.
+    """
+
+    OK = "OK"
+    NOT_FOUND = "NOT_FOUND"
+    TRANSIENT = "TRANSIENT"
+    AUTH_ERROR = "AUTH_ERROR"
+
+
 async def _get_json(
     session: aiohttp.ClientSession, url: str, params: dict | None = None
-) -> dict | list | None:
-    """Single GET with explicit error tolerance — caller decides retry semantics."""
+) -> tuple[str, dict | list | None]:
+    """Single GET returning (outcome, body). Caller decides retry semantics
+    based on the outcome rather than guessing from None."""
     try:
         async with session.get(
             url, params=params, timeout=aiohttp.ClientTimeout(total=10)
         ) as resp:
-            if resp.status == 429:
-                log.warning("resolver_rate_limited", url=url)
-                return None
-            if resp.status >= 500:
-                log.warning("resolver_5xx", url=url, status=resp.status)
-                return None
-            if resp.status != 200:
-                # 404 is normal for unresolved CAs — log info, not warning
-                log.info("resolver_non_200", url=url, status=resp.status)
-                return None
-            return await resp.json()
+            if resp.status == 200:
+                return (_Outcome.OK, await resp.json())
+            if resp.status == 404:
+                # Normal for unresolved CAs / unknown tickers
+                log.info("resolver_not_found", url=url)
+                return (_Outcome.NOT_FOUND, None)
+            if resp.status in (401, 403):
+                log.warning("resolver_auth_error", url=url, status=resp.status)
+                return (_Outcome.AUTH_ERROR, None)
+            if resp.status == 429 or resp.status >= 500:
+                log.warning("resolver_transient", url=url, status=resp.status)
+                return (_Outcome.TRANSIENT, None)
+            log.warning("resolver_unexpected_status", url=url, status=resp.status)
+            return (_Outcome.TRANSIENT, None)
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         log.warning("resolver_network_error", url=url, error=str(e))
-        return None
+        return (_Outcome.TRANSIENT, None)
 
 
 async def _resolve_ca_via_cg(
     session: aiohttp.ClientSession, ref: ContractRef
-) -> ResolvedToken | None:
-    """CG by-contract lookup. Returns enriched ResolvedToken or None on miss."""
+) -> tuple[str, ResolvedToken | None]:
+    """CG by-contract lookup. Returns (outcome, token-or-None)."""
     platform = _CG_PLATFORM.get(ref.chain)
     if platform is None:
-        return None
-    data = await _get_json(
+        return (_Outcome.NOT_FOUND, None)
+    outcome, data = await _get_json(
         session, f"{CG_BASE}/coins/{platform}/contract/{ref.address}"
     )
-    if not isinstance(data, dict) or not data.get("id"):
-        return None
+    if outcome != _Outcome.OK or not isinstance(data, dict) or not data.get("id"):
+        return (outcome, None)
     market = data.get("market_data") or {}
-    return ResolvedToken(
-        token_id=data["id"],
-        symbol=str(data.get("symbol") or "").upper(),
-        chain=ref.chain,
-        contract_address=ref.address,
-        mcap=_safe_float(market.get("market_cap", {}).get("usd")),
-        price_usd=_safe_float(market.get("current_price", {}).get("usd")),
-        volume_24h_usd=_safe_float(market.get("total_volume", {}).get("usd")),
-        age_days=None,
+    return (
+        _Outcome.OK,
+        ResolvedToken(
+            token_id=data["id"],
+            symbol=str(data.get("symbol") or "").upper(),
+            chain=ref.chain,
+            contract_address=ref.address,
+            mcap=_safe_float(market.get("market_cap", {}).get("usd")),
+            price_usd=_safe_float(market.get("current_price", {}).get("usd")),
+            volume_24h_usd=_safe_float(market.get("total_volume", {}).get("usd")),
+            age_days=None,
+        ),
     )
 
 
 async def _resolve_ca_via_dexscreener(
     session: aiohttp.ClientSession, ref: ContractRef
-) -> ResolvedToken | None:
-    """DexScreener fallback when CG misses (brand-new pools)."""
-    data = await _get_json(session, f"{DEXSCREENER_BASE}/{ref.address}")
-    if not isinstance(data, dict):
-        return None
+) -> tuple[str, ResolvedToken | None]:
+    """DexScreener fallback when CG misses (brand-new pools). Returns (outcome, token)."""
+    outcome, data = await _get_json(session, f"{DEXSCREENER_BASE}/{ref.address}")
+    if outcome != _Outcome.OK or not isinstance(data, dict):
+        return (outcome, None)
     pairs = data.get("pairs") or []
     if not pairs:
-        return None
-    # Pick the highest-liquidity pair as the canonical source for this token.
+        return (_Outcome.NOT_FOUND, None)
     best = max(pairs, key=lambda p: _safe_float(p.get("liquidity", {}).get("usd")) or 0)
     base = best.get("baseToken") or {}
-    return ResolvedToken(
-        token_id=f"dex:{ref.chain}:{ref.address}",  # synthetic id when CG misses
-        symbol=str(base.get("symbol") or "").upper(),
-        chain=ref.chain,
-        contract_address=ref.address,
-        mcap=_safe_float(best.get("fdv")) or _safe_float(best.get("marketCap")),
-        price_usd=_safe_float(best.get("priceUsd")),
-        volume_24h_usd=_safe_float((best.get("volume") or {}).get("h24")),
-        age_days=None,
+    return (
+        _Outcome.OK,
+        ResolvedToken(
+            token_id=f"dex:{ref.chain}:{ref.address}",
+            symbol=str(base.get("symbol") or "").upper(),
+            chain=ref.chain,
+            contract_address=ref.address,
+            mcap=_safe_float(best.get("fdv")) or _safe_float(best.get("marketCap")),
+            price_usd=_safe_float(best.get("priceUsd")),
+            volume_24h_usd=_safe_float((best.get("volume") or {}).get("h24")),
+            age_days=None,
+        ),
     )
 
 
 async def _resolve_ticker_top3(
     session: aiohttp.ClientSession, ticker: str
-) -> list[ResolvedToken]:
-    """CG search by ticker, return top-3 by mcap. Used for cashtag-only posts.
-
-    Cashtag-only resolution NEVER triggers a paper trade (gate 2 in
-    dispatcher); we surface candidates so the operator can verify.
-    """
-    data = await _get_json(session, f"{CG_BASE}/search", params={"query": ticker})
-    if not isinstance(data, dict):
-        return []
+) -> tuple[str, list[ResolvedToken]]:
+    """CG search by ticker, return (outcome, top-3 by mcap). Cashtag-only
+    resolution NEVER triggers a paper trade (gate 2 in dispatcher)."""
+    outcome, data = await _get_json(
+        session, f"{CG_BASE}/search", params={"query": ticker}
+    )
+    if outcome != _Outcome.OK or not isinstance(data, dict):
+        return (outcome, [])
     coins = (data.get("coins") or [])[:10]
     if not coins:
-        return []
-    # /search doesn't include mcap, so do a follow-up /coins/markets
+        return (_Outcome.NOT_FOUND, [])
     ids = ",".join(c["id"] for c in coins if c.get("id"))
     if not ids:
-        return []
-    market = await _get_json(
+        return (_Outcome.NOT_FOUND, [])
+    outcome2, market = await _get_json(
         session,
         f"{CG_BASE}/coins/markets",
         params={"vs_currency": "usd", "ids": ids, "per_page": "10"},
     )
-    if not isinstance(market, list):
-        return []
+    if outcome2 != _Outcome.OK or not isinstance(market, list):
+        return (outcome2, [])
     market.sort(key=lambda m: m.get("market_cap") or 0, reverse=True)
     out: list[ResolvedToken] = []
     for m in market[:3]:
@@ -148,7 +170,7 @@ async def _resolve_ticker_top3(
             ResolvedToken(
                 token_id=m["id"],
                 symbol=str(m.get("symbol") or "").upper(),
-                chain=None,  # cross-chain ticker — chain unknown here
+                chain=None,
                 contract_address=None,
                 mcap=_safe_float(m.get("market_cap")),
                 price_usd=_safe_float(m.get("current_price")),
@@ -156,7 +178,7 @@ async def _resolve_ticker_top3(
                 age_days=None,
             )
         )
-    return out
+    return (_Outcome.OK, out)
 
 
 def _safe_float(v) -> float | None:
@@ -174,12 +196,17 @@ def _safe_float(v) -> float | None:
 async def _check_safety(
     session: aiohttp.ClientSession, token: ResolvedToken
 ) -> ResolvedToken:
-    """Mutate-and-return: stamp safety_pass + safety_check_completed on the token."""
+    """Mutate-and-return: stamp safety_skipped_no_ca / safety_pass / completed.
+
+    Cashtag-only resolutions (no CA) get safety_skipped_no_ca=True, which the
+    alerter renders as a distinct badge ("⊘ no CA — check skipped") instead
+    of the misleading "❌ FAILED safety check". Dispatcher gate 2 (no_ca)
+    rejects them before gate 4 (safety) is consulted, so behaviour is
+    unchanged; only the alert text becomes truthful.
+    """
     if not token.contract_address or not token.chain:
-        # Cashtag-only resolutions can't be safety-checked; treat as completed=True
-        # but pass=False so the dispatcher's gate 4 keeps it alert-only. Combined
-        # with gate 2 (CA-required) this never reaches a trade either way.
-        token.safety_check_completed = True
+        token.safety_skipped_no_ca = True
+        token.safety_check_completed = False
         token.safety_pass = False
         return token
     is_safe, completed = await is_safe_strict(
@@ -215,45 +242,52 @@ async def resolve_and_enrich(
 
     if contracts:
         resolved: list[ResolvedToken] = []
+        any_transient = False
         for ref in contracts:
-            tok = await _resolve_ca_via_cg(session, ref)
+            outcome, tok = await _resolve_ca_via_cg(session, ref)
+            if outcome == _Outcome.TRANSIENT:
+                any_transient = True
             if tok is None:
-                tok = await _resolve_ca_via_dexscreener(session, ref)
+                outcome2, tok = await _resolve_ca_via_dexscreener(session, ref)
+                if outcome2 == _Outcome.TRANSIENT:
+                    any_transient = True
             if tok is not None:
                 tok = await _check_safety(session, tok)
                 resolved.append(tok)
         if resolved:
             return ResolutionResult(state=ResolutionState.RESOLVED, tokens=resolved)
-        # No contracts resolved — transient on first try, terminal on retry
+        # No contracts resolved — only retry on transient (404 won't change next minute)
+        if any_transient and not is_retry:
+            return ResolutionResult(
+                state=ResolutionState.UNRESOLVED_TRANSIENT,
+                tokens=[],
+                error_text=f"transient miss on contracts: {[r.address for r in contracts]}",
+            )
         return ResolutionResult(
-            state=(
-                ResolutionState.UNRESOLVED_TERMINAL
-                if is_retry
-                else ResolutionState.UNRESOLVED_TRANSIENT
-            ),
+            state=ResolutionState.UNRESOLVED_TERMINAL,
             tokens=[],
             error_text=f"no resolution for contracts: {[r.address for r in contracts]}",
         )
 
     if cashtags:
-        # Cashtag-only path — surface top-3 candidates per ticker; first ticker only.
-        # Multi-cashtag posts are rare; tally rule lives in dispatcher if needed.
         first = cashtags[0]
-        candidates = await _resolve_ticker_top3(session, first)
+        outcome, candidates = await _resolve_ticker_top3(session, first)
         if candidates:
             for c in candidates:
                 await _check_safety(session, c)
             return ResolutionResult(
                 state=ResolutionState.RESOLVED,
-                tokens=[],  # ticker-only never trade-eligible
+                tokens=[],
                 candidates_top3=candidates,
             )
+        if outcome == _Outcome.TRANSIENT and not is_retry:
+            return ResolutionResult(
+                state=ResolutionState.UNRESOLVED_TRANSIENT,
+                tokens=[],
+                error_text=f"transient miss on cashtag '{first}'",
+            )
         return ResolutionResult(
-            state=(
-                ResolutionState.UNRESOLVED_TERMINAL
-                if is_retry
-                else ResolutionState.UNRESOLVED_TRANSIENT
-            ),
+            state=ResolutionState.UNRESOLVED_TERMINAL,
             tokens=[],
             error_text=f"no CG search match for cashtag '{first}'",
         )

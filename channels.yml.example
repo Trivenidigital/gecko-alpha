@@ -1,0 +1,28 @@
+# BL-064 — TG social-signal channels (template)
+#
+# Copy to channels.yml (or whatever TG_SOCIAL_CHANNELS_FILE points at)
+# and edit the entries. Run `python -m scout.social.telegram.cli sync-channels`
+# to push to the tg_social_channels table.
+#
+# Notes:
+# - `handle` must be a public @username; for private channels you'll need to
+#   add the bot manually via TG and use the numeric -100... id instead.
+# - `display_name` is operator-friendly text for alert provenance.
+# - `trade_eligible: false` makes the channel alert-only (no paper trades).
+# - Removing an entry from this file does NOT auto-tombstone the DB row;
+#   use `cli remove @handle` for that. Sync is additive + reactivating only.
+#   This is intentional — DB-side toggles via `cli set-trade` persist across
+#   yaml syncs.
+
+channels:
+  - handle: "@gem_detecter"
+    display_name: "Gem Detector"
+    trade_eligible: true
+
+  - handle: "@example_alerts"
+    display_name: "Example Alerts"
+    trade_eligible: false  # alert-only
+
+  # - handle: "@your_third_channel"
+  #   display_name: "Third Channel"
+  #   trade_eligible: true

@@ -138,13 +138,14 @@ async def dispatch_to_engine(
     engine: TradingEngine,
     token: ResolvedToken,
     channel_handle: str,
-) -> int | None:
-    """Execute admission then call TradingEngine.open_trade. Returns paper_trade_id
-    on dispatch, None if any TG-only gate or engine-side gate rejected.
+) -> tuple[int | None, str | None]:
+    """Execute admission then call TradingEngine.open_trade. Returns
+    (paper_trade_id, blocked_gate) — the gate name is captured FROM THE
+    SAME evaluate() call that decided rejection, eliminating the TOCTOU
+    race the previous double-evaluate created (silent-failure HIGH#4).
 
-    Engine-side rejections (warmup, global max-open, exposure, mcap caps, junk
-    filter, per-signal-type cooldown) are logged by the engine itself; we log
-    the TG-only gate rejections here for symmetry.
+    On engine-side rejection the gate is reported as 'engine_*' so the
+    operator can correlate with the engine's own log line.
     """
     decision = await evaluate(
         db=db, settings=settings, token=token, channel_handle=channel_handle
@@ -158,7 +159,7 @@ async def dispatch_to_engine(
             gate_name=decision.blocked_gate,
             reason=decision.reason,
         )
-        return None
+        return (None, decision.blocked_gate)
 
     trade_id = await engine.open_trade(
         token_id=token.token_id,
@@ -184,13 +185,15 @@ async def dispatch_to_engine(
             amount_usd=settings.PAPER_TG_SOCIAL_TRADE_AMOUNT_USD,
             channel_handle=channel_handle,
         )
-    else:
-        # Engine-side gate rejected; engine already logged the specific reason.
-        log.info(
-            "tg_social_admission_blocked_engine",
-            token_id=token.token_id,
-            symbol=token.symbol,
-            channel_handle=channel_handle,
-            note="see engine log for specific gate (warmup/quota/exposure/mcap/junk/cooldown)",
-        )
-    return trade_id
+        return (trade_id, None)
+
+    # Engine-side gate rejected; engine logs the specific reason. We tag
+    # generically so the alerter can render "blocked by engine".
+    log.info(
+        "tg_social_admission_blocked_engine",
+        token_id=token.token_id,
+        symbol=token.symbol,
+        channel_handle=channel_handle,
+        note="see engine log for specific gate (warmup/quota/exposure/mcap/junk/cooldown)",
+    )
+    return (None, "engine_rejected")
