@@ -32,16 +32,24 @@ _URL_RE = re.compile(r"https?://[^\s<>\")]+", re.IGNORECASE)
 # Birdeye:      https://birdeye.so/token/<address>?chain=solana
 # Photon:       https://photon-sol.tinyastro.io/en/lp/<lp>
 # We don't try to invert pair→token here — that's the resolver's job.
-_DEX_HOSTS = {
-    "dexscreener.com",
-    "www.dexscreener.com",
-    "birdeye.so",
-    "www.birdeye.so",
-    "photon-sol.tinyastro.io",
-    "solscan.io",
-    "etherscan.io",
-    "basescan.org",
+_DEX_HOST_CHAIN: dict[str, str | None] = {
+    # None = chain inferred from URL path (dexscreener) or query (birdeye)
+    "dexscreener.com": None,
+    "www.dexscreener.com": None,
+    "birdeye.so": None,
+    "www.birdeye.so": None,
+    "photon-sol.tinyastro.io": "solana",
+    "solscan.io": "solana",
+    "etherscan.io": "ethereum",
+    "basescan.org": "base",
+    "polygonscan.com": "polygon",
+    "arbiscan.io": "arbitrum",
+    "optimistic.etherscan.io": "optimism",
+    "bscscan.com": "bsc",
+    "snowtrace.io": "avalanche",
+    "ftmscan.com": "fantom",
 }
+_DEX_HOSTS = set(_DEX_HOST_CHAIN.keys())
 
 
 def _classify_chain(address: str) -> str | None:
@@ -97,7 +105,10 @@ def parse_message(text: str | None) -> ParsedMessage:
         ref = ContractRef(chain=chain, address=addr)
         contracts[ref.normalized] = ref
 
-    # URL-embedded CAs — pull CAs out of dex/explorer URL paths.
+    # URL-embedded CAs — pull CAs out of dex/explorer URL paths. The host
+    # provides a stronger chain attribution than the address-shape heuristic
+    # (e.g., basescan.org → 'base' instead of the parser default 'ethereum').
+    # Closes round-2 Low #4.
     for url in urls:
         try:
             parsed = urlparse(url)
@@ -105,13 +116,22 @@ def parse_message(text: str | None) -> ParsedMessage:
             continue
         if parsed.hostname not in _DEX_HOSTS:
             continue
+        host_chain = _DEX_HOST_CHAIN.get(parsed.hostname)
         path_parts = [p for p in parsed.path.split("/") if p]
+        # DexScreener / Birdeye encode the chain in the path or query.
+        if (
+            host_chain is None
+            and parsed.hostname in ("dexscreener.com", "www.dexscreener.com")
+            and path_parts
+        ):
+            # dexscreener.com/<chain>/<address>
+            host_chain = path_parts[0]
         for part in path_parts:
             for re_ in (_EVM_RE, _SOLANA_RE):
                 m = re_.search(part)
                 if m:
                     addr = m.group(0)
-                    chain = _classify_chain(addr) or "solana"
+                    chain = host_chain or _classify_chain(addr) or "solana"
                     ref = ContractRef(chain=chain, address=addr)
                     contracts.setdefault(ref.normalized, ref)
 

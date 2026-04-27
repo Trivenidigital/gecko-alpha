@@ -83,11 +83,27 @@ class ResolutionResult(BaseModel):
     error_text: str | None = None
 
 
+BlockedGate = Literal[
+    "no_ca",
+    "safety_unknown",
+    "safety_failed",
+    "channel_disabled",
+    "dedup_open",
+    "tg_social_quota",
+    "engine_rejected",
+]
+
+
 class AdmissionDecision(BaseModel):
-    """Output of dispatcher gates — captures why a trade did/didn't dispatch."""
+    """Output of dispatcher gates — captures why a trade did/didn't dispatch.
+
+    `blocked_gate` is a Literal so mypy + alerter can exhaustively narrow
+    the badge rendering. Mirrors the BL-063 TradeStatus pattern (round-2
+    Low #7).
+    """
 
     dispatch_trade: bool
-    blocked_gate: str | None = None  # 'dedup_open', 'no_ca', 'channel_disabled', etc.
+    blocked_gate: BlockedGate | None = None
     reason: str | None = None
 
 

@@ -43,7 +43,9 @@ def test_cashtag_skips_dollar_amounts():
 
 
 def test_solana_contract_extraction():
-    text = "Someone asked me to look at $RIV: 2bpT3ksMdwdZ6DuHyq3FDUr7HDwvZ5DRZoT1fUPALJaH"
+    text = (
+        "Someone asked me to look at $RIV: 2bpT3ksMdwdZ6DuHyq3FDUr7HDwvZ5DRZoT1fUPALJaH"
+    )
     p = parse_message(text)
     assert p.cashtags == ["RIV"]
     assert len(p.contracts) == 1
@@ -68,18 +70,23 @@ def test_contract_dedup_within_message():
 
 
 def test_dexscreener_url_extracts_ca():
-    text = (
-        "$RIV chart: https://dexscreener.com/solana/2bpT3ksMdwdZ6DuHyq3FDUr7HDwvZ5DRZoT1fUPALJaH"
-    )
+    text = "$RIV chart: https://dexscreener.com/solana/2bpT3ksMdwdZ6DuHyq3FDUr7HDwvZ5DRZoT1fUPALJaH"
     p = parse_message(text)
-    assert "https://dexscreener.com/solana/2bpT3ksMdwdZ6DuHyq3FDUr7HDwvZ5DRZoT1fUPALJaH" in p.urls
-    assert any(c.address == "2bpT3ksMdwdZ6DuHyq3FDUr7HDwvZ5DRZoT1fUPALJaH" for c in p.contracts)
+    assert (
+        "https://dexscreener.com/solana/2bpT3ksMdwdZ6DuHyq3FDUr7HDwvZ5DRZoT1fUPALJaH"
+        in p.urls
+    )
+    assert any(
+        c.address == "2bpT3ksMdwdZ6DuHyq3FDUr7HDwvZ5DRZoT1fUPALJaH" for c in p.contracts
+    )
 
 
 def test_birdeye_url_extracts_ca():
     text = "https://birdeye.so/token/2bpT3ksMdwdZ6DuHyq3FDUr7HDwvZ5DRZoT1fUPALJaH?chain=solana"
     p = parse_message(text)
-    assert any(c.address == "2bpT3ksMdwdZ6DuHyq3FDUr7HDwvZ5DRZoT1fUPALJaH" for c in p.contracts)
+    assert any(
+        c.address == "2bpT3ksMdwdZ6DuHyq3FDUr7HDwvZ5DRZoT1fUPALJaH" for c in p.contracts
+    )
 
 
 def test_multi_token_message():

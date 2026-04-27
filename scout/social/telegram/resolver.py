@@ -13,6 +13,7 @@ from a terminal miss (alert-only forever).
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import Iterable
 
 import aiohttp
@@ -116,7 +117,14 @@ async def _resolve_ca_via_cg(
 async def _resolve_ca_via_dexscreener(
     session: aiohttp.ClientSession, ref: ContractRef
 ) -> tuple[str, ResolvedToken | None]:
-    """DexScreener fallback when CG misses (brand-new pools). Returns (outcome, token)."""
+    """DexScreener fallback when CG misses (brand-new pools). Returns (outcome, token).
+
+    DexScreener returns the canonical chainId per pair. We RE-ATTRIBUTE the
+    token's chain from this field rather than trusting the parser's default
+    "ethereum" for any 0x+40-hex string — closes round-2-review Medium #2
+    (Optimism/BSC/Avalanche CAs were silently going to is_safe_strict with
+    chain="ethereum", returning wrong verdicts).
+    """
     outcome, data = await _get_json(session, f"{DEXSCREENER_BASE}/{ref.address}")
     if outcome != _Outcome.OK or not isinstance(data, dict):
         return (outcome, None)
@@ -125,12 +133,15 @@ async def _resolve_ca_via_dexscreener(
         return (_Outcome.NOT_FOUND, None)
     best = max(pairs, key=lambda p: _safe_float(p.get("liquidity", {}).get("usd")) or 0)
     base = best.get("baseToken") or {}
+    # Re-attribute chain from DexScreener's chainId. Defaults to parser's
+    # original tag if the field is missing.
+    canonical_chain = best.get("chainId") or ref.chain
     return (
         _Outcome.OK,
         ResolvedToken(
-            token_id=f"dex:{ref.chain}:{ref.address}",
+            token_id=f"dex:{canonical_chain}:{ref.address}",
             symbol=str(base.get("symbol") or "").upper(),
-            chain=ref.chain,
+            chain=canonical_chain,
             contract_address=ref.address,
             mcap=_safe_float(best.get("fdv")) or _safe_float(best.get("marketCap")),
             price_usd=_safe_float(best.get("priceUsd")),
@@ -186,7 +197,7 @@ def _safe_float(v) -> float | None:
         return None
     try:
         f = float(v)
-        if f != f:  # NaN
+        if math.isnan(f):
             return None
         return f
     except (TypeError, ValueError):

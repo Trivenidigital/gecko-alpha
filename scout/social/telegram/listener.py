@@ -24,7 +24,6 @@ from telethon.errors import (
     FloodWaitError,
 )
 
-from scout.alerter import send_telegram
 from scout.config import Settings
 from scout.db import Database
 from scout.social.telegram.alerter import (
@@ -45,6 +44,36 @@ from scout.social.telegram.resolver import resolve_and_enrich
 from scout.trading.engine import TradingEngine
 
 log = structlog.get_logger()
+
+
+async def send_telegram(
+    session: aiohttp.ClientSession,
+    bot_token: str,
+    chat_id: str,
+    body: str,
+) -> None:
+    """Send a plain-text message to Telegram. Local helper so the listener
+    can pass bot_token/chat_id explicitly (testability) without depending on
+    `scout.alerter.send_telegram_message` which takes a Settings object.
+    """
+    if not bot_token or not chat_id:
+        log.warning("tg_social_send_telegram_missing_creds")
+        return
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": body[:4096]}
+    try:
+        async with session.post(
+            url, json=payload, timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            if resp.status != 200:
+                txt = await resp.text()
+                log.warning(
+                    "tg_social_send_telegram_failed",
+                    status=resp.status,
+                    body=txt[:200],
+                )
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        log.warning("tg_social_send_telegram_error", error=str(e))
 
 
 _WATERMARK_LOCKS: dict[str, asyncio.Lock] = {}
@@ -331,9 +360,25 @@ async def _persist_message_with_watermark(
                 )
                 message_pk = cur.lastrowid
             except aiosqlite.IntegrityError as e:
-                # Specifically check for the UNIQUE(channel_handle, msg_id)
-                # conflict; any other IntegrityError (FK, NOT NULL) propagates.
-                if "tg_social_messages" in str(e) and "UNIQUE" in str(e).upper():
+                # Specifically check for UNIQUE(channel_handle, msg_id) on the
+                # messages table; other IntegrityErrors (FK, NOT NULL, UNIQUE
+                # on a different table) propagate. Use sqlite_errorname when
+                # available (Python 3.11+) instead of the fragile substring
+                # match flagged in round-2 Medium #1 — error messages can
+                # change across SQLite versions.
+                err_name = getattr(e, "sqlite_errorname", None)
+                # aiosqlite wraps sqlite3.IntegrityError; the underlying may
+                # surface via __cause__ on older versions.
+                if err_name is None and e.__cause__ is not None:
+                    err_name = getattr(e.__cause__, "sqlite_errorname", None)
+                is_unique_violation = err_name == "SQLITE_CONSTRAINT_UNIQUE"
+                # Fallback for Python < 3.11 / aiosqlite versions without the
+                # attribute: scope the substring match to the messages table.
+                if err_name is None:
+                    is_unique_violation = (
+                        "tg_social_messages" in str(e) and "UNIQUE" in str(e).upper()
+                    )
+                if is_unique_violation:
                     await conn.execute("ROLLBACK")
                     log.info(
                         "tg_social_message_duplicate_skipped",
@@ -480,11 +525,30 @@ async def handle_new_message(
     if getattr(chat, "username", None):
         channel_handle = f"@{chat.username}"
     elif getattr(chat, "id", None) is not None:
-        # Telethon supergroup ids are already raw; build the t.me-compatible
-        # form. For private groups, str(id) suffices for our DB key.
         chat_id = chat.id
-        # Negative ids (supergroups) come prefixed; positive ids are users.
-        channel_handle = f"-100{chat_id}" if chat_id > 0 else str(chat_id)
+        # Telethon: negative ids = supergroups/channels (broadcast use case);
+        # positive ids = users (DMs). User DMs should not reach this handler
+        # (events.NewMessage(chats=channels) restricts at attach time), but if
+        # one does, DLQ it instead of synthesizing a bogus `-100<positive>`
+        # handle that would never round-trip back to Telegram. Round-2 Low #6.
+        if chat_id > 0:
+            log.warning(
+                "tg_social_unsupported_chat_type_user_dm",
+                msg_id=getattr(msg, "id", None),
+                chat_id=chat_id,
+            )
+            await _append_dlq(
+                db,
+                f"user:{chat_id}",
+                getattr(msg, "id", None) or 0,
+                getattr(msg, "message", None) or getattr(msg, "text", None),
+                ValueError(
+                    f"unsupported chat type: user DM (id={chat_id}); "
+                    f"events.NewMessage(chats=...) should have filtered this"
+                ),
+            )
+            return
+        channel_handle = str(chat_id)
     else:
         log.warning("tg_social_message_no_chat_id", msg_id=getattr(msg, "id", None))
         await _append_dlq(
@@ -724,7 +788,8 @@ async def _catchup_channel(
             telegram_bot_token,
             telegram_chat_id,
             f"⚠️ tg_social: catchup hit limit ({settings.TG_SOCIAL_CATCHUP_LIMIT}) on "
-            f"{channel_handle} — N messages may have been missed.",
+            f"{channel_handle} — additional messages older than "
+            f"min_id={last_seen} may have been missed.",
         )
 
 
@@ -912,6 +977,28 @@ async def run_listener(
         silence_task.cancel()
 
 
+def _next_silence_alert_due_hours(
+    last_alerted_at_hours: float, threshold_hours: int
+) -> float:
+    """Exponential-then-linear backoff schedule for silence alerts.
+
+    Closes round-2 Medium #3: a 7-day outage at default 1h check + 72h
+    threshold previously produced 168 alerts. New schedule fires at:
+        threshold, 1.5×, 2×, 3×, 4× threshold,
+        then every max(threshold, 24h) past that.
+
+    Returns the elapsed-hours threshold at which the NEXT alert should fire.
+    Caller compares current elapsed against this.
+    """
+    milestones = [1.0, 1.5, 2.0, 3.0, 4.0]
+    for m in milestones:
+        if last_alerted_at_hours < threshold_hours * m:
+            return threshold_hours * m
+    floor_hours = max(threshold_hours, 24)
+    fired_extra = int((last_alerted_at_hours - threshold_hours * 4) / floor_hours)
+    return threshold_hours * 4 + (fired_extra + 1) * floor_hours
+
+
 async def _emit_silence_alerts(
     db: Database,
     http_session: aiohttp.ClientSession,
@@ -919,44 +1006,62 @@ async def _emit_silence_alerts(
     telegram_bot_token: str,
     telegram_chat_id: str,
 ) -> None:
-    """Per-channel silence check. Emits one Telegram alert per silent channel
-    until activity resumes. State is implicit in tg_social_health.last_message_at
-    so we don't need a separate 'last alert sent' table; the alert fires every
-    _CHECK_INTERVAL_SEC while the channel remains silent — which is the right
-    operator behaviour (a silent channel is a continuing problem).
+    """Per-channel silence check with exponential-then-linear backoff.
+
+    Stamps `tg_social_health.detail` with the elapsed-hours of the most
+    recent alert so subsequent runs know whether to fire again. Closes
+    round-2 Medium #3 (alert flood — was every check_interval forever).
     """
-    threshold_seconds = settings.TG_SOCIAL_CHANNEL_SILENCE_ALERT_HOURS * 3600
+    threshold_hours = settings.TG_SOCIAL_CHANNEL_SILENCE_ALERT_HOURS
     cur = await db._conn.execute(
-        """SELECT component, last_message_at FROM tg_social_health
+        """SELECT component, last_message_at, detail FROM tg_social_health
            WHERE component LIKE 'channel:%' AND last_message_at IS NOT NULL"""
     )
     rows = await cur.fetchall()
     now = datetime.now(timezone.utc)
-    for component, last_at_str in rows:
+    for component, last_at_str, detail in rows:
         try:
             last_at = datetime.fromisoformat(last_at_str)
             if last_at.tzinfo is None:
                 last_at = last_at.replace(tzinfo=timezone.utc)
         except (ValueError, TypeError):
             continue
-        elapsed = (now - last_at).total_seconds()
-        if elapsed >= threshold_seconds:
-            channel = component.removeprefix("channel:")
-            log.warning(
-                "tg_social_channel_silenced",
-                channel_handle=channel,
-                last_message_at=last_at_str,
-                silence_hours=round(elapsed / 3600, 1),
-            )
+        elapsed_hours = (now - last_at).total_seconds() / 3600
+        if elapsed_hours < threshold_hours:
+            continue
+        # Decode last-alerted-at-hours from `detail` field; format
+        # "silence_alert_at:{hours}". Absent/malformed → 0 (so the first
+        # alert fires at the threshold milestone).
+        last_alerted = 0.0
+        if detail and detail.startswith("silence_alert_at:"):
             try:
-                await send_telegram(
-                    http_session,
-                    telegram_bot_token,
-                    telegram_chat_id,
-                    f"⚠️ tg_social: no messages from {channel} in "
-                    f"{round(elapsed / 3600, 1)}h "
-                    f"(threshold {settings.TG_SOCIAL_CHANNEL_SILENCE_ALERT_HOURS}h). "
-                    f"Check channel access.",
-                )
-            except Exception:
-                log.warning("tg_social_silence_alert_send_failed", channel=channel)
+                last_alerted = float(detail.split(":", 1)[1])
+            except (IndexError, ValueError):
+                last_alerted = 0.0
+        next_due = _next_silence_alert_due_hours(last_alerted, threshold_hours)
+        if elapsed_hours < next_due:
+            continue
+        channel = component.removeprefix("channel:")
+        log.warning(
+            "tg_social_channel_silenced",
+            channel_handle=channel,
+            last_message_at=last_at_str,
+            silence_hours=round(elapsed_hours, 1),
+        )
+        try:
+            await send_telegram(
+                http_session,
+                telegram_bot_token,
+                telegram_chat_id,
+                f"⚠️ tg_social: no messages from {channel} in "
+                f"{round(elapsed_hours, 1)}h "
+                f"(threshold {threshold_hours}h). Check channel access.",
+            )
+        except Exception:
+            log.warning("tg_social_silence_alert_send_failed", channel=channel)
+            continue
+        await db._conn.execute(
+            "UPDATE tg_social_health SET detail = ? WHERE component = ?",
+            (f"silence_alert_at:{round(elapsed_hours, 1)}", component),
+        )
+        await db._conn.commit()

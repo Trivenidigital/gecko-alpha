@@ -9,10 +9,12 @@
 #   add the bot manually via TG and use the numeric -100... id instead.
 # - `display_name` is operator-friendly text for alert provenance.
 # - `trade_eligible: false` makes the channel alert-only (no paper trades).
-# - Removing an entry from this file does NOT auto-tombstone the DB row;
-#   use `cli remove @handle` for that. Sync is additive + reactivating only.
-#   This is intentional — DB-side toggles via `cli set-trade` persist across
-#   yaml syncs.
+# - DELETION ASYMMETRY: removing an entry from this file does NOT
+#   auto-tombstone the DB row. Use `cli remove @handle` for that. Sync is
+#   additive + reactivating only. This is intentional — DB-side toggles
+#   via `cli set-trade` persist across yaml syncs (operator-side overrides
+#   shouldn't be wiped by a yaml git-revert).
+#   Round-2 Low #8: spelled out here so the runbook can reference it.
 
 channels:
   - handle: "@gem_detecter"
