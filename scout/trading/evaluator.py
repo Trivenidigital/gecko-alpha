@@ -45,6 +45,20 @@ async def _load_bl062_cutover_ts(conn) -> str | None:
     return row[0] if row else None
 
 
+def compute_trail_threshold(peak_price: float, drawdown_pct: float) -> float:
+    """Pure helper: trailing-stop trigger price for a given peak + drawdown.
+
+    Extracted so the formula can be exercised by deterministic table-driven
+    tests independent of the evaluator state machine.
+
+    Invariants (asserted by tests):
+    - Result is always > 0 when peak > 0 and 0 < drawdown < 100.
+    - Result is always < peak_price (trail must trigger below peak).
+    - Widening drawdown monotonically lowers the threshold.
+    """
+    return peak_price * (1 - drawdown_pct / 100.0)
+
+
 def _parse_ts(s: str | None) -> datetime | None:
     """Parse SQLite datetime('now') (space, no tz) or ISO-with-tz into a UTC datetime.
 
@@ -74,7 +88,11 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
     if conn is None:
         raise RuntimeError("Database not initialized.")
 
-    # 1. Get all open trades
+    # 1. Get all open trades. Rows are unpacked positionally; column order
+    # below maps to row[0]..row[29]. `original_trail_drawdown_pct` is
+    # intentionally NOT selected — it is written at arm time for post-mortem
+    # queries on closed trades but is never consumed on the evaluator hot
+    # path; pulling it here would just bloat each pass.
     cursor = await conn.execute("""SELECT id, token_id, entry_price, opened_at,
                   tp_price, sl_price, tp_pct, sl_pct,
                   checkpoint_1h_price, checkpoint_6h_price,
@@ -83,7 +101,8 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                   amount_usd, quantity, signal_type,
                   created_at, leg_1_filled_at, leg_2_filled_at,
                   remaining_qty, floor_armed, realized_pnl_usd,
-                  checkpoint_6h_pct, checkpoint_24h_pct
+                  checkpoint_6h_pct, checkpoint_24h_pct,
+                  moonshot_armed_at
            FROM paper_trades
            WHERE status = 'open'""")
     rows = await cursor.fetchall()
@@ -201,8 +220,12 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             created_at_str = row[21] if len(row) > 21 else None
             leg_1_filled = row[22] if len(row) > 22 else None
             leg_2_filled = row[23] if len(row) > 23 else None
-            remaining_qty = float(row[24]) if len(row) > 24 and row[24] is not None else None
-            floor_armed = bool(row[25]) if len(row) > 25 and row[25] is not None else False
+            remaining_qty = (
+                float(row[24]) if len(row) > 24 and row[24] is not None else None
+            )
+            floor_armed = (
+                bool(row[25]) if len(row) > 25 and row[25] is not None else False
+            )
 
             # BL-061 eligibility via datetime compare: SQLite datetime('now')
             # has second precision; cutover_ts has microsecond. Truncate cutover
@@ -221,21 +244,73 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
 
             if is_bl061:
                 # BL-062 peak-fade checkpoint pct values (may be NULL)
-                cp_6h_pct = row[27] if len(row) > 27 and row[27] is not None else None
-                cp_24h_pct = row[28] if len(row) > 28 and row[28] is not None else None
+                cp_6h_pct = row[27] if row[27] is not None else None
+                cp_24h_pct = row[28] if row[28] is not None else None
+                # BL-063 moonshot state (NULL on pre-cutover or not-yet-armed
+                # rows). Indexed directly — schema migration guarantees the
+                # column exists; a `len(row)` guard would silently mask schema
+                # drift as "unarmed forever".
+                moonshot_armed_at = row[29]
+
+                # BL-063 moonshot arm — fires once when peak_pct crosses the
+                # threshold. Atomic UPDATE inside arm_moonshot guards against
+                # concurrent ticks. Order matters: arm BEFORE the trail-stop
+                # check below, so the same eval pass that crosses the threshold
+                # uses the widened trail. Note: `tp_disabled` from the spec
+                # was unnecessary because BL-061 ladder rows reach the
+                # `continue` at the end of this block before the legacy
+                # cascade ever consults `tp_price` — the fixed-TP exit path
+                # is structurally unreachable for moonshot-eligible trades.
+                if (
+                    settings.PAPER_MOONSHOT_ENABLED
+                    and moonshot_armed_at is None
+                    and peak_pct is not None
+                    and peak_pct >= settings.PAPER_MOONSHOT_THRESHOLD_PCT
+                ):
+                    armed_ts = await _trader.arm_moonshot(
+                        db=db,
+                        trade_id=trade_id,
+                        peak_pct_at_arm=float(peak_pct),
+                        original_trail_drawdown_pct=settings.PAPER_LADDER_TRAIL_PCT,
+                    )
+                    if armed_ts is not None:
+                        # Use the exact DB-written timestamp — avoids the
+                        # microsecond drift of a fresh datetime.now() here.
+                        moonshot_armed_at = armed_ts
+
+                # Effective trail width for this trade: widened if moonshot armed.
+                effective_trail_pct = (
+                    settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT
+                    if moonshot_armed_at is not None
+                    else settings.PAPER_LADDER_TRAIL_PCT
+                )
 
                 close_reason = None
                 close_status: str | None = None
+                # BL-061 ladder exit cascade — order is load-bearing and
+                # locked in by tests/test_moonshot_exit.py:
+                #   SL  →  Leg 1  →  Leg 2  →  Floor  →  Trailing stop
+                #   (then peak-fade, then expiry — both gated by
+                #    `if close_reason is None` further down).
+                # Editing this elif chain breaks the regression tests
+                # `test_floor_exit_pre_empts_moonshot_trail` and
+                # `test_moonshot_trail_wins_over_peak_fade`.
                 # SL applies only before leg 1 arms the floor
                 if not floor_armed and sl_price > 0 and current_price <= sl_price:
                     close_reason = "stop_loss"
                     close_status = "closed_sl"
                 # Leg 1
-                elif leg_1_filled is None and change_pct >= settings.PAPER_LADDER_LEG_1_PCT:
+                elif (
+                    leg_1_filled is None
+                    and change_pct >= settings.PAPER_LADDER_LEG_1_PCT
+                ):
                     await _trader.execute_partial_sell(
-                        db=db, trade_id=trade_id, leg=1,
+                        db=db,
+                        trade_id=trade_id,
+                        leg=1,
                         sell_qty_frac=settings.PAPER_LADDER_LEG_1_QTY_FRAC,
-                        current_price=current_price, slippage_bps=slippage_bps,
+                        current_price=current_price,
+                        slippage_bps=slippage_bps,
                     )
                     continue
                 # Leg 2
@@ -245,9 +320,12 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     and change_pct >= settings.PAPER_LADDER_LEG_2_PCT
                 ):
                     await _trader.execute_partial_sell(
-                        db=db, trade_id=trade_id, leg=2,
+                        db=db,
+                        trade_id=trade_id,
+                        leg=2,
                         sell_qty_frac=settings.PAPER_LADDER_LEG_2_QTY_FRAC,
-                        current_price=current_price, slippage_bps=slippage_bps,
+                        current_price=current_price,
+                        slippage_bps=slippage_bps,
                     )
                     continue
                 # Floor exit — once armed, don't let the runner slice close below entry
@@ -256,22 +334,43 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     close_status = "closed_floor"
                     log.info(
                         "floor_exit",
-                        trade_id=trade_id, peak_pct=round(peak_pct or 0, 2),
+                        trade_id=trade_id,
+                        peak_pct=round(peak_pct or 0, 2),
                         current_price=current_price,
                     )
-                # Trailing stop on runner (post-leg-1 only)
+                # Trailing stop on runner (post-leg-1 only). Width is
+                # widened to PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT once moonshot
+                # is armed; close status reflects that path so dashboards
+                # and digests can attribute the source.
                 elif (
                     floor_armed
                     and peak_price is not None
                     and peak_pct is not None
                     and peak_pct >= settings.PAPER_LADDER_LEG_1_PCT
                 ):
-                    trail_threshold = peak_price * (
-                        1 - settings.PAPER_LADDER_TRAIL_PCT / 100.0
+                    trail_threshold = compute_trail_threshold(
+                        peak_price, effective_trail_pct
                     )
                     if current_price < trail_threshold:
                         close_reason = "trailing_stop"
-                        close_status = "closed_trailing_stop"
+                        close_status = (
+                            "closed_moonshot_trail"
+                            if moonshot_armed_at is not None
+                            else "closed_trailing_stop"
+                        )
+                        if moonshot_armed_at is not None:
+                            # give_back_pp = peak_pct - exit_pct, in
+                            # percentage points (NOT a fraction of peak).
+                            # E.g. peak 60%, exit 35% → give_back_pp 25.
+                            log.info(
+                                "moonshot_trail_exit",
+                                trade_id=trade_id,
+                                peak_pct=round(float(peak_pct), 2),
+                                exit_pct=round(float(change_pct), 2),
+                                give_back_pp=round(
+                                    float(peak_pct) - float(change_pct), 2
+                                ),
+                            )
                 # BL-062 peak-fade — sustained fade at 6h AND 24h checkpoints.
                 # NB: fires on any pass with cp_24h present, not only the pass
                 # that records it. The expiry bound caps the window to 1-2
@@ -301,7 +400,8 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
 
                 if close_reason is not None:
                     closed = await _trader.execute_sell(
-                        db=db, trade_id=trade_id,
+                        db=db,
+                        trade_id=trade_id,
                         current_price=current_price,
                         reason=close_reason,
                         slippage_bps=slippage_bps,
@@ -310,7 +410,8 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     if closed:
                         log.info(
                             "paper_trade_eval_closed",
-                            trade_id=trade_id, token_id=token_id,
+                            trade_id=trade_id,
+                            token_id=token_id,
                             reason=close_reason,
                             current_price=current_price,
                             change_pct=round(change_pct, 2),

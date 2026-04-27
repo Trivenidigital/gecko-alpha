@@ -879,6 +879,11 @@ class Database:
                 "realized_pnl_usd": "REAL",
                 # BL-062 peak-fade exit marker (NULL until fire)
                 "peak_fade_fired_at": "TEXT",
+                # BL-063 moonshot exit upgrade — NULL until armed when peak_pct
+                # crosses the moonshot threshold; original_trail snapshot at
+                # arm time for post-mortem analysis.
+                "moonshot_armed_at": "TEXT",
+                "original_trail_drawdown_pct": "REAL",
             }
             cur = await conn.execute("PRAGMA table_info(paper_trades)")
             existing = {row[1] for row in await cur.fetchall()}
@@ -918,6 +923,20 @@ class Database:
                 "WHERE peak_fade_fired_at IS NOT NULL"
             )
 
+            # BL-063: moonshot cutover row + partial index on arm time.
+            # Per BL-060 lesson: CREATE INDEX lives in this migration step,
+            # NOT in _create_tables (which is a no-op for existing tables).
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl063_moonshot", datetime.now(timezone.utc).isoformat()),
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_paper_trades_moonshot_armed_at "
+                "ON paper_trades(moonshot_armed_at) "
+                "WHERE moonshot_armed_at IS NOT NULL"
+            )
+
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_combo_opened "
                 "ON paper_trades(signal_combo, opened_at)"
@@ -938,6 +957,24 @@ class Database:
             missing = set(expected_cols) - final
             if missing:
                 raise RuntimeError(f"Schema migration incomplete: missing {missing}")
+
+            # BL-063 defense-in-depth: confirm the cutover rows are present.
+            # INSERT OR IGNORE above is unconditional, but a future refactor
+            # could regress this; the assertion catches that before commit.
+            cur = await conn.execute(
+                "SELECT name FROM paper_migrations WHERE name IN "
+                "('bl061_ladder', 'bl062_peak_fade', 'bl063_moonshot')"
+            )
+            recorded = {row[0] for row in await cur.fetchall()}
+            missing_migrations = {
+                "bl061_ladder",
+                "bl062_peak_fade",
+                "bl063_moonshot",
+            } - recorded
+            if missing_migrations:
+                raise RuntimeError(
+                    f"paper_migrations missing rows: {missing_migrations}"
+                )
 
             await conn.execute(
                 "INSERT OR IGNORE INTO schema_version (version, applied_at, description) "

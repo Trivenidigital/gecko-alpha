@@ -175,6 +175,7 @@ def test_bl061_ladder_config_defaults(monkeypatch, tmp_path):
     ):
         monkeypatch.delenv(var, raising=False)
     from scout.config import Settings
+
     s = Settings(
         _env_file=None,
         TELEGRAM_BOT_TOKEN="x",
@@ -197,6 +198,7 @@ def test_bl061_qty_frac_rejects_oversell(monkeypatch, tmp_path):
     """Fractions > 1.0 would oversell the position — must raise."""
     import pytest
     from pydantic import ValidationError
+
     monkeypatch.chdir(tmp_path)
     from scout.config import Settings
 
@@ -222,6 +224,7 @@ def test_ladder_qty_fracs_reject_no_runner(monkeypatch, tmp_path):
     """leg_1 + leg_2 >= 1.0 leaves no runner slice — reject at settings load."""
     import pytest
     from pydantic import ValidationError
+
     monkeypatch.chdir(tmp_path)
     from scout.config import Settings
 
@@ -267,6 +270,7 @@ def test_ladder_qty_fracs_defaults_leave_runner(monkeypatch, tmp_path):
 
 def test_first_signal_min_signal_count_default_is_two(tmp_path, monkeypatch):
     from scout.config import Settings
+
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("FIRST_SIGNAL_MIN_SIGNAL_COUNT", raising=False)
     s = Settings(
@@ -281,6 +285,7 @@ def test_first_signal_min_signal_count_default_is_two(tmp_path, monkeypatch):
 def test_first_signal_min_signal_count_rejects_zero(monkeypatch):
     from pydantic import ValidationError
     from scout.config import Settings
+
     monkeypatch.setenv("FIRST_SIGNAL_MIN_SIGNAL_COUNT", "0")
     with pytest.raises(ValidationError, match="FIRST_SIGNAL_MIN_SIGNAL_COUNT"):
         Settings(
@@ -293,6 +298,7 @@ def test_first_signal_min_signal_count_rejects_zero(monkeypatch):
 
 def test_peak_fade_enabled_default_true(tmp_path, monkeypatch):
     from scout.config import Settings
+
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("PEAK_FADE_ENABLED", raising=False)
     s = Settings(
@@ -307,6 +313,7 @@ def test_peak_fade_enabled_default_true(tmp_path, monkeypatch):
 def test_peak_fade_min_peak_pct_rejects_zero(monkeypatch):
     from pydantic import ValidationError
     from scout.config import Settings
+
     monkeypatch.setenv("PEAK_FADE_MIN_PEAK_PCT", "0")
     with pytest.raises(ValidationError, match="PEAK_FADE_MIN_PEAK_PCT"):
         Settings(
@@ -320,6 +327,7 @@ def test_peak_fade_min_peak_pct_rejects_zero(monkeypatch):
 def test_peak_fade_min_peak_pct_rejects_negative(monkeypatch):
     from pydantic import ValidationError
     from scout.config import Settings
+
     monkeypatch.setenv("PEAK_FADE_MIN_PEAK_PCT", "-5")
     with pytest.raises(ValidationError, match="PEAK_FADE_MIN_PEAK_PCT"):
         Settings(
@@ -333,6 +341,7 @@ def test_peak_fade_min_peak_pct_rejects_negative(monkeypatch):
 def test_peak_fade_retrace_ratio_rejects_one(monkeypatch):
     from pydantic import ValidationError
     from scout.config import Settings
+
     monkeypatch.setenv("PEAK_FADE_RETRACE_RATIO", "1.0")
     with pytest.raises(ValidationError, match="PEAK_FADE_RETRACE_RATIO"):
         Settings(
@@ -346,6 +355,7 @@ def test_peak_fade_retrace_ratio_rejects_one(monkeypatch):
 def test_peak_fade_retrace_ratio_rejects_zero(monkeypatch):
     from pydantic import ValidationError
     from scout.config import Settings
+
     monkeypatch.setenv("PEAK_FADE_RETRACE_RATIO", "0")
     with pytest.raises(ValidationError, match="PEAK_FADE_RETRACE_RATIO"):
         Settings(
@@ -358,6 +368,7 @@ def test_peak_fade_retrace_ratio_rejects_zero(monkeypatch):
 
 def test_peak_fade_retrace_ratio_accepts_half(monkeypatch):
     from scout.config import Settings
+
     monkeypatch.setenv("PEAK_FADE_RETRACE_RATIO", "0.5")
     s = Settings(
         _env_file=None,
@@ -366,3 +377,76 @@ def test_peak_fade_retrace_ratio_accepts_half(monkeypatch):
         ANTHROPIC_API_KEY="k",
     )
     assert s.PEAK_FADE_RETRACE_RATIO == 0.5
+
+
+def test_bl063_moonshot_defaults(monkeypatch, tmp_path):
+    """BL-063 moonshot config defaults — flag off, threshold 40, trail 30."""
+    monkeypatch.chdir(tmp_path)
+    for var in (
+        "PAPER_MOONSHOT_ENABLED",
+        "PAPER_MOONSHOT_THRESHOLD_PCT",
+        "PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    from scout.config import Settings
+
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.PAPER_MOONSHOT_ENABLED is False
+    assert s.PAPER_MOONSHOT_THRESHOLD_PCT == 40.0
+    assert s.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT == 30.0
+
+
+def test_bl063_moonshot_rejects_non_positive_threshold():
+    """THRESHOLD_PCT <= 0 would arm every trade at open."""
+    from pydantic import ValidationError
+    from scout.config import Settings
+
+    with pytest.raises(
+        ValidationError, match="PAPER_MOONSHOT_THRESHOLD_PCT must be > 0"
+    ):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            PAPER_MOONSHOT_THRESHOLD_PCT=0.0,
+        )
+
+
+def test_bl063_moonshot_rejects_drawdown_out_of_range():
+    """Trail drawdown must be in (0, 100); 100+ silently disables trailing."""
+    from pydantic import ValidationError
+    from scout.config import Settings
+
+    with pytest.raises(
+        ValidationError,
+        match=r"PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT must be in \(0, 100\)",
+    ):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT=100.0,
+        )
+
+
+def test_bl063_moonshot_rejects_trail_narrower_than_ladder():
+    """Cross-field guard: moonshot trail must WIDEN, never tighten."""
+    from pydantic import ValidationError
+    from scout.config import Settings
+
+    with pytest.raises(ValidationError, match="moonshot widens the trail"):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            PAPER_LADDER_TRAIL_PCT=25.0,
+            PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT=20.0,
+        )

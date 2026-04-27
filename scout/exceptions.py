@@ -31,3 +31,13 @@ class AlertDeliveryError(ScoutError):
 
 class SafetyCheckError(ScoutError):
     """Error checking token safety."""
+
+
+class MoonshotArmFailed(ScoutError):
+    """Atomic moonshot arm UPDATE returned rowcount=0 unexpectedly.
+
+    Distinct from the already-armed and disabled-flag cases, which are
+    normal returns. This is raised only when the trade row is missing or
+    the WHERE clause matched zero rows for an unrecognised reason — a
+    state that should never silently propagate.
+    """

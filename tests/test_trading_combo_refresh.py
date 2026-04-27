@@ -524,3 +524,61 @@ async def test_refresh_counts_closed_trailing_stop_in_rollup(
     assert row["losses"] == 1
     assert abs(row["win_rate_pct"] - 75.0) < 0.01
     await db.close()
+
+
+async def test_refresh_counts_closed_moonshot_trail_in_rollup(
+    tmp_path, settings_factory
+):
+    """closed_moonshot_trail (BL-063) must be counted in 7d/30d rollups
+    just like closed_trailing_stop. Locks in the CLOSED_COUNTABLE_STATUSES
+    contract so a future refactor can't silently exclude moonshot exits
+    from combo_performance.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+
+    # 2 moonshot-trail wins + 1 TP win + 1 SL loss = 4 trades, 3 wins
+    await _insert_trade(
+        db,
+        "moon_combo",
+        45.0,
+        30.0,
+        now - timedelta(days=1),
+        status="closed_moonshot_trail",
+    )
+    await _insert_trade(
+        db,
+        "moon_combo",
+        80.0,
+        60.0,
+        now - timedelta(days=1),
+        status="closed_moonshot_trail",
+    )
+    await _insert_trade(
+        db,
+        "moon_combo",
+        20.0,
+        15.0,
+        now - timedelta(days=1),
+        status="closed_tp",
+    )
+    await _insert_trade(
+        db,
+        "moon_combo",
+        -10.0,
+        -8.0,
+        now - timedelta(days=1),
+        status="closed_sl",
+    )
+
+    ok = await combo_refresh.refresh_combo(db, "moon_combo", s)
+    assert ok
+
+    row = await _get_combo_row(db, "moon_combo", "7d")
+    assert row["trades"] == 4
+    assert row["wins"] == 3
+    assert row["losses"] == 1
+    assert abs(row["win_rate_pct"] - 75.0) < 0.01
+    await db.close()
