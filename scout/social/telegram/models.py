@@ -68,7 +68,9 @@ class ResolutionResult(BaseModel):
 
     state: ResolutionState
     tokens: list[ResolvedToken] = Field(default_factory=list)
-    candidates_top3: list[ResolvedToken] = Field(default_factory=list)  # cashtag-only ambiguous
+    candidates_top3: list[ResolvedToken] = Field(
+        default_factory=list
+    )  # cashtag-only ambiguous
     error_text: str | None = None
 
 

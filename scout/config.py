@@ -568,14 +568,18 @@ class Settings(BaseSettings):
     @classmethod
     def _validate_tg_social_resolution_retry(cls, v: int) -> int:
         if v < 0:
-            raise ValueError(f"TG_SOCIAL_RESOLUTION_RETRY_DELAY_SEC must be >= 0; got={v}")
+            raise ValueError(
+                f"TG_SOCIAL_RESOLUTION_RETRY_DELAY_SEC must be >= 0; got={v}"
+            )
         return v
 
     @field_validator("TG_SOCIAL_CHANNEL_SILENCE_ALERT_HOURS")
     @classmethod
     def _validate_tg_social_silence_hours(cls, v: int) -> int:
         if v < 1:
-            raise ValueError(f"TG_SOCIAL_CHANNEL_SILENCE_ALERT_HOURS must be >= 1; got={v}")
+            raise ValueError(
+                f"TG_SOCIAL_CHANNEL_SILENCE_ALERT_HOURS must be >= 1; got={v}"
+            )
         return v
 
     @model_validator(mode="after")

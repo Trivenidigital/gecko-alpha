@@ -12,7 +12,6 @@ from urllib.parse import urlparse
 
 from scout.social.telegram.models import ContractRef, ParsedMessage
 
-
 # $SYMBOL — 2-12 alphanumerics (allows the standard $WIF, $RIV, $PEPE shape).
 # Excludes $ followed by digit-only strings ($100 etc.) which would be amounts.
 _CASHTAG_RE = re.compile(r"\$([A-Za-z][A-Za-z0-9_]{1,11})\b")
@@ -55,7 +54,10 @@ def _classify_chain(address: str) -> str | None:
     """
     if address.startswith("0x") and len(address) == 42:
         return "ethereum"  # resolver may re-tag to base / arbitrum / etc.
-    if 32 <= len(address) <= 44 and address[0] in "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz":
+    if (
+        32 <= len(address) <= 44
+        and address[0] in "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    ):
         return "solana"
     return None
 

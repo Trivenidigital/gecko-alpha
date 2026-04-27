@@ -938,8 +938,7 @@ class Database:
             )
 
             # BL-064: TG social signals — six tables, indexes in migration step.
-            await conn.execute(
-                """
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS tg_social_channels (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     channel_handle  TEXT NOT NULL UNIQUE,
@@ -948,19 +947,15 @@ class Database:
                     added_at        TEXT NOT NULL,
                     removed_at      TEXT
                 )
-                """
-            )
-            await conn.execute(
-                """
+                """)
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS tg_social_watermarks (
                     channel_handle    TEXT PRIMARY KEY,
                     last_seen_msg_id  INTEGER NOT NULL DEFAULT 0,
                     updated_at        TEXT NOT NULL
                 )
-                """
-            )
-            await conn.execute(
-                """
+                """)
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS tg_social_messages (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     channel_handle  TEXT NOT NULL,
@@ -974,10 +969,8 @@ class Database:
                     parsed_at       TEXT NOT NULL,
                     UNIQUE(channel_handle, msg_id)
                 )
-                """
-            )
-            await conn.execute(
-                """
+                """)
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS tg_social_signals (
                     id                     INTEGER PRIMARY KEY AUTOINCREMENT,
                     message_pk             INTEGER NOT NULL,
@@ -993,10 +986,8 @@ class Database:
                     created_at             TEXT NOT NULL,
                     FOREIGN KEY (message_pk) REFERENCES tg_social_messages(id)
                 )
-                """
-            )
-            await conn.execute(
-                """
+                """)
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS tg_social_health (
                     component        TEXT PRIMARY KEY,
                     listener_state   TEXT NOT NULL,
@@ -1004,10 +995,8 @@ class Database:
                     updated_at       TEXT NOT NULL,
                     detail           TEXT
                 )
-                """
-            )
-            await conn.execute(
-                """
+                """)
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS tg_social_dlq (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     channel_handle  TEXT NOT NULL,
@@ -1018,8 +1007,7 @@ class Database:
                     failed_at       TEXT NOT NULL,
                     retried_at      TEXT
                 )
-                """
-            )
+                """)
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tg_social_signals_token_created "
                 "ON tg_social_signals(token_id, created_at)"
