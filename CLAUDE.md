@@ -54,6 +54,8 @@ uv run black scout/ tests/               # Format code
 - No committing `.env` or files with real API keys
 - Never call `/coins/top_gainers_losers` (paid Pro endpoint)
 - No `os.getenv()` in business logic (use Settings)
+- Do not auto-bump Telethon in dependabot PRs — upstream is archived (Feb 2026); manual review required for every version change. Fallback path is fork-at-pinned-version, NOT Hydrogram (GPL + pre-1.0). See BL-064 spec.
+- Never commit `*.session` files — they authenticate as the user (full Telegram identity); treat as secret material, mode 0600, exclude from backup tarballs.
 
 ## MiroFish Integration
 

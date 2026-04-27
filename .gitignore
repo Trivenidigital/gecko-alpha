@@ -15,3 +15,7 @@ build/
 dashboard/frontend/node_modules/
 *.ssh_out*
 _*.py
+
+# BL-064 Telegram session — authenticates as the user; never commit
+*.session
+*.session-journal
