@@ -209,8 +209,13 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             "WHERE id = ? AND moonshot_armed_at IS NULL",
             (now, original_trail_drawdown_pct, trade_id),
         )
+        # Always close the implicit transaction the UPDATE may have opened,
+        # whether it changed a row or not. Symmetric on rowcount=0 and =1
+        # keeps connection-level transaction state predictable for the
+        # verify SELECT below and any caller that runs more queries after.
+        await conn.commit()
+
         if cursor.rowcount == 1:
-            await conn.commit()
             log.info(
                 "moonshot_armed",
                 trade_id=trade_id,
@@ -221,7 +226,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
 
         # rowcount == 0: distinguish "already armed" (normal) from "trade
         # doesn't exist" (bug). One extra round-trip on the cold path; the
-        # hot path took the rowcount==1 branch above.
+        # hot path took the rowcount==1 branch above. The verify-SELECT race
+        # window is closed by the BL-055 ON DELETE RESTRICT contract on
+        # live_trades.paper_trade_id — paper_trades rows cannot be deleted
+        # while a live trade references them. If that contract is ever
+        # loosened, this branch can falsely raise MoonshotArmFailed.
         verify = await conn.execute(
             "SELECT moonshot_armed_at FROM paper_trades WHERE id = ?",
             (trade_id,),

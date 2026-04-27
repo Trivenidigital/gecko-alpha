@@ -237,8 +237,10 @@ async def test_pre_bl061_trade_never_arms(tmp_path, settings_factory):
     )
     armed_at, status = await cur.fetchone()
     assert armed_at is None, "pre-cutover trades must skip the BL-063 path entirely"
-    # Status will be set by the legacy cascade (TP at +50% > 20% TP threshold)
-    # but the assertion we care about is the absence of armed_at.
+    # Lock in legacy-cascade behavior at the same time: a +50% pass on a
+    # pre-BL-061 trade with TP=+20% closes via the legacy fixed-TP path.
+    # Catches an unrelated regression in the legacy cascade.
+    assert status == "closed_tp"
     await db.close()
 
 
@@ -350,4 +352,49 @@ async def test_moonshot_trail_wins_over_peak_fade(tmp_path, settings_factory):
     assert (
         status == "closed_moonshot_trail"
     ), "moonshot trail must fire before peak-fade in the cascade"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_bl061_moonshot_trade_never_closes_via_fixed_tp(
+    tmp_path, settings_factory
+):
+    """Locks in the structural-unreachability claim from the PR body:
+    on a BL-061 trade, the legacy `current_price >= tp_price` check at the
+    pre-cutover cascade is unreachable because the BL-061 branch ends with
+    a `continue`.
+
+    A +50% trade with tp_pct=20 (so tp_price = entry * 1.20) MUST NOT close
+    as `closed_tp` — it stays open until trail/peak-fade/expire fires.
+    Without this gate a future refactor that drops the `continue` would
+    silently re-introduce the early-clipping bug BL-063 was built to fix.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    trader = PaperTrader()
+    settings = settings_factory(
+        PAPER_MOONSHOT_ENABLED=True,
+        PAPER_MOONSHOT_THRESHOLD_PCT=40.0,
+    )
+    # Open a fresh BL-061 trade (post-cutover by default).
+    trade_id = await _open_armed_runner(db, trader, token_id="ntp", settings=settings)
+
+    # Push to +50% — well past tp_pct=20. If the legacy fixed-TP path were
+    # reachable, the trade would close as closed_tp here.
+    await _seed_price(db, "ntp", 1.50)
+    await evaluate_paper_trades(db, settings)
+
+    cur = await db._conn.execute(
+        "SELECT status, moonshot_armed_at, leg_2_filled_at "
+        "FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    status, armed_at, leg_2 = await cur.fetchone()
+    assert status != "closed_tp", (
+        "BL-061 trades must reach `continue` before the legacy fixed-TP "
+        "cascade — closing as closed_tp would re-introduce the early-clip bug"
+    )
+    # Confirm the BL-061 path actually ran (moonshot armed + leg 2 filled).
+    assert armed_at is not None
+    assert leg_2 is not None
     await db.close()

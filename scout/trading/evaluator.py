@@ -88,7 +88,11 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
     if conn is None:
         raise RuntimeError("Database not initialized.")
 
-    # 1. Get all open trades
+    # 1. Get all open trades. Rows are unpacked positionally; column order
+    # below maps to row[0]..row[29]. `original_trail_drawdown_pct` is
+    # intentionally NOT selected — it is written at arm time for post-mortem
+    # queries on closed trades but is never consumed on the evaluator hot
+    # path; pulling it here would just bloat each pass.
     cursor = await conn.execute("""SELECT id, token_id, entry_price, opened_at,
                   tp_price, sl_price, tp_pct, sl_pct,
                   checkpoint_1h_price, checkpoint_6h_price,
@@ -98,7 +102,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                   created_at, leg_1_filled_at, leg_2_filled_at,
                   remaining_qty, floor_armed, realized_pnl_usd,
                   checkpoint_6h_pct, checkpoint_24h_pct,
-                  moonshot_armed_at, original_trail_drawdown_pct
+                  moonshot_armed_at
            FROM paper_trades
            WHERE status = 'open'""")
     rows = await cursor.fetchall()
@@ -283,6 +287,14 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
 
                 close_reason = None
                 close_status: str | None = None
+                # BL-061 ladder exit cascade — order is load-bearing and
+                # locked in by tests/test_moonshot_exit.py:
+                #   SL  →  Leg 1  →  Leg 2  →  Floor  →  Trailing stop
+                #   (then peak-fade, then expiry — both gated by
+                #    `if close_reason is None` further down).
+                # Editing this elif chain breaks the regression tests
+                # `test_floor_exit_pre_empts_moonshot_trail` and
+                # `test_moonshot_trail_wins_over_peak_fade`.
                 # SL applies only before leg 1 arms the floor
                 if not floor_armed and sl_price > 0 and current_price <= sl_price:
                     close_reason = "stop_loss"
@@ -347,6 +359,9 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                             else "closed_trailing_stop"
                         )
                         if moonshot_armed_at is not None:
+                            # give_back_pp = peak_pct - exit_pct, in
+                            # percentage points (NOT a fraction of peak).
+                            # E.g. peak 60%, exit 35% → give_back_pp 25.
                             log.info(
                                 "moonshot_trail_exit",
                                 trade_id=trade_id,
