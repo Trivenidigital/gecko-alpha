@@ -937,6 +937,109 @@ class Database:
                 "WHERE moonshot_armed_at IS NOT NULL"
             )
 
+            # BL-064: TG social signals — six tables, indexes in migration step.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS tg_social_channels (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_handle  TEXT NOT NULL UNIQUE,
+                    display_name    TEXT NOT NULL,
+                    trade_eligible  INTEGER NOT NULL DEFAULT 1,
+                    added_at        TEXT NOT NULL,
+                    removed_at      TEXT
+                )
+                """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS tg_social_watermarks (
+                    channel_handle    TEXT PRIMARY KEY,
+                    last_seen_msg_id  INTEGER NOT NULL DEFAULT 0,
+                    updated_at        TEXT NOT NULL
+                )
+                """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS tg_social_messages (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_handle  TEXT NOT NULL,
+                    msg_id          INTEGER NOT NULL,
+                    posted_at       TEXT NOT NULL,
+                    sender          TEXT,
+                    text            TEXT,
+                    cashtags        TEXT,
+                    contracts       TEXT,
+                    urls            TEXT,
+                    parsed_at       TEXT NOT NULL,
+                    UNIQUE(channel_handle, msg_id)
+                )
+                """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS tg_social_signals (
+                    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_pk             INTEGER NOT NULL,
+                    token_id               TEXT NOT NULL,
+                    symbol                 TEXT NOT NULL,
+                    contract_address       TEXT,
+                    chain                  TEXT,
+                    mcap_at_sighting       REAL,
+                    resolution_state       TEXT NOT NULL,
+                    source_channel_handle  TEXT NOT NULL,
+                    alert_sent_at          TEXT,
+                    paper_trade_id         INTEGER,
+                    created_at             TEXT NOT NULL,
+                    FOREIGN KEY (message_pk) REFERENCES tg_social_messages(id),
+                    -- BL-055 contract: paper_trades is append-only; mirror the
+                    -- ON DELETE RESTRICT pattern from live_trades.paper_trade_id
+                    -- so an accidental DELETE on paper_trades cannot orphan
+                    -- tg_social_signals references.
+                    FOREIGN KEY (paper_trade_id) REFERENCES paper_trades(id) ON DELETE RESTRICT
+                )
+                """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS tg_social_health (
+                    component        TEXT PRIMARY KEY,
+                    listener_state   TEXT NOT NULL,
+                    last_message_at  TEXT,
+                    updated_at       TEXT NOT NULL,
+                    detail           TEXT
+                )
+                """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS tg_social_dlq (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_handle  TEXT NOT NULL,
+                    msg_id          INTEGER NOT NULL,
+                    raw_text        TEXT,
+                    error_class     TEXT NOT NULL,
+                    error_text      TEXT NOT NULL,
+                    failed_at       TEXT NOT NULL,
+                    retried_at      TEXT
+                )
+                """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tg_social_signals_token_created "
+                "ON tg_social_signals(token_id, created_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tg_social_signals_channel_created "
+                "ON tg_social_signals(source_channel_handle, created_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tg_social_signals_paper_trade_id "
+                "ON tg_social_signals(paper_trade_id) "
+                "WHERE paper_trade_id IS NOT NULL"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tg_social_messages_channel_msgid "
+                "ON tg_social_messages(channel_handle, msg_id)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tg_social_dlq_failed_at "
+                "ON tg_social_dlq(failed_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl064_tg_social", datetime.now(timezone.utc).isoformat()),
+            )
+
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_combo_opened "
                 "ON paper_trades(signal_combo, opened_at)"
@@ -958,18 +1061,17 @@ class Database:
             if missing:
                 raise RuntimeError(f"Schema migration incomplete: missing {missing}")
 
-            # BL-063 defense-in-depth: confirm the cutover rows are present.
-            # INSERT OR IGNORE above is unconditional, but a future refactor
-            # could regress this; the assertion catches that before commit.
+            # BL-063/BL-064 defense-in-depth: confirm cutover rows are present.
             cur = await conn.execute(
                 "SELECT name FROM paper_migrations WHERE name IN "
-                "('bl061_ladder', 'bl062_peak_fade', 'bl063_moonshot')"
+                "('bl061_ladder', 'bl062_peak_fade', 'bl063_moonshot', 'bl064_tg_social')"
             )
             recorded = {row[0] for row in await cur.fetchall()}
             missing_migrations = {
                 "bl061_ladder",
                 "bl062_peak_fade",
                 "bl063_moonshot",
+                "bl064_tg_social",
             } - recorded
             if missing_migrations:
                 raise RuntimeError(

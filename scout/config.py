@@ -242,6 +242,25 @@ class Settings(BaseSettings):
     PAPER_MOONSHOT_ENABLED: bool = False
     PAPER_MOONSHOT_THRESHOLD_PCT: float = 40.0
     PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT: float = 30.0
+
+    # BL-064 TG Social Signals — Telethon user-session listener for curated TG
+    # channels. Default OFF. Auto-read 3-4 watched channels, parse cashtags +
+    # contract addresses, alert always, paper-trade via TradingEngine when
+    # CA-resolved + admission gates pass. Spec: 2026-04-27-bl064-...md.
+    TG_SOCIAL_ENABLED: bool = False
+    TG_SOCIAL_API_ID: int = 0
+    TG_SOCIAL_API_HASH: SecretStr | None = None
+    TG_SOCIAL_PHONE_NUMBER: str = ""
+    TG_SOCIAL_SESSION_PATH: Path = Path("./tg_social.session")
+    TG_SOCIAL_CHANNELS_FILE: Path = Path("./channels.yml")
+    TG_SOCIAL_MAX_OPEN_TRADES: int = 5
+    PAPER_TG_SOCIAL_TRADE_AMOUNT_USD: float = 300.0
+    TG_SOCIAL_CATCHUP_LIMIT: int = 200
+    TG_SOCIAL_FLOOD_WAIT_MAX_SEC: int = 600
+    TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC: int = 300
+    TG_SOCIAL_RESOLUTION_RETRY_DELAY_SEC: int = 60
+    TG_SOCIAL_CHANNEL_SILENCE_ALERT_HOURS: int = 72
+    TG_SOCIAL_CHANNEL_SILENCE_CHECK_INTERVAL_SEC: int = 3600
     # BL-062 signal-stacking: require >=N scoring signals for first_signal admission
     FIRST_SIGNAL_MIN_SIGNAL_COUNT: int = 2
     # BL-062 peak-fade early-kill: sustained-fade exit between trail and expiry
@@ -506,6 +525,79 @@ class Settings(BaseSettings):
         if abs(total - 1.0) > 1e-9:
             msg = f"QUANT_WEIGHT ({self.QUANT_WEIGHT}) + NARRATIVE_WEIGHT ({self.NARRATIVE_WEIGHT}) = {total}, must sum to 1.0"
             raise ValueError(msg)
+        return self
+
+    @field_validator("TG_SOCIAL_MAX_OPEN_TRADES")
+    @classmethod
+    def _validate_tg_social_max_open_trades(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"TG_SOCIAL_MAX_OPEN_TRADES must be >= 1; got={v}")
+        return v
+
+    @field_validator("PAPER_TG_SOCIAL_TRADE_AMOUNT_USD")
+    @classmethod
+    def _validate_paper_tg_social_trade_amount(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"PAPER_TG_SOCIAL_TRADE_AMOUNT_USD must be > 0; got={v}")
+        return v
+
+    @field_validator("TG_SOCIAL_CATCHUP_LIMIT")
+    @classmethod
+    def _validate_tg_social_catchup_limit(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"TG_SOCIAL_CATCHUP_LIMIT must be >= 0; got={v}")
+        return v
+
+    @field_validator("TG_SOCIAL_FLOOD_WAIT_MAX_SEC")
+    @classmethod
+    def _validate_tg_social_flood_wait_max(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"TG_SOCIAL_FLOOD_WAIT_MAX_SEC must be > 0; got={v}")
+        return v
+
+    @field_validator("TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC")
+    @classmethod
+    def _validate_tg_social_channel_reload(cls, v: int) -> int:
+        if v < 60:
+            raise ValueError(
+                f"TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC must be >= 60 (anti-thrash); got={v}"
+            )
+        return v
+
+    @field_validator("TG_SOCIAL_RESOLUTION_RETRY_DELAY_SEC")
+    @classmethod
+    def _validate_tg_social_resolution_retry(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(
+                f"TG_SOCIAL_RESOLUTION_RETRY_DELAY_SEC must be >= 0; got={v}"
+            )
+        return v
+
+    @field_validator("TG_SOCIAL_CHANNEL_SILENCE_ALERT_HOURS")
+    @classmethod
+    def _validate_tg_social_silence_hours(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(
+                f"TG_SOCIAL_CHANNEL_SILENCE_ALERT_HOURS must be >= 1; got={v}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_tg_social_creds(self) -> "Settings":
+        # Value-only check — filesystem (.session existence) is checked at
+        # listener startup in scout/social/telegram/client.py with an
+        # actionable error message including the bootstrap command.
+        if self.TG_SOCIAL_ENABLED:
+            if self.TG_SOCIAL_API_ID <= 0:
+                raise ValueError(
+                    "TG_SOCIAL_ENABLED=True requires TG_SOCIAL_API_ID > 0; "
+                    "get one from https://my.telegram.org -> API Development tools"
+                )
+            if self.TG_SOCIAL_API_HASH is None:
+                raise ValueError(
+                    "TG_SOCIAL_ENABLED=True requires TG_SOCIAL_API_HASH; "
+                    "get one from https://my.telegram.org -> API Development tools"
+                )
         return self
 
     @model_validator(mode="after")

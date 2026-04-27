@@ -582,3 +582,34 @@ async def test_refresh_counts_closed_moonshot_trail_in_rollup(
     assert row["losses"] == 1
     assert abs(row["win_rate_pct"] - 75.0) < 0.01
     await db.close()
+
+
+async def test_refresh_counts_tg_social_signal_type_in_rollup(tmp_path, settings_factory):
+    """BL-064 regression: tg_social signal_type contributes to combo_performance
+    rollups across all CLOSED_COUNTABLE_STATUSES — including closed_moonshot_trail
+    which BL-063 added. Locks the contract that a future refactor of
+    CLOSED_COUNTABLE_STATUSES doesn't silently exclude tg_social."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    now = datetime.now(timezone.utc)
+
+    for status, pct in [
+        ("closed_tp", 25.0),
+        ("closed_trailing_stop", 12.0),
+        ("closed_moonshot_trail", 60.0),
+        ("closed_expired", -3.0),
+        ("closed_sl", -15.0),
+    ]:
+        await _insert_trade(
+            db, "tg_social", pct, pct, now - timedelta(days=1), status=status,
+        )
+
+    ok = await combo_refresh.refresh_combo(db, "tg_social", s)
+    assert ok
+    row = await _get_combo_row(db, "tg_social", "7d")
+    assert row["trades"] == 5
+    # Wins: tp(+25), trail(+12), moonshot(+60) = 3 wins; expired(-3) and sl(-15) = 2 losses
+    assert row["wins"] == 3
+    assert row["losses"] == 2
+    await db.close()

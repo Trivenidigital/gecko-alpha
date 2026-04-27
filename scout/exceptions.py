@@ -41,3 +41,30 @@ class MoonshotArmFailed(ScoutError):
     the WHERE clause matched zero rows for an unrecognised reason — a
     state that should never silently propagate.
     """
+
+
+class TgSocialAuthError(ScoutError):
+    """BL-064 Telegram auth failure (missing creds, invalid session, AuthKeyError mid-flight).
+
+    The error message is structured so the operator sees the bootstrap
+    command immediately in logs / alerts.
+    """
+
+    def __init__(self, channel: str | None, reason: str) -> None:
+        self.channel = channel
+        self.reason = reason
+        super().__init__(
+            f"[tg_social_auth] channel={channel or '(none)'} reason={reason} "
+            f"-- run: python -m scout.social.telegram.cli bootstrap"
+        )
+
+
+class TgSocialResolutionError(ScoutError):
+    """BL-064 token resolution failure (CA/ticker not found on CG or DexScreener)."""
+
+    def __init__(self, identifier: str, source: str) -> None:
+        self.identifier = identifier
+        self.source = source
+        super().__init__(
+            f"[tg_social_resolution] could not resolve '{identifier}' from {source}"
+        )

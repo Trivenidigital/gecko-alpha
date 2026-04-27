@@ -791,9 +791,7 @@ async def check_outcomes(
     return recorded
 
 
-async def _drain_pending_live_tasks(
-    paper_trader, timeout_sec: float = 5.0
-) -> None:
+async def _drain_pending_live_tasks(paper_trader, timeout_sec: float = 5.0) -> None:
     """Drain any in-flight PaperTrader live-handoff tasks before DB close.
 
     Spec §10.3 — orphaned shadow-row writes are a data-loss risk, so we wait
@@ -901,9 +899,7 @@ async def main(argv: list[str] | None = None) -> int:
         if live_config.mode == "live":
             if not settings.BINANCE_API_KEY or not settings.BINANCE_API_SECRET:
                 await db.close()
-                raise RuntimeError(
-                    "LIVE_MODE=live requires BINANCE_API_KEY/SECRET"
-                )
+                raise RuntimeError("LIVE_MODE=live requires BINANCE_API_KEY/SECRET")
             # Balance gate is not yet implemented — fail closed at boot so
             # shadow traffic cannot accidentally leak to real funds.
             await db.close()
@@ -1176,6 +1172,24 @@ async def main(argv: list[str] | None = None) -> int:
                 tasks.append(asyncio.create_task(briefing_loop(session, settings, db)))
             if settings.CHAINS_ENABLED:
                 tasks.append(asyncio.create_task(run_chain_tracker(db, settings)))
+
+            # BL-064: TG social signals listener (default OFF). Launches a
+            # Telethon user-session subscriber to curated channels.
+            if settings.TG_SOCIAL_ENABLED:
+                from scout.social.telegram.listener import (
+                    run_listener as run_tg_social_listener,
+                )
+
+                tasks.append(
+                    asyncio.create_task(
+                        run_tg_social_listener(
+                            db=db,
+                            settings=settings,
+                            engine=trading_engine,
+                            http_session=session,
+                        )
+                    )
+                )
 
             # BL-055 live-subsystem loops (spec §10) — only spawned when a
             # LiveEngine was constructed above. Each loop is independently

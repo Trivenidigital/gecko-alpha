@@ -13,6 +13,12 @@ dependencies = [
     "python-dotenv>=1.0,<2",
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.30,<1",
+    # BL-064: Telegram MTProto user-session listener.
+    # Telethon was archived 2026-02 (moved to Codeberg). Pinned and version-frozen
+    # per CLAUDE.md note — do NOT auto-bump in dependabot PRs.
+    "telethon>=1.36,<1.40",
+    # BL-064: channels.yml source-of-truth parser.
+    "pyyaml>=6.0,<7",
 ]
 
 [project.optional-dependencies]
