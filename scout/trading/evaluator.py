@@ -149,8 +149,38 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             peak_price = float(row[12]) if row[12] is not None else None
             peak_pct = float(row[13]) if row[13] is not None else None
 
+            # Compute elapsed up-front so the stale/no-price branches below can
+            # still expire trades that have aged past max_duration. Without
+            # this, a token whose price_cache stops updating leaves its trade
+            # `status='open'` indefinitely (zombie row) — discovered while
+            # auditing the BL-064 dashboard mismatch on 2026-04-27.
+            elapsed_for_stale_check = now - opened_at
+
             price_data = price_map.get(token_id)
             if price_data is None:
+                if elapsed_for_stale_check >= max_duration:
+                    # No price at all but trade is past expiry — force close
+                    # at entry_price for a zero-PnL marker. We don't know
+                    # the token's current market price (it dropped from
+                    # price_cache entirely), so the conservative move is
+                    # entry-price → pnl_pct=0 with a distinct exit_reason.
+                    await _trader.execute_sell(
+                        db=db,
+                        trade_id=trade_id,
+                        current_price=entry_price,
+                        reason="expired_stale_no_price",
+                        slippage_bps=0,
+                        status_override="closed_expired",
+                    )
+                    log.info(
+                        "trade_eval_expired_no_price_forced_close",
+                        trade_id=trade_id,
+                        token_id=token_id,
+                        hours_open=round(
+                            elapsed_for_stale_check.total_seconds() / 3600, 1
+                        ),
+                    )
+                    continue
                 log.info("trade_eval_no_price", trade_id=trade_id, token_id=token_id)
                 continue
 
@@ -161,6 +191,30 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             price_age_seconds = (now - updated_at).total_seconds()
 
             if price_age_seconds > 3600:  # 1 hour max for evaluator
+                if elapsed_for_stale_check >= max_duration:
+                    # Stale price but trade is past expiry — close at the
+                    # stale snapshot (best-effort) with a distinct
+                    # exit_reason so analytics can distinguish from a clean
+                    # `closed_expired`. Better than letting the row sit
+                    # `open` forever.
+                    await _trader.execute_sell(
+                        db=db,
+                        trade_id=trade_id,
+                        current_price=current_price,
+                        reason="expired_stale_price",
+                        slippage_bps=0,
+                        status_override="closed_expired",
+                    )
+                    log.info(
+                        "trade_eval_expired_stale_price_forced_close",
+                        trade_id=trade_id,
+                        token_id=token_id,
+                        price_age_seconds=round(price_age_seconds, 1),
+                        hours_open=round(
+                            elapsed_for_stale_check.total_seconds() / 3600, 1
+                        ),
+                    )
+                    continue
                 log.info(
                     "trade_eval_stale_price",
                     trade_id=trade_id,
