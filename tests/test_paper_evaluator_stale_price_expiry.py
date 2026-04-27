@@ -78,9 +78,10 @@ async def test_no_price_past_expiry_force_closes(tmp_path, settings_factory):
     status, reason, exit_price, pnl_pct = await cur.fetchone()
     assert status == "closed_expired"
     assert reason == "expired_stale_no_price"
-    # Closes at entry_price (1.00) → ~zero PnL
-    assert exit_price == pytest.approx(1.00, rel=1e-3)
-    assert pnl_pct == pytest.approx(0.0, abs=0.5)
+    # Closes at entry_price exactly → strictly zero PnL.
+    # The fix passes slippage_bps=0 explicitly, so any drift here would be a bug.
+    assert exit_price == pytest.approx(1.00, abs=1e-9)
+    assert pnl_pct == pytest.approx(0.0, abs=1e-9)
     await db.close()
 
 

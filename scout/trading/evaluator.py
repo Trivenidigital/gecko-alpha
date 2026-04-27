@@ -154,16 +154,26 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             # this, a token whose price_cache stops updating leaves its trade
             # `status='open'` indefinitely (zombie row) — discovered while
             # auditing the BL-064 dashboard mismatch on 2026-04-27.
-            elapsed_for_stale_check = now - opened_at
+            #
+            # `max_duration` is a `timedelta` (built from PAPER_MAX_DURATION_HOURS
+            # at line 134); `elapsed` is `now - opened_at` (also timedelta), so
+            # the comparisons below are unit-consistent.
+            elapsed = now - opened_at
 
             price_data = price_map.get(token_id)
             if price_data is None:
-                if elapsed_for_stale_check >= max_duration:
+                if elapsed >= max_duration:
                     # No price at all but trade is past expiry — force close
                     # at entry_price for a zero-PnL marker. We don't know
                     # the token's current market price (it dropped from
                     # price_cache entirely), so the conservative move is
                     # entry-price → pnl_pct=0 with a distinct exit_reason.
+                    #
+                    # `slippage_bps=0` because no real fill is happening — this
+                    # is a bookkeeping close, not a market sell. `status_override`
+                    # pre-existed on `execute_sell`; reused here so combo_performance
+                    # rollups (CLOSED_COUNTABLE_STATUSES) treat this identically
+                    # to a clean `closed_expired`.
                     await _trader.execute_sell(
                         db=db,
                         trade_id=trade_id,
@@ -176,9 +186,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                         "trade_eval_expired_no_price_forced_close",
                         trade_id=trade_id,
                         token_id=token_id,
-                        hours_open=round(
-                            elapsed_for_stale_check.total_seconds() / 3600, 1
-                        ),
+                        hours_open=round(elapsed.total_seconds() / 3600, 1),
                     )
                     continue
                 log.info("trade_eval_no_price", trade_id=trade_id, token_id=token_id)
@@ -191,12 +199,13 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             price_age_seconds = (now - updated_at).total_seconds()
 
             if price_age_seconds > 3600:  # 1 hour max for evaluator
-                if elapsed_for_stale_check >= max_duration:
+                if elapsed >= max_duration:
                     # Stale price but trade is past expiry — close at the
                     # stale snapshot (best-effort) with a distinct
                     # exit_reason so analytics can distinguish from a clean
                     # `closed_expired`. Better than letting the row sit
-                    # `open` forever.
+                    # `open` forever. See no-price branch above for the
+                    # rationale on `slippage_bps=0` and `status_override`.
                     await _trader.execute_sell(
                         db=db,
                         trade_id=trade_id,
@@ -210,9 +219,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                         trade_id=trade_id,
                         token_id=token_id,
                         price_age_seconds=round(price_age_seconds, 1),
-                        hours_open=round(
-                            elapsed_for_stale_check.total_seconds() / 3600, 1
-                        ),
+                        hours_open=round(elapsed.total_seconds() / 3600, 1),
                     )
                     continue
                 log.info(
@@ -232,7 +239,8 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                 )
                 continue
 
-            elapsed = now - opened_at
+            # `elapsed` was hoisted to before the stale/no-price guards above
+            # so the zombie-expiry branches can use it; it's still valid here.
             change_pct = ((current_price - entry_price) / entry_price) * 100
 
             reference = peak_price if peak_price is not None else entry_price
