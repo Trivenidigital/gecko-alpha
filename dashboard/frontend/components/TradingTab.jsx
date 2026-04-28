@@ -179,8 +179,8 @@ export default function TradingTab() {
       case 'entry': va = a.entry_price || 0; vb = b.entry_price || 0; break
       case 'amount': va = a.amount_usd || 0; vb = b.amount_usd || 0; break
       case 'current': va = a.current_price || 0; vb = b.current_price || 0; break
-      case 'pnl_usd': va = a.unrealized_pnl_usd || 0; vb = b.unrealized_pnl_usd || 0; break
-      case 'pnl_pct': va = a.unrealized_pnl_pct || 0; vb = b.unrealized_pnl_pct || 0; break
+      case 'pnl_usd': va = a.total_pnl_usd ?? 0; vb = b.total_pnl_usd ?? 0; break
+      case 'pnl_pct': va = a.total_pnl_pct ?? 0; vb = b.total_pnl_pct ?? 0; break
       case 'opened': va = a.opened_at || ''; vb = b.opened_at || ''; break
       default: va = 0; vb = 0
     }
@@ -202,10 +202,13 @@ export default function TradingTab() {
     )
   }
 
-  // Rank map: persistent P&L rank regardless of current sort order
+  // Rank map: persistent P&L rank regardless of current sort order. Uses
+  // total_pnl_pct (realized + unrealized vs original capital) so the
+  // leaderboard reflects actual trader return, not raw price move on a
+  // partially-filled ladder trade.
   const pnlRankMap = useMemo(() => {
     const byPnl = [...positions].sort(
-      (a, b) => (b.unrealized_pnl_pct ?? -Infinity) - (a.unrealized_pnl_pct ?? -Infinity)
+      (a, b) => (b.total_pnl_pct ?? -Infinity) - (a.total_pnl_pct ?? -Infinity)
     )
     const m = new Map()
     byPnl.forEach((p, idx) => m.set(p.id, idx + 1))
@@ -227,7 +230,10 @@ export default function TradingTab() {
   const winRate = stats?.win_rate_pct ?? 0
   const openCount = positions.length
   const totalExposure = positions.reduce((sum, p) => sum + (p.amount_usd ?? 0), 0)
-  const totalUnrealizedPnl = positions.reduce((sum, p) => sum + (p.unrealized_pnl_usd ?? 0), 0)
+  // Sum of total_pnl_usd across open trades (realized-on-closed-legs +
+  // unrealized-on-remainder). Reconciles with the per-row PnL$ column so
+  // numbers across the page tell the same story.
+  const totalOpenPnl = positions.reduce((sum, p) => sum + (p.total_pnl_usd ?? 0), 0)
   const totalTrades = stats?.total_trades ?? 0
 
   return (
@@ -246,9 +252,9 @@ export default function TradingTab() {
           </div>
         </div>
         <div className="panel" style={{ padding: '16px 20px', textAlign: 'center' }}>
-          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Unrealized PnL</div>
-          <div style={{ fontSize: 28, fontWeight: 700, color: pnlColor(totalUnrealizedPnl) }}>
-            {fmtUsd(totalUnrealizedPnl)}
+          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Open PnL</div>
+          <div style={{ fontSize: 28, fontWeight: 700, color: pnlColor(totalOpenPnl) }}>
+            {fmtUsd(totalOpenPnl)}
           </div>
         </div>
         <div className="panel" style={{ padding: '16px 20px', textAlign: 'center' }}>
@@ -355,12 +361,16 @@ export default function TradingTab() {
               </thead>
               <tbody>
                 {sortedPositions.map((p, i) => {
-                  const pnlUsd = p.unrealized_pnl_usd
-                  const pnlPct = p.unrealized_pnl_pct
+                  // Total PnL = realized (closed ladder legs) + unrealized
+                  // (remainder at current price), reconciled against the
+                  // original amount_usd so the $ and % columns tell one
+                  // coherent story even after partial fills.
+                  const pnlUsd = p.total_pnl_usd
+                  const pnlPct = p.total_pnl_pct
                   return (
                     <tr key={p.id || i}>
                       <td className="rank-cell" style={{ whiteSpace: 'nowrap', textAlign: 'center', fontWeight: 600, fontSize: 13 }}>
-                        {p.unrealized_pnl_pct == null ? '—' : (pnlRankMap.get(p.id) ?? '—')}
+                        {p.total_pnl_pct == null ? '—' : (pnlRankMap.get(p.id) ?? '—')}
                       </td>
                       <td>
                         <TokenLink

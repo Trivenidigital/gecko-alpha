@@ -172,3 +172,66 @@ async def test_unrealized_pnl_falls_back_to_quantity_pre_cutover(client):
     assert pos["remaining_qty"] is None
 
 
+async def test_total_pnl_combines_realized_and_unrealized_against_original_capital(
+    client,
+):
+    """The dashboard's PnL$ and PnL% columns must reconcile against the
+    trader's original `amount_usd` so a partially-filled ladder trade does
+    NOT show a price-based +X% next to a smaller-than-expected $ figure
+    (the bug observed on ZKJ #1357 with realized=$67, unrealized=$234,
+    +195% price move on a 40% remainder).
+
+    With realized_pnl_usd=$50 already booked from closed legs and
+    unrealized=$70 on the open remainder, total must be $120 and percent
+    must be 12% (against the original $1000 amount_usd).
+    """
+    c, db = client
+    await _insert_trade(db._conn, "ladder-mix", "LMX", "first_signal", "open")
+    await db._conn.execute(
+        "UPDATE paper_trades SET remaining_qty = 7.0, realized_pnl_usd = 50.0, "
+        "leg_1_filled_at = ? WHERE token_id = 'ladder-mix'",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    await db._conn.commit()
+    await _seed_price(db._conn, "ladder-mix", 110.0)
+
+    resp = await c.get("/api/trading/positions")
+    assert resp.status_code == 200
+    pos = [p for p in resp.json() if p["token_id"] == "ladder-mix"][0]
+    # entry=100, cp=110, remaining_qty=7 → unrealized = $70
+    assert pos["unrealized_pnl_usd"] == 70.00
+    # realized=50, unrealized=70 → total=$120, 120/1000 = 12.0%
+    assert pos["total_pnl_usd"] == 120.00
+    assert pos["total_pnl_pct"] == 12.00
+
+
+async def test_total_pnl_handles_null_realized(client):
+    """When realized_pnl_usd is NULL (no ladder legs filled), total must
+    equal unrealized — no NoneType arithmetic crash."""
+    c, db = client
+    await _insert_trade(db._conn, "no-fills", "NOF", "first_signal", "open")
+    await _seed_price(db._conn, "no-fills", 110.0)
+
+    resp = await c.get("/api/trading/positions")
+    assert resp.status_code == 200
+    pos = [p for p in resp.json() if p["token_id"] == "no-fills"][0]
+    # quantity=10, no remaining_qty, no realized → unrealized = $100, total = $100
+    assert pos["unrealized_pnl_usd"] == 100.00
+    assert pos["total_pnl_usd"] == 100.00
+    assert pos["total_pnl_pct"] == 10.00  # 100/1000
+
+
+async def test_total_pnl_null_when_no_current_price(client):
+    """No current_price → all PnL fields stay None (no NoneType crash)."""
+    c, db = client
+    await _insert_trade(db._conn, "no-price", "NOP", "first_signal", "open")
+    # No price_cache row inserted
+
+    resp = await c.get("/api/trading/positions")
+    assert resp.status_code == 200
+    pos = [p for p in resp.json() if p["token_id"] == "no-price"][0]
+    assert pos["unrealized_pnl_usd"] is None
+    assert pos["total_pnl_usd"] is None
+    assert pos["total_pnl_pct"] is None
+
+

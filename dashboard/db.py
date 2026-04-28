@@ -920,6 +920,8 @@ async def _get_trading_positions_inner(db) -> list[dict]:
             cp = prices.get(r["token_id"])
             if cp and r["entry_price"]:
                 r["current_price"] = cp
+                # Price-only delta from entry — useful for UX badges but
+                # NOT a portfolio metric on partially-filled ladder trades.
                 r["unrealized_pnl_pct"] = round(
                     ((cp - r["entry_price"]) / r["entry_price"]) * 100, 2
                 )
@@ -932,10 +934,25 @@ async def _get_trading_positions_inner(db) -> list[dict]:
                 r["unrealized_pnl_usd"] = round(
                     (cp - r["entry_price"]) * open_qty, 2
                 )
+                # Total PnL = realized (from any closed ladder legs) +
+                # unrealized on the still-open remainder. Reconciled against
+                # the trader's original capital so PnL$ and PnL% always tell
+                # the same story (closes UI bug where +X% price move +
+                # post-leg-1 partial fill produced misleading numbers).
+                realized = r.get("realized_pnl_usd") or 0.0
+                total_pnl_usd = realized + r["unrealized_pnl_usd"]
+                r["total_pnl_usd"] = round(total_pnl_usd, 2)
+                r["total_pnl_pct"] = (
+                    round(total_pnl_usd / r["amount_usd"] * 100, 2)
+                    if r["amount_usd"]
+                    else None
+                )
             else:
                 r["current_price"] = None
                 r["unrealized_pnl_pct"] = None
                 r["unrealized_pnl_usd"] = None
+                r["total_pnl_usd"] = None
+                r["total_pnl_pct"] = None
 
     return rows
 
