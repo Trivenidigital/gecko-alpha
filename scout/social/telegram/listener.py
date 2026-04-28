@@ -22,6 +22,8 @@ from telethon.errors import (
     ChannelPrivateError,
     ChatAdminRequiredError,
     FloodWaitError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
 )
 
 from scout.config import Settings
@@ -76,7 +78,6 @@ async def send_telegram(
         log.warning("tg_social_send_telegram_error", error=str(e))
 
 
-_WATERMARK_LOCKS: dict[str, asyncio.Lock] = {}
 # Module-level set so fire-and-forget retry/silence tasks aren't GC'd.
 _PENDING_TASKS: set[asyncio.Task] = set()
 
@@ -292,18 +293,6 @@ async def _replay_post_resolution(
         )
 
 
-def _channel_lock(channel_handle: str) -> asyncio.Lock:
-    """Per-channel lock to serialize transactional writes against concurrent
-    catchup + live-event paths on the same channel. SQLite's connection-level
-    serialization handles cross-channel safety; this lock additionally
-    prevents interleaved BEGIN/commits within a single channel's pipeline."""
-    lock = _WATERMARK_LOCKS.get(channel_handle)
-    if lock is None:
-        lock = asyncio.Lock()
-        _WATERMARK_LOCKS[channel_handle] = lock
-    return lock
-
-
 async def _persist_message_with_watermark(
     *,
     db: Database,
@@ -324,11 +313,20 @@ async def _persist_message_with_watermark(
 
     Returns the inserted row pk, or None if the message was a duplicate
     (UNIQUE conflict — normal during catchup re-run).
+
+    Holds db._txn_lock for the entire BEGIN…COMMIT window. This is the
+    project-wide pattern (engine.py, kill_switch.py, metrics.py, resolver.py,
+    shadow_evaluator.py, combo_refresh.py, suppression.py all use it).
+    The original implementation used a per-channel lock instead, which let
+    two channels' coroutines interleave at the BEGIN IMMEDIATE step on the
+    shared aiosqlite connection — producing OperationalError "cannot start
+    a transaction within a transaction" on 66% of catchup persists. Closes
+    fix/bl-064-listener-resilience.
     """
     import aiosqlite
 
     conn = db._conn
-    if conn is None:
+    if conn is None or db._txn_lock is None:
         raise RuntimeError("Database not initialized.")
     now_iso = datetime.now(timezone.utc).isoformat()
     posted_iso = (
@@ -337,7 +335,7 @@ async def _persist_message_with_watermark(
         else posted_at.replace(tzinfo=timezone.utc).isoformat()
     )
 
-    async with _channel_lock(channel_handle):
+    async with db._txn_lock:
         try:
             await conn.execute("BEGIN IMMEDIATE")
             try:
@@ -739,11 +737,26 @@ async def _catchup_channel(
                 # the catchup loop moving so one poison pill doesn't block.
                 await _append_dlq(db, channel_handle, getattr(msg, "id", 0), None, e)
             fetched += 1
-    except (ChannelPrivateError, ChatAdminRequiredError) as e:
+    except (
+        ChannelPrivateError,
+        ChatAdminRequiredError,
+        UsernameInvalidError,
+        UsernameNotOccupiedError,
+        ValueError,
+    ) as e:
+        # ValueError covers Telethon's "Cannot find any entity corresponding to..."
+        # and "No user has username..." paths that surface as bare ValueError
+        # depending on Telethon version. Without this, one bad handle in
+        # channels.yml killed the entire listener task: iter_messages raised,
+        # the except didn't match, exception propagated to gather(return_exceptions=
+        # True) which silently swallowed it. tg_social_health.listener_state
+        # stayed 'running' (state was set before catchup) — health was lying
+        # for ~24h until manual diagnosis. See PR fix/bl-064-listener-resilience.
         log.warning(
             "tg_social_channel_access_error",
             channel_handle=channel_handle,
             error=type(e).__name__,
+            error_text=str(e)[:200],
         )
         await db._conn.execute(
             "UPDATE tg_social_channels SET removed_at = ? WHERE channel_handle = ?",
@@ -822,6 +835,54 @@ async def run_listener(
     await _set_listener_state(db, "running")
     log.info("tg_social_listener_started", **info)
 
+    # Top-level crash watchdog — any unhandled exception inside catchup,
+    # handler attach, or run_until_disconnected flips listener_state to
+    # 'crashed' and emits a Telegram alert before re-raising. Without this,
+    # asyncio.gather(return_exceptions=True) in main.py silently swallows
+    # the exception and tg_social_health.listener_state keeps lying with
+    # 'running'. Closes fix/bl-064-listener-resilience.
+    try:
+        await _run_listener_body(
+            db=db,
+            settings=settings,
+            engine=engine,
+            http_session=http_session,
+            client=client,
+        )
+    except Exception as exc:
+        log.exception(
+            "tg_social_listener_crashed",
+            error_class=type(exc).__name__,
+            error_text=str(exc)[:300],
+        )
+        await _set_listener_state(
+            db,
+            "crashed",
+            detail=f"{type(exc).__name__}: {str(exc)[:180]}",
+        )
+        try:
+            await send_telegram(
+                http_session,
+                settings.TELEGRAM_BOT_TOKEN,
+                settings.TELEGRAM_CHAT_ID,
+                f"🛑 tg_social listener crashed: {type(exc).__name__}: "
+                f"{str(exc)[:200]}. Restart pipeline after diagnosing.",
+            )
+        except Exception:
+            log.warning("tg_social_alert_send_failed_on_crash")
+        raise
+
+
+async def _run_listener_body(
+    *,
+    db: Database,
+    settings: Settings,
+    engine: TradingEngine,
+    http_session: aiohttp.ClientSession,
+    client,
+) -> None:
+    """Inner listener body — extracted so run_listener can wrap it in a
+    top-level crash handler without entangling the pre-running auth_lost path."""
     # Load active channels
     cur = await db._conn.execute(
         "SELECT channel_handle FROM tg_social_channels WHERE removed_at IS NULL"
