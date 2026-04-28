@@ -944,6 +944,7 @@ class Database:
                     channel_handle  TEXT NOT NULL UNIQUE,
                     display_name    TEXT NOT NULL,
                     trade_eligible  INTEGER NOT NULL DEFAULT 1,
+                    safety_required INTEGER NOT NULL DEFAULT 1,
                     added_at        TEXT NOT NULL,
                     removed_at      TEXT
                 )
@@ -1040,6 +1041,36 @@ class Database:
                 ("bl064_tg_social", datetime.now(timezone.utc).isoformat()),
             )
 
+            # Per-channel safety_required column (added 2026-04-28).
+            # Pre-existing rows backfill to 1 (strict) by the NOT NULL DEFAULT,
+            # preserving fail-closed behavior for already-deployed channels.
+            cur = await conn.execute("PRAGMA table_info(tg_social_channels)")
+            tg_chan_cols = {row[1] for row in await cur.fetchall()}
+            if "safety_required" in tg_chan_cols:
+                _log.info(
+                    "schema_migration_column_action",
+                    col="safety_required",
+                    action="skip_exists",
+                )
+            else:
+                await conn.execute(
+                    "ALTER TABLE tg_social_channels "
+                    "ADD COLUMN safety_required INTEGER NOT NULL DEFAULT 1"
+                )
+                _log.info(
+                    "schema_migration_column_action",
+                    col="safety_required",
+                    action="added",
+                )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (
+                    "bl064_safety_required_per_channel",
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_combo_opened "
                 "ON paper_trades(signal_combo, opened_at)"
@@ -1064,7 +1095,8 @@ class Database:
             # BL-063/BL-064 defense-in-depth: confirm cutover rows are present.
             cur = await conn.execute(
                 "SELECT name FROM paper_migrations WHERE name IN "
-                "('bl061_ladder', 'bl062_peak_fade', 'bl063_moonshot', 'bl064_tg_social')"
+                "('bl061_ladder', 'bl062_peak_fade', 'bl063_moonshot', "
+                "'bl064_tg_social', 'bl064_safety_required_per_channel')"
             )
             recorded = {row[0] for row in await cur.fetchall()}
             missing_migrations = {
@@ -1072,6 +1104,7 @@ class Database:
                 "bl062_peak_fade",
                 "bl063_moonshot",
                 "bl064_tg_social",
+                "bl064_safety_required_per_channel",
             } - recorded
             if missing_migrations:
                 raise RuntimeError(

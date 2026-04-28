@@ -40,6 +40,26 @@ async def _channel_trade_eligible(db: Database, channel_handle: str) -> bool:
     return bool(row[0])
 
 
+async def _channel_safety_required(db: Database, channel_handle: str) -> bool:
+    """True iff the channel requires GoPlus safety check completion before
+    trade. Defaults True (strict / fail-closed) on missing row or NULL —
+    the per-channel opt-in to lenient is explicit, never implicit.
+
+    Lenient channels still get the safety check run; only the
+    no-record/timeout/5xx path is permitted to pass through. Honeypot
+    or high-tax verdicts ALWAYS block, regardless of this flag.
+    """
+    cur = await db._conn.execute(
+        "SELECT safety_required FROM tg_social_channels "
+        "WHERE channel_handle = ? AND removed_at IS NULL",
+        (channel_handle,),
+    )
+    row = await cur.fetchone()
+    if row is None or row[0] is None:
+        return True
+    return bool(row[0])
+
+
 async def _has_open_tg_social_exposure(db: Database, token_id: str) -> bool:
     """Per-OPEN-exposure dedup: any tg_social_signals row whose linked
     paper_trades.status = 'open' for this token? Replaces v1's 24h-per-token
@@ -85,15 +105,28 @@ async def evaluate(
             reason="ticker-only resolution; auto-trade disabled by design",
         )
 
-    # Gate 4 part A: safety check must have COMPLETED (fail-closed)
+    # Gate 4 part A: safety check must have COMPLETED — but per-channel
+    # `safety_required=False` lets trusted curators bypass this for fresh
+    # tokens (e.g. Pump.fun memes minted ~30min ago that GoPlus hasn't
+    # indexed yet). The lenient path still passes through Gate 4 part B,
+    # so a CONFIRMED honeypot/high-tax verdict still blocks regardless.
     if not token.safety_check_completed:
-        return AdmissionDecision(
-            dispatch_trade=False,
-            blocked_gate="safety_unknown",
-            reason="GoPlus safety check did not complete (5xx/timeout/no-record)",
+        if await _channel_safety_required(db, channel_handle):
+            return AdmissionDecision(
+                dispatch_trade=False,
+                blocked_gate="safety_unknown",
+                reason="GoPlus safety check did not complete (5xx/timeout/no-record)",
+            )
+        log.info(
+            "tg_social_safety_unknown_lenient_pass",
+            channel_handle=channel_handle,
+            token_id=token.token_id,
+            symbol=token.symbol,
+            note="channel.safety_required=0 — trusting curator on no-record",
         )
-    # Gate 4 part B: safety verdict must PASS
-    if not token.safety_pass:
+    # Gate 4 part B: safety verdict must PASS — applies even on lenient
+    # channels. Honeypot/high-tax is a definitive verdict, not a no-record.
+    if token.safety_check_completed and not token.safety_pass:
         return AdmissionDecision(
             dispatch_trade=False,
             blocked_gate="safety_failed",

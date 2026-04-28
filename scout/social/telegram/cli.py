@@ -136,15 +136,26 @@ async def cmd_add(args, settings: Settings) -> int:
     await db.initialize()
     now_iso = datetime.now(timezone.utc).isoformat()
     trade_eligible = 0 if args.no_trade else 1
+    safety_required = 0 if args.no_safety else 1
     try:
         await db._conn.execute(
             """INSERT OR REPLACE INTO tg_social_channels
-               (channel_handle, display_name, trade_eligible, added_at, removed_at)
-               VALUES (?, ?, ?, ?, NULL)""",
-            (args.handle, args.display_name, trade_eligible, now_iso),
+               (channel_handle, display_name, trade_eligible, safety_required,
+                added_at, removed_at)
+               VALUES (?, ?, ?, ?, ?, NULL)""",
+            (
+                args.handle,
+                args.display_name,
+                trade_eligible,
+                safety_required,
+                now_iso,
+            ),
         )
         await db._conn.commit()
-        print(f"✅ Added {args.handle} (trade_eligible={trade_eligible})")
+        print(
+            f"✅ Added {args.handle} "
+            f"(trade_eligible={trade_eligible}, safety_required={safety_required})"
+        )
     finally:
         await db.close()
     return 0
@@ -190,6 +201,28 @@ async def cmd_set_trade(args, settings: Settings) -> int:
     return 0
 
 
+async def cmd_set_safety(args, settings: Settings) -> int:
+    """Toggle per-channel safety_required (strict vs lenient). Lenient lets
+    GoPlus no-record/timeout pass through; honeypot/high-tax still blocks."""
+    db = Database(settings.DB_PATH)
+    await db.initialize()
+    required = 1 if args.value.lower() in ("true", "1", "yes", "on") else 0
+    try:
+        cur = await db._conn.execute(
+            "UPDATE tg_social_channels SET safety_required = ? "
+            "WHERE channel_handle = ? AND removed_at IS NULL",
+            (required, args.handle),
+        )
+        await db._conn.commit()
+        if cur.rowcount == 0:
+            print(f"⚠️  {args.handle} not found.")
+            return 1
+        print(f"✅ {args.handle}.safety_required = {bool(required)}")
+    finally:
+        await db.close()
+    return 0
+
+
 async def cmd_sync_channels(args, settings: Settings) -> int:
     """Reconcile channels.yml → tg_social_channels.
 
@@ -208,32 +241,57 @@ async def cmd_sync_channels(args, settings: Settings) -> int:
     try:
         now_iso = datetime.now(timezone.utc).isoformat()
         added = 0
+        updated = 0
         for entry in yml_channels:
             handle = entry.get("handle")
             display = entry.get("display_name") or handle
             trade_eligible = 1 if entry.get("trade_eligible", True) else 0
+            # Default strict (safety_required=True) when the key is absent —
+            # opt-in to lenient is explicit, never implicit.
+            safety_required = 1 if entry.get("safety_required", True) else 0
             cur = await db._conn.execute(
-                "SELECT id FROM tg_social_channels WHERE channel_handle = ?",
+                "SELECT id, safety_required FROM tg_social_channels "
+                "WHERE channel_handle = ?",
                 (handle,),
             )
             row = await cur.fetchone()
             if row is None:
                 await db._conn.execute(
                     """INSERT INTO tg_social_channels
-                       (channel_handle, display_name, trade_eligible, added_at)
-                       VALUES (?, ?, ?, ?)""",
-                    (handle, display, trade_eligible, now_iso),
+                       (channel_handle, display_name, trade_eligible,
+                        safety_required, added_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (handle, display, trade_eligible, safety_required, now_iso),
                 )
                 added += 1
             else:
-                # Just unmark removed_at (re-activate) but DON'T overwrite trade_eligible
-                await db._conn.execute(
-                    "UPDATE tg_social_channels SET removed_at = NULL WHERE channel_handle = ?",
-                    (handle,),
-                )
+                # Reactivate via clearing removed_at. ALSO sync safety_required
+                # from yml so operators can flip the strict/lenient flag by
+                # editing yml + re-running sync — that's the documented
+                # operator workflow, and silently ignoring yml changes here
+                # would surprise them. trade_eligible still stays sticky
+                # because operators sometimes flip it via `set-trade` for
+                # incident response without intending to revert via yml.
+                if row[1] != safety_required:
+                    await db._conn.execute(
+                        "UPDATE tg_social_channels "
+                        "SET removed_at = NULL, safety_required = ? "
+                        "WHERE channel_handle = ?",
+                        (safety_required, handle),
+                    )
+                    updated += 1
+                else:
+                    await db._conn.execute(
+                        "UPDATE tg_social_channels SET removed_at = NULL "
+                        "WHERE channel_handle = ?",
+                        (handle,),
+                    )
         await db._conn.commit()
+        unchanged = len(yml_channels) - added - updated
         print(
-            f"✅ Sync complete: {added} added, {len(yml_channels) - added} reactivated/unchanged."
+            f"✅ Sync complete: {added} added, "
+            f"{updated} updated (safety_required), "
+            f"{unchanged} reactivated/unchanged."
         )
     finally:
         await db.close()
@@ -318,6 +376,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Mark channel alert-only (trade_eligible=0)",
     )
+    p_add.add_argument(
+        "--no-safety",
+        action="store_true",
+        help=(
+            "Mark channel lenient on GoPlus no-record/timeout "
+            "(safety_required=0). Honeypot/high-tax still blocks."
+        ),
+    )
 
     p_remove = sub.add_parser("remove", help="Soft-remove a channel")
     p_remove.add_argument("handle")
@@ -325,6 +391,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_set = sub.add_parser("set-trade", help="Toggle trade_eligible for a channel")
     p_set.add_argument("handle")
     p_set.add_argument("value", help="true/false")
+
+    p_safety = sub.add_parser(
+        "set-safety",
+        help="Toggle safety_required for a channel (strict vs lenient on no-record)",
+    )
+    p_safety.add_argument("handle")
+    p_safety.add_argument("value", help="true/false")
 
     sub.add_parser("sync-channels", help="Reconcile channels.yml → DB")
 
@@ -350,6 +423,7 @@ async def _main() -> int:
         "add": cmd_add,
         "remove": cmd_remove,
         "set-trade": cmd_set_trade,
+        "set-safety": cmd_set_safety,
         "sync-channels": cmd_sync_channels,
         "replay-dlq": cmd_replay_dlq,
     }
