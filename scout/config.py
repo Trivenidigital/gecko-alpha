@@ -235,7 +235,19 @@ class Settings(BaseSettings):
     PAPER_LADDER_LEG_2_PCT: float = 50.0
     PAPER_LADDER_LEG_2_QTY_FRAC: float = 0.30
     PAPER_LADDER_TRAIL_PCT: float = 12.0
+    # Adaptive trail (2026-04-28): when a trade's peak_pct is below the
+    # low-peak threshold, use a tighter trail to harvest profit on modest
+    # peakers before they fade. When peak ≥ threshold, the full
+    # PAPER_LADDER_TRAIL_PCT applies. Post-moonshot, the moonshot trail
+    # always wins. Must be < PAPER_LADDER_TRAIL_PCT.
+    PAPER_LADDER_TRAIL_PCT_LOW_PEAK: float = 8.0
+    PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT: float = 20.0
     PAPER_LADDER_FLOOR_ARM_ON_LEG_1: bool = True
+    # Per-signal-type kill switches (2026-04-28 strategy review). Net-loser
+    # signals can be disabled at their call sites without removing source
+    # code — flip via .env when the underlying market behavior changes.
+    PAPER_SIGNAL_LOSERS_CONTRARIAN_ENABLED: bool = True
+    PAPER_SIGNAL_TRENDING_CATCH_ENABLED: bool = True
     # BL-063 moonshot exit upgrade: when peak_pct crosses MOONSHOT_THRESHOLD_PCT,
     # widen the BL-061 ladder trail from PAPER_LADDER_TRAIL_PCT to
     # PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT so big runners aren't clipped early.
@@ -626,6 +638,53 @@ class Settings(BaseSettings):
                 "PAPER_LADDER_TRAIL_PCT (moonshot widens the trail); "
                 f"got moonshot={self.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT}, "
                 f"ladder={self.PAPER_LADDER_TRAIL_PCT}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_low_peak_trail(self) -> "Settings":
+        """Adaptive trail invariants:
+          - low_peak trail must be in (0, 100)
+          - low_peak threshold must be in (0, moonshot_threshold)
+          - low_peak trail must be < full trail (tighter on modest peakers)
+
+        A misconfigured low_peak ≥ full would silently INVERT the strategy —
+        modest peakers would have looser trail than runners.
+        """
+        if not (0 < self.PAPER_LADDER_TRAIL_PCT_LOW_PEAK < 100):
+            raise ValueError(
+                "PAPER_LADDER_TRAIL_PCT_LOW_PEAK must be in (0, 100); "
+                f"got={self.PAPER_LADDER_TRAIL_PCT_LOW_PEAK}"
+            )
+        if self.PAPER_LADDER_TRAIL_PCT_LOW_PEAK >= self.PAPER_LADDER_TRAIL_PCT:
+            raise ValueError(
+                "PAPER_LADDER_TRAIL_PCT_LOW_PEAK must be < PAPER_LADDER_TRAIL_PCT "
+                "(tighter trail on modest peakers); "
+                f"got low_peak={self.PAPER_LADDER_TRAIL_PCT_LOW_PEAK}, "
+                f"full={self.PAPER_LADDER_TRAIL_PCT}"
+            )
+        if self.PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT <= 0:
+            raise ValueError(
+                "PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT must be > 0; "
+                f"got={self.PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT}"
+            )
+        # If moonshot is enabled, low-peak threshold must be below the moonshot
+        # threshold. Otherwise a peak in [moonshot, low_peak] is ambiguous —
+        # moonshot logic catches it via moonshot_armed_at, but the read-order
+        # in the evaluator picks low_peak vs full BEFORE checking moonshot_armed,
+        # so an inverted relationship would mean a peak ≥ moonshot uses the
+        # tighter trail until the next eval pass arms moonshot. The ordering
+        # invariant is `low_peak_threshold < moonshot_threshold`.
+        if (
+            self.PAPER_MOONSHOT_ENABLED
+            and self.PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT
+            >= self.PAPER_MOONSHOT_THRESHOLD_PCT
+        ):
+            raise ValueError(
+                "PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT must be < "
+                "PAPER_MOONSHOT_THRESHOLD_PCT when moonshot is enabled; "
+                f"got low_peak={self.PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT}, "
+                f"moonshot={self.PAPER_MOONSHOT_THRESHOLD_PCT}"
             )
         return self
 

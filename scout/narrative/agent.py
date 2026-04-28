@@ -128,7 +128,12 @@ async def narrative_agent_loop(
                     await fetch_and_store_trending(
                         session, db, settings.COINGECKO_API_KEY
                     )
-                    if trading_engine:
+                    # trending_catch historically net-loses (-$339 / 86 trades);
+                    # disabled in prod via PAPER_SIGNAL_TRENDING_CATCH_ENABLED=False.
+                    if (
+                        trading_engine
+                        and settings.PAPER_SIGNAL_TRENDING_CATCH_ENABLED
+                    ):
                         await trade_trending(
                             trading_engine,
                             db,

@@ -340,12 +340,24 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                         # microsecond drift of a fresh datetime.now() here.
                         moonshot_armed_at = armed_ts
 
-                # Effective trail width for this trade: widened if moonshot armed.
-                effective_trail_pct = (
-                    settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT
-                    if moonshot_armed_at is not None
-                    else settings.PAPER_LADDER_TRAIL_PCT
-                )
+                # Effective trail width: widest tier wins.
+                # - Post-moonshot:    PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT
+                # - peak ≥ low-peak threshold: PAPER_LADDER_TRAIL_PCT (full)
+                # - peak < threshold: PAPER_LADDER_TRAIL_PCT_LOW_PEAK (tighter)
+                # Closes 2026-04-28 strategy review: 91% of trades that peak
+                # ≥10% win, but the wide 20% trail meant a +14%-peak fader
+                # didn't fire until -6% (negative). The tighter low-peak
+                # trail harvests profit on modest peakers without choking
+                # moonshots (those go through the moonshot branch above).
+                if moonshot_armed_at is not None:
+                    effective_trail_pct = settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT
+                elif (
+                    peak_pct is not None
+                    and peak_pct < settings.PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT
+                ):
+                    effective_trail_pct = settings.PAPER_LADDER_TRAIL_PCT_LOW_PEAK
+                else:
+                    effective_trail_pct = settings.PAPER_LADDER_TRAIL_PCT
 
                 close_reason = None
                 close_status: str | None = None
