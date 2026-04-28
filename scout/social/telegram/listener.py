@@ -12,11 +12,11 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import aiohttp
 import structlog
-from telethon import events
+from telethon import TelegramClient, events
 from telethon.errors import (
     AuthKeyError,
     ChannelPrivateError,
@@ -46,6 +46,36 @@ from scout.social.telegram.resolver import resolve_and_enrich
 from scout.trading.engine import TradingEngine
 
 log = structlog.get_logger()
+
+
+# Single source of truth for valid `tg_social_health.listener_state` values.
+# Mypy/pyright catches typos at type-check time.
+ListenerState = Literal[
+    "running", "crashed", "stopped", "auth_lost", "disabled_floodwait"
+]
+
+# Telethon raises bare ValueError for "no entity found" in some versions.
+# Match by message prefix so we don't swallow unrelated ValueErrors from
+# downstream code paths (Pydantic validation, parameter coercion, etc.).
+_TELETHON_ENTITY_NOT_FOUND_PREFIXES = (
+    "Cannot find any entity",
+    "No user has",
+    "No user has username",
+    "Could not find the input entity",
+)
+
+
+def _is_telethon_entity_resolution_error(exc: ValueError) -> bool:
+    """True iff `exc` matches Telethon's bare-ValueError shape for missing
+    entities. Used to scope the catchup except-tuple narrowly."""
+    msg = str(exc)
+    return any(msg.startswith(p) for p in _TELETHON_ENTITY_NOT_FOUND_PREFIXES)
+
+
+def _crash_detail(exc: BaseException, limit: int = 200) -> str:
+    """Single source of truth for "{ExceptionClass}: {short message}"
+    truncation. Replaces the previous mix of 180/200/300-char inline slices."""
+    return f"{type(exc).__name__}: {str(exc)[:limit]}"
 
 
 async def send_telegram(
@@ -306,22 +336,16 @@ async def _persist_message_with_watermark(
     """Single transaction: BEGIN IMMEDIATE → INSERT message + UPDATE watermark
     + UPDATE health → COMMIT (or ROLLBACK on failure).
 
-    Watermark advances atomically with the message persist so a crash anywhere
-    in the pipeline is safe: UNIQUE(channel_handle, msg_id) makes catchup
-    replay idempotent and the watermark cannot lead OR trail the messages
-    table out of sync. Closes silent-failure HIGH#2 properly.
+    Watermark advances atomically with the message persist: UNIQUE(channel_handle,
+    msg_id) makes catchup replay idempotent and the watermark cannot lead OR
+    trail the messages table out of sync.
+
+    Holds db._txn_lock (the project-wide single-writer lock) so concurrent
+    channels don't interleave BEGIN IMMEDIATE on the shared aiosqlite
+    connection — sqlite refuses nested BEGINs.
 
     Returns the inserted row pk, or None if the message was a duplicate
     (UNIQUE conflict — normal during catchup re-run).
-
-    Holds db._txn_lock for the entire BEGIN…COMMIT window. This is the
-    project-wide pattern (engine.py, kill_switch.py, metrics.py, resolver.py,
-    shadow_evaluator.py, combo_refresh.py, suppression.py all use it).
-    The original implementation used a per-channel lock instead, which let
-    two channels' coroutines interleave at the BEGIN IMMEDIATE step on the
-    shared aiosqlite connection — producing OperationalError "cannot start
-    a transaction within a transaction" on 66% of catchup persists. Closes
-    fix/bl-064-listener-resilience.
     """
     import aiosqlite
 
@@ -672,8 +696,47 @@ async def handle_new_message(
     )
 
 
+async def _mark_channel_removed_and_alert(
+    *,
+    db: Database,
+    http_session: aiohttp.ClientSession,
+    telegram_bot_token: str,
+    telegram_chat_id: str,
+    channel_handle: str,
+    exc: BaseException,
+) -> None:
+    """Mark a channel as removed_at and emit a best-effort Telegram alert.
+
+    Shared between the explicit-Telethon-error and bare-ValueError branches
+    of `_catchup_channel`. Uses log.exception (not log.warning) so the
+    traceback is preserved — operators need it to distinguish between an
+    actually-removed channel and a downstream bug that triggered the catch.
+    """
+    log.exception(
+        "tg_social_channel_access_error",
+        channel_handle=channel_handle,
+        error=type(exc).__name__,
+        error_text=str(exc)[:200],
+    )
+    await db._conn.execute(
+        "UPDATE tg_social_channels SET removed_at = ? WHERE channel_handle = ?",
+        (datetime.now(timezone.utc).isoformat(), channel_handle),
+    )
+    await db._conn.commit()
+    try:
+        await send_telegram(
+            http_session,
+            telegram_bot_token,
+            telegram_chat_id,
+            f"⚠️ tg_social: lost access to {channel_handle} "
+            f"({type(exc).__name__}); marked removed_at.",
+        )
+    except Exception:
+        log.warning("tg_social_alert_send_failed_on_kicked")
+
+
 async def _set_listener_state(
-    db: Database, state: str, detail: str | None = None
+    db: Database, state: ListenerState, detail: str | None = None
 ) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
     await db._conn.execute(
@@ -690,7 +753,7 @@ async def _set_listener_state(
 
 async def _catchup_channel(
     *,
-    client,
+    client: TelegramClient,
     db: Database,
     settings: Settings,
     engine: TradingEngine,
@@ -742,37 +805,30 @@ async def _catchup_channel(
         ChatAdminRequiredError,
         UsernameInvalidError,
         UsernameNotOccupiedError,
-        ValueError,
     ) as e:
-        # ValueError covers Telethon's "Cannot find any entity corresponding to..."
-        # and "No user has username..." paths that surface as bare ValueError
-        # depending on Telethon version. Without this, one bad handle in
-        # channels.yml killed the entire listener task: iter_messages raised,
-        # the except didn't match, exception propagated to gather(return_exceptions=
-        # True) which silently swallowed it. tg_social_health.listener_state
-        # stayed 'running' (state was set before catchup) — health was lying
-        # for ~24h until manual diagnosis. See PR fix/bl-064-listener-resilience.
-        log.warning(
-            "tg_social_channel_access_error",
+        await _mark_channel_removed_and_alert(
+            db=db,
+            http_session=http_session,
+            telegram_bot_token=telegram_bot_token,
+            telegram_chat_id=telegram_chat_id,
             channel_handle=channel_handle,
-            error=type(e).__name__,
-            error_text=str(e)[:200],
+            exc=e,
         )
-        await db._conn.execute(
-            "UPDATE tg_social_channels SET removed_at = ? WHERE channel_handle = ?",
-            (datetime.now(timezone.utc).isoformat(), channel_handle),
+    except ValueError as e:
+        # Telethon emits bare ValueError for "no entity found" in some
+        # versions. Match by message prefix to avoid swallowing unrelated
+        # ValueErrors from downstream code (Pydantic, parameter coercion,
+        # etc.) — those should propagate.
+        if not _is_telethon_entity_resolution_error(e):
+            raise
+        await _mark_channel_removed_and_alert(
+            db=db,
+            http_session=http_session,
+            telegram_bot_token=telegram_bot_token,
+            telegram_chat_id=telegram_chat_id,
+            channel_handle=channel_handle,
+            exc=e,
         )
-        await db._conn.commit()
-        try:
-            await send_telegram(
-                http_session,
-                telegram_bot_token,
-                telegram_chat_id,
-                f"⚠️ tg_social: lost access to {channel_handle} ({type(e).__name__}); "
-                f"marked removed_at.",
-            )
-        except Exception:
-            log.warning("tg_social_alert_send_failed_on_kicked")
     except FloodWaitError as fwe:
         # Catchup-time FloodWait: log and re-raise to caller (run_listener)
         # which decides whether to circuit-break (closes code-review BLOCKER #1).
@@ -835,12 +891,9 @@ async def run_listener(
     await _set_listener_state(db, "running")
     log.info("tg_social_listener_started", **info)
 
-    # Top-level crash watchdog — any unhandled exception inside catchup,
-    # handler attach, or run_until_disconnected flips listener_state to
-    # 'crashed' and emits a Telegram alert before re-raising. Without this,
-    # asyncio.gather(return_exceptions=True) in main.py silently swallows
-    # the exception and tg_social_health.listener_state keeps lying with
-    # 'running'. Closes fix/bl-064-listener-resilience.
+    # Top-level crash watchdog. Without this, an unhandled exception in
+    # the body propagates to asyncio.gather(return_exceptions=True) in
+    # main.py and is swallowed — listener_state would lie 'running' forever.
     try:
         await _run_listener_body(
             db=db,
@@ -849,24 +902,32 @@ async def run_listener(
             http_session=http_session,
             client=client,
         )
+    except AuthKeyError:
+        # Already stamped 'auth_lost' inside _run_listener_body; don't
+        # overwrite that more-specific terminal state with 'crashed'.
+        raise
     except Exception as exc:
         log.exception(
             "tg_social_listener_crashed",
             error_class=type(exc).__name__,
             error_text=str(exc)[:300],
         )
-        await _set_listener_state(
-            db,
-            "crashed",
-            detail=f"{type(exc).__name__}: {str(exc)[:180]}",
-        )
+        # Each side-effect (state flip + alert send) is wrapped in its own
+        # try/except so a failure in one cannot suppress the original `exc`
+        # — that would recreate the silent-failure mode this PR is fixing.
+        try:
+            await _set_listener_state(
+                db, "crashed", detail=_crash_detail(exc, limit=180)
+            )
+        except Exception:
+            log.exception("tg_social_set_crashed_state_failed")
         try:
             await send_telegram(
                 http_session,
                 settings.TELEGRAM_BOT_TOKEN,
                 settings.TELEGRAM_CHAT_ID,
-                f"🛑 tg_social listener crashed: {type(exc).__name__}: "
-                f"{str(exc)[:200]}. Restart pipeline after diagnosing.",
+                f"🛑 tg_social listener crashed: {_crash_detail(exc)}. "
+                f"Restart pipeline after diagnosing.",
             )
         except Exception:
             log.warning("tg_social_alert_send_failed_on_crash")
@@ -879,10 +940,11 @@ async def _run_listener_body(
     settings: Settings,
     engine: TradingEngine,
     http_session: aiohttp.ClientSession,
-    client,
+    client: TelegramClient,
 ) -> None:
-    """Inner listener body — extracted so run_listener can wrap it in a
-    top-level crash handler without entangling the pre-running auth_lost path."""
+    """Inner listener body. Extracted so run_listener can wrap it in a
+    top-level crash handler without entangling the pre-running auth_lost
+    path (which is set + raised before this function is entered)."""
     # Load active channels
     cur = await db._conn.execute(
         "SELECT channel_handle FROM tg_social_channels WHERE removed_at IS NULL"
@@ -949,10 +1011,6 @@ async def _run_listener_body(
             except Exception:
                 log.exception("tg_social_silence_heartbeat_error")
 
-    silence_task = asyncio.create_task(_silence_heartbeat())
-    _track_task(silence_task)
-
-    @client.on(events.NewMessage(chats=channels))
     async def _on_new(event):
         try:
             await handle_new_message(
@@ -1029,12 +1087,25 @@ async def _run_listener_body(
                 e,
             )
 
+    # silence_task creation, handler attach, and run_until_disconnected
+    # all share one try/finally: silence_task MUST be cancelled on every
+    # exit path or the heartbeat keeps firing after the listener dies. The
+    # `success` guard ensures 'stopped' only stamps on the clean exit path —
+    # if run_until_disconnected raised, the outer crash-watchdog (or the
+    # AuthKey/FloodWait branches in _on_new) stamps the more-specific
+    # terminal state.
+    silence_task = asyncio.create_task(_silence_heartbeat())
+    _track_task(silence_task)
+    success = False
     try:
+        client.on(events.NewMessage(chats=channels))(_on_new)
         await client.run_until_disconnected()
+        success = True
     finally:
-        await _set_listener_state(
-            db, "stopped", detail="run_until_disconnected returned"
-        )
+        if success:
+            await _set_listener_state(
+                db, "stopped", detail="run_until_disconnected returned"
+            )
         silence_task.cancel()
 
 
