@@ -402,28 +402,35 @@ async def test_authkey_error_preserves_auth_lost_state(
 async def test_concurrent_persists_use_shared_txn_lock(tmp_path, monkeypatch):
     """Reproduces the prod 'cannot start a transaction within a transaction'
     OperationalError. The bug only triggers when two persist coroutines
-    interleave at the BEGIN IMMEDIATE step on the shared aiosqlite
-    connection. This test forces interleaving by injecting an
-    `await asyncio.sleep(0)` between BEGIN and INSERT — without
-    `db._txn_lock` serializing the entire BEGIN…COMMIT, the second
-    coroutine's BEGIN attempt would hit sqlite's "transaction already
-    open" error.
+    interleave on the shared aiosqlite connection. This test forces
+    interleaving by injecting `await asyncio.sleep(0)` immediately after
+    each persist's first INSERT (which is what triggers aiosqlite's
+    implicit auto-BEGIN). Without `db._txn_lock` serializing the entire
+    INSERT…COMMIT block, two coroutines could both have implicit
+    transactions open against the same connection — the trailing
+    coroutine's commit would either flush the leading coroutine's writes
+    too early, or the conflict would surface as an OperationalError on
+    the next execute.
     """
     db = Database(tmp_path / "t.db")
     await db.initialize()
 
-    # Patch in a deterministic yield to force the scheduler to interleave.
-    # Without _txn_lock, this would expose the nested-BEGIN bug; with it,
-    # the second coroutine simply waits for the lock.
     real_execute = db._conn.execute
-    saw_begin_count = 0
+    saw_first_insert_count = 0
 
     async def _yielding_execute(sql, *args, **kwargs):
-        nonlocal saw_begin_count
+        nonlocal saw_first_insert_count
         result = await real_execute(sql, *args, **kwargs)
-        if isinstance(sql, str) and sql.strip().upper().startswith("BEGIN"):
-            saw_begin_count += 1
-            await asyncio.sleep(0)  # force scheduler to swap
+        # Hook just the first INSERT in each persist call (messages table)
+        # to force scheduler interleaving at exactly the implicit-BEGIN
+        # boundary. Without _txn_lock, two coroutines would simultaneously
+        # have writes pending on the connection.
+        if (
+            isinstance(sql, str)
+            and "INSERT INTO tg_social_messages" in sql
+        ):
+            saw_first_insert_count += 1
+            await asyncio.sleep(0)
         return result
 
     monkeypatch.setattr(db._conn, "execute", _yielding_execute)
@@ -454,7 +461,9 @@ async def test_concurrent_persists_use_shared_txn_lock(tmp_path, monkeypatch):
     cur = await db._conn.execute("SELECT COUNT(*) FROM tg_social_watermarks")
     (count,) = await cur.fetchone()
     assert count == 8
-    assert saw_begin_count >= 8, "test must actually hit BEGIN at least 8 times"
+    assert saw_first_insert_count >= 8, (
+        "test must actually hit the messages-table INSERT at least 8 times"
+    )
     await db.close()
 
 
