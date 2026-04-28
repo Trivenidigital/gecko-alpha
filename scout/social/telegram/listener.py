@@ -340,12 +340,20 @@ async def _persist_message_with_watermark(
     msg_id) makes catchup replay idempotent and the watermark cannot lead OR
     trail the messages table out of sync.
 
-    Holds db._txn_lock (the project-wide single-writer lock) so concurrent
-    channels don't interleave BEGIN IMMEDIATE on the shared aiosqlite
-    connection — sqlite refuses nested BEGINs.
+    Uses the project-wide pattern (engine.py / kill_switch.py / metrics.py /
+    etc.): hold `db._txn_lock` and rely on aiosqlite's implicit deferred
+    transaction sealed by `commit()`. NO explicit `BEGIN IMMEDIATE` —
+    other code paths in the project don't acquire `_txn_lock` and trigger
+    auto-BEGIN on the shared connection, which would make our explicit
+    BEGIN IMMEDIATE fail with "cannot start a transaction within a
+    transaction." `_txn_lock` already gives us single-writer semantics
+    inside the block; SQLite IMMEDIATE eagerness is unnecessary here.
 
-    Returns the inserted row pk, or None if the message was a duplicate
-    (UNIQUE conflict — normal during catchup re-run).
+    On UNIQUE-constraint failure for the messages row (catchup re-run hit
+    a row already inserted), rollback any in-flight statements via
+    `conn.rollback()` and return None.
+
+    Returns the inserted row pk, or None if the message was a duplicate.
     """
     import aiosqlite
 
@@ -361,7 +369,6 @@ async def _persist_message_with_watermark(
 
     async with db._txn_lock:
         try:
-            await conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = await conn.execute(
                     """INSERT INTO tg_social_messages
@@ -382,26 +389,19 @@ async def _persist_message_with_watermark(
                 )
                 message_pk = cur.lastrowid
             except aiosqlite.IntegrityError as e:
-                # Specifically check for UNIQUE(channel_handle, msg_id) on the
-                # messages table; other IntegrityErrors (FK, NOT NULL, UNIQUE
-                # on a different table) propagate. Use sqlite_errorname when
-                # available (Python 3.11+) instead of the fragile substring
-                # match flagged in round-2 Medium #1 — error messages can
-                # change across SQLite versions.
+                # Detect UNIQUE(channel_handle, msg_id) on the messages table.
+                # Use sqlite_errorname (Python 3.11+) when available; fall back
+                # to a table-scoped substring match on older versions.
                 err_name = getattr(e, "sqlite_errorname", None)
-                # aiosqlite wraps sqlite3.IntegrityError; the underlying may
-                # surface via __cause__ on older versions.
                 if err_name is None and e.__cause__ is not None:
                     err_name = getattr(e.__cause__, "sqlite_errorname", None)
                 is_unique_violation = err_name == "SQLITE_CONSTRAINT_UNIQUE"
-                # Fallback for Python < 3.11 / aiosqlite versions without the
-                # attribute: scope the substring match to the messages table.
                 if err_name is None:
                     is_unique_violation = (
                         "tg_social_messages" in str(e) and "UNIQUE" in str(e).upper()
                     )
                 if is_unique_violation:
-                    await conn.execute("ROLLBACK")
+                    await conn.rollback()
                     log.info(
                         "tg_social_message_duplicate_skipped",
                         channel_handle=channel_handle,
@@ -432,7 +432,7 @@ async def _persist_message_with_watermark(
             return message_pk
         except Exception:
             try:
-                await conn.execute("ROLLBACK")
+                await conn.rollback()
             except Exception:
                 pass
             raise
