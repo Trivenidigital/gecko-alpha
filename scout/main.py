@@ -456,7 +456,9 @@ async def run_cycle(
             )
         except Exception:
             logger.exception("losers_tracker_error")
-        if trading_engine:
+        # losers_contrarian historically net-loses (-$581 / 109 trades);
+        # disabled by default in prod via PAPER_SIGNAL_LOSERS_CONTRARIAN_ENABLED=False.
+        if trading_engine and settings.PAPER_SIGNAL_LOSERS_CONTRARIAN_ENABLED:
             try:
                 await trade_losers(
                     trading_engine,
