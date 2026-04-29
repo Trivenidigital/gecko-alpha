@@ -327,6 +327,23 @@ class Settings(BaseSettings):
     FEEDBACK_COMBO_REFRESH_HOUR: int = 3
     FEEDBACK_FALLBACK_ALERT_THRESHOLD: int = 5
     FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC: int = 900
+
+    # Tier 1a + 1b (signal-params self-tuning). Default OFF — first deploy
+    # is a no-op: the migration seeds the table from current Settings, but
+    # the evaluator/engine keep reading from Settings until the flag flips.
+    SIGNAL_PARAMS_ENABLED: bool = False
+    # Auto-suspension thresholds. PNL_THRESHOLD requires at least MIN_TRADES;
+    # HARD_LOSS bypasses the trade floor for catastrophic bleed.
+    SIGNAL_SUSPEND_PNL_THRESHOLD_USD: float = -200.0
+    SIGNAL_SUSPEND_HARD_LOSS_USD: float = -500.0
+    SIGNAL_SUSPEND_MIN_TRADES: int = 50
+    SUSPENSION_CHECK_HOUR: int = 1  # local hour, in-loop scheduler
+    # Calibration — dry-run by default; --apply gated on Telegram health
+    # unless --force-no-alert. Trade-count floor mirrors suspension floor
+    # so we don't tune on noise.
+    CALIBRATION_MIN_TRADES: int = 50
+    CALIBRATION_WINDOW_DAYS: int = 30
+    CALIBRATION_STEP_SIZE_PCT: float = 2.0
     FEEDBACK_CHRONIC_FAILURE_THRESHOLD: int = 3
 
     # -------- Perp WebSocket Anomaly Detector (BL-054) --------

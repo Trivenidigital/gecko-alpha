@@ -71,6 +71,7 @@ class Database:
         await self._create_tables()
         await self._migrate_feedback_loop_schema()
         await self._migrate_live_trading_schema()
+        await self._migrate_signal_params_schema()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -1337,6 +1338,150 @@ class Database:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             _log.error("SCHEMA_DRIFT_DETECTED")
             raise
+
+    async def _migrate_signal_params_schema(self) -> None:
+        """Tier 1a + 1b: per-signal-type ladder/SL params + audit log.
+
+        Mirrors the BL-055 / BL-061 migration style: ``BEGIN EXCLUSIVE`` +
+        per-statement execute + explicit commit/ROLLBACK. No ``executescript``
+        (implicit COMMIT defeats rollback). No explicit ``BEGIN IMMEDIATE``
+        (per BL-064 lesson — matches project _txn_lock pattern).
+
+        Idempotent on every dimension: ``CREATE TABLE IF NOT EXISTS``,
+        ``CREATE INDEX IF NOT EXISTS``, ``INSERT OR IGNORE`` on the seed rows
+        and the cutover marker.
+
+        Seed values come from current Settings, so the first ``--apply``
+        diff is a no-op until the operator actually wants new values.
+        """
+        import structlog
+
+        from scout.config import Settings
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+
+        # Local import to avoid a config -> db -> trading.params -> db cycle.
+        # DEFAULT_SIGNAL_TYPES lives in trading.params; importing it here keeps
+        # the seed list in one place.
+        from scout.trading.params import DEFAULT_SIGNAL_TYPES
+
+        ddl_statements: list[str] = [
+            """
+            CREATE TABLE IF NOT EXISTS signal_params (
+                signal_type             TEXT PRIMARY KEY,
+                leg_1_pct               REAL    NOT NULL,
+                leg_1_qty_frac          REAL    NOT NULL,
+                leg_2_pct               REAL    NOT NULL,
+                leg_2_qty_frac          REAL    NOT NULL,
+                trail_pct               REAL    NOT NULL,
+                trail_pct_low_peak      REAL    NOT NULL,
+                low_peak_threshold_pct  REAL    NOT NULL,
+                sl_pct                  REAL    NOT NULL,
+                max_duration_hours      INTEGER NOT NULL,
+                enabled                 INTEGER NOT NULL DEFAULT 1,
+                suspended_at            TEXT,
+                suspended_reason        TEXT,
+                updated_at              TEXT    NOT NULL DEFAULT (datetime('now')),
+                updated_by              TEXT    NOT NULL,
+                last_calibration_at     TEXT,
+                last_calibration_reason TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS signal_params_audit (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_type     TEXT NOT NULL,
+                field_name      TEXT NOT NULL,
+                old_value       TEXT,
+                new_value       TEXT,
+                reason          TEXT NOT NULL,
+                applied_by      TEXT NOT NULL,
+                applied_at      TEXT NOT NULL
+            )
+            """,
+            (
+                "CREATE INDEX IF NOT EXISTS idx_signal_params_audit_signal_at "
+                "ON signal_params_audit(signal_type, applied_at)"
+            ),
+        ]
+
+        # Seed values come from Settings *class-level defaults* (not a fresh
+        # Settings() — that would require env vars at migration time, including
+        # secrets the test environment doesn't have). model_fields stays in
+        # sync with the Settings class without needing .env. This is a one-shot
+        # seed; subsequent calibration/operator updates are the source of truth.
+        fields = Settings.model_fields
+        defaults = {name: fields[name].default for name in (
+            "PAPER_LADDER_LEG_1_PCT", "PAPER_LADDER_LEG_1_QTY_FRAC",
+            "PAPER_LADDER_LEG_2_PCT", "PAPER_LADDER_LEG_2_QTY_FRAC",
+            "PAPER_LADDER_TRAIL_PCT", "PAPER_LADDER_TRAIL_PCT_LOW_PEAK",
+            "PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT", "PAPER_SL_PCT",
+            "PAPER_MAX_DURATION_HOURS",
+        )}
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            for stmt in ddl_statements:
+                await conn.execute(stmt)
+
+            # Seed one row per known signal_type.
+            for signal_type in sorted(DEFAULT_SIGNAL_TYPES):
+                await conn.execute(
+                    """INSERT OR IGNORE INTO signal_params (
+                        signal_type, leg_1_pct, leg_1_qty_frac,
+                        leg_2_pct, leg_2_qty_frac, trail_pct,
+                        trail_pct_low_peak, low_peak_threshold_pct,
+                        sl_pct, max_duration_hours,
+                        enabled, updated_at, updated_by
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'seed')""",
+                    (
+                        signal_type,
+                        defaults["PAPER_LADDER_LEG_1_PCT"],
+                        defaults["PAPER_LADDER_LEG_1_QTY_FRAC"],
+                        defaults["PAPER_LADDER_LEG_2_PCT"],
+                        defaults["PAPER_LADDER_LEG_2_QTY_FRAC"],
+                        defaults["PAPER_LADDER_TRAIL_PCT"],
+                        defaults["PAPER_LADDER_TRAIL_PCT_LOW_PEAK"],
+                        defaults["PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT"],
+                        defaults["PAPER_SL_PCT"],
+                        defaults["PAPER_MAX_DURATION_HOURS"],
+                        now_iso,
+                    ),
+                )
+
+            # Behavioural cutover marker (matches BL-061..BL-064 pattern).
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("signal_params_v1", now_iso),
+            )
+            # Code-level schema version stamp (matches BL-055 pattern).
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260429, now_iso, "tier_1a_signal_params_v1"),
+            )
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="signal_params_v1")
+            raise
+
+        # Post-assertion — cutover row must exist.
+        cur = await conn.execute(
+            "SELECT 1 FROM paper_migrations WHERE name = ?",
+            ("signal_params_v1",),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError("signal_params_v1 cutover row missing after migration")
 
     # ------------------------------------------------------------------
     # Candidates

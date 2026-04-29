@@ -9,6 +9,11 @@ import structlog
 
 from scout.db import Database
 from scout.trading.paper import PaperTrader
+from scout.trading.params import (
+    DEFAULT_SIGNAL_TYPES,
+    UnknownSignalType,
+    get_params,
+)
 
 log = structlog.get_logger()
 
@@ -121,7 +126,33 @@ class TradingEngine:
         if conn is None:
             raise RuntimeError("Database not initialized.")
 
-        # 0. Startup warmup: a real trader doesn't bulk-enter on boot.
+        # 0a. Tier 1a kill switch — finer-grained than .env-level
+        # PAPER_SIGNAL_*_ENABLED flags. When SIGNAL_PARAMS_ENABLED=False,
+        # get_params() returns enabled=True from Settings (no behaviour
+        # change). When the flag is on, signal_params.enabled is honoured.
+        # Unknown signal_types raise — that's a typo/bug, not a runtime
+        # condition to silently swallow.
+        try:
+            signal_params = await get_params(self.db, signal_type, self.settings)
+        except UnknownSignalType:
+            log.error(
+                "trade_skipped_unknown_signal_type",
+                err_id="SIGNAL_PARAMS_UNKNOWN_TYPE",
+                token_id=token_id,
+                signal_type=signal_type,
+                known=sorted(DEFAULT_SIGNAL_TYPES),
+            )
+            return None
+        if not signal_params.enabled:
+            log.info(
+                "trade_skipped_signal_disabled",
+                token_id=token_id,
+                signal_type=signal_type,
+                source=signal_params.source,
+            )
+            return None
+
+        # 0b. Startup warmup: a real trader doesn't bulk-enter on boot.
         warmup = getattr(self.settings, "PAPER_STARTUP_WARMUP_SECONDS", 0) or 0
         if warmup > 0:
             elapsed = time.monotonic() - self._started_at
@@ -242,7 +273,10 @@ class TradingEngine:
                 current_price=current_price,
                 amount_usd=trade_amount,
                 tp_pct=self.settings.PAPER_TP_PCT,
-                sl_pct=self.settings.PAPER_SL_PCT,
+                # Per-signal sl_pct stamps onto the row so the evaluator
+                # respects the params in effect at open time, even if
+                # calibration changes them later.
+                sl_pct=signal_params.sl_pct,
                 slippage_bps=self.settings.PAPER_SLIPPAGE_BPS,
                 signal_combo=signal_combo,
                 lead_time_vs_trending_min=lead_time_min,

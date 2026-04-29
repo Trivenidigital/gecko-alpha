@@ -721,6 +721,104 @@ def create_app(db_path: str | None = None) -> FastAPI:
         finally:
             _ws_clients.discard(ws)
 
+    @app.get("/api/signal_params")
+    async def get_signal_params():
+        """Per-signal params + rolling 30d performance + flag state.
+
+        ``effective_source`` is "settings" when SIGNAL_PARAMS_ENABLED=False
+        (table values shown but NOT in use) — the frontend renders a
+        warning banner in that case so the operator never thinks
+        post-calibration values are live when they aren't.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        from scout.config import Settings
+
+        settings = Settings()
+        scout_db = await _get_scout_db(_db_path)
+        conn = scout_db._conn
+        flag_enabled = bool(settings.SIGNAL_PARAMS_ENABLED)
+
+        cur = await conn.execute(
+            """SELECT signal_type, leg_1_pct, leg_1_qty_frac, leg_2_pct,
+                      leg_2_qty_frac, trail_pct, trail_pct_low_peak,
+                      low_peak_threshold_pct, sl_pct, max_duration_hours,
+                      enabled, suspended_at, suspended_reason,
+                      last_calibration_at, last_calibration_reason
+               FROM signal_params ORDER BY signal_type"""
+        )
+        rows = await cur.fetchall()
+
+        since_iso = (
+            datetime.now(timezone.utc) - timedelta(days=30)
+        ).isoformat()
+        params = []
+        for r in rows:
+            stat_cur = await conn.execute(
+                """SELECT COUNT(*),
+                          COALESCE(SUM(pnl_usd), 0),
+                          SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END)
+                   FROM paper_trades
+                   WHERE signal_type = ?
+                     AND status LIKE 'closed_%'
+                     AND datetime(closed_at) >= datetime(?)""",
+                (r[0], since_iso),
+            )
+            n, net, wins = await stat_cur.fetchone()
+            n = n or 0
+            wins = wins or 0
+            win_pct = round(100.0 * wins / n, 1) if n > 0 else 0.0
+            params.append(
+                {
+                    "signal_type": r[0],
+                    "leg_1_pct": r[1],
+                    "leg_1_qty_frac": r[2],
+                    "leg_2_pct": r[3],
+                    "leg_2_qty_frac": r[4],
+                    "trail_pct": r[5],
+                    "trail_pct_low_peak": r[6],
+                    "low_peak_threshold_pct": r[7],
+                    "sl_pct": r[8],
+                    "max_duration_hours": r[9],
+                    "enabled": bool(r[10]),
+                    "suspended_at": r[11],
+                    "suspended_reason": r[12],
+                    "last_calibration_at": r[13],
+                    "last_calibration_reason": r[14],
+                    "effective_source": "table" if flag_enabled else "settings",
+                    "rolling_30d": {
+                        "trades": n,
+                        "net_pnl": round(float(net or 0), 2),
+                        "win_pct": win_pct,
+                    },
+                }
+            )
+
+        audit_cur = await conn.execute(
+            """SELECT signal_type, field_name, old_value, new_value,
+                      reason, applied_by, applied_at
+               FROM signal_params_audit
+               ORDER BY applied_at DESC LIMIT 10"""
+        )
+        recent = [
+            {
+                "signal_type": a[0],
+                "field_name": a[1],
+                "old_value": a[2],
+                "new_value": a[3],
+                "reason": a[4],
+                "applied_by": a[5],
+                "applied_at": a[6],
+            }
+            for a in await audit_cur.fetchall()
+        ]
+
+        return {
+            "flag_enabled": flag_enabled,
+            "params": params,
+            "recent_changes": recent,
+        }
+
     # --- Static files (mounted last so API routes take priority) ---
     dist_dir = os.path.join(os.path.dirname(__file__), "frontend", "dist")
     if os.path.isdir(dist_dir):
