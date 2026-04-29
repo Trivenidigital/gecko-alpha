@@ -721,6 +721,121 @@ def create_app(db_path: str | None = None) -> FastAPI:
         finally:
             _ws_clients.discard(ws)
 
+    @app.get("/api/tg_social/alerts")
+    async def get_tg_social_alerts(limit: int = 50):
+        """BL-064 visibility surface: recent messages joined with their
+        resolved signal (if any) and channel config. Until the Telegram
+        bot token is fixed this is the only operator-facing view of TG
+        cashtag/contract activity. See backlog item BL-066.
+        """
+        scout_db = await _get_scout_db(_db_path)
+        conn = scout_db._conn
+
+        ch_cur = await conn.execute(
+            """SELECT channel_handle, trade_eligible, safety_required,
+                      removed_at, added_at
+               FROM tg_social_channels ORDER BY added_at"""
+        )
+        channels = [
+            {
+                "channel_handle": r[0],
+                "trade_eligible": bool(r[1]),
+                "safety_required": bool(r[2]),
+                "removed": r[3] is not None,
+                "added_at": r[4],
+            }
+            for r in await ch_cur.fetchall()
+        ]
+
+        health_cur = await conn.execute(
+            "SELECT component, listener_state, last_message_at, updated_at "
+            "FROM tg_social_health"
+        )
+        health = {
+            r[0]: {
+                "state": r[1],
+                "last_message_at": r[2],
+                "updated_at": r[3],
+            }
+            for r in await health_cur.fetchall()
+        }
+
+        # Messages joined to their resolution (left join — many messages
+        # have no signal row when the parser found nothing tradeable).
+        msg_cur = await conn.execute(
+            """SELECT m.id, m.channel_handle, m.msg_id, m.posted_at,
+                      m.sender, m.text, m.cashtags, m.contracts,
+                      s.token_id, s.symbol, s.contract_address, s.chain,
+                      s.mcap_at_sighting, s.resolution_state, s.paper_trade_id
+               FROM tg_social_messages m
+               LEFT JOIN tg_social_signals s ON s.message_pk = m.id
+               ORDER BY m.posted_at DESC
+               LIMIT ?""",
+            (max(1, min(limit, 200)),),
+        )
+        alerts = []
+        for r in await msg_cur.fetchall():
+            text = r[5] or ""
+            alerts.append(
+                {
+                    "id": r[0],
+                    "channel_handle": r[1],
+                    "msg_id": r[2],
+                    "posted_at": r[3],
+                    "sender": r[4],
+                    "text_preview": text[:240],
+                    "cashtags": r[6],
+                    "contracts": r[7],
+                    "resolution": {
+                        "token_id": r[8],
+                        "symbol": r[9],
+                        "contract_address": r[10],
+                        "chain": r[11],
+                        "mcap": r[12],
+                        "state": r[13],
+                        "paper_trade_id": r[14],
+                    } if r[8] is not None or r[13] is not None else None,
+                }
+            )
+
+        # 24h rollup
+        stats_cur = await conn.execute(
+            """SELECT
+                 COUNT(*) AS msgs,
+                 SUM(CASE WHEN contracts NOT IN ('','[]') THEN 1 ELSE 0 END) AS with_ca,
+                 SUM(CASE WHEN cashtags NOT IN ('','[]') THEN 1 ELSE 0 END) AS with_cashtag
+               FROM tg_social_messages
+               WHERE datetime(posted_at) >= datetime('now', '-24 hours')"""
+        )
+        s = await stats_cur.fetchone()
+        sig_cur = await conn.execute(
+            """SELECT
+                 COUNT(*) AS sigs,
+                 SUM(CASE WHEN paper_trade_id IS NOT NULL THEN 1 ELSE 0 END) AS dispatched
+               FROM tg_social_signals
+               WHERE datetime(created_at) >= datetime('now', '-24 hours')"""
+        )
+        sig = await sig_cur.fetchone()
+        dlq_cur = await conn.execute(
+            "SELECT COUNT(*) FROM tg_social_dlq "
+            "WHERE datetime(failed_at) >= datetime('now', '-24 hours')"
+        )
+        dlq = (await dlq_cur.fetchone())[0]
+
+        return {
+            "channels": channels,
+            "health": health,
+            "stats_24h": {
+                "messages": s[0] or 0,
+                "with_ca": s[1] or 0,
+                "with_cashtag": s[2] or 0,
+                "signals_resolved": sig[0] or 0,
+                "trades_dispatched": sig[1] or 0,
+                "dlq": dlq,
+            },
+            "alerts": alerts,
+        }
+
     @app.get("/api/signal_params")
     async def get_signal_params():
         """Per-signal params + rolling 30d performance + flag state.

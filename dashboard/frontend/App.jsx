@@ -9,6 +9,7 @@ import SignalsTab from './components/SignalsTab.jsx'
 import TradingTab from './components/TradingTab.jsx'
 import HealthTab from './components/HealthTab.jsx'
 import BriefingTab from './components/BriefingTab.jsx'
+import TGAlertsTab from './components/TGAlertsTab.jsx'
 
 const DEFAULT_STATUS = {
   pipeline_status: 'connecting',
@@ -148,6 +149,12 @@ export default function App() {
         >
           Health
         </button>
+        <button
+          className={`tab-btn ${activeTab === 'tg' ? 'active' : ''}`}
+          onClick={() => setActiveTab('tg')}
+        >
+          TG Alerts
+        </button>
       </div>
 
       {activeTab === 'signals' && <SignalsTab />}
@@ -174,6 +181,8 @@ export default function App() {
       {activeTab === 'briefing' && <BriefingTab />}
 
       {activeTab === 'health' && <HealthTab />}
+
+      {activeTab === 'tg' && <TGAlertsTab />}
     </div>
   )
 }
