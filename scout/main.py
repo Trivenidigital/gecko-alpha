@@ -94,6 +94,10 @@ _combo_refresh_failure_streak = 0
 # iteration once the streak stays at or above 3. Reset to 0 when streak clears.
 _combo_refresh_streak_last_alerted = 0
 
+# Last YYYY-MM-DD that maybe_suspend_signals fired. Same idempotency pattern
+# as last_refresh_date / last_digest_date — once per local day per process.
+_last_suspension_date = ""
+
 
 async def _run_feedback_schedulers(
     db,
@@ -146,6 +150,26 @@ async def _run_feedback_schedulers(
                         )
                 except Exception:
                     logger.exception("combo_refresh_streak_alert_dispatch_error")
+
+    # Tier 1b auto-suspension — daily hour-gate (SUSPENSION_CHECK_HOUR local).
+    # No-op when SIGNAL_PARAMS_ENABLED=False (handled inside the helper).
+    global _last_suspension_date
+    if (
+        now_local.hour == settings.SUSPENSION_CHECK_HOUR
+        and _last_suspension_date != today_iso
+    ):
+        try:
+            from scout.trading.auto_suspend import maybe_suspend_signals
+
+            async with aiohttp.ClientSession() as session:
+                suspended = await maybe_suspend_signals(
+                    db, settings, session=session
+                )
+            if suspended:
+                logger.info("auto_suspend_pass", count=len(suspended))
+            _last_suspension_date = today_iso
+        except Exception:
+            logger.exception("auto_suspend_loop_error")
 
     # Weekly digest (FEEDBACK_WEEKLY_DIGEST_WEEKDAY, _HOUR local)
     if (

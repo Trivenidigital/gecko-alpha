@@ -13,6 +13,7 @@ import structlog
 
 from scout.db import Database
 from scout.trading.paper import PaperTrader
+from scout.trading.params import params_for_signal
 
 log = structlog.get_logger()
 
@@ -131,7 +132,9 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
     # _load_bl062_cutover_ts), so we intentionally do NOT load it here.
 
     now = datetime.now(timezone.utc)
-    max_duration = timedelta(hours=settings.PAPER_MAX_DURATION_HOURS)
+    # max_duration is now per-signal (Tier 1a). When SIGNAL_PARAMS_ENABLED=False,
+    # params_for_signal() returns the global Settings value, so behaviour is
+    # unchanged. When the flag is on, each row resolves its own duration.
     slippage_bps = settings.PAPER_SLIPPAGE_BPS
 
     for row in rows:
@@ -148,16 +151,17 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             cp_48h = row[11]
             peak_price = float(row[12]) if row[12] is not None else None
             peak_pct = float(row[13]) if row[13] is not None else None
+            signal_type_row = row[20]
+
+            # Per-signal params (Tier 1a). Cached for 5 min so this is cheap.
+            sp = await params_for_signal(db, signal_type_row, settings)
+            max_duration = timedelta(hours=sp.max_duration_hours)
 
             # Compute elapsed up-front so the stale/no-price branches below can
             # still expire trades that have aged past max_duration. Without
             # this, a token whose price_cache stops updating leaves its trade
             # `status='open'` indefinitely (zombie row) — discovered while
             # auditing the BL-064 dashboard mismatch on 2026-04-27.
-            #
-            # `max_duration` is a `timedelta` (built from PAPER_MAX_DURATION_HOURS
-            # at line 134); `elapsed` is `now - opened_at` (also timedelta), so
-            # the comparisons below are unit-consistent.
             elapsed = now - opened_at
 
             price_data = price_map.get(token_id)
@@ -333,7 +337,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                         db=db,
                         trade_id=trade_id,
                         peak_pct_at_arm=float(peak_pct),
-                        original_trail_drawdown_pct=settings.PAPER_LADDER_TRAIL_PCT,
+                        original_trail_drawdown_pct=sp.trail_pct,
                     )
                     if armed_ts is not None:
                         # Use the exact DB-written timestamp — avoids the
@@ -353,11 +357,11 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     effective_trail_pct = settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT
                 elif (
                     peak_pct is not None
-                    and peak_pct < settings.PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT
+                    and peak_pct < sp.low_peak_threshold_pct
                 ):
-                    effective_trail_pct = settings.PAPER_LADDER_TRAIL_PCT_LOW_PEAK
+                    effective_trail_pct = sp.trail_pct_low_peak
                 else:
-                    effective_trail_pct = settings.PAPER_LADDER_TRAIL_PCT
+                    effective_trail_pct = sp.trail_pct
 
                 close_reason = None
                 close_status: str | None = None
@@ -376,13 +380,13 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                 # Leg 1
                 elif (
                     leg_1_filled is None
-                    and change_pct >= settings.PAPER_LADDER_LEG_1_PCT
+                    and change_pct >= sp.leg_1_pct
                 ):
                     await _trader.execute_partial_sell(
                         db=db,
                         trade_id=trade_id,
                         leg=1,
-                        sell_qty_frac=settings.PAPER_LADDER_LEG_1_QTY_FRAC,
+                        sell_qty_frac=sp.leg_1_qty_frac,
                         current_price=current_price,
                         slippage_bps=slippage_bps,
                     )
@@ -391,13 +395,13 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                 elif (
                     leg_1_filled is not None
                     and leg_2_filled is None
-                    and change_pct >= settings.PAPER_LADDER_LEG_2_PCT
+                    and change_pct >= sp.leg_2_pct
                 ):
                     await _trader.execute_partial_sell(
                         db=db,
                         trade_id=trade_id,
                         leg=2,
-                        sell_qty_frac=settings.PAPER_LADDER_LEG_2_QTY_FRAC,
+                        sell_qty_frac=sp.leg_2_qty_frac,
                         current_price=current_price,
                         slippage_bps=slippage_bps,
                     )
@@ -420,7 +424,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     floor_armed
                     and peak_price is not None
                     and peak_pct is not None
-                    and peak_pct >= settings.PAPER_LADDER_LEG_1_PCT
+                    and peak_pct >= sp.leg_1_pct
                 ):
                     trail_threshold = compute_trail_threshold(
                         peak_price, effective_trail_pct

@@ -9,6 +9,11 @@ import structlog
 
 from scout.db import Database
 from scout.trading.paper import PaperTrader
+from scout.trading.params import (
+    DEFAULT_SIGNAL_TYPES,
+    UnknownSignalType,
+    get_params,
+)
 
 log = structlog.get_logger()
 
@@ -121,7 +126,9 @@ class TradingEngine:
         if conn is None:
             raise RuntimeError("Database not initialized.")
 
-        # 0. Startup warmup: a real trader doesn't bulk-enter on boot.
+        # 0a. Startup warmup — coarsest gate (no DB, no allocations).
+        # Runs before signal_params lookup so we don't hit the DB for
+        # every rejected-by-warmup call in the first N seconds after boot.
         warmup = getattr(self.settings, "PAPER_STARTUP_WARMUP_SECONDS", 0) or 0
         if warmup > 0:
             elapsed = time.monotonic() - self._started_at
@@ -134,6 +141,31 @@ class TradingEngine:
                     warmup=warmup,
                 )
                 return None
+
+        # 0b. Tier 1a kill switch + per-signal params lookup. Comes after
+        # the no-DB warmup so the warmup-skip path is allocation-free, but
+        # before the price/duplicate/exposure DB hits so a disabled signal
+        # short-circuits before paying for those reads. UnknownSignalType
+        # is a caller bug (typo) — fail loud, not silently inherit globals.
+        try:
+            signal_params = await get_params(self.db, signal_type, self.settings)
+        except UnknownSignalType:
+            log.error(
+                "trade_skipped_unknown_signal_type",
+                err_id="SIGNAL_PARAMS_UNKNOWN_TYPE",
+                token_id=token_id,
+                signal_type=signal_type,
+                known=sorted(DEFAULT_SIGNAL_TYPES),
+            )
+            return None
+        if not signal_params.enabled:
+            log.info(
+                "trade_skipped_signal_disabled",
+                token_id=token_id,
+                signal_type=signal_type,
+                source=signal_params.source,
+            )
+            return None
 
         # 1. Resolve current price -- prefer caller-supplied entry_price
         if entry_price is not None and entry_price > 0:
@@ -242,7 +274,10 @@ class TradingEngine:
                 current_price=current_price,
                 amount_usd=trade_amount,
                 tp_pct=self.settings.PAPER_TP_PCT,
-                sl_pct=self.settings.PAPER_SL_PCT,
+                # Per-signal sl_pct stamps onto the row so the evaluator
+                # respects the params in effect at open time, even if
+                # calibration changes them later.
+                sl_pct=signal_params.sl_pct,
                 slippage_bps=self.settings.PAPER_SLIPPAGE_BPS,
                 signal_combo=signal_combo,
                 lead_time_vs_trending_min=lead_time_min,
