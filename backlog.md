@@ -220,6 +220,37 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 ---
 
+## P2 — BL-064 follow-ups (TG social signals deployed 2026-04-27)
+
+### BL-065: Dispatch paper trades from cashtag-only resolutions
+**Status:** Not started — flagged 2026-04-29
+**Files:** `scout/social/telegram/listener.py` (cashtag-only branch ~L249-276), `scout/social/telegram/dispatcher.py`, `scout/social/telegram/resolver.py` (search-top-3 path), schema (`tg_social_channels` add column), tests
+**Why:** Today, when a curator posts only `$EITHER` (cashtag) without a contract address, BL-064 sends a Telegram alert with top-3 CoinGecko candidates but **never** dispatches a paper trade — `listener.py:249` returns before `dispatch_to_engine`. With the active trade-eligible curators (`@thanos_mind`, `@detecter_calls`) currently posting cashtag-only hype, this means BL-064 has dispatched zero trades despite the listener being healthy. Extending dispatch to cashtags would unlock the bulk of curator activity.
+**Design decisions to make:**
+- **Candidate selection** — top-1 by mcap? Top-1 with minimum mcap floor (e.g. $1M to skip dead tickers)? Top-1 with confidence-margin gap over #2? Reject if top-3 is ambiguous (small mcap spread)?
+- **Safety** — current path skips GoPlus on cashtags (no CA to query). Either: (a) fetch CA from CoinGecko candidate before safety check, (b) allow cashtag dispatches per-channel via new `cashtag_trade_eligible` flag (mirrors `safety_required`), (c) require both `trade_eligible=1 AND safety_required=0` to opt in.
+- **Per-channel opt-in** — separate column `cashtag_trade_eligible` on `tg_social_channels` so we can enable for the trusted-curator subset without auto-enabling the alert-only ones.
+- **Trade size** — same `PAPER_TG_SOCIAL_TRADE_AMOUNT_USD=300` as CA path, or smaller given lower confidence (e.g. $150)?
+- **Dedup with CA path** — if the same curator later posts the CA for the same token (cashtag→CA upgrade path), do we open a second trade? Probably no — same `_has_open_tg_social_exposure` check already covers it once we resolve the cashtag to a coin_id.
+**Acceptance:** Post a `$<CASHTAG>` message in a channel marked `cashtag_trade_eligible=1`, verify a paper trade opens with `signal_type=tg_social`, `signal_data` carries `{"resolution": "cashtag", "cashtag": "$X", "candidate_rank": 1, "candidates_total": 3}`, and the existing alert-only channels remain alert-only.
+**Estimate:** 0.5-1 day with tests.
+
+### BL-066: Dashboard view for BL-064 activity (channels, messages, alerts)
+**Status:** Not started — flagged 2026-04-29
+**Files:** `dashboard/api.py` (new `/api/tg_social/*` endpoints), `dashboard/db.py`, `dashboard/frontend/components/` (new TGSocial section), `dashboard/frontend/main.jsx` (add tab or section)
+**Why:** BL-064 has been live since 2026-04-27 with 1,019 messages ingested, 487 signals parsed, 395 in DLQ — and there is currently **zero dashboard visibility** into any of it. Operators have to SSH to the VPS and run sqlite queries to see channel activity. The Telegram alert channel that was supposed to be the primary visibility surface is non-functional because the bot token is a placeholder. Until the token is fixed, the dashboard is the only realistic visibility surface.
+**Endpoints to add:**
+- `GET /api/tg_social/channels` — list configured channels with `trade_eligible`, `safety_required`, last_seen_msg_id, last_message_at, listener_state
+- `GET /api/tg_social/messages?limit=20` — recent messages with cashtags/contracts extracted, has_ca flag
+- `GET /api/tg_social/signals?limit=20` — recent resolved signals + which message they came from, dispatch outcome
+- `GET /api/tg_social/dlq?limit=20` — recent DLQ entries with error, channel, message preview
+- `GET /api/tg_social/stats` — totals: messages last 24h by channel, resolution success rate, dispatch rate, DLQ rate
+**Frontend:** new "Social" tab (or section in Health tab) showing channel health, recent messages, recent signals, DLQ count, link to full DLQ detail.
+**Acceptance:** Operator can open dashboard, see at a glance: are listeners running? are messages flowing? what's in DLQ? did a trade dispatch?
+**Estimate:** 0.5-1 day backend + 0.5 day frontend.
+
+---
+
 ## P3 — Future / Nice-to-have
 
 ### BL-040: Add backtesting framework
