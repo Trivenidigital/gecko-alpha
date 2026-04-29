@@ -18,14 +18,15 @@ from scout.trading.calibrate import (
 from scout.trading.params import clear_cache_for_tests
 
 
+_seq_counter = [0]
+
+
 @pytest.fixture(autouse=True)
 def _wipe_cache():
+    _seq_counter[0] = 0
     clear_cache_for_tests()
     yield
     clear_cache_for_tests()
-
-
-_seq_counter = [0]
 
 
 async def _insert_closed_trade(

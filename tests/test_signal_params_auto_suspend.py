@@ -11,14 +11,15 @@ from scout.trading.auto_suspend import maybe_suspend_signals
 from scout.trading.params import clear_cache_for_tests
 
 
+_seq = [0]
+
+
 @pytest.fixture(autouse=True)
 def _wipe_cache():
+    _seq[0] = 0
     clear_cache_for_tests()
     yield
     clear_cache_for_tests()
-
-
-_seq = [0]
 
 
 async def _insert_closed_trade(

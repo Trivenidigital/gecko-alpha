@@ -162,10 +162,6 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             # this, a token whose price_cache stops updating leaves its trade
             # `status='open'` indefinitely (zombie row) — discovered while
             # auditing the BL-064 dashboard mismatch on 2026-04-27.
-            #
-            # `max_duration` is a `timedelta` (built from PAPER_MAX_DURATION_HOURS
-            # at line 134); `elapsed` is `now - opened_at` (also timedelta), so
-            # the comparisons below are unit-consistent.
             elapsed = now - opened_at
 
             price_data = price_map.get(token_id)

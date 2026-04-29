@@ -148,12 +148,16 @@ def _propose_changes(
 ) -> tuple[list[FieldChange], list[str]]:
     """Apply the v1 heuristic table. Returns (changes, reason_parts).
 
-    Order matters — the SL widening rule takes priority over trail tightening
-    when both fire (per design doc, SL is the bigger lever). Both can fire
-    the same run if their inputs are independently sufficient.
+    Both rules evaluate independently and can both fire in one run — they
+    mutate different fields (sl_pct vs trail_pct) so there is no conflict.
+    The reason-list ordering puts SL first for audit-log readability only.
 
     Each value is rounded to 1 decimal place to prevent float-precision flap
     on idempotent re-runs.
+
+    v1 heuristics only touch ``sl_pct`` and ``trail_pct``. All other fields
+    (leg_*, low_peak_*, max_duration_hours, qty fractions) are operator-only —
+    schema carries them; calibrator does not.
     """
     changes: list[FieldChange] = []
     reasons: list[str] = []
@@ -180,9 +184,6 @@ def _propose_changes(
             reasons.append(
                 f"expired {stats.expired_pct}% > 30 → tighten trail"
             )
-
-    # leg_1 calibration is intentionally OUT OF SCOPE for v1 (per adversarial
-    # review). The column is in the schema; the calibrator does not touch it.
 
     return changes, reasons
 
@@ -281,9 +282,15 @@ async def apply_diffs(
 ) -> int:
     """Write changes inside a single transaction. Returns number of rows touched.
 
-    Telegram alert is sent INSIDE the transaction's success path so a
-    delivery error rolls back the writes — the operator never gets into a
-    state where params changed without notification.
+    Telegram is dispatched inside the transaction so the txn-boundary is
+    *one* unit. **Important caveat:** ``alerter.send_telegram_message``
+    swallows aiohttp errors and only logs a warning — it does NOT raise.
+    So a Telegram delivery failure (network, 401, wrong chat_id) will NOT
+    roll back the params write. The ``_telegram_token_looks_real`` gate at
+    CLI entry is what protects against the *known* placeholder failure
+    mode; runtime-only delivery failures fall through silently. If
+    detection of those becomes important, swap ``send_telegram_message``
+    for a strict variant that raises on non-200.
     """
     conn = db._conn
     if conn is None:
@@ -364,6 +371,9 @@ async def apply_diffs(
         log.error("CALIBRATE_APPLY_FAILED")
         raise
 
+    # AFTER commit only — bumping before commit would expose other readers
+    # to uncommitted state if a rollback fired. The bump invalidates the
+    # in-process cache so the next get_params() re-reads the table.
     bump_cache_version()
     return sum(len(d.changes) for d in actionable)
 
@@ -373,13 +383,35 @@ async def apply_diffs(
 # ---------------------------------------------------------------------------
 
 
-def _telegram_token_looks_real(settings: Settings) -> bool:
-    """Best-effort placeholder check.
+_TELEGRAM_PLACEHOLDER_TOKENS = frozenset(
+    {
+        "placeholder",
+        "todo",
+        "changeme",
+        "replace_me",
+        "your_token_here",
+        "xxx",
+        "test",
+        "none",
+        "null",
+        "0",
+    }
+)
 
-    Project memory notes the bot token has been a literal placeholder in
-    prod — getting `--apply` to refuse on a placeholder is the entire
-    point of this guard. We reject obvious placeholders; we do NOT call
-    the API here (that's a runtime error path, not a precondition check).
+
+def _telegram_token_looks_real(settings: Settings) -> bool:
+    """Returns True for any well-formed-looking bot token.
+
+    Does NOT prove deliverability — a syntactically valid but stale or
+    revoked token still passes here and will silently fail at runtime
+    (alerter swallows aiohttp errors). This guards against the known
+    placeholder failure mode (project memory: BL-064 — token has been
+    literally "placeholder" in prod for weeks) and against obvious
+    malformed strings, not against deliverability.
+
+    Real Telegram bot tokens have shape ``<bot_id>:<hash>`` where
+    ``bot_id`` is digits and the suffix is base64-ish — we require the
+    colon and a numeric prefix.
     """
     token = getattr(settings, "TELEGRAM_BOT_TOKEN", None)
     if token is None:
@@ -389,7 +421,14 @@ def _telegram_token_looks_real(settings: Settings) -> bool:
     )
     if not raw or len(raw) < 20:
         return False
-    return raw.lower() not in {"placeholder", "todo", "changeme"}
+    if raw.lower() in _TELEGRAM_PLACEHOLDER_TOKENS:
+        return False
+    # Real bot token shape: digits + ":" + suffix. Reject hex/random
+    # strings that happen to be ≥20 chars but lack the format.
+    if ":" not in raw:
+        return False
+    bot_id, _, _ = raw.partition(":")
+    return bot_id.isdigit() and len(bot_id) >= 6
 
 
 # ---------------------------------------------------------------------------

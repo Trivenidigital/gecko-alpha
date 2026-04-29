@@ -126,12 +126,27 @@ class TradingEngine:
         if conn is None:
             raise RuntimeError("Database not initialized.")
 
-        # 0a. Tier 1a kill switch — finer-grained than .env-level
-        # PAPER_SIGNAL_*_ENABLED flags. When SIGNAL_PARAMS_ENABLED=False,
-        # get_params() returns enabled=True from Settings (no behaviour
-        # change). When the flag is on, signal_params.enabled is honoured.
-        # Unknown signal_types raise — that's a typo/bug, not a runtime
-        # condition to silently swallow.
+        # 0a. Startup warmup — coarsest gate (no DB, no allocations).
+        # Runs before signal_params lookup so we don't hit the DB for
+        # every rejected-by-warmup call in the first N seconds after boot.
+        warmup = getattr(self.settings, "PAPER_STARTUP_WARMUP_SECONDS", 0) or 0
+        if warmup > 0:
+            elapsed = time.monotonic() - self._started_at
+            if elapsed < warmup:
+                log.info(
+                    "trade_skipped_warmup",
+                    token_id=token_id,
+                    signal_type=signal_type,
+                    elapsed=round(elapsed, 1),
+                    warmup=warmup,
+                )
+                return None
+
+        # 0b. Tier 1a kill switch + per-signal params lookup. Comes after
+        # the no-DB warmup so the warmup-skip path is allocation-free, but
+        # before the price/duplicate/exposure DB hits so a disabled signal
+        # short-circuits before paying for those reads. UnknownSignalType
+        # is a caller bug (typo) — fail loud, not silently inherit globals.
         try:
             signal_params = await get_params(self.db, signal_type, self.settings)
         except UnknownSignalType:
@@ -151,20 +166,6 @@ class TradingEngine:
                 source=signal_params.source,
             )
             return None
-
-        # 0b. Startup warmup: a real trader doesn't bulk-enter on boot.
-        warmup = getattr(self.settings, "PAPER_STARTUP_WARMUP_SECONDS", 0) or 0
-        if warmup > 0:
-            elapsed = time.monotonic() - self._started_at
-            if elapsed < warmup:
-                log.info(
-                    "trade_skipped_warmup",
-                    token_id=token_id,
-                    signal_type=signal_type,
-                    elapsed=round(elapsed, 1),
-                    warmup=warmup,
-                )
-                return None
 
         # 1. Resolve current price -- prefer caller-supplied entry_price
         if entry_price is not None and entry_price > 0:

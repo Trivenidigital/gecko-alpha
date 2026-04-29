@@ -140,7 +140,15 @@ async def get_params(
             return params
 
     if db._conn is None:
-        # DB closed mid-call — return Settings instead of crashing the eval loop.
+        # DB closed mid-call (shutdown race, restart). Returning Settings
+        # instead of crashing the eval loop is the lesser evil, but it
+        # silently bypasses any suspended/calibrated row — log loudly so
+        # the operator can correlate with restart events.
+        log.error(
+            "signal_params_db_closed",
+            err_id="SIGNAL_PARAMS_DB_CLOSED",
+            signal_type=signal_type,
+        )
         return _settings_params(signal_type, settings)
 
     cursor = await db._conn.execute(

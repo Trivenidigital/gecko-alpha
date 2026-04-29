@@ -49,10 +49,12 @@ async def _rolling_stats(
 ) -> tuple[int, float, float]:
     """Return (n_trades, net_pnl_usd, max_drawdown_usd) for the window.
 
-    ``max_drawdown_usd`` is the worst point reached by the running cumulative
-    pnl over the window — a small number of catastrophic losses won't be
-    masked by an averaging window. Computed by sorting closes ascending and
-    folding cumulative sum.
+    ``max_drawdown_usd`` is **peak-to-trough** — the deepest cumulative-pnl
+    drop from any prior peak in the window, returned as a non-positive
+    number. A signal that ran +$1,000 and then bled to +$1 has drawdown
+    -$999. The earlier ``min(running, 0)`` formulation missed this case
+    entirely (it never went negative). Comparison ``<= hard_loss``
+    (e.g. -500.0) fires when the trough is at least that deep.
     """
     cur = await conn.execute(
         """SELECT COALESCE(pnl_usd, 0) AS pnl
@@ -68,11 +70,15 @@ async def _rolling_stats(
     if n == 0:
         return 0, 0.0, 0.0
     running = 0.0
-    max_drawdown = 0.0
+    peak = 0.0
+    max_drawdown = 0.0  # most-negative running-minus-peak we've seen
     for row in rows:
         running += float(row[0])
-        if running < max_drawdown:
-            max_drawdown = running
+        if running > peak:
+            peak = running
+        drop = running - peak  # always <= 0
+        if drop < max_drawdown:
+            max_drawdown = drop
     return n, round(running, 2), round(max_drawdown, 2)
 
 
@@ -125,13 +131,21 @@ async def maybe_suspend_signals(
 ) -> list[dict]:
     """Run one suspension pass. Returns list of suspended signals (may be empty)."""
     if not getattr(settings, "SIGNAL_PARAMS_ENABLED", False):
-        # Flag-off — we don't auto-modify behaviour the operator hasn't
-        # opted into yet. Calibration script is similarly gated.
+        # Flag-off — same gate as calibrate.py. Never auto-modify until
+        # operator opts in.
         return []
 
     conn = db._conn
     if conn is None:
         raise RuntimeError("Database not initialized.")
+
+    # Defer alerter import to the call sites — `scout.alerter` imports
+    # aiohttp at module level, which triggers Windows OpenSSL Applink
+    # loading even when no Telegram delivery actually happens. We import
+    # right where it's needed (both branches) — the previous "hoist to top
+    # of function" fix accidentally re-introduced the cost. The
+    # NameError-on-pnl_threshold-path bug is solved by importing in BOTH
+    # branches, not by hoisting.
 
     pnl_threshold = settings.SIGNAL_SUSPEND_PNL_THRESHOLD_USD
     hard_loss = settings.SIGNAL_SUSPEND_HARD_LOSS_USD

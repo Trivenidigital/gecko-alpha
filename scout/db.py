@@ -1475,6 +1475,12 @@ class Database:
             raise
 
         # Post-assertion — cutover row must exist.
+        # Limitation: INSERT OR IGNORE makes the marker idempotent, so on a
+        # second run this assertion passes regardless of body completion. It
+        # only catches the "row never existed" case (first-run failure where
+        # the entire migration body silently no-op'd). Stronger assertion
+        # would be a row count on signal_params, but that re-creates a
+        # different fragility class — the marker pattern matches BL-061..64.
         cur = await conn.execute(
             "SELECT 1 FROM paper_migrations WHERE name = ?",
             ("signal_params_v1",),
