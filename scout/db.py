@@ -1369,6 +1369,17 @@ class Database:
         from scout.trading.params import DEFAULT_SIGNAL_TYPES
 
         ddl_statements: list[str] = [
+            # Defensive create — if upstream feedback migration was skipped
+            # or monkey-patched (test_trading_db_migration.py exercises this),
+            # paper_migrations may not exist yet. CREATE IF NOT EXISTS keeps
+            # the cutover INSERT safe and is idempotent against the canonical
+            # creation in _migrate_feedback_loop_schema.
+            """
+            CREATE TABLE IF NOT EXISTS paper_migrations (
+                name TEXT PRIMARY KEY,
+                cutover_ts TEXT NOT NULL
+            )
+            """,
             """
             CREATE TABLE IF NOT EXISTS signal_params (
                 signal_type             TEXT PRIMARY KEY,
