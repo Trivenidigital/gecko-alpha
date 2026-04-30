@@ -249,6 +249,58 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Acceptance:** Operator can open dashboard, see at a glance: are listeners running? are messages flowing? what's in DLQ? did a trade dispatch?
 **Estimate:** 0.5-1 day backend + 0.5 day frontend.
 
+### BL-067: Conviction-locked hold — extend exit gates when independent signals stack on the same token
+**Status:** **RESEARCH-GATED — DO NOT IMPLEMENT YET.** Requires backtest + design decisions documented below before any production code lands.
+**Tag:** `research-gated` `strategy` `multi-signal` `requires-backtest`
+**Files (when implementation starts):** `scout/trading/evaluator.py`, `scout/trading/conviction.py` (new), `scout/db.py` (signal-stack lookup), `scout/trading/params.py` (per-signal opt-in column), tests.
+**Why — the BIO case study (2026-04-30):** BIO (`bio-protocol`) was caught across **5 independent signal surfaces over 7 days** (`first_signal` → `gainers_snapshots` → `trending_snapshots` → `losers_contrarian` on dip → `narrative_prediction` → `trending_catch` → `gainers_early` + DEX-side wrapper). Each fired a *separate* paper trade that exited within 2.5h–25h on trailing-stop / peak-fade / expiry. Net captured: **+$63 across 5 trades**. If the FIRST trade (`#869 first_signal`, opened 2026-04-23 01:10 at $0.0349) had been held continuously, the single position would now sit at **+16.3% / ~$49 unrealized** with a 7-day peak near +37.8%. **One position held through the multi-signal confirmation beats five positions churned in 12-hour windows.** The system correctly identified high conviction; the exit logic ignored that context. This is a structural, not BIO-specific, gap.
+**Concept:** When a paper trade is open AND `N >= 2` *distinct* independent signals fire on the same `token_id` AFTER `opened_at`, the trade enters "conviction-locked" mode with extended exit gates:
+
+| Stacked signals | max_duration_hours | trail_pct | sl_pct |
+|---|---|---|---|
+| 1 (default) | from `signal_params` | from `signal_params` | from `signal_params` |
+| 2 | +72h | +5pp (cap 35%) | +5pp (cap 35%) |
+| 3 | +168h | +10pp (cap 35%) | +10pp (cap 40%) |
+| ≥4 | +336h | +15pp (cap 35%) | +15pp (cap 40%) |
+
+**Definition of "distinct independent signal":**
+- Different `signal_type` from the trade's own `signal_type`
+- Fired *after* the trade's `opened_at`
+- Not a duplicate of a `signal_type` already counted in the stack
+- Sources to query: `gainers_snapshots`, `losers_snapshots`, `trending_snapshots`, `velocity_alerts`, `volume_spikes`, `narrative_predictions`, `chain_matches`, `tg_social_signals` — all already populated in scout.db.
+
+**Open design questions (must resolve BEFORE coding):**
+1. **Lookback window** — count only signals fired in last 7d, or full open-life?
+2. **Per-signal-type opt-in** — does `narrative_prediction` (slow, multi-day window) benefit, or does conviction-lock only apply to fast signals (`gainers_early`, `first_signal`, `volume_spike`)?
+3. **Interaction with PR #59 adaptive trail (low-peak tightening)** — does conviction-lock OVERRIDE the low-peak threshold (peak<20% → trail to 8%)? Or compose? They pull opposite directions.
+4. **Interaction with BL-063 moonshot trail (peak ≥ 40% → 30% trail)** — moonshot is peak-driven, conviction is signal-count-driven. Likely compose (whichever is wider wins), but verify.
+5. **Cap on stack count** — count up to 4? 6? Diminishing returns past N=3?
+6. **Storage** — compute stack on-the-fly each evaluator pass (cheap, ~10 row DB hit), or persist `conviction_stack_count` column on `paper_trades`?
+7. **Per-signal `conviction_lock_enabled` boolean on `signal_params`** — same calibration table controls which signal-types respect the multiplier.
+8. **TG social interaction** — should `tg_social_signals` count as a stacked signal? It's a separate detection surface but the same trade would already be open under that signal_type if dispatched.
+9. **Conviction stack downgrade** — once locked, does the lock stay regardless of subsequent activity? Or expire if no new signals fire for X days?
+
+**Required research before implementing:**
+1. **Backtest script** (`scripts/backtest_conviction_lock.py`) replaying last 30-90d of paper trades:
+   - For each open trade, compute the stack count at every evaluator tick
+   - Simulate exits under conviction-locked params vs the actual exits
+   - Output: number of trades that would have been locked, simulated PnL delta vs actual, win-rate change, max-hold change, expired-pct change
+2. **Survey of "BIO-like" plays in the existing data** — count how many tokens hit `N≥3` stacked signals over a 7d window in 2026-04 paper trades. If the answer is "BIO is unique," the feature is a poor ROI investment.
+3. **Document edge cases:** what happens to a conviction-locked trade when the original `signal_type` gets auto-suspended (Tier 1b)? When an additional signal of an excluded-from-calibration type (`narrative_prediction`) fires?
+4. **Compare to existing PR #6 (Multi-Signal Conviction Chains)** — that ships an *alert-time* convicition concept; this is *exit-time*. Verify they're orthogonal, not duplicating logic.
+
+**Acceptance (when implementation eventually lands):**
+- `backtest_conviction_lock.py` shows ≥10% PnL lift on simulated 30d window vs actual
+- BIO replay demonstrates the trade staying open ≥5 days vs current ≤26h exits
+- All 5 design questions above resolved in PR description
+- Per-signal opt-in via `signal_params.conviction_lock_enabled` column (default OFF — deploy as no-op, flip per signal after observation)
+- Tests: stack counts correctly, conviction-lock + adaptive-trail compose correctly, conviction-lock + moonshot compose correctly, suspended source signal does NOT block conviction lock from staying active
+- Dashboard surfaces: badge on open positions showing current stack count + "conviction-locked" status
+
+**Estimate (post-research):** 1.5–2 days code + tests + dashboard surface. Backtest script is a separate ~0.5 day deliverable that gates everything else.
+
+**Resume protocol:** When user says "let's work on conviction-locked hold" or "BL-067", FIRST step is the backtest script. Do not write `scout/trading/conviction.py` until the backtest output justifies it.
+
 ---
 
 ## P3 — Future / Nice-to-have
