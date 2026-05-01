@@ -1,0 +1,92 @@
+# Backlog — gecko-alpha
+
+Last updated: 2026-05-01 (Tier 1a flip)
+
+## Active soaks (don't disturb)
+
+- [ ] **Tier 1a flip — gainers_early kill** — flipped 2026-05-01T14:06Z via signal_params.enabled=0. SIGNAL_PARAMS_ENABLED=true in prod .env. Soak ends 2026-05-15T14:06Z.
+  - Pre-flip 30d net: −$506. Backtest projects post-flip 30d net to swing to ~+$428 (delta ~+$933 from killing the −$629 gainers_early bleed).
+  - Decision gate at 2026-05-15: if 14d net ≥ +$200, leave on permanently and re-evaluate BL-070 with clean data. If neutral/negative, investigate other signals.
+  - Revert: `UPDATE signal_params SET enabled=1 WHERE signal_type='gainers_early'` + restart pipeline.
+- [ ] **PR #58 BL-064 lenient-safety soak** — flag flipped 2026-04-28T15:17Z. Re-check window: 2026-05-12.
+  - Decision gate: ≥40% win rate + avg pnl_pct >0 → keep on. As of 2026-04-29T12:25Z: 0 trades dispatched yet (curators haven't posted CA-bearing messages since flag flipped). Operational gap, not code.
+- [ ] **PR #59 strategy tuning soak** — deployed 2026-04-28T22:58Z. Re-check window: 2026-05-05.
+  - Early signal at 13.5h: 23 closes, +$650 net, ~70% win rate, 0 expired closes. 9× improvement in $/trade vs historical −$3.05. Letting it ride.
+- [ ] **BL-063 moonshot soak** — flag flipped 2026-04-27T13:58Z. Soak ends 2026-05-04T13:58Z.
+- [ ] **BL-064 14d TG social soak** — ends 2026-05-11T22:10Z.
+- [ ] **Paper-lifecycle widening soak** — .env tweaks deployed 2026-04-27T22:24Z. Soak ends ~2026-05-04T22:24Z.
+
+## Pending operator action (blocked on user)
+
+- [ ] **Set real `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in prod `.env`.** Both are literal placeholders. Every alert path (BL-063 moonshot, BL-064 social, channel-silence, kill-switch, paper fills) is silently 404-ing. Get a token from BotFather, `/start` the bot in the target chat, then `https://api.telegram.org/bot<TOKEN>/getUpdates` shows the chat_id.
+
+## Next deliverables (in priority order)
+
+### 1. Self-learning Tier 1a + 1b (proposed, awaiting user go-ahead)
+
+The user asked "why isn't the agent self-learning". My response (deferred decision): scope a single PR for **per-signal parameter table** + **auto-suspension of dud signals**. Roughly:
+
+- New `signal_params` DB table — per-signal-type LEG_1_PCT / TRAIL_PCT / SL_PCT / etc. Defaults seeded from current global Settings.
+- Weekly calibration script that reads `combo_performance` rolling 30d, writes recalibrated params back to `signal_params`. Operator approves before write goes live (dry-run flag default).
+- Evaluator reads per-signal params instead of global Settings.
+- Auto-suspension: rolling 30d net P&L < threshold → set signal's `enabled=False` in DB + Telegram alert. One-way switch (manual re-enable).
+- Tests + 1-2 day estimate.
+
+This is NOT ML — just data-driven static rules with self-resetting parameters. Real ML (outcome model, RL exit timing) gated on ≥1000 trades/signal stable for 30d (not yet).
+
+**User has not approved scope yet.** Resume by asking.
+
+### 2. Watchlist for next strategy-tuning re-check
+
+When user asks "how is strategy tuning going" tomorrow:
+- Re-run `.ssh_recheck.txt` queries (commands documented in conversation)
+- Compare 36h post-deploy vs 13.5h baseline
+- Look for: BL-064 first dispatched trade (depends on curator activity), trail/leg-1 fire rate stabilizing, gainers_early per-trade P&L sign
+
+### 3. Open optional follow-ups (not urgent)
+
+- [ ] Channel-list reload task in BL-064 listener — currently each new channel requires pipeline restart. Long-pending.
+- [ ] `narrative_prediction` token_id divergence fix — 32 of 56 stale-young open trades have empty/synthetic token_ids that don't appear in `price_cache`. Separate upstream fix.
+- [ ] Verify @s1mple_s1mple / t.me/s1mplegod123 ownership before adding (long-pending).
+- [ ] Audit fix #4 (24h hard-exit if peak<5%) deferred — accumulate more data first.
+
+## What shipped this session (2026-04-28 → 2026-04-29)
+
+| PR | Commit | Topic |
+|---|---|---|
+| #55 | 4c057e3 | BL-064 listener resilience (bad-handle / crash-state / txn-lock) — 3 fixes + 13 tests |
+| #56 | 9127959 | Drop explicit BEGIN IMMEDIATE — match project _txn_lock pattern |
+| #57 | adf1a32 | Dashboard reconcile open-trade PnL$ and PnL% on partial-fill ladders |
+| #58 | 2061675 | BL-064 per-channel `safety_required` flag — unblocks fresh memecoins |
+| #59 | 3c83fb7 | Strategy tuning — adaptive trail + per-signal kill switches |
+
+Test count: 1354 → 1389 passing (+35 across the PRs).
+
+Prod .env current state (relevant flags):
+```
+PAPER_MAX_DURATION_HOURS=168
+PAPER_SL_PCT=25
+PAPER_LADDER_TRAIL_PCT=20
+PAPER_LADDER_LEG_1_PCT=10.0           # PR #59 — was 25 default
+PAPER_LADDER_LEG_1_QTY_FRAC=0.50
+PAPER_SIGNAL_LOSERS_CONTRARIAN_ENABLED=false
+PAPER_SIGNAL_TRENDING_CATCH_ENABLED=false
+TG_SOCIAL_ENABLED=True
+TELEGRAM_BOT_TOKEN=placeholder        # ⚠️ not real
+TELEGRAM_CHAT_ID=placeholder          # ⚠️ not real
+```
+
+Active TG channels (7):
+- `@detecter_calls` (trade_eligible, safety_required=0)
+- `@thanos_mind` (trade_eligible, safety_required=0)
+- `@cryptoyeezuscalls` `@Alt_Crypto_Gems` `@nebukadnaza` `@alohcooks` `@CallerFiona1` (alert-only, strict)
+- `@gem_detecter` (retired — typo, doesn't exist on Telegram)
+
+## Resume hook
+
+When the user comes back, the obvious next move is one of:
+1. Approve the Tier 1a + 1b self-learning PR scope and start that work
+2. Re-run the post-deploy strategy check-in (24-36h window now)
+3. Set the real Telegram bot token + chat_id
+
+Default suggestion if user opens with a generic "what's up": run the post-deploy check-in (option 2) — it's quick and gives them fresh data.

@@ -249,6 +249,12 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Acceptance:** Operator can open dashboard, see at a glance: are listeners running? are messages flowing? what's in DLQ? did a trade dispatch?
 **Estimate:** 0.5-1 day backend + 0.5 day frontend.
 
+### BL-070: Entry stack gate — refuse trades with insufficient signal confirmation
+**Status:** **SHELVED — re-evaluate 2026-05-15** (Tier 1a flip soak ends)
+**Tag:** `research-gated` `strategy` `entry-filter` `requires-backtest`
+**Plan:** `tasks/plan_bl070_entry_stack_gate.md`
+**Why shelved:** v1 backtest (`scripts/backtest_v1_signal_stacking.py`) showed stack≥2 trades net +$722 vs stack=1 trades net −$1,243 over 30d. Plan proposed entry-time gate filtering stack=1 trades. **Adversarial reviewer's Q10 prompted a baseline check that showed Tier 1a `enabled=0` for `gainers_early` + `trending_catch` captures $933 of the $1,243 swing with zero new code.** Tier 1a kill executed 2026-05-01; shelving BL-070 until soak ends. If post-flip 14d net is clearly positive, BL-070 may be unnecessary entirely. If still bleeding, revisit with the 3 plan-review blockers addressed (drop `paper_trades` source, point-in-time v2 backtest, index audit).
+
 ### BL-067: Conviction-locked hold — extend exit gates when independent signals stack on the same token
 **Status:** **RESEARCH-GATED — DO NOT IMPLEMENT YET.** Requires backtest + design decisions documented below before any production code lands.
 **Tag:** `research-gated` `strategy` `multi-signal` `requires-backtest`
