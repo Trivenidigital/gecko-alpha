@@ -87,17 +87,20 @@ def _distinct_stack_count(conn, token_id: str, opened_at: str, end_at: str) -> t
         if cur.fetchone() is not None:
             sources.append(label)
 
-    # narrative_predictions
-    cur = conn.execute(
-        """SELECT 1 FROM narrative_predictions
-           WHERE coin_id = ?
-             AND datetime(created_at) >= datetime(?)
-             AND datetime(created_at) <= datetime(?)
-           LIMIT 1""",
-        (token_id, opened_at, end_at),
-    )
-    if cur.fetchone() is not None:
-        sources.append("narrative")
+    # predictions (narrative agent picks)
+    try:
+        cur = conn.execute(
+            """SELECT 1 FROM predictions
+               WHERE coin_id = ?
+                 AND datetime(predicted_at) >= datetime(?)
+                 AND datetime(predicted_at) <= datetime(?)
+               LIMIT 1""",
+            (token_id, opened_at, end_at),
+        )
+        if cur.fetchone() is not None:
+            sources.append("narrative")
+    except sqlite3.OperationalError:
+        pass
 
     # velocity_alerts — column may not exist on this branch; guard
     try:
@@ -229,7 +232,8 @@ def section_b(conn) -> None:
     cur = conn.execute(
         """SELECT cm.id, cm.token_id, cm.pattern_name, cm.completed_at,
                   cm.outcome_change_pct, cm.outcome_class, cm.conviction_boost,
-                  pc.current_price AS now_price
+                  pc.current_price AS now_price,
+                  pc.market_cap AS now_mcap
            FROM chain_matches cm
            LEFT JOIN price_cache pc ON pc.coin_id = cm.token_id
            WHERE datetime(cm.completed_at) >= datetime('now','-30 days')
