@@ -47,6 +47,7 @@ from scout.gainers.tracker import store_top_gainers
 from scout.losers.tracker import store_top_losers
 from scout.velocity.detector import alert_velocity_detections, detect_velocity
 from scout.trading.signals import (
+    trade_chain_completions,
     trade_first_signals,
     trade_gainers,
     trade_losers,
@@ -493,6 +494,20 @@ async def run_cycle(
                 )
             except Exception:
                 logger.exception("losers_trade_dispatch_error")
+
+    # Chain pattern completions (BL-068 wiring 2026-05-01) — fires when a
+    # chain_pattern triggers a chain_matches row. Long-hold defaults belong
+    # in signal_params for signal_type='chain_completed' (max_duration=720h,
+    # trail_pct=35, sl_pct=30) — these multi-day plays don't fit the
+    # default 168h/20% trail. Function existed in signals.py:760 since
+    # BL-064 but was never imported here, so 0 chain_completed paper trades
+    # had ever opened. dispatcher self-bounds to last 5 min — no-op when
+    # chain_patterns are deactivated or no recent matches.
+    if trading_engine:
+        try:
+            await trade_chain_completions(trading_engine, db, settings=settings)
+        except Exception:
+            logger.exception("chain_completions_trade_dispatch_error")
 
     # 7-Day Momentum Scanner (zero extra API calls -- filters existing data)
     if settings.MOMENTUM_7D_ENABLED and _raw_markets_combined:

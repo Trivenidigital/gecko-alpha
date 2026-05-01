@@ -251,11 +251,16 @@ export default function SignalsTab() {
               </thead>
               <tbody>
                 {earlyCatchSort.sorted.map((c, i) => {
-                  // Build detected-by label
+                  // Build detected-by label.
+                  // "Early Signal" = signal_events row existed for this token
+                  // before the gainer hit. NOT a chain_pattern match — the
+                  // chain_pattern engine writes to chain_matches, which the
+                  // gainers tracker doesn't query. Renamed from "Chains"
+                  // 2026-05-01 to stop misleading the operator.
                   const methods = []
                   if (c.detected_by_narrative) methods.push('Narrative')
                   if (c.detected_by_pipeline) methods.push('Pipeline')
-                  if (c.detected_by_chains) methods.push('Chains')
+                  if (c.detected_by_chains) methods.push('Early Signal')
                   const detectedBy = methods.length > 0 ? methods.join(' + ') : (c.is_gap ? 'MISSED' : '-')
 
                   return (
@@ -600,10 +605,11 @@ export default function SignalsTab() {
               </thead>
               <tbody>
                 {gainersSort.sorted.map((c, i) => {
+                  // See Early Catches block above for rename rationale.
                   const methods = []
                   if (c.detected_by_narrative) methods.push('Narrative')
                   if (c.detected_by_pipeline) methods.push('Pipeline')
-                  if (c.detected_by_chains) methods.push('Chains')
+                  if (c.detected_by_chains) methods.push('Early Signal')
                   if (c.detected_by_spikes) methods.push('Spikes')
                   const detectedBy = methods.length > 0 ? methods.join(' + ') : (c.is_gap ? 'MISSED' : '-')
                   return (
