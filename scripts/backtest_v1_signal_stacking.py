@@ -73,24 +73,7 @@ def _distinct_stack_count(conn, token_id: str, opened_at: str, end_at: str) -> t
     not 100. This is what the BIO case study showed mattered: signal class
     diversity, not signal-event volume.
     """
-    sources = []
-    for table, ts_col, label in _SIGNAL_SOURCES:
-        cur = conn.execute(
-            f"""SELECT 1 FROM {table}
-                WHERE coin_id = ? OR token_id = ?
-                LIMIT 1"""
-            if table == "chain_matches"
-            else f"""SELECT 1 FROM {table}
-                    WHERE coin_id = ?
-                    AND datetime({ts_col}) >= datetime(?)
-                    AND datetime({ts_col}) <= datetime(?)
-                    LIMIT 1""",
-            (token_id, opened_at, end_at),
-        )
-        # chain_matches uses token_id, others use coin_id. Re-issue properly.
-
-    # Simpler form — explicit query per source
-    sources = []
+    sources: list[str] = []
     for table, ts_col, label in _SIGNAL_SOURCES:
         token_col = "token_id" if table == "chain_matches" else "coin_id"
         cur = conn.execute(
