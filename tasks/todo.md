@@ -1,6 +1,22 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-01 (Tier 1a flip)
+Last updated: 2026-05-03 (chain dispatch alive + Tier 1a reversal)
+
+## Pending verifications (time-gated)
+
+- [ ] **2026-05-04 ~01:09Z+ — BL-071 guard verification (24h check).** First daily LEARN tick after the systemic-zero-hits guard deployed (2026-05-03 ~15:13Z). Sequence: chain_patterns reactivated 2026-05-03 15:13Z (3rd time) → BL-071 guard merged commit 2a45263 → patterns reactivated again 2026-05-03 15:13Z. The next LEARN tick at ~01:09Z UTC will run `run_pattern_lifecycle`. With the guard in place, it should hit `total_hits_across_all == 0`, log `chain_pattern_retirement_skipped_systemwide_zero_hits` warning, and short-circuit before any UPDATE.
+  - Verify via:
+    ```
+    ssh srilu-vps "sqlite3 /root/gecko-alpha/scout.db 'SELECT id, name, is_active, updated_at FROM chain_patterns ORDER BY id'"
+    ssh srilu-vps "journalctl -u gecko-pipeline --since '01:00' --no-pager | grep retirement_skipped_systemwide"
+    ssh srilu-vps "sqlite3 /root/gecko-alpha/scout.db \"SELECT COUNT(*), MAX(opened_at) FROM paper_trades WHERE signal_type='chain_completed'\""
+    ```
+  - Pass criteria: all 3 patterns still `is_active=1`, warning visible in logs, chain_completed paper_trades count growing past current 7.
+  - Fail recovery: if `is_active=0`, the guard didn't fire (different bug); investigate immediately.
+- [ ] **2026-05-04 13:58Z — BL-063 moonshot soak ends.** Sneak-peek already strong (+$1,420 net on moonshot path vs +$473 on regular trail at peak ≥30%). Decision: keep on.
+- [ ] **2026-05-04 22:24Z — Paper-lifecycle widening soak ends.** Sneak-peek +$1,234 net / 91 closes. Decision: keep on.
+- [ ] **2026-05-05 22:58Z — PR #59 strategy tuning soak ends.** Sneak-peek +$1,994 net / 135 closes / 67.4% win / 20% expired. Decision: keep on permanently.
+- [ ] **2026-05-10 15:53Z — gainers_early reversal re-soak (7d).** Watch for performance vs the +$190/day sneak-peek that justified reversal. If actuals < +$100/day for 7d, re-evaluate.
 
 ## Active soaks (don't disturb)
 
