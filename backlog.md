@@ -401,6 +401,41 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 **Resume protocol:** When user says "let's work on conviction-locked hold" or "BL-067", FIRST step is the backtest script. Do not write `scout/trading/conviction.py` until the backtest output justifies it.
 
+### BL-075: Slow-burn miss diagnostic + watcher (RIV-shape blind spot)
+**Status:** RESEARCH-GATED — Phase A (diagnostic) is cheap and unblocks Phase B; Phase B (watcher) is shadow-only and gated on Phase A telemetry
+**Tag:** `research-gated` `detection-blind-spot` `silent-failure-surface`
+**Motivating evidence (2026-05-03):** RIV (`riv-coin`) ran $2M → $200M mcap over 30 days — exactly the asymmetric move the system exists to surface. SSH audit against prod `scout.db` returned **zero rows** for RIV across `gainers_snapshots`, `trending_snapshots`, `velocity_alerts`, `volume_spikes`, `momentum_7d`, `second_wave_candidates`, `predictions`, `narrative_signals`, `chain_matches`, `tg_social_signals`, `candidates`, `paper_trades`, `alerts`. Only trace: one row in `price_cache` from 2026-05-01T00:08Z with `market_cap=0.0` (CoinGecko returned null mcap, our parser writes 0). For context: gainers polling captured 90,002 rows in last 30d; trending captured 5,655. Polling is healthy. RIV simply never appeared in either.
+**Best-fit hypothesis (three compounding causes):**
+1. **CoinGecko `/coins/markets` 1h-change top-50 cut.** A 100x distributed over 30 days averages ~16%/day; individual 1h windows may rarely hit the top-50 cut. We catch concentrated short pumps (BLESS 16h, GENIUS 10.5h, MEZO 8h) — slow-burn marathons fall through.
+2. **`market_cap=0.0` silent rejection.** BL-010 hard-rejects `liquidity_usd < $15K` and the predictions agent floors `market_cap_at_prediction`. CoinGecko returning null mcap → our parser writes 0 → multiple downstream gates auto-drop without logging a rejection. No "rescue" path for tokens with strong price action but missing mcap data.
+3. **Trending-list miss.** Our trending poller catches 91.8% of CoinGecko Highlights tokens — but RIV apparently never made that tab during a poll cycle (or pumped between polls). We can't distinguish from the data.
+**Honest scope caveat:** n=1. RIV alone doesn't justify a major detection rebuild. The point of Phase A is to find out **how often this is actually happening** before building anything heavyweight.
+
+**Phase A — Cheap diagnostic (1h):**
+- Add a `mcap_missing_count` counter to ingestion telemetry (`scout/ingestion/coingecko.py` + heartbeat log).
+- Increment when CoinGecko returns a token with `market_cap` null/0 but `current_price > 0`.
+- Log to existing heartbeat output every 5min (matches BL-033 pattern).
+- **Acceptance:** After 7d of telemetry, we know the rate of mcap-missing silent rejections. Decision tree:
+  - If < 1% of unique tokens scanned → silent-rejection is a corner case; close BL-075 as won't-fix on this axis.
+  - If 1–5% → worth a fallback (estimate mcap from `volume_24h × ratio` or pull from DexScreener); tractable scope expansion.
+  - If > 5% → significant blind spot; Phase B is justified.
+
+**Phase B — Slow-burn watcher (shadow-only, ~0.5d after Phase A):**
+- New module `scout/early/slow_burn.py` — separate from existing detection layer.
+- Filter: `price_change_7d > 50%` AND `price_change_1h < 5%` (the inverse of velocity_alerter — slow accumulation, not concentrated pump).
+- Write to new `slow_burn_candidates` table with snapshot history.
+- **No paper trade dispatch.** Research-only, like the original PR #27 velocity_alerter pattern. Shadow soak ≥ 14d before any signal-routing decision.
+- **Acceptance:** After 14d shadow soak, count tokens that flagged → became 5x+ runners. If hit-rate matches or beats existing velocity_alerter (~zero false-negative cost; the test is whether the new signal catches misses the existing layer doesn't), promote to a real signal type with paper trade dispatch behind a flag (`SLOW_BURN_DISPATCH_ENABLED=False` default).
+
+**Cross-references (do NOT pre-couple, but worth knowing):**
+- BL-073 Phase 1 GEPA on `narrative_prediction` could plausibly evolve a slow-burn classifier as a downstream consumer of the same eval set. Worth re-checking after Phase 1 ships (if it ships).
+- BL-032 social signal source decision — slow-burn tokens often have organic social mentions before the price move; a working `social_mentions_24h` signal could complement the slow-burn watcher.
+- BL-067 conviction-locked hold — slow-burn signal would be one more independent surface that could stack into conviction-lock once both ship.
+
+**Estimate:** Phase A: 1h. Phase B: 0.5d code + 14d shadow soak before any acceptance read.
+
+**Resume protocol:** Operator says "BL-075" or "RIV miss" or "slow-burn watcher" → start with Phase A. Do not skip to Phase B; the diagnostic data informs whether B is worth building.
+
 ---
 
 ## P3 — Future / Nice-to-have
