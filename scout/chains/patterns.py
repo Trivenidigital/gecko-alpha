@@ -294,6 +294,26 @@ async def run_pattern_lifecycle(db: Database, settings: Settings) -> None:
         if cur_best is None or s["hit_rate"] > cur_best["hit_rate"]:
             by_pattern[pid] = s
 
+    # Systemic-zero-hits guard (BL-071, 2026-05-01).
+    # When EVERY pattern shows 0 hits across N triggers, the cause is
+    # almost certainly upstream outcome telemetry — not bad patterns.
+    # Auto-retiring on this signal disabled all 3 patterns on 2026-05-01,
+    # which silently killed chain_matches for ~17 days before the operator
+    # noticed. Only retire when the system has demonstrated it CAN produce
+    # hits somewhere; otherwise leave is_active alone and surface the
+    # condition for investigation. See backlog BL-071a/b for the deeper
+    # outcome-plumbing fixes (memecoin outcomes table empty; narrative
+    # chain_matches start at outcome_class='EXPIRED' which the hydrator
+    # filter `WHERE outcome_class IS NULL` skips entirely).
+    total_hits_across_all = sum(s["hits"] for s in by_pattern.values())
+    if total_hits_across_all == 0:
+        logger.warning(
+            "chain_pattern_retirement_skipped_systemwide_zero_hits",
+            n_patterns=len(by_pattern),
+            total_evaluated=sum(s["total_evaluated"] for s in by_pattern.values()),
+        )
+        return
+
     conn = db._conn
     for pid, s in by_pattern.items():
         async with conn.execute(

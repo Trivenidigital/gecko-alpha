@@ -252,3 +252,64 @@ async def test_update_chain_outcomes_skips_recent(db, settings):
     await db._conn.commit()
     updated = await update_chain_outcomes(db)
     assert updated == 0
+
+
+# ---------------------------------------------------------------------------
+# BL-071 — systemic-zero-hits guard
+# ---------------------------------------------------------------------------
+
+
+async def test_lifecycle_skips_retirement_when_all_patterns_zero_hits(db, settings):
+    """When every pattern shows 0 hits across the trigger floor, the cause is
+    almost certainly broken outcome telemetry — NOT bad patterns. The guard
+    must short-circuit before any is_active is touched.
+
+    This is the exact scenario that fired on 2026-05-01T01:26Z and silently
+    deactivated all 3 patterns, killing chain_matches for ~17 days.
+    """
+    # Seed 12 misses on each of the 3 built-in patterns. Above
+    # CHAIN_MIN_TRIGGERS_FOR_STATS=10, well below _RETIREMENT_HIT_RATE=0.20.
+    # Without the guard, all 3 patterns would be auto-retired.
+    await _seed_matches(db, "full_conviction", "memecoin", n_hits=0, n_misses=12)
+    await _seed_matches(db, "narrative_momentum", "narrative", n_hits=0, n_misses=12)
+    await _seed_matches(db, "volume_breakout", "memecoin", n_hits=0, n_misses=12)
+
+    await run_pattern_lifecycle(db, settings)
+
+    # All three patterns must remain active — guard short-circuited the loop
+    # before any UPDATE could fire. The `chain_pattern_retirement_skipped_systemwide_zero_hits`
+    # warning is logged via structlog (not stdlib) so we assert behaviour, not log text.
+    async with db._conn.execute(
+        "SELECT name, is_active FROM chain_patterns ORDER BY name"
+    ) as cur:
+        rows = await cur.fetchall()
+    for r in rows:
+        assert r[1] == 1, f"pattern {r[0]} was retired despite zero-hits-systemwide"
+
+
+async def test_lifecycle_still_retires_bad_pattern_when_others_have_hits(
+    db, settings
+):
+    """The guard must NOT block per-pattern retirement when at least one
+    other pattern is producing hits. That keeps Tier-1b-style auto-suspend
+    working for genuinely bad patterns when the system has demonstrated it
+    CAN observe hits elsewhere.
+    """
+    # full_conviction: 6 hits / 4 misses (60%) — healthy
+    # narrative_momentum: 0 hits / 12 misses (0%) — should retire
+    # volume_breakout: 0 hits / 12 misses (0%) — should retire
+    await _seed_matches(db, "full_conviction", "memecoin", n_hits=6, n_misses=4)
+    await _seed_matches(db, "narrative_momentum", "narrative", n_hits=0, n_misses=12)
+    await _seed_matches(db, "volume_breakout", "memecoin", n_hits=0, n_misses=12)
+
+    await run_pattern_lifecycle(db, settings)
+
+    async with db._conn.execute(
+        "SELECT name, is_active FROM chain_patterns ORDER BY name"
+    ) as cur:
+        rows = {r[0]: r[1] for r in await cur.fetchall()}
+
+    assert rows["full_conviction"] == 1, "healthy pattern must stay active"
+    assert rows["narrative_momentum"] == 0, "bad pattern must retire when others have hits"
+    assert rows["volume_breakout"] == 0, "bad pattern must retire when others have hits"
+
