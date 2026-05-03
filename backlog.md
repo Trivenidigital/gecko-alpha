@@ -321,6 +321,18 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Acceptance:** Operator can open dashboard, see at a glance: are listeners running? are messages flowing? what's in DLQ? did a trade dispatch?
 **Estimate:** 0.5-1 day backend + 0.5 day frontend.
 
+### BL-071a': Wire chain_match writers + DexScreener fetch for memecoin outcome hydration
+**Status:** UNBLOCKED (follow-up from Bundle A 2026-05-03) — schema column + hydrator branch shipped; only writer wiring + DexScreener fetch remain
+**Tag:** `chain-pipeline` `outcome-telemetry` `unblocks-BL-071a-fully`
+**Files:** `scout/chains/tracker.py` (`_record_chain_complete`, `_record_expired_chain` — accept and store mcap; hydrator's populated-branch — replace silent `continue` with DexScreener FDV fetch + outcome computation), `scout/chains/events.py` or chain-completion caller chain (pass current FDV through to writers), tests
+**Why:** Bundle A added `chain_matches.mcap_at_completion REAL` column + hydrator branch that skips silently when populated. Writers still pass NULL because adding the caller-wiring would have grown Bundle A scope. Once writers populate the column AND the hydrator inlines the DexScreener fetch, hit/miss outcomes flow for memecoin chain_matches. Closes the BL-071a death-spiral structurally.
+**Acceptance:**
+- New memecoin chain_matches have non-NULL `mcap_at_completion`.
+- LEARN cycle emits `chain_outcomes_hydrated count>0` for memecoin pipeline (instead of `chain_outcomes_unhydrateable_memecoin total_unhydrateable=N` aggregate warning).
+- Pattern hit-rate becomes meaningful for memecoin patterns.
+- Remove the `chain_outcomes_unhydrateable_memecoin` warning OR downgrade to INFO (per design-doc §6 Q1).
+**Estimate:** 0.5d (small caller-chain edit + DexScreener fetch in hydrator + tests).
+
 ### BL-071a: Investigate why memecoin `outcomes` table is empty
 **Status:** Not started — flagged 2026-05-03 during BL-071 investigation
 **Tag:** `research-gated` `chain-pipeline` `outcome-telemetry`

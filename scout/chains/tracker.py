@@ -584,6 +584,7 @@ async def update_chain_outcomes(db: Database) -> int:
 
     now_iso = datetime.now(timezone.utc).isoformat()
     updated = 0
+    memecoin_unhydrateable = 0
     for row in pending:
         match_id = row["id"]
         token_id = row["token_id"]
@@ -607,6 +608,23 @@ async def update_chain_outcomes(db: Database) -> int:
                 if outcome not in ("hit", "miss"):
                     outcome = "hit" if outcome == "hit" else "miss"
         elif pipeline == "memecoin":
+            # BL-071a partial (Bundle A 2026-05-03): prefer mcap_at_completion
+            # (set by writer once BL-071a' wires them; today always NULL).
+            # When populated, skip SILENTLY — BL-071a' will inline the
+            # DexScreener fetch here. When NULL, fall back to legacy outcomes
+            # table; if THAT is also empty, count for the aggregate warning
+            # emitted once at end (not per-row, to avoid log spam).
+            async with conn.execute(
+                """SELECT mcap_at_completion FROM chain_matches WHERE id = ?""",
+                (match_id,),
+            ) as cur_m:
+                mcap_row = await cur_m.fetchone()
+            mcap_at_completion = mcap_row[0] if mcap_row else None
+
+            if mcap_at_completion is not None and mcap_at_completion > 0:
+                # Intentional silent skip — BL-071a' inlines the fetch here.
+                continue
+
             async with conn.execute(
                 """SELECT price_change_pct FROM outcomes
                    WHERE contract_address = ? AND price_change_pct IS NOT NULL
@@ -616,6 +634,8 @@ async def update_chain_outcomes(db: Database) -> int:
                 orow = await cur2.fetchone()
             if orow is not None and orow[0] is not None:
                 outcome = "hit" if float(orow[0]) > 0 else "miss"
+            else:
+                memecoin_unhydrateable += 1
 
         if outcome is None:
             continue
@@ -631,6 +651,21 @@ async def update_chain_outcomes(db: Database) -> int:
     await conn.commit()
     if updated:
         logger.info("chain_outcomes_hydrated", count=updated)
+    # BL-071a partial: aggregate warning per LEARN cycle (not per row) so
+    # operators see the silent-failure surface without log spam. Will go
+    # quiet once BL-071a' wires writers + adds DexScreener fetch.
+    # Structured fields: explicit counts so operators can filter via
+    # `jq '.total_unhydrateable'` etc. Carries expires_when + backlog_ref
+    # so the deferral doesn't decay into known-noise.
+    if memecoin_unhydrateable:
+        logger.warning(
+            "chain_outcomes_unhydrateable_memecoin",
+            total_unhydrateable=memecoin_unhydrateable,
+            mcap_at_completion_null_count=memecoin_unhydrateable,
+            outcomes_table_empty_count=memecoin_unhydrateable,
+            expires_when="BL-071a' ships (writers populate mcap_at_completion)",
+            backlog_ref="BL-071a'",
+        )
     return updated
 
 

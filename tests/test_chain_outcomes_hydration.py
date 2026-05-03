@@ -182,3 +182,118 @@ async def test_migration_converts_expired_narrative_rows(tmp_path):
     # Re-run: must be a no-op (second invocation hits the gate)
     await d1._migrate_feedback_loop_schema()
     await d1.close()
+
+
+@pytest.mark.asyncio
+async def test_chain_matches_has_mcap_at_completion_column(db):
+    """BL-071a partial: schema check — column must exist after migrations run."""
+    cur = await db._conn.execute("PRAGMA table_info(chain_matches)")
+    cols = {row[1]: row[2] for row in await cur.fetchall()}
+    assert "mcap_at_completion" in cols
+    assert cols["mcap_at_completion"] == "REAL"
+
+
+def _capture_chain_logs(monkeypatch):
+    """Monkey-patch tracker module's logger to a list-capture stub.
+
+    Mirrors tests/test_heartbeat.py's _capture_logs pattern — bypasses caplog,
+    which doesn't reliably capture structlog event_dicts when structlog
+    isn't bridged to stdlib in the test config.
+    """
+    captured: list[tuple[str, dict]] = []
+
+    class _CapLogger:
+        def info(self, event, **kwargs):
+            captured.append(("INFO", event, kwargs))
+
+        def warning(self, event, **kwargs):
+            captured.append(("WARNING", event, kwargs))
+
+        def error(self, event, **kwargs):
+            captured.append(("ERROR", event, kwargs))
+
+        def exception(self, event, **kwargs):
+            captured.append(("ERROR", event, kwargs))
+
+        def debug(self, event, **kwargs):
+            captured.append(("DEBUG", event, kwargs))
+
+    from scout.chains import tracker as tracker_module
+    monkeypatch.setattr(tracker_module, "logger", _CapLogger())
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_hydrator_silent_skip_when_mcap_at_completion_populated(db, monkeypatch):
+    """BL-071a partial: when memecoin chain_match has non-NULL
+    mcap_at_completion, hydrator must skip silently — BL-071a' will add the
+    DexScreener fetch later. No per-row warning (that would be permanent
+    log noise)."""
+    captured = _capture_chain_logs(monkeypatch)
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES ('0xdeadbeef','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, 1500000.0)""",
+        (long_ago, long_ago),
+    )
+    await db._conn.commit()
+    updated = await update_chain_outcomes(db)
+    assert updated == 0
+    # Must NOT emit per-row warning for the populated case (silent intentional skip).
+    pending_warnings = [c for c in captured if "pending" in c[1]]
+    assert pending_warnings == [], (
+        f"populated mcap_at_completion must skip silently; got {pending_warnings}"
+    )
+    # Also: must NOT emit aggregate warning (the row was skipped, not unhydrateable).
+    aggregate_warnings = [c for c in captured if c[1] == "chain_outcomes_unhydrateable_memecoin"]
+    assert aggregate_warnings == [], (
+        f"populated row should not count as unhydrateable; got {aggregate_warnings}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_hydrator_aggregate_warning_when_no_source(db, monkeypatch):
+    """BL-071a partial: when N memecoin rows lack BOTH mcap_at_completion
+    AND outcomes-table data, hydrator emits ONE aggregate warning per
+    LEARN cycle (not N).
+
+    Includes T3.A coverage: mcap_at_completion=0.0 falls through to legacy
+    path same as NULL (zero mcap is meaningless for hydration). Includes
+    T3.B coverage: negative mcap_at_completion also falls through.
+    """
+    captured = _capture_chain_logs(monkeypatch)
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    rows = [
+        # 3 NULL mcap rows
+        (f"0xnosrc{i}", "memecoin", 1, "p", 1, 2, long_ago, long_ago, 0.0, 0, None, None)
+        for i in range(3)
+    ] + [
+        # T3.A: explicit zero mcap — must be treated as no usable data
+        ("0xzeroM", "memecoin", 1, "p", 1, 2, long_ago, long_ago, 0.0, 0, None, 0.0),
+        # T3.B: negative mcap (impossible in practice but defensively handled)
+        ("0xnegM", "memecoin", 1, "p", 1, 2, long_ago, long_ago, 0.0, 0, None, -1.0),
+    ]
+    await db._conn.executemany(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    await db._conn.commit()
+    updated = await update_chain_outcomes(db)
+    assert updated == 0
+    aggregate = [c for c in captured if c[1] == "chain_outcomes_unhydrateable_memecoin"]
+    assert len(aggregate) == 1, (
+        f"expected exactly one aggregate warning for 5 unhydrateable rows, got "
+        f"{len(aggregate)}: {captured}"
+    )
+    _, _, kwargs = aggregate[0]
+    assert kwargs["total_unhydrateable"] == 5
+    assert kwargs["mcap_at_completion_null_count"] == 5
+    assert kwargs["outcomes_table_empty_count"] == 5
+    assert kwargs["backlog_ref"] == "BL-071a'"
