@@ -662,11 +662,22 @@ async def test_hydrator_silent_skip_when_mcap_at_completion_populated(db, caplog
 @pytest.mark.asyncio
 async def test_hydrator_aggregate_warning_when_no_source(db, caplog):
     """When N memecoin rows lack BOTH mcap_at_completion AND outcomes-table
-    data, hydrator emits ONE aggregate warning per LEARN cycle (not N)."""
+    data, hydrator emits ONE aggregate warning per LEARN cycle (not N).
+
+    Includes T3.A coverage: mcap_at_completion=0.0 falls through to legacy
+    path same as NULL (zero mcap is meaningless for hydration). Includes
+    T3.B coverage: negative mcap_at_completion also falls through.
+    """
     long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
     rows = [
+        # 3 NULL mcap rows
         (f"0xnosrc{i}", "memecoin", 1, "p", 1, 2, long_ago, long_ago, 0.0, 0, None, None)
         for i in range(3)
+    ] + [
+        # T3.A: explicit zero mcap — must be treated as no usable data
+        ("0xzeroM", "memecoin", 1, "p", 1, 2, long_ago, long_ago, 0.0, 0, None, 0.0),
+        # T3.B: negative mcap (impossible in practice but defensively handled)
+        ("0xnegM", "memecoin", 1, "p", 1, 2, long_ago, long_ago, 0.0, 0, None, -1.0),
     ]
     await db._conn.executemany(
         """INSERT INTO chain_matches
@@ -685,9 +696,13 @@ async def test_hydrator_aggregate_warning_when_no_source(db, caplog):
         if "chain_outcomes_unhydrateable_memecoin" in (rec.message + str(rec.__dict__))
     ]
     assert len(aggregate_logs) == 1, (
-        "expected exactly one aggregate warning for 3 unhydrateable rows, got "
+        "expected exactly one aggregate warning for 5 unhydrateable rows, got "
         f"{len(aggregate_logs)}"
     )
+    # Aggregate must carry structured count fields (R2 SHOULD-FIX feedback)
+    rec = aggregate_logs[0]
+    rec_str = str(rec.__dict__)
+    assert "total_unhydrateable=5" in rec_str or "'total_unhydrateable': 5" in rec_str
 ```
 
 - [ ] **Step 3.2 — Run tests to verify they fail**
@@ -718,6 +733,37 @@ Edit `scout/db.py`. Inside the same `_migrate_feedback_loop_schema` block where 
                 ),
             )
 ```
+
+- [ ] **Step 3.3b — Add `mcap_at_completion` to ChainMatch Pydantic model**
+
+Edit `scout/chains/models.py`. Locate `class ChainMatch(BaseModel)` (around line 67-83). Add the new optional field between `evaluated_at` and the closing of the class:
+
+```python
+class ChainMatch(BaseModel):
+    """A completed chain — stored for LEARN phase and boost application."""
+
+    id: int | None = None
+    token_id: str
+    pipeline: str
+    pattern_id: int
+    pattern_name: str
+    steps_matched: int
+    total_steps: int
+    anchor_time: datetime
+    completed_at: datetime
+    chain_duration_hours: float
+    conviction_boost: int
+    outcome_class: str | None = None
+    outcome_change_pct: float | None = None
+    evaluated_at: datetime | None = None
+    # BL-071a partial (Bundle A 2026-05-03): writer wiring lives in BL-071a',
+    # but the field exists on the model now to preserve the "model mirrors
+    # table" invariant and prevent future schema/model drift.
+    mcap_at_completion: float | None = None
+```
+
+Run: `uv run pytest tests/ -k "chain" -v`
+Expected: still all green (purely additive, defaulted field).
 
 - [ ] **Step 3.4 — Modify `update_chain_outcomes` for new memecoin branch + aggregate warning**
 
@@ -801,20 +847,23 @@ Edit `scout/chains/tracker.py`. The function `update_chain_outcomes` lives at li
     # BL-071a partial: aggregate warning per LEARN cycle (not per row) so
     # operators see the silent-failure surface without log spam. Will go
     # quiet once BL-071a' wires writers + adds DexScreener fetch.
+    # Structured fields (per design-review R2 SHOULD-FIX): explicit counts
+    # so operators can filter via `jq '.total_unhydrateable'` etc.
     if memecoin_unhydrateable:
         logger.warning(
             "chain_outcomes_unhydrateable_memecoin",
-            count=memecoin_unhydrateable,
-            reason=(
-                "outcomes table empty AND mcap_at_completion NULL across N rows. "
-                "BL-071a' will populate mcap_at_completion at write time AND "
-                "inline the DexScreener fetch in this hydrator branch."
-            ),
+            total_unhydrateable=memecoin_unhydrateable,
+            mcap_at_completion_null_count=memecoin_unhydrateable,  # all are NULL today; BL-071a' will start populating
+            outcomes_table_empty_count=memecoin_unhydrateable,  # same — both sources lacking
+            expires_when="BL-071a' ships (writers populate mcap_at_completion)",
+            backlog_ref="BL-071a'",
         )
     return updated
 ```
 
-The key change vs. v1 of the plan: the populated-column branch is `continue` with NO warning (silent skip — intentional intermediate state). The no-source-available case increments a counter that's emitted ONCE at the end of the function as `chain_outcomes_unhydrateable_memecoin count=N` — aggregated, not per-row.
+The key change vs. v1 of the plan: the populated-column branch is `continue` with NO warning (silent skip — intentional intermediate state). The no-source-available case increments a counter that's emitted ONCE at the end of the function as `chain_outcomes_unhydrateable_memecoin total_unhydrateable=N mcap_at_completion_null_count=N outcomes_table_empty_count=N expires_when="BL-071a' ships" backlog_ref="BL-071a'"` — aggregated, structured, with explicit expiry pointer.
+
+**Note on ChainMatch Pydantic model (R2 SHOULD-FIX):** Add `mcap_at_completion: float | None = None` to `ChainMatch` in `scout/chains/models.py` — keeps the model-mirrors-table invariant intact. One-line change, defaulted, zero-risk. Build phase appends this between `evaluated_at` and the closing line.
 
 - [ ] **Step 3.5 — Run tests to verify they pass**
 

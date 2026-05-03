@@ -91,6 +91,9 @@ Both write to `chain_matches`. The hydrator's `WHERE outcome_class IS NULL` woul
 
 No data corruption. Worst case: row stays NULL one cycle longer. Acceptable.
 
+**Failure mode F2.1' — `_record_expired_chain` does not commit; caller commits later.** (Per design-review R1 M1.)
+`_record_expired_chain` issues `await db._conn.execute(INSERT ...)` but does NOT call `commit()`. The caller (`run_chain_tracker` at tracker.py:151) commits after the cycle completes. If the caller path crashes between the INSERT and the commit (out-of-memory, unhandled exception in subsequent code), the row is silently lost — the same as before this PR (the existing `EXPIRED` write also relied on the caller's deferred commit). This is NOT a regression introduced by Bundle A; it's a pre-existing property of the writer's commit-deferral pattern. Mitigation already in place: aiosqlite is configured with daemon worker threads (`tests/conftest.py:30`); on process death the OS reclaims the connection without partial-write commit. Database state is consistent. **Documented here so future readers don't think Bundle A introduced this** — it didn't, but the commit-boundary surface should be visible.
+
 **Failure mode F2.2 — Migration runs while LEARN cycle is mid-execution in another process.**
 Single-process pipeline (`gecko-pipeline.service`); no cross-process contention. Migration runs at startup *inside* `Database.initialize()` BEFORE the LEARN scheduler is wired. No race.
 
@@ -114,8 +117,10 @@ Inside `BEGIN EXCLUSIVE` — exclusive lock on the DB held for the duration. No 
 **Failure mode F3.3 — Hydrator's per-row sub-query for `mcap_at_completion` is slow at scale.**
 Each pending memecoin row triggers one extra `SELECT mcap_at_completion FROM chain_matches WHERE id = ?`. This is a primary-key lookup, O(1) per row, negligible. Even at 10,000 pending rows the overhead is sub-second. NIT: could be optimized into the outer SELECT, but that's a refactor not worth the change-volume in Bundle A scope.
 
-**Failure mode F3.4 — Aggregate warning fires every LEARN cycle indefinitely.**
+**Failure mode F3.4 — Aggregate warning fires every LEARN cycle indefinitely.** (Per design-review R1 S1, refined.)
 This is BY DESIGN until BL-071a' lands. The aggregate-once-per-cycle shape limits log volume to N lines/day (LEARN runs daily-ish). Acceptable signal-to-noise. Reviewer R2 M2 explicitly flagged the per-row antipattern; the aggregate fix addresses the spirit of that concern.
+
+**Anti-decay protection (R1 S1):** The structured log carries explicit `expires_when="BL-071a' ships"` AND `backlog_ref="BL-071a'"` fields. If operators see the warning still firing N days from now, the structured field tells them why and where to track — instead of becoming "known noise" filtered into invisibility. Additionally, the §5 operational verification explicitly checks for the warning's *absence* once BL-071a' lands; the warning's presence after that is a regression flag, not noise.
 
 **Failure mode F3.5 — `update_chain_outcomes` returns count of `updated`, but new memecoin-skip path doesn't add to that count.**
 Correct. `updated` = "rows where outcome_class was set". Skipped rows (because no source) are NOT updated. Caller (`run_chain_tracker`) uses `updated` for log granularity, not for correctness. The aggregate warning communicates the skip count separately.
@@ -149,6 +154,8 @@ If any of the three changes ships and is found to cause a regression in producti
 
 **Combined rollback:** `git revert` all three commits in any order; restart service. No coupled rollback ordering required because the changes don't depend on each other.
 
+**Partial-deploy story (R1 S3):** gecko-alpha runs as a single systemd unit (`gecko-pipeline.service`). `git pull` is atomic at the file-tree level (working tree updates fully or not at all under a successful fetch+checkout). `systemctl restart` reloads the entire process from scratch. **There is no scenario where one commit lands but another doesn't from the same `git pull`** — and there is no scenario where one Python module gets reloaded while another stays at the old version, because the process is restarted as a unit. The "partial-deploy" worry doesn't apply to this deployment shape; it would apply to a multi-process or hot-reload setup, neither of which we run.
+
 **One-way doors:**
 - The `chain_matches.mcap_at_completion` column is effectively permanent (SQLite ALTER COLUMN DROP requires creating a new table + COPY + DROP old). This is fine — an unused nullable column has no cost.
 - The `bl071b_unstamp_expired_narrative` and `bl071a_chain_matches_mcap_at_completion` rows in `paper_migrations` are permanent. Deleting them would let the migration re-run on next startup. Not worth manual intervention.
@@ -159,30 +166,49 @@ If any of the three changes ships and is found to cause a regression in producti
 
 After `git pull` + `systemctl restart gecko-pipeline` on the VPS, verify in this order:
 
+0. **Pre-deploy backup (R2 wording fix):** `cp /root/gecko-alpha/scout.db /root/gecko-alpha/scout.db.bak.$(date +%s)` BEFORE the restart. Standard operational hygiene before any DDL change. Bounded migration risk is low but the backup costs nothing and unblocks a one-command rollback if anything surprises.
 1. **Service started cleanly:** `systemctl status gecko-pipeline` shows active+running.
 2. **Migration applied:** `sqlite3 /root/gecko-alpha/scout.db "SELECT name FROM paper_migrations WHERE name LIKE 'bl071%'"` returns both `bl071b_unstamp_expired_narrative` AND `bl071a_chain_matches_mcap_at_completion`.
 3. **Column exists:** `sqlite3 /root/gecko-alpha/scout.db "PRAGMA table_info(chain_matches)"` lists `mcap_at_completion REAL`.
 4. **EXPIRED narrative rows converted:** `sqlite3 /root/gecko-alpha/scout.db "SELECT COUNT(*) FROM chain_matches WHERE pipeline='narrative' AND outcome_class='EXPIRED' AND evaluated_at IS NULL"` returns 0 (was 154 pre-deploy per memory).
+4b. **Rows are converted, not lost (R1 N2):** `sqlite3 /root/gecko-alpha/scout.db "SELECT COUNT(*) FROM chain_matches WHERE pipeline='narrative' AND outcome_class IS NULL AND evaluated_at IS NULL"` should now return ~154 (the converted rows, plus any new NULL writes since deploy). Confirms the migration converted vs. dropped.
 5. **Heartbeat shows new field:** `journalctl -u gecko-pipeline --since '6 minutes ago' | grep heartbeat | tail -1` shows `mcap_null_with_price_count=N` for some N.
 6. **No new exceptions:** `journalctl -u gecko-pipeline --since '6 minutes ago' | grep -iE 'error|exception|traceback' | wc -l` returns 0 or only known-pre-existing entries.
-7. **LEARN cycle succeeds at next tick (~24h after deploy):** look for `chain_outcomes_hydrated count=N` (success) AND/OR `chain_outcomes_unhydrateable_memecoin count=N` (expected aggregate, not an error).
+7. **LEARN cycle succeeds at next tick (~24h after deploy):** look for `chain_outcomes_hydrated count=N` (success) AND/OR `chain_outcomes_unhydrateable_memecoin count=N` (expected aggregate, not an error). **Per R1 S2: this step is calendar-gated. To prevent forgetting:** create a TaskCreate / scheduled wakeup at the time of merge that fires 24-26h post-deploy with the exact `journalctl` command. Step 7 is documented as part of the merge-and-deploy task in `tasks/todo.md`-style tracking, not as an item that depends on operator memory.
 
 ---
 
 ## 6. Open questions / non-blocking items for reviewers
 
-1. **Should the aggregate `chain_outcomes_unhydrateable_memecoin` warning be downgraded to INFO once BL-071a' is shipped?** Currently WARNING because it represents an actionable silent-failure gap. Once BL-071a' lands and the gap is closed, the warning is no longer actionable. Suggest documenting in BL-071a' acceptance: "remove this warning when DexScreener fetch is wired."
+1. **Should the aggregate `chain_outcomes_unhydrateable_memecoin` warning be downgraded to INFO once BL-071a' is shipped?** Currently WARNING because it represents an actionable silent-failure gap. Once BL-071a' lands and the gap is closed, the warning is no longer actionable. Documented in BL-071a' acceptance: "remove this warning when DexScreener fetch is wired."
 2. **Should the `mcap_null_with_price_count` field be added to dashboard?** Out of Bundle A scope — operator can read heartbeat output via `journalctl` for the 7-day BL-075 Phase A measurement window. If we want a chart, that's a future dashboard PR.
-3. **Should we do a one-off pre-deploy backup of `scout.db` on the VPS before running the migration?** The migration is bounded (UPDATE WHERE pipeline='narrative' AND outcome_class='EXPIRED' AND evaluated_at IS NULL) and inside BEGIN EXCLUSIVE. Risk is very low. Suggest YES anyway as standard operational hygiene before any DDL change. Operator decision.
+3. **Pre-deploy backup of `scout.db`.** Resolved per R2 wording fix: promoted from "open question" to runbook step §5 #0. No longer a punt.
 
 ---
 
-## 7. Self-review
+## 7. Deliberate counter-decisions on design-review feedback
+
+R2 made two SHOULD-FIX suggestions that I am NOT applying, with rationale documented here so future readers see the choice was considered.
+
+**Counter-decision A — Did NOT extract `_has_usable_mcap(v: float | None) -> bool` predicate.** R2 NIT.
+The 3-way collapse (`v is not None and v > 0`) is open-coded inline at one call site (the new memecoin hydrator branch). Extracting it adds a new symbol to `scout/chains/tracker.py` that's used exactly once. Bundle A's guiding principle is minimal scope — adding helpers we don't need creates surface for future drift (e.g., a second consumer might use the predicate with subtly different intent). Future PR (BL-071a') will likely have multiple call sites once the DexScreener fetch is wired; **at that point** extracting the predicate becomes earned. Not yet.
+
+**Counter-decision B — Did NOT create `_migrate_chain_outcome_telemetry` sibling method.** R2 SHOULD-FIX.
+The existing `_migrate_feedback_loop_schema` co-tenants migrations from BL-061 (ladder), BL-062 (peak-fade), BL-063 (moonshot), and BL-064 (TG social, safety_required) — five distinct concerns spanning ~250 lines. The pattern of "all post-launch migrations live in this one method, gated by `paper_migrations` rows and verified by the post-assertion block" is a *consciously-maintained* convention in this repo. Splitting Bundle A into a new method would break the convention, fragment the post-assertion (which currently verifies all migrations applied in one place), and require duplicating the `BEGIN EXCLUSIVE` + ROLLBACK scaffolding. **Pattern conformity beats single-responsibility-purity here.** If the file ever gets refactored (BL-072'-style scope), all migrations should split out together — not just the new one.
+
+R1 NIT (N1) — documenting hidden behaviour change introduced by Task 2:
+Task 2 (BL-071b) changes write-time semantics from EXPIRED to NULL. The hydrator's existing fall-through in `update_chain_outcomes` for the narrative branch (`outcome = "hit" if outcome == "hit" else "miss"`) is a "non-canonical → miss" silent fallback that's been there pre-Bundle-A. **After BL-071b, more rows flow through that branch** (because the EXPIRED→NULL conversion now lets them be re-evaluated). If `predictions.outcome_class` ever holds a non-canonical value (anything other than `'hit'`, `'miss'`, `'UNRESOLVED'`), Bundle A will surface previously-hidden miscategorizations as `miss`. Verified: as of 2026-05-03 the predictions table only contains `'HIT'`, `'MISS'`, `'NEUTRAL'`, `'UNRESOLVED'`, NULL — and `'NEUTRAL'` skips the hydrator entirely (pre-existing filter `outcome_class != 'UNRESOLVED'` doesn't catch NEUTRAL — actually verify before claiming this). **Build phase action:** confirm distinct values of `predictions.outcome_class` in prod via SSH; if any non-canonical values exist, document or fix.
+
+## 8. Self-review
 
 - [x] **All test gaps explicitly named** with disposition (covered / not worth / will-add-in-build).
-- [x] **All failure modes analyzed** for each task (5 for Task 1, 5 for Task 2, 5 for Task 3).
+- [x] **All failure modes analyzed** for each task (Task 1: 5; Task 2: 5+1=6 incl. F2.1'; Task 3: 5).
 - [x] **Performance impact quantified** (table at §3).
-- [x] **Rollback strategy** for each task + combined (§4).
-- [x] **Operational verification checklist** for the deploy (§5).
-- [x] **Open questions** explicitly flagged as non-blocking (§6).
+- [x] **Rollback strategy** for each task + combined + partial-deploy clarification (§4).
+- [x] **Operational verification checklist** for the deploy (§5) including pre-deploy backup (§5 #0) and row-count integrity (§5 #4b).
+- [x] **Open questions** explicitly flagged as non-blocking (§6) and one promoted to runbook step.
+- [x] **Deliberate counter-decisions** on R2 feedback documented (§7) with rationale.
 - [x] **No new primitives** beyond what the plan declared (frontmatter).
+- [x] **Design-review MUST-FIX items addressed:** R1 M1 (F2.1' commit-boundary surface added); R1 M2 (T3.A/T3.B promoted from "build phase action" to explicit row in plan Step 3.1's test fixture); R2 wording on backup (promoted to §5 #0).
+- [x] **Design-review SHOULD-FIX items addressed:** R1 S1 (anti-decay `expires_when`/`backlog_ref` log fields); R1 S2 (step 7 calendared); R1 S3 (partial-deploy section in §4); R2 ChainMatch model (added to plan Step 3.3b); R2 structured log fields (plan Step 3.4 split `reason` into structured fields).
+- [x] **Design-review NIT items addressed or counter-decided:** R1 N1 (documented in §7); R1 N2 (added §5 #4b); R2 NIT (counter-decision A in §7).
