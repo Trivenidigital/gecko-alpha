@@ -199,12 +199,17 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Why:** Current binary $10K-$500K gate misses the sweet spot. Diagram shows $10K-$100K as peak score, tapering to $500K.
 **Changes:** Graduated scoring: 8 pts for $10K-$100K, 5 pts for $100K-$250K, 2 pts for $250K-$500K
 
-### BL-032: Populate social_mentions_24h signal
-**Status:** Not started — currently dead signal (15 pts never fire)
-**Files:** scout/ingestion/, scout/models.py
-**Why:** Code review found social_mentions_24h is never populated.
-**Note:** PRD defers Twitter/X integration to Phase 5. Could use free Telegram channel monitoring or LunarCrush API as interim source.
-**Blocked by:** Social data source decision (LunarCrush is an option at $24/mo)
+### BL-032: Social signal source decision (consolidates old BL-032 + BL-041)
+**Status:** DECISION-PENDING — three options below; pick one before any code lands
+**Tag:** `decision-pending` `dead-signal` `consolidates-BL-041`
+**Files (eventual):** `scout/ingestion/`, `scout/models.py`, `scout/scorer.py`
+**Why:** `social_mentions_24h` is a 15-point signal that has never fired in production — code review found it's never populated. Hermes findings 2026-05-03 confirmed the 671-skill hub has **no** Twitter/X, social-volume, or LunarCrush-equivalent skill, so the Hermes route is closed. Three real options remain:
+- **(a) Reuse BL-064 listener data.** Compute `mentions_24h` per `coin_id` from the existing `tg_social_messages` table (1,019+ messages already ingested). Cheapest path; data is already on disk; chain-agnostic; no new dependency. Limitation: Telegram-only, not full social graph.
+- **(b) Third-party API.** LunarCrush ($24/mo) was the leading candidate but is in the "do not propose" list (see memory `feedback_lunarcrush_dropped.md`). Other options: Defined.fi (free tier), CryptoPanic social signal (already integrated for news). Cost vs. coverage trade-off; another monthly subscription.
+- **(c) Honest delete.** Remove the `social_mentions_24h` field from `CandidateToken`, drop the 15 points from the scorer, lower `SCORER_MAX_RAW` accordingly, document as won't-fix. Cleanest if no source ever ships.
+**Acceptance:** Either (a) or (b) ships and the signal fires non-zero on real tokens, OR (c) ships and the dead-signal surface is removed from the codebase.
+**Estimate:** (a) 0.5–1d, (b) depends on source, (c) 0.25d.
+**Note on consolidation:** This entry replaces the prior separate BL-032 + BL-041 (X/Twitter monitoring). They were two pending entries for the same dead-signal problem; merged 2026-05-03.
 
 ### BL-033: Add heartbeat logging every 5 minutes
 **Status:** DONE — heartbeat logging implemented (PR #7)
@@ -405,16 +410,21 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Why:** PRD Phase 4 (weeks 4-6). Need 30 days of outcome data first. /backtest slash command exists but needs real data.
 
 ### BL-041: Add X/Twitter social monitoring
-**Status:** Not started
-**Why:** PRD Phase 5. Requires Twitter API or scraping infrastructure.
+**Status:** MERGED INTO BL-032 (2026-05-03) — see "Social signal source decision". X/Twitter is one of several possible sources; the actual question is "which source fills the dead `social_mentions_24h` signal", not "must we use Twitter specifically". Resolved at the decision level.
 
 ### BL-042: Refactor test helpers to use conftest.py fixtures
 **Status:** DONE — 17 test files migrated to shared conftest.py fixtures
 **Why:** Code review M5 — shared fixtures added to conftest.py but existing tests still use local helpers. Low priority cleanup.
 
 ### BL-043: Add Prometheus/Grafana monitoring
-**Status:** Not started
-**Why:** Production observability. Export scan rates, alert rates, MiroFish latency as metrics.
+**Status:** DEFER UNTIL BL-073 PHASE 2 DECIDED (tagged 2026-05-03)
+**Tag:** `defer-until-BL-073-Phase-2` `observability` `parallel-work-risk`
+**Why:** Production observability — export scan rates, alert rates, MiroFish latency as metrics.
+**Why deferred:** BL-073 Phase 2 (`JackTheGit/hermes-ai-infrastructure-monitoring-toolkit`, 0.5–1d) provides Telegram bot + cron + monitoring as a near-drop-in. If that ships, much of this work is redundant. Decision tree:
+- If BL-073 Phase 2 ships → re-scope BL-043 to "Prometheus exporters for what the Hermes monitoring toolkit doesn't cover" (likely much smaller).
+- If BL-073 Phase 2 is rejected (operator declines new VPS service) → BL-043 returns to its original full scope.
+- If BL-073 Phase 2 is still unfunded at 2026-06-03 (+30d check) → re-evaluate independently.
+**Do not parallel-work** with BL-073 Phase 2 — risk of building Prometheus scaffolding that the Hermes toolkit replaces.
 
 ### BL-044: VPS deployment with systemd service
 **Status:** DONE — deployed to Srilu VPS (89.167.116.187)
@@ -470,7 +480,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
   - PR #32 — Dune smart-money queries, cron-scheduled → `smart_money` tier
   - PR #33 — pump.fun new-deploy watcher with fuzzy-match → `copycat_launch` tier
 - **Sprint 4 — meta-layer:**
-  - PR #34 — Ensemble virality classifier. Requires ≥3 tiers live + ~2 weeks of labeled data. Tags each alert: `influencer-driven | whale-accumulation | rotation | copycat | news | perp-driven`. Telegram messages gain virality-class badges; exit logic diverges by class (influencer dies in hours, whale runs for days).
+  - PR #34 — Ensemble virality classifier. Requires ≥3 tiers live + ~2 weeks of labeled data. Tags each alert: `influencer-driven | whale-accumulation | rotation | copycat | news | perp-driven`. Telegram messages gain virality-class badges; exit logic diverges by class (influencer dies in hours, whale runs for days). **Cross-ref (2026-05-03):** the BL-073 Phase 1 framework (`NousResearch/hermes-agent-self-evolution`, DSPy + GEPA) is structurally compatible with this classification problem — if Phase 1 ships and works on `narrative_prediction`, PR #34 becomes a downstream consumer of the same pipeline rather than a separate build. Worth checking before building from scratch.
 
 **First action:** PR #28 (DexScreener boosts + GeckoTerminal trending) — free, 2 days, proves the paid-promo hypothesis before committing to LunarCrush subscription. Execute after PR #27 velocity alerter stabilizes with ~48h of live Telegram traffic.
 
