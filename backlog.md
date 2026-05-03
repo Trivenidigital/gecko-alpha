@@ -235,25 +235,27 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Honest limitation:** the hook checks the marker EXISTS — does NOT validate that the listed primitives are truthful. Human PR review verifies accuracy. Documented in `docs/gecko-alpha-alignment.md` Part 4 and `CLAUDE.md`.
 
 ### BL-073: Hermes Agent integration roadmap
-**Status:** RESEARCH-GATED — Phase 0 only as of 2026-05-03; Phase 1 unfunded
+**Status:** RESEARCH-GATED — Phase 0 DONE 2026-05-03; Phase 1 unfunded
 **Tag:** `research-gated` `hermes` `cost-gated` `90-day-cancellation`
-**Realistic outlook:** Phase 1 (GEPA on `narrative_prediction` LLM prompt) is the one Hermes capability with concrete projected value for gecko-alpha. Cost gate: ~$10 + ~2 days work. Trigger to start: operator commits funding + bandwidth.
+**Realistic outlook:** Phase 1 (GEPA on `narrative_prediction` LLM prompt) is the one Hermes capability with concrete projected value for gecko-alpha. Cost gate revised down to ~$10 + ~1 day work after Phase 0 identified `NousResearch/hermes-agent-self-evolution` as a near-complete starting framework. Trigger to start: operator commits funding + bandwidth.
 
 **Phases:**
 
-| # | What | Cost | Trigger | Status |
-|---|---|---|---|---|
-| 0 | Browse `agentskills.io` for relevant skills | 1h | operator-driven | null-result 2026-05-03 — browse not performed; decision gate 2026-05-17. See `tasks/notes_agentskills_browse_2026_05_03.md` |
-| 1 | GEPA evolve `narrative_prediction` LLM prompt against the 1,274-row `predictions` table eval set (42 HIT / 40 MISS / 566 NEUTRAL / 561 UNRESOLVED) | $10 + 2d | operator commits | unfunded |
-| 2 | Hermes ops agent on VPS — Telegram NL access to gecko-alpha state, scheduled cron checks, cross-platform messaging gateway | 1-2d + $5/mo | operator approves new VPS service | unfunded |
-| 3 | Model routing for narrative LLM via OpenRouter (200+ models, ensemble, A/B against the Phase 1 eval harness) | 2-3d + variable per-model cost | Phase 1 eval harness exists | gated on Phase 1 |
-| 4 | BL-064 cross-platform expansion via Hermes gateway (Discord/Slack curator channels in addition to Telegram) | 2-3d | BL-064 14d soak (2026-05-11) shows curator-side trade dispatch works on Telegram first | gated on BL-064 soak |
-| 5 | Atropos RL infrastructure for tool-calling model training | n/a now | ≥1000 trades/signal stable for 30d (per memory `feedback_ml_not_yet.md`) | gated on data volume — months out |
+| # | What | Cost | Starting framework | Trigger | Status |
+|---|---|---|---|---|---|
+| 0 | Browse Hermes skills hub + ecosystem for relevant skills | 1h | — | operator-driven | DONE 2026-05-03 — 671 skills hub identified, frameworks chosen for Phases 1+2, ≥3 honest rejects logged. See `tasks/notes_agentskills_browse_2026_05_03.md` |
+| 1 | GEPA evolve `narrative_prediction` LLM prompt against the 1,274-row `predictions` table eval set (42 HIT / 40 MISS / 566 NEUTRAL / 561 UNRESOLVED) | $10 + ~1d (was 2d before Phase 0) | `NousResearch/hermes-agent-self-evolution` (MIT, 2.7k stars, DSPy+GEPA pipeline). Hermes built-ins: `dspy`, `evaluating-llms-harness`, `weights-and-biases` from the 671-skill hub | operator commits | unfunded |
+| 2 | Hermes ops agent on VPS — Telegram NL access to gecko-alpha state, scheduled cron checks, cross-platform messaging gateway | ~0.5–1d (was 1-2d before Phase 0) + $5/mo | `JackTheGit/hermes-ai-infrastructure-monitoring-toolkit` (near-drop-in: Telegram bot + cron + monitoring). Optional fleet view: `builderz-labs/mission-control` (3.7k stars) | operator approves new VPS service | unfunded |
+| 3 | Model routing for narrative LLM via OpenRouter (200+ models, ensemble, A/B against the Phase 1 eval harness) | 2-3d + variable per-model cost | reuse Phase 1 eval harness | Phase 1 eval harness exists | gated on Phase 1 |
+| 4 | BL-064 cross-platform expansion via Hermes gateway (Discord/Slack curator channels in addition to Telegram) | 2-3d | reuse Phase 2 gateway | BL-064 14d soak (2026-05-11) shows curator-side trade dispatch works on Telegram first | gated on BL-064 soak |
+| 5 | Atropos RL infrastructure for tool-calling model training | n/a now | — | ≥1000 trades/signal stable for 30d (per memory `feedback_ml_not_yet.md`) | gated on data volume — months out |
 
-**Honest cancellation criterion:** If Phase 1 isn't started within 90 days of this entry's creation (by 2026-08-03), close BL-073 as won't-fix. Don't let it accrete as theatre. Status check at +30d (2026-06-03), +60d (2026-07-03), +90d (2026-08-03).
+**Honest cancellation criterion (REVISED post-Phase 0):** Original criterion was "close as won't-fix by 2026-08-03 if Phase 1 hasn't started". With Phase 1 work halved by `hermes-agent-self-evolution`, the activation barrier is mostly operator attention rather than engineering risk. Re-evaluate this criterion at the +30d check (2026-06-03) — if it still looks like the right call, keep it; if Phase 1 looks like a no-brainer, drop the cancellation criterion. Status checks: +30d (2026-06-03), +60d (2026-07-03), +90d (2026-08-03).
 
-**Realistic outcome 4 weeks from now:** Phase 0 done, Phase 1 not started.
-**Realistic outcome 90 days from now:** same, OR Phase 1 funded and shipped (positive case) OR closed-won't-fix (negative case).
+**Realistic outcome 4 weeks from now:** Phase 0 done (it is), Phase 1 may now be cheap enough to attempt opportunistically.
+**Realistic outcome 90 days from now:** Phase 1 + Phase 2 shipped (positive case, more plausible after Phase 0) OR still unfunded (worst case — re-evaluate cancellation).
+
+**Honest reject reasons logged in Phase 0:** `chainlink-agent-skills` (wrong oracle model), `hxsteric/mercury` (wrong problem — execution routing, not signals), `ripley-xmr-gateway` (wrong chain), no paper-trade skill exists, no CoinGecko/DexScreener-specific skill, no SQLite-audit-log skill.
 
 **Adapted from `Trivenidigital/shift-agent` analysis:** the inspiration for BL-072 + BL-073 was `shift-agent`'s `docs/hermes-alignment.md` + `CLAUDE.md` "Hermes-first" rules. shift-agent **runs on Hermes** as its production runtime; gecko-alpha does NOT (vanilla async Python pipeline). The adaptation is structural — we kept the 4-part doc shape and the read-deployed-code rule, dropped the Hermes-specific drift-tag vocabulary as cargo-cult, and replaced it with the more answerable single-line `**New primitives introduced:** [list or NONE]` declaration.
 
