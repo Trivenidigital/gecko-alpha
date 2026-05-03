@@ -249,6 +249,27 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Acceptance:** Operator can open dashboard, see at a glance: are listeners running? are messages flowing? what's in DLQ? did a trade dispatch?
 **Estimate:** 0.5-1 day backend + 0.5 day frontend.
 
+### BL-071a: Investigate why memecoin `outcomes` table is empty
+**Status:** Not started — flagged 2026-05-03 during BL-071 investigation
+**Tag:** `research-gated` `chain-pipeline` `outcome-telemetry`
+**Files:** likely `scout/chains/tracker.py`, `scout/memecoin/`, wherever outcomes are supposed to be written for pump.fun / dexscreener tokens
+**Why:** `chain_matches.update_chain_outcomes` queries `outcomes WHERE contract_address = ? AND price_change_pct IS NOT NULL` for `pipeline='memecoin'` rows. The `outcomes` table has **0 rows** in prod. So memecoin chain_matches can NEVER get hydrated — they all stay `outcome_class=NULL` or get marked `EXPIRED` by the miss-recorder. That's half the cause of the BL-071 auto-retirement death spiral.
+**Investigation:** trace which writer is supposed to insert into `outcomes` for memecoin tokens. Possibilities: (a) writer never existed (intentional — memecoin pipeline never had outcome tracking), (b) writer exists but is gated behind a disabled config flag, (c) writer exists but is silently failing.
+**Acceptance:** Either (a) confirm `outcomes` is dead by design and route memecoin chain_matches to a different outcome source (e.g. `paper_trades` outcomes), OR (b) re-enable the writer + verify rows start appearing.
+**Estimate:** 0.5–1 day investigation + fix.
+
+### BL-071b: narrative `chain_matches` start at `outcome_class='EXPIRED'`, hydrator skips them
+**Status:** Not started — flagged 2026-05-03 during BL-071 investigation
+**Tag:** `research-gated` `chain-pipeline` `outcome-telemetry`
+**Files:** `scout/chains/tracker.py:518` (`_record_chain_miss` writer), `scout/chains/tracker.py:550` (`update_chain_outcomes` hydrator)
+**Why:** All 154 narrative `chain_matches` in prod have `outcome_class='EXPIRED'` with NO `evaluated_at` timestamp — meaning they were marked EXPIRED at write-time by `_record_chain_miss`, not by the hydrator. The hydrator's `WHERE outcome_class IS NULL` clause then skips them entirely, even though the `predictions` table has 42 actual `'HIT'` outcomes that should propagate. Net effect: narrative pattern hit-rate is permanently 0% even when patterns succeed. Other half of the BL-071 death spiral.
+**Two design choices to evaluate:**
+- (a) Change `_record_chain_miss` to write `outcome_class=NULL` (let the hydrator decide later), OR
+- (b) Widen the hydrator's WHERE clause to include `outcome_class='EXPIRED'` (re-evaluate marked-expired matches against the predictions table).
+- Option (a) is cleaner semantically — EXPIRED should mean "we waited and nothing happened", not "we wrote it as EXPIRED on first encounter". But may break other consumers expecting EXPIRED-at-write-time semantics.
+**Acceptance:** narrative chain_matches start producing `outcome_class='hit'` for tokens whose predictions resolved as HIT. Pattern hit-rate becomes meaningful (non-zero for real winners).
+**Estimate:** 0.5 day investigation + 0.5 day fix + tests.
+
 ### BL-070: Entry stack gate — refuse trades with insufficient signal confirmation
 **Status:** **SHELVED — re-evaluate 2026-05-15** (Tier 1a flip soak ends)
 **Tag:** `research-gated` `strategy` `entry-filter` `requires-backtest`
