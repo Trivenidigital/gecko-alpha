@@ -46,6 +46,32 @@ uv run black scout/ tests/               # Format code
 - **Type hints** on all public functions
 - **Domain exceptions** — Raise from scout.exceptions, never swallow silently
 
+### Plan/Design Document Conventions
+
+Every plan, design, or spec document under `tasks/` matching `plan_*.md`,
+`design_*.md`, or `spec_*.md` MUST begin with:
+
+`**New primitives introduced:** [list, or NONE]`
+
+Mechanically enforced by `.claude/hooks/check-new-primitives.py` — the hook
+blocks any `Write` / `Edit` / `MultiEdit` / `NotebookEdit` to a gated file
+that lacks the line. The marker is matched case-insensitively, ignoring
+formatting variations (`**New Primitives Introduced:**`, missing bold,
+extra whitespace) so typos don't block. Markers inside ```code fences```
+do NOT count — they must appear in real prose.
+
+If a file matches the gated pattern but isn't a real plan (e.g., scratch
+notes accidentally named `plan_x.md`), include the bypass comment:
+`<!-- new-primitives-check: bypass -->`. Bypasses are logged to
+`.claude/hooks/bypass.log` for PR-time review.
+
+For deployed-pattern reference (so you don't reinvent existing primitives),
+see `docs/gecko-alpha-alignment.md`.
+
+**Important limitation:** the hook checks the marker EXISTS. It does NOT
+validate that the listed primitives are TRUTHFUL or COMPLETE. Human PR
+review verifies accuracy.
+
 ## What NOT To Do
 
 - No global aiohttp sessions (pass session as parameter)
