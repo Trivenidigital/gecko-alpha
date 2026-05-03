@@ -259,6 +259,32 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 **Adapted from `Trivenidigital/shift-agent` analysis:** the inspiration for BL-072 + BL-073 was `shift-agent`'s `docs/hermes-alignment.md` + `CLAUDE.md` "Hermes-first" rules. shift-agent **runs on Hermes** as its production runtime; gecko-alpha does NOT (vanilla async Python pipeline). The adaptation is structural — we kept the 4-part doc shape and the read-deployed-code rule, dropped the Hermes-specific drift-tag vocabulary as cargo-cult, and replaced it with the more answerable single-line `**New primitives introduced:** [list or NONE]` declaration.
 
+### BL-074: Minara as live-execution layer (post-BL-055 unlock)
+**Status:** VISION — gated on BL-055 unlock. Captured 2026-05-03.
+**Tag:** `gated-on-BL-055` `live-execution` `minara` `hermes-ecosystem`
+**Vision:** gecko-alpha alerts in → Minara executes out. gecko-alpha continues to own signal generation, conviction gating, and observability; Minara owns wallet custody, venue routing (EVM + Solana + Hyperliquid perps), order placement, and on-ramp. Two-layer architecture, clean separation.
+
+**Why this is BL-074, not Phase N of BL-073:** BL-073 is about Hermes building blocks for gecko-alpha's *narrative LLM and ops agent*. Minara is a *live-execution skill pack* — different problem class. Lumping them would muddle the dependency graph (BL-073 phases are independent of BL-055; this work absolutely is not).
+
+**Hard prerequisites (all from BL-055 unlock criteria, copied here so they don't drift):**
+1. BL-055 shadow soak passes 7d clean (per memory `project_bl055_deployed_2026_04_23.md`).
+2. `scout/live/balance_gate.py` implemented (currently the live path raises `NotImplementedError`; verified 2026-05-03 — file does not exist).
+3. `would_be_live` paper-trade subset has been validated against actual outcomes (per `feedback_paper_mirrors_live.md` — capital-constrained FCFS-20-slots subset must show positive PnL before risking real capital).
+4. Operator writes a live-execution policy: capital allocation rules, per-trade size limits, daily loss limits, kill-switch escalation, custody approach (hot wallet vs. external signer), regulatory posture.
+5. Operator explicit go-ahead.
+
+**Architectural choices to revisit when the gate opens (do NOT pre-decide now):**
+- **Adapter shape.** Minara is an *agent skill* (NL commands like "Buy 100 USDC of ETH"), not a CCXT-style REST client. Existing `scout/live/adapter_base.py` + `binance_adapter.py` pattern assumes the latter. Either: (a) write `MinaraAdapter` that shells out to `minara` CLI (npm package `minara@latest`) translating intents to NL commands — bypasses Hermes entirely, treats Minara as a thin executor; (b) gecko-alpha publishes structured trade intents to a queue (Redis/SQLite outbox), separate Hermes+Minara process subscribes — preserves agent UX, adds infra; (c) keep alerts → Telegram → operator → Hermes+Minara as today, no integration. Decision belongs in a future spec, not in this entry.
+- **Custody.** Minara wallet is a hot wallet on the same host as gecko-alpha → blast radius if VPS compromised. Mitigations to evaluate: per-trade size limit, separate signing host, hardware key, withdraw-only kill switch.
+- **Failure semantics.** What does gecko-alpha do if Minara is down at the moment of a high-conviction alert? Queue and retry, or fail-closed and alert operator? (Default fail-closed — execution layer outage should not silently drop signals.)
+- **Reconciliation.** Minara executions need to flow back into `paper_trades`/`live_trades` tables for the existing PnL/audit/dashboard surfaces, otherwise we lose end-to-end traceability.
+
+**Reference:** `Minara-AI/skills` (MIT, 263⭐ as of 2026-05-03, last push 2026-04-21). 88/100 self-reported on `Minara-AI/crypto-skill-benchmark` (Sonnet 4.6, 76 scenarios — note self-reported). Multi-chain: Ethereum, Base, Arbitrum, Optimism, Polygon, Avalanche, Solana, BSC, Berachain, Blast, Manta, Mode, Sonic, Conflux, Merlin, Monad, Polymarket, XLayer, Hyperliquid (perps).
+
+**Honest reality check:** Until items 1–4 of the prerequisites above are real, this entry is a vision artifact, not an actionable backlog item. Re-evaluate when BL-055 reaches the unlock checkpoint. Don't let it accrete into a spec prematurely — premature spec for a system whose upstream gate hasn't opened is exactly the BL-073-style theatre we just argued against.
+
+**Operator-side evaluation worth doing now (zero gecko-alpha code change):** install Hermes + Minara on a terminal you control, manually execute a small number of trades on alerts gecko-alpha currently surfaces to Telegram. This is the cheapest way to assess Minara's execution quality on signals you already trust. Outcome of that trial directly informs adapter-shape choice (a) vs. (b) above.
+
 ---
 
 ## P2 — BL-064 follow-ups (TG social signals deployed 2026-04-27)
