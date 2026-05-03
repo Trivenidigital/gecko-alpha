@@ -1100,21 +1100,34 @@ class Database:
             # BL-071a partial (Bundle A 2026-05-03): add mcap_at_completion
             # column to chain_matches. Hydrator (Task 3) reads it; writers
             # (BL-071a' follow-up) will populate it. PRAGMA-guarded ALTER,
-            # idempotent.
+            # idempotent. Mirrors the BL-071b pattern above: gate BOTH the
+            # ALTER and the paper_migrations insert on the same condition
+            # for internal consistency (per PR-review R3 #1). The else
+            # branch covers the partial-state recovery case (column landed
+            # on a previous startup but the marker insert didn't).
             cur = await conn.execute("PRAGMA table_info(chain_matches)")
             cm_cols = {row[1] for row in await cur.fetchall()}
             if "mcap_at_completion" not in cm_cols:
                 await conn.execute(
                     "ALTER TABLE chain_matches ADD COLUMN mcap_at_completion REAL"
                 )
-            await conn.execute(
-                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
-                "VALUES (?, ?)",
-                (
-                    "bl071a_chain_matches_mcap_at_completion",
-                    datetime.now(timezone.utc).isoformat(),
-                ),
-            )
+                await conn.execute(
+                    "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                    "VALUES (?, ?)",
+                    (
+                        "bl071a_chain_matches_mcap_at_completion",
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+            else:
+                await conn.execute(
+                    "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                    "VALUES (?, ?)",
+                    (
+                        "bl071a_chain_matches_mcap_at_completion",
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
 
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_combo_opened "

@@ -654,15 +654,18 @@ async def update_chain_outcomes(db: Database) -> int:
     # BL-071a partial: aggregate warning per LEARN cycle (not per row) so
     # operators see the silent-failure surface without log spam. Will go
     # quiet once BL-071a' wires writers + adds DexScreener fetch.
-    # Structured fields: explicit counts so operators can filter via
-    # `jq '.total_unhydrateable'` etc. Carries expires_when + backlog_ref
+    # Structured fields: only `total_unhydrateable` is meaningful today.
+    # Per PR-review feedback (R1+R2+R3 cross-confirmed): the previous
+    # mcap_at_completion_null_count + outcomes_table_empty_count fields
+    # were misleading because the counter only fires when BOTH conditions
+    # are true — they always equal total_unhydrateable. BL-071a' will
+    # split the failure modes and re-introduce per-cause counts when
+    # they're actually distinguishable. Carries expires_when + backlog_ref
     # so the deferral doesn't decay into known-noise.
     if memecoin_unhydrateable:
         logger.warning(
             "chain_outcomes_unhydrateable_memecoin",
             total_unhydrateable=memecoin_unhydrateable,
-            mcap_at_completion_null_count=memecoin_unhydrateable,
-            outcomes_table_empty_count=memecoin_unhydrateable,
             expires_when="BL-071a' ships (writers populate mcap_at_completion)",
             backlog_ref="BL-071a'",
         )

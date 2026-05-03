@@ -330,8 +330,10 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 - New memecoin chain_matches have non-NULL `mcap_at_completion`.
 - LEARN cycle emits `chain_outcomes_hydrated count>0` for memecoin pipeline (instead of `chain_outcomes_unhydrateable_memecoin total_unhydrateable=N` aggregate warning).
 - Pattern hit-rate becomes meaningful for memecoin patterns.
-- Remove the `chain_outcomes_unhydrateable_memecoin` warning OR downgrade to INFO (per design-doc §6 Q1).
-**Estimate:** 0.5d (small caller-chain edit + DexScreener fetch in hydrator + tests).
+- Remove the `chain_outcomes_unhydrateable_memecoin` warning OR downgrade to INFO (per Bundle A design-doc §6 Q1).
+- **Coupling guard (per Bundle A PR-review R2 S2):** writer-wiring + DexScreener fetch MUST land in the same PR. Splitting them would re-introduce the silent-skip path on populated rows (hydrator skips silently when `mcap_at_completion` is set; if writers wire the column without the fetch landing, every populated row is silently dropped from outcome resolution). Add a test that fails if `chain_matches` has any row with non-NULL `mcap_at_completion` AND `outcome_class IS NULL` AND `completed_at < now-48h` after a LEARN cycle — that's the canary.
+- **Re-introduce per-cause counters in the aggregate warning** when the failure modes are actually distinguishable (today they aren't; Bundle A intentionally collapsed `mcap_at_completion_null_count` + `outcomes_table_empty_count` into just `total_unhydrateable` to avoid misleading log fields).
+**Estimate:** 0.5d (small caller-chain edit + DexScreener fetch in hydrator + tests + coupling-guard test).
 
 ### BL-071a: Investigate why memecoin `outcomes` table is empty
 **Status:** Not started — flagged 2026-05-03 during BL-071 investigation

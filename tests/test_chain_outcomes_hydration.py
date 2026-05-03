@@ -311,6 +311,113 @@ async def test_hydrator_aggregate_warning_when_no_source(db, monkeypatch):
     )
     _, _, kwargs = aggregate[0]
     assert kwargs["total_unhydrateable"] == 5
-    assert kwargs["mcap_at_completion_null_count"] == 5
-    assert kwargs["outcomes_table_empty_count"] == 5
     assert kwargs["backlog_ref"] == "BL-071a'"
+    assert kwargs["expires_when"].startswith("BL-071a'")
+
+
+@pytest.mark.asyncio
+async def test_hydrator_memecoin_legacy_outcomes_path_hits(db):
+    """PR-review R1 SHOULD-FIX: cover the memecoin POSITIVE path —
+    NULL mcap_at_completion + populated outcomes-table row → "hit"/"miss".
+
+    Without this test, a future refactor breaking the legacy outcomes
+    lookup (column rename, query typo) would be silent because all
+    existing tests cover only the no-source path.
+    """
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    contract = "0xfeedface"
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES (?, 'memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, NULL)""",
+        (contract, long_ago, long_ago),
+    )
+    # Seed legacy outcomes row — positive pct → 'hit'
+    await db._conn.execute(
+        """INSERT INTO outcomes
+           (contract_address, alert_price, check_price, check_time, price_change_pct)
+           VALUES (?, 100.0, 175.0, ?, 75.0)""",
+        (contract, long_ago),
+    )
+    await db._conn.commit()
+    updated = await update_chain_outcomes(db)
+    assert updated == 1
+    cur = await db._conn.execute(
+        "SELECT outcome_class FROM chain_matches WHERE token_id = ?",
+        (contract,),
+    )
+    row = await cur.fetchone()
+    assert row[0] == "hit"
+
+
+@pytest.mark.asyncio
+async def test_hydrator_aggregate_does_not_count_narrative_rows(db, monkeypatch):
+    """PR-review R1 SHOULD-FIX: narrative-pipeline rows that don't resolve
+    must NOT increment the memecoin unhydrateable counter.
+
+    Defends against a future refactor that extracts the elif into a shared
+    helper and accidentally lets narrative rows bleed into the memecoin
+    aggregate warning.
+    """
+    captured = _capture_chain_logs(monkeypatch)
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    # 2 narrative rows with no matching predictions, 2 memecoin rows with no
+    # mcap_at_completion + no outcomes data.
+    await db._conn.executemany(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES (?, ?, 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, NULL)""",
+        [
+            ("narr-no-pred-1", "narrative", long_ago, long_ago),
+            ("narr-no-pred-2", "narrative", long_ago, long_ago),
+            ("0xmemenosrc1", "memecoin", long_ago, long_ago),
+            ("0xmemenosrc2", "memecoin", long_ago, long_ago),
+        ],
+    )
+    await db._conn.commit()
+    updated = await update_chain_outcomes(db)
+    assert updated == 0
+    aggregate = [c for c in captured if c[1] == "chain_outcomes_unhydrateable_memecoin"]
+    assert len(aggregate) == 1
+    _, _, kwargs = aggregate[0]
+    # Counter must reflect ONLY memecoin rows (2), not narrative+memecoin (4)
+    assert (
+        kwargs["total_unhydrateable"] == 2
+    ), f"narrative rows must NOT bleed into memecoin counter; got {kwargs}"
+
+
+def test_chain_match_model_has_mcap_at_completion_field():
+    """PR-review R1 SHOULD-FIX: lock down the Pydantic field contract.
+
+    ChainMatch is currently documentation-only (no production code constructs
+    it from rows), so this test is the only place the field's default and
+    type contract is enforceable. If someone removes the field or changes
+    the default, this test catches it.
+    """
+    from scout.chains.models import ChainMatch
+
+    base_kwargs = dict(
+        token_id="T1",
+        pipeline="memecoin",
+        pattern_id=1,
+        pattern_name="p",
+        steps_matched=1,
+        total_steps=2,
+        anchor_time=datetime.now(timezone.utc),
+        completed_at=datetime.now(timezone.utc),
+        chain_duration_hours=0.0,
+        conviction_boost=0,
+    )
+    # Default: mcap_at_completion is None (not required, model-mirrors-table invariant).
+    cm_default = ChainMatch(**base_kwargs)
+    assert cm_default.mcap_at_completion is None
+    # Accepts a positive float (the BL-071a' writer-wiring shape).
+    cm_populated = ChainMatch(**base_kwargs, mcap_at_completion=1_500_000.0)
+    assert cm_populated.mcap_at_completion == 1_500_000.0
+    # Accepts None explicitly (alternate construction path).
+    cm_null = ChainMatch(**base_kwargs, mcap_at_completion=None)
+    assert cm_null.mcap_at_completion is None
