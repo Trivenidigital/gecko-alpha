@@ -4,10 +4,7 @@ Last updated: 2026-05-01 (Tier 1a flip)
 
 ## Active soaks (don't disturb)
 
-- [ ] **Tier 1a flip — gainers_early kill** — flipped 2026-05-01T14:06Z via signal_params.enabled=0. SIGNAL_PARAMS_ENABLED=true in prod .env. Soak ends 2026-05-15T14:06Z.
-  - Pre-flip 30d net: −$506. Backtest projects post-flip 30d net to swing to ~+$428 (delta ~+$933 from killing the −$629 gainers_early bleed).
-  - Decision gate at 2026-05-15: if 14d net ≥ +$200, leave on permanently and re-evaluate BL-070 with clean data. If neutral/negative, investigate other signals.
-  - Revert: `UPDATE signal_params SET enabled=1 WHERE signal_type='gainers_early'` + restart pipeline.
+- [x] **Tier 1a flip — gainers_early kill REVERSED 2026-05-03T15:53Z** — original kill was based on pre-PR-#59 30d data. Sneak-peek of post-#59 data (4.7d window) showed gainers_early at +$508 / 59 closes / +$8.61/trade / 67.8% win — clearly profitable under the new adaptive trail. PR #59 fixed gainers_early; the kill was forfeiting ~$190/day. SQL reversal + restart verified: 5 new gainers_early trades opened at 15:58:29Z, zero `trade_skipped_signal_disabled` events. Tier 1a `SIGNAL_PARAMS_ENABLED=true` flag stays on for the other 7 signals (per-signal params still honored). Audit row in signal_params_audit. Backup: `scout.db.bak.gainers_revive_20260503_155322`.
 - [ ] **PR #58 BL-064 lenient-safety soak** — flag flipped 2026-04-28T15:17Z. Re-check window: 2026-05-12.
   - Decision gate: ≥40% win rate + avg pnl_pct >0 → keep on. As of 2026-04-29T12:25Z: 0 trades dispatched yet (curators haven't posted CA-bearing messages since flag flipped). Operational gap, not code.
 - [ ] **PR #59 strategy tuning soak** — deployed 2026-04-28T22:58Z. Re-check window: 2026-05-05.
