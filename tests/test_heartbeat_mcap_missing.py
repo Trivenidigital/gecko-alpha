@@ -7,6 +7,7 @@ ssl module and aiohttp's bundled OpenSSL. This is a local-env
 mitigation, not a production change. Tests behave identically when
 collected on Linux/CI.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -99,15 +100,29 @@ async def test_fetch_top_movers_increments_counter(settings_factory):
 
     s = settings_factory(MIN_MARKET_CAP=0, MAX_MARKET_CAP=10**12)
     payload = [
-        {"id": "tok1", "name": "Tok1", "symbol": "T1",
-         "market_cap": None, "current_price": 0.0123, "total_volume": 10000},
-        {"id": "tok2", "name": "Tok2", "symbol": "T2",
-         "market_cap": 1_000_000, "current_price": 0.5, "total_volume": 50000},
+        {
+            "id": "tok1",
+            "name": "Tok1",
+            "symbol": "T1",
+            "market_cap": None,
+            "current_price": 0.0123,
+            "total_volume": 10000,
+        },
+        {
+            "id": "tok2",
+            "name": "Tok2",
+            "symbol": "T2",
+            "market_cap": 1_000_000,
+            "current_price": 0.5,
+            "total_volume": 50000,
+        },
     ]
     with aioresponses() as m:
         m.get(
             "https://api.coingecko.com/api/v3/coins/markets",
-            payload=payload, status=200, repeat=True,
+            payload=payload,
+            status=200,
+            repeat=True,
         )
         async with aiohttp.ClientSession() as session:
             await fetch_top_movers(session, s)

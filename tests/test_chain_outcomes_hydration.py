@@ -3,6 +3,7 @@
 Uses local `db` fixture matching tests/test_chains_tracker.py pattern —
 there is no global tmp_db fixture in conftest.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -219,6 +220,7 @@ def _capture_chain_logs(monkeypatch):
             captured.append(("DEBUG", event, kwargs))
 
     from scout.chains import tracker as tracker_module
+
     monkeypatch.setattr(tracker_module, "logger", _CapLogger())
     return captured
 
@@ -244,14 +246,16 @@ async def test_hydrator_silent_skip_when_mcap_at_completion_populated(db, monkey
     assert updated == 0
     # Must NOT emit per-row warning for the populated case (silent intentional skip).
     pending_warnings = [c for c in captured if "pending" in c[1]]
-    assert pending_warnings == [], (
-        f"populated mcap_at_completion must skip silently; got {pending_warnings}"
-    )
+    assert (
+        pending_warnings == []
+    ), f"populated mcap_at_completion must skip silently; got {pending_warnings}"
     # Also: must NOT emit aggregate warning (the row was skipped, not unhydrateable).
-    aggregate_warnings = [c for c in captured if c[1] == "chain_outcomes_unhydrateable_memecoin"]
-    assert aggregate_warnings == [], (
-        f"populated row should not count as unhydrateable; got {aggregate_warnings}"
-    )
+    aggregate_warnings = [
+        c for c in captured if c[1] == "chain_outcomes_unhydrateable_memecoin"
+    ]
+    assert (
+        aggregate_warnings == []
+    ), f"populated row should not count as unhydrateable; got {aggregate_warnings}"
 
 
 @pytest.mark.asyncio
@@ -268,7 +272,20 @@ async def test_hydrator_aggregate_warning_when_no_source(db, monkeypatch):
     long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
     rows = [
         # 3 NULL mcap rows
-        (f"0xnosrc{i}", "memecoin", 1, "p", 1, 2, long_ago, long_ago, 0.0, 0, None, None)
+        (
+            f"0xnosrc{i}",
+            "memecoin",
+            1,
+            "p",
+            1,
+            2,
+            long_ago,
+            long_ago,
+            0.0,
+            0,
+            None,
+            None,
+        )
         for i in range(3)
     ] + [
         # T3.A: explicit zero mcap — must be treated as no usable data

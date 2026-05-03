@@ -1083,13 +1083,11 @@ class Database:
                 ("bl071b_unstamp_expired_narrative",),
             )
             if not await cur.fetchone():
-                await conn.execute(
-                    """UPDATE chain_matches
+                await conn.execute("""UPDATE chain_matches
                           SET outcome_class = NULL
                         WHERE pipeline = 'narrative'
                           AND outcome_class = 'EXPIRED'
-                          AND evaluated_at IS NULL"""
-                )
+                          AND evaluated_at IS NULL""")
                 await conn.execute(
                     "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
                     "VALUES (?, ?)",
@@ -1477,13 +1475,20 @@ class Database:
         # sync with the Settings class without needing .env. This is a one-shot
         # seed; subsequent calibration/operator updates are the source of truth.
         fields = Settings.model_fields
-        defaults = {name: fields[name].default for name in (
-            "PAPER_LADDER_LEG_1_PCT", "PAPER_LADDER_LEG_1_QTY_FRAC",
-            "PAPER_LADDER_LEG_2_PCT", "PAPER_LADDER_LEG_2_QTY_FRAC",
-            "PAPER_LADDER_TRAIL_PCT", "PAPER_LADDER_TRAIL_PCT_LOW_PEAK",
-            "PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT", "PAPER_SL_PCT",
-            "PAPER_MAX_DURATION_HOURS",
-        )}
+        defaults = {
+            name: fields[name].default
+            for name in (
+                "PAPER_LADDER_LEG_1_PCT",
+                "PAPER_LADDER_LEG_1_QTY_FRAC",
+                "PAPER_LADDER_LEG_2_PCT",
+                "PAPER_LADDER_LEG_2_QTY_FRAC",
+                "PAPER_LADDER_TRAIL_PCT",
+                "PAPER_LADDER_TRAIL_PCT_LOW_PEAK",
+                "PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT",
+                "PAPER_SL_PCT",
+                "PAPER_MAX_DURATION_HOURS",
+            )
+        }
         now_iso = datetime.now(timezone.utc).isoformat()
 
         try:
