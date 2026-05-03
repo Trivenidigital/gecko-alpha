@@ -321,6 +321,20 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Acceptance:** Operator can open dashboard, see at a glance: are listeners running? are messages flowing? what's in DLQ? did a trade dispatch?
 **Estimate:** 0.5-1 day backend + 0.5 day frontend.
 
+### BL-071a': Wire chain_match writers + DexScreener fetch for memecoin outcome hydration
+**Status:** UNBLOCKED (follow-up from Bundle A 2026-05-03) — schema column + hydrator branch shipped; only writer wiring + DexScreener fetch remain
+**Tag:** `chain-pipeline` `outcome-telemetry` `unblocks-BL-071a-fully`
+**Files:** `scout/chains/tracker.py` (`_record_chain_complete`, `_record_expired_chain` — accept and store mcap; hydrator's populated-branch — replace silent `continue` with DexScreener FDV fetch + outcome computation), `scout/chains/events.py` or chain-completion caller chain (pass current FDV through to writers), tests
+**Why:** Bundle A added `chain_matches.mcap_at_completion REAL` column + hydrator branch that skips silently when populated. Writers still pass NULL because adding the caller-wiring would have grown Bundle A scope. Once writers populate the column AND the hydrator inlines the DexScreener fetch, hit/miss outcomes flow for memecoin chain_matches. Closes the BL-071a death-spiral structurally.
+**Acceptance:**
+- New memecoin chain_matches have non-NULL `mcap_at_completion`.
+- LEARN cycle emits `chain_outcomes_hydrated count>0` for memecoin pipeline (instead of `chain_outcomes_unhydrateable_memecoin total_unhydrateable=N` aggregate warning).
+- Pattern hit-rate becomes meaningful for memecoin patterns.
+- Remove the `chain_outcomes_unhydrateable_memecoin` warning OR downgrade to INFO (per Bundle A design-doc §6 Q1).
+- **Coupling guard (per Bundle A PR-review R2 S2):** writer-wiring + DexScreener fetch MUST land in the same PR. Splitting them would re-introduce the silent-skip path on populated rows (hydrator skips silently when `mcap_at_completion` is set; if writers wire the column without the fetch landing, every populated row is silently dropped from outcome resolution). Add a test that fails if `chain_matches` has any row with non-NULL `mcap_at_completion` AND `outcome_class IS NULL` AND `completed_at < now-48h` after a LEARN cycle — that's the canary.
+- **Re-introduce per-cause counters in the aggregate warning** when the failure modes are actually distinguishable (today they aren't; Bundle A intentionally collapsed `mcap_at_completion_null_count` + `outcomes_table_empty_count` into just `total_unhydrateable` to avoid misleading log fields).
+**Estimate:** 0.5d (small caller-chain edit + DexScreener fetch in hydrator + tests + coupling-guard test).
+
 ### BL-071a: Investigate why memecoin `outcomes` table is empty
 **Status:** Not started — flagged 2026-05-03 during BL-071 investigation
 **Tag:** `research-gated` `chain-pipeline` `outcome-telemetry`

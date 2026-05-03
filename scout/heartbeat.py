@@ -3,6 +3,11 @@
 Tracks cumulative pipeline stats across cycles and emits a structured
 "heartbeat" log every HEARTBEAT_INTERVAL_SECONDS so operators can see
 the pipeline is alive.
+
+BL-075 Phase A (2026-05-03) adds `mcap_null_with_price_count` —
+increments on each CoinGecko ingestion parse where market_cap was
+null/0 but current_price was positive. Surfaces the silent-rejection
+rate at the mcap=0 floor that caused the RIV (riv-coin) miss.
 """
 
 from datetime import datetime, timezone
@@ -19,6 +24,7 @@ _heartbeat_stats: dict = {
     "narrative_predictions": 0,
     "counter_scores_memecoin": 0,
     "counter_scores_narrative": 0,
+    "mcap_null_with_price_count": 0,
     "last_heartbeat_at": None,
 }
 
@@ -37,8 +43,19 @@ def _reset_heartbeat_stats() -> None:
         narrative_predictions=0,
         counter_scores_memecoin=0,
         counter_scores_narrative=0,
+        mcap_null_with_price_count=0,
         last_heartbeat_at=None,
     )
+
+
+def increment_mcap_null_with_price() -> None:
+    """BL-075 Phase A: bump null-mcap-with-price counter (called from ingestion).
+
+    Fires when CoinGecko returns a token with market_cap=null/0 but
+    current_price>0 — the silent-rejection shape that caused the RIV
+    (riv-coin) 100x miss on 2026-05-03.
+    """
+    _heartbeat_stats["mcap_null_with_price_count"] += 1
 
 
 def _maybe_emit_heartbeat(settings) -> bool:
@@ -65,6 +82,7 @@ def _maybe_emit_heartbeat(settings) -> bool:
         narrative_predictions=_heartbeat_stats["narrative_predictions"],
         counter_scores_memecoin=_heartbeat_stats["counter_scores_memecoin"],
         counter_scores_narrative=_heartbeat_stats["counter_scores_narrative"],
+        mcap_null_with_price_count=_heartbeat_stats["mcap_null_with_price_count"],
         last_heartbeat_at=_heartbeat_stats["last_heartbeat_at"].isoformat(),
     )
     _heartbeat_stats["last_heartbeat_at"] = now

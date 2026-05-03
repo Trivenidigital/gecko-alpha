@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import aiohttp
 import structlog
 
+from scout.heartbeat import increment_mcap_null_with_price
 from scout.models import CandidateToken
 from scout.ratelimit import coingecko_limiter
 
@@ -109,6 +110,11 @@ async def fetch_top_movers(
 
     tokens: list[CandidateToken] = []
     for raw in raw_by_id.values():
+        # BL-075 Phase A (2026-05-03): track silent-rejection rate at the
+        # mcap=0 floor. CoinGecko occasionally returns market_cap=null
+        # for tokens with active price action (the RIV-shape blind spot).
+        if (raw.get("market_cap") in (None, 0)) and (raw.get("current_price") or 0) > 0:
+            increment_mcap_null_with_price()
         token = CandidateToken.from_coingecko(raw)
         if token.market_cap_usd < settings.MIN_MARKET_CAP:
             continue
@@ -236,6 +242,10 @@ async def fetch_by_volume(
 
     tokens: list[CandidateToken] = []
     for raw in raw_by_id.values():
+        # BL-075 Phase A (2026-05-03): same silent-rejection counter as
+        # fetch_top_movers — tracks tokens with mcap=null/0 + price>0.
+        if (raw.get("market_cap") in (None, 0)) and (raw.get("current_price") or 0) > 0:
+            increment_mcap_null_with_price()
         token = CandidateToken.from_coingecko(raw)
         # Use wider cap range: keep anything with mcap > MIN_MARKET_CAP
         # (upper bound filtering is done at scoring/gate stage)

@@ -81,3 +81,7 @@ class ChainMatch(BaseModel):
     outcome_class: str | None = None
     outcome_change_pct: float | None = None
     evaluated_at: datetime | None = None
+    # BL-071a partial (Bundle A 2026-05-03): writer wiring lives in BL-071a',
+    # but the field exists on the model now to preserve the "model mirrors
+    # table" invariant and prevent future schema/model drift.
+    mcap_at_completion: float | None = None
