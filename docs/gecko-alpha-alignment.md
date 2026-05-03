@@ -43,7 +43,7 @@ What `scout/`, `dashboard/`, and `tests/` provide today and how new code is expe
 
 ### Migration pattern
 
-`BEGIN EXCLUSIVE` + per-statement `await conn.execute(stmt)` + explicit `await conn.commit()` / `ROLLBACK`. NEVER `executescript` **in migration methods** (implicit COMMIT defeats rollback semantics — see `scout/db.py:1139-1144` comment). The single exception is `_create_tables` (`scout/db.py:89`) which uses `executescript` legitimately for initial schema creation — no prior rows exist to lose, and the implicit COMMIT is acceptable for the bootstrap path.
+`BEGIN EXCLUSIVE` + per-statement `await conn.execute(stmt)` + explicit `await conn.commit()` / `ROLLBACK`. NEVER `executescript` **in migration methods** (implicit COMMIT defeats rollback semantics — see `scout/db.py:1139-1144` comment). The single exception is `_create_tables` (`scout/db.py:90`, with `executescript` call at line 93) which uses it legitimately for initial schema creation — no prior rows exist to lose, and the implicit COMMIT is acceptable for the bootstrap path.
 
 Indexes for added columns live in the migration step, NOT `_create_tables` (per `feedback_ddl_before_alter.md` memory). `CREATE TABLE IF NOT EXISTS` is a no-op for existing tables, so any paired index declaration there silently skips on the upgrade path.
 

@@ -243,7 +243,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 | # | What | Cost | Trigger | Status |
 |---|---|---|---|---|
-| 0 | Browse `agentskills.io` for relevant skills | 1h | operator-driven | done 2026-05-03 — see `tasks/notes_agentskills_browse_2026_05_03.md` |
+| 0 | Browse `agentskills.io` for relevant skills | 1h | operator-driven | null-result 2026-05-03 — browse not performed; decision gate 2026-05-17. See `tasks/notes_agentskills_browse_2026_05_03.md` |
 | 1 | GEPA evolve `narrative_prediction` LLM prompt against the 1,274-row `predictions` table eval set (42 HIT / 40 MISS / 566 NEUTRAL / 561 UNRESOLVED) | $10 + 2d | operator commits | unfunded |
 | 2 | Hermes ops agent on VPS — Telegram NL access to gecko-alpha state, scheduled cron checks, cross-platform messaging gateway | 1-2d + $5/mo | operator approves new VPS service | unfunded |
 | 3 | Model routing for narrative LLM via OpenRouter (200+ models, ensemble, A/B against the Phase 1 eval harness) | 2-3d + variable per-model cost | Phase 1 eval harness exists | gated on Phase 1 |

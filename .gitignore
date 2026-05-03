@@ -19,3 +19,6 @@ _*.py
 # BL-064 Telegram session — authenticates as the user; never commit
 *.session
 *.session-journal
+
+# BL-072 hook bypass audit log — local-only, not source-controlled
+.claude/hooks/bypass.log

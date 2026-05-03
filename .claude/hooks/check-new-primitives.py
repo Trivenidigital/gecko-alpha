@@ -91,7 +91,18 @@ def _resulting_content_after_edit(
     """Apply Edit / MultiEdit substitutions to existing content. Returns the
     POST-edit content for marker checking. We never short-circuit on
     'existing has marker' — an edit can delete the marker, and the resulting
-    file would silently bypass the check otherwise."""
+    file would silently bypass the check otherwise.
+
+    Limitation (acceptable for plan/spec files): if MultiEdit edit N's
+    new_string contains text matching edit N+1's old_string, the chained
+    apply finds a match in edit N's output that doesn't exist in the
+    original file — producing post-edit content that diverges from what
+    Claude Code actually applies (Claude Code validates non-overlap on
+    the source file). For structured markdown plan/spec files this overlap
+    is rare in practice; if it bites, the symptom is a false-positive
+    block which the operator can clear by re-issuing the edit or adding
+    the bypass comment.
+    """
     out = existing
     for old, new in edits:
         if old:
@@ -104,15 +115,27 @@ def _resulting_content_after_edit(
 
 
 def _log_bypass(path: str, tool: str) -> None:
-    log_path = Path(".claude/hooks/bypass.log")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    entry = {
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "path": path,
-        "tool": tool,
-    }
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+    """Append an audit row to .claude/hooks/bypass.log. Best-effort: if
+    the log can't be written (filesystem permission, dir-as-file, etc.),
+    print a warning to stderr but do NOT raise — the bypass policy check
+    already passed, an audit-trail failure should not block a legitimate
+    bypass."""
+    try:
+        log_path = Path(".claude/hooks/bypass.log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "path": path,
+            "tool": tool,
+        }
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        print(
+            f"[check-new-primitives] WARN: bypass-log write failed "
+            f"({type(e).__name__}: {e}); bypass still allowed.",
+            file=sys.stderr,
+        )
 
 
 def main() -> int:
@@ -130,24 +153,48 @@ def main() -> int:
     if not GATED_PATH_RE.search(file_path):
         return 0  # not a plan/design/spec file
 
+    # Tool unknown/empty: matcher SHOULD have gated, but if we got here on
+    # a gated path with no tool name, the env contract was violated. Fail
+    # CLOSED rather than silently allow — the gated-path is the load-bearing
+    # signal here, not the tool name.
+    if not tool:
+        print(
+            f"[check-new-primitives] BLOCKED: gated path {file_path} but "
+            f"CLAUDE_TOOL_NAME env var was empty. Hook contract violated; "
+            f"failing closed. If this is unexpected, verify the hook "
+            f"matcher in .claude/settings.json fires only for "
+            f"Write/Edit/MultiEdit/NotebookEdit tools.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Helper: tolerant file read. Plan/spec files SHOULD be UTF-8, but a
+    # decode failure shouldn't cascade into a fail-closed-with-traceback.
+    # `errors="replace"` lossy-reads non-UTF-8 bytes as U+FFFD; we only
+    # need to find the ASCII marker text, so this is safe.
+    def _read(p: str) -> str:
+        if not Path(p).exists():
+            return ""
+        try:
+            return Path(p).read_text(encoding="utf-8", errors="replace")
+        except (IsADirectoryError, PermissionError, OSError) as e:
+            print(
+                f"[check-new-primitives] BLOCKED: cannot read {p} "
+                f"({type(e).__name__}: {e}).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
     # Compute the resulting file content after the operation
     if tool == "Write":
         new_content = inp.get("content", "")
     elif tool == "Edit":
-        existing = (
-            Path(file_path).read_text(encoding="utf-8")
-            if Path(file_path).exists()
-            else ""
-        )
+        existing = _read(file_path)
         new_content = _resulting_content_after_edit(
             existing, [(inp.get("old_string", ""), inp.get("new_string", ""))]
         )
     elif tool == "MultiEdit":
-        existing = (
-            Path(file_path).read_text(encoding="utf-8")
-            if Path(file_path).exists()
-            else ""
-        )
+        existing = _read(file_path)
         edits = [
             (e.get("old_string", ""), e.get("new_string", ""))
             for e in inp.get("edits", [])
@@ -162,7 +209,14 @@ def main() -> int:
         )
         return 2
     else:
-        return 0  # unknown tool — fail open (matcher should prevent reaching)
+        # Unknown tool name on a GATED path. Same logic as empty-tool
+        # case above — fail closed.
+        print(
+            f"[check-new-primitives] BLOCKED: unknown CLAUDE_TOOL_NAME "
+            f"'{tool}' on gated path {file_path}; failing closed.",
+            file=sys.stderr,
+        )
+        return 2
 
     if _has_marker(new_content):
         return 0
