@@ -220,6 +220,45 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 ---
 
+## P2 — Operational hygiene + agent-framework integrations
+
+### BL-072: Operational alignment doc + new-primitives convention + pre-write hook
+**Status:** SHIPPED 2026-05-03 (this PR)
+**Tag:** `convention` `tooling` `enforcement`
+**What shipped:**
+- `docs/gecko-alpha-alignment.md` — 4-part operational hygiene reference (deployed patterns / drift checklist / working agreement / explicit limits)
+- `.claude/hooks/check-new-primitives.py` — PreToolUse hook gating `tasks/(plan|design|spec)_*.md` on the `**New primitives introduced:** [list or NONE]` line
+- `.claude/settings.json` — hook registered as 4th PreToolUse entry (matcher `Write|Edit|MultiEdit|NotebookEdit`); preserves existing 3 PreToolUse hooks + 2 PostToolUse blocks + Stop hook
+- `CLAUDE.md` — "Plan/Design Document Conventions" sub-heading under existing "Coding Conventions" (no new top-level)
+**Why:** chain_patterns auto-retired silently for 17d (2026-04-14 → 2026-05-01) because no convention surfaced the silent-failure surface at proposal time. This PR codifies the surface so future plans declare what infrastructure they add, and the hook prevents drift mechanically (not by discipline alone).
+**No production code modified.** No DB migration. Existing tests still pass.
+**Honest limitation:** the hook checks the marker EXISTS — does NOT validate that the listed primitives are truthful. Human PR review verifies accuracy. Documented in `docs/gecko-alpha-alignment.md` Part 4 and `CLAUDE.md`.
+
+### BL-073: Hermes Agent integration roadmap
+**Status:** RESEARCH-GATED — Phase 0 only as of 2026-05-03; Phase 1 unfunded
+**Tag:** `research-gated` `hermes` `cost-gated` `90-day-cancellation`
+**Realistic outlook:** Phase 1 (GEPA on `narrative_prediction` LLM prompt) is the one Hermes capability with concrete projected value for gecko-alpha. Cost gate: ~$10 + ~2 days work. Trigger to start: operator commits funding + bandwidth.
+
+**Phases:**
+
+| # | What | Cost | Trigger | Status |
+|---|---|---|---|---|
+| 0 | Browse `agentskills.io` for relevant skills | 1h | operator-driven | null-result 2026-05-03 — browse not performed; decision gate 2026-05-17. See `tasks/notes_agentskills_browse_2026_05_03.md` |
+| 1 | GEPA evolve `narrative_prediction` LLM prompt against the 1,274-row `predictions` table eval set (42 HIT / 40 MISS / 566 NEUTRAL / 561 UNRESOLVED) | $10 + 2d | operator commits | unfunded |
+| 2 | Hermes ops agent on VPS — Telegram NL access to gecko-alpha state, scheduled cron checks, cross-platform messaging gateway | 1-2d + $5/mo | operator approves new VPS service | unfunded |
+| 3 | Model routing for narrative LLM via OpenRouter (200+ models, ensemble, A/B against the Phase 1 eval harness) | 2-3d + variable per-model cost | Phase 1 eval harness exists | gated on Phase 1 |
+| 4 | BL-064 cross-platform expansion via Hermes gateway (Discord/Slack curator channels in addition to Telegram) | 2-3d | BL-064 14d soak (2026-05-11) shows curator-side trade dispatch works on Telegram first | gated on BL-064 soak |
+| 5 | Atropos RL infrastructure for tool-calling model training | n/a now | ≥1000 trades/signal stable for 30d (per memory `feedback_ml_not_yet.md`) | gated on data volume — months out |
+
+**Honest cancellation criterion:** If Phase 1 isn't started within 90 days of this entry's creation (by 2026-08-03), close BL-073 as won't-fix. Don't let it accrete as theatre. Status check at +30d (2026-06-03), +60d (2026-07-03), +90d (2026-08-03).
+
+**Realistic outcome 4 weeks from now:** Phase 0 done, Phase 1 not started.
+**Realistic outcome 90 days from now:** same, OR Phase 1 funded and shipped (positive case) OR closed-won't-fix (negative case).
+
+**Adapted from `Trivenidigital/shift-agent` analysis:** the inspiration for BL-072 + BL-073 was `shift-agent`'s `docs/hermes-alignment.md` + `CLAUDE.md` "Hermes-first" rules. shift-agent **runs on Hermes** as its production runtime; gecko-alpha does NOT (vanilla async Python pipeline). The adaptation is structural — we kept the 4-part doc shape and the read-deployed-code rule, dropped the Hermes-specific drift-tag vocabulary as cargo-cult, and replaced it with the more answerable single-line `**New primitives introduced:** [list or NONE]` declaration.
+
+---
+
 ## P2 — BL-064 follow-ups (TG social signals deployed 2026-04-27)
 
 ### BL-065: Dispatch paper trades from cashtag-only resolutions
