@@ -271,10 +271,11 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Estimate:** 0.5 day investigation + 0.5 day fix + tests.
 
 ### BL-070: Entry stack gate — refuse trades with insufficient signal confirmation
-**Status:** **SHELVED — re-evaluate 2026-05-15** (Tier 1a flip soak ends)
+**Status:** **SHELVED — re-evaluate when system net is clearly negative again, OR if 30d data still shows large stack=1 bleed after 2026-05-15 checkpoint.**
 **Tag:** `research-gated` `strategy` `entry-filter` `requires-backtest`
 **Plan:** `tasks/plan_bl070_entry_stack_gate.md`
-**Why shelved:** v1 backtest (`scripts/backtest_v1_signal_stacking.py`) showed stack≥2 trades net +$722 vs stack=1 trades net −$1,243 over 30d. Plan proposed entry-time gate filtering stack=1 trades. **Adversarial reviewer's Q10 prompted a baseline check that showed Tier 1a `enabled=0` for `gainers_early` + `trending_catch` captures $933 of the $1,243 swing with zero new code.** Tier 1a kill executed 2026-05-01; shelving BL-070 until soak ends. If post-flip 14d net is clearly positive, BL-070 may be unnecessary entirely. If still bleeding, revisit with the 3 plan-review blockers addressed (drop `paper_trades` source, point-in-time v2 backtest, index audit).
+**Why shelved (history):** v1 backtest (`scripts/backtest_v1_signal_stacking.py`) showed stack≥2 trades net +$722 vs stack=1 trades net −$1,243 over 30d. Plan proposed entry-time gate filtering stack=1 trades. Adversarial reviewer's Q10 prompted a baseline check that showed Tier 1a `enabled=0` for `gainers_early` + `trending_catch` would capture $933 of the $1,243 swing with zero new code, so we executed the Tier 1a kill 2026-05-01 instead of building BL-070. **However:** the kill of `gainers_early` was reversed 2026-05-03 when the post-PR-#59 data showed it had become profitable (+$8.61/trade across 59 closes). PR #59 + chain dispatch revival + Tier 1a infrastructure together appear to be enough to swing the system net positive without BL-070.
+**Resume protocol:** Only revisit if (a) the 2026-05-15 checkpoint shows 14d net materially negative, OR (b) a future targeted backtest (point-in-time entry replay, paper_trades source removed, index audit, lookback sensitivity sweep) shows entry-time stack-gate lift > $200/30d on top of the current state. If neither — BL-070 is structurally unneeded; close as won't-fix.
 
 ### BL-067: Conviction-locked hold — extend exit gates when independent signals stack on the same token
 **Status:** **RESEARCH-GATED — DO NOT IMPLEMENT YET.** Requires backtest + design decisions documented below before any production code lands.

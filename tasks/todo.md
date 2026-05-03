@@ -21,6 +21,33 @@ Last updated: 2026-05-03 (chain dispatch alive + Tier 1a reversal)
 ## Active soaks (don't disturb)
 
 - [x] **Tier 1a flip — gainers_early kill REVERSED 2026-05-03T15:53Z** — original kill was based on pre-PR-#59 30d data. Sneak-peek of post-#59 data (4.7d window) showed gainers_early at +$508 / 59 closes / +$8.61/trade / 67.8% win — clearly profitable under the new adaptive trail. PR #59 fixed gainers_early; the kill was forfeiting ~$190/day. SQL reversal + restart verified: 5 new gainers_early trades opened at 15:58:29Z, zero `trade_skipped_signal_disabled` events. Tier 1a `SIGNAL_PARAMS_ENABLED=true` flag stays on for the other 7 signals (per-signal params still honored). Audit row in signal_params_audit. Backup: `scout.db.bak.gainers_revive_20260503_155322`.
+
+- [ ] **2026-05-15 14:06Z — RE-SCOPED system health checkpoint (was: "Tier 1a kill 14d soak").** The original A/B (kill gainers_early, see net swing) was invalidated 2026-05-03 when we reversed the kill based on post-PR-#59 data. New scope: 2-week strategic checkpoint after a flurry of changes (Tier 1a flag on, per-signal params live, chain_completed dispatch wired + long-hold tuned, BL-071 guard live). Three concrete questions:
+  1. **System P&L re-baseline.** Compute 14d rolling net (2026-05-01 → 2026-05-15) and compare to the −$506 baseline that motivated all the recent changes. Decision gate: ≥ +$1,000 net = strategy stack worked; +$0–$1,000 = mixed; < $0 = something else is bleeding, dig in.
+  2. **Tier 1a infrastructure health.** Did Tier 1b auto-suspend fire on anything (shouldn't have, since all signals trended profitable in the 4.7d sneak-peek)? Did anyone run `calibrate.py`? Are signal_params_audit rows clean and traceable? Any latency regression from per-signal lookup vs Settings reads?
+  3. **Next-best-next decision.** With 2 weeks of cleaner data and chain_completed actually producing trades, decide what's next: BL-067 (conviction-locked hold), BL-071a/b (outcome plumbing fixes), or "leave the system alone, monitor for another 30d, then revisit". Optionally also: do we re-evaluate BL-070 (entry stack gate) given the data actually shows we're net positive without it?
+  - Verify queries (paste into VPS sqlite):
+    ```
+    -- (1) 14d rolling net since Tier 1a flip
+    SELECT COUNT(*), ROUND(SUM(pnl_usd),2), ROUND(AVG(pnl_usd),2),
+      ROUND(100.0*SUM(CASE WHEN pnl_usd>0 THEN 1 ELSE 0 END)/COUNT(*),1) AS win_pct
+    FROM paper_trades WHERE status LIKE 'closed_%'
+      AND datetime(closed_at) >= datetime('2026-05-01 14:06:00');
+    -- (2) per-signal breakdown including chain_completed
+    SELECT signal_type, COUNT(*) AS n, ROUND(SUM(pnl_usd),2) AS net,
+      ROUND(AVG(pnl_usd),2) AS per_trade,
+      ROUND(100.0*SUM(CASE WHEN pnl_usd>0 THEN 1 ELSE 0 END)/COUNT(*),1) AS win_pct
+    FROM paper_trades WHERE status LIKE 'closed_%'
+      AND datetime(closed_at) >= datetime('2026-05-01 14:06:00')
+    GROUP BY signal_type ORDER BY net DESC;
+    -- (3) auto-suspend events (Tier 1b should NOT have fired)
+    SELECT * FROM signal_params_audit WHERE applied_by = 'auto_suspend';
+    -- (4) all operator/calibration changes since Tier 1a went on
+    SELECT * FROM signal_params_audit
+    WHERE datetime(applied_at) >= datetime('2026-05-01 14:06:00')
+    ORDER BY applied_at;
+    ```
+  - This is no longer an A/B test — just a 2-week strategic checkpoint. No automatic action; user-driven decision.
 - [ ] **PR #58 BL-064 lenient-safety soak** — flag flipped 2026-04-28T15:17Z. Re-check window: 2026-05-12.
   - Decision gate: ≥40% win rate + avg pnl_pct >0 → keep on. As of 2026-04-29T12:25Z: 0 trades dispatched yet (curators haven't posted CA-bearing messages since flag flipped). Operational gap, not code.
 - [ ] **PR #59 strategy tuning soak** — deployed 2026-04-28T22:58Z. Re-check window: 2026-05-05.
