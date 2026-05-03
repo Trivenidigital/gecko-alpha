@@ -1072,6 +1072,52 @@ class Database:
                 ),
             )
 
+            # BL-071b (Bundle A 2026-05-03): convert pre-stamped EXPIRED
+            # narrative rows to NULL so the hydrator can re-evaluate them
+            # against the predictions table. Bounded scope: narrative pipeline
+            # only, EXPIRED-with-no-evaluated_at only. Memecoin EXPIRED rows
+            # are left alone (their outcome path is BL-071a, not BL-071b).
+            # Idempotent: gated by paper_migrations row; second run is a no-op.
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl071b_unstamp_expired_narrative",),
+            )
+            if not await cur.fetchone():
+                await conn.execute(
+                    """UPDATE chain_matches
+                          SET outcome_class = NULL
+                        WHERE pipeline = 'narrative'
+                          AND outcome_class = 'EXPIRED'
+                          AND evaluated_at IS NULL"""
+                )
+                await conn.execute(
+                    "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                    "VALUES (?, ?)",
+                    (
+                        "bl071b_unstamp_expired_narrative",
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+
+            # BL-071a partial (Bundle A 2026-05-03): add mcap_at_completion
+            # column to chain_matches. Hydrator (Task 3) reads it; writers
+            # (BL-071a' follow-up) will populate it. PRAGMA-guarded ALTER,
+            # idempotent.
+            cur = await conn.execute("PRAGMA table_info(chain_matches)")
+            cm_cols = {row[1] for row in await cur.fetchall()}
+            if "mcap_at_completion" not in cm_cols:
+                await conn.execute(
+                    "ALTER TABLE chain_matches ADD COLUMN mcap_at_completion REAL"
+                )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (
+                    "bl071a_chain_matches_mcap_at_completion",
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_combo_opened "
                 "ON paper_trades(signal_combo, opened_at)"
@@ -1093,11 +1139,15 @@ class Database:
             if missing:
                 raise RuntimeError(f"Schema migration incomplete: missing {missing}")
 
-            # BL-063/BL-064 defense-in-depth: confirm cutover rows are present.
+            # BL-063/BL-064/Bundle A defense-in-depth: confirm cutover rows
+            # are present. Bundle A added bl071b_unstamp_expired_narrative
+            # and bl071a_chain_matches_mcap_at_completion.
             cur = await conn.execute(
                 "SELECT name FROM paper_migrations WHERE name IN "
                 "('bl061_ladder', 'bl062_peak_fade', 'bl063_moonshot', "
-                "'bl064_tg_social', 'bl064_safety_required_per_channel')"
+                "'bl064_tg_social', 'bl064_safety_required_per_channel', "
+                "'bl071b_unstamp_expired_narrative', "
+                "'bl071a_chain_matches_mcap_at_completion')"
             )
             recorded = {row[0] for row in await cur.fetchall()}
             missing_migrations = {
@@ -1106,6 +1156,8 @@ class Database:
                 "bl063_moonshot",
                 "bl064_tg_social",
                 "bl064_safety_required_per_channel",
+                "bl071b_unstamp_expired_narrative",
+                "bl071a_chain_matches_mcap_at_completion",
             } - recorded
             if missing_migrations:
                 raise RuntimeError(

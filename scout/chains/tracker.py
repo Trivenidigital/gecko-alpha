@@ -515,7 +515,18 @@ async def _record_expired_chain(
     pattern: ChainPattern,
     now: datetime,
 ) -> None:
-    """Record an expired (unresolved) chain as a miss in chain_matches.
+    """Record an expired (unresolved) chain as a pending miss in chain_matches.
+
+    BL-071b fix (2026-05-03): writes outcome_class=NULL (not 'EXPIRED') so the
+    hydrator `update_chain_outcomes` can later resolve the outcome from the
+    predictions table. The previous behaviour pre-stamped 'EXPIRED' at write
+    time, which the hydrator's `WHERE outcome_class IS NULL` filter then
+    permanently skipped — a silent failure that caused 154 narrative
+    chain_matches in prod to be stuck as EXPIRED with no evaluated_at.
+
+    Verified safe: only patterns.py:263 reads chain_match outcomes for
+    stats, and it tolerates NULL/EXPIRED equally (NULL rows simply don't
+    contribute until the hydrator processes them).
 
     Only records if at least one step was matched — otherwise there is
     nothing meaningful for the LEARN phase to learn from.
@@ -528,7 +539,7 @@ async def _record_expired_chain(
            (token_id, pipeline, pattern_id, pattern_name, steps_matched,
             total_steps, anchor_time, completed_at, chain_duration_hours,
             conviction_boost, outcome_class)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'EXPIRED')""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
         (
             chain.token_id,
             chain.pipeline,
