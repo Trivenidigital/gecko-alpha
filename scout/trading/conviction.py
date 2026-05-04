@@ -28,6 +28,7 @@ editing two code locations.
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 
 import structlog
@@ -54,7 +55,13 @@ _SIGNAL_SOURCES: list[tuple[str, str, str, str]] = [
 # (e.g., partial-rollback snapshot). First miss is logged once;
 # subsequent calls skip the source. Test isolation: see
 # clear_missing_sources_cache_for_tests() per design-v2 arch-S2.
+#
+# PR-review H3-silent: TTL added to allow recovery without process restart.
+# If a missing table is later re-added (migration completes, DB restored
+# from backup), the cache entry expires and the next call re-probes.
 _signal_sources_missing: set[str] = set()
+_MISSING_CACHE_TTL_SEC = 3600  # 1 hour
+_signal_sources_missing_at: dict[str, float] = {}
 
 
 def clear_missing_sources_cache_for_tests() -> None:
@@ -63,6 +70,25 @@ def clear_missing_sources_cache_for_tests() -> None:
     autouse fixture; per-test reset prevents tmp_path-DB cross-pollution
     of the missing-table set."""
     _signal_sources_missing.clear()
+    _signal_sources_missing_at.clear()
+
+
+def _is_in_missing_cache(table: str) -> bool:
+    """PR-review H3-silent: TTL-aware membership test."""
+    if table not in _signal_sources_missing:
+        return False
+    cached_at = _signal_sources_missing_at.get(table, 0.0)
+    if (time.monotonic() - cached_at) > _MISSING_CACHE_TTL_SEC:
+        # Expired — drop from cache, allow re-probe.
+        _signal_sources_missing.discard(table)
+        _signal_sources_missing_at.pop(table, None)
+        return False
+    return True
+
+
+def _mark_table_missing(table: str) -> None:
+    _signal_sources_missing.add(table)
+    _signal_sources_missing_at[table] = time.monotonic()
 
 
 async def _table_exists(db: Database, table: str) -> bool:
@@ -90,10 +116,10 @@ async def _count_stacked_signals_in_window(
     """
     sources: list[str] = []
     for table, ts_col, label, token_col in _SIGNAL_SOURCES:
-        if table in _signal_sources_missing:
+        if _is_in_missing_cache(table):
             continue
         if not await _table_exists(db, table):
-            _signal_sources_missing.add(table)
+            _mark_table_missing(table)
             log.warning(
                 "conviction_signal_source_missing",
                 table=table,
@@ -119,7 +145,7 @@ async def _count_stacked_signals_in_window(
             ) from exc
 
     # paper_trades distinct signal_types — design-v2 adv-S2 exclude self
-    if "paper_trades" not in _signal_sources_missing and await _table_exists(
+    if not _is_in_missing_cache("paper_trades") and await _table_exists(
         db, "paper_trades"
     ):
         try:
@@ -254,3 +280,13 @@ async def compute_stack(
         exclude_trade_id=exclude_trade_id,
     )
     return n
+
+
+# PR-review N5-arch: public alias so cross-module imports (backtest
+# script) don't violate the leading-underscore module-private convention.
+# IMPORTANT — PR-review M3-silent: this helper MUST NOT introduce real
+# `await` calls (e.g., `asyncio.sleep(0)`, pool acquires). The backtest
+# sync wrapper drives the coroutine via `coro.send(None)` once and
+# expects synchronous completion through the `_SyncDBShim`. T7 round-trip
+# pin catches this in CI.
+count_stacked_signals_in_window = _count_stacked_signals_in_window

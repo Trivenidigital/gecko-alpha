@@ -173,6 +173,28 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             #
             # `row[30]` = conviction_locked_at (SELECT extended above).
             conviction_locked_at = row[30] if len(row) > 30 else None
+
+            # PR-review H1: emit one-shot log when master kill is OFF but
+            # the trade was previously armed. Operator-rollback scenario
+            # (Layer 1 .env flip + restart): trades stay open but their
+            # exit gates silently revert from locked to base. Without
+            # this log, a fleet of held trades can quietly tighten their
+            # trail mid-flight on `PAPER_CONVICTION_LOCK_ENABLED=False`.
+            # Idempotent via `conviction_locked_at IS NOT NULL` check —
+            # one log per trade per pass; aggregates as a count signal.
+            if (
+                conviction_locked_at is not None
+                and not settings.PAPER_CONVICTION_LOCK_ENABLED
+            ):
+                log.info(
+                    "conviction_lock_disarmed_post_rollback",
+                    trade_id=trade_id,
+                    token_id=token_id,
+                    signal_type=signal_type_row,
+                    armed_at=conviction_locked_at,
+                    hint="master kill-switch OFF; locked params reverting to base",
+                )
+
             if (
                 settings.PAPER_CONVICTION_LOCK_ENABLED
                 and sp.conviction_lock_enabled
@@ -228,6 +250,10 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                             token_id=token_id,
                             signal_type=signal_type_row,
                             stack=stack,
+                            # PR-review N2-arch: explicit bucket value
+                            # (saturates at 4) so operator can tell if
+                            # the lock applied saturated params or not.
+                            bucket=min(stack, 4),
                             threshold=threshold,
                             locked_trail_pct=sp.trail_pct,
                             locked_sl_pct=sp.sl_pct,

@@ -166,8 +166,10 @@ import asyncio  # noqa: E402
 import concurrent.futures  # noqa: E402
 
 # Production helpers — single source of truth (D3 fix).
+# PR-review N5-arch: import the public alias instead of the underscore-
+# prefixed private name. Both refer to the same function object.
 from scout.trading.conviction import (  # noqa: E402
-    _count_stacked_signals_in_window as _async_count_stacked,
+    count_stacked_signals_in_window as _async_count_stacked,
     conviction_locked_params,
 )
 

@@ -172,15 +172,22 @@ def test_settings_paper_conviction_lock_threshold_must_be_at_least_two(
         settings_factory(PAPER_CONVICTION_LOCK_THRESHOLD=0)
 
 
-def test_settings_paper_conviction_lock_threshold_must_be_at_most_eleven(
+def test_settings_paper_conviction_lock_threshold_upper_bound(
     settings_factory,
 ):
-    """T2d — design-v2 S2: upper bound 11 (highest observed stack 30d)."""
+    """T2d — PR-review M2: upper bound relaxed to 50 (operator escape
+    hatch) from previous design-v2 limit of 11. Values > 50 still rejected
+    as likely typos."""
     from pydantic import ValidationError
+    # 11 still accepted (previously the cap)
     s = settings_factory(PAPER_CONVICTION_LOCK_THRESHOLD=11)
     assert s.PAPER_CONVICTION_LOCK_THRESHOLD == 11
+    # 50 boundary accepted (new escape-hatch ceiling)
+    s = settings_factory(PAPER_CONVICTION_LOCK_THRESHOLD=50)
+    assert s.PAPER_CONVICTION_LOCK_THRESHOLD == 50
+    # 51 rejected
     with pytest.raises(ValidationError):
-        settings_factory(PAPER_CONVICTION_LOCK_THRESHOLD=12)
+        settings_factory(PAPER_CONVICTION_LOCK_THRESHOLD=51)
 
 
 # ---------------------------------------------------------------------------
@@ -320,9 +327,10 @@ def test_moonshot_trail_composes_with_locked_trail(settings_factory):
 
 
 def test_backtest_script_imports_conviction_module_helpers():
-    """T7 — design-v2 arch-S1: pin sync wrapper round-trip works through
-    asyncio.run on the production async helper. Catches silent breakage
-    on Database._conn refactor."""
+    """T7 — design-v2 arch-S1 + PR-review N2 tightening: pin sync wrapper
+    round-trip + non-trivial assertion (N=1 from one seeded source row)
+    against the actual `paper_trades` DISTINCT scan. Catches silent
+    breakage on Database._conn refactor AND empty-DB-only T7 weakness."""
     import sqlite3
     from scripts.backtest_conviction_lock import (
         _count_stacked_signals_in_window as backtest_helper,
@@ -334,14 +342,475 @@ def test_backtest_script_imports_conviction_module_helpers():
         "CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, "
         "token_id TEXT, signal_type TEXT, opened_at TEXT)"
     )
+    conn.execute(
+        "INSERT INTO paper_trades (token_id, signal_type, opened_at) "
+        "VALUES (?, ?, ?)",
+        ("test-coin", "first_signal", "2026-05-02T00:00:00+00:00"),
+    )
     conn.commit()
-    n, _sources = backtest_helper(
-        conn, "test-coin", "2026-05-01T00:00:00+00:00",
+    n, sources = backtest_helper(
+        conn, "test-coin",
+        "2026-05-01T00:00:00+00:00",
         "2026-05-04T00:00:00+00:00",
     )
     assert isinstance(n, int)
-    assert n == 0
+    assert n == 1
+    assert "trade:first_signal" in sources
 
     base = {"max_duration_hours": 168, "trail_pct": 20.0, "sl_pct": 25.0}
     p = conviction_locked_params(stack=4, base=base)
     assert p["max_duration_hours"] == 504
+
+
+# ---------------------------------------------------------------------------
+# PR-review additions: T5/T5d/T5e/T5g/T6b + self-counting check (T3+)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_locked_eligible_trade(
+    db,
+    *,
+    signal_type: str = "first_signal",
+    opt_in_signal: bool = False,
+    n_extra_sources: int = 3,
+    opened_at: str | None = None,
+    entry_price: float = 1.0,
+    token_id: str = "lab-coin",
+    current_price: float | None = None,
+):
+    """Shared fixture per design-v2 arch-S3.
+
+    Seeds a paper_trade row + ≥`n_extra_sources` source-table rows on the
+    same `token_id` after `opened_at`. Defaults: signal_type=first_signal,
+    opened_at=now-2d, n_extra_sources=3 (enough for default threshold=3).
+
+    Source-table seeding ORDER (additive — first N seeded):
+      1. gainers_snapshots @ opened_at + 1h
+      2. trending_snapshots @ opened_at + 2h
+      3. volume_spikes @ opened_at + 3h (no chain_matches FK headache)
+      ...
+
+    For T8 (n_extra_sources=11) sources 9-11 are extra paper_trades rows
+    with different signal_types.
+    """
+    from datetime import datetime, timedelta, timezone
+    if opened_at is None:
+        opened_at = (
+            datetime.now(timezone.utc) - timedelta(days=2)
+        ).isoformat()
+    open_dt = datetime.fromisoformat(opened_at.replace("Z", "+00:00"))
+
+    # Insert paper_trade
+    cur = await db._conn.execute(
+        """INSERT INTO paper_trades
+           (token_id, symbol, name, chain, signal_type, signal_data,
+            entry_price, amount_usd, quantity,
+            tp_price, sl_price, opened_at, status, peak_pct)
+           VALUES (?, 'LAB', 'Lab Coin', 'sol', ?, '{}',
+                   ?, 100.0, 100.0,
+                   ?, ?, ?, 'open', 10.0)""",
+        (
+            token_id, signal_type,
+            entry_price, entry_price * 1.5, entry_price * 0.75,
+            opened_at,
+        ),
+    )
+    trade_id = cur.lastrowid
+
+    # Operator opt-in if requested
+    if opt_in_signal:
+        await db._conn.execute(
+            "UPDATE signal_params SET conviction_lock_enabled = 1 "
+            "WHERE signal_type = ?",
+            (signal_type,),
+        )
+
+    # Seed source-table rows (offsets in hours from opened_at)
+    seed_specs = [
+        # (table, sql, params builder)
+        (
+            1, "gainers_snapshots",
+            "INSERT INTO gainers_snapshots "
+            "(coin_id, symbol, name, price_change_24h, market_cap, "
+            " volume_24h, price_at_snapshot, snapshot_at) "
+            "VALUES (?, 'LAB', 'Lab', 12.0, 5000000, 1000, 1.0, ?)",
+        ),
+        (
+            2, "trending_snapshots",
+            # Schema may vary; use flexible inserts. Read schema dynamically.
+            None,
+        ),
+        (
+            3, "volume_spikes",
+            None,
+        ),
+    ]
+    sources_added = 0
+    for hours, table, sql in seed_specs:
+        if sources_added >= n_extra_sources:
+            break
+        ts = (open_dt + timedelta(hours=hours)).isoformat()
+        if table == "gainers_snapshots" and sql:
+            await db._conn.execute(sql, (token_id, ts))
+            sources_added += 1
+        else:
+            # Probe schema and insert minimal NULLable defaults
+            cur = await db._conn.execute(f"PRAGMA table_info({table})")
+            cols = [(r[1], r[2], r[3]) for r in await cur.fetchall()]
+            if not cols:
+                continue
+            non_null = [c for c in cols if c[2] == 1]
+            colnames = []
+            placeholders = []
+            values = []
+            for name, ctype, _notnull in cols:
+                if name == "id":
+                    continue
+                colnames.append(name)
+                placeholders.append("?")
+                if name in ("coin_id", "token_id"):
+                    values.append(token_id)
+                elif name in ("snapshot_at", "detected_at", "created_at",
+                              "completed_at", "predicted_at", "recorded_at"):
+                    values.append(ts)
+                elif ctype.upper() == "TEXT":
+                    values.append("LAB")
+                elif ctype.upper() in ("INTEGER", "REAL"):
+                    values.append(1.0 if ctype.upper() == "REAL" else 1)
+                else:
+                    values.append(None)
+            try:
+                await db._conn.execute(
+                    f"INSERT INTO {table} ({','.join(colnames)}) "
+                    f"VALUES ({','.join(placeholders)})",
+                    values,
+                )
+                sources_added += 1
+            except Exception:
+                # Table may not exist or schema doesn't match; skip
+                continue
+
+    # Extra paper_trades rows for sources 9-11 (different signal_types)
+    extra_signals = [
+        "gainers_early", "trending_catch", "losers_contrarian",
+    ]
+    for idx in range(min(max(n_extra_sources - sources_added, 0), 3)):
+        ts = (open_dt + timedelta(hours=9 + idx)).isoformat()
+        await db._conn.execute(
+            """INSERT INTO paper_trades
+               (token_id, symbol, name, chain, signal_type, signal_data,
+                entry_price, amount_usd, quantity,
+                tp_price, sl_price, opened_at, status)
+               VALUES (?, 'LAB', 'Lab Coin', 'sol', ?, '{}',
+                       ?, 100.0, 100.0, 1.5, 0.75, ?, 'closed')""",
+            (token_id, extra_signals[idx], entry_price, ts),
+        )
+
+    # price_cache row keeping the trade live (current_price defaults to
+    # entry * 1.05 — peak_pct=10 stays valid; trade survives short-term
+    # exit gates on this evaluator pass).
+    if current_price is None:
+        current_price = entry_price * 1.05
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT OR REPLACE INTO price_cache
+           (coin_id, current_price, updated_at)
+           VALUES (?, ?, ?)""",
+        (token_id, current_price, now_iso),
+    )
+    await db._conn.commit()
+    return trade_id
+
+
+@pytest.mark.asyncio
+async def test_evaluator_skips_conviction_lock_when_settings_kill_switch_off(
+    db, settings_factory
+):
+    """T5 (PR-review H2 coverage gap) — fail-closed at master gate:
+    settings.PAPER_CONVICTION_LOCK_ENABLED=False means NO overlay
+    regardless of per-signal flag or stack count."""
+    from scout.trading.evaluator import evaluate_paper_trades
+    settings = settings_factory(SIGNAL_PARAMS_ENABLED=True)
+    # Default: PAPER_CONVICTION_LOCK_ENABLED=False
+    assert settings.PAPER_CONVICTION_LOCK_ENABLED is False
+    await _seed_locked_eligible_trade(
+        db, signal_type="first_signal", opt_in_signal=True,
+        n_extra_sources=5,
+    )
+    with capture_logs() as logs:
+        await evaluate_paper_trades(db, settings)
+    events = [e.get("event") for e in logs]
+    assert "conviction_lock_armed" not in events
+    cur = await db._conn.execute(
+        "SELECT conviction_locked_at FROM paper_trades WHERE token_id = ?",
+        ("lab-coin",),
+    )
+    row = await cur.fetchone()
+    assert row[0] is None  # not stamped
+
+
+@pytest.mark.asyncio
+async def test_evaluator_arms_conviction_lock_when_all_gates_pass(
+    db, settings_factory
+):
+    """T5d (PR-review arch-D1 merge-blocker) — happy path: all 3 gates
+    pass → locked params used. Asserts:
+    - conviction_lock_armed event fires
+    - paper_trades.conviction_locked_at + conviction_locked_stack stamped
+    - locked max_duration_hours overlaid"""
+    from scout.trading.evaluator import evaluate_paper_trades
+    settings = settings_factory(
+        SIGNAL_PARAMS_ENABLED=True,
+        PAPER_CONVICTION_LOCK_ENABLED=True,
+    )
+    await _seed_locked_eligible_trade(
+        db, signal_type="first_signal", opt_in_signal=True,
+        n_extra_sources=3,
+    )
+    with capture_logs() as logs:
+        await evaluate_paper_trades(db, settings)
+    armed = [e for e in logs if e.get("event") == "conviction_lock_armed"]
+    assert armed, (
+        f"expected conviction_lock_armed; got {[e.get('event') for e in logs]}"
+    )
+    a = armed[0]
+    assert a["stack"] >= 3
+    assert a["threshold"] == 3
+    # Stack=3 bucket adds +168h. settings_factory()'s default
+    # PAPER_MAX_DURATION_HOURS is 48 (from scout/config.py:220), so
+    # locked_max_duration_hours = 48 + 168 = 216.
+    assert a["locked_max_duration_hours"] == 48 + 168, (
+        f"expected stack=3 bucket → base 48 + 168 = 216; "
+        f"got {a['locked_max_duration_hours']}"
+    )
+    cur = await db._conn.execute(
+        "SELECT conviction_locked_at, conviction_locked_stack "
+        "FROM paper_trades WHERE token_id = ?",
+        ("lab-coin",),
+    )
+    row = await cur.fetchone()
+    assert row[0] is not None  # stamped
+    assert row[1] is not None
+    assert row[1] >= 3
+
+
+@pytest.mark.asyncio
+async def test_evaluator_logs_conviction_lock_armed_only_once(
+    db, settings_factory
+):
+    """T5e (PR-review H1 — D2 idempotency, soak-signal-critical):
+    second eval pass on the same armed trade does NOT re-emit the log
+    (would corrupt the 14d operator soak monitor with ~672 spurious
+    events per locked trade)."""
+    from scout.trading.evaluator import evaluate_paper_trades
+    settings = settings_factory(
+        SIGNAL_PARAMS_ENABLED=True,
+        PAPER_CONVICTION_LOCK_ENABLED=True,
+    )
+    await _seed_locked_eligible_trade(
+        db, signal_type="first_signal", opt_in_signal=True,
+        n_extra_sources=3,
+    )
+    # Pass 1 — arms
+    with capture_logs() as logs1:
+        await evaluate_paper_trades(db, settings)
+    armed1 = [e for e in logs1 if e.get("event") == "conviction_lock_armed"]
+    assert len(armed1) == 1
+    # Pass 2 — must NOT re-emit
+    with capture_logs() as logs2:
+        await evaluate_paper_trades(db, settings)
+    armed2 = [e for e in logs2 if e.get("event") == "conviction_lock_armed"]
+    assert armed2 == [], (
+        f"D2 regression: re-emitted on pass 2; got {len(armed2)} events"
+    )
+
+
+@pytest.mark.asyncio
+async def test_evaluator_overlay_placement_keeps_trade_alive_past_base_max(
+    db, settings_factory
+):
+    """T5g (PR-review C1 + arch-D1 — STRUCTURAL placement pin):
+    seed opened_at so elapsed > base PAPER_MAX_DURATION_HOURS but <
+    locked max. Overlay-after-line-158 BUG would close the trade via
+    expired (max_duration uses un-overlaid base); correct placement
+    keeps status='open' (timedelta uses overlaid locked max).
+
+    Default PAPER_MAX_DURATION_HOURS = 48. Stack=3 locked = 48 + 168 = 216.
+    Seed opened_at = now - 100h (100 > 48, 100 < 216).
+
+    Without this test, a future refactor moving the overlay AFTER
+    `max_duration = timedelta(...)` makes the feature a silent no-op."""
+    from datetime import datetime, timedelta, timezone
+    from scout.trading.evaluator import evaluate_paper_trades
+    settings = settings_factory(
+        SIGNAL_PARAMS_ENABLED=True,
+        PAPER_CONVICTION_LOCK_ENABLED=True,
+    )
+    opened_at = (
+        datetime.now(timezone.utc) - timedelta(hours=100)
+    ).isoformat()
+    await _seed_locked_eligible_trade(
+        db, signal_type="first_signal", opt_in_signal=True,
+        n_extra_sources=3, opened_at=opened_at,
+    )
+    await evaluate_paper_trades(db, settings)
+    cur = await db._conn.execute(
+        "SELECT status FROM paper_trades WHERE token_id = ?",
+        ("lab-coin",),
+    )
+    row = await cur.fetchone()
+    # Overlay-after-158 BUG would have closed via expired (100h > base 48h).
+    # Overlay-before-158 (correct): trade still open at 100h since locked
+    # max=216h.
+    assert row[0] == "open", (
+        f"placement bug: trade closed prematurely; status={row[0]!r}. "
+        "Overlay must run BEFORE line 158 max_duration = timedelta(...)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_evaluator_moonshot_branch_uses_max_with_sp_trail_pct(
+    db, settings_factory, monkeypatch
+):
+    """T6b (PR-review C2 — moonshot composition production-call-site pin):
+    T6 only verified `max(30, 35) == 35` arithmetic; T6b verifies the
+    PRODUCTION code path at evaluator.py reads `sp.trail_pct` (overlaid
+    by conviction-lock) rather than the moonshot constant alone.
+
+    Setup: stack=4 (saturated → locked trail=35); pre-stamp moonshot_armed_at
+    to simulate prior-arming. Force peak_pct above moonshot threshold so the
+    moonshot branch fires. Assert the trade survives a price drop within
+    the locked 35% drawdown but outside the moonshot 30% drawdown.
+
+    Pre-fix: effective_trail_pct = settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT
+    (=30); a 33% drawdown closes the trade.
+    Post-fix: effective_trail_pct = max(30, 35) = 35; same drawdown does
+    NOT close the trade.
+    """
+    from datetime import datetime, timezone
+    from scout.trading.evaluator import evaluate_paper_trades
+    settings = settings_factory(
+        SIGNAL_PARAMS_ENABLED=True,
+        PAPER_CONVICTION_LOCK_ENABLED=True,
+        PAPER_MOONSHOT_ENABLED=True,
+    )
+    # Seed trade with stack=4 sources; pre-stamp moonshot_armed_at.
+    trade_id = await _seed_locked_eligible_trade(
+        db, signal_type="first_signal", opt_in_signal=True,
+        n_extra_sources=4,
+        entry_price=1.0,
+        # Set current_price to simulate a peak retracement: we'll stamp
+        # peak_pct via direct UPDATE below, then set current = entry * 0.67
+        # which is 33% drawdown from peak (entry was the original anchor).
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # Stamp moonshot_armed_at + peak_pct=50 + peak_price=1.50.
+    # current_price = 1.005 → drawdown from peak (1.50→1.005) = 33%.
+    # Locked 35% trail: not triggered (33% < 35%) → trade stays open.
+    # Moonshot-only 30% trail: triggered (33% > 30%) → trade closes.
+    await db._conn.execute(
+        """UPDATE paper_trades
+           SET moonshot_armed_at = ?, peak_pct = 50.0, peak_price = 1.50,
+               floor_armed = 1
+           WHERE id = ?""",
+        (now_iso, trade_id),
+    )
+    await db._conn.execute(
+        "UPDATE price_cache SET current_price = 1.005 WHERE coin_id = ?",
+        ("lab-coin",),
+    )
+    await db._conn.commit()
+    await evaluate_paper_trades(db, settings)
+    cur = await db._conn.execute(
+        "SELECT status FROM paper_trades WHERE id = ?", (trade_id,)
+    )
+    row = await cur.fetchone()
+    # Without A1 fix, trade closes (33% drawdown > moonshot 30%).
+    # With A1 fix, trade survives (33% drawdown < locked 35%).
+    assert row[0] == "open", (
+        f"A1 regression: moonshot branch ignored locked sp.trail_pct=35; "
+        f"trade closed at status={row[0]!r}. "
+        "Production must use max(MOONSHOT, sp.trail_pct), not constant."
+    )
+
+
+@pytest.mark.asyncio
+async def test_evaluator_emits_disarmed_log_when_master_off_post_arm(
+    db, settings_factory
+):
+    """PR-review H1 silent-failure: emit `conviction_lock_disarmed_post_rollback`
+    when a trade has conviction_locked_at set but master kill-switch is OFF.
+    Operator-rollback visibility — without this, the fleet of armed trades
+    silently retightens trail mid-flight on .env flip."""
+    from datetime import datetime, timezone
+    from scout.trading.evaluator import evaluate_paper_trades
+    # First, arm the trade with master ON
+    settings_on = settings_factory(
+        SIGNAL_PARAMS_ENABLED=True,
+        PAPER_CONVICTION_LOCK_ENABLED=True,
+    )
+    await _seed_locked_eligible_trade(
+        db, signal_type="first_signal", opt_in_signal=True,
+        n_extra_sources=3,
+    )
+    await evaluate_paper_trades(db, settings_on)
+    # Verify armed
+    cur = await db._conn.execute(
+        "SELECT conviction_locked_at FROM paper_trades "
+        "WHERE token_id = ?",
+        ("lab-coin",),
+    )
+    row = await cur.fetchone()
+    assert row[0] is not None
+    # Now flip master OFF and run another pass
+    settings_off = settings_factory(
+        SIGNAL_PARAMS_ENABLED=True,
+        PAPER_CONVICTION_LOCK_ENABLED=False,
+    )
+    with capture_logs() as logs:
+        await evaluate_paper_trades(db, settings_off)
+    events = [e.get("event") for e in logs]
+    assert "conviction_lock_disarmed_post_rollback" in events, (
+        f"H1: rollback regression invisible; events={events}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_stack_excludes_self_trade_from_paper_trades_count(db):
+    """PR-review C3 (test-coverage): paper_trades self-counting prevention
+    pinned. compute_stack with exclude_trade_id should not count the
+    excluded trade row as a confirmation."""
+    from datetime import datetime, timedelta, timezone
+    from scout.trading.conviction import compute_stack
+    open_dt = datetime.now(timezone.utc) - timedelta(days=1)
+    opened_at = open_dt.isoformat()
+    # Insert paper_trade for token "x" with the same signal_type — this
+    # would inflate stack by 1 if not excluded.
+    cur = await db._conn.execute(
+        """INSERT INTO paper_trades
+           (token_id, symbol, name, chain, signal_type, signal_data,
+            entry_price, amount_usd, quantity, tp_price, sl_price,
+            opened_at, status)
+           VALUES ('x', 'X', 'X', 'sol', 'first_signal', '{}',
+                   1.0, 100.0, 100.0, 1.5, 0.75, ?, 'open')""",
+        (opened_at,),
+    )
+    self_id = cur.lastrowid
+    await db._conn.commit()
+
+    # Without exclude_trade_id: stack includes self-reference → at least 1
+    n_with_self = await compute_stack(
+        db, "x", opened_at, exclude_trade_id=None,
+    )
+    # With exclude_trade_id=self_id: stack excludes self → 0
+    n_without_self = await compute_stack(
+        db, "x", opened_at, exclude_trade_id=self_id,
+    )
+    assert n_with_self >= 1, (
+        f"compute_stack should count paper_trades when not excluding "
+        f"(got {n_with_self})"
+    )
+    assert n_without_self == 0, (
+        f"compute_stack with exclude_trade_id should drop self-reference "
+        f"(got {n_without_self})"
+    )

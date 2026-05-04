@@ -512,19 +512,25 @@ class Settings(BaseSettings):
     @field_validator("PAPER_CONVICTION_LOCK_THRESHOLD")
     @classmethod
     def _validate_conviction_lock_threshold(cls, v: int) -> int:
-        # Lower bound 2: stack=1 means no independent signals fired; nothing
-        # to "lock" against. Upper bound 11 (design-v2 adv-S2): highest
-        # observed stack count over 30d backtest data per
-        # tasks/findings_bl067_backtest_conviction_lock.md Section A.
+        # Lower bound 2: stack=1 means no independent signals fired;
+        # nothing to "lock" against.
+        # Upper bound 50 (PR-review M2 relaxation): operator escape hatch
+        # — previously hard-capped at 11 (highest observed stack 30d),
+        # but operators may want to effectively-disable lock for one
+        # signal_type via threshold > observed-max without flipping the
+        # per-signal flag. Above 11 is unusual; an explicit log noise
+        # would be ideal but field validators can't log cleanly. Above
+        # 50 is almost certainly a typo.
         if v < 2:
             raise ValueError(
                 "PAPER_CONVICTION_LOCK_THRESHOLD must be >= 2 "
                 f"(stack=1 means no independent signals fired); got={v}"
             )
-        if v > 11:
+        if v > 50:
             raise ValueError(
-                "PAPER_CONVICTION_LOCK_THRESHOLD must be <= 11 "
-                f"(stack saturates at 4; observed max=11 over 30d); got={v}"
+                "PAPER_CONVICTION_LOCK_THRESHOLD must be <= 50 "
+                f"(observed max=11 over 30d; values > 50 likely a typo); "
+                f"got={v}"
             )
         return v
 
