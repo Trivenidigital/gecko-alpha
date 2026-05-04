@@ -1,6 +1,25 @@
-# BL-065: Dispatch paper trades from cashtag-only resolutions — Implementation Plan
+# BL-065: Dispatch paper trades from cashtag-only resolutions — Implementation Plan (v2 post-review)
 
-**New primitives introduced:** new column `tg_social_channels.cashtag_trade_eligible INTEGER NOT NULL DEFAULT 0` (added via `_migrate_feedback_loop_schema` extension, gated by `paper_migrations` row); new function `scout/social/telegram/dispatcher.py:dispatch_cashtag_to_engine` (sibling of existing `dispatch_to_engine`, with cashtag-specific gate set); new helpers `_channel_cashtag_trade_eligible`, `_evaluate_cashtag` (cashtag-specific gates); new Settings fields `PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD: float = 300.0` (defaults to same as CA path), `PAPER_TG_SOCIAL_CASHTAG_MIN_MCAP_USD: float = 100_000.0`, `PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO: float = 2.0`; new `BlockedGate` literal values `cashtag_disabled`, `cashtag_below_floor`, `cashtag_ambiguous`; new structured log events `tg_social_cashtag_admission_blocked`, `tg_social_cashtag_trade_dispatched`. No new models — reuses existing `ResolvedToken` (`candidates_top3` is already `list[ResolvedToken]`).
+**New primitives introduced:** new column `tg_social_channels.cashtag_trade_eligible INTEGER NOT NULL DEFAULT 0` (added via `_migrate_feedback_loop_schema` extension, gated by `paper_migrations` row); new function `scout/social/telegram/dispatcher.py:dispatch_cashtag_to_engine` (sibling of existing `dispatch_to_engine`, with cashtag-specific gate set); new helpers `_channel_cashtag_trade_eligible`, `_evaluate_cashtag`, `_channel_cashtag_trades_today_count` (R1#5 v2); new Settings fields `PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD: float = 300.0`, `PAPER_TG_SOCIAL_CASHTAG_MIN_MCAP_USD: float = 100_000.0`, `PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO: float = 2.0`, `PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY: int = 5` (R1#5 v2); new `BlockedGate` literal values `cashtag_disabled`, `cashtag_below_floor`, `cashtag_ambiguous`, `cashtag_no_candidates` (R2#3 v2), `cashtag_channel_rate_limited` (R1#5 v2), `cashtag_dispatch_exception` (R1#2 v2); new structured log events `tg_social_cashtag_admission_blocked`, `tg_social_cashtag_trade_dispatched`, `tg_social_cashtag_dispatch_exception` (R1#2 v2), `tg_social_dlq_write_failed` (R1#1 v2), `tg_social_potential_duplicate_symbol` (R1#6 v2 partial mitigation). No new models — reuses existing `ResolvedToken` (`candidates_top3` is already `list[ResolvedToken]`).
+
+**v2 changes from 2-agent plan-review feedback:**
+- **MUST-FIX R1#1** (DLQ-write listener-death class — same as PR #55): Step 3.3 listener change now uses NESTED try/except with the DLQ write itself guarded; `tg_social_dlq_write_failed` event logged on inner failure so the listener loop survives even when both dispatch AND DLQ-write fail.
+- **MUST-FIX R1#2** (catch-all swallows CancelledError + bugs): explicit `except (asyncio.CancelledError, KeyboardInterrupt, SystemExit): raise` BEFORE the broad `except Exception`. Distinct gate `cashtag_dispatch_exception` + `tg_social_cashtag_dispatch_exception` log event so dashboard/metrics distinguish infrastructure faults from clean engine rejections.
+- **MUST-FIX R1#3** (migration race): operational verification §0a now requires `systemctl stop gecko-pipeline` BEFORE `git pull`, then start AFTER migration verification. Closes the listener-runs-OLD-code-during-migration window.
+- **MUST-FIX R1#4** (top-1 ordering unverified): added `tests/test_tg_social_resolver_ordering.py` regression test pinning the resolver's `candidates_top3` order contract. Without this, future resolver refactor silently picks a different top-1.
+- **SHOULD-FIX R1#5** (no rate cap): added `PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY=5` setting + `cashtag_channel_rate_limited` gate. Counts `paper_trades` rows where `signal_data` carries `channel_handle=X` AND `resolution=cashtag` AND `opened_at` in last 24h. Blast radius cap is per-channel (not global) so one noisy curator doesn't starve all of them.
+- **SHOULD-FIX R1#6** (cross-coin_id dedup gap): added `_check_potential_symbol_duplicate` helper — when opening a cashtag trade, log `tg_social_potential_duplicate_symbol` WARNING if any other open `tg_social` trade has the same SYMBOL but different `token_id`. Operator visibility for the cross-listing case (e.g., `pepe` vs `pepe-bsc`). Full fix (per-symbol dedup option) deferred to BL-065'.
+- **SHOULD-FIX R1#8** (BlockedGate downstream consumers): added Step 0 explicit grep audit + remediation list. Six new literal values must not silently fail dashboard/alerter pattern matches.
+- **SHOULD-FIX R1#10** (`_persist_signal_row` failure): wrapped in nested try/except + log; trade is already opened so we don't re-raise (lifecycle owns it).
+- **SHOULD-FIX R2#1** (lazy import inconsistent): top-of-file import in listener.py alongside existing `dispatch_to_engine`.
+- **SHOULD-FIX R2#2** (`format_candidates_alert` diff): explicit signature + body diff in Step 3.4 including fix for hardcoded "auto-trade disabled" string that becomes wrong post-BL-065.
+- **SHOULD-FIX R2#3** (empty-candidates wrong gate): added `cashtag_no_candidates` to BlockedGate literal; empty branch returns this distinct value (was conflated with `cashtag_disabled`).
+- **NIT R2#4**: cleaned up duplicated `INSERT OR IGNORE` in else-branch of migration.
+
+**Explicitly deferred to BL-065' or follow-up:**
+- **R1#7** Honeypot compensating control beyond R1#5 rate cap: per-channel daily $loss circuit breaker. Captured as BL-065' future work; R1#5 daily-rate-cap is partial mitigation.
+- **R1#6** full cross-coin_id dedup (e.g., `pepe`+`pepe-bsc` deduped as one logical token): R1#6 mitigation here is OBSERVABILITY only (warning log). Full fix needs operator decision on per-symbol vs per-coin_id dedup semantic.
+- **R1#9** disambiguity semantic (mcap-dominance vs operator-intent): documented as v1 tradeoff, externalized via `DISAMBIGUITY_RATIO` setting; revisit after seeing real cashtag dispatch data.
 
 **Goal:** Today, when a curator posts only `$EITHER` (cashtag) without a contract address, the listener at `scout/social/telegram/listener.py:249-276` sends a Telegram alert with top-3 CoinGecko candidates and **returns before** `dispatch_to_engine`. Trade-eligible curators (`@thanos_mind`, `@detecter_calls`) currently posting cashtag-only signals have produced **zero** paper trades despite the listener being healthy. BL-065 extends the cashtag path to dispatch a paper trade when the channel has the new `cashtag_trade_eligible=1` flag set, picks top-1 candidate (subject to floor + disambiguity gates), and reuses `_has_open_tg_social_exposure` for dedup with the CA path.
 
@@ -17,6 +36,35 @@
 - Cashtag dispatch is **inherently no-safety-check** — the cashtag→token_id resolution doesn't yield a CA to check with GoPlus. Operators opt into this risk explicitly per channel by setting `cashtag_trade_eligible=1`. This is documented in the column comment.
 - Trade size defaults to same as CA path ($300) for v1; the operator can tune via the new `PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD` setting if cashtag confidence proves lower in real data.
 - `candidates_top3[0]` selection assumes the resolver returns them in a meaningful order. **Verified** in `scout/social/telegram/resolver.py:292` — order is by CoinGecko search-rank-then-mcap (existing behaviour). Top-1 = "best CoinGecko match for this cashtag." Disambiguity gate (top.mcap >= 2× second.mcap) protects against the "look-alike token at similar mcap" failure mode.
+
+---
+
+## Task 0 — BlockedGate downstream-consumer audit (R1#8 v2)
+
+**Files:** read-only audit of the codebase
+
+**Why:** Adding 6 new literal values to `BlockedGate` could silently miss handling in any consumer that pattern-matches on the existing 7 values (match/case statements, dict lookups, dashboard color maps, alert string formatters).
+
+- [ ] **Step 0.1 — grep BlockedGate consumers**
+
+Run:
+```bash
+cd C:/projects/gecko-alpha && grep -rn "BlockedGate\|blocked_gate" scout/ dashboard/ 2>&1 | grep -v __pycache__
+```
+
+Build a list of files referencing `blocked_gate`. For each:
+- If it's a `match/case` or `if/elif` chain on string values, verify the new gates are handled or fall through to a sane default.
+- If it's a dict lookup with `.get()`, defaults are safe.
+- If it's a dict lookup with `[gate_name]`, the new values will KeyError — must add entries.
+
+- [ ] **Step 0.2 — Document findings + required fixes**
+
+Append findings to this plan as a checklist of files-to-update IF needed. Today, the known consumers are:
+- `scout/social/telegram/alerter.py` — `format_resolved_alert` and `format_candidates_alert` likely format `blocked_gate` into operator-readable text. Update needed.
+- `scout/social/telegram/dispatcher.py` — only the gate values are referenced, no exhaustive match.
+- Dashboard backend/frontend — TBD per audit.
+
+If audit finds NO exhaustive match consumers beyond alerter, this task is essentially a no-op. Otherwise, add explicit handling tasks here.
 
 ---
 
@@ -130,15 +178,9 @@ Edit `scout/db.py`. Find the BL-071a' block (search `bl071a_chain_matches_mcap_a
                         datetime.now(timezone.utc).isoformat(),
                     ),
                 )
-            else:
-                await conn.execute(
-                    "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
-                    "VALUES (?, ?)",
-                    (
-                        "bl065_cashtag_trade_eligible",
-                        datetime.now(timezone.utc).isoformat(),
-                    ),
-                )
+            # else: column already exists from prior run; paper_migrations
+            # row was inserted at that time. Per R2#4 NIT (v2): no need to
+            # re-INSERT on every cold-start. Matches BL-061..BL-064 pattern.
 ```
 
 - [ ] **Step 1.5 — Extend POST-ASSERTION set**
@@ -207,6 +249,7 @@ Edit `scout/config.py`. Find `PAPER_TG_SOCIAL_TRADE_AMOUNT_USD` (existing settin
     PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD: float = 300.0  # default = same as CA path; tune lower if confidence is empirically lower
     PAPER_TG_SOCIAL_CASHTAG_MIN_MCAP_USD: float = 100_000.0  # skip dust candidates
     PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO: float = 2.0  # top.mcap >= 2× second.mcap, else reject as ambiguous
+    PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY: int = 5  # R1#5 v2: per-channel rate cap (cashtag dispatch bypasses GoPlus, so blast radius higher than CA path)
 ```
 
 (Verify the existing `PAPER_TG_SOCIAL_TRADE_AMOUNT_USD` field by grep first — adjust placement to keep logically-grouped settings adjacent.)
@@ -224,10 +267,13 @@ BlockedGate = Literal[
     "dedup_open",
     "tg_social_quota",
     "engine_rejected",
-    # BL-065 cashtag-path gates
+    # BL-065 v2 cashtag-path gates
     "cashtag_disabled",
+    "cashtag_no_candidates",  # R2#3 v2: empty candidates (resolver upstream issue)
     "cashtag_below_floor",
     "cashtag_ambiguous",
+    "cashtag_channel_rate_limited",  # R1#5 v2: per-channel daily cap
+    "cashtag_dispatch_exception",  # R1#2 v2: distinguishable from engine_rejected
 ]
 ```
 
@@ -489,12 +535,14 @@ async def _evaluate_cashtag(
             reason="tg_social_channels.cashtag_trade_eligible=0 (default)",
         )
 
+    # R2#3 v2: empty candidates is a distinct upstream-resolver problem,
+    # NOT a channel configuration issue. Use its own gate name so operators
+    # don't misattribute when filtering tg_social_cashtag_admission_blocked.
     if not candidates:
-        # Defensive — caller should have filtered, but explicit here.
         return AdmissionDecision(
             dispatch_trade=False,
-            blocked_gate="cashtag_disabled",
-            reason="no candidates (caller bug)",
+            blocked_gate="cashtag_no_candidates",
+            reason="resolver returned empty candidates_top3 (upstream issue)",
         )
     top = candidates[0]
 
@@ -531,7 +579,7 @@ async def _evaluate_cashtag(
             reason="another tg_social trade is currently open on this token",
         )
 
-    # Gate E: tg_social slot quota
+    # Gate E: tg_social slot quota (global)
     open_count = await _tg_social_open_count(db)
     if open_count >= settings.TG_SOCIAL_MAX_OPEN_TRADES:
         return AdmissionDecision(
@@ -543,7 +591,47 @@ async def _evaluate_cashtag(
             ),
         )
 
+    # Gate F (R1#5 v2): per-channel daily cashtag-dispatch rate cap.
+    # Cashtag dispatch bypasses GoPlus, so blast radius of one bad/noisy
+    # curator is higher than CA path. Cap is per-channel (not global) so
+    # one noisy curator doesn't starve the others.
+    today_count = await _channel_cashtag_trades_today_count(db, channel_handle)
+    if today_count >= settings.PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY:
+        return AdmissionDecision(
+            dispatch_trade=False,
+            blocked_gate="cashtag_channel_rate_limited",
+            reason=(
+                f"channel {channel_handle} cashtag trades today {today_count} "
+                f">= cap {settings.PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY}"
+            ),
+        )
+
     return AdmissionDecision(dispatch_trade=True)
+
+
+async def _channel_cashtag_trades_today_count(db: Database, channel_handle: str) -> int:
+    """R1#5 v2: count cashtag-resolution paper_trades opened today by channel.
+
+    Counts paper_trades where signal_data carries channel_handle=X AND
+    resolution=cashtag AND opened_at >= today's UTC midnight. Used by
+    Gate F (cashtag_channel_rate_limited).
+
+    JSON1 extension is available in SQLite >=3.38; the json_extract path
+    is the same one BL-064 already uses for signal_data lookups. If the
+    project ever drops JSON1, fall back to LIKE pattern match.
+    """
+    cur = await db._conn.execute(
+        """
+        SELECT COUNT(*) FROM paper_trades
+         WHERE signal_type = 'tg_social'
+           AND json_extract(signal_data, '$.channel_handle') = ?
+           AND json_extract(signal_data, '$.resolution') = 'cashtag'
+           AND opened_at >= datetime('now', 'start of day')
+        """,
+        (channel_handle,),
+    )
+    row = await cur.fetchone()
+    return int(row[0]) if row else 0
 
 
 async def dispatch_cashtag_to_engine(
@@ -717,21 +805,40 @@ async def test_dispatch_cashtag_end_to_end_opens_paper_trade(db, settings_factor
 Run: `SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_bl065_cashtag_dispatch.py::test_dispatch_cashtag_end_to_end_opens_paper_trade -v`
 Expected: PASS.
 
-- [ ] **Step 3.3 — Modify listener cashtag-only branch**
+- [ ] **Step 3.3a — Add module-level import (R2#1 v2)**
+
+Edit `scout/social/telegram/listener.py`. Find the existing `from scout.social.telegram.dispatcher import dispatch_to_engine` line near the top. Add `dispatch_cashtag_to_engine` to the same import:
+
+```python
+from scout.social.telegram.dispatcher import (
+    dispatch_cashtag_to_engine,  # NEW — BL-065
+    dispatch_to_engine,
+)
+```
+
+(Adjust if the existing import is on a single line; the goal is module-level, NOT inline-in-function-body. Project pattern.)
+
+- [ ] **Step 3.3b — Modify listener cashtag-only branch**
 
 Edit `scout/social/telegram/listener.py`. Find the cashtag-only branch (search `# Cashtag-only candidates path`). Replace lines 249-276 with:
 
 ```python
     # Cashtag-only candidates path
     if not result.tokens and result.candidates_top3:
-        # BL-065 (Bundle B 2026-05-04): dispatch top-1 candidate to engine
+        # BL-065 v2 (Bundle B 2026-05-04): dispatch top-1 candidate to engine
         # if channel has cashtag_trade_eligible=1. Otherwise alert-only
-        # (existing behaviour).
-        from scout.social.telegram.dispatcher import dispatch_cashtag_to_engine
-
+        # (existing behaviour). Failure shape per R1#1 + R1#2 v2:
+        # - asyncio.CancelledError / SystemExit / KeyboardInterrupt: re-raise
+        #   (do NOT swallow into engine_rejected — pipeline shutdown signals)
+        # - Other Exception: distinct cashtag_dispatch_exception gate (so
+        #   dashboards don't conflate infrastructure faults with clean
+        #   engine rejections); log + DLQ-write attempted with NESTED guard
+        #   so DLQ-write failure doesn't kill the listener (PR #55 class).
         cashtag_normalized = (
             parsed.cashtags[0] if parsed.cashtags else ""
         )  # already upper, no '$' (per parser contract)
+        paper_trade_id: int | None = None
+        blocked_gate: str | None = None
         try:
             paper_trade_id, blocked_gate = await dispatch_cashtag_to_engine(
                 db=db,
@@ -741,10 +848,34 @@ Edit `scout/social/telegram/listener.py`. Find the cashtag-only branch (search `
                 cashtag=cashtag_normalized,
                 channel_handle=channel_handle,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            # Pipeline shutdown — let it propagate
+            raise
         except Exception as e:
-            await _append_dlq(db, channel_handle, msg_id or 0, text, e)
+            # Log dispatch failure FIRST so error context survives even if
+            # DLQ write also fails (R1#1 v2 — same listener-death class as PR #55).
+            log.exception(
+                "tg_social_cashtag_dispatch_exception",
+                cashtag=cashtag_normalized,
+                channel_handle=channel_handle,
+                error_type=type(e).__name__,
+            )
             paper_trade_id = None
-            blocked_gate = "engine_rejected"
+            blocked_gate = "cashtag_dispatch_exception"  # distinct from engine_rejected
+            # Best-effort DLQ write — must not propagate
+            try:
+                await _append_dlq(db, channel_handle, msg_id or 0, text, e)
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as dlq_err:
+                log.error(
+                    "tg_social_dlq_write_failed",
+                    channel_handle=channel_handle,
+                    msg_id=msg_id,
+                    original_error_type=type(e).__name__,
+                    dlq_error_type=type(dlq_err).__name__,
+                    note="listener loop continues despite DLQ-write failure",
+                )
 
         body = format_candidates_alert(
             channel_handle=channel_handle,
@@ -758,21 +889,42 @@ Edit `scout/social/telegram/listener.py`. Find the cashtag-only branch (search `
             await send_telegram(
                 http_session, telegram_bot_token, telegram_chat_id, body
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
             log.warning("tg_social_alert_send_failed", error=str(e))
+
+        # R1#10 v2: _persist_signal_row failure must NOT propagate or kill
+        # the listener — trade is already opened (if dispatched), lifecycle
+        # owns it. Provenance loss is logged but accepted.
         top = result.candidates_top3[0]
-        await _persist_signal_row(
-            db=db,
-            message_pk=message_pk,
-            token_id=top.token_id,
-            symbol=top.symbol,
-            contract_address=None,
-            chain=None,
-            mcap=top.mcap,
-            resolution_state=result.state.value,
-            channel_handle=channel_handle,
-            paper_trade_id=paper_trade_id,  # NEW — was hard-coded None
-        )
+        try:
+            await _persist_signal_row(
+                db=db,
+                message_pk=message_pk,
+                token_id=top.token_id,
+                symbol=top.symbol,
+                contract_address=None,
+                chain=None,
+                mcap=top.mcap,
+                resolution_state=result.state.value,
+                channel_handle=channel_handle,
+                paper_trade_id=paper_trade_id,  # NEW — was hard-coded None
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            log.error(
+                "tg_social_persist_signal_failed",
+                channel_handle=channel_handle,
+                token_id=top.token_id,
+                paper_trade_id=paper_trade_id,
+                error_type=type(e).__name__,
+                note=(
+                    "trade may have opened without tg_social_signals row "
+                    "linking it back — provenance lost but lifecycle owns trade"
+                ),
+            )
         return
 ```
 
@@ -810,6 +962,221 @@ kwargs (default None — preserves existing alert-only call shape)."
 
 ---
 
+## Task 4 — Resolver ordering regression test (R1#4 v2) + symbol-collision warning (R1#6 v2)
+
+**Files:**
+- Create: `tests/test_tg_social_resolver_ordering.py` — pin the `candidates_top3` order contract
+- Modify: `scout/social/telegram/dispatcher.py` — add `_check_potential_symbol_duplicate` warning after successful dispatch
+
+**Why:** Top-1 selection in BL-065 is foundational. If the resolver order changes silently (refactor, new search algo, CoinGecko API behaviour shift), the disambiguity gate's input becomes wrong without any test failing. R1#4 v2 makes the contract testable. R1#6 v2 provides observability for the cross-coin_id case (e.g., `pepe` vs `pepe-bsc`) without committing to a specific dedup semantic — operators see the WARNING and decide.
+
+- [ ] **Step 4.1 — Write resolver-ordering regression test**
+
+Create `tests/test_tg_social_resolver_ordering.py`:
+
+```python
+"""BL-065 R1#4 v2: pin the candidates_top3 ordering contract.
+
+If a future refactor changes the resolver's ordering (e.g., adds
+liquidity tiebreaker, changes CoinGecko search params), this test
+fails — the disambiguity gate's foundation breaks otherwise.
+"""
+from __future__ import annotations
+
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_resolver_candidates_top3_order_contract():
+    """Build a known input set and assert resolver returns candidates in
+    [search-rank-then-mcap] order (the contract BL-065 _evaluate_cashtag relies
+    on for top-1 selection)."""
+    # Use a stub CoinGecko response with three candidates of identical
+    # search relevance but distinct mcap. Resolver MUST order by mcap desc.
+    from scout.social.telegram.resolver import resolve_message
+    # ... construct stub or mock CG API response, call resolver, assert
+    # candidates_top3[0].mcap > candidates_top3[1].mcap > candidates_top3[2].mcap.
+    # Implementation depends on resolver's testability — use the same
+    # aiohttp + aioresponses pattern as tests/test_tg_social_resolver.py.
+    # If resolver doesn't easily accept a stub, refactor a small seam first.
+    pytest.skip(
+        "Implement against actual resolver test harness during build phase. "
+        "Contract: candidates_top3[i].mcap >= candidates_top3[i+1].mcap. "
+        "If this is the first time you're seeing this skip, write the test "
+        "before merging — silent ordering changes cost real money."
+    )
+```
+
+(Build phase: replace the `pytest.skip` with a real mocked resolver test. If the resolver is hard to stub, refactor a tiny seam first — but the test MUST land in the same PR.)
+
+- [ ] **Step 4.2 — Add symbol-collision warning helper to dispatcher.py**
+
+Edit `scout/social/telegram/dispatcher.py`. Append:
+
+```python
+async def _check_potential_symbol_duplicate(
+    db: Database, token_id: str, symbol: str
+) -> None:
+    """R1#6 v2 partial mitigation for cross-coin_id dedup gap.
+
+    When a cashtag dispatch opens a trade for token_id=X symbol=Y, check
+    if any OTHER currently-open tg_social trade has the same SYMBOL Y but
+    different token_id (e.g., 'pepe' vs 'pepe-bsc' — same memecoin across
+    chains, different CoinGecko coin_ids, dedup-by-token_id misses).
+
+    Logs a WARNING for operator visibility — does NOT block the trade.
+    Full dedup (per-symbol option) deferred to BL-065'.
+    """
+    cur = await db._conn.execute(
+        """
+        SELECT s.token_id, p.id
+          FROM tg_social_signals s
+          JOIN paper_trades p ON s.paper_trade_id = p.id
+         WHERE p.status = 'open'
+           AND p.signal_type = 'tg_social'
+           AND UPPER(s.symbol) = UPPER(?)
+           AND s.token_id != ?
+         LIMIT 5
+        """,
+        (symbol, token_id),
+    )
+    collisions = await cur.fetchall()
+    if collisions:
+        log.warning(
+            "tg_social_potential_duplicate_symbol",
+            new_token_id=token_id,
+            symbol=symbol,
+            colliding_token_ids=[r[0] for r in collisions],
+            colliding_paper_trade_ids=[r[1] for r in collisions],
+            note=(
+                "open tg_social trade(s) exist with same SYMBOL but "
+                "different token_id — possible cross-listing duplicate "
+                "(e.g., pepe vs pepe-bsc). Trade NOT blocked; full per-"
+                "symbol dedup deferred to BL-065'."
+            ),
+        )
+```
+
+Then in `dispatch_cashtag_to_engine`, after the successful `engine.open_trade` returns a `trade_id`:
+
+```python
+    if trade_id is not None:
+        await _check_potential_symbol_duplicate(db, top.token_id, top.symbol)
+        log.info(
+            "tg_social_cashtag_trade_dispatched",
+            ...
+        )
+```
+
+- [ ] **Step 4.3 — Add a test for the symbol-collision warning**
+
+Append to `tests/test_bl065_cashtag_dispatch.py`:
+
+```python
+@pytest.mark.asyncio
+async def test_dispatch_cashtag_logs_symbol_collision(db, settings_factory, monkeypatch):
+    """R1#6 v2: when a cashtag trade opens with symbol matching another
+    open tg_social trade (different token_id), WARNING is logged."""
+    from scout.social.telegram.dispatcher import dispatch_cashtag_to_engine
+    from scout.social.telegram import dispatcher as dispatcher_mod
+
+    captured = []
+    real_warning = dispatcher_mod.log.warning
+
+    def _capture_warning(event, **kwargs):
+        captured.append((event, kwargs))
+        return real_warning(event, **kwargs)
+
+    monkeypatch.setattr(dispatcher_mod.log, "warning", _capture_warning)
+
+    await _seed_channel(db, "@trusted", cashtag=1)
+    # Seed an existing open tg_social trade for symbol "PEPE", token_id="pepe"
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO paper_trades
+           (token_id, symbol, name, chain, signal_type, signal_data,
+            entry_price, amount_usd, quantity, tp_price, sl_price,
+            status, opened_at)
+           VALUES ('pepe','PEPE','Pepe','coingecko','tg_social','{}',
+                   1.0, 300, 300, 1.2, 0.9, 'open', ?)""",
+        (now,),
+    )
+    pt_cur = await db._conn.execute("SELECT last_insert_rowid()")
+    existing_trade_id = (await pt_cur.fetchone())[0]
+    await db._conn.execute(
+        """INSERT INTO tg_social_messages
+           (channel_handle, msg_id, posted_at, sender, text, cashtags,
+            contracts, urls, parsed_at)
+           VALUES ('@trusted', 99, ?, 'tester', 'test', '[]', '[]', '[]', ?)""",
+        (now, now),
+    )
+    msg_cur = await db._conn.execute("SELECT last_insert_rowid()")
+    await db._conn.execute(
+        """INSERT INTO tg_social_signals
+           (message_pk, token_id, symbol, contract_address, chain,
+            mcap_at_sighting, resolution_state, source_channel_handle,
+            paper_trade_id, created_at)
+           VALUES (?, 'pepe', 'PEPE', NULL, NULL, 5000000.0,
+                   'cashtag', '@trusted', ?, ?)""",
+        ((await msg_cur.fetchone())[0], existing_trade_id, now),
+    )
+    await db._conn.commit()
+
+    s = settings_factory(
+        PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD=300.0,
+        PAPER_TG_SOCIAL_CASHTAG_MIN_MCAP_USD=100_000.0,
+        PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO=2.0,
+        PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY=5,
+        TG_SOCIAL_MAX_OPEN_TRADES=20,
+    )
+
+    class _StubEngine:
+        async def open_trade(self, **kwargs):
+            return 99  # fake trade id
+
+    # Now dispatch a NEW cashtag trade for symbol "PEPE" but different
+    # token_id "pepe-bsc" (cross-listing case).
+    paper_trade_id, blocked = await dispatch_cashtag_to_engine(
+        db=db,
+        settings=s,
+        engine=_StubEngine(),
+        candidates=[_candidate("pepe-bsc", "PEPE", 5_000_000)],
+        cashtag="PEPE",
+        channel_handle="@trusted",
+    )
+    assert paper_trade_id == 99  # trade STILL opens (warning, not block)
+
+    collision_warnings = [c for c in captured if c[0] == "tg_social_potential_duplicate_symbol"]
+    assert len(collision_warnings) == 1
+    _, kwargs = collision_warnings[0]
+    assert kwargs["symbol"] == "PEPE"
+    assert kwargs["new_token_id"] == "pepe-bsc"
+    assert "pepe" in kwargs["colliding_token_ids"]
+```
+
+- [ ] **Step 4.4 — Run, expect Step 4.3 test to pass**
+
+Run: `SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_bl065_cashtag_dispatch.py::test_dispatch_cashtag_logs_symbol_collision -v`
+Expected: PASS.
+
+- [ ] **Step 4.5 — Commit**
+
+```bash
+git add scout/social/telegram/dispatcher.py tests/test_tg_social_resolver_ordering.py tests/test_bl065_cashtag_dispatch.py
+git commit -m "feat(BL-065): R1#4 + R1#6 — ordering test + symbol-collision warning
+
+R1#4 v2: tests/test_tg_social_resolver_ordering.py pins the
+candidates_top3 ordering contract. Disambiguity gate's foundation
+becomes a tested invariant, not just a documentation comment.
+
+R1#6 v2: _check_potential_symbol_duplicate logs WARNING when a
+cashtag trade opens with same SYMBOL but different token_id (e.g.,
+'pepe' vs 'pepe-bsc' cross-listing). Operator visibility for the
+gap; trade still opens. Full per-symbol dedup deferred to BL-065'."
+```
+
+---
+
 ## Final integration
 
 - [ ] **Step F.1 — Full chain + heartbeat + telegram regression**
@@ -832,9 +1199,13 @@ git commit -m "style: black formatting"
 
 ## Operational verification post-deploy
 
-After `git pull` + `systemctl restart gecko-pipeline`:
+**R1#3 v2 — DEPLOY ORDER MATTERS.** The previous "git pull → systemctl restart" pattern leaves a window where the listener processes messages with OLD code AFTER the pull but BEFORE the restart, OR concurrent migration runs while listener writes mid-transaction. ALTER TABLE holds a SQLite write lock; concurrent listener writes can fail. Required deploy sequence:
 
-1. **Pre-deploy backup:** `cp /root/gecko-alpha/scout.db /root/gecko-alpha/scout.db.bak.$(date +%s)`
+0. **Pre-deploy backup** (before stopping anything): `cp /root/gecko-alpha/scout.db /root/gecko-alpha/scout.db.bak.$(date +%s)`
+0a. **Stop service FIRST:** `systemctl stop gecko-pipeline` — listener stops processing.
+0b. **Pull:** `cd /root/gecko-alpha && git pull origin master` — code update with no concurrent process.
+0c. **Start service:** `systemctl start gecko-pipeline` — startup runs migration FIRST in `Database.initialize()` before any listener writes happen.
+1. **Pre-deploy backup:** [completed in §0]
 2. **Service started cleanly:** `systemctl status gecko-pipeline` — active+running.
 3. **Migration applied:** `sqlite3 scout.db "SELECT name FROM paper_migrations WHERE name='bl065_cashtag_trade_eligible'"` returns the row.
 4. **Column exists:** `sqlite3 scout.db "PRAGMA table_info(tg_social_channels)"` lists `cashtag_trade_eligible INTEGER`.
