@@ -323,7 +323,10 @@ async def test_hydrator_aggregate_warning_when_no_source(db, monkeypatch):
     )
     await db._conn.commit()
     updated = await update_chain_outcomes(db, session=object())
-    assert updated == 0
+    # Post-PR-review R2#1 (3rd pass): dust rows (mcap=0.0/-1.0) now write
+    # outcome_class='dust_skipped' to exit pending set → counted as updated.
+    # 0 hydrateable + 2 dust_skipped = 2 updates.
+    assert updated == 2
     aggregate = [c for c in captured if c[1] == "chain_outcomes_unhydrateable_memecoin"]
     assert len(aggregate) == 1, (
         f"expected exactly one aggregate warning for unhydrateable rows, got "
@@ -332,11 +335,15 @@ async def test_hydrator_aggregate_warning_when_no_source(db, monkeypatch):
     _, _, kwargs = aggregate[0]
     # Post-BL-071a' v3 semantic: 'unhydrateable' = NULL mcap + no legacy
     # outcomes row. Dust mcap (0.0/-1.0) is a separate concern handled by
-    # the chain_outcome_mcap_below_floor_at_hydrate DEBUG log, NOT counted
-    # as 'unhydrateable'. So this test now expects 3 (the 3 NULL-mcap rows
-    # from the for-loop), not 5.
+    # chain_outcomes_dust_abandoned WARNING (per R2#1 3rd-pass fix), NOT
+    # counted as 'unhydrateable'.
     assert kwargs["total_unhydrateable"] == 3
     assert kwargs["cause"] == "legacy_no_mcap_no_outcomes_row"
+    # The 2 dust rows show up under the dust_abandoned aggregate
+    dust_agg = [c for c in captured if c[1] == "chain_outcomes_dust_abandoned"]
+    assert len(dust_agg) == 1
+    _, _, dust_kwargs = dust_agg[0]
+    assert dust_kwargs["count"] == 2
 
 
 @pytest.mark.asyncio
@@ -1038,5 +1045,222 @@ async def test_hydrator_persistent_failure_error_escalation_rate_limited(
         persistent_2 == []
     ), f"cycle 2 must not re-fire ERROR (no escalation); got {persistent_2}"
 
+    # Cycle 3 (PR-review R3#1): fetcher recovers → row resolves → state cleared
+    # via chain_outcome_ds_persistent_failure_cleared INFO. Ensures the clear
+    # path is exercised; without it, alert state pins forever and the next
+    # genuine stuck cluster never re-fires.
+    captured.clear()
+
+    async def _now_ok(session, contract):
+        return FetchResult(2_000_000.0, FetchStatus.OK)  # +100% vs 1M
+
+    await update_chain_outcomes(db, settings=s, session=object(), mcap_fetcher=_now_ok)
+    cleared = [
+        c for c in captured if c[1] == "chain_outcome_ds_persistent_failure_cleared"
+    ]
+    assert (
+        len(cleared) == 1
+    ), f"cycle 3 expected 1 cleared INFO event; got {len(cleared)}"
+    _, _, kwargs = cleared[0]
+    # PR-review R2#2 (3rd pass) field — pending_count is the SELECT result
+    # at start of the cycle (before resolution). pending_count=1 means
+    # "1 row was in pending and got resolved this cycle" (DS recovered);
+    # pending_count=0 would mean "table was purged BEFORE the cycle"
+    # (the misleading-INFO scenario the field exists to disambiguate).
+    assert kwargs["pending_count"] == 1
+    # Module state cleared
+    assert tracker_module._persistent_failure_alert_state is None
+
     # Cleanup module state
     tracker_module._persistent_failure_alert_state = None
+
+
+@pytest.mark.asyncio
+async def test_hydrator_mixed_cycle_aggregates_use_correct_denominators(
+    db, monkeypatch, settings_factory
+):
+    """PR-review R3#2: cycle with all 4 cause-classes simultaneously.
+    Catches a future bug where someone subtracts rate_limited from the
+    failures numerator (instead of attempts denominator) — passes every
+    isolated test, silently inverts the unhealthy-rate semantic.
+
+    Setup: 1 row resolves OK + 1 NULL-mcap legacy unhydrateable + 2
+    NON-rate-limited failures + 2 rate-limited.
+    Expected:
+    - 1 hydrated
+    - 1 unhydrateable_memecoin (legacy NULL fallback path)
+    - 2 ds_transient_failures (NULL-fdv with non-RATE_LIMITED status)
+    - 2 ds_rate_limited (separate counter)
+    - session_unhealthy fires: failures(2) / non_rate_limited_attempts(3) = 67%
+      (3 attempts = 1 OK + 2 failures; rate_limited rows skip BEFORE attempts++)
+      Wait — re-reading code at L777 `memecoin_ds_rate_limited += 1; continue`
+      vs L763 `memecoin_ds_attempts += 1` higher up. So rate_limited rows
+      DO count toward attempts (incremented before status check), then are
+      excluded from non_rate_limited_attempts (= attempts - rate_limited).
+      So: attempts=5 (1 OK + 2 fail + 2 rl), non_rate_limited=3, fail_rate=2/3=67%.
+    """
+    from scout.chains import tracker as tracker_module
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
+    tracker_module._persistent_failure_alert_state = None
+
+    captured = _capture_chain_logs(monkeypatch)
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+
+    # 1 OK-resolving row
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES ('0xok','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, 1_000_000.0)""",
+        (long_ago, long_ago),
+    )
+    # 1 legacy NULL-mcap row (no outcomes data → unhydrateable)
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES ('0xlegacy','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, NULL)""",
+        (long_ago, long_ago),
+    )
+    # 2 transient-failure rows (populated mcap, fetcher will return TRANSIENT)
+    await db._conn.executemany(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES (?, 'memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, ?)""",
+        [
+            ("0xfail1", long_ago, long_ago, 1_000_000.0),
+            ("0xfail2", long_ago, long_ago, 2_000_000.0),
+        ],
+    )
+    # 2 rate-limited rows
+    await db._conn.executemany(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES (?, 'memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, ?)""",
+        [
+            ("0xrl1", long_ago, long_ago, 1_500_000.0),
+            ("0xrl2", long_ago, long_ago, 2_500_000.0),
+        ],
+    )
+    await db._conn.commit()
+
+    async def _mixed_fetcher(session, contract):
+        if contract == "0xok":
+            return FetchResult(2_000_000.0, FetchStatus.OK)
+        if contract.startswith("0xrl"):
+            return FetchResult(None, FetchStatus.RATE_LIMITED)
+        return FetchResult(None, FetchStatus.TRANSIENT)
+
+    s = settings_factory(
+        CHAIN_OUTCOME_HIT_THRESHOLD_PCT=50.0,
+        CHAIN_TRACKER_UNHEALTHY_FAILURE_RATE=0.5,
+        CHAIN_TRACKER_UNHEALTHY_MIN_ATTEMPTS=3,
+    )
+    updated = await update_chain_outcomes(
+        db, settings=s, session=object(), mcap_fetcher=_mixed_fetcher
+    )
+    assert updated == 1, "only the 0xok row should resolve"
+
+    # Aggregate emissions present and counted correctly
+    by_event = {c[1]: c[2] for c in captured if c[0] in ("WARNING", "ERROR", "INFO")}
+
+    # 1 unhydrateable from legacy NULL path
+    assert "chain_outcomes_unhydrateable_memecoin" in by_event
+    assert by_event["chain_outcomes_unhydrateable_memecoin"]["total_unhydrateable"] == 1
+
+    # 2 transient (non-rate-limited) failures
+    assert "chain_outcomes_ds_transient_failures" in by_event
+    assert by_event["chain_outcomes_ds_transient_failures"]["count"] == 2
+
+    # 2 rate-limited (separate counter)
+    assert "chain_outcomes_ds_rate_limited" in by_event
+    assert by_event["chain_outcomes_ds_rate_limited"]["count"] == 2
+
+    # Session-health: 2 fail / 3 non-rate-limited = 67% > 50% → ERROR fires.
+    # If a future change subtracted rate_limited from failures (wrong place),
+    # numerator would be 2-2=0 → 0% failure rate → no ERROR → silent inversion.
+    assert "chain_tracker_session_unhealthy" in by_event
+    assert by_event["chain_tracker_session_unhealthy"]["attempts"] == 3
+    assert by_event["chain_tracker_session_unhealthy"]["failures"] == 2
+    # 2/3 ≈ 66.67%, threshold_pct=50.0
+    assert by_event["chain_tracker_session_unhealthy"][
+        "failure_rate_pct"
+    ] == pytest.approx(66.7, rel=0.01)
+
+    tracker_module._persistent_failure_alert_state = None
+
+
+@pytest.mark.asyncio
+async def test_hydrator_dust_abandoned_writes_sentinel_outcome_class(
+    db, monkeypatch, settings_factory
+):
+    """PR-review R2#1 (3rd pass): hydrator's mcap<floor branch must write
+    outcome_class='dust_skipped' so the row exits the pending set.
+    Without this, the row re-enters the SELECT every LEARN cycle forever
+    (silent unbounded re-scan, exact pattern Bundle A R2 flagged)."""
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
+    captured = _capture_chain_logs(monkeypatch)
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    # mcap_at_completion=0.5 — below default floor of 1000.0.
+    # Could come from manual SQL INSERT or pre-floor history (defensive case).
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES ('0xdust','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, 0.5)""",
+        (long_ago, long_ago),
+    )
+    await db._conn.commit()
+
+    async def _stub_fetcher(session, contract):
+        # Should NOT be called — defense-in-depth catches dust before fetch
+        raise AssertionError(f"fetcher called for dust row: {contract}")
+
+    s = settings_factory(
+        CHAIN_OUTCOME_HIT_THRESHOLD_PCT=50.0,
+        CHAIN_OUTCOME_MIN_MCAP_USD=1000.0,
+    )
+    updated = await update_chain_outcomes(
+        db, settings=s, session=object(), mcap_fetcher=_stub_fetcher
+    )
+    assert updated == 1, "dust-abandoned row counts as updated (sentinel write)"
+
+    cur = await db._conn.execute(
+        "SELECT outcome_class, outcome_change_pct FROM chain_matches WHERE token_id='0xdust'"
+    )
+    row = await cur.fetchone()
+    assert (
+        row[0] == "dust_skipped"
+    ), f"expected sentinel 'dust_skipped' to exit pending set, got {row[0]!r}"
+    assert row[1] is None  # no meaningful pct change for dust
+
+    # Aggregate WARNING fires for visibility
+    aggregate = [c for c in captured if c[1] == "chain_outcomes_dust_abandoned"]
+    assert (
+        len(aggregate) == 1
+    ), f"expected 1 chain_outcomes_dust_abandoned WARNING; got {len(aggregate)}"
+    _, _, kwargs = aggregate[0]
+    assert kwargs["count"] == 1
+    assert kwargs["cause"] == "mcap_at_completion_below_floor"
+
+    # Re-run hydrator: the dust row is now resolved, must NOT be re-scanned
+    # (this is what the sentinel write protects against — silent re-scan
+    # antipattern).
+    captured.clear()
+    await update_chain_outcomes(
+        db, settings=s, session=object(), mcap_fetcher=_stub_fetcher
+    )
+    aggregate_2 = [c for c in captured if c[1] == "chain_outcomes_dust_abandoned"]
+    assert aggregate_2 == [], (
+        "dust row must not re-enter pending set on next cycle; "
+        "second WARNING means silent re-scan returned"
+    )

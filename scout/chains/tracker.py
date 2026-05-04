@@ -731,6 +731,7 @@ async def _update_chain_outcomes_inner(
     memecoin_ds_failures = 0
     memecoin_ds_attempts = 0
     memecoin_ds_rate_limited = 0
+    memecoin_dust_abandoned = 0  # PR-review R2#1 (3rd pass): rows with mcap<floor written as 'dust_skipped' to exit pending set
     persistent_stuck_count = 0
     oldest_persistent_age_hours = 0.0
 
@@ -817,7 +818,12 @@ async def _update_chain_outcomes_inner(
                 )
             elif mcap_at_completion is not None and mcap_at_completion < min_mcap:
                 # Defense-in-depth: dust mcap row (writer floor failed or
-                # row predates BL-071a'). Skip with debug log.
+                # row predates BL-071a'). PR-review R2#1 (3rd pass) fix:
+                # write outcome_class='dust_skipped' so the row EXITS the
+                # pending set — without this, the row re-enters the SELECT
+                # every LEARN cycle forever (silent unbounded re-scan,
+                # exact pattern Bundle A R2 flagged as antipattern).
+                memecoin_dust_abandoned += 1
                 logger.debug(
                     "chain_outcome_mcap_below_floor_at_hydrate",
                     match_id=match_id,
@@ -825,7 +831,10 @@ async def _update_chain_outcomes_inner(
                     mcap_at_completion=mcap_at_completion,
                     floor=min_mcap,
                 )
-                continue
+                outcome = (
+                    "dust_skipped"  # sentinel — patterns.py:263 tolerates non-hit/miss
+                )
+                outcome_change_pct = None  # no meaningful pct change for dust
             else:
                 # mcap_at_completion is NULL — fall back to legacy outcomes
                 async with conn.execute(
@@ -887,6 +896,22 @@ async def _update_chain_outcomes_inner(
                 "cycle; consider widening CHAIN_CHECK_INTERVAL_SEC if persistent."
             ),
         )
+    # PR-review R2#1 (3rd pass): visibility for dust-mcap rows that the
+    # hydrator wrote off as 'dust_skipped'. Operators see growth and can
+    # investigate whether the writer's floor is being bypassed.
+    if memecoin_dust_abandoned:
+        logger.warning(
+            "chain_outcomes_dust_abandoned",
+            count=memecoin_dust_abandoned,
+            cause="mcap_at_completion_below_floor",
+            note=(
+                "Memecoin chain_matches with mcap_at_completion < "
+                "CHAIN_OUTCOME_MIN_MCAP_USD floor were marked outcome_class="
+                "'dust_skipped' to exit the pending set. If count is non-zero, "
+                "investigate whether the writer's floor was bypassed (manual "
+                "INSERT? row from before BL-071a' shipped?)."
+            ),
+        )
     # R1-1 + R1-S3: aging-aware ERROR with escalation rate-limiting
     if persistent_stuck_count:
         prev_state = _persistent_failure_alert_state
@@ -914,10 +939,20 @@ async def _update_chain_outcomes_inner(
                 "oldest_age": oldest_persistent_age_hours,
             }
     elif _persistent_failure_alert_state is not None:
-        # Backlog cleared — reset alert state so next stuck-cluster fires
+        # Backlog cleared — reset alert state so next stuck-cluster fires.
+        # PR-review R2#2 (3rd pass) fix: include current pending_count so
+        # SRE can distinguish "DS recovered (rows actually resolved)" from
+        # "table emptied (manual purge / pending=0 because rows gone)".
         logger.info(
             "chain_outcome_ds_persistent_failure_cleared",
             previous_count=_persistent_failure_alert_state["count"],
+            pending_count=len(pending),
+            note=(
+                "Backlog cleared. If pending_count > 0 then DS recovered "
+                "naturally (rows being resolved). If pending_count == 0 "
+                "then either all rows resolved this cycle OR table was "
+                "manually purged."
+            ),
         )
         _persistent_failure_alert_state = None
 
