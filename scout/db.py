@@ -188,6 +188,45 @@ class Database:
             )
         return "", ""
 
+    async def coin_id_resolves(self, coin_id: str | None) -> bool:
+        """narrative_prediction-fix: explicit token_id existence probe.
+
+        Returns True iff coin_id appears in any of the canonical sources
+        (price_cache + 3 snapshot tables). Replaces the fragile truthiness
+        probe on `lookup_symbol_name_by_coin_id` (which returns ("", "")
+        on miss; future evolution to default-fill placeholders would
+        silently invert the gate's semantics — arch-A2 fix).
+
+        Empty / whitespace coin_id → False (defensive; matches
+        _is_tradeable_candidate shape).
+
+        Raises `RuntimeError` on `aiosqlite.OperationalError` so the
+        caller can fail-CLOSED. Caller controls whether infra exception
+        triggers reject + telemetry or accept-with-degraded-confidence.
+        """
+        if not coin_id or not coin_id.strip():
+            return False
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        for table in (
+            "price_cache",
+            "gainers_snapshots",
+            "volume_history_cg",
+            "volume_spikes",
+        ):
+            try:
+                cur = await self._conn.execute(
+                    f"SELECT 1 FROM {table} WHERE coin_id = ? LIMIT 1",
+                    (coin_id,),
+                )
+                if (await cur.fetchone()) is not None:
+                    return True
+            except aiosqlite.OperationalError as exc:
+                raise RuntimeError(
+                    f"coin_id_resolves OperationalError on {table}: {exc}"
+                ) from exc
+        return False
+
     # ------------------------------------------------------------------
     # Schema
     # ------------------------------------------------------------------
