@@ -450,3 +450,59 @@ def test_bl063_moonshot_rejects_trail_narrower_than_ladder():
             PAPER_LADDER_TRAIL_PCT=25.0,
             PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT=20.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# BL-064 channel-reload — validator (PR #73 PR-review HV-1)
+# ---------------------------------------------------------------------------
+
+
+def test_channel_reload_interval_allows_zero_as_explicit_disable():
+    """PR-review HV-1: validator accepts 0 as the explicit opt-out
+    (was rejected by `if v < 60` in the original validator before the
+    BL-064 reload PR amended it to `if v != 0 and v < 60`)."""
+    from scout.config import Settings
+
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC=0,
+    )
+    assert s.TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC == 0
+
+
+def test_channel_reload_interval_rejects_below_60_and_nonzero():
+    """PR-review HV-1: anti-thrash guard — 1-59 still rejected so an
+    operator can't accidentally hot-loop the DB."""
+    from pydantic import ValidationError
+    from scout.config import Settings
+
+    for bad_value in (1, 30, 59, -5):
+        with pytest.raises(
+            ValidationError,
+            match="must be >= 60",
+        ):
+            Settings(
+                _env_file=None,
+                TELEGRAM_BOT_TOKEN="t",
+                TELEGRAM_CHAT_ID="c",
+                ANTHROPIC_API_KEY="k",
+                TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC=bad_value,
+            )
+
+
+def test_channel_reload_interval_accepts_60_and_above():
+    """PR-review HV-1: 60+ accepted; default 300 accepted."""
+    from scout.config import Settings
+
+    for good_value in (60, 300, 3600):
+        s = Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC=good_value,
+        )
+        assert s.TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC == good_value
