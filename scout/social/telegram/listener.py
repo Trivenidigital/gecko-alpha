@@ -1204,11 +1204,17 @@ async def _run_listener_body(
     # terminal state.
     silence_task = asyncio.create_task(_silence_heartbeat())
     _track_task(silence_task)
-    reload_task = asyncio.create_task(reload_heartbeat())
-    _track_task(reload_task)
     success = False
+    reload_task: asyncio.Task | None = None
     try:
+        # PR-review CR-1 (silent-failure): bind the initial handler BEFORE
+        # spawning the reload heartbeat. Otherwise the heartbeat could
+        # tick (after sleep) and call `client.remove_event_handler(_on_new)`
+        # against a handler Telethon hasn't registered yet, leaving the
+        # listener silently handler-less.
         client.on(events.NewMessage(chats=channels))(_on_new)
+        reload_task = asyncio.create_task(reload_heartbeat())
+        _track_task(reload_task)
         await client.run_until_disconnected()
         success = True
     finally:
@@ -1217,7 +1223,8 @@ async def _run_listener_body(
                 db, "stopped", detail="run_until_disconnected returned"
             )
         silence_task.cancel()
-        reload_task.cancel()
+        if reload_task is not None:
+            reload_task.cancel()
 
 
 async def _channel_reload_once(
@@ -1254,25 +1261,37 @@ async def _channel_reload_once(
         return in_memory
     added = sorted(set(latest) - set(in_memory))
     removed = sorted(set(in_memory) - set(latest))
-    # Atomic swap with rollback (arch-S2).
+    # Atomic swap with rollback (arch-S2 + PR-review HI-1/HI-2).
     client.remove_event_handler(on_new_handler)
     try:
         client.on(events.NewMessage(chats=latest))(on_new_handler)
     except Exception as exc:
-        # Re-attach OLD handler so listener doesn't go silent.
-        try:
-            client.on(events.NewMessage(chats=in_memory))(on_new_handler)
-        except Exception:
-            # If even rollback fails, listener is genuinely broken;
-            # let the outer heartbeat handler land it in the error log.
-            pass
+        # PR-review HI-2: include added/removed/latest so operator can
+        # identify the offending handle without DB cross-reference.
         log.warning(
             "tg_social_channel_reload_swap_failed",
             error_type=type(exc).__name__,
             error=str(exc),
+            added=added,
+            removed=removed,
+            latest=latest[:50],  # truncated guard
             in_memory_count=len(in_memory),
             latest_count=len(latest),
         )
+        # Re-attach OLD handler so listener doesn't go silent. If THIS
+        # also fails, log explicitly with handler_state=DETACHED so the
+        # operator knows the listener is genuinely broken — PR-review
+        # HI-1 (was nested `except Exception: pass` silent failure).
+        try:
+            client.on(events.NewMessage(chats=in_memory))(on_new_handler)
+        except Exception as rollback_exc:
+            log.error(
+                "tg_social_channel_reload_rollback_failed",
+                listener_handler_state="DETACHED",
+                original_error=str(exc),
+                rollback_error_type=type(rollback_exc).__name__,
+                rollback_error=str(rollback_exc),
+            )
         raise
     log.info(
         "tg_social_channel_list_reloaded",
@@ -1309,6 +1328,9 @@ def _make_channel_reload_heartbeat(
 
     async def _heartbeat():
         if settings.TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC == 0:
+            # PR-review ME-2: re-emit the disable log every hour so it
+            # remains visible in any reasonable journalctl window. Single
+            # boot-time log was easy to miss on long-running VPS.
             log.info(
                 "tg_social_channel_reload_disabled",
                 hint=(
@@ -1316,7 +1338,15 @@ def _make_channel_reload_heartbeat(
                     "additions require pipeline restart"
                 ),
             )
-            return
+            while True:
+                try:
+                    await asyncio.sleep(3600)  # 1h re-log cadence
+                    log.info(
+                        "tg_social_channel_reload_disabled",
+                        hint="reload still disabled (interval=0)",
+                    )
+                except asyncio.CancelledError:
+                    raise
         while True:
             try:
                 await asyncio.sleep(
@@ -1329,6 +1359,14 @@ def _make_channel_reload_heartbeat(
                     on_new_handler,
                 )
             except asyncio.CancelledError:
+                raise
+            except AuthKeyError:
+                # PR-review HI-3: let auth-class exceptions propagate so
+                # the listener crash-watchdog stamps `auth_lost` instead
+                # of the heartbeat silently retrying. AuthKeyError is the
+                # base class in Telethon's hierarchy; subclasses like
+                # AuthKeyUnregistered inherit. Same pattern as _on_new at
+                # listener.py:1155.
                 raise
             except Exception:
                 log.exception("tg_social_channel_reload_error")

@@ -7,6 +7,23 @@ TelegramClient — does NOT exercise real network I/O.
 Tests gated by SKIP_AIOHTTP_TESTS=1 on Windows because the listener
 module imports aiohttp + alerter (transitive scout.alerter chain triggers
 Windows OpenSSL DLL conflict). Full suite runs on VPS Linux.
+
+DEFERRED FAILURE MODES (PR-review HV-2 acknowledgement):
+- F2 (race during atomic swap): not pinned. Plan v2 claims atomicity
+  rests on no-await-between-calls; testing this would require pinning
+  asyncio scheduler internals + Telethon update-queue behavior, which
+  tests asyncio not our code. Justification: the swap is two synchronous
+  calls (`client.remove_event_handler` + `client.on(...)`); a future
+  refactor that introduces an `await` between them is a code-review
+  concern, not a unit-test concern.
+- F5 (task-death from uncaught exception): not pinned at the
+  _run_listener_body lifecycle level. The reload_task.cancel() in
+  finally mirrors the existing _silence_heartbeat pattern (also not
+  unit-tested at lifecycle level — pre-existing gap, not introduced
+  here).
+- F7 (crash-watchdog race): not pinned. Multi-task choreography testing
+  doesn't earn its complexity; behavior verified during VPS deploy
+  smoke tests.
 """
 from __future__ import annotations
 

@@ -55,6 +55,14 @@ async def _channel_safety_required(db: Database, channel_handle: str) -> bool:
     Lenient channels still get the safety check run; only the
     no-record/timeout/5xx path is permitted to pass through. Honeypot
     or high-tax verdicts ALWAYS block, regardless of this flag.
+
+    BL-064 channel-reload coordination — DO NOT add an in-memory cache
+    here without coordinating with `_channel_reload_heartbeat` in
+    `listener.py`. The reload heartbeat ONLY diffs `channel_handle` rows;
+    if this function caches `safety_required` values, operator updates
+    via SQL would silently not take effect (F1 in plan-doc was
+    explicitly removed because the per-message DB read is the source
+    of truth — caching here re-introduces F1).
     """
     cur = await db._conn.execute(
         "SELECT safety_required FROM tg_social_channels "
