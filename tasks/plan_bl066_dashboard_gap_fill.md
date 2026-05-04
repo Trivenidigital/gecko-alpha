@@ -23,6 +23,22 @@
 - **NIT N3** (acc5aaa — FastAPI Query bounds): `limit: int = Query(20, ge=1, le=100)` for the DLQ endpoint (matches existing handler idiom in api.py).
 - **NIT N2** (acc5aaa): added Prerequisites line above.
 
+**v3 changes from 2-agent design-review feedback:**
+- **MUST-FIX M2/A2** (BOTH — T9 contract test theatrical): T9 redesigned as RUNTIME assertion (Task 4 Step 6) — invokes `dispatch_cashtag_to_engine` against captured engine, inspects persisted `paper_trades.signal_data` dict directly. Pins behavior, not source text.
+- **MUST-FIX A1** (a702f1f — F2 has no test): added T9b SQL-literal grep for `'start of day'` in dispatcher's `_channel_cashtag_trades_today_count` (Task 4 Step 7). Mitigates date-math drift between dispatcher and dashboard.
+- **MUST-FIX D6/S4** (BOTH — rollback file-independence claim wrong): design's rollback section corrected to acknowledge TGAlertsTab.jsx is shared across Tasks 5+6; cleaner partial-rollback is at API layer (Task 4 or 2) with frontend graceful-degrade via `??` defaults.
+- **SHOULD-FIX D5/D1** (a702f1f — promote T11): T11 moved from deferred-skip to active test (Task 4 Step 8). Defensive try/except for missing `cashtag_trade_eligible` column actually mitigates F19 startup race; without test it's untested cargo.
+- **SHOULD-FIX S1** (a25704a — F17 table-missing): added defensive `try/except aiosqlite.OperationalError` in `get_tg_social_dlq` for rolled-back-DB scenario (mirrors S2 column-missing pattern).
+- **SHOULD-FIX D3** (a702f1f — F3 reclass): F3 in design failure-modes table now correctly labelled "Loud (HTTP 500) but unmonitored" with rationale.
+- **SHOULD-FIX D4** (a702f1f — Pydantic cost): design Performance section quantifies ~5ms cold-path Settings init × 30 fields; explains why module-level singleton is self-justifying.
+- **SHOULD-FIX D5/F18** (a702f1f — auth posture): F18 added to design — dashboard exposes DLQ raw_text (truncated) on public VPS; same posture as existing `text_preview` field.
+- **SHOULD-FIX D5/F19** (a702f1f — migration race): F19 added to design — startup race mitigated by S2 defensive try/except (now tested via T11).
+- **SHOULD-FIX S3** (a25704a — Windows test pattern): F8 in design augmented with explicit "test must commit+close before reader" guidance.
+- **NIT N1** (a25704a — silent count): F4 reclassified silent (`??` defaults render dashes); silent count is 10 not 9.
+- **NIT N2** (a25704a — env_file path): documented in design Performance section (env_file is relative; depends on systemd WorkingDirectory).
+- **NIT N3** (a25704a — dist/ git-status): noted in §5 step 8 as operator check.
+- **DELIBERATE COUNTER-DECISION D2** (a702f1f — shared-contract module): NOT applied. ROI requires third consumer of BL-065 signal_data; deferred as `BL-066''-contract-module`.
+
 ## Hermes-first analysis
 
 **Domains checked against the 671-skill hub at `hermes-agent.nousresearch.com/docs/skills` (verified 2026-05-04):**
@@ -178,17 +194,27 @@ async def get_tg_social_dlq(db_path: str, limit: int = 20) -> list[dict]:
     raw_text is truncated to 240 chars (mirrors text_preview convention
     in get_tg_social_alerts handler) so the response stays under the
     payload budget — full text accessible by SSH if needed.
+
+    Defensive (S1 — F17 mitigation): if the dashboard is pointed at a
+    pre-BL-064 DB snapshot (rollback scenario), tg_social_dlq won't exist
+    and the SELECT 500s. Mirror the cashtag_trade_eligible column-missing
+    pattern: catch OperationalError mentioning the table, return [].
     """
     async with _ro_db(db_path) as conn:
-        cur = await conn.execute(
-            "SELECT id, channel_handle, msg_id, raw_text, "
-            "error_class, error_text, failed_at, retried_at "
-            "FROM tg_social_dlq "
-            "ORDER BY failed_at DESC "
-            "LIMIT ?",
-            (max(1, min(limit, 100)),),
-        )
-        rows = await cur.fetchall()
+        try:
+            cur = await conn.execute(
+                "SELECT id, channel_handle, msg_id, raw_text, "
+                "error_class, error_text, failed_at, retried_at "
+                "FROM tg_social_dlq "
+                "ORDER BY failed_at DESC "
+                "LIMIT ?",
+                (max(1, min(limit, 100)),),
+            )
+            rows = await cur.fetchall()
+        except aiosqlite.OperationalError as e:
+            if "tg_social_dlq" in str(e):
+                return []
+            raise
         return [
             {
                 "id": r[0],
@@ -778,40 +804,196 @@ async def test_endpoint_tg_social_alerts_existing_keys_preserved(tmp_path):
 
 Run: `SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_dashboard_tg_social_extensions.py::test_endpoint_tg_social_alerts_existing_keys_preserved -v` — Expected: PASS
 
-- [ ] **Step 6: Add contract test pinning BL-065 signal_data shape (D5)**
+- [ ] **Step 6: Add T9 runtime contract test pinning BL-065 signal_data shape (M2/A2 — load-bearing)**
 
-The dashboard hard-codes `json_extract(signal_data, '$.resolution')` and `'$.channel_handle'`. If BL-065's dispatcher ever renames those keys (`resolution` → `resolution_kind`), the dashboard silently shows zeros — no test fails. This contract test pins the producer/consumer coupling in one spot:
+The dashboard hard-codes `json_extract(signal_data, '$.resolution')` and `'$.channel_handle'`. The original v2 source-grep test was theatrical — would pass if a future BL-065 refactor moved the literal into a constant or built the dict programmatically while runtime behavior was unchanged, AND would fail spuriously on cosmetic source moves. Replace with a **runtime assertion** that calls the dispatcher path and inspects the actually-written `paper_trades.signal_data`:
 
 ```python
 @pytest.mark.asyncio
-async def test_contract_bl065_signal_data_shape_includes_resolution_and_channel(tmp_path):
-    """BL-066' depends on BL-065's signal_data shape. If BL-065 renames keys,
-    THIS test fails loudly — without it, the dashboard would silently report
-    0 cashtag dispatches and the operator would never know the contract drifted."""
-    import inspect
-    from scout.social.telegram import dispatcher as bl065_dispatcher
-    src = inspect.getsource(bl065_dispatcher)
-    # The dispatcher writes signal_data inside dispatch_cashtag_to_engine.
-    # We assert the literal JSON-key names this dashboard reads via json_extract.
-    assert '"resolution": "cashtag"' in src or "'resolution': 'cashtag'" in src, (
-        "BL-065 dispatcher no longer writes 'resolution'='cashtag' literal — "
-        "dashboard's json_extract($.resolution) will silently return 0. "
-        "Update both dashboard/db.py:get_tg_social_per_channel_cashtag_today "
-        "AND dashboard/db.py:get_tg_social_cashtag_stats_24h."
+async def test_contract_bl065_dispatch_writes_resolution_and_channel_handle(
+    tmp_path, monkeypatch
+):
+    """LOAD-BEARING contract test (T9). Invokes dispatch_cashtag_to_engine
+    against the real Database/engine path, then inspects the persisted
+    paper_trades.signal_data. If BL-065 ever changes the JSON-key names
+    this dashboard reads via json_extract, this test fails fast with a
+    diagnostic message naming the dashboard helpers that need updating."""
+    import json
+    from scout.db import Database
+    from scout.config import Settings
+    from scout.trading.engine import TradingEngine
+    from scout.social.telegram.dispatcher import dispatch_cashtag_to_engine
+    from scout.social.telegram.models import ResolvedToken, ResolutionResult, ResolutionState
+
+    db_path = str(tmp_path / "contract.db")
+    sd = Database(db_path)
+    await sd.initialize()
+    # Seed channel as cashtag-eligible so dispatch isn't gated.
+    now = datetime.now(timezone.utc).isoformat()
+    await sd._conn.execute(
+        "INSERT INTO tg_social_channels (channel_handle, display_name, "
+        "trade_eligible, safety_required, cashtag_trade_eligible, added_at) "
+        "VALUES ('@contract', 'Contract', 1, 0, 1, ?)",
+        (now,),
     )
-    assert '"channel_handle"' in src or "'channel_handle'" in src, (
-        "BL-065 dispatcher no longer includes 'channel_handle' in signal_data — "
-        "dashboard per-channel rollup will return empty dict."
+    # Seed a price so engine.open_trade resolves entry price.
+    await sd._conn.execute(
+        "INSERT OR REPLACE INTO price_cache (coin_id, price_usd, market_cap_usd, "
+        "fetched_at) VALUES ('contract-coin', 0.001, 200000, ?)",
+        (now,),
+    )
+    await sd._conn.commit()
+
+    settings = Settings()
+    engine = TradingEngine(sd, settings)
+    candidate = ResolvedToken(
+        token_id="contract-coin",
+        symbol="CONTRACT",
+        chain=None,
+        contract_address=None,
+        mcap=200_000.0,
+        price_usd=0.001,
+        safety_pass=False,
+        safety_check_completed=False,
+        safety_skipped_no_ca=True,
+    )
+    result = ResolutionResult(
+        state=ResolutionState.RESOLVED_CASHTAG,
+        resolved=candidate,
+        candidates_top3=[candidate],
+        cashtags=["CONTRACT"],
+        contracts=[],
+    )
+
+    outcome = await dispatch_cashtag_to_engine(
+        db=sd, engine=engine, settings=settings,
+        channel_handle="@contract", parsed=None,
+        resolution=result,
+    )
+    # outcome may be (trade_id, blocked_gate) — either way the dispatch
+    # attempt should have written exactly one paper_trades row IF not blocked.
+    cur = await sd._conn.execute(
+        "SELECT signal_data FROM paper_trades WHERE signal_type='tg_social' "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    row = await cur.fetchone()
+    assert row is not None, (
+        f"dispatch_cashtag_to_engine did not write paper_trades row; "
+        f"outcome={outcome}. Check engine.open_trade gating."
+    )
+    sd_dict = json.loads(row[0])
+    assert sd_dict.get("resolution") == "cashtag", (
+        f"BL-065 dispatcher no longer writes resolution='cashtag' "
+        f"(got {sd_dict.get('resolution')!r}). Dashboard's "
+        f"dashboard/db.py:get_tg_social_per_channel_cashtag_today AND "
+        f"get_tg_social_cashtag_stats_24h queries depend on this exact key."
+    )
+    assert "channel_handle" in sd_dict, (
+        f"BL-065 dispatcher no longer includes channel_handle in signal_data "
+        f"(keys: {sorted(sd_dict.keys())}). Dashboard's per-channel rollup "
+        f"json_extract($.channel_handle) will return NULL → empty dict."
+    )
+    await sd.close()
+```
+
+Run: `SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_dashboard_tg_social_extensions.py::test_contract_bl065_dispatch_writes_resolution_and_channel_handle -v` — Expected: PASS (pins runtime contract; fails loudly if BL-065 producer drifts).
+
+- [ ] **Step 7: Add T9b SQL-literal contract test for F2 mitigation**
+
+```python
+def test_contract_dispatcher_today_count_uses_start_of_day_semantics():
+    """T9b — pins F2 mitigation. Dashboard MUST use identical date math
+    as the dispatcher's gate. If dispatcher refactors to '-24 hours' or
+    similar, dashboard cap badge would diverge from gate decision near
+    midnight UTC. Same shape as T9 source-grep belt-and-suspenders."""
+    import inspect
+    from scout.social.telegram.dispatcher import _channel_cashtag_trades_today_count
+    src = inspect.getsource(_channel_cashtag_trades_today_count)
+    assert "'start of day'" in src or '"start of day"' in src, (
+        "BL-065 dispatcher's _channel_cashtag_trades_today_count no longer "
+        "uses 'start of day' SQL literal — dashboard's "
+        "dashboard/db.py:get_tg_social_per_channel_cashtag_today MUST be "
+        "updated to match the new date-math semantics, otherwise the "
+        "cap badge will diverge from the dispatcher's actual gate decision."
     )
 ```
 
-Run: `SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_dashboard_tg_social_extensions.py::test_contract_bl065_signal_data_shape_includes_resolution_and_channel -v` — Expected: PASS (verifies current shape, fails fast if BL-065 dispatcher is refactored).
+Run: `SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_dashboard_tg_social_extensions.py::test_contract_dispatcher_today_count_uses_start_of_day_semantics -v` — Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Add T11 active test for F19 migration-race + F5 rollback (was deferred in v2 — promoted in v3)**
+
+The defensive `try/except aiosqlite.OperationalError` in Task 4 Step 3(a) is meant to mitigate F19 (dashboard wins startup race against pipeline migrating `cashtag_trade_eligible`) and F5 (DB rolled back to pre-BL-065). Without a test, the defensive code is untested cargo. Two-line synthetic DB:
+
+```python
+@pytest.mark.asyncio
+async def test_endpoint_tg_social_alerts_falls_back_when_cashtag_column_missing(tmp_path):
+    """T11 — pins F19/F5. Synthesize a pre-BL-065 tg_social_channels schema
+    (no cashtag_trade_eligible column); endpoint must NOT 500."""
+    db_path = str(tmp_path / "old.db")
+    # Build an old-shape DB by hand (do NOT run Database.initialize() which
+    # would add the BL-065 column).
+    async with aiosqlite.connect(db_path) as conn:
+        # Mirror the pre-BL-065 schema for tg_social_channels and the
+        # other tables the endpoint touches (tg_social_health, _messages,
+        # _signals, _dlq, paper_trades). Minimum subset for the endpoint
+        # to read without 500ing.
+        await conn.execute(
+            "CREATE TABLE tg_social_channels ("
+            "  channel_handle TEXT PRIMARY KEY, trade_eligible INTEGER, "
+            "  safety_required INTEGER, removed_at TEXT, added_at TEXT, "
+            "  display_name TEXT)"
+        )
+        await conn.execute(
+            "INSERT INTO tg_social_channels VALUES "
+            "('@old', 1, 1, NULL, '2026-01-01T00:00:00+00:00', 'Old')"
+        )
+        # Other tables need to exist (even if empty) so the composite
+        # endpoint's subqueries don't 500. The endpoint reads:
+        # tg_social_health, tg_social_messages, tg_social_signals,
+        # tg_social_dlq, paper_trades.
+        for ddl in (
+            "CREATE TABLE tg_social_health (component TEXT, listener_state TEXT, "
+            "  last_message_at TEXT, updated_at TEXT)",
+            "CREATE TABLE tg_social_messages (id INTEGER PRIMARY KEY, "
+            "  channel_handle TEXT, msg_id INTEGER, posted_at TEXT, sender TEXT, "
+            "  text TEXT, cashtags TEXT, contracts TEXT)",
+            "CREATE TABLE tg_social_signals (id INTEGER PRIMARY KEY, "
+            "  message_pk INTEGER, token_id TEXT, symbol TEXT, "
+            "  contract_address TEXT, chain TEXT, mcap_at_sighting REAL, "
+            "  resolution_state TEXT, paper_trade_id INTEGER, created_at TEXT)",
+            "CREATE TABLE tg_social_dlq (id INTEGER PRIMARY KEY, "
+            "  channel_handle TEXT, msg_id INTEGER, raw_text TEXT, "
+            "  error_class TEXT, error_text TEXT, failed_at TEXT, retried_at TEXT)",
+            "CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, signal_type TEXT, "
+            "  signal_data TEXT, opened_at TEXT)",
+        ):
+            await conn.execute(ddl)
+        await conn.commit()
+
+    from httpx import ASGITransport, AsyncClient
+    from dashboard.api import create_app
+    app = create_app(db_path=db_path)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.get("/api/tg_social/alerts")
+    assert resp.status_code == 200, (
+        f"Endpoint should fall back gracefully when cashtag_trade_eligible "
+        f"missing; got {resp.status_code}: {resp.text[:500]}"
+    )
+    body = resp.json()
+    ch = body["channels"][0]
+    assert ch["channel_handle"] == "@old"
+    # Defensive fallback sets cashtag_trade_eligible=False
+    assert ch["cashtag_trade_eligible"] is False
+```
+
+Run: `SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_dashboard_tg_social_extensions.py::test_endpoint_tg_social_alerts_falls_back_when_cashtag_column_missing -v` — Expected: PASS.
+
+- [ ] **Step 9: Commit**
 
 ```bash
 git add dashboard/api.py tests/test_dashboard_tg_social_extensions.py
-git commit -m "feat(BL-066'): extend /api/tg_social/alerts with cashtag dispatch visibility + signal_data contract test"
+git commit -m "feat(BL-066'): extend /api/tg_social/alerts + 3 contract/defensive tests (T9 runtime, T9b SQL-literal, T11 fallback)"
 ```
 
 ---
