@@ -1,6 +1,23 @@
-# BL-071a': Wire chain_match writers + DexScreener fetch — Implementation Plan (v2 post-review)
+# BL-071a': Wire chain_match writers + DexScreener fetch — Implementation Plan (v3 post-design-review)
 
-**New primitives introduced:** new helper module `scout/chains/mcap_fetcher.py` (single async function `fetch_token_fdv` + protocol type `McapFetcher` for dependency injection in tests); new structured log event `chain_outcome_resolved_via_dexscreener` (per-row INFO); new structured log event `chain_outcome_dexscreener_failed` (per-row **DEBUG** — demoted from WARNING per R1-3, plan v2); new aggregate log events `chain_outcomes_ds_transient_failures` (WARNING, once per LEARN cycle) and `chain_outcome_ds_persistent_failure` (ERROR, when stuck-row age exceeds threshold per R1-1); new aggregate `chain_tracker_session_unhealthy` (ERROR, when DS failure rate > 50% in one cycle per R1-2). No new database columns or migrations — uses the `chain_matches.mcap_at_completion REAL` column shipped in Bundle A.
+**New primitives introduced:** new helper module `scout/chains/mcap_fetcher.py` containing: (a) `FetchStatus` str-enum (`OK`/`NO_DATA`/`NOT_FOUND`/`RATE_LIMITED`/`TRANSIENT`/`MALFORMED`), (b) `FetchResult` NamedTuple `(fdv: float | None, status: FetchStatus)`, (c) async function `fetch_token_fdv` returning `FetchResult`, (d) `McapFetcher` Callable type alias (replaces v2 Protocol per R2-1); new Settings fields `CHAIN_OUTCOME_HIT_THRESHOLD_PCT: float = 50.0`, `CHAIN_OUTCOME_MIN_MCAP_USD: float = 1000.0`, `CHAIN_OUTCOME_PERSISTENT_FAILURE_HOURS: float = 1.0`, `CHAIN_TRACKER_UNHEALTHY_FAILURE_RATE: float = 0.5`, `CHAIN_TRACKER_UNHEALTHY_MIN_ATTEMPTS: int = 3` (per R2-7); new structured log events: `chain_outcome_resolved_via_dexscreener` (INFO, per row), `chain_outcome_dexscreener_failed` (DEBUG, per row), `chain_outcome_mcap_below_floor` (DEBUG, per row), `chain_outcomes_ds_transient_failures` (WARNING, aggregate), `chain_outcomes_ds_rate_limited` (WARNING, aggregate, per R1-M1), `chain_outcome_ds_persistent_failure` (ERROR, aggregate, escalation-rate-limited per R1-S3), `chain_tracker_session_unhealthy` (ERROR, aggregate). No new database columns or migrations — uses the `chain_matches.mcap_at_completion REAL` column shipped in Bundle A.
+
+**v3 changes from 2-agent design-review feedback (cross-confirmed by both reviewers):**
+- **MUST-FIX R1-M1 + R2-2 (429 conflation):** v2's `fetch_token_fdv -> float | None` collapsed all errors to None. Rate-limited responses (routine on DS free tier) got classified as "session unhealthy → restart" — actively misleading. v3 returns `FetchResult(fdv, status)` so the hydrator distinguishes RATE_LIMITED from session-degradation, only counts non-rate-limited errors toward the unhealthy-session signal, and emits a separate aggregate `chain_outcomes_ds_rate_limited` WARNING.
+- **MUST-FIX R1-M2 + R2-5 (dust-mcap fake hits):** A pump.fun token with `mcap_at_completion=0.0001` and current FDV $500 would compute +499,999,900% = `hit` → poisons the LEARN feedback loop. v3 enforces `CHAIN_OUTCOME_MIN_MCAP_USD=1000.0` floor in the WRITER (writes NULL if below), so no nonsensical `mcap_at_completion` ever reaches the hydrator. Hydrator additionally skips populated rows below floor as a defense-in-depth.
+- **MUST-FIX R1-M3 + R2-8 (backfill SQL pollution):** v2 manual SQL one-shot for 30 pre-Bundle-A rows would mix `'expired_no_data'` into outcome_class queries. v3 **drops the backfill from this PR entirely** — captured as separate properly-versioned migration follow-up (BL-071a''). The aggregate warning will fire for those ~30 rows on each LEARN cycle until backfill ships, but that's bounded noise (one log line/day) vs. data-model pollution.
+- **MUST-FIX R1-S1 (`ValueError` except):** v2 except clause `(asyncio.TimeoutError, aiohttp.ClientError)` doesn't catch `json.JSONDecodeError` (subclass of `ValueError`). Malformed DS response would crash hydrator mid-loop. v3 widens to `(asyncio.TimeoutError, aiohttp.ClientError, ValueError)`.
+- **MUST-FIX R1-S3 (persistent-failure ERROR wallpaper):** v2 `chain_outcome_ds_persistent_failure` ERROR fires every LEARN cycle for every stuck row. v3 module-level state tracks `_last_alerted_oldest_age_hours`; ERROR only re-fires on escalation (oldest_age increased ≥+24h vs. last alert) OR new stuck rows appeared.
+- **SHOULD-FIX R2-1 (Protocol vs Callable):** Single-method protocol added no value over a Callable alias. v3 uses `McapFetcher = Callable[[aiohttp.ClientSession, str], Awaitable[FetchResult]]`.
+- **SHOULD-FIX R2-7 (SRE-tunable defaults):** v2 hardcoded `failure_rate=0.5`, `attempts_floor=3`, `persistent_failure_age` derivation in function body. v3 promotes all three to Pydantic Settings fields (env-overridable at 3am during a DS outage without a deploy).
+- **SHOULD-FIX R1-S2 (post-restart smoke test):** v3 ops verification §5 adds a one-shot smoke test against a known-live contract immediately post-restart, so DNS/SSL/proxy issues surface in seconds instead of hours-later silent NULLs.
+
+**Explicitly deferred to BL-071a''/'''/follow-ups (v3 honest scope):**
+- **R2-4 `mcap_capture_status` discriminant column:** valid concern (NULL today conflates "narrative by-design" + "memecoin DS-failed" + "memecoin populated"), but adding a column requires schema migration in BL-071a' which triples blast radius. Captured as BL-071a'' "mcap_capture_status discriminant + outcome_source provenance". The Bundle A regression test (`test_hydrator_aggregate_does_not_count_narrative_rows`) still guards against the conflation in code.
+- **R2-5 `outcome_source` provenance column:** same as R2-4 — defer with R2-4.
+- **R2-3 pre-fetch FDVs outside transaction:** unchanged from v2 deferral.
+- **R1-4 misrouted-pipeline regex:** unchanged from v2 deferral.
+- **R1-6 / R1-M3 backlog backfill:** v3 demotes to "separate versioned migration PR" (was v2 "manual SQL during merge").
 
 **v2 changes from plan-review feedback (cross-confirmed by 2 parallel reviewers):**
 - **MUST-FIX R2-1:** Task 4 was targeting the wrong file. The actual `update_chain_outcomes` caller is `scout/narrative/learner.py:326`, NOT `scout/main.py`. Without this fix, BL-071a' would be dead-on-arrival (the `session is not None` guard would silently fall through to the legacy path forever — exactly the silent-skip class this PR exists to close). v2 fixes Task 4 + adds **defense-in-depth: hydrator self-creates an aiohttp session if `session is None`**, so even if a future caller forgets to wire the session the new path still fires.
@@ -196,16 +213,26 @@ Uses the chain-agnostic `/latest/dex/tokens/{contract}` endpoint so the
 caller does NOT need to know the chain. Returns the FDV of the first
 pair (DexScreener orders by liquidity desc by default).
 
-Fail-soft: returns None on any error (404, timeout, malformed response,
-missing field). Callers are responsible for graceful degradation —
-the writer leaves `mcap_at_completion` NULL, the hydrator skips this
-LEARN cycle and re-tries next time.
+Returns FetchResult(fdv, status) — the status enum lets the hydrator
+distinguish 429 (rate-limited, don't punish session-health) from other
+errors (transient, malformed, etc.). Without this distinction, routine
+DS rate-limiting would trigger the chain_tracker_session_unhealthy
+ERROR with misleading 'restart service' guidance (per design-review
+R1-M1 + R2-2).
+
+Fail-soft: never raises. Callers are responsible for graceful
+degradation based on (fdv is None, status).
+
+Logging convention (per design-review R2-6): `chain_outcome_*` for
+per-row events; `chain_outcomes_*` (plural) for aggregate events.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Protocol
+from collections.abc import Awaitable, Callable
+from enum import Enum
+from typing import NamedTuple
 
 import aiohttp
 import structlog
@@ -216,58 +243,86 @@ DS_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{contract}"
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15, connect=5)
 
 
-class McapFetcher(Protocol):
-    """Protocol for the FDV-fetcher dependency. Production: fetch_token_fdv.
-    Tests: stub returning a fixed value (or None to simulate no-data)."""
+class FetchStatus(str, Enum):
+    """Outcome classification for fetch_token_fdv result."""
 
-    async def __call__(
-        self,
-        session: aiohttp.ClientSession,
-        contract: str,
-    ) -> float | None: ...
+    OK = "ok"  # fdv is non-None and positive
+    NO_DATA = "no_data"  # 200 + empty pairs / missing fdv field
+    NOT_FOUND = "not_found"  # 404 (contract may be delisted)
+    RATE_LIMITED = "rate_limited"  # 429 (DS free-tier throttle)
+    TRANSIENT = "transient"  # timeout / connection error / non-200/404/429
+    MALFORMED = "malformed"  # JSON decode failure / unexpected shape
+
+
+class FetchResult(NamedTuple):
+    """Result of fetch_token_fdv. fdv is None for any non-OK status."""
+
+    fdv: float | None
+    status: FetchStatus
+
+
+# McapFetcher is the injected-dependency type for tests. Single Callable
+# alias is lighter than a Protocol (per design-review R2-1).
+McapFetcher = Callable[[aiohttp.ClientSession, str], Awaitable[FetchResult]]
 
 
 async def fetch_token_fdv(
     session: aiohttp.ClientSession,
     contract: str,
-) -> float | None:
+) -> FetchResult:
     """Fetch current FDV for a token contract from DexScreener.
 
-    Returns float FDV (USD) of the most-liquid pair, or None on any
-    error / missing data. Never raises.
+    Returns FetchResult(fdv, status). fdv is non-None ONLY when status==OK.
+    Never raises.
     """
     url = DS_TOKEN_URL.format(contract=contract)
     try:
         async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
-            if resp.status != 200:
+            status = resp.status
+            if status == 404:
+                return FetchResult(None, FetchStatus.NOT_FOUND)
+            if status == 429:
+                return FetchResult(None, FetchStatus.RATE_LIMITED)
+            if status != 200:
                 logger.debug(
-                    "ds_fetch_non_200",
-                    contract=contract,
-                    status=resp.status,
+                    "ds_fetch_non_200", contract=contract, status=status
                 )
-                return None
-            data = await resp.json()
+                return FetchResult(None, FetchStatus.TRANSIENT)
+            try:
+                data = await resp.json()
+            except (aiohttp.ContentTypeError, ValueError) as exc:
+                # ValueError covers json.JSONDecodeError (per R1-S1)
+                logger.debug(
+                    "ds_fetch_malformed",
+                    contract=contract,
+                    error_type=type(exc).__name__,
+                )
+                return FetchResult(None, FetchStatus.MALFORMED)
     except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
         logger.debug(
             "ds_fetch_error",
             contract=contract,
             error_type=type(exc).__name__,
         )
-        return None
+        return FetchResult(None, FetchStatus.TRANSIENT)
 
     pairs = data.get("pairs") if isinstance(data, dict) else None
     if not pairs or not isinstance(pairs, list):
-        return None
+        return FetchResult(None, FetchStatus.NO_DATA)
 
     fdv_raw = pairs[0].get("fdv") if isinstance(pairs[0], dict) else None
     if fdv_raw is None:
-        return None
+        return FetchResult(None, FetchStatus.NO_DATA)
     try:
         fdv = float(fdv_raw)
     except (TypeError, ValueError):
-        return None
-    return fdv if fdv > 0 else None
+        return FetchResult(None, FetchStatus.NO_DATA)
+    if fdv <= 0:
+        return FetchResult(None, FetchStatus.NO_DATA)
+    return FetchResult(fdv, FetchStatus.OK)
 ```
+
+Update Step 1.1 tests accordingly — every assertion that did `assert fdv == 1_500_000.0` now does `assert result == FetchResult(1_500_000.0, FetchStatus.OK)`. Add new test for 429 → `FetchStatus.RATE_LIMITED` and one for malformed JSON → `FetchStatus.MALFORMED`.
 
 - [ ] **Step 1.4 — Run, expect 5 pass (1 may skip on Windows)**
 
@@ -454,18 +509,39 @@ async def _record_completion(
     # (single-process pipeline, ~0-2 completions per 60s cycle in prod);
     # if completion bursts ever appear, refactor to pre-fetch in parallel
     # outside the transaction in a follow-up optimization PR.
+    #
+    # BL-071a' v3 (R1-M2 + R2-5): enforce CHAIN_OUTCOME_MIN_MCAP_USD
+    # floor — dust-mcap (e.g., 0.0001 from pump.fun) would compute
+    # fake +500,000% hits at hydration time and poison the LEARN
+    # feedback loop. Below floor → write NULL, fall through to legacy.
     mcap_at_completion: float | None = None
     if chain.pipeline == "memecoin" and session is not None:
         fetcher = mcap_fetcher or fetch_token_fdv
+        min_mcap = (
+            settings.CHAIN_OUTCOME_MIN_MCAP_USD
+            if hasattr(settings, "CHAIN_OUTCOME_MIN_MCAP_USD")
+            else 1000.0
+        )
         try:
-            mcap_at_completion = await fetcher(session, chain.token_id)
+            result = await fetcher(session, chain.token_id)
         except Exception:
             # Fail-soft — never block chain write on the snapshot
             logger.exception(
                 "mcap_at_completion_fetch_unexpected_error",
                 token_id=chain.token_id,
             )
-            mcap_at_completion = None
+            result = None
+        if result is not None and result.fdv is not None:
+            if result.fdv >= min_mcap:
+                mcap_at_completion = result.fdv
+            else:
+                logger.debug(
+                    "chain_outcome_mcap_below_floor",
+                    token_id=chain.token_id,
+                    fdv=result.fdv,
+                    floor=min_mcap,
+                    note="writing NULL — dust mcap would produce fake hits",
+                )
 
     await db._conn.execute(
         """INSERT INTO chain_matches
@@ -613,13 +689,20 @@ the legacy outcomes path."
 
 **Why:** Closes the silent-skip surface Bundle A intentionally left open. Once writers populate `mcap_at_completion`, the hydrator now does the actual outcome resolution.
 
-- [ ] **Step 3.1 — Add config setting**
+- [ ] **Step 3.1 — Add config settings (5 fields per R2-7)**
 
 Edit `scout/config.py`. Find the chain-related settings block (search `CHAIN_`). Add:
 
 ```python
-    CHAIN_OUTCOME_HIT_THRESHOLD_PCT: float = 50.0  # BL-071a': memecoin chain hit if (current_fdv/completion_fdv - 1)*100 >= this
+    # BL-071a' (2026-05-04): outcome resolution + health-monitoring tunables
+    CHAIN_OUTCOME_HIT_THRESHOLD_PCT: float = 50.0  # memecoin chain hit if (current_fdv/completion_fdv - 1)*100 >= this
+    CHAIN_OUTCOME_MIN_MCAP_USD: float = 1000.0  # writer skips dust mcap that would produce fake hits
+    CHAIN_OUTCOME_PERSISTENT_FAILURE_HOURS: float = 1.0  # ERROR threshold for stuck-row aging
+    CHAIN_TRACKER_UNHEALTHY_FAILURE_RATE: float = 0.5  # 50% of attempts → session-unhealthy ERROR
+    CHAIN_TRACKER_UNHEALTHY_MIN_ATTEMPTS: int = 3  # floor — don't ERROR on 1-row cycles
 ```
+
+All five are env-overridable via standard Pydantic Settings — operators tune at runtime without redeploy.
 
 - [ ] **Step 3.2 — Add failing tests for new hydrator behaviour**
 
@@ -891,32 +974,45 @@ async def _update_chain_outcomes_inner(
                 mcap_row = await cur_m.fetchone()
             mcap_at_completion = mcap_row[0] if mcap_row else None
 
-            if mcap_at_completion is not None and mcap_at_completion > 0:
-                # BL-071a': active DexScreener resolution path. Note: NO
-                # `session is not None` guard — the wrapper self-creates
-                # one if needed (R2-1 defense-in-depth, plan v2). Also
-                # tracks DS attempts for cycle-level health signal (R1-2).
+            min_mcap = (
+                settings.CHAIN_OUTCOME_MIN_MCAP_USD
+                if settings is not None and hasattr(settings, "CHAIN_OUTCOME_MIN_MCAP_USD")
+                else 1000.0
+            )
+            # Defense-in-depth (R1-M2): even though writer enforces the
+            # floor, double-check at hydration time in case of rows
+            # populated by an old writer or manual SQL.
+            if mcap_at_completion is not None and mcap_at_completion >= min_mcap:
+                # BL-071a': active DexScreener resolution path. Wrapper
+                # self-creates session if none was injected (R2-1 defense-
+                # in-depth). Tracks DS attempts/failures/rate-limits/
+                # persistents for the aggregate health signals.
                 memecoin_ds_attempts += 1
                 try:
-                    current_fdv = await fetcher(session, token_id)
+                    result = await fetcher(session, token_id)
                 except Exception:
                     logger.exception(
                         "chain_outcome_dexscreener_unexpected_error",
                         match_id=match_id,
                         token_id=token_id,
                     )
-                    current_fdv = None
-                if current_fdv is None or current_fdv <= 0:
+                    result = FetchResult(None, FetchStatus.TRANSIENT)
+                if result.status == FetchStatus.RATE_LIMITED:
+                    # R1-M1: distinct path — rate-limited rows do NOT
+                    # count toward session-health failure rate (we're not
+                    # unhealthy, DS is throttling). Tracked separately.
+                    memecoin_ds_rate_limited += 1
+                    continue
+                if result.fdv is None or result.fdv <= 0:
                     memecoin_ds_failures += 1
-                    # R1-3: DEBUG not WARNING — per-row WARNING was the
-                    # antipattern Bundle A R2 flagged. Aggregate WARNING
-                    # below covers operator visibility; aging-aware ERROR
-                    # covers persistent stuck rows.
+                    # R1-3: DEBUG per-row, not WARNING. Aggregate WARNING
+                    # + aging-aware ERROR cover operator visibility.
                     logger.debug(
                         "chain_outcome_dexscreener_failed",
                         match_id=match_id,
                         token_id=token_id,
                         mcap_at_completion=mcap_at_completion,
+                        status=result.status.value,
                     )
                     # R1-1: track persistent stuck rows for aging ERROR
                     completed_at_str = (
@@ -936,6 +1032,8 @@ async def _update_chain_outcomes_inner(
                     except (ValueError, AttributeError):
                         pass  # malformed timestamp, skip aging check
                     continue  # leave row UNRESOLVED, retry next cycle
+                # Status is OK and fdv is valid — resolve outcome
+                current_fdv = result.fdv
                 outcome_change_pct = (
                     (current_fdv / mcap_at_completion) - 1.0
                 ) * 100.0
@@ -949,6 +1047,19 @@ async def _update_chain_outcomes_inner(
                     outcome_change_pct=round(outcome_change_pct, 2),
                     outcome=outcome,
                 )
+            elif (
+                mcap_at_completion is not None and mcap_at_completion < min_mcap
+            ):
+                # Defense-in-depth: dust mcap row (writer's floor failed
+                # or row predates BL-071a'). Skip with debug log.
+                logger.debug(
+                    "chain_outcome_mcap_below_floor_at_hydrate",
+                    match_id=match_id,
+                    token_id=token_id,
+                    mcap_at_completion=mcap_at_completion,
+                    floor=min_mcap,
+                )
+                continue
             else:
                 # Fall back to legacy outcomes table (covers expired chains
                 # and the pre-Bundle-A backlog of NULL-mcap rows)
@@ -979,9 +1090,10 @@ async def _update_chain_outcomes_inner(
     await conn.commit()
     if updated:
         logger.info("chain_outcomes_hydrated", count=updated)
-    # BL-071a': aggregate warnings now distinguishable into two causes:
+    # BL-071a' v3: aggregate warnings now distinguishable into THREE causes:
     # (1) memecoin_unhydrateable = legacy (NULL mcap, no outcomes-table row)
-    # (2) memecoin_ds_failures = transient DS errors that may resolve next cycle
+    # (2) memecoin_ds_failures = non-rate-limited DS errors (may resolve next cycle)
+    # (3) memecoin_ds_rate_limited = 429s from DS free tier (NOT session-degraded)
     if memecoin_unhydrateable:
         logger.warning(
             "chain_outcomes_unhydrateable_memecoin",
@@ -989,52 +1101,113 @@ async def _update_chain_outcomes_inner(
             cause="legacy_no_mcap_no_outcomes_row",
             note=(
                 "These rows pre-date BL-071a' writer wiring AND have no legacy "
-                "outcomes-table data. Backfill follow-up captured in BL-071a' "
-                "merge-and-deploy step (manual SQL one-shot)."
+                "outcomes-table data. Properly-versioned migration backfill "
+                "deferred to BL-071a''."
             ),
         )
     if memecoin_ds_failures:
         logger.warning(
             "chain_outcomes_ds_transient_failures",
             count=memecoin_ds_failures,
-            cause="dexscreener_returned_no_data",
+            cause="dexscreener_returned_no_data_or_error",
             note="Will retry next LEARN cycle.",
         )
-    # R1-1: aging-aware ERROR for rows persistently stuck across cycles.
-    # Triggers when a row has been NULL-due-to-DS-failure across multiple
-    # LEARN cycles — operators see this and can investigate (DS API key
-    # invalid, rate-limited, contract delisted, etc.).
-    if persistent_stuck_count:
-        logger.error(
-            "chain_outcome_ds_persistent_failure",
-            stuck_count=persistent_stuck_count,
-            oldest_pending_age_hours=round(oldest_persistent_age_hours, 1),
-            threshold_hours=round(persistent_failure_age_hours, 2),
+    # R1-M1: rate-limited rows are NOT a session-health failure. Separate
+    # WARNING gives operators the right diagnosis path (upstream throttle
+    # vs. local session degradation).
+    if memecoin_ds_rate_limited:
+        logger.warning(
+            "chain_outcomes_ds_rate_limited",
+            count=memecoin_ds_rate_limited,
+            cause="dexscreener_429_throttle",
             note=(
-                "These memecoin chain_matches have populated mcap_at_completion "
-                "but DexScreener has returned no FDV for >threshold cycles. "
-                "Investigate: API key valid? rate-limited? contract delisted?"
+                "DS free-tier rate limit hit. Rows will retry next LEARN "
+                "cycle; consider widening CHAIN_CHECK_INTERVAL_SEC or "
+                "upgrading DS plan if persistent."
             ),
         )
-    # R1-2: cycle-level session health. If >50% of attempts failed
-    # (with floor of >=3 attempts to avoid noise from low-volume cycles),
-    # the long-lived session may be in a degraded state.
-    if memecoin_ds_attempts >= 3:
-        failure_rate = memecoin_ds_failures / memecoin_ds_attempts
-        if failure_rate > 0.5:
+    # R1-1 + R1-S3: aging-aware ERROR for rows persistently stuck across
+    # cycles. Escalation-rate-limited (per R1-S3) — only re-fires when
+    # oldest_age increased ≥+24h since last alert OR new rows joined the
+    # stuck set. Module-level state `_persistent_failure_alert_state`
+    # tracks this. Without rate-limiting, the ERROR fires every LEARN
+    # cycle forever once any row gets stuck = wallpaper antipattern.
+    if persistent_stuck_count:
+        prev_state = _persistent_failure_alert_state
+        should_alert = (
+            prev_state is None
+            or persistent_stuck_count > prev_state["count"]
+            or (oldest_persistent_age_hours - prev_state["oldest_age"]) >= 24.0
+        )
+        if should_alert:
+            logger.error(
+                "chain_outcome_ds_persistent_failure",
+                stuck_count=persistent_stuck_count,
+                oldest_pending_age_hours=round(oldest_persistent_age_hours, 1),
+                threshold_hours=round(persistent_failure_age_hours, 2),
+                note=(
+                    "Memecoin chain_matches with populated mcap_at_completion "
+                    "but DS returned no FDV for >threshold. Investigate: "
+                    "DS API status? rate-limited? contract delisted? Next "
+                    "ERROR fires only on escalation (oldest age +≥24h) or "
+                    "new stuck rows."
+                ),
+            )
+            _persistent_failure_alert_state = {
+                "count": persistent_stuck_count,
+                "oldest_age": oldest_persistent_age_hours,
+            }
+    elif _persistent_failure_alert_state is not None:
+        # Backlog cleared — reset alert state so next stuck-cluster fires
+        logger.info(
+            "chain_outcome_ds_persistent_failure_cleared",
+            previous_count=_persistent_failure_alert_state["count"],
+        )
+        _persistent_failure_alert_state = None  # noqa: F841 (assigned to module global below)
+    # R1-2: cycle-level session health. Excludes rate-limited from numerator
+    # (per R1-M1) — rate-limit is upstream throttle, not session degradation.
+    unhealthy_min_attempts = (
+        settings.CHAIN_TRACKER_UNHEALTHY_MIN_ATTEMPTS
+        if settings is not None and hasattr(settings, "CHAIN_TRACKER_UNHEALTHY_MIN_ATTEMPTS")
+        else 3
+    )
+    unhealthy_failure_rate = (
+        settings.CHAIN_TRACKER_UNHEALTHY_FAILURE_RATE
+        if settings is not None and hasattr(settings, "CHAIN_TRACKER_UNHEALTHY_FAILURE_RATE")
+        else 0.5
+    )
+    non_rate_limited_attempts = memecoin_ds_attempts - memecoin_ds_rate_limited
+    if non_rate_limited_attempts >= unhealthy_min_attempts:
+        failure_rate = memecoin_ds_failures / non_rate_limited_attempts
+        if failure_rate > unhealthy_failure_rate:
             logger.error(
                 "chain_tracker_session_unhealthy",
-                attempts=memecoin_ds_attempts,
+                attempts=non_rate_limited_attempts,
                 failures=memecoin_ds_failures,
                 failure_rate_pct=round(failure_rate * 100, 1),
+                threshold_pct=round(unhealthy_failure_rate * 100, 1),
                 note=(
-                    "DexScreener fetch failure rate exceeds 50% in this cycle. "
-                    "Long-lived aiohttp session may be degraded; consider "
-                    "service restart to reset connector pool."
+                    "Non-rate-limited DS fetch failure rate exceeds threshold "
+                    "in this cycle. Long-lived aiohttp session may be degraded; "
+                    "consider service restart to reset connector pool. "
+                    "(Rate-limited responses excluded from this calculation.)"
                 ),
             )
     return updated
 ```
+
+**Module-level state** for the escalation-rate-limited persistent-failure ERROR — add to top of `scout/chains/tracker.py`:
+
+```python
+# BL-071a' v3 (R1-S3): persistent-failure ERROR is escalation-rate-limited
+# to avoid log wallpaper. Module-level state tracks the previous alert's
+# (count, oldest_age) so we only re-fire on (a) more stuck rows or
+# (b) oldest_age increased ≥+24h since last alert. Reset to None when
+# stuck-row count drops to zero.
+_persistent_failure_alert_state: dict | None = None
+```
+
+Note the use of `nonlocal` or `global` is NOT needed for the dict-mutation case (we reassign the module attribute via the `_update_chain_outcomes_inner` function). For the explicit reassignment, declare `global _persistent_failure_alert_state` at the top of `_update_chain_outcomes_inner`.
 
 - [ ] **Step 3.5 — Run, expect 4 pass**
 
@@ -1208,7 +1381,32 @@ git commit -m "style: black formatting"
 
 ---
 
-## Self-Review (post-v2 edits)
+## Operational verification post-deploy (v3 adds R1-S2 smoke test)
+
+After `git pull` + `systemctl restart gecko-pipeline`:
+
+1. **Pre-deploy backup:** `cp /root/gecko-alpha/scout.db /root/gecko-alpha/scout.db.bak.$(date +%s)`
+2. **Service started cleanly:** `systemctl status gecko-pipeline` — active+running.
+3. **R1-S2 immediate smoke test (NEW v3):** Don't wait hours for the next memecoin completion. Run a one-shot proof against a known-live contract immediately:
+   ```bash
+   ssh root@89.167.116.187 'cd /root/gecko-alpha && .venv/bin/python -c "
+   import asyncio, aiohttp
+   from scout.chains.mcap_fetcher import fetch_token_fdv, FetchStatus
+   async def _t():
+     async with aiohttp.ClientSession() as s:
+       r = await fetch_token_fdv(s, \"0xCB0c224f9382Ca5d09aCFb60141D332A8cA9ce42\")
+       print(f\"fdv={r.fdv} status={r.status.value}\")
+       assert r.status == FetchStatus.OK, f\"smoke failed: {r}\"
+       assert r.fdv is not None and r.fdv > 0, f\"no fdv: {r}\"
+   asyncio.run(_t())
+   "'
+   ```
+   Expected: `fdv=<float> status=ok`. If non-OK, investigate DNS/SSL/proxy in prod env BEFORE waiting hours for the next memecoin chain to complete.
+4. **No new exceptions:** `journalctl -u gecko-pipeline --since '5 min ago' | grep -iE "error|exception|traceback"` returns 0 or only pre-existing known-noise.
+5. **First memecoin chain completion** (may take hours): when it happens, `journalctl ... | grep "chain_complete"` shows `event_data.mcap_at_completion=<float>` instead of NULL.
+6. **First LEARN cycle (~24h):** `journalctl ... | grep "chain_outcomes_hydrated"` shows `count>0` for memecoin pipeline; coupling-guard SQL (`SELECT COUNT(*) FROM chain_matches WHERE pipeline='memecoin' AND mcap_at_completion IS NOT NULL AND outcome_class IS NULL AND completed_at < datetime('now','-48 hours')`) returns 0 for any post-deploy completion.
+
+## Self-Review (post-v3 edits)
 
 1. **Scope coverage:**
    - Writer wiring → Task 2 ✓
@@ -1231,21 +1429,14 @@ git commit -m "style: black formatting"
    - R2-4 ✓ (superseded test kept with `@pytest.mark.skip`)
    - R2-2 ✓ (doc note in v2 scope-decision: existing learner tests don't validate new path)
 
-## Manual SQL backfill follow-up (post-merge, deferred from R1-6)
+## Pre-Bundle-A backlog backfill — DEFERRED to BL-071a'' (per R1-M3 + R2-8)
 
-After BL-071a' is merged + deployed and verified working on NEW chain completions, one-shot SQL on VPS to clear the pre-Bundle-A backlog of 30 stuck memecoin rows:
+**v3 fix:** v2 specified a manual SQL `UPDATE chain_matches SET outcome_class='expired_no_data' WHERE ...` to clear the ~30 pre-Bundle-A stuck memecoin rows. This was flagged by R1-M3 (outcome_class consumer pollution) and R2-8 (out-of-version-control SQL = future-debt) as a bad shape.
 
-```sql
--- Run AFTER BL-071a' is verified clean for ≥1 LEARN cycle
--- Marks pre-existing NULL-mcap memecoin rows as 'expired_no_data' so the
--- aggregate warning stops firing for them. Does NOT generate fake outcomes.
-UPDATE chain_matches
-   SET outcome_class = 'expired_no_data',
-       evaluated_at = datetime('now')
- WHERE pipeline = 'memecoin'
-   AND mcap_at_completion IS NULL
-   AND outcome_class IS NULL
-   AND completed_at < datetime('now', '-7 days');
-```
+v3 **drops the backfill from this PR entirely.** The aggregate `chain_outcomes_unhydrateable_memecoin` warning will fire ~once per LEARN cycle for those 30 rows until BL-071a'' ships — that's bounded operational noise (1 warning line/day) vs. the data-model pollution alternative.
 
-This is a one-shot data fix, NOT part of the BL-071a' code change. Documented here so it doesn't get lost. After this, the only chain_outcomes_unhydrateable_memecoin warnings should be from genuinely-new-but-unfetcheable rows.
+BL-071a'' (separate properly-scoped follow-up PR) will handle the backfill via the existing migration runner pattern (`scout/db.py:_migrate_*`), with three options to evaluate at design time:
+- (a) Add `hydration_status TEXT` column to chain_matches; populate `'expired_no_data'` for backlog rows; update `outcome_class` consumer audit list (currently just `patterns.py:263`) to ignore non-hit/miss values.
+- (b) Hard-delete backlog rows older than 30 days (irretrievable; consider impact on historical audit).
+- (c) Backfill `mcap_at_completion` retroactively via a one-shot DS lookup loop, then let the hydrator resolve normally (rows may still fail if contracts are delisted).
+- The right choice depends on how many of the 30 rows have live contracts vs. delisted, plus the project's audit-trail requirements.
