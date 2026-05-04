@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import structlog
 
@@ -12,6 +13,12 @@ from scout.chains.events import (
     load_recent_events,
     prune_old_events,
     safe_emit,
+)
+from scout.chains.mcap_fetcher import (
+    FetchResult,
+    FetchStatus,
+    McapFetcher,
+    fetch_token_fdv,
 )
 from scout.chains.models import ActiveChain, ChainEvent, ChainPattern
 from scout.chains.patterns import (
@@ -23,6 +30,13 @@ from scout.config import Settings
 from scout.db import Database
 
 logger = structlog.get_logger()
+
+# BL-071a' v3 (R1-S3): persistent-failure ERROR is escalation-rate-limited
+# to avoid log wallpaper. Module-level state tracks the previous alert's
+# (count, oldest_age) so we only re-fire on (a) more stuck rows or
+# (b) oldest_age increased ≥+24h since last alert. Reset to None when
+# stuck-row count drops to zero (logged via *_cleared INFO event).
+_persistent_failure_alert_state: dict | None = None
 
 
 def _parse_time(value) -> datetime:
@@ -47,22 +61,30 @@ def _parse_time(value) -> datetime:
 
 
 async def run_chain_tracker(db: Database, settings: Settings) -> None:
-    """Main chain tracking loop — runs forever."""
+    """Main chain tracking loop — runs forever.
+
+    BL-071a' v3 (2026-05-04): owns a single aiohttp session for the loop's
+    lifetime. The session is threaded through check_chains -> _record_completion
+    so memecoin chain completions can fetch FDV from DexScreener.
+    """
+    import aiohttp  # lazy import to avoid Windows OpenSSL DLL crash on test collection
+
     await seed_built_in_patterns(db)
     logger.info(
         "chain_tracker_started",
         interval_sec=settings.CHAIN_CHECK_INTERVAL_SEC,
     )
-    while True:
-        try:
-            await check_chains(db, settings)
-        except Exception:
-            logger.exception("chain_tracker_cycle_error")
-        try:
-            await asyncio.sleep(settings.CHAIN_CHECK_INTERVAL_SEC)
-        except asyncio.CancelledError:
-            logger.info("chain_tracker_cancelled")
-            raise
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                await check_chains(db, settings, session=session)
+            except Exception:
+                logger.exception("chain_tracker_cycle_error")
+            try:
+                await asyncio.sleep(settings.CHAIN_CHECK_INTERVAL_SEC)
+            except asyncio.CancelledError:
+                logger.info("chain_tracker_cancelled")
+                raise
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +92,13 @@ async def run_chain_tracker(db: Database, settings: Settings) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def check_chains(db: Database, settings: Settings) -> None:
+async def check_chains(
+    db: Database,
+    settings: Settings,
+    *,
+    session: Any | None = None,
+    mcap_fetcher: McapFetcher | None = None,
+) -> None:
     """One pass of the pattern matching engine, wrapped in a single
     transaction so that writes across helpers commit atomically."""
     patterns = await load_active_patterns(db)
@@ -145,7 +173,10 @@ async def check_chains(db: Database, settings: Settings) -> None:
                     completed_chains.append((chain, pattern))
 
         for chain, pattern in completed_chains:
-            await _record_completion(db, chain, pattern, settings)
+            await _record_completion(
+                db, chain, pattern, settings,
+                session=session, mcap_fetcher=mcap_fetcher,
+            )
 
         await _prune_stale(db, settings)
         await conn.commit()
@@ -455,15 +486,64 @@ async def _record_completion(
     chain: ActiveChain,
     pattern: ChainPattern,
     settings: Settings,
+    *,
+    session: Any | None = None,
+    mcap_fetcher: McapFetcher | None = None,
 ) -> None:
-    """Write chain_matches row + emit chain_complete event + optional alert."""
+    """Write chain_matches row + emit chain_complete event + optional alert.
+
+    BL-071a' v3 (2026-05-04): for memecoin pipeline, captures a DexScreener
+    FDV snapshot in `mcap_at_completion` so the hydrator can later compute
+    pct change vs current FDV. Narrative pipeline skips the fetch
+    (token_id is a CoinGecko slug, not a contract; FDV lookup would fail).
+
+    Enforces CHAIN_OUTCOME_MIN_MCAP_USD floor (per design-review R1-M2):
+    dust mcap (e.g. 0.5 USD from pump.fun) would compute fake +500,000%
+    hits at hydration time and poison the LEARN feedback loop. Below floor
+    → write NULL, fall through to legacy outcomes path.
+
+    Failures are graceful: row writes with mcap_at_completion=NULL.
+
+    SCOPE NOTE (deferred to BL-071a''): the DS fetch happens INSIDE the
+    check_chains transaction. SQLite write lock is held for up to 15s
+    (DS timeout) per memecoin completion. Acceptable today (single-process
+    pipeline, ~0-2 completions per cycle); pre-fetch outside transaction
+    is a future optimization.
+    """
     duration_h = (chain.last_step_time - chain.anchor_time).total_seconds() / 3600.0
+
+    # BL-071a' v3: fetch FDV snapshot for memecoin chains, gated by floor.
+    mcap_at_completion: float | None = None
+    if chain.pipeline == "memecoin" and session is not None:
+        fetcher = mcap_fetcher or fetch_token_fdv
+        min_mcap = getattr(settings, "CHAIN_OUTCOME_MIN_MCAP_USD", 1000.0)
+        try:
+            result = await fetcher(session, chain.token_id)
+        except Exception:
+            # Fail-soft — never block chain write on the snapshot
+            logger.exception(
+                "mcap_at_completion_fetch_unexpected_error",
+                token_id=chain.token_id,
+            )
+            result = None
+        if result is not None and result.fdv is not None:
+            if result.fdv >= min_mcap:
+                mcap_at_completion = result.fdv
+            else:
+                logger.debug(
+                    "chain_outcome_mcap_below_floor",
+                    token_id=chain.token_id,
+                    fdv=result.fdv,
+                    floor=min_mcap,
+                    note="writing NULL — dust mcap would produce fake hits",
+                )
+
     await db._conn.execute(
         """INSERT INTO chain_matches
            (token_id, pipeline, pattern_id, pattern_name, steps_matched,
             total_steps, anchor_time, completed_at, chain_duration_hours,
-            conviction_boost)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            conviction_boost, mcap_at_completion)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             chain.token_id,
             chain.pipeline,
@@ -475,6 +555,7 @@ async def _record_completion(
             (chain.completed_at or datetime.now(timezone.utc)).isoformat(),
             round(duration_h, 3),
             pattern.conviction_boost,
+            mcap_at_completion,
         ),
     )
     await db._conn.execute(
@@ -493,6 +574,7 @@ async def _record_completion(
             "total_steps": len(pattern.steps),
             "conviction_boost": pattern.conviction_boost,
             "chain_duration_hours": round(duration_h, 3),
+            "mcap_at_completion": mcap_at_completion,
         },
         source_module="chains.tracker",
     )

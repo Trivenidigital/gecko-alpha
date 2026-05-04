@@ -95,6 +95,12 @@ class Settings(BaseSettings):
     CHAIN_PROMOTION_THRESHOLD: float = 0.45
     CHAIN_GRADUATION_MIN_TRIGGERS: int = 30
     CHAIN_GRADUATION_HIT_RATE: float = 0.55
+    # BL-071a' v3 (2026-05-04): outcome resolution + health-monitoring tunables
+    CHAIN_OUTCOME_HIT_THRESHOLD_PCT: float = 50.0  # memecoin chain hit if (current_fdv/completion_fdv - 1)*100 >= this
+    CHAIN_OUTCOME_MIN_MCAP_USD: float = 1000.0  # writer skips dust mcap that would produce fake hits at hydrate
+    CHAIN_OUTCOME_PERSISTENT_FAILURE_HOURS: float = 1.0  # ERROR threshold for stuck-row aging
+    CHAIN_TRACKER_UNHEALTHY_FAILURE_RATE: float = 0.5  # 50% of attempts → session-unhealthy ERROR
+    CHAIN_TRACKER_UNHEALTHY_MIN_ATTEMPTS: int = 3  # floor — don't ERROR on 1-row cycles
 
     # -------- Market Briefing Agent --------
     BRIEFING_ENABLED: bool = False  # opt-in, not default-on
