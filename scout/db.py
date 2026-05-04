@@ -12,6 +12,18 @@ import structlog
 
 _db_log = structlog.get_logger(__name__)
 
+
+# PR #72 H2 — distinct exception classes for `coin_id_resolves` so callers
+# can emit `reason="db_not_initialized"` (catastrophic, page) vs
+# `reason="resolution_check_error"` (transient, dashboard-aggregated).
+class DbNotInitializedError(RuntimeError):
+    """Raised when a Database method is called before initialize()."""
+
+
+class CoinIdResolutionError(RuntimeError):
+    """Raised by Database.coin_id_resolves on aiosqlite.OperationalError
+    (column rename / table lock). Caller decides fail-CLOSED vs fail-OPEN."""
+
 from scout.models import CandidateToken
 
 if TYPE_CHECKING:
@@ -187,6 +199,63 @@ class Database:
                 error=str(exc),
             )
         return "", ""
+
+    async def coin_id_resolves(self, coin_id: str | None) -> bool:
+        """narrative_prediction-fix: explicit token_id existence probe.
+
+        Returns True iff coin_id appears in any of the canonical sources
+        (price_cache + 3 snapshot tables). Replaces the fragile truthiness
+        probe on `lookup_symbol_name_by_coin_id` (which returns ("", "")
+        on miss; future evolution to default-fill placeholders would
+        silently invert the gate's semantics — arch-A2 fix).
+
+        Empty / whitespace coin_id → False (defensive; matches
+        _is_tradeable_candidate shape).
+
+        Raises:
+        - `CoinIdResolutionError` (RuntimeError subclass) on
+          `aiosqlite.OperationalError` so the caller can fail-CLOSED.
+        - `DbNotInitializedError` (RuntimeError subclass) when
+          `self._conn is None` — distinct class so caller can emit
+          `reason="db_not_initialized"` (PR #72 H2) instead of the
+          generic resolution_check_error (catastrophic vs transient).
+
+        SQL safety: `table` is interpolated via f-string but values come
+        ONLY from the hard-coded tuple below. Settings-driven table list
+        is forbidden (would enable injection). PR #72 H3 — fail-loud if
+        violated.
+        """
+        if not coin_id or not coin_id.strip():
+            return False
+        if self._conn is None:
+            raise DbNotInitializedError("Database not initialized.")
+        # PR #72 H3 — defense against future caller-driven table values.
+        _ALLOWED_TABLES = frozenset({
+            "price_cache", "gainers_snapshots",
+            "volume_history_cg", "volume_spikes",
+        })
+        for table in (
+            "price_cache",
+            "gainers_snapshots",
+            "volume_history_cg",
+            "volume_spikes",
+        ):
+            assert table in _ALLOWED_TABLES, (
+                f"coin_id_resolves: table {table!r} not in allowlist; "
+                "settings-driven tables are forbidden (SQL injection risk)"
+            )
+            try:
+                cur = await self._conn.execute(
+                    f"SELECT 1 FROM {table} WHERE coin_id = ? LIMIT 1",
+                    (coin_id,),
+                )
+                if (await cur.fetchone()) is not None:
+                    return True
+            except aiosqlite.OperationalError as exc:
+                raise CoinIdResolutionError(
+                    f"coin_id_resolves OperationalError on {table}: {exc}"
+                ) from exc
+        return False
 
     # ------------------------------------------------------------------
     # Schema

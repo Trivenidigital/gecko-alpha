@@ -562,77 +562,16 @@ def _normalize_category(name: str) -> str:
     return name.lower().strip().replace("-", " ").replace("_", " ")
 
 
-# coin_id substrings that identify wrapped/bridged assets. These pump rarely
-# (price tracks the underlying) and consume paper-trade slots.
-_JUNK_COINID_SUBSTRINGS = (
-    "-bridged-",
-    "-wrapped-",
+# Junk-coin filter helpers extracted to scout/trading/filters.py to allow
+# scout/narrative/predictor.py to apply _is_tradeable_candidate upstream
+# (defense in depth) without forming a predictor → signals → predictor
+# circular import. Re-exported here for back-compat with existing callers.
+from scout.trading.filters import (  # noqa: F401  re-exports for back-compat
+    _is_junk_coinid,
+    _is_tradeable_candidate,
+    _JUNK_COINID_PREFIXES,
+    _JUNK_COINID_SUBSTRINGS,
 )
-_JUNK_COINID_PREFIXES = (
-    "bridged-",
-    "wrapped-",
-    "superbridge-",
-    # BL-076: CoinGecko placeholder coins (test-1, test-2, ..., test-N)
-    # have real price feeds and triggered paper trades #980 (first_signal,
-    # closed -$9.96) and #1551 (volume_spike, closed +$188.91 by lucky
-    # pump). Anchored at slug start (startswith) — false positives like
-    # "protest-coin", "biggest-token", "pretest" are NOT rejected (T1b
-    # pins this). Trade-off: legit testnet-themed tokens like
-    # "test-net-token" WOULD be rejected — accepted risk; operator can
-    # grep signal_skipped_junk events to spot losses. If the prefix tuple
-    # exceeds ~10 entries OR a regex/substring requirement appears,
-    # refactor to settings-backed PAPER_JUNK_COINID_PREFIXES.
-    "test-",
-)
-
-
-def _is_junk_coinid(coin_id: object) -> bool:
-    """True when coin_id matches a wrapped/bridged/superbridge slug pattern.
-
-    Defensive on type: non-str or empty inputs return False (no match). A
-    caller that cares about missing/invalid input should check separately —
-    here we just report "not a known junk pattern."
-    """
-    if not isinstance(coin_id, str) or not coin_id:
-        return False
-    cid = coin_id.lower()
-    if cid.startswith(_JUNK_COINID_PREFIXES):
-        return True
-    return any(s in cid for s in _JUNK_COINID_SUBSTRINGS)
-
-
-def _is_tradeable_candidate(coin_id: object, ticker: object) -> bool:
-    """Paper-trade admission filter shared across the non-prediction signal paths.
-
-    Mirrors the PR #44 gates used by trade_predictions, minus the category
-    check — the 6 non-prediction paths query intermediate snapshot tables
-    that carry no category column (see BL-061 for the follow-up).
-
-    Returns False when the token is an obvious junk asset:
-    - wrapped/bridged/superbridge coin_id (price tracks the underlying)
-    - non-ASCII coin_id (Chinese-meme / cyrillic / emoji slug)
-    - non-ASCII ticker (same classes on the symbol side — surfaced post-wipe
-      on 2026-04-22 with tokens like 我踏马来了 and 币安人生)
-    - missing / non-str coin_id or ticker (can't safely trade it)
-
-    Scope note — DEX-origin tokens: the coin_id prefix and ASCII checks are
-    designed for CoinGecko slugs (e.g. "wrapped-bitcoin"). For DexScreener
-    and GeckoTerminal inputs, `contract_address` is an EVM hex or Solana
-    mint. Hex passes the prefix check by construction (never starts with
-    "wrapped-" / "bridged-") and is always ASCII — so on DEX paths this
-    filter degenerates to "reject only on non-ASCII ticker." That is the
-    intended behavior for BL-059; separate DEX-specific junk guards belong
-    in their own backlog item.
-    """
-    if not isinstance(coin_id, str) or not coin_id:
-        return False
-    if not isinstance(ticker, str) or not ticker:
-        return False
-    if _is_junk_coinid(coin_id):
-        return False
-    if not coin_id.isascii() or not ticker.isascii():
-        return False
-    return True
 
 
 async def trade_predictions(
@@ -730,6 +669,67 @@ async def trade_predictions(
             continue
         # Quality gate: skip wrapped/bridged coin_id patterns regardless of category
         if _is_junk_coinid(pred.coin_id):
+            continue
+        # narrative_prediction token_id existence gate (this PR — adv-M1/M2,
+        # arch-A2). Position is load-bearing: AFTER _is_junk_coinid (so the
+        # gate doesn't double-fire on junk-prefix IDs) and BEFORE should_open
+        # (so the skip event is always visible regardless of combo
+        # suppression state). Fail-CLOSED on infra exception per project
+        # convention — operator-aggregator dashboards filter by
+        # signal_skipped_synthetic_token_id.
+        if not pred.coin_id or not pred.coin_id.strip():
+            logger.info(
+                "signal_skipped_synthetic_token_id",
+                coin_id=pred.coin_id,
+                symbol=pred.symbol,
+                signal_type="narrative_prediction",
+                reason="empty_or_whitespace_coin_id",
+            )
+            continue
+        # PR #72 H1: narrowed exception handling. asyncio.CancelledError
+        # MUST propagate (don't swallow shutdown); AttributeError MUST
+        # propagate (helper signature drift). Only the documented raises
+        # (DbNotInitializedError + CoinIdResolutionError) trigger the
+        # fail-CLOSED reject path. PR #72 H2: distinct reason field per
+        # exception class for catastrophic-vs-transient paging.
+        from scout.db import (
+            CoinIdResolutionError,
+            DbNotInitializedError,
+        )
+        try:
+            resolves = await db.coin_id_resolves(pred.coin_id)
+        except DbNotInitializedError as exc:
+            logger.warning(
+                "signal_skipped_synthetic_token_id",
+                coin_id=pred.coin_id,
+                symbol=pred.symbol,
+                signal_type="narrative_prediction",
+                reason="db_not_initialized",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            continue
+        except CoinIdResolutionError as exc:
+            # PR #72 M1: fail-CLOSED ≠ info noise; warning-level so
+            # operator dashboards aggregate it for paging.
+            logger.warning(
+                "signal_skipped_synthetic_token_id",
+                coin_id=pred.coin_id,
+                symbol=pred.symbol,
+                signal_type="narrative_prediction",
+                reason="resolution_check_error",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            continue
+        if not resolves:
+            logger.info(
+                "signal_skipped_synthetic_token_id",
+                coin_id=pred.coin_id,
+                symbol=pred.symbol,
+                signal_type="narrative_prediction",
+                reason="token_id_not_in_price_cache_or_snapshots",
+            )
             continue
         try:
             combo_key = build_combo_key(

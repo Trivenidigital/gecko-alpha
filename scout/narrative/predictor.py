@@ -98,6 +98,15 @@ def filter_laggards(
     Sort by price_change_24h ascending (most behind first),
     tie-breaker: volume_24h / market_cap descending.
     """
+    # narrative_prediction-fix arch-A1: defense-in-depth filter at fetch
+    # time. _is_tradeable_candidate rejects empty/whitespace IDs, junk
+    # prefixes (test-, wrapped-, bridged-), and non-ASCII tickers BEFORE
+    # the prediction is stored. Catches the upstream class of bad data
+    # so the dispatcher gate at signals.py:trade_predictions only has to
+    # handle the harder "passes upstream but absent from our snapshot
+    # tables" case.
+    from scout.trading.filters import _is_tradeable_candidate
+
     result: list[LaggardToken] = []
     for t in tokens:
         try:
@@ -108,7 +117,7 @@ def filter_laggards(
             coin_id = t.get("id", "")
             symbol = t.get("symbol", "")
             name = t.get("name", "")
-            if not coin_id:
+            if not _is_tradeable_candidate(coin_id, symbol):
                 continue
         except (TypeError, ValueError):
             continue
