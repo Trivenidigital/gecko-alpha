@@ -295,7 +295,9 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 ## P2 — BL-064 follow-ups (TG social signals deployed 2026-04-27)
 
 ### BL-065: Dispatch paper trades from cashtag-only resolutions
-**Status:** Not started — flagged 2026-04-29
+**Status:** SHIPPED 2026-05-04 — PR #65 squash-merged as `835ce7f`, deployed VPS 2026-05-04T05:08:30Z. Default fail-closed (`cashtag_trade_eligible=0` on all 8 channels). Operator must `UPDATE tg_social_channels SET cashtag_trade_eligible=1 WHERE channel_handle='@<curator>'` to enable. 6 new BlockedGate values + 4 Settings + 6 log events. 18 active tests + 6 cleanly-skipped placeholders. Closes BL-064 zero-trade gap. See memory `project_bl065_deployed_2026_05_04.md`.
+
+**Original spec — flagged 2026-04-29, now historical:**
 **Files:** `scout/social/telegram/listener.py` (cashtag-only branch ~L249-276), `scout/social/telegram/dispatcher.py`, `scout/social/telegram/resolver.py` (search-top-3 path), schema (`tg_social_channels` add column), tests
 **Why:** Today, when a curator posts only `$EITHER` (cashtag) without a contract address, BL-064 sends a Telegram alert with top-3 CoinGecko candidates but **never** dispatches a paper trade — `listener.py:249` returns before `dispatch_to_engine`. With the active trade-eligible curators (`@thanos_mind`, `@detecter_calls`) currently posting cashtag-only hype, this means BL-064 has dispatched zero trades despite the listener being healthy. Extending dispatch to cashtags would unlock the bulk of curator activity.
 **Design decisions to make:**
@@ -308,7 +310,9 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Estimate:** 0.5-1 day with tests.
 
 ### BL-066: Dashboard view for BL-064 activity (channels, messages, alerts)
-**Status:** Not started — flagged 2026-04-29
+**Status:** SHIPPED-VARIANT 2026-05-04 — original 5-endpoint scope reduced after drift check found `/api/tg_social/alerts` (composite) + `TGAlertsTab.jsx` already deployed. BL-066' (gap-fill) PR #66 squash-merged as `6b95c2f`, deployed VPS 2026-05-04T06:09:04Z: added `/api/tg_social/dlq` + extended composite endpoint with `cashtag_dispatched_24h` + per-channel cashtag fields (`cashtag_trade_eligible`, `cashtag_dispatched_today`, `cashtag_cap_per_day`) + new `TGDLQPanel.jsx`. 12 active tests + 3 cleanly-skipped. **Lesson learned:** `find . -name __pycache__ -exec rm -rf {} +` mandatory on VPS after any `git pull` touching `dashboard/` Python (stale .pyc caused 14 startup 500s). See memory `project_bl066_deployed_2026_05_04.md` + `feedback_clear_pycache_on_deploy.md`. **Remaining gap (low priority):** original spec proposed 5 separate endpoints; composite covers 95% of need, defer split unless operator finds it limiting.
+
+**Original spec — flagged 2026-04-29, now historical:**
 **Files:** `dashboard/api.py` (new `/api/tg_social/*` endpoints), `dashboard/db.py`, `dashboard/frontend/components/` (new TGSocial section), `dashboard/frontend/main.jsx` (add tab or section)
 **Why:** BL-064 has been live since 2026-04-27 with 1,019 messages ingested, 487 signals parsed, 395 in DLQ — and there is currently **zero dashboard visibility** into any of it. Operators have to SSH to the VPS and run sqlite queries to see channel activity. The Telegram alert channel that was supposed to be the primary visibility surface is non-functional because the bot token is a placeholder. Until the token is fixed, the dashboard is the only realistic visibility surface.
 **Endpoints to add:**
@@ -322,7 +326,9 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Estimate:** 0.5-1 day backend + 0.5 day frontend.
 
 ### BL-071a': Wire chain_match writers + DexScreener fetch for memecoin outcome hydration
-**Status:** UNBLOCKED (follow-up from Bundle A 2026-05-03) — schema column + hydrator branch shipped; only writer wiring + DexScreener fetch remain
+**Status:** SHIPPED 2026-05-04 — PR #64 squash-merged as `cbb1e7f`, deployed VPS. Closes the silent-skip surface for DexScreener-resolved memecoin chain outcomes. See memory `project_chain_revival_2026_05_03.md` (related context).
+
+**Original spec (post-Bundle A 2026-05-03), now historical:**
 **Tag:** `chain-pipeline` `outcome-telemetry` `unblocks-BL-071a-fully`
 **Files:** `scout/chains/tracker.py` (`_record_chain_complete`, `_record_expired_chain` — accept and store mcap; hydrator's populated-branch — replace silent `continue` with DexScreener FDV fetch + outcome computation), `scout/chains/events.py` or chain-completion caller chain (pass current FDV through to writers), tests
 **Why:** Bundle A added `chain_matches.mcap_at_completion REAL` column + hydrator branch that skips silently when populated. Writers still pass NULL because adding the caller-wiring would have grown Bundle A scope. Once writers populate the column AND the hydrator inlines the DexScreener fetch, hit/miss outcomes flow for memecoin chain_matches. Closes the BL-071a death-spiral structurally.
