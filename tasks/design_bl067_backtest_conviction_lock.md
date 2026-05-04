@@ -53,7 +53,11 @@ Per plan v2 §"Drift grounding": verified file:line refs to `backlog.md:367-413`
 | F9 | Recent trades (< 504h ago at as_of) get clipped sim window | Silent (biases LOW for recent trades) | S6 fix: truncated_window flag per trade in deltas; reported as subset metric | Operator can re-run with `--as-of` 30d in the past to avoid clipping for any specific window |
 | F10 | Baseline params hardcoded → wrong baseline → wrong lift | **Silent** | M3 fix: `_load_signal_params` reads `signal_params` per signal_type | If `signal_params` row absent for a signal_type, falls back to settings defaults (warns? no — silent) |
 | F11 | SL exits at threshold not observed price → unrealistic uniform losses | Silent (understates SL depth) | N4 fix: SL exits at observed price (gap-down realistic) | None |
-| F12 | datetime string-comparison bug (`min("2026-05-04T...", "2026-05-04 ...")`) | **Loud** under specific input shapes; **silent** for matching formats | N3 fix: parse both to datetime, min(), .isoformat() | None |
+| F12 | datetime string-comparison bug (`min("2026-05-04T...", "2026-05-04 ...")`) | **Loud** under specific input shapes; **silent** for matching formats | N3 fix: parse both to datetime, min(), .isoformat(); applied via `_min_iso_ts` helper in Section C | None |
+| F13 | `signal_params` table empty/absent → `_load_signal_params` returns hardcoded defaults | **Silent** (lift number runs against wrong baseline) | Smoke test (Task 7) prints actual baseline params per signal_type so operator sees if defaults are firing | If prod has signal_params populated by Tier 1a but a specific signal_type row is missing, that signal's baseline silently falls to defaults |
+| F14 | chain_completed historical signal_data has empty symbol+name pre-BL-076 | **Silent (benign)** — stack count uses coin_id/token_id columns, NOT signal_data JSON | None needed — verified benign | None |
+| F15 | Saturation at stack=4 hides upside for stack>=6 tokens (BIO/LAB) | **Silent** (locked params for stack=10 are same as stack=4) | Documented as BL-067 spec choice. If Section D shows >=5 tokens with stack>=6 AND those tokens hit `held_to_end` (locked params capped before trade naturally exited), recommend BL-067-v2 spec extension to stack=6+ in findings §5 | If saturation matters, BL-067-v2 (`--max-stack-bonus`) re-run before production rollout |
+| F16 | Single-window regime caveat — backtest run on whatever 30d window operator picks | **Silent** (findings don't generalize across regimes) | Re-run quarterly with shifted `--as-of`; track lift drift | None — findings are point-estimate, not stationary |
 
 ---
 
@@ -120,7 +124,7 @@ After PR merge, the run task is operator-facing:
    ssh root@89.167.116.187 'cp /root/gecko-alpha/scout.db /tmp/scout-bl067.db'
    scp root@89.167.116.187:/tmp/scout-bl067.db /tmp/scout-bl067.db
    ```
-2. **Run backtest:**
+2. **Run backtest (REQUIRED `--as-of` for reproducible findings):**
    ```bash
    cd C:/projects/gecko-alpha && uv run python scripts/backtest_conviction_lock.py \
        --db /tmp/scout-bl067.db \
@@ -128,11 +132,20 @@ After PR merge, the run task is operator-facing:
        --days 30 | tee /tmp/bl067_run.txt
    ```
 3. **Findings doc:** auto-emitted at `tasks/findings_bl067_backtest_conviction_lock.md`. Edit §2 (decision) + §5 (resolved design questions).
-4. **Decision:**
-   - Section B at N=2 PASSES gate AND Section B at N=3 PASSES gate → **GREENLIGHT BL-067 implementation** with threshold N=3 (more conservative — fewer false-positive locks)
-   - Section B passes at one threshold but not the other → operator decision based on per-signal breakdown
-   - Both fail → **CLOSE BL-067 as won't-fix**; document in backlog.md
+
+4. **Decision matrix (B × B2, per A2 fix):**
+
+   | Section B (per-trade) | Section B2 (first-entry hold) | Action |
+   |---|---|---|
+   | PASS at both N=2 + N=3 | (any) | **GREENLIGHT BL-067 at N=3** (conservative) |
+   | PASS at N=2 only | (any) | **GREENLIGHT-AT-N=3-ONLY** unless per-signal subset shows specific signal_type benefits at N=2 with locked_count >= 5 AND lift >= 20% |
+   | PASS at N=3 only | PASS | GREENLIGHT BL-067 at N=3 |
+   | FAIL both N | PASS | **CLOSE BL-067 as specified, OPEN BL-067-alt: first-entry sticky hold** for design (different feature — early-entry-hold not extending current trades) |
+   | FAIL both N | FAIL | **CLOSE BL-067 as won't-fix**; document in backlog.md |
+
 5. **If greenlight:** open BL-067 implementation PR (`scout/trading/conviction.py` + DB column + dashboard surface) per the BL-067 backlog spec.
+
+6. **If GREENLIGHT but per-signal table flags `narrative_prediction.truncated_window_rate > 30%`:** before implementation, re-run with `--max-hours 720` (or skip narrative_prediction from initial rollout via `signal_params.conviction_lock_enabled=0`).
 
 ---
 
