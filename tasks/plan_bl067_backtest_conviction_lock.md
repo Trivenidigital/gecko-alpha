@@ -32,6 +32,34 @@
 - N5 (velocity_alerts schema verification) — handled at smoke-test time (Task 7).
 - D4 partial (no shared module) — single-line TODO comment is sufficient.
 
+**v3 changes from 2-agent design-review feedback:**
+
+*MUST-FIX (6 — 3 from each reviewer):*
+- **MF1 (aa1cf28) — plan/design step disagreement:** plan v2 §"v2 changes" says "1-hour step" for Section D; design F6 + plan code use 24h step. Reconciled to **1-hour step** (real implementation): `for hour_offset in range(days * 24)` so a BIO-style 6h cluster on day 4 (between 24h grid boundaries) is no longer missed. Cost: 30× more `_count_stacked_signals_in_window` calls per candidate; partially offset by early-exit at `max_stack >= 5`.
+- **MF2 (aa1cf28) — F2 symmetry claim false:** simulator skips ladder + peak-fade. Both fire ASYMMETRICALLY by peak — peak-fade closes high-peak winners earlier, ladder cuts upside on partial fills. The locked sim sees more high-peak excursions → omitted paths trigger more on locked → biased UP. **Applied**: implement peak-fade in `_simulate_conviction_locked_exit` (single threshold check, ~10 lines per `PAPER_PEAK_FADE_*` constants). Ladder remains skipped + documented as residual bias. Decision gate raised to **lift_pct >= 15%** (was 10%) to leave headroom for residual ladder asymmetry.
+- **MF3 (aa1cf28) — LAB +$531 path-coverage fragile:** snapshot tables drop a coin off leaderboard; LAB peak prices may be missed. **Applied**: Section B2 augments `_reconstruct_price_path` output with `price_cache.current_price` as a final synthetic sample at `as_of` (one anchor at "now's price"). Per-row `path_density` emitted in B2 deltas so operator can see why a token shows whatever it shows.
+- **A1 (ae6a6c3) — headline metric mismatch:** decision gate uses `delta_vs_baseline` but operator's mental model is `delta_vs_actual` (LAB +$531 vs $101). **Applied**: compound gate adds `delta_vs_actual >= $0` sanity guard — locked sim must not lose vs production reality. Findings markdown gets a 1-line table explaining all three numbers.
+- **A2 (ae6a6c3) — decision matrix incomplete:** B-FAIL but B2-PASS = "we should hold from start, not extend current trades" → different feature (early-entry-hold), not BL-067-as-specified. **Applied**: design Operational notes §4 extended with 2-axis B × B2 matrix; B-FAIL+B2-PASS routes to "close BL-067 as specified, open BL-067-alt: first-entry sticky hold for design".
+- **A3 (ae6a6c3) — narrative_prediction window truncation:** locked max_duration ceiling is 504h; narrative_prediction's natural hold may be 720h+. Per-signal table risks "narrative_prediction doesn't benefit" verdict that's an artifact of window truncation. **Applied**: per-signal table flags any signal_type with `truncated_window=True` rate >30% as "biased-low; re-run with --max-hours 720" recommendation.
+
+*SHOULD-FIX (8 applied):*
+- **SF1 (aa1cf28) — F7 magnitude wrong:** "<20 trades/day" misleading. Real caps: `PAPER_MAX_OPEN_TRADES=10` (`scout/config.py:232`), `LIVE_MAX_OPEN_POSITIONS=5` (`scout/config.py:327`). Locked-extended holds + 5 live slots → bind within hours. F7 rewritten to call out paper headline as upper-bound + reference live constraints explicitly.
+- **SF2 (aa1cf28) — N=2 PASS / N=3 FAIL rule:** explicit decision rule added — default GREENLIGHT-AT-N=3-ONLY (more conservative); flip only if per-signal subset shows specific signal_type benefits at N=2 with locked_count >= 5 AND lift >= 20%.
+- **SF3 (aa1cf28) — F1 wording cleanup:** rewrote to "Signal firing is independent of trade exit state, so M1 captures live-equivalent signals in the lock-decision window. Residual: zero." (No behavior change, clarity only.)
+- **SF4 (aa1cf28) — F13/F14 added:** F13 = `signal_params` empty fallback (smoke-test prints actual baseline params used); F14 = chain_completed historical empty signal_data is benign because stack count uses coin_id/token_id, not signal_data.
+- **SF5/SF6 (aa1cf28) — F15/F16 added:** F15 saturation-at-stack=4 honestly documented (recommend BL-067-v2 spec extension if Section D shows >=5 tokens with stack>=6 AND those tokens hit `held_to_end`); F16 single-window regime caveat (re-run quarterly with shifted `--as-of`).
+- **SF7 (aa1cf28) — performance estimate revised:** "<30s" was 5-20× optimistic. Revised: "<10min on local Python; <2min on VPS". Justification: 16,500 helper calls × 9 SELECTs ≈ 150k SELECTs at 1-5ms each.
+- **N2 (aa1cf28) — Section C M3 inconsistency:** Section C now uses `_load_signal_params(conn, signal_type)` (was hardcoded `{trail:20, sl:25, max:168}` — inconsistent with M3 fix elsewhere).
+- **N3 (aa1cf28) — Section C datetime string-min bug:** survived from v1; fixed via `_min_iso_ts(a, b)` helper (parse both → datetime → min → isoformat).
+- **ASF1 (ae6a6c3) — B2 portfolio asymmetry markdown qualifier:** Section B2 markdown line includes "Note: assumes infinite slot capacity; real-world bounded above by PAPER_MAX_OPEN_TRADES=10 contention. Treat as upper bound, not achievable estimate."
+- **ASF2 (ae6a6c3) — `--as-of` warning when default:** keep default for ad-hoc, but emit `as_of_was_default: true` in JSON + warning to stderr; markdown header includes "AS-OF DEFAULTED — re-run with explicit --as-of for reproducible findings" if applicable.
+- **N8 (ae6a6c3) — Section A derived line in markdown:** add `"Stack distribution: N=1 X%, N=2 Y%, N=3 Z%, N>=4 W% — threshold N=3 affects A% of trades vs N=2's B%"` to findings markdown so Section A becomes operationally useful, not descriptive ballast.
+
+*NIT (deferred):*
+- N7 (aa1cf28 + ae6a6c3 helper extraction): legitimate but scope creep for v1; TODO comment + flag for next backtest PR to extract `scripts/_backtest_lib.py`.
+- N9 (ae6a6c3 JSON schema documents `as_of`/`days` keys): minor; add to design output schema.
+- N4 (aa1cf28 test-count drift): expand T4b stubs OR relabel — relabel chosen ("13 planned, 9 with code" → matches reality).
+
 **Prerequisites:** master ≥ `07875db` (BL-076 deployed — symbol+name now populated for narrative_prediction / volume_spike / chain_completed paths, makes case-study output more readable).
 
 **Resume protocol authority:** per `backlog.md:412` — *"FIRST step is the backtest script. Do not write `scout/trading/conviction.py` until the backtest output justifies it."* This plan delivers ONLY the backtest script + findings; no production conviction code lands.
@@ -733,6 +761,20 @@ def _parse_iso(ts: str) -> datetime:
 
 _MOONSHOT_THRESHOLD_PCT = 40.0  # mirrors PAPER_MOONSHOT_THRESHOLD_PCT
 _MOONSHOT_TRAIL_DRAWDOWN_PCT = 30.0  # mirrors PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT
+# MF2 fix: peak-fade closes when peak retraces back below threshold for N min
+# Mirrors scout/trading/evaluator.py peak-fade path. Approximated with single
+# threshold check (no time-window — close immediately when peak_pct retraces
+# below PAPER_PEAK_FADE_THRESHOLD_PCT after having been above it). Ladder is
+# still skipped + documented as residual asymmetry.
+_PEAK_FADE_THRESHOLD_PCT = 60.0  # mirrors PAPER_PEAK_FADE_THRESHOLD_PCT default
+_PEAK_FADE_RETRACE_PCT = 30.0    # close when current_pct < peak_pct - retrace
+
+
+def _min_iso_ts(a: str, b: str) -> str:
+    """N3 fix: lexicographic min on datetime strings is undefined when
+    formats differ (`2026-05-04T...+00:00` vs `2026-05-04 ...`). Parse
+    both, min, isoformat."""
+    return min(_parse_iso(a), _parse_iso(b)).isoformat()
 
 
 def _simulate_conviction_locked_exit(
@@ -832,6 +874,22 @@ def _simulate_conviction_locked_exit(
                 "pnl_pct": (price - entry_price) / entry_price * 100.0,
                 "moonshot_armed": moonshot_armed,
             }
+        # MF2 fix: peak-fade — close when peak >= 60% AND current retraces
+        # >= 30pp below peak. Production has more nuanced logic; this is
+        # the single-threshold approximation. Ladder remains skipped +
+        # documented as residual asymmetry (locked sim sees more high-peak
+        # excursions; ladder would have cut those upside on partial fills).
+        if peak_pct >= _PEAK_FADE_THRESHOLD_PCT:
+            current_pct = (price - entry_price) / entry_price * 100.0
+            if current_pct < peak_pct - _PEAK_FADE_RETRACE_PCT:
+                return {
+                    "exit_price": price,
+                    "exit_reason": "peak_fade",
+                    "hold_hours": hours,
+                    "peak_pct": peak_pct,
+                    "pnl_pct": current_pct,
+                    "moonshot_armed": moonshot_armed,
+                }
     # Walked entire path without exit — held-to-end
     last_ts, last_price = price_path[-1]
     last_hours = (_parse_iso(last_ts) - open_dt).total_seconds() / 3600.0
@@ -932,7 +990,7 @@ git commit -m "feat(BL-067 backtest): _load_signal_params + _path_density_score 
 - [ ] **Step 1: Add Section A (stack histogram across closed paper trades)**
 
 ```python
-def section_a(conn: sqlite3.Connection, *, days: int = 30) -> dict:
+def section_a(conn: sqlite3.Connection, *, as_of: str, days: int = 30) -> dict:
     """Section A: stack-distribution histogram for paper trades closed in
     last N days. Reuses scripts/backtest_v1_signal_stacking.py findings
     but reframes for the BL-067 decision."""
@@ -942,8 +1000,10 @@ def section_a(conn: sqlite3.Connection, *, days: int = 30) -> dict:
                    pnl_usd, pnl_pct, peak_pct, exit_reason
             FROM paper_trades
             WHERE status LIKE 'closed_%'
-              AND datetime(opened_at) >= datetime('now','-{days} days')
+              AND datetime(opened_at) >= datetime(?, '-{days} days')
+              AND datetime(opened_at) <= datetime(?)
             ORDER BY opened_at""",
+        (as_of, as_of),
     )
     trades = cur.fetchall()
     by_stack: dict[int, list[sqlite3.Row]] = defaultdict(list)
@@ -1121,11 +1181,13 @@ def _section_b_for_threshold(
         if baseline_total else 0.0
     )
 
-    # A3 compound decision gate
+    # A3 compound decision gate (v3 — gate raised to 15% per MF2 residual
+    # ladder asymmetry; sanity guard delta_vs_actual >= 0 per A1).
     gate_passed = (
-        lift_pct >= 10
+        lift_pct >= 15
         and abs(delta_vs_baseline) >= 100
         and locked_count >= 5
+        and delta_vs_actual >= 0  # A1: must not lose vs production reality
     )
 
     print(f"Closed trades in window:           {len(trades)}")
@@ -1141,8 +1203,8 @@ def _section_b_for_threshold(
     print(f"Delta vs baseline (apples-apples): ${delta_vs_baseline:>+10.2f}")
     print(f"Delta vs actual (vs production):   ${delta_vs_actual:>+10.2f}")
     print(f"Lift vs baseline:                  {lift_pct:>+6.1f}%")
-    print(f"Decision gate (lift>=10% AND |delta|>=$100 AND locked>=5):"
-          f" {'PASS' if gate_passed else 'FAIL'}")
+    print(f"Decision gate (lift>=15% AND |delta|>=$100 AND locked>=5"
+          f" AND delta_vs_actual>=0): {'PASS' if gate_passed else 'FAIL'}")
     if deltas:
         print()
         print("Top 10 simulated lifts (vs baseline, locked + dense):")
@@ -1287,6 +1349,25 @@ def section_b2_first_entry_hold(
             conn, token_id,
             start=first["opened_at"], end=sim_end_dt.isoformat(),
         )
+        # MF3 fix: snapshot tables drop a coin off leaderboard; LAB peak
+        # prices may be missed → first-entry hold simulator misses the
+        # +$531 hypothetical the operator computed manually. Augment with
+        # price_cache.current_price as a final synthetic anchor at as_of
+        # so simulator has at least one sample at "now's price".
+        try:
+            cur_pc = conn.execute(
+                "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                (token_id,),
+            )
+            pc_row = cur_pc.fetchone()
+            if pc_row and pc_row[0] and pc_row[0] > 0:
+                path = list(path) + [(as_of, float(pc_row[0]))]
+                path.sort(key=lambda r: r[0])
+        except sqlite3.OperationalError:
+            pass
+        density = _path_density_score(
+            path, opened_at=first["opened_at"], end_at=sim_end_dt.isoformat()
+        )
         sim = _simulate_conviction_locked_exit(
             entry_price=float(first["entry_price"]),
             opened_at=first["opened_at"],
@@ -1301,6 +1382,7 @@ def section_b2_first_entry_hold(
             "trade_count": len(ts),
             "first_signal_type": first["signal_type"],
             "stack": n,
+            "path_density": density,  # MF3 — operator sees coverage per row
             "actual_sum_pnl": actual_sum,
             "first_entry_hold_pnl": first_entry_pnl,
             "first_entry_pnl_pct": sim["pnl_pct"],
@@ -1370,7 +1452,7 @@ git commit -m "feat(BL-067 backtest): Section A stack histogram + Section B simu
 - [ ] **Step 1: Add Section C — BIO + LAB replay**
 
 ```python
-def section_c(conn: sqlite3.Connection) -> dict:
+def section_c(conn: sqlite3.Connection, *, as_of: str) -> dict:
     """Section C: BIO + LAB case studies — operator-flagged. List all paper
     trades + simulated lift per trade for the two known multi-signal tokens."""
     _h("SECTION C — BIO + LAB case studies")
@@ -1393,21 +1475,15 @@ def section_c(conn: sqlite3.Connection) -> dict:
             n, _ = _count_stacked_signals_in_window(
                 conn, t["token_id"], t["opened_at"], t["closed_at"],
             )
-            base_params = {
-                "max_duration_hours": 168.0,
-                "trail_pct": 20.0,
-                "sl_pct": 25.0,
-            }
+            # N2 fix: read per-signal params (was hardcoded; inconsistent with M3)
+            base_params = _load_signal_params(conn, t["signal_type"])
             locked = conviction_locked_params(stack=max(n, 1), base=base_params)
             from datetime import timedelta
             end_window_dt = _parse_iso(t["opened_at"]) + timedelta(
                 hours=locked["max_duration_hours"],
             )
-            now_cur = conn.execute("SELECT datetime('now')")
-            now_str = now_cur.fetchone()[0]
-            end_window = min(
-                end_window_dt.isoformat(), now_str + "+00:00",
-            )
+            # N3 fix: was lex-min on different datetime string formats
+            end_window = _min_iso_ts(end_window_dt.isoformat(), as_of)
             path = _reconstruct_price_path(
                 conn, token_id,
                 start=t["opened_at"], end=end_window,
@@ -1476,10 +1552,13 @@ def section_d(
     cohort_n3: list[tuple[str, int]] = []
     cohort_n5: list[tuple[str, int]] = []
     for token_id in candidates:
-        # 7d sliding window, 24h step
+        # MF1 fix: 7d sliding window, 1-HOUR step (was 24h — would miss
+        # BIO-style 6h burst between day boundaries). 30 days × 24 = 720
+        # evals/candidate × ~few hundred candidates = ~150k evals.
+        # Early-exit at max_stack >= 5 partially offsets cost.
         max_stack = 0
-        for day_offset in range(days):
-            window_end = as_of_dt - timedelta(days=day_offset)
+        for hour_offset in range(days * 24):
+            window_end = as_of_dt - timedelta(hours=hour_offset)
             window_start = window_end - timedelta(days=7)
             n, _ = _count_stacked_signals_in_window(
                 conn, token_id,
@@ -1517,15 +1596,18 @@ def section_d(
 import argparse
 
 
-def _resolve_as_of(arg: str | None, conn: sqlite3.Connection) -> str:
+def _resolve_as_of(arg: str | None, conn: sqlite3.Connection) -> tuple[str, bool]:
     """S3/D5: resolve --as-of arg to a deterministic timestamp.
-    Default is current DB time (datetime('now'))."""
+    Default is current DB time (datetime('now')).
+
+    ASF2 fix: returns (timestamp, was_default). Caller emits warning to
+    stderr if defaulted; markdown header reflects this so findings are
+    flagged as non-reproducible if --as-of was unset."""
     if arg:
-        # Validate parseable as ISO; tolerate trailing Z or +00:00.
-        _parse_iso(arg)
-        return arg
+        _parse_iso(arg)  # validate parseable
+        return arg, False
     cur = conn.execute("SELECT datetime('now')")
-    return cur.fetchone()[0] + "+00:00"
+    return cur.fetchone()[0] + "+00:00", True
 
 
 def _emit_findings_markdown(results: dict, out_path: Path) -> None:
@@ -1536,15 +1618,38 @@ def _emit_findings_markdown(results: dict, out_path: Path) -> None:
     b_n3 = results.get("section_b_n3", {})
     b2 = results.get("section_b2", [])
     d = results.get("section_d", {})
+    a = results.get("section_a", {})
+    a_total = sum(b.get("n", 0) for b in a.values()) if isinstance(a, dict) else 0
+    a_n2 = sum(b.get("n", 0) for k, b in a.items()
+               if isinstance(k, (int, str)) and int(k) >= 2) if a_total else 0
+    a_n3 = sum(b.get("n", 0) for k, b in a.items()
+               if isinstance(k, (int, str)) and int(k) >= 3) if a_total else 0
+    a_n4 = sum(b.get("n", 0) for k, b in a.items()
+               if isinstance(k, (int, str)) and int(k) >= 4) if a_total else 0
+    a_pct_n2 = (100 * a_n2 / a_total) if a_total else 0
+    a_pct_n3 = (100 * a_n3 / a_total) if a_total else 0
+    asof_warning = (
+        "\n> ⚠️ **AS-OF DEFAULTED** — re-run with explicit `--as-of` for "
+        "reproducible findings.\n"
+        if results.get("as_of_was_default") else ""
+    )
+
     md = f"""# BL-067 Backtest Findings
 
 **As-of:** `{results.get("as_of", "?")}`
 **Window:** {results.get("days", 30)} days
-
+{asof_warning}
 ## §1 — Section results
 
 ### Section A — Stack distribution
-{json.dumps(results.get("section_a", {}), indent=2, default=str)}
+
+**N8 derived view:** threshold N=3 affects {a_pct_n3:.1f}% of trades vs
+N=2's {a_pct_n2:.1f}% — operator can use this to choose which threshold
+to act on if both PASS the gate.
+
+```json
+{json.dumps(a, indent=2, default=str)}
+```
 
 ### Section B (threshold N>=2) — Conviction-lock simulation (delta-of-deltas)
 - Locked count: {b_n2.get("locked_count", 0)}
@@ -1563,6 +1668,10 @@ def _emit_findings_markdown(results: dict, out_path: Path) -> None:
 ### Section B2 — First-entry hold simulation (operator's mental model)
 - Tokens with N>=2 + first-entry-hold: {len(b2)}
 - See JSON for token-by-token detail.
+
+> **Note:** Section B2 assumes infinite slot capacity; real-world bounded
+> above by `PAPER_MAX_OPEN_TRADES=10` contention (and `LIVE_MAX_OPEN_POSITIONS=5`
+> for live). Treat as upper bound, not achievable estimate. (ASF1)
 
 ### Section C — BIO + LAB case studies
 See JSON for trade-by-trade replay.
@@ -1613,9 +1722,19 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     conn = _conn(args.db)
-    as_of = _resolve_as_of(args.as_of, conn)
+    as_of, was_default = _resolve_as_of(args.as_of, conn)
     print(f"--as-of resolved to: {as_of}")
-    results: dict = {"as_of": as_of, "days": args.days}
+    if was_default:
+        import sys
+        print(
+            "WARNING: --as-of defaulted to datetime('now'); findings are "
+            "NOT reproducible. Re-run with explicit --as-of for audit trail.",
+            file=sys.stderr,
+        )
+    results: dict = {
+        "as_of": as_of, "days": args.days,
+        "as_of_was_default": was_default,
+    }
     results.update(section_a(conn, as_of=as_of, days=args.days))
     results.update(section_b(conn, as_of=as_of, days=args.days))
     results.update(section_b2_first_entry_hold(
