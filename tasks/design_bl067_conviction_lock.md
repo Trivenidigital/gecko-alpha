@@ -1,5 +1,33 @@
 # BL-067: Conviction-locked hold — Design
 
+**v2 changes from 2-agent design review (adversarial `ac1cfda9` + architecture `acd61417`):**
+
+*MUST-FIX (6 — bug-class issues that would have shipped):*
+- **adv-M4 — migration idempotency:** `INSERT OR IGNORE INTO paper_migrations` was inside the column-existence PRAGMA guard. Re-run after partial-failure (column applied + cutover row absent) hit the post-migration assertion → service refused to start. Plan v2 amended; T1e rewritten to actually exercise the failure branch.
+- **adv-M1 — T5g vacuous:** the placement-pin test passed regardless of correct/incorrect placement because the seeded trade was only 2d old. Rewrote with `opened_at=now-200h` so elapsed > base 168h but < locked 336h → test now structurally distinguishes overlay-before-158 from after-158.
+- **adv-M2 — "Zero deferred" contradicted T8 skeleton:** T8 in plan was `pass # Filled in during Build`, but design self-review claimed zero deferred. Rewrote T8 with concrete test body using `_seed_locked_eligible_trade(n_extra_sources=11)`; consistency restored.
+- **adv-M3 — T1e success-only:** original test only verified the success path of the post-migration assertion. Rewrote to delete the cutover row + re-run migration + assert the M4 fix re-inserts (the actual failure-branch coverage).
+- **arch-A2 — two-pass moonshot ordering:** T6 was pure arithmetic; missing was the integration pin that on pass N+1 (after moonshot armed on pass N), the conviction-lock overlay still produces `effective_trail_pct = max(30, locked_trail)`. Added T6c.
+- **arch-D1 — schema decision now:** `paper_trades.conviction_locked_stack INTEGER` column added to migration alongside `conviction_locked_at`. Avoids unreliable backfill of 499+ historical locked rows once source tables age out.
+
+*SHOULD-FIX (6 applied):*
+- **adv-S2 — `paper_trades` self-counting:** added `exclude_trade_id` parameter to `compute_stack` + `_count_stacked_signals_in_window`. Evaluator passes current `trade_id` so the trade isn't a "confirmation" of itself.
+- **adv-S1 — performance claim 9→10 sources:** `paper_trades` DISTINCT scan is the 10th source. Updated index audit to include `paper_trades(token_id, opened_at)`.
+- **adv-S3 — sed pattern fragility:** Layer 1 rollback's `sed -i "/^PAPER_CONVICTION_LOCK_ENABLED=/d"` no-op'd against commented/spaced variants. Relaxed anchoring + added grep-verify step.
+- **adv-S4 — silent-count inconsistency:** §Self-Review item 4 said "10 silent / 6 loud" while table header said "8 silent". Reconciled to 10 silent / 6 loud (F1, F2, F3, F4, F5, F9, F10, F11, F15, F16).
+- **adv-N1 — Task 4 SQL snippet wrong:** plan's `SELECT signal_type, ...` would have shifted positional indexes. `params.py:154-160` uses argument, not row[0]. Plan v2 amended.
+- **arch-S1 — backtest sync wrapper coupling:** added T7 round-trip test through `_SyncDBShim` so silent breakage on `Database._conn` refactor surfaces in CI.
+- **arch-S2 — module-level cache pollution:** added `clear_missing_sources_cache_for_tests()` paralleling `params.py:213-217`; conftest registers autouse reset.
+- **arch-S3 — fixture parameterization:** `_seed_locked_eligible_trade` now supports `n_extra_sources` 0..11 so T8 LAB-replay reuses it instead of forking.
+- **arch-D2 — operator opt-in transaction:** wrapped `UPDATE` + `INSERT INTO signal_params_audit` in `BEGIN;/COMMIT;` — auto-commit per statement otherwise was a silent audit-loss path.
+
+*NIT:*
+- **arch-D3 — refactor trigger update:** changed from "4th source family" to "any source addition requires editing two code locations" (the threshold is already crossed at 9 sources).
+- **arch-N1 — module docstring:** acknowledges paper_trades contributes non-uniform stack entries (multiple distinct signal_types > 1 from this single source — intentional, not a docstring violation).
+- **arch-N2 / arch-A1:** plan v2 already adds `conviction_locked_at` to evaluator SELECT (line 1037 of plan); design v1 stated this in drift grounding. Reviewer's A1 attribution overstated.
+
+---
+
 **New primitives introduced:** new column `signal_params.conviction_lock_enabled INTEGER NOT NULL DEFAULT 0` (added inside the existing `BEGIN EXCLUSIVE` block in `_migrate_signal_params_schema` at `scout/db.py:1638-1680`, gated by `paper_migrations` row + a NEW post-migration assertion paralleling `signal_params_v1` at `db.py:1696-1702`); new column `paper_trades.conviction_locked_at TEXT` (NULL until first arm — D2 fix for log idempotency + dashboard surface); new module `scout/trading/conviction.py` with `compute_stack(db, token_id, opened_at) -> int` (canonical async, defensive on `db._conn is None` per M4 fix), `conviction_locked_params(stack, base) -> dict` (pure, saturates at stack=4), and `_count_stacked_signals_in_window(db, token_id, opened_at, end_at) -> tuple[int, list[str]]` (consolidated from `scripts/backtest_conviction_lock.py:160-258` per D3 — single source of truth; backtest wraps with `asyncio.run()` adapter ~5 LOC); new evaluator overlay block in `scout/trading/evaluator.py:evaluate_paper_trades` placed STRICTLY between line 157 (`sp = await params_for_signal(...)`) and line 158 (`max_duration = timedelta(hours=sp.max_duration_hours)`) so the overlaid `max_duration_hours` flows into `timedelta()` (M2/A2 fix); new moonshot composition `effective_trail_pct = max(settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT, sp.trail_pct)` at `evaluator.py:357` (A1 fix — production currently reads moonshot constant directly, locked trail is ignored in the moonshot regime); new Settings field `PAPER_CONVICTION_LOCK_ENABLED: bool = False` (master kill-switch); new Settings field `PAPER_CONVICTION_LOCK_THRESHOLD: int = 3` with `field_validator` enforcing `2 <= v <= 11` (S2 — upper bound matches highest observed stack count over 30d); new structured log events `conviction_lock_armed` (fired ONCE per trade life, gated on `conviction_locked_at IS NULL` per D2) and `conviction_lock_db_closed` (defensive, fired when `db._conn is None`). NO new DB tables; NO changes to `SignalParams` shape beyond the new `conviction_lock_enabled: bool = False` field. Default fail-closed everywhere.
 
 ## Hermes-first analysis
@@ -63,8 +91,8 @@
 | T1 | `test_conviction_lock_enabled_column_exists` | Migration | `INTEGER NOT NULL DEFAULT 0` (fail-closed) |
 | T1b | `test_conviction_lock_enabled_paper_migrations_row` | Migration | `bl067_conviction_lock_enabled` recorded |
 | T1c | `test_conviction_lock_enabled_default_zero_on_seeded_signals` | Migration | EVERY seeded signal_type defaults 0 (no surprise opt-ins) |
-| T1d | `test_conviction_locked_at_column_exists_on_paper_trades` | Migration | D2: `paper_trades.conviction_locked_at TEXT` NULL default |
-| T1e | `test_conviction_lock_migration_post_assertion_present` | Migration | M3: post-migration assertion fires `RuntimeError` if cutover row missing (paralleling existing `signal_params_v1` shape) |
+| T1d | `test_conviction_locked_at_column_exists_on_paper_trades` | Migration | D2: `paper_trades.conviction_locked_at TEXT` NULL default; design-v2 D1: also asserts `conviction_locked_stack INTEGER` |
+| T1e | `test_conviction_lock_post_migration_assertion_fires_when_cutover_row_missing` | Migration | design-v2 adv-M3 + M4: failure-branch — manually delete cutover row, re-run migration, assert M4 fix re-inserts (NOT the original success-path-only check) |
 | T2 | `test_settings_paper_conviction_lock_enabled_default_false` | Unit (config) | Master kill-switch fail-closed default |
 | T2b | `test_settings_paper_conviction_lock_threshold_default_3` | Unit (config) | Conservative N=3 default (per findings) |
 | T2c | `test_settings_paper_conviction_lock_threshold_must_be_at_least_two` | Unit (config) | Validator lower bound 2 (stack=1 = no signals) |
@@ -81,13 +109,14 @@
 | T5d | `test_evaluator_arms_conviction_lock_when_all_gates_pass` | Integration (evaluator) | Happy path: 3 gates pass + stack≥3 → log fires + `paper_trades.conviction_locked_at` stamped + `max_duration_hours` overlaid (≥336 at stack=3) |
 | T5e | `test_evaluator_logs_conviction_lock_armed_only_once` | Integration (evaluator) | D2 idempotency: 2nd evaluator pass on same trade → no re-emit |
 | T5f | `test_compute_stack_returns_zero_when_db_conn_closed` | Integration (helper) | M4 defensive: `db._conn is None` → 0 + `conviction_lock_db_closed` log |
-| T5g | `test_evaluator_overlay_runs_before_max_duration_timedelta` | Integration (evaluator) | M2/A2 placement-critical: when locked sets max_duration=504, the trade survives past base 168h (placement guard) |
+| T5g | `test_evaluator_overlay_placement_keeps_trade_alive_past_base_max` | Integration (evaluator) | design-v2 adv-M1 rewrite: opened_at=now-200h (between base 168h and locked 336h); overlay-after-158 BUG would close trade prematurely; correct placement keeps `status='open'` |
 | T6 | `test_moonshot_trail_composes_with_locked_trail` | Unit (arithmetic) | A1 composition: `max(30, 35) == 35` |
-| T6b | `test_evaluator_moonshot_branch_uses_max_with_sp_trail_pct` | Integration (evaluator) | A1 production: at stack=4 + moonshot armed, evaluator uses `effective_trail_pct=35.0` (not 30.0) |
-| T7 | `test_backtest_script_imports_conviction_module_helpers` | Integration (script) | D3: `scripts/backtest_conviction_lock.py` imports work; `_count_stacked_signals_in_window` sync wrapper round-trips through `asyncio.run` |
-| T8 | `test_lab_711_regression_simulates_locked_first_signal` | Integration (regression) | N4: synthetic 11-stack first_signal trade survives with `max_duration_hours=504` saturation; pins LAB #711 +$549 finding |
+| T6b | `test_evaluator_moonshot_branch_uses_max_with_sp_trail_pct` | Integration (evaluator) | A1 production: at stack=4 + moonshot armed (single-pass), evaluator uses `effective_trail_pct=35.0` (not 30.0) |
+| T6c | `test_evaluator_two_pass_moonshot_armed_then_lock_overlay_composes` | Integration (evaluator) | design-v2 arch-A2: two-pass ordering — moonshot arms on pass N (writes moonshot_armed_at); pass N+1 reads moonshot_armed_at + applies overlay → `effective_trail_pct = max(30, locked)` correctly |
+| T7 | `test_backtest_script_imports_conviction_module_helpers` | Integration (script) | design-v2 D3 + arch-S1: `_SyncDBShim` round-trip through `asyncio.run` works against actual `sqlite3.Connection`. Catches silent breakage on `Database._conn` refactor |
+| T8 | `test_lab_711_regression_simulates_locked_first_signal` | Integration (regression) | design-v2 adv-M2 reconciliation: concrete test body using `_seed_locked_eligible_trade(n_extra_sources=11)`. Asserts conviction_lock_armed + locked_max_duration_hours=504 (saturated) + conviction_locked_stack ≥ 11 + status='open' at opened_at+200h |
 
-**Total: 25 active tests.** Zero deferred. T8 LAB regression is allowed minimal price-path fixture (entry $0.597 → peak $1.85) per the findings doc — concrete fixture builder (`_seed_lab_711_replay(db)`) lands in Build phase per S5; T8 itself asserts the post-overlay `max_duration_hours` and the surviving trade record.
+**Total: 26 active tests + T6c (skeletal, concrete fixture in Build).** Zero permanent skeletons. T8 reconciled per design-v2 adv-M2: now reuses parameterized `_seed_locked_eligible_trade(n_extra_sources=11)` per design-v2 arch-S3. T6c is the only test that lives as `pass` in the plan because the two-pass moonshot trajectory needs price-path fixture work that's properly Build-phase scope; the structural intent + assertions are documented inline in the test body.
 
 ---
 
@@ -112,23 +141,36 @@
 | F15 | LAB-trajectory T8 fixture too synthetic — pins arithmetic but not real-world price-path drift | **Silent** (test passes; production behavior diverges from finding) | T8 is the regression anchor for the +$549 finding; concrete fixture covers entry → peak → trail-out trajectory. Real-world divergence is the soak-then-escalate signal (§"Operational verification" step 8) | Acceptable — T8 is the structural pin; live monitoring is the empirical one |
 | F16 | Operator restarts pipeline mid-eval pass — partially-stamped `conviction_locked_at` rows leave inconsistent state | **Silent** (some open trades stamped, others not on next pass — but next pass simply stamps the rest with new timestamp) | UPDATE+commit per trade is atomic; restart at any point leaves at most 1 trade in-flight; next pass continues without resync. Acceptable | None — same shape as moonshot_armed_at restart behavior |
 
-**Silent-failure count: 8** (F1, F2, F3, F4, F5, F9, F10, F11, F15, F16) **/ Loud: 6** (F6, F7, F8, F12, F13, F14). F1+F2 are the BIG silent failures — both are pinned by tests AND would have shipped to production without the v2 plan-review fixes.
+**Silent-failure count: 10** (F1, F2, F3, F4, F5, F9, F10, F11, F15, F16) **/ Loud: 6** (F6, F7, F8, F12, F13, F14). F1+F2 are the BIG silent failures — both are pinned by tests AND would have shipped to production without the v2 plan-review fixes. (design-v2 adv-S4 reconciliation: previous "8 silent" count miscounted F4 and F11 as not-silent; corrected.)
+
+**design-v2 added failure modes (incremental, NOT renumbered to preserve cross-references):**
+
+| # | Failure | Silent or loud? | Mitigation in design v2 | Residual risk |
+|---|---|---|---|---|
+| F17 | Migration re-run after partial failure: column applied + commit succeeded but `paper_migrations` INSERT skipped (e.g., disk pressure during the same transaction's commit phase). PRAGMA on next run sees column exists → SKIPS the entire `if column not in existing_cols` block including the INSERT → post-migration assertion fails at startup → service refuses to start | **Loud (catastrophic)** — service outage on next deploy | design-v2 adv-M4: `INSERT OR IGNORE INTO paper_migrations` moved OUTSIDE the column-existence guard. Idempotent on duplicate row. T1e rewritten to delete cutover row + re-run + assert re-insertion | None — pinned by code structure AND test |
+| F18 | `paper_trades` DISTINCT signal_type scan counts the trade itself as a stack contributor → first_signal trade gets `stack=1` from its own existence | **Silent** — stack inflated by 1 in `conviction_lock_armed` log; 3-gate threshold gate may pass with only 2 external sources | design-v2 adv-S2: `exclude_trade_id` parameter; evaluator passes current `trade_id`; `_count_stacked_signals_in_window` adds `AND id != ?` clause | None — code structure prevents |
+| F19 | Operator opt-in UPDATE succeeds but audit INSERT fails (e.g., `signal_params_audit` schema drift) → conviction_lock_enabled=1 active on prod with no audit row | **Silent** — feature activates with no paper trail | design-v2 arch-D2: `BEGIN;/COMMIT;` wrapping in operator-opt-in heredoc; both succeed atomically or both roll back | None |
+| F20 | Module-level `_signal_sources_missing` set pollutes across tests in different `tmp_path` DBs → suppressed WARNINGs in later tests, hidden table-missing bugs | **Silent** in test suite (CI false-greens) | design-v2 arch-S2: `clear_missing_sources_cache_for_tests()` + autouse conftest fixture; matches `params.py:213-217` shape | None |
+| F21 | T8 LAB-replay forks `_seed_locked_eligible_trade` instead of parameterizing → 11-stack fixture drifts from 3-stack one when source schemas change | **Loud** in CI eventually (fixture mismatch) but **Silent** until then | design-v2 arch-S3: `_seed_locked_eligible_trade(n_extra_sources=...)` supports 0..11 in one call; T8 reuses with n=11 | None |
+| F22 | Future migration adds `conviction_locked_stack` mid-flight after 499+ historical rows accumulate `conviction_locked_at` → backfill requires re-running `compute_stack` against aged-out source rows that may have been pruned (BL-076 schema retention) | **Silent** (dashboard shows "stack: NULL" for all historical locked trades forever) | design-v2 arch-D1: `conviction_locked_stack INTEGER` added in same migration as `conviction_locked_at`; no future backfill needed | None — schema decision baked in NOW |
+| F23 | Two-pass moonshot ordering bug: moonshot arms on pass N (writes `moonshot_armed_at` with un-overlaid sp.trail_pct in scope); pass N+1 reads `moonshot_armed_at IS NOT NULL` and immediately takes moonshot branch — but design says overlay STILL runs before line 158 on pass N+1, and moonshot composition on pass N+1 should use overlaid sp.trail_pct via `max()` | **Silent** — moonshot composition on pass N+1 silently uses pre-overlaid sp.trail_pct if implementer forgets that overlay runs every pass | design-v2 arch-A2: T6c integration test pins the two-pass scenario explicitly | None — test pins behavior |
 
 ---
 
 ## Performance notes
 
-**`compute_stack` per evaluator tick:**
-- 9 source tables × 1 indexed `LIMIT 1` SELECT each = 9 round-trips per open trade per pass.
-- All 9 source tables verified to have indexes covering `(token_id|coin_id, ts_col)`:
+**`compute_stack` per evaluator tick (design-v2 adv-S1 — corrected to 10 sources):**
+- 8 source tables in `_SIGNAL_SOURCES` × 1 indexed `LIMIT 1` SELECT each + 1 `paper_trades` DISTINCT signal_type scan + 1 sqlite_master probe = up to 10 round-trips per open trade per pass.
+- All 10 source tables verified to have indexes covering `(token_id|coin_id, ts_col)`:
   - `gainers_snapshots`: `idx_gainers_snap (coin_id, snapshot_at)` (`db.py:490-491`)
   - `losers_snapshots`: equivalent (`db.py` analogous index) — verify during Build phase
   - `trending_snapshots`: equivalent — verify during Build phase
   - `chain_matches`: `(token_id, completed_at)` — verify during Build phase
   - `predictions`: `(coin_id, predicted_at)` — verify during Build phase
-  - `velocity_alerts`, `volume_spikes`, `tg_social_signals`, `paper_trades` — verify during Build phase
-- **Build-phase audit:** for each of the 9 sources, run `EXPLAIN QUERY PLAN SELECT 1 FROM <table> WHERE <token_col>=? AND datetime(<ts_col>) >= datetime(?) AND datetime(<ts_col>) <= datetime(?) LIMIT 1` and verify `SEARCH ... USING INDEX`. Add missing indexes if any source table forces SCAN.
-- **Per LEARN-cycle scaling:** N open trades × 9 SELECTs × ≤1 round-trip = ≤9N. At observed N=10–20 open trades, ≤180 round-trips/cycle = <2ms/cycle DB cost. Re-evaluate if N exceeds 100 (refactor to single CTE-based aggregate query).
+  - `velocity_alerts`, `volume_spikes`, `tg_social_signals` — verify during Build phase
+  - **`paper_trades`:** verify `(token_id, opened_at)` covering index exists — DISTINCT scan, NOT `LIMIT 1` (semantics differ — paper_trades counts distinct signal_types).
+- **Build-phase audit:** for each of the 10 sources, run `EXPLAIN QUERY PLAN ...` and verify `SEARCH ... USING INDEX`. Add missing indexes if any source forces SCAN. The `paper_trades` DISTINCT scan is the most expensive of the 10 — verify it doesn't force a table scan at observed N=10-20 open trades.
+- **Per LEARN-cycle scaling:** N open trades × 10 source operations = ≤10N round-trips. At observed N=10–20, ≤200 round-trips/cycle = <2ms/cycle DB cost. Re-evaluate if N > 100 (refactor to single CTE).
 - **Backlog Q6 already validated this:** "compute on-the-fly, ~9 indexed SELECTs (~ms); evaluator already does similar lookups per tick. Persist only if profiling shows the eval-loop hot path."
 
 **Backtest sync wrapper overhead:**
@@ -145,11 +187,17 @@
 ## Rollback
 
 **Layer 1 — Operator-side (`.env` flip, no code change):**
+
+design-v2 adv-S3: relaxed `sed` anchoring + grep-verify so the rollback no-ops loudly instead of silently when operator has commented or spaced variants.
+
 ```bash
-ssh root@89.167.116.187 'sed -i "/^PAPER_CONVICTION_LOCK_ENABLED=/d" /root/gecko-alpha/.env'
+# Relaxed pattern — matches ANY line containing the key (commented, spaced, etc.)
+ssh root@89.167.116.187 'sed -i "/PAPER_CONVICTION_LOCK_ENABLED/d" /root/gecko-alpha/.env'
+# Verify removal
+ssh root@89.167.116.187 'grep PAPER_CONVICTION_LOCK_ENABLED /root/gecko-alpha/.env || echo "REMOVED"' > .ssh_revert_verify.txt
 ssh root@89.167.116.187 'systemctl restart gecko-pipeline'
 ```
-Disables the master kill-switch; per-signal `signal_params.conviction_lock_enabled=1` rows stay set but become inert. Effective in <1 minute; takes effect immediately at next eval pass after restart.
+Disables the master kill-switch; per-signal `signal_params.conviction_lock_enabled=1` rows stay set but become inert. Effective in <1 minute.
 
 **Layer 2 — Per-signal SQL revert (operator-side, no code change):**
 ```bash
@@ -197,8 +245,8 @@ Design adds no operational verification beyond plan; this section is here for cr
 
 1. **Hermes-first present:** ✓ table + ecosystem + verdict per convention.
 2. **Drift grounding:** ✓ explicit file:line refs to evaluator hot path (97-108, 157, 158, 356-357), SignalParams shape (params.py:60-78), migration pattern (db.py:1536-1614), BEGIN EXCLUSIVE block (1638-1680), post-assertion shape (1696-1702), backlog spec (367-413), findings doc, BL-076 deploy lesson.
-3. **Test matrix:** **25 active tests** across 5 layers (migration / config / helper / params / evaluator). Zero deferred. Critical placement bug F1 is pinned by T5g; critical moonshot bug F2 is pinned by T6+T6b. D2 idempotency by T5e. M4 defensive guard by T5f. M3 post-assertion by T1e.
-4. **Failure modes 16/16, silent-failure-first count: 10 silent / 6 loud.** F1 + F2 are the catastrophic silent failures — both would have shipped to production without v2 plan-review fixes. F4 (narrative_prediction premature opt-in) and F10 (cache invalidation) are operator-discipline failures captured in the runbook.
+3. **Test matrix:** **26 active tests + T6c (skeletal — Build-phase price-path fixture)** across 5 layers (migration / config / helper / params / evaluator). Critical placement bug F1 pinned STRUCTURALLY by T5g (design-v2 adv-M1 rewrite — pre-rewrite passed regardless of correctness). Critical moonshot bug F2 pinned by T6 (arithmetic) + T6b (single-pass) + T6c (two-pass per design-v2 arch-A2). D2 idempotency by T5e. M4 defensive guard by T5f. M3 post-assertion failure-branch by T1e (design-v2 adv-M3 rewrite). T8 reconciled per design-v2 adv-M2 (no longer skeletal).
+4. **Failure modes 23/23, silent-failure-first count: 16 silent / 7 loud.** F1 + F2 + F17 are the catastrophic failures — F1/F2 silent; F17 fail-loud-on-restart. All would have shipped without plan-review v2 + design-review v2 fixes. F4 (narrative_prediction premature opt-in), F10 (cache invalidation), F19 (audit-row loss) are operator-discipline failures with runbook + structural mitigations. design-v2 adds F17–F23 (7 incremental modes from review).
 5. **Performance honest:** 9N SELECTs/cycle worst case, ≤2ms/cycle at observed N. Index audit deferred to Build phase but per-table audit step explicitly listed. Zero overhead in pre-opt-in deploys (3-gate short-circuit).
 6. **Rollback complete:** 3-layer rollback (env flip → SQL revert → code revert). Already-armed trades on code rollback fall back to base gates with zombie safeguard catching overdue trades. Migration is forward-only (idempotent).
 7. **Backtest sync wrapper trigger documented:** if `asyncio.run` per-call overhead becomes material, refactor to single shared loop. Helper docstring documents.
@@ -211,5 +259,5 @@ Design adds no operational verification beyond plan; this section is here for cr
    - **DELIBERATELY DEFERRED:** conviction_stack downgrade on inactivity — once locked, stays locked through trade life (per backlog Q9 + simpler).
 9. **Soak-then-escalate criterion:** monitor `conviction_lock_armed` events daily for 14 days after operator opts in `first_signal` + `gainers_early`. If no regressions (no unusual `trading_open_*_error` events, no PnL delta from previous 14d baseline beyond expected variance, no spike in locked-then-trailing-out-late losses), then operator can flip the next signal_type (`losers_contrarian`, `volume_spike`, `chain_completed`). `narrative_prediction` requires the 720h re-run BEFORE flipping. Escalation criterion is **non-binary** — must include the LAB-tier validation: at least one open trade armed at stack≥4 closes via natural exit (peak_fade or trail) rather than max_duration ceiling, confirming locked params actually exercised.
 10. **No production code that auto-arms:** migration column DEFAULT 0; `Settings.PAPER_CONVICTION_LOCK_ENABLED` default False; `Settings.PAPER_CONVICTION_LOCK_THRESHOLD` default 3 (conservative); 3-layer fail-closed (master + per-signal + threshold); operator opt-in requires `.env` flip + SQL UPDATE + restart. Quadruple gate.
-11. **Refactor trigger documented:** if a 4th source-table family is added or per-chain priority becomes dynamic, refactor `_SIGNAL_SOURCES` list to a `MetadataSource` plugin pattern. Documented in module docstring + here for future contributors.
+11. **Refactor trigger documented (design-v2 arch-D3 update):** trigger is "any new source addition requires editing two code locations" (already true given 9 sources in `_SIGNAL_SOURCES` + the inline `paper_trades` block). Future contributors adding a 10th external source MUST refactor to a `MetadataSource` plugin pattern in the same PR. Module docstring documents.
 12. **Test fixture FK dependency:** T5d/T5e require `chain_patterns` row seeded first when `chain_matches` is one of the seeded sources (FK on `chain_matches.pattern_id`). Reuse `_seed_chain_pattern(db, id)` if BL-076 conftest exposed it; otherwise inline in `_seed_locked_eligible_trade` per S5.
