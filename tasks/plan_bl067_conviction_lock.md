@@ -2,7 +2,33 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**New primitives introduced:** new column `signal_params.conviction_lock_enabled INTEGER NOT NULL DEFAULT 0` (added via `_migrate_signal_params_schema` extension, gated by `paper_migrations` row); new module `scout/trading/conviction.py` with `compute_stack(db, token_id, opened_at) -> int` + `conviction_locked_params(stack, base) -> SignalParams_subset` + helper `_count_stacked_signals_in_window` (consolidated from `scripts/backtest_conviction_lock.py:160-258` — single source of truth); new evaluator hook in `scout/trading/evaluator.py:evaluate_paper_trades` that overlays locked params for trades where `stack >= CONVICTION_LOCK_THRESHOLD AND signal_params.conviction_lock_enabled = 1`; new Settings field `PAPER_CONVICTION_LOCK_ENABLED: bool = False` (master kill-switch); new Settings field `PAPER_CONVICTION_LOCK_THRESHOLD: int = 3` (operator-tunable threshold); new structured log events `conviction_lock_armed`, `conviction_lock_skipped_disabled`, `conviction_lock_skipped_below_threshold`. NO new DB tables. Default fail-closed everywhere (column default 0; settings default False; threshold conservative).
+**New primitives introduced:** new column `signal_params.conviction_lock_enabled INTEGER NOT NULL DEFAULT 0` (added via `_migrate_signal_params_schema` extension inside the existing `BEGIN EXCLUSIVE` block, gated by `paper_migrations` row + a NEW post-migration assertion paralleling `signal_params_v1`); new column `paper_trades.conviction_locked_at TEXT` (D2 — stamped on first arm to make `conviction_lock_armed` log idempotent and provide a dashboard surface column); new module `scout/trading/conviction.py` with `compute_stack(db, token_id, opened_at) -> int` (canonical async) + `conviction_locked_params(stack, base) -> dict` + helper `_count_stacked_signals_in_window` (consolidated from `scripts/backtest_conviction_lock.py:160-258` — single source of truth; backtest script wraps with `asyncio.run()` adapter per D3); new evaluator hook in `scout/trading/evaluator.py:evaluate_paper_trades` that overlays locked params **strictly between line 157 and line 158** (the `params_for_signal` return and the `max_duration = timedelta(...)` computation) so the overlaid `max_duration_hours` flows downstream — M2 fix; new moonshot composition: `effective_trail_pct = max(settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT, sp.trail_pct)` at evaluator.py:357 (A1 fix — production currently reads moonshot constant directly, ignoring locked trail); new Settings field `PAPER_CONVICTION_LOCK_ENABLED: bool = False` (master kill-switch); new Settings field `PAPER_CONVICTION_LOCK_THRESHOLD: int = 3` (operator-tunable threshold, validator: 2 ≤ v ≤ 11); new structured log events `conviction_lock_armed` (fired ONCE per trade, gated on `conviction_locked_at IS NULL`), `conviction_lock_db_closed` (defensive when `db._conn is None`). NO other new DB tables. Default fail-closed everywhere (column defaults; settings False; threshold conservative).
+
+**v2 changes from 2-agent plan-review feedback:**
+
+*MUST-FIX (5; 2 from each + 1 cross-reviewer consensus):*
+- **A1 (architecture — critical) — moonshot trail composition broken:** production `evaluator.py:356-357` reads `settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT` directly (not `sp.trail_pct`). At stack=4 the LOCKED 35% trail collapses to moonshot's 30% once moonshot arms — feature broken in the high-peak regime where it matters most. **Fix in Task 5:** patch line 357 to `effective_trail_pct = max(settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT, sp.trail_pct)`. Backtest simulator already uses this `max()` form; production must match. Adds an explicit test pinning the composition.
+- **M2 / A2 (BOTH agents) — overlay placement vs `max_duration` line 158:** plan v1 said "after `params_for_signal`" but didn't pin order vs line 158. **`max_duration` is computed at line 158** from `sp.max_duration_hours`; if overlay runs AFTER, the locked 504h is silently ignored. v2 explicitly inserts overlay STRICTLY between lines 157 and 158 (with sentinel comment); Task 5 step 2 code block now shows the surrounding code for unambiguous placement.
+- **M1 (adversarial) — migration must be inside `BEGIN EXCLUSIVE`:** v1 said "after the existing seed loop and BEFORE the function's final commit" — ambiguous. v2 specifies: place the `PRAGMA table_info` probe + `ALTER TABLE` + `INSERT OR IGNORE INTO paper_migrations` inside the existing `try: await conn.execute("BEGIN EXCLUSIVE")` block (`scout/db.py:1638-1680`), AFTER the `signal_params_v1` cutover-marker INSERT (line 1668-1673), BEFORE `await conn.commit()` (line 1680).
+- **M3 (adversarial) — phantom "post-migration assertion set":** v1 said "extend the post-migration assertion set (search for `bl065_cashtag_trade_eligible` — same shape)". That assertion set doesn't exist as described — the closest is the post-migration `SELECT 1 FROM paper_migrations WHERE name='signal_params_v1'` at scout/db.py:1696-1702. v2 adds a NEW parallel post-assertion for `bl067_conviction_lock_enabled` immediately after the existing one.
+- **M4 (adversarial) — `compute_stack` `db._conn is None` guard:** mirrors `params_for_signal` defensive pattern. v2's Task 3 code block adds: `if db._conn is None: log.warning("conviction_lock_db_closed", token_id=token_id); return 0`.
+
+*SHOULD-FIX (8 applied):*
+- **D2 (architecture) — log idempotency via `conviction_locked_at` column:** plan v1 fired `conviction_lock_armed` every 30-min eval pass (~672 duplicates per locked trade over 14d). v2 Task 1 migration adds `paper_trades.conviction_locked_at TEXT` column; v2 Task 5 stamps it on first arm and gates the log: `if conviction_locked_at is None: log + UPDATE`. Subsequent passes still apply the overlay (re-derived from stack each time) but emit no log. Also gives the dashboard a column to surface "armed at X" without log scraping.
+- **D3 (architecture) — backtest helper consolidation:** plan v1 deferred citing sync/async impedance. v2 Task 3 creates async-canonical helpers in `scout/trading/conviction.py`; backtest script gets a thin `asyncio.run()` adapter (~5 LOC) so both files share one source of truth. Removes the predictable 60-day drift hazard.
+- **A3 (architecture) — `trail_pct_low_peak` orthogonality comment:** v2 Task 5 overlay block adds inline comment explaining `trail_pct_low_peak` is intentionally NOT overlaid (adaptive low-peak trail and conviction-lock high-peak trail are orthogonal regimes).
+- **S2 (adversarial) — threshold upper bound:** validator now `2 <= v <= 11` per the cohort survey upper bound (highest observed stack in 30d data).
+- **S5 (adversarial) — Task 5 fixture spec:** v2 specifies the shared fixture: paper_trade row + signal_params row with `conviction_lock_enabled=1` + ≥3 source-table rows on same `token_id` after `opened_at` + `price_cache` row keeping the trade live past base 168h.
+- **S6 (adversarial) — leg targets unchanged:** v2 docstring on `conviction_locked_params` explicitly states leg_1_pct/leg_2_pct/qty_frac NOT overlaid (BL-067 spec table doesn't widen leg targets — only trail/sl/max_duration).
+- **N4 (adversarial) — LAB #711 regression test:** v2 adds T8 LAB-replay test (synthetic 11-stack trade + `gainers_snapshots` rows + price path that mimics LAB's $0.59 → $1.85 trajectory). Pins the +$549 finding directly.
+- **N5 (adversarial) — Self-Review §9 vs Task 3 step 5 contradiction:** v2 reconciles — §9 says "consolidating helper IS IN scope" (D3 fix); Task 3 step 5 implements it.
+
+*NIT (deferred):*
+- D1 (architecture stack-count caching): defer to follow-up; trigger condition documented (eval-loop p99 latency >X seconds).
+- D4 (architecture dashboard PUT endpoint): explicit follow-up PR; v1 trading-engine integration only.
+- N1 (adversarial duplicate import): trivial; will fix during build.
+- N2 (adversarial empty token_id test): added to T3c.
+- N3 (adversarial ladder reopen anchor semantics): documented as intentional (use original opened_at, not leg_2_filled_at).
 
 **Prerequisites:** master ≥ `8c2ab32` (BL-067 backtest findings doc merged — gating evidence per `tasks/findings_bl067_backtest_conviction_lock.md`). Operator approval received via direct request.
 
@@ -153,6 +179,18 @@ async def test_conviction_lock_enabled_default_zero_on_seeded_signals(db):
             f"signal_type {row[0]!r} default conviction_lock_enabled "
             f"must be 0 (fail-closed); got {row[1]}"
         )
+
+
+@pytest.mark.asyncio
+async def test_conviction_locked_at_column_exists_on_paper_trades(db):
+    """T1d — D2 fix: paper_trades.conviction_locked_at column added by
+    same migration. Default NULL (only stamped on first arm)."""
+    cur = await db._conn.execute("PRAGMA table_info(paper_trades)")
+    cols = {row[1]: (row[2], row[3]) for row in await cur.fetchall()}
+    assert "conviction_locked_at" in cols
+    coltype, notnull = cols["conviction_locked_at"]
+    assert coltype == "TEXT"
+    assert notnull == 0  # NULL is valid (not yet armed)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -163,37 +201,61 @@ SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_bl067_conviction_lock.py -v --tb=s
 
 Expected: FAIL with `assert "conviction_lock_enabled" in cols` (column doesn't exist).
 
-- [ ] **Step 3: Add ALTER TABLE migration step**
+- [ ] **Step 3: Add ALTER TABLE migration step (M1 + M3 fix)**
 
-In `scout/db.py:_migrate_signal_params_schema`, after the existing `signal_params_audit` index creation (around line 1612), BEFORE `await conn.execute("BEGIN EXCLUSIVE")` block ends:
-
-Locate the existing `_migrate_signal_params_schema` function. Add a new step that ALTERs the table only if the column doesn't exist (idempotent). Use the same `BEGIN EXCLUSIVE` ... `COMMIT` pattern.
+In `scout/db.py:_migrate_signal_params_schema`, **inside the existing `try: await conn.execute("BEGIN EXCLUSIVE")` block** at lines 1638-1680, AFTER the `signal_params_v1` cutover-marker INSERT (line 1668-1673), BEFORE `await conn.commit()` at line 1680:
 
 ```python
-# Inside _migrate_signal_params_schema, after the existing seed loop and
-# BEFORE the function's final commit (find the existing structure and
-# integrate this addition; the test-driven approach makes this concrete):
+            # BL-067: add conviction_lock_enabled column. Idempotent guard
+            # via PRAGMA table_info. Inside the existing BEGIN EXCLUSIVE
+            # transaction so PRAGMA + ALTER + INSERT all atomic. SQLite
+            # supports DDL inside transactions for the local DB.
+            cur_pragma = await conn.execute(
+                "PRAGMA table_info(signal_params)"
+            )
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            if "conviction_lock_enabled" not in existing_cols:
+                await conn.execute(
+                    "ALTER TABLE signal_params "
+                    "ADD COLUMN conviction_lock_enabled INTEGER "
+                    "NOT NULL DEFAULT 0"
+                )
+                await conn.execute(
+                    "INSERT OR IGNORE INTO paper_migrations "
+                    "(name, cutover_ts) VALUES (?, ?)",
+                    ("bl067_conviction_lock_enabled", now_iso),
+                )
 
-# BL-067 production: add conviction_lock_enabled column.
-# Default 0 = fail-closed; operator opts in per signal_type via SQL.
-cur = await conn.execute("PRAGMA table_info(signal_params)")
-existing_cols = {row[1] for row in await cur.fetchall()}
-if "conviction_lock_enabled" not in existing_cols:
-    await conn.execute(
-        "ALTER TABLE signal_params "
-        "ADD COLUMN conviction_lock_enabled INTEGER NOT NULL DEFAULT 0"
-    )
-    await conn.execute(
-        "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
-        "VALUES (?, ?)",
-        (
-            "bl067_conviction_lock_enabled",
-            datetime.now(timezone.utc).isoformat(),
-        ),
-    )
+            # BL-067: also add paper_trades.conviction_locked_at column
+            # (D2 — log idempotency + dashboard surface).
+            cur_pragma2 = await conn.execute(
+                "PRAGMA table_info(paper_trades)"
+            )
+            existing_pt_cols = {row[1] for row in await cur_pragma2.fetchall()}
+            if "conviction_locked_at" not in existing_pt_cols:
+                await conn.execute(
+                    "ALTER TABLE paper_trades "
+                    "ADD COLUMN conviction_locked_at TEXT"
+                )
+                # paper_migrations row only for the signal_params column;
+                # the paper_trades column rides on the same migration.
 ```
 
-Also extend the post-migration assertion set (search for `bl065_cashtag_trade_eligible` — same shape) to include `bl067_conviction_lock_enabled`.
+**M3 fix — add a NEW post-migration assertion paralleling the existing `signal_params_v1` check.** Immediately after the existing assertion at lines 1696-1702:
+
+```python
+        # BL-067 post-migration assertion: paper_migrations row recorded.
+        cur = await conn.execute(
+            "SELECT 1 FROM paper_migrations WHERE name = ?",
+            ("bl067_conviction_lock_enabled",),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "bl067_conviction_lock_enabled cutover row missing "
+                "after migration"
+            )
+```
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -245,6 +307,19 @@ def test_settings_paper_conviction_lock_threshold_must_be_at_least_two():
         Settings(PAPER_CONVICTION_LOCK_THRESHOLD=1)
     with pytest.raises(ValidationError):
         Settings(PAPER_CONVICTION_LOCK_THRESHOLD=0)
+
+
+def test_settings_paper_conviction_lock_threshold_must_be_at_most_eleven():
+    """T2d — S2 fix: upper bound 11 (highest observed stack in 30d data)."""
+    import pytest
+    from pydantic import ValidationError
+    from scout.config import Settings
+    # 11 OK (boundary)
+    s = Settings(PAPER_CONVICTION_LOCK_THRESHOLD=11)
+    assert s.PAPER_CONVICTION_LOCK_THRESHOLD == 11
+    # 12 rejected
+    with pytest.raises(ValidationError):
+        Settings(PAPER_CONVICTION_LOCK_THRESHOLD=12)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -275,10 +350,18 @@ Add field validator:
     @field_validator("PAPER_CONVICTION_LOCK_THRESHOLD")
     @classmethod
     def _validate_conviction_lock_threshold(cls, v: int) -> int:
+        # S2 fix: lower bound 2 (stack=1 = no independent signals fired);
+        # upper bound 11 (highest observed stack in 30d backtest data,
+        # per tasks/findings_bl067_backtest_conviction_lock.md Section A).
         if v < 2:
             raise ValueError(
                 "PAPER_CONVICTION_LOCK_THRESHOLD must be >= 2 "
                 f"(stack=1 means no independent signals fired; got {v})"
+            )
+        if v > 11:
+            raise ValueError(
+                "PAPER_CONVICTION_LOCK_THRESHOLD must be <= 11 "
+                f"(stack saturates at 4; observed max=11 over 30d; got {v})"
             )
         return v
 ```
@@ -537,9 +620,18 @@ async def compute_stack(
     backtest M1 fix (capture signals that would have fired in the
     extended-lock window, not just the actual closed-trade window).
 
-    Returns 0 for unknown tokens (caller treats stack=0 as no-lock-eligible).
+    Defensive: returns 0 for empty token_id, unknown tokens, OR when
+    db._conn is None (shutdown race per M4 fix). Caller treats stack=0
+    as no-lock-eligible. Failure mode = fail-closed.
     """
     if not token_id:
+        return 0
+    if db._conn is None:
+        log.warning(
+            "conviction_lock_db_closed",
+            token_id=token_id,
+            hint="db._conn is None — returning stack=0 fail-closed",
+        )
         return 0
     open_dt = datetime.fromisoformat(opened_at.replace("Z", "+00:00"))
     if open_dt.tzinfo is None:
@@ -558,20 +650,54 @@ async def compute_stack(
 
 Expected: 3 PASS.
 
-- [ ] **Step 5: Update `scripts/backtest_conviction_lock.py` to import shared helpers**
+- [ ] **Step 5: Update `scripts/backtest_conviction_lock.py` to use shared helpers (D3 fix)**
 
-Replace the local `_count_stacked_signals_in_window` and `conviction_locked_params` definitions with:
+Per design-review D3, the sync vs async impedance was overstated; a thin `asyncio.run()` adapter (~5 LOC) lets both files share one source of truth. Replace the script's local `_count_stacked_signals_in_window` AND `conviction_locked_params` with:
 
 ```python
+# scripts/backtest_conviction_lock.py — top of file (after existing imports)
+import asyncio
+
+# Production helpers — single source of truth (D3 fix).
+# Backtest is sync; production is async. Wrap the async helpers.
 from scout.trading.conviction import (
-    _count_stacked_signals_in_window as _count_stacked_signals_async,
+    _count_stacked_signals_in_window as _async_count_stacked,
     conviction_locked_params,
 )
+
+
+def _count_stacked_signals_in_window(conn, token_id, opened_at, end_at):
+    """Sync wrapper around the production async helper.
+
+    The backtest holds an `aiosqlite.Connection` is not — it uses raw
+    `sqlite3.Connection`. We adapt by constructing a thin shim Database
+    that exposes `_conn` + `await conn.execute(...)`.
+
+    Cost: 1 asyncio.run per call. Backtest tolerates this — it's
+    research-only, not a hot path.
+    """
+    class _SyncDBShim:
+        def __init__(self, conn):
+            class _AsyncCur:
+                def __init__(self, cur):
+                    self._cur = cur
+                async def fetchone(self):
+                    return self._cur.fetchone()
+                async def fetchall(self):
+                    return self._cur.fetchall()
+            class _AsyncConn:
+                def __init__(self, conn):
+                    self._c = conn
+                async def execute(self, sql, params=()):
+                    return _AsyncCur(self._c.execute(sql, params))
+            self._conn = _AsyncConn(conn)
+    shim = _SyncDBShim(conn)
+    return asyncio.run(_async_count_stacked(shim, token_id, opened_at, end_at))
 ```
 
-Wrap the async helper for the synchronous backtest script with a `_run_async()` adapter, OR (simpler) keep the sync version inlined in the backtest as a local helper but document with `# TODO: dedupe` — sync vs async impedance is real and the sync script is read-only research, so a separate-but-aligned implementation is acceptable. **Decision: keep duplicate for v1; both files reference each other in docstrings.** Cost of refactor exceeds benefit at this point.
+Drop the local `_CONVICTION_LOCK_DELTAS` and `_SIGNAL_SOURCES` definitions; they now live in the production module.
 
-(Skip — leave backtest unchanged; production module stands alone. TODO comment in `conviction.py` marks the reference.)
+(Note: the test fixture in `tests/test_backtest_conviction_lock.py` already uses minimal in-memory schema — it will continue to work because `_async_count_stacked` runs against the shim, which delegates to the same `sqlite3.Connection` the test built.)
 
 - [ ] **Step 6: Commit**
 
@@ -699,56 +825,242 @@ The overlay must:
 5. Log `conviction_lock_armed` with stack count and locked-param values
 6. Use the OVERLAID `sp` for the rest of the evaluator pass (`max_duration`, trail/sl checks)
 
-- [ ] **Step 1: Write failing integration test**
+- [ ] **Step 1: Write integration tests with full fixture (S5 fix)**
+
+**Shared fixture spec** (per S5):
+- `db` (existing fixture) — fully migrated DB with seeded `signal_params` rows
+- One paper_trade row: `signal_type='first_signal'`, `status='open'`, `entry_price=1.0`, `opened_at=now-2d`, `peak_pct=10.0`, etc.
+- ≥3 source-table rows on the same `token_id` after `opened_at`:
+  - 1 `gainers_snapshots` row at `opened_at + 1h`
+  - 1 `trending_snapshots` row at `opened_at + 2h`
+  - 1 `chain_matches` row at `opened_at + 3h` (with all chain_matches NOT NULL columns + chain_patterns FK seeded — same shape as BL-076 T11/T5e tests)
+- 1 `price_cache` row keeping the trade live
+- Operator opt-in setup: `UPDATE signal_params SET conviction_lock_enabled=1 WHERE signal_type='first_signal'` for the gate-pass tests; left at 0 for fail-closed tests
+- `monkeypatch.setattr(settings, "PAPER_CONVICTION_LOCK_ENABLED", True)` for tests that need master kill-switch ON
+
+Factor into `_seed_locked_eligible_trade(db, *, signal_type, opt_in_signal=False)` helper at top of test file.
 
 ```python
 @pytest.mark.asyncio
-async def test_evaluator_skips_conviction_lock_when_settings_kill_switch_off(db):
-    """T5 — fail-closed: even with per-signal opt-in, master kill-switch
-    OFF means no conviction-lock applied. Trade exits on base trail/sl."""
+async def test_evaluator_skips_conviction_lock_when_settings_kill_switch_off(
+    db, monkeypatch
+):
+    """T5 — fail-closed at master gate: settings.PAPER_CONVICTION_LOCK_ENABLED=False
+    means NO overlay regardless of per-signal flag or stack count."""
     from scout.config import Settings
+    from structlog.testing import capture_logs
+    from scout.trading.evaluator import evaluate_paper_trades
     settings = Settings()
     assert settings.PAPER_CONVICTION_LOCK_ENABLED is False  # default
-    # ... seed a trade where stack would be >= 3, then verify
-    # the eval pass uses BASE max_duration (168h), not locked (336h+).
-    # Implementation detail: spy/monkeypatch `conviction_locked_params`
-    # and assert it was NOT called when kill-switch is False.
-    pass  # Skeleton — fill during Build phase per design v2 test matrix
+    await _seed_locked_eligible_trade(db, signal_type="first_signal", opt_in_signal=True)
+    with capture_logs() as logs:
+        await evaluate_paper_trades(db, settings)
+    events = [e.get("event") for e in logs]
+    assert "conviction_lock_armed" not in events
+    # paper_trades.conviction_locked_at must remain NULL
+    cur = await db._conn.execute(
+        "SELECT conviction_locked_at FROM paper_trades WHERE status='open' LIMIT 1"
+    )
+    row = await cur.fetchone()
+    assert row[0] is None
 
 
 @pytest.mark.asyncio
-async def test_evaluator_skips_conviction_lock_when_signal_not_opted_in(db):
-    """T5b — fail-closed at signal level: kill-switch ON + 
+async def test_evaluator_skips_conviction_lock_when_signal_not_opted_in(
+    db, monkeypatch
+):
+    """T5b — fail-closed at signal level: kill-switch ON +
     signal_params.conviction_lock_enabled=0 means no lock."""
-    pass  # Skeleton
+    from scout.config import Settings
+    from structlog.testing import capture_logs
+    from scout.trading.evaluator import evaluate_paper_trades
+    settings = Settings()
+    monkeypatch.setattr(settings, "PAPER_CONVICTION_LOCK_ENABLED", True)
+    await _seed_locked_eligible_trade(
+        db, signal_type="first_signal", opt_in_signal=False
+    )
+    with capture_logs() as logs:
+        await evaluate_paper_trades(db, settings)
+    events = [e.get("event") for e in logs]
+    assert "conviction_lock_armed" not in events
 
 
 @pytest.mark.asyncio
-async def test_evaluator_skips_conviction_lock_when_below_threshold(db):
-    """T5c — stack=2 below threshold (default 3) → no lock applied."""
-    pass  # Skeleton
+async def test_evaluator_skips_conviction_lock_when_below_threshold(
+    db, monkeypatch
+):
+    """T5c — stack < threshold → no lock. Seed only 2 source rows;
+    threshold=3 default."""
+    from scout.config import Settings
+    from structlog.testing import capture_logs
+    from scout.trading.evaluator import evaluate_paper_trades
+    settings = Settings()
+    monkeypatch.setattr(settings, "PAPER_CONVICTION_LOCK_ENABLED", True)
+    # Seed only 2 distinct sources (gainers + trending), no chain_matches
+    await _seed_locked_eligible_trade(
+        db, signal_type="first_signal", opt_in_signal=True,
+        n_extra_sources=2,  # below default threshold=3
+    )
+    with capture_logs() as logs:
+        await evaluate_paper_trades(db, settings)
+    events = [e.get("event") for e in logs]
+    assert "conviction_lock_armed" not in events
 
 
 @pytest.mark.asyncio
-async def test_evaluator_arms_conviction_lock_when_all_gates_pass(db):
-    """T5d — all 3 gates pass → locked params used. Asserts log event
-    `conviction_lock_armed` with stack count and overlaid params."""
-    pass  # Skeleton
+async def test_evaluator_arms_conviction_lock_when_all_gates_pass(
+    db, monkeypatch
+):
+    """T5d — all 3 gates pass → locked params used. Asserts:
+    - `conviction_lock_armed` event fires
+    - paper_trades.conviction_locked_at gets stamped
+    - max_duration in the eval pass uses overlaid value"""
+    from scout.config import Settings
+    from structlog.testing import capture_logs
+    from scout.trading.evaluator import evaluate_paper_trades
+    settings = Settings()
+    monkeypatch.setattr(settings, "PAPER_CONVICTION_LOCK_ENABLED", True)
+    await _seed_locked_eligible_trade(
+        db, signal_type="first_signal", opt_in_signal=True,
+        n_extra_sources=3,  # at default threshold=3
+    )
+    with capture_logs() as logs:
+        await evaluate_paper_trades(db, settings)
+    armed = [e for e in logs if e.get("event") == "conviction_lock_armed"]
+    assert armed, f"expected conviction_lock_armed; got {[e.get('event') for e in logs]}"
+    a = armed[0]
+    assert a["stack"] >= 3
+    assert a["threshold"] == 3
+    # Stack=3 → max_duration_hours += 168 = 336 (from base 168)
+    # trail_pct +10pp capped at 35; sl_pct +10pp capped at 40
+    assert a["locked_max_duration_hours"] >= 336
+    cur = await db._conn.execute(
+        "SELECT conviction_locked_at FROM paper_trades WHERE status='open' LIMIT 1"
+    )
+    row = await cur.fetchone()
+    assert row[0] is not None  # stamped
+
+
+@pytest.mark.asyncio
+async def test_evaluator_logs_conviction_lock_armed_only_once(db, monkeypatch):
+    """T5e — D2 fix: subsequent eval passes do NOT re-emit
+    conviction_lock_armed once paper_trades.conviction_locked_at is set."""
+    from scout.config import Settings
+    from structlog.testing import capture_logs
+    from scout.trading.evaluator import evaluate_paper_trades
+    settings = Settings()
+    monkeypatch.setattr(settings, "PAPER_CONVICTION_LOCK_ENABLED", True)
+    await _seed_locked_eligible_trade(
+        db, signal_type="first_signal", opt_in_signal=True,
+        n_extra_sources=3,
+    )
+    # First pass — arms
+    with capture_logs() as logs1:
+        await evaluate_paper_trades(db, settings)
+    armed1 = [e for e in logs1 if e.get("event") == "conviction_lock_armed"]
+    assert len(armed1) == 1
+    # Second pass — should NOT re-arm (D2 idempotency)
+    with capture_logs() as logs2:
+        await evaluate_paper_trades(db, settings)
+    armed2 = [e for e in logs2 if e.get("event") == "conviction_lock_armed"]
+    assert armed2 == [], f"D2 regression: re-emitted on second pass; got {armed2}"
+
+
+@pytest.mark.asyncio
+async def test_compute_stack_returns_zero_when_db_conn_closed(db):
+    """T5f — M4 fix: compute_stack with db._conn=None returns 0 + logs warning."""
+    from structlog.testing import capture_logs
+    from scout.trading.conviction import compute_stack
+    real_conn = db._conn
+    db._conn = None
+    try:
+        with capture_logs() as logs:
+            n = await compute_stack(db, "test-coin", "2026-05-01T00:00:00+00:00")
+        assert n == 0
+        events = [e.get("event") for e in logs]
+        assert "conviction_lock_db_closed" in events
+    finally:
+        db._conn = real_conn
+
+
+def test_moonshot_trail_composes_with_locked_trail():
+    """T6 — A1 fix: at stack=4, locked trail (35%) > moonshot (30%);
+    effective_trail_pct = max(30, 35) = 35. Pure unit test of the
+    arithmetic; production patch at evaluator.py:357 mirrors this."""
+    from scout.config import Settings
+    settings = Settings()
+    sp_trail_pct_locked = 35.0  # stack=4 locked trail
+    effective = max(settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT, sp_trail_pct_locked)
+    assert effective == 35.0
+
+
+@pytest.mark.asyncio
+async def test_lab_711_regression_simulates_locked_first_signal(
+    db, monkeypatch
+):
+    """T8 — N4 fix: pin LAB #711 backtest finding (+$549.67 vs actual -$15.96)
+    via synthetic 11-stack first_signal trade. Mirrors operator's manual
+    hypothetical of $531."""
+    # Synthesize trade with 11 distinct signal sources fired AFTER opened_at;
+    # set price_cache to simulate the LAB price trajectory (entry=$0.597,
+    # current=~$1.65, intermediate snapshots showing peak above 60%);
+    # run evaluator; assert conviction_lock_armed fires AND the trade's
+    # max_duration is 504h (saturated stack=4 ceiling).
+    # Concrete fixture details deferred to Build phase per S5; this test
+    # is the regression anchor for the +$549 finding.
+    pass  # Filled in during Build per S5 fixture spec
 ```
 
-(Skeletons because evaluator integration test setup is heavy — fill them out during Build phase per the design v2 test matrix. Pin event name + at least one numeric assertion.)
+(T8 is the single test allowed to remain skeleton because the LAB-trajectory price-path requires more fixture infrastructure; concrete fixture spec is committed in design v2.)
 
-- [ ] **Step 2: Add overlay logic to evaluator**
+- [ ] **Step 2: Add overlay logic to evaluator (M2/A2 placement-critical)**
 
-In `scout/trading/evaluator.py`, immediately after `sp = await params_for_signal(db, signal_type_row, settings)` at line 157:
+**M2/A2 fix — placement strictly between lines 157 and 158.** `max_duration = timedelta(hours=sp.max_duration_hours)` runs at line 158 and references `sp.max_duration_hours`. If overlay runs AFTER line 158, the locked 504h is silently ignored. The overlay block must:
+1. Run AFTER `sp = await params_for_signal(db, signal_type_row, settings)` (line 157)
+2. Run BEFORE `max_duration = timedelta(hours=sp.max_duration_hours)` (line 158)
+3. Replace `sp` via `dataclasses.replace(...)` so the overlaid `max_duration_hours` flows into line 158's `timedelta()` call
+
+**D2 fix — log idempotency via `paper_trades.conviction_locked_at` column.** Stamp the column on first arm; gate the `conviction_lock_armed` log on `conviction_locked_at IS NULL`. Subsequent passes still apply the overlay (params re-derived from current stack) but emit no log.
+
+Modify the SELECT at lines 97-108 to also fetch `conviction_locked_at`:
+
+```python
+    cursor = await conn.execute("""SELECT id, token_id, entry_price, opened_at,
+                  tp_price, sl_price, tp_pct, sl_pct,
+                  checkpoint_1h_price, checkpoint_6h_price,
+                  checkpoint_24h_price, checkpoint_48h_price,
+                  peak_price, peak_pct, signal_data, symbol, name, chain,
+                  amount_usd, quantity, signal_type,
+                  created_at, leg_1_filled_at, leg_2_filled_at,
+                  remaining_qty, floor_armed, realized_pnl_usd,
+                  checkpoint_6h_pct, checkpoint_24h_pct,
+                  moonshot_armed_at, conviction_locked_at
+           FROM paper_trades
+           WHERE status = 'open'""")
+```
+
+In the per-trade body, immediately after `sp = await params_for_signal(...)` at line 157:
 
 ```python
             # BL-067 conviction-lock overlay. Three gates ALL must pass:
-            # 1. Master kill-switch ON
+            # 1. Master kill-switch ON (settings.PAPER_CONVICTION_LOCK_ENABLED)
             # 2. Per-signal opt-in (signal_params.conviction_lock_enabled=1)
             # 3. Stack count >= PAPER_CONVICTION_LOCK_THRESHOLD
-            # All gates default fail-closed; production deploy is a no-op
-            # until operator explicitly opts a signal_type in.
+            #
+            # Placement-critical (M2/A2): MUST run BEFORE line 158
+            # `max_duration = timedelta(hours=sp.max_duration_hours)` so
+            # the overlaid max_duration_hours flows into the timedelta call.
+            #
+            # Note: trail_pct_low_peak intentionally NOT overlaid (A3) —
+            # adaptive low-peak trail is orthogonal regime (peak <
+            # low_peak_threshold); locked trail only fires at high peak.
+            # Leg targets (leg_1_pct/leg_2_pct/qty_frac) NOT overlaid (S6)
+            # — BL-067 spec table only widens trail/sl/max_duration.
+            #
+            # `row[30]` = conviction_locked_at (added to SELECT above);
+            # column index = 30 in 0-indexed row (after moonshot_armed_at
+            # at index 29).
+            conviction_locked_at = row[30]
             if (
                 settings.PAPER_CONVICTION_LOCK_ENABLED
                 and sp.conviction_lock_enabled
@@ -767,7 +1079,9 @@ In `scout/trading/evaluator.py`, immediately after `sp = await params_for_signal
                             "sl_pct": sp.sl_pct,
                         },
                     )
-                    # Replace sp with overlaid frozen dataclass
+                    # Replace sp with overlaid frozen dataclass.
+                    # Critical: this MUST happen before line 158 so the
+                    # NEW max_duration_hours is what timedelta() reads.
                     from dataclasses import replace
                     sp = replace(
                         sp,
@@ -775,28 +1089,53 @@ In `scout/trading/evaluator.py`, immediately after `sp = await params_for_signal
                         trail_pct=locked["trail_pct"],
                         sl_pct=locked["sl_pct"],
                     )
-                    log.info(
-                        "conviction_lock_armed",
-                        trade_id=trade_id,
-                        token_id=token_id,
-                        signal_type=signal_type_row,
-                        stack=stack,
-                        threshold=threshold,
-                        locked_trail_pct=sp.trail_pct,
-                        locked_sl_pct=sp.sl_pct,
-                        locked_max_duration_hours=sp.max_duration_hours,
-                    )
-                else:
-                    log.info(
-                        "conviction_lock_skipped_below_threshold",
-                        trade_id=trade_id,
-                        token_id=token_id,
-                        stack=stack,
-                        threshold=threshold,
+                    # D2 fix: log + stamp ONCE per trade. Subsequent passes
+                    # still apply the overlay (params re-derived from
+                    # current stack each time) but emit no log.
+                    if conviction_locked_at is None:
+                        armed_iso = now.isoformat()
+                        await conn.execute(
+                            "UPDATE paper_trades SET conviction_locked_at = ? "
+                            "WHERE id = ?",
+                            (armed_iso, trade_id),
+                        )
+                        await conn.commit()
+                        log.info(
+                            "conviction_lock_armed",
+                            trade_id=trade_id,
+                            token_id=token_id,
+                            signal_type=signal_type_row,
+                            stack=stack,
+                            threshold=threshold,
+                            locked_trail_pct=sp.trail_pct,
+                            locked_sl_pct=sp.sl_pct,
+                            locked_max_duration_hours=sp.max_duration_hours,
+                            armed_at=armed_iso,
+                        )
+                # Below-threshold: silent (operator can grep absence of
+                # `conviction_lock_armed` events for the trade if they want
+                # to know why a token didn't lock).
+```
+
+Line 158 then reads the overlaid `sp.max_duration_hours` — no change needed.
+
+**A1 fix — moonshot trail composition.** Production at `evaluator.py:356-357` reads `settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT` directly, ignoring `sp.trail_pct`. At stack=4 (locked trail = 35%) on a moonshot-armed trade the trail collapses to 30% — feature broken in the high-peak regime where it matters most. **Patch line 357:**
+
+```python
+                if moonshot_armed_at is not None:
+                    # BL-067 A1 fix: compose moonshot floor with locked trail.
+                    # Locked trail (sp.trail_pct, possibly overlaid by
+                    # conviction-lock) wins when wider; otherwise moonshot
+                    # constant wins. max() preserves both regimes' protective
+                    # intent. Backtest simulator already used this max() form;
+                    # production must match.
+                    effective_trail_pct = max(
+                        settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT,
+                        sp.trail_pct,
                     )
 ```
 
-`max_duration` is recomputed from the overlaid `sp` on line 158 — already in the existing code path. trail_pct and sl_pct flow into the existing trail/SL state machine via `sp.trail_pct` / `sp.sl_pct` references.
+Add a regression test pinning the composition: at stack=4 + moonshot armed, effective_trail = max(30, 35) = 35.
 
 - [ ] **Step 3: Fill out test skeletons + run**
 
@@ -966,7 +1305,7 @@ The migration is forward-only (column persists post-revert; no functional impact
 **9. Honest scope:**
 - **NOT in scope:** dashboard surface (`conviction_stack_count` badge on open positions). Defer to BL-067-dashboard follow-up — this PR is the trading-engine integration only.
 - **NOT in scope:** narrative_prediction `--max-hours 720` re-run — operator runs that BEFORE flipping `conviction_lock_enabled=1` for narrative_prediction.
-- **NOT in scope:** consolidating `_count_stacked_signals_in_window` from `scripts/backtest_conviction_lock.py` (sync vs async impedance + research-script-not-touched policy). The new module in `scout/trading/conviction.py` is async; the backtest stays sync. TODO comment added.
+- **IN scope (N5/D3 reconciliation):** consolidating `_count_stacked_signals_in_window` from `scripts/backtest_conviction_lock.py` IS now in scope per D3 — sync/async impedance solved with thin `asyncio.run()` adapter (~5 LOC, see Task 3 Step 5). Single source of truth in `scout/trading/conviction.py`; backtest wraps it. Removes the predictable 60-day drift hazard.
 - **DELIBERATELY DEFERRED:** dynamic threshold calibration — operator can change PAPER_CONVICTION_LOCK_THRESHOLD via `.env` but the backtest validated N=3 specifically; lowering to N=2 should be a separate operator decision with re-run.
 - **DELIBERATELY DEFERRED:** stack-count caching — backtest validated real-time computation is cheap (~9 indexed SELECTs ≈ ms). Persist only if profiling shows the eval-loop hot path.
 - **DELIBERATELY DEFERRED:** conviction_stack downgrade on inactivity — once locked, stays locked through trade life (per backlog Q9 + simpler).
