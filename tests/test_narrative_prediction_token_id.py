@@ -162,6 +162,15 @@ async def test_legit_in_lookup_chain_opens_trade(db, settings_factory):
         (now,),
     )
     await db._conn.commit()
+    # PR #72 Gap #4 — explicit assertion that price_cache is EMPTY for
+    # race-coin; otherwise the test could pass on either source path.
+    cur = await db._conn.execute(
+        "SELECT 1 FROM price_cache WHERE coin_id = 'race-coin'"
+    )
+    assert (await cur.fetchone()) is None, (
+        "T2b precondition: price_cache must be empty for race-coin; "
+        "test exercises the snapshot-table fallback path"
+    )
     pred = _make_pred(coin_id="race-coin")
     with capture_logs() as logs:
         await trade_predictions(engine, db, [pred], settings=settings)
@@ -263,3 +272,114 @@ def test_filters_module_exports_match_signals_back_compat():
     # Both modules expose the same callable
     assert filt._is_junk_coinid is sig._is_junk_coinid
     assert filt._is_tradeable_candidate is sig._is_tradeable_candidate
+
+
+# ---------------------------------------------------------------------------
+# PR #72 reviewer-requested gaps (silent-failure + test-coverage)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_coin_id_resolves_raises_on_operational_error(db, monkeypatch):
+    """Gap #1 (PR #72 test-coverage CRITICAL) — F3 fail-CLOSED at the
+    helper source. Mock _conn.execute to raise aiosqlite.OperationalError;
+    assert CoinIdResolutionError propagates from the helper itself."""
+    import aiosqlite
+    from scout.db import CoinIdResolutionError
+
+    real_execute = db._conn.execute
+
+    async def _broken_execute(sql, params=()):
+        if "FROM price_cache" in sql:
+            raise aiosqlite.OperationalError("simulated column rename")
+        return await real_execute(sql, params)
+
+    monkeypatch.setattr(db._conn, "execute", _broken_execute)
+    with pytest.raises(CoinIdResolutionError) as exc_info:
+        await db.coin_id_resolves("any-coin")
+    assert "OperationalError on price_cache" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_coin_id_resolves_raises_db_not_initialized_when_conn_none(
+    tmp_path,
+):
+    """PR #72 silent-failure H2 — distinct exception class when
+    self._conn is None (catastrophic) vs OperationalError (transient).
+    Caller dispatches to different `reason` fields."""
+    from scout.db import Database, DbNotInitializedError
+
+    d = Database(tmp_path / "x.db")
+    # Don't initialize → _conn is None
+    with pytest.raises(DbNotInitializedError):
+        await d.coin_id_resolves("any-coin")
+
+
+def test_is_tradeable_candidate_rejects_all_whitespace_inputs():
+    """Gap #2 (PR #72 test-coverage CRITICAL) — cross-dispatcher
+    regression pin. The strip() addition rejects ALL-whitespace
+    coin_ids/tickers across all 6 callers (trade_volume_spikes,
+    trade_gainers, etc.) + the new predictor.filter_laggards.
+
+    Pre-PR: `"   "` was silently accepted by `not coin_id` (truthy).
+    Post-PR: `not coin_id.strip()` rejects.
+
+    Whitespace-PADDED inputs (e.g., `"bitcoin "` with trailing space)
+    are still accepted — strip evaluates to "bitcoin" which is truthy.
+    Documented behavior: this PR doesn't normalize whitespace, only
+    rejects pure-whitespace junk."""
+    from scout.trading.filters import _is_tradeable_candidate
+
+    # ALL-whitespace coin_id → reject (pre-PR accepted silently)
+    assert _is_tradeable_candidate("   ", "BTC") is False
+    assert _is_tradeable_candidate("\t\n", "BTC") is False
+    # ALL-whitespace ticker → reject (pre-PR accepted silently)
+    assert _is_tradeable_candidate("bitcoin", "   ") is False
+    # Empty → reject (pre-PR also rejected via `not coin_id`)
+    assert _is_tradeable_candidate("", "BTC") is False
+    assert _is_tradeable_candidate("bitcoin", "") is False
+    # Whitespace-PADDED still accepted (stripped value is non-empty;
+    # this PR doesn't normalize). Documents the boundary.
+    assert _is_tradeable_candidate("bitcoin ", "BTC") is True
+    assert _is_tradeable_candidate(" bitcoin", "BTC") is True
+    # Clean input → accepted (existing behavior preserved)
+    assert _is_tradeable_candidate("bitcoin", "BTC") is True
+
+
+@_SKIP_AIOHTTP
+def test_predictor_filter_laggards_drops_junk_prefix_tokens_end_to_end():
+    """Gap #3 (PR #72 test-coverage HIGH) — exercise the actual
+    filter_laggards function with a CoinGecko-shape response containing
+    junk-prefix entries. Without this, a revert of the predictor.py
+    edit would leave T4 (helper-only) green but the upstream defense
+    would silently disappear."""
+    from scout.narrative.predictor import filter_laggards
+
+    raw_tokens = [
+        {
+            "id": "test-1", "symbol": "TEST1", "name": "Test 1",
+            "market_cap": 1_000_000, "price_change_percentage_24h": -10.0,
+            "total_volume": 100_000, "current_price": 1.0,
+        },
+        {
+            "id": "real-coin", "symbol": "REAL", "name": "Real Coin",
+            "market_cap": 5_000_000, "price_change_percentage_24h": -5.0,
+            "total_volume": 100_000, "current_price": 2.0,
+        },
+        {
+            "id": "wrapped-bitcoin", "symbol": "WBTC", "name": "Wrapped BTC",
+            "market_cap": 10_000_000, "price_change_percentage_24h": -8.0,
+            "total_volume": 100_000, "current_price": 50000.0,
+        },
+    ]
+    result = filter_laggards(
+        raw_tokens,
+        category_id="test", category_name="Test",
+        max_mcap=1e9, max_change=100, min_change=-100, min_volume=0,
+    )
+    coin_ids = [tok.coin_id for tok in result]
+    # Junk-prefix entries REJECTED by upstream filter
+    assert "test-1" not in coin_ids
+    assert "wrapped-bitcoin" not in coin_ids
+    # Real coin ACCEPTED
+    assert "real-coin" in coin_ids
