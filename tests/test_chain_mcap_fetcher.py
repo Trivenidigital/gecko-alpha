@@ -4,6 +4,7 @@ Tests the FetchResult-returning fetcher (per design-review R1-M1 + R2-2:
 the v2 'float | None' signature conflated 429 with no-data, leading to
 misleading 'restart service' guidance during routine DS rate-limiting).
 """
+
 from __future__ import annotations
 
 import os

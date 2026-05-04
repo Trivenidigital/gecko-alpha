@@ -96,9 +96,7 @@ async def fetch_token_fdv(
             if status == 429:
                 return FetchResult(None, FetchStatus.RATE_LIMITED)
             if status != 200:
-                logger.debug(
-                    "ds_fetch_non_200", contract=contract, status=status
-                )
+                logger.debug("ds_fetch_non_200", contract=contract, status=status)
                 return FetchResult(None, FetchStatus.TRANSIENT)
             try:
                 data = await resp.json()

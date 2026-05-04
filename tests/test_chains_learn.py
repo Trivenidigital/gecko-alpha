@@ -211,7 +211,7 @@ async def test_update_chain_outcomes_from_predictions(db, settings):
     )
     await db._conn.commit()
 
-    updated = await update_chain_outcomes(db)
+    updated = await update_chain_outcomes(db, session=object())
     assert updated == 1
 
     async with db._conn.execute(
@@ -250,7 +250,7 @@ async def test_update_chain_outcomes_skips_recent(db, settings):
         ),
     )
     await db._conn.commit()
-    updated = await update_chain_outcomes(db)
+    updated = await update_chain_outcomes(db, session=object())
     assert updated == 0
 
 
@@ -287,9 +287,7 @@ async def test_lifecycle_skips_retirement_when_all_patterns_zero_hits(db, settin
         assert r[1] == 1, f"pattern {r[0]} was retired despite zero-hits-systemwide"
 
 
-async def test_lifecycle_still_retires_bad_pattern_when_others_have_hits(
-    db, settings
-):
+async def test_lifecycle_still_retires_bad_pattern_when_others_have_hits(db, settings):
     """The guard must NOT block per-pattern retirement when at least one
     other pattern is producing hits. That keeps Tier-1b-style auto-suspend
     working for genuinely bad patterns when the system has demonstrated it
@@ -310,6 +308,7 @@ async def test_lifecycle_still_retires_bad_pattern_when_others_have_hits(
         rows = {r[0]: r[1] for r in await cur.fetchall()}
 
     assert rows["full_conviction"] == 1, "healthy pattern must stay active"
-    assert rows["narrative_momentum"] == 0, "bad pattern must retire when others have hits"
+    assert (
+        rows["narrative_momentum"] == 0
+    ), "bad pattern must retire when others have hits"
     assert rows["volume_breakout"] == 0, "bad pattern must retire when others have hits"
-

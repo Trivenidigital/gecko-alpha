@@ -1,14 +1,25 @@
-"""BL-071b + BL-071a (partial): chain_matches outcome hydration regression tests.
+"""BL-071b + BL-071a (partial) + BL-071a' v3: chain_matches outcome hydration tests.
 
 Uses local `db` fixture matching tests/test_chains_tracker.py pattern —
 there is no global tmp_db fixture in conftest.
+
+Tests that verify the BL-071a' hydrator session-self-create path require
+real aiohttp; gated by SKIP_AIOHTTP_TESTS=1 on Windows due to OpenSSL
+DLL conflict (matches Bundle A pattern in tests/test_heartbeat_mcap_missing.py).
 """
 
 from __future__ import annotations
 
+import os
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
+
+_SKIP_AIOHTTP = pytest.mark.skipif(
+    sys.platform == "win32" and os.environ.get("SKIP_AIOHTTP_TESTS") == "1",
+    reason="Windows + SKIP_AIOHTTP_TESTS=1: skip aiohttp self-create path",
+)
 
 from scout.chains.models import ActiveChain, ChainPattern, ChainStep
 from scout.chains.patterns import seed_built_in_patterns
@@ -122,7 +133,7 @@ async def test_hydrator_picks_up_null_expired_chain(db):
         (long_ago.isoformat(),),
     )
     await db._conn.commit()
-    updated = await update_chain_outcomes(db)
+    updated = await update_chain_outcomes(db, session=object())
     assert updated == 1
     cur = await db._conn.execute(
         "SELECT outcome_class FROM chain_matches WHERE token_id='TOKEN_B'"
@@ -226,8 +237,17 @@ def _capture_chain_logs(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(
+    reason=(
+        "Superseded by BL-071a' (commit b51324c+next): silent-skip semantics "
+        "are gone — populated mcap_at_completion is now actively resolved via "
+        "DexScreener fetch. Test preserved as documentation of Bundle A "
+        "intermediate behaviour and as a guard if someone later removes the "
+        "BL-071a' resolution path. Per plan v3 R2-4."
+    )
+)
 async def test_hydrator_silent_skip_when_mcap_at_completion_populated(db, monkeypatch):
-    """BL-071a partial: when memecoin chain_match has non-NULL
+    """[SUPERSEDED] BL-071a partial: when memecoin chain_match has non-NULL
     mcap_at_completion, hydrator must skip silently — BL-071a' will add the
     DexScreener fetch later. No per-row warning (that would be permanent
     log noise)."""
@@ -242,7 +262,7 @@ async def test_hydrator_silent_skip_when_mcap_at_completion_populated(db, monkey
         (long_ago, long_ago),
     )
     await db._conn.commit()
-    updated = await update_chain_outcomes(db)
+    updated = await update_chain_outcomes(db, session=object())
     assert updated == 0
     # Must NOT emit per-row warning for the populated case (silent intentional skip).
     pending_warnings = [c for c in captured if "pending" in c[1]]
@@ -302,17 +322,21 @@ async def test_hydrator_aggregate_warning_when_no_source(db, monkeypatch):
         rows,
     )
     await db._conn.commit()
-    updated = await update_chain_outcomes(db)
+    updated = await update_chain_outcomes(db, session=object())
     assert updated == 0
     aggregate = [c for c in captured if c[1] == "chain_outcomes_unhydrateable_memecoin"]
     assert len(aggregate) == 1, (
-        f"expected exactly one aggregate warning for 5 unhydrateable rows, got "
+        f"expected exactly one aggregate warning for unhydrateable rows, got "
         f"{len(aggregate)}: {captured}"
     )
     _, _, kwargs = aggregate[0]
-    assert kwargs["total_unhydrateable"] == 5
-    assert kwargs["backlog_ref"] == "BL-071a'"
-    assert kwargs["expires_when"].startswith("BL-071a'")
+    # Post-BL-071a' v3 semantic: 'unhydrateable' = NULL mcap + no legacy
+    # outcomes row. Dust mcap (0.0/-1.0) is a separate concern handled by
+    # the chain_outcome_mcap_below_floor_at_hydrate DEBUG log, NOT counted
+    # as 'unhydrateable'. So this test now expects 3 (the 3 NULL-mcap rows
+    # from the for-loop), not 5.
+    assert kwargs["total_unhydrateable"] == 3
+    assert kwargs["cause"] == "legacy_no_mcap_no_outcomes_row"
 
 
 @pytest.mark.asyncio
@@ -342,7 +366,7 @@ async def test_hydrator_memecoin_legacy_outcomes_path_hits(db):
         (contract, long_ago),
     )
     await db._conn.commit()
-    updated = await update_chain_outcomes(db)
+    updated = await update_chain_outcomes(db, session=object())
     assert updated == 1
     cur = await db._conn.execute(
         "SELECT outcome_class FROM chain_matches WHERE token_id = ?",
@@ -379,7 +403,7 @@ async def test_hydrator_aggregate_does_not_count_narrative_rows(db, monkeypatch)
         ],
     )
     await db._conn.commit()
-    updated = await update_chain_outcomes(db)
+    updated = await update_chain_outcomes(db, session=object())
     assert updated == 0
     aggregate = [c for c in captured if c[1] == "chain_outcomes_unhydrateable_memecoin"]
     assert len(aggregate) == 1
@@ -428,7 +452,9 @@ def test_chain_match_model_has_mcap_at_completion_field():
 # ---------------------------------------------------------------------------
 
 
-def _make_active_chain_for_completion(token_id: str, pipeline: str = "memecoin") -> ActiveChain:
+def _make_active_chain_for_completion(
+    token_id: str, pipeline: str = "memecoin"
+) -> ActiveChain:
     """Build a chain that's at completion state (is_complete=True)."""
     now = datetime.now(timezone.utc)
     anchor = now - timedelta(hours=2)
@@ -467,7 +493,10 @@ async def test_record_completion_populates_mcap_at_completion(db, settings_facto
     )
 
     await _record_completion(
-        db, chain, pattern, s,
+        db,
+        chain,
+        pattern,
+        s,
         session=object(),  # any non-None — fetcher is stubbed
         mcap_fetcher=_stub_fetcher,
     )
@@ -480,7 +509,9 @@ async def test_record_completion_populates_mcap_at_completion(db, settings_facto
 
 
 @pytest.mark.asyncio
-async def test_record_completion_leaves_mcap_null_when_fetcher_returns_no_data(db, settings_factory):
+async def test_record_completion_leaves_mcap_null_when_fetcher_returns_no_data(
+    db, settings_factory
+):
     """Graceful degradation: NO_DATA → row writes with mcap NULL."""
     from scout.chains.mcap_fetcher import FetchResult, FetchStatus
     from scout.chains.tracker import _record_completion
@@ -497,7 +528,10 @@ async def test_record_completion_leaves_mcap_null_when_fetcher_returns_no_data(d
     )
 
     await _record_completion(
-        db, chain, pattern, s,
+        db,
+        chain,
+        pattern,
+        s,
         session=object(),
         mcap_fetcher=_none_fetcher,
     )
@@ -510,7 +544,9 @@ async def test_record_completion_leaves_mcap_null_when_fetcher_returns_no_data(d
 
 
 @pytest.mark.asyncio
-async def test_record_completion_skips_fetcher_for_narrative_pipeline(db, settings_factory):
+async def test_record_completion_skips_fetcher_for_narrative_pipeline(
+    db, settings_factory
+):
     """Narrative pipeline doesn't use FDV-based outcome — token_id is a
     CoinGecko slug, not a contract address. Fetcher MUST NOT be called."""
     from scout.chains.tracker import _record_completion
@@ -523,6 +559,7 @@ async def test_record_completion_skips_fetcher_for_narrative_pipeline(db, settin
     async def _spy_fetcher(session, contract):
         fetcher_calls.append(contract)
         from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
         return FetchResult(999_999.0, FetchStatus.OK)
 
     s = settings_factory(
@@ -531,14 +568,17 @@ async def test_record_completion_skips_fetcher_for_narrative_pipeline(db, settin
     )
 
     await _record_completion(
-        db, chain, pattern, s,
+        db,
+        chain,
+        pattern,
+        s,
         session=object(),
         mcap_fetcher=_spy_fetcher,
     )
     await db._conn.commit()
-    assert fetcher_calls == [], (
-        f"narrative pipeline must NOT call DS fetcher; got {fetcher_calls}"
-    )
+    assert (
+        fetcher_calls == []
+    ), f"narrative pipeline must NOT call DS fetcher; got {fetcher_calls}"
     cur = await db._conn.execute(
         "SELECT mcap_at_completion FROM chain_matches WHERE token_id='boba-network'"
     )
@@ -566,7 +606,10 @@ async def test_record_completion_enforces_mcap_floor(db, settings_factory):
     )
 
     await _record_completion(
-        db, chain, pattern, s,
+        db,
+        chain,
+        pattern,
+        s,
         session=object(),
         mcap_fetcher=_dust_fetcher,
     )
@@ -579,3 +622,421 @@ async def test_record_completion_enforces_mcap_floor(db, settings_factory):
         f"dust mcap below floor must write NULL, not {row[0]} — "
         "would produce fake +500,000% hits at hydration time"
     )
+
+
+# ---------------------------------------------------------------------------
+# BL-071a' v3 hydrator tests (DexScreener resolution + aggregate signals)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hydrator_resolves_memecoin_via_dexscreener_hit(db, settings_factory):
+    """BL-071a': memecoin chain_match with populated mcap_at_completion
+    + current FDV >+50% → outcome_class='hit'."""
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES ('0xwinner','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, 1000000.0)""",
+        (long_ago, long_ago),
+    )
+    await db._conn.commit()
+
+    async def _stub_fetcher(session, contract):
+        assert contract == "0xwinner"
+        return FetchResult(2_000_000.0, FetchStatus.OK)  # +100%
+
+    s = settings_factory(CHAIN_OUTCOME_HIT_THRESHOLD_PCT=50.0)
+    updated = await update_chain_outcomes(
+        db, settings=s, session=object(), mcap_fetcher=_stub_fetcher
+    )
+    assert updated == 1
+    cur = await db._conn.execute(
+        "SELECT outcome_class, outcome_change_pct FROM chain_matches WHERE token_id='0xwinner'"
+    )
+    row = await cur.fetchone()
+    assert row[0] == "hit"
+    assert row[1] == pytest.approx(100.0, rel=0.01)
+
+
+@pytest.mark.asyncio
+async def test_hydrator_resolves_memecoin_via_dexscreener_miss(db, settings_factory):
+    """+0% to +50% → 'miss'."""
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES ('0xflat','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, 1000000.0)""",
+        (long_ago, long_ago),
+    )
+    await db._conn.commit()
+
+    async def _stub_fetcher(session, contract):
+        return FetchResult(1_200_000.0, FetchStatus.OK)  # +20%
+
+    s = settings_factory(CHAIN_OUTCOME_HIT_THRESHOLD_PCT=50.0)
+    updated = await update_chain_outcomes(
+        db, settings=s, session=object(), mcap_fetcher=_stub_fetcher
+    )
+    assert updated == 1
+    cur = await db._conn.execute(
+        "SELECT outcome_class FROM chain_matches WHERE token_id='0xflat'"
+    )
+    assert (await cur.fetchone())[0] == "miss"
+
+
+@pytest.mark.asyncio
+async def test_hydrator_skips_on_dexscreener_no_data(db, monkeypatch, settings_factory):
+    """When DS returns NO_DATA: row stays UNRESOLVED, retries next cycle.
+    Per-row log is DEBUG (not WARNING) — antipattern Bundle A R2 flagged."""
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
+    captured = _capture_chain_logs(monkeypatch)
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES ('0xunavail','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, 1000000.0)""",
+        (long_ago, long_ago),
+    )
+    await db._conn.commit()
+
+    async def _none_fetcher(session, contract):
+        return FetchResult(None, FetchStatus.NO_DATA)
+
+    s = settings_factory(CHAIN_OUTCOME_HIT_THRESHOLD_PCT=50.0)
+    updated = await update_chain_outcomes(
+        db, settings=s, session=object(), mcap_fetcher=_none_fetcher
+    )
+    assert updated == 0
+    cur = await db._conn.execute(
+        "SELECT outcome_class FROM chain_matches WHERE token_id='0xunavail'"
+    )
+    assert (await cur.fetchone())[0] is None
+
+
+@pytest.mark.asyncio
+async def test_hydrator_rate_limited_excluded_from_session_health(
+    db, monkeypatch, settings_factory
+):
+    """R1-M1 critical: 429 (RATE_LIMITED) does NOT count toward session
+    failure rate. Routine DS rate-limiting must NOT trigger
+    chain_tracker_session_unhealthy ERROR with 'restart service' guidance."""
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
+    captured = _capture_chain_logs(monkeypatch)
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    rows = [
+        (
+            f"0xlimited{i}",
+            "memecoin",
+            1,
+            "p",
+            1,
+            2,
+            long_ago,
+            long_ago,
+            0.0,
+            0,
+            None,
+            1_000_000.0,
+        )
+        for i in range(5)
+    ]
+    await db._conn.executemany(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    await db._conn.commit()
+
+    async def _ratelimit_fetcher(session, contract):
+        return FetchResult(None, FetchStatus.RATE_LIMITED)
+
+    s = settings_factory(CHAIN_OUTCOME_HIT_THRESHOLD_PCT=50.0)
+    await update_chain_outcomes(
+        db, settings=s, session=object(), mcap_fetcher=_ratelimit_fetcher
+    )
+    # Session-health ERROR must NOT fire — rate-limited rows are excluded
+    unhealthy = [c for c in captured if c[1] == "chain_tracker_session_unhealthy"]
+    assert (
+        unhealthy == []
+    ), f"rate-limited rows should not flag session unhealthy; got {unhealthy}"
+    # Aggregate rate-limit WARNING SHOULD fire
+    rate_limited = [c for c in captured if c[1] == "chain_outcomes_ds_rate_limited"]
+    assert len(rate_limited) == 1
+    _, _, kwargs = rate_limited[0]
+    assert kwargs["count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_hydrator_session_unhealthy_fires_on_high_failure_rate(
+    db, monkeypatch, settings_factory
+):
+    """T3 (design gap): session-health ERROR fires when >50% of NON-rate-
+    limited attempts fail (with floor of 3 attempts)."""
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
+    captured = _capture_chain_logs(monkeypatch)
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    rows = [
+        (
+            f"0xfail{i}",
+            "memecoin",
+            1,
+            "p",
+            1,
+            2,
+            long_ago,
+            long_ago,
+            0.0,
+            0,
+            None,
+            1_000_000.0,
+        )
+        for i in range(5)
+    ]
+    await db._conn.executemany(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    await db._conn.commit()
+
+    async def _all_fail(session, contract):
+        return FetchResult(None, FetchStatus.TRANSIENT)
+
+    s = settings_factory(
+        CHAIN_OUTCOME_HIT_THRESHOLD_PCT=50.0,
+        CHAIN_TRACKER_UNHEALTHY_FAILURE_RATE=0.5,
+        CHAIN_TRACKER_UNHEALTHY_MIN_ATTEMPTS=3,
+    )
+    await update_chain_outcomes(
+        db, settings=s, session=object(), mcap_fetcher=_all_fail
+    )
+    unhealthy = [c for c in captured if c[1] == "chain_tracker_session_unhealthy"]
+    assert (
+        len(unhealthy) == 1
+    ), f"expected 1 unhealthy ERROR; got {len(unhealthy)}: {captured}"
+    _, _, kwargs = unhealthy[0]
+    assert kwargs["failure_rate_pct"] == 100.0
+    assert kwargs["attempts"] == 5
+
+
+@pytest.mark.asyncio
+async def test_hydrator_session_health_does_not_fire_below_threshold(
+    db, monkeypatch, settings_factory
+):
+    """T4 (design gap, negative case): session-health ERROR must NOT fire
+    when failure rate is below threshold."""
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
+    captured = _capture_chain_logs(monkeypatch)
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    rows = [
+        (
+            f"0xmix{i}",
+            "memecoin",
+            1,
+            "p",
+            1,
+            2,
+            long_ago,
+            long_ago,
+            0.0,
+            0,
+            None,
+            1_000_000.0,
+        )
+        for i in range(3)
+    ]
+    await db._conn.executemany(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    await db._conn.commit()
+
+    call_count = {"n": 0}
+
+    async def _mostly_ok(session, contract):
+        call_count["n"] += 1
+        # 1 of 3 fails (33% failure rate, below 50% threshold)
+        if call_count["n"] == 1:
+            return FetchResult(None, FetchStatus.TRANSIENT)
+        return FetchResult(2_000_000.0, FetchStatus.OK)
+
+    s = settings_factory(
+        CHAIN_OUTCOME_HIT_THRESHOLD_PCT=50.0,
+        CHAIN_TRACKER_UNHEALTHY_FAILURE_RATE=0.5,
+        CHAIN_TRACKER_UNHEALTHY_MIN_ATTEMPTS=3,
+    )
+    await update_chain_outcomes(
+        db, settings=s, session=object(), mcap_fetcher=_mostly_ok
+    )
+    unhealthy = [c for c in captured if c[1] == "chain_tracker_session_unhealthy"]
+    assert (
+        unhealthy == []
+    ), f"33% failure rate is BELOW 50% threshold; ERROR must not fire. Got {unhealthy}"
+
+
+@pytest.mark.asyncio
+async def test_hydrator_coupling_guard(db, settings_factory):
+    """BL-071a' acceptance: after hydration, NO chain_match should have
+    populated mcap AND unresolved outcome AND completed_at < now-48h.
+    This is the canary that detects writer-wiring shipped without
+    fetcher-wiring (or vice versa)."""
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    await db._conn.executemany(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES (?, 'memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, ?)""",
+        [
+            ("0xpop1", long_ago, long_ago, 1_000_000.0),
+            ("0xpop2", long_ago, long_ago, 500_000.0),
+        ],
+    )
+    await db._conn.commit()
+
+    async def _stub_fetcher(session, contract):
+        return FetchResult(2_000_000.0, FetchStatus.OK)
+
+    s = settings_factory(CHAIN_OUTCOME_HIT_THRESHOLD_PCT=50.0)
+    await update_chain_outcomes(
+        db, settings=s, session=object(), mcap_fetcher=_stub_fetcher
+    )
+
+    cur = await db._conn.execute("""SELECT COUNT(*) FROM chain_matches
+           WHERE pipeline='memecoin'
+             AND mcap_at_completion IS NOT NULL
+             AND outcome_class IS NULL
+             AND completed_at < datetime('now','-48 hours')""")
+    leftover = (await cur.fetchone())[0]
+    assert leftover == 0, (
+        f"BL-071a' coupling-guard FAILED: {leftover} memecoin chain_matches "
+        f"have populated mcap_at_completion AND unresolved outcome_class"
+    )
+
+
+@_SKIP_AIOHTTP
+@pytest.mark.asyncio
+async def test_hydrator_self_creates_session_when_none_provided(db, settings_factory):
+    """T1 (design gap, R2-1 defense-in-depth): hydrator self-creates an
+    aiohttp session if none is injected. Without this, callers like
+    scout/narrative/learner.py:326 (no session in scope) would silently
+    fall through to legacy path and BL-071a' would be dead-on-arrival."""
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES ('0xnosess','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, 1_000_000.0)""",
+        (long_ago, long_ago),
+    )
+    await db._conn.commit()
+
+    fetcher_calls = []
+
+    async def _spy_fetcher(session, contract):
+        # session must be NOT None — verifies self-creation worked
+        assert (
+            session is not None
+        ), "hydrator should self-create session if none injected"
+        fetcher_calls.append(contract)
+        return FetchResult(2_000_000.0, FetchStatus.OK)
+
+    s = settings_factory(CHAIN_OUTCOME_HIT_THRESHOLD_PCT=50.0)
+    # Note: NO session kwarg — hydrator must self-create one
+    updated = await update_chain_outcomes(db, settings=s, mcap_fetcher=_spy_fetcher)
+    assert updated == 1
+    assert len(fetcher_calls) == 1
+    cur = await db._conn.execute(
+        "SELECT outcome_class FROM chain_matches WHERE token_id='0xnosess'"
+    )
+    assert (await cur.fetchone())[0] == "hit"
+
+
+@pytest.mark.asyncio
+async def test_hydrator_persistent_failure_error_escalation_rate_limited(
+    db, monkeypatch, settings_factory
+):
+    """T2 (design gap, R1-S3): persistent-failure ERROR fires once on
+    initial alert + only re-fires on escalation (oldest_age increased
+    >=24h OR new stuck rows). Without this, ERROR fires every LEARN
+    cycle = wallpaper antipattern."""
+    from scout.chains import tracker as tracker_module
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
+    # Reset module state for test isolation
+    tracker_module._persistent_failure_alert_state = None
+
+    captured = _capture_chain_logs(monkeypatch)
+    # Old enough to trigger persistent threshold (default 1.0 hour)
+    long_ago = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    await db._conn.execute(
+        """INSERT INTO chain_matches
+           (token_id, pipeline, pattern_id, pattern_name, steps_matched,
+            total_steps, anchor_time, completed_at, chain_duration_hours,
+            conviction_boost, outcome_class, mcap_at_completion)
+           VALUES ('0xstuck','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, 1_000_000.0)""",
+        (long_ago, long_ago),
+    )
+    await db._conn.commit()
+
+    async def _all_fail(session, contract):
+        return FetchResult(None, FetchStatus.TRANSIENT)
+
+    s = settings_factory(
+        CHAIN_OUTCOME_HIT_THRESHOLD_PCT=50.0,
+        CHAIN_OUTCOME_PERSISTENT_FAILURE_HOURS=1.0,
+    )
+
+    # Cycle 1: ERROR should fire (initial alert)
+    await update_chain_outcomes(
+        db, settings=s, session=object(), mcap_fetcher=_all_fail
+    )
+    persistent_1 = [
+        c for c in captured if c[1] == "chain_outcome_ds_persistent_failure"
+    ]
+    assert len(persistent_1) == 1, f"cycle 1 expected 1 ERROR; got {len(persistent_1)}"
+
+    # Cycle 2 (immediately): ERROR should NOT fire — same row, age delta < 24h
+    captured.clear()
+    await update_chain_outcomes(
+        db, settings=s, session=object(), mcap_fetcher=_all_fail
+    )
+    persistent_2 = [
+        c for c in captured if c[1] == "chain_outcome_ds_persistent_failure"
+    ]
+    assert (
+        persistent_2 == []
+    ), f"cycle 2 must not re-fire ERROR (no escalation); got {persistent_2}"
+
+    # Cleanup module state
+    tracker_module._persistent_failure_alert_state = None
