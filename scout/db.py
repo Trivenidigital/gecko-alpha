@@ -1129,6 +1129,30 @@ class Database:
                     ),
                 )
 
+            # BL-065 v3 (Bundle B 2026-05-04): per-channel cashtag dispatch
+            # opt-in. Default 0 = fail-closed; operators explicitly UPDATE
+            # to 1 per known-good curator. Independent of trade_eligible
+            # (the CA-path flag) and safety_required (the no-record-pass
+            # flag) — three flags = three independent concerns.
+            cur = await conn.execute("PRAGMA table_info(tg_social_channels)")
+            tg_chan_cols2 = {row[1] for row in await cur.fetchall()}
+            if "cashtag_trade_eligible" not in tg_chan_cols2:
+                await conn.execute(
+                    "ALTER TABLE tg_social_channels "
+                    "ADD COLUMN cashtag_trade_eligible INTEGER NOT NULL DEFAULT 0"
+                )
+                await conn.execute(
+                    "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                    "VALUES (?, ?)",
+                    (
+                        "bl065_cashtag_trade_eligible",
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+            # else: column already exists; paper_migrations row was
+            # inserted at that prior run (R2#4 NIT v2 — matches BL-061..
+            # BL-064 pattern, no need to re-INSERT every cold-start).
+
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_combo_opened "
                 "ON paper_trades(signal_combo, opened_at)"
@@ -1158,7 +1182,8 @@ class Database:
                 "('bl061_ladder', 'bl062_peak_fade', 'bl063_moonshot', "
                 "'bl064_tg_social', 'bl064_safety_required_per_channel', "
                 "'bl071b_unstamp_expired_narrative', "
-                "'bl071a_chain_matches_mcap_at_completion')"
+                "'bl071a_chain_matches_mcap_at_completion', "
+                "'bl065_cashtag_trade_eligible')"
             )
             recorded = {row[0] for row in await cur.fetchall()}
             missing_migrations = {
@@ -1169,6 +1194,7 @@ class Database:
                 "bl064_safety_required_per_channel",
                 "bl071b_unstamp_expired_narrative",
                 "bl071a_chain_matches_mcap_at_completion",
+                "bl065_cashtag_trade_eligible",
             } - recorded
             if missing_migrations:
                 raise RuntimeError(

@@ -11,9 +11,16 @@ Then delegates to TradingEngine.open_trade(signal_type='tg_social', ...) which
 handles the cross-cutting gates (warmup, max-open-trades global cap, max
 exposure, mcap caps, junk filter, per-signal-type cooldown). This avoids the
 maintenance split flagged by the architecture reviewer.
+
+BL-065 v3 (2026-05-04): adds sibling cashtag dispatcher — see
+`dispatch_cashtag_to_engine` and `_evaluate_cashtag` below. Cashtag-specific
+gate set (no_ca/safety skipped by design; cashtag_disabled/no_candidates/
+below_floor/ambiguous/channel_rate_limited added).
 """
 
 from __future__ import annotations
+
+import asyncio
 
 import structlog
 
@@ -228,5 +235,294 @@ async def dispatch_to_engine(
         symbol=token.symbol,
         channel_handle=channel_handle,
         note="see engine log for specific gate (warmup/quota/exposure/mcap/junk/cooldown)",
+    )
+    return (None, "engine_rejected")
+
+
+# ---------------------------------------------------------------------------
+# BL-065 v3 (Bundle B 2026-05-04): cashtag-only dispatch path
+# ---------------------------------------------------------------------------
+
+
+async def _channel_cashtag_trade_eligible(db: Database, channel_handle: str) -> bool:
+    """BL-065: per-channel opt-in for cashtag dispatch. Fail-closed default
+    (returns False on missing row, NULL, or 0 — explicit 1 required).
+
+    Independent of trade_eligible (the CA-path flag) — operator may want
+    a channel to dispatch CAs without dispatching cashtags, or vice versa.
+    """
+    cur = await db._conn.execute(
+        "SELECT cashtag_trade_eligible FROM tg_social_channels "
+        "WHERE channel_handle = ? AND removed_at IS NULL",
+        (channel_handle,),
+    )
+    row = await cur.fetchone()
+    if row is None or row[0] is None:
+        return False
+    return bool(row[0])
+
+
+async def _channel_cashtag_trades_today_count(db: Database, channel_handle: str) -> int:
+    """R1#5 v2: count cashtag-resolution paper_trades opened today by channel.
+
+    Per design F2.1 v3: SCAN within indexed (signal_combo, opened_at) prefix;
+    json_extract is per-row Python call within that narrowed scan. Sub-ms at
+    current cardinality (5-50 same-day tg_social rows in prod).
+    """
+    cur = await db._conn.execute(
+        """
+        SELECT COUNT(*) FROM paper_trades
+         WHERE signal_type = 'tg_social'
+           AND json_extract(signal_data, '$.channel_handle') = ?
+           AND json_extract(signal_data, '$.resolution') = 'cashtag'
+           AND opened_at >= datetime('now', 'start of day')
+        """,
+        (channel_handle,),
+    )
+    row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def _check_potential_symbol_duplicate(
+    db: Database, token_id: str, symbol: str
+) -> list[tuple[str, int]]:
+    """R1#6 v2 / R2#5 v3: returns list of (token_id, paper_trade_id) collisions
+    instead of logging per-row. Caller decides log level (INFO single vs
+    aggregate WARNING).
+
+    Cross-coin_id dedup gap mitigation: when a cashtag dispatch opens a trade
+    for token_id=X symbol=Y, return any OTHER currently-open tg_social trade
+    with same SYMBOL Y but different token_id (e.g., 'pepe' vs 'pepe-bsc' —
+    same memecoin across chains, different CoinGecko coin_ids).
+    """
+    cur = await db._conn.execute(
+        """
+        SELECT s.token_id, p.id
+          FROM tg_social_signals s
+          JOIN paper_trades p ON s.paper_trade_id = p.id
+         WHERE p.status = 'open'
+           AND p.signal_type = 'tg_social'
+           AND UPPER(s.symbol) = UPPER(?)
+           AND s.token_id != ?
+         LIMIT 5
+        """,
+        (symbol, token_id),
+    )
+    return [(r[0], r[1]) for r in await cur.fetchall()]
+
+
+async def _evaluate_cashtag(
+    *,
+    db: Database,
+    settings: Settings,
+    candidates: list[ResolvedToken],
+    channel_handle: str,
+) -> AdmissionDecision:
+    """BL-065 v3: cashtag-specific gates.
+
+    Skipped (vs. CA path):
+      * Gate 2 no_ca — by definition no CA; skipping is the whole point
+      * Gate 4 safety — no CA = no GoPlus; operator opts into this risk
+        explicitly via cashtag_trade_eligible=1
+
+    Added:
+      * cashtag_disabled — channel.cashtag_trade_eligible=0
+      * cashtag_no_candidates — empty candidates_top3 (R2#3 v3)
+      * cashtag_below_floor — top.mcap < PAPER_TG_SOCIAL_CASHTAG_MIN_MCAP_USD
+      * cashtag_ambiguous — len>1 AND top.mcap < second.mcap × DISAMBIGUITY_RATIO
+      * cashtag_channel_rate_limited — per-channel daily cap (R1#5 v2)
+
+    Reused (from CA path):
+      * dedup_open — per-OPEN-exposure dedup by token_id (shared semantic)
+      * tg_social_quota — same TG_SOCIAL_MAX_OPEN_TRADES global cap
+    """
+    # Gate A: channel cashtag opt-in
+    if not await _channel_cashtag_trade_eligible(db, channel_handle):
+        return AdmissionDecision(
+            dispatch_trade=False,
+            blocked_gate="cashtag_disabled",
+            reason="tg_social_channels.cashtag_trade_eligible=0 (default)",
+        )
+
+    # R2#3 v3: empty candidates is a distinct upstream-resolver problem,
+    # NOT a channel configuration issue.
+    if not candidates:
+        return AdmissionDecision(
+            dispatch_trade=False,
+            blocked_gate="cashtag_no_candidates",
+            reason="resolver returned empty candidates_top3 (upstream issue)",
+        )
+    top = candidates[0]
+
+    # Gate B: mcap floor (skip dust)
+    min_mcap = settings.PAPER_TG_SOCIAL_CASHTAG_MIN_MCAP_USD
+    if (top.mcap or 0) < min_mcap:
+        return AdmissionDecision(
+            dispatch_trade=False,
+            blocked_gate="cashtag_below_floor",
+            reason=f"top candidate mcap {top.mcap} < floor {min_mcap}",
+        )
+
+    # Gate C: disambiguity (top must clearly dominate #2)
+    if len(candidates) > 1:
+        second_mcap = candidates[1].mcap or 0
+        ratio_required = settings.PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO
+        if second_mcap > 0 and (top.mcap or 0) < second_mcap * ratio_required:
+            return AdmissionDecision(
+                dispatch_trade=False,
+                blocked_gate="cashtag_ambiguous",
+                reason=(
+                    f"top mcap {top.mcap} < {ratio_required}x second mcap "
+                    f"{second_mcap} - possible look-alike token"
+                ),
+            )
+
+    # Gate D: per-OPEN-exposure dedup (shared with CA path)
+    if await _has_open_tg_social_exposure(db, top.token_id):
+        return AdmissionDecision(
+            dispatch_trade=False,
+            blocked_gate="dedup_open",
+            reason="another tg_social trade is currently open on this token",
+        )
+
+    # Gate E: tg_social slot quota (global)
+    open_count = await _tg_social_open_count(db)
+    if open_count >= settings.TG_SOCIAL_MAX_OPEN_TRADES:
+        return AdmissionDecision(
+            dispatch_trade=False,
+            blocked_gate="tg_social_quota",
+            reason=(
+                f"tg_social open trades {open_count} "
+                f">= TG_SOCIAL_MAX_OPEN_TRADES {settings.TG_SOCIAL_MAX_OPEN_TRADES}"
+            ),
+        )
+
+    # Gate F (R1#5 v2): per-channel daily cashtag-dispatch rate cap.
+    # Cashtag dispatch bypasses GoPlus, so blast radius of one bad/noisy
+    # curator is higher than CA path.
+    today_count = await _channel_cashtag_trades_today_count(db, channel_handle)
+    if today_count >= settings.PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY:
+        return AdmissionDecision(
+            dispatch_trade=False,
+            blocked_gate="cashtag_channel_rate_limited",
+            reason=(
+                f"channel {channel_handle} cashtag trades today {today_count} "
+                f">= cap {settings.PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY}"
+            ),
+        )
+
+    return AdmissionDecision(dispatch_trade=True)
+
+
+async def dispatch_cashtag_to_engine(
+    *,
+    db: Database,
+    settings: Settings,
+    engine: TradingEngine,
+    candidates: list[ResolvedToken],
+    cashtag: str,  # e.g. "EITHER" — already normalized (no '$')
+    channel_handle: str,
+) -> tuple[int | None, str | None]:
+    """BL-065 v3: dispatch top-1 cashtag candidate to TradingEngine.open_trade.
+
+    Returns (paper_trade_id, blocked_gate). signal_data carries the
+    cashtag-resolution provenance fields per BL-065 acceptance:
+    {"resolution": "cashtag", "cashtag": "$X", "candidate_rank": 1,
+     "candidates_total": N}.
+
+    On any rejection, returns (None, gate_name). On engine-side rejection,
+    gate is 'engine_rejected' (engine logs specific reason).
+
+    R1-M2 v3: symbol-collision check is wrapped in nested try/except so
+    helper failure does NOT escape the dispatcher (trade is already open).
+    """
+    decision = await _evaluate_cashtag(
+        db=db,
+        settings=settings,
+        candidates=candidates,
+        channel_handle=channel_handle,
+    )
+    if not decision.dispatch_trade:
+        log.info(
+            "tg_social_cashtag_admission_blocked",
+            cashtag=cashtag,
+            candidates_total=len(candidates),
+            channel_handle=channel_handle,
+            gate_name=decision.blocked_gate,
+            reason=decision.reason,
+        )
+        return (None, decision.blocked_gate)
+
+    top = candidates[0]
+    trade_id = await engine.open_trade(
+        token_id=top.token_id,
+        symbol=top.symbol,
+        name=top.symbol,
+        chain=top.chain or "coingecko",
+        signal_type="tg_social",
+        signal_data={
+            "channel_handle": channel_handle,
+            "resolution": "cashtag",
+            "cashtag": f"${cashtag}",
+            "candidate_rank": 1,
+            "candidates_total": len(candidates),
+            "mcap_at_sighting": top.mcap,
+        },
+        amount_usd=settings.PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD,
+        entry_price=top.price_usd,
+        signal_combo="tg_social",
+    )
+    if trade_id is not None:
+        # R1-M2 v3 + R2#5 v3: nested guard — helper failure must NOT escape.
+        # Trade is already open; lifecycle owns it.
+        try:
+            collisions = await _check_potential_symbol_duplicate(
+                db, top.token_id, top.symbol
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            log.exception(
+                "tg_social_symbol_collision_check_failed",
+                paper_trade_id=trade_id,
+                token_id=top.token_id,
+                note="trade is open; collision check skipped this dispatch",
+            )
+            collisions = []
+        if collisions:
+            # R2#5 v3: INFO not WARNING — symbol collisions are routine on
+            # memecoins (every chain has its own PEPE).
+            log.info(
+                "tg_social_potential_duplicate_symbol",
+                paper_trade_id=trade_id,
+                new_token_id=top.token_id,
+                symbol=top.symbol,
+                colliding_token_ids=[c[0] for c in collisions],
+                colliding_paper_trade_ids=[c[1] for c in collisions],
+                note=(
+                    "open tg_social trade(s) exist with same SYMBOL but "
+                    "different token_id - possible cross-listing duplicate. "
+                    "Trade NOT blocked; full per-symbol dedup deferred to BL-065'."
+                ),
+            )
+        log.info(
+            "tg_social_cashtag_trade_dispatched",
+            paper_trade_id=trade_id,
+            token_id=top.token_id,
+            symbol=top.symbol,
+            cashtag=f"${cashtag}",
+            candidates_total=len(candidates),
+            amount_usd=settings.PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD,
+            channel_handle=channel_handle,
+        )
+        return (trade_id, None)
+
+    log.info(
+        "tg_social_cashtag_admission_blocked_engine",
+        token_id=top.token_id,
+        symbol=top.symbol,
+        cashtag=f"${cashtag}",
+        channel_handle=channel_handle,
+        note="see engine log for specific gate",
     )
     return (None, "engine_rejected")

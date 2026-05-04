@@ -34,7 +34,10 @@ from scout.social.telegram.alerter import (
     format_unresolved_alert,
 )
 from scout.social.telegram.client import build_client, connect_and_verify
-from scout.social.telegram.dispatcher import dispatch_to_engine
+from scout.social.telegram.dispatcher import (
+    dispatch_cashtag_to_engine,  # BL-065 v3
+    dispatch_to_engine,
+)
 from scout.social.telegram.models import (
     ContractRef,
     ParsedMessage,
@@ -248,31 +251,113 @@ async def _replay_post_resolution(
 
     # Cashtag-only candidates path
     if not result.tokens and result.candidates_top3:
-        body = format_candidates_alert(
-            channel_handle=channel_handle,
-            cashtags=parsed.cashtags,
-            candidates=result.candidates_top3,
-            msg_link=msg_link,
-        )
+        # BL-065 v3 (Bundle B 2026-05-04): dispatch top-1 candidate to engine
+        # if channel has cashtag_trade_eligible=1. Otherwise alert-only.
+        # Failure shape per R1#1 + R1#2 v2:
+        # - asyncio.CancelledError / SystemExit / KeyboardInterrupt: re-raise
+        # - Other Exception: distinct cashtag_dispatch_exception gate, log
+        #   + DLQ-write attempted with NESTED guard so DLQ-write failure
+        #   does NOT kill the listener (PR #55 class).
+        cashtag_normalized = (
+            parsed.cashtags[0] if parsed.cashtags else ""
+        )  # already upper, no '$' (per parser contract)
+        paper_trade_id: int | None = None
+        blocked_gate: str | None = None
         try:
-            await send_telegram(
-                http_session, telegram_bot_token, telegram_chat_id, body
+            paper_trade_id, blocked_gate = await dispatch_cashtag_to_engine(
+                db=db,
+                settings=settings,
+                engine=engine,
+                candidates=result.candidates_top3,
+                cashtag=cashtag_normalized,
+                channel_handle=channel_handle,
             )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception as e:
-            log.warning("tg_social_alert_send_failed", error=str(e))
+            log.exception(
+                "tg_social_cashtag_dispatch_exception",
+                cashtag=cashtag_normalized,
+                channel_handle=channel_handle,
+                error_type=type(e).__name__,
+            )
+            paper_trade_id = None
+            blocked_gate = "cashtag_dispatch_exception"
+            try:
+                await _append_dlq(db, channel_handle, msg_id or 0, text, e)
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as dlq_err:
+                log.error(
+                    "tg_social_dlq_write_failed",
+                    channel_handle=channel_handle,
+                    msg_id=msg_id,
+                    original_error_type=type(e).__name__,
+                    dlq_error_type=type(dlq_err).__name__,
+                    note="listener loop continues despite DLQ-write failure",
+                )
+
+        # R1-M3 v3: format_candidates_alert MUST NOT propagate.
+        body = None
+        try:
+            body = format_candidates_alert(
+                channel_handle=channel_handle,
+                cashtags=parsed.cashtags,
+                candidates=result.candidates_top3,
+                msg_link=msg_link,
+                paper_trade_id=paper_trade_id,
+                blocked_gate=blocked_gate,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            log.exception(
+                "tg_social_alert_format_failed",
+                channel_handle=channel_handle,
+                paper_trade_id=paper_trade_id,
+                error_type=type(e).__name__,
+            )
+        if body is not None:
+            try:
+                await send_telegram(
+                    http_session, telegram_bot_token, telegram_chat_id, body
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:
+                log.warning("tg_social_alert_send_failed", error=str(e))
+
+        # R1#10 v2: _persist_signal_row failure must NOT propagate or kill
+        # the listener — trade is already opened (if dispatched), lifecycle
+        # owns it.
         top = result.candidates_top3[0]
-        await _persist_signal_row(
-            db=db,
-            message_pk=message_pk,
-            token_id=top.token_id,
-            symbol=top.symbol,
-            contract_address=None,
-            chain=None,
-            mcap=top.mcap,
-            resolution_state=result.state.value,
-            channel_handle=channel_handle,
-            paper_trade_id=None,
-        )
+        try:
+            await _persist_signal_row(
+                db=db,
+                message_pk=message_pk,
+                token_id=top.token_id,
+                symbol=top.symbol,
+                contract_address=None,
+                chain=None,
+                mcap=top.mcap,
+                resolution_state=result.state.value,
+                channel_handle=channel_handle,
+                paper_trade_id=paper_trade_id,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            log.error(
+                "tg_social_persist_signal_failed",
+                channel_handle=channel_handle,
+                token_id=top.token_id,
+                paper_trade_id=paper_trade_id,
+                error_type=type(e).__name__,
+                note=(
+                    "trade may have opened without tg_social_signals row "
+                    "linking it back — provenance lost but lifecycle owns trade"
+                ),
+            )
         return
 
     # Resolved-by-CA path

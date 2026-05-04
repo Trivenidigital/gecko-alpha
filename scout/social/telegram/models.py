@@ -83,7 +83,11 @@ class ResolutionResult(BaseModel):
     error_text: str | None = None
 
 
-BlockedGate = Literal[
+# BL-065 v3 (R2#1): split into two narrow Literal types so cashtag-path
+# dispatcher can return CashtagGate specifically and the type-checker
+# enforces the partition. Combined union BlockedGate stays for back-compat
+# with AdmissionDecision and dashboards/alerters that don't care about path.
+CAGate = Literal[
     "no_ca",
     "safety_unknown",
     "safety_failed",
@@ -92,6 +96,20 @@ BlockedGate = Literal[
     "tg_social_quota",
     "engine_rejected",
 ]
+
+CashtagGate = Literal[
+    "cashtag_disabled",
+    "cashtag_no_candidates",
+    "cashtag_below_floor",
+    "cashtag_ambiguous",
+    "cashtag_channel_rate_limited",
+    "cashtag_dispatch_exception",
+    # Note: cashtag path also returns "dedup_open", "tg_social_quota",
+    # "engine_rejected" (shared with CA). Those stay in CAGate; the
+    # union below means a cashtag dispatcher can return either Literal.
+]
+
+BlockedGate = CAGate | CashtagGate
 
 
 class AdmissionDecision(BaseModel):

@@ -281,6 +281,13 @@ class Settings(BaseSettings):
     TG_SOCIAL_CHANNELS_FILE: Path = Path("./channels.yml")
     TG_SOCIAL_MAX_OPEN_TRADES: int = 5
     PAPER_TG_SOCIAL_TRADE_AMOUNT_USD: float = 300.0
+    # BL-065 v3 (Bundle B 2026-05-04): cashtag-only dispatch tunables.
+    # R2#7 v3: Field validators in a separate @field_validator below so
+    # invalid .env values fail at startup, not at first dispatch.
+    PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD: float = 300.0
+    PAPER_TG_SOCIAL_CASHTAG_MIN_MCAP_USD: float = 100_000.0
+    PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO: float = 2.0
+    PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY: int = 5
     TG_SOCIAL_CATCHUP_LIMIT: int = 200
     TG_SOCIAL_FLOOD_WAIT_MAX_SEC: int = 600
     TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC: int = 300
@@ -582,6 +589,43 @@ class Settings(BaseSettings):
     def _validate_paper_tg_social_trade_amount(cls, v: float) -> float:
         if v <= 0:
             raise ValueError(f"PAPER_TG_SOCIAL_TRADE_AMOUNT_USD must be > 0; got={v}")
+        return v
+
+    # BL-065 v3 (R2#7): cashtag-dispatch field validators
+    @field_validator("PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD")
+    @classmethod
+    def _validate_cashtag_trade_amount(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(
+                f"PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD must be > 0; got={v}"
+            )
+        return v
+
+    @field_validator("PAPER_TG_SOCIAL_CASHTAG_MIN_MCAP_USD")
+    @classmethod
+    def _validate_cashtag_min_mcap(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(
+                f"PAPER_TG_SOCIAL_CASHTAG_MIN_MCAP_USD must be > 0; got={v}"
+            )
+        return v
+
+    @field_validator("PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO")
+    @classmethod
+    def _validate_cashtag_disambiguity_ratio(cls, v: float) -> float:
+        if v < 1.0:
+            raise ValueError(
+                f"PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO must be >= 1.0; got={v}"
+            )
+        return v
+
+    @field_validator("PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY")
+    @classmethod
+    def _validate_cashtag_max_per_channel_per_day(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(
+                f"PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY must be >= 1; got={v}"
+            )
         return v
 
     @field_validator("TG_SOCIAL_CATCHUP_LIMIT")

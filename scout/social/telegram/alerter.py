@@ -122,13 +122,34 @@ def format_candidates_alert(
     cashtags: list[str],
     candidates: list[ResolvedToken],
     msg_link: str | None = None,
+    paper_trade_id: int | None = None,  # BL-065 v3
+    blocked_gate: str | None = None,  # BL-065 v3
 ) -> str:
-    """Cashtag-only alert with top-3 candidates surfaced for manual disambig."""
+    """Cashtag-only alert with top-3 candidates surfaced for manual disambig.
+
+    BL-065 v3 (2026-05-04): when channel has cashtag_trade_eligible=1, the
+    listener dispatches top-1 via dispatch_cashtag_to_engine. Adds:
+    - paper_trade_id: opened trade ID (None if not dispatched / blocked)
+    - blocked_gate: dispatcher's gate name when admission blocked (None if dispatched)
+    """
     cashtag_str = ", ".join(f"${t}" for t in cashtags) if cashtags else "—"
+    # BL-065 v3 fix the hardcoded 'auto-trade disabled' line — show actual outcome.
+    if paper_trade_id is not None:
+        outcome_line = (
+            f"Top-3 candidates by mcap "
+            f"(✅ DISPATCHED top-1 as paper_trade_id={paper_trade_id}):"
+        )
+    elif blocked_gate is not None:
+        outcome_line = (
+            f"Top-3 candidates by mcap "
+            f"(🚫 cashtag dispatch blocked: {blocked_gate}):"
+        )
+    else:
+        outcome_line = "Top-3 candidates by mcap (no CA in the post — alert-only):"
     lines = [
         "⚠️ [CURATOR SIGNAL — TICKER-ONLY, VERIFY MANUALLY] ⚠️",
         f"{channel_handle} posted {cashtag_str}",
-        "Top-3 candidates by mcap (no CA in the post — auto-trade disabled):",
+        outcome_line,
     ]
     for i, c in enumerate(candidates, start=1):
         lines.append(
@@ -137,10 +158,21 @@ def format_candidates_alert(
     if msg_link:
         lines.append(f"🔗 {msg_link}")
     lines.append("─────")
-    lines.append(
-        "Resolved by ticker only — could be wrong token. "
-        "Verify CA on the source post before any action."
-    )
+    if paper_trade_id is not None:
+        lines.append(
+            f"Top-1 candidate auto-dispatched to paper trade {paper_trade_id}. "
+            "Verify on dashboard if the candidate matches curator intent."
+        )
+    elif blocked_gate is not None:
+        lines.append(
+            f"Cashtag dispatch admission denied at gate '{blocked_gate}'. "
+            "See journalctl tg_social_cashtag_admission_blocked for reason."
+        )
+    else:
+        lines.append(
+            "Resolved by ticker only — could be wrong token. "
+            "Verify CA on the source post before any action."
+        )
     return "\n".join(lines)
 
 
