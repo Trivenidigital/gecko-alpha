@@ -1,6 +1,19 @@
-# BL-071a': Wire chain_match writers + DexScreener fetch — Implementation Plan
+# BL-071a': Wire chain_match writers + DexScreener fetch — Implementation Plan (v2 post-review)
 
-**New primitives introduced:** new helper module `scout/chains/mcap_fetcher.py` (single async function `fetch_token_fdv` + protocol type `McapFetcher` for dependency injection in tests); new structured log event `chain_outcome_resolved_via_dexscreener` (per-row INFO, replaces today's silent skip in the populated-mcap branch); new structured log event `chain_outcome_dexscreener_failed` (per-row WARNING for transient DS errors so we can distinguish "no source" from "source unreachable"). No new database columns or migrations — uses the `chain_matches.mcap_at_completion REAL` column shipped in Bundle A.
+**New primitives introduced:** new helper module `scout/chains/mcap_fetcher.py` (single async function `fetch_token_fdv` + protocol type `McapFetcher` for dependency injection in tests); new structured log event `chain_outcome_resolved_via_dexscreener` (per-row INFO); new structured log event `chain_outcome_dexscreener_failed` (per-row **DEBUG** — demoted from WARNING per R1-3, plan v2); new aggregate log events `chain_outcomes_ds_transient_failures` (WARNING, once per LEARN cycle) and `chain_outcome_ds_persistent_failure` (ERROR, when stuck-row age exceeds threshold per R1-1); new aggregate `chain_tracker_session_unhealthy` (ERROR, when DS failure rate > 50% in one cycle per R1-2). No new database columns or migrations — uses the `chain_matches.mcap_at_completion REAL` column shipped in Bundle A.
+
+**v2 changes from plan-review feedback (cross-confirmed by 2 parallel reviewers):**
+- **MUST-FIX R2-1:** Task 4 was targeting the wrong file. The actual `update_chain_outcomes` caller is `scout/narrative/learner.py:326`, NOT `scout/main.py`. Without this fix, BL-071a' would be dead-on-arrival (the `session is not None` guard would silently fall through to the legacy path forever — exactly the silent-skip class this PR exists to close). v2 fixes Task 4 + adds **defense-in-depth: hydrator self-creates an aiohttp session if `session is None`**, so even if a future caller forgets to wire the session the new path still fires.
+- **MUST-FIX R1-3:** Per-row `chain_outcome_dexscreener_failed` WARNING re-introduced the antipattern Bundle A R2 flagged (permanent log noise). v2 demotes per-row to DEBUG and keeps the aggregate WARNING.
+- **MUST-FIX R1-1:** Persistent DS outage made invisible by per-cycle aggregate that resets. v2 adds `chain_outcome_ds_persistent_failure` ERROR when any unresolved-due-to-DS row's age exceeds `2 × CHAIN_CHECK_INTERVAL_SEC`.
+- **SHOULD-FIX R1-2:** Long-lived session degradation undetectable. v2 adds `chain_tracker_session_unhealthy` ERROR when DS failure rate exceeds 50% of attempts in one LEARN cycle (with floor of ≥3 attempts to avoid noise from single-row cycles).
+- **SHOULD-FIX R2-4:** v2 keeps the superseded `test_hydrator_silent_skip_when_mcap_at_completion_populated` Bundle A test marked `@pytest.mark.skip` (with reason) instead of deleting — preserves the invariant doc that "no session = falls back to legacy" still holds for future maintainers.
+- **SHOULD-FIX R2-2:** v2 explicitly notes that the existing `tests/test_chains_learn.py` callers exercise the legacy path (because they pass no session); they don't validate the new BL-071a' code path. The new tests in this plan do.
+
+**Explicitly deferred to BL-071a'' (follow-up):**
+- **R2-3** (pre-fetch FDVs OUTSIDE the `check_chains` transaction to avoid 15s SQLite write-lock-hold per memecoin completion): pragmatically acceptable today because chain completions are rare (~0-2 per cycle in prod) and the pipeline is single-process. Documented inline in `_record_completion` as a known scope-limitation. Optimization PR if completion-burst behaviour ever appears.
+- **R1-4** (misrouted-pipeline regex detection): orthogonal scope; capture as separate backlog item if it ever happens.
+- **R1-6** (pre-Bundle-A backlog backfill of 30 stuck rows): combining a one-shot data backfill with the writer-wiring fix increases blast radius. Ship BL-071a' first, verify it works, then a small follow-up PR backfills the historical rows. Note added to BL-071a' merge-and-deploy step (manual SQL for now).
 
 **Goal:** Close the silent-skip surface that Bundle A intentionally left open: `_record_completion` will populate `mcap_at_completion` at write time (via DexScreener FDV fetch); `update_chain_outcomes` will use the populated value plus a current-time DexScreener fetch to compute hit/miss for memecoin chain_matches. Includes the coupling-guard test BL-071a' acceptance requires.
 
@@ -435,6 +448,12 @@ async def _record_completion(
     duration_h = (chain.last_step_time - chain.anchor_time).total_seconds() / 3600.0
 
     # BL-071a': fetch FDV snapshot for memecoin chains.
+    # SCOPE NOTE (deferred to BL-071a'' per R2-3): this fetch happens
+    # INSIDE the check_chains transaction. SQLite write lock is held for
+    # up to 15s (DS timeout) per memecoin completion. Acceptable today
+    # (single-process pipeline, ~0-2 completions per 60s cycle in prod);
+    # if completion bursts ever appear, refactor to pre-fetch in parallel
+    # outside the transaction in a follow-up optimization PR.
     mcap_at_completion: float | None = None
     if chain.pipeline == "memecoin" and session is not None:
         fetcher = mcap_fetcher or fetch_token_fdv
@@ -774,7 +793,15 @@ async def update_chain_outcomes(
       Else fall back to legacy outcomes table for back-compat.
 
     BL-071a' coupling-guard: populated mcap_at_completion rows MUST be
-    resolvable (or fail loudly via WARNING) — never silently skip.
+    resolvable (or surfaced via aggregate WARNING + aging-aware ERROR) —
+    never silently skip.
+
+    Defense-in-depth (R2-1, plan v2): if `session is None`, this function
+    creates and closes its own aiohttp session for the cycle. Callers that
+    don't have a session in scope (e.g., scout/narrative/learner.py:326
+    LEARN cycle) get the BL-071a' resolution path automatically without
+    needing to thread a session through. The injected-session path is
+    preferred where available (avoids per-cycle connector setup overhead).
 
     Returns the number of rows updated. Designed for once-per-LEARN-cycle.
     """
@@ -785,20 +812,56 @@ async def update_chain_outcomes(
     hit_threshold_pct = (
         settings.CHAIN_OUTCOME_HIT_THRESHOLD_PCT if settings is not None else 50.0
     )
+    persistent_failure_age_hours = (
+        # 2 × CHAIN_CHECK_INTERVAL_SEC default (300s) → 10 minutes; in prod
+        # the LEARN cycle runs daily-ish, so this gates on "stuck across
+        # multiple LEARN cycles" not "stuck a single retry."
+        max(
+            2.0,
+            (settings.CHAIN_CHECK_INTERVAL_SEC if settings is not None else 300) * 2 / 3600.0,
+        )
+    )
     fetcher = mcap_fetcher or fetch_token_fdv
 
+    # Defense-in-depth: self-create session if not injected (R2-1)
+    own_session = session is None
+    if own_session:
+        session = aiohttp.ClientSession()
+    try:
+        return await _update_chain_outcomes_inner(
+            conn, session, fetcher, hit_threshold_pct,
+            persistent_failure_age_hours,
+        )
+    finally:
+        if own_session and session is not None:
+            await session.close()
+
+
+async def _update_chain_outcomes_inner(
+    conn,
+    session,
+    fetcher,
+    hit_threshold_pct: float,
+    persistent_failure_age_hours: float,
+) -> int:
+    """Inner body of update_chain_outcomes (split out so the session
+    self-create wrapper stays small and the inner logic is testable)."""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
     async with conn.execute(
-        """SELECT id, token_id, pipeline FROM chain_matches
+        """SELECT id, token_id, pipeline, completed_at FROM chain_matches
            WHERE outcome_class IS NULL AND completed_at < ?""",
         (cutoff,),
     ) as cur:
         pending = await cur.fetchall()
 
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
     updated = 0
     memecoin_unhydrateable = 0
     memecoin_ds_failures = 0
+    memecoin_ds_attempts = 0
+    persistent_stuck_count = 0
+    oldest_persistent_age_hours = 0.0
     for row in pending:
         match_id = row["id"]
         token_id = row["token_id"]
@@ -828,12 +891,12 @@ async def update_chain_outcomes(
                 mcap_row = await cur_m.fetchone()
             mcap_at_completion = mcap_row[0] if mcap_row else None
 
-            if (
-                mcap_at_completion is not None
-                and mcap_at_completion > 0
-                and session is not None
-            ):
-                # BL-071a': active DexScreener resolution path
+            if mcap_at_completion is not None and mcap_at_completion > 0:
+                # BL-071a': active DexScreener resolution path. Note: NO
+                # `session is not None` guard — the wrapper self-creates
+                # one if needed (R2-1 defense-in-depth, plan v2). Also
+                # tracks DS attempts for cycle-level health signal (R1-2).
+                memecoin_ds_attempts += 1
                 try:
                     current_fdv = await fetcher(session, token_id)
                 except Exception:
@@ -845,13 +908,33 @@ async def update_chain_outcomes(
                     current_fdv = None
                 if current_fdv is None or current_fdv <= 0:
                     memecoin_ds_failures += 1
-                    logger.warning(
+                    # R1-3: DEBUG not WARNING — per-row WARNING was the
+                    # antipattern Bundle A R2 flagged. Aggregate WARNING
+                    # below covers operator visibility; aging-aware ERROR
+                    # covers persistent stuck rows.
+                    logger.debug(
                         "chain_outcome_dexscreener_failed",
                         match_id=match_id,
                         token_id=token_id,
                         mcap_at_completion=mcap_at_completion,
-                        note="DexScreener returned no FDV; will retry next LEARN cycle",
                     )
+                    # R1-1: track persistent stuck rows for aging ERROR
+                    completed_at_str = (
+                        row["completed_at"] if isinstance(row, dict) else row[3]
+                    )
+                    try:
+                        completed_at = datetime.fromisoformat(
+                            completed_at_str.replace("Z", "+00:00")
+                        )
+                        if completed_at.tzinfo is None:
+                            completed_at = completed_at.replace(tzinfo=timezone.utc)
+                        age_hours = (now - completed_at).total_seconds() / 3600.0
+                        if age_hours > persistent_failure_age_hours:
+                            persistent_stuck_count += 1
+                            if age_hours > oldest_persistent_age_hours:
+                                oldest_persistent_age_hours = age_hours
+                    except (ValueError, AttributeError):
+                        pass  # malformed timestamp, skip aging check
                     continue  # leave row UNRESOLVED, retry next cycle
                 outcome_change_pct = (
                     (current_fdv / mcap_at_completion) - 1.0
@@ -906,8 +989,8 @@ async def update_chain_outcomes(
             cause="legacy_no_mcap_no_outcomes_row",
             note=(
                 "These rows pre-date BL-071a' writer wiring AND have no legacy "
-                "outcomes-table data. They will stay UNRESOLVED until manually "
-                "purged or until a writer-update populates mcap_at_completion."
+                "outcomes-table data. Backfill follow-up captured in BL-071a' "
+                "merge-and-deploy step (manual SQL one-shot)."
             ),
         )
     if memecoin_ds_failures:
@@ -917,6 +1000,39 @@ async def update_chain_outcomes(
             cause="dexscreener_returned_no_data",
             note="Will retry next LEARN cycle.",
         )
+    # R1-1: aging-aware ERROR for rows persistently stuck across cycles.
+    # Triggers when a row has been NULL-due-to-DS-failure across multiple
+    # LEARN cycles — operators see this and can investigate (DS API key
+    # invalid, rate-limited, contract delisted, etc.).
+    if persistent_stuck_count:
+        logger.error(
+            "chain_outcome_ds_persistent_failure",
+            stuck_count=persistent_stuck_count,
+            oldest_pending_age_hours=round(oldest_persistent_age_hours, 1),
+            threshold_hours=round(persistent_failure_age_hours, 2),
+            note=(
+                "These memecoin chain_matches have populated mcap_at_completion "
+                "but DexScreener has returned no FDV for >threshold cycles. "
+                "Investigate: API key valid? rate-limited? contract delisted?"
+            ),
+        )
+    # R1-2: cycle-level session health. If >50% of attempts failed
+    # (with floor of >=3 attempts to avoid noise from low-volume cycles),
+    # the long-lived session may be in a degraded state.
+    if memecoin_ds_attempts >= 3:
+        failure_rate = memecoin_ds_failures / memecoin_ds_attempts
+        if failure_rate > 0.5:
+            logger.error(
+                "chain_tracker_session_unhealthy",
+                attempts=memecoin_ds_attempts,
+                failures=memecoin_ds_failures,
+                failure_rate_pct=round(failure_rate * 100, 1),
+                note=(
+                    "DexScreener fetch failure rate exceeds 50% in this cycle. "
+                    "Long-lived aiohttp session may be degraded; consider "
+                    "service restart to reset connector pool."
+                ),
+            )
     return updated
 ```
 
@@ -925,9 +1041,29 @@ async def update_chain_outcomes(
 Run: `uv run pytest tests/test_chain_outcomes_hydration.py -v`
 Expected: all green (10+ tests including the 4 new ones).
 
-- [ ] **Step 3.6 — Update VPS-state-aware tests that are now stale**
+- [ ] **Step 3.6 — Add the post-BL-071a' resolved-via-fetcher test + keep the superseded Bundle A test as documentation**
 
-The Bundle A test `test_hydrator_silent_skip_when_mcap_at_completion_populated` asserted the populated-column row was SILENTLY SKIPPED. With BL-071a', that row should now be RESOLVED (hit/miss). Update the test:
+The Bundle A test `test_hydrator_silent_skip_when_mcap_at_completion_populated` asserted the populated-column row was SILENTLY SKIPPED. With BL-071a', that row should now be RESOLVED (hit/miss). Per R2-4 plan-review feedback, **keep the superseded test as `@pytest.mark.skip` with reason** (preserves the invariant doc that "no session = falls back to legacy" still holds for future maintainers — defense-in-depth makes that case unreachable in practice but the documented behavior is still meaningful).
+
+In `tests/test_chain_outcomes_hydration.py`, locate the existing `test_hydrator_silent_skip_when_mcap_at_completion_populated`. PRESERVE it but add the skip marker and rename to clarify:
+
+```python
+@pytest.mark.skip(
+    reason=(
+        "Superseded by BL-071a' (commit forthcoming): the silent-skip "
+        "semantics are gone — populated mcap_at_completion is now actively "
+        "resolved via DexScreener fetch (or self-created session if caller "
+        "doesn't provide one). Test preserved as documentation of the "
+        "Bundle A intermediate behaviour and as a guard if someone later "
+        "removes the defense-in-depth session self-create."
+    )
+)
+@pytest.mark.asyncio
+async def test_hydrator_silent_skip_when_mcap_at_completion_populated_BUNDLE_A_BEHAVIOUR(db, monkeypatch):
+    # ... existing body unchanged ...
+```
+
+Then add the NEW test that asserts the BL-071a' behaviour:
 
 ```python
 @pytest.mark.asyncio
@@ -996,49 +1132,58 @@ Aggregate warning split into two distinguishable causes:
 
 ---
 
-## Task 4 — Wire `update_chain_outcomes` caller (LEARN cycle) to pass session
+## Task 4 — Wire `update_chain_outcomes` caller (LEARN cycle) to pass settings
+
+**v2 CRITICAL FIX (R2-1):** The original plan v1 targeted `scout/main.py`. **There is no `update_chain_outcomes` caller in main.py.** The actual caller is `scout/narrative/learner.py:326`. v1's grep would have returned zero results and the implementer would have shipped Task 4 as a no-op — leaving BL-071a' dead-on-arrival in production. v2 corrects this AND removes the session-wiring requirement entirely (defense-in-depth in Task 3 means the hydrator self-creates a session if none is passed; Task 4 only needs to pass `settings` for the threshold).
 
 **Files:**
-- Modify: `scout/main.py` (LEARN cycle — find caller of `update_chain_outcomes`, pass session)
+- Modify: `scout/narrative/learner.py:326` (one-line change)
 
-**Why:** Without this wiring, the hydrator's new code path will never see a session — it'll always fall through to the legacy outcomes path and the silent-skip surface stays open in production.
+**Why:** Pass `settings` so the hit threshold is honored. Session is no longer required (hydrator self-creates).
 
-- [ ] **Step 4.1 — Find caller in main.py**
+- [ ] **Step 4.1 — Verify the call site (sanity check)**
 
-Run: `cd C:/projects/gecko-alpha && grep -n "update_chain_outcomes" scout/main.py`
-Note the line number(s). Read 10 lines of context around each call site.
+Run: `cd C:/projects/gecko-alpha && grep -n "update_chain_outcomes" scout/narrative/learner.py`
+Expected: line 322 (import) and line 326 (await call).
 
-- [ ] **Step 4.2 — Pass session + settings into the call**
+Read context: `scout/narrative/learner.py` lines 315-330. Confirm the function this lives inside has `settings = get_settings()` already in scope at line ~319 (it does — verified during recon).
 
-For each call site found in Step 4.1, change:
+- [ ] **Step 4.2 — Update the call**
+
+Edit `scout/narrative/learner.py`. Find line 326:
 
 ```python
 await update_chain_outcomes(db)
 ```
 
-to:
+Replace with:
 
 ```python
-await update_chain_outcomes(db, settings=settings, session=session)
+await update_chain_outcomes(db, settings=settings)
 ```
 
-`session` is the aiohttp.ClientSession created at pipeline startup — it's already in scope wherever the LEARN cycle runs (verify by checking that the call site is inside `async with aiohttp.ClientSession() as session:`).
+The hydrator self-creates an aiohttp session if `session is None` (Task 3 defense-in-depth), so we don't need to thread a session through the learner. Just pass settings for the threshold + persistent-failure timing.
 
-- [ ] **Step 4.3 — Run full test suite to catch any regression**
+- [ ] **Step 4.3 — Run full chain + heartbeat test suite to catch any regression**
 
-Run: `SKIP_AIOHTTP_TESTS=1 uv run pytest tests/ -k "chain or heartbeat" -q --tb=line`
-Expected: all green (no test depends on the old `update_chain_outcomes(db)` signature without kwargs — they're all kwargs-only).
+Run: `SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_chains_tracker.py tests/test_chains_db.py tests/test_chains_learn.py tests/test_chain_outcomes_hydration.py tests/test_heartbeat.py tests/test_heartbeat_mcap_missing.py tests/test_chain_mcap_fetcher.py -q --tb=line`
+Expected: all green or skipped. Existing `test_chains_learn.py` callers pass `db` only (no kwargs) and exercise the NARRATIVE path (which doesn't depend on session/fetcher), so they keep passing.
 
 - [ ] **Step 4.4 — Commit**
 
 ```bash
-git add scout/main.py
-git commit -m "feat(BL-071a'): wire LEARN cycle to pass session to update_chain_outcomes
+git add scout/narrative/learner.py
+git commit -m "feat(BL-071a'): wire LEARN cycle to pass settings to update_chain_outcomes
 
-Without this, the new BL-071a' DexScreener resolution path never sees
-a session and silently falls back to the legacy outcomes table (which
-is empty in prod). This is the wiring that closes the silent-skip
-surface end-to-end."
+Pass settings (for CHAIN_OUTCOME_HIT_THRESHOLD_PCT + persistent-failure
+threshold) to the hydrator. Session is NOT threaded through — the
+hydrator self-creates an aiohttp session if none is provided (Task 3
+defense-in-depth), so callers without a session in scope (like this
+LEARN cycle in narrative/learner.py) get the BL-071a' resolution path
+without needing to refactor the call chain.
+
+Plan v1 incorrectly targeted scout/main.py for this wiring; the actual
+caller lives in scout/narrative/learner.py:326. R2-1 plan-review fix."
 ```
 
 ---
@@ -1063,17 +1208,44 @@ git commit -m "style: black formatting"
 
 ---
 
-## Self-Review
+## Self-Review (post-v2 edits)
 
 1. **Scope coverage:**
    - Writer wiring → Task 2 ✓
    - DexScreener fetch in hydrator → Task 3 ✓
    - Coupling-guard test → Task 3 Step 3.2 (`test_hydrator_coupling_guard`) ✓
-   - Aggregate warning evolved with structured per-cause counters → Task 3 Step 3.4 ✓
+   - Aggregate warning + per-cause + persistent-failure ERROR + session-health ERROR → Task 3 Step 3.4 (v2) ✓
    - Helper module → Task 1 ✓
-   - Caller wiring (LEARN cycle) → Task 4 ✓
+   - Caller wiring (LEARN cycle, **learner.py not main.py**) → Task 4 (v2) ✓
 2. **Placeholder scan:** none — all code shown verbatim ✓
-3. **New primitives marker:** present at top (helper module + 2 log events declared) ✓
+3. **New primitives marker:** present at top (helper module + 5 log events declared, updated in v2) ✓
 4. **TDD discipline:** failing-test → minimal-impl → passing-test → commit per task ✓
 5. **No cross-task coupling:** Tasks 1 (helper), 2 (writer), 3 (hydrator), 4 (wiring) touch different files; could be reverted independently ✓
-6. **Honest scope:** chain-agnostic DS endpoint chosen explicitly, hit threshold made configurable, narrative pipeline intentionally skipped (token_id format mismatch). All documented at top.
+6. **Honest scope (v2):** explicitly deferred to BL-071a'' captured at top — pre-fetch FDVs outside transaction (R2-3), misrouted-pipeline detection (R1-4), pre-Bundle-A backlog backfill (R1-6 — handled as manual SQL one-shot during merge-and-deploy instead).
+7. **All MUST-FIX from review addressed in v2:**
+   - R2-1 ✓ (Task 4 targets learner.py + hydrator self-creates session)
+   - R1-3 ✓ (per-row WARNING demoted to DEBUG)
+   - R1-1 ✓ (aging-aware `chain_outcome_ds_persistent_failure` ERROR)
+8. **All actionable SHOULD-FIX from review addressed in v2:**
+   - R1-2 ✓ (`chain_tracker_session_unhealthy` ERROR at >50% failure rate)
+   - R2-4 ✓ (superseded test kept with `@pytest.mark.skip`)
+   - R2-2 ✓ (doc note in v2 scope-decision: existing learner tests don't validate new path)
+
+## Manual SQL backfill follow-up (post-merge, deferred from R1-6)
+
+After BL-071a' is merged + deployed and verified working on NEW chain completions, one-shot SQL on VPS to clear the pre-Bundle-A backlog of 30 stuck memecoin rows:
+
+```sql
+-- Run AFTER BL-071a' is verified clean for ≥1 LEARN cycle
+-- Marks pre-existing NULL-mcap memecoin rows as 'expired_no_data' so the
+-- aggregate warning stops firing for them. Does NOT generate fake outcomes.
+UPDATE chain_matches
+   SET outcome_class = 'expired_no_data',
+       evaluated_at = datetime('now')
+ WHERE pipeline = 'memecoin'
+   AND mcap_at_completion IS NULL
+   AND outcome_class IS NULL
+   AND completed_at < datetime('now', '-7 days');
+```
+
+This is a one-shot data fix, NOT part of the BL-071a' code change. Documented here so it doesn't get lost. After this, the only chain_outcomes_unhydrateable_memecoin warnings should be from genuinely-new-but-unfetcheable rows.
