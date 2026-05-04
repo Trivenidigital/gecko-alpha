@@ -314,6 +314,11 @@ def _reconstruct_price_path(
     schema-drift OperationalError re-raises to surface real bugs.
     Sort uses _parse_iso for mixed-format timestamps."""
     rows: list[tuple[str, float]] = []
+    # trending_snapshots intentionally NOT included — verified against
+    # prod schema: it has no price column (just market_cap_rank +
+    # trending_score). Plan/design v3 listed it incorrectly; backtest
+    # run on 2026-05-04 surfaced the schema mismatch via the SF-M3
+    # narrowing (re-raise on schema drift). Real fix: drop the query.
     queries = [
         ("gainers_snapshots",
          "SELECT snapshot_at, price_at_snapshot FROM gainers_snapshots "
@@ -322,11 +327,6 @@ def _reconstruct_price_path(
          "AND datetime(snapshot_at) <= datetime(?)"),
         ("losers_snapshots",
          "SELECT snapshot_at, price_at_snapshot FROM losers_snapshots "
-         "WHERE coin_id = ? AND price_at_snapshot > 0 "
-         "AND datetime(snapshot_at) >= datetime(?) "
-         "AND datetime(snapshot_at) <= datetime(?)"),
-        ("trending_snapshots",
-         "SELECT snapshot_at, price_at_snapshot FROM trending_snapshots "
          "WHERE coin_id = ? AND price_at_snapshot > 0 "
          "AND datetime(snapshot_at) >= datetime(?) "
          "AND datetime(snapshot_at) <= datetime(?)"),
