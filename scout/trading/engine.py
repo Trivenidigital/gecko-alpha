@@ -112,6 +112,7 @@ class TradingEngine:
         entry_price: float | None = None,
         *,
         signal_combo: str,
+        expected_empty_metadata: bool = False,
     ) -> int | None:
         """Open a new trade. Returns trade_id or None if rejected.
 
@@ -132,14 +133,25 @@ class TradingEngine:
         # so a placement after gate would silently swallow the warning
         # during the warmup window.
         #
-        # Two events emitted:
+        # MF-2 fix (PR #67 silent-failure-hunter): chain_completed orphan
+        # path KNOWS it has no metadata (Database.lookup_symbol_name_by_coin_id
+        # returned ('', '') and dispatcher already logged
+        # chain_completed_no_metadata). Without `expected_empty_metadata=True`
+        # opt-in, every orphan chain trade triple-fires events
+        # (dispatcher WARNING + this WARNING + this INFO), making
+        # Self-Review #8's "14d zero trade_metadata_empty events" soak
+        # criterion structurally unreachable. The sentinel preserves
+        # caller-drift detection (default False) while letting known-empty
+        # callers bypass the engine signal.
+        #
+        # Two events emitted (only when expected_empty_metadata=False):
         # - WARNING: human-readable journalctl visibility
         # - INFO trade_metadata_empty: lands in same telemetry pipeline
         #   that aggregates signal_skipped_* events. Future BL-077 (after
         #   14d clean soak) flips warning+proceed to log+return-None
         #   using SAME event name (trade_skipped_empty_metadata) — purely
         #   additive change at that point.
-        if not symbol and not name:
+        if not symbol and not name and not expected_empty_metadata:
             log.warning(
                 "open_trade_called_with_empty_symbol_and_name",
                 token_id=token_id,

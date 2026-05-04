@@ -352,19 +352,183 @@ async def test_lookup_symbol_name_skips_null_symbol_in_source(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad_coin_id", ["", None])
+@pytest.mark.parametrize("bad_coin_id", ["", None, 0, False])
 async def test_lookup_symbol_name_handles_empty_or_none_coin_id(tmp_path, bad_coin_id):
-    """T5e — F16 mitigation. Defensive guard at top of helper for
-    empty/None coin_id (caller-side bug). Should return ("","") without
-    issuing a SELECT."""
+    """T5e — F16 mitigation + ad38b9 S2: extend parametrize to all
+    Python falsy. Defensive guard at top of helper for empty/None/0/False
+    coin_id (caller-side bug). Should return ("","") AND log
+    `lookup_symbol_name_called_with_empty_coin_id` (SF-1 fix)."""
     from scout.db import Database
 
     db_path = str(tmp_path / "t.db")
     sd = Database(db_path)
     await sd.initialize()
-    symbol, name = await sd.lookup_symbol_name_by_coin_id(bad_coin_id)
+    with capture_logs() as logs:
+        symbol, name = await sd.lookup_symbol_name_by_coin_id(bad_coin_id)
     assert symbol == ""
     assert name == ""
+    # SF-1: caller-bug breadcrumb is mandatory
+    assert any(
+        e.get("event") == "lookup_symbol_name_called_with_empty_coin_id"
+        for e in logs
+    ), f"SF-1 caller-bug breadcrumb missing; got: {[e.get('event') for e in logs]}"
+    await sd.close()
+
+
+@pytest.mark.asyncio
+async def test_chain_completed_orphan_does_not_trigger_engine_warning(tmp_path):
+    """T5f'' — MF-2 fix (PR #67 silent-failure-hunter): when chain
+    resolver returns ("", ""), dispatcher passes
+    expected_empty_metadata=True so the engine WARNING + INFO events
+    DO NOT fire. Otherwise every chain orphan triple-fires events
+    (chain_completed_no_metadata + WARNING + INFO), making
+    Self-Review #8's "14d zero trade_metadata_empty events" soak
+    criterion structurally unreachable."""
+    from scout.config import Settings
+    from scout.db import Database
+    from scout.trading.engine import TradingEngine
+    from scout.trading.signals import trade_chain_completions
+
+    db_path = str(tmp_path / "t.db")
+    sd = Database(db_path)
+    await sd.initialize()
+    now = datetime.now(timezone.utc).isoformat()
+    await sd._conn.execute(
+        "INSERT OR REPLACE INTO price_cache "
+        "(coin_id, current_price, market_cap, updated_at) "
+        "VALUES ('orphan-coin', 0.05, 5000000, ?)",
+        (now,),
+    )
+    await sd._conn.execute(
+        "INSERT INTO chain_patterns (id, name, pipeline, steps_json, "
+        " is_active, hit_threshold_pct, max_chain_duration_hours, created_at) "
+        "VALUES (3, 'full_conviction', 'narrative', '[]', 1, 5.0, 48.0, ?)",
+        (now,),
+    )
+    await sd._conn.execute(
+        "INSERT INTO chain_matches "
+        "(token_id, pipeline, pattern_id, pattern_name, "
+        " steps_matched, total_steps, anchor_time, completed_at, "
+        " chain_duration_hours, conviction_boost, created_at) "
+        "VALUES ('orphan-coin', 'narrative', 3, 'full_conviction', "
+        " 3, 3, ?, ?, 4.0, 1, ?)",
+        (now, now, now),
+    )
+    await sd._conn.commit()
+    settings = Settings()
+    # Use REAL TradingEngine so engine WARNING actually fires when called
+    # without the sentinel — this is the bug we're guarding against.
+    engine = TradingEngine(sd, settings)
+    with capture_logs() as logs:
+        await trade_chain_completions(engine, sd, settings=settings)
+    events = [e.get("event") for e in logs]
+    # Dispatcher's WARNING fires (visibility for orphan rate)
+    assert "chain_completed_no_metadata" in events, (
+        f"chain_completed_no_metadata did not fire; got: {events}"
+    )
+    # Engine WARNING + INFO MUST NOT fire — they're suppressed by
+    # expected_empty_metadata=True
+    assert "open_trade_called_with_empty_symbol_and_name" not in events, (
+        f"MF-2 regression: engine WARNING fired for known-orphan chain; "
+        f"got events: {events}"
+    )
+    assert "trade_metadata_empty" not in events, (
+        f"MF-2 regression: engine INFO fired for known-orphan chain; "
+        f"got events: {events}"
+    )
+    await sd.close()
+
+
+@pytest.mark.asyncio
+async def test_open_trade_with_expected_empty_metadata_suppresses_warnings(tmp_path):
+    """T2c — MF-2 sentinel direct test: open_trade with
+    expected_empty_metadata=True + empty symbol+name MUST NOT log the
+    WARNING or INFO events. With the sentinel False (default), the
+    same call DOES log both. Pins the kwarg semantics."""
+    from scout.config import Settings
+    from scout.db import Database
+    from scout.trading.engine import TradingEngine
+
+    db_path = str(tmp_path / "t.db")
+    sd = Database(db_path)
+    await sd.initialize()
+    settings = Settings()
+    engine = TradingEngine(sd, settings)
+
+    # Sentinel ON: WARNING + INFO MUST NOT fire
+    with capture_logs() as logs_on:
+        await engine.open_trade(
+            token_id="known-orphan",
+            symbol="",
+            name="",
+            signal_type="chain_completed",
+            signal_data={"foo": "bar"},
+            signal_combo="cc|none",
+            entry_price=0.001,
+            expected_empty_metadata=True,
+        )
+    events_on = [e.get("event") for e in logs_on]
+    assert "open_trade_called_with_empty_symbol_and_name" not in events_on, (
+        f"sentinel did not suppress WARNING; got: {events_on}"
+    )
+    assert "trade_metadata_empty" not in events_on, (
+        f"sentinel did not suppress INFO; got: {events_on}"
+    )
+
+    # Sentinel OFF (default): WARNING + INFO MUST fire (regression check)
+    with capture_logs() as logs_off:
+        await engine.open_trade(
+            token_id="caller-drift",
+            symbol="",
+            name="",
+            signal_type="volume_spike",
+            signal_data={"foo": "bar"},
+            signal_combo="vs|none",
+            entry_price=0.001,
+        )
+    events_off = [e.get("event") for e in logs_off]
+    assert "open_trade_called_with_empty_symbol_and_name" in events_off, (
+        f"sentinel False did not log WARNING; got: {events_off}"
+    )
+    assert "trade_metadata_empty" in events_off, (
+        f"sentinel False did not log INFO; got: {events_off}"
+    )
+    await sd.close()
+
+
+@pytest.mark.asyncio
+async def test_lookup_symbol_name_logs_breadcrumb_on_operational_error(tmp_path, monkeypatch):
+    """T5h — MF-1 fix (PR #67 silent-failure-hunter): per-table
+    OperationalError swallow MUST emit a debug breadcrumb so
+    connection-drop / lock signature is greppable. Without the log,
+    operator can't distinguish F6 orphans from F3/F17 infra failures."""
+    from scout.db import Database
+
+    db_path = str(tmp_path / "t.db")
+    sd = Database(db_path)
+    await sd.initialize()
+    real_execute = sd._conn.execute
+
+    async def fail_first(*args, **kwargs):
+        # First call raises OperationalError (gainers_snapshots);
+        # subsequent calls work normally.
+        if "gainers_snapshots" in args[0]:
+            raise aiosqlite.OperationalError("simulated lock")
+        return await real_execute(*args, **kwargs)
+
+    monkeypatch.setattr(sd._conn, "execute", fail_first)
+    with capture_logs() as logs:
+        symbol, name = await sd.lookup_symbol_name_by_coin_id("test-coin")
+    # Helper falls through to volume_history_cg + volume_spikes (both
+    # empty in this test) → returns ("", "")
+    assert symbol == ""
+    assert name == ""
+    # MF-1: the swallow MUST be visible
+    assert any(
+        e.get("event") == "lookup_symbol_name_table_unavailable"
+        and e.get("table") == "gainers_snapshots"
+        for e in logs
+    ), f"MF-1 breadcrumb missing; got: {[e.get('event') for e in logs]}"
     await sd.close()
 
 

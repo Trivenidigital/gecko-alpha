@@ -572,7 +572,7 @@ _JUNK_COINID_PREFIXES = (
     "bridged-",
     "wrapped-",
     "superbridge-",
-    # BL-076: CoinGecko placeholder coins (test-1, test-2, ..., test-3)
+    # BL-076: CoinGecko placeholder coins (test-1, test-2, ..., test-N)
     # have real price feeds and triggered paper trades #980 (first_signal,
     # closed -$9.96) and #1551 (volume_spike, closed +$188.91 by lucky
     # pump). Anchored at slug start (startswith) — false positives like
@@ -832,15 +832,37 @@ async def trade_chain_completions(engine, db: Database, *, settings) -> None:
                 # Returns ("", "") for orphan coins; log a warning so
                 # operator sees the gap rate. open_trade still fires —
                 # the trade is real, we just lack metadata.
-                ct_symbol, ct_name = await db.lookup_symbol_name_by_coin_id(
-                    c["token_id"]
-                )
-                if not ct_symbol and not ct_name:
+                #
+                # SF-2 fix (PR #67 silent-failure-hunter): wrap the lookup
+                # in its own try/except so an unexpected exception
+                # (e.g. aiosqlite.ProgrammingError) doesn't get caught by
+                # the dispatcher's outer `except Exception` and silently
+                # drop the trade. Lookup error → degrade metadata, NOT
+                # block the trade.
+                try:
+                    ct_symbol, ct_name = await db.lookup_symbol_name_by_coin_id(
+                        c["token_id"]
+                    )
+                except Exception:
+                    logger.exception(
+                        "chain_metadata_lookup_failed",
+                        token_id=c["token_id"],
+                    )
+                    ct_symbol, ct_name = "", ""
+                ct_orphan = not ct_symbol and not ct_name
+                if ct_orphan:
                     logger.warning(
                         "chain_completed_no_metadata",
                         coin_id=c["token_id"],
                         hint="no row in gainers_snapshots/volume_history_cg/volume_spikes",
                     )
+                # MF-2 fix: pass expected_empty_metadata=True when we
+                # KNOW we have no metadata (orphan path) so the engine
+                # WARNING+INFO doesn't double-fire. The dispatcher already
+                # logged chain_completed_no_metadata above; the engine
+                # event would be wallpaper noise indistinguishable from
+                # a 4th-dispatcher caller-drift bug (which is what F4 is
+                # supposed to surface).
                 await engine.open_trade(
                     token_id=c["token_id"],
                     symbol=ct_symbol,
@@ -853,6 +875,7 @@ async def trade_chain_completions(engine, db: Database, *, settings) -> None:
                     },
                     entry_price=chain_price,
                     signal_combo=combo_key,
+                    expected_empty_metadata=ct_orphan,
                 )
             except Exception:
                 logger.exception("trading_chain_error", token_id=c["token_id"])

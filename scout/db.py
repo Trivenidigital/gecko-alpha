@@ -118,8 +118,12 @@ class Database:
           per-table OperationalError fallback for happy-path single
           round-trip.
         """
-        # F16 mitigation: defensive None/empty coin_id guard.
+        # F16 mitigation + SF-1 fix (PR #67 silent-failure-hunter):
+        # defensive None/empty coin_id guard with breadcrumb. Without
+        # the log, the F16 caller-bug stays invisible forever — violates
+        # explicit-fallback project rule.
         if not coin_id:
+            _db_log.warning("lookup_symbol_name_called_with_empty_coin_id")
             return "", ""
         if self._conn is None:
             raise RuntimeError("Database not initialized.")
@@ -132,13 +136,20 @@ class Database:
                 (coin_id,),
             )
             row = await cur.fetchone()
-            if row and row[0] and row[1]:
-                return row[0], row[1]
-        except aiosqlite.OperationalError:
+            if row and row["symbol"] and row["name"]:
+                return row["symbol"], row["name"]
+        except aiosqlite.OperationalError as exc:
             # F3 (schema drift) + F17 (table locked) — fall through.
             # Other exceptions (e.g. ProgrammingError from a logic bug)
-            # propagate per A11.
-            pass
+            # propagate per A11. MF-1 fix (PR #67 silent-failure-hunter):
+            # log a debug breadcrumb so connection-drop / lock signature
+            # is greppable, distinguishing infra failure from F6 orphans.
+            _db_log.debug(
+                "lookup_symbol_name_table_unavailable",
+                table="gainers_snapshots",
+                coin_id=coin_id,
+                error=str(exc),
+            )
         # 2. volume_history_cg — fallback
         try:
             cur = await self._conn.execute(
@@ -148,10 +159,15 @@ class Database:
                 (coin_id,),
             )
             row = await cur.fetchone()
-            if row and row[0] and row[1]:
-                return row[0], row[1]
-        except aiosqlite.OperationalError:
-            pass
+            if row and row["symbol"] and row["name"]:
+                return row["symbol"], row["name"]
+        except aiosqlite.OperationalError as exc:
+            _db_log.debug(
+                "lookup_symbol_name_table_unavailable",
+                table="volume_history_cg",
+                coin_id=coin_id,
+                error=str(exc),
+            )
         # 3. volume_spikes — last resort
         try:
             cur = await self._conn.execute(
@@ -161,10 +177,15 @@ class Database:
                 (coin_id,),
             )
             row = await cur.fetchone()
-            if row and row[0] and row[1]:
-                return row[0], row[1]
-        except aiosqlite.OperationalError:
-            pass
+            if row and row["symbol"] and row["name"]:
+                return row["symbol"], row["name"]
+        except aiosqlite.OperationalError as exc:
+            _db_log.debug(
+                "lookup_symbol_name_table_unavailable",
+                table="volume_spikes",
+                coin_id=coin_id,
+                error=str(exc),
+            )
         return "", ""
 
     # ------------------------------------------------------------------
