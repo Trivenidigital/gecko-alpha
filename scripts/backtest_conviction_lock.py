@@ -156,28 +156,33 @@ def _path_density_score(
 
 
 # ---------------------------------------------------------------------------
-# Stack-count helper — see TODO above re: dedupe
+# Stack-count helper — design-v2 D3 + arch-S1 consolidation:
+# Production helpers in scout.trading.conviction are async (aiosqlite);
+# this script is sync (raw sqlite3.Connection). _SyncDBShim wraps the
+# raw connection to satisfy the async helper's interface; sync wrapper
+# round-trips via asyncio.run. Coupling acknowledged in design v2.
 # ---------------------------------------------------------------------------
+import asyncio  # noqa: E402
+import concurrent.futures  # noqa: E402
 
-_SIGNAL_SOURCES = [
-    ("gainers_snapshots", "snapshot_at", "gainers"),
-    ("losers_snapshots", "snapshot_at", "losers"),
-    ("trending_snapshots", "snapshot_at", "trending"),
-    ("chain_matches", "completed_at", "chains"),
-]
+# Production helpers — single source of truth (D3 fix).
+# PR-review N5-arch: import the public alias instead of the underscore-
+# prefixed private name. Both refer to the same function object.
+from scout.trading.conviction import (  # noqa: E402
+    count_stacked_signals_in_window as _async_count_stacked,
+    conviction_locked_params,
+)
 
 
-# SF-M2 fix: track signal sources that ARE genuinely missing (table-not-found)
-# vs sources that errored on schema drift / connectivity. Sources in
-# _signal_sources_missing are logged once at startup; sources NOT in the set
-# but still raising OperationalError re-raise to surface real bugs.
+# `_reconstruct_price_path` (separate function, kept sync) reads + maintains
+# its own missing-source cache. The set is shared with the consolidated
+# stack helper conceptually but kept module-local for the price-path code.
 _signal_sources_missing: set[str] = set()
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    """SF-M2: probe table presence so we can narrow OperationalError handling
-    in _count_stacked_signals_in_window. Cached via _signal_sources_missing
-    on first call per table."""
+    """Sync helper for `_reconstruct_price_path` (kept inline here so the
+    price-path code doesn't need the async shim)."""
     try:
         cur = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
@@ -188,110 +193,64 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
         return False
 
 
+class _SyncDBShim:
+    """Sync wrapper around `sqlite3.Connection` that satisfies the
+    `Database._conn` async-cursor contract used by
+    `scout.trading.conviction._count_stacked_signals_in_window`.
+
+    Coupling note (design-v2 arch-S1): if `Database._conn` ever changes
+    (e.g. to a connection pool), the shim breaks. T7 round-trip pin in
+    tests/test_bl067_conviction_lock.py catches that drift in CI.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        class _AsyncCur:
+            def __init__(self, cur):
+                self._cur = cur
+
+            async def fetchone(self):
+                return self._cur.fetchone()
+
+            async def fetchall(self):
+                return self._cur.fetchall()
+
+        class _AsyncConn:
+            def __init__(self, c):
+                self._c = c
+
+            async def execute(self, sql, params=()):
+                return _AsyncCur(self._c.execute(sql, params))
+
+        self._conn = _AsyncConn(conn)
+
+
 def _count_stacked_signals_in_window(
     conn: sqlite3.Connection,
     token_id: str,
     opened_at: str,
     end_at: str,
 ) -> tuple[int, list[str]]:
-    """Count DISTINCT signal-source firings on token_id within the window.
-    Each source contributes at most 1 to the stack count. BIO/LAB principle:
-    class diversity, not event volume.
+    """Sync wrapper around the production async helper.
 
-    SF-M2 fix (PR #68 silent-failure-hunter): per-table OperationalError
-    swallow now distinguishes missing-table (acceptable, logged once) from
-    schema-drift / runtime errors (re-raised). _signal_sources_missing
-    cached at module level."""
-    sources: list[str] = []
-
-    sources_to_check = list(_SIGNAL_SOURCES) + [
-        ("predictions", "predicted_at", "narrative"),
-        ("velocity_alerts", "detected_at", "velocity"),
-        ("volume_spikes", "detected_at", "volume_spike"),
-        ("tg_social_signals", "created_at", "tg_social"),
-    ]
-    for table, ts_col, label in sources_to_check:
-        if table == "chain_matches":
-            token_col = "token_id"
-        elif table == "tg_social_signals":
-            token_col = "token_id"
-        else:
-            token_col = "coin_id"
-        if table in _signal_sources_missing:
-            continue
-        if not _table_exists(conn, table):
-            if table not in _signal_sources_missing:
-                _signal_sources_missing.add(table)
-                print(
-                    f"WARN: signal source {table!r} not found in DB; "
-                    f"stack count will not include {label!r} contributions.",
-                    file=sys.stderr,
-                )
-            continue
-        try:
-            cur = conn.execute(
-                f"""SELECT 1 FROM {table}
-                    WHERE {token_col} = ?
-                      AND datetime({ts_col}) >= datetime(?)
-                      AND datetime({ts_col}) <= datetime(?)
-                    LIMIT 1""",
-                (token_id, opened_at, end_at),
-            )
-            if cur.fetchone() is not None:
-                sources.append(label)
-        except sqlite3.OperationalError as exc:
-            # SF-M2: schema drift / column rename — re-raise so operator
-            # sees the real bug instead of getting silent zero.
-            raise RuntimeError(
-                f"OperationalError on {table}.{ts_col} (column may have "
-                f"been renamed; backtest cannot silently continue): {exc}"
-            ) from exc
-
-    if "paper_trades" not in _signal_sources_missing and _table_exists(conn, "paper_trades"):
-        try:
-            cur = conn.execute(
-                """SELECT DISTINCT signal_type FROM paper_trades
-                   WHERE token_id = ?
-                     AND datetime(opened_at) >= datetime(?)
-                     AND datetime(opened_at) <= datetime(?)""",
-                (token_id, opened_at, end_at),
-            )
-            for r in cur.fetchall():
-                sources.append(f"trade:{r[0]}")
-        except sqlite3.OperationalError as exc:
-            raise RuntimeError(
-                f"OperationalError on paper_trades stack scan: {exc}"
-            ) from exc
-
-    return len(sources), sources
-
-
-# ---------------------------------------------------------------------------
-# Conviction-lock param composition
-# ---------------------------------------------------------------------------
-
-_CONVICTION_LOCK_DELTAS = {
-    1: {"max_duration_hours": 0, "trail_pct": 0, "sl_pct": 0,
-        "trail_cap": 35, "sl_cap": 25},
-    2: {"max_duration_hours": 72, "trail_pct": 5, "sl_pct": 5,
-        "trail_cap": 35, "sl_cap": 35},
-    3: {"max_duration_hours": 168, "trail_pct": 10, "sl_pct": 10,
-        "trail_cap": 35, "sl_cap": 40},
-    4: {"max_duration_hours": 336, "trail_pct": 15, "sl_pct": 15,
-        "trail_cap": 35, "sl_cap": 40},
-}
-
-
-def conviction_locked_params(stack: int, base: dict) -> dict:
-    """Return base params with BL-067 conviction-lock deltas applied.
-    Saturates at stack=4."""
-    bucket = min(max(stack, 1), 4)
-    delta = _CONVICTION_LOCK_DELTAS[bucket]
-    return {
-        "max_duration_hours": base["max_duration_hours"] + delta["max_duration_hours"],
-        "trail_pct": min(base["trail_pct"] + delta["trail_pct"], delta["trail_cap"]),
-        "sl_pct": min(base["sl_pct"] + delta["sl_pct"], delta["sl_cap"]),
-    }
+    The shim's async methods have no real async I/O — they wrap sync
+    sqlite3 calls. So the coroutine runs to completion in one `.send()`
+    and we don't need an event loop at all. This avoids three pitfalls:
+    (a) SQLite same-thread restriction (no worker thread), (b) running-
+    loop conflict with `asyncio.run` (pytest-asyncio mode=auto), and
+    (c) "another loop is running" with `new_event_loop().run_until_complete`.
+    """
+    shim = _SyncDBShim(conn)
+    coro = _async_count_stacked(shim, token_id, opened_at, end_at)
+    try:
+        coro.send(None)
+        # If the coroutine yielded a value (real async I/O), the shim is
+        # broken — surface the issue immediately.
+        raise RuntimeError(
+            "backtest sync wrapper: coroutine yielded; shim's async "
+            "methods must complete without awaiting real I/O"
+        )
+    except StopIteration as result:
+        return result.value
 
 
 # ---------------------------------------------------------------------------

@@ -1677,6 +1677,55 @@ class Database:
                 "(version, applied_at, description) VALUES (?, ?, ?)",
                 (20260429, now_iso, "tier_1a_signal_params_v1"),
             )
+
+            # BL-067 conviction-lock: add conviction_lock_enabled column on
+            # signal_params + conviction_locked_at/conviction_locked_stack
+            # columns on paper_trades. Idempotent guards via PRAGMA.
+            #
+            # design-v2 adv-M4: INSERT OR IGNORE INTO paper_migrations is
+            # OUTSIDE the column-existence guard. Otherwise, partial-failure
+            # on first run (column applied + cutover row absent) would leave
+            # the post-migration assertion permanently failing on every
+            # subsequent run because PRAGMA sees the column → skips the
+            # entire `if` block including the marker INSERT.
+            cur_pragma = await conn.execute(
+                "PRAGMA table_info(signal_params)"
+            )
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            if "conviction_lock_enabled" not in existing_cols:
+                await conn.execute(
+                    "ALTER TABLE signal_params "
+                    "ADD COLUMN conviction_lock_enabled INTEGER "
+                    "NOT NULL DEFAULT 0"
+                )
+            # Marker INSERT — UNCONDITIONAL per M4 fix.
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations "
+                "(name, cutover_ts) VALUES (?, ?)",
+                ("bl067_conviction_lock_enabled", now_iso),
+            )
+
+            # design-v2 arch-D1: paper_trades.conviction_locked_at +
+            # conviction_locked_stack added in same migration. Avoids
+            # unreliable backfill of historical locked rows once source
+            # tables age out.
+            cur_pragma_pt = await conn.execute(
+                "PRAGMA table_info(paper_trades)"
+            )
+            existing_pt_cols = {
+                row[1] for row in await cur_pragma_pt.fetchall()
+            }
+            if "conviction_locked_at" not in existing_pt_cols:
+                await conn.execute(
+                    "ALTER TABLE paper_trades "
+                    "ADD COLUMN conviction_locked_at TEXT"
+                )
+            if "conviction_locked_stack" not in existing_pt_cols:
+                await conn.execute(
+                    "ALTER TABLE paper_trades "
+                    "ADD COLUMN conviction_locked_stack INTEGER"
+                )
+
             await conn.commit()
         except Exception:
             try:
@@ -1700,6 +1749,21 @@ class Database:
         row = await cur.fetchone()
         if row is None:
             raise RuntimeError("signal_params_v1 cutover row missing after migration")
+
+        # BL-067 post-migration assertion (M3) — paralleling
+        # signal_params_v1 above. design-v2 adv-M4 makes the cutover-row
+        # INSERT unconditional so this assertion is the catch for the
+        # "INSERT-OR-IGNORE was somehow not applied" pathological case
+        # (rare but loud-on-startup).
+        cur = await conn.execute(
+            "SELECT 1 FROM paper_migrations WHERE name = ?",
+            ("bl067_conviction_lock_enabled",),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "bl067_conviction_lock_enabled cutover row missing after migration"
+            )
 
     # ------------------------------------------------------------------
     # Candidates

@@ -36,6 +36,25 @@ class _DaemonThread(_OrigThread):
 aiosqlite.core.Thread = _DaemonThread
 
 
+@pytest.fixture(autouse=True)
+def _reset_signal_sources_cache():
+    """BL-067: per-test reset of `scout.trading.conviction` module cache.
+
+    The `_signal_sources_missing` set is module-level — without a reset
+    fixture, a missing-table cached during one test silently propagates
+    to all subsequent tests in the same session, causing backtest tests
+    to see stack=0 for tables that were missing in a different DB.
+
+    Try/except for TDD-friendliness — works before the module exists.
+    """
+    try:
+        from scout.trading.conviction import clear_missing_sources_cache_for_tests
+        clear_missing_sources_cache_for_tests()
+    except ImportError:
+        pass
+    yield
+
+
 @pytest.fixture
 def settings_factory():
     def _make(**overrides):

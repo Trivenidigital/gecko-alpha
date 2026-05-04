@@ -77,6 +77,10 @@ class SignalParams:
     max_duration_hours: int
     enabled: bool
     source: Literal["table", "settings"]
+    # BL-067 conviction-lock per-signal opt-in. Defaults False (fail-closed)
+    # both in the Settings fallback path and in the table path. Default
+    # value placed last to preserve existing positional construction sites.
+    conviction_lock_enabled: bool = False
 
 
 # Module-level cache. Keyed by signal_type, value = (params, expires_at).
@@ -151,10 +155,14 @@ async def get_params(
         )
         return _settings_params(signal_type, settings)
 
+    # BL-067: conviction_lock_enabled is row[10]. Existing column count
+    # before this PR was 10 (indexes 0..9). Per design-v2 adv-N1, signal_type
+    # is NOT in the SELECT — caller passes it as the function argument.
     cursor = await db._conn.execute(
         """SELECT leg_1_pct, leg_1_qty_frac, leg_2_pct, leg_2_qty_frac,
                   trail_pct, trail_pct_low_peak, low_peak_threshold_pct,
-                  sl_pct, max_duration_hours, enabled
+                  sl_pct, max_duration_hours, enabled,
+                  conviction_lock_enabled
            FROM signal_params WHERE signal_type = ?""",
         (signal_type,),
     )
@@ -183,6 +191,7 @@ async def get_params(
             max_duration_hours=int(row[8]),
             enabled=bool(row[9]),
             source="table",
+            conviction_lock_enabled=bool(row[10]),
         )
 
     _cache[signal_type] = (params, now + _CACHE_TTL_SEC, _cache_version)

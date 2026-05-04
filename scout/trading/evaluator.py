@@ -103,7 +103,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                   created_at, leg_1_filled_at, leg_2_filled_at,
                   remaining_qty, floor_armed, realized_pnl_usd,
                   checkpoint_6h_pct, checkpoint_24h_pct,
-                  moonshot_armed_at
+                  moonshot_armed_at, conviction_locked_at
            FROM paper_trades
            WHERE status = 'open'""")
     rows = await cursor.fetchall()
@@ -155,6 +155,112 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
 
             # Per-signal params (Tier 1a). Cached for 5 min so this is cheap.
             sp = await params_for_signal(db, signal_type_row, settings)
+
+            # BL-067 conviction-lock overlay. Three gates ALL must pass:
+            #   1. Master kill-switch ON (settings.PAPER_CONVICTION_LOCK_ENABLED)
+            #   2. Per-signal opt-in (signal_params.conviction_lock_enabled=1)
+            #   3. Stack count >= settings.PAPER_CONVICTION_LOCK_THRESHOLD
+            #
+            # Placement-critical (M2/A2): MUST run BEFORE
+            # `max_duration = timedelta(hours=sp.max_duration_hours)` below
+            # so the overlaid max_duration_hours flows into the timedelta call.
+            #
+            # Note: trail_pct_low_peak intentionally NOT overlaid (A3) —
+            # adaptive low-peak trail is orthogonal regime (peak <
+            # low_peak_threshold); locked trail only fires at high peak.
+            # Leg targets (leg_1_pct/leg_2_pct/qty_frac) NOT overlaid (S6) —
+            # BL-067 spec table only widens trail/sl/max_duration.
+            #
+            # `row[30]` = conviction_locked_at (SELECT extended above).
+            conviction_locked_at = row[30] if len(row) > 30 else None
+
+            # PR-review H1: emit one-shot log when master kill is OFF but
+            # the trade was previously armed. Operator-rollback scenario
+            # (Layer 1 .env flip + restart): trades stay open but their
+            # exit gates silently revert from locked to base. Without
+            # this log, a fleet of held trades can quietly tighten their
+            # trail mid-flight on `PAPER_CONVICTION_LOCK_ENABLED=False`.
+            # Idempotent via `conviction_locked_at IS NOT NULL` check —
+            # one log per trade per pass; aggregates as a count signal.
+            if (
+                conviction_locked_at is not None
+                and not settings.PAPER_CONVICTION_LOCK_ENABLED
+            ):
+                log.info(
+                    "conviction_lock_disarmed_post_rollback",
+                    trade_id=trade_id,
+                    token_id=token_id,
+                    signal_type=signal_type_row,
+                    armed_at=conviction_locked_at,
+                    hint="master kill-switch OFF; locked params reverting to base",
+                )
+
+            if (
+                settings.PAPER_CONVICTION_LOCK_ENABLED
+                and sp.conviction_lock_enabled
+            ):
+                from scout.trading.conviction import (
+                    compute_stack,
+                    conviction_locked_params,
+                )
+                # design-v2 adv-S2: exclude_trade_id prevents the trade
+                # from counting itself as a "confirmation" via the
+                # paper_trades DISTINCT signal_type scan.
+                stack = await compute_stack(
+                    db, token_id, str(row[3]),
+                    exclude_trade_id=trade_id,
+                )
+                threshold = settings.PAPER_CONVICTION_LOCK_THRESHOLD
+                if stack >= threshold:
+                    locked = conviction_locked_params(
+                        stack=stack,
+                        base={
+                            "max_duration_hours": sp.max_duration_hours,
+                            "trail_pct": sp.trail_pct,
+                            "sl_pct": sp.sl_pct,
+                        },
+                    )
+                    # Replace sp with overlaid frozen dataclass. Critical:
+                    # this MUST happen before line 158 so the NEW
+                    # max_duration_hours is what timedelta() reads.
+                    from dataclasses import replace
+                    sp = replace(
+                        sp,
+                        max_duration_hours=locked["max_duration_hours"],
+                        trail_pct=locked["trail_pct"],
+                        sl_pct=locked["sl_pct"],
+                    )
+                    # D2 idempotency: log + stamp ONCE per trade. Subsequent
+                    # passes still apply the overlay (re-derived) but emit
+                    # no log. design-v2 D1: also stamp conviction_locked_stack
+                    # so dashboard reads stack-at-arm without re-computing.
+                    if conviction_locked_at is None:
+                        armed_iso = now.isoformat()
+                        await conn.execute(
+                            "UPDATE paper_trades "
+                            "SET conviction_locked_at = ?, "
+                            "    conviction_locked_stack = ? "
+                            "WHERE id = ?",
+                            (armed_iso, stack, trade_id),
+                        )
+                        await conn.commit()
+                        log.info(
+                            "conviction_lock_armed",
+                            trade_id=trade_id,
+                            token_id=token_id,
+                            signal_type=signal_type_row,
+                            stack=stack,
+                            # PR-review N2-arch: explicit bucket value
+                            # (saturates at 4) so operator can tell if
+                            # the lock applied saturated params or not.
+                            bucket=min(stack, 4),
+                            threshold=threshold,
+                            locked_trail_pct=sp.trail_pct,
+                            locked_sl_pct=sp.sl_pct,
+                            locked_max_duration_hours=sp.max_duration_hours,
+                            armed_at=armed_iso,
+                        )
+
             max_duration = timedelta(hours=sp.max_duration_hours)
 
             # Compute elapsed up-front so the stale/no-price branches below can
@@ -354,7 +460,17 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                 # trail harvests profit on modest peakers without choking
                 # moonshots (those go through the moonshot branch above).
                 if moonshot_armed_at is not None:
-                    effective_trail_pct = settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT
+                    # BL-067 A1 fix: compose moonshot floor with locked trail.
+                    # When conviction-lock has overlaid sp.trail_pct above
+                    # (e.g., to 35% at stack=4), the locked trail wins
+                    # whenever wider than the moonshot constant. max()
+                    # preserves both regimes' protective intent. Backtest
+                    # simulator already used this max() form; production
+                    # must match.
+                    effective_trail_pct = max(
+                        settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT,
+                        sp.trail_pct,
+                    )
                 elif (
                     peak_pct is not None
                     and peak_pct < sp.low_peak_threshold_pct

@@ -269,6 +269,17 @@ class Settings(BaseSettings):
     PAPER_MOONSHOT_THRESHOLD_PCT: float = 40.0
     PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT: float = 30.0
 
+    # BL-067 conviction-lock: when N>= PAPER_CONVICTION_LOCK_THRESHOLD
+    # distinct signals fire on the same token within a 504h window, widen
+    # the trade's trail_pct / sl_pct / max_duration_hours per the spec
+    # table at backlog.md:374-380. Master kill-switch defaults False; per-
+    # signal opt-in via signal_params.conviction_lock_enabled (default 0).
+    # Validated by tasks/findings_bl067_backtest_conviction_lock.md
+    # (lift +114% at N=3 threshold, both compound gates PASS). Default
+    # fail-closed.
+    PAPER_CONVICTION_LOCK_ENABLED: bool = False
+    PAPER_CONVICTION_LOCK_THRESHOLD: int = 3
+
     # BL-064 TG Social Signals — Telethon user-session listener for curated TG
     # channels. Default OFF. Auto-read 3-4 watched channels, parse cashtags +
     # contract addresses, alert always, paper-trade via TradingEngine when
@@ -496,6 +507,31 @@ class Settings(BaseSettings):
     def _validate_first_signal_min_count(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"FIRST_SIGNAL_MIN_SIGNAL_COUNT must be >= 1; got={v}")
+        return v
+
+    @field_validator("PAPER_CONVICTION_LOCK_THRESHOLD")
+    @classmethod
+    def _validate_conviction_lock_threshold(cls, v: int) -> int:
+        # Lower bound 2: stack=1 means no independent signals fired;
+        # nothing to "lock" against.
+        # Upper bound 50 (PR-review M2 relaxation): operator escape hatch
+        # — previously hard-capped at 11 (highest observed stack 30d),
+        # but operators may want to effectively-disable lock for one
+        # signal_type via threshold > observed-max without flipping the
+        # per-signal flag. Above 11 is unusual; an explicit log noise
+        # would be ideal but field validators can't log cleanly. Above
+        # 50 is almost certainly a typo.
+        if v < 2:
+            raise ValueError(
+                "PAPER_CONVICTION_LOCK_THRESHOLD must be >= 2 "
+                f"(stack=1 means no independent signals fired); got={v}"
+            )
+        if v > 50:
+            raise ValueError(
+                "PAPER_CONVICTION_LOCK_THRESHOLD must be <= 50 "
+                f"(observed max=11 over 30d; values > 50 likely a typo); "
+                f"got={v}"
+            )
         return v
 
     @field_validator("PEAK_FADE_MIN_PEAK_PCT")
