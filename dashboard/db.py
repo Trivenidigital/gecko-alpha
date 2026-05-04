@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import aiosqlite
+import structlog
 
 KNOWN_SIGNALS = [
     "vol_liq_ratio",
@@ -1092,9 +1093,19 @@ async def get_tg_social_dlq(db_path: str, limit: int = 20) -> list[dict]:
             )
             rows = await cur.fetchall()
         except aiosqlite.OperationalError as e:
-            if "tg_social_dlq" in str(e):
-                return []
-            raise
+            # PR-review MF2 (a707628): narrow catch — only swallow the
+            # specific "no such table" form, not any error mentioning the
+            # table name. Otherwise a future query bug like
+            # "near 'tg_social_dlq': syntax error" would silently return
+            # [], masking the bug forever.
+            msg = str(e)
+            if "no such table" not in msg or "tg_social_dlq" not in msg:
+                raise
+            structlog.get_logger().warning(
+                "dashboard_dlq_table_missing_fallback",
+                err=msg,
+            )
+            return []
         return [
             {
                 "id": r[0],
@@ -1156,4 +1167,22 @@ async def get_tg_social_per_channel_cashtag_today(db_path: str) -> dict[str, int
                GROUP BY ch"""
         )
         rows = await cur.fetchall()
-        return {r[0]: r[1] for r in rows if r[0]}
+        # PR-review SHOULD-FIX (a707628 SF1 + ae6d0a #2): count rows where
+        # json_extract($.channel_handle) returned NULL or empty separately
+        # and warn if any. Otherwise a producer-side bug that drops
+        # channel_handle from signal_data silently makes per-channel counts
+        # mismatch the rolling 24h aggregate — exactly the silent failure
+        # the project's discipline forbids.
+        result: dict[str, int] = {}
+        unknown_count = 0
+        for r in rows:
+            if r[0]:
+                result[r[0]] = r[1]
+            else:
+                unknown_count += r[1]
+        if unknown_count:
+            structlog.get_logger().warning(
+                "dashboard_cashtag_null_channel_handle",
+                count=unknown_count,
+            )
+        return result

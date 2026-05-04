@@ -6,6 +6,7 @@ import os
 from datetime import timedelta
 
 import aiosqlite
+import structlog
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -20,22 +21,25 @@ from dashboard.models import (
     WinRateResponse,
 )
 
-# BL-066': module-level Settings singleton.
+_log = structlog.get_logger()
+
+# BL-066': module-level Settings singleton (PR-review MF3 + ae6d0a SHOULD-FIX #1).
 # Pydantic v2 BaseSettings re-reads .env + runs ~30 field validations on every
 # instantiation (~5ms cold path). Calling Settings() per-request was a real
 # regression on existing endpoints AND made the existing alerts endpoint
-# fragile to .env state. Catch ValidationError defensively so a misconfigured
-# .env doesn't 500 the read-only dashboard.
+# fragile to .env state. Catch broadly so a misconfigured .env (or any other
+# import-time crash in scout.config) doesn't take down the read-only dashboard
+# at module import. structlog hoisted to top-of-file so the except clause
+# can't itself fail on a deferred import.
 try:
     from scout.config import Settings as _ScoutSettings
     _DASHBOARD_SETTINGS = _ScoutSettings()
 except Exception as _e:  # pragma: no cover — paranoia for misconfigured .env
-    import structlog as _structlog
     _DASHBOARD_SETTINGS = None
-    _structlog.get_logger().error(
-        "dashboard_settings_init_failed",
-        err=str(_e),
-    )
+    _log.error("dashboard_settings_init_failed", err=str(_e))
+
+# BL-066' fallback constant — keep aligned with scout/config.py default.
+_CAP_PER_DAY_FALLBACK = 5
 
 # Default DB path — can be overridden via create_app()
 # Note: _db_path is closure-captured via create_app() and safe for single-process use (L5).
@@ -750,12 +754,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
         conn = scout_db._conn
 
         # BL-066': defensive fallback for the F19 startup race + F5 rollback
-        # scenarios. The cashtag_trade_eligible column was added in BL-065
-        # (master >= 835ce7f); if dashboard reads the DB before pipeline
-        # finishes its migration, OR if DB is rolled back to pre-BL-065 while
-        # dashboard stays current, the new SELECT shape would 500. Try the
-        # new shape first; fall back to old shape with cashtag column defaulted
-        # to 0. T11 in tests/test_dashboard_tg_social_extensions.py pins this.
+        # scenarios (PR-review MF1 — narrow the substring catch so it doesn't
+        # swallow unrelated OperationalErrors that mention the column name).
+        # The cashtag_trade_eligible column was added in BL-065 (master >=
+        # 835ce7f); if dashboard reads the DB before pipeline finishes its
+        # migration OR if DB is rolled back to pre-BL-065 while dashboard
+        # stays current, the new SELECT shape would 500. Catch only the
+        # specific "no such column" form; anything else (syntax error,
+        # ambiguous column from a JOIN refactor) re-raises so the bug stays
+        # visible. T11 pins this path.
         try:
             ch_cur = await conn.execute(
                 """SELECT channel_handle, trade_eligible, safety_required,
@@ -765,8 +772,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
             ch_rows = await ch_cur.fetchall()
             _has_cashtag_col = True
         except aiosqlite.OperationalError as exc:
-            if "cashtag_trade_eligible" not in str(exc):
+            _msg = str(exc)
+            if "no such column" not in _msg or "cashtag_trade_eligible" not in _msg:
                 raise
+            _log.warning(
+                "dashboard_cashtag_column_missing_fallback",
+                err=_msg,
+            )
             ch_cur = await conn.execute(
                 """SELECT channel_handle, trade_eligible, safety_required,
                           removed_at, added_at
@@ -785,12 +797,20 @@ def create_app(db_path: str | None = None) -> FastAPI:
             if _has_cashtag_col else {}
         )
         # BL-066': cap_per_day from cached module-level Settings singleton
-        # (NOT per-request). Falls back to 5 if Settings init failed.
-        cap_per_day = (
-            _DASHBOARD_SETTINGS.PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY
-            if _DASHBOARD_SETTINGS is not None
-            else 5
-        )
+        # (PR-review MF3 — log at REQUEST time when fallback active so the
+        # failure isn't silent. Without this, a misconfigured .env at process
+        # start would make every dashboard call silently use cap=5 even if
+        # operator's real cap is 10, with only the import-time log to show
+        # for it).
+        if _DASHBOARD_SETTINGS is None:
+            _log.error(
+                "dashboard_cap_per_day_fallback_active",
+                endpoint="/api/tg_social/alerts",
+                fallback=_CAP_PER_DAY_FALLBACK,
+            )
+            cap_per_day = _CAP_PER_DAY_FALLBACK
+        else:
+            cap_per_day = _DASHBOARD_SETTINGS.PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY
 
         channels = [
             {
@@ -883,6 +903,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         # BL-066': cashtag-dispatch 24h rollup (rolling window — different
         # surface from per-channel cap utilization, which is calendar-day).
+        # PR-review SHOULD-FIX #4 (ae6d0a): named `cashtag_dispatched_24h` so
+        # consumer can't accidentally compare against per-channel
+        # `cashtag_dispatched_today` (calendar-day) and conclude the stats
+        # are "inconsistent" — they use different windows by design.
         cashtag_stats = await db.get_tg_social_cashtag_stats_24h(_db_path)
 
         return {
@@ -894,10 +918,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 "with_cashtag": s[2] or 0,
                 "signals_resolved": sig[0] or 0,
                 "trades_dispatched": sig[1] or 0,
-                "cashtag_dispatched": cashtag_stats["dispatched"],
+                "cashtag_dispatched_24h": cashtag_stats["dispatched"],
                 "dlq": dlq,
             },
             "alerts": alerts,
+            # PR-review MF3 (a707628): expose Settings init state so the
+            # frontend can render an honest banner if the cap_per_day shown
+            # is the hard-coded fallback rather than operator-configured.
+            "settings_loaded": _DASHBOARD_SETTINGS is not None,
         }
 
     @app.get("/api/tg_social/dlq")

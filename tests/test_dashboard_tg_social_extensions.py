@@ -137,6 +137,40 @@ async def test_get_tg_social_dlq_returns_recent_failures(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_get_tg_social_dlq_returns_empty_when_table_missing(tmp_path):
+    """PR-review M1 (ac8c1c): pins F17/S1 — dashboard pointed at a
+    pre-BL-064 DB snapshot (rolled-back scenario) where tg_social_dlq
+    table doesn't exist yet. Helper must return [] not 500."""
+    db_path = str(tmp_path / "pre_bl064.db")
+    await _seed_db(db_path)
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute("DROP TABLE tg_social_dlq")
+        await conn.commit()
+    rows = await dash_db.get_tg_social_dlq(db_path, limit=10)
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_endpoint_tg_social_dlq_returns_empty_when_table_missing(tmp_path):
+    """PR-review M1 follow-on: same fallback path through the FastAPI
+    endpoint (verifies the helper's defensive try/except surfaces
+    correctly through the route handler)."""
+    db_path = str(tmp_path / "pre_bl064.db")
+    await _seed_db(db_path)
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute("DROP TABLE tg_social_dlq")
+        await conn.commit()
+    from httpx import ASGITransport, AsyncClient
+    from dashboard.api import create_app
+    app = create_app(db_path=db_path)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        resp = await ac.get("/api/tg_social/dlq?limit=5")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+@pytest.mark.asyncio
 async def test_get_tg_social_dlq_clamps_limit_to_100(tmp_path):
     db_path = str(tmp_path / "test.db")
     await _seed_db(db_path)
@@ -295,7 +329,7 @@ async def test_endpoint_tg_social_alerts_includes_cashtag_dispatched_in_stats(tm
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         resp = await ac.get("/api/tg_social/alerts")
     body = resp.json()
-    assert body["stats_24h"]["cashtag_dispatched"] == 1
+    assert body["stats_24h"]["cashtag_dispatched_24h"] == 1
     ch = next(c for c in body["channels"] if c["channel_handle"] == "@thanos_mind")
     assert ch["cashtag_trade_eligible"] is True
     assert ch["cashtag_dispatched_today"] == 1
@@ -334,7 +368,7 @@ async def test_endpoint_tg_social_alerts_existing_keys_preserved(tmp_path):
     assert isinstance(ch["cashtag_trade_eligible"], bool)
     assert isinstance(ch["cashtag_dispatched_today"], int)
     assert isinstance(ch["cashtag_cap_per_day"], int)
-    assert isinstance(body["stats_24h"]["cashtag_dispatched"], int)
+    assert isinstance(body["stats_24h"]["cashtag_dispatched_24h"], int)
 
 
 # ---------------------------------------------------------------------------

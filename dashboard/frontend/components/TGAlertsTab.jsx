@@ -136,7 +136,7 @@ export default function TGAlertsTab() {
           </div>
           <div className="tg-stat">
             <div className="tg-stat-label">Cashtag Dispatched</div>
-            <div className="tg-stat-value">{stats.cashtag_dispatched ?? 0}</div>
+            <div className="tg-stat-value">{stats.cashtag_dispatched_24h ?? 0}</div>
           </div>
           <div className="tg-stat">
             <div className="tg-stat-label">DLQ</div>
