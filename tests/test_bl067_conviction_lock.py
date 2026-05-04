@@ -282,9 +282,12 @@ async def test_get_params_loads_conviction_lock_enabled(db, settings_factory):
     """T4 — get_params reads conviction_lock_enabled from signal_params row."""
     from scout.trading.params import bump_cache_version, get_params
 
-    settings = settings_factory()
+    # SIGNAL_PARAMS_ENABLED=True forces the table read path (otherwise the
+    # function returns Settings fallback with conviction_lock_enabled=False).
+    settings = settings_factory(SIGNAL_PARAMS_ENABLED=True)
     sp = await get_params(db, "first_signal", settings)
     assert sp.conviction_lock_enabled is False
+    assert sp.source == "table"
 
     await db._conn.execute(
         "UPDATE signal_params SET conviction_lock_enabled = 1 "
