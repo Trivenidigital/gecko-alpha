@@ -2,9 +2,28 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans.
 
-**New primitives introduced:** new structured log event `signal_skipped_synthetic_token_id` (parallels existing `signal_skipped_junk` shape at `scout/trading/signals.py`); new pre-open validation gate at `trade_predictions` dispatcher (`scout/trading/signals.py:~748`) that REJECTS the prediction if `pred.coin_id` is missing from BOTH `price_cache` AND the BL-076 `Database.lookup_symbol_name_by_coin_id` resolution chain (`gainers_snapshots` / `volume_history_cg` / `volume_spikes`); no DB schema changes; no Settings changes.
+**New primitives introduced:** new structured log event `signal_skipped_synthetic_token_id` (parallels existing `signal_skipped_junk` shape at `scout/trading/signals.py`); new pre-open validation gate in `trade_predictions` dispatcher placed AFTER `_is_junk_coinid` filter (`signals.py:732`) but BEFORE `should_open` call (`signals.py:738`); new `Database.coin_id_resolves(coin_id) -> bool` method (single SELECT 1 across `price_cache` ∪ 3 snapshot tables — explicit existence probe); upstream defense-in-depth filter at `scout/narrative/predictor.py:filter_laggards` to apply `_is_tradeable_candidate(coin_id, symbol)` before predictions are stored; new shared module `scout/trading/filters.py` (extracted from `signals.py:591-622`) to avoid `predictor → signals` circular import. No DB schema changes; no Settings changes; no migrations.
 
-**Combined plan + design rationale:** scope is ~10 LOC behavioral change + 2-3 tests. Full plan + 2 reviewers + design + 2 reviewers cycle is overkill for scope; combined doc + 2 reviewers is sufficient rigor.
+**v2 changes from 2-agent plan-review feedback (adversarial `ab2ef9ee` + architecture `a73653cc`):**
+
+*MUST-FIX (4):*
+- **adv-M1 / arch-D1 — `coin_id: str` is non-Optional:** Pydantic v2 rejects `None` at model boundary; the proposed `if pred.coin_id is None` guard is dead code. Real risk = empty/whitespace (Pydantic accepts both for bare `str`). Replaced with `if not pred.coin_id or not pred.coin_id.strip()` matching `_is_tradeable_candidate` shape. Added explicit T2c whitespace test.
+- **adv-M2 — `lookup_symbol_name_by_coin_id` `("", "")` on `aiosqlite.OperationalError`:** would silently degrade to "miss" → false rejection of legit tokens. v2 wraps the resolution check in `try/except aiosqlite.OperationalError` with fail-CLOSED on infra exception (rejects + logs `reason="resolution_check_error"`). Avoids leaking through outer `except Exception` at `signals.py:768`.
+- **arch-A1 — upstream defense in depth:** add filter at `predictor.py:filter_laggards` to apply `_is_tradeable_candidate(coin_id, symbol)` BEFORE prediction is stored. Catches junk-prefixed IDs at fetch time. Required: factor `_is_tradeable_candidate` into shared `scout/trading/filters.py` to avoid `predictor → signals` circular import. Dispatcher gate stays as second layer for tokens that pass upstream but aren't in our snapshot tables.
+- **arch-A2 — fragile truthiness contract:** replaced `bool(symbol and name)` probe with new dedicated `Database.coin_id_resolves(coin_id) -> bool`. Single explicit-purpose method; immune to BL-076 helper return-value evolution.
+
+*SHOULD-FIX (5):*
+- **adv-S1 / arch-D2 — drop `signal_combo` from skip event:** field reserved for combo_performance composite-key. Literal `"narrative_prediction"` would corrupt operator dashboards. v2 emits only `signal_type` + `coin_id` + `reason`.
+- **adv-S2 — gate position EXPLICIT:** AFTER `_is_junk_coinid` (signals.py:732), BEFORE `should_open` (signals.py:738-747). Skip event always visible; no wasted combo-performance lookup on synthetic IDs.
+- **arch-S1 — rejection-window documented:** fresh CoinGecko listing has 5-10min window where snapshot tables haven't caught up; the gate may reject legit tokens during that window. Acceptable per design — operator-grep `signal_skipped_synthetic_token_id` to spot losses.
+- **arch-S2 — refactor-trigger commitment:** `trade_predictions` has 5 conditionals; this PR adds 6th. Any 7th gate triggers refactor to `_PREDICTION_FILTERS: list[Callable]` registry. Captured in `tasks/todo.md`.
+- **arch-S3 — cross-dispatcher inconsistency justified inline:** `trade_volume_spikes`/`trade_gainers` source from snapshot tables directly (implicit existence). `trade_chain_completions` uses `lookup_symbol_name_by_coin_id` for metadata but degrades gracefully. Only `trade_predictions` is structurally vulnerable; documented as design choice.
+
+*NIT:*
+- **adv-N3:** explicit `engine.opened == []` assert verified in T1.
+- **adv-N2:** rollback risk @ `PAPER_MAX_DURATION_HOURS=168` acceptable; bounded by zombie-safeguard.
+
+**Combined plan + design rationale:** scope is ~30 LOC + 4 tests. Full plan + 2 reviewers + design + 2 reviewers cycle is overkill for scope; combined doc + 2 reviewers is sufficient rigor.
 
 ---
 
@@ -218,46 +237,151 @@ Expected: T1 FAILS (rejection event not emitted), T2 + T3 likely fail at the dis
 
 ---
 
-### Task 2: Implement the gate
+### Task 2: Implement the gate (v2)
 
 **Files:**
-- Modify: `scout/trading/signals.py:trade_predictions`
+- Create: `scout/trading/filters.py` (move `_is_tradeable_candidate` here to avoid circular import)
+- Modify: `scout/trading/signals.py` (re-export `_is_tradeable_candidate` from new module; add gate)
+- Modify: `scout/narrative/predictor.py:filter_laggards` (apply `_is_tradeable_candidate` upstream)
+- Modify: `scout/db.py` (add `Database.coin_id_resolves` method)
 
-- [ ] **Step 1: Insert validation gate**
-
-In `scout/trading/signals.py:trade_predictions` dispatcher, after the existing junk-coin_id check at line 732 and BEFORE the existing price_cache fetch at line 748:
+- [ ] **Step 1a: Extract `_is_tradeable_candidate` to `scout/trading/filters.py`**
 
 ```python
-            # narrative_prediction token_id validation (this PR):
-            # Reject predictions whose coin_id does not resolve in
-            # price_cache OR the BL-076 lookup chain (gainers_snapshots /
-            # volume_history_cg / volume_spikes). 32 of 56 stale-young
-            # open trades had synthetic/empty token_ids; engine's reactive
-            # trade_skipped_no_price log fires too late to gate the trade.
-            #
-            # Fallback to lookup_symbol_name_by_coin_id handles the race
-            # where price_cache hasn't caught up to a fresh prediction.
-            cur = await db._conn.execute(
-                "SELECT 1 FROM price_cache WHERE coin_id = ? LIMIT 1",
-                (pred.coin_id,),
-            )
-            in_price_cache = (await cur.fetchone()) is not None
-            if not in_price_cache:
-                # Race-tolerant fallback: BL-076 lookup chain.
-                fallback_symbol, fallback_name = (
-                    await db.lookup_symbol_name_by_coin_id(pred.coin_id)
+# scout/trading/filters.py — NEW module
+"""Shared filter helpers used by both predictor.py (upstream defense in depth)
+and signals.py dispatchers (downstream pre-open gates).
+
+Extracted from scout/trading/signals.py:591-622 to break the circular
+import that would otherwise form: predictor → signals → predictor.
+"""
+from __future__ import annotations
+
+# `_is_junk_coinid` and `_is_tradeable_candidate` migrated here from
+# scout/trading/signals.py. Also re-exported there for backwards-compat
+# with existing imports.
+
+_JUNK_COINID_PREFIXES = (
+    "wrapped-", "bridged-", "test-",
+)
+
+
+def _is_junk_coinid(coin_id: str) -> bool:
+    if not coin_id:
+        return True
+    cid = coin_id.lower()
+    return any(cid.startswith(p) for p in _JUNK_COINID_PREFIXES)
+
+
+def _is_tradeable_candidate(coin_id: str, symbol: str) -> bool:
+    """Returns False for empty/whitespace IDs, non-ASCII tickers,
+    and junk-prefixed coin_ids (per PR #44)."""
+    if not coin_id or not coin_id.strip():
+        return False
+    if not symbol or not symbol.isascii():
+        return False
+    return not _is_junk_coinid(coin_id)
+```
+
+`scout/trading/signals.py:591-622`: replace function bodies with re-exports:
+
+```python
+from scout.trading.filters import _is_junk_coinid, _is_tradeable_candidate  # noqa
+```
+
+- [ ] **Step 1b: Add `Database.coin_id_resolves` method (arch-A2)**
+
+In `scout/db.py`:
+
+```python
+    async def coin_id_resolves(self, coin_id: str) -> bool:
+        """BL-067-followup token-id existence probe.
+
+        Returns True iff coin_id appears in any of:
+          - price_cache (canonical authority)
+          - gainers_snapshots / volume_history_cg / volume_spikes
+            (race-tolerant fallback for fresh predictions)
+
+        Per-table aiosqlite.OperationalError raises (matches BL-076
+        narrowing pattern). Caller decides whether to fail-closed or
+        fail-open on infra exception.
+        """
+        if not coin_id or not coin_id.strip():
+            return False
+        for table in ("price_cache", "gainers_snapshots",
+                      "volume_history_cg", "volume_spikes"):
+            try:
+                cur = await self._conn.execute(
+                    f"SELECT 1 FROM {table} WHERE coin_id = ? LIMIT 1",
+                    (coin_id,),
                 )
-                in_lookup_chain = bool(fallback_symbol and fallback_name)
-                if not in_lookup_chain:
-                    log.info(
-                        "signal_skipped_synthetic_token_id",
-                        coin_id=pred.coin_id,
-                        symbol=pred.symbol,
-                        signal_type="narrative_prediction",
-                        signal_combo="narrative_prediction",
-                        reason="token_id not in price_cache or BL-076 lookup chain",
-                    )
-                    continue
+                if (await cur.fetchone()) is not None:
+                    return True
+            except aiosqlite.OperationalError as exc:
+                raise RuntimeError(
+                    f"coin_id_resolves OperationalError on {table}: {exc}"
+                ) from exc
+        return False
+```
+
+- [ ] **Step 1c: Insert dispatcher gate (signals.py:trade_predictions)**
+
+Position: AFTER `_is_junk_coinid` filter at `signals.py:732`, BEFORE `should_open` call at `signals.py:738`:
+
+```python
+            # narrative_prediction token_id existence gate (adv-M1/M2 v2):
+            # Reject predictions whose coin_id is empty/whitespace or
+            # doesn't resolve in price_cache ∪ snapshot tables. Fail-CLOSED
+            # on infra exception (OperationalError → reject + telemetry).
+            if not pred.coin_id or not pred.coin_id.strip():
+                log.info(
+                    "signal_skipped_synthetic_token_id",
+                    coin_id=pred.coin_id,
+                    symbol=pred.symbol,
+                    signal_type="narrative_prediction",
+                    reason="empty_or_whitespace_coin_id",
+                )
+                continue
+            try:
+                resolves = await db.coin_id_resolves(pred.coin_id)
+            except Exception as exc:
+                log.info(
+                    "signal_skipped_synthetic_token_id",
+                    coin_id=pred.coin_id,
+                    symbol=pred.symbol,
+                    signal_type="narrative_prediction",
+                    reason="resolution_check_error",
+                    error=str(exc),
+                )
+                continue
+            if not resolves:
+                log.info(
+                    "signal_skipped_synthetic_token_id",
+                    coin_id=pred.coin_id,
+                    symbol=pred.symbol,
+                    signal_type="narrative_prediction",
+                    reason="token_id_not_in_price_cache_or_snapshots",
+                )
+                continue
+```
+
+- [ ] **Step 1d: Upstream filter in predictor.py:filter_laggards**
+
+```python
+# Existing filter at predictor.py:108-112 currently:
+#   coin_id = t.get("id", "")
+#   if not coin_id:
+#       continue
+# Tighten to apply _is_tradeable_candidate (catches test- / wrapped- /
+# bridged- / non-ASCII) at fetch time so junk never enters the
+# predictions table.
+
+from scout.trading.filters import _is_tradeable_candidate
+# ...
+            coin_id = t.get("id", "")
+            symbol = t.get("symbol", "").upper()
+            if not _is_tradeable_candidate(coin_id, symbol):
+                continue
 ```
 
 - [ ] **Step 2: Run tests to verify GREEN**
@@ -302,15 +426,20 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
 
 ---
 
-## Test matrix
+## Test matrix (v2)
 
 | ID | Test | Layer | What it pins |
 |---|---|---|---|
-| T1 | `test_synthetic_token_id_rejected_with_telemetry` | Integration (dispatcher) | Reject + `signal_skipped_synthetic_token_id` event fires; engine.open_trade NOT called |
-| T2 | `test_legit_in_price_cache_opens_trade` | Integration (dispatcher) | Existing behavior preserved (gate is refusal-only) |
-| T3 | `test_missing_from_price_cache_but_in_lookup_chain_opens_trade` | Integration (dispatcher) | Race-window fallback works; no false-positive rejection of fresh predictions |
+| T1 | `test_synthetic_token_id_rejected_with_telemetry` | Integration (dispatcher) | Reject + `signal_skipped_synthetic_token_id` with `reason=token_id_not_in_price_cache_or_snapshots`; engine NOT called |
+| T2a | `test_legit_in_price_cache_opens_trade` | Integration (dispatcher) | Existing behavior preserved |
+| T2b | `test_legit_in_lookup_chain_opens_trade` | Integration (dispatcher) | Race-window fallback (gainers_snapshots only); engine called |
+| T2c | `test_empty_or_whitespace_coin_id_rejected` | Integration (dispatcher) | adv-M1: empty + whitespace coin_id → reject with `reason=empty_or_whitespace_coin_id` |
+| T2d | `test_resolution_check_error_fails_closed` | Integration (dispatcher) | adv-M2: `coin_id_resolves` raises → reject with `reason=resolution_check_error`; engine NOT called |
+| T3 | `test_database_coin_id_resolves_method` | Unit (db) | arch-A2: explicit existence probe across 4 tables; True if in any, False if none |
+| T4 | `test_predictor_filter_laggards_rejects_junk_prefix` | Unit (predictor) | arch-A1: upstream `_is_tradeable_candidate` rejects `test-1` / `wrapped-X` etc. before `predictions` table insert |
+| T5 | `test_filters_module_exports_match_signals_back_compat` | Unit (filters) | New `scout/trading/filters.py` re-exports symbols still importable from `scout.trading.signals` |
 
-3 active tests. Zero deferred.
+8 active tests. Zero deferred.
 
 ---
 
