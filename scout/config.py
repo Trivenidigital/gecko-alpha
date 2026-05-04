@@ -269,6 +269,17 @@ class Settings(BaseSettings):
     PAPER_MOONSHOT_THRESHOLD_PCT: float = 40.0
     PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT: float = 30.0
 
+    # BL-067 conviction-lock: when N>= PAPER_CONVICTION_LOCK_THRESHOLD
+    # distinct signals fire on the same token within a 504h window, widen
+    # the trade's trail_pct / sl_pct / max_duration_hours per the spec
+    # table at backlog.md:374-380. Master kill-switch defaults False; per-
+    # signal opt-in via signal_params.conviction_lock_enabled (default 0).
+    # Validated by tasks/findings_bl067_backtest_conviction_lock.md
+    # (lift +114% at N=3 threshold, both compound gates PASS). Default
+    # fail-closed.
+    PAPER_CONVICTION_LOCK_ENABLED: bool = False
+    PAPER_CONVICTION_LOCK_THRESHOLD: int = 3
+
     # BL-064 TG Social Signals — Telethon user-session listener for curated TG
     # channels. Default OFF. Auto-read 3-4 watched channels, parse cashtags +
     # contract addresses, alert always, paper-trade via TradingEngine when
@@ -496,6 +507,25 @@ class Settings(BaseSettings):
     def _validate_first_signal_min_count(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"FIRST_SIGNAL_MIN_SIGNAL_COUNT must be >= 1; got={v}")
+        return v
+
+    @field_validator("PAPER_CONVICTION_LOCK_THRESHOLD")
+    @classmethod
+    def _validate_conviction_lock_threshold(cls, v: int) -> int:
+        # Lower bound 2: stack=1 means no independent signals fired; nothing
+        # to "lock" against. Upper bound 11 (design-v2 adv-S2): highest
+        # observed stack count over 30d backtest data per
+        # tasks/findings_bl067_backtest_conviction_lock.md Section A.
+        if v < 2:
+            raise ValueError(
+                "PAPER_CONVICTION_LOCK_THRESHOLD must be >= 2 "
+                f"(stack=1 means no independent signals fired); got={v}"
+            )
+        if v > 11:
+            raise ValueError(
+                "PAPER_CONVICTION_LOCK_THRESHOLD must be <= 11 "
+                f"(stack saturates at 4; observed max=11 over 30d); got={v}"
+            )
         return v
 
     @field_validator("PEAK_FADE_MIN_PEAK_PCT")

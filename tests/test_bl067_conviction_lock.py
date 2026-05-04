@@ -149,38 +149,38 @@ async def test_conviction_lock_post_migration_assertion_fires_when_cutover_row_m
 # ---------------------------------------------------------------------------
 
 
-def test_settings_paper_conviction_lock_enabled_default_false():
+def test_settings_paper_conviction_lock_enabled_default_false(settings_factory):
     """T2 — master kill-switch defaults False (fail-closed)."""
-    from scout.config import Settings
-    s = Settings()
+    s = settings_factory()
     assert s.PAPER_CONVICTION_LOCK_ENABLED is False
 
 
-def test_settings_paper_conviction_lock_threshold_default_3():
+def test_settings_paper_conviction_lock_threshold_default_3(settings_factory):
     """T2b — threshold defaults to N=3 (per backtest findings)."""
-    from scout.config import Settings
-    s = Settings()
+    s = settings_factory()
     assert s.PAPER_CONVICTION_LOCK_THRESHOLD == 3
 
 
-def test_settings_paper_conviction_lock_threshold_must_be_at_least_two():
+def test_settings_paper_conviction_lock_threshold_must_be_at_least_two(
+    settings_factory,
+):
     """T2c — validator: threshold < 2 makes no sense."""
     from pydantic import ValidationError
-    from scout.config import Settings
     with pytest.raises(ValidationError):
-        Settings(PAPER_CONVICTION_LOCK_THRESHOLD=1)
+        settings_factory(PAPER_CONVICTION_LOCK_THRESHOLD=1)
     with pytest.raises(ValidationError):
-        Settings(PAPER_CONVICTION_LOCK_THRESHOLD=0)
+        settings_factory(PAPER_CONVICTION_LOCK_THRESHOLD=0)
 
 
-def test_settings_paper_conviction_lock_threshold_must_be_at_most_eleven():
+def test_settings_paper_conviction_lock_threshold_must_be_at_most_eleven(
+    settings_factory,
+):
     """T2d — design-v2 S2: upper bound 11 (highest observed stack 30d)."""
     from pydantic import ValidationError
-    from scout.config import Settings
-    s = Settings(PAPER_CONVICTION_LOCK_THRESHOLD=11)
+    s = settings_factory(PAPER_CONVICTION_LOCK_THRESHOLD=11)
     assert s.PAPER_CONVICTION_LOCK_THRESHOLD == 11
     with pytest.raises(ValidationError):
-        Settings(PAPER_CONVICTION_LOCK_THRESHOLD=12)
+        settings_factory(PAPER_CONVICTION_LOCK_THRESHOLD=12)
 
 
 # ---------------------------------------------------------------------------
@@ -278,12 +278,11 @@ async def test_compute_stack_db_conn_none_returns_zero_with_log(db):
 
 
 @pytest.mark.asyncio
-async def test_get_params_loads_conviction_lock_enabled(db):
+async def test_get_params_loads_conviction_lock_enabled(db, settings_factory):
     """T4 — get_params reads conviction_lock_enabled from signal_params row."""
-    from scout.config import Settings
     from scout.trading.params import bump_cache_version, get_params
 
-    settings = Settings()
+    settings = settings_factory()
     sp = await get_params(db, "first_signal", settings)
     assert sp.conviction_lock_enabled is False
 
@@ -302,10 +301,9 @@ async def test_get_params_loads_conviction_lock_enabled(db):
 # ---------------------------------------------------------------------------
 
 
-def test_moonshot_trail_composes_with_locked_trail():
+def test_moonshot_trail_composes_with_locked_trail(settings_factory):
     """T6 — A1 fix: max(30, 35) == 35."""
-    from scout.config import Settings
-    settings = Settings()
+    settings = settings_factory()
     sp_trail_pct_locked = 35.0
     effective = max(
         settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT, sp_trail_pct_locked
