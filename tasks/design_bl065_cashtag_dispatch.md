@@ -57,7 +57,7 @@ Build phase MUST add T1–T7. Without them, the v2 fixes are documented but unen
 
 ### Dispatcher (Task 2)
 
-**F2.1 — Gate F (rate cap) JSON1 query performance.** `json_extract` on every cashtag dispatch evaluation. With `paper_trades` index on `signal_type` + `opened_at`, the query scans only same-day tg_social trades (~5–50 rows in prod). Sub-millisecond. NIT only.
+**F2.1 — Gate F (rate cap) JSON1 query performance.** `json_extract` on every cashtag dispatch evaluation. **R2#6 v3 honesty correction:** JSON1 expressions are NOT index-able by SQLite without an explicit expression index. The query plan is `SCAN paper_trades USING INDEX idx_paper_trades_combo_opened` (existing composite on `signal_combo, opened_at` from BL-061) which narrows to same-day tg_social rows; the json_extract on `signal_data` is then a per-row Python-call within that narrowed scan. At current cardinality (5–50 same-day tg_social rows in prod) this is sub-millisecond. v3 does NOT add an expression index because cardinality doesn't justify the maintenance cost; revisit if message volume grows 100×.
 
 **F2.2 — Gate F counter is wall-clock-day, not 24h rolling.** A noisy curator at 23:59 UTC can dispatch 5; at 00:01 UTC dispatch another 5 = 10 in 2 minutes. Acceptable v1 tradeoff (simpler SQL, predictable boundary). Operator can lower the cap if abuse seen. Documented in v2 R1#5 plan note.
 
@@ -77,7 +77,7 @@ Build phase MUST add T1–T7. Without them, the v2 fixes are documented but unen
 
 **F3.4 — `send_telegram` raises after formatter succeeded.** Already wrapped in try/except at plan code: logs `tg_social_alert_send_failed`, listener continues. Correct.
 
-**F3.5 — Two cashtag messages arrive within milliseconds for the SAME channel near the cap.** Both pass `_channel_cashtag_trades_today_count(N-1) < cap`; both dispatch. Gate F is racy. Acceptable: cap is a soft guardrail not a hard contract. Documented as v1 tradeoff.
+**F3.5 — Two cashtag messages arrive within milliseconds for the SAME channel near the cap.** Both pass `_channel_cashtag_trades_today_count(N-1) < cap`; both dispatch. Gate F is racy. **R1-S1 v3 honesty correction:** under burst conditions (N+1 messages within <100ms), Gate F can be exceeded by ~2× in the worst case (e.g., cap=5, two messages at the same instant both observe count=4, both dispatch → 6 trades). The HARD cap that ALWAYS holds is `TG_SOCIAL_MAX_OPEN_TRADES` (currently 20 globally — per-channel can exceed cap as long as total stays under 20). Why this is acceptable in v1: (a) Telegram listener processes messages sequentially per channel (Telethon's MessageEvent ordering is sync per dialog), so true within-100ms races require multi-channel collision; (b) paper-trade scope means worst-case cost is a few extra paper trades, not real money; (c) folding the count + insert into a transaction is the proper fix but adds complexity not justified at v1 scale. If real-world data shows the race fires, BL-065' upgrade to transactional rate-cap.
 
 ### Cross-cutting
 
@@ -119,11 +119,15 @@ Build phase MUST add T1–T7. Without them, the v2 fixes are documented but unen
 
 **Operational kill-switch (no code change):** SQL `UPDATE tg_social_channels SET cashtag_trade_eligible = 0 WHERE channel_handle = '@misbehaving'` instantly stops dispatch for one channel. `UPDATE tg_social_channels SET cashtag_trade_eligible = 0` instantly stops cashtag dispatch globally.
 
+**R1-S3 v3 — kill-switch caching assumption (DO NOT VIOLATE):** kill-switch instantness depends on `_channel_cashtag_trade_eligible` querying the DB on every message (no module-level cache). Verified true today; helper does a fresh `SELECT cashtag_trade_eligible FROM tg_social_channels WHERE channel_handle=? AND removed_at IS NULL` per call. **A future performance optimization that adds caching to this helper MUST also revise the kill-switch RTO promise** (or add a cache-invalidation channel). If this gets refactored without that consideration, the kill-switch silently degrades from instant to "instant + cache TTL." Documented here so a future PR doesn't break this contract by accident.
+
 ---
 
 ## 5. Operational verification post-deploy
 
-(See plan v2 §5 for the deploy-order sequence — `systemctl stop` BEFORE `git pull` per R1#3 v2.)
+(See plan v3 §5 for the deploy-order sequence — `systemctl stop` BEFORE `git pull` per R1#3 v2.)
+
+**R1-N1 v3 confirmation: not a zero-downtime regression.** gecko-alpha has no zero-downtime deploy practice today (single VPS, single systemd unit, every PR causes a full restart per memory `project_bl062_deployed_2026_04_24.md`). Adding `systemctl stop` before `git pull` is not a downgrade — it's making the implicit ~10-second downtime explicit and ordered. If we ever adopt blue-green or rolling deploys, this convention needs updating; today it's the right shape.
 
 **Post-restart verification:**
 1. Service active+running: `systemctl status gecko-pipeline`
