@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import structlog
 
@@ -12,6 +13,12 @@ from scout.chains.events import (
     load_recent_events,
     prune_old_events,
     safe_emit,
+)
+from scout.chains.mcap_fetcher import (
+    FetchResult,
+    FetchStatus,
+    McapFetcher,
+    fetch_token_fdv,
 )
 from scout.chains.models import ActiveChain, ChainEvent, ChainPattern
 from scout.chains.patterns import (
@@ -23,6 +30,13 @@ from scout.config import Settings
 from scout.db import Database
 
 logger = structlog.get_logger()
+
+# BL-071a' v3 (R1-S3): persistent-failure ERROR is escalation-rate-limited
+# to avoid log wallpaper. Module-level state tracks the previous alert's
+# (count, oldest_age) so we only re-fire on (a) more stuck rows or
+# (b) oldest_age increased ≥+24h since last alert. Reset to None when
+# stuck-row count drops to zero (logged via *_cleared INFO event).
+_persistent_failure_alert_state: dict | None = None
 
 
 def _parse_time(value) -> datetime:
@@ -47,22 +61,30 @@ def _parse_time(value) -> datetime:
 
 
 async def run_chain_tracker(db: Database, settings: Settings) -> None:
-    """Main chain tracking loop — runs forever."""
+    """Main chain tracking loop — runs forever.
+
+    BL-071a' v3 (2026-05-04): owns a single aiohttp session for the loop's
+    lifetime. The session is threaded through check_chains -> _record_completion
+    so memecoin chain completions can fetch FDV from DexScreener.
+    """
+    import aiohttp  # lazy import to avoid Windows OpenSSL DLL crash on test collection
+
     await seed_built_in_patterns(db)
     logger.info(
         "chain_tracker_started",
         interval_sec=settings.CHAIN_CHECK_INTERVAL_SEC,
     )
-    while True:
-        try:
-            await check_chains(db, settings)
-        except Exception:
-            logger.exception("chain_tracker_cycle_error")
-        try:
-            await asyncio.sleep(settings.CHAIN_CHECK_INTERVAL_SEC)
-        except asyncio.CancelledError:
-            logger.info("chain_tracker_cancelled")
-            raise
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                await check_chains(db, settings, session=session)
+            except Exception:
+                logger.exception("chain_tracker_cycle_error")
+            try:
+                await asyncio.sleep(settings.CHAIN_CHECK_INTERVAL_SEC)
+            except asyncio.CancelledError:
+                logger.info("chain_tracker_cancelled")
+                raise
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +92,13 @@ async def run_chain_tracker(db: Database, settings: Settings) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def check_chains(db: Database, settings: Settings) -> None:
+async def check_chains(
+    db: Database,
+    settings: Settings,
+    *,
+    session: Any | None = None,
+    mcap_fetcher: McapFetcher | None = None,
+) -> None:
     """One pass of the pattern matching engine, wrapped in a single
     transaction so that writes across helpers commit atomically."""
     patterns = await load_active_patterns(db)
@@ -145,7 +173,14 @@ async def check_chains(db: Database, settings: Settings) -> None:
                     completed_chains.append((chain, pattern))
 
         for chain, pattern in completed_chains:
-            await _record_completion(db, chain, pattern, settings)
+            await _record_completion(
+                db,
+                chain,
+                pattern,
+                settings,
+                session=session,
+                mcap_fetcher=mcap_fetcher,
+            )
 
         await _prune_stale(db, settings)
         await conn.commit()
@@ -455,15 +490,64 @@ async def _record_completion(
     chain: ActiveChain,
     pattern: ChainPattern,
     settings: Settings,
+    *,
+    session: Any | None = None,
+    mcap_fetcher: McapFetcher | None = None,
 ) -> None:
-    """Write chain_matches row + emit chain_complete event + optional alert."""
+    """Write chain_matches row + emit chain_complete event + optional alert.
+
+    BL-071a' v3 (2026-05-04): for memecoin pipeline, captures a DexScreener
+    FDV snapshot in `mcap_at_completion` so the hydrator can later compute
+    pct change vs current FDV. Narrative pipeline skips the fetch
+    (token_id is a CoinGecko slug, not a contract; FDV lookup would fail).
+
+    Enforces CHAIN_OUTCOME_MIN_MCAP_USD floor (per design-review R1-M2):
+    dust mcap (e.g. 0.5 USD from pump.fun) would compute fake +500,000%
+    hits at hydration time and poison the LEARN feedback loop. Below floor
+    → write NULL, fall through to legacy outcomes path.
+
+    Failures are graceful: row writes with mcap_at_completion=NULL.
+
+    SCOPE NOTE (deferred to BL-071a''): the DS fetch happens INSIDE the
+    check_chains transaction. SQLite write lock is held for up to 15s
+    (DS timeout) per memecoin completion. Acceptable today (single-process
+    pipeline, ~0-2 completions per cycle); pre-fetch outside transaction
+    is a future optimization.
+    """
     duration_h = (chain.last_step_time - chain.anchor_time).total_seconds() / 3600.0
+
+    # BL-071a' v3: fetch FDV snapshot for memecoin chains, gated by floor.
+    mcap_at_completion: float | None = None
+    if chain.pipeline == "memecoin" and session is not None:
+        fetcher = mcap_fetcher or fetch_token_fdv
+        min_mcap = getattr(settings, "CHAIN_OUTCOME_MIN_MCAP_USD", 1000.0)
+        try:
+            result = await fetcher(session, chain.token_id)
+        except Exception:
+            # Fail-soft — never block chain write on the snapshot
+            logger.exception(
+                "mcap_at_completion_fetch_unexpected_error",
+                token_id=chain.token_id,
+            )
+            result = None
+        if result is not None and result.fdv is not None:
+            if result.fdv >= min_mcap:
+                mcap_at_completion = result.fdv
+            else:
+                logger.debug(
+                    "chain_outcome_mcap_below_floor",
+                    token_id=chain.token_id,
+                    fdv=result.fdv,
+                    floor=min_mcap,
+                    note="writing NULL — dust mcap would produce fake hits",
+                )
+
     await db._conn.execute(
         """INSERT INTO chain_matches
            (token_id, pipeline, pattern_id, pattern_name, steps_matched,
             total_steps, anchor_time, completed_at, chain_duration_hours,
-            conviction_boost)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            conviction_boost, mcap_at_completion)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             chain.token_id,
             chain.pipeline,
@@ -475,6 +559,7 @@ async def _record_completion(
             (chain.completed_at or datetime.now(timezone.utc)).isoformat(),
             round(duration_h, 3),
             pattern.conviction_boost,
+            mcap_at_completion,
         ),
     )
     await db._conn.execute(
@@ -493,6 +578,7 @@ async def _record_completion(
             "total_steps": len(pattern.steps),
             "conviction_boost": pattern.conviction_boost,
             "chain_duration_hours": round(duration_h, 3),
+            "mcap_at_completion": mcap_at_completion,
         },
         source_module="chains.tracker",
     )
@@ -558,38 +644,104 @@ async def _record_expired_chain(
     )
 
 
-async def update_chain_outcomes(db: Database) -> int:
+async def update_chain_outcomes(
+    db: Database,
+    *,
+    settings: Settings | None = None,
+    session: Any | None = None,
+    mcap_fetcher: McapFetcher | None = None,
+) -> int:
     """Hydrate chain_matches.outcome_class from downstream outcome tables.
 
-    For each completed chain_match that is older than 48h and still has
-    outcome_class NULL, look up the token's realized outcome:
+    For each completed chain_match older than 48h with outcome_class NULL:
+    * narrative pipeline → predictions.outcome_class (HIT/MISS/etc.)
+    * memecoin pipeline → BL-071a' v3:
+       - if mcap_at_completion populated, fetch current FDV via DexScreener,
+         compute pct change; hit if >= CHAIN_OUTCOME_HIT_THRESHOLD_PCT
+       - else fall back to legacy outcomes table for back-compat
 
-    * narrative pipeline  -> predictions.outcome_class (HIT / MISS / etc.)
-    * memecoin pipeline   -> outcomes.price_change_pct (positive => hit)
+    Defense-in-depth (R2-1, plan v3): if `session is None`, this function
+    creates and closes its own aiohttp session for the cycle. Callers
+    that don't have a session in scope (e.g., scout/narrative/learner.py:326
+    LEARN cycle) get the BL-071a' resolution path automatically.
 
-    Returns the number of rows updated. Designed to be invoked once per
-    daily LEARN cycle before compute_pattern_stats.
+    Returns the number of rows updated. Designed for once-per-LEARN-cycle.
     """
     conn = db._conn
     if conn is None:
         raise RuntimeError("Database not initialized")
 
+    fetcher = mcap_fetcher or fetch_token_fdv
+
+    # Defense-in-depth: self-create session if not injected (R2-1)
+    own_session = session is None
+    if own_session:
+        import aiohttp  # lazy — Windows OpenSSL workaround
+
+        session = aiohttp.ClientSession()
+    try:
+        return await _update_chain_outcomes_inner(
+            conn,
+            session,
+            fetcher,
+            settings,
+        )
+    finally:
+        if own_session and session is not None:
+            await session.close()
+
+
+async def _update_chain_outcomes_inner(
+    conn,
+    session: Any,
+    fetcher: McapFetcher,
+    settings: Settings | None,
+) -> int:
+    """Inner body of update_chain_outcomes (split out so the session
+    self-create wrapper stays small and the inner logic is testable)."""
+    global _persistent_failure_alert_state
+
+    hit_threshold_pct = (
+        settings.CHAIN_OUTCOME_HIT_THRESHOLD_PCT if settings is not None else 50.0
+    )
+    min_mcap = settings.CHAIN_OUTCOME_MIN_MCAP_USD if settings is not None else 1000.0
+    persistent_failure_age_hours = (
+        settings.CHAIN_OUTCOME_PERSISTENT_FAILURE_HOURS if settings is not None else 1.0
+    )
+    unhealthy_failure_rate = (
+        settings.CHAIN_TRACKER_UNHEALTHY_FAILURE_RATE if settings is not None else 0.5
+    )
+    unhealthy_min_attempts = (
+        settings.CHAIN_TRACKER_UNHEALTHY_MIN_ATTEMPTS if settings is not None else 3
+    )
+
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
     async with conn.execute(
-        """SELECT id, token_id, pipeline FROM chain_matches
+        """SELECT id, token_id, pipeline, completed_at, mcap_at_completion
+           FROM chain_matches
            WHERE outcome_class IS NULL AND completed_at < ?""",
         (cutoff,),
     ) as cur:
         pending = await cur.fetchall()
 
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
     updated = 0
     memecoin_unhydrateable = 0
+    memecoin_ds_failures = 0
+    memecoin_ds_attempts = 0
+    memecoin_ds_rate_limited = 0
+    memecoin_dust_abandoned = 0  # PR-review R2#1 (3rd pass): rows with mcap<floor written as 'dust_skipped' to exit pending set
+    persistent_stuck_count = 0
+    oldest_persistent_age_hours = 0.0
+
     for row in pending:
         match_id = row["id"]
         token_id = row["token_id"]
         pipeline = row["pipeline"]
+        mcap_at_completion = row["mcap_at_completion"]
         outcome: str | None = None
+        outcome_change_pct: float | None = None
 
         if pipeline == "narrative":
             async with conn.execute(
@@ -603,72 +755,225 @@ async def update_chain_outcomes(db: Database) -> int:
                 prow = await cur2.fetchone()
             if prow is not None and prow[0]:
                 outcome = str(prow[0]).lower()
-                # Normalize to hit/miss so it matches compute_pattern_stats
-                # which compares against 'hit'.
                 if outcome not in ("hit", "miss"):
                     outcome = "hit" if outcome == "hit" else "miss"
         elif pipeline == "memecoin":
-            # BL-071a partial (Bundle A 2026-05-03): prefer mcap_at_completion
-            # (set by writer once BL-071a' wires them; today always NULL).
-            # When populated, skip SILENTLY — BL-071a' will inline the
-            # DexScreener fetch here. When NULL, fall back to legacy outcomes
-            # table; if THAT is also empty, count for the aggregate warning
-            # emitted once at end (not per-row, to avoid log spam).
-            async with conn.execute(
-                """SELECT mcap_at_completion FROM chain_matches WHERE id = ?""",
-                (match_id,),
-            ) as cur_m:
-                mcap_row = await cur_m.fetchone()
-            mcap_at_completion = mcap_row[0] if mcap_row else None
+            # Defense-in-depth: even though writer enforces floor, double-check
+            if mcap_at_completion is not None and mcap_at_completion >= min_mcap:
+                # BL-071a' v3: active DexScreener resolution
+                memecoin_ds_attempts += 1
+                try:
+                    result = await fetcher(session, token_id)
+                except Exception:
+                    logger.exception(
+                        "chain_outcome_dexscreener_unexpected_error",
+                        match_id=match_id,
+                        token_id=token_id,
+                    )
+                    result = FetchResult(None, FetchStatus.TRANSIENT)
 
-            if mcap_at_completion is not None and mcap_at_completion > 0:
-                # Intentional silent skip — BL-071a' inlines the fetch here.
-                continue
+                if result.status == FetchStatus.RATE_LIMITED:
+                    # R1-M1: distinct path — rate-limited rows do NOT count
+                    # toward session-health failure rate.
+                    memecoin_ds_rate_limited += 1
+                    continue
 
-            async with conn.execute(
-                """SELECT price_change_pct FROM outcomes
-                   WHERE contract_address = ? AND price_change_pct IS NOT NULL
-                   ORDER BY id DESC LIMIT 1""",
-                (token_id,),
-            ) as cur2:
-                orow = await cur2.fetchone()
-            if orow is not None and orow[0] is not None:
-                outcome = "hit" if float(orow[0]) > 0 else "miss"
+                if result.fdv is None or result.fdv <= 0:
+                    memecoin_ds_failures += 1
+                    logger.debug(
+                        "chain_outcome_dexscreener_failed",
+                        match_id=match_id,
+                        token_id=token_id,
+                        mcap_at_completion=mcap_at_completion,
+                        status=result.status.value,
+                    )
+                    # R1-1: track persistent stuck rows for aging ERROR
+                    completed_at_str = row["completed_at"]
+                    try:
+                        completed_at = datetime.fromisoformat(
+                            completed_at_str.replace("Z", "+00:00")
+                        )
+                        if completed_at.tzinfo is None:
+                            completed_at = completed_at.replace(tzinfo=timezone.utc)
+                        age_hours = (now - completed_at).total_seconds() / 3600.0
+                        if age_hours > persistent_failure_age_hours:
+                            persistent_stuck_count += 1
+                            if age_hours > oldest_persistent_age_hours:
+                                oldest_persistent_age_hours = age_hours
+                    except (ValueError, AttributeError):
+                        pass
+                    continue
+
+                # OK + valid fdv → resolve outcome
+                outcome_change_pct = ((result.fdv / mcap_at_completion) - 1.0) * 100.0
+                outcome = "hit" if outcome_change_pct >= hit_threshold_pct else "miss"
+                logger.info(
+                    "chain_outcome_resolved_via_dexscreener",
+                    match_id=match_id,
+                    token_id=token_id,
+                    mcap_at_completion=mcap_at_completion,
+                    current_fdv=result.fdv,
+                    outcome_change_pct=round(outcome_change_pct, 2),
+                    outcome=outcome,
+                )
+            elif mcap_at_completion is not None and mcap_at_completion < min_mcap:
+                # Defense-in-depth: dust mcap row (writer floor failed or
+                # row predates BL-071a'). PR-review R2#1 (3rd pass) fix:
+                # write outcome_class='dust_skipped' so the row EXITS the
+                # pending set — without this, the row re-enters the SELECT
+                # every LEARN cycle forever (silent unbounded re-scan,
+                # exact pattern Bundle A R2 flagged as antipattern).
+                memecoin_dust_abandoned += 1
+                logger.debug(
+                    "chain_outcome_mcap_below_floor_at_hydrate",
+                    match_id=match_id,
+                    token_id=token_id,
+                    mcap_at_completion=mcap_at_completion,
+                    floor=min_mcap,
+                )
+                outcome = (
+                    "dust_skipped"  # sentinel — patterns.py:263 tolerates non-hit/miss
+                )
+                outcome_change_pct = None  # no meaningful pct change for dust
             else:
-                memecoin_unhydrateable += 1
+                # mcap_at_completion is NULL — fall back to legacy outcomes
+                async with conn.execute(
+                    """SELECT price_change_pct FROM outcomes
+                       WHERE contract_address = ? AND price_change_pct IS NOT NULL
+                       ORDER BY id DESC LIMIT 1""",
+                    (token_id,),
+                ) as cur2:
+                    orow = await cur2.fetchone()
+                if orow is not None and orow[0] is not None:
+                    outcome_change_pct = float(orow[0])
+                    outcome = "hit" if outcome_change_pct > 0 else "miss"
+                else:
+                    memecoin_unhydrateable += 1
 
         if outcome is None:
             continue
 
         await conn.execute(
             """UPDATE chain_matches
-               SET outcome_class = ?, evaluated_at = ?
+               SET outcome_class = ?, outcome_change_pct = ?, evaluated_at = ?
                WHERE id = ?""",
-            (outcome, now_iso, match_id),
+            (outcome, outcome_change_pct, now_iso, match_id),
         )
         updated += 1
 
     await conn.commit()
     if updated:
         logger.info("chain_outcomes_hydrated", count=updated)
-    # BL-071a partial: aggregate warning per LEARN cycle (not per row) so
-    # operators see the silent-failure surface without log spam. Will go
-    # quiet once BL-071a' wires writers + adds DexScreener fetch.
-    # Structured fields: only `total_unhydrateable` is meaningful today.
-    # Per PR-review feedback (R1+R2+R3 cross-confirmed): the previous
-    # mcap_at_completion_null_count + outcomes_table_empty_count fields
-    # were misleading because the counter only fires when BOTH conditions
-    # are true — they always equal total_unhydrateable. BL-071a' will
-    # split the failure modes and re-introduce per-cause counts when
-    # they're actually distinguishable. Carries expires_when + backlog_ref
-    # so the deferral doesn't decay into known-noise.
+
+    # BL-071a' v3: aggregate WARNINGS distinguished by cause
     if memecoin_unhydrateable:
         logger.warning(
             "chain_outcomes_unhydrateable_memecoin",
             total_unhydrateable=memecoin_unhydrateable,
-            expires_when="BL-071a' ships (writers populate mcap_at_completion)",
-            backlog_ref="BL-071a'",
+            cause="legacy_no_mcap_no_outcomes_row",
+            note=(
+                "These rows pre-date BL-071a' writer wiring AND have no legacy "
+                "outcomes-table data. Properly-versioned migration backfill "
+                "deferred to BL-071a''."
+            ),
         )
+    if memecoin_ds_failures:
+        logger.warning(
+            "chain_outcomes_ds_transient_failures",
+            count=memecoin_ds_failures,
+            cause="dexscreener_returned_no_data_or_error",
+            note="Will retry next LEARN cycle.",
+        )
+    # R1-M1: rate-limited is NOT a session-health failure — separate WARNING
+    # gives operators the right diagnosis path (upstream throttle vs local).
+    if memecoin_ds_rate_limited:
+        logger.warning(
+            "chain_outcomes_ds_rate_limited",
+            count=memecoin_ds_rate_limited,
+            cause="dexscreener_429_throttle",
+            note=(
+                "DS free-tier rate limit hit. Rows will retry next LEARN "
+                "cycle; consider widening CHAIN_CHECK_INTERVAL_SEC if persistent."
+            ),
+        )
+    # PR-review R2#1 (3rd pass): visibility for dust-mcap rows that the
+    # hydrator wrote off as 'dust_skipped'. Operators see growth and can
+    # investigate whether the writer's floor is being bypassed.
+    if memecoin_dust_abandoned:
+        logger.warning(
+            "chain_outcomes_dust_abandoned",
+            count=memecoin_dust_abandoned,
+            cause="mcap_at_completion_below_floor",
+            note=(
+                "Memecoin chain_matches with mcap_at_completion < "
+                "CHAIN_OUTCOME_MIN_MCAP_USD floor were marked outcome_class="
+                "'dust_skipped' to exit the pending set. If count is non-zero, "
+                "investigate whether the writer's floor was bypassed (manual "
+                "INSERT? row from before BL-071a' shipped?)."
+            ),
+        )
+    # R1-1 + R1-S3: aging-aware ERROR with escalation rate-limiting
+    if persistent_stuck_count:
+        prev_state = _persistent_failure_alert_state
+        should_alert = (
+            prev_state is None
+            or persistent_stuck_count > prev_state["count"]
+            or (oldest_persistent_age_hours - prev_state["oldest_age"]) >= 24.0
+        )
+        if should_alert:
+            logger.error(
+                "chain_outcome_ds_persistent_failure",
+                stuck_count=persistent_stuck_count,
+                oldest_pending_age_hours=round(oldest_persistent_age_hours, 1),
+                threshold_hours=round(persistent_failure_age_hours, 2),
+                note=(
+                    "Memecoin chain_matches with populated mcap_at_completion "
+                    "but DS returned no FDV for >threshold. Investigate: "
+                    "DS API status? rate-limited? contract delisted? Next "
+                    "ERROR fires only on escalation (oldest age +>=24h) or "
+                    "new stuck rows."
+                ),
+            )
+            _persistent_failure_alert_state = {
+                "count": persistent_stuck_count,
+                "oldest_age": oldest_persistent_age_hours,
+            }
+    elif _persistent_failure_alert_state is not None:
+        # Backlog cleared — reset alert state so next stuck-cluster fires.
+        # PR-review R2#2 (3rd pass) fix: include current pending_count so
+        # SRE can distinguish "DS recovered (rows actually resolved)" from
+        # "table emptied (manual purge / pending=0 because rows gone)".
+        logger.info(
+            "chain_outcome_ds_persistent_failure_cleared",
+            previous_count=_persistent_failure_alert_state["count"],
+            pending_count=len(pending),
+            note=(
+                "Backlog cleared. If pending_count > 0 then DS recovered "
+                "naturally (rows being resolved). If pending_count == 0 "
+                "then either all rows resolved this cycle OR table was "
+                "manually purged."
+            ),
+        )
+        _persistent_failure_alert_state = None
+
+    # R1-2: cycle-level session health (excludes rate-limited per R1-M1)
+    non_rate_limited_attempts = memecoin_ds_attempts - memecoin_ds_rate_limited
+    if non_rate_limited_attempts >= unhealthy_min_attempts:
+        failure_rate = memecoin_ds_failures / non_rate_limited_attempts
+        if failure_rate > unhealthy_failure_rate:
+            logger.error(
+                "chain_tracker_session_unhealthy",
+                attempts=non_rate_limited_attempts,
+                failures=memecoin_ds_failures,
+                failure_rate_pct=round(failure_rate * 100, 1),
+                threshold_pct=round(unhealthy_failure_rate * 100, 1),
+                note=(
+                    "Non-rate-limited DS fetch failure rate exceeds threshold "
+                    "in this cycle. Long-lived aiohttp session may be degraded; "
+                    "consider service restart to reset connector pool. "
+                    "(Rate-limited responses excluded from this calculation.)"
+                ),
+            )
     return updated
 
 

@@ -323,7 +323,12 @@ async def daily_learn(
 
                 # Hydrate chain_matches.outcome_class from realized
                 # prediction / outcomes tables BEFORE computing stats.
-                await update_chain_outcomes(db)
+                # BL-071a' v3 (2026-05-04): pass settings so the hit
+                # threshold + persistent-failure timing are honored. The
+                # hydrator self-creates an aiohttp session if none is
+                # provided (defense-in-depth), so we don't need to thread
+                # one through this LEARN cycle.
+                await update_chain_outcomes(db, settings=settings)
                 await run_pattern_lifecycle(db, settings)
         except Exception:
             # Full traceback — don't silently str(e) a bug away.
