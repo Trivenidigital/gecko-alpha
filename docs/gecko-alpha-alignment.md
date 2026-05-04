@@ -89,6 +89,33 @@ The hook at `.claude/hooks/check-new-primitives.py` blocks Write/Edit/MultiEdit/
 
 Bypass via `<!-- new-primitives-check: bypass -->` (logged to `.claude/hooks/bypass.log` for PR-time review).
 
+### Hermes-first analysis convention (added 2026-05-04)
+
+Every `tasks/(plan|design|spec)_*.md` file MUST contain a **"Hermes-first analysis"** section near the top (after `**New primitives introduced:**`, before the goal/architecture). This section explicitly checks the Hermes ecosystem for relevant building blocks BEFORE describing custom code, so the operator gets documented evidence (positive or negative) instead of implicit "I don't think it applies."
+
+**Required shape:**
+
+```markdown
+## Hermes-first analysis
+
+**Domains checked against the 671-skill hub at `hermes-agent.nousresearch.com/docs/skills`:**
+
+| Domain | Hermes skill found? | Decision |
+|---|---|---|
+| <domain 1> | <yes — name + url> OR <none found> | <use it> OR <build from scratch (rationale)> |
+| <domain 2> | ... | ... |
+
+**Awesome-hermes-agent ecosystem check:** <yes — repo cited> OR <no relevant repos>.
+
+**Verdict:** <one sentence — e.g., "Pure internal pipeline logic with no Hermes-skill replacement; building from scratch is the only path">.
+```
+
+**Why this exists:** discipline gap. Bundle A, BL-071a', and BL-065 plans all shipped without explicit Hermes-first checks — pattern-matching on "this looks internal" rather than running the check. The check itself is cheap (one WebFetch); the cost was always the discipline of running it. Mandatory section makes the negative result documented evidence, not unstated assumption.
+
+**Honest scope:** the section is a check on PROPOSED implementation, not a vetoes-everything-not-Hermes rule. If 6/6 domains return "none found" the verdict is "build from scratch" and that's a perfectly valid plan — but the verdict is now ON RECORD instead of implicit.
+
+**Limitation:** mechanical hook does NOT enforce this section yet (the existing `check-new-primitives.py` hook only checks the `**New primitives introduced:**` marker). Adding a second hook check is potential follow-up; for now this is convention enforced by reviewer agents (the plan-review subagents should flag missing Hermes-first sections).
+
 ---
 
 ## Part 2 — Operational drift checklist
