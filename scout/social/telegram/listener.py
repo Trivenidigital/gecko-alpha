@@ -258,9 +258,23 @@ async def _replay_post_resolution(
         # - Other Exception: distinct cashtag_dispatch_exception gate, log
         #   + DLQ-write attempted with NESTED guard so DLQ-write failure
         #   does NOT kill the listener (PR #55 class).
-        cashtag_normalized = (
-            parsed.cashtags[0] if parsed.cashtags else ""
-        )  # already upper, no '$' (per parser contract)
+        # R1#2 v3 (PR-review): contract violation guard — candidates_top3
+        # implies the resolver found cashtag-resolved candidates, so
+        # parsed.cashtags must be non-empty. The defensive `or ""` would
+        # silently emit `signal_data["cashtag"] = "$"` and corrupt later
+        # cashtag analytics. Surface the bug instead.
+        if not parsed.cashtags:
+            log.error(
+                "tg_social_cashtag_missing_unexpected",
+                channel_handle=channel_handle,
+                msg_id=msg_id,
+                note=(
+                    "candidates_top3 present but parsed.cashtags is empty — "
+                    "resolver/parser contract violation; skipping dispatch"
+                ),
+            )
+            return
+        cashtag_normalized = parsed.cashtags[0]  # already upper, no '$' per parser contract
         paper_trade_id: int | None = None
         blocked_gate: str | None = None
         try:

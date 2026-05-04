@@ -265,9 +265,13 @@ async def _channel_cashtag_trade_eligible(db: Database, channel_handle: str) -> 
 async def _channel_cashtag_trades_today_count(db: Database, channel_handle: str) -> int:
     """R1#5 v2: count cashtag-resolution paper_trades opened today by channel.
 
-    Per design F2.1 v3: SCAN within indexed (signal_combo, opened_at) prefix;
-    json_extract is per-row Python call within that narrowed scan. Sub-ms at
-    current cardinality (5-50 same-day tg_social rows in prod).
+    Performance note (corrected per PR #65 R1#1 honesty fix): SQLite picks
+    `idx_paper_trades_signal (signal_type=?)` for this query, NOT the
+    composite `idx_paper_trades_combo_opened` (the query doesn't reference
+    signal_combo, the leftmost column). Effect is equivalent — narrows to
+    same-day tg_social rows; json_extract is then a per-row Python call
+    within that narrowed scan. Sub-ms at current cardinality (5-50 same-day
+    tg_social rows in prod).
     """
     cur = await db._conn.execute(
         """
@@ -475,6 +479,7 @@ async def dispatch_cashtag_to_engine(
     if trade_id is not None:
         # R1-M2 v3 + R2#5 v3: nested guard — helper failure must NOT escape.
         # Trade is already open; lifecycle owns it.
+        collision_check_status = "ok"
         try:
             collisions = await _check_potential_symbol_duplicate(
                 db, top.token_id, top.symbol
@@ -482,6 +487,9 @@ async def dispatch_cashtag_to_engine(
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception:
+            # R2 SHOULD-FIX (PR #65 silent-failure-hunter pass 4): record the
+            # degraded-observability state so forensic analysis later can
+            # tell why collision wasn't logged for this trade.
             log.exception(
                 "tg_social_symbol_collision_check_failed",
                 paper_trade_id=trade_id,
@@ -489,6 +497,7 @@ async def dispatch_cashtag_to_engine(
                 note="trade is open; collision check skipped this dispatch",
             )
             collisions = []
+            collision_check_status = "failed"
         if collisions:
             # R2#5 v3: INFO not WARNING — symbol collisions are routine on
             # memecoins (every chain has its own PEPE).

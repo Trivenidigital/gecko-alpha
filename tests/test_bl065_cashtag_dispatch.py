@@ -304,13 +304,20 @@ async def test_dispatch_cashtag_logs_symbol_collision(
     from scout.social.telegram import dispatcher as dispatcher_mod
 
     captured = []
+    captured_warnings = []  # R3#3 v3: anti-wallpaper guard
     real_info = dispatcher_mod.log.info
+    real_warning = dispatcher_mod.log.warning
 
     def _capture_info(event, **kwargs):
         captured.append((event, kwargs))
         return real_info(event, **kwargs)
 
+    def _capture_warning(event, **kwargs):
+        captured_warnings.append((event, kwargs))
+        return real_warning(event, **kwargs)
+
     monkeypatch.setattr(dispatcher_mod.log, "info", _capture_info)
+    monkeypatch.setattr(dispatcher_mod.log, "warning", _capture_warning)
 
     await _seed_channel(db, "@trusted", cashtag=1)
     now = datetime.now(timezone.utc).isoformat()
@@ -375,23 +382,187 @@ async def test_dispatch_cashtag_logs_symbol_collision(
     assert kwargs["new_token_id"] == "pepe-bsc"
     assert "pepe" in kwargs["colliding_token_ids"]
 
+    # R3#3 v3 anti-wallpaper guard: a future contributor "improving
+    # observability" by re-promoting to WARNING would not break the INFO
+    # assertion alone. Catch the regression by asserting NO collision
+    # WARNING fires (R2#5 v3 design intent).
+    collision_warnings = [
+        c for c in captured_warnings
+        if c[0] == "tg_social_potential_duplicate_symbol"
+    ]
+    assert collision_warnings == [], (
+        f"symbol-collision must log INFO (anti-wallpaper for memecoins where "
+        f"every chain has its own PEPE); got WARNING: {collision_warnings}"
+    )
+
 
 # ---------------------------------------------------------------------------
 # R1-M1 v3: T1-T8 placeholder skip tests so build-phase gap is visible in CI
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="BL-065 build phase: implement T1 — Gate F blocks at daily cap"
-)
 @pytest.mark.asyncio
 async def test_t1_gate_f_blocks_when_channel_hits_daily_cap(db, settings_factory):
-    """Seed PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY cashtag-resolution
-    paper_trades opened today; assert next dispatch returns
-    blocked_gate='cashtag_channel_rate_limited'."""
-    raise NotImplementedError(
-        "BL-065 build phase: implement against json_extract count helper"
+    """T1 (PR-review R3#4 promoted): seed CAP cashtag-resolution paper_trades
+    opened today; assert next dispatch returns blocked_gate='cashtag_channel_rate_limited'.
+
+    Critical: signal_data must have BOTH channel_handle AND resolution='cashtag'
+    AND opened_at>=start of day for the json_extract count helper to count it.
+    A under-specified fixture would make a green test that doesn't actually
+    exercise the json_extract path."""
+    import json
+
+    await _seed_channel(db, "@noisy", cashtag=1)
+    cap = 3  # smaller than default 5 — cheaper test fixture
+    s = settings_factory(
+        PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD=300.0,
+        PAPER_TG_SOCIAL_CASHTAG_MIN_MCAP_USD=100_000.0,
+        PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO=2.0,
+        PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY=cap,
+        TG_SOCIAL_MAX_OPEN_TRADES=20,
     )
+
+    # Seed `cap` cashtag-resolution trades for @noisy opened today
+    now = datetime.now(timezone.utc).isoformat()
+    for i in range(cap):
+        signal_data_json = json.dumps(
+            {
+                "channel_handle": "@noisy",
+                "resolution": "cashtag",
+                "cashtag": f"$T{i}",
+                "candidate_rank": 1,
+                "candidates_total": 1,
+            }
+        )
+        await db._conn.execute(
+            """INSERT INTO paper_trades
+               (token_id, symbol, name, chain, signal_type, signal_data,
+                entry_price, amount_usd, quantity, tp_price, sl_price,
+                status, opened_at)
+               VALUES (?, 'X', 'X', 'coingecko', 'tg_social', ?,
+                       1.0, 300, 300, 1.2, 0.9, 'open', ?)""",
+            (f"token-{i}", signal_data_json, now),
+        )
+    await db._conn.commit()
+
+    decision = await _evaluate_cashtag(
+        db=db,
+        settings=s,
+        candidates=[_candidate("token-fresh", "FRESH", 5_000_000)],
+        channel_handle="@noisy",
+    )
+    assert decision.dispatch_trade is False
+    assert decision.blocked_gate == "cashtag_channel_rate_limited"
+
+
+@pytest.mark.asyncio
+async def test_t1b_gate_f_does_not_count_other_channels(db, settings_factory):
+    """Companion to T1: counter is per-channel, not global. Trades from
+    @other should NOT exhaust @noisy's daily quota."""
+    import json
+
+    await _seed_channel(db, "@noisy", cashtag=1)
+    await _seed_channel(db, "@other", cashtag=1)
+    cap = 3
+    s = settings_factory(
+        PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD=300.0,
+        PAPER_TG_SOCIAL_CASHTAG_MIN_MCAP_USD=100_000.0,
+        PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO=2.0,
+        PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY=cap,
+        TG_SOCIAL_MAX_OPEN_TRADES=20,
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    # Seed CAP trades for @other (NOT @noisy)
+    for i in range(cap):
+        sd = json.dumps({"channel_handle": "@other", "resolution": "cashtag"})
+        await db._conn.execute(
+            """INSERT INTO paper_trades
+               (token_id, symbol, name, chain, signal_type, signal_data,
+                entry_price, amount_usd, quantity, tp_price, sl_price,
+                status, opened_at)
+               VALUES (?, 'X', 'X', 'coingecko', 'tg_social', ?,
+                       1.0, 300, 300, 1.2, 0.9, 'open', ?)""",
+            (f"token-other-{i}", sd, now),
+        )
+    await db._conn.commit()
+
+    # @noisy should still pass — its quota is independent
+    decision = await _evaluate_cashtag(
+        db=db,
+        settings=s,
+        candidates=[_candidate("token-noisy", "NOISY", 5_000_000)],
+        channel_handle="@noisy",
+    )
+    assert decision.dispatch_trade is True
+
+
+# ---------------------------------------------------------------------------
+# R3#2 v3 (PR-review MUST-FIX): Settings @field_validator coverage
+# ---------------------------------------------------------------------------
+
+
+def test_settings_cashtag_trade_amount_must_be_positive():
+    """@field_validator: PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD > 0."""
+    from pydantic import ValidationError
+
+    from scout.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD=0,
+        )
+
+
+def test_settings_cashtag_min_mcap_must_be_positive():
+    """@field_validator: PAPER_TG_SOCIAL_CASHTAG_MIN_MCAP_USD > 0."""
+    from pydantic import ValidationError
+
+    from scout.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            PAPER_TG_SOCIAL_CASHTAG_MIN_MCAP_USD=-1,
+        )
+
+
+def test_settings_cashtag_disambiguity_ratio_must_be_at_least_one():
+    """@field_validator: PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO >= 1.0
+    (else top can't actually dominate the comparison — divide-by-near-zero
+    risk + always-pass semantic)."""
+    from pydantic import ValidationError
+
+    from scout.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO=0.5,
+        )
+
+
+def test_settings_cashtag_max_per_channel_per_day_must_be_at_least_one():
+    """@field_validator: PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY >= 1
+    (else cap=0 silently disables ALL cashtag dispatches — fail-loud is
+    better than fail-quiet)."""
+    from pydantic import ValidationError
+
+    from scout.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY=0,
+        )
 
 
 @pytest.mark.skip(reason="BL-065 build phase: implement T2 — Gate F passes under cap")
