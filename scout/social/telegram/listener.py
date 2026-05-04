@@ -1186,8 +1186,17 @@ async def _run_listener_body(
                 e,
             )
 
+    # BL-064 channel-reload — heartbeat lifecycle parallel to silence task.
+    # Holder dict because Python's nonlocal doesn't combine cleanly with
+    # the test factory (`_make_channel_reload_heartbeat`); the dict gives
+    # us a mutable container the heartbeat updates in-place.
+    channels_holder = {"channels": channels}
+    reload_heartbeat = _make_channel_reload_heartbeat(
+        db, client, settings, channels_holder, _on_new
+    )
+
     # silence_task creation, handler attach, and run_until_disconnected
-    # all share one try/finally: silence_task MUST be cancelled on every
+    # all share one try/finally: tasks MUST be cancelled on every
     # exit path or the heartbeat keeps firing after the listener dies. The
     # `success` guard ensures 'stopped' only stamps on the clean exit path —
     # if run_until_disconnected raised, the outer crash-watchdog (or the
@@ -1195,6 +1204,8 @@ async def _run_listener_body(
     # terminal state.
     silence_task = asyncio.create_task(_silence_heartbeat())
     _track_task(silence_task)
+    reload_task = asyncio.create_task(reload_heartbeat())
+    _track_task(reload_task)
     success = False
     try:
         client.on(events.NewMessage(chats=channels))(_on_new)
@@ -1206,6 +1217,123 @@ async def _run_listener_body(
                 db, "stopped", detail="run_until_disconnected returned"
             )
         silence_task.cancel()
+        reload_task.cancel()
+
+
+async def _channel_reload_once(
+    db: Database,
+    client,
+    in_memory: list[str],
+    on_new_handler,
+) -> list[str]:
+    """BL-064 channel-reload: single-shot reload + handler swap.
+
+    Re-queries `tg_social_channels` for active rows; diffs against
+    `in_memory`. If different, removes the existing event handler and
+    re-binds with the new list. Returns the new in-memory list.
+
+    Atomicity: the swap (remove + re-add) has NO `await` between calls,
+    so the asyncio scheduler treats it as atomic from any awaiting
+    coroutine's perspective. Telethon's `client.on(...)` is itself
+    synchronous (it calls `client.add_event_handler` which appends to
+    `_event_builders`).
+
+    PR-review arch-S2 — handler-swap rollback: if `client.on(...)` raises
+    after `remove_event_handler` (e.g., entity-resolution failure), we
+    re-attach the OLD handler so the listener doesn't go silent.
+
+    Errors propagate to the heartbeat wrapper which catches via
+    `tg_social_channel_reload_error`. PR-review arch-S1.
+    """
+    cur = await db._conn.execute(
+        "SELECT channel_handle FROM tg_social_channels WHERE removed_at IS NULL"
+    )
+    latest = sorted(row[0] for row in await cur.fetchall())
+    in_memory_sorted = sorted(in_memory)
+    if latest == in_memory_sorted:
+        return in_memory
+    added = sorted(set(latest) - set(in_memory))
+    removed = sorted(set(in_memory) - set(latest))
+    # Atomic swap with rollback (arch-S2).
+    client.remove_event_handler(on_new_handler)
+    try:
+        client.on(events.NewMessage(chats=latest))(on_new_handler)
+    except Exception as exc:
+        # Re-attach OLD handler so listener doesn't go silent.
+        try:
+            client.on(events.NewMessage(chats=in_memory))(on_new_handler)
+        except Exception:
+            # If even rollback fails, listener is genuinely broken;
+            # let the outer heartbeat handler land it in the error log.
+            pass
+        log.warning(
+            "tg_social_channel_reload_swap_failed",
+            error_type=type(exc).__name__,
+            error=str(exc),
+            in_memory_count=len(in_memory),
+            latest_count=len(latest),
+        )
+        raise
+    log.info(
+        "tg_social_channel_list_reloaded",
+        added=added,
+        removed=removed,
+        total=len(latest),
+    )
+    return latest
+
+
+def _make_channel_reload_heartbeat(
+    db: Database,
+    client,
+    settings,
+    channels_holder: dict,
+    on_new_handler,
+):
+    """BL-064 channel-reload: heartbeat factory.
+
+    Returns an async coroutine that, when awaited, runs the periodic
+    reload loop. Factory shape (rather than nested closure) so tests
+    can construct it independently of `_run_listener_body`.
+
+    Disable path (PR-review adv-M1): if
+    `settings.TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC == 0`, the coroutine
+    logs `tg_social_channel_reload_disabled` once and returns immediately.
+    Validator at config.py:684 was amended to allow 0 as the explicit
+    opt-out.
+
+    Error handling (PR-review arch-S1): catch-all `Exception` lands as
+    `tg_social_channel_reload_error`; loop continues. asyncio.CancelledError
+    propagates so the lifecycle's `task.cancel()` works correctly.
+    """
+
+    async def _heartbeat():
+        if settings.TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC == 0:
+            log.info(
+                "tg_social_channel_reload_disabled",
+                hint=(
+                    "TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC=0 — channel "
+                    "additions require pipeline restart"
+                ),
+            )
+            return
+        while True:
+            try:
+                await asyncio.sleep(
+                    settings.TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC
+                )
+                channels_holder["channels"] = await _channel_reload_once(
+                    db,
+                    client,
+                    channels_holder["channels"],
+                    on_new_handler,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("tg_social_channel_reload_error")
+
+    return _heartbeat
 
 
 def _next_silence_alert_due_hours(

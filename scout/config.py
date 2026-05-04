@@ -681,9 +681,14 @@ class Settings(BaseSettings):
     @field_validator("TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC")
     @classmethod
     def _validate_tg_social_channel_reload(cls, v: int) -> int:
-        if v < 60:
+        # BL-064 channel-reload PR — operator escape-hatch: 0 disables
+        # the reload heartbeat entirely (returns immediately + emits
+        # `tg_social_channel_reload_disabled` log). All other values
+        # must be >= 60 to prevent DB hot-loops (anti-thrash).
+        if v != 0 and v < 60:
             raise ValueError(
-                f"TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC must be >= 60 (anti-thrash); got={v}"
+                "TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC must be >= 60 "
+                f"(anti-thrash) or exactly 0 (disable); got={v}"
             )
         return v
 
