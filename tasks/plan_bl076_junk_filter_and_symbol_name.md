@@ -28,6 +28,31 @@
 - a09b333 N3 (BL-061 reference cleanup), N4 (commit squashing) — minor.
 - aff3517 #7-#8 — confirmed defensible (single-PR, no test pollution from `_StubEngine` in BL-065 tests).
 
+**v3 changes from 2-agent design-review feedback:**
+
+*MUST-FIX:*
+- **M1 (a6fcf0f7) — performance prediction unsupported:** chain_completed orphan rate is UNKNOWN until §5 step 10 measures it. Self-Review #8 amended: soak-then-escalate is contingent on chain orphan rate, NOT binary 14d-clean.
+- **M2 (a6fcf0f7) — F2 wording inverted:** corrected — `test-net-token` IS REJECTED (false positive risk), not "slips through".
+- **A3 (a2616834) — parallel `log.info` event:** added `trade_metadata_empty` INFO event next to WARNING in Task 2 Step 3. Matches existing `signal_skipped_*` telemetry pattern; future BL-077 reuses same event name.
+- **A4 (a2616834) — BL-077 sketch:** added one paragraph to design Self-Review #8 — flip from `log.warning + proceed` to `log.info("trade_skipped_empty_metadata") + return None`. NOT exception (would break dispatcher per-signal isolation).
+
+*SHOULD-FIX:*
+- **a6fcf0f7 S3 — M2 has no test:** added Task 2 Step 5 — T2b `test_open_trade_warning_fires_even_during_warmup` with `PAPER_STARTUP_WARMUP_SECONDS=10` monkeypatch.
+- **a6fcf0f7 S6 — F11 WAL claim irrelevant:** rewrote — same-connection serialization stronger than WAL.
+- **a6fcf0f7 S7 — F14 forward guard:** documented `FakeEngine` stub pattern in design F14 mitigation column.
+- **a6fcf0f7 S8 — "no DB schema changes" wording:** clarified to "no DDL changes (zero CREATE/ALTER/DROP, zero migrations)".
+- **A2 (a2616834) — F8 in-line citation:** added `pyproject.toml:12, structlog>=24.1,<25` exact citation.
+- **A5 (a2616834) — F4 reframed:** "WARNING fires unexpectedly often (>10/hour) — investigation trigger" — now real failure mode.
+- **A6 (a2616834) — performance scaling math:** added per-LEARN-cycle calculation + refactor trigger at N>500.
+- **A7 (a2616834) — `signal_combo` field added to WARNING + INFO event:** caller-context for operator debugging.
+- **A8 (a2616834) — refactor trigger documented in helper docstring + Self-Review #11.**
+- **A9 (a2616834) — F7 deleted:** project-wide migration risk, not BL-076-specific.
+- **A11 (a2616834) — narrow exception:** Task 5 helper changed from `except Exception:  # noqa: BLE001` to `except aiosqlite.OperationalError` per-table. Added T5g — monkeypatch `ValueError` on first SELECT, assert it propagates.
+- **A10 (a2616834) — F16/F17 added + F16 defensive guard:** helper opens with `if not coin_id: return "", ""` (F16). Added T5e — parametrized empty + None coin_id test.
+
+*NIT:*
+- a6fcf0f7 #10-12 (cosmetic — symmetry-preserving NULL filter, gainers index citation cleanup, test count drift). Applied to design.
+
 ## Hermes-first analysis
 
 **Domains checked against the 671-skill hub at `hermes-agent.nousresearch.com/docs/skills` (verified 2026-05-04):**
@@ -284,22 +309,39 @@ SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_bl076_junk_filter_and_symbol_name.
 
 Expected: FAIL — log event not emitted.
 
-- [ ] **Step 3: Add WARNING log in `open_trade`**
+- [ ] **Step 3: Add WARNING + parallel INFO log in `open_trade`**
 
-In `scout/trading/engine.py`, immediately after the `if signal_data is None: signal_data = {}` block (around line 122):
+In `scout/trading/engine.py`, immediately after the `if signal_data is None: signal_data = {}` block (around line 122) — **placement BEFORE warmup gate at line 132 is load-bearing per M2**:
 
 ```python
         # BL-076: defense-in-depth visibility. Bug 2 (2026-05-04) showed
         # ~150+ paper trades had empty symbol+name because 3 dispatchers
-        # forgot to pass them. Tasks 3-5 fix the dispatchers; this WARNING
-        # surfaces any FUTURE caller drift. NOT a hard reject — that would
-        # break in-flight pipelines mid-deploy.
+        # forgot to pass them. Tasks 3-5 fix the dispatchers; this guard
+        # surfaces any FUTURE caller drift. NOT a hard reject — would
+        # break in-flight pipelines mid-deploy. Soak-then-escalate per
+        # plan §10: BL-077 flips this to log.info + return None after
+        # 14d clean (matches existing trade_skipped_* patterns).
+        #
+        # Two events emitted (per design A3):
+        # - WARNING: human-readable visibility in journalctl
+        # - INFO trade_metadata_empty: structured event lands in same
+        #   telemetry pipeline that aggregates signal_skipped_* events,
+        #   so existing operator dashboards pick it up. Same event name
+        #   that BL-077 will reuse when it flips to skip semantics.
         if not symbol and not name:
             log.warning(
                 "open_trade_called_with_empty_symbol_and_name",
                 token_id=token_id,
                 signal_type=signal_type,
+                signal_combo=signal_combo,
                 hint="dispatcher likely missing symbol=... + name=... kwargs",
+            )
+            log.info(
+                "trade_metadata_empty",
+                reason="empty_metadata",
+                token_id=token_id,
+                signal_type=signal_type,
+                signal_combo=signal_combo,
             )
 ```
 
@@ -311,11 +353,58 @@ SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_bl076_junk_filter_and_symbol_name.
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Add T2b — pin WARNING fires before warmup gate**
+
+Per M2 fix + design F9 + a6fcf0f7 S3 — pin that WARNING placement is BEFORE the warmup gate at `engine.py:132`. Without this test, a future refactor could move the WARNING below warmup and production WARNINGs vanish silently during the warmup window.
+
+```python
+@pytest.mark.asyncio
+async def test_open_trade_warning_fires_even_during_warmup(tmp_path, monkeypatch):
+    """T2b — pins F9 mitigation. Engine WARNING placement BEFORE
+    PAPER_STARTUP_WARMUP_SECONDS gate. Asserts both WARNING + warmup-skip
+    events fire; warmup-skip alone (without WARNING) means the placement
+    regressed."""
+    from scout.trading.engine import TradingEngine
+    from scout.config import Settings
+    from scout.db import Database
+
+    db_path = str(tmp_path / "t.db")
+    sd = Database(db_path)
+    await sd.initialize()
+    settings = Settings()
+    monkeypatch.setattr(settings, "PAPER_STARTUP_WARMUP_SECONDS", 10)
+    engine = TradingEngine(sd, settings)
+    with capture_logs() as captured:
+        result = await engine.open_trade(
+            token_id="warmup-test",
+            signal_type="volume_spike",
+            signal_data={"foo": "bar"},
+            signal_combo="vs|none",
+            entry_price=0.001,
+        )
+    # open_trade returns None during warmup
+    assert result is None
+    events = [e.get("event") for e in captured]
+    # BOTH events must fire — WARNING placement is BEFORE warmup gate
+    assert "open_trade_called_with_empty_symbol_and_name" in events, (
+        f"WARNING regressed below warmup gate; got events: {events}"
+    )
+    assert "trade_metadata_empty" in events, (
+        f"INFO event regressed below warmup gate; got events: {events}"
+    )
+    assert "trade_skipped_warmup" in events, (
+        f"warmup gate didn't fire (test setup bug); got events: {events}"
+    )
+    await sd.close()
+```
+
+Run: `SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_bl076_junk_filter_and_symbol_name.py::test_open_trade_warning_fires_even_during_warmup -v` — Expected: PASS.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add scout/trading/engine.py tests/test_bl076_junk_filter_and_symbol_name.py
-git commit -m "feat(BL-076): engine-level WARNING on empty symbol+name (defense-in-depth)"
+git commit -m "feat(BL-076): engine-level WARNING + parallel INFO event on empty symbol+name (T2 + T2b)"
 ```
 
 ---
@@ -641,6 +730,52 @@ async def test_lookup_symbol_name_skips_null_symbol_in_source(tmp_path):
     assert symbol == "PART"
     assert name == "Partial Coin"
     await sd.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_coin_id", ["", None])
+async def test_lookup_symbol_name_handles_empty_or_none_coin_id(tmp_path, bad_coin_id):
+    """T5e — F16 mitigation. Defensive guard at top of helper for
+    empty/None coin_id (caller-side bug). Should return ("","") without
+    issuing a SELECT."""
+    from scout.db import Database
+
+    db_path = str(tmp_path / "t.db")
+    sd = Database(db_path)
+    await sd.initialize()
+    symbol, name = await sd.lookup_symbol_name_by_coin_id(bad_coin_id)
+    assert symbol == ""
+    assert name == ""
+    await sd.close()
+
+
+@pytest.mark.asyncio
+async def test_lookup_symbol_name_propagates_non_operational_errors(tmp_path, monkeypatch):
+    """T5g (A11 fix) — pin that the per-table catch is narrow:
+    `except aiosqlite.OperationalError` ONLY. Other exception types
+    (programming errors, type mismatches) MUST propagate — otherwise
+    we hide real bugs behind silent ("","") returns.
+
+    Monkeypatch _conn.execute to raise ValueError on the first call;
+    helper must propagate, not swallow."""
+    from scout.db import Database
+
+    db_path = str(tmp_path / "t.db")
+    sd = Database(db_path)
+    await sd.initialize()
+    real_execute = sd._conn.execute
+    call_count = {"n": 0}
+
+    async def boom(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise ValueError("simulated programming error")
+        return await real_execute(*args, **kwargs)
+
+    monkeypatch.setattr(sd._conn, "execute", boom)
+    with pytest.raises(ValueError, match="simulated programming error"):
+        await sd.lookup_symbol_name_by_coin_id("any-coin")
+    await sd.close()
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -675,12 +810,23 @@ In `scout/db.py`, add near the other public methods (search for `async def initi
           2. volume_history_cg (CoinGecko volume telemetry)
           3. volume_spikes (DexScreener-side spikes)
 
-        Each SELECT in its own try/except (per architecture-review #1):
-        a column rename in any one table fails ONLY that lookup; the
-        next table still works. Returns ("", "") if nothing found —
-        caller decides whether to log + still proceed.
+        Each SELECT in its own `except aiosqlite.OperationalError`
+        (per architecture-review #1 + A11 narrowing — NOT bare `except
+        Exception`): a column rename or table lock in any one table fails
+        ONLY that lookup; the next table still works. Other exception
+        types (programming errors, etc.) propagate. Returns ("", "") if
+        nothing found — caller decides whether to log + still proceed.
+
+        Refactor trigger (per A8): when a 4th source is added OR source
+        priority becomes dynamic per-chain, refactor to a `MetadataSource`
+        plugin pattern. Performance trigger (per A1): if cardinality
+        exceeds ~500/cycle, refactor to UNION ALL with per-table
+        OperationalError fallback for happy-path single round-trip.
         """
-        # 1. gainers_snapshots — primary source
+        # F16 mitigation: defensive None/empty coin_id guard.
+        if not coin_id:
+            return "", ""
+        # 1. gainers_snapshots — primary source (canonical CoinGecko)
         try:
             cur = await self._conn.execute(
                 "SELECT symbol, name FROM gainers_snapshots "
@@ -691,7 +837,10 @@ In `scout/db.py`, add near the other public methods (search for `async def initi
             row = await cur.fetchone()
             if row and row[0] and row[1]:
                 return row[0], row[1]
-        except Exception:  # noqa: BLE001 — schema-drift resilience per A1
+        except aiosqlite.OperationalError:
+            # F3 (schema drift) + F17 (table locked) — fall through.
+            # Other exceptions (e.g. ProgrammingError from a logic bug)
+            # propagate, per A11.
             pass
         # 2. volume_history_cg — fallback
         try:
@@ -704,7 +853,7 @@ In `scout/db.py`, add near the other public methods (search for `async def initi
             row = await cur.fetchone()
             if row and row[0] and row[1]:
                 return row[0], row[1]
-        except Exception:  # noqa: BLE001
+        except aiosqlite.OperationalError:
             pass
         # 3. volume_spikes — last resort
         try:
@@ -717,10 +866,12 @@ In `scout/db.py`, add near the other public methods (search for `async def initi
             row = await cur.fetchone()
             if row and row[0] and row[1]:
                 return row[0], row[1]
-        except Exception:  # noqa: BLE001
+        except aiosqlite.OperationalError:
             pass
         return "", ""
 ```
+
+Ensure `import aiosqlite` is at the top of `scout/db.py` (verified — `scout/db.py` already imports it).
 
 - [ ] **Step 4: Run lookup tests to verify they pass**
 

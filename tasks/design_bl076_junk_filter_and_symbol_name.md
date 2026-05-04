@@ -1,6 +1,38 @@
 # BL-076: Junk-filter expansion + symbol/name population — Design
 
-**New primitives introduced:** add `"test-"` to `_JUNK_COINID_PREFIXES`; new method `Database.lookup_symbol_name_by_coin_id(coin_id) -> tuple[str, str]` (sequential prioritized lookup with per-table try/except); engine-level WARNING `open_trade_called_with_empty_symbol_and_name` (defense-in-depth, NOT hard-reject); modify 3 dispatcher call sites to populate `symbol`+`name`. NO new DB tables, columns, or settings.
+**New primitives introduced:** add `"test-"` to `_JUNK_COINID_PREFIXES`; new method `Database.lookup_symbol_name_by_coin_id(coin_id) -> tuple[str, str]` (sequential prioritized lookup with per-table `except aiosqlite.OperationalError`); engine-level WARNING `open_trade_called_with_empty_symbol_and_name` AND parallel `log.info` event `trade_metadata_empty` (matches existing `signal_skipped_*` telemetry pattern at `signals.py:34/132/...` so existing operator dashboards aggregate it; future BL-077 hard-reject path becomes "log+return None" using same event name); modify 3 dispatcher call sites to populate `symbol`+`name`. NO new DB tables, columns, or settings.
+
+**v2 changes from 2-agent design-review feedback:**
+
+*MUST-FIX (consensus or high-impact):*
+- **M1 (a6fcf0f7) — performance claim unsupported:** rewrote design line 97 — chain_completed orphan rate is UNKNOWN until §5 step 10 measures it post-deploy. Removed bare "expected ~0/hour" prediction. Coupled fix: amended Self-Review #8 — soak-then-escalate is contingent on chain orphan rate; if orphans dominate, BL-077 must add fallback resolution BEFORE escalation.
+- **M2 (a6fcf0f7) — F2 wording inverted:** `test-net-token` STARTS WITH `test-`, so it's REJECTED (false positive risk), NOT "slips through". Rewrote F2 to describe the actual risk: legit testnet-themed tokens get rejected; operator can grep `signal_skipped_junk` to spot losses.
+- **A3 (a2616834) — skip-counter telemetry channel bypassed:** added parallel `log.info("trade_metadata_empty", reason=..., token_id=..., signal_type=..., signal_combo=...)` next to the WARNING. Existing operator dashboards aggregate `signal_skipped_*` events; WARNING-only would be invisible there. Future BL-077 flips from `log + proceed` to `log + return None` — same event name, additive change.
+- **A4 (a2616834) — BL-077 sketch:** added one paragraph to design §"Soak-then-escalate" — BL-077 converts the WARNING block to `log.info("trade_skipped_empty_metadata", ...) ; return None` (mirrors `trade_skipped_warmup` / `trade_skipped_no_price` / `trade_skipped_signal_disabled` at engine.py:136-168). NOT an exception — exceptions break the dispatcher loop's per-signal isolation.
+
+*SHOULD-FIX (worth applying):*
+- **a6fcf0f7 S3 — M2 has no test:** added T2b — `test_open_trade_warning_fires_even_during_warmup` with `PAPER_STARTUP_WARMUP_SECONDS=10` monkeypatch. Pins WARNING placement before warmup gate.
+- **a6fcf0f7 S4 — Self-Review failure-mode count wrong:** F4 reframed (per A5 below); count corrected.
+- **a6fcf0f7 S5 — chain_patterns FK dependency:** added test-matrix annotation referencing `_seed_chain_pattern` helper for future test authors.
+- **a6fcf0f7 S6 — F11 WAL claim irrelevant:** rewrote — same-connection reads via `self._conn` are serialized by aiosqlite's single-thread executor; race is structurally impossible, not just isolated by WAL.
+- **a6fcf0f7 S7 — F14 forward guard:** documented FakeEngine stub pattern recommendation.
+- **a6fcf0f7 S8 — "no DB schema changes" wording:** clarified — "no DDL changes (zero CREATE/ALTER/DROP, zero migrations); new `Database.lookup_symbol_name_by_coin_id` method is pure code".
+- **A2 (a2616834) — F8 in-line citation:** replaced "(already pinned per project convention)" with "(pinned `structlog>=24.1,<25` at `pyproject.toml:12`)".
+- **A5 (a2616834) — F4 reframe:** F4 now "Engine WARNING fires unexpectedly often (>10/hour) — investigation trigger — root cause: a 4th dispatcher leaks empty metadata that audit didn't catch". Real failure mode (silent: operator dismisses as expected noise; mitigation: §5 step 9 quantifies).
+- **A6 (a2616834) — performance scaling math:** added per-LEARN-cycle scaling (N × ≤3 SELECTs ≤ 150/cycle at observed N=10–50, <1ms/cycle DB cost; revisit at N>500).
+- **A7 (a2616834) — WARNING caller-context:** added `signal_combo` field to both WARNING and `log.info` event so operator can grep by combo to identify leaking dispatcher.
+- **A8 (a2616834) — coupling to 3 hard-coded snapshot tables:** added Self-Review #11 trigger documentation: refactor to `MetadataSource` plugin pattern when (a) 4th source added, OR (b) source priority becomes dynamic per-chain.
+- **A9 (a2616834) — F7 doesn't belong:** deleted (project-wide migration risk, not BL-076-specific).
+- **A11 (a2616834) — narrow exception catches:** `except Exception:  # noqa: BLE001` → `except aiosqlite.OperationalError:` per-table. Added T5g monkeypatch test asserting non-OperationalError errors propagate (not swallowed).
+- **A10 (a2616834) — F16/F17 added:**
+  - F16: `lookup_symbol_name_by_coin_id` called with empty/None coin_id → defensive `if not coin_id: return "", ""` at top of helper
+  - F17: SQLite locked during sequential SELECTs → already mitigated by per-table `except aiosqlite.OperationalError`; acknowledge as deliberate
+
+*NIT:*
+- a6fcf0f7 #10: redundant NULL filter for gainers_snapshots — kept for symmetry across 3 SELECTs.
+- a6fcf0f7 #11: gainers index citation cleanup — applied to Performance section.
+- a6fcf0f7 #12: plan/design test count mismatch — both now agree on 12 active tests (was 11 + new T2b + T5g).
+- a2616834 #9 F7 deletion — applied above.
 
 ## Hermes-first analysis
 
@@ -58,43 +90,46 @@
 
 ---
 
-## Failure modes (15 — silent-failure-first ordering)
+## Failure modes (16 — silent-failure-first ordering; F7 deleted, F4 reframed, F16-F17 added)
 
-| # | Failure | Silent or loud? | Mitigation in plan v2 | Residual risk |
+| # | Failure | Silent or loud? | Mitigation in plan v3 / design v2 | Residual risk |
 |---|---|---|---|---|
-| F1 | New CoinGecko placeholder family appears (`example-N`, `demo-N`) | **Silent** (paper trade opens against junk) | Pre-merge §"Pre-merge audits" §A enumerates prefixes; if found, add to PR | Future placeholder families need same pre-merge query before next backlog item touching trading admission |
-| F2 | `_is_junk_coinid` too aggressive — false-positive rejects legit token starting with `test-` | **Loud** (would log `signal_skipped_junk` for legit token) | T1b pins false-positives `protest-coin`, `biggest-token`, `pre-testnet`, `pretest` | `test-net-token` etc. would still slip through `_JUNK_COINID_PREFIXES` because `test-` matches; acceptable — operator can grep `signal_skipped_junk` to see if any legit token was rejected |
-| F3 | One of 3 snapshot tables gets a column rename (BL-NNN renames `volume_history_cg.recorded_at` → `recorded_ts`) | **Silent** (helper's UNION-without-try would fall back to ""; v2 try/except catches the OperationalError per-table) | A1 fix: per-table try/except in `lookup_symbol_name_by_coin_id` | A column rename in `gainers_snapshots` (primary source) would still be detectable via §5 step 9 WARNING-rate spike; see T5d for validation pattern |
-| F4 | Engine WARNING never fires (resolver works perfectly OR all 3 dispatchers always have data) | None — this is the success state | n/a | If WARNING ALSO never fires after 14d soak, BL-077 escalates to hard reject |
-| F5 | Engine WARNING becomes wallpaper (fires constantly) | **Silent** (operator stops noticing) | §5 step 9 quantifies daily count; soak-then-escalate criterion gates BL-077 on clean soak | If wallpaper, investigate which dispatcher is leaking BEFORE escalating to reject |
-| F6 | chain_completed dispatcher has high orphan rate (no snapshot row for most coin_ids) | **Silent** (chain trades open with empty metadata; operator can't identify in dashboard) | §5 step 10 attribution query measures coverage rate; if orphan rate >20%, investigate ingestion gap | If chain trades dominate empty-metadata trades, BL-077 to add JOIN with `candidates` table (different keying — `contract_address` not `coin_id`) or direct CoinGecko fetch |
-| F7 | Concurrent migration from BL-NNN adds NEW NOT NULL column to `chain_matches` while pipeline is running | **Loud** (INSERT 500s on missing column) | Already mitigated by SQLite ALTER TABLE adding columns at end with default; pipeline restart picks it up | Standard migration risk — same as any other DB schema change in this project |
-| F8 | structlog renderer changes between versions; `capture_logs` API breaks | **Loud** (test suite fails) | Pin structlog version in pyproject.toml (already pinned per project convention); CI catches | None |
-| F9 | T2 test fires the WARNING but `open_trade` short-circuits at warmup gate (`PAPER_STARTUP_WARMUP_SECONDS > 0`) BEFORE the WARNING line | None — warmup gate is at engine.py:132 (line numbers approximate); WARNING placement at engine.py:~123 means it fires FIRST | M2 fix: WARNING placed BEFORE warmup gate explicitly | None |
+| F1 | New CoinGecko placeholder family appears (`example-N`, `demo-N`) | **Silent** (paper trade opens against junk) | Pre-merge §"Pre-merge audits" §A enumerates prefixes; if found, add to PR | One-shot human task; recommend quarterly cron of pre-merge §A query as part of BL-077+ housekeeping. Acceptable until placeholder churn outpaces our cadence |
+| F2 | `_is_junk_coinid` REJECTS legit testnet-themed token (e.g. `test-net-token`) because `test-` is a prefix match | **Loud** (`signal_skipped_junk` event fires for legit token) | Accepted risk — current `_JUNK_COINID_PREFIXES` uses `startswith` so `test-net-token` IS rejected | Operator can grep `signal_skipped_junk` events to spot any legit token loss. If a legit `test-`-prefixed token surfaces, switch to substring/regex shape per Self-Review #11 trigger |
+| F3 | One of 3 snapshot tables gets a column rename (BL-NNN renames `volume_history_cg.recorded_at` → `recorded_ts`) | **Silent** (helper's UNION-without-try would fall back to ""; v2 per-table `except aiosqlite.OperationalError` only fails ONE lookup, others continue) | A1 fix: per-table `except aiosqlite.OperationalError` in `lookup_symbol_name_by_coin_id` (NOT bare `except Exception` — A11 narrowing) | A column rename in `gainers_snapshots` (primary source) would still be detectable via §5 step 9 WARNING-rate spike; see T5b for validation pattern |
+| F4 | Engine WARNING fires unexpectedly often (>10/hour) AFTER Tasks 3-5 patches deploy (where dispatchers were supposed to have populated metadata) | **Silent** (operator dismisses as expected noise) | §5 step 9 quantifies daily count; spike triggers root-cause investigation: a 4th dispatcher is leaking empty metadata that pre-deploy audit didn't catch | Investigation surface is the WARNING's `signal_combo` field (A7 fix) — operator greps by combo to identify the unknown leaker |
+| F5 | Engine WARNING becomes wallpaper (fires constantly from chain_completed orphans) | **Silent** (operator stops noticing) | §5 step 9 quantifies daily count; soak-then-escalate criterion (Self-Review #8) is contingent on resolving chain_completed coverage FIRST | If wallpaper, BL-077 must add fallback resolution (CoinGecko fetch / candidates JOIN) BEFORE escalating WARNING to hard reject |
+| F6 | chain_completed dispatcher has high orphan rate (no snapshot row for most coin_ids) | **Silent** (chain trades open with empty metadata; operator can't identify in dashboard) | §5 step 10 attribution query measures coverage rate post-deploy. **Pre-deploy unknown** (per M1 fix). If orphan rate >20%, investigate ingestion gap | If chain trades dominate empty-metadata trades, BL-077 to add JOIN with `candidates` table (different keying — `contract_address` not `coin_id`) or direct CoinGecko fetch. **This may be the dominant failure mode — measure first, decide later** |
+| F8 | structlog renderer changes between versions; `capture_logs` API breaks | **Loud** (test suite fails) | structlog pinned `>=24.1,<25` at `pyproject.toml:12`; CI catches version drift | None |
+| F9 | T2 test fires the WARNING but `open_trade` short-circuits at warmup gate (`PAPER_STARTUP_WARMUP_SECONDS > 0`) BEFORE the WARNING line | **Loud** (production WARNINGs vanish during warmup if WARNING placement is wrong) | M2 fix: WARNING placed BEFORE warmup gate explicitly. **T2b** (S3 fix) pins this with `PAPER_STARTUP_WARMUP_SECONDS=10` monkeypatch + assert WARNING fires alongside `trade_skipped_warmup` | None |
 | F10 | NULL `symbol` in legacy snapshot table row | **Silent** (helper would return NULL via tuple, str-typed columns would crash later) | T5d pins `if row[0] and row[1]` filter | None |
-| F11 | Race: chain dispatch fires while gainers_snapshots row for that coin_id is being inserted (mid-transaction) | None — read-side lookup will see committed state via WAL | SQLite WAL guarantees readers see consistent snapshot | None |
-| F12 | Same coin_id has different symbols in different snapshot tables (e.g., gainers has "PEPE", volume_spikes has "pepe-bsc") | **Silent** (operator might see weird casing in dashboard) | Sequential prioritized lookup picks gainers_snapshots first (canonical); other tables only used as fallback | If operator finds inconsistency in dashboard, the helper docstring documents priority order — root-cause traceable |
-| F13 | `_JUNK_COINID_PREFIXES` tuple grows unbounded in future PRs | **Loud** (review pain at >10 entries) | Self-Review #11 documents refactor trigger | Convention enforced by code-review reviewer |
-| F14 | Engine WARNING captures false positives — caller intentionally passes empty symbol/name (e.g. test fixture) | **Silent** (operator dismisses as noise) | All known callers must populate symbol+name; test fixtures using `_StubEngine` bypass real engine (verified for BL-065 tests) | If a NEW test fixture leaks empty values to real engine, WARNING fires correctly (catches the bug) |
+| F11 | Race: chain dispatch fires while gainers_snapshots row for that coin_id is being inserted (mid-transaction) | None — same-connection reads via `self._conn` are serialized by aiosqlite's single-thread executor | Race is structurally impossible (not just isolated by WAL — single-connection serialization is stronger) | None |
+| F12 | Same coin_id has different symbols in different snapshot tables (e.g., gainers has "PEPE", volume_spikes has "pepe-bsc") | **Silent** (operator might see weird casing in dashboard) | Sequential prioritized lookup picks gainers_snapshots first (canonical CoinGecko source); other tables only used as fallback | If operator finds inconsistency in dashboard, the helper docstring documents priority order — root-cause traceable |
+| F13 | `_JUNK_COINID_PREFIXES` tuple grows unbounded in future PRs | **Loud** (review pain at >10 entries) | Self-Review #11 documents refactor trigger to settings-backed `PAPER_JUNK_COINID_PREFIXES` | Convention enforced by code-review reviewer |
+| F14 | Engine WARNING captures false positives — caller intentionally passes empty symbol/name (e.g. test fixture using real engine) | **Silent** (operator dismisses as noise; signal-to-noise of WARNING erodes) | BL-065 tests use `_StubEngine` (verified `tests/test_bl065_cashtag_dispatch.py:265-268`); future tests should EITHER populate symbol+name OR use a `FakeEngine` stub. WARNING in CI test logs is a feature (catches dispatcher drift), not a bug | Recommendation in `tests/conftest.py` documents the FakeEngine stub pattern; new contributors discover it on copy-paste |
 | F15 | Pre-deploy baseline missing (operator skips §"Pre-merge audits") | **Silent** (post-deploy attribution query has no comparison point) | §"Pre-merge audits" is mandatory; post-deploy operator audit references the file | Operator should run audits before merge; if skipped, attribution is reduced to "fix is in" without coverage breakdown |
+| F16 | `lookup_symbol_name_by_coin_id` called with empty/None coin_id (caller bug) | **Silent** (would `SELECT ... WHERE coin_id = ''` always-empty result; return ("", "") with no log) | Defensive `if not coin_id: return "", ""` at top of helper | None |
+| F17 | SQLite locked during the 3 sequential SELECTs (e.g., concurrent writer holding write lock) | **Loud** (`OperationalError: database is locked`) → **degraded under fix** (per-table `except aiosqlite.OperationalError` returns ("", "") for that lookup, falls through to next table) | A11 fix: per-table catch handles this incidentally as well as schema drift. **Acknowledged as deliberate**, not coincidental | If ALL 3 tables locked simultaneously, returns ("", "") + caller logs `chain_completed_no_metadata` — same path as orphan |
 
 ---
 
 ## Performance notes
 
 **Sequential 3-table lookup in `lookup_symbol_name_by_coin_id`:**
-- All 3 source tables have indexes on `coin_id`:
-  - `gainers_snapshots`: covered by INSERT-side schema (typical PK or unique constraint)
-  - `volume_history_cg`: `idx_vol_hist_cg ON (coin_id, recorded_at)` (verified `scout/db.py:442-443`)
-  - `volume_spikes`: standard `coin_id` index in BL-026 deploy
+- All 3 source tables have indexes on `coin_id` (verified):
+  - `gainers_snapshots`: `idx_gainers_snap ON (coin_id, snapshot_at)` (`scout/db.py:490-491`)
+  - `volume_history_cg`: `idx_vol_hist_cg ON (coin_id, recorded_at)` (`scout/db.py:442-443`)
+  - `volume_spikes`: `idx_vol_spikes ON (coin_id, detected_at)` (`scout/db.py:459-460`)
 - Each SELECT is O(log n) via index seek, returns at most 1 row.
 - Best case (gainers hit): 1 SELECT.
 - Worst case (orphan): 3 SELECTs. ~sub-ms total.
-- Per chain_completed dispatch: ~3 SELECTs added to existing flow. Negligible.
+- **Per LEARN cycle (5min):** N chain matches × ≤3 SELECTs = ≤3N. At observed N=10–50, <150 SELECTs/cycle = <1ms/cycle DB cost. Re-evaluate if N exceeds 500/cycle (refactor to UNION ALL with per-table OperationalError fallback for happy-path single round-trip).
+- **Helper docstring acknowledges trade-off** (per A1 architecture-review): worst case 3 round-trips per orphan; refactor trigger documented at the cardinality threshold.
 
-**Engine WARNING:**
-- Single conditional check + 1 structlog event per `open_trade` call when both symbol+name empty.
-- After Tasks 3-5 patches land, expected rate: ~0/hour from fixed dispatchers; only chain_completed orphans.
+**Engine WARNING + parallel `log.info` event:**
+- Single conditional check + 2 structlog events (WARNING + INFO `trade_metadata_empty`) per `open_trade` call when both symbol+name empty.
+- After Tasks 3-5 patches land, **expected rate from fixed dispatchers (volume_spike + narrative_prediction): 0/hour**.
+- **chain_completed orphan rate: UNKNOWN until §5 step 10 measures it post-deploy.** If orphan rate is significant, soak-then-escalate criterion (Self-Review #8) is contingent on resolving chain_completed coverage FIRST — see F5/F6.
 
 ---
 
@@ -135,10 +170,17 @@ Design adds no operational verification beyond plan; this section is here for cr
 ## Self-Review
 
 1. **Hermes-first present:** ✓ table + ecosystem + verdict per convention.
-2. **Drift grounding:** ✓ explicit file:line refs to all extended code; Pydantic shapes verified; deployed schemas verified; structlog config verified.
-3. **Test matrix:** 11 active tests covering both bugs at unit + integration layers; zero deferred.
-4. **Failure modes 15/15, silent-failure-first count: 7 silent** — F1, F3, F5, F6, F10, F12, F14, F15 (mitigated or accepted with rationale); **8 loud** — F2, F4, F7, F8, F9, F11, F13. F4 is the success state (no failure).
-5. **Performance honest:** indexes verified; sub-ms cost quantified.
-6. **Rollback complete:** code-only revert; partial rollback per cluster.
-7. **No new DB schema:** verified — no migration.
-8. **Soak-then-escalate criterion:** documented in plan v2 §10; tracks WARNING rate daily for 14d before BL-077 hard-reject escalation.
+2. **Drift grounding:** ✓ explicit file:line refs to all extended code; Pydantic shapes verified; deployed schemas verified; structlog config verified; pyproject pin cited.
+3. **Test matrix:** **12 active tests** (T1-T1b junk filter + T2-T2b engine WARNING + T3-T4 dispatcher wiring + T5-T5g resolver + chain integration + structlog capture across all). Zero deferred. T2b pins WARNING-vs-warmup ordering (S3 fix); T5g pins per-table `except aiosqlite.OperationalError` narrowness (A11 fix).
+4. **Failure modes 16/16, silent-failure-first count: 9 silent** (F1, F3, F4, F5, F6, F10, F12, F14, F15, F16) **/ 7 loud** (F2, F8, F9, F11, F13, F17 [degraded under fix], reframed F4 [success-state-with-investigation-trigger]). F7 deleted (project-wide migration risk, not BL-076-specific).
+5. **Performance honest:** all 3 indexes verified at exact `scout/db.py` lines; per-LEARN-cycle scaling math added; WARNING rate prediction conservative (`UNKNOWN until measured` for chain_completed).
+6. **Rollback complete:** code-only revert; partial rollback per cluster (junk-filter / dispatcher fix independent at file level).
+7. **No DDL changes:** verified — zero CREATE/ALTER/DROP, zero migrations. New `Database.lookup_symbol_name_by_coin_id` method is pure code; reverts with the file. (Wording clarification per a6fcf0f7 S8.)
+8. **Soak-then-escalate criterion (CONTINGENT, not binary — per A4 sketch):**
+   - **Soak target:** 14 consecutive days of zero `trade_metadata_empty` events (the parallel `log.info` event added per A3 — counts in same operator dashboard as `signal_skipped_*`).
+   - **Contingent on:** chain_completed orphan rate first reaching ~0/cycle. If F6 dominates the WARNING surface (orphans keep firing), BL-077 must FIRST add fallback resolution (CoinGecko fetch / candidates JOIN) before flipping the WARNING.
+   - **BL-077 architecture sketch (per A4):** convert engine WARNING block at `engine.py:~123` from `log.warning(...)` to `log.info("trade_skipped_empty_metadata", ...) ; return None`. Mirrors existing `trade_skipped_warmup` / `trade_skipped_no_price` / `trade_skipped_signal_disabled` patterns at `engine.py:136-168`. **NOT** an exception — exceptions break the dispatcher loop's per-signal isolation. Caller already handles `None` returns from `open_trade`.
+9. **Engine WARNING + parallel INFO event channel choice (per A3):** project's existing telemetry pipeline aggregates `signal_skipped_*` / `trade_skipped_*` `log.info` events. WARNING-only would be invisible there. Adding the parallel INFO event matches the existing convention; future BL-077 hard-reject becomes additive (flip from `log.warning + proceed` to `log.info + return None` using the same event name).
+10. **F4 reframed as real failure mode (per A5):** "WARNING fires unexpectedly often after Tasks 3-5 deploy → investigation trigger" — surfaces the case where a 4th unknown dispatcher leaks empty metadata. Investigation surface is the `signal_combo` field on the WARNING.
+11. **Hard-coded 3 snapshot tables — refactor trigger (per A8):** acceptable at current cardinality. Refactor to `MetadataSource` plugin pattern when EITHER (a) a 4th source is added OR (b) source priority becomes dynamic (e.g., per-chain ordering). One-sentence trigger documented in helper docstring + here for future contributors.
+12. **Test fixture FK dependency (per S5):** T5e/T5f require `chain_patterns` row seeded first (FK on `chain_matches.pattern_id`, `db.py:336`). Future chain_matches integration tests must do the same — test matrix annotates this; consider factoring `_seed_chain_pattern(sd, id)` into `tests/conftest.py` if a 3rd test needs it.
