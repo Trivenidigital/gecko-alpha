@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react'
+import TGDLQPanel from './TGDLQPanel.jsx'
 
 function fmtTime(iso) {
   if (!iso) return '–'
@@ -134,6 +135,10 @@ export default function TGAlertsTab() {
             <div className="tg-stat-value">{stats.trades_dispatched ?? 0}</div>
           </div>
           <div className="tg-stat">
+            <div className="tg-stat-label">Cashtag Dispatched</div>
+            <div className="tg-stat-value">{stats.cashtag_dispatched_24h ?? 0}</div>
+          </div>
+          <div className="tg-stat">
             <div className="tg-stat-label">DLQ</div>
             <div className="tg-stat-value">{stats.dlq ?? 0}</div>
           </div>
@@ -148,6 +153,8 @@ export default function TGAlertsTab() {
               <th>Channel</th>
               <th>Trade-eligible</th>
               <th>Safety required</th>
+              <th>Cashtag-eligible</th>
+              <th>Cashtag today</th>
               <th>Listener</th>
               <th>Last message</th>
             </tr>
@@ -155,11 +162,24 @@ export default function TGAlertsTab() {
           <tbody>
             {channels.filter(c => !c.removed).map(c => {
               const h = health[`channel:${c.channel_handle}`] || {}
+              // BL-066': defensive ?? defaults so a stale-cache or
+              // pre-extension API response renders dashes, not "undefined".
+              const today = c.cashtag_dispatched_today
+              const cap = c.cashtag_cap_per_day
+              const nearCap = today != null && cap != null && today >= cap
               return (
                 <tr key={c.channel_handle}>
                   <td>{c.channel_handle}</td>
                   <td>{c.trade_eligible ? 'yes' : 'no'}</td>
                   <td>{c.safety_required ? 'yes' : 'no'}</td>
+                  <td>{c.cashtag_trade_eligible ? 'yes' : 'no'}</td>
+                  <td>
+                    <span className={
+                      nearCap ? 'tg-badge tg-badge-warn' : 'tg-badge tg-badge-muted'
+                    }>
+                      {today ?? '–'} / {cap ?? '–'}
+                    </span>
+                  </td>
                   <td>
                     <span className={`tg-badge ${
                       h.state === 'running' ? 'tg-badge-ok' : 'tg-badge-warn'
@@ -217,6 +237,8 @@ export default function TGAlertsTab() {
           </table>
         )}
       </div>
+
+      <TGDLQPanel />
     </div>
   )
 }
