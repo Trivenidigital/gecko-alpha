@@ -1061,3 +1061,99 @@ async def get_trading_stats_by_signal(db_path: str, days: int = 7) -> dict:
                 "win_rate": round((w / total) * 100, 1) if total > 0 else 0,
             }
         return result
+
+
+# ---------------------------------------------------------------------------
+# BL-066': TG-social dashboard gap-fill
+# ---------------------------------------------------------------------------
+
+
+async def get_tg_social_dlq(db_path: str, limit: int = 20) -> list[dict]:
+    """Recent tg_social DLQ entries, ordered by failed_at DESC.
+
+    raw_text is truncated to 240 chars (mirrors text_preview convention
+    in get_tg_social_alerts handler) so the response stays under the
+    payload budget — full text accessible by SSH if needed.
+
+    Defensive (S1 — F17 mitigation): if the dashboard is pointed at a
+    pre-BL-064 DB snapshot (rollback scenario), tg_social_dlq won't exist
+    and the SELECT 500s. Mirror the cashtag_trade_eligible column-missing
+    pattern: catch OperationalError mentioning the table, return [].
+    """
+    async with _ro_db(db_path) as conn:
+        try:
+            cur = await conn.execute(
+                "SELECT id, channel_handle, msg_id, raw_text, "
+                "error_class, error_text, failed_at, retried_at "
+                "FROM tg_social_dlq "
+                "ORDER BY failed_at DESC "
+                "LIMIT ?",
+                (max(1, min(limit, 100)),),
+            )
+            rows = await cur.fetchall()
+        except aiosqlite.OperationalError as e:
+            if "tg_social_dlq" in str(e):
+                return []
+            raise
+        return [
+            {
+                "id": r[0],
+                "channel_handle": r[1],
+                "msg_id": r[2],
+                "raw_text_preview": (r[3] or "")[:240],
+                "error_class": r[4],
+                "error_text": r[5],
+                "failed_at": r[6],
+                "retried_at": r[7],
+            }
+            for r in rows
+        ]
+
+
+async def get_tg_social_cashtag_stats_24h(db_path: str) -> dict:
+    """BL-066' cashtag-dispatch rollup: count of paper_trades opened in
+    last 24h whose signal_data carries resolution=cashtag.
+
+    Returns {"dispatched": int}. Rolling 24h window — distinct from
+    get_tg_social_per_channel_cashtag_today (calendar-day) which mirrors
+    the dispatcher's gate semantics. This is a different surface (24h
+    rollup card, not cap enforcement)."""
+    async with _ro_db(db_path) as conn:
+        cur = await conn.execute(
+            """SELECT COUNT(*)
+               FROM paper_trades
+               WHERE signal_type = 'tg_social'
+                 AND json_extract(signal_data, '$.resolution') = 'cashtag'
+                 AND datetime(opened_at) >= datetime('now', '-24 hours')"""
+        )
+        row = await cur.fetchone()
+        return {"dispatched": row[0] if row else 0}
+
+
+async def get_tg_social_per_channel_cashtag_today(db_path: str) -> dict[str, int]:
+    """BL-066' per-channel cashtag dispatches since UTC midnight.
+
+    Mirrors the **calendar-day** semantics of the dispatcher's gate at
+    `scout/social/telegram/dispatcher.py:_channel_cashtag_trades_today_count`
+    (which uses `opened_at >= datetime('now', 'start of day')`). If we
+    used a rolling 24h window instead, the dashboard would lie about cap
+    utilization — at 06:00 UTC, a channel that hit cap=5 yesterday at
+    23:00 would read `5/5 (warn)` here but `0/5` to the dispatcher, and
+    the next dispatch would actually go through. **The two surfaces MUST
+    use identical date math.**
+
+    Returns dict keyed by channel_handle; channels with zero dispatches
+    are omitted (frontend defaults missing keys to 0).
+    """
+    async with _ro_db(db_path) as conn:
+        cur = await conn.execute(
+            """SELECT json_extract(signal_data, '$.channel_handle') AS ch,
+                      COUNT(*) AS n
+               FROM paper_trades
+               WHERE signal_type = 'tg_social'
+                 AND json_extract(signal_data, '$.resolution') = 'cashtag'
+                 AND opened_at >= datetime('now', 'start of day')
+               GROUP BY ch"""
+        )
+        rows = await cur.fetchall()
+        return {r[0]: r[1] for r in rows if r[0]}
