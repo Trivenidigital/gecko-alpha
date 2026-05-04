@@ -80,7 +80,7 @@ async def test_open_trade_logs_warning_when_symbol_and_name_both_empty(tmp_path)
     sd = Database(db_path)
     await sd.initialize()
     settings = Settings()
-    engine = TradingEngine(sd, settings)
+    engine = TradingEngine("paper", sd, settings)
     with capture_logs() as captured:
         await engine.open_trade(
             token_id="some-coin",
@@ -125,7 +125,7 @@ async def test_open_trade_warning_fires_even_during_warmup(tmp_path, monkeypatch
     await sd.initialize()
     settings = Settings()
     monkeypatch.setattr(settings, "PAPER_STARTUP_WARMUP_SECONDS", 10)
-    engine = TradingEngine(sd, settings)
+    engine = TradingEngine("paper", sd, settings)
     with capture_logs() as captured:
         result = await engine.open_trade(
             token_id="warmup-test",
@@ -400,10 +400,9 @@ async def test_chain_completed_orphan_does_not_trigger_engine_warning(tmp_path):
         (now,),
     )
     await sd._conn.execute(
-        "INSERT INTO chain_patterns (id, name, pipeline, steps_json, "
-        " is_active, hit_threshold_pct, max_chain_duration_hours, created_at) "
-        "VALUES (3, 'full_conviction', 'narrative', '[]', 1, 5.0, 48.0, ?)",
-        (now,),
+        "INSERT INTO chain_patterns (id, name, description, steps_json, "
+        " min_steps_to_trigger, conviction_boost, alert_priority, is_active) "
+        "VALUES (3, 'full_conviction', 'narrative full conviction', '[]', 1, 1, 'low', 1)",
     )
     await sd._conn.execute(
         "INSERT INTO chain_matches "
@@ -418,7 +417,7 @@ async def test_chain_completed_orphan_does_not_trigger_engine_warning(tmp_path):
     settings = Settings()
     # Use REAL TradingEngine so engine WARNING actually fires when called
     # without the sentinel — this is the bug we're guarding against.
-    engine = TradingEngine(sd, settings)
+    engine = TradingEngine("paper", sd, settings)
     with capture_logs() as logs:
         await trade_chain_completions(engine, sd, settings=settings)
     events = [e.get("event") for e in logs]
@@ -453,7 +452,7 @@ async def test_open_trade_with_expected_empty_metadata_suppresses_warnings(tmp_p
     sd = Database(db_path)
     await sd.initialize()
     settings = Settings()
-    engine = TradingEngine(sd, settings)
+    engine = TradingEngine("paper", sd, settings)
 
     # Sentinel ON: WARNING + INFO MUST NOT fire
     with capture_logs() as logs_on:
@@ -555,10 +554,9 @@ async def test_trade_chain_completions_uses_lookup_helper_for_metadata(tmp_path)
         (now,),
     )
     await sd._conn.execute(
-        "INSERT INTO chain_patterns (id, name, pipeline, steps_json, "
-        " is_active, hit_threshold_pct, max_chain_duration_hours, created_at) "
-        "VALUES (1, 'full_conviction', 'narrative', '[]', 1, 5.0, 48.0, ?)",
-        (now,),
+        "INSERT INTO chain_patterns (id, name, description, steps_json, "
+        " min_steps_to_trigger, conviction_boost, alert_priority, is_active) "
+        "VALUES (1, 'full_conviction', 'narrative full conviction', '[]', 1, 1, 'low', 1)",
     )
     await sd._conn.execute(
         "INSERT INTO chain_matches "
@@ -613,10 +611,9 @@ async def test_trade_chain_completions_falls_back_to_empty_when_no_snapshot(tmp_
         (now,),
     )
     await sd._conn.execute(
-        "INSERT INTO chain_patterns (id, name, pipeline, steps_json, "
-        " is_active, hit_threshold_pct, max_chain_duration_hours, created_at) "
-        "VALUES (2, 'full_conviction', 'narrative', '[]', 1, 5.0, 48.0, ?)",
-        (now,),
+        "INSERT INTO chain_patterns (id, name, description, steps_json, "
+        " min_steps_to_trigger, conviction_boost, alert_priority, is_active) "
+        "VALUES (2, 'full_conviction', 'narrative full conviction', '[]', 1, 1, 'low', 1)",
     )
     await sd._conn.execute(
         "INSERT INTO chain_matches "
