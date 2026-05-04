@@ -97,12 +97,18 @@ def _min_iso_ts(a: str, b: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# SF-M1 (PR #68 silent-failure-hunter): track signal_types that fell back
+# to defaults so the JSON + markdown surface this state. Without this,
+# baseline_total can be computed against the wrong baseline silently.
+_signal_params_fallback_seen: set[str] = set()
+
+
 def _load_signal_params(
     conn: sqlite3.Connection, signal_type: str
 ) -> dict:
     """M3 fix: load per-signal-type baseline from signal_params table.
     Falls back to settings defaults if signal_params missing or row absent.
-    Mirrors scout/trading/params.py:60-110 SignalParams shape (subset)."""
+    SF-M1 fix: track + warn on fallback so operator sees if defaults were used."""
     try:
         cur = conn.execute(
             "SELECT trail_pct, sl_pct, max_duration_hours "
@@ -120,8 +126,15 @@ def _load_signal_params(
         pass
     # Fallback: post-paper-lifecycle-widening defaults (memory
     # project_paper_lifecycle_widen_2026_04_27.md): max=168h, sl=25%,
-    # trail=20%. These are the global Settings defaults the system uses
-    # when SIGNAL_PARAMS_ENABLED=false or row missing.
+    # trail=20%.
+    if signal_type not in _signal_params_fallback_seen:
+        _signal_params_fallback_seen.add(signal_type)
+        print(
+            f"WARN: signal_params fallback for {signal_type!r} → defaults "
+            f"(trail=20, sl=25, max=168). Baseline simulation may diverge "
+            f"from production for this signal_type.",
+            file=sys.stderr,
+        )
     return {"trail_pct": 20.0, "sl_pct": 25.0, "max_duration_hours": 168}
 
 
@@ -154,6 +167,27 @@ _SIGNAL_SOURCES = [
 ]
 
 
+# SF-M2 fix: track signal sources that ARE genuinely missing (table-not-found)
+# vs sources that errored on schema drift / connectivity. Sources in
+# _signal_sources_missing are logged once at startup; sources NOT in the set
+# but still raising OperationalError re-raise to surface real bugs.
+_signal_sources_missing: set[str] = set()
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """SF-M2: probe table presence so we can narrow OperationalError handling
+    in _count_stacked_signals_in_window. Cached via _signal_sources_missing
+    on first call per table."""
+    try:
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        )
+        return cur.fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+
+
 def _count_stacked_signals_in_window(
     conn: sqlite3.Connection,
     token_id: str,
@@ -162,10 +196,38 @@ def _count_stacked_signals_in_window(
 ) -> tuple[int, list[str]]:
     """Count DISTINCT signal-source firings on token_id within the window.
     Each source contributes at most 1 to the stack count. BIO/LAB principle:
-    class diversity, not event volume."""
+    class diversity, not event volume.
+
+    SF-M2 fix (PR #68 silent-failure-hunter): per-table OperationalError
+    swallow now distinguishes missing-table (acceptable, logged once) from
+    schema-drift / runtime errors (re-raised). _signal_sources_missing
+    cached at module level."""
     sources: list[str] = []
-    for table, ts_col, label in _SIGNAL_SOURCES:
-        token_col = "token_id" if table == "chain_matches" else "coin_id"
+
+    sources_to_check = list(_SIGNAL_SOURCES) + [
+        ("predictions", "predicted_at", "narrative"),
+        ("velocity_alerts", "detected_at", "velocity"),
+        ("volume_spikes", "detected_at", "volume_spike"),
+        ("tg_social_signals", "created_at", "tg_social"),
+    ]
+    for table, ts_col, label in sources_to_check:
+        if table == "chain_matches":
+            token_col = "token_id"
+        elif table == "tg_social_signals":
+            token_col = "token_id"
+        else:
+            token_col = "coin_id"
+        if table in _signal_sources_missing:
+            continue
+        if not _table_exists(conn, table):
+            if table not in _signal_sources_missing:
+                _signal_sources_missing.add(table)
+                print(
+                    f"WARN: signal source {table!r} not found in DB; "
+                    f"stack count will not include {label!r} contributions.",
+                    file=sys.stderr,
+                )
+            continue
         try:
             cur = conn.execute(
                 f"""SELECT 1 FROM {table}
@@ -177,41 +239,29 @@ def _count_stacked_signals_in_window(
             )
             if cur.fetchone() is not None:
                 sources.append(label)
-        except sqlite3.OperationalError:
-            pass
+        except sqlite3.OperationalError as exc:
+            # SF-M2: schema drift / column rename — re-raise so operator
+            # sees the real bug instead of getting silent zero.
+            raise RuntimeError(
+                f"OperationalError on {table}.{ts_col} (column may have "
+                f"been renamed; backtest cannot silently continue): {exc}"
+            ) from exc
 
-    for table, ts_col, label, key_col in [
-        ("predictions", "predicted_at", "narrative", "coin_id"),
-        ("velocity_alerts", "detected_at", "velocity", "coin_id"),
-        ("volume_spikes", "detected_at", "volume_spike", "coin_id"),
-        ("tg_social_signals", "created_at", "tg_social", "token_id"),
-    ]:
+    if "paper_trades" not in _signal_sources_missing and _table_exists(conn, "paper_trades"):
         try:
             cur = conn.execute(
-                f"""SELECT 1 FROM {table}
-                    WHERE {key_col} = ?
-                      AND datetime({ts_col}) >= datetime(?)
-                      AND datetime({ts_col}) <= datetime(?)
-                    LIMIT 1""",
+                """SELECT DISTINCT signal_type FROM paper_trades
+                   WHERE token_id = ?
+                     AND datetime(opened_at) >= datetime(?)
+                     AND datetime(opened_at) <= datetime(?)""",
                 (token_id, opened_at, end_at),
             )
-            if cur.fetchone() is not None:
-                sources.append(label)
-        except sqlite3.OperationalError:
-            pass
-
-    try:
-        cur = conn.execute(
-            """SELECT DISTINCT signal_type FROM paper_trades
-               WHERE token_id = ?
-                 AND datetime(opened_at) >= datetime(?)
-                 AND datetime(opened_at) <= datetime(?)""",
-            (token_id, opened_at, end_at),
-        )
-        for r in cur.fetchall():
-            sources.append(f"trade:{r[0]}")
-    except sqlite3.OperationalError:
-        pass
+            for r in cur.fetchall():
+                sources.append(f"trade:{r[0]}")
+        except sqlite3.OperationalError as exc:
+            raise RuntimeError(
+                f"OperationalError on paper_trades stack scan: {exc}"
+            ) from exc
 
     return len(sources), sources
 
@@ -257,39 +307,63 @@ def _reconstruct_price_path(
     end: str,
 ) -> list[tuple[str, float]]:
     """Reconstruct (timestamp, price) chronologically from snapshot tables.
-    UNION over 5 sources, prices > 0, within [start, end]."""
+    UNION over 5 sources, prices > 0, within [start, end].
+
+    SF-M3 fix (PR #68 silent-failure-hunter): same narrowing as SF-M2 —
+    table-missing (cached via _signal_sources_missing) is acceptable;
+    schema-drift OperationalError re-raises to surface real bugs.
+    Sort uses _parse_iso for mixed-format timestamps."""
     rows: list[tuple[str, float]] = []
     queries = [
-        ("SELECT snapshot_at, price_at_snapshot FROM gainers_snapshots "
+        ("gainers_snapshots",
+         "SELECT snapshot_at, price_at_snapshot FROM gainers_snapshots "
          "WHERE coin_id = ? AND price_at_snapshot > 0 "
          "AND datetime(snapshot_at) >= datetime(?) "
          "AND datetime(snapshot_at) <= datetime(?)"),
-        ("SELECT snapshot_at, price_at_snapshot FROM losers_snapshots "
+        ("losers_snapshots",
+         "SELECT snapshot_at, price_at_snapshot FROM losers_snapshots "
          "WHERE coin_id = ? AND price_at_snapshot > 0 "
          "AND datetime(snapshot_at) >= datetime(?) "
          "AND datetime(snapshot_at) <= datetime(?)"),
-        ("SELECT snapshot_at, price_at_snapshot FROM trending_snapshots "
+        ("trending_snapshots",
+         "SELECT snapshot_at, price_at_snapshot FROM trending_snapshots "
          "WHERE coin_id = ? AND price_at_snapshot > 0 "
          "AND datetime(snapshot_at) >= datetime(?) "
          "AND datetime(snapshot_at) <= datetime(?)"),
-        ("SELECT recorded_at, price FROM volume_history_cg "
+        ("volume_history_cg",
+         "SELECT recorded_at, price FROM volume_history_cg "
          "WHERE coin_id = ? AND price > 0 "
          "AND datetime(recorded_at) >= datetime(?) "
          "AND datetime(recorded_at) <= datetime(?)"),
-        ("SELECT detected_at, price FROM volume_spikes "
+        ("volume_spikes",
+         "SELECT detected_at, price FROM volume_spikes "
          "WHERE coin_id = ? AND price > 0 "
          "AND datetime(detected_at) >= datetime(?) "
          "AND datetime(detected_at) <= datetime(?)"),
     ]
-    for q in queries:
+    for table, q in queries:
+        if table in _signal_sources_missing:
+            continue
+        if not _table_exists(conn, table):
+            if table not in _signal_sources_missing:
+                _signal_sources_missing.add(table)
+                print(
+                    f"WARN: price-path source {table!r} not found in DB; "
+                    f"path may be sparse for some tokens.",
+                    file=sys.stderr,
+                )
+            continue
         try:
             cur = conn.execute(q, (coin_id, start, end))
             for ts, price in cur.fetchall():
                 if ts and price and price > 0:
                     rows.append((ts, float(price)))
-        except sqlite3.OperationalError:
-            pass
-    rows.sort(key=lambda r: r[0])
+        except sqlite3.OperationalError as exc:
+            raise RuntimeError(
+                f"OperationalError on price-path source {table!r} "
+                f"(column may have been renamed): {exc}"
+            ) from exc
+    rows.sort(key=lambda r: _parse_iso(r[0]))  # CR-M2: parsed-datetime sort
     return rows
 
 
@@ -314,6 +388,19 @@ def _simulate_conviction_locked_exit(
         return {
             "exit_price": entry_price, "exit_reason": "no_data",
             "hold_hours": 0.0, "peak_pct": 0.0, "pnl_pct": 0.0,
+            "moonshot_armed": False,
+        }
+    # SF-S3 fix: 1-2 sample paths can't drive a meaningful exit decision —
+    # peak never gets a chance to develop, trail never arms. Distinct from
+    # "no_data" so operator can filter / debug separately.
+    if len(price_path) <= 2:
+        last_ts, last_price = price_path[-1]
+        open_dt_chk = _parse_iso(opened_at)
+        last_hours = (_parse_iso(last_ts) - open_dt_chk).total_seconds() / 3600.0
+        return {
+            "exit_price": last_price, "exit_reason": "insufficient_path",
+            "hold_hours": last_hours, "peak_pct": 0.0,
+            "pnl_pct": (last_price - entry_price) / entry_price * 100.0,
             "moonshot_armed": False,
         }
     open_dt = _parse_iso(opened_at)
@@ -375,7 +462,7 @@ def _simulate_conviction_locked_exit(
     last_ts, last_price = price_path[-1]
     last_hours = (_parse_iso(last_ts) - open_dt).total_seconds() / 3600.0
     return {
-        "exit_price": last_price, "exit_reason": "held_to_end",
+        "exit_price": last_price, "exit_reason": "held_to_window_end",
         "hold_hours": last_hours, "peak_pct": peak_pct,
         "pnl_pct": (last_price - entry_price) / entry_price * 100.0,
         "moonshot_armed": moonshot_armed,
@@ -400,11 +487,18 @@ def section_a(conn: sqlite3.Connection, *, as_of: str, days: int = 30) -> dict:
         (as_of, as_of),
     )
     trades = cur.fetchall()
+    as_of_dt_a = _parse_iso(as_of)
     by_stack: dict[int, list[sqlite3.Row]] = defaultdict(list)
     for t in trades:
-        end_at = t["closed_at"] or as_of
+        # CR-SF1 fix: Section A used closed_at, Section B uses opened+504h.
+        # Operator confusion if histograms disagree. Align Section A to the
+        # same M1 max-bucket window so distributions match.
+        end_at_dt = min(
+            _parse_iso(t["opened_at"]) + timedelta(hours=MAX_LOCKED_HOURS),
+            as_of_dt_a,
+        )
         n, _ = _count_stacked_signals_in_window(
-            conn, t["token_id"], t["opened_at"], end_at,
+            conn, t["token_id"], t["opened_at"], end_at_dt.isoformat(),
         )
         by_stack[n].append(t)
 
@@ -687,7 +781,12 @@ def section_b2_first_entry_hold(
             conn, token_id,
             start=first["opened_at"], end=sim_end_dt.isoformat(),
         )
-        # MF3: append price_cache anchor at as_of
+        # MF3: append price_cache anchor at as_of.
+        # CR-M2 fix: sort by parsed datetime (not lex) — mixed-format
+        # timestamps (space vs T separator) sort incorrectly under lex.
+        # SF-S8 fix: only append if as_of is at/after path's last sample;
+        # otherwise the anchor would slot into the middle and the simulator
+        # would fire exits prematurely against the "current" price.
         try:
             cur_pc = conn.execute(
                 "SELECT current_price FROM price_cache WHERE coin_id = ?",
@@ -695,8 +794,12 @@ def section_b2_first_entry_hold(
             )
             pc_row = cur_pc.fetchone()
             if pc_row and pc_row[0] and pc_row[0] > 0:
-                path = list(path) + [(as_of, float(pc_row[0]))]
-                path.sort(key=lambda r: r[0])
+                path_list = list(path)
+                # SF-S8: skip anchor when as_of is before path tail (e.g.,
+                # operator passed historical --as-of for replay).
+                if not path_list or _parse_iso(as_of) >= _parse_iso(path_list[-1][0]):
+                    path_list.append((as_of, float(pc_row[0])))
+                path = sorted(path_list, key=lambda r: _parse_iso(r[0]))
         except sqlite3.OperationalError:
             pass
         density = _path_density_score(
@@ -771,8 +874,9 @@ def section_c(conn: sqlite3.Connection, *, as_of: str) -> dict:
                 _parse_iso(t["opened_at"]) + timedelta(hours=MAX_LOCKED_HOURS),
                 as_of_dt,
             )
+            # token_id is the outer loop variable; the SELECT didn't include it
             n, _ = _count_stacked_signals_in_window(
-                conn, t["token_id"], t["opened_at"], stack_end_dt.isoformat(),
+                conn, token_id, t["opened_at"], stack_end_dt.isoformat(),
             )
             # N2 fix: use _load_signal_params not hardcoded
             base_params = _load_signal_params(conn, t["signal_type"])
@@ -879,12 +983,18 @@ def section_d(
 
 
 def _resolve_as_of(arg: str | None, conn: sqlite3.Connection) -> tuple[str, bool]:
-    """Returns (as_of, was_default). Default is current DB time."""
+    """Returns (as_of, was_default). Default is current DB time.
+
+    CR-M1 fix: SQLite's `datetime('now')` returns "YYYY-MM-DD HH:MM:SS"
+    (space separator). Concatenating "+00:00" gives a non-ISO-8601 string
+    that some downstream callers (lex sort, third-party parsers) handle
+    incorrectly. Normalize at source by replacing space with T."""
     if arg:
         _parse_iso(arg)  # validate parseable
         return arg, False
     cur = conn.execute("SELECT datetime('now')")
-    return cur.fetchone()[0] + "+00:00", True
+    raw = cur.fetchone()[0]
+    return raw.replace(" ", "T") + "+00:00", True
 
 
 def _emit_findings_markdown(results: dict, out_path: Path) -> None:
@@ -910,6 +1020,27 @@ def _emit_findings_markdown(results: dict, out_path: Path) -> None:
         "reproducible findings.\n"
         if results.get("as_of_was_default") else ""
     )
+    # SF-S4 fix: preserve operator edits to §2 and §5 across re-runs.
+    # If existing file has been edited (placeholder text gone), splice
+    # those sections back into the new content.
+    preserved_sections: dict[str, str] = {}
+    if out_path.exists():
+        existing = out_path.read_text(encoding="utf-8")
+        for header in ("## §2 — Decision (operator-edited)",
+                       "## §5 — Open design questions"):
+            idx = existing.find(header)
+            if idx == -1:
+                continue
+            # Find next ## or end-of-file
+            next_idx = existing.find("\n## ", idx + 1)
+            if next_idx == -1:
+                next_idx = existing.find("\n---", idx + 1)
+            if next_idx == -1:
+                next_idx = len(existing)
+            block = existing[idx:next_idx]
+            if "[FILL IN" not in block:  # operator has edited
+                preserved_sections[header] = block
+
     md = f"""# BL-067 Backtest Findings
 
 **As-of:** `{results.get("as_of", "?")}`
@@ -981,6 +1112,18 @@ chain_completed orphan rate affect the comparison?]
 
 Generated by `scripts/backtest_conviction_lock.py` — do not edit §1.
 """
+    # SF-S4: splice preserved operator edits back in
+    for header, block in preserved_sections.items():
+        # Find the placeholder block in the new md (template starts with header)
+        idx = md.find(header)
+        if idx == -1:
+            continue
+        next_idx = md.find("\n## ", idx + 1)
+        if next_idx == -1:
+            next_idx = md.find("\n---", idx + 1)
+        if next_idx == -1:
+            next_idx = len(md)
+        md = md[:idx] + block + md[next_idx:]
     out_path.write_text(md, encoding="utf-8")
 
 
@@ -995,8 +1138,9 @@ if __name__ == "__main__":
         help="ISO-8601 snapshot timestamp; default datetime('now')",
     )
     parser.add_argument(
-        "--days", type=int, default=30,
-        help="Lookback window in days (default 30)",
+        "--days", type=int, default=30, choices=range(1, 91),
+        metavar="[1-90]",
+        help="Lookback window in days (default 30, max 90 — SF-S5 cap)",
     )
     args = parser.parse_args()
     conn = _conn(args.db)
@@ -1017,6 +1161,10 @@ if __name__ == "__main__":
     results.update(section_b2_first_entry_hold(conn, as_of=as_of, days=args.days))
     results.update(section_c(conn, as_of=as_of))
     results.update(section_d(conn, as_of=as_of, days=args.days))
+    # SF-M1 surface: list signal_types that fell back to defaults so the
+    # operator can see if Tier 1a baseline was actually loaded.
+    results["signal_params_fallback_signal_types"] = sorted(_signal_params_fallback_seen)
+    results["signal_sources_missing"] = sorted(_signal_sources_missing)
     json_path = Path("tasks/findings_bl067_backtest_conviction_lock.json")
     json_path.parent.mkdir(parents=True, exist_ok=True)
     with json_path.open("w", encoding="utf-8") as f:

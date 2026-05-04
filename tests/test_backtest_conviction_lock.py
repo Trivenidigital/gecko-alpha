@@ -21,7 +21,8 @@ def db(tmp_path):
         CREATE TABLE paper_trades (
             id INTEGER PRIMARY KEY,
             token_id TEXT, signal_type TEXT, signal_data TEXT,
-            entry_price REAL, amount_usd REAL, quantity REAL,
+            entry_price REAL, exit_price REAL,
+            amount_usd REAL, quantity REAL,
             tp_pct REAL, sl_pct REAL, tp_price REAL, sl_price REAL,
             status TEXT, opened_at TEXT, closed_at TEXT,
             pnl_usd REAL, pnl_pct REAL, peak_pct REAL, peak_price REAL,
@@ -342,11 +343,131 @@ def test_min_iso_ts_handles_mixed_formats():
 
 def test_resolve_as_of_flags_default(db):
     """ASF2: default usage flagged for non-reproducibility warning."""
-    from backtest_conviction_lock import _resolve_as_of
+    from backtest_conviction_lock import _resolve_as_of, _parse_iso
     as_of, was_default = _resolve_as_of(None, db)
     assert was_default is True
     assert as_of  # non-empty
+    # CR-M1 fix: as_of must be parseable ISO-8601
+    parsed = _parse_iso(as_of)
+    assert parsed is not None
+    # Pin the T-separator (CR-M1 requirement)
+    assert "T" in as_of, f"as_of must use T separator; got {as_of!r}"
 
     as_of2, was_default2 = _resolve_as_of("2026-05-04T12:00:00+00:00", db)
     assert was_default2 is False
     assert as_of2 == "2026-05-04T12:00:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# PR-review additions (test-analyzer S1-S4)
+# ---------------------------------------------------------------------------
+
+
+def test_count_stacked_signals_includes_post_close_window(db):
+    """test-analyzer S1: M1 fix pin — signal firing AFTER closed_at but
+    within opened_at+504h MUST count toward stack. Without this test,
+    refactoring stack_window_end_dt back to closed_at would silently
+    regress the entire backtest premise."""
+    from backtest_conviction_lock import _count_stacked_signals_in_window
+    db.executescript("""
+        INSERT INTO gainers_snapshots VALUES
+          ('post', 'P', 'Post', 1.0, 1e6, 5.0, '2026-05-03T10:00:00+00:00');
+    """)
+    db.commit()
+    # Trade lifetime would have been 05-01 → 05-02; signal fires AFTER that
+    # but within the 504h max-bucket window. M1 fix counts it.
+    n, sources = _count_stacked_signals_in_window(
+        db, "post",
+        "2026-05-01T00:00:00+00:00", "2026-05-22T00:00:00+00:00",
+    )
+    assert n == 1
+    assert "gainers" in sources
+
+
+def test_load_signal_params_handles_missing_table(tmp_path):
+    """test-analyzer S3: F13 — fresh DB without signal_params table
+    falls back to defaults without raising."""
+    import sqlite3
+    from backtest_conviction_lock import _load_signal_params
+    conn = sqlite3.connect(":memory:")
+    p = _load_signal_params(conn, "anything")
+    assert p == {"trail_pct": 20.0, "sl_pct": 25.0, "max_duration_hours": 168}
+
+
+def test_simulate_exit_no_data_when_path_empty():
+    """test-analyzer S4: empty path → no_data exit_reason."""
+    from backtest_conviction_lock import _simulate_conviction_locked_exit
+    r = _simulate_conviction_locked_exit(
+        entry_price=1.0, opened_at="2026-05-01T00:00:00+00:00",
+        params={"max_duration_hours": 168, "trail_pct": 20, "sl_pct": 20},
+        price_path=[],
+    )
+    assert r["exit_reason"] == "no_data"
+    assert r["pnl_pct"] == 0.0
+
+
+def test_simulate_exit_insufficient_path_at_two_samples():
+    """SF-S3 pin: 1-2 sample paths return insufficient_path (peak never
+    develops, trail never arms — distinct from no_data + held_to_window_end)."""
+    from backtest_conviction_lock import _simulate_conviction_locked_exit
+    path = [
+        ("2026-05-01T01:00:00+00:00", 1.05),
+        ("2026-05-01T02:00:00+00:00", 1.10),
+    ]
+    r = _simulate_conviction_locked_exit(
+        entry_price=1.0, opened_at="2026-05-01T00:00:00+00:00",
+        params={"max_duration_hours": 168, "trail_pct": 20, "sl_pct": 20},
+        price_path=path,
+    )
+    assert r["exit_reason"] == "insufficient_path"
+    assert r["pnl_pct"] == pytest.approx(10.0, abs=0.5)
+
+
+@pytest.mark.asyncio
+async def test_smoke_main_runs_against_minimal_db(db, tmp_path, monkeypatch):
+    """test-analyzer S2: smoke — build a minimal DB, run all 4 sections
+    + emit findings, no crash. Exercises Section B compound gate, B2
+    first-entry path, D 7d rolling, and _emit_findings_markdown."""
+    import backtest_conviction_lock as m
+    db.execute(
+        "INSERT INTO paper_trades (id, token_id, signal_type, status, "
+        "opened_at, closed_at, entry_price, pnl_usd, pnl_pct, peak_pct, "
+        "exit_reason) VALUES (1, 'bio-protocol', 'gainers_early', "
+        "'closed_trail', '2026-05-01T00:00:00+00:00', "
+        "'2026-05-02T00:00:00+00:00', 1.0, 12.5, 4.2, 8.0, 'trailing_stop')"
+    )
+    db.commit()
+    as_of = "2026-05-04T00:00:00+00:00"
+    results = {"as_of": as_of, "days": 7, "as_of_was_default": False}
+    results.update(m.section_a(db, as_of=as_of, days=7))
+    results.update(m.section_b(db, as_of=as_of, days=7))
+    results.update(m.section_b2_first_entry_hold(db, as_of=as_of, days=7))
+    results.update(m.section_c(db, as_of=as_of))
+    results.update(m.section_d(db, as_of=as_of, days=7))
+    md_path = tmp_path / "out.md"
+    m._emit_findings_markdown(results, md_path)
+    assert md_path.exists()
+    content = md_path.read_text(encoding="utf-8")
+    assert content.startswith("# BL-067")
+    # Either threshold gate must produce PASS or FAIL (compound gate fired)
+    assert "PASS" in content or "FAIL" in content
+
+
+def test_simulate_exit_held_to_window_end_naming():
+    """SF-S2: rename held_to_end → held_to_window_end to disambiguate
+    from production exit_reason classes."""
+    from backtest_conviction_lock import _simulate_conviction_locked_exit
+    # Path with 3 samples that don't trigger SL/trail/expired/peak-fade
+    path = [
+        ("2026-05-01T01:00:00+00:00", 1.02),
+        ("2026-05-01T02:00:00+00:00", 1.03),
+        ("2026-05-01T03:00:00+00:00", 1.04),
+    ]
+    r = _simulate_conviction_locked_exit(
+        entry_price=1.0, opened_at="2026-05-01T00:00:00+00:00",
+        params={"max_duration_hours": 168, "trail_pct": 20, "sl_pct": 20},
+        price_path=path,
+    )
+    assert r["exit_reason"] == "held_to_window_end", (
+        f"expected held_to_window_end (SF-S2 naming); got {r['exit_reason']!r}"
+    )
