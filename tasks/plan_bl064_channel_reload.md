@@ -2,7 +2,31 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans.
 
-**New primitives introduced:** new periodic background task `_channel_reload_heartbeat` in `scout/social/telegram/listener.py:_run_listener_body` (sibling of existing `_silence_heartbeat` at lines 1095-1111); new `_track_task` lifecycle entry for the new task (cancel on listener exit); new structured log events `tg_social_channel_list_reloaded` (fired when added/removed sets non-empty), `tg_social_channel_reload_disabled` (fired ONCE at task spawn when `TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC=0`), `tg_social_channel_reload_error` (catch-all error path matching silence-heartbeat shape); reuse of existing `Settings.TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC: int = 300` (already validated at `scout/config.py:304`+`:681-686` per drift research). NO new DB tables, columns, settings, or migrations. NO new dependencies.
+**v2 changes from 2-agent plan-review (adversarial `a6e37f55` + architecture `aeca09e0`):**
+
+*MUST-FIX (4):*
+- **adv-M1 / arch-A1 — validator at `config.py:684` REJECTS 0:** v1 disable-path crashes pipeline at startup (`if v < 60: raise`). v2: amend validator to `if v != 0 and v < 60` so 0 is the explicit opt-out (1-line change).
+- **adv-M2 — `nonlocal channels` commentary misleading:** Telethon stores `chats` list at `NewMessage(chats=...)` construction time, NOT by-reference to the Python variable. The remove+rebind IS the mechanism. v2 corrects prose; `nonlocal` only threads new list into next reload cycle's `in_memory` argument.
+- **adv-M3 / arch-A2 — T4 + T5 stubs/contradictions:** T4 was `pass`; T5 had `pytest.fail` contradicting the heartbeat-catches-errors contract. v2 rewrites both as real tests calling `_channel_reload_heartbeat` directly with a one-tick driver.
+- **arch-S2 — handler swap can leave listener handler-less if `client.on(...)` raises after `remove_event_handler`:** v2 wraps swap in try/except — re-attach OLD handler on swap-failure + re-raise so heartbeat catches.
+
+*SHOULD-FIX (3):*
+- **adv-S1 — Telethon "buffers in-flight events" claim unverified:** removed from F2. Atomic-swap claim still holds (no `await` between calls).
+- **adv-S2 — `_make_mock_client` identity vs equality:** `is`-based mock vs `==`-based real Telethon `cb == callback`. For named functions/lambdas, behavior is identical. Documented.
+- **arch-S1 — T5 contract clarification:** `_channel_reload_once` propagates errors; `_channel_reload_heartbeat` catches via try/except. T5 verifies heartbeat-level catch.
+
+*NIT (3 applied):*
+- **adv-N1 — F1 (safety_required) was incorrect:** drift research confirms `_channel_safety_required` reads `tg_social_channels.safety_required` per message via live SQL. No in-memory cache. F1 removed from failure-modes.
+- **arch-D1 — `nonlocal channels`:** v2 picks `nonlocal channels` + reassignment; removes conflicting "mutate the in-memory channels list" prose.
+- **arch-D4 — Telethon lazy entity resolution:** added §5 runbook note: "After adding a new channel, send a test message from that channel within 5 minutes to verify routing."
+
+*DEFERRED:*
+- arch-D2 (BackgroundTaskManager): not warranted at 2 tasks; refactor trigger when 3rd task with restart-on-failure semantics is added.
+- arch-D3 (TelegramClientProtocol typing): nice-to-have follow-up; explicit Protocol would tighten the mock contract but isn't blocking.
+
+---
+
+**New primitives introduced:** new periodic background task `_channel_reload_heartbeat` in `scout/social/telegram/listener.py:_run_listener_body` (sibling of existing `_silence_heartbeat` at lines 1095-1111); new `_track_task` lifecycle entry for the new task (cancel on listener exit); new structured log events `tg_social_channel_list_reloaded` (fired when added/removed sets non-empty), `tg_social_channel_reload_disabled` (fired ONCE at task spawn when `TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC=0`), `tg_social_channel_reload_error` (catch-all error path matching silence-heartbeat shape), `tg_social_channel_reload_swap_failed` (PR-review arch-S2: handler-swap rollback path); reuse of existing `Settings.TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC: int = 300` with v2-amended validator at `scout/config.py:684` (`v != 0 and v < 60` — 0 is explicit opt-out per adv-M1). NO new DB tables, columns, settings, or migrations. NO new dependencies.
 
 ---
 
