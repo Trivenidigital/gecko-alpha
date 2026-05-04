@@ -66,7 +66,26 @@ The user asked "why isn't the agent self-learning". My response (deferred decisi
 
 This is NOT ML — just data-driven static rules with self-resetting parameters. Real ML (outcome model, RL exit timing) gated on ≥1000 trades/signal stable for 30d (not yet).
 
-**User has not approved scope yet.** Resume by asking.
+**~~User has not approved scope yet. Resume by asking.~~ CLOSED 2026-05-04 — already shipped.**
+
+Drift research 2026-05-04 confirmed every component is in tree and operating in production:
+
+- ✅ `signal_params` table + `signal_params_audit` (`scout/db.py:1578-1679`)
+- ✅ `SignalParams` dataclass + `get_params` + cache (`scout/trading/params.py`)
+- ✅ `SIGNAL_PARAMS_ENABLED=true` on prod
+- ✅ **`scout/trading/calibrate.py`** (557 lines) — `--apply` / `--dry-run` / `--since-deploy` / `--force-no-alert`
+- ✅ **`scout/trading/auto_suspend.py`** (268 lines) — hard_loss + pnl_threshold triggers
+- ✅ Auto-suspend wired in `_run_feedback_schedulers` at `scout/main.py:163-170`
+- ✅ Dashboard endpoint at `dashboard/api.py:953`
+- ✅ Plan/design at `tasks/plan_tier_1a_1b.md` (544 lines, 5-reviewer signed off)
+
+**Production evidence Tier 1b is firing daily** (3 audit rows by `applied_by='auto_suspend'`):
+- 2026-05-02T01:00:18Z — first_signal + losers_contrarian (hard_loss)
+- 2026-05-04T01:01:02Z — gainers_early (hard_loss)
+
+**Real residual gaps (small, NOT blocking):**
+- Calibrator never run in production (0 audit rows with `applied_by='calibration'`); operator-manual-by-design. Optional follow-up: weekly cron `--dry-run` + Telegram diff alert (no auto-apply).
+- BL-067 opt-in 2026-05-04T15:31Z flipped `conviction_lock_enabled=1` for first_signal + gainers_early, both currently `enabled=0` (auto-suspended). Lock works on existing open trades only. Strategy decision pending: re-enable for new entries, or stay suspended-with-locked-existing.
 
 ### 2. Watchlist for next strategy-tuning re-check
 
