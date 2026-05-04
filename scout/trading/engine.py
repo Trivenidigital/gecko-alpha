@@ -122,6 +122,39 @@ class TradingEngine:
         if signal_data is None:
             signal_data = {}
 
+        # BL-076: defense-in-depth visibility for empty symbol+name.
+        # Bug 2 (operator audit 2026-05-04) showed ~150+ paper trades had
+        # empty symbol+name because 3 dispatchers (volume_spike,
+        # narrative_prediction, chain_completed) didn't pass them. The
+        # symbol_name population is fixed in scout/trading/signals.py;
+        # this guard surfaces any FUTURE caller drift. Placement BEFORE
+        # warmup gate is load-bearing — warmup short-circuits return None
+        # so a placement after gate would silently swallow the warning
+        # during the warmup window.
+        #
+        # Two events emitted:
+        # - WARNING: human-readable journalctl visibility
+        # - INFO trade_metadata_empty: lands in same telemetry pipeline
+        #   that aggregates signal_skipped_* events. Future BL-077 (after
+        #   14d clean soak) flips warning+proceed to log+return-None
+        #   using SAME event name (trade_skipped_empty_metadata) — purely
+        #   additive change at that point.
+        if not symbol and not name:
+            log.warning(
+                "open_trade_called_with_empty_symbol_and_name",
+                token_id=token_id,
+                signal_type=signal_type,
+                signal_combo=signal_combo,
+                hint="dispatcher likely missing symbol=... + name=... kwargs",
+            )
+            log.info(
+                "trade_metadata_empty",
+                reason="empty_metadata",
+                token_id=token_id,
+                signal_type=signal_type,
+                signal_combo=signal_combo,
+            )
+
         conn = self.db._conn
         if conn is None:
             raise RuntimeError("Database not initialized.")

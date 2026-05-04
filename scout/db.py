@@ -84,6 +84,90 @@ class Database:
             self._conn = None
 
     # ------------------------------------------------------------------
+    # BL-076: shared metadata resolver
+    # ------------------------------------------------------------------
+
+    async def lookup_symbol_name_by_coin_id(
+        self, coin_id: str | None
+    ) -> tuple[str, str]:
+        """BL-076: pure metadata lookup. Returns (symbol, name) for a
+        CoinGecko coin_id, resolving via 3 sequential prioritized SELECTs.
+
+        chain_matches table carries no symbol/name. This helper bridges
+        that gap by querying snapshot tables that DO have it (all keyed
+        by coin_id). Lives on Database (not signals.py) so future callers
+        (dashboard, backfill scripts) reuse the resolver instead of
+        reimplementing the JOIN.
+
+        Lookup order (gainers_snapshots is the most authoritative source,
+        populated from CoinGecko's /coins/markets endpoint):
+          1. gainers_snapshots (canonical CoinGecko metadata)
+          2. volume_history_cg (CoinGecko volume telemetry)
+          3. volume_spikes (DexScreener-side spikes)
+
+        Each SELECT in its own ``except aiosqlite.OperationalError``:
+        a column rename or table lock in any one table fails ONLY that
+        lookup; the next table still works. Other exception types
+        (programming errors, etc.) propagate. Returns ("", "") if nothing
+        found — caller decides whether to log + still proceed.
+
+        Refactor triggers:
+        - Add a 4th source OR source priority becomes dynamic per-chain →
+          refactor to MetadataSource plugin pattern.
+        - Cardinality exceeds ~500/cycle → refactor to UNION ALL with
+          per-table OperationalError fallback for happy-path single
+          round-trip.
+        """
+        # F16 mitigation: defensive None/empty coin_id guard.
+        if not coin_id:
+            return "", ""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        # 1. gainers_snapshots — primary source (canonical CoinGecko)
+        try:
+            cur = await self._conn.execute(
+                "SELECT symbol, name FROM gainers_snapshots "
+                "WHERE coin_id = ? AND symbol IS NOT NULL AND name IS NOT NULL "
+                "ORDER BY snapshot_at DESC LIMIT 1",
+                (coin_id,),
+            )
+            row = await cur.fetchone()
+            if row and row[0] and row[1]:
+                return row[0], row[1]
+        except aiosqlite.OperationalError:
+            # F3 (schema drift) + F17 (table locked) — fall through.
+            # Other exceptions (e.g. ProgrammingError from a logic bug)
+            # propagate per A11.
+            pass
+        # 2. volume_history_cg — fallback
+        try:
+            cur = await self._conn.execute(
+                "SELECT symbol, name FROM volume_history_cg "
+                "WHERE coin_id = ? AND symbol IS NOT NULL AND name IS NOT NULL "
+                "ORDER BY recorded_at DESC LIMIT 1",
+                (coin_id,),
+            )
+            row = await cur.fetchone()
+            if row and row[0] and row[1]:
+                return row[0], row[1]
+        except aiosqlite.OperationalError:
+            pass
+        # 3. volume_spikes — last resort
+        try:
+            cur = await self._conn.execute(
+                "SELECT symbol, name FROM volume_spikes "
+                "WHERE coin_id = ? AND symbol IS NOT NULL AND name IS NOT NULL "
+                "ORDER BY detected_at DESC LIMIT 1",
+                (coin_id,),
+            )
+            row = await cur.fetchone()
+            if row and row[0] and row[1]:
+                return row[0], row[1]
+        except aiosqlite.OperationalError:
+            pass
+        return "", ""
+
+    # ------------------------------------------------------------------
     # Schema
     # ------------------------------------------------------------------
 

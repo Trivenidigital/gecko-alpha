@@ -52,6 +52,8 @@ async def trade_volume_spikes(
                 continue
             await engine.open_trade(
                 token_id=spike.coin_id,
+                symbol=spike.symbol,  # BL-076 Bug 2 fix
+                name=spike.name,  # BL-076 Bug 2 fix
                 chain="coingecko",
                 signal_type="volume_spike",
                 signal_data={"spike_ratio": spike.spike_ratio},
@@ -570,6 +572,17 @@ _JUNK_COINID_PREFIXES = (
     "bridged-",
     "wrapped-",
     "superbridge-",
+    # BL-076: CoinGecko placeholder coins (test-1, test-2, ..., test-3)
+    # have real price feeds and triggered paper trades #980 (first_signal,
+    # closed -$9.96) and #1551 (volume_spike, closed +$188.91 by lucky
+    # pump). Anchored at slug start (startswith) — false positives like
+    # "protest-coin", "biggest-token", "pretest" are NOT rejected (T1b
+    # pins this). Trade-off: legit testnet-themed tokens like
+    # "test-net-token" WOULD be rejected — accepted risk; operator can
+    # grep signal_skipped_junk events to spot losses. If the prefix tuple
+    # exceeds ~10 entries OR a regex/substring requirement appears,
+    # refactor to settings-backed PAPER_JUNK_COINID_PREFIXES.
+    "test-",
 )
 
 
@@ -740,6 +753,8 @@ async def trade_predictions(
             pred_price = pr[0] if pr else None
             await engine.open_trade(
                 token_id=pred.coin_id,
+                symbol=pred.symbol,  # BL-076 Bug 2 fix
+                name=pred.name,  # BL-076 Bug 2 fix
                 chain="coingecko",
                 signal_type="narrative_prediction",
                 signal_data={
@@ -811,8 +826,25 @@ async def trade_chain_completions(engine, db: Database, *, settings) -> None:
                 )
                 price_row = await pc.fetchone()
                 chain_price = price_row[0] if price_row else None
+                # BL-076: chain_matches has no symbol/name — resolve via
+                # Database.lookup_symbol_name_by_coin_id (sequential lookup
+                # gainers_snapshots → volume_history_cg → volume_spikes).
+                # Returns ("", "") for orphan coins; log a warning so
+                # operator sees the gap rate. open_trade still fires —
+                # the trade is real, we just lack metadata.
+                ct_symbol, ct_name = await db.lookup_symbol_name_by_coin_id(
+                    c["token_id"]
+                )
+                if not ct_symbol and not ct_name:
+                    logger.warning(
+                        "chain_completed_no_metadata",
+                        coin_id=c["token_id"],
+                        hint="no row in gainers_snapshots/volume_history_cg/volume_spikes",
+                    )
                 await engine.open_trade(
                     token_id=c["token_id"],
+                    symbol=ct_symbol,
+                    name=ct_name,
                     chain="coingecko",
                     signal_type="chain_completed",
                     signal_data={
