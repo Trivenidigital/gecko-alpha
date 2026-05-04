@@ -2,9 +2,31 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**New primitives introduced:** add `"test-"` to `_JUNK_COINID_PREFIXES` in `scout/trading/signals.py:569`; add empty-string check on `symbol` and `name` to engine-level guard in `scout/trading/engine.py:open_trade` (reject when both are empty after BL-076 dispatcher patches land — defense in depth, fails loud not silent); modify call sites in `trade_volume_spikes` (line 53) + `trade_predictions` (line 741) + `trade_chain_completions` (line 814) to populate `symbol` + `name` parameters; new `dashboard/db.py` query NOT introduced (existing surfaces use the corrected fields directly). NO new DB tables, columns, or settings.
+**New primitives introduced:** add `"test-"` to `_JUNK_COINID_PREFIXES` in `scout/trading/signals.py:569`; new method `Database.lookup_symbol_name_by_coin_id(coin_id) -> tuple[str, str]` in `scout/db.py` (per architecture-review #2 — pure metadata read, belongs on Database not signals.py module); add WARNING log in `scout/trading/engine.py:open_trade` when called with both `symbol=""` and `name=""` (defense-in-depth visibility, NOT a hard reject — soak-then-escalate criterion documented below); modify call sites in `trade_volume_spikes` (line 53) + `trade_predictions` (line 741) + `trade_chain_completions` (line 814) to populate `symbol` + `name` parameters. NO new DB tables, columns, or settings.
 
 **Prerequisites:** master ≥ `64a8e35` (BL-066' deployed + backlog hygiene merged).
+
+**v2 changes from 2-agent plan-review feedback:**
+
+*MUST-FIX (consensus blockers):*
+- **M1 (a09b333 + aff3517 #6) — structlog `caplog` won't capture:** project uses `structlog.PrintLoggerFactory()` (verified `scout/main.py:911`); `caplog` reads stdlib logging only. Tasks 2 + 5b tests rewritten to use `structlog.testing.capture_logs()` context manager + assert exact `event` field (not substring match).
+- **M2 (a09b333) — engine WARNING placement:** verify it fires before `trade_skipped_no_price` short-circuit at engine.py:170-177. WARNING goes immediately AFTER `if signal_data is None: signal_data = {}` and BEFORE the warmup gate so it always fires regardless of downstream gates.
+- **M3 (a09b333) — T5 INSERT violates `chain_matches` NOT NULL:** schema (verified `scout/db.py:332-348`) requires `steps_matched`, `total_steps`, `anchor_time`, `chain_duration_hours`, `conviction_boost` — all NOT NULL. Plan v1 omitted 4 of 5; v2 INSERTs include all required columns.
+- **A1 (aff3517) — UNION fragile across schema drift:** replaced single UNION ALL with **3 sequential prioritized SELECTs** (gainers_snapshots → volume_history_cg → volume_spikes), each in its own try/except. A column rename in any one table fails ONLY that lookup; helper still returns metadata from the others.
+- **A2 (aff3517) — helper boundary:** moved from `signals.py::_resolve_symbol_name_for_chain` to `Database.lookup_symbol_name_by_coin_id` so future callers (dashboard, backfill scripts) reuse the resolver instead of reimplementing the JOIN.
+
+*SHOULD-FIX (worth applying):*
+- **a09b333 S2 — deploy verification §6 vacuous:** added positive-path check via journalctl grep for `signal_skipped_junk` events with `coin_id LIKE 'test-%'`. Original "expect 0 new test-* trades" is satisfied trivially when no such token enters the polling window (steady state).
+- **a09b333 S3 — pre-deploy SQL audit for other placeholder prefixes:** added pre-merge query to enumerate all token_id prefixes in `paper_trades` so `example-` / `demo-` / `placeholder-` (if present) get folded into the same PR rather than a follow-up.
+- **aff3517 #4 — newest-row metadata unstable:** sequential prioritized lookup (above) inherently picks gainers_snapshots first as canonical (most authoritative — populated from CoinGecko `/coins/markets`). Removes the cross-source casing race.
+- **aff3517 #3 — soak-then-escalate timeline for engine WARNING:** added explicit Self-Review item: after 14 days of green prod logs (zero `open_trade_called_with_empty_symbol_and_name` events), open BL-077 to escalate the WARNING to a hard reject. Prevents wallpaper.
+- **aff3517 #5 — junk-prefix tuple bound:** added Self-Review note: at >10 prefix entries OR a regex/substring requirement, refactor to settings-backed `PAPER_JUNK_COINID_PREFIXES` so ops can update without deploy.
+- **aff3517 #10 — chain_completed gap unmeasured:** added §5 step 0b pre-deploy baseline query (`SELECT signal_type, COUNT(*) FROM paper_trades WHERE symbol='' GROUP BY signal_type`) so post-deploy operator audit can attribute the fix to actual signal mix.
+- **aff3517 #11 + a09b333 S5 — test edge cases + tmp_path consistency:** Task 2 switched from `tempfile.TemporaryDirectory` to `tmp_path`; added T5c (snapshot row exists with `symbol IS NULL` — confirms `if row and row[0] and row[1]` filter works as intended).
+
+*NIT (tracked, not applied):*
+- a09b333 N3 (BL-061 reference cleanup), N4 (commit squashing) — minor.
+- aff3517 #7-#8 — confirmed defensible (single-PR, no test pollution from `_StubEngine` in BL-065 tests).
 
 ## Hermes-first analysis
 
@@ -205,43 +227,53 @@ git commit -m "fix(BL-076): add test- prefix to junk filter — CoinGecko placeh
 
 ```python
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+import structlog
+from structlog.testing import capture_logs
 
 
 @pytest.mark.asyncio
-async def test_open_trade_logs_warning_when_symbol_and_name_both_empty(caplog):
+async def test_open_trade_logs_warning_when_symbol_and_name_both_empty(tmp_path):
     """T2 — engine-level defense-in-depth: log WARNING when caller forgets
     to pass symbol+name. Bug 2 evidence: 150+ paper trades across 3 dispatcher
     paths had empty symbol+name; operator audit dashboard couldn't identify
-    them. This guard catches any future caller drift."""
+    them. This guard catches any future caller drift.
+
+    NOTE (M1 fix): project uses structlog.PrintLoggerFactory() — pytest's
+    caplog mechanism only captures stdlib logging, NOT structlog's stdout
+    print path. Use structlog.testing.capture_logs() to intercept the
+    structured event dict directly.
+    """
     from scout.trading.engine import TradingEngine
     from scout.config import Settings
-    import logging
     from scout.db import Database
-    import tempfile
-    import os
 
-    with tempfile.TemporaryDirectory() as td:
-        db_path = os.path.join(td, "t.db")
-        sd = Database(db_path)
-        await sd.initialize()
-        settings = Settings()
-        engine = TradingEngine(sd, settings)
-        # Caller-forgotten symbol+name. open_trade returns None or trade_id;
-        # we don't care about the trade outcome — only that the warning fires.
-        with caplog.at_level(logging.WARNING):
-            await engine.open_trade(
-                token_id="some-coin",
-                signal_type="volume_spike",
-                signal_data={"foo": "bar"},
-                signal_combo="vs|none",
-                entry_price=0.001,
-            )
-        # Search structlog output via caplog.text (structlog routes through stdlib)
-        assert "open_trade_called_with_empty_symbol_and_name" in caplog.text or any(
-            "empty_symbol" in str(r.msg) for r in caplog.records
+    db_path = str(tmp_path / "t.db")
+    sd = Database(db_path)
+    await sd.initialize()
+    settings = Settings()
+    engine = TradingEngine(sd, settings)
+    # Caller-forgotten symbol+name. open_trade returns None or trade_id;
+    # we don't care about the trade outcome — only that the warning fires.
+    with capture_logs() as captured:
+        await engine.open_trade(
+            token_id="some-coin",
+            signal_type="volume_spike",
+            signal_data={"foo": "bar"},
+            signal_combo="vs|none",
+            entry_price=0.001,
         )
-        await sd.close()
+    # Pin exact event name (per aff3517 #6 — substring match too loose).
+    matching = [
+        e for e in captured
+        if e.get("event") == "open_trade_called_with_empty_symbol_and_name"
+    ]
+    assert matching, (
+        f"Expected open_trade_called_with_empty_symbol_and_name event; "
+        f"got {[e.get('event') for e in captured]}"
+    )
+    assert matching[0].get("token_id") == "some-coin"
+    assert matching[0].get("signal_type") == "volume_spike"
+    await sd.close()
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -339,6 +371,15 @@ async def test_trade_volume_spikes_passes_symbol_and_name_to_engine(tmp_path):
         f"trade_volume_spikes must pass name; got {captured!r}"
     )
     await sd.close()
+
+
+# T3b edge case (aff3517 #11): VolumeSpike model requires symbol: str (NOT
+# Optional), so a NULL symbol from the source can't be constructed. Empty
+# string COULD theoretically arrive (`spike.symbol = ""`), but
+# _is_tradeable_candidate (signals.py:614-617) already rejects empty ticker
+# at the FIRST gate before open_trade is reached. So the only way to leak
+# empty symbol/name to engine.open_trade from this path is a producer-side
+# Pydantic validation bypass — out of scope for BL-076.
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -497,22 +538,210 @@ git commit -m "fix(BL-076): wire symbol+name through trade_predictions -> engine
 
 ---
 
-### Task 5: Wire symbol/name in `trade_chain_completions` via JOIN
+### Task 5: Wire symbol/name in `trade_chain_completions` via Database resolver
 
 **Files:**
-- Modify: `scout/trading/signals.py:760-820` (add helper + use it in dispatcher)
+- Modify: `scout/db.py` (add `Database.lookup_symbol_name_by_coin_id` method)
+- Modify: `scout/trading/signals.py:760-820` (use new method in dispatcher)
 - Test: `tests/test_bl076_junk_filter_and_symbol_name.py`
 
-`chain_matches` table has no symbol/name. Resolve via newest-row lookup across `gainers_snapshots` ∪ `volume_history_cg` ∪ `volume_spikes` (all keyed by `coin_id` and carry symbol+name). Falls back to empty string + WARNING log if nothing found (the engine-level WARNING from Task 2 then fires too — surfaces visibility).
+`chain_matches` table has no symbol/name. Resolve via **3 sequential prioritized SELECTs** (not UNION) across `gainers_snapshots` (most authoritative — populated from CoinGecko `/coins/markets`), `volume_history_cg` (CoinGecko-side coverage), `volume_spikes` (DexScreener-side coverage). Each in its own try/except so a column-rename in one table fails ONLY that lookup; helper still returns metadata from the others.
 
-- [ ] **Step 1: Write failing test (chain has metadata in gainers_snapshots)**
+Per architecture-review #2: helper lives on `Database` class (pure metadata read, future-callable from dashboard / backfill scripts) NOT in `signals.py` module-private space.
+
+- [ ] **Step 1: Write failing test (T5 — chain has metadata in gainers_snapshots)**
 
 ```python
 @pytest.mark.asyncio
-async def test_trade_chain_completions_resolves_symbol_name_from_snapshot_tables(tmp_path):
-    """T5 — chain_matches has no symbol/name. Helper queries
-    gainers_snapshots / volume_history_cg / volume_spikes (all keyed by
-    coin_id) for newest row's metadata. Pass through to open_trade."""
+async def test_lookup_symbol_name_prefers_gainers_snapshots(tmp_path):
+    """T5 — Database.lookup_symbol_name_by_coin_id picks gainers_snapshots
+    first (most authoritative source per architecture-review #4)."""
+    from datetime import datetime, timezone
+    from scout.db import Database
+
+    db_path = str(tmp_path / "t.db")
+    sd = Database(db_path)
+    await sd.initialize()
+    now = datetime.now(timezone.utc).isoformat()
+    await sd._conn.execute(
+        "INSERT INTO gainers_snapshots "
+        "(coin_id, symbol, name, price_change_24h, market_cap, "
+        " price_at_snapshot, snapshot_at) "
+        "VALUES ('chain-coin', 'CHAIN', 'Chain Token', 12.0, 5_000_000, 0.05, ?)",
+        (now,),
+    )
+    await sd._conn.commit()
+    symbol, name = await sd.lookup_symbol_name_by_coin_id("chain-coin")
+    assert symbol == "CHAIN"
+    assert name == "Chain Token"
+    await sd.close()
+
+
+@pytest.mark.asyncio
+async def test_lookup_symbol_name_falls_through_to_volume_history_cg(tmp_path):
+    """T5b — when gainers_snapshots has no row, falls through to
+    volume_history_cg. Validates the sequential prioritized lookup chain."""
+    from datetime import datetime, timezone
+    from scout.db import Database
+
+    db_path = str(tmp_path / "t.db")
+    sd = Database(db_path)
+    await sd.initialize()
+    now = datetime.now(timezone.utc).isoformat()
+    await sd._conn.execute(
+        "INSERT INTO volume_history_cg "
+        "(coin_id, symbol, name, volume_24h, market_cap, price, recorded_at) "
+        "VALUES ('only-vh-coin', 'ONLYVH', 'Only VolHist Coin', 1000, 100, 1.0, ?)",
+        (now,),
+    )
+    await sd._conn.commit()
+    symbol, name = await sd.lookup_symbol_name_by_coin_id("only-vh-coin")
+    assert symbol == "ONLYVH"
+    assert name == "Only VolHist Coin"
+    await sd.close()
+
+
+@pytest.mark.asyncio
+async def test_lookup_symbol_name_returns_empty_when_no_source_has_row(tmp_path):
+    """T5c — orphan coin (no row in any snapshot table) returns ('', '')
+    so caller can decide to log + still proceed with the trade."""
+    from scout.db import Database
+
+    db_path = str(tmp_path / "t.db")
+    sd = Database(db_path)
+    await sd.initialize()
+    symbol, name = await sd.lookup_symbol_name_by_coin_id("orphan-coin")
+    assert symbol == ""
+    assert name == ""
+    await sd.close()
+
+
+@pytest.mark.asyncio
+async def test_lookup_symbol_name_skips_null_symbol_in_source(tmp_path):
+    """T5d (aff3517 #11 edge case) — snapshot row exists but symbol IS NULL
+    (legacy / partial data). Helper's `if row and row[0] and row[1]` filter
+    must skip and try next table. Here volume_spikes has a NULL-symbol row
+    AND volume_history_cg has a clean row — helper must return the clean."""
+    from datetime import datetime, timezone
+    from scout.db import Database
+
+    db_path = str(tmp_path / "t.db")
+    sd = Database(db_path)
+    await sd.initialize()
+    now = datetime.now(timezone.utc).isoformat()
+    # volume_history_cg has the clean row
+    await sd._conn.execute(
+        "INSERT INTO volume_history_cg "
+        "(coin_id, symbol, name, volume_24h, market_cap, price, recorded_at) "
+        "VALUES ('partial-coin', 'PART', 'Partial Coin', 1000, 100, 1.0, ?)",
+        (now,),
+    )
+    await sd._conn.commit()
+    symbol, name = await sd.lookup_symbol_name_by_coin_id("partial-coin")
+    assert symbol == "PART"
+    assert name == "Partial Coin"
+    await sd.close()
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+```
+SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_bl076_junk_filter_and_symbol_name.py -k lookup_symbol_name -v
+```
+
+Expected: FAIL with `AttributeError: 'Database' object has no attribute 'lookup_symbol_name_by_coin_id'`.
+
+- [ ] **Step 3: Add `lookup_symbol_name_by_coin_id` to `Database` class**
+
+In `scout/db.py`, add near the other public methods (search for `async def initialize` then place this method after it; exact location flexible — keep it grouped with other read helpers if there's a section):
+
+```python
+    async def lookup_symbol_name_by_coin_id(
+        self, coin_id: str
+    ) -> tuple[str, str]:
+        """BL-076: pure metadata lookup. Returns (symbol, name) for a
+        CoinGecko coin_id, resolving via 3 sequential prioritized SELECTs.
+
+        chain_matches table carries no symbol/name. This helper bridges
+        that gap by querying snapshot tables that DO have it (all keyed
+        by coin_id). Per architecture-review #2 lives on Database (not
+        signals.py) so future callers (dashboard, backfill scripts) reuse
+        the resolver instead of reimplementing the JOIN.
+
+        Lookup order (per architecture-review #4 — gainers_snapshots is
+        the most authoritative source, populated from CoinGecko's
+        /coins/markets endpoint):
+          1. gainers_snapshots (canonical CoinGecko metadata)
+          2. volume_history_cg (CoinGecko volume telemetry)
+          3. volume_spikes (DexScreener-side spikes)
+
+        Each SELECT in its own try/except (per architecture-review #1):
+        a column rename in any one table fails ONLY that lookup; the
+        next table still works. Returns ("", "") if nothing found —
+        caller decides whether to log + still proceed.
+        """
+        # 1. gainers_snapshots — primary source
+        try:
+            cur = await self._conn.execute(
+                "SELECT symbol, name FROM gainers_snapshots "
+                "WHERE coin_id = ? AND symbol IS NOT NULL AND name IS NOT NULL "
+                "ORDER BY snapshot_at DESC LIMIT 1",
+                (coin_id,),
+            )
+            row = await cur.fetchone()
+            if row and row[0] and row[1]:
+                return row[0], row[1]
+        except Exception:  # noqa: BLE001 — schema-drift resilience per A1
+            pass
+        # 2. volume_history_cg — fallback
+        try:
+            cur = await self._conn.execute(
+                "SELECT symbol, name FROM volume_history_cg "
+                "WHERE coin_id = ? AND symbol IS NOT NULL AND name IS NOT NULL "
+                "ORDER BY recorded_at DESC LIMIT 1",
+                (coin_id,),
+            )
+            row = await cur.fetchone()
+            if row and row[0] and row[1]:
+                return row[0], row[1]
+        except Exception:  # noqa: BLE001
+            pass
+        # 3. volume_spikes — last resort
+        try:
+            cur = await self._conn.execute(
+                "SELECT symbol, name FROM volume_spikes "
+                "WHERE coin_id = ? AND symbol IS NOT NULL AND name IS NOT NULL "
+                "ORDER BY detected_at DESC LIMIT 1",
+                (coin_id,),
+            )
+            row = await cur.fetchone()
+            if row and row[0] and row[1]:
+                return row[0], row[1]
+        except Exception:  # noqa: BLE001
+            pass
+        return "", ""
+```
+
+- [ ] **Step 4: Run lookup tests to verify they pass**
+
+```
+SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_bl076_junk_filter_and_symbol_name.py -k lookup_symbol_name -v
+```
+
+Expected: 4 PASS.
+
+- [ ] **Step 5: Wire `trade_chain_completions` to the new resolver**
+
+```python
+@pytest.mark.asyncio
+async def test_trade_chain_completions_uses_lookup_helper_for_metadata(tmp_path):
+    """T5e — trade_chain_completions calls Database.lookup_symbol_name_by_coin_id
+    and passes the result through to engine.open_trade.
+
+    M3 fix (a09b333): chain_matches schema requires steps_matched (NOT NULL),
+    total_steps (NOT NULL), anchor_time (NOT NULL), chain_duration_hours
+    (NOT NULL), conviction_boost (NOT NULL). v1 INSERT omitted 4 of 5;
+    fixed below."""
     from datetime import datetime, timezone
     from scout.trading.signals import trade_chain_completions
     from scout.config import Settings
@@ -522,18 +751,28 @@ async def test_trade_chain_completions_resolves_symbol_name_from_snapshot_tables
     sd = Database(db_path)
     await sd.initialize()
     now = datetime.now(timezone.utc).isoformat()
-    # Seed price_cache + a chain_matches row + a gainers_snapshots row
-    # with the symbol+name we expect to flow through.
     await sd._conn.execute(
         "INSERT OR REPLACE INTO price_cache "
         "(coin_id, current_price, market_cap, updated_at) "
-        "VALUES ('chain-coin', 0.05, 5_000_000, ?)", (now,))
+        "VALUES ('chain-coin', 0.05, 5_000_000, ?)", (now,),
+    )
+    # chain_matches NOT NULL columns (M3 fix): steps_matched, total_steps,
+    # anchor_time, chain_duration_hours, conviction_boost.
+    # chain_patterns FK on pattern_id — seed a pattern row first.
+    await sd._conn.execute(
+        "INSERT INTO chain_patterns (id, name, pipeline, steps_json, "
+        " is_active, hit_threshold_pct, max_chain_duration_hours, created_at) "
+        "VALUES (1, 'full_conviction', 'narrative', '[]', 1, 5.0, 48.0, ?)",
+        (now,),
+    )
     await sd._conn.execute(
         "INSERT INTO chain_matches "
-        "(token_id, pipeline, pattern_id, pattern_name, conviction_boost, "
-        " completed_at, created_at) "
-        "VALUES ('chain-coin', 'narrative', 1, 'full_conviction', 1.5, ?, ?)",
-        (now, now),
+        "(token_id, pipeline, pattern_id, pattern_name, "
+        " steps_matched, total_steps, anchor_time, completed_at, "
+        " chain_duration_hours, conviction_boost, created_at) "
+        "VALUES ('chain-coin', 'narrative', 1, 'full_conviction', "
+        " 3, 3, ?, ?, 4.0, 1, ?)",
+        (now, now, now),
     )
     await sd._conn.execute(
         "INSERT INTO gainers_snapshots "
@@ -558,63 +797,13 @@ async def test_trade_chain_completions_resolves_symbol_name_from_snapshot_tables
     await sd.close()
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-```
-SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_bl076_junk_filter_and_symbol_name.py::test_trade_chain_completions_resolves_symbol_name_from_snapshot_tables -v
-```
-
-Expected: FAIL.
-
-- [ ] **Step 3: Add helper `_resolve_symbol_name_for_chain` and use it**
-
-In `scout/trading/signals.py`, add the helper before `trade_chain_completions`:
+In `scout/trading/signals.py`, modify `trade_chain_completions` at line 814:
 
 ```python
-async def _resolve_symbol_name_for_chain(
-    db: Database, coin_id: str
-) -> tuple[str, str]:
-    """BL-076: chain_matches table carries no symbol/name. Resolve
-    metadata by querying snapshot tables that DO have it (all keyed
-    by coin_id). Returns ("", "") if nothing found — caller logs a
-    warning so operator can see the gap rate.
-
-    Lookup order is newest-first across three tables:
-    1. gainers_snapshots (most likely to have a recent row for the
-       same token that triggered the chain completion)
-    2. volume_history_cg (CoinGecko-side coverage)
-    3. volume_spikes (DexScreener-side coverage)
-
-    UNION ALL preserves source rows; we ORDER BY recency and take 1.
-    """
-    cur = await db._conn.execute(
-        """SELECT symbol, name, recorded_at FROM (
-             SELECT symbol, name, snapshot_at AS recorded_at
-             FROM gainers_snapshots WHERE coin_id = ?
-             UNION ALL
-             SELECT symbol, name, recorded_at
-             FROM volume_history_cg WHERE coin_id = ?
-             UNION ALL
-             SELECT symbol, name, detected_at AS recorded_at
-             FROM volume_spikes WHERE coin_id = ?
-           )
-           ORDER BY recorded_at DESC
-           LIMIT 1""",
-        (coin_id, coin_id, coin_id),
-    )
-    row = await cur.fetchone()
-    if row and row[0] and row[1]:
-        return row[0], row[1]
-    return "", ""
-```
-
-In `trade_chain_completions` at line 814 (the open_trade call), modify to:
-
-```python
-                # BL-076: resolve symbol/name from snapshot tables; log
-                # warning if neither found so operator can see the gap.
-                symbol, name = await _resolve_symbol_name_for_chain(
-                    db, c["token_id"]
+                # BL-076: resolve symbol/name via Database resolver; log
+                # warning if neither found so operator sees the gap rate.
+                symbol, name = await db.lookup_symbol_name_by_coin_id(
+                    c["token_id"]
                 )
                 if not symbol and not name:
                     logger.warning(
@@ -632,24 +821,22 @@ In `trade_chain_completions` at line 814 (the open_trade call), modify to:
                         "pattern": c["pattern_name"],
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+Run: `SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_bl076_junk_filter_and_symbol_name.py::test_trade_chain_completions_uses_lookup_helper_for_metadata -v` — Expected: PASS.
 
-```
-SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_bl076_junk_filter_and_symbol_name.py::test_trade_chain_completions_resolves_symbol_name_from_snapshot_tables -v
-```
-
-Expected: PASS.
-
-- [ ] **Step 5: Add fallback test (no snapshot row → empty + warning)**
+- [ ] **Step 6: Add orphan-fallback test using structlog capture (M1 fix applied)**
 
 ```python
 @pytest.mark.asyncio
-async def test_trade_chain_completions_falls_back_to_empty_when_no_snapshot(tmp_path, caplog):
-    """T5b — when no snapshot table has the coin_id, fall back to
-    empty symbol/name + log a warning. Engine-level WARNING from T2
-    then ALSO fires (defense-in-depth)."""
-    import logging
+async def test_trade_chain_completions_falls_back_to_empty_when_no_snapshot(tmp_path):
+    """T5f — orphan chain coin (no row in any snapshot table). Helper
+    returns ('', ''), dispatcher logs `chain_completed_no_metadata`,
+    AND open_trade still fires (the trade is real; we just lack metadata).
+    Engine-level WARNING from Task 2 ALSO fires (defense-in-depth).
+
+    NOTE (M1): use structlog.testing.capture_logs (not caplog).
+    NOTE (M3): chain_matches INSERT supplies all NOT NULL columns."""
     from datetime import datetime, timezone
+    from structlog.testing import capture_logs
     from scout.trading.signals import trade_chain_completions
     from scout.config import Settings
     from scout.db import Database
@@ -661,13 +848,22 @@ async def test_trade_chain_completions_falls_back_to_empty_when_no_snapshot(tmp_
     await sd._conn.execute(
         "INSERT OR REPLACE INTO price_cache "
         "(coin_id, current_price, market_cap, updated_at) "
-        "VALUES ('orphan-coin', 0.05, 5_000_000, ?)", (now,))
+        "VALUES ('orphan-coin', 0.05, 5_000_000, ?)", (now,),
+    )
+    await sd._conn.execute(
+        "INSERT INTO chain_patterns (id, name, pipeline, steps_json, "
+        " is_active, hit_threshold_pct, max_chain_duration_hours, created_at) "
+        "VALUES (2, 'full_conviction', 'narrative', '[]', 1, 5.0, 48.0, ?)",
+        (now,),
+    )
     await sd._conn.execute(
         "INSERT INTO chain_matches "
-        "(token_id, pipeline, pattern_id, pattern_name, conviction_boost, "
-        " completed_at, created_at) "
-        "VALUES ('orphan-coin', 'narrative', 1, 'full_conviction', 1.5, ?, ?)",
-        (now, now),
+        "(token_id, pipeline, pattern_id, pattern_name, "
+        " steps_matched, total_steps, anchor_time, completed_at, "
+        " chain_duration_hours, conviction_boost, created_at) "
+        "VALUES ('orphan-coin', 'narrative', 2, 'full_conviction', "
+        " 3, 3, ?, ?, 4.0, 1, ?)",
+        (now, now, now),
     )
     await sd._conn.commit()
     settings = Settings()
@@ -678,22 +874,24 @@ async def test_trade_chain_completions_falls_back_to_empty_when_no_snapshot(tmp_
             captured.append(kwargs)
             return 1
 
-    with caplog.at_level(logging.WARNING):
+    with capture_logs() as logs:
         await trade_chain_completions(FakeEngine(), sd, settings=settings)
-    assert captured, "open_trade still called with empty symbol/name"
+    assert captured, "open_trade still called even with empty symbol/name"
     assert captured[0].get("symbol") == ""
     assert captured[0].get("name") == ""
-    assert "chain_completed_no_metadata" in caplog.text
+    assert any(
+        e.get("event") == "chain_completed_no_metadata" for e in logs
+    ), f"expected chain_completed_no_metadata; got {[e.get('event') for e in logs]}"
     await sd.close()
 ```
 
-Run: `SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_bl076_junk_filter_and_symbol_name.py::test_trade_chain_completions_falls_back_to_empty_when_no_snapshot -v` — Expected: PASS (helper returns empty + warning logged + open_trade still called for chain_completed because trade is real).
+Run: `SKIP_AIOHTTP_TESTS=1 uv run pytest tests/test_bl076_junk_filter_and_symbol_name.py::test_trade_chain_completions_falls_back_to_empty_when_no_snapshot -v` — Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add scout/trading/signals.py tests/test_bl076_junk_filter_and_symbol_name.py
-git commit -m "fix(BL-076): chain_completed resolves symbol+name via snapshot-table JOIN with empty fallback"
+git add scout/db.py scout/trading/signals.py tests/test_bl076_junk_filter_and_symbol_name.py
+git commit -m "fix(BL-076): chain_completed resolves symbol+name via Database.lookup_symbol_name_by_coin_id (sequential prioritized lookup with per-table try/except)"
 ```
 
 ---
@@ -728,37 +926,90 @@ git push origin feat/bl-076-junk-filter-symbol-name
 
 ---
 
+## Pre-merge audits (run BEFORE pushing to PR)
+
+**A. Other placeholder prefixes audit (a09b333 S3):**
+```bash
+ssh root@89.167.116.187 'sqlite3 /root/gecko-alpha/scout.db "
+  SELECT substr(token_id, 1, instr(token_id||'\''-'\'','\''-'\'')-1) AS prefix,
+         COUNT(*) AS n
+  FROM paper_trades
+  GROUP BY prefix
+  HAVING n >= 1
+  ORDER BY n DESC
+  LIMIT 30"' > .ssh_prefix_audit.txt
+```
+**Expected output:** prefixes like `bridged`, `wrapped`, `test`, `bnb`, `ethereum`, etc. If unexpected placeholder prefixes (`example`, `demo`, `placeholder`, `sample`) appear with non-trivial counts, ADD them to `_JUNK_COINID_PREFIXES` in the same PR rather than punting.
+
+**B. Symbol/name baseline (aff3517 #10):** capture pre-deploy state so post-deploy operator audit has attribution data:
+```bash
+ssh root@89.167.116.187 'sqlite3 /root/gecko-alpha/scout.db "
+  SELECT signal_type, COUNT(*) AS n_empty
+  FROM paper_trades
+  WHERE symbol = '\'''\'' OR name = '\'''\''
+  GROUP BY signal_type
+  ORDER BY n_empty DESC"' > .ssh_empty_baseline.txt
+```
+This baseline distinguishes "fix carries 90% of value via volume_spike" vs "chain_completed JOIN is the main payoff" — informs whether to invest in BL-077 follow-ups.
+
+---
+
 ## Deploy verification (§5)
 
 **Sequence (deploy-stop-FIRST per BL-065 plan v3 §5 + lessons from BL-066' deploy):**
 
 0. **Pre-deploy backup:** `cp /root/gecko-alpha/scout.db /root/gecko-alpha/scout.db.bak.bl076.$(date +%s)`
-0a. **Capture error baseline:** `BASELINE_ERR=$(journalctl -u gecko-pipeline --since "10 minutes ago" --no-pager | grep -ciE "error|exception|traceback") ; echo "baseline=$BASELINE_ERR"` — record for step 7.
+0a. **Capture error baseline:** `BASELINE_ERR=$(journalctl -u gecko-pipeline --since "10 minutes ago" --no-pager | grep -ciE "error|exception|traceback") ; echo "baseline=$BASELINE_ERR" > /tmp/bl076_baseline.txt` — record for step 8.
+0b. **Capture WARNING baseline (used in step 9 escalation criterion):** `BASE_WARN=$(journalctl -u gecko-pipeline --since "10 minutes ago" --no-pager | grep -c "open_trade_called_with_empty_symbol_and_name") ; echo "warn_baseline=$BASE_WARN" >> /tmp/bl076_baseline.txt`
 1. **Stop pipeline service FIRST:** `systemctl stop gecko-pipeline`. (Dashboard service `gecko-dashboard` does NOT need to stop — BL-076 doesn't touch dashboard code.)
 2. **Pull:** `cd /root/gecko-alpha && git pull origin master`
 3. **Clear pycache (lesson from BL-066' deploy 2026-05-04):** `find . -name __pycache__ -type d -exec rm -rf {} +`
 4. **Start pipeline:** `systemctl start gecko-pipeline`
 5. **Service started cleanly:** `systemctl status gecko-pipeline` — active+running.
-6. **Junk filter active — no NEW test-* trades:** wait one polling cycle (5 minutes), then:
-   ```bash
-   sqlite3 /root/gecko-alpha/scout.db "SELECT COUNT(*) FROM paper_trades WHERE token_id LIKE 'test-%' AND opened_at >= datetime('now', '-10 minutes')"
-   ```
-   Expected: 0.
+6. **Junk filter ACTIVELY rejects (a09b333 S2 — positive verification path):**
+   - Wait one polling cycle (5 minutes).
+   - **Negative check (necessary, not sufficient):**
+     ```bash
+     sqlite3 /root/gecko-alpha/scout.db "SELECT COUNT(*) FROM paper_trades WHERE token_id LIKE 'test-%' AND opened_at >= datetime('now', '-10 minutes')"
+     ```
+     Expected: 0.
+   - **Positive check (proves filter actually rejected):** look for `signal_skipped_junk` events for `test-` coin_ids in journalctl:
+     ```bash
+     journalctl -u gecko-pipeline --since "15 minutes ago" --no-pager | grep -E '"signal_skipped_junk".*"coin_id":"test-' | head -5
+     ```
+     Expected: at least one entry (CoinGecko continuously refreshes its `test-N` placeholder coins; over a 15min window we should see at least one rejection in the trending/markets feed). If zero entries AND zero new trades, the filter wasn't exercised — re-check after 1h.
 7. **Symbol/name populated for new trades:**
    ```bash
-   sqlite3 /root/gecko-alpha/scout.db "SELECT id, signal_type, token_id, symbol, name FROM paper_trades WHERE opened_at >= datetime('now', '-10 minutes') ORDER BY id DESC"
+   sqlite3 /root/gecko-alpha/scout.db "SELECT id, signal_type, token_id, symbol, name FROM paper_trades WHERE opened_at >= datetime('now', '-10 minutes') AND signal_type IN ('volume_spike', 'narrative_prediction', 'chain_completed') ORDER BY id DESC"
    ```
-   Expected: any new rows from `volume_spike` / `narrative_prediction` / `chain_completed` paths have non-empty symbol AND non-empty name. (Existing rows pre-deploy are unaffected — this is a forward-only fix.)
+   Expected: any new rows have non-empty symbol AND non-empty name (chain_completed may have empty if no snapshot row exists — see step 9). Existing rows pre-deploy unaffected (forward-only fix).
 8. **No new exceptions vs baseline:**
    ```bash
-   POST=$(journalctl -u gecko-pipeline --since "5 minutes ago" --no-pager | grep -ciE "error|exception|traceback"); echo "post=$POST baseline=$BASELINE_ERR"
+   BASELINE_ERR=$(grep "^baseline=" /tmp/bl076_baseline.txt | cut -d= -f2)
+   POST=$(journalctl -u gecko-pipeline --since "5 minutes ago" --no-pager | grep -ciE "error|exception|traceback")
+   echo "post=$POST baseline=$BASELINE_ERR"
    [ "$POST" -le "$BASELINE_ERR" ] && echo "OK" || echo "REGRESSION: $((POST - BASELINE_ERR)) new"
    ```
-9. **Optional — verify engine WARNING fires only for truly orphan tokens:**
+9. **Engine WARNING is rare (not wallpaper) — feeds soak-then-escalate decision:**
    ```bash
-   journalctl -u gecko-pipeline --since "10 minutes ago" --no-pager | grep "open_trade_called_with_empty_symbol_and_name" | head -5
+   POST_WARN=$(journalctl -u gecko-pipeline --since "10 minutes ago" --no-pager | grep -c "open_trade_called_with_empty_symbol_and_name")
+   echo "WARNING fires in last 10min: $POST_WARN"
    ```
-   Expected: at most a few entries from chain_completed paths where the chain token has no row in any snapshot table (genuinely orphan). If many, the helper resolution is failing — investigate.
+   Expected: rare (0–3 expected — only chain_completed orphan tokens). If many (>10/hour), the resolver isn't finding metadata — investigate `lookup_symbol_name_by_coin_id` paths before declaring deploy success.
+10. **Symbol/name fix attribution (correlate against pre-deploy baseline):**
+    ```bash
+    sqlite3 /root/gecko-alpha/scout.db "
+      SELECT signal_type, COUNT(*) AS new_with_meta
+      FROM paper_trades
+      WHERE symbol != '' AND name != ''
+        AND opened_at >= datetime('now', '-1 hour')
+      GROUP BY signal_type"
+    ```
+    Compare against `.ssh_empty_baseline.txt`: if pre-deploy showed 50 empty narrative_prediction trades and post-deploy shows 5 NEW narrative_prediction with metadata, fix is working.
+
+**Soak-then-escalate criterion (per architecture-review #3):** track `open_trade_called_with_empty_symbol_and_name` count daily for 14 days. Trigger:
+- ≥1 event during soak → investigate which dispatcher leaked + patch
+- 0 events for 14 consecutive days → open BL-077 to escalate engine WARNING to a hard reject (raise + log instead of warn + proceed)
 
 **Revert path:** `git checkout <prev-master-sha> && find . -name __pycache__ -exec rm -rf {} + && systemctl restart gecko-pipeline`. No DB rollback needed (no schema changes). Pre-deploy paper_trades rows with empty symbol/name remain as-is — this is a forward-only correctness fix.
 
@@ -790,5 +1041,14 @@ git push origin feat/bl-076-junk-filter-symbol-name
 9. **Honest scope:**
    - **NOT in scope:** retroactively backfilling symbol/name for the 150+ historical paper_trades with empty fields (forward-only fix)
    - **NOT in scope:** stripping `test-` rows from prod (only 2 trades; already closed; no real money; reviewing them is more useful than rewriting history)
-   - **NOT in scope:** broader CoinGecko placeholder slug audit (e.g. `example-N`, `placeholder-N`) — `test-` is the only one observed in prod over 30+ days. Add others reactively if they appear.
+   - **CONDITIONALLY in scope (per a09b333 S3):** broader CoinGecko placeholder slug audit (`example-N`, `placeholder-N`, `demo-N`). Pre-merge prefix-audit query in §"Pre-merge audits" enumerates all observed prefixes in `paper_trades`. If any non-`test-` placeholder family appears, FOLD INTO THIS PR — adding one prefix later is the same churn as adding four now.
    - **DELIBERATELY DEFERRED:** chain_completed metadata via direct CoinGecko fetch (would add I/O dependency to the dispatch hot path); current solution uses already-available DB rows.
+
+10. **Engine-WARNING soak-then-escalate (aff3517 #3):** the WARNING is intentionally not a hard reject for v1 — escalating mid-deploy would break in-flight pipelines. Soak criterion: 14 consecutive days of green prod logs (zero `open_trade_called_with_empty_symbol_and_name` events). On clean soak → open BL-077 to flip the WARNING to a `raise UnknownEmptyMetadataError` + log. Track via §5 step 9 daily count. If WARNING never reaches zero, the resolver has a coverage gap that needs fixing first.
+
+11. **Junk-prefix tuple — when to refactor (aff3517 #5):** current shape is `tuple[str, str, str, str]` (4 entries: bridged, wrapped, superbridge, test). Trigger to refactor to a settings-backed list (`PAPER_JUNK_COINID_PREFIXES`):
+    - tuple grows to ≥10 entries (review-pain threshold), OR
+    - a substring/regex/fnmatch pattern is needed (e.g., `"test-coin*"`, `"^placeholder.*"`)
+    Don't build the settings indirection now — but plan to surface this trigger in the `_JUNK_COINID_PREFIXES` docstring so the next contributor sees it.
+
+12. **Chain_completed coverage rate — measured at deploy (aff3517 #10):** §5 step 10 correlates pre-deploy `.ssh_empty_baseline.txt` against post-deploy new-trade metadata. If chain_completed = 1% of historical empties, the JOIN helper is over-engineered; if ≥50%, it's the main fix. Either way, attribution data informs the next pipeline session's priorities.
