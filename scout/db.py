@@ -24,6 +24,7 @@ class CoinIdResolutionError(RuntimeError):
     """Raised by Database.coin_id_resolves on aiosqlite.OperationalError
     (column rename / table lock). Caller decides fail-CLOSED vs fail-OPEN."""
 
+
 from scout.models import CandidateToken
 
 if TYPE_CHECKING:
@@ -84,6 +85,7 @@ class Database:
         await self._migrate_feedback_loop_schema()
         await self._migrate_live_trading_schema()
         await self._migrate_signal_params_schema()
+        await self._migrate_high_peak_fade_columns_and_audit_table()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -230,10 +232,14 @@ class Database:
         if self._conn is None:
             raise DbNotInitializedError("Database not initialized.")
         # PR #72 H3 — defense against future caller-driven table values.
-        _ALLOWED_TABLES = frozenset({
-            "price_cache", "gainers_snapshots",
-            "volume_history_cg", "volume_spikes",
-        })
+        _ALLOWED_TABLES = frozenset(
+            {
+                "price_cache",
+                "gainers_snapshots",
+                "volume_history_cg",
+                "volume_spikes",
+            }
+        )
         for table in (
             "price_cache",
             "gainers_snapshots",
@@ -1757,9 +1763,7 @@ class Database:
             # the post-migration assertion permanently failing on every
             # subsequent run because PRAGMA sees the column → skips the
             # entire `if` block including the marker INSERT.
-            cur_pragma = await conn.execute(
-                "PRAGMA table_info(signal_params)"
-            )
+            cur_pragma = await conn.execute("PRAGMA table_info(signal_params)")
             existing_cols = {row[1] for row in await cur_pragma.fetchall()}
             if "conviction_lock_enabled" not in existing_cols:
                 await conn.execute(
@@ -1778,16 +1782,11 @@ class Database:
             # conviction_locked_stack added in same migration. Avoids
             # unreliable backfill of historical locked rows once source
             # tables age out.
-            cur_pragma_pt = await conn.execute(
-                "PRAGMA table_info(paper_trades)"
-            )
-            existing_pt_cols = {
-                row[1] for row in await cur_pragma_pt.fetchall()
-            }
+            cur_pragma_pt = await conn.execute("PRAGMA table_info(paper_trades)")
+            existing_pt_cols = {row[1] for row in await cur_pragma_pt.fetchall()}
             if "conviction_locked_at" not in existing_pt_cols:
                 await conn.execute(
-                    "ALTER TABLE paper_trades "
-                    "ADD COLUMN conviction_locked_at TEXT"
+                    "ALTER TABLE paper_trades " "ADD COLUMN conviction_locked_at TEXT"
                 )
             if "conviction_locked_stack" not in existing_pt_cols:
                 await conn.execute(
@@ -1833,6 +1832,50 @@ class Database:
             raise RuntimeError(
                 "bl067_conviction_lock_enabled cutover row missing after migration"
             )
+
+    async def _migrate_high_peak_fade_columns_and_audit_table(self) -> None:
+        """BL-NEW-HPF: per-signal opt-in column + fire-events audit table.
+
+        Adds:
+          - signal_params.high_peak_fade_enabled INTEGER DEFAULT 0
+          - high_peak_fade_audit table (records both real and dry-run fires)
+
+        Idempotent: column-add and table-create are guarded by IF NOT EXISTS
+        (column-add via try/except on duplicate-column OperationalError,
+        consistent with existing migration pattern).
+        """
+        try:
+            await self._conn.execute(
+                "ALTER TABLE signal_params "
+                "ADD COLUMN high_peak_fade_enabled INTEGER NOT NULL DEFAULT 0"
+            )
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS high_peak_fade_audit (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id     INTEGER NOT NULL,
+                token_id     TEXT    NOT NULL,
+                signal_type  TEXT    NOT NULL,
+                peak_pct     REAL    NOT NULL,
+                peak_price   REAL    NOT NULL,
+                current_price REAL   NOT NULL,
+                fired_at     TEXT    NOT NULL,
+                dry_run      INTEGER NOT NULL,
+                FOREIGN KEY (trade_id) REFERENCES paper_trades(id)
+            )
+            """)
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hpf_audit_trade_id "
+            "ON high_peak_fade_audit(trade_id)"
+        )
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hpf_audit_fired_at "
+            "ON high_peak_fade_audit(fired_at)"
+        )
+        await self._conn.commit()
 
     # ------------------------------------------------------------------
     # Candidates
