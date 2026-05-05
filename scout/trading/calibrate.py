@@ -454,6 +454,46 @@ def _format_diff(diff: SignalDiff) -> str:
     return head + f"→ {body} [{diff.reason}]"
 
 
+def format_dryrun_telegram_message(
+    diffs: list[SignalDiff],
+    actionable: int,
+    *,
+    window_days: int,
+) -> str:
+    """Build the Telegram message body for the weekly calibration dry-run.
+
+    Truncates if total length exceeds Telegram's 4096-char ceiling.
+    Returns plain text (NOT Markdown) — `_format_diff` includes
+    `[reason]` brackets that Telegram's Markdown parser would mis-handle
+    as link anchors. Caller MUST send with `parse_mode=None` (or no
+    parse_mode kwarg).
+
+    Used by scout/main.py:_run_feedback_schedulers calibration_dryrun
+    hook (PR-review arch-Issue1 — public function so cross-module
+    private-name import is avoided).
+    """
+    header = (
+        f"📊 Weekly calibration dry-run (window={window_days}d, since-deploy)\n"
+        f"{actionable} of {len(diffs)} signal(s) would change.\n"
+    )
+    body = "\n".join(_format_diff(d) for d in diffs)
+    footer = (
+        "\n\nTo apply: ssh root@<vps> 'cd /root/gecko-alpha && "
+        "uv run python -m scout.trading.calibrate --apply'"
+    )
+    full = header + "\n" + body + footer
+    if len(full) > 4090:  # leave headroom under 4096 Telegram cap
+        full = full[:4087] + "..."
+    return full
+
+
+def telegram_token_looks_real(settings: Settings) -> bool:
+    """Public alias for the private guard. Used by scout/main.py
+    calibration_dryrun hook to gate Telegram emission (avoids attempting
+    a 401/404 on placeholder tokens)."""
+    return _telegram_token_looks_real(settings)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------

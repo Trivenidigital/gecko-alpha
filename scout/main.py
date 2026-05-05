@@ -99,6 +99,20 @@ _combo_refresh_streak_last_alerted = 0
 # as last_refresh_date / last_digest_date — once per local day per process.
 _last_suspension_date = ""
 
+# Last YYYY-MM-DD that the weekly calibration dry-run scheduler fired.
+# Same module-level-sentinel idempotency as _last_suspension_date.
+# Test-only reset helper exposed below per project convention
+# (mirrors `scout.trading.params.clear_cache_for_tests` shape).
+_last_calibration_dryrun_date = ""
+
+
+def _clear_calibration_dryrun_date_for_tests() -> None:
+    """Reset module-level sentinel (test isolation per arch-D5 + adv-M1).
+    Conftest registers an autouse fixture that calls this so T6 (sets
+    sentinel to today) doesn't poison T8/T0."""
+    global _last_calibration_dryrun_date
+    _last_calibration_dryrun_date = ""
+
 
 async def _run_feedback_schedulers(
     db,
@@ -183,6 +197,82 @@ async def _run_feedback_schedulers(
             last_digest_date = today_iso
         except Exception:
             logger.exception("weekly_digest_loop_error")
+
+    # Weekly calibration dry-run alert
+    # (CALIBRATION_DRY_RUN_WEEKDAY/_HOUR local; gated on
+    # CALIBRATION_DRY_RUN_ENABLED kill-switch per adv-S1).
+    # NEVER auto-applies — operator manually re-runs with --apply
+    # after reviewing the Telegram message.
+    global _last_calibration_dryrun_date
+    if (
+        settings.CALIBRATION_DRY_RUN_ENABLED
+        and now_local.weekday() == settings.CALIBRATION_DRY_RUN_WEEKDAY
+        and now_local.hour == settings.CALIBRATION_DRY_RUN_HOUR
+        and _last_calibration_dryrun_date != today_iso
+    ):
+        try:
+            from scout.trading.calibrate import (
+                build_diffs,
+                format_dryrun_telegram_message,
+                telegram_token_looks_real,
+            )
+            diffs = await build_diffs(
+                db, settings,
+                window_days=settings.CALIBRATION_WINDOW_DAYS,
+                min_trades=settings.CALIBRATION_MIN_TRADES,
+                step=settings.CALIBRATION_STEP_SIZE_PCT,
+                signal_filter=None,
+                since_deploy=True,  # adv-M3: skip pre-apply contamination
+            )
+            actionable = sum(1 for d in diffs if d.changes)
+            msg = format_dryrun_telegram_message(
+                diffs, actionable,
+                window_days=settings.CALIBRATION_WINDOW_DAYS,
+            )
+            # adv-S2 / silent-failure-C1: pass parse_mode=None — message body
+            # contains [reason] brackets that Telegram's Markdown parser would
+            # mis-handle as link anchors and reject the entire message with
+            # HTTP 400. send_telegram_message accepts parse_mode kwarg as of
+            # this PR (default "Markdown" preserves back-compat for other
+            # callers).
+            if telegram_token_looks_real(settings):
+                # M3 fix: explicit 10s total timeout so a hanging Telegram API
+                # doesn't block the entire feedback-scheduler callback.
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    await alerter.send_telegram_message(
+                        msg, session, settings, parse_mode=None
+                    )
+                logger.info(
+                    "calibration_dryrun_pass",
+                    actionable=actionable,
+                    total=len(diffs),
+                )
+            else:
+                # M2 fix: warning-level (was info) so the placeholder-token
+                # condition surfaces in operator dashboards filtered for
+                # `level >= warning`. The project-wide token has been
+                # placeholder for weeks; without warning surface, the
+                # operator won't know calibration alerts are silently
+                # log-skipping every Monday.
+                logger.warning(
+                    "calibration_dryrun_telegram_skipped",
+                    reason="placeholder_token",
+                    actionable=actionable,
+                    total=len(diffs),
+                )
+            _last_calibration_dryrun_date = today_iso
+        except (ImportError, AttributeError):
+            # H3 fix: deterministic-class errors (typo on rename, missing
+            # symbol) won't fix themselves on retry. Advance sentinel so
+            # we don't burn 60 retries/hour. Log with distinct event so
+            # the operator can grep separately.
+            logger.exception("calibration_dryrun_terminal_error")
+            _last_calibration_dryrun_date = today_iso
+        except Exception:
+            # Transient errors (DB, network) — don't advance sentinel so
+            # we retry next minute within the hour window.
+            logger.exception("calibration_dryrun_loop_error")
 
     return last_refresh_date, last_digest_date
 
