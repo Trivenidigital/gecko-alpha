@@ -376,6 +376,11 @@ class Settings(BaseSettings):
     CALIBRATION_MIN_TRADES: int = 50
     CALIBRATION_WINDOW_DAYS: int = 30
     CALIBRATION_STEP_SIZE_PCT: float = 2.0
+    # Weekly scheduled --dry-run + Telegram alert (no auto-apply).
+    # Operator reviews diff in chat, manually re-runs --apply if approved.
+    CALIBRATION_DRY_RUN_ENABLED: bool = True
+    CALIBRATION_DRY_RUN_WEEKDAY: int = 0  # 0=Mon (matches WEEKLY_DIGEST_WEEKDAY)
+    CALIBRATION_DRY_RUN_HOUR: int = 2     # local hour
     FEEDBACK_CHRONIC_FAILURE_THRESHOLD: int = 3
 
     # -------- Perp WebSocket Anomaly Detector (BL-054) --------
@@ -707,6 +712,24 @@ class Settings(BaseSettings):
         if v < 1:
             raise ValueError(
                 f"TG_SOCIAL_CHANNEL_SILENCE_ALERT_HOURS must be >= 1; got={v}"
+            )
+        return v
+
+    @field_validator("CALIBRATION_DRY_RUN_WEEKDAY")
+    @classmethod
+    def _validate_calibration_dry_run_weekday(cls, v: int) -> int:
+        if not 0 <= v <= 6:
+            raise ValueError(
+                f"CALIBRATION_DRY_RUN_WEEKDAY must be 0-6 (Mon-Sun); got={v}"
+            )
+        return v
+
+    @field_validator("CALIBRATION_DRY_RUN_HOUR")
+    @classmethod
+    def _validate_calibration_dry_run_hour(cls, v: int) -> int:
+        if not 0 <= v <= 23:
+            raise ValueError(
+                f"CALIBRATION_DRY_RUN_HOUR must be 0-23; got={v}"
             )
         return v
 

@@ -99,6 +99,20 @@ _combo_refresh_streak_last_alerted = 0
 # as last_refresh_date / last_digest_date — once per local day per process.
 _last_suspension_date = ""
 
+# Last YYYY-MM-DD that the weekly calibration dry-run scheduler fired.
+# Same module-level-sentinel idempotency as _last_suspension_date.
+# Test-only reset helper exposed below per project convention
+# (mirrors `scout.trading.params.clear_cache_for_tests` shape).
+_last_calibration_dryrun_date = ""
+
+
+def _clear_calibration_dryrun_date_for_tests() -> None:
+    """Reset module-level sentinel (test isolation per arch-D5 + adv-M1).
+    Conftest registers an autouse fixture that calls this so T6 (sets
+    sentinel to today) doesn't poison T8/T0."""
+    global _last_calibration_dryrun_date
+    _last_calibration_dryrun_date = ""
+
 
 async def _run_feedback_schedulers(
     db,
@@ -183,6 +197,62 @@ async def _run_feedback_schedulers(
             last_digest_date = today_iso
         except Exception:
             logger.exception("weekly_digest_loop_error")
+
+    # Weekly calibration dry-run alert
+    # (CALIBRATION_DRY_RUN_WEEKDAY/_HOUR local; gated on
+    # CALIBRATION_DRY_RUN_ENABLED kill-switch per adv-S1).
+    # NEVER auto-applies — operator manually re-runs with --apply
+    # after reviewing the Telegram message.
+    global _last_calibration_dryrun_date
+    if (
+        settings.CALIBRATION_DRY_RUN_ENABLED
+        and now_local.weekday() == settings.CALIBRATION_DRY_RUN_WEEKDAY
+        and now_local.hour == settings.CALIBRATION_DRY_RUN_HOUR
+        and _last_calibration_dryrun_date != today_iso
+    ):
+        try:
+            from scout.trading.calibrate import (
+                build_diffs,
+                format_dryrun_telegram_message,
+                telegram_token_looks_real,
+            )
+            diffs = await build_diffs(
+                db, settings,
+                window_days=settings.CALIBRATION_WINDOW_DAYS,
+                min_trades=settings.CALIBRATION_MIN_TRADES,
+                step=settings.CALIBRATION_STEP_SIZE_PCT,
+                signal_filter=None,
+                since_deploy=True,  # adv-M3: skip pre-apply contamination
+            )
+            actionable = sum(1 for d in diffs if d.changes)
+            msg = format_dryrun_telegram_message(
+                diffs, actionable,
+                window_days=settings.CALIBRATION_WINDOW_DAYS,
+            )
+            # adv-S2: pass plain text — _format_diff produces [reason]
+            # brackets that Telegram Markdown parser would mis-handle.
+            # alerter.send_telegram_message defaults to Markdown; gate
+            # via token-validity check first.
+            if telegram_token_looks_real(settings):
+                async with aiohttp.ClientSession() as session:
+                    await alerter.send_telegram_message(
+                        msg, session, settings
+                    )
+                logger.info(
+                    "calibration_dryrun_pass",
+                    actionable=actionable,
+                    total=len(diffs),
+                )
+            else:
+                logger.info(
+                    "calibration_dryrun_telegram_skipped",
+                    reason="placeholder_token",
+                    actionable=actionable,
+                    total=len(diffs),
+                )
+            _last_calibration_dryrun_date = today_iso
+        except Exception:
+            logger.exception("calibration_dryrun_loop_error")
 
     return last_refresh_date, last_digest_date
 
