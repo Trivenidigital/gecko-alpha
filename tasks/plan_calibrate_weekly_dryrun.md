@@ -2,6 +2,28 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development.
 
+**v2 changes from 2-agent plan-review (adversarial `aac94615` + architecture `a887799a`):**
+
+*MUST-FIX (4):*
+- **arch-Issue1 / adv-C2 — cross-module private import + missing token guard:** move `_format_diff` body into a NEW public `scout/trading/calibrate.format_dryrun_telegram_message(diffs, actionable, *, window_days)`. Hook in main.py imports the public symbol. Hook ALSO adds explicit `_telegram_token_looks_real(settings)` guard before `send_telegram_message` — without it, T7 cannot pass as written (`send_telegram_message` doesn't gate; just emits warning on 401/404). Emit `calibration_dryrun_telegram_skipped` log when token is placeholder.
+- **adv-M1 — test-isolation:** add `_clear_calibration_dryrun_date_for_tests()` helper in `scout/main.py` paralleling `_reset_signal_sources_cache` pattern; autouse fixture in test file. Without it, T6 (sets sentinel) poisons T8 (expects sentinel unset).
+- **adv-M2 — missing positive happy-path test:** add T0 — mock `build_diffs` returning one actionable diff, monkeypatch `alerter.send_telegram_message`, assert it called ONCE + `calibration_dryrun_pass` log fires + sentinel advanced. T6/T8 are vacuous without T0.
+- **adv-M3 — pre-apply history contamination:** switch hardcoded `since_deploy=False` to `True` (matches calibrate CLI default). Avoids re-recommending changes already applied.
+
+*SHOULD-FIX (4):*
+- **adv-S1 — promote kill-switch to in-scope:** add `CALIBRATION_DRY_RUN_ENABLED: bool = True` Settings field; gate the hook on it. Plain `if not settings.CALIBRATION_DRY_RUN_ENABLED: return`. No `.env` workaround otherwise (validators reject WEEKDAY=99 / HOUR=99).
+- **adv-S2 — Markdown escape:** `_format_diff` produces `[low_win]` which breaks Telegram Markdown parser. Solution: pass `parse_mode=None` to send_telegram_message via a new optional kwarg, OR use `_escape_md` wrap. Easiest: pass plain text — calibration diff is machine-readable prose, not Markdown.
+- **adv-S3 — missed-window detection:** add `calibration_dryrun_window_missed` structured log (post-hoc grep target) when sentinel != today AND current time is within `HOUR+1`.
+- **arch-NIT-5 — Settings field placement:** put new fields with `CALIBRATION_*` block (`config.py:376-378`), not near `SUSPENSION_CHECK_HOUR`. Operator scans for calibration knobs together.
+- **arch-NIT-7 — T5 SignalDiff fixture:** construct real `SignalDiff` dataclass instances (not dict mocks) so type drift fails loudly.
+
+*NIT:*
+- adv-N1: F4 math fix — 7 signals (not 8) since `narrative_prediction` is in `CALIBRATION_EXCLUDE_SIGNALS`.
+- adv-N2: cross-module private-name imports are accepted in this project (other places do it); the underscore is informational, not forbidden.
+- adv-N3: `db` is already in `_run_feedback_schedulers` signature — confirmed.
+
+---
+
 **New primitives introduced:** new in-loop scheduler hook `_run_calibration_dryrun_scheduler()` inside the existing `_run_feedback_schedulers` at `scout/main.py:103-187` (sibling pattern to the existing `maybe_suspend_signals` hook at lines 155-173); new Settings fields `CALIBRATION_DRY_RUN_WEEKDAY: int = 0` (Monday) + `CALIBRATION_DRY_RUN_HOUR: int = 2` (local hour); new module-level idempotency sentinel `_last_calibration_dryrun_date` paralleling `_last_suspension_date` at scout/main.py:100; new structured log events `calibration_dryrun_pass` (success) + `calibration_dryrun_loop_error` (failure); new Telegram message body composed by reusing existing `build_diffs()` from `scout/trading/calibrate.py` + a thin format helper. NO new DB tables, columns, migrations, or dependencies.
 
 **Drift-grounding 60-sec audit (per `feedback_drift_check_before_proposing.md`):**
