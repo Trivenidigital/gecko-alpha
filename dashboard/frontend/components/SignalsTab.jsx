@@ -185,6 +185,170 @@ export default function SignalsTab() {
 
   return (
     <div>
+      {/* ── Section D: Top Gainers Tracker ── (moved to top: high-priority signals) */}
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
+            Top Gainers Tracker
+          </span>
+          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
+            Tokens with 20%+ 24h gain -- did we catch them early?
+          </span>
+        </div>
+
+        {gainersStats && (
+          <div style={{
+            display: 'flex', gap: 24, padding: '12px 16px',
+            borderBottom: '1px solid var(--color-border)', flexWrap: 'wrap',
+          }}>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Gainers Hit Rate</div>
+              <div style={{
+                fontSize: 22, fontWeight: 700,
+                color: gainersStats.hit_rate_pct >= 50 ? 'var(--color-accent-green)' : 'var(--color-accent-amber)',
+              }}>
+                {gainersStats.caught}/{gainersStats.total_tracked} ({gainersStats.hit_rate_pct}%)
+              </div>
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Avg Lead</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--color-accent-green)' }}>
+                {gainersStats.avg_lead_minutes != null ? (gainersStats.avg_lead_minutes / 60).toFixed(1) + 'h' : '-'}
+              </div>
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Missed</div>
+              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--color-accent-red, #ef5350)' }}>{gainersStats.missed}</div>
+            </div>
+          </div>
+        )}
+
+        {gainersComps.length === 0 ? (
+          <div className="empty-state">No gainers data yet. The tracker runs every cycle.</div>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table className="candidates-table">
+              <thead>
+                <tr>
+                  <SortHeader col="symbol" label="Token" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="price_change_24h" label="24h %" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="price_change_7d" label="7d %" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="price_at_detection" label="Detected Price" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="price_current" label="Current Price" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="_gain_since" label="Gain Since Detection" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="peak_gain_pct" label="Peak Gain" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="market_cap" label="MCap" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="_lead_minutes" label="Lead Time" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <SortHeader col="appeared_on_gainers_at" label="Gained At" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <th>Detected By</th>
+                </tr>
+              </thead>
+              <tbody>
+                {gainersSort.sorted.map((c, i) => {
+                  // See Early Catches block above for rename rationale.
+                  const methods = []
+                  if (c.detected_by_narrative) methods.push('Narrative')
+                  if (c.detected_by_pipeline) methods.push('Pipeline')
+                  if (c.detected_by_chains) methods.push('Early Signal')
+                  if (c.detected_by_spikes) methods.push('Spikes')
+                  const detectedBy = methods.length > 0 ? methods.join(' + ') : (c.is_gap ? 'MISSED' : '-')
+                  return (
+                    <tr key={c.coin_id || i}>
+                      <td>
+                        <TokenLink tokenId={c.coin_id} symbol={c.symbol || c.name} chain="coingecko" />
+                      </td>
+                      <td style={{ fontWeight: 700 }}>
+                        {c.price_change_24h != null ? (
+                          <span style={{ color: 'var(--color-accent-green)' }}>
+                            +{Number(c.price_change_24h).toFixed(1)}%
+                          </span>
+                        ) : '-'}
+                      </td>
+                      <td style={{ fontWeight: 700 }}>
+                        {c.price_change_7d != null ? (
+                          <span style={{ color: c.price_change_7d > 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
+                            {c.price_change_7d > 0 ? '+' : ''}{Number(c.price_change_7d).toFixed(1)}%
+                          </span>
+                        ) : '-'}
+                      </td>
+                      <td style={{ fontSize: 12 }}>{fmtPrice(c.price_at_detection)}</td>
+                      <td style={{ fontSize: 12 }}>{fmtPrice(c.price_current)}</td>
+                      <td style={{ fontWeight: 700 }}>
+                        {c._gain_since != null ? (
+                          <span style={{ color: c._gain_since >= 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
+                            {c._gain_since >= 0 ? '+' : ''}{c._gain_since.toFixed(1)}%
+                          </span>
+                        ) : '-'}
+                      </td>
+                      <td style={{ fontWeight: 700 }}>
+                        {c.peak_gain_pct != null ? (
+                          <span style={{ color: 'var(--color-accent-green)' }}>
+                            +{Number(c.peak_gain_pct).toFixed(1)}%
+                          </span>
+                        ) : '-'}
+                      </td>
+                      <td style={{ fontSize: 12 }}>{fmtNum(c.market_cap)}</td>
+                      <td>
+                        <span style={{ fontWeight: 700, color: leadTimeColor(c._lead_minutes) }}>
+                          {fmtLeadTime(c._lead_minutes)}
+                        </span>
+                      </td>
+                      <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
+                        {fmtDate(c.appeared_on_gainers_at)}
+                      </td>
+                      <td style={{ fontSize: 12 }}>{detectedBy}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {missedGainers.length > 0 && (
+          <div style={{ marginTop: 8 }}>
+            <div
+              style={{
+                cursor: 'pointer', padding: '8px 12px',
+                fontSize: 12, color: 'var(--color-accent-red, #ef5350)',
+                display: 'flex', alignItems: 'center', gap: 8,
+              }}
+              onClick={() => setShowMissed(!showMissed)}
+            >
+              {showMissed ? '▼' : '▶'} Missed ({missedGainers.length})
+            </div>
+            {showMissed && (
+              <div style={{ overflowX: 'auto' }}>
+                <table className="candidates-table">
+                  <thead>
+                    <tr>
+                      <th>Token</th>
+                      <th>24h % (at time)</th>
+                      <th>Gained At</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {missedGainers.map((c, i) => (
+                      <tr key={c.coin_id || i} style={{ opacity: 0.7 }}>
+                        <td>
+                          <TokenLink tokenId={c.coin_id} symbol={c.symbol || c.name} chain="coingecko" />
+                        </td>
+                        <td style={{ fontWeight: 600, color: 'var(--color-accent-green)' }}>
+                          +{Number(c.price_change_24h).toFixed(1)}%
+                        </td>
+                        <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
+                          {fmtDate(c.appeared_on_gainers_at)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
       {/* ── Section A: Early Catches ── */}
       <div className="panel" style={{ marginBottom: 16 }}>
         <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -541,170 +705,6 @@ export default function SignalsTab() {
                 ))}
               </tbody>
             </table>
-          </div>
-        )}
-      </div>
-
-      {/* ── Section D: Top Gainers Tracker ── */}
-      <div className="panel" style={{ marginBottom: 16 }}>
-        <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
-            Top Gainers Tracker
-          </span>
-          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
-            Tokens with 20%+ 24h gain -- did we catch them early?
-          </span>
-        </div>
-
-        {gainersStats && (
-          <div style={{
-            display: 'flex', gap: 24, padding: '12px 16px',
-            borderBottom: '1px solid var(--color-border)', flexWrap: 'wrap',
-          }}>
-            <div style={{ textAlign: 'center' }}>
-              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Gainers Hit Rate</div>
-              <div style={{
-                fontSize: 22, fontWeight: 700,
-                color: gainersStats.hit_rate_pct >= 50 ? 'var(--color-accent-green)' : 'var(--color-accent-amber)',
-              }}>
-                {gainersStats.caught}/{gainersStats.total_tracked} ({gainersStats.hit_rate_pct}%)
-              </div>
-            </div>
-            <div style={{ textAlign: 'center' }}>
-              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Avg Lead</div>
-              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--color-accent-green)' }}>
-                {gainersStats.avg_lead_minutes != null ? (gainersStats.avg_lead_minutes / 60).toFixed(1) + 'h' : '-'}
-              </div>
-            </div>
-            <div style={{ textAlign: 'center' }}>
-              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>Missed</div>
-              <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--color-accent-red, #ef5350)' }}>{gainersStats.missed}</div>
-            </div>
-          </div>
-        )}
-
-        {gainersComps.length === 0 ? (
-          <div className="empty-state">No gainers data yet. The tracker runs every cycle.</div>
-        ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table className="candidates-table">
-              <thead>
-                <tr>
-                  <SortHeader col="symbol" label="Token" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
-                  <SortHeader col="price_change_24h" label="24h %" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
-                  <SortHeader col="price_change_7d" label="7d %" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
-                  <SortHeader col="price_at_detection" label="Detected Price" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
-                  <SortHeader col="price_current" label="Current Price" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
-                  <SortHeader col="_gain_since" label="Gain Since Detection" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
-                  <SortHeader col="peak_gain_pct" label="Peak Gain" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
-                  <SortHeader col="market_cap" label="MCap" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
-                  <SortHeader col="_lead_minutes" label="Lead Time" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
-                  <SortHeader col="appeared_on_gainers_at" label="Gained At" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
-                  <th>Detected By</th>
-                </tr>
-              </thead>
-              <tbody>
-                {gainersSort.sorted.map((c, i) => {
-                  // See Early Catches block above for rename rationale.
-                  const methods = []
-                  if (c.detected_by_narrative) methods.push('Narrative')
-                  if (c.detected_by_pipeline) methods.push('Pipeline')
-                  if (c.detected_by_chains) methods.push('Early Signal')
-                  if (c.detected_by_spikes) methods.push('Spikes')
-                  const detectedBy = methods.length > 0 ? methods.join(' + ') : (c.is_gap ? 'MISSED' : '-')
-                  return (
-                    <tr key={c.coin_id || i}>
-                      <td>
-                        <TokenLink tokenId={c.coin_id} symbol={c.symbol || c.name} chain="coingecko" />
-                      </td>
-                      <td style={{ fontWeight: 700 }}>
-                        {c.price_change_24h != null ? (
-                          <span style={{ color: 'var(--color-accent-green)' }}>
-                            +{Number(c.price_change_24h).toFixed(1)}%
-                          </span>
-                        ) : '-'}
-                      </td>
-                      <td style={{ fontWeight: 700 }}>
-                        {c.price_change_7d != null ? (
-                          <span style={{ color: c.price_change_7d > 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
-                            {c.price_change_7d > 0 ? '+' : ''}{Number(c.price_change_7d).toFixed(1)}%
-                          </span>
-                        ) : '-'}
-                      </td>
-                      <td style={{ fontSize: 12 }}>{fmtPrice(c.price_at_detection)}</td>
-                      <td style={{ fontSize: 12 }}>{fmtPrice(c.price_current)}</td>
-                      <td style={{ fontWeight: 700 }}>
-                        {c._gain_since != null ? (
-                          <span style={{ color: c._gain_since >= 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)' }}>
-                            {c._gain_since >= 0 ? '+' : ''}{c._gain_since.toFixed(1)}%
-                          </span>
-                        ) : '-'}
-                      </td>
-                      <td style={{ fontWeight: 700 }}>
-                        {c.peak_gain_pct != null ? (
-                          <span style={{ color: 'var(--color-accent-green)' }}>
-                            +{Number(c.peak_gain_pct).toFixed(1)}%
-                          </span>
-                        ) : '-'}
-                      </td>
-                      <td style={{ fontSize: 12 }}>{fmtNum(c.market_cap)}</td>
-                      <td>
-                        <span style={{ fontWeight: 700, color: leadTimeColor(c._lead_minutes) }}>
-                          {fmtLeadTime(c._lead_minutes)}
-                        </span>
-                      </td>
-                      <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
-                        {fmtDate(c.appeared_on_gainers_at)}
-                      </td>
-                      <td style={{ fontSize: 12 }}>{detectedBy}</td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-
-        {missedGainers.length > 0 && (
-          <div style={{ marginTop: 8 }}>
-            <div
-              style={{
-                cursor: 'pointer', padding: '8px 12px',
-                fontSize: 12, color: 'var(--color-accent-red, #ef5350)',
-                display: 'flex', alignItems: 'center', gap: 8,
-              }}
-              onClick={() => setShowMissed(!showMissed)}
-            >
-              {showMissed ? '\u25BC' : '\u25B6'} Missed ({missedGainers.length})
-            </div>
-            {showMissed && (
-              <div style={{ overflowX: 'auto' }}>
-                <table className="candidates-table">
-                  <thead>
-                    <tr>
-                      <th>Token</th>
-                      <th>24h % (at time)</th>
-                      <th>Gained At</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {missedGainers.map((c, i) => (
-                      <tr key={c.coin_id || i} style={{ opacity: 0.7 }}>
-                        <td>
-                          <TokenLink tokenId={c.coin_id} symbol={c.symbol || c.name} chain="coingecko" />
-                        </td>
-                        <td style={{ fontWeight: 600, color: 'var(--color-accent-green)' }}>
-                          +{Number(c.price_change_24h).toFixed(1)}%
-                        </td>
-                        <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
-                          {fmtDate(c.appeared_on_gainers_at)}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
           </div>
         )}
       </div>
