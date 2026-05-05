@@ -1840,42 +1840,106 @@ class Database:
           - signal_params.high_peak_fade_enabled INTEGER DEFAULT 0
           - high_peak_fade_audit table (records both real and dry-run fires)
 
-        Idempotent: column-add and table-create are guarded by IF NOT EXISTS
-        (column-add via try/except on duplicate-column OperationalError,
-        consistent with existing migration pattern).
-        """
-        try:
-            await self._conn.execute(
-                "ALTER TABLE signal_params "
-                "ADD COLUMN high_peak_fade_enabled INTEGER NOT NULL DEFAULT 0"
-            )
-        except aiosqlite.OperationalError as e:
-            if "duplicate column name" not in str(e).lower():
-                raise
+        Wrapped in ``BEGIN EXCLUSIVE`` / ``ROLLBACK`` and stamped with a
+        ``schema_version`` row + ``paper_migrations`` cutover marker, consistent
+        with the pattern established by ``_migrate_feedback_loop_schema``,
+        ``_migrate_live_trading_schema``, and ``_migrate_signal_params_schema``.
 
-        await self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS high_peak_fade_audit (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                trade_id     INTEGER NOT NULL,
-                token_id     TEXT    NOT NULL,
-                signal_type  TEXT    NOT NULL,
-                peak_pct     REAL    NOT NULL,
-                peak_price   REAL    NOT NULL,
-                current_price REAL   NOT NULL,
-                fired_at     TEXT    NOT NULL,
-                dry_run      INTEGER NOT NULL,
-                FOREIGN KEY (trade_id) REFERENCES paper_trades(id)
+        Idempotent: column-add is guarded by a PRAGMA existence-check;
+        table-create and index-create use IF NOT EXISTS; inserts use
+        INSERT OR IGNORE.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+
+            # Defensive create — mirrors _migrate_signal_params_schema guard so
+            # this migration is safe even if run in isolation (e.g. tests).
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY,
+                    cutover_ts TEXT NOT NULL
+                )
+                """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )
+                """)
+
+            # Column-add: guarded by PRAGMA to stay idempotent under
+            # BEGIN EXCLUSIVE (ALTER TABLE inside a transaction is valid in
+            # SQLite 3.x; the PRAGMA read is also valid inside the txn).
+            cur_pragma = await conn.execute("PRAGMA table_info(signal_params)")
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            if "high_peak_fade_enabled" not in existing_cols:
+                await conn.execute(
+                    "ALTER TABLE signal_params "
+                    "ADD COLUMN high_peak_fade_enabled INTEGER NOT NULL DEFAULT 0"
+                )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS high_peak_fade_audit (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id     INTEGER NOT NULL,
+                    token_id     TEXT    NOT NULL,
+                    signal_type  TEXT    NOT NULL,
+                    peak_pct     REAL    NOT NULL,
+                    peak_price   REAL    NOT NULL,
+                    current_price REAL   NOT NULL,
+                    fired_at     TEXT    NOT NULL,
+                    dry_run      INTEGER NOT NULL,
+                    FOREIGN KEY (trade_id) REFERENCES paper_trades(id)
+                )
+                """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_hpf_audit_trade_id "
+                "ON high_peak_fade_audit(trade_id)"
             )
-            """)
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_hpf_audit_trade_id "
-            "ON high_peak_fade_audit(trade_id)"
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_hpf_audit_fired_at "
+                "ON high_peak_fade_audit(fired_at)"
+            )
+
+            # Behavioural cutover marker (matches BL-061..BL-067 pattern).
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_hpf_v1", now_iso),
+            )
+            # Code-level schema version stamp (matches BL-055 / Tier-1a pattern).
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260505, now_iso, "bl_hpf_v1_high_peak_fade"),
+            )
+
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_hpf_v1")
+            raise
+
+        # Post-assertion — cutover row must exist after a successful migration.
+        cur = await conn.execute(
+            "SELECT 1 FROM paper_migrations WHERE name = ?",
+            ("bl_hpf_v1",),
         )
-        await self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_hpf_audit_fired_at "
-            "ON high_peak_fade_audit(fired_at)"
-        )
-        await self._conn.commit()
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError("bl_hpf_v1 cutover row missing after migration")
 
     # ------------------------------------------------------------------
     # Candidates
