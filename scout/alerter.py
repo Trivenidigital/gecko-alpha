@@ -122,15 +122,26 @@ async def send_telegram_message(
     text: str,
     session: aiohttp.ClientSession,
     settings: Settings,
+    *,
+    parse_mode: str | None = "Markdown",
 ) -> None:
-    """Send a plain text message to Telegram."""
+    """Send a Telegram message.
+
+    `parse_mode` defaults to `"Markdown"` for back-compat with all
+    pre-existing callers. Pass `parse_mode=None` to send plain text
+    (caller already escaped or doesn't want Markdown parsing —
+    e.g., calibrate dry-run alerts whose body contains `[reason]`
+    brackets that the Markdown parser would mis-handle as link
+    anchors → silent 400 BAD_REQUEST per PR #76 silent-failure C1).
+    """
     text = _truncate(text)
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
+    payload: dict = {
         "chat_id": settings.TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",
     }
+    if parse_mode is not None:
+        payload["parse_mode"] = parse_mode
     try:
         async with session.post(url, json=payload) as resp:
             if resp.status != 200:

@@ -101,30 +101,35 @@ def test_format_dryrun_telegram_message_shape():
         format_dryrun_telegram_message,
     )
 
-    # Real SignalDiff with no changes (skipped path)
+    # Real SignalDiff (skipped path) — `reason` is a @property derived
+    # from `reason_parts`, NOT an init arg. PR #76 test-coverage review
+    # caught my earlier fixture which used wrong field names.
     skipped_diff = SignalDiff(
         signal_type="losers_contrarian",
-        stats=None,
+        stats=SignalStats(
+            signal_type="losers_contrarian",
+            n_trades=18,
+            win_rate_pct=44.4,
+            expired_pct=22.2,
+            avg_loss_pct=-12.0,
+            avg_winner_peak_pct=8.0,
+        ),
         changes=[],
+        reason_parts=[],
         skipped_reason="n_trades 18 < min 50",
-        reason=None,
     )
-    # Real SignalDiff with no changes (no_change path)
     nochange_diff = SignalDiff(
         signal_type="first_signal",
         stats=SignalStats(
+            signal_type="first_signal",
             n_trades=87,
-            wins=45,
-            losses=42,
-            expired=11,
             win_rate_pct=51.7,
             expired_pct=12.6,
-            avg_pnl_pct=2.1,
             avg_loss_pct=-15.0,
+            avg_winner_peak_pct=18.0,
         ),
         changes=[],
-        skipped_reason=None,
-        reason=None,
+        reason_parts=[],
     )
     msg = format_dryrun_telegram_message(
         [skipped_diff, nochange_diff],
@@ -156,21 +161,21 @@ async def test_calibration_dryrun_scheduler_happy_path_fires_alert(
     blank + real token), hook calls send_telegram_message ONCE +
     `calibration_dryrun_pass` log fires + sentinel advances."""
     from scout import main as scout_main
-    from scout.trading.calibrate import SignalDiff, SignalStats
+    from scout.trading.calibrate import FieldChange, SignalDiff, SignalStats
 
     # Real SignalDiff with one change to make actionable=1
     actionable_diff = SignalDiff(
         signal_type="gainers_early",
         stats=SignalStats(
-            n_trades=131, wins=69, losses=62, expired=11,
-            win_rate_pct=52.6, expired_pct=8.4,
-            avg_pnl_pct=1.2, avg_loss_pct=-15.0,
+            signal_type="gainers_early",
+            n_trades=131,
+            win_rate_pct=52.6,
+            expired_pct=8.4,
+            avg_loss_pct=-15.0,
+            avg_winner_peak_pct=22.0,
         ),
-        changes=[
-            SimpleNamespace(field="trail_pct", old=20.0, new=18.0),
-        ],
-        skipped_reason=None,
-        reason="expired%",
+        changes=[FieldChange(field="trail_pct", old=20.0, new=18.0)],
+        reason_parts=["expired%"],
     )
 
     async def _fake_build_diffs(*a, **kw):
@@ -216,6 +221,77 @@ async def test_calibration_dryrun_scheduler_happy_path_fires_alert(
     assert "calibration_dryrun_pass" in events
     # Sentinel advanced
     assert scout_main._last_calibration_dryrun_date == "2026-05-06"
+
+
+# ---------------------------------------------------------------------------
+# T0b: parse_mode=None plumbed through to Telegram (CRITICAL — PR #76
+#      silent-failure C1: without this, [reason] brackets break Markdown
+#      and Telegram silently 400s every weekly fire)
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_AIOHTTP
+@pytest.mark.asyncio
+async def test_calibration_dryrun_passes_parse_mode_none_to_telegram(
+    monkeypatch, settings_factory
+):
+    """T0b — pin that the dispatcher calls send_telegram_message with
+    parse_mode=None. Without this kwarg the message body containing
+    `[expired%]` brackets breaks Telegram Markdown parser; alert silently
+    400s. Pinned via monkeypatched send that captures kwargs."""
+    from scout import main as scout_main
+    from scout.trading.calibrate import FieldChange, SignalDiff, SignalStats
+
+    actionable_diff = SignalDiff(
+        signal_type="gainers_early",
+        stats=SignalStats(
+            signal_type="gainers_early",
+            n_trades=131,
+            win_rate_pct=52.6,
+            expired_pct=8.4,
+            avg_loss_pct=-15.0,
+            avg_winner_peak_pct=22.0,
+        ),
+        changes=[FieldChange(field="trail_pct", old=20.0, new=18.0)],
+        reason_parts=["expired%"],
+    )
+
+    captured_kwargs: list[dict] = []
+
+    async def _capture_send(msg, session, settings, **kwargs):
+        captured_kwargs.append(kwargs)
+
+    async def _fake_build_diffs(*a, **kw):
+        return [actionable_diff]
+
+    monkeypatch.setattr(
+        "scout.trading.calibrate.build_diffs", _fake_build_diffs
+    )
+    monkeypatch.setattr(
+        "scout.alerter.send_telegram_message", _capture_send
+    )
+    monkeypatch.setattr(
+        "scout.trading.calibrate.telegram_token_looks_real",
+        lambda s: True,
+    )
+
+    settings = settings_factory(
+        CALIBRATION_DRY_RUN_ENABLED=True,
+        CALIBRATION_DRY_RUN_WEEKDAY=2,
+        CALIBRATION_DRY_RUN_HOUR=14,
+    )
+    now_local = datetime(2026, 5, 6, 14, 30)
+    await scout_main._run_feedback_schedulers(
+        db=None, settings=settings,
+        last_refresh_date="", last_digest_date="",
+        now_local=now_local,
+    )
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0].get("parse_mode") is None, (
+        "PR #76 silent-failure C1 regression: dispatcher did not pass "
+        "parse_mode=None — Markdown parser will silently 400 on "
+        "[reason] brackets in production"
+    )
 
 
 # ---------------------------------------------------------------------------

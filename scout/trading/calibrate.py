@@ -454,11 +454,6 @@ def _format_diff(diff: SignalDiff) -> str:
     return head + f"→ {body} [{diff.reason}]"
 
 
-# Public alias: weekly-cron scheduler at scout/main.py imports this directly
-# (vs reaching for the underscore-private name across module boundaries).
-format_diff = _format_diff
-
-
 def format_dryrun_telegram_message(
     diffs: list[SignalDiff],
     actionable: int,
