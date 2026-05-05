@@ -113,7 +113,13 @@ export default function SignalsTab() {
         fetch('/api/narrative/predictions?limit=20'),
         fetch('/api/spikes/recent?limit=15'),
         fetch('/api/spikes/stats'),
-        fetch('/api/gainers/comparisons?limit=30'),
+        // limit=100 (was 30): backend orders by appeared_on_gainers_at DESC,
+        // so a 30-row cutoff drops older big-peak entries (ASTEROID +925%,
+        // LAB +606% on 2026-05-04 fell off the next day when 30+ newer
+        // gainers were detected). 100 gives ~3-4 days of context at
+        // current ~30/day detection rate; operator can sort by peak_gain_pct
+        // column to surface biggest movers.
+        fetch('/api/gainers/comparisons?limit=100'),
         fetch('/api/gainers/stats'),
         fetch('/api/momentum/7d?limit=15'),
         fetch('/api/momentum/7d/stats'),
