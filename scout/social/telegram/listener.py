@@ -12,12 +12,10 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 import aiohttp
 import structlog
-from typing import TypedDict
-
 from telethon import TelegramClient, events
 
 
@@ -33,8 +31,10 @@ class ChannelsHolder(TypedDict):
     yields `list[str]`. Structural typing — runtime-equivalent to dict.
 
     Future-fields growth path (per arch-D4 forward-compat): additional
-    fields can be added as `NotRequired[...]` so existing `{"channels":
-    channels}` literals remain valid.
+    OPTIONAL fields can be added as `NotRequired[...]` so existing
+    `{"channels": channels}` literals remain valid. Adding a REQUIRED
+    field would break every literal site — operator must either migrate
+    all sites or scope the field as `NotRequired`.
     """
 
     channels: list[str]
