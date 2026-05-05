@@ -16,7 +16,28 @@ from typing import Any, Literal
 
 import aiohttp
 import structlog
+from typing import TypedDict
+
 from telethon import TelegramClient, events
+
+
+class ChannelsHolder(TypedDict):
+    """BL-064 channel-reload mutable container shared between
+    `_run_listener_body` and `_make_channel_reload_heartbeat` factory.
+    The factory + heartbeat read/write `channels` to coordinate the
+    in-memory channel list across the closure boundary without using
+    `nonlocal` (cleaner test surface; explicit mutation point).
+
+    PR #73 architecture-review NIT cleanup: was bare `dict` annotation;
+    upgraded to TypedDict so pyright can verify `holder["channels"]`
+    yields `list[str]`. Structural typing — runtime-equivalent to dict.
+
+    Future-fields growth path (per arch-D4 forward-compat): additional
+    fields can be added as `NotRequired[...]` so existing `{"channels":
+    channels}` literals remain valid.
+    """
+
+    channels: list[str]
 from telethon.errors import (
     AuthKeyError,
     ChannelPrivateError,
@@ -1187,10 +1208,11 @@ async def _run_listener_body(
             )
 
     # BL-064 channel-reload — heartbeat lifecycle parallel to silence task.
-    # Holder dict because Python's nonlocal doesn't combine cleanly with
-    # the test factory (`_make_channel_reload_heartbeat`); the dict gives
-    # us a mutable container the heartbeat updates in-place.
-    channels_holder = {"channels": channels}
+    # ChannelsHolder TypedDict (PR #73 NIT cleanup) — mutable container
+    # because Python's nonlocal doesn't combine cleanly with the test
+    # factory (`_make_channel_reload_heartbeat`); structural-typed dict
+    # gives pyright something to verify without runtime overhead.
+    channels_holder: ChannelsHolder = {"channels": channels}
     reload_heartbeat = _make_channel_reload_heartbeat(
         db, client, settings, channels_holder, _on_new
     )
@@ -1306,7 +1328,7 @@ def _make_channel_reload_heartbeat(
     db: Database,
     client,
     settings,
-    channels_holder: dict,
+    channels_holder: ChannelsHolder,
     on_new_handler,
 ):
     """BL-064 channel-reload: heartbeat factory.

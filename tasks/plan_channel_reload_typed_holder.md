@@ -23,10 +23,20 @@
 
 ## Drift grounding
 
-**Read before drafting (verified):**
-- `scout/social/telegram/listener.py:1190-1196` — `channels_holder = {"channels": channels}` initialization in `_run_listener_body`.
-- `scout/social/telegram/listener.py:~1245-1255` — `_make_channel_reload_heartbeat(... channels_holder: dict, ...)` parameter (untyped per PR #73 architecture-NIT).
-- `scout/social/telegram/listener.py:~1308` — heartbeat reads/writes `channels_holder["channels"]`.
+**Read before drafting (verified — line numbers refreshed against branch sha 532df64):**
+- `scout/social/telegram/listener.py:15` — existing `from typing import Any, Literal` (extend with `TypedDict`).
+- `scout/social/telegram/listener.py:1193` — `channels_holder = {"channels": channels}` instantiation in `_run_listener_body`.
+- `scout/social/telegram/listener.py:1195` — passed positionally to `_make_channel_reload_heartbeat`.
+- `scout/social/telegram/listener.py:1309` — `channels_holder: dict` parameter (the bare-dict annotation triggering the NIT).
+- `scout/social/telegram/listener.py:1355,1358` — heartbeat closure write/read; pyright infers from captured TypedDict, no annotation needed.
+- `tests/test_bl064_channel_reload.py:200,231` — test mocks construct bare `{"channels": [...]}` literal. **TypedDict is structural in CPython** — bare dict satisfies type at runtime; tests pass unchanged.
+
+**v2 plan-review fixes (item1-adv `ab2139f6` + item1-arch `a900a032`):**
+- adv-SF1: line numbers refreshed (was 1190/1245/1308; stale ~47 lines vs actual 1193/1195/1309).
+- adv-N1 / arch-D3: extend existing `from typing import Any, Literal` line (NOT a separate import).
+- arch-S1: `@dataclass` rebuttal strengthened — also requires rewriting the dict-literal at line 1193 + every subscript access at 1355/1358 → ~6 LOC invasive vs 0 LOC for TypedDict.
+- arch-D4: TypedDict growth path acknowledged: future fields can be `NotRequired[...]` so existing `{"channels": ...}` literals stay valid.
+- arch-D5: keep module-private (no `__all__` export); only 2 callers in same module.
 - PR #73 architecture review (a1c3edcb) §1+§6: "`channels_holder: dict` is the only untyped seam in an otherwise type-hinted module — gives pyright something to lint." Recommendation: TypedDict OR `@dataclass(slots=True)`. NIT, not blocker.
 
 **Pattern conformance:**
