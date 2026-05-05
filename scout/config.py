@@ -311,6 +311,19 @@ class Settings(BaseSettings):
     PEAK_FADE_ENABLED: bool = True
     PEAK_FADE_MIN_PEAK_PCT: float = 10.0
     PEAK_FADE_RETRACE_RATIO: float = 0.7
+    # BL-NEW-HPF high-peak fade — single-pass tighter exit on confirmed runners.
+    # Fires when peak_pct >= MIN_PEAK_PCT AND current price has retraced
+    # >= RETRACE_PCT from peak. Tighter than moonshot trail (30%) because
+    # the cohort can afford it: capture > give-back at this peak.
+    # See tasks/findings_high_peak_giveback.md §14 for backtest evidence
+    # (n=10 cohort, +$696 lift, bootstrap p5 = $35.42, slippage-robust to 500bps).
+    PAPER_HIGH_PEAK_FADE_ENABLED: bool = False  # master kill, default off
+    PAPER_HIGH_PEAK_FADE_MIN_PEAK_PCT: float = 75.0  # below this, regular trail
+    PAPER_HIGH_PEAK_FADE_RETRACE_PCT: float = 15.0  # tighter than moonshot 30%
+    PAPER_HIGH_PEAK_FADE_DRY_RUN: bool = True  # log-only initially
+    PAPER_HIGH_PEAK_FADE_PER_SIGNAL_OPT_IN: bool = (
+        True  # require signal_params.high_peak_fade_enabled=1
+    )
     TRADING_DIGEST_HOUR_UTC: int = 0  # midnight digest
     TRADING_EVAL_INTERVAL: int = 1800  # 30 min eval cycle
 
@@ -380,7 +393,7 @@ class Settings(BaseSettings):
     # Operator reviews diff in chat, manually re-runs --apply if approved.
     CALIBRATION_DRY_RUN_ENABLED: bool = True
     CALIBRATION_DRY_RUN_WEEKDAY: int = 0  # 0=Mon (matches WEEKLY_DIGEST_WEEKDAY)
-    CALIBRATION_DRY_RUN_HOUR: int = 2     # local hour
+    CALIBRATION_DRY_RUN_HOUR: int = 2  # local hour
     FEEDBACK_CHRONIC_FAILURE_THRESHOLD: int = 3
 
     # -------- Perp WebSocket Anomaly Detector (BL-054) --------
@@ -551,6 +564,15 @@ class Settings(BaseSettings):
     def _validate_peak_fade_retrace_ratio(cls, v: float) -> float:
         if not (0.0 < v < 1.0):
             raise ValueError(f"PEAK_FADE_RETRACE_RATIO must be in (0, 1); got={v}")
+        return v
+
+    @field_validator("PAPER_HIGH_PEAK_FADE_RETRACE_PCT")
+    @classmethod
+    def _validate_high_peak_fade_retrace_pct(cls, v: float) -> float:
+        if not (0 < v < 100):
+            raise ValueError(
+                f"PAPER_HIGH_PEAK_FADE_RETRACE_PCT must be in (0, 100); got={v}"
+            )
         return v
 
     @field_validator("PAPER_MAX_MCAP")
@@ -728,9 +750,7 @@ class Settings(BaseSettings):
     @classmethod
     def _validate_calibration_dry_run_hour(cls, v: int) -> int:
         if not 0 <= v <= 23:
-            raise ValueError(
-                f"CALIBRATION_DRY_RUN_HOUR must be 0-23; got={v}"
-            )
+            raise ValueError(f"CALIBRATION_DRY_RUN_HOUR must be 0-23; got={v}")
         return v
 
     @model_validator(mode="after")
@@ -824,6 +844,33 @@ class Settings(BaseSettings):
                 "PAPER_MOONSHOT_THRESHOLD_PCT when moonshot is enabled; "
                 f"got low_peak={self.PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT}, "
                 f"moonshot={self.PAPER_MOONSHOT_THRESHOLD_PCT}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_high_peak_fade_cross_fields(self) -> "Settings":
+        # MIN_PEAK_PCT must be > moonshot threshold so the gate only fires
+        # in the moonshot regime (peak >= 40%). Below that, the regular
+        # adaptive trail (sp.trail_pct_low_peak / sp.trail_pct) handles it.
+        if self.PAPER_HIGH_PEAK_FADE_MIN_PEAK_PCT <= self.PAPER_MOONSHOT_THRESHOLD_PCT:
+            raise ValueError(
+                "PAPER_HIGH_PEAK_FADE_MIN_PEAK_PCT must be > "
+                "PAPER_MOONSHOT_THRESHOLD_PCT (gate targets moonshot regime); "
+                f"got high_peak={self.PAPER_HIGH_PEAK_FADE_MIN_PEAK_PCT}, "
+                f"moonshot={self.PAPER_MOONSHOT_THRESHOLD_PCT}"
+            )
+        # RETRACE_PCT must be tighter than the moonshot trail, otherwise
+        # the gate is a no-op (moonshot trail fires first).
+        if (
+            self.PAPER_HIGH_PEAK_FADE_RETRACE_PCT
+            >= self.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT
+        ):
+            raise ValueError(
+                "PAPER_HIGH_PEAK_FADE_RETRACE_PCT must be < "
+                "PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT (must be tighter than "
+                "moonshot trail); "
+                f"got retrace={self.PAPER_HIGH_PEAK_FADE_RETRACE_PCT}, "
+                f"moonshot_trail={self.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT}"
             )
         return self
 
