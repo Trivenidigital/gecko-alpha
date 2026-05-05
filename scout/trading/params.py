@@ -81,6 +81,10 @@ class SignalParams:
     # both in the Settings fallback path and in the table path. Default
     # value placed last to preserve existing positional construction sites.
     conviction_lock_enabled: bool = False
+    # BL-NEW-HPF high-peak fade per-signal opt-in. Default False (fail-closed).
+    # Requires signal_params.high_peak_fade_enabled=1 when master
+    # PAPER_HIGH_PEAK_FADE_PER_SIGNAL_OPT_IN=True (the default).
+    high_peak_fade_enabled: bool = False
 
 
 # Module-level cache. Keyed by signal_type, value = (params, expires_at).
@@ -158,11 +162,13 @@ async def get_params(
     # BL-067: conviction_lock_enabled is row[10]. Existing column count
     # before this PR was 10 (indexes 0..9). Per design-v2 adv-N1, signal_type
     # is NOT in the SELECT — caller passes it as the function argument.
+    # BL-NEW-HPF: high_peak_fade_enabled is row[11].
     cursor = await db._conn.execute(
         """SELECT leg_1_pct, leg_1_qty_frac, leg_2_pct, leg_2_qty_frac,
                   trail_pct, trail_pct_low_peak, low_peak_threshold_pct,
                   sl_pct, max_duration_hours, enabled,
-                  conviction_lock_enabled
+                  conviction_lock_enabled,
+                  high_peak_fade_enabled
            FROM signal_params WHERE signal_type = ?""",
         (signal_type,),
     )
@@ -192,6 +198,7 @@ async def get_params(
             enabled=bool(row[9]),
             source="table",
             conviction_lock_enabled=bool(row[10]),
+            high_peak_fade_enabled=bool(row[11]),
         )
 
     _cache[signal_type] = (params, now + _CACHE_TTL_SEC, _cache_version)
