@@ -622,3 +622,284 @@ async def test_empty_window_does_not_trigger_either_gate(tmp_path, settings_fact
     cur = await db._conn.execute("SELECT COUNT(*) FROM signal_params WHERE enabled = 1")
     assert (await cur.fetchone())[0] > 0  # all signals still enabled
     await db.close()
+
+
+# BL-NEW-REVIVAL-COOLOFF: cool-off between consecutive operator revivals
+
+
+async def test_revive_first_time_never_blocks(tmp_path, settings_factory):
+    """Signal with NO prior revival audit row — must succeed regardless of cool-off."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0, suspended_reason='auto_suspend' "
+        "WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    s = settings_factory(SIGNAL_REVIVAL_MIN_SOAK_DAYS=7)
+    # First revival — no cool-off applies
+    await db.revive_signal_with_baseline(
+        "gainers_early", reason="first revival", settings=s
+    )
+    cur = await db._conn.execute(
+        "SELECT enabled FROM signal_params WHERE signal_type='gainers_early'"
+    )
+    assert (await cur.fetchone())[0] == 1
+    await db.close()
+
+
+async def test_revive_within_cooloff_window_raises(tmp_path, settings_factory):
+    """Second revival within SIGNAL_REVIVAL_MIN_SOAK_DAYS must raise ValueError."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(SIGNAL_REVIVAL_MIN_SOAK_DAYS=7)
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    await db.revive_signal_with_baseline("gainers_early", reason="first", settings=s)
+    # Re-suspend (simulate auto_suspend re-firing)
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0, suspended_reason='auto_suspend' "
+        "WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    with pytest.raises(ValueError, match="cool-off"):
+        await db.revive_signal_with_baseline(
+            "gainers_early", reason="second within window", settings=s
+        )
+    await db.close()
+
+
+async def test_revive_after_cooloff_window_allows(tmp_path, settings_factory):
+    """Backdate the prior revival audit row > 7 days; second revival succeeds."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(SIGNAL_REVIVAL_MIN_SOAK_DAYS=7)
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    await db.revive_signal_with_baseline("gainers_early", reason="first", settings=s)
+    # Backdate the audit row 8 days ago
+    eight_days_ago = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+    await db._conn.execute(
+        "UPDATE signal_params_audit SET applied_at=? "
+        "WHERE signal_type='gainers_early' AND applied_by='operator'",
+        (eight_days_ago,),
+    )
+    # Re-suspend
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0, suspended_reason='auto_suspend' "
+        "WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    # Should succeed — past cool-off
+    await db.revive_signal_with_baseline(
+        "gainers_early", reason="second after window", settings=s
+    )
+    cur = await db._conn.execute(
+        "SELECT enabled FROM signal_params WHERE signal_type='gainers_early'"
+    )
+    assert (await cur.fetchone())[0] == 1
+    await db.close()
+
+
+async def test_revive_force_true_bypasses_cooloff(tmp_path, settings_factory):
+    """force=True must bypass the cool-off check."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(SIGNAL_REVIVAL_MIN_SOAK_DAYS=7)
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    await db.revive_signal_with_baseline("gainers_early", reason="first", settings=s)
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    # Should succeed even though within window
+    await db.revive_signal_with_baseline(
+        "gainers_early", reason="emergency override", force=True, settings=s
+    )
+    cur = await db._conn.execute(
+        "SELECT enabled FROM signal_params WHERE signal_type='gainers_early'"
+    )
+    assert (await cur.fetchone())[0] == 1
+    await db.close()
+
+
+async def test_revive_force_true_audit_marks_bypass(tmp_path, settings_factory):
+    """The bypass revival's audit row must contain a marker so operators
+    reading history can see the cool-off was overridden."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(SIGNAL_REVIVAL_MIN_SOAK_DAYS=7)
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    await db.revive_signal_with_baseline("gainers_early", reason="first", settings=s)
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    await db.revive_signal_with_baseline(
+        "gainers_early", reason="emergency override", force=True, settings=s
+    )
+    cur = await db._conn.execute(
+        "SELECT reason FROM signal_params_audit WHERE signal_type='gainers_early' "
+        "AND applied_by='operator' ORDER BY applied_at DESC LIMIT 1"
+    )
+    reason = (await cur.fetchone())[0]
+    assert (
+        "force" in reason.lower() or "bypass" in reason.lower()
+    ), f"force=True audit must mark bypass; got: {reason}"
+    await db.close()
+
+
+async def test_revive_cooloff_independent_per_signal(tmp_path, settings_factory):
+    """Reviving signal A within window does NOT block reviving signal B."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(SIGNAL_REVIVAL_MIN_SOAK_DAYS=7)
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 "
+        "WHERE signal_type IN ('gainers_early', 'losers_contrarian')"
+    )
+    await db._conn.commit()
+    await db.revive_signal_with_baseline("gainers_early", reason="first GE", settings=s)
+    # Should succeed despite gainers_early being within cool-off
+    await db.revive_signal_with_baseline(
+        "losers_contrarian", reason="first LC", settings=s
+    )
+    cur = await db._conn.execute(
+        "SELECT signal_type, enabled FROM signal_params "
+        "WHERE signal_type IN ('gainers_early', 'losers_contrarian') ORDER BY signal_type"
+    )
+    rows = await cur.fetchall()
+    assert all(r[1] == 1 for r in rows)
+    await db.close()
+
+
+async def test_revive_force_true_no_warning_on_first_revival(
+    tmp_path, settings_factory
+):
+    """Per design-stage operator-experience reviewer RECOMMEND + PR-stage
+    code reviewer CRITICAL fix: force=True on a signal with NO prior
+    revival audit row must NOT emit the revive_signal_force_bypass
+    WARNING (no actual bypass occurred). It should emit
+    revive_signal_force_no_prior at INFO instead.
+
+    Uses structlog.testing.capture_logs() rather than pytest's caplog
+    because the project uses structlog.PrintLoggerFactory() — caplog
+    only captures stdlib logging. See test_trading_analytics.py:255
+    for the canonical pattern."""
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(SIGNAL_REVIVAL_MIN_SOAK_DAYS=7)
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    with capture_logs() as captured:
+        await db.revive_signal_with_baseline(
+            "gainers_early",
+            reason="defensive force on first revival",
+            force=True,
+            settings=s,
+        )
+    bypass_events = [
+        e for e in captured if e.get("event") == "revive_signal_force_bypass"
+    ]
+    assert not bypass_events, (
+        "force=True on first-ever revival must not log "
+        f"revive_signal_force_bypass at WARNING — that path should only "
+        f"fire when an actual bypass occurred. Got: {bypass_events}"
+    )
+    # Confirm the alternative INFO path WAS emitted.
+    no_prior_events = [
+        e for e in captured if e.get("event") == "revive_signal_force_no_prior"
+    ]
+    assert no_prior_events, (
+        "force=True on first revival must emit revive_signal_force_no_prior "
+        f"at INFO; got captured events: {[e.get('event') for e in captured]}"
+    )
+    await db.close()
+
+
+async def test_revive_force_true_warning_on_actual_bypass(tmp_path, settings_factory):
+    """Companion to the no-warning test: when a prior revival DOES exist
+    AND force=True, the revive_signal_force_bypass WARNING must fire."""
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(SIGNAL_REVIVAL_MIN_SOAK_DAYS=7)
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    # First revival to create the audit row.
+    await db.revive_signal_with_baseline("gainers_early", reason="first", settings=s)
+    # Re-suspend then force-revive within the cool-off window.
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    with capture_logs() as captured:
+        await db.revive_signal_with_baseline(
+            "gainers_early", reason="force bypass", force=True, settings=s
+        )
+    bypass_events = [
+        e for e in captured if e.get("event") == "revive_signal_force_bypass"
+    ]
+    assert bypass_events, (
+        "force=True bypassing an actual cool-off must emit WARNING "
+        f"revive_signal_force_bypass; got: {[e.get('event') for e in captured]}"
+    )
+    # Verify structured fields are populated.
+    evt = bypass_events[0]
+    assert evt.get("signal_type") == "gainers_early"
+    assert evt.get("prior_revival_at") is not None
+    await db.close()
+
+
+async def test_revive_after_operator_suspend_then_revive_first_time_succeeds(
+    tmp_path, settings_factory
+):
+    """Per design-stage policy reviewer Q4: an operator-issued suspension
+    writes a 1→0 audit row (NOT a 0→1 row). The cool-off filter
+    `old_value='0' AND new_value='1'` excludes the suspension row, so the
+    FIRST post-suspend revival succeeds regardless of cool-off."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(SIGNAL_REVIVAL_MIN_SOAK_DAYS=7)
+    # Simulate operator-issued suspension: writes 1→0 audit row + flips enabled.
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0, suspended_at=?, "
+        "suspended_reason='operator: testing' WHERE signal_type='gainers_early'",
+        (now_iso,),
+    )
+    await db._conn.execute(
+        "INSERT INTO signal_params_audit "
+        "(signal_type, field_name, old_value, new_value, reason, applied_by, applied_at) "
+        "VALUES ('gainers_early', 'enabled', '1', '0', 'operator manual suspend', "
+        "'operator', ?)",
+        (now_iso,),
+    )
+    await db._conn.commit()
+    # First revival — must succeed, even though there's a recent operator
+    # audit row (it's the suspend, not a prior revive).
+    await db.revive_signal_with_baseline(
+        "gainers_early", reason="post-operator-suspend revival", settings=s
+    )
+    cur = await db._conn.execute(
+        "SELECT enabled FROM signal_params WHERE signal_type='gainers_early'"
+    )
+    assert (await cur.fetchone())[0] == 1
+    await db.close()

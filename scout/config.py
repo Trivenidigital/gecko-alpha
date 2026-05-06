@@ -383,6 +383,12 @@ class Settings(BaseSettings):
     SIGNAL_SUSPEND_HARD_LOSS_USD: float = -500.0
     SIGNAL_SUSPEND_MIN_TRADES: int = 50
     SUSPENSION_CHECK_HOUR: int = 1  # local hour, in-loop scheduler
+    # Revival cool-off (BL-NEW-REVIVAL-COOLOFF). Minimum days between
+    # consecutive operator-issued revivals of the same signal via
+    # Database.revive_signal_with_baseline. Set to 0 to disable. Bypass
+    # per-call with force=True (logs revive_signal_force_bypass WARNING
+    # and tags the audit row).
+    SIGNAL_REVIVAL_MIN_SOAK_DAYS: int = 7
     # Calibration — dry-run by default; --apply gated on Telegram health
     # unless --force-no-alert. Trade-count floor mirrors suspension floor
     # so we don't tune on noise.
@@ -557,6 +563,13 @@ class Settings(BaseSettings):
     def _validate_peak_fade_min_peak_pct(cls, v: float) -> float:
         if v <= 0:
             raise ValueError(f"PEAK_FADE_MIN_PEAK_PCT must be > 0; got={v}")
+        return v
+
+    @field_validator("SIGNAL_REVIVAL_MIN_SOAK_DAYS")
+    @classmethod
+    def _validate_revival_min_soak_days(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"SIGNAL_REVIVAL_MIN_SOAK_DAYS must be >= 0; got={v}")
         return v
 
     @field_validator("PEAK_FADE_RETRACE_RATIO")

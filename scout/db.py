@@ -28,6 +28,7 @@ class CoinIdResolutionError(RuntimeError):
 from scout.models import CandidateToken
 
 if TYPE_CHECKING:
+    from scout.config import Settings
     from scout.news.schemas import CryptoPanicPost
     from scout.perp.schemas import PerpAnomaly
 
@@ -2029,6 +2030,8 @@ class Database:
         *,
         reason: str,
         operator: str = "operator",
+        force: bool = False,
+        settings: "Settings | None" = None,
     ) -> None:
         """Atomic operator revival: enabled=1, stamp drawdown_baseline_at=NOW(),
         write audit row.
@@ -2038,11 +2041,110 @@ class Database:
         The baseline anchors the auto_suspend rolling window to the revival
         instant; pre-revival drawdown is excluded.
 
-        Raises ValueError if signal_type is unknown.
+        BL-NEW-REVIVAL-COOLOFF (2026-05-06): enforces a configurable cool-off
+        between consecutive operator revivals of the same signal to prevent
+        immortalization via repeated baseline-stamping. Default cool-off is
+        ``Settings.SIGNAL_REVIVAL_MIN_SOAK_DAYS`` (7 days); set to 0 to
+        disable. Pass ``force=True`` to bypass per-call (an audit-row marker
+        + structlog WARNING ``revive_signal_force_bypass`` are emitted).
+
+        Args:
+            signal_type: signal_params row to revive
+            reason: audit-row reason text
+            operator: applied_by field; defaults to ``"operator"``. The cool-off
+                only triggers on prior rows with ``applied_by='operator'``.
+                Automated paths that should not trip the cool-off should pass
+                a different operator value.
+            force: bypass the cool-off; tags audit row + emits WARNING.
+            settings: optional Settings instance for dependency injection
+                (per CLAUDE.md "no global state"). Falls back to
+                ``get_settings()`` if not passed.
+
+        Raises:
+            ValueError: if signal_type is unknown, OR if the cool-off
+                window is active and ``force=False``.
         """
         if self._conn is None:
             raise RuntimeError("Database not initialized.")
         conn = self._conn
+
+        # BL-NEW-REVIVAL-COOLOFF cool-off check (skipped on force=True).
+        # Positive filter applied_by='operator' (per plan-stage reviewer
+        # MUST-FIX) to avoid future calibrate / dashboard / other applied_by
+        # values inadvertently triggering the cool-off. Single SELECT
+        # before branch (per PR-stage code reviewer Issue 3) — both
+        # force=True and force=False paths read the same prior-revival
+        # row; only the cool-off comparison branches.
+        cur = await conn.execute(
+            """SELECT applied_at FROM signal_params_audit
+               WHERE signal_type = ?
+                 AND field_name = 'enabled'
+                 AND old_value = '0'
+                 AND new_value = '1'
+                 AND applied_by = 'operator'
+               ORDER BY applied_at DESC LIMIT 1""",
+            (signal_type,),
+        )
+        row = await cur.fetchone()
+        prior_revival_at: str | None = row[0] if row is not None else None
+
+        if not force and prior_revival_at is not None:
+            if settings is None:
+                from scout.config import get_settings
+
+                settings = get_settings()
+            # Direct attribute access (per PR-stage strategy reviewer
+            # RECOMMEND): single source of truth for the default in
+            # scout/config.py. AttributeError on a malformed Settings
+            # stub is a louder failure than a silently-stale 7.
+            cool_off_days = settings.SIGNAL_REVIVAL_MIN_SOAK_DAYS
+            if cool_off_days > 0:
+                last_at = datetime.fromisoformat(prior_revival_at)
+                delta = datetime.now(timezone.utc) - last_at
+                if delta < timedelta(days=cool_off_days):
+                    days_elapsed = int(delta.total_seconds() // 86400)
+                    days_remaining = max(0, cool_off_days - days_elapsed)
+                    raise ValueError(
+                        f"revive_signal_with_baseline cool-off: "
+                        f"{signal_type} was last revived at {prior_revival_at} "
+                        f"({days_elapsed} days ago); minimum "
+                        f"{cool_off_days} days required between "
+                        f"consecutive revivals "
+                        f"({days_remaining} days remaining). "
+                        f"Pass force=True to bypass: "
+                        f"db.revive_signal_with_baseline("
+                        f"'{signal_type}', reason='...', force=True)"
+                    )
+
+        # Force-bypass observability hook (per design-stage reviewer
+        # RECOMMEND): emit WARNING only when the bypass actually overrode
+        # something — i.e., a prior recent revival exists. force=True on
+        # first-ever revival logs at INFO instead, to avoid noisy WARNINGs
+        # from defensive operator-scripting habits.
+        if force:
+            import structlog as _structlog
+
+            _logger = _structlog.get_logger("scout.db")
+            if prior_revival_at is not None:
+                _logger.warning(
+                    "revive_signal_force_bypass",
+                    signal_type=signal_type,
+                    operator=operator,
+                    reason=reason,
+                    prior_revival_at=prior_revival_at,
+                )
+            else:
+                _logger.info(
+                    "revive_signal_force_no_prior",
+                    signal_type=signal_type,
+                    operator=operator,
+                    reason=reason,
+                )
+
+        audit_reason = (
+            f"{reason} [force=True bypass of revival cool-off]" if force else reason
+        )
+
         now_iso = datetime.now(timezone.utc).isoformat()
 
         try:
@@ -2075,7 +2177,7 @@ class Database:
                    (signal_type, field_name, old_value, new_value,
                     reason, applied_by, applied_at)
                    VALUES (?, 'enabled', ?, '1', ?, ?, ?)""",
-                (signal_type, str(old_enabled), reason, operator, now_iso),
+                (signal_type, str(old_enabled), audit_reason, operator, now_iso),
             )
             await conn.commit()
         except ValueError:
