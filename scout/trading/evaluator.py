@@ -564,6 +564,14 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                             # give_back_pp = peak_pct - exit_pct, in
                             # percentage points (NOT a fraction of peak).
                             # E.g. peak 60%, exit 35% → give_back_pp 25.
+                            # BL-NEW-MOONSHOT-OPT-OUT (per #2 PR strategy
+                            # reviewer RECOMMEND): emit moonshot_opt_out
+                            # field so post-flip operator audit can
+                            # distinguish "exited with 30% floor" from
+                            # "exited via per-signal trail" without a
+                            # signal_params join. Independent of the
+                            # exit_status which remains closed_moonshot_trail
+                            # (keyed on moonshot_armed_at, not opt-out).
                             log.info(
                                 "moonshot_trail_exit",
                                 trade_id=trade_id,
@@ -572,6 +580,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                                 give_back_pp=round(
                                     float(peak_pct) - float(change_pct), 2
                                 ),
+                                moonshot_opt_out=not sp.moonshot_enabled,
                             )
                 # BL-NEW-HPF high-peak fade — single-pass tighter exit on
                 # confirmed runners (peak_pct >= MIN_PEAK_PCT, retrace >= RETRACE_PCT).

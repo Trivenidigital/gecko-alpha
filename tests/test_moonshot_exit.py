@@ -635,6 +635,102 @@ async def test_moonshot_opt_out_pre_moonshot_path_unchanged(tmp_path, settings_f
 
 
 @pytest.mark.asyncio
+async def test_moonshot_opt_out_with_conviction_lock(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Per #2 PR statistical reviewer MUST-FIX: pin the conviction-lock
+    interaction claimed in the evaluator opt-out branch comment.
+
+    When BL-067 conviction-lock has overlaid sp.trail_pct upward (via
+    dataclasses.replace at evaluator.py ~228), the moonshot_enabled=0
+    branch reads the LOCKED sp.trail_pct value (35%), NOT the base
+    config 12% nor the moonshot floor 30%. This test exercises that
+    specific composition.
+
+    We monkeypatch compute_stack to return 3 (>= threshold) rather than
+    constructing sibling-trade fixtures, which would require seeding
+    multiple signal-source tables per `_SIGNAL_SOURCES`. The point of
+    THIS test is the post-overlay → moonshot-opt-out flow, not the
+    stack-counting fixture.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    # Opt-out + base trail = 12 (so the locked overlay can widen to 35;
+    # delta at stack=3 is +20pp capped at 35). conviction_lock_enabled=1
+    # so the per-signal opt-in passes.
+    await db._conn.execute(
+        "UPDATE signal_params SET moonshot_enabled = 0, "
+        "trail_pct = 12.0, conviction_lock_enabled = 1 "
+        "WHERE signal_type = 'first_signal'"
+    )
+    await db._conn.commit()
+    from scout.trading.params import clear_cache_for_tests
+
+    clear_cache_for_tests()
+
+    # Force compute_stack to return 3 (>= default threshold of 3).
+    # The evaluator overlays sp.trail_pct = min(12 + 20, 35) = 32.
+    async def _stub_stack(db_arg, token_id, signal_type, exclude_trade_id=None):
+        return 3
+
+    monkeypatch.setattr(
+        "scout.trading.conviction.compute_stack", _stub_stack, raising=True
+    )
+
+    trader = PaperTrader()
+    settings = settings_factory(
+        PAPER_MOONSHOT_ENABLED=True,
+        PAPER_MOONSHOT_THRESHOLD_PCT=40.0,
+        PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT=30.0,
+        PAPER_LADDER_TRAIL_PCT=12.0,
+        PAPER_CONVICTION_LOCK_ENABLED=True,
+        PAPER_CONVICTION_LOCK_THRESHOLD=3,
+        SIGNAL_PARAMS_ENABLED=True,
+    )
+    trade_id = await _arm_at_50pct(db, trader, token_id="m_lock", settings=settings)
+
+    # Confirm conviction-lock fired (audit row stamped).
+    cur = await db._conn.execute(
+        "SELECT conviction_locked_at, conviction_locked_stack "
+        "FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    locked_at, locked_stack = await cur.fetchone()
+    assert (
+        locked_at is not None
+    ), "expected conviction-lock to fire with stack>=3; check stub setup"
+    assert locked_stack == 3
+
+    # The locked trail at stack=3 with base 12 is min(12+20, 35) = 32.
+    # With moonshot_enabled=0, effective_trail_pct = sp.trail_pct = 32%
+    # (NOT the moonshot floor 30, NOT the base 12).
+    #
+    # Push price to -25% retrace from peak 1.50: 1.125. That's ABOVE
+    # 32% trail (1.50 * 0.68 = 1.02), so trade stays open.
+    await _seed_price(db, "m_lock", 1.125)
+    await evaluate_paper_trades(db, settings)
+    cur = await db._conn.execute(
+        "SELECT status FROM paper_trades WHERE id = ?", (trade_id,)
+    )
+    status = (await cur.fetchone())[0]
+    assert (
+        status == "open"
+    ), f"-25% retrace should not close at locked trail 32%; got {status}"
+
+    # Push to -34% retrace: 1.50 * 0.66 = 0.99. NOW past 32% trail.
+    await _seed_price(db, "m_lock", 0.99)
+    await evaluate_paper_trades(db, settings)
+    cur = await db._conn.execute(
+        "SELECT status FROM paper_trades WHERE id = ?", (trade_id,)
+    )
+    status = (await cur.fetchone())[0]
+    assert status.startswith(
+        "closed_"
+    ), f"-34% retrace > locked trail 32% should close; got {status}"
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_moonshot_opt_out_low_peak_path_unchanged(tmp_path, settings_factory):
     """Below low_peak_threshold (default 20), trail_pct_low_peak applies
     regardless of moonshot_enabled — this branch is independent of the
