@@ -121,6 +121,8 @@ class TestMigration:
 
         db = Database(str(tmp_path / "test.db"))
         await db.initialize()
+        # Temporarily disable FK to insert audit rows without a real paper_trades row
+        await db._conn.execute("PRAGMA foreign_keys=OFF")
         # Insert a row
         await db._conn.execute(
             "INSERT INTO high_peak_fade_audit "
@@ -429,6 +431,206 @@ class TestPerSignalOptIn:
             (trade_id,),
         )
         assert (await cur.fetchone())[0] == 0
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_per_signal_opt_in_off_bypasses_signal_check(
+        self, tmp_path, settings_factory
+    ):
+        """When PER_SIGNAL_OPT_IN=False, signal_params.high_peak_fade_enabled is
+        bypassed — gate fires regardless of per-signal flag (operator override path)."""
+        from scout.db import Database
+        from scout.trading.evaluator import evaluate_paper_trades
+        from scout.trading.paper import PaperTrader
+        from scout.trading.params import clear_cache_for_tests
+
+        db = Database(str(tmp_path / "test.db"))
+        await db.initialize()
+        # gainers_early NOT opted in (default 0 = high_peak_fade_enabled off)
+        # widen trail_pct so trailing-stop does NOT pre-empt the HPF gate
+        await db._conn.execute(
+            "UPDATE signal_params SET trail_pct = 20.0 "
+            "WHERE signal_type = 'gainers_early'"
+        )
+        await db._conn.commit()
+        clear_cache_for_tests()
+
+        trader = PaperTrader()
+        trade_id = await trader.execute_buy(
+            db=db,
+            token_id="tok_bypass",
+            symbol="BYPASS",
+            name="Bypass",
+            chain="solana",
+            signal_type="gainers_early",
+            signal_data={},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=200.0,
+            sl_pct=20.0,
+            slippage_bps=0,
+            signal_combo="gainers_early",
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await db._conn.execute(
+            "UPDATE paper_trades SET peak_price = 1.80, peak_pct = 80.0, "
+            "floor_armed = 1, leg_1_filled_at = ?, leg_2_filled_at = ?, "
+            "remaining_qty = quantity * 0.5 "
+            "WHERE id = ?",
+            (now_iso, now_iso, trade_id),
+        )
+        await db._conn.execute(
+            "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+            "VALUES (?, ?, ?)",
+            ("tok_bypass", 1.50, datetime.now(timezone.utc).isoformat()),
+        )
+        await db._conn.commit()
+
+        # PER_SIGNAL_OPT_IN=False → bypass signal-level check; gate fires
+        # even though high_peak_fade_enabled=0 in signal_params
+        settings = settings_factory(
+            PAPER_HIGH_PEAK_FADE_ENABLED=True,
+            PAPER_HIGH_PEAK_FADE_DRY_RUN=True,
+            PAPER_HIGH_PEAK_FADE_PER_SIGNAL_OPT_IN=False,
+            SIGNAL_PARAMS_ENABLED=True,
+        )
+        await evaluate_paper_trades(db, settings)
+
+        cur = await db._conn.execute(
+            "SELECT COUNT(*) FROM high_peak_fade_audit WHERE trade_id = ?",
+            (trade_id,),
+        )
+        assert (await cur.fetchone())[0] == 1, (
+            "audit row should exist when PER_SIGNAL_OPT_IN=False bypasses signal check"
+        )
+        await db.close()
+
+
+class TestEdgeCases:
+    @pytest.mark.asyncio
+    async def test_null_peak_pct_does_not_fire(self, tmp_path, settings_factory):
+        """Trade that never went into profit (peak_pct IS NULL) cannot trigger gate."""
+        from scout.db import Database
+        from scout.trading.evaluator import evaluate_paper_trades
+        from scout.trading.paper import PaperTrader
+        from scout.trading.params import clear_cache_for_tests
+
+        db = Database(str(tmp_path / "test.db"))
+        await db.initialize()
+        await db._conn.execute(
+            "UPDATE signal_params SET high_peak_fade_enabled = 1, trail_pct = 20.0 "
+            "WHERE signal_type = 'gainers_early'"
+        )
+        await db._conn.commit()
+        clear_cache_for_tests()
+
+        trader = PaperTrader()
+        trade_id = await trader.execute_buy(
+            db=db,
+            token_id="tok_null_peak",
+            symbol="NULLPK",
+            name="NullPeak",
+            chain="solana",
+            signal_type="gainers_early",
+            signal_data={},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=200.0,
+            sl_pct=20.0,
+            slippage_bps=0,
+            signal_combo="gainers_early",
+        )
+        # Do NOT update peak_price / peak_pct — they remain NULL
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await db._conn.execute(
+            "UPDATE paper_trades SET floor_armed = 1, "
+            "leg_1_filled_at = ?, leg_2_filled_at = ?, "
+            "remaining_qty = quantity * 0.5 "
+            "WHERE id = ?",
+            (now_iso, now_iso, trade_id),
+        )
+        await db._conn.execute(
+            "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+            "VALUES (?, ?, ?)",
+            ("tok_null_peak", 0.90, datetime.now(timezone.utc).isoformat()),
+        )
+        await db._conn.commit()
+
+        settings = settings_factory(
+            PAPER_HIGH_PEAK_FADE_ENABLED=True,
+            PAPER_HIGH_PEAK_FADE_DRY_RUN=True,
+            SIGNAL_PARAMS_ENABLED=True,
+        )
+        await evaluate_paper_trades(db, settings)
+
+        cur = await db._conn.execute(
+            "SELECT COUNT(*) FROM high_peak_fade_audit WHERE trade_id = ?",
+            (trade_id,),
+        )
+        assert (await cur.fetchone())[0] == 0, "gate skipped via peak_pct is not None guard"
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_null_peak_price_does_not_fire(self, tmp_path, settings_factory):
+        """Trade with peak_price IS NULL cannot trigger gate (defensive guard)."""
+        from scout.db import Database
+        from scout.trading.evaluator import evaluate_paper_trades
+        from scout.trading.paper import PaperTrader
+        from scout.trading.params import clear_cache_for_tests
+
+        db = Database(str(tmp_path / "test.db"))
+        await db.initialize()
+        await db._conn.execute(
+            "UPDATE signal_params SET high_peak_fade_enabled = 1, trail_pct = 20.0 "
+            "WHERE signal_type = 'gainers_early'"
+        )
+        await db._conn.commit()
+        clear_cache_for_tests()
+
+        trader = PaperTrader()
+        trade_id = await trader.execute_buy(
+            db=db,
+            token_id="tok_null_price",
+            symbol="NULLPR",
+            name="NullPrice",
+            chain="solana",
+            signal_type="gainers_early",
+            signal_data={},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=200.0,
+            sl_pct=20.0,
+            slippage_bps=0,
+            signal_combo="gainers_early",
+        )
+        # Set peak_pct to trigger threshold but peak_price to NULL (schema allows NULL)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await db._conn.execute(
+            "UPDATE paper_trades SET peak_pct = 80.0, peak_price = NULL, "
+            "floor_armed = 1, leg_1_filled_at = ?, leg_2_filled_at = ?, "
+            "remaining_qty = quantity * 0.5 "
+            "WHERE id = ?",
+            (now_iso, now_iso, trade_id),
+        )
+        await db._conn.execute(
+            "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+            "VALUES (?, ?, ?)",
+            ("tok_null_price", 1.50, datetime.now(timezone.utc).isoformat()),
+        )
+        await db._conn.commit()
+
+        settings = settings_factory(
+            PAPER_HIGH_PEAK_FADE_ENABLED=True,
+            PAPER_HIGH_PEAK_FADE_DRY_RUN=True,
+            SIGNAL_PARAMS_ENABLED=True,
+        )
+        await evaluate_paper_trades(db, settings)
+
+        cur = await db._conn.execute(
+            "SELECT COUNT(*) FROM high_peak_fade_audit WHERE trade_id = ?",
+            (trade_id,),
+        )
+        assert (await cur.fetchone())[0] == 0, "gate skipped via peak_price is not None guard"
         await db.close()
 
 
