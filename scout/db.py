@@ -86,6 +86,7 @@ class Database:
         await self._migrate_live_trading_schema()
         await self._migrate_signal_params_schema()
         await self._migrate_high_peak_fade_columns_and_audit_table()
+        await self._migrate_autosuspend_baseline_column()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -1943,6 +1944,148 @@ class Database:
         row = await cur.fetchone()
         if row is None:
             raise RuntimeError("bl_hpf_v1 cutover row missing after migration")
+
+    async def _migrate_autosuspend_baseline_column(self) -> None:
+        """BL-NEW-AUTOSUSPEND-FIX: per-signal drawdown rolling-window floor.
+
+        Adds:
+          - signal_params.drawdown_baseline_at TEXT (nullable)
+
+        Operator revival stamps this column with NOW() so the auto_suspend
+        rolling window doesn't carry historical drawdown across the revival
+        boundary. Existing rows default to NULL — no behavior change for
+        signals that have never been suspended/revived.
+
+        Wrapped in BEGIN EXCLUSIVE / ROLLBACK + paper_migrations cutover row +
+        schema_version stamp, matching the BL-NEW-HPF migration pattern.
+        Idempotent: column-add is guarded by PRAGMA existence-check.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY,
+                    cutover_ts TEXT NOT NULL
+                )
+                """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )
+                """)
+
+            cur_pragma = await conn.execute("PRAGMA table_info(signal_params)")
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            if "drawdown_baseline_at" not in existing_cols:
+                await conn.execute(
+                    "ALTER TABLE signal_params " "ADD COLUMN drawdown_baseline_at TEXT"
+                )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_autosuspend_baseline_v1", now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260506, now_iso, "bl_autosuspend_baseline_v1"),
+            )
+
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_autosuspend_baseline_v1")
+            raise
+
+        # Post-assertion — cutover row must exist after a successful migration.
+        cur = await conn.execute(
+            "SELECT 1 FROM paper_migrations WHERE name = ?",
+            ("bl_autosuspend_baseline_v1",),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "bl_autosuspend_baseline_v1 cutover row missing after migration"
+            )
+
+    async def revive_signal_with_baseline(
+        self,
+        signal_type: str,
+        *,
+        reason: str,
+        operator: str = "operator",
+    ) -> None:
+        """Atomic operator revival: enabled=1, stamp drawdown_baseline_at=NOW(),
+        write audit row.
+
+        Used by operator dashboards / scripts to revive a previously-suspended
+        signal without having historical drawdown immediately re-trip the rule.
+        The baseline anchors the auto_suspend rolling window to the revival
+        instant; pre-revival drawdown is excluded.
+
+        Raises ValueError if signal_type is unknown.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            cur = await conn.execute(
+                "SELECT enabled FROM signal_params WHERE signal_type = ?",
+                (signal_type,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                # Roll back the empty txn before raising so the connection
+                # state is clean for the caller.
+                await conn.execute("ROLLBACK")
+                raise ValueError(f"unknown signal_type: {signal_type}")
+            old_enabled = row[0]
+
+            await conn.execute(
+                """UPDATE signal_params
+                   SET enabled = 1,
+                       suspended_at = NULL,
+                       suspended_reason = NULL,
+                       drawdown_baseline_at = ?,
+                       updated_at = ?,
+                       updated_by = ?
+                   WHERE signal_type = ?""",
+                (now_iso, now_iso, operator, signal_type),
+            )
+            await conn.execute(
+                """INSERT INTO signal_params_audit
+                   (signal_type, field_name, old_value, new_value,
+                    reason, applied_by, applied_at)
+                   VALUES (?, 'enabled', ?, '1', ?, ?, ?)""",
+                (signal_type, str(old_enabled), reason, operator, now_iso),
+            )
+            await conn.commit()
+        except ValueError:
+            raise
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     # ------------------------------------------------------------------
     # Candidates
