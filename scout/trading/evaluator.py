@@ -461,17 +461,30 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                 # trail harvests profit on modest peakers without choking
                 # moonshots (those go through the moonshot branch above).
                 if moonshot_armed_at is not None:
-                    # BL-067 A1 fix: compose moonshot floor with locked trail.
-                    # When conviction-lock has overlaid sp.trail_pct above
-                    # (e.g., to 35% at stack=4), the locked trail wins
-                    # whenever wider than the moonshot constant. max()
-                    # preserves both regimes' protective intent. Backtest
-                    # simulator already used this max() form; production
-                    # must match.
-                    effective_trail_pct = max(
-                        settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT,
-                        sp.trail_pct,
-                    )
+                    if not sp.moonshot_enabled:
+                        # BL-NEW-MOONSHOT-OPT-OUT: signal opted out of the
+                        # moonshot floor. Use sp.trail_pct directly, letting
+                        # calibration / conviction-lock fully control the
+                        # trail width. Note: sp.trail_pct here ALREADY
+                        # reflects any BL-067 conviction-lock overlay
+                        # applied earlier in this evaluator pass — opting
+                        # out of moonshot does NOT bypass the lock's
+                        # widening effect. See
+                        # tasks/findings_moonshot_floor_nullification.md
+                        # §3.2 for the conviction-lock interaction matrix.
+                        effective_trail_pct = sp.trail_pct
+                    else:
+                        # BL-067 A1 fix: compose moonshot floor with locked
+                        # trail. When conviction-lock has overlaid
+                        # sp.trail_pct above (e.g., to 35% at stack=4), the
+                        # locked trail wins whenever wider than the
+                        # moonshot constant. max() preserves both regimes'
+                        # protective intent. Backtest simulator already
+                        # used this max() form; production must match.
+                        effective_trail_pct = max(
+                            settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT,
+                            sp.trail_pct,
+                        )
                 elif peak_pct is not None and peak_pct < sp.low_peak_threshold_pct:
                     effective_trail_pct = sp.trail_pct_low_peak
                 else:
@@ -551,6 +564,14 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                             # give_back_pp = peak_pct - exit_pct, in
                             # percentage points (NOT a fraction of peak).
                             # E.g. peak 60%, exit 35% → give_back_pp 25.
+                            # BL-NEW-MOONSHOT-OPT-OUT (per #2 PR strategy
+                            # reviewer RECOMMEND): emit moonshot_opt_out
+                            # field so post-flip operator audit can
+                            # distinguish "exited with 30% floor" from
+                            # "exited via per-signal trail" without a
+                            # signal_params join. Independent of the
+                            # exit_status which remains closed_moonshot_trail
+                            # (keyed on moonshot_armed_at, not opt-out).
                             log.info(
                                 "moonshot_trail_exit",
                                 trade_id=trade_id,
@@ -559,6 +580,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                                 give_back_pp=round(
                                     float(peak_pct) - float(change_pct), 2
                                 ),
+                                moonshot_opt_out=not sp.moonshot_enabled,
                             )
                 # BL-NEW-HPF high-peak fade — single-pass tighter exit on
                 # confirmed runners (peak_pct >= MIN_PEAK_PCT, retrace >= RETRACE_PCT).

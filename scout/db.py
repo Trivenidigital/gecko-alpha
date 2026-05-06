@@ -88,6 +88,7 @@ class Database:
         await self._migrate_signal_params_schema()
         await self._migrate_high_peak_fade_columns_and_audit_table()
         await self._migrate_autosuspend_baseline_column()
+        await self._migrate_moonshot_opt_out_column()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -2023,6 +2024,100 @@ class Database:
             raise RuntimeError(
                 "bl_autosuspend_baseline_v1 cutover row missing after migration"
             )
+
+    async def _migrate_moonshot_opt_out_column(self) -> None:
+        """BL-NEW-MOONSHOT-OPT-OUT: per-signal moonshot regime opt-out flag.
+
+        Adds:
+          - signal_params.moonshot_enabled INTEGER NOT NULL DEFAULT 1
+
+        When 0, the evaluator skips the
+        ``max(PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT, sp.trail_pct)`` floor in
+        moonshot regime (peak >= 40%) and uses ``sp.trail_pct`` directly.
+        Default 1 preserves current behavior for all existing rows.
+
+        Resolves the structural finding documented in
+        ``tasks/findings_moonshot_floor_nullification.md``: the moonshot
+        floor silently dominated per-signal ``trail_pct`` even when a
+        signal would benefit from a tighter / wider trail.
+
+        Wrapped in BEGIN EXCLUSIVE / ROLLBACK + paper_migrations cutover
+        row (``bl_moonshot_opt_out_v1``) + schema_version 20260507,
+        consistent with the BL-NEW-HPF + BL-NEW-AUTOSUSPEND migration
+        patterns. Idempotent: column-add is guarded by PRAGMA
+        existence-check; INSERT OR IGNORE on both stamps.
+
+        Note: a moonshot-opted-out trade that closes via trail still
+        carries the ``closed_moonshot_trail`` exit-status (the close-
+        labeling path checks ``moonshot_armed_at is not None``, which
+        is independent of ``moonshot_enabled``). This is a minor
+        semantic oddity, not a correctness bug — flagged by the
+        design-stage data-soundness reviewer.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY,
+                    cutover_ts TEXT NOT NULL
+                )
+                """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )
+                """)
+
+            cur_pragma = await conn.execute("PRAGMA table_info(signal_params)")
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            if "moonshot_enabled" not in existing_cols:
+                await conn.execute(
+                    "ALTER TABLE signal_params "
+                    "ADD COLUMN moonshot_enabled INTEGER NOT NULL DEFAULT 1"
+                )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_moonshot_opt_out_v1", now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260507, now_iso, "bl_moonshot_opt_out_v1"),
+            )
+
+            # Post-assertion INSIDE the try block (per design-stage
+            # correctness reviewer RECOMMEND): if the cutover row is
+            # missing, ROLLBACK + log SCHEMA_DRIFT before raising.
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_moonshot_opt_out_v1",),
+            )
+            if (await cur.fetchone()) is None:
+                raise RuntimeError(
+                    "bl_moonshot_opt_out_v1 cutover row missing after migration"
+                )
+
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_moonshot_opt_out_v1")
+            raise
 
     async def revive_signal_with_baseline(
         self,
