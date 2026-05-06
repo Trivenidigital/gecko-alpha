@@ -195,19 +195,19 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     hint="master kill-switch OFF; locked params reverting to base",
                 )
 
-            if (
-                settings.PAPER_CONVICTION_LOCK_ENABLED
-                and sp.conviction_lock_enabled
-            ):
+            if settings.PAPER_CONVICTION_LOCK_ENABLED and sp.conviction_lock_enabled:
                 from scout.trading.conviction import (
                     compute_stack,
                     conviction_locked_params,
                 )
+
                 # design-v2 adv-S2: exclude_trade_id prevents the trade
                 # from counting itself as a "confirmation" via the
                 # paper_trades DISTINCT signal_type scan.
                 stack = await compute_stack(
-                    db, token_id, str(row[3]),
+                    db,
+                    token_id,
+                    str(row[3]),
                     exclude_trade_id=trade_id,
                 )
                 threshold = settings.PAPER_CONVICTION_LOCK_THRESHOLD
@@ -224,6 +224,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     # this MUST happen before line 158 so the NEW
                     # max_duration_hours is what timedelta() reads.
                     from dataclasses import replace
+
                     sp = replace(
                         sp,
                         max_duration_hours=locked["max_duration_hours"],
@@ -471,10 +472,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                         settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT,
                         sp.trail_pct,
                     )
-                elif (
-                    peak_pct is not None
-                    and peak_pct < sp.low_peak_threshold_pct
-                ):
+                elif peak_pct is not None and peak_pct < sp.low_peak_threshold_pct:
                     effective_trail_pct = sp.trail_pct_low_peak
                 else:
                     effective_trail_pct = sp.trail_pct
@@ -494,10 +492,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     close_reason = "stop_loss"
                     close_status = "closed_sl"
                 # Leg 1
-                elif (
-                    leg_1_filled is None
-                    and change_pct >= sp.leg_1_pct
-                ):
+                elif leg_1_filled is None and change_pct >= sp.leg_1_pct:
                     await _trader.execute_partial_sell(
                         db=db,
                         trade_id=trade_id,
@@ -565,6 +560,79 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                                     float(peak_pct) - float(change_pct), 2
                                 ),
                             )
+                # BL-NEW-HPF high-peak fade — single-pass tighter exit on
+                # confirmed runners (peak_pct >= MIN_PEAK_PCT, retrace >= RETRACE_PCT).
+                # MUST be standalone `if close_reason is None`, NOT elif. The
+                # trailing_stop branch above enters the elif chain whenever
+                # floor_armed AND peak_pct >= leg_1_pct, regardless of whether
+                # its inner threshold fires; an elif placement here would be
+                # structurally unreachable. See findings_high_peak_giveback.md §13.4.
+                #
+                # Defer to BL-067 conviction-lock when armed: skipped on
+                # conviction_locked_at IS NOT NULL. At stack >= 3, the system
+                # has explicitly opted into "let it ride"; honoring that is
+                # the contract. See findings_high_peak_giveback.md §7.6.
+                if (
+                    close_reason is None
+                    and settings.PAPER_HIGH_PEAK_FADE_ENABLED
+                    and (
+                        not settings.PAPER_HIGH_PEAK_FADE_PER_SIGNAL_OPT_IN
+                        or sp.high_peak_fade_enabled
+                    )
+                    and conviction_locked_at is None
+                    and peak_pct is not None
+                    and peak_pct >= settings.PAPER_HIGH_PEAK_FADE_MIN_PEAK_PCT
+                    and peak_price is not None
+                    and current_price
+                    < peak_price
+                    * (1 - settings.PAPER_HIGH_PEAK_FADE_RETRACE_PCT / 100.0)
+                    and remaining_qty is not None
+                    and remaining_qty > 0
+                ):
+                    fired_at = datetime.now(timezone.utc).isoformat()
+                    dry_run = settings.PAPER_HIGH_PEAK_FADE_DRY_RUN
+                    retrace_pct_value = (1 - current_price / float(peak_price)) * 100.0
+                    await conn.execute(
+                        "INSERT OR IGNORE INTO high_peak_fade_audit "
+                        "(trade_id, token_id, signal_type, peak_pct, peak_price, "
+                        " current_price, threshold_pct, retrace_pct, fired_at, dry_run) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            trade_id,
+                            token_id,
+                            signal_type_row,
+                            float(peak_pct),
+                            float(peak_price),
+                            float(current_price),
+                            float(settings.PAPER_HIGH_PEAK_FADE_MIN_PEAK_PCT),
+                            round(retrace_pct_value, 4),
+                            fired_at,
+                            1 if dry_run else 0,
+                        ),
+                    )
+                    if dry_run:
+                        log.info(
+                            "high_peak_fade_would_fire",
+                            trade_id=trade_id,
+                            token_id=token_id,
+                            peak_pct=round(float(peak_pct), 2),
+                            current_price=current_price,
+                            peak_price=float(peak_price),
+                            retrace_pp=round(
+                                (1 - current_price / float(peak_price)) * 100.0, 2
+                            ),
+                        )
+                    else:
+                        close_reason = "high_peak_fade"
+                        close_status = "closed_high_peak_fade"
+                        log.info(
+                            "high_peak_fade_fired",
+                            trade_id=trade_id,
+                            token_id=token_id,
+                            peak_pct=round(float(peak_pct), 2),
+                            current_price=current_price,
+                            give_back_pp=round(float(peak_pct) - float(change_pct), 2),
+                        )
                 # BL-062 peak-fade — sustained fade at 6h AND 24h checkpoints.
                 # NB: fires on any pass with cp_24h present, not only the pass
                 # that records it. The expiry bound caps the window to 1-2

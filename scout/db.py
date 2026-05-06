@@ -24,6 +24,7 @@ class CoinIdResolutionError(RuntimeError):
     """Raised by Database.coin_id_resolves on aiosqlite.OperationalError
     (column rename / table lock). Caller decides fail-CLOSED vs fail-OPEN."""
 
+
 from scout.models import CandidateToken
 
 if TYPE_CHECKING:
@@ -84,6 +85,7 @@ class Database:
         await self._migrate_feedback_loop_schema()
         await self._migrate_live_trading_schema()
         await self._migrate_signal_params_schema()
+        await self._migrate_high_peak_fade_columns_and_audit_table()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -230,10 +232,14 @@ class Database:
         if self._conn is None:
             raise DbNotInitializedError("Database not initialized.")
         # PR #72 H3 — defense against future caller-driven table values.
-        _ALLOWED_TABLES = frozenset({
-            "price_cache", "gainers_snapshots",
-            "volume_history_cg", "volume_spikes",
-        })
+        _ALLOWED_TABLES = frozenset(
+            {
+                "price_cache",
+                "gainers_snapshots",
+                "volume_history_cg",
+                "volume_spikes",
+            }
+        )
         for table in (
             "price_cache",
             "gainers_snapshots",
@@ -1757,9 +1763,7 @@ class Database:
             # the post-migration assertion permanently failing on every
             # subsequent run because PRAGMA sees the column → skips the
             # entire `if` block including the marker INSERT.
-            cur_pragma = await conn.execute(
-                "PRAGMA table_info(signal_params)"
-            )
+            cur_pragma = await conn.execute("PRAGMA table_info(signal_params)")
             existing_cols = {row[1] for row in await cur_pragma.fetchall()}
             if "conviction_lock_enabled" not in existing_cols:
                 await conn.execute(
@@ -1778,16 +1782,11 @@ class Database:
             # conviction_locked_stack added in same migration. Avoids
             # unreliable backfill of historical locked rows once source
             # tables age out.
-            cur_pragma_pt = await conn.execute(
-                "PRAGMA table_info(paper_trades)"
-            )
-            existing_pt_cols = {
-                row[1] for row in await cur_pragma_pt.fetchall()
-            }
+            cur_pragma_pt = await conn.execute("PRAGMA table_info(paper_trades)")
+            existing_pt_cols = {row[1] for row in await cur_pragma_pt.fetchall()}
             if "conviction_locked_at" not in existing_pt_cols:
                 await conn.execute(
-                    "ALTER TABLE paper_trades "
-                    "ADD COLUMN conviction_locked_at TEXT"
+                    "ALTER TABLE paper_trades " "ADD COLUMN conviction_locked_at TEXT"
                 )
             if "conviction_locked_stack" not in existing_pt_cols:
                 await conn.execute(
@@ -1833,6 +1832,117 @@ class Database:
             raise RuntimeError(
                 "bl067_conviction_lock_enabled cutover row missing after migration"
             )
+
+    async def _migrate_high_peak_fade_columns_and_audit_table(self) -> None:
+        """BL-NEW-HPF: per-signal opt-in column + fire-events audit table.
+
+        Adds:
+          - signal_params.high_peak_fade_enabled INTEGER DEFAULT 0
+          - high_peak_fade_audit table (records both real and dry-run fires)
+
+        Wrapped in ``BEGIN EXCLUSIVE`` / ``ROLLBACK`` and stamped with a
+        ``schema_version`` row + ``paper_migrations`` cutover marker, consistent
+        with the pattern established by ``_migrate_feedback_loop_schema``,
+        ``_migrate_live_trading_schema``, and ``_migrate_signal_params_schema``.
+
+        Idempotent: column-add is guarded by a PRAGMA existence-check;
+        table-create and index-create use IF NOT EXISTS; inserts use
+        INSERT OR IGNORE.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+
+            # Defensive create — mirrors _migrate_signal_params_schema guard so
+            # this migration is safe even if run in isolation (e.g. tests).
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY,
+                    cutover_ts TEXT NOT NULL
+                )
+                """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )
+                """)
+
+            # Column-add: guarded by PRAGMA to stay idempotent under
+            # BEGIN EXCLUSIVE (ALTER TABLE inside a transaction is valid in
+            # SQLite 3.x; the PRAGMA read is also valid inside the txn).
+            cur_pragma = await conn.execute("PRAGMA table_info(signal_params)")
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            if "high_peak_fade_enabled" not in existing_cols:
+                await conn.execute(
+                    "ALTER TABLE signal_params "
+                    "ADD COLUMN high_peak_fade_enabled INTEGER NOT NULL DEFAULT 0"
+                )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS high_peak_fade_audit (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id      INTEGER NOT NULL,
+                    token_id      TEXT    NOT NULL,
+                    signal_type   TEXT    NOT NULL,
+                    peak_pct      REAL    NOT NULL,
+                    peak_price    REAL    NOT NULL,
+                    current_price REAL    NOT NULL,
+                    threshold_pct REAL    NOT NULL,
+                    retrace_pct   REAL    NOT NULL,
+                    fired_at      TEXT    NOT NULL,
+                    dry_run       INTEGER NOT NULL,
+                    UNIQUE(trade_id, threshold_pct, dry_run),
+                    FOREIGN KEY (trade_id) REFERENCES paper_trades(id)
+                )
+                """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_hpf_audit_trade_id "
+                "ON high_peak_fade_audit(trade_id)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_hpf_audit_fired_at "
+                "ON high_peak_fade_audit(fired_at)"
+            )
+
+            # Behavioural cutover marker (matches BL-061..BL-067 pattern).
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_hpf_v1", now_iso),
+            )
+            # Code-level schema version stamp (matches BL-055 / Tier-1a pattern).
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260505, now_iso, "bl_hpf_v1_high_peak_fade"),
+            )
+
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_hpf_v1")
+            raise
+
+        # Post-assertion — cutover row must exist after a successful migration.
+        cur = await conn.execute(
+            "SELECT 1 FROM paper_migrations WHERE name = ?",
+            ("bl_hpf_v1",),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError("bl_hpf_v1 cutover row missing after migration")
 
     # ------------------------------------------------------------------
     # Candidates
