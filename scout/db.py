@@ -28,6 +28,7 @@ class CoinIdResolutionError(RuntimeError):
 from scout.models import CandidateToken
 
 if TYPE_CHECKING:
+    from scout.config import Settings
     from scout.news.schemas import CryptoPanicPost
     from scout.perp.schemas import PerpAnomaly
 
@@ -2030,7 +2031,7 @@ class Database:
         reason: str,
         operator: str = "operator",
         force: bool = False,
-        settings=None,
+        settings: "Settings | None" = None,
     ) -> None:
         """Atomic operator revival: enabled=1, stamp drawdown_baseline_at=NOW(),
         write audit row.
@@ -2070,61 +2071,50 @@ class Database:
         # BL-NEW-REVIVAL-COOLOFF cool-off check (skipped on force=True).
         # Positive filter applied_by='operator' (per plan-stage reviewer
         # MUST-FIX) to avoid future calibrate / dashboard / other applied_by
-        # values inadvertently triggering the cool-off.
-        prior_revival_at: str | None = None
-        if not force:
-            cur = await conn.execute(
-                """SELECT applied_at FROM signal_params_audit
-                   WHERE signal_type = ?
-                     AND field_name = 'enabled'
-                     AND old_value = '0'
-                     AND new_value = '1'
-                     AND applied_by = 'operator'
-                   ORDER BY applied_at DESC LIMIT 1""",
-                (signal_type,),
-            )
-            row = await cur.fetchone()
-            if row is not None:
-                prior_revival_at = row[0]
-                if settings is None:
-                    from scout.config import get_settings
+        # values inadvertently triggering the cool-off. Single SELECT
+        # before branch (per PR-stage code reviewer Issue 3) — both
+        # force=True and force=False paths read the same prior-revival
+        # row; only the cool-off comparison branches.
+        cur = await conn.execute(
+            """SELECT applied_at FROM signal_params_audit
+               WHERE signal_type = ?
+                 AND field_name = 'enabled'
+                 AND old_value = '0'
+                 AND new_value = '1'
+                 AND applied_by = 'operator'
+               ORDER BY applied_at DESC LIMIT 1""",
+            (signal_type,),
+        )
+        row = await cur.fetchone()
+        prior_revival_at: str | None = row[0] if row is not None else None
 
-                    settings = get_settings()
-                cool_off_days = getattr(settings, "SIGNAL_REVIVAL_MIN_SOAK_DAYS", 7)
-                if cool_off_days > 0:
-                    last_at = datetime.fromisoformat(row[0])
-                    delta = datetime.now(timezone.utc) - last_at
-                    if delta < timedelta(days=cool_off_days):
-                        days_elapsed = int(delta.total_seconds() // 86400)
-                        days_remaining = max(0, cool_off_days - days_elapsed)
-                        raise ValueError(
-                            f"revive_signal_with_baseline cool-off: "
-                            f"{signal_type} was last revived at {row[0]} "
-                            f"({days_elapsed} days ago); minimum "
-                            f"{cool_off_days} days required between "
-                            f"consecutive revivals "
-                            f"({days_remaining} days remaining). "
-                            f"Pass force=True to bypass: "
-                            f"db.revive_signal_with_baseline("
-                            f"'{signal_type}', reason='...', force=True)"
-                        )
-        else:
-            # force=True: still query prior revival to inform the structured
-            # log (so we can distinguish "true bypass" from "first revival
-            # with defensive force=True").
-            cur = await conn.execute(
-                """SELECT applied_at FROM signal_params_audit
-                   WHERE signal_type = ?
-                     AND field_name = 'enabled'
-                     AND old_value = '0'
-                     AND new_value = '1'
-                     AND applied_by = 'operator'
-                   ORDER BY applied_at DESC LIMIT 1""",
-                (signal_type,),
-            )
-            row = await cur.fetchone()
-            if row is not None:
-                prior_revival_at = row[0]
+        if not force and prior_revival_at is not None:
+            if settings is None:
+                from scout.config import get_settings
+
+                settings = get_settings()
+            # Direct attribute access (per PR-stage strategy reviewer
+            # RECOMMEND): single source of truth for the default in
+            # scout/config.py. AttributeError on a malformed Settings
+            # stub is a louder failure than a silently-stale 7.
+            cool_off_days = settings.SIGNAL_REVIVAL_MIN_SOAK_DAYS
+            if cool_off_days > 0:
+                last_at = datetime.fromisoformat(prior_revival_at)
+                delta = datetime.now(timezone.utc) - last_at
+                if delta < timedelta(days=cool_off_days):
+                    days_elapsed = int(delta.total_seconds() // 86400)
+                    days_remaining = max(0, cool_off_days - days_elapsed)
+                    raise ValueError(
+                        f"revive_signal_with_baseline cool-off: "
+                        f"{signal_type} was last revived at {prior_revival_at} "
+                        f"({days_elapsed} days ago); minimum "
+                        f"{cool_off_days} days required between "
+                        f"consecutive revivals "
+                        f"({days_remaining} days remaining). "
+                        f"Pass force=True to bypass: "
+                        f"db.revive_signal_with_baseline("
+                        f"'{signal_type}', reason='...', force=True)"
+                    )
 
         # Force-bypass observability hook (per design-stage reviewer
         # RECOMMEND): emit WARNING only when the bypass actually overrode

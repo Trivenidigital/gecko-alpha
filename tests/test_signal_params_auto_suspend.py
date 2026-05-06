@@ -784,13 +784,19 @@ async def test_revive_cooloff_independent_per_signal(tmp_path, settings_factory)
 
 
 async def test_revive_force_true_no_warning_on_first_revival(
-    tmp_path, settings_factory, caplog
+    tmp_path, settings_factory
 ):
-    """Per design-stage operator-experience reviewer RECOMMEND: force=True
-    on a signal with NO prior revival audit row should NOT emit the
-    revive_signal_force_bypass WARNING (no actual bypass occurred). It
-    should emit revive_signal_force_no_prior at INFO instead."""
-    import logging
+    """Per design-stage operator-experience reviewer RECOMMEND + PR-stage
+    code reviewer CRITICAL fix: force=True on a signal with NO prior
+    revival audit row must NOT emit the revive_signal_force_bypass
+    WARNING (no actual bypass occurred). It should emit
+    revive_signal_force_no_prior at INFO instead.
+
+    Uses structlog.testing.capture_logs() rather than pytest's caplog
+    because the project uses structlog.PrintLoggerFactory() — caplog
+    only captures stdlib logging. See test_trading_analytics.py:255
+    for the canonical pattern."""
+    from structlog.testing import capture_logs
 
     db = Database(tmp_path / "t.db")
     await db.initialize()
@@ -799,19 +805,66 @@ async def test_revive_force_true_no_warning_on_first_revival(
         "UPDATE signal_params SET enabled=0 WHERE signal_type='gainers_early'"
     )
     await db._conn.commit()
-    caplog.set_level(logging.INFO)
-    await db.revive_signal_with_baseline(
-        "gainers_early",
-        reason="defensive force on first revival",
-        force=True,
-        settings=s,
+    with capture_logs() as captured:
+        await db.revive_signal_with_baseline(
+            "gainers_early",
+            reason="defensive force on first revival",
+            force=True,
+            settings=s,
+        )
+    bypass_events = [
+        e for e in captured if e.get("event") == "revive_signal_force_bypass"
+    ]
+    assert not bypass_events, (
+        "force=True on first-ever revival must not log "
+        f"revive_signal_force_bypass at WARNING — that path should only "
+        f"fire when an actual bypass occurred. Got: {bypass_events}"
     )
-    log_text = caplog.text
-    assert "revive_signal_force_bypass" not in log_text, (
-        "force=True on first-ever revival must not log WARNING-level "
-        "revive_signal_force_bypass — that path should only fire when an "
-        "actual bypass occurred. Got log: " + log_text
+    # Confirm the alternative INFO path WAS emitted.
+    no_prior_events = [
+        e for e in captured if e.get("event") == "revive_signal_force_no_prior"
+    ]
+    assert no_prior_events, (
+        "force=True on first revival must emit revive_signal_force_no_prior "
+        f"at INFO; got captured events: {[e.get('event') for e in captured]}"
     )
+    await db.close()
+
+
+async def test_revive_force_true_warning_on_actual_bypass(tmp_path, settings_factory):
+    """Companion to the no-warning test: when a prior revival DOES exist
+    AND force=True, the revive_signal_force_bypass WARNING must fire."""
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory(SIGNAL_REVIVAL_MIN_SOAK_DAYS=7)
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    # First revival to create the audit row.
+    await db.revive_signal_with_baseline("gainers_early", reason="first", settings=s)
+    # Re-suspend then force-revive within the cool-off window.
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    with capture_logs() as captured:
+        await db.revive_signal_with_baseline(
+            "gainers_early", reason="force bypass", force=True, settings=s
+        )
+    bypass_events = [
+        e for e in captured if e.get("event") == "revive_signal_force_bypass"
+    ]
+    assert bypass_events, (
+        "force=True bypassing an actual cool-off must emit WARNING "
+        f"revive_signal_force_bypass; got: {[e.get('event') for e in captured]}"
+    )
+    # Verify structured fields are populated.
+    evt = bypass_events[0]
+    assert evt.get("signal_type") == "gainers_early"
+    assert evt.get("prior_revival_at") is not None
     await db.close()
 
 
