@@ -10,7 +10,7 @@ Triggers (any one is sufficient, in priority order):
 1. ``hard_loss``      — Combined gate (BL-NEW-AUTOSUSPEND-FIX 2026-05-06):
                           ``net_pnl <= SIGNAL_SUSPEND_HARD_LOSS_USD``
                           OR (``max_drawdown <= SIGNAL_SUSPEND_HARD_LOSS_USD``
-                              AND ``net_pnl <= 0``).
+                              AND ``net_pnl < SIGNAL_SUSPEND_PNL_THRESHOLD_USD``).
                         First disjunct catches catastrophic net bleed (no
                         MIN_TRADES floor). Second disjunct catches
                         pump-then-crash (drew up then fell below zero with
@@ -199,13 +199,21 @@ async def maybe_suspend_signals(
 
         # Hard-loss combined gate (BL-NEW-AUTOSUSPEND-FIX): fires on either
         #   (a) catastrophic net bleed: net_pnl <= hard_loss (no MIN_TRADES floor)
-        #   (b) pump-then-crash: deep peak-to-trough AND net <= 0
+        #   (b) pump-then-crash: deep peak-to-trough AND net < pnl_threshold
         # Profitable signals with normal volatility (drew up, gave back, still
         # net positive) do NOT fire. The previous drawdown-only rule killed
         # losers_contrarian (+$635 net, -$857 dd) and gainers_early (+$120 net,
         # -$1640 dd) on 2026-05-02 / 2026-05-04 — both false positives.
+        #
+        # Second disjunct uses ``net_pnl < pnl_threshold`` (NOT ``<= 0``) to
+        # close the no-MIN_TRADES-floor gap: a sparse-data signal at
+        # (n=2, net=-$10, dd=-$510) would otherwise hard-kill via this branch
+        # while the proper pnl_threshold rule defers it (n < MIN_TRADES). The
+        # tightened threshold preserves the pump-then-crash kill on real
+        # losses (e.g., n=9, net=-$300, dd=-$600 still fires) while letting
+        # borderline-negative low-data signals route to pnl_threshold.
         fires_hard_loss = net_pnl <= hard_loss or (
-            max_drawdown <= hard_loss and net_pnl <= 0
+            max_drawdown <= hard_loss and net_pnl < pnl_threshold
         )
         if fires_hard_loss:
             try:
@@ -263,6 +271,8 @@ async def maybe_suspend_signals(
                 now_iso=now_iso,
             )
             if session is not None:
+                from scout import alerter  # local import (Windows OpenSSL)
+
                 await alerter.send_telegram_message(
                     f"⚠ signal {signal_type} auto-suspended (pnl_threshold): "
                     f"net ${net_pnl:.0f}, n={n}",
