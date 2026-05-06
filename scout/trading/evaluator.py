@@ -195,19 +195,19 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     hint="master kill-switch OFF; locked params reverting to base",
                 )
 
-            if (
-                settings.PAPER_CONVICTION_LOCK_ENABLED
-                and sp.conviction_lock_enabled
-            ):
+            if settings.PAPER_CONVICTION_LOCK_ENABLED and sp.conviction_lock_enabled:
                 from scout.trading.conviction import (
                     compute_stack,
                     conviction_locked_params,
                 )
+
                 # design-v2 adv-S2: exclude_trade_id prevents the trade
                 # from counting itself as a "confirmation" via the
                 # paper_trades DISTINCT signal_type scan.
                 stack = await compute_stack(
-                    db, token_id, str(row[3]),
+                    db,
+                    token_id,
+                    str(row[3]),
                     exclude_trade_id=trade_id,
                 )
                 threshold = settings.PAPER_CONVICTION_LOCK_THRESHOLD
@@ -224,6 +224,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     # this MUST happen before line 158 so the NEW
                     # max_duration_hours is what timedelta() reads.
                     from dataclasses import replace
+
                     sp = replace(
                         sp,
                         max_duration_hours=locked["max_duration_hours"],
@@ -471,10 +472,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                         settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT,
                         sp.trail_pct,
                     )
-                elif (
-                    peak_pct is not None
-                    and peak_pct < sp.low_peak_threshold_pct
-                ):
+                elif peak_pct is not None and peak_pct < sp.low_peak_threshold_pct:
                     effective_trail_pct = sp.trail_pct_low_peak
                 else:
                     effective_trail_pct = sp.trail_pct
@@ -494,10 +492,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     close_reason = "stop_loss"
                     close_status = "closed_sl"
                 # Leg 1
-                elif (
-                    leg_1_filled is None
-                    and change_pct >= sp.leg_1_pct
-                ):
+                elif leg_1_filled is None and change_pct >= sp.leg_1_pct:
                     await _trader.execute_partial_sell(
                         db=db,
                         trade_id=trade_id,
@@ -588,9 +583,9 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                     and peak_pct is not None
                     and peak_pct >= settings.PAPER_HIGH_PEAK_FADE_MIN_PEAK_PCT
                     and peak_price is not None
-                    and current_price < peak_price * (
-                        1 - settings.PAPER_HIGH_PEAK_FADE_RETRACE_PCT / 100.0
-                    )
+                    and current_price
+                    < peak_price
+                    * (1 - settings.PAPER_HIGH_PEAK_FADE_RETRACE_PCT / 100.0)
                     and remaining_qty is not None
                     and remaining_qty > 0
                 ):
@@ -601,9 +596,16 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                         "(trade_id, token_id, signal_type, peak_pct, peak_price, "
                         " current_price, fired_at, dry_run) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (trade_id, token_id, signal_type_row,
-                         float(peak_pct), float(peak_price), float(current_price),
-                         fired_at, 1 if dry_run else 0),
+                        (
+                            trade_id,
+                            token_id,
+                            signal_type_row,
+                            float(peak_pct),
+                            float(peak_price),
+                            float(current_price),
+                            fired_at,
+                            1 if dry_run else 0,
+                        ),
                     )
                     if dry_run:
                         log.info(
@@ -626,9 +628,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                             token_id=token_id,
                             peak_pct=round(float(peak_pct), 2),
                             current_price=current_price,
-                            give_back_pp=round(
-                                float(peak_pct) - float(change_pct), 2
-                            ),
+                            give_back_pp=round(float(peak_pct) - float(change_pct), 2),
                         )
                 # BL-062 peak-fade — sustained fade at 6h AND 24h checkpoints.
                 # NB: fires on any pass with cp_24h present, not only the pass

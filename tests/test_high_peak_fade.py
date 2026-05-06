@@ -169,9 +169,7 @@ class TestSignalParamsField:
 
 class TestEvaluatorGateDryRun:
     @pytest.mark.asyncio
-    async def test_dry_run_does_not_close_trade(
-        self, tmp_path, settings_factory
-    ):
+    async def test_dry_run_does_not_close_trade(self, tmp_path, settings_factory):
         """In dry-run mode, the gate logs would-fire but does NOT set close_reason."""
         from scout.db import Database
         from scout.trading.evaluator import evaluate_paper_trades
@@ -195,10 +193,18 @@ class TestEvaluatorGateDryRun:
         trader = PaperTrader()
         # open a trade with a high peak (entry $1, peak $1.80 = +80%)
         trade_id = await trader.execute_buy(
-            db=db, token_id="tok1", symbol="TOK", name="Tok",
-            chain="solana", signal_type="gainers_early",
-            signal_data={}, current_price=1.0, amount_usd=100.0,
-            tp_pct=200.0, sl_pct=20.0, slippage_bps=0,
+            db=db,
+            token_id="tok1",
+            symbol="TOK",
+            name="Tok",
+            chain="solana",
+            signal_type="gainers_early",
+            signal_data={},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=200.0,
+            sl_pct=20.0,
+            slippage_bps=0,
             signal_combo="gainers_early",
         )
         # simulate peak having been recorded at $1.80, both legs already
@@ -237,7 +243,8 @@ class TestEvaluatorGateDryRun:
         # Audit-table should have a dry-run row
         cur = await db._conn.execute(
             "SELECT dry_run, peak_pct, current_price FROM high_peak_fade_audit "
-            "WHERE trade_id = ?", (trade_id,)
+            "WHERE trade_id = ?",
+            (trade_id,),
         )
         audit = await cur.fetchone()
         assert audit is not None, "audit row should exist"
@@ -250,9 +257,7 @@ class TestEvaluatorGateDryRun:
 
 class TestConvictionLockDefer:
     @pytest.mark.asyncio
-    async def test_gate_skips_when_conviction_locked(
-        self, tmp_path, settings_factory
-    ):
+    async def test_gate_skips_when_conviction_locked(self, tmp_path, settings_factory):
         """When conviction_locked_at IS NOT NULL, gate must NOT fire even
         in live mode (DRY_RUN=False)."""
         from scout.db import Database
@@ -272,10 +277,18 @@ class TestConvictionLockDefer:
 
         trader = PaperTrader()
         trade_id = await trader.execute_buy(
-            db=db, token_id="tok2", symbol="TOK2", name="Tok2",
-            chain="solana", signal_type="gainers_early",
-            signal_data={}, current_price=1.0, amount_usd=100.0,
-            tp_pct=200.0, sl_pct=20.0, slippage_bps=0,
+            db=db,
+            token_id="tok2",
+            symbol="TOK2",
+            name="Tok2",
+            chain="solana",
+            signal_type="gainers_early",
+            signal_data={},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=200.0,
+            sl_pct=20.0,
+            slippage_bps=0,
             signal_combo="gainers_early",
         )
         # high peak + conviction locked; both legs pre-filled so elif chain
@@ -342,10 +355,18 @@ class TestPerSignalOptIn:
 
         trader = PaperTrader()
         trade_id = await trader.execute_buy(
-            db=db, token_id="tok3", symbol="TOK3", name="Tok3",
-            chain="solana", signal_type="gainers_early",
-            signal_data={}, current_price=1.0, amount_usd=100.0,
-            tp_pct=200.0, sl_pct=20.0, slippage_bps=0,
+            db=db,
+            token_id="tok3",
+            symbol="TOK3",
+            name="Tok3",
+            chain="solana",
+            signal_type="gainers_early",
+            signal_data={},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=200.0,
+            sl_pct=20.0,
+            slippage_bps=0,
             signal_combo="gainers_early",
         )
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -408,10 +429,18 @@ class TestCascadeOrdering:
 
         trader = PaperTrader()
         trade_id = await trader.execute_buy(
-            db=db, token_id="tok4", symbol="TOK4", name="Tok4",
-            chain="solana", signal_type="gainers_early",
-            signal_data={}, current_price=1.0, amount_usd=100.0,
-            tp_pct=200.0, sl_pct=20.0, slippage_bps=0,
+            db=db,
+            token_id="tok4",
+            symbol="TOK4",
+            name="Tok4",
+            chain="solana",
+            signal_type="gainers_early",
+            signal_data={},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=200.0,
+            sl_pct=20.0,
+            slippage_bps=0,
             signal_combo="gainers_early",
         )
         # peak $1.80, current $1.17 = 35% retrace from peak (below moonshot 30% trail)
@@ -471,10 +500,18 @@ class TestCascadeOrdering:
 
         trader = PaperTrader()
         trade_id = await trader.execute_buy(
-            db=db, token_id="tok5", symbol="TOK5", name="Tok5",
-            chain="solana", signal_type="gainers_early",
-            signal_data={}, current_price=1.0, amount_usd=100.0,
-            tp_pct=200.0, sl_pct=20.0, slippage_bps=0,
+            db=db,
+            token_id="tok5",
+            symbol="TOK5",
+            name="Tok5",
+            chain="solana",
+            signal_type="gainers_early",
+            signal_data={},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=200.0,
+            sl_pct=20.0,
+            slippage_bps=0,
             signal_combo="gainers_early",
         )
         # peak 80%, current at 17% retrace = $1.49 (HPF threshold: 15% → $1.53)
@@ -514,9 +551,7 @@ class TestCascadeOrdering:
         await db.close()
 
     @pytest.mark.asyncio
-    async def test_below_75_peak_does_not_fire(
-        self, tmp_path, settings_factory
-    ):
+    async def test_below_75_peak_does_not_fire(self, tmp_path, settings_factory):
         """Below MIN_PEAK_PCT, gate stays silent; existing trail handles it."""
         from scout.db import Database
         from scout.trading.evaluator import evaluate_paper_trades
@@ -535,10 +570,18 @@ class TestCascadeOrdering:
 
         trader = PaperTrader()
         trade_id = await trader.execute_buy(
-            db=db, token_id="tok6", symbol="TOK6", name="Tok6",
-            chain="solana", signal_type="gainers_early",
-            signal_data={}, current_price=1.0, amount_usd=100.0,
-            tp_pct=200.0, sl_pct=20.0, slippage_bps=0,
+            db=db,
+            token_id="tok6",
+            symbol="TOK6",
+            name="Tok6",
+            chain="solana",
+            signal_type="gainers_early",
+            signal_data={},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=200.0,
+            sl_pct=20.0,
+            slippage_bps=0,
             signal_combo="gainers_early",
         )
         # peak 70% (BELOW threshold 75); current=$1.40 = ~18% retrace from peak $1.70
@@ -574,9 +617,7 @@ class TestCascadeOrdering:
 
 class TestMasterKillSwitch:
     @pytest.mark.asyncio
-    async def test_master_disabled_no_fire(
-        self, tmp_path, settings_factory
-    ):
+    async def test_master_disabled_no_fire(self, tmp_path, settings_factory):
         """When PAPER_HIGH_PEAK_FADE_ENABLED=False (default), gate is dead
         regardless of all other conditions. Audit table stays empty."""
         from scout.db import Database
@@ -596,10 +637,18 @@ class TestMasterKillSwitch:
 
         trader = PaperTrader()
         trade_id = await trader.execute_buy(
-            db=db, token_id="tok7", symbol="TOK7", name="Tok7",
-            chain="solana", signal_type="gainers_early",
-            signal_data={}, current_price=1.0, amount_usd=100.0,
-            tp_pct=200.0, sl_pct=20.0, slippage_bps=0,
+            db=db,
+            token_id="tok7",
+            symbol="TOK7",
+            name="Tok7",
+            chain="solana",
+            signal_type="gainers_early",
+            signal_data={},
+            current_price=1.0,
+            amount_usd=100.0,
+            tp_pct=200.0,
+            sl_pct=20.0,
+            slippage_bps=0,
             signal_combo="gainers_early",
         )
         now_iso = datetime.now(timezone.utc).isoformat()
