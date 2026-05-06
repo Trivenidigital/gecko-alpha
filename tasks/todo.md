@@ -59,7 +59,7 @@ Last updated: 2026-05-06 (BL-NEW-AUTOSUSPEND-FIX shipped + losers_contrarian/gai
 
 ## Pending operator action (blocked on user)
 
-- [ ] **Set real `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in prod `.env`.** Both are literal placeholders. Every alert path (BL-063 moonshot, BL-064 social, channel-silence, kill-switch, paper fills) is silently 404-ing. Get a token from BotFather, `/start` the bot in the target chat, then `https://api.telegram.org/bot<TOKEN>/getUpdates` shows the chat_id.
+- [x] **2026-05-06 02:40Z — Telegram credentials wired up.** Bot @Srini_gecko_bot (id 8427551586) DM'd to chat_id 6337722878 (operator's @LowCapHunt account). Test message via `alerter.send_telegram_message` confirmed end-to-end delivery. .env backup at `.env.bak.tg_<timestamp>`. Unblocks: BL-063 moonshot alerts, BL-064 social dispatches, channel-silence heartbeat, auto_suspend kill-switch (incl. new combined-gate paths), paper fills, calibrate weekly --dry-run alert (PR #76), future BL-NEW-HPF would-fire alerts.
 
 ## Next deliverables (in priority order)
 
