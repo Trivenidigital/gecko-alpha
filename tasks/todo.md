@@ -1,6 +1,6 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-03 (chain dispatch alive + Tier 1a reversal)
+Last updated: 2026-05-06 (BL-NEW-AUTOSUSPEND-FIX shipped + losers_contrarian/gainers_early revived + HPF dry-run activated)
 
 ## Pending verifications (time-gated)
 
@@ -9,6 +9,15 @@ Last updated: 2026-05-03 (chain dispatch alive + Tier 1a reversal)
 - [ ] **2026-05-04 22:24Z — Paper-lifecycle widening soak ends.** Sneak-peek +$1,234 net / 91 closes. Decision: keep on.
 - [ ] **2026-05-05 22:58Z — PR #59 strategy tuning soak ends.** Sneak-peek +$1,994 net / 135 closes / 67.4% win / 20% expired. Decision: keep on permanently.
 - [ ] **2026-05-10 15:53Z — gainers_early reversal re-soak (7d).** Watch for performance vs the +$190/day sneak-peek that justified reversal. If actuals < +$100/day for 7d, re-evaluate.
+- [ ] **2026-05-13 02:13Z — losers_contrarian post-BL-NEW-AUTOSUSPEND-FIX revival 7d soak.** Baseline stamped 2026-05-06T02:13:27Z. Decision gate: ≥+$200 net post-baseline OR per-trade > +$5 = keep on. <-$200 net OR <-$5/trade = re-evaluate (combined gate auto-fires at -$500 anyway).
+- [ ] **2026-05-13 02:15Z — gainers_early post-BL-NEW-AUTOSUSPEND-FIX revival 7d soak.** Baseline stamped 2026-05-06T02:15:23Z. Same decision gate as losers_contrarian. Pre-revival 30d net was -$850 (zombie cleanup) but post-PR-#59 was +$120 / 82 closes / 61% win — proving signal works under new trail.
+- [ ] **2026-05-13 02:18Z — HPF dry-run 7d soak (BL-NEW-HPF Phase 1).** Opt-in: gainers_early + losers_contrarian. Review queries:
+  ```sql
+  SELECT trade_id, signal_type, peak_pct, peak_price, current_price,
+         threshold_pct, retrace_pct, fired_at FROM high_peak_fade_audit
+  WHERE dry_run = 1 ORDER BY fired_at DESC;
+  ```
+  Cross-reference would-fires against actual paper_trades exits. If gate would have fired earlier than actual exit AND counter-factual PnL is positive, flip `PAPER_HIGH_PEAK_FADE_DRY_RUN=False`.
 
 ## Active soaks (don't disturb)
 
@@ -100,6 +109,8 @@ When user asks "how is strategy tuning going" tomorrow:
 - [ ] `narrative_prediction` token_id divergence fix — 32 of 56 stale-young open trades have empty/synthetic token_ids that don't appear in `price_cache`. Separate upstream fix.
 - [ ] Verify @s1mple_s1mple / t.me/s1mplegod123 ownership before adding (long-pending).
 - [ ] Audit fix #4 (24h hard-exit if peak<5%) deferred — accumulate more data first.
+- [ ] **BL-NEW-REVIVAL-COOLOFF** — strategy reviewer's RECOMMEND on PR #79: add 7-day cool-off to `Database.revive_signal_with_baseline()` to prevent operator-side immortalization via repeated baseline-stamping. Implementation: `SELECT applied_at FROM signal_params_audit WHERE signal_type=? AND applied_by='operator' AND old_value='0' AND new_value='1' ORDER BY applied_at DESC LIMIT 1`, raise ValueError if < N days ago. Default 7 days, configurable via Settings. Gated on going-live (BL-055) — paper-trading + audit-trail is interim mitigation.
+- [ ] **first_signal revival decision** — under new combined-gate rule (deployed 2026-05-06), first_signal would NOT auto-fire (-$132 30d net is borderline). Operator decision: revive for soak, or leave suspended pending more data. Audit row to use if reviving: `revive_signal_with_baseline("first_signal", reason="...")`.
 
 ## What shipped this session (2026-04-28 → 2026-04-29)
 
