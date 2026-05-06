@@ -304,8 +304,7 @@ async def test_initialize_upgrades_pre_bl060_db(tmp_path):
     """
     db_path = tmp_path / "gecko.db"
     async with aiosqlite.connect(str(db_path)) as conn:
-        await conn.executescript(
-            """
+        await conn.executescript("""
             CREATE TABLE paper_trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 token_id TEXT NOT NULL,
@@ -333,8 +332,7 @@ async def test_initialize_upgrades_pre_bl060_db(tmp_path):
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 UNIQUE(token_id, signal_type, opened_at)
             );
-            """
-        )
+            """)
         await conn.commit()
 
     db = Database(str(db_path))
@@ -403,19 +401,21 @@ async def test_bl061_ladder_columns_added(tmp_path):
 
 async def test_bl062_peak_fade_column_added(tmp_path):
     from scout.db import Database
+
     db = Database(tmp_path / "t.db")
     await db.initialize()
     cur = await db._conn.execute("PRAGMA table_info(paper_trades)")
     cols = {row[1] for row in await cur.fetchall()}
-    assert "peak_fade_fired_at" in cols, (
-        f"peak_fade_fired_at column missing from paper_trades; have {sorted(cols)}"
-    )
+    assert (
+        "peak_fade_fired_at" in cols
+    ), f"peak_fade_fired_at column missing from paper_trades; have {sorted(cols)}"
     await db.close()
 
 
 async def test_bl062_cutover_row_written(tmp_path):
     from scout.db import Database
     from datetime import datetime
+
     db = Database(tmp_path / "t.db")
     await db.initialize()
     cur = await db._conn.execute(
@@ -430,6 +430,7 @@ async def test_bl062_cutover_row_written(tmp_path):
 
 async def test_bl062_index_created(tmp_path):
     from scout.db import Database
+
     db = Database(tmp_path / "t.db")
     await db.initialize()
     cur = await db._conn.execute(
@@ -444,6 +445,7 @@ async def test_bl062_index_created(tmp_path):
 async def test_bl062_migration_idempotent_re_run(tmp_path):
     """Re-initialize an existing DB: no errors, cutover_ts preserved."""
     from scout.db import Database
+
     db_path = tmp_path / "t.db"
     db = Database(db_path)
     await db.initialize()
@@ -459,9 +461,9 @@ async def test_bl062_migration_idempotent_re_run(tmp_path):
         "SELECT cutover_ts FROM paper_migrations WHERE name='bl062_peak_fade'"
     )
     (second_ts,) = await cur.fetchone()
-    assert second_ts == first_ts, (
-        f"cutover_ts must be preserved across re-init; first={first_ts} second={second_ts}"
-    )
+    assert (
+        second_ts == first_ts
+    ), f"cutover_ts must be preserved across re-init; first={first_ts} second={second_ts}"
     await db2.close()
 
 

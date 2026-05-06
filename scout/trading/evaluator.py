@@ -591,9 +591,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                 ):
                     fired_at = datetime.now(timezone.utc).isoformat()
                     dry_run = settings.PAPER_HIGH_PEAK_FADE_DRY_RUN
-                    retrace_pct_value = (
-                        1 - current_price / float(peak_price)
-                    ) * 100.0
+                    retrace_pct_value = (1 - current_price / float(peak_price)) * 100.0
                     await conn.execute(
                         "INSERT OR IGNORE INTO high_peak_fade_audit "
                         "(trade_id, token_id, signal_type, peak_pct, peak_price, "

@@ -14,6 +14,7 @@ Five analyses:
 
 Output: structured markdown to stdout for direct paste into findings doc.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -68,7 +69,9 @@ def _is_eligible(t: Trade) -> bool:
     return True
 
 
-def _counter_pnl_pct(peak_pct: float, retrace_frac: float, slip_bps: float = 0.0) -> float:
+def _counter_pnl_pct(
+    peak_pct: float, retrace_frac: float, slip_bps: float = 0.0
+) -> float:
     """Counter-factual exit at retrace_frac from peak, with optional slippage discount.
 
     Slippage applies to the EXIT PRICE (not entry-relative return). For a trade
@@ -137,11 +140,11 @@ def _wilcoxon_signed_rank_p(deltas: list[float]) -> float:
     var_w = n_eff * (n_eff + 1) * (2 * n_eff + 1) / 24.0
     if var_w == 0:
         return 1.0
-    z = (w_plus - mean_w) / (var_w ** 0.5)
+    z = (w_plus - mean_w) / (var_w**0.5)
     # One-tailed: P(W >= observed) under H0
     # Approximation via normal CDF: p = 1 - Phi(z)
     # Math.erf-based normal CDF
-    return 0.5 * (1 - math.erf(z / (2 ** 0.5)))
+    return 0.5 * (1 - math.erf(z / (2**0.5)))
 
 
 def analysis_a_bootstrap(trades: list[Trade], threshold: float, retrace: float) -> str:
@@ -153,7 +156,7 @@ def analysis_a_bootstrap(trades: list[Trade], threshold: float, retrace: float) 
         return f"### A. Bootstrap CI (peak >= {threshold:.0f}%, retrace {retrace*100:.0f}%)\n\nNo trades fire policy. n=0.\n"
 
     mean = statistics.mean(deltas)
-    se = (statistics.stdev(deltas) / (n ** 0.5)) if n > 1 else 0.0
+    se = (statistics.stdev(deltas) / (n**0.5)) if n > 1 else 0.0
 
     # 10,000 bootstrap resamples
     rng = random.Random(20260505)
@@ -169,7 +172,7 @@ def analysis_a_bootstrap(trades: list[Trade], threshold: float, retrace: float) 
     # Leave-one-out
     loo_totals = []
     for i in range(n):
-        loo = deltas[:i] + deltas[i+1:]
+        loo = deltas[:i] + deltas[i + 1 :]
         loo_totals.append(sum(loo))
     loo_min = min(loo_totals)
     loo_max = max(loo_totals)
@@ -209,7 +212,9 @@ def analysis_b_cohort_widening(trades: list[Trade]) -> str:
         total = sum(deltas)
         mean = total / n
         rng = random.Random(20260505)
-        boot = sorted(sum(rng.choice(deltas) for _ in range(n)) / n for _ in range(5000))
+        boot = sorted(
+            sum(rng.choice(deltas) for _ in range(n)) / n for _ in range(5000)
+        )
         p5 = boot[int(0.05 * len(boot))]
         out += f"| peak >= {thr}% | {n} | ${total:+.2f} | ${mean:+.2f} | ${p5:+.2f} |\n"
     out += (
@@ -241,7 +246,9 @@ def analysis_c_regime_stratification(trades: list[Trade]) -> str:
             n = len(deltas)
             total = sum(deltas) if n else 0.0
             mean = (total / n) if n else 0.0
-            out += f"| {label} | {cohort_label} | {n} | ${total:+.2f} | ${mean:+.2f} |\n"
+            out += (
+                f"| {label} | {cohort_label} | {n} | ${total:+.2f} | ${mean:+.2f} |\n"
+            )
     out += (
         "\n**Interpretation:** if lift survives in BOTH pre and post cohorts of either split, "
         "regime-stationarity worry is reduced. If lift is concentrated in only one regime, "
@@ -253,7 +260,9 @@ def analysis_c_regime_stratification(trades: list[Trade]) -> str:
 def analysis_d_per_signal(trades: list[Trade], threshold: float, retrace: float) -> str:
     """D: Per-signal lift at the best policy."""
     applied = _apply_policy(trades, threshold, retrace)
-    by_sig: dict[str, dict] = defaultdict(lambda: {"n": 0, "n_applied": 0, "actual": 0.0, "counter": 0.0})
+    by_sig: dict[str, dict] = defaultdict(
+        lambda: {"n": 0, "n_applied": 0, "actual": 0.0, "counter": 0.0}
+    )
     for t, c, fired in applied:
         by_sig[t.signal_type]["n"] += 1
         by_sig[t.signal_type]["actual"] += t.pnl_usd
@@ -282,7 +291,9 @@ def analysis_d_per_signal(trades: list[Trade], threshold: float, retrace: float)
     return out
 
 
-def analysis_e_slippage_sensitivity(trades: list[Trade], threshold: float, retrace: float) -> str:
+def analysis_e_slippage_sensitivity(
+    trades: list[Trade], threshold: float, retrace: float
+) -> str:
     """E: Slippage sensitivity at the best policy."""
     out = f"### E. Slippage sensitivity (peak >= {threshold:.0f}%, retrace {retrace*100:.0f}%)\n\n"
     out += "| Slippage (bps) | Total counter $ | Δ vs actual $ |\n|---|---|---|\n"
@@ -304,10 +315,18 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--db-path", default="/root/gecko-alpha/scout.db")
     p.add_argument("--window", type=int, default=30)
-    p.add_argument("--threshold", type=float, default=75.0,
-                   help="Best-policy peak threshold (default 75)")
-    p.add_argument("--retrace", type=float, default=0.15,
-                   help="Best-policy retrace fraction (default 0.15)")
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=75.0,
+        help="Best-policy peak threshold (default 75)",
+    )
+    p.add_argument(
+        "--retrace",
+        type=float,
+        default=0.15,
+        help="Best-policy retrace fraction (default 0.15)",
+    )
     args = p.parse_args()
 
     try:
@@ -322,10 +341,14 @@ def main() -> int:
         return 0
 
     print(f"# Existing-data analysis battery — high-peak proposal\n")
-    print(f"**Window:** {args.window}d, **n trades:** {len(trades)}, "
-          f"**eligible (peak > 0):** {sum(1 for t in trades if _is_eligible(t))}, "
-          f"**actual net:** ${sum(t.pnl_usd for t in trades):+.2f}\n")
-    print(f"**Best policy under test:** peak >= {args.threshold:.0f}%, retrace {args.retrace*100:.0f}%\n")
+    print(
+        f"**Window:** {args.window}d, **n trades:** {len(trades)}, "
+        f"**eligible (peak > 0):** {sum(1 for t in trades if _is_eligible(t))}, "
+        f"**actual net:** ${sum(t.pnl_usd for t in trades):+.2f}\n"
+    )
+    print(
+        f"**Best policy under test:** peak >= {args.threshold:.0f}%, retrace {args.retrace*100:.0f}%\n"
+    )
     print()
     print(analysis_a_bootstrap(trades, args.threshold, args.retrace))
     print(analysis_b_cohort_widening(trades))

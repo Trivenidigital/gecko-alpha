@@ -142,7 +142,9 @@ class TestMigration:
         cur = await db._conn.execute(
             "SELECT COUNT(*) FROM high_peak_fade_audit WHERE trade_id = 1"
         )
-        assert (await cur.fetchone())[0] == 1, "UNIQUE constraint should prevent duplicate"
+        assert (await cur.fetchone())[
+            0
+        ] == 1, "UNIQUE constraint should prevent duplicate"
         await db.close()
 
     @pytest.mark.asyncio
@@ -500,7 +502,9 @@ class TestPerSignalOptIn:
             "SELECT COUNT(*) FROM high_peak_fade_audit WHERE trade_id = ?",
             (trade_id,),
         )
-        assert (await cur.fetchone())[0] == 1, (
+        assert (await cur.fetchone())[
+            0
+        ] == 1, (
             "audit row should exist when PER_SIGNAL_OPT_IN=False bypasses signal check"
         )
         await db.close()
@@ -567,7 +571,9 @@ class TestEdgeCases:
             "SELECT COUNT(*) FROM high_peak_fade_audit WHERE trade_id = ?",
             (trade_id,),
         )
-        assert (await cur.fetchone())[0] == 0, "gate skipped via peak_pct is not None guard"
+        assert (await cur.fetchone())[
+            0
+        ] == 0, "gate skipped via peak_pct is not None guard"
         await db.close()
 
     @pytest.mark.asyncio
@@ -630,7 +636,9 @@ class TestEdgeCases:
             "SELECT COUNT(*) FROM high_peak_fade_audit WHERE trade_id = ?",
             (trade_id,),
         )
-        assert (await cur.fetchone())[0] == 0, "gate skipped via peak_price is not None guard"
+        assert (await cur.fetchone())[
+            0
+        ] == 0, "gate skipped via peak_price is not None guard"
         await db.close()
 
 
