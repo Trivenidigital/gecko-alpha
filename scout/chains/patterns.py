@@ -86,7 +86,13 @@ BUILT_IN_PATTERNS: list[ChainPattern] = [
         ],
         min_steps_to_trigger=3,
         conviction_boost=25,
-        alert_priority="low",
+        # BL-NEW-CHAIN-COHERENCE 2026-05-06: bumped low→medium so the first
+        # post-fix completion produces a Telegram alert. Pre-fix this
+        # pattern matched 0 times in production despite 2,770 anchor
+        # candidates (token_id keying bug). Operator needs ambient
+        # confirmation that the per-laggard fix unblocked matching;
+        # falls back to "low" once observability is no longer load-bearing.
+        alert_priority="medium",
     ),
     ChainPattern(
         name="narrative_momentum",
@@ -120,7 +126,9 @@ BUILT_IN_PATTERNS: list[ChainPattern] = [
         ],
         min_steps_to_trigger=3,
         conviction_boost=15,
-        alert_priority="low",
+        # BL-NEW-CHAIN-COHERENCE 2026-05-06: bumped low→medium for the
+        # same observability reason as full_conviction above.
+        alert_priority="medium",
     ),
     ChainPattern(
         name="volume_breakout",
