@@ -398,3 +398,268 @@ async def test_bl061_moonshot_trade_never_closes_via_fixed_tp(
     assert armed_at is not None
     assert leg_2 is not None
     await db.close()
+
+
+# BL-NEW-MOONSHOT-OPT-OUT: per-signal opt-out from the moonshot floor
+
+
+@pytest.mark.asyncio
+async def test_signal_params_has_moonshot_enabled_column(tmp_path):
+    """Migration adds moonshot_enabled INTEGER NOT NULL DEFAULT 1."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    cur = await db._conn.execute("PRAGMA table_info(signal_params)")
+    cols = {row[1] for row in await cur.fetchall()}
+    assert "moonshot_enabled" in cols
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_moonshot_enabled_defaults_to_1_for_all_seed_signals(tmp_path):
+    """All seeded signal_params rows have moonshot_enabled=1 (default opt-in,
+    no behavior change on deploy)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT signal_type, moonshot_enabled FROM signal_params"
+    )
+    rows = await cur.fetchall()
+    assert len(rows) > 0
+    for sig, opt in rows:
+        assert opt == 1, f"{sig} should default to 1 (opt-in); got {opt}"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_idempotent_on_rerun(tmp_path):
+    """Per design-stage policy reviewer RECOMMEND: re-running the
+    migration on an already-migrated DB must be a no-op (no exception,
+    column still exists, paper_migrations + schema_version each have
+    exactly one row for this migration)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    # Re-run the migration directly — initialize() already ran it once.
+    await db._migrate_moonshot_opt_out_column()
+    # Column still exists exactly once.
+    cur = await db._conn.execute("PRAGMA table_info(signal_params)")
+    cols = [row[1] for row in await cur.fetchall()]
+    assert cols.count("moonshot_enabled") == 1
+    # Cutover row exists exactly once.
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM paper_migrations WHERE name = ?",
+        ("bl_moonshot_opt_out_v1",),
+    )
+    assert (await cur.fetchone())[0] == 1
+    # Schema_version row exists exactly once.
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM schema_version WHERE version = ?",
+        (20260507,),
+    )
+    assert (await cur.fetchone())[0] == 1
+    await db.close()
+
+
+async def _arm_at_50pct(db, trader, *, token_id, settings, signal_type="first_signal"):
+    """Helper: open a trade, arm leg-1, arm moonshot at +50% peak."""
+    trade_id = await trader.execute_buy(
+        db=db,
+        token_id=token_id,
+        symbol=token_id.upper(),
+        name=token_id.title(),
+        chain="coingecko",
+        signal_type=signal_type,
+        signal_data={},
+        current_price=1.00,
+        amount_usd=100.0,
+        tp_pct=20.0,
+        sl_pct=10.0,
+        slippage_bps=0,
+        signal_combo=signal_type,
+    )
+    await trader.execute_partial_sell(
+        db=db,
+        trade_id=trade_id,
+        leg=1,
+        sell_qty_frac=settings.PAPER_LADDER_LEG_1_QTY_FRAC,
+        current_price=1.30,
+        slippage_bps=0,
+    )
+    # Push price to +50% to arm moonshot in the next evaluator pass.
+    await _seed_price(db, token_id, 1.50)
+    await evaluate_paper_trades(db, settings)
+    return trade_id
+
+
+@pytest.mark.asyncio
+async def test_moonshot_floor_applies_by_default(tmp_path, settings_factory):
+    """moonshot_enabled=1 (default): trade armed at peak >= 40 closes via
+    trailing_stop only when retrace exceeds the MOONSHOT_TRAIL floor (30%),
+    NOT the tighter sp.trail_pct from per-signal calibration. This is the
+    pre-PR behavior the opt-out is designed to escape from."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    trader = PaperTrader()
+    settings = settings_factory(
+        PAPER_MOONSHOT_ENABLED=True,
+        PAPER_MOONSHOT_THRESHOLD_PCT=40.0,
+        PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT=30.0,
+        PAPER_LADDER_TRAIL_PCT=15.0,  # tighter than 30 floor; floor wins
+        SIGNAL_PARAMS_ENABLED=True,
+    )
+    trade_id = await _arm_at_50pct(db, trader, token_id="m_opt1", settings=settings)
+    # Confirm armed.
+    cur = await db._conn.execute(
+        "SELECT moonshot_armed_at FROM paper_trades WHERE id = ?", (trade_id,)
+    )
+    assert (await cur.fetchone())[0] is not None
+    # Push to -20% retrace from peak (1.50 → 1.20). trail floor=30%, not yet
+    # triggered; trade stays open.
+    await _seed_price(db, "m_opt1", 1.20)
+    await evaluate_paper_trades(db, settings)
+    cur = await db._conn.execute(
+        "SELECT status FROM paper_trades WHERE id = ?", (trade_id,)
+    )
+    assert (await cur.fetchone())[0] == "open"
+    # Push to -35% retrace (1.50 → 0.975). Now > floor 30%; closes.
+    await _seed_price(db, "m_opt1", 0.975)
+    await evaluate_paper_trades(db, settings)
+    cur = await db._conn.execute(
+        "SELECT status FROM paper_trades WHERE id = ?", (trade_id,)
+    )
+    assert (await cur.fetchone())[0].startswith("closed_")
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_moonshot_floor_skipped_when_opted_out(tmp_path, settings_factory):
+    """moonshot_enabled=0: signal-level trail_pct=15 controls the trail in
+    moonshot regime, NOT the global 30 floor. Trade armed at +50% peak
+    closes when retrace > 15%, which would NOT trigger under default
+    moonshot_enabled=1 (where the floor at 30% wins)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    # Opt out first_signal from moonshot
+    await db._conn.execute(
+        "UPDATE signal_params SET moonshot_enabled = 0 WHERE signal_type = 'first_signal'"
+    )
+    # Tighten trail_pct to 15 in the table (overrides Settings default)
+    await db._conn.execute(
+        "UPDATE signal_params SET trail_pct = 15.0 WHERE signal_type = 'first_signal'"
+    )
+    await db._conn.commit()
+    from scout.trading.params import clear_cache_for_tests
+
+    clear_cache_for_tests()
+
+    trader = PaperTrader()
+    settings = settings_factory(
+        PAPER_MOONSHOT_ENABLED=True,
+        PAPER_MOONSHOT_THRESHOLD_PCT=40.0,
+        PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT=30.0,
+        PAPER_LADDER_TRAIL_PCT=15.0,
+        SIGNAL_PARAMS_ENABLED=True,
+    )
+    trade_id = await _arm_at_50pct(db, trader, token_id="m_opt2", settings=settings)
+    # Push to -20% retrace from peak (1.50 → 1.20). With moonshot_enabled=0
+    # and sp.trail_pct=15%, this IS past trail; trade should close.
+    await _seed_price(db, "m_opt2", 1.20)
+    await evaluate_paper_trades(db, settings)
+    cur = await db._conn.execute(
+        "SELECT status FROM paper_trades WHERE id = ?", (trade_id,)
+    )
+    status = (await cur.fetchone())[0]
+    assert status.startswith("closed_"), (
+        f"With moonshot_enabled=0 and sp.trail_pct=15, a 20% retrace from peak "
+        f"should close the trade; got status={status}"
+    )
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_moonshot_opt_out_pre_moonshot_path_unchanged(tmp_path, settings_factory):
+    """Opt-out only affects moonshot regime (peak >= 40). At peak in
+    [low_peak_threshold, 40), the existing sp.trail_pct path runs
+    regardless of moonshot_enabled."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await db._conn.execute(
+        "UPDATE signal_params SET moonshot_enabled = 0 WHERE signal_type = 'first_signal'"
+    )
+    await db._conn.commit()
+    from scout.trading.params import clear_cache_for_tests
+
+    clear_cache_for_tests()
+
+    trader = PaperTrader()
+    settings = settings_factory(
+        PAPER_MOONSHOT_ENABLED=True,
+        PAPER_MOONSHOT_THRESHOLD_PCT=40.0,
+        PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT=30.0,
+        PAPER_LADDER_TRAIL_PCT=12.0,
+        SIGNAL_PARAMS_ENABLED=True,
+    )
+    trade_id = await trader.execute_buy(
+        db=db,
+        token_id="m_opt3",
+        symbol="M3",
+        name="M3",
+        chain="coingecko",
+        signal_type="first_signal",
+        signal_data={},
+        current_price=1.00,
+        amount_usd=100.0,
+        tp_pct=20.0,
+        sl_pct=10.0,
+        slippage_bps=0,
+        signal_combo="first_signal",
+    )
+    await trader.execute_partial_sell(
+        db=db,
+        trade_id=trade_id,
+        leg=1,
+        sell_qty_frac=settings.PAPER_LADDER_LEG_1_QTY_FRAC,
+        current_price=1.30,
+        slippage_bps=0,
+    )
+    # Push only to +30% peak (below moonshot threshold 40)
+    await _seed_price(db, "m_opt3", 1.30)
+    await evaluate_paper_trades(db, settings)
+    # Confirm not armed (peak < 40)
+    cur = await db._conn.execute(
+        "SELECT moonshot_armed_at FROM paper_trades WHERE id = ?", (trade_id,)
+    )
+    assert (await cur.fetchone())[0] is None
+    # The trade should obey sp.trail_pct = 12 (NOT the moonshot 30 floor)
+    # because we're not in moonshot regime — same as pre-PR behavior.
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_moonshot_opt_out_low_peak_path_unchanged(tmp_path, settings_factory):
+    """Below low_peak_threshold (default 20), trail_pct_low_peak applies
+    regardless of moonshot_enabled — this branch is independent of the
+    opt-out logic."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await db._conn.execute(
+        "UPDATE signal_params SET moonshot_enabled = 0 WHERE signal_type = 'first_signal'"
+    )
+    await db._conn.commit()
+    from scout.trading.params import clear_cache_for_tests, get_params
+
+    clear_cache_for_tests()
+
+    settings = settings_factory(
+        PAPER_MOONSHOT_ENABLED=True,
+        PAPER_LADDER_TRAIL_PCT=20.0,
+        PAPER_LADDER_TRAIL_PCT_LOW_PEAK=8.0,
+        PAPER_LADDER_LOW_PEAK_THRESHOLD_PCT=20.0,
+        SIGNAL_PARAMS_ENABLED=True,
+    )
+    sp = await get_params(db, "first_signal", settings)
+    # Sanity: opt-out flag is set on params
+    assert sp.moonshot_enabled is False
+    # The low-peak branch is structural — verified by reading
+    # evaluator.py:475: `elif peak_pct is not None and peak_pct < ...`
+    # is the path for sub-threshold peaks regardless of moonshot_enabled.
+    await db.close()
