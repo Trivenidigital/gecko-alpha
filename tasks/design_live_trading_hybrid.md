@@ -1,4 +1,4 @@
-**New primitives introduced:** Three new `Settings` fields — `LIVE_TRADING_ENABLED: bool = False` (master kill switch), `LIVE_MAX_TRADE_NOTIONAL_USD: float = 100.0` (per-trade cap), `LIVE_MAX_OPEN_EXPOSURE_USD: float = 1000.0` (aggregate cap). One signature change — `VenueResolver.resolve()` gains `chain: str` parameter; returned `ResolvedVenue.venue` becomes `f"minara_{chain}"` for DEX rows (was hardcoded `"binance"`). New SQL view `cross_venue_exposure` aggregating `live_orders` + chain-native `paper_trades`. Updated `gates.py` Gate 7 to query the view. New module `scout/live/minara_health.py` with `is_minara_alive()` + circuit-breaker state. Idempotency contract: Binance `client_order_id = f"gecko-{paper_trade_id}-{intent_uuid}"` for retry-safety; Minara-side `intent_uuid + minara_invocation_attempts_count` persisted to `live_orders` (no auto-retry on Minara timeout — gated on operator-in-loop). Pre-registered approval-removal criteria (6 gates, including new idempotency-clean). Pre-registered Phase 3 design-trigger criteria. New `live_orders_skipped_*` counter family (`master_kill`, `mode_paper`, `signal_disabled`, `kill_switch`, `exposure_cap`, `minara_down`, `dual_signal_aggregate`). Phase-2-only `live_position_aggregator` check (deferred from M1). Operator-side `venue_overrides` schema simplified to `(symbol, primary_chain)` only — no venue-internal pair format leakage. Tier-2 gap: `wallet_snapshots` table for true total-exposure (Phase 2+).
+**New primitives introduced:** Three new `Settings` fields — `LIVE_TRADING_ENABLED: bool = False` (master kill switch), `LIVE_MAX_TRADE_NOTIONAL_USD: float = 100.0` (per-trade cap), `LIVE_MAX_OPEN_EXPOSURE_USD: float = 1000.0` (aggregate cap). One signature change — `VenueResolver.resolve()` gains `chain: str` parameter; returned `ResolvedVenue.venue` becomes `f"minara_{chain}"` for DEX rows (was hardcoded `"binance"`). New SQL view `cross_venue_exposure` aggregating `live_trades` + chain-native `paper_trades`. Updated `gates.py` Gate 7 to query the view. New module `scout/live/minara_health.py` with `is_minara_alive()` + circuit-breaker state. Idempotency contract: Binance `client_order_id = f"gecko-{paper_trade_id}-{intent_uuid}"` for retry-safety; Minara-side `intent_uuid + minara_invocation_attempts_count` persisted to `live_trades` (no auto-retry on Minara timeout — gated on operator-in-loop). Pre-registered approval-removal criteria (6 gates, including new idempotency-clean). Pre-registered Phase 3 design-trigger criteria. New `live_trades_skipped_*` counter family (`master_kill`, `mode_paper`, `signal_disabled`, `kill_switch`, `exposure_cap`, `minara_down`, `dual_signal_aggregate`). Phase-2-only `live_position_aggregator` check (deferred from M1). Operator-side `venue_overrides` schema simplified to `(symbol, primary_chain)` only — no venue-internal pair format leakage. Tier-2 gap: `wallet_snapshots` table for true total-exposure (Phase 2+).
 
 # Live Trading — Hybrid Execution Architecture Design
 
@@ -59,7 +59,7 @@ Answer: **Hybrid — chain-field routing**. Signals stamped `chain="coingecko"` 
                                      │
                                      ▼
                      gecko-side reconciliation
-                     (paper_trades + live_orders + live_fills)
+                     (paper_trades + live_trades + live_fills)
                      ↓
                      Cross-venue exposure SQL view (NEW)
                      ↓
@@ -102,7 +102,7 @@ Concrete edge case: BILL fires `gainers_early` (chain="coingecko", routes to ove
 
 **Phase 0/1 policy:** allowed — operator sees both confirmation prompts and decides whether to approve the second. Reasonable signal-conviction stacking pattern.
 
-**Phase 2+ policy:** introduce a `live_position_aggregator` check at engine entry: if a live_orders row already exists for `(symbol, venue)` with status='open' AND the new intent's signal_type is different, refuse with `live_orders_skipped_dual_signal_aggregate`. Operator can override per-trade by passing `--allow-stack`.
+**Phase 2+ policy:** introduce a `live_position_aggregator` check at engine entry: if a live_trades row already exists for `(symbol, venue)` with status='open' AND the new intent's signal_type is different, refuse with `live_trades_skipped_dual_signal_aggregate`. Operator can override per-trade by passing `--allow-stack`.
 
 **Note:** this is documented here as a Phase-2 design requirement. The Phase-0/1 implementation plan does NOT need this gate. It's a follow-up before autonomy.
 
@@ -135,7 +135,7 @@ Live execution is gated by **four independent layers**. ALL must allow execution
 LIVE_TRADING_ENABLED: bool = False  # MASTER kill — operator-controlled via .env
 ```
 
-**Semantics:** when `False`, `scout/live/engine.py` short-circuits at the entry point: emits `live_execution_skipped_master_kill` log event, increments `live_orders_skipped_master_kill` counter, leaves the paper_trade row untouched. When `True`, execution proceeds to layer 2. Default `False`. Operator-controlled by editing `/root/gecko-alpha/.env` and restarting the pipeline.
+**Semantics:** when `False`, `scout/live/engine.py` short-circuits at the entry point: emits `live_execution_skipped_master_kill` log event, increments `live_trades_skipped_master_kill` counter, leaves the paper_trade row untouched. When `True`, execution proceeds to layer 2. Default `False`. Operator-controlled by editing `/root/gecko-alpha/.env` and restarting the pipeline.
 
 **Why this exists in addition to `LIVE_MODE`:** `LIVE_MODE` is a graduation-state knob (paper → shadow → live). `LIVE_TRADING_ENABLED` is a hard kill — orthogonal to LIVE_MODE. Even with `LIVE_MODE="live"` AND per-signal opt-in AND no kill_switch active, if `LIVE_TRADING_ENABLED=False`, nothing fires. This means the operator can flip live trading off in seconds via an .env edit + restart, regardless of the rest of the config state. Mirrors the BL-NEW-AUTOSUSPEND-FIX `SIGNAL_PARAMS_ENABLED` flag's role for auto-suspend, and the `PAPER_HIGH_PEAK_FADE_ENABLED` flag's role for HPF.
 
@@ -163,7 +163,7 @@ signal_params.live_eligible=1 ──┤
 kill_switch_active=False ────────┘
 ```
 
-ANY one False → `live_orders_skipped_<reason>` counter increments + log event + paper_trade unaffected.
+ANY one False → `live_trades_skipped_<reason>` counter increments + log event + paper_trade unaffected.
 
 ## Pre-registered approval-removal criteria (Phase 1 → Phase 2)
 
@@ -181,7 +181,7 @@ Pre-registered HERE in this document. Tolerances NOT adjustable post-Phase-0-sta
 >
 >    Per-venue thresholds reflect the actual liquidity-class differences (Binance perps have deep books; DEX micro-cap tokens routinely run 200-500 bps actual slippage). Thresholds are absolute and NOT adjustable post-Phase-0-start. The per-(signal_type × venue) breakdown is load-bearing — a global aggregate could hide route-specific bias.
 >
-> 4. **Reconciliation-clean gate:** No unresolved reconciliation discrepancies (paper_trades / live_orders state mismatches) for this (signal_type × venue) pair in the past 14 days.
+> 4. **Reconciliation-clean gate:** No unresolved reconciliation discrepancies (paper_trades / live_trades state mismatches) for this (signal_type × venue) pair in the past 14 days.
 >
 > 5. **Idempotency-clean gate (per architectural-reviewer RECOMMEND):** No double-fill incidents in the past 14 days. A double-fill is defined as: gecko-alpha records 2+ live_fills rows for the same `intent_id` (Binance: `client_order_id`; Minara: gecko-side intent UUID). This gate is a Phase 2 blocker because operator-in-loop catches double-confirms; autonomous mode does not.
 >
@@ -252,7 +252,7 @@ default — allows ~10 concurrent positions at default size. Operator
 controls via .env."""
 ```
 
-**Enforcement point:** Layer 4 of the kill-switch stack — checked AFTER LIVE_TRADING_ENABLED + LIVE_MODE + per-signal opt-in but BEFORE the venue adapter is called. Engine queries `cross_venue_exposure_view` (defined below) for current total open exposure, adds the proposed trade's notional, refuses if over ceiling. Logs `live_orders_skipped_exposure_cap` + Telegram alert on breach (alerts because this means signals are firing faster than the operator's intended deployment rate, which is itself a meaningful alert).
+**Enforcement point:** Layer 4 of the kill-switch stack — checked AFTER LIVE_TRADING_ENABLED + LIVE_MODE + per-signal opt-in but BEFORE the venue adapter is called. Engine queries `cross_venue_exposure_view` (defined below) for current total open exposure, adds the proposed trade's notional, refuses if over ceiling. Logs `live_trades_skipped_exposure_cap` + Telegram alert on breach (alerts because this means signals are firing faster than the operator's intended deployment rate, which is itself a meaningful alert).
 
 **Why the ceiling lives in `.env` and not `signal_params`:** the operator wants to flip caps in seconds without DB migration. `.env` change + restart takes 30s. SQL UPDATE on signal_params requires more thought (which signal? which value?) and can't be a true "halt all expansion" lever.
 
@@ -268,7 +268,7 @@ CREATE VIEW cross_venue_exposure AS
     'binance' AS venue,
     COALESCE(SUM(size_usd), 0) AS open_exposure_usd,
     COUNT(*) AS open_count
-  FROM live_orders
+  FROM live_trades
   WHERE status = 'open'
 UNION ALL
   SELECT
@@ -300,13 +300,13 @@ async def is_minara_alive(timeout_sec: float = 5.0) -> bool:
     """
 ```
 
-Failure mode: signal misses (skip the trade with `live_orders_skipped_minara_down` counter increment). **NO fallback.** The advisor's framing: fallback is the trap option (silent execution somewhere unintended is worse than no execution).
+Failure mode: signal misses (skip the trade with `live_trades_skipped_minara_down` counter increment). **NO fallback.** The advisor's framing: fallback is the trap option (silent execution somewhere unintended is worse than no execution).
 
 Heartbeat surfaces 24h skip count + last-success timestamp.
 
 **False-positive circuit breaker (per risk-reviewer RECOMMEND):** the liveness probe confirms `minara account` responds. It does NOT confirm `minara swap` execution. A CLI that returns account data instantly but hangs on swap calls is false-positive on the probe. Mitigation:
 
-- Track `live_orders_skipped_minara_down` AND `live_swap_calls_timed_out` counters in a rolling 1-hour window.
+- Track `live_trades_skipped_minara_down` AND `live_swap_calls_timed_out` counters in a rolling 1-hour window.
 - If `live_swap_calls_timed_out` ≥ 3 in any 1h window despite probe-green, **halt all DEX execution** (set a process-local `_minara_circuit_open=True` flag) AND fire Telegram alert: `"⚠ Minara circuit breaker tripped: 3 swap timeouts despite liveness-probe green. DEX execution paused. Operator: investigate or run /minara-circuit-reset."`
 - Operator-acknowledgment (Telegram command or .env flag flip) clears the breaker.
 
@@ -314,9 +314,9 @@ This is the design-level guard against the liveness-probe-deceives-us scenario; 
 
 ### 3. Idempotency on retry (per architectural-reviewer + risk-reviewer RECOMMEND)
 
-**Binance side (BL-055 adapter):** every order submission sets a `client_order_id = f"gecko-{paper_trade_id}-{intent_uuid}"` (intent_uuid is gecko-generated, persisted to `live_orders` row at submit-time). Before retrying any Binance order on timeout/transient error, the adapter MUST query open orders + recent fills by `client_order_id` and confirm no existing fill before submitting a second request. If an existing matching `client_order_id` is found, the second submit is suppressed and the adapter waits for the original's terminal state instead.
+**Binance side (BL-055 adapter):** every order submission sets a `client_order_id = f"gecko-{paper_trade_id}-{intent_uuid}"` (intent_uuid is gecko-generated, persisted to `live_trades` row at submit-time). Before retrying any Binance order on timeout/transient error, the adapter MUST query open orders + recent fills by `client_order_id` and confirm no existing fill before submitting a second request. If an existing matching `client_order_id` is found, the second submit is suppressed and the adapter waits for the original's terminal state instead.
 
-**Minara side (BL-074 adapter):** Minara CLI doesn't expose an obvious idempotency key in the public skill. Compensating control: gecko-side adapter persists `intent_uuid + minara_invocation_attempts_count` to `live_orders` row; if an attempt ends in subprocess timeout (15s built-in or our 30s outer wrapper), gecko marks the intent `status='timed_out_unknown'` and DOES NOT auto-retry. Operator-in-loop mode (Phase 0/1) handles this by surfacing the row in a Telegram alert; operator manually checks `minara balance --json` to determine whether the swap actually filled and updates the row. Phase 2 (autonomous) is GATED on idempotency-clean criterion #5 above — if double-fills occur, autonomy is removed.
+**Minara side (BL-074 adapter):** Minara CLI doesn't expose an obvious idempotency key in the public skill. Compensating control: gecko-side adapter persists `intent_uuid + minara_invocation_attempts_count` to `live_trades` row; if an attempt ends in subprocess timeout (15s built-in or our 30s outer wrapper), gecko marks the intent `status='timed_out_unknown'` and DOES NOT auto-retry. Operator-in-loop mode (Phase 0/1) handles this by surfacing the row in a Telegram alert; operator manually checks `minara balance --json` to determine whether the swap actually filled and updates the row. Phase 2 (autonomous) is GATED on idempotency-clean criterion #5 above — if double-fills occur, autonomy is removed.
 
 **Why no auto-retry on Minara:** without a CLI-side idempotency key, automated retry risks double-fill. Operator-in-loop is the failsafe.
 
