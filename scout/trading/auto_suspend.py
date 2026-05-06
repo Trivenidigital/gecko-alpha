@@ -7,17 +7,30 @@ pattern, NOT an external cron job. Idempotent within a day via
 
 Triggers (any one is sufficient, in priority order):
 
-1. ``hard_loss``      — ``max(running net pnl drawdown) <= SIGNAL_SUSPEND_HARD_LOSS_USD``
-                        (no MIN_TRADES floor — catastrophic bleed must stop fast).
+1. ``hard_loss``      — Combined gate (BL-NEW-AUTOSUSPEND-FIX 2026-05-06):
+                          ``net_pnl <= SIGNAL_SUSPEND_HARD_LOSS_USD``
+                          OR (``max_drawdown <= SIGNAL_SUSPEND_HARD_LOSS_USD``
+                              AND ``net_pnl < SIGNAL_SUSPEND_PNL_THRESHOLD_USD``).
+                        First disjunct catches catastrophic net bleed (no
+                        MIN_TRADES floor). Second disjunct catches
+                        pump-then-crash (drew up then fell below zero with
+                        deep peak-to-trough). Profitable signals with normal
+                        volatility (drew up, gave some back, still net
+                        positive) do NOT fire — the prior drawdown-only rule
+                        produced false positives killing winners.
 2. ``pnl_threshold``  — ``net_pnl < SIGNAL_SUSPEND_PNL_THRESHOLD_USD``
                         AND ``n_trades >= SIGNAL_SUSPEND_MIN_TRADES``.
 
-Suspension is ONE-WAY — the job NEVER sets ``enabled=1``. Re-enable
-requires manual SQL or operator dashboard action.
+Auto-suspension is ONE-WAY — the job NEVER sets ``enabled=1``. Re-enable
+requires operator action via :meth:`Database.revive_signal_with_baseline`,
+which atomically flips ``enabled=1`` AND stamps ``drawdown_baseline_at`` so
+historical drawdown isn't carried into the new rolling window.
 
-Window: trades closed since ``signal_params.last_calibration_at`` (or
-last 30d if no calibration recorded) — avoids killing a signal for
-losses incurred under stale params. Per adversarial review §2.
+Window: trades closed since ``MAX(signal_params.last_calibration_at,
+signal_params.drawdown_baseline_at, last 30d)`` — last_calibration_at protects
+against killing a signal for losses incurred under stale params (per
+adversarial review §2); drawdown_baseline_at protects against carrying
+historical drawdown across operator revival (BL-NEW-AUTOSUSPEND-FIX).
 """
 
 from __future__ import annotations
@@ -151,9 +164,7 @@ async def maybe_suspend_signals(
     hard_loss = settings.SIGNAL_SUSPEND_HARD_LOSS_USD
     min_trades = settings.SIGNAL_SUSPEND_MIN_TRADES
 
-    fixed_window_iso = (
-        datetime.now(timezone.utc) - timedelta(days=30)
-    ).isoformat()
+    fixed_window_iso = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
     now_iso = datetime.now(timezone.utc).isoformat()
 
     suspended: list[dict] = []
@@ -172,25 +183,48 @@ async def maybe_suspend_signals(
             continue
 
         cur = await conn.execute(
-            "SELECT last_calibration_at FROM signal_params WHERE signal_type = ?",
+            "SELECT last_calibration_at, drawdown_baseline_at "
+            "FROM signal_params WHERE signal_type = ?",
             (signal_type,),
         )
         row = await cur.fetchone()
         last_cal = row[0] if row else None
-        since_iso = last_cal if last_cal else fixed_window_iso
+        baseline = row[1] if row else None
+        # Window floor = MAX(last_cal, baseline, 30d_default).
+        # ISO-8601 lex-sort matches chronological order for any consistent
+        # timezone offset; all writes use UTC isoformat() so this is safe.
+        since_iso = max(iso for iso in (last_cal, baseline, fixed_window_iso) if iso)
 
         n, net_pnl, max_drawdown = await _rolling_stats(conn, signal_type, since_iso)
 
-        # Hard-loss escape hatch — fires regardless of trade count. A signal
-        # with 19 trades and -$1000 cumulative shouldn't keep trading.
-        if max_drawdown <= hard_loss:
+        # Hard-loss combined gate (BL-NEW-AUTOSUSPEND-FIX): fires on either
+        #   (a) catastrophic net bleed: net_pnl <= hard_loss (no MIN_TRADES floor)
+        #   (b) pump-then-crash: deep peak-to-trough AND net < pnl_threshold
+        # Profitable signals with normal volatility (drew up, gave back, still
+        # net positive) do NOT fire. The previous drawdown-only rule killed
+        # losers_contrarian (+$635 net, -$857 dd) and gainers_early (+$120 net,
+        # -$1640 dd) on 2026-05-02 / 2026-05-04 — both false positives.
+        #
+        # Second disjunct uses ``net_pnl < pnl_threshold`` (NOT ``<= 0``) to
+        # close the no-MIN_TRADES-floor gap: a sparse-data signal at
+        # (n=2, net=-$10, dd=-$510) would otherwise hard-kill via this branch
+        # while the proper pnl_threshold rule defers it (n < MIN_TRADES). The
+        # tightened threshold preserves the pump-then-crash kill on real
+        # losses (e.g., n=9, net=-$300, dd=-$600 still fires) while letting
+        # borderline-negative low-data signals route to pnl_threshold.
+        fires_hard_loss = net_pnl <= hard_loss or (
+            max_drawdown <= hard_loss and net_pnl < pnl_threshold
+        )
+        if fires_hard_loss:
             try:
                 await conn.execute("BEGIN EXCLUSIVE")
                 await _suspend(
                     conn,
                     signal_type,
                     reason="hard_loss",
-                    detail=f"max_drawdown ${max_drawdown:.0f} (n={n})",
+                    detail=(
+                        f"net ${net_pnl:.0f}, drawdown ${max_drawdown:.0f} " f"(n={n})"
+                    ),
                     now_iso=now_iso,
                 )
                 if session is not None:
@@ -198,7 +232,8 @@ async def maybe_suspend_signals(
 
                     await alerter.send_telegram_message(
                         f"⚠ signal {signal_type} auto-suspended (hard_loss): "
-                        f"drawdown ${max_drawdown:.0f}, n={n}",
+                        f"net ${net_pnl:.0f}, drawdown ${max_drawdown:.0f}, "
+                        f"n={n}",
                         session,
                         settings,
                     )
@@ -207,9 +242,7 @@ async def maybe_suspend_signals(
                 try:
                     await conn.execute("ROLLBACK")
                 except Exception as rb_err:
-                    log.exception(
-                        "auto_suspend_rollback_failed", err=str(rb_err)
-                    )
+                    log.exception("auto_suspend_rollback_failed", err=str(rb_err))
                 raise
             suspended.append(
                 {
@@ -238,6 +271,8 @@ async def maybe_suspend_signals(
                 now_iso=now_iso,
             )
             if session is not None:
+                from scout import alerter  # local import (Windows OpenSSL)
+
                 await alerter.send_telegram_message(
                     f"⚠ signal {signal_type} auto-suspended (pnl_threshold): "
                     f"net ${net_pnl:.0f}, n={n}",
