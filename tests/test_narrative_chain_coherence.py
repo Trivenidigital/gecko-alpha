@@ -112,10 +112,20 @@ def test_category_heating_event_data_preserves_category_metadata():
 
 def test_category_heating_inside_laggards_loop():
     """Verify the emission is structurally inside the laggards-scoring loop,
-    not the outer category loop. We pin this by checking the emission appears
-    AFTER a `for token in scored_laggards` (or similar) construct in source
-    order. This protects against accidental re-introduction of the
-    once-per-category placement."""
+    not the outer category loop. We pin this with a sandwich check:
+
+        laggards_loop_open < emission_pos < post_loop_marker
+
+    The post-loop marker is a known call (`store_predictions(`) that lives
+    AFTER the `for token in scored_laggards:` block closes. This rules out
+    the failure mode where the emission is in source-order after the loop
+    opening but actually outside the loop body (e.g., placed after the
+    closing dedent). Per #4 code-structural reviewer Issue 1.
+
+    Also accepts variable renames (token / laggard / pick) to stay
+    consistent with the affirmative-marker tolerance in
+    test_category_heating_emission_uses_token_coin_id (per Issue 2).
+    """
     src = _AGENT_SRC
     # Find positions of all category_heating emissions.
     heating_positions = []
@@ -129,21 +139,39 @@ def test_category_heating_inside_laggards_loop():
 
     assert heating_positions, "expected at least one category_heating emission"
 
-    # The laggards loop in agent.py uses `for token in scored_laggards`
-    # (see scout/narrative/agent.py:257). Find its position.
-    laggards_loop_marker = "for token in scored_laggards"
-    laggards_loop_pos = src.find(laggards_loop_marker)
+    # Find the laggards-loop opening. Accept variable renames consistent
+    # with the affirmative-marker tolerance in
+    # test_category_heating_emission_uses_token_coin_id.
+    laggards_loop_pos = -1
+    for marker in (
+        "for token in scored_laggards",
+        "for laggard in scored_laggards",
+        "for pick in scored_laggards",
+    ):
+        p = src.find(marker)
+        if p > 0:
+            laggards_loop_pos = p
+            break
     assert laggards_loop_pos > 0, (
-        f"expected a 'for token in scored_laggards' loop marker; "
-        f"variable rename? search source for the actual loop construct."
+        "expected a 'for <var> in scored_laggards' loop marker — search "
+        "source for the actual loop construct if the variable was renamed."
     )
 
-    # Every category_heating emission must come AFTER the laggards-loop
-    # opening, structurally placing it inside the loop.
+    # Find the post-loop marker. `store_predictions(` is called AFTER the
+    # inner laggards loop closes. Sandwich the emission between loop-open
+    # and post-loop-marker to guarantee placement inside the loop body,
+    # not merely after it in source order.
+    post_loop_pos = src.find("store_predictions(", laggards_loop_pos)
+    assert post_loop_pos > laggards_loop_pos, (
+        "expected a 'store_predictions(' call AFTER the laggards loop to "
+        "use as a post-loop marker; codebase refactor may have removed it."
+    )
+
     for pos in heating_positions:
-        assert pos > laggards_loop_pos, (
-            f"category_heating emission at offset {pos} appears BEFORE the "
-            f"'for token in scored_laggards' loop at offset {laggards_loop_pos}. "
+        assert laggards_loop_pos < pos < post_loop_pos, (
+            f"category_heating emission at offset {pos} is not inside the "
+            f"laggards loop body (loop opens at {laggards_loop_pos}, "
+            f"closes before store_predictions at {post_loop_pos}). "
             f"Move emission inside the laggards loop so token_id can be "
             f"per-laggard coin_id."
         )
