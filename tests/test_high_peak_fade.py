@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from scout.config import Settings
@@ -162,4 +164,85 @@ class TestSignalParamsField:
         settings = settings_factory(SIGNAL_PARAMS_ENABLED=True)
         sp = await params_for_signal(db, "gainers_early", settings)
         assert sp.high_peak_fade_enabled is True
+        await db.close()
+
+
+class TestEvaluatorGateDryRun:
+    @pytest.mark.asyncio
+    async def test_dry_run_does_not_close_trade(
+        self, tmp_path, settings_factory, token_factory
+    ):
+        """In dry-run mode, the gate logs would-fire but does NOT set close_reason."""
+        from scout.db import Database
+        from scout.trading.evaluator import evaluate_paper_trades
+        from scout.trading.paper import PaperTrader
+        from scout.trading.params import clear_cache_for_tests
+
+        db = Database(str(tmp_path / "test.db"))
+        await db.initialize()
+        # opt in gainers_early; widen trail_pct so the trailing-stop branch
+        # does NOT pre-empt the new high-peak fade gate. With peak=$1.80 and
+        # current=$1.50, a trail_pct of 20% gives trail_threshold=$1.44 (no
+        # pre-empt). The default 12% would pre-empt at $1.584.
+        await db._conn.execute(
+            "UPDATE signal_params SET high_peak_fade_enabled = 1, "
+            "trail_pct = 20.0 "
+            "WHERE signal_type = 'gainers_early'"
+        )
+        await db._conn.commit()
+        clear_cache_for_tests()
+
+        trader = PaperTrader()
+        # open a trade with a high peak (entry $1, peak $1.80 = +80%)
+        trade_id = await trader.execute_buy(
+            db=db, token_id="tok1", symbol="TOK", name="Tok",
+            chain="solana", signal_type="gainers_early",
+            signal_data={}, current_price=1.0, amount_usd=100.0,
+            tp_pct=200.0, sl_pct=20.0, slippage_bps=0,
+            signal_combo="gainers_early",
+        )
+        # simulate peak having been recorded at $1.80, both legs already
+        # fired (so the elif chain falls past leg-1/leg-2 to the new gate
+        # without triggering an early `continue`).
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await db._conn.execute(
+            "UPDATE paper_trades SET peak_price = 1.80, peak_pct = 80.0, "
+            "floor_armed = 1, leg_1_filled_at = ?, leg_2_filled_at = ?, "
+            "remaining_qty = quantity * 0.5 "
+            "WHERE id = ?",
+            (now_iso, now_iso, trade_id),
+        )
+        # current price at $1.50 (16.7% retrace from peak)
+        await db._conn.execute(
+            "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+            "VALUES (?, ?, ?)",
+            ("tok1", 1.50, datetime.now(timezone.utc).isoformat()),
+        )
+        await db._conn.commit()
+
+        settings = settings_factory(
+            PAPER_HIGH_PEAK_FADE_ENABLED=True,
+            PAPER_HIGH_PEAK_FADE_DRY_RUN=True,
+            SIGNAL_PARAMS_ENABLED=True,
+        )
+        await evaluate_paper_trades(db, settings)
+
+        # Trade should still be open
+        cur = await db._conn.execute(
+            "SELECT status FROM paper_trades WHERE id = ?", (trade_id,)
+        )
+        row = await cur.fetchone()
+        assert row[0] == "open", f"dry-run should not close; got status={row[0]}"
+
+        # Audit-table should have a dry-run row
+        cur = await db._conn.execute(
+            "SELECT dry_run, peak_pct, current_price FROM high_peak_fade_audit "
+            "WHERE trade_id = ?", (trade_id,)
+        )
+        audit = await cur.fetchone()
+        assert audit is not None, "audit row should exist"
+        assert audit[0] == 1, "dry_run flag should be 1"
+        assert abs(audit[1] - 80.0) < 0.01
+        assert abs(audit[2] - 1.50) < 0.01
+
         await db.close()
