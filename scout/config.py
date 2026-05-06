@@ -316,9 +316,9 @@ class Settings(BaseSettings):
     # >= RETRACE_PCT from peak. Tighter than moonshot trail (30%) because
     # the cohort can afford it: capture > give-back at this peak.
     # See tasks/findings_high_peak_giveback.md §14 for backtest evidence
-    # (n=10 cohort, +$696 lift, bootstrap p5 = $35.42, slippage-robust to 500bps).
+    # (n=15 cohort at 60%, +$650 lift, bootstrap p5=$23, slippage-robust to 500bps).
     PAPER_HIGH_PEAK_FADE_ENABLED: bool = False  # master kill, default off
-    PAPER_HIGH_PEAK_FADE_MIN_PEAK_PCT: float = 75.0  # below this, regular trail
+    PAPER_HIGH_PEAK_FADE_MIN_PEAK_PCT: float = 60.0  # §14 sweet spot — n=15, p5=$23
     PAPER_HIGH_PEAK_FADE_RETRACE_PCT: float = 15.0  # tighter than moonshot 30%
     PAPER_HIGH_PEAK_FADE_DRY_RUN: bool = True  # log-only initially
     PAPER_HIGH_PEAK_FADE_PER_SIGNAL_OPT_IN: bool = (

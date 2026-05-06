@@ -21,9 +21,9 @@ class TestConfigDefaults:
         s = Settings(**_REQUIRED)
         assert s.PAPER_HIGH_PEAK_FADE_ENABLED is False
 
-    def test_default_min_peak_pct_is_75(self):
+    def test_default_min_peak_pct_is_60(self):
         s = Settings(**_REQUIRED)
-        assert s.PAPER_HIGH_PEAK_FADE_MIN_PEAK_PCT == 75.0
+        assert s.PAPER_HIGH_PEAK_FADE_MIN_PEAK_PCT == 60.0
 
     def test_default_retrace_pct_is_15(self):
         s = Settings(**_REQUIRED)
@@ -96,7 +96,8 @@ class TestMigration:
         cur = await db._conn.execute("PRAGMA table_info(high_peak_fade_audit)")
         cols = {row[1] for row in await cur.fetchall()}
         # MUST contain: id, trade_id, token_id, signal_type, peak_pct,
-        # peak_price, current_price, fired_at, dry_run (1=would_fire, 0=real_fire)
+        # peak_price, current_price, threshold_pct, retrace_pct,
+        # fired_at, dry_run (1=would_fire, 0=real_fire)
         for required in (
             "id",
             "trade_id",
@@ -105,10 +106,41 @@ class TestMigration:
             "peak_pct",
             "peak_price",
             "current_price",
+            "threshold_pct",
+            "retrace_pct",
             "fired_at",
             "dry_run",
         ):
             assert required in cols, f"missing column: {required}"
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_high_peak_fade_audit_table_has_unique_constraint(self, tmp_path):
+        """Verify UNIQUE(trade_id, threshold_pct, dry_run) prevents duplicate rows."""
+        from scout.db import Database
+
+        db = Database(str(tmp_path / "test.db"))
+        await db.initialize()
+        # Insert a row
+        await db._conn.execute(
+            "INSERT INTO high_peak_fade_audit "
+            "(trade_id, token_id, signal_type, peak_pct, peak_price, "
+            " current_price, threshold_pct, retrace_pct, fired_at, dry_run) "
+            "VALUES (1, 'tok', 'gainers_early', 80.0, 1.80, 1.50, 60.0, "
+            "16.6667, '2026-05-05T00:00:00', 1)"
+        )
+        # Re-insert with same key — should INSERT OR IGNORE silently skip
+        await db._conn.execute(
+            "INSERT OR IGNORE INTO high_peak_fade_audit "
+            "(trade_id, token_id, signal_type, peak_pct, peak_price, "
+            " current_price, threshold_pct, retrace_pct, fired_at, dry_run) "
+            "VALUES (1, 'tok', 'gainers_early', 85.0, 1.85, 1.55, 60.0, "
+            "16.2162, '2026-05-05T00:30:00', 1)"
+        )
+        cur = await db._conn.execute(
+            "SELECT COUNT(*) FROM high_peak_fade_audit WHERE trade_id = 1"
+        )
+        assert (await cur.fetchone())[0] == 1, "UNIQUE constraint should prevent duplicate"
         await db.close()
 
     @pytest.mark.asyncio
@@ -551,8 +583,8 @@ class TestCascadeOrdering:
         await db.close()
 
     @pytest.mark.asyncio
-    async def test_below_75_peak_does_not_fire(self, tmp_path, settings_factory):
-        """Below MIN_PEAK_PCT, gate stays silent; existing trail handles it."""
+    async def test_below_60_peak_does_not_fire(self, tmp_path, settings_factory):
+        """Below MIN_PEAK_PCT (60), gate stays silent; existing trail handles it."""
         from scout.db import Database
         from scout.trading.evaluator import evaluate_paper_trades
         from scout.trading.paper import PaperTrader
@@ -584,10 +616,10 @@ class TestCascadeOrdering:
             slippage_bps=0,
             signal_combo="gainers_early",
         )
-        # peak 70% (BELOW threshold 75); current=$1.40 = ~18% retrace from peak $1.70
+        # peak 50% (BELOW threshold 60); current=$1.40 = ~7% retrace from peak $1.50
         now_iso = datetime.now(timezone.utc).isoformat()
         await db._conn.execute(
-            "UPDATE paper_trades SET peak_price = 1.70, peak_pct = 70.0, "
+            "UPDATE paper_trades SET peak_price = 1.50, peak_pct = 50.0, "
             "floor_armed = 1, leg_1_filled_at = ?, leg_2_filled_at = ?, "
             "remaining_qty = quantity * 0.5 "
             "WHERE id = ?",

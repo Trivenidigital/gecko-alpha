@@ -1889,15 +1889,18 @@ class Database:
 
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS high_peak_fade_audit (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    trade_id     INTEGER NOT NULL,
-                    token_id     TEXT    NOT NULL,
-                    signal_type  TEXT    NOT NULL,
-                    peak_pct     REAL    NOT NULL,
-                    peak_price   REAL    NOT NULL,
-                    current_price REAL   NOT NULL,
-                    fired_at     TEXT    NOT NULL,
-                    dry_run      INTEGER NOT NULL,
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id      INTEGER NOT NULL,
+                    token_id      TEXT    NOT NULL,
+                    signal_type   TEXT    NOT NULL,
+                    peak_pct      REAL    NOT NULL,
+                    peak_price    REAL    NOT NULL,
+                    current_price REAL    NOT NULL,
+                    threshold_pct REAL    NOT NULL,
+                    retrace_pct   REAL    NOT NULL,
+                    fired_at      TEXT    NOT NULL,
+                    dry_run       INTEGER NOT NULL,
+                    UNIQUE(trade_id, threshold_pct, dry_run),
                     FOREIGN KEY (trade_id) REFERENCES paper_trades(id)
                 )
                 """)
