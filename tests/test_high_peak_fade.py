@@ -170,7 +170,7 @@ class TestSignalParamsField:
 class TestEvaluatorGateDryRun:
     @pytest.mark.asyncio
     async def test_dry_run_does_not_close_trade(
-        self, tmp_path, settings_factory, token_factory
+        self, tmp_path, settings_factory
     ):
         """In dry-run mode, the gate logs would-fire but does NOT set close_reason."""
         from scout.db import Database
@@ -245,4 +245,73 @@ class TestEvaluatorGateDryRun:
         assert abs(audit[1] - 80.0) < 0.01
         assert abs(audit[2] - 1.50) < 0.01
 
+        await db.close()
+
+
+class TestConvictionLockDefer:
+    @pytest.mark.asyncio
+    async def test_gate_skips_when_conviction_locked(
+        self, tmp_path, settings_factory
+    ):
+        """When conviction_locked_at IS NOT NULL, gate must NOT fire even
+        in live mode (DRY_RUN=False)."""
+        from scout.db import Database
+        from scout.trading.evaluator import evaluate_paper_trades
+        from scout.trading.paper import PaperTrader
+        from scout.trading.params import clear_cache_for_tests
+
+        db = Database(str(tmp_path / "test.db"))
+        await db.initialize()
+        await db._conn.execute(
+            "UPDATE signal_params SET high_peak_fade_enabled = 1, "
+            "trail_pct = 20.0 "
+            "WHERE signal_type = 'gainers_early'"
+        )
+        await db._conn.commit()
+        clear_cache_for_tests()
+
+        trader = PaperTrader()
+        trade_id = await trader.execute_buy(
+            db=db, token_id="tok2", symbol="TOK2", name="Tok2",
+            chain="solana", signal_type="gainers_early",
+            signal_data={}, current_price=1.0, amount_usd=100.0,
+            tp_pct=200.0, sl_pct=20.0, slippage_bps=0,
+            signal_combo="gainers_early",
+        )
+        # high peak + conviction locked; both legs pre-filled so elif chain
+        # doesn't pre-empt with a leg-2 continue
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await db._conn.execute(
+            "UPDATE paper_trades SET peak_price = 1.80, peak_pct = 80.0, "
+            "floor_armed = 1, leg_1_filled_at = ?, leg_2_filled_at = ?, "
+            "remaining_qty = quantity * 0.5, "
+            "conviction_locked_at = ?, conviction_locked_stack = 3 "
+            "WHERE id = ?",
+            (now_iso, now_iso, now_iso, trade_id),
+        )
+        await db._conn.execute(
+            "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+            "VALUES (?, ?, ?)",
+            ("tok2", 1.50, datetime.now(timezone.utc).isoformat()),
+        )
+        await db._conn.commit()
+
+        settings = settings_factory(
+            PAPER_HIGH_PEAK_FADE_ENABLED=True,
+            PAPER_HIGH_PEAK_FADE_DRY_RUN=False,  # live mode
+            SIGNAL_PARAMS_ENABLED=True,
+        )
+        await evaluate_paper_trades(db, settings)
+
+        # Trade must remain open AND no audit row written.
+        cur = await db._conn.execute(
+            "SELECT status FROM paper_trades WHERE id = ?", (trade_id,)
+        )
+        assert (await cur.fetchone())[0] == "open"
+
+        cur = await db._conn.execute(
+            "SELECT COUNT(*) FROM high_peak_fade_audit WHERE trade_id = ?",
+            (trade_id,),
+        )
+        assert (await cur.fetchone())[0] == 0
         await db.close()
