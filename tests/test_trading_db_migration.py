@@ -463,3 +463,24 @@ async def test_bl062_migration_idempotent_re_run(tmp_path):
         f"cutover_ts must be preserved across re-init; first={first_ts} second={second_ts}"
     )
     await db2.close()
+
+
+async def test_bl_hpf_v1_migration_idempotent_re_run(tmp_path):
+    """BL-NEW-HPF migration must succeed on second initialize() without error.
+
+    Project pattern — see test_bl062_migration_idempotent_re_run.
+    """
+    from scout.db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    await db.initialize()
+    await db.initialize()  # second run must not raise
+    cur = await db._conn.execute(
+        "SELECT 1 FROM paper_migrations WHERE name='bl_hpf_v1'"
+    )
+    assert await cur.fetchone() is not None, "cutover row should exist"
+    cur = await db._conn.execute(
+        "SELECT version FROM schema_version WHERE description LIKE '%hpf%'"
+    )
+    assert await cur.fetchone() is not None, "schema_version stamp should exist"
+    await db.close()
