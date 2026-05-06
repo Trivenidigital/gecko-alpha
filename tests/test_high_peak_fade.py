@@ -377,3 +377,196 @@ class TestPerSignalOptIn:
         )
         assert (await cur.fetchone())[0] == 0
         await db.close()
+
+
+class TestCascadeOrdering:
+    @pytest.mark.asyncio
+    async def test_trailing_stop_pre_empts_high_peak_fade(
+        self, tmp_path, settings_factory
+    ):
+        """When current_price is below the moonshot trail threshold, the
+        trailing_stop branch fires first; gate should NOT also fire."""
+        # Setup: peak 80%, moonshot trail 30% from peak → threshold=$1.26.
+        # current=$1.17 is 35% retrace from peak — below moonshot 30% trail.
+        # That triggers trailing_stop/closed_moonshot_trail. The HPF gate at
+        # 15% retrace would also be eligible, but trailing_stop fires first
+        # and sets close_reason, so HPF's `close_reason is None` guard blocks it.
+        from scout.db import Database
+        from scout.trading.evaluator import evaluate_paper_trades
+        from scout.trading.paper import PaperTrader
+        from scout.trading.params import clear_cache_for_tests
+
+        db = Database(str(tmp_path / "test.db"))
+        await db.initialize()
+        await db._conn.execute(
+            "UPDATE signal_params SET high_peak_fade_enabled = 1, "
+            "trail_pct = 20.0 "
+            "WHERE signal_type = 'gainers_early'"
+        )
+        await db._conn.commit()
+        clear_cache_for_tests()
+
+        trader = PaperTrader()
+        trade_id = await trader.execute_buy(
+            db=db, token_id="tok4", symbol="TOK4", name="Tok4",
+            chain="solana", signal_type="gainers_early",
+            signal_data={}, current_price=1.0, amount_usd=100.0,
+            tp_pct=200.0, sl_pct=20.0, slippage_bps=0,
+            signal_combo="gainers_early",
+        )
+        # peak $1.80, current $1.17 = 35% retrace from peak (below moonshot 30% trail)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await db._conn.execute(
+            "UPDATE paper_trades SET peak_price = 1.80, peak_pct = 80.0, "
+            "floor_armed = 1, leg_1_filled_at = ?, leg_2_filled_at = ?, "
+            "remaining_qty = quantity * 0.5, moonshot_armed_at = ? "
+            "WHERE id = ?",
+            (now_iso, now_iso, now_iso, trade_id),
+        )
+        await db._conn.execute(
+            "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+            "VALUES (?, ?, ?)",
+            ("tok4", 1.17, datetime.now(timezone.utc).isoformat()),
+        )
+        await db._conn.commit()
+
+        settings = settings_factory(
+            PAPER_HIGH_PEAK_FADE_ENABLED=True,
+            PAPER_HIGH_PEAK_FADE_DRY_RUN=False,
+            PAPER_MOONSHOT_ENABLED=True,
+            SIGNAL_PARAMS_ENABLED=True,
+        )
+        await evaluate_paper_trades(db, settings)
+
+        cur = await db._conn.execute(
+            "SELECT status, exit_reason FROM paper_trades WHERE id = ?",
+            (trade_id,),
+        )
+        row = await cur.fetchone()
+        # Should close via moonshot trail, NOT high_peak_fade
+        assert row[0] in ("closed_trailing_stop", "closed_moonshot_trail")
+        assert row[1] == "trailing_stop"
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_high_peak_fade_pre_empts_bl062_peak_fade(
+        self, tmp_path, settings_factory
+    ):
+        """When BOTH high_peak_fade and BL-062 peak_fade conditions are met
+        on the same pass, high_peak_fade fires FIRST (it's ordered earlier)."""
+        from scout.db import Database
+        from scout.trading.evaluator import evaluate_paper_trades
+        from scout.trading.paper import PaperTrader
+        from scout.trading.params import clear_cache_for_tests
+
+        db = Database(str(tmp_path / "test.db"))
+        await db.initialize()
+        await db._conn.execute(
+            "UPDATE signal_params SET high_peak_fade_enabled = 1, "
+            "trail_pct = 20.0 "
+            "WHERE signal_type = 'gainers_early'"
+        )
+        await db._conn.commit()
+        clear_cache_for_tests()
+
+        trader = PaperTrader()
+        trade_id = await trader.execute_buy(
+            db=db, token_id="tok5", symbol="TOK5", name="Tok5",
+            chain="solana", signal_type="gainers_early",
+            signal_data={}, current_price=1.0, amount_usd=100.0,
+            tp_pct=200.0, sl_pct=20.0, slippage_bps=0,
+            signal_combo="gainers_early",
+        )
+        # peak 80%, current at 17% retrace = $1.49 (HPF threshold: 15% → $1.53)
+        # cp_6h_pct and cp_24h_pct both at 40%, below peak * 0.7 = 56%
+        # → BL-062 conditions also met; HPF must win because it runs first.
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await db._conn.execute(
+            "UPDATE paper_trades SET peak_price = 1.80, peak_pct = 80.0, "
+            "floor_armed = 1, leg_1_filled_at = ?, leg_2_filled_at = ?, "
+            "remaining_qty = quantity * 0.5, "
+            "checkpoint_6h_pct = 40.0, checkpoint_24h_pct = 40.0 "
+            "WHERE id = ?",
+            (now_iso, now_iso, trade_id),
+        )
+        await db._conn.execute(
+            "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+            "VALUES (?, ?, ?)",
+            ("tok5", 1.49, datetime.now(timezone.utc).isoformat()),
+        )
+        await db._conn.commit()
+
+        settings = settings_factory(
+            PAPER_HIGH_PEAK_FADE_ENABLED=True,
+            PAPER_HIGH_PEAK_FADE_DRY_RUN=False,
+            PEAK_FADE_ENABLED=True,
+            SIGNAL_PARAMS_ENABLED=True,
+        )
+        await evaluate_paper_trades(db, settings)
+
+        cur = await db._conn.execute(
+            "SELECT status, exit_reason FROM paper_trades WHERE id = ?",
+            (trade_id,),
+        )
+        row = await cur.fetchone()
+        assert row[0] == "closed_high_peak_fade"
+        assert row[1] == "high_peak_fade"
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_below_75_peak_does_not_fire(
+        self, tmp_path, settings_factory
+    ):
+        """Below MIN_PEAK_PCT, gate stays silent; existing trail handles it."""
+        from scout.db import Database
+        from scout.trading.evaluator import evaluate_paper_trades
+        from scout.trading.paper import PaperTrader
+        from scout.trading.params import clear_cache_for_tests
+
+        db = Database(str(tmp_path / "test.db"))
+        await db.initialize()
+        await db._conn.execute(
+            "UPDATE signal_params SET high_peak_fade_enabled = 1, "
+            "trail_pct = 20.0 "
+            "WHERE signal_type = 'gainers_early'"
+        )
+        await db._conn.commit()
+        clear_cache_for_tests()
+
+        trader = PaperTrader()
+        trade_id = await trader.execute_buy(
+            db=db, token_id="tok6", symbol="TOK6", name="Tok6",
+            chain="solana", signal_type="gainers_early",
+            signal_data={}, current_price=1.0, amount_usd=100.0,
+            tp_pct=200.0, sl_pct=20.0, slippage_bps=0,
+            signal_combo="gainers_early",
+        )
+        # peak 70% (BELOW threshold 75); current=$1.40 = ~18% retrace from peak $1.70
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await db._conn.execute(
+            "UPDATE paper_trades SET peak_price = 1.70, peak_pct = 70.0, "
+            "floor_armed = 1, leg_1_filled_at = ?, leg_2_filled_at = ?, "
+            "remaining_qty = quantity * 0.5 "
+            "WHERE id = ?",
+            (now_iso, now_iso, trade_id),
+        )
+        await db._conn.execute(
+            "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+            "VALUES (?, ?, ?)",
+            ("tok6", 1.40, datetime.now(timezone.utc).isoformat()),
+        )
+        await db._conn.commit()
+
+        settings = settings_factory(
+            PAPER_HIGH_PEAK_FADE_ENABLED=True,
+            PAPER_HIGH_PEAK_FADE_DRY_RUN=True,
+            SIGNAL_PARAMS_ENABLED=True,
+        )
+        await evaluate_paper_trades(db, settings)
+
+        cur = await db._conn.execute(
+            "SELECT COUNT(*) FROM high_peak_fade_audit WHERE trade_id = ?",
+            (trade_id,),
+        )
+        assert (await cur.fetchone())[0] == 0
+        await db.close()
