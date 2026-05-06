@@ -130,10 +130,7 @@ async def narrative_agent_loop(
                     )
                     # trending_catch historically net-loses (-$339 / 86 trades);
                     # disabled in prod via PAPER_SIGNAL_TRENDING_CATCH_ENABLED=False.
-                    if (
-                        trading_engine
-                        and settings.PAPER_SIGNAL_TRENDING_CATCH_ENABLED
-                    ):
+                    if trading_engine and settings.PAPER_SIGNAL_TRENDING_CATCH_ENABLED:
                         await trade_trending(
                             trading_engine,
                             db,
@@ -171,20 +168,14 @@ async def narrative_agent_loop(
 
             for accel in heating:
                 try:
-                    await safe_emit(
-                        db,
-                        token_id=accel.category_id,
-                        pipeline="narrative",
-                        event_type="category_heating",
-                        event_data={
-                            "category_id": accel.category_id,
-                            "name": accel.name,
-                            "acceleration": accel.acceleration,
-                            "volume_growth_pct": accel.volume_growth_pct,
-                            "market_regime": market_regime,
-                        },
-                        source_module="narrative.observer",
-                    )
+                    # BL-NEW-CHAIN-COHERENCE 2026-05-06: the per-laggard
+                    # category_heating emission moved INTO the
+                    # `for token in scored_laggards` loop below so anchor +
+                    # downstream events share token_id. The previous
+                    # once-per-category emission at this position used
+                    # token_id=accel.category_id, which broke chain pattern
+                    # matching for full_conviction + narrative_momentum
+                    # (anchor token_id never matched downstream coin_id).
                     if await is_cooling_down(db, accel.category_id):
                         logger.info(
                             "narrative.category_cooling_down", category=accel.name
@@ -293,6 +284,29 @@ async def narrative_agent_loop(
                         consecutive_failures = 0  # reset on success
 
                         fit_score = parse_fit_score(result, default=0)
+
+                        # BL-NEW-CHAIN-COHERENCE 2026-05-06: per-laggard
+                        # category_heating emission. Anchors the chain on
+                        # token.coin_id so subsequent laggard_picked /
+                        # narrative_scored / counter_scored events on the
+                        # same token can match (full_conviction +
+                        # narrative_momentum patterns). event_data preserves
+                        # category metadata for dashboard / pattern
+                        # conditions.
+                        await safe_emit(
+                            db,
+                            token_id=token.coin_id,
+                            pipeline="narrative",
+                            event_type="category_heating",
+                            event_data={
+                                "category_id": accel.category_id,
+                                "name": accel.name,
+                                "acceleration": accel.acceleration,
+                                "volume_growth_pct": accel.volume_growth_pct,
+                                "market_regime": market_regime,
+                            },
+                            source_module="narrative.observer",
+                        )
 
                         # Chain events: laggard was selected and narrative scored
                         await safe_emit(
