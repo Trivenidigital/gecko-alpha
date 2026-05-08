@@ -91,6 +91,7 @@ class Database:
         await self._migrate_moonshot_opt_out_column()
         await self._migrate_live_eligible_column()
         await self._migrate_per_venue_services()
+        await self._migrate_live_trades_telemetry()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -1466,7 +1467,10 @@ class Database:
                 reject_reason       TEXT CHECK (reject_reason IS NULL OR reject_reason IN (
                     'no_venue','insufficient_depth','slippage_exceeds_cap','insufficient_balance',
                     'daily_cap_hit','kill_switch','exposure_cap','override_disabled',
-                    'venue_unavailable'
+                    'venue_unavailable',
+                    'notional_cap_exceeded','signal_disabled','token_aggregate',
+                    'dual_signal_aggregate','all_candidates_failed',
+                    'master_kill','mode_paper'
                 )),
                 exit_walked_vwap    TEXT,
                 realized_pnl_usd    TEXT,
@@ -1502,7 +1506,10 @@ class Database:
                 reject_reason       TEXT CHECK (reject_reason IS NULL OR reject_reason IN (
                     'no_venue','insufficient_depth','slippage_exceeds_cap','insufficient_balance',
                     'daily_cap_hit','kill_switch','exposure_cap','override_disabled',
-                    'venue_unavailable'
+                    'venue_unavailable',
+                    'notional_cap_exceeded','signal_disabled','token_aggregate',
+                    'dual_signal_aggregate','all_candidates_failed',
+                    'master_kill','mode_paper'
                 )),
                 exit_order_id       TEXT,
                 exit_fill_price     TEXT,
@@ -2334,6 +2341,90 @@ class Database:
             except Exception as rb_err:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_per_venue_services_v1")
+            raise
+
+    async def _migrate_live_trades_telemetry(self) -> None:
+        """BL-NEW-LIVE-HYBRID M1 v2.1: telemetry plumbing for
+        approval-removal criteria (per plan-stage policy reviewer).
+        Adds:
+          - live_trades.fill_slippage_bps REAL
+          - live_trades.correction_at TEXT
+          - live_trades.correction_reason TEXT
+          - signal_venue_correction_count table (running counters)
+        Layer 4-prep: approval-removal gate reads these. M1 ships schema;
+        runtime population deferred to Task 12 (slippage compute) + Task
+        11 (correction counter wiring)."""
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
+            )
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL)"""
+            )
+
+            cur_pragma = await conn.execute("PRAGMA table_info(live_trades)")
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            for col, ddl in [
+                ("fill_slippage_bps", "REAL"),
+                ("correction_at", "TEXT"),
+                ("correction_reason", "TEXT"),
+            ]:
+                if col not in existing_cols:
+                    await conn.execute(
+                        f"ALTER TABLE live_trades ADD COLUMN {col} {ddl}"
+                    )
+
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS signal_venue_correction_count (
+                    signal_type              TEXT NOT NULL,
+                    venue                    TEXT NOT NULL,
+                    consecutive_no_correction INTEGER NOT NULL DEFAULT 0,
+                    last_corrected_at        TEXT,
+                    last_updated_at          TEXT NOT NULL,
+                    PRIMARY KEY (signal_type, venue)
+                )"""
+            )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_live_trades_telemetry_v1", now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260511, now_iso, "bl_live_trades_telemetry_v1"),
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_live_trades_telemetry_v1",),
+            )
+            if (await cur.fetchone()) is None:
+                raise RuntimeError(
+                    "bl_live_trades_telemetry_v1 cutover row missing"
+                )
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error(
+                "SCHEMA_DRIFT_DETECTED",
+                migration="bl_live_trades_telemetry_v1",
+            )
             raise
 
     async def revive_signal_with_baseline(

@@ -140,3 +140,53 @@ async def test_cross_venue_exposure_aggregates_correctly(tmp_path):
     assert "minara_coingecko" not in by_venue, "coingecko chain must be filtered"
     assert "minara_" not in by_venue, "empty chain must be filtered"
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_live_trades_has_telemetry_columns(tmp_path):
+    """Task 7.5: bl_live_trades_telemetry_v1 migration adds 3 columns."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    cur = await db._conn.execute("PRAGMA table_info(live_trades)")
+    cols = {row[1] for row in await cur.fetchall()}
+    assert "fill_slippage_bps" in cols
+    assert "correction_at" in cols
+    assert "correction_reason" in cols
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_signal_venue_correction_count_table_exists(tmp_path):
+    """Task 7.5: bl_live_trades_telemetry_v1 migration creates counter table."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='signal_venue_correction_count'"
+    )
+    assert (await cur.fetchone()) is not None
+    cur = await db._conn.execute("PRAGMA table_info(signal_venue_correction_count)")
+    cols = {row[1] for row in await cur.fetchall()}
+    expected = {
+        "signal_type",
+        "venue",
+        "consecutive_no_correction",
+        "last_corrected_at",
+        "last_updated_at",
+    }
+    assert expected <= cols
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_migration_idempotent(tmp_path):
+    """Re-running the telemetry migration is a no-op."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await db._migrate_live_trades_telemetry()  # second call
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM paper_migrations WHERE name = ?",
+        ("bl_live_trades_telemetry_v1",),
+    )
+    assert (await cur.fetchone())[0] == 1
+    await db.close()
