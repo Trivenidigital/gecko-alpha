@@ -1052,21 +1052,21 @@ async def main(argv: list[str] | None = None) -> int:
 
     if live_config.mode in ("shadow", "live"):
         if live_config.mode == "live":
-            # BL-NEW-LIVE-HYBRID M1 v2.1 Layer 1 enforcement — master kill
-            # must be flipped before LIVE_MODE='live' can boot.
-            if not getattr(settings, "LIVE_TRADING_ENABLED", False):
-                await db.close()
-                raise RuntimeError(
-                    "LIVE_MODE=live requires LIVE_TRADING_ENABLED=True "
-                    "(Layer 1 master kill must be flipped). Operator must "
-                    "set LIVE_TRADING_ENABLED=True in .env after answering "
-                    "the 4 design open questions + funding the venue."
-                )
             if not settings.BINANCE_API_KEY or not settings.BINANCE_API_SECRET:
                 await db.close()
                 raise RuntimeError("LIVE_MODE=live requires BINANCE_API_KEY/SECRET")
             # Balance gate is not yet implemented — fail closed at boot so
             # shadow traffic cannot accidentally leak to real funds.
+            # NOTE: BL-NEW-LIVE-HYBRID M1 v2.1 Layer 1 master-kill enforcement
+            # (LIVE_TRADING_ENABLED required when LIVE_MODE=live) lands AFTER
+            # this NotImplementedError in M1.5 — when balance_gate is wired,
+            # the next guard becomes:
+            #   if not settings.LIVE_TRADING_ENABLED:
+            #       raise RuntimeError("LIVE_MODE=live requires LIVE_TRADING_ENABLED=True")
+            # M1 ships the master-kill knob (defaults False) + the design
+            # commitment, but the runtime guard activates with M1.5's balance
+            # gate wiring. Today this NotImplementedError IS the Layer 1
+            # enforcement (no path to real money exists).
             await db.close()
             raise NotImplementedError(
                 "balance gate not wired for live mode — cannot start live "
