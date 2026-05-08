@@ -92,6 +92,7 @@ class Database:
         await self._migrate_live_eligible_column()
         await self._migrate_per_venue_services()
         await self._migrate_live_trades_telemetry()
+        await self._migrate_live_client_order_id()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -2445,6 +2446,87 @@ class Database:
             _log.error(
                 "SCHEMA_DRIFT_DETECTED",
                 migration="bl_live_trades_telemetry_v1",
+            )
+            raise
+
+    async def _migrate_live_client_order_id(self) -> None:
+        """BL-NEW-LIVE-HYBRID M1 v2.1 (Task 12): client_order_id idempotency.
+
+        Adds live_trades.client_order_id TEXT (UNIQUE) for the
+        gecko-side idempotency contract: every order intent computes
+        `client_order_id = f"gecko-{paper_trade_id}-{intent_uuid}"`,
+        which Binance accepts as `newClientOrderId`. Pre-retry dedup
+        query checks this column before submitting to the venue;
+        retried submits return the existing venue_order_id.
+
+        UNIQUE allows SQLite to enforce exactly-once at the DB layer
+        as a backstop. NULL allowed for old rows (pre-migration) and
+        for shadow_mode rows that never hit a venue.
+
+        Migration `bl_live_client_order_id_v1`, schema_version 20260509.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
+            )
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL)"""
+            )
+
+            cur_pragma = await conn.execute("PRAGMA table_info(live_trades)")
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            if "client_order_id" not in existing_cols:
+                await conn.execute(
+                    "ALTER TABLE live_trades ADD COLUMN client_order_id TEXT"
+                )
+                # UNIQUE INDEX (partial, ignores NULLs) gives us the
+                # dedup guarantee without ALTER-CHECK rebuild costs.
+                await conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "idx_live_trades_client_order_id "
+                    "ON live_trades(client_order_id) "
+                    "WHERE client_order_id IS NOT NULL"
+                )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_live_client_order_id_v1", now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260509, now_iso, "bl_live_client_order_id_v1"),
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_live_client_order_id_v1",),
+            )
+            if (await cur.fetchone()) is None:
+                raise RuntimeError(
+                    "bl_live_client_order_id_v1 cutover row missing"
+                )
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error(
+                "SCHEMA_DRIFT_DETECTED",
+                migration="bl_live_client_order_id_v1",
             )
             raise
 
