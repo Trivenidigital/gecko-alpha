@@ -93,6 +93,7 @@ class Database:
         await self._migrate_per_venue_services()
         await self._migrate_live_trades_telemetry()
         await self._migrate_live_client_order_id()
+        await self._migrate_reject_reason_extend()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -2513,6 +2514,179 @@ class Database:
             _log.error(
                 "SCHEMA_DRIFT_DETECTED",
                 migration="bl_live_client_order_id_v1",
+            )
+            raise
+
+    async def _migrate_reject_reason_extend(self) -> None:
+        """V3 reviewer C-1: extend reject_reason CHECK constraint on
+        existing prod tables via SQLite table-rename pattern.
+
+        CREATE TABLE IF NOT EXISTS in `_create_tables` is a no-op for
+        existing tables, so the BL-NEW-LIVE-HYBRID M1 v2.1 CHECK
+        extension (7 new reject_reasons) only applies to fresh DBs.
+        On prod (BL-055 shadow soak DB exists since 2026-04-23), the
+        old 9-value CHECK persists. First INSERT with a new reason
+        (`signal_disabled` from Gate 9 / `notional_cap_exceeded` from
+        Gate 8 / `master_kill` / `mode_paper` / etc.) raises
+        sqlite3.IntegrityError + crashes the engine path.
+
+        This migration rebuilds shadow_trades + live_trades with the
+        16-value CHECK via CREATE-NEW-COPY-DROP-RENAME. Tables are
+        append-only and small (LIVE_MODE was 'paper' until M1.5 wires
+        balance_gate), so COPY cost is bounded.
+
+        Migration `bl_reject_reason_extend_v1`, schema_version 20260512.
+        Idempotent — checks current CHECK constraint via PRAGMA table_info
+        + sqlite_master.sql before rebuilding.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
+            )
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL)"""
+            )
+
+            # Idempotency check: skip if marker already present.
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_reject_reason_extend_v1",),
+            )
+            if (await cur.fetchone()) is not None:
+                await conn.commit()
+                return
+
+            # Determine if rebuild is needed by checking sqlite_master.sql
+            # for one of the new reasons. If 'notional_cap_exceeded' is
+            # already present in the CHECK (fresh DB), skip the rebuild
+            # and just stamp the marker.
+            for table in ("shadow_trades", "live_trades"):
+                cur = await conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    continue  # table doesn't exist yet (fresh DB pre-_create_tables)
+                table_sql = row[0] or ""
+                if "notional_cap_exceeded" in table_sql:
+                    continue  # already has the new CHECK; nothing to do
+
+                # Rebuild via table-rename. The new CHECK has 16 values
+                # matching the latest CREATE TABLE in _create_tables.
+                # Preserve column order + types by extracting via PRAGMA.
+                cur = await conn.execute(f"PRAGMA table_info({table})")
+                cols = await cur.fetchall()  # (cid, name, type, notnull, default, pk)
+                if not cols:
+                    continue
+                col_names = [c[1] for c in cols]
+                col_list = ", ".join(col_names)
+
+                # Build the NEW CHECK CREATE TABLE by string-replacing the
+                # CHECK clause. The old shape is:
+                #   reject_reason TEXT CHECK (reject_reason IS NULL OR reject_reason IN (
+                #       ...9 values...
+                #   ))
+                # Build the new clause inline.
+                new_check = (
+                    "CHECK (reject_reason IS NULL OR reject_reason IN ("
+                    "'no_venue','insufficient_depth','slippage_exceeds_cap',"
+                    "'insufficient_balance','daily_cap_hit','kill_switch',"
+                    "'exposure_cap','override_disabled','venue_unavailable',"
+                    "'notional_cap_exceeded','signal_disabled','token_aggregate',"
+                    "'dual_signal_aggregate','all_candidates_failed',"
+                    "'master_kill','mode_paper'))"
+                )
+                # The new CREATE TABLE keeps everything but replaces just
+                # the reject_reason CHECK. Use the existing _create_tables
+                # statement reference: we know shadow_trades and live_trades
+                # have a `reject_reason TEXT CHECK (...)` clause. Regex the
+                # old CHECK out + sub the new one.
+                import re as _re
+
+                # Match `reject_reason       TEXT CHECK (...)` with arbitrary
+                # whitespace and multi-line CHECK list.
+                pattern = _re.compile(
+                    r"reject_reason\s+TEXT\s+CHECK\s*\([^)]*\)\s*\)",
+                    _re.IGNORECASE | _re.DOTALL,
+                )
+                new_table_sql = pattern.sub(
+                    f"reject_reason       TEXT {new_check}", table_sql
+                )
+                if new_table_sql == table_sql:
+                    _log.warning(
+                        "reject_reason_check_pattern_miss",
+                        table=table,
+                        sql_excerpt=table_sql[:200],
+                    )
+                    continue
+
+                # Rename the matched _new table name in CREATE TABLE
+                # statement to <table>_new for the rebuild.
+                new_table_sql_renamed = new_table_sql.replace(
+                    f"TABLE {table} (", f"TABLE {table}_new (", 1
+                ).replace(
+                    f"TABLE IF NOT EXISTS {table} (",
+                    f"TABLE {table}_new (",
+                    1,
+                )
+
+                await conn.execute(new_table_sql_renamed)
+                await conn.execute(
+                    f"INSERT INTO {table}_new ({col_list}) "
+                    f"SELECT {col_list} FROM {table}"
+                )
+                await conn.execute(f"DROP TABLE {table}")
+                await conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+                _log.info(
+                    "reject_reason_check_rebuilt",
+                    table=table,
+                    rows_copied=(
+                        await (
+                            await conn.execute(f"SELECT COUNT(*) FROM {table}")
+                        ).fetchone()
+                    )[0],
+                )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_reject_reason_extend_v1", now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260512, now_iso, "bl_reject_reason_extend_v1"),
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_reject_reason_extend_v1",),
+            )
+            if (await cur.fetchone()) is None:
+                raise RuntimeError(
+                    "bl_reject_reason_extend_v1 cutover row missing"
+                )
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error(
+                "SCHEMA_DRIFT_DETECTED",
+                migration="bl_reject_reason_extend_v1",
             )
             raise
 

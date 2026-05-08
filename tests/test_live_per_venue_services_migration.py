@@ -190,3 +190,65 @@ async def test_telemetry_migration_idempotent(tmp_path):
     )
     assert (await cur.fetchone())[0] == 1
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_reject_reason_extend_migration_recorded(tmp_path):
+    """V3 reviewer C-1 fix: bl_reject_reason_extend_v1 migration runs +
+    stamps marker. Fresh DBs already have the 16-value CHECK via
+    _create_tables, so the migration is a no-op-but-stamped path."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM paper_migrations WHERE name = ?",
+        ("bl_reject_reason_extend_v1",),
+    )
+    assert (await cur.fetchone())[0] == 1
+    cur = await db._conn.execute(
+        "SELECT version FROM schema_version WHERE description = ?",
+        ("bl_reject_reason_extend_v1",),
+    )
+    assert (await cur.fetchone())[0] == 20260512
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_reject_reason_check_accepts_new_values_on_fresh_db(tmp_path):
+    """V3 reviewer C-1 fix: new reject_reasons (signal_disabled,
+    notional_cap_exceeded, etc.) must be acceptable INSERTs on fresh
+    DBs after migrations run. Verifies the CHECK constraint was either
+    extended in CREATE TABLE OR rebuilt by the migration."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    # Seed paper_trade so live_trades FK is satisfied
+    cur = await db._conn.execute(
+        """INSERT INTO paper_trades
+           (token_id, symbol, name, chain, signal_type, signal_data,
+            entry_price, amount_usd, quantity, tp_price, sl_price,
+            status, opened_at)
+           VALUES ('tok', 'X', 'x', 'ethereum', 'first_signal', '{}',
+                   100, 50, 0.5, 120, 80, 'open',
+                   '2026-05-08T00:00:00+00:00')"""
+    )
+    paper_id = cur.lastrowid
+    for new_reason in (
+        "signal_disabled",
+        "notional_cap_exceeded",
+        "token_aggregate",
+        "master_kill",
+    ):
+        await db._conn.execute(
+            """INSERT INTO live_trades
+               (paper_trade_id, coin_id, symbol, venue, pair, signal_type,
+                size_usd, status, reject_reason, created_at)
+               VALUES (?, 'x', 'X', 'binance', 'XUSDT', 'first_signal',
+                       '50', 'rejected', ?, ?)""",
+            (paper_id, new_reason, "2026-05-08T00:00:00+00:00"),
+        )
+    await db._conn.commit()
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM live_trades WHERE reject_reason IN "
+        "('signal_disabled','notional_cap_exceeded','token_aggregate','master_kill')"
+    )
+    assert (await cur.fetchone())[0] == 4
+    await db.close()

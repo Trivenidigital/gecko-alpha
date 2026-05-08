@@ -551,15 +551,10 @@ async def run_cycle(
             logger.exception("gainers_tracker_error")
         if trading_engine:
             try:
-                gainers_min_mcap = (
-                    settings.PAPER_GAINERS_MIN_MCAP
-                    if settings.PAPER_GAINERS_MIN_MCAP is not None
-                    else settings.PAPER_MIN_MCAP
-                )
                 await trade_gainers(
                     trading_engine,
                     db,
-                    min_mcap=gainers_min_mcap,
+                    min_mcap=settings.PAPER_MIN_MCAP,
                     max_mcap=settings.PAPER_MAX_MCAP,
                     settings=settings,
                 )

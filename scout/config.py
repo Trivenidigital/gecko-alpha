@@ -221,12 +221,6 @@ class Settings(BaseSettings):
     PAPER_TP_SELL_PCT: float = 70.0  # sell 70% at TP, keep 30% as long_hold
     PAPER_SLIPPAGE_BPS: int = 50  # 0.5% slippage simulation
     PAPER_MIN_MCAP: float = 5_000_000  # min $5M mcap to paper trade (filters junk)
-    # Optional gainers-scoped override of PAPER_MIN_MCAP. None = inherit global.
-    # Lowering this only widens the trade_gainers entry band; losers/narrative
-    # paths keep using the global floor. See
-    # tasks/plan_paper_gainers_min_mcap_3m.md for the n=16 backtest motivating
-    # the $3M setting (38% strike rate, +$315/30d projected).
-    PAPER_GAINERS_MIN_MCAP: float | None = None
     # Upper mcap cap for paper trades. Large caps (BTC, ETH, SOL, AAVE...) rarely
     # pump fast enough to hit PAPER_TP_PCT within PAPER_MAX_DURATION_HOURS, so
     # they consume slots without producing wins. Signals/alerts still fire —
@@ -513,17 +507,6 @@ class Settings(BaseSettings):
             raise ValueError("PAPER_GAINERS_MAX_24H_PCT must be >= 0 (0 disables)")
         return v
 
-    @field_validator("PAPER_GAINERS_MIN_MCAP")
-    @classmethod
-    def _validate_gainers_min_mcap(cls, v: float | None) -> float | None:
-        if v is None:
-            return v
-        if v < 0:
-            raise ValueError(
-                "PAPER_GAINERS_MIN_MCAP must be >= 0 or None (None inherits PAPER_MIN_MCAP)"
-            )
-        return v
-
     @field_validator("PAPER_SL_PCT")
     @classmethod
     def _validate_paper_sl_pct(cls, v: float) -> float:
@@ -613,6 +596,23 @@ class Settings(BaseSettings):
         if v < 1:
             raise ValueError(f"LIVE_MAX_OPEN_POSITIONS_PER_TOKEN must be >= 1; got={v}")
         return v
+
+    @model_validator(mode="after")
+    def _validate_live_caps_relation(self) -> "Settings":
+        """V1 reviewer I4: prevent cap-relation footgun. Operator could
+        configure LIVE_TRADE_AMOUNT_USD > LIVE_MAX_EXPOSURE_USD which
+        would silently block all live trades (Gate 7's exposure cap is
+        smaller than Gate 8's per-trade cap → no single trade fits).
+        Symptom is "no trades", not data corruption — bounded blast
+        radius, but a footgun. Fail-fast at config load."""
+        if self.LIVE_MAX_EXPOSURE_USD < self.LIVE_TRADE_AMOUNT_USD:
+            raise ValueError(
+                "LIVE_MAX_EXPOSURE_USD must be >= LIVE_TRADE_AMOUNT_USD; "
+                f"got exposure={self.LIVE_MAX_EXPOSURE_USD}, "
+                f"trade={self.LIVE_TRADE_AMOUNT_USD}. A single trade cannot "
+                "exceed the aggregate cap or no trades will ever pass Gate 8."
+            )
+        return self
 
     @field_validator("PEAK_FADE_RETRACE_RATIO")
     @classmethod
