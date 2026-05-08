@@ -564,10 +564,12 @@ git commit -m "feat(live-m1): per-venue services framework tables (5 tables, 1 m
 ## Task 4: cross_venue_exposure SQL view (M1-blocker for Gate 7) + cross_venue_pnl scaffold
 
 **Files:**
-- Modify: `scout/db.py` (add view creation in `_create_tables`)
+- Modify: `scout/db.py` (add view creation INSIDE `_migrate_per_venue_services` body — see structural correction below)
 - Test: extend `tests/test_live_per_venue_services_migration.py` with the cross_venue_exposure view-existence test (no separate file — orphan removed per plan-stage structural reviewer)
 
-- [ ] **Step 1: Add view creation in `_create_tables` (one of the SQL statements list)**
+**Build-stage structural correction (2026-05-08, commit `de61129`):** Plan originally said put views in `_create_tables` (line 275). Task 3+4 implementer caught the defect: `live_trades` is defined in `_migrate_live_trading_schema` (scout/db.py:1403), NOT in `_create_tables`. Views referencing `live_trades` from `_create_tables` would fail at startup because `live_trades` doesn't exist yet at that point in `Database.initialize()`. **Correct placement (shipped at de61129):** the two `CREATE VIEW IF NOT EXISTS` statements live inside `_migrate_per_venue_services` (after the 5 CREATE TABLE statements, before the paper_migrations stamp). The migration runs after `_migrate_live_trading_schema`, so both source tables exist. Views are idempotent via `IF NOT EXISTS`. Plan-stage 2-reviewer pass missed this drift.
+
+- [ ] **Step 1: Add view creation INSIDE `_migrate_per_venue_services` body (after the 5 CREATE TABLE statements, before the paper_migrations stamp)**
 
 ```python
             """
