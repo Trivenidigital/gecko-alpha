@@ -95,6 +95,8 @@ class SignalParams:
     # True is load-bearing: without it, the Settings-fallback path in
     # _settings_params (which omits the kwarg) would TypeError.
     moonshot_enabled: bool = True
+    # BL-NEW-LIVE-HYBRID M1 — Layer 3 per-signal opt-in. Default 0 fail-closed.
+    live_eligible: bool = False
 
 
 # Module-level cache. Keyed by signal_type, value = (params, expires_at).
@@ -171,7 +173,8 @@ async def get_params(
 
     # BL-067: conviction_lock_enabled is row[10]. BL-NEW-HPF:
     # high_peak_fade_enabled is row[11]. BL-NEW-MOONSHOT-OPT-OUT:
-    # moonshot_enabled is row[12]. Per design-v2 adv-N1, signal_type is
+    # moonshot_enabled is row[12]. BL-NEW-LIVE-HYBRID M1:
+    # live_eligible is row[13]. Per design-v2 adv-N1, signal_type is
     # NOT in the SELECT — caller passes it as the function argument.
     cursor = await db._conn.execute(
         """SELECT leg_1_pct, leg_1_qty_frac, leg_2_pct, leg_2_qty_frac,
@@ -179,7 +182,8 @@ async def get_params(
                   sl_pct, max_duration_hours, enabled,
                   conviction_lock_enabled,
                   high_peak_fade_enabled,
-                  moonshot_enabled
+                  moonshot_enabled,
+                  live_eligible
            FROM signal_params WHERE signal_type = ?""",
         (signal_type,),
     )
@@ -211,6 +215,7 @@ async def get_params(
             conviction_lock_enabled=bool(row[10]),
             high_peak_fade_enabled=bool(row[11]),
             moonshot_enabled=bool(row[12]),
+            live_eligible=bool(row[13]),
         )
 
     _cache[signal_type] = (params, now + _CACHE_TTL_SEC, _cache_version)
