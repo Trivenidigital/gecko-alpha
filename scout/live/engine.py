@@ -73,6 +73,18 @@ class LiveEngine:
 
     async def on_paper_trade_opened(self, paper_trade: _PaperTradeLike) -> None:
         """Single entry point from PaperTrader chokepoint. Fire-and-forget."""
+        # Layer 1 of 4-layer kill stack (BL-NEW-LIVE-HYBRID M1 v2.1):
+        # master kill — short-circuits ALL live execution regardless of
+        # LIVE_MODE / per-signal opt-in / kill_switch state. Operator
+        # flips via .env LIVE_TRADING_ENABLED=True + restart.
+        if not getattr(self._config._s, "LIVE_TRADING_ENABLED", False):
+            log.info(
+                "live_execution_skipped_master_kill",
+                paper_trade_id=paper_trade.id,
+                signal_type=paper_trade.signal_type,
+            )
+            return
+
         assert self._config.mode != "live", (
             "LiveEngine reached in LIVE_MODE=live — startup guard in "
             "scout/main.py failed; refusing to write any row"

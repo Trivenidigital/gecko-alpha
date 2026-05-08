@@ -1031,6 +1031,29 @@ async def main(argv: list[str] | None = None) -> int:
     live_kill_switch: KillSwitch | None = None
     _live_owned: list = []  # adapters to close() on graceful shutdown
 
+    # BL-NEW-LIVE-HYBRID M1 v2.1 startup notification (Task 14):
+    # post a Telegram alert ONCE when LIVE_TRADING_ENABLED=True at
+    # process startup so the operator confirms the master kill state.
+    # Uses parse_mode=None to avoid Markdown anchor mis-parsing on the
+    # `$` chars (silent 400 per PR #76 silent-failure C1).
+    if getattr(settings, "LIVE_TRADING_ENABLED", False):
+        try:
+            async with aiohttp.ClientSession() as _startup_session:
+                await alerter.send_telegram_message(
+                    (
+                        "[live-trading] master kill OFF — "
+                        f"LIVE_TRADING_ENABLED=True; LIVE_MODE={live_config.mode}; "
+                        f"per-trade-cap=${settings.LIVE_TRADE_AMOUNT_USD}; "
+                        f"agg-cap=${settings.LIVE_MAX_EXPOSURE_USD}; "
+                        f"per-token-cap={settings.LIVE_MAX_OPEN_POSITIONS_PER_TOKEN}"
+                    ),
+                    _startup_session,
+                    settings,
+                    parse_mode=None,
+                )
+        except Exception:
+            logger.exception("live_startup_notification_failed")
+
     if live_config.mode in ("shadow", "live"):
         if live_config.mode == "live":
             if not settings.BINANCE_API_KEY or not settings.BINANCE_API_SECRET:
