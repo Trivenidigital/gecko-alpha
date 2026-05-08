@@ -1,4 +1,4 @@
-**New primitives introduced:** Five new `Settings` fields — `LIVE_TRADING_ENABLED: bool = False` (master kill, Layer 1 of 4-layer kill stack), `LIVE_MAX_TRADE_NOTIONAL_USD: float = 100.0` (per-trade cap), `LIVE_MAX_OPEN_EXPOSURE_USD: float = 1000.0` (aggregate cross-venue cap), `LIVE_MAX_OPEN_POSITIONS_PER_TOKEN: int = 1` (per-token concurrency cap — M1-blocker live-position-aggregator guard), `LIVE_OVERRIDE_REPLACE_ONLY: bool = False` (PREPEND-vs-REPLACE semantics for OverrideStore). New `signal_params.live_eligible INTEGER NOT NULL DEFAULT 0` column (migration `bl_live_eligible_v1`, schema_version 20260508 — Layer 3 per-signal opt-in). Five new tables (one combined migration `bl_per_venue_services_v1`, schema_version 20260510): `venue_health` (with `last_quote_mid_price` + `last_depth_at_size_bps` pre-fetched routing inputs + `fills_30d_count` + `is_dormant`), `wallet_snapshots`, `venue_listings`, `venue_rate_state`, `symbol_aliases`. New SQL view `cross_venue_exposure` (M1-blocker — Gate 7 queries this not `shadow_trades`). New SQL view `cross_venue_pnl` scaffold (returns 0s at M1; M2 adds aggregations). `ExchangeAdapter` ABC reshape (M1-included, structural-reviewer MUST-FIX) — split `send_order` → `place_order_request` + `await_fill_confirmation`; generalize `fetch_exchange_info_row` → `fetch_venue_metadata(canonical) → VenueMetadata | None`; `resolve_pair_for_symbol` becomes delegate-able. New scaffold class `CCXTAdapter` (parameterized by venue name; not wired to any venue at M1; M1.5 wires first venue). New module `scout/live/balance_gate.py` (was missing per BL-055 prereq). New idempotency contract on `scout/live/binance_adapter.py`: `client_order_id = f"gecko-{paper_trade_id}-{intent_uuid}"` + pre-retry dedup query (migration `bl_live_client_order_id_v1`, schema_version 20260509). New module `scout/live/routing.py` — routing layer producing ranked candidate list with <200ms p95 budget, live-position-aggregator guard (M1-blocker), on-demand venue_listings fetch (M1-blocker), chain="coingecko" enrichment, OverrideStore PREPEND semantics, delisting fallback. New `scout/live/services/` package — `VenueService` ABC (typed `adapter: ExchangeAdapter` + concurrency contract), service-runner harness, three concrete services (`HealthProbe`, `BalanceSnapshot`, `KillSwitchEnforcer`), one stub (`RateLimitAccountantStub` returns CONSERVATIVE 50% headroom). New `live_orders_skipped_*` metric family (`master_kill`, `mode_paper`, `signal_disabled`, `kill_switch`, `exposure_cap`, `notional_cap`, `token_aggregate`, `no_venue`, `all_candidates_failed`, `dual_signal_aggregate`, `approval_new_venue_gate`, `approval_trade_size_gate`, `approval_venue_health_gate`, `approval_operator_flag`). New telemetry columns on `live_trades` per plan-stage policy reviewer: `fill_slippage_bps REAL` (computed at fill confirmation as `(fill_price/mid_at_entry - 1) * 10000`), `correction_at TEXT`, `correction_reason TEXT`. New `signal_venue_correction_count` table (running counter for approval-removal gate 1, migration `bl_live_trades_telemetry_v1`, schema_version 20260511). New module `scout/live/approval_thresholds.py` with `should_require_approval(db, settings, signal_type, venue, size_usd) → tuple[bool, gate_name | None]` implementing the 4 pre-registered operator-in-loop gates (new-venue <30 fills, trade-size >2× rolling-30 median, venue-health degraded-24h, /approval-required flag). New Telegram startup notification when `LIVE_TRADING_ENABLED=True` (`scout/main.py` startup hook). New Telegram approval gateway with `/allow-stack <token>`, `/auto-approve venue=<name>`, `/approval-required venue=<name>`, `/venue-revive name=<name>` commands. Operator-in-loop scaling rules pre-registered in design doc (no runtime knob). canonical-extraction rule for `symbol_aliases` explicit (CCXT `markets[symbol]` split-on-`/` taking `[0]`; perp suffix `:USDT` stripped). Dormancy daily job sets `venue_health.is_dormant=1` for venues with `fills_30d_count=0`.
+**New primitives introduced:** Three new `Settings` fields — `LIVE_TRADING_ENABLED: bool = False` (master kill, Layer 1 of 4-layer kill stack), `LIVE_MAX_OPEN_POSITIONS_PER_TOKEN: int = 1` (per-token concurrency cap — M1-blocker live-position-aggregator guard; distinct from existing `LIVE_MAX_OPEN_POSITIONS: int = 5` which is total-across-venues cap), `LIVE_OVERRIDE_REPLACE_ONLY: bool = False` (PREPEND-vs-REPLACE semantics for OverrideStore). **Drift-check 2026-05-08 / Option A reconciliation:** the original v2.1 plan claimed 5 new fields including `LIVE_MAX_TRADE_NOTIONAL_USD` and `LIVE_MAX_OPEN_EXPOSURE_USD`; build-stage drift-check found existing equivalents in `scout/config.py:335,350` (`LIVE_TRADE_AMOUNT_USD: Decimal = Decimal("100")` per-trade cap; `LIVE_MAX_EXPOSURE_USD: Decimal = Decimal("500")` aggregate cap) shipped under BL-055. Plan now reuses those existing fields by name (Option A); 6 existing call sites — `scout/live/gates.py:216-217`, `scout/main.py:988-989`, `tests/integration/test_live_shadow_loop.py:67-68`, `tests/live/test_config.py:80-81`, `tests/live/test_live_engine.py:67-68,324-325`, `tests/live/test_pretrade_gates.py:66-67,329,351-352` — remain untouched. New `signal_params.live_eligible INTEGER NOT NULL DEFAULT 0` column (migration `bl_live_eligible_v1`, schema_version 20260508 — Layer 3 per-signal opt-in). Five new tables (one combined migration `bl_per_venue_services_v1`, schema_version 20260510): `venue_health` (with `last_quote_mid_price` + `last_depth_at_size_bps` pre-fetched routing inputs + `fills_30d_count` + `is_dormant`), `wallet_snapshots`, `venue_listings`, `venue_rate_state`, `symbol_aliases`. New SQL view `cross_venue_exposure` (M1-blocker — Gate 7 queries this not `shadow_trades`). New SQL view `cross_venue_pnl` scaffold (returns 0s at M1; M2 adds aggregations). `ExchangeAdapter` ABC reshape (M1-included, structural-reviewer MUST-FIX) — split `send_order` → `place_order_request` + `await_fill_confirmation`; generalize `fetch_exchange_info_row` → `fetch_venue_metadata(canonical) → VenueMetadata | None`; `resolve_pair_for_symbol` becomes delegate-able. New scaffold class `CCXTAdapter` (parameterized by venue name; not wired to any venue at M1; M1.5 wires first venue). New module `scout/live/balance_gate.py` (was missing per BL-055 prereq). New idempotency contract on `scout/live/binance_adapter.py`: `client_order_id = f"gecko-{paper_trade_id}-{intent_uuid}"` + pre-retry dedup query (migration `bl_live_client_order_id_v1`, schema_version 20260509). New module `scout/live/routing.py` — routing layer producing ranked candidate list with <200ms p95 budget, live-position-aggregator guard (M1-blocker), on-demand venue_listings fetch (M1-blocker), chain="coingecko" enrichment, OverrideStore PREPEND semantics, delisting fallback. New `scout/live/services/` package — `VenueService` ABC (typed `adapter: ExchangeAdapter` + concurrency contract), service-runner harness, three concrete services (`HealthProbe`, `BalanceSnapshot`, `KillSwitchEnforcer`), one stub (`RateLimitAccountantStub` returns CONSERVATIVE 50% headroom). New `live_orders_skipped_*` metric family (`master_kill`, `mode_paper`, `signal_disabled`, `kill_switch`, `exposure_cap`, `notional_cap`, `token_aggregate`, `no_venue`, `all_candidates_failed`, `dual_signal_aggregate`, `approval_new_venue_gate`, `approval_trade_size_gate`, `approval_venue_health_gate`, `approval_operator_flag`). New telemetry columns on `live_trades` per plan-stage policy reviewer: `fill_slippage_bps REAL` (computed at fill confirmation as `(fill_price/mid_at_entry - 1) * 10000`), `correction_at TEXT`, `correction_reason TEXT`. New `signal_venue_correction_count` table (running counter for approval-removal gate 1, migration `bl_live_trades_telemetry_v1`, schema_version 20260511). New module `scout/live/approval_thresholds.py` with `should_require_approval(db, settings, signal_type, venue, size_usd) → tuple[bool, gate_name | None]` implementing the 4 pre-registered operator-in-loop gates (new-venue <30 fills, trade-size >2× rolling-30 median, venue-health degraded-24h, /approval-required flag). New Telegram startup notification when `LIVE_TRADING_ENABLED=True` (`scout/main.py` startup hook). New Telegram approval gateway with `/allow-stack <token>`, `/auto-approve venue=<name>`, `/approval-required venue=<name>`, `/venue-revive name=<name>` commands. Operator-in-loop scaling rules pre-registered in design doc (no runtime knob). canonical-extraction rule for `symbol_aliases` explicit (CCXT `markets[symbol]` split-on-`/` taking `[0]`; perp suffix `:USDT` stripped). Dormancy daily job sets `venue_health.is_dormant=1` for venues with `fills_30d_count=0`.
 
 # Live Trading Milestone 1 — Multi-Venue Architecture, Binance Wired
 
@@ -18,7 +18,7 @@
 
 | File | Action | Responsibility |
 |---|---|---|
-| `scout/config.py` | Modify | Add 5 Settings fields + 5 field_validators |
+| `scout/config.py` | Modify | Add 3 Settings fields + 1 field_validator (Option A: reuses existing `LIVE_TRADE_AMOUNT_USD` + `LIVE_MAX_EXPOSURE_USD`) |
 | `scout/db.py` | Modify | Add 3 migrations (bl_live_eligible_v1, bl_live_client_order_id_v1, bl_per_venue_services_v1) + 2 SQL views in `_create_tables` |
 | `scout/trading/params.py` | Modify | Add `live_eligible: bool = False` to SignalParams + extend SELECT to row[13] |
 | `scout/live/adapter_base.py` | Modify (M1-include reshape) | Split `send_order` → `place_order_request` + `await_fill_confirmation`; generalize to `fetch_venue_metadata`; `resolve_pair_for_symbol` delegate-able. Add `VenueMetadata` dataclass. |
@@ -84,18 +84,20 @@ If errors, that's a Task 5 prereq — flag and continue.
 
 ---
 
-## Task 1: Settings — 5 new fields + validators
+## Task 1: Settings — 3 new fields + validator (Option A reconciliation)
 
 **Files:**
-- Modify: `scout/config.py` (after `LIVE_MODE` line ~332)
+- Modify: `scout/config.py` (after existing `LIVE_SIGNAL_ALLOWLIST` ~line 354)
 - Test: `tests/test_live_master_kill.py` (NEW)
+
+**Drift-check note:** Build-stage check on 2026-05-08 found `scout/config.py:332-354` already contains BL-055-shipped `LIVE_*` config block (LIVE_MODE, LIVE_TRADE_AMOUNT_USD, LIVE_MAX_EXPOSURE_USD, LIVE_MAX_OPEN_POSITIONS, LIVE_DAILY_LOSS_CAP_USD, etc.). Original v2.1 plan's `LIVE_MAX_TRADE_NOTIONAL_USD` and `LIVE_MAX_OPEN_EXPOSURE_USD` were rename-conflicts with existing `LIVE_TRADE_AMOUNT_USD` (line 335) and `LIVE_MAX_EXPOSURE_USD` (line 350). Per Option A reconciliation: reuse existing names, add only 3 truly new fields. 6 existing call sites untouched. Cap-relation validator omitted (existing code has 5+ months of production use without it; adding is separate hardening proposal).
 
 - [ ] **Step 1: Failing test for defaults**
 
 Create `tests/test_live_master_kill.py`:
 
 ```python
-"""BL-NEW-LIVE-HYBRID M1: master kill + capital caps + aggregator + override."""
+"""BL-NEW-LIVE-HYBRID M1: master kill + per-token aggregator + override."""
 from __future__ import annotations
 
 import pytest
@@ -107,12 +109,6 @@ class TestLiveTradingSettings:
     def test_master_kill_defaults_off(self):
         assert Settings(_env_file=None).LIVE_TRADING_ENABLED is False
 
-    def test_max_trade_notional_default(self):
-        assert Settings(_env_file=None).LIVE_MAX_TRADE_NOTIONAL_USD == 100.0
-
-    def test_max_open_exposure_default(self):
-        assert Settings(_env_file=None).LIVE_MAX_OPEN_EXPOSURE_USD == 1000.0
-
     def test_max_open_positions_per_token_default(self):
         assert Settings(_env_file=None).LIVE_MAX_OPEN_POSITIONS_PER_TOKEN == 1
 
@@ -121,28 +117,12 @@ class TestLiveTradingSettings:
 
 
 class TestLiveTradingValidators:
-    def test_max_trade_notional_must_be_positive(self):
-        with pytest.raises(ValueError, match="must be > 0"):
-            Settings(_env_file=None, LIVE_MAX_TRADE_NOTIONAL_USD=0.0)
-
-    def test_max_open_exposure_must_be_positive(self):
-        with pytest.raises(ValueError, match="must be > 0"):
-            Settings(_env_file=None, LIVE_MAX_OPEN_EXPOSURE_USD=0.0)
-
-    def test_max_open_exposure_must_exceed_single_trade(self):
-        with pytest.raises(ValueError, match=">= LIVE_MAX_TRADE_NOTIONAL_USD"):
-            Settings(
-                _env_file=None,
-                LIVE_MAX_TRADE_NOTIONAL_USD=500.0,
-                LIVE_MAX_OPEN_EXPOSURE_USD=400.0,
-            )
-
     def test_max_open_positions_per_token_must_be_at_least_1(self):
         with pytest.raises(ValueError, match="must be >= 1"):
             Settings(_env_file=None, LIVE_MAX_OPEN_POSITIONS_PER_TOKEN=0)
 ```
 
-- [ ] **Step 2: Run — expect 9 FAILs**
+- [ ] **Step 2: Run — expect 4 FAILs**
 
 ```bash
 uv run pytest tests/test_live_master_kill.py::TestLiveTradingSettings tests/test_live_master_kill.py::TestLiveTradingValidators -v
@@ -150,25 +130,20 @@ uv run pytest tests/test_live_master_kill.py::TestLiveTradingSettings tests/test
 
 - [ ] **Step 3: Add Settings fields**
 
-In `scout/config.py` after `LIVE_MODE` (~line 332), add:
+In `scout/config.py` after `LIVE_SIGNAL_ALLOWLIST` (~line 354) — i.e. AFTER the existing BL-055 LIVE_* block, NOT replacing it — add:
 
 ```python
     # -------- BL-NEW-LIVE-HYBRID M1 (design v2.1, 2026-05-08) --------
     # Layer 1 of 4-layer kill stack. Master kill — when False, all live
     # execution short-circuits at engine entry regardless of LIVE_MODE /
     # per-signal opt-in / kill_switch state. Operator via .env edit + restart.
+    # Distinct from LIVE_MODE (paper/shadow/live tri-state, Layer 2).
     LIVE_TRADING_ENABLED: bool = False
-
-    # Hard per-trade notional cap.
-    LIVE_MAX_TRADE_NOTIONAL_USD: float = 100.0
-
-    # Hard ceiling on SUM of open live-position notionals across ALL venues.
-    # Queried via cross_venue_exposure SQL view at Gate 7.
-    LIVE_MAX_OPEN_EXPOSURE_USD: float = 1000.0
 
     # Per-token concurrency cap. Routing layer's live-position-aggregator
     # guard rejects intents when live_trades.count(canonical_symbol, status='open')
     # >= this value. Default 1 covers BILL dual-signal pattern.
+    # Distinct from existing LIVE_MAX_OPEN_POSITIONS (total-across-venues cap, default 5).
     LIVE_MAX_OPEN_POSITIONS_PER_TOKEN: int = 1
 
     # OverrideStore semantics: False = PREPEND chain's venues to candidate list
@@ -177,25 +152,11 @@ In `scout/config.py` after `LIVE_MODE` (~line 332), add:
     LIVE_OVERRIDE_REPLACE_ONLY: bool = False
 ```
 
-- [ ] **Step 4: Add validators**
+- [ ] **Step 4: Add validator**
 
 In `scout/config.py` after the `_validate_revival_min_soak_days` validator (search for it):
 
 ```python
-    @field_validator("LIVE_MAX_TRADE_NOTIONAL_USD")
-    @classmethod
-    def _validate_live_max_trade_notional_usd(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError(f"LIVE_MAX_TRADE_NOTIONAL_USD must be > 0; got={v}")
-        return v
-
-    @field_validator("LIVE_MAX_OPEN_EXPOSURE_USD")
-    @classmethod
-    def _validate_live_max_open_exposure_usd(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError(f"LIVE_MAX_OPEN_EXPOSURE_USD must be > 0; got={v}")
-        return v
-
     @field_validator("LIVE_MAX_OPEN_POSITIONS_PER_TOKEN")
     @classmethod
     def _validate_live_max_open_positions_per_token(cls, v: int) -> int:
@@ -204,25 +165,15 @@ In `scout/config.py` after the `_validate_revival_min_soak_days` validator (sear
                 f"LIVE_MAX_OPEN_POSITIONS_PER_TOKEN must be >= 1; got={v}"
             )
         return v
-
-    @model_validator(mode="after")
-    def _validate_live_caps_relation(self) -> "Settings":
-        if self.LIVE_MAX_OPEN_EXPOSURE_USD < self.LIVE_MAX_TRADE_NOTIONAL_USD:
-            raise ValueError(
-                "LIVE_MAX_OPEN_EXPOSURE_USD must be >= LIVE_MAX_TRADE_NOTIONAL_USD; "
-                f"got open={self.LIVE_MAX_OPEN_EXPOSURE_USD}, "
-                f"trade={self.LIVE_MAX_TRADE_NOTIONAL_USD}"
-            )
-        return self
 ```
 
-- [ ] **Step 5: Run — expect 9 PASS**
+- [ ] **Step 5: Run — expect 4 PASS**
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add scout/config.py tests/test_live_master_kill.py
-git commit -m "feat(live-m1): 5 Settings fields + validators (BL-NEW-LIVE-HYBRID v2.1)"
+git commit -m "feat(live-m1): 3 Settings fields + validator (BL-NEW-LIVE-HYBRID v2.1, Option A reconciliation)"
 ```
 
 ---
@@ -1030,12 +981,14 @@ In `scout/live/gates.py` around line 207-231 (current Gate 7 query), replace:
             "SELECT COALESCE(SUM(open_exposure_usd), 0) FROM cross_venue_exposure"
         )
         open_total = float((await cur.fetchone())[0])
-        if open_total + amount_usd > settings.LIVE_MAX_OPEN_EXPOSURE_USD:
+        # Reuses existing Settings field (BL-055-shipped) per Option A drift-check.
+        cap = float(settings.LIVE_MAX_EXPOSURE_USD)
+        if open_total + amount_usd > cap:
             await inc(db, "live_orders_skipped_exposure_cap")
             return GateResult(
                 approved=False, reject_reason="exposure_cap",
                 detail=(f"open=${open_total:.2f} + new=${amount_usd:.2f} > "
-                        f"cap=${settings.LIVE_MAX_OPEN_EXPOSURE_USD:.2f}"),
+                        f"cap=${cap:.2f}"),
             )
 ```
 
@@ -1045,12 +998,14 @@ After Gate 7, add:
 
 ```python
         # Gate 8: per-trade notional cap.
-        if amount_usd > settings.LIVE_MAX_TRADE_NOTIONAL_USD:
+        # Reuses existing Settings field LIVE_TRADE_AMOUNT_USD (BL-055-shipped) per Option A drift-check.
+        notional_cap = float(settings.LIVE_TRADE_AMOUNT_USD)
+        if amount_usd > notional_cap:
             await inc(db, "live_orders_skipped_notional_cap")
             return GateResult(
                 approved=False, reject_reason="notional_cap_exceeded",
                 detail=(f"amount_usd=${amount_usd:.2f} > "
-                        f"cap=${settings.LIVE_MAX_TRADE_NOTIONAL_USD:.2f}"),
+                        f"cap=${notional_cap:.2f}"),
             )
 
         # Gate 9: per-signal opt-in (Layer 3 of 4-layer kill stack).
