@@ -90,6 +90,7 @@ class Database:
         await self._migrate_autosuspend_baseline_column()
         await self._migrate_moonshot_opt_out_column()
         await self._migrate_live_eligible_column()
+        await self._migrate_per_venue_services()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -2174,6 +2175,163 @@ class Database:
             except Exception as rb_err:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_live_eligible_v1")
+            raise
+
+    async def _migrate_per_venue_services(self) -> None:
+        """BL-NEW-LIVE-HYBRID M1: 5 per-venue services tables + 2 cross-venue views.
+
+        Tables: venue_health, wallet_snapshots, venue_listings,
+        venue_rate_state, symbol_aliases. All idempotent via
+        ``CREATE TABLE IF NOT EXISTS``.
+
+        Views: ``cross_venue_exposure`` (M1 — Gate 7 blocker, sums open
+        exposure across binance + minara_<chain>) and ``cross_venue_pnl``
+        (M1 scaffold; M2 fills in). Views are created here (not in
+        ``_create_tables``) because they reference ``live_trades`` which
+        is defined in :meth:`_migrate_live_trading_schema` — that migration
+        runs before this one in :meth:`initialize`, so both source tables
+        are guaranteed to exist by the time the view DDL runs.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL
+                )""")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )""")
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS venue_health (
+                    venue                   TEXT NOT NULL,
+                    probe_at                TEXT NOT NULL,
+                    rest_responsive         INTEGER NOT NULL,
+                    rest_latency_ms         INTEGER,
+                    ws_connected            INTEGER NOT NULL,
+                    rate_limit_headroom_pct REAL,
+                    auth_ok                 INTEGER NOT NULL,
+                    last_balance_fetch_ok   INTEGER NOT NULL,
+                    last_quote_mid_price    REAL,
+                    last_quote_at           TEXT,
+                    last_depth_at_size_bps  REAL,
+                    fills_30d_count         INTEGER NOT NULL DEFAULT 0,
+                    is_dormant              INTEGER NOT NULL DEFAULT 0,
+                    error_text              TEXT,
+                    PRIMARY KEY (venue, probe_at)
+                )""")
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_venue_health_recent "
+                "ON venue_health(venue, probe_at DESC)"
+            )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_snapshots (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    venue         TEXT NOT NULL,
+                    asset         TEXT NOT NULL,
+                    balance       REAL NOT NULL,
+                    balance_usd   REAL,
+                    snapshot_at   TEXT NOT NULL
+                )""")
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_wallet_snapshots_venue_recent "
+                "ON wallet_snapshots(venue, snapshot_at DESC)"
+            )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS venue_listings (
+                    venue         TEXT NOT NULL,
+                    canonical     TEXT NOT NULL,
+                    venue_pair    TEXT NOT NULL,
+                    quote         TEXT NOT NULL,
+                    asset_class   TEXT NOT NULL CHECK (
+                        asset_class IN ('spot','perp','option','equity','forex')),
+                    listed_at     TEXT,
+                    delisted_at   TEXT,
+                    refreshed_at  TEXT NOT NULL,
+                    PRIMARY KEY (venue, canonical, asset_class)
+                )""")
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS venue_rate_state (
+                    venue                TEXT PRIMARY KEY,
+                    last_updated_at      TEXT NOT NULL,
+                    requests_per_min_cap INTEGER NOT NULL,
+                    requests_seen_60s    INTEGER NOT NULL DEFAULT 0,
+                    headroom_pct         REAL NOT NULL DEFAULT 100.0
+                )""")
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS symbol_aliases (
+                    canonical    TEXT NOT NULL,
+                    venue        TEXT NOT NULL,
+                    venue_symbol TEXT NOT NULL,
+                    PRIMARY KEY (canonical, venue)
+                )""")
+
+            # Task 4: cross-venue views. Defined here (not in
+            # _create_tables) because they reference live_trades, which is
+            # created by _migrate_live_trading_schema (runs earlier in
+            # initialize()). M1 ships cross_venue_pnl as a placeholder
+            # scaffold; M2 fills in the realized/unrealized math.
+            await conn.execute("""
+                CREATE VIEW IF NOT EXISTS cross_venue_exposure AS
+                SELECT
+                    'binance' AS venue,
+                    COALESCE(SUM(CAST(size_usd AS REAL)), 0) AS open_exposure_usd,
+                    COUNT(*) AS open_count
+                FROM live_trades
+                WHERE status = 'open'
+                UNION ALL
+                SELECT
+                    'minara_' || COALESCE(chain, 'unknown') AS venue,
+                    COALESCE(SUM(amount_usd), 0) AS open_exposure_usd,
+                    COUNT(*) AS open_count
+                FROM paper_trades
+                WHERE status = 'open' AND chain != 'coingecko'
+                GROUP BY chain""")
+
+            await conn.execute("""
+                CREATE VIEW IF NOT EXISTS cross_venue_pnl AS
+                SELECT
+                    'placeholder_m1' AS venue,
+                    0.0 AS realized_pnl_usd,
+                    0.0 AS unrealized_pnl_usd""")
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_per_venue_services_v1", now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260510, now_iso, "bl_per_venue_services_v1"),
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_per_venue_services_v1",),
+            )
+            if (await cur.fetchone()) is None:
+                raise RuntimeError("bl_per_venue_services_v1 cutover row missing")
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_per_venue_services_v1")
             raise
 
     async def revive_signal_with_baseline(
