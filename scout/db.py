@@ -2397,6 +2397,27 @@ class Database:
                 )"""
             )
 
+            # Task 13/13.5: ephemeral operator-set overrides
+            # (/allow-stack, /auto-approve, /approval-required, /venue-revive).
+            # Read by approval_thresholds.should_require_approval (gate 4).
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS live_operator_overrides (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    override_type TEXT NOT NULL CHECK (override_type IN (
+                        'allow_stack','auto_approve','approval_required','venue_revive'
+                    )),
+                    venue         TEXT,
+                    canonical     TEXT,
+                    set_at        TEXT NOT NULL,
+                    expires_at    TEXT NOT NULL,
+                    set_by        TEXT
+                )"""
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_operator_overrides_active "
+                "ON live_operator_overrides(override_type, venue, expires_at)"
+            )
+
             await conn.execute(
                 "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
                 "VALUES (?, ?)",
