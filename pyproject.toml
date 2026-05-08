@@ -19,6 +19,7 @@ dependencies = [
     "telethon>=1.36,<1.40",
     # BL-064: channels.yml source-of-truth parser.
     "pyyaml>=6.0,<7",
+    "ccxt==4.5.52",
 ]
 
 [project.optional-dependencies]
