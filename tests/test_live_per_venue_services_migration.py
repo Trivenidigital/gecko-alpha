@@ -103,3 +103,40 @@ async def test_cross_venue_pnl_view_exists(tmp_path):
     )
     assert (await cur.fetchone()) is not None
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_cross_venue_exposure_aggregates_correctly(tmp_path):
+    """View must sum + filter correctly: 2 ethereum opens (+7500),
+    1 closed sol excluded, 1 coingecko filtered, 1 empty-chain filtered."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    rows = [
+        ("t_eth_5000", "ETHTOKA", "ethtoka", "ethereum", 5000.0, "open"),
+        ("t_eth_2500", "ETHTOKB", "ethtokb", "ethereum", 2500.0, "open"),
+        ("t_sol_99999", "SOLTOK", "soltok", "solana", 99999.0, "closed_tp"),
+        ("t_cg_1000", "CGTOK", "cgtok", "coingecko", 1000.0, "open"),
+        ("t_empty_500", "ETOK", "etok", "", 500.0, "open"),
+    ]
+    for token_id, symbol, name, chain, amt, status in rows:
+        await db._conn.execute(
+            """INSERT INTO paper_trades
+               (token_id, symbol, name, chain, signal_type, signal_data,
+                entry_price, amount_usd, quantity, tp_price, sl_price,
+                status, opened_at)
+               VALUES (?, ?, ?, ?, 'first_signal', '{}',
+                       100, ?, 10, 120, 80, ?, '2026-05-08T00:00:00+00:00')""",
+            (token_id, symbol, name, chain, amt, status),
+        )
+    await db._conn.commit()
+    cur = await db._conn.execute(
+        "SELECT venue, open_exposure_usd, open_count "
+        "FROM cross_venue_exposure ORDER BY venue"
+    )
+    by_venue = {r[0]: (r[1], r[2]) for r in await cur.fetchall()}
+    assert by_venue["binance"] == (0, 0), "no live_trades opens"
+    assert by_venue["minara_ethereum"] == (7500.0, 2), "2 ethereum opens summed"
+    assert "minara_solana" not in by_venue, "closed sol must be excluded"
+    assert "minara_coingecko" not in by_venue, "coingecko chain must be filtered"
+    assert "minara_" not in by_venue, "empty chain must be filtered"
+    await db.close()

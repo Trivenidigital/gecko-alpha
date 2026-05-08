@@ -2299,7 +2299,9 @@ class Database:
                     COALESCE(SUM(amount_usd), 0) AS open_exposure_usd,
                     COUNT(*) AS open_count
                 FROM paper_trades
-                WHERE status = 'open' AND chain != 'coingecko'
+                WHERE status = 'open'
+                  AND chain != 'coingecko'
+                  AND chain != ''
                 GROUP BY chain""")
 
             await conn.execute("""
