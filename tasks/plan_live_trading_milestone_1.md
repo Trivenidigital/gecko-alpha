@@ -681,9 +681,9 @@ def test_old_send_order_method_removed():
 
 - [ ] **Step 2: Run — expect 5 FAILs**
 
-- [ ] **Step 3: Reshape ABC**
+- [ ] **Step 3: Reshape ABC (ADDITIVE — keep existing methods)**
 
-Replace `scout/live/adapter_base.py` body. Keep existing module-level imports + `venue_name` class var. New shape:
+**Build-stage drift-check 2026-05-08:** The plan originally said "Replace `scout/live/adapter_base.py` body". Drift-check during Task 5 dispatch found 6 modules in active use of existing ABC methods: `scout/live/loops.py:133` (`fetch_exchange_info_row`), `scout/live/reconciliation.py:136,212` (`fetch_price`), `scout/live/shadow_evaluator.py:145,180` (`fetch_price`+`fetch_depth`), `scout/live/resolver.py:129` (`resolve_pair_for_symbol`), `scout/live/engine.py:155` (`fetch_depth`), `scout/live/gates.py:151-159` (`fetch_depth`). Pure replacement would break the BL-055 shadow loop. **Correct approach (folded 2026-05-08): keep existing methods, add new methods alongside.** New shape adds: `VenueMetadata`/`OrderRequest`/`OrderConfirmation` dataclasses, `fetch_venue_metadata(canonical)`, `place_order_request(request)`, `await_fill_confirmation(...)`, `fetch_account_balance(asset)`. KEEPS existing: `fetch_exchange_info_row(pair)`, `fetch_price(pair)`, `fetch_depth(pair, limit)`, `resolve_pair_for_symbol(symbol)`, `send_order(*, pair, side, size_usd)` (latter still raises NotImplementedError on BinanceSpotAdapter; M2 may remove). The reshape is additive — Step 3 below shows the FULL new ABC body including the back-compat methods.
 
 ```python
 """ExchangeAdapter ABC — supports Tier 1 (CLI), Tier 2 (aggregator),
