@@ -1052,6 +1052,16 @@ async def main(argv: list[str] | None = None) -> int:
 
     if live_config.mode in ("shadow", "live"):
         if live_config.mode == "live":
+            # BL-NEW-LIVE-HYBRID M1 v2.1 Layer 1 enforcement — master kill
+            # must be flipped before LIVE_MODE='live' can boot.
+            if not getattr(settings, "LIVE_TRADING_ENABLED", False):
+                await db.close()
+                raise RuntimeError(
+                    "LIVE_MODE=live requires LIVE_TRADING_ENABLED=True "
+                    "(Layer 1 master kill must be flipped). Operator must "
+                    "set LIVE_TRADING_ENABLED=True in .env after answering "
+                    "the 4 design open questions + funding the venue."
+                )
             if not settings.BINANCE_API_KEY or not settings.BINANCE_API_SECRET:
                 await db.close()
                 raise RuntimeError("LIVE_MODE=live requires BINANCE_API_KEY/SECRET")

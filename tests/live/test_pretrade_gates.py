@@ -140,7 +140,10 @@ async def _seed_open_shadow(
 
 def test_param_lists_cover_check_constraint():
     """gates.VALID_REJECT_REASONS must match the shadow/live_trades
-    reject_reason CHECK constraint exactly. Spec §3.1."""
+    reject_reason CHECK constraint exactly. Spec §3.1, extended in
+    BL-NEW-LIVE-HYBRID M1 v2.1 with 7 new reject_reasons (Tasks 7+7.5).
+    The DB CHECK constraint extension on prod is migrated via
+    bl_reject_reason_extend_v1 (schema_version 20260512)."""
     expected = {
         "no_venue",
         "insufficient_depth",
@@ -151,6 +154,14 @@ def test_param_lists_cover_check_constraint():
         "exposure_cap",
         "override_disabled",
         "venue_unavailable",
+        # BL-NEW-LIVE-HYBRID M1 v2.1 additions:
+        "notional_cap_exceeded",
+        "signal_disabled",
+        "token_aggregate",
+        "dual_signal_aggregate",
+        "all_candidates_failed",
+        "master_kill",
+        "mode_paper",
     }
     assert VALID_REJECT_REASONS == expected
 

@@ -73,19 +73,18 @@ class LiveEngine:
         return self._config.is_signal_enabled(signal_type)
 
     async def on_paper_trade_opened(self, paper_trade: _PaperTradeLike) -> None:
-        """Single entry point from PaperTrader chokepoint. Fire-and-forget."""
-        # Layer 1 of 4-layer kill stack (BL-NEW-LIVE-HYBRID M1 v2.1):
-        # master kill — short-circuits ALL live execution regardless of
-        # LIVE_MODE / per-signal opt-in / kill_switch state. Operator
-        # flips via .env LIVE_TRADING_ENABLED=True + restart.
-        if not getattr(self._config._s, "LIVE_TRADING_ENABLED", False):
-            log.info(
-                "live_execution_skipped_master_kill",
-                paper_trade_id=paper_trade.id,
-                signal_type=paper_trade.signal_type,
-            )
-            return
+        """Single entry point from PaperTrader chokepoint. Fire-and-forget.
 
+        Layer 1 of 4-layer kill stack (BL-NEW-LIVE-HYBRID M1 v2.1):
+        master kill (`LIVE_TRADING_ENABLED`) is enforced at process
+        startup in `scout/main.py` — when `LIVE_MODE='live'` AND
+        `LIVE_TRADING_ENABLED=False`, startup refuses to construct the
+        live adapter (existing balance_gate NotImplementedError is the
+        belt-and-braces guard). Shadow mode (`LIVE_MODE='shadow'`) is
+        paper-money and continues to flow through the engine for BL-055
+        soak telemetry. The engine entry NO LONGER short-circuits on
+        master kill, because that would also block shadow-mode soak.
+        """
         assert self._config.mode != "live", (
             "LiveEngine reached in LIVE_MODE=live — startup guard in "
             "scout/main.py failed; refusing to write any row"
