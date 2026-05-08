@@ -2365,15 +2365,11 @@ class Database:
 
         try:
             await conn.execute("BEGIN EXCLUSIVE")
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS paper_migrations (
-                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
-            )
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS schema_version (
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS schema_version (
                     version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
-                    description TEXT NOT NULL)"""
-            )
+                    description TEXT NOT NULL)""")
 
             cur_pragma = await conn.execute("PRAGMA table_info(live_trades)")
             existing_cols = {row[1] for row in await cur_pragma.fetchall()}
@@ -2401,8 +2397,7 @@ class Database:
             # Task 13/13.5: ephemeral operator-set overrides
             # (/allow-stack, /auto-approve, /approval-required, /venue-revive).
             # Read by approval_thresholds.should_require_approval (gate 4).
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS live_operator_overrides (
+            await conn.execute("""CREATE TABLE IF NOT EXISTS live_operator_overrides (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
                     override_type TEXT NOT NULL CHECK (override_type IN (
                         'allow_stack','auto_approve','approval_required','venue_revive'
@@ -2412,8 +2407,7 @@ class Database:
                     set_at        TEXT NOT NULL,
                     expires_at    TEXT NOT NULL,
                     set_by        TEXT
-                )"""
-            )
+                )""")
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_live_operator_overrides_active "
                 "ON live_operator_overrides(override_type, venue, expires_at)"
@@ -2434,9 +2428,7 @@ class Database:
                 ("bl_live_trades_telemetry_v1",),
             )
             if (await cur.fetchone()) is None:
-                raise RuntimeError(
-                    "bl_live_trades_telemetry_v1 cutover row missing"
-                )
+                raise RuntimeError("bl_live_trades_telemetry_v1 cutover row missing")
             await conn.commit()
         except Exception:
             try:
@@ -2475,15 +2467,11 @@ class Database:
 
         try:
             await conn.execute("BEGIN EXCLUSIVE")
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS paper_migrations (
-                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
-            )
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS schema_version (
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS schema_version (
                     version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
-                    description TEXT NOT NULL)"""
-            )
+                    description TEXT NOT NULL)""")
 
             cur_pragma = await conn.execute("PRAGMA table_info(live_trades)")
             existing_cols = {row[1] for row in await cur_pragma.fetchall()}
@@ -2515,9 +2503,7 @@ class Database:
                 ("bl_live_client_order_id_v1",),
             )
             if (await cur.fetchone()) is None:
-                raise RuntimeError(
-                    "bl_live_client_order_id_v1 cutover row missing"
-                )
+                raise RuntimeError("bl_live_client_order_id_v1 cutover row missing")
             await conn.commit()
         except Exception:
             try:

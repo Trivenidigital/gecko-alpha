@@ -154,9 +154,7 @@ async def test_high_peak_uses_full_trail(tmp_path, settings_factory):
 
 
 @pytest.mark.asyncio
-async def test_high_peak_full_trail_fires_on_wider_drop(
-    tmp_path, settings_factory
-):
+async def test_high_peak_full_trail_fires_on_wider_drop(tmp_path, settings_factory):
     """Sanity: high-peak trade with -22% drop from peak DOES fire."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
@@ -207,7 +205,11 @@ async def test_moonshot_overrides_low_peak_trail(tmp_path, settings_factory):
         PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT=30.0,
     )
     trade_id = await _open_post_leg1(
-        db, trader, token_id="ms1", settings=settings, peak_price=1.50  # +50% past moonshot
+        db,
+        trader,
+        token_id="ms1",
+        settings=settings,
+        peak_price=1.50,  # +50% past moonshot
     )
     # Drop to 1.10 (= -26.7% from peak 1.50). Moonshot trail (30%) does
     # NOT fire. Without moonshot, low-peak trail (8%) WOULD have fired.

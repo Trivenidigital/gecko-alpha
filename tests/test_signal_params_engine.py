@@ -27,9 +27,7 @@ async def _seed_price(db, coin_id="tok", price=1.0):
     await db._conn.commit()
 
 
-async def test_engine_stamps_per_signal_sl_pct_when_flag_on(
-    tmp_path, settings_factory
-):
+async def test_engine_stamps_per_signal_sl_pct_when_flag_on(tmp_path, settings_factory):
     db = Database(tmp_path / "t.db")
     await db.initialize()
     await _seed_price(db)
@@ -67,9 +65,7 @@ async def test_engine_stamps_per_signal_sl_pct_when_flag_on(
     await db.close()
 
 
-async def test_engine_uses_settings_sl_pct_when_flag_off(
-    tmp_path, settings_factory
-):
+async def test_engine_uses_settings_sl_pct_when_flag_off(tmp_path, settings_factory):
     db = Database(tmp_path / "t.db")
     await db.initialize()
     await _seed_price(db)

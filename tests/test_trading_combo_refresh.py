@@ -584,7 +584,9 @@ async def test_refresh_counts_closed_moonshot_trail_in_rollup(
     await db.close()
 
 
-async def test_refresh_counts_tg_social_signal_type_in_rollup(tmp_path, settings_factory):
+async def test_refresh_counts_tg_social_signal_type_in_rollup(
+    tmp_path, settings_factory
+):
     """BL-064 regression: tg_social signal_type contributes to combo_performance
     rollups across all CLOSED_COUNTABLE_STATUSES — including closed_moonshot_trail
     which BL-063 added. Locks the contract that a future refactor of
@@ -602,7 +604,12 @@ async def test_refresh_counts_tg_social_signal_type_in_rollup(tmp_path, settings
         ("closed_sl", -15.0),
     ]:
         await _insert_trade(
-            db, "tg_social", pct, pct, now - timedelta(days=1), status=status,
+            db,
+            "tg_social",
+            pct,
+            pct,
+            now - timedelta(days=1),
+            status=status,
         )
 
     ok = await combo_refresh.refresh_combo(db, "tg_social", s)

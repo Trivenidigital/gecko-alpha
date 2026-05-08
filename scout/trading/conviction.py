@@ -25,6 +25,7 @@ Note (design-v2 arch-D3): refactor `_SIGNAL_SOURCES` list to a
 `MetadataSource` plugin pattern when ANY new source addition requires
 editing two code locations.
 """
+
 from __future__ import annotations
 
 import sqlite3
@@ -225,9 +226,7 @@ def conviction_locked_params(stack: int, base: dict) -> dict:
         "trail_pct": float(
             min(base["trail_pct"] + delta["trail_pct"], delta["trail_cap"])
         ),
-        "sl_pct": float(
-            min(base["sl_pct"] + delta["sl_pct"], delta["sl_cap"])
-        ),
+        "sl_pct": float(min(base["sl_pct"] + delta["sl_pct"], delta["sl_cap"])),
     }
 
 

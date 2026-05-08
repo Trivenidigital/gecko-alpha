@@ -387,8 +387,7 @@ async def test_dispatch_cashtag_logs_symbol_collision(
     # assertion alone. Catch the regression by asserting NO collision
     # WARNING fires (R2#5 v3 design intent).
     collision_warnings = [
-        c for c in captured_warnings
-        if c[0] == "tg_social_potential_duplicate_symbol"
+        c for c in captured_warnings if c[0] == "tg_social_potential_duplicate_symbol"
     ]
     assert collision_warnings == [], (
         f"symbol-collision must log INFO (anti-wallpaper for memecoins where "

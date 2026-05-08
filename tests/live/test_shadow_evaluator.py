@@ -9,6 +9,7 @@ Covers:
 6. Close that breaches LIVE_DAILY_LOSS_CAP_USD arms the kill switch.
 7. NULL entry_walked_vwap is skipped gracefully.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -27,7 +28,6 @@ from scout.live.shadow_evaluator import (
     evaluate_open_shadow_trades,
 )
 from scout.live.types import Depth, DepthLevel
-
 
 # ---------- helpers ----------------------------------------------------------
 
@@ -51,12 +51,10 @@ def _settings(**overrides):
 
 def _depth(mid=Decimal("100"), qty=Decimal("1000")):
     bids = tuple(
-        DepthLevel(price=mid - Decimal(i) * Decimal("0.1"), qty=qty)
-        for i in range(10)
+        DepthLevel(price=mid - Decimal(i) * Decimal("0.1"), qty=qty) for i in range(10)
     )
     asks = tuple(
-        DepthLevel(price=mid + Decimal(i) * Decimal("0.1"), qty=qty)
-        for i in range(10)
+        DepthLevel(price=mid + Decimal(i) * Decimal("0.1"), qty=qty) for i in range(10)
     )
     return Depth(
         pair="TUSDT",
@@ -67,9 +65,7 @@ def _depth(mid=Decimal("100"), qty=Decimal("1000")):
     )
 
 
-async def _seed_paper_trade(
-    db, *, coin_id="c", symbol="T", signal_type="first_signal"
-):
+async def _seed_paper_trade(db, *, coin_id="c", symbol="T", signal_type="first_signal"):
     assert db._conn is not None
     await db._conn.execute(
         "INSERT INTO paper_trades (token_id, symbol, name, chain, signal_type, "
@@ -243,9 +239,7 @@ async def test_duration_exit_closes_row(tmp_path):
     try:
         pt_id = await _seed_paper_trade(db)
         old = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
-        sid = await _seed_open_shadow(
-            db, paper_trade_id=pt_id, created_at=old
-        )
+        sid = await _seed_open_shadow(db, paper_trade_id=pt_id, created_at=old)
         settings = _settings()
         # Mid-range price — neither TP nor SL crosses, so duration wins.
         adapter = _make_adapter(fetch_price=Decimal("110"))
@@ -274,9 +268,7 @@ async def test_transient_error_bumps_review_retries(tmp_path):
         pt_id = await _seed_paper_trade(db)
         sid = await _seed_open_shadow(db, paper_trade_id=pt_id)
         settings = _settings()
-        adapter = _make_adapter(
-            fetch_price_exc=VenueTransientError("503 upstream")
-        )
+        adapter = _make_adapter(fetch_price_exc=VenueTransientError("503 upstream"))
 
         before = datetime.now(timezone.utc)
         closed = await evaluate_open_shadow_trades(
@@ -299,9 +291,7 @@ async def test_transient_error_bumps_review_retries(tmp_path):
         next_at = datetime.fromisoformat(row[2])
         delta = next_at - before
         # ~24h +/- a few seconds of test overhead.
-        assert timedelta(hours=23, minutes=59) < delta < timedelta(
-            hours=24, minutes=1
-        )
+        assert timedelta(hours=23, minutes=59) < delta < timedelta(hours=24, minutes=1)
     finally:
         await db.close()
 
@@ -315,9 +305,7 @@ async def test_third_failure_flips_to_needs_manual_review(tmp_path):
             db, paper_trade_id=pt_id, review_retries=MAX_REVIEW_RETRIES - 1
         )
         settings = _settings()
-        adapter = _make_adapter(
-            fetch_price_exc=VenueTransientError("timeout")
-        )
+        adapter = _make_adapter(fetch_price_exc=VenueTransientError("timeout"))
 
         with structlog.testing.capture_logs() as logs:
             await evaluate_open_shadow_trades(
@@ -382,9 +370,7 @@ async def test_no_entry_vwap_skipped_gracefully(tmp_path):
     await db.initialize()
     try:
         pt_id = await _seed_paper_trade(db)
-        sid = await _seed_open_shadow(
-            db, paper_trade_id=pt_id, entry_vwap=None
-        )
+        sid = await _seed_open_shadow(db, paper_trade_id=pt_id, entry_vwap=None)
         settings = _settings()
         adapter = _make_adapter(fetch_price=Decimal("125"))
 

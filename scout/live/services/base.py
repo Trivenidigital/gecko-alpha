@@ -28,8 +28,6 @@ class VenueService(ABC):
     """Stable lowercase identifier used in log keys + lock keys."""
 
     @abstractmethod
-    async def run_once(
-        self, *, adapter: Any, db: Database, venue: str
-    ) -> None:
+    async def run_once(self, *, adapter: Any, db: Database, venue: str) -> None:
         """Single tick. Errors must be caught + logged; do not raise."""
         ...

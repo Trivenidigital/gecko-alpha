@@ -14,6 +14,7 @@ Exception handling (spec §10.1 + §10.5): transient venue errors increment
 failures flip the row to ``needs_manual_review`` and emit a WARN log
 (``live_shadow_review_exhausted``).
 """
+
 from __future__ import annotations
 
 import asyncio

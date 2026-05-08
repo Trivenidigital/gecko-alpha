@@ -38,9 +38,7 @@ async def test_set_operator_override_writes_row(tmp_path):
 async def test_has_active_override_returns_true_when_unexpired(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    await set_operator_override(
-        db, override_type="approval_required", venue="binance"
-    )
+    await set_operator_override(db, override_type="approval_required", venue="binance")
     active = await has_active_override(
         db, override_type="approval_required", venue="binance"
     )
@@ -73,9 +71,7 @@ async def test_has_active_override_matches_null_venue_globally(tmp_path):
     """venue IS NULL means 'all venues'."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    await set_operator_override(
-        db, override_type="approval_required", venue=None
-    )
+    await set_operator_override(db, override_type="approval_required", venue=None)
     active = await has_active_override(
         db, override_type="approval_required", venue="binance"
     )
@@ -116,9 +112,7 @@ async def test_request_operator_approval_returns_true_when_pre_approved(tmp_path
 
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    await set_operator_override(
-        db, override_type="auto_approve", venue="binance"
-    )
+    await set_operator_override(db, override_type="auto_approve", venue="binance")
 
     class _PaperTrade:
         id = 1

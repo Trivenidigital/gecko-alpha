@@ -11,6 +11,7 @@ Pins per design v2 (commit 1a4fe18) + plan v2 (commit a1b6926):
 - T7 — backtest sync wrapper round-trip
 - T8 — LAB #711 regression (11-stack saturation)
 """
+
 from __future__ import annotations
 
 import os
@@ -37,6 +38,7 @@ def _reset_signal_sources_cache():
     """design-v2 arch-S2: per-test reset of conviction.py module cache."""
     try:
         from scout.trading.conviction import clear_missing_sources_cache_for_tests
+
         clear_missing_sources_cache_for_tests()
     except ImportError:
         pass  # Module not yet built (TDD red phase)
@@ -46,6 +48,7 @@ def _reset_signal_sources_cache():
 @pytest.fixture
 async def db(tmp_path):
     from scout.db import Database
+
     d = Database(tmp_path / "t.db")
     await d.initialize()
     yield d
@@ -122,6 +125,7 @@ async def test_conviction_lock_post_migration_assertion_fires_when_cutover_row_m
     existence guard. Without M4, the second run no-ops on the column
     check + skips the INSERT, and post-migration assertion raises."""
     from scout.db import Database
+
     d = Database(tmp_path / "t.db")
     await d.initialize()
     # Force cutover row missing while column is present
@@ -166,6 +170,7 @@ def test_settings_paper_conviction_lock_threshold_must_be_at_least_two(
 ):
     """T2c — validator: threshold < 2 makes no sense."""
     from pydantic import ValidationError
+
     with pytest.raises(ValidationError):
         settings_factory(PAPER_CONVICTION_LOCK_THRESHOLD=1)
     with pytest.raises(ValidationError):
@@ -179,6 +184,7 @@ def test_settings_paper_conviction_lock_threshold_upper_bound(
     hatch) from previous design-v2 limit of 11. Values > 50 still rejected
     as likely typos."""
     from pydantic import ValidationError
+
     # 11 still accepted (previously the cap)
     s = settings_factory(PAPER_CONVICTION_LOCK_THRESHOLD=11)
     assert s.PAPER_CONVICTION_LOCK_THRESHOLD == 11
@@ -229,6 +235,7 @@ def test_conviction_locked_params_table_matches_backlog_spec():
 def test_conviction_locked_params_saturates_at_stack_4():
     """T3b — stack=10 returns same as stack=4."""
     from scout.trading.conviction import conviction_locked_params
+
     base = {"max_duration_hours": 168, "trail_pct": 20.0, "sl_pct": 25.0}
     p4 = conviction_locked_params(stack=4, base=base)
     p10 = conviction_locked_params(stack=10, base=base)
@@ -239,6 +246,7 @@ def test_conviction_locked_params_saturates_at_stack_4():
 async def test_compute_stack_returns_int(db):
     """T3c — compute_stack returns int >= 0; counts at least 1 source."""
     from scout.trading.conviction import compute_stack
+
     now = datetime.now(timezone.utc).isoformat()
     await db._conn.execute(
         "INSERT INTO gainers_snapshots "
@@ -257,6 +265,7 @@ async def test_compute_stack_returns_int(db):
 async def test_compute_stack_empty_token_id_returns_zero(db):
     """T3d — empty token_id → 0 (defensive)."""
     from scout.trading.conviction import compute_stack
+
     n = await compute_stack(db, "", "2026-05-01T00:00:00+00:00")
     assert n == 0
 
@@ -265,13 +274,12 @@ async def test_compute_stack_empty_token_id_returns_zero(db):
 async def test_compute_stack_db_conn_none_returns_zero_with_log(db):
     """T5f / M4 — defensive: db._conn is None → 0 + warning log."""
     from scout.trading.conviction import compute_stack
+
     real_conn = db._conn
     db._conn = None
     try:
         with capture_logs() as logs:
-            n = await compute_stack(
-                db, "test-coin", "2026-05-01T00:00:00+00:00"
-            )
+            n = await compute_stack(db, "test-coin", "2026-05-01T00:00:00+00:00")
         assert n == 0
         events = [e.get("event") for e in logs]
         assert "conviction_lock_db_closed" in events
@@ -315,9 +323,7 @@ def test_moonshot_trail_composes_with_locked_trail(settings_factory):
     """T6 — A1 fix: max(30, 35) == 35."""
     settings = settings_factory()
     sp_trail_pct_locked = 35.0
-    effective = max(
-        settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT, sp_trail_pct_locked
-    )
+    effective = max(settings.PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT, sp_trail_pct_locked)
     assert effective == 35.0
 
 
@@ -349,7 +355,8 @@ def test_backtest_script_imports_conviction_module_helpers():
     )
     conn.commit()
     n, sources = backtest_helper(
-        conn, "test-coin",
+        conn,
+        "test-coin",
         "2026-05-01T00:00:00+00:00",
         "2026-05-04T00:00:00+00:00",
     )
@@ -394,10 +401,9 @@ async def _seed_locked_eligible_trade(
     with different signal_types.
     """
     from datetime import datetime, timedelta, timezone
+
     if opened_at is None:
-        opened_at = (
-            datetime.now(timezone.utc) - timedelta(days=2)
-        ).isoformat()
+        opened_at = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
     open_dt = datetime.fromisoformat(opened_at.replace("Z", "+00:00"))
 
     # Insert paper_trade
@@ -410,8 +416,11 @@ async def _seed_locked_eligible_trade(
                    ?, 100.0, 100.0,
                    ?, ?, ?, 'open', 10.0)""",
         (
-            token_id, signal_type,
-            entry_price, entry_price * 1.5, entry_price * 0.75,
+            token_id,
+            signal_type,
+            entry_price,
+            entry_price * 1.5,
+            entry_price * 0.75,
             opened_at,
         ),
     )
@@ -429,19 +438,22 @@ async def _seed_locked_eligible_trade(
     seed_specs = [
         # (table, sql, params builder)
         (
-            1, "gainers_snapshots",
+            1,
+            "gainers_snapshots",
             "INSERT INTO gainers_snapshots "
             "(coin_id, symbol, name, price_change_24h, market_cap, "
             " volume_24h, price_at_snapshot, snapshot_at) "
             "VALUES (?, 'LAB', 'Lab', 12.0, 5000000, 1000, 1.0, ?)",
         ),
         (
-            2, "trending_snapshots",
+            2,
+            "trending_snapshots",
             # Schema may vary; use flexible inserts. Read schema dynamically.
             None,
         ),
         (
-            3, "volume_spikes",
+            3,
+            "volume_spikes",
             None,
         ),
     ]
@@ -470,8 +482,14 @@ async def _seed_locked_eligible_trade(
                 placeholders.append("?")
                 if name in ("coin_id", "token_id"):
                     values.append(token_id)
-                elif name in ("snapshot_at", "detected_at", "created_at",
-                              "completed_at", "predicted_at", "recorded_at"):
+                elif name in (
+                    "snapshot_at",
+                    "detected_at",
+                    "created_at",
+                    "completed_at",
+                    "predicted_at",
+                    "recorded_at",
+                ):
                     values.append(ts)
                 elif ctype.upper() == "TEXT":
                     values.append("LAB")
@@ -492,7 +510,9 @@ async def _seed_locked_eligible_trade(
 
     # Extra paper_trades rows for sources 9-11 (different signal_types)
     extra_signals = [
-        "gainers_early", "trending_catch", "losers_contrarian",
+        "gainers_early",
+        "trending_catch",
+        "losers_contrarian",
     ]
     for idx in range(min(max(n_extra_sources - sources_added, 0), 3)):
         ts = (open_dt + timedelta(hours=9 + idx)).isoformat()
@@ -530,11 +550,14 @@ async def test_evaluator_skips_conviction_lock_when_settings_kill_switch_off(
     settings.PAPER_CONVICTION_LOCK_ENABLED=False means NO overlay
     regardless of per-signal flag or stack count."""
     from scout.trading.evaluator import evaluate_paper_trades
+
     settings = settings_factory(SIGNAL_PARAMS_ENABLED=True)
     # Default: PAPER_CONVICTION_LOCK_ENABLED=False
     assert settings.PAPER_CONVICTION_LOCK_ENABLED is False
     await _seed_locked_eligible_trade(
-        db, signal_type="first_signal", opt_in_signal=True,
+        db,
+        signal_type="first_signal",
+        opt_in_signal=True,
         n_extra_sources=5,
     )
     with capture_logs() as logs:
@@ -550,29 +573,30 @@ async def test_evaluator_skips_conviction_lock_when_settings_kill_switch_off(
 
 
 @pytest.mark.asyncio
-async def test_evaluator_arms_conviction_lock_when_all_gates_pass(
-    db, settings_factory
-):
+async def test_evaluator_arms_conviction_lock_when_all_gates_pass(db, settings_factory):
     """T5d (PR-review arch-D1 merge-blocker) — happy path: all 3 gates
     pass → locked params used. Asserts:
     - conviction_lock_armed event fires
     - paper_trades.conviction_locked_at + conviction_locked_stack stamped
     - locked max_duration_hours overlaid"""
     from scout.trading.evaluator import evaluate_paper_trades
+
     settings = settings_factory(
         SIGNAL_PARAMS_ENABLED=True,
         PAPER_CONVICTION_LOCK_ENABLED=True,
     )
     await _seed_locked_eligible_trade(
-        db, signal_type="first_signal", opt_in_signal=True,
+        db,
+        signal_type="first_signal",
+        opt_in_signal=True,
         n_extra_sources=3,
     )
     with capture_logs() as logs:
         await evaluate_paper_trades(db, settings)
     armed = [e for e in logs if e.get("event") == "conviction_lock_armed"]
-    assert armed, (
-        f"expected conviction_lock_armed; got {[e.get('event') for e in logs]}"
-    )
+    assert (
+        armed
+    ), f"expected conviction_lock_armed; got {[e.get('event') for e in logs]}"
     a = armed[0]
     assert a["stack"] >= 3
     assert a["threshold"] == 3
@@ -595,20 +619,21 @@ async def test_evaluator_arms_conviction_lock_when_all_gates_pass(
 
 
 @pytest.mark.asyncio
-async def test_evaluator_logs_conviction_lock_armed_only_once(
-    db, settings_factory
-):
+async def test_evaluator_logs_conviction_lock_armed_only_once(db, settings_factory):
     """T5e (PR-review H1 — D2 idempotency, soak-signal-critical):
     second eval pass on the same armed trade does NOT re-emit the log
     (would corrupt the 14d operator soak monitor with ~672 spurious
     events per locked trade)."""
     from scout.trading.evaluator import evaluate_paper_trades
+
     settings = settings_factory(
         SIGNAL_PARAMS_ENABLED=True,
         PAPER_CONVICTION_LOCK_ENABLED=True,
     )
     await _seed_locked_eligible_trade(
-        db, signal_type="first_signal", opt_in_signal=True,
+        db,
+        signal_type="first_signal",
+        opt_in_signal=True,
         n_extra_sources=3,
     )
     # Pass 1 — arms
@@ -620,9 +645,9 @@ async def test_evaluator_logs_conviction_lock_armed_only_once(
     with capture_logs() as logs2:
         await evaluate_paper_trades(db, settings)
     armed2 = [e for e in logs2 if e.get("event") == "conviction_lock_armed"]
-    assert armed2 == [], (
-        f"D2 regression: re-emitted on pass 2; got {len(armed2)} events"
-    )
+    assert (
+        armed2 == []
+    ), f"D2 regression: re-emitted on pass 2; got {len(armed2)} events"
 
 
 @pytest.mark.asyncio
@@ -642,16 +667,18 @@ async def test_evaluator_overlay_placement_keeps_trade_alive_past_base_max(
     `max_duration = timedelta(...)` makes the feature a silent no-op."""
     from datetime import datetime, timedelta, timezone
     from scout.trading.evaluator import evaluate_paper_trades
+
     settings = settings_factory(
         SIGNAL_PARAMS_ENABLED=True,
         PAPER_CONVICTION_LOCK_ENABLED=True,
     )
-    opened_at = (
-        datetime.now(timezone.utc) - timedelta(hours=100)
-    ).isoformat()
+    opened_at = (datetime.now(timezone.utc) - timedelta(hours=100)).isoformat()
     await _seed_locked_eligible_trade(
-        db, signal_type="first_signal", opt_in_signal=True,
-        n_extra_sources=3, opened_at=opened_at,
+        db,
+        signal_type="first_signal",
+        opt_in_signal=True,
+        n_extra_sources=3,
+        opened_at=opened_at,
     )
     await evaluate_paper_trades(db, settings)
     cur = await db._conn.execute(
@@ -689,6 +716,7 @@ async def test_evaluator_moonshot_branch_uses_max_with_sp_trail_pct(
     """
     from datetime import datetime, timezone
     from scout.trading.evaluator import evaluate_paper_trades
+
     settings = settings_factory(
         SIGNAL_PARAMS_ENABLED=True,
         PAPER_CONVICTION_LOCK_ENABLED=True,
@@ -696,7 +724,9 @@ async def test_evaluator_moonshot_branch_uses_max_with_sp_trail_pct(
     )
     # Seed trade with stack=4 sources; pre-stamp moonshot_armed_at.
     trade_id = await _seed_locked_eligible_trade(
-        db, signal_type="first_signal", opt_in_signal=True,
+        db,
+        signal_type="first_signal",
+        opt_in_signal=True,
         n_extra_sources=4,
         entry_price=1.0,
         # Set current_price to simulate a peak retracement: we'll stamp
@@ -744,20 +774,22 @@ async def test_evaluator_emits_disarmed_log_when_master_off_post_arm(
     silently retightens trail mid-flight on .env flip."""
     from datetime import datetime, timezone
     from scout.trading.evaluator import evaluate_paper_trades
+
     # First, arm the trade with master ON
     settings_on = settings_factory(
         SIGNAL_PARAMS_ENABLED=True,
         PAPER_CONVICTION_LOCK_ENABLED=True,
     )
     await _seed_locked_eligible_trade(
-        db, signal_type="first_signal", opt_in_signal=True,
+        db,
+        signal_type="first_signal",
+        opt_in_signal=True,
         n_extra_sources=3,
     )
     await evaluate_paper_trades(db, settings_on)
     # Verify armed
     cur = await db._conn.execute(
-        "SELECT conviction_locked_at FROM paper_trades "
-        "WHERE token_id = ?",
+        "SELECT conviction_locked_at FROM paper_trades " "WHERE token_id = ?",
         ("lab-coin",),
     )
     row = await cur.fetchone()
@@ -770,9 +802,9 @@ async def test_evaluator_emits_disarmed_log_when_master_off_post_arm(
     with capture_logs() as logs:
         await evaluate_paper_trades(db, settings_off)
     events = [e.get("event") for e in logs]
-    assert "conviction_lock_disarmed_post_rollback" in events, (
-        f"H1: rollback regression invisible; events={events}"
-    )
+    assert (
+        "conviction_lock_disarmed_post_rollback" in events
+    ), f"H1: rollback regression invisible; events={events}"
 
 
 @pytest.mark.asyncio
@@ -782,6 +814,7 @@ async def test_compute_stack_excludes_self_trade_from_paper_trades_count(db):
     excluded trade row as a confirmation."""
     from datetime import datetime, timedelta, timezone
     from scout.trading.conviction import compute_stack
+
     open_dt = datetime.now(timezone.utc) - timedelta(days=1)
     opened_at = open_dt.isoformat()
     # Insert paper_trade for token "x" with the same signal_type — this
@@ -800,11 +833,17 @@ async def test_compute_stack_excludes_self_trade_from_paper_trades_count(db):
 
     # Without exclude_trade_id: stack includes self-reference → at least 1
     n_with_self = await compute_stack(
-        db, "x", opened_at, exclude_trade_id=None,
+        db,
+        "x",
+        opened_at,
+        exclude_trade_id=None,
     )
     # With exclude_trade_id=self_id: stack excludes self → 0
     n_without_self = await compute_stack(
-        db, "x", opened_at, exclude_trade_id=self_id,
+        db,
+        "x",
+        opened_at,
+        exclude_trade_id=self_id,
     )
     assert n_with_self >= 1, (
         f"compute_stack should count paper_trades when not excluding "

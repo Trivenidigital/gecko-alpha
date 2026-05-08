@@ -174,15 +174,13 @@ async def test_dormancy_clears_when_recent_fills_exist(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
     # Seed a paper_trade + closed live_trade in the lookback window
-    cur = await db._conn.execute(
-        """INSERT INTO paper_trades
+    cur = await db._conn.execute("""INSERT INTO paper_trades
            (token_id, symbol, name, chain, signal_type, signal_data,
             entry_price, amount_usd, quantity, tp_price, sl_price,
             status, opened_at)
            VALUES ('tok', 'X', 'x', 'ethereum', 'first_signal', '{}',
                    100, 50, 0.5, 120, 80, 'closed_tp',
-                   '2026-05-08T00:00:00+00:00')"""
-    )
+                   '2026-05-08T00:00:00+00:00')""")
     paper_id = cur.lastrowid
     recent = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     await db._conn.execute(

@@ -30,11 +30,14 @@ from scout.social.telegram.models import ParsedMessage
 
 def _make_iter_raising(exc: BaseException):
     """Build a stub for client.iter_messages that raises `exc` on first iteration."""
+
     def _stub(*args, **kwargs):
         async def _gen():
             raise exc
             yield  # pragma: no cover
+
         return _gen()
+
     return _stub
 
 
@@ -48,9 +51,7 @@ def _make_iter_raising(exc: BaseException):
     [
         lambda: UsernameInvalidError(request=None),
         lambda: UsernameNotOccupiedError(request=None),
-        lambda: ValueError(
-            "Cannot find any entity corresponding to '@bogus'"
-        ),
+        lambda: ValueError("Cannot find any entity corresponding to '@bogus'"),
         lambda: ValueError("No user has username @bogus"),
     ],
     ids=[
@@ -106,9 +107,9 @@ async def test_bad_handle_marks_removed_at_and_alerts(
     (removed_at,) = await cur.fetchone()
     assert removed_at is not None, "bad handle must be marked removed_at"
     # Operator-visible alert must have been attempted
-    assert http_session.post.call_count >= 1, (
-        "send_telegram must be invoked with the 'lost access' message"
-    )
+    assert (
+        http_session.post.call_count >= 1
+    ), "send_telegram must be invoked with the 'lost access' message"
     await db.close()
 
 
@@ -154,9 +155,9 @@ async def test_unrelated_value_error_propagates(tmp_path, settings_factory):
         ("@good",),
     )
     (removed_at,) = await cur.fetchone()
-    assert removed_at is None, (
-        "unrelated ValueError must NOT cause a channel to be marked removed"
-    )
+    assert (
+        removed_at is None
+    ), "unrelated ValueError must NOT cause a channel to be marked removed"
     await db.close()
 
 
@@ -205,9 +206,7 @@ def test_is_telethon_entity_resolution_error_predicate():
     assert _is_telethon_entity_resolution_error(
         ValueError("Cannot find any entity corresponding to '@x'")
     )
-    assert _is_telethon_entity_resolution_error(
-        ValueError("No user has username @x")
-    )
+    assert _is_telethon_entity_resolution_error(ValueError("No user has username @x"))
     assert _is_telethon_entity_resolution_error(
         ValueError("Could not find the input entity for...")
     )
@@ -236,9 +235,7 @@ def _stub_auth(monkeypatch):
     async def _fake_verify(_client):
         return {"id": 1, "username": "tester", "first_name": "Tester"}
 
-    monkeypatch.setattr(
-        "scout.social.telegram.listener.build_client", _fake_build
-    )
+    monkeypatch.setattr("scout.social.telegram.listener.build_client", _fake_build)
     monkeypatch.setattr(
         "scout.social.telegram.listener.connect_and_verify", _fake_verify
     )
@@ -250,11 +247,11 @@ async def test_listener_crash_flips_state_and_alerts(
     tmp_path, settings_factory, monkeypatch
 ):
     """Unhandled exception in the body must:
-      (a) flip listener_state to 'crashed',
-      (b) include the exception class in detail,
-      (c) attempt the operator Telegram alert,
-      (d) re-raise so gather() can observe the failure (even if it
-          ultimately suppresses via return_exceptions=True).
+    (a) flip listener_state to 'crashed',
+    (b) include the exception class in detail,
+    (c) attempt the operator Telegram alert,
+    (d) re-raise so gather() can observe the failure (even if it
+        ultimately suppresses via return_exceptions=True).
     """
     db = Database(tmp_path / "t.db")
     await db.initialize()
@@ -270,9 +267,7 @@ async def test_listener_crash_flips_state_and_alerts(
     async def _boom(**_):
         raise RuntimeError("synthetic listener crash")
 
-    monkeypatch.setattr(
-        "scout.social.telegram.listener._run_listener_body", _boom
-    )
+    monkeypatch.setattr("scout.social.telegram.listener._run_listener_body", _boom)
 
     http_session = MagicMock()
     http_session.post = MagicMock()
@@ -289,9 +284,9 @@ async def test_listener_crash_flips_state_and_alerts(
     state, detail = await cur.fetchone()
     assert state == "crashed"
     assert "RuntimeError" in (detail or "")
-    assert http_session.post.call_count >= 1, (
-        "operator Telegram alert must be attempted on crash"
-    )
+    assert (
+        http_session.post.call_count >= 1
+    ), "operator Telegram alert must be attempted on crash"
     await db.close()
 
 
@@ -316,9 +311,7 @@ async def test_crash_state_flip_failure_preserves_original_exception(
     async def _boom(**_):
         raise RuntimeError("primary crash")
 
-    monkeypatch.setattr(
-        "scout.social.telegram.listener._run_listener_body", _boom
-    )
+    monkeypatch.setattr("scout.social.telegram.listener._run_listener_body", _boom)
 
     set_state_calls: list[str] = []
     real_set = None  # not used; we replace entirely
@@ -341,9 +334,9 @@ async def test_crash_state_flip_failure_preserves_original_exception(
             engine=MagicMock(),
             http_session=MagicMock(),
         )
-    assert "crashed" in set_state_calls, (
-        "crash watchdog must attempt the state flip even if it fails"
-    )
+    assert (
+        "crashed" in set_state_calls
+    ), "crash watchdog must attempt the state flip even if it fails"
     await db.close()
 
 
@@ -371,9 +364,7 @@ async def test_authkey_error_preserves_auth_lost_state(
         await _set_listener_state(db, "auth_lost", detail="AuthKeyError")
         raise AuthKeyError(request=None, message="auth key revoked")
 
-    monkeypatch.setattr(
-        "scout.social.telegram.listener._run_listener_body", _body
-    )
+    monkeypatch.setattr("scout.social.telegram.listener._run_listener_body", _body)
 
     with pytest.raises(AuthKeyError):
         await run_listener(
@@ -387,9 +378,9 @@ async def test_authkey_error_preserves_auth_lost_state(
         "SELECT listener_state FROM tg_social_health WHERE component = 'listener'"
     )
     (state,) = await cur.fetchone()
-    assert state == "auth_lost", (
-        f"AuthKeyError must keep state at 'auth_lost', got {state!r}"
-    )
+    assert (
+        state == "auth_lost"
+    ), f"AuthKeyError must keep state at 'auth_lost', got {state!r}"
     await db.close()
 
 
@@ -425,10 +416,7 @@ async def test_concurrent_persists_use_shared_txn_lock(tmp_path, monkeypatch):
         # to force scheduler interleaving at exactly the implicit-BEGIN
         # boundary. Without _txn_lock, two coroutines would simultaneously
         # have writes pending on the connection.
-        if (
-            isinstance(sql, str)
-            and "INSERT INTO tg_social_messages" in sql
-        ):
+        if isinstance(sql, str) and "INSERT INTO tg_social_messages" in sql:
             saw_first_insert_count += 1
             await asyncio.sleep(0)
         return result
@@ -450,9 +438,9 @@ async def test_concurrent_persists_use_shared_txn_lock(tmp_path, monkeypatch):
     pks = await asyncio.gather(*coros, return_exceptions=True)
 
     for i, pk in enumerate(pks):
-        assert not isinstance(pk, BaseException), (
-            f"persist #{i} raised {type(pk).__name__}: {pk}"
-        )
+        assert not isinstance(
+            pk, BaseException
+        ), f"persist #{i} raised {type(pk).__name__}: {pk}"
         assert pk is not None
 
     cur = await db._conn.execute("SELECT COUNT(*) FROM tg_social_messages")
@@ -461,9 +449,9 @@ async def test_concurrent_persists_use_shared_txn_lock(tmp_path, monkeypatch):
     cur = await db._conn.execute("SELECT COUNT(*) FROM tg_social_watermarks")
     (count,) = await cur.fetchone()
     assert count == 8
-    assert saw_first_insert_count >= 8, (
-        "test must actually hit the messages-table INSERT at least 8 times"
-    )
+    assert (
+        saw_first_insert_count >= 8
+    ), "test must actually hit the messages-table INSERT at least 8 times"
     await db.close()
 
 
@@ -504,9 +492,11 @@ async def test_listener_body_attaches_handler_after_catchup(
 
     def _fake_client_on(*args, **kwargs):
         call_order.append("client.on")
+
         # client.on returns a decorator; we return a no-op
         def _decorator(f):
             return f
+
         return _decorator
 
     fake_client = MagicMock()
@@ -520,9 +510,7 @@ async def test_listener_body_attaches_handler_after_catchup(
     async def _fake_verify(_client):
         return {"id": 1, "username": "tester", "first_name": "Tester"}
 
-    monkeypatch.setattr(
-        "scout.social.telegram.listener.build_client", _fake_build
-    )
+    monkeypatch.setattr("scout.social.telegram.listener.build_client", _fake_build)
     monkeypatch.setattr(
         "scout.social.telegram.listener.connect_and_verify", _fake_verify
     )
@@ -537,9 +525,10 @@ async def test_listener_body_attaches_handler_after_catchup(
         http_session=MagicMock(),
     )
 
-    assert call_order == ["catchup", "client.on"], (
-        f"catchup must precede handler attach, got: {call_order}"
-    )
+    assert call_order == [
+        "catchup",
+        "client.on",
+    ], f"catchup must precede handler attach, got: {call_order}"
 
     # And on clean exit, listener_state should be 'stopped' (not 'crashed')
     cur = await db._conn.execute(

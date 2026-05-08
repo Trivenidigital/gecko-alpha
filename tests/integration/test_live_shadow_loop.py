@@ -25,6 +25,7 @@ The six canonical flows are:
    third failure flips to ``needs_manual_review`` with
    ``live_shadow_review_exhausted`` WARN log.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -49,7 +50,6 @@ from scout.live.shadow_evaluator import (
     evaluate_open_shadow_trades,
 )
 from scout.trading.paper import _PaperTradeHandoff
-
 
 # ---------- helpers ----------------------------------------------------------
 
@@ -256,8 +256,7 @@ async def test_flow_1_happy_path_opens_then_closes_tp(tmp_path):
         assert row is not None, "expected a shadow_trades row after handoff"
         status, reject_reason, entry_vwap, pair = row
         assert status == "open", (
-            f"expected open row, got status={status} "
-            f"reject_reason={reject_reason}"
+            f"expected open row, got status={status} " f"reject_reason={reject_reason}"
         )
         assert pair == "SUSDT"
         assert entry_vwap is not None and Decimal(entry_vwap) > 0
@@ -273,9 +272,7 @@ async def test_flow_1_happy_path_opens_then_closes_tp(tmp_path):
             # Evaluator fetch_depth to walk the exit-side bids.
             exit_depth = _healthy_depth_payload()
             exit_depth["bids"] = [[str(125 - i * 0.1), "1000"] for i in range(20)]
-            exit_depth["asks"] = [
-                [str(125 + (i + 1) * 0.1), "1000"] for i in range(20)
-            ]
+            exit_depth["asks"] = [[str(125 + (i + 1) * 0.1), "1000"] for i in range(20)]
             m.get(
                 "https://api.binance.com/api/v3/depth?symbol=SUSDT&limit=100",
                 payload=exit_depth,

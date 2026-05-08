@@ -51,9 +51,7 @@ def make_client_order_id(paper_trade_id: int, intent_uuid: str) -> str:
     return cid
 
 
-async def lookup_existing_order_id(
-    db: Database, client_order_id: str
-) -> str | None:
+async def lookup_existing_order_id(db: Database, client_order_id: str) -> str | None:
     """Pre-retry dedup. Returns existing venue_order_id if a live_trades
     row already has this client_order_id; else None.
     """

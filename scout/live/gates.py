@@ -17,6 +17,7 @@ Execution order (spec §5, first-failure-wins):
 Valid reject_reasons match the shadow_trades / live_trades CHECK constraint in
 :func:`scout.db.Database.initialize`.
 """
+
 from __future__ import annotations
 
 from decimal import Decimal
@@ -173,21 +174,14 @@ class Gates:
         required = multiplier * size_usd
         top_bids = depth.bids[:10]
         top_asks = depth.asks[:10]
-        bid_total = sum(
-            (lv.price * lv.qty for lv in top_bids), Decimal(0)
-        )
-        ask_total = sum(
-            (lv.price * lv.qty for lv in top_asks), Decimal(0)
-        )
+        bid_total = sum((lv.price * lv.qty for lv in top_bids), Decimal(0))
+        ask_total = sum((lv.price * lv.qty for lv in top_asks), Decimal(0))
         if bid_total < required or ask_total < required:
             return (
                 GateResult(
                     passed=False,
                     reject_reason="insufficient_depth",
-                    detail=(
-                        f"bid={bid_total} ask={ask_total} "
-                        f"required={required}"
-                    ),
+                    detail=(f"bid={bid_total} ask={ask_total} " f"required={required}"),
                 ),
                 venue,
             )
@@ -196,17 +190,13 @@ class Gates:
         walk = walk_asks(depth, size_usd)
         slippage_cap = self._config._s.LIVE_SLIPPAGE_BPS_CAP
         if walk.insufficient_liquidity or (
-            walk.slippage_bps is not None
-            and walk.slippage_bps > slippage_cap
+            walk.slippage_bps is not None and walk.slippage_bps > slippage_cap
         ):
             return (
                 GateResult(
                     passed=False,
                     reject_reason="slippage_exceeds_cap",
-                    detail=(
-                        f"slippage_bps={walk.slippage_bps} "
-                        f"cap={slippage_cap}"
-                    ),
+                    detail=(f"slippage_bps={walk.slippage_bps} " f"cap={slippage_cap}"),
                 ),
                 venue,
             )
@@ -231,10 +221,7 @@ class Gates:
                 GateResult(
                     passed=False,
                     reject_reason="exposure_cap",
-                    detail=(
-                        f"sum={sum_open_dec}+{size_usd} "
-                        f"cap={max_exposure}"
-                    ),
+                    detail=(f"sum={sum_open_dec}+{size_usd} " f"cap={max_exposure}"),
                 ),
                 venue,
             )

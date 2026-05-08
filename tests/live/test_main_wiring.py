@@ -18,9 +18,7 @@ def _restore_structlog_after_main_invocation():
     structlog.reset_defaults()
 
 
-async def test_live_mode_live_raises_not_implemented_at_startup(
-    monkeypatch, tmp_path
-):
+async def test_live_mode_live_raises_not_implemented_at_startup(monkeypatch, tmp_path):
     """LIVE_MODE=live with credentials must raise NotImplementedError before
     any real Binance traffic happens."""
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
@@ -73,6 +71,7 @@ async def test_shutdown_drains_pending_live_tasks(tmp_path):
     task.add_done_callback(pt._pending_live_tasks.discard)
 
     from scout.main import _drain_pending_live_tasks
+
     await _drain_pending_live_tasks(pt, timeout_sec=5.0)
 
     assert completed.is_set()
@@ -94,6 +93,7 @@ async def test_drain_timeout_does_not_raise(tmp_path):
     task.add_done_callback(pt._pending_live_tasks.discard)
 
     from scout.main import _drain_pending_live_tasks
+
     # Should return without raising even though the task is still running.
     await _drain_pending_live_tasks(pt, timeout_sec=0.05)
 

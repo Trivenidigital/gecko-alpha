@@ -181,9 +181,7 @@ def _propose_changes(
         new_trail = round(max(current["trail_pct"] - step, _TRAIL_FLOOR_PCT), 1)
         if new_trail != round(current["trail_pct"], 1):
             changes.append(FieldChange("trail_pct", current["trail_pct"], new_trail))
-            reasons.append(
-                f"expired {stats.expired_pct}% > 30 → tighten trail"
-            )
+            reasons.append(f"expired {stats.expired_pct}% > 30 → tighten trail")
 
     return changes, reasons
 
@@ -349,10 +347,7 @@ async def apply_diffs(
 
             summary = "\n".join(
                 f"  {d.signal_type}: "
-                + ", ".join(
-                    f"{c.field} {c.old:.1f}→{c.new:.1f}"
-                    for c in d.changes
-                )
+                + ", ".join(f"{c.field} {c.old:.1f}→{c.new:.1f}" for c in d.changes)
                 + f" [{d.reason}]"
                 for d in actionable
             )
@@ -416,9 +411,7 @@ def _telegram_token_looks_real(settings: Settings) -> bool:
     token = getattr(settings, "TELEGRAM_BOT_TOKEN", None)
     if token is None:
         return False
-    raw = (
-        token.get_secret_value() if hasattr(token, "get_secret_value") else str(token)
-    )
+    raw = token.get_secret_value() if hasattr(token, "get_secret_value") else str(token)
     if not raw or len(raw) < 20:
         return False
     if raw.lower() in _TELEGRAM_PLACEHOLDER_TOKENS:
@@ -448,9 +441,7 @@ def _format_diff(diff: SignalDiff) -> str:
     )
     if not diff.changes:
         return head + "→ no change"
-    body = ", ".join(
-        f"{c.field} {c.old:.1f}→{c.new:.1f}" for c in diff.changes
-    )
+    body = ", ".join(f"{c.field} {c.old:.1f}→{c.new:.1f}" for c in diff.changes)
     return head + f"→ {body} [{diff.reason}]"
 
 
@@ -510,7 +501,11 @@ async def _main_async(args: argparse.Namespace) -> int:
         )
         return 2
 
-    if args.apply and not _telegram_token_looks_real(settings) and not args.force_no_alert:
+    if (
+        args.apply
+        and not _telegram_token_looks_real(settings)
+        and not args.force_no_alert
+    ):
         print(
             "[CALIBRATE] TELEGRAM_BOT_TOKEN is missing/placeholder. "
             "Operator visibility is the load-bearing safety control here. "

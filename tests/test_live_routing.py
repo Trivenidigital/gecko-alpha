@@ -51,8 +51,10 @@ async def test_aggregator_guard_rejects_when_token_already_open(tmp_path):
     s = _settings(LIVE_MAX_OPEN_POSITIONS_PER_TOKEN=1)
     routing = RoutingLayer(db=db, settings=s, adapters={})
     candidates = await routing.get_candidates(
-        canonical="BILL", chain_hint="solana",
-        signal_type="chain_completed", size_usd=50.0,
+        canonical="BILL",
+        chain_hint="solana",
+        signal_type="chain_completed",
+        size_usd=50.0,
     )
     assert candidates == []
     await db.close()
@@ -80,12 +82,14 @@ async def test_aggregator_guard_uses_symbol_not_coin_id(tmp_path):
     s = _settings(LIVE_MAX_OPEN_POSITIONS_PER_TOKEN=1)
     routing = RoutingLayer(db=db, settings=s, adapters={})
     candidates = await routing.get_candidates(
-        canonical="BTC", chain_hint=None,
-        signal_type="gainers_early", size_usd=50.0,
+        canonical="BTC",
+        chain_hint=None,
+        signal_type="gainers_early",
+        size_usd=50.0,
     )
-    assert candidates == [], (
-        "guard must fire when symbol matches, regardless of coin_id divergence"
-    )
+    assert (
+        candidates == []
+    ), "guard must fire when symbol matches, regardless of coin_id divergence"
     await db.close()
 
 
@@ -97,8 +101,10 @@ async def test_no_venue_when_listings_empty_and_no_adapters(tmp_path):
     s = _settings()
     routing = RoutingLayer(db=db, settings=s, adapters={})
     candidates = await routing.get_candidates(
-        canonical="UNKNOWN", chain_hint=None,
-        signal_type="first_signal", size_usd=50.0,
+        canonical="UNKNOWN",
+        chain_hint=None,
+        signal_type="first_signal",
+        size_usd=50.0,
     )
     assert candidates == []
     await db.close()
@@ -128,8 +134,10 @@ async def test_seeded_listings_produce_candidates(tmp_path):
     s = _settings()
     routing = RoutingLayer(db=db, settings=s, adapters={})
     candidates = await routing.get_candidates(
-        canonical="BTC", chain_hint=None,
-        signal_type="first_signal", size_usd=50.0,
+        canonical="BTC",
+        chain_hint=None,
+        signal_type="first_signal",
+        size_usd=50.0,
     )
     assert len(candidates) == 1
     c = candidates[0]
@@ -164,8 +172,10 @@ async def test_unhealthy_venues_excluded(tmp_path):
     s = _settings()
     routing = RoutingLayer(db=db, settings=s, adapters={})
     candidates = await routing.get_candidates(
-        canonical="BTC", chain_hint=None,
-        signal_type="first_signal", size_usd=50.0,
+        canonical="BTC",
+        chain_hint=None,
+        signal_type="first_signal",
+        size_usd=50.0,
     )
     assert candidates == []
     await db.close()
@@ -203,8 +213,10 @@ async def test_override_prepend_keeps_other_candidates_as_fallback(tmp_path):
     s = _settings(LIVE_OVERRIDE_REPLACE_ONLY=False)
     routing = RoutingLayer(db=db, settings=s, adapters={})
     candidates = await routing.get_candidates(
-        canonical="BTC", chain_hint=None,
-        signal_type="first_signal", size_usd=50.0,
+        canonical="BTC",
+        chain_hint=None,
+        signal_type="first_signal",
+        size_usd=50.0,
     )
     venues = [c.venue for c in candidates]
     assert venues[0] == "kraken", f"override should be first; got {venues}"
@@ -243,8 +255,10 @@ async def test_override_replace_drops_other_candidates(tmp_path):
     s = _settings(LIVE_OVERRIDE_REPLACE_ONLY=True)
     routing = RoutingLayer(db=db, settings=s, adapters={})
     candidates = await routing.get_candidates(
-        canonical="BTC", chain_hint=None,
-        signal_type="first_signal", size_usd=50.0,
+        canonical="BTC",
+        chain_hint=None,
+        signal_type="first_signal",
+        size_usd=50.0,
     )
     venues = [c.venue for c in candidates]
     assert venues == ["kraken"]

@@ -177,9 +177,7 @@ async def _run_feedback_schedulers(
             from scout.trading.auto_suspend import maybe_suspend_signals
 
             async with aiohttp.ClientSession() as session:
-                suspended = await maybe_suspend_signals(
-                    db, settings, session=session
-                )
+                suspended = await maybe_suspend_signals(db, settings, session=session)
             if suspended:
                 logger.info("auto_suspend_pass", count=len(suspended))
             _last_suspension_date = today_iso
@@ -216,8 +214,10 @@ async def _run_feedback_schedulers(
                 format_dryrun_telegram_message,
                 telegram_token_looks_real,
             )
+
             diffs = await build_diffs(
-                db, settings,
+                db,
+                settings,
                 window_days=settings.CALIBRATION_WINDOW_DAYS,
                 min_trades=settings.CALIBRATION_MIN_TRADES,
                 step=settings.CALIBRATION_STEP_SIZE_PCT,
@@ -226,7 +226,8 @@ async def _run_feedback_schedulers(
             )
             actionable = sum(1 for d in diffs if d.changes)
             msg = format_dryrun_telegram_message(
-                diffs, actionable,
+                diffs,
+                actionable,
                 window_days=settings.CALIBRATION_WINDOW_DAYS,
             )
             # adv-S2 / silent-failure-C1: pass parse_mode=None — message body

@@ -30,9 +30,7 @@ class RateLimitAccountantStub(VenueService):
     # M1 conservative default; do NOT raise this without a real accountant.
     HEADROOM_PCT = 50.0
 
-    async def run_once(
-        self, *, adapter: Any, db: Database, venue: str
-    ) -> None:
+    async def run_once(self, *, adapter: Any, db: Database, venue: str) -> None:
         if db._conn is None:
             return
         now_iso = datetime.now(timezone.utc).isoformat()

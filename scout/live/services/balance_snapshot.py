@@ -27,9 +27,7 @@ class BalanceSnapshot(VenueService):
     # (BTC, ETH, etc.) for total-portfolio accounting.
     assets: tuple[str, ...] = ("USDT",)
 
-    async def run_once(
-        self, *, adapter: Any, db: Database, venue: str
-    ) -> None:
+    async def run_once(self, *, adapter: Any, db: Database, venue: str) -> None:
         if db._conn is None:
             return
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -52,7 +50,5 @@ class BalanceSnapshot(VenueService):
                 )
                 return  # Don't keep iterating if the adapter isn't wired
             except Exception:
-                log.exception(
-                    "balance_snapshot_failed", venue=venue, asset=asset
-                )
+                log.exception("balance_snapshot_failed", venue=venue, asset=asset)
         await db._conn.commit()

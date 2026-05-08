@@ -9,8 +9,8 @@ from `predictor`).
 Original location of these symbols remains importable from
 `scout.trading.signals` for back-compat with existing callers (T5 pin).
 """
-from __future__ import annotations
 
+from __future__ import annotations
 
 # coin_id substrings that identify wrapped/bridged assets. These pump rarely
 # (price tracks the underlying) and consume paper-trade slots.

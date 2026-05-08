@@ -17,7 +17,6 @@ from scout.trading.calibrate import (
 )
 from scout.trading.params import clear_cache_for_tests
 
-
 _seq_counter = [0]
 
 
@@ -46,9 +45,9 @@ async def _insert_closed_trade(
     opened_at = (
         datetime.now(timezone.utc) - timedelta(hours=2, seconds=seq)
     ).isoformat()
-    closed_at = closed_at or (
-        datetime.now(timezone.utc) - timedelta(seconds=seq)
-    ).isoformat()
+    closed_at = (
+        closed_at or (datetime.now(timezone.utc) - timedelta(seconds=seq)).isoformat()
+    )
     await db._conn.execute(
         """INSERT INTO paper_trades
            (token_id, symbol, name, chain, signal_type, signal_data,
@@ -89,9 +88,12 @@ async def _insert_closed_trade(
 
 def test_propose_changes_widens_sl_when_low_winrate_and_deep_avg_loss():
     stats = SignalStats(
-        signal_type="x", n_trades=60,
-        win_rate_pct=30.0, expired_pct=10.0,
-        avg_loss_pct=-25.0, avg_winner_peak_pct=22.0,
+        signal_type="x",
+        n_trades=60,
+        win_rate_pct=30.0,
+        expired_pct=10.0,
+        avg_loss_pct=-25.0,
+        avg_winner_peak_pct=22.0,
     )
     current = {"trail_pct": 20.0, "sl_pct": 15.0}
     changes, reasons = _propose_changes(stats, current, step=2.0)
@@ -103,9 +105,12 @@ def test_propose_changes_widens_sl_when_low_winrate_and_deep_avg_loss():
 
 def test_propose_changes_tightens_trail_when_too_many_expirations():
     stats = SignalStats(
-        signal_type="x", n_trades=60,
-        win_rate_pct=55.0, expired_pct=42.0,
-        avg_loss_pct=-12.0, avg_winner_peak_pct=22.0,
+        signal_type="x",
+        n_trades=60,
+        win_rate_pct=55.0,
+        expired_pct=42.0,
+        avg_loss_pct=-12.0,
+        avg_winner_peak_pct=22.0,
     )
     current = {"trail_pct": 20.0, "sl_pct": 15.0}
     changes, _ = _propose_changes(stats, current, step=2.0)
@@ -115,9 +120,12 @@ def test_propose_changes_tightens_trail_when_too_many_expirations():
 
 def test_propose_changes_no_action_within_thresholds():
     stats = SignalStats(
-        signal_type="x", n_trades=60,
-        win_rate_pct=55.0, expired_pct=15.0,
-        avg_loss_pct=-12.0, avg_winner_peak_pct=22.0,
+        signal_type="x",
+        n_trades=60,
+        win_rate_pct=55.0,
+        expired_pct=15.0,
+        avg_loss_pct=-12.0,
+        avg_winner_peak_pct=22.0,
     )
     current = {"trail_pct": 20.0, "sl_pct": 15.0}
     changes, _ = _propose_changes(stats, current, step=2.0)
@@ -127,9 +135,12 @@ def test_propose_changes_no_action_within_thresholds():
 def test_propose_changes_skips_sl_rule_when_no_losers():
     """avg_loss_pct=None → SL rule must skip silently, not crash."""
     stats = SignalStats(
-        signal_type="x", n_trades=60,
-        win_rate_pct=30.0, expired_pct=10.0,
-        avg_loss_pct=None, avg_winner_peak_pct=22.0,
+        signal_type="x",
+        n_trades=60,
+        win_rate_pct=30.0,
+        expired_pct=10.0,
+        avg_loss_pct=None,
+        avg_winner_peak_pct=22.0,
     )
     current = {"trail_pct": 20.0, "sl_pct": 15.0}
     changes, _ = _propose_changes(stats, current, step=2.0)
@@ -139,9 +150,12 @@ def test_propose_changes_skips_sl_rule_when_no_losers():
 def test_propose_changes_respects_floor_ceiling():
     """sl_pct already at ceiling → no further widening."""
     stats = SignalStats(
-        signal_type="x", n_trades=60,
-        win_rate_pct=20.0, expired_pct=50.0,
-        avg_loss_pct=-30.0, avg_winner_peak_pct=10.0,
+        signal_type="x",
+        n_trades=60,
+        win_rate_pct=20.0,
+        expired_pct=50.0,
+        avg_loss_pct=-30.0,
+        avg_winner_peak_pct=10.0,
     )
     current = {"trail_pct": 5.0, "sl_pct": 30.0}  # both already at bounds
     changes, _ = _propose_changes(stats, current, step=2.0)
@@ -151,9 +165,12 @@ def test_propose_changes_respects_floor_ceiling():
 def test_propose_changes_strict_at_30_percent_expired():
     """expired_pct == 30.0 must NOT trigger (rule is strict >)."""
     stats = SignalStats(
-        signal_type="x", n_trades=60,
-        win_rate_pct=55.0, expired_pct=30.0,
-        avg_loss_pct=-12.0, avg_winner_peak_pct=22.0,
+        signal_type="x",
+        n_trades=60,
+        win_rate_pct=55.0,
+        expired_pct=30.0,
+        avg_loss_pct=-12.0,
+        avg_winner_peak_pct=22.0,
     )
     current = {"trail_pct": 20.0, "sl_pct": 15.0}
     changes, _ = _propose_changes(stats, current, step=2.0)
@@ -172,7 +189,9 @@ def test_telegram_token_health_check_rejects_placeholder(settings_factory):
 
 def test_telegram_token_health_check_accepts_real_looking(settings_factory):
     # 40+ chars roughly mimics real bot token shape
-    s = settings_factory(TELEGRAM_BOT_TOKEN="123456:ABCDEFghijklmnopqrstuvwxyz0123456789")
+    s = settings_factory(
+        TELEGRAM_BOT_TOKEN="123456:ABCDEFghijklmnopqrstuvwxyz0123456789"
+    )
     assert _telegram_token_looks_real(s) is True
 
 
@@ -187,8 +206,12 @@ async def test_build_diffs_skips_signals_below_min_trades(tmp_path, settings_fac
     # 3 trades only — below default MIN
     for _ in range(3):
         await _insert_closed_trade(
-            db, signal_type="gainers_early",
-            pnl_usd=-10, pnl_pct=-25, peak_pct=5, status="closed_sl",
+            db,
+            signal_type="gainers_early",
+            pnl_usd=-10,
+            pnl_pct=-25,
+            peak_pct=5,
+            status="closed_sl",
         )
     await db._conn.commit()
 
@@ -206,8 +229,12 @@ async def test_build_diffs_excludes_narrative_prediction(tmp_path, settings_fact
     await db.initialize()
     for _ in range(60):
         await _insert_closed_trade(
-            db, signal_type="narrative_prediction",
-            pnl_usd=-50, pnl_pct=-25, peak_pct=5, status="closed_sl",
+            db,
+            signal_type="narrative_prediction",
+            pnl_usd=-50,
+            pnl_pct=-25,
+            peak_pct=5,
+            status="closed_sl",
         )
     await db._conn.commit()
 
@@ -255,8 +282,11 @@ async def test_apply_writes_signal_params_and_audit_atomically(
     await db.initialize()
     for i in range(60):
         await _insert_closed_trade(
-            db, signal_type="gainers_early",
-            pnl_usd=1.0, pnl_pct=0.5, peak_pct=8.0,
+            db,
+            signal_type="gainers_early",
+            pnl_usd=1.0,
+            pnl_pct=0.5,
+            peak_pct=8.0,
             status="closed_expired" if i < 42 else "closed_trailing_stop",
         )
     await db._conn.commit()
@@ -282,15 +312,16 @@ async def test_apply_writes_signal_params_and_audit_atomically(
     await db.close()
 
 
-async def test_apply_idempotent_zero_changes_on_rerun(
-    tmp_path, settings_factory
-):
+async def test_apply_idempotent_zero_changes_on_rerun(tmp_path, settings_factory):
     db = Database(tmp_path / "t.db")
     await db.initialize()
     for i in range(60):
         await _insert_closed_trade(
-            db, signal_type="gainers_early",
-            pnl_usd=1.0, pnl_pct=0.5, peak_pct=8.0,
+            db,
+            signal_type="gainers_early",
+            pnl_usd=1.0,
+            pnl_pct=0.5,
+            peak_pct=8.0,
             status="closed_expired" if i < 42 else "closed_trailing_stop",
         )
     await db._conn.commit()

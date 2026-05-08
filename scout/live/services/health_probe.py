@@ -24,9 +24,7 @@ class HealthProbe(VenueService):
     name = "health_probe"
     cadence_seconds = 60.0
 
-    async def run_once(
-        self, *, adapter: Any, db: Database, venue: str
-    ) -> None:
+    async def run_once(self, *, adapter: Any, db: Database, venue: str) -> None:
         if db._conn is None:
             return
         now_iso = datetime.now(timezone.utc).isoformat()

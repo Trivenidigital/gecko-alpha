@@ -70,9 +70,7 @@ async def test_evaluator_uses_per_signal_max_duration_when_flag_on(
     )
     await evaluate_paper_trades(db, settings)
 
-    cur = await db._conn.execute(
-        "SELECT status FROM paper_trades WHERE token_id='tok'"
-    )
+    cur = await db._conn.execute("SELECT status FROM paper_trades WHERE token_id='tok'")
     status = (await cur.fetchone())[0]
     # Closed via the per-signal 1h table value; if evaluator was still reading
     # global 48h, status would still be 'open'.
@@ -113,9 +111,7 @@ async def test_evaluator_ignores_table_when_flag_off(tmp_path, settings_factory)
     )
     await evaluate_paper_trades(db, settings)
 
-    cur = await db._conn.execute(
-        "SELECT status FROM paper_trades WHERE token_id='tok'"
-    )
+    cur = await db._conn.execute("SELECT status FROM paper_trades WHERE token_id='tok'")
     assert (await cur.fetchone())[0] == "open"
     await db.close()
 

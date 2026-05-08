@@ -6,6 +6,7 @@ to avoid network I/O. Dispatcher tests gated by @_SKIP_AIOHTTP for
 Windows OpenSSL chain (scout.alerter triggers the same DLL conflict
 that's been an issue across the session).
 """
+
 from __future__ import annotations
 
 import os
@@ -39,6 +40,7 @@ def _reset_calibration_dryrun_sentinel():
         return
     try:
         from scout.main import _clear_calibration_dryrun_date_for_tests
+
         _clear_calibration_dryrun_date_for_tests()
     except ImportError:
         pass  # Module not yet built (TDD red phase)
@@ -72,6 +74,7 @@ def test_calibration_dryrun_enabled_default_true(settings_factory):
 def test_calibration_dryrun_weekday_validator_rejects_out_of_range(settings_factory):
     """T3 — validator: -1, 7, 8 rejected (0-6 only, Mon-Sun)."""
     from pydantic import ValidationError
+
     for bad in (-1, 7, 8):
         with pytest.raises(ValidationError):
             settings_factory(CALIBRATION_DRY_RUN_WEEKDAY=bad)
@@ -80,6 +83,7 @@ def test_calibration_dryrun_weekday_validator_rejects_out_of_range(settings_fact
 def test_calibration_dryrun_hour_validator_rejects_out_of_range(settings_factory):
     """T4 — validator: -1, 24, 25 rejected (0-23 only)."""
     from pydantic import ValidationError
+
     for bad in (-1, 24, 25):
         with pytest.raises(ValidationError):
             settings_factory(CALIBRATION_DRY_RUN_HOUR=bad)
@@ -186,12 +190,8 @@ async def test_calibration_dryrun_scheduler_happy_path_fires_alert(
     async def _fake_send(msg, session, settings):
         sent_messages.append(msg)
 
-    monkeypatch.setattr(
-        "scout.trading.calibrate.build_diffs", _fake_build_diffs
-    )
-    monkeypatch.setattr(
-        "scout.alerter.send_telegram_message", _fake_send
-    )
+    monkeypatch.setattr("scout.trading.calibrate.build_diffs", _fake_build_diffs)
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
     # Force token-looks-real → True (no placeholder gate)
     monkeypatch.setattr(
         "scout.trading.calibrate.telegram_token_looks_real",
@@ -209,13 +209,15 @@ async def test_calibration_dryrun_scheduler_happy_path_fires_alert(
 
     with capture_logs() as logs:
         await scout_main._run_feedback_schedulers(
-            db=None, settings=settings,
-            last_refresh_date="", last_digest_date="",
+            db=None,
+            settings=settings,
+            last_refresh_date="",
+            last_digest_date="",
             now_local=now_local,
         )
-    assert len(sent_messages) == 1, (
-        f"expected 1 send_telegram_message call; got {len(sent_messages)}"
-    )
+    assert (
+        len(sent_messages) == 1
+    ), f"expected 1 send_telegram_message call; got {len(sent_messages)}"
     assert "Weekly calibration dry-run" in sent_messages[0]
     events = [e.get("event") for e in logs]
     assert "calibration_dryrun_pass" in events
@@ -264,12 +266,8 @@ async def test_calibration_dryrun_passes_parse_mode_none_to_telegram(
     async def _fake_build_diffs(*a, **kw):
         return [actionable_diff]
 
-    monkeypatch.setattr(
-        "scout.trading.calibrate.build_diffs", _fake_build_diffs
-    )
-    monkeypatch.setattr(
-        "scout.alerter.send_telegram_message", _capture_send
-    )
+    monkeypatch.setattr("scout.trading.calibrate.build_diffs", _fake_build_diffs)
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _capture_send)
     monkeypatch.setattr(
         "scout.trading.calibrate.telegram_token_looks_real",
         lambda s: True,
@@ -282,8 +280,10 @@ async def test_calibration_dryrun_passes_parse_mode_none_to_telegram(
     )
     now_local = datetime(2026, 5, 6, 14, 30)
     await scout_main._run_feedback_schedulers(
-        db=None, settings=settings,
-        last_refresh_date="", last_digest_date="",
+        db=None,
+        settings=settings,
+        last_refresh_date="",
+        last_digest_date="",
         now_local=now_local,
     )
     assert len(captured_kwargs) == 1
@@ -301,26 +301,21 @@ async def test_calibration_dryrun_passes_parse_mode_none_to_telegram(
 
 @_SKIP_AIOHTTP
 @pytest.mark.asyncio
-async def test_calibration_dryrun_scheduler_idempotency(
-    monkeypatch, settings_factory
-):
+async def test_calibration_dryrun_scheduler_idempotency(monkeypatch, settings_factory):
     """T6 — second call same day → no second alert (sentinel)."""
     from scout import main as scout_main
     from scout.trading.calibrate import SignalDiff
 
     sent_messages = []
+
     async def _fake_send(msg, session, settings):
         sent_messages.append(msg)
 
     async def _fake_build_diffs(*a, **kw):
         return []  # empty is fine for sentinel test
 
-    monkeypatch.setattr(
-        "scout.trading.calibrate.build_diffs", _fake_build_diffs
-    )
-    monkeypatch.setattr(
-        "scout.alerter.send_telegram_message", _fake_send
-    )
+    monkeypatch.setattr("scout.trading.calibrate.build_diffs", _fake_build_diffs)
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
     monkeypatch.setattr(
         "scout.trading.calibrate.telegram_token_looks_real",
         lambda s: True,
@@ -335,15 +330,19 @@ async def test_calibration_dryrun_scheduler_idempotency(
 
     # First call — fires
     await scout_main._run_feedback_schedulers(
-        db=None, settings=settings,
-        last_refresh_date="", last_digest_date="",
+        db=None,
+        settings=settings,
+        last_refresh_date="",
+        last_digest_date="",
         now_local=now_local,
     )
     assert len(sent_messages) == 1
     # Second call same day — sentinel blocks
     await scout_main._run_feedback_schedulers(
-        db=None, settings=settings,
-        last_refresh_date="", last_digest_date="",
+        db=None,
+        settings=settings,
+        last_refresh_date="",
+        last_digest_date="",
         now_local=now_local,
     )
     assert len(sent_messages) == 1, "duplicate alert fired same day"
@@ -367,18 +366,15 @@ async def test_calibration_dryrun_scheduler_skips_telegram_on_placeholder_token(
     from scout.trading.calibrate import SignalDiff
 
     sent_messages = []
+
     async def _fake_send(msg, session, settings):
         sent_messages.append(msg)
 
     async def _fake_build_diffs(*a, **kw):
         return []
 
-    monkeypatch.setattr(
-        "scout.trading.calibrate.build_diffs", _fake_build_diffs
-    )
-    monkeypatch.setattr(
-        "scout.alerter.send_telegram_message", _fake_send
-    )
+    monkeypatch.setattr("scout.trading.calibrate.build_diffs", _fake_build_diffs)
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
     monkeypatch.setattr(
         "scout.trading.calibrate.telegram_token_looks_real",
         lambda s: False,  # placeholder
@@ -393,8 +389,10 @@ async def test_calibration_dryrun_scheduler_skips_telegram_on_placeholder_token(
 
     with capture_logs() as logs:
         await scout_main._run_feedback_schedulers(
-            db=None, settings=settings,
-            last_refresh_date="", last_digest_date="",
+            db=None,
+            settings=settings,
+            last_refresh_date="",
+            last_digest_date="",
             now_local=now_local,
         )
     assert sent_messages == [], "placeholder-token: send must NOT fire"
@@ -422,9 +420,7 @@ async def test_calibration_dryrun_scheduler_catches_build_diffs_error(
     async def _broken_build_diffs(*a, **kw):
         raise RuntimeError("simulated DB lost")
 
-    monkeypatch.setattr(
-        "scout.trading.calibrate.build_diffs", _broken_build_diffs
-    )
+    monkeypatch.setattr("scout.trading.calibrate.build_diffs", _broken_build_diffs)
 
     settings = settings_factory(
         CALIBRATION_DRY_RUN_ENABLED=True,
@@ -436,8 +432,10 @@ async def test_calibration_dryrun_scheduler_catches_build_diffs_error(
     with capture_logs() as logs:
         # MUST NOT raise
         await scout_main._run_feedback_schedulers(
-            db=None, settings=settings,
-            last_refresh_date="", last_digest_date="",
+            db=None,
+            settings=settings,
+            last_refresh_date="",
+            last_digest_date="",
             now_local=now_local,
         )
     events = [e.get("event") for e in logs]
@@ -461,6 +459,7 @@ async def test_calibration_dryrun_scheduler_disabled_when_killswitch_off(
     from scout import main as scout_main
 
     sent_messages = []
+
     async def _fake_send(msg, session, settings):
         sent_messages.append(msg)
 
@@ -470,12 +469,8 @@ async def test_calibration_dryrun_scheduler_disabled_when_killswitch_off(
             "build_diffs called despite CALIBRATION_DRY_RUN_ENABLED=False"
         )
 
-    monkeypatch.setattr(
-        "scout.trading.calibrate.build_diffs", _fake_build_diffs
-    )
-    monkeypatch.setattr(
-        "scout.alerter.send_telegram_message", _fake_send
-    )
+    monkeypatch.setattr("scout.trading.calibrate.build_diffs", _fake_build_diffs)
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
 
     settings = settings_factory(
         CALIBRATION_DRY_RUN_ENABLED=False,  # kill-switch
@@ -486,8 +481,10 @@ async def test_calibration_dryrun_scheduler_disabled_when_killswitch_off(
 
     with capture_logs() as logs:
         await scout_main._run_feedback_schedulers(
-            db=None, settings=settings,
-            last_refresh_date="", last_digest_date="",
+            db=None,
+            settings=settings,
+            last_refresh_date="",
+            last_digest_date="",
             now_local=now_local,
         )
     assert sent_messages == []

@@ -1,4 +1,5 @@
 """Task 19: PaperTrader optional LiveEngine chokepoint."""
+
 import asyncio
 from unittest.mock import AsyncMock
 

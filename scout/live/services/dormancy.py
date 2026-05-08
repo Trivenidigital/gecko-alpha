@@ -24,14 +24,11 @@ class DormancyJob(VenueService):
 
     DORMANCY_LOOKBACK_DAYS = 30
 
-    async def run_once(
-        self, *, adapter: Any, db: Database, venue: str
-    ) -> None:
+    async def run_once(self, *, adapter: Any, db: Database, venue: str) -> None:
         if db._conn is None:
             return
         cutoff = (
-            datetime.now(timezone.utc)
-            - timedelta(days=self.DORMANCY_LOOKBACK_DAYS)
+            datetime.now(timezone.utc) - timedelta(days=self.DORMANCY_LOOKBACK_DAYS)
         ).isoformat()
         cur = await db._conn.execute(
             """SELECT COUNT(*) FROM live_trades

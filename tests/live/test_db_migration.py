@@ -9,16 +9,12 @@ from scout.db import Database
 
 
 async def _tables(conn) -> set[str]:
-    cur = await conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    )
+    cur = await conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     return {row[0] for row in await cur.fetchall()}
 
 
 async def _indexes(conn) -> set[str]:
-    cur = await conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='index'"
-    )
+    cur = await conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
     return {row[0] for row in await cur.fetchall()}
 
 
@@ -51,9 +47,7 @@ async def test_migration_creates_bl055_indexes(tmp_path):
 async def test_live_control_has_singleton_row(tmp_path):
     db = Database(tmp_path / "gecko.db")
     await db.initialize()
-    cur = await db._conn.execute(
-        "SELECT id, active_kill_event_id FROM live_control"
-    )
+    cur = await db._conn.execute("SELECT id, active_kill_event_id FROM live_control")
     rows = await cur.fetchall()
     assert len(rows) == 1
     assert rows[0][0] == 1
@@ -100,7 +94,9 @@ async def test_paper_trades_fk_restrict(tmp_path):
         "VALUES ('c','S','N','eth','first_signal','{}',1,100,100,40,20,1.4,0.8,"
         "'open','2026-04-23T00:00:00Z')"
     )
-    paper_id = (await (await db._conn.execute("SELECT last_insert_rowid()")).fetchone())[0]
+    paper_id = (
+        await (await db._conn.execute("SELECT last_insert_rowid()")).fetchone()
+    )[0]
     await db._conn.execute(
         "INSERT INTO shadow_trades "
         "(paper_trade_id, coin_id, symbol, venue, pair, signal_type, size_usd, "
@@ -111,9 +107,7 @@ async def test_paper_trades_fk_restrict(tmp_path):
     )
     await db._conn.commit()
     with pytest.raises(aiosqlite.IntegrityError):
-        await db._conn.execute(
-            "DELETE FROM paper_trades WHERE id = ?", (paper_id,)
-        )
+        await db._conn.execute("DELETE FROM paper_trades WHERE id = ?", (paper_id,))
         await db._conn.commit()
     await db.close()
 
@@ -173,14 +167,17 @@ async def test_initialize_upgrades_pre_bl055_db(tmp_path):
     # 3. All 7 new tables exist.
     tables = await _tables(db._conn)
     assert {
-        "shadow_trades", "live_trades", "kill_events", "live_control",
-        "venue_overrides", "resolver_cache", "live_metrics_daily",
+        "shadow_trades",
+        "live_trades",
+        "kill_events",
+        "live_control",
+        "venue_overrides",
+        "resolver_cache",
+        "live_metrics_daily",
     } <= tables
 
     # 4. live_control seed row exists with id=1.
-    cur = await db._conn.execute(
-        "SELECT id, active_kill_event_id FROM live_control"
-    )
+    cur = await db._conn.execute("SELECT id, active_kill_event_id FROM live_control")
     rows = await cur.fetchall()
     assert len(rows) == 1 and rows[0][0] == 1 and rows[0][1] is None
 

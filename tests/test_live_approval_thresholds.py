@@ -28,8 +28,11 @@ async def test_new_venue_gate_fires_below_threshold(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
     require, gate = await should_require_approval(
-        db=db, settings=_settings(), signal_type="first_signal",
-        venue="binance", size_usd=50.0,
+        db=db,
+        settings=_settings(),
+        signal_type="first_signal",
+        venue="binance",
+        size_usd=50.0,
     )
     assert require is True
     assert gate == "new_venue_gate"
@@ -45,13 +48,20 @@ async def test_new_venue_gate_clears_at_threshold(tmp_path):
         """INSERT INTO signal_venue_correction_count
            (signal_type, venue, consecutive_no_correction, last_updated_at)
            VALUES (?, ?, ?, ?)""",
-        ("first_signal", "binance", NEW_VENUE_FILL_THRESHOLD,
-         "2026-05-08T00:00:00+00:00"),
+        (
+            "first_signal",
+            "binance",
+            NEW_VENUE_FILL_THRESHOLD,
+            "2026-05-08T00:00:00+00:00",
+        ),
     )
     await db._conn.commit()
     require, gate = await should_require_approval(
-        db=db, settings=_settings(), signal_type="first_signal",
-        venue="binance", size_usd=50.0,
+        db=db,
+        settings=_settings(),
+        signal_type="first_signal",
+        venue="binance",
+        size_usd=50.0,
     )
     assert require is False, f"expected clear; got gate={gate}"
     assert gate is None
@@ -94,8 +104,11 @@ async def test_trade_size_gate_fires_above_2x_median(tmp_path):
     )
     await db._conn.commit()
     require, gate = await should_require_approval(
-        db=db, settings=_settings(), signal_type="first_signal",
-        venue="binance", size_usd=150.0,
+        db=db,
+        settings=_settings(),
+        signal_type="first_signal",
+        venue="binance",
+        size_usd=150.0,
     )
     assert require is True
     assert gate == "trade_size_gate"
@@ -107,11 +120,9 @@ async def test_venue_health_gate_fires_when_auth_failed(tmp_path):
     """auth_ok=0 in past 24h → health gate fires."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    await db._conn.execute(
-        """INSERT INTO signal_venue_correction_count
+    await db._conn.execute("""INSERT INTO signal_venue_correction_count
            (signal_type, venue, consecutive_no_correction, last_updated_at)
-           VALUES ('first_signal', 'binance', 30, '2026-05-08T00:00:00+00:00')"""
-    )
+           VALUES ('first_signal', 'binance', 30, '2026-05-08T00:00:00+00:00')""")
     now_iso = datetime.now(timezone.utc).isoformat()
     await db._conn.execute(
         """INSERT INTO venue_health
@@ -122,8 +133,11 @@ async def test_venue_health_gate_fires_when_auth_failed(tmp_path):
     )
     await db._conn.commit()
     require, gate = await should_require_approval(
-        db=db, settings=_settings(), signal_type="first_signal",
-        venue="binance", size_usd=50.0,
+        db=db,
+        settings=_settings(),
+        signal_type="first_signal",
+        venue="binance",
+        size_usd=50.0,
     )
     assert require is True
     assert gate == "venue_health_gate"
@@ -135,11 +149,9 @@ async def test_venue_health_gate_fires_when_rate_limit_caution(tmp_path):
     """rate_limit_headroom_pct = 20 (< 30) → health gate fires."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    await db._conn.execute(
-        """INSERT INTO signal_venue_correction_count
+    await db._conn.execute("""INSERT INTO signal_venue_correction_count
            (signal_type, venue, consecutive_no_correction, last_updated_at)
-           VALUES ('first_signal', 'binance', 30, '2026-05-08T00:00:00+00:00')"""
-    )
+           VALUES ('first_signal', 'binance', 30, '2026-05-08T00:00:00+00:00')""")
     now_iso = datetime.now(timezone.utc).isoformat()
     await db._conn.execute(
         """INSERT INTO venue_health
@@ -150,8 +162,11 @@ async def test_venue_health_gate_fires_when_rate_limit_caution(tmp_path):
     )
     await db._conn.commit()
     require, gate = await should_require_approval(
-        db=db, settings=_settings(), signal_type="first_signal",
-        venue="binance", size_usd=50.0,
+        db=db,
+        settings=_settings(),
+        signal_type="first_signal",
+        venue="binance",
+        size_usd=50.0,
     )
     assert require is True
     assert gate == "venue_health_gate"
@@ -163,11 +178,9 @@ async def test_operator_flag_gate_fires_when_approval_required_set(tmp_path):
     """Operator-set approval_required override → operator_flag gate fires."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    await db._conn.execute(
-        """INSERT INTO signal_venue_correction_count
+    await db._conn.execute("""INSERT INTO signal_venue_correction_count
            (signal_type, venue, consecutive_no_correction, last_updated_at)
-           VALUES ('first_signal', 'binance', 30, '2026-05-08T00:00:00+00:00')"""
-    )
+           VALUES ('first_signal', 'binance', 30, '2026-05-08T00:00:00+00:00')""")
     expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
     now_iso = datetime.now(timezone.utc).isoformat()
     await db._conn.execute(
@@ -178,8 +191,11 @@ async def test_operator_flag_gate_fires_when_approval_required_set(tmp_path):
     )
     await db._conn.commit()
     require, gate = await should_require_approval(
-        db=db, settings=_settings(), signal_type="first_signal",
-        venue="binance", size_usd=50.0,
+        db=db,
+        settings=_settings(),
+        signal_type="first_signal",
+        venue="binance",
+        size_usd=50.0,
     )
     assert require is True
     assert gate == "operator_flag"
@@ -191,11 +207,9 @@ async def test_all_gates_clear_returns_false_none(tmp_path):
     """No gate fires → returns (False, None) — autonomous execution."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    await db._conn.execute(
-        """INSERT INTO signal_venue_correction_count
+    await db._conn.execute("""INSERT INTO signal_venue_correction_count
            (signal_type, venue, consecutive_no_correction, last_updated_at)
-           VALUES ('first_signal', 'binance', 30, '2026-05-08T00:00:00+00:00')"""
-    )
+           VALUES ('first_signal', 'binance', 30, '2026-05-08T00:00:00+00:00')""")
     # Healthy probe in past 24h
     now_iso = datetime.now(timezone.utc).isoformat()
     await db._conn.execute(
@@ -207,8 +221,11 @@ async def test_all_gates_clear_returns_false_none(tmp_path):
     )
     await db._conn.commit()
     require, gate = await should_require_approval(
-        db=db, settings=_settings(), signal_type="first_signal",
-        venue="binance", size_usd=50.0,
+        db=db,
+        settings=_settings(),
+        signal_type="first_signal",
+        venue="binance",
+        size_usd=50.0,
     )
     assert require is False
     assert gate is None

@@ -1066,6 +1066,7 @@ class _FakeEngine:
 
 def _bl062_make_candidate(contract_address="tok-a"):
     from scout.models import CandidateToken
+
     return CandidateToken(
         contract_address=contract_address,
         ticker="TOK",

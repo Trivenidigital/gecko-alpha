@@ -35,16 +35,13 @@ def canonical_from_ccxt_market(symbol: str) -> str:
     return base.split(":", 1)[0]
 
 
-async def lookup_canonical(
-    db: Database, venue: str, venue_pair: str
-) -> str | None:
+async def lookup_canonical(db: Database, venue: str, venue_pair: str) -> str | None:
     """Reverse lookup: given a venue + venue_pair, return canonical
     ticker via symbol_aliases. Returns None if no alias recorded."""
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
     cur = await db._conn.execute(
-        "SELECT canonical FROM symbol_aliases "
-        "WHERE venue = ? AND venue_symbol = ?",
+        "SELECT canonical FROM symbol_aliases " "WHERE venue = ? AND venue_symbol = ?",
         (venue, venue_pair),
     )
     row = await cur.fetchone()

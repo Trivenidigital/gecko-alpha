@@ -14,7 +14,8 @@ from scout.live.resolver import VenueResolver, OverrideStore
 async def test_single_flight_one_miss_one_binance_call(tmp_path):
     """Spec §7.1: N=10 concurrent resolve('WBTC') during cache miss must issue
     ONE Binance exchangeInfo call. Thundering-herd protection."""
-    db = Database(tmp_path / "t.db"); await db.initialize()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
     adapter = AsyncMock()
     adapter.resolve_pair_for_symbol = AsyncMock(return_value="WBTCUSDT")
     resolver = VenueResolver(
@@ -31,12 +32,15 @@ async def test_single_flight_one_miss_one_binance_call(tmp_path):
 
 
 async def test_resolver_cache_hit_skips_binance(tmp_path):
-    db = Database(tmp_path / "t.db"); await db.initialize()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
     adapter = AsyncMock()
     adapter.resolve_pair_for_symbol = AsyncMock(return_value="WBTCUSDT")
     resolver = VenueResolver(
-        binance_adapter=adapter, override_store=OverrideStore(db),
-        positive_ttl=timedelta(hours=1), negative_ttl=timedelta(seconds=60),
+        binance_adapter=adapter,
+        override_store=OverrideStore(db),
+        positive_ttl=timedelta(hours=1),
+        negative_ttl=timedelta(seconds=60),
         db=db,
     )
     await resolver.resolve("WBTC")
@@ -46,7 +50,8 @@ async def test_resolver_cache_hit_skips_binance(tmp_path):
 
 
 async def test_override_row_overrides_exchange_info(tmp_path):
-    db = Database(tmp_path / "t.db"); await db.initialize()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
     await db._conn.execute(
         "INSERT INTO venue_overrides (symbol, venue, pair, note, disabled, "
         "created_at, updated_at) "
@@ -56,8 +61,10 @@ async def test_override_row_overrides_exchange_info(tmp_path):
     adapter = AsyncMock()
     adapter.resolve_pair_for_symbol = AsyncMock(return_value="ZZZUSDT")
     resolver = VenueResolver(
-        binance_adapter=adapter, override_store=OverrideStore(db),
-        positive_ttl=timedelta(hours=1), negative_ttl=timedelta(seconds=60),
+        binance_adapter=adapter,
+        override_store=OverrideStore(db),
+        positive_ttl=timedelta(hours=1),
+        negative_ttl=timedelta(seconds=60),
         db=db,
     )
     r = await resolver.resolve("WBTC")
@@ -67,7 +74,8 @@ async def test_override_row_overrides_exchange_info(tmp_path):
 
 
 async def test_override_disabled_returns_none_with_disabled_flag(tmp_path):
-    db = Database(tmp_path / "t.db"); await db.initialize()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
     await db._conn.execute(
         "INSERT INTO venue_overrides (symbol, venue, pair, disabled, "
         "created_at, updated_at) "
@@ -75,8 +83,10 @@ async def test_override_disabled_returns_none_with_disabled_flag(tmp_path):
     )
     await db._conn.commit()
     resolver = VenueResolver(
-        binance_adapter=AsyncMock(), override_store=OverrideStore(db),
-        positive_ttl=timedelta(hours=1), negative_ttl=timedelta(seconds=60),
+        binance_adapter=AsyncMock(),
+        override_store=OverrideStore(db),
+        positive_ttl=timedelta(hours=1),
+        negative_ttl=timedelta(seconds=60),
         db=db,
     )
     r = await resolver.resolve("WBTC")
@@ -86,12 +96,15 @@ async def test_override_disabled_returns_none_with_disabled_flag(tmp_path):
 
 
 async def test_negative_cache_ttl_expires_at_60s(tmp_path):
-    db = Database(tmp_path / "t.db"); await db.initialize()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
     adapter = AsyncMock()
     adapter.resolve_pair_for_symbol = AsyncMock(return_value=None)
     resolver = VenueResolver(
-        binance_adapter=adapter, override_store=OverrideStore(db),
-        positive_ttl=timedelta(hours=1), negative_ttl=timedelta(seconds=60),
+        binance_adapter=adapter,
+        override_store=OverrideStore(db),
+        positive_ttl=timedelta(hours=1),
+        negative_ttl=timedelta(seconds=60),
         db=db,
     )
     with freeze_time("2026-04-23 00:00:00") as frozen:
@@ -109,22 +122,23 @@ async def test_locks_dict_is_bounded_after_resolutions(tmp_path):
     After N symbols resolve and no task is waiting on them, _locks should
     be empty (locks get evicted in the finally block once lock.locked()
     is False)."""
-    db = Database(tmp_path / "t.db"); await db.initialize()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
     adapter = AsyncMock()
-    adapter.resolve_pair_for_symbol = AsyncMock(
-        side_effect=lambda sym: f"{sym}USDT"
-    )
+    adapter.resolve_pair_for_symbol = AsyncMock(side_effect=lambda sym: f"{sym}USDT")
     resolver = VenueResolver(
-        binance_adapter=adapter, override_store=OverrideStore(db),
-        positive_ttl=timedelta(hours=1), negative_ttl=timedelta(seconds=60),
+        binance_adapter=adapter,
+        override_store=OverrideStore(db),
+        positive_ttl=timedelta(hours=1),
+        negative_ttl=timedelta(seconds=60),
         db=db,
     )
     # Sequential resolutions — each frees its lock on exit.
     for sym in ["AAA", "BBB", "CCC", "DDD", "EEE"]:
         await resolver.resolve(sym)
-    assert resolver._locks == {}, (
-        f"_locks leaked after sequential resolves: {list(resolver._locks)}"
-    )
+    assert (
+        resolver._locks == {}
+    ), f"_locks leaked after sequential resolves: {list(resolver._locks)}"
 
     # Concurrent single-flight on one symbol: all waiters share one Lock,
     # and after the last one exits the lock is evicted.
@@ -137,16 +151,19 @@ async def test_locks_dict_is_bounded_after_resolutions(tmp_path):
 async def test_resolver_increments_cache_hit_and_miss_metrics(tmp_path):
     """Spec §10.2: resolver reports resolver_cache_hits / resolver_cache_misses
     so operators can see whether the cache is actually saving Binance calls."""
-    db = Database(tmp_path / "t.db"); await db.initialize()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
     adapter = AsyncMock()
     adapter.resolve_pair_for_symbol = AsyncMock(return_value="WBTCUSDT")
     resolver = VenueResolver(
-        binance_adapter=adapter, override_store=OverrideStore(db),
-        positive_ttl=timedelta(hours=1), negative_ttl=timedelta(seconds=60),
+        binance_adapter=adapter,
+        override_store=OverrideStore(db),
+        positive_ttl=timedelta(hours=1),
+        negative_ttl=timedelta(seconds=60),
         db=db,
     )
-    await resolver.resolve("WBTC")   # miss → Binance call + positive cache
-    await resolver.resolve("WBTC")   # hit  → no Binance call
+    await resolver.resolve("WBTC")  # miss → Binance call + positive cache
+    await resolver.resolve("WBTC")  # hit  → no Binance call
 
     async def _val(metric):
         cur = await db._conn.execute(

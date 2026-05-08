@@ -16,6 +16,7 @@ Handoff matrix (spec §5 + §2.2):
 LIVE_MODE=live must be blocked at startup (scout/main.py); the engine
 asserts as a belt-and-braces guard and refuses to write any row.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
