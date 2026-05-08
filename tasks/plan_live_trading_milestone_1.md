@@ -10,6 +10,8 @@
 
 **Tech Stack:** Python 3.12, aiosqlite, pydantic v2 BaseSettings + field_validator, pytest-asyncio (auto mode), structlog (PrintLoggerFactory — tests use `structlog.testing.capture_logs`, NOT pytest caplog), black formatting. NEW dependency: `ccxt` Python library (pinned version, scaffold-only at M1; first wired CCXT venue is M1.5).
 
+**Test reference snippets omit `_REQUIRED` for brevity** — `Settings(_env_file=None)` calls in this plan must add `**_REQUIRED` (or use `tests/conftest.py:60` `settings_factory` fixture) to satisfy the 3 mandatory fields (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `ANTHROPIC_API_KEY`). Module-level convention from `tests/test_config.py:11`: `_REQUIRED = dict(TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k")`. Apply to all `Settings(...)` constructions in tests created under this plan. Captured during Task 1 build-stage code review (`798cd99`).
+
 **Total scope:** ~80 steps across 16 tasks. Per advisor's sizing this is ~2x the original v1 plan (50 steps), reflecting the architectural framework shipping at M1 vs the v1 single-venue-throwaway shape.
 
 ---
