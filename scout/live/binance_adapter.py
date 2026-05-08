@@ -8,6 +8,7 @@ Shadow-mode HTTP client for Binance public endpoints:
 Implements the weight-header governor (§9.1) and retry taxonomy (§10.1).
 ``send_order`` is intentionally not implemented — BL-055 is shadow only.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +20,12 @@ import aiohttp
 import structlog
 
 from scout.config import Settings
-from scout.live.adapter_base import ExchangeAdapter
+from scout.live.adapter_base import (
+    ExchangeAdapter,
+    OrderConfirmation,
+    OrderRequest,
+    VenueMetadata,
+)
 from scout.live.exceptions import RateLimitError, VenueTransientError
 from scout.live.types import Depth, DepthLevel
 
@@ -30,7 +36,7 @@ _BASE_URL = "https://api.binance.com"
 _BACKOFFS: tuple[float, ...] = (1.0, 2.0, 4.0)
 
 # Spec §9.1 weight thresholds (max 1200/min).
-_WEIGHT_SHRINK = 960     # 80% — shrink concurrency to 3
+_WEIGHT_SHRINK = 960  # 80% — shrink concurrency to 3
 _WEIGHT_GATE_CLOSE = 1140  # 95% — close gate, pause for 10s
 
 # Optional metric increment — the ``scout.live.metrics.inc`` helper is
@@ -104,9 +110,7 @@ class BinanceSpotAdapter(ExchangeAdapter):
                     if resp.status == 429:
                         if self._db is not None and _metric_inc is not None:
                             try:
-                                await _metric_inc(
-                                    self._db, "binance_rate_limit_hits"
-                                )
+                                await _metric_inc(self._db, "binance_rate_limit_hits")
                             except Exception:  # noqa: BLE001
                                 # Metric write is best-effort; never mask
                                 # the RateLimitError that follows.
@@ -114,9 +118,7 @@ class BinanceSpotAdapter(ExchangeAdapter):
                                     "binance_rate_limit_metric_failed",
                                     exc_info=True,
                                 )
-                        raise RateLimitError(
-                            f"binance 429 weight={weight}"
-                        )
+                        raise RateLimitError(f"binance 429 weight={weight}")
 
                     if 500 <= resp.status < 600:
                         last_exc = VenueTransientError(
@@ -129,10 +131,7 @@ class BinanceSpotAdapter(ExchangeAdapter):
 
                     if resp.status == 400:
                         body = await resp.json(content_type=None)
-                        if (
-                            isinstance(body, dict)
-                            and body.get("code") == -1121
-                        ):
+                        if isinstance(body, dict) and body.get("code") == -1121:
                             # Sentinel — caller translates to None.
                             return {"__code": -1121}
                         # Other 400s — raise immediately (no retry).
@@ -149,9 +148,7 @@ class BinanceSpotAdapter(ExchangeAdapter):
                 # the exception was constructed with a null connection key
                 # (seen in tests). Render the type name instead — it is
                 # both safe and sufficient for logging.
-                last_exc = VenueTransientError(
-                    f"network error: {type(exc).__name__}"
-                )
+                last_exc = VenueTransientError(f"network error: {type(exc).__name__}")
                 if attempt < len(_BACKOFFS):
                     await self._retry_sleep(_BACKOFFS[attempt])
                     continue
@@ -190,9 +187,7 @@ class BinanceSpotAdapter(ExchangeAdapter):
         Returns ``None`` on Binance ``-1121`` ("Invalid symbol") — the
         terminal-unknown-symbol path. Other failures propagate.
         """
-        body = await self._http_get(
-            "/api/v3/exchangeInfo", params={"symbol": pair}
-        )
+        body = await self._http_get("/api/v3/exchangeInfo", params={"symbol": pair})
         if body.get("__code") == -1121:
             return None
         symbols = body.get("symbols") or []
@@ -240,14 +235,10 @@ class BinanceSpotAdapter(ExchangeAdapter):
 
     async def fetch_price(self, pair: str) -> Decimal:
         """Fetch spot price via ``/ticker/price`` (weight=1)."""
-        body = await self._http_get(
-            "/api/v3/ticker/price", params={"symbol": pair}
-        )
+        body = await self._http_get("/api/v3/ticker/price", params={"symbol": pair})
         return Decimal(str(body["price"]))
 
-    async def send_order(
-        self, *, pair: str, side: str, size_usd: Decimal
-    ) -> dict:
+    async def send_order(self, *, pair: str, side: str, size_usd: Decimal) -> dict:
         """Hard-block real order submission — BL-055 is shadow only (§1.3).
 
         The primary gate is ``scout/main.py`` (blocks on ``LIVE_MODE``); this
@@ -257,6 +248,94 @@ class BinanceSpotAdapter(ExchangeAdapter):
         """
         raise NotImplementedError(
             "BL-055 shadow mode — send_order blocked; wire in BL-058"
+        )
+
+    # ------------------------------------------------------------------
+    # Multi-tier routing surface (BL-NEW-LIVE-HYBRID M1, Task 5).
+    # ------------------------------------------------------------------
+    async def fetch_venue_metadata(self, canonical: str) -> VenueMetadata | None:
+        """Resolve `canonical` on Binance spot and wrap as VenueMetadata.
+
+        Reuses the legacy ``resolve_pair_for_symbol`` + ``fetch_exchange_info_row``
+        path — keeps a single source of truth for Binance pair shape.
+        Returns ``None`` if the canonical symbol is not listed as a
+        TRADING USDT pair.
+
+        Filter extraction (LOT_SIZE.minQty/stepSize, PRICE_FILTER.tickSize)
+        is best-effort: if a filter is missing/malformed we set the field
+        to ``None``. M1 routing layer treats ``None`` as "size validation
+        deferred downstream" — see plan §Task 5.
+        """
+        pair = await self.resolve_pair_for_symbol(canonical)
+        if pair is None:
+            return None
+        row = await self.fetch_exchange_info_row(pair)
+        if row is None:
+            return None
+
+        min_size: float | None = None
+        tick_size: float | None = None
+        lot_size: float | None = None
+        for f in row.get("filters", []) or []:
+            ftype = f.get("filterType")
+            try:
+                if ftype == "LOT_SIZE":
+                    min_size = float(f.get("minQty")) if f.get("minQty") else None
+                    lot_size = float(f.get("stepSize")) if f.get("stepSize") else None
+                elif ftype == "PRICE_FILTER":
+                    tick_size = float(f.get("tickSize")) if f.get("tickSize") else None
+            except (TypeError, ValueError):
+                # Malformed filter — leave field as None.
+                continue
+
+        return VenueMetadata(
+            venue="binance",
+            canonical=canonical.upper(),
+            venue_pair=row.get("symbol", pair),
+            quote=row.get("quoteAsset", "USDT"),
+            asset_class="spot",
+            min_size=min_size,
+            tick_size=tick_size,
+            lot_size=lot_size,
+        )
+
+    async def place_order_request(self, request: OrderRequest) -> str:
+        """Hard-block order placement — BL-055 is shadow only (§1.3).
+
+        Defense-in-depth alongside ``send_order``; live wiring lands in
+        Task 12 (client_order_id idempotency).
+        """
+        raise NotImplementedError(
+            "BL-055 shadow mode — place_order_request blocked; "
+            "wire in Task 12 (client_order_id idempotency)"
+        )
+
+    async def await_fill_confirmation(
+        self,
+        *,
+        venue_order_id: str,
+        client_order_id: str,
+        timeout_sec: float,
+    ) -> OrderConfirmation:
+        """Hard-block fill confirmation — BL-055 is shadow only (§1.3).
+
+        Wired in Task 12 once ``place_order_request`` is unblocked.
+        """
+        raise NotImplementedError(
+            "BL-055 shadow mode — await_fill_confirmation blocked; " "wire in Task 12"
+        )
+
+    async def fetch_account_balance(self, asset: str = "USDT") -> float:
+        """Return free balance in `asset`.
+
+        Stubbed for M1 — Task 8 (balance_gate.py) will implement the
+        signed ``/api/v3/account`` request with HMAC + timestamp + recvWindow.
+        Stubbing avoids landing partial signed-request code on the
+        adapter while balance_gate's full requirements are still being
+        fleshed out.
+        """
+        raise NotImplementedError(
+            "fetch_account_balance: implement in Task 8 (balance_gate.py)"
         )
 
     async def close(self) -> None:
