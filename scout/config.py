@@ -353,6 +353,24 @@ class Settings(BaseSettings):
     # Signal allowlist — CSV, lowercased, trimmed; empty = no signals eligible
     LIVE_SIGNAL_ALLOWLIST: str = ""
 
+    # -------- BL-NEW-LIVE-HYBRID M1 (design v2.1, 2026-05-08) --------
+    # Layer 1 of 4-layer kill stack. Master kill — when False, all live
+    # execution short-circuits at engine entry regardless of LIVE_MODE /
+    # per-signal opt-in / kill_switch state. Operator via .env edit + restart.
+    # Distinct from LIVE_MODE (paper/shadow/live tri-state, Layer 2).
+    LIVE_TRADING_ENABLED: bool = False
+
+    # Per-token concurrency cap. Routing layer's live-position-aggregator
+    # guard rejects intents when live_trades.count(canonical_symbol, status='open')
+    # >= this value. Default 1 covers BILL dual-signal pattern.
+    # Distinct from existing LIVE_MAX_OPEN_POSITIONS (total-across-venues cap, default 5).
+    LIVE_MAX_OPEN_POSITIONS_PER_TOKEN: int = 1
+
+    # OverrideStore semantics: False = PREPEND chain's venues to candidate list
+    # (graceful fallback if override chain has no healthy venue); True = REPLACE
+    # (only override chain's venues; abort if none healthy). Default False.
+    LIVE_OVERRIDE_REPLACE_ONLY: bool = False
+
     # Credentials (live mode only; never in .env.example — see spec §4.4)
     BINANCE_API_KEY: SecretStr | None = None
     BINANCE_API_SECRET: SecretStr | None = None
@@ -570,6 +588,13 @@ class Settings(BaseSettings):
     def _validate_revival_min_soak_days(cls, v: int) -> int:
         if v < 0:
             raise ValueError(f"SIGNAL_REVIVAL_MIN_SOAK_DAYS must be >= 0; got={v}")
+        return v
+
+    @field_validator("LIVE_MAX_OPEN_POSITIONS_PER_TOKEN")
+    @classmethod
+    def _validate_live_max_open_positions_per_token(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"LIVE_MAX_OPEN_POSITIONS_PER_TOKEN must be >= 1; got={v}")
         return v
 
     @field_validator("PEAK_FADE_RETRACE_RATIO")
