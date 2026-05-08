@@ -1,4 +1,4 @@
-**New primitives introduced:** Five new `Settings` fields — `LIVE_TRADING_ENABLED: bool = False` (master kill, Layer 1 of 4-layer kill stack), `LIVE_MAX_TRADE_NOTIONAL_USD: float = 100.0` (per-trade cap), `LIVE_MAX_OPEN_EXPOSURE_USD: float = 1000.0` (aggregate cross-venue cap), `LIVE_MAX_OPEN_POSITIONS_PER_TOKEN: int = 1` (per-token concurrency cap — M1-blocker live-position-aggregator guard), `LIVE_OVERRIDE_REPLACE_ONLY: bool = False` (PREPEND-vs-REPLACE semantics for OverrideStore). New `signal_params.live_eligible INTEGER NOT NULL DEFAULT 0` column (migration `bl_live_eligible_v1`, schema_version 20260508 — Layer 3 per-signal opt-in). Five new tables (one combined migration `bl_per_venue_services_v1`, schema_version 20260510): `venue_health` (with `last_quote_mid_price` + `last_depth_at_size_bps` pre-fetched routing inputs + `fills_30d_count` + `is_dormant`), `wallet_snapshots`, `venue_listings`, `venue_rate_state`, `symbol_aliases`. New SQL view `cross_venue_exposure` (M1-blocker — Gate 7 queries this not `shadow_trades`). New SQL view `cross_venue_pnl` scaffold (returns 0s at M1; M2 adds aggregations). `ExchangeAdapter` ABC reshape (M1-included, structural-reviewer MUST-FIX) — split `send_order` → `place_order_request` + `await_fill_confirmation`; generalize `fetch_exchange_info_row` → `fetch_venue_metadata(canonical) → VenueMetadata | None`; `resolve_pair_for_symbol` becomes delegate-able. New scaffold class `CCXTAdapter` (parameterized by venue name; not wired to any venue at M1; M1.5 wires first venue). New module `scout/live/balance_gate.py` (was missing per BL-055 prereq). New idempotency contract on `scout/live/binance_adapter.py`: `client_order_id = f"gecko-{paper_trade_id}-{intent_uuid}"` + pre-retry dedup query (migration `bl_live_client_order_id_v1`, schema_version 20260509). New module `scout/live/routing.py` — routing layer producing ranked candidate list with <200ms p95 budget, live-position-aggregator guard (M1-blocker), on-demand venue_listings fetch (M1-blocker), chain="coingecko" enrichment, OverrideStore PREPEND semantics, delisting fallback. New `scout/live/services/` package — `VenueService` ABC (typed `adapter: ExchangeAdapter` + concurrency contract), service-runner harness, three concrete services (`HealthProbe`, `BalanceSnapshot`, `KillSwitchEnforcer`), one stub (`RateLimitAccountantStub` returns CONSERVATIVE 50% headroom). New `live_orders_skipped_*` metric family (`master_kill`, `mode_paper`, `signal_disabled`, `kill_switch`, `exposure_cap`, `notional_cap`, `token_aggregate`, `no_venue`, `all_candidates_failed`, `dual_signal_aggregate`). New Telegram startup notification when `LIVE_TRADING_ENABLED=True` (`scout/main.py` startup hook). New Telegram approval gateway with `/allow-stack <token>`, `/auto-approve venue=<name>`, `/approval-required venue=<name>`, `/venue-revive name=<name>` commands. Operator-in-loop scaling rules pre-registered in design doc (no runtime knob). canonical-extraction rule for `symbol_aliases` explicit (CCXT `markets[symbol]` split-on-`/` taking `[0]`; perp suffix `:USDT` stripped). Dormancy daily job sets `venue_health.is_dormant=1` for venues with `fills_30d_count=0`.
+**New primitives introduced:** Five new `Settings` fields — `LIVE_TRADING_ENABLED: bool = False` (master kill, Layer 1 of 4-layer kill stack), `LIVE_MAX_TRADE_NOTIONAL_USD: float = 100.0` (per-trade cap), `LIVE_MAX_OPEN_EXPOSURE_USD: float = 1000.0` (aggregate cross-venue cap), `LIVE_MAX_OPEN_POSITIONS_PER_TOKEN: int = 1` (per-token concurrency cap — M1-blocker live-position-aggregator guard), `LIVE_OVERRIDE_REPLACE_ONLY: bool = False` (PREPEND-vs-REPLACE semantics for OverrideStore). New `signal_params.live_eligible INTEGER NOT NULL DEFAULT 0` column (migration `bl_live_eligible_v1`, schema_version 20260508 — Layer 3 per-signal opt-in). Five new tables (one combined migration `bl_per_venue_services_v1`, schema_version 20260510): `venue_health` (with `last_quote_mid_price` + `last_depth_at_size_bps` pre-fetched routing inputs + `fills_30d_count` + `is_dormant`), `wallet_snapshots`, `venue_listings`, `venue_rate_state`, `symbol_aliases`. New SQL view `cross_venue_exposure` (M1-blocker — Gate 7 queries this not `shadow_trades`). New SQL view `cross_venue_pnl` scaffold (returns 0s at M1; M2 adds aggregations). `ExchangeAdapter` ABC reshape (M1-included, structural-reviewer MUST-FIX) — split `send_order` → `place_order_request` + `await_fill_confirmation`; generalize `fetch_exchange_info_row` → `fetch_venue_metadata(canonical) → VenueMetadata | None`; `resolve_pair_for_symbol` becomes delegate-able. New scaffold class `CCXTAdapter` (parameterized by venue name; not wired to any venue at M1; M1.5 wires first venue). New module `scout/live/balance_gate.py` (was missing per BL-055 prereq). New idempotency contract on `scout/live/binance_adapter.py`: `client_order_id = f"gecko-{paper_trade_id}-{intent_uuid}"` + pre-retry dedup query (migration `bl_live_client_order_id_v1`, schema_version 20260509). New module `scout/live/routing.py` — routing layer producing ranked candidate list with <200ms p95 budget, live-position-aggregator guard (M1-blocker), on-demand venue_listings fetch (M1-blocker), chain="coingecko" enrichment, OverrideStore PREPEND semantics, delisting fallback. New `scout/live/services/` package — `VenueService` ABC (typed `adapter: ExchangeAdapter` + concurrency contract), service-runner harness, three concrete services (`HealthProbe`, `BalanceSnapshot`, `KillSwitchEnforcer`), one stub (`RateLimitAccountantStub` returns CONSERVATIVE 50% headroom). New `live_orders_skipped_*` metric family (`master_kill`, `mode_paper`, `signal_disabled`, `kill_switch`, `exposure_cap`, `notional_cap`, `token_aggregate`, `no_venue`, `all_candidates_failed`, `dual_signal_aggregate`, `approval_new_venue_gate`, `approval_trade_size_gate`, `approval_venue_health_gate`, `approval_operator_flag`). New telemetry columns on `live_trades` per plan-stage policy reviewer: `fill_slippage_bps REAL` (computed at fill confirmation as `(fill_price/mid_at_entry - 1) * 10000`), `correction_at TEXT`, `correction_reason TEXT`. New `signal_venue_correction_count` table (running counter for approval-removal gate 1, migration `bl_live_trades_telemetry_v1`, schema_version 20260511). New module `scout/live/approval_thresholds.py` with `should_require_approval(db, settings, signal_type, venue, size_usd) → tuple[bool, gate_name | None]` implementing the 4 pre-registered operator-in-loop gates (new-venue <30 fills, trade-size >2× rolling-30 median, venue-health degraded-24h, /approval-required flag). New Telegram startup notification when `LIVE_TRADING_ENABLED=True` (`scout/main.py` startup hook). New Telegram approval gateway with `/allow-stack <token>`, `/auto-approve venue=<name>`, `/approval-required venue=<name>`, `/venue-revive name=<name>` commands. Operator-in-loop scaling rules pre-registered in design doc (no runtime knob). canonical-extraction rule for `symbol_aliases` explicit (CCXT `markets[symbol]` split-on-`/` taking `[0]`; perp suffix `:USDT` stripped). Dormancy daily job sets `venue_health.is_dormant=1` for venues with `fills_30d_count=0`.
 
 # Live Trading Milestone 1 — Multi-Venue Architecture, Binance Wired
 
@@ -50,7 +50,7 @@
 | `tests/test_live_telegram_approval.py` | **Create** | Approval gateway commands; uses `structlog.testing.capture_logs` |
 | `tests/test_live_symbol_normalize.py` | **Create** | CCXT canonical extraction; Tier 1/2 custom |
 
-**Schema versions reserved:** 20260508 (bl_live_eligible_v1), 20260509 (bl_live_client_order_id_v1), 20260510 (bl_per_venue_services_v1).
+**Schema versions reserved:** 20260508 (bl_live_eligible_v1), 20260509 (bl_live_client_order_id_v1), 20260510 (bl_per_venue_services_v1), 20260511 (bl_live_trades_telemetry_v1 — added per plan-stage policy reviewer).
 
 ---
 
@@ -612,7 +612,7 @@ git commit -m "feat(live-m1): per-venue services framework tables (5 tables, 1 m
 
 **Files:**
 - Modify: `scout/db.py` (add view creation in `_create_tables`)
-- Test: `tests/test_live_cross_venue_exposure.py` (NEW — covered partly by Task 7's Gate 7 test)
+- Test: extend `tests/test_live_per_venue_services_migration.py` with the cross_venue_exposure view-existence test (no separate file — orphan removed per plan-stage structural reviewer)
 
 - [ ] **Step 1: Add view creation in `_create_tables` (one of the SQL statements list)**
 
@@ -861,10 +861,10 @@ git commit -m "feat(live-m1): ABC reshape — place_order/await_fill split + fet
 - [ ] **Step 1: Add ccxt to dependencies**
 
 ```bash
-uv add ccxt --frozen-lockfile-update
+uv add "ccxt==4.5.52"
 ```
 
-(Pin a specific version per CCXT verification — e.g., `ccxt==4.5.52`.)
+`uv add` updates `uv.lock` automatically — no special flag needed. The pinned version matches the CCXT verification's latest stable release; bump cadence is operator-driven quarterly per the design's "no auto-bump" policy.
 
 - [ ] **Step 2: Failing test**
 
@@ -995,11 +995,11 @@ git commit -m "feat(live-m1): CCXTAdapter scaffold (Tier 3b — not wired at M1)
 **Files:**
 - Modify: `scout/live/gates.py`
 - Modify: `scout/db.py` (extend reject_reason CHECK constraint via migration if shadow_trades/live_trades have rows; otherwise update CREATE TABLE)
-- Test: `tests/test_live_master_kill.py` (extend) + `tests/test_live_cross_venue_exposure.py` (NEW small)
+- Test: `tests/test_live_master_kill.py` (extend) + extend `tests/test_live_per_venue_services_migration.py` for view-related coverage
 
 - [ ] **Step 1: Extend reject_reason CHECK constraint**
 
-In `scout/db.py`, update both `live_trades` and `shadow_trades` CREATE TABLE CHECK lists:
+In `scout/db.py`, update both `live_trades` and `shadow_trades` CREATE TABLE CHECK lists. **Per plan-stage policy reviewer: include `dual_signal_aggregate` in the list (was missing in initial draft — would cause silent INSERT failure on the BILL pattern).**
 
 ```python
                 reject_reason TEXT CHECK (reject_reason IS NULL OR reject_reason IN (
@@ -1007,11 +1007,14 @@ In `scout/db.py`, update both `live_trades` and `shadow_trades` CREATE TABLE CHE
                     'daily_cap_hit','kill_switch','exposure_cap','override_disabled',
                     'venue_unavailable',
                     'notional_cap_exceeded','signal_disabled','token_aggregate',
-                    'all_candidates_failed','master_kill','mode_paper'
+                    'dual_signal_aggregate','all_candidates_failed',
+                    'master_kill','mode_paper'
                 )),
 ```
 
 (If the tables exist with old constraint: write a `_migrate_reject_reason_extend` migration with table-rename pattern. Skip for M1 if no live_trades/shadow_trades rows exist yet — likely true since LIVE_MODE was paper.)
+
+**Note on `token_aggregate` vs `dual_signal_aggregate`:** these are DISTINCT reasons. `token_aggregate` fires when `LIVE_MAX_OPEN_POSITIONS_PER_TOKEN` cap reached (1 by default — the M1-blocker guard). `dual_signal_aggregate` fires when two signals on the same token+venue race the same routing call (Phase-2 aggregator deferred per design v2.1; reserved as a CHECK value at M1 so the column is forward-compatible when the Phase-2 service ships).
 
 - [ ] **Step 2: Failing tests for Gate 7/8/9**
 
@@ -1065,6 +1068,143 @@ After Gate 7, add:
 ```
 
 - [ ] **Step 5: Run + commit**
+
+---
+
+## Task 7.5: Approval-removal telemetry plumbing (per plan-stage policy reviewer)
+
+**Files:**
+- Modify: `scout/db.py` — add columns to `live_trades`: `fill_slippage_bps REAL` (computed at fill-confirmation time), `correction_at TEXT` (when operator unwinds within 24h), `correction_reason TEXT`. Add new table `signal_venue_correction_count` (per-pair running counter that the approval-removal gate reads).
+- Modify: `scout/live/binance_adapter.py` — populate `fill_slippage_bps` in `await_fill_confirmation` (compute `(fill_price / mid_at_submit - 1) * 10000`).
+- Modify: `scout/live/engine.py` — increment / reset `signal_venue_correction_count` on trade close events.
+- Test: extend `tests/test_live_master_kill.py` with telemetry tests.
+
+Without these columns, the design's approval-removal criteria (1) trade-count gate, (3) slippage-fit gate per-(signal × venue) basis-points are TEXT-ONLY in the design — unenforceable. M1 needs the data plumbing the moment the first live trade fires; otherwise we'd have to backfill counters at autonomy-evaluation time.
+
+- [ ] **Step 1: Failing tests**
+
+```python
+@pytest.mark.asyncio
+async def test_live_trades_has_fill_slippage_bps_column(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    cur = await db._conn.execute("PRAGMA table_info(live_trades)")
+    cols = {row[1] for row in await cur.fetchall()}
+    assert "fill_slippage_bps" in cols
+    assert "correction_at" in cols
+    assert "correction_reason" in cols
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_signal_venue_correction_count_table_exists(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='signal_venue_correction_count'"
+    )
+    assert (await cur.fetchone()) is not None
+    cur = await db._conn.execute(
+        "PRAGMA table_info(signal_venue_correction_count)"
+    )
+    cols = {row[1] for row in await cur.fetchall()}
+    expected = {"signal_type", "venue", "consecutive_no_correction",
+                "last_corrected_at", "last_updated_at"}
+    assert expected <= cols
+    await db.close()
+```
+
+- [ ] **Step 2: Add migration `bl_live_trades_telemetry_v1` (schema_version 20260511)** — adds the three columns to live_trades + creates `signal_venue_correction_count` table:
+
+```python
+    async def _migrate_live_trades_telemetry(self) -> None:
+        """BL-NEW-LIVE-HYBRID M1 v2.1: telemetry plumbing for
+        approval-removal criteria (per plan-stage policy reviewer).
+        Adds:
+          - live_trades.fill_slippage_bps REAL
+          - live_trades.correction_at TEXT
+          - live_trades.correction_reason TEXT
+          - signal_venue_correction_count table (running counters)"""
+        # ... full migration body mirroring bl_live_eligible_v1 shape ...
+        # PRAGMA-guarded ALTERs + CREATE TABLE IF NOT EXISTS +
+        # paper_migrations marker `bl_live_trades_telemetry_v1` +
+        # schema_version 20260511 + post-assertion INSIDE try.
+```
+
+Schema for the new table:
+
+```sql
+CREATE TABLE IF NOT EXISTS signal_venue_correction_count (
+    signal_type              TEXT NOT NULL,
+    venue                    TEXT NOT NULL,
+    consecutive_no_correction INTEGER NOT NULL DEFAULT 0,
+    last_corrected_at        TEXT,
+    last_updated_at          TEXT NOT NULL,
+    PRIMARY KEY (signal_type, venue)
+);
+```
+
+Wire into `Database.initialize()` after `_migrate_per_venue_services`.
+
+- [ ] **Step 3: Wire `fill_slippage_bps` in `binance_adapter.await_fill_confirmation`**
+
+```python
+        # Compute slippage bps relative to mid_at_entry recorded at submit.
+        if mid_at_entry and fill_price:
+            slippage_bps = (
+                (float(fill_price) / float(mid_at_entry) - 1.0) * 10000.0
+            )
+            await db._conn.execute(
+                "UPDATE live_trades SET fill_slippage_bps = ? WHERE id = ?",
+                (round(slippage_bps, 2), live_trade_id),
+            )
+```
+
+- [ ] **Step 4: Wire correction-counter increment/reset in engine**
+
+In `scout/live/engine.py`, on every trade close event:
+- If `correction_at IS NULL` (no operator unwound it) → `consecutive_no_correction += 1`
+- If `correction_at IS NOT NULL` → reset to 0 + record `last_corrected_at`
+
+```python
+async def _update_correction_counter(
+    db, signal_type: str, venue: str, was_corrected: bool
+) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if was_corrected:
+        await db._conn.execute(
+            """INSERT INTO signal_venue_correction_count
+               (signal_type, venue, consecutive_no_correction,
+                last_corrected_at, last_updated_at)
+               VALUES (?, ?, 0, ?, ?)
+               ON CONFLICT (signal_type, venue) DO UPDATE SET
+                  consecutive_no_correction = 0,
+                  last_corrected_at = excluded.last_corrected_at,
+                  last_updated_at = excluded.last_updated_at""",
+            (signal_type, venue, now_iso, now_iso),
+        )
+    else:
+        await db._conn.execute(
+            """INSERT INTO signal_venue_correction_count
+               (signal_type, venue, consecutive_no_correction, last_updated_at)
+               VALUES (?, ?, 1, ?)
+               ON CONFLICT (signal_type, venue) DO UPDATE SET
+                  consecutive_no_correction = consecutive_no_correction + 1,
+                  last_updated_at = excluded.last_updated_at""",
+            (signal_type, venue, now_iso),
+        )
+    await db._conn.commit()
+```
+
+- [ ] **Step 5: Run + commit**
+
+```bash
+git add scout/db.py scout/live/binance_adapter.py scout/live/engine.py tests/test_live_master_kill.py
+git commit -m "feat(live-m1): approval-removal telemetry plumbing (slippage_bps + correction counter)"
+```
+
+**Schema versions reserved (updated):** 20260508 (bl_live_eligible_v1), 20260509 (bl_live_client_order_id_v1), 20260510 (bl_per_venue_services_v1), **20260511 (bl_live_trades_telemetry_v1 — NEW per policy reviewer).**
 
 ---
 
@@ -1127,6 +1267,42 @@ async def test_live_position_aggregator_rejects_when_token_already_open(
     )
     assert candidates == [], (
         "expected aggregator-guard to reject; got " + str(candidates)
+    )
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_live_position_aggregator_uses_symbol_not_coin_id(
+    tmp_path, settings_factory
+):
+    """Per plan-stage structural reviewer: aggregator-guard must query by
+    SYMBOL (ticker), NOT by coin_id (CoinGecko slug). For BTC, the
+    CoinGecko slug is 'bitcoin' but the canonical ticker is 'BTC'.
+    Querying coin_id with canonical.lower() would compare 'bitcoin' to
+    'btc' and silently fail to fire the guard. This test pins the
+    correct column choice."""
+    from scout.live.routing import RoutingLayer
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    # Insert with REAL CoinGecko slug semantics: coin_id="bitcoin", symbol="BTC"
+    await db._conn.execute(
+        """INSERT INTO live_trades
+           (paper_trade_id, coin_id, symbol, venue, pair, signal_type,
+            size_usd, status, created_at)
+           VALUES (1, 'bitcoin', 'BTC', 'binance', 'BTCUSDT', 'gainers_early',
+                   '50.0', 'open', '2026-05-08T00:00:00+00:00')"""
+    )
+    await db._conn.commit()
+    s = settings_factory(LIVE_MAX_OPEN_POSITIONS_PER_TOKEN=1)
+    routing = RoutingLayer(db=db, settings=s, adapters={})
+    # canonical is the TICKER, not the slug
+    candidates = await routing.get_candidates(
+        canonical="BTC", chain_hint=None, signal_type="gainers_early",
+        size_usd=50.0,
+    )
+    assert candidates == [], (
+        "guard must fire when symbol matches, regardless of coin_id slug "
+        f"divergence; got {candidates}"
     )
     await db.close()
 
@@ -1225,11 +1401,20 @@ class RoutingLayer:
         self, *, canonical: str, chain_hint: str | None,
         signal_type: str, size_usd: float,
     ) -> list[RouteCandidate]:
-        # Step 1 — live-position-aggregator guard
+        # Step 1 — live-position-aggregator guard (M1-BLOCKER)
+        # CONTRACT: `canonical` is the uppercase TICKER ("BTC", "BILL"),
+        # NOT the CoinGecko slug ("bitcoin"). live_trades.symbol stores
+        # the ticker; live_trades.coin_id stores the CoinGecko slug.
+        # We query by SYMBOL because:
+        #   1. routing.py inputs are canonical tickers (per RouteCandidate.venue_pair contract)
+        #   2. CoinGecko slugs differ from tickers (bitcoin vs BTC), so a
+        #      coin_id query with canonical.lower() silently fails for
+        #      every coin where slug != ticker.lower().
+        # UPPER() comparison guarantees case-insensitive match.
         cur = await self._db._conn.execute(
             "SELECT COUNT(*) FROM live_trades "
-            "WHERE coin_id = ? AND status = 'open'",
-            (canonical.lower(),),
+            "WHERE UPPER(symbol) = UPPER(?) AND status = 'open'",
+            (canonical,),
         )
         open_count = (await cur.fetchone())[0]
         if open_count >= self._settings.LIVE_MAX_OPEN_POSITIONS_PER_TOKEN:
@@ -1390,7 +1575,7 @@ async def test_runner_harness_serializes_per_pair(tmp_path):
 
 The HealthProbe runs `await adapter.fetch_account_balance(...)` + measures latency, writes a venue_health row. BalanceSnapshot writes wallet_snapshots rows for relevant assets. RateLimitAccountantStub writes 50% headroom unconditionally. DormancyJob runs daily, sets is_dormant=1 for venues with fills_30d_count=0. Service-runner harness uses `asyncio.create_task` per (adapter, service) pair with an `asyncio.Lock` per pair.
 
-(Bodies follow patterns from existing `scout/main._run_feedback_schedulers` for the harness.)
+(Bodies follow patterns from the existing `_run_feedback_schedulers` async function in `scout/main.py` for the harness — module-level function, not a method.)
 
 - [ ] **Step 3: Run + commit**
 
@@ -1441,6 +1626,237 @@ Per v1 archived plan Task 8 — copy verbatim. Migration `bl_live_client_order_i
 - [ ] **Step 4: Wire to telegram bot framework** (existing alerter integration; reuse the bot token wired up 2026-05-06).
 
 - [ ] **Step 5-6: Tests + commit**
+
+---
+
+## Task 13.5: Operator-in-loop threshold evaluation function (per plan-stage policy reviewer)
+
+**Files:**
+- Create: `scout/live/approval_thresholds.py` — `_should_require_approval()` function implementing the four pre-registered threshold gates
+- Modify: `scout/live/engine.py` — call `_should_require_approval()` BEFORE adapter dispatch; if True, route through Telegram approval gateway
+- Test: `tests/test_live_approval_thresholds.py` (NEW)
+
+The design v2.1 pre-registers 4 thresholds (new-venue gate <30 fills, trade-size gate >2× median, venue-health gate degraded-24h, /approval-required flag). Task 13 ships command handlers. Without the threshold-evaluation function, the gates are decorative — the gateway only fires on the explicit `/approval-required` flag. Implement the autonomous threshold evaluation:
+
+- [ ] **Step 1: Failing tests**
+
+```python
+"""BL-NEW-LIVE-HYBRID M1 v2.1: operator-in-loop threshold gates."""
+from __future__ import annotations
+
+import pytest
+from scout.db import Database
+
+
+@pytest.mark.asyncio
+async def test_new_venue_gate_fires_below_30_fills(tmp_path, settings_factory):
+    """When (signal_type × venue) has < 30 successful autonomous fills,
+    require operator approval per design v2.1 §"Operator-in-loop scaling rules"."""
+    from scout.live.approval_thresholds import should_require_approval
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    require, reason = await should_require_approval(
+        db=db, settings=s, signal_type="first_signal", venue="binance",
+        size_usd=50.0,
+    )
+    assert require is True
+    assert reason == "new_venue_gate"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_new_venue_gate_clears_at_30_fills(tmp_path, settings_factory):
+    """At 30+ no-correction fills on a (signal × venue) pair, the
+    new-venue gate clears."""
+    from scout.live.approval_thresholds import should_require_approval
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await db._conn.execute(
+        """INSERT INTO signal_venue_correction_count
+           (signal_type, venue, consecutive_no_correction, last_updated_at)
+           VALUES ('first_signal', 'binance', 30, '2026-05-08T00:00:00+00:00')"""
+    )
+    await db._conn.commit()
+    s = settings_factory()
+    require, reason = await should_require_approval(
+        db=db, settings=s, signal_type="first_signal", venue="binance",
+        size_usd=50.0,
+    )
+    # Returns False if other gates also clear; here we only insert
+    # consecutive_no_correction=30 + no other gate triggers, so should be False.
+    assert require is False, f"new_venue_gate should clear; reason={reason}"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_trade_size_gate_fires_above_2x_median(tmp_path, settings_factory):
+    """Trade size > 2× median for (signal × venue) → approval required.
+    Median is computed from recent live_trades (rolling 30-trade window)."""
+    from scout.live.approval_thresholds import should_require_approval
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    # Seed 30 fills at $50 (clears new-venue gate; sets median = 50)
+    for i in range(30):
+        await db._conn.execute(
+            """INSERT INTO live_trades
+               (paper_trade_id, coin_id, symbol, venue, pair, signal_type,
+                size_usd, status, created_at)
+               VALUES (?, 'btc', 'BTC', 'binance', 'BTCUSDT', 'first_signal',
+                       '50.0', 'closed_tp', ?)""",
+            (i + 1, f"2026-05-0{i % 9 + 1}T00:00:00+00:00"),
+        )
+    await db._conn.execute(
+        """INSERT INTO signal_venue_correction_count
+           (signal_type, venue, consecutive_no_correction, last_updated_at)
+           VALUES ('first_signal', 'binance', 30, '2026-05-08T00:00:00+00:00')"""
+    )
+    await db._conn.commit()
+    s = settings_factory()
+    # Trade size $150 (3× median 50) → trade-size gate fires
+    require, reason = await should_require_approval(
+        db=db, settings=s, signal_type="first_signal", venue="binance",
+        size_usd=150.0,
+    )
+    assert require is True
+    assert reason == "trade_size_gate"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_venue_health_gate_fires_when_degraded(tmp_path, settings_factory):
+    """venue_health degraded in past 24h → approval required regardless
+    of new-venue + trade-size gates."""
+    # ... insert venue_health row with rate_limit_headroom_pct=20
+    #     (caution range) within past 24h ...
+    # ... assert require=True, reason='venue_health_gate'
+    pass  # Stub — implementer fills in given the contract above
+```
+
+- [ ] **Step 2: Implement `scout/live/approval_thresholds.py`**
+
+```python
+"""BL-NEW-LIVE-HYBRID M1 v2.1: operator-in-loop threshold evaluation.
+
+Pre-registered thresholds per design v2.1 §"Operator-in-loop scaling rules":
+  1. new-venue gate: < 30 successful autonomous fills on this pair
+  2. trade-size gate: > 2× median trade size for this pair
+  3. venue-health gate: any caution-range metric in past 24h on the venue
+  4. operator-set /approval-required flag (via Telegram command, 24h expiry)
+
+ALL FOUR FALSE → trade auto-executes (autonomous).
+ANY ONE TRUE → trade requires operator approval via Telegram.
+
+Thresholds (30, 2×, 24h) are pre-registered and NOT runtime-tunable.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import structlog
+
+from scout.db import Database
+
+log = structlog.get_logger(__name__)
+
+NEW_VENUE_FILL_THRESHOLD = 30  # pre-registered; not runtime-tunable
+TRADE_SIZE_MEDIAN_MULTIPLIER = 2.0  # pre-registered
+VENUE_HEALTH_LOOKBACK_HOURS = 24  # pre-registered
+RATE_LIMIT_CAUTION_PCT = 30.0  # below this is "caution range"
+
+
+async def should_require_approval(
+    *, db: Database, settings, signal_type: str, venue: str, size_usd: float,
+) -> tuple[bool, str | None]:
+    """Returns (require_approval, gate_name_if_required).
+    gate_name is one of: 'new_venue_gate', 'trade_size_gate',
+    'venue_health_gate', 'operator_flag', None."""
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+
+    # Gate 1: new-venue
+    cur = await db._conn.execute(
+        "SELECT consecutive_no_correction FROM signal_venue_correction_count "
+        "WHERE signal_type = ? AND venue = ?",
+        (signal_type, venue),
+    )
+    row = await cur.fetchone()
+    fills = row[0] if row else 0
+    if fills < NEW_VENUE_FILL_THRESHOLD:
+        return True, "new_venue_gate"
+
+    # Gate 2: trade-size
+    cur = await db._conn.execute(
+        """SELECT CAST(size_usd AS REAL) FROM live_trades
+           WHERE signal_type = ? AND venue = ? AND status LIKE 'closed%'
+           ORDER BY created_at DESC LIMIT 30""",
+        (signal_type, venue),
+    )
+    sizes = [row[0] for row in await cur.fetchall()]
+    if sizes:
+        sizes_sorted = sorted(sizes)
+        median = sizes_sorted[len(sizes_sorted) // 2]
+        if size_usd > TRADE_SIZE_MEDIAN_MULTIPLIER * median:
+            return True, "trade_size_gate"
+
+    # Gate 3: venue-health
+    lookback_iso = (
+        datetime.now(timezone.utc) - timedelta(hours=VENUE_HEALTH_LOOKBACK_HOURS)
+    ).isoformat()
+    cur = await db._conn.execute(
+        """SELECT auth_ok, rest_responsive, rate_limit_headroom_pct
+           FROM venue_health
+           WHERE venue = ? AND probe_at >= ?
+           ORDER BY probe_at DESC LIMIT 30""",
+        (venue, lookback_iso),
+    )
+    for auth_ok, rest_resp, headroom in await cur.fetchall():
+        if not auth_ok or not rest_resp or (
+            headroom is not None and headroom < RATE_LIMIT_CAUTION_PCT
+        ):
+            return True, "venue_health_gate"
+
+    # Gate 4: operator /approval-required flag
+    cur = await db._conn.execute(
+        """SELECT 1 FROM live_operator_overrides
+           WHERE override_type = 'approval_required' AND venue = ?
+             AND expires_at > ?""",
+        (venue, datetime.now(timezone.utc).isoformat()),
+    )
+    if await cur.fetchone() is not None:
+        return True, "operator_flag"
+
+    return False, None
+```
+
+- [ ] **Step 3: Wire into engine**
+
+In `scout/live/engine.py` after master-kill check, BEFORE adapter dispatch:
+
+```python
+        from scout.live.approval_thresholds import should_require_approval
+        require, gate = await should_require_approval(
+            db=self._db, settings=self._settings,
+            signal_type=paper_trade.signal_type,
+            venue=top_candidate.venue, size_usd=paper_trade.amount_usd,
+        )
+        if require:
+            from scout.live.telegram_approval import request_operator_approval
+            approved = await request_operator_approval(
+                db=self._db, paper_trade=paper_trade, candidate=top_candidate,
+                gate=gate, timeout_sec=300,
+            )
+            if not approved:
+                await inc(self._db, f"live_orders_skipped_approval_{gate}")
+                return
+```
+
+- [ ] **Step 4: Run + commit**
+
+```bash
+git add scout/live/approval_thresholds.py scout/live/engine.py tests/test_live_approval_thresholds.py
+git commit -m "feat(live-m1): operator-in-loop threshold evaluation function (4 gates)"
+```
 
 ---
 
