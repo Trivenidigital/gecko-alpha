@@ -1165,7 +1165,7 @@ async def main(argv: list[str] | None = None) -> int:
                 settings=settings,
                 adapters={"binance": live_adapter},
             )
-            log.info("routing_layer_constructed", venues=["binance"])
+            logger.info("routing_layer_constructed", venues=["binance"])
 
         live_engine = LiveEngine(
             config=live_config,

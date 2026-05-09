@@ -318,6 +318,7 @@ class LiveEngine:
         from scout.live.correction_counter import increment_consecutive
         from scout.live.exceptions import VenueTransientError
         from scout.live.idempotency import make_client_order_id
+        from scout.live.kill_switch import compute_kill_duration
 
         canonical = paper_trade.symbol
         chain_hint = getattr(paper_trade, "chain", None)
@@ -345,17 +346,34 @@ class LiveEngine:
         )
 
         if not candidates:
+            # V1-C2 + V3-C1 PR-stage fix: live_trades has 7 NOT NULL columns
+            # (paper_trade_id, coin_id, symbol, venue, pair, signal_type,
+            # size_usd, status). venue/pair are sentinel-empty since no
+            # candidate was selected.
             now_iso = datetime.now(timezone.utc).isoformat()
             assert self._db._conn is not None
             async with self._db._txn_lock:
                 await self._db._conn.execute(
                     "INSERT INTO live_trades "
-                    "(paper_trade_id, status, reject_reason, created_at) "
-                    "VALUES (?, 'rejected', 'no_venue', ?)",
-                    (paper_trade.id, now_iso),
+                    "(paper_trade_id, coin_id, symbol, venue, pair, "
+                    " signal_type, size_usd, status, reject_reason, "
+                    " created_at) "
+                    "VALUES (?, ?, ?, '', '', ?, ?, 'rejected', "
+                    " 'no_venue', ?)",
+                    (
+                        paper_trade.id,
+                        paper_trade.coin_id,
+                        paper_trade.symbol,
+                        paper_trade.signal_type,
+                        str(size_usd),
+                        now_iso,
+                    ),
                 )
                 await self._db._conn.commit()
-            log.info(
+            # V3-I2 PR-stage fix: WARN level — operator searches "did this
+            # signal succeed?" should not skim past INFO when routing
+            # silently returns zero candidates.
+            log.warning(
                 "live_dispatch_no_venue",
                 paper_trade_id=paper_trade.id,
                 canonical=canonical,
@@ -390,7 +408,13 @@ class LiveEngine:
                 paper_trade_id=paper_trade.id,
                 err=str(exc),
             )
-            await self._ks.engage(reason="binance_auth_revoked_mid_session")
+            # V1+V2+V3 PR-stage CRITICAL fix: KillSwitch.engage does not
+            # exist; real API is trigger(triggered_by, reason, duration).
+            await self._ks.trigger(
+                triggered_by="live_engine",
+                reason="binance_auth_revoked_mid_session",
+                duration=compute_kill_duration(datetime.now(timezone.utc)),
+            )
             return
         except BinanceIPBanError as exc:
             log.error(
@@ -398,7 +422,11 @@ class LiveEngine:
                 paper_trade_id=paper_trade.id,
                 err=str(exc),
             )
-            await self._ks.engage(reason="binance_ip_banned")
+            await self._ks.trigger(
+                triggered_by="live_engine",
+                reason="binance_ip_banned",
+                duration=compute_kill_duration(datetime.now(timezone.utc)),
+            )
             return
         except VenueTransientError as exc:
             log.info(

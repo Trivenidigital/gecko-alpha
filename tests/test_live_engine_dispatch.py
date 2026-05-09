@@ -9,7 +9,6 @@ SimpleNamespace shims. M1.5c reconciler tests should reuse the
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -24,6 +23,7 @@ from scout.live.binance_adapter import (
 from scout.live.config import LiveConfig
 from scout.live.engine import LiveEngine
 from scout.live.exceptions import VenueTransientError
+from scout.live.kill_switch import KillSwitch
 from scout.live.routing import RouteCandidate
 
 _REQUIRED = {
@@ -82,7 +82,12 @@ async def _make_engine(
             )
         )
     resolver = MagicMock()
-    kill_switch = SimpleNamespace(engage=AsyncMock())
+    # PR-stage V1+V2+V3 fix: spec=KillSwitch locks the contract — any
+    # call to a non-existent attribute (e.g., the now-fixed .engage())
+    # raises AttributeError instead of silently returning. Async methods
+    # need explicit AsyncMock binding.
+    kill_switch = MagicMock(spec=KillSwitch)
+    kill_switch.trigger = AsyncMock(return_value=(1, True))
     return LiveEngine(
         config=config,
         resolver=resolver,
@@ -320,7 +325,10 @@ async def test_dispatch_live_no_venue_writes_reject_row(tmp_path):
 
 @pytest.mark.asyncio
 async def test_dispatch_live_binance_auth_error_engages_killswitch(tmp_path):
-    """R1-M1 fold: BinanceAuthError -> KillSwitch.engage(reason=...)."""
+    """R1-M1 fold + V1+V2+V3 PR-stage fix: BinanceAuthError ->
+    KillSwitch.trigger(triggered_by, reason, duration). Earlier code
+    called .engage() which does not exist on KillSwitch — production
+    raised AttributeError silently."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     routing = MagicMock()
@@ -331,9 +339,11 @@ async def test_dispatch_live_binance_auth_error_engages_killswitch(tmp_path):
     engine = await _make_engine(db, routing=routing, adapter=adapter)
     pt = _make_paper_trade()
     await engine._dispatch_live(paper_trade=pt, size_usd=10.0)
-    engine._ks.engage.assert_awaited_once()
-    call = engine._ks.engage.call_args
+    engine._ks.trigger.assert_awaited_once()
+    call = engine._ks.trigger.call_args
     assert call.kwargs["reason"] == "binance_auth_revoked_mid_session"
+    assert call.kwargs["triggered_by"] == "live_engine"
+    assert "duration" in call.kwargs
     await db.close()
 
 
@@ -348,9 +358,10 @@ async def test_dispatch_live_ip_ban_engages_killswitch(tmp_path):
     adapter.await_fill_confirmation = AsyncMock()
     engine = await _make_engine(db, routing=routing, adapter=adapter)
     await engine._dispatch_live(paper_trade=_make_paper_trade(), size_usd=10.0)
-    engine._ks.engage.assert_awaited_once()
-    call = engine._ks.engage.call_args
+    engine._ks.trigger.assert_awaited_once()
+    call = engine._ks.trigger.call_args
     assert call.kwargs["reason"] == "binance_ip_banned"
+    assert call.kwargs["triggered_by"] == "live_engine"
     await db.close()
 
 
@@ -365,7 +376,7 @@ async def test_dispatch_live_venue_transient_no_counter(tmp_path):
     adapter.await_fill_confirmation = AsyncMock()
     engine = await _make_engine(db, routing=routing, adapter=adapter)
     await engine._dispatch_live(paper_trade=_make_paper_trade(), size_usd=10.0)
-    engine._ks.engage.assert_not_called()
+    engine._ks.trigger.assert_not_called()
     cur = await db._conn.execute("SELECT COUNT(*) FROM signal_venue_correction_count")
     assert (await cur.fetchone())[0] == 0
     await db.close()
