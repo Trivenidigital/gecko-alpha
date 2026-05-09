@@ -341,8 +341,18 @@ Collapsing flags buys nothing (the operator must still verify each invariant) an
 ## 11. Approval checklist
 
 Before merge:
-- [ ] Plan-stage 2-reviewer pass complete (DONE — folded at e6c4b4e)
-- [ ] Design-stage 2-reviewer pass complete (THIS DOC)
+- [x] Plan-stage 2-reviewer pass complete (folded at e6c4b4e / a4f2fa6)
+- [x] Design-stage 2-reviewer pass complete (folded in d2de30b + this commit)
 - [ ] All folds applied + test coverage verified
 - [ ] Build → PR → 3-vector reviewer pass → merge → deploy
 - [ ] M1.5b deploy complete + first signal observed (live OR shadow OR paper as posture dictates)
+
+## 12. Runbook update task (R2-I4 fold)
+
+The plan adds a NEW Task 5 (after Task 4 regression+black, before PR creation) to update `docs/runbooks/live-trading-deploy.md`:
+
+1. **§4 .env activation checklist** — add `LIVE_USE_ROUTING_LAYER=True` as a REQUIRED checklist item
+2. **§4 first-dispatch verification block** (NEW) — add the pre-flip verification command (`SELECT * FROM venue_health` returns empty) + walkaway calc + post-flip log greps from design §3
+3. **§5 reversibility** — add an in-flight caveat note: "if engine restart happens between place_order_request and await_fill_confirmation, the order is live on Binance with no engine watcher; cleanup per §6"
+4. **§6 orphaned trade reconciliation** — extend the SELECT query annotation to cover M1.5b's specific scenario (flag flipped mid-`await_fill`), explicit step-by-step manual remediation
+5. **§7 deferred items** — reslate from "M1.5a → M1.5b deferred" to "M1.5b → M1.5c deferred"; remove items closed by M1.5b (engine routing dispatch, correction counter writers); keep items deferred to M1.5c (Telegram approval gateway, recurring health probe, reconciliation worker)
