@@ -2922,13 +2922,24 @@ class Database:
                     )
                     continue
 
-                new_table_sql_renamed = new_table_sql.replace(
-                    f"TABLE {table} (", f"TABLE {table}_new (", 1
-                ).replace(
-                    f"TABLE IF NOT EXISTS {table} (",
+                # Hotfix 2026-05-09: prod's sqlite_master.sql uses
+                # CREATE TABLE "shadow_trades" (quoted) after M1's V3-C1
+                # rebuild. Original substring replace missed that. Use
+                # regex covering both quoted + unquoted + IF-NOT-EXISTS.
+                new_table_sql_renamed = _re.sub(
+                    rf'TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?{table}["`]?\s*\(',
                     f"TABLE {table}_new (",
-                    1,
+                    new_table_sql,
+                    count=1,
+                    flags=_re.IGNORECASE,
                 )
+                if new_table_sql_renamed == new_table_sql:
+                    _log.warning(
+                        "reject_reason_check_v2_rename_pattern_miss",
+                        table=table,
+                        sql_excerpt=new_table_sql[:200],
+                    )
+                    continue
 
                 # Drop dependent views before rebuild (M1 hotfix lesson —
                 # cross_venue_exposure references live_trades).
