@@ -9,7 +9,7 @@ StateDirectory=gecko-alpha
 StateDirectoryMode=0750
 Environment=GECKO_BACKUP_DIR=/root/gecko-alpha
 Environment=GECKO_BACKUP_KEEP=3
-Environment=GECKO_BACKUP_HEARTBEAT_FILE=/var/lib/gecko-alpha/backup-last-ok
+Environment=GECKO_BACKUP_HEARTBEAT_FILE=/var/lib/gecko-alpha/backup-rotation/backup-last-ok
 ExecStartPre=/usr/bin/test -x /usr/local/bin/gecko-backup-rotate.sh
 ExecStart=/usr/local/bin/gecko-backup-rotate.sh
 TimeoutStartSec=120

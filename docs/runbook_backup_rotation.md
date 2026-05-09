@@ -9,9 +9,17 @@ Closes the recurring "disk-100% during deploy" incident pattern (BL-076 deploy
 - Daily at 03:00 UTC: `gecko-backup-rotate.sh` keeps the top-N most-recent
   `scout.db.bak.*` and `scout.db.bak-*` files in `/root/gecko-alpha/`,
   deletes the rest. N defaults to 3.
-- Daily at 09:00 UTC: `gecko-backup-watchdog.sh` checks the heartbeat
-  `/var/lib/gecko-alpha/backup-last-ok`. If older than 48h or missing,
-  fires a Telegram alert via `scout.alerter.send_telegram_message`.
+- Daily at 09:00 UTC: `gecko-backup-watchdog.sh` checks the heartbeat at
+  `/var/lib/gecko-alpha/backup-rotation/backup-last-ok`. If older than 48h,
+  missing, or corrupt (empty / non-numeric), fires a Telegram alert via
+  direct `curl` to the bot API.
+
+## Pre-install: kernel + systemd version check
+
+```bash
+ssh srilu-vps 'uname -r && systemctl --version | head -1'
+# Expected: Linux 6.x kernel, systemd 252+ (Ubuntu 24.04 LTS)
+```
 
 ## One-time install
 
@@ -44,19 +52,38 @@ ssh srilu-vps '
 '
 ```
 
-## Verify install
-
-```bash
-ssh srilu-vps 'systemctl status gecko-backup.timer gecko-backup-watchdog.timer'
-# Both should show: active (waiting), enabled
-```
+## Smoke test #1: rotation manually fires
 
 ```bash
 ssh srilu-vps 'systemctl start gecko-backup.service && \
   journalctl -u gecko-backup.service -n 30 --no-pager'
-# Should print: dir=/root/gecko-alpha found=N keep=3
-# Either "no rotation needed" OR "rm -v" lines + "deleted=X retained=3"
-# Final line: "heartbeat updated at /var/lib/gecko-alpha/backup-last-ok"
+```
+
+Expected: `gecko-backup-rotate: dir=/root/gecko-alpha found=N keep=3` and either
+`no rotation needed` OR `rotating X files:` + per-file paths + final line
+`heartbeat updated at /var/lib/gecko-alpha/backup-rotation/backup-last-ok`.
+
+## Smoke test #2: watchdog Telegram delivery (R7 MUST-FIX)
+
+Without this step, a misconfigured watchdog fails silently for 48h before the
+operator notices.
+
+```bash
+ssh srilu-vps '
+  date -d "50 hours ago" +%s > /var/lib/gecko-alpha/backup-rotation/backup-last-ok
+  systemctl start gecko-backup-watchdog.service
+  journalctl -u gecko-backup-watchdog.service -n 20 --no-pager
+'
+```
+
+Expected: Telegram message arrives in operator's chat within ~5s; journal
+shows `ALERT DELIVERED: HTTP 200`. If you see `ERROR: TELEGRAM_BOT_TOKEN
+missing/placeholder`, fix `.env` before relying on this watchdog.
+
+After the smoke test, restore the heartbeat:
+
+```bash
+ssh srilu-vps 'systemctl start gecko-backup.service'
 ```
 
 ## Manual rotation (e.g., disk pressure before next 03:00)
@@ -77,52 +104,53 @@ ssh srilu-vps 'systemctl daemon-reload && systemctl restart gecko-backup.timer'
 
 ## Persistent=true behavior — operator warning
 
-`systemctl enable --now gecko-backup.timer` sees that today's 03:00 window has
-been missed (assuming install happens after 03:00 UTC) and per `Persistent=true`
-fires `gecko-backup.service` IMMEDIATELY (within the `AccuracySec=1h` smear
-window). Same for the watchdog at 09:00.
-
-This is benign but surprising. The operator's manual backup, if just-created,
-is the NEWEST file and is preserved as #1; older backups rotate normally. To
-avoid the immediate fire entirely:
-
-- Install during the 03:00–04:00 UTC window (no missed window).
-- OR `systemctl enable gecko-backup.timer` WITHOUT `--now`, then
-  `systemctl start` only when ready.
+`systemctl enable --now gecko-backup.timer` after 03:00 UTC fires the rotation
+service immediately (within `AccuracySec=1h`). Same for the watchdog at 09:00.
+The newest manual backup (if any) is preserved as #1; older backups rotate.
+To avoid the immediate fire: install during 03:00–04:00 UTC, or use
+`systemctl enable` without `--now`.
 
 ## Heartbeat is persistent across reboots
 
-The heartbeat file lives in `/var/lib/gecko-alpha/backup-last-ok` — a
-persistent path managed by the systemd `StateDirectory=gecko-alpha` directive,
-not `/var/run/` (which is `tmpfs` and clears at boot). The watchdog will NOT
-false-positive after a reboot.
+The heartbeat lives in `/var/lib/gecko-alpha/backup-rotation/`
+(`StateDirectory=gecko-alpha` + script `mkdir -p`). NOT `/var/run` (`tmpfs`).
+The watchdog will NOT false-positive after a reboot.
 
 ## Race with operator's manual backup
 
-If the operator runs `cp scout.db scout.db.bak.X` while the timer fires
-concurrently, the rotation script's `flock` guard exits 3 cleanly without
-rotating. Next 03:00 fire processes both files together by mtime. No
-corruption, no data loss.
+If `cp scout.db scout.db.bak.X` runs concurrently with the timer, the
+rotation script's `flock` guard exits 3 cleanly. Next 03:00 fire processes
+both files together by mtime.
 
-## Watchdog alert
+## Watchdog alert delivery path
 
-If `gecko-backup.service` fails or is silently disabled, the watchdog timer
-fires daily at 09:00 UTC and sends a Telegram alert via
-`scout.alerter.send_telegram_message` (uses `.env` Telegram credentials —
-verified wired 2026-05-06).
+The watchdog reads `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` from
+`/root/gecko-alpha/.env` and POSTs directly to the Telegram bot API via
+`curl`. It does NOT use `scout.alerter.send_telegram_message` (which takes
+3 positional args including `aiohttp.ClientSession` and swallows HTTP errors).
 
-When you receive the alert:
+Watchdog exit codes:
+- `0` — heartbeat fresh, no alert needed
+- `1` — heartbeat stale/missing/corrupt, alert delivered (HTTP 200)
+- `4` — env file not found
+- `5` — credentials missing/placeholder
+- `6` — system python missing
+- `7` — Telegram API delivery failed (HTTP non-200)
 
-1. `journalctl -u gecko-backup.service -n 100 --no-pager` — last successful run.
-2. `cat /var/lib/gecko-alpha/backup-last-ok` — heartbeat timestamp.
-3. Manually trigger via `systemctl start gecko-backup.service` once root
-   cause is fixed.
+When you receive a Telegram alert:
+1. `journalctl -u gecko-backup.service -n 100 --no-pager`
+2. `cat /var/lib/gecko-alpha/backup-rotation/backup-last-ok`
+3. Manually trigger `systemctl start gecko-backup.service` after fix.
 
-## Run the test suite on the VPS (verification)
+When the watchdog itself enters `failed` state (no second-channel alert):
+1. `systemctl status gecko-backup-watchdog.service`
+2. `journalctl -u gecko-backup-watchdog.service -n 50` — diagnose exit code.
+3. Fix `.env` credentials or network egress; restart timer.
+
+## Run the test suite on the VPS
 
 ```bash
-ssh srilu-vps 'cd /root/gecko-alpha && uv run pytest tests/test_backup_rotate_script.py -v'
-# 17 tests should pass. They skip on Windows but run on Linux.
+ssh srilu-vps 'cd /root/gecko-alpha && /root/.local/bin/uv run pytest tests/test_backup_rotate_script.py -v'
 ```
 
 ## Disable / revert
@@ -136,7 +164,7 @@ ssh srilu-vps '
         /etc/systemd/system/gecko-backup.{service,timer} \
         /etc/systemd/system/gecko-backup-watchdog.{service,timer}
   systemctl daemon-reload
-  rm -rf /var/lib/gecko-alpha
+  rm -rf /var/lib/gecko-alpha/backup-rotation
   rm -f /var/lock/gecko-backup-rotate.lock
 '
 ```
@@ -147,3 +175,8 @@ ssh srilu-vps '
 - Offsite upload to S3/Backblaze (Phase 2).
 - Backup integrity verification (`PRAGMA integrity_check`).
 - Pre-deploy backup hook (auto-create backup before each `git pull`).
+- Second-channel watchdog alert (e.g., file drop in `/var/log/...`) so
+  a Telegram-API outage doesn't leave the operator silently uninformed.
+  Today: if Telegram is down, the watchdog enters `failed` state and the
+  operator must observe via `systemctl status` or `journalctl`. Acceptable
+  trade-off for v1; documented here as known gap.

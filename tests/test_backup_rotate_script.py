@@ -2,12 +2,12 @@
 
 Test methodology: each test creates an isolated tmp_path with fake backup
 files at staggered mtimes (via os.utime), then invokes the bash script via
-subprocess with environment overrides. Asserts on file survival + heartbeat
-state + exit code.
+subprocess with environment overrides.
 
-Watchdog tests use a stub `uv` script on $PATH (also overrides UV_BIN env)
-to observe the Telegram-via-uv-run-python alert path without making a real
-network call.
+Watchdog has two alert-delivery paths:
+- UV_BIN set: invoke stub recorder (tested via _run_watchdog).
+- UV_BIN unset: read $ENV_FILE for Telegram creds + curl direct (tested via
+  _run_watchdog_real_path with ENV_FILE pointing at fixture-controlled paths).
 
 Skipped on Windows: bash + flock + os.utime semantics differ. The scripts
 are deployed to Linux only (Hetzner VPS via systemd).
@@ -16,7 +16,7 @@ are deployed to Linux only (Hetzner VPS via systemd).
 from __future__ import annotations
 
 import os
-import shutil
+import shlex
 import subprocess
 import sys
 import time
@@ -59,13 +59,10 @@ def _run(env_overrides=None, cwd=None):
 
 
 def test_keeps_top_n_by_mtime(tmp_path):
-    """5 backups, KEEP=3 → top-3-by-mtime survive."""
     now = time.time()
     for i, age_hours in enumerate([10, 20, 30, 40, 50]):
         _make_backup(
-            tmp_path,
-            f"scout.db.bak.tag{i}.{int(now)}",
-            now - age_hours * 3600,
+            tmp_path, f"scout.db.bak.tag{i}.{int(now)}", now - age_hours * 3600
         )
     hb = tmp_path / "hb"
     res = _run(
@@ -78,11 +75,8 @@ def test_keeps_top_n_by_mtime(tmp_path):
     )
     assert res.returncode == 0, res.stderr
     surviving = sorted(
-        p.name
-        for p in tmp_path.iterdir()
-        if p.name not in {"hb", "lock"}
+        p.name for p in tmp_path.iterdir() if p.name not in {"hb", "lock"}
     )
-    # Top-3 by recency: tag0 (10h), tag1 (20h), tag2 (30h) survive.
     assert any("tag0" in n for n in surviving)
     assert any("tag1" in n for n in surviving)
     assert any("tag2" in n for n in surviving)
@@ -92,7 +86,6 @@ def test_keeps_top_n_by_mtime(tmp_path):
 
 
 def test_idempotent_rerun_on_trimmed_dir(tmp_path):
-    """Re-running on a 3-file dir with KEEP=3 is a no-op."""
     now = time.time()
     for i in range(3):
         _make_backup(tmp_path, f"scout.db.bak.tag{i}.x", now - i * 3600)
@@ -106,14 +99,11 @@ def test_idempotent_rerun_on_trimmed_dir(tmp_path):
     _run(env)
     res2 = _run(env)
     assert res2.returncode == 0
-    surviving = [
-        p for p in tmp_path.iterdir() if p.name not in {"hb", "lock"}
-    ]
+    surviving = [p for p in tmp_path.iterdir() if p.name not in {"hb", "lock"}]
     assert len(surviving) == 3
 
 
 def test_empty_dir_is_noop(tmp_path):
-    """Empty backup dir — exit 0, no error, heartbeat written."""
     hb = tmp_path / "hb"
     res = _run(
         {
@@ -129,7 +119,6 @@ def test_empty_dir_is_noop(tmp_path):
 
 
 def test_keep_zero_deletes_everything(tmp_path):
-    """KEEP=0 operator escape hatch — all backups deleted."""
     now = time.time()
     for i in range(3):
         _make_backup(tmp_path, f"scout.db.bak.tag{i}", now - i * 3600)
@@ -143,18 +132,13 @@ def test_keep_zero_deletes_everything(tmp_path):
         }
     )
     assert res.returncode == 0
-    remaining = [
-        p
-        for p in tmp_path.iterdir()
-        if p.name not in {"hb", "lock"}
-    ]
+    remaining = [p for p in tmp_path.iterdir() if p.name not in {"hb", "lock"}]
     assert len(remaining) == 0
 
 
 def test_unified_sort_across_both_name_patterns(tmp_path):
     """R2 MUST-FIX regression-lock: both naming patterns participate in
-    a SINGLE mtime sort. 8 alternating files, KEEP=3 → exactly 3 survive
-    (NOT 6 = 3-from-each-bucket)."""
+    a SINGLE mtime sort. 8 alternating files, KEEP=3 → exactly 3 survive."""
     now = time.time()
     for i, hours_ago in enumerate([1, 2, 3, 4, 5, 6, 7, 8]):
         if i % 2 == 0:
@@ -172,15 +156,8 @@ def test_unified_sort_across_both_name_patterns(tmp_path):
         }
     )
     assert res.returncode == 0
-    surviving = [
-        p.name
-        for p in tmp_path.iterdir()
-        if p.name not in {"hb", "lock"}
-    ]
-    assert len(surviving) == 3, (
-        f"Expected exactly 3 survivors (single unified sort); got "
-        f"{len(surviving)}: {surviving}"
-    )
+    surviving = [p.name for p in tmp_path.iterdir() if p.name not in {"hb", "lock"}]
+    assert len(surviving) == 3
 
 
 # ----------------------------------------------------------------------
@@ -189,22 +166,15 @@ def test_unified_sort_across_both_name_patterns(tmp_path):
 
 
 def test_unset_dir_aborts(tmp_path):
-    """R1 MUST-FIX: GECKO_BACKUP_DIR unset → script exits non-zero."""
     env = {k: v for k, v in os.environ.items() if k != "GECKO_BACKUP_DIR"}
     env["GECKO_BACKUP_HEARTBEAT_FILE"] = str(tmp_path / "hb")
     env["GECKO_BACKUP_LOCK_FILE"] = str(tmp_path / "lock")
-    res = subprocess.run(
-        ["bash", str(SCRIPT)],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    res = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
     assert res.returncode != 0
     assert "GECKO_BACKUP_DIR" in res.stderr
 
 
 def test_nonexistent_dir_aborts(tmp_path):
-    """R1 MUST-FIX: GECKO_BACKUP_DIR set to nonexistent path → exit 2."""
     nonexistent = tmp_path / "does-not-exist"
     res = _run(
         {
@@ -219,7 +189,6 @@ def test_nonexistent_dir_aborts(tmp_path):
 
 
 def test_negative_keep_aborts(tmp_path):
-    """R3 NIT: GECKO_BACKUP_KEEP=-1 is rejected by `^[0-9]+$` regex → exit 2."""
     hb = tmp_path / "hb"
     _make_backup(tmp_path, "scout.db.bak.x", time.time())
     res = _run(
@@ -235,18 +204,9 @@ def test_negative_keep_aborts(tmp_path):
 
 
 def test_unwritable_heartbeat_path_aborts(tmp_path):
-    """R3 MUST-FIX: heartbeat-write failure must surface, not silently succeed.
-
-    Original draft used `chmod 000` on a parent dir, but root bypasses DAC
-    permissions on Linux — the test passed silently when run as root on the
-    VPS during pre-PR verification. Switched to path-blocked-by-regular-file:
-    the script's `mkdir -p $(dirname $HB)` fails with ENOTDIR ("Not a
-    directory") because the parent path component is a file. Root cannot
-    bypass this kernel-level error.
-    """
+    """R3 MUST-FIX: heartbeat-write failure must surface (ENOTDIR — root cannot bypass)."""
     blocker_file = tmp_path / "blocker_file"
     blocker_file.write_text("not a directory")
-    # Heartbeat would-be-parent is a regular file → mkdir -p fails ENOTDIR.
     hb = blocker_file / "hb"
     _make_backup(tmp_path, "scout.db.bak.x", time.time())
     res = _run(
@@ -257,10 +217,7 @@ def test_unwritable_heartbeat_path_aborts(tmp_path):
             "GECKO_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
         }
     )
-    assert res.returncode != 0, (
-        f"Expected non-zero exit for unwritable heartbeat; "
-        f"got {res.returncode}, stderr={res.stderr}"
-    )
+    assert res.returncode != 0
 
 
 def test_flock_concurrent_invocation_exits_3(tmp_path):
@@ -268,14 +225,12 @@ def test_flock_concurrent_invocation_exits_3(tmp_path):
     hb = tmp_path / "hb"
     lock = tmp_path / "lock"
     _make_backup(tmp_path, "scout.db.bak.x", time.time())
-
-    # Hold the lock with a separate flock invocation that sleeps so the
-    # file desc stays open during our test invocation.
+    quoted_lock = shlex.quote(str(lock))
     holder = subprocess.Popen(
-        ["bash", "-c", f"exec 9>{lock}; flock 9; sleep 5"],
+        ["bash", "-c", f"exec 9>{quoted_lock}; flock 9; sleep 5"],
     )
     try:
-        time.sleep(0.5)  # give holder time to take the lock
+        time.sleep(0.5)
         res = _run(
             {
                 "GECKO_BACKUP_DIR": str(tmp_path),
@@ -284,11 +239,7 @@ def test_flock_concurrent_invocation_exits_3(tmp_path):
                 "GECKO_BACKUP_LOCK_FILE": str(lock),
             }
         )
-        assert res.returncode == 3, (
-            f"Expected exit 3 for lock contention; got {res.returncode} "
-            f"stderr={res.stderr}"
-        )
-        # Heartbeat must NOT be written when locked out.
+        assert res.returncode == 3
         assert not hb.exists()
     finally:
         holder.terminate()
@@ -296,13 +247,11 @@ def test_flock_concurrent_invocation_exits_3(tmp_path):
 
 
 # ----------------------------------------------------------------------
-# Rotation script — heartbeat + symlink + space safety
+# Heartbeat + symlink + space safety
 # ----------------------------------------------------------------------
 
 
 def test_filename_with_space_preserved(tmp_path):
-    """R2 NIT: pathological filename with embedded space — `cut` preserves
-    the path correctly. Locks the `cut -d' ' -f2-` choice over `awk`."""
     now = time.time()
     _make_backup(tmp_path, "scout.db.bak.tag.normal", now - 1)
     _make_backup(tmp_path, "scout.db.bak. extra-tag", now - 2)
@@ -318,9 +267,7 @@ def test_filename_with_space_preserved(tmp_path):
     )
     assert res.returncode == 0, res.stderr
     surviving = sorted(
-        p.name
-        for p in tmp_path.iterdir()
-        if p.name not in {"hb", "lock"}
+        p.name for p in tmp_path.iterdir() if p.name not in {"hb", "lock"}
     )
     assert "scout.db.bak.tag.normal" in surviving
     assert "scout.db.bak. extra-tag" in surviving
@@ -328,10 +275,6 @@ def test_filename_with_space_preserved(tmp_path):
 
 
 def test_heartbeat_written_on_success(tmp_path):
-    """Heartbeat file is written with current epoch on success.
-
-    R3 MUST-FIX: float bounds with 1s tolerance for slow CI / clock-skew.
-    """
     hb = tmp_path / "hb"
     _make_backup(tmp_path, "scout.db.bak.x", time.time())
     before = time.time()
@@ -343,17 +286,14 @@ def test_heartbeat_written_on_success(tmp_path):
             "GECKO_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
         }
     )
-    after = time.time() + 1  # 1s tolerance for slow CI / int truncation
+    after = time.time() + 1
     assert res.returncode == 0
     assert hb.exists()
     written = int(hb.read_text().strip())
-    assert before - 1 <= written <= after, (
-        f"heartbeat={written} not within [{before-1}, {after}]"
-    )
+    assert before - 1 <= written <= after
 
 
 def test_heartbeat_NOT_written_on_failure(tmp_path):
-    """Heartbeat NOT updated when script fails (e.g., bad dir → exit 2)."""
     hb = tmp_path / "hb"
     res = _run(
         {
@@ -367,12 +307,28 @@ def test_heartbeat_NOT_written_on_failure(tmp_path):
     assert not hb.exists()
 
 
+def test_heartbeat_atomic_write_via_rename(tmp_path):
+    """R6 MUST-FIX regression-lock: heartbeat must be written via .tmp + mv-f rename."""
+    hb = tmp_path / "hb"
+    _make_backup(tmp_path, "scout.db.bak.x", time.time())
+    res = _run(
+        {
+            "GECKO_BACKUP_DIR": str(tmp_path),
+            "GECKO_BACKUP_KEEP": "3",
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(hb),
+            "GECKO_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
+        }
+    )
+    assert res.returncode == 0
+    tmp_files = [p for p in tmp_path.iterdir() if p.name.startswith("hb.tmp.")]
+    assert tmp_files == [], f"orphan tmp files: {tmp_files}"
+
+
 def test_symlink_not_followed(tmp_path):
-    """Defensive: symlink matching the glob is NOT rotated (-type f filter)."""
     real = tmp_path / "scout.db.bak.real"
     real.write_text("x")
     target_outside = tmp_path / "outside.db"
-    target_outside.write_text("important — should not be touched")
+    target_outside.write_text("important")
     symlink = tmp_path / "scout.db.bak.symlink"
     symlink.symlink_to(target_outside)
     hb = tmp_path / "hb"
@@ -385,34 +341,24 @@ def test_symlink_not_followed(tmp_path):
         }
     )
     assert res.returncode == 0
-    # The real file got deleted (matches -type f).
     assert not real.exists()
-    # The symlink was NOT followed; target_outside survives.
     assert target_outside.exists()
-    assert target_outside.read_text() == "important — should not be touched"
-    # The symlink inode itself was NOT in the deletion list.
-    assert symlink.is_symlink(), (
-        "symlink should survive — find -type f must exclude symlinks"
-    )
+    assert symlink.is_symlink()
 
 
 # ----------------------------------------------------------------------
-# Watchdog tests — R3 CRITICAL gap closed.
-# Stub `uv` to observe the Telegram-via-uv-run-python alert path without
-# making a real network call.
+# Watchdog tests — UV_BIN stub path
 # ----------------------------------------------------------------------
 
 
 def _make_uv_stub(tmp_path: Path) -> tuple[Path, Path]:
-    """Create a stub `uv` script that records its invocation to a marker."""
     stub_dir = tmp_path / "stubs"
     stub_dir.mkdir()
     stub = stub_dir / "uv"
     marker = tmp_path / "alert_marker"
+    quoted_marker = shlex.quote(str(marker))
     stub.write_text(
-        "#!/usr/bin/env bash\n"
-        f'echo "uv called: $@" >> {marker}\n'
-        "exit 0\n"
+        "#!/usr/bin/env bash\n" f'echo "uv called: $@" >> {quoted_marker}\n' "exit 0\n"
     )
     stub.chmod(0o755)
     return stub, marker
@@ -434,7 +380,6 @@ def _run_watchdog(tmp_path: Path, env_overrides):
 
 
 def test_watchdog_missing_heartbeat_alerts(tmp_path):
-    """R3 CRITICAL: heartbeat file missing → watchdog fires alert (exit 1)."""
     res, marker = _run_watchdog(
         tmp_path,
         {
@@ -445,13 +390,12 @@ def test_watchdog_missing_heartbeat_alerts(tmp_path):
     )
     assert res.returncode == 1, res.stderr
     assert "MISSING" in res.stdout or "MISSING" in res.stderr
-    assert marker.exists(), "uv stub was not called — alert path skipped"
+    assert marker.exists()
 
 
 def test_watchdog_stale_heartbeat_alerts(tmp_path):
-    """R3 CRITICAL: heartbeat older than threshold → watchdog fires alert."""
     hb = tmp_path / "hb"
-    hb.write_text(str(int(time.time() - 49 * 3600)))  # 49h ago > 48h
+    hb.write_text(str(int(time.time() - 49 * 3600)))
     res, marker = _run_watchdog(
         tmp_path,
         {
@@ -461,13 +405,12 @@ def test_watchdog_stale_heartbeat_alerts(tmp_path):
         },
     )
     assert res.returncode == 1
-    assert marker.exists(), "stale-path alert was not delivered"
+    assert marker.exists()
 
 
 def test_watchdog_fresh_heartbeat_ok(tmp_path):
-    """R3 CRITICAL: heartbeat fresh → exit 0, NO alert delivered."""
     hb = tmp_path / "hb"
-    hb.write_text(str(int(time.time() - 3600)))  # 1h ago
+    hb.write_text(str(int(time.time() - 3600)))
     res, marker = _run_watchdog(
         tmp_path,
         {
@@ -478,4 +421,130 @@ def test_watchdog_fresh_heartbeat_ok(tmp_path):
     )
     assert res.returncode == 0
     assert "OK:" in res.stdout
-    assert not marker.exists(), "uv stub was unexpectedly called on fresh path"
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "corrupt_content, label",
+    [
+        ("", "empty"),
+        ("not-a-number", "non-numeric"),
+        ("1234abc", "mixed"),
+        ("\n", "newline-only"),
+        ("   ", "whitespace-only"),
+    ],
+)
+def test_watchdog_corrupt_heartbeat_alerts(tmp_path, corrupt_content, label):
+    """R5 + R6 CRITICAL: corrupt heartbeat must NOT die in bash arithmetic."""
+    hb = tmp_path / "hb"
+    hb.write_text(corrupt_content)
+    res, marker = _run_watchdog(
+        tmp_path,
+        {
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(hb),
+            "GECKO_REPO": str(tmp_path),
+            "GECKO_BACKUP_STALE_AFTER_SEC": "172800",
+        },
+    )
+    assert (
+        res.returncode == 1
+    ), f"Corrupt heartbeat ({label!r}) should fire alert; got {res.returncode} stderr={res.stderr}"
+    assert "CORRUPT" in res.stdout
+    assert marker.exists()
+
+
+# ----------------------------------------------------------------------
+# Watchdog — real (non-stub) Telegram delivery path
+# ----------------------------------------------------------------------
+
+
+def _run_watchdog_real_path(tmp_path: Path, env_overrides):
+    env = os.environ.copy()
+    env.pop("UV_BIN", None)
+    env.update(env_overrides)
+    return subprocess.run(
+        ["bash", str(WATCHDOG_SCRIPT)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_watchdog_no_env_file_exits_4(tmp_path):
+    res = _run_watchdog_real_path(
+        tmp_path,
+        {
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(tmp_path / "missing-hb"),
+            "GECKO_REPO": str(tmp_path),
+            "GECKO_ENV_FILE": str(tmp_path / "no-such-env"),
+            "GECKO_BACKUP_STALE_AFTER_SEC": "172800",
+        },
+    )
+    assert res.returncode == 4
+    assert "env file" in res.stderr
+    assert "alert NOT delivered" in res.stderr
+
+
+def test_watchdog_placeholder_token_exits_5(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("TELEGRAM_BOT_TOKEN=placeholder\nTELEGRAM_CHAT_ID=12345\n")
+    res = _run_watchdog_real_path(
+        tmp_path,
+        {
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(tmp_path / "missing-hb"),
+            "GECKO_REPO": str(tmp_path),
+            "GECKO_ENV_FILE": str(env_file),
+            "GECKO_BACKUP_STALE_AFTER_SEC": "172800",
+        },
+    )
+    assert res.returncode == 5
+    assert "TELEGRAM_BOT_TOKEN" in res.stderr
+
+
+def test_watchdog_placeholder_chat_id_exits_5(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("TELEGRAM_BOT_TOKEN=real-looking-token\nTELEGRAM_CHAT_ID=\n")
+    res = _run_watchdog_real_path(
+        tmp_path,
+        {
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(tmp_path / "missing-hb"),
+            "GECKO_REPO": str(tmp_path),
+            "GECKO_ENV_FILE": str(env_file),
+            "GECKO_BACKUP_STALE_AFTER_SEC": "172800",
+        },
+    )
+    assert res.returncode == 5
+    assert "TELEGRAM_CHAT_ID" in res.stderr
+
+
+def test_watchdog_fresh_heartbeat_skips_alert_path(tmp_path):
+    hb = tmp_path / "hb"
+    hb.write_text(str(int(time.time() - 3600)))
+    res = _run_watchdog_real_path(
+        tmp_path,
+        {
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(hb),
+            "GECKO_REPO": str(tmp_path),
+            "GECKO_ENV_FILE": str(tmp_path / "would-have-errored"),
+            "GECKO_BACKUP_STALE_AFTER_SEC": "172800",
+        },
+    )
+    assert res.returncode == 0
+    assert "OK:" in res.stdout
+
+
+def test_watchdog_path_with_apostrophe_does_not_break(tmp_path):
+    """R5/R6 CRITICAL regression-lock: HEARTBEAT path with apostrophe."""
+    weird_dir = tmp_path / "it's-broken"
+    weird_dir.mkdir()
+    weird_hb = weird_dir / "hb"
+    res, marker = _run_watchdog(
+        tmp_path,
+        {
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(weird_hb),
+            "GECKO_REPO": str(tmp_path),
+            "GECKO_BACKUP_STALE_AFTER_SEC": "172800",
+        },
+    )
+    assert res.returncode == 1
+    assert marker.exists()
