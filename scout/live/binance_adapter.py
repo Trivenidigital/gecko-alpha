@@ -12,6 +12,7 @@ Implements the weight-header governor (§9.1) and retry taxonomy (§10.1).
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -30,6 +31,19 @@ from scout.live.exceptions import RateLimitError, VenueTransientError
 from scout.live.types import Depth, DepthLevel
 
 log = structlog.get_logger(__name__)
+
+
+# M1.5a — typed exceptions for signed-endpoint failures (Task 1.5).
+class BinanceAuthError(Exception):
+    """-2014 (signature) / -2015 (auth) / -1021 (timestamp). Never retry."""
+
+
+class BinanceIPBanError(Exception):
+    """HTTP 418 — distinct from 429; back off MINUTES (operator action)."""
+
+
+class BinanceDuplicateOrderError(Exception):
+    """-2010 duplicate newClientOrderId. Caller recovers via origClientOrderId GET."""
 
 
 _BASE_URL = "https://api.binance.com"
@@ -87,14 +101,30 @@ class BinanceSpotAdapter(ExchangeAdapter):
     # ------------------------------------------------------------------
     # HTTP core
     # ------------------------------------------------------------------
-    async def _http_get(
-        self, path: str, params: dict[str, Any] | None = None
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        signed: bool = False,
     ) -> dict[str, Any]:
-        """Central Binance GET with retry taxonomy (spec §10.1).
+        """Central Binance HTTP — core method shared by signed + unsigned callers.
 
-        Returns the parsed JSON body, or the sentinel ``{"__code": -1121}``
-        when Binance answers 400 + code=-1121 (unknown symbol). Callers
-        such as :meth:`fetch_exchange_info_row` translate that to ``None``.
+        Retry taxonomy (spec §10.1):
+        - 200 → return JSON
+        - 400 + code=-1121 (unknown symbol) → return ``{"__code": -1121}`` sentinel
+        - 400 + code=-2010 (duplicate cid) → raise ``BinanceDuplicateOrderError`` (signed=True only)
+        - 4xx + auth codes -2014/-2015/-1021 → raise ``BinanceAuthError`` (signed=True only)
+        - 418 (IP ban) → raise ``BinanceIPBanError``
+        - 429 (rate limit) → raise ``RateLimitError``
+        - 5xx → retry up to 3 times with backoff, then raise ``VenueTransientError``
+        - Other 4xx → ``resp.raise_for_status()``
+        - Network/timeout → retry up to 3 times, then raise ``VenueTransientError``
+
+        Added in M1.5a (Task 1.5) to share retry+weight+429+418 across signed
+        and unsigned codepaths (R1-C1 plan-stage finding).
         """
         await self._rate_limit_gate.wait()
 
@@ -103,17 +133,29 @@ class BinanceSpotAdapter(ExchangeAdapter):
 
         for attempt in range(len(_BACKOFFS) + 1):
             try:
-                async with self._session.get(url, params=params) as resp:
+                if method == "GET":
+                    cm = self._session.get(url, params=params, headers=headers)
+                elif method == "POST":
+                    cm = self._session.post(url, params=params, headers=headers)
+                else:
+                    raise ValueError(f"Unsupported method: {method!r}")
+
+                async with cm as resp:
                     weight = int(resp.headers.get("X-MBX-USED-WEIGHT-1M", 0))
                     await self._update_weight_governor(weight)
+
+                    if resp.status == 418:
+                        # IP-ban — distinct from 429 transient (R1-I1)
+                        body = await resp.json(content_type=None)
+                        raise BinanceIPBanError(
+                            f"{method} {path}: 418 IP-banned: {body}"
+                        )
 
                     if resp.status == 429:
                         if self._db is not None and _metric_inc is not None:
                             try:
                                 await _metric_inc(self._db, "binance_rate_limit_hits")
                             except Exception:  # noqa: BLE001
-                                # Metric write is best-effort; never mask
-                                # the RateLimitError that follows.
                                 log.warning(
                                     "binance_rate_limit_metric_failed",
                                     exc_info=True,
@@ -130,33 +172,69 @@ class BinanceSpotAdapter(ExchangeAdapter):
                         raise last_exc
 
                     if resp.status == 400:
+                        # R2-M1: content-type sniff before json() — CDN HTML 5xx
+                        # masquerading as 400 raises clearer error.
+                        ctype = resp.headers.get("Content-Type", "")
+                        if "text/html" in ctype:
+                            raise VenueTransientError(
+                                f"binance 400: CDN error (HTML response)"
+                            )
                         body = await resp.json(content_type=None)
-                        if isinstance(body, dict) and body.get("code") == -1121:
-                            # Sentinel — caller translates to None.
-                            return {"__code": -1121}
-                        # Other 400s — raise immediately (no retry).
+                        if isinstance(body, dict):
+                            code = body.get("code")
+                            if code == -1121:
+                                # Unknown symbol — sentinel preserved
+                                return {"__code": -1121}
+                            if signed and code in (-2014, -2015, -1021):
+                                # Auth-class — never retry (R1-I1)
+                                raise BinanceAuthError(
+                                    f"{method} {path} failed code={code} "
+                                    f"msg={body.get('msg')!r}"
+                                )
+                            if signed and code == -2010:
+                                # Duplicate clientOrderId (R2-I2 dedup race)
+                                raise BinanceDuplicateOrderError(
+                                    f"duplicate newClientOrderId: {body.get('msg')!r}"
+                                )
+                        # Other 400s — raise (no retry).
                         resp.raise_for_status()
 
                     if resp.status >= 400:
-                        # 401/403/404/etc — raise immediately.
+                        # Signed callers: also map auth codes from non-400 responses
+                        if signed:
+                            try:
+                                body = await resp.json(content_type=None)
+                                code = (
+                                    body.get("code") if isinstance(body, dict) else None
+                                )
+                                if code in (-2014, -2015, -1021):
+                                    raise BinanceAuthError(
+                                        f"{method} {path} failed code={code} "
+                                        f"msg={body.get('msg')!r}"
+                                    )
+                            except (aiohttp.ContentTypeError, ValueError):
+                                pass
                         resp.raise_for_status()
 
                     return await resp.json()
 
             except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as exc:
-                # NOTE: some aiohttp versions raise from ``str(exc)`` when
-                # the exception was constructed with a null connection key
-                # (seen in tests). Render the type name instead — it is
-                # both safe and sufficient for logging.
-                last_exc = VenueTransientError(f"network error: {type(exc).__name__}")
+                last_exc = VenueTransientError(
+                    f"network error: {type(exc).__name__}"
+                )
                 if attempt < len(_BACKOFFS):
                     await self._retry_sleep(_BACKOFFS[attempt])
                     continue
                 raise last_exc
 
-        # Shouldn't be reached — the loop either returns or raises.
         assert last_exc is not None
         raise last_exc
+
+    async def _http_get(
+        self, path: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Public unsigned GET — back-compat wrapper over `_request`."""
+        return await self._request("GET", path, params=params, signed=False)
 
     async def _update_weight_governor(self, weight: int) -> None:
         """Adjust concurrency + gate state based on used-weight header."""
