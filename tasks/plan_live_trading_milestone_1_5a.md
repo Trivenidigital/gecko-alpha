@@ -67,7 +67,7 @@ grep "BINANCE_API_KEY\|BINANCE_API_SECRET" scout/config.py | head -3
 
 **If creds plumbing is missing, STOP and report BLOCKED.** Plan does NOT introduce Settings fields for BINANCE_API_KEY / BINANCE_API_SECRET — they must already exist in `scout/config.py` from BL-055. If absent, fix that first as a separate ticket. (R1-M4: previous wording was "flag and continue" — this hardens it to fail-fast since Task 2 cannot proceed without these.)
 
-- [ ] **Step 4: Add 2 new Settings fields**
+- [ ] **Step 4: Add 1 new Settings field (design-stage R2-C2 amended — rate-limit field dropped)**
 
 In `scout/config.py`, add (mirror the BL-NEW-LIVE-HYBRID block from M1):
 
@@ -77,31 +77,17 @@ In `scout/config.py`, add (mirror the BL-NEW-LIVE-HYBRID block from M1):
     # revert without git revert. Operator flips True after balance smoke check
     # passes on testnet (R2-I4).
     LIVE_USE_REAL_SIGNED_REQUESTS: bool = False
-
-    # M1.5a — rate-limit the LIVE_TRADING_ENABLED=True startup Telegram alert
-    # to ≤1 per N seconds. Prevents alert-spam during systemd restart loops
-    # if the balance smoke check is flapping (R2-I5).
-    LIVE_STARTUP_NOTIFICATION_MIN_INTERVAL_SEC: int = 300
 ```
 
-Plus a small validator on the second field (`> 0`).
+**Note on dropped field**: original plan included `LIVE_STARTUP_NOTIFICATION_MIN_INTERVAL_SEC` (R2-I5 fold) but design-stage R2-C2 reviewer flagged that the proposed `paper_migrations`-as-telemetry-store was schema-misuse. With Task 7.5's systemd hardening (`RestartSec=30s` + `StartLimitBurst=3`), the worst-case Telegram spam is 3 messages in 5 min before service goes `failed` — that's signal, not spam. **Drop the rate-limit entirely. Drop the Settings field. Drop the paper_migrations rate-limit query in Task 7.**
 
-- [ ] **Step 5: Failing test for the 2 new Settings**
+- [ ] **Step 5: Failing test**
 
 Add to `tests/test_live_master_kill.py`:
 
 ```python
 def test_live_use_real_signed_requests_defaults_off(self):
     assert Settings(_env_file=None, **_REQUIRED).LIVE_USE_REAL_SIGNED_REQUESTS is False
-
-
-def test_live_startup_notification_min_interval_default(self):
-    assert Settings(_env_file=None, **_REQUIRED).LIVE_STARTUP_NOTIFICATION_MIN_INTERVAL_SEC == 300
-
-
-def test_live_startup_notification_min_interval_must_be_positive(self):
-    with pytest.raises(ValueError, match="must be > 0"):
-        Settings(_env_file=None, **_REQUIRED, LIVE_STARTUP_NOTIFICATION_MIN_INTERVAL_SEC=0)
 ```
 
 - [ ] **Step 6: Run + commit**
@@ -109,8 +95,116 @@ def test_live_startup_notification_min_interval_must_be_positive(self):
 ```bash
 uv run --native-tls pytest tests/test_live_master_kill.py -v
 git add scout/config.py tests/test_live_master_kill.py
-git commit -m "feat(live-m1.5a): 2 new Settings fields (revert flag + Telegram rate-limit) — Task 0"
+git commit -m "feat(live-m1.5a): LIVE_USE_REAL_SIGNED_REQUESTS Settings field — Task 0"
 ```
+
+---
+
+## Task 0.5: NEW migration `bl_reject_reason_extend_v2` (design-stage R1-I1 + R2-I3)
+
+**Why this task exists:** Design-stage R1-I1 + R2-I3 both flagged that Gate 10's reject_reason taxonomy lacks granularity:
+- `LIVE_USE_REAL_SIGNED_REQUESTS=False` + Gate 10 fires under `mode='live'` → currently maps to generic `'insufficient_balance'`, hiding the kill-switch state.
+- `BinanceAuthError(-2015)` from POST permission denial → currently maps to generic `'insufficient_balance'`, mis-attributed as funds issue.
+
+**Fix:** add 2 new reject_reason values via table-rename migration (mirrors M1's `bl_reject_reason_extend_v1` from V3-C1).
+
+**Files:**
+- Modify: `scout/db.py` (new migration + `_create_tables` CHECK extension)
+- Modify: `scout/live/gates.py` (extend `VALID_REJECT_REASONS` frozenset)
+- Test: extend `tests/test_live_per_venue_services_migration.py` with reject_reason_extend_v2 stamp + INSERT-with-new-reasons test
+
+- [ ] **Step 1: Update `_create_tables` CHECK constraint**
+
+In `scout/db.py`, find the `live_trades` + `shadow_trades` CREATE TABLE blocks (lines ~1466 + 1502). The existing 16-value CHECK list grows to 18:
+
+```python
+                reject_reason       TEXT CHECK (reject_reason IS NULL OR reject_reason IN (
+                    'no_venue','insufficient_depth','slippage_exceeds_cap','insufficient_balance',
+                    'daily_cap_hit','kill_switch','exposure_cap','override_disabled',
+                    'venue_unavailable',
+                    'notional_cap_exceeded','signal_disabled','token_aggregate',
+                    'dual_signal_aggregate','all_candidates_failed',
+                    'master_kill','mode_paper',
+                    'live_signed_disabled','api_key_lacks_trade_scope'  -- M1.5a additions
+                )),
+```
+
+- [ ] **Step 2: Add migration `_migrate_reject_reason_extend_v2`** (schema_version 20260513)
+
+Mirror the body of `_migrate_reject_reason_extend` (M1's V3-C1 fix) but bump:
+- marker: `bl_reject_reason_extend_v2`
+- schema_version: `20260513`
+- new_check string: include the 2 new values
+
+Wire into `Database.initialize()` after `_migrate_reject_reason_extend` (at end of migration list).
+
+Implementation note: the existing `_migrate_reject_reason_extend` regex (`reject_reason\s+TEXT\s+CHECK\s*\(...\)\s*\)`) and table-rename logic are reusable; copy-paste with the new marker + new_check + version values. Idempotency check at top of v2 looks for `'live_signed_disabled'` in the existing CHECK SQL.
+
+- [ ] **Step 3: Update `VALID_REJECT_REASONS` frozenset**
+
+In `scout/live/gates.py`:
+
+```python
+VALID_REJECT_REASONS: frozenset[str] = frozenset({
+    # ... existing 16 values ...
+    "live_signed_disabled",        # M1.5a R1-I1
+    "api_key_lacks_trade_scope",   # M1.5a R2-I3
+})
+```
+
+- [ ] **Step 4: Tests**
+
+Add to `tests/test_live_per_venue_services_migration.py`:
+
+```python
+@pytest.mark.asyncio
+async def test_reject_reason_extend_v2_migration_recorded(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT version FROM schema_version WHERE description = ?",
+        ("bl_reject_reason_extend_v2",),
+    )
+    assert (await cur.fetchone())[0] == 20260513
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_reject_reason_check_accepts_m1_5a_new_values(tmp_path):
+    """live_signed_disabled + api_key_lacks_trade_scope must be acceptable INSERTs."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    # Seed paper_trade FK
+    cur = await db._conn.execute(
+        """INSERT INTO paper_trades
+           (token_id, symbol, name, chain, signal_type, signal_data,
+            entry_price, amount_usd, quantity, tp_price, sl_price,
+            status, opened_at)
+           VALUES ('tok', 'X', 'x', 'ethereum', 'first_signal', '{}',
+                   100, 50, 0.5, 120, 80, 'open',
+                   '2026-05-09T00:00:00+00:00')"""
+    )
+    paper_id = cur.lastrowid
+    for reason in ("live_signed_disabled", "api_key_lacks_trade_scope"):
+        await db._conn.execute(
+            """INSERT INTO live_trades
+               (paper_trade_id, coin_id, symbol, venue, pair, signal_type,
+                size_usd, status, reject_reason, created_at)
+               VALUES (?, 'x', 'X', 'binance', 'XUSDT', 'first_signal',
+                       '50', 'rejected', ?, '2026-05-09T00:00:00+00:00')""",
+            (paper_id, reason),
+        )
+    await db._conn.commit()
+    await db.close()
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git commit -am "feat(live-m1.5a): bl_reject_reason_extend_v2 migration — 2 new reasons (Task 0.5)"
+```
+
+---
 
 ---
 
@@ -1218,6 +1312,58 @@ git commit -am "feat(live-m1.5a): await_fill_confirmation runtime body + slippag
 
 **Plan-stage 2-reviewer fixes folded (R1-I3):** move `from scout.live.balance_gate import check_sufficient_balance` to top of `scout/live/gates.py` (matches existing convention at gates.py:28-31). Lazy import inside the gate body is a code smell — there's no circular dependency to dodge (balance_gate doesn't import gates).
 
+**Design-stage R1-I1 + R2-I3 folds:** Gate 10 returns 1 of 3 reject_reasons based on the failure shape (was: just `'insufficient_balance'`):
+
+```python
+        if self._config.mode == "live":
+            from scout.live.balance_gate import check_sufficient_balance
+            from scout.live.binance_adapter import BinanceAuthError
+
+            # M1.5a R1-I1: when LIVE_USE_REAL_SIGNED_REQUESTS=False, surface
+            # explicit kill-switch reject_reason so dashboard can distinguish
+            # "balance gate disabled" from "real balance insufficient."
+            if not self._config._s.LIVE_USE_REAL_SIGNED_REQUESTS:
+                return (
+                    GateResult(
+                        passed=False,
+                        reject_reason="live_signed_disabled",
+                        detail="LIVE_USE_REAL_SIGNED_REQUESTS=False — emergency-revert posture",
+                    ),
+                    venue,
+                )
+
+            try:
+                result = await check_sufficient_balance(
+                    self._adapter, float(size_usd), margin_factor=1.1
+                )
+            except BinanceAuthError as exc:
+                # M1.5a R2-I3: -2015 from POST = key lacks SPOT trade scope.
+                # Distinguish from real balance shortage (operator might
+                # otherwise debug "fund Binance" when actual fix is "rotate key").
+                if "2015" in str(exc):
+                    return (
+                        GateResult(
+                            passed=False,
+                            reject_reason="api_key_lacks_trade_scope",
+                            detail=f"Binance auth-fail on balance fetch: {exc}",
+                        ),
+                        venue,
+                    )
+                # -2014 / -1021 / other auth-class — surface as transient
+                # (engine layer writes needs_manual_review row).
+                raise
+
+            if not result.passed:
+                return (
+                    GateResult(
+                        passed=False,
+                        reject_reason="insufficient_balance",
+                        detail=result.detail,
+                    ),
+                    venue,
+                )
+```
+
 **Files:**
 - Modify: `scout/live/gates.py`
 - Test: `tests/test_live_gates_balance_runtime.py` (NEW)
@@ -1308,10 +1454,73 @@ git commit -am "feat(live-m1.5a): Gate 10 balance runtime (replaces M1 NotImplem
 
 ## Task 7: main.py startup — Layer 1 + balance smoke check
 
-**Plan-stage 2-reviewer fixes folded (R1-I4, R2-I1, R2-I5):** see AMENDMENTS A7. Implementer MUST:
+**Plan-stage 2-reviewer fixes folded (R1-I4, R2-I1):** see AMENDMENTS A7. Implementer MUST:
 - Drop redundant `except (asyncio.TimeoutError, Exception)` — `Exception` already catches `TimeoutError`. Use single `except Exception as exc:` after the explicit `except BinanceAuthError` branch (R1-I4)
 - Add operator-facing message to Step 7 post-deploy smoke instructions: "**M1.5a smoke pass ≠ live ready.** Approval-gate runtime call (V1-C1) + correction-counter increment on close (V1-C2) are M1.5b. Do NOT flip `live_eligible=1` for any signal until M1.5b ships." (R2-I1)
-- Apply Telegram startup notification rate-limit (R2-I5): query `paper_migrations` table for last_startup_notification timestamp; skip the alert if `< LIVE_STARTUP_NOTIFICATION_MIN_INTERVAL_SEC` ago. Use `paper_migrations` since it already exists; key name `live_startup_notification_last_sent`. Default 300s (5 min) prevents Telegram spam during systemd restart loop (R2-C1 mitigation)
+- ~~Apply Telegram startup notification rate-limit~~ **DROPPED per design-stage R2-C2** — was conflating runtime telemetry with `paper_migrations` schema-version table. Systemd hardening (Task 7.5 RestartSec=30s + StartLimitBurst=3) caps worst-case Telegram messages to 3-in-5min before service goes `failed`. Drop the rate-limit; drop the Settings field; drop the paper_migrations key.
+
+**Design-stage R2-C1 + R2-I6 folds:** smoke check must verify SPOT permission (not just balance), and timeout must be 10s not 5s.
+
+```python
+    if live_config.mode == "live":
+        if not getattr(settings, "LIVE_TRADING_ENABLED", False):
+            await db.close()
+            raise RuntimeError("LIVE_MODE=live requires LIVE_TRADING_ENABLED=True (Layer 1 master kill).")
+
+        if not settings.BINANCE_API_KEY or not settings.BINANCE_API_SECRET:
+            await db.close()
+            raise RuntimeError("LIVE_MODE=live requires BINANCE_API_KEY/SECRET")
+
+        # M1.5a smoke check (replaces M1's NotImplementedError).
+        # R2-C1 fold: verify SPOT permission, not just balance fetch.
+        # R2-I6 fold: timeout 10s, not 5s (EU-VPS jitter tolerance).
+        from scout.live.binance_adapter import (
+            BinanceAuthError,
+            BinanceSpotAdapter,
+        )
+
+        smoke_adapter = BinanceSpotAdapter(settings, db=db)
+        smoke_start = time.monotonic()
+        try:
+            account = await asyncio.wait_for(
+                smoke_adapter._signed_get("/api/v3/account", params={}),
+                timeout=10.0,
+            )
+            permissions = account.get("permissions", []) or []
+            if "SPOT" not in permissions:
+                await smoke_adapter.close()
+                await db.close()
+                raise RuntimeError(
+                    f"LIVE_MODE=live boot blocked: API key lacks SPOT trade permission. "
+                    f"Got permissions={permissions!r}. Verify in Binance API console."
+                )
+            balances = account.get("balances", []) or []
+            usdt_free = next(
+                (float(b.get("free", "0")) for b in balances if b.get("asset") == "USDT"),
+                0.0,
+            )
+            smoke_dur_ms = int((time.monotonic() - smoke_start) * 1000)
+            logger.info(
+                "live_smoke_check_passed",
+                usdt_free=usdt_free,
+                permissions=permissions,
+                duration_ms=smoke_dur_ms,
+            )
+        except BinanceAuthError as exc:
+            await smoke_adapter.close()
+            await db.close()
+            raise RuntimeError(
+                f"LIVE_MODE=live smoke check auth-fail: {exc}. "
+                "Verify BINANCE_API_KEY/SECRET correctness + IP whitelist + key not revoked."
+            ) from exc
+        except Exception as exc:  # R1-I4: single Exception clause after explicit auth-error
+            await smoke_adapter.close()
+            await db.close()
+            raise RuntimeError(
+                f"LIVE_MODE=live smoke check failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        await smoke_adapter.close()
+```
 
 **Files:**
 - Modify: `scout/main.py`
@@ -1494,6 +1703,47 @@ If the smoke check fails 3 times in 5 min, systemd marks the service
 ```bash
 git add docs/runbooks/live-trading-deploy.md
 git commit -m "docs(live-m1.5a): systemd hardening runbook (RestartSec + StartLimitBurst) — Task 7.5"
+```
+
+- [ ] **Step 6: Design-stage R2-I4 fold — `OnFailure=` directive + one-shot Telegram notify unit**
+
+Service `failed` after StartLimitBurst exhaustion currently leaves operator without out-of-band signal (parent unit's Telegram path is dead). Add `OnFailure=` directive pointing to a one-shot unit that posts to Telegram independently.
+
+`/etc/systemd/system/gecko-pipeline.service` (additional `[Service]` field):
+
+```ini
+[Unit]
+OnFailure=gecko-pipeline-failure-notify.service
+```
+
+`/etc/systemd/system/gecko-pipeline-failure-notify.service` (NEW):
+
+```ini
+[Unit]
+Description=Telegram notify on gecko-pipeline failure (M1.5a R2-I4)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '\
+  if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then \
+    curl -sS -X POST "https://api.telegram.org/bot$${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      --data-urlencode "chat_id=$${TELEGRAM_CHAT_ID}" \
+      --data-urlencode "text=🚨 gecko-pipeline.service FAILED — exhausted StartLimitBurst. Operator action required: investigate root cause, then systemctl reset-failed gecko-pipeline && systemctl start gecko-pipeline." \
+      --max-time 10 || true; \
+  fi'
+EnvironmentFile=/root/gecko-alpha/.env
+```
+
+Verification:
+
+```bash
+ssh root@89.167.116.187 'systemctl daemon-reload && systemctl is-enabled gecko-pipeline-failure-notify.service' > .ssh_notify_unit.txt 2>&1
+```
+
+Document in `docs/runbooks/live-trading-deploy.md` runbook under "Out-of-band failure notification."
+
+```bash
+git commit -am "docs(live-m1.5a): OnFailure= notify unit (R2-I4 fold) — Task 7.5 Step 6"
 ```
 
 ---

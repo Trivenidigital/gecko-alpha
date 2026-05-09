@@ -326,6 +326,69 @@ Drift component is symmetric (long-side fills could drift up OR down) and averag
 
 Column name `fill_slippage_bps` retained from M1's migration `bl_live_trades_telemetry_v1` to avoid schema churn. M1.5b *could* split into `fill_drift_bps` + `fill_venue_slippage_bps` if precision becomes load-bearing, but for V1's gate signature the current single column is sufficient.
 
+## 9.5 Design-stage 2-reviewer pass — folded 2026-05-09
+
+R1 (architecture/composition) returned **SHIP** + 3 importants. R2 (operator/runbook/production) returned **FOLD then SHIP** + 2 criticals + 6 importants + 4 minors. All folded:
+
+### R1 (architecture) folds
+
+- **R1-I1 — `'live_signed_disabled'` reject_reason** (§2.5): when `LIVE_USE_REAL_SIGNED_REQUESTS=False` and Gate 10 fires under `mode='live'`, balance_gate's `NotImplementedError` mapping currently surfaces as generic `insufficient_balance`. Hides kill-switch state from telemetry. Fold: Gate 10 branches on `not settings.LIVE_USE_REAL_SIGNED_REQUESTS` and returns `reject_reason='live_signed_disabled'`. Adds 1 reject_reason to CHECK constraint (handled by NEW Task 0.5 schema migration `bl_reject_reason_extend_v2`).
+
+- **R1-I2 — Smoke is boot-time-only disclaimer** (§2.4): the boot-time smoke check is point-in-time; auth degradation mid-cycle (testnet maintenance, IP whitelist drift, cert rotation, key revocation) leaks `BinanceAuthError` into per-fire `fetch_account_balance` calls. balance_gate maps these to `passed=False` so the loop survives but with no health surface. **M1.5a explicitly defers continuous health monitoring to M1.5b's `HealthProbe` service** (already shipped per `tasks/design_live_trading_hybrid.md` v2.1 §555 + `scout/live/services/health_probe.py`); M1.5a's smoke check is a startup gate only.
+
+- **R1-I3 — Code-level revert guard** (§5): folded as DEFERRED follow-on (not blocker per R1 explicit) — the operator-discipline checklist suffices for M1.5a; M1.5b can add the boot-time guard if recurring revert incidents demonstrate need.
+
+### R2 (operator) folds
+
+- **R2-C1 — SPOT permission verification in smoke check** (§2.4 + §6 + plan Task 7): `fetch_account_balance` is the lightest signed endpoint and a read-only API key passes it. First POST hits -2015 instead. Fold: `_signed_get("/api/v3/account")` response includes a `permissions: ["SPOT", ...]` array — parse it, refuse boot if `"SPOT"` not present. Operator-facing message: `LIVE_MODE=live boot blocked: API key lacks SPOT trade permission. Verify in Binance API console.` Adds ~5 LOC to smoke check; closes the read-scope foot-gun. Implementation lands in plan Task 7 Step 3.
+
+- **R2-C2 — Drop Telegram rate-limit (paper_migrations misuse)** (§2.4 + plan Task 0/7): the original R2-I5 fold proposed storing `live_startup_notification_last_sent` in `paper_migrations`. R2 reviewer flagged this as schema-misuse. **Resolution: drop the rate-limit entirely.** Rationale: with Task 7.5's systemd hardening (`RestartSec=30s` + `StartLimitBurst=3`), the worst case is 3 Telegram alerts in 5 min before service goes `failed`. That's not spam; it's the operator's signal that something's wrong. Removing `LIVE_STARTUP_NOTIFICATION_MIN_INTERVAL_SEC` Settings field + the `paper_migrations` plumbing simplifies M1.5a + dodges the table-misuse. Plan Task 0 Step 4 amended.
+
+- **R2-I1 — IP-whitelist pre-flip verification** (§6): no programmatic check that the VPS IP is whitelisted. Smoke passes on a non-whitelisted key; first signed call later fails. Fold: §6 step 3a adds an explicit operator-runnable command for pre-flip verification:
+  ```bash
+  ssh root@89.167.116.187 \
+    'curl -s -H "X-MBX-APIKEY: $BINANCE_API_KEY" "https://api.binance.com/api/v3/ping"'
+  # Expected: {} (empty response, status 200) — confirms IP reaches Binance.
+  # If this fails or returns 4xx, IP whitelist or DNS is broken before any signed call.
+  ```
+
+- **R2-I2 — `LIVE_USE_REAL_SIGNED_REQUESTS=True` as explicit REQUIRED checklist item** (§6): the field default is False (R2-I4 emergency-revert posture). Operator who misses this hits NotImplementedError on first Gate 10 fire. Fold: §6 reformatted as explicit REQUIRED-checkbox checklist with `LIVE_USE_REAL_SIGNED_REQUESTS=True` flagged as "REQUIRED for live execution; default False is the emergency-revert posture."
+
+- **R2-I3 — `'api_key_lacks_trade_scope'` reject_reason** (§2.5 + Gate 10 branch + plan Task 6 + Task 0.5 migration): `BinanceAuthError(-2015)` from POST surfaces today as generic `BinanceAuthError`. Operator dashboard sees `insufficient_balance` (Gate 10 catch-all). Fold: when `BinanceAuthError` raised by `fetch_account_balance` matches `-2015` code, Gate 10 returns `reject_reason='api_key_lacks_trade_scope'` not `'insufficient_balance'`. Same migration as R1-I1 covers this addition.
+
+- **R2-I4 — `OnFailure=` systemd directive** (Task 7.5): `gecko-pipeline.service` failure beyond `StartLimitBurst=3` currently leaves operator without out-of-band signal. Fold: add `OnFailure=gecko-pipeline-failure-notify.service` to the unit; create `gecko-pipeline-failure-notify.service` as a one-shot ExecStart that posts to Telegram (independent of the dead pipeline's own Telegram code path). Documented in `docs/runbooks/live-trading-deploy.md`.
+
+- **R2-I5 — Orphaned `live_trades` rows runbook query** (§4 + runbook): rows where `place_order_request` succeeded at Binance but `await_fill_confirmation` timed out leave `entry_order_id IS NOT NULL + status='open' + fill_slippage_bps IS NULL`. M1.5a doesn't auto-reconcile (M1.5b's reconciler does). Fold: M1.5a operator runbook query:
+  ```sql
+  SELECT id, paper_trade_id, symbol, entry_order_id, created_at
+  FROM live_trades
+  WHERE status='open'
+    AND fill_slippage_bps IS NULL
+    AND entry_order_id IS NOT NULL
+    AND created_at < datetime('now', '-10 minutes');
+  ```
+  + manual remediation: query Binance `GET /api/v3/order?origClientOrderId=...`, write outcome to live_trades. M1.5b commitment to reconciler.
+
+- **R2-I6 — Smoke timeout 5s → 10s** (§2.4 + plan Task 7): EU-VPS round-trip jitter triggers spurious smoke failures at 5s. Raise to 10s with NO retry (single-shot; systemd RestartSec absorbs flap). Log actual round-trip duration for operator audit.
+
+- **R2-M1 — HTML-503 sniff** (plan Task 1.5 `_request`): `await resp.json()` on text/html CDN proxy error raises `JSONDecodeError`. Fold: pre-`json()` content-type check; if `text/html`, raise `VenueTransientError("CDN error: response was HTML, not JSON")`.
+
+- **R2-M2 — Subaccount assumption** (§8): document explicitly: "M1.5a assumes a single Binance master API key. Subaccount routing deferred to M2."
+
+- **R2-M3 — §6 cross-link to runbook** (§6): §6 lives in design as architecture-of-prerequisites; `docs/runbooks/live-trading-deploy.md` (Task 7.5) carries the operator-runnable steps. Cross-link both directions in M1.5a.
+
+- **R2-M4 — `bias_warning` monitor** (§9 footnote): if `stdev(fill_slippage_bps) / |median|` over rolling-30 exceeds 3, emit `live_slippage_bias_warning` log event. Cheap monitor; gives operator early signal of one-sided trend cohort. M2 may use this to switch to mean-based gate.
+
+### Net delta from design-stage fold
+
+- +1 schema migration (`bl_reject_reason_extend_v2`, schema_version 20260513) — adds `'live_signed_disabled'` + `'api_key_lacks_trade_scope'` to live_trades + shadow_trades CHECK constraints via table-rename pattern (mirrors M1's `bl_reject_reason_extend_v1`).
+- +1 systemd unit (`gecko-pipeline-failure-notify.service`) — one-shot Telegram notify on parent unit failure.
+- −1 Settings field (`LIVE_STARTUP_NOTIFICATION_MIN_INTERVAL_SEC` removed; rate-limit dropped per R2-C2).
+- ~10 LOC adjustments to plan Tasks 0, 6, 7 (smoke check timeout + permission parse + reject_reason branching).
+- §6 reformatted as REQUIRED checklist with IP-whitelist verification step.
+
+M1.5a stops being "migration-free" — adds 1 migration. Acceptable trade-off: the `'live_signed_disabled'` + `'api_key_lacks_trade_scope'` reject_reasons close 2 high-probability operator-confusion failure modes (R2-I3 ranked #2 silent-failure risk).
+
 ## 10. What "ready for design review" means
 
 - All 8 plan-stage critical findings folded (R1-C1 through R1-C6 + R2-C1, R2-C2)
