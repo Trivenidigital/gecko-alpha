@@ -18,32 +18,40 @@ def _restore_structlog_after_main_invocation():
     structlog.reset_defaults()
 
 
-async def test_live_mode_live_raises_not_implemented_at_startup(monkeypatch, tmp_path):
-    """LIVE_MODE=live with credentials must raise NotImplementedError before
-    any real Binance traffic happens."""
+async def test_live_mode_live_raises_runtime_error_without_master_kill(
+    monkeypatch, tmp_path
+):
+    """M1.5a (PR #86): LIVE_MODE=live without LIVE_TRADING_ENABLED=True
+    raises RuntimeError at startup (Layer 1 master-kill is the FIRST
+    boot-time guard). Replaces M1's expectation of NotImplementedError
+    on balance_gate (M1.5a wired balance_gate, so that NotImplementedError
+    is gone)."""
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "c")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
     monkeypatch.setenv("LIVE_MODE", "live")
     monkeypatch.setenv("BINANCE_API_KEY", "fake-key")
     monkeypatch.setenv("BINANCE_API_SECRET", "fake-secret")
+    monkeypatch.delenv("LIVE_TRADING_ENABLED", raising=False)
     monkeypatch.setenv("DB_PATH", str(tmp_path / "guard.db"))
 
     from scout.main import main as scout_main
 
-    with pytest.raises(NotImplementedError, match="balance gate"):
+    with pytest.raises(RuntimeError, match="LIVE_TRADING_ENABLED"):
         await scout_main(["--dry-run", "--cycles", "1"])
 
 
 async def test_live_mode_live_without_credentials_raises_runtime_error(
     monkeypatch, tmp_path
 ):
-    """LIVE_MODE=live without creds raises RuntimeError before the
-    NotImplementedError — the credential check fires first."""
+    """LIVE_MODE=live + LIVE_TRADING_ENABLED=True without creds raises
+    RuntimeError matching BINANCE_API_KEY — credential check fires after
+    Layer 1 master kill."""
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "c")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
     monkeypatch.setenv("LIVE_MODE", "live")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "True")
     monkeypatch.delenv("BINANCE_API_KEY", raising=False)
     monkeypatch.delenv("BINANCE_API_SECRET", raising=False)
     monkeypatch.setenv("DB_PATH", str(tmp_path / "guard.db"))
@@ -51,6 +59,29 @@ async def test_live_mode_live_without_credentials_raises_runtime_error(
     from scout.main import main as scout_main
 
     with pytest.raises(RuntimeError, match="BINANCE_API_KEY"):
+        await scout_main(["--dry-run", "--cycles", "1"])
+
+
+async def test_live_mode_live_without_signed_flag_raises_runtime_error(
+    monkeypatch, tmp_path
+):
+    """M1.5a (PR #86 V3-I2 fold): LIVE_MODE=live + LIVE_TRADING_ENABLED=True
+    + creds present but LIVE_USE_REAL_SIGNED_REQUESTS=False (default) →
+    RuntimeError naming the flag. Prevents operator from booting cleanly
+    + every signal silently hitting 'live_signed_disabled'."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "c")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("LIVE_MODE", "live")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "True")
+    monkeypatch.setenv("BINANCE_API_KEY", "fake-key")
+    monkeypatch.setenv("BINANCE_API_SECRET", "fake-secret")
+    monkeypatch.delenv("LIVE_USE_REAL_SIGNED_REQUESTS", raising=False)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "guard.db"))
+
+    from scout.main import main as scout_main
+
+    with pytest.raises(RuntimeError, match="LIVE_USE_REAL_SIGNED_REQUESTS"):
         await scout_main(["--dry-run", "--cycles", "1"])
 
 

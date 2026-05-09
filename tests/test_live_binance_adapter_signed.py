@@ -13,10 +13,18 @@ signing primitive without aiohttp.
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 
 import pytest
 from aioresponses import aioresponses
+
+# aioresponses matches URL EXACTLY by default — signed endpoints append
+# ?timestamp=...&signature=...&recvWindow=10000 query strings, breaking
+# bare-URL mocks. Use regex prefix patterns instead.
+_ACCOUNT_RE = re.compile(r"https://api\.binance\.com/api/v3/account.*")
+_ORDER_RE = re.compile(r"https://api\.binance\.com/api/v3/order.*")
+_DEPTH_RE = re.compile(r"https://api\.binance\.com/api/v3/depth.*")
 
 from scout.config import Settings
 from scout.db import Database
@@ -50,7 +58,7 @@ async def test_signed_get_appends_timestamp_and_signature():
     adapter = BinanceSpotAdapter(s, db=None)
     with aioresponses() as m:
         m.get(
-            "https://api.binance.com/api/v3/account",
+            _ACCOUNT_RE,
             payload={"balances": [], "permissions": ["SPOT"]},
         )
         await adapter._signed_get("/api/v3/account", params={})
@@ -63,7 +71,7 @@ async def test_signed_get_includes_api_key_header():
     adapter = BinanceSpotAdapter(s, db=None)
     with aioresponses() as m:
         m.get(
-            "https://api.binance.com/api/v3/account",
+            _ACCOUNT_RE,
             payload={"balances": []},
         )
         await adapter._signed_get("/api/v3/account", params={})
@@ -80,7 +88,7 @@ async def test_signed_post_round_trips():
     adapter = BinanceSpotAdapter(s, db=None)
     with aioresponses() as m:
         m.post(
-            "https://api.binance.com/api/v3/order",
+            _ORDER_RE,
             payload={"orderId": 12345, "status": "NEW"},
         )
         result = await adapter._signed_post(
@@ -104,7 +112,7 @@ async def test_signed_get_raises_on_signature_invalid():
     adapter = BinanceSpotAdapter(s, db=None)
     with aioresponses() as m:
         m.get(
-            "https://api.binance.com/api/v3/account",
+            _ACCOUNT_RE,
             status=400,
             payload={"code": -2014, "msg": "Signature for input invalid"},
         )
@@ -121,7 +129,7 @@ async def test_signed_get_raises_on_timestamp_drift():
     adapter = BinanceSpotAdapter(s, db=None)
     with aioresponses() as m:
         m.get(
-            "https://api.binance.com/api/v3/account",
+            _ACCOUNT_RE,
             status=400,
             payload={
                 "code": -1021,
@@ -142,7 +150,7 @@ async def test_signed_endpoint_raises_ip_ban_on_418():
     adapter._retry_sleep = lambda _: None  # no delay
     with aioresponses() as m:
         m.get(
-            "https://api.binance.com/api/v3/account",
+            _ACCOUNT_RE,
             status=418,
             payload={"code": -1003, "msg": "Way too much request weight used"},
         )
@@ -160,7 +168,7 @@ async def test_fetch_account_balance_returns_free_usdt():
     adapter = BinanceSpotAdapter(s, db=None)
     with aioresponses() as m:
         m.get(
-            "https://api.binance.com/api/v3/account",
+            _ACCOUNT_RE,
             payload={
                 "balances": [
                     {"asset": "BTC", "free": "0.5", "locked": "0.0"},
@@ -180,7 +188,7 @@ async def test_fetch_account_balance_returns_zero_when_asset_absent():
     adapter = BinanceSpotAdapter(s, db=None)
     with aioresponses() as m:
         m.get(
-            "https://api.binance.com/api/v3/account",
+            _ACCOUNT_RE,
             payload={"balances": [{"asset": "BTC", "free": "0.5", "locked": "0"}]},
         )
         balance = await adapter.fetch_account_balance("XYZ")
@@ -271,7 +279,7 @@ async def test_place_order_request_first_attempt_records_then_submits(tmp_path):
     with aioresponses() as m:
         # fetch_depth call
         m.get(
-            "https://api.binance.com/api/v3/depth",
+            _DEPTH_RE,
             payload={
                 "lastUpdateId": 1,
                 "bids": [["100.0", "1.0"]],
@@ -279,7 +287,7 @@ async def test_place_order_request_first_attempt_records_then_submits(tmp_path):
             },
         )
         m.post(
-            "https://api.binance.com/api/v3/order",
+            _ORDER_RE,
             payload={"orderId": 88888, "status": "NEW"},
         )
         request = OrderRequest(
@@ -319,7 +327,7 @@ async def test_place_order_request_recovers_from_2010(tmp_path):
     adapter = BinanceSpotAdapter(s, db=db)
     with aioresponses() as m:
         m.get(
-            "https://api.binance.com/api/v3/depth",
+            _DEPTH_RE,
             payload={
                 "lastUpdateId": 1,
                 "bids": [["100.0", "1.0"]],
@@ -328,13 +336,13 @@ async def test_place_order_request_recovers_from_2010(tmp_path):
         )
         # POST returns -2010 (duplicate)
         m.post(
-            "https://api.binance.com/api/v3/order",
+            _ORDER_RE,
             status=400,
             payload={"code": -2010, "msg": "Duplicate clientOrderId"},
         )
         # Recovery GET returns the existing order
         m.get(
-            "https://api.binance.com/api/v3/order",
+            _ORDER_RE,
             payload={"orderId": 77777, "status": "FILLED"},
         )
         request = OrderRequest(
@@ -366,7 +374,7 @@ async def test_place_order_request_rejects_empty_order_id(tmp_path):
     adapter = BinanceSpotAdapter(s, db=db)
     with aioresponses() as m:
         m.get(
-            "https://api.binance.com/api/v3/depth",
+            _DEPTH_RE,
             payload={
                 "lastUpdateId": 1,
                 "bids": [["100.0", "1.0"]],
@@ -375,7 +383,7 @@ async def test_place_order_request_rejects_empty_order_id(tmp_path):
         )
         # Malformed Binance response: missing orderId
         m.post(
-            "https://api.binance.com/api/v3/order",
+            _ORDER_RE,
             payload={"status": "NEW"},
         )
         request = OrderRequest(
@@ -437,7 +445,7 @@ async def test_await_fill_confirmation_terminal_filled_writes_slippage(tmp_path)
     adapter = BinanceSpotAdapter(s, db=db)
     with aioresponses() as m:
         m.get(
-            "https://api.binance.com/api/v3/order",
+            _ORDER_RE,
             payload={
                 "orderId": 88888,
                 "status": "FILLED",
@@ -484,7 +492,7 @@ async def test_await_fill_confirmation_skips_slippage_when_mid_null(tmp_path):
     adapter = BinanceSpotAdapter(s, db=db)
     with aioresponses() as m:
         m.get(
-            "https://api.binance.com/api/v3/order",
+            _ORDER_RE,
             payload={
                 "orderId": 88888,
                 "status": "FILLED",
@@ -530,7 +538,7 @@ async def test_await_fill_confirmation_timeout_returns_status_timeout(tmp_path):
         # Always NEW
         for _ in range(20):
             m.get(
-                "https://api.binance.com/api/v3/order",
+                _ORDER_RE,
                 payload={"orderId": 88888, "status": "NEW"},
             )
         confirmation = await adapter.await_fill_confirmation(
@@ -563,7 +571,7 @@ async def test_await_fill_confirmation_partial_fill_returns_partial(tmp_path):
     adapter = BinanceSpotAdapter(s, db=db)
     with aioresponses() as m:
         m.get(
-            "https://api.binance.com/api/v3/order",
+            _ORDER_RE,
             payload={
                 "orderId": 88888,
                 "status": "PARTIALLY_FILLED",
@@ -602,7 +610,7 @@ async def test_await_fill_confirmation_canceled_returns_rejected(tmp_path):
     adapter = BinanceSpotAdapter(s, db=db)
     with aioresponses() as m:
         m.get(
-            "https://api.binance.com/api/v3/order",
+            _ORDER_RE,
             payload={"orderId": 88888, "status": "CANCELED"},
         )
         confirmation = await adapter.await_fill_confirmation(
