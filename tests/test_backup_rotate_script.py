@@ -235,27 +235,32 @@ def test_negative_keep_aborts(tmp_path):
 
 
 def test_unwritable_heartbeat_path_aborts(tmp_path):
-    """R3 MUST-FIX: heartbeat-write failure must surface, not silently succeed."""
-    locked_parent = tmp_path / "locked"
-    locked_parent.mkdir(mode=0o000)
-    try:
-        hb = locked_parent / "hb"
-        _make_backup(tmp_path, "scout.db.bak.x", time.time())
-        res = _run(
-            {
-                "GECKO_BACKUP_DIR": str(tmp_path),
-                "GECKO_BACKUP_KEEP": "3",
-                "GECKO_BACKUP_HEARTBEAT_FILE": str(hb),
-                "GECKO_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
-            }
-        )
-        assert res.returncode != 0, (
-            f"Expected non-zero exit for unwritable heartbeat; "
-            f"got {res.returncode}"
-        )
-    finally:
-        # Restore perms so tmp_path teardown can clean up.
-        locked_parent.chmod(0o755)
+    """R3 MUST-FIX: heartbeat-write failure must surface, not silently succeed.
+
+    Original draft used `chmod 000` on a parent dir, but root bypasses DAC
+    permissions on Linux — the test passed silently when run as root on the
+    VPS during pre-PR verification. Switched to path-blocked-by-regular-file:
+    the script's `mkdir -p $(dirname $HB)` fails with ENOTDIR ("Not a
+    directory") because the parent path component is a file. Root cannot
+    bypass this kernel-level error.
+    """
+    blocker_file = tmp_path / "blocker_file"
+    blocker_file.write_text("not a directory")
+    # Heartbeat would-be-parent is a regular file → mkdir -p fails ENOTDIR.
+    hb = blocker_file / "hb"
+    _make_backup(tmp_path, "scout.db.bak.x", time.time())
+    res = _run(
+        {
+            "GECKO_BACKUP_DIR": str(tmp_path),
+            "GECKO_BACKUP_KEEP": "3",
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(hb),
+            "GECKO_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
+        }
+    )
+    assert res.returncode != 0, (
+        f"Expected non-zero exit for unwritable heartbeat; "
+        f"got {res.returncode}, stderr={res.stderr}"
+    )
 
 
 def test_flock_concurrent_invocation_exits_3(tmp_path):
