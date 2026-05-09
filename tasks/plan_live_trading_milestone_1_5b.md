@@ -1,4 +1,4 @@
-**New primitives introduced:** New module `scout/live/correction_counter.py` exposing `increment_consecutive(db, signal_type, venue)` (writes/upserts `signal_venue_correction_count` row, resets `last_corrected_at` on each successful fill) and `reset_on_correction(db, signal_type, venue, correction_at)` (zeroes `consecutive_no_correction` when operator unwinds within 24h). New `LiveEngine._dispatch_live(paper_trade, venue, size_usd)` private method — runs only when `LIVE_MODE='live'` AND `LIVE_TRADING_ENABLED=True` AND `LIVE_USE_REAL_SIGNED_REQUESTS=True`; calls `RoutingLayer.get_candidates` → picks top → adapter.place_order_request → adapter.await_fill_confirmation → on terminal=filled/partial calls `correction_counter.increment_consecutive`. Existing shadow-mode flow (write `shadow_trades` row) preserved verbatim under `LIVE_MODE='shadow'`. New optional dependency on `LiveEngine.__init__`: `routing: RoutingLayer | None = None` (when None, live-mode flow falls back to BL-055 resolver path — operator gradient: M1.5b ships routing-layer enabled but flag-gated). New Settings field `LIVE_USE_ROUTING_LAYER: bool = False` — default False = M1.5a behavior preserved (routing scaffold present but not wired); operator opts in to M1.5b's multi-venue dispatch by flipping this. M1.5b does NOT call `should_require_approval` (Telegram gateway runtime integration deferred to M1.5c). M1.5b does NOT add recurring health probe, reconciler, or V2 minor cleanups (deferred to M1.5c).
+**New primitives introduced:** New module `scout/live/correction_counter.py` exposing `increment_consecutive(db, signal_type, venue)` (writes/upserts `signal_venue_correction_count` row on terminal `status='filled'` ONLY — partial fills excluded per plan-stage R1+R2 finding C3; coerces None/empty `signal_type` to "unknown" per R1-I7) and `reset_on_correction(db, signal_type, venue, correction_at)` (zeroes `consecutive_no_correction` for the (signal_type, venue) pair when operator issues a correction; M1.5b operator manual SQL only — no automatic caller). New `LiveEngine._dispatch_live(paper_trade, size_usd)` private method — runs only when `LIVE_MODE='live'` AND `LIVE_USE_ROUTING_LAYER=True` AND `routing is not None`; calls `RoutingLayer.get_candidates` → picks top → adapter.place_order_request → adapter.await_fill_confirmation (using cid derived via `make_client_order_id(paper_trade.id, intent_uuid)` per R1-C2) → on terminal=`filled` only calls `correction_counter.increment_consecutive`. **Existing assert at `engine.py:88-91` (`assert self._config.mode != "live"`) is REMOVED** — M1.5b legitimately needs live mode to reach the engine; main.py boot guard at `scout/main.py:1062-1086` is the authoritative safety contract per R1+R2 finding C1. Existing shadow-mode flow (write `shadow_trades` row) preserved verbatim under `LIVE_MODE='shadow'`. New optional dependency on `LiveEngine.__init__`: `routing: RoutingLayer | None = None` — emits structlog WARN at construction if mode='live' AND flag=True AND routing=None (R1-I5 visibility). New Settings field `LIVE_USE_ROUTING_LAYER: bool = False` — default False = M1.5a behavior preserved (routing scaffold present but not wired); operator opts in to M1.5b's multi-venue dispatch by flipping this. M1.5b does NOT call `should_require_approval` (Telegram gateway runtime integration deferred to M1.5c — plan honestly closes V1-C1 as ROUTING-HALF only). M1.5b does NOT add recurring health probe, reconciler, `total_fills_lifetime` lifetime telemetry column, or V2 minor cleanups (all deferred to M1.5c).
 
 # Live Trading Milestone 1.5b Implementation Plan — Engine Routing Dispatch + Correction Counter Writer
 
@@ -8,12 +8,16 @@
 
 **Architecture:** `LiveEngine.on_paper_trade_opened` keeps existing shadow-mode flow intact. Adds a parallel `_dispatch_live()` private method that fires under `LIVE_MODE='live'` AND `LIVE_USE_ROUTING_LAYER=True`. The live path:
 1. Calls `RoutingLayer.get_candidates(canonical, chain_hint, signal_type, size_usd)` — returns ranked list
-2. If empty → INSERT live_trades row with `status='rejected', reject_reason='no_venue'`; return
+2. If empty → log `live_dispatch_no_venue`; return (routing layer logged structural reason; engine does NOT write a separate live_trades reject row — `place_order_request` is the only writer of `live_trades` rows)
 3. Picks top candidate
-4. Calls `adapter.place_order_request(OrderRequest)` — idempotency-aware (M1.5a)
-5. Calls `adapter.await_fill_confirmation(...)` — polls until terminal (M1.5a)
-6. On `status='filled'` / `'partial'` → calls `correction_counter.increment_consecutive(db, signal_type, venue)`
-7. On `status='rejected'` / `'timeout'` → no counter increment; UPDATE live_trades.status accordingly
+4. Calls `adapter.place_order_request(OrderRequest)` — idempotency-aware (M1.5a). Adapter computes `cid = make_client_order_id(paper_trade.id, intent_uuid)` internally and writes the live_trades row.
+5. Calls `adapter.await_fill_confirmation(...)` with **the same `cid` from step 4** (NOT the raw `intent_uuid`) — polls until terminal (M1.5a). The `cid` format is `gecko-{paper_trade_id}-{uuid8}` per `scout/live/idempotency.py:make_client_order_id`; passing raw `intent_uuid` would cause `await_fill_confirmation`'s SELECT lookup at `binance_adapter.py:628` to return zero rows → RuntimeError.
+6. On `status='filled'` ONLY → calls `correction_counter.increment_consecutive(db, signal_type, venue)`. Partial-fills are NOT counted (per V1-C2 reviewer fold: PARTIALLY_FILLED can transition to CANCELED for IOC/remaining-cancel; reconciler-domain).
+7. On `status='partial'` / `'rejected'` / `'timeout'` → no counter increment.
+
+**Per-venue counter intent (intentional):** `signal_venue_correction_count` PK is `(signal_type, venue)`. When M1.5c adds Kraken/Coinbase, each venue's counter starts at 0 — the operator gradually builds confidence per-venue (binance counter at 30 does NOT auto-clear approval for first kraken trade). This is the V1 design intent, not a bug.
+
+**Counter-reset semantic (acknowledged simplification):** `reset_on_correction` zeros the entire `consecutive_no_correction` field for a `(signal_type, venue)` pair on a single operator unwind. Worked example: 30 successful fills → counter=30 → operator unwinds trade #31 → counter=0 → all 30 prior good fills lose their auto-clear progress. This semantic matches the field name (`consecutive_no_correction` = "consecutive trades without correction") but has UX consequence — runbook entry surfaces this so operators know one unwind costs the full streak. M1.5c reconciler may add a separate `total_fills_lifetime` column for dashboard telemetry that survives resets.
 
 Telegram approval gateway runtime hook (V1-C1 partial) deferred to M1.5c — ALL approval gates are decorative in M1.5b. Acceptable because dormant state remains fail-closed: `LIVE_USE_ROUTING_LAYER=False` default → routing not called; `LIVE_USE_REAL_SIGNED_REQUESTS=False` default → place_order_request raises NotImplementedError; `LIVE_TRADING_ENABLED=False` default → main.py refuses live boot.
 
@@ -220,14 +224,22 @@ log = structlog.get_logger(__name__)
 
 
 async def increment_consecutive(
-    db: Database, signal_type: str, venue: str
+    db: Database, signal_type: str | None, venue: str
 ) -> None:
     """Increment consecutive_no_correction by 1 for (signal_type, venue).
 
-    Creates the row on first call (ON CONFLICT...DO UPDATE).
+    Creates the row on first call (ON CONFLICT...DO UPDATE). Counter is
+    incremented only on terminal status='filled' (NOT 'partial' — see
+    engine.py:_dispatch_live + plan-stage R1+R2 finding C3).
+
+    Empty/None signal_type is coerced to "unknown" (R1-I7 fold) — this
+    avoids a crash if a future dispatcher path emits empty signal_type
+    (cashtag-dispatch path under BL-065 has historically produced empty
+    values).
     """
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
+    signal_type = signal_type or "unknown"
     now_iso = datetime.now(timezone.utc).isoformat()
     async with db._txn_lock:
         await db._conn.execute(
@@ -248,16 +260,28 @@ async def increment_consecutive(
 
 
 async def reset_on_correction(
-    db: Database, signal_type: str, venue: str, correction_at: str
+    db: Database, signal_type: str | None, venue: str, correction_at: str
 ) -> None:
     """Reset consecutive_no_correction to 0 + record last_corrected_at.
 
     Called from the operator-correction path (M1.5c when reconciler
     detects a 24h-window unwind; M1.5b operator can call directly via
     SQL for manual corrections).
+
+    SEMANTIC ACKNOWLEDGMENT (plan-stage R2 finding C2): a single reset
+    zeros the ENTIRE consecutive_no_correction field for the
+    (signal_type, venue) pair. Worked example: 30 fills → counter=30 →
+    operator unwinds trade #31 → counter=0 → all 30 prior good fills
+    lose their auto-clear-approval progress. This semantic matches the
+    field name (`consecutive_no_correction` = "consecutive trades
+    without correction") and matches V1's gate intent ("trust requires
+    UNBROKEN streak"), but has UX consequence — runbook entry surfaces
+    this. M1.5c reconciler may add `total_fills_lifetime` for dashboard
+    telemetry that survives resets.
     """
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
+    signal_type = signal_type or "unknown"
     now_iso = datetime.now(timezone.utc).isoformat()
     async with db._txn_lock:
         await db._conn.execute(
@@ -297,18 +321,34 @@ git commit -m "feat(live-m1.5b): correction_counter increment/reset helpers (Tas
 - Modify: `scout/live/engine.py`
 - Test: `tests/test_live_engine_dispatch.py` (NEW)
 
-- [ ] **Step 1: Refactor `on_paper_trade_opened`**
+- [ ] **Step 1: Remove M1.5a's `assert mode != "live"` guard at engine.py:88-91**
+
+R1+R2 plan-stage CRITICAL finding C1: the existing assert at engine.py:88-91 (`assert self._config.mode != "live"`) blocks ALL paths reaching the engine in live mode — including the new `_dispatch_live` branch added below. Without removing it, M1.5b's dispatch is structurally unreachable and operator activation crashes with `AssertionError` on the first live signal.
+
+Replace the assert (lines 88-91) with a comment documenting that main.py boot guard at `scout/main.py:1062-1086` enforces `LIVE_TRADING_ENABLED=True` for live mode — that boot guard is the safety contract; the runtime assert is no longer needed because M1.5b legitimately wants live-mode flows to reach the engine. The docstring above the method (lines 73-87) should also be updated to remove the "engine entry NO LONGER short-circuits on master kill" line and replace with "M1.5b: live mode dispatch is enabled when `LIVE_USE_ROUTING_LAYER=True`."
+
+```python
+        # M1.5b: live mode dispatch is permitted. main.py boot guards
+        # (scout/main.py:1062-1086) enforce LIVE_TRADING_ENABLED=True +
+        # LIVE_USE_REAL_SIGNED_REQUESTS=True for mode='live'. The
+        # assertion that previously blocked live mode here is removed
+        # because M1.5b's _dispatch_live path legitimately fires under
+        # mode='live' AND LIVE_USE_ROUTING_LAYER=True.
+```
+
+- [ ] **Step 2: Refactor `on_paper_trade_opened`**
 
 Add `LIVE_USE_ROUTING_LAYER` branch. Existing shadow flow preserved verbatim under `mode='shadow'` OR `mode='live' and not flag_set`.
 
 ```python
     async def on_paper_trade_opened(self, paper_trade: _PaperTradeLike) -> None:
+        # M1.5b: assert removed (see Step 1).
         # ... existing master-kill check, gates, allowlist, etc unchanged ...
 
         # After gates pass + entry_vwap computed + shadow_trades row written:
         # ... existing happy-path code unchanged for shadow mode ...
 
-        # M1.5b live-mode dispatch (V1-C1 closure)
+        # M1.5b live-mode dispatch (V1-C1 routing-half closure)
         if (
             self._config.mode == "live"
             and getattr(self._config._s, "LIVE_USE_ROUTING_LAYER", False)
@@ -322,16 +362,18 @@ Add `LIVE_USE_ROUTING_LAYER` branch. Existing shadow flow preserved verbatim und
     async def _dispatch_live(
         self, *, paper_trade: _PaperTradeLike, size_usd: Decimal
     ) -> None:
-        """M1.5b live-mode dispatch (V1-C1 + V1-C2 closure).
+        """M1.5b live-mode dispatch (V1-C1 routing-half + V1-C2 closures).
 
         - Routes via RoutingLayer
         - Calls adapter.place_order_request (M1.5a idempotency-aware)
-        - Calls adapter.await_fill_confirmation (M1.5a polling)
-        - On terminal=filled/partial → increment correction counter
+        - Calls adapter.await_fill_confirmation (M1.5a polling) with the
+          same cid the adapter just wrote to live_trades
+        - On terminal=filled → increment correction counter
         """
         from uuid import uuid4
         from scout.live.adapter_base import OrderRequest
         from scout.live.correction_counter import increment_consecutive
+        from scout.live.idempotency import make_client_order_id
 
         canonical = paper_trade.symbol
         chain_hint = getattr(paper_trade, "chain", None)
@@ -360,6 +402,11 @@ Add `LIVE_USE_ROUTING_LAYER` branch. Existing shadow flow preserved verbatim und
             size_usd=float(size_usd),
             intent_uuid=intent_uuid,
         )
+        # R1-C2 fix: derive the same cid the adapter writes to
+        # live_trades.client_order_id. await_fill_confirmation's SELECT
+        # lookup at binance_adapter.py:628 uses this cid; passing raw
+        # intent_uuid here would return zero rows → RuntimeError.
+        cid = make_client_order_id(paper_trade.id, intent_uuid)
 
         try:
             venue_order_id = await self._adapter.place_order_request(request)
@@ -380,7 +427,7 @@ Add `LIVE_USE_ROUTING_LAYER` branch. Existing shadow flow preserved verbatim und
         try:
             confirmation = await self._adapter.await_fill_confirmation(
                 venue_order_id=venue_order_id,
-                client_order_id=request.intent_uuid,  # cid format covered by idempotency.py
+                client_order_id=cid,  # R1-C2 fix: full cid, not raw intent_uuid
                 timeout_sec=30.0,
             )
         except Exception:
@@ -400,15 +447,17 @@ Add `LIVE_USE_ROUTING_LAYER` branch. Existing shadow flow preserved verbatim und
         )
 
         # V1-C2 closure: increment consecutive_no_correction counter on
-        # successful fill. Resets fire from operator-correction path
-        # (manual SQL or M1.5c reconciler).
-        if confirmation.status in ("filled", "partial"):
+        # successful fill ONLY. R1+R2 plan-stage finding C3: PARTIALLY_FILLED
+        # can transition to CANCELED for IOC orders, so partial fills are
+        # NOT counted to avoid double-count when the eventual terminal is
+        # observed by the M1.5c reconciler. Resets fire from operator-
+        # correction path (manual SQL or M1.5c reconciler).
+        if confirmation.status == "filled":
             await increment_consecutive(
                 self._db, paper_trade.signal_type, top.venue
             )
-```
 
-- [ ] **Step 2: Update `LiveEngine.__init__` to accept routing param**
+- [ ] **Step 3: Update `LiveEngine.__init__` to accept routing param + log warning if mode/flag/routing mismatch**
 
 ```python
     def __init__(
@@ -423,9 +472,23 @@ Add `LIVE_USE_ROUTING_LAYER` branch. Existing shadow flow preserved verbatim und
     ) -> None:
         # ... existing ...
         self._routing = routing
+        # R1-I5 fix: structural visibility for "operator wanted routing
+        # but main.py couldn't construct it" — surfaces silent mismatch
+        # in logs at boot rather than at first signal silently skipping.
+        if (
+            config.mode == "live"
+            and getattr(config._s, "LIVE_USE_ROUTING_LAYER", False)
+            and routing is None
+        ):
+            log.warning(
+                "live_routing_flag_set_but_layer_missing",
+                msg="LIVE_USE_ROUTING_LAYER=True but routing=None; "
+                    "_dispatch_live will silently skip. Check main.py "
+                    "construction.",
+            )
 ```
 
-- [ ] **Step 3: Tests in `tests/test_live_engine_dispatch.py`**
+- [ ] **Step 4: Tests in `tests/test_live_engine_dispatch.py`**
 
 Stubbed RoutingLayer + stubbed adapter to test dispatch flow without real Binance:
 
@@ -440,6 +503,18 @@ async def test_dispatch_live_skips_when_no_candidates(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_live_uses_full_cid_for_await_fill(tmp_path):
+    """R1-C2 regression: await_fill_confirmation receives
+    'gecko-{paper_trade_id}-{uuid8}' cid format, NOT raw intent_uuid.
+    Verifies make_client_order_id is called with (paper_trade.id, intent_uuid)
+    and the resulting cid is passed to await_fill_confirmation."""
+    # ... stub routing returns 1 candidate ...
+    # ... stub adapter.place_order_request returns 'BNX-1' ...
+    # ... capture await_fill_confirmation kwargs ...
+    # ... assert kwargs['client_order_id'] starts with 'gecko-' and != raw intent_uuid
+
+
+@pytest.mark.asyncio
 async def test_dispatch_live_increments_counter_on_filled(tmp_path):
     """Top candidate + adapter returns FILLED → counter incremented."""
     # ... stub routing returns [RouteCandidate(binance, BTCUSDT, ...)] ...
@@ -447,6 +522,14 @@ async def test_dispatch_live_increments_counter_on_filled(tmp_path):
     # ... stub adapter.await_fill_confirmation returns confirmation status='filled' ...
     # ... call _dispatch_live ...
     # ... assert signal_venue_correction_count[(first_signal, binance)].consecutive_no_correction == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_live_no_counter_on_partial(tmp_path):
+    """R1+R2 C3 regression: partial fills do NOT increment counter.
+    PARTIALLY_FILLED can transition to CANCELED — reconciler-domain."""
+    # ... stub adapter.await_fill_confirmation returns status='partial' ...
+    # ... assert correction_counter.consecutive_no_correction == 0
 
 
 @pytest.mark.asyncio
@@ -462,10 +545,53 @@ async def test_dispatch_live_no_op_when_signed_disabled(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_live_mode_routing_layer_off_does_not_call_routing(tmp_path):
+    """R1-I6 regression: mode='live' AND LIVE_USE_ROUTING_LAYER=False →
+    existing M1.5a flow runs WITHOUT calling routing.get_candidates.
+    Protects against future refactor moving routing call before flag check."""
+    # ... construct engine with mode='live', LIVE_USE_ROUTING_LAYER=False ...
+    # ... routing stub records all calls ...
+    # ... call on_paper_trade_opened ...
+    # ... assert routing.get_candidates was NEVER called
+
+
+@pytest.mark.asyncio
+async def test_engine_init_warns_when_routing_flag_set_but_layer_none(tmp_path, caplog):
+    """R1-I5 regression: structlog WARN emitted when mode='live' AND
+    LIVE_USE_ROUTING_LAYER=True AND routing=None at construction."""
+    # ... construct engine with mode='live', flag=True, routing=None ...
+    # ... assert 'live_routing_flag_set_but_layer_missing' event emitted
+
+
+@pytest.mark.asyncio
 async def test_shadow_mode_unchanged_when_routing_layer_off(tmp_path):
-    """LIVE_USE_ROUTING_LAYER=False (default) + mode='live' → existing
+    """LIVE_USE_ROUTING_LAYER=False (default) + mode='shadow' → existing
     M1.5a flow runs (no _dispatch_live call). M1.5a tests stay green."""
 ```
+
+- [ ] **Step 5: Counter test — empty/None signal_type semantic**
+
+R1-I7 fold: define behavior for `signal_type=None` or empty string. Decision: **coerce to "unknown"** so the counter still tracks the (signal_type='unknown', venue) pair rather than crashing — matches the resilient posture of the existing dispatch path. Add to `tests/test_live_correction_counter.py`:
+
+```python
+@pytest.mark.asyncio
+async def test_increment_handles_none_signal_type(tmp_path):
+    """signal_type=None coerced to 'unknown' (not crash, not silent skip)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await increment_consecutive(db, None, "binance")  # type: ignore
+    cur = await db._conn.execute(
+        "SELECT signal_type, consecutive_no_correction "
+        "FROM signal_venue_correction_count WHERE venue = ?",
+        ("binance",),
+    )
+    row = await cur.fetchone()
+    assert row[0] == "unknown"
+    assert row[1] == 1
+    await db.close()
+```
+
+Update `increment_consecutive` (Task 1) to coerce: `signal_type = signal_type or "unknown"`. Same coercion for `reset_on_correction`.
 
 - [ ] **Step 4: Commit**
 
@@ -538,18 +664,34 @@ Per CLAUDE.md §8 (money flows axis):
 
 - All new tests pass; full regression clean
 - 0 schema migrations introduced
-- V1-C1 closure: routing layer is called from engine under flag-gated live mode
-- V1-C2 closure: signal_venue_correction_count has writers
+- **V1-C1 routing-half closure**: routing layer is called from engine under flag-gated live mode (R2-I3 fold: tightened from "V1-C1 closure" — Telegram approval gateway runtime hook is M1.5c scope, so V1-C1 is only HALF closed by M1.5b)
+- V1-C2 closure: signal_venue_correction_count has writers (filled-only; reset semantic acknowledged)
 - LIVE_USE_ROUTING_LAYER defaults False — M1.5a behavior preserved unless operator opts in
+- M1.5a's `assert mode != "live"` removed at engine.py:88-91 (R1+R2 plan-stage finding C1)
+- `_dispatch_live` uses `make_client_order_id(paper_trade.id, intent_uuid)` for `await_fill_confirmation` cid (R1 plan-stage finding C2)
+- Engine __init__ logs WARN if routing flag set but layer is None (R1-I5)
 - M1.5c plan can be drafted (recurring health probe + reconciler + Telegram approval gateway runtime + minor cleanups)
 
 ## What this milestone does NOT do (M1.5c scope)
 
-- Does NOT call `should_require_approval` from engine (Telegram gateway runtime hook)
-- Does NOT add recurring health probe (boot-time smoke is point-in-time)
-- Does NOT add reconciliation worker for orphaned live_trades rows
+- Does NOT call `should_require_approval` from engine (Telegram gateway runtime hook) — V1-C1 approval-half deferred
+- Does NOT add recurring health probe (boot-time smoke is point-in-time; first M1.5b live dispatch fires WITHOUT venue_health row, falling back to routing's default 0.5 score — R2-I1 risk surfaced in runbook)
+- Does NOT add reconciliation worker for orphaned live_trades rows (in-flight orders mid-restart are operator-manual cleanup per `docs/runbooks/live-trading-deploy.md` §6 — R1-M10 / R2-M2 fold)
+- Does NOT auto-call `reset_on_correction` from any path (M1.5b operator manual SQL only — R1-I4 fold)
 - Does NOT bundle V2 deferred minors (ServiceRunner cancel-log, view CAST symmetry, override-NULL filter, venue_health staleness gate)
+- Does NOT add `total_fills_lifetime` column for dashboard telemetry that survives resets (M1.5c may add — counter-reset UX cost acknowledged but not mitigated here)
+
+## Operator activation prereqs (post-M1.5b deploy)
+
+In addition to M1.5a prereqs already documented in `project_live_m1_5a_shipped_2026_05_09.md`:
+
+1. Flip `LIVE_USE_ROUTING_LAYER=True` in `.env`
+2. **Acknowledge first-signal venue_health gap (R2-I1):** the first M1.5b live dispatch fires before any `venue_health` row exists; routing's health filter defaults to score 0.5. The boot-time smoke check validates auth + read-only paths but does not write a venue_health row. Operator should treat the FIRST live dispatch as a verification trade and watch for an immediate fill confirmation — if any anomaly, kill-switch via flag-flip + restart.
+3. **Acknowledge counter-reset UX cost:** any operator unwind (manual SQL or M1.5c reconciler) zeros the entire `consecutive_no_correction` for the (signal_type, venue) pair. After 30 successful fills, one unwind costs the full streak.
+4. Per-venue counters intended: when M1.5c adds a second venue, that venue's counter starts at 0 (not auto-cleared from binance progress) — this is the V1 design intent.
 
 ## Reversibility
 
-Fast revert: `LIVE_USE_ROUTING_LAYER=False` in `.env` → restart. Engine falls back to M1.5a's BL-055 single-venue resolver path; no live trades are dispatched via routing.
+**Fast revert (in-flight-tolerant):** `LIVE_USE_ROUTING_LAYER=False` in `.env` → restart. Engine falls back to M1.5a's BL-055 single-venue resolver path; no NEW live trades are dispatched via routing. **In-flight caveat:** if the engine restart happens between `place_order_request` and `await_fill_confirmation`, the order is live on Binance with no engine watcher; the live_trades row stays `status='open'`. M1.5c reconciler will close these; for M1.5b, operator manual cleanup per `docs/runbooks/live-trading-deploy.md` §6 (R1-M10 / R2-M2).
+
+**Slower revert (git):** `git revert <PR squash>` + LIVE_MODE='paper' before the revert (otherwise the restored M1.5a `assert mode != "live"` immediately crashes engine entry under live mode).
