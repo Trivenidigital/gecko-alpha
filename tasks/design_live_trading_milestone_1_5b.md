@@ -30,15 +30,45 @@ Close V1 review's CRITICAL findings on routing-layer disconnection (C1) and zero
 
 **Tradeoff:** code duplication for shared concerns (logging context, exception classification). Acceptable because the duplication is a few lines and surfaces the live-vs-shadow divergence rather than hiding it.
 
-### 2.2 Removing M1.5a's `assert mode != "live"` guard
+### 2.2 Removing M1.5a's `assert mode != "live"` guard + adding fail-loud misconfig CRASH
 
-**Chosen:** Remove. Replace with comment pointing at `scout/main.py:1062-1086` boot guard.
+**Chosen:** Remove the assert. Add a NEW boot-time CRASH in `LiveEngine.__init__` for misconfig.
 
-**Why:** R1+R2 plan-stage CRITICAL finding C1 — the assert at `engine.py:88-91` blocks ALL paths (including the new `_dispatch_live` branch) under `mode='live'`. Without removal, M1.5b is structurally unreachable.
+**Why remove:** R1+R2 plan-stage CRITICAL finding C1 — the assert at `engine.py:88-91` blocks ALL paths (including the new `_dispatch_live` branch) under `mode='live'`. Without removal, M1.5b is structurally unreachable.
 
 **Why this is safe:** `main.py` boot guard at line 1062 already enforces `LIVE_TRADING_ENABLED=True` for `mode='live'`. Line 1079 enforces `LIVE_USE_REAL_SIGNED_REQUESTS=True`. Lines 1108-1144 require a successful smoke-check against Binance with SPOT permission. The assert was M1's belt-and-braces guard for the period before any live wiring existed; M1.5b's actual contract is the boot guard.
 
-**Tradeoff:** the assert was self-documenting at the runtime call site. The replacement comment + the docstring update preserve documentation; the boot guard preserves enforcement.
+**Why ADD the misconfig CRASH:** Design-stage R2-C1 + R1-M2 + R2-I3 — three failure modes silently no-op every signal in M1.5b's parallel design:
+1. `LIVE_USE_ROUTING_LAYER=True` AND `LIVE_USE_REAL_SIGNED_REQUESTS=False` (operator forgot signed flag) → `place_order_request` raises `NotImplementedError` → engine catches + returns silently → ZERO live trades, ZERO alerts. At ~1.8 signals/hr observed prod rate (43 trades / 24h), an operator who walks away for 8 hours returns to ~14 silently-skipped signals.
+2. `LIVE_USE_ROUTING_LAYER=True` AND `routing is None` (main.py wiring forgot kwarg) → `_dispatch_live` branch evaluates False on `routing is not None` → silently no-ops every signal.
+3. `LIVE_USE_ROUTING_LAYER=True` AND `LIVE_TRADING_ENABLED=False` — already covered by main.py boot guard, included for defense-in-depth.
+
+The design-stage reviewers correctly identified these as a re-occurrence of the BL-064/BL-065 silent-failure-on-misconfig class of bug. The fix is a single CRASH in engine `__init__`:
+
+```python
+def __init__(self, *, config, ..., routing=None) -> None:
+    # ... existing assignment ...
+    if config.mode == "live":
+        flag_routing = getattr(config._s, "LIVE_USE_ROUTING_LAYER", False)
+        flag_signed = getattr(config._s, "LIVE_USE_REAL_SIGNED_REQUESTS", False)
+        if flag_routing and not flag_signed:
+            raise RuntimeError(
+                "Misconfig: LIVE_USE_ROUTING_LAYER=True but "
+                "LIVE_USE_REAL_SIGNED_REQUESTS=False. Engine would "
+                "silently no-op every signal. Set LIVE_USE_REAL_SIGNED_REQUESTS=True "
+                "or LIVE_USE_ROUTING_LAYER=False before boot."
+            )
+        if flag_routing and routing is None:
+            raise RuntimeError(
+                "Misconfig: LIVE_USE_ROUTING_LAYER=True but routing=None. "
+                "Check scout/main.py construction passes routing=live_routing "
+                "kwarg to LiveEngine."
+            )
+```
+
+**Why CRASH not WARN-and-skip:** Crash is bounded by `RestartSec=30s + StartLimitBurst=3` (M1.5a runbook §1), so misconfig produces a tight feedback loop with operator-visible systemd failure + OnFailure Telegram alert (M1.5a runbook §2). WARN-and-skip is unbounded — operator walkaway = arbitrary missed signals. The cost of CRASH is bounded; the cost of WARN-and-skip is unbounded.
+
+**Tradeoff:** the assert was self-documenting at the runtime call site. The replacement runtime comment + the new __init__ misconfig CRASH preserve documentation AND tighten enforcement.
 
 ### 2.3 cid derivation in `_dispatch_live`
 
@@ -53,6 +83,8 @@ Close V1 review's CRITICAL findings on routing-layer disconnection (C1) and zero
 **Chosen:** Increment only on `confirmation.status == "filled"`. Partial fills are NOT counted.
 
 **Why:** Plan-stage R1+R2 finding C3 — Binance's PARTIALLY_FILLED status is per-spec terminal in M1.5a's adapter abstraction (`OrderConfirmation.status='partial'`), but in real Binance behavior, PARTIALLY_FILLED can transition to CANCELED for IOC orders or operator-cancel-remaining flows. M1.5b's `await_fill_confirmation` returns on first terminal observed. If the same order subsequently flips to FILLED or CANCELED from PARTIALLY_FILLED, the counter would either double-count (engine reissues) or be incorrectly counted toward auto-clear (operator subsequently unwinds the partial).
+
+**Verified terminal-status path (R1-M3 fold):** `binance_adapter.py:644-704` polls Binance order status; lines 669-679 map PARTIALLY_FILLED → status='partial' and RETURN immediately (does NOT keep polling for the final state). M1.5b therefore NEVER observes a partial → CANCELED transition — it returns on first PARTIALLY_FILLED. The eventual CANCELED is M1.5c reconciler's job. The terminal status set returned by `await_fill_confirmation` is `{'filled', 'partial', 'rejected', 'timeout'}`. Counter increments only on `'filled'`.
 
 **Tradeoff:** legitimate partial fills (the order really did execute partially and stay there) are not counted toward the operator's auto-clear streak. This understates the streak in the V1 gate; acceptable because the V1 gate threshold is 30 fills and partials are a minority of expected dispatches. Reconciler-domain (M1.5c) can refine.
 
@@ -75,6 +107,20 @@ Close V1 review's CRITICAL findings on routing-layer disconnection (C1) and zero
 **Why:** R1-I7 fold — `paper_trade.signal_type` can theoretically be empty string or None. Cashtag-dispatch path under BL-065 has historically produced empty values when symbol resolution failed. A crash here would block dispatch silently (the engine swallows exceptions). A silent skip would lose the counter increment. Coercing to "unknown" preserves the count under a reserved bucket.
 
 **Tradeoff:** "unknown" entries pollute dashboards. Acceptable because dashboards already filter by signal_type allowlist; "unknown" rows surface as anomalies for operator investigation rather than silent data loss.
+
+### 2.7a BL-055 shadow soak orthogonality under live mode (R1-I1 fold)
+
+**Chosen:** BL-055 shadow-mode soak ENDS when operator flips `LIVE_MODE='live'`. Live mode does NOT also write `shadow_trades` rows.
+
+**Why:** R1-I1 surfaced the design ambiguity. The two ledgers serve different purposes:
+- `shadow_trades` (BL-055): "what would have been the live PnL if we had executed?" — paper-money simulation against real Binance prices/depth
+- `live_trades` (M1.5b): real money execution outcomes
+
+When operator flips to LIVE_MODE='live', the operator's intent is "execute for real, not simulate." The shadow simulation is no longer load-bearing — actual fill data is the better signal. Continuing shadow_trades writes under live mode would (a) duplicate the engine path complexity, (b) require maintaining the shadow-vs-live PnL diff query as a permanent operator interface (not in scope for M1.5b), (c) blur the operator's mental model of what "live mode" means.
+
+**Tradeoff:** operator loses the ability to compare "shadow's prediction vs live's actual outcome on the same signal." Acceptable because the comparison was BL-055's PRE-go-live discipline; once live, the live data is authoritative. M1.5c reconciler may build a slippage-comparison view from `live_trades.fill_slippage_bps` against historical shadow telemetry if the operator finds that valuable.
+
+**Documented in:** plan §"What this milestone does NOT do" — explicit "BL-055 shadow soak ends at first live signal" note.
 
 ### 2.7 Per-venue counter intent
 
@@ -105,11 +151,34 @@ Close V1 review's CRITICAL findings on routing-layer disconnection (C1) and zero
 1. Plan §"Operator activation prereqs" — explicit warning + verification trade recommendation
 2. M1.5c plan (future) — recurring health probe is the structural fix
 
-**Operator activation guidance:**
-- Treat the FIRST live dispatch as a verification trade
-- Watch for an immediate fill confirmation in logs
-- If any anomaly, kill-switch via `LIVE_USE_ROUTING_LAYER=False` flag-flip + restart
-- Recommended first-dispatch trade size: `LIVE_TRADE_AMOUNT_USD=10` (already M1.5a runbook recommendation V3-M3)
+**Operator activation guidance (R2-I1 actionable fold):**
+
+The advisory "treat the first live dispatch as a verification trade" is not actionable when operator can't predict which signal fires first. Reframed with concrete bounds + verification commands:
+
+- **Pre-flip verification** (run before flipping `LIVE_USE_ROUTING_LAYER=True`):
+  ```bash
+  ssh root@89.167.116.187 \
+    'sqlite3 /root/gecko-alpha/scout.db "SELECT * FROM venue_health;"' > .venue_health.txt
+  ```
+  Empty result confirms first-time activation (no probe rows yet) — gap is genuinely "first dispatch fires before any health probe."
+
+- **First-dispatch timing bound:** observed prod signal rate is ~1.8 signals/hr (43 paper trades / 24h). First M1.5b live dispatch is expected within ~30 minutes of flag flip. Operator should remain at terminal for 1 hour post-flip and grep journalctl for the first `live_dispatch_terminal` event.
+
+- **Walkaway blast-radius bound** (R2-M3 fold): walkaway exposure = `LIVE_TRADE_AMOUNT_USD × hourly_signal_rate × max_open_per_token × walkaway_hours`. Defaults: `$10 × 2 × 1 × N hours`. **8-hour walkaway = ≤ $160 max exposure.** This bound assumes (a) misconfig CRASH at boot guards against silent-no-op losses (§2.2), (b) per-token cap enforced.
+
+- **First-dispatch verification log greps** (post-flip):
+  ```bash
+  # Did _dispatch_live fire?
+  ssh root@89.167.116.187 'journalctl -u gecko-pipeline --since "1 hour ago" | grep live_dispatch_entered'
+  # Was a terminal status reached?
+  ssh root@89.167.116.187 'journalctl -u gecko-pipeline --since "1 hour ago" | grep live_dispatch_terminal'
+  # Was the counter incremented?
+  ssh root@89.167.116.187 'sqlite3 /root/gecko-alpha/scout.db "SELECT * FROM signal_venue_correction_count;"'
+  ```
+
+- **Anomaly response:** kill-switch via `LIVE_USE_ROUTING_LAYER=False` flag-flip + `systemctl restart gecko-pipeline`. Window: ~2 seconds.
+
+- **First-24h trade size cap:** `LIVE_TRADE_AMOUNT_USD=10` (already M1.5a runbook recommendation V3-M3)
 
 ## 4. Operator activation experience: 4-flag cumulative gating
 
@@ -160,36 +229,55 @@ Collapsing flags buys nothing (the operator must still verify each invariant) an
 
 ## 6. Test strategy
 
-**New tests (Task 1 + Task 2):**
+**New tests (Task 1 + Task 2 + Task 4):**
+
+*Counter helper unit tests:*
 - 4 counter helper tests (create-on-first-call, bump-on-subsequent, reset-zeros + records correction_at, per-venue-pair independence)
-- 1 None/empty signal_type coercion test
-- 1 cid format regression test (R1-C2 — verifies await_fill receives full cid)
+- 1 None/empty signal_type coercion test (R1-I7)
+
+*Engine `_dispatch_live` unit tests (stubbed routing + adapter):*
+- 1 cid format regression test (R1-C2 — verifies await_fill receives full `gecko-{paper_trade_id}-{uuid8}` cid, NOT raw intent_uuid)
 - 1 status='filled' counter test (counter += 1)
 - 1 status='partial' counter NOT incremented test (R1+R2 C3 regression)
+- 1 status='rejected' counter NOT incremented test (R1-I2 — no test in original 13)
 - 1 status='timeout' counter NOT incremented test
-- 1 NotImplementedError silent return test (LIVE_USE_REAL_SIGNED_REQUESTS=False fallback)
-- 1 mode='live' AND flag=False regression (R1-I6 — does NOT call routing)
-- 1 engine-init WARN test (R1-I5 — flag set but layer None)
-- 1 shadow-mode unchanged test
+- 1 no-candidates path test (`live_dispatch_no_venue` event + reject-row written per Q2 fold below)
+- 1 NotImplementedError silent return test (defense-in-depth — should not fire in practice because §2.2 misconfig CRASH catches the upstream cause)
+- 1 BinanceAuthError mid-session test (R1-I2 — verifies engine engages KillSwitch when API key revoked mid-session, since gates already approved)
+- 1 multi-candidate ordering test (R1-I2 — verifies dispatch picks highest `venue_health_score`, not just `[0]`; protects against future refactor that drops the sort)
+- 1 mode='live' AND flag=False regression (R1-I6 — does NOT call routing under default flag posture)
+
+*Engine `__init__` misconfig CRASH tests (§2.2):*
+- 1 CRASH on `mode='live' AND LIVE_USE_ROUTING_LAYER=True AND LIVE_USE_REAL_SIGNED_REQUESTS=False` (R2-C1)
+- 1 CRASH on `mode='live' AND LIVE_USE_ROUTING_LAYER=True AND routing=None` (R2-I3)
+- 1 NO crash on `mode='shadow' AND LIVE_USE_ROUTING_LAYER=True AND LIVE_USE_REAL_SIGNED_REQUESTS=False` (shadow mode is exempt — no live trades dispatched)
+
+*Shadow regression:*
+- 1 shadow-mode unchanged test (LIVE_MODE='shadow' does not invoke `_dispatch_live` and `shadow_trades` row still written)
+
+*Integration test (Task 4 — R2-C2 fold, NEW):*
+- 1 end-to-end happy-path test using REAL `scout.main.py` construction code (lifted into a fixture). Stubs ONLY the Binance HTTP layer (via `aioresponses`). Verifies: operator flips all 4 flags → paper-trade opens → `_dispatch_live` fires → `place_order_request` called → `await_fill_confirmation` returns FILLED → counter increments to 1 → `live_dispatch_terminal` event emitted. Catches the regression class where Task 3 forgets `routing=live_routing` kwarg in main.py and unit tests pass while prod silently no-ops.
 
 **Modified tests:**
 - `tests/test_live_master_kill.py` — add `LIVE_USE_ROUTING_LAYER=False` default
 
-**Total: 13 new test cases. Regression surface: M1.5a tests must stay green.**
+**Total: 18 new test cases (was 13). Regression surface: M1.5a tests must stay green.**
 
-## 7. Open questions for design-stage reviewers
+**Fixture pattern (R1-I4 fold — first engine-level test file):** `tests/test_live_engine_dispatch.py` introduces the FIRST direct unit-test surface for `LiveEngine`. Document the stub-adapter + stub-routing fixture pattern at the top of the file with a docstring. M1.5c reconciler tests will reuse this fixture; the convention should be visible.
 
-1. Is the `_dispatch_live` exception classification correct? Currently:
-   - `NotImplementedError` → INFO log + return (signed-disabled posture)
-   - All other Exceptions → log.exception + return
-   
-   Should we distinguish `BinanceAuthError` / `BinanceIPBanError` / `VenueTransientError` separately for telemetry, or is the catch-all sufficient for M1.5b's "fail-silent and let next signal try" posture?
+## 7. Open questions — RESOLVED post-design-stage review
 
-2. Should `_dispatch_live` write a `live_trades` row when `candidates is empty`? Currently it does NOT (routing layer logs the structural reason; engine returns silently). This means there is no `live_trades` row to query for "how often did routing return zero candidates." Is the routing-layer-side logging sufficient for operator observability, or should the engine write a `status='rejected', reject_reason='no_venue'` row?
+**Q1 (RESOLVED — fold):** distinguish `BinanceAuthError` / `BinanceIPBanError` from generic Exception?
+- **Resolution:** YES, distinguish. After Gate 10 already approved the dispatch, an in-flight `BinanceAuthError(-2015)` means the API key was revoked mid-session. This is severe enough to engage KillSwitch (`self._kill_switch.engage(reason="binance_auth_revoked_mid_session")`) — subsequent dispatches must NOT fire until operator investigates. `BinanceIPBanError` (HTTP 418) → KillSwitch + Telegram alert. `VenueTransientError` → log INFO + return (next signal will retry, this is a known transient class).
 
-3. Should `LIVE_USE_ROUTING_LAYER=True` AND `routing is None` be a STARTUP CRASH instead of a WARN log? Crashing forces operator to fix the misconfiguration before live trades can fire. WARN-and-silent-skip allows the operator to discover the misconfiguration only when the first signal fires and silently does nothing.
+**Q2 (RESOLVED — fold):** write `live_trades` reject row when no candidates?
+- **Resolution:** YES, write the row. R2-M1: dashboard `/api/live_trades` is operator's primary observability surface. Without a row, "routing silently returns zero candidates for every signal" is invisible. Engine writes `INSERT INTO live_trades (paper_trade_id, status, reject_reason, ...) VALUES (?, 'rejected', 'no_venue', ...)`. The reject_reason 'no_venue' is already in M1.5a's CHECK constraint — no migration needed.
 
-4. The 30-second `timeout_sec` in `_dispatch_live` is hardcoded. Should it be a Settings field (`LIVE_AWAIT_FILL_TIMEOUT_SEC`)? M1.5a left it as a parameter; M1.5b inherits.
+**Q3 (RESOLVED — fold):** CRASH vs WARN on `LIVE_USE_ROUTING_LAYER=True AND routing=None`?
+- **Resolution:** CRASH at engine `__init__`. R2-I3 + R1-M2 both recommend CRASH. Cost-of-crash is bounded by systemd `RestartSec=30s + StartLimitBurst=3` + OnFailure Telegram (M1.5a runbook §1+§2). Cost-of-WARN-and-skip is unbounded (operator walkaway = arbitrary missed signals). Folded into §2.2 above.
+
+**Q4 (RESOLVED — defer):** make `timeout_sec` a Settings field?
+- **Resolution:** DEFER to M1.5c. The 30s value is reasonable for Binance spot fills; Settings-ization is M1.5c hygiene, not M1.5b correctness. M1.5a left it as a parameter; M1.5b inherits. If operator finds 30s wrong in early activation, a one-line code-edit + restart is faster than designing a Settings interface for this single value.
 
 ## 8. M1.5b deferred items (forward to M1.5c plan)
 
@@ -201,7 +289,9 @@ Collapsing flags buys nothing (the operator must still verify each invariant) an
 - V2 deferred minors: ServiceRunner cancel-log, view CAST symmetry, override-NULL filter, venue_health staleness gate
 - `LIVE_AWAIT_FILL_TIMEOUT_SEC` Settings field (if reviewers OK7 above flags it)
 
-## 9. Reviewer-fold summary (plan-stage)
+## 9. Reviewer-fold summary
+
+### Plan-stage (commit `e6c4b4e`)
 
 | Finding | Reviewer | Severity | Status |
 |---|---|---|---|
@@ -209,14 +299,33 @@ Collapsing flags buys nothing (the operator must still verify each invariant) an
 | cid mismatch in await_fill | R1 | C2 | Folded — `_dispatch_live` uses `make_client_order_id` |
 | Partial-fill double-count | R1+R2 | C3 | Folded — counter restricted to `status='filled'` only |
 | Counter-reset destroys history | R2 | C2 | Acknowledged in docstring + runbook + design §2.5 |
-| WARN log on flag-vs-layer mismatch | R1 | I5 | Folded — engine __init__ logs WARN |
+| WARN log on flag-vs-layer mismatch | R1 | I5 | Superseded by design-stage CRASH fold |
 | Test for flag=False+live | R1 | I6 | Folded — explicit test added |
 | None signal_type | R1 | I7 | Folded — coerce to "unknown" |
-| venue_health gap | R2 | I1 | Folded — runbook documentation; M1.5c structural fix |
+| venue_health gap | R2 | I1 | Folded plan-stage; sharpened design-stage |
 | Counter only Binance | R2 | I2 | Per-venue-by-design — design §2.7 |
 | V1-C1 partial closure | R2 | I3 | Folded — renamed "V1-C1 routing-half closure" |
 | In-flight reversibility | R1+R2 | M | Folded — runbook cross-ref to §6 |
 | 4-flag cumulative gating | R2 | M | Defended — design §4 |
+
+### Design-stage (this commit)
+
+| Finding | Reviewer | Severity | Status |
+|---|---|---|---|
+| Silent no-op on signed-disabled misconfig | R2 | C1 | **Folded — engine __init__ CRASH (§2.2)** |
+| No end-to-end happy-path integration test | R2 | C2 | **Folded — Task 4 integration test (§6)** |
+| Shadow_trades writer ambiguity under live | R1 | I1 | **Folded — §2.7a explicitly closes BL-055 at first live signal** |
+| 4 missing test cases | R1 | I2 | **Folded — added BinanceAuthError, multi-candidate, status='rejected', routing=None+live runtime tests (§6)** |
+| RouteCandidate test stub shape | R1 | I3 | **Folded — fixture pattern documented (§6)** |
+| First engine-level test file | R1 | I4 | **Folded — fixture pattern docstring requirement (§6)** |
+| venue_health mitigation actionable | R2 | I1 | **Folded — pre-flip verification command + walkaway calc + post-flip greps (§3)** |
+| Missing entry/candidate-count telemetry | R2 | I2 | **Folded — `live_dispatch_entered` + `live_dispatch_candidates_returned` events (§7 Q1 fold)** |
+| CRASH vs WARN on routing=None | R1+R2 | M2/I3 | **Folded — CRASH at engine __init__ (§2.2 + §7 Q3)** |
+| Runbook update task missing | R2 | I4 | **Folded — Task 5 in plan (§12 below)** |
+| BinanceAuthError → KillSwitch | R1 | M1 | **Folded — §7 Q1** |
+| Q2 — write reject row on no-venue | R2 | M1 | **Folded — §7 Q2** |
+| partial→CANCELED trace | R1 | M3 | **Folded — §2.4 verified path** |
+| timeout_sec Settings-ization | — | Q4 | **Deferred to M1.5c** |
 
 ## 10. Blast radius
 
