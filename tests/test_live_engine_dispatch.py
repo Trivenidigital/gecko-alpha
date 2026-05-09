@@ -9,6 +9,7 @@ SimpleNamespace shims. M1.5c reconciler tests should reuse the
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -48,6 +49,26 @@ class _PaperTrade:
 
 def _make_paper_trade(**overrides) -> _PaperTrade:
     return _PaperTrade(**overrides)
+
+
+async def _insert_paper_trade(db: Database, *, trade_id: int = 42) -> None:
+    """Insert a paper_trades row so live_trades FK on paper_trade_id is
+    satisfied. Required for any test that triggers _dispatch_live's
+    no_venue / live_trades INSERT path.
+    """
+    if db._conn is None:
+        raise RuntimeError("db not initialized")
+    await db._conn.execute(
+        """INSERT INTO paper_trades
+           (id, token_id, symbol, name, chain, signal_type, signal_data,
+            entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price,
+            sl_price, status, opened_at)
+           VALUES (?, 'btc', 'BTC', 'btc', 'binance', 'first_signal',
+                   '{}', 100.0, 10.0, 0.1, 20.0, 10.0, 120.0, 90.0,
+                   'open', ?)""",
+        (trade_id, datetime.now(timezone.utc).isoformat()),
+    )
+    await db._conn.commit()
 
 
 async def _make_engine(
@@ -211,8 +232,11 @@ async def test_dispatch_live_uses_full_cid_for_await_fill(tmp_path):
     await engine._dispatch_live(paper_trade=pt, size_usd=10.0)
     call = adapter.await_fill_confirmation.call_args
     cid = call.kwargs["client_order_id"]
+    # Format: gecko-{paper_trade_id}-{uuid8} where uuid8 is 8 hex chars
+    # (no dashes within). For paper_trade_id=42, cid is "gecko-42-XXXXXXXX".
     assert cid.startswith("gecko-42-"), f"cid format wrong: {cid!r}"
-    assert "-" in cid[9:], "missing uuid8 suffix"
+    assert len(cid) == len("gecko-42-") + 8, f"cid length wrong: {cid!r}"
+    assert cid != "42", "raw intent_uuid leaked through"
     await db.close()
 
 
@@ -302,13 +326,15 @@ async def test_dispatch_live_status_rejected_no_counter(tmp_path):
 
 @pytest.mark.asyncio
 async def test_dispatch_live_no_venue_writes_reject_row(tmp_path):
-    """R2-M1 / Q2 fold: empty candidates -> live_trades reject row written."""
+    """R2-M1 / Q2 fold + V1+V3 PR-stage CRITICAL fix: empty candidates ->
+    live_trades reject row written with all NOT NULL columns populated."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
+    pt = _make_paper_trade()
+    await _insert_paper_trade(db, trade_id=pt.id)
     routing = MagicMock()
     routing.get_candidates = AsyncMock(return_value=[])
     engine = await _make_engine(db, routing=routing)
-    pt = _make_paper_trade()
     await engine._dispatch_live(paper_trade=pt, size_usd=10.0)
     cur = await db._conn.execute(
         "SELECT status, reject_reason FROM live_trades WHERE paper_trade_id=?",
