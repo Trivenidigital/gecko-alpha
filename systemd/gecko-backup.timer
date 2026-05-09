@@ -1,0 +1,11 @@
+[Unit]
+Description=Gecko-Alpha — nightly backup rotation timer
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+AccuracySec=1h
+Unit=gecko-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Gecko-Alpha — daily watchdog: backup-rotation freshness check
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+AccuracySec=30m
+Unit=gecko-backup-watchdog.service
+
+[Install]
+WantedBy=timers.target
