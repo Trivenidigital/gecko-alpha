@@ -465,4 +465,9 @@ class LiveEngine:
         )
 
         if confirmation.status == "filled":
-            await increment_consecutive(self._db, paper_trade.signal_type, top.venue)
+            await increment_consecutive(
+                self._db,
+                paper_trade.signal_type,
+                top.venue,
+                paper_trade_id=paper_trade.id,
+            )

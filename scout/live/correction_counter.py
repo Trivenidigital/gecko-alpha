@@ -25,7 +25,11 @@ log = structlog.get_logger(__name__)
 
 
 async def increment_consecutive(
-    db: Database, signal_type: str | None, venue: str
+    db: Database,
+    signal_type: str | None,
+    venue: str,
+    *,
+    paper_trade_id: int | None = None,
 ) -> None:
     """Increment consecutive_no_correction by 1 for (signal_type, venue).
 
@@ -33,6 +37,10 @@ async def increment_consecutive(
 
     Empty/None signal_type is coerced to "unknown" (R1-I7) — avoids a
     crash if a future dispatcher path emits empty signal_type.
+
+    `paper_trade_id` is optional (V3-I4 fold): when supplied, it is
+    included in the structured log so operator post-mortem can trace
+    a counter increment back to the dispatching trade.
     """
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
@@ -53,6 +61,7 @@ async def increment_consecutive(
         "correction_counter_incremented",
         signal_type=signal_type,
         venue=venue,
+        paper_trade_id=paper_trade_id,
     )
 
 

@@ -193,9 +193,11 @@ ssh root@89.167.116.187 \
   > .counter.txt
 ```
 
-**Walkaway blast-radius bound** (operator absence):
+**Walkaway blast-radius bound** (operator absence) — V2-I4 PR-stage fold:
 - exposure ≤ `LIVE_TRADE_AMOUNT_USD × hourly_signal_rate × max_open_per_token × walkaway_hours`
-- defaults: `$10 × 2 × 1 × N hours` → 8-hour walkaway = ≤ $160 max exposure
+- **Default `LIVE_TRADE_AMOUNT_USD=100`** (`scout/config.py`): 8-hour walkaway = `$100 × 2 × 1 × 8 = $1,600` max exposure
+- **First-24h discipline** (per §3 line 104): set `LIVE_TRADE_AMOUNT_USD=10` for the first 24h. With this cap, 8-hour walkaway = `$10 × 2 × 1 × 8 = $160`
+- The first-24h discipline is the operator-controlled bound; the $1,600 figure is what happens if you skip it
 
 **Counter-reset UX cost** (design §2.5 ack): a single `reset_on_correction`
 zeros the entire `consecutive_no_correction` for the (signal_type, venue)
@@ -203,6 +205,20 @@ pair. Worked example: 30 successful fills → counter=30 → operator unwinds
 trade #31 → counter=0 → all 30 prior good fills lose their auto-clear-
 approval progress. M1.5c may add `total_fills_lifetime` for dashboard
 telemetry that survives resets.
+
+**Operator manual SQL close does NOT reset counter** (V3-I3 PR-stage fold):
+M1.5b does not auto-call `reset_on_correction`. If operator closes a
+`live_trades` row manually via SQL during the soak, the counter keeps
+accumulating and may cross the 30-trade auto-clear threshold on stale
+data. Manual unwind protocol: also run an UPSERT setting
+`consecutive_no_correction=0, last_corrected_at=...` for the affected
+(signal_type, venue) pair. M1.5c reconciler will automate this.
+
+**SSH stdout capture on Windows** (V2-I5 PR-stage fold): if running this
+runbook from Bash-on-Windows, the `ssh ... > .file.txt` redirect pattern
+produces empty files (platform constraint per `~/.claude/CLAUDE.md`).
+Use the two-step pattern (redirect to remote file then `scp`), or run
+from a Linux shell. macOS / Linux can use `>` as written.
 
 **Anomaly response:** `LIVE_USE_ROUTING_LAYER=False` in `.env` →
 `systemctl restart gecko-pipeline` (~2 second window).
