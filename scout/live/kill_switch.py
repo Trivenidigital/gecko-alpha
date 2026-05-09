@@ -73,15 +73,13 @@ class KillSwitch:
         re-check here so a partial/hand-edited row does not look active.
         """
         assert self._db._conn is not None
-        cur = await self._db._conn.execute(
-            """
+        cur = await self._db._conn.execute("""
             SELECT ke.id, ke.killed_until, ke.reason, ke.triggered_by
               FROM live_control AS lc
               JOIN kill_events  AS ke ON ke.id = lc.active_kill_event_id
              WHERE lc.id = 1
                AND ke.cleared_at IS NULL
-            """
-        )
+            """)
         row = await cur.fetchone()
         if row is None:
             return None
@@ -186,12 +184,10 @@ class KillSwitch:
                 # Nothing to clear — commit nothing, return silently.
                 return
             await self._db._conn.execute(
-                "UPDATE live_control SET active_kill_event_id = NULL "
-                "WHERE id = 1"
+                "UPDATE live_control SET active_kill_event_id = NULL " "WHERE id = 1"
             )
             await self._db._conn.execute(
-                "UPDATE kill_events SET cleared_at = ?, cleared_by = ? "
-                "WHERE id = ?",
+                "UPDATE kill_events SET cleared_at = ?, cleared_by = ? " "WHERE id = ?",
                 (now.isoformat(), cleared_by, active_id),
             )
             await self._db._conn.commit()
@@ -274,8 +270,7 @@ async def maybe_trigger_from_daily_loss(
         _id, i_won = await ks.trigger(
             triggered_by="daily_loss_cap",
             reason=(
-                f"daily_sum={daily_sum:.2f} "
-                f"cap=-{settings.LIVE_DAILY_LOSS_CAP_USD}"
+                f"daily_sum={daily_sum:.2f} " f"cap=-{settings.LIVE_DAILY_LOSS_CAP_USD}"
             ),
             duration=compute_kill_duration(datetime.now(timezone.utc)),
         )

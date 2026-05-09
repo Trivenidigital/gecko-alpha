@@ -29,12 +29,14 @@ async def test_fetch_exchange_info_row_happy_path():
         m.get(
             "https://api.binance.com/api/v3/exchangeInfo?symbol=WBTCUSDT",
             payload={
-                "symbols": [{
-                    "symbol": "WBTCUSDT",
-                    "status": "TRADING",
-                    "baseAsset": "WBTC",
-                    "quoteAsset": "USDT",
-                }]
+                "symbols": [
+                    {
+                        "symbol": "WBTCUSDT",
+                        "status": "TRADING",
+                        "baseAsset": "WBTC",
+                        "quoteAsset": "USDT",
+                    }
+                ]
             },
             headers={"X-MBX-USED-WEIGHT-1M": "12"},
         )
@@ -81,7 +83,7 @@ async def test_semaphore_shrinks_at_80pct_weight():
     with aioresponses() as m:
         m.get(
             "https://api.binance.com/api/v3/depth?symbol=X&limit=100",
-            payload={"bids": [["1","1"]], "asks": [["1.01","1"]]},
+            payload={"bids": [["1", "1"]], "asks": [["1.01", "1"]]},
             headers={"X-MBX-USED-WEIGHT-1M": "965"},
         )
         adapter = BinanceSpotAdapter(_settings())
@@ -119,13 +121,15 @@ async def test_send_order_raises_not_implemented_in_shadow():
     adapter = BinanceSpotAdapter(_settings())
     try:
         with pytest.raises(NotImplementedError):
-            await adapter.send_order(pair="WBTCUSDT", side="BUY",
-                                     size_usd=Decimal("100"))
+            await adapter.send_order(
+                pair="WBTCUSDT", side="BUY", size_usd=Decimal("100")
+            )
     finally:
         await adapter.close()
 
 
 # --- Retry taxonomy (spec §10.1) -----------------------------------------
+
 
 async def test_http_get_retries_5xx_three_times():
     """5xx → up to 3 retries with backoff [1.0, 2.0, 4.0] then raise
@@ -200,7 +204,9 @@ async def test_429_increments_binance_rate_limit_hits_metric(tmp_path):
     TODO(BL-055 Task 11): re-enable once scout.live.metrics.inc exists.
     """
     from scout.db import Database
-    db = Database(tmp_path / "t.db"); await db.initialize()
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
     with aioresponses() as m:
         m.get(
             "https://api.binance.com/api/v3/ticker/price?symbol=X",
@@ -244,6 +250,7 @@ async def test_rate_governor_opens_gate_after_10s():
     so concurrent requests resume in parallel (not 10s-serial). Asserts the
     asyncio.Event-based backpressure pattern."""
     import asyncio
+
     with aioresponses() as m:
         m.get(
             "https://api.binance.com/api/v3/ticker/price?symbol=Y",

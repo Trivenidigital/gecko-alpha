@@ -27,10 +27,7 @@ async def test_losers_contrarian_disabled_skips_call(settings_factory):
             "trade_losers MUST NOT be called when flag is False"
         )
         # Reproduce the gated call site condition from main.py
-        if (
-            trading_engine
-            and settings.PAPER_SIGNAL_LOSERS_CONTRARIAN_ENABLED
-        ):
+        if trading_engine and settings.PAPER_SIGNAL_LOSERS_CONTRARIAN_ENABLED:
             await mock_trade_losers(trading_engine, db, settings=settings)
         # If we reach here, the gate worked
         mock_trade_losers.assert_not_called()
@@ -60,10 +57,7 @@ async def test_trending_catch_disabled_skips_call(settings_factory):
             "trade_trending MUST NOT be called when flag is False"
         )
     )
-    if (
-        trading_engine
-        and settings.PAPER_SIGNAL_TRENDING_CATCH_ENABLED
-    ):
+    if trading_engine and settings.PAPER_SIGNAL_TRENDING_CATCH_ENABLED:
         await mock_trade_trending(trading_engine, db, settings=settings)
     mock_trade_trending.assert_not_called()
 

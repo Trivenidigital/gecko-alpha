@@ -15,15 +15,15 @@ class DepthLevel:
 @dataclass(frozen=True)
 class Depth:
     pair: str
-    bids: tuple[DepthLevel, ...]     # descending
-    asks: tuple[DepthLevel, ...]     # ascending
+    bids: tuple[DepthLevel, ...]  # descending
+    asks: tuple[DepthLevel, ...]  # ascending
     mid: Decimal
     fetched_at: datetime
 
 
 @dataclass(frozen=True)
 class WalkResult:
-    vwap: Decimal | None             # None if insufficient_liquidity
+    vwap: Decimal | None  # None if insufficient_liquidity
     filled_qty: Decimal
     filled_notional: Decimal
     slippage_bps: int | None

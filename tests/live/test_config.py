@@ -48,9 +48,7 @@ def test_live_sizing_defaults():
 
 
 def test_live_signal_sizes_map_parses_csv():
-    s = Settings(**_base_kwargs(
-        LIVE_SIGNAL_SIZES="first_signal=50,gainers_early=75"
-    ))
+    s = Settings(**_base_kwargs(LIVE_SIGNAL_SIZES="first_signal=50,gainers_early=75"))
     assert s.live_signal_sizes_map == {
         "first_signal": Decimal("50"),
         "gainers_early": Decimal("75"),
@@ -64,12 +62,8 @@ def test_live_signal_sizes_map_rejects_malformed():
 
 
 def test_live_signal_allowlist_set_lowercased_and_trimmed():
-    s = Settings(**_base_kwargs(
-        LIVE_SIGNAL_ALLOWLIST=" First_Signal , gainers_early "
-    ))
-    assert s.live_signal_allowlist_set == frozenset(
-        {"first_signal", "gainers_early"}
-    )
+    s = Settings(**_base_kwargs(LIVE_SIGNAL_ALLOWLIST=" First_Signal , gainers_early "))
+    assert s.live_signal_allowlist_set == frozenset({"first_signal", "gainers_early"})
 
 
 def test_live_risk_gate_defaults():
@@ -92,12 +86,16 @@ from scout.live.config import LiveConfig  # noqa: E402
 
 
 def _make(**over):
-    return LiveConfig(Settings(**{
-        "TELEGRAM_BOT_TOKEN": "t",
-        "TELEGRAM_CHAT_ID": "c",
-        "ANTHROPIC_API_KEY": "k",
-        **over,
-    }))
+    return LiveConfig(
+        Settings(
+            **{
+                "TELEGRAM_BOT_TOKEN": "t",
+                "TELEGRAM_CHAT_ID": "c",
+                "ANTHROPIC_API_KEY": "k",
+                **over,
+            }
+        )
+    )
 
 
 def test_live_config_mode_passthrough():
@@ -113,8 +111,9 @@ def test_live_config_is_signal_enabled_is_case_insensitive():
 
 
 def test_resolve_size_usd_falls_back_to_default():
-    lc = _make(LIVE_TRADE_AMOUNT_USD=Decimal("100"),
-               LIVE_SIGNAL_SIZES="first_signal=50")
+    lc = _make(
+        LIVE_TRADE_AMOUNT_USD=Decimal("100"), LIVE_SIGNAL_SIZES="first_signal=50"
+    )
     assert lc.resolve_size_usd("first_signal") == Decimal("50")
     assert lc.resolve_size_usd("volume_spike") == Decimal("100")
 

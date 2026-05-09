@@ -14,6 +14,7 @@ One test per handoff-matrix branch (spec §5 + §2.2):
 ``paper_trades`` is an FK with ON DELETE RESTRICT, so every test seeds a real
 row before invoking the engine.
 """
+
 from __future__ import annotations
 
 import types
@@ -27,7 +28,6 @@ from scout.live.config import LiveConfig
 from scout.live.engine import LiveEngine
 from scout.live.kill_switch import KillSwitch
 from scout.live.types import Depth, DepthLevel
-
 
 # ---------- fixture helpers --------------------------------------------------
 
@@ -292,9 +292,7 @@ async def test_slippage_exceeds_cap_writes_rejected_row(tmp_path):
     await engine.on_paper_trade_opened(pt)
 
     assert (
-        await _count_shadow(
-            db, status="rejected", reject_reason="slippage_exceeds_cap"
-        )
+        await _count_shadow(db, status="rejected", reject_reason="slippage_exceeds_cap")
         == 1
     )
     assert await _metric_value(db, "shadow_rejects_slippage_exceeds_cap") == 1
@@ -329,9 +327,7 @@ async def test_exposure_cap_writes_rejected_row(tmp_path):
 
     await engine.on_paper_trade_opened(pt)
 
-    assert (
-        await _count_shadow(db, status="rejected", reject_reason="exposure_cap") == 1
-    )
+    assert await _count_shadow(db, status="rejected", reject_reason="exposure_cap") == 1
     assert await _metric_value(db, "shadow_rejects_exposure_cap") == 1
     await db.close()
 

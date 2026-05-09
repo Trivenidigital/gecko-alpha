@@ -177,9 +177,7 @@ async def _run_feedback_schedulers(
             from scout.trading.auto_suspend import maybe_suspend_signals
 
             async with aiohttp.ClientSession() as session:
-                suspended = await maybe_suspend_signals(
-                    db, settings, session=session
-                )
+                suspended = await maybe_suspend_signals(db, settings, session=session)
             if suspended:
                 logger.info("auto_suspend_pass", count=len(suspended))
             _last_suspension_date = today_iso
@@ -216,8 +214,10 @@ async def _run_feedback_schedulers(
                 format_dryrun_telegram_message,
                 telegram_token_looks_real,
             )
+
             diffs = await build_diffs(
-                db, settings,
+                db,
+                settings,
                 window_days=settings.CALIBRATION_WINDOW_DAYS,
                 min_trades=settings.CALIBRATION_MIN_TRADES,
                 step=settings.CALIBRATION_STEP_SIZE_PCT,
@@ -226,7 +226,8 @@ async def _run_feedback_schedulers(
             )
             actionable = sum(1 for d in diffs if d.changes)
             msg = format_dryrun_telegram_message(
-                diffs, actionable,
+                diffs,
+                actionable,
                 window_days=settings.CALIBRATION_WINDOW_DAYS,
             )
             # adv-S2 / silent-failure-C1: pass parse_mode=None — message body
@@ -1026,6 +1027,29 @@ async def main(argv: list[str] | None = None) -> int:
     live_kill_switch: KillSwitch | None = None
     _live_owned: list = []  # adapters to close() on graceful shutdown
 
+    # BL-NEW-LIVE-HYBRID M1 v2.1 startup notification (Task 14):
+    # post a Telegram alert ONCE when LIVE_TRADING_ENABLED=True at
+    # process startup so the operator confirms the master kill state.
+    # Uses parse_mode=None to avoid Markdown anchor mis-parsing on the
+    # `$` chars (silent 400 per PR #76 silent-failure C1).
+    if getattr(settings, "LIVE_TRADING_ENABLED", False):
+        try:
+            async with aiohttp.ClientSession() as _startup_session:
+                await alerter.send_telegram_message(
+                    (
+                        "[live-trading] master kill OFF — "
+                        f"LIVE_TRADING_ENABLED=True; LIVE_MODE={live_config.mode}; "
+                        f"per-trade-cap=${settings.LIVE_TRADE_AMOUNT_USD}; "
+                        f"agg-cap=${settings.LIVE_MAX_EXPOSURE_USD}; "
+                        f"per-token-cap={settings.LIVE_MAX_OPEN_POSITIONS_PER_TOKEN}"
+                    ),
+                    _startup_session,
+                    settings,
+                    parse_mode=None,
+                )
+        except Exception:
+            logger.exception("live_startup_notification_failed")
+
     if live_config.mode in ("shadow", "live"):
         if live_config.mode == "live":
             if not settings.BINANCE_API_KEY or not settings.BINANCE_API_SECRET:
@@ -1033,6 +1057,16 @@ async def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError("LIVE_MODE=live requires BINANCE_API_KEY/SECRET")
             # Balance gate is not yet implemented — fail closed at boot so
             # shadow traffic cannot accidentally leak to real funds.
+            # NOTE: BL-NEW-LIVE-HYBRID M1 v2.1 Layer 1 master-kill enforcement
+            # (LIVE_TRADING_ENABLED required when LIVE_MODE=live) lands AFTER
+            # this NotImplementedError in M1.5 — when balance_gate is wired,
+            # the next guard becomes:
+            #   if not settings.LIVE_TRADING_ENABLED:
+            #       raise RuntimeError("LIVE_MODE=live requires LIVE_TRADING_ENABLED=True")
+            # M1 ships the master-kill knob (defaults False) + the design
+            # commitment, but the runtime guard activates with M1.5's balance
+            # gate wiring. Today this NotImplementedError IS the Layer 1
+            # enforcement (no path to real money exists).
             await db.close()
             raise NotImplementedError(
                 "balance gate not wired for live mode — cannot start live "

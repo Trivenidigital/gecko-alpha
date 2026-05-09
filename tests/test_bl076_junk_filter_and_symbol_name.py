@@ -15,6 +15,7 @@ Test layout:
 - T5 — Database.lookup_symbol_name_by_coin_id sequential lookup (4 cases)
        + chain_completed dispatcher integration (T5e/f) + narrow-except (T5g)
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -25,7 +26,6 @@ import structlog
 from structlog.testing import capture_logs
 
 from scout.trading.signals import _is_junk_coinid
-
 
 # ---------------------------------------------------------------------------
 # Task 1: junk filter — `test-` prefix
@@ -91,18 +91,17 @@ async def test_open_trade_logs_warning_when_symbol_and_name_both_empty(tmp_path)
         )
     # Pin exact event names — substring match too loose (per aff3517 #6).
     warning_events = [
-        e for e in captured
+        e
+        for e in captured
         if e.get("event") == "open_trade_called_with_empty_symbol_and_name"
     ]
-    info_events = [
-        e for e in captured if e.get("event") == "trade_metadata_empty"
-    ]
-    assert warning_events, (
-        f"Expected WARNING event; got events: {[e.get('event') for e in captured]}"
-    )
-    assert info_events, (
-        f"Expected parallel INFO event (A3); got: {[e.get('event') for e in captured]}"
-    )
+    info_events = [e for e in captured if e.get("event") == "trade_metadata_empty"]
+    assert (
+        warning_events
+    ), f"Expected WARNING event; got events: {[e.get('event') for e in captured]}"
+    assert (
+        info_events
+    ), f"Expected parallel INFO event (A3); got: {[e.get('event') for e in captured]}"
     assert warning_events[0].get("token_id") == "some-coin"
     assert warning_events[0].get("signal_type") == "volume_spike"
     assert warning_events[0].get("signal_combo") == "vs|none"
@@ -138,15 +137,15 @@ async def test_open_trade_warning_fires_even_during_warmup(tmp_path, monkeypatch
     assert result is None
     events = [e.get("event") for e in captured]
     # All three events must fire — WARNING placement is BEFORE warmup gate
-    assert "open_trade_called_with_empty_symbol_and_name" in events, (
-        f"WARNING regressed below warmup gate; got: {events}"
-    )
-    assert "trade_metadata_empty" in events, (
-        f"INFO event regressed below warmup gate; got: {events}"
-    )
-    assert "trade_skipped_warmup" in events, (
-        f"warmup gate didn't fire (test setup bug); got: {events}"
-    )
+    assert (
+        "open_trade_called_with_empty_symbol_and_name" in events
+    ), f"WARNING regressed below warmup gate; got: {events}"
+    assert (
+        "trade_metadata_empty" in events
+    ), f"INFO event regressed below warmup gate; got: {events}"
+    assert (
+        "trade_skipped_warmup" in events
+    ), f"warmup gate didn't fire (test setup bug); got: {events}"
     await sd.close()
 
 
@@ -188,12 +187,12 @@ async def test_trade_volume_spikes_passes_symbol_and_name_to_engine(tmp_path):
         detected_at=datetime.now(timezone.utc),
     )
     await trade_volume_spikes(FakeEngine(), sd, [spike], settings)
-    assert captured.get("symbol") == "REAL", (
-        f"trade_volume_spikes must pass symbol; got {captured!r}"
-    )
-    assert captured.get("name") == "Real Coin", (
-        f"trade_volume_spikes must pass name; got {captured!r}"
-    )
+    assert (
+        captured.get("symbol") == "REAL"
+    ), f"trade_volume_spikes must pass symbol; got {captured!r}"
+    assert (
+        captured.get("name") == "Real Coin"
+    ), f"trade_volume_spikes must pass name; got {captured!r}"
     await sd.close()
 
 
@@ -249,8 +248,12 @@ async def test_trade_predictions_passes_symbol_and_name_to_engine(tmp_path):
         predicted_at=datetime.now(timezone.utc),
     )
     await trade_predictions(
-        FakeEngine(), sd, [pred],
-        min_mcap=1_000_000, max_mcap=None, min_fit_score=1,
+        FakeEngine(),
+        sd,
+        [pred],
+        min_mcap=1_000_000,
+        max_mcap=None,
+        min_fit_score=1,
         settings=settings,
     )
     assert captured, "trade_predictions did not call open_trade"
@@ -369,8 +372,7 @@ async def test_lookup_symbol_name_handles_empty_or_none_coin_id(tmp_path, bad_co
     assert name == ""
     # SF-1: caller-bug breadcrumb is mandatory
     assert any(
-        e.get("event") == "lookup_symbol_name_called_with_empty_coin_id"
-        for e in logs
+        e.get("event") == "lookup_symbol_name_called_with_empty_coin_id" for e in logs
     ), f"SF-1 caller-bug breadcrumb missing; got: {[e.get('event') for e in logs]}"
     await sd.close()
 
@@ -422,9 +424,9 @@ async def test_chain_completed_orphan_does_not_trigger_engine_warning(tmp_path):
         await trade_chain_completions(engine, sd, settings=settings)
     events = [e.get("event") for e in logs]
     # Dispatcher's WARNING fires (visibility for orphan rate)
-    assert "chain_completed_no_metadata" in events, (
-        f"chain_completed_no_metadata did not fire; got: {events}"
-    )
+    assert (
+        "chain_completed_no_metadata" in events
+    ), f"chain_completed_no_metadata did not fire; got: {events}"
     # Engine WARNING + INFO MUST NOT fire — they're suppressed by
     # expected_empty_metadata=True
     assert "open_trade_called_with_empty_symbol_and_name" not in events, (
@@ -467,12 +469,12 @@ async def test_open_trade_with_expected_empty_metadata_suppresses_warnings(tmp_p
             expected_empty_metadata=True,
         )
     events_on = [e.get("event") for e in logs_on]
-    assert "open_trade_called_with_empty_symbol_and_name" not in events_on, (
-        f"sentinel did not suppress WARNING; got: {events_on}"
-    )
-    assert "trade_metadata_empty" not in events_on, (
-        f"sentinel did not suppress INFO; got: {events_on}"
-    )
+    assert (
+        "open_trade_called_with_empty_symbol_and_name" not in events_on
+    ), f"sentinel did not suppress WARNING; got: {events_on}"
+    assert (
+        "trade_metadata_empty" not in events_on
+    ), f"sentinel did not suppress INFO; got: {events_on}"
 
     # Sentinel OFF (default): WARNING + INFO MUST fire (regression check)
     with capture_logs() as logs_off:
@@ -486,17 +488,19 @@ async def test_open_trade_with_expected_empty_metadata_suppresses_warnings(tmp_p
             entry_price=0.001,
         )
     events_off = [e.get("event") for e in logs_off]
-    assert "open_trade_called_with_empty_symbol_and_name" in events_off, (
-        f"sentinel False did not log WARNING; got: {events_off}"
-    )
-    assert "trade_metadata_empty" in events_off, (
-        f"sentinel False did not log INFO; got: {events_off}"
-    )
+    assert (
+        "open_trade_called_with_empty_symbol_and_name" in events_off
+    ), f"sentinel False did not log WARNING; got: {events_off}"
+    assert (
+        "trade_metadata_empty" in events_off
+    ), f"sentinel False did not log INFO; got: {events_off}"
     await sd.close()
 
 
 @pytest.mark.asyncio
-async def test_lookup_symbol_name_logs_breadcrumb_on_operational_error(tmp_path, monkeypatch):
+async def test_lookup_symbol_name_logs_breadcrumb_on_operational_error(
+    tmp_path, monkeypatch
+):
     """T5h — MF-1 fix (PR #67 silent-failure-hunter): per-table
     OperationalError swallow MUST emit a debug breadcrumb so
     connection-drop / lock signature is greppable. Without the log,
@@ -645,7 +649,9 @@ async def test_trade_chain_completions_falls_back_to_empty_when_no_snapshot(tmp_
 
 
 @pytest.mark.asyncio
-async def test_lookup_symbol_name_propagates_non_operational_errors(tmp_path, monkeypatch):
+async def test_lookup_symbol_name_propagates_non_operational_errors(
+    tmp_path, monkeypatch
+):
     """T5g (A11 fix) — pin that the per-table catch is narrow:
     `except aiosqlite.OperationalError` ONLY. Other exception types
     (programming errors, type mismatches) MUST propagate — otherwise

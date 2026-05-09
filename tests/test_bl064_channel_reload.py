@@ -25,6 +25,7 @@ DEFERRED FAILURE MODES (PR-review HV-2 acknowledgement):
   doesn't earn its complexity; behavior verified during VPS deploy
   smoke tests.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -50,6 +51,7 @@ _SKIP_AIOHTTP = pytest.mark.skipif(
 @pytest.fixture
 async def db(tmp_path):
     from scout.db import Database
+
     d = Database(tmp_path / "t.db")
     await d.initialize()
     yield d
@@ -75,9 +77,7 @@ def _make_mock_client():
         return _decorator
 
     def _remove_event_handler(func):
-        client._handlers = [
-            (et, f) for et, f in client._handlers if f is not func
-        ]
+        client._handlers = [(et, f) for et, f in client._handlers if f is not func]
 
     client.on = _on
     client.remove_event_handler = _remove_event_handler
@@ -116,15 +116,14 @@ async def _remove_channel(db, handle):
 async def test_reload_no_op_when_channels_unchanged(db):
     """T1 — re-query returns same set → no log, no handler swap."""
     from scout.social.telegram.listener import _channel_reload_once
+
     await _seed_channels(db, "@a", "@b")
     client = _make_mock_client()
     initial_handler = lambda evt: None
     client._handlers.append(("NewMessage", initial_handler))
     in_memory = ["@a", "@b"]
     with capture_logs() as logs:
-        new_list = await _channel_reload_once(
-            db, client, in_memory, initial_handler
-        )
+        new_list = await _channel_reload_once(db, client, in_memory, initial_handler)
     events = [e.get("event") for e in logs]
     assert "tg_social_channel_list_reloaded" not in events
     assert sorted(new_list) == ["@a", "@b"]
@@ -138,6 +137,7 @@ async def test_reload_detects_added_channel_and_re_binds(db):
     """T2 — new row in tg_social_channels → tg_social_channel_list_reloaded
     event with added=[@c], total=N+1; handler re-bound."""
     from scout.social.telegram.listener import _channel_reload_once
+
     await _seed_channels(db, "@a", "@b")
     client = _make_mock_client()
     initial_handler = lambda evt: None
@@ -146,9 +146,7 @@ async def test_reload_detects_added_channel_and_re_binds(db):
     # Operator adds @c
     await _seed_channels(db, "@c")
     with capture_logs() as logs:
-        new_list = await _channel_reload_once(
-            db, client, in_memory, initial_handler
-        )
+        new_list = await _channel_reload_once(db, client, in_memory, initial_handler)
     armed = [e for e in logs if e.get("event") == "tg_social_channel_list_reloaded"]
     assert len(armed) == 1
     assert "@c" in armed[0]["added"]
@@ -163,6 +161,7 @@ async def test_reload_detects_removed_channel_and_re_binds(db):
     """T3 — removed_at stamped → tg_social_channel_list_reloaded event
     with removed=[@b], total=N-1."""
     from scout.social.telegram.listener import _channel_reload_once
+
     await _seed_channels(db, "@a", "@b", "@c")
     client = _make_mock_client()
     initial_handler = lambda evt: None
@@ -170,9 +169,7 @@ async def test_reload_detects_removed_channel_and_re_binds(db):
     in_memory = ["@a", "@b", "@c"]
     await _remove_channel(db, "@b")
     with capture_logs() as logs:
-        new_list = await _channel_reload_once(
-            db, client, in_memory, initial_handler
-        )
+        new_list = await _channel_reload_once(db, client, in_memory, initial_handler)
     armed = [e for e in logs if e.get("event") == "tg_social_channel_list_reloaded"]
     assert len(armed) == 1
     assert armed[0]["added"] == []
@@ -194,6 +191,7 @@ async def test_reload_disabled_when_interval_is_zero(db, settings_factory):
     This now WORKS because the validator was amended to allow 0 as the
     explicit opt-out (PR-review adv-M1)."""
     from scout.social.telegram.listener import _make_channel_reload_heartbeat
+
     settings = settings_factory(TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC=0)
     client = _make_mock_client()
     initial_handler = lambda evt: None
@@ -224,6 +222,7 @@ async def test_reload_error_is_caught_in_heartbeat_not_propagated(
     crash the listener loop. Tests the heartbeat-level catch (not the
     once-level — `_channel_reload_once` propagates by design)."""
     from scout.social.telegram.listener import _make_channel_reload_heartbeat
+
     # 60s interval but we'll use a fast monkeypatch on asyncio.sleep
     settings = settings_factory(TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC=60)
     client = _make_mock_client()
@@ -252,9 +251,7 @@ async def test_reload_error_is_caught_in_heartbeat_not_propagated(
             raise asyncio.CancelledError()
         await real_sleep(0)  # quick yield
 
-    monkeypatch.setattr(
-        "scout.social.telegram.listener.asyncio.sleep", _fast_sleep
-    )
+    monkeypatch.setattr("scout.social.telegram.listener.asyncio.sleep", _fast_sleep)
 
     heartbeat = _make_channel_reload_heartbeat(
         db, client, settings, channels_holder, initial_handler
@@ -264,9 +261,9 @@ async def test_reload_error_is_caught_in_heartbeat_not_propagated(
         with pytest.raises(asyncio.CancelledError):
             await heartbeat()
     events = [e.get("event") for e in logs]
-    assert "tg_social_channel_reload_error" in events, (
-        f"heartbeat must catch and log error; got {events}"
-    )
+    assert (
+        "tg_social_channel_reload_error" in events
+    ), f"heartbeat must catch and log error; got {events}"
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +278,7 @@ async def test_reload_swap_failure_rolls_back_to_old_handler(db):
     remove_event_handler, the OLD handler must be re-attached so the
     listener doesn't go silent."""
     from scout.social.telegram.listener import _channel_reload_once
+
     await _seed_channels(db, "@a", "@b")
     client = _make_mock_client()
     initial_handler = lambda evt: None
@@ -303,9 +301,7 @@ async def test_reload_swap_failure_rolls_back_to_old_handler(db):
 
     with capture_logs() as logs:
         with pytest.raises(RuntimeError):
-            await _channel_reload_once(
-                db, client, in_memory, initial_handler
-            )
+            await _channel_reload_once(db, client, in_memory, initial_handler)
     events = [e.get("event") for e in logs]
     assert "tg_social_channel_reload_swap_failed" in events
     # Old handler re-attached — listener still has a handler

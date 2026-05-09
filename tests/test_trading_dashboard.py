@@ -233,5 +233,3 @@ async def test_total_pnl_null_when_no_current_price(client):
     assert pos["unrealized_pnl_usd"] is None
     assert pos["total_pnl_usd"] is None
     assert pos["total_pnl_pct"] is None
-
-

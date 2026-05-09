@@ -5,6 +5,7 @@ First-failure-wins ordering:
   → 5 depth_health (VenueTransientError → venue_unavailable) → 6 slippage
   → 7 exposure → 8 balance (live-only NotImplementedError in BL-055).
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -20,7 +21,6 @@ from scout.live.exceptions import VenueTransientError
 from scout.live.gates import VALID_REJECT_REASONS, Gates
 from scout.live.kill_switch import KillSwitch
 from scout.live.types import Depth, DepthLevel, ResolvedVenue
-
 
 # ---------- fixture helpers --------------------------------------------------
 
@@ -48,9 +48,7 @@ def _depth(asks=None, bids=None, mid=Decimal("100")):
 
 
 def _venue(symbol="TEST", pair="TUSDT"):
-    return ResolvedVenue(
-        symbol=symbol, venue="binance", pair=pair, source="cache"
-    )
+    return ResolvedVenue(symbol=symbol, venue="binance", pair=pair, source="cache")
 
 
 def _settings(**overrides):
@@ -81,9 +79,7 @@ async def _make_gates(
     s = settings or _settings()
     config = LiveConfig(s)
     resolver = AsyncMock()
-    resolver.resolve = AsyncMock(
-        return_value=venue if venue is not None else _venue()
-    )
+    resolver.resolve = AsyncMock(return_value=venue if venue is not None else _venue())
     adapter = AsyncMock()
     if fetch_depth_exc is not None:
         adapter.fetch_depth = AsyncMock(side_effect=fetch_depth_exc)
@@ -144,7 +140,10 @@ async def _seed_open_shadow(
 
 def test_param_lists_cover_check_constraint():
     """gates.VALID_REJECT_REASONS must match the shadow/live_trades
-    reject_reason CHECK constraint exactly. Spec §3.1."""
+    reject_reason CHECK constraint exactly. Spec §3.1, extended in
+    BL-NEW-LIVE-HYBRID M1 v2.1 with 7 new reject_reasons (Tasks 7+7.5).
+    The DB CHECK constraint extension on prod is migrated via
+    bl_reject_reason_extend_v1 (schema_version 20260512)."""
     expected = {
         "no_venue",
         "insufficient_depth",
@@ -155,6 +154,14 @@ def test_param_lists_cover_check_constraint():
         "exposure_cap",
         "override_disabled",
         "venue_unavailable",
+        # BL-NEW-LIVE-HYBRID M1 v2.1 additions:
+        "notional_cap_exceeded",
+        "signal_disabled",
+        "token_aggregate",
+        "dual_signal_aggregate",
+        "all_candidates_failed",
+        "master_kill",
+        "mode_paper",
     }
     assert VALID_REJECT_REASONS == expected
 
@@ -259,12 +266,10 @@ async def test_gate_insufficient_depth(tmp_path):
     # Tiny depth: 10 levels * price 100 * qty 0.01 = $10 total per side.
     # Required = multiplier(3) * size_usd(100) = $300. Fails.
     thin_asks = tuple(
-        DepthLevel(price=Decimal("100"), qty=Decimal("0.01"))
-        for _ in range(10)
+        DepthLevel(price=Decimal("100"), qty=Decimal("0.01")) for _ in range(10)
     )
     thin_bids = tuple(
-        DepthLevel(price=Decimal("99"), qty=Decimal("0.01"))
-        for _ in range(10)
+        DepthLevel(price=Decimal("99"), qty=Decimal("0.01")) for _ in range(10)
     )
     depth = _depth(asks=thin_asks, bids=thin_bids)
     gates = await _make_gates(db, depth=depth)

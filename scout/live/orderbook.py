@@ -1,4 +1,5 @@
 """Pure VWAP walker. No I/O (spec §8)."""
+
 from __future__ import annotations
 
 from decimal import Decimal

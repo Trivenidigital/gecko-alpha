@@ -49,6 +49,7 @@ def _reset_signal_sources_cache():
     """
     try:
         from scout.trading.conviction import clear_missing_sources_cache_for_tests
+
         clear_missing_sources_cache_for_tests()
     except ImportError:
         pass
@@ -87,7 +88,11 @@ def patch_module_sleep(monkeypatch):
     import types
 
     fake_asyncio = types.SimpleNamespace(
-        **{n: getattr(_asyncio_mod, n) for n in dir(_asyncio_mod) if not n.startswith("_")}
+        **{
+            n: getattr(_asyncio_mod, n)
+            for n in dir(_asyncio_mod)
+            if not n.startswith("_")
+        }
     )
 
     async def _instant(_):

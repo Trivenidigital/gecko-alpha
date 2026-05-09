@@ -3,6 +3,7 @@
 Single source of truth for fallback logic (LIVE_* → PAPER_* → default).
 Consumers never read Settings directly.
 """
+
 from __future__ import annotations
 
 from decimal import Decimal
@@ -43,7 +44,4 @@ class LiveConfig:
         )
 
     def resolve_max_duration_hours(self) -> int:
-        return (
-            self._s.LIVE_MAX_DURATION_HOURS
-            or self._s.PAPER_MAX_DURATION_HOURS
-        )
+        return self._s.LIVE_MAX_DURATION_HOURS or self._s.PAPER_MAX_DURATION_HOURS

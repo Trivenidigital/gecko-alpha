@@ -3,6 +3,7 @@
 Raised by Binance adapter, resolver, gates, engine. Callers (shadow evaluator,
 reconciliation, LiveEngine) discriminate on type rather than message string.
 """
+
 from __future__ import annotations
 
 

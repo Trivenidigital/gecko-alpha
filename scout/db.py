@@ -89,6 +89,11 @@ class Database:
         await self._migrate_high_peak_fade_columns_and_audit_table()
         await self._migrate_autosuspend_baseline_column()
         await self._migrate_moonshot_opt_out_column()
+        await self._migrate_live_eligible_column()
+        await self._migrate_per_venue_services()
+        await self._migrate_live_trades_telemetry()
+        await self._migrate_live_client_order_id()
+        await self._migrate_reject_reason_extend()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -1464,7 +1469,10 @@ class Database:
                 reject_reason       TEXT CHECK (reject_reason IS NULL OR reject_reason IN (
                     'no_venue','insufficient_depth','slippage_exceeds_cap','insufficient_balance',
                     'daily_cap_hit','kill_switch','exposure_cap','override_disabled',
-                    'venue_unavailable'
+                    'venue_unavailable',
+                    'notional_cap_exceeded','signal_disabled','token_aggregate',
+                    'dual_signal_aggregate','all_candidates_failed',
+                    'master_kill','mode_paper'
                 )),
                 exit_walked_vwap    TEXT,
                 realized_pnl_usd    TEXT,
@@ -1500,7 +1508,10 @@ class Database:
                 reject_reason       TEXT CHECK (reject_reason IS NULL OR reject_reason IN (
                     'no_venue','insufficient_depth','slippage_exceeds_cap','insufficient_balance',
                     'daily_cap_hit','kill_switch','exposure_cap','override_disabled',
-                    'venue_unavailable'
+                    'venue_unavailable',
+                    'notional_cap_exceeded','signal_disabled','token_aggregate',
+                    'dual_signal_aggregate','all_candidates_failed',
+                    'master_kill','mode_paper'
                 )),
                 exit_order_id       TEXT,
                 exit_fill_price     TEXT,
@@ -2117,6 +2128,566 @@ class Database:
             except Exception as rb_err:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_moonshot_opt_out_v1")
+            raise
+
+    async def _migrate_live_eligible_column(self) -> None:
+        """BL-NEW-LIVE-HYBRID M1: per-signal live-execution opt-in.
+
+        Adds signal_params.live_eligible INTEGER NOT NULL DEFAULT 0.
+        Layer 3 of the 4-layer kill stack."""
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL
+                )""")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )""")
+            cur_pragma = await conn.execute("PRAGMA table_info(signal_params)")
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            if "live_eligible" not in existing_cols:
+                await conn.execute(
+                    "ALTER TABLE signal_params "
+                    "ADD COLUMN live_eligible INTEGER NOT NULL DEFAULT 0"
+                )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_live_eligible_v1", now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260508, now_iso, "bl_live_eligible_v1"),
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_live_eligible_v1",),
+            )
+            if (await cur.fetchone()) is None:
+                raise RuntimeError("bl_live_eligible_v1 cutover row missing")
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_live_eligible_v1")
+            raise
+
+    async def _migrate_per_venue_services(self) -> None:
+        """BL-NEW-LIVE-HYBRID M1: 5 per-venue services tables + 2 cross-venue views.
+
+        Tables: venue_health, wallet_snapshots, venue_listings,
+        venue_rate_state, symbol_aliases. All idempotent via
+        ``CREATE TABLE IF NOT EXISTS``.
+
+        Views: ``cross_venue_exposure`` (M1 — Gate 7 blocker, sums open
+        exposure across binance + minara_<chain>) and ``cross_venue_pnl``
+        (M1 scaffold; M2 fills in). Views are created here (not in
+        ``_create_tables``) because they reference ``live_trades`` which
+        is defined in :meth:`_migrate_live_trading_schema` — that migration
+        runs before this one in :meth:`initialize`, so both source tables
+        are guaranteed to exist by the time the view DDL runs.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL
+                )""")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )""")
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS venue_health (
+                    venue                   TEXT NOT NULL,
+                    probe_at                TEXT NOT NULL,
+                    rest_responsive         INTEGER NOT NULL,
+                    rest_latency_ms         INTEGER,
+                    ws_connected            INTEGER NOT NULL,
+                    rate_limit_headroom_pct REAL,
+                    auth_ok                 INTEGER NOT NULL,
+                    last_balance_fetch_ok   INTEGER NOT NULL,
+                    last_quote_mid_price    REAL,
+                    last_quote_at           TEXT,
+                    last_depth_at_size_bps  REAL,
+                    fills_30d_count         INTEGER NOT NULL DEFAULT 0,
+                    is_dormant              INTEGER NOT NULL DEFAULT 0,
+                    error_text              TEXT,
+                    PRIMARY KEY (venue, probe_at)
+                )""")
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_venue_health_recent "
+                "ON venue_health(venue, probe_at DESC)"
+            )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_snapshots (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    venue         TEXT NOT NULL,
+                    asset         TEXT NOT NULL,
+                    balance       REAL NOT NULL,
+                    balance_usd   REAL,
+                    snapshot_at   TEXT NOT NULL
+                )""")
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_wallet_snapshots_venue_recent "
+                "ON wallet_snapshots(venue, snapshot_at DESC)"
+            )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS venue_listings (
+                    venue         TEXT NOT NULL,
+                    canonical     TEXT NOT NULL,
+                    venue_pair    TEXT NOT NULL,
+                    quote         TEXT NOT NULL,
+                    asset_class   TEXT NOT NULL CHECK (
+                        asset_class IN ('spot','perp','option','equity','forex')),
+                    listed_at     TEXT,
+                    delisted_at   TEXT,
+                    refreshed_at  TEXT NOT NULL,
+                    PRIMARY KEY (venue, canonical, asset_class)
+                )""")
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS venue_rate_state (
+                    venue                TEXT PRIMARY KEY,
+                    last_updated_at      TEXT NOT NULL,
+                    requests_per_min_cap INTEGER NOT NULL,
+                    requests_seen_60s    INTEGER NOT NULL DEFAULT 0,
+                    headroom_pct         REAL NOT NULL DEFAULT 100.0
+                )""")
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS symbol_aliases (
+                    canonical    TEXT NOT NULL,
+                    venue        TEXT NOT NULL,
+                    venue_symbol TEXT NOT NULL,
+                    PRIMARY KEY (canonical, venue)
+                )""")
+
+            # Task 4: cross-venue views. Defined here (not in
+            # _create_tables) because they reference live_trades, which is
+            # created by _migrate_live_trading_schema (runs earlier in
+            # initialize()). M1 ships cross_venue_pnl as a placeholder
+            # scaffold; M2 fills in the realized/unrealized math.
+            await conn.execute("""
+                CREATE VIEW IF NOT EXISTS cross_venue_exposure AS
+                SELECT
+                    'binance' AS venue,
+                    COALESCE(SUM(CAST(size_usd AS REAL)), 0) AS open_exposure_usd,
+                    COUNT(*) AS open_count
+                FROM live_trades
+                WHERE status = 'open'
+                UNION ALL
+                SELECT
+                    'minara_' || COALESCE(chain, 'unknown') AS venue,
+                    COALESCE(SUM(amount_usd), 0) AS open_exposure_usd,
+                    COUNT(*) AS open_count
+                FROM paper_trades
+                WHERE status = 'open'
+                  AND chain != 'coingecko'
+                  AND chain != ''
+                GROUP BY chain""")
+
+            await conn.execute("""
+                CREATE VIEW IF NOT EXISTS cross_venue_pnl AS
+                SELECT
+                    'placeholder_m1' AS venue,
+                    0.0 AS realized_pnl_usd,
+                    0.0 AS unrealized_pnl_usd""")
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_per_venue_services_v1", now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260510, now_iso, "bl_per_venue_services_v1"),
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_per_venue_services_v1",),
+            )
+            if (await cur.fetchone()) is None:
+                raise RuntimeError("bl_per_venue_services_v1 cutover row missing")
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_per_venue_services_v1")
+            raise
+
+    async def _migrate_live_trades_telemetry(self) -> None:
+        """BL-NEW-LIVE-HYBRID M1 v2.1: telemetry plumbing for
+        approval-removal criteria (per plan-stage policy reviewer).
+        Adds:
+          - live_trades.fill_slippage_bps REAL
+          - live_trades.correction_at TEXT
+          - live_trades.correction_reason TEXT
+          - signal_venue_correction_count table (running counters)
+        Layer 4-prep: approval-removal gate reads these. M1 ships schema;
+        runtime population deferred to Task 12 (slippage compute) + Task
+        11 (correction counter wiring)."""
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL)""")
+
+            cur_pragma = await conn.execute("PRAGMA table_info(live_trades)")
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            for col, ddl in [
+                ("fill_slippage_bps", "REAL"),
+                ("correction_at", "TEXT"),
+                ("correction_reason", "TEXT"),
+            ]:
+                if col not in existing_cols:
+                    await conn.execute(
+                        f"ALTER TABLE live_trades ADD COLUMN {col} {ddl}"
+                    )
+
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS signal_venue_correction_count (
+                    signal_type              TEXT NOT NULL,
+                    venue                    TEXT NOT NULL,
+                    consecutive_no_correction INTEGER NOT NULL DEFAULT 0,
+                    last_corrected_at        TEXT,
+                    last_updated_at          TEXT NOT NULL,
+                    PRIMARY KEY (signal_type, venue)
+                )"""
+            )
+
+            # Task 13/13.5: ephemeral operator-set overrides
+            # (/allow-stack, /auto-approve, /approval-required, /venue-revive).
+            # Read by approval_thresholds.should_require_approval (gate 4).
+            await conn.execute("""CREATE TABLE IF NOT EXISTS live_operator_overrides (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    override_type TEXT NOT NULL CHECK (override_type IN (
+                        'allow_stack','auto_approve','approval_required','venue_revive'
+                    )),
+                    venue         TEXT,
+                    canonical     TEXT,
+                    set_at        TEXT NOT NULL,
+                    expires_at    TEXT NOT NULL,
+                    set_by        TEXT
+                )""")
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_operator_overrides_active "
+                "ON live_operator_overrides(override_type, venue, expires_at)"
+            )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_live_trades_telemetry_v1", now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260511, now_iso, "bl_live_trades_telemetry_v1"),
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_live_trades_telemetry_v1",),
+            )
+            if (await cur.fetchone()) is None:
+                raise RuntimeError("bl_live_trades_telemetry_v1 cutover row missing")
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error(
+                "SCHEMA_DRIFT_DETECTED",
+                migration="bl_live_trades_telemetry_v1",
+            )
+            raise
+
+    async def _migrate_live_client_order_id(self) -> None:
+        """BL-NEW-LIVE-HYBRID M1 v2.1 (Task 12): client_order_id idempotency.
+
+        Adds live_trades.client_order_id TEXT (UNIQUE) for the
+        gecko-side idempotency contract: every order intent computes
+        `client_order_id = f"gecko-{paper_trade_id}-{intent_uuid}"`,
+        which Binance accepts as `newClientOrderId`. Pre-retry dedup
+        query checks this column before submitting to the venue;
+        retried submits return the existing venue_order_id.
+
+        UNIQUE allows SQLite to enforce exactly-once at the DB layer
+        as a backstop. NULL allowed for old rows (pre-migration) and
+        for shadow_mode rows that never hit a venue.
+
+        Migration `bl_live_client_order_id_v1`, schema_version 20260509.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL)""")
+
+            cur_pragma = await conn.execute("PRAGMA table_info(live_trades)")
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            if "client_order_id" not in existing_cols:
+                await conn.execute(
+                    "ALTER TABLE live_trades ADD COLUMN client_order_id TEXT"
+                )
+                # UNIQUE INDEX (partial, ignores NULLs) gives us the
+                # dedup guarantee without ALTER-CHECK rebuild costs.
+                await conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "idx_live_trades_client_order_id "
+                    "ON live_trades(client_order_id) "
+                    "WHERE client_order_id IS NOT NULL"
+                )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_live_client_order_id_v1", now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260509, now_iso, "bl_live_client_order_id_v1"),
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_live_client_order_id_v1",),
+            )
+            if (await cur.fetchone()) is None:
+                raise RuntimeError("bl_live_client_order_id_v1 cutover row missing")
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error(
+                "SCHEMA_DRIFT_DETECTED",
+                migration="bl_live_client_order_id_v1",
+            )
+            raise
+
+    async def _migrate_reject_reason_extend(self) -> None:
+        """V3 reviewer C-1: extend reject_reason CHECK constraint on
+        existing prod tables via SQLite table-rename pattern.
+
+        CREATE TABLE IF NOT EXISTS in `_create_tables` is a no-op for
+        existing tables, so the BL-NEW-LIVE-HYBRID M1 v2.1 CHECK
+        extension (7 new reject_reasons) only applies to fresh DBs.
+        On prod (BL-055 shadow soak DB exists since 2026-04-23), the
+        old 9-value CHECK persists. First INSERT with a new reason
+        (`signal_disabled` from Gate 9 / `notional_cap_exceeded` from
+        Gate 8 / `master_kill` / `mode_paper` / etc.) raises
+        sqlite3.IntegrityError + crashes the engine path.
+
+        This migration rebuilds shadow_trades + live_trades with the
+        16-value CHECK via CREATE-NEW-COPY-DROP-RENAME. Tables are
+        append-only and small (LIVE_MODE was 'paper' until M1.5 wires
+        balance_gate), so COPY cost is bounded.
+
+        Migration `bl_reject_reason_extend_v1`, schema_version 20260512.
+        Idempotent — checks current CHECK constraint via PRAGMA table_info
+        + sqlite_master.sql before rebuilding.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
+            )
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL)"""
+            )
+
+            # Idempotency check: skip if marker already present.
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_reject_reason_extend_v1",),
+            )
+            if (await cur.fetchone()) is not None:
+                await conn.commit()
+                return
+
+            # Determine if rebuild is needed by checking sqlite_master.sql
+            # for one of the new reasons. If 'notional_cap_exceeded' is
+            # already present in the CHECK (fresh DB), skip the rebuild
+            # and just stamp the marker.
+            for table in ("shadow_trades", "live_trades"):
+                cur = await conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    continue  # table doesn't exist yet (fresh DB pre-_create_tables)
+                table_sql = row[0] or ""
+                if "notional_cap_exceeded" in table_sql:
+                    continue  # already has the new CHECK; nothing to do
+
+                # Rebuild via table-rename. The new CHECK has 16 values
+                # matching the latest CREATE TABLE in _create_tables.
+                # Preserve column order + types by extracting via PRAGMA.
+                cur = await conn.execute(f"PRAGMA table_info({table})")
+                cols = await cur.fetchall()  # (cid, name, type, notnull, default, pk)
+                if not cols:
+                    continue
+                col_names = [c[1] for c in cols]
+                col_list = ", ".join(col_names)
+
+                # Build the NEW CHECK CREATE TABLE by string-replacing the
+                # CHECK clause. The old shape is:
+                #   reject_reason TEXT CHECK (reject_reason IS NULL OR reject_reason IN (
+                #       ...9 values...
+                #   ))
+                # Build the new clause inline.
+                new_check = (
+                    "CHECK (reject_reason IS NULL OR reject_reason IN ("
+                    "'no_venue','insufficient_depth','slippage_exceeds_cap',"
+                    "'insufficient_balance','daily_cap_hit','kill_switch',"
+                    "'exposure_cap','override_disabled','venue_unavailable',"
+                    "'notional_cap_exceeded','signal_disabled','token_aggregate',"
+                    "'dual_signal_aggregate','all_candidates_failed',"
+                    "'master_kill','mode_paper'))"
+                )
+                # The new CREATE TABLE keeps everything but replaces just
+                # the reject_reason CHECK. Use the existing _create_tables
+                # statement reference: we know shadow_trades and live_trades
+                # have a `reject_reason TEXT CHECK (...)` clause. Regex the
+                # old CHECK out + sub the new one.
+                import re as _re
+
+                # Match `reject_reason       TEXT CHECK (...)` with arbitrary
+                # whitespace and multi-line CHECK list.
+                pattern = _re.compile(
+                    r"reject_reason\s+TEXT\s+CHECK\s*\([^)]*\)\s*\)",
+                    _re.IGNORECASE | _re.DOTALL,
+                )
+                new_table_sql = pattern.sub(
+                    f"reject_reason       TEXT {new_check}", table_sql
+                )
+                if new_table_sql == table_sql:
+                    _log.warning(
+                        "reject_reason_check_pattern_miss",
+                        table=table,
+                        sql_excerpt=table_sql[:200],
+                    )
+                    continue
+
+                # Rename the matched _new table name in CREATE TABLE
+                # statement to <table>_new for the rebuild.
+                new_table_sql_renamed = new_table_sql.replace(
+                    f"TABLE {table} (", f"TABLE {table}_new (", 1
+                ).replace(
+                    f"TABLE IF NOT EXISTS {table} (",
+                    f"TABLE {table}_new (",
+                    1,
+                )
+
+                await conn.execute(new_table_sql_renamed)
+                await conn.execute(
+                    f"INSERT INTO {table}_new ({col_list}) "
+                    f"SELECT {col_list} FROM {table}"
+                )
+                await conn.execute(f"DROP TABLE {table}")
+                await conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+                _log.info(
+                    "reject_reason_check_rebuilt",
+                    table=table,
+                    rows_copied=(
+                        await (
+                            await conn.execute(f"SELECT COUNT(*) FROM {table}")
+                        ).fetchone()
+                    )[0],
+                )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_reject_reason_extend_v1", now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260512, now_iso, "bl_reject_reason_extend_v1"),
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_reject_reason_extend_v1",),
+            )
+            if (await cur.fetchone()) is None:
+                raise RuntimeError(
+                    "bl_reject_reason_extend_v1 cutover row missing"
+                )
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error(
+                "SCHEMA_DRIFT_DETECTED",
+                migration="bl_reject_reason_extend_v1",
+            )
             raise
 
     async def revive_signal_with_baseline(

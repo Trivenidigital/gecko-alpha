@@ -1,4 +1,5 @@
 """VenueResolver + OverrideStore (spec §7). Two classes, one file per §2.1."""
+
 from __future__ import annotations
 
 import asyncio
@@ -131,7 +132,9 @@ class VenueResolver:
                     await self._cache_put_negative(sym)
                     return None
                 resolved = ResolvedVenue(
-                    symbol=sym, venue="binance", pair=pair,
+                    symbol=sym,
+                    venue="binance",
+                    pair=pair,
                     source="binance_exchangeinfo",
                 )
                 await self._cache_put_positive(sym, resolved)
@@ -178,7 +181,10 @@ class VenueResolver:
         if row[0] == "positive":
             return (
                 ResolvedVenue(
-                    symbol=sym, venue=row[1], pair=row[2], source="cache",
+                    symbol=sym,
+                    venue=row[1],
+                    pair=row[2],
+                    source="cache",
                 ),
                 ttl_remaining_sec,
             )

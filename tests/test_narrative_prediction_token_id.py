@@ -11,6 +11,7 @@ Fix references:
 - arch-A1: upstream filter prevents junk in predictions table
 - arch-A2: explicit Database.coin_id_resolves replaces fragile probe
 """
+
 from __future__ import annotations
 
 import os
@@ -30,6 +31,7 @@ _SKIP_AIOHTTP = pytest.mark.skipif(
 @pytest.fixture
 async def db(tmp_path):
     from scout.db import Database
+
     d = Database(tmp_path / "t.db")
     await d.initialize()
     yield d
@@ -108,6 +110,7 @@ async def test_synthetic_token_id_rejected_with_telemetry(db, settings_factory):
     """T1 — coin_id missing from price_cache + snapshot tables → reject
     with `signal_skipped_synthetic_token_id` reason=token_id_not_in_*."""
     from scout.trading.signals import trade_predictions
+
     settings = settings_factory()
     engine = _StubEngine()
     pred = _make_pred(coin_id="synthetic-coin-xyz")
@@ -127,6 +130,7 @@ async def test_synthetic_token_id_rejected_with_telemetry(db, settings_factory):
 async def test_legit_in_price_cache_opens_trade(db, settings_factory):
     """T2a — coin_id in price_cache → trade opens (existing behavior preserved)."""
     from scout.trading.signals import trade_predictions
+
     settings = settings_factory()
     engine = _StubEngine()
     now = datetime.now(timezone.utc).isoformat()
@@ -151,6 +155,7 @@ async def test_legit_in_lookup_chain_opens_trade(db, settings_factory):
     """T2b — race scenario: coin_id missing from price_cache but PRESENT
     in gainers_snapshots → fallback accepts; trade opens."""
     from scout.trading.signals import trade_predictions
+
     settings = settings_factory()
     engine = _StubEngine()
     now = datetime.now(timezone.utc).isoformat()
@@ -190,14 +195,13 @@ async def test_empty_or_whitespace_coin_id_rejected(db, settings_factory):
     rejects None at boundary. But empty / whitespace strings pass the
     model and arrive at the dispatcher; gate must catch both."""
     from scout.trading.signals import trade_predictions
+
     settings = settings_factory()
     engine = _StubEngine()
     pred_empty = _make_pred(coin_id="")
     pred_ws = _make_pred(coin_id="   ")
     with capture_logs() as logs:
-        await trade_predictions(
-            engine, db, [pred_empty, pred_ws], settings=settings
-        )
+        await trade_predictions(engine, db, [pred_empty, pred_ws], settings=settings)
     skip_events = [
         e for e in logs if e.get("event") == "signal_skipped_synthetic_token_id"
     ]
@@ -209,12 +213,11 @@ async def test_empty_or_whitespace_coin_id_rejected(db, settings_factory):
 
 @_SKIP_AIOHTTP
 @pytest.mark.asyncio
-async def test_resolution_check_error_fails_closed(
-    db, settings_factory, monkeypatch
-):
+async def test_resolution_check_error_fails_closed(db, settings_factory, monkeypatch):
     """T2d (adv-M2) — coin_id_resolves raises → fail-CLOSED with
     reason=resolution_check_error; engine NOT called."""
     from scout.trading.signals import trade_predictions
+
     settings = settings_factory()
     engine = _StubEngine()
 
@@ -357,25 +360,41 @@ def test_predictor_filter_laggards_drops_junk_prefix_tokens_end_to_end():
 
     raw_tokens = [
         {
-            "id": "test-1", "symbol": "TEST1", "name": "Test 1",
-            "market_cap": 1_000_000, "price_change_percentage_24h": -10.0,
-            "total_volume": 100_000, "current_price": 1.0,
+            "id": "test-1",
+            "symbol": "TEST1",
+            "name": "Test 1",
+            "market_cap": 1_000_000,
+            "price_change_percentage_24h": -10.0,
+            "total_volume": 100_000,
+            "current_price": 1.0,
         },
         {
-            "id": "real-coin", "symbol": "REAL", "name": "Real Coin",
-            "market_cap": 5_000_000, "price_change_percentage_24h": -5.0,
-            "total_volume": 100_000, "current_price": 2.0,
+            "id": "real-coin",
+            "symbol": "REAL",
+            "name": "Real Coin",
+            "market_cap": 5_000_000,
+            "price_change_percentage_24h": -5.0,
+            "total_volume": 100_000,
+            "current_price": 2.0,
         },
         {
-            "id": "wrapped-bitcoin", "symbol": "WBTC", "name": "Wrapped BTC",
-            "market_cap": 10_000_000, "price_change_percentage_24h": -8.0,
-            "total_volume": 100_000, "current_price": 50000.0,
+            "id": "wrapped-bitcoin",
+            "symbol": "WBTC",
+            "name": "Wrapped BTC",
+            "market_cap": 10_000_000,
+            "price_change_percentage_24h": -8.0,
+            "total_volume": 100_000,
+            "current_price": 50000.0,
         },
     ]
     result = filter_laggards(
         raw_tokens,
-        category_id="test", category_name="Test",
-        max_mcap=1e9, max_change=100, min_change=-100, min_volume=0,
+        category_id="test",
+        category_name="Test",
+        max_mcap=1e9,
+        max_change=100,
+        min_change=-100,
+        min_volume=0,
     )
     coin_ids = [tok.coin_id for tok in result]
     # Junk-prefix entries REJECTED by upstream filter

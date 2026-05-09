@@ -31,6 +31,7 @@ def _reset_dashboard_module_state():
     cached `_scout_db` connection from a previous test (against a
     different tmp_path) doesn't leak into the current test."""
     import dashboard.api as dash_api
+
     dash_api._scout_db = None
     dash_api._db_path = "scout.db"
     yield
@@ -50,10 +51,14 @@ async def _seed_db(db_path: str):
 
 
 async def _insert_dlq(
-    db_path: str, *,
-    channel: str, msg_id: int,
-    error_class: str, error_text: str,
-    raw_text: str, failed_at: str,
+    db_path: str,
+    *,
+    channel: str,
+    msg_id: int,
+    error_class: str,
+    error_text: str,
+    raw_text: str,
+    failed_at: str,
 ):
     async with aiosqlite.connect(db_path) as conn:
         await conn.execute(
@@ -67,9 +72,12 @@ async def _insert_dlq(
 
 
 async def _insert_cashtag_paper_trade(
-    db_path: str, *,
-    channel: str, opened_at: str,
-    cashtag: str = "ABC", token_id: str | None = None,
+    db_path: str,
+    *,
+    channel: str,
+    opened_at: str,
+    cashtag: str = "ABC",
+    token_id: str | None = None,
 ):
     """Insert a paper_trade row matching the deployed schema (scout/db.py
     line 557-600). All NOT NULL columns supplied: token_id, symbol, name,
@@ -79,13 +87,15 @@ async def _insert_cashtag_paper_trade(
     insert when seeding multiples for the same channel within the same call."""
     async with aiosqlite.connect(db_path) as conn:
         tid = token_id or f"abc-coin-{opened_at}"
-        signal_data = json.dumps({
-            "resolution": "cashtag",
-            "channel_handle": channel,
-            "cashtag": cashtag,
-            "candidate_rank": 1,
-            "candidates_total": 3,
-        })
+        signal_data = json.dumps(
+            {
+                "resolution": "cashtag",
+                "channel_handle": channel,
+                "cashtag": cashtag,
+                "candidate_rank": 1,
+                "candidates_total": 3,
+            }
+        )
         entry_price = 0.001
         amount_usd = 300.0
         quantity = amount_usd / entry_price
@@ -98,9 +108,17 @@ async def _insert_cashtag_paper_trade(
             " tp_price, sl_price, opened_at) "
             "VALUES (?, ?, ?, ?, 'tg_social', ?, ?, ?, ?, ?, ?, ?)",
             (
-                tid, cashtag, cashtag, "solana", signal_data,
-                entry_price, amount_usd, quantity,
-                tp_price, sl_price, opened_at,
+                tid,
+                cashtag,
+                cashtag,
+                "solana",
+                signal_data,
+                entry_price,
+                amount_usd,
+                quantity,
+                tp_price,
+                sl_price,
+                opened_at,
             ),
         )
         await conn.commit()
@@ -162,6 +180,7 @@ async def test_endpoint_tg_social_dlq_returns_empty_when_table_missing(tmp_path)
         await conn.commit()
     from httpx import ASGITransport, AsyncClient
     from dashboard.api import create_app
+
     app = create_app(db_path=db_path)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -211,6 +230,7 @@ async def test_endpoint_tg_social_dlq_returns_json(tmp_path):
     )
     from httpx import ASGITransport, AsyncClient
     from dashboard.api import create_app
+
     app = create_app(db_path=db_path)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -229,6 +249,7 @@ async def test_endpoint_tg_social_dlq_empty_returns_empty_list(tmp_path):
     await _seed_db(db_path)
     from httpx import ASGITransport, AsyncClient
     from dashboard.api import create_app
+
     app = create_app(db_path=db_path)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -249,16 +270,20 @@ async def test_get_tg_social_cashtag_stats_24h_counts_dispatched(tmp_path):
     now = datetime.now(timezone.utc)
     # 2 dispatches in last 24h
     await _insert_cashtag_paper_trade(
-        db_path, channel="@thanos_mind", opened_at=now.isoformat(),
+        db_path,
+        channel="@thanos_mind",
+        opened_at=now.isoformat(),
     )
     await _insert_cashtag_paper_trade(
-        db_path, channel="@thanos_mind",
+        db_path,
+        channel="@thanos_mind",
         opened_at=(now - timedelta(hours=2)).isoformat(),
         token_id="abc-coin-2",
     )
     # 1 outside window — should NOT count
     await _insert_cashtag_paper_trade(
-        db_path, channel="@thanos_mind",
+        db_path,
+        channel="@thanos_mind",
         opened_at=(now - timedelta(hours=30)).isoformat(),
         token_id="abc-coin-30h",
     )
@@ -285,14 +310,16 @@ async def test_get_tg_social_per_channel_cashtag_today_returns_counts(tmp_path):
     base = today_midnight + timedelta(seconds=1)
     for i in range(3):
         await _insert_cashtag_paper_trade(
-            db_path, channel="@thanos_mind",
+            db_path,
+            channel="@thanos_mind",
             opened_at=(base + timedelta(seconds=i)).isoformat(),
             token_id=f"abc-coin-today-{i}",
         )
     # 1 dispatch in PRIOR calendar day for thanos — should NOT count
     yesterday = today_midnight - timedelta(hours=2)
     await _insert_cashtag_paper_trade(
-        db_path, channel="@thanos_mind",
+        db_path,
+        channel="@thanos_mind",
         opened_at=yesterday.isoformat(),
         token_id="abc-coin-yesterday",
     )
@@ -320,10 +347,13 @@ async def test_endpoint_tg_social_alerts_includes_cashtag_dispatched_in_stats(tm
         )
         await conn.commit()
     await _insert_cashtag_paper_trade(
-        db_path, channel="@thanos_mind", opened_at=now.isoformat(),
+        db_path,
+        channel="@thanos_mind",
+        opened_at=now.isoformat(),
     )
     from httpx import ASGITransport, AsyncClient
     from dashboard.api import create_app
+
     app = create_app(db_path=db_path)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -352,6 +382,7 @@ async def test_endpoint_tg_social_alerts_existing_keys_preserved(tmp_path):
         await conn.commit()
     from httpx import ASGITransport, AsyncClient
     from dashboard.api import create_app
+
     app = create_app(db_path=db_path)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -359,11 +390,17 @@ async def test_endpoint_tg_social_alerts_existing_keys_preserved(tmp_path):
     body = resp.json()
     for key in ["channels", "health", "stats_24h", "alerts"]:
         assert key in body, f"BL-066' broke backward compat: missing {key}"
-    for key in ["messages", "with_ca", "with_cashtag",
-                "signals_resolved", "trades_dispatched", "dlq"]:
-        assert key in body["stats_24h"], (
-            f"BL-066' broke backward compat: stats_24h missing {key}"
-        )
+    for key in [
+        "messages",
+        "with_ca",
+        "with_cashtag",
+        "signals_resolved",
+        "trades_dispatched",
+        "dlq",
+    ]:
+        assert (
+            key in body["stats_24h"]
+        ), f"BL-066' broke backward compat: stats_24h missing {key}"
     ch = body["channels"][0]
     assert isinstance(ch["cashtag_trade_eligible"], bool)
     assert isinstance(ch["cashtag_dispatched_today"], int)
@@ -383,6 +420,7 @@ def test_contract_dispatcher_today_count_uses_start_of_day_semantics():
     midnight UTC. Source-grep belt-and-suspenders for the runtime path."""
     import inspect
     from scout.social.telegram.dispatcher import _channel_cashtag_trades_today_count
+
     src = inspect.getsource(_channel_cashtag_trades_today_count)
     assert "'start of day'" in src or '"start of day"' in src, (
         "BL-065 dispatcher's _channel_cashtag_trades_today_count no longer "
@@ -417,7 +455,9 @@ def test_contract_bl065_dispatch_writes_resolution_and_channel_handle():
 
 
 @pytest.mark.asyncio
-async def test_endpoint_tg_social_alerts_falls_back_when_cashtag_column_missing(tmp_path):
+async def test_endpoint_tg_social_alerts_falls_back_when_cashtag_column_missing(
+    tmp_path,
+):
     """T11 — pins F19 (migration race) + F5 (rollback). Synthesize a
     pre-BL-065 tg_social_channels schema (no cashtag_trade_eligible);
     endpoint must NOT 500.
@@ -453,6 +493,7 @@ async def test_endpoint_tg_social_alerts_falls_back_when_cashtag_column_missing(
 
     from httpx import ASGITransport, AsyncClient
     from dashboard.api import create_app
+
     app = create_app(db_path=db_path)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:

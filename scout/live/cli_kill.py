@@ -40,15 +40,9 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Manually trigger / clear / inspect the live kill switch.",
     )
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--on", metavar="REASON", help="trigger the kill with REASON"
-    )
-    group.add_argument(
-        "--off", action="store_true", help="clear an active kill"
-    )
-    group.add_argument(
-        "--status", action="store_true", help="print current state"
-    )
+    group.add_argument("--on", metavar="REASON", help="trigger the kill with REASON")
+    group.add_argument("--off", action="store_true", help="clear an active kill")
+    group.add_argument("--status", action="store_true", help="print current state")
     return parser
 
 

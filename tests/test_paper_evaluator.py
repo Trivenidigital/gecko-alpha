@@ -18,6 +18,7 @@ async def test_cutover_ts_returns_iso_timestamp(tmp_path):
 async def test_ladder_leg_1_fires_at_25_percent(tmp_path, settings_factory):
     from scout.trading.paper import PaperTrader
     from scout.trading.evaluator import evaluate_paper_trades
+
     db = Database(tmp_path / "t.db")
     await db.initialize()
     trader = PaperTrader()
@@ -29,9 +30,18 @@ async def test_ladder_leg_1_fires_at_25_percent(tmp_path, settings_factory):
         PAPER_SL_PCT=15.0,
     )
     trade_id = await trader.execute_buy(
-        db=db, token_id="tok", symbol="TOK", name="Token", chain="coingecko",
-        signal_type="gainers_early", signal_data={}, current_price=1.00,
-        amount_usd=300.0, tp_pct=40.0, sl_pct=15.0, slippage_bps=0,
+        db=db,
+        token_id="tok",
+        symbol="TOK",
+        name="Token",
+        chain="coingecko",
+        signal_type="gainers_early",
+        signal_data={},
+        current_price=1.00,
+        amount_usd=300.0,
+        tp_pct=40.0,
+        sl_pct=15.0,
+        slippage_bps=0,
         signal_combo="gainers_early",
     )
     # Seed price_cache at +26% (above leg 1 threshold)
@@ -58,19 +68,33 @@ async def test_ladder_leg_1_fires_at_25_percent(tmp_path, settings_factory):
 async def test_ladder_leg_2_fires_at_50_percent(tmp_path, settings_factory):
     from scout.trading.paper import PaperTrader
     from scout.trading.evaluator import evaluate_paper_trades
+
     db = Database(tmp_path / "t.db")
     await db.initialize()
     trader = PaperTrader()
     settings = settings_factory()
     trade_id = await trader.execute_buy(
-        db=db, token_id="tok2", symbol="TOK2", name="T2", chain="coingecko",
-        signal_type="gainers_early", signal_data={}, current_price=1.00,
-        amount_usd=300.0, tp_pct=40.0, sl_pct=15.0, slippage_bps=0,
+        db=db,
+        token_id="tok2",
+        symbol="TOK2",
+        name="T2",
+        chain="coingecko",
+        signal_type="gainers_early",
+        signal_data={},
+        current_price=1.00,
+        amount_usd=300.0,
+        tp_pct=40.0,
+        sl_pct=15.0,
+        slippage_bps=0,
         signal_combo="gainers_early",
     )
     await trader.execute_partial_sell(
-        db=db, trade_id=trade_id, leg=1, sell_qty_frac=0.30,
-        current_price=1.25, slippage_bps=0,
+        db=db,
+        trade_id=trade_id,
+        leg=1,
+        sell_qty_frac=0.30,
+        current_price=1.25,
+        slippage_bps=0,
     )
     await db._conn.execute(
         "INSERT OR REPLACE INTO price_cache (coin_id, current_price, updated_at) "
@@ -90,19 +114,33 @@ async def test_ladder_leg_2_fires_at_50_percent(tmp_path, settings_factory):
 async def test_floor_blocks_below_entry_close(tmp_path, settings_factory):
     from scout.trading.paper import PaperTrader
     from scout.trading.evaluator import evaluate_paper_trades
+
     db = Database(tmp_path / "t.db")
     await db.initialize()
     trader = PaperTrader()
     settings = settings_factory()
     trade_id = await trader.execute_buy(
-        db=db, token_id="tok3", symbol="TOK3", name="T3", chain="coingecko",
-        signal_type="trending_catch", signal_data={}, current_price=1.00,
-        amount_usd=300.0, tp_pct=40.0, sl_pct=15.0, slippage_bps=0,
+        db=db,
+        token_id="tok3",
+        symbol="TOK3",
+        name="T3",
+        chain="coingecko",
+        signal_type="trending_catch",
+        signal_data={},
+        current_price=1.00,
+        amount_usd=300.0,
+        tp_pct=40.0,
+        sl_pct=15.0,
+        slippage_bps=0,
         signal_combo="trending_catch",
     )
     await trader.execute_partial_sell(
-        db=db, trade_id=trade_id, leg=1, sell_qty_frac=0.30,
-        current_price=1.25, slippage_bps=0,
+        db=db,
+        trade_id=trade_id,
+        leg=1,
+        sell_qty_frac=0.30,
+        current_price=1.25,
+        slippage_bps=0,
     )
     await db._conn.execute(
         "INSERT OR REPLACE INTO price_cache (coin_id, current_price, updated_at) "
@@ -122,14 +160,24 @@ async def test_floor_blocks_below_entry_close(tmp_path, settings_factory):
 async def test_sl_at_15_fires_pre_leg_1(tmp_path, settings_factory):
     from scout.trading.paper import PaperTrader
     from scout.trading.evaluator import evaluate_paper_trades
+
     db = Database(tmp_path / "t.db")
     await db.initialize()
     trader = PaperTrader()
     settings = settings_factory()
     trade_id = await trader.execute_buy(
-        db=db, token_id="tok4", symbol="TOK4", name="T4", chain="coingecko",
-        signal_type="gainers_early", signal_data={}, current_price=1.00,
-        amount_usd=300.0, tp_pct=40.0, sl_pct=15.0, slippage_bps=0,
+        db=db,
+        token_id="tok4",
+        symbol="TOK4",
+        name="T4",
+        chain="coingecko",
+        signal_type="gainers_early",
+        signal_data={},
+        current_price=1.00,
+        amount_usd=300.0,
+        tp_pct=40.0,
+        sl_pct=15.0,
+        slippage_bps=0,
         signal_combo="gainers_early",
     )
     # Drop to 0.849 → past -15% SL (sl_price = 1.0 * 0.85 = 0.85)
@@ -151,19 +199,33 @@ async def test_sl_at_15_fires_pre_leg_1(tmp_path, settings_factory):
 async def test_trailing_stop_on_runner_only_after_leg_1(tmp_path, settings_factory):
     from scout.trading.paper import PaperTrader
     from scout.trading.evaluator import evaluate_paper_trades
+
     db = Database(tmp_path / "t.db")
     await db.initialize()
     trader = PaperTrader()
     settings = settings_factory()
     trade_id = await trader.execute_buy(
-        db=db, token_id="tok5", symbol="TOK5", name="T5", chain="coingecko",
-        signal_type="gainers_early", signal_data={}, current_price=1.00,
-        amount_usd=300.0, tp_pct=40.0, sl_pct=15.0, slippage_bps=0,
+        db=db,
+        token_id="tok5",
+        symbol="TOK5",
+        name="T5",
+        chain="coingecko",
+        signal_type="gainers_early",
+        signal_data={},
+        current_price=1.00,
+        amount_usd=300.0,
+        tp_pct=40.0,
+        sl_pct=15.0,
+        slippage_bps=0,
         signal_combo="gainers_early",
     )
     await trader.execute_partial_sell(
-        db=db, trade_id=trade_id, leg=1, sell_qty_frac=0.30,
-        current_price=1.25, slippage_bps=0,
+        db=db,
+        trade_id=trade_id,
+        leg=1,
+        sell_qty_frac=0.30,
+        current_price=1.25,
+        slippage_bps=0,
     )
     # Manually set peak to +45% (post-leg-1)
     await db._conn.execute(
@@ -196,9 +258,18 @@ async def test_pre_cutover_rows_use_old_policy(tmp_path, settings_factory):
     trader = PaperTrader()
     settings = settings_factory()
     trade_id = await trader.execute_buy(
-        db=db, token_id="old", symbol="OLD", name="Old", chain="coingecko",
-        signal_type="gainers_early", signal_data={}, current_price=1.00,
-        amount_usd=300.0, tp_pct=40.0, sl_pct=10.0, slippage_bps=0,
+        db=db,
+        token_id="old",
+        symbol="OLD",
+        name="Old",
+        chain="coingecko",
+        signal_type="gainers_early",
+        signal_data={},
+        current_price=1.00,
+        amount_usd=300.0,
+        tp_pct=40.0,
+        sl_pct=10.0,
+        slippage_bps=0,
         signal_combo="gainers_early",
     )
     # Backdate created_at to 1 day ago and null-out ladder state to simulate
@@ -234,21 +305,33 @@ async def test_pre_cutover_rows_use_old_policy(tmp_path, settings_factory):
     )
     leg1, status = await cur.fetchone()
     assert leg1 is None, "pre-cutover row must not fire ladder legs"
-    assert status == "open", "pre-cutover row still open (old policy TP at +40%, not +25%)"
+    assert (
+        status == "open"
+    ), "pre-cutover row still open (old policy TP at +40%, not +25%)"
     await db.close()
 
 
 async def test_ladder_leg_fired_log_includes_peak_pct(tmp_path, settings_factory):
     """ladder_leg_fired and floor_activated logs must carry peak_pct for later calibration."""
     from scout.trading.paper import PaperTrader
+
     db = Database(tmp_path / "t.db")
     await db.initialize()
     trader = PaperTrader()
     settings_factory()  # normalize knobs; not used here
     trade_id = await trader.execute_buy(
-        db=db, token_id="pk", symbol="PK", name="Peak", chain="coingecko",
-        signal_type="gainers_early", signal_data={}, current_price=1.00,
-        amount_usd=300.0, tp_pct=40.0, sl_pct=15.0, slippage_bps=0,
+        db=db,
+        token_id="pk",
+        symbol="PK",
+        name="Peak",
+        chain="coingecko",
+        signal_type="gainers_early",
+        signal_data={},
+        current_price=1.00,
+        amount_usd=300.0,
+        tp_pct=40.0,
+        sl_pct=15.0,
+        slippage_bps=0,
         signal_combo="gainers_early",
     )
     # Seed a peak of +28% before firing leg 1 at +26% current
@@ -260,8 +343,12 @@ async def test_ladder_leg_fired_log_includes_peak_pct(tmp_path, settings_factory
 
     with structlog.testing.capture_logs() as logs:
         ok = await trader.execute_partial_sell(
-            db=db, trade_id=trade_id, leg=1, sell_qty_frac=0.30,
-            current_price=1.26, slippage_bps=0,
+            db=db,
+            trade_id=trade_id,
+            leg=1,
+            sell_qty_frac=0.30,
+            current_price=1.26,
+            slippage_bps=0,
         )
     assert ok is True
     fired = [e for e in logs if e["event"] == "ladder_leg_fired"]
@@ -276,14 +363,24 @@ async def test_partial_sell_race_lost_when_another_writer_fills_first(
 ):
     """If WHERE leg_N_filled_at IS NULL filters the row out, log partial_sell_race_lost."""
     from scout.trading.paper import PaperTrader
+
     db = Database(tmp_path / "t.db")
     await db.initialize()
     trader = PaperTrader()
     settings_factory()
     trade_id = await trader.execute_buy(
-        db=db, token_id="rc", symbol="RC", name="Race", chain="coingecko",
-        signal_type="gainers_early", signal_data={}, current_price=1.00,
-        amount_usd=300.0, tp_pct=40.0, sl_pct=15.0, slippage_bps=0,
+        db=db,
+        token_id="rc",
+        symbol="RC",
+        name="Race",
+        chain="coingecko",
+        signal_type="gainers_early",
+        signal_data={},
+        current_price=1.00,
+        amount_usd=300.0,
+        tp_pct=40.0,
+        sl_pct=15.0,
+        slippage_bps=0,
         signal_combo="gainers_early",
     )
 
@@ -314,8 +411,12 @@ async def test_partial_sell_race_lost_when_another_writer_fills_first(
     try:
         with structlog.testing.capture_logs() as logs:
             ok = await trader.execute_partial_sell(
-                db=db, trade_id=trade_id, leg=1, sell_qty_frac=0.30,
-                current_price=1.25, slippage_bps=0,
+                db=db,
+                trade_id=trade_id,
+                leg=1,
+                sell_qty_frac=0.30,
+                current_price=1.25,
+                slippage_bps=0,
             )
     finally:
         db._conn.execute = orig_execute  # type: ignore[assignment]
@@ -372,28 +473,38 @@ async def _seed_post_leg1_trade(db, token_id, settings):
 
     trader = PaperTrader()
     trade_id = await trader.execute_buy(
-        db=db, token_id=token_id, symbol=token_id.upper(), name=token_id,
-        chain="coingecko", signal_type="first_signal", signal_data={},
-        current_price=1.00, amount_usd=100.0, tp_pct=40.0, sl_pct=15.0,
-        slippage_bps=0, signal_combo="first_signal+momentum_ratio",
+        db=db,
+        token_id=token_id,
+        symbol=token_id.upper(),
+        name=token_id,
+        chain="coingecko",
+        signal_type="first_signal",
+        signal_data={},
+        current_price=1.00,
+        amount_usd=100.0,
+        tp_pct=40.0,
+        sl_pct=15.0,
+        slippage_bps=0,
+        signal_combo="first_signal+momentum_ratio",
     )
     # Simulate leg 1 fill at +25% — arms the floor, reduces qty to 70%
     await trader.execute_partial_sell(
-        db=db, trade_id=trade_id, leg=1,
+        db=db,
+        trade_id=trade_id,
+        leg=1,
         sell_qty_frac=settings.PAPER_LADDER_LEG_1_QTY_FRAC,
-        current_price=1.25, slippage_bps=0,
+        current_price=1.25,
+        slippage_bps=0,
     )
     # Backdate opened_at/created_at to 25h ago so the 24h checkpoint path is legal.
     # Also move the BL-061 cutover_ts back to 30h ago so the backdated trade is
     # still classified as post-cutover (created_at >= cutover_ts).
-    twenty_five_h_ago = (datetime.now(timezone.utc).timestamp() - 25 * 3600)
-    thirty_h_ago = (datetime.now(timezone.utc).timestamp() - 30 * 3600)
-    backdate_iso = datetime.fromtimestamp(
-        twenty_five_h_ago, tz=timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S")
-    cutover_iso = datetime.fromtimestamp(
-        thirty_h_ago, tz=timezone.utc
-    ).isoformat()
+    twenty_five_h_ago = datetime.now(timezone.utc).timestamp() - 25 * 3600
+    thirty_h_ago = datetime.now(timezone.utc).timestamp() - 30 * 3600
+    backdate_iso = datetime.fromtimestamp(twenty_five_h_ago, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    cutover_iso = datetime.fromtimestamp(thirty_h_ago, tz=timezone.utc).isoformat()
     await db._conn.execute(
         "UPDATE paper_trades SET opened_at = ?, created_at = ? WHERE id = ?",
         (backdate_iso, backdate_iso, trade_id),
@@ -406,9 +517,7 @@ async def _seed_post_leg1_trade(db, token_id, settings):
     return trade_id
 
 
-async def _set_checkpoints_and_peak(
-    db, trade_id, *, peak_pct, cp_6h_pct, cp_24h_pct
-):
+async def _set_checkpoints_and_peak(db, trade_id, *, peak_pct, cp_6h_pct, cp_24h_pct):
     """Manually set peak_pct + both checkpoint_*_pct columns."""
     await db._conn.execute(
         "UPDATE paper_trades SET peak_pct = ?, peak_price = ?, "
@@ -416,9 +525,12 @@ async def _set_checkpoints_and_peak(
         "checkpoint_24h_pct = ?, checkpoint_24h_price = ? "
         "WHERE id = ?",
         (
-            peak_pct, 1.0 + peak_pct / 100,
-            cp_6h_pct, 1.0 + cp_6h_pct / 100,
-            cp_24h_pct, 1.0 + cp_24h_pct / 100,
+            peak_pct,
+            1.0 + peak_pct / 100,
+            cp_6h_pct,
+            1.0 + cp_6h_pct / 100,
+            cp_24h_pct,
+            1.0 + cp_24h_pct / 100,
             trade_id,
         ),
     )
@@ -427,6 +539,7 @@ async def _set_checkpoints_and_peak(
 
 async def _seed_current_price(db, token_id, price):
     from datetime import datetime, timezone
+
     await db._conn.execute(
         "INSERT OR REPLACE INTO price_cache (coin_id, current_price, updated_at) "
         "VALUES (?, ?, ?)",
@@ -469,9 +582,7 @@ async def test_peak_fade_fires_when_both_checkpoints_below_ratio(
     await db.close()
 
 
-async def test_peak_fade_no_fire_when_peak_below_threshold(
-    tmp_path, settings_factory
-):
+async def test_peak_fade_no_fire_when_peak_below_threshold(tmp_path, settings_factory):
     from scout.db import Database
     from scout.trading.evaluator import evaluate_paper_trades
 
@@ -497,9 +608,7 @@ async def test_peak_fade_no_fire_when_peak_below_threshold(
     await db.close()
 
 
-async def test_peak_fade_no_fire_when_cp_6h_missing(
-    tmp_path, settings_factory
-):
+async def test_peak_fade_no_fire_when_cp_6h_missing(tmp_path, settings_factory):
     from scout.db import Database
     from scout.trading.evaluator import evaluate_paper_trades
 
@@ -529,9 +638,7 @@ async def test_peak_fade_no_fire_when_cp_6h_missing(
     await db.close()
 
 
-async def test_peak_fade_no_fire_when_cp_24h_missing(
-    tmp_path, settings_factory
-):
+async def test_peak_fade_no_fire_when_cp_24h_missing(tmp_path, settings_factory):
     from scout.db import Database
     from scout.trading.evaluator import evaluate_paper_trades
 
@@ -587,9 +694,7 @@ async def test_peak_fade_no_fire_when_only_one_cp_below_ratio(
     await db.close()
 
 
-async def test_peak_fade_disabled_flag_suppresses_fire(
-    tmp_path, settings_factory
-):
+async def test_peak_fade_disabled_flag_suppresses_fire(tmp_path, settings_factory):
     from scout.db import Database
     from scout.trading.evaluator import evaluate_paper_trades
 
@@ -613,9 +718,7 @@ async def test_peak_fade_disabled_flag_suppresses_fire(
     await db.close()
 
 
-async def test_peak_fade_sl_wins_when_both_eligible(
-    tmp_path, settings_factory
-):
+async def test_peak_fade_sl_wins_when_both_eligible(tmp_path, settings_factory):
     """SL triggers before peak-fade in the precedence chain."""
     from scout.db import Database
     from scout.trading.evaluator import evaluate_paper_trades
@@ -629,10 +732,19 @@ async def test_peak_fade_sl_wins_when_both_eligible(
 
     trader = PaperTrader()
     trade_id = await trader.execute_buy(
-        db=db, token_id="tok-pf7", symbol="PF7", name="pf7",
-        chain="coingecko", signal_type="first_signal", signal_data={},
-        current_price=1.00, amount_usd=100.0, tp_pct=40.0, sl_pct=15.0,
-        slippage_bps=0, signal_combo="first_signal+momentum_ratio",
+        db=db,
+        token_id="tok-pf7",
+        symbol="PF7",
+        name="pf7",
+        chain="coingecko",
+        signal_type="first_signal",
+        signal_data={},
+        current_price=1.00,
+        amount_usd=100.0,
+        tp_pct=40.0,
+        sl_pct=15.0,
+        slippage_bps=0,
+        signal_combo="first_signal+momentum_ratio",
     )
     twenty_five_h = datetime.now(timezone.utc).timestamp() - 25 * 3600
     backdate = datetime.fromtimestamp(twenty_five_h, tz=timezone.utc).strftime(
@@ -671,9 +783,7 @@ async def test_peak_fade_sl_wins_when_both_eligible(
     await db.close()
 
 
-async def test_peak_fade_trail_wins_when_both_eligible(
-    tmp_path, settings_factory
-):
+async def test_peak_fade_trail_wins_when_both_eligible(tmp_path, settings_factory):
     """Trailing-stop triggers before peak-fade on the same evaluator pass."""
     from scout.db import Database
     from scout.trading.evaluator import evaluate_paper_trades
@@ -699,16 +809,12 @@ async def test_peak_fade_trail_wins_when_both_eligible(
         (trade_id,),
     )
     reason, fired_at = await cur.fetchone()
-    assert reason == "trailing_stop", (
-        f"trail must win; got reason={reason}"
-    )
+    assert reason == "trailing_stop", f"trail must win; got reason={reason}"
     assert fired_at is None
     await db.close()
 
 
-async def test_peak_fade_fires_when_trail_not_tripped(
-    tmp_path, settings_factory
-):
+async def test_peak_fade_fires_when_trail_not_tripped(tmp_path, settings_factory):
     """Trail armed but current price ABOVE trail threshold on this pass;
     peak-fade must still fire based on the 6h/24h observations."""
     from scout.db import Database
@@ -740,9 +846,7 @@ async def test_peak_fade_fires_when_trail_not_tripped(
     await db.close()
 
 
-async def test_peak_fade_closes_remaining_qty_only(
-    tmp_path, settings_factory
-):
+async def test_peak_fade_closes_remaining_qty_only(tmp_path, settings_factory):
     from scout.db import Database
     from scout.trading.evaluator import evaluate_paper_trades
 
@@ -773,9 +877,7 @@ async def test_peak_fade_closes_remaining_qty_only(
     await db.close()
 
 
-async def test_peak_fade_does_not_refire_once_closed(
-    tmp_path, settings_factory
-):
+async def test_peak_fade_does_not_refire_once_closed(tmp_path, settings_factory):
     """Second evaluator pass on an already-closed trade must be a no-op."""
     from scout.db import Database
     from scout.trading.evaluator import evaluate_paper_trades
@@ -809,9 +911,7 @@ async def test_peak_fade_does_not_refire_once_closed(
     await db.close()
 
 
-async def test_peak_fade_no_fire_when_remaining_qty_is_zero(
-    tmp_path, settings_factory
-):
+async def test_peak_fade_no_fire_when_remaining_qty_is_zero(tmp_path, settings_factory):
     """Belt-and-suspenders: a legacy inconsistent row with status='open'
     but remaining_qty=0 must not trigger a zero-qty peak-fade close."""
     from scout.db import Database

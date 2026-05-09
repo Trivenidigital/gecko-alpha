@@ -38,6 +38,8 @@ class ChannelsHolder(TypedDict):
     """
 
     channels: list[str]
+
+
 from telethon.errors import (
     AuthKeyError,
     ChannelPrivateError,
@@ -295,7 +297,9 @@ async def _replay_post_resolution(
                 ),
             )
             return
-        cashtag_normalized = parsed.cashtags[0]  # already upper, no '$' per parser contract
+        cashtag_normalized = parsed.cashtags[
+            0
+        ]  # already upper, no '$' per parser contract
         paper_trade_id: int | None = None
         blocked_gate: str | None = None
         try:
@@ -1371,9 +1375,7 @@ def _make_channel_reload_heartbeat(
                     raise
         while True:
             try:
-                await asyncio.sleep(
-                    settings.TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC
-                )
+                await asyncio.sleep(settings.TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC)
                 channels_holder["channels"] = await _channel_reload_once(
                     db,
                     client,

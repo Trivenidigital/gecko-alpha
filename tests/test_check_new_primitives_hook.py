@@ -20,7 +20,9 @@ from pathlib import Path
 
 import pytest
 
-HOOK_SCRIPT = Path(__file__).parent.parent / ".claude" / "hooks" / "check-new-primitives.py"
+HOOK_SCRIPT = (
+    Path(__file__).parent.parent / ".claude" / "hooks" / "check-new-primitives.py"
+)
 
 
 def _run(

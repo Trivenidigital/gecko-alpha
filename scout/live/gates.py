@@ -17,6 +17,7 @@ Execution order (spec §5, first-failure-wins):
 Valid reject_reasons match the shadow_trades / live_trades CHECK constraint in
 :func:`scout.db.Database.initialize`.
 """
+
 from __future__ import annotations
 
 from decimal import Decimal
@@ -53,6 +54,14 @@ VALID_REJECT_REASONS: frozenset[str] = frozenset(
         "exposure_cap",
         "override_disabled",
         "venue_unavailable",
+        # BL-NEW-LIVE-HYBRID M1 v2.1 additions:
+        "notional_cap_exceeded",
+        "signal_disabled",
+        "token_aggregate",
+        "dual_signal_aggregate",
+        "all_candidates_failed",
+        "master_kill",
+        "mode_paper",
     }
 )
 
@@ -165,21 +174,14 @@ class Gates:
         required = multiplier * size_usd
         top_bids = depth.bids[:10]
         top_asks = depth.asks[:10]
-        bid_total = sum(
-            (lv.price * lv.qty for lv in top_bids), Decimal(0)
-        )
-        ask_total = sum(
-            (lv.price * lv.qty for lv in top_asks), Decimal(0)
-        )
+        bid_total = sum((lv.price * lv.qty for lv in top_bids), Decimal(0))
+        ask_total = sum((lv.price * lv.qty for lv in top_asks), Decimal(0))
         if bid_total < required or ask_total < required:
             return (
                 GateResult(
                     passed=False,
                     reject_reason="insufficient_depth",
-                    detail=(
-                        f"bid={bid_total} ask={ask_total} "
-                        f"required={required}"
-                    ),
+                    detail=(f"bid={bid_total} ask={ask_total} " f"required={required}"),
                 ),
                 venue,
             )
@@ -188,30 +190,40 @@ class Gates:
         walk = walk_asks(depth, size_usd)
         slippage_cap = self._config._s.LIVE_SLIPPAGE_BPS_CAP
         if walk.insufficient_liquidity or (
-            walk.slippage_bps is not None
-            and walk.slippage_bps > slippage_cap
+            walk.slippage_bps is not None and walk.slippage_bps > slippage_cap
         ):
             return (
                 GateResult(
                     passed=False,
                     reject_reason="slippage_exceeds_cap",
-                    detail=(
-                        f"slippage_bps={walk.slippage_bps} "
-                        f"cap={slippage_cap}"
-                    ),
+                    detail=(f"slippage_bps={walk.slippage_bps} " f"cap={slippage_cap}"),
                 ),
                 venue,
             )
 
-        # Gate 7: exposure cap
+        # Gate 7: exposure cap. Query path is conditional on master kill:
+        # - LIVE_TRADING_ENABLED=True (M1 v2.1):  query cross_venue_exposure
+        #   view (Tasks 3+4 — aggregates binance live_trades + per-chain
+        #   minara_<chain> paper_trades).
+        # - LIVE_TRADING_ENABLED=False (BL-055 shadow soak): query
+        #   shadow_trades directly (back-compat for the existing soak loop).
+        # Master-kill flip in production = view-mode flip in semantics.
         assert self._db._conn is not None
-        cur = await self._db._conn.execute(
-            "SELECT COALESCE(SUM(CAST(size_usd AS REAL)), 0), COUNT(*) "
-            "FROM shadow_trades WHERE status = 'open'"
-        )
+        live_master_kill = getattr(self._config._s, "LIVE_TRADING_ENABLED", False)
+        if live_master_kill:
+            cur = await self._db._conn.execute(
+                "SELECT COALESCE(SUM(open_exposure_usd), 0), "
+                "       COALESCE(SUM(open_count), 0) "
+                "FROM cross_venue_exposure"
+            )
+        else:
+            cur = await self._db._conn.execute(
+                "SELECT COALESCE(SUM(CAST(size_usd AS REAL)), 0), COUNT(*) "
+                "FROM shadow_trades WHERE status = 'open'"
+            )
         row = await cur.fetchone()
-        sum_open = row[0] if row is not None else 0
-        count_open = row[1] if row is not None else 0
+        sum_open = float(row[0]) if row is not None else 0.0
+        count_open = int(row[1]) if row is not None else 0
         sum_open_dec = Decimal(str(sum_open))
         max_exposure = self._config._s.LIVE_MAX_EXPOSURE_USD
         max_positions = self._config._s.LIVE_MAX_OPEN_POSITIONS
@@ -220,10 +232,7 @@ class Gates:
                 GateResult(
                     passed=False,
                     reject_reason="exposure_cap",
-                    detail=(
-                        f"sum={sum_open_dec}+{size_usd} "
-                        f"cap={max_exposure}"
-                    ),
+                    detail=(f"sum={sum_open_dec}+{size_usd} cap={max_exposure}"),
                 ),
                 venue,
             )
@@ -237,11 +246,44 @@ class Gates:
                 venue,
             )
 
-        # Gate 8: balance (live-only — BL-055 must be blocked at startup)
+        # Gate 8 (per-trade notional cap) + Gate 9 (per-signal opt-in) only
+        # fire when master kill is OFF — they enforce live-execution
+        # invariants. Shadow-mode soak (BL-055) should not trip them.
+        if live_master_kill:
+            # Gate 8: per-trade notional cap (BL-NEW-LIVE-HYBRID M1 v2.1).
+            notional_cap = self._config._s.LIVE_TRADE_AMOUNT_USD
+            if size_usd > notional_cap:
+                return (
+                    GateResult(
+                        passed=False,
+                        reject_reason="notional_cap_exceeded",
+                        detail=f"size_usd={size_usd} cap={notional_cap}",
+                    ),
+                    venue,
+                )
+
+            # Gate 9: per-signal opt-in (Layer 3 of 4-layer kill stack).
+            cur = await self._db._conn.execute(
+                "SELECT live_eligible FROM signal_params WHERE signal_type = ?",
+                (signal_type,),
+            )
+            row = await cur.fetchone()
+            if not (row and bool(row[0])):
+                return (
+                    GateResult(
+                        passed=False,
+                        reject_reason="signal_disabled",
+                        detail=f"signal_params.live_eligible=0 for {signal_type}",
+                    ),
+                    venue,
+                )
+
+        # Gate 10: balance (live-only — BL-055 must be blocked at startup;
+        # full implementation lands in Task 8 / balance_gate.py).
         if self._config.mode == "live":
             raise NotImplementedError(
-                "Balance gate wired in BL-058; LIVE_MODE=live must be "
-                "blocked at startup in BL-055"
+                "Balance gate wired in BL-058 / Task 8; LIVE_MODE=live must "
+                "be blocked at startup in BL-055"
             )
 
         return GateResult(passed=True), venue

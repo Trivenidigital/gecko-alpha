@@ -696,6 +696,7 @@ async def trade_predictions(
             CoinIdResolutionError,
             DbNotInitializedError,
         )
+
         try:
             resolves = await db.coin_id_resolves(pred.coin_id)
         except DbNotInitializedError as exc:
