@@ -369,14 +369,31 @@ Add `LIVE_USE_ROUTING_LAYER` branch. Existing shadow flow preserved verbatim und
         - Calls adapter.await_fill_confirmation (M1.5a polling) with the
           same cid the adapter just wrote to live_trades
         - On terminal=filled → increment correction counter
+        - On BinanceAuthError mid-session → engages KillSwitch (R1-M1)
+        - On no candidates → writes live_trades reject row (R2-M1 / Q2)
         """
         from uuid import uuid4
         from scout.live.adapter_base import OrderRequest
+        from scout.live.binance_adapter import (
+            BinanceAuthError,
+            BinanceIPBanError,
+        )
         from scout.live.correction_counter import increment_consecutive
+        from scout.live.exceptions import VenueTransientError
         from scout.live.idempotency import make_client_order_id
 
         canonical = paper_trade.symbol
         chain_hint = getattr(paper_trade, "chain", None)
+
+        # R2-I2 fold: entry telemetry — operator can grep "did
+        # _dispatch_live even fire for this signal?"
+        log.info(
+            "live_dispatch_entered",
+            paper_trade_id=paper_trade.id,
+            canonical=canonical,
+            size_usd=float(size_usd),
+            signal_type=paper_trade.signal_type,
+        )
 
         candidates = await self._routing.get_candidates(
             canonical=canonical,
@@ -384,13 +401,32 @@ Add `LIVE_USE_ROUTING_LAYER` branch. Existing shadow flow preserved verbatim und
             signal_type=paper_trade.signal_type,
             size_usd=float(size_usd),
         )
+
+        # R2-I2 fold: candidate-count visibility
+        log.info(
+            "live_dispatch_candidates_returned",
+            paper_trade_id=paper_trade.id,
+            count=len(candidates),
+            top_venue=candidates[0].venue if candidates else None,
+        )
+
         if not candidates:
+            # R2-M1 / §7 Q2 fold: write a live_trades reject row so the
+            # dashboard /api/live_trades surface shows the silent-failure
+            # mode. reject_reason 'no_venue' is in M1.5a's CHECK list.
+            await self._db._conn.execute(
+                "INSERT INTO live_trades "
+                "(paper_trade_id, status, reject_reason, created_at) "
+                "VALUES (?, 'rejected', 'no_venue', ?)",
+                (paper_trade.id, datetime.now(timezone.utc).isoformat()),
+            )
+            await self._db._conn.commit()
             log.info(
                 "live_dispatch_no_venue",
                 paper_trade_id=paper_trade.id,
                 canonical=canonical,
             )
-            return  # routing layer logs reason; engine doesn't double-write
+            return
 
         top = candidates[0]
         intent_uuid = str(uuid4())
@@ -411,8 +447,42 @@ Add `LIVE_USE_ROUTING_LAYER` branch. Existing shadow flow preserved verbatim und
         try:
             venue_order_id = await self._adapter.place_order_request(request)
         except NotImplementedError as exc:
+            # Defense-in-depth: §2.2 misconfig CRASH should prevent
+            # reaching here (engine __init__ refuses to construct under
+            # routing+signed misconfig). If we still hit it (e.g.,
+            # operator runtime-edited .env without restart), log + return.
             log.info(
                 "live_dispatch_signed_disabled",
+                paper_trade_id=paper_trade.id,
+                err=str(exc),
+            )
+            return
+        except BinanceAuthError as exc:
+            # R1-M1 fold: API key revoked mid-session. Gates already
+            # approved, so this is severe — engage KillSwitch and stop
+            # all subsequent live dispatches until operator investigates.
+            log.error(
+                "live_dispatch_auth_revoked_mid_session",
+                paper_trade_id=paper_trade.id,
+                err=str(exc),
+            )
+            await self._kill_switch.engage(
+                reason="binance_auth_revoked_mid_session"
+            )
+            return
+        except BinanceIPBanError as exc:
+            # R1-M1 fold: IP banned. KillSwitch + Telegram alert.
+            log.error(
+                "live_dispatch_ip_banned",
+                paper_trade_id=paper_trade.id,
+                err=str(exc),
+            )
+            await self._kill_switch.engage(reason="binance_ip_banned")
+            return
+        except VenueTransientError as exc:
+            # Known transient class — log INFO, next signal will retry.
+            log.info(
+                "live_dispatch_venue_transient",
                 paper_trade_id=paper_trade.id,
                 err=str(exc),
             )
@@ -457,7 +527,9 @@ Add `LIVE_USE_ROUTING_LAYER` branch. Existing shadow flow preserved verbatim und
                 self._db, paper_trade.signal_type, top.venue
             )
 
-- [ ] **Step 3: Update `LiveEngine.__init__` to accept routing param + log warning if mode/flag/routing mismatch**
+- [ ] **Step 3: Update `LiveEngine.__init__` to accept routing param + CRASH on misconfig**
+
+R2-C1 + R2-I3 + R1-M2 fold: replace the planned WARN log with a fail-closed CRASH covering BOTH (a) `LIVE_USE_ROUTING_LAYER=True AND LIVE_USE_REAL_SIGNED_REQUESTS=False` (operator forgot signed flag → silent no-op) and (b) `LIVE_USE_ROUTING_LAYER=True AND routing=None` (main.py wiring forgot kwarg).
 
 ```python
     def __init__(
@@ -472,20 +544,33 @@ Add `LIVE_USE_ROUTING_LAYER` branch. Existing shadow flow preserved verbatim und
     ) -> None:
         # ... existing ...
         self._routing = routing
-        # R1-I5 fix: structural visibility for "operator wanted routing
-        # but main.py couldn't construct it" — surfaces silent mismatch
-        # in logs at boot rather than at first signal silently skipping.
-        if (
-            config.mode == "live"
-            and getattr(config._s, "LIVE_USE_ROUTING_LAYER", False)
-            and routing is None
-        ):
-            log.warning(
-                "live_routing_flag_set_but_layer_missing",
-                msg="LIVE_USE_ROUTING_LAYER=True but routing=None; "
-                    "_dispatch_live will silently skip. Check main.py "
-                    "construction.",
+
+        # R2-C1 + R2-I3 + R1-M2 fold: fail-closed CRASH on misconfig.
+        # Cost-of-crash is bounded by systemd RestartSec=30s +
+        # StartLimitBurst=3 + OnFailure Telegram (M1.5a runbook §1+§2).
+        # Cost-of-WARN-and-skip is unbounded (operator walkaway = arbitrary
+        # missed signals at observed ~1.8 signals/hr prod rate).
+        if config.mode == "live":
+            flag_routing = getattr(
+                config._s, "LIVE_USE_ROUTING_LAYER", False
             )
+            flag_signed = getattr(
+                config._s, "LIVE_USE_REAL_SIGNED_REQUESTS", False
+            )
+            if flag_routing and not flag_signed:
+                raise RuntimeError(
+                    "Misconfig: LIVE_USE_ROUTING_LAYER=True but "
+                    "LIVE_USE_REAL_SIGNED_REQUESTS=False. Engine would "
+                    "silently no-op every signal. Set "
+                    "LIVE_USE_REAL_SIGNED_REQUESTS=True or "
+                    "LIVE_USE_ROUTING_LAYER=False before boot."
+                )
+            if flag_routing and routing is None:
+                raise RuntimeError(
+                    "Misconfig: LIVE_USE_ROUTING_LAYER=True but "
+                    "routing=None. Check scout/main.py construction "
+                    "passes routing=live_routing kwarg to LiveEngine."
+                )
 ```
 
 - [ ] **Step 4: Tests in `tests/test_live_engine_dispatch.py`**
