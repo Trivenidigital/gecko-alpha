@@ -390,6 +390,14 @@ class Settings(BaseSettings):
     # (only override chain's venues; abort if none healthy). Default False.
     LIVE_OVERRIDE_REPLACE_ONLY: bool = False
 
+    # -------- BL-NEW-LIVE-HYBRID M1.5a (2026-05-09) --------
+    # Gates the signed-endpoint runtime codepath for the 3 ABC methods on
+    # BinanceSpotAdapter (place_order_request, await_fill_confirmation,
+    # fetch_account_balance). When False (default), runtime bodies fall back
+    # to NotImplementedError — emergency-revert posture without git revert.
+    # Operator flips True after balance smoke check passes on testnet.
+    LIVE_USE_REAL_SIGNED_REQUESTS: bool = False
+
     # Credentials (live mode only; never in .env.example — see spec §4.4)
     BINANCE_API_KEY: SecretStr | None = None
     BINANCE_API_SECRET: SecretStr | None = None

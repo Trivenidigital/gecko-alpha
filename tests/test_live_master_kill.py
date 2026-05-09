@@ -27,6 +27,13 @@ class TestLiveTradingSettings:
     def test_override_replace_only_default(self):
         assert Settings(_env_file=None, **_REQUIRED).LIVE_OVERRIDE_REPLACE_ONLY is False
 
+    def test_live_use_real_signed_requests_defaults_off(self):
+        """M1.5a R2-I4 emergency-revert posture — default False until operator
+        explicitly opts in after testnet smoke pass."""
+        assert (
+            Settings(_env_file=None, **_REQUIRED).LIVE_USE_REAL_SIGNED_REQUESTS is False
+        )
+
 
 class TestLiveTradingValidators:
     def test_max_open_positions_per_token_must_be_at_least_1(self):
