@@ -11,16 +11,24 @@ Handoff matrix (spec §5 + §2.2):
 5. insufficient_depth        → DB row rejected/insufficient_depth, metric inc
 6. slippage_exceeds_cap      → DB row rejected/slippage_exceeds_cap, metric inc
 7. exposure_cap              → DB row rejected/exposure_cap, metric inc
-8. Happy path                → DB row status=open + walked vwap, metric inc
+8. Happy path under shadow / live-without-routing → shadow_trades open row
+9. Happy path under live + LIVE_USE_ROUTING_LAYER=True → _dispatch_live
+   (M1.5b — routes via RoutingLayer, places order, awaits fill, increments
+   correction counter on terminal=filled)
 
-LIVE_MODE=live must be blocked at startup (scout/main.py); the engine
-asserts as a belt-and-braces guard and refuses to write any row.
+M1.5b: live mode dispatch is permitted via _dispatch_live. main.py boot
+guards (scout/main.py:1062-1086) enforce LIVE_TRADING_ENABLED=True +
+LIVE_USE_REAL_SIGNED_REQUESTS=True for mode='live'. Engine __init__
+raises RuntimeError if LIVE_USE_ROUTING_LAYER=True without
+LIVE_USE_REAL_SIGNED_REQUESTS=True (silent-no-op misconfig CRASH per
+design §2.2). BL-055 shadow soak ends at first live signal under
+LIVE_USE_ROUTING_LAYER=True (design §2.7a).
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import structlog
 
@@ -33,6 +41,9 @@ from scout.live.metrics import inc
 from scout.live.orderbook import walk_asks
 from scout.live.resolver import VenueResolver
 
+if TYPE_CHECKING:
+    from scout.live.routing import RoutingLayer
+
 log = structlog.get_logger(__name__)
 
 
@@ -44,7 +55,11 @@ class _PaperTradeLike(Protocol):
 
 
 class LiveEngine:
-    """Chokepoint dispatcher. Reads from Gates, writes to shadow_trades ledger."""
+    """Chokepoint dispatcher. Reads from Gates, writes to shadow_trades ledger.
+
+    M1.5b: optionally dispatches live trades when `LIVE_MODE='live'` AND
+    `LIVE_USE_ROUTING_LAYER=True` AND a `routing` layer is wired.
+    """
 
     def __init__(
         self,
@@ -54,12 +69,14 @@ class LiveEngine:
         adapter: ExchangeAdapter,
         db: Database,
         kill_switch: KillSwitch,
+        routing: "RoutingLayer | None" = None,
     ) -> None:
         self._config = config
         self._resolver = resolver
         self._adapter = adapter
         self._db = db
         self._ks = kill_switch
+        self._routing = routing
         self._gates = Gates(
             config=config,
             db=db,
@@ -67,6 +84,35 @@ class LiveEngine:
             adapter=adapter,
             kill_switch=kill_switch,
         )
+
+        # M1.5b R2-C1 + R2-I3 + R1-M2 fold: fail-closed CRASH on misconfig.
+        # Cost-of-crash is bounded by systemd RestartSec=30s +
+        # StartLimitBurst=3 + OnFailure Telegram (M1.5a runbook §1+§2).
+        # Cost-of-WARN-and-skip is unbounded (operator walkaway = arbitrary
+        # missed signals). Shadow mode is exempt — no live trades are
+        # dispatched under shadow.
+        if config.mode == "live":
+            settings = getattr(config, "_s", None)
+            flag_routing = getattr(
+                settings, "LIVE_USE_ROUTING_LAYER", False
+            )
+            flag_signed = getattr(
+                settings, "LIVE_USE_REAL_SIGNED_REQUESTS", False
+            )
+            if flag_routing and not flag_signed:
+                raise RuntimeError(
+                    "Misconfig: LIVE_USE_ROUTING_LAYER=True but "
+                    "LIVE_USE_REAL_SIGNED_REQUESTS=False. Engine would "
+                    "silently no-op every signal. Set "
+                    "LIVE_USE_REAL_SIGNED_REQUESTS=True or "
+                    "LIVE_USE_ROUTING_LAYER=False before boot."
+                )
+            if flag_routing and routing is None:
+                raise RuntimeError(
+                    "Misconfig: LIVE_USE_ROUTING_LAYER=True but "
+                    "routing=None. Check scout/main.py construction "
+                    "passes routing=live_routing kwarg to LiveEngine."
+                )
 
     def is_eligible(self, signal_type: str) -> bool:
         """Cheap pre-check for chokepoint (spec §2.3). No I/O."""
