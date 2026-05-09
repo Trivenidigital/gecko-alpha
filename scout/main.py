@@ -1088,10 +1088,10 @@ async def main(argv: list[str] | None = None) -> int:
 
             # R2-C1: verify SPOT permission, not just balance fetch
             # R2-I6: 10s timeout (was 5s), absorbs EU-VPS jitter
-            from scout.live.binance_adapter import (
-                BinanceAuthError,
-                BinanceSpotAdapter,
-            )
+            # NOTE: BinanceSpotAdapter is already imported at module top
+            # (line 66). Local import would shadow it as a function-local
+            # name, breaking shadow-mode boot under Python scoping rules.
+            from scout.live.binance_adapter import BinanceAuthError
 
             smoke_adapter = BinanceSpotAdapter(settings, db=db)
             smoke_start = time.monotonic()
