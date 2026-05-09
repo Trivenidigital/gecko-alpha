@@ -58,6 +58,9 @@ _CANDIDATE_COLUMNS = [
     "counter_argument",
     "counter_data_completeness",
     "counter_scored_at",
+    # BL-NEW-QUOTE-PAIR (schema_version 20260513)
+    "quote_symbol",
+    "dex_id",
 ]
 
 
@@ -94,6 +97,7 @@ class Database:
         await self._migrate_live_trades_telemetry()
         await self._migrate_live_client_order_id()
         await self._migrate_reject_reason_extend()
+        await self._migrate_bl_quote_pair_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -2549,15 +2553,11 @@ class Database:
 
         try:
             await conn.execute("BEGIN EXCLUSIVE")
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS paper_migrations (
-                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
-            )
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS schema_version (
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS schema_version (
                     version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
-                    description TEXT NOT NULL)"""
-            )
+                    description TEXT NOT NULL)""")
 
             # Idempotency check: skip if marker already present.
             cur = await conn.execute(
@@ -2675,9 +2675,7 @@ class Database:
                 ("bl_reject_reason_extend_v1",),
             )
             if (await cur.fetchone()) is None:
-                raise RuntimeError(
-                    "bl_reject_reason_extend_v1 cutover row missing"
-                )
+                raise RuntimeError("bl_reject_reason_extend_v1 cutover row missing")
             await conn.commit()
         except Exception:
             try:
@@ -2689,6 +2687,84 @@ class Database:
                 migration="bl_reject_reason_extend_v1",
             )
             raise
+
+    async def _migrate_bl_quote_pair_v1(self) -> None:
+        """BL-NEW-QUOTE-PAIR: add `quote_symbol` + `dex_id` to candidates.
+
+        Stable-pair liquidity-quality signal capture. DexScreener already
+        returns `quoteToken.symbol` + `dexId` per pair; this migration adds
+        nullable TEXT columns to persist them. Pre-cutover rows stay NULL
+        per ``feedback_mid_flight_flag_migration.md`` discipline.
+
+        Migration `bl_quote_pair_v1`, schema_version 20260513.
+        Idempotent: PRAGMA-guarded ALTER per existing
+        ``_migrate_high_peak_fade_columns_and_audit_table`` pattern.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+
+            # Defensive create — mirrors HPF/Tier-1a pattern; safe in isolation.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )
+            """)
+
+            expected_cols = {"quote_symbol": "TEXT", "dex_id": "TEXT"}
+            cur_pragma = await conn.execute("PRAGMA table_info(candidates)")
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            for col, coltype in expected_cols.items():
+                if col in existing_cols:
+                    _log.info(
+                        "schema_migration_column_action",
+                        migration="bl_quote_pair_v1",
+                        col=col,
+                        action="skip_exists",
+                    )
+                else:
+                    await conn.execute(
+                        f"ALTER TABLE candidates ADD COLUMN {col} {coltype}"
+                    )
+                    _log.info(
+                        "schema_migration_column_action",
+                        migration="bl_quote_pair_v1",
+                        col=col,
+                        action="added",
+                    )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260513, now_iso, "bl_quote_pair_v1_quote_symbol_dex_id"),
+            )
+
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_quote_pair_v1")
+            raise
+
+        # Post-assertion — schema_version row must exist after success.
+        cur = await conn.execute(
+            "SELECT 1 FROM schema_version WHERE version = ?", (20260513,)
+        )
+        if (await cur.fetchone()) is None:
+            raise RuntimeError(
+                "bl_quote_pair_v1 schema_version row missing after migration"
+            )
 
     async def revive_signal_with_baseline(
         self,

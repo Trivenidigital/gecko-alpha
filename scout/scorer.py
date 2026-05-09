@@ -223,6 +223,20 @@ def score(
         points += 10
         signals.append("perp_anomaly")
 
+    # BL-NEW-QUOTE-PAIR: stable_paired_liq — +5 raw / +2 normalized.
+    # Tokens paired with a known stablecoin AND liquidity_usd >= 50K signal
+    # cleaner exit dynamics (no secondary stable-leg slippage). Counts toward
+    # co-occurrence multiplier — adding to signals list is intended.
+    # Match is case-sensitive against settings.STABLE_QUOTE_SYMBOLS; DexScreener
+    # canonically returns uppercase symbols. If the API ever shifts, the
+    # case-sensitivity test catches the regression and we'll normalize parser-side.
+    if (
+        token.quote_symbol in settings.STABLE_QUOTE_SYMBOLS
+        and token.liquidity_usd >= settings.STABLE_PAIRED_LIQ_THRESHOLD_USD
+    ):
+        points += settings.STABLE_PAIRED_BONUS
+        signals.append("stable_paired_liq")
+
     # Normalize to 0-100 scale
     points = min(100, int(points * 100 / SCORER_MAX_RAW))
 

@@ -19,12 +19,13 @@ Scaffold was copied from `C:\projects\coinpump-scout` — that project must NEVE
 - `GET /coins/markets` — sorted by 1h change, top 50
 - `GET /search/trending` — trending coins list
 
-**3 New Scoring Signals:**
-| Signal | Condition | Points | Config Key |
-|--------|-----------|--------|------------|
+**Net-new Scoring Signals (post-scaffold):**
+| Signal | Condition | Points (raw) | Config Key |
+|--------|-----------|--------------|------------|
 | momentum_ratio | 1h/24h price change > 0.6 | +20 | MOMENTUM_RATIO_THRESHOLD |
 | vol_acceleration | volume / 7d_avg > 5.0 | +25 | MIN_VOL_ACCEL_RATIO |
 | cg_trending_rank | rank <= 10 in trending | +15 | — |
+| stable_paired_liq | quote_symbol ∈ {USDC,USDT,DAI,FDUSD,USDe,PYUSD,RLUSD,sUSDe} AND liquidity_usd ≥ $50K | +5 (≈+2 normalized) | STABLE_PAIRED_BONUS / STABLE_PAIRED_LIQ_THRESHOLD_USD / STABLE_QUOTE_SYMBOLS |
 
 **Rate limiting:** Tracks call timestamps, enforces 30/min. Exponential backoff on 429 (2s, 4s, 8s).
 

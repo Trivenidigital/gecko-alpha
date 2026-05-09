@@ -1,6 +1,11 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-06 (BL-NEW-AUTOSUSPEND-FIX shipped + losers_contrarian/gainers_early revived + HPF dry-run activated)
+Last updated: 2026-05-09 (autonomous build: BL-NEW-QUOTE-PAIR plan + design + impl + tests; PR pending)
+
+## BL-NEW-QUOTE-PAIR soak (post-deploy)
+
+- [ ] **D+3 mid-soak verification** — query `candidates` table for fraction satisfying `quote_symbol ∈ stables AND liquidity_usd >= 50K`. Threshold: < 40% to keep current bonus magnitude. Query in `docs/runbook_high_peak_fade.md`-adjacent runbook if needed.
+- [ ] **D+7 soak end** — alert volume must not exceed +10% baseline. Revert via `STABLE_PAIRED_BONUS=0` env override if breached.
 
 ## Pending verifications (time-gated)
 
