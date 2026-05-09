@@ -59,6 +59,51 @@ def test_from_dexscreener_handles_empty_quote_token():
     assert token.dex_id == "uniswap"
 
 
+def test_from_dexscreener_handles_string_quote_token():
+    """R6 PR review MUST-FIX: malformed quoteToken (string instead of dict).
+
+    Without the isinstance guard, `"USDC".get("symbol")` raises AttributeError
+    that bubbles up to the DexScreener poller's broad-except, silently
+    dropping the entire pair from the cycle.
+    """
+    raw = _ds_pair_dict(quoteToken="USDC", dexId="raydium")
+    token = CandidateToken.from_dexscreener(raw)
+    assert token.quote_symbol is None
+    assert token.dex_id == "raydium"
+
+
+def test_from_dexscreener_handles_list_quote_token():
+    """R6 PR review MUST-FIX: malformed quoteToken (list instead of dict)."""
+    raw = _ds_pair_dict(quoteToken=["USDC", "USDT"], dexId="raydium")
+    token = CandidateToken.from_dexscreener(raw)
+    assert token.quote_symbol is None
+    assert token.dex_id == "raydium"
+
+
+def test_from_dexscreener_handles_int_dex_id():
+    """R6 PR review MUST-FIX: malformed dexId (int instead of string)."""
+    raw = _ds_pair_dict(
+        quoteToken={"symbol": "USDC"},
+        dexId=42,  # malformed
+    )
+    token = CandidateToken.from_dexscreener(raw)
+    assert token.quote_symbol == "USDC"
+    assert token.dex_id is None
+
+
+def test_from_dexscreener_handles_non_string_quote_symbol():
+    """R6 PR review MUST-FIX: nested non-string symbol (list / int / None)."""
+    for malformed in [["USDC"], 42, {"a": 1}]:
+        raw = _ds_pair_dict(
+            quoteToken={"symbol": malformed},
+            dexId="raydium",
+        )
+        token = CandidateToken.from_dexscreener(raw)
+        assert (
+            token.quote_symbol is None
+        ), f"Expected None for malformed symbol={malformed!r}"
+
+
 def test_candidate_token_default_none_for_quote_fields():
     """Direct constructor (no DexScreener parser) defaults to None."""
     token = CandidateToken(

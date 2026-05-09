@@ -123,6 +123,33 @@ async def test_bl_quote_pair_v1_preserves_pre_existing_rows(tmp_path, token_fact
 
 
 @pytest.mark.asyncio
+async def test_bl_quote_pair_v1_description_mismatch_raises(tmp_path):
+    """R6 PR review MUST-FIX: version-collision case with different description.
+
+    If an external migration tool pre-seeded version=20260513 with a different
+    description (e.g., a manual operator fix script), `INSERT OR IGNORE` would
+    silently skip the write. Without the description-match post-assertion, the
+    migration would falsely claim success while the schema_version row points
+    to a different migration's description.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+
+    # Tamper: replace the description with a wrong value, simulating a
+    # version-collision pre-seed scenario.
+    await db._conn.execute(
+        "UPDATE schema_version SET description = ? WHERE version = ?",
+        ("some_other_migration_v999", 20260513),
+    )
+    await db._conn.commit()
+
+    # Re-running the migration must catch the mismatch via post-assertion.
+    with pytest.raises(RuntimeError, match="description mismatch"):
+        await db._migrate_bl_quote_pair_v1()
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_bl_quote_pair_v1_round_trip_persists_values(tmp_path, token_factory):
     """Forward-looking: post-cutover rows with quote_symbol + dex_id round-trip
     correctly via upsert_candidate."""

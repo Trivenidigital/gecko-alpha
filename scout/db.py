@@ -2749,21 +2749,49 @@ class Database:
             )
 
             await conn.commit()
-        except Exception:
+        except Exception as e:
+            # R6 PR review MUST-FIX: capture original exception with type+str,
+            # log original BEFORE the rollback attempt so a rollback failure
+            # doesn't bury the root-cause traceback. Distinguish lock-contention
+            # from genuine schema drift via exception type so on-call doesn't
+            # page on the wrong cause.
+            _log.exception(
+                "schema_migration_failed",
+                migration="bl_quote_pair_v1",
+                err=str(e),
+                err_type=type(e).__name__,
+            )
             try:
                 await conn.execute("ROLLBACK")
             except Exception as rb_err:
-                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+                _log.exception(
+                    "schema_migration_rollback_failed",
+                    migration="bl_quote_pair_v1",
+                    err=str(rb_err),
+                    err_type=type(rb_err).__name__,
+                )
             _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_quote_pair_v1")
             raise
 
-        # Post-assertion — schema_version row must exist after success.
+        # Post-assertion — schema_version row must exist with our description.
+        # R6 PR review MUST-FIX: also assert description matches, to surface a
+        # version-collision case where some external tool pre-seeded
+        # version=20260513 with a different description; INSERT OR IGNORE would
+        # silently skip the write and the post-assertion would still pass with
+        # the old (wrong) row, producing inconsistent state.
         cur = await conn.execute(
-            "SELECT 1 FROM schema_version WHERE version = ?", (20260513,)
+            "SELECT description FROM schema_version WHERE version = ?", (20260513,)
         )
-        if (await cur.fetchone()) is None:
+        row = await cur.fetchone()
+        if row is None:
             raise RuntimeError(
                 "bl_quote_pair_v1 schema_version row missing after migration"
+            )
+        if row[0] != "bl_quote_pair_v1_quote_symbol_dex_id":
+            raise RuntimeError(
+                f"bl_quote_pair_v1 schema_version description mismatch — "
+                f"expected 'bl_quote_pair_v1_quote_symbol_dex_id', got {row[0]!r}. "
+                f"Possible version-collision; investigate before continuing."
             )
 
     async def revive_signal_with_baseline(

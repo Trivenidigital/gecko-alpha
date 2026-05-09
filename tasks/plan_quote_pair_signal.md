@@ -1,4 +1,4 @@
-**New primitives introduced:** `CandidateToken.quote_symbol`, `CandidateToken.dex_id`, `candidates.quote_symbol` column, `candidates.dex_id` column, scorer signal `stable_paired_liq` (+5pts raw), Settings `STABLE_PAIRED_LIQ_THRESHOLD_USD` + `STABLE_PAIRED_BONUS` + `STABLE_QUOTE_SYMBOLS`, migration `bl_quote_pair_v1` (schema_version 20260512). Migration writes a row to existing `schema_version` table (singular, per `scout/db.py:1030`).
+**New primitives introduced:** `CandidateToken.quote_symbol`, `CandidateToken.dex_id`, `candidates.quote_symbol` column, `candidates.dex_id` column, scorer signal `stable_paired_liq` (+5pts raw), Settings `STABLE_PAIRED_LIQ_THRESHOLD_USD` + `STABLE_PAIRED_BONUS` + `STABLE_QUOTE_SYMBOLS`, migration `bl_quote_pair_v1` (schema_version 20260513). Migration writes a row to existing `schema_version` table (singular, per `scout/db.py:1030`).
 
 # Plan — BL-NEW-QUOTE-PAIR: Quote-currency liquidity-quality signal
 
@@ -54,7 +54,7 @@ Industry precedent (Birdeye filters, GMGN.ai): "stable-pair preferred" is a stan
 3. DB migration `bl_quote_pair_v1`:
    - Pattern: follow `_migrate_feedback_loop_schema` at `scout/db.py:1077` — `PRAGMA table_info(candidates)` → set existing → conditional `ALTER TABLE candidates ADD COLUMN <col> TEXT` for each missing.
    - Idempotent: re-running the migration on an already-migrated DB skips with `schema_migration_column_action action=skip_exists` log.
-   - Schema-version write: existing table is `schema_version` (singular, NOT `schema_versions`) — confirmed at `scout/db.py:1030`. Insert via project's `_record_schema_version` helper if present, otherwise raw `INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (20260512, ...)`.
+   - Schema-version write: existing table is `schema_version` (singular, NOT `schema_versions`) — confirmed at `scout/db.py:1030`. Insert via project's `_record_schema_version` helper if present, otherwise raw `INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (20260513, ...)`.
    - Both columns nullable (pre-cutover rows = NULL, per `feedback_mid_flight_flag_migration.md` discipline).
 
 4. Persistence: `db.upsert_candidate` writes both fields when present.
@@ -114,7 +114,7 @@ Industry precedent (Birdeye filters, GMGN.ai): "stable-pair preferred" is a stan
 3. **DB migration `bl_quote_pair_v1`** (`scout/db.py`)
    - Add `_migrate_bl_quote_pair_v1` method following pattern of existing `_migrate_*` helpers
    - Add ALTER TABLE statements; idempotency check via `PRAGMA table_info(candidates)`
-   - Increment schema_version to 20260512
+   - Increment schema_version to 20260513
    - Wire in `_apply_migrations`
    - Update `upsert_candidate` SQL to include new columns
    - Tests in `tests/test_migrations.py` + `tests/test_db.py`

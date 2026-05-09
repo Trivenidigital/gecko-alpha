@@ -1,4 +1,4 @@
-**New primitives introduced:** Same as `plan_quote_pair_signal.md` — `CandidateToken.quote_symbol`, `CandidateToken.dex_id`, `candidates.quote_symbol` column, `candidates.dex_id` column, scorer signal `stable_paired_liq` (+5pts raw / +2 normalized), Settings `STABLE_PAIRED_LIQ_THRESHOLD_USD` + `STABLE_PAIRED_BONUS` + `STABLE_QUOTE_SYMBOLS`, migration `bl_quote_pair_v1` (writes schema_version=20260512 to existing `schema_version` table).
+**New primitives introduced:** Same as `plan_quote_pair_signal.md` — `CandidateToken.quote_symbol`, `CandidateToken.dex_id`, `candidates.quote_symbol` column, `candidates.dex_id` column, scorer signal `stable_paired_liq` (+5pts raw / +2 normalized), Settings `STABLE_PAIRED_LIQ_THRESHOLD_USD` + `STABLE_PAIRED_BONUS` + `STABLE_QUOTE_SYMBOLS`, migration `bl_quote_pair_v1` (writes schema_version=20260513 to existing `schema_version` table).
 
 # Design — BL-NEW-QUOTE-PAIR
 
@@ -105,7 +105,7 @@ async def _migrate_bl_quote_pair_v1(self) -> None:
         await conn.execute(
             "INSERT OR IGNORE INTO schema_version "
             "(version, applied_at, description) VALUES (?, ?, ?)",
-            (20260512, now_iso, "bl_quote_pair_v1_quote_symbol_dex_id"),
+            (20260513, now_iso, "bl_quote_pair_v1_quote_symbol_dex_id"),
         )
 
         await conn.commit()
@@ -119,7 +119,7 @@ async def _migrate_bl_quote_pair_v1(self) -> None:
 
     # Post-assertion — schema_version row must exist after a successful migration.
     cur = await conn.execute(
-        "SELECT 1 FROM schema_version WHERE version = ?", (20260512,)
+        "SELECT 1 FROM schema_version WHERE version = ?", (20260513,)
     )
     row = await cur.fetchone()
     if row is None:
@@ -316,12 +316,12 @@ async def test_bl_quote_pair_v1_wired_into_apply_migrations(tmp_path):
     """R3 MUST-FIX (a): orphaned migration would silently succeed first test.
 
     Use a freshly-created DB (no schema_version row), call ONLY initialize(),
-    then assert version 20260512 was written — proves the migration is in chain.
+    then assert version 20260513 was written — proves the migration is in chain.
     """
     db = Database(...)
     await db.initialize()
     cur = await db._conn.execute(
-        "SELECT 1 FROM schema_version WHERE version = 20260512"
+        "SELECT 1 FROM schema_version WHERE version = 20260513"
     )
     assert (await cur.fetchone()) is not None, (
         "bl_quote_pair_v1 not wired into _apply_migrations"
@@ -333,11 +333,11 @@ async def test_bl_quote_pair_v1_schema_version_row_written(tmp_path):
     await db.initialize()
     cur = await db._conn.execute(
         "SELECT version, applied_at, description FROM schema_version "
-        "WHERE version = 20260512"
+        "WHERE version = 20260513"
     )
     row = await cur.fetchone()
     assert row is not None
-    assert row[0] == 20260512
+    assert row[0] == 20260513
     assert row[2] == "bl_quote_pair_v1_quote_symbol_dex_id"
 
 async def test_bl_quote_pair_v1_idempotent_rerun_does_not_raise(tmp_path):
@@ -422,8 +422,8 @@ sudo systemctl restart scout
 sqlite3 /opt/scout/scout.db "PRAGMA table_info(candidates);" | grep -E "quote_symbol|dex_id"
 # Expect: 2 lines — one for each new column, type TEXT
 
-sqlite3 /opt/scout/scout.db "SELECT * FROM schema_version WHERE version=20260512;"
-# Expect: 20260512|<iso-timestamp>|bl_quote_pair_v1_quote_symbol_dex_id
+sqlite3 /opt/scout/scout.db "SELECT * FROM schema_version WHERE version=20260513;"
+# Expect: 20260513|<iso-timestamp>|bl_quote_pair_v1_quote_symbol_dex_id
 
 # 6. Verify forward-ingestion populates new fields (D+0, ~5 min after restart)
 sqlite3 /opt/scout/scout.db "

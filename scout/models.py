@@ -131,12 +131,18 @@ class CandidateToken(BaseModel):
         price_change_1h = price_change.get("h1")
         price_change_24h = price_change.get("h24")
 
-        # Parse quote-currency + DEX (BL-NEW-QUOTE-PAIR). The `or {}` guard
-        # handles `"quoteToken": null` API responses (matches priceChange
-        # pattern above; AttributeError if quote_token is None then .get()).
-        quote_token = data.get("quoteToken") or {}
+        # Parse quote-currency + DEX (BL-NEW-QUOTE-PAIR). Defensive isinstance
+        # guard handles `null` AND non-dict-truthy responses (string / list / int)
+        # — `or {}` alone would raise AttributeError on a malformed string-typed
+        # `quoteToken` and silently drop the entire pair via the broad-except in
+        # the DexScreener poller. R6 PR review MUST-FIX.
+        raw_quote = data.get("quoteToken")
+        quote_token = raw_quote if isinstance(raw_quote, dict) else {}
         quote_symbol = quote_token.get("symbol")
-        dex_id = data.get("dexId")
+        if not isinstance(quote_symbol, str):
+            quote_symbol = None
+        raw_dex_id = data.get("dexId")
+        dex_id = raw_dex_id if isinstance(raw_dex_id, str) else None
 
         return cls(
             contract_address=base_token.get("address", ""),

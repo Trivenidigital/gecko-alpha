@@ -16,6 +16,11 @@ _PRESERVE_FIELDS = [
     "vol_7d_avg",
     "txns_h1_buys",
     "txns_h1_sells",
+    # BL-NEW-QUOTE-PAIR: only DexScreener populates these — protect against
+    # last-write-wins null-out when a CG/GT entry for the same contract
+    # arrives later in the merge (R7 PR review MUST-FIX).
+    "quote_symbol",
+    "dex_id",
 ]
 
 
