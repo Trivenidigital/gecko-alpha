@@ -1152,12 +1152,31 @@ async def main(argv: list[str] | None = None) -> int:
             db=db,
         )
         live_kill_switch = KillSwitch(db)
+
+        # M1.5b: construct RoutingLayer when LIVE_USE_ROUTING_LAYER=True.
+        # When the flag is False (default), routing=None is passed and the
+        # engine's _dispatch_live branch is bypassed (M1.5a single-venue
+        # behavior preserved). When True, the engine's __init__ misconfig
+        # CRASH validates that LIVE_USE_REAL_SIGNED_REQUESTS is also True
+        # (design §2.2).
+        live_routing = None
+        if getattr(settings, "LIVE_USE_ROUTING_LAYER", False):
+            from scout.live.routing import RoutingLayer
+
+            live_routing = RoutingLayer(
+                db=db,
+                settings=settings,
+                adapters={"binance": live_adapter},
+            )
+            log.info("routing_layer_constructed", venues=["binance"])
+
         live_engine = LiveEngine(
             config=live_config,
             resolver=resolver,
             adapter=live_adapter,
             db=db,
             kill_switch=live_kill_switch,
+            routing=live_routing,
         )
         # Boot-time drift reconciliation + startup status (Task 16).
         await reconcile_open_shadow_trades(
