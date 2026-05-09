@@ -1,4 +1,6 @@
-**New primitives introduced:** New module `scout/live/binance_signing.py` exposing `sign_request(secret, params) → (params_with_signature, signature_header)` (HMAC-SHA256 over query-string `key=value&...&timestamp=...&recvWindow=...`); new methods on `BinanceSpotAdapter`: `_signed_get(path, params)` + `_signed_post(path, params)` (reuse the existing `_http_get` rate-limit gate + retry taxonomy + weight governor + signed-request error taxonomy on top — `-1021` Timestamp out-of-recvWindow / `-2014` Signature for input invalid / `-2015` Invalid API key, IP, or permissions for action). Runtime bodies for the 3 ABC stubs introduced in M1: `fetch_account_balance(asset)` (signed GET `/api/v3/account` parsing `balances[].free` for `asset`), `place_order_request(request)` (signed POST `/api/v3/order` with `newClientOrderId` from `idempotency.make_client_order_id` + pre-retry dedup via `idempotency.lookup_existing_order_id`), `await_fill_confirmation(*, venue_order_id, client_order_id, timeout_sec)` (signed GET `/api/v3/order` polled until terminal state `FILLED` / `PARTIALLY_FILLED` / `CANCELED` / `REJECTED` or timeout, fill_slippage_bps computed at confirmation against `mid_at_entry` recorded at `place_order_request` time and written to `live_trades.fill_slippage_bps`). New Gate 10 runtime body in `scout/live/gates.py` — replaces existing NotImplementedError with `await balance_gate.check_sufficient_balance(adapter, size_usd, margin_factor=1.1)` returning `GateResult(passed=False, reject_reason="insufficient_balance", detail=...)` on insufficient. New main.py startup smoke check: when `LIVE_MODE='live'` AND `LIVE_TRADING_ENABLED=True`, call `live_adapter.fetch_account_balance("USDT")` once at boot (5s timeout) — if it raises, refuse to start with a clear operator-facing message naming the auth/network failure mode. Replaces existing `balance gate not wired` NotImplementedError. Per V1 review fix: `LIVE_MODE='live' AND not LIVE_TRADING_ENABLED → RuntimeError("Layer 1 master kill")` lands here too as the second startup guard. Telegram approval gateway runtime hook NOT added (Layer 4 enforcement = M1.5b scope).
+**New primitives introduced:** New module `scout/live/binance_signing.py` exposing `sign_request(secret, params) → (params_with_signature, signature_header)` (HMAC-SHA256 over query-string). New `BinanceSpotAdapter._request(method, path, *, params, headers, signed)` core method — `_http_get` is refactored to delegate (per R1-C1 plan-stage finding); `_signed_get` + `_signed_post` are thin wrappers over `_request` that add HMAC + timestamp + recvWindow + auth-error taxonomy. New `BinanceAuthError` (auth failures `-2014`/`-2015`/`-1021`) and `BinanceIPBanError` (HTTP 418 — distinct from 429 transient rate-limit) exception classes. Runtime bodies for the 3 ABC stubs introduced in M1: `fetch_account_balance(asset)`, `place_order_request(request)` (idempotency-aware via `idempotency.make_client_order_id` + pre-retry `lookup_existing_order_id` + `IntegrityError` race handler + Binance `-2010` duplicate handling per R2-I2), `await_fill_confirmation(*, venue_order_id, client_order_id, timeout_sec)` (pre-loop symbol resolution via single `SELECT pair FROM live_trades WHERE client_order_id = ?` per R1-C4; venue-side polling with adaptive backoff; `fill_slippage_bps` computed at confirmation — semantic clarified per R2-C2: "drift-inclusive proxy" measuring `(fill_price/mid_at_entry - 1) * 10000` where `mid_at_entry` was sampled at `place_order_request` start; includes ~200-500ms of market drift between quote + fill, averages to ~0 across ≥30 samples in V1 approval-removal gate; column name `fill_slippage_bps` retained from M1 migration to avoid schema churn). New Gate 10 runtime body in `scout/live/gates.py` (top-of-module `from scout.live.balance_gate import check_sufficient_balance` per R1-I3). New main.py startup smoke check (5s timeout) gated on `LIVE_MODE='live'` — replaces M1's NotImplementedError. Per R2-C1 (systemd restart-loop fix): plan ALSO requires `gecko-pipeline.service` to have `RestartSec=30s` + `StartLimitBurst=3` — verified in new Task 7.5 BEFORE any LIVE_MODE flip. New `LIVE_USE_REAL_SIGNED_REQUESTS: bool = False` Settings flag (R2-I4 emergency-revert path) — when False, the 3 runtime bodies fall back to NotImplementedError as before; default False so post-deploy behavior is identical to M1 unless operator explicitly opts in. New `LIVE_STARTUP_NOTIFICATION_MIN_INTERVAL_SEC: int = 300` Settings field — rate-limits Telegram startup notification to ≤1 per 5 min (R2-I5 anti-spam under restart loop). Telegram approval gateway runtime hook NOT added (Layer 4 enforcement = M1.5b).
+
+**Plan-stage 2-reviewer pass folded 2026-05-09** — R1 (structural/code) + R2 (strategy/blast-radius). 6 R1 critical + 2 R2 critical + 9 important + 4 minor. All folded. See "AMENDMENTS" section at end of file for itemized resolution. Net plan delta: +1 task (Task 1.5: HTTP core refactor), +1 task (Task 7.5: systemd verification), 2 new Settings fields, expanded test matrix (-1021 timestamp / IntegrityError race / -2010 dedup / mid_at_entry NULL / partial-fill terminal / POST 5xx retry).
 
 # Live Trading Milestone 1.5a Implementation Plan — Binance REST Signing + Runtime Bodies
 
@@ -56,14 +58,59 @@ grep -c "from scout.live.binance_signing" scout/live/binance_adapter.py
 # Expected: 0 (signing module not yet imported — will land in Task 2)
 ```
 
-- [ ] **Step 3: Verify Binance API base + creds plumbing**
+- [ ] **Step 3: Verify Binance API base + creds plumbing — HARD PREREQ (R1-M4)**
 
 ```bash
 grep -E "_BASE_URL|api.binance.com|BINANCE_API_KEY" scout/live/binance_adapter.py | head -5
 grep "BINANCE_API_KEY\|BINANCE_API_SECRET" scout/config.py | head -3
 ```
 
-If creds plumbing is missing, that's a Task 1 prereq — flag and continue.
+**If creds plumbing is missing, STOP and report BLOCKED.** Plan does NOT introduce Settings fields for BINANCE_API_KEY / BINANCE_API_SECRET — they must already exist in `scout/config.py` from BL-055. If absent, fix that first as a separate ticket. (R1-M4: previous wording was "flag and continue" — this hardens it to fail-fast since Task 2 cannot proceed without these.)
+
+- [ ] **Step 4: Add 2 new Settings fields**
+
+In `scout/config.py`, add (mirror the BL-NEW-LIVE-HYBRID block from M1):
+
+```python
+    # M1.5a — gates the signed-endpoint runtime codepath. When False (default),
+    # the 3 ABC runtime bodies fall back to NotImplementedError for emergency
+    # revert without git revert. Operator flips True after balance smoke check
+    # passes on testnet (R2-I4).
+    LIVE_USE_REAL_SIGNED_REQUESTS: bool = False
+
+    # M1.5a — rate-limit the LIVE_TRADING_ENABLED=True startup Telegram alert
+    # to ≤1 per N seconds. Prevents alert-spam during systemd restart loops
+    # if the balance smoke check is flapping (R2-I5).
+    LIVE_STARTUP_NOTIFICATION_MIN_INTERVAL_SEC: int = 300
+```
+
+Plus a small validator on the second field (`> 0`).
+
+- [ ] **Step 5: Failing test for the 2 new Settings**
+
+Add to `tests/test_live_master_kill.py`:
+
+```python
+def test_live_use_real_signed_requests_defaults_off(self):
+    assert Settings(_env_file=None, **_REQUIRED).LIVE_USE_REAL_SIGNED_REQUESTS is False
+
+
+def test_live_startup_notification_min_interval_default(self):
+    assert Settings(_env_file=None, **_REQUIRED).LIVE_STARTUP_NOTIFICATION_MIN_INTERVAL_SEC == 300
+
+
+def test_live_startup_notification_min_interval_must_be_positive(self):
+    with pytest.raises(ValueError, match="must be > 0"):
+        Settings(_env_file=None, **_REQUIRED, LIVE_STARTUP_NOTIFICATION_MIN_INTERVAL_SEC=0)
+```
+
+- [ ] **Step 6: Run + commit**
+
+```bash
+uv run --native-tls pytest tests/test_live_master_kill.py -v
+git add scout/config.py tests/test_live_master_kill.py
+git commit -m "feat(live-m1.5a): 2 new Settings fields (revert flag + Telegram rate-limit) — Task 0"
+```
 
 ---
 
@@ -211,6 +258,157 @@ git commit -m "feat(live-m1.5a): Binance HMAC-SHA256 signing primitive (BL-NEW-L
 
 ---
 
+## Task 1.5: Refactor `_http_get` → `_request` core (R1-C1)
+
+**Files:**
+- Modify: `scout/live/binance_adapter.py`
+- Test: extend existing `tests/live/test_binance_adapter.py` (re-runs against the refactored core)
+
+**Why this task exists:** R1-C1 plan-stage finding caught that the original M1.5a plan duplicated `_http_get`'s retry loop, weight governor, and 429 handling inside `_signed_get` + `_signed_post`. Drift between the two retry paths is guaranteed unless they share a core. Task 1.5 introduces a shared `_request` method; Task 2 then implements `_signed_get`/`_signed_post` as thin wrappers.
+
+- [ ] **Step 1: Read existing `_http_get` (line 90-159) to understand the retry shape**
+
+```bash
+grep -A 70 "async def _http_get" scout/live/binance_adapter.py | head -80
+```
+
+- [ ] **Step 2: Extract `_request(method, path, *, params, headers, signed)` core**
+
+```python
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        signed: bool = False,  # signed callers pre-inject signature; flag exists
+                                # for future telemetry / weight differentiation
+    ) -> dict[str, Any]:
+        """Central Binance HTTP. Retry taxonomy + weight governor +
+        rate-limit gate + signed-vs-unsigned error mapping.
+
+        Returns parsed JSON body on 200. Returns sentinel `{"__code": -1121}`
+        on Binance 400+code=-1121 (unknown symbol — preserved from M1
+        contract). Raises:
+          - BinanceAuthError on -2014/-2015/-1021 (signed callers only)
+          - BinanceIPBanError on HTTP 418 (R1-I1)
+          - VenueTransientError on 5xx, network, max retries
+        """
+        await self._rate_limit_gate.wait()
+        url = f"{_BASE_URL}{path}"
+        last_exc: Exception | None = None
+        for attempt in range(len(_BACKOFFS) + 1):
+            try:
+                if method == "GET":
+                    cm = self._session.get(url, params=params, headers=headers)
+                elif method == "POST":
+                    cm = self._session.post(url, params=params, headers=headers)
+                else:
+                    raise ValueError(f"Unsupported method: {method}")
+                async with cm as resp:
+                    weight = int(resp.headers.get("X-MBX-USED-WEIGHT-1M", 0))
+                    await self._update_weight_governor(weight)
+                    if resp.status == 200:
+                        return await resp.json()
+                    if resp.status == 418:
+                        # IP-ban — distinct from 429 (R1-I1)
+                        body = await resp.json()
+                        raise BinanceIPBanError(
+                            f"{method} {path}: 418 IP-banned: {body}"
+                        )
+                    if resp.status == 429:
+                        retry_after = resp.headers.get("Retry-After")
+                        await asyncio.sleep(
+                            int(retry_after)
+                            if retry_after
+                            else (
+                                _BACKOFFS[attempt]
+                                if attempt < len(_BACKOFFS)
+                                else 8
+                            )
+                        )
+                        continue
+                    body = await resp.json()
+                    code = body.get("code") if isinstance(body, dict) else None
+                    if code == -1121:
+                        # Unknown symbol — preserve M1 sentinel contract
+                        return {"__code": -1121}
+                    if signed and code in (-2014, -2015, -1021):
+                        raise BinanceAuthError(
+                            f"{method} {path} failed code={code} msg={body.get('msg')!r}"
+                        )
+                    if signed and code == -2010:
+                        # Duplicate clientOrderId (R2-I2 dedup race) — surface
+                        # as a typed exception so caller can recover via
+                        # origClientOrderId lookup instead of treating as
+                        # transient. Caller is responsible for re-querying
+                        # the existing order.
+                        raise BinanceDuplicateOrderError(
+                            f"duplicate newClientOrderId: {body.get('msg')!r}"
+                        )
+                    if resp.status >= 500:
+                        if attempt < len(_BACKOFFS):
+                            await asyncio.sleep(_BACKOFFS[attempt])
+                            continue
+                    raise VenueTransientError(
+                        f"{method} {path}: {resp.status} {body}"
+                    )
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+            ) as exc:
+                last_exc = exc
+                if attempt < len(_BACKOFFS):
+                    await asyncio.sleep(_BACKOFFS[attempt])
+                    continue
+                break
+        if last_exc:
+            raise VenueTransientError(f"{method} {path}: {last_exc}") from last_exc
+        raise VenueTransientError(f"{method} {path}: max retries exceeded")
+```
+
+Add new exception classes near the top of binance_adapter.py:
+
+```python
+class BinanceAuthError(Exception):
+    """-2014/-2015/-1021 — never retry."""
+
+
+class BinanceIPBanError(Exception):
+    """HTTP 418 — distinct from 429; back off minutes-to-hours."""
+
+
+class BinanceDuplicateOrderError(Exception):
+    """-2010 — duplicate newClientOrderId; caller recovers via origClientOrderId lookup."""
+```
+
+- [ ] **Step 3: Refactor `_http_get` to delegate**
+
+```python
+    async def _http_get(
+        self, path: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Public unsigned GET — back-compat wrapper over `_request`."""
+        return await self._request("GET", path, params=params, signed=False)
+```
+
+- [ ] **Step 4: Run existing BL-055 tests — expect all pass (no regression)**
+
+```bash
+uv run --native-tls pytest tests/live/test_binance_adapter.py -v
+```
+
+(May hit Windows OpenSSL crash — that's pre-existing, not regression.)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git commit -am "refactor(binance_adapter): extract _request core for signed-vs-unsigned share — Task 1.5"
+```
+
+---
+
 ## Task 2: `_signed_get` + `_signed_post` helpers on BinanceSpotAdapter
 
 **Files:**
@@ -327,133 +525,124 @@ async def test_signed_get_raises_on_signature_invalid():
 
 - [ ] **Step 2: Run — expect 4 FAILs**
 
-- [ ] **Step 3: Implement `_signed_get` + `_signed_post`**
+- [ ] **Step 3: Implement `_signed_get` + `_signed_post` as thin wrappers over `_request` (R1-C1, R1-C2)**
 
-In `scout/live/binance_adapter.py`, add (next to `_http_get`):
+`BinanceAuthError`, `BinanceIPBanError`, `BinanceDuplicateOrderError` are added in Task 1.5. `_request` is the shared core. `_signed_get` and `_signed_post` only handle signature injection + sign-specific parameter setup; retry/weight/418/429 all live in `_request`.
 
 ```python
     async def _signed_get(
         self, path: str, *, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Central Binance signed GET (USER_DATA / TRADE endpoints).
-
-        Reuses _http_get's rate-limit gate + retry taxonomy + weight
-        governor. Adds: timestamp + recvWindow injection, HMAC-SHA256
-        signature, X-MBX-APIKEY header.
-
-        Raises specific exception on -2014 (signature) / -2015 (auth)
-        / -1021 (timestamp) so callers can distinguish auth failures
-        from transient errors.
-        """
+        """Signed GET — adds HMAC + timestamp + recvWindow + X-MBX-APIKEY.
+        All retry/weight/auth-error logic lives in `_request`."""
         from scout.live.binance_signing import sign_request
-
-        await self._rate_limit_gate.wait()
-        url = f"{_BASE_URL}{path}"
 
         body_params = dict(params or {})
         body_params["timestamp"] = int(time.time() * 1000)
         body_params["recvWindow"] = 5000
-
         signed_params, _sig = sign_request(
             self._settings.BINANCE_API_SECRET, body_params
         )
         headers = {"X-MBX-APIKEY": self._settings.BINANCE_API_KEY}
-
-        last_exc: Exception | None = None
-        for attempt in range(len(_BACKOFFS) + 1):
-            try:
-                async with self._session.get(
-                    url, params=signed_params, headers=headers
-                ) as resp:
-                    weight = int(resp.headers.get("X-MBX-USED-WEIGHT-1M", 0))
-                    await self._update_weight_governor(weight)
-                    if resp.status == 200:
-                        return await resp.json()
-                    body = await resp.json()
-                    code = body.get("code") if isinstance(body, dict) else None
-                    if code in (-2014, -2015, -1021):
-                        # Auth-level failure — never retry
-                        raise BinanceAuthError(
-                            f"signed_get {path} failed with code={code} "
-                            f"msg={body.get('msg')!r}"
-                        )
-                    if resp.status == 429:
-                        # Rate-limit; honor Retry-After if present
-                        retry_after = resp.headers.get("Retry-After")
-                        await asyncio.sleep(
-                            int(retry_after) if retry_after else _BACKOFFS[attempt]
-                            if attempt < len(_BACKOFFS) else 8
-                        )
-                        continue
-                    if resp.status >= 500:
-                        # Transient — retry
-                        if attempt < len(_BACKOFFS):
-                            await asyncio.sleep(_BACKOFFS[attempt])
-                            continue
-                    # Other 4xx — non-retryable, surface
-                    raise VenueTransientError(
-                        f"signed_get {path}: {resp.status} {body}"
-                    )
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                last_exc = exc
-                if attempt < len(_BACKOFFS):
-                    await asyncio.sleep(_BACKOFFS[attempt])
-                    continue
-                break
-        if last_exc:
-            raise VenueTransientError(f"signed_get {path}: {last_exc}") from last_exc
-        raise VenueTransientError(f"signed_get {path}: max retries exceeded")
+        return await self._request(
+            "GET", path, params=signed_params, headers=headers, signed=True
+        )
 
 
     async def _signed_post(
         self, path: str, *, params: dict[str, Any]
     ) -> dict[str, Any]:
-        """Central Binance signed POST (TRADE endpoints).
-
-        Mirrors _signed_get but uses POST + form-encoded body. Same
-        signature scheme (params + timestamp + recvWindow → HMAC).
-        """
+        """Signed POST — same signature scheme as _signed_get; full retry +
+        5xx handling inherited from `_request` (R1-C2 fix — original plan
+        had no retry for POST, leaking 503s as fatal)."""
         from scout.live.binance_signing import sign_request
 
-        await self._rate_limit_gate.wait()
-        url = f"{_BASE_URL}{path}"
-
-        body_params = dict(params or {})
+        body_params = dict(params)
         body_params["timestamp"] = int(time.time() * 1000)
         body_params["recvWindow"] = 5000
-
         signed_params, _sig = sign_request(
             self._settings.BINANCE_API_SECRET, body_params
         )
         headers = {"X-MBX-APIKEY": self._settings.BINANCE_API_KEY}
-
-        # Binance accepts POST signed params in the query string OR body;
-        # use query string so the same signing path serves both methods.
-        async with self._session.post(
-            url, params=signed_params, headers=headers
-        ) as resp:
-            body = await resp.json()
-            if resp.status == 200:
-                return body
-            code = body.get("code") if isinstance(body, dict) else None
-            if code in (-2014, -2015, -1021):
-                raise BinanceAuthError(
-                    f"signed_post {path} failed with code={code} "
-                    f"msg={body.get('msg')!r}"
-                )
-            raise VenueTransientError(
-                f"signed_post {path}: {resp.status} {body}"
-            )
+        return await self._request(
+            "POST", path, params=signed_params, headers=headers, signed=True
+        )
 ```
 
-Add a new exception class at the top of binance_adapter.py:
+The 3 exception classes (`BinanceAuthError`, `BinanceIPBanError`, `BinanceDuplicateOrderError`) ALREADY exist near the top of `binance_adapter.py` from Task 1.5 — DO NOT add them again here.
+
+- [ ] **Step 3.5: Add tests for the auth-error matrix expansion (R1 test gap)**
+
+Add to `tests/test_live_binance_adapter_signed.py`:
 
 ```python
-class BinanceAuthError(Exception):
-    """Raised on Binance signed-endpoint auth/signature failures (-2014/-2015/-1021).
-    Distinct from VenueTransientError so callers don't retry."""
-    pass
+@pytest.mark.asyncio
+async def test_signed_get_raises_on_timestamp_drift():
+    """Binance error -1021 (Timestamp out-of-recvWindow) — common in prod
+    on clock skew; must surface as BinanceAuthError (not retry)."""
+    s = _settings()
+    adapter = BinanceSpotAdapter(s, db=None)
+    with aioresponses() as m:
+        m.get(
+            "https://api.binance.com/api/v3/account",
+            status=400,
+            payload={"code": -1021, "msg": "Timestamp for this request is outside of the recvWindow"},
+        )
+        from scout.live.binance_adapter import BinanceAuthError
+        with pytest.raises(BinanceAuthError) as excinfo:
+            await adapter._signed_get("/api/v3/account", params={})
+        assert "1021" in str(excinfo.value)
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_signed_endpoint_raises_ip_ban_on_418():
+    """HTTP 418 → BinanceIPBanError (distinct from 429 retry-able)."""
+    s = _settings()
+    adapter = BinanceSpotAdapter(s, db=None)
+    with aioresponses() as m:
+        m.get(
+            "https://api.binance.com/api/v3/account",
+            status=418,
+            payload={"code": -1003, "msg": "Way too much request weight used"},
+        )
+        from scout.live.binance_adapter import BinanceIPBanError
+        with pytest.raises(BinanceIPBanError):
+            await adapter._signed_get("/api/v3/account", params={})
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_signed_post_retries_on_5xx():
+    """POST must tolerate transient 5xx (R1-C2 fix). One 503 then 200 →
+    success, not crash."""
+    s = _settings()
+    adapter = BinanceSpotAdapter(s, db=None)
+    with aioresponses() as m:
+        m.post(
+            "https://api.binance.com/api/v3/order",
+            status=503,
+            payload={"code": -1000, "msg": "transient"},
+        )
+        m.post(
+            "https://api.binance.com/api/v3/order",
+            payload={"orderId": 12345, "status": "NEW"},
+        )
+        result = await adapter._signed_post(
+            "/api/v3/order",
+            params={
+                "symbol": "BTCUSDT",
+                "side": "BUY",
+                "type": "MARKET",
+                "quoteOrderQty": "10",
+                "newClientOrderId": "gecko-1-abcd1234",
+            },
+        )
+        assert result["orderId"] == 12345
+    await adapter.close()
 ```
+
+**Windows OpenSSL test gotcha note (R1-I5):** these aiohttp-based tests will not run on Windows due to pre-existing OpenSSL Applink crash. They run on CI Linux runners. For local-Windows test coverage, the implementer adds a parallel set of source-text-inspection tests OR uses `aioresponses` with a stub-session pattern. Pre-existing convention in `tests/test_live_balance_gate.py:13-26` uses stub-adapter pattern — mirror that for cross-platform smoke tests on the runtime-body call paths.
 
 - [ ] **Step 4: Run — expect 4 PASS**
 
@@ -550,6 +739,13 @@ git commit -am "feat(live-m1.5a): fetch_account_balance runtime body (BL-NEW-LIV
 ---
 
 ## Task 4: `place_order_request` runtime body (idempotency-aware)
+
+**Plan-stage 2-reviewer fixes folded (R1-C3, R1-C6, R1-I2, R2-I2):** see AMENDMENTS A4 at end of file. Implementer MUST:
+- Wrap `record_pending_order(...)` in `try/except sqlite3.IntegrityError` and re-call `lookup_existing_order_id` on collision (R1-C3)
+- Reject empty/missing `orderId` from Binance response with `VenueTransientError` — never persist `entry_order_id=""` (R1-C6)
+- Acquire `db._txn_lock` around the `UPDATE live_trades SET entry_order_id` (R1-I2)
+- Catch `BinanceDuplicateOrderError` from `_signed_post` (-2010 means our retry collided with a successful Binance submit on the previous attempt) — recover by signed GET on `origClientOrderId`, extract `orderId`, persist, return (R2-I2)
+- Gate the entire signed codepath behind `if self._settings.LIVE_USE_REAL_SIGNED_REQUESTS:` — when False, raise NotImplementedError as before (R2-I4 emergency-revert)
 
 **Files:**
 - Modify: `scout/live/binance_adapter.py`
@@ -754,6 +950,13 @@ git commit -am "feat(live-m1.5a): place_order_request runtime body with idempote
 ---
 
 ## Task 5: `await_fill_confirmation` runtime body + slippage compute
+
+**Plan-stage 2-reviewer fixes folded (R1-C4, R1-C5, R2-C2):** see AMENDMENTS A5 at end of file. Implementer MUST:
+- Resolve `symbol` ONCE via `SELECT pair FROM live_trades WHERE client_order_id = ?` BEFORE entering the poll loop — cache the string + reuse (R1-C4 — original plan's `_symbol_from_cid` returning empty string was a known-incomplete that would have broken every poll)
+- Mark `_extract_avg_fill_price` as a SYNC helper (no `async`/`await`) — original plan had async with no await body; calls were missing `await` (R1-C5)
+- Treat `PARTIALLY_FILLED` as terminal-with-warning (return immediately with `status='partial'`); document that engine layer is responsible for follow-up reconciliation if Binance later cancels the unfilled remainder (M2 reconciliation worker scope)
+- Wrap `_write_slippage_bps` UPDATE in `db._txn_lock`
+- Document the `fill_slippage_bps` semantic clearly in docstring + AMENDMENTS A5: it includes ~200-500ms market drift between `place_order_request`'s `fetch_depth` and the actual fill — measures "drift-inclusive slippage proxy", NOT pure venue execution slippage (R2-C2). Column name retained from M1 migration to avoid schema churn. V1 review's approval-removal gate uses median of 30 fills which averages drift to ~0.
 
 **Files:**
 - Modify: `scout/live/binance_adapter.py`
@@ -1013,6 +1216,8 @@ git commit -am "feat(live-m1.5a): await_fill_confirmation runtime body + slippag
 
 ## Task 6: Wire balance_gate into Gates Gate 10
 
+**Plan-stage 2-reviewer fixes folded (R1-I3):** move `from scout.live.balance_gate import check_sufficient_balance` to top of `scout/live/gates.py` (matches existing convention at gates.py:28-31). Lazy import inside the gate body is a code smell — there's no circular dependency to dodge (balance_gate doesn't import gates).
+
 **Files:**
 - Modify: `scout/live/gates.py`
 - Test: `tests/test_live_gates_balance_runtime.py` (NEW)
@@ -1102,6 +1307,11 @@ git commit -am "feat(live-m1.5a): Gate 10 balance runtime (replaces M1 NotImplem
 ---
 
 ## Task 7: main.py startup — Layer 1 + balance smoke check
+
+**Plan-stage 2-reviewer fixes folded (R1-I4, R2-I1, R2-I5):** see AMENDMENTS A7. Implementer MUST:
+- Drop redundant `except (asyncio.TimeoutError, Exception)` — `Exception` already catches `TimeoutError`. Use single `except Exception as exc:` after the explicit `except BinanceAuthError` branch (R1-I4)
+- Add operator-facing message to Step 7 post-deploy smoke instructions: "**M1.5a smoke pass ≠ live ready.** Approval-gate runtime call (V1-C1) + correction-counter increment on close (V1-C2) are M1.5b. Do NOT flip `live_eligible=1` for any signal until M1.5b ships." (R2-I1)
+- Apply Telegram startup notification rate-limit (R2-I5): query `paper_migrations` table for last_startup_notification timestamp; skip the alert if `< LIVE_STARTUP_NOTIFICATION_MIN_INTERVAL_SEC` ago. Use `paper_migrations` since it already exists; key name `live_startup_notification_last_sent`. Default 300s (5 min) prevents Telegram spam during systemd restart loop (R2-C1 mitigation)
 
 **Files:**
 - Modify: `scout/main.py`
@@ -1200,6 +1410,90 @@ In the `if live_config.mode == "live":` block, replace the existing NotImplement
 
 ```bash
 git commit -am "feat(live-m1.5a): main.py startup balance smoke check + Layer 1 guard (BL-NEW-LIVE-HYBRID M1.5a Task 7)"
+```
+
+---
+
+## Task 7.5: systemd unit hardening — RestartSec + StartLimitBurst (R2-C1)
+
+**Why this task exists:** R2-C1 plan-stage finding caught that smoke-check failure in main.py raises `RuntimeError` → systemd default `Restart=on-failure` + no backoff = sub-second restart loop hitting Binance auth at 50+ req/s within minutes → IP-ban risk. M1.5a deploy MUST land alongside systemd unit hardening.
+
+**Files:**
+- VPS-side: `/etc/systemd/system/gecko-pipeline.service` (operator-edited)
+- Repo-side: documentation in `docs/runbooks/live-trading-deploy.md` (NEW or extend existing)
+
+- [ ] **Step 1: Inspect current unit file**
+
+```bash
+ssh root@89.167.116.187 'systemctl cat gecko-pipeline.service' > .ssh_systemd_current.txt 2>&1
+```
+
+Read the output. Look for `[Service]` block fields: `Restart`, `RestartSec`, `StartLimitBurst`, `StartLimitIntervalSec`.
+
+- [ ] **Step 2: Patch unit file**
+
+Required `[Service]` block fields:
+
+```ini
+Restart=on-failure
+RestartSec=30s
+StartLimitBurst=3
+StartLimitIntervalSec=300s
+```
+
+This means: on failure, wait 30s before restart. Allow at most 3 restart attempts in 300s (5 min). Beyond that, systemd marks the service `failed` and stops trying — operator must manually intervene with `systemctl reset-failed gecko-pipeline && systemctl start gecko-pipeline` after fixing root cause.
+
+```bash
+# On VPS (operator-side):
+sudo systemctl edit gecko-pipeline.service
+# Add the 4 fields under [Service]
+sudo systemctl daemon-reload
+sudo systemctl restart gecko-pipeline
+```
+
+- [ ] **Step 3: Verify**
+
+```bash
+ssh root@89.167.116.187 'systemctl show gecko-pipeline.service | grep -E "Restart=|RestartSec=|StartLimitBurst=|StartLimitIntervalSec="' > .ssh_systemd_verify.txt 2>&1
+```
+
+Expected output:
+```
+Restart=on-failure
+RestartSec=30000000
+StartLimitBurst=3
+StartLimitIntervalUSec=5min
+```
+
+- [ ] **Step 4: Document in runbook**
+
+Add to `docs/runbooks/live-trading-deploy.md` (create if missing):
+
+```markdown
+## systemd unit requirements for LIVE_MODE='live'
+
+Before flipping LIVE_MODE='live', the gecko-pipeline.service unit
+MUST have:
+
+- Restart=on-failure
+- RestartSec=30s         # 30s backoff prevents Binance IP-ban
+- StartLimitBurst=3      # max 3 restart attempts
+- StartLimitIntervalSec=300s  # before systemd gives up
+
+If the smoke check fails 3 times in 5 min, systemd marks the service
+'failed' and stops trying. Operator wakes up to a dead pipeline (not a
+50-req/s loop hitting Binance auth) and must:
+  1. Investigate failure mode (auth / network / IP whitelist)
+  2. Fix root cause
+  3. systemctl reset-failed gecko-pipeline
+  4. systemctl start gecko-pipeline
+```
+
+- [ ] **Step 5: Commit doc + add to deploy checklist**
+
+```bash
+git add docs/runbooks/live-trading-deploy.md
+git commit -m "docs(live-m1.5a): systemd hardening runbook (RestartSec + StartLimitBurst) — Task 7.5"
 ```
 
 ---
@@ -1305,3 +1599,82 @@ V2 review's I1-I4 + hidden seam still apply post-M1.5a:
 - Hidden seam: no staleness gate on `venue_health.probe_at`
 
 Bundle into M1.5b PR or separate cleanup PR.
+
+---
+
+## AMENDMENTS — plan-stage 2-reviewer findings folded 2026-05-09
+
+R1 (structural/code) + R2 (strategy/blast-radius) returned with 6 R1 critical + 2 R2 critical + 9 important + 4 minor. Itemized resolution:
+
+### R1 Critical
+
+| ID | Finding | Resolution location |
+|---|---|---|
+| R1-C1 | `_signed_get` duplicated `_http_get` retry loop | NEW Task 1.5 (refactor `_request` core); Task 2 Step 3 rewrites helpers as thin wrappers |
+| R1-C2 | `_signed_post` skipped retry entirely | Task 1.5 `_request` covers POST 5xx retry path; Task 2 Step 3.5 adds explicit test |
+| R1-C3 | Idempotency race: concurrent INSERT not caught | Task 4 inline pointer A4 — `try/except sqlite3.IntegrityError` + re-call lookup |
+| R1-C4 | `_symbol_from_cid` returned empty string (broken) | Task 5 inline pointer A5 — pre-loop `SELECT pair FROM live_trades WHERE client_order_id = ?` cached |
+| R1-C5 | `_extract_avg_fill_price` async-no-await mismatch | Task 5 inline pointer A5 — sync helper, drop `async` |
+| R1-C6 | Empty-string `orderId` fallback poisons dedup | Task 4 inline pointer A4 — raise `VenueTransientError` if missing |
+
+### R2 Critical
+
+| ID | Finding | Resolution location |
+|---|---|---|
+| R2-C1 | Smoke-check fail → infinite systemd restart loop | NEW Task 7.5 (systemd unit hardening: `RestartSec=30s`, `StartLimitBurst=3`, runbook) |
+| R2-C2 | `fill_slippage_bps` semantic conflates drift + execution | Task 5 inline pointer A5 — column name retained, docstring + plan §0 clarify "drift-inclusive proxy"; V1 review's median-of-30 averages drift to ~0 |
+
+### R1 Important
+
+| ID | Finding | Resolution location |
+|---|---|---|
+| R1-I1 | 418 IP-ban not handled | Task 1.5 `_request` raises `BinanceIPBanError` on 418 |
+| R1-I2 | `db._txn_lock` not acquired around UPDATE | Task 4 + Task 5 inline pointers — wrap UPDATEs in `async with self._db._txn_lock:` |
+| R1-I3 | Gate 10 lazy import code smell | Task 6 inline pointer — top-of-module `from scout.live.balance_gate import` |
+| R1-I4 | Redundant `except (asyncio.TimeoutError, Exception)` | Task 7 inline pointer A7 — single `except Exception` after explicit `BinanceAuthError` |
+| R1-I5 | Tests-on-Windows OpenSSL gotcha | Task 2 Step 3.5 note — implementer adds source-text-inspection or stub-adapter parallel tests for cross-platform; aiohttp tests OK on CI Linux |
+| R1-I6 | Test fixture leakage | Implementer reuses `tests/conftest.py:60 settings_factory` — no inline duplication |
+
+### R2 Important
+
+| ID | Finding | Resolution location |
+|---|---|---|
+| R2-I1 | Operator might think smoke-pass = live-ready | Task 7 inline pointer A7 — explicit "smoke pass ≠ live ready; M1.5b wires V1-C1+C2" message |
+| R2-I2 | `_signed_post` doesn't handle -2010 (duplicate cid) | Task 1.5 `_request` raises `BinanceDuplicateOrderError`; Task 4 catches it, recovers via `origClientOrderId` lookup |
+| R2-I3 | Weight governor — signed endpoints heavier (M1.5b consideration) | Acknowledged as M1.5b scope; not blocking M1.5a |
+| R2-I4 | No fast revert path | NEW Settings field `LIVE_USE_REAL_SIGNED_REQUESTS: bool = False` (Task 0 Step 4); when False, runtime bodies fall back to NotImplementedError |
+| R2-I5 | Telegram startup notification spam under restart loop | NEW Settings field `LIVE_STARTUP_NOTIFICATION_MIN_INTERVAL_SEC: int = 300` (Task 0 Step 4); Task 7 inline pointer A7 — query `paper_migrations` for last_sent timestamp |
+
+### R1 Minor
+
+| ID | Finding | Resolution location |
+|---|---|---|
+| R1-M1 | Done-criteria off-by-one count | Task 9 done-criteria edited inline (3 stubs not 4) |
+| R1-M2 | Slippage write race documented but not gated | Task 5 inline — txn_lock acquired (R1-I2 covers) |
+| R1-M3 | `--native-tls` flag in test commands | Documented as Windows TLS workaround; CI Linux runs without it. Acceptable plan-document divergence. |
+| R1-M4 | Step 0 prereq was "flag and continue" | Task 0 Step 3 edited inline — hardened to STOP / report BLOCKED |
+
+### Test matrix expansion (R1 + R2)
+
+Implementer adds these tests beyond the original plan's set:
+
+- `test_signed_get_raises_on_timestamp_drift` — -1021 path (Task 2 Step 3.5)
+- `test_signed_endpoint_raises_ip_ban_on_418` — 418 distinct from 429 (Task 2 Step 3.5)
+- `test_signed_post_retries_on_5xx` — POST 5xx tolerance (Task 2 Step 3.5)
+- `test_place_order_request_handles_integrity_error_race` — concurrent INSERT collision (Task 4 extension)
+- `test_place_order_request_handles_duplicate_order_2010` — Binance dedup recovery (Task 4 extension)
+- `test_place_order_request_rejects_empty_order_id` — orderId fallback safety (Task 4 extension)
+- `test_await_fill_confirmation_resolves_symbol_from_db_once` — pre-loop SELECT cached (Task 5 extension)
+- `test_await_fill_confirmation_skips_slippage_write_when_mid_null` — graceful skip (Task 5 extension)
+- `test_smoke_check_failure_does_not_create_runtime_dependency_on_db` — main.py recovery (Task 7 extension)
+
+### Net plan delta
+
+- +2 new tasks (1.5 + 7.5)
+- +2 new Settings fields (`LIVE_USE_REAL_SIGNED_REQUESTS`, `LIVE_STARTUP_NOTIFICATION_MIN_INTERVAL_SEC`)
+- +9 test cases beyond original plan
+- +1 documentation file (`docs/runbooks/live-trading-deploy.md`)
+- +1 dependency on systemd unit hardening (operator-side)
+- 0 new schema migrations (M1.5a still migration-free)
+
+Net plan size: ~50 → ~70 implementation steps. Same 9-task structure remains the primary frame; Task 1.5 + 7.5 are additions.
