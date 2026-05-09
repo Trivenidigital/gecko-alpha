@@ -641,11 +641,48 @@ async def test_live_mode_routing_layer_off_does_not_call_routing(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_engine_init_warns_when_routing_flag_set_but_layer_none(tmp_path, caplog):
-    """R1-I5 regression: structlog WARN emitted when mode='live' AND
-    LIVE_USE_ROUTING_LAYER=True AND routing=None at construction."""
-    # ... construct engine with mode='live', flag=True, routing=None ...
-    # ... assert 'live_routing_flag_set_but_layer_missing' event emitted
+async def test_dispatch_live_status_rejected_no_counter(tmp_path):
+    """R1-I2 fold: status='rejected' (CANCELED/EXPIRED/REJECTED maps) →
+    counter NOT incremented."""
+
+
+@pytest.mark.asyncio
+async def test_dispatch_live_binance_auth_error_engages_killswitch(tmp_path):
+    """R1-M1 fold: BinanceAuthError mid-session (Gates already approved)
+    → KillSwitch.engage(reason='binance_auth_revoked_mid_session')."""
+
+
+@pytest.mark.asyncio
+async def test_dispatch_live_picks_highest_health_score(tmp_path):
+    """R1-I2 fold: multi-candidate, dispatch picks highest venue_health_score
+    (NOT just [0]). Construct 3 candidates with scores [0.4, 0.9, 0.6]."""
+
+
+@pytest.mark.asyncio
+async def test_dispatch_live_no_venue_writes_reject_row(tmp_path):
+    """R2-M1 / Q2 fold: empty candidates → live_trades row inserted
+    with status='rejected', reject_reason='no_venue'."""
+
+
+@pytest.mark.asyncio
+async def test_engine_init_crashes_on_routing_without_signed(tmp_path):
+    """R2-C1 + design §2.2 fold: LIVE_USE_ROUTING_LAYER=True AND
+    LIVE_USE_REAL_SIGNED_REQUESTS=False → RuntimeError at __init__."""
+    with pytest.raises(RuntimeError, match="LIVE_USE_REAL_SIGNED_REQUESTS=False"):
+        LiveEngine(...)
+
+
+@pytest.mark.asyncio
+async def test_engine_init_crashes_on_routing_flag_without_layer(tmp_path):
+    """R2-I3 + R1-M2 + design §2.2 fold: LIVE_USE_ROUTING_LAYER=True
+    AND routing=None → RuntimeError at __init__."""
+    with pytest.raises(RuntimeError, match="routing=None"):
+        LiveEngine(routing=None, ...)
+
+
+@pytest.mark.asyncio
+async def test_engine_init_no_crash_under_shadow_mode(tmp_path):
+    """Shadow mode exempt from the misconfig CRASH (no live dispatches)."""
 
 
 @pytest.mark.asyncio
