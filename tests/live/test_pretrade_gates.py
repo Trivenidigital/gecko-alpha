@@ -402,7 +402,9 @@ async def test_gate_balance_returns_live_signed_disabled_in_live_mode(tmp_path):
     balance shortage."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    settings = _settings(LIVE_MODE="live")  # LIVE_USE_REAL_SIGNED_REQUESTS defaults False
+    settings = _settings(
+        LIVE_MODE="live"
+    )  # LIVE_USE_REAL_SIGNED_REQUESTS defaults False
     gates = await _make_gates(db, settings=settings)
     result, _venue = await gates.evaluate(
         signal_type="first_signal",

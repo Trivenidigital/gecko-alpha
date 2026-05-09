@@ -398,6 +398,15 @@ class Settings(BaseSettings):
     # Operator flips True after balance smoke check passes on testnet.
     LIVE_USE_REAL_SIGNED_REQUESTS: bool = False
 
+    # M1.5b — gates the multi-venue routing layer dispatch in LiveEngine.
+    # When False (default), engine falls back to M1.5a's single-venue path
+    # and _dispatch_live is not invoked. Operator opts in by flipping True
+    # after observing 1-3 successful place_order_request + await_fill cycles
+    # in live mode. Engine __init__ raises RuntimeError if this is True
+    # AND LIVE_USE_REAL_SIGNED_REQUESTS=False (silent no-op misconfig CRASH
+    # per design §2.2).
+    LIVE_USE_ROUTING_LAYER: bool = False
+
     # Credentials (live mode only; never in .env.example — see spec §4.4)
     BINANCE_API_KEY: SecretStr | None = None
     BINANCE_API_SECRET: SecretStr | None = None
