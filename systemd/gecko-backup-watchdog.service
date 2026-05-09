@@ -1,0 +1,21 @@
+[Unit]
+Description=Gecko-Alpha — alert if backup rotation is stale
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=GECKO_BACKUP_STALE_AFTER_SEC=172800
+Environment=GECKO_BACKUP_HEARTBEAT_FILE=/var/lib/gecko-alpha/backup-last-ok
+Environment=GECKO_REPO=/root/gecko-alpha
+Environment=UV_BIN=/root/.local/bin/uv
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/usr/bin/test -x /usr/local/bin/gecko-backup-watchdog.sh
+ExecStartPre=/usr/bin/test -x /root/.local/bin/uv
+ExecStart=/usr/local/bin/gecko-backup-watchdog.sh
+TimeoutStartSec=60
+StandardOutput=journal
+StandardError=journal
