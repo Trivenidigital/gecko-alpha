@@ -115,7 +115,10 @@ async def test_engine_init_crashes_on_routing_without_signed(tmp_path):
     await db.initialize()
     with pytest.raises(RuntimeError, match="LIVE_USE_REAL_SIGNED_REQUESTS=False"):
         await _make_engine(
-            db, mode="live", routing_flag=True, signed_flag=False,
+            db,
+            mode="live",
+            routing_flag=True,
+            signed_flag=False,
             routing=MagicMock(),
         )
     await db.close()
@@ -129,7 +132,11 @@ async def test_engine_init_crashes_on_routing_flag_without_layer(tmp_path):
     await db.initialize()
     with pytest.raises(RuntimeError, match="routing=None"):
         await _make_engine(
-            db, mode="live", routing_flag=True, signed_flag=True, routing=None,
+            db,
+            mode="live",
+            routing_flag=True,
+            signed_flag=True,
+            routing=None,
         )
     await db.close()
 
@@ -140,7 +147,11 @@ async def test_engine_init_no_crash_under_shadow_mode(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
     engine = await _make_engine(
-        db, mode="shadow", routing_flag=True, signed_flag=False, routing=None,
+        db,
+        mode="shadow",
+        routing_flag=True,
+        signed_flag=False,
+        routing=None,
     )
     assert engine is not None
     await db.close()
@@ -223,9 +234,7 @@ async def test_dispatch_live_no_counter_on_partial(tmp_path):
     engine = await _make_engine(db, routing=routing, adapter=adapter)
     pt = _make_paper_trade()
     await engine._dispatch_live(paper_trade=pt, size_usd=10.0)
-    cur = await db._conn.execute(
-        "SELECT COUNT(*) FROM signal_venue_correction_count"
-    )
+    cur = await db._conn.execute("SELECT COUNT(*) FROM signal_venue_correction_count")
     row = await cur.fetchone()
     assert row[0] == 0
     await db.close()
@@ -253,9 +262,7 @@ async def test_dispatch_live_no_counter_on_timeout(tmp_path):
     engine = await _make_engine(db, routing=routing, adapter=adapter)
     pt = _make_paper_trade()
     await engine._dispatch_live(paper_trade=pt, size_usd=10.0)
-    cur = await db._conn.execute(
-        "SELECT COUNT(*) FROM signal_venue_correction_count"
-    )
+    cur = await db._conn.execute("SELECT COUNT(*) FROM signal_venue_correction_count")
     assert (await cur.fetchone())[0] == 0
     await db.close()
 
@@ -283,9 +290,7 @@ async def test_dispatch_live_status_rejected_no_counter(tmp_path):
     engine = await _make_engine(db, routing=routing, adapter=adapter)
     pt = _make_paper_trade()
     await engine._dispatch_live(paper_trade=pt, size_usd=10.0)
-    cur = await db._conn.execute(
-        "SELECT COUNT(*) FROM signal_venue_correction_count"
-    )
+    cur = await db._conn.execute("SELECT COUNT(*) FROM signal_venue_correction_count")
     assert (await cur.fetchone())[0] == 0
     await db.close()
 
@@ -308,9 +313,7 @@ async def test_dispatch_live_no_venue_writes_reject_row(tmp_path):
     assert row[0] == "rejected"
     assert row[1] == "no_venue"
     # counter NOT incremented
-    cur = await db._conn.execute(
-        "SELECT COUNT(*) FROM signal_venue_correction_count"
-    )
+    cur = await db._conn.execute("SELECT COUNT(*) FROM signal_venue_correction_count")
     assert (await cur.fetchone())[0] == 0
     await db.close()
 
@@ -363,9 +366,7 @@ async def test_dispatch_live_venue_transient_no_counter(tmp_path):
     engine = await _make_engine(db, routing=routing, adapter=adapter)
     await engine._dispatch_live(paper_trade=_make_paper_trade(), size_usd=10.0)
     engine._ks.engage.assert_not_called()
-    cur = await db._conn.execute(
-        "SELECT COUNT(*) FROM signal_venue_correction_count"
-    )
+    cur = await db._conn.execute("SELECT COUNT(*) FROM signal_venue_correction_count")
     assert (await cur.fetchone())[0] == 0
     await db.close()
 
@@ -394,8 +395,7 @@ async def test_dispatch_live_picks_highest_health_score(tmp_path):
     assert request.venue_pair == "BTCUSDT"
     # Counter for binance pair only
     cur = await db._conn.execute(
-        "SELECT venue, consecutive_no_correction "
-        "FROM signal_venue_correction_count"
+        "SELECT venue, consecutive_no_correction " "FROM signal_venue_correction_count"
     )
     rows = await cur.fetchall()
     assert {r[0]: r[1] for r in rows} == {"binance": 1}
@@ -410,14 +410,10 @@ async def test_dispatch_live_signed_disabled_no_counter(tmp_path):
     routing = MagicMock()
     routing.get_candidates = AsyncMock(return_value=[_candidate()])
     adapter = MagicMock()
-    adapter.place_order_request = AsyncMock(
-        side_effect=NotImplementedError("disabled")
-    )
+    adapter.place_order_request = AsyncMock(side_effect=NotImplementedError("disabled"))
     adapter.await_fill_confirmation = AsyncMock()
     engine = await _make_engine(db, routing=routing, adapter=adapter)
     await engine._dispatch_live(paper_trade=_make_paper_trade(), size_usd=10.0)
-    cur = await db._conn.execute(
-        "SELECT COUNT(*) FROM signal_venue_correction_count"
-    )
+    cur = await db._conn.execute("SELECT COUNT(*) FROM signal_venue_correction_count")
     assert (await cur.fetchone())[0] == 0
     await db.close()

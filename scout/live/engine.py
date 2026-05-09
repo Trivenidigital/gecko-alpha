@@ -93,12 +93,8 @@ class LiveEngine:
         # dispatched under shadow.
         if config.mode == "live":
             settings = getattr(config, "_s", None)
-            flag_routing = getattr(
-                settings, "LIVE_USE_ROUTING_LAYER", False
-            )
-            flag_signed = getattr(
-                settings, "LIVE_USE_REAL_SIGNED_REQUESTS", False
-            )
+            flag_routing = getattr(settings, "LIVE_USE_ROUTING_LAYER", False)
+            flag_signed = getattr(settings, "LIVE_USE_REAL_SIGNED_REQUESTS", False)
             if flag_routing and not flag_signed:
                 raise RuntimeError(
                     "Misconfig: LIVE_USE_ROUTING_LAYER=True but "
@@ -254,11 +250,7 @@ class LiveEngine:
         # §2.7a — BL-055 shadow soak ends at first live signal).
         settings = getattr(self._config, "_s", None)
         flag_routing = getattr(settings, "LIVE_USE_ROUTING_LAYER", False)
-        if (
-            self._config.mode == "live"
-            and flag_routing
-            and self._routing is not None
-        ):
+        if self._config.mode == "live" and flag_routing and self._routing is not None:
             await self._dispatch_live(
                 paper_trade=paper_trade,
                 size_usd=size_usd,
@@ -445,6 +437,4 @@ class LiveEngine:
         )
 
         if confirmation.status == "filled":
-            await increment_consecutive(
-                self._db, paper_trade.signal_type, top.venue
-            )
+            await increment_consecutive(self._db, paper_trade.signal_type, top.venue)

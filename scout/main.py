@@ -1033,10 +1033,7 @@ async def main(argv: list[str] | None = None) -> int:
     # PR #86 V3-M1: only fire when mode='live' too — a paper-mode boot
     # with LIVE_TRADING_ENABLED=True is a sensible safety step (not
     # alarming) and shouldn't generate a "master kill OFF" alert.
-    if (
-        getattr(settings, "LIVE_TRADING_ENABLED", False)
-        and live_config.mode == "live"
-    ):
+    if getattr(settings, "LIVE_TRADING_ENABLED", False) and live_config.mode == "live":
         try:
             async with aiohttp.ClientSession() as _startup_session:
                 await alerter.send_telegram_message(
