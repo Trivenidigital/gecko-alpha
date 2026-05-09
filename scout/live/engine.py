@@ -126,15 +126,16 @@ class LiveEngine:
         startup in `scout/main.py` — when `LIVE_MODE='live'` AND
         `LIVE_TRADING_ENABLED=False`, startup refuses to construct the
         live adapter (existing balance_gate NotImplementedError is the
-        belt-and-braces guard). Shadow mode (`LIVE_MODE='shadow'`) is
-        paper-money and continues to flow through the engine for BL-055
-        soak telemetry. The engine entry NO LONGER short-circuits on
-        master kill, because that would also block shadow-mode soak.
+        belt-and-braces guard).
+
+        M1.5b: live mode dispatch is permitted via `_dispatch_live` when
+        `LIVE_USE_ROUTING_LAYER=True` AND a `routing` layer is wired.
+        The previous belt-and-braces assert was removed (R1+R2 plan-stage
+        finding C1) — main.py boot guards + engine __init__ misconfig
+        CRASH provide the safety contract.
         """
-        assert self._config.mode != "live", (
-            "LiveEngine reached in LIVE_MODE=live — startup guard in "
-            "scout/main.py failed; refusing to write any row"
-        )
+        # M1.5b: assert removed. main.py boot guards + engine __init__
+        # misconfig CRASH provide the safety contract.
         trade_id = paper_trade.id
         size_usd = self._config.resolve_size_usd(paper_trade.signal_type)
 
@@ -248,6 +249,22 @@ class LiveEngine:
         entry_slip = walk.slippage_bps  # may be None
         mid = str(depth.mid)
 
+        # M1.5b: under live + routing-flag + routing-layer, dispatch via
+        # _dispatch_live and SKIP shadow_trades happy-path write (design
+        # §2.7a — BL-055 shadow soak ends at first live signal).
+        settings = getattr(self._config, "_s", None)
+        flag_routing = getattr(settings, "LIVE_USE_ROUTING_LAYER", False)
+        if (
+            self._config.mode == "live"
+            and flag_routing
+            and self._routing is not None
+        ):
+            await self._dispatch_live(
+                paper_trade=paper_trade,
+                size_usd=size_usd,
+            )
+            return
+
         assert self._db._conn is not None
         async with self._db._txn_lock:
             await self._db._conn.execute(
@@ -282,3 +299,152 @@ class LiveEngine:
             slippage_bps=entry_slip,
             size_usd=str(size_usd),
         )
+
+    async def _dispatch_live(
+        self,
+        *,
+        paper_trade: _PaperTradeLike,
+        size_usd,
+    ) -> None:
+        """M1.5b live-mode dispatch (V1-C1 routing-half + V1-C2 closures).
+
+        - Routes via RoutingLayer
+        - Calls adapter.place_order_request (M1.5a idempotency-aware)
+        - Calls adapter.await_fill_confirmation (M1.5a polling) using
+          the same cid the adapter just wrote to live_trades
+        - On terminal=filled -> increment correction counter
+        - On BinanceAuthError mid-session -> engages KillSwitch
+        - On no candidates -> writes live_trades reject row (Q2 fold)
+        """
+        from uuid import uuid4
+
+        from scout.live.adapter_base import OrderRequest
+        from scout.live.binance_adapter import (
+            BinanceAuthError,
+            BinanceIPBanError,
+        )
+        from scout.live.correction_counter import increment_consecutive
+        from scout.live.exceptions import VenueTransientError
+        from scout.live.idempotency import make_client_order_id
+
+        canonical = paper_trade.symbol
+        chain_hint = getattr(paper_trade, "chain", None)
+
+        log.info(
+            "live_dispatch_entered",
+            paper_trade_id=paper_trade.id,
+            canonical=canonical,
+            size_usd=str(size_usd),
+            signal_type=paper_trade.signal_type,
+        )
+
+        candidates = await self._routing.get_candidates(
+            canonical=canonical,
+            chain_hint=chain_hint,
+            signal_type=paper_trade.signal_type,
+            size_usd=float(size_usd),
+        )
+
+        log.info(
+            "live_dispatch_candidates_returned",
+            paper_trade_id=paper_trade.id,
+            count=len(candidates),
+            top_venue=candidates[0].venue if candidates else None,
+        )
+
+        if not candidates:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            assert self._db._conn is not None
+            async with self._db._txn_lock:
+                await self._db._conn.execute(
+                    "INSERT INTO live_trades "
+                    "(paper_trade_id, status, reject_reason, created_at) "
+                    "VALUES (?, 'rejected', 'no_venue', ?)",
+                    (paper_trade.id, now_iso),
+                )
+                await self._db._conn.commit()
+            log.info(
+                "live_dispatch_no_venue",
+                paper_trade_id=paper_trade.id,
+                canonical=canonical,
+            )
+            return
+
+        top = candidates[0]
+        intent_uuid = str(uuid4())
+        request = OrderRequest(
+            paper_trade_id=paper_trade.id,
+            canonical=canonical,
+            venue_pair=top.venue_pair,
+            side="buy",
+            size_usd=float(size_usd),
+            intent_uuid=intent_uuid,
+        )
+        # R1-C2 fix: derive same cid the adapter writes to live_trades.
+        cid = make_client_order_id(paper_trade.id, intent_uuid)
+
+        try:
+            venue_order_id = await self._adapter.place_order_request(request)
+        except NotImplementedError as exc:
+            log.info(
+                "live_dispatch_signed_disabled",
+                paper_trade_id=paper_trade.id,
+                err=str(exc),
+            )
+            return
+        except BinanceAuthError as exc:
+            log.error(
+                "live_dispatch_auth_revoked_mid_session",
+                paper_trade_id=paper_trade.id,
+                err=str(exc),
+            )
+            await self._ks.engage(reason="binance_auth_revoked_mid_session")
+            return
+        except BinanceIPBanError as exc:
+            log.error(
+                "live_dispatch_ip_banned",
+                paper_trade_id=paper_trade.id,
+                err=str(exc),
+            )
+            await self._ks.engage(reason="binance_ip_banned")
+            return
+        except VenueTransientError as exc:
+            log.info(
+                "live_dispatch_venue_transient",
+                paper_trade_id=paper_trade.id,
+                err=str(exc),
+            )
+            return
+        except Exception:
+            log.exception(
+                "live_dispatch_place_order_failed",
+                paper_trade_id=paper_trade.id,
+            )
+            return
+
+        try:
+            confirmation = await self._adapter.await_fill_confirmation(
+                venue_order_id=venue_order_id,
+                client_order_id=cid,
+                timeout_sec=30.0,
+            )
+        except Exception:
+            log.exception(
+                "live_dispatch_await_fill_failed",
+                paper_trade_id=paper_trade.id,
+                venue_order_id=venue_order_id,
+            )
+            return
+
+        log.info(
+            "live_dispatch_terminal",
+            paper_trade_id=paper_trade.id,
+            venue_order_id=venue_order_id,
+            status=confirmation.status,
+            fill_price=confirmation.fill_price,
+        )
+
+        if confirmation.status == "filled":
+            await increment_consecutive(
+                self._db, paper_trade.signal_type, top.venue
+            )
