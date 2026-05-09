@@ -21,9 +21,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 
-def sign_request(
-    secret: str, params: dict[str, Any]
-) -> tuple[dict[str, Any], str]:
+def sign_request(secret: str, params: dict[str, Any]) -> tuple[dict[str, Any], str]:
     """Sign a Binance request.
 
     Args:

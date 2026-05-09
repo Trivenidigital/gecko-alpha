@@ -2695,13 +2695,11 @@ class Database:
                              AND chain != ''
                            GROUP BY chain"""
                     )
-                    await conn.execute(
-                        """CREATE VIEW IF NOT EXISTS cross_venue_pnl AS
+                    await conn.execute("""CREATE VIEW IF NOT EXISTS cross_venue_pnl AS
                            SELECT
                                'placeholder_m1' AS venue,
                                0.0 AS realized_pnl_usd,
-                               0.0 AS unrealized_pnl_usd"""
-                    )
+                               0.0 AS unrealized_pnl_usd""")
 
             await conn.execute(
                 "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
@@ -2863,15 +2861,11 @@ class Database:
 
         try:
             await conn.execute("BEGIN EXCLUSIVE")
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS paper_migrations (
-                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
-            )
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS schema_version (
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS schema_version (
                     version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
-                    description TEXT NOT NULL)"""
-            )
+                    description TEXT NOT NULL)""")
 
             # Idempotency check: skip if marker already present.
             cur = await conn.execute(
@@ -2972,13 +2966,11 @@ class Database:
                              AND chain != ''
                            GROUP BY chain"""
                     )
-                    await conn.execute(
-                        """CREATE VIEW IF NOT EXISTS cross_venue_pnl AS
+                    await conn.execute("""CREATE VIEW IF NOT EXISTS cross_venue_pnl AS
                            SELECT
                                'placeholder_m1' AS venue,
                                0.0 AS realized_pnl_usd,
-                               0.0 AS unrealized_pnl_usd"""
-                    )
+                               0.0 AS unrealized_pnl_usd""")
 
             await conn.execute(
                 "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
@@ -2995,9 +2987,7 @@ class Database:
                 ("bl_reject_reason_extend_v2",),
             )
             if (await cur.fetchone()) is None:
-                raise RuntimeError(
-                    "bl_reject_reason_extend_v2 cutover row missing"
-                )
+                raise RuntimeError("bl_reject_reason_extend_v2 cutover row missing")
             await conn.commit()
         except Exception:
             try:

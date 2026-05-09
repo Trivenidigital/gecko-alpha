@@ -221,15 +221,13 @@ async def test_reject_reason_check_accepts_new_values_on_fresh_db(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
     # Seed paper_trade so live_trades FK is satisfied
-    cur = await db._conn.execute(
-        """INSERT INTO paper_trades
+    cur = await db._conn.execute("""INSERT INTO paper_trades
            (token_id, symbol, name, chain, signal_type, signal_data,
             entry_price, amount_usd, quantity, tp_price, sl_price,
             status, opened_at)
            VALUES ('tok', 'X', 'x', 'ethereum', 'first_signal', '{}',
                    100, 50, 0.5, 120, 80, 'open',
-                   '2026-05-08T00:00:00+00:00')"""
-    )
+                   '2026-05-08T00:00:00+00:00')""")
     paper_id = cur.lastrowid
     for new_reason in (
         "signal_disabled",
@@ -281,15 +279,13 @@ async def test_reject_reason_check_accepts_m1_5a_new_values(tmp_path):
     scope-disambiguation gaps R1-I1 and R2-I3 caught."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    cur = await db._conn.execute(
-        """INSERT INTO paper_trades
+    cur = await db._conn.execute("""INSERT INTO paper_trades
            (token_id, symbol, name, chain, signal_type, signal_data,
             entry_price, amount_usd, quantity, tp_price, sl_price,
             status, opened_at)
            VALUES ('tok-m1-5a', 'X', 'x', 'ethereum', 'first_signal', '{}',
                    100, 50, 0.5, 120, 80, 'open',
-                   '2026-05-09T00:00:00+00:00')"""
-    )
+                   '2026-05-09T00:00:00+00:00')""")
     paper_id = cur.lastrowid
     for new_reason in ("live_signed_disabled", "api_key_lacks_trade_scope"):
         await db._conn.execute(

@@ -28,7 +28,6 @@ from scout.live.binance_adapter import (
     BinanceSpotAdapter,
 )
 
-
 _REQUIRED = dict(TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k")
 
 
@@ -204,15 +203,13 @@ async def test_fetch_account_balance_raises_when_signed_disabled():
 
 
 async def _seed_paper(db):
-    cur = await db._conn.execute(
-        """INSERT INTO paper_trades
+    cur = await db._conn.execute("""INSERT INTO paper_trades
            (token_id, symbol, name, chain, signal_type, signal_data,
             entry_price, amount_usd, quantity, tp_price, sl_price,
             status, opened_at)
            VALUES ('btc-tok', 'BTC', 'btc', 'ethereum', 'first_signal', '{}',
                    100, 50, 0.5, 120, 80, 'open',
-                   '2026-05-09T00:00:00+00:00')"""
-    )
+                   '2026-05-09T00:00:00+00:00')""")
     return cur.lastrowid
 
 

@@ -219,9 +219,7 @@ class BinanceSpotAdapter(ExchangeAdapter):
                     return await resp.json()
 
             except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as exc:
-                last_exc = VenueTransientError(
-                    f"network error: {type(exc).__name__}"
-                )
+                last_exc = VenueTransientError(f"network error: {type(exc).__name__}")
                 if attempt < len(_BACKOFFS):
                     await self._retry_sleep(_BACKOFFS[attempt])
                     continue
@@ -476,9 +474,7 @@ class BinanceSpotAdapter(ExchangeAdapter):
             depth = await self.fetch_depth(request.venue_pair)
             mid_str = str(depth.mid)
         except Exception:
-            log.exception(
-                "place_order_mid_fetch_failed", canonical=request.canonical
-            )
+            log.exception("place_order_mid_fetch_failed", canonical=request.canonical)
 
         # Step 3: record pending row, handle concurrent-INSERT race (R1-C3)
         try:
@@ -528,9 +524,7 @@ class BinanceSpotAdapter(ExchangeAdapter):
         except BinanceDuplicateOrderError:
             # Prior retry's POST succeeded but response was lost (network drop).
             # Recover by reading the existing order via origClientOrderId.
-            log.info(
-                "place_order_recovered_from_duplicate", client_order_id=cid
-            )
+            log.info("place_order_recovered_from_duplicate", client_order_id=cid)
             body = await self._signed_get(
                 "/api/v3/order",
                 params={
@@ -542,9 +536,7 @@ class BinanceSpotAdapter(ExchangeAdapter):
         # Step 5: validate orderId, persist, return (R1-C6 fix)
         order_id_raw = body.get("orderId")
         if order_id_raw in (None, "", 0):
-            raise VenueTransientError(
-                f"Binance response missing orderId: {body!r}"
-            )
+            raise VenueTransientError(f"Binance response missing orderId: {body!r}")
         venue_order_id = str(order_id_raw)
 
         # Step 6: persist entry_order_id under txn lock (R1-I2)

@@ -293,9 +293,7 @@ class Gates:
         if self._config.mode == "live":
             # R1-I1: surface explicit kill-switch reject_reason so dashboard
             # can distinguish "balance gate disabled" from "balance insufficient."
-            if not getattr(
-                self._config._s, "LIVE_USE_REAL_SIGNED_REQUESTS", False
-            ):
+            if not getattr(self._config._s, "LIVE_USE_REAL_SIGNED_REQUESTS", False):
                 return (
                     GateResult(
                         passed=False,
