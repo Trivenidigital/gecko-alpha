@@ -15,6 +15,11 @@ Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 ExecStartPre=/usr/bin/test -x /usr/local/bin/gecko-backup-watchdog.sh
 ExecStartPre=/usr/bin/test -x /usr/bin/curl
 ExecStart=/usr/local/bin/gecko-backup-watchdog.sh
+# Exit 1 = "heartbeat stale + alert delivered HTTP 200" — this is the
+# DESIGNED behavior, not a failure. Treat as success so journalctl /
+# systemctl status only show `failed` for real diagnostic conditions
+# (exit 4 env file missing, 5 placeholder creds, 6 no python, 7 HTTP non-200).
+SuccessExitStatus=1
 TimeoutStartSec=60
 StandardOutput=journal
 StandardError=journal
