@@ -39,6 +39,13 @@ class CandidateToken(BaseModel):
     txns_h1_buys: int | None = None
     txns_h1_sells: int | None = None
 
+    # Quote-currency awareness (BL-NEW-QUOTE-PAIR).
+    # quote_symbol: DexScreener `quoteToken.symbol` (e.g., "USDC", "WSOL").
+    # dex_id: DexScreener `dexId` (e.g., "raydium", "uniswap").
+    # Populated only via from_dexscreener; CG/GT sources stay None by default.
+    quote_symbol: str | None = None
+    dex_id: str | None = None
+
     # CoinGecko-specific fields
     price_change_1h: float | None = None
     price_change_24h: float | None = None
@@ -124,6 +131,19 @@ class CandidateToken(BaseModel):
         price_change_1h = price_change.get("h1")
         price_change_24h = price_change.get("h24")
 
+        # Parse quote-currency + DEX (BL-NEW-QUOTE-PAIR). Defensive isinstance
+        # guard handles `null` AND non-dict-truthy responses (string / list / int)
+        # — `or {}` alone would raise AttributeError on a malformed string-typed
+        # `quoteToken` and silently drop the entire pair via the broad-except in
+        # the DexScreener poller. R6 PR review MUST-FIX.
+        raw_quote = data.get("quoteToken")
+        quote_token = raw_quote if isinstance(raw_quote, dict) else {}
+        quote_symbol = quote_token.get("symbol")
+        if not isinstance(quote_symbol, str):
+            quote_symbol = None
+        raw_dex_id = data.get("dexId")
+        dex_id = raw_dex_id if isinstance(raw_dex_id, str) else None
+
         return cls(
             contract_address=base_token.get("address", ""),
             chain=data.get("chainId", ""),
@@ -141,6 +161,8 @@ class CandidateToken(BaseModel):
             ),
             txns_h1_buys=txns_h1_buys,
             txns_h1_sells=txns_h1_sells,
+            quote_symbol=quote_symbol,
+            dex_id=dex_id,
             holder_count=0,
             holder_growth_1h=0,
         )

@@ -223,6 +223,32 @@ def score(
         points += 10
         signals.append("perp_anomaly")
 
+    # BL-NEW-QUOTE-PAIR: stable_paired_liq — +5 raw / +2 normalized.
+    # Tokens paired with a known stablecoin AND liquidity_usd >= 50K signal
+    # cleaner exit dynamics (no secondary stable-leg slippage). Counts toward
+    # co-occurrence multiplier — adding to signals list is intended.
+    # Match is case-sensitive against settings.STABLE_QUOTE_SYMBOLS; DexScreener
+    # canonically returns uppercase symbols. If the API ever shifts, the
+    # case-sensitivity test catches the regression and we'll normalize parser-side.
+    # The isinstance guard surfaces upstream corruption (R6 PR review CRITICAL):
+    # a non-string quote_symbol that bypassed Pydantic validation would silently
+    # not fire (`int in tuple[str,...]` is False) — log it explicitly so it can
+    # be diagnosed instead of vanishing into a non-fire.
+    quote_symbol = token.quote_symbol
+    if quote_symbol is not None and not isinstance(quote_symbol, str):
+        logger.warning(
+            "stable_paired_liq_invalid_symbol_type",
+            contract_address=token.contract_address,
+            quote_symbol_type=type(quote_symbol).__name__,
+        )
+        quote_symbol = None
+    if (
+        quote_symbol in settings.STABLE_QUOTE_SYMBOLS
+        and token.liquidity_usd >= settings.STABLE_PAIRED_LIQ_THRESHOLD_USD
+    ):
+        points += settings.STABLE_PAIRED_BONUS
+        signals.append("stable_paired_liq")
+
     # Normalize to 0-100 scale
     points = min(100, int(points * 100 / SCORER_MAX_RAW))
 

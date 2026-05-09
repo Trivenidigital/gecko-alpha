@@ -32,6 +32,25 @@ class Settings(BaseSettings):
     BUY_PRESSURE_THRESHOLD: float = 0.65
     CO_OCCURRENCE_MIN_SIGNALS: int = 3
     CO_OCCURRENCE_MULTIPLIER: float = 1.15
+
+    # BL-NEW-QUOTE-PAIR: stable-pair liquidity-quality signal.
+    # Tokens whose DexScreener quoteToken.symbol is in STABLE_QUOTE_SYMBOLS AND
+    # whose liquidity_usd >= STABLE_PAIRED_LIQ_THRESHOLD_USD get +5 raw / +2
+    # normalized points. Counts toward co-occurrence multiplier (intended).
+    # 2026-05-09 stable list: PYUSD/RLUSD/sUSDe added; BUSD/TUSD intentionally
+    # excluded (BUSD redemption-only since 2024-02; TUSD repeat depegs).
+    STABLE_QUOTE_SYMBOLS: tuple[str, ...] = (
+        "USDC",
+        "USDT",
+        "DAI",
+        "FDUSD",
+        "USDe",
+        "PYUSD",
+        "RLUSD",
+        "sUSDe",
+    )
+    STABLE_PAIRED_LIQ_THRESHOLD_USD: float = 50_000.0
+    STABLE_PAIRED_BONUS: int = 5
     CHAINS: list[str] = ["solana", "base", "ethereum"]
 
     # CoinGecko
