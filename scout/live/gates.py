@@ -62,6 +62,9 @@ VALID_REJECT_REASONS: frozenset[str] = frozenset(
         "all_candidates_failed",
         "master_kill",
         "mode_paper",
+        # M1.5a (design-stage R1-I1 + R2-I3) — Gate 10 disambiguation:
+        "live_signed_disabled",
+        "api_key_lacks_trade_scope",
     }
 )
 

@@ -98,6 +98,7 @@ class Database:
         await self._migrate_live_client_order_id()
         await self._migrate_reject_reason_extend()
         await self._migrate_bl_quote_pair_v1()
+        await self._migrate_reject_reason_extend_v2()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -1476,7 +1477,8 @@ class Database:
                     'venue_unavailable',
                     'notional_cap_exceeded','signal_disabled','token_aggregate',
                     'dual_signal_aggregate','all_candidates_failed',
-                    'master_kill','mode_paper'
+                    'master_kill','mode_paper',
+                    'live_signed_disabled','api_key_lacks_trade_scope'
                 )),
                 exit_walked_vwap    TEXT,
                 realized_pnl_usd    TEXT,
@@ -1515,7 +1517,8 @@ class Database:
                     'venue_unavailable',
                     'notional_cap_exceeded','signal_disabled','token_aggregate',
                     'dual_signal_aggregate','all_candidates_failed',
-                    'master_kill','mode_paper'
+                    'master_kill','mode_paper',
+                    'live_signed_disabled','api_key_lacks_trade_scope'
                 )),
                 exit_order_id       TEXT,
                 exit_fill_price     TEXT,
@@ -2833,6 +2836,179 @@ class Database:
                 f"expected 'bl_quote_pair_v1_quote_symbol_dex_id', got {row[0]!r}. "
                 f"Possible version-collision; investigate before continuing."
             )
+
+    async def _migrate_reject_reason_extend_v2(self) -> None:
+        """BL-NEW-LIVE-HYBRID M1.5a (design-stage R1-I1 + R2-I3): extend
+        reject_reason CHECK constraint with 2 new values via SQLite
+        table-rename pattern (mirrors `_migrate_reject_reason_extend` from
+        M1's V3-C1).
+
+        Adds:
+          - 'live_signed_disabled' — Gate 10 emergency-revert kill-switch
+            visibility when LIVE_USE_REAL_SIGNED_REQUESTS=False (R1-I1)
+          - 'api_key_lacks_trade_scope' — Gate 10 disambiguation of -2015
+            (key lacks SPOT) from generic insufficient_balance (R2-I3)
+
+        Migration `bl_reject_reason_extend_v2`, schema_version 20260514.
+        Idempotent — checks current CHECK constraint via sqlite_master.sql
+        before rebuilding.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
+            )
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL)"""
+            )
+
+            # Idempotency check: skip if marker already present.
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_reject_reason_extend_v2",),
+            )
+            if (await cur.fetchone()) is not None:
+                await conn.commit()
+                return
+
+            for table in ("shadow_trades", "live_trades"):
+                cur = await conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    continue
+                table_sql = row[0] or ""
+                if "live_signed_disabled" in table_sql:
+                    continue  # already has the new CHECK; nothing to do
+
+                cur = await conn.execute(f"PRAGMA table_info({table})")
+                cols = await cur.fetchall()
+                if not cols:
+                    continue
+                col_names = [c[1] for c in cols]
+                col_list = ", ".join(col_names)
+
+                new_check = (
+                    "CHECK (reject_reason IS NULL OR reject_reason IN ("
+                    "'no_venue','insufficient_depth','slippage_exceeds_cap',"
+                    "'insufficient_balance','daily_cap_hit','kill_switch',"
+                    "'exposure_cap','override_disabled','venue_unavailable',"
+                    "'notional_cap_exceeded','signal_disabled','token_aggregate',"
+                    "'dual_signal_aggregate','all_candidates_failed',"
+                    "'master_kill','mode_paper',"
+                    "'live_signed_disabled','api_key_lacks_trade_scope'))"
+                )
+                import re as _re
+
+                pattern = _re.compile(
+                    r"reject_reason\s+TEXT\s+CHECK\s*\([^)]*\)\s*\)",
+                    _re.IGNORECASE | _re.DOTALL,
+                )
+                new_table_sql = pattern.sub(
+                    f"reject_reason       TEXT {new_check}", table_sql
+                )
+                if new_table_sql == table_sql:
+                    _log.warning(
+                        "reject_reason_check_v2_pattern_miss",
+                        table=table,
+                        sql_excerpt=table_sql[:200],
+                    )
+                    continue
+
+                new_table_sql_renamed = new_table_sql.replace(
+                    f"TABLE {table} (", f"TABLE {table}_new (", 1
+                ).replace(
+                    f"TABLE IF NOT EXISTS {table} (",
+                    f"TABLE {table}_new (",
+                    1,
+                )
+
+                # Drop dependent views before rebuild (M1 hotfix lesson —
+                # cross_venue_exposure references live_trades).
+                if table == "live_trades":
+                    await conn.execute("DROP VIEW IF EXISTS cross_venue_exposure")
+                    await conn.execute("DROP VIEW IF EXISTS cross_venue_pnl")
+
+                await conn.execute(new_table_sql_renamed)
+                await conn.execute(
+                    f"INSERT INTO {table}_new ({col_list}) "
+                    f"SELECT {col_list} FROM {table}"
+                )
+                await conn.execute(f"DROP TABLE {table}")
+                await conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+
+                if table == "live_trades":
+                    # Recreate views (DDL identical to _migrate_per_venue_services
+                    # + I1+I2 fixes from M1).
+                    await conn.execute(
+                        """CREATE VIEW IF NOT EXISTS cross_venue_exposure AS
+                           SELECT
+                               'binance' AS venue,
+                               COALESCE(SUM(CAST(size_usd AS REAL)), 0) AS open_exposure_usd,
+                               COUNT(*) AS open_count
+                           FROM live_trades
+                           WHERE status = 'open'
+                           UNION ALL
+                           SELECT
+                               'minara_' || COALESCE(chain, 'unknown') AS venue,
+                               COALESCE(SUM(amount_usd), 0) AS open_exposure_usd,
+                               COUNT(*) AS open_count
+                           FROM paper_trades
+                           WHERE status = 'open'
+                             AND chain != 'coingecko'
+                             AND chain != ''
+                           GROUP BY chain"""
+                    )
+                    await conn.execute(
+                        """CREATE VIEW IF NOT EXISTS cross_venue_pnl AS
+                           SELECT
+                               'placeholder_m1' AS venue,
+                               0.0 AS realized_pnl_usd,
+                               0.0 AS unrealized_pnl_usd"""
+                    )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_reject_reason_extend_v2", now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260514, now_iso, "bl_reject_reason_extend_v2"),
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_reject_reason_extend_v2",),
+            )
+            if (await cur.fetchone()) is None:
+                raise RuntimeError(
+                    "bl_reject_reason_extend_v2 cutover row missing"
+                )
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error(
+                "SCHEMA_DRIFT_DETECTED",
+                migration="bl_reject_reason_extend_v2",
+            )
+            raise
 
     async def revive_signal_with_baseline(
         self,
