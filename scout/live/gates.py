@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING
 import structlog
 
 from scout.db import Database
+from scout.live.balance_gate import check_sufficient_balance
+from scout.live.binance_adapter import BinanceAuthError
 from scout.live.exceptions import VenueTransientError
 from scout.live.orderbook import walk_asks
 from scout.live.types import GateResult, ResolvedVenue
@@ -281,12 +283,63 @@ class Gates:
                     venue,
                 )
 
-        # Gate 10: balance (live-only — BL-055 must be blocked at startup;
-        # full implementation lands in Task 8 / balance_gate.py).
+        # Gate 10: balance (live-only). Wired in M1.5a — replaces M1's
+        # NotImplementedError stub. Returns 1 of 3 reject_reasons:
+        # - 'live_signed_disabled' when LIVE_USE_REAL_SIGNED_REQUESTS=False
+        #   (R1-I1: kill-switch state visibility on dashboard)
+        # - 'api_key_lacks_trade_scope' when -2015 surfaces from balance
+        #   fetch (R2-I3: scope-fail vs balance-fail disambiguation)
+        # - 'insufficient_balance' on real balance shortage
         if self._config.mode == "live":
-            raise NotImplementedError(
-                "Balance gate wired in BL-058 / Task 8; LIVE_MODE=live must "
-                "be blocked at startup in BL-055"
-            )
+            # R1-I1: surface explicit kill-switch reject_reason so dashboard
+            # can distinguish "balance gate disabled" from "balance insufficient."
+            if not getattr(
+                self._config._s, "LIVE_USE_REAL_SIGNED_REQUESTS", False
+            ):
+                return (
+                    GateResult(
+                        passed=False,
+                        reject_reason="live_signed_disabled",
+                        detail=(
+                            "LIVE_USE_REAL_SIGNED_REQUESTS=False — "
+                            "emergency-revert posture"
+                        ),
+                    ),
+                    venue,
+                )
+
+            try:
+                bal_result = await check_sufficient_balance(
+                    self._adapter,
+                    float(size_usd),
+                    margin_factor=1.1,
+                )
+            except BinanceAuthError as exc:
+                # R2-I3: -2015 from POST = key lacks SPOT trade scope.
+                # Distinguish from real balance shortage (operator might
+                # otherwise debug "fund Binance" when actual fix is
+                # "rotate key with TRADE permission").
+                if "2015" in str(exc):
+                    return (
+                        GateResult(
+                            passed=False,
+                            reject_reason="api_key_lacks_trade_scope",
+                            detail=f"Binance auth-fail on balance fetch: {exc}",
+                        ),
+                        venue,
+                    )
+                # -2014 / -1021 / other auth-class — surface as transient;
+                # engine layer writes needs_manual_review row in M1.5b.
+                raise
+
+            if not bal_result.passed:
+                return (
+                    GateResult(
+                        passed=False,
+                        reject_reason="insufficient_balance",
+                        detail=bal_result.detail,
+                    ),
+                    venue,
+                )
 
         return GateResult(passed=True), venue
