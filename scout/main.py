@@ -1030,9 +1030,13 @@ async def main(argv: list[str] | None = None) -> int:
     # BL-NEW-LIVE-HYBRID M1 v2.1 startup notification (Task 14):
     # post a Telegram alert ONCE when LIVE_TRADING_ENABLED=True at
     # process startup so the operator confirms the master kill state.
-    # Uses parse_mode=None to avoid Markdown anchor mis-parsing on the
-    # `$` chars (silent 400 per PR #76 silent-failure C1).
-    if getattr(settings, "LIVE_TRADING_ENABLED", False):
+    # PR #86 V3-M1: only fire when mode='live' too — a paper-mode boot
+    # with LIVE_TRADING_ENABLED=True is a sensible safety step (not
+    # alarming) and shouldn't generate a "master kill OFF" alert.
+    if (
+        getattr(settings, "LIVE_TRADING_ENABLED", False)
+        and live_config.mode == "live"
+    ):
         try:
             async with aiohttp.ClientSession() as _startup_session:
                 await alerter.send_telegram_message(
@@ -1068,6 +1072,20 @@ async def main(argv: list[str] | None = None) -> int:
                 raise RuntimeError("LIVE_MODE=live requires BINANCE_API_KEY/SECRET")
 
             # M1.5a balance smoke check (replaces M1's NotImplementedError).
+            # PR #86 V3-I2 fold: smoke check should also gate on
+            # LIVE_USE_REAL_SIGNED_REQUESTS=True. Otherwise operator who
+            # forgets that flag boots cleanly + every signal fires
+            # 'live_signed_disabled' indefinitely.
+            if not getattr(settings, "LIVE_USE_REAL_SIGNED_REQUESTS", False):
+                await db.close()
+                raise RuntimeError(
+                    "LIVE_MODE=live requires LIVE_USE_REAL_SIGNED_REQUESTS=True. "
+                    "Default False is the M1.5a emergency-revert posture; "
+                    "operator must explicitly opt in to live execution by "
+                    "setting LIVE_USE_REAL_SIGNED_REQUESTS=True in .env "
+                    "after balance smoke check passes on testnet."
+                )
+
             # R2-C1: verify SPOT permission, not just balance fetch
             # R2-I6: 10s timeout (was 5s), absorbs EU-VPS jitter
             from scout.live.binance_adapter import (

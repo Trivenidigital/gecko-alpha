@@ -98,19 +98,46 @@ Before flipping `LIVE_MODE='live'`, verify all of:
       → Restrict access to trusted IPs only → add 89.167.116.187)
 - [ ] **Account funded with USDT** for the LIVE_TRADE_AMOUNT_USD cap
       (start small: $100 testnet → $50-100 production)
-- [ ] **NTP sync on VPS** (Binance recvWindow=5000ms requires clock
-      skew < 5s; `timedatectl` should show `NTP service: active`)
+- [ ] **NTP sync on VPS** (Binance recvWindow=10000ms requires clock
+      skew < 10s; `timedatectl` should show `NTP service: active`).
+      M1.5a uses recvWindow=10000 for jitter tolerance (V1-M3 fold).
+- [ ] **First-24h cap recommendation** (PR #86 V3-M3 fold): set
+      `LIVE_TRADE_AMOUNT_USD=10` for the first 24h after enabling live;
+      after observing 1-3 successful close events with valid
+      fill_slippage_bps, raise to the operating cap (default 100).
 
-### Pre-flip whitelist verification (R2-I1)
+### Pre-flip whitelist verification (R2-I1, PR #86 V3-I1 fix)
+
+**Important**: `/api/v3/ping` is UNSIGNED and does NOT enforce IP
+whitelist — it returns `{}` from any caller. The whitelist is only
+enforced on signed requests. To actually verify the whitelist, hit a
+signed endpoint (`/api/v3/account`).
+
+The smoke check at boot already does this; for pre-flip verification
+the operator can run it manually:
 
 ```bash
+# This requires HMAC signing — run via the gecko-alpha venv from VPS:
 ssh root@89.167.116.187 \
-  'curl -s -H "X-MBX-APIKEY: $(grep BINANCE_API_KEY /root/gecko-alpha/.env | cut -d= -f2)" \
-   "https://api.binance.com/api/v3/ping"'
+  'cd /root/gecko-alpha && uv run python -c "
+import asyncio
+from scout.config import Settings
+from scout.live.binance_adapter import BinanceSpotAdapter
+async def main():
+    s = Settings()
+    a = BinanceSpotAdapter(s)
+    try:
+        r = await a._signed_get(\"/api/v3/account\", params={})
+        print(\"OK; permissions:\", r.get(\"permissions\"))
+    finally:
+        await a.close()
+asyncio.run(main())
+"'
 ```
 
-Expected: `{}` (status 200). If this fails or returns 4xx, IP whitelist
-or DNS is broken before any signed call. Fix BEFORE proceeding.
+Expected output: `OK; permissions: ['SPOT', ...]`. If this fails with
+`-2015`, either the API key is wrong, IP whitelist is broken, or key
+lacks SPOT permission. Fix BEFORE proceeding.
 
 ## 4. .env activation checklist (REQUIRED checklist — R2-I2)
 

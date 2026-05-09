@@ -331,11 +331,20 @@ class Gates:
                 raise
 
             if not bal_result.passed:
+                # PR #86 V3-I3 fold: balance_gate signals venue-down via
+                # detail prefix 'venue_unavailable:' so dashboards don't
+                # misread Binance maintenance as 'insufficient_balance'.
+                detail = bal_result.detail or ""
+                reason = (
+                    "venue_unavailable"
+                    if detail.startswith("venue_unavailable:")
+                    else "insufficient_balance"
+                )
                 return (
                     GateResult(
                         passed=False,
-                        reject_reason="insufficient_balance",
-                        detail=bal_result.detail,
+                        reject_reason=reason,
+                        detail=detail,
                     ),
                     venue,
                 )

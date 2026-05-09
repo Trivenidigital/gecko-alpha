@@ -12,6 +12,7 @@ Implements the weight-header governor (§9.1) and retry taxonomy (§10.1).
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -44,6 +45,16 @@ class BinanceIPBanError(Exception):
 
 class BinanceDuplicateOrderError(Exception):
     """-2010 duplicate newClientOrderId. Caller recovers via origClientOrderId GET."""
+
+
+class BinanceInsufficientFundsError(Exception):
+    """-2018 Balance is insufficient / -2019 Margin is insufficient. PR #86 V1-C1.
+
+    Distinct from BinanceAuthError (different operator action — fund the
+    account vs rotate the key) and from VenueTransientError (NEVER retry —
+    funds aren't going to grow on retry). Engine layer maps to
+    reject_reason='insufficient_balance'.
+    """
 
 
 _BASE_URL = "https://api.binance.com"
@@ -196,6 +207,14 @@ class BinanceSpotAdapter(ExchangeAdapter):
                                 raise BinanceDuplicateOrderError(
                                     f"duplicate newClientOrderId: {body.get('msg')!r}"
                                 )
+                            if signed and code in (-2018, -2019):
+                                # PR #86 V1-C1: Balance/margin insufficient.
+                                # Distinct from generic transient error so
+                                # engine layer maps to insufficient_balance.
+                                raise BinanceInsufficientFundsError(
+                                    f"{method} {path} code={code} "
+                                    f"msg={body.get('msg')!r}"
+                                )
                         # Other 400s — raise (no retry).
                         resp.raise_for_status()
 
@@ -258,7 +277,7 @@ class BinanceSpotAdapter(ExchangeAdapter):
 
         body_params: dict[str, Any] = dict(params or {})
         body_params["timestamp"] = int(time.time() * 1000)
-        body_params["recvWindow"] = 5000
+        body_params["recvWindow"] = 10000  # V1-M3: jitter tolerance for EU-VPS NTP
         signed_params, _sig = sign_request(self._api_secret(), body_params)
         headers = {"X-MBX-APIKEY": self._api_key()}
         return await self._request(
@@ -275,7 +294,7 @@ class BinanceSpotAdapter(ExchangeAdapter):
 
         body_params: dict[str, Any] = dict(params)
         body_params["timestamp"] = int(time.time() * 1000)
-        body_params["recvWindow"] = 5000
+        body_params["recvWindow"] = 10000  # V1-M3: jitter tolerance for EU-VPS NTP
         signed_params, _sig = sign_request(self._api_secret(), body_params)
         headers = {"X-MBX-APIKEY": self._api_key()}
         return await self._request(
@@ -476,13 +495,34 @@ class BinanceSpotAdapter(ExchangeAdapter):
         except Exception:
             log.exception("place_order_mid_fetch_failed", canonical=request.canonical)
 
+        # PR #86 V2-C1: look up CoinGecko slug from paper_trades to keep
+        # live_trades.coin_id semantically consistent with engine.py path
+        # (which writes paper_trade.coin_id slug, e.g. "bitcoin"). The
+        # naive lower() ("btc") would silently corrupt analytics.
+        coin_id_slug = request.canonical.lower()  # safe fallback
+        try:
+            cur_pt = await self._db._conn.execute(
+                "SELECT token_id FROM paper_trades WHERE id = ?",
+                (request.paper_trade_id,),
+            )
+            row = await cur_pt.fetchone()
+            if row is not None and row[0]:
+                coin_id_slug = row[0]
+        except Exception:
+            log.exception(
+                "place_order_coin_id_lookup_failed",
+                paper_trade_id=request.paper_trade_id,
+            )
+
         # Step 3: record pending row, handle concurrent-INSERT race (R1-C3)
+        # PR #86 V2-I1: narrow except to sqlite3.IntegrityError so other
+        # exceptions (RuntimeError, TypeError) propagate cleanly.
         try:
             await record_pending_order(
                 self._db,
                 client_order_id=cid,
                 paper_trade_id=request.paper_trade_id,
-                coin_id=request.canonical.lower(),
+                coin_id=coin_id_slug,
                 symbol=request.canonical,
                 venue=self.venue_name,
                 pair=request.venue_pair,
@@ -490,11 +530,10 @@ class BinanceSpotAdapter(ExchangeAdapter):
                 size_usd=str(request.size_usd),
                 mid_at_entry=mid_str,
             )
-        except Exception as exc:
-            # Catch sqlite3.IntegrityError (UNIQUE constraint) or any wrapper.
-            # Re-lookup; another retry beat us. If still NULL entry_order_id,
-            # fall through to submit — Binance's -2010 catches if our prior
-            # retry already POSTed.
+        except sqlite3.IntegrityError as exc:
+            # UNIQUE constraint on client_order_id — another retry beat us.
+            # Re-lookup; if still NULL entry_order_id, fall through to submit
+            # — Binance's -2010 catches if our prior retry already POSTed.
             existing = await lookup_existing_order_id(self._db, cid)
             if existing is not None:
                 log.info(
@@ -614,7 +653,10 @@ class BinanceSpotAdapter(ExchangeAdapter):
                 status_str = body.get("status", "")
                 if status_str == "FILLED":
                     fill_price = self._extract_avg_fill_price(body)
-                    await self._write_slippage_bps(client_order_id, fill_price)
+                    # V1-I2: skip slippage write if we couldn't compute a
+                    # reliable fill price; otherwise write under txn_lock.
+                    if fill_price is not None:
+                        await self._write_slippage_bps(client_order_id, fill_price)
                     return OrderConfirmation(
                         venue=self.venue_name,
                         venue_order_id=venue_order_id,
@@ -665,10 +707,16 @@ class BinanceSpotAdapter(ExchangeAdapter):
         )
 
     @staticmethod
-    def _extract_avg_fill_price(body: dict[str, Any]) -> float:
+    def _extract_avg_fill_price(body: dict[str, Any]) -> float | None:
         """Volume-weighted avg fill price from Binance fills array.
 
         SYNC helper (R1-C5 fix — original plan had async no-await mismatch).
+
+        PR #86 V1-I2 fix: original fallback to body.avgPrice was wrong
+        (avgPrice is FUTURES-only; spot /api/v3/order returns
+        cummulativeQuoteQty + executedQty). New fallback computes
+        cummulativeQuoteQty/executedQty when both > 0; returns None when
+        we can't compute a reliable avg (caller skips slippage write).
         """
         fills = body.get("fills", []) or []
         total_qty = 0.0
@@ -678,9 +726,17 @@ class BinanceSpotAdapter(ExchangeAdapter):
             price = float(fill.get("price", "0"))
             total_qty += qty
             total_quote += qty * price
-        if total_qty <= 0:
-            return float(body.get("avgPrice", "0") or "0")
-        return total_quote / total_qty
+        if total_qty > 0:
+            return total_quote / total_qty
+        # Fallback: cummulativeQuoteQty / executedQty (spot endpoint shape)
+        try:
+            cum_quote = float(body.get("cummulativeQuoteQty", "0") or "0")
+            executed = float(body.get("executedQty", "0") or "0")
+        except (TypeError, ValueError):
+            return None
+        if executed > 0 and cum_quote > 0:
+            return cum_quote / executed
+        return None
 
     async def _write_slippage_bps(
         self, client_order_id: str, fill_price: float
