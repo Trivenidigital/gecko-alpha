@@ -147,6 +147,11 @@ For LIVE_MODE='live' to boot successfully, ALL of these must be set:
 - [ ] `LIVE_MODE=live` (Layer 2)
 - [ ] `LIVE_USE_REAL_SIGNED_REQUESTS=True` (M1.5a — REQUIRED for
       runtime bodies; default False is the emergency-revert posture)
+- [ ] `LIVE_USE_ROUTING_LAYER=True` (M1.5b — REQUIRED for engine
+      `_dispatch_live` to fire; default False preserves M1.5a behavior.
+      Engine `__init__` raises RuntimeError if this is True without
+      `LIVE_USE_REAL_SIGNED_REQUESTS=True` — silent-no-op misconfig
+      prevention per design §2.2)
 - [ ] `BINANCE_API_KEY=...` (TRADE-scoped key, IP whitelisted)
 - [ ] `BINANCE_API_SECRET=...`
 - [ ] At least one signal has `live_eligible=1` in signal_params:
@@ -154,15 +159,73 @@ For LIVE_MODE='live' to boot successfully, ALL of these must be set:
 - [ ] systemd unit hardened (§1 above)
 - [ ] OnFailure notify unit installed (§2 above)
 
-**M1.5a smoke pass ≠ live ready** (R2-I1): boot succeeds = smoke
-passed. Engine routing dispatch + approval gateway wiring + correction
-counter increment are M1.5b. Until M1.5b ships, signals will not
-actually fire live trades.
+### M1.5b first-dispatch verification (NEW — design §3 R2-I1 fold)
+
+Before flipping `LIVE_USE_ROUTING_LAYER=True`:
+
+```bash
+# Confirm first-time activation — venue_health table empty means routing
+# falls back to score 0.5 default for the first dispatch (M1.5c recurring
+# probe is the structural fix; M1.5b operator activates with eyes-open).
+ssh root@89.167.116.187 \
+  'sqlite3 /root/gecko-alpha/scout.db "SELECT * FROM venue_health;"' \
+  > .venue_health.txt
+cat .venue_health.txt  # expected: empty
+```
+
+After flipping (within 1 hour at observed ~1.8 signals/hr prod rate, the
+first dispatch should fire):
+
+```bash
+# Did _dispatch_live fire?
+ssh root@89.167.116.187 \
+  'journalctl -u gecko-pipeline --since "1 hour ago" | grep live_dispatch_entered' \
+  > .dispatch_entered.txt
+
+# Was a terminal status reached?
+ssh root@89.167.116.187 \
+  'journalctl -u gecko-pipeline --since "1 hour ago" | grep live_dispatch_terminal' \
+  > .dispatch_terminal.txt
+
+# Was the counter incremented?
+ssh root@89.167.116.187 \
+  'sqlite3 /root/gecko-alpha/scout.db "SELECT * FROM signal_venue_correction_count;"' \
+  > .counter.txt
+```
+
+**Walkaway blast-radius bound** (operator absence):
+- exposure ≤ `LIVE_TRADE_AMOUNT_USD × hourly_signal_rate × max_open_per_token × walkaway_hours`
+- defaults: `$10 × 2 × 1 × N hours` → 8-hour walkaway = ≤ $160 max exposure
+
+**Counter-reset UX cost** (design §2.5 ack): a single `reset_on_correction`
+zeros the entire `consecutive_no_correction` for the (signal_type, venue)
+pair. Worked example: 30 successful fills → counter=30 → operator unwinds
+trade #31 → counter=0 → all 30 prior good fills lose their auto-clear-
+approval progress. M1.5c may add `total_fills_lifetime` for dashboard
+telemetry that survives resets.
+
+**Anomaly response:** `LIVE_USE_ROUTING_LAYER=False` in `.env` →
+`systemctl restart gecko-pipeline` (~2 second window).
+
+**M1.5a smoke pass ≠ live ready** (R2-I1 historical): boot succeeds =
+smoke passed. With M1.5b shipped, the engine routing dispatch + correction
+counter writers ARE wired; approval gateway runtime hook + recurring
+health probe + reconciliation worker are M1.5c.
 
 ## 5. Reversibility (R2-I4 emergency revert)
 
 ### Fast revert — `.env` flip (no git)
 
+For M1.5b multi-venue routing dispatch:
+```bash
+# In .env on VPS:
+LIVE_USE_ROUTING_LAYER=False
+# systemctl restart gecko-pipeline
+# Result: engine bypasses _dispatch_live; M1.5a single-venue path
+# resumes. NEW signals are not dispatched via routing layer.
+```
+
+For M1.5a signed-request runtime bodies:
 ```bash
 # In .env on VPS:
 LIVE_USE_REAL_SIGNED_REQUESTS=False
@@ -170,6 +233,11 @@ LIVE_USE_REAL_SIGNED_REQUESTS=False
 # Result: 3 ABC runtime bodies fall back to NotImplementedError;
 # Gate 10 returns 'live_signed_disabled' reject_reason.
 ```
+
+**M1.5b in-flight caveat** (design §5): if engine restart happens
+between `place_order_request` and `await_fill_confirmation`, the order
+is live on Binance with no engine watcher. The `live_trades` row stays
+`status='open'`. Cleanup per §6.
 
 ### Slower revert — git revert
 
@@ -212,18 +280,26 @@ Manual remediation per row: query Binance
 `GET /api/v3/order?origClientOrderId=...` (signed); read terminal status;
 write outcome to live_trades manually.
 
-## 7. M1.5a → M1.5b deferred items
+## 7. M1.5b → M1.5c deferred items
 
-For tracking — these are NOT blockers for M1.5a but DO gate full live
-trading capability:
+Items closed by M1.5b:
+- ✅ Engine wiring of `RoutingLayer.get_candidates` (V1-C1 routing-half)
+- ✅ `signal_venue_correction_count.consecutive_no_correction` writer
+  (V1-C2 closure — increment on terminal=filled)
 
-- Engine wiring of `RoutingLayer.get_candidates` (currently bypassed
-  for shadow soak; M1.5b enables it under live mode)
+Items deferred to M1.5c:
 - Engine call to `should_require_approval` before adapter dispatch
-- `signal_venue_correction_count.consecutive_no_correction` increment
-  on close events (V1-C2 closure)
-- Recurring health probe (M1.5a smoke is point-in-time only)
-- M1.5b's reconciliation worker for orphaned `live_trades` rows
+  (V1-C1 approval-half)
+- Recurring health probe (M1.5a + M1.5b boot smoke is point-in-time;
+  closes design §3 R2-I1 venue_health gap structurally)
+- Reconciliation worker for orphaned `live_trades` rows (in-flight
+  reversibility caveat per §5)
+- Automatic `reset_on_correction` triggers (operator-correction window
+  detection)
+- `total_fills_lifetime` column for dashboard telemetry that survives
+  counter resets (design §2.5 UX cost mitigation)
+- V2 deferred minors: ServiceRunner cancel-log, view CAST symmetry,
+  override-NULL filter, venue_health staleness gate
 - BL-055 retirement evaluation gate (3 pre-registered conditions in
   `tasks/design_live_trading_hybrid.md` v2.1)
 
