@@ -763,7 +763,136 @@ git commit -am "feat(live-m1.5b): construct RoutingLayer + inject into LiveEngin
 
 ---
 
-## Task 4: Full regression + black
+## Task 4: Integration test using real `scout/main.py` wiring (R2-C2 fold)
+
+**Files:**
+- Create: `tests/test_live_m1_5b_integration.py` (NEW)
+
+**Why:** R2-C2 fold — design-stage R2 critical finding. Unit tests in Task 2 stub routing AND adapter. If Task 3's `routing=live_routing` kwarg is forgotten in `scout/main.py`, all unit tests pass and prod silently no-ops. The integration test catches this regression class by exercising the real `main.py` wiring code.
+
+- [ ] **Step 1: Failing integration test**
+
+```python
+"""BL-NEW-LIVE-HYBRID M1.5b: integration test — real main.py wiring,
+stub only the Binance HTTP layer (via aioresponses)."""
+
+@pytest.mark.asyncio
+async def test_m1_5b_end_to_end_routing_dispatch(tmp_path, aioresponses):
+    """Operator flips all 4 flags + paper-trade opens + _dispatch_live
+    fires + place_order_request called + await_fill_confirmation returns
+    FILLED + counter increments to 1 + live_dispatch_terminal event
+    emitted. Catches the regression where main.py forgets the
+    routing=live_routing kwarg."""
+
+    # 1. Construct settings with all 4 flags set
+    settings = Settings(
+        _env_file=None,
+        LIVE_TRADING_ENABLED=True,
+        LIVE_USE_REAL_SIGNED_REQUESTS=True,
+        LIVE_USE_ROUTING_LAYER=True,
+        LIVE_MODE="live",
+        BINANCE_API_KEY="test_key",
+        BINANCE_API_SECRET="test_secret",
+        ...
+    )
+
+    # 2. Mock Binance HTTP responses (signed endpoints + exchangeInfo)
+    aioresponses.get(re.compile(r"/api/v3/exchangeInfo.*"), payload={...})
+    aioresponses.post(re.compile(r"/api/v3/order.*"), payload={
+        "orderId": 12345,
+        "status": "FILLED",
+        ...
+    })
+    aioresponses.get(re.compile(r"/api/v3/order.*"), payload={
+        "status": "FILLED",
+        "executedQty": "1.0",
+        "cummulativeQuoteQty": "10.0",
+        "fills": [...],
+    })
+
+    # 3. Construct LiveEngine via the SAME path scout/main.py uses
+    # (lift the construction code into a helper or import from main.py)
+    db, live_engine = await _construct_via_main_path(settings, tmp_path)
+
+    # 4. Open a paper trade — engine should fire _dispatch_live
+    paper_trade = await open_paper_trade(db, signal_type="first_signal", ...)
+    await live_engine.on_paper_trade_opened(paper_trade)
+
+    # 5. Verify counter incremented
+    counter = await get_counter(db, "first_signal", "binance")
+    assert counter == 1
+
+    # 6. Verify live_trades row exists with status='filled'
+    rows = await db._conn.execute("SELECT status FROM live_trades").fetchall()
+    assert any(r[0] == "filled" for r in rows)
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add tests/test_live_m1_5b_integration.py
+git commit -m "test(live-m1.5b): integration test for end-to-end routing dispatch (Task 4, R2-C2)"
+```
+
+---
+
+## Task 5: Runbook updates (R2-I4 fold)
+
+**Files:**
+- Modify: `docs/runbooks/live-trading-deploy.md`
+
+- [ ] **Step 1: §4 .env activation checklist** — add `LIVE_USE_ROUTING_LAYER=True` as a REQUIRED checklist item
+
+- [ ] **Step 2: §4 first-dispatch verification block (NEW)** — add the pre-flip verification command, walkaway calc, and post-flip log greps from design §3:
+
+```markdown
+### M1.5b first-dispatch verification (NEW)
+
+Before flipping `LIVE_USE_ROUTING_LAYER=True`:
+
+```bash
+# Confirm first-time activation (no probe rows yet — gap is genuine)
+ssh root@89.167.116.187 \
+  'sqlite3 /root/gecko-alpha/scout.db "SELECT * FROM venue_health;"'
+# Expected: empty
+```
+
+After flipping (within 1 hour):
+
+```bash
+# Did _dispatch_live fire?
+journalctl -u gecko-pipeline --since "1 hour ago" | grep live_dispatch_entered
+
+# Was a terminal status reached?
+journalctl -u gecko-pipeline --since "1 hour ago" | grep live_dispatch_terminal
+
+# Was the counter incremented?
+sqlite3 /root/gecko-alpha/scout.db "SELECT * FROM signal_venue_correction_count;"
+```
+
+**Walkaway blast-radius bound** (operator absence):
+- exposure ≤ `LIVE_TRADE_AMOUNT_USD × hourly_signal_rate × max_open_per_token × walkaway_hours`
+- defaults: `$10 × 2 × 1 × N hours` → 8-hour walkaway = ≤ $160 max exposure
+
+**Anomaly response:** `LIVE_USE_ROUTING_LAYER=False` → `systemctl restart gecko-pipeline` (~2 second window).
+```
+
+- [ ] **Step 3: §5 reversibility** — add in-flight caveat note: "if engine restart happens between place_order_request and await_fill_confirmation, the order is live on Binance with no engine watcher; cleanup per §6"
+
+- [ ] **Step 4: §6 orphaned trade reconciliation** — extend SELECT query annotation to cover M1.5b's flag-flipped-mid-await_fill scenario; explicit step-by-step manual remediation
+
+- [ ] **Step 5: §7 deferred items** — reslate from "M1.5a → M1.5b deferred" to "M1.5b → M1.5c deferred"; remove items closed by M1.5b (engine routing dispatch, correction counter writers); keep items deferred to M1.5c (Telegram approval gateway, recurring health probe, reconciliation worker)
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add docs/runbooks/live-trading-deploy.md
+git commit -m "docs(runbook): M1.5b activation checklist + first-dispatch verification (Task 5, R2-I4)"
+```
+
+---
+
+## Task 6: Full regression + black
 
 ```bash
 uv run --native-tls pytest tests/test_live_*.py tests/live/ -q
@@ -773,7 +902,7 @@ git commit -am "chore(live-m1.5b): black reformat"
 
 ---
 
-## Task 5: PR + 3-vector reviewers + merge + deploy
+## Task 7: PR + 3-vector reviewers + merge + deploy
 
 Per CLAUDE.md §8 (money flows axis):
 - V1 — statistical/policy: counter semantic correctness; correction-counter use case alignment with V1's approval-removal gate.
