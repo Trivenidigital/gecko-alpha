@@ -68,6 +68,45 @@ async def check_sufficient_balance(
             detail=f"adapter.fetch_account_balance not implemented: {exc}",
         )
     except Exception as exc:
+        # PR #86 V3-I3 fold: surface VenueTransientError + IPBan as a
+        # distinct detail string — caller (Gate 10) maps to
+        # reject_reason='venue_unavailable' instead of confusing operator
+        # with 'insufficient_balance' during a Binance maintenance window.
+        from scout.live.exceptions import VenueTransientError
+
+        try:
+            from scout.live.binance_adapter import (
+                BinanceIPBanError,
+                BinanceInsufficientFundsError,
+            )
+        except ImportError:  # pragma: no cover
+            BinanceIPBanError = type("BinanceIPBanError", (Exception,), {})
+            BinanceInsufficientFundsError = type(
+                "BinanceInsufficientFundsError", (Exception,), {}
+            )
+
+        if isinstance(exc, BinanceInsufficientFundsError):
+            # PR #86 V1-C1: -2018/-2019 from Binance. Real funds shortage —
+            # NOT venue-down — so treat as insufficient_balance.
+            log.info("balance_gate_insufficient_funds_from_venue", err=str(exc))
+            return BalanceGateResult(
+                passed=False,
+                available_usd=0.0,
+                required_with_margin_usd=required_with_margin,
+                detail=f"venue reported insufficient funds: {exc}",
+            )
+        if isinstance(exc, (VenueTransientError, BinanceIPBanError)):
+            log.warning(
+                "balance_gate_venue_unavailable",
+                exc_type=type(exc).__name__,
+                err=str(exc),
+            )
+            return BalanceGateResult(
+                passed=False,
+                available_usd=0.0,
+                required_with_margin_usd=required_with_margin,
+                detail=f"venue_unavailable: {type(exc).__name__}: {exc}",
+            )
         log.exception("balance_gate_fetch_failed", asset=asset)
         return BalanceGateResult(
             passed=False,

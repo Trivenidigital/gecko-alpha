@@ -162,6 +162,9 @@ def test_param_lists_cover_check_constraint():
         "all_candidates_failed",
         "master_kill",
         "mode_paper",
+        # M1.5a (design-stage R1-I1 + R2-I3) additions:
+        "live_signed_disabled",
+        "api_key_lacks_trade_scope",
     }
     assert VALID_REJECT_REASONS == expected
 
@@ -389,18 +392,24 @@ async def test_gate_venue_unavailable_on_transient_error(tmp_path):
     await db.close()
 
 
-async def test_gate_balance_raises_in_live_mode(tmp_path):
+async def test_gate_balance_returns_live_signed_disabled_in_live_mode(tmp_path):
+    """M1.5a (PR #86 R1-I1 fold): LIVE_MODE=live with default
+    LIVE_USE_REAL_SIGNED_REQUESTS=False returns reject_reason=
+    'live_signed_disabled' (kill-switch state visibility on dashboard)
+    instead of the M1 NotImplementedError. BL-055 contract preserved
+    semantically — Gate 10 still refuses to fire — but operator
+    dashboard can distinguish 'flag-off revert posture' from a real
+    balance shortage."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    # LIVE_MODE=live must raise NotImplementedError once all pre-balance gates
-    # pass. BL-055 deliberately refuses to reach a real balance check — that
-    # lands in BL-058. Startup-gating is the main defense; this is belt-and-braces.
-    settings = _settings(LIVE_MODE="live")
+    settings = _settings(LIVE_MODE="live")  # LIVE_USE_REAL_SIGNED_REQUESTS defaults False
     gates = await _make_gates(db, settings=settings)
-    with pytest.raises(NotImplementedError, match="BL-058"):
-        await gates.evaluate(
-            signal_type="first_signal",
-            symbol="TEST",
-            size_usd=Decimal("100"),
-        )
+    result, _venue = await gates.evaluate(
+        signal_type="first_signal",
+        symbol="TEST",
+        size_usd=Decimal("100"),
+    )
+    assert result.passed is False
+    assert result.reject_reason == "live_signed_disabled"
+    assert "emergency-revert" in result.detail
     await db.close()

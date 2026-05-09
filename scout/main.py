@@ -1030,9 +1030,13 @@ async def main(argv: list[str] | None = None) -> int:
     # BL-NEW-LIVE-HYBRID M1 v2.1 startup notification (Task 14):
     # post a Telegram alert ONCE when LIVE_TRADING_ENABLED=True at
     # process startup so the operator confirms the master kill state.
-    # Uses parse_mode=None to avoid Markdown anchor mis-parsing on the
-    # `$` chars (silent 400 per PR #76 silent-failure C1).
-    if getattr(settings, "LIVE_TRADING_ENABLED", False):
+    # PR #86 V3-M1: only fire when mode='live' too — a paper-mode boot
+    # with LIVE_TRADING_ENABLED=True is a sensible safety step (not
+    # alarming) and shouldn't generate a "master kill OFF" alert.
+    if (
+        getattr(settings, "LIVE_TRADING_ENABLED", False)
+        and live_config.mode == "live"
+    ):
         try:
             async with aiohttp.ClientSession() as _startup_session:
                 await alerter.send_telegram_message(
@@ -1052,26 +1056,92 @@ async def main(argv: list[str] | None = None) -> int:
 
     if live_config.mode in ("shadow", "live"):
         if live_config.mode == "live":
+            # M1.5a Layer 1 master-kill enforcement (replaces M1's
+            # NotImplementedError): operator MUST flip LIVE_TRADING_ENABLED
+            # to enter live mode.
+            if not getattr(settings, "LIVE_TRADING_ENABLED", False):
+                await db.close()
+                raise RuntimeError(
+                    "LIVE_MODE=live requires LIVE_TRADING_ENABLED=True "
+                    "(Layer 1 master kill). Operator must set "
+                    "LIVE_TRADING_ENABLED=True in .env after answering "
+                    "the 4 design open questions + funding the venue."
+                )
             if not settings.BINANCE_API_KEY or not settings.BINANCE_API_SECRET:
                 await db.close()
                 raise RuntimeError("LIVE_MODE=live requires BINANCE_API_KEY/SECRET")
-            # Balance gate is not yet implemented — fail closed at boot so
-            # shadow traffic cannot accidentally leak to real funds.
-            # NOTE: BL-NEW-LIVE-HYBRID M1 v2.1 Layer 1 master-kill enforcement
-            # (LIVE_TRADING_ENABLED required when LIVE_MODE=live) lands AFTER
-            # this NotImplementedError in M1.5 — when balance_gate is wired,
-            # the next guard becomes:
-            #   if not settings.LIVE_TRADING_ENABLED:
-            #       raise RuntimeError("LIVE_MODE=live requires LIVE_TRADING_ENABLED=True")
-            # M1 ships the master-kill knob (defaults False) + the design
-            # commitment, but the runtime guard activates with M1.5's balance
-            # gate wiring. Today this NotImplementedError IS the Layer 1
-            # enforcement (no path to real money exists).
-            await db.close()
-            raise NotImplementedError(
-                "balance gate not wired for live mode — cannot start live "
-                "trading until scout/live/balance_gate.py is implemented"
+
+            # M1.5a balance smoke check (replaces M1's NotImplementedError).
+            # PR #86 V3-I2 fold: smoke check should also gate on
+            # LIVE_USE_REAL_SIGNED_REQUESTS=True. Otherwise operator who
+            # forgets that flag boots cleanly + every signal fires
+            # 'live_signed_disabled' indefinitely.
+            if not getattr(settings, "LIVE_USE_REAL_SIGNED_REQUESTS", False):
+                await db.close()
+                raise RuntimeError(
+                    "LIVE_MODE=live requires LIVE_USE_REAL_SIGNED_REQUESTS=True. "
+                    "Default False is the M1.5a emergency-revert posture; "
+                    "operator must explicitly opt in to live execution by "
+                    "setting LIVE_USE_REAL_SIGNED_REQUESTS=True in .env "
+                    "after balance smoke check passes on testnet."
+                )
+
+            # R2-C1: verify SPOT permission, not just balance fetch
+            # R2-I6: 10s timeout (was 5s), absorbs EU-VPS jitter
+            from scout.live.binance_adapter import (
+                BinanceAuthError,
+                BinanceSpotAdapter,
             )
+
+            smoke_adapter = BinanceSpotAdapter(settings, db=db)
+            smoke_start = time.monotonic()
+            try:
+                account = await asyncio.wait_for(
+                    smoke_adapter._signed_get("/api/v3/account", params={}),
+                    timeout=10.0,
+                )
+                permissions = account.get("permissions", []) or []
+                if "SPOT" not in permissions:
+                    await smoke_adapter.close()
+                    await db.close()
+                    raise RuntimeError(
+                        f"LIVE_MODE=live boot blocked: API key lacks SPOT trade "
+                        f"permission. Got permissions={permissions!r}. Verify in "
+                        f"Binance API console (Edit Restrictions → Enable Spot "
+                        f"& Margin Trading)."
+                    )
+                balances = account.get("balances", []) or []
+                usdt_free = next(
+                    (
+                        float(b.get("free", "0"))
+                        for b in balances
+                        if b.get("asset") == "USDT"
+                    ),
+                    0.0,
+                )
+                smoke_dur_ms = int((time.monotonic() - smoke_start) * 1000)
+                logger.info(
+                    "live_smoke_check_passed",
+                    usdt_free=usdt_free,
+                    permissions=permissions,
+                    duration_ms=smoke_dur_ms,
+                )
+            except BinanceAuthError as exc:
+                await smoke_adapter.close()
+                await db.close()
+                raise RuntimeError(
+                    f"LIVE_MODE=live smoke check auth-fail: {exc}. "
+                    "Verify BINANCE_API_KEY/SECRET correctness + IP whitelist + "
+                    "key not revoked + key has TRADE permission scope."
+                ) from exc
+            except Exception as exc:  # R1-I4: single Exception clause
+                await smoke_adapter.close()
+                await db.close()
+                raise RuntimeError(
+                    f"LIVE_MODE=live smoke check failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            await smoke_adapter.close()
         live_adapter = BinanceSpotAdapter(settings, db=db)
         _live_owned.append(live_adapter)
         resolver = VenueResolver(
