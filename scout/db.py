@@ -2643,6 +2643,17 @@ class Database:
                     1,
                 )
 
+                # SQLite refuses to DROP a table while a view references it.
+                # cross_venue_exposure references live_trades; drop both views
+                # before the rebuild and recreate them after with the same
+                # DDL used in `_migrate_per_venue_services`. Idempotent via
+                # CREATE VIEW IF NOT EXISTS — re-runs on already-rebuilt DB
+                # are no-ops because the views already exist (this branch
+                # short-circuits earlier on the marker check).
+                if table == "live_trades":
+                    await conn.execute("DROP VIEW IF EXISTS cross_venue_exposure")
+                    await conn.execute("DROP VIEW IF EXISTS cross_venue_pnl")
+
                 await conn.execute(new_table_sql_renamed)
                 await conn.execute(
                     f"INSERT INTO {table}_new ({col_list}) "
@@ -2659,6 +2670,35 @@ class Database:
                         ).fetchone()
                     )[0],
                 )
+
+                if table == "live_trades":
+                    # Recreate views (DDL identical to _migrate_per_venue_services)
+                    await conn.execute(
+                        """CREATE VIEW IF NOT EXISTS cross_venue_exposure AS
+                           SELECT
+                               'binance' AS venue,
+                               COALESCE(SUM(CAST(size_usd AS REAL)), 0) AS open_exposure_usd,
+                               COUNT(*) AS open_count
+                           FROM live_trades
+                           WHERE status = 'open'
+                           UNION ALL
+                           SELECT
+                               'minara_' || COALESCE(chain, 'unknown') AS venue,
+                               COALESCE(SUM(amount_usd), 0) AS open_exposure_usd,
+                               COUNT(*) AS open_count
+                           FROM paper_trades
+                           WHERE status = 'open'
+                             AND chain != 'coingecko'
+                             AND chain != ''
+                           GROUP BY chain"""
+                    )
+                    await conn.execute(
+                        """CREATE VIEW IF NOT EXISTS cross_venue_pnl AS
+                           SELECT
+                               'placeholder_m1' AS venue,
+                               0.0 AS realized_pnl_usd,
+                               0.0 AS unrealized_pnl_usd"""
+                    )
 
             await conn.execute(
                 "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
