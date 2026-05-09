@@ -136,6 +136,19 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 - Update MIN_SCORE semantics if needed
 **Acceptance:** All scores remain 0-100, tests verify edge cases
 
+### BL-NEW-QUOTE-PAIR: Stable-pair liquidity-quality signal
+**Status:** SHIPPED 2026-05-09 — PR #85 (`3774591`) squash-merged + deployed VPS 2026-05-09T16:40:34Z. Migration `bl_quote_pair_v1` (schema_version 20260513) applied; columns `quote_symbol` + `dex_id` added to candidates table; forward-ingestion populating both fields for DexScreener-sourced rows.
+**Tag:** `scoring` `dexscreener` `co-occurrence`
+**Files:** scout/models.py (2 fields + parser), scout/config.py (3 settings), scout/scorer.py (inlined signal), scout/db.py (migration + columns), scout/aggregator.py (`_PRESERVE_FIELDS`), tests/test_models_quote_pair.py, tests/test_scorer_quote_pair.py, tests/test_db_migration_bl_quote_pair.py, tests/test_aggregator.py.
+**Why:** DexScreener returns `quoteToken.symbol` + `dexId` per pair but the parser was discarding both. Tokens paired with USDC/USDT have materially different exit dynamics than WETH/SOL-paired tokens (no secondary stable-leg slippage). Industry precedent: Birdeye/GMGN use stable-pair as a standard liquidity-quality discriminator.
+**Effect:** +5 raw / +2 normalized when `quote_symbol ∈ {USDC, USDT, DAI, FDUSD, USDe, PYUSD, RLUSD, sUSDe} AND liquidity_usd >= $50K`. Counts toward co-occurrence multiplier (intended — stable-pair is real evidence).
+**Magnitude analysis:** Direct +2 normalized is a tiebreaker; dominant mechanical effect is when `stable_paired_liq` pushes a 2-signal token to 3-signal, triggering the 1.15× co-occurrence multiplier (~+15 normalized uplift).
+**Test count:** 32 new + 11 added during PR review = 43 net-new (160-test subset baseline went 149→160).
+**Pipeline executed:** Industry research → drift+Hermes-first → plan + 2 reviewers (R1 statistical, R2 code-structural) → fixes → design + 2 reviewers (R3 test-discipline, R4 operational) → fixes → build (TDD) → PR #85 + 3 reviewers (R5 code-quality, R6 silent-failure, R7 type/integration) → 1 CRITICAL + 5 MUST-FIX + 1 NIT folded → squash-merge → deploy.
+**Soak:** D+0 = 2026-05-09T16:40Z; D+3 mid-soak verification 2026-05-12; D+7 ends 2026-05-16. Revert via `STABLE_PAIRED_BONUS=0` env override (no code rollback). Acceptance: alert volume must not exceed +10% baseline.
+**Skipped reviewer NITs (deferred):** sub-threshold debug log; INSERT OR IGNORE log; lock-contention test; Literal type for quote_symbol; frozenset vs tuple; `dex_id` consumer (planned); GT-only token coverage (defer to soak data).
+**See:** `tasks/plan_quote_pair_signal.md`, `tasks/design_quote_pair_signal.md`, memory `project_bl_quote_pair_2026_05_09.md`.
+
 ---
 
 ## P2 — Phase 2 Enhancements (Helius/Moralis required)
@@ -216,6 +229,18 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Files:** scout/main.py
 **Why:** PRD requires heartbeat log showing: tokens scanned, candidates promoted, alerts fired, MiroFish jobs today.
 **Changes:** Track cumulative stats, log summary every 5 min (or every N cycles)
+
+### BL-NEW-INGEST-WATCHDOG: Per-source ingestion starvation alert
+**Status:** PROPOSED — queued autonomously 2026-05-09. Plan/design not yet committed; resume via "execute item 2" after BL-NEW-QUOTE-PAIR D+3 mid-soak (~2026-05-12) to keep soak signals separable.
+**Tag:** `observability` `silent-failure` `tg-alert`
+**Files (planned):** scout/heartbeat.py (per-source consecutive-empty counter), scout/main.py (cycle-loop instrumentation), scout/alerter.py (TG starvation message), tests/test_heartbeat.py.
+**Why:** When a single ingestion source (CoinGecko / DexScreener / GeckoTerminal) returns 0 candidates for N consecutive cycles, the pipeline silently keeps running on the remaining sources. Memory `feedback_clear_pycache_on_deploy.md` and the BL-066' incident showed the operator only learns about silent ingestion failures via downstream symptoms (e.g., paper-trade volume drop). Industry-standard ops pattern.
+**Drift verdict:** NET-NEW. Heartbeat module (`scout/heartbeat.py`) currently tracks aggregate cycle stats only — no per-source counters. Existing failure-streak precedent: `_combo_refresh_failure_streak` (`scout/main.py:92`), `_social_consecutive_restarts` (`scout/main.py:89`). The proposed implementation follows that pattern.
+**Hermes verdict:** No DevOps / Monitoring skill in 18 Hermes domains covers per-source-API starvation watchdog. Build from scratch.
+**Effect:** New per-source counter (`_consecutive_empty_cycles[source]`); increments when a source returns `[]`; resets on first non-empty cycle. When counter ≥ `INGEST_STARVATION_THRESHOLD` (default 3), emit TG alert + structlog warning with last-success timestamp. One alert per source per starvation episode (no flood; clears on recovery alert).
+**Risks:** False positives when an upstream API has a legitimate quiet period. Mitigation: per-source threshold tunable via Settings; threshold 3 (= ~15 minutes at default cycle interval) is conservative. Telegram credentials are now wired (2026-05-06) — false positives WOULD reach the operator, so the threshold matters.
+**Soak isolation rationale:** Item 2 sends Telegram alerts. Deploying it during BL-NEW-QUOTE-PAIR's 7d soak would mix new alert noise with existing alert-volume measurements, making the +10% revert threshold harder to attribute. Defer until D+3 mid-soak verification of BL-NEW-QUOTE-PAIR (2026-05-12) at minimum.
+**Estimate:** ~2-3 hours coding + tests, ~1 hour reviewer dispatch + fix cycles, ~30 min PR + reviewers + merge + deploy. Same pipeline shape as BL-NEW-QUOTE-PAIR.
 
 ### BL-034: Set up MiroFish Docker integration
 **Status:** DROPPED — Claude Haiku fallback is sufficient, gate lowered to MIN_SCORE=25
