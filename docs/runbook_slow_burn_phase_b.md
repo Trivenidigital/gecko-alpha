@@ -52,25 +52,58 @@ WHERE datetime(detected_at) >= datetime('now', '-14 days');
 If <35: thresholds too tight. Widen `SLOW_BURN_MIN_7D_CHANGE` from 50 → 40
 and resoak 7 more days.
 
-### Gate 2 — Quality (≥3 of first 35 hit ≥2x in 30d post-detection)
+### Gate 2 — Quality (≥3 of first 35 hit ≥2x within outcome window)
 
-Manual operator check — query the first 35 detections (in chronological
-order) with their detection-time `current_price`, then re-query CG today
-and compute % gain. Threshold: ≥3 of those 35 must show ≥2x.
+**Methodology pre-registered 2026-05-10 (post-merge user feedback):** lock the
+assessment process BEFORE D+14 to prevent drift to "whatever feels right when
+staring at the 35 detections."
 
-```sql
-SELECT coin_id, symbol, detected_at, current_price, market_cap
-FROM slow_burn_candidates
-ORDER BY detected_at ASC
-LIMIT 35;
-```
+| Field | Value |
+|---|---|
+| Sample selection | All 35 detections if exactly 35; first 35 by detection time if more; flag-and-extend soak if fewer than 35 by D+14 |
+| Outcome window | **48 hours** from detection-time epoch |
+| 2x definition | Price at any point within outcome window ≥ 2× detection-time price (any tick, NOT close-to-close) |
+| Reviewer | Operator-only, no LLM-assisted classification |
+| Acceptance threshold | **≥3 of 35 (8.6%) hit 2x within outcome window** |
 
-For each row: `https://api.coingecko.com/api/v3/coins/<coin_id>` → check
-`market_data.current_price.usd` → compute `(now_price / detected_price) - 1`.
-Manual eval; no automation in v1.
+Numbers tunable, structure locked. Same discipline pattern as the operator-
+removal criteria pre-registration on the live-trading thread.
 
-If <3 of 35: the signal is no better than random — close BL-075 as
-won't-fix-on-this-axis.
+#### Step-by-step procedure
+
+1. **Pull the sample** — query rows in chronological order, capturing detection-time
+   `current_price` as the baseline:
+   ```sql
+   SELECT coin_id, symbol, detected_at, current_price, market_cap
+   FROM slow_burn_candidates
+   ORDER BY detected_at ASC
+   LIMIT 35;
+   ```
+2. **For each coin, fetch the 48h price range post-detection** via CG OHLC:
+   `https://api.coingecko.com/api/v3/coins/<coin_id>/ohlc?vs_currency=usd&days=2`
+   — returns 30-min candles. Find max(`high`) within (detection_at, detection_at + 48h).
+3. **Compute hit ratio:** `max_price_48h / detected_current_price`. Hit if ≥ 2.0.
+4. **Tally:** count coins where hit==True. Accept if count ≥ 3.
+
+#### What "high" means
+
+The 2x test is "any tick within window" — using the OHLC `high` field, NOT
+the closing price. This catches transient pumps that retrace within the
+window. The slow-burn signal's value proposition is "catches early; user
+exits at peak via existing trail logic" — the 2x-tick semantic matches that
+exit assumption.
+
+#### If <3 of 35 hit 2x
+
+Signal is no better than random for slow-burn detection. Close BL-075 as
+won't-fix-on-this-axis. Document the cohort that survived 14d shadow
+storage but failed quality gate as anti-evidence for the proposal — useful
+for blocking future "let's revisit this" loops.
+
+#### If sample size < 35 by D+14
+
+Flag-and-extend. Continue soak 7 more days, re-evaluate. Do NOT relax the
+35-coin floor (statistical power requirement per R1's plan-stage finding).
 
 ### Gate 3 — Separability (<70% momentum_7d overlap)
 
