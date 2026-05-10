@@ -102,17 +102,26 @@ class TradingEngine:
         # Monotonic start marker for the warmup window
         self._started_at = time.monotonic()
         # BL-NEW-TG-ALERT-ALLOWLIST (R1-I3+I5 design fold): aiohttp.ClientSession
-        # for TG dispatch. Wired by scout/main.py inside the cycle's
-        # ClientSession block. None at construction is allowed but means
-        # TG alerts will fail with AttributeError + log dispatch_failed
-        # for every fire — the joint check in main.py guarantees session
-        # is non-None when this engine is constructed.
+        # for TG dispatch. Wired AFTER construction by main.py via
+        # set_tg_session(session) inside the cycle's ClientSession block,
+        # because the engine is constructed BEFORE the ClientSession
+        # context manager opens. None during the brief construction-to-
+        # set_tg_session window means TG alerts can't fire — but no paper
+        # trades are processed in that window either.
         self._tg_session = session
         # R1-C3 design fold: ref-holding set so spawned alert tasks aren't
         # GC'd mid-flight (mirrors scout/main.py:91 `_social_restart_tasks`
         # pattern). Mid-flight loss on shutdown is acceptable — paper
         # trade row is committed; only the alert + log row is lost.
         self._tg_alert_tasks: set[asyncio.Task] = set()
+
+    def set_tg_session(self, session) -> None:
+        """Wire the aiohttp.ClientSession used for TG alert dispatch.
+
+        scout/main.py calls this inside the cycle's `async with
+        aiohttp.ClientSession() as session:` block.
+        """
+        self._tg_session = session
 
     async def open_trade(
         self,
