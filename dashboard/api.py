@@ -33,6 +33,7 @@ _log = structlog.get_logger()
 # can't itself fail on a deferred import.
 try:
     from scout.config import Settings as _ScoutSettings
+
     _DASHBOARD_SETTINGS = _ScoutSettings()
 except Exception as _e:  # pragma: no cover — paranoia for misconfigured .env
     _DASHBOARD_SETTINGS = None
@@ -54,6 +55,7 @@ async def _get_scout_db(db_path: str):
     global _scout_db
     if _scout_db is None:
         from scout.db import Database as ScoutDatabase
+
         _scout_db = ScoutDatabase(db_path)
         await _scout_db.initialize()
     return _scout_db
@@ -104,7 +106,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
         limit: int = Query(50, ge=1, le=500),
         outcome: str | None = Query(None),
     ):
-        return await db.get_narrative_predictions(_db_path, limit=limit, outcome=outcome)
+        return await db.get_narrative_predictions(
+            _db_path, limit=limit, outcome=outcome
+        )
 
     @app.get("/api/narrative/metrics")
     async def get_narrative_metrics():
@@ -141,9 +145,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
         strategy_rows = await db.get_narrative_strategy(_db_path)
         row_map = {r["key"]: r for r in strategy_rows}
         if key not in row_map:
-            return JSONResponse(status_code=404, content={"detail": f"Key '{key}' not found"})
+            return JSONResponse(
+                status_code=404, content={"detail": f"Key '{key}' not found"}
+            )
         if row_map[key].get("locked"):
-            return JSONResponse(status_code=403, content={"detail": f"Key '{key}' is locked"})
+            return JSONResponse(
+                status_code=403, content={"detail": f"Key '{key}' is locked"}
+            )
 
         # Bounds validation
         if key in STRATEGY_BOUNDS:
@@ -158,12 +166,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
             if numeric_val < lo or numeric_val > hi:
                 return JSONResponse(
                     status_code=400,
-                    content={"detail": f"Value for '{key}' must be between {lo} and {hi}"},
+                    content={
+                        "detail": f"Value for '{key}' must be between {lo} and {hi}"
+                    },
                 )
 
         result = await db.update_narrative_strategy(_db_path, key, body.value)
         if result is None:
-            return JSONResponse(status_code=404, content={"detail": f"Key '{key}' not found"})
+            return JSONResponse(
+                status_code=404, content={"detail": f"Key '{key}' not found"}
+            )
         return result
 
     @app.get("/api/narrative/learn-logs")
@@ -227,7 +239,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if not row:
             return JSONResponse(status_code=404, content={"error": "Trade not found"})
         if row["status"] != "open":
-            return JSONResponse(status_code=400, content={"error": "Trade already closed"})
+            return JSONResponse(
+                status_code=400, content={"error": "Trade already closed"}
+            )
 
         token_id = row["token_id"]
         pc = await sdb._conn.execute(
@@ -238,7 +252,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         trader = PaperTrader()
         await trader.execute_sell(
-            db=sdb, trade_id=trade_id,
+            db=sdb,
+            trade_id=trade_id,
             current_price=current_price,
             reason="manual",
             slippage_bps=50,
@@ -305,14 +320,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
     # --- Trending Tracker endpoints ---
 
     @app.get("/api/trending/snapshots")
-    async def trending_snapshots(hours: int = Query(24, ge=1, le=168), limit: int = Query(100, ge=1, le=500)):
+    async def trending_snapshots(
+        hours: int = Query(24, ge=1, le=168), limit: int = Query(100, ge=1, le=500)
+    ):
         from scout.trending.tracker import get_recent_snapshots
+
         sdb = await _get_scout_db(_db_path)
         return await get_recent_snapshots(sdb, hours=hours, limit=limit)
 
     @app.get("/api/trending/stats")
     async def trending_stats():
         from scout.trending.tracker import get_trending_stats
+
         sdb = await _get_scout_db(_db_path)
         stats = await get_trending_stats(sdb)
         return stats.model_dump()
@@ -320,6 +339,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/trending/comparisons")
     async def trending_comparisons(limit: int = Query(100, ge=1, le=500)):
         from scout.trending.tracker import get_recent_comparisons
+
         sdb = await _get_scout_db(_db_path)
         return await get_recent_comparisons(sdb, limit=limit)
 
@@ -424,6 +444,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def spikes_recent(limit: int = Query(20, ge=1, le=200)):
         """Recent volume spikes."""
         from scout.spikes.detector import get_recent_spikes
+
         sdb = await _get_scout_db(_db_path)
         return await get_recent_spikes(sdb, limit=limit)
 
@@ -431,6 +452,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def spikes_stats():
         """Spike detection stats."""
         from scout.spikes.detector import get_spike_stats
+
         sdb = await _get_scout_db(_db_path)
         return await get_spike_stats(sdb)
 
@@ -440,6 +462,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def momentum_7d_recent(limit: int = Query(20, ge=1, le=200)):
         """Tokens with extreme 7d returns detected by the momentum scanner."""
         from scout.spikes.detector import get_recent_momentum_7d
+
         sdb = await _get_scout_db(_db_path)
         return await get_recent_momentum_7d(sdb, limit=limit)
 
@@ -447,8 +470,28 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def momentum_7d_stats():
         """7d momentum scanner stats."""
         from scout.spikes.detector import get_momentum_7d_stats
+
         sdb = await _get_scout_db(_db_path)
         return await get_momentum_7d_stats(sdb)
+
+    # --- Slow-Burn Watcher endpoints (BL-075 Phase B) ---
+
+    @app.get("/api/slow_burn")
+    async def slow_burn_recent(limit: int = Query(20, ge=1, le=200)):
+        """Recent slow-burn detections (research-only)."""
+        from scout.spikes.detector import get_recent_slow_burn
+
+        sdb = await _get_scout_db(_db_path)
+        return await get_recent_slow_burn(sdb, limit=limit)
+
+    @app.get("/api/slow_burn/stats")
+    async def slow_burn_stats():
+        """Slow-burn stats incl. D+14 soak gate values (volume / mcap-unknown
+        cohort split / momentum_7d overlap %)."""
+        from scout.spikes.detector import get_slow_burn_stats
+
+        sdb = await _get_scout_db(_db_path)
+        return await get_slow_burn_stats(sdb)
 
     # --- Top Gainers Tracker endpoints ---
 
@@ -456,6 +499,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def gainers_snapshots(limit: int = Query(20, ge=1, le=200)):
         """Recent top gainers snapshots."""
         from scout.gainers.tracker import get_recent_gainers
+
         sdb = await _get_scout_db(_db_path)
         return await get_recent_gainers(sdb, limit=limit)
 
@@ -463,6 +507,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def gainers_comparisons(limit: int = Query(50, ge=1, le=500)):
         """Gainers comparisons enriched with price_cache data."""
         from scout.gainers.tracker import get_gainers_comparisons
+
         sdb = await _get_scout_db(_db_path)
         comparisons = await get_gainers_comparisons(sdb, limit=limit)
         if not comparisons:
@@ -548,6 +593,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def gainers_stats():
         """Gainers tracker hit rate stats."""
         from scout.gainers.tracker import get_gainers_stats
+
         sdb = await _get_scout_db(_db_path)
         return await get_gainers_stats(sdb)
 
@@ -557,6 +603,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def losers_comparisons(limit: int = Query(50, ge=1, le=500)):
         """Losers comparisons with signal detection."""
         from scout.losers.tracker import get_losers_comparisons
+
         sdb = await _get_scout_db(_db_path)
         return await get_losers_comparisons(sdb, limit=limit)
 
@@ -564,6 +611,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def losers_stats():
         """Losers tracker hit rate stats."""
         from scout.losers.tracker import get_losers_stats
+
         sdb = await _get_scout_db(_db_path)
         return await get_losers_stats(sdb)
 
@@ -600,16 +648,22 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 remaining = int(300 - elapsed)
                 return JSONResponse(
                     status_code=429,
-                    content={"detail": f"Cooldown: wait {remaining}s before next manual briefing"},
+                    content={
+                        "detail": f"Cooldown: wait {remaining}s before next manual briefing"
+                    },
                 )
 
         try:
             sdb = await _get_scout_db(_db_path)
             from scout.config import get_settings
+
             settings = get_settings()
 
             if not settings.ANTHROPIC_API_KEY:
-                return JSONResponse(status_code=400, content={"detail": "ANTHROPIC_API_KEY not configured"})
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "ANTHROPIC_API_KEY not configured"},
+                )
 
             import aiohttp as _aio
             from scout.briefing.collector import collect_briefing_data
@@ -633,7 +687,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
             _last_manual_briefing_at["ts"] = now
             return {"id": bid, "synthesis": synthesis, "created_at": now.isoformat()}
         except Exception:
-            return JSONResponse(status_code=500, content={"detail": "Briefing generation failed"})
+            return JSONResponse(
+                status_code=500, content={"detail": "Briefing generation failed"}
+            )
 
     @app.get("/api/briefing/schedule")
     async def briefing_schedule():
@@ -687,13 +743,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
         try:
             async with db._ro_db(_db_path) as conn:
                 db_ok = True
-                cursor = await conn.execute(
-                    "SELECT MAX(first_seen_at) FROM candidates"
-                )
+                cursor = await conn.execute("SELECT MAX(first_seen_at) FROM candidates")
                 row = await cursor.fetchone()
                 last_cycle = row[0] if row and row[0] else None
                 if last_cycle:
                     from datetime import datetime, timezone
+
                     last_dt = datetime.fromisoformat(last_cycle.replace("Z", "+00:00"))
                     age = (datetime.now(timezone.utc) - last_dt).total_seconds()
                     pipeline_running = age < 180  # 3x 60s scan interval
@@ -724,14 +779,17 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     signals = await db.get_signal_hit_rates(_db_path)
                     alerts = await db.get_recent_alerts(_db_path, limit=20)
 
-                    payload = json.dumps({
-                        "type": "update",
-                        "status": status,
-                        "candidates": candidates,
-                        "funnel": funnel,
-                        "signals": signals,
-                        "alerts": alerts,
-                    }, default=str)
+                    payload = json.dumps(
+                        {
+                            "type": "update",
+                            "status": status,
+                            "candidates": candidates,
+                            "funnel": funnel,
+                            "signals": signals,
+                            "alerts": alerts,
+                        },
+                        default=str,
+                    )
 
                     await ws.send_text(payload)
                 except Exception:
@@ -785,8 +843,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                    FROM tg_social_channels ORDER BY added_at"""
             )
             ch_rows = [
-                (r[0], r[1], r[2], 0, r[3], r[4])
-                for r in await ch_cur.fetchall()
+                (r[0], r[1], r[2], 0, r[3], r[4]) for r in await ch_cur.fetchall()
             ]
             _has_cashtag_col = False
 
@@ -794,7 +851,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
         # mirrors dispatcher.py:_channel_cashtag_trades_today_count).
         cashtag_today = (
             await db.get_tg_social_per_channel_cashtag_today(_db_path)
-            if _has_cashtag_col else {}
+            if _has_cashtag_col
+            else {}
         )
         # BL-066': cap_per_day from cached module-level Settings singleton
         # (PR-review MF3 — log at REQUEST time when fallback active so the
@@ -810,7 +868,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
             cap_per_day = _CAP_PER_DAY_FALLBACK
         else:
-            cap_per_day = _DASHBOARD_SETTINGS.PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY
+            cap_per_day = (
+                _DASHBOARD_SETTINGS.PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY
+            )
 
         channels = [
             {
@@ -865,35 +925,35 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     "text_preview": text[:240],
                     "cashtags": r[6],
                     "contracts": r[7],
-                    "resolution": {
-                        "token_id": r[8],
-                        "symbol": r[9],
-                        "contract_address": r[10],
-                        "chain": r[11],
-                        "mcap": r[12],
-                        "state": r[13],
-                        "paper_trade_id": r[14],
-                    } if r[8] is not None or r[13] is not None else None,
+                    "resolution": (
+                        {
+                            "token_id": r[8],
+                            "symbol": r[9],
+                            "contract_address": r[10],
+                            "chain": r[11],
+                            "mcap": r[12],
+                            "state": r[13],
+                            "paper_trade_id": r[14],
+                        }
+                        if r[8] is not None or r[13] is not None
+                        else None
+                    ),
                 }
             )
 
         # 24h rollup
-        stats_cur = await conn.execute(
-            """SELECT
+        stats_cur = await conn.execute("""SELECT
                  COUNT(*) AS msgs,
                  SUM(CASE WHEN contracts NOT IN ('','[]') THEN 1 ELSE 0 END) AS with_ca,
                  SUM(CASE WHEN cashtags NOT IN ('','[]') THEN 1 ELSE 0 END) AS with_cashtag
                FROM tg_social_messages
-               WHERE datetime(posted_at) >= datetime('now', '-24 hours')"""
-        )
+               WHERE datetime(posted_at) >= datetime('now', '-24 hours')""")
         s = await stats_cur.fetchone()
-        sig_cur = await conn.execute(
-            """SELECT
+        sig_cur = await conn.execute("""SELECT
                  COUNT(*) AS sigs,
                  SUM(CASE WHEN paper_trade_id IS NOT NULL THEN 1 ELSE 0 END) AS dispatched
                FROM tg_social_signals
-               WHERE datetime(created_at) >= datetime('now', '-24 hours')"""
-        )
+               WHERE datetime(created_at) >= datetime('now', '-24 hours')""")
         sig = await sig_cur.fetchone()
         dlq_cur = await conn.execute(
             "SELECT COUNT(*) FROM tg_social_dlq "
@@ -978,9 +1038,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         )
         rows = await cur.fetchall()
 
-        since_iso = (
-            datetime.now(timezone.utc) - timedelta(days=30)
-        ).isoformat()
+        since_iso = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         params = []
         for r in rows:
             stat_cur = await conn.execute(

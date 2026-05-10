@@ -130,4 +130,4 @@ def test_slow_burn_heartbeat_counter_present():
     """
     from scout.heartbeat import _heartbeat_stats
 
-    assert "slow_burn_detected_today" in _heartbeat_stats
+    assert "slow_burn_detected_total" in _heartbeat_stats

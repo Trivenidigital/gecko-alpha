@@ -39,6 +39,19 @@ def _coin(**overrides) -> dict:
     return base
 
 
+@pytest.fixture(autouse=True)
+def _reset_heartbeat_for_slow_burn():
+    """R5 MUST-FIX: heartbeat _heartbeat_stats is module-level global; without
+    this autouse reset, any earlier-running test that exercises the detector
+    pollutes counter state and breaks
+    test_slow_burn_increments_heartbeat_counter (asserts == 1)."""
+    from scout.heartbeat import _reset_heartbeat_stats
+
+    _reset_heartbeat_stats()
+    yield
+    _reset_heartbeat_stats()
+
+
 @pytest.fixture
 async def db(tmp_path):
     database = Database(str(tmp_path / "t.db"))
@@ -239,4 +252,4 @@ async def test_slow_burn_increments_heartbeat_counter(db):
     _reset_heartbeat_stats()
     coin = _coin(id="counter-test")
     await detect_slow_burn_7d(db, [coin])
-    assert _heartbeat_stats["slow_burn_detected_today"] == 1
+    assert _heartbeat_stats["slow_burn_detected_total"] == 1
