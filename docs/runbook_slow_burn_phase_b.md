@@ -105,6 +105,37 @@ for blocking future "let's revisit this" loops.
 Flag-and-extend. Continue soak 7 more days, re-evaluate. Do NOT relax the
 35-coin floor (statistical power requirement per R1's plan-stage finding).
 
+#### Boundary handling (pre-registered before D+14)
+
+The D+14 evaluation will produce one of three outcomes — pass cleanly, fail
+cleanly, or land at the boundary. Pre-register the boundary case here, not
+at evaluation time, so post-hoc threshold relaxation isn't an option.
+
+**Boundary cases:**
+- 2 of 35 hit 2x (one below threshold).
+- 3 of 35 hit 2x BUT one is borderline: `high / detected_price` in `[2.000, 2.05]`.
+- 35-coin sample exists AND quality-gate result is within ±1 hit of threshold.
+
+**Boundary action:** extend soak by 14 days. Recompute at D+28 with full
+~70-detection sample (assuming current ~21-detections-per-cycle rate holds).
+
+**What NOT to do at boundary:**
+- Do NOT change the 2x threshold to fit the result (relaxing to 1.8x post-hoc
+  is exactly the drift this pre-registration prevents).
+- Do NOT change the 3-of-35 acceptance threshold to fit the result.
+- Do NOT include detections post-D+14 in the original 35-coin sample to "rescue"
+  the count (extension means new sample, not extended sample).
+
+**If D+28 still at boundary:** escalate as architectural finding, not pass/fail
+decision. The signal may be genuinely on a knife-edge between "useful" and
+"random" — worth deeper investigation (sub-cohort analysis: mcap-known vs
+mcap-unknown rates; chain split; time-of-day clustering) before final verdict.
+
+**Locking rationale:** without this pre-registration, a D+14 of "2 of 35"
+becomes grounds to argue "maybe 2 of 35 is fine, the threshold was conservative."
+Same discipline pattern as operator-removal pre-registration on the
+live-trading thread — locks decision criteria BEFORE seeing the data.
+
 ### Gate 3 — Separability (<70% momentum_7d overlap)
 
 ```sql
