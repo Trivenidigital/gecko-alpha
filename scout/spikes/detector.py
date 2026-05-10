@@ -393,7 +393,10 @@ async def detect_slow_burn_7d(
     # no detector imports today, but the project pattern is to defer
     # heartbeat-counter touches to runtime to insulate against future
     # heartbeat refactors that might pull in detector helpers.
-    from scout.heartbeat import increment_slow_burn_detected
+    from scout.heartbeat import (
+        increment_slow_burn_coins_skipped,
+        increment_slow_burn_detected,
+    )
 
     def _safe_float(v):
         """R6 CRITICAL fix: CG occasionally returns numeric strings or
@@ -548,6 +551,26 @@ async def detect_slow_burn_7d(
                 count=len(results),
                 err=str(e),
             )
+
+    if coins_skipped > 0:
+        # Post-merge user feedback: per-coin try/except is correct for
+        # resilience but creates a new silent-failure surface — if EVERY
+        # coin throws, watcher reports 0 detections cleanly with no
+        # surfaced exception. Bump heartbeat counter so the failure mode
+        # has a visible metric (operator sees skipped_total non-zero on
+        # heartbeat tick).
+        try:
+            increment_slow_burn_coins_skipped(coins_skipped)
+        except Exception as e:
+            logger.exception(
+                "slow_burn_skipped_counter_increment_failed",
+                coins_skipped=coins_skipped,
+                err=str(e),
+            )
+
+    if results or coins_skipped > 0:
+        # Always emit summary when ANYTHING happened in the cycle (was
+        # previously gated on `if results:` which hid the all-skip path).
         mcap_unknown = sum(1 for r in results if r["market_cap"] is None)
         logger.info(
             "slow_burn_detected",
@@ -555,6 +578,15 @@ async def detect_slow_burn_7d(
             mcap_unknown=mcap_unknown,
             also_in_momentum_count=sum(r["also_in_momentum_7d"] for r in results),
             coins_skipped=coins_skipped,
+        )
+
+    if coins_skipped > 0 and not results:
+        # All-skipped pathology — promote to WARNING so journal review
+        # surfaces it without scrolling individual slow_burn_coin_skipped.
+        logger.warning(
+            "slow_burn_all_results_skipped",
+            coins_skipped=coins_skipped,
+            sample_size=len(raw_coins),
         )
 
     return results

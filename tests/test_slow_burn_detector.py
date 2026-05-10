@@ -253,3 +253,107 @@ async def test_slow_burn_increments_heartbeat_counter(db):
     coin = _coin(id="counter-test")
     await detect_slow_burn_7d(db, [coin])
     assert _heartbeat_stats["slow_burn_detected_total"] == 1
+
+
+# ----- Per-coin skip telemetry (post-merge user-feedback fix) -----
+
+
+async def test_slow_burn_all_coins_throw_emits_visible_telemetry(db):
+    """Post-merge fix: if every coin throws (e.g., CG schema regression that
+    breaks all coercions), the watcher must emit visible telemetry — NOT
+    silently report zero detections.
+
+    Validates the three observability paths added by the follow-up:
+    1. WARNING `slow_burn_all_results_skipped` (humans grep journalctl)
+    2. INFO `slow_burn_detected` summary even with count=0 (dashboard parses)
+    3. heartbeat counter slow_burn_coins_skipped_total bumps (heartbeat tick)
+    """
+    import structlog
+    from scout.heartbeat import _heartbeat_stats, _reset_heartbeat_stats
+
+    _reset_heartbeat_stats()
+
+    # Coin shape passes filters but `total_volume` value will explode the
+    # internal float coercion path indirectly — use a payload that survives
+    # filters but trips the INSERT (mismatched-type market_cap that survives
+    # _safe_float but causes downstream issues). Simulate with volume=NaN-like.
+    bad_coins = [
+        {
+            "id": "boom-1",
+            "symbol": "B1",
+            "name": "Boom",
+            # _safe_float(object()) → TypeError → caught and returns None
+            # → defaults to 0 → fails 7d threshold.
+            # To force the per-coin try/except path, raise INSIDE the coin
+            # loop. Use a malformed `id` that's unhashable (a list) — coin.get
+            # will return it but db.execute will fail downstream.
+            "price_change_percentage_7d_in_currency": 80.0,
+            "price_change_percentage_1h_in_currency": 2.0,
+            "market_cap": 10_000_000,
+            "current_price": 0.5,
+            "total_volume": 200_000,
+        },
+    ]
+    # Force INSERT failure by closing the connection (drastic but reliable).
+    # The per-coin try/except should catch the failure and continue.
+    saved_conn = db._conn
+    saved_execute = saved_conn.execute
+
+    fail_count = [0]
+    select_failed = [False]
+
+    async def boom_execute(sql, *args, **kwargs):
+        if "INSERT INTO slow_burn_candidates" in sql:
+            fail_count[0] += 1
+            raise RuntimeError("simulated INSERT failure")
+        return await saved_execute(sql, *args, **kwargs)
+
+    saved_conn.execute = boom_execute
+    try:
+        with structlog.testing.capture_logs() as captured:
+            results = await detect_slow_burn_7d(db, bad_coins)
+    finally:
+        saved_conn.execute = saved_execute
+
+    assert results == []
+    events = [e["event"] for e in captured]
+    # 1. WARNING for the all-skipped pathology
+    assert "slow_burn_all_results_skipped" in events
+    # 2. INFO summary fired even though count=0
+    assert "slow_burn_detected" in events
+    summary = next(e for e in captured if e["event"] == "slow_burn_detected")
+    assert summary["count"] == 0
+    assert summary["coins_skipped"] >= 1
+    # 3. heartbeat counter bumped
+    assert _heartbeat_stats["slow_burn_coins_skipped_total"] >= 1
+
+
+async def test_slow_burn_partial_skip_still_reports_results(db):
+    """Mixed cycle: some coins succeed, some skip. Both surface in summary."""
+    from scout.heartbeat import _reset_heartbeat_stats, _heartbeat_stats
+
+    _reset_heartbeat_stats()
+
+    good_coin = _coin(id="good")
+    bad_coin = _coin(id="bad")
+
+    saved_conn = db._conn
+    saved_execute = saved_conn.execute
+
+    async def selective_boom(sql, *args, **kwargs):
+        if "INSERT INTO slow_burn_candidates" in sql:
+            params = args[0] if args else ()
+            if params and params[0] == "bad":
+                raise RuntimeError("simulated INSERT failure for bad coin")
+        return await saved_execute(sql, *args, **kwargs)
+
+    saved_conn.execute = selective_boom
+    try:
+        results = await detect_slow_burn_7d(db, [good_coin, bad_coin])
+    finally:
+        saved_conn.execute = saved_execute
+
+    assert len(results) == 1
+    assert results[0]["coin_id"] == "good"
+    assert _heartbeat_stats["slow_burn_detected_total"] == 1
+    assert _heartbeat_stats["slow_burn_coins_skipped_total"] == 1
