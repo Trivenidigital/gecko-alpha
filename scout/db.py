@@ -3338,16 +3338,27 @@ class Database:
                 raise ValueError(f"unknown signal_type: {signal_type}")
             old_enabled = row[0]
 
+            # R2-I1 design fold: restore tg_alert_eligible=1 jointly with
+            # enabled if signal is in DEFAULT_ALLOW_SIGNALS. Auto-suspend
+            # cleared both flags; revive restores both for default-allow
+            # signals so operator doesn't have to manually re-enable
+            # alerting after a Tier 1b cycle.
+            from scout.trading.tg_alert_dispatch import DEFAULT_ALLOW_SIGNALS
+
+            restore_eligible = (
+                1 if signal_type in DEFAULT_ALLOW_SIGNALS else 0
+            )
             await conn.execute(
                 """UPDATE signal_params
                    SET enabled = 1,
+                       tg_alert_eligible = ?,
                        suspended_at = NULL,
                        suspended_reason = NULL,
                        drawdown_baseline_at = ?,
                        updated_at = ?,
                        updated_by = ?
                    WHERE signal_type = ?""",
-                (now_iso, now_iso, operator, signal_type),
+                (restore_eligible, now_iso, now_iso, operator, signal_type),
             )
             await conn.execute(
                 """INSERT INTO signal_params_audit
@@ -3355,6 +3366,19 @@ class Database:
                     reason, applied_by, applied_at)
                    VALUES (?, 'enabled', ?, '1', ?, ?, ?)""",
                 (signal_type, str(old_enabled), audit_reason, operator, now_iso),
+            )
+            await conn.execute(
+                """INSERT INTO signal_params_audit
+                   (signal_type, field_name, old_value, new_value,
+                    reason, applied_by, applied_at)
+                   VALUES (?, 'tg_alert_eligible', '0', ?, ?, ?, ?)""",
+                (
+                    signal_type,
+                    str(restore_eligible),
+                    f"revive joint flag: {audit_reason}",
+                    operator,
+                    now_iso,
+                ),
             )
             await conn.commit()
         except ValueError:
