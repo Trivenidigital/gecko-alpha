@@ -247,6 +247,14 @@ class Settings(BaseSettings):
     PAPER_MAX_DURATION_HOURS: int = 48  # auto-expire
     PAPER_TP_SELL_PCT: float = 70.0  # sell 70% at TP, keep 30% as long_hold
     PAPER_SLIPPAGE_BPS: int = 50  # 0.5% slippage simulation
+
+    # BL-NEW-TG-ALERT-ALLOWLIST: per-signal Telegram alert dispatch on
+    # paper-trade open. Eligibility tracked per-signal in
+    # signal_params.tg_alert_eligible (default 0). Cooldown is per-token
+    # ACROSS signal types (R2-I1 design fold) — a single token firing two
+    # different signals within the window only alerts once.
+    TG_ALERT_PER_TOKEN_COOLDOWN_HOURS: int = 6
+
     PAPER_MIN_MCAP: float = 5_000_000  # min $5M mcap to paper trade (filters junk)
     # Upper mcap cap for paper trades. Large caps (BTC, ETH, SOL, AAVE...) rarely
     # pump fast enough to hit PAPER_TP_PCT within PAPER_MAX_DURATION_HOURS, so
