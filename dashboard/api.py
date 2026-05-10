@@ -202,6 +202,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
     ):
         return await db.get_trading_history(_db_path, limit=limit, offset=offset)
 
+    @app.get("/api/trading/history/count")
+    async def get_trading_history_count_endpoint():
+        """Total count of closed paper trades — for frontend pagination."""
+        return {"total": await db.get_trading_history_count(_db_path)}
+
     @app.get("/api/trading/stats")
     async def get_trading_stats_endpoint(
         days: int = Query(7, ge=1, le=365),

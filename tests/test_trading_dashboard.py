@@ -233,3 +233,91 @@ async def test_total_pnl_null_when_no_current_price(client):
     assert pos["unrealized_pnl_usd"] is None
     assert pos["total_pnl_usd"] is None
     assert pos["total_pnl_pct"] is None
+
+
+# --- Closed-trades pagination tests ---
+
+
+async def test_history_count_endpoint(client):
+    """Count endpoint returns total closed paper trades (status != 'open')."""
+    c, db = client
+    await _insert_trade(
+        db._conn, "bitcoin", "BTC", "volume_spike", "closed_tp", 200.0, 20.0
+    )
+    await _insert_trade(
+        db._conn, "ethereum", "ETH", "volume_spike", "closed_sl", -50.0, -5.0
+    )
+    await _insert_trade(
+        db._conn, "solana", "SOL", "first_signal", "closed_duration", 0.0, 0.0
+    )
+    await _insert_trade(db._conn, "doge", "DOGE", "volume_spike", "open")
+    await _insert_trade(db._conn, "shib", "SHIB", "volume_spike", "open")
+    resp = await c.get("/api/trading/history/count")
+    assert resp.status_code == 200
+    assert resp.json() == {"total": 3}
+
+
+async def test_history_count_endpoint_empty(client):
+    """Count endpoint returns 0 when no closed trades."""
+    c, _ = client
+    resp = await c.get("/api/trading/history/count")
+    assert resp.status_code == 200
+    assert resp.json() == {"total": 0}
+
+
+async def test_history_offset_pagination(client):
+    """offset returns non-overlapping windows in closed_at DESC order.
+
+    R1-C1 design-stage fold: stagger closed_at via direct INSERT (NOT
+    _insert_trade's now.isoformat()) — Windows clock granularity (15.6ms)
+    can produce ties under tight loops, making ORDER BY closed_at DESC
+    non-deterministic on ties.
+
+    R1-I3 design-stage fold: also asserts closed_at is monotonically
+    non-increasing across page0+page1, not just len() and disjoint ids.
+    """
+    c, db = client
+    base = datetime.now(timezone.utc)
+    for i in range(25):
+        opened = (base - timedelta(hours=2, seconds=i)).isoformat()
+        closed = (base - timedelta(seconds=i)).isoformat()
+        await db._conn.execute(
+            """INSERT INTO paper_trades
+               (token_id, symbol, name, chain, signal_type, signal_data,
+                entry_price, amount_usd, quantity, tp_pct, sl_pct,
+                tp_price, sl_price, status, pnl_usd, pnl_pct,
+                opened_at, closed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                f"coin-{i}",
+                f"C{i}",
+                f"coin-{i}".title(),
+                "coingecko",
+                "volume_spike",
+                json.dumps({}),
+                100.0,
+                1000.0,
+                10.0,
+                20.0,
+                10.0,
+                120.0,
+                90.0,
+                "closed_tp",
+                float(i),
+                float(i),
+                opened,
+                closed,
+            ),
+        )
+    await db._conn.commit()
+    page0 = (await c.get("/api/trading/history?limit=20&offset=0")).json()
+    page1 = (await c.get("/api/trading/history?limit=20&offset=20")).json()
+    assert len(page0) == 20
+    assert len(page1) == 5
+    ids0 = {r["id"] for r in page0}
+    ids1 = {r["id"] for r in page1}
+    assert ids0.isdisjoint(ids1)
+    all_closed = [r["closed_at"] for r in (page0 + page1)]
+    assert all_closed == sorted(all_closed, reverse=True), (
+        "rows not in closed_at DESC order"
+    )

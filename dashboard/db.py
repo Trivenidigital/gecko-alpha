@@ -984,6 +984,24 @@ async def get_trading_history(
             return []  # table doesn't exist yet
 
 
+async def get_trading_history_count(db_path: str) -> int:
+    """Total count of closed paper trades (status != 'open').
+
+    Read by /api/trading/history/count for frontend pagination math.
+    Mirrors the WHERE clause of get_trading_history exactly so totals
+    line up with the paginated rows.
+    """
+    async with _ro_db(db_path) as db:
+        try:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM paper_trades WHERE status != 'open'"
+            )
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            return 0  # table doesn't exist yet
+
+
 async def get_trading_stats(db_path: str, days: int = 7) -> dict:
     """Aggregate paper trading PnL stats."""
     _empty_stats = {
