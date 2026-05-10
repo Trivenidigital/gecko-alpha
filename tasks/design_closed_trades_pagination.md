@@ -165,9 +165,25 @@ No DB migration. No Settings change. No external callers depend on the new endpo
 | Mobile rendering | R2 | M | Skipped — operator-laptop-only |
 | Server-side sort scope creep | R2 | M | Skipped — out of scope |
 
-## 9. Approval checklist
+## 9. Design-stage reviewer folds (round 2)
+
+| Finding | Reviewer | Severity | Status |
+|---|---|---|---|
+| `_insert_trade` ties on `closed_at` (Windows clock granularity 15.6ms) → flaky pagination test | R1 | C1 | **Folded** — test uses direct INSERT with staggered `base - timedelta(seconds=i)` |
+| `signal.aborted` belt-and-braces semantics conflated with await throw | R1 | I1 | **Folded** — comment clarifies it catches "all 5 resolved + next fetchAll already aborted" timeline race |
+| `closedSort` headers misleading when `closedTotal > 20` | R1 | I2 | **Folded** — header text appends "(sort applies to current page only)" when `closedTotal > CLOSED_PER_PAGE` |
+| Missing `closed_at DESC` ordering assertion | R1 | I3 | **Folded** — test asserts `all_closed == sorted(all_closed, reverse=True)` |
+| AbortController over-cancels stats/by-signal/positions on page change | R2 | I1 | **Doc-folded** — comment in `_dispatch_live` style explaining brief staleness, ≤200ms until next tick |
+| Polling timer reset on rapid pagination | R2 | I2 | **Folded** — split into 2 useEffects + `fetchAllRef` so timer never resets |
+| StrictMode double-fire | R1 | M2 | Verified absent (main.jsx doesn't wrap App) |
+| Vite asset hashing for cache busting | R1 | M | Verified working (hashed filenames in dist/) |
+| First-time stale page surprise | R2 | M3 | Documented — header N change self-indicates the shift |
+| N-growth vs auto-clamp interaction | R2 | M4 | Verified — clamp is decrease-only |
+| Browser back/forward | R2 | M2 | Verified — sessionStorage survives same-tab navigation |
+
+## 10. Approval checklist
 
 - [x] Plan-stage 2-reviewer pass complete (folded at `96aa9f0`)
-- [x] Design-stage 2-reviewer pass complete (this commit)
+- [x] Design-stage 2-reviewer pass complete (folds in this commit)
 - [ ] All folds applied + test coverage verified
 - [ ] Build → PR → 3-vector reviewer pass → merge → deploy

@@ -108,15 +108,38 @@ async def test_history_count_endpoint_empty(client):
 
 async def test_history_offset_pagination(client):
     """offset returns non-overlapping windows in closed_at DESC order.
-    Seeds 25 closed trades; verifies page 0 (limit=20, offset=0) returns
-    20 rows and page 1 (limit=20, offset=20) returns the remaining 5
-    with no overlap on `id`."""
+
+    R1-C1 design-stage fold: stagger closed_at via direct INSERT (NOT
+    _insert_trade's now.isoformat()) — Windows clock granularity (15.6ms)
+    can produce ties under tight loops, making ORDER BY closed_at DESC
+    non-deterministic on ties.
+
+    R1-I3 design-stage fold: also asserts closed_at is monotonically
+    non-increasing across page0+page1, not just len() and disjoint ids.
+    """
+    from datetime import datetime, timedelta, timezone
+    import json
     c, db = client
+    base = datetime.now(timezone.utc)
     for i in range(25):
-        await _insert_trade(
-            db._conn, f"coin-{i}", f"C{i}", "volume_spike",
-            "closed_tp", float(i), float(i),
+        opened = (base - timedelta(hours=2, seconds=i)).isoformat()
+        closed = (base - timedelta(seconds=i)).isoformat()
+        await db._conn.execute(
+            """INSERT INTO paper_trades
+               (token_id, symbol, name, chain, signal_type, signal_data,
+                entry_price, amount_usd, quantity, tp_pct, sl_pct,
+                tp_price, sl_price, status, pnl_usd, pnl_pct,
+                opened_at, closed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                f"coin-{i}", f"C{i}", f"coin-{i}".title(), "coingecko",
+                "volume_spike", json.dumps({}),
+                100.0, 1000.0, 10.0, 20.0, 10.0, 120.0, 90.0,
+                "closed_tp", float(i), float(i),
+                opened, closed,
+            ),
         )
+    await db._conn.commit()
     page0 = (await c.get("/api/trading/history?limit=20&offset=0")).json()
     page1 = (await c.get("/api/trading/history?limit=20&offset=20")).json()
     assert len(page0) == 20
@@ -124,6 +147,10 @@ async def test_history_offset_pagination(client):
     ids0 = {r["id"] for r in page0}
     ids1 = {r["id"] for r in page1}
     assert ids0.isdisjoint(ids1)
+    all_closed = [r["closed_at"] for r in (page0 + page1)]
+    assert all_closed == sorted(all_closed, reverse=True), (
+        "rows not in closed_at DESC order"
+    )
 ```
 
 - [ ] **Step 4: Run + commit**
@@ -173,6 +200,10 @@ const setClosedPage = useCallback((v) => {
 
 R1-I1 fold: AbortController prevents stale-page fetches from overwriting current-page response when user clicks Next during a poll-fired in-flight request.
 
+R2-I1 design-stage doc-fold: aborting on page-change ALSO cancels stats / by-signal / positions in-flight responses (they share the AbortController). Brief staleness (≤200ms typically) until the next fetchAll completes; resolves on next tick. Acceptable for a money-flow-adjacent UX where page-change frequency is low.
+
+R1-I1 design-stage clarification: the `signal.aborted` belt-and-braces guard is load-bearing for the timeline race where 5 fetches all resolve cleanly BEFORE the next `fetchAll` invocation calls `ac.abort()`. In that case `Promise.all` doesn't reject, but our state writes would still be stale. The `signal.aborted` check after `Promise.all` catches this.
+
 ```jsx
 // Module-level OR useRef inside component — track the latest in-flight
 // AbortController so we can cancel before launching a new fetch.
@@ -180,7 +211,9 @@ const abortRef = useRef(null)
 
 const fetchAll = useCallback(async () => {
   // R1-I1: cancel any prior in-flight fetch so its (stale) response
-  // can't overwrite the current page after a page change.
+  // can't overwrite the current page after a page change. R2-I1
+  // acknowledged: this also briefly stales stats/positions/by-signal
+  // (~200ms until next tick).
   if (abortRef.current) abortRef.current.abort()
   const ac = new AbortController()
   abortRef.current = ac
@@ -194,7 +227,9 @@ const fetchAll = useCallback(async () => {
       fetch(`/api/trading/history?limit=${CLOSED_PER_PAGE}&offset=${offset}`, { signal }),
       fetch('/api/trading/history/count', { signal }),
     ])
-    if (signal.aborted) return  // belt-and-braces
+    // R1-I1 timeline-race guard: catches "5 resolved cleanly + next
+    // fetchAll fired ac.abort() before we wrote state".
+    if (signal.aborted) return
     if (statsRes.ok) setStats(await statsRes.json())
     if (sigRes.ok) {
       const sig = await sigRes.json()
@@ -231,6 +266,32 @@ useEffect(() => {
 }, [closedTotal, closedPage, setClosedPage])
 ```
 
+- [ ] **Step 2.6: Decouple polling timer from `closedPage` (R2-I2 design-stage fold)**
+
+R2-I2 design-stage finding: existing pattern is `useEffect(() => { fetchAll(); const poll = setInterval(fetchAll, 30000); return () => clearInterval(poll) }, [fetchAll])`. Adding `closedPage` to fetchAll's dep array would CLEAR + RECREATE the timer on every page change — operator clicking through 10 pages over 90s never gets a polling tick (interval keeps resetting; stats / positions go > 30s stale).
+
+Decouple: split into TWO useEffects. One fires `fetchAll` when `closedPage` changes (immediate refetch). The other manages the 30s polling timer using a ref-based latest-callback so the timer never restarts.
+
+```jsx
+// Latest fetchAll ref — timer reads from this so we don't reset the
+// interval when closedPage changes.
+const fetchAllRef = useRef(fetchAll)
+useEffect(() => { fetchAllRef.current = fetchAll }, [fetchAll])
+
+// Effect 1: immediate refetch on page change.
+useEffect(() => {
+  fetchAll()
+}, [fetchAll])
+
+// Effect 2: 30s polling — runs once at mount, never resets.
+useEffect(() => {
+  const poll = setInterval(() => fetchAllRef.current(), 30000)
+  return () => clearInterval(poll)
+}, [])
+```
+
+Trade-off: 2 useEffects + 1 ref vs. 1 useEffect that resets on page change. The decoupled version is the standard React pattern for "interval that should call latest callback without restarting" — see also `useEvent` proposal.
+
 - [ ] **Step 3: Update header + add pagination controls in Section 4**
 
 Replace lines around 470-538:
@@ -245,7 +306,7 @@ Replace lines around 470-538:
     <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
       {closedTotal === 0
         ? 'No closed trades yet'
-        : `Showing ${closedPage * CLOSED_PER_PAGE + 1}–${Math.min((closedPage + 1) * CLOSED_PER_PAGE, closedTotal)} of ${closedTotal}`}
+        : `Showing ${closedPage * CLOSED_PER_PAGE + 1}–${Math.min((closedPage + 1) * CLOSED_PER_PAGE, closedTotal)} of ${closedTotal}${closedTotal > CLOSED_PER_PAGE ? ' (sort applies to current page only)' : ''}`}
     </span>
   </div>
   {history.length === 0 ? (
@@ -355,7 +416,7 @@ Per CLAUDE.md §8 (operator-visible UI change with money-flow indirect — close
 
 - Does NOT add per-page jump (skip-to-page-N) — only Prev/Next
 - Does NOT add page-size selector (hardcoded 20)
-- Does NOT add server-side sort (closedSort is still client-side, sorts only the visible 20)
+- Does NOT add server-side sort (closedSort is still client-side, sorts only the visible 20). R1-I2 design-stage: when the operator is on page 1+ OR closedTotal > 20, the section header tag note should change from `Last 20 completed trades` to `Showing X–Y of N (sort applies to current page only)` so operator understands the sort scoping. This is a single string-edit, not a code change. Append `(sort applies to current page only)` to the count text when closedTotal > CLOSED_PER_PAGE.
 - Does NOT add date-range or signal-type filters
 - Does NOT cache previous pages (each page is a fresh fetch)
 - Does NOT freeze pagination across the 30s polling refresh: if a new trade closes mid-read on a non-first page, the offset-based query window shifts (newest closed_at pushes existing rows down by one). At observed close cadence (often hours between closes) this is rare; cursor-based pagination is M2 if needed (R2-I2 fold)
