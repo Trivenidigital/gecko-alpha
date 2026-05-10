@@ -186,10 +186,19 @@ export default function TradingTab() {
         setBySignal(Array.isArray(sig) ? sig : Object.entries(sig).map(([k, v]) => ({ signal_type: k, ...v })))
       }
       if (posRes.ok) setPositions(await posRes.json())
-      if (histRes.ok) setHistory(await histRes.json())
+      let histRows = null
+      if (histRes.ok) {
+        histRows = await histRes.json()
+        setHistory(histRows)
+      }
       if (countRes.ok) {
         const { total } = await countRes.json()
         setClosedTotal(total ?? 0)
+      } else if (histRows && histRows.length > 0) {
+        // V3-C1 PR-stage fix: count endpoint failed but history loaded
+        // → fall back to history.length so the header doesn't show
+        // "No closed trades yet" while rows are clearly visible.
+        setClosedTotal(prev => (prev > 0 ? prev : histRows.length))
       }
     } catch (e) {
       if (e?.name === 'AbortError') return  // expected on page-change race
@@ -216,6 +225,11 @@ export default function TradingTab() {
   useEffect(() => {
     if (closedTotal > 0 && closedPage * CLOSED_PER_PAGE >= closedTotal) {
       const lastPage = Math.max(0, Math.ceil(closedTotal / CLOSED_PER_PAGE) - 1)
+      // V3-I2 PR-stage fix: log auto-clamp for observability — silent
+      // page rewrites are otherwise invisible if they fire unexpectedly.
+      console.warn(
+        `[closed-trades] auto-clamp page=${closedPage} → ${lastPage} (total=${closedTotal})`
+      )
       setClosedPage(lastPage)
     }
   }, [closedTotal, closedPage, setClosedPage])
@@ -537,7 +551,10 @@ export default function TradingTab() {
           >
             {closedTotal === 0
               ? 'No closed trades yet'
-              : `Showing ${closedPage * CLOSED_PER_PAGE + 1}–${Math.min((closedPage + 1) * CLOSED_PER_PAGE, closedTotal)} of ${closedTotal}${closedTotal > CLOSED_PER_PAGE ? ' (sort applies to current page only)' : ''}`}
+              // V3-I1 PR-stage fix: clamp lower bound so a stale
+              // sessionStorage page (e.g., page=99999 from a prior session
+              // when N=10) doesn't render nonsensical "1999981–10".
+              : `Showing ${Math.min(closedPage * CLOSED_PER_PAGE + 1, closedTotal)}–${Math.min((closedPage + 1) * CLOSED_PER_PAGE, closedTotal)} of ${closedTotal}${closedTotal > CLOSED_PER_PAGE ? ' (sort applies to current page only)' : ''}`}
           </span>
         </div>
         {history.length === 0 ? (
