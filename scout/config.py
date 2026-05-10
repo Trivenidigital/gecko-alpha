@@ -144,6 +144,14 @@ class Settings(BaseSettings):
         100_000  # min $100K 24h volume — weeds out illiquid junk
     )
 
+    # -------- Slow-Burn Watcher (BL-075 Phase B) --------
+    SLOW_BURN_ENABLED: bool = True
+    SLOW_BURN_MIN_7D_CHANGE: float = 50.0
+    SLOW_BURN_MAX_1H_CHANGE: float = 5.0
+    SLOW_BURN_MAX_MCAP: float = 500_000_000
+    SLOW_BURN_MIN_VOLUME: float = 100_000
+    SLOW_BURN_DEDUP_DAYS: int = 7
+
     # -------- Volume Spike Detector --------
     VOLUME_SPIKE_ENABLED: bool = True
     VOLUME_SPIKE_RATIO: float = 5.0

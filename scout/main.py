@@ -42,7 +42,12 @@ from scout.news.cryptopanic import (
 from scout.news.schemas import classify_macro, classify_sentiment
 from scout.safety import is_safe
 from scout.scorer import score
-from scout.spikes.detector import record_volume, detect_spikes, detect_7d_momentum
+from scout.spikes.detector import (
+    record_volume,
+    detect_spikes,
+    detect_7d_momentum,
+    detect_slow_burn_7d,
+)
 from scout.gainers.tracker import store_top_gainers
 from scout.losers.tracker import store_top_losers
 from scout.velocity.detector import alert_velocity_detections, detect_velocity
@@ -618,6 +623,32 @@ async def run_cycle(
                 )
         except Exception:
             logger.exception("momentum_7d_error")
+    # BL-075 Phase B: Slow-Burn Watcher (RIV-shape detector, research-only).
+    if settings.SLOW_BURN_ENABLED and _raw_markets_combined:
+        try:
+            slow_burn = await detect_slow_burn_7d(
+                db,
+                _raw_markets_combined,
+                min_7d_change=settings.SLOW_BURN_MIN_7D_CHANGE,
+                max_1h_change=settings.SLOW_BURN_MAX_1H_CHANGE,
+                max_mcap=settings.SLOW_BURN_MAX_MCAP,
+                min_volume_24h=settings.SLOW_BURN_MIN_VOLUME,
+                dedup_days=settings.SLOW_BURN_DEDUP_DAYS,
+            )
+            if slow_burn:
+                logger.info(
+                    "slow_burn_tokens",
+                    count=len(slow_burn),
+                    tokens=[s["symbol"] for s in slow_burn],
+                    mcap_unknown_count=sum(
+                        1 for s in slow_burn if not s.get("market_cap")
+                    ),
+                    also_in_momentum_count=sum(
+                        1 for s in slow_burn if s.get("also_in_momentum_7d")
+                    ),
+                )
+        except Exception:
+            logger.exception("slow_burn_error")
 
     # Velocity Alerter (1h extreme-pump research alert, no paper trade)
     if settings.VELOCITY_ALERTS_ENABLED and _raw_markets_combined:
