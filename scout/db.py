@@ -99,6 +99,7 @@ class Database:
         await self._migrate_reject_reason_extend()
         await self._migrate_bl_quote_pair_v1()
         await self._migrate_reject_reason_extend_v2()
+        await self._migrate_bl_slow_burn_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -3010,6 +3011,94 @@ class Database:
                 migration="bl_reject_reason_extend_v2",
             )
             raise
+
+    async def _migrate_bl_slow_burn_v1(self) -> None:
+        """BL-075 Phase B: create slow_burn_candidates table.
+
+        Migration bl_slow_burn_v1, schema_version 20260515.
+        Mcap nullable (Phase A blind-spot fix); composite index for dedup
+        hot-path; canonical BEGIN EXCLUSIVE / try-except-ROLLBACK pattern.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS slow_burn_candidates (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    coin_id         TEXT    NOT NULL,
+                    symbol          TEXT    NOT NULL,
+                    name            TEXT,
+                    price_change_7d REAL    NOT NULL,
+                    price_change_1h REAL    NOT NULL,
+                    price_change_24h REAL,
+                    market_cap      REAL,
+                    current_price   REAL,
+                    volume_24h      REAL,
+                    also_in_momentum_7d INTEGER NOT NULL DEFAULT 0,
+                    detected_at     TEXT    NOT NULL
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_slow_burn_detected "
+                "ON slow_burn_candidates(detected_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_slow_burn_coin_date "
+                "ON slow_burn_candidates(coin_id, detected_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260515, now_iso, "bl_slow_burn_v1_slow_burn_candidates"),
+            )
+            await conn.commit()
+        except Exception as e:
+            _log.exception(
+                "schema_migration_failed",
+                migration="bl_slow_burn_v1",
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception(
+                    "schema_migration_rollback_failed",
+                    migration="bl_slow_burn_v1",
+                    err=str(rb_err),
+                    err_type=type(rb_err).__name__,
+                )
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_slow_burn_v1")
+            raise
+
+        cur = await conn.execute(
+            "SELECT description FROM schema_version WHERE version = ?",
+            (20260515,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "bl_slow_burn_v1 schema_version row missing after migration"
+            )
+        if row[0] != "bl_slow_burn_v1_slow_burn_candidates":
+            raise RuntimeError(
+                f"bl_slow_burn_v1 schema_version description mismatch — "
+                f"expected 'bl_slow_burn_v1_slow_burn_candidates', got {row[0]!r}"
+            )
 
     async def revive_signal_with_baseline(
         self,

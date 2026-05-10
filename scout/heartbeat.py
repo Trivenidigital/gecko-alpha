@@ -25,6 +25,7 @@ _heartbeat_stats: dict = {
     "counter_scores_memecoin": 0,
     "counter_scores_narrative": 0,
     "mcap_null_with_price_count": 0,
+    "slow_burn_detected_today": 0,
     "last_heartbeat_at": None,
 }
 
@@ -44,6 +45,7 @@ def _reset_heartbeat_stats() -> None:
         counter_scores_memecoin=0,
         counter_scores_narrative=0,
         mcap_null_with_price_count=0,
+        slow_burn_detected_today=0,
         last_heartbeat_at=None,
     )
 
@@ -83,7 +85,13 @@ def _maybe_emit_heartbeat(settings) -> bool:
         counter_scores_memecoin=_heartbeat_stats["counter_scores_memecoin"],
         counter_scores_narrative=_heartbeat_stats["counter_scores_narrative"],
         mcap_null_with_price_count=_heartbeat_stats["mcap_null_with_price_count"],
+        slow_burn_detected_today=_heartbeat_stats["slow_burn_detected_today"],
         last_heartbeat_at=_heartbeat_stats["last_heartbeat_at"].isoformat(),
     )
     _heartbeat_stats["last_heartbeat_at"] = now
     return True
+
+
+def increment_slow_burn_detected(count: int = 1) -> None:
+    """BL-075 Phase B: bump slow-burn detection counter (called from detector)."""
+    _heartbeat_stats["slow_burn_detected_today"] += count
