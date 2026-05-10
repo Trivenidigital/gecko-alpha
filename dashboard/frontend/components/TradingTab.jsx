@@ -1,6 +1,16 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react'
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import TokenLink from './TokenLink'
 import { useSort, SortHeader as SharedSortHeader } from './useSort.jsx'
+
+const CLOSED_PER_PAGE = 20  // closed-trades pagination size
+
+function _readStoredPage() {
+  try {
+    const v = sessionStorage.getItem('gecko.closedPage')
+    const n = v == null ? 0 : parseInt(v, 10)
+    return Number.isFinite(n) && n >= 0 ? n : 0
+  } catch { return 0 }
+}
 
 function fmtUsd(n) {
   if (n == null) return '-'
@@ -132,18 +142,44 @@ export default function TradingTab() {
   const [bySignal, setBySignal] = useState([])
   const [positions, setPositions] = useState([])
   const [history, setHistory] = useState([])
+  const [closedPage, setClosedPageState] = useState(_readStoredPage)
+  const [closedTotal, setClosedTotal] = useState(0)
   const [sortCol, setSortCol] = useState('pnl_pct')
   const [sortDir, setSortDir] = useState('desc')
   const [closingId, setClosingId] = useState(null)
 
+  // R2-I1 fold: persist page to sessionStorage so tab-switch unmount
+  // (App.jsx conditional render) doesn't reset operator's position.
+  const setClosedPage = useCallback((v) => {
+    setClosedPageState(prev => {
+      const next = typeof v === 'function' ? v(prev) : v
+      try { sessionStorage.setItem('gecko.closedPage', String(next)) } catch {}
+      return next
+    })
+  }, [])
+
+  // R1-I1 fold: AbortController guard against stale-page fetches
+  // overwriting current-page response when page-change races polling.
+  const abortRef = useRef(null)
+
   const fetchAll = useCallback(async () => {
+    if (abortRef.current) abortRef.current.abort()
+    const ac = new AbortController()
+    abortRef.current = ac
+    const signal = ac.signal
     try {
-      const [statsRes, sigRes, posRes, histRes] = await Promise.all([
-        fetch('/api/trading/stats'),
-        fetch('/api/trading/stats/by-signal'),
-        fetch('/api/trading/positions'),
-        fetch('/api/trading/history?limit=20'),
+      const offset = closedPage * CLOSED_PER_PAGE
+      const [statsRes, sigRes, posRes, histRes, countRes] = await Promise.all([
+        fetch('/api/trading/stats', { signal }),
+        fetch('/api/trading/stats/by-signal', { signal }),
+        fetch('/api/trading/positions', { signal }),
+        fetch(`/api/trading/history?limit=${CLOSED_PER_PAGE}&offset=${offset}`, { signal }),
+        fetch('/api/trading/history/count', { signal }),
       ])
+      // R1-I1 timeline-race guard: catches "5 fetches resolved cleanly +
+      // a subsequent fetchAll already called ac.abort() before we wrote
+      // state". The Promise.all itself doesn't reject in this case.
+      if (signal.aborted) return
       if (statsRes.ok) setStats(await statsRes.json())
       if (sigRes.ok) {
         const sig = await sigRes.json()
@@ -151,16 +187,38 @@ export default function TradingTab() {
       }
       if (posRes.ok) setPositions(await posRes.json())
       if (histRes.ok) setHistory(await histRes.json())
-    } catch {
+      if (countRes.ok) {
+        const { total } = await countRes.json()
+        setClosedTotal(total ?? 0)
+      }
+    } catch (e) {
+      if (e?.name === 'AbortError') return  // expected on page-change race
       // API not available yet
     }
+  }, [closedPage])
+
+  // R2-I2 fold: decouple polling timer from page change so rapid
+  // pagination doesn't starve the 30s polling refresh of stats /
+  // positions / by-signal.
+  const fetchAllRef = useRef(fetchAll)
+  useEffect(() => { fetchAllRef.current = fetchAll }, [fetchAll])
+
+  // Effect 1: immediate refetch when closedPage changes.
+  useEffect(() => { fetchAll() }, [fetchAll])
+
+  // Effect 2: 30s polling — runs once at mount, never resets.
+  useEffect(() => {
+    const poll = setInterval(() => fetchAllRef.current(), 30000)
+    return () => clearInterval(poll)
   }, [])
 
+  // R1-I2 + R2-I2 fold: auto-clamp on closedTotal decrease.
   useEffect(() => {
-    fetchAll()
-    const poll = setInterval(fetchAll, 30000)
-    return () => clearInterval(poll)
-  }, [fetchAll])
+    if (closedTotal > 0 && closedPage * CLOSED_PER_PAGE >= closedTotal) {
+      const lastPage = Math.max(0, Math.ceil(closedTotal / CLOSED_PER_PAGE) - 1)
+      setClosedPage(lastPage)
+    }
+  }, [closedTotal, closedPage, setClosedPage])
 
   function handleSort(col) {
     if (sortCol === col) {
@@ -467,14 +525,19 @@ export default function TradingTab() {
         )}
       </div>
 
-      {/* Section 4: Recent Closed Trades */}
+      {/* Section 4: Closed Trades (paginated) */}
       <div className="panel" style={{ marginBottom: 16 }}>
         <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
-            Recent Closed Trades
+            Closed Trades
           </span>
-          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
-            Last 20 completed trades
+          <span
+            style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}
+            aria-live="polite"
+          >
+            {closedTotal === 0
+              ? 'No closed trades yet'
+              : `Showing ${closedPage * CLOSED_PER_PAGE + 1}–${Math.min((closedPage + 1) * CLOSED_PER_PAGE, closedTotal)} of ${closedTotal}${closedTotal > CLOSED_PER_PAGE ? ' (sort applies to current page only)' : ''}`}
           </span>
         </div>
         {history.length === 0 ? (
@@ -534,6 +597,46 @@ export default function TradingTab() {
                 })}
               </tbody>
             </table>
+            {/* Pagination controls — R2-C1 fold: inline disabled style
+                because plain .btn class has no :disabled rule. */}
+            <div style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              padding: '12px 8px',
+              borderTop: '1px solid var(--color-border)',
+            }}>
+              <button
+                className="btn"
+                disabled={closedPage === 0}
+                onClick={() => setClosedPage(p => Math.max(0, p - 1))}
+                aria-label="Previous page"
+                style={{
+                  opacity: closedPage === 0 ? 0.4 : 1,
+                  cursor: closedPage === 0 ? 'not-allowed' : 'pointer',
+                }}
+              >
+                ← Prev
+              </button>
+              <span
+                style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}
+                aria-live="polite"
+              >
+                Page {closedPage + 1} of {Math.max(1, Math.ceil(closedTotal / CLOSED_PER_PAGE))}
+              </span>
+              <button
+                className="btn"
+                disabled={(closedPage + 1) * CLOSED_PER_PAGE >= closedTotal}
+                onClick={() => setClosedPage(p => p + 1)}
+                aria-label="Next page"
+                style={{
+                  opacity: (closedPage + 1) * CLOSED_PER_PAGE >= closedTotal ? 0.4 : 1,
+                  cursor: (closedPage + 1) * CLOSED_PER_PAGE >= closedTotal ? 'not-allowed' : 'pointer',
+                }}
+              >
+                Next →
+              </button>
+            </div>
           </div>
         )}
       </div>
