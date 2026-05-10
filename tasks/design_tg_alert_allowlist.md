@@ -211,9 +211,94 @@ Sets expectations + makes the open-only scope explicit.
 | Provisional state invisible to operator | R2 | I3 | Folded — first-deploy announcement |
 | Open-only scope undocumented | R2 | I4 | Folded — first-deploy announcement |
 
-## 9. Approval checklist
+## 9. Design-stage reviewer folds (round 2)
+
+### CRITICAL folds
+
+**R2-C1: First-deploy announcement re-fires on every engine restart before first eligible trade.**
+The earlier "empty `tg_alert_log` → fire" idempotency is wrong: between deploy and first eligible paper-trade open (minutes-hours at observed rate), every engine restart re-fires the announcement.
+
+**Fix:** anchor on a sentinel row inserted at announcement-send time. Extend the `tg_alert_log.outcome` CHECK constraint to admit `'announcement_sent'`; insert that row immediately on send; gate the announcement on `SELECT 1 FROM tg_alert_log WHERE outcome='announcement_sent' LIMIT 1`. Migration adds `'announcement_sent'` to the CHECK enum.
+
+**R2-C2: Concurrent dispatch race writes 2-N alerts for the same token within 100ms — defeats per-token cooldown.**
+`scout/main.py:539,559,584,604,794` calls dispatcher functions sequentially. Each iterates candidates and calls `engine.open_trade` → `_spawn_tg_alert` → `asyncio.create_task`. Tasks are NOT awaited; the next dispatcher call can fire for the same token before task #1's `tg_alert_log` INSERT lands. Both tasks see empty cooldown query → both fire.
+
+**Fix:** atomic check-then-write inside the spawned task. New flow:
+1. Acquire `db._txn_lock`
+2. Re-check cooldown
+3. Pre-INSERT a tentative `'sent'` row (or the appropriate `blocked_*` outcome)
+4. Release lock
+5. If outcome was `'sent'` (i.e., we won the race), call `send_telegram_message`
+6. If dispatch fails, `UPDATE tg_alert_log SET outcome='dispatch_failed' WHERE id=?`
+
+This ordering — write-then-dispatch — means concurrent tasks see each other's pending sends through `_check_cooldown`, and only one proceeds. New test: spawn 3 concurrent `notify_paper_trade_opened` for same token → assert exactly 1 outcome='sent'.
+
+**R1-C2: Post-assertion `COUNT(*)=4` is fragile.**
+If `_migrate_signal_params_schema` ever drops one of the 4 default-allow signals from the seed list (rename / retire), the post-assertion fails on every startup, blocking init.
+
+**Fix:** assert each signal individually:
+```python
+for sig in DEFAULT_ALLOW_SIGNALS:
+    cur = await conn.execute(
+        "SELECT tg_alert_eligible FROM signal_params WHERE signal_type=?",
+        (sig,),
+    )
+    row = await cur.fetchone()
+    assert row and row[0] == 1, f"bl_tg_alert_eligible_v1: {sig} not eligible"
+```
+
+**R1-C1 (cosmetic): drop `async with self._txn_lock:` to match `_migrate_bl_quote_pair_v1` precedent.** Migration runs at startup-only (single coroutine) — lock is harmless but inconsistent. Fold cosmetic.
+
+### Important folds
+
+**R1-I2 — engine `_tg_alert_tasks` shutdown handling:**
+acceptable to lose mid-flight tasks (paper-trade row already written; only the alert + log is lost). Document explicitly in `_spawn_tg_alert` docstring: "Mid-flight task loss on shutdown is acceptable — the paper_trades row is already committed; the only loss is the TG alert + tg_alert_log row." No code-side drain in M1.
+
+**R1-I3 + R1-I4 — `scout/main.py` wiring spec:**
+- Pass `aiohttp.ClientSession` into `TradingEngine` constructor at `scout/main.py:1230` (need to refactor to construct session before engine OR pass an async-context-manager factory). Engine stores as `self._tg_session`; `_spawn_tg_alert` uses it.
+- Announcement call site: in `scout/main.py` after `Database.initialize()` runs but BEFORE first cycle. Plan must specify this is in the cycle setup section after migration runs (so `tg_alert_log` table exists). Concrete site: just before the cycle while-loop, inside the `aiohttp.ClientSession` block.
+
+**R1-I5 — test coverage gaps:**
+Add tests:
+- `test_migration_idempotent`: run `_migrate_tg_alert_eligible_v1` twice → no error, row count stable
+- `test_post_slip_price_in_alert_body`: insert paper_trade with effective_entry differing from current_price; assert alert body contains effective_entry
+- `test_engine_constructor_accepts_session_kwarg`: minimal smoke
+- `test_concurrent_dispatch_only_one_sent` (per R2-C2): spawn 3 tasks for same token, assert 1 sent + 2 blocked_cooldown
+
+**R2-I1 — auto_suspend joint flag maintenance:**
+Modify `scout/trading/auto_suspend.py:_atomic_suspend` to also set `tg_alert_eligible=0` when suspending a signal. Audit row tracks both flag changes. On `revive_signal_with_baseline`, restore `tg_alert_eligible=1` if the signal was originally in the default-allow list.
+
+**R2-I2 — operator opt-out path in announcement:**
+Add to first-deploy announcement body: `"To silence per-signal: UPDATE signal_params SET tg_alert_eligible=0 WHERE signal_type='...';"`
+
+**R2-I3 — second-leg tradeoff documentation:**
+The 6h cooldown is exposed as `TG_ALERT_PER_TOKEN_COOLDOWN_HOURS` env-tunable. Document in announcement body: "Cooldown 6h; reduce via .env TG_ALERT_PER_TOKEN_COOLDOWN_HOURS=2 to receive second-leg signals."
+
+**R2-I4 — chain_completed dual-session documentation:**
+Document in §2.2 that flipping chain_completed eligibility=1 produces 2 simultaneous TG sends (existing chains/alerts.py + new dispatch). Each opens its own ClientSession briefly (low chain rate makes this acceptable).
+
+### Reviewer-fold table (design-stage)
+
+| Finding | Reviewer | Severity | Status |
+|---|---|---|---|
+| Migration `async with self._txn_lock` deviation | R1 | C1 | **Folded — drop lock to match precedent** |
+| Post-assertion `COUNT(*)=4` fragility | R1 | C2 | **Folded — per-signal assertions** |
+| Announcement re-fires on restart before first trade | R2 | C1 | **Folded — `'announcement_sent'` sentinel row in tg_alert_log** |
+| Concurrent dispatch race defeats per-token cooldown | R2 | C2 | **Folded — atomic check-then-write under `_txn_lock`** |
+| `_tg_alert_tasks` shutdown drain | R1 | I2 | **Folded — documented acceptable loss** |
+| `session=None` runtime path broken | R1 | I3 | **Folded — main.py wiring spec'd in plan** |
+| Announcement call site unspecified | R1 | I4 | **Folded — main.py:1262-area** |
+| Test coverage gaps | R1 | I5 | **Folded — 4 new tests** |
+| auto_suspend doesn't clear tg_alert_eligible | R2 | I1 | **Folded — joint flag maintenance** |
+| Opt-out path missing from announcement | R2 | I2 | **Folded — added to body** |
+| 6h vs second-leg tradeoff | R2 | I3 | **Folded — env-tunable + announcement note** |
+| chain_completed dual-session | R2 | I4 | **Folded — documented in §2.2** |
+| db._conn private access | R1 | I1 | Documented (project pattern) |
+| Emoji choice / format safety | R2 | M | Verified |
+
+## 10. Approval checklist
 
 - [x] Plan-stage 2-reviewer pass complete (folded at `53f63e2`)
-- [ ] Design-stage 2-reviewer pass complete (this commit)
-- [ ] All folds applied + test coverage verified
+- [x] Design-stage 2-reviewer pass complete (folds in this commit)
+- [ ] All folds applied to plan + test coverage verified
 - [ ] Build → PR → 3-vector reviewer pass → merge → deploy

@@ -28,7 +28,9 @@ Failure modes (network, missing creds) are caught + logged; never block paper-tr
 
 | File | Action | Responsibility |
 |---|---|---|
-| `scout/db.py` | Modify | Add migration `bl_tg_alert_eligible_v1` (schema 20260516): `ALTER TABLE signal_params ADD COLUMN tg_alert_eligible INTEGER NOT NULL DEFAULT 0`; UPDATE existing rows for default-allow signals; CREATE TABLE `tg_alert_log` (audit + cooldown source) |
+| `scout/db.py` | Modify | Add migration `bl_tg_alert_eligible_v1` (schema 20260516): `ALTER TABLE signal_params ADD COLUMN tg_alert_eligible INTEGER NOT NULL DEFAULT 0`; UPDATE existing rows for default-allow signals; CREATE TABLE `tg_alert_log` (audit + cooldown source) with `outcome IN ('sent','blocked_eligibility','blocked_cooldown','dispatch_failed','announcement_sent')` (R2-C1 fold: 5th value for first-deploy announcement sentinel) |
+| `scout/trading/auto_suspend.py` | Modify | `_atomic_suspend` sets `tg_alert_eligible=0` jointly with `enabled=0` (R2-I1 fold: joint flag maintenance); revive helper restores `=1` if signal was in default-allow set |
+| `scout/main.py` | Modify | Pass `aiohttp.ClientSession` into `TradingEngine` constructor (R1-I3+I5 fold); add first-deploy announcement call after `Database.initialize()` gated on `'announcement_sent'` sentinel (R2-C1 + R1-I4 fold) |
 | `scout/config.py` | Modify | Add `TG_ALERT_PER_TOKEN_COOLDOWN_HOURS: int = 6` Settings |
 | `scout/trading/tg_alert_dispatch.py` | **Create** | `notify_paper_trade_opened(...)` orchestrator + `format_paper_trade_alert(...)` formatter + `_check_eligibility`, `_check_cooldown` helpers. Pure async, no I/O beyond aiosqlite + alerter. |
 | `scout/trading/engine.py` | Modify | After `trade_id = await self._paper_trader.execute_buy(...)` returns non-None, await `notify_paper_trade_opened(...)` (fire-and-forget pattern via task spawn so paper-trade dispatch never blocks on Telegram) |
@@ -86,9 +88,10 @@ async def _migrate_tg_alert_eligible_v1(self, conn) -> None:
     )
     if await cur.fetchone():
         return  # already applied
-    async with self._txn_lock:
-        await conn.execute("BEGIN EXCLUSIVE")
-        try:
+    # R1-C1 design-stage fold: drop _txn_lock to match _migrate_bl_quote_pair_v1
+    # precedent. Migration runs at startup-only (single coroutine).
+    await conn.execute("BEGIN EXCLUSIVE")
+    try:
             cur = await conn.execute("PRAGMA table_info(signal_params)")
             cols = {row[1] for row in await cur.fetchall()}
             if "tg_alert_eligible" not in cols:
@@ -114,7 +117,8 @@ async def _migrate_tg_alert_eligible_v1(self, conn) -> None:
                     alerted_at  TEXT NOT NULL,
                     outcome     TEXT NOT NULL CHECK (outcome IN (
                         'sent','blocked_eligibility',
-                        'blocked_cooldown','dispatch_failed'
+                        'blocked_cooldown','dispatch_failed',
+                        'announcement_sent'
                     )),
                     detail      TEXT
                 )"""
@@ -128,22 +132,25 @@ async def _migrate_tg_alert_eligible_v1(self, conn) -> None:
                 "VALUES (?, 'bl_tg_alert_eligible_v1', ?)",
                 (SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
             )
-            # Post-assertion: at least the 4 default-allow signals have eligibility=1
-            cur = await conn.execute(
-                "SELECT COUNT(*) FROM signal_params WHERE tg_alert_eligible=1 "
-                "AND signal_type IN ('gainers_early','narrative_prediction',"
-                "'losers_contrarian','volume_spike')"
-            )
-            row = await cur.fetchone()
-            assert row and row[0] == 4, (
-                f"bl_tg_alert_eligible_v1 post-assert: expected 4 default-allow "
-                f"rows, got {row[0] if row else None}"
-            )
+            # Post-assertion: per-signal individual checks (R1-C2 design-stage
+            # fold — robust to future signal-set expansion vs COUNT(*)=4).
+            for sig in DEFAULT_ALLOW_SIGNALS:
+                cur = await conn.execute(
+                    "SELECT tg_alert_eligible FROM signal_params "
+                    "WHERE signal_type = ?",
+                    (sig,),
+                )
+                row = await cur.fetchone()
+                assert row and row[0] == 1, (
+                    f"bl_tg_alert_eligible_v1 post-assert: {sig} not eligible"
+                )
             await conn.commit()
         except Exception:
             await conn.execute("ROLLBACK")
             raise
 ```
+
+`DEFAULT_ALLOW_SIGNALS` is a module-level constant (`= ("gainers_early", "narrative_prediction", "losers_contrarian", "volume_spike")`). Same constant used by `auto_suspend.py` revive helper to restore `tg_alert_eligible=1` for signals in this set (R2-I1 fold).
 
 - [ ] **Step 4: Failing test for migration**
 
@@ -640,6 +647,22 @@ async def notify_paper_trade_opened(
     Never raises. Always writes a tg_alert_log row recording the outcome
     (sent / blocked_eligibility / blocked_cooldown / dispatch_failed) for
     audit.
+
+    R2-C2 design-stage fold: atomic check-then-write. The cooldown check
+    AND the pre-write of the 'sent' row happen under a single
+    `db._txn_lock` so concurrent tasks for the same token serialize
+    cleanly. Without this, sequential `engine.open_trade` calls in
+    `scout/main.py` can dispatch 2-N alerts for the same token within
+    100ms because each task spawns + returns before the prior
+    `tg_alert_log` INSERT lands.
+
+    Flow:
+      1. lock + eligibility check
+      2. lock + cooldown check + INSERT pre-emptive 'sent' row
+         (acts as the atomic claim)
+      3. release lock
+      4. call send_telegram_message
+      5. on dispatch failure, UPDATE the row to 'dispatch_failed'
     """
     try:
         if not await _check_eligibility(db, signal_type):
@@ -648,13 +671,52 @@ async def notify_paper_trade_opened(
                 token_id=token_id, outcome="blocked_eligibility",
             )
             return
-        if await _check_cooldown(db, settings, token_id):
-            await _log_outcome(
-                db, paper_trade_id=paper_trade_id, signal_type=signal_type,
-                token_id=token_id, outcome="blocked_cooldown",
-                detail=f"hours={settings.TG_ALERT_PER_TOKEN_COOLDOWN_HOURS}",
-            )
+
+        # R2-C2 atomic claim: lock, re-check cooldown, pre-INSERT 'sent'
+        # row that subsequent tasks see via _check_cooldown's SELECT.
+        sent_row_id = None
+        if db._conn is None:
             return
+        async with db._txn_lock:
+            cutoff = (
+                datetime.now(timezone.utc)
+                - timedelta(hours=settings.TG_ALERT_PER_TOKEN_COOLDOWN_HOURS)
+            ).isoformat()
+            cur = await db._conn.execute(
+                "SELECT 1 FROM tg_alert_log "
+                "WHERE token_id = ? AND outcome = 'sent' "
+                "AND alerted_at >= ? LIMIT 1",
+                (token_id, cutoff),
+            )
+            if await cur.fetchone():
+                # Cooldown active — log + return under lock (no race window)
+                await db._conn.execute(
+                    "INSERT INTO tg_alert_log "
+                    "(paper_trade_id, signal_type, token_id, alerted_at, "
+                    " outcome, detail) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        paper_trade_id, signal_type, token_id,
+                        datetime.now(timezone.utc).isoformat(),
+                        "blocked_cooldown",
+                        f"hours={settings.TG_ALERT_PER_TOKEN_COOLDOWN_HOURS}",
+                    ),
+                )
+                await db._conn.commit()
+                return
+            # Win the race: insert pre-emptive 'sent' row
+            cur = await db._conn.execute(
+                "INSERT INTO tg_alert_log "
+                "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
+                "VALUES (?, ?, ?, ?, 'sent')",
+                (
+                    paper_trade_id, signal_type, token_id,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            sent_row_id = cur.lastrowid
+            await db._conn.commit()
+
+        # Dispatch outside the lock
         body = format_paper_trade_alert(
             signal_type=signal_type, symbol=symbol, coin_id=token_id,
             entry_price=entry_price, amount_usd=amount_usd,
@@ -666,10 +728,7 @@ async def notify_paper_trade_opened(
             await alerter.send_telegram_message(
                 body, session, settings, parse_mode=None
             )
-            await _log_outcome(
-                db, paper_trade_id=paper_trade_id, signal_type=signal_type,
-                token_id=token_id, outcome="sent",
-            )
+            # Row is already 'sent' from the atomic claim. No-op.
         except Exception as e:
             log.warning(
                 "tg_alert_dispatch_failed",
@@ -678,11 +737,17 @@ async def notify_paper_trade_opened(
                 token_id=token_id,
                 err=str(e),
             )
-            await _log_outcome(
-                db, paper_trade_id=paper_trade_id, signal_type=signal_type,
-                token_id=token_id, outcome="dispatch_failed",
-                detail=str(e)[:200],
-            )
+            # Demote pre-emptive 'sent' row to 'dispatch_failed'.
+            # Note: cooldown query filters on outcome='sent' so this
+            # demotion correctly clears the cooldown for the next fire.
+            if sent_row_id is not None and db._conn is not None:
+                async with db._txn_lock:
+                    await db._conn.execute(
+                        "UPDATE tg_alert_log SET outcome='dispatch_failed', "
+                        "detail=? WHERE id=?",
+                        (str(e)[:200], sent_row_id),
+                    )
+                    await db._conn.commit()
     except Exception:
         # Belt-and-braces: even logging failures must not propagate up
         # to block paper-trade dispatch.
@@ -853,6 +918,169 @@ async def test_post_open_hook_failure_does_not_block_open(tmp_path, monkeypatch)
 ```bash
 git add scout/trading/engine.py tests/test_engine_post_open_hook.py
 git commit -m "feat(tg-alert-allowlist): engine post-open hook (Task 2)"
+```
+
+---
+
+## Task 2.5: auto_suspend joint flag maintenance (R2-I1 fold)
+
+**Files:**
+- Modify: `scout/trading/auto_suspend.py`
+- Test: `tests/test_auto_suspend.py` (existing)
+
+- [ ] **Step 1: Modify `_atomic_suspend` to clear `tg_alert_eligible`**
+
+In the existing `UPDATE signal_params SET enabled=0, suspended_at=?, suspended_reason=? WHERE signal_type=?` add `tg_alert_eligible=0`:
+
+```python
+await conn.execute(
+    """UPDATE signal_params
+       SET enabled=0, tg_alert_eligible=0,
+           suspended_at=?, suspended_reason=?
+       WHERE signal_type=?""",
+    (now_iso, reason, signal_type),
+)
+```
+
+- [ ] **Step 2: Modify `revive_signal_with_baseline` to restore eligibility**
+
+When reviving, restore `tg_alert_eligible=1` IF the signal was in `DEFAULT_ALLOW_SIGNALS`:
+
+```python
+from scout.trading.tg_alert_dispatch import DEFAULT_ALLOW_SIGNALS
+
+restore_eligible = 1 if signal_type in DEFAULT_ALLOW_SIGNALS else 0
+await conn.execute(
+    """UPDATE signal_params
+       SET enabled=1, tg_alert_eligible=?,
+           suspended_at=NULL, suspended_reason=NULL
+       WHERE signal_type=?""",
+    (restore_eligible, signal_type),
+)
+```
+
+- [ ] **Step 3: Add tests** in `tests/test_auto_suspend.py`:
+
+```python
+async def test_atomic_suspend_clears_tg_alert_eligible(tmp_path):
+    """R2-I1 fold: auto-suspend clears BOTH enabled and tg_alert_eligible."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    # gainers_early starts eligible=1 from migration
+    await _atomic_suspend(db._conn, "gainers_early", "hard_loss", now_iso)
+    cur = await db._conn.execute(
+        "SELECT enabled, tg_alert_eligible FROM signal_params "
+        "WHERE signal_type='gainers_early'"
+    )
+    row = await cur.fetchone()
+    assert row[0] == 0  # enabled cleared
+    assert row[1] == 0  # tg_alert_eligible also cleared
+
+
+async def test_revive_restores_default_allow_eligibility(tmp_path):
+    """R2-I1 fold: revive restores tg_alert_eligible=1 for default-allow signals."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _atomic_suspend(db._conn, "gainers_early", "hard_loss", now_iso)
+    await revive_signal_with_baseline(db, "gainers_early", ...)
+    cur = await db._conn.execute(
+        "SELECT enabled, tg_alert_eligible FROM signal_params "
+        "WHERE signal_type='gainers_early'"
+    )
+    row = await cur.fetchone()
+    assert row[0] == 1
+    assert row[1] == 1
+
+
+async def test_revive_does_not_restore_non_default_allow(tmp_path):
+    """trending_catch is not in DEFAULT_ALLOW_SIGNALS → revive sets eligible=0."""
+    # ... similar, asserts tg_alert_eligible=0 after revive
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add scout/trading/auto_suspend.py tests/test_auto_suspend.py
+git commit -m "feat(tg-alert-allowlist): auto_suspend joint flag maintenance (Task 2.5, R2-I1)"
+```
+
+---
+
+## Task 2.6: scout/main.py wiring — session pass + first-deploy announcement
+
+**Files:**
+- Modify: `scout/main.py`
+- Test: `tests/test_main_wiring.py` (existing)
+
+- [ ] **Step 1: Pass session into TradingEngine**
+
+In `scout/main.py:1230`, the engine is constructed inside the cycle loop where `aiohttp.ClientSession` is already available. Pass it:
+
+```python
+trading_engine = TradingEngine(
+    mode=settings.TRADING_MODE,
+    db=db,
+    settings=settings,
+    live_engine=live_engine,
+    session=session,  # R1-I3+I5 fold: TG alert dispatch uses this
+)
+```
+
+- [ ] **Step 2: Add first-deploy announcement**
+
+After `Database.initialize()` (which runs the migration creating tg_alert_log) but before the cycle loop, INSIDE the `aiohttp.ClientSession` block:
+
+```python
+# R2-C1 + R1-I4 design-stage fold: first-deploy operator announcement.
+# Gated on tg_alert_log 'announcement_sent' sentinel — fires exactly
+# once per database lifetime regardless of restart count.
+async def _maybe_announce_tg_alerts(db, session, settings):
+    cur = await db._conn.execute(
+        "SELECT 1 FROM tg_alert_log WHERE outcome='announcement_sent' LIMIT 1"
+    )
+    if await cur.fetchone():
+        return  # already announced
+    body = (
+        "📢 TG alert allowlist active\n"
+        "Allowed signals (paper-trade open): gainers_early, "
+        "narrative_prediction, losers_contrarian, volume_spike\n"
+        "Open-only — check dashboard for closes\n"
+        "chain_completed via existing chain alerter\n"
+        "Per-token cooldown: "
+        f"{settings.TG_ALERT_PER_TOKEN_COOLDOWN_HOURS}h "
+        "(reduce via .env TG_ALERT_PER_TOKEN_COOLDOWN_HOURS=2 for "
+        "second-leg signals)\n"
+        "To silence per-signal: UPDATE signal_params SET "
+        "tg_alert_eligible=0 WHERE signal_type='...';"
+    )
+    try:
+        await alerter.send_telegram_message(
+            body, session, settings, parse_mode=None
+        )
+        # Sentinel insert — must succeed for idempotency
+        async with db._txn_lock:
+            await db._conn.execute(
+                "INSERT INTO tg_alert_log "
+                "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
+                "VALUES (NULL, 'announcement', '_system', ?, "
+                "'announcement_sent')",
+                (datetime.now(timezone.utc).isoformat(),),
+            )
+            await db._conn.commit()
+        logger.info("tg_alert_announcement_sent")
+    except Exception:
+        # Don't block startup on announcement failure; will retry next start
+        logger.exception("tg_alert_announcement_failed")
+
+# Call once after engine setup, before cycle loop
+await _maybe_announce_tg_alerts(db, session, settings)
+```
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add scout/main.py tests/test_main_wiring.py
+git commit -m "feat(tg-alert-allowlist): main.py session wiring + first-deploy announcement (Task 2.6, R2-C1+R1-I4)"
 ```
 
 ---
