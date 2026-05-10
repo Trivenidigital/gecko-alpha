@@ -244,7 +244,9 @@ async def test_notify_writes_sent_row_on_success(tmp_path, monkeypatch):
 
     monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
     await notify_paper_trade_opened(
-        db, settings, session=None,
+        db,
+        settings,
+        session=None,
         paper_trade_id=42,
         signal_type="gainers_early",
         token_id="bitcoin",
@@ -274,7 +276,9 @@ async def test_notify_logs_eligibility_block(tmp_path):
     settings = _settings()
     await _insert_paper_trade(db, trade_id=42)
     await notify_paper_trade_opened(
-        db, settings, session=None,
+        db,
+        settings,
+        session=None,
         paper_trade_id=42,
         signal_type="first_signal",  # suspended in default migration
         token_id="bitcoin",
@@ -306,7 +310,9 @@ async def test_notify_handles_dispatch_failure_demotes_to_dispatch_failed(
 
     monkeypatch.setattr("scout.alerter.send_telegram_message", _fail)
     await notify_paper_trade_opened(
-        db, settings, session=None,
+        db,
+        settings,
+        session=None,
         paper_trade_id=42,
         signal_type="gainers_early",
         token_id="bitcoin",
@@ -340,21 +346,39 @@ async def test_notify_concurrent_only_one_sent(tmp_path, monkeypatch):
     # Spawn 3 concurrent dispatches for the same token
     await asyncio.gather(
         notify_paper_trade_opened(
-            db, settings, session=None, paper_trade_id=1,
-            signal_type="gainers_early", token_id="btc", symbol="BTC",
-            entry_price=50000.0, amount_usd=100.0,
+            db,
+            settings,
+            session=None,
+            paper_trade_id=1,
+            signal_type="gainers_early",
+            token_id="btc",
+            symbol="BTC",
+            entry_price=50000.0,
+            amount_usd=100.0,
             signal_data={"price_change_24h": 30.0, "mcap": 1_000_000},
         ),
         notify_paper_trade_opened(
-            db, settings, session=None, paper_trade_id=2,
-            signal_type="losers_contrarian", token_id="btc", symbol="BTC",
-            entry_price=50000.0, amount_usd=100.0,
+            db,
+            settings,
+            session=None,
+            paper_trade_id=2,
+            signal_type="losers_contrarian",
+            token_id="btc",
+            symbol="BTC",
+            entry_price=50000.0,
+            amount_usd=100.0,
             signal_data={"price_change_24h": -30.0, "mcap": 1_000_000},
         ),
         notify_paper_trade_opened(
-            db, settings, session=None, paper_trade_id=3,
-            signal_type="volume_spike", token_id="btc", symbol="BTC",
-            entry_price=50000.0, amount_usd=100.0,
+            db,
+            settings,
+            session=None,
+            paper_trade_id=3,
+            signal_type="volume_spike",
+            token_id="btc",
+            symbol="BTC",
+            entry_price=50000.0,
+            amount_usd=100.0,
             signal_data={"spike_ratio": 5.0},
         ),
     )

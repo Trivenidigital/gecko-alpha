@@ -67,9 +67,7 @@ async def _check_eligibility(db: Database, signal_type: str) -> bool:
     return bool(row and row[0])
 
 
-async def _check_cooldown(
-    db: Database, settings: Settings, token_id: str
-) -> bool:
+async def _check_cooldown(db: Database, settings: Settings, token_id: str) -> bool:
     """Returns True if cooldown is in effect (block the alert).
 
     R2-I1 fold: keyed on token_id ONLY (across all signal types) so a

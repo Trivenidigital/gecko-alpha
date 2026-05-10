@@ -399,9 +399,7 @@ class TradingEngine:
             row = await cur.fetchone()
             effective_entry = float(row[0]) if row and row[0] is not None else 0.0
         except Exception:
-            log.exception(
-                "tg_alert_post_open_price_read_failed", trade_id=trade_id
-            )
+            log.exception("tg_alert_post_open_price_read_failed", trade_id=trade_id)
             effective_entry = 0.0
 
         task = asyncio.create_task(

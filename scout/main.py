@@ -965,8 +965,7 @@ async def _maybe_announce_tg_alerts(db, session, settings) -> None:
         return
     try:
         cur = await db._conn.execute(
-            "SELECT 1 FROM tg_alert_log WHERE outcome='announcement_sent' "
-            "LIMIT 1"
+            "SELECT 1 FROM tg_alert_log WHERE outcome='announcement_sent' " "LIMIT 1"
         )
         if await cur.fetchone():
             return  # already announced
@@ -989,9 +988,7 @@ async def _maybe_announce_tg_alerts(db, session, settings) -> None:
         "tg_alert_eligible=0 WHERE signal_type='...';"
     )
     try:
-        await alerter.send_telegram_message(
-            body, session, settings, parse_mode=None
-        )
+        await alerter.send_telegram_message(body, session, settings, parse_mode=None)
         async with db._txn_lock:
             await db._conn.execute(
                 "INSERT INTO tg_alert_log "

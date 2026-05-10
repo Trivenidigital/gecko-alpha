@@ -318,6 +318,6 @@ async def test_history_offset_pagination(client):
     ids1 = {r["id"] for r in page1}
     assert ids0.isdisjoint(ids1)
     all_closed = [r["closed_at"] for r in (page0 + page1)]
-    assert all_closed == sorted(all_closed, reverse=True), (
-        "rows not in closed_at DESC order"
-    )
+    assert all_closed == sorted(
+        all_closed, reverse=True
+    ), "rows not in closed_at DESC order"

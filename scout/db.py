@@ -3147,8 +3147,7 @@ class Database:
                     "WHERE signal_type = ?",
                     (sig,),
                 )
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS tg_alert_log (
+            await conn.execute("""CREATE TABLE IF NOT EXISTS tg_alert_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     paper_trade_id INTEGER REFERENCES paper_trades(id) ON DELETE SET NULL,
                     signal_type TEXT NOT NULL,
@@ -3160,8 +3159,7 @@ class Database:
                         'announcement_sent'
                     )),
                     detail      TEXT
-                )"""
-            )
+                )""")
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tg_alert_log_token "
                 "ON tg_alert_log(token_id, alerted_at)"
@@ -3183,16 +3181,13 @@ class Database:
                 await conn.execute("ROLLBACK")
             except Exception:
                 pass
-            _log.error(
-                "SCHEMA_DRIFT_DETECTED", migration="bl_tg_alert_eligible_v1"
-            )
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_tg_alert_eligible_v1")
             raise
 
         # Per-signal post-assertion (R1-C2 fold)
         for sig in DEFAULT_ALLOW:
             cur = await conn.execute(
-                "SELECT tg_alert_eligible FROM signal_params "
-                "WHERE signal_type = ?",
+                "SELECT tg_alert_eligible FROM signal_params " "WHERE signal_type = ?",
                 (sig,),
             )
             row = await cur.fetchone()
@@ -3345,9 +3340,7 @@ class Database:
             # alerting after a Tier 1b cycle.
             from scout.trading.tg_alert_dispatch import DEFAULT_ALLOW_SIGNALS
 
-            restore_eligible = (
-                1 if signal_type in DEFAULT_ALLOW_SIGNALS else 0
-            )
+            restore_eligible = 1 if signal_type in DEFAULT_ALLOW_SIGNALS else 0
             await conn.execute(
                 """UPDATE signal_params
                    SET enabled = 1,
