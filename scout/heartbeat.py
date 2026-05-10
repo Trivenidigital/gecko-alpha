@@ -4,7 +4,7 @@ Tracks cumulative pipeline stats across cycles and emits a structured
 "heartbeat" log every HEARTBEAT_INTERVAL_SECONDS so operators can see
 the pipeline is alive.
 
-BL-075 Phase A (2026-05-03) adds `mcap_null_with_price_count` —
+BL-075 Phase A (2026-05-03) adds `mcap_null_with_price_count` --
 increments on each CoinGecko ingestion parse where market_cap was
 null/0 but current_price was positive. Surfaces the silent-rejection
 rate at the mcap=0 floor that caused the RIV (riv-coin) miss.
@@ -26,6 +26,7 @@ _heartbeat_stats: dict = {
     "counter_scores_narrative": 0,
     "mcap_null_with_price_count": 0,
     "slow_burn_detected_total": 0,
+    "slow_burn_coins_skipped_total": 0,
     "last_heartbeat_at": None,
 }
 
@@ -46,6 +47,7 @@ def _reset_heartbeat_stats() -> None:
         counter_scores_narrative=0,
         mcap_null_with_price_count=0,
         slow_burn_detected_total=0,
+        slow_burn_coins_skipped_total=0,
         last_heartbeat_at=None,
     )
 
@@ -54,7 +56,7 @@ def increment_mcap_null_with_price() -> None:
     """BL-075 Phase A: bump null-mcap-with-price counter (called from ingestion).
 
     Fires when CoinGecko returns a token with market_cap=null/0 but
-    current_price>0 — the silent-rejection shape that caused the RIV
+    current_price>0 -- the silent-rejection shape that caused the RIV
     (riv-coin) 100x miss on 2026-05-03.
     """
     _heartbeat_stats["mcap_null_with_price_count"] += 1
@@ -86,6 +88,7 @@ def _maybe_emit_heartbeat(settings) -> bool:
         counter_scores_narrative=_heartbeat_stats["counter_scores_narrative"],
         mcap_null_with_price_count=_heartbeat_stats["mcap_null_with_price_count"],
         slow_burn_detected_total=_heartbeat_stats["slow_burn_detected_total"],
+        slow_burn_coins_skipped_total=_heartbeat_stats["slow_burn_coins_skipped_total"],
         last_heartbeat_at=_heartbeat_stats["last_heartbeat_at"].isoformat(),
     )
     _heartbeat_stats["last_heartbeat_at"] = now
@@ -95,3 +98,13 @@ def _maybe_emit_heartbeat(settings) -> bool:
 def increment_slow_burn_detected(count: int = 1) -> None:
     """BL-075 Phase B: bump slow-burn detection counter (called from detector)."""
     _heartbeat_stats["slow_burn_detected_total"] += count
+
+
+def increment_slow_burn_coins_skipped(count: int = 1) -> None:
+    """BL-075 Phase B follow-up: bump per-coin-skip counter for live silent-
+    failure detection. Surfaces 'watcher is alive but cannot process any coins'
+    pathology that the per-coin try/except containment created.
+
+    Mirrors increment_slow_burn_detected semantics - process-cumulative.
+    """
+    _heartbeat_stats["slow_burn_coins_skipped_total"] += count
