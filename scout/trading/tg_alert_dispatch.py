@@ -250,20 +250,23 @@ async def notify_paper_trade_opened(
             sent_row_id = cur.lastrowid
             await db._conn.commit()
 
-        body = format_paper_trade_alert(
-            signal_type=signal_type,
-            symbol=symbol,
-            coin_id=token_id,
-            entry_price=entry_price,
-            amount_usd=amount_usd,
-            signal_data=signal_data,
-        )
+        # V3-C1 PR-stage fold: format + dispatch BOTH inside the try.
+        # If format raises (string mcap, list signal_data), the
+        # pre-emptive 'sent' row would otherwise persist -> cooldown
+        # query suppresses next legitimate alert for 6h.
         try:
+            body = format_paper_trade_alert(
+                signal_type=signal_type,
+                symbol=symbol,
+                coin_id=token_id,
+                entry_price=entry_price,
+                amount_usd=amount_usd,
+                signal_data=signal_data,
+            )
             # R1-C1 fold: parse_mode=None to avoid Markdown 400 silent-fail
             await alerter.send_telegram_message(
                 body, session, settings, parse_mode=None
             )
-            # Pre-emptive 'sent' row already written; no-op.
         except Exception as e:
             log.warning(
                 "tg_alert_dispatch_failed",

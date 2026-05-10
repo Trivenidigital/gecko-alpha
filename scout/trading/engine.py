@@ -402,6 +402,17 @@ class TradingEngine:
             log.exception("tg_alert_post_open_price_read_failed", trade_id=trade_id)
             effective_entry = 0.0
 
+        # V3-I1 PR-stage fold: skip TG dispatch if entry_price re-read
+        # failed. Earlier behavior would render "$0" in alert body.
+        if effective_entry <= 0.0:
+            log.warning(
+                "tg_alert_skipped_invalid_entry_price",
+                trade_id=trade_id,
+                signal_type=signal_type,
+                token_id=token_id,
+            )
+            return
+
         task = asyncio.create_task(
             notify_paper_trade_opened(
                 self.db,

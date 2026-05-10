@@ -3341,6 +3341,14 @@ class Database:
             from scout.trading.tg_alert_dispatch import DEFAULT_ALLOW_SIGNALS
 
             restore_eligible = 1 if signal_type in DEFAULT_ALLOW_SIGNALS else 0
+            # V3-I3 PR-stage fold: log decision so operator sees why
+            # non-default-allow opt-in wasn't restored after revive.
+            _db_log.info(
+                "signal_revived_tg_eligible",
+                signal_type=signal_type,
+                restored_to=restore_eligible,
+                in_default_allow=signal_type in DEFAULT_ALLOW_SIGNALS,
+            )
             await conn.execute(
                 """UPDATE signal_params
                    SET enabled = 1,
