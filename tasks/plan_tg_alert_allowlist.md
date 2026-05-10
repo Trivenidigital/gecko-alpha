@@ -1,4 +1,4 @@
-**New primitives introduced:** New `signal_params.tg_alert_eligible` BOOLEAN column (default 0); migration `bl_tg_alert_eligible_v1`. New module `scout/trading/tg_alert_dispatch.py` exposing `notify_paper_trade_opened(db, settings, session, paper_trade_id, signal_type, ...)` with per-signal allowlist + provisional n≥30 gate + per-token cooldown. New helper `format_paper_trade_alert(...)` producing concise Telegram body. New post-open hook in `scout/trading/engine.py` after `execute_buy` returns trade_id. New Settings `TG_ALERT_PROVISIONAL_MIN_TRADES: int = 30`, `TG_ALERT_PER_TOKEN_COOLDOWN_HOURS: int = 24`. Default eligibility set in migration: gainers_early=1, narrative_prediction=1, losers_contrarian=1, volume_spike=1, chain_completed=1 (BUT chain_completed gates further on n≥30 closed trades count). Existing `scout/chains/alerts.py` chain_completion alert is RETAINED (chain-pattern detection alert; separate from paper-trade-open alert path). Operator can audit-trail-flip eligibility via `UPDATE signal_params SET tg_alert_eligible=N WHERE signal_type=...`.
+**New primitives introduced:** New `signal_params.tg_alert_eligible` BOOLEAN column (default 0); migration `bl_tg_alert_eligible_v1` (schema 20260516, stamps `schema_version` + `paper_migrations` cutover row, mirrors `_migrate_bl_quote_pair_v1` structure). New module `scout/trading/tg_alert_dispatch.py` exposing `notify_paper_trade_opened(db, settings, session, paper_trade_id, signal_type, ...)` with per-signal allowlist + per-token cooldown. New helper `format_paper_trade_alert(...)` producing concise single-line Telegram body with `parse_mode=None` (R1-C1 fold: avoids the silent-400 Markdown class caught in PR #76). New post-open hook in `scout/trading/engine.py` after `execute_buy` returns trade_id, using `asyncio.create_task` + `_tg_alert_tasks: set[asyncio.Task]` ref-holding pattern (R1-C3 fold: mirrors `scout/main.py:91` `_social_restart_tasks`). Engine post-slip entry price re-read after open via `SELECT entry_price FROM paper_trades WHERE id=?` (R1-C2 fold). New Settings `TG_ALERT_PER_TOKEN_COOLDOWN_HOURS: int = 6` (R2-I1 fold: per-token-across-signals, default 6h). Default eligibility set in migration: gainers_early=1, narrative_prediction=1, losers_contrarian=1, volume_spike=1. **chain_completed=0 (R2-C2 fold)** — the existing `scout/chains/alerts.py` chain-pattern-completion alert already carries chain_completed; new paper-trade-open dispatch suppresses to avoid duplicate alerts on the same event. First-deploy operator announcement message via `scout/main.py` startup logging (R2-I3+I4 fold). Operator can audit-trail-flip eligibility via `UPDATE signal_params SET tg_alert_eligible=N WHERE signal_type=...`.
 
 # TG Alert Allowlist (Option B) Implementation Plan
 
@@ -8,12 +8,15 @@
 
 **Architecture:** Introduce `signal_params.tg_alert_eligible` flag. After `engine.open_trade` successfully creates a paper_trade row, fire a post-open hook that:
 1. Reads `tg_alert_eligible` for the signal_type — if 0, no-op
-2. If signal is "provisional" (configured per-signal — default chain_completed has eligibility=1 BUT historical n<min_threshold), gate further: only fire if `paper_trades` closed-trade count for this signal_type ≥ `TG_ALERT_PROVISIONAL_MIN_TRADES` (30)
-3. Per-token cooldown — don't re-alert the same `(signal_type, token_id)` within `TG_ALERT_PER_TOKEN_COOLDOWN_HOURS` (24h default)
-4. Format message + dispatch via `alerter.send_telegram_message`
-5. Record fire in `tg_alert_log` table for audit + cooldown lookup
+2. **Per-token cooldown** (R2-I1 fold): don't re-alert the same `token_id` within `TG_ALERT_PER_TOKEN_COOLDOWN_HOURS` (6h default) regardless of signal_type. Operator scenario: bitcoin firing gainers_early at 10am + losers_contrarian at 4pm → 1 alert, not 2. Reduces signal-type-collision noise on a single token.
+3. Format message + dispatch via `alerter.send_telegram_message(parse_mode=None)` (R1-C1 fold: avoid Markdown 400-error from underscores in `signal_type.upper()`)
+4. Record fire in `tg_alert_log` table for audit + cooldown lookup
 
 Failure modes (network, missing creds) are caught + logged; never block paper-trade dispatch.
+
+**chain_completed exclusion** (R2-C2 fold): existing `scout/chains/alerts.py:59` already fires a Telegram alert when a chain pattern completes — that's the same event a chain_completed paper-trade-open would alert on. To avoid duplicate alerts (operator inbox sees one event = two pings), `chain_completed` is left at `tg_alert_eligible=0` in the default migration. The existing chain-pattern-completion path remains. Operator can opt-in via `UPDATE signal_params SET tg_alert_eligible=1 WHERE signal_type='chain_completed'` if they want both, accepting the duplication.
+
+**Provisional gate not introduced in M1** (R1-I4 fold): the prior plan's `TG_ALERT_PROVISIONAL_MIN_TRADES` gate is removed. With chain_completed excluded, no signal in the M1 default-allow list needs a provisional gate. If a future signal needs it, the gate can be added then; M1 keeps eligibility binary.
 
 **Tech Stack:** Python 3.12, aiosqlite, aiohttp, pydantic v2 BaseSettings, structlog, pytest-asyncio (auto mode), aioresponses (HTTP mock).
 
@@ -26,8 +29,8 @@ Failure modes (network, missing creds) are caught + logged; never block paper-tr
 | File | Action | Responsibility |
 |---|---|---|
 | `scout/db.py` | Modify | Add migration `bl_tg_alert_eligible_v1` (schema 20260516): `ALTER TABLE signal_params ADD COLUMN tg_alert_eligible INTEGER NOT NULL DEFAULT 0`; UPDATE existing rows for default-allow signals; CREATE TABLE `tg_alert_log` (audit + cooldown source) |
-| `scout/config.py` | Modify | Add `TG_ALERT_PROVISIONAL_MIN_TRADES: int = 30` + `TG_ALERT_PER_TOKEN_COOLDOWN_HOURS: int = 24` Settings |
-| `scout/trading/tg_alert_dispatch.py` | **Create** | `notify_paper_trade_opened(...)` orchestrator + `format_paper_trade_alert(...)` formatter + `_check_eligibility`, `_check_provisional_gate`, `_check_cooldown` helpers. Pure async, no I/O beyond aiosqlite + alerter. |
+| `scout/config.py` | Modify | Add `TG_ALERT_PER_TOKEN_COOLDOWN_HOURS: int = 6` Settings |
+| `scout/trading/tg_alert_dispatch.py` | **Create** | `notify_paper_trade_opened(...)` orchestrator + `format_paper_trade_alert(...)` formatter + `_check_eligibility`, `_check_cooldown` helpers. Pure async, no I/O beyond aiosqlite + alerter. |
 | `scout/trading/engine.py` | Modify | After `trade_id = await self._paper_trader.execute_buy(...)` returns non-None, await `notify_paper_trade_opened(...)` (fire-and-forget pattern via task spawn so paper-trade dispatch never blocks on Telegram) |
 | `tests/test_tg_alert_dispatch.py` | **Create** | Eligibility allowlist tests + provisional gate tests + per-token cooldown tests + format tests + tg_alert_log writer tests + failure-mode tests |
 | `tests/test_engine_post_open_hook.py` | **Create** | Engine integration test — verify `notify_paper_trade_opened` fires on successful open + does NOT fire when allowlist=0 |
@@ -52,64 +55,94 @@ In `scout/config.py` near other paper-trade Settings:
 ```python
     # BL-NEW-TG-ALERT-ALLOWLIST: per-signal Telegram alert dispatch on
     # paper-trade open. Eligibility is tracked per-signal in
-    # signal_params.tg_alert_eligible. Provisional signals (low historical
-    # sample size) gate further on closed-trade count.
-    TG_ALERT_PROVISIONAL_MIN_TRADES: int = 30
-    # Per-(signal_type, token_id) cooldown to prevent spam when the same
-    # signal re-fires repeatedly on a single token (multi-snapshot bursts).
-    TG_ALERT_PER_TOKEN_COOLDOWN_HOURS: int = 24
+    # signal_params.tg_alert_eligible.
+    # Per-token cooldown (R2-I1 fold: per-token-across-signals, NOT
+    # per-(signal,token), so a single token firing two different signals
+    # within the window only alerts once).
+    TG_ALERT_PER_TOKEN_COOLDOWN_HOURS: int = 6
 ```
 
 - [ ] **Step 3: Add migration `bl_tg_alert_eligible_v1` to `scout/db.py`**
 
-Add after the most recent `_migrate_*` function, register in `_apply_migrations` with schema version 20260516:
+R1-I1 fold: mirror the BEGIN EXCLUSIVE + schema_version stamp + paper_migrations cutover row pattern of `_migrate_bl_quote_pair_v1` (db.py:2733-2837). Migration registration MUST be appended AFTER `_migrate_bl_slow_burn_v1` (currently last at db.py:102) so the existing `_migrate_signal_params_schema` (db.py:91) seeds the rows BEFORE the default-allow UPDATE runs (R1-I2 fold).
 
 ```python
 async def _migrate_tg_alert_eligible_v1(self, conn) -> None:
     """BL-NEW-TG-ALERT-ALLOWLIST: per-signal TG alert eligibility.
 
-    Adds signal_params.tg_alert_eligible (default 0). Sets eligibility=1
-    for the 4 statistically-validated signals + chain_completed (which
-    is gated additionally by TG_ALERT_PROVISIONAL_MIN_TRADES).
+    Schema version 20260516. Adds signal_params.tg_alert_eligible
+    (default 0). Sets eligibility=1 for the 4 statistically-validated
+    signals (gainers_early, narrative_prediction, losers_contrarian,
+    volume_spike). chain_completed stays 0 because the existing
+    scout/chains/alerts.py path already alerts on chain pattern
+    completion; setting it 1 here would duplicate.
 
-    Creates tg_alert_log for audit + cooldown lookup.
+    Creates tg_alert_log for audit + cooldown lookup. ON DELETE SET NULL
+    on paper_trade_id FK so future paper_trades cleanup doesn't block.
     """
-    # Idempotent: skip column add if already present (pragma_table_info)
-    cur = await conn.execute("PRAGMA table_info(signal_params)")
-    cols = {row[1] for row in await cur.fetchall()}
-    if "tg_alert_eligible" not in cols:
-        await conn.execute(
-            "ALTER TABLE signal_params ADD COLUMN "
-            "tg_alert_eligible INTEGER NOT NULL DEFAULT 0"
-        )
-    # Default-allow signals (data-driven assessment 2026-05-10)
-    for sig in ("gainers_early", "narrative_prediction", "losers_contrarian",
-                "volume_spike", "chain_completed"):
-        await conn.execute(
-            "UPDATE signal_params SET tg_alert_eligible=1 "
-            "WHERE signal_type = ?",
-            (sig,),
-        )
-    # Audit + cooldown source
-    await conn.execute(
-        """CREATE TABLE IF NOT EXISTS tg_alert_log (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            paper_trade_id INTEGER REFERENCES paper_trades(id),
-            signal_type  TEXT NOT NULL,
-            token_id     TEXT NOT NULL,
-            alerted_at   TEXT NOT NULL,
-            outcome      TEXT NOT NULL CHECK (outcome IN (
-                'sent','blocked_eligibility','blocked_provisional',
-                'blocked_cooldown','dispatch_failed'
-            )),
-            detail       TEXT
-        )"""
+    SCHEMA_VERSION = 20260516
+    cur = await conn.execute(
+        "SELECT 1 FROM schema_version WHERE version = ?", (SCHEMA_VERSION,)
     )
-    await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tg_alert_log_token "
-        "ON tg_alert_log(signal_type, token_id, alerted_at)"
-    )
-    await conn.commit()
+    if await cur.fetchone():
+        return  # already applied
+    async with self._txn_lock:
+        await conn.execute("BEGIN EXCLUSIVE")
+        try:
+            cur = await conn.execute("PRAGMA table_info(signal_params)")
+            cols = {row[1] for row in await cur.fetchall()}
+            if "tg_alert_eligible" not in cols:
+                await conn.execute(
+                    "ALTER TABLE signal_params ADD COLUMN "
+                    "tg_alert_eligible INTEGER NOT NULL DEFAULT 0"
+                )
+            for sig in (
+                "gainers_early", "narrative_prediction",
+                "losers_contrarian", "volume_spike",
+            ):
+                await conn.execute(
+                    "UPDATE signal_params SET tg_alert_eligible=1 "
+                    "WHERE signal_type = ?",
+                    (sig,),
+                )
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS tg_alert_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_trade_id INTEGER REFERENCES paper_trades(id) ON DELETE SET NULL,
+                    signal_type TEXT NOT NULL,
+                    token_id    TEXT NOT NULL,
+                    alerted_at  TEXT NOT NULL,
+                    outcome     TEXT NOT NULL CHECK (outcome IN (
+                        'sent','blocked_eligibility',
+                        'blocked_cooldown','dispatch_failed'
+                    )),
+                    detail      TEXT
+                )"""
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tg_alert_log_token "
+                "ON tg_alert_log(token_id, alerted_at)"
+            )
+            await conn.execute(
+                "INSERT INTO schema_version (version, description, applied_at) "
+                "VALUES (?, 'bl_tg_alert_eligible_v1', ?)",
+                (SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
+            )
+            # Post-assertion: at least the 4 default-allow signals have eligibility=1
+            cur = await conn.execute(
+                "SELECT COUNT(*) FROM signal_params WHERE tg_alert_eligible=1 "
+                "AND signal_type IN ('gainers_early','narrative_prediction',"
+                "'losers_contrarian','volume_spike')"
+            )
+            row = await cur.fetchone()
+            assert row and row[0] == 4, (
+                f"bl_tg_alert_eligible_v1 post-assert: expected 4 default-allow "
+                f"rows, got {row[0] if row else None}"
+            )
+            await conn.commit()
+        except Exception:
+            await conn.execute("ROLLBACK")
+            raise
 ```
 
 - [ ] **Step 4: Failing test for migration**
@@ -164,7 +197,6 @@ from scout.trading.tg_alert_dispatch import (
     notify_paper_trade_opened,
     format_paper_trade_alert,
     _check_eligibility,
-    _check_provisional_gate,
     _check_cooldown,
 )
 
@@ -198,36 +230,12 @@ async def test_eligibility_unknown_signal_blocked(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_provisional_gate_allows_at_or_above_threshold(tmp_path):
-    """chain_completed has eligibility=1 but is gated by closed-trade count."""
+async def test_eligibility_chain_completed_excluded_by_default(tmp_path):
+    """R2-C2 fold: chain_completed defaults to tg_alert_eligible=0
+    because the existing scout/chains/alerts.py path already alerts."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    settings = Settings(_env_file=None, **_REQUIRED, TG_ALERT_PROVISIONAL_MIN_TRADES=30)
-    # Insert 30 closed chain_completed trades
-    await _seed_closed_trades(db, "chain_completed", count=30)
-    assert await _check_provisional_gate(db, settings, "chain_completed") is True
-    await db.close()
-
-
-@pytest.mark.asyncio
-async def test_provisional_gate_blocks_below_threshold(tmp_path):
-    db = Database(tmp_path / "t.db")
-    await db.initialize()
-    settings = Settings(_env_file=None, **_REQUIRED, TG_ALERT_PROVISIONAL_MIN_TRADES=30)
-    await _seed_closed_trades(db, "chain_completed", count=8)  # current prod
-    assert await _check_provisional_gate(db, settings, "chain_completed") is False
-    await db.close()
-
-
-@pytest.mark.asyncio
-async def test_provisional_gate_skipped_for_non_provisional(tmp_path):
-    """gainers_early is non-provisional → skip the count gate."""
-    db = Database(tmp_path / "t.db")
-    await db.initialize()
-    settings = Settings(_env_file=None, **_REQUIRED, TG_ALERT_PROVISIONAL_MIN_TRADES=30)
-    await _seed_closed_trades(db, "gainers_early", count=0)
-    # Provisional gate is ONLY applied to chain_completed in M1; others skip.
-    assert await _check_provisional_gate(db, settings, "gainers_early") is True
+    assert await _check_eligibility(db, "chain_completed") is False
     await db.close()
 
 
@@ -235,8 +243,7 @@ async def test_provisional_gate_skipped_for_non_provisional(tmp_path):
 async def test_cooldown_blocks_within_window(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    settings = Settings(_env_file=None, **_REQUIRED, TG_ALERT_PER_TOKEN_COOLDOWN_HOURS=24)
-    # Insert recent alert log
+    settings = Settings(_env_file=None, **_REQUIRED, TG_ALERT_PER_TOKEN_COOLDOWN_HOURS=6)
     now = datetime.now(timezone.utc)
     await db._conn.execute(
         "INSERT INTO tg_alert_log (paper_trade_id, signal_type, token_id, "
@@ -244,24 +251,40 @@ async def test_cooldown_blocks_within_window(tmp_path):
         (now.isoformat(),),
     )
     await db._conn.commit()
-    in_cd = await _check_cooldown(db, settings, "gainers_early", "btc")
-    assert in_cd is True
+    assert await _check_cooldown(db, settings, "btc") is True
+
+
+@pytest.mark.asyncio
+async def test_cooldown_blocks_across_signals_for_same_token(tmp_path):
+    """R2-I1 fold: per-token cooldown blocks DIFFERENT signal_type for
+    the same token within the window."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = Settings(_env_file=None, **_REQUIRED, TG_ALERT_PER_TOKEN_COOLDOWN_HOURS=6)
+    now = datetime.now(timezone.utc)
+    await db._conn.execute(
+        "INSERT INTO tg_alert_log (paper_trade_id, signal_type, token_id, "
+        "alerted_at, outcome) VALUES (1, 'gainers_early', 'btc', ?, 'sent')",
+        (now.isoformat(),),
+    )
+    await db._conn.commit()
+    # Different signal_type — should still block via per-token cooldown.
+    assert await _check_cooldown(db, settings, "btc") is True
 
 
 @pytest.mark.asyncio
 async def test_cooldown_allows_after_window(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    settings = Settings(_env_file=None, **_REQUIRED, TG_ALERT_PER_TOKEN_COOLDOWN_HOURS=24)
-    # Insert OLD alert log (25h ago)
-    old = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+    settings = Settings(_env_file=None, **_REQUIRED, TG_ALERT_PER_TOKEN_COOLDOWN_HOURS=6)
+    old = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
     await db._conn.execute(
         "INSERT INTO tg_alert_log (paper_trade_id, signal_type, token_id, "
         "alerted_at, outcome) VALUES (1, 'gainers_early', 'btc', ?, 'sent')",
         (old,),
     )
     await db._conn.commit()
-    assert await _check_cooldown(db, settings, "gainers_early", "btc") is False
+    assert await _check_cooldown(db, settings, "btc") is False
 
 
 @pytest.mark.asyncio
@@ -270,7 +293,7 @@ async def test_cooldown_only_counts_sent_outcome(tmp_path):
     so a transient failure doesn't suppress the next legitimate fire."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    settings = Settings(_env_file=None, **_REQUIRED, TG_ALERT_PER_TOKEN_COOLDOWN_HOURS=24)
+    settings = Settings(_env_file=None, **_REQUIRED, TG_ALERT_PER_TOKEN_COOLDOWN_HOURS=6)
     now = datetime.now(timezone.utc).isoformat()
     await db._conn.execute(
         "INSERT INTO tg_alert_log (paper_trade_id, signal_type, token_id, "
@@ -278,24 +301,66 @@ async def test_cooldown_only_counts_sent_outcome(tmp_path):
         (now,),
     )
     await db._conn.commit()
-    assert await _check_cooldown(db, settings, "gainers_early", "btc") is False
+    assert await _check_cooldown(db, settings, "btc") is False
 
 
 @pytest.mark.asyncio
-async def test_format_paper_trade_alert_renders_signal_data(tmp_path):
-    """Format is concise + includes signal-specific data."""
+async def test_format_gainers_early_renders_dispatcher_fields(tmp_path):
+    """R2-C1 fold: gainers_early dispatcher emits {price_change_24h, mcap}."""
     body = format_paper_trade_alert(
-        signal_type="gainers_early",
-        symbol="BTC",
-        coin_id="bitcoin",
-        entry_price=50000.0,
-        amount_usd=100.0,
+        signal_type="gainers_early", symbol="BTC", coin_id="bitcoin",
+        entry_price=50000.0, amount_usd=100.0,
         signal_data={"price_change_24h": 36.92, "mcap": 5_500_000},
     )
-    assert "GAINERS_EARLY" in body
+    assert "GAINERS EARLY" in body
     assert "BTC" in body
-    assert "36.92" in body  # price change
-    assert "$5.5M" in body or "5,500,000" in body or "5500000" in body  # mcap
+    assert "+36.9%" in body  # 24h price change
+    assert "$5.5M" in body  # mcap
+    assert "coingecko.com/en/coins/bitcoin" in body  # one-tap research link
+
+
+@pytest.mark.asyncio
+async def test_format_narrative_prediction_renders_fit_and_category(tmp_path):
+    """R2-C1 fold: narrative_prediction dispatcher emits {fit, category, mcap}.
+    Earlier plan rendered narrative_score (never emitted) — would have
+    shipped blank alerts for ~25% of fires."""
+    body = format_paper_trade_alert(
+        signal_type="narrative_prediction", symbol="DOGE", coin_id="dogecoin",
+        entry_price=0.15, amount_usd=100.0,
+        signal_data={"fit": 87, "category": "memecoin", "mcap": 20_000_000_000},
+    )
+    assert "NARRATIVE PREDICTION" in body
+    assert "DOGE" in body
+    assert "memecoin" in body
+    assert "fit 87" in body
+    assert "$20.0B" in body
+
+
+@pytest.mark.asyncio
+async def test_format_volume_spike_renders_spike_ratio(tmp_path):
+    """R2-C1 fold: volume_spike dispatcher emits {spike_ratio} only."""
+    body = format_paper_trade_alert(
+        signal_type="volume_spike", symbol="PEPE", coin_id="pepe",
+        entry_price=0.0001, amount_usd=100.0,
+        signal_data={"spike_ratio": 8.3},
+    )
+    assert "VOLUME SPIKE" in body
+    assert "vol×8.3" in body
+
+
+@pytest.mark.asyncio
+async def test_format_does_not_use_markdown_specials(tmp_path):
+    """R1-C1 fold: the format is dispatched with parse_mode=None. Verify
+    the format itself doesn't ACCIDENTALLY use Markdown specials that
+    would render badly even in plain-text — sanity check."""
+    body = format_paper_trade_alert(
+        signal_type="gainers_early", symbol="BTC", coin_id="bitcoin",
+        entry_price=50000.0, amount_usd=100.0,
+        signal_data={"price_change_24h": 36.92, "mcap": 5_500_000},
+    )
+    # signal_type underscores were the silent-400 trigger; the format
+    # transforms them to spaces ("GAINERS EARLY") — verify.
+    assert "_" not in body.split("\n")[0]
 
 
 @pytest.mark.asyncio
@@ -376,11 +441,10 @@ paper-trade open.
 
 Architecture (see tasks/plan_tg_alert_allowlist.md):
 - _check_eligibility: signal_params.tg_alert_eligible == 1
-- _check_provisional_gate: for chain_completed, require closed-trade
-  count >= TG_ALERT_PROVISIONAL_MIN_TRADES
-- _check_cooldown: don't re-alert (signal_type, token_id) within
-  TG_ALERT_PER_TOKEN_COOLDOWN_HOURS
-- format_paper_trade_alert: concise body
+- _check_cooldown: per-token (across signals) — don't re-alert the same
+  token_id within TG_ALERT_PER_TOKEN_COOLDOWN_HOURS (R2-I1 fold)
+- format_paper_trade_alert: concise single-line body with per-signal
+  field map (R2-C1 fold) + parse_mode=None caller (R1-C1 fold)
 - notify_paper_trade_opened: orchestrator; never raises (logs failures)
 """
 
@@ -396,11 +460,6 @@ from scout.db import Database
 
 log = structlog.get_logger(__name__)
 
-# Provisional signals — gated on closed-trade count threshold.
-# Operator can graduate by setting tg_alert_eligible while count < threshold,
-# but the gate enforces n>=threshold regardless.
-_PROVISIONAL_SIGNALS = {"chain_completed"}
-
 
 async def _check_eligibility(db: Database, signal_type: str) -> bool:
     if db._conn is None:
@@ -413,31 +472,18 @@ async def _check_eligibility(db: Database, signal_type: str) -> bool:
     return bool(row and row[0])
 
 
-async def _check_provisional_gate(
-    db: Database, settings: Settings, signal_type: str
-) -> bool:
-    """For provisional signals, require >= TG_ALERT_PROVISIONAL_MIN_TRADES
-    closed paper trades. Non-provisional signals always pass."""
-    if signal_type not in _PROVISIONAL_SIGNALS:
-        return True
-    if db._conn is None:
-        return False
-    cur = await db._conn.execute(
-        "SELECT COUNT(*) FROM paper_trades "
-        "WHERE signal_type = ? AND status != 'open'",
-        (signal_type,),
-    )
-    row = await cur.fetchone()
-    n = int(row[0]) if row else 0
-    return n >= settings.TG_ALERT_PROVISIONAL_MIN_TRADES
-
-
 async def _check_cooldown(
-    db: Database, settings: Settings, signal_type: str, token_id: str
+    db: Database, settings: Settings, token_id: str
 ) -> bool:
     """Returns True if cooldown is in effect (block the alert).
 
-    Only counts 'sent' outcomes — transient failures don't suppress next fire.
+    R2-I1 fold: keyed on token_id ONLY (across all signal types) so a
+    single token firing two different signals within the window only
+    alerts once. Operator scenario: bitcoin firing gainers_early at 10am
+    + losers_contrarian at 4pm → 1 alert (the first), not 2.
+
+    Only counts 'sent' outcomes — transient failures don't suppress next
+    legitimate fire.
     """
     if db._conn is None:
         return False
@@ -447,9 +493,9 @@ async def _check_cooldown(
     ).isoformat()
     cur = await db._conn.execute(
         "SELECT 1 FROM tg_alert_log "
-        "WHERE signal_type = ? AND token_id = ? AND outcome = 'sent' "
+        "WHERE token_id = ? AND outcome = 'sent' "
         "AND alerted_at >= ? LIMIT 1",
-        (signal_type, token_id, cutoff),
+        (token_id, cutoff),
     )
     return (await cur.fetchone()) is not None
 
@@ -478,6 +524,15 @@ def _fmt_price(p):
     return f"${p:.8f}"
 
 
+_SIGNAL_EMOJI = {
+    "gainers_early": "📈",
+    "losers_contrarian": "📉",
+    "volume_spike": "⚡",
+    "narrative_prediction": "🪙",
+    "chain_completed": "🔗",
+}
+
+
 def format_paper_trade_alert(
     *,
     signal_type: str,
@@ -487,23 +542,57 @@ def format_paper_trade_alert(
     amount_usd: float,
     signal_data: dict | None,
 ) -> str:
-    """Concise Telegram body for a paper-trade open. Single message, no
-    parse_mode (avoids Markdown 400-error class per BL-080-style fix).
+    """Concise single-line + extras Telegram body for a paper-trade open.
+
+    R1-C1 fold: caller MUST dispatch with parse_mode=None — signal_type
+    contains underscores that Markdown parses as italic delimiters,
+    producing a silent 400 BAD_REQUEST (caught project-wide once in PR
+    #76 per memory project_overnight_2026_05_05.md).
+
+    R2-C1 fold: per-signal field maps verified against actual emissions
+    in scout/trading/signals.py:
+      - volume_spike:        {spike_ratio}
+      - gainers_early:       {price_change_24h, mcap}
+      - losers_contrarian:   {price_change_24h, mcap}
+      - narrative_prediction:{fit, category, mcap}
+      - chain_completed:     {pattern, boost, ...} (excluded from
+                              default-allow per R2-C2 — alerted via
+                              existing scout/chains/alerts.py)
+
+    R2-format fold: header line is single-line glanceable; per-signal
+    detail follows; CoinGecko link last for one-tap research.
     """
     sd = signal_data or {}
-    lines = [
-        f"📈 {signal_type.upper()}",
-        f"{symbol} ({coin_id})",
-        f"Entry {_fmt_price(entry_price)} | Size ${amount_usd:.0f}",
-    ]
-    # Per-signal extras
-    if "price_change_24h" in sd:
-        lines.append(f"24h: {sd['price_change_24h']:+.1f}%")
-    if "mcap" in sd:
-        lines.append(f"MCap {_fmt_mcap(sd['mcap'])}")
-    if "narrative_score" in sd:
-        lines.append(f"Narrative score: {sd['narrative_score']}")
-    return "\n".join(lines)
+    emoji = _SIGNAL_EMOJI.get(signal_type, "📊")
+    # Header — single glanceable line (phone-screen-friendly)
+    header = (
+        f"{emoji} {signal_type.upper().replace('_', ' ')} · {symbol} · "
+        f"{_fmt_price(entry_price)} · ${amount_usd:.0f}"
+    )
+    extras = []
+    # Per-signal detail (only fields the dispatcher actually emits)
+    if signal_type == "gainers_early" or signal_type == "losers_contrarian":
+        if "price_change_24h" in sd:
+            extras.append(f"24h: {sd['price_change_24h']:+.1f}%")
+        if "mcap" in sd:
+            extras.append(f"mcap {_fmt_mcap(sd['mcap'])}")
+    elif signal_type == "volume_spike":
+        if "spike_ratio" in sd:
+            extras.append(f"vol×{sd['spike_ratio']:.1f}")
+    elif signal_type == "narrative_prediction":
+        if "category" in sd:
+            extras.append(f"{sd['category']}")
+        if "fit" in sd:
+            extras.append(f"fit {sd['fit']}")
+        if "mcap" in sd:
+            extras.append(f"mcap {_fmt_mcap(sd['mcap'])}")
+    detail = " · ".join(extras) if extras else None
+    link = f"coingecko.com/en/coins/{coin_id}"
+    parts = [header]
+    if detail:
+        parts.append(detail)
+    parts.append(link)
+    return "\n".join(parts)
 
 
 async def _log_outcome(
@@ -549,8 +638,8 @@ async def notify_paper_trade_opened(
     """Fire a Telegram alert for a paper-trade open (best-effort).
 
     Never raises. Always writes a tg_alert_log row recording the outcome
-    (sent / blocked_eligibility / blocked_provisional / blocked_cooldown /
-    dispatch_failed) for audit.
+    (sent / blocked_eligibility / blocked_cooldown / dispatch_failed) for
+    audit.
     """
     try:
         if not await _check_eligibility(db, signal_type):
@@ -559,14 +648,7 @@ async def notify_paper_trade_opened(
                 token_id=token_id, outcome="blocked_eligibility",
             )
             return
-        if not await _check_provisional_gate(db, settings, signal_type):
-            await _log_outcome(
-                db, paper_trade_id=paper_trade_id, signal_type=signal_type,
-                token_id=token_id, outcome="blocked_provisional",
-                detail=f"min={settings.TG_ALERT_PROVISIONAL_MIN_TRADES}",
-            )
-            return
-        if await _check_cooldown(db, settings, signal_type, token_id):
+        if await _check_cooldown(db, settings, token_id):
             await _log_outcome(
                 db, paper_trade_id=paper_trade_id, signal_type=signal_type,
                 token_id=token_id, outcome="blocked_cooldown",
@@ -579,7 +661,11 @@ async def notify_paper_trade_opened(
             signal_data=signal_data,
         )
         try:
-            await alerter.send_telegram_message(body, session, settings)
+            # R1-C1 fold: parse_mode=None to avoid Markdown 400 silent-fail
+            # on signal_type underscores ("GAINERS_EARLY" etc.).
+            await alerter.send_telegram_message(
+                body, session, settings, parse_mode=None
+            )
             await _log_outcome(
                 db, paper_trade_id=paper_trade_id, signal_type=signal_type,
                 token_id=token_id, outcome="sent",
@@ -637,25 +723,71 @@ After `trade_id = await self._paper_trader.execute_buy(...)` returns:
             # Fire-and-forget — alert dispatch never blocks paper-trade
             # success path. notify_paper_trade_opened never raises.
             if trade_id is not None:
-                from scout.trading.tg_alert_dispatch import notify_paper_trade_opened
-                # session reused if available on engine; else None (alerter
-                # creates a fresh ClientSession internally)
-                tg_session = getattr(self, "_tg_session", None)
-                # Spawn as background task — paper-trade success returns
-                # immediately even if Telegram is slow.
-                asyncio.create_task(
-                    notify_paper_trade_opened(
-                        self.db, self.settings, tg_session,
-                        paper_trade_id=trade_id,
-                        signal_type=signal_type,
-                        token_id=token_id,
-                        symbol=symbol,
-                        entry_price=current_price,
-                        amount_usd=trade_amount,
-                        signal_data=signal_data,
-                    )
+                await self._spawn_tg_alert(
+                    trade_id=trade_id,
+                    signal_type=signal_type,
+                    token_id=token_id,
+                    symbol=symbol,
+                    amount_usd=trade_amount,
+                    signal_data=signal_data,
                 )
             return trade_id
+```
+
+**`__init__` additions** (R1-C3 + R1-I5 folds):
+
+```python
+def __init__(self, ..., session: aiohttp.ClientSession | None = None) -> None:
+    # ... existing ...
+    self._tg_session = session  # R1-I5: passed from main.py cycle session
+    self._tg_alert_tasks: set[asyncio.Task] = set()  # R1-C3: GC-protect
+```
+
+**`_spawn_tg_alert` helper method** (R1-C2 + R1-C3 folds):
+
+```python
+async def _spawn_tg_alert(
+    self,
+    *,
+    trade_id: int,
+    signal_type: str,
+    token_id: str,
+    symbol: str,
+    amount_usd: float,
+    signal_data: dict,
+) -> None:
+    """Spawn the TG alert dispatch as a tracked background task.
+
+    R1-C2 fold: re-read entry_price from paper_trades AFTER execute_buy
+    so the alert's price matches the audit row (post-slip). The slipped
+    entry price is the operator-facing reality.
+
+    R1-C3 fold: hold task reference in self._tg_alert_tasks to prevent
+    GC + dropped exceptions on shutdown. Mirrors scout/main.py:91
+    `_social_restart_tasks` pattern.
+    """
+    from scout.trading.tg_alert_dispatch import notify_paper_trade_opened
+
+    cur = await self.db._conn.execute(
+        "SELECT entry_price FROM paper_trades WHERE id = ?", (trade_id,)
+    )
+    row = await cur.fetchone()
+    effective_entry = float(row[0]) if row else 0.0
+
+    task = asyncio.create_task(
+        notify_paper_trade_opened(
+            self.db, self.settings, self._tg_session,
+            paper_trade_id=trade_id,
+            signal_type=signal_type,
+            token_id=token_id,
+            symbol=symbol,
+            entry_price=effective_entry,  # R1-C2: post-slip
+            amount_usd=amount_usd,
+            signal_data=signal_data,
+        )
+    )
+    self._tg_alert_tasks.add(task)
+    task.add_done_callback(self._tg_alert_tasks.discard)
 ```
 
 - [ ] **Step 2: Tests in `tests/test_engine_post_open_hook.py`**
@@ -748,13 +880,14 @@ Per CLAUDE.md §8 (operator-visible alert change with potential spam blast radiu
 ## Done criteria
 
 - 4 default-allow signals (gainers_early, narrative_prediction, losers_contrarian, volume_spike) fire TG alerts on paper-trade open
-- chain_completed eligibility=1 BUT gated by closed-trade count >= 30 (currently 8 → blocked until 22 more close)
+- chain_completed kept at `tg_alert_eligible=0` (R2-C2 fold) — existing `scout/chains/alerts.py` chain-pattern alert is its TG path; new dispatch suppresses to avoid duplicate alerts. Operator can opt-in via UPDATE if they want both.
 - Suspended signals (first_signal, trending_catch, tg_social) explicitly blocked by tg_alert_eligible=0
-- Per-(signal, token) 24h cooldown prevents re-alert spam
+- Per-token 6h cooldown across signals prevents re-alert spam (R2-I1 fold)
 - tg_alert_log records every outcome for audit + dashboard reporting
 - TG dispatch failure NEVER blocks paper-trade dispatch path
-- Schema migration `bl_tg_alert_eligible_v1` (20260516) applied on prod
+- Schema migration `bl_tg_alert_eligible_v1` (20260516) applied on prod with schema_version stamp + post-assertion (R1-I1 fold)
 - Existing TG dispatch surfaces (`scout/main.py:855`, `scout/chains/alerts.py`, research streams) unchanged
+- First-deploy operator announcement message (R2-I3 + R2-I4 folds): on `scout/main.py` startup when `LIVE_MODE='paper'` AND no prior `tg_alert_log` rows exist, send a one-time Telegram message: `📢 TG alert allowlist active: gainers_early, narrative_prediction, losers_contrarian, volume_spike (open-only; check dashboard for closes). chain_completed via existing chain alerter. Per-token 6h cooldown.`
 
 ## What this milestone does NOT do
 
