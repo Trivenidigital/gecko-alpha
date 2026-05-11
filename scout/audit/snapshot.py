@@ -153,10 +153,9 @@ async def snapshot_volume_history_for_phase_b(
     for i in range(0, len(coin_ids), CHUNK):
         chunk = coin_ids[i : i + CHUNK]
         placeholders = ",".join("?" * len(chunk))
-        # Use INSERT OR IGNORE for SQLite ON CONFLICT compatibility on
-        # UNIQUE-constrained insert. changes() reports rows actually inserted
-        # by the most recent INSERT (intervening SELECTs do NOT reset changes()).
-        await db._conn.execute(
+        # INSERT OR IGNORE for SQLite ON CONFLICT compatibility on
+        # UNIQUE-constrained insert. cur.rowcount returns rows actually inserted.
+        cur_insert = await db._conn.execute(
             f"""INSERT OR IGNORE INTO audit_volume_snapshot_phase_b
                 (coin_id, symbol, name, volume_24h, market_cap, price,
                  recorded_at, snapshotted_at)
@@ -166,9 +165,7 @@ async def snapshot_volume_history_for_phase_b(
                 WHERE coin_id IN ({placeholders})""",
             (snapshotted_at, *chunk),
         )
-        cur2 = await db._conn.execute("SELECT changes()")
-        inserted_row = await cur2.fetchone()
-        chunk_inserted = int(inserted_row[0]) if inserted_row else 0
+        chunk_inserted = cur_insert.rowcount if cur_insert.rowcount is not None else 0
         total_inserted += chunk_inserted
         # Per-chunk commit releases SQLite write lock between chunks.
         await db._conn.commit()
