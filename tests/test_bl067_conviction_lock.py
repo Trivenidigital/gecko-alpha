@@ -242,6 +242,116 @@ def test_conviction_locked_params_saturates_at_stack_4():
     assert p4 == p10
 
 
+# ---------------------------------------------------------------------------
+# BL-NEW-LOW-PEAK-LOCK (P2): trail_pct_low_peak overlay tests
+# ---------------------------------------------------------------------------
+
+
+def test_locked_params_low_peak_overlay_stack_2():
+    """P2: stack=2 widens low_peak trail by +5pp."""
+    from scout.trading.conviction import conviction_locked_params
+
+    base = {
+        "max_duration_hours": 168,
+        "trail_pct": 20.0,
+        "trail_pct_low_peak": 8.0,
+        "sl_pct": 25.0,
+    }
+    p = conviction_locked_params(stack=2, base=base)
+    assert p["trail_pct_low_peak"] == 13.0  # 8 + 5
+
+
+def test_locked_params_low_peak_overlay_stack_3():
+    """P2: stack=3 widens low_peak trail by +10pp (the OSMO fix)."""
+    from scout.trading.conviction import conviction_locked_params
+
+    base = {
+        "max_duration_hours": 168,
+        "trail_pct": 20.0,
+        "trail_pct_low_peak": 8.0,
+        "sl_pct": 25.0,
+    }
+    p = conviction_locked_params(stack=3, base=base)
+    assert p["trail_pct_low_peak"] == 18.0  # 8 + 10. OSMO would have survived.
+
+
+def test_locked_params_low_peak_overlay_stack_4():
+    """P2: stack=4 widens low_peak trail by +15pp."""
+    from scout.trading.conviction import conviction_locked_params
+
+    base = {
+        "max_duration_hours": 168,
+        "trail_pct": 20.0,
+        "trail_pct_low_peak": 8.0,
+        "sl_pct": 25.0,
+    }
+    p = conviction_locked_params(stack=4, base=base)
+    assert p["trail_pct_low_peak"] == 23.0  # 8 + 15
+
+
+def test_locked_params_low_peak_overlay_caps_at_25():
+    """P2: low_peak trail caps at 25% even with extreme base + stack."""
+    from scout.trading.conviction import conviction_locked_params
+
+    # Base 18% + stack=4 (+15) = 33 → must cap at 25
+    base = {
+        "max_duration_hours": 168,
+        "trail_pct": 20.0,
+        "trail_pct_low_peak": 18.0,
+        "sl_pct": 25.0,
+    }
+    p = conviction_locked_params(stack=4, base=base)
+    assert p["trail_pct_low_peak"] == 25.0
+
+
+def test_locked_params_low_peak_omitted_when_base_lacks_it():
+    """Backwards-compat: callers not supplying trail_pct_low_peak get
+    a result dict without the key (old behavior preserved)."""
+    from scout.trading.conviction import conviction_locked_params
+
+    base = {"max_duration_hours": 168, "trail_pct": 20.0, "sl_pct": 25.0}
+    p = conviction_locked_params(stack=3, base=base)
+    assert "trail_pct_low_peak" not in p
+    # And the legacy keys are still correct.
+    assert p["trail_pct"] == 30.0
+    assert p["sl_pct"] == 35.0
+
+
+def test_locked_params_low_peak_stack_1_no_change():
+    """Stack=1 returns base unchanged (no overlay)."""
+    from scout.trading.conviction import conviction_locked_params
+
+    base = {
+        "max_duration_hours": 168,
+        "trail_pct": 20.0,
+        "trail_pct_low_peak": 8.0,
+        "sl_pct": 25.0,
+    }
+    p = conviction_locked_params(stack=1, base=base)
+    assert p["trail_pct_low_peak"] == 8.0  # unchanged
+
+
+def test_locked_params_osmo_regression_pin():
+    """OSMO #1838 regression pin: stack=3 conviction-locked trade with
+    base trail_pct_low_peak=8.0 must yield 18.0 (not 8.0).
+
+    If this test ever fails with 8.0, evaluator.py is silently bypassing
+    the lock for low_peak again — the same bug we shipped P2 to fix."""
+    from scout.trading.conviction import conviction_locked_params
+
+    base = {
+        "max_duration_hours": 168,
+        "trail_pct": 20.0,
+        "trail_pct_low_peak": 8.0,
+        "sl_pct": 25.0,
+    }
+    locked = conviction_locked_params(stack=3, base=base)
+    assert locked["trail_pct_low_peak"] == 18.0, (
+        "OSMO regression: stack=3 must widen trail_pct_low_peak 8→18 "
+        "to fix BL-067 contract violation at low-peak regime"
+    )
+
+
 @pytest.mark.asyncio
 async def test_compute_stack_returns_int(db):
     """T3c — compute_stack returns int >= 0; counts at least 1 source."""

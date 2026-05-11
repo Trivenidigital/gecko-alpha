@@ -177,33 +177,48 @@ async def _count_stacked_signals_in_window(
 
 
 # Per backlog.md:374-380 spec table.
+# BL-NEW-LOW-PEAK-LOCK (2026-05-11): `trail_pct_low_peak` overlay added per
+# `tasks/findings_sustain_winners_cut_losers_2026_05_11.md` §5 P2. The original
+# S6/A3 decision to NOT widen low_peak trail was a silent BL-067 contract
+# violation — conviction-lock widening promised but neutralized for
+# peak<low_peak_threshold trades. OSMO #1838 (paper, 2026-05-10) trail-stop-
+# exited at 8.6% drawdown from peak 13.3% despite stack=3, because the 8% low-
+# peak trail was used unmodified. This overlay fixes that.
 _CONVICTION_LOCK_DELTAS: dict[int, dict[str, float]] = {
     1: {
         "max_duration_hours": 0,
         "trail_pct": 0.0,
+        "trail_pct_low_peak": 0.0,
         "sl_pct": 0.0,
         "trail_cap": 35.0,
+        "trail_low_peak_cap": 25.0,
         "sl_cap": 25.0,
     },
     2: {
         "max_duration_hours": 72,
         "trail_pct": 5.0,
+        "trail_pct_low_peak": 5.0,
         "sl_pct": 5.0,
         "trail_cap": 35.0,
+        "trail_low_peak_cap": 25.0,
         "sl_cap": 35.0,
     },
     3: {
         "max_duration_hours": 168,
         "trail_pct": 10.0,
+        "trail_pct_low_peak": 10.0,
         "sl_pct": 10.0,
         "trail_cap": 35.0,
+        "trail_low_peak_cap": 25.0,
         "sl_cap": 40.0,
     },
     4: {
         "max_duration_hours": 336,
         "trail_pct": 15.0,
+        "trail_pct_low_peak": 15.0,
         "sl_pct": 15.0,
         "trail_cap": 35.0,
+        "trail_low_peak_cap": 25.0,
         "sl_cap": 40.0,
     },
 }
@@ -212,14 +227,17 @@ _CONVICTION_LOCK_DELTAS: dict[int, dict[str, float]] = {
 def conviction_locked_params(stack: int, base: dict) -> dict:
     """Return base params with BL-067 conviction-lock deltas applied.
 
-    Saturates at stack=4. Stack=1 returns base unchanged. Only widens
-    `trail_pct`, `sl_pct`, `max_duration_hours` (per spec table —
-    `trail_pct_low_peak` / leg targets / qty_frac NOT widened, design
-    decision per S6/A3 plan-review notes).
+    Saturates at stack=4. Stack=1 returns base unchanged. Widens
+    `trail_pct`, `trail_pct_low_peak`, `sl_pct`, `max_duration_hours`.
+    Leg targets (leg_1_pct/leg_2_pct/qty_frac) NOT widened per S6 design.
+
+    `trail_pct_low_peak` overlay (BL-NEW-LOW-PEAK-LOCK 2026-05-11):
+    backwards-compatible — if `base` doesn't include `trail_pct_low_peak`
+    (older callers), it's omitted from the return dict.
     """
     bucket = min(max(stack, 1), 4)
     delta = _CONVICTION_LOCK_DELTAS[bucket]
-    return {
+    result = {
         "max_duration_hours": int(
             base["max_duration_hours"] + delta["max_duration_hours"]
         ),
@@ -228,6 +246,15 @@ def conviction_locked_params(stack: int, base: dict) -> dict:
         ),
         "sl_pct": float(min(base["sl_pct"] + delta["sl_pct"], delta["sl_cap"])),
     }
+    # BL-NEW-LOW-PEAK-LOCK: overlay trail_pct_low_peak when caller provides it.
+    if "trail_pct_low_peak" in base:
+        result["trail_pct_low_peak"] = float(
+            min(
+                base["trail_pct_low_peak"] + delta["trail_pct_low_peak"],
+                delta["trail_low_peak_cap"],
+            )
+        )
+    return result
 
 
 # Real-time stack window: [opened_at, opened_at + 504h] capped at "now"
