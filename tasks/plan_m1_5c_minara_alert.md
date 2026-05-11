@@ -55,10 +55,14 @@ Near the M1.5b `TG_ALERT_PER_TOKEN_COOLDOWN_HOURS` block:
     # Quote token for the swap command. Default USDC matches Minara wallet
     # operational norm; operator can override via .env.
     MINARA_ALERT_FROM_TOKEN: str = "USDC"
-    # Override the default trade size. None → use settings.LIVE_TRADE_AMOUNT_USD
-    # (same as live-trading defaults). Set explicitly (e.g., 10.0) to decouple
-    # alert-suggested size from live-trading size.
-    MINARA_ALERT_AMOUNT_USD_OVERRIDE: float | None = None
+    # Default trade-size suggestion in the Run: command. R2-C1 PR-stage fold:
+    # default $10 mirrors M1.5a V3-M3 first-24h discipline. The earlier
+    # design used None-fallback-to-paper_trade.amount_usd which would emit
+    # `--amount-usd 300` (prod) or `--amount-usd 1000` (default) — an
+    # operator pasting a $300 swap on a 50%-slippage memecoin loses ~$150
+    # per swap. Hardcoded floor of $10 forces explicit operator override
+    # if they want larger sizes.
+    MINARA_ALERT_AMOUNT_USD: float = 10.0
 ```
 
 - [ ] **Step 3: Commit**
@@ -205,21 +209,91 @@ async def test_handles_unexpected_exception(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_uses_amount_override_when_set(monkeypatch):
-    """MINARA_ALERT_AMOUNT_USD_OVERRIDE decouples alert from live size."""
+async def test_uses_settings_amount_not_caller(monkeypatch):
+    """R2-C1 fold: command size uses MINARA_ALERT_AMOUNT_USD, NOT caller's amount."""
     async def _fake_detail(session, coin_id, api_key=""):
         return {"platforms": {"solana": "SOLADDR"}}
     monkeypatch.setattr(
         "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
     )
     cmd = await maybe_minara_command(
-        session=None,
-        settings=_settings(MINARA_ALERT_AMOUNT_USD_OVERRIDE=5.0),
-        coin_id="bonk", amount_usd=100.0,
+        session=object(),  # non-None sentinel
+        settings=_settings(MINARA_ALERT_AMOUNT_USD=5.0),
+        coin_id="bonk", amount_usd=300.0,
     )
     assert cmd is not None
-    assert "5" in cmd  # override wins
-    assert "100" not in cmd  # caller amount ignored
+    assert "--amount-usd 5" in cmd  # Settings value wins
+    assert "300" not in cmd  # caller (paper-trade) size ignored
+
+
+@pytest.mark.asyncio
+async def test_default_amount_is_10_dollars(monkeypatch):
+    """R2-C1 fold: default MINARA_ALERT_AMOUNT_USD=10 (M1.5a V3-M3 discipline)."""
+    async def _fake_detail(session, coin_id, api_key=""):
+        return {"platforms": {"solana": "SOLADDR"}}
+    monkeypatch.setattr(
+        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
+    )
+    cmd = await maybe_minara_command(
+        session=object(), settings=_settings(),  # no override
+        coin_id="bonk", amount_usd=999.0,
+    )
+    assert "--amount-usd 10" in cmd
+
+
+@pytest.mark.asyncio
+async def test_returns_none_when_session_is_none(monkeypatch):
+    """R1-I1 fold: session=None short-circuits before fetch (rate-limiter
+    not consumed)."""
+    fetch_count = [0]
+    async def _fake_detail(*args, **kwargs):
+        fetch_count[0] += 1
+        return {"platforms": {"solana": "SOLADDR"}}
+    monkeypatch.setattr(
+        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
+    )
+    cmd = await maybe_minara_command(
+        session=None, settings=_settings(),
+        coin_id="bonk", amount_usd=10.0,
+    )
+    assert cmd is None
+    assert fetch_count[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_amount_clamps_to_minimum_1_dollar(monkeypatch):
+    """R1-I2 fold: emit --amount-usd ≥ 1 even if Settings has tiny value."""
+    async def _fake_detail(session, coin_id, api_key=""):
+        return {"platforms": {"solana": "SOLADDR"}}
+    monkeypatch.setattr(
+        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
+    )
+    cmd = await maybe_minara_command(
+        session=object(),
+        settings=_settings(MINARA_ALERT_AMOUNT_USD=0.4),
+        coin_id="bonk", amount_usd=10.0,
+    )
+    assert cmd is not None
+    assert "--amount-usd 1" in cmd  # clamped up from 0
+    assert "--amount-usd 0" not in cmd
+
+
+@pytest.mark.asyncio
+async def test_amount_handles_none_gracefully(monkeypatch):
+    """R1-I3 fold: amount_usd=None from engine doesn't crash format."""
+    async def _fake_detail(session, coin_id, api_key=""):
+        return {"platforms": {"solana": "SOLADDR"}}
+    monkeypatch.setattr(
+        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
+    )
+    cmd = await maybe_minara_command(
+        session=object(),
+        settings=_settings(MINARA_ALERT_AMOUNT_USD=10.0),
+        coin_id="bonk", amount_usd=None,
+    )
+    # Should not raise; size derived from Settings, not amount_usd
+    assert cmd is not None
+    assert "--amount-usd 10" in cmd
 ```
 
 - [ ] **Step 2: Implement `scout/trading/minara_alert.py`**
@@ -266,15 +340,20 @@ async def maybe_minara_command(
     session,
     settings: Settings,
     coin_id: str,
-    amount_usd: float,
+    amount_usd: float | None,
 ) -> str | None:
     """Return a Minara swap shell command for the operator if the token
     is Solana-listed. Returns None for any other case (not listed,
-    fetch failed, feature disabled).
+    fetch failed, feature disabled, session None, amount invalid).
 
     Never raises.
     """
     if not getattr(settings, "MINARA_ALERT_ENABLED", True):
+        return None
+    # R1-I1 PR-stage fold: short-circuit when session is None — fetch_coin_detail
+    # would AttributeError on `async with session.get(...)`; outer try/except
+    # would catch but rate-limiter `acquire()` already fired wastefully.
+    if session is None:
         return None
     try:
         detail = await fetch_coin_detail(
@@ -295,10 +374,18 @@ async def maybe_minara_command(
         if not spl_address or not isinstance(spl_address, str):
             return None
         from_token = getattr(settings, "MINARA_ALERT_FROM_TOKEN", "USDC")
-        override = getattr(settings, "MINARA_ALERT_AMOUNT_USD_OVERRIDE", None)
-        size = override if override is not None else amount_usd
-        # Round to whole dollars for clean copy-paste UX
-        size_int = int(round(float(size)))
+        # R2-C1 PR-stage fold: use MINARA_ALERT_AMOUNT_USD Settings field
+        # (default $10) instead of caller's amount_usd which is the
+        # paper-trade size ($300 on prod, $1000 default). Operator can
+        # override via .env if they want different sizes.
+        size = getattr(settings, "MINARA_ALERT_AMOUNT_USD", 10.0)
+        # R1-I2 PR-stage fold: clamp to integer ≥ 1 to avoid emitting
+        # `--amount-usd 0` for small/zero values. Banker's rounding on
+        # 0.5 → 0 also caught here. R1-I3 fold: type-guard against None.
+        try:
+            size_int = max(1, int(round(float(size))))
+        except (TypeError, ValueError):
+            size_int = 10  # fallback to default safe size
         return (
             f"minara swap --from {from_token} --to {spl_address} "
             f"--amount-usd {size_int}"
@@ -500,6 +587,126 @@ git commit -m "feat(m1.5c): tg_alert_dispatch integration — format_paper_trade
 
 ---
 
+## Task 2.5: M1.5c first-deploy operator onboarding announcement (R2-C2 fold)
+
+**Files:**
+- Modify: `scout/main.py` — extend `_maybe_announce_tg_alerts` to fire an M1.5c follow-up announcement when the M1.5b announcement sentinel exists but no M1.5c sentinel exists yet
+- Migration: extend `tg_alert_log.outcome` CHECK enum to admit `'m1_5c_announcement_sent'`
+
+R2-C2 fold rationale: M1.5b's first-deploy announcement (sentinel-gated, sent once) has already fired on prod (2026-05-11 00:28Z). Operator has never used Minara. New `Run:` lines will appear with no install/login/funding guidance. Need a SECOND announcement covering Minara onboarding without re-firing the M1.5b body.
+
+- [ ] **Step 1: Extend migration `bl_tg_alert_eligible_v1` OR add a new follow-up migration**
+
+Cleanest path: new migration `_migrate_tg_alert_log_m1_5c_outcome` (schema 20260517) that runs the SQLite table-rename pattern to add `'m1_5c_announcement_sent'` to the CHECK enum. Mirror `_migrate_reject_reason_extend_v2` shape from M1.5a.
+
+```python
+async def _migrate_tg_alert_log_m1_5c_outcome(self) -> None:
+    """M1.5c follow-up: admit 'm1_5c_announcement_sent' outcome."""
+    SCHEMA_VERSION = 20260517
+    # ... standard schema_version idempotency check ...
+    # ... table-rename pattern: rename tg_alert_log → _old, CREATE TABLE
+    #     with extended CHECK, INSERT INTO ... SELECT FROM _old, DROP _old ...
+```
+
+Register after `_migrate_tg_alert_eligible_v1` in `_apply_migrations`.
+
+- [ ] **Step 2: Extend `_maybe_announce_tg_alerts` in `scout/main.py`**
+
+```python
+async def _maybe_announce_tg_alerts(db, session, settings):
+    """M1.5b + M1.5c first-deploy operator announcements.
+
+    Two sentinels, each fires once:
+    - 'announcement_sent' (M1.5b): allowlist active + signals + cooldown
+    - 'm1_5c_announcement_sent' (M1.5c): Minara onboarding (run npm
+       install, minara login, minara deposit USDC + SOL gas)
+    """
+    if db._conn is None:
+        return
+
+    # M1.5b announcement (sentinel-gated, unchanged behavior)
+    try:
+        cur = await db._conn.execute(
+            "SELECT 1 FROM tg_alert_log WHERE outcome='announcement_sent' LIMIT 1"
+        )
+        m1_5b_done = (await cur.fetchone()) is not None
+    except Exception:
+        logger.exception("tg_alert_announcement_table_check_failed")
+        return
+
+    if not m1_5b_done:
+        # ... existing M1.5b announcement body + send + sentinel insert ...
+        await _send_m1_5b_announcement(db, session, settings)
+
+    # M1.5c announcement (separate sentinel, fires once when MINARA_ALERT_ENABLED)
+    if not getattr(settings, "MINARA_ALERT_ENABLED", True):
+        return
+    try:
+        cur = await db._conn.execute(
+            "SELECT 1 FROM tg_alert_log "
+            "WHERE outcome='m1_5c_announcement_sent' LIMIT 1"
+        )
+        if await cur.fetchone():
+            return
+    except Exception:
+        return
+
+    body = (
+        "📢 M1.5c — Minara DEX-eligibility extension active\n"
+        "Solana-listed tokens now include a copy-paste-able command in alerts:\n"
+        "  Run: minara swap --from USDC --to <addr> --amount-usd N\n"
+        "\n"
+        "First-time setup (one-time, on your local terminal):\n"
+        "1. npm install -g minara@latest\n"
+        "2. minara login --device  (browser device-code OAuth)\n"
+        "3. minara deposit  (fund USDC + SOL for gas on Solana)\n"
+        "\n"
+        "Default size: $10. Set MINARA_ALERT_AMOUNT_USD=N in .env to override.\n"
+        "Disable: MINARA_ALERT_ENABLED=False + restart.\n"
+        "Note: gecko-alpha does NOT execute — you paste + Minara prompts before swap."
+    )
+    try:
+        await alerter.send_telegram_message(
+            body, session, settings, parse_mode=None
+        )
+        async with db._txn_lock:
+            await db._conn.execute(
+                "INSERT INTO tg_alert_log "
+                "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
+                "VALUES (NULL, 'announcement', '_system', ?, "
+                "'m1_5c_announcement_sent')",
+                (datetime.now(timezone.utc).isoformat(),),
+            )
+            await db._conn.commit()
+        logger.info("tg_alert_m1_5c_announcement_sent")
+    except Exception:
+        logger.exception("tg_alert_m1_5c_announcement_failed")
+```
+
+- [ ] **Step 3: Tests in `tests/test_main_wiring.py` or `tests/test_tg_alert_dispatch.py`**
+
+```python
+async def test_m1_5c_announcement_fires_once(tmp_path, monkeypatch):
+    """M1.5c announcement fires when migration applied + MINARA_ALERT_ENABLED;
+    sentinel prevents re-fire."""
+    # ... db fixture, monkeypatch alerter, call _maybe_announce_tg_alerts twice ...
+    # assert send called exactly once for m1_5c
+    # assert sentinel row 'm1_5c_announcement_sent' present
+
+
+async def test_m1_5c_announcement_skipped_when_disabled(tmp_path):
+    """MINARA_ALERT_ENABLED=False → no M1.5c announcement."""
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add scout/main.py scout/db.py tests/test_main_wiring.py
+git commit -m "feat(m1.5c): M1.5c first-deploy operator onboarding announcement (Task 2.5, R2-C2 fold)"
+```
+
+---
+
 ## Task 3: Full regression + black
 
 ```bash
@@ -527,7 +734,9 @@ Per CLAUDE.md §8 (operator-visible alert change, low blast radius — no execut
 - `MINARA_ALERT_ENABLED=False` → no fetch at all (zero-overhead disable)
 - Existing TG alert allowlist behavior (eligibility + cooldown + auto_suspend joint flag) unchanged
 - M1.5b dispatch atomic check-then-write semantics preserved
-- Zero schema migrations
+- **M1.5c onboarding announcement** delivers Minara install + login + funding instructions ONCE on first deploy (R2-C2 fold)
+- **Default `--amount-usd 10`** matches M1.5a V3-M3 first-24h discipline (R2-C1 fold)
+- One schema migration (`bl_tg_alert_log_m1_5c_outcome` / 20260517) to admit `'m1_5c_announcement_sent'` outcome
 
 ## What this milestone does NOT do
 
@@ -547,3 +756,19 @@ Per CLAUDE.md §8 (operator-visible alert change, low blast radius — no execut
 **Slower revert (git):** `git revert <PR squash>` removes Settings + helper + format kwarg + integration call. Backward-compatible: removed kwarg defaulted to None.
 
 **Operator copy-paste safety:** the `Run:` line is plain text — Telegram doesn't auto-execute. Operator must explicitly copy + paste + confirm in Minara CLI (Minara's own confirmation prompt fires on swap when called without `--yes`). Three-layer safety: gecko-alpha doesn't execute, Telegram doesn't execute, Minara prompts before executing.
+
+## Reviewer-fold summary (plan-stage)
+
+| Finding | Reviewer | Severity | Status |
+|---|---|---|---|
+| Default amount source = paper-trade $300 → $150 loss per swap risk | R2 | C1 | **Folded — MINARA_ALERT_AMOUNT_USD=10.0 default** |
+| Operator onboarding gap (no Minara install/login guidance) | R2 | C2 | **Folded — Task 2.5 M1.5c onboarding announcement + new sentinel** |
+| session=None wastes rate-limiter | R1 | I1 | **Folded — short-circuit before fetch** |
+| Amount rounding 0.4 → 0 (invalid `--amount-usd 0`) | R1 | I2 | **Folded — `max(1, int(round(...)))` clamp** |
+| amount_usd=None TypeError | R1 | I3 | **Folded — Settings-sourced size; None doesn't reach format** |
+| Phone-screen Run: below fold | R2 | I1 | Acknowledged — 4-line body, expand to copy. Future: hoist if operator complains |
+| Alert volume validation deferred | R2 | I2 | Acknowledged — runbook adds 7-day soak query |
+| Copy-paste selection UX | R2 | I3 | Acknowledged — minor; accept |
+| Cache hit test bypassed by monkeypatch | R1 | M1 | Acceptable — behavioral test |
+| No heartbeat counter | R1 | M2 | Deferred to M1.5d / dashboard panel |
+| Amount rounding documentation | R2 | M | Inline comment in code |
