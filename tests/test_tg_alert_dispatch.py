@@ -457,9 +457,7 @@ async def test_notify_includes_minara_command_for_solana_token(tmp_path, monkeyp
     async def _fake_detail(session, coin_id, api_key=""):
         return {"platforms": {"solana": "BONKADDR123"}}
 
-    monkeypatch.setattr(
-        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
-    )
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
 
     await notify_paper_trade_opened(
         db,
@@ -495,9 +493,7 @@ async def test_notify_no_minara_command_for_evm_only_token(tmp_path, monkeypatch
     async def _fake_detail(session, coin_id, api_key=""):
         return {"platforms": {"ethereum": "0xabc"}}
 
-    monkeypatch.setattr(
-        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
-    )
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
 
     await notify_paper_trade_opened(
         db,

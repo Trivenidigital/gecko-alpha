@@ -7,7 +7,6 @@ import pytest
 from scout.config import Settings
 from scout.trading.minara_alert import maybe_minara_command
 
-
 _REQUIRED = {
     "TELEGRAM_BOT_TOKEN": "x",
     "TELEGRAM_CHAT_ID": "x",
@@ -24,15 +23,9 @@ async def test_returns_command_for_solana_token(monkeypatch):
     """Token with platforms.solana set → formatted command returned."""
 
     async def _fake_detail(session, coin_id, api_key=""):
-        return {
-            "platforms": {
-                "solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
-            }
-        }
+        return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
 
-    monkeypatch.setattr(
-        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
-    )
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     settings = _settings(MINARA_ALERT_FROM_TOKEN="USDC")
     cmd = await maybe_minara_command(
         session=object(),
@@ -54,9 +47,7 @@ async def test_returns_none_when_no_solana_platform(monkeypatch):
     async def _fake_detail(session, coin_id, api_key=""):
         return {"platforms": {"ethereum": "0xabc"}}
 
-    monkeypatch.setattr(
-        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
-    )
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
         session=object(),
         settings=_settings(),
@@ -73,9 +64,7 @@ async def test_returns_none_when_solana_platform_empty(monkeypatch):
     async def _fake_detail(session, coin_id, api_key=""):
         return {"platforms": {"solana": ""}}
 
-    monkeypatch.setattr(
-        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
-    )
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
         session=object(),
         settings=_settings(),
@@ -92,9 +81,7 @@ async def test_returns_none_when_fetch_detail_fails(monkeypatch):
     async def _fake_detail(session, coin_id, api_key=""):
         return None
 
-    monkeypatch.setattr(
-        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
-    )
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
         session=object(),
         settings=_settings(),
@@ -113,9 +100,7 @@ async def test_returns_none_when_disabled(monkeypatch):
         fetch_count[0] += 1
         return {"platforms": {"solana": "SOLADDR"}}
 
-    monkeypatch.setattr(
-        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
-    )
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
         session=object(),
         settings=_settings(MINARA_ALERT_ENABLED=False),
@@ -152,9 +137,7 @@ async def test_uses_settings_amount_not_caller(monkeypatch):
     async def _fake_detail(session, coin_id, api_key=""):
         return {"platforms": {"solana": "SOLADDR"}}
 
-    monkeypatch.setattr(
-        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
-    )
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
         session=object(),
         settings=_settings(MINARA_ALERT_AMOUNT_USD=5.0),
@@ -173,9 +156,7 @@ async def test_default_amount_is_10_dollars(monkeypatch):
     async def _fake_detail(session, coin_id, api_key=""):
         return {"platforms": {"solana": "SOLADDR"}}
 
-    monkeypatch.setattr(
-        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
-    )
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
         session=object(),
         settings=_settings(),
@@ -194,9 +175,7 @@ async def test_returns_none_when_session_is_none(monkeypatch):
         fetch_count[0] += 1
         return {"platforms": {"solana": "SOLADDR"}}
 
-    monkeypatch.setattr(
-        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
-    )
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
         session=None,
         settings=_settings(),
@@ -214,9 +193,7 @@ async def test_amount_clamps_to_minimum_1_dollar(monkeypatch):
     async def _fake_detail(session, coin_id, api_key=""):
         return {"platforms": {"solana": "SOLADDR"}}
 
-    monkeypatch.setattr(
-        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
-    )
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
         session=object(),
         settings=_settings(MINARA_ALERT_AMOUNT_USD=0.4),
@@ -235,9 +212,7 @@ async def test_amount_handles_none_gracefully(monkeypatch):
     async def _fake_detail(session, coin_id, api_key=""):
         return {"platforms": {"solana": "SOLADDR"}}
 
-    monkeypatch.setattr(
-        "scout.trading.minara_alert.fetch_coin_detail", _fake_detail
-    )
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
         session=object(),
         settings=_settings(MINARA_ALERT_AMOUNT_USD=10.0),

@@ -3216,10 +3216,8 @@ class Database:
 
         try:
             await conn.execute("BEGIN EXCLUSIVE")
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS paper_migrations (
-                       name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
-            )
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                       name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
 
             cur = await conn.execute(
                 "SELECT 1 FROM paper_migrations WHERE name = ?",
@@ -3303,9 +3301,7 @@ class Database:
                 f"SELECT {col_list} FROM tg_alert_log"
             )
             await conn.execute("DROP TABLE tg_alert_log")
-            await conn.execute(
-                "ALTER TABLE tg_alert_log_new RENAME TO tg_alert_log"
-            )
+            await conn.execute("ALTER TABLE tg_alert_log_new RENAME TO tg_alert_log")
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tg_alert_log_token "
                 "ON tg_alert_log(token_id, alerted_at)"

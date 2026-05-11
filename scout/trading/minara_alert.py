@@ -72,9 +72,7 @@ async def maybe_minara_command(
             api_key=getattr(settings, "COINGECKO_API_KEY", "") or "",
         )
     except Exception:
-        log.exception(
-            "minara_alert_detail_fetch_failed", coin_id=coin_id
-        )
+        log.exception("minara_alert_detail_fetch_failed", coin_id=coin_id)
         return None
     if not detail:
         return None
@@ -106,7 +104,5 @@ async def maybe_minara_command(
         )
         return cmd
     except Exception:
-        log.exception(
-            "minara_alert_format_failed", coin_id=coin_id
-        )
+        log.exception("minara_alert_format_failed", coin_id=coin_id)
         return None

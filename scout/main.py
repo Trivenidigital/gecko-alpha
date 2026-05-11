@@ -1048,9 +1048,7 @@ async def _maybe_announce_m1_5c(db, session, settings) -> None:
         "Note: gecko-alpha does NOT execute — Minara prompts before swap."
     )
     try:
-        await alerter.send_telegram_message(
-            body, session, settings, parse_mode=None
-        )
+        await alerter.send_telegram_message(body, session, settings, parse_mode=None)
         async with db._txn_lock:
             await db._conn.execute(
                 "INSERT INTO tg_alert_log "
