@@ -154,6 +154,29 @@ Reality: zero rows in `cryptopanic_posts` since deploy. BL-053 ingestion is dead
 - Most plausible: **ship-time bug at PR #36.** Writer never produced a row in 22 days. Three sub-hypotheses (from audit text): (a) `CRYPTOPANIC_API_KEY` never configured / expired, (b) listener task code-exists but isn't actually scheduled in `main.py` startup, (c) API call silently failing (gate-swallow pattern).
 - Diagnostic order: SSH `journalctl -u gecko-pipeline --since 2026-04-20 | grep -i cryptopanic` — error spam = case (c), silence = case (b), auth errors = case (a). Most likely (b) since BL-053 was deployed pre-CryptoPanic-API-rate-limit-issues per the project memory; (a) would have produced auth errors which presumably someone would have noticed.
 
+**Diagnosis (2026-05-11 evening, post-annotation pass):**
+
+Classification: **(b)-variant the original audit didn't enumerate — "feature flag never flipped from default."** Three corroborating evidence sources:
+
+1. **`scout/main.py:672-747`** — `if settings.CRYPTOPANIC_ENABLED:` gates `fetch_cryptopanic_posts` + `db.insert_cryptopanic_post`. Code is intact and reachable.
+2. **`scout/config.py:233-234`** — defaults: `CRYPTOPANIC_ENABLED: bool = False`, `CRYPTOPANIC_API_TOKEN: str = ""`. Docstring at lines 228-230 confirms: even with `_ENABLED=True`, empty token causes `fetch_cryptopanic_posts` to short-circuit to `[]` without a network call. **Both keys required for activation.**
+3. **Prod state** (verified 2026-05-11T21:30Z): VPS `.env` has no `CRYPTOPANIC_*` keys (both defaults active). VPS journalctl `-n 50000` shows **zero `cryptopanic` events ever** — the listener has not executed once since BL-053 deploy 2026-04-20 (22+ days).
+
+**Sub-finding (audit taxonomy refinement):** the original (a)/(b)/(c) classification missed the **"feature flag never flipped from default"** sub-case. Structurally distinct from both (b) "code missing in prod" and (c) "task creation fails silently" — it's the **deploy-without-activate** pattern: PR #36 (`7eb3d10`) shipped the code 2026-04-20 expecting a follow-up flag-flip that never happened.
+
+**Fix shape:** operator-side `.env` edit only — no code change required:
+```
+CRYPTOPANIC_ENABLED=True
+CRYPTOPANIC_API_TOKEN=<free-tier-token-from-cryptopanic.com>
+```
+Restart `gecko-pipeline.service`. Monitor after flip:
+- `journalctl -u gecko-pipeline -g "cryptopanic_fetch_failed|cryptopanic_persist_error" --since "10 minutes ago"` — should be silent
+- `SELECT COUNT(*) FROM cryptopanic_posts WHERE fetched_at > datetime('now','-1 hour')` — first non-zero count confirms end-to-end
+
+**§2.2 status:** **Diagnosed. Not a code bug.** Pending operator decision to either (i) activate BL-053 by flipping the two `.env` flags, or (ii) formally mark BL-053 "shipped but deactivated — activate by setting `CRYPTOPANIC_ENABLED=True` + `CRYPTOPANIC_API_TOKEN`" so future audits don't re-surface this finding. **Severity downgraded from CRITICAL to OPERATOR-DECISION.** The 22-day "silent failure" is actually a 22-day "deploy without activate" — distinct failure class.
+
+**Meta-implication worth scanning for separately:** how many other shipped-but-default-off features have the same gap? `CRYPTOPANIC_SCORING_ENABLED` (config.py:237, default False) is one immediate sibling. The live-trading family (`LIVE_TRADING_ENABLED`, `LIVE_USE_REAL_SIGNED_REQUESTS`, `LIVE_USE_ROUTING_LAYER`) is intentionally guarded by design — NOT a deploy-without-activate (different shape: guarded-by-design vs flag-flip-never-happened). Worth a one-pass scan when prioritizing P4 cleanups.
+
 ### §2.3 [REFRAMED — withdrawn from CRITICAL] shadow_trades correctly idle, BL-055 unlock is policy-blocked
 
 **Original claim (incorrect):** "writer disconnected by M1.5 refactor wave, requires rewiring."
