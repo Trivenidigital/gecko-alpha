@@ -71,6 +71,16 @@ Plus 3 known dry-spell items resuming now Anthropic is topped up:
 - `briefings` (last 2026-05-06) — daily briefing synthesizer
 - `predictions` is_control-only since 2026-05-07 (now resuming)
 
+## §0.5 Classification update (post-annotation pass, 2026-05-11)
+
+The git-log suspect-commit annotation pass (§2.x annotations below) collapsed the 8 findings to **5 root-cause shapes**, not 8 independent failures. Future-self reading this audit cold should orient against this taxonomy *before* re-investigating any individual finding from scratch:
+
+- **Legacy-displaced** — §2.1 `alerts`, §2.4 `outcomes`. **NOT bugs.** The legacy memecoin alert path (`alerts` + `outcomes` writers) was displaced by paper-trade signal routing (BL-029 onward → `tg_alert_log`). The 2026-05-02 cutoff aligns with `first_signal` hard_loss removing the last live caller. "Fix" = formal schema retirement decision, NOT writer rewire. A non-trivial slice of the original CRITICAL count is, on closer inspection, **retired-but-not-formally-decommissioned**. Do not re-investigate these as broken writers — they're disconnected by design.
+- **Ship-time never-worked** — §2.2 `cryptopanic_posts`, §2.6 `perp_anomalies`. Single deploy commit, zero rows since. "Fix" = diagnose why the writer never ran (listener scheduling / API key / thresholds calibrated for absent regime). NOT regressions.
+- **Auto-retirement loop fed by §2.4** — §2.7 memecoin chain dispatch. Closes as side effect of §2.4 work. See §2.7 sequencing pre-registration below.
+- **Low-frequency, probably fine** — §2.8 HPF audit. Single SQL classification will tell.
+- **Real Class-2 bug, code-fixed pending production verification** — §2.9 auto_suspend silent rendering. See §2.9 closure tracking block.
+
 ## §1 Why monitoring missed each failure
 
 ### §1.1 The architectural gap
@@ -121,6 +131,12 @@ vs. 309 paper trades opened in the last 7 days. The `alerts` table is supposed t
 
 **Fix:** verify whether `alerts` table is still load-bearing for any consumer. If yes, find the orphaned writer. If no, formally retire the table or stamp it deprecated in schema.
 
+**Suspect commit / root cause (post-audit annotation 2026-05-11):**
+- Writer: `scout/db.py:3589` (`INSERT INTO alerts`). **Zero commits** touching this SQL since 2026-04-01 — SQL stable since pre-April.
+- Caller chain: `scout/main.py` + `scout/alerter.py`. alerter.py changes since 2026-04-01: `571617d` PR #76 (calibrate weekly), `0ec5897` PR #29 (paper-trading), `f20fb5d` PR #28 (lunarcrush) — none touch the alerts-write path.
+- Most plausible: **NOT a refactor regression.** Per audit text + memory, the `alerts` table is the legacy memecoin alert path; newer signal types (BL-029 onward) route through `tg_alert_log`. The 2026-05-02 cutoff aligns with `first_signal` hard_loss suspension. Effectively retired-by-evolution.
+- Diagnostic order: (1) grep consumers of `alerts` table — if none in live code, schema-deprecate. (2) If consumer exists, trace its expected writer (likely an old memecoin-pipeline `log_alert` caller in main.py that no longer fires post-paper-trade migration).
+
 ### §2.2 [CRITICAL] `cryptopanic_posts` empty — BL-053 silently dead 22+ days
 
 Per memory `project_session_2026_04_20_bl052_bl053.md`: "GeckoTerminal per-chain trending + CryptoPanic news feed shipped. PRs #35/#36 squash-merged as 09ff21d/7eb3d10, deployed."
@@ -131,6 +147,42 @@ Reality: zero rows in `cryptopanic_posts` since deploy. BL-053 ingestion is dead
 - The writer code path is reachable but the API call is failing silently (gate-swallow pattern)
 
 **Fix:** grep `journalctl` for cryptopanic errors; if dry-since-deploy, verify the listener task is actually scheduled in `main.py`.
+
+**Suspect commit / root cause (post-audit annotation 2026-05-11):**
+- Writer: `scout/news/cryptopanic.py`. **Single commit:** `7eb3d10` (PR #36 BL-053, 2026-04-20 ship). Never modified after.
+- Caller scheduling: zero `cryptopanic`-string changes to `scout/main.py` since PR #36 either.
+- Most plausible: **ship-time bug at PR #36.** Writer never produced a row in 22 days. Three sub-hypotheses (from audit text): (a) `CRYPTOPANIC_API_KEY` never configured / expired, (b) listener task code-exists but isn't actually scheduled in `main.py` startup, (c) API call silently failing (gate-swallow pattern).
+- Diagnostic order: SSH `journalctl -u gecko-pipeline --since 2026-04-20 | grep -i cryptopanic` — error spam = case (c), silence = case (b), auth errors = case (a). Most likely (b) since BL-053 was deployed pre-CryptoPanic-API-rate-limit-issues per the project memory; (a) would have produced auth errors which presumably someone would have noticed.
+
+**Diagnosis (2026-05-11 evening, post-annotation pass):**
+
+Classification: **(b)-variant the original audit didn't enumerate — "feature flag never flipped from default."** Three corroborating evidence sources:
+
+1. **`scout/main.py:672-747`** — `if settings.CRYPTOPANIC_ENABLED:` gates `fetch_cryptopanic_posts` + `db.insert_cryptopanic_post`. Code is intact and reachable.
+2. **`scout/config.py:233-234`** — defaults: `CRYPTOPANIC_ENABLED: bool = False`, `CRYPTOPANIC_API_TOKEN: str = ""`. Docstring at lines 228-230 confirms: even with `_ENABLED=True`, empty token causes `fetch_cryptopanic_posts` to short-circuit to `[]` without a network call. **Both keys required for activation.**
+3. **Prod state** (verified 2026-05-11T21:30Z): VPS `.env` has no `CRYPTOPANIC_*` keys (both defaults active). VPS journalctl `-n 50000` shows **zero `cryptopanic` events ever** — the listener has not executed once since BL-053 deploy 2026-04-20 (22+ days).
+
+**Sub-finding (audit taxonomy refinement):** the original (a)/(b)/(c) classification missed the **"feature flag never flipped from default"** sub-case. Structurally distinct from both (b) "code missing in prod" and (c) "task creation fails silently" — it's the **deploy-without-activate** pattern: PR #36 (`7eb3d10`) shipped the code 2026-04-20 expecting a follow-up flag-flip that never happened.
+
+**Fix shape:** operator-side `.env` edit only — no code change required:
+```
+CRYPTOPANIC_ENABLED=True
+CRYPTOPANIC_API_TOKEN=<free-tier-token-from-cryptopanic.com>
+```
+Restart `gecko-pipeline.service`. Monitor after flip:
+- `journalctl -u gecko-pipeline -g "cryptopanic_fetch_failed|cryptopanic_persist_error" --since "10 minutes ago"` — should be silent
+- `SELECT COUNT(*) FROM cryptopanic_posts WHERE fetched_at > datetime('now','-1 hour')` — first non-zero count confirms end-to-end
+
+**§2.2 status:** **Diagnosed. Not a code bug.** Pending operator decision to either (i) activate BL-053 by flipping the two `.env` flags, or (ii) formally mark BL-053 "shipped but deactivated — activate by setting `CRYPTOPANIC_ENABLED=True` + `CRYPTOPANIC_API_TOKEN`" so future audits don't re-surface this finding. **Severity downgraded from CRITICAL to OPERATOR-DECISION.** The 22-day "silent failure" is actually a 22-day "deploy without activate" — distinct failure class.
+
+**Meta-implication worth scanning for separately:** how many other shipped-but-default-off features have the same gap? `CRYPTOPANIC_SCORING_ENABLED` (config.py:237, default False) is one immediate sibling. The live-trading family (`LIVE_TRADING_ENABLED`, `LIVE_USE_REAL_SIGNED_REQUESTS`, `LIVE_USE_ROUTING_LAYER`) is intentionally guarded by design — NOT a deploy-without-activate (different shape: guarded-by-design vs flag-flip-never-happened). Worth a one-pass scan when prioritizing P4 cleanups.
+
+**§2.2 closure (Path A selected 2026-05-11 evening):** Sub-checks confirmed Path A is correct:
+
+- *Sub-check 1* (prod `SCAN_INTERVAL_SECONDS`): verified **60s** on prod. Design assumed 300s (12 req/hr); current state is **60 req/hr** at the **low end** of the CryptoPanic free-tier band (50-200 req/hr per design doc §3). Rate-limit concern is real, not phantom. **Surfaced separate finding** about design-time assumptions vs current cycle frequency → filed as `BL-NEW-CYCLE-CHANGE-AUDIT` in backlog.
+- *Sub-check 2* (operator intent for news data): backlog "Virality Detection Roadmap" lists CryptoPanic as Source #2 for news/macro events (roadmap-level intent EXISTS), but no "validated-and-blocked" claim was found — deploy memory documents activation as "how-to-enable-when-ready" guidance, not a blocked-on-condition workflow. Path A remains correct; the activation path is well-specified for future operator pickup.
+
+**Deactivation formalized in backlog** as `BL-053: CryptoPanic news feed (shipped 2026-04-20, deactivated by default — operator activation pending)` with full 5-point activation conditions (both flags + token + scorer recalibration + decoupled interval + §12a SLO, as one coherent PR). §2.2 now **closed-as-operator-decision-resolved**. Severity downgrade CRITICAL → OPERATOR-DECISION sticks. Future audits should not re-surface this finding.
 
 ### §2.3 [REFRAMED — withdrawn from CRITICAL] shadow_trades correctly idle, BL-055 unlock is policy-blocked
 
@@ -191,6 +243,12 @@ The `outcomes` table records "alert price → check price after N hours" for pap
 
 Only 2 rows ever — both 2026-05-01/02, same trades as `alerts`. The `outcomes` writer either ran only twice in project history or was scoped to a single signal type that's no longer firing. **The paper-mirrors-live correlation analysis has zero data to work from.**
 
+**Suspect commit / root cause (post-audit annotation 2026-05-11):**
+- Writer: `scout/db.py` (function name TBD; likely `update_outcome` or similar). **Zero commits** touching `INSERT INTO outcomes` since 2026-04-01 — SQL stable.
+- Caller chain: same path as §2.1 — the 2 outcomes rows correlate exactly with the 2 alerts rows (same legacy memecoin alert pipeline).
+- Most plausible: **same root cause as §2.1.** Legacy memecoin pipeline displaced by paper-trade signal routing. The `outcomes` table was the memecoin-pipeline "alert price → check price after N hours" correlation surface, but new signal types do their correlation via `paper_trades.peak_pct` / `realized_pnl_pct` instead.
+- **Connected to §2.7:** BL-071a (open backlog) — "Investigate why memecoin `outcomes` table is empty" — is the same investigation. Fixing the memecoin-token `outcomes` writer closes §2.4 AND removes the auto-retirement trigger feeding §2.7. Diagnostic-order priority: do §2.7 root-cause first (more value), §2.4 closes as a side effect.
+
 ### §2.5 [HIGH] `holder_snapshots` empty — BL-020 never wired
 
 Per backlog: BL-020 "Populate holder_growth_1h from enricher." The schema column `holder_growth_1h` exists. The snapshot table that feeds it is empty. The `holder_growth_1h` signal in scorer.py is gated on this data; if absent, the signal silently scores 0 and never fires. Affects every memecoin scoring decision.
@@ -203,6 +261,77 @@ Per memory `project_session_2026_04_20_perp_enablement.md`: BL-054 was fully ena
 - Detector code path stopped firing after a refactor
 
 **Fix:** verify the WS listener is alive (`ws_perp_*` events in journalctl), check thresholds, check signal_params.
+
+**Suspect commit / root cause (post-audit annotation 2026-05-11):**
+- Writer: `scout/perp/watcher.py` + `scout/perp/enrichment.py`. **Single commit:** `b36b8ff` (BL-054 ship, PR #37). Never modified after. Adjacent: PR #38 (commit `46ba56f` per memory) recalibrated perp scoring — does not touch the watcher writer.
+- Most plausible: **NOT writer regression — detector enabled but doesn't find anomalies.** Per memory `project_session_2026_04_20_perp_enablement.md`: BL-054 was fully enabled in 3 phases (watcher on, recalibration, scoring flag flipped). Memory also flags: "Bybit disabled due to 1000x symbol prefix quirk." Three sub-hypotheses:
+  - Bybit disablement removed the primary source; Binance never picked up the slack (anomaly definition was Bybit-tuned)
+  - Thresholds calibrated for an older market regime — current vol doesn't trigger
+  - "Anomaly" definition too narrow given current order-book depth
+- Diagnostic order: (1) SSH `journalctl | grep ws_perp` — listener alive? (2) Check `signal_params` for perp-related rows — disabled? (3) If listener alive + signal enabled: lower threshold by 10%, observe 24h. If still empty → definition is wrong, not threshold.
+
+**§2.6 closure (2026-05-11 evening, mechanism (e) identified):**
+
+Diagnostic chain:
+
+- **(c) Listener dead** — RULED OUT. `perp_watcher_stats` events fire every 60s (1436 events in last 24h). Current process started 2026-05-11T14:03:21Z; watcher is alive throughout.
+- **(d) Write-gate variant** — RULED OUT. The (b'-new) sweep (§2.10) confirmed no separate `PERP_ANOMALIES_SCORING_ENABLED` flag — `PERP_SCORING_ENABLED` gates the scorer signal, not the table write. Write path is reachable when data arrives.
+- **(a) Bybit-disabled + Binance-no-pickup** — PARTIALLY confirmed but underspecified. Prod state: `PERP_BYBIT_ENABLED=false` (known 1000x prefix quirk per memory), `PERP_BINANCE_ENABLED` defaults to `True` (not overridden in prod). The Binance task IS spawned. But no data flows.
+- **(b) Thresholds too high** — MOOT. `baseline_keys: 0` since service start; no data ever reaches the threshold-classifier step.
+
+**Mechanism (e) — new sub-case the original audit didn't enumerate: WebSocket layer produces zero output, no exceptions, no logs.**
+
+Evidence:
+- Distinct perp events across 50,000 journalctl lines: **only `perp_watcher_stats`**. Zero `perp_exchange_stream_error`, zero `perp_exchange_circuit_break`, zero connect/subscribe/frame/EOF events.
+- `_run_exchange_with_supervision` (`scout/perp/watcher.py:217-258`) catches `Exception` and logs `perp_exchange_stream_error` + increments `state.exchange_errors[name]`. Zero such events means **`stream_ticks` is NOT raising** — either `session.ws_connect` hangs in handshake forever, OR it connects and `async for msg in ws:` sits on an empty channel.
+- `scout/perp/binance.py:134-140`: `session.ws_connect(url, headers=None, max_msg_size=0, ...)` — **no explicit timeout passed**. aiohttp ws_connect behavior on session-default-timeout varies; a hung handshake without timeout silently waits.
+- `scout/perp/binance.py` has **zero log statements around the WS lifecycle** — no `ws_connect_attempted`, no `ws_open`, no `ws_closed`, no `ws_subscribe_confirmed`. The connection state is structurally invisible from outside.
+
+Sub-mechanism narrowing requires either:
+- Adding WS lifecycle logging to `scout/perp/binance.py` (FIX work — out of scope for this audit; instrumentation prerequisite to further investigation)
+- External probe: `wscat -c "wss://fstream.binance.com/stream?streams=btcusdt@markPrice/btcusdt@openInterest"` from VPS to verify the URL reaches Binance at all
+- aiohttp connect timeout introduction (~3 LoC) — once handshake fails fast, errors surface via supervision
+
+**§2.6 status: classified-as-mechanism-(e), instrumentation gap identified.** Severity stays HIGH (BL-054 inert 20+ days). The fix shape is **not** a quick `.env` flip (like BL-053) nor a writer rewire — it's "add WS-lifecycle observability so the next investigation can localize handshake-hang vs frames-not-arriving." Sub-mechanism resolution awaits that instrumentation.
+
+**Not in this audit's scope, surfaced as a separate finding:** the watcher emits a heartbeat with nine counters that all read zero whether the watcher is healthy-idle or starved. See §2.11 below.
+
+## §2.11 [NEW FINDING] Heartbeat reports "healthy" while writer produces zero output
+
+Surfaced 2026-05-11 evening during §2.6 diagnosis. **Structurally distinct from §2.1-§2.9 and §2.10.** Not a Class 1 / Class 2 / (b'-new) instance — a new structural critique of monitoring design.
+
+**The observation:**
+
+`perp_watcher_stats` is emitted every ~60 seconds by `_shadow_stats_loop` (`scout/perp/watcher.py:332+`) with nine counters:
+
+```json
+{"dropped_ticks_last_min": 0, "queue_high_water": 0, "malformed_frames_last_min": 0,
+ "exchange_errors_last_min": {}, "baseline_keys": 0, "flush_failures_last_min": 0,
+ "rows_lost_to_flush_failure_last_min": 0, "baseline_rejected_values_last_min": 0,
+ "parse_rejects_last_min": 0, "event": "perp_watcher_stats"}
+```
+
+When the watcher is in mechanism (e) state (`§2.6` — alive but producing zero output), every counter reads zero — and the heartbeat is **structurally indistinguishable** from a healthy-but-idle state (e.g., "no anomalies fired this minute because market was calm").
+
+**The watchdog blind spot:**
+
+The natural watchdog rule for this watcher — "alert if `perp_watcher_stats` hasn't fired in N minutes" — would report green throughout the 20+ day silent failure §2.6 documents. The watcher's heartbeat fires reliably. What it doesn't fire on is the actual failure signal: `baseline_keys: 0 for >N minutes when service uptime > N + 30 minutes`. Nothing in current monitoring acts on that ambiguity-resolving condition.
+
+**The §12c rule shape (draft, NOT yet promoted):**
+
+> **Heartbeat counters that can legitimately be zero are not health signals.** When a counter being zero is ambiguous between "healthy idle" (no activity this window, writer has produced output recently) and "starved" (writer has produced zero output since service start, or for an abnormally long time), the heartbeat cannot distinguish them. Watchdogs must read the writer's INTENDED OUTPUT directly (table row counts, file timestamps, downstream events) — not its INTERNAL STATE (heartbeat counters, "I'm alive" pings). A writer emitting a heartbeat of all-zeros is structurally indistinguishable from a writer that's silently starved.
+
+**Composes with §12a:** the freshness SLO rule (§12a) is correct precisely *because* heartbeat-based monitoring is insufficient. §12a says "every pipeline table ships with freshness SLO + watchdog" — read against output (table writes), not status. §12c is the underlying *why*.
+
+**Composes with §12b:** §12b (alert at write site for automated state reversals) is also output-oriented — fires on the actual write event, not on a status indicator wrapping it.
+
+**Evidence base honesty:** the §12c rule has **one strong direct instance (perp_watcher, §2.6)**. The audit's other findings (Anthropic dry, cryptopanic, etc.) are *suggestive* — heartbeats existed and didn't catch the silent failures — but the specific "counter-zero-is-ambiguous" pattern is most clearly present in §2.6. Promotion to global CLAUDE.md §12c should wait until 3+ direct instances accumulate, OR an explicit operator decision that "1 instance + structural argument" is sufficient. Capturing here while context is hot; promotion is a separate session.
+
+**Immediate action items §12c-derived:**
+
+1. **PR #105 verification — DEFERRED to post-M1.5c-gate, before merge:** Does the audit-snapshot CLI (the future watchdog) read tables directly, or does it consume heartbeat output? If tables → correct §12c-compliant design. If heartbeats → CLI would inherit the same blind spot perp_watcher demonstrated. **Cannot verify now — would violate the agreed soak isolation between detection-surface deploys.** Flag for post-gate verification before merge.
+2. **perp_watcher specifically (next fix session):** instrument the WS lifecycle (§2.6 fix) AND add a heartbeat-side counter for `ws_connect_attempts` / `ws_connected_since` / `frames_received_total` (NOT just last_min) so the "alive but starved" state is detectable from the heartbeat itself. Both at once — partial fix recreates the §12c blind spot.
+3. **Future watchers (BL-NEW-INGEST-WATCHDOG and onwards):** the watchdog design must read its monitored writer's *output*, not its heartbeat. Pre-promotion application of §12c to anything that lands before §12c is formally adopted.
 
 ### §2.7 [HIGH] Memecoin chain dispatch — last fire 2026-05-04
 
@@ -219,9 +348,187 @@ WHERE completed_at > datetime('now','-7 days') GROUP BY ...
 
 Narrative chain pipeline is healthy. **Memecoin chain pipeline died 7 days ago.** Per memory `project_chain_revival_2026_05_03.md`, chain dispatch had been dead 17 days before that revival; this looks like it died AGAIN. Likely same root cause as outcomes-telemetry-broken-→-auto-retirement.
 
+**Suspect commit / root cause (post-audit annotation 2026-05-11):**
+- Writer: `scout/chains/tracker.py`. Relevant commits in the 2026-05-04 window: `cbb1e7f` PR #64 BL-071a' (DexScreener-resolved memecoin chain outcomes, **merged 2026-05-04**), `b51324c` PR #63 Bundle A (detection telemetry hygiene, 2026-05-03).
+- Post-2026-05-04 commits to `scout/chains/`: **only** `eaf3523` PR #80 (BL-NEW-CHAIN-COHERENCE 2026-05-06, narrative-only — does not touch memecoin path).
+- Timeline alignment: revival happened 2026-05-01 (PR #60) + 2026-05-03 (PR #61 BL-071 systemic-zero-hits guard, commit `2a45263`). Memecoin chains fired through 2026-05-04T00:51Z, then went silent. PR #64 merged later that day.
+- Most plausible: **§2.4 root cause feeds §2.7.** Memecoin `outcomes` table is empty (§2.4) → memecoin chain hits cannot be hydrated → systemic-zero-hits guard from PR #61 auto-retires the memecoin patterns again → no dispatches. Same death loop as the original 17-day outage, just with new guard.
+- Alternative: PR #64 itself introduced a regression in the dispatch path while closing the silent-skip surface. Less likely (PR review history is clean) but worth a quick git-blame of the dispatcher.
+- Diagnostic order: (1) SSH `SELECT pattern_name, retired_at FROM chain_patterns WHERE pipeline='memecoin' AND retired_at IS NOT NULL` — confirms auto-retirement hypothesis. (2) If retired: re-run the 2026-05-03 revival method from `project_chain_revival_2026_05_03.md`. (3) If NOT retired but no fires: bisect against `cbb1e7f`.
+
+**§2.4 → §2.7 sequencing pre-registration (do not collapse the fix).** §2.4 and §2.7 share a suspected root cause (memecoin `outcomes` empty → can't hydrate hits → auto-retirement guard fires). The fix for §2.4 should land **first**, and §2.7 observed for **≥3 days** before any §2.7-specific work. Rationale: same investigation shape as §2.9 — single-variable change with a clean attribution window. If §2.7 closes after §2.4 alone is fixed → confirmed shared root cause. If §2.7 does NOT close → second independent root cause exists in the dispatch path itself, which is much more valuable to know than discovering it after a combined fix that conflates the two attribution paths. **Do not fix both simultaneously.**
+
+**§2.7 closure (2026-05-11 evening, BL-071a investigation — INVERTS the suspect-PR hypothesis):**
+
+The pre-registered sequencing above assumed §2.4 feeds §2.7. **Diagnostic investigation flipped this finding entirely.** Three observations from prod data:
+
+1. **ALL 257 volume_breakout chain_matches are pre-PR-#64.** Last fire 2026-05-04T00:51:02Z. PR #64 (`cbb1e7f`, BL-071a') merged 2026-05-04 later that day. ZERO chain_matches written after that date.
+2. **ALL 257 have `mcap_at_completion = NULL`.** PR #64's writer-side change to populate `mcap_at_completion` at chain_match write-time has **not been exercised on prod data** because no new memecoin chain_matches have been written.
+3. **Outcome distribution:** 3 HIT + 108 EXPIRED + 146 NULL = 257. The 108 EXPIRED rows all aged into expired status pre-PR-#64 because hydration was structurally broken (no mcap_at_completion → fall back to empty legacy outcomes table → never hydrate → expire). The 3 hits happened 2026-05-01 to 2026-05-03 via a pre-PR-#64 path (the legacy alert-derived outcomes flow, before it stopped).
+
+The 2026-05-07T01:23:42Z retirement decision (`scout/chains/patterns.py:339-346`) computed `hit_rate = 3 hits / 111 evaluated = 2.7%` (the 111 = 108 EXPIRED + 3 HIT). 2.7% < `_RETIREMENT_HIT_RATE = 0.20` → `is_active = 0`. Working-as-coded.
+
+**Two distinct mechanisms drive "memecoin chain pipeline dead":**
+
+- **Mechanism (X) — auto-retirement on broken-hydration-era data.** The retirement code treats EXPIRED rows as "evaluated misses" indistinguishably from genuine misses. When hydration plumbing was broken pre-PR-#64, rows aged into EXPIRED because they *couldn't* be hydrated, not because they were *actually* misses. The retirement decision was computationally correct but operated on compromised input — the "real" post-PR-#64 hit_rate is unknown because mechanism (Y) prevented any post-PR-#64 data from accumulating.
+- **Mechanism (Y) — upstream chain detection ceased producing memecoin volume_breakout matches starting 2026-05-04.** ZERO new chain_matches in the 8 days the pattern remained is_active=1 (2026-05-04 → 2026-05-07 retirement). **Separate root cause from (X), unknown mechanism, not investigated tonight.** The detection-stop happened BEFORE retirement and is the primary "no new chain_matches" cause.
+
+**§2.4 ↔ §2.7 coupling — opposite direction from audit hypothesis:** the suspect-PR annotation hypothesized "§2.4 feeds §2.7" (outcomes-empty → can't hydrate → retirement). Actual mechanism: **§2.4 is purely legacy-displaced (audit §0.5 was correct).** PR #64 (BL-071a') was meant to decouple memecoin chain hydration from the empty outcomes table via DexScreener fetch. But because mechanism (Y) stopped upstream detection on the same day PR #64 merged, **PR #64's writer-side change has never actually run on prod data.** The fix exists in code; the data path to exercise it doesn't.
+
+**§2.7 status: two-mechanism closure.** Mechanism (X) is working-as-coded-on-stale-data, NOT a bug — a §9b-shape structural issue (the retirement math has hidden assumptions about what "evaluated" means; those assumptions broke when hydration was broken pre-PR-#64). Mechanism (Y) is **filed as §2.12 below** because it's structurally distinct from §2.7's original framing and warrants its own investigation.
+
+**Operator-decision points (separate from audit closure):**
+- (i) Un-retire volume_breakout (`UPDATE chain_patterns SET is_active=1 WHERE name='volume_breakout'`) to let post-fix data accumulate — but worthless until §2.12 mechanism (Y) is resolved (no new chain_matches to evaluate).
+- (ii) Accept volume_breakout retirement as-is; the data behind the decision is stale-but-pattern-was-also-not-detecting; current state is approximately correct.
+- (iii) Reconsider the retirement math to weight EXPIRED-without-hydration rows differently from genuine misses. §9b-class fix.
+
+**Related: BL-071b memory is stale.** Memory said "all 154 narrative chain_matches in prod have outcome_class='EXPIRED'." Current state: full_conviction has 257 NULL (zero EXPIRED), narrative_momentum has 262 NULL + 2 MISS. The bug shape evolved between memory write-time and now — narrative-side EXPIRED-at-write may have been partially fixed, but the hydrator still doesn't populate them. BL-071b needs re-diagnosis with current state; the memory's specifics no longer apply.
+
+**§2.4 status: closed-as-legacy-displaced (audit §0.5 confirmed).** Two outcomes rows = two alerts rows via `check_outcomes` at `main.py:898`. Decoupled from chain hydration by PR #64. No further §2.4-specific action needed.
+
+## §2.12 [NEW FINDING] Memecoin chain detection ceased 2026-05-04 — unknown mechanism
+
+Surfaced 2026-05-11 evening during BL-071a investigation as mechanism (Y) of §2.7. **Structurally distinct from §2.7's auto-retirement (mechanism X) and from any prior audit finding.** Filed as its own item because the diagnostic path differs.
+
+**The observation:**
+
+`volume_breakout` (memecoin pipeline) produced 257 chain_matches between 2026-04-13T17:21 and 2026-05-04T00:51. **Zero new chain_matches since 2026-05-04T00:51:02Z** — despite `is_active=1` until the 2026-05-07T01:23:42Z retirement (3 full days during which it could have fired but didn't).
+
+For comparison, narrative patterns continued firing throughout:
+- `narrative_momentum`: 264 fires, last 2026-05-11T16:43:05Z (today)
+- `full_conviction`: 257 fires, last 2026-05-11T16:43:05Z (today)
+
+So chain detection IS running. Memecoin-pipeline detection specifically stopped producing volume_breakout matches.
+
+**Possible mechanisms (NOT investigated tonight — separate session):**
+
+1. Pattern definition relies on a memecoin-specific upstream signal that stopped producing data (e.g., a pump.fun watcher, a specific scorer signal, a memecoin-pipeline gate)
+2. The chain pattern-matching code path has a bug that skipped memecoin pipeline starting 2026-05-04 (regression introduced by a PR around that date)
+3. Real-world tokens no longer match the pattern (regime change) — but 8 days of zero would be statistically suspicious for a 257-match-in-3-weeks pattern
+4. PR #64 (`cbb1e7f`, merged 2026-05-04) itself introduced a regression in the writer path that prevents chain_matches from being written even when pattern-matches occur
+
+**Why this is significant beyond §2.7:**
+
+PR #64's intent was to populate `mcap_at_completion` at chain_match write time. The investigation showed **zero** post-PR-#64 chain_matches have `mcap_at_completion` populated — because zero chain_matches exist at all. If hypothesis (4) is correct, PR #64 silently broke the writer path it was supposed to enhance. This would be a §2.9-shape silent regression — the fix shipped, looks like it should work, but the upstream that fires it stopped firing on the same day.
+
+**Diagnostic order for next session (~30-45 min):**
+
+1. Git-blame `scout/chains/tracker.py` around `_record_chain_complete` for commits between 2026-05-03 and 2026-05-04. If PR #64 changed write-site logic, bisect.
+2. Test the upstream signal flow: query whether the pre-conditions for volume_breakout pattern (whatever those are — need to read pattern definition) are firing post-2026-05-04. If pre-conditions fire but matches don't, regression in match logic. If pre-conditions don't fire, upstream issue.
+3. If hypothesis (4) confirmed: revert or rewrite the PR #64 writer change so memecoin chain_matches start flowing again, allowing the new hydration path to actually run.
+
+**§2.12 status: filed-as-new-finding.** Severity HIGH (BL-074 chain-completed dispatch depends on memecoin chain_matches; 8 days of zero matches is operational impact). Deferred to a dedicated session per the BL-071a sequencing discipline — investigation of (Y) requires fresh head and reading more code than the diagnosis tonight had budget for.
+
+**§2.12 investigation update (2026-05-11 evening, hypothesis space narrowed):**
+
+Per the 4 pre-registered hypotheses, partial investigation eliminated some and refined others. Diagnostic depth limited by remaining session budget (next-step requires careful read of `_advance_chain` pattern-step semantics — fresh-head work).
+
+**Hypothesis (4) — PR #64 silently broke writer path: UNLIKELY.** Code-read of PR #64 (`cbb1e7f`) changes to `_record_completion` in `scout/chains/tracker.py:488`:
+- Memecoin-specific writer branch is gated `if chain.pipeline == "memecoin" and session is not None`
+- DexScreener fetch wrapped in `try: ... except Exception: result = None` — fail-soft
+- `fetch_token_fdv` has explicit timeouts (15s total, 5s connect; `scout/chains/mcap_fetcher.py:45-46`)
+- `mcap_at_completion` stays None on any failure path; INSERT proceeds
+- Narrative writer path is unchanged — and narrative chain_matches continue firing (last 2026-05-11T16:43:05Z = today), confirming the writer isn't globally broken
+
+**Hypothesis (1) — memecoin upstream signal cessation: PARTIALLY CONFIRMED but incomplete explanation.** signal_events distribution by event_type for memecoin pipeline:
+
+| event_type | total | last fire |
+|---|---:|---|
+| `candidate_scored` | 6,057,629 | 2026-05-11T23:02 (today) |
+| `conviction_gated` | 104,407 | 2026-05-11T23:02 (today) |
+| `chain_complete` | 146 | 2026-05-04T00:26 (cessation) |
+| `counter_scored` | **2** | **2026-05-02T00:00 (cessation; only 2 events ever)** |
+
+So:
+- `candidate_scored` and `conviction_gated` continue flowing in millions post-PR-#64. Upstream detection layer is alive and producing events.
+- `chain_complete` signal_events are OUTPUT of chain detection (emitted from `_record_completion` at `scout/chains/tracker.py:574`). Their cessation is circular with chain_matches cessation — same event.
+- **`counter_scored` for memecoin pipeline only ever fired twice** (2026-05-01 + 2026-05-02). It's been at zero since 2026-05-02 — TWO DAYS BEFORE PR #64 merged.
+
+Volume_breakout pattern definition (from `chain_patterns.steps_json`):
+1. `candidate_scored` with `signal_count >= 2`
+2. `candidate_scored` with `signal_count >= 3` (within 4h)
+3. `counter_scored` with `risk_score < 50` (within 6h)
+4. `conviction_gated` (within 8h)
+
+`min_steps_to_trigger = 3` of 4. With counter_scored almost-never-firing for memecoin pipeline, the pattern *must* have been matching via {1, 2, 4} step combinations (skipping step 3). But 146 chain_matches accumulated despite this — so the pattern *did* match without step 3, somehow.
+
+**Sharper question for next session:** with `candidate_scored` and `conviction_gated` still flowing in millions, why does `_advance_chain` no longer produce volume_breakout matches?  Possible mechanisms:
+- (1') Pattern step ordering semantics in `_advance_chain` require step 3 to be matched-or-explicitly-skipped, and the skip path broke
+- (2') The pattern step combination that was matching (probably {1, 2, 4}) requires temporal ordering that's now violated by event-stream timing changes
+- (3') counter_scored cessation 2026-05-02 might trigger a guard somewhere that prevents the pattern from advancing — though `chain_complete` fires continued until 2026-05-04T00:26 despite counter_scored being at zero
+- (4') Some pattern-state cleanup change in PR #64 (the +441/-88 diff to tracker.py) inadvertently invalidated active chains that were in steps 1-2 but waiting for step 4
+
+**Diagnostic order for next session (~30-45 min):**
+
+1. **Read `_advance_chain` carefully** — understand the exact pattern-step matching semantics. What does `min_steps_to_trigger=3` allow as valid step subsets? Is there a step-skip path or does the chain require consecutive matches?
+2. **Test directly:** find 1 memecoin token from prod that fires candidate_scored ≥2 + ≥3 + conviction_gated in sequence. Manually trace what `_advance_chain` would do with those events. If it should produce a chain_match but doesn't, that's the bug.
+3. **Cross-check the cooldown logic** (`_in_cooldown` at tracker.py:157) — could the recent-completion-cooldown be suppressing all new volume_breakout matches if the cooldown window is too long?
+4. **If still no answer:** git-bisect the chain detection code between 2026-05-03 and 2026-05-04 changes (PR #63 Bundle A + PR #64) for behavior changes in the matching path.
+
+**§2.12 mechanism is narrower than at filing time.** Not "PR #64 broke the writer" (ruled out) and not "millions of events stopped" (refuted by data). It's somewhere in chain pattern-matching semantics or a pattern-state cleanup change. The investigation depth required for full resolution is reading code carefully, not running SQL queries — fresh-head work.
+
 ### §2.8 [MEDIUM] `high_peak_fade_audit` only 7 rows
 
 BL-NEW-HPF deployed 2026-05-04 per memory. 7 audit rows in 7 days = 1/day. Could be legitimately rare (high-peak fades only fire on tokens that reach high peaks) or could indicate the detector is partially broken. **Worth a manual cross-check** against trades with peak_pct ≥ HPF threshold to verify expected fire rate.
+
+**Suspect commit / root cause (post-audit annotation 2026-05-11):**
+- Writer: `scout/trading/evaluator.py`. **Single commit:** `f150f75` (PR #78 BL-NEW-HPF ship). Never modified after.
+- Most plausible: **NOT broken — working at expected low frequency.** HPF only fires on tokens that reach high peaks then retrace; both conditions are rare. 7 fires in ~7d ≈ 1/day matches a low-prior detector.
+- Diagnostic order: single SQL — `SELECT COUNT(*) FROM paper_trades WHERE peak_pct >= <PAPER_HPF_THRESHOLD_PCT> AND opened_at > '2026-05-04'`. If count >> 7, detector is partially broken (eligibility met but not firing). If count ≈ 7-15, working as designed.
+- Lowest-severity item in §2 — defer until §2.2/§2.4/§2.6/§2.7 are closed.
+
+**§2.8 closure (Path: confirmed working-as-designed, 2026-05-11 evening):**
+
+Prod state verified via direct query (`scout.db` + `.env`):
+
+- `PAPER_HIGH_PEAK_FADE_ENABLED=True` (master gate on)
+- `PAPER_HIGH_PEAK_FADE_DRY_RUN=True` (log-only mode — writes audit rows, does not exit trades)
+- Per-signal opt-in via `signal_params.high_peak_fade_enabled`: gainers_early=1, losers_contrarian=1; chain_completed/first_signal/narrative_prediction/tg_social/trending_catch/volume_spike=0
+
+Fire-rate analysis on opted-in signals since 2026-05-04:
+
+| Signal | Eligible (peak_pct ≥ 60%) | HPF audit fires | Fire rate |
+|---|---:|---:|---:|
+| gainers_early | 8 | 6 | 75% |
+| losers_contrarian | 4 | 1 | 25% |
+| **Total opted-in** | **12** | **7** | **58%** |
+
+All 7 audit rows: `threshold_pct=60.0`, `dry_run=1`, `retrace_pct` 15.13-17.22%. The 12→7 gap is explainable by the design — HPF requires BOTH `peak_pct ≥ 60%` AND `retrace_pct ≥ 15%`. Trades that hit 60% peak but exited via TP/SL before retracing 15%, or are still open and still riding, don't fire. **No detector pathology detected.**
+
+**§2.8 status: closed-as-working-as-designed.** Detector is doing exactly what the design prescribes — capturing instances where confirmed runners faded ≥15% from peak. Severity downgrade MEDIUM → CLOSED. Outcome matches the pre-registered "Outcome 1" classification (count ≈ 7-15 = working as designed).
+
+**Open operator-decision NOT in scope of this audit:** whether to flip `PAPER_HIGH_PEAK_FADE_DRY_RUN=False` for live exit gating. That requires counterfactual analysis of HPF-fired trades (would they have continued running after the fade, or did the fade signal correctly mark the top?) — separate workstream, naturally bundles with PR #105 audit-snapshot data once it accumulates.
+
+## §2.10 Deploy-without-activate sweep (post-§2.2 follow-on, 2026-05-11 evening)
+
+**Trigger:** §2.2's (b'-new) classification raised the question — is "feature flag never flipped from default" a one-off or a systemic pattern? Cheap sweep to find out.
+
+**Method:** Two-surface grep:
+1. Primary — `: bool = False` across `scout/config.py` (Pydantic Settings — the canonical gating surface in this project)
+2. Secondary — `getenv.*[Ee]nabled|getenv.*FLAG|getenv.*MODE` across `scout/` (catches ad-hoc gating outside the Settings layer)
+
+Secondary surface returned **zero matches** — all feature gating lives in Pydantic Settings. Clean design.
+
+**Pre-registered classification buckets:**
+- (i) Intentional safety gate — guarded-by-design, comment names the safety reason
+- (ii) Deferred research feature by design — shipped flag-gated with documented activation path
+- (iii) Forgotten activation — no documented intent, no comment, no backlog reference
+
+**Result (21 flags total):**
+
+| Bucket | Count | Flags |
+|---|---:|---|
+| (i) Safety gate, **flipped True in prod** | 14 | `NARRATIVE_ENABLED`, `CHAINS_ENABLED`, `BRIEFING_ENABLED`, `VELOCITY_ALERTS_ENABLED`, `LOSERS_TRACKER_ENABLED`, `SECONDWAVE_ENABLED`, `TRADING_ENABLED`, `PAPER_MOONSHOT_ENABLED`, `PAPER_CONVICTION_LOCK_ENABLED`, `TG_SOCIAL_ENABLED`, `PAPER_HIGH_PEAK_FADE_ENABLED`, `SIGNAL_PARAMS_ENABLED`, `PERP_ENABLED`, `PERP_SCORING_ENABLED` |
+| (i) Safety gate, **deliberately False** | 5 | `LUNARCRUSH_ENABLED` (DROPPED — see memory `feedback_lunarcrush_dropped.md`), `LIVE_TRADING_ENABLED`, `LIVE_OVERRIDE_REPLACE_ONLY`, `LIVE_USE_REAL_SIGNED_REQUESTS`, `LIVE_USE_ROUTING_LAYER` |
+| (ii) Deferred research feature | 1 | `CRYPTOPANIC_SCORING_ENABLED` (paired with `CRYPTOPANIC_ENABLED` in BL-053 Path C activation conditions) |
+| (b'-new) Deploy-without-activate | 1 | `CRYPTOPANIC_ENABLED` (already filed as BL-053) |
+| **(iii) Forgotten activation** | **0** | — |
+
+**Conclusion: (b'-new) is a one-off, not a systemic pattern.** 20 of 21 flags are working as designed (14 flipped on per operator decision; 5 deliberately gated for safety or by design). Only the cryptopanic pair (one feature, two flags) sits in deferred-research / deploy-without-activate territory.
+
+**Confirmed: the (b'-new) taxonomy addition stays as a one-off classification** — surfaced once, captured in BL-053 backlog entry, no further audit-pass companion needed. The original meta-implication paragraph in §2.2's closure (live-trading family is guarded-by-design, NOT deploy-without-activate) is correct.
+
+**No new backlog entries from this sweep.** Sweep cost: ~10 min. Sweep value: closed the "one-off or systemic?" question with a clean negative — meaningful for prioritization (no follow-on audit class needed beyond BL-NEW-CYCLE-CHANGE-AUDIT).
 
 ### §2.9 [HIGH] [Class 2] Auto-suspension reversals are silent — operator-action silently reversed
 
@@ -245,6 +552,28 @@ Review: combo_performance + decide re-enable vs accept suspension.
 **Scope creep guard:** this alert fires ONLY when `applied_by='auto_suspend'`, NOT on every signal_params change. Operator-initiated changes don't need self-notifications.
 
 **Generalizes to a broader rule** (see §5.5): every automated state change that reverses or overrides an operator-applied state must fire an operator alert at write time.
+
+### §2.9 closure tracking (added post-PR-#106)
+
+PR #106 (commit `e8758b5`, merged 2026-05-11T20:38:03Z) shipped the fix. The fix is **code-verified-only** — tests pass, manual curl replay produced correctly-rendered output — until the next production `auto_suspend` event fires and is verified end-to-end. Production verification must be detectable, not contingent on operator attention at the right moment (which is the failure shape §2.9 itself documents).
+
+**Trigger pattern.** Watch VPS journalctl for the next `auto_suspend_alert_dispatched` line after 2026-05-11T20:38:03Z:
+
+```
+journalctl -u gecko-pipeline --since "2026-05-11 20:38" | grep auto_suspend_alert_dispatched
+```
+
+When the first match appears, the verification block below activates.
+
+**Verification checklist** (all three must pass to declare §2.9 closed-in-production):
+
+1. **Trace pair present** — a paired `auto_suspend_alert_delivered` line follows the `_dispatched` line for the same signal (correlate by timestamp + `signal_type` field).
+2. **Body preserves underscores** — fetch the corresponding Telegram message from chat `6337722878` history. Verify the signal name and `suspended_reason` field contain literal underscores (e.g., `trending_catch` renders as `trending_catch`, NOT `trendingcatch` with surrounding italics).
+3. **Closure entry recorded** — append a line to this audit doc: `§2.9 closed-in-production YYYY-MM-DDTHH:MM:SSZ: signal_type=<X>, suspended_reason=<Y>, journalctl evidence <timestamp>`.
+
+**Time-bounded fallback.** If no `auto_suspend` event fires by **2026-05-25T20:38:03Z** (14d post-merge), §2.9 is marked `closed-by-time-bound, no production firing observed` and the audit doc records that production confirmation rests on the code-level evidence alone (PR #106 tests + manual curl replay). Time-bound closure is weaker than firing-event closure, but it prevents §2.9 from becoming permanent paperwork waiting for a low-frequency event.
+
+**Why this shape:** §2.9's original failure was "alert fired, operator didn't recognize the mangled signal name." The closure criterion for the *fix* must not depend on the same operator-attention-at-the-right-moment the finding documents — pinning observation to a log-grep pattern + an explicit verification checklist makes the closure event detectable rather than discretionary.
 
 ## §3 Why Telegram doesn't catch this
 

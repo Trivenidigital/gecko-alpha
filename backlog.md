@@ -293,6 +293,64 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 - Project CLAUDE.md "What NOT To Do" — pointers to global §12b + worked example
 - `tasks/findings_silent_failure_audit_2026_05_11.md` §2.9 — original finding
 
+### BL-053: CryptoPanic news feed (shipped 2026-04-20, deactivated by default — operator activation pending)
+**Status:** SHIPPED-BUT-DEACTIVATED — diagnosed 2026-05-11 during silent-failure audit §2.2 closure. Code intact in tree; flags default-off per original design intent ("research-only, no scoring signal activation in this increment" per BL-053 design doc §1). The 22-day "silent failure" surfaced in the audit was actually a 22-day deploy-without-activate — a **(b'-new)** failure class distinct from (a) auth failure, (b) listener-not-scheduled, and (c) gate-swallow. See `tasks/findings_silent_failure_audit_2026_05_11.md` §2.2 diagnosis block.
+**Tag:** `shipped-but-deactivated` `news-feed` `bl-053` `deploy-without-activate`
+
+**Deactivation reasoning:**
+- Original design (BL-053 design doc §1) explicitly shipped flag-gated as research-only.
+- No automated SQL consumer of `cryptopanic_posts` table — scoring path uses in-memory enrichment (`model_copy` on candidates), not DB reads. The table is archive-for-future-analysis only. `fetch_all_cryptopanic_posts` (`scout/db.py:4314`) exists as a SELECT helper but has zero callers in `scout/`.
+- Activating without a validated research need produces archival data nobody uses (the "data nobody uses" antipattern).
+- §12a discipline (global CLAUDE.md): shipping a monitored pipeline table without a consumer is the exact failure shape the silent-failure audit was created to surface; should not repeat it.
+
+**Activation conditions (when operator chooses Path C — must ship as ONE coherent PR, not piecewise):**
+1. **Both flags + token** in prod `.env`:
+   - `CRYPTOPANIC_ENABLED=True` — enables fetch + persist
+   - `CRYPTOPANIC_API_TOKEN=<free-tier-token-from-cryptopanic.com>` — fetch short-circuits to `[]` without it
+   - `CRYPTOPANIC_SCORING_ENABLED=True` — gates the `cryptopanic_bullish` Signal 13 in `scout/scorer.py:197`. Flipping `_ENABLED` alone does NOT activate the scoring path.
+2. **Scorer recalibration** — bump `SCORER_MAX_RAW` from 198 to ~208 (or whatever the new total is after Signal 13's +10) per memory `project_session_2026_04_20_bl052_bl053.md`. Requires a recalibration PR with weight verification, NOT just an `.env` change.
+3. **Rate-limit decoupling** — listener currently fires once per main pipeline cycle. Current prod `SCAN_INTERVAL_SECONDS=60` → 60 req/hr → borderline of free-tier (50-200 req/hr per BL-053 design doc §3). Design assumed 300s (12 req/hr). At least one of:
+   - revert pipeline cadence to 300s (broad blast radius across all modules — undesirable)
+   - introduce a decoupled `CRYPTOPANIC_FETCH_INTERVAL_SECONDS` (cleanest; +5 LoC + tests; should be ≥120s for safety margin)
+   - empirically verify the actual free-tier limit (request + sustain at 60/hr for 24h with monitoring) before deciding
+4. **§12a freshness SLO** — add `cryptopanic_posts` to the audit-snapshot CLI's monitored-tables list (the CLI lands via PR #105 post-M1.5c gate). Pre-registered SLO suggestion: "writes within 1h of pipeline restart; alert if no writes for 4h."
+5. **One coherent PR** — flags + recalibration + decoupled interval + SLO in the same change. Splitting reintroduces the deploy-without-activate trap.
+
+**Cross-references:**
+- BL-053 original design: `docs/superpowers/specs/2026-04-20-bl053-cryptopanic-news-feed-design.md`
+- BL-053 plan: `docs/superpowers/plans/2026-04-20-bl053-cryptopanic-news-feed-plan.md`
+- Deploy session memory: `project_session_2026_04_20_bl052_bl053.md`
+- Activation gate: BL-NEW-CYCLE-CHANGE-AUDIT (next entry) feeds the decoupling decision in (3)
+- Roadmap context: this backlog's "Virality Detection Roadmap" §2 ranks CryptoPanic as Source #2
+
+### BL-NEW-CYCLE-CHANGE-AUDIT: audit design-time assumptions against current `SCAN_INTERVAL_SECONDS`
+**Status:** PROPOSED — surfaced 2026-05-11 during BL-053 §2.2 closure analysis. The default `SCAN_INTERVAL_SECONDS` decreased from **300s to 60s** at some point between BL-053's design (which assumed 300s → 12 req/hr CryptoPanic, "well under any free-tier cap") and the current deployed state (60s → 60 req/hr, **at the low end** of the 50-200/hr CryptoPanic free-tier band). BL-053 is one concrete instance; **other modules with design-time rate-limit / throttle / polling / cache-TTL / backoff-window assumptions may have silently become broken or borderline by the cycle change.**
+**Tag:** `audit` `structural-attribute-verification` `silent-degradation` `§9b`
+
+**Why:** This is a structurally different audit class than the silent-failure audit (`findings_silent_failure_audit_2026_05_11.md`). That audit was **table-freshness-based** — does the writer still produce rows? This audit would be **assumption-validity-based** — does the code's design-time math still hold given a known config change? §9b (structural-attribute verification) territory.
+
+**Investigation scope:**
+1. **Find all time-based design-time math** — grep for `SCAN_INTERVAL`, `req/hr`, `req/min`, `requests per`, `rate_limit`, `backoff`, `interval`, `TTL`, `cache_seconds` across `scout/`. List every place where a design-time computation assumed a specific cycle frequency.
+2. **For each finding, classify:**
+   - **Phantom drift** — design-time computation still holds at 60s (the assumption had wide margin)
+   - **Borderline** — at 60s, math just barely fits; one bad cycle would tip it (BL-053 is this case)
+   - **Broken** — at 60s, the assumption is violated; module is silently rate-limited or throttling itself
+3. **Cross-reference each module's external rate limit** (CoinGecko, GeckoTerminal, DexScreener, GoPlus, Helius, Moralis, etc.) against the current cycle math.
+4. **Report:** list of `(module, design-assumption, current-validity, severity, fix-shape)`.
+
+**Drift verdict:** NET-NEW. No existing backlog entry tracks assumption-validity audit. Sibling to `BL-NEW-CI-MASTER-BROKEN` (test-validity audit) and the silent-failure audit (table-freshness audit).
+
+**Hermes verdict:** No skill covers config-change-impact analysis on time-based assumptions. Project-internal.
+
+**Estimate:** ~2-3 hours focused investigation + ~30 min report write-up. Per-finding fix scope varies (most likely 1-line interval-decoupling additions; in rare cases, full module reworks).
+
+**When to run:** Not urgent — system is running, no acute breakage. Schedule as a dedicated session with clean head, not during a wait window. Could naturally bundle with BL-053 reactivation (which needs investigation finding #3's resolution anyway).
+
+**Cross-references:**
+- BL-053 deactivation (immediately above) — first concrete instance of cycle-change-drift
+- `tasks/findings_silent_failure_audit_2026_05_11.md` §2.2 closure — discovery context
+- `feedback_section_9_promotion_due.md` — methodological framing (§9b structural-attribute verification)
+
 ### BL-034: Set up MiroFish Docker integration
 **Status:** DROPPED — Claude Haiku fallback is sufficient, gate lowered to MIN_SCORE=25
 **Files:** docker-compose.yml, scout/mirofish/client.py
