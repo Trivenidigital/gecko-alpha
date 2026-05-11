@@ -315,6 +315,38 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 **Operator-side evaluation worth doing now (zero gecko-alpha code change):** install Hermes + Minara on a terminal you control, manually execute a small number of trades on alerts gecko-alpha currently surfaces to Telegram. This is the cheapest way to assess Minara's execution quality on signals you already trust. Outcome of that trial directly informs adapter-shape choice (a) vs. (b) above.
 
+### BL-NEW-LIVE-ELIGIBLE: would_be_live writer with tier-based eligibility (BL-060 revival)
+**Status:** SHIPPED 2026-05-11 — PR #98 (`8a07662`) squash-merged + deployed VPS 2026-05-11T13:22Z. Closes the ~3-week-old BL-060 writer gap (column existed since 2026-04-23 but all 752 closed trades had NULL/0). See data analysis `tasks/findings_live_eligibility_winners_vs_losers_2026_05_11.md` + memory `project_live_eligible_writer_shipped_2026_05_11.md`.
+**Tag:** `observability` `bl060-revival` `data-driven-thresholds` `pre-execution-routing`
+**What shipped:** Tier-based `would_be_live` stamping on every paper-trade open:
+- **Tier 1 (mandatory):** `chain_completed` (any) OR `conviction_locked_stack >= 3` — historical n=27, 77.8% WR, $47/trade
+- **Tier 2 (high-quality):** `volume_spike` (any spike_ratio) OR `gainers_early` AND `mcap >= $10M` AND `price_change_24h >= 25%` — historical n=95, 55.8% WR
+- **FCFS cap** `PAPER_LIVE_ELIGIBLE_SLOTS=20`: stamps 1 only if Tier 1/2 AND under cap. Closed trades don't occupy slots.
+- 3 new tunable Settings (`PAPER_LIVE_ELIGIBLE_SLOTS`, `PAPER_TIER2_GAINERS_MIN_MCAP_USD`, `PAPER_TIER2_GAINERS_MIN_24H_PCT`)
+- Pure observability — **NO production behavior change**. Paper trades open at same rate; column just records membership.
+
+**PR-stage V1 reviewer folds (5b8e4e6):**
+- IMPORTANT: docstring tightened to acknowledge SELECT-then-INSERT race (1-2 over-stamp possible under burst opens; acceptable for observation, must wrap in `db._txn_lock` when live trading routes through)
+- NIT: skip `compute_stack` DB call for `chain_completed`/`volume_spike` (unconditionally Tier 1a/2a, stack value unused)
+- NIT: annotate evaluator long_hold partial-TP reopen with explicit "settings omitted by design" intent comment
+
+**Why this BL number:** revives BL-060 (paper-mirrors-live) with the data-derived gate that the original quant-score-based plan would not have caught. Original BL-060 design preserved in `docs/superpowers/plans/2026-04-23-bl060-paper-mirrors-live.md` for historical reference.
+
+**Verification queries:**
+```bash
+ssh root@89.167.116.187 "sqlite3 /root/gecko-alpha/scout.db \"SELECT signal_type, would_be_live, COUNT(*) FROM paper_trades WHERE opened_at > datetime('now','-24 hours') GROUP BY signal_type, would_be_live\""
+# expect post-deploy rows to have would_be_live = 0 or 1 (not NULL)
+ssh root@89.167.116.187 "sqlite3 /root/gecko-alpha/scout.db \"SELECT MIN(opened_at), MAX(opened_at), COUNT(*) FROM paper_trades WHERE would_be_live=1\""
+# expect monotonic accumulation post-13:22Z
+```
+
+**Revert:** Set `PAPER_LIVE_ELIGIBLE_SLOTS=0` in `.env` + restart (all stamps become 0). No DB cleanup. Existing rows untouched.
+
+**Follow-up items (NOT in this PR):**
+- Dashboard surface for `would_be_live=1` cohort PnL (separate small UI change)
+- Weekly digest A/B comparing live-eligible cohort vs unfiltered firehose
+- Make race-strict (wrap SELECT+INSERT under `db._txn_lock`) once live trading routes through this filter
+
 ### BL-NEW-M1.5C: Minara DEX-eligibility alert extension (Phase 0 Option A under BL-074)
 **Status:** SHIPPED 2026-05-11 — PR #96 (`ef68c6c`) squash-merged + deployed VPS 2026-05-11T01:54Z. Schema 20260517 migration `bl_tg_alert_log_m1_5c_outcome` applied; M1.5b sentinel preserved across rebuild (verified `m1_5b_sentinel_preserved=true`). Onboarding TG announcement delivered. See memory `project_m1_5c_deployed_2026_05_11.md`.
 **Tag:** `decision-support` `minara` `solana-first` `phase-0-option-a` `pre-execution-layer`
