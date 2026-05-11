@@ -96,10 +96,17 @@ class PaperTrader:
 
         # BL-NEW-LIVE-ELIGIBLE: stamp would_be_live flag. Defensive — any
         # failure here returns 0 so paper-trade open is never blocked.
+        # PR-review NIT fold: skip compute_stack for chain_completed +
+        # volume_spike (unconditionally Tier 1a/2a; stack value unused).
+        # Other signal_types may pass via Tier 1b (stack ≥ 3) OR Tier 2b
+        # (gainers_early thresholds), so stack must be computed.
         would_be_live = 0
         if settings is not None:
             try:
-                stack = await compute_stack(db, token_id, now)
+                if signal_type in ("chain_completed", "volume_spike"):
+                    stack = 0
+                else:
+                    stack = await compute_stack(db, token_id, now)
                 would_be_live = await compute_would_be_live(
                     db,
                     signal_type=signal_type,

@@ -14,10 +14,18 @@ Tier rules derived from `tasks/findings_live_eligibility_winners_vs_losers_2026_
   NOT included in the live-eligible filter — Tier 1+2 alone already
   oversubscribes the 20-slot cap.
 
-Cap: PAPER_LIVE_ELIGIBLE_SLOTS (default 20). FCFS — if a Tier-1/2 signal
-fires while N>=cap trades with would_be_live=1 are already open, the new
-trade stamps would_be_live=0 (recorded for later digest analysis but
-excluded from the "would-have-been-live" cohort).
+Cap: PAPER_LIVE_ELIGIBLE_SLOTS (default 20). Approximate FCFS — if a
+Tier-1/2 signal fires while N>=cap trades with would_be_live=1 are
+already open, the new trade stamps would_be_live=0 (recorded for later
+digest analysis but excluded from the "would-have-been-live" cohort).
+
+Race note (PR-review IMPORTANT fold): the SELECT-then-INSERT is NOT
+under the paper-trade lock, so concurrent opens during a burst can each
+see (open_live_count < cap) and over-stamp by 1-2 rows briefly. This is
+acceptable for purely observational use; the digest cohort will rarely
+contain 21-22 rows instead of 20 under burst conditions. If/when live
+trading routes through this filter, this code MUST be re-wrapped under
+`db._txn_lock` so the cap is strict.
 
 would_be_live=0 for any signal that does not match Tier 1 or 2, regardless
 of slot availability. That's intentional — we want to see only the

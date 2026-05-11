@@ -776,6 +776,11 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
 
                     if keep_amount > 0:
                         signal_data_raw = row[14] if len(row) > 14 else "{}"
+                        # PR-review NIT (BL-NEW-LIVE-ELIGIBLE): settings
+                        # intentionally omitted — long_hold is a partial-TP
+                        # carry, NOT a tier-eligible signal. would_be_live
+                        # stamps 0 by definition. Re-evaluate if any future
+                        # tier rule includes signal_type='long_hold'.
                         new_id = await _trader.execute_buy(
                             db=db,
                             token_id=token_id,
