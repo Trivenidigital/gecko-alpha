@@ -255,6 +255,19 @@ class Settings(BaseSettings):
     # different signals within the window only alerts once.
     TG_ALERT_PER_TOKEN_COOLDOWN_HOURS: int = 6
 
+    # BL-NEW-M1.5C: Minara DEX-eligibility alert extension (Phase 0 Option A).
+    # When a TG paper-trade-open alert is about to fire for a Solana-listed
+    # token, append a `minara swap` shell command to the alert body for
+    # operator copy-paste. gecko-alpha does NOT execute — pure decision-
+    # support. Solana-only in M1.5c; EVM chains are M1.5d/M2.
+    MINARA_ALERT_ENABLED: bool = True
+    MINARA_ALERT_FROM_TOKEN: str = "USDC"
+    # Default trade-size suggestion in the Run: command. R2-C1 fold:
+    # default $10 mirrors M1.5a V3-M3 first-24h discipline. Paper-trade
+    # caller size is $300 prod / $1000 default — too large for memecoin
+    # slippage. Operator overrides via .env if they want larger sizes.
+    MINARA_ALERT_AMOUNT_USD: float = 10.0
+
     PAPER_MIN_MCAP: float = 5_000_000  # min $5M mcap to paper trade (filters junk)
     # Upper mcap cap for paper trades. Large caps (BTC, ETH, SOL, AAVE...) rarely
     # pump fast enough to hit PAPER_TP_PCT within PAPER_MAX_DURATION_HOURS, so
