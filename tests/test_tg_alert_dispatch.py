@@ -454,8 +454,10 @@ async def test_notify_includes_minara_command_for_solana_token(tmp_path, monkeyp
 
     monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
 
+    _SPL = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+
     async def _fake_detail(session, coin_id, api_key=""):
-        return {"platforms": {"solana": "BONKADDR123"}}
+        return {"platforms": {"solana": _SPL}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
 
@@ -472,7 +474,7 @@ async def test_notify_includes_minara_command_for_solana_token(tmp_path, monkeyp
         signal_data={"price_change_24h": 50.0, "mcap": 2_000_000},
     )
     assert len(sent) == 1
-    assert "Run: minara swap --from USDC --to BONKADDR123" in sent[0]
+    assert f"Run: minara swap --from USDC --to {_SPL}" in sent[0]
     await db.close()
 
 
@@ -509,4 +511,54 @@ async def test_notify_no_minara_command_for_evm_only_token(tmp_path, monkeypatch
     )
     assert len(sent) == 1
     assert "Run:" not in sent[0]
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_notify_demotes_sent_row_on_cancelled_error_during_minara_lookup(
+    tmp_path, monkeypatch
+):
+    """PR-V2-I1 fold: asyncio.CancelledError raised inside maybe_minara_command
+    (network interrupted, task cancelled mid-fetch) must NOT leave the
+    pre-emptive 'sent' row stuck — that would suppress the cooldown for 6h.
+    Demote to 'dispatch_failed' then re-raise."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _send_never_called(*args, **kwargs):
+        raise AssertionError("send should not be called on cancel")
+
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _send_never_called)
+
+    async def _cancel_mid_fetch(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        "scout.trading.minara_alert.maybe_minara_command", _cancel_mid_fetch
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await notify_paper_trade_opened(
+            db,
+            settings,
+            session=object(),
+            paper_trade_id=42,
+            signal_type="gainers_early",
+            token_id="bonk",
+            symbol="BONK",
+            entry_price=0.0001,
+            amount_usd=10.0,
+            signal_data={"price_change_24h": 50.0, "mcap": 2_000_000},
+        )
+
+    # Sentinel row must have been demoted, NOT left as 'sent'.
+    cur = await db._conn.execute(
+        "SELECT outcome, detail FROM tg_alert_log "
+        "WHERE token_id='bonk' ORDER BY id DESC LIMIT 1"
+    )
+    outcome, detail = await cur.fetchone()
+    assert outcome == "dispatch_failed"
+    assert "cancel" in (detail or "").lower()
     await db.close()

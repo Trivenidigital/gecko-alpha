@@ -28,6 +28,7 @@ already committed; only the TG alert + tg_alert_log row is lost.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import structlog
@@ -261,12 +262,36 @@ async def notify_paper_trade_opened(
 
         # M1.5c BL-NEW-M1.5C: Minara DEX-eligibility check. After cooldown
         # claim (outside lock) so 100-500ms CG latency doesn't extend
-        # lock-hold. Never raises (4-layer isolation in helper).
+        # lock-hold. Helper never raises Exception, but asyncio.CancelledError
+        # propagates per asyncio convention.
         from scout.trading.minara_alert import maybe_minara_command
 
-        minara_cmd = await maybe_minara_command(
-            session, settings, coin_id=token_id, amount_usd=amount_usd
-        )
+        # PR-V2-I1 fold: on asyncio.CancelledError mid-fetch, the
+        # pre-emptive 'sent' row would otherwise block the per-token
+        # cooldown for 6h. Demote to 'dispatch_failed' then re-raise to
+        # honor cancellation semantics.
+        try:
+            minara_cmd = await maybe_minara_command(
+                session, settings, coin_id=token_id, amount_usd=amount_usd
+            )
+        except asyncio.CancelledError:
+            if sent_row_id is not None and db._conn is not None:
+                try:
+                    async with db._txn_lock:
+                        await db._conn.execute(
+                            "UPDATE tg_alert_log "
+                            "SET outcome='dispatch_failed', "
+                            "detail='cancelled_during_minara_lookup' "
+                            "WHERE id=?",
+                            (sent_row_id,),
+                        )
+                        await db._conn.commit()
+                except Exception:
+                    log.exception(
+                        "tg_alert_log_demote_failed_on_cancel",
+                        sent_row_id=sent_row_id,
+                    )
+            raise
 
         # V3-C1 PR-stage fold: format + dispatch BOTH inside the try.
         # If format raises (string mcap, list signal_data), the

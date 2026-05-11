@@ -98,7 +98,7 @@ async def test_returns_none_when_disabled(monkeypatch):
 
     async def _fake_detail(*args, **kwargs):
         fetch_count[0] += 1
-        return {"platforms": {"solana": "SOLADDR"}}
+        return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
@@ -135,7 +135,7 @@ async def test_uses_settings_amount_not_caller(monkeypatch):
     """R2-C1 fold: command size uses MINARA_ALERT_AMOUNT_USD, NOT caller's amount."""
 
     async def _fake_detail(session, coin_id, api_key=""):
-        return {"platforms": {"solana": "SOLADDR"}}
+        return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
@@ -154,7 +154,7 @@ async def test_default_amount_is_10_dollars(monkeypatch):
     """R2-C1 fold: default MINARA_ALERT_AMOUNT_USD=10."""
 
     async def _fake_detail(session, coin_id, api_key=""):
-        return {"platforms": {"solana": "SOLADDR"}}
+        return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
@@ -173,7 +173,7 @@ async def test_returns_none_when_session_is_none(monkeypatch):
 
     async def _fake_detail(*args, **kwargs):
         fetch_count[0] += 1
-        return {"platforms": {"solana": "SOLADDR"}}
+        return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
@@ -191,7 +191,7 @@ async def test_amount_clamps_to_minimum_1_dollar(monkeypatch):
     """R1-I2 fold: emit --amount-usd ≥ 1 even if Settings has tiny value."""
 
     async def _fake_detail(session, coin_id, api_key=""):
-        return {"platforms": {"solana": "SOLADDR"}}
+        return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
@@ -210,7 +210,7 @@ async def test_amount_handles_none_gracefully(monkeypatch):
     """R1-I3 fold: amount_usd=None doesn't crash; size from Settings."""
 
     async def _fake_detail(session, coin_id, api_key=""):
-        return {"platforms": {"solana": "SOLADDR"}}
+        return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
     cmd = await maybe_minara_command(
@@ -221,3 +221,96 @@ async def test_amount_handles_none_gracefully(monkeypatch):
     )
     assert cmd is not None
     assert "--amount-usd 10" in cmd
+
+
+@pytest.mark.asyncio
+async def test_returns_none_when_platforms_is_not_dict(monkeypatch):
+    """PR-V1-I1 fold: CG schema drift (platforms=string/list) → None,
+    no spurious format_failed log."""
+
+    async def _fake_detail(session, coin_id, api_key=""):
+        return {"platforms": "oops"}
+
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
+    cmd = await maybe_minara_command(
+        session=object(),
+        settings=_settings(),
+        coin_id="bonk",
+        amount_usd=10.0,
+    )
+    assert cmd is None
+
+
+@pytest.mark.asyncio
+async def test_returns_none_when_platforms_is_null(monkeypatch):
+    """Bitcoin literal: `{"platforms": null}` → None via `or {}` fallback."""
+
+    async def _fake_detail(session, coin_id, api_key=""):
+        return {"platforms": None}
+
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
+    cmd = await maybe_minara_command(
+        session=object(),
+        settings=_settings(),
+        coin_id="bitcoin",
+        amount_usd=10.0,
+    )
+    assert cmd is None
+
+
+@pytest.mark.asyncio
+async def test_rejects_evm_shaped_address_under_solana_key(monkeypatch):
+    """PR-V1-I1 + V2-I2 fold: corrupt CG data putting an EVM hex address
+    (`0xabc...`, contains '0' which is not in base58 alphabet) under the
+    solana platforms key must NOT emit a malformed Run: line."""
+
+    async def _fake_detail(session, coin_id, api_key=""):
+        return {
+            "platforms": {
+                "solana": "0xabcdef0123456789abcdef0123456789abcdef01",
+            }
+        }
+
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
+    cmd = await maybe_minara_command(
+        session=object(),
+        settings=_settings(),
+        coin_id="corrupted",
+        amount_usd=10.0,
+    )
+    assert cmd is None, "corrupt EVM address must be rejected by shape check"
+
+
+@pytest.mark.asyncio
+async def test_rejects_address_too_short(monkeypatch):
+    """SPL addresses are 32-44 chars; reject shorter."""
+
+    async def _fake_detail(session, coin_id, api_key=""):
+        return {"platforms": {"solana": "abc"}}
+
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
+    cmd = await maybe_minara_command(
+        session=object(),
+        settings=_settings(),
+        coin_id="tiny",
+        amount_usd=10.0,
+    )
+    assert cmd is None
+
+
+@pytest.mark.asyncio
+async def test_accepts_real_world_spl_address(monkeypatch):
+    """Sanity: a real BONK-like SPL address passes the shape check."""
+
+    async def _fake_detail(session, coin_id, api_key=""):
+        return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
+
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
+    cmd = await maybe_minara_command(
+        session=object(),
+        settings=_settings(),
+        coin_id="bonk",
+        amount_usd=10.0,
+    )
+    assert cmd is not None
+    assert "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263" in cmd
