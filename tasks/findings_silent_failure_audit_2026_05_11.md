@@ -305,6 +305,59 @@ BL-NEW-HPF deployed 2026-05-04 per memory. 7 audit rows in 7 days = 1/day. Could
 - Diagnostic order: single SQL — `SELECT COUNT(*) FROM paper_trades WHERE peak_pct >= <PAPER_HPF_THRESHOLD_PCT> AND opened_at > '2026-05-04'`. If count >> 7, detector is partially broken (eligibility met but not firing). If count ≈ 7-15, working as designed.
 - Lowest-severity item in §2 — defer until §2.2/§2.4/§2.6/§2.7 are closed.
 
+**§2.8 closure (Path: confirmed working-as-designed, 2026-05-11 evening):**
+
+Prod state verified via direct query (`scout.db` + `.env`):
+
+- `PAPER_HIGH_PEAK_FADE_ENABLED=True` (master gate on)
+- `PAPER_HIGH_PEAK_FADE_DRY_RUN=True` (log-only mode — writes audit rows, does not exit trades)
+- Per-signal opt-in via `signal_params.high_peak_fade_enabled`: gainers_early=1, losers_contrarian=1; chain_completed/first_signal/narrative_prediction/tg_social/trending_catch/volume_spike=0
+
+Fire-rate analysis on opted-in signals since 2026-05-04:
+
+| Signal | Eligible (peak_pct ≥ 60%) | HPF audit fires | Fire rate |
+|---|---:|---:|---:|
+| gainers_early | 8 | 6 | 75% |
+| losers_contrarian | 4 | 1 | 25% |
+| **Total opted-in** | **12** | **7** | **58%** |
+
+All 7 audit rows: `threshold_pct=60.0`, `dry_run=1`, `retrace_pct` 15.13-17.22%. The 12→7 gap is explainable by the design — HPF requires BOTH `peak_pct ≥ 60%` AND `retrace_pct ≥ 15%`. Trades that hit 60% peak but exited via TP/SL before retracing 15%, or are still open and still riding, don't fire. **No detector pathology detected.**
+
+**§2.8 status: closed-as-working-as-designed.** Detector is doing exactly what the design prescribes — capturing instances where confirmed runners faded ≥15% from peak. Severity downgrade MEDIUM → CLOSED. Outcome matches the pre-registered "Outcome 1" classification (count ≈ 7-15 = working as designed).
+
+**Open operator-decision NOT in scope of this audit:** whether to flip `PAPER_HIGH_PEAK_FADE_DRY_RUN=False` for live exit gating. That requires counterfactual analysis of HPF-fired trades (would they have continued running after the fade, or did the fade signal correctly mark the top?) — separate workstream, naturally bundles with PR #105 audit-snapshot data once it accumulates.
+
+## §2.10 Deploy-without-activate sweep (post-§2.2 follow-on, 2026-05-11 evening)
+
+**Trigger:** §2.2's (b'-new) classification raised the question — is "feature flag never flipped from default" a one-off or a systemic pattern? Cheap sweep to find out.
+
+**Method:** Two-surface grep:
+1. Primary — `: bool = False` across `scout/config.py` (Pydantic Settings — the canonical gating surface in this project)
+2. Secondary — `getenv.*[Ee]nabled|getenv.*FLAG|getenv.*MODE` across `scout/` (catches ad-hoc gating outside the Settings layer)
+
+Secondary surface returned **zero matches** — all feature gating lives in Pydantic Settings. Clean design.
+
+**Pre-registered classification buckets:**
+- (i) Intentional safety gate — guarded-by-design, comment names the safety reason
+- (ii) Deferred research feature by design — shipped flag-gated with documented activation path
+- (iii) Forgotten activation — no documented intent, no comment, no backlog reference
+
+**Result (21 flags total):**
+
+| Bucket | Count | Flags |
+|---|---:|---|
+| (i) Safety gate, **flipped True in prod** | 14 | `NARRATIVE_ENABLED`, `CHAINS_ENABLED`, `BRIEFING_ENABLED`, `VELOCITY_ALERTS_ENABLED`, `LOSERS_TRACKER_ENABLED`, `SECONDWAVE_ENABLED`, `TRADING_ENABLED`, `PAPER_MOONSHOT_ENABLED`, `PAPER_CONVICTION_LOCK_ENABLED`, `TG_SOCIAL_ENABLED`, `PAPER_HIGH_PEAK_FADE_ENABLED`, `SIGNAL_PARAMS_ENABLED`, `PERP_ENABLED`, `PERP_SCORING_ENABLED` |
+| (i) Safety gate, **deliberately False** | 5 | `LUNARCRUSH_ENABLED` (DROPPED — see memory `feedback_lunarcrush_dropped.md`), `LIVE_TRADING_ENABLED`, `LIVE_OVERRIDE_REPLACE_ONLY`, `LIVE_USE_REAL_SIGNED_REQUESTS`, `LIVE_USE_ROUTING_LAYER` |
+| (ii) Deferred research feature | 1 | `CRYPTOPANIC_SCORING_ENABLED` (paired with `CRYPTOPANIC_ENABLED` in BL-053 Path C activation conditions) |
+| (b'-new) Deploy-without-activate | 1 | `CRYPTOPANIC_ENABLED` (already filed as BL-053) |
+| **(iii) Forgotten activation** | **0** | — |
+
+**Conclusion: (b'-new) is a one-off, not a systemic pattern.** 20 of 21 flags are working as designed (14 flipped on per operator decision; 5 deliberately gated for safety or by design). Only the cryptopanic pair (one feature, two flags) sits in deferred-research / deploy-without-activate territory.
+
+**Confirmed: the (b'-new) taxonomy addition stays as a one-off classification** — surfaced once, captured in BL-053 backlog entry, no further audit-pass companion needed. The original meta-implication paragraph in §2.2's closure (live-trading family is guarded-by-design, NOT deploy-without-activate) is correct.
+
+**No new backlog entries from this sweep.** Sweep cost: ~10 min. Sweep value: closed the "one-off or systemic?" question with a clean negative — meaningful for prioritization (no follow-on audit class needed beyond BL-NEW-CYCLE-CHANGE-AUDIT).
+
 ### §2.9 [HIGH] [Class 2] Auto-suspension reversals are silent — operator-action silently reversed
 
 **Trigger evidence:** `trending_catch` was operator-re-enabled 2026-05-10 (per memory `project_trending_catch_soak_2026_05_10.md`) for a pre-registered n=50 soak. At 2026-05-11T01:00:26Z (~14h later), the combo_performance auto-suspend kill switch caught the pre-registered KILL criterion (WR<50% OR total<-$100) and re-suspended the signal. Audit row in `signal_params_audit` ID 22 confirms `auto_suspend` reversed operator-enabled state.
