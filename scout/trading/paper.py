@@ -10,8 +10,11 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from scout.config import Settings
 from scout.db import Database
 from scout.exceptions import MoonshotArmFailed
+from scout.trading.conviction import compute_stack
+from scout.trading.live_eligibility import compute_would_be_live
 
 if TYPE_CHECKING:
     from scout.live.engine import LiveEngine
@@ -63,6 +66,7 @@ class PaperTrader:
         signal_combo: str,
         lead_time_vs_trending_min: float | None = None,
         lead_time_vs_trending_status: str | None = None,
+        settings: Settings | None = None,
     ) -> int | None:
         """Record a paper buy. Returns trade ID, or None if rejected by guards.
 
@@ -90,6 +94,34 @@ class PaperTrader:
         sl_price = effective_entry * (1 - sl_pct / 100) if sl_pct > 0 else 0.0
         now = datetime.now(timezone.utc).isoformat()
 
+        # BL-NEW-LIVE-ELIGIBLE: stamp would_be_live flag. Defensive — any
+        # failure here returns 0 so paper-trade open is never blocked.
+        # PR-review NIT fold: skip compute_stack for chain_completed +
+        # volume_spike (unconditionally Tier 1a/2a; stack value unused).
+        # Other signal_types may pass via Tier 1b (stack ≥ 3) OR Tier 2b
+        # (gainers_early thresholds), so stack must be computed.
+        would_be_live = 0
+        if settings is not None:
+            try:
+                if signal_type in ("chain_completed", "volume_spike"):
+                    stack = 0
+                else:
+                    stack = await compute_stack(db, token_id, now)
+                would_be_live = await compute_would_be_live(
+                    db,
+                    signal_type=signal_type,
+                    signal_data=signal_data,
+                    conviction_stack=stack,
+                    settings=settings,
+                )
+            except Exception:
+                log.exception(
+                    "would_be_live_stamp_failed",
+                    token_id=token_id,
+                    signal_type=signal_type,
+                )
+                would_be_live = 0
+
         INSERT_SQL = """
 INSERT INTO paper_trades
   (token_id, symbol, name, chain, signal_type, signal_data,
@@ -97,9 +129,9 @@ INSERT INTO paper_trades
    tp_pct, sl_pct, tp_price, sl_price,
    status, opened_at,
    signal_combo, lead_time_vs_trending_min, lead_time_vs_trending_status,
-   remaining_qty, floor_armed, realized_pnl_usd)
+   remaining_qty, floor_armed, realized_pnl_usd, would_be_live)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
-        ?, 0, 0.0)
+        ?, 0, 0.0, ?)
 """
         cursor = await conn.execute(
             INSERT_SQL,
@@ -122,6 +154,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
                 lead_time_vs_trending_min,
                 lead_time_vs_trending_status,
                 quantity,  # remaining_qty = full qty at open
+                would_be_live,
             ),
         )
         trade_id = cursor.lastrowid
@@ -137,6 +170,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             amount_usd=amount_usd,
             tp_price=tp_price,
             sl_price=sl_price,
+            would_be_live=would_be_live,
         )
 
         # BL-055 chokepoint: fire-and-forget handoff to LiveEngine when injected

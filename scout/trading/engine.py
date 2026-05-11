@@ -350,6 +350,7 @@ class TradingEngine:
                 signal_combo=signal_combo,
                 lead_time_vs_trending_min=lead_time_min,
                 lead_time_vs_trending_status=lead_time_status,
+                settings=self.settings,
             )
             # BL-NEW-TG-ALERT-ALLOWLIST: post-open Telegram alert hook.
             # Fire-and-forget; never blocks paper-trade success path.
