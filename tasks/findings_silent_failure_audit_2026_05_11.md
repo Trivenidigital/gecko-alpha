@@ -316,6 +316,8 @@ Build the always-on watchdog daemon ONLY after §2.1-§2.8 are fixed and the aud
 
 **Estimated build:** 4-6 hours when the time comes. ~200 LoC + tests + systemd unit. Re-uses the gecko-backup-watchdog.sh curl-direct-to-Telegram alert pattern.
 
+**TODO (added 2026-05-11):** When implementing the watchdog daemon's monitored-tables list, include `audit_volume_snapshot_phase_b` per `tasks/plan_audit_volume_snapshot_phase_b_2026_05_11.md`. The snapshot-job's own watchdog (`gecko-audit-snapshot-watchdog.timer`) covers heartbeat-file staleness (per-run cessation); this daemon would cover table-write-staleness (per-table-row cessation) — siblings, not redundant. Stacked-failure mode the cross-reference prevents: snapshot job dies + snapshot-job-watchdog also dies → audit table silently stops receiving rows. With both watchdogs in place, either failure alerts independently.
+
 ### Priority 7 (still useful, sequence later): Per-API-key liveness probe
 
 In `main.py` startup + every 1h: make a minimal API call to each configured external service (Anthropic, OpenRouter, Telegram, CoinGecko, GoPlus, Helius, Moralis). Catches credit-dry / key-rotation / service-outage scenarios. Originally Priority 3; reviewer didn't object to it but it's not blocking — defer until the daemon ships.

@@ -1,0 +1,11 @@
+[Unit]
+Description=Gecko-Alpha — daily Phase B audit-snapshot timer (04:00 UTC)
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+AccuracySec=10m
+Unit=gecko-audit-snapshot.service
+
+[Install]
+WantedBy=timers.target
