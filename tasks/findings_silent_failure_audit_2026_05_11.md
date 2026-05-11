@@ -358,6 +358,67 @@ Narrative chain pipeline is healthy. **Memecoin chain pipeline died 7 days ago.*
 
 **§2.4 → §2.7 sequencing pre-registration (do not collapse the fix).** §2.4 and §2.7 share a suspected root cause (memecoin `outcomes` empty → can't hydrate hits → auto-retirement guard fires). The fix for §2.4 should land **first**, and §2.7 observed for **≥3 days** before any §2.7-specific work. Rationale: same investigation shape as §2.9 — single-variable change with a clean attribution window. If §2.7 closes after §2.4 alone is fixed → confirmed shared root cause. If §2.7 does NOT close → second independent root cause exists in the dispatch path itself, which is much more valuable to know than discovering it after a combined fix that conflates the two attribution paths. **Do not fix both simultaneously.**
 
+**§2.7 closure (2026-05-11 evening, BL-071a investigation — INVERTS the suspect-PR hypothesis):**
+
+The pre-registered sequencing above assumed §2.4 feeds §2.7. **Diagnostic investigation flipped this finding entirely.** Three observations from prod data:
+
+1. **ALL 257 volume_breakout chain_matches are pre-PR-#64.** Last fire 2026-05-04T00:51:02Z. PR #64 (`cbb1e7f`, BL-071a') merged 2026-05-04 later that day. ZERO chain_matches written after that date.
+2. **ALL 257 have `mcap_at_completion = NULL`.** PR #64's writer-side change to populate `mcap_at_completion` at chain_match write-time has **not been exercised on prod data** because no new memecoin chain_matches have been written.
+3. **Outcome distribution:** 3 HIT + 108 EXPIRED + 146 NULL = 257. The 108 EXPIRED rows all aged into expired status pre-PR-#64 because hydration was structurally broken (no mcap_at_completion → fall back to empty legacy outcomes table → never hydrate → expire). The 3 hits happened 2026-05-01 to 2026-05-03 via a pre-PR-#64 path (the legacy alert-derived outcomes flow, before it stopped).
+
+The 2026-05-07T01:23:42Z retirement decision (`scout/chains/patterns.py:339-346`) computed `hit_rate = 3 hits / 111 evaluated = 2.7%` (the 111 = 108 EXPIRED + 3 HIT). 2.7% < `_RETIREMENT_HIT_RATE = 0.20` → `is_active = 0`. Working-as-coded.
+
+**Two distinct mechanisms drive "memecoin chain pipeline dead":**
+
+- **Mechanism (X) — auto-retirement on broken-hydration-era data.** The retirement code treats EXPIRED rows as "evaluated misses" indistinguishably from genuine misses. When hydration plumbing was broken pre-PR-#64, rows aged into EXPIRED because they *couldn't* be hydrated, not because they were *actually* misses. The retirement decision was computationally correct but operated on compromised input — the "real" post-PR-#64 hit_rate is unknown because mechanism (Y) prevented any post-PR-#64 data from accumulating.
+- **Mechanism (Y) — upstream chain detection ceased producing memecoin volume_breakout matches starting 2026-05-04.** ZERO new chain_matches in the 8 days the pattern remained is_active=1 (2026-05-04 → 2026-05-07 retirement). **Separate root cause from (X), unknown mechanism, not investigated tonight.** The detection-stop happened BEFORE retirement and is the primary "no new chain_matches" cause.
+
+**§2.4 ↔ §2.7 coupling — opposite direction from audit hypothesis:** the suspect-PR annotation hypothesized "§2.4 feeds §2.7" (outcomes-empty → can't hydrate → retirement). Actual mechanism: **§2.4 is purely legacy-displaced (audit §0.5 was correct).** PR #64 (BL-071a') was meant to decouple memecoin chain hydration from the empty outcomes table via DexScreener fetch. But because mechanism (Y) stopped upstream detection on the same day PR #64 merged, **PR #64's writer-side change has never actually run on prod data.** The fix exists in code; the data path to exercise it doesn't.
+
+**§2.7 status: two-mechanism closure.** Mechanism (X) is working-as-coded-on-stale-data, NOT a bug — a §9b-shape structural issue (the retirement math has hidden assumptions about what "evaluated" means; those assumptions broke when hydration was broken pre-PR-#64). Mechanism (Y) is **filed as §2.12 below** because it's structurally distinct from §2.7's original framing and warrants its own investigation.
+
+**Operator-decision points (separate from audit closure):**
+- (i) Un-retire volume_breakout (`UPDATE chain_patterns SET is_active=1 WHERE name='volume_breakout'`) to let post-fix data accumulate — but worthless until §2.12 mechanism (Y) is resolved (no new chain_matches to evaluate).
+- (ii) Accept volume_breakout retirement as-is; the data behind the decision is stale-but-pattern-was-also-not-detecting; current state is approximately correct.
+- (iii) Reconsider the retirement math to weight EXPIRED-without-hydration rows differently from genuine misses. §9b-class fix.
+
+**Related: BL-071b memory is stale.** Memory said "all 154 narrative chain_matches in prod have outcome_class='EXPIRED'." Current state: full_conviction has 257 NULL (zero EXPIRED), narrative_momentum has 262 NULL + 2 MISS. The bug shape evolved between memory write-time and now — narrative-side EXPIRED-at-write may have been partially fixed, but the hydrator still doesn't populate them. BL-071b needs re-diagnosis with current state; the memory's specifics no longer apply.
+
+**§2.4 status: closed-as-legacy-displaced (audit §0.5 confirmed).** Two outcomes rows = two alerts rows via `check_outcomes` at `main.py:898`. Decoupled from chain hydration by PR #64. No further §2.4-specific action needed.
+
+## §2.12 [NEW FINDING] Memecoin chain detection ceased 2026-05-04 — unknown mechanism
+
+Surfaced 2026-05-11 evening during BL-071a investigation as mechanism (Y) of §2.7. **Structurally distinct from §2.7's auto-retirement (mechanism X) and from any prior audit finding.** Filed as its own item because the diagnostic path differs.
+
+**The observation:**
+
+`volume_breakout` (memecoin pipeline) produced 257 chain_matches between 2026-04-13T17:21 and 2026-05-04T00:51. **Zero new chain_matches since 2026-05-04T00:51:02Z** — despite `is_active=1` until the 2026-05-07T01:23:42Z retirement (3 full days during which it could have fired but didn't).
+
+For comparison, narrative patterns continued firing throughout:
+- `narrative_momentum`: 264 fires, last 2026-05-11T16:43:05Z (today)
+- `full_conviction`: 257 fires, last 2026-05-11T16:43:05Z (today)
+
+So chain detection IS running. Memecoin-pipeline detection specifically stopped producing volume_breakout matches.
+
+**Possible mechanisms (NOT investigated tonight — separate session):**
+
+1. Pattern definition relies on a memecoin-specific upstream signal that stopped producing data (e.g., a pump.fun watcher, a specific scorer signal, a memecoin-pipeline gate)
+2. The chain pattern-matching code path has a bug that skipped memecoin pipeline starting 2026-05-04 (regression introduced by a PR around that date)
+3. Real-world tokens no longer match the pattern (regime change) — but 8 days of zero would be statistically suspicious for a 257-match-in-3-weeks pattern
+4. PR #64 (`cbb1e7f`, merged 2026-05-04) itself introduced a regression in the writer path that prevents chain_matches from being written even when pattern-matches occur
+
+**Why this is significant beyond §2.7:**
+
+PR #64's intent was to populate `mcap_at_completion` at chain_match write time. The investigation showed **zero** post-PR-#64 chain_matches have `mcap_at_completion` populated — because zero chain_matches exist at all. If hypothesis (4) is correct, PR #64 silently broke the writer path it was supposed to enhance. This would be a §2.9-shape silent regression — the fix shipped, looks like it should work, but the upstream that fires it stopped firing on the same day.
+
+**Diagnostic order for next session (~30-45 min):**
+
+1. Git-blame `scout/chains/tracker.py` around `_record_chain_complete` for commits between 2026-05-03 and 2026-05-04. If PR #64 changed write-site logic, bisect.
+2. Test the upstream signal flow: query whether the pre-conditions for volume_breakout pattern (whatever those are — need to read pattern definition) are firing post-2026-05-04. If pre-conditions fire but matches don't, regression in match logic. If pre-conditions don't fire, upstream issue.
+3. If hypothesis (4) confirmed: revert or rewrite the PR #64 writer change so memecoin chain_matches start flowing again, allowing the new hydration path to actually run.
+
+**§2.12 status: filed-as-new-finding.** Severity HIGH (BL-074 chain-completed dispatch depends on memecoin chain_matches; 8 days of zero matches is operational impact). Deferred to a dedicated session per the BL-071a sequencing discipline — investigation of (Y) requires fresh head and reading more code than the diagnosis tonight had budget for.
+
 ### §2.8 [MEDIUM] `high_peak_fade_audit` only 7 rows
 
 BL-NEW-HPF deployed 2026-05-04 per memory. 7 audit rows in 7 days = 1/day. Could be legitimately rare (high-peak fades only fire on tokens that reach high peaks) or could indicate the detector is partially broken. **Worth a manual cross-check** against trades with peak_pct ≥ HPF threshold to verify expected fire rate.
