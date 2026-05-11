@@ -959,3 +959,143 @@ async def test_revive_after_operator_suspend_then_revive_first_time_succeeds(
     )
     assert (await cur.fetchone())[0] == 1
     await db.close()
+
+
+# --- §2.9 silent-rendering fix (parse_mode=None + dispatched/delivered logs) ---
+#
+# Trigger evidence: trending_catch was auto-suspended 2026-05-11T01:00:26Z via
+# hard_loss; signal_params_audit ID 22 confirms the path fired. Live curl-direct
+# replay against Telegram API confirmed HTTP 200 with rendered body
+# `trendingcatch ... (hardloss)` and italics entities consuming the underscores.
+# Operator did not recognize the mangled alert. Fix: pass parse_mode=None so the
+# message renders as plain text. Defense-in-depth: dispatched/delivered structured
+# logs make every fire traceable in journalctl even when delivery succeeds (the
+# alerter only logs on failure).
+
+
+def _install_fake_alerter(monkeypatch, capture: list):
+    """Pre-inject ``scout.alerter`` into ``sys.modules`` so auto_suspend's
+    ``from scout import alerter`` local-import never loads aiohttp. On
+    Windows the real import triggers an OpenSSL Applink crash inside the
+    .venv (see ``feedback_windows_venv_openssl_state.md``) — pre-injection
+    bypasses the crash without skipping the test."""
+    import sys
+    import types
+
+    async def _capture_send(text, session, settings, **kwargs):
+        capture.append({"text": text, **kwargs})
+
+    fake = types.ModuleType("scout.alerter")
+    fake.send_telegram_message = _capture_send
+    monkeypatch.setitem(sys.modules, "scout.alerter", fake)
+
+
+async def test_hard_loss_alert_uses_plain_text_and_traces(
+    tmp_path, settings_factory, monkeypatch
+):
+    """§2.9 fix — hard_loss Telegram alert MUST pass parse_mode=None and emit
+    dispatched + delivered structured logs."""
+    import structlog
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    for _ in range(20):
+        await _insert_closed_trade(db, signal_type="gainers_early", pnl_usd=-50)
+    await db._conn.commit()
+
+    captured_kwargs: list[dict] = []
+    _install_fake_alerter(monkeypatch, captured_kwargs)
+
+    s = settings_factory(
+        SIGNAL_PARAMS_ENABLED=True,
+        SIGNAL_SUSPEND_PNL_THRESHOLD_USD=-200.0,
+        SIGNAL_SUSPEND_HARD_LOSS_USD=-500.0,
+        SIGNAL_SUSPEND_MIN_TRADES=50,
+    )
+
+    fake_session = object()  # non-None — exercises the alerter branch
+    with structlog.testing.capture_logs() as log_events:
+        suspended = await maybe_suspend_signals(db, s, session=fake_session)
+
+    assert any(
+        x["signal_type"] == "gainers_early" and x["reason"] == "hard_loss"
+        for x in suspended
+    ), "hard_loss path must fire for n=20 / net=-$1000 cohort"
+
+    assert len(captured_kwargs) == 1, (
+        f"expected exactly 1 send_telegram_message call; got "
+        f"{len(captured_kwargs)}"
+    )
+    payload = captured_kwargs[0]
+    assert payload.get("parse_mode") is None, (
+        f"parse_mode MUST be None to avoid Markdown silent-rendering of "
+        f"underscore-containing signal names (e.g., gainers_early, hard_loss). "
+        f"Got parse_mode={payload.get('parse_mode')!r}. See §2.9 finding."
+    )
+    assert "gainers_early" in payload["text"]
+    assert "hard_loss" in payload["text"]
+
+    events = {e["event"] for e in log_events}
+    assert "auto_suspend_alert_dispatched" in events, (
+        "dispatched trace log missing — needed for journalctl observability "
+        "of every alert fire regardless of delivery outcome"
+    )
+    assert "auto_suspend_alert_delivered" in events, (
+        "delivered trace log missing — needed to distinguish "
+        "alerter-returned-cleanly from hung/exception path"
+    )
+    dispatched = next(
+        e for e in log_events if e["event"] == "auto_suspend_alert_dispatched"
+    )
+    assert dispatched["signal_type"] == "gainers_early"
+    assert dispatched["reason"] == "hard_loss"
+
+    await db.close()
+
+
+async def test_pnl_threshold_alert_uses_plain_text_and_traces(
+    tmp_path, settings_factory, monkeypatch
+):
+    """§2.9 fix — pnl_threshold Telegram alert MUST pass parse_mode=None and
+    emit dispatched + delivered structured logs."""
+    import structlog
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    # 60 small losers — pnl_threshold path, not hard_loss
+    for _ in range(60):
+        await _insert_closed_trade(db, signal_type="gainers_early", pnl_usd=-10)
+    await db._conn.commit()
+
+    captured_kwargs: list[dict] = []
+    _install_fake_alerter(monkeypatch, captured_kwargs)
+
+    s = settings_factory(
+        SIGNAL_PARAMS_ENABLED=True,
+        SIGNAL_SUSPEND_PNL_THRESHOLD_USD=-200.0,
+        SIGNAL_SUSPEND_HARD_LOSS_USD=-5000.0,  # well below net=-$600 so HL skipped
+        SIGNAL_SUSPEND_MIN_TRADES=50,
+    )
+
+    fake_session = object()
+    with structlog.testing.capture_logs() as log_events:
+        suspended = await maybe_suspend_signals(db, s, session=fake_session)
+
+    assert any(
+        x["signal_type"] == "gainers_early" and x["reason"] == "pnl_threshold"
+        for x in suspended
+    ), "pnl_threshold path must fire for n=60 / net=-$600 cohort"
+
+    assert len(captured_kwargs) == 1
+    payload = captured_kwargs[0]
+    assert payload.get("parse_mode") is None, (
+        f"parse_mode MUST be None on pnl_threshold path too. "
+        f"Got parse_mode={payload.get('parse_mode')!r}."
+    )
+    assert "pnl_threshold" in payload["text"]
+
+    events = {e["event"] for e in log_events}
+    assert "auto_suspend_alert_dispatched" in events
+    assert "auto_suspend_alert_delivered" in events
+
+    await db.close()
