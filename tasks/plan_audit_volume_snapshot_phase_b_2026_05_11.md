@@ -441,6 +441,39 @@ async def snapshot_volume_history_for_phase_b(
         snapshotted_at=snapshotted_at,
     )
 
+    # 2b. Disk pre-flight (R2-C1 hard gate, post-script-start re-check).
+    # The bash wrapper does a pre-run check (catches deploy-time disk-low). This
+    # check catches mid-run drift: pipeline may have written a large batch in
+    # the seconds between bash-wrapper-start and Python-INSERT-start, eating
+    # the slack. Re-verify immediately before chunk loop. <10G free → abort
+    # cleanly; heartbeat file is NOT updated → watchdog at 10:00 UTC alerts
+    # via existing direct-curl Telegram path. Cost asymmetry (per locked
+    # decision 2026-05-11): hard-gate false-positive = 1 day missed snapshot
+    # (recoverable next run, ON CONFLICT DO NOTHING handles re-runs);
+    # warn-and-proceed false-negative = partial-write or disk-full mid-run
+    # corrupting audit data. Favor the safer gate.
+    import shutil
+
+    DISK_GATE_PATH = "/root"
+    DISK_GATE_THRESHOLD_GB = 10
+    free_bytes = shutil.disk_usage(DISK_GATE_PATH).free
+    free_gb = free_bytes / 1_000_000_000
+    if free_gb < DISK_GATE_THRESHOLD_GB:
+        logger.error(
+            "audit_snapshot_disk_gate_failed_at_insert_time",
+            path=DISK_GATE_PATH,
+            free_gb=round(free_gb, 2),
+            threshold_gb=DISK_GATE_THRESHOLD_GB,
+            coin_ids_count=len(coin_ids),
+            estimated_source_rows=estimated_source_rows,
+        )
+        raise RuntimeError(
+            f"Disk gate failed at INSERT time: {free_gb:.2f}G free at "
+            f"{DISK_GATE_PATH}, need {DISK_GATE_THRESHOLD_GB}G. "
+            f"Cohort={len(coin_ids)} coin_ids, estimated_rows={estimated_source_rows}. "
+            f"Heartbeat not updated; watchdog at 10:00 UTC will alert."
+        )
+
     # 3. Copy matching volume_history_cg rows with ON CONFLICT DO NOTHING.
     # SQLite parameter limit safety: chunk if cohort > 500 coin_ids.
     # Per-chunk commit (R2-M2 amendment): a single multi-chunk transaction
@@ -1007,6 +1040,51 @@ set -euo pipefail
 : "${GECKO_AUDIT_SOAK_END:?ERROR: GECKO_AUDIT_SOAK_END must be set}"
 : "${GECKO_AUDIT_HEARTBEAT_FILE:?ERROR: GECKO_AUDIT_HEARTBEAT_FILE must be set}"
 
+# R2-C1 hard gate: pre-run disk check.
+# Threshold = 10G free at $GECKO_DISK_GATE_PATH (default /root).
+# Locked 2026-05-11 after R2 design review found cohort generates ~177K rows
+# day-1 (2-3 orders of magnitude higher than initial plan estimate). On gate
+# failure: abort + Telegram alert via direct-curl (same mechanism as
+# gecko-audit-snapshot-watchdog.sh) so operator finds out at gate time, not
+# 6 hours later at watchdog cycle. Per locked decision: hard gate, NOT
+# warn-and-prompt — cron at 04:00 UTC is unattended; prompts go ignored.
+
+DISK_GATE_PATH="${GECKO_DISK_GATE_PATH:-/root}"
+DISK_GATE_THRESHOLD_GB="${GECKO_DISK_GATE_THRESHOLD_GB:-10}"
+
+free_gb=$(df -BG "$DISK_GATE_PATH" 2>/dev/null | tail -1 | awk '{print $4}' | sed 's/G//')
+if [[ ! "$free_gb" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: disk gate could not parse df output for $DISK_GATE_PATH (got: $free_gb)" >&2
+    exit 9  # 9 = disk-gate-parse-failure
+fi
+
+if (( free_gb < DISK_GATE_THRESHOLD_GB )); then
+    echo "DISK GATE FAILED: only ${free_gb}G free at $DISK_GATE_PATH, need ${DISK_GATE_THRESHOLD_GB}G" >&2
+
+    # Direct-curl Telegram alert. Mirrors gecko-audit-snapshot-watchdog.sh
+    # alert path (curl POST to bot API, check HTTP status, propagate non-200).
+    # Skipped if env is missing creds; the watchdog path also fires at 10:00
+    # UTC and catches heartbeat-not-updated separately.
+    ENV_FILE="${GECKO_ENV_FILE:-$GECKO_REPO/.env}"
+    if [[ -f "$ENV_FILE" ]]; then
+        TELEGRAM_BOT_TOKEN="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
+        TELEGRAM_CHAT_ID="$(grep -E '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
+        if [[ -n "$TELEGRAM_BOT_TOKEN" && "$TELEGRAM_BOT_TOKEN" != "placeholder" && -n "$TELEGRAM_CHAT_ID" && "$TELEGRAM_CHAT_ID" != "placeholder" ]]; then
+            TEXT="⚠️ gecko-audit-snapshot: DISK GATE FAILED — only ${free_gb}G free at ${DISK_GATE_PATH}, need ${DISK_GATE_THRESHOLD_GB}G. Snapshot aborted; investigate disk pressure before next 04:00 UTC fire."
+            PYTHON_BIN="$(command -v python3 || command -v python || true)"
+            if [[ -n "$PYTHON_BIN" ]]; then
+                PAYLOAD="$(GECKO_TG_TEXT="$TEXT" GECKO_TG_CHAT="$TELEGRAM_CHAT_ID" "$PYTHON_BIN" -c '
+import json, os
+print(json.dumps({"chat_id": os.environ["GECKO_TG_CHAT"], "text": os.environ["GECKO_TG_TEXT"]}))
+')"
+                curl -s -o /dev/null -w '' -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" \
+                    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" || true
+            fi
+        fi
+    fi
+    exit 8  # 8 = disk-gate-failure
+fi
+
 if [[ ! -d "$GECKO_REPO" ]]; then
     echo "ERROR: GECKO_REPO=$GECKO_REPO is not a directory" >&2
     exit 2
@@ -1391,80 +1469,32 @@ calls. 4 stub-driven tests cover fresh/stale/missing/corrupt heartbeat."
 
 ---
 
-## Task 6: Audit brief revisions
+## Task 6: Audit brief revisions [✅ ABSORBED INTO BRIEF RECREATION 2026-05-11]
 
 **Files:**
-- Modify: `tasks/audit_brief_phase_b_slow_burn_2026_05_11.md`
+- Affected: `tasks/audit_brief_phase_b_slow_burn_2026_05_11.md` (commit 3f2de5d)
 
-- [ ] **Step 1: Replace `price_cache` references with `audit_volume_snapshot_phase_b`**
+**Status:** All four originally-planned amendments + Q2 scope-limitation addition + end-of-soak runbook were baked in at brief recreation time (commit 3f2de5d on `feat/audit-volume-snapshot-phase-b`). The original brief was lost between branch switches; reconstruction from conversation history embedded the locked criteria (formerly §4.1/§4.2 of the lost findings doc) directly into the brief as §2 + §3, and applied all R1/R2 amendments inline. This task is therefore **complete via recreation, not via edit-existing-file**.
 
-Use Edit tool on `tasks/audit_brief_phase_b_slow_burn_2026_05_11.md`. Four locations:
+**Verification map — what's where in the recreated brief:**
 
-1. "Data path correctness (§9c discipline)" section: replace `price_cache` with `audit_volume_snapshot_phase_b`
-2. "Outcome metric operationalization" section: replace `price_cache` with `audit_volume_snapshot_phase_b`
-3. "Cross-references" section: update §4.1/§4.2/§9c references to reflect new data source
-4. Header "Related" line: add reference to this plan + the snapshot job
+| Original Task 6 amendment | Brief section in 3f2de5d | Verification grep |
+|---|---|---|
+| Step 1: `price_cache` → `audit_volume_snapshot_phase_b` | §4 (Data path correctness) | `grep -c "audit_volume_snapshot_phase_b" brief.md` should return 0 occurrences of `price_cache` and many of `audit_volume_snapshot_phase_b` |
+| Step 2: B2 tail validation spec | §8 (B3 hybrid tail validation) | `grep "Tail validation" brief.md` |
+| Step 3: Cross-token gap analysis spec | §7 (per-token dropout vs system-wide pause) | `grep "per_token_dropout" brief.md` |
+| Step 4: Data-source-lock clause | §11 (audit runs at D+14 regardless) | `grep "Data-source lock" brief.md` |
+| Q2 addition: scope limitation (no pre-detection ramp-up) | §10 (Scope limitations) | `grep "Pre-detection ramp-up" brief.md` |
+| End-of-soak runbook | §14 (operator SSH commands) | `grep "End-of-soak runbook" brief.md` |
+| Forward direction of Task 8 cross-reference | §15 (silent-failure-audit watchdog reference) | `grep "findings_silent_failure_audit" brief.md` |
 
-- [ ] **Step 2: Add B2 tail validation spec**
+The **fidelity check against conversation transcript** (verifying recreation matches locked language) is folded into Task 8's re-self-review (step E of the amendment trajectory). If any section's content drifted from conversation lock, that's a defect to fix via separate Edit on the brief — but the original Task 6 edit-existing-file work is no longer applicable.
 
-Append new section after "Outputs":
-
-```markdown
-## Tail validation (B3 hybrid spec)
-
-The primary CI runs on flat-price peak from `audit_volume_snapshot_phase_b` (60s cadence; intra-poll spikes bounded to ≤60s gaps). To validate the peak-fidelity assumption on the load-bearing subset:
-
-- Identify the top-N detections that drive the bootstrap-CI lower bound on `peak_achieved_pct` (suggest N = 15 OR top 25% of bootstrap-CI-lower-bound-driving detections, whichever is smaller)
-- For each of those N detections, query CG `/coins/{id}/ohlc?days=2` at audit time and recompute `peak_achieved_pct` from the OHLC `high` field
-- Report divergence: `flat_price_peak_pct vs ohlc_peak_pct` per detection, plus summary stats (mean divergence, max divergence, count of detections where ohlc_peak > flat_peak by >10%)
-- If divergence exceeds 10% for >30% of validated detections, escalate as a finding (flat-price peak materially under-reports OHLC peak for the load-bearing subset); primary CI lower bound is reported with the caveat
-
-CG rate limit: 30 req/min free tier. N=15 fits comfortably in one minute.
-```
-
-- [ ] **Step 3: Add cross-token gap analysis spec**
-
-Append new section before "Outputs":
-
-```markdown
-## Cross-token gap analysis (dropout vs ingest interruption)
-
-`volume_history_cg` writer (`scout/spikes/detector.py:record_volume`) silently skips coins that aren't in `_raw_markets_combined` (top-N CG markets response). Per-token dropout (token exited top-500-by-vol) looks identical to system-wide ingest pause at single-token analysis. Audit must distinguish:
-
-- For each detection's 48h window, compute per-token gap count (timestamps where no row exists for THIS coin_id but at least one row exists for some other coin_id in the cohort within the same minute-bucket)
-- Tag gaps as `per_token_dropout` (other tokens have rows, this one doesn't) vs `system_wide_pause` (no tokens have rows in the minute-bucket)
-- Report per-detection breakdown: `gap_minutes_total / per_token_dropout_minutes / system_wide_pause_minutes`
-
-Gap-rate distribution output (from "Outputs" section) is broken down by tag.
-```
-
-- [ ] **Step 4: Add data-source-lock clause**
-
-Append to "What this brief does NOT do" section:
-
-```markdown
-## Data-source lock (pre-registered 2026-05-11)
-
-Primary data source is `audit_volume_snapshot_phase_b` (populated by daily snapshot job per `tasks/plan_audit_volume_snapshot_phase_b_2026_05_11.md`). Tail validation source is CG `/coins/{id}/ohlc?days=2` at audit time.
-
-**At D+14 evaluation, audit runs against available data with explicit reporting of what's missing.** Coverage gaps in `audit_volume_snapshot_phase_b` (snapshot job failures, missed days, etc.) become a finding about the audit infrastructure — NOT a reason to extend the soak or defer evaluation. Soak extension is triggered ONLY by sample size (<35 detections per §4.1), never by data-quality concerns at audit time.
-
-This composes with the §4.1 extension rule: data quality is reported as a finding; sample size triggers extension; evaluation runs at D+14 against whatever data exists.
-```
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add tasks/audit_brief_phase_b_slow_burn_2026_05_11.md
-git commit -m "docs(audit): revise brief for audit_volume_snapshot_phase_b data source
-
-Four updates per locked decision 2026-05-11:
-1. price_cache → audit_volume_snapshot_phase_b (data-source correction)
-2. Add B2 tail validation spec (CG OHLC for top-N bootstrap-driving detections)
-3. Add cross-token gap analysis spec (distinguish dropout vs ingest pause)
-4. Add data-source-lock clause (audit runs at D+14 regardless of source completeness;
-   coverage gaps become findings, not extension triggers)"
-```
+- [x] **Step 1: Replace `price_cache` references** — done in recreation (§4 of brief)
+- [x] **Step 2: Add B2 tail validation spec** — done in recreation (§8 of brief)
+- [x] **Step 3: Add cross-token gap analysis spec** — done in recreation (§7 of brief)
+- [x] **Step 4: Add data-source-lock clause** — done in recreation (§11 of brief)
+- [x] **Step 5: Commit** — landed as commit 3f2de5d cherry-picked from d7ea51d after the recovery sequence; orphan reverted on `fix/tg-parse-mode-hygiene-audit` as b26be9f
 
 ---
 
@@ -1529,6 +1559,21 @@ Read `.ssh_pipeline_restart.txt`. Verify:
 - If you see `SCHEMA_DRIFT_DETECTED` in logs: do NOT proceed to Step 6. Capture the exception details, investigate (likely a transient lock from another writer), retry pipeline restart at a quieter time.
 - Pipeline service status after restart should be `active (running)` — verify with `systemctl status gecko-pipeline` if log inspection is inconclusive.
 
+- [ ] **Step 5.5: Pre-flight disk-space gate (R2-C1 hard gate, deploy-time check)**
+
+The plan's R2-C1 amendment locked a hard gate at 10G free disk space before any snapshot write. The bash wrapper does this on every run; the deploy-time check here is the operator's explicit pre-flight before invoking the bootstrap. The reason for both: empirical disk consumption is 2-3 orders of magnitude higher than the initial plan estimate (cohort generates ~177K rows day-1 per R2 verification); ongoing visibility matters as much as one-time check.
+
+```bash
+ssh root@89.167.116.187 'echo "--- df check ---"; df -h /root; echo "--- backup directory ---"; ls -lh /root/gecko-alpha/scout.db.bak* 2>/dev/null | head -5 || echo "(no backups visible)"; echo "--- estimated cohort size ---"; sqlite3 /root/gecko-alpha/scout.db "SELECT COUNT(DISTINCT coin_id) FROM slow_burn_candidates WHERE datetime(detected_at) >= datetime(\"2026-05-10T00:00:00\")"; echo "--- estimated source rows ---"; sqlite3 /root/gecko-alpha/scout.db "SELECT COUNT(*) FROM volume_history_cg WHERE coin_id IN (SELECT DISTINCT coin_id FROM slow_burn_candidates WHERE datetime(detected_at) >= datetime(\"2026-05-10T00:00:00\"))"' > .ssh_disk_preflight.txt 2>&1
+```
+
+Read `.ssh_disk_preflight.txt`. Verify:
+- `df -h /root` shows **at least 10G free** in the `Avail` column. If below 10G: ABORT this deploy. Cleanup backups (per `feedback_vps_backup_rotation.md`), wait for `gecko-backup.timer` to rotate, OR free space manually before retrying. Do NOT proceed.
+- Backup directory size is reasonable (no orphan multi-GB files from interrupted backups).
+- Cohort size and estimated source rows are within expectations (cohort grows during soak; check that the numbers are plausible for the time-since-2026-05-10).
+
+**This gate is intentionally strict.** Per locked decision 2026-05-11: hard gate at <10G free, abort with visibility. Cron at 04:00 UTC is unattended; warn-and-prompt assumes operator presence that won't exist. Cost asymmetry favors the safer gate.
+
 - [ ] **Step 6: Bootstrap snapshot (manual run before scheduled timer fires)**
 
 Critical: this captures all CURRENTLY-EXISTING `volume_history_cg` rows for the 56-detection cohort before any get pruned. If we wait for the next scheduled 04:00 UTC fire, rows recorded today (2026-05-11) that get pruned on 2026-05-18 are still safe; but rows from earliest 2026-05-10 detections are at risk (prune at 2026-05-17). Bootstrap-now eliminates the timing risk.
@@ -1541,6 +1586,45 @@ Read `.ssh_bootstrap_snapshot.txt`. Expected:
 - `audit_snapshot_completed` structured log with `rows_captured` > 0 and `coin_ids_covered` matching the slow_burn cohort size at time of run
 - `audit_snapshot_cli_completed` log
 - systemd shows `Finished Gecko-Alpha — Phase B audit-snapshot...` and `(success)`
+
+- [ ] **Step 6.5: Expected-vs-actual coverage verification (R2-M1 amendment)**
+
+After bootstrap, verify which detections actually got their pre-detection window captured. Any detection whose earliest snapshotted row is AFTER its `detected_at` indicates data was already pruned before bootstrap could capture it. This is informational — for the audit's locked `[detected_at, +48h]` forward window, pre-detection data isn't load-bearing — but the coverage report is the operator's signal of how much pre-detection context was lost to prune-timing.
+
+```bash
+ssh root@89.167.116.187 'sqlite3 -header -column /root/gecko-alpha/scout.db "
+  WITH cohort AS (
+    SELECT coin_id, MIN(detected_at) AS first_detected
+    FROM slow_burn_candidates
+    WHERE datetime(detected_at) >= datetime(\"2026-05-10T00:00:00\")
+    GROUP BY coin_id
+  ),
+  snapshot_coverage AS (
+    SELECT coin_id, MIN(recorded_at) AS earliest_in_audit, MAX(recorded_at) AS latest_in_audit, COUNT(*) AS row_count
+    FROM audit_volume_snapshot_phase_b
+    GROUP BY coin_id
+  )
+  SELECT
+    c.coin_id,
+    c.first_detected,
+    s.earliest_in_audit,
+    s.row_count,
+    CASE
+      WHEN s.earliest_in_audit IS NULL THEN \"NO COVERAGE\"
+      WHEN datetime(s.earliest_in_audit) > datetime(c.first_detected) THEN \"PRE-DETECTION TRUNCATED\"
+      ELSE \"FULL COVERAGE\"
+    END AS coverage_status
+  FROM cohort c LEFT JOIN snapshot_coverage s USING (coin_id)
+  ORDER BY coverage_status, c.first_detected
+"' > .ssh_coverage_verify.txt 2>&1
+```
+
+Read `.ssh_coverage_verify.txt`. Tally the three `coverage_status` buckets:
+- **FULL COVERAGE**: pre-detection context preserved (snapshot's earliest row is AT OR BEFORE first detected_at). Best outcome.
+- **PRE-DETECTION TRUNCATED**: snapshot's earliest row is AFTER detected_at — pre-detection ramp-up rows were already pruned before bootstrap captured the cohort. Acceptable per §10 of audit brief (pre-detection scope explicitly NOT load-bearing for the locked audit gate).
+- **NO COVERAGE**: snapshot has zero rows for this coin_id — token must have dropped out of CG markets response entirely between detection and bootstrap. Flag for investigation; possibly an audit-coverage hole that affects the forward `[detected_at, +48h]` window too.
+
+If any detection lands in NO COVERAGE: investigate before proceeding. If many lands in PRE-DETECTION TRUNCATED: expected and consistent with §10 scope limitation. If all in FULL COVERAGE: bootstrap was timely.
 
 - [ ] **Step 7: Verify heartbeat file written**
 
@@ -1616,60 +1700,117 @@ EOF
 )"
 ```
 
-- [ ] **Step 12: Capture deployment summary**
+- [ ] **Step 12: Capture deployment summary (with operator-disable runbook at top)**
 
-Document in `tasks/plan_audit_volume_snapshot_phase_b_2026_05_11.md` (append at bottom) or in a separate `tasks/deployed_audit_snapshot_2026_05_11.md`:
+Create `tasks/deployed_audit_snapshot_2026_05_11.md` (separate file, not appended to plan) with the following structure. The **operator-must-disable step lands at the TOP** so it's visible at the calendar moment without scrolling — per R2-M3 amendment, end-of-soak handoff must be in a doc the operator actually visits when D+14 arrives.
 
-- PR number + merge commit hash
-- Bootstrap snapshot row count + coin_ids covered
-- First scheduled run time (next 04:00 UTC after deploy)
-- Watchdog smoke test result
-- Any deviations from plan (should be zero per pre-registration)
+```markdown
+# Phase B audit-snapshot deployed — runbook + summary
+
+## ⚠️ OPERATOR ACTION REQUIRED on 2026-05-25 (D+15)
+
+After the final scheduled run completes at 04:00 UTC on 2026-05-25, **disable the timers**:
+
+\`\`\`bash
+# Branch-verification not needed here (no commits); just SSH
+ssh root@89.167.116.187 'systemctl disable --now gecko-audit-snapshot.timer && systemctl disable --now gecko-audit-snapshot-watchdog.timer && systemctl list-timers gecko-audit-snapshot* --no-pager' > .ssh_disable_audit.txt 2>&1
+\`\`\`
+
+Verify both timers show as `inactive` / `disabled` in the output. The audit table `audit_volume_snapshot_phase_b` is preserved indefinitely as the audit artifact — do NOT drop it. The D+14 audit reads from this table on 2026-05-24.
+
+After D+14 audit completes and findings are written: optionally compress/archive the table if disk pressure rises. Otherwise leave in place.
+
+---
+
+## Deployment summary
+
+**Date deployed:** YYYY-MM-DD HH:MM UTC
+**PR:** #NNN (merged at commit HASH)
+**Branch:** feat/audit-volume-snapshot-phase-b → master
+
+### Bootstrap snapshot result
+
+- **rows_captured:** N
+- **coin_ids_covered:** M (slow_burn cohort size at bootstrap time)
+- **estimated_source_rows:** K (from pre-INSERT log)
+- **Coverage report (per Step 6.5):**
+  - FULL COVERAGE: X coins
+  - PRE-DETECTION TRUNCATED: Y coins (expected per §10 of brief)
+  - NO COVERAGE: Z coins (Z must be 0; if not, investigation required)
+
+### Verifications
+
+- [x] Heartbeat file written at `/var/lib/gecko-alpha/audit-snapshot/snapshot-last-ok` with valid unix timestamp
+- [x] Audit table row count > 0
+- [x] Both timers enabled with next-fire times
+- [x] Watchdog smoke test: deleted heartbeat → STALE detected → Telegram delivered HTTP 200 → heartbeat restored
+- [x] Disk pre-flight passed (df -h /root showed at least 10G free at deploy time)
+
+### First scheduled run
+
+Next 04:00 UTC fire: YYYY-MM-DD 04:00 UTC. Will verify journalctl after that fire confirms `audit_snapshot_completed` log + heartbeat update.
+
+### Deviations from plan
+
+(Should be zero per pre-registration. Document any here.)
+
+### Cross-references
+
+- Plan: `tasks/plan_audit_volume_snapshot_phase_b_2026_05_11.md`
+- Brief: `tasks/audit_brief_phase_b_slow_burn_2026_05_11.md` §14 (end-of-soak runbook — duplicate of the action-required block above)
+- Parallel discipline: `tasks/findings_silent_failure_audit_2026_05_11.md` §4 Priority 6 (table-freshness watchdog daemon TODO)
+- Backlog entry: BL-NEW-AUDIT-SNAPSHOT (added 2026-05-11 per Task 9 of plan)
+```
+
+The deployed-summary file lives alongside the plan + brief in `tasks/`. Operator sees it when they navigate to the audit work at any future point. The action-required block at the top is the load-bearing element — D+14 evaluation reads brief §14 and post-deploy memory file simultaneously; both have the same disable command.
 
 ---
 
 ---
 
-## Task 8: Cross-reference amendment for parallel discipline workstreams
+## Task 8: Cross-reference amendment for parallel discipline workstreams [✅ BOTH DIRECTIONS APPLIED 2026-05-11]
 
 **Files:**
-- Modify: `tasks/audit_brief_phase_b_slow_burn_2026_05_11.md` (add cross-reference paragraph)
-- Modify: `tasks/findings_silent_failure_audit_2026_05_11.md` (add TODO linking to `audit_volume_snapshot_phase_b` as a monitored table)
+- Affected: `tasks/audit_brief_phase_b_slow_burn_2026_05_11.md` §15 (forward direction)
+- Affected: `tasks/findings_silent_failure_audit_2026_05_11.md` §4 Priority 6 (reverse direction)
 
-**Rationale:** Two parallel discipline workstreams are converging on related watchdog infrastructure on the same day (2026-05-11):
+**Rationale:** Two parallel discipline workstreams converging on related watchdog infrastructure on 2026-05-11:
 
 - This plan: snapshot-job heartbeat watchdog (per-job-run staleness)
-- `findings_silent_failure_audit_2026_05_11.md`: table-freshness watchdog daemon (per-table-write staleness)
+- `findings_silent_failure_audit_2026_05_11.md`: table-freshness watchdog daemon (per-table-write staleness — deferred to Priority 6 of that doc)
 
-Different concerns, no functional overlap. But stacked failures (snapshot job silently dies AND the snapshot-job watchdog also fails) would let the audit data source silently degrade without alert. Adding `audit_volume_snapshot_phase_b` to the silent-failure-audit watchdog's monitored-tables list provides defense-in-depth.
+Different concerns, no functional overlap. Stacked-failure mode (snapshot job silently dies AND the snapshot-job watchdog also fails) would let the audit data source silently degrade without alert. Adding `audit_volume_snapshot_phase_b` to the silent-failure-audit watchdog's monitored-tables list provides defense-in-depth.
 
-This is also the third recent instance of parallel discipline workstreams converging on shared primitives without cross-reference (closed-trades-pagination + live-trading-m1-5b WIP contention; BL-075 Phase A drift-check; now this). Building the cross-reference now while both workstreams are fresh is cheaper than building it once either ships and the connection becomes archaeology.
+Third recent instance of parallel discipline workstreams converging on shared primitives without cross-reference (closed-trades-pagination + live-trading-m1-5b WIP contention; BL-075 Phase A drift-check; now this).
 
-- [ ] **Step 1: Edit `tasks/audit_brief_phase_b_slow_burn_2026_05_11.md` — add cross-reference paragraph**
+- [x] **Step 1: Forward direction — audit brief §15 references silent-failure-audit watchdog**
 
-Use Edit tool. Add a new line to the "Cross-references" section:
+Landed during brief recreation 2026-05-11 (commit 3f2de5d). The §15 entry reads:
 
-```markdown
-- Parallel discipline workstream: `tasks/findings_silent_failure_audit_2026_05_11.md` (same date) proposes a table-freshness watchdog daemon. When that ships, `audit_volume_snapshot_phase_b` should be on its monitored-tables list — provides defense-in-depth against stacked-failure mode (snapshot job dies + snapshot-job watchdog also dies).
-```
+> `tasks/findings_silent_failure_audit_2026_05_11.md` (same date) — parallel discipline workstream proposing a table-freshness watchdog daemon. When that ships, `audit_volume_snapshot_phase_b` should be on its monitored-tables list — provides defense-in-depth against stacked-failure mode (snapshot job dies + snapshot-job watchdog also dies).
 
-- [ ] **Step 2: Edit `tasks/findings_silent_failure_audit_2026_05_11.md` — add TODO**
+- [x] **Step 2: Reverse direction — TODO in `findings_silent_failure_audit_2026_05_11.md`**
 
-Use Edit tool. Add a TODO to the watchdog-daemon-proposal section (locate via Grep for the proposed primitives list in §4 of that doc):
+Landed at the end of **§4 Priority 6 (Watchdog daemon)** of that doc, immediately after the "Estimated build" line. Target section identified by grep on `^### Priority 6` 2026-05-11. The TODO content:
 
-```markdown
-**TODO (added 2026-05-11):** When implementing watchdog daemon's monitored-tables list, include `audit_volume_snapshot_phase_b` per `tasks/plan_audit_volume_snapshot_phase_b_2026_05_11.md`. The snapshot-job's own watchdog (`gecko-audit-snapshot-watchdog.timer`) covers heartbeat-file staleness; this daemon covers table-write-staleness — siblings, not redundant.
-```
+> **TODO (added 2026-05-11):** When implementing the watchdog daemon's monitored-tables list, include `audit_volume_snapshot_phase_b` per `tasks/plan_audit_volume_snapshot_phase_b_2026_05_11.md`. The snapshot-job's own watchdog (`gecko-audit-snapshot-watchdog.timer`) covers heartbeat-file staleness (per-run cessation); this daemon would cover table-write-staleness (per-table-row cessation) — siblings, not redundant. Stacked-failure mode the cross-reference prevents: snapshot job dies + snapshot-job-watchdog also dies → audit table silently stops receiving rows. With both watchdogs in place, either failure alerts independently.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Commit (pending — bundled with other plan amendments in scope F)**
 
 ```bash
-git add tasks/audit_brief_phase_b_slow_burn_2026_05_11.md tasks/findings_silent_failure_audit_2026_05_11.md
+# Branch-verification pattern (locked 2026-05-11 after fix/tg-parse-mode-hygiene-audit incident):
+CURRENT=$(git branch --show-current)
+[[ "$CURRENT" == "feat/audit-volume-snapshot-phase-b" ]] || { echo "WRONG BRANCH: $CURRENT"; exit 1; }
+
+git add tasks/findings_silent_failure_audit_2026_05_11.md tasks/plan_audit_volume_snapshot_phase_b_2026_05_11.md
 git commit -m "docs(audit): cross-reference snapshot-job watchdog and table-freshness watchdog
+
+Reverse-direction TODO lands at §4 Priority 6 of findings_silent_failure_audit_2026_05_11.md
+(forward direction already in audit brief §15 via recreation commit 3f2de5d).
 
 Two parallel discipline workstreams converging on related watchdog
 infrastructure on 2026-05-11: this plan's snapshot-job heartbeat watchdog
-(per-job-run staleness) and findings_silent_failure_audit's proposed
+(per-job-run staleness) and findings_silent_failure_audit's deferred-Priority-6
 table-freshness watchdog daemon (per-table-write staleness).
 
 Different concerns, no functional overlap, but stacked failures would
@@ -1677,6 +1818,35 @@ let the audit data source silently degrade. Cross-reference adds the
 snapshot table to the silent-failure-audit watchdog's monitored-tables
 list — defense-in-depth, not redundant."
 ```
+
+---
+
+## Task 9: Backlog entry for BL-NEW-AUDIT-SNAPSHOT [✅ APPLIED 2026-05-11]
+
+**Files:**
+- Modify: `backlog.md` (added BL-NEW-AUDIT-SNAPSHOT entry under "P2 — Infrastructure & Reliability" after BL-NEW-INGEST-WATCHDOG)
+
+**Rationale (R2-M4):** Without a backlog entry, when the snapshot job lands as `BL-NEW-AUDIT-SNAPSHOT shipped` in next-session memory, it maps to nothing in backlog.md. Memory entries follow the pattern `BL-NNN deployed YYYY-MM-DD` → memory file; the backlog entry is the anchor for post-deploy summary writing. Adding it pre-merge is the cheap fix.
+
+- [x] **Step 1: Insert BL-NEW-AUDIT-SNAPSHOT entry in backlog.md**
+
+Landed 2026-05-11 (commit pending in scope F). Entry placed between BL-NEW-INGEST-WATCHDOG (line 233) and BL-034 (line 245), in the "P2 — Infrastructure & Reliability" section. Mirrors BL-NEW-INGEST-WATCHDOG's structure (Status / Tag / Files (planned) / Why / Drift verdict / Hermes verdict / Effect / Risks / Pre-registration discipline / Cross-references / Estimate).
+
+- [x] **Step 2: Update entry status on deploy (post-merge, post-bootstrap)**
+
+After successful bootstrap snapshot + timer enable (Task 7 Steps 6-9), update the entry's **Status** line from `PLANNED` to `SHIPPED YYYY-MM-DD (commit HASH)`. Use the branch-verification pattern for any commit on backlog.md:
+
+```bash
+CURRENT=$(git branch --show-current)
+[[ "$CURRENT" == "feat/audit-volume-snapshot-phase-b" ]] || { echo "WRONG BRANCH: $CURRENT"; exit 1; }
+# Edit backlog.md status line, then:
+git add backlog.md
+git commit -m "docs(backlog): BL-NEW-AUDIT-SNAPSHOT SHIPPED YYYY-MM-DD"
+```
+
+- [ ] **Step 3: Commit pre-deploy entry (bundled with other plan amendments in scope F)**
+
+Initial entry commit (PLANNED status); status flip to SHIPPED happens post-deploy per Step 2.
 
 ---
 
