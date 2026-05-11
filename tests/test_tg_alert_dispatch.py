@@ -402,3 +402,163 @@ async def test_default_allow_signals_constant():
     assert "volume_spike" in DEFAULT_ALLOW_SIGNALS
     assert "chain_completed" not in DEFAULT_ALLOW_SIGNALS
     assert "first_signal" not in DEFAULT_ALLOW_SIGNALS
+
+
+# ---------- M1.5c integration tests ----------
+
+
+def test_format_with_minara_command_includes_run_line():
+    """M1.5c: when minara_command is provided, body has 'Run: minara swap...' line."""
+    body = format_paper_trade_alert(
+        signal_type="gainers_early",
+        symbol="BONK",
+        coin_id="bonk",
+        entry_price=0.0001,
+        amount_usd=10.0,
+        signal_data={"price_change_24h": 50.0, "mcap": 2_000_000},
+        minara_command="minara swap --from USDC --to ABC123 --amount-usd 10",
+    )
+    assert "Run: minara swap --from USDC --to ABC123 --amount-usd 10" in body
+    # Run: line appears BEFORE coingecko link
+    lines = body.split("\n")
+    run_idx = next(i for i, l in enumerate(lines) if l.startswith("Run:"))
+    link_idx = next(i for i, l in enumerate(lines) if "coingecko.com" in l)
+    assert run_idx < link_idx
+
+
+def test_format_without_minara_command_unchanged():
+    """M1.5c: when minara_command is None, format matches pre-M1.5c output."""
+    body = format_paper_trade_alert(
+        signal_type="gainers_early",
+        symbol="BTC",
+        coin_id="bitcoin",
+        entry_price=50000.0,
+        amount_usd=100.0,
+        signal_data={"price_change_24h": 30.0, "mcap": 1_000_000_000_000},
+        minara_command=None,
+    )
+    assert "Run:" not in body
+
+
+@pytest.mark.asyncio
+async def test_notify_includes_minara_command_for_solana_token(tmp_path, monkeypatch):
+    """End-to-end: Solana token paper-trade-open alert includes Run: line."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings()
+    await _insert_paper_trade(db, trade_id=42)
+    sent = []
+
+    async def _fake_send(text, session, settings, parse_mode=None):
+        sent.append(text)
+
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+
+    _SPL = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+
+    async def _fake_detail(session, coin_id, api_key=""):
+        return {"platforms": {"solana": _SPL}}
+
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
+
+    await notify_paper_trade_opened(
+        db,
+        settings,
+        session=object(),  # non-None for session-guard
+        paper_trade_id=42,
+        signal_type="gainers_early",
+        token_id="bonk",
+        symbol="BONK",
+        entry_price=0.0001,
+        amount_usd=10.0,
+        signal_data={"price_change_24h": 50.0, "mcap": 2_000_000},
+    )
+    assert len(sent) == 1
+    assert f"Run: minara swap --from USDC --to {_SPL}" in sent[0]
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_notify_no_minara_command_for_evm_only_token(tmp_path, monkeypatch):
+    """Token with platforms.ethereum but no platforms.solana → no Run: line."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings()
+    await _insert_paper_trade(db, trade_id=42)
+    sent = []
+
+    async def _fake_send(text, session, settings, parse_mode=None):
+        sent.append(text)
+
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+
+    async def _fake_detail(session, coin_id, api_key=""):
+        return {"platforms": {"ethereum": "0xabc"}}
+
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
+
+    await notify_paper_trade_opened(
+        db,
+        settings,
+        session=object(),
+        paper_trade_id=42,
+        signal_type="gainers_early",
+        token_id="random",
+        symbol="RND",
+        entry_price=1.0,
+        amount_usd=10.0,
+        signal_data={"price_change_24h": 30.0, "mcap": 5_000_000},
+    )
+    assert len(sent) == 1
+    assert "Run:" not in sent[0]
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_notify_demotes_sent_row_on_cancelled_error_during_minara_lookup(
+    tmp_path, monkeypatch
+):
+    """PR-V2-I1 fold: asyncio.CancelledError raised inside maybe_minara_command
+    (network interrupted, task cancelled mid-fetch) must NOT leave the
+    pre-emptive 'sent' row stuck — that would suppress the cooldown for 6h.
+    Demote to 'dispatch_failed' then re-raise."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _send_never_called(*args, **kwargs):
+        raise AssertionError("send should not be called on cancel")
+
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _send_never_called)
+
+    async def _cancel_mid_fetch(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        "scout.trading.minara_alert.maybe_minara_command", _cancel_mid_fetch
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await notify_paper_trade_opened(
+            db,
+            settings,
+            session=object(),
+            paper_trade_id=42,
+            signal_type="gainers_early",
+            token_id="bonk",
+            symbol="BONK",
+            entry_price=0.0001,
+            amount_usd=10.0,
+            signal_data={"price_change_24h": 50.0, "mcap": 2_000_000},
+        )
+
+    # Sentinel row must have been demoted, NOT left as 'sent'.
+    cur = await db._conn.execute(
+        "SELECT outcome, detail FROM tg_alert_log "
+        "WHERE token_id='bonk' ORDER BY id DESC LIMIT 1"
+    )
+    outcome, detail = await cur.fetchone()
+    assert outcome == "dispatch_failed"
+    assert "cancel" in (detail or "").lower()
+    await db.close()

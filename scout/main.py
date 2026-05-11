@@ -1005,6 +1005,64 @@ async def _maybe_announce_tg_alerts(db, session, settings) -> None:
         logger.exception("tg_alert_announcement_failed")
 
 
+async def _maybe_announce_m1_5c(db, session, settings) -> None:
+    """BL-NEW-M1.5C: Minara DEX-eligibility onboarding announcement.
+
+    Fires ONCE per database lifetime, gated on:
+    - MINARA_ALERT_ENABLED=True (default; honors the feature flag)
+    - Separate sentinel 'm1_5c_announcement_sent' in tg_alert_log
+      (independent from M1.5b's 'announcement_sent')
+
+    R2-C2 design-stage fold. R1-I1 fold: separate from M1.5b function to
+    avoid refactor regression.
+    """
+    if db._conn is None:
+        return
+    if not getattr(settings, "MINARA_ALERT_ENABLED", True):
+        return
+    try:
+        cur = await db._conn.execute(
+            "SELECT 1 FROM tg_alert_log "
+            "WHERE outcome='m1_5c_announcement_sent' LIMIT 1"
+        )
+        if await cur.fetchone():
+            return  # already announced
+    except Exception:
+        logger.exception("tg_alert_m1_5c_announcement_check_failed")
+        return
+
+    body = (
+        "📢 M1.5c — Minara DEX-eligibility extension active\n"
+        "Solana-listed tokens now include a copy-pasteable command:\n"
+        "  Run: minara swap --from USDC --to <addr> --amount-usd N\n"
+        "\n"
+        "First-time setup (one-time, on your local terminal):\n"
+        "1. npm install -g minara@latest\n"
+        "2. minara login --device  (browser device-code OAuth)\n"
+        "3. minara deposit  (fund USDC + SOL gas on Solana)\n"
+        "Docs: https://github.com/Minara-AI/skills\n"
+        "\n"
+        "Default size: $10. Override via .env MINARA_ALERT_AMOUNT_USD=N.\n"
+        "Disable: MINARA_ALERT_ENABLED=False + restart.\n"
+        "Tip: long-press the `Run:` line to copy only that line.\n"
+        "Note: gecko-alpha does NOT execute — Minara prompts before swap."
+    )
+    try:
+        await alerter.send_telegram_message(body, session, settings, parse_mode=None)
+        async with db._txn_lock:
+            await db._conn.execute(
+                "INSERT INTO tg_alert_log "
+                "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
+                "VALUES (NULL, 'announcement', '_system', ?, "
+                "'m1_5c_announcement_sent')",
+                (datetime.now(timezone.utc).isoformat(),),
+            )
+            await db._conn.commit()
+        logger.info("tg_alert_m1_5c_announcement_sent")
+    except Exception:
+        logger.exception("tg_alert_m1_5c_announcement_failed")
+
+
 async def _drain_pending_live_tasks(paper_trader, timeout_sec: float = 5.0) -> None:
     """Drain any in-flight PaperTrader live-handoff tasks before DB close.
 
@@ -1348,6 +1406,8 @@ async def main(argv: list[str] | None = None) -> int:
             # exactly once per database lifetime regardless of restart
             # count.
             await _maybe_announce_tg_alerts(db, session, settings)
+            # M1.5c addition (R1-I1 fold: separate function, separate sentinel)
+            await _maybe_announce_m1_5c(db, session, settings)
 
             async def _pipeline_loop() -> None:
                 nonlocal cycle_count

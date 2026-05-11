@@ -28,6 +28,7 @@ already committed; only the TG alert + tg_alert_log row is lost.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import structlog
@@ -124,6 +125,7 @@ def format_paper_trade_alert(
     entry_price: float,
     amount_usd: float,
     signal_data: dict | None,
+    minara_command: str | None = None,
 ) -> str:
     """Concise single-line + extras Telegram body for a paper-trade open.
 
@@ -136,6 +138,10 @@ def format_paper_trade_alert(
 
     R2-format fold: header line is single-line glanceable; per-signal
     detail follows; CoinGecko link last for one-tap research.
+
+    BL-NEW-M1.5C: when `minara_command` is supplied (Solana-listed token),
+    appends a `Run: <cmd>` line BEFORE the coingecko link for operator
+    copy-paste into their local Minara CLI.
     """
     sd = signal_data or {}
     emoji = _SIGNAL_EMOJI.get(signal_type, "📊")
@@ -164,6 +170,10 @@ def format_paper_trade_alert(
     parts = [header]
     if detail:
         parts.append(detail)
+    if minara_command:
+        # M1.5c: copy-paste shell command for Solana DEX-eligible tokens.
+        # Inserted BEFORE the coingecko link so it's prominent.
+        parts.append(f"Run: {minara_command}")
     parts.append(link)
     return "\n".join(parts)
 
@@ -250,6 +260,39 @@ async def notify_paper_trade_opened(
             sent_row_id = cur.lastrowid
             await db._conn.commit()
 
+        # M1.5c BL-NEW-M1.5C: Minara DEX-eligibility check. After cooldown
+        # claim (outside lock) so 100-500ms CG latency doesn't extend
+        # lock-hold. Helper never raises Exception, but asyncio.CancelledError
+        # propagates per asyncio convention.
+        from scout.trading.minara_alert import maybe_minara_command
+
+        # PR-V2-I1 fold: on asyncio.CancelledError mid-fetch, the
+        # pre-emptive 'sent' row would otherwise block the per-token
+        # cooldown for 6h. Demote to 'dispatch_failed' then re-raise to
+        # honor cancellation semantics.
+        try:
+            minara_cmd = await maybe_minara_command(
+                session, settings, coin_id=token_id, amount_usd=amount_usd
+            )
+        except asyncio.CancelledError:
+            if sent_row_id is not None and db._conn is not None:
+                try:
+                    async with db._txn_lock:
+                        await db._conn.execute(
+                            "UPDATE tg_alert_log "
+                            "SET outcome='dispatch_failed', "
+                            "detail='cancelled_during_minara_lookup' "
+                            "WHERE id=?",
+                            (sent_row_id,),
+                        )
+                        await db._conn.commit()
+                except Exception:
+                    log.exception(
+                        "tg_alert_log_demote_failed_on_cancel",
+                        sent_row_id=sent_row_id,
+                    )
+            raise
+
         # V3-C1 PR-stage fold: format + dispatch BOTH inside the try.
         # If format raises (string mcap, list signal_data), the
         # pre-emptive 'sent' row would otherwise persist -> cooldown
@@ -262,6 +305,7 @@ async def notify_paper_trade_opened(
                 entry_price=entry_price,
                 amount_usd=amount_usd,
                 signal_data=signal_data,
+                minara_command=minara_cmd,
             )
             # R1-C1 fold: parse_mode=None to avoid Markdown 400 silent-fail
             await alerter.send_telegram_message(
