@@ -79,13 +79,11 @@ Add to `tests/audit/test_snapshot.py`:
 import pytest
 import aiosqlite
 from scout.db import Database
-from scout.config import Settings
 
 
 @pytest.mark.asyncio
 async def test_migration_creates_audit_volume_snapshot_table(tmp_path):
     """Schema migration creates audit_volume_snapshot_phase_b with correct columns + UNIQUE constraint."""
-    settings = Settings(_env_file=None)
     db_path = tmp_path / "test.db"
     db = Database(str(db_path))
     await db.connect()
