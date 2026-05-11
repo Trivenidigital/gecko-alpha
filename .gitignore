@@ -16,6 +16,18 @@ dashboard/frontend/node_modules/
 *.ssh_out*
 _*.py
 
+# SSH two-step diagnostic dumps (the bash→file→read pattern per CLAUDE.md)
+# Accumulate as `.ssh_<topic>.txt` during investigation sessions; never tracked
+.ssh_*.txt
+
+# Broken venv backups (e.g., .venv_broken_bak/ left by recovery operations)
+*_broken_bak/
+*.bak
+
+# Defensive: ad-hoc scratch / temp files
+.tmp_*
+.scratch_*
+
 # BL-064 Telegram session — authenticates as the user; never commit
 *.session
 *.session-journal
