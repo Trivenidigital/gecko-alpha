@@ -248,6 +248,18 @@ class Settings(BaseSettings):
     PAPER_TP_SELL_PCT: float = 70.0  # sell 70% at TP, keep 30% as long_hold
     PAPER_SLIPPAGE_BPS: int = 50  # 0.5% slippage simulation
 
+    # BL-NEW-LIVE-ELIGIBLE: writes would_be_live=1 on paper trades that
+    # match the tier rules from tasks/findings_live_eligibility_*.md AND
+    # fit under the live-eligible concurrent-slot cap. Pure observability;
+    # paper trade behavior is unchanged.
+    # Tier 1 (mandatory): signal_type='chain_completed' OR conviction stack≥3.
+    # Tier 2 (high-quality): signal_type='volume_spike' OR (signal_type=
+    #   'gainers_early' AND mcap≥PAPER_TIER2_GAINERS_MIN_MCAP_USD AND
+    #   24h≥PAPER_TIER2_GAINERS_MIN_24H_PCT).
+    PAPER_LIVE_ELIGIBLE_SLOTS: int = 20
+    PAPER_TIER2_GAINERS_MIN_MCAP_USD: float = 10_000_000.0
+    PAPER_TIER2_GAINERS_MIN_24H_PCT: float = 25.0
+
     # BL-NEW-TG-ALERT-ALLOWLIST: per-signal Telegram alert dispatch on
     # paper-trade open. Eligibility tracked per-signal in
     # signal_params.tg_alert_eligible (default 0). Cooldown is per-token
