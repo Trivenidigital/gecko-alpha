@@ -38,9 +38,7 @@ async def _insert_m1_5b_sentinel(db: Database) -> None:
 
 
 @pytest.mark.asyncio
-async def test_m1_5c_announcement_fires_when_m1_5b_already_sent(
-    tmp_path, monkeypatch
-):
+async def test_m1_5c_announcement_fires_when_m1_5b_already_sent(tmp_path, monkeypatch):
     """Prod path: M1.5b sentinel pre-exists; M1.5c must still announce
     via its independent sentinel (separate outcome value)."""
     db = Database(tmp_path / "t.db")
@@ -58,8 +56,7 @@ async def test_m1_5c_announcement_fires_when_m1_5b_already_sent(
     assert "minara swap" in body
 
     cur = await db._conn.execute(
-        "SELECT COUNT(*) FROM tg_alert_log "
-        "WHERE outcome='m1_5c_announcement_sent'"
+        "SELECT COUNT(*) FROM tg_alert_log " "WHERE outcome='m1_5c_announcement_sent'"
     )
     assert (await cur.fetchone())[0] == 1
     await db.close()
@@ -80,8 +77,7 @@ async def test_m1_5c_announcement_skipped_when_disabled(tmp_path, monkeypatch):
 
     sent.assert_not_called()
     cur = await db._conn.execute(
-        "SELECT COUNT(*) FROM tg_alert_log "
-        "WHERE outcome='m1_5c_announcement_sent'"
+        "SELECT COUNT(*) FROM tg_alert_log " "WHERE outcome='m1_5c_announcement_sent'"
     )
     assert (await cur.fetchone())[0] == 0
     await db.close()
@@ -101,8 +97,7 @@ async def test_m1_5c_announcement_on_fresh_db_still_works(tmp_path, monkeypatch)
 
     sent.assert_called_once()
     cur = await db._conn.execute(
-        "SELECT COUNT(*) FROM tg_alert_log "
-        "WHERE outcome='m1_5c_announcement_sent'"
+        "SELECT COUNT(*) FROM tg_alert_log " "WHERE outcome='m1_5c_announcement_sent'"
     )
     assert (await cur.fetchone())[0] == 1
 
