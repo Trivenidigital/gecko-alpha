@@ -290,8 +290,8 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Adapted from `Trivenidigital/shift-agent` analysis:** the inspiration for BL-072 + BL-073 was `shift-agent`'s `docs/hermes-alignment.md` + `CLAUDE.md` "Hermes-first" rules. shift-agent **runs on Hermes** as its production runtime; gecko-alpha does NOT (vanilla async Python pipeline). The adaptation is structural — we kept the 4-part doc shape and the read-deployed-code rule, dropped the Hermes-specific drift-tag vocabulary as cargo-cult, and replaced it with the more answerable single-line `**New primitives introduced:** [list or NONE]` declaration.
 
 ### BL-074: Minara as live-execution layer (post-BL-055 unlock)
-**Status:** VISION — gated on BL-055 unlock. Captured 2026-05-03.
-**Tag:** `gated-on-BL-055` `live-execution` `minara` `hermes-ecosystem`
+**Status:** PHASE 0 Option A SHIPPED 2026-05-11 — see BL-NEW-M1.5C below. Subsequent phases (Option B execution-on-VPS + adapter shape decision) remain gated on BL-055 unlock. Captured 2026-05-03.
+**Tag:** `phase-0-shipped` `gated-on-BL-055` `live-execution` `minara` `hermes-ecosystem`
 **Vision:** gecko-alpha alerts in → Minara executes out. gecko-alpha continues to own signal generation, conviction gating, and observability; Minara owns wallet custody, venue routing (EVM + Solana + Hyperliquid perps), order placement, and on-ramp. Two-layer architecture, clean separation.
 
 **Why this is BL-074, not Phase N of BL-073:** BL-073 is about Hermes building blocks for gecko-alpha's *narrative LLM and ops agent*. Minara is a *live-execution skill pack* — different problem class. Lumping them would muddle the dependency graph (BL-073 phases are independent of BL-055; this work absolutely is not).
@@ -314,6 +314,33 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Honest reality check:** Until items 1–4 of the prerequisites above are real, this entry is a vision artifact, not an actionable backlog item. Re-evaluate when BL-055 reaches the unlock checkpoint. Don't let it accrete into a spec prematurely — premature spec for a system whose upstream gate hasn't opened is exactly the BL-073-style theatre we just argued against.
 
 **Operator-side evaluation worth doing now (zero gecko-alpha code change):** install Hermes + Minara on a terminal you control, manually execute a small number of trades on alerts gecko-alpha currently surfaces to Telegram. This is the cheapest way to assess Minara's execution quality on signals you already trust. Outcome of that trial directly informs adapter-shape choice (a) vs. (b) above.
+
+### BL-NEW-M1.5C: Minara DEX-eligibility alert extension (Phase 0 Option A under BL-074)
+**Status:** SHIPPED 2026-05-11 — PR #96 (`ef68c6c`) squash-merged + deployed VPS 2026-05-11T01:54Z. Schema 20260517 migration `bl_tg_alert_log_m1_5c_outcome` applied; M1.5b sentinel preserved across rebuild (verified `m1_5b_sentinel_preserved=true`). Onboarding TG announcement delivered. See memory `project_m1_5c_deployed_2026_05_11.md`.
+**Tag:** `decision-support` `minara` `solana-first` `phase-0-option-a` `pre-execution-layer`
+**What shipped:** TG paper-trade-open alerts now include a copy-pasteable line `Run: minara swap --from USDC --to <SPL_addr> --amount-usd 10` for Solana-listed tokens. Operator copy-pastes into their local terminal where Minara CLI is logged in. **gecko-alpha does NOT execute** — pure decision-support. Settings-sourced `MINARA_ALERT_AMOUNT_USD=10` default; caller's $300 paper-trade size cannot leak (R2-C1 discipline). 4-layer failure isolation in `maybe_minara_command` + base58 SPL shape validation (32-44 chars; rejects EVM-hex under solana key) + asyncio.CancelledError-safe sentinel demotion (clears 6h cooldown trap on dispatch cancel).
+**Why this BL number:** Phase 0 Option A is the cheapest valuable step toward BL-074's vision. Adds gecko-alpha → Minara decision-support BEFORE the BL-055 unlock gates on full execution. Operator behavior during soak informs whether Option B (TG approval gateway + VPS-side execution) is worth scoping or whether Option A is sufficient.
+**Forward kill criterion (per V3 strategy reviewer fold):** 14d post-deploy, count `minara_alert_command_emitted` log events vs. operator self-reported manual paste count. Decision tree:
+- High emission + high paste rate → proceed to M1.5d Option B scoping.
+- High emission + low paste rate → Option A was wrong product shape; defer Option B, revisit operator workflow.
+- Low emission rate → re-examine Solana coverage rate; consider EVM expansion (M1.5d EVM, 17 chains supported by Minara).
+
+**Verification queries (24h soak ends 2026-05-12T01:54Z):**
+```bash
+ssh root@89.167.116.187 "journalctl -u gecko-pipeline --since '24 hours ago' | grep -c minara_alert_command_emitted"
+ssh root@89.167.116.187 "sqlite3 /root/gecko-alpha/scout.db \"SELECT COUNT(*) FROM tg_alert_log WHERE outcome='m1_5c_announcement_sent'\""  # expect 1
+```
+
+**Revert:** `MINARA_ALERT_ENABLED=False` + restart. No code rollback, no DB cleanup. Migration is forward-only but idempotent.
+
+**Post-merge folds (deferred from 3-vector PR review):**
+- Retrofit `**Hermes-first analysis:**` + `**Drift-check:**` sections into `tasks/plan_m1_5c_minara_alert.md` per CLAUDE.md §7 convention (V3-I1)
+- Revisit `$10` default sizing after 7d soak (V3-I2)
+- Document alternatives (bash function, dashboard column, skip-to-Option-B) in plan (V3-I4)
+- Better migration test exercising rebuild path with pre-existing rows (V1-I2 — empirically validated on prod deploy, defer test-quality improvement)
+- Operator runbook note: do not `DELETE FROM tg_alert_log WHERE outcome != 'sent'` or M1.5b + M1.5c announcement sentinels re-spam (V2-I4)
+
+**3-vector PR review caught 3 CRITICAL pre-merge** (folded in commit `fff3658` pre-rebase): base58 SPL shape validation (V1-I1 + V2-I2 convergence), CancelledError sentinel-stuck (V2-I1), isinstance(dict) guard for CG schema drift (V1-I1).
 
 ---
 
@@ -447,8 +474,8 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Resume protocol:** When user says "let's work on conviction-locked hold" or "BL-067", FIRST step is the backtest script. Do not write `scout/trading/conviction.py` until the backtest output justifies it.
 
 ### BL-075: Slow-burn miss diagnostic + watcher (RIV-shape blind spot)
-**Status:** RESEARCH-GATED — Phase A (diagnostic) is cheap and unblocks Phase B; Phase B (watcher) is shadow-only and gated on Phase A telemetry
-**Tag:** `research-gated` `detection-blind-spot` `silent-failure-surface`
+**Status:** PHASE A + PHASE B SHIPPED 2026-05-10. **Phase A** (mcap-missing telemetry) shipped 2026-05-03; 6d telemetry showed 53.5% mcap-null rate (>5% gate → Phase B unblocked). **Phase B** PR #91 (`395feab`) `detect_slow_burn_7d` + schema 20260515; PR #93 (`975c45b`) silent-skip telemetry follow-up (heartbeat counter + all-skipped WARNING + always-emit summary log). 21 first-cycle detections; 47.6% momentum overlap (under 70% gate). **14d shadow soak ends 2026-05-24** — kill criterion + promotion-to-paper-dispatch decision at that point. See memory `project_bl075_phase_b_2026_05_10.md`.
+**Tag:** `phase-a-shipped` `phase-b-shipped` `shadow-soak-active` `detection-blind-spot`
 **Motivating evidence (2026-05-03):** RIV (`riv-coin`) ran $2M → $200M mcap over 30 days — exactly the asymmetric move the system exists to surface. SSH audit against prod `scout.db` returned **zero rows** for RIV across `gainers_snapshots`, `trending_snapshots`, `velocity_alerts`, `volume_spikes`, `momentum_7d`, `second_wave_candidates`, `predictions`, `narrative_signals`, `chain_matches`, `tg_social_signals`, `candidates`, `paper_trades`, `alerts`. Only trace: one row in `price_cache` from 2026-05-01T00:08Z with `market_cap=0.0` (CoinGecko returned null mcap, our parser writes 0). For context: gainers polling captured 90,002 rows in last 30d; trending captured 5,655. Polling is healthy. RIV simply never appeared in either.
 **Best-fit hypothesis (three compounding causes):**
 1. **CoinGecko `/coins/markets` 1h-change top-50 cut.** A 100x distributed over 30 days averages ~16%/day; individual 1h windows may rarely hit the top-50 cut. We catch concentrated short pumps (BLESS 16h, GENIUS 10.5h, MEZO 8h) — slow-burn marathons fall through.
