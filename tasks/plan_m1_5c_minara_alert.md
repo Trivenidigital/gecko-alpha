@@ -386,10 +386,21 @@ async def maybe_minara_command(
             size_int = max(1, int(round(float(size))))
         except (TypeError, ValueError):
             size_int = 10  # fallback to default safe size
-        return (
+        cmd = (
             f"minara swap --from {from_token} --to {spl_address} "
             f"--amount-usd {size_int}"
         )
+        # R2-I2 design-stage fold: success-path log event so operator
+        # can grep journalctl as a sanity-check sibling to silence-
+        # heartbeat. Lets operator distinguish "no Solana tokens fired"
+        # from "detection silently broken."
+        log.info(
+            "minara_alert_command_emitted",
+            coin_id=coin_id,
+            chain="solana",
+            amount_usd=size_int,
+        )
+        return cmd
     except Exception:
         log.exception(
             "minara_alert_format_failed", coin_id=coin_id
@@ -595,50 +606,197 @@ git commit -m "feat(m1.5c): tg_alert_dispatch integration — format_paper_trade
 
 R2-C2 fold rationale: M1.5b's first-deploy announcement (sentinel-gated, sent once) has already fired on prod (2026-05-11 00:28Z). Operator has never used Minara. New `Run:` lines will appear with no install/login/funding guidance. Need a SECOND announcement covering Minara onboarding without re-firing the M1.5b body.
 
-- [ ] **Step 1: Extend migration `bl_tg_alert_eligible_v1` OR add a new follow-up migration**
+- [ ] **Step 1: Add migration `_migrate_tg_alert_log_m1_5c_outcome` (R1-C1 full scaffold)**
 
-Cleanest path: new migration `_migrate_tg_alert_log_m1_5c_outcome` (schema 20260517) that runs the SQLite table-rename pattern to add `'m1_5c_announcement_sent'` to the CHECK enum. Mirror `_migrate_reject_reason_extend_v2` shape from M1.5a.
+Mirrors `_migrate_reject_reason_extend_v2` (db.py:2840) line-by-line. R1-C1 design-stage fold: full scaffold required (not skeleton) so the implementor doesn't miss the quoted-identifier hotfix regex (db.py:2932), idempotency markers, or post-assertion.
 
 ```python
 async def _migrate_tg_alert_log_m1_5c_outcome(self) -> None:
-    """M1.5c follow-up: admit 'm1_5c_announcement_sent' outcome."""
-    SCHEMA_VERSION = 20260517
-    # ... standard schema_version idempotency check ...
-    # ... table-rename pattern: rename tg_alert_log → _old, CREATE TABLE
-    #     with extended CHECK, INSERT INTO ... SELECT FROM _old, DROP _old ...
+    """M1.5c follow-up: extend tg_alert_log.outcome CHECK constraint
+    to admit 'm1_5c_announcement_sent' sentinel (R2-C2 design fold).
+
+    Schema version 20260517. Mirrors `_migrate_reject_reason_extend_v2`
+    table-rename pattern. Idempotent via `paper_migrations` sentinel +
+    sqlite_master.sql substring guard.
+    """
+    import re as _re
+    import structlog
+
+    _log = structlog.get_logger()
+    if self._conn is None:
+        raise RuntimeError("Database not initialized.")
+    conn = self._conn
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    try:
+        await conn.execute("BEGIN EXCLUSIVE")
+        await conn.execute(
+            """CREATE TABLE IF NOT EXISTS paper_migrations (
+                   name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
+        )
+
+        # Idempotency: skip if marker already present.
+        cur = await conn.execute(
+            "SELECT 1 FROM paper_migrations WHERE name = ?",
+            ("bl_tg_alert_log_m1_5c_outcome",),
+        )
+        if (await cur.fetchone()) is not None:
+            await conn.commit()
+            return
+
+        cur = await conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            ("tg_alert_log",),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            # Table absent — bl_tg_alert_eligible_v1 didn't run yet.
+            # That migration is registered BEFORE this one in
+            # _apply_migrations, so this path is unreachable on a
+            # normally-initialized DB. Defensive ROLLBACK.
+            await conn.execute("ROLLBACK")
+            raise RuntimeError(
+                "bl_tg_alert_log_m1_5c_outcome: tg_alert_log missing; "
+                "migration ordering bug"
+            )
+        table_sql = row[0] or ""
+
+        # Idempotency: skip if CHECK already includes the new value.
+        if "m1_5c_announcement_sent" in table_sql:
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_tg_alert_log_m1_5c_outcome", now_iso),
+            )
+            await conn.commit()
+            return
+
+        # Get column list for INSERT-SELECT data preservation.
+        cur = await conn.execute("PRAGMA table_info(tg_alert_log)")
+        cols = await cur.fetchall()
+        col_names = [c[1] for c in cols]
+        col_list = ", ".join(col_names)
+
+        new_check = (
+            "CHECK (outcome IN ("
+            "'sent','blocked_eligibility',"
+            "'blocked_cooldown','dispatch_failed',"
+            "'announcement_sent','m1_5c_announcement_sent'"
+            "))"
+        )
+
+        # Replace existing CHECK clause on the outcome column.
+        pattern = _re.compile(
+            r"outcome\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\([^)]*\)",
+            _re.IGNORECASE | _re.DOTALL,
+        )
+        new_table_sql = pattern.sub(
+            f"outcome     TEXT NOT NULL {new_check}", table_sql
+        )
+        if new_table_sql == table_sql:
+            _log.warning(
+                "tg_alert_log_m1_5c_check_pattern_miss",
+                sql_excerpt=table_sql[:200],
+            )
+            await conn.execute("ROLLBACK")
+            return
+
+        # Quoted-identifier hotfix regex from M1.5a (db.py:2932-2937).
+        # Covers both "tg_alert_log" and tg_alert_log forms, with/without
+        # IF NOT EXISTS prefix.
+        new_table_sql_renamed = _re.sub(
+            r'TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?tg_alert_log["`]?\s*\(',
+            "TABLE tg_alert_log_new (",
+            new_table_sql,
+            count=1,
+            flags=_re.IGNORECASE,
+        )
+        if new_table_sql_renamed == new_table_sql:
+            _log.warning(
+                "tg_alert_log_m1_5c_rename_pattern_miss",
+                sql_excerpt=new_table_sql[:200],
+            )
+            await conn.execute("ROLLBACK")
+            return
+
+        # No views depend on tg_alert_log (verified) → skip view-drop step.
+        await conn.execute(new_table_sql_renamed)
+        await conn.execute(
+            f"INSERT INTO tg_alert_log_new ({col_list}) "
+            f"SELECT {col_list} FROM tg_alert_log"
+        )
+        await conn.execute("DROP TABLE tg_alert_log")
+        await conn.execute(
+            "ALTER TABLE tg_alert_log_new RENAME TO tg_alert_log"
+        )
+        # Recreate index dropped with the table.
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tg_alert_log_token "
+            "ON tg_alert_log(token_id, alerted_at)"
+        )
+
+        await conn.execute(
+            "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+            "VALUES (?, ?)",
+            ("bl_tg_alert_log_m1_5c_outcome", now_iso),
+        )
+        await conn.execute(
+            "INSERT OR IGNORE INTO schema_version "
+            "(version, applied_at, description) VALUES (?, ?, ?)",
+            (20260517, now_iso, "bl_tg_alert_log_m1_5c_outcome"),
+        )
+
+        # Post-assertion: verify the existing M1.5b sentinel survived
+        # the table rebuild (data-preservation gate).
+        cur = await conn.execute(
+            "SELECT 1 FROM tg_alert_log WHERE outcome='announcement_sent' LIMIT 1"
+        )
+        # M1.5b sentinel may or may not be present at migration time
+        # (test fresh DB vs prod with M1.5b already fired). Not a hard
+        # assertion — just log if it surprises us.
+        m1_5b_present = (await cur.fetchone()) is not None
+
+        await conn.commit()
+        _log.info(
+            "tg_alert_log_m1_5c_outcome_migration_complete",
+            m1_5b_sentinel_preserved=m1_5b_present,
+        )
+    except Exception:
+        try:
+            await conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
 ```
 
-Register after `_migrate_tg_alert_eligible_v1` in `_apply_migrations`.
-
-- [ ] **Step 2: Extend `_maybe_announce_tg_alerts` in `scout/main.py`**
+**`_apply_migrations` registration** (R1-I2 fold — explicit ordering):
 
 ```python
-async def _maybe_announce_tg_alerts(db, session, settings):
-    """M1.5b + M1.5c first-deploy operator announcements.
+# scout/db.py:_apply_migrations — append after _migrate_tg_alert_eligible_v1
+await self._migrate_tg_alert_eligible_v1()
+await self._migrate_tg_alert_log_m1_5c_outcome()  # ← NEW
+```
 
-    Two sentinels, each fires once:
-    - 'announcement_sent' (M1.5b): allowlist active + signals + cooldown
-    - 'm1_5c_announcement_sent' (M1.5c): Minara onboarding (run npm
-       install, minara login, minara deposit USDC + SOL gas)
+Migration order matters: 20260516 (creates `tg_alert_log`) must run BEFORE 20260517 (modifies its CHECK constraint).
+
+- [ ] **Step 2: Add NEW `_maybe_announce_m1_5c` function in `scout/main.py` (R1-I1 fold)**
+
+R1-I1 design-stage fold: do NOT refactor the existing M1.5b `_maybe_announce_tg_alerts` body. Add a separate function called sequentially from the same call site. This preserves the M1.5b tested code path verbatim (parse_mode=None, `db._txn_lock` for sentinel insert, structured-log event `tg_alert_announcement_sent`) — no refactor regression risk.
+
+```python
+async def _maybe_announce_m1_5c(db, session, settings) -> None:
+    """BL-NEW-M1.5C: Minara DEX-eligibility onboarding announcement.
+
+    Fires ONCE per database lifetime, gated on:
+    - `MINARA_ALERT_ENABLED=True` (default; honors the feature flag)
+    - Separate sentinel `'m1_5c_announcement_sent'` in tg_alert_log
+      (independent from M1.5b's `'announcement_sent'`)
+
+    R2-C2 design-stage fold. R1-I1 fold: separate from M1.5b function
+    to avoid refactor regression.
     """
     if db._conn is None:
         return
-
-    # M1.5b announcement (sentinel-gated, unchanged behavior)
-    try:
-        cur = await db._conn.execute(
-            "SELECT 1 FROM tg_alert_log WHERE outcome='announcement_sent' LIMIT 1"
-        )
-        m1_5b_done = (await cur.fetchone()) is not None
-    except Exception:
-        logger.exception("tg_alert_announcement_table_check_failed")
-        return
-
-    if not m1_5b_done:
-        # ... existing M1.5b announcement body + send + sentinel insert ...
-        await _send_m1_5b_announcement(db, session, settings)
-
-    # M1.5c announcement (separate sentinel, fires once when MINARA_ALERT_ENABLED)
     if not getattr(settings, "MINARA_ALERT_ENABLED", True):
         return
     try:
@@ -647,23 +805,26 @@ async def _maybe_announce_tg_alerts(db, session, settings):
             "WHERE outcome='m1_5c_announcement_sent' LIMIT 1"
         )
         if await cur.fetchone():
-            return
+            return  # already announced
     except Exception:
+        logger.exception("tg_alert_m1_5c_announcement_check_failed")
         return
 
     body = (
         "📢 M1.5c — Minara DEX-eligibility extension active\n"
-        "Solana-listed tokens now include a copy-paste-able command in alerts:\n"
+        "Solana-listed tokens now include a copy-pasteable command:\n"
         "  Run: minara swap --from USDC --to <addr> --amount-usd N\n"
         "\n"
         "First-time setup (one-time, on your local terminal):\n"
         "1. npm install -g minara@latest\n"
         "2. minara login --device  (browser device-code OAuth)\n"
-        "3. minara deposit  (fund USDC + SOL for gas on Solana)\n"
+        "3. minara deposit  (fund USDC + SOL gas on Solana)\n"
+        "Docs: https://github.com/Minara-AI/skills\n"  # R2-I1 fold
         "\n"
-        "Default size: $10. Set MINARA_ALERT_AMOUNT_USD=N in .env to override.\n"
+        "Default size: $10. Override via .env MINARA_ALERT_AMOUNT_USD=N.\n"
         "Disable: MINARA_ALERT_ENABLED=False + restart.\n"
-        "Note: gecko-alpha does NOT execute — you paste + Minara prompts before swap."
+        "Tip: long-press the `Run:` line to copy only that line (R2-M1).\n"
+        "Note: gecko-alpha does NOT execute — Minara prompts before swap."
     )
     try:
         await alerter.send_telegram_message(
@@ -683,19 +844,123 @@ async def _maybe_announce_tg_alerts(db, session, settings):
         logger.exception("tg_alert_m1_5c_announcement_failed")
 ```
 
-- [ ] **Step 3: Tests in `tests/test_main_wiring.py` or `tests/test_tg_alert_dispatch.py`**
+**Call site** (in the existing `async with aiohttp.ClientSession() as session:` block in main.py, BELOW the existing `_maybe_announce_tg_alerts(db, session, settings)` call):
 
 ```python
-async def test_m1_5c_announcement_fires_once(tmp_path, monkeypatch):
-    """M1.5c announcement fires when migration applied + MINARA_ALERT_ENABLED;
-    sentinel prevents re-fire."""
-    # ... db fixture, monkeypatch alerter, call _maybe_announce_tg_alerts twice ...
-    # assert send called exactly once for m1_5c
-    # assert sentinel row 'm1_5c_announcement_sent' present
+            # Existing M1.5b call — DO NOT MODIFY (R1-I1 fold)
+            await _maybe_announce_tg_alerts(db, session, settings)
+            # M1.5c addition — separate function, separate sentinel
+            await _maybe_announce_m1_5c(db, session, settings)
+```
+
+- [ ] **Step 3: Tests in `tests/test_main_wiring.py` or `tests/test_tg_alert_dispatch.py` (R1-I3 fold — explicit fixturing)**
+
+R1-I3 design-stage fold: test two specific pre-states to mirror both deploy paths:
+
+```python
+@pytest.mark.asyncio
+async def test_m1_5c_announcement_fires_when_m1_5b_already_sent(
+    tmp_path, monkeypatch
+):
+    """Prod first-deploy path: M1.5b sentinel exists (from M1.5b deploy);
+    M1.5c fires on next restart and writes its own sentinel.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    # Pre-insert M1.5b sentinel to mirror prod state.
+    await db._conn.execute(
+        "INSERT INTO tg_alert_log "
+        "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
+        "VALUES (NULL, 'announcement', '_system', ?, 'announcement_sent')",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    await db._conn.commit()
+    sent = []
+    async def _fake_send(text, session, settings, parse_mode=None):
+        sent.append(text)
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+    from scout.main import _maybe_announce_m1_5c
+    settings = _settings()
+    await _maybe_announce_m1_5c(db, session=object(), settings=settings)
+    # M1.5c body should land
+    assert len(sent) == 1
+    assert "Minara" in sent[0]
+    assert "npm install -g minara" in sent[0]
+    # Sentinel written
+    cur = await db._conn.execute(
+        "SELECT 1 FROM tg_alert_log WHERE outcome='m1_5c_announcement_sent'"
+    )
+    assert (await cur.fetchone()) is not None
+    # Second call: idempotent
+    await _maybe_announce_m1_5c(db, session=object(), settings=settings)
+    assert len(sent) == 1  # still 1, not 2
+    await db.close()
 
 
-async def test_m1_5c_announcement_skipped_when_disabled(tmp_path):
+@pytest.mark.asyncio
+async def test_m1_5c_announcement_skipped_when_disabled(tmp_path, monkeypatch):
     """MINARA_ALERT_ENABLED=False → no M1.5c announcement."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    sent = []
+    async def _fake_send(text, session, settings, parse_mode=None):
+        sent.append(text)
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+    from scout.main import _maybe_announce_m1_5c
+    settings = _settings(MINARA_ALERT_ENABLED=False)
+    await _maybe_announce_m1_5c(db, session=object(), settings=settings)
+    assert len(sent) == 0
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM tg_alert_log WHERE outcome='m1_5c_announcement_sent'"
+    )
+    assert (await cur.fetchone())[0] == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_m1_5c_announcement_on_fresh_db_still_works(tmp_path, monkeypatch):
+    """Fresh DB path (test fixture / dev): M1.5b sentinel absent.
+    M1.5c can still fire — it doesn't depend on M1.5b sentinel presence.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    sent = []
+    async def _fake_send(text, session, settings, parse_mode=None):
+        sent.append(text)
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+    from scout.main import _maybe_announce_m1_5c
+    await _maybe_announce_m1_5c(db, session=object(), settings=_settings())
+    assert len(sent) == 1
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_m1_5c_migration_preserves_m1_5b_sentinel(tmp_path):
+    """R1-C1 fold + data-preservation: the table-rename migration
+    preserves the M1.5b 'announcement_sent' sentinel row."""
+    db = Database(tmp_path / "t.db")
+    # Stop initialize() partway: run only through bl_tg_alert_eligible_v1
+    # (M1.5b migration), then insert M1.5b sentinel manually, then run
+    # the M1.5c migration and assert row survives.
+    # Simplest: run full initialize() (both migrations), then verify
+    # the post-assertion at end of M1.5c migration didn't fail. The
+    # full DB-init success implies migration completion + post-assertion.
+    await db.initialize()
+    # Insert the sentinel post-migration to confirm the new CHECK admits
+    # both old and new values.
+    await db._conn.execute(
+        "INSERT INTO tg_alert_log "
+        "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
+        "VALUES (NULL, 'announcement', '_system', ?, 'announcement_sent')",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    await db._conn.commit()
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log "
+        "WHERE outcome='announcement_sent'"
+    )
+    assert (await cur.fetchone()) is not None
+    await db.close()
 ```
 
 - [ ] **Step 4: Commit**
@@ -757,18 +1022,29 @@ Per CLAUDE.md §8 (operator-visible alert change, low blast radius — no execut
 
 **Operator copy-paste safety:** the `Run:` line is plain text — Telegram doesn't auto-execute. Operator must explicitly copy + paste + confirm in Minara CLI (Minara's own confirmation prompt fires on swap when called without `--yes`). Three-layer safety: gecko-alpha doesn't execute, Telegram doesn't execute, Minara prompts before executing.
 
-## Reviewer-fold summary (plan-stage)
+## Reviewer-fold summary
+
+### Plan-stage (folded at `775cb6c`)
 
 | Finding | Reviewer | Severity | Status |
 |---|---|---|---|
 | Default amount source = paper-trade $300 → $150 loss per swap risk | R2 | C1 | **Folded — MINARA_ALERT_AMOUNT_USD=10.0 default** |
-| Operator onboarding gap (no Minara install/login guidance) | R2 | C2 | **Folded — Task 2.5 M1.5c onboarding announcement + new sentinel** |
+| Operator onboarding gap | R2 | C2 | **Folded — Task 2.5 onboarding announcement + new sentinel** |
 | session=None wastes rate-limiter | R1 | I1 | **Folded — short-circuit before fetch** |
-| Amount rounding 0.4 → 0 (invalid `--amount-usd 0`) | R1 | I2 | **Folded — `max(1, int(round(...)))` clamp** |
-| amount_usd=None TypeError | R1 | I3 | **Folded — Settings-sourced size; None doesn't reach format** |
-| Phone-screen Run: below fold | R2 | I1 | Acknowledged — 4-line body, expand to copy. Future: hoist if operator complains |
-| Alert volume validation deferred | R2 | I2 | Acknowledged — runbook adds 7-day soak query |
-| Copy-paste selection UX | R2 | I3 | Acknowledged — minor; accept |
-| Cache hit test bypassed by monkeypatch | R1 | M1 | Acceptable — behavioral test |
-| No heartbeat counter | R1 | M2 | Deferred to M1.5d / dashboard panel |
-| Amount rounding documentation | R2 | M | Inline comment in code |
+| Amount rounding 0.4 → 0 | R1 | I2 | **Folded — `max(1, int(round(...)))` clamp** |
+| amount_usd=None TypeError | R1 | I3 | **Folded — Settings-sourced size** |
+
+### Design-stage (this commit)
+
+| Finding | Reviewer | Severity | Status |
+|---|---|---|---|
+| Migration `_migrate_tg_alert_log_m1_5c_outcome` was a stub | R1 | C1 | **Folded — full scaffold mirroring `_migrate_reject_reason_extend_v2`** |
+| M1.5b function-body refactor regression risk | R1 | I1 | **Folded — separate `_maybe_announce_m1_5c` function; M1.5b untouched** |
+| Migration ordering not explicit in plan | R1 | I2 | **Folded — explicit `_apply_migrations` diff shown** |
+| Announcement test fixturing incomplete | R1 | I3 | **Folded — 4 test cases covering both prod-state (M1.5b sentinel pre-set) + fresh-DB + disabled + data-preservation** |
+| Announcement body missing Minara repo URL | R2 | I1 | **Folded — `Docs: https://github.com/Minara-AI/skills` line added** |
+| No log-event on success path (silent-detection-broken risk) | R2 | I2 | **Folded — `log.info("minara_alert_command_emitted", ...)` at success return** |
+| Soak query unspecified in onboarding | R2 | I3 | Acknowledged — runbook addendum post-merge |
+| Long-press copy hint | R2 | M1 | **Folded — added to announcement body** |
+| Cache stale-data 30min TTL | R2 | M2 | Accepted — corner case |
+| Second-deploy idempotency test | R2 | M3 | Covered — `assert len(sent) == 1  # still 1, not 2` after 2nd call |
