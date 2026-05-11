@@ -165,11 +165,16 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
             # `max_duration = timedelta(hours=sp.max_duration_hours)` below
             # so the overlaid max_duration_hours flows into the timedelta call.
             #
-            # Note: trail_pct_low_peak intentionally NOT overlaid (A3) —
-            # adaptive low-peak trail is orthogonal regime (peak <
-            # low_peak_threshold); locked trail only fires at high peak.
-            # Leg targets (leg_1_pct/leg_2_pct/qty_frac) NOT overlaid (S6) —
-            # BL-067 spec table only widens trail/sl/max_duration.
+            # BL-NEW-LOW-PEAK-LOCK (2026-05-11): trail_pct_low_peak NOW
+            # overlaid per tasks/findings_sustain_winners_cut_losers_2026_
+            # 05_11.md §5 P2. Reverses A3 design decision: empirical data
+            # (OSMO #1838 + n=75 cohort) showed the original "low_peak is
+            # orthogonal regime, lock shouldn't widen it" rationale was
+            # wrong — the bypass was a silent BL-067 contract violation
+            # producing 10pp avg giveback on conviction-locked trades that
+            # peaked below the low_peak_threshold. Cap at 25%.
+            # Leg targets (leg_1_pct/leg_2_pct/qty_frac) STILL NOT overlaid
+            # (S6) — BL-067 spec table only widens trail/sl/max_duration.
             #
             # `row[30]` = conviction_locked_at (SELECT extended above).
             conviction_locked_at = row[30] if len(row) > 30 else None
@@ -217,6 +222,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                         base={
                             "max_duration_hours": sp.max_duration_hours,
                             "trail_pct": sp.trail_pct,
+                            "trail_pct_low_peak": sp.trail_pct_low_peak,
                             "sl_pct": sp.sl_pct,
                         },
                     )
@@ -229,6 +235,7 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                         sp,
                         max_duration_hours=locked["max_duration_hours"],
                         trail_pct=locked["trail_pct"],
+                        trail_pct_low_peak=locked["trail_pct_low_peak"],
                         sl_pct=locked["sl_pct"],
                     )
                     # D2 idempotency: log + stamp ONCE per trade. Subsequent

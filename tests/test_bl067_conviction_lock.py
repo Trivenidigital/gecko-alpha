@@ -242,6 +242,118 @@ def test_conviction_locked_params_saturates_at_stack_4():
     assert p4 == p10
 
 
+# ---------------------------------------------------------------------------
+# BL-NEW-LOW-PEAK-LOCK (P2): trail_pct_low_peak overlay tests
+# ---------------------------------------------------------------------------
+
+
+def test_locked_params_low_peak_overlay_stack_2():
+    """P2: stack=2 widens low_peak trail by +5pp."""
+    from scout.trading.conviction import conviction_locked_params
+
+    base = {
+        "max_duration_hours": 168,
+        "trail_pct": 20.0,
+        "trail_pct_low_peak": 8.0,
+        "sl_pct": 25.0,
+    }
+    p = conviction_locked_params(stack=2, base=base)
+    assert p["trail_pct_low_peak"] == 13.0  # 8 + 5
+
+
+def test_locked_params_low_peak_overlay_stack_3():
+    """P2: stack=3 widens low_peak trail by +10pp (the OSMO fix)."""
+    from scout.trading.conviction import conviction_locked_params
+
+    base = {
+        "max_duration_hours": 168,
+        "trail_pct": 20.0,
+        "trail_pct_low_peak": 8.0,
+        "sl_pct": 25.0,
+    }
+    p = conviction_locked_params(stack=3, base=base)
+    assert p["trail_pct_low_peak"] == 18.0  # 8 + 10. OSMO would have survived.
+
+
+def test_locked_params_low_peak_overlay_stack_4():
+    """P2: stack=4 widens low_peak trail by +15pp."""
+    from scout.trading.conviction import conviction_locked_params
+
+    base = {
+        "max_duration_hours": 168,
+        "trail_pct": 20.0,
+        "trail_pct_low_peak": 8.0,
+        "sl_pct": 25.0,
+    }
+    p = conviction_locked_params(stack=4, base=base)
+    assert p["trail_pct_low_peak"] == 23.0  # 8 + 15
+
+
+def test_locked_params_low_peak_overlay_caps_at_25():
+    """P2: low_peak trail caps at 25% even with extreme base + stack."""
+    from scout.trading.conviction import conviction_locked_params
+
+    # Base 18% + stack=4 (+15) = 33 → must cap at 25
+    base = {
+        "max_duration_hours": 168,
+        "trail_pct": 20.0,
+        "trail_pct_low_peak": 18.0,
+        "sl_pct": 25.0,
+    }
+    p = conviction_locked_params(stack=4, base=base)
+    assert p["trail_pct_low_peak"] == 25.0
+
+
+def test_locked_params_low_peak_omitted_when_base_lacks_it():
+    """Backwards-compat: callers not supplying trail_pct_low_peak get
+    a result dict without the key (old behavior preserved)."""
+    from scout.trading.conviction import conviction_locked_params
+
+    base = {"max_duration_hours": 168, "trail_pct": 20.0, "sl_pct": 25.0}
+    p = conviction_locked_params(stack=3, base=base)
+    assert "trail_pct_low_peak" not in p
+    # And the legacy keys are still correct.
+    assert p["trail_pct"] == 30.0
+    assert p["sl_pct"] == 35.0
+
+
+def test_locked_params_low_peak_stack_1_no_change():
+    """Stack=1 returns base unchanged (no overlay)."""
+    from scout.trading.conviction import conviction_locked_params
+
+    base = {
+        "max_duration_hours": 168,
+        "trail_pct": 20.0,
+        "trail_pct_low_peak": 8.0,
+        "sl_pct": 25.0,
+    }
+    p = conviction_locked_params(stack=1, base=base)
+    assert p["trail_pct_low_peak"] == 8.0  # unchanged
+
+
+def test_locked_params_osmo_regression_pin():
+    """OSMO #1838 regression pin: stack=3 conviction-locked trade with
+    base trail_pct_low_peak=8.0 must yield 18.0 (not 8.0).
+
+    If this test ever fails with 8.0, evaluator.py is silently bypassing
+    the lock for low_peak again — the same bug we shipped P2 to fix."""
+    from scout.trading.conviction import conviction_locked_params
+
+    base = {
+        "max_duration_hours": 168,
+        "trail_pct": 20.0,
+        "trail_pct_low_peak": 8.0,
+        "sl_pct": 25.0,
+    }
+    locked = conviction_locked_params(stack=3, base=base)
+    assert locked["trail_pct_low_peak"] == 18.0, (
+        "OSMO regression: stack=3 must widen trail_pct_low_peak from base "
+        "8.0 + delta[3]['trail_pct_low_peak']=+10pp = 18.0 (cap 25). "
+        "If this value changed legitimately, update the assert + the "
+        "_CONVICTION_LOCK_DELTAS table together and document in commit."
+    )
+
+
 @pytest.mark.asyncio
 async def test_compute_stack_returns_int(db):
     """T3c — compute_stack returns int >= 0; counts at least 1 source."""
@@ -761,6 +873,94 @@ async def test_evaluator_moonshot_branch_uses_max_with_sp_trail_pct(
         f"A1 regression: moonshot branch ignored locked sp.trail_pct=35; "
         f"trade closed at status={row[0]!r}. "
         "Production must use max(MOONSHOT, sp.trail_pct), not constant."
+    )
+
+
+@pytest.mark.asyncio
+async def test_evaluator_low_peak_branch_uses_locked_trail_pct_low_peak(
+    db, settings_factory, monkeypatch
+):
+    """P2 PR-review I1 — end-to-end pin for the low-peak conviction-lock overlay.
+
+    Mirrors T6b's structure but for the LOW-PEAK branch (peak<low_peak_threshold).
+    Pre-fix (evaluator.py:168 bypass): trade with stack=3 and peak=15% had
+    trail_pct_low_peak=8 (unchanged from base). A 12% drawdown from peak fires
+    the trail, closes the trade. This is the literal OSMO failure mode.
+
+    Post-fix: locked trail_pct_low_peak = 8 + 10 = 18. The same 12% drawdown
+    does NOT fire the trail; trade stays open.
+
+    If a future refactor drops `trail_pct_low_peak` from the `replace(sp, ...)`
+    call at evaluator.py or omits it from the `base` dict passed to
+    conviction_locked_params(), THIS test fails — guarding against silent
+    OSMO regression.
+    """
+    from datetime import datetime, timezone
+    from scout.trading.evaluator import evaluate_paper_trades
+
+    settings = settings_factory(
+        SIGNAL_PARAMS_ENABLED=True,
+        PAPER_CONVICTION_LOCK_ENABLED=True,
+        PAPER_MOONSHOT_ENABLED=False,  # exclude moonshot branch
+    )
+    # Seed trade with stack=3 sources, signal_type=first_signal opted in.
+    trade_id = await _seed_locked_eligible_trade(
+        db,
+        signal_type="first_signal",
+        opt_in_signal=True,
+        n_extra_sources=3,
+        entry_price=1.0,
+    )
+    # Configure signal_params to ensure low_peak branch fires:
+    # peak < low_peak_threshold (20) AND base trail_pct_low_peak = 8.
+    await db._conn.execute(
+        """UPDATE signal_params
+           SET trail_pct = 20.0,
+               trail_pct_low_peak = 8.0,
+               low_peak_threshold_pct = 20.0,
+               sl_pct = 25.0
+           WHERE signal_type = ?""",
+        ("first_signal",),
+    )
+    # Stamp peak_pct=15 (below 20% low_peak_threshold) + peak_price=1.15.
+    # current_price = 1.012 → drawdown from peak (1.15 → 1.012) = 12%.
+    # Pre-fix trail_pct_low_peak=8: 12% > 8% → close.
+    # Post-fix locked trail_pct_low_peak=18: 12% < 18% → stay open.
+    await db._conn.execute(
+        """UPDATE paper_trades
+           SET peak_pct = 15.0, peak_price = 1.15
+           WHERE id = ?""",
+        (trade_id,),
+    )
+    await db._conn.execute(
+        "UPDATE price_cache SET current_price = 1.012 WHERE coin_id = ?",
+        ("lab-coin",),
+    )
+    await db._conn.commit()
+
+    await evaluate_paper_trades(db, settings)
+
+    cur = await db._conn.execute(
+        "SELECT status FROM paper_trades WHERE id = ?", (trade_id,)
+    )
+    row = await cur.fetchone()
+    assert row[0] == "open", (
+        f"P2 OSMO regression: low-peak branch did NOT apply locked "
+        f"trail_pct_low_peak=18 — trade closed at status={row[0]!r}. "
+        "Production evaluator.py must include sp.trail_pct_low_peak in the "
+        "base dict passed to conviction_locked_params() and apply the "
+        "returned value via dataclasses.replace."
+    )
+
+    # Verify conviction_lock_armed actually fired (i.e., the overlay ran).
+    cur = await db._conn.execute(
+        "SELECT conviction_locked_stack FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    row = await cur.fetchone()
+    assert row[0] is not None and row[0] >= 3, (
+        f"P2 sanity: conviction_locked_stack not stamped — overlay may "
+        f"have been skipped entirely. stack={row[0]!r}"
     )
 
 
