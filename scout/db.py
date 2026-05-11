@@ -3264,7 +3264,7 @@ class Database:
             )
 
             pattern = _re.compile(
-                r"outcome\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\([^)]*\)",
+                r"outcome\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(\s*outcome\s+IN\s*\([^)]*\)\s*\)",
                 _re.IGNORECASE | _re.DOTALL,
             )
             new_table_sql = pattern.sub(
