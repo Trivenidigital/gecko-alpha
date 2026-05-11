@@ -163,6 +163,63 @@ Currently `scout/trading/evaluator.py:168` explicitly excludes `trail_pct_low_pe
 
 **Boundary:** If results land between success and failure, extend soak. Do NOT renegotiate criteria to fit results.
 
+#### +1h health check action rules (LOCKED at deploy time, NOT at +1h)
+
+Pre-registered to prevent judgment-call drift under stress. Mirrored in memory `project_p2_low_peak_lock_shipped_2026_05_11.md`.
+
+| SL-hits at +1h | Action |
+|---|---|
+| 0-1 | Noise — continue soak normally |
+| 2 | **Pause** — dump per-trade detail (peak trajectory, exit price, drawdown from peak, would-baseline-8%-trail-have-fired). Decision branches: (a) trade's peak trajectory shows "wider trail let position drift past clean reversal" → revert P2; (b) trade would have SL'd under baseline 8% trail too → continue soak, P2 not at fault |
+| 3+ | **Revert immediately** — emergency-debug. The whole 10-trade cohort is small enough that 3 SLs in 1h is a statistically significant cluster signal, not noise |
+
+Counterfactual baseline-SL math: trade hit SL means price ≤ entry × (1 − 0.25). Under baseline 8% trail with peak P%, trail would have fired at entry × (1 + P/100) × 0.92. If actual exit is below both the trail trigger AND the SL trigger, the trade would have SL'd regardless of trail width — P2 is not the cause.
+
+#### Backtest output consumption rule (LOCKED before backtest runs)
+
+The P1-width-lock backtest runs in parallel with P2 soak (see §6.5). Output is consulted for P1 sizing **only if P2 succeeds at D+14**. If P2 fails:
+
+- Backtest output is **filed as reference** but does NOT justify any P1 variant
+- A failed P2 + favorable backtest data does NOT auto-promote to P1
+- Failed P2 requires re-scoping what failed; backtest cannot "look optimal in historical replay" and override the P2 verdict
+
+This is the next-decision version of "do not change thresholds to fit results."
+
+#### Two-sub-cohort D+14 evaluation (LOCKED)
+
+Pre-registered split because the n=10 currently-open trades passed a hidden selection filter ("open at deploy time → already alive at 2026-05-11T14:03Z").
+
+| Sub-cohort | Definition | Why it matters |
+|---|---|---|
+| **Pre-deploy open** | n=10 stack=3 trades open at 2026-05-11T14:03Z, closed during 14-day window | Deploy-time survivors; passed implicit "still alive" filter |
+| **Post-deploy new** | All stack=3 low-peak trades opened AFTER 2026-05-11T14:03Z, closed during 14-day window | Fresh sample; more representative of forward distribution |
+
+**Combined ship-decision rule:**
+- Both sub-cohorts pass success criteria → P2 succeeds; proceed to P1 backtest consumption
+- Pre-deploy passes, post-deploy fails → **INTERPRETABLE**: P2 only "works" on deploy-time survivors; re-scope. Most likely failure mode being signaled.
+- Pre-deploy fails, post-deploy passes → **INTERPRETABLE**: pre-deploy was a stale/bad cohort; investigate why before promoting
+- Both fail → P2 fails; revert
+- One cohort has n<3 AND the other passes → P2 succeeds on the passing cohort; defer interpretation of the n<3 cohort until n≥5
+- Both have n<3 → extend soak
+
+Without this split, P2 "success" driven entirely by the pre-deploy cohort reads as "P2 works" when actually evidence is limited to deploy-time survivors.
+
+Query template:
+```sql
+-- Pre-deploy sub-cohort
+SELECT * FROM paper_trades
+WHERE conviction_locked_stack >= 3 AND peak_pct < 20
+  AND status LIKE 'closed_%' AND realized_pnl_usd IS NOT NULL
+  AND opened_at < '2026-05-11T14:03'  -- opened BEFORE deploy
+  AND closed_at > '2026-05-11T14:03';  -- closed AFTER deploy
+
+-- Post-deploy sub-cohort
+SELECT * FROM paper_trades
+WHERE conviction_locked_stack >= 3 AND peak_pct < 20
+  AND status LIKE 'closed_%' AND realized_pnl_usd IS NOT NULL
+  AND opened_at >= '2026-05-11T14:03';
+```
+
 ### P3 (cut losers earlier) — No-momentum 24h cutoff
 
 If `peak_pct < 5%` AND `hold_hours >= 24` AND not conviction-locked → close at market.
