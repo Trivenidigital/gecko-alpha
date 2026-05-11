@@ -270,6 +270,69 @@ Per memory `project_session_2026_04_20_perp_enablement.md`: BL-054 was fully ena
   - "Anomaly" definition too narrow given current order-book depth
 - Diagnostic order: (1) SSH `journalctl | grep ws_perp` — listener alive? (2) Check `signal_params` for perp-related rows — disabled? (3) If listener alive + signal enabled: lower threshold by 10%, observe 24h. If still empty → definition is wrong, not threshold.
 
+**§2.6 closure (2026-05-11 evening, mechanism (e) identified):**
+
+Diagnostic chain:
+
+- **(c) Listener dead** — RULED OUT. `perp_watcher_stats` events fire every 60s (1436 events in last 24h). Current process started 2026-05-11T14:03:21Z; watcher is alive throughout.
+- **(d) Write-gate variant** — RULED OUT. The (b'-new) sweep (§2.10) confirmed no separate `PERP_ANOMALIES_SCORING_ENABLED` flag — `PERP_SCORING_ENABLED` gates the scorer signal, not the table write. Write path is reachable when data arrives.
+- **(a) Bybit-disabled + Binance-no-pickup** — PARTIALLY confirmed but underspecified. Prod state: `PERP_BYBIT_ENABLED=false` (known 1000x prefix quirk per memory), `PERP_BINANCE_ENABLED` defaults to `True` (not overridden in prod). The Binance task IS spawned. But no data flows.
+- **(b) Thresholds too high** — MOOT. `baseline_keys: 0` since service start; no data ever reaches the threshold-classifier step.
+
+**Mechanism (e) — new sub-case the original audit didn't enumerate: WebSocket layer produces zero output, no exceptions, no logs.**
+
+Evidence:
+- Distinct perp events across 50,000 journalctl lines: **only `perp_watcher_stats`**. Zero `perp_exchange_stream_error`, zero `perp_exchange_circuit_break`, zero connect/subscribe/frame/EOF events.
+- `_run_exchange_with_supervision` (`scout/perp/watcher.py:217-258`) catches `Exception` and logs `perp_exchange_stream_error` + increments `state.exchange_errors[name]`. Zero such events means **`stream_ticks` is NOT raising** — either `session.ws_connect` hangs in handshake forever, OR it connects and `async for msg in ws:` sits on an empty channel.
+- `scout/perp/binance.py:134-140`: `session.ws_connect(url, headers=None, max_msg_size=0, ...)` — **no explicit timeout passed**. aiohttp ws_connect behavior on session-default-timeout varies; a hung handshake without timeout silently waits.
+- `scout/perp/binance.py` has **zero log statements around the WS lifecycle** — no `ws_connect_attempted`, no `ws_open`, no `ws_closed`, no `ws_subscribe_confirmed`. The connection state is structurally invisible from outside.
+
+Sub-mechanism narrowing requires either:
+- Adding WS lifecycle logging to `scout/perp/binance.py` (FIX work — out of scope for this audit; instrumentation prerequisite to further investigation)
+- External probe: `wscat -c "wss://fstream.binance.com/stream?streams=btcusdt@markPrice/btcusdt@openInterest"` from VPS to verify the URL reaches Binance at all
+- aiohttp connect timeout introduction (~3 LoC) — once handshake fails fast, errors surface via supervision
+
+**§2.6 status: classified-as-mechanism-(e), instrumentation gap identified.** Severity stays HIGH (BL-054 inert 20+ days). The fix shape is **not** a quick `.env` flip (like BL-053) nor a writer rewire — it's "add WS-lifecycle observability so the next investigation can localize handshake-hang vs frames-not-arriving." Sub-mechanism resolution awaits that instrumentation.
+
+**Not in this audit's scope, surfaced as a separate finding:** the watcher emits a heartbeat with nine counters that all read zero whether the watcher is healthy-idle or starved. See §2.11 below.
+
+## §2.11 [NEW FINDING] Heartbeat reports "healthy" while writer produces zero output
+
+Surfaced 2026-05-11 evening during §2.6 diagnosis. **Structurally distinct from §2.1-§2.9 and §2.10.** Not a Class 1 / Class 2 / (b'-new) instance — a new structural critique of monitoring design.
+
+**The observation:**
+
+`perp_watcher_stats` is emitted every ~60 seconds by `_shadow_stats_loop` (`scout/perp/watcher.py:332+`) with nine counters:
+
+```json
+{"dropped_ticks_last_min": 0, "queue_high_water": 0, "malformed_frames_last_min": 0,
+ "exchange_errors_last_min": {}, "baseline_keys": 0, "flush_failures_last_min": 0,
+ "rows_lost_to_flush_failure_last_min": 0, "baseline_rejected_values_last_min": 0,
+ "parse_rejects_last_min": 0, "event": "perp_watcher_stats"}
+```
+
+When the watcher is in mechanism (e) state (`§2.6` — alive but producing zero output), every counter reads zero — and the heartbeat is **structurally indistinguishable** from a healthy-but-idle state (e.g., "no anomalies fired this minute because market was calm").
+
+**The watchdog blind spot:**
+
+The natural watchdog rule for this watcher — "alert if `perp_watcher_stats` hasn't fired in N minutes" — would report green throughout the 20+ day silent failure §2.6 documents. The watcher's heartbeat fires reliably. What it doesn't fire on is the actual failure signal: `baseline_keys: 0 for >N minutes when service uptime > N + 30 minutes`. Nothing in current monitoring acts on that ambiguity-resolving condition.
+
+**The §12c rule shape (draft, NOT yet promoted):**
+
+> **Heartbeat counters that can legitimately be zero are not health signals.** When a counter being zero is ambiguous between "healthy idle" (no activity this window, writer has produced output recently) and "starved" (writer has produced zero output since service start, or for an abnormally long time), the heartbeat cannot distinguish them. Watchdogs must read the writer's INTENDED OUTPUT directly (table row counts, file timestamps, downstream events) — not its INTERNAL STATE (heartbeat counters, "I'm alive" pings). A writer emitting a heartbeat of all-zeros is structurally indistinguishable from a writer that's silently starved.
+
+**Composes with §12a:** the freshness SLO rule (§12a) is correct precisely *because* heartbeat-based monitoring is insufficient. §12a says "every pipeline table ships with freshness SLO + watchdog" — read against output (table writes), not status. §12c is the underlying *why*.
+
+**Composes with §12b:** §12b (alert at write site for automated state reversals) is also output-oriented — fires on the actual write event, not on a status indicator wrapping it.
+
+**Evidence base honesty:** the §12c rule has **one strong direct instance (perp_watcher, §2.6)**. The audit's other findings (Anthropic dry, cryptopanic, etc.) are *suggestive* — heartbeats existed and didn't catch the silent failures — but the specific "counter-zero-is-ambiguous" pattern is most clearly present in §2.6. Promotion to global CLAUDE.md §12c should wait until 3+ direct instances accumulate, OR an explicit operator decision that "1 instance + structural argument" is sufficient. Capturing here while context is hot; promotion is a separate session.
+
+**Immediate action items §12c-derived:**
+
+1. **PR #105 verification — DEFERRED to post-M1.5c-gate, before merge:** Does the audit-snapshot CLI (the future watchdog) read tables directly, or does it consume heartbeat output? If tables → correct §12c-compliant design. If heartbeats → CLI would inherit the same blind spot perp_watcher demonstrated. **Cannot verify now — would violate the agreed soak isolation between detection-surface deploys.** Flag for post-gate verification before merge.
+2. **perp_watcher specifically (next fix session):** instrument the WS lifecycle (§2.6 fix) AND add a heartbeat-side counter for `ws_connect_attempts` / `ws_connected_since` / `frames_received_total` (NOT just last_min) so the "alive but starved" state is detectable from the heartbeat itself. Both at once — partial fix recreates the §12c blind spot.
+3. **Future watchers (BL-NEW-INGEST-WATCHDOG and onwards):** the watchdog design must read its monitored writer's *output*, not its heartbeat. Pre-promotion application of §12c to anything that lands before §12c is formally adopted.
+
 ### §2.7 [HIGH] Memecoin chain dispatch — last fire 2026-05-04
 
 ```sql
