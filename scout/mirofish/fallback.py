@@ -1,11 +1,28 @@
-"""Anthropic fallback for narrative scoring when MiroFish is unavailable."""
+"""Narrative-scoring fallback when MiroFish is unavailable.
+
+Despite the historic "fallback" name, this is the PRIMARY scoring path
+in prod because MiroFish has never been deployed on the VPS (BL-034
+DROPPED). All `mirofish_report` alert-body text comes from here.
+
+BL-NEW-LLM-ROUTER (2026-05-11): supports two providers behind a Settings
+flag so we can route this high-volume call site (60% of LLM spend) to
+OpenRouter+Kimi while keeping signal-critical paths (predictor, counter
+scorer) on Anthropic. Output feeds `alerter.py:48-49` text only — it does
+NOT drive trade gates, so calibration drift risk is minimal.
+
+Switch via .env: `MIROFISH_FALLBACK_PROVIDER=openrouter` + restart. Revert
+by flipping back to `anthropic`. Both providers return the same
+MiroFishResult schema.
+"""
 
 import json
-import structlog
 import re
 
+import aiohttp
 import anthropic
+import structlog
 
+from scout.config import Settings
 from scout.models import MiroFishResult
 
 logger = structlog.get_logger()
@@ -33,6 +50,9 @@ SYSTEM_PROMPT = (
     "No other text. JSON only."
 )
 
+_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_OPENROUTER_TIMEOUT_SEC = 60
+
 
 class FallbackScoringError(Exception):
     """Raised when the fallback LLM returns unparseable or invalid output."""
@@ -40,27 +60,112 @@ class FallbackScoringError(Exception):
 
 async def score_narrative_fallback(
     seed: dict,
-    api_key: str,
-    client: anthropic.AsyncAnthropic | None = None,
+    settings: Settings,
+    *,
+    anthropic_client: anthropic.AsyncAnthropic | None = None,
+    aiohttp_session: aiohttp.ClientSession | None = None,
 ) -> MiroFishResult:
-    """Score a token's narrative using Claude haiku as a fallback.
+    """Score a token's narrative using the provider configured in Settings.
 
-    Uses claude-haiku-4-5 with max_tokens=300. Returns the same MiroFishResult
-    schema as the MiroFish client for compatibility with gate.py.
+    Dispatches to Anthropic (claude-haiku-4-5) or OpenRouter (Kimi via
+    `settings.OPENROUTER_MODEL`) based on `settings.MIROFISH_FALLBACK_PROVIDER`.
+
+    Returns the same MiroFishResult schema regardless of provider.
+
+    Test seam: pass `anthropic_client` or `aiohttp_session` to mock the
+    underlying HTTP call without monkeypatching.
     """
-    if client is None:
-        client = anthropic.AsyncAnthropic(api_key=api_key)
+    provider = (
+        getattr(settings, "MIROFISH_FALLBACK_PROVIDER", "anthropic") or "anthropic"
+    ).lower()
+    if provider == "openrouter":
+        return await _score_via_openrouter(seed, settings, aiohttp_session)
+    # Default to anthropic for any unrecognized value (fail-safe to known-good).
+    return await _score_via_anthropic(seed, settings, anthropic_client)
 
+
+async def _score_via_anthropic(
+    seed: dict,
+    settings: Settings,
+    client: anthropic.AsyncAnthropic | None,
+) -> MiroFishResult:
+    """Anthropic path — preserves pre-BL-NEW-LLM-ROUTER behavior."""
+    if client is None:
+        client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
     message = await client.messages.create(
         model="claude-haiku-4-5",
         max_tokens=300,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": seed["prompt"]}],
     )
-
     text = message.content[0].text
-    logger.debug("fallback_raw_response", text=text[:300])
+    logger.debug("fallback_raw_response", provider="anthropic", text=text[:300])
+    return _parse_result(text)
 
+
+async def _score_via_openrouter(
+    seed: dict,
+    settings: Settings,
+    session: aiohttp.ClientSession | None,
+) -> MiroFishResult:
+    """OpenRouter path — uses OpenAI-compatible chat-completions endpoint."""
+    if not settings.OPENROUTER_API_KEY:
+        raise FallbackScoringError(
+            "MIROFISH_FALLBACK_PROVIDER=openrouter but OPENROUTER_API_KEY is unset"
+        )
+
+    payload = {
+        "model": settings.OPENROUTER_MODEL,
+        "max_tokens": 300,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": seed["prompt"]},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        # OpenRouter recommends these headers for app identification.
+        "HTTP-Referer": "https://github.com/Trivenidigital/gecko-alpha",
+        "X-Title": "gecko-alpha",
+    }
+    timeout = aiohttp.ClientTimeout(total=_OPENROUTER_TIMEOUT_SEC)
+
+    owns_session = session is None
+    if owns_session:
+        session = aiohttp.ClientSession()
+    try:
+        async with session.post(
+            _OPENROUTER_URL, json=payload, headers=headers, timeout=timeout
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise FallbackScoringError(
+                    f"OpenRouter HTTP {resp.status}: {body[:200]}"
+                )
+            data = await resp.json()
+    finally:
+        if owns_session:
+            await session.close()
+
+    try:
+        text = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise FallbackScoringError(
+            f"OpenRouter response missing choices[0].message.content: {e}. "
+            f"Body: {str(data)[:200]}"
+        ) from e
+    logger.debug(
+        "fallback_raw_response",
+        provider="openrouter",
+        model=settings.OPENROUTER_MODEL,
+        text=text[:300],
+    )
+    return _parse_result(text)
+
+
+def _parse_result(text: str) -> MiroFishResult:
+    """Parse the JSON narrative-scoring response (provider-agnostic)."""
     try:
         data = _extract_json(text)
         return MiroFishResult(
@@ -76,9 +181,7 @@ async def score_narrative_fallback(
 
 def _extract_json(text: str) -> dict:
     """Extract JSON from text that may include markdown code blocks."""
-    # Try to find JSON in a code block first
     match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
     if match:
         return json.loads(match.group(1).strip())
-    # Otherwise try to parse the whole text
     return json.loads(text.strip())

@@ -82,6 +82,17 @@ class Settings(BaseSettings):
     # Anthropic fallback
     ANTHROPIC_API_KEY: str
 
+    # BL-NEW-LLM-ROUTER (2026-05-11): OpenRouter alternative for narrative
+    # scoring fallback (60% of total LLM spend per cost analysis). Output
+    # feeds alerter.py:48-49 alert-body text only — does NOT drive trade
+    # gates, so calibration drift risk is minimal. Counter-risk + predictor
+    # + learner + briefing intentionally stay on Anthropic (signal-critical
+    # or low-cost; not worth the calibration soak).
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_MODEL: str = "moonshotai/kimi-k2-thinking"
+    # Provider switch: "anthropic" (default, current behavior) | "openrouter".
+    MIROFISH_FALLBACK_PROVIDER: str = "anthropic"
+
     # Narrative Rotation Agent
     NARRATIVE_POLL_INTERVAL: int = 1800
     NARRATIVE_EVAL_INTERVAL: int = 21600

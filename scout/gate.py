@@ -120,7 +120,7 @@ async def _get_narrative_score(
             error=str(e),
         )
         try:
-            result = await score_narrative_fallback(seed, settings.ANTHROPIC_API_KEY)
+            result = await score_narrative_fallback(seed, settings)
             await db.log_mirofish_job(token.contract_address)
             return result.narrative_score
         except Exception as e:
