@@ -1,12 +1,7 @@
 import asyncio
-import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
-
-import pytest
-import aiosqlite
 
 
 def _seed_db(db_path: str) -> None:
