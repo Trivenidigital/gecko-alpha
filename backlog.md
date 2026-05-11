@@ -242,6 +242,28 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Soak isolation rationale:** Item 2 sends Telegram alerts. Deploying it during BL-NEW-QUOTE-PAIR's 7d soak would mix new alert noise with existing alert-volume measurements, making the +10% revert threshold harder to attribute. Defer until D+3 mid-soak verification of BL-NEW-QUOTE-PAIR (2026-05-12) at minimum.
 **Estimate:** ~2-3 hours coding + tests, ~1 hour reviewer dispatch + fix cycles, ~30 min PR + reviewers + merge + deploy. Same pipeline shape as BL-NEW-QUOTE-PAIR.
 
+### BL-NEW-CI-MASTER-BROKEN: Master CI has 8 consistently failing tests (root cause uninvestigated)
+**Status:** PROPOSED — surfaced 2026-05-11 during audit-snapshot build phase. Discovery: PR #105's CI failures matched master HEAD's CI failures 1:1; checking master CI history shows the same 8 tests failing across the last 5 master runs. Project-level technical debt; not blocking the audit-snapshot work but unblocks any future PR that needs green CI signal.
+**Tag:** `ci` `tech-debt` `silent-degradation`
+**Failed tests (consistent across master runs at commits 2b46b33 / ecf4823 / 160da8b / e960d68 / 5ea197d):**
+- `tests/test_bl064_channel_reload.py::test_reload_disabled_when_interval_is_zero` — TimeoutError
+- `tests/test_calibration_dryrun_scheduler.py::test_calibration_dryrun_scheduler_happy_path_fires_alert` — assert 0 == 1 (send_telegram_message not called)
+- `tests/test_calibration_dryrun_scheduler.py::test_calibration_dryrun_scheduler_idempotency` — assert 0 == 1
+- `tests/test_heartbeat_mcap_missing.py::test_fetch_top_movers_increments_counter` — assert 0 == 1
+- `tests/test_heartbeat_mcap_missing.py::test_fetch_by_volume_increments_counter` — assert 0 == 1
+- `tests/test_narrative_prediction_token_id.py::test_resolution_check_error_fails_closed` — RuntimeError: simulated DB outage
+- `tests/test_signal_params_auto_suspend.py::test_revive_signal_with_baseline_stamps_baseline_and_audit` — assert 'tg_alert_eligible' == 'enabled' (column-name drift?)
+- `tests/test_signal_params_auto_suspend.py::test_revive_signal_with_baseline_on_already_enabled_signal` — assert '0' == '1'
+**Reference CI runs:**
+- Master HEAD failure: https://github.com/Trivenidigital/gecko-alpha/actions/runs/25687904194 (master at 2b46b33, 8 failed / 1992 passed)
+- PR #105 first run: https://github.com/Trivenidigital/gecko-alpha/actions/runs/25692124799 (same 8 failures, 1:1 match)
+**Why this matters:** Five master runs failing on the same 8 tests means the CI signal has been broken across an unknown window. Any future PR that needs green CI to merge has no clean baseline to compare against — failures get hidden in the noise of "8 always fail anyway." This is exactly the silent-degradation pattern that the silent_failure_audit findings doc (2026-05-11) was built to surface.
+**Drift verdict:** Genuinely new — no existing backlog entry tracks CI health. Audit infrastructure (BL-NEW-AUDIT-SNAPSHOT, BL-NEW-INGEST-WATCHDOG, silent-failure-audit watchdog at Priority 6) are forward-looking observability; this is backward-looking "fix the test suite that's already broken."
+**Effect:** No code shipped by this entry — it's a tracking entry for the bug surface. When investigated, root causes likely cluster: 3 tests in `test_signal_params_auto_suspend` + `test_revive_signal_with_baseline_*` suggest a column-name change (`enabled` → `tg_alert_eligible`?) that wasn't reflected in tests; 2 `test_heartbeat_mcap_missing` tests suggest the BL-075 Phase A heartbeat counter is no longer being incremented in the test path; 2 `test_calibration_dryrun_scheduler` tests suggest mock-Telegram setup drift; 1 `test_bl064_channel_reload` timing test is flaky.
+**Risks:** Leaving unaddressed = continued CI-broken status, manual override required for every merge, real regressions hidden in the noise.
+**Estimate:** Investigation ~1-2 hours (per-test triage of last-good vs first-bad commit via git bisect on each); fixes vary by root cause from ~5 min (column rename in test) to ~30 min (mock drift). Total budget: 3-5 hours.
+**Cross-references:** `tasks/findings_silent_failure_audit_2026_05_11.md` §2 (same-day audit of silent-failure surfaces) is the closest sibling; this is the test-suite analogue of that audit's table-write-staleness findings.
+
 ### BL-NEW-AUDIT-SNAPSHOT: Phase B audit-data preservation (snapshot job before 7d prune)
 **Status:** PLANNED — plan locked 2026-05-11 at `tasks/plan_audit_volume_snapshot_phase_b_2026_05_11.md`; brief at `tasks/audit_brief_phase_b_slow_burn_2026_05_11.md`. Implementation queued; deploy timed post-M1.5c soak (post-2026-05-12T02:00Z per R2-M3). Bootstrap deadline 2026-05-17 (when earliest 2026-05-10 detection data is pruned).
 **Tag:** `audit-infra` `phase-b` `pre-registered` `silent-failure-mitigation`
