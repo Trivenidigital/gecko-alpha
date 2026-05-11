@@ -1,0 +1,21 @@
+[Unit]
+Description=Gecko-Alpha — Phase B audit-snapshot of volume_history_cg for slow_burn cohort
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+StateDirectory=gecko-alpha/audit-snapshot
+StateDirectoryMode=0750
+Environment=GECKO_REPO=/root/gecko-alpha
+Environment=GECKO_DB_PATH=/root/gecko-alpha/scout.db
+Environment=GECKO_AUDIT_SOAK_START=2026-05-10T00:00:00+00:00
+Environment=GECKO_AUDIT_SOAK_END=2026-05-25T00:00:00+00:00
+Environment=GECKO_AUDIT_HEARTBEAT_FILE=/var/lib/gecko-alpha/audit-snapshot/snapshot-last-ok
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/usr/bin/test -x /usr/local/bin/gecko-audit-snapshot.sh
+ExecStart=/usr/local/bin/gecko-audit-snapshot.sh
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
