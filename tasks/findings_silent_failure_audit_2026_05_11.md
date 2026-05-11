@@ -419,6 +419,54 @@ PR #64's intent was to populate `mcap_at_completion` at chain_match write time. 
 
 **§2.12 status: filed-as-new-finding.** Severity HIGH (BL-074 chain-completed dispatch depends on memecoin chain_matches; 8 days of zero matches is operational impact). Deferred to a dedicated session per the BL-071a sequencing discipline — investigation of (Y) requires fresh head and reading more code than the diagnosis tonight had budget for.
 
+**§2.12 investigation update (2026-05-11 evening, hypothesis space narrowed):**
+
+Per the 4 pre-registered hypotheses, partial investigation eliminated some and refined others. Diagnostic depth limited by remaining session budget (next-step requires careful read of `_advance_chain` pattern-step semantics — fresh-head work).
+
+**Hypothesis (4) — PR #64 silently broke writer path: UNLIKELY.** Code-read of PR #64 (`cbb1e7f`) changes to `_record_completion` in `scout/chains/tracker.py:488`:
+- Memecoin-specific writer branch is gated `if chain.pipeline == "memecoin" and session is not None`
+- DexScreener fetch wrapped in `try: ... except Exception: result = None` — fail-soft
+- `fetch_token_fdv` has explicit timeouts (15s total, 5s connect; `scout/chains/mcap_fetcher.py:45-46`)
+- `mcap_at_completion` stays None on any failure path; INSERT proceeds
+- Narrative writer path is unchanged — and narrative chain_matches continue firing (last 2026-05-11T16:43:05Z = today), confirming the writer isn't globally broken
+
+**Hypothesis (1) — memecoin upstream signal cessation: PARTIALLY CONFIRMED but incomplete explanation.** signal_events distribution by event_type for memecoin pipeline:
+
+| event_type | total | last fire |
+|---|---:|---|
+| `candidate_scored` | 6,057,629 | 2026-05-11T23:02 (today) |
+| `conviction_gated` | 104,407 | 2026-05-11T23:02 (today) |
+| `chain_complete` | 146 | 2026-05-04T00:26 (cessation) |
+| `counter_scored` | **2** | **2026-05-02T00:00 (cessation; only 2 events ever)** |
+
+So:
+- `candidate_scored` and `conviction_gated` continue flowing in millions post-PR-#64. Upstream detection layer is alive and producing events.
+- `chain_complete` signal_events are OUTPUT of chain detection (emitted from `_record_completion` at `scout/chains/tracker.py:574`). Their cessation is circular with chain_matches cessation — same event.
+- **`counter_scored` for memecoin pipeline only ever fired twice** (2026-05-01 + 2026-05-02). It's been at zero since 2026-05-02 — TWO DAYS BEFORE PR #64 merged.
+
+Volume_breakout pattern definition (from `chain_patterns.steps_json`):
+1. `candidate_scored` with `signal_count >= 2`
+2. `candidate_scored` with `signal_count >= 3` (within 4h)
+3. `counter_scored` with `risk_score < 50` (within 6h)
+4. `conviction_gated` (within 8h)
+
+`min_steps_to_trigger = 3` of 4. With counter_scored almost-never-firing for memecoin pipeline, the pattern *must* have been matching via {1, 2, 4} step combinations (skipping step 3). But 146 chain_matches accumulated despite this — so the pattern *did* match without step 3, somehow.
+
+**Sharper question for next session:** with `candidate_scored` and `conviction_gated` still flowing in millions, why does `_advance_chain` no longer produce volume_breakout matches?  Possible mechanisms:
+- (1') Pattern step ordering semantics in `_advance_chain` require step 3 to be matched-or-explicitly-skipped, and the skip path broke
+- (2') The pattern step combination that was matching (probably {1, 2, 4}) requires temporal ordering that's now violated by event-stream timing changes
+- (3') counter_scored cessation 2026-05-02 might trigger a guard somewhere that prevents the pattern from advancing — though `chain_complete` fires continued until 2026-05-04T00:26 despite counter_scored being at zero
+- (4') Some pattern-state cleanup change in PR #64 (the +441/-88 diff to tracker.py) inadvertently invalidated active chains that were in steps 1-2 but waiting for step 4
+
+**Diagnostic order for next session (~30-45 min):**
+
+1. **Read `_advance_chain` carefully** — understand the exact pattern-step matching semantics. What does `min_steps_to_trigger=3` allow as valid step subsets? Is there a step-skip path or does the chain require consecutive matches?
+2. **Test directly:** find 1 memecoin token from prod that fires candidate_scored ≥2 + ≥3 + conviction_gated in sequence. Manually trace what `_advance_chain` would do with those events. If it should produce a chain_match but doesn't, that's the bug.
+3. **Cross-check the cooldown logic** (`_in_cooldown` at tracker.py:157) — could the recent-completion-cooldown be suppressing all new volume_breakout matches if the cooldown window is too long?
+4. **If still no answer:** git-bisect the chain detection code between 2026-05-03 and 2026-05-04 changes (PR #63 Bundle A + PR #64) for behavior changes in the matching path.
+
+**§2.12 mechanism is narrower than at filing time.** Not "PR #64 broke the writer" (ruled out) and not "millions of events stopped" (refuted by data). It's somewhere in chain pattern-matching semantics or a pattern-state cleanup change. The investigation depth required for full resolution is reading code carefully, not running SQL queries — fresh-head work.
+
 ### §2.8 [MEDIUM] `high_peak_fade_audit` only 7 rows
 
 BL-NEW-HPF deployed 2026-05-04 per memory. 7 audit rows in 7 days = 1/day. Could be legitimately rare (high-peak fades only fire on tokens that reach high peaks) or could indicate the detector is partially broken. **Worth a manual cross-check** against trades with peak_pct ≥ HPF threshold to verify expected fire rate.
