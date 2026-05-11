@@ -177,6 +177,13 @@ Restart `gecko-pipeline.service`. Monitor after flip:
 
 **Meta-implication worth scanning for separately:** how many other shipped-but-default-off features have the same gap? `CRYPTOPANIC_SCORING_ENABLED` (config.py:237, default False) is one immediate sibling. The live-trading family (`LIVE_TRADING_ENABLED`, `LIVE_USE_REAL_SIGNED_REQUESTS`, `LIVE_USE_ROUTING_LAYER`) is intentionally guarded by design — NOT a deploy-without-activate (different shape: guarded-by-design vs flag-flip-never-happened). Worth a one-pass scan when prioritizing P4 cleanups.
 
+**§2.2 closure (Path A selected 2026-05-11 evening):** Sub-checks confirmed Path A is correct:
+
+- *Sub-check 1* (prod `SCAN_INTERVAL_SECONDS`): verified **60s** on prod. Design assumed 300s (12 req/hr); current state is **60 req/hr** at the **low end** of the CryptoPanic free-tier band (50-200 req/hr per design doc §3). Rate-limit concern is real, not phantom. **Surfaced separate finding** about design-time assumptions vs current cycle frequency → filed as `BL-NEW-CYCLE-CHANGE-AUDIT` in backlog.
+- *Sub-check 2* (operator intent for news data): backlog "Virality Detection Roadmap" lists CryptoPanic as Source #2 for news/macro events (roadmap-level intent EXISTS), but no "validated-and-blocked" claim was found — deploy memory documents activation as "how-to-enable-when-ready" guidance, not a blocked-on-condition workflow. Path A remains correct; the activation path is well-specified for future operator pickup.
+
+**Deactivation formalized in backlog** as `BL-053: CryptoPanic news feed (shipped 2026-04-20, deactivated by default — operator activation pending)` with full 5-point activation conditions (both flags + token + scorer recalibration + decoupled interval + §12a SLO, as one coherent PR). §2.2 now **closed-as-operator-decision-resolved**. Severity downgrade CRITICAL → OPERATOR-DECISION sticks. Future audits should not re-surface this finding.
+
 ### §2.3 [REFRAMED — withdrawn from CRITICAL] shadow_trades correctly idle, BL-055 unlock is policy-blocked
 
 **Original claim (incorrect):** "writer disconnected by M1.5 refactor wave, requires rewiring."
