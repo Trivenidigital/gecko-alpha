@@ -242,6 +242,57 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Soak isolation rationale:** Item 2 sends Telegram alerts. Deploying it during BL-NEW-QUOTE-PAIR's 7d soak would mix new alert noise with existing alert-volume measurements, making the +10% revert threshold harder to attribute. Defer until D+3 mid-soak verification of BL-NEW-QUOTE-PAIR (2026-05-12) at minimum.
 **Estimate:** ~2-3 hours coding + tests, ~1 hour reviewer dispatch + fix cycles, ~30 min PR + reviewers + merge + deploy. Same pipeline shape as BL-NEW-QUOTE-PAIR.
 
+### BL-NEW-PARSE-MODE-AUDIT: Project-wide `send_telegram_message` parse_mode hygiene
+**Status:** PROPOSED — surfaced 2026-05-11 during §2.9 fix (PR #106). The auto_suspend bug was one instance of a systemic class. Filing now to preserve the inventory while the analysis is fresh; per-site fixes are a separate PR (or a series of small PRs grouped by area).
+**Tag:** `silent-failure` `tg-alert` `parse_mode` `class-2-residual`
+**Why:** `alerter.send_telegram_message` defaults to `parse_mode="Markdown"`. Telegram MarkdownV1 parses unbalanced `_ * [ ] \`` as formatting markers — when a message body contains a signal name (`gainers_early`, `hard_loss`, `trending_catch`) or token symbol (e.g., `AS_ROID`) with stray markdown chars, Telegram returns HTTP 200 with the body silently mangled (markers consumed, weird italics applied). The §2.9 trending_catch incident on 2026-05-11T01:00:26Z is the worked example: operator received the alert but didn't recognize it as auto-suspend. PR #106 fixes the two auto_suspend sites; the remaining call sites need site-by-site audit.
+**Drift verdict:** NET-NEW. No existing backlog entry tracks this class. PR #106 closes the §2.9 *instance*; this entry tracks the *class*. CLAUDE.md §12b (global) now encodes the rule; existing call sites pre-date the rule and need retroactive verification.
+**Hermes verdict:** No Hermes skill covers Telegram-payload-parse-mode hygiene. Project-internal.
+
+**Inventory (24 total `send_telegram_message` call sites in `scout/`):**
+
+*Already pass `parse_mode=None` (7 — verified 2026-05-11):*
+- `scout/main.py:250` (calibration dry-run alert — PR #76 silent-failure C1 fix)
+- `scout/main.py:991` (heartbeat/health summary)
+- `scout/main.py:1051` (heartbeat/health summary)
+- `scout/main.py:1189` (per PR-stage adv-S2 fix)
+- `scout/trading/auto_suspend.py:272` (hard_loss — PR #106)
+- `scout/trading/auto_suspend.py:327` (pnl_threshold — PR #106)
+- `scout/trading/tg_alert_dispatch.py:312` (BL-NEW-TG-ALERT-ALLOWLIST R1-C1 fold)
+
+*Default to Markdown — needs audit (15 sites):*
+- `scout/chains/alerts.py:59` — chain pattern alerts (likely contains signal names)
+- `scout/live/loops.py:251` — live trading alerts (token symbols + signal names)
+- `scout/main.py:165` — combo_refresh failure (generic body, low risk)
+- `scout/main.py:350` — chunked summary (body unclear)
+- `scout/main.py:433` — generic summary (body unclear)
+- `scout/main.py:1521` — daily summary (formatted text with signal names)
+- `scout/narrative/agent.py:557` — narrative LEARN reflection
+- `scout/narrative/agent.py:715` — narrative LEARN reflection
+- `scout/secondwave/detector.py:285` — secondwave alerts (token symbols)
+- `scout/social/lunarcrush/alerter.py:144` — LunarCrush social alerts
+- `scout/trading/calibrate.py:354` — calibration applied (HIGH RISK — body iterates over signal_type)
+- `scout/trading/suppression.py:186` — suppression alerts (signal-info body)
+- `scout/trading/weekly_digest.py:335` — weekly digest chunks
+- `scout/trading/weekly_digest.py:340` — weekly digest tail
+- `scout/velocity/detector.py:193` — velocity alerts (token symbols)
+
+**Effect:** Per-site decision — `parse_mode=None` for system-health/diagnostic alerts where formatting adds no value; `_escape_md(value)` for user-data fields inside intentionally-formatted operator-visible messages (chains/alerts, daily summary). Each site reviewed for whether body could realistically contain `_ * [ ] \``.
+
+**Triage hint:** HIGH RISK = body iterates over signal_type or token symbols (calibrate.py:354, chains/alerts.py:59, secondwave/detector.py:285, suppression.py:186, weekly_digest.py:335/340, velocity/detector.py:193, narrative/agent.py:557/715, live/loops.py:251); LOW RISK = body is static or controlled (main.py:165 combo_refresh, main.py:350/433 chunked).
+
+**Risks of NOT fixing:** Each high-risk site can produce a silent-rendering alert that operator doesn't recognize, exactly matching the §2.9 pattern. The class-2 silent-failure surface stays open until each site is audited.
+**Risks of fixing all at once:** A single sprawling PR conflates 15 review surfaces. Better to group by module area (e.g., one PR for `scout/trading/`, one for `scout/narrative/`, one for `scout/main.py` daily-summary sites) and ship sequentially.
+
+**Discovery:** PR #106 grep audit 2026-05-11. Inventory preserved here before head-state decays.
+**Estimate:** ~1-2 hours per area group (read each call's body context + decide `parse_mode=None` vs `_escape_md` + test). Total 3-5 hours across all 15 sites. Sequenceable independently — no shared state, no soak risk.
+
+**Cross-references:**
+- PR #106 (instance fix at auto_suspend) — closure pattern for each site
+- Global CLAUDE.md §12b — encodes the rule the audit enforces
+- Project CLAUDE.md "What NOT To Do" — pointers to global §12b + worked example
+- `tasks/findings_silent_failure_audit_2026_05_11.md` §2.9 — original finding
+
 ### BL-034: Set up MiroFish Docker integration
 **Status:** DROPPED — Claude Haiku fallback is sufficient, gate lowered to MIN_SCORE=25
 **Files:** docker-compose.yml, scout/mirofish/client.py

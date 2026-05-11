@@ -83,6 +83,8 @@ review verifies accuracy.
 - No `os.getenv()` in business logic (use Settings)
 - Do not auto-bump Telethon in dependabot PRs — upstream is archived (Feb 2026); manual review required for every version change. Fallback path is fork-at-pinned-version, NOT Hydrogram (GPL + pre-1.0). See BL-064 spec.
 - Never commit `*.session` files — they authenticate as the user (full Telegram identity); treat as secret material, mode 0600, exclude from backup tarballs.
+- Do not pass user-supplied or signal-name strings to `alerter.send_telegram_message` with the default `parse_mode="Markdown"`. Signal names contain `_` (`gainers_early`, `hard_loss`, `trending_catch`) which Telegram MarkdownV1 parses as italics markers, mangling the message body without returning an error. Pass `parse_mode=None` for system-health alerts, OR `_escape_md(value)` for user-data fields inside intentionally-formatted messages. See global CLAUDE.md §12b for the rule; `scout/trading/auto_suspend.py` for the worked example.
+- Every automated state change reversing operator-applied state must emit `*_alert_dispatched` + `*_alert_delivered` structured logs around the Telegram call. The default alerter logs only on failure, so success is silent — making "no logs" ambiguous between "delivered cleanly" and "skipped." See global CLAUDE.md §12b.
 
 ## MiroFish Integration
 
