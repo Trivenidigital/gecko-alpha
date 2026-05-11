@@ -315,6 +315,32 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 **Operator-side evaluation worth doing now (zero gecko-alpha code change):** install Hermes + Minara on a terminal you control, manually execute a small number of trades on alerts gecko-alpha currently surfaces to Telegram. This is the cheapest way to assess Minara's execution quality on signals you already trust. Outcome of that trial directly informs adapter-shape choice (a) vs. (b) above.
 
+### BL-NEW-LOW-PEAK-LOCK: apply conviction-lock widening to trail_pct_low_peak (P2)
+**Status:** SHIPPED 2026-05-11 — PR #100 (`e960d68`) squash-merged + deployed VPS 2026-05-11T14:03Z. Fixes silent BL-067 contract violation at `scout/trading/evaluator.py:168` where conviction-lock widening was explicitly bypassed for low_peak trades. See `tasks/findings_sustain_winners_cut_losers_2026_05_11.md` §5 + memory `project_p2_low_peak_lock_shipped_2026_05_11.md`.
+**Tag:** `osmo-fix` `bl-067-completion` `surgical-fix` `proof-of-mechanism-for-p1`
+**Trigger:** OSMO #1838 (paper, 2026-05-10) — stack=3 conviction-locked, peaked +13.3%, trail-exited at 8.6% drawdown for +$11/+3.67%, then token ran +87% post-exit. Bug: the 8% `trail_pct_low_peak` fired despite stack=3 supposedly adding +10pp via BL-067.
+**What shipped:** `_CONVICTION_LOCK_DELTAS` extended with `trail_pct_low_peak` field per stack tier (stack=2 +5pp, stack=3 +10pp, stack=4 +15pp; all cap at 25%). `conviction_locked_params()` returns the widened value when base supplies it (backwards-compat for `scripts/backtest_conviction_lock.py` which uses 3-field shape). Evaluator passes `sp.trail_pct_low_peak` in base + applies locked value via `dataclasses.replace`. Backwards-compatible — paper trades stay open at same rate; only trail width inside the low-peak branch widens for conviction-locked trades.
+
+**Empirical justification:** n=75 trail-stop-winners-with-peak<20% show uniform 10pp giveback across all signal types AND all mcap tiers ($5M-$250M+). Mcap-tier hypothesis explicitly **TESTED AND REJECTED** — findings §4.5.
+
+**Blast radius (verified 2026-05-11):** 10 currently-open stack=3 gainers_early trades with peak<20%, $3,000 capital. Realistic 14d sample: 3-7 closes.
+
+**Pre-registered evaluation criteria (locked, see findings §5):**
+- **Success:** ≥50% qualifying closes giveback ≤5pp + mean ≤6pp + none >15pp
+- **Failure:** (≥2 SL paths at -25% loss) OR (≥3 expiry worse than baseline 8% trail would have realized = peak × 0.92) OR (mean PnL across qualifying closes <0)
+- **n<5 at D+14:** positive → extend soak 14d (do NOT proceed to P1); negative → revert; neutral → extend
+
+**Dependency:** P1-uniform width-lock backtest is GATED on P2 success. If P2 fails, P1 does NOT auto-ship — re-scope based on revealed failure mode.
+
+**What this does NOT close:**
+- 91% of n=75 finding surface (99 non-locked trades with peak<20%) — pending P1-uniform after width-lock backtest (scoped findings §6.5, infrastructure verified in `scripts/backtest_conviction_lock.py`)
+- Moonshot floor neutralization at peak≥40% — tracked separately in `tasks/findings_moonshot_floor_nullification.md`
+- Conviction-lock now operates in two of three peak regimes (low_peak ✅ + middle band ✅), still neutralized at moonshot regime ❌
+
+**Revert:** `UPDATE signal_params SET conviction_lock_enabled=0` (disables BL-067 entirely incl. the widening). For narrower revert, `PAPER_CONVICTION_LOCK_ENABLED=False` in .env + restart.
+
+**D+14 evaluation:** 2026-05-25T14:03Z. Query template in memory file.
+
 ### BL-NEW-LIVE-ELIGIBLE: would_be_live writer with tier-based eligibility (BL-060 revival)
 **Status:** SHIPPED 2026-05-11 — PR #98 (`8a07662`) squash-merged + deployed VPS 2026-05-11T13:22Z. Closes the ~3-week-old BL-060 writer gap (column existed since 2026-04-23 but all 752 closed trades had NULL/0). See data analysis `tasks/findings_live_eligibility_winners_vs_losers_2026_05_11.md` + memory `project_live_eligible_writer_shipped_2026_05_11.md`.
 **Tag:** `observability` `bl060-revival` `data-driven-thresholds` `pre-execution-routing`
