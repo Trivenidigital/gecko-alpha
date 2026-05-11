@@ -1,0 +1,11 @@
+[Unit]
+Description=Gecko-Alpha — daily watchdog: Phase B audit-snapshot freshness
+
+[Timer]
+OnCalendar=*-*-* 10:00:00
+Persistent=true
+AccuracySec=30m
+Unit=gecko-audit-snapshot-watchdog.service
+
+[Install]
+WantedBy=timers.target

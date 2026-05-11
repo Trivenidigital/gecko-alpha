@@ -1,0 +1,24 @@
+[Unit]
+Description=Gecko-Alpha — alert if Phase B audit-snapshot is stale
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=GECKO_AUDIT_STALE_AFTER_SEC=108000
+Environment=GECKO_AUDIT_HEARTBEAT_FILE=/var/lib/gecko-alpha/audit-snapshot/snapshot-last-ok
+Environment=GECKO_REPO=/root/gecko-alpha
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+ExecStartPre=/usr/bin/test -x /usr/local/bin/gecko-audit-snapshot-watchdog.sh
+ExecStartPre=/usr/bin/test -x /usr/bin/curl
+ExecStart=/usr/local/bin/gecko-audit-snapshot-watchdog.sh
+# Exit 1 = "heartbeat stale + alert delivered HTTP 200" — designed behavior.
+# Treat as success so systemctl status only shows `failed` for real errors
+# (exit 4 env file missing, 5 placeholder creds, 6 no python, 7 HTTP non-200).
+SuccessExitStatus=1
+TimeoutStartSec=60
+StandardOutput=journal
+StandardError=journal
