@@ -5,11 +5,11 @@ Shared module for stack counting and locked-param composition. Used by:
 - scripts/backtest_conviction_lock.py (research backtest, via thin
   asyncio.run() sync wrapper)
 
-Per backlog.md:374-380 spec table:
+Per backlog.md:374-380 spec table + BL-NEW-LOW-PEAK-LOCK 2026-05-11:
 - stack=1: defaults (no lock)
-- stack=2: +72h max, +5pp trail (cap 35), +5pp sl (cap 35)
-- stack=3: +168h max, +10pp trail (cap 35), +10pp sl (cap 40)
-- stack>=4: +336h max, +15pp trail (cap 35), +15pp sl (cap 40)
+- stack=2: +72h max, +5pp trail (cap 35), +5pp trail_low_peak (cap 25), +5pp sl (cap 35)
+- stack=3: +168h max, +10pp trail (cap 35), +10pp trail_low_peak (cap 25), +10pp sl (cap 40)
+- stack>=4: +336h max, +15pp trail (cap 35), +15pp trail_low_peak (cap 25), +15pp sl (cap 40)
 
 Validated by tasks/findings_bl067_backtest_conviction_lock.md (lift
 +114% at N=3 threshold, both compound gates PASS).
