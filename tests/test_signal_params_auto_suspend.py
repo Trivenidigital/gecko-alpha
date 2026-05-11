@@ -51,6 +51,62 @@ async def _insert_closed_trade(
     )
 
 
+async def test_suspend_clears_tg_alert_eligible_jointly(tmp_path, settings_factory):
+    """V3-I2 PR-stage fold: auto-suspend clears BOTH enabled AND
+    tg_alert_eligible (R2-I1 joint flag maintenance)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT enabled, tg_alert_eligible FROM signal_params "
+        "WHERE signal_type='gainers_early'"
+    )
+    pre = await cur.fetchone()
+    assert pre[0] == 1 and pre[1] == 1
+    for _ in range(30):
+        await _insert_closed_trade(db, signal_type="gainers_early", pnl_usd=-100)
+    await db._conn.commit()
+    s = settings_factory(SIGNAL_PARAMS_ENABLED=True)
+    suspended = await maybe_suspend_signals(db, s, session=None)
+    assert any(r["signal_type"] == "gainers_early" for r in suspended)
+    cur = await db._conn.execute(
+        "SELECT enabled, tg_alert_eligible FROM signal_params "
+        "WHERE signal_type='gainers_early'"
+    )
+    row = await cur.fetchone()
+    assert row[0] == 0 and row[1] == 0
+    cur = await db._conn.execute(
+        "SELECT old_value, new_value FROM signal_params_audit "
+        "WHERE signal_type='gainers_early' AND field_name='tg_alert_eligible' "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    audit = await cur.fetchone()
+    assert audit is not None and audit[0] == "1" and audit[1] == "0"
+    await db.close()
+
+
+async def test_suspend_no_falsified_audit_for_already_zero(tmp_path, settings_factory):
+    """V1-I1 PR-stage fold: signals starting at tg_alert_eligible=0
+    (e.g., trending_catch) don't get a falsified '1->0' audit row."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT tg_alert_eligible FROM signal_params "
+        "WHERE signal_type='trending_catch'"
+    )
+    assert (await cur.fetchone())[0] == 0
+    for _ in range(30):
+        await _insert_closed_trade(db, signal_type="trending_catch", pnl_usd=-100)
+    await db._conn.commit()
+    s = settings_factory(SIGNAL_PARAMS_ENABLED=True)
+    await maybe_suspend_signals(db, s, session=None)
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM signal_params_audit "
+        "WHERE signal_type='trending_catch' AND field_name='tg_alert_eligible'"
+    )
+    assert (await cur.fetchone())[0] == 0
+    await db.close()
+
+
 async def test_no_op_when_flag_off(tmp_path, settings_factory):
     db = Database(tmp_path / "t.db")
     await db.initialize()

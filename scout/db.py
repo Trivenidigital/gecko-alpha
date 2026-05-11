@@ -100,6 +100,7 @@ class Database:
         await self._migrate_bl_quote_pair_v1()
         await self._migrate_reject_reason_extend_v2()
         await self._migrate_bl_slow_burn_v1()
+        await self._migrate_tg_alert_eligible_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -3100,6 +3101,101 @@ class Database:
                 f"expected 'bl_slow_burn_v1_slow_burn_candidates', got {row[0]!r}"
             )
 
+    async def _migrate_tg_alert_eligible_v1(self) -> None:
+        """BL-NEW-TG-ALERT-ALLOWLIST: per-signal TG alert eligibility.
+
+        Schema version 20260516. Adds signal_params.tg_alert_eligible
+        (default 0). Sets eligibility=1 for the 4 statistically-validated
+        signals (gainers_early, narrative_prediction, losers_contrarian,
+        volume_spike). chain_completed stays 0 because the existing
+        scout/chains/alerts.py path already alerts on chain pattern
+        completion; setting it 1 here would duplicate.
+
+        Creates tg_alert_log for audit + cooldown lookup. CHECK constraint
+        admits 'announcement_sent' for first-deploy operator announcement
+        sentinel (R2-C1 design fold).
+
+        Per-signal post-assertion (R1-C2 design fold) — robust to future
+        signal_params seed-list changes vs COUNT(*)=4.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+        DEFAULT_ALLOW = (
+            "gainers_early",
+            "narrative_prediction",
+            "losers_contrarian",
+            "volume_spike",
+        )
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            cur = await conn.execute("PRAGMA table_info(signal_params)")
+            cols = {row[1] for row in await cur.fetchall()}
+            if "tg_alert_eligible" not in cols:
+                await conn.execute(
+                    "ALTER TABLE signal_params ADD COLUMN "
+                    "tg_alert_eligible INTEGER NOT NULL DEFAULT 0"
+                )
+            for sig in DEFAULT_ALLOW:
+                await conn.execute(
+                    "UPDATE signal_params SET tg_alert_eligible=1 "
+                    "WHERE signal_type = ?",
+                    (sig,),
+                )
+            await conn.execute("""CREATE TABLE IF NOT EXISTS tg_alert_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_trade_id INTEGER REFERENCES paper_trades(id) ON DELETE SET NULL,
+                    signal_type TEXT NOT NULL,
+                    token_id    TEXT NOT NULL,
+                    alerted_at  TEXT NOT NULL,
+                    outcome     TEXT NOT NULL CHECK (outcome IN (
+                        'sent','blocked_eligibility',
+                        'blocked_cooldown','dispatch_failed',
+                        'announcement_sent'
+                    )),
+                    detail      TEXT
+                )""")
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tg_alert_log_token "
+                "ON tg_alert_log(token_id, alerted_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260516, now_iso, "bl_tg_alert_eligible_v1"),
+            )
+            await conn.commit()
+        except Exception as e:
+            _log.exception(
+                "schema_migration_failed",
+                migration="bl_tg_alert_eligible_v1",
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_tg_alert_eligible_v1")
+            raise
+
+        # Per-signal post-assertion (R1-C2 fold)
+        for sig in DEFAULT_ALLOW:
+            cur = await conn.execute(
+                "SELECT tg_alert_eligible FROM signal_params " "WHERE signal_type = ?",
+                (sig,),
+            )
+            row = await cur.fetchone()
+            if not (row and row[0] == 1):
+                raise RuntimeError(
+                    f"bl_tg_alert_eligible_v1 post-assert: {sig!r} not eligible"
+                )
+
     async def revive_signal_with_baseline(
         self,
         signal_type: str,
@@ -3237,16 +3333,33 @@ class Database:
                 raise ValueError(f"unknown signal_type: {signal_type}")
             old_enabled = row[0]
 
+            # R2-I1 design fold: restore tg_alert_eligible=1 jointly with
+            # enabled if signal is in DEFAULT_ALLOW_SIGNALS. Auto-suspend
+            # cleared both flags; revive restores both for default-allow
+            # signals so operator doesn't have to manually re-enable
+            # alerting after a Tier 1b cycle.
+            from scout.trading.tg_alert_dispatch import DEFAULT_ALLOW_SIGNALS
+
+            restore_eligible = 1 if signal_type in DEFAULT_ALLOW_SIGNALS else 0
+            # V3-I3 PR-stage fold: log decision so operator sees why
+            # non-default-allow opt-in wasn't restored after revive.
+            _db_log.info(
+                "signal_revived_tg_eligible",
+                signal_type=signal_type,
+                restored_to=restore_eligible,
+                in_default_allow=signal_type in DEFAULT_ALLOW_SIGNALS,
+            )
             await conn.execute(
                 """UPDATE signal_params
                    SET enabled = 1,
+                       tg_alert_eligible = ?,
                        suspended_at = NULL,
                        suspended_reason = NULL,
                        drawdown_baseline_at = ?,
                        updated_at = ?,
                        updated_by = ?
                    WHERE signal_type = ?""",
-                (now_iso, now_iso, operator, signal_type),
+                (restore_eligible, now_iso, now_iso, operator, signal_type),
             )
             await conn.execute(
                 """INSERT INTO signal_params_audit
@@ -3254,6 +3367,19 @@ class Database:
                     reason, applied_by, applied_at)
                    VALUES (?, 'enabled', ?, '1', ?, ?, ?)""",
                 (signal_type, str(old_enabled), audit_reason, operator, now_iso),
+            )
+            await conn.execute(
+                """INSERT INTO signal_params_audit
+                   (signal_type, field_name, old_value, new_value,
+                    reason, applied_by, applied_at)
+                   VALUES (?, 'tg_alert_eligible', '0', ?, ?, ?, ?)""",
+                (
+                    signal_type,
+                    str(restore_eligible),
+                    f"revive joint flag: {audit_reason}",
+                    operator,
+                    now_iso,
+                ),
             )
             await conn.commit()
         except ValueError:

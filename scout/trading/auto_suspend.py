@@ -117,9 +117,21 @@ async def _suspend(
     Caller is responsible for the surrounding ``BEGIN EXCLUSIVE`` so the
     suspend + audit + Telegram are one transaction.
     """
+    # V1-I1 PR-stage fold: read pre-update tg_alert_eligible.
+    cur = await conn.execute(
+        "SELECT tg_alert_eligible FROM signal_params WHERE signal_type = ?",
+        (signal_type,),
+    )
+    pre_row = await cur.fetchone()
+    pre_eligible = str(pre_row[0]) if pre_row and pre_row[0] is not None else "0"
+    # R2-I1 design fold: clear tg_alert_eligible jointly with enabled so
+    # auto-suspended signals don't continue alerting after they stop
+    # producing paper trades. Revive helper restores =1 if signal in
+    # DEFAULT_ALLOW_SIGNALS.
     await conn.execute(
         """UPDATE signal_params
            SET enabled = 0,
+               tg_alert_eligible = 0,
                suspended_at = ?,
                suspended_reason = ?,
                updated_at = ?,
@@ -134,6 +146,15 @@ async def _suspend(
            VALUES (?, 'enabled', '1', '0', ?, 'auto_suspend', ?)""",
         (signal_type, f"{reason}: {detail}", now_iso),
     )
+    # V1-I1 fold: only emit audit row if value actually changed.
+    if pre_eligible != "0":
+        await conn.execute(
+            """INSERT INTO signal_params_audit
+               (signal_type, field_name, old_value, new_value,
+                reason, applied_by, applied_at)
+               VALUES (?, 'tg_alert_eligible', ?, '0', ?, 'auto_suspend', ?)""",
+            (signal_type, pre_eligible, f"joint suspend: {reason}", now_iso),
+        )
 
 
 async def maybe_suspend_signals(

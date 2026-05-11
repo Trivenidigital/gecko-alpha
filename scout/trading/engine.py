@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime, timezone
 
@@ -90,6 +91,7 @@ class TradingEngine:
         settings,
         *,
         live_engine=None,
+        session=None,
     ) -> None:
         self.mode = mode
         self.db = db
@@ -99,6 +101,27 @@ class TradingEngine:
         self._paper_trader = PaperTrader(live_engine=live_engine)
         # Monotonic start marker for the warmup window
         self._started_at = time.monotonic()
+        # BL-NEW-TG-ALERT-ALLOWLIST (R1-I3+I5 design fold): aiohttp.ClientSession
+        # for TG dispatch. Wired AFTER construction by main.py via
+        # set_tg_session(session) inside the cycle's ClientSession block,
+        # because the engine is constructed BEFORE the ClientSession
+        # context manager opens. None during the brief construction-to-
+        # set_tg_session window means TG alerts can't fire — but no paper
+        # trades are processed in that window either.
+        self._tg_session = session
+        # R1-C3 design fold: ref-holding set so spawned alert tasks aren't
+        # GC'd mid-flight (mirrors scout/main.py:91 `_social_restart_tasks`
+        # pattern). Mid-flight loss on shutdown is acceptable — paper
+        # trade row is committed; only the alert + log row is lost.
+        self._tg_alert_tasks: set[asyncio.Task] = set()
+
+    def set_tg_session(self, session) -> None:
+        """Wire the aiohttp.ClientSession used for TG alert dispatch.
+
+        scout/main.py calls this inside the cycle's `async with
+        aiohttp.ClientSession() as session:` block.
+        """
+        self._tg_session = session
 
     async def open_trade(
         self,
@@ -328,10 +351,84 @@ class TradingEngine:
                 lead_time_vs_trending_min=lead_time_min,
                 lead_time_vs_trending_status=lead_time_status,
             )
+            # BL-NEW-TG-ALERT-ALLOWLIST: post-open Telegram alert hook.
+            # Fire-and-forget; never blocks paper-trade success path.
+            if trade_id is not None:
+                await self._spawn_tg_alert(
+                    trade_id=trade_id,
+                    signal_type=signal_type,
+                    token_id=token_id,
+                    symbol=symbol,
+                    amount_usd=trade_amount,
+                    signal_data=signal_data,
+                )
             return trade_id
 
         log.warning("trade_mode_not_supported", mode=self.mode)
         return None
+
+    async def _spawn_tg_alert(
+        self,
+        *,
+        trade_id: int,
+        signal_type: str,
+        token_id: str,
+        symbol: str,
+        amount_usd: float,
+        signal_data: dict,
+    ) -> None:
+        """Spawn the TG alert dispatch as a tracked background task.
+
+        R1-C2 design fold: re-read entry_price from paper_trades AFTER
+        execute_buy so the alert's price matches the audit row (post-slip).
+
+        R1-C3 design fold: hold task reference in self._tg_alert_tasks +
+        register done_callback to drain on completion. Mirrors
+        scout/main.py:91 `_social_restart_tasks` GC-protect pattern.
+        Mid-flight loss on engine shutdown is acceptable — paper_trades
+        row is already committed; only TG alert + tg_alert_log row is lost.
+        """
+        from scout.trading.tg_alert_dispatch import notify_paper_trade_opened
+
+        # Post-slip entry price (R1-C2)
+        try:
+            cur = await self.db._conn.execute(
+                "SELECT entry_price FROM paper_trades WHERE id = ?",
+                (trade_id,),
+            )
+            row = await cur.fetchone()
+            effective_entry = float(row[0]) if row and row[0] is not None else 0.0
+        except Exception:
+            log.exception("tg_alert_post_open_price_read_failed", trade_id=trade_id)
+            effective_entry = 0.0
+
+        # V3-I1 PR-stage fold: skip TG dispatch if entry_price re-read
+        # failed. Earlier behavior would render "$0" in alert body.
+        if effective_entry <= 0.0:
+            log.warning(
+                "tg_alert_skipped_invalid_entry_price",
+                trade_id=trade_id,
+                signal_type=signal_type,
+                token_id=token_id,
+            )
+            return
+
+        task = asyncio.create_task(
+            notify_paper_trade_opened(
+                self.db,
+                self.settings,
+                self._tg_session,
+                paper_trade_id=trade_id,
+                signal_type=signal_type,
+                token_id=token_id,
+                symbol=symbol,
+                entry_price=effective_entry,
+                amount_usd=amount_usd,
+                signal_data=signal_data,
+            )
+        )
+        self._tg_alert_tasks.add(task)
+        task.add_done_callback(self._tg_alert_tasks.discard)
 
     async def close_trade(self, trade_id: int, reason: str = "manual") -> None:
         """Force-close a trade."""

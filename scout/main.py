@@ -954,6 +954,57 @@ async def check_outcomes(
     return recorded
 
 
+async def _maybe_announce_tg_alerts(db, session, settings) -> None:
+    """BL-NEW-TG-ALERT-ALLOWLIST: first-deploy operator announcement.
+
+    R2-C1 + R1-I4 design folds. Gated on 'announcement_sent' sentinel
+    row in tg_alert_log so it fires exactly once per database lifetime
+    regardless of engine restart count.
+    """
+    if db._conn is None:
+        return
+    try:
+        cur = await db._conn.execute(
+            "SELECT 1 FROM tg_alert_log WHERE outcome='announcement_sent' " "LIMIT 1"
+        )
+        if await cur.fetchone():
+            return  # already announced
+    except Exception:
+        # Table may not exist on older schema during deploy transition;
+        # don't crash — let the migration apply, then announce on next start.
+        logger.exception("tg_alert_announcement_table_check_failed")
+        return
+
+    body = (
+        "📢 TG alert allowlist active\n"
+        "Allowed signals (paper-trade open): gainers_early, "
+        "narrative_prediction, losers_contrarian, volume_spike\n"
+        "Open-only — check dashboard for closes\n"
+        "chain_completed via existing chain alerter\n"
+        f"Per-token cooldown: {settings.TG_ALERT_PER_TOKEN_COOLDOWN_HOURS}h "
+        "(reduce via .env TG_ALERT_PER_TOKEN_COOLDOWN_HOURS=2 for "
+        "second-leg signals)\n"
+        "To silence per-signal: UPDATE signal_params SET "
+        "tg_alert_eligible=0 WHERE signal_type='...';"
+    )
+    try:
+        await alerter.send_telegram_message(body, session, settings, parse_mode=None)
+        async with db._txn_lock:
+            await db._conn.execute(
+                "INSERT INTO tg_alert_log "
+                "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
+                "VALUES (NULL, 'announcement', '_system', ?, "
+                "'announcement_sent')",
+                (datetime.now(timezone.utc).isoformat(),),
+            )
+            await db._conn.commit()
+        logger.info("tg_alert_announcement_sent")
+    except Exception:
+        # Don't block startup on announcement failure; will retry next start
+        # because no sentinel row was written.
+        logger.exception("tg_alert_announcement_failed")
+
+
 async def _drain_pending_live_tasks(paper_trader, timeout_sec: float = 5.0) -> None:
     """Drain any in-flight PaperTrader live-handoff tasks before DB close.
 
@@ -1284,6 +1335,19 @@ async def main(argv: list[str] | None = None) -> int:
 
     try:
         async with aiohttp.ClientSession() as session:
+            # BL-NEW-TG-ALERT-ALLOWLIST (R1-I3+I5 design fold): wire the
+            # session into trading_engine for TG alert dispatch. Engine was
+            # constructed pre-session-context above; set_tg_session is the
+            # post-construction hook.
+            if trading_engine is not None:
+                trading_engine.set_tg_session(session)
+
+            # BL-NEW-TG-ALERT-ALLOWLIST (R2-C1 + R1-I4 design folds):
+            # one-time first-deploy operator announcement gated on
+            # 'announcement_sent' sentinel row in tg_alert_log. Fires
+            # exactly once per database lifetime regardless of restart
+            # count.
+            await _maybe_announce_tg_alerts(db, session, settings)
 
             async def _pipeline_loop() -> None:
                 nonlocal cycle_count
