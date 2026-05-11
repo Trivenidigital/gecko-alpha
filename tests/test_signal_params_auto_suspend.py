@@ -974,13 +974,28 @@ async def test_revive_after_operator_suspend_then_revive_first_time_succeeds(
 
 
 def _install_fake_alerter(monkeypatch, capture: list):
-    """Pre-inject ``scout.alerter`` into ``sys.modules`` so auto_suspend's
-    ``from scout import alerter`` local-import never loads aiohttp. On
-    Windows the real import triggers an OpenSSL Applink crash inside the
-    .venv (see ``feedback_windows_venv_openssl_state.md``) — pre-injection
-    bypasses the crash without skipping the test."""
+    """Replace ``scout.alerter`` for the auto_suspend's local-import path.
+
+    Two-pronged patch needed because Python's ``from scout import alerter``
+    resolves in two steps:
+
+      1. ``getattr(scout, "alerter")`` — wins if scout.alerter is already
+         loaded and bound as an attribute on the scout package (Linux CI:
+         other tests in the session have already imported scout.alerter).
+      2. Falls through to ``sys.modules["scout.alerter"]`` — wins if the
+         submodule wasn't yet imported (Windows local: real import crashes
+         on aiohttp's OpenSSL Applink load per
+         ``feedback_windows_venv_openssl_state.md``, so we never let it
+         get that far).
+
+    Patching only sys.modules works on Windows but is bypassed on Linux;
+    patching only the attribute works on Linux but errors on Windows
+    (attribute access on a not-yet-imported submodule triggers import).
+    Both paths handled here.
+    """
     import sys
     import types
+    import scout  # parent package is safe to import; doesn't pull aiohttp
 
     async def _capture_send(text, session, settings, **kwargs):
         capture.append({"text": text, **kwargs})
@@ -988,6 +1003,7 @@ def _install_fake_alerter(monkeypatch, capture: list):
     fake = types.ModuleType("scout.alerter")
     fake.send_telegram_message = _capture_send
     monkeypatch.setitem(sys.modules, "scout.alerter", fake)
+    monkeypatch.setattr(scout, "alerter", fake, raising=False)
 
 
 async def test_hard_loss_alert_uses_plain_text_and_traces(
