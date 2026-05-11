@@ -102,6 +102,7 @@ class Database:
         await self._migrate_bl_slow_burn_v1()
         await self._migrate_tg_alert_eligible_v1()
         await self._migrate_tg_alert_log_m1_5c_outcome()
+        await self._migrate_audit_volume_snapshot_phase_b()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -3334,6 +3335,85 @@ class Database:
             except Exception:
                 pass
             raise
+
+    async def _migrate_audit_volume_snapshot_phase_b(self) -> None:
+        """BL-NEW-AUDIT-SNAPSHOT: Phase B audit-time snapshot of volume_history_cg.
+
+        Schema version 20260518. Creates audit_volume_snapshot_phase_b table — a
+        non-pruned mirror of volume_history_cg rows for slow_burn-detected coin_ids
+        during the Phase B soak window (2026-05-10 through 2026-05-25). The source
+        table volume_history_cg is rolling-pruned at 7 days by spikes/detector.py;
+        this table preserves data through D+14 evaluation (2026-05-24).
+
+        UNIQUE (coin_id, recorded_at) enables ON CONFLICT DO NOTHING idempotency
+        for daily snapshot runs without duplicate rows.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS audit_volume_snapshot_phase_b (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    coin_id         TEXT    NOT NULL,
+                    symbol          TEXT    NOT NULL,
+                    name            TEXT    NOT NULL,
+                    volume_24h      REAL    NOT NULL,
+                    market_cap      REAL,
+                    price           REAL,
+                    recorded_at     TEXT    NOT NULL,
+                    snapshotted_at  TEXT    NOT NULL,
+                    UNIQUE (coin_id, recorded_at)
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audit_vol_snap_coin "
+                "ON audit_volume_snapshot_phase_b(coin_id, recorded_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260518, now_iso, "bl_audit_volume_snapshot_phase_b"),
+            )
+            await conn.commit()
+        except Exception as e:
+            _log.exception(
+                "schema_migration_failed",
+                migration="bl_audit_volume_snapshot_phase_b",
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception(
+                    "schema_migration_rollback_failed",
+                    migration="bl_audit_volume_snapshot_phase_b",
+                    err=str(rb_err),
+                    err_type=type(rb_err).__name__,
+                )
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_audit_volume_snapshot_phase_b")
+            raise
+
+        cur = await conn.execute(
+            "SELECT description FROM schema_version WHERE version = ?", (20260518,)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "bl_audit_volume_snapshot_phase_b schema_version row missing after migration"
+            )
+        if row[0] != "bl_audit_volume_snapshot_phase_b":
+            raise RuntimeError(
+                f"bl_audit_volume_snapshot_phase_b schema_version description mismatch — "
+                f"expected 'bl_audit_volume_snapshot_phase_b', got {row[0]!r}"
+            )
 
     async def revive_signal_with_baseline(
         self,
