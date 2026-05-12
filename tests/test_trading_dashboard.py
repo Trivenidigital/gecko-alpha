@@ -37,7 +37,15 @@ async def client(db):
 
 
 async def _insert_trade(
-    conn, token_id, symbol, signal_type, status, pnl_usd=None, pnl_pct=None
+    conn,
+    token_id,
+    symbol,
+    signal_type,
+    status,
+    pnl_usd=None,
+    pnl_pct=None,
+    would_be_live=None,
+    conviction_locked_stack=None,
 ):
     now = datetime.now(timezone.utc)
     opened = (now - timedelta(hours=2)).isoformat()
@@ -46,8 +54,9 @@ async def _insert_trade(
         """INSERT INTO paper_trades
            (token_id, symbol, name, chain, signal_type, signal_data,
             entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, sl_price,
-            status, pnl_usd, pnl_pct, opened_at, closed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            status, pnl_usd, pnl_pct, opened_at, closed_at,
+            would_be_live, conviction_locked_stack)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             token_id,
             symbol,
@@ -67,6 +76,8 @@ async def _insert_trade(
             pnl_pct,
             opened,
             closed,
+            would_be_live,
+            conviction_locked_stack,
         ),
     )
     await conn.commit()
@@ -120,6 +131,193 @@ async def test_get_stats_by_signal(client):
     assert resp.status_code == 200
     data = resp.json()
     assert "volume_spike" in data
+
+
+# ---------------------------------------------------------------------------
+# BL-NEW-LIVE-ELIGIBLE follow-up: cohort-comparison endpoint
+# (tasks/plan_dashboard_live_eligible_view.md)
+# ---------------------------------------------------------------------------
+
+
+async def test_stats_by_signal_cohort_shape(client):
+    """Endpoint returns the expected top-level keys.
+
+    Vector B/C review folds added near_identical_cohorts +
+    min_eligible_n_for_verdict + verdict_window_anchor — operator-visible
+    contract that the dashboard reads to gate verdicts. Lock them in tests
+    so a future refactor can't silently drop them.
+    """
+    c, _ = client
+    resp = await c.get("/api/trading/stats/by-signal-cohort")
+    assert resp.status_code == 200
+    data = resp.json()
+    for key in (
+        "full_cohort",
+        "eligible_cohort",
+        "excluded_signal_types",
+        "near_identical_cohorts",
+        "min_eligible_n_for_verdict",
+        "verdict_window_anchor",
+        "small_n_caveat",
+        "window_days",
+    ):
+        assert key in data, f"missing key: {key}"
+    assert data["window_days"] == 7
+    assert data["min_eligible_n_for_verdict"] == 10
+    # chain_completed is structurally near-identical (Tier 1a) — must appear
+    # in near_identical_cohorts unconditionally, not contingent on data.
+    assert "chain_completed" in data["near_identical_cohorts"]
+
+
+async def test_stats_by_signal_cohort_splits_eligible_from_full(client):
+    """full_cohort includes all closes; eligible_cohort only would_be_live=1."""
+    c, db = client
+    # gainers_early: 2 closes, 1 eligible 1 ineligible
+    await _insert_trade(
+        db._conn,
+        "btc",
+        "BTC",
+        "gainers_early",
+        "closed_tp",
+        pnl_usd=100.0,
+        pnl_pct=10.0,
+        would_be_live=1,
+    )
+    await _insert_trade(
+        db._conn,
+        "eth",
+        "ETH",
+        "gainers_early",
+        "closed_sl",
+        pnl_usd=-30.0,
+        pnl_pct=-3.0,
+        would_be_live=0,
+    )
+    resp = await c.get("/api/trading/stats/by-signal-cohort")
+    assert resp.status_code == 200
+    data = resp.json()
+    full = {r["signal_type"]: r for r in data["full_cohort"]}
+    eligible = {r["signal_type"]: r for r in data["eligible_cohort"]}
+    assert full["gainers_early"]["trades"] == 2
+    assert full["gainers_early"]["total_pnl_usd"] == 70.0
+    assert eligible["gainers_early"]["trades"] == 1
+    assert eligible["gainers_early"]["total_pnl_usd"] == 100.0
+
+
+async def test_stats_by_signal_cohort_excludes_non_stackable(client):
+    """A signal_type with MAX(conviction_locked_stack) < 3 AND not in Tier
+    1a/2a/2b enumeration appears in excluded_signal_types with a structural
+    reason. Visibility-not-hiding: trending_catch surfaces with its cap, not
+    silently disappears.
+
+    Vector C F-I1 fold: the reason string must clearly explain that the
+    eligible subset is *structurally empty*, not just *small*. Lock the
+    operator-facing language.
+    """
+    c, db = client
+    # trending_catch — single-source, never stacks; should be excluded.
+    await _insert_trade(
+        db._conn,
+        "tok1",
+        "T1",
+        "trending_catch",
+        "closed_sl",
+        pnl_usd=-10.0,
+        pnl_pct=-1.0,
+        conviction_locked_stack=None,
+    )
+    # volume_spike — tier-enumerated; should NEVER be excluded even if stack low.
+    await _insert_trade(
+        db._conn,
+        "tok2",
+        "T2",
+        "volume_spike",
+        "closed_tp",
+        pnl_usd=50.0,
+        pnl_pct=5.0,
+        conviction_locked_stack=None,
+    )
+    resp = await c.get("/api/trading/stats/by-signal-cohort")
+    data = resp.json()
+    excluded_types = {e["signal_type"] for e in data["excluded_signal_types"]}
+    assert "trending_catch" in excluded_types
+    assert "volume_spike" not in excluded_types
+    tc = next(
+        e for e in data["excluded_signal_types"] if e["signal_type"] == "trending_catch"
+    )
+    assert tc["max_observed_stack"] == 0
+    # Reason must use "structurally empty" framing (Vector C F-I1 fold),
+    # not just "stack cap = 0" jargon that inverts on casual read.
+    assert "structurally empty" in tc["reason"]
+    assert "max stack" in tc["reason"]
+    assert "Still paper-trading" in tc["reason"]
+
+
+async def test_stats_by_signal_cohort_non_enum_signal_NOT_excluded_when_stack_ge_3(
+    client,
+):
+    """A signal_type not in Tier 1a/2a/2b enumeration but with observed
+    conviction_locked_stack >= 3 is NOT excluded — Tier 1b (stack-based)
+    eligibility applies regardless of signal_type. Catches the regression
+    where the exclusion list mistakenly uses hardcoded enumeration alone."""
+    c, db = client
+    # narrative_prediction is not in the tier enum but CAN stack to 3+.
+    await _insert_trade(
+        db._conn,
+        "tok1",
+        "T1",
+        "narrative_prediction",
+        "closed_tp",
+        pnl_usd=80.0,
+        pnl_pct=8.0,
+        conviction_locked_stack=3,
+        would_be_live=1,
+    )
+    resp = await c.get("/api/trading/stats/by-signal-cohort")
+    data = resp.json()
+    excluded_types = {e["signal_type"] for e in data["excluded_signal_types"]}
+    assert "narrative_prediction" not in excluded_types
+
+
+async def test_stats_by_signal_cohort_eligible_empty_when_no_writer_stamps(client):
+    """Existing trades pre-2026-05-11 have would_be_live=NULL. The eligible
+    cohort must return [] (or omit the signal_type), not silently include
+    NULL rows."""
+    c, db = client
+    await _insert_trade(
+        db._conn,
+        "btc",
+        "BTC",
+        "gainers_early",
+        "closed_tp",
+        pnl_usd=100.0,
+        pnl_pct=10.0,
+        would_be_live=None,
+    )
+    resp = await c.get("/api/trading/stats/by-signal-cohort")
+    data = resp.json()
+    eligible_types = {r["signal_type"] for r in data["eligible_cohort"]}
+    assert "gainers_early" not in eligible_types
+    # but full cohort sees it
+    full_types = {r["signal_type"] for r in data["full_cohort"]}
+    assert "gainers_early" in full_types
+
+
+async def test_stats_by_signal_cohort_carries_caveat_text(client):
+    """The small_n_caveat must lead with the operator-actionable framing
+    (Vector C F-N1/F-I3 folds): n-gate requirement, exploratory-not-
+    confirmatory framing, and the explicit decision-lock date. Without
+    these the operator anchors on the smaller-n verdict prematurely."""
+    c, _ = client
+    resp = await c.get("/api/trading/stats/by-signal-cohort")
+    data = resp.json()
+    caveat = data["small_n_caveat"]
+    assert "INSUFFICIENT_DATA" in caveat
+    assert "exploratory" in caveat
+    assert "2026-06-08" in caveat
+    # Decision-lock date duplicated in verdict_window_anchor so the
+    # UI can render it independently from the caveat text.
+    assert "2026-06-08" in data["verdict_window_anchor"]
 
 
 async def test_positions_empty(client):

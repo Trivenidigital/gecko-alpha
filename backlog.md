@@ -482,6 +482,73 @@ ssh root@89.167.116.187 "sqlite3 /root/gecko-alpha/scout.db \"SELECT MIN(opened_
 - Weekly digest A/B comparing live-eligible cohort vs unfiltered firehose
 - Make race-strict (wrap SELECT+INSERT under `db._txn_lock`) once live trading routes through this filter
 
+### BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT: structural live-evaluability per signal_type
+**Status:** PROPOSED — surfaced 2026-05-12 during Step 1 verification of "(2) would auto-suspend-against-=1-cohort have spared trending_catch / first_signal." Filing now while the structural finding is fresh; implementation deferred to next live-trading roadmap revisit.
+**Tag:** `observability` `live-roadmap-input` `structural-evaluability` `tier-rule-coverage`
+**Why:** Both trending_catch and first_signal are **structurally non-eligible** under current Tier 1/2 rules — their signal_data shape caps the stack count below the Tier-1b threshold of 3. This is the load-bearing argument; the empirical data corroborates it but cannot prove it on its own:
+
+- `trending_catch` — signal_data is `{"source": "trending_snapshot", "mcap_rank": N}` only; fires alone from the trending-snapshot ingestion path; **max stack = 1 by design**.
+- `first_signal` — admission rule (`scout/config.py:369`, `FIRST_SIGNAL_MIN_SIGNAL_COUNT=2`) requires ≥2 stacking signals; observed signal_data carries exactly 2 (momentum_ratio + cg_trending_rank); **max stack = 2 by design**.
+
+Corroborating empirical data (Vector B T-TIGHT-2 fold — demoted to corroboration, not load-bearing): Step 1 saw 0/108 trending_catch and 0/253 first_signal trades with `conviction_locked_stack >= 3` in their pre-kill cohorts. The first_signal "0/253" figure is partly an artifact — BL-067 conviction-lock didn't deploy until 2026-05-04, so the column was uniformly NULL during the cohort window. The structural cap is what makes the claim hold even where the empirical record can't reach.
+
+The auto-suspends weren't wrong (paper losses were real), but they also weren't *answering* the question "would live trading on this signal lose money," because live trading on this signal was structurally impossible under current Tier 1/2 rules.
+
+**Drift verdict:** NET-NEW. No existing entry audits the structural live-eligibility surface per signal_type. BL-NEW-LIVE-ELIGIBLE shipped the writer; this entry asks what the writer can never stamp `=1` for and why.
+**Hermes verdict:** No Hermes skill covers signal-type × eligibility-rule coverage analysis. Project-internal.
+
+**Effect (proposed):** For each signal_type currently producing paper trades, compute:
+1. **Structural max conviction_stack** — the maximum number of co-occurring signals possible at open time given the signal's source (e.g., trending_catch fires alone from `trending_snapshot` → max stack = 1; first_signal stacks on momentum+trending → max stack = 2; gainers_early can carry multiple co-firing signals → max stack ≥ 3 possible).
+2. **Empirical eligible-subset rate** — historical % of trades where `compute_would_be_live` would have returned 1 (post-2026-05-11 writer for forward; backfill via `matches_tier_1_or_2()` against historical signal_data for prior rows).
+3. **Tier rule path coverage** — which Tier 1a/1b/2a/2b path admits the signal_type (or none).
+
+**Interpretation:** signal_types with structural max stack < 3 AND signal_type ∉ {chain_completed, volume_spike, gainers_early-with-gate} have *structurally empty* eligible subsets — they are not live-trading candidates regardless of paper performance. Their continued resource consumption (paper slots, alert noise, calibration cycles, MiroFish jobs) should be evaluated against that constraint at the next live-trading roadmap revisit.
+
+**Known instances from Step 1:**
+- `trending_catch` — max stack = 1 (single-source from trending_snapshot); not in Tier 1a/2a/2b; **structurally non-eligible**
+- `first_signal` — max stack = 2 (momentum_ratio + cg_trending_rank pair); not in Tier 1a/2a/2b; **structurally non-eligible**
+
+**Other candidate signal_types to audit when this runs:** `losers_contrarian`, `narrative_prediction`, `tg_social` (each may or may not be structurally stackable to ≥3 — empirical question).
+
+**Not in this PR:** dashboard surface for the audit results (could fold into BL-NEW-LIVE-ELIGIBLE's dashboard view), or a settings-driven "signal_types in scope for live evaluation" allowlist that excludes structurally-empty types from auto-suspend / calibration / alerting calculations.
+
+**Estimate:** ~2 hours analysis + ~1 hour write-up. No code change for the audit itself.
+
+### BL-NEW-Q2-SIMULATOR: paired counterfactual for the live-eligibility evaluation
+**Status:** PROPOSED — surfaced 2026-05-12 during Vector C strategy/framing review of the dashboard cohort view PR. The dashboard answers Q1 (cohort divergence empirical question); this item answers Q2 (worth the statistical cost?).
+**Tag:** `evaluation-framework` `q2-simulator` `live-roadmap-gate` `paired-counterfactual`
+**Why:** The dashboard cohort view (BL-NEW-LIVE-ELIGIBLE follow-up) measures whether the eligible cohort diverges from the full cohort. That answers Q1 (cohort identification). But the strategic question — Q2: *"is eligible-cohort evaluation worth the statistical cost of smaller n?"* — requires a different artifact entirely: a paired simulator that, for each historical operational decision made on the full cohort (auto-suspend fires, calibration parameter changes, alert routing thresholds), shows what the same decision would have been if made on the eligible subset.
+
+Without Q2's answer, the 4-week dashboard verdict still leaves the operator with: *"yes the cohorts diverge — but would acting on the divergence have led to better operational outcomes, or just noisier ones at small n?"* That's the actual gate on whether (2)/(3)/(4) are worth pursuing.
+
+**Drift verdict:** NET-NEW. The dashboard view is observational; no existing artifact does the counterfactual decision-replay. `scripts/backtest_*.py` family is closest precedent but each is single-purpose.
+
+**Hermes verdict:** No Hermes skill covers paired-counterfactual decision-replay for cohort comparisons. Project-internal.
+
+**Effect (proposed):** A `scripts/q2_simulator.py` that, for a window of historical operational events (auto-suspends, calibration changes, threshold flips), replays each event against both cohorts and reports:
+- Decisions that would have been *different* under eligible-cohort gating (fire fewer / fire later / fire never)
+- Operational outcome delta (PnL, win-rate, drawdown) under each branch
+- Per-decision sample size at decision time (gates the confidence interval on each comparison)
+
+**Sequence:** scoped after the 4-week dashboard verdict produces evidence — only worth building if Q1's answer is non-trivial. Filing now so Q2 doesn't get implicitly "answered" by sunk-cost reasoning at the 4-week mark.
+
+**Estimate:** ~6-8 hours simulator + ~2 hours findings doc.
+
+### BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST: scheduled-summary shape for the 4-week evidence window
+**Status:** PROPOSED — surfaced 2026-05-12 during Vector C strategy/framing review of the dashboard cohort view PR. Filed as a UX-shape improvement; doesn't block the dashboard.
+**Tag:** `evaluation-framework` `attention-budget` `scheduled-summary` `digest-shape`
+**Why:** The dashboard cohort view requires the operator to glance at it ~3× per day for 4 weeks looking for a low-probability divergence event across ~7 signal_types. That's a high vigilance cost for a small expected output. A scheduled weekly summary alert ("Week 2 of 4: gainers_early eligible n=14, wrΔ=+4pp, no sign-flip — tracking") followed by a single end-of-window verdict alert produces the same evidence at &lt;10% of the attention cost, with the dashboard available for ad-hoc drill-in when the operator chooses.
+
+**Drift verdict:** NET-NEW. No existing weekly-digest covers the cohort comparison surface. Existing `scout/trading/weekly_digest.py` is signal-PnL-focused (not cohort-comparison-focused) but is the architectural neighbor.
+
+**Hermes verdict:** No Hermes skill covers scheduled cohort-summary digests. Project-internal.
+
+**Effect (proposed):** New weekly cron + `scout/trading/cohort_digest.py` writing a TG message with per-signal-type cohort comparison + verdict classification (matching dashboard's logic). At the 4-week mark, fire a final summary message with the decision-point recommendation.
+
+**Sequence:** can ship anytime after the dashboard view. Independent of Q1 outcome.
+
+**Estimate:** ~3-4 hours weekly digest + cron + tests.
+
 ### BL-NEW-M1.5C: Minara DEX-eligibility alert extension (Phase 0 Option A under BL-074)
 **Status:** SHIPPED 2026-05-11 — PR #96 (`ef68c6c`) squash-merged + deployed VPS 2026-05-11T01:54Z. Schema 20260517 migration `bl_tg_alert_log_m1_5c_outcome` applied; M1.5b sentinel preserved across rebuild (verified `m1_5b_sentinel_preserved=true`). Onboarding TG announcement delivered. See memory `project_m1_5c_deployed_2026_05_11.md`.
 **Tag:** `decision-support` `minara` `solana-first` `phase-0-option-a` `pre-execution-layer`

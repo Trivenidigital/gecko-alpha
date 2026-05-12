@@ -271,6 +271,17 @@ def create_app(db_path: str | None = None) -> FastAPI:
     ):
         return await db.get_trading_stats_by_signal(_db_path, days=days)
 
+    @app.get("/api/trading/stats/by-signal-cohort")
+    async def get_trading_stats_by_signal_cohort_endpoint(
+        days: int = Query(7, ge=1, le=365),
+    ):
+        """Side-by-side full-cohort vs live-eligible (would_be_live=1) cohort.
+
+        Read-only follow-up to BL-NEW-LIVE-ELIGIBLE. Pre-registered evaluation
+        criteria in tasks/plan_dashboard_live_eligible_view.md.
+        """
+        return await db.get_trading_stats_by_signal_cohort(_db_path, days=days)
+
     # --- Preferences endpoints ---
 
     @app.get("/api/preferences/categories")

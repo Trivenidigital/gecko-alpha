@@ -26,6 +26,7 @@ KNOWN_SIGNALS = [
 async def _ro_db(db_path: str):
     """Open a read-only connection to the database."""
     import os
+
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Database file not found: {db_path}")
     db = await aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -310,8 +311,7 @@ async def get_narrative_predictions(
 async def get_narrative_metrics(db_path: str) -> dict:
     """Hit rate and true alpha metrics for narrative predictions."""
     async with _ro_db(db_path) as conn:
-        cursor = await conn.execute(
-            """SELECT
+        cursor = await conn.execute("""SELECT
                 SUM(CASE WHEN outcome_class='HIT' AND is_control=0 THEN 1 ELSE 0 END) as agent_hits,
                 SUM(CASE WHEN is_control=0 AND outcome_class IS NOT NULL
                      AND outcome_class != 'UNRESOLVED' THEN 1 ELSE 0 END) as agent_total,
@@ -321,8 +321,7 @@ async def get_narrative_metrics(db_path: str) -> dict:
                 COUNT(*) as total_predictions,
                 SUM(CASE WHEN outcome_class IS NOT NULL
                      AND outcome_class != 'UNRESOLVED' THEN 1 ELSE 0 END) as resolved
-               FROM predictions"""
-        )
+               FROM predictions""")
         row = await cursor.fetchone()
         d = dict(row) if row else {}
 
@@ -333,7 +332,9 @@ async def get_narrative_metrics(db_path: str) -> dict:
         total_predictions = d.get("total_predictions") or 0
         resolved = d.get("resolved") or 0
 
-        agent_rate = round((agent_hits / agent_total * 100) if agent_total > 0 else 0, 1)
+        agent_rate = round(
+            (agent_hits / agent_total * 100) if agent_total > 0 else 0, 1
+        )
         ctrl_rate = round((ctrl_hits / ctrl_total * 100) if ctrl_total > 0 else 0, 1)
         true_alpha = round(agent_rate - ctrl_rate, 1)
 
@@ -573,9 +574,7 @@ async def get_chains_stats(db_path: str) -> dict:
         matches_count = (await cursor.fetchone())[0]
 
         # Expired = is_complete but no chain_matches linkage (best-effort)
-        cursor = await conn.execute(
-            "SELECT COUNT(*) FROM signal_events"
-        )
+        cursor = await conn.execute("SELECT COUNT(*) FROM signal_events")
         total_events = (await cursor.fetchone())[0]
 
     return {
@@ -744,8 +743,7 @@ async def get_quality_signals(
         # 3. Category heating signals
         heating = []
         try:
-            cursor = await conn.execute(
-                """SELECT
+            cursor = await conn.execute("""SELECT
                        'category_heating'    as signal_type,
                        ns.category_id        as token_id,
                        NULL                  as symbol,
@@ -763,8 +761,7 @@ async def get_quality_signals(
                        ns.acceleration        as quality_score
                    FROM narrative_signals ns
                    ORDER BY ns.detected_at DESC
-                   LIMIT 10"""
-            )
+                   LIMIT 10""")
             heating = [dict(r) for r in await cursor.fetchall()]
         except Exception:
             pass
@@ -782,7 +779,10 @@ async def get_quality_signals(
 
     # Classify signals as narrative vs meme/DEX
     for s in merged:
-        if s["signal_type"] == "narrative_prediction" or s["signal_type"] == "category_heating":
+        if (
+            s["signal_type"] == "narrative_prediction"
+            or s["signal_type"] == "category_heating"
+        ):
             s["is_meme"] = False
         elif s.get("chain") and s["chain"] not in ("coingecko", None, ""):
             s["is_meme"] = True
@@ -847,6 +847,7 @@ async def store_briefing(
 ) -> int:
     """Insert a briefing and return its id."""
     from datetime import datetime, timezone as tz
+
     if created_at is None:
         created_at = datetime.now(tz.utc).isoformat()
     async with _rw_db(db_path) as conn:
@@ -929,12 +930,11 @@ async def _get_trading_positions_inner(db) -> list[dict]:
                 # Post-leg-1 ladder trades hold only remaining_qty at current price;
                 # quantity is the initial size and overstates the open slice.
                 open_qty = (
-                    r["remaining_qty"] if r.get("remaining_qty") is not None
+                    r["remaining_qty"]
+                    if r.get("remaining_qty") is not None
                     else r["quantity"]
                 )
-                r["unrealized_pnl_usd"] = round(
-                    (cp - r["entry_price"]) * open_qty, 2
-                )
+                r["unrealized_pnl_usd"] = round((cp - r["entry_price"]) * open_qty, 2)
                 # Total PnL = realized (from any closed ladder legs) +
                 # unrealized on the still-open remainder. Reconciled against
                 # the trader's original capital so PnL$ and PnL% always tell
@@ -1005,10 +1005,16 @@ async def get_trading_history_count(db_path: str) -> int:
 async def get_trading_stats(db_path: str, days: int = 7) -> dict:
     """Aggregate paper trading PnL stats."""
     _empty_stats = {
-        "total_trades": 0, "wins": 0, "losses": 0,
-        "total_pnl_usd": 0, "avg_pnl_pct": 0,
-        "best_trade": None, "worst_trade": None,
-        "win_rate_pct": 0, "open_positions": 0, "open_exposure": 0,
+        "total_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "total_pnl_usd": 0,
+        "avg_pnl_pct": 0,
+        "best_trade": None,
+        "worst_trade": None,
+        "win_rate_pct": 0,
+        "open_positions": 0,
+        "open_exposure": 0,
     }
     async with _ro_db(db_path) as db:
         try:
@@ -1082,6 +1088,175 @@ async def get_trading_stats_by_signal(db_path: str, days: int = 7) -> dict:
         return result
 
 
+# Tier 1a/2a/2b enumerated types per scout.trading.live_eligibility.
+# Kept in sync with matches_tier_1_or_2(); a signal_type in this set is
+# never structurally excluded — only Tier 1b (stack >= 3) can promote
+# other signal_types into the eligible cohort.
+_LIVE_ELIGIBLE_ENUMERATED_TYPES = ("chain_completed", "volume_spike", "gainers_early")
+
+
+def _is_expected_cohort_oe(err: "aiosqlite.OperationalError") -> bool:
+    """True iff the OperationalError is the expected pre-migration / pre-writer
+    snapshot shape (missing table or missing would_be_live / conviction_locked_stack
+    column). Anything else — syntax errors, locked DB, renamed-but-still-present
+    column — propagates so the dashboard 500s loudly instead of silently emptying
+    the cohort view.
+
+    Vector A N2 fold: narrow the catch to match the project's documented precedent
+    (see get_tg_social_dlq below) per global CLAUDE.md
+    feedback_resilience_layered_failure_modes.md ("every resilience addition must
+    extend a visibility surface").
+    """
+    msg = str(err).lower()
+    if "no such table" in msg and "paper_trades" in msg:
+        return True
+    if "no such column" in msg and (
+        "would_be_live" in msg or "conviction_locked_stack" in msg
+    ):
+        return True
+    return False
+
+
+async def get_trading_stats_by_signal_cohort(db_path: str, days: int = 7) -> dict:
+    """Side-by-side PnL/win-rate by signal_type for full vs live-eligible cohorts.
+
+    Powers the dashboard cohort-toggle view (see `tasks/plan_dashboard_live_eligible_view.md`).
+    Read-only. No behavior change.
+
+    Returns three lists:
+      - full_cohort: every signal_type, all `would_be_live` values
+      - eligible_cohort: every signal_type, restricted to `would_be_live=1`
+      - excluded_signal_types: signal_types whose eligible-subset is structurally
+        empty (max observed conviction_locked_stack < 3 AND not in Tier 1a/2a/2b).
+        Derived from data — list updates as new signal_types ship.
+
+    The derivation matters: excluding by hardcoded list would silently miss new
+    structurally-non-stackable signals; deriving from MAX(conviction_locked_stack)
+    catches them. The trade-off — a signal that has never coincidentally stacked
+    to 3 will be flagged as excluded even if it theoretically could; the operator
+    sees the derivation in the reason string and can override.
+    """
+    if days < 1:
+        days = 1
+    window = f"-{days} days"
+    async with _ro_db(db_path) as db:
+        # Full cohort (existing get_trading_stats_by_signal pattern with avg_pnl_pct added).
+        try:
+            cursor = await db.execute(
+                """SELECT signal_type,
+                          COUNT(*)                                AS trades,
+                          SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
+                          COALESCE(SUM(pnl_usd), 0)               AS pnl,
+                          COALESCE(AVG(pnl_pct), 0)               AS avg_pct
+                     FROM paper_trades
+                    WHERE status != 'open'
+                      AND closed_at >= datetime('now', ?)
+                    GROUP BY signal_type""",
+                (window,),
+            )
+            full_rows = await cursor.fetchall()
+        except aiosqlite.OperationalError as e:
+            if not _is_expected_cohort_oe(e):
+                structlog.get_logger().warning("cohort_full_query_oe", err=str(e))
+                raise
+            full_rows = []
+
+        # Eligible cohort — same shape, filtered to would_be_live=1.
+        try:
+            cursor = await db.execute(
+                """SELECT signal_type,
+                          COUNT(*)                                AS trades,
+                          SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
+                          COALESCE(SUM(pnl_usd), 0)               AS pnl,
+                          COALESCE(AVG(pnl_pct), 0)               AS avg_pct
+                     FROM paper_trades
+                    WHERE status != 'open'
+                      AND closed_at >= datetime('now', ?)
+                      AND would_be_live = 1
+                    GROUP BY signal_type""",
+                (window,),
+            )
+            eligible_rows = await cursor.fetchall()
+        except aiosqlite.OperationalError as e:
+            if not _is_expected_cohort_oe(e):
+                structlog.get_logger().warning("cohort_eligible_query_oe", err=str(e))
+                raise
+            eligible_rows = []
+
+        # Excluded list — derived from ALL-time history (not the days window),
+        # because structural eligibility is a property of the signal_type, not
+        # the rolling window. A signal that hasn't stacked in 7d but did stack
+        # 30d ago is NOT structurally excluded.
+        placeholders = ",".join(["?"] * len(_LIVE_ELIGIBLE_ENUMERATED_TYPES))
+        try:
+            cursor = await db.execute(
+                f"""SELECT signal_type,
+                           MAX(COALESCE(conviction_locked_stack, 0)) AS max_stack,
+                           COUNT(*)                                  AS lifetime_trades
+                      FROM paper_trades
+                     WHERE signal_type NOT IN ({placeholders})
+                     GROUP BY signal_type
+                    HAVING max_stack < 3""",
+                _LIVE_ELIGIBLE_ENUMERATED_TYPES,
+            )
+            excluded_rows = await cursor.fetchall()
+        except aiosqlite.OperationalError as e:
+            if not _is_expected_cohort_oe(e):
+                structlog.get_logger().warning("cohort_excluded_query_oe", err=str(e))
+                raise
+            excluded_rows = []
+
+    def _to_row(r):
+        trades = r[1] or 0
+        wins = r[2] or 0
+        return {
+            "signal_type": r[0],
+            "trades": trades,
+            "wins": wins,
+            "total_pnl_usd": round(r[3] or 0, 2),
+            "win_rate_pct": round((wins / trades) * 100, 1) if trades > 0 else 0,
+            "avg_pnl_pct": round(r[4] or 0, 2),
+        }
+
+    excluded = [
+        {
+            "signal_type": r[0],
+            "max_observed_stack": r[1] or 0,
+            "lifetime_trades": r[2] or 0,
+            "reason": (
+                f"max stack achieved in lifetime: {r[1] or 0} (need >=3 for live "
+                "eligibility); single-source signal — eligible subset is "
+                "structurally empty, not small. Still paper-trading."
+            ),
+        }
+        for r in excluded_rows
+    ]
+
+    # chain_completed annotation (Vector B M-CRIT-2 fold): Tier 1a entry means
+    # full and eligible cohorts are nearly identical populations; divergence
+    # verdicts are not informative. Surface this in the API response so the
+    # UI can annotate the row.
+    near_identical_cohorts = ["chain_completed"]
+
+    return {
+        "window_days": days,
+        "full_cohort": [_to_row(r) for r in full_rows],
+        "eligible_cohort": [_to_row(r) for r in eligible_rows],
+        "excluded_signal_types": excluded,
+        "near_identical_cohorts": near_identical_cohorts,
+        "min_eligible_n_for_verdict": 10,
+        "verdict_window_anchor": "writer-deployment 2026-05-11 + 28d = 2026-06-08",
+        "small_n_caveat": (
+            "Live-eligible cohort is typically 5-10% of paper-trade volume. "
+            "Per-signal-type verdicts require eligible n >= 10 (otherwise "
+            "INSUFFICIENT_DATA). Strong-pattern verdicts are exploratory, NOT "
+            "confirmatory — family-wise FPR ~50% across 4 signal_types at "
+            "projected n. Decision-locked at writer-deployment + 28d = "
+            "2026-06-08. See tasks/plan_dashboard_live_eligible_view.md."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # BL-066': TG-social dashboard gap-fill
 # ---------------------------------------------------------------------------
@@ -1148,13 +1323,11 @@ async def get_tg_social_cashtag_stats_24h(db_path: str) -> dict:
     the dispatcher's gate semantics. This is a different surface (24h
     rollup card, not cap enforcement)."""
     async with _ro_db(db_path) as conn:
-        cur = await conn.execute(
-            """SELECT COUNT(*)
+        cur = await conn.execute("""SELECT COUNT(*)
                FROM paper_trades
                WHERE signal_type = 'tg_social'
                  AND json_extract(signal_data, '$.resolution') = 'cashtag'
-                 AND datetime(opened_at) >= datetime('now', '-24 hours')"""
-        )
+                 AND datetime(opened_at) >= datetime('now', '-24 hours')""")
         row = await cur.fetchone()
         return {"dispatched": row[0] if row else 0}
 
