@@ -154,7 +154,7 @@ async def test_mixed_cohort_only_cg_ids_in_batch(db, settings_factory):
     await _insert_open_trade(db, "bitcoin", "BTC")
     await _insert_open_trade(db, "0xabc123", "EVMTKN")
     await _insert_open_trade(db, "payai-network-2", "PAYAI")
-    settings = settings_factory()
+    settings = settings_factory(HELD_POSITION_PRICE_REFRESH_ENABLED=True)
     async with aiohttp.ClientSession() as session:
         with aioresponses() as m:
             m.get(
@@ -225,7 +225,10 @@ async def test_disabled_flag_short_circuits(db, settings_factory):
 async def test_cadence_throttling(db, settings_factory):
     """interval=3 means refresh fires on counter 3, 6, 9, ... (1-indexed)."""
     await _insert_open_trade(db, "bitcoin", "BTC")
-    settings = settings_factory(HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES=3)
+    settings = settings_factory(
+        HELD_POSITION_PRICE_REFRESH_ENABLED=True,
+        HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES=3,
+    )
     payload = {"bitcoin": {"usd": 100.0, "usd_market_cap": 1e9, "usd_24h_change": 0.0}}
 
     async with aiohttp.ClientSession() as session:
@@ -248,7 +251,7 @@ async def test_aalien_never_cached_case_gets_row_created(db, settings_factory):
     """AALIEN-style: open trade exists but no price_cache row.
     First refresh should create the row via INSERT ON CONFLICT DO UPDATE."""
     await _insert_open_trade(db, "anon-alien", "AALIEN")
-    settings = settings_factory()
+    settings = settings_factory(HELD_POSITION_PRICE_REFRESH_ENABLED=True)
 
     # Confirm no cache row exists pre-refresh
     pre = await db.get_cached_prices(["anon-alien"])
@@ -282,7 +285,7 @@ async def test_429_handled_gracefully(db, settings_factory, patch_module_sleep):
     """A 429 from CoinGecko should produce empty result, not raise."""
     patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
     await _insert_open_trade(db, "bitcoin", "BTC")
-    settings = settings_factory()
+    settings = settings_factory(HELD_POSITION_PRICE_REFRESH_ENABLED=True)
 
     async with aiohttp.ClientSession() as session:
         with aioresponses() as m:

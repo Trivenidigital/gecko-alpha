@@ -49,11 +49,16 @@ SIMPLE_PRICE_BATCH_SIZE = 250
 def _is_cg_coin_id(token_id: str | None) -> bool:
     """Heuristic: skip obvious contract addresses; pass everything else.
 
-    Matches the heuristic in scripts/triage_refresh_held_token_prices_20260512.py.
-    CG ids are lowercase alphanumeric + hyphens/underscores; contract addresses
-    start with 0x (EVM) or are long base58 strings (Solana). Permissive on the
-    CG side, strict on the obvious-contract side — false-negatives at CG just
-    produce log entries and skip, not data corruption.
+    CG coin_ids are lowercase alphanumeric + hyphens/underscores.
+    Contract addresses look different:
+      - EVM: starts with '0x', 40+ hex chars
+      - Solana base58 mints: mixed case, 32-44 chars (e.g.,
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" — too short to be
+        caught by a length>60 check; the mixed-case check catches it).
+
+    Permissive on the CG side, strict on the obvious-contract side —
+    false-negatives at CG just produce `not_found_in_cg` log entries and
+    skip, not data corruption.
     """
     if not token_id:
         return False
@@ -61,7 +66,12 @@ def _is_cg_coin_id(token_id: str | None) -> bool:
         return False
     if len(token_id) > 60:
         return False
-    return all(c.isalnum() or c in "-_" for c in token_id.lower())
+    # CG coin_ids are lowercase; mixed-case is a strong signal of base58
+    # (Solana mints, etc.). The triage script that produced the empirical
+    # held cohort confirmed 0 false-skips of real CG ids under this rule.
+    if token_id != token_id.lower():
+        return False
+    return all(c.isalnum() or c in "-_" for c in token_id)
 
 
 async def _get_held_token_ids(db: "Database") -> list[str]:
