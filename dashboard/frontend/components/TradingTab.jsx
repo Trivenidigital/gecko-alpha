@@ -126,6 +126,16 @@ const MIN_ELIGIBLE_N_FOR_VERDICT_DEFAULT = 10
 const STRONG_PATTERN_WR_GAP_PP = 15
 const STRONG_PATTERN_PNL_FLOOR = 200
 
+// Cohort-warming hint window. The writer for `would_be_live` deployed
+// 2026-05-11T13:22Z; for ~14d after, an "0 of N (0.0% live-eligible)" reading
+// is most likely cohort-not-warmed rather than eligibility-logic-broken.
+// After WARMING_WINDOW_DAYS, the hint suppresses — a sustained 0% rate at
+// day 14+ should remain visible as a finding to investigate, not get
+// permanently softened by the hint. Same shape as the witness-vs-dispatch
+// finding: the surface displays accurate data, the natural inference is wrong.
+const WRITER_DEPLOY_ISO = '2026-05-11T13:22:00Z'
+const WARMING_WINDOW_DAYS = 14
+
 function PnlBySignalPanel({ bySignal, cohort, cohortView, setCohortView }) {
   // Prefer the cohort endpoint's full_cohort (carries win_rate_pct/avg_pnl_pct
   // uniformly); fall back to legacy /by-signal payload if the cohort endpoint
@@ -147,6 +157,10 @@ function PnlBySignalPanel({ bySignal, cohort, cohortView, setCohortView }) {
   const fullN = full.reduce((s, r) => s + (r.trades ?? r.total_trades ?? 0), 0)
   const eligibleN = eligible.reduce((s, r) => s + (r.trades ?? r.total_trades ?? 0), 0)
   const eligiblePct = fullN > 0 ? (eligibleN / fullN) * 100 : 0
+  const daysSinceWriterDeploy =
+    (Date.now() - new Date(WRITER_DEPLOY_ISO).getTime()) / (1000 * 60 * 60 * 24)
+  const showWarmingHint =
+    fullN > 0 && eligibleN === 0 && daysSinceWriterDeploy < WARMING_WINDOW_DAYS
 
   const TabBtn = ({ id, label }) => (
     <button
@@ -276,6 +290,14 @@ function PnlBySignalPanel({ bySignal, cohort, cohortView, setCohortView }) {
             All trades
           </button>
           {' to see full cohort'}
+          {showWarmingHint && (
+            <div style={{ marginTop: 4, opacity: 0.85 }}>
+              Cohort warming — writer shipped {WRITER_DEPLOY_ISO.slice(0, 10)}
+              {' ('}{Math.floor(daysSinceWriterDeploy)}d ago).
+              Eligible closes accumulate as Tier 1a/1b/2a/2b trades close;
+              ~5% of paper volume at steady state.
+            </div>
+          )}
         </div>
       )}
 
