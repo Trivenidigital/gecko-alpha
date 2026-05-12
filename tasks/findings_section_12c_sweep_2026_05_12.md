@@ -151,9 +151,74 @@ The sweep surfaced multiple genuine sibling patterns that may themselves be prom
 
 **Class-3 rendering corruption (C4).** Already documented; instance count = 1 (trending_catch auto_suspend). May be unique to that case.
 
+## Meta-result: taxonomy completeness
+
+11 surface-similar cases distributed across 8+ candidate rules is itself a
+structural finding. The audit's `§0.5 Classification update` block enumerated
+**5 root-cause shapes** (Legacy-displaced, Ship-time never-worked, Auto-
+retirement loop, Low-frequency probably fine, Real Class-2 bug). The sweep
+surfaced rule candidates that don't slot cleanly into those 5:
+
+| Candidate rule | Instances from this sweep | Status |
+|---|---|---|
+| §12a (pipeline table freshness SLO + watchdog) | known, already promoted | promoted |
+| §12b (alert at write-time for operator-state reversal) | 1 (audit §2.9) | promoted |
+| §12c-narrow (health-claim vs specific output subset) | 2 confirmed | promotion candidate, see §12c-promotion-evidence memory |
+| §12e candidate (signal-without-actionable-threshold) | **3+** (`alerts_fired`, `narrative_predictions`, `mcap_null_with_price`) | promotion candidate, see §12e-candidate memory |
+| Legacy-displaced (schema retirement decision) | 2 (alerts, outcomes) | holding-thread; may be 1-off |
+| Parse_mode rendering corruption (Class 3) | 1 known (trending_catch) | holding-thread; **parse-mode audit pending** to determine count |
+| Deploy-without-activate | 1 (cryptopanic) | already documented as feedback memory |
+| Signal-doesn't-verify-result | 2 (correction_counter fill, live open_count) | holding-thread; both money-flow |
+| Signal-conflates-failure-modes | 1 (venue health probe timeout/auth) | holding-thread |
+| Signal-loses-cardinality | 1 (signal_type → "unknown" coercion) | holding-thread |
+| Signal-uses-proxy-not-actual | 1 (dashboard `pipeline_running`) | holding-thread |
+| Signal-doesn't-distinguish-cause | 1 (dormancy attempted vs genuine) | holding-thread |
+
+**The audit's 5-root-cause classification is under-resolved at the rule
+layer.** The right read isn't "5 patterns total" but "5 highest-frequency
+patterns + 7-8 additional candidate patterns with single-instance evidence
+each." Promotion candidates ≥2 instances:
+
+1. **§12e** (signal-without-threshold) — 3+ instances, broadest
+2. **§12c-narrow** — 2 instances, narrow surface area
+3. **Legacy-displaced** — 2 instances, but may be specific to the
+   memecoin→paper-trade pipeline-displacement era; not a recurring
+   structural pattern
+4. **Signal-doesn't-verify-result** — 2 instances, both money-flow;
+   worth tracking for a 3rd
+
+**Sibling-pattern observations beyond promotion-candidate scope** —
+the single-instance cases (signal-conflates-failure-modes, etc.) are
+holding-thread material. Re-evaluate after each new audit cycle whether
+any have accumulated a second instance.
+
+## Note on the §12a vs §12e collapse question
+
+Operator-surfaced 2026-05-12 (sweep review): is §12e (signal-without-
+actionable-threshold) a sibling rule, or is it §12a generalized to all
+counters (not just table-freshness counters)? The mechanism is the same
+(signal + threshold + actor pulling action), but the scope differs (any
+observability counter vs just table-write-rate counters). If §12e is a
+one-line scope expansion of §12a, the right move is to amend §12a in
+the global CLAUDE.md, not add a sibling rule.
+
+Resolution deferred to the dedicated promotion session. The 3+ §12e
+instances (`alerts_fired`, `narrative_predictions`, `mcap_null_with_price`)
+are evidence either way — the question is whether existing §12a, with
+its narrower table-freshness scoping, would cover them under a generous
+reading.
+
 ## Carry-forward
 
 1. Verify B1 (`holder_snapshots`) diagnosis before next promotion session
-2. Consider promoting **§12e signal-without-actionable-threshold** alongside or instead of §12c-narrow — the evidence base may be stronger for it
-3. Document the C11 sibling pattern as a candidate rule entry in MEMORY.md
-4. Re-run this sweep if a third independent §12c-narrow instance surfaces organically; that's the trigger to revisit
+2. Decide §12a-vs-§12e at the promotion session — sibling rule, §12a
+   scope expansion, or defer
+3. Run BL-NEW-PARSE-MODE-AUDIT (audit-only scope, separate finding doc) —
+   determines whether parse_mode hygiene is a 1-instance holding-thread
+   or a promotion candidate
+4. Re-evaluate signal-doesn't-verify-result holding-thread after the
+   next money-flow audit cycle; both current instances are in live
+   trading code
+5. Re-run this sweep if a third independent §12c-narrow instance
+   surfaces organically — that's the trigger to revisit §12c
+   promotion specifically
