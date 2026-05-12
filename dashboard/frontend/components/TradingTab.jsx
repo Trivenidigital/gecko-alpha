@@ -110,6 +110,41 @@ function reasonBadge(reason) {
   return <span className="outcome-badge">{reason}</span>
 }
 
+// Live-eligibility indicator for per-trade rows.
+// Source: paper_trades.would_be_live (0 / 1 / NULL). NULL = pre-writer-deploy
+// trade (writer shipped 2026-05-11); these are permanently un-classifiable.
+// Explicit hover text for accessibility / screen-readers.
+function EligibilityIcon({ value }) {
+  if (value === 1) {
+    return (
+      <span
+        title="Live-eligible: yes"
+        style={{ color: 'var(--color-accent-green)', fontWeight: 700 }}
+      >
+        ✓
+      </span>
+    )
+  }
+  if (value === 0) {
+    return (
+      <span
+        title="Live-eligible: no"
+        style={{ color: 'var(--color-text-secondary)' }}
+      >
+        ✗
+      </span>
+    )
+  }
+  return (
+    <span
+      title="Pre-writer trade — not classifiable (opened before 2026-05-11)"
+      style={{ color: 'var(--color-text-secondary)' }}
+    >
+      —
+    </span>
+  )
+}
+
 // BL-NEW-LIVE-ELIGIBLE follow-up: cohort-comparison panel for PnL by signal type.
 // Default tab is 'full' so a casual glance at the dashboard doesn't anchor on
 // the smaller-n live-eligible cohort. See tasks/plan_dashboard_live_eligible_view.md.
@@ -188,9 +223,34 @@ function PnlBySignalPanel({ bySignal, cohort, cohortView, setCohortView }) {
       : pnl < 0
         ? 'rgba(239, 83, 80, 0.07)'
         : 'transparent'
+    // Ticker inline display: when count ≤ 5, show all comma-separated;
+    // otherwise show first 5 + " +N more" with title-attribute for the rest.
+    // Subdued styling so the aggregate metrics remain the visual anchor.
+    const symbols = Array.isArray(s.symbols) ? s.symbols : []
+    const visibleSymbols = symbols.slice(0, 5)
+    const overflowCount = Math.max(0, symbols.length - visibleSymbols.length)
     return (
       <tr key={(opts.keyPrefix || '') + (s.signal_type || i)} style={{ background: rowBg }}>
-        <td style={{ fontWeight: 600 }}>{s.signal_type || '-'}</td>
+        <td style={{ fontWeight: 600 }}>
+          <div>{s.signal_type || '-'}</div>
+          {symbols.length > 0 && (
+            <div
+              style={{
+                fontSize: 11,
+                fontWeight: 400,
+                color: 'var(--color-text-secondary)',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                maxWidth: 280,
+              }}
+              title={symbols.join(', ')}
+            >
+              {visibleSymbols.join(', ')}
+              {overflowCount > 0 ? ` +${overflowCount} more` : ''}
+            </div>
+          )}
+        </td>
         <td>{s.trades ?? s.total_trades ?? 0}</td>
         <td>{s.wins ?? 0}</td>
         <td style={{ fontWeight: 700, color: pnlColor(pnl) }}>{fmtUsd(pnl)}</td>
@@ -491,6 +551,10 @@ export default function TradingTab() {
   const [sortCol, setSortCol] = useState('pnl_pct')
   const [sortDir, setSortDir] = useState('desc')
   const [closingId, setClosingId] = useState(null)
+  // Per-table "show only live-eligible" filters. Independent per panel so
+  // operator can filter positions without forcing the same on history.
+  const [showOnlyEligibleOpen, setShowOnlyEligibleOpen] = useState(false)
+  const [showOnlyEligibleClosed, setShowOnlyEligibleClosed] = useState(false)
 
   // R2-I1 fold: persist page to sessionStorage so tab-switch unmount
   // (App.jsx conditional render) doesn't reset operator's position.
@@ -589,7 +653,10 @@ export default function TradingTab() {
     }
   }
 
-  const sortedPositions = [...positions].sort((a, b) => {
+  const filteredPositions = showOnlyEligibleOpen
+    ? positions.filter((p) => p.would_be_live === 1)
+    : positions
+  const sortedPositions = [...filteredPositions].sort((a, b) => {
     let va, vb
     switch (sortCol) {
       case 'token': va = (a.symbol || a.token_id || '').toLowerCase(); vb = (b.symbol || b.token_id || '').toLowerCase(); break
@@ -642,7 +709,15 @@ export default function TradingTab() {
     _token: (h.symbol || h.name || h.token_id || '').toLowerCase(),
   })), [history])
 
-  const closedSort = useSort(enrichedHistory, 'closed_at', 'desc')
+  const filteredHistory = React.useMemo(
+    () =>
+      showOnlyEligibleClosed
+        ? enrichedHistory.filter((h) => h.would_be_live === 1)
+        : enrichedHistory,
+    [enrichedHistory, showOnlyEligibleClosed],
+  )
+
+  const closedSort = useSort(filteredHistory, 'closed_at', 'desc')
 
   const totalPnl = stats?.total_pnl_usd ?? stats?.total_pnl ?? 0
   const winRate = stats?.win_rate_pct ?? 0
@@ -703,18 +778,39 @@ export default function TradingTab() {
 
       {/* Section 3: Open Positions */}
       <div className="panel" style={{ marginBottom: 16 }}>
-        <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
             Open Positions
           </span>
           {positions.length > 0 && (
             <div className="summary-line" style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
-              {positions.length} active
+              {showOnlyEligibleOpen
+                ? `${filteredPositions.length} of ${positions.length} active (live-eligible)`
+                : `${positions.length} active`}
             </div>
           )}
+          <label style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--color-text-secondary)', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={showOnlyEligibleOpen}
+              onChange={(e) => setShowOnlyEligibleOpen(e.target.checked)}
+            />
+            Show only live-eligible
+          </label>
         </div>
         {positions.length === 0 ? (
           <div className="empty-state">No open positions.</div>
+        ) : filteredPositions.length === 0 ? (
+          <div className="empty-state">
+            No live-eligible open positions.{' '}
+            <button
+              type="button"
+              onClick={() => setShowOnlyEligibleOpen(false)}
+              style={{ border: 'none', background: 'transparent', color: 'var(--color-accent-blue, #4a90e2)', cursor: 'pointer', fontSize: 12, textDecoration: 'underline', padding: 0 }}
+            >
+              Show all positions
+            </button>
+          </div>
         ) : (
           <div style={{ overflowX: 'auto' }}>
             <table className="candidates-table">
@@ -722,6 +818,7 @@ export default function TradingTab() {
                 <tr>
                   <SortHeader col="pnl_pct" label="Rank" />
                   <SortHeader col="token" label="Token" />
+                  <th title="Live-eligible: would this trade have been opened under live FCFS-20-slots capital constraints? See tasks/findings_open_position_price_freshness_2026_05_12.md.">Eligible</th>
                   <SortHeader col="category" label="Category" />
                   <SortHeader col="entry" label="Entry" />
                   <SortHeader col="amount" label="Amount" />
@@ -754,6 +851,9 @@ export default function TradingTab() {
                           symbol={getTokenLabel(p)}
                           chain="coingecko"
                         />
+                      </td>
+                      <td style={{ textAlign: 'center' }}>
+                        <EligibilityIcon value={p.would_be_live} />
                       </td>
                       <td style={{ fontSize: 11, maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {getCategory(p)}
@@ -845,7 +945,7 @@ export default function TradingTab() {
 
       {/* Section 4: Closed Trades (paginated) */}
       <div className="panel" style={{ marginBottom: 16 }}>
-        <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
             Closed Trades
           </span>
@@ -860,15 +960,35 @@ export default function TradingTab() {
               // when N=10) doesn't render nonsensical "1999981–10".
               : `Showing ${Math.min(closedPage * CLOSED_PER_PAGE + 1, closedTotal)}–${Math.min((closedPage + 1) * CLOSED_PER_PAGE, closedTotal)} of ${closedTotal}${closedTotal > CLOSED_PER_PAGE ? ' (sort applies to current page only)' : ''}`}
           </span>
+          <label style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--color-text-secondary)', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={showOnlyEligibleClosed}
+              onChange={(e) => setShowOnlyEligibleClosed(e.target.checked)}
+            />
+            Show only live-eligible
+          </label>
         </div>
         {history.length === 0 ? (
           <div className="empty-state">No closed trades yet.</div>
+        ) : filteredHistory.length === 0 ? (
+          <div className="empty-state">
+            No live-eligible closed trades in this page.{' '}
+            <button
+              type="button"
+              onClick={() => setShowOnlyEligibleClosed(false)}
+              style={{ border: 'none', background: 'transparent', color: 'var(--color-accent-blue, #4a90e2)', cursor: 'pointer', fontSize: 12, textDecoration: 'underline', padding: 0 }}
+            >
+              Show all closed trades
+            </button>
+          </div>
         ) : (
           <div style={{ overflowX: 'auto' }}>
             <table className="candidates-table">
               <thead>
                 <tr>
                   <SharedSortHeader col="_token" label="Token" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
+                  <th title="Live-eligible: would this trade have been opened under live FCFS-20-slots capital constraints? See tasks/findings_open_position_price_freshness_2026_05_12.md.">Eligible</th>
                   <SharedSortHeader col="_category" label="Category" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
                   <SharedSortHeader col="entry_price" label="Entry / Exit" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
                   <SharedSortHeader col="amount_usd" label="Amount" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
@@ -895,6 +1015,9 @@ export default function TradingTab() {
                           symbol={getTokenLabel(h)}
                           chain="coingecko"
                         />
+                      </td>
+                      <td style={{ textAlign: 'center' }}>
+                        <EligibilityIcon value={h.would_be_live} />
                       </td>
                       <td style={{ fontSize: 11, maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {getCategory(h)}

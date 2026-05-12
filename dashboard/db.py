@@ -901,7 +901,8 @@ async def _get_trading_positions_inner(db) -> list[dict]:
                   leg_2_filled_at,
                   remaining_qty,
                   realized_pnl_usd,
-                  floor_armed
+                  floor_armed,
+                  would_be_live
            FROM paper_trades
            WHERE status = 'open'
            ORDER BY opened_at DESC"""
@@ -971,7 +972,8 @@ async def get_trading_history(
                           peak_price, peak_pct,
                           checkpoint_1h_pct, checkpoint_6h_pct,
                           checkpoint_24h_pct, checkpoint_48h_pct,
-                          opened_at, closed_at
+                          opened_at, closed_at,
+                          would_be_live
                    FROM paper_trades
                    WHERE status != 'open'
                    ORDER BY closed_at DESC
@@ -1141,13 +1143,18 @@ async def get_trading_stats_by_signal_cohort(db_path: str, days: int = 7) -> dic
     window = f"-{days} days"
     async with _ro_db(db_path) as db:
         # Full cohort (existing get_trading_stats_by_signal pattern with avg_pnl_pct added).
+        # symbols field added for the dashboard's ticker-in-aggregate display
+        # (see tasks/plan_dashboard_live_eligible_view.md follow-up + plan
+        # at ~/.claude/plans/fluttering-riding-kernighan.md). GROUP_CONCAT order
+        # is SQLite-unspecified; Python sorts after split for deterministic UI.
         try:
             cursor = await db.execute(
                 """SELECT signal_type,
                           COUNT(*)                                AS trades,
                           SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
                           COALESCE(SUM(pnl_usd), 0)               AS pnl,
-                          COALESCE(AVG(pnl_pct), 0)               AS avg_pct
+                          COALESCE(AVG(pnl_pct), 0)               AS avg_pct,
+                          GROUP_CONCAT(symbol, '|')               AS symbols
                      FROM paper_trades
                     WHERE status != 'open'
                       AND closed_at >= datetime('now', ?)
@@ -1168,7 +1175,8 @@ async def get_trading_stats_by_signal_cohort(db_path: str, days: int = 7) -> dic
                           COUNT(*)                                AS trades,
                           SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
                           COALESCE(SUM(pnl_usd), 0)               AS pnl,
-                          COALESCE(AVG(pnl_pct), 0)               AS avg_pct
+                          COALESCE(AVG(pnl_pct), 0)               AS avg_pct,
+                          GROUP_CONCAT(symbol, '|')               AS symbols
                      FROM paper_trades
                     WHERE status != 'open'
                       AND closed_at >= datetime('now', ?)
@@ -1209,6 +1217,13 @@ async def get_trading_stats_by_signal_cohort(db_path: str, days: int = 7) -> dic
     def _to_row(r):
         trades = r[1] or 0
         wins = r[2] or 0
+        # r[5] is GROUP_CONCAT(symbol, '|') — split + sort for deterministic
+        # UI display order. Empty symbols (NULL or empty string) filtered out
+        # so the frontend never renders a blank ticker chip.
+        raw_symbols = r[5] if len(r) > 5 else None
+        symbols = (
+            sorted({s for s in raw_symbols.split("|") if s}) if raw_symbols else []
+        )
         return {
             "signal_type": r[0],
             "trades": trades,
@@ -1216,6 +1231,7 @@ async def get_trading_stats_by_signal_cohort(db_path: str, days: int = 7) -> dic
             "total_pnl_usd": round(r[3] or 0, 2),
             "win_rate_pct": round((wins / trades) * 100, 1) if trades > 0 else 0,
             "avg_pnl_pct": round(r[4] or 0, 2),
+            "symbols": symbols,
         }
 
     excluded = [

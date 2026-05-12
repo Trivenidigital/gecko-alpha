@@ -203,6 +203,69 @@ async def test_stats_by_signal_cohort_splits_eligible_from_full(client):
     assert eligible["gainers_early"]["trades"] == 1
     assert eligible["gainers_early"]["total_pnl_usd"] == 100.0
 
+    # Ticker aggregation (Piece 1 of dashboard eligibility-visibility hybrid):
+    # the cohort endpoint returns sorted ticker lists per signal_type for the
+    # dashboard's inline-ticker display. Empty/NULL symbols filtered out.
+    assert "symbols" in full["gainers_early"]
+    assert sorted(full["gainers_early"]["symbols"]) == ["BTC", "ETH"]
+    assert "symbols" in eligible["gainers_early"]
+    assert eligible["gainers_early"]["symbols"] == ["BTC"]
+
+
+async def test_positions_and_history_include_would_be_live(client):
+    """Piece 2 of dashboard eligibility-visibility hybrid: the per-trade
+    payloads from /positions and /history now expose would_be_live so the
+    frontend can render the per-row Eligible column with ✓/✗/— icons.
+    """
+    c, db = client
+    # One open trade, would_be_live=1
+    await _insert_trade(
+        db._conn,
+        "open-eligible",
+        "OPEN1",
+        "gainers_early",
+        "open",
+        pnl_usd=None,
+        pnl_pct=None,
+        would_be_live=1,
+    )
+    # One closed trade, would_be_live=0
+    await _insert_trade(
+        db._conn,
+        "closed-not-eligible",
+        "CLOSED1",
+        "gainers_early",
+        "closed_tp",
+        pnl_usd=10.0,
+        pnl_pct=1.0,
+        would_be_live=0,
+    )
+    # One closed trade pre-writer (would_be_live=None) — simulates pre-2026-05-11
+    await _insert_trade(
+        db._conn,
+        "closed-pre-writer",
+        "CLOSED2",
+        "gainers_early",
+        "closed_tp",
+        pnl_usd=5.0,
+        pnl_pct=0.5,
+        would_be_live=None,
+    )
+
+    pos_resp = await c.get("/api/trading/positions")
+    assert pos_resp.status_code == 200
+    positions = pos_resp.json()
+    by_token = {p["token_id"]: p for p in positions}
+    assert "open-eligible" in by_token
+    assert by_token["open-eligible"]["would_be_live"] == 1
+
+    hist_resp = await c.get("/api/trading/history?limit=20&offset=0")
+    assert hist_resp.status_code == 200
+    history = hist_resp.json()
+    by_token = {h["token_id"]: h for h in history}
+    assert by_token["closed-not-eligible"]["would_be_live"] == 0
+    assert by_token["closed-pre-writer"]["would_be_live"] is None
+
 
 async def test_stats_by_signal_cohort_excludes_non_stackable(client):
     """A signal_type with MAX(conviction_locked_stack) < 3 AND not in Tier
