@@ -482,6 +482,31 @@ ssh root@89.167.116.187 "sqlite3 /root/gecko-alpha/scout.db \"SELECT MIN(opened_
 - Weekly digest A/B comparing live-eligible cohort vs unfiltered firehose
 - Make race-strict (wrap SELECT+INSERT under `db._txn_lock`) once live trading routes through this filter
 
+### BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT: structural live-evaluability per signal_type
+**Status:** PROPOSED — surfaced 2026-05-12 during Step 1 verification of "(2) would auto-suspend-against-=1-cohort have spared trending_catch / first_signal." Filing now while the structural finding is fresh; implementation deferred to next live-trading roadmap revisit.
+**Tag:** `observability` `live-roadmap-input` `structural-evaluability` `tier-rule-coverage`
+**Why:** Step 1 empirically confirmed both trending_catch (n=108, kill 2026-05-11T01:00) and first_signal (n=253, kill 2026-05-02T01:00) have **zero** trades with `conviction_locked_stack >= 3` in their pre-kill cohorts — i.e., their `would_be_live=1` subsets are structurally empty (caveat: BL-067 conviction-lock not deployed until 2026-05-04, so first_signal's window predates the column being populated, but the signal's design caps stacking at n=2 anyway). The auto-suspends weren't wrong (paper losses were real), but they also weren't *answering* the question "would live trading on this signal lose money," because live trading on this signal was structurally impossible under current Tier 1/2 rules.
+
+**Drift verdict:** NET-NEW. No existing entry audits the structural live-eligibility surface per signal_type. BL-NEW-LIVE-ELIGIBLE shipped the writer; this entry asks what the writer can never stamp `=1` for and why.
+**Hermes verdict:** No Hermes skill covers signal-type × eligibility-rule coverage analysis. Project-internal.
+
+**Effect (proposed):** For each signal_type currently producing paper trades, compute:
+1. **Structural max conviction_stack** — the maximum number of co-occurring signals possible at open time given the signal's source (e.g., trending_catch fires alone from `trending_snapshot` → max stack = 1; first_signal stacks on momentum+trending → max stack = 2; gainers_early can carry multiple co-firing signals → max stack ≥ 3 possible).
+2. **Empirical eligible-subset rate** — historical % of trades where `compute_would_be_live` would have returned 1 (post-2026-05-11 writer for forward; backfill via `matches_tier_1_or_2()` against historical signal_data for prior rows).
+3. **Tier rule path coverage** — which Tier 1a/1b/2a/2b path admits the signal_type (or none).
+
+**Interpretation:** signal_types with structural max stack < 3 AND signal_type ∉ {chain_completed, volume_spike, gainers_early-with-gate} have *structurally empty* eligible subsets — they are not live-trading candidates regardless of paper performance. Their continued resource consumption (paper slots, alert noise, calibration cycles, MiroFish jobs) should be evaluated against that constraint at the next live-trading roadmap revisit.
+
+**Known instances from Step 1:**
+- `trending_catch` — max stack = 1 (single-source from trending_snapshot); not in Tier 1a/2a/2b; **structurally non-eligible**
+- `first_signal` — max stack = 2 (momentum_ratio + cg_trending_rank pair); not in Tier 1a/2a/2b; **structurally non-eligible**
+
+**Other candidate signal_types to audit when this runs:** `losers_contrarian`, `narrative_prediction`, `tg_social` (each may or may not be structurally stackable to ≥3 — empirical question).
+
+**Not in this PR:** dashboard surface for the audit results (could fold into BL-NEW-LIVE-ELIGIBLE's dashboard view), or a settings-driven "signal_types in scope for live evaluation" allowlist that excludes structurally-empty types from auto-suspend / calibration / alerting calculations.
+
+**Estimate:** ~2 hours analysis + ~1 hour write-up. No code change for the audit itself.
+
 ### BL-NEW-M1.5C: Minara DEX-eligibility alert extension (Phase 0 Option A under BL-074)
 **Status:** SHIPPED 2026-05-11 — PR #96 (`ef68c6c`) squash-merged + deployed VPS 2026-05-11T01:54Z. Schema 20260517 migration `bl_tg_alert_log_m1_5c_outcome` applied; M1.5b sentinel preserved across rebuild (verified `m1_5b_sentinel_preserved=true`). Onboarding TG announcement delivered. See memory `project_m1_5c_deployed_2026_05_11.md`.
 **Tag:** `decision-support` `minara` `solana-first` `phase-0-option-a` `pre-execution-layer`

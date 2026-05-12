@@ -110,6 +110,190 @@ function reasonBadge(reason) {
   return <span className="outcome-badge">{reason}</span>
 }
 
+// BL-NEW-LIVE-ELIGIBLE follow-up: cohort-comparison panel for PnL by signal type.
+// Default tab is 'full' so a casual glance at the dashboard doesn't anchor on
+// the smaller-n live-eligible cohort. See tasks/plan_dashboard_live_eligible_view.md.
+function PnlBySignalPanel({ bySignal, cohort, cohortView, setCohortView }) {
+  // Prefer the cohort endpoint's full_cohort (carries win_rate_pct/avg_pnl_pct
+  // uniformly); fall back to legacy /by-signal payload if the cohort endpoint
+  // isn't deployed yet (older backend).
+  const full = (cohort && cohort.full_cohort) || bySignal || []
+  const eligible = (cohort && cohort.eligible_cohort) || []
+  const excluded = (cohort && cohort.excluded_signal_types) || []
+  const caveat = cohort && cohort.small_n_caveat
+  const isEmpty = full.length === 0 && eligible.length === 0
+
+  const TabBtn = ({ id, label }) => (
+    <button
+      onClick={() => setCohortView(id)}
+      style={{
+        padding: '4px 10px',
+        fontSize: 12,
+        fontWeight: 600,
+        border: '1px solid var(--color-border)',
+        background: cohortView === id ? 'var(--color-accent-blue, #4a90e2)' : 'transparent',
+        color: cohortView === id ? '#fff' : 'var(--color-text-secondary)',
+        borderRadius: 4,
+        cursor: 'pointer',
+      }}
+    >
+      {label}
+    </button>
+  )
+
+  const renderRow = (s, i, opts = {}) => {
+    const pnl = s.total_pnl_usd ?? s.total_pnl ?? s.pnl ?? 0
+    const wr = s.win_rate_pct ?? s.win_rate ?? (s.trades > 0 ? ((s.wins / s.trades) * 100) : 0)
+    const rowBg = pnl > 0
+      ? 'rgba(76, 175, 80, 0.07)'
+      : pnl < 0
+        ? 'rgba(239, 83, 80, 0.07)'
+        : 'transparent'
+    return (
+      <tr key={(opts.keyPrefix || '') + (s.signal_type || i)} style={{ background: rowBg }}>
+        <td style={{ fontWeight: 600 }}>{s.signal_type || '-'}</td>
+        <td>{s.trades ?? s.total_trades ?? 0}</td>
+        <td>{s.wins ?? 0}</td>
+        <td style={{ fontWeight: 700, color: pnlColor(pnl) }}>{fmtUsd(pnl)}</td>
+        <td>{Number(wr).toFixed(1)}%</td>
+        <td style={{ color: pnlColor(s.avg_pnl_pct) }}>{fmtPct(s.avg_pnl_pct)}</td>
+      </tr>
+    )
+  }
+
+  // Side-by-side view: merge by signal_type, compute deltas.
+  const sideBySide = (() => {
+    const byType = new Map()
+    full.forEach(s => byType.set(s.signal_type, { full: s, eligible: null }))
+    eligible.forEach(s => {
+      const e = byType.get(s.signal_type) || { full: null, eligible: null }
+      e.eligible = s
+      byType.set(s.signal_type, e)
+    })
+    return Array.from(byType.entries()).map(([signal_type, pair]) => ({
+      signal_type,
+      full: pair.full,
+      eligible: pair.eligible,
+    }))
+  })()
+
+  return (
+    <div className="panel" style={{ marginBottom: 16 }}>
+      <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
+          PnL by Signal Type
+        </span>
+        <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
+          Which signals make money?
+        </span>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+          <TabBtn id="full" label="All trades" />
+          <TabBtn id="eligible" label="Live-eligible only" />
+          <TabBtn id="side-by-side" label="Side-by-side" />
+        </div>
+      </div>
+
+      {isEmpty ? (
+        <div className="empty-state">No signal data yet. Trades will appear after the first paper trade closes.</div>
+      ) : cohortView === 'side-by-side' ? (
+        <div style={{ overflowX: 'auto' }}>
+          <table className="candidates-table">
+            <thead>
+              <tr>
+                <th rowSpan={2}>Signal Type</th>
+                <th colSpan={3} style={{ textAlign: 'center', borderBottom: '1px solid var(--color-border)' }}>Full cohort</th>
+                <th colSpan={3} style={{ textAlign: 'center', borderBottom: '1px solid var(--color-border)' }}>Live-eligible only</th>
+                <th colSpan={2} style={{ textAlign: 'center', borderBottom: '1px solid var(--color-border)' }}>Δ (eligible − full)</th>
+              </tr>
+              <tr>
+                <th>n</th><th>PnL</th><th>Win %</th>
+                <th>n</th><th>PnL</th><th>Win %</th>
+                <th>Win-rate Δ</th><th>PnL sign</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sideBySide.map(({ signal_type, full: f, eligible: e }) => {
+                const fPnl = f?.total_pnl_usd ?? 0
+                const ePnl = e?.total_pnl_usd ?? 0
+                const fWr = f?.win_rate_pct ?? 0
+                const eWr = e?.win_rate_pct ?? 0
+                const wrDelta = e ? (eWr - fWr) : null
+                // Strong divergence per pre-registration: PnL sign flips AND win-rate gap > 15pp.
+                const signFlip = e && f && ((fPnl > 0 && ePnl < 0) || (fPnl < 0 && ePnl > 0))
+                const strong = signFlip && wrDelta != null && Math.abs(wrDelta) > 15
+                return (
+                  <tr key={signal_type} style={{ background: strong ? 'rgba(255, 183, 77, 0.10)' : 'transparent' }}>
+                    <td style={{ fontWeight: 600 }}>{signal_type}{strong && <span title="Strong divergence: PnL sign flip + win-rate gap > 15pp" style={{ marginLeft: 6 }}>⚠</span>}</td>
+                    <td>{f?.trades ?? 0}</td>
+                    <td style={{ color: pnlColor(fPnl), fontWeight: 600 }}>{fmtUsd(fPnl)}</td>
+                    <td>{fWr.toFixed(1)}%</td>
+                    <td>{e?.trades ?? 0}</td>
+                    <td style={{ color: pnlColor(ePnl), fontWeight: 600 }}>{e ? fmtUsd(ePnl) : '-'}</td>
+                    <td>{e ? eWr.toFixed(1) + '%' : '-'}</td>
+                    <td style={{ color: wrDelta == null ? 'var(--color-text-secondary)' : (wrDelta > 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red, #ef5350)') }}>
+                      {wrDelta == null ? '-' : (wrDelta > 0 ? '+' : '') + wrDelta.toFixed(1) + 'pp'}
+                    </td>
+                    <td style={{ color: signFlip ? 'var(--color-accent-amber)' : 'var(--color-text-secondary)' }}>
+                      {signFlip ? 'FLIP' : (e ? 'same' : '-')}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div style={{ overflowX: 'auto' }}>
+          <table className="candidates-table">
+            <thead>
+              <tr>
+                <th>Signal Type</th>
+                <th>Trades</th>
+                <th>Wins</th>
+                <th>PnL ($)</th>
+                <th>Win Rate</th>
+                <th>Avg PnL %</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(cohortView === 'eligible' ? eligible : full).map((s, i) => renderRow(s, i, { keyPrefix: cohortView + '-' }))}
+              {cohortView === 'eligible' && eligible.length === 0 && (
+                <tr><td colSpan={6} style={{ color: 'var(--color-text-secondary)', fontStyle: 'italic', padding: '12px 8px' }}>
+                  No live-eligible closes in this window. would_be_live writer shipped 2026-05-11; eligibility rate is typically 5-10% of paper volume.
+                </td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Excluded signal_types — visibility-not-hiding per §2.11 discipline */}
+      {excluded.length > 0 && (
+        <details style={{ marginTop: 12, padding: '8px 12px', background: 'var(--color-bar-bg, #1a1a1a)', borderRadius: 4 }}>
+          <summary style={{ cursor: 'pointer', fontSize: 12, fontWeight: 600, color: 'var(--color-text-secondary)' }}>
+            Excluded from live-eligible cohort ({excluded.length})
+          </summary>
+          <div style={{ marginTop: 8, fontSize: 11, color: 'var(--color-text-secondary)' }}>
+            {excluded.map(e => (
+              <div key={e.signal_type} style={{ padding: '4px 0', borderBottom: '1px dashed var(--color-border)' }}>
+                <span style={{ fontWeight: 600, color: 'var(--color-text-primary)' }}>{e.signal_type}</span>
+                {' — '}{e.reason}
+                {' '}<span style={{ opacity: 0.7 }}>(lifetime n={e.lifetime_trades})</span>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+
+      {caveat && (
+        <div style={{ marginTop: 8, fontSize: 11, color: 'var(--color-text-secondary)', fontStyle: 'italic', padding: '0 12px' }}>
+          {caveat}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function checkpointBadges(p) {
   const checks = [
     { label: '1h', val: p.checkpoint_1h_pct },
@@ -140,6 +324,10 @@ function checkpointBadges(p) {
 export default function TradingTab() {
   const [stats, setStats] = useState(null)
   const [bySignal, setBySignal] = useState([])
+  // Cohort-toggle view (BL-NEW-LIVE-ELIGIBLE follow-up). Default 'full' —
+  // smaller-n eligible view is opt-in to avoid anchoring on wide CIs.
+  const [bySignalCohort, setBySignalCohort] = useState(null)
+  const [cohortView, setCohortView] = useState('full') // 'full' | 'eligible' | 'side-by-side'
   const [positions, setPositions] = useState([])
   const [history, setHistory] = useState([])
   const [closedPage, setClosedPageState] = useState(_readStoredPage)
@@ -169,9 +357,10 @@ export default function TradingTab() {
     const signal = ac.signal
     try {
       const offset = closedPage * CLOSED_PER_PAGE
-      const [statsRes, sigRes, posRes, histRes, countRes] = await Promise.all([
+      const [statsRes, sigRes, cohortRes, posRes, histRes, countRes] = await Promise.all([
         fetch('/api/trading/stats', { signal }),
         fetch('/api/trading/stats/by-signal', { signal }),
+        fetch('/api/trading/stats/by-signal-cohort', { signal }),
         fetch('/api/trading/positions', { signal }),
         fetch(`/api/trading/history?limit=${CLOSED_PER_PAGE}&offset=${offset}`, { signal }),
         fetch('/api/trading/history/count', { signal }),
@@ -185,6 +374,7 @@ export default function TradingTab() {
         const sig = await sigRes.json()
         setBySignal(Array.isArray(sig) ? sig : Object.entries(sig).map(([k, v]) => ({ signal_type: k, ...v })))
       }
+      if (cohortRes.ok) setBySignalCohort(await cohortRes.json())
       if (posRes.ok) setPositions(await posRes.json())
       let histRows = null
       if (histRes.ok) {
@@ -346,56 +536,14 @@ export default function TradingTab() {
         </div>
       </div>
 
-      {/* Section 2: PnL by Signal Type */}
-      <div className="panel" style={{ marginBottom: 16 }}>
-        <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
-            PnL by Signal Type
-          </span>
-          <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
-            Which signals make money?
-          </span>
-        </div>
-        {bySignal.length === 0 ? (
-          <div className="empty-state">No signal data yet. Trades will appear after the first paper trade closes.</div>
-        ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table className="candidates-table">
-              <thead>
-                <tr>
-                  <th>Signal Type</th>
-                  <th>Trades</th>
-                  <th>Wins</th>
-                  <th>PnL ($)</th>
-                  <th>Win Rate</th>
-                  <th>Avg PnL %</th>
-                </tr>
-              </thead>
-              <tbody>
-                {bySignal.map((s, i) => {
-                  const pnl = s.total_pnl ?? s.pnl ?? 0
-                  const wr = s.win_rate_pct ?? s.win_rate ?? (s.trades > 0 ? ((s.wins / s.trades) * 100) : 0)
-                  const rowBg = pnl > 0
-                    ? 'rgba(76, 175, 80, 0.07)'
-                    : pnl < 0
-                      ? 'rgba(239, 83, 80, 0.07)'
-                      : 'transparent'
-                  return (
-                    <tr key={s.signal_type || i} style={{ background: rowBg }}>
-                      <td style={{ fontWeight: 600 }}>{s.signal_type || '-'}</td>
-                      <td>{s.trades ?? s.total_trades ?? 0}</td>
-                      <td>{s.wins ?? 0}</td>
-                      <td style={{ fontWeight: 700, color: pnlColor(pnl) }}>{fmtUsd(pnl)}</td>
-                      <td>{Number(wr).toFixed(1)}%</td>
-                      <td style={{ color: pnlColor(s.avg_pnl_pct) }}>{fmtPct(s.avg_pnl_pct)}</td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+      {/* Section 2: PnL by Signal Type — cohort-toggle view (BL-NEW-LIVE-ELIGIBLE follow-up) */}
+      <PnlBySignalPanel
+        bySignal={bySignal}
+        cohort={bySignalCohort}
+        cohortView={cohortView}
+        setCohortView={setCohortView}
+      />
+
 
       {/* Section 3: Open Positions */}
       <div className="panel" style={{ marginBottom: 16 }}>
