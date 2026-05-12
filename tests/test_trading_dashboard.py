@@ -140,16 +140,33 @@ async def test_get_stats_by_signal(client):
 
 
 async def test_stats_by_signal_cohort_shape(client):
-    """Endpoint returns the four expected top-level keys."""
+    """Endpoint returns the expected top-level keys.
+
+    Vector B/C review folds added near_identical_cohorts +
+    min_eligible_n_for_verdict + verdict_window_anchor — operator-visible
+    contract that the dashboard reads to gate verdicts. Lock them in tests
+    so a future refactor can't silently drop them.
+    """
     c, _ = client
     resp = await c.get("/api/trading/stats/by-signal-cohort")
     assert resp.status_code == 200
     data = resp.json()
-    assert "full_cohort" in data
-    assert "eligible_cohort" in data
-    assert "excluded_signal_types" in data
-    assert "window_days" in data
+    for key in (
+        "full_cohort",
+        "eligible_cohort",
+        "excluded_signal_types",
+        "near_identical_cohorts",
+        "min_eligible_n_for_verdict",
+        "verdict_window_anchor",
+        "small_n_caveat",
+        "window_days",
+    ):
+        assert key in data, f"missing key: {key}"
     assert data["window_days"] == 7
+    assert data["min_eligible_n_for_verdict"] == 10
+    # chain_completed is structurally near-identical (Tier 1a) — must appear
+    # in near_identical_cohorts unconditionally, not contingent on data.
+    assert "chain_completed" in data["near_identical_cohorts"]
 
 
 async def test_stats_by_signal_cohort_splits_eligible_from_full(client):
@@ -191,7 +208,12 @@ async def test_stats_by_signal_cohort_excludes_non_stackable(client):
     """A signal_type with MAX(conviction_locked_stack) < 3 AND not in Tier
     1a/2a/2b enumeration appears in excluded_signal_types with a structural
     reason. Visibility-not-hiding: trending_catch surfaces with its cap, not
-    silently disappears."""
+    silently disappears.
+
+    Vector C F-I1 fold: the reason string must clearly explain that the
+    eligible subset is *structurally empty*, not just *small*. Lock the
+    operator-facing language.
+    """
     c, db = client
     # trending_catch — single-source, never stacks; should be excluded.
     await _insert_trade(
@@ -224,8 +246,11 @@ async def test_stats_by_signal_cohort_excludes_non_stackable(client):
         e for e in data["excluded_signal_types"] if e["signal_type"] == "trending_catch"
     )
     assert tc["max_observed_stack"] == 0
-    assert "structural stack cap" in tc["reason"]
-    assert "Tier 1a/2a/2b" in tc["reason"]
+    # Reason must use "structurally empty" framing (Vector C F-I1 fold),
+    # not just "stack cap = 0" jargon that inverts on casual read.
+    assert "structurally empty" in tc["reason"]
+    assert "max stack" in tc["reason"]
+    assert "Still paper-trading" in tc["reason"]
 
 
 async def test_stats_by_signal_cohort_non_enum_signal_NOT_excluded_when_stack_ge_3(
@@ -279,14 +304,20 @@ async def test_stats_by_signal_cohort_eligible_empty_when_no_writer_stamps(clien
 
 
 async def test_stats_by_signal_cohort_carries_caveat_text(client):
-    """The small_n_caveat key must be present and reference the 4-week
-    convergence window — that's the operator-visible disclaimer that
-    matches the pre-registered evaluation criteria."""
+    """The small_n_caveat must lead with the operator-actionable framing
+    (Vector C F-N1/F-I3 folds): n-gate requirement, exploratory-not-
+    confirmatory framing, and the explicit decision-lock date. Without
+    these the operator anchors on the smaller-n verdict prematurely."""
     c, _ = client
     resp = await c.get("/api/trading/stats/by-signal-cohort")
     data = resp.json()
-    assert "small_n_caveat" in data
-    assert "4 weeks" in data["small_n_caveat"]
+    caveat = data["small_n_caveat"]
+    assert "INSUFFICIENT_DATA" in caveat
+    assert "exploratory" in caveat
+    assert "2026-06-08" in caveat
+    # Decision-lock date duplicated in verdict_window_anchor so the
+    # UI can render it independently from the caveat text.
+    assert "2026-06-08" in data["verdict_window_anchor"]
 
 
 async def test_positions_empty(client):

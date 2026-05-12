@@ -63,23 +63,36 @@ These are deferred until the dashboard view's 4-week evidence answers Q1.
 
 Future signal_types with the same property (single-source, not tier-enumerated) are excluded by the same rule.
 
-**Window:** 4 weeks from dashboard deployment.
+**Window:** writer-deployment + 28 days = **2026-06-08** (writer deployed 2026-05-11T13:22Z). Anchoring the clock to writer-deployment rather than dashboard-deployment locks the available n; dashboard-deployment was the build cost, not the measurement start.
 
 **Metrics tracked separately** (per the refined-framing turn 2026-05-12):
 - Win-rate (% closes with pnl_usd > 0)
 - Net PnL (USD)
 
-**Divergence classification per signal_type:** both metrics evaluated independently; **agreement required** before declaring strong divergence:
-- **Strong divergence** — both win-rate gap >15pp AND PnL sign flip (eligible subset positive while full cohort negative, or vice versa). Justifies scoping (2) / (3) for that signal_type.
-- **Moderate divergence** — either win-rate gap 5-15pp OR PnL sign flip alone. Record; do not act.
-- **Win-rate flip alone, PnL agrees** — eligible subset changes *which* trades close green/red without changing economic outcome. Interesting; not actionable for signal evaluation. May be actionable for risk-management framing.
-- **PnL flip alone, win-rate agrees** — eligible subset changes the tail shape (rare big winners absent or concentrated). More actionable for risk-management than for signal evaluation.
-- **Tracking (<5pp win-rate AND PnL same-sign)** — full-cohort evaluation is fine for that signal_type. (2) / (3) is scope creep.
+**N-gate** (added 2026-05-12 post-Vector-B/C review): per-signal-type verdicts require **eligible-cohort n ≥ `MIN_ELIGIBLE_N_FOR_VERDICT` (default 10)** before classification fires. Below threshold, the verdict is **INSUFFICIENT_DATA** — explicitly displayed as a distinct row class in the UI, never silently collapsed into Tracking. Without the n-gate, Vector B computed power 25-40% and family-wise FPR ~50% across 4 signal_types at projected weekly n; the dashboard would generate strong-divergence verdicts on pure noise.
 
-**Decision points at 4-week mark:**
-- If ≥1 signal_type shows strong divergence (both metrics agree, same direction) → scope (2) and/or (3) for that signal_type, with explicit n caveats and recalibrated thresholds for small-n cohorts.
-- If only moderate or split divergences → continue observation; do not act.
-- If all signal_types track → full-cohort evaluation is empirically validated; close the Q1/Q2 thread; do not pursue (2) / (3).
+**Divergence classification per signal_type** (only when eligible n ≥ MIN_ELIGIBLE_N_FOR_VERDICT):
+- **Strong-pattern (exploratory, not confirmatory)** — both win-rate gap >15pp AND PnL sign flip with |PnL| ≥ `STRONG_PATTERN_PNL_MAGNITUDE_FLOOR` (default $200) in BOTH cohorts. **This is a hypothesis-generating signal, NOT a verdict to act on.** Confirmation requires a separate scoped re-evaluation (see "What this does NOT close" below).
+- **Moderate pattern** — either win-rate gap 5-15pp OR PnL sign flip alone. Record; do not act.
+- **Win-rate flip alone, PnL agrees** — eligible subset changes *which* trades close green/red without changing economic outcome.
+- **PnL flip alone, win-rate agrees** — eligible subset changes the tail shape (rare big winners absent or concentrated).
+- **Tracking (<5pp win-rate AND PnL same-sign)** — full-cohort evaluation is fine for that signal_type.
+- **INSUFFICIENT_DATA** — eligible cohort n < MIN_ELIGIBLE_N_FOR_VERDICT. Cannot classify; not Tracking.
+
+**Why "exploratory not confirmatory":** with 4 signal_types under test and per-test α ≈ 0.16 (the empirical false-positive rate of a 15pp threshold at n=20 under the null per Vector B's calculation), the family-wise error rate is roughly 50%. The conjunction with PnL sign-flip reduces FPR somewhat but sign-flips themselves are noisy at near-zero full-cohort PnL — hence the magnitude floor. Treating strong-pattern verdicts as actionable in this PR would mis-classify the verdict's epistemic weight. Confirmation requires either (a) Bonferroni-corrected thresholds re-derived for the achieved n, or (b) a separate scoped re-evaluation with bootstrap CI on the win-rate difference (10,000 resamples, distribution-free, no normality assumption). Either path is OUT OF SCOPE for this PR.
+
+**chain_completed-specific caveat** (added 2026-05-12 post-Vector-B review): `chain_completed`'s Tier 1a eligibility is *structural* — virtually all chain_completed trades carry stack ≥ 3 by design, so its full-cohort and eligible-cohort are nearly identical populations. The win-rate gap is mechanically forced toward zero. Divergence verdicts on chain_completed are not informative; the UI shows this signal with a `near-identical-cohorts` annotation, and the 4-week summary explicitly excludes chain_completed from the divergence-detection question.
+
+**Decision points at the 4-week mark:**
+- If ≥1 signal_type shows **strong-pattern** verdict with n ≥ threshold → scope a confirmation evaluation (Bonferroni-corrected OR bootstrap-CI) for THAT signal_type. Do NOT directly scope (2)/(3) on the dashboard's verdict alone.
+- If only moderate / split / INSUFFICIENT_DATA → either extend the window for INSUFFICIENT_DATA signals or close Q1 as "no actionable divergence detected; full-cohort evaluation suffices."
+- If all signal_types track → Q1 answered negative; (2)/(3) are scope creep, do not pursue.
+
+**Window asymmetry (intentional, documented per Vector B M-CONC-2):**
+- Full-cohort & eligible-cohort SQL: **rolling 7d/30d window** (configurable via `days` query parameter).
+- Exclusion-list derivation: **all-time** `MAX(conviction_locked_stack)` query.
+
+Reason: structural eligibility (Tier 1b stack-based path) is a property of the signal_type's data shape, not the rolling window. A signal that has historically stacked to ≥3 but didn't this week is NOT structurally excluded — it's empirically empty for this window, which is correctly the INSUFFICIENT_DATA case. The dashboard's `<details>` excluded-section explicitly documents this asymmetry.
 
 ## Anchoring discipline
 
@@ -165,6 +178,9 @@ Pure additive; revert is a file-level revert of the `dashboard/api.py` and `dash
 - (4) alert routing against =1 cohort — same
 - BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT — separate backlog entry, fires at the next live-trading roadmap revisit
 - The live-trading enablement decision itself — gated on BL-055 unlock per memory `project_bl055_deployed_2026_04_23.md`
+- **Q2 (statistical-cost worthwhile?) is NOT answered by this view** (Vector C S-C1). Q2 requires a paired "what would (2)/(3) decide at n=eligible" simulator that is not in scope for this PR. The dashboard answers Q1 (cohort divergence empirical question); Q2 requires a separate scoped follow-up. Filed as backlog item.
+- **Confirmation evaluation** for any strong-pattern verdict — Bonferroni-corrected OR bootstrap-CI re-test of the surfaced divergence. Not scoped here; would be scoped at the 4-week mark only if a strong-pattern verdict actually fires.
+- **Weekly-digest / scheduled-summary shape** for the 4-week evidence collection (Vector C S-C2) — daily glance over 4 weeks × ~7 signal_types is a heavy attention burden for a low-probability output. Filed as backlog follow-up; doesn't block this PR.
 
 ## Forward-looking pre-registration recall
 

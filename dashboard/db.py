@@ -1095,6 +1095,28 @@ async def get_trading_stats_by_signal(db_path: str, days: int = 7) -> dict:
 _LIVE_ELIGIBLE_ENUMERATED_TYPES = ("chain_completed", "volume_spike", "gainers_early")
 
 
+def _is_expected_cohort_oe(err: "aiosqlite.OperationalError") -> bool:
+    """True iff the OperationalError is the expected pre-migration / pre-writer
+    snapshot shape (missing table or missing would_be_live / conviction_locked_stack
+    column). Anything else — syntax errors, locked DB, renamed-but-still-present
+    column — propagates so the dashboard 500s loudly instead of silently emptying
+    the cohort view.
+
+    Vector A N2 fold: narrow the catch to match the project's documented precedent
+    (see get_tg_social_dlq below) per global CLAUDE.md
+    feedback_resilience_layered_failure_modes.md ("every resilience addition must
+    extend a visibility surface").
+    """
+    msg = str(err).lower()
+    if "no such table" in msg and "paper_trades" in msg:
+        return True
+    if "no such column" in msg and (
+        "would_be_live" in msg or "conviction_locked_stack" in msg
+    ):
+        return True
+    return False
+
+
 async def get_trading_stats_by_signal_cohort(db_path: str, days: int = 7) -> dict:
     """Side-by-side PnL/win-rate by signal_type for full vs live-eligible cohorts.
 
@@ -1133,7 +1155,10 @@ async def get_trading_stats_by_signal_cohort(db_path: str, days: int = 7) -> dic
                 (window,),
             )
             full_rows = await cursor.fetchall()
-        except aiosqlite.OperationalError:
+        except aiosqlite.OperationalError as e:
+            if not _is_expected_cohort_oe(e):
+                structlog.get_logger().warning("cohort_full_query_oe", err=str(e))
+                raise
             full_rows = []
 
         # Eligible cohort — same shape, filtered to would_be_live=1.
@@ -1152,7 +1177,10 @@ async def get_trading_stats_by_signal_cohort(db_path: str, days: int = 7) -> dic
                 (window,),
             )
             eligible_rows = await cursor.fetchall()
-        except aiosqlite.OperationalError:
+        except aiosqlite.OperationalError as e:
+            if not _is_expected_cohort_oe(e):
+                structlog.get_logger().warning("cohort_eligible_query_oe", err=str(e))
+                raise
             eligible_rows = []
 
         # Excluded list — derived from ALL-time history (not the days window),
@@ -1172,7 +1200,10 @@ async def get_trading_stats_by_signal_cohort(db_path: str, days: int = 7) -> dic
                 _LIVE_ELIGIBLE_ENUMERATED_TYPES,
             )
             excluded_rows = await cursor.fetchall()
-        except aiosqlite.OperationalError:
+        except aiosqlite.OperationalError as e:
+            if not _is_expected_cohort_oe(e):
+                structlog.get_logger().warning("cohort_excluded_query_oe", err=str(e))
+                raise
             excluded_rows = []
 
     def _to_row(r):
@@ -1193,23 +1224,35 @@ async def get_trading_stats_by_signal_cohort(db_path: str, days: int = 7) -> dic
             "max_observed_stack": r[1] or 0,
             "lifetime_trades": r[2] or 0,
             "reason": (
-                f"structural stack cap = {r[1] or 0}; "
-                "not in Tier 1a/2a/2b enumeration (chain_completed, volume_spike, gainers_early)"
+                f"max stack achieved in lifetime: {r[1] or 0} (need >=3 for live "
+                "eligibility); single-source signal — eligible subset is "
+                "structurally empty, not small. Still paper-trading."
             ),
         }
         for r in excluded_rows
     ]
+
+    # chain_completed annotation (Vector B M-CRIT-2 fold): Tier 1a entry means
+    # full and eligible cohorts are nearly identical populations; divergence
+    # verdicts are not informative. Surface this in the API response so the
+    # UI can annotate the row.
+    near_identical_cohorts = ["chain_completed"]
 
     return {
         "window_days": days,
         "full_cohort": [_to_row(r) for r in full_rows],
         "eligible_cohort": [_to_row(r) for r in eligible_rows],
         "excluded_signal_types": excluded,
+        "near_identical_cohorts": near_identical_cohorts,
+        "min_eligible_n_for_verdict": 10,
+        "verdict_window_anchor": "writer-deployment 2026-05-11 + 28d = 2026-06-08",
         "small_n_caveat": (
-            "Live-eligible cohort is typically 5-10% of paper-trade volume; "
-            "signal-type breakdowns require >= 4 weeks before win-rate "
-            "confidence intervals tighten. See tasks/plan_dashboard_live_eligible_view.md "
-            "for the pre-registered divergence-classification criteria."
+            "Live-eligible cohort is typically 5-10% of paper-trade volume. "
+            "Per-signal-type verdicts require eligible n >= 10 (otherwise "
+            "INSUFFICIENT_DATA). Strong-pattern verdicts are exploratory, NOT "
+            "confirmatory — family-wise FPR ~50% across 4 signal_types at "
+            "projected n. Decision-locked at writer-deployment + 28d = "
+            "2026-06-08. See tasks/plan_dashboard_live_eligible_view.md."
         ),
     }
 
