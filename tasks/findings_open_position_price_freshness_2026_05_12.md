@@ -150,14 +150,55 @@ A one-off triage script (`scripts/triage_refresh_held_token_prices_20260512.py`)
 
 **Triage summary (filled post-run):**
 
-- Started at: TIME_TBD
-- Total held tokens: TBD
-- Eligible for refresh (stale OR missing): TBD
-- Skipped (non-CG-format token_ids — e.g., chain_completed contract addresses): TBD
-- Refreshed successfully: TBD
-- Not found in CoinGecko (delisted / renamed): TBD
-- Material-drift count (|delta_pct| > 10%): TBD
-- Largest drift examples: TBD
+- Started at: 2026-05-12T12:58:52Z
+- Finished at: 2026-05-12T12:58:52Z (wall-clock 0.2 sec)
+- Total held tokens: 150
+- Skipped — already cache-fresh < 1h: 84
+- Skipped — non-CG-format token_ids: 0 (this cohort had no contract-addr-shaped held tokens; all held tokens are CG coin_ids)
+- Eligible for refresh: 66
+- Refreshed successfully: 66 (100% CoinGecko coverage)
+- Not found in CoinGecko: 0
+- **Material-drift count (|delta_pct| > 10%): 17 of 66 = 25.8% of refreshed cohort**
+- Log file: `/root/gecko-alpha/triage_price_refresh_20260512T125852Z.json`
+
+**Largest drift cases (selected from top-20 by |delta_pct|):**
+
+| Symbol | token_id | Stale (h) | Old price | New price | Δ% |
+|---|---|---:|---:|---:|---:|
+| RIV | riv-coin | 66.7 | $0.005637 | $0.008591 | **+52.4%** |
+| (no sym) | goblin-trump | 227.4 | $5.01e-6 | $2.94e-6 | **−41.3%** |
+| TRUTH | swarm-network | 34.2 | $0.01315 | $0.01589 | +20.8% |
+| tibbir | ribbita-by-virtuals | 163.5 | $0.16122 | $0.12987 | −19.4% |
+| BDAG | blockdag | 28.8 | $1.25e-4 | $1.03e-4 | −17.6% |
+| EVAA | evaa-protocol | 85.2 | $0.7309 | $0.6131 | −16.1% |
+| anon | heyanon | 143.1 | $0.8772 | $0.7368 | −16.0% |
+| AIOT | okzoo | 144.4 | $0.0906 | $0.1048 | +15.7% |
+| SWARMS | swarms | 45.7 | $0.02259 | $0.01920 | −15.0% |
+| LMTS | limitless-3 | 42.8 | $0.1493 | $0.1282 | −14.1% |
+| PAYAI | payai-network-2 | 28.0 | $0.01170 | $0.01027 | −12.2% |
+
+**Urgency calibration update:**
+
+25.8% material-drift rate is between the MEDIUM (<10%) and HIGH (>30%) bands
+the finding pre-registered. Net read: severity remains **HIGH** but not
+maximally urgent — the trailing-stop blindness has been materially affecting
+exit decisions on roughly a quarter of the stale-cache cohort, but the
+distribution of moves includes substantial cases in both directions (RIV +52%
+would have been favorable; goblin-trump −41% would have been the more
+worrying case where SL would have triggered if visible). The architectural
+fix should be the immediate next priority after this session, but does not
+warrant emergency same-day patching.
+
+**Specific check on PAYAI** (the seed case): −12.2% move in 28h. Peak was
+$0.01170 (moonshot armed), current $0.01027, so 12.2% below peak. Moonshot
+trail-drawdown threshold is 30% per `PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT`;
+not yet at the trigger but headed there. With the cache refreshed, the
+evaluator's next cycle will see the actual price and resume making
+trail-drawdown decisions normally.
+
+**Observed delisted/renamed:** none. CoinGecko had all 66 held tokens. This
+is a useful negative finding — the staleness was purely due to ingestion-
+lane drop-off, not because tokens disappeared from CoinGecko's universe.
 
 **Critical:** this is a one-off. Running this script twice does not constitute a fix. The architectural gap remains until the design pass ships. **Do not schedule this script as a recurring job** — that would entrench the symptom-level patch and reduce urgency to fix the underlying gap.
 
