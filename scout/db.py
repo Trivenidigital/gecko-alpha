@@ -4016,6 +4016,12 @@ class Database:
         """Bulk-upsert price data from a CoinGecko /coins/markets response.
 
         Returns the number of rows upserted.
+
+        Uses INSERT ... ON CONFLICT DO UPDATE with COALESCE on price_change_7d
+        so callers that don't supply 7d-change (notably the held-position
+        refresh lane, which uses /simple/price) preserve any existing 7d value
+        rather than nulling it out. No-op for /coins/markets callers (they
+        always supply 7d). See tasks/plan_held_position_price_freshness.md.
         """
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
@@ -4026,10 +4032,17 @@ class Database:
             if not cid:
                 continue
             await self._conn.execute(
-                """INSERT OR REPLACE INTO price_cache
+                """INSERT INTO price_cache
                    (coin_id, current_price, price_change_24h, price_change_7d,
                     market_cap, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(coin_id) DO UPDATE SET
+                     current_price = excluded.current_price,
+                     price_change_24h = excluded.price_change_24h,
+                     price_change_7d = COALESCE(
+                       excluded.price_change_7d, price_cache.price_change_7d),
+                     market_cap = excluded.market_cap,
+                     updated_at = excluded.updated_at""",
                 (
                     cid,
                     coin.get("current_price"),

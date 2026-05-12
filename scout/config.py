@@ -62,6 +62,20 @@ class Settings(BaseSettings):
     COINGECKO_API_KEY: str = ""
     COINGECKO_RATE_LIMIT_PER_MIN: int = 25  # buffer under 30/min free tier
 
+    # Held-position price-refresh lane (§12c-narrow remediation).
+    # See tasks/plan_held_position_price_freshness.md and
+    # tasks/findings_open_position_price_freshness_2026_05_12.md.
+    # When enabled, every Nth pipeline cycle queries open paper_trades and
+    # forces a price_cache refresh for held tokens regardless of whether they
+    # appear in any other ingestion lane.
+    #
+    # DEFAULT IS FALSE — deploy-safe-by-default. Operator explicitly sets
+    # HELD_POSITION_PRICE_REFRESH_ENABLED=True on the VPS .env on 2026-05-14
+    # (the planned activation date — clean cohort boundary post BL-NEW-
+    # AUTOSUSPEND-FIX soak close). Revert via _ENABLED=False.
+    HELD_POSITION_PRICE_REFRESH_ENABLED: bool = False
+    HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES: int = 1
+
     # MiroFish
     MIROFISH_URL: str = "http://localhost:5001"
     MIROFISH_TIMEOUT_SEC: int = 180

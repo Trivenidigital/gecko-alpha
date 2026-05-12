@@ -33,6 +33,7 @@ from scout.ingestion.coingecko import fetch_by_volume as cg_fetch_by_volume
 from scout.ingestion import coingecko as _cg_module
 from scout.ingestion.dexscreener import fetch_trending
 from scout.ingestion.geckoterminal import fetch_trending_pools
+from scout.ingestion.held_position_prices import fetch_held_position_prices
 from scout.ingestion.holder_enricher import enrich_holders
 from scout.narrative.agent import narrative_agent_loop
 from scout.news.cryptopanic import (
@@ -476,15 +477,25 @@ async def run_cycle(
     stats = {"tokens_scanned": 0, "candidates_promoted": 0, "alerts_fired": 0}
 
     # Stage 1: Parallel ingestion
-    dex_tokens, gecko_tokens, cg_movers, cg_trending, cg_by_volume = (
-        await asyncio.gather(
-            fetch_trending(session, settings),
-            fetch_trending_pools(session, settings),
-            cg_fetch_top_movers(session, settings),
-            cg_fetch_trending(session, settings),
-            cg_fetch_by_volume(session, settings),
-            return_exceptions=True,
-        )
+    # Held-position refresh lane (§12c-narrow remediation, BL-NEW-HELD-POSITION-REFRESH).
+    # Refreshes price_cache for tokens currently in open paper_trades regardless
+    # of whether they appear in any other ingestion lane. See
+    # tasks/plan_held_position_price_freshness.md.
+    (
+        dex_tokens,
+        gecko_tokens,
+        cg_movers,
+        cg_trending,
+        cg_by_volume,
+        held_position_raw,
+    ) = await asyncio.gather(
+        fetch_trending(session, settings),
+        fetch_trending_pools(session, settings),
+        cg_fetch_top_movers(session, settings),
+        cg_fetch_trending(session, settings),
+        cg_fetch_by_volume(session, settings),
+        fetch_held_position_prices(session, settings, db),
+        return_exceptions=True,
     )
     # Handle exceptions from gather
     if isinstance(dex_tokens, Exception):
@@ -502,6 +513,9 @@ async def run_cycle(
     if isinstance(cg_by_volume, Exception):
         logger.warning("CoinGecko volume scan failed", error=str(cg_by_volume))
         cg_by_volume = []
+    if isinstance(held_position_raw, Exception):
+        logger.warning("held_position_refresh failed", error=str(held_position_raw))
+        held_position_raw = []
 
     # Cache raw CoinGecko prices for dashboard (zero extra API calls)
     all_raw = list(_cg_module.last_raw_markets)
@@ -509,6 +523,8 @@ async def run_cycle(
         all_raw.extend(_cg_module.last_raw_trending)
     if _cg_module.last_raw_by_volume:
         all_raw.extend(_cg_module.last_raw_by_volume)
+    if held_position_raw:
+        all_raw.extend(held_position_raw)
     if all_raw:
         try:
             cached = await db.cache_prices(all_raw)

@@ -576,6 +576,17 @@ ssh root@89.167.116.187 "sqlite3 /root/gecko-alpha/scout.db \"SELECT COUNT(*) FR
 
 **3-vector PR review caught 3 CRITICAL pre-merge** (folded in commit `fff3658` pre-rebase): base58 SPL shape validation (V1-I1 + V2-I2 convergence), CancelledError sentinel-stuck (V2-I1), isinstance(dict) guard for CG schema drift (V1-I1).
 
+### BL-NEW-DEX-PRICE-COVERAGE: DexScreener/GeckoTerminal price_cache coverage gap (follow-up to held-position refresh)
+**Status:** PROPOSED 2026-05-12 — filed as follow-up during Alt A design pass for held-position price refresh.
+**Why:** Structural finding surfaced by 2026-05-12 Phase 1 Explore agent on price_cache write path: **`scout/ingestion/dexscreener.py` and `scout/ingestion/geckoterminal.py` do not write to `price_cache` at all.** Their tokens get cache rows only as a side effect of also appearing in a CoinGecko ingestion lane (markets/trending). Pure-DEX-discovered tokens (no CG listing) get no cache row — same shape as the AALIEN case but for a different reason. Currently latent because the open-trades cohort is 0% contract-addr-shaped (all current held tokens have CoinGecko coin_ids), but this is a known landmine.
+**Scope:**
+- Add a price-source fallback for tokens whose `token_id` is a contract address (starts with `0x`, base58 Solana mint shape, or otherwise non-CG-format)
+- Most natural shape: extend `scout/ingestion/held_position_prices.py` (shipped via BL-NEW-HELD-POSITION-REFRESH) with a per-address DexScreener fallback for held positions that fall outside the CG-id filter
+- Alternative shape: have DexScreener / GeckoTerminal ingestion lanes write to `price_cache` directly when they discover tokens
+**Coverage gap reference:** `tasks/findings_open_position_price_freshness_2026_05_12.md` triage data — 0 of 150 currently-held tokens were contract-addr-shaped, so this fix's deferred status is empirically validated for now. Promote out of deferred state if a future audit shows contract-addr-shaped tokens accumulating in the held cohort.
+**Acceptance:** With the fallback shipped, every open paper_trade has a `price_cache` row that's < N minutes old regardless of whether the underlying token has a CG listing.
+**Estimate:** 2-4 hours including DexScreener client wiring + tests.
+
 ---
 
 ## P2 — BL-064 follow-ups (TG social signals deployed 2026-04-27)
