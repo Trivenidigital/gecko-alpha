@@ -247,3 +247,60 @@ def test_weekly_digest_calls_pass_parse_mode_none():
         assert "parse_mode=None" in tail, (
             f"weekly_digest dispatch at char {idx} missing parse_mode=None"
         )
+
+
+# ---------------------------------------------------------------------
+# Site #6: velocity alert (escape user-data, keep Markdown)
+# ---------------------------------------------------------------------
+
+
+def test_velocity_alert_escapes_user_data_fields():
+    """Site #6: format_velocity_alert preserves *bold* + [chart](url)
+    intent, but symbol/name are passed through _escape_md so underscores
+    do not get consumed as italics markers.
+    """
+    from scout.velocity.detector import format_velocity_alert
+
+    detection = {
+        "symbol": "AS_ROID",
+        "name": "Asteroid_Test",
+        "coin_id": "asteroid_coin",
+        "price_change_1h": 50.0,
+        "price_change_24h": 30.0,
+        "market_cap": 1_000_000.0,
+        "volume_24h": 500_000.0,
+        "vol_mcap_ratio": 0.5,
+        "current_price": 0.0001,
+    }
+    text = format_velocity_alert([detection])
+    assert "AS\\_ROID" in text, "symbol underscore must be escaped"
+    assert "Asteroid\\_Test" in text, "name underscore must be escaped"
+    assert "*AS\\_ROID*" in text, "bold formatting around symbol preserved"
+    assert "[chart](" in text, "chart link preserved"
+
+
+def test_velocity_alert_url_path_not_escaped():
+    """Site #6 (no-escape pin): coin_id sits inside a URL path; escaping
+    it would break the link target. PINS the no-escape decision so a
+    future "helpful" PR that escapes coin_id is caught.
+    """
+    from scout.velocity.detector import format_velocity_alert
+
+    detection = {
+        "symbol": "AST",
+        "name": "Asteroid",
+        "coin_id": "asteroid_coin",
+        "price_change_1h": 50.0,
+        "price_change_24h": 30.0,
+        "market_cap": 1_000_000.0,
+        "volume_24h": 500_000.0,
+        "vol_mcap_ratio": 0.5,
+        "current_price": 0.0001,
+    }
+    text = format_velocity_alert([detection])
+    assert "(https://www.coingecko.com/en/coins/asteroid_coin)" in text, (
+        "coin_id in URL path must NOT be escaped"
+    )
+    assert "asteroid\\_coin" not in text, (
+        "coin_id in URL path must NOT be escaped"
+    )

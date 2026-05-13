@@ -157,7 +157,16 @@ def _fmt_usd(value: float | None) -> str:
 
 
 def format_velocity_alert(detections: list[dict]) -> str:
-    """Render a Markdown Telegram message for the given detections."""
+    """Render a Markdown Telegram message for the given detections.
+
+    Caller may pass raw dict fields; this function applies _escape_md to
+    every user-data field interpolated into Markdown formatters (symbol,
+    name). URL path fields (coin_id) are NOT escaped because Telegram
+    requires literal characters inside [label](url) link targets. See
+    CLAUDE.md §12b for the parse-mode hygiene rule.
+    """
+    from scout.alerter import _escape_md
+
     lines: list[str] = ["*Velocity Alerts* (1h pump)"]
     for det in detections:
         ch_1h = det.get("price_change_1h") or 0.0
@@ -168,8 +177,10 @@ def format_velocity_alert(detections: list[dict]) -> str:
         price = det.get("current_price")
         ch_24h_s = f"{ch_24h:+.1f}%" if ch_24h is not None else "?"
         url = f"https://www.coingecko.com/en/coins/{det['coin_id']}"
+        symbol_safe = _escape_md(det.get("symbol", ""))
+        name_safe = _escape_md(det.get("name", ""))
         lines.append(
-            f"\n*{det['symbol']}* — {det['name']}\n"
+            f"\n*{symbol_safe}* — {name_safe}\n"
             f"1h: *{ch_1h:+.1f}%* | 24h: {ch_24h_s} | price: {_fmt_price(price)}\n"
             f"mcap: {_fmt_usd(mcap)} | vol: {_fmt_usd(vol)} | v/mc: {ratio:.2f}\n"
             f"[chart]({url})"
