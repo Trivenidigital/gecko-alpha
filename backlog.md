@@ -749,6 +749,81 @@ SELECT COUNT(*) FROM narrative_alerts_inbound;
 
 ---
 
+## BL-NEW carry-forwards filed 2026-05-13 from BL-NEW-CYCLE-CHANGE-AUDIT (PR #114)
+
+All 13 entries below were surfaced by the cycle-change audit findings doc and stubbed here per the actionability discipline (PR-review fold). Each carries a `decision-by` field; the audit's next-audit trigger (2026-11-13) measures shipped vs drifted ratio.
+
+### BL-NEW-CG-RATE-LIMITER-BURST-PROFILE
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B1 (Borderline; 1.30× headroom against 30/min CG free tier; ~138 actual 429s/24h).
+**Action:** investigate `cg_429_backoff` burst pattern; consider lowering `COINGECKO_RATE_LIMIT_PER_MIN` from 25 to 20 OR adding inter-call jitter in `_get_with_backoff`.
+**decision-by:** 2 weeks (per design v2 §4 Borderline urgency mapping).
+
+### BL-NEW-GT-429-HANDLER
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B3b (defect; `geckoterminal.py:27-29` has no 429/5xx handler vs DexScreener's `dexscreener.py:32-37`).
+**Action:** add 429/5xx handler matching DexScreener's pattern.
+**decision-by:** 2 weeks.
+
+### BL-NEW-GT-ETH-ENDPOINT-404
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B3-side (~40 GeckoTerminal 404 errors/hr for ethereum chain).
+**Action:** investigate whether the trending-pools URL changed upstream OR the chain identifier is stale; cheap test fetch suffices.
+**decision-by:** 4 weeks.
+
+### BL-NEW-HELIUS-PLAN-AUDIT
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B5 (Broken-if-free / Phantom-if-paid).
+**Action:** confirm prod Helius plan tier; if free: add per-cycle throttle OR move enrichment behind a wall-clock interval (e.g., 30 min per-token cache).
+**decision-by:** 1 week (Broken-if-free severity).
+
+### BL-NEW-MORALIS-PLAN-AUDIT
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B6 (Broken-if-legacy-free; 25× over-cap math: 994k/month vs 40k/month).
+**Action:** confirm prod Moralis plan tier; if legacy-free: throttle OR upgrade.
+**decision-by:** 1 week (Broken-if-free severity).
+
+### BL-NEW-ANTHROPIC-SPEND-TARGET
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B11 (Unfalsifiable-by-policy; current baseline ~$0.06/day).
+**Action:** operator decision — accept proposed skeleton `$5/day soft cap, $20/day alert` OR modify; record decision by adding `ANTHROPIC_DAILY_SPEND_SOFT_CAP_USD` setting to `.env` + `config.py`.
+**decision-by:** 2 weeks.
+
+### BL-NEW-SCORE-HISTORY-WATCHDOG-SLO
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-score (no SLO documented; 17,325 rows/hr).
+**Action:** add `score_history` to §12a watchdog daemon's monitored-tables list with **relative-to-baseline SLO**: alert if row-rate drops below 10% of trailing-1h p50.
+**Dependency:** §12a daemon implementation (unbuilt; see `findings_silent_failure_audit_2026_05_11.md` closing notes).
+**decision-by:** 2 weeks filing; implementation gated on daemon.
+
+### BL-NEW-SCORE-HISTORY-PRUNING
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-score (17,325 rows/hr × 24 = ~415k rows/day = ~12.5M rows/30d; no pruning rule in tree).
+**Action:** add per-token rolling retention (e.g., keep last N=10 scores per `contract_address`) OR time-based pruning (e.g., keep last 30 days).
+**decision-by:** 2 weeks (independently actionable; no daemon dependency).
+
+### BL-NEW-VOLUME-SNAPSHOTS-WATCHDOG-SLO
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-volume (same shape as C2-score).
+**Action:** add `volume_snapshots` to §12a watchdog daemon's monitored-tables list (relative-to-baseline SLO).
+**decision-by:** 2 weeks filing; implementation gated on daemon.
+
+### BL-NEW-VOLUME-SNAPSHOTS-PRUNING
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-volume.
+**Action:** same pruning rule pattern as BL-NEW-SCORE-HISTORY-PRUNING.
+**decision-by:** 2 weeks.
+
+### BL-NEW-CALIBRATION-ERA-DOC
+**Status:** SHIPPED-WITH-AUDIT 2026-05-13 — surfaced by cycle-change audit Tier F; 1-line code comments documenting cycle-era assumption shipped as part of PR #114. Comment text: `# calibration era: undocumented — see BL-NEW-CALIBRATION-ERA-DOC`. 7 settings tagged: VELOCITY_DEDUP_HOURS, LUNARCRUSH_DEDUP_HOURS, SLOW_BURN_DEDUP_DAYS, SECONDWAVE_DEDUP_DAYS, FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN, PAPER_STARTUP_WARMUP_SECONDS, CACHE_TTL_SECONDS.
+
+### BL-NEW-BL060-CYCLE-VERIFY
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit Tier E.
+**Action:** verify BL-060 implementation (paper-mirrors-live) paces independently of 60s cycle, not the 15-min cycle assumed in design doc `bl060-paper-mirrors-live-design.md:197`.
+**decision-by:** 4 weeks.
+
+### BL-NEW-SQLITE-WAL-PROFILE
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit non-external-constraint sub-scan.
+**Action:** measure SQLite WAL bloat at 17k+ writes/hr (combined score_history + volume_snapshots + upsert_candidate); add WAL checkpoint cadence tuning if bloat is observed.
+**decision-by:** 8 weeks.
+
+### BL-NEW-TG-BURST-PROFILE
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit Telegram-burst reclassification (Phantom-fragile; 13+ dispatch sites point at one chat; coincident-burst probability unmeasured).
+**Action:** instrument per-cycle Telegram dispatch volume; measure burst frequency vs 1/sec same-chat and 20/min same-group limits.
+**decision-by:** 4 weeks.
+
+---
+
 ## P2 — BL-064 follow-ups (TG social signals deployed 2026-04-27)
 
 ### BL-065: Dispatch paper trades from cashtag-only resolutions

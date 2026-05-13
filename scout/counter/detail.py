@@ -14,6 +14,7 @@ from scout.ratelimit import coingecko_limiter
 logger = structlog.get_logger()
 
 CG_DETAIL_URL = "https://api.coingecko.com/api/v3/coins/{coin_id}"
+# calibration era: undocumented -- see BL-NEW-CALIBRATION-ERA-DOC
 CACHE_TTL_SECONDS = 1800  # 30 minutes
 
 _detail_cache: dict[str, tuple[datetime, dict]] = {}

@@ -76,18 +76,22 @@ Chain distribution of `candidates` table (last 7 days, 1547 unique tokens):
 
 | ID | Site | Assumption | Current math (60s) | Constraint (source) | Verdict | Severity | Fix-shape | Effort | decision-by |
 |---|---|---|---|---|---|---|---|---|---|
-| B1 | `scout/ingestion/coingecko.py` (movers + trending + by_volume) | absent | Rate-limiter capped at 25/min; backoffs fired **551 times over 24h** = ~23/hr backoffs against 30/min CG free tier; mean ~1380/hr | 30/min CoinGecko free tier (documented at `scout/config.py:63`) | **Watch** | Medium | Investigate burst pattern; consider lowering `COINGECKO_RATE_LIMIT_PER_MIN` from 25 to 20 OR adding inter-call jitter | same-day (config nudge) | next deploy or 90d sunset |
+| B1 | `scout/ingestion/coingecko.py` (movers + trending + by_volume) | absent | Rate-limiter capped at 25/min; **551 `cg_429_backoff` log lines over 24h are an upper bound on 429 events** (per `coingecko.py:39-49` retry loop with MAX_RETRIES=3, each 429 emits 1-4 backoff lines); lower bound ~138 actual 429 events = ~5.7/hr. Mean call rate ~1,380/hr against 1,800/hr cap = **1.30× headroom** | 30/min CoinGecko free tier (documented at `scout/config.py:63`) | **Borderline** (1.30× < 2× per design v2 §2) | Medium | Investigate burst pattern; consider lowering `COINGECKO_RATE_LIMIT_PER_MIN` from 25 to 20 OR adding inter-call jitter | same-day (config nudge) | 2 weeks |
 | B2 | `scout/ingestion/dexscreener.py` | absent | per-cycle 1 call → ~60/hr; **3 errors observed in 24h** | undocumented (DexScreener does not publish rate card) | Phantom-fragile | Low | None now; re-audit if error count rises | none | 6mo or next deploy |
-| B3 | `scout/ingestion/geckoterminal.py` | absent | per-chain call per cycle | undocumented + no 429 handler in `geckoterminal.py:27-29` | **Borderline** + side-finding | Medium | (a) add 429 handler matching DexScreener pattern; (b) investigate ethereum-chain 404 separately (filed as `BL-NEW-GT-ETH-ENDPOINT-404`) | 1-day (handler) + investigation | 2 weeks |
+| B3a | `scout/ingestion/geckoterminal.py` (rate posture) | absent | per-chain call per cycle | undocumented (no public rate card) | **Unfalsifiable** (no documented constraint) | Medium | Operator decision: confirm GeckoTerminal plan tier; if known, document in config.py | 2 weeks | 2 weeks |
+| B3b | `scout/ingestion/geckoterminal.py:27-29` (defect) | N/A | missing 429/5xx handler vs DexScreener's pattern at `dexscreener.py:32-37` | N/A (defect, not headroom) | **Defect** | Medium | Add 429/5xx handler matching DexScreener's pattern | 1 day | 2 weeks |
+| B3-side | GeckoTerminal ethereum endpoint | N/A | ~40/hr 404 responses for ethereum chain (`journalctl` recent 1h) | N/A | **Out-of-scope side-finding** | Medium | Investigate (file `BL-NEW-GT-ETH-ENDPOINT-404`) | 4 weeks | 4 weeks |
 | B4 | `scout/safety.py` GoPlus | absent | only fires on tg_social admission (~8/24h observed); NOT per-cycle per all_candidates | undocumented; per-token | Phantom-fragile | Low | None now | none | 6mo |
-| B5 | `scout/ingestion/holder_enricher.py` Helius (solana) | absent | fan-out: 121 solana/cycle × 60 = **~7,260 calls/hr → ~174k/day** | Helius free tier ~100k credits/day (per Helius docs); each `getTokenAccounts` is 1 credit | **Broken** (if free tier) | High | (a) confirm prod plan tier (free vs paid); if free: add per-cycle throttle OR move enrichment behind a wall-clock interval | 1-week investigation + remediation | 1 week |
-| B6 | `scout/ingestion/holder_enricher.py` Moralis (EVM) | absent | fan-out: ~23 EVM/cycle × 60 = ~1,380 calls/hr → ~33k/day → ~1M/month | Moralis legacy free 40k/month; CU-based tier higher | **Borderline** (legacy free) | Medium | Confirm prod plan; document assumed plan in code | 1-week investigation | 2 weeks |
+| B5 | `scout/ingestion/holder_enricher.py` Helius (solana) | absent | fan-out: 121 solana/cycle × 60 = **~7,260 calls/hr → ~174k/day** | Helius free tier ~100k credits/day (per Helius docs `developer.helius.dev/pricing`, audit-time 2026-05-13; each `getTokenAccounts` is 1 credit). **Constraint stability**: Helius has revised free-tier limits historically; mark Phantom-fragile against constraint stability. | **Broken-if-free / Phantom-if-paid** (conditional; pending plan-tier confirmation) | High | (a) confirm prod plan tier (free vs paid); if free: add per-cycle throttle OR move enrichment behind a wall-clock interval | 1-week investigation + remediation | 1 week |
+| B6 | `scout/ingestion/holder_enricher.py` Moralis (EVM) | absent | fan-out: ~23 EVM/cycle × 60 = ~1,380 calls/hr → ~33k/day → **~994k/month vs 40k legacy-free = 25× over-cap** | Moralis legacy free 40k/month; CU-based tier higher (unbounded with billing) | **Broken** (if on legacy-free) / Phantom (if on CU tier) — pending plan confirmation | High | Confirm prod plan; if legacy-free: throttle enrichment OR upgrade plan | 1-week investigation + remediation | 1 week |
 | B7 | `scout/news/cryptopanic.py` | "300s cycle → 12 req/hr" (BL-053 design doc, inherited from coinpump-scout) | **deactivated**; would be 60 req/hr if reactivated | 50-200 req/hr free-tier band; lower-bound = 50/hr | **Closed-by-§2.2 + composed-finding** | — | Already in BL-053 5-point activation checklist (`decoupled interval` is item 4) | gated by operator | evidence-gated |
 | B8 | `scout/counter/detail.py` (CG detail endpoint, per alert) | absent | ~1 call per alert × ~1 alert/hr = ~1/hr | CoinGecko 30/min | Phantom | — | — | — | — |
 | B9 | `scout/briefing/collector.py` | "asyncio.sleep(60)" (briefing loop self-paced via wall-clock; verified launched-once-at-startup) | wall-clock self-paced | Multi-provider (defi-llama, coinglass, fear&greed, cryptopanic) | Decoupled (Tier D shape) | — | — | — | — |
 | B10 | `scout/mirofish/client.py` | absent | per gated alert (~1/hr) | undocumented (internal service) | Phantom-fragile | Low | — | — | 6mo |
 | B11 | `scout/main.py _safe_counter_followup` (Anthropic) | absent | per alert (~1/hr) | Documented Anthropic tier limits + 429 semantics | **Unfalsifiable** | Medium | Set operator spend target (proposed skeleton below) | 1-week (operator decision) | 2 weeks |
 | B12 | `scout/chains/mcap_fetcher.py` (DexScreener fetch per chain-tracker entry) | absent | Self-paced via `CHAIN_CHECK_INTERVAL_SEC = 300` (Tier D shape) | undocumented | Decoupled (safe) | — | — | — | — |
+| B13 | `scout/ingestion/held_position_prices.py` (CoinGecko `/simple/price` batched per cycle) | absent | 1 call/cycle batched across N held positions → 60 calls/hr | CoinGecko 30/min free tier (shared) | Phantom (batched, single call) | Low | None now | — | — |
+| B14 | `scout/main.py:914-970` `check_outcomes` (DexScreener `/tokens/v1/{chain}/{contract}` per unchecked alert) | absent | Wall-clock gated to hourly (`outcome_check_interval=3600`); within hour, fans across unchecked alerts | DexScreener undocumented | Phantom-fragile (low volume + decoupled by hourly gate) | Low | None now | — | — |
 
 ### Tier B2 — Sub-loop fan-out (in-table above as B5/B6/B11)
 
@@ -110,6 +114,7 @@ Sub-loop fan-out math captured per Tier B entry. Key: **tokens_per_cycle (mean: 
 | C2-holder | `holder_snapshots` | **0** (empty) | Cross-ref `findings_silent_failure_audit_2026_05_11.md §2.5` — writer disconnected from input (holder_count = 0 → snapshot not logged) | — | (deferred to §2.5) |
 | C2-safe-emit | chains/events (`safe_emit`) | per-token + per-alert; rate not directly probed | **Unfalsifiable — no SLO** | `watchdog-row` | Low |
 | C2-cache_prices | `price_cache` bulk upsert | per-cycle batch | Phantom (bulk upsert) | — | — |
+| C2-candidates | `candidates` table (`db.upsert_candidate` at `main.py:780, 830`) | ~289 writes/cycle (post-score) + ~scored writes (gate) → ~17,340/hr same class as score_history | **Unfalsifiable — no SLO** | `watchdog-row` + `pruning-rule` (PRIMARY KEY upsert masks underlying rate; row count growth bounded by unique tokens) | Medium |
 
 ### Tier D — Decoupled-by-design (verification only)
 
@@ -142,6 +147,11 @@ Cross-referenced from plan v3 Tier E grep + plan-review scope coverage:
 | `docs/superpowers/specs/2026-04-10-conviction-chains-design.md:318,364,791` | "tracker runs every 5 minutes", "~100 events/hour" | Chain tracker self-paces (`CHAIN_CHECK_INTERVAL_SEC = 300`); the "~100 events/hour" assumption depends on upstream `run_cycle` event-emission rate which fires 5× as often as coinpump-scout's heritage — **document the assumption** | Decoupled-in-rate; event-volume math may be stale |
 | `docs/superpowers/specs/2026-04-20-bl053-cryptopanic-news-feed-design.md:31` | "300s cycle → 12 req/hr → well under free-tier 50-200/hr band" | At 60s cycle: 60 req/hr against lower-bound 50/hr = 1.2× headroom = Borderline if reactivated | **Cross-ref B7 + silent-failure §2.2** |
 | `docs/superpowers/specs/2026-04-23-bl060-paper-mirrors-live-design.md:197` | "scored_candidates regenerates each 15-min cycle" | gecko-alpha cycle is 60s; the "15-min cycle" assumption is inherited and stale; mooted in practice if BL-060 implementation self-paces | **Verify BL-060 implementation paces independently** — file `BL-NEW-BL060-CYCLE-VERIFY` carry-forward |
+| `docs/superpowers/specs/2026-04-19-trending-tracker-design.md:26,97,103` | "every 30 min" snapshot cadence (inherited from coinpump-scout) | Runs in narrative_agent_loop (Tier D); doc-math statement is stale | Decoupled-in-practice; flag stale doc text |
+| `docs/superpowers/specs/2026-04-18-lunarcrush-integration-design.md:86,91,398` | "Primary poll, every 5 min" + "9 req/min" + "free tier 2000/day credit budget" | Self-paced via `LUNARCRUSH_POLL_INTERVAL=300`; the 2000/day credit math at line 398 not cross-checked against current usage — worth a separate audit | Decoupled-in-rate; credit budget unverified |
+| `docs/superpowers/specs/2026-04-20-bl054-perp-ws-anomaly-detector-design.md:144,193,213` | "evict_idle every 5 min", "log every 60s" | WS-driven perp watcher (Tier D); decoupled in practice | Decoupled (safe) |
+| `docs/superpowers/specs/2026-04-22-bl055-live-trading-execution-core-design.md` | live-trading cycle math (price/exec staleness windows) | live-trading is gated by LIVE_MODE=shadow currently; math unaudited until LIVE_MODE flips | Decoupled-in-practice (live-trading dormant); flag for re-audit at LIVE_MODE flip |
+| `docs/superpowers/specs/2026-04-27-bl064-tg-social-signals-design.md` | TG-social listener cycle assumptions | Self-paced via `TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC=300` (Tier D); decoupled | Decoupled (safe) |
 
 ### Tier F — Calibration-era non-INTERVAL settings
 
@@ -161,15 +171,15 @@ Per design v2: **recommend "document the assumption + flag absence,"** NOT "re-c
 
 Not deeply probed; flagged for follow-up:
 - **SQLite WAL** — gecko-alpha uses `aiosqlite`. WAL mode enabled by default. At 17k writes/hr each on `score_history` + `volume_snapshots` + bulk upserts, WAL bloat is plausible. Not measured. File `BL-NEW-SQLITE-WAL-PROFILE` carry-forward.
-- **Telegram per-chat 1/sec** — alert volume is very low (~1 alert/hr from `alerts` table), well under 1/sec. Phantom.
+- **Telegram per-chat 1/sec** — 13+ distinct dispatch sites point at the same chat (`scout/alerter.py`, `scout/velocity/detector.py`, `scout/secondwave/detector.py`, `scout/narrative/agent.py`, `scout/social/lunarcrush/alerter.py`, `scout/social/telegram/listener.py`, `scout/trading/auto_suspend.py`, `scout/trading/calibrate.py`, `scout/trading/weekly_digest.py`, `scout/trading/suppression.py`, `scout/trading/tg_alert_dispatch.py`, `scout/chains/alerts.py`, plus daily-summary). Aggregate alert volume is ~1/hr from `alerts` table (low) BUT a market-event burst can fire concurrent velocity + secondwave + chain_completion + alert paths in one cycle, exceeding the 1/sec same-chat or 20/min same-group limits. **Reclassification per PR-review: Phantom-fragile** (constraint is stable + documented but coincident-burst probability is unmeasured). File `BL-NEW-TG-BURST-PROFILE` to instrument and measure burst frequency.
 - **File descriptor exhaustion** — not measured. Probably Phantom given alerts/calls volume.
 - **asyncio task queue depth** — not measured. No symptoms in journalctl. Likely Phantom.
 
 ## 2. Per-finding details (non-Phantom only)
 
-### B1 — CoinGecko rate-limiter at edge (Watch)
+### B1 — CoinGecko rate-limiter at edge (Borderline — recomputed per PR-review)
 
-**Evidence:** `journalctl -u gecko-pipeline --since "24 hours ago" | grep -c cg_429_backoff` = **551** over 24h = ~23 backoffs/hr. Recent 1h = 12. The rate limiter at `scout/ratelimit.py:18` is configured for 25 calls/min (`RateLimiter(max_calls=25, period=60.0)`), buffer under documented 30/min free tier. But 23 backoffs/hr means the buffer is being consumed in bursts (likely the parallel `asyncio.gather` of 3 CG fetches at cycle start hits the limit).
+**Evidence:** `journalctl -u gecko-pipeline --since "24 hours ago" | grep -c cg_429_backoff` = **551** over 24h. **Backoff arithmetic correction (PR-review verdict-soundness fold)**: `coingecko.py:39-49` retries up to MAX_RETRIES=3 times, emitting `cg_429_backoff` log line per attempt. So 551 backoff lines is an **upper bound** on 429 events; the **lower bound** is 551/4 = ~138 actual 429s over 24h = ~5.7/hr. Recent 1h showed 12 backoff lines (lower bound 3 actual 429s). The rate limiter at `scout/ratelimit.py:18` is configured for 25 calls/min (`RateLimiter(max_calls=25, period=60.0)`), buffer under documented 30/min free tier. Mean call rate is ~1,380/hr against 1,800/hr cap = **1.30× headroom** — by design v2 §2 (< 2× = Borderline). Initial Watch verdict was wrong per audit's own classification rule.
 
 **Constraint:** CoinGecko Demo tier (30 req/min) — documented at `scout/config.py:63`. Constraint stability: **stable** (CoinGecko publishes changelogs).
 
@@ -177,9 +187,9 @@ Not deeply probed; flagged for follow-up:
 
 **Fix-shape:** investigate the burst pattern (`journalctl | grep cg_429_backoff` over 1h to find clustering); options: (a) lower `COINGECKO_RATE_LIMIT_PER_MIN` from 25 to 20; (b) add inter-call jitter inside `_get_with_backoff`. Same-day shippable as a config nudge.
 
-**decision-by:** next deploy or 90-day Watch sunset.
+**decision-by:** 2 weeks (re-classified Borderline; design v2 §4 maps Borderline -> 2-week filing).
 
-### B3 — GeckoTerminal (Borderline + side-finding)
+### B3 — GeckoTerminal (split: Unfalsifiable rate posture + Defect missing handler + Side-finding ethereum 404)
 
 **Evidence (cycle-audit scope):** `geckoterminal.py:27-29` has no 429 handler — it logs any non-200 and returns. Compared to DexScreener which has full 429/5xx backoff at lines 32-37. The asymmetry is itself a finding.
 
@@ -201,9 +211,9 @@ Not deeply probed; flagged for follow-up:
 
 **decision-by:** 1 week (high severity).
 
-### B6 — Moralis enrichment (Borderline if legacy free)
+### B6 — Moralis enrichment (Broken-if-legacy-free; 25x over-cap math correction per PR-review)
 
-**Evidence:** 23 EVM tokens/cycle × 60 = ~1,380 calls/hr → ~33k/day → ~1M/month. Moralis legacy free is 40k req/month; newer CU-based tier is higher. **33k/day × 30 = ~990k/month — borderline against legacy free**, fine against CU tier.
+**Evidence:** 23 EVM tokens/cycle × 60 = ~1,380 calls/hr → ~33k/day → **~994k/month** (33k * 30). Moralis legacy free is 40k req/month; newer CU-based tier is higher (effectively unbounded). **994k/40k = 25× over-cap on legacy-free tier**. Per audit's own design v2 §2 rule, that's **Broken**, not Borderline. The initial Borderline classification was a math error (read 33k/day vs 40k as if both were per-day units).
 
 **Cross-ref:** same shape as B5. Moralis 0 failures in 24h logs.
 
@@ -223,7 +233,7 @@ Not deeply probed; flagged for follow-up:
 
 ### B11 — Anthropic counter-arg follow-up (Unfalsifiable)
 
-**Evidence:** `_safe_counter_followup` at `main.py:904` calls Anthropic per alert. Current rate ~1 alert/hr → ~1 Anthropic call/hr → ~24/day. No operator-experience target documented for Anthropic spend.
+**Evidence:** `_safe_counter_followup` at `main.py:904` calls Anthropic per alert. Current rate ~1 alert/hr → ~1 Anthropic call/hr → ~24/day. **Computed current baseline**: at haiku-4-5 pricing ~$0.001-0.003 per call × 24/day = **~$0.06/day observed** (rough estimate; actual depends on input/output token counts). Against the proposed $5/day soft cap that's ~83× headroom. So the metric IS measurable today — the Unfalsifiable verdict applies to operator-experience *target*, not to the rate itself. Re-classification: **Phantom-by-current-numbers / Unfalsifiable-by-policy** (no documented target to test against).
 
 **Proposed-target-skeleton:**
 ```
@@ -246,7 +256,7 @@ Suggested target (operator decides):
 **Evidence:** `score_history` writes at 17,325/hr (mean) → 22,018/hr (max). `volume_snapshots` at 17,281/hr → 21,943/hr. **No watchdog SLO exists** for either table (the §12a watchdog daemon is itself unbuilt per silent-failure audit closing notes — "the watchdog itself is a future infrastructure item").
 
 **§12a tagging:** `watchdog-row` + `pruning-rule`. Two distinct concerns:
-1. **Watchdog-row** — when the §12a daemon is built, these two tables MUST be in its monitored-tables list with SLO "≥ 1 row per minute, alert if absent for ≥ 5 min." Without an SLO, a disconnect between writer and table is silent.
+1. **Watchdog-row** — when the §12a daemon is built, these two tables MUST be in its monitored-tables list with **relative-to-baseline SLO**: alert if row-rate drops below 10% of trailing-1h p50 (e.g., for score_history at p50 ~289/min, alert if < 29/min over a 5-min window). The original 'absolute floor 1/min' draft was a heartbeat-not-output-rate check (pairs with `feedback_heartbeat_vs_output_monitoring.md`); 289x headroom would not catch silent degradation where writer produces 10/min when it should produce 289/min.
 2. **Pruning-rule** — 17,325 rows/hr × 24 = ~415k rows/day. Over 30 days = 12.5M rows. Is there a pruning rule? Check `scout/db.py` for `score_history` retention. If absent, table grows unbounded.
 
 **Fix-shape:** file two BL-NEW-* entries: `BL-NEW-SCORE-HISTORY-WATCHDOG-SLO` + `BL-NEW-SCORE-HISTORY-PRUNING` (and analogous for volume_snapshots).
