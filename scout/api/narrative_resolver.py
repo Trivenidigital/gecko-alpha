@@ -25,49 +25,71 @@ async def resolve_ca(db_path: str, *, ca: str, chain: str) -> dict[str, Any] | N
     """Resolve a contract address to canonical CG/DexScreener data.
 
     Reads from existing tables populated by scout/ingestion/* and scout/safety.py.
-    Returns ``None`` if no resolution found across all sources (Hermes side
-    treats as deferred-resolution case).
+    Returns:
+      - ``None`` if the CA is genuinely not found (Hermes treats as deferred)
+      - ``dict`` with resolved fields if found
+      - ``dict`` with ``_resolver_error: True`` if a DB-side error prevented
+        resolution (V2-PR-review C-SFC2 fold — differentiate from genuinely-unknown)
 
-    V1 scope:
-      - solana: looks up candidates / price_cache by contract_address; falls
-        back to DexScreener-side schema if available.
-      - ethereum / base: looks up candidates / price_cache; same fallback.
+    Case-normalization (V2-PR-review A-coverage-gap fold): EVM addresses are
+    checksummed mixed-case by convention; SQLite WHERE is case-sensitive.
+    Lowercase the CA before comparison for ETH/BASE; Solana base58 is
+    case-sensitive natively (no normalization).
 
-    Implementation is intentionally simple — V1 returns first-match-wins from
-    the available tables. V2 may layer a richer multi-source resolution.
+    Defensive open (V2-PR-review A-I3 fold): aiosqlite.connect can raise
+    OperationalError if the DB file is missing at first request — return
+    _resolver_error sentinel rather than 500-ing the request.
     """
-    async with aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True) as db:
-        db.row_factory = aiosqlite.Row
+    # Case-normalize for EVM chains.
+    query_ca = ca.lower() if chain in ("ethereum", "base") else ca
 
-        # 1. Try candidates table — primary CoinGecko-ingestion home.
-        try:
-            cur = await db.execute(
-                """SELECT contract_address, chain, token_name, ticker,
-                          market_cap_usd, liquidity_usd
-                   FROM candidates
-                   WHERE contract_address = ? AND chain = ?
-                   LIMIT 1""",
-                (ca, chain),
-            )
-            row = await cur.fetchone()
-            if row is not None:
-                # price_cache lookup keyed on coin_id; not contract_address.
-                # Skip the price join for V1 — Hermes can call back for it if needed.
-                return {
-                    "coin_id": None,  # candidates doesn't carry coin_id directly
-                    "symbol": row["ticker"],
-                    "name": row["token_name"],
-                    "market_cap_usd": row["market_cap_usd"],
-                    "liquidity_usd": row["liquidity_usd"],
-                    "price_usd": None,
-                    "source": "candidates",
-                }
-        except aiosqlite.OperationalError as e:
-            # Table missing on very old DB snapshot — fall through.
-            _log.warning("narrative_resolver_candidates_oe", err=str(e))
+    try:
+        conn_ctx = aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True)
+    except aiosqlite.OperationalError as e:
+        _log.warning(
+            "narrative_resolver_connect_failed", err=str(e), ca=ca, chain=chain
+        )
+        return {"_resolver_error": True}
 
-        # 2. No additional V1 source. Return None → deferred-resolution.
-        return None
+    try:
+        async with conn_ctx as db:
+            db.row_factory = aiosqlite.Row
+
+            try:
+                cur = await db.execute(
+                    """SELECT contract_address, chain, token_name, ticker,
+                              market_cap_usd, liquidity_usd
+                       FROM candidates
+                       WHERE LOWER(contract_address) = LOWER(?) AND chain = ?
+                       LIMIT 1""",
+                    (query_ca, chain),
+                )
+                row = await cur.fetchone()
+                if row is not None:
+                    return {
+                        "coin_id": None,
+                        "symbol": row["ticker"],
+                        "name": row["token_name"],
+                        "market_cap_usd": row["market_cap_usd"],
+                        "liquidity_usd": row["liquidity_usd"],
+                        "price_usd": None,
+                        "source": "candidates",
+                    }
+            except aiosqlite.OperationalError as e:
+                # Table missing on pre-migration DB snapshot. Signal upstream so
+                # Hermes can distinguish "unknown CA" from "resolver broken".
+                _log.warning(
+                    "narrative_resolver_query_oe",
+                    err=str(e),
+                    ca=ca,
+                    chain=chain,
+                )
+                return {"_resolver_error": True}
+
+            return None
+    except aiosqlite.OperationalError as e:
+        _log.warning("narrative_resolver_ctx_oe", err=str(e))
+        return {"_resolver_error": True}
 
 
 async def insert_narrative_alert(db_path: str, payload: Any) -> dict[str, Any]:
@@ -116,7 +138,12 @@ async def insert_narrative_alert(db_path: str, payload: Any) -> dict[str, Any]:
             )
             return {"status": "created", "id": cur.lastrowid}
         except aiosqlite.IntegrityError as e:
-            if "UNIQUE" in str(e) or "unique" in str(e):
+            # V2-PR-review A-N2 fold: prefer sqlite_errorcode (2067 = SQLITE_CONSTRAINT_UNIQUE)
+            # over substring match. Fall back to substring if errorcode unavailable
+            # (older aiosqlite versions on weird Python builds).
+            errcode = getattr(e, "sqlite_errorcode", None)
+            is_unique = errcode == 2067 or "UNIQUE" in str(e) or "unique" in str(e)
+            if is_unique:
                 _log.info(
                     "narrative_alert_duplicate",
                     event_id=payload.event_id,

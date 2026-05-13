@@ -109,14 +109,25 @@ async def client_no_secret(db):
 # ---------------------------------------------------------------------------
 
 
-def _sign(secret: str, method: str, path: str, ts: str, body: bytes) -> str:
-    canonical = f"{method}\n{path}\n{ts}\n".encode("utf-8") + body
+def _sign(
+    secret: str, method: str, path: str, ts: str, body: bytes, query: str = ""
+) -> str:
+    """Canonical: METHOD\\n PATH\\n QUERY\\n TIMESTAMP\\n BODY.
+
+    PR-V2 reviewer B-C1 fold: query string is included so GET signatures bind
+    their query params. Test helper updated to match.
+    """
+    canonical = f"{method}\n{path}\n{query}\n{ts}\n".encode("utf-8") + body
     return hmac.new(secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
 
 
-def _valid_alert_payload(
-    event_id: str = "abc123def456abc123def456abc123def456",
-) -> dict:
+def _valid_alert_payload(event_id: str | None = None) -> dict:
+    # V2-PR-review A-N4 fold: event_id pinned to 64-char sha256 hex.
+    if event_id is None:
+        event_id = "a" * 64
+    elif len(event_id) != 64:
+        # Pad/truncate to 64 chars (sha256 hex)
+        event_id = (event_id + "0" * 64)[:64]
     return {
         "event_id": event_id,
         "tweet_id": "1834567890",
@@ -360,28 +371,29 @@ async def test_post_rejects_invalid_confidence(client_with_secret):
 
 
 async def test_lookup_unknown_ca_returns_found_false(client_with_secret):
-    """Unknown CA → found=false (deferred-resolution case, Vector A FC-1 fold)."""
+    """Unknown CA → found=false with reason='not_found' (V2-PR-review C-SFC2)."""
     c, _, secret = client_with_secret
     ca = "FoMoLanaJzCFkUEcVTbgScfhUC6axpkvfFV3KGNVpump"
     ts = str(int(time.time()))
-    sig = _sign(secret, "GET", "/api/coin/lookup", ts, b"")
+    query = f"ca={ca}&chain=solana"
+    sig = _sign(secret, "GET", "/api/coin/lookup", ts, b"", query=query)
     resp = await c.get(
-        f"/api/coin/lookup?ca={ca}&chain=solana",
+        f"/api/coin/lookup?{query}",
         headers={"X-Timestamp": ts, "X-Signature": sig},
     )
     assert resp.status_code == 200
     data = resp.json()
     assert data["found"] is False
-    assert data["ca"] == ca
-    assert data["chain"] == "solana"
+    assert data["reason"] == "not_found"
 
 
 async def test_lookup_rejects_bad_chain(client_with_secret):
     c, _, secret = client_with_secret
     ts = str(int(time.time()))
-    sig = _sign(secret, "GET", "/api/coin/lookup", ts, b"")
+    query = "ca=Foo123Bar456&chain=bitcoin"
+    sig = _sign(secret, "GET", "/api/coin/lookup", ts, b"", query=query)
     resp = await c.get(
-        "/api/coin/lookup?ca=Foo123Bar456&chain=bitcoin",  # invalid chain
+        f"/api/coin/lookup?{query}",
         headers={"X-Timestamp": ts, "X-Signature": sig},
     )
     assert resp.status_code == 400
@@ -391,9 +403,10 @@ async def test_lookup_rejects_bad_chain(client_with_secret):
 async def test_lookup_rejects_bad_ca_shape(client_with_secret):
     c, _, secret = client_with_secret
     ts = str(int(time.time()))
-    sig = _sign(secret, "GET", "/api/coin/lookup", ts, b"")
+    query = "ca=tiny&chain=solana"
+    sig = _sign(secret, "GET", "/api/coin/lookup", ts, b"", query=query)
     resp = await c.get(
-        "/api/coin/lookup?ca=tiny&chain=solana",  # < 16 chars
+        f"/api/coin/lookup?{query}",
         headers={"X-Timestamp": ts, "X-Signature": sig},
     )
     assert resp.status_code == 400
@@ -425,18 +438,76 @@ async def test_lookup_finds_known_ca(client_with_secret):
     await db._conn.commit()
 
     ts = str(int(time.time()))
-    sig = _sign(secret, "GET", "/api/coin/lookup", ts, b"")
+    query = f"ca={ca}&chain=ethereum"
+    sig = _sign(secret, "GET", "/api/coin/lookup", ts, b"", query=query)
     resp = await c.get(
-        f"/api/coin/lookup?ca={ca}&chain=ethereum",
+        f"/api/coin/lookup?{query}",
         headers={"X-Timestamp": ts, "X-Signature": sig},
     )
     assert resp.status_code == 200
     data = resp.json()
     assert data["found"] is True
+    assert data["reason"] == "found"
     assert data["symbol"] == "ASTORID"
     assert data["name"] == "AstoridFantasy"
     assert data["market_cap_usd"] == 50_000_000
     assert data["source"] == "candidates"
+
+
+async def test_lookup_hmac_binds_query_string(client_with_secret):
+    """V2-PR-review B-C1 fold: signature MUST bind query string.
+
+    Capture a valid signature for ?ca=X&chain=solana; replay against
+    ?ca=Y&chain=solana with the same (ts, sig) — must reject as
+    signature-mismatch (NOT replay, since the canonical changes when
+    query changes).
+    """
+    c, _, secret = client_with_secret
+    ts = str(int(time.time()))
+    legitimate_query = "ca=legitimateCAabcdef1234567890abcd&chain=solana"
+    sig_legit = _sign(
+        secret, "GET", "/api/coin/lookup", ts, b"", query=legitimate_query
+    )
+    # Replay sig_legit against a different CA — must 403 (sig mismatch).
+    attacker_query = "ca=ATTACKERaaaaaaaaaaaaaaaaaaaaaaaaaa&chain=solana"
+    resp = await c.get(
+        f"/api/coin/lookup?{attacker_query}",
+        headers={"X-Timestamp": ts, "X-Signature": sig_legit},
+    )
+    assert resp.status_code == 403, (
+        f"Expected 403 (sig mismatch) when query rewritten; "
+        f"got {resp.status_code}: {resp.text}. C1 not fixed."
+    )
+
+
+async def test_lookup_evm_case_normalized(client_with_secret):
+    """V2-PR-review A-coverage-gap fold: SQLite WHERE is case-sensitive; EVM
+    addresses are checksum-mixed-case. Lookup must succeed even if Hermes
+    sent lowercase but candidates stored mixed-case (or vice versa)."""
+    c, db, secret = client_with_secret
+    stored_ca = "0xAaBbCcDdEeFf" + "1" * 28  # mixed case
+    from datetime import datetime, timezone
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO candidates (
+            contract_address, chain, token_name, ticker, first_seen_at
+        ) VALUES (?, ?, ?, ?, ?)""",
+        (stored_ca, "ethereum", "MixedCaseToken", "MCT", now_iso),
+    )
+    await db._conn.commit()
+    # Query with lowercase
+    query_ca = stored_ca.lower()
+    ts = str(int(time.time()))
+    query = f"ca={query_ca}&chain=ethereum"
+    sig = _sign(secret, "GET", "/api/coin/lookup", ts, b"", query=query)
+    resp = await c.get(
+        f"/api/coin/lookup?{query}",
+        headers={"X-Timestamp": ts, "X-Signature": sig},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["found"] is True
+    assert resp.json()["symbol"] == "MCT"
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +554,137 @@ async def test_migration_creates_narrative_alerts_inbound(db):
                 ("dup_event_id", "2", "x", "2026-01-01", "t", "h", "v"),
             )
             await conn.commit()
+
+
+async def test_hmac_secret_validator_rejects_short_secret():
+    """V2-PR-review B-S1 fold: Settings rejects HMAC secrets < 32 chars
+    (empty is allowed as gated-off sentinel)."""
+    # Empty is OK (gated-off)
+    Settings(
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        NARRATIVE_SCANNER_HMAC_SECRET="",
+    )
+    # >=32 chars is OK
+    Settings(
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        NARRATIVE_SCANNER_HMAC_SECRET="x" * 64,
+    )
+    # 1-31 chars must reject
+    with pytest.raises(Exception):
+        Settings(
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            NARRATIVE_SCANNER_HMAC_SECRET="too-short",
+        )
+
+
+async def test_post_rejects_oversize_body(client_with_secret):
+    """V2-PR-review B-D5 fold: body-size cap rejects multi-MB payloads
+    BEFORE HMAC compute."""
+    c, _, secret = client_with_secret
+    payload = _valid_alert_payload(event_id="b" * 64)
+    # Inflate tweet_text to >16KB (cap default)
+    payload["tweet_text"] = "x" * 20_000
+    body = json.dumps(payload).encode("utf-8")
+    ts = str(int(time.time()))
+    sig = _sign(secret, "POST", "/api/narrative-alert", ts, body)
+    resp = await c.post(
+        "/api/narrative-alert",
+        content=body,
+        headers={
+            "X-Timestamp": ts,
+            "X-Signature": sig,
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body)),
+        },
+    )
+    assert resp.status_code == 413
+    assert "body exceeds" in resp.json()["detail"].lower()
+
+
+async def test_post_rejects_chain_ca_shape_mismatch(client_with_secret):
+    """V2-PR-review B-S3 fold: model_validator enforces chain×CA pairing.
+
+    Solana CA with chain=ethereum must reject; EVM CA with chain=solana must reject.
+    """
+    c, _, secret = client_with_secret
+    # Solana base58 CA with chain=ethereum
+    payload = _valid_alert_payload(event_id="c" * 64)
+    payload["extracted_ca"] = "FoMoLanaJzCFkUEcVTbgScfhUC6axpkvfFV3KGNVpump"
+    payload["extracted_chain"] = "ethereum"
+    body = json.dumps(payload).encode("utf-8")
+    ts = str(int(time.time()))
+    sig = _sign(secret, "POST", "/api/narrative-alert", ts, body)
+    resp = await c.post(
+        "/api/narrative-alert",
+        content=body,
+        headers={
+            "X-Timestamp": ts,
+            "X-Signature": sig,
+            "Content-Type": "application/json",
+        },
+    )
+    assert resp.status_code == 400
+    assert (
+        "extracted_ca for chain=ethereum" in resp.json()["detail"].lower()
+        or "must match" in resp.json()["detail"].lower()
+    )
+
+
+async def test_post_accepts_cashtag_only_no_ca(client_with_secret):
+    """V2-PR-review B-S3 fold edge case: cashtag-only with no CA + no chain
+    is allowed (deferred-resolution case)."""
+    c, _, secret = client_with_secret
+    payload = _valid_alert_payload(event_id="d" * 64)
+    payload["extracted_ca"] = None
+    payload["extracted_chain"] = None
+    body = json.dumps(payload).encode("utf-8")
+    ts = str(int(time.time()))
+    sig = _sign(secret, "POST", "/api/narrative-alert", ts, body)
+    resp = await c.post(
+        "/api/narrative-alert",
+        content=body,
+        headers={
+            "X-Timestamp": ts,
+            "X-Signature": sig,
+            "Content-Type": "application/json",
+        },
+    )
+    assert resp.status_code == 200
+
+
+async def test_503_detail_does_not_leak_env_var_name(client_no_secret):
+    """V2-PR-review B-D1 fold: 503 detail should NOT mention the env var name."""
+    c, _ = client_no_secret
+    resp = await c.get("/api/coin/lookup?ca=Foo&chain=solana")
+    assert resp.status_code == 503
+    detail = resp.json()["detail"].lower()
+    assert "narrative_scanner_hmac_secret" not in detail
+
+
+async def test_event_id_must_be_64_chars(client_with_secret):
+    """V2-PR-review A-N4 fold: event_id pinned to 64-char sha256 hex."""
+    c, _, secret = client_with_secret
+    payload = _valid_alert_payload()
+    payload["event_id"] = "a" * 32  # too short
+    body = json.dumps(payload).encode("utf-8")
+    ts = str(int(time.time()))
+    sig = _sign(secret, "POST", "/api/narrative-alert", ts, body)
+    resp = await c.post(
+        "/api/narrative-alert",
+        content=body,
+        headers={
+            "X-Timestamp": ts,
+            "X-Signature": sig,
+            "Content-Type": "application/json",
+        },
+    )
+    assert resp.status_code == 400
 
 
 async def test_migration_is_idempotent(db):

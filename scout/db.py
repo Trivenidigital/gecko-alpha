@@ -3356,21 +3356,24 @@ class Database:
 
         try:
             await conn.execute("BEGIN EXCLUSIVE")
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS paper_migrations (
-                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
-            )
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
 
             cur = await conn.execute(
                 "SELECT 1 FROM paper_migrations WHERE name = ?",
                 ("bl_narrative_scanner_v1",),
             )
             if (await cur.fetchone()) is not None:
+                # V2-PR-review C-OG1 fold: emit log on idempotent skip so
+                # journalctl can distinguish "ran before" from "never ran".
+                _log.info(
+                    "narrative_scanner_v1_migration_skip_already_applied",
+                    table="narrative_alerts_inbound",
+                )
                 await conn.commit()
                 return
 
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS narrative_alerts_inbound (
+            await conn.execute("""CREATE TABLE IF NOT EXISTS narrative_alerts_inbound (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_id TEXT NOT NULL UNIQUE,
                     tweet_id TEXT NOT NULL,
@@ -3387,8 +3390,7 @@ class Database:
                     classifier_confidence REAL,
                     classifier_version TEXT NOT NULL,
                     received_at TEXT NOT NULL DEFAULT (datetime('now'))
-                )"""
-            )
+                )""")
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_narrative_inbound_received "
                 "ON narrative_alerts_inbound(received_at)"
@@ -3410,7 +3412,14 @@ class Database:
                 action="created",
                 table="narrative_alerts_inbound",
             )
-        except Exception:
+        except Exception as exc:
+            # V2-PR-review C-OG2 fold: log rollback so journalctl attributes
+            # the failure to this migration even if upstream re-raise is noisy.
+            _log.error(
+                "narrative_scanner_v1_migration_rollback",
+                err=str(exc),
+                err_type=type(exc).__name__,
+            )
             try:
                 await conn.execute("ROLLBACK")
             except Exception:

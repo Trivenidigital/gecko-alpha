@@ -73,10 +73,19 @@ def create_app(db_path: str | None = None) -> FastAPI:
     # Hermes integration. Endpoints are HMAC-gated; respond 503 when
     # NARRATIVE_SCANNER_HMAC_SECRET is empty (feature off by default).
     # See scout/api/narrative.py + tasks/design_crypto_narrative_scanner.md.
-    if _DASHBOARD_SETTINGS is not None:
-        from scout.api.narrative import create_router as _create_narrative_router
+    #
+    # V2-PR-review C-SFC1 fold: when _DASHBOARD_SETTINGS is None (Settings
+    # load failed at import), mount a stub-503 router so the Hermes side
+    # gets the same 503 response shape rather than a 404 (which would be
+    # indistinguishable from "endpoint doesn't exist"). The stub emits a
+    # distinct reason="settings_init_failed" log per request.
+    from scout.api.narrative import create_router as _create_narrative_router
+    from scout.api.narrative import create_stub_router as _create_narrative_stub
 
+    if _DASHBOARD_SETTINGS is not None:
         app.include_router(_create_narrative_router(_db_path, _DASHBOARD_SETTINGS))
+    else:
+        app.include_router(_create_narrative_stub())
 
     # --- REST endpoints ---
 

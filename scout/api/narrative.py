@@ -16,15 +16,22 @@ empty — feature is gated off by default. See
 ``tasks/design_crypto_narrative_scanner.md`` for the full design, including
 the concrete HMAC scheme (§3) and idempotency semantics (§5).
 
-HMAC scheme (per §3):
+HMAC scheme (per §3, V2-PR-review C1 fold):
 
-    canonical = f"{METHOD}\\n{PATH}\\n{X-Timestamp}\\n{BODY}"
+    canonical = f"{METHOD}\\n{PATH}\\n{QUERY}\\n{X-Timestamp}\\n{BODY}"
     signature = HMAC-SHA256(secret, canonical)
 
+NOTE: query-string is included in the canonical (V2 fold for B-C1) — without
+this, a captured GET signature would replay against different ``?ca=`` values.
+
 Server enforces:
-    1. ``|now() - X-Timestamp| <= NARRATIVE_SCANNER_REPLAY_WINDOW_SEC`` (default 300s)
-    2. Constant-time signature compare
-    3. Per-secret replay LRU (300s + buffer = 600s effective)
+    1. Body size <= ``NARRATIVE_SCANNER_MAX_BODY_BYTES`` (cap BEFORE HMAC).
+    2. ``|now() - X-Timestamp| <= NARRATIVE_SCANNER_REPLAY_WINDOW_SEC`` (default 300s).
+    3. Constant-time signature compare.
+    4. Per-secret replay LRU (300s + buffer = 600s effective).
+
+Deployment note (Vector B S2): replay-LRU is in-process. Run uvicorn with
+``--workers 1`` until Day 2 moves the LRU to SQLite-backed shared state.
 """
 
 from __future__ import annotations
@@ -34,12 +41,13 @@ import hmac
 import json
 import time
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Request, Response
+from pydantic import BaseModel, Field, model_validator
 
+from scout.api.narrative_resolver import insert_narrative_alert, resolve_ca
 from scout.config import Settings
 
 _log = structlog.get_logger()
@@ -80,68 +88,121 @@ def _replay_check(timestamp: str, signature: str, ttl_sec: int) -> bool:
 
 
 def _compute_signature(
-    secret: str, method: str, path: str, timestamp: str, body: bytes
+    secret: str,
+    method: str,
+    path: str,
+    query: str,
+    timestamp: str,
+    body: bytes,
 ) -> str:
-    canonical = f"{method}\n{path}\n{timestamp}\n".encode("utf-8") + body
+    """Compute HMAC-SHA256 over the canonical-string.
+
+    V2-PR-review C1 fold: ``query`` (raw query-string, without leading '?') is
+    included in the canonical so GET signatures bind their query params.
+    Without this, a captured signature for ``/api/coin/lookup?ca=X&chain=solana``
+    would replay against ``?ca=ATTACKER_CA&chain=solana``.
+    """
+    canonical = f"{method}\n{path}\n{query}\n{timestamp}\n".encode("utf-8") + body
     return hmac.new(secret.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
 
 
-async def _verify_hmac(request: Request, settings: Settings) -> None:
-    """Verify HMAC headers; raise 401/403 on any failure. Constant-time compare.
+def _reject(status_code: int, reason: str, detail: str) -> HTTPException:
+    """Helper: emit a structured rejection log AND return the HTTPException.
 
-    Feature gate: empty ``NARRATIVE_SCANNER_HMAC_SECRET`` → 503. Endpoints
-    intended for the Hermes side; with no secret, no caller can authenticate
-    and the feature is off.
+    V2-PR-review C-OG4 fold: every rejection path logs a
+    ``narrative_scanner_request_rejected`` event with the reason code so
+    journalctl can distinguish "feature off" from "bad headers" from
+    "replay-cache hit" without correlating with uvicorn access logs.
+    """
+    _log.info("narrative_scanner_request_rejected", reason=reason, status=status_code)
+    return HTTPException(status_code=status_code, detail=detail)
+
+
+async def _verify_hmac(request: Request, settings: Settings) -> bytes:
+    """Verify HMAC headers; raise 401/403/409/413/503 on any failure.
+
+    Returns the request body bytes on success (caller doesn't need to re-read).
+    Feature gate: empty ``NARRATIVE_SCANNER_HMAC_SECRET`` → 503.
     """
     if not settings.NARRATIVE_SCANNER_HMAC_SECRET:
-        raise HTTPException(
-            status_code=503,
-            detail="narrative_scanner: feature disabled (NARRATIVE_SCANNER_HMAC_SECRET empty)",
+        # V2-PR-review B-D1 fold: drop env-var name from detail (info-leak hardening).
+        raise _reject(503, "disabled", "narrative_scanner: feature disabled")
+
+    # Body-size cap BEFORE reading body or computing HMAC.
+    # V2-PR-review B-D5 fold: prevents body-flood DoS by unauthenticated clients.
+    content_length = request.headers.get("content-length", "0")
+    try:
+        cl_int = int(content_length)
+    except ValueError:
+        cl_int = 0
+    max_body = settings.NARRATIVE_SCANNER_MAX_BODY_BYTES
+    if cl_int > max_body:
+        raise _reject(
+            413,
+            "body_too_large",
+            f"body exceeds NARRATIVE_SCANNER_MAX_BODY_BYTES ({max_body})",
         )
 
     timestamp = request.headers.get("X-Timestamp", "")
     signature = request.headers.get("X-Signature", "")
     if not timestamp or not signature:
-        raise HTTPException(
-            status_code=401, detail="missing X-Timestamp or X-Signature"
-        )
+        raise _reject(401, "missing_headers", "missing X-Timestamp or X-Signature")
 
     try:
         ts_int = int(timestamp)
     except ValueError:
-        raise HTTPException(
-            status_code=401, detail="X-Timestamp not an integer (unix seconds)"
-        )
+        raise _reject(401, "bad_timestamp", "X-Timestamp not an integer (unix seconds)")
 
     now = int(time.time())
     window = settings.NARRATIVE_SCANNER_REPLAY_WINDOW_SEC
-    if abs(now - ts_int) > window:
-        raise HTTPException(
-            status_code=401,
-            detail=f"X-Timestamp outside replay window ({window}s)",
+    delta = abs(now - ts_int)
+    if delta > window:
+        # V2-PR-review C-SFC3 fold: log delta_sec so cross-VPS clock-skew
+        # is diagnosable via journalctl grep.
+        _log.warning(
+            "narrative_scanner_timestamp_window_violation",
+            delta_sec=delta,
+            window_sec=window,
+        )
+        raise _reject(
+            401,
+            "out_of_window",
+            f"X-Timestamp outside replay window ({window}s)",
         )
 
     body = await request.body()
+    # Recheck size after read (Content-Length can lie / streaming uploads).
+    if len(body) > max_body:
+        raise _reject(
+            413,
+            "body_too_large",
+            f"body exceeds NARRATIVE_SCANNER_MAX_BODY_BYTES ({max_body})",
+        )
+
     expected = _compute_signature(
         settings.NARRATIVE_SCANNER_HMAC_SECRET,
         request.method,
         request.url.path,
+        request.url.query,  # V2-PR-review B-C1 fold: bind query string
         timestamp,
         body,
     )
     if not hmac.compare_digest(expected, signature):
-        raise HTTPException(status_code=403, detail="HMAC signature mismatch")
+        raise _reject(403, "sig_mismatch", "HMAC signature mismatch")
 
     # Replay window = 2× clock-skew window (per §3). Detects retransmits.
     if _replay_check(timestamp, signature, ttl_sec=window * 2):
-        raise HTTPException(
-            status_code=409, detail="duplicate request (replay-cache hit)"
-        )
+        raise _reject(409, "replay", "duplicate request (replay-cache hit)")
+
+    return body
 
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
+
+
+_ALLOWED_CHAINS = ("solana", "ethereum", "base")
 
 
 class NarrativeAlertIn(BaseModel):
@@ -150,9 +211,16 @@ class NarrativeAlertIn(BaseModel):
     Idempotency key is the Hermes-computed ``event_id`` (sha256 of tweet_id +
     tweet_text_hash + extracted_ca). Gecko-alpha side stores via
     UNIQUE(event_id) — duplicates rejected silently as 200-OK no-op.
+
+    V2-PR-review A-N4 fold: ``event_id`` pinned to 64-char sha256 hex
+    (Hermes-side spec).
+
+    V2-PR-review B-S3 fold: ``(extracted_chain, extracted_ca)`` pair is
+    validated for shape consistency via the model_validator below — Solana
+    must be base58 32-44 chars; ETH/BASE must be ``0x`` + 40 hex.
     """
 
-    event_id: str = Field(..., min_length=16, max_length=128)
+    event_id: str = Field(..., min_length=64, max_length=64)
     tweet_id: str = Field(..., min_length=1, max_length=64)
     tweet_author: str = Field(..., min_length=1, max_length=64)
     tweet_ts: str = Field(..., min_length=1, max_length=64)
@@ -160,12 +228,43 @@ class NarrativeAlertIn(BaseModel):
     tweet_text_hash: str = Field(..., min_length=16, max_length=128)
     extracted_cashtag: str | None = Field(default=None, max_length=32)
     extracted_ca: str | None = Field(default=None, max_length=64)
-    extracted_chain: str | None = Field(default=None, max_length=16)
+    extracted_chain: Literal["solana", "ethereum", "base"] | None = None
     resolved_coin_id: str | None = Field(default=None, max_length=128)
     narrative_theme: str | None = Field(default=None, max_length=64)
     urgency_signal: str | None = Field(default=None, max_length=32)
     classifier_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     classifier_version: str = Field(..., min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _validate_chain_ca_consistency(self) -> "NarrativeAlertIn":
+        """V2-PR-review B-S3: enforce chain×CA shape pairing.
+
+        - solana → base58, 32-44 chars, no '0x' prefix
+        - ethereum, base → ^0x[a-fA-F0-9]{40}$
+        - missing chain → CA must also be None (cashtag-only is allowed)
+        """
+        ca = self.extracted_ca
+        chain = self.extracted_chain
+        if ca is None and chain is None:
+            return self
+        if ca is None:
+            # Chain set but no CA — Hermes side may surface a cashtag-only event.
+            return self
+        if chain is None:
+            raise ValueError("extracted_ca provided but extracted_chain missing")
+        if chain == "solana":
+            if ca.startswith("0x") or not (32 <= len(ca) <= 44):
+                raise ValueError(
+                    "extracted_ca for chain=solana must be base58, 32-44 chars, no 0x prefix"
+                )
+        else:  # ethereum, base
+            import re as _re
+
+            if not _re.fullmatch(r"0x[a-fA-F0-9]{40}", ca):
+                raise ValueError(
+                    f"extracted_ca for chain={chain} must match ^0x[a-fA-F0-9]{{40}}$"
+                )
+        return self
 
 
 class CoinLookupOut(BaseModel):
@@ -174,11 +273,15 @@ class CoinLookupOut(BaseModel):
     Best-effort union of CoinGecko + DexScreener data. ``found=False`` when
     no resolver path returned anything; Hermes side proceeds with
     ``resolved_coin_id=NULL`` in that case (deferred-resolution).
+
+    V2-PR-review C-SFC2 fold: ``reason`` differentiates "CA genuinely unknown"
+    from "resolver-side error" so Hermes can branch.
     """
 
     found: bool
     ca: str
     chain: str
+    reason: Literal["found", "not_found", "resolver_error"] = "found"
     coin_id: str | None = None
     symbol: str | None = None
     name: str | None = None
@@ -214,21 +317,25 @@ def create_router(
     ) -> CoinLookupOut:
         """Resolve a contract address to canonical coin data."""
         await _verify_hmac(request, settings)
-        # Basic shape validation
-        if chain not in ("solana", "ethereum", "base"):
-            raise HTTPException(
-                status_code=400,
-                detail="chain must be one of: solana, ethereum, base",
+        # Basic shape validation (chain whitelist + length)
+        if chain not in _ALLOWED_CHAINS:
+            raise _reject(
+                400,
+                "bad_chain",
+                f"chain must be one of: {', '.join(_ALLOWED_CHAINS)}",
             )
         if not ca or len(ca) < 16 or len(ca) > 64:
-            raise HTTPException(status_code=400, detail="ca shape invalid")
+            raise _reject(400, "bad_ca_shape", "ca shape invalid")
 
-        from scout.api.narrative_resolver import resolve_ca
-
-        data = await resolve_ca(db_path, ca=ca, chain=chain)
-        if data is None:
-            return CoinLookupOut(found=False, ca=ca, chain=chain)
-        return CoinLookupOut(found=True, ca=ca, chain=chain, **data)
+        result = await resolve_ca(db_path, ca=ca, chain=chain)
+        if result is None:
+            return CoinLookupOut(found=False, ca=ca, chain=chain, reason="not_found")
+        if result.get("_resolver_error"):
+            # V2-PR-review C-SFC2 fold: distinguish unknown-CA from resolver-broken.
+            return CoinLookupOut(
+                found=False, ca=ca, chain=chain, reason="resolver_error"
+            )
+        return CoinLookupOut(found=True, ca=ca, chain=chain, reason="found", **result)
 
     @router.post("/narrative-alert", status_code=200)
     async def narrative_alert(
@@ -240,16 +347,52 @@ def create_router(
         Idempotent: duplicate event_id returns 200 with ``{"status": "duplicate"}``;
         new event returns 200 with ``{"status": "created", "id": <row_id>}``.
         """
-        await _verify_hmac(request, settings)
-        body = await request.body()
+        body = await _verify_hmac(request, settings)
         try:
             payload = NarrativeAlertIn.model_validate_json(body)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"invalid payload: {e}")
+            raise _reject(400, "invalid_payload", f"invalid payload: {e}")
 
-        from scout.api.narrative_resolver import insert_narrative_alert
-
-        result = await insert_narrative_alert(db_path, payload)
-        return result
+        try:
+            result = await insert_narrative_alert(db_path, payload)
+            return result
+        except Exception as exc:
+            # V2-PR-review C-OG3 fold: structured failure log tying the 500
+            # back to event_id + tweet_id so journalctl is searchable.
+            _log.error(
+                "narrative_alert_insert_failed",
+                event_id=payload.event_id,
+                tweet_id=payload.tweet_id,
+                err=str(exc),
+                err_type=type(exc).__name__,
+            )
+            raise
 
     return router
+
+
+def create_stub_router() -> APIRouter:
+    """Stub router used when Settings load failed at module import.
+
+    V2-PR-review C-SFC1 fold: returns 503 on both endpoints with
+    ``detail="dashboard_settings_init_failed"`` so the Hermes side gets a
+    503 (same disabled-feature contract) rather than a 404 (which would be
+    indistinguishable from "endpoint doesn't exist"). Each request emits a
+    distinct rejection log for operator forensics.
+    """
+    stub = APIRouter(prefix="/api", tags=["narrative-scanner-stub"])
+
+    async def _stub_503() -> None:
+        raise _reject(
+            503, "settings_init_failed", "narrative_scanner: settings init failed"
+        )
+
+    @stub.get("/coin/lookup")
+    async def stub_lookup(ca: str = "", chain: str = "") -> None:
+        await _stub_503()
+
+    @stub.post("/narrative-alert")
+    async def stub_post() -> None:
+        await _stub_503()
+
+    return stub
