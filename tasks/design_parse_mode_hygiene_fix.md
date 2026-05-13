@@ -72,7 +72,13 @@ Three sites (`:350`, `:434`, `:1521`/`:1537`). All structurally vulnerable. None
 
 ### 3c. Audit-methodology gap (THIS PR's discovery)
 
-The audit grepped `send_telegram_message` only. It missed `send_alert` at `scout/alerter.py:189` — a sibling function that does its own `session.post(...sendMessage...)` with hardcoded `parse_mode=Markdown`. **The audit's grep should have been `(send_telegram_message|sendMessage)`** to catch all Telegram-send paths. Filed as follow-up in the plan's "out-of-scope" section: a re-audit run with the broadened pattern.
+The audit grepped `send_telegram_message` only. It missed `send_alert` at `scout/alerter.py:189` — a sibling function that does its own `session.post(...sendMessage...)` with hardcoded `parse_mode=Markdown`. **The audit's grep should have been `(send_telegram_message|sendMessage)`** to catch all Telegram-send paths. The plan adds a structural Layer 3 AST test that catches the `send_telegram_message`-call case mechanically; the `session.post(.../sendMessage)`-call case is one-known-site (now fixed) and re-audit is filed as a deferred follow-up.
+
+### 3d. Docstring contracts (design-review fold)
+
+Per design-review reviewer D: hidden coupling risk on `format_velocity_alert` and `format_alert_message` — the convention "caller passes raw fields, formatter escapes" is implicit. The next formatter author may forget (the audit just demonstrated callers forget for the lifetime of the codebase). Mitigation: add a one-line docstring contract on each escaping formatter stating the rule and pointing at CLAUDE.md §12b. Zero LOC in callers; ~2 lines per formatter. Discoverability defense.
+
+Reviewer D explicitly evaluated and rejected: new wrapper functions (`send_plain_telegram_message`, `send_safe_telegram_message`), vararg `_escape_fields` helper, template-DSL `format_safe_alert_body`, and type-system aids (`NewType("MarkdownSafeStr", str)`). Codebase already has 7+ raw-primitive sites (e.g., `auto_suspend.py:266,322`, `tg_alert_dispatch.py:311`, `lunarcrush/alerter.py:144`); adding a new pattern would either cause migration scope creep or two-pattern coexistence — both worse for future maintainers than staying with raw primitives.
 
 ## 4. Test architecture
 
@@ -106,14 +112,29 @@ assert "parse_mode=None" in tail
 **Catches:** future refactors that remove the kwarg or restructure the dispatch.
 **Misses:** silent regressions where a new dispatch path is added without the kwarg (the test only inspects the one paragraph around the known formatter call).
 
-### Layer 3 (rejected): structural site-discovery test
+### Layer 3 (PROMOTED from REJECTED — design-review fold): AST-based structural test
 
-Considered: a test that walks `scout/` finding every `send_telegram_message(` call and asserts each has `parse_mode=` set. Rejected because:
-- Pattern-matching dispatch calls in source is fragile — multi-line function calls, kwargs from variables, etc.
-- The structural test would have to be updated every time a new dispatch site is added (negating its safety-net value).
-- Per-site tests already pin the known cases; new sites should be added with per-site tests as part of their own PR (this is what the lessons.md entry codifies).
+Original disposition was REJECTED — rationale was that pattern-matching dispatch calls in source is fragile (multi-line function calls, kwargs from variables, etc.). Design-review reviewer C correctly identified that the rejection rationale was wrong: AST-based walking handles all the cited fragility cases natively. `ast.walk` over `ast.Call` nodes finds every `send_telegram_message` invocation regardless of formatting, multi-line layout, or kwarg-from-variable; then the test asserts `parse_mode` is in `[kw.arg for kw in call.keywords]`.
 
-Better: the audit-methodology fix at 3c above is the right structural defense — a re-audit any time a new dispatch site is added.
+The audit's missed `send_alert` is the empirical case for keeping this test:
+- The original audit grepped `send_telegram_message` source-occurrences and missed `send_alert` because it does its own `session.post(...sendMessage...)` (not a `send_telegram_message` call).
+- An AST test pinned at PR time would catch a new dispatch site added 6 months from now without `parse_mode=`, even before an operator notices the mangled alert.
+
+Implemented as `tests/test_parse_mode_hygiene.py::test_all_dispatch_sites_pin_parse_mode` (Task 1.1). Caveat: it only catches sites that go through `send_telegram_message`. Sites that do their own `session.post(...sendMessage...)` (like the pre-fix `send_alert`) are not caught — for those, the AST walker would need a second arm matching `session.post` with a URL containing `/sendMessage`. Deferred (one known site; mark as a follow-up if a future audit finds more).
+
+### Layer 4 (added — design-review fold): wire-level integration tests
+
+Per design-review reviewer C: source-level pins (Layer 2) miss wire-level regressions. The fix is an `aioresponses`-mocked test per primitive that captures the actual JSON payload posted to Telegram. Two tests:
+- `parse_mode=None` path → asserts `parse_mode` key is ABSENT from payload (per `scout/alerter.py:143-144` conditional include).
+- `parse_mode='Markdown'` + `_escape_md` path → asserts payload `text` contains the escaped form AND `parse_mode == "Markdown"`.
+
+Implemented in Task 8.5.
+
+### URL-path no-escape pins (added — design-review fold)
+
+For sites #6 (velocity) and #7 (alerter), URL path fields (`coin_id`, `contract_address`) sit inside `[label](url)` link targets where Telegram requires literal characters. The original tests asserted escape on data fields but did not pin the no-escape decision on URL fields. A future "helpful" PR that escapes those fields would break every chart link / CoinGecko link silently. Added two pin tests:
+- `test_velocity_alert_url_path_not_escaped` — `coin_id="asteroid_coin"` round-trips literal underscore through URL
+- `test_format_alert_message_url_path_not_escaped` — `contract_address="0xabc_def"` round-trips through both DexScreener and CoinGecko URL paths
 
 ### Why no end-to-end test against real Telegram?
 
