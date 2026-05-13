@@ -201,6 +201,8 @@ async def alert_velocity_detections(
 
     text = format_velocity_alert(detections)
     try:
-        await send_telegram_message(text, session, settings)
+        await send_telegram_message(
+            text, session, settings, parse_mode="Markdown"
+        )
     except Exception:
         log.exception("velocity_alert_send_failed", count=len(detections))

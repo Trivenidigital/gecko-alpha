@@ -66,22 +66,48 @@ def _find_dispatch_calls(tree: ast.AST) -> list[ast.Call]:
     return calls
 
 
+# Allowlist of currently-known sites that DO NOT explicitly pin parse_mode.
+# BL-NEW-PARSE-MODE-AUDIT scope only fixes the 7 HIGH ACTUAL sites. The
+# 8 sites below fall into:
+#  - LOW/MEDIUM (audit classification, body shape unlikely to mangle):
+#      scout/chains/alerts.py:59
+#      scout/trading/suppression.py:186
+#      scout/live/loops.py:251
+#      scout/main.py:166 (combo_refresh failure)
+#      scout/social/lunarcrush/alerter.py:144 (body uses _escape_md)
+#  - HIGH POTENTIAL (deferred per audit, need 7-day production log review):
+#      scout/main.py:351 (briefing chunked summary)
+#      scout/main.py:434 (counter-arg follow-up)
+#      scout/main.py:1537 (daily summary)
+# Follow-up PRs remove entries from this set; a NEW dispatch site that's
+# not in this allowlist will be caught at CI time.
+_ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE: set[tuple[str, int]] = {
+    ("scout/chains/alerts.py", 59),
+    ("scout/trading/suppression.py", 186),
+    ("scout/live/loops.py", 251),
+    ("scout/main.py", 166),
+    ("scout/social/lunarcrush/alerter.py", 144),
+    ("scout/main.py", 351),
+    ("scout/main.py", 434),
+    ("scout/main.py", 1537),
+}
+
+
 def test_all_dispatch_sites_pin_parse_mode():
     """Layer 3: every send_telegram_message call site in scout/ MUST pass
     parse_mode explicitly (None or "Markdown" or "MarkdownV2" or "HTML").
 
     Rationale: the original audit grepped `send_telegram_message` source
     occurrences and missed `send_alert` at scout/alerter.py:189 because
-    that function does its own session.post call. An AST walk over the
-    invocation graph catches every dispatch regardless of formatting,
-    multi-line layout, or kwarg-from-variable. Closes the audit-methodology
-    gap so a NEW dispatch site added 6 months from now without parse_mode=
-    is caught at CI time, not after an operator notices a mangled alert.
+    that function does its own session.post call. An AST walk catches every
+    dispatch regardless of formatting, multi-line layout, or kwarg-from-
+    variable. Closes the audit-methodology gap so a NEW dispatch site added
+    6 months from now without parse_mode= is caught at CI time.
 
-    Exclusion: scout/alerter.py itself defines send_telegram_message, so
-    references inside its own module body (the function definition's
-    default-value reference, internal helpers calling it for testing)
-    are tolerated only if they explicitly pass parse_mode= in the call.
+    Allowlist: this PR scopes only the 7 HIGH ACTUAL sites; deferred sites
+    (LOW/MEDIUM + HIGH POTENTIAL per the audit) live in
+    _ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE. Follow-up PRs remove
+    entries as those sites are fixed.
     """
     offenders: list[str] = []
     for py_path in SCOUT_DIR.rglob("*.py"):
@@ -89,13 +115,18 @@ def test_all_dispatch_sites_pin_parse_mode():
             tree = ast.parse(py_path.read_text(encoding="utf-8"))
         except SyntaxError:
             continue
+        rel_path = str(py_path.relative_to(SCOUT_DIR.parent)).replace("\\", "/")
         for call in _find_dispatch_calls(tree):
             kwarg_names = {kw.arg for kw in call.keywords}
-            if "parse_mode" not in kwarg_names:
-                offenders.append(
-                    f"{py_path.relative_to(SCOUT_DIR.parent)}:{call.lineno} "
-                    f"send_telegram_message() without parse_mode= kwarg"
-                )
+            if "parse_mode" in kwarg_names:
+                continue
+            site = (rel_path, call.lineno)
+            if site in _ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE:
+                continue
+            offenders.append(
+                f"{rel_path}:{call.lineno} send_telegram_message() "
+                f"without parse_mode= kwarg (and not allowlisted)"
+            )
     assert not offenders, (
         "send_telegram_message dispatch sites missing parse_mode kwarg "
         "(see BL-NEW-PARSE-MODE-AUDIT + CLAUDE.md §12b):\n  "
@@ -127,6 +158,8 @@ def test_narrative_heating_alert_formatter_preserves_underscored_symbol():
         acceleration=4.0,
         volume_growth_pct=50.0,
         coin_count_change=0,
+        volume_24h=1_000_000.0,
+        is_heating=True,
     )
     pred = NarrativePrediction(
         symbol="AS_ROID",
@@ -193,10 +226,12 @@ def test_secondwave_alert_call_passes_parse_mode_none():
     import scout.secondwave.detector as detector
 
     source = inspect.getsource(detector)
+    # Look BEFORE+AFTER the format-call anchor since send_telegram_message
+    # is now in a multi-line wrap that puts it BEFORE the format call.
     idx = source.index("format_secondwave_alert(")
-    tail = source[idx : idx + 400]
-    assert "send_telegram_message(" in tail
-    assert "parse_mode=None" in tail
+    window = source[max(0, idx - 200) : idx + 400]
+    assert "send_telegram_message(" in window
+    assert "parse_mode=None" in window
 
 
 # ---------------------------------------------------------------------
@@ -213,10 +248,12 @@ def test_calibrate_apply_alert_call_passes_parse_mode_none():
     import scout.trading.calibrate as calibrate
 
     source = inspect.getsource(calibrate)
+    # Search a window BEFORE+AFTER the body string anchor; the dispatch
+    # wraps the body, so send_telegram_message( appears BEFORE the anchor.
     idx = source.index("calibration applied:")
-    tail = source[idx : idx + 400]
-    assert "send_telegram_message(" in tail
-    assert "parse_mode=None" in tail
+    window = source[max(0, idx - 200) : idx + 400]
+    assert "send_telegram_message(" in window
+    assert "parse_mode=None" in window
 
 
 # ---------------------------------------------------------------------
@@ -229,23 +266,26 @@ def test_weekly_digest_calls_pass_parse_mode_none():
     dispatch at :335 and fallback at :340) use parse_mode=None. Body
     interpolates signal_type, combo_key, symbol; section headers use
     [...] brackets which would mis-render as Markdown link anchors.
+
+    Uses AST to find actual dispatch Call nodes (avoids false matches
+    against docstring text that mentions send_telegram_message).
     """
     import scout.trading.weekly_digest as wd
 
     source = inspect.getsource(wd)
-    occurrences = []
-    cursor = 0
-    while True:
-        idx = source.find("alerter.send_telegram_message", cursor)
-        if idx == -1:
-            break
-        occurrences.append(idx)
-        cursor = idx + 1
-    assert len(occurrences) >= 2, "expected at least 2 dispatch sites"
-    for idx in occurrences:
-        tail = source[idx : idx + 300]
-        assert "parse_mode=None" in tail, (
-            f"weekly_digest dispatch at char {idx} missing parse_mode=None"
+    tree = ast.parse(source)
+    calls = _find_dispatch_calls(tree)
+    assert len(calls) >= 2, f"expected >= 2 dispatch Call nodes, got {len(calls)}"
+    for call in calls:
+        kwargs = {kw.arg for kw in call.keywords}
+        assert "parse_mode" in kwargs, (
+            f"weekly_digest dispatch at line {call.lineno} missing parse_mode= kwarg"
+        )
+        # The kwarg value must be None (a Constant node with value=None)
+        pm = next(kw for kw in call.keywords if kw.arg == "parse_mode")
+        assert isinstance(pm.value, ast.Constant) and pm.value.value is None, (
+            f"weekly_digest dispatch at line {call.lineno} parse_mode value "
+            f"is not None"
         )
 
 
