@@ -197,3 +197,23 @@ def test_secondwave_alert_call_passes_parse_mode_none():
     tail = source[idx : idx + 400]
     assert "send_telegram_message(" in tail
     assert "parse_mode=None" in tail
+
+
+# ---------------------------------------------------------------------
+# Site #4: calibration apply alert
+# ---------------------------------------------------------------------
+
+
+def test_calibrate_apply_alert_call_passes_parse_mode_none():
+    """Site #4: scout/trading/calibrate.py:354 (apply path) dispatches
+    with parse_mode=None. Body interpolates d.signal_type (always has
+    underscores) inside [reason] brackets; same shape as the dry-run
+    path (calibrate.py:459 docstring).
+    """
+    import scout.trading.calibrate as calibrate
+
+    source = inspect.getsource(calibrate)
+    idx = source.index("calibration applied:")
+    tail = source[idx : idx + 400]
+    assert "send_telegram_message(" in tail
+    assert "parse_mode=None" in tail
