@@ -49,7 +49,11 @@ def _find_dispatch_calls(tree: ast.AST) -> list[ast.Call]:
     """Find every ast.Call to `send_telegram_message` in a parsed module.
 
     Matches both `send_telegram_message(...)` (attribute or name) and
-    `alerter.send_telegram_message(...)`.
+    `alerter.send_telegram_message(...)`. Does NOT catch:
+      - `from scout.alerter import send_telegram_message as stm; stm(...)`
+      - `f = send_telegram_message; await f(...)` local-variable aliases
+    Current tree has zero such patterns (verified by grep). If introduced,
+    extend the walker accordingly.
     """
     calls: list[ast.Call] = []
     for node in ast.walk(tree):

@@ -20,7 +20,7 @@ def format_alert_message(token: CandidateToken, signals: list[str]) -> str:
     ticker, chain, virality_class, signal names, mirofish_report). URL path
     fields (contract_address) are NOT escaped because Telegram requires
     literal characters inside [label](url) link targets. Sent with
-    parse_mode='Markdown' (see send_alert at line 189). See CLAUDE.md
+    parse_mode='Markdown' in the send_alert payload. See CLAUDE.md
     §12b for the parse-mode hygiene rule.
     """
     lines: list[str] = []
