@@ -281,6 +281,26 @@ class Settings(BaseSettings):
     # different signals within the window only alerts once.
     TG_ALERT_PER_TOKEN_COOLDOWN_HOURS: int = 6
 
+    # BL-NEW-NARRATIVE-SCANNER: Hermes-driven narrative pump scanner (V1).
+    # Hermes (main-vps) emits structured events to gecko-alpha via HMAC-authed
+    # HTTPS. Feature gated off when secret is empty (endpoints respond 503).
+    # See tasks/design_crypto_narrative_scanner.md for full design.
+    #
+    # PR #110 V2 reviewer S1 fold: secret must be empty (gated-off sentinel)
+    # OR >= 32 chars (32-byte hex from `secrets.token_hex(32)` is 64 chars).
+    # The field_validator below enforces this at Settings() construction.
+    NARRATIVE_SCANNER_HMAC_SECRET: str = ""
+    # Replay-protection window: reject requests where |now - timestamp| exceeds this.
+    NARRATIVE_SCANNER_REPLAY_WINDOW_SEC: int = 300
+    # Max body bytes for POST /api/narrative-alert. Cap BEFORE HMAC compute
+    # so attackers without secret can't flood with multi-MB bodies.
+    # (Vector B D5 fold.) 16KB comfortably fits a max-length tweet + metadata.
+    NARRATIVE_SCANNER_MAX_BODY_BYTES: int = 16 * 1024
+    # NOTE: rate-limit middleware (slowapi) deferred to Day 2 — see
+    # tasks/design_crypto_narrative_scanner.md §8. PR #110 V1-I1 fold:
+    # the unused NARRATIVE_SCANNER_RATE_LIMIT_PER_MIN setting was removed
+    # to avoid the footgun of operators assuming protection exists.
+
     # BL-NEW-M1.5C: Minara DEX-eligibility alert extension (Phase 0 Option A).
     # When a TG paper-trade-open alert is about to fire for a Solana-listed
     # token, append a `minara swap` shell command to the alert body for
@@ -603,6 +623,23 @@ class Settings(BaseSettings):
     def _validate_paper_sl_pct(cls, v: float) -> float:
         if v < 0:
             raise ValueError("sl_pct must be positive, e.g. 10.0 for 10% stop loss")
+        return v
+
+    @field_validator("NARRATIVE_SCANNER_HMAC_SECRET")
+    @classmethod
+    def _validate_narrative_scanner_hmac_secret(cls, v: str) -> str:
+        """PR #110 V2 reviewer S1 fold: HMAC secret must be empty (gated-off
+        sentinel) OR >= 32 chars. Rejects accidentally-too-short secrets that
+        would be brute-forceable. 32 bytes hex = 64 chars (operator should
+        generate via `secrets.token_hex(32)`).
+        """
+        if v and len(v) < 32:
+            raise ValueError(
+                "NARRATIVE_SCANNER_HMAC_SECRET must be empty (feature off) "
+                f"or >= 32 chars (got len={len(v)}). Generate via "
+                '`python3 -c "import secrets; print(secrets.token_hex(32))"` '
+                "for a 64-char hex secret."
+            )
         return v
 
     @field_validator("PAPER_TP_PCT")
