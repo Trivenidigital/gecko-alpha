@@ -304,3 +304,79 @@ def test_velocity_alert_url_path_not_escaped():
     assert "asteroid\\_coin" not in text, (
         "coin_id in URL path must NOT be escaped"
     )
+
+
+# ---------------------------------------------------------------------
+# Site #7: send_alert / format_alert_message (audit-missed)
+# ---------------------------------------------------------------------
+
+
+def test_format_alert_message_escapes_user_data_fields(token_factory):
+    """Site #7: format_alert_message at scout/alerter.py:15 must escape
+    user-data fields (token_name, ticker, chain, virality_class, signal
+    names, mirofish_report) so Telegram's MarkdownV1 parser does not
+    consume underscores.
+    """
+    from scout.alerter import format_alert_message
+
+    token = token_factory(
+        contract_address="0xabc_def",
+        chain="solana_test",
+        token_name="AS_ROID",
+        ticker="AS_RD",
+        market_cap_usd=75000,
+        quant_score=80,
+        narrative_score=75,
+        conviction_score=78,
+        virality_class="High_Test",
+        mirofish_report="Has under_score chars",
+    )
+    signals = ["vol_liq_ratio", "momentum_ratio"]
+    msg = format_alert_message(token, signals)
+
+    assert r"AS\_ROID" in msg, "token_name underscore must be escaped"
+    assert r"AS\_RD" in msg, "ticker underscore must be escaped"
+    assert r"solana\_test" in msg, "chain underscore must be escaped"
+    assert r"High\_Test" in msg, "virality_class underscore must be escaped"
+    assert r"vol\_liq\_ratio" in msg, "signal name underscore must be escaped"
+    assert r"momentum\_ratio" in msg, "signal name underscore must be escaped"
+    assert r"under\_score" in msg, "mirofish_report underscore must be escaped"
+    assert r"*AS\_ROID*" in msg, "bold formatting around token_name preserved"
+
+
+def test_format_alert_message_url_path_not_escaped(token_factory):
+    """Site #7 (no-escape pin): contract_address sits inside a URL path
+    (DexScreener or CoinGecko); escaping it would break the link.
+    """
+    from scout.alerter import format_alert_message
+
+    # DexScreener path
+    token = token_factory(
+        contract_address="0xabc_def",
+        chain="solana",
+        token_name="MoonCoin",
+        ticker="MOON",
+        market_cap_usd=75000,
+        virality_class="High",
+        mirofish_report="x",
+    )
+    msg = format_alert_message(token, ["vol_liq_ratio"])
+    assert "https://dexscreener.com/solana/0xabc_def" in msg, (
+        "contract_address in URL path must NOT be escaped"
+    )
+    assert "0xabc\\_def" not in msg, "contract_address must NOT be escaped"
+
+    # CoinGecko path (chain == 'coingecko')
+    token = token_factory(
+        contract_address="some_id",
+        chain="coingecko",
+        token_name="MoonCoin",
+        ticker="MOON",
+        market_cap_usd=75000,
+        virality_class="High",
+        mirofish_report="x",
+    )
+    msg = format_alert_message(token, ["vol_liq_ratio"])
+    assert "https://www.coingecko.com/en/coins/some_id" in msg, (
+        "contract_address in CoinGecko URL must NOT be escaped"
+    )

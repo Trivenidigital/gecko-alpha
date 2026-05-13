@@ -13,12 +13,24 @@ logger = structlog.get_logger()
 
 
 def format_alert_message(token: CandidateToken, signals: list[str]) -> str:
-    """Format a candidate token into a human-readable alert message."""
+    """Format a candidate token into a human-readable alert message.
+
+    Caller may pass raw model fields; this function applies _escape_md to
+    every user-data field interpolated into Markdown formatters (token_name,
+    ticker, chain, virality_class, signal names, mirofish_report). URL path
+    fields (contract_address) are NOT escaped because Telegram requires
+    literal characters inside [label](url) link targets. Sent with
+    parse_mode='Markdown' (see send_alert at line 189). See CLAUDE.md
+    §12b for the parse-mode hygiene rule.
+    """
     lines: list[str] = []
 
     lines.append("⚠️ WARNING: RESEARCH ONLY - Not financial advice")
     lines.append("")
-    lines.append(f"*{token.token_name}* ({token.ticker}) — {token.chain}")
+    lines.append(
+        f"*{_escape_md(token.token_name)}* "
+        f"({_escape_md(token.ticker)}) — {_escape_md(token.chain)}"
+    )
     lines.append(f"Market Cap: ${token.market_cap_usd:,.0f}")
     lines.append("")
 
@@ -36,17 +48,17 @@ def format_alert_message(token: CandidateToken, signals: list[str]) -> str:
     if token.narrative_score is not None:
         lines.append(f"  Narrative: {narrative_display}")
 
-    # Signals
+    # Signals -- each signal_type contains underscores; escape per-element
     lines.append("")
-    lines.append("Signals: " + ", ".join(signals))
+    lines.append("Signals: " + ", ".join(_escape_md(s) for s in signals))
 
     # Virality
     if token.virality_class is not None:
-        lines.append(f"Virality: {token.virality_class}")
+        lines.append(f"Virality: {_escape_md(token.virality_class)}")
 
-    # Narrative summary
+    # Narrative summary -- LLM-generated; can contain any markdown chars
     if token.mirofish_report is not None:
-        lines.append(f"Narrative: {token.mirofish_report}")
+        lines.append(f"Narrative: {_escape_md(token.mirofish_report)}")
 
     # CoinGecko signal flags
     cg_flags = []

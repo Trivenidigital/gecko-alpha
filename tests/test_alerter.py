@@ -43,7 +43,7 @@ def test_format_alert_message_contains_required_fields(token_factory):
     assert "80" in msg  # quant score
     assert "75" in msg  # narrative score
     assert "High" in msg  # virality class
-    assert "vol_liq_ratio" in msg
+    assert r"vol\_liq\_ratio" in msg
     assert "dexscreener.com" in msg
     assert "0xabc123" in msg
 
