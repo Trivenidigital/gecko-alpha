@@ -86,7 +86,7 @@ where `tokens_per_cycle` is the candidate-pool size after the aggregator + MIN_S
 17. `scout/spikes/detector.py` — has "every cycle for 7 days" comment
 18. `scout/main.py:1463` — peak-price updates ("every cycle" comment)
 
-### Tier C2 — Per-cycle DB write rates (NEW, plan-review fold)
+### Tier C2 — Per-cycle DB write rates (design-review v2 fold)
 
 If a watchdog SLO was calibrated for "expect ≥ 1 row per 5 min" but the writer now fires every 60s, the SLO is silently over-provisioned (still passes, but cannot catch under-write regressions). Inversely, retention/pruning rules may have assumed slower rates.
 
@@ -96,7 +96,12 @@ If a watchdog SLO was calibrated for "expect ≥ 1 row per 5 min" but the writer
 22. `scout/db.py cache_prices` (called from `main.py:530`) — bulk upsert per cycle
 23. `scout/chains/events.py safe_emit` (called from `main.py:405,782,875`) — per-token + per-alert event writes
 
-For each: read the writer + read any `*_RETENTION_*` / pruning code in `db.py`; cross-reference against §12a (freshness SLO + watchdog from CLAUDE.md).
+**§12a tagging discipline** (design-review actionability fold): each Tier-C2 finding must be tagged with one of:
+- `watchdog-row` — extend the (yet-unbuilt) watchdog daemon's monitored-tables list with this row + SLO
+- `pruning-rule` — add a per-table pruning rule because row growth exceeds retention assumption
+- `both` — needs both
+
+Without this tagging, "DB write rate scaled 5×" is a number with no action.
 
 ### Tier D — Decoupled-by-design (verification only)
 
@@ -139,17 +144,19 @@ Known design-doc candidates (from plan-review scope coverage):
 - `docs/superpowers/specs/2026-04-20-bl053-cryptopanic-news-feed-design.md:31` — known canonical case
 - `docs/superpowers/specs/2026-04-23-bl060-paper-mirrors-live-design.md:197` — "scored_candidates regenerates each 15-min cycle" (15-min framing — would be missed by the original grep without the new "15-min cycle" pattern)
 
-### Tier F — Calibration-era non-INTERVAL settings (NEW, plan-review fold)
+### Tier F — Calibration-era non-INTERVAL settings (design-review v2 fold)
 
 Settings that are wall-clock but were calibrated against an assumed cycle frequency:
 
-34. `VELOCITY_DEDUP_HOURS = 4` (`config.py:182`) — at higher cycle rate, more re-evaluations of same token; calibrated against unknown era
-35. `LUNARCRUSH_DEDUP_HOURS = 4` (`config.py:231`) — same shape
-36. `SLOW_BURN_DEDUP_DAYS = 7` (`config.py:167`) — same
-37. `SECONDWAVE_DEDUP_DAYS = 7` (`config.py:212`) — same
-38. `FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN = 60` (`config.py:498`) — at 60s cycle, 60 consecutive missed cycles before alert; verify operator intent
-39. `PAPER_STARTUP_WARMUP_SECONDS = 180` (`config.py:330`) — was this 180s = 0.6 cycles (at 300s) or 3 cycles (at 60s)? Burst-suppression semantics differ
-40. `CACHE_TTL_SECONDS = 1800` in `scout/counter/detail.py:17` — hardcoded module-level constant
+34. `VELOCITY_DEDUP_HOURS = 4` (`config.py:182`)
+35. `LUNARCRUSH_DEDUP_HOURS = 4` (`config.py:231`)
+36. `SLOW_BURN_DEDUP_DAYS = 7` (`config.py:167`)
+37. `SECONDWAVE_DEDUP_DAYS = 7` (`config.py:212`)
+38. `FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN = 60` (`config.py:498`)
+39. `PAPER_STARTUP_WARMUP_SECONDS = 180` (`config.py:330`)
+40. `CACHE_TTL_SECONDS = 1800` in `scout/counter/detail.py:17`
+
+**Tier F output discipline** (design-review actionability fold): for each setting, the audit's recommendation is `document the assumption + flag absence`, NOT `re-calibrate`. Read-only audit recommending behavioral changes silently transitions from finding to proposal. Re-calibration is a separate PR with its own soak. The correct finding output is: "this setting was calibrated against `<unknown / 300s / 60s>` era; the assumption is undocumented; file BL-NEW-* to re-calibrate with a soak window."
 
 ## Audit methodology (v2)
 
@@ -175,17 +182,25 @@ For each Tier-A/B/B2/C/C2/E/F site:
    - Time-gated guards inside the loop (`datetime.now() - last_X > Y`) — effectively self-paced even inside `run_cycle`
    - Recent provider rate-limit increases (check provider changelog if available)
 
-### Pass 2 — Four-bucket classification
+### Pass 2 — Five-bucket classification (v3, fold from design-review)
 
-| Bucket | Definition |
+See design doc §2 + §3 for full rules. Summary:
+
+| Bucket | Definition (numeric) |
 |---|---|
-| **Phantom** | Current math has ≥ 3× headroom vs **documented** constraint; constraint is stable. |
-| **Phantom-fragile** | Current math has ≥ 3× headroom vs constraint, BUT constraint is undocumented / volatile / from a provider with history of unilateral tightening (DexScreener, GeckoTerminal, GoPlus — none publishes a public rate card). |
-| **Watch** | Current math has 1.5×–3× headroom vs constraint. One upstream regime shift or traffic spike tips it. (NEW bucket, plan-review fold) |
-| **Borderline** | Current math has < 1.5× headroom, OR matches/just-fits the constraint. One bad cycle or burst tips over. (BL-053 is this case at 60/200 = 30% of band, well into Borderline.) |
-| **Broken** | Current math exceeds the constraint, OR operator-experience target is violated. |
+| **Phantom** | ≥ 3× headroom vs documented stable constraint |
+| **Phantom-fragile** | ≥ 3× headroom vs undocumented/volatile constraint (source field required) |
+| **Watch** | 2×–3× headroom (sunset rule: close-or-act by D+90) |
+| **Borderline** | < 2× headroom, OR matches/just-fits, OR margin against **lower bound** of a banded constraint |
+| **Broken** | Exceeds constraint, OR violates documented operator-experience target |
+| **Unfalsifiable (meta)** | No documented constraint; cannot classify Phantom/Broken. File BL-NEW-* for operator-target elicitation with proposed-target-skeleton. |
 
-For each non-Phantom row, write a per-finding details section: severity, evidence (the math + the constraint source), and fix-shape (`add throttle`, `widen interval`, `decouple from cycle`, `move setting from cycle-coupled to wall-clock`).
+**Critical rules** (per design v2 §2):
+- **Lower-bound-of-band** is the constraint for banded providers (e.g., CryptoPanic 50-200/hr → constraint = 50/hr).
+- **Burst window**: compute headroom against the constraint's natural window (per-sec / per-min / per-hr / per-day), NOT hourly mean.
+- **p95 over mean** for sub-loop fan-out: if mean is Phantom but p95 is Broken, verdict is **Broken — intermittent**.
+
+For each non-Phantom row, write a per-finding details section: severity, **evidence (math + constraint source)**, fix-shape, **effort-class** (`same-day` / `≤1-week` / `multi-week`), **decision-by** (date or trigger).
 
 ### Operator-experience target sources (plan-review fold)
 
@@ -198,7 +213,7 @@ Sources to check beyond the original `feedback_*.md` grep:
 
 If no operator-experience target documented for a site: **flag the absence as a finding** rather than fabricate a heuristic.
 
-## Output shape
+## Output shape (v3, design-review fold)
 
 `tasks/findings_cycle_change_audit_2026_05_13.md` structure:
 
@@ -207,29 +222,42 @@ If no operator-experience target documented for a site: **flag the absence as a 
 
 # Cycle-Change Audit (BL-NEW-CYCLE-CHANGE-AUDIT) -- 2026-05-13
 
-## Critical reframe (per plan-review)
+## 0. Critical reframe (per plan-review)
+[gecko-alpha was always 60s; audit question is per-design-doc-vs-60s.]
 
-[Restate the framing-error finding: gecko-alpha was always 60s; the audit
-question is per-design-doc-vs-60s, not global-transition.]
+## 0.5 Cross-audit index
+[One-line summary per Tier-X finding-ID — operator scans this for next-action
+without reading every cross-reference target.]
 
-## Per-module verdict table
+## 0.6 Quick wins (≤30-min fixes)
+[Findings flagged as same-day shippable, surfaced first so they ship within
+the week the audit lands rather than getting buried.]
 
-| Module | Assumed cycle | Source of assumption | Current math (60s) | Constraint (source) | Verdict | Severity | Fix shape |
-| --- | --- | --- | --- | --- | --- | --- | --- |
+## 1. Per-module verdict table
+
+| ID | Module | documented_cycle_assumption | Current math (60s) | Constraint (source) | Verdict | Severity | Fix-shape | Effort-class | decision-by |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 ...
 
-## Per-finding details (non-Phantom only)
-...
+(`documented_cycle_assumption: {value | absent}` per design v2 §1 — no intent attribution.)
 
-## Cross-references to silent-failure audit
-...
+## 2. Per-finding details (non-Phantom only)
+[Severity, evidence (math + constraint source), fix-shape, effort-class,
+decision-by trigger.]
 
-## Carry-forward
-[Each non-Phantom finding: file separate BL-NEW-* / bundle into existing item / no follow-up]
+## 3. Cross-references to silent-failure audit
+[Per design §6: findings compose, do not collapse. Per-finding cite.]
 
-## §9b promotion data point
-[Brief note for the §9b structural-attribute-verification promotion candidate.]
+## 4. Carry-forward
+[Each non-Phantom finding's BL-NEW-* filing recommendation with
+decision-by date or trigger.]
+
+## 5. Next-audit trigger
+[Per design §11: SCAN_INTERVAL change / new external API / new *_CYCLES /
+2026-11-13 (6mo).]
 ```
+
+**Note on §9b promotion data point** (design v2 §12): the §9b-promotion observation (framing-error in the audit's own backlog entry) lives in a separate update to `feedback_section_9_promotion_due.md`, NOT in the findings doc body. Findings doc stays single-purpose.
 
 ## File structure
 
@@ -303,11 +331,13 @@ Read `scout/main.py:466-911` (`run_cycle` body + tail). Mark every `for token in
 
 - [ ] **Step 2.2: Probe prod-DB for `tokens_per_cycle`**
 
-SSH to srilu-vps, run:
+SSH to srilu-vps, run **30-day window** (design v2 fold; 7-day window was fragile):
 ```
-sqlite3 /root/gecko-alpha/scout.db "SELECT strftime('%Y-%m-%d %H', created_at) hour, COUNT(*) c FROM candidates WHERE created_at > datetime('now','-7 days') GROUP BY hour ORDER BY hour DESC LIMIT 24"
+sqlite3 /root/gecko-alpha/scout.db "SELECT strftime('%Y-%m-%d %H', created_at) hour, COUNT(*) c FROM candidates WHERE created_at > datetime('now','-30 days') GROUP BY hour ORDER BY c DESC LIMIT 50"
 ```
-Compute avg candidates/hour ÷ 60 cycles/hr = avg tokens/cycle. Note variance.
+Capture **both mean and p95** (or proxy: max-of-720-hours). Note variance regime.
+
+For sub-loop classification: **classify on p95**, qualify with mean. If mean ∈ Phantom but p95 ∈ Broken, verdict is `Broken — intermittent`.
 
 - [ ] **Step 2.3: Cross-check MIN_SCORE filter**
 
@@ -349,9 +379,33 @@ For each of 7 settings in Tier F, document the claim and current behavior. Most 
 
 ---
 
+## Task 4.5: Non-external-constraint sub-scan (design-review v2 fold)
+
+External rate limits are not the only constraint. Sub-scan for:
+
+- [ ] **Step 4.5.1: SQLite WAL throughput / write contention**
+
+Read `scout/db.py` for the sqlite connection setup. Check if WAL mode is enabled. If yes: WAL writes are buffered, but per-cycle DB writes at high rate can cause WAL bloat (the file grows until a checkpoint completes). At 5× write rate, WAL pressure may surface as latency creep or backup file size growth.
+
+- [ ] **Step 4.5.2: Telegram per-chat 1/sec rate limit**
+
+Bot API enforces 1 message/sec to a single chat. If `gecko-pipeline` emits multiple alert types to the same chat in the same cycle (auto-suspend + heating + paper-digest + ...), they may queue/throttle. Compute max alerts-per-second per-chat.
+
+- [ ] **Step 4.5.3: File descriptor exhaustion**
+
+Per-cycle aiohttp.ClientSession + concurrent gather calls can consume file descriptors. Check ulimit on prod VPS (`ssh srilu-vps "ulimit -n"`); compare against max-concurrent-connections at peak.
+
+- [ ] **Step 4.5.4: asyncio task queue depth**
+
+If per-cycle work doesn't complete before the next cycle fires (cycle skew), tasks accumulate. Look for `asyncio.create_task` without `await` boundary inside `run_cycle`.
+
+Classify each non-external constraint per the same 5-bucket axis. Source these from prod measurement, not theory.
+
+---
+
 ## Task 5: Classification pass + per-finding details
 
-- [ ] **Step 5.1: Apply 4-bucket classification (Phantom / Phantom-fragile / Watch / Borderline / Broken)**
+- [ ] **Step 5.1: Apply 5-bucket classification (Phantom / Phantom-fragile / Watch / Borderline / Broken / Unfalsifiable)**
 
 - [ ] **Step 5.2: False-positive screen** — per Pass 1 step 4
 
