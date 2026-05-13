@@ -178,3 +178,22 @@ def test_paper_digest_call_passes_parse_mode_none():
     tail = source[idx : idx + 800]
     assert "send_telegram_message(" in tail
     assert "parse_mode=None" in tail
+
+
+
+# ---------------------------------------------------------------------
+# Site #3: secondwave detector alert
+# ---------------------------------------------------------------------
+
+
+def test_secondwave_alert_call_passes_parse_mode_none():
+    """Site #3: scout/secondwave/detector.py:285 dispatches with parse_mode=None.
+    Body interpolates ticker, token_name, peak_signals join, reacc_signals join.
+    """
+    import scout.secondwave.detector as detector
+
+    source = inspect.getsource(detector)
+    idx = source.index("format_secondwave_alert(")
+    tail = source[idx : idx + 400]
+    assert "send_telegram_message(" in tail
+    assert "parse_mode=None" in tail
