@@ -651,6 +651,42 @@ GROUP BY day ORDER BY day;
 
 **Estimate:** ~2-3 hours for migration + write logic + backfill script + tests + PR review + deploy. Should ship before 2026-05-22 (D+11) to leave 3-day buffer for the D+14 query to have clean data.
 
+### BL-NEW-MINARA-COOLDOWN-REVERIFY: re-verify Minara per-coin cooldown after parallel-session soak merges
+**Status:** PROPOSED 2026-05-13 — filed defensively during D+2 Minara verification. Observation flagged + clarified, but the parallel-session PR is not yet visible from gecko-alpha master, so re-verify is appropriate once it lands.
+
+**Tag:** `defensive-filing` `minara` `m1_5c` `cooldown` `parallel-session-coordination`
+
+**Empirical observation (2026-05-13 verification, srilu-vps):** `goblincoin` (solana) emitted `minara_alert_command_emitted` twice — 2026-05-11T22:26:10Z and 2026-05-12T15:57:45Z, **17h apart**. Per BL-NEW-M1.5C line 599, the documented Minara cooldown is **6h** ("asyncio.CancelledError-safe sentinel demotion (clears 6h cooldown trap on dispatch cancel)"). 17h > 6h, so under the *currently-deployed* design the two emits are legitimate (cooldown expired correctly between firings).
+
+**Why this entry exists (despite the above):** operator reports a newer cooldown PR is in soak on the parallel-session (shift-agent) side — not yet visible in gecko-alpha master commits as of 2026-05-13. If that PR changes the cooldown duration, behavior, or per-coin/per-signal scoping, the goblincoin double-emit may become non-legitimate or the design intent may shift. This entry is a checkpoint to re-verify *after* the parallel PR lands on master, not a claim of any current bug.
+
+**Drift verdict:** NET-NEW filing, but the underlying mechanism is already covered by BL-NEW-M1.5C. This is observability of a soak window, not a new feature.
+**Hermes verdict:** Not Hermes-relevant. Pure project-internal cooldown logic.
+
+**Coordination note (2026-05-13):** the parallel Claude session owns shift-agent + may also own the cooldown work referenced. This entry's check should be deferred until: (a) the parallel session's cooldown PR is merged to gecko-alpha master, OR (b) the parallel session explicitly confirms the cooldown work is shift-agent-scoped and not coming to gecko-alpha.
+
+**Pre-registered re-verification (run when triggered):**
+```bash
+# 1. Confirm cooldown PR landed on master (look for minara_alert.py or tg_alert_dispatch.py touch)
+git log --since="2026-05-13" -- scout/trading/minara_alert.py scout/trading/tg_alert_dispatch.py
+
+# 2. Sample double-emit cases on prod since the new cooldown took effect
+ssh root@89.167.116.187 "journalctl -u gecko-pipeline --since '<post-merge timestamp>' \
+  | grep minara_alert_command_emitted \
+  | python3 -c 'import sys, json, collections; \
+    rows=[json.loads(l.split(\":\",4)[-1].strip()) for l in sys.stdin if l.strip().startswith(\"{\")]; \
+    by_coin=collections.defaultdict(list); \
+    [by_coin[r[\"coin_id\"]].append(r[\"timestamp\"]) for r in rows if r.get(\"event\")==\"minara_alert_command_emitted\"]; \
+    [print(c, ts) for c,ts in by_coin.items() if len(ts)>1]'"
+
+# 3. Assert: all intra-coin intervals respect the new cooldown
+# If new cooldown is e.g. 12h, any pair within 12h is a violation
+```
+
+**Action if violation found:** open a bug PR against the parallel session's cooldown logic with the violating coin + timestamps as evidence. Do NOT silently fix in-place — parallel-session ownership boundary applies.
+
+**Estimate:** ~15 min check + ~30 min triage if violations found. Skip entirely if the parallel cooldown PR turns out to be shift-agent-scoped only.
+
 ### BL-NEW-DEX-PRICE-COVERAGE: DexScreener/GeckoTerminal price_cache coverage gap (follow-up to held-position refresh)
 **Status:** PROPOSED 2026-05-12 — filed as follow-up during Alt A design pass for held-position price refresh.
 **Why:** Structural finding surfaced by 2026-05-12 Phase 1 Explore agent on price_cache write path: **`scout/ingestion/dexscreener.py` and `scout/ingestion/geckoterminal.py` do not write to `price_cache` at all.** Their tokens get cache rows only as a side effect of also appearing in a CoinGecko ingestion lane (markets/trending). Pure-DEX-discovered tokens (no CG listing) get no cache row — same shape as the AALIEN case but for a different reason. Currently latent because the open-trades cohort is 0% contract-addr-shaped (all current held tokens have CoinGecko coin_ids), but this is a known landmine.
