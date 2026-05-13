@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     )
 
     # Scanner
+    # next-audit-trigger: 2026-11-13 OR SCAN_INTERVAL value change OR new external API OR
+    # new *_CYCLES setting OR score_history/volume_snapshots write-rate +/- 2x.
+    # See tasks/findings_cycle_change_audit_2026_05_13.md sec 5.
     SCAN_INTERVAL_SECONDS: int = 60
     HEARTBEAT_INTERVAL_SECONDS: int = 300  # BL-033: periodic heartbeat summary
     MIN_SCORE: int = 60
@@ -164,6 +167,7 @@ class Settings(BaseSettings):
     SLOW_BURN_MAX_1H_CHANGE: float = 5.0
     SLOW_BURN_MAX_MCAP: float = 500_000_000
     SLOW_BURN_MIN_VOLUME: float = 100_000
+    # calibration era: undocumented -- see BL-NEW-CALIBRATION-ERA-DOC
     SLOW_BURN_DEDUP_DAYS: int = 7
 
     # -------- Volume Spike Detector --------
@@ -179,6 +183,7 @@ class Settings(BaseSettings):
     VELOCITY_MIN_MCAP: float = 500_000  # skip dust
     VELOCITY_MAX_MCAP: float = 50_000_000  # skip mega-caps
     VELOCITY_MIN_VOL_MCAP_RATIO: float = 0.2  # vol_24h / mcap -- liquidity sanity
+    # calibration era: undocumented -- see BL-NEW-CALIBRATION-ERA-DOC
     VELOCITY_DEDUP_HOURS: int = 4  # re-alert cooldown per coin
     VELOCITY_TOP_N: int = 10  # max alerts per cycle
 
@@ -209,6 +214,7 @@ class Settings(BaseSettings):
     SECONDWAVE_MIN_RECOVERY_PCT: float = 70.0
     SECONDWAVE_VOL_PICKUP_RATIO: float = 2.0
     SECONDWAVE_ALERT_THRESHOLD: int = 50
+    # calibration era: undocumented -- see BL-NEW-CALIBRATION-ERA-DOC
     SECONDWAVE_DEDUP_DAYS: int = 7
     SECONDWAVE_MIN_VOLUME_POINTS: int = 2
 
@@ -228,6 +234,7 @@ class Settings(BaseSettings):
     LUNARCRUSH_SOCIAL_SPIKE_RATIO: float = 2.0
     LUNARCRUSH_GALAXY_JUMP: float = 10.0
     LUNARCRUSH_INTERACTIONS_ACCEL: float = 3.0
+    # calibration era: undocumented -- see BL-NEW-CALIBRATION-ERA-DOC
     LUNARCRUSH_DEDUP_HOURS: int = 4
     LUNARCRUSH_TOP_N: int = 10
     LUNARCRUSH_BASELINE_MIN_HOURS: int = 24  # warmup wall-clock, interval-aware
@@ -327,6 +334,7 @@ class Settings(BaseSettings):
     # Cooldown after service start: refuse to open new paper trades during
     # this window so a restart doesn't replay every currently-qualifying
     # candidate as a fresh signal. A live trader doesn't bulk-enter on reboot.
+    # calibration era: undocumented -- see BL-NEW-CALIBRATION-ERA-DOC
     PAPER_STARTUP_WARMUP_SECONDS: int = 180
     # Trailing stop (legacy — still used for pre-BL-061 rows; BL-061 ladder
     # uses PAPER_LADDER_TRAIL_PCT on the runner slice).
@@ -495,6 +503,7 @@ class Settings(BaseSettings):
     FEEDBACK_MISSED_WINNER_MIN_PCT: float = 50.0
     FEEDBACK_MISSED_WINNER_MIN_MCAP: float = 5_000_000
     FEEDBACK_MISSED_WINNER_WINDOW_MIN: int = 30
+    # calibration era: undocumented -- see BL-NEW-CALIBRATION-ERA-DOC
     FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN: int = 60
     FEEDBACK_WEEKLY_DIGEST_WEEKDAY: int = 6
     FEEDBACK_WEEKLY_DIGEST_HOUR: int = 9

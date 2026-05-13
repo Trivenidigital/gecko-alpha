@@ -243,7 +243,8 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Estimate:** ~2-3 hours coding + tests, ~1 hour reviewer dispatch + fix cycles, ~30 min PR + reviewers + merge + deploy. Same pipeline shape as BL-NEW-QUOTE-PAIR.
 
 ### BL-NEW-PARSE-MODE-AUDIT: Project-wide `send_telegram_message` parse_mode hygiene
-**Status:** PROPOSED — surfaced 2026-05-11 during §2.9 fix (PR #106). The auto_suspend bug was one instance of a systemic class. Filing now to preserve the inventory while the analysis is fresh; per-site fixes are a separate PR (or a series of small PRs grouped by area).
+**Status:** SHIPPED 2026-05-13 — per-site fixes landed via PR #111 (commit `325369d`). 7 HIGH ACTUAL sites closed (6 from audit + 1 plan-review discovery: `scout/alerter.py:189 send_alert` was missed because audit grepped only `send_telegram_message` calls). AST coverage test (`tests/test_parse_mode_hygiene.py::test_all_dispatch_sites_pin_parse_mode`) with resolver-aware second arm mechanically enforces the audit-methodology lesson going forward. 3 HIGH POTENTIAL sites in `scout/main.py:351,434,1537` deferred per audit policy (need 7-day production log review before promotion). 8 currently-allowlisted sites listed inline in test file with rationale.
+**Surfaced 2026-05-11 during §2.9 fix (PR #106).** The auto_suspend bug was one instance of a systemic class. Per-site fixes shipped as a single PR (#111) covering all 7 HIGH ACTUAL sites with 4-layer test coverage.
 **Tag:** `silent-failure` `tg-alert` `parse_mode` `class-2-residual`
 **Why:** `alerter.send_telegram_message` defaults to `parse_mode="Markdown"`. Telegram MarkdownV1 parses unbalanced `_ * [ ] \`` as formatting markers — when a message body contains a signal name (`gainers_early`, `hard_loss`, `trending_catch`) or token symbol (e.g., `AS_ROID`) with stray markdown chars, Telegram returns HTTP 200 with the body silently mangled (markers consumed, weird italics applied). The §2.9 trending_catch incident on 2026-05-11T01:00:26Z is the worked example: operator received the alert but didn't recognize it as auto-suspend. PR #106 fixes the two auto_suspend sites; the remaining call sites need site-by-site audit.
 **Drift verdict:** NET-NEW. No existing backlog entry tracks this class. PR #106 closes the §2.9 *instance*; this entry tracks the *class*. CLAUDE.md §12b (global) now encodes the rule; existing call sites pre-date the rule and need retroactive verification.
@@ -324,7 +325,8 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 - Roadmap context: this backlog's "Virality Detection Roadmap" §2 ranks CryptoPanic as Source #2
 
 ### BL-NEW-CYCLE-CHANGE-AUDIT: audit design-time assumptions against current `SCAN_INTERVAL_SECONDS`
-**Status:** PROPOSED — surfaced 2026-05-11 during BL-053 §2.2 closure analysis. The default `SCAN_INTERVAL_SECONDS` decreased from **300s to 60s** at some point between BL-053's design (which assumed 300s → 12 req/hr CryptoPanic, "well under any free-tier cap") and the current deployed state (60s → 60 req/hr, **at the low end** of the 50-200/hr CryptoPanic free-tier band). BL-053 is one concrete instance; **other modules with design-time rate-limit / throttle / polling / cache-TTL / backoff-window assumptions may have silently become broken or borderline by the cycle change.**
+**Status:** SHIPPED 2026-05-13 — findings doc at `tasks/findings_cycle_change_audit_2026_05_13.md`. **Audit reframed mid-execution**: plan-review verified via `git log --all -S "SCAN_INTERVAL_SECONDS" -- scout/config.py` that gecko-alpha has had `SCAN_INTERVAL_SECONDS = 60` since the initial scaffold commit `bbf6810` (2026-03-20). The "300s era" cited in this filing was coinpump-scout heritage; gecko-alpha was scaffolded from coinpump-scout and inherited design docs assuming the upstream cycle. Per-module reframing on "does each design-doc cycle-math assumption hold at gecko-alpha's 60s cycle?" Five-bucket classification (Phantom / Phantom-fragile / Watch / Borderline / Broken) + Unfalsifiable meta-bucket. 13 per-finding carry-forward BL-NEW-* entries filed for follow-up (Helius / Moralis / CG burst-profile / GeckoTerminal 429-handler + ethereum 404 / Anthropic spend target / Tier C2 SLOs / Tier F documentation pass / BL-060 cycle-verify / SQLite WAL profile). Next-audit trigger: SCAN_INTERVAL change OR new external API OR new *_CYCLES setting OR write-rate ±2× OR 2026-11-13.
+**Surfaced 2026-05-11 during BL-053 §2.2 closure analysis.** The default `SCAN_INTERVAL_SECONDS` decreased from **300s to 60s** at some point between BL-053's design (which assumed 300s → 12 req/hr CryptoPanic, "well under any free-tier cap") and the current deployed state (60s → 60 req/hr, **at the low end** of the 50-200/hr CryptoPanic free-tier band). BL-053 is one concrete instance; **other modules with design-time rate-limit / throttle / polling / cache-TTL / backoff-window assumptions may have silently become broken or borderline by the cycle change.**
 **Tag:** `audit` `structural-attribute-verification` `silent-degradation` `§9b`
 
 **Why:** This is a structurally different audit class than the silent-failure audit (`findings_silent_failure_audit_2026_05_11.md`). That audit was **table-freshness-based** — does the writer still produce rows? This audit would be **assumption-validity-based** — does the code's design-time math still hold given a known config change? §9b (structural-attribute verification) territory.
@@ -744,6 +746,81 @@ SELECT COUNT(*) FROM narrative_alerts_inbound;
 **Hermes verdict:** ✅ Hermes-first check done 2026-05-13 — none of 687 skill-hub entries cover Telegram/Slack/Discord/email/webhook-out from a Hermes skill. Wiring into gecko-alpha's existing `scout.alerter` is the cheapest correct path.
 
 **Estimate:** ~30-60 min code (new endpoint mirroring narrative.py pattern) + ~30 min tests + review cycle.
+
+---
+
+## BL-NEW carry-forwards filed 2026-05-13 from BL-NEW-CYCLE-CHANGE-AUDIT (PR #114)
+
+All 13 entries below were surfaced by the cycle-change audit findings doc and stubbed here per the actionability discipline (PR-review fold). Each carries a `decision-by` field; the audit's next-audit trigger (2026-11-13) measures shipped vs drifted ratio.
+
+### BL-NEW-CG-RATE-LIMITER-BURST-PROFILE
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B1 (Borderline; 1.30× headroom against 30/min CG free tier; ~138 actual 429s/24h).
+**Action:** investigate `cg_429_backoff` burst pattern; consider lowering `COINGECKO_RATE_LIMIT_PER_MIN` from 25 to 20 OR adding inter-call jitter in `_get_with_backoff`.
+**decision-by:** 2 weeks (per design v2 §4 Borderline urgency mapping).
+
+### BL-NEW-GT-429-HANDLER
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B3b (defect; `geckoterminal.py:27-29` has no 429/5xx handler vs DexScreener's `dexscreener.py:32-37`).
+**Action:** add 429/5xx handler matching DexScreener's pattern.
+**decision-by:** 2 weeks.
+
+### BL-NEW-GT-ETH-ENDPOINT-404
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B3-side (~40 GeckoTerminal 404 errors/hr for ethereum chain).
+**Action:** investigate whether the trending-pools URL changed upstream OR the chain identifier is stale; cheap test fetch suffices.
+**decision-by:** 4 weeks.
+
+### BL-NEW-HELIUS-PLAN-AUDIT
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B5 (Broken-if-free / Phantom-if-paid).
+**Action:** confirm prod Helius plan tier; if free: add per-cycle throttle OR move enrichment behind a wall-clock interval (e.g., 30 min per-token cache).
+**decision-by:** 1 week (Broken-if-free severity).
+
+### BL-NEW-MORALIS-PLAN-AUDIT
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B6 (Broken-if-legacy-free; 25× over-cap math: 994k/month vs 40k/month).
+**Action:** confirm prod Moralis plan tier; if legacy-free: throttle OR upgrade.
+**decision-by:** 1 week (Broken-if-free severity).
+
+### BL-NEW-ANTHROPIC-SPEND-TARGET
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B11 (Unfalsifiable-by-policy; current baseline ~$0.06/day).
+**Action:** operator decision — accept proposed skeleton `$5/day soft cap, $20/day alert` OR modify; record decision by adding `ANTHROPIC_DAILY_SPEND_SOFT_CAP_USD` setting to `.env` + `config.py`.
+**decision-by:** 2 weeks.
+
+### BL-NEW-SCORE-HISTORY-WATCHDOG-SLO
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-score (no SLO documented; 17,325 rows/hr).
+**Action:** add `score_history` to §12a watchdog daemon's monitored-tables list with **relative-to-baseline SLO**: alert if row-rate drops below 10% of trailing-1h p50.
+**Dependency:** §12a daemon implementation (unbuilt; see `findings_silent_failure_audit_2026_05_11.md` closing notes).
+**decision-by:** 2 weeks filing; implementation gated on daemon.
+
+### BL-NEW-SCORE-HISTORY-PRUNING
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-score (17,325 rows/hr × 24 = ~415k rows/day = ~12.5M rows/30d; no pruning rule in tree).
+**Action:** add per-token rolling retention (e.g., keep last N=10 scores per `contract_address`) OR time-based pruning (e.g., keep last 30 days).
+**decision-by:** 2 weeks (independently actionable; no daemon dependency).
+
+### BL-NEW-VOLUME-SNAPSHOTS-WATCHDOG-SLO
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-volume (same shape as C2-score).
+**Action:** add `volume_snapshots` to §12a watchdog daemon's monitored-tables list (relative-to-baseline SLO).
+**decision-by:** 2 weeks filing; implementation gated on daemon.
+
+### BL-NEW-VOLUME-SNAPSHOTS-PRUNING
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-volume.
+**Action:** same pruning rule pattern as BL-NEW-SCORE-HISTORY-PRUNING.
+**decision-by:** 2 weeks.
+
+### BL-NEW-CALIBRATION-ERA-DOC
+**Status:** SHIPPED-WITH-AUDIT 2026-05-13 — surfaced by cycle-change audit Tier F; 1-line code comments documenting cycle-era assumption shipped as part of PR #114. Comment text: `# calibration era: undocumented — see BL-NEW-CALIBRATION-ERA-DOC`. 7 settings tagged: VELOCITY_DEDUP_HOURS, LUNARCRUSH_DEDUP_HOURS, SLOW_BURN_DEDUP_DAYS, SECONDWAVE_DEDUP_DAYS, FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN, PAPER_STARTUP_WARMUP_SECONDS, CACHE_TTL_SECONDS.
+
+### BL-NEW-BL060-CYCLE-VERIFY
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit Tier E.
+**Action:** verify BL-060 implementation (paper-mirrors-live) paces independently of 60s cycle, not the 15-min cycle assumed in design doc `bl060-paper-mirrors-live-design.md:197`.
+**decision-by:** 4 weeks.
+
+### BL-NEW-SQLITE-WAL-PROFILE
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit non-external-constraint sub-scan.
+**Action:** measure SQLite WAL bloat at 17k+ writes/hr (combined score_history + volume_snapshots + upsert_candidate); add WAL checkpoint cadence tuning if bloat is observed.
+**decision-by:** 8 weeks.
+
+### BL-NEW-TG-BURST-PROFILE
+**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit Telegram-burst reclassification (Phantom-fragile; 13+ dispatch sites point at one chat; coincident-burst probability unmeasured).
+**Action:** instrument per-cycle Telegram dispatch volume; measure burst frequency vs 1/sec same-chat and 20/min same-group limits.
+**decision-by:** 4 weeks.
 
 ---
 
