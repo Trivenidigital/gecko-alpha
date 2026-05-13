@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     )
 
     # Scanner
+    # next-audit-trigger: 2026-11-13 OR SCAN_INTERVAL value change OR new external API OR
+    # new *_CYCLES setting OR score_history/volume_snapshots write-rate +/- 2x.
+    # See tasks/findings_cycle_change_audit_2026_05_13.md sec 5.
     SCAN_INTERVAL_SECONDS: int = 60
     HEARTBEAT_INTERVAL_SECONDS: int = 300  # BL-033: periodic heartbeat summary
     MIN_SCORE: int = 60
