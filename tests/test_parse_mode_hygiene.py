@@ -16,7 +16,6 @@ import pathlib
 
 import pytest
 
-
 # ---------------------------------------------------------------------
 # AST structural coverage — Layer 3
 # ---------------------------------------------------------------------
@@ -50,9 +49,7 @@ def _find_dispatch_calls(tree: ast.AST) -> list[ast.Call]:
     return calls
 
 
-def _resolve_string_literal(
-    expr: ast.AST, name_map: dict[str, ast.AST]
-) -> str | None:
+def _resolve_string_literal(expr: ast.AST, name_map: dict[str, ast.AST]) -> str | None:
     """Best-effort resolution of `expr` to its static-string content.
     Follows Name -> assigned-value through `name_map`. Returns None if
     the expression is not statically resolvable.
@@ -76,9 +73,7 @@ def _resolve_string_literal(
         return None
 
 
-def _resolve_dict(
-    expr: ast.AST, name_map: dict[str, ast.AST]
-) -> ast.Dict | None:
+def _resolve_dict(expr: ast.AST, name_map: dict[str, ast.AST]) -> ast.Dict | None:
     """Resolve `expr` to an ast.Dict, following Name through name_map."""
     seen: set[int] = set()
     while True:
@@ -149,9 +144,7 @@ def _find_direct_telegram_post_calls(tree: ast.AST) -> list[ast.Call]:
     return calls
 
 
-def _direct_post_has_parse_mode(
-    call: ast.Call, name_map: dict[str, ast.AST]
-) -> bool:
+def _direct_post_has_parse_mode(call: ast.Call, name_map: dict[str, ast.AST]) -> bool:
     """Return True if a session.post(...) call carries parse_mode either
     as a direct kwarg or inside its `json=`/`data=` dict (resolved through
     name_map). Note: name_map must come from the SAME function scope as
@@ -191,7 +184,7 @@ def _direct_post_has_parse_mode(
 #      scout/main.py:1537 (daily summary)
 #  - direct session.post(.../sendMessage) sites (caught by the resolver-
 #    aware second AST arm — both are intentionally parse_mode-less):
-#      scout/alerter.py:162 — INSIDE send_telegram_message itself; the
+#      scout/alerter.py:163 — INSIDE send_telegram_message itself; the
 #        function takes parse_mode as a parameter and adds it to the
 #        payload conditionally (`if parse_mode is not None: payload[...]
 #        = parse_mode`). The walker can't see the dynamic dict insert,
@@ -214,7 +207,7 @@ _ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE: set[tuple[str, int]] = {
     ("scout/main.py", 351),
     ("scout/main.py", 434),
     ("scout/main.py", 1537),
-    ("scout/alerter.py", 162),
+    ("scout/alerter.py", 163),
     ("scout/social/telegram/listener.py", 123),
 }
 
@@ -262,19 +255,14 @@ def test_all_dispatch_sites_pin_parse_mode():
         # is caught -- this is the pattern the original audit missed at
         # scout/alerter.py:189.
         for func_node in ast.walk(tree):
-            if not isinstance(
-                func_node, (ast.FunctionDef, ast.AsyncFunctionDef)
-            ):
+            if not isinstance(func_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             name_map = _build_name_map(func_node.body)
             for call in ast.walk(func_node):
                 if not isinstance(call, ast.Call):
                     continue
                 cfunc = call.func
-                if (
-                    not isinstance(cfunc, ast.Attribute)
-                    or cfunc.attr != "post"
-                ):
+                if not isinstance(cfunc, ast.Attribute) or cfunc.attr != "post":
                     continue
                 # Resolve URL arg
                 url_expr: ast.AST | None = None
@@ -301,8 +289,7 @@ def test_all_dispatch_sites_pin_parse_mode():
                 )
     assert not offenders, (
         "Telegram dispatch sites missing parse_mode "
-        "(see BL-NEW-PARSE-MODE-AUDIT + CLAUDE.md §12b):\n  "
-        + "\n  ".join(offenders)
+        "(see BL-NEW-PARSE-MODE-AUDIT + CLAUDE.md §12b):\n  " + "\n  ".join(offenders)
     )
 
 
@@ -327,7 +314,6 @@ def test_narrative_agent_alert_call_passes_parse_mode_none():
     assert "parse_mode=None" in tail
 
 
-
 # ---------------------------------------------------------------------
 # Site #2: paper trading daily digest
 # ---------------------------------------------------------------------
@@ -345,7 +331,6 @@ def test_paper_digest_call_passes_parse_mode_none():
     tail = source[idx : idx + 800]
     assert "send_telegram_message(" in tail
     assert "parse_mode=None" in tail
-
 
 
 # ---------------------------------------------------------------------
@@ -412,9 +397,9 @@ def test_weekly_digest_calls_pass_parse_mode_none():
     assert len(calls) >= 2, f"expected >= 2 dispatch Call nodes, got {len(calls)}"
     for call in calls:
         kwargs = {kw.arg for kw in call.keywords}
-        assert "parse_mode" in kwargs, (
-            f"weekly_digest dispatch at line {call.lineno} missing parse_mode= kwarg"
-        )
+        assert (
+            "parse_mode" in kwargs
+        ), f"weekly_digest dispatch at line {call.lineno} missing parse_mode= kwarg"
         # The kwarg value must be None (a Constant node with value=None)
         pm = next(kw for kw in call.keywords if kw.arg == "parse_mode")
         assert isinstance(pm.value, ast.Constant) and pm.value.value is None, (
@@ -472,12 +457,10 @@ def test_velocity_alert_url_path_not_escaped():
         "current_price": 0.0001,
     }
     text = format_velocity_alert([detection])
-    assert "(https://www.coingecko.com/en/coins/asteroid_coin)" in text, (
-        "coin_id in URL path must NOT be escaped"
-    )
-    assert "asteroid\\_coin" not in text, (
-        "coin_id in URL path must NOT be escaped"
-    )
+    assert (
+        "(https://www.coingecko.com/en/coins/asteroid_coin)" in text
+    ), "coin_id in URL path must NOT be escaped"
+    assert "asteroid\\_coin" not in text, "coin_id in URL path must NOT be escaped"
 
 
 # ---------------------------------------------------------------------
@@ -535,9 +518,9 @@ def test_format_alert_message_url_path_not_escaped(token_factory):
         mirofish_report="x",
     )
     msg = format_alert_message(token, ["vol_liq_ratio"])
-    assert "[chart](https://dexscreener.com/solana/0xabc_def)" in msg, (
-        "URL emitted as [chart](url) link with raw contract_address inside parens"
-    )
+    assert (
+        "[chart](https://dexscreener.com/solana/0xabc_def)" in msg
+    ), "URL emitted as [chart](url) link with raw contract_address inside parens"
     assert "0xabc\\_def" not in msg, "contract_address must NOT be escaped"
 
     # CoinGecko path (chain == 'coingecko')
@@ -551,9 +534,9 @@ def test_format_alert_message_url_path_not_escaped(token_factory):
         mirofish_report="x",
     )
     msg = format_alert_message(token, ["vol_liq_ratio"])
-    assert "[chart](https://www.coingecko.com/en/coins/some_id)" in msg, (
-        "CoinGecko URL emitted as [chart](url) link with raw contract_address inside parens"
-    )
+    assert (
+        "[chart](https://www.coingecko.com/en/coins/some_id)" in msg
+    ), "CoinGecko URL emitted as [chart](url) link with raw contract_address inside parens"
 
 
 # ---------------------------------------------------------------------
@@ -598,10 +581,38 @@ async def test_dispatch_with_parse_mode_none_omits_parse_mode_from_payload(
                 parse_mode=None,
             )
 
-    assert "parse_mode" not in captured_payload, (
-        "parse_mode=None caller must NOT set the parse_mode JSON field"
-    )
+    assert (
+        "parse_mode" not in captured_payload
+    ), "parse_mode=None caller must NOT set the parse_mode JSON field"
     assert captured_payload["text"] == "gainers_early alert: AS_ROID up 50%"
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_message_can_raise_on_non_200(settings_factory):
+    import aiohttp
+    from aioresponses import aioresponses
+
+    from scout.alerter import send_telegram_message
+
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-token",
+        TELEGRAM_CHAT_ID="test-chat",
+    )
+    with aioresponses() as m:
+        m.post(
+            "https://api.telegram.org/bottest-token/sendMessage",
+            status=500,
+            body="telegram outage",
+        )
+        async with aiohttp.ClientSession() as session:
+            with pytest.raises(RuntimeError, match="telegram send failed"):
+                await send_telegram_message(
+                    "gainers_early alert",
+                    session,
+                    settings,
+                    parse_mode=None,
+                    raise_on_failure=True,
+                )
 
 
 @pytest.mark.asyncio
@@ -637,12 +648,12 @@ async def test_dispatch_with_parse_mode_markdown_sends_escaped_payload(
             await send_telegram_message(body, session, settings)
 
     assert captured_payload["parse_mode"] == "Markdown"
-    assert "AS\\_ROID" in captured_payload["text"], (
-        "user-data field must be wire-level escaped"
-    )
-    assert "*AS\\_ROID*" in captured_payload["text"], (
-        "intentional Markdown bold must reach the wire"
-    )
+    assert (
+        "AS\\_ROID" in captured_payload["text"]
+    ), "user-data field must be wire-level escaped"
+    assert (
+        "*AS\\_ROID*" in captured_payload["text"]
+    ), "intentional Markdown bold must reach the wire"
 
 
 # ---------------------------------------------------------------------
@@ -652,7 +663,8 @@ async def test_dispatch_with_parse_mode_markdown_sends_escaped_payload(
 
 @pytest.mark.asyncio
 async def test_send_alert_wire_level_escapes_user_data(
-    token_factory, settings_factory,
+    token_factory,
+    settings_factory,
 ):
     """Site #7 end-to-end: send_alert -> format_alert_message ->
     session.post(.../sendMessage). The full path. Body composer escapes
@@ -705,6 +717,6 @@ async def test_send_alert_wire_level_escapes_user_data(
     assert "momentum\\_ratio" in body, "signal name escaped at wire"
     assert "under\\_score" in body, "mirofish_report escaped at wire"
     assert "*AS\\_ROID*" in body, "intentional bold preserved at wire"
-    assert "[chart](https://dexscreener.com/solana_test/0xabc_def)" in body, (
-        "URL emitted as [chart](url) link with raw contract_address"
-    )
+    assert (
+        "[chart](https://dexscreener.com/solana_test/0xabc_def)" in body
+    ), "URL emitted as [chart](url) link with raw contract_address"

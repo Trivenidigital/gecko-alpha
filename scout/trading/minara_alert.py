@@ -1,51 +1,16 @@
-"""BL-NEW-M1.5C: Minara DEX-eligibility alert extension (Phase 0 Option A).
+"""BL-NEW-M1.5C: Minara DEX-eligibility alert extension.
 
 When a TG paper-trade-open alert is about to fire for a Solana-listed
-token, this module returns a formatted `minara swap` shell command that
-the operator copy-pastes into their local terminal where Minara is
-logged in. gecko-alpha does NOT execute the command — pure decision-
-support.
-
-Architecture:
-- `maybe_minara_command(session, settings, coin_id, amount_usd) -> str | None`
-- Reads CoinGecko `/coins/{id}` via existing `scout.counter.detail.fetch_coin_detail`
-  (30-min in-memory cache; soft-fails to None on 404/429/error)
-- Detects Solana eligibility via `platforms.solana` field (non-empty SPL address)
-- Returns formatted command string OR None (never raises Exception)
-
-Failure modes (5-layer isolation):
-  1. MINARA_ALERT_ENABLED=False → immediate None (no fetch)
-  2. session is None → immediate None (R1-I1 design fold; no wasted
-     rate-limiter acquire)
-  3. fetch_coin_detail returns None (CG outage, 404, rate-limit) → None
-  4. platforms non-dict or platforms.solana missing/empty → None
-  5. SPL address fails base58 shape validation → None (PR-V1-I1 + V2-I2:
-     guard against corrupt CG data putting EVM-shaped addresses under
-     the solana key)
-  6. Any unexpected Exception → caught, logged, return None
-  Note: asyncio.CancelledError is NOT caught here; it propagates per
-  asyncio convention. Caller (tg_alert_dispatch.notify_paper_trade_opened)
-  has a try/except that demotes the pre-emptive 'sent' row to
-  'dispatch_failed' so the per-token cooldown clears on cancel.
-
-R2-C1 design fold: trade size is sourced from Settings field
-MINARA_ALERT_AMOUNT_USD (default $10), NOT the caller's amount_usd
-(which would be the $300 paper-trade size on prod). Operator overrides
-via .env for larger sizes; default forces explicit decision.
-
-R1-I2 design fold: size_int is clamped to ≥ 1 to avoid emitting
-`--amount-usd 0` for sub-dollar Settings values.
-
-R1-I3 design fold: amount_usd parameter is typed Optional and is
-unused for size derivation (kept for API compatibility with the
-notify_paper_trade_opened caller signature).
-
-R2-I2 design fold: success-path emits structured-log event
-`minara_alert_command_emitted` so operator can grep journalctl to
-verify detection is working (vs. silent-never-fires regression).
+token, this module prepares a formatted `minara swap` shell command that
+the operator copy-pastes into their local terminal where Minara is logged
+in. gecko-alpha does NOT execute the command. Durable emission logging and
+DB persistence happen after Telegram delivery succeeds, so generated-but-
+undelivered commands do not count as operator-visible Minara emissions.
 """
 
 from __future__ import annotations
+
+import asyncio
 
 import structlog
 
@@ -54,21 +19,117 @@ from scout.counter.detail import fetch_coin_detail
 
 log = structlog.get_logger(__name__)
 
-# PR-V1-I1 + V2-I2 fold: Solana SPL addresses are base58-encoded Ed25519
-# public keys → exactly 32 bytes encoded → 32-44 chars from this alphabet.
-# Reject corrupt CG entries where an EVM hex address ("0xabc...") or
-# arbitrary string ended up under the solana platforms key.
+# Solana SPL addresses are base58-encoded Ed25519 public keys: exactly
+# 32 bytes encoded to 32-44 chars from this alphabet. Reject corrupt CG
+# entries where an EVM-shaped address appears under the solana platform.
 _BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
 
 def _looks_like_spl_address(s: str) -> bool:
-    """True if `s` is plausibly a Solana SPL address (base58, 32-44 chars).
-    Defensive check against corrupt CoinGecko `platforms.solana` values
-    (e.g., EVM-shaped 0x... addresses mistakenly placed under the solana
-    key, observed on aggregators with sloppy normalization)."""
+    """True if `s` is plausibly a Solana SPL address."""
     if not (32 <= len(s) <= 44):
         return False
     return all(c in _BASE58_ALPHABET for c in s)
+
+
+def minara_alert_amount_usd(settings: Settings) -> int:
+    """Settings-sourced Minara size, clamped to a positive integer."""
+    size = getattr(settings, "MINARA_ALERT_AMOUNT_USD", 10.0)
+    try:
+        return max(1, int(round(float(size))))
+    except (TypeError, ValueError):
+        return 10
+
+
+def minara_source_event_id(tg_alert_log_id: int | None) -> str | None:
+    if tg_alert_log_id is None:
+        return None
+    return f"tg_alert_log:{tg_alert_log_id}"
+
+
+def log_minara_alert_command_emitted(
+    *,
+    coin_id: str,
+    chain: str,
+    amount_usd: int,
+    source_event_id: str | None,
+) -> None:
+    """Emit the operator-visible Minara command log after Telegram delivery."""
+    log.info(
+        "minara_alert_command_emitted",
+        coin_id=coin_id,
+        chain=chain,
+        amount_usd=amount_usd,
+        source_event_id=source_event_id,
+    )
+
+
+async def persist_minara_alert_emission(
+    *,
+    db,
+    paper_trade_id: int | None,
+    signal_type: str | None,
+    tg_alert_log_id: int | None,
+    coin_id: str,
+    chain: str,
+    amount_usd: int,
+    command_text: str,
+    persistence_lock_timeout_sec: float = 0.25,
+) -> None:
+    """Best-effort persistence for an already delivered Minara alert."""
+    source_event_id = minara_source_event_id(tg_alert_log_id)
+    if db is None or signal_type is None:
+        log.info(
+            "minara_alert_emission_persist_skipped",
+            reason="missing_db" if db is None else "missing_signal_type",
+            coin_id=coin_id,
+            chain=chain,
+            amount_usd=amount_usd,
+            source_event_id=source_event_id,
+        )
+        return
+
+    try:
+        inserted = await db.record_minara_alert_emission(
+            paper_trade_id=paper_trade_id,
+            tg_alert_log_id=tg_alert_log_id,
+            signal_type=signal_type,
+            coin_id=coin_id,
+            chain=chain,
+            amount_usd=amount_usd,
+            command_text=command_text,
+            source_event_id=source_event_id,
+            lock_timeout_sec=persistence_lock_timeout_sec,
+        )
+        log.info(
+            (
+                "minara_alert_emission_persisted"
+                if inserted
+                else "minara_alert_emission_persist_duplicate_ignored"
+            ),
+            coin_id=coin_id,
+            chain=chain,
+            amount_usd=amount_usd,
+            source_event_id=source_event_id,
+        )
+    except asyncio.TimeoutError:
+        log.warning(
+            "minara_alert_emission_persist_timeout",
+            coin_id=coin_id,
+            chain=chain,
+            amount_usd=amount_usd,
+            source_event_id=source_event_id,
+        )
+    except Exception as exc:
+        log.warning(
+            "minara_alert_emission_persist_failed",
+            coin_id=coin_id,
+            chain=chain,
+            amount_usd=amount_usd,
+            source_event_id=source_event_id,
+            err=str(exc),
+            err_type=type(exc).__name__,
+        )
 
 
 async def maybe_minara_command(
@@ -77,17 +138,17 @@ async def maybe_minara_command(
     coin_id: str,
     amount_usd: float | None,
 ) -> str | None:
-    """Return a Minara swap shell command for the operator if the token
-    is Solana-listed. Returns None for any other case (not listed,
-    fetch failed, feature disabled, session None, format error).
+    """Return a Minara swap command for Solana-listed tokens.
 
-    Never raises.
+    Returns None for non-Solana, disabled, fetch-failed, or malformed cases.
+    Never catches asyncio.CancelledError.
     """
+    del amount_usd  # Paper-trade size is intentionally not used.
     if not getattr(settings, "MINARA_ALERT_ENABLED", True):
         return None
-    # R1-I1 fold: session=None short-circuit before fetch.
     if session is None:
         return None
+
     try:
         detail = await fetch_coin_detail(
             session=session,
@@ -99,18 +160,14 @@ async def maybe_minara_command(
         return None
     if not detail:
         return None
+
     try:
         platforms = detail.get("platforms") or {}
-        # PR-V1-I1 fold: non-dict platforms (CG schema drift) → None, no
-        # spurious format_failed log noise.
         if not isinstance(platforms, dict):
             return None
         spl_address = platforms.get("solana")
         if not spl_address or not isinstance(spl_address, str):
             return None
-        # PR-V1-I1 + V2-I2 fold: shape-validate SPL address. Prevents
-        # operator pasting an EVM-shaped `Run:` line that Minara will
-        # only reject server-side.
         if not _looks_like_spl_address(spl_address):
             log.info(
                 "minara_alert_skipped_invalid_spl_shape",
@@ -118,28 +175,13 @@ async def maybe_minara_command(
                 addr_prefix=spl_address[:8],
             )
             return None
+
         from_token = getattr(settings, "MINARA_ALERT_FROM_TOKEN", "USDC")
-        # R2-C1 fold: Settings-sourced size (default $10), NOT caller's
-        # paper-trade size. Decoupling enforces M1.5a V3-M3 discipline.
-        size = getattr(settings, "MINARA_ALERT_AMOUNT_USD", 10.0)
-        # R1-I2 + R1-I3 fold: clamp to int ≥ 1; handle TypeError/ValueError
-        # if Settings value is mistyped at operator override time.
-        try:
-            size_int = max(1, int(round(float(size))))
-        except (TypeError, ValueError):
-            size_int = 10
-        cmd = (
+        size_int = minara_alert_amount_usd(settings)
+        return (
             f"minara swap --from {from_token} --to {spl_address} "
             f"--amount-usd {size_int}"
         )
-        # R2-I2 fold: success-path log event for operator observability.
-        log.info(
-            "minara_alert_command_emitted",
-            coin_id=coin_id,
-            chain="solana",
-            amount_usd=size_int,
-        )
-        return cmd
     except Exception:
         log.exception("minara_alert_format_failed", coin_id=coin_id)
         return None

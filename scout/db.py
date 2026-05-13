@@ -1,8 +1,10 @@
 """Async SQLite database layer for CoinPump Scout."""
 
 import asyncio
+import hashlib
 import json
 import math
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -103,6 +105,7 @@ class Database:
         await self._migrate_tg_alert_eligible_v1()
         await self._migrate_tg_alert_log_m1_5c_outcome()
         await self._migrate_narrative_scanner_v1()
+        await self._migrate_minara_alert_emissions_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -3425,6 +3428,324 @@ class Database:
             except Exception:
                 pass
             raise
+
+    async def _migrate_minara_alert_emissions_v1(self) -> None:
+        """BL-NEW-MINARA-DB-PERSISTENCE: durable Minara emit telemetry."""
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+        migration_name = "bl_minara_alert_emissions_v1"
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )""")
+
+            await conn.execute("""CREATE TABLE IF NOT EXISTS minara_alert_emissions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_trade_id INTEGER REFERENCES paper_trades(id) ON DELETE RESTRICT,
+                    tg_alert_log_id INTEGER,
+                    signal_type TEXT NOT NULL,
+                    coin_id TEXT NOT NULL,
+                    chain TEXT NOT NULL,
+                    amount_usd REAL NOT NULL,
+                    command_text TEXT,
+                    command_hash TEXT,
+                    command_text_observed INTEGER NOT NULL DEFAULT 0
+                        CHECK (command_text_observed IN (0,1)),
+                    source TEXT NOT NULL
+                        CHECK (source IN ('live','journalctl_backfill')),
+                    source_event_id TEXT NOT NULL UNIQUE,
+                    emitted_at TEXT NOT NULL,
+                    operator_paste_acknowledged_at TEXT
+                )""")
+            await self._assert_minara_alert_emissions_schema(
+                conn, require_indexes=False
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_minara_alert_emissions_emitted_at "
+                "ON minara_alert_emissions(emitted_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_minara_alert_emissions_coin_id "
+                "ON minara_alert_emissions(coin_id, emitted_at)"
+            )
+            await conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_minara_alert_emissions_tg_alert_log_id "
+                "ON minara_alert_emissions(tg_alert_log_id) "
+                "WHERE tg_alert_log_id IS NOT NULL"
+            )
+
+            await self._assert_minara_alert_emissions_schema(conn)
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260519, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "minara_alert_emissions_v1_migration_complete",
+                table="minara_alert_emissions",
+            )
+        except BaseException as e:
+            _log.exception(
+                "schema_migration_failed",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            _log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)
+            raise
+
+    async def _assert_minara_alert_emissions_schema(
+        self, conn, *, require_indexes: bool = True
+    ) -> None:
+        required_columns = {
+            "id",
+            "paper_trade_id",
+            "tg_alert_log_id",
+            "signal_type",
+            "coin_id",
+            "chain",
+            "amount_usd",
+            "command_text",
+            "command_hash",
+            "command_text_observed",
+            "source",
+            "source_event_id",
+            "emitted_at",
+            "operator_paste_acknowledged_at",
+        }
+        cur = await conn.execute("PRAGMA table_info(minara_alert_emissions)")
+        col_rows = await cur.fetchall()
+        cols = {row[1] for row in col_rows}
+        missing = sorted(required_columns - cols)
+        if missing:
+            raise RuntimeError(
+                "bl_minara_alert_emissions_v1 schema missing columns: "
+                + ", ".join(missing)
+            )
+        by_name = {row[1]: row for row in col_rows}
+        expected = {
+            "id": ("INTEGER", False, None, 1),
+            "paper_trade_id": ("INTEGER", False, None, 0),
+            "tg_alert_log_id": ("INTEGER", False, None, 0),
+            "signal_type": ("TEXT", True, None, 0),
+            "coin_id": ("TEXT", True, None, 0),
+            "chain": ("TEXT", True, None, 0),
+            "amount_usd": ("REAL", True, None, 0),
+            "command_text": ("TEXT", False, None, 0),
+            "command_hash": ("TEXT", False, None, 0),
+            "command_text_observed": ("INTEGER", True, "0", 0),
+            "source": ("TEXT", True, None, 0),
+            "source_event_id": ("TEXT", True, None, 0),
+            "emitted_at": ("TEXT", True, None, 0),
+            "operator_paste_acknowledged_at": ("TEXT", False, None, 0),
+        }
+        for name, (typ, notnull, default, pk) in expected.items():
+            row = by_name[name]
+            if (row[2] or "").upper() != typ:
+                raise RuntimeError(
+                    f"bl_minara_alert_emissions_v1 column {name} type mismatch"
+                )
+            if bool(row[3]) != notnull:
+                raise RuntimeError(
+                    f"bl_minara_alert_emissions_v1 column {name} NOT NULL mismatch"
+                )
+            actual_default = row[4]
+            if default is None:
+                if actual_default is not None:
+                    raise RuntimeError(
+                        f"bl_minara_alert_emissions_v1 column {name} default mismatch"
+                    )
+            elif str(actual_default).strip("'\"") != default:
+                raise RuntimeError(
+                    f"bl_minara_alert_emissions_v1 column {name} default mismatch"
+                )
+            if int(row[5]) != pk:
+                raise RuntimeError(
+                    f"bl_minara_alert_emissions_v1 column {name} pk mismatch"
+                )
+
+        cur = await conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='minara_alert_emissions'"
+        )
+        create_sql_row = await cur.fetchone()
+        create_sql = (create_sql_row[0] if create_sql_row else "").upper()
+        if "CHECK (COMMAND_TEXT_OBSERVED IN (0,1))" not in create_sql:
+            raise RuntimeError(
+                "bl_minara_alert_emissions_v1 command_text_observed CHECK missing"
+            )
+        if "CHECK (SOURCE IN ('LIVE','JOURNALCTL_BACKFILL'))" not in create_sql:
+            raise RuntimeError("bl_minara_alert_emissions_v1 source CHECK missing")
+        if "ON DELETE RESTRICT" not in create_sql:
+            raise RuntimeError(
+                "bl_minara_alert_emissions_v1 paper_trade_id FK action missing"
+            )
+
+        cur = await conn.execute("PRAGMA foreign_key_list(minara_alert_emissions)")
+        fks = await cur.fetchall()
+        has_paper_trade_fk = any(
+            row[2] == "paper_trades"
+            and row[3] == "paper_trade_id"
+            and row[4] == "id"
+            and row[6].upper() == "RESTRICT"
+            for row in fks
+        )
+        if not has_paper_trade_fk:
+            raise RuntimeError("bl_minara_alert_emissions_v1 paper_trade_id FK missing")
+
+        if not require_indexes:
+            return
+
+        cur = await conn.execute("PRAGMA index_list(minara_alert_emissions)")
+        indexes = {row[1]: bool(row[2]) for row in await cur.fetchall()}
+        if "sqlite_autoindex_minara_alert_emissions_1" not in indexes:
+            raise RuntimeError(
+                "bl_minara_alert_emissions_v1 source_event_id unique index missing"
+            )
+        if indexes.get("idx_minara_alert_emissions_emitted_at") is not False:
+            raise RuntimeError("bl_minara_alert_emissions_v1 emitted_at index missing")
+        if indexes.get("idx_minara_alert_emissions_coin_id") is not False:
+            raise RuntimeError("bl_minara_alert_emissions_v1 coin_id index missing")
+        if indexes.get("idx_minara_alert_emissions_tg_alert_log_id") is not True:
+            raise RuntimeError(
+                "bl_minara_alert_emissions_v1 tg_alert_log_id unique index missing"
+            )
+        expected_index_columns = {
+            "idx_minara_alert_emissions_emitted_at": ["emitted_at"],
+            "idx_minara_alert_emissions_coin_id": ["coin_id", "emitted_at"],
+            "idx_minara_alert_emissions_tg_alert_log_id": ["tg_alert_log_id"],
+        }
+        for index_name, expected_cols in expected_index_columns.items():
+            cur = await conn.execute(f"PRAGMA index_info({index_name})")
+            actual_cols = [row[2] for row in await cur.fetchall()]
+            if actual_cols != expected_cols:
+                raise RuntimeError(
+                    f"bl_minara_alert_emissions_v1 {index_name} columns mismatch"
+                )
+        cur = await conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='index' "
+            "AND name='idx_minara_alert_emissions_tg_alert_log_id'"
+        )
+        idx_row = await cur.fetchone()
+        idx_sql = (idx_row[0] if idx_row else "").upper()
+        if "WHERE TG_ALERT_LOG_ID IS NOT NULL" not in idx_sql:
+            raise RuntimeError(
+                "bl_minara_alert_emissions_v1 tg_alert_log_id partial index missing"
+            )
+
+    async def record_minara_alert_emission(
+        self,
+        *,
+        paper_trade_id: int | None,
+        tg_alert_log_id: int | None,
+        signal_type: str,
+        coin_id: str,
+        chain: str,
+        amount_usd: float,
+        command_text: str | None,
+        emitted_at: str | None = None,
+        source_event_id: str | None = None,
+        source: str = "live",
+        lock_timeout_sec: float | None = None,
+    ) -> bool:
+        """Persist one Minara command-emission audit row.
+
+        Returns True when inserted, False when a duplicate idempotency key
+        was ignored.
+        """
+        if self._conn is None or self._txn_lock is None:
+            raise RuntimeError("Database not initialized.")
+        if source_event_id is None:
+            if tg_alert_log_id is None:
+                raise ValueError(
+                    "source_event_id is required when tg_alert_log_id is absent"
+                )
+            source_event_id = f"tg_alert_log:{tg_alert_log_id}"
+        if emitted_at is None:
+            emitted_at = datetime.now(timezone.utc).isoformat()
+        command_hash = (
+            hashlib.sha256(command_text.encode("utf-8")).hexdigest()
+            if command_text is not None
+            else None
+        )
+        command_text_observed = 1 if command_text is not None else 0
+
+        lock_acquired = False
+        if lock_timeout_sec is None:
+            await self._txn_lock.acquire()
+        else:
+            await asyncio.wait_for(self._txn_lock.acquire(), timeout=lock_timeout_sec)
+        lock_acquired = True
+        try:
+            await self._conn.execute(
+                """INSERT INTO minara_alert_emissions (
+                    paper_trade_id, tg_alert_log_id, signal_type, coin_id,
+                    chain, amount_usd, command_text, command_hash,
+                    command_text_observed, source, source_event_id,
+                    emitted_at, operator_paste_acknowledged_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+                (
+                    paper_trade_id,
+                    tg_alert_log_id,
+                    signal_type,
+                    coin_id,
+                    chain,
+                    amount_usd,
+                    command_text,
+                    command_hash,
+                    command_text_observed,
+                    source,
+                    source_event_id,
+                    emitted_at,
+                ),
+            )
+            await self._conn.commit()
+            return True
+        except sqlite3.IntegrityError as exc:
+            try:
+                await self._conn.rollback()
+            except Exception:
+                pass
+            msg = str(exc)
+            if "UNIQUE constraint failed" in msg and (
+                "minara_alert_emissions.source_event_id" in msg
+                or "minara_alert_emissions.tg_alert_log_id" in msg
+            ):
+                return False
+            raise
+        except BaseException:
+            try:
+                await self._conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            if lock_acquired:
+                self._txn_lock.release()
 
     async def revive_signal_with_baseline(
         self,

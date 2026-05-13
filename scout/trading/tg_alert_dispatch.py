@@ -48,6 +48,29 @@ DEFAULT_ALLOW_SIGNALS = (
     "volume_spike",
 )
 
+
+async def _demote_sent_row(
+    db: Database,
+    *,
+    sent_row_id: int | None,
+    detail: str,
+    log_event: str,
+) -> None:
+    if sent_row_id is None or db._conn is None:
+        return
+    try:
+        async with db._txn_lock:
+            await db._conn.execute(
+                "UPDATE tg_alert_log "
+                "SET outcome='dispatch_failed', detail=? "
+                "WHERE id=?",
+                (detail, sent_row_id),
+            )
+            await db._conn.commit()
+    except Exception:
+        log.exception(log_event, sent_row_id=sent_row_id)
+
+
 _SIGNAL_EMOJI = {
     "gainers_early": "📈",
     "losers_contrarian": "📉",
@@ -264,7 +287,13 @@ async def notify_paper_trade_opened(
         # claim (outside lock) so 100-500ms CG latency doesn't extend
         # lock-hold. Helper never raises Exception, but asyncio.CancelledError
         # propagates per asyncio convention.
-        from scout.trading.minara_alert import maybe_minara_command
+        from scout.trading.minara_alert import (
+            log_minara_alert_command_emitted,
+            maybe_minara_command,
+            minara_alert_amount_usd,
+            minara_source_event_id,
+            persist_minara_alert_emission,
+        )
 
         # PR-V2-I1 fold: on asyncio.CancelledError mid-fetch, the
         # pre-emptive 'sent' row would otherwise block the per-token
@@ -272,25 +301,18 @@ async def notify_paper_trade_opened(
         # honor cancellation semantics.
         try:
             minara_cmd = await maybe_minara_command(
-                session, settings, coin_id=token_id, amount_usd=amount_usd
+                session,
+                settings,
+                coin_id=token_id,
+                amount_usd=amount_usd,
             )
         except asyncio.CancelledError:
-            if sent_row_id is not None and db._conn is not None:
-                try:
-                    async with db._txn_lock:
-                        await db._conn.execute(
-                            "UPDATE tg_alert_log "
-                            "SET outcome='dispatch_failed', "
-                            "detail='cancelled_during_minara_lookup' "
-                            "WHERE id=?",
-                            (sent_row_id,),
-                        )
-                        await db._conn.commit()
-                except Exception:
-                    log.exception(
-                        "tg_alert_log_demote_failed_on_cancel",
-                        sent_row_id=sent_row_id,
-                    )
+            await _demote_sent_row(
+                db,
+                sent_row_id=sent_row_id,
+                detail="cancelled_during_minara_lookup",
+                log_event="tg_alert_log_demote_failed_on_cancel",
+            )
             raise
 
         # V3-C1 PR-stage fold: format + dispatch BOTH inside the try.
@@ -309,8 +331,20 @@ async def notify_paper_trade_opened(
             )
             # R1-C1 fold: parse_mode=None to avoid Markdown 400 silent-fail
             await alerter.send_telegram_message(
-                body, session, settings, parse_mode=None
+                body,
+                session,
+                settings,
+                parse_mode=None,
+                raise_on_failure=True,
             )
+        except asyncio.CancelledError:
+            await _demote_sent_row(
+                db,
+                sent_row_id=sent_row_id,
+                detail="cancelled_during_telegram_send",
+                log_event="tg_alert_log_demote_failed_on_send_cancel",
+            )
+            raise
         except Exception as e:
             log.warning(
                 "tg_alert_dispatch_failed",
@@ -337,6 +371,27 @@ async def notify_paper_trade_opened(
                         "tg_alert_log_demote_failed",
                         sent_row_id=sent_row_id,
                     )
+            return
+
+        if minara_cmd is not None:
+            minara_amount_usd = minara_alert_amount_usd(settings)
+            source_event_id = minara_source_event_id(sent_row_id)
+            log_minara_alert_command_emitted(
+                coin_id=token_id,
+                chain="solana",
+                amount_usd=minara_amount_usd,
+                source_event_id=source_event_id,
+            )
+            await persist_minara_alert_emission(
+                db=db,
+                paper_trade_id=paper_trade_id,
+                signal_type=signal_type,
+                tg_alert_log_id=sent_row_id,
+                coin_id=token_id,
+                chain="solana",
+                amount_usd=minara_amount_usd,
+                command_text=minara_cmd,
+            )
     except Exception:
         # Belt-and-braces: even logging failures must not propagate up
         # to block paper-trade dispatch.

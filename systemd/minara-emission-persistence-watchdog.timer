@@ -1,0 +1,11 @@
+[Unit]
+Description=Gecko-Alpha - hourly Minara emission persistence parity watchdog
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+AccuracySec=10m
+Unit=minara-emission-persistence-watchdog.service
+
+[Install]
+WantedBy=timers.target
