@@ -549,6 +549,50 @@ Without Q2's answer, the 4-week dashboard verdict still leaves the operator with
 
 **Estimate:** ~3-4 hours weekly digest + cron + tests.
 
+### BL-NEW-HPF-RE-EVALUATION: re-evaluate `PAPER_HIGH_PEAK_FADE_DRY_RUN` flip decision at n≥20
+**Status:** PROPOSED — surfaced 2026-05-13 at the D+7 review of PR #79 (BL-NEW-AUTOSUSPEND-FIX). HPF dry-run produced n=7 would-fires by 2026-05-13; pre-registered criterion was ambiguous and aggregate counter-factual was -$45 vs actuals, so the flip is deferred rather than acted on.
+**Tag:** `paper-trading` `high-peak-fade` `dry-run-extension` `heavy-tail-truncation`
+**Why:** HPF dry-run was activated 2026-05-06T02:18Z on `gainers_early` + `losers_contrarian` per parent BL-NEW-AUTOSUSPEND-FIX. The pre-registered flip criterion ("If gate would have fired earlier AND counter-factual PnL is positive, flip `PAPER_HIGH_PEAK_FADE_DRY_RUN=False`") was ambiguous in practice — per-trade PnL positive on all 7 fires (would say flip), but aggregate USD vs actual exits was -$45/-4.0% (would say don't flip). The 3 trades where HPF capped heavy-tail winners (1811 -$185, 1638 -$87, 1836 -$44) are exactly the asymmetric-truncation risk that n=7 cannot resolve. Deferring to n≥20 (or +14d) reduces the sampling-noise interpretation.
+
+**Drift verdict:** NET-NEW. BL-NEW-AUTOSUSPEND-FIX is in memory only (`project_bl_autosuspend_fix_2026_05_06.md`), not in backlog; this is the natural follow-up entry.
+**Hermes verdict:** No Hermes skill covers heavy-tail-truncation evaluation. Project-internal.
+
+**Counter-factual evidence at 2026-05-13 (n=7):**
+| Trade | Signal | HPF exit% | Actual% | HPF $ delta |
+|---|---|---:|---:|---:|
+| 1836 | losers_contrarian | 95.6 | 110.2 | -$44 |
+| 1811 | gainers_early | 60.5 | 122.1 | -$185 |
+| 1815 | gainers_early | 45.1 | 19.6 | +$76 |
+| 1791 | gainers_early | 42.2 | 31.8 | +$31 |
+| 1765 | gainers_early | 36.9 | 9.9 | +$81 |
+| 1699 | gainers_early | 34.4 | 7.3 | +$81 |
+| 1638 | gainers_early | 44.7 | 73.6 | -$87 |
+
+Aggregate: HPF $1,078 vs Actual $1,124. HPF improves 4/7 but the 3 heavy-tail caps dominate the $-delta.
+
+**Refined criteria for next review (locked):**
+- **Trigger:** earliest of (a) `SELECT COUNT(*) FROM high_peak_fade_audit WHERE dry_run=1` ≥ 20, OR (b) 2026-05-20T00:00Z.
+- **Flip to live (`PAPER_HIGH_PEAK_FADE_DRY_RUN=False`):** aggregate HPF counter-factual $ ≥ actual exits $ by ≥ +5% across the full audit window AND no single trade shows HPF $ delta ≤ -$200.
+- **Keep dry-run, extend +14d:** aggregate within ±5% (noise band) OR n still <20.
+- **Disable HPF entirely (`PAPER_HIGH_PEAK_FADE_ENABLED=False`):** aggregate HPF counter-factual $ < actual exits $ by ≥ -10% AND ≥3 trades show HPF $ delta ≤ -$100 (heavy-tail-cap pattern confirmed).
+
+**Verification query template (run at trigger):**
+```sql
+SELECT a.trade_id, p.signal_type,
+       ROUND(a.peak_pct,2) AS hpf_peak,
+       ROUND(a.retrace_pct,2) AS hpf_retrace_at_fire,
+       ROUND((1 + a.peak_pct/100.0) * (1 - a.retrace_pct/100.0) * 100 - 100, 2) AS hpf_exit_pnl_pct,
+       p.exit_reason, ROUND(p.pnl_pct,2) AS actual_pnl_pct, ROUND(p.pnl_usd,2) AS actual_pnl_usd
+FROM high_peak_fade_audit a JOIN paper_trades p ON p.id = a.trade_id
+WHERE a.dry_run = 1 ORDER BY a.fired_at DESC;
+```
+
+**Where to act:** `.env` PAPER_HIGH_PEAK_FADE_DRY_RUN / PAPER_HIGH_PEAK_FADE_ENABLED + restart pipeline. No code change.
+
+**Parent context:** see memory `project_bl_autosuspend_fix_2026_05_06.md` § "Soak outcomes (2026-05-13 actuals)" for full per-trade table + reasoning.
+
+**Estimate:** ~30 min query + decision + .env edit + restart.
+
 ### BL-NEW-M1.5C: Minara DEX-eligibility alert extension (Phase 0 Option A under BL-074)
 **Status:** SHIPPED 2026-05-11 — PR #96 (`ef68c6c`) squash-merged + deployed VPS 2026-05-11T01:54Z. Schema 20260517 migration `bl_tg_alert_log_m1_5c_outcome` applied; M1.5b sentinel preserved across rebuild (verified `m1_5b_sentinel_preserved=true`). Onboarding TG announcement delivered. See memory `project_m1_5c_deployed_2026_05_11.md`.
 **Tag:** `decision-support` `minara` `solana-first` `phase-0-option-a` `pre-execution-layer`
