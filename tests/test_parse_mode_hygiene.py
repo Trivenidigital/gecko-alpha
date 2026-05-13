@@ -176,17 +176,33 @@ def _direct_post_has_parse_mode(
 
 # Allowlist of currently-known sites that DO NOT explicitly pin parse_mode.
 # BL-NEW-PARSE-MODE-AUDIT scope only fixes the 7 HIGH ACTUAL sites. The
-# 8 sites below fall into:
-#  - LOW/MEDIUM (audit classification, body shape unlikely to mangle):
+# 10 sites below fall into:
+#  - send_telegram_message dispatch sites (LOW/MEDIUM per audit, body
+#    shape unlikely to mangle):
 #      scout/chains/alerts.py:59
 #      scout/trading/suppression.py:186
 #      scout/live/loops.py:251
 #      scout/main.py:166 (combo_refresh failure)
 #      scout/social/lunarcrush/alerter.py:144 (body uses _escape_md)
-#  - HIGH POTENTIAL (deferred per audit, need 7-day production log review):
+#  - send_telegram_message dispatch sites (HIGH POTENTIAL per audit,
+#    deferred pending 7-day production log review):
 #      scout/main.py:351 (briefing chunked summary)
 #      scout/main.py:434 (counter-arg follow-up)
 #      scout/main.py:1537 (daily summary)
+#  - direct session.post(.../sendMessage) sites (caught by the resolver-
+#    aware second AST arm — both are intentionally parse_mode-less):
+#      scout/alerter.py:162 — INSIDE send_telegram_message itself; the
+#        function takes parse_mode as a parameter and adds it to the
+#        payload conditionally (`if parse_mode is not None: payload[...]
+#        = parse_mode`). The walker can't see the dynamic dict insert,
+#        but the function's caller-passes-kwarg contract is the design
+#        intent and is enforced by every CALL site (which the first AST
+#        arm checks). Self-referential allowlist entry.
+#      scout/social/telegram/listener.py:123 — intentional plain-text
+#        Telegram dispatch (channel-listener auth flow). Payload at
+#        :120-121 builds {chat_id, text} with NO parse_mode field;
+#        Telegram defaults to plain text. Per plan-review reviewer A:
+#        "SAFE by construction."
 # Follow-up PRs remove entries from this set; a NEW dispatch site that's
 # not in this allowlist will be caught at CI time.
 _ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE: set[tuple[str, int]] = {
@@ -198,6 +214,8 @@ _ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE: set[tuple[str, int]] = {
     ("scout/main.py", 351),
     ("scout/main.py", 434),
     ("scout/main.py", 1537),
+    ("scout/alerter.py", 162),
+    ("scout/social/telegram/listener.py", 123),
 }
 
 
