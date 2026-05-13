@@ -618,6 +618,12 @@ body {
   gap: 16px;
 }
 
+.x-alerts {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
 .tg-stat-row {
   display: grid;
   grid-template-columns: repeat(6, 1fr);
@@ -706,4 +712,58 @@ body {
 .tg-badge-muted {
   background: rgba(255, 255, 255, 0.06);
   color: var(--color-text-secondary);
+}
+
+.x-stat-row {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.x-alert-table {
+  table-layout: fixed;
+}
+
+.x-alert-table th:nth-child(1),
+.x-alert-table td:nth-child(1) {
+  width: 110px;
+}
+
+.x-alert-table th:nth-child(2),
+.x-alert-table td:nth-child(2) {
+  width: 120px;
+}
+
+.x-alert-table th:nth-child(3),
+.x-alert-table td:nth-child(3) {
+  width: 130px;
+}
+
+.x-alert-table th:nth-child(4),
+.x-alert-table td:nth-child(4) {
+  width: 78px;
+}
+
+.x-alert-table th:nth-child(6),
+.x-alert-table td:nth-child(6),
+.x-alert-table th:nth-child(7),
+.x-alert-table td:nth-child(7) {
+  width: 110px;
+}
+
+.x-author-link {
+  color: var(--color-accent-blue);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.x-author-link:hover {
+  text-decoration: underline;
+}
+
+.x-contract {
+  display: inline-block;
+  max-width: 118px;
+  color: var(--color-text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  white-space: nowrap;
 }

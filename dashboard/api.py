@@ -1022,6 +1022,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "settings_loaded": _DASHBOARD_SETTINGS is not None,
         }
 
+    @app.get("/api/x_alerts")
+    async def get_x_alerts(limit: int = Query(80, ge=1)):
+        """Dashboard view of Hermes/xurl narrative alerts.
+
+        Collection and classification live in Hermes skills. This endpoint only
+        reads the gecko-alpha inbound table populated by /api/narrative-alert.
+        """
+        return await db.get_x_alerts(_db_path, limit=limit)
+
     @app.get("/api/tg_social/dlq")
     async def get_tg_social_dlq_endpoint(
         limit: int = Query(20, ge=1, le=100),

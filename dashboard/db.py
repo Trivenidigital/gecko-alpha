@@ -1278,6 +1278,106 @@ async def get_trading_stats_by_signal_cohort(db_path: str, days: int = 7) -> dic
 # ---------------------------------------------------------------------------
 
 
+async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
+    """Recent Hermes/xurl narrative alerts for the dashboard.
+
+    Source table is ``narrative_alerts_inbound``. The Hermes side owns X
+    collection/classification; the dashboard only renders the accepted inbound
+    events so we don't introduce another X polling path.
+    """
+    safe_limit = max(1, min(limit, 200))
+    async with _ro_db(db_path) as conn:
+        try:
+            cur = await conn.execute(
+                """SELECT id, event_id, tweet_id, tweet_author, tweet_ts,
+                          tweet_text, extracted_cashtag, extracted_ca,
+                          extracted_chain, resolved_coin_id, narrative_theme,
+                          urgency_signal, classifier_confidence,
+                          classifier_version, received_at
+                   FROM narrative_alerts_inbound
+                   ORDER BY datetime(received_at) DESC, id DESC
+                   LIMIT ?""",
+                (safe_limit,),
+            )
+            rows = await cur.fetchall()
+
+            stats_cur = await conn.execute("""SELECT
+                         COUNT(*) AS alerts,
+                         COUNT(DISTINCT tweet_author) AS unique_authors,
+                         SUM(CASE WHEN COALESCE(extracted_ca, '') != ''
+                                  THEN 1 ELSE 0 END) AS with_ca,
+                         SUM(CASE WHEN COALESCE(extracted_cashtag, '') != ''
+                                  THEN 1 ELSE 0 END) AS with_cashtag,
+                         SUM(CASE WHEN COALESCE(resolved_coin_id, '') != ''
+                                  THEN 1 ELSE 0 END) AS resolved,
+                         AVG(classifier_confidence) AS avg_confidence
+                   FROM narrative_alerts_inbound
+                   WHERE datetime(received_at) >= datetime('now', '-24 hours')""")
+            stats_row = await stats_cur.fetchone()
+        except aiosqlite.OperationalError as e:
+            msg = str(e)
+            if "no such table" not in msg or "narrative_alerts_inbound" not in msg:
+                raise
+            structlog.get_logger().warning(
+                "dashboard_x_alerts_table_missing_fallback",
+                err=msg,
+            )
+            return {
+                "stats_24h": {
+                    "alerts": 0,
+                    "unique_authors": 0,
+                    "with_ca": 0,
+                    "with_cashtag": 0,
+                    "resolved": 0,
+                    "avg_confidence": None,
+                },
+                "alerts": [],
+            }
+
+        def _tweet_url(author: str | None, tweet_id: str | None) -> str | None:
+            if not author or not tweet_id:
+                return None
+            return f"https://x.com/{author}/status/{tweet_id}"
+
+        alerts = []
+        for row in rows:
+            text = row["tweet_text"] or ""
+            alerts.append(
+                {
+                    "id": row["id"],
+                    "event_id": row["event_id"],
+                    "tweet_id": row["tweet_id"],
+                    "tweet_author": row["tweet_author"],
+                    "tweet_ts": row["tweet_ts"],
+                    "tweet_url": _tweet_url(row["tweet_author"], row["tweet_id"]),
+                    "text_preview": text[:240],
+                    "extracted_cashtag": row["extracted_cashtag"],
+                    "extracted_ca": row["extracted_ca"],
+                    "extracted_chain": row["extracted_chain"],
+                    "resolved_coin_id": row["resolved_coin_id"],
+                    "narrative_theme": row["narrative_theme"],
+                    "urgency_signal": row["urgency_signal"],
+                    "classifier_confidence": row["classifier_confidence"],
+                    "classifier_version": row["classifier_version"],
+                    "received_at": row["received_at"],
+                }
+            )
+
+        avg = stats_row["avg_confidence"] if stats_row else None
+        return {
+            "stats_24h": {
+                "alerts": (stats_row["alerts"] if stats_row else 0) or 0,
+                "unique_authors": (stats_row["unique_authors"] if stats_row else 0)
+                or 0,
+                "with_ca": (stats_row["with_ca"] if stats_row else 0) or 0,
+                "with_cashtag": (stats_row["with_cashtag"] if stats_row else 0) or 0,
+                "resolved": (stats_row["resolved"] if stats_row else 0) or 0,
+                "avg_confidence": round(avg, 3) if avg is not None else None,
+            },
+            "alerts": alerts,
+        }
+
+
 async def get_tg_social_dlq(db_path: str, limit: int = 20) -> list[dict]:
     """Recent tg_social DLQ entries, ordered by failed_at DESC.
 
