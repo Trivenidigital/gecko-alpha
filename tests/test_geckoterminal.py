@@ -84,17 +84,32 @@ async def test_fetch_trending_pools_filters_market_cap(mock_aiohttp, settings_fa
     assert len(tokens) == 0
 
 
-async def test_fetch_trending_pools_handles_api_error(mock_aiohttp, settings_factory):
+async def test_fetch_trending_pools_exhausts_5xx_retries(
+    mock_aiohttp, settings_factory, geckoterminal_sleep_spy
+):
     url = f"{GECKO_BASE}/networks/solana/trending_pools"
+    mock_aiohttp.get(url, status=500)
+    mock_aiohttp.get(url, status=500)
     mock_aiohttp.get(url, status=500)
 
     settings = settings_factory(
         CHAINS=["solana"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000
     )
-    async with aiohttp.ClientSession() as session:
-        tokens = await fetch_trending_pools(session, settings)
+    with capture_logs() as logs:
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_trending_pools(session, settings)
 
     assert tokens == []
+    assert _request_count(mock_aiohttp, url) == 3
+    assert geckoterminal_sleep_spy == [1, 2]
+    assert logs[-1] == {
+        "chain": "solana",
+        "url": url,
+        "status": 500,
+        "max_attempts": 3,
+        "event": "geckoterminal_retries_exhausted",
+        "log_level": "warning",
+    }
 
 
 def _request_count(mock_aiohttp, url: str) -> int:
@@ -189,6 +204,39 @@ async def test_fetch_trending_pools_exhausts_429_retries(
         "geckoterminal_retries_exhausted",
     ]
     assert [log.get("wait") for log in logs[:2]] == [1, 2]
+    assert logs[-1] == {
+        "chain": "solana",
+        "url": url,
+        "status": 429,
+        "max_attempts": 3,
+        "event": "geckoterminal_retries_exhausted",
+        "log_level": "warning",
+    }
+
+
+async def test_fetch_trending_pools_continues_after_chain_retry_exhaustion(
+    mock_aiohttp, settings_factory, geckoterminal_sleep_spy
+):
+    sol_url = f"{GECKO_BASE}/networks/solana/trending_pools"
+    base_url = f"{GECKO_BASE}/networks/base/trending_pools"
+    mock_aiohttp.get(sol_url, status=429)
+    mock_aiohttp.get(sol_url, status=429)
+    mock_aiohttp.get(sol_url, status=429)
+    mock_aiohttp.get(base_url, payload={"data": [SAMPLE_POOL]})
+
+    settings = settings_factory(
+        CHAINS=["solana", "base"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000
+    )
+    with capture_logs() as logs:
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_trending_pools(session, settings)
+
+    assert len(tokens) == 1
+    assert tokens[0].chain == "base"
+    assert _request_count(mock_aiohttp, sol_url) == 3
+    assert _request_count(mock_aiohttp, base_url) == 1
+    assert geckoterminal_sleep_spy == [1, 2]
+    assert "geckoterminal_retries_exhausted" in [log["event"] for log in logs]
 
 
 async def test_fetch_trending_pools_does_not_retry_404(
