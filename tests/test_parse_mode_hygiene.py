@@ -217,3 +217,33 @@ def test_calibrate_apply_alert_call_passes_parse_mode_none():
     tail = source[idx : idx + 400]
     assert "send_telegram_message(" in tail
     assert "parse_mode=None" in tail
+
+
+# ---------------------------------------------------------------------
+# Site #5: weekly digest (two call sites)
+# ---------------------------------------------------------------------
+
+
+def test_weekly_digest_calls_pass_parse_mode_none():
+    """Site #5: scout/trading/weekly_digest.py both call sites (chunk
+    dispatch at :335 and fallback at :340) use parse_mode=None. Body
+    interpolates signal_type, combo_key, symbol; section headers use
+    [...] brackets which would mis-render as Markdown link anchors.
+    """
+    import scout.trading.weekly_digest as wd
+
+    source = inspect.getsource(wd)
+    occurrences = []
+    cursor = 0
+    while True:
+        idx = source.find("alerter.send_telegram_message", cursor)
+        if idx == -1:
+            break
+        occurrences.append(idx)
+        cursor = idx + 1
+    assert len(occurrences) >= 2, "expected at least 2 dispatch sites"
+    for idx in occurrences:
+        tail = source[idx : idx + 300]
+        assert "parse_mode=None" in tail, (
+            f"weekly_digest dispatch at char {idx} missing parse_mode=None"
+        )

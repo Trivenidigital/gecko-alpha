@@ -273,7 +273,7 @@ async def test_send_weekly_digest_empty_skips_telegram(
 
     sent: list = []
 
-    async def _capture(text, session, settings):
+    async def _capture(text, session, settings, **kwargs):
         sent.append(text)
 
     monkeypatch.setattr(
@@ -344,7 +344,7 @@ async def test_send_weekly_digest_fallback_on_error(
 
     sent: list = []
 
-    async def _capture(text, session, settings):
+    async def _capture(text, session, settings, **kwargs):
         sent.append(text)
 
     monkeypatch.setattr(
