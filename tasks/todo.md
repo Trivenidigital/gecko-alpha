@@ -21,7 +21,8 @@ Last updated: 2026-05-09 (autonomous build: BL-NEW-QUOTE-PAIR plan + design + im
 - [x] Targeted verification rerun: `tests/test_geckoterminal.py tests/test_geckoterminal_rank.py tests/test_dexscreener.py tests/test_coingecko.py` -> 28 passed
 - [x] PR creation: https://github.com/Trivenidigital/gecko-alpha/pull/115
 - [x] Three-reviewer PR pass (two completed; operational/Hermes reviewer timed out and was closed)
-- [ ] Merge and deploy
+- [x] Merge: PR #115 squash-merged as `30b588a`
+- [x] Deploy to VPS: `master` at `30b588a`, `gecko-pipeline` active, `geckoterminal_non_retryable_status` observed for known ethereum 404
 
 ## BL-NEW-QUOTE-PAIR soak (post-deploy)
 
