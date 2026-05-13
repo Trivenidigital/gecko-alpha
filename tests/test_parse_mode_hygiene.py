@@ -101,3 +101,60 @@ def test_all_dispatch_sites_pin_parse_mode():
         "(see BL-NEW-PARSE-MODE-AUDIT + CLAUDE.md §12b):\n  "
         + "\n  ".join(offenders)
     )
+
+
+# ---------------------------------------------------------------------
+# Site #1: narrative heating alert
+# ---------------------------------------------------------------------
+
+
+def test_narrative_heating_alert_formatter_preserves_underscored_symbol():
+    """Site #1: format_heating_alert body interpolates p.symbol raw —
+    the dispatch site at scout/narrative/agent.py:557 must use
+    parse_mode=None to render literal underscores in symbols like AS_ROID.
+
+    This test verifies the formatter STILL interpolates the raw symbol
+    (no double-escaping); the call-site test below pins parse_mode=None.
+    """
+    from scout.narrative.digest import format_heating_alert
+    from scout.narrative.models import CategoryAcceleration, NarrativePrediction
+
+    accel = CategoryAcceleration(
+        category_id="ai",
+        name="AI",
+        previous_velocity=1.0,
+        current_velocity=5.0,
+        acceleration=4.0,
+        volume_growth_pct=50.0,
+        coin_count_change=0,
+    )
+    pred = NarrativePrediction(
+        symbol="AS_ROID",
+        market_cap_at_prediction=1_000_000,
+        price_at_prediction=0.01,
+        narrative_fit_score=80,
+        confidence="high",
+        reasoning="test",
+        is_control=False,
+        market_regime="bull",
+    )
+    text = format_heating_alert(accel, [pred], "BTC, ETH, SOL")
+    # Body itself contains raw underscored symbol; escaping happens at the wire
+    # via parse_mode=None (no Markdown parsing at all).
+    assert "AS_ROID" in text
+
+
+def test_narrative_agent_alert_call_passes_parse_mode_none():
+    """Site #1 call-site contract: scout/narrative/agent.py:557 dispatches
+    with parse_mode=None. Source-level pin — if a future refactor removes
+    the kwarg, this test fails.
+    """
+    import scout.narrative.agent as agent
+
+    source = inspect.getsource(agent)
+    assert "format_heating_alert(" in source
+    idx = source.index("format_heating_alert(")
+    # Look ahead within ~600 chars for the send_telegram_message + parse_mode
+    tail = source[idx : idx + 600]
+    assert "send_telegram_message(" in tail
+    assert "parse_mode=None" in tail

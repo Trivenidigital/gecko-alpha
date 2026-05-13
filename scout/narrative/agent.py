@@ -555,7 +555,7 @@ async def narrative_agent_loop(
                                         accel, alertable, top_3_coins
                                     )
                                     await send_telegram_message(
-                                        alert_text, session, settings
+                                        alert_text, session, settings, parse_mode=None
                                     )
                                     logger.info(
                                         "narrative.alert_sent", category=accel.name
