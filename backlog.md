@@ -620,6 +620,37 @@ ssh root@89.167.116.187 "sqlite3 /root/gecko-alpha/scout.db \"SELECT COUNT(*) FR
 
 **3-vector PR review caught 3 CRITICAL pre-merge** (folded in commit `fff3658` pre-rebase): base58 SPL shape validation (V1-I1 + V2-I2 convergence), CancelledError sentinel-stuck (V2-I1), isinstance(dict) guard for CG schema drift (V1-I1).
 
+### BL-NEW-MINARA-DB-PERSISTENCE: persist `minara_alert_command_emitted` events to DB for D+14 kill-criterion eval
+**Status:** PROPOSED 2026-05-13 — surfaced during D+2 Minara verification on srilu-vps. M1.5c is operationally healthy (10 emissions in 48h covering 9 unique Solana tokens including `goblincoin`, `chill-guy`, `troll-2`, `useless-3`), but the V3-strategy kill-criterion at D+14 (2026-05-25) depends on counting `minara_alert_command_emitted` events vs operator self-reported manual paste count — and that event currently has **no DB-side persistence**, only structured logs in journalctl. journalctl retention defaults to ~30 days on systemd but can rotate earlier under disk pressure. The kill-criterion eval is one journalctl rotation away from being unverifiable.
+
+**Tag:** `silent-failure-class-1` `minara` `m1_5c` `kill-criterion-substrate` `observability`
+
+**Why:** Class 1 silent-failure shape per global CLAUDE.md §12a-style discipline — decision-bearing telemetry stored only in logs creates an availability dependency that's invisible until the dependency lapses. The kill-criterion at D+14 is the load-bearing eval for whether to scope M1.5d Option B (VPS-side execution); losing the data because journalctl rotated before the eval is run is a structural failure mode.
+
+**Drift verdict:** NET-NEW. No existing entry covers Minara-emission persistence. BL-NEW-M1.5C (PR #96) shipped the emit logic but did NOT include DB-side row writes. The migration `bl_tg_alert_log_m1_5c_outcome` added `m1_5c_announcement_sent` to the `tg_alert_log.outcome` enum but no per-emit row schema.
+**Hermes verdict:** No Hermes skill covers Minara-specific telemetry persistence. Project-internal.
+
+**Effect (proposed):** Add a `tg_alert_log` write (or new sibling table `minara_alert_emissions`) inside `scout/trading/minara_alert.py:maybe_minara_command` immediately before/after the `minara_alert_command_emitted` log call. Columns: `id`, `coin_id`, `chain`, `amount_usd`, `command_text` (or hash of it), `emitted_at`, `paper_trade_id` (FK if applicable), `signal_type`. Plus an `operator_paste_acknowledged_at` column (NULL by default; future operator-facing UI lets them mark "yes I executed this").
+
+**Pre-registered kill-criterion query (D+14 = 2026-05-25):**
+```sql
+SELECT DATE(emitted_at) AS day, COUNT(*) AS emitted,
+       SUM(CASE WHEN operator_paste_acknowledged_at IS NOT NULL THEN 1 ELSE 0 END) AS pasted,
+       ROUND(100.0 * SUM(CASE WHEN operator_paste_acknowledged_at IS NOT NULL THEN 1 ELSE 0 END) / COUNT(*), 1) AS paste_rate_pct
+FROM minara_alert_emissions
+WHERE emitted_at >= '2026-05-11T01:54:00Z'
+GROUP BY day ORDER BY day;
+```
+- High emit + high paste → Option B scoping per BL-NEW-M1.5C kill tree
+- High emit + low paste → wrong product shape; revisit operator workflow
+- Low emit → re-examine Solana coverage; consider EVM expansion (M1.5d EVM, 17 chains)
+
+**Where to act:** `scout/trading/minara_alert.py` (add DB write); `scout/db.py` (new migration for `minara_alert_emissions` table OR new columns on `tg_alert_log`); `scout/trading/tg_alert_dispatch.py` (pass paper_trade_id through to maybe_minara_command).
+
+**Backfill consideration:** the 10+ events already emitted since 2026-05-11 are in journalctl only. A one-time backfill script can parse the journalctl JSON lines into the new table — captures the soak window's history. Bounded by journalctl retention (~30 days max).
+
+**Estimate:** ~2-3 hours for migration + write logic + backfill script + tests + PR review + deploy. Should ship before 2026-05-22 (D+11) to leave 3-day buffer for the D+14 query to have clean data.
+
 ### BL-NEW-DEX-PRICE-COVERAGE: DexScreener/GeckoTerminal price_cache coverage gap (follow-up to held-position refresh)
 **Status:** PROPOSED 2026-05-12 — filed as follow-up during Alt A design pass for held-position price refresh.
 **Why:** Structural finding surfaced by 2026-05-12 Phase 1 Explore agent on price_cache write path: **`scout/ingestion/dexscreener.py` and `scout/ingestion/geckoterminal.py` do not write to `price_cache` at all.** Their tokens get cache rows only as a side effect of also appearing in a CoinGecko ingestion lane (markets/trending). Pure-DEX-discovered tokens (no CG listing) get no cache row — same shape as the AALIEN case but for a different reason. Currently latent because the open-trades cohort is 0% contract-addr-shaped (all current held tokens have CoinGecko coin_ids), but this is a known landmine.
