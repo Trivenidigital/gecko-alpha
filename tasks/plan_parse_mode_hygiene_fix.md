@@ -35,6 +35,14 @@ Searched `scout/` for sites already fixed:
 
 The 6 HIGH ACTUAL sites remain unfixed. Audit doc is current as of 2026-05-12; no prior PR has closed them.
 
+## Reviewer-discovered scope expansion (Plan-review round 1, 2026-05-13)
+
+Plan-review round 1 (Reviewer A, scope/coverage vector) discovered an additional HIGH ACTUAL site that the audit had missed: `scout/alerter.py:189 send_alert` — the **primary candidate-alert path** (called from `scout/main.py:871` on every gate pass). The audit grepped `send_telegram_message` only; `send_alert` is a separate function that calls Telegram directly via `session.post` with hardcoded `"parse_mode": "Markdown"` at line 209. Body `format_alert_message` (lines 15-72) interpolates raw `token.token_name`, `token.ticker`, `token.chain`, signal names (every gecko-alpha signal_type contains underscores), and `token.mirofish_report` (LLM output). This is the highest-volume mangling path in the system; every primary candidate alert has been silently mangling its `Signals:` line and any LLM-special-char content for the lifetime of the codebase.
+
+Fix shape: same as velocity (#6) — author intent is Markdown (`*token_name*` bold wrapper at line 21, `[chart]({url})` link patterns in other formatters); keep `parse_mode=Markdown` at line 209 and `_escape_md` the interpolated user-data fields in `format_alert_message`.
+
+**Total in-scope HIGH ACTUAL sites in this PR: 7** (6 from audit + 1 from plan review).
+
 ## Per-site fix matrix
 
 | # | Site | Current state | Fix primitive | Why this primitive |
@@ -45,6 +53,7 @@ The 6 HIGH ACTUAL sites remain unfixed. Audit doc is current as of 2026-05-12; n
 | 4 | `scout/trading/calibrate.py:354` (apply path) | default `parse_mode=Markdown`; body interpolates `d.signal_type` (always has `_`), `c.field`, `d.reason` inside `[…]` brackets | `parse_mode=None` at call site | Already-documented inconsistency: dry-run path uses `parse_mode=None` (per docstring at `calibrate.py:459` and `alerter.py:131-135`), apply path doesn't. Same `[reason]` shape → same fix. |
 | 5 | `scout/trading/weekly_digest.py:335,340` (both call sites in same function) | default `parse_mode=Markdown`; body interpolates `e["symbol"]`, `sig` (signal_type), `r["combo_key"]`, plus `[…]` section markers | `parse_mode=None` at both call sites | System-health digest; brackets are section delimiters, not Markdown |
 | 6 | `scout/velocity/detector.py:193` (call) + `scout/velocity/detector.py:159-177:format_velocity_alert` (body) | default `parse_mode=Markdown`; body INTENTIONALLY uses `*bold*` and `[chart](url)` link formatting; interpolates `det['symbol']`, `det['name']` raw | `_escape_md(det['symbol'])` + `_escape_md(det['name'])` in `format_velocity_alert`; keep `parse_mode=Markdown` | Author intended Markdown rendering (bold/clickable links); escape only the user-data fields |
+| 7 | `scout/alerter.py:189` (`send_alert` function) + `scout/alerter.py:15-72` (`format_alert_message` body) | hardcoded `"parse_mode": "Markdown"` at line 209; body intentionally uses `*{token_name}*` bold; interpolates `token_name`, `ticker`, `chain`, signal names (join), `mirofish_report` raw | `_escape_md(...)` on each user-data field in `format_alert_message`; keep `parse_mode=Markdown` in `send_alert` payload | Primary candidate-alert path. Author intent was Markdown bold for token name. Same pattern as velocity: keep Markdown, escape interpolated fields. (Discovered by plan review — audit missed because it grepped `send_telegram_message` only.) |
 
 ## File structure
 
@@ -55,14 +64,20 @@ The 6 HIGH ACTUAL sites remain unfixed. Audit doc is current as of 2026-05-12; n
 - `scout/trading/calibrate.py` — add `parse_mode=None` at line 354
 - `scout/trading/weekly_digest.py` — add `parse_mode=None` at lines 335 and 340
 - `scout/velocity/detector.py` — wrap `det['symbol']` and `det['name']` with `_escape_md(...)` in `format_velocity_alert`
+- `scout/alerter.py` — wrap `token.token_name`, `token.ticker`, `token.chain`, signal names (in the `", ".join(signals)`), and `token.mirofish_report` with `_escape_md(...)` in `format_alert_message` (lines 15-72); keep hardcoded `parse_mode=Markdown` at line 209 (intentional)
+
+**Files to modify (test code — for kwarg compatibility):**
+- `tests/test_trading_weekly_digest.py:276,347` — update `_capture(text, session, settings)` to `_capture(text, session, settings, **kwargs)` to accept the new `parse_mode=None` kwarg
+- `tests/test_alerter.py:46` — update assertion from `assert "vol_liq_ratio" in msg` to `assert r"vol\_liq\_ratio" in msg` (signal names now escaped under format_alert_message)
 
 **Files to create (tests):**
-- `tests/test_parse_mode_hygiene.py` — regression tests covering all 6 sites + a structural test that walks `scout/` for any future site missing the hygiene primitive.
+- `tests/test_parse_mode_hygiene.py` — regression tests covering all 7 sites + a structural test that walks `scout/` for any future site missing the hygiene primitive.
 
 **Files NOT to touch in this PR (out of scope):**
-- `scout/main.py:350,433,1521` — 3 HIGH POTENTIAL sites. Per audit §"What's NOT in this audit" point 3, these need post-deploy log observation first; deferred to a separate follow-up PR after a 7-day soak.
+- `scout/main.py:350,433,1521` — 3 HIGH POTENTIAL sites. Per audit §"What's NOT in this audit" point 3, these need post-deploy log observation first; deferred to a separate follow-up PR after a 7-day soak. Plan-review reviewer A suggested promoting `:434` (counter-arg) to HIGH ACTUAL on the basis of `[HIGH]`/`[CRITICAL]` bracket markdown-link-anchor risk. **Rejected after verification:** Telegram MarkdownV1 link parsing requires `[label](url)` adjacency; the body at line 425 has `[{severity}] {flag}: {detail}` where the bracket is followed by whitespace + text, not `(`. Bare `[HIGH]` renders as literal text. Underlying ticker/LLM-output Markdown-special-char risk matches the audit's HIGH POTENTIAL classification — defer per audit policy.
 - The 5 LOW/MEDIUM sites — body shape unlikely to mangle; per audit, no change needed.
-- `scout/narrative/digest.py:format_daily_digest` — not in audit's HIGH ACTUAL list; review-only verification that no call site dispatches it via the vulnerable path. (Audit may have missed it; flagged in carry-forward.)
+- `scout/narrative/digest.py:format_daily_digest` — verified by plan review: zero callers in `scout/` (grep). Dead-path; safe to defer.
+- `tests/test_trading_suppression.py:321` `_capture` — uses positional-only signature too, BUT this PR does not modify `scout/trading/suppression.py:186` dispatch, so the test mock signature does not need updating in this PR.
 
 ## Self-review notes (in advance)
 
@@ -477,7 +492,27 @@ def test_weekly_digest_calls_pass_parse_mode_none():
 Run: `uv run pytest tests/test_parse_mode_hygiene.py::test_weekly_digest_calls_pass_parse_mode_none -v`
 Expected: FAIL.
 
-- [ ] **Step 6.3: Apply fix at line 335**
+- [ ] **Step 6.3: Update test mock signatures to accept kwargs**
+
+Plan-review reviewer B flagged: `tests/test_trading_weekly_digest.py:276` and `:347` define `async def _capture(text, session, settings):` — positional-only, no `**kwargs`. After we add `parse_mode=None` to the dispatch call, the mock will raise `TypeError: _capture() got an unexpected keyword argument 'parse_mode'`.
+
+Edit `tests/test_trading_weekly_digest.py:276` from:
+
+```python
+    async def _capture(text, session, settings):
+        sent.append(text)
+```
+
+to:
+
+```python
+    async def _capture(text, session, settings, **kwargs):
+        sent.append(text)
+```
+
+Apply the **same edit** to the second `_capture` definition at `tests/test_trading_weekly_digest.py:347`.
+
+- [ ] **Step 6.4: Apply fix at line 335**
 
 Edit `scout/trading/weekly_digest.py` line 335. Change:
 
@@ -495,7 +530,7 @@ to:
                 )
 ```
 
-- [ ] **Step 6.4: Apply fix at line 340**
+- [ ] **Step 6.5: Apply fix at line 340**
 
 In the same file, change:
 
@@ -520,16 +555,16 @@ to:
                 )
 ```
 
-- [ ] **Step 6.5: Run test to verify it passes**
+- [ ] **Step 6.6: Run test to verify it passes + verify existing weekly_digest tests still pass**
 
-Run: `uv run pytest tests/test_parse_mode_hygiene.py -v`
-Expected: PASS.
+Run: `uv run pytest tests/test_parse_mode_hygiene.py tests/test_trading_weekly_digest.py -v`
+Expected: PASS (the existing weekly_digest tests will catch the mock-signature TypeError if step 6.3 was skipped).
 
-- [ ] **Step 6.6: Commit**
+- [ ] **Step 6.7: Commit**
 
 ```bash
-git add scout/trading/weekly_digest.py tests/test_parse_mode_hygiene.py
-git commit -m "fix(weekly_digest): both dispatches use parse_mode=None (BL-NEW-PARSE-MODE-AUDIT site #5)"
+git add scout/trading/weekly_digest.py tests/test_trading_weekly_digest.py tests/test_parse_mode_hygiene.py
+git commit -m "fix(weekly_digest): both dispatches use parse_mode=None + update mock sigs (BL-NEW-PARSE-MODE-AUDIT site #5)"
 ```
 
 ---
@@ -637,19 +672,177 @@ git commit -m "fix(velocity): escape symbol+name with _escape_md, preserve Markd
 
 ---
 
-## Task 8: Final-pass full test suite + lint
+## Task 8: Fix site #7 — primary send_alert path (audit-missed)
 
-- [ ] **Step 8.1: Run full test suite**
+**Files:**
+- Modify: `scout/alerter.py:15-72` (`format_alert_message`)
+- Modify: `tests/test_alerter.py:46` (update existing assertion to expect escaped form)
+- Test: `tests/test_parse_mode_hygiene.py`
+
+This site was missed by the audit. Plan-review reviewer A discovered it during scope/coverage review. It's the **primary candidate-alert path** (every gate-pass alert from `scout/main.py:871`). Body is intentionally Markdown-formatted (`*{token_name}*` bold wrapper). Fix shape mirrors velocity (#6): keep Markdown, escape interpolated user-data fields.
+
+- [ ] **Step 8.1: Write failing test**
+
+Append to `tests/test_parse_mode_hygiene.py`:
+
+```python
+def test_format_alert_message_escapes_user_data_fields(token_factory):
+    """Site #7: format_alert_message at scout/alerter.py:15 must escape
+    user-data fields (token_name, ticker, chain, signal names, mirofish_report)
+    so Telegram's MarkdownV1 parser does not consume underscores.
+
+    Signal names always contain underscores (gainers_early, hard_loss, etc.);
+    this site has been mangling every candidate alert since the codebase's
+    inception.
+    """
+    from scout.alerter import format_alert_message
+
+    token = token_factory(
+        contract_address="0xabc123",
+        chain="solana",
+        token_name="AS_ROID",
+        ticker="AS_RD",
+        market_cap_usd=75000,
+        quant_score=80,
+        narrative_score=75,
+        conviction_score=78,
+        virality_class="High",
+        mirofish_report="Has under_score chars",
+    )
+    signals = ["vol_liq_ratio", "momentum_ratio"]
+    msg = format_alert_message(token, signals)
+
+    # User-data fields appear in escaped form
+    assert r"AS\_ROID" in msg, "token_name underscore must be escaped"
+    assert r"AS\_RD" in msg, "ticker underscore must be escaped"
+    assert r"vol\_liq\_ratio" in msg, "signal name underscore must be escaped"
+    assert r"momentum\_ratio" in msg, "signal name underscore must be escaped"
+    assert r"under\_score" in msg, "mirofish_report underscore must be escaped"
+    # The intentional *bold* wrapping around token_name MUST still be present
+    assert r"*AS\_ROID*" in msg, "bold formatting around token_name preserved"
+```
+
+- [ ] **Step 8.2: Run test to verify it fails**
+
+Run: `uv run pytest tests/test_parse_mode_hygiene.py::test_format_alert_message_escapes_user_data_fields -v`
+Expected: FAIL — fields not yet escaped.
+
+- [ ] **Step 8.3: Update existing alerter test that asserts raw signal name**
+
+Edit `tests/test_alerter.py:46`. Change:
+
+```python
+    assert "vol_liq_ratio" in msg
+```
+
+to:
+
+```python
+    assert r"vol\_liq\_ratio" in msg
+```
+
+This existing test ran fine pre-fix (signal name interpolated raw); post-fix it must assert the escaped form.
+
+- [ ] **Step 8.4: Apply fix in format_alert_message**
+
+Edit `scout/alerter.py:15-72`. Apply `_escape_md` to each user-data interpolation. Final form of the function:
+
+```python
+def format_alert_message(token: CandidateToken, signals: list[str]) -> str:
+    """Format a candidate token into a human-readable alert message."""
+    lines: list[str] = []
+
+    lines.append("⚠️ WARNING: RESEARCH ONLY - Not financial advice")
+    lines.append("")
+    lines.append(
+        f"*{_escape_md(token.token_name)}* "
+        f"({_escape_md(token.ticker)}) — {_escape_md(token.chain)}"
+    )
+    lines.append(f"Market Cap: ${token.market_cap_usd:,.0f}")
+    lines.append("")
+
+    # Conviction breakdown
+    conviction_display = (
+        f"{token.conviction_score:.1f}" if token.conviction_score is not None else "N/A"
+    )
+    quant_display = str(token.quant_score) if token.quant_score is not None else "N/A"
+    narrative_display = (
+        str(token.narrative_score) if token.narrative_score is not None else "N/A"
+    )
+
+    lines.append(f"Conviction Score: {conviction_display}")
+    lines.append(f"  Quant: {quant_display}")
+    if token.narrative_score is not None:
+        lines.append(f"  Narrative: {narrative_display}")
+
+    # Signals — each signal_type contains underscores; escape per-element
+    lines.append("")
+    lines.append("Signals: " + ", ".join(_escape_md(s) for s in signals))
+
+    # Virality
+    if token.virality_class is not None:
+        lines.append(f"Virality: {_escape_md(token.virality_class)}")
+
+    # Narrative summary — LLM-generated, can contain any markdown chars
+    if token.mirofish_report is not None:
+        lines.append(f"Narrative: {_escape_md(token.mirofish_report)}")
+
+    # CoinGecko signal flags
+    cg_flags = []
+    if "momentum_ratio" in signals:
+        cg_flags.append("Momentum: 1h gain accelerating vs 24h")
+    if "vol_acceleration" in signals:
+        cg_flags.append("Volume Spike: current vol >> 7d average")
+    if "cg_trending_rank" in signals:
+        cg_flags.append(f"CG Trending: rank #{token.cg_trending_rank or '?'}")
+    if cg_flags:
+        lines.append("")
+        lines.append("CoinGecko Signals:")
+        for flag in cg_flags:
+            lines.append(f"  {flag}")
+
+    # Source link — CoinGecko tokens use CG URL, others use DEXScreener.
+    # contract_address is escaped because it appears in a URL path; while
+    # URLs typically don't have markdown chars, hex addresses can include
+    # underscores in some chains.
+    lines.append("")
+    if token.chain == "coingecko":
+        lines.append(f"https://www.coingecko.com/en/coins/{token.contract_address}")
+    else:
+        lines.append(f"https://dexscreener.com/{token.chain}/{token.contract_address}")
+
+    return "\n".join(lines)
+```
+
+Note: `send_alert` at line 189-220 keeps its hardcoded `"parse_mode": "Markdown"` at line 209 unchanged. The fix is purely on the body, not the parse_mode.
+
+- [ ] **Step 8.5: Run new + existing alerter tests**
+
+Run: `uv run pytest tests/test_parse_mode_hygiene.py tests/test_alerter.py -v`
+Expected: PASS.
+
+- [ ] **Step 8.6: Commit**
+
+```bash
+git add scout/alerter.py tests/test_alerter.py tests/test_parse_mode_hygiene.py
+git commit -m "fix(alerter): escape user-data fields in format_alert_message (BL-NEW-PARSE-MODE-AUDIT site #7, plan-review discovery)"
+```
+
+---
+
+## Task 9: Final-pass full test suite + lint
+
+- [ ] **Step 9.1: Run full test suite**
 
 Run: `uv run pytest --tb=short -q`
 Expected: All tests pass, no regressions introduced.
 
-- [ ] **Step 8.2: Format**
+- [ ] **Step 9.2: Format**
 
 Run: `uv run black scout/ tests/`
-Expected: No-op or only formatting touch on the 6 files above.
+Expected: No-op or only formatting touch on the modified files.
 
-- [ ] **Step 8.3: If formatter changed anything, commit**
+- [ ] **Step 9.3: If formatter changed anything, commit**
 
 ```bash
 git add -u
@@ -658,9 +851,9 @@ git commit -m "style: black formatting after parse-mode-hygiene fixes" || echo "
 
 ---
 
-## Task 9: Update lessons + carry-forward
+## Task 10: Update lessons + carry-forward
 
-- [ ] **Step 9.1: Append entry to `tasks/lessons.md`**
+- [ ] **Step 10.1: Append entry to `tasks/lessons.md`**
 
 Add at end of `tasks/lessons.md`:
 
@@ -676,7 +869,7 @@ Add at end of `tasks/lessons.md`:
 **Default:** when in doubt, choose `parse_mode=None`. Markdown is only worth keeping when the formatting is operator-visible and load-bearing (e.g., velocity alerts with clickable chart links).
 ```
 
-- [ ] **Step 9.2: Commit**
+- [ ] **Step 10.2: Commit**
 
 ```bash
 git add tasks/lessons.md
@@ -687,9 +880,10 @@ git commit -m "docs(lessons): parse-mode hygiene Class-3 rule (CLAUDE.md §12b e
 
 ## Out-of-scope follow-ups (filed for separate PRs)
 
-1. **HIGH POTENTIAL re-evaluation (3 sites in `scout/main.py`):** observe production logs for 7 days post-deploy; if any mangled alerts appear, fix those sites in a follow-up PR.
-2. **`scout/narrative/digest.py:format_daily_digest`:** interpolates `r.get('symbol')` and `c.get('key')` raw. Not in audit's HIGH ACTUAL list; audit may have missed it. Worth a separate dispatcher-side review to confirm whether the daily-digest dispatch path was already fixed.
-3. **CLAUDE.md §12b scope expansion:** the rule currently scopes parse_mode discipline to auto-suspend-style write-time alerts; the audit (and this PR) demonstrate that the same Markdown-mangling failure mode applies to all `send_telegram_message` call sites with user-data interpolation. Promote in the dedicated rule-promotion session.
+1. **HIGH POTENTIAL re-evaluation (3 sites in `scout/main.py`):** observe production logs for 7 days post-deploy; if any mangled alerts appear, fix those sites in a follow-up PR. Plan-review reviewer A flagged `scout/main.py:434` (counter-arg) as a HIGH ACTUAL candidate; the underlying ticker+LLM-output Markdown-special-char risk is real but matches the audit's HIGH POTENTIAL classification — deferred per audit policy. (Reviewer A's bracket-as-link-anchor reasoning was incorrect: Telegram MarkdownV1 requires `[label](url)` adjacency, not bare `[HIGH]`.)
+2. **`scout/narrative/digest.py:format_daily_digest`:** plan review confirmed zero callers in `scout/`. Dead-path. Carry-forward: delete if it stays unused at next sweep, or wire-and-fix if a caller reappears.
+3. **Audit-methodology gap (THIS PR's discovery):** the audit grepped `send_telegram_message` only and missed `send_alert` at `scout/alerter.py:189` — a separate function with its own hardcoded `parse_mode=Markdown` `session.post` call. Carry-forward: a follow-up audit should grep ALL `parse_mode` occurrences in `scout/` (not just `send_telegram_message` callers) AND ALL direct `session.post(...sendMessage...)` patterns. Filed for the next audit cycle.
+4. **CLAUDE.md §12b scope expansion:** the rule currently scopes parse_mode discipline to auto-suspend-style write-time alerts; the audit (and this PR) demonstrate that the same Markdown-mangling failure mode applies to ALL Telegram-send paths with user-data interpolation, including `send_alert`. Promote in the dedicated rule-promotion session.
 
 ## Rollback plan
 
