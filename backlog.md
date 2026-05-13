@@ -550,7 +550,17 @@ Without Q2's answer, the 4-week dashboard verdict still leaves the operator with
 **Estimate:** ~3-4 hours weekly digest + cron + tests.
 
 ### BL-NEW-HPF-RE-EVALUATION: re-evaluate `PAPER_HIGH_PEAK_FADE_DRY_RUN` flip decision at n≥20
-**Status:** PROPOSED — surfaced 2026-05-13 at the D+7 review of PR #79 (BL-NEW-AUTOSUSPEND-FIX). HPF dry-run produced n=7 would-fires by 2026-05-13; pre-registered criterion was ambiguous and aggregate counter-factual was -$45 vs actuals, so the flip is deferred rather than acted on.
+**Status:** ACTIVE — D+7 review closed 2026-05-13T04:05Z (audit row id=25, `signal_params_audit.field_name='soak_verdict'`, value `dry_run_continued`). HPF dry-run produced n=7 would-fires by 2026-05-13; pre-registered criterion was ambiguous and aggregate counter-factual was −$45 vs actuals, so the flip is deferred rather than acted on. Continue accumulating toward n≥20.
+
+**2026-05-13 closure — subset finding (structural, §9c lever-vs-data-path):**
+
+Per-trade pattern is sharper than the aggregate:
+- HPF beats `moonshot_trail` 3/3 (1699 +$81, 1765 +$81, 1815 +$76 → **+$238 total**) — moonshot floor (`PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT=30`) lets trades give back more than HPF's 60% retrace.
+- HPF loses to existing `peak_fade` 3/4 (1811 −$185, 1638 −$87, 1836 −$44; 1791 +$31 → **−$285 net**) — existing `peak_fade` exits later and captures more upside.
+
+HPF's 60% peak threshold fires *rarely* (7 over 7d vs ~64 actual `peak_fade` exits in the same window). The lever HPF appears to be ("fade high peaks earlier") is only meaningful for the **moonshot_trail subset** — overlapping with the parked high-peak-giveback finding (`project_session_2026_05_05_high_peak_park.md`). Turning HPF on globally would clip the profitable `peak_fade` exits short.
+
+**Refined criterion-scope (added 2026-05-13):** the next n≥20 eval should be **stratified by actual exit reason**, not aggregate. Specifically: compute the counterfactual delta separately for the `moonshot_trail`-actual subset vs the `peak_fade`-actual subset. If the moonshot_trail subset is consistently positive at n≥10 within it, consider a *targeted* flip — e.g., only arm HPF when peak ≥ moonshot threshold — rather than the binary global flip the locked criteria below currently model.
 **Tag:** `paper-trading` `high-peak-fade` `dry-run-extension` `heavy-tail-truncation`
 **Why:** HPF dry-run was activated 2026-05-06T02:18Z on `gainers_early` + `losers_contrarian` per parent BL-NEW-AUTOSUSPEND-FIX. The pre-registered flip criterion ("If gate would have fired earlier AND counter-factual PnL is positive, flip `PAPER_HIGH_PEAK_FADE_DRY_RUN=False`") was ambiguous in practice — per-trade PnL positive on all 7 fires (would say flip), but aggregate USD vs actual exits was -$45/-4.0% (would say don't flip). The 3 trades where HPF capped heavy-tail winners (1811 -$185, 1638 -$87, 1836 -$44) are exactly the asymmetric-truncation risk that n=7 cannot resolve. Deferring to n≥20 (or +14d) reduces the sampling-noise interpretation.
 
