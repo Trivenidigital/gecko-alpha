@@ -355,6 +355,7 @@ async def apply_diffs(
                 f"calibration applied:\n{summary}",
                 session,
                 settings,
+                parse_mode=None,
             )
 
         await conn.commit()

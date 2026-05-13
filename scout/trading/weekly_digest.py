@@ -332,7 +332,9 @@ async def send_weekly_digest(db: Database, settings: Settings) -> None:
                 return
 
             for chunk in chunks:
-                await alerter.send_telegram_message(chunk, session, settings)
+                await alerter.send_telegram_message(
+                    chunk, session, settings, parse_mode=None
+                )
             log.info("weekly_digest_sent", bytes=len(text))
         except Exception as e:
             log.exception("weekly_digest_failed", corr=corr)
@@ -341,6 +343,7 @@ async def send_weekly_digest(db: Database, settings: Settings) -> None:
                     f"Weekly digest failed: {type(e).__name__} [ref={corr}]. Check logs.",
                     session,
                     settings,
+                    parse_mode=None,
                 )
             except Exception:
                 log.exception("weekly_digest_fallback_dispatch_error", corr=corr)
