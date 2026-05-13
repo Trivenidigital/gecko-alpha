@@ -380,3 +380,92 @@ def test_format_alert_message_url_path_not_escaped(token_factory):
     assert "https://www.coingecko.com/en/coins/some_id" in msg, (
         "contract_address in CoinGecko URL must NOT be escaped"
     )
+
+
+# ---------------------------------------------------------------------
+# Wire-level integration tests (both primitives)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_with_parse_mode_none_omits_parse_mode_from_payload(
+    settings_factory,
+):
+    """Wire-level: when parse_mode=None is passed to send_telegram_message,
+    the JSON payload posted to Telegram does NOT include a parse_mode field
+    (per scout/alerter.py:143-144). Layer 4 pin behind Layer 2 source-pins
+    for sites #1-5.
+    """
+    import aiohttp
+    from aioresponses import aioresponses
+
+    from scout.alerter import send_telegram_message
+
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-token",
+        TELEGRAM_CHAT_ID="test-chat",
+    )
+    captured_payload: dict = {}
+
+    async def _callback(url, **kwargs):
+        captured_payload.update(kwargs.get("json", {}))
+
+    with aioresponses() as m:
+        m.post(
+            "https://api.telegram.org/bottest-token/sendMessage",
+            payload={"ok": True},
+            callback=_callback,
+        )
+        async with aiohttp.ClientSession() as session:
+            await send_telegram_message(
+                "gainers_early alert: AS_ROID up 50%",
+                session,
+                settings,
+                parse_mode=None,
+            )
+
+    assert "parse_mode" not in captured_payload, (
+        "parse_mode=None caller must NOT set the parse_mode JSON field"
+    )
+    assert captured_payload["text"] == "gainers_early alert: AS_ROID up 50%"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_with_parse_mode_markdown_sends_escaped_payload(
+    settings_factory,
+):
+    """Wire-level: when parse_mode='Markdown' is passed and the caller has
+    already _escape_md-ed user-data fields, the payload carries the escaped
+    form AND parse_mode=Markdown. Layer 4 pin for sites #6, #7.
+    """
+    import aiohttp
+    from aioresponses import aioresponses
+
+    from scout.alerter import _escape_md, send_telegram_message
+
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-token",
+        TELEGRAM_CHAT_ID="test-chat",
+    )
+    captured_payload: dict = {}
+
+    async def _callback(url, **kwargs):
+        captured_payload.update(kwargs.get("json", {}))
+
+    with aioresponses() as m:
+        m.post(
+            "https://api.telegram.org/bottest-token/sendMessage",
+            payload={"ok": True},
+            callback=_callback,
+        )
+        async with aiohttp.ClientSession() as session:
+            body = f"*{_escape_md('AS_ROID')}* alert"
+            await send_telegram_message(body, session, settings)
+
+    assert captured_payload["parse_mode"] == "Markdown"
+    assert "AS\\_ROID" in captured_payload["text"], (
+        "user-data field must be wire-level escaped"
+    )
+    assert "*AS\\_ROID*" in captured_payload["text"], (
+        "intentional Markdown bold must reach the wire"
+    )
