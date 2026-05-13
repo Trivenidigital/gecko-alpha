@@ -50,47 +50,128 @@ def _find_dispatch_calls(tree: ast.AST) -> list[ast.Call]:
     return calls
 
 
-def _find_direct_telegram_post_calls(tree: ast.AST) -> list[ast.Call]:
-    """Find every `*.post(...)` call whose first string-literal arg
-    contains '/sendMessage' (i.e., direct Telegram API hits that bypass
-    scout.alerter.send_telegram_message).
+def _resolve_string_literal(
+    expr: ast.AST, name_map: dict[str, ast.AST]
+) -> str | None:
+    """Best-effort resolution of `expr` to its static-string content.
+    Follows Name -> assigned-value through `name_map`. Returns None if
+    the expression is not statically resolvable.
+    """
+    seen: set[int] = set()
+    while True:
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return expr.value
+        if isinstance(expr, ast.JoinedStr):
+            return "".join(
+                seg.value
+                for seg in expr.values
+                if isinstance(seg, ast.Constant) and isinstance(seg.value, str)
+            )
+        if isinstance(expr, ast.Name) and expr.id in name_map:
+            if id(expr) in seen:
+                return None
+            seen.add(id(expr))
+            expr = name_map[expr.id]
+            continue
+        return None
 
-    This second AST arm exists because the original audit grepped
-    `send_telegram_message` and missed `scout/alerter.py:189 send_alert`,
-    which does its own session.post call. The mechanical enforcement
-    of the audit-methodology lesson lives here.
+
+def _resolve_dict(
+    expr: ast.AST, name_map: dict[str, ast.AST]
+) -> ast.Dict | None:
+    """Resolve `expr` to an ast.Dict, following Name through name_map."""
+    seen: set[int] = set()
+    while True:
+        if isinstance(expr, ast.Dict):
+            return expr
+        if isinstance(expr, ast.Name) and expr.id in name_map:
+            if id(expr) in seen:
+                return None
+            seen.add(id(expr))
+            expr = name_map[expr.id]
+            continue
+        return None
+
+
+def _build_name_map(
+    body: list[ast.stmt],
+) -> dict[str, ast.AST]:
+    """Build a {name: value} map from Assign statements in `body`.
+    Only handles simple `name = expr` forms (Name target); skips tuples,
+    attribute targets, augmented assignments, etc.
+    """
+    name_map: dict[str, ast.AST] = {}
+    for stmt in ast.walk(ast.Module(body=body, type_ignores=[])):
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    name_map[target.id] = stmt.value
+        elif isinstance(stmt, ast.AnnAssign):
+            if isinstance(stmt.target, ast.Name) and stmt.value is not None:
+                name_map[stmt.target.id] = stmt.value
+    return name_map
+
+
+def _find_direct_telegram_post_calls(tree: ast.AST) -> list[ast.Call]:
+    """Find every `*.post(...)` call whose URL arg statically resolves to
+    a string containing '/sendMessage'. Resolves variables through their
+    enclosing-function assignments so that the canonical pattern
+    `telegram_url = f"...sendMessage"; session.post(telegram_url, ...)`
+    is caught -- this is the pattern that the original audit missed at
+    scout/alerter.py:189 (send_alert).
     """
     calls: list[ast.Call] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+    # Walk every function (sync + async); within each, build a name map
+    # and resolve session.post URL args through it.
+    for func_node in ast.walk(tree):
+        if not isinstance(func_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        func = node.func
-        if not isinstance(func, ast.Attribute):
-            continue
-        if func.attr != "post":
-            continue
-        # Look for /sendMessage in any positional string-literal arg OR
-        # any keyword "url" value
-        sources: list[ast.AST] = list(node.args)
-        for kw in node.keywords:
-            if kw.arg == "url":
-                sources.append(kw.value)
-        for src in sources:
-            literal = None
-            if isinstance(src, ast.Constant) and isinstance(src.value, str):
-                literal = src.value
-            elif isinstance(src, ast.JoinedStr):
-                # f-string: concatenate static literal parts
-                literal = "".join(
-                    seg.value
-                    for seg in src.values
-                    if isinstance(seg, ast.Constant)
-                    and isinstance(seg.value, str)
-                )
-            if literal and "/sendMessage" in literal:
-                calls.append(node)
-                break
+        name_map = _build_name_map(func_node.body)
+        for call in ast.walk(func_node):
+            if not isinstance(call, ast.Call):
+                continue
+            cfunc = call.func
+            if not isinstance(cfunc, ast.Attribute) or cfunc.attr != "post":
+                continue
+            # URL is positional[0] OR url= kwarg
+            url_expr: ast.AST | None = None
+            if call.args:
+                url_expr = call.args[0]
+            for kw in call.keywords:
+                if kw.arg == "url":
+                    url_expr = kw.value
+                    break
+            if url_expr is None:
+                continue
+            url_str = _resolve_string_literal(url_expr, name_map)
+            if url_str and "/sendMessage" in url_str:
+                calls.append(call)
     return calls
+
+
+def _direct_post_has_parse_mode(
+    call: ast.Call, name_map: dict[str, ast.AST]
+) -> bool:
+    """Return True if a session.post(...) call carries parse_mode either
+    as a direct kwarg or inside its `json=`/`data=` dict (resolved through
+    name_map). Note: name_map must come from the SAME function scope as
+    the call.
+    """
+    payload_expr: ast.AST | None = None
+    for kw in call.keywords:
+        if kw.arg == "parse_mode":
+            return True
+        if kw.arg in ("json", "data"):
+            payload_expr = kw.value
+    if payload_expr is None:
+        return False
+    payload_dict = _resolve_dict(payload_expr, name_map)
+    if payload_dict is None:
+        return False
+    for k in payload_dict.keys:
+        if isinstance(k, ast.Constant) and k.value == "parse_mode":
+            return True
+    return False
 
 
 # Allowlist of currently-known sites that DO NOT explicitly pin parse_mode.
@@ -155,34 +236,47 @@ def test_all_dispatch_sites_pin_parse_mode():
                 f"without parse_mode= kwarg (and not allowlisted)"
             )
         # Second arm: direct session.post(...) hits to Telegram
-        # /sendMessage. The body must contain a parse_mode field if it
-        # intends Markdown rendering; if absent, the dispatch is
-        # plain-text (Telegram default) and safe. The arm here ensures
-        # the audit-methodology lesson is mechanically enforced.
-        for call in _find_direct_telegram_post_calls(tree):
-            site = (rel_path, call.lineno)
-            if site in _ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE:
+        # /sendMessage. The body must contain parse_mode if it intends
+        # Markdown rendering; if absent, the dispatch is plain-text
+        # (Telegram default) and safe. Resolver-aware: follows variable
+        # assignments through the enclosing function scope so the
+        # canonical pattern `payload = {...}; session.post(url, json=payload)`
+        # is caught -- this is the pattern the original audit missed at
+        # scout/alerter.py:189.
+        for func_node in ast.walk(tree):
+            if not isinstance(
+                func_node, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
                 continue
-            # Look for parse_mode either as a kwarg of .post or as a
-            # "parse_mode" key in a dict-literal passed positionally
-            # or as the `json=` kwarg.
-            payload_has_parse_mode = False
-            payload_sources: list[ast.AST] = list(call.args)
-            for kw in call.keywords:
-                if kw.arg == "parse_mode":
-                    payload_has_parse_mode = True
-                    break
-                if kw.arg in ("json", "data") and isinstance(kw.value, ast.Dict):
-                    payload_sources.append(kw.value)
-            for src in payload_sources:
-                if isinstance(src, ast.Dict):
-                    for k in src.keys:
-                        if isinstance(k, ast.Constant) and k.value == "parse_mode":
-                            payload_has_parse_mode = True
-                            break
-                if payload_has_parse_mode:
-                    break
-            if not payload_has_parse_mode:
+            name_map = _build_name_map(func_node.body)
+            for call in ast.walk(func_node):
+                if not isinstance(call, ast.Call):
+                    continue
+                cfunc = call.func
+                if (
+                    not isinstance(cfunc, ast.Attribute)
+                    or cfunc.attr != "post"
+                ):
+                    continue
+                # Resolve URL arg
+                url_expr: ast.AST | None = None
+                if call.args:
+                    url_expr = call.args[0]
+                for kw in call.keywords:
+                    if kw.arg == "url":
+                        url_expr = kw.value
+                        break
+                if url_expr is None:
+                    continue
+                url_str = _resolve_string_literal(url_expr, name_map)
+                if not (url_str and "/sendMessage" in url_str):
+                    continue
+                # Telegram dispatch -- check allowlist + parse_mode resolution
+                site = (rel_path, call.lineno)
+                if site in _ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE:
+                    continue
+                if _direct_post_has_parse_mode(call, name_map):
+                    continue
                 offenders.append(
                     f"{rel_path}:{call.lineno} direct session.post(.../sendMessage) "
                     f"without parse_mode in payload (and not allowlisted)"
