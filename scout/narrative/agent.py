@@ -713,7 +713,7 @@ async def narrative_agent_loop(
                         if digest_text:
                             try:
                                 await send_telegram_message(
-                                    digest_text, session, settings
+                                    digest_text, session, settings, parse_mode=None
                                 )
                             except Exception:
                                 logger.exception("trading_digest_send_error")

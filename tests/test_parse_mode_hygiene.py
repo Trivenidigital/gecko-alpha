@@ -158,3 +158,23 @@ def test_narrative_agent_alert_call_passes_parse_mode_none():
     tail = source[idx : idx + 600]
     assert "send_telegram_message(" in tail
     assert "parse_mode=None" in tail
+
+
+
+# ---------------------------------------------------------------------
+# Site #2: paper trading daily digest
+# ---------------------------------------------------------------------
+
+
+def test_paper_digest_call_passes_parse_mode_none():
+    """Site #2: scout/narrative/agent.py:715 dispatches paper digest with
+    parse_mode=None. Body interpolates best_symbol/worst_symbol AND per-
+    signal_type keys; every signal_type has underscores.
+    """
+    import scout.narrative.agent as agent
+
+    source = inspect.getsource(agent)
+    idx = source.index("build_paper_digest")
+    tail = source[idx : idx + 800]
+    assert "send_telegram_message(" in tail
+    assert "parse_mode=None" in tail
