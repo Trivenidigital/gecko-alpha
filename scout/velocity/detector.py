@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 import aiohttp
 import structlog
 
+from scout.alerter import _escape_md
+
 if TYPE_CHECKING:
     from scout.config import Settings
     from scout.db import Database
@@ -165,8 +167,6 @@ def format_velocity_alert(detections: list[dict]) -> str:
     requires literal characters inside [label](url) link targets. See
     CLAUDE.md §12b for the parse-mode hygiene rule.
     """
-    from scout.alerter import _escape_md
-
     lines: list[str] = ["*Velocity Alerts* (1h pump)"]
     for det in detections:
         ch_1h = det.get("price_change_1h") or 0.0

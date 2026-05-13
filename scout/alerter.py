@@ -74,12 +74,16 @@ def format_alert_message(token: CandidateToken, signals: list[str]) -> str:
         for flag in cg_flags:
             lines.append(f"  {flag}")
 
-    # Source link — CoinGecko tokens use CG URL, others use DEXScreener
+    # Source link -- use [chart](url) link syntax so MarkdownV1 does NOT
+    # parse special chars inside the URL string. contract_address may
+    # contain `_`, `*`, etc. and bare URL emission with parse_mode=Markdown
+    # would silently mangle the link. Reviewer-2 fold on PR #111.
     lines.append("")
     if token.chain == "coingecko":
-        lines.append(f"https://www.coingecko.com/en/coins/{token.contract_address}")
+        url = f"https://www.coingecko.com/en/coins/{token.contract_address}"
     else:
-        lines.append(f"https://dexscreener.com/{token.chain}/{token.contract_address}")
+        url = f"https://dexscreener.com/{token.chain}/{token.contract_address}"
+    lines.append(f"[chart]({url})")
 
     return "\n".join(lines)
 

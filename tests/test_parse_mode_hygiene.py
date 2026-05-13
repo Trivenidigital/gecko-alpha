@@ -18,26 +18,6 @@ import pytest
 
 
 # ---------------------------------------------------------------------
-# Helper: capture the payload that scout.alerter.send_telegram_message
-# would post to Telegram (used by per-site source-pin tests).
-# ---------------------------------------------------------------------
-
-
-def _capture_send(monkeypatch):
-    """Patch scout.alerter.send_telegram_message to capture call args.
-
-    Returns a list appended-to on each call. Each entry: {text, parse_mode}.
-    """
-    captured: list[dict] = []
-
-    async def fake_send(text, session, settings, *, parse_mode="Markdown"):
-        captured.append({"text": text, "parse_mode": parse_mode})
-
-    monkeypatch.setattr("scout.alerter.send_telegram_message", fake_send)
-    return captured
-
-
-# ---------------------------------------------------------------------
 # AST structural coverage — Layer 3
 # ---------------------------------------------------------------------
 
@@ -67,6 +47,49 @@ def _find_dispatch_calls(tree: ast.AST) -> list[ast.Call]:
             name = func.id
         if name == "send_telegram_message":
             calls.append(node)
+    return calls
+
+
+def _find_direct_telegram_post_calls(tree: ast.AST) -> list[ast.Call]:
+    """Find every `*.post(...)` call whose first string-literal arg
+    contains '/sendMessage' (i.e., direct Telegram API hits that bypass
+    scout.alerter.send_telegram_message).
+
+    This second AST arm exists because the original audit grepped
+    `send_telegram_message` and missed `scout/alerter.py:189 send_alert`,
+    which does its own session.post call. The mechanical enforcement
+    of the audit-methodology lesson lives here.
+    """
+    calls: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        if func.attr != "post":
+            continue
+        # Look for /sendMessage in any positional string-literal arg OR
+        # any keyword "url" value
+        sources: list[ast.AST] = list(node.args)
+        for kw in node.keywords:
+            if kw.arg == "url":
+                sources.append(kw.value)
+        for src in sources:
+            literal = None
+            if isinstance(src, ast.Constant) and isinstance(src.value, str):
+                literal = src.value
+            elif isinstance(src, ast.JoinedStr):
+                # f-string: concatenate static literal parts
+                literal = "".join(
+                    seg.value
+                    for seg in src.values
+                    if isinstance(seg, ast.Constant)
+                    and isinstance(seg.value, str)
+                )
+            if literal and "/sendMessage" in literal:
+                calls.append(node)
+                break
     return calls
 
 
@@ -131,8 +154,41 @@ def test_all_dispatch_sites_pin_parse_mode():
                 f"{rel_path}:{call.lineno} send_telegram_message() "
                 f"without parse_mode= kwarg (and not allowlisted)"
             )
+        # Second arm: direct session.post(...) hits to Telegram
+        # /sendMessage. The body must contain a parse_mode field if it
+        # intends Markdown rendering; if absent, the dispatch is
+        # plain-text (Telegram default) and safe. The arm here ensures
+        # the audit-methodology lesson is mechanically enforced.
+        for call in _find_direct_telegram_post_calls(tree):
+            site = (rel_path, call.lineno)
+            if site in _ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE:
+                continue
+            # Look for parse_mode either as a kwarg of .post or as a
+            # "parse_mode" key in a dict-literal passed positionally
+            # or as the `json=` kwarg.
+            payload_has_parse_mode = False
+            payload_sources: list[ast.AST] = list(call.args)
+            for kw in call.keywords:
+                if kw.arg == "parse_mode":
+                    payload_has_parse_mode = True
+                    break
+                if kw.arg in ("json", "data") and isinstance(kw.value, ast.Dict):
+                    payload_sources.append(kw.value)
+            for src in payload_sources:
+                if isinstance(src, ast.Dict):
+                    for k in src.keys:
+                        if isinstance(k, ast.Constant) and k.value == "parse_mode":
+                            payload_has_parse_mode = True
+                            break
+                if payload_has_parse_mode:
+                    break
+            if not payload_has_parse_mode:
+                offenders.append(
+                    f"{rel_path}:{call.lineno} direct session.post(.../sendMessage) "
+                    f"without parse_mode in payload (and not allowlisted)"
+                )
     assert not offenders, (
-        "send_telegram_message dispatch sites missing parse_mode kwarg "
+        "Telegram dispatch sites missing parse_mode "
         "(see BL-NEW-PARSE-MODE-AUDIT + CLAUDE.md §12b):\n  "
         + "\n  ".join(offenders)
     )
@@ -367,8 +423,8 @@ def test_format_alert_message_url_path_not_escaped(token_factory):
         mirofish_report="x",
     )
     msg = format_alert_message(token, ["vol_liq_ratio"])
-    assert "https://dexscreener.com/solana/0xabc_def" in msg, (
-        "contract_address in URL path must NOT be escaped"
+    assert "[chart](https://dexscreener.com/solana/0xabc_def)" in msg, (
+        "URL emitted as [chart](url) link with raw contract_address inside parens"
     )
     assert "0xabc\\_def" not in msg, "contract_address must NOT be escaped"
 
@@ -383,8 +439,8 @@ def test_format_alert_message_url_path_not_escaped(token_factory):
         mirofish_report="x",
     )
     msg = format_alert_message(token, ["vol_liq_ratio"])
-    assert "https://www.coingecko.com/en/coins/some_id" in msg, (
-        "contract_address in CoinGecko URL must NOT be escaped"
+    assert "[chart](https://www.coingecko.com/en/coins/some_id)" in msg, (
+        "CoinGecko URL emitted as [chart](url) link with raw contract_address inside parens"
     )
 
 
@@ -474,4 +530,69 @@ async def test_dispatch_with_parse_mode_markdown_sends_escaped_payload(
     )
     assert "*AS\\_ROID*" in captured_payload["text"], (
         "intentional Markdown bold must reach the wire"
+    )
+
+
+# ---------------------------------------------------------------------
+# End-to-end wire-level send_alert test (Reviewer 1 C6)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_alert_wire_level_escapes_user_data(
+    token_factory, settings_factory,
+):
+    """Site #7 end-to-end: send_alert -> format_alert_message ->
+    session.post(.../sendMessage). The full path. Body composer escapes
+    user-data fields, dispatch keeps parse_mode='Markdown'. Pins the
+    primary candidate-alert path that the original audit missed.
+    """
+    import aiohttp
+    from aioresponses import aioresponses
+
+    from scout.alerter import send_alert
+
+    token = token_factory(
+        contract_address="0xabc_def",
+        chain="solana_test",
+        token_name="AS_ROID",
+        ticker="AS_RD",
+        market_cap_usd=75000,
+        quant_score=80,
+        narrative_score=75,
+        conviction_score=78,
+        virality_class="High",
+        mirofish_report="Has under_score text",
+    )
+    signals = ["vol_liq_ratio", "momentum_ratio"]
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-token",
+        TELEGRAM_CHAT_ID="test-chat",
+        DISCORD_WEBHOOK_URL="",
+    )
+    captured: dict = {}
+
+    async def _callback(url, **kwargs):
+        captured.update(kwargs.get("json", {}))
+
+    with aioresponses() as m:
+        m.post(
+            "https://api.telegram.org/bottest-token/sendMessage",
+            payload={"ok": True},
+            callback=_callback,
+        )
+        async with aiohttp.ClientSession() as session:
+            await send_alert(token, signals, session, settings)
+
+    assert captured.get("parse_mode") == "Markdown"
+    body = captured["text"]
+    assert "AS\\_ROID" in body, "token_name escaped at wire"
+    assert "AS\\_RD" in body, "ticker escaped at wire"
+    assert "solana\\_test" in body, "chain escaped at wire"
+    assert "vol\\_liq\\_ratio" in body, "signal name escaped at wire"
+    assert "momentum\\_ratio" in body, "signal name escaped at wire"
+    assert "under\\_score" in body, "mirofish_report escaped at wire"
+    assert "*AS\\_ROID*" in body, "intentional bold preserved at wire"
+    assert "[chart](https://dexscreener.com/solana_test/0xabc_def)" in body, (
+        "URL emitted as [chart](url) link with raw contract_address"
     )
