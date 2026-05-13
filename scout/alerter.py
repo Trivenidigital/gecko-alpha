@@ -140,6 +140,7 @@ async def send_telegram_message(
     settings: Settings,
     *,
     parse_mode: str | None = "Markdown",
+    raise_on_failure: bool = False,
 ) -> None:
     """Send a Telegram message.
 
@@ -165,8 +166,14 @@ async def send_telegram_message(
                 logger.warning(
                     "Telegram daily summary failed", status=resp.status, body=body[:200]
                 )
+                if raise_on_failure:
+                    raise RuntimeError(
+                        f"telegram send failed status={resp.status} body={body[:200]}"
+                    )
     except Exception as e:
         logger.warning("Telegram daily summary error", error=str(e))
+        if raise_on_failure:
+            raise
 
 
 TELEGRAM_MAX_LENGTH = 4096

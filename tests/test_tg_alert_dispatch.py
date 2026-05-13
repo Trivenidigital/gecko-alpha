@@ -239,7 +239,7 @@ async def test_notify_writes_sent_row_on_success(tmp_path, monkeypatch):
     await _insert_paper_trade(db, trade_id=42)
     sent = []
 
-    async def _fake_send(text, session, settings, parse_mode=None):
+    async def _fake_send(text, session, settings, parse_mode=None, **kwargs):
         sent.append((text, parse_mode))
 
     monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
@@ -339,7 +339,7 @@ async def test_notify_concurrent_only_one_sent(tmp_path, monkeypatch):
     for tid in (1, 2, 3):
         await _insert_paper_trade(db, trade_id=tid)
 
-    async def _fake_send(text, session, settings, parse_mode=None):
+    async def _fake_send(text, session, settings, parse_mode=None, **kwargs):
         await asyncio.sleep(0.01)  # simulate I/O so race window opens
 
     monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
@@ -449,7 +449,7 @@ async def test_notify_includes_minara_command_for_solana_token(tmp_path, monkeyp
     await _insert_paper_trade(db, trade_id=42)
     sent = []
 
-    async def _fake_send(text, session, settings, parse_mode=None):
+    async def _fake_send(text, session, settings, parse_mode=None, **kwargs):
         sent.append(text)
 
     monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
@@ -475,6 +475,63 @@ async def test_notify_includes_minara_command_for_solana_token(tmp_path, monkeyp
     )
     assert len(sent) == 1
     assert f"Run: minara swap --from USDC --to {_SPL}" in sent[0]
+    cur = await db._conn.execute(
+        "SELECT paper_trade_id, signal_type, coin_id, chain, command_text_observed "
+        "FROM minara_alert_emissions"
+    )
+    row = await cur.fetchone()
+    assert row["paper_trade_id"] == 42
+    assert row["signal_type"] == "gainers_early"
+    assert row["coin_id"] == "bonk"
+    assert row["chain"] == "solana"
+    assert row["command_text_observed"] == 1
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_notify_passes_minara_persistence_context(tmp_path, monkeypatch):
+    """BL-NEW-MINARA-DB-PERSISTENCE: TG pre-claim id becomes Minara audit context."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings()
+    await _insert_paper_trade(db, trade_id=42)
+    calls = []
+
+    async def _fake_send(text, session, settings, parse_mode=None, **kwargs):
+        pass
+
+    async def _fake_minara(*args, **kwargs):
+        return "minara swap --from USDC --to ABC --amount-usd 10"
+
+    async def _fake_persist(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _fake_minara)
+    monkeypatch.setattr(
+        "scout.trading.minara_alert.persist_minara_alert_emission",
+        _fake_persist,
+    )
+
+    await notify_paper_trade_opened(
+        db,
+        settings,
+        session=object(),
+        paper_trade_id=42,
+        signal_type="gainers_early",
+        token_id="bonk",
+        symbol="BONK",
+        entry_price=0.0001,
+        amount_usd=10.0,
+        signal_data={"price_change_24h": 50.0, "mcap": 2_000_000},
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["db"] is db
+    assert calls[0]["paper_trade_id"] == 42
+    assert calls[0]["signal_type"] == "gainers_early"
+    assert calls[0]["tg_alert_log_id"] is not None
+    assert calls[0]["command_text"].startswith("minara swap")
     await db.close()
 
 
@@ -487,7 +544,7 @@ async def test_notify_no_minara_command_for_evm_only_token(tmp_path, monkeypatch
     await _insert_paper_trade(db, trade_id=42)
     sent = []
 
-    async def _fake_send(text, session, settings, parse_mode=None):
+    async def _fake_send(text, session, settings, parse_mode=None, **kwargs):
         sent.append(text)
 
     monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
@@ -561,4 +618,146 @@ async def test_notify_demotes_sent_row_on_cancelled_error_during_minara_lookup(
     outcome, detail = await cur.fetchone()
     assert outcome == "dispatch_failed"
     assert "cancel" in (detail or "").lower()
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_notify_demotes_sent_row_on_cancelled_error_during_telegram_send(
+    tmp_path, monkeypatch
+):
+    """Cancellation during Telegram send must not leave pre-claimed row as sent."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _prepared_minara(*args, **kwargs):
+        return "minara swap --from USDC --to ABC --amount-usd 10"
+
+    async def _cancel_send(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        "scout.trading.minara_alert.maybe_minara_command", _prepared_minara
+    )
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _cancel_send)
+
+    with pytest.raises(asyncio.CancelledError):
+        await notify_paper_trade_opened(
+            db,
+            settings,
+            session=object(),
+            paper_trade_id=42,
+            signal_type="gainers_early",
+            token_id="bonk",
+            symbol="BONK",
+            entry_price=0.0001,
+            amount_usd=10.0,
+            signal_data={"price_change_24h": 50.0, "mcap": 2_000_000},
+        )
+
+    cur = await db._conn.execute(
+        "SELECT outcome, detail FROM tg_alert_log "
+        "WHERE token_id='bonk' ORDER BY id DESC LIMIT 1"
+    )
+    outcome, detail = await cur.fetchone()
+    assert outcome == "dispatch_failed"
+    assert "telegram" in (detail or "").lower()
+    cur = await db._conn.execute("SELECT COUNT(*) FROM minara_alert_emissions")
+    assert (await cur.fetchone())[0] == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_notify_does_not_persist_minara_when_telegram_send_reports_failure(
+    tmp_path, monkeypatch
+):
+    """Swallowed Telegram failures must be promoted to dispatch_failed here."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _prepared_minara(*args, **kwargs):
+        return "minara swap --from USDC --to ABC --amount-usd 10"
+
+    async def _failed_send(*args, **kwargs):
+        assert kwargs["raise_on_failure"] is True
+        raise RuntimeError("telegram send failed status=500")
+
+    monkeypatch.setattr(
+        "scout.trading.minara_alert.maybe_minara_command", _prepared_minara
+    )
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _failed_send)
+
+    await notify_paper_trade_opened(
+        db,
+        settings,
+        session=object(),
+        paper_trade_id=42,
+        signal_type="gainers_early",
+        token_id="bonk",
+        symbol="BONK",
+        entry_price=0.0001,
+        amount_usd=10.0,
+        signal_data={"price_change_24h": 50.0, "mcap": 2_000_000},
+    )
+
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE token_id='bonk'"
+    )
+    assert (await cur.fetchone())[0] == "dispatch_failed"
+    cur = await db._conn.execute("SELECT COUNT(*) FROM minara_alert_emissions")
+    assert (await cur.fetchone())[0] == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_notify_does_not_demote_if_persistence_cancelled_after_send(
+    tmp_path, monkeypatch
+):
+    """After Telegram send returns, persistence cancellation must not clear cooldown."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _prepared_minara(*args, **kwargs):
+        return "minara swap --from USDC --to ABC --amount-usd 10"
+
+    async def _send_ok(*args, **kwargs):
+        assert kwargs["raise_on_failure"] is True
+
+    async def _persist_cancelled(**kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        "scout.trading.minara_alert.maybe_minara_command", _prepared_minara
+    )
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _send_ok)
+    monkeypatch.setattr(
+        "scout.trading.minara_alert.persist_minara_alert_emission",
+        _persist_cancelled,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await notify_paper_trade_opened(
+            db,
+            settings,
+            session=object(),
+            paper_trade_id=42,
+            signal_type="gainers_early",
+            token_id="bonk",
+            symbol="BONK",
+            entry_price=0.0001,
+            amount_usd=10.0,
+            signal_data={"price_change_24h": 50.0, "mcap": 2_000_000},
+        )
+
+    cur = await db._conn.execute(
+        "SELECT outcome, detail FROM tg_alert_log WHERE token_id='bonk'"
+    )
+    outcome, detail = await cur.fetchone()
+    assert outcome == "sent"
+    assert detail is None
     await db.close()

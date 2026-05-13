@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
+from structlog.testing import capture_logs
 
 from scout.config import Settings
-from scout.trading.minara_alert import maybe_minara_command
+from scout.trading.minara_alert import (
+    maybe_minara_command,
+    persist_minara_alert_emission,
+)
 
 _REQUIRED = {
     "TELEGRAM_BOT_TOKEN": "x",
@@ -16,6 +22,25 @@ _REQUIRED = {
 
 def _settings(**overrides) -> Settings:
     return Settings(_env_file=None, **{**_REQUIRED, **overrides})
+
+
+class _FakeEmissionDb:
+    def __init__(self):
+        self.calls = []
+
+    async def record_minara_alert_emission(self, **kwargs):
+        self.calls.append(kwargs)
+        return True
+
+
+class _FailingEmissionDb:
+    async def record_minara_alert_emission(self, **kwargs):
+        raise RuntimeError("db nope")
+
+
+class _TimeoutEmissionDb:
+    async def record_minara_alert_emission(self, **kwargs):
+        raise asyncio.TimeoutError()
 
 
 @pytest.mark.asyncio
@@ -38,6 +63,67 @@ async def test_returns_command_for_solana_token(monkeypatch):
     assert "USDC" in cmd
     assert "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263" in cmd
     assert "--amount-usd 10" in cmd
+
+
+@pytest.mark.asyncio
+async def test_persists_emission_when_db_context_supplied(monkeypatch):
+    fake_db = _FakeEmissionDb()
+    cmd = "minara swap --from USDC --to DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263 --amount-usd 10"
+    await persist_minara_alert_emission(
+        coin_id="bonk",
+        db=fake_db,
+        paper_trade_id=42,
+        signal_type="gainers_early",
+        tg_alert_log_id=99,
+        chain="solana",
+        amount_usd=10,
+        command_text=cmd,
+    )
+    assert fake_db.calls == [
+        {
+            "paper_trade_id": 42,
+            "tg_alert_log_id": 99,
+            "signal_type": "gainers_early",
+            "coin_id": "bonk",
+            "chain": "solana",
+            "amount_usd": 10,
+            "command_text": cmd,
+            "source_event_id": "tg_alert_log:99",
+            "lock_timeout_sec": 0.25,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_persistence_failure_returns_command_and_logs(monkeypatch):
+    with capture_logs() as logs:
+        await persist_minara_alert_emission(
+            coin_id="bonk",
+            db=_FailingEmissionDb(),
+            paper_trade_id=42,
+            signal_type="gainers_early",
+            tg_alert_log_id=99,
+            chain="solana",
+            amount_usd=10,
+            command_text="minara swap --from USDC --to ABC --amount-usd 10",
+        )
+    assert any(e["event"] == "minara_alert_emission_persist_failed" for e in logs)
+
+
+@pytest.mark.asyncio
+async def test_persistence_timeout_returns_command_and_logs(monkeypatch):
+    with capture_logs() as logs:
+        await persist_minara_alert_emission(
+            coin_id="bonk",
+            db=_TimeoutEmissionDb(),
+            paper_trade_id=42,
+            signal_type="gainers_early",
+            tg_alert_log_id=99,
+            chain="solana",
+            amount_usd=10,
+            command_text="minara swap --from USDC --to ABC --amount-usd 10",
+        )
+    assert any(e["event"] == "minara_alert_emission_persist_timeout" for e in logs)
 
 
 @pytest.mark.asyncio
