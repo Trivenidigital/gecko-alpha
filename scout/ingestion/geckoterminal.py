@@ -11,7 +11,62 @@ from scout.models import CandidateToken
 logger = structlog.get_logger()
 
 GECKO_BASE = "https://api.geckoterminal.com/api/v2"
+MAX_ATTEMPTS = 3
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
+
+
+async def _get_json(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    chain: str,
+    max_attempts: int = MAX_ATTEMPTS,
+) -> list | dict | None:
+    """GET GeckoTerminal JSON with bounded retries on HTTP 429 / 5xx."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
+                if resp.status == 429 or resp.status >= 500:
+                    if attempt < max_attempts:
+                        wait = 2 ** (attempt - 1)
+                        logger.warning(
+                            "geckoterminal_retrying",
+                            chain=chain,
+                            url=url,
+                            status=resp.status,
+                            wait=wait,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    logger.warning(
+                        "geckoterminal_retries_exhausted",
+                        chain=chain,
+                        url=url,
+                        status=resp.status,
+                        max_attempts=max_attempts,
+                    )
+                    return None
+                if resp.status != 200:
+                    logger.warning(
+                        "geckoterminal_non_retryable_status",
+                        chain=chain,
+                        url=url,
+                        status=resp.status,
+                    )
+                    return None
+                return await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning(
+                "geckoterminal_request_error",
+                chain=chain,
+                url=url,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return None
+    return None
 
 
 async def fetch_trending_pools(
@@ -22,16 +77,8 @@ async def fetch_trending_pools(
 
     for chain in settings.CHAINS:
         url = f"{GECKO_BASE}/networks/{chain}/trending_pools"
-        try:
-            async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
-                if resp.status != 200:
-                    logger.warning(
-                        "GeckoTerminal returned error", chain=chain, status=resp.status
-                    )
-                    continue
-                data = await resp.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning("GeckoTerminal request error", chain=chain, error=str(e))
+        data = await _get_json(session, url, chain=chain)
+        if not isinstance(data, dict):
             continue
 
         # NB: GT returns trending_pools in rank order; idx 0 = most-traded.

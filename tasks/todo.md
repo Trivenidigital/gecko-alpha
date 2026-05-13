@@ -2,28 +2,25 @@
 
 Last updated: 2026-05-09 (autonomous build: BL-NEW-QUOTE-PAIR plan + design + impl + tests; PR pending)
 
-## Active Work: BL-NEW-MINARA-DB-PERSISTENCE
+## Active Work: BL-NEW-GT-429-HANDLER
 
-- [x] Isolated worktree created: `C:\projects\gecko-alpha-minara-db-persistence` on `codex/minara-db-persistence`
-- [x] Drift check: no existing `minara_alert_emissions` table; current event is log-only in `scout/trading/minara_alert.py`
-- [x] Hermes-first check: no installed VPS/public Hermes skill covers project-specific Minara telemetry persistence
-- [x] Baseline relevant tests: `uv run --extra dev pytest tests/test_minara_alert.py tests/test_tg_alert_dispatch.py -q` -> 38 passed
-- [x] Plan drafted: `tasks/plan_bl_new_minara_db_persistence.md`
+- [x] Isolated worktree created: `C:\projects\gecko-alpha-gt-429-handler` on `codex/gt-429-handler`
+- [x] Drift check: GeckoTerminal lacks 429/5xx retry; DexScreener has the in-tree retry pattern to reuse
+- [x] Hermes-first check: no installed VPS/public Hermes skill covers GeckoTerminal aiohttp ingestion retry
+- [x] Baseline relevant tests: `tests/test_geckoterminal.py tests/test_dexscreener.py` -> 8 passed using pre-provisioned project venv
+- [x] Plan drafted: `tasks/plan_bl_new_gt_429_handler.md`
 - [x] Plan review by two parallel reviewers
 - [x] Fold plan-review findings
-- [x] Design drafted: `tasks/design_bl_new_minara_db_persistence.md`
+- [x] Design drafted: `tasks/design_bl_new_gt_429_handler.md`
 - [x] Design review by two parallel reviewers (one completed with findings; second timed out and was closed)
 - [x] Fold design-review findings
 - [x] TDD build
-- [x] PR-review fix: plain INSERT only masks duplicate unique-key conflicts, not CHECK/NOT NULL/FK violations
-- [x] PR-review fix: cancellation during Telegram send demotes preclaimed `tg_alert_log` row
-- [x] PR-review fix: Minara persistence parity watchdog added for sparse-table SLO
-- [x] PR-review fix: deployment notes require offline migration/backfill window bounded by stop timestamp
-- [x] PR-review fix: durable Minara emission persistence moved after Telegram delivery succeeds
-- [x] PR-review fix: watchdog fails closed on journalctl errors, matches by source_event_id, and ships systemd timer
-- [x] PR-review fix: migration ignores stale markers, asserts constraints/FK/defaults, and rolls back on cancellation
-- [x] PR creation: https://github.com/Trivenidigital/gecko-alpha/pull/112
-- [ ] Three-reviewer PR pass
+- [x] PR-review fix: convert legacy 500 test into explicit 5xx exhaustion coverage
+- [x] PR-review fix: add multi-chain continuation after retry exhaustion
+- [x] PR-review fix: assert structured fields on exhaustion telemetry
+- [x] Targeted verification rerun: `tests/test_geckoterminal.py tests/test_geckoterminal_rank.py tests/test_dexscreener.py tests/test_coingecko.py` -> 28 passed
+- [x] PR creation: https://github.com/Trivenidigital/gecko-alpha/pull/115
+- [x] Three-reviewer PR pass (two completed; operational/Hermes reviewer timed out and was closed)
 - [ ] Merge and deploy
 
 ## BL-NEW-QUOTE-PAIR soak (post-deploy)

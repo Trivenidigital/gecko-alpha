@@ -759,8 +759,8 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 **decision-by:** 2 weeks (per design v2 §4 Borderline urgency mapping).
 
 ### BL-NEW-GT-429-HANDLER
-**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B3b (defect; `geckoterminal.py:27-29` has no 429/5xx handler vs DexScreener's `dexscreener.py:32-37`).
-**Action:** add 429/5xx handler matching DexScreener's pattern.
+**Status:** IMPLEMENTED-PENDING-PR 2026-05-13 — `codex/gt-429-handler` adds bounded GeckoTerminal HTTP 429/5xx retry with stable structured logs. Transport errors remain single-attempt fail-soft to avoid broadening cycle-latency blast radius. Tests cover 429 recovery, 503 recovery, 429 exhaustion, 404 no-retry, and transport-error no-retry.
+**Action:** add 429/5xx handler matching DexScreener's HTTP-status retry pattern.
 **decision-by:** 2 weeks.
 
 ### BL-NEW-GT-ETH-ENDPOINT-404
