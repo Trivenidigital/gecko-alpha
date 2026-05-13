@@ -2,6 +2,16 @@
 
 # BL-NEW-CYCLE-CHANGE-AUDIT — Design (v2, folded design-review)
 
+## 0. Hermes-first analysis
+
+| Domain | Hermes skill found? | Decision |
+|---|---|---|
+| Config-change-impact / assumption-validity audits | none found | Project-internal; same shape as the silent-failure audit (`findings_silent_failure_audit_2026_05_11.md`) which was bespoke. |
+| Time-based-assumption verification | none found | Same. |
+| Cycle-frequency math drift analysis | none found | No external skill covers "verify design-doc rate math against current cycle frequency." |
+
+Awesome-hermes-agent ecosystem check: no skill for config-drift-against-design audits. Verdict: project-internal audit, no Hermes opportunity. (Carried from `plan_cycle_change_audit.md` Hermes-first analysis section per project plan/design convention.)
+
 ## 1. The reframe (load-bearing)
 
 The backlog filing for `BL-NEW-CYCLE-CHANGE-AUDIT` (`backlog.md:326`) framed this as: "`SCAN_INTERVAL_SECONDS` decreased from 300s to 60s — audit what design-time math broke." Verified via `git log --all -S "SCAN_INTERVAL_SECONDS" -- scout/config.py`: the only commit touching that line is `bbf6810` (the initial coinpump-scout scaffold import, 2026-03-20), where the value was already `60`. **gecko-alpha has never had a 300s cycle.**

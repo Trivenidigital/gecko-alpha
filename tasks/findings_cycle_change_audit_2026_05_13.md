@@ -23,30 +23,38 @@ The actual failure pattern (BL-053 is the canonical instance): **inherited desig
 
 ## 0.5 Cross-audit index
 
+(Aligned with detailed verdicts in §1 and backlog stubs after 3-reviewer fold round.)
+
 | Tier | Module / Setting | Verdict | Quick-win? | Severity |
 |---|---|---|---|---|
-| B | scout/ingestion/coingecko.py | Watch | — | Medium |
-| B | scout/ingestion/dexscreener.py | Phantom-fragile | — | Low |
-| B | scout/ingestion/geckoterminal.py | Borderline + side-finding | — | Medium |
-| B | scout/safety.py (GoPlus) | Phantom-fragile | — | Low |
-| B | scout/ingestion/holder_enricher.py (Helius) | **Broken** | — | High |
-| B | scout/ingestion/holder_enricher.py (Moralis) | **Borderline** | — | Medium |
-| B | scout/news/cryptopanic.py | Closed-by-§2.2 + composed-finding | — | Low (gated) |
-| B | scout/counter/detail.py | Phantom | — | — |
-| B | scout/briefing/collector.py | Decoupled (Tier D shape) | — | — |
-| B | scout/mirofish/client.py | Phantom-fragile | — | Low |
-| B | scout/main.py `_safe_counter_followup` (Anthropic) | **Unfalsifiable** | — | Medium |
+| B1 | scout/ingestion/coingecko.py | **Borderline** (1.30× headroom; recomputed) | — | Medium |
+| B2 | scout/ingestion/dexscreener.py | Phantom-fragile | — | Low |
+| B3a | scout/ingestion/geckoterminal.py (rate posture) | **Unfalsifiable** (no documented constraint) | — | Medium |
+| B3b | scout/ingestion/geckoterminal.py:27-29 (missing 429 handler) | **Defect** | — | Medium |
+| B3-side | GeckoTerminal ethereum 404 (~40/hr) | Out-of-scope side-finding | Yes | Medium |
+| B4 | scout/safety.py (GoPlus) | Phantom-fragile | — | Low |
+| B5 | scout/ingestion/holder_enricher.py (Helius) | **Broken-if-free / Phantom-if-paid** (conditional, plan-tier pending) | — | High |
+| B6 | scout/ingestion/holder_enricher.py (Moralis) | **Broken-if-legacy-free / Phantom-if-CU** (25× over-cap math; conditional) | — | High |
+| B7 | scout/news/cryptopanic.py | Closed-by-§2.2 + composed-finding (Borderline if reactivated) | — | Low (gated) |
+| B8 | scout/counter/detail.py | Phantom | — | — |
+| B9 | scout/briefing/collector.py | Decoupled (Tier D shape) | — | — |
+| B10 | scout/mirofish/client.py | Phantom-fragile | — | Low |
+| B11 | scout/main.py `_safe_counter_followup` (Anthropic) | **Phantom-by-current-numbers / Unfalsifiable-by-policy** (~$0.06/day baseline) | — | Medium |
+| B13 | scout/ingestion/held_position_prices.py | Phantom (batched, single call/cycle) | — | Low |
+| B14 | scout/main.py `check_outcomes` (DexScreener per unchecked alert) | Phantom-fragile (low volume + hourly gate) | — | Low |
 | C | scout/velocity/detector.py | Phantom | — | — |
 | C | scout/spikes/detector.py | Phantom | — | — |
 | C | scout/main.py:1463 (peak-price) | Phantom | — | — |
-| C2 | holder_snapshots (writer not producing) | Cross-ref §2.5 | — | — |
-| C2 | score_history (~17,325 rows/hr) | **Unfalsifiable** — no SLO | — | Medium |
-| C2 | volume_snapshots (~17,281 rows/hr) | **Unfalsifiable** — no SLO | — | Medium |
-| C2 | safe_emit chain events | **Unfalsifiable** — no SLO | — | Low |
+| C2-score | score_history (~17,325 rows/hr) | **Unfalsifiable** — no SLO | — | Medium |
+| C2-volume | volume_snapshots (~17,281 rows/hr) | **Unfalsifiable** — no SLO | — | Medium |
+| C2-holder | holder_snapshots (writer not producing) | Cross-ref §2.5 | — | — |
+| C2-safe-emit | safe_emit chain events | **Unfalsifiable** — no SLO | — | Low |
+| C2-candidates | candidates table (`db.upsert_candidate`) | **Unfalsifiable** — no SLO | — | Medium |
+| C2-cache_prices | price_cache bulk upsert | Phantom | — | — |
 | D | narrative / secondwave / chains / trading / TG-social / perp / lunarcrush / briefing | Decoupled (safe) | — | — |
-| E | 6 design docs with cycle math | Mixed (see §3) | — | — |
-| F | VELOCITY_DEDUP_HOURS / LUNARCRUSH_DEDUP_HOURS / SLOW_BURN_DEDUP_DAYS / SECONDWAVE_DEDUP_DAYS / FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN / PAPER_STARTUP_WARMUP_SECONDS / CACHE_TTL_SECONDS | **Unfalsifiable** — no era documented | Yes (doc-add) | Low (per setting) |
-| Side | GeckoTerminal ethereum 404 (~40/hr) | Out-of-scope finding | Yes | Medium |
+| E | 11 design docs with cycle math (expanded from 6 per PR-review fold) | Mixed (see §3) | — | — |
+| F | VELOCITY_DEDUP_HOURS / LUNARCRUSH_DEDUP_HOURS / SLOW_BURN_DEDUP_DAYS / SECONDWAVE_DEDUP_DAYS / FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN / PAPER_STARTUP_WARMUP_SECONDS / CACHE_TTL_SECONDS | **Unfalsifiable** — no era documented | Shipped (7 code comments in this PR) | Low (per setting) |
+| Non-ext | Telegram per-chat (13+ dispatch sites) | **Phantom-fragile** (burst frequency unmeasured; reclassified) | — | Medium |
 
 ## 0.6 Quick wins (≤30-min fixes)
 
@@ -279,11 +287,11 @@ Each non-Phantom row needs a backlog filing with `decision-by` trigger:
 
 | Finding | Carry-forward filing | decision-by |
 |---|---|---|
-| B1 | `BL-NEW-CG-RATE-LIMITER-BURST-PROFILE` — investigate `cg_429_backoff` burst pattern; consider lowering `COINGECKO_RATE_LIMIT_PER_MIN` or adding jitter | next deploy or 90d sunset |
+| B1 | `BL-NEW-CG-RATE-LIMITER-BURST-PROFILE` — investigate `cg_429_backoff` burst pattern; consider lowering `COINGECKO_RATE_LIMIT_PER_MIN` or adding jitter | 2 weeks (Borderline urgency per design v2 §4) |
 | B3 | `BL-NEW-GT-429-HANDLER` — add 429/5xx handler to `geckoterminal.py` matching DexScreener's pattern | 2 weeks |
 | B3 side | `BL-NEW-GT-ETH-ENDPOINT-404` — investigate ethereum chain 404 (~40/hr) | 4 weeks |
 | B5 | `BL-NEW-HELIUS-PLAN-AUDIT` — confirm prod Helius plan tier; throttle enrichment if free | 1 week |
-| B6 | `BL-NEW-MORALIS-PLAN-AUDIT` — same shape for Moralis | 2 weeks |
+| B6 | `BL-NEW-MORALIS-PLAN-AUDIT` — same shape for Moralis | 1 week (Broken-if-free severity per design v2 §4) |
 | B7 | (Already in BL-053's 5-point activation checklist — no new filing) | gated by BL-053 reactivation |
 | B11 | `BL-NEW-ANTHROPIC-SPEND-TARGET` — operator target elicitation + add `ANTHROPIC_DAILY_SPEND_SOFT_CAP_USD` setting | 2 weeks (operator decision) |
 | C2-score | `BL-NEW-SCORE-HISTORY-WATCHDOG-SLO` + `BL-NEW-SCORE-HISTORY-PRUNING` | 2 weeks (filing); multi-week (impl, gated on §12a daemon) |
