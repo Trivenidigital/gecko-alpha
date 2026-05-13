@@ -281,6 +281,17 @@ class Settings(BaseSettings):
     # different signals within the window only alerts once.
     TG_ALERT_PER_TOKEN_COOLDOWN_HOURS: int = 6
 
+    # BL-NEW-NARRATIVE-SCANNER: Hermes-driven narrative pump scanner (V1).
+    # Hermes (main-vps) emits structured events to gecko-alpha via HMAC-authed
+    # HTTPS. Feature gated off when secret is empty (endpoints respond 503).
+    # See tasks/design_crypto_narrative_scanner.md for full design.
+    NARRATIVE_SCANNER_HMAC_SECRET: str = ""
+    # Replay-protection window: reject requests where |now - timestamp| exceeds this.
+    NARRATIVE_SCANNER_REPLAY_WINDOW_SEC: int = 300
+    # Rate limit per HMAC secret. Vector A FC-3 fold: HMAC-keyed not IP-keyed
+    # (both VPSes may share egress NAT).
+    NARRATIVE_SCANNER_RATE_LIMIT_PER_MIN: int = 100
+
     # BL-NEW-M1.5C: Minara DEX-eligibility alert extension (Phase 0 Option A).
     # When a TG paper-trade-open alert is about to fire for a Solana-listed
     # token, append a `minara swap` shell command to the alert body for

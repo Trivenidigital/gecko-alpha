@@ -102,6 +102,7 @@ class Database:
         await self._migrate_bl_slow_burn_v1()
         await self._migrate_tg_alert_eligible_v1()
         await self._migrate_tg_alert_log_m1_5c_outcome()
+        await self._migrate_narrative_scanner_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -3327,6 +3328,87 @@ class Database:
             _log.info(
                 "tg_alert_log_m1_5c_outcome_migration_complete",
                 m1_5b_sentinel_preserved=m1_5b_present,
+            )
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    async def _migrate_narrative_scanner_v1(self) -> None:
+        """BL-NEW-NARRATIVE-SCANNER (V1): create narrative_alerts_inbound table.
+
+        Receives events emitted by the Hermes-based crypto narrative scanner
+        on main-vps via HMAC-authed HTTPS. Append-only; one row per
+        Hermes-computed event_id. See tasks/design_crypto_narrative_scanner.md
+        for full design + idempotency semantics + per-column rationale.
+
+        Schema version 20260518. Idempotent via paper_migrations sentinel.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
+            )
+
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_narrative_scanner_v1",),
+            )
+            if (await cur.fetchone()) is not None:
+                await conn.commit()
+                return
+
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS narrative_alerts_inbound (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    tweet_id TEXT NOT NULL,
+                    tweet_author TEXT NOT NULL,
+                    tweet_ts TEXT NOT NULL,
+                    tweet_text TEXT NOT NULL,
+                    tweet_text_hash TEXT NOT NULL,
+                    extracted_cashtag TEXT,
+                    extracted_ca TEXT,
+                    extracted_chain TEXT,
+                    resolved_coin_id TEXT,
+                    narrative_theme TEXT,
+                    urgency_signal TEXT,
+                    classifier_confidence REAL,
+                    classifier_version TEXT NOT NULL,
+                    received_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )"""
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_narrative_inbound_received "
+                "ON narrative_alerts_inbound(received_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_narrative_inbound_resolved "
+                "ON narrative_alerts_inbound(resolved_coin_id) "
+                "WHERE resolved_coin_id IS NOT NULL"
+            )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_narrative_scanner_v1", now_iso),
+            )
+            await conn.commit()
+            _log.info(
+                "narrative_scanner_v1_migration_complete",
+                action="created",
+                table="narrative_alerts_inbound",
             )
         except Exception:
             try:

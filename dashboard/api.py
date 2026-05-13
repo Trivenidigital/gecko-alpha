@@ -69,6 +69,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(title="Gecko-Alpha Dashboard")
 
+    # BL-NEW-NARRATIVE-SCANNER (V1): mount narrative router for cross-VPS
+    # Hermes integration. Endpoints are HMAC-gated; respond 503 when
+    # NARRATIVE_SCANNER_HMAC_SECRET is empty (feature off by default).
+    # See scout/api/narrative.py + tasks/design_crypto_narrative_scanner.md.
+    if _DASHBOARD_SETTINGS is not None:
+        from scout.api.narrative import create_router as _create_narrative_router
+
+        app.include_router(_create_narrative_router(_db_path, _DASHBOARD_SETTINGS))
+
     # --- REST endpoints ---
 
     @app.get("/api/candidates", response_model=list[CandidateResponse])
