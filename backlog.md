@@ -708,6 +708,43 @@ ssh root@89.167.116.187 "journalctl -u gecko-pipeline --since '<post-merge times
 **Acceptance:** With the fallback shipped, every open paper_trade has a `price_cache` row that's < N minutes old regardless of whether the underlying token has a CG listing.
 **Estimate:** 2-4 hours including DexScreener client wiring + tests.
 
+### BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE: wire push-notification for narrative_alert_dispatcher 503 misconfig (Path C1)
+**Status:** PROPOSED 2026-05-13 — filed alongside narrative-scanner V1.1 dispatcher ship. Replaces V1.1's Path B (log-only) 503 alert semantics with active push delivery.
+**Tag:** `narrative-scanner` `path-c1` `operator-alert` `post-activation` `evidence-gated`
+
+**Why deferred:** V1.1 dispatcher emits a structured `narrative_dispatcher_misconfig` journalctl log on 503 (Path B). Operator-side discovery via `journalctl -g 'narrative_dispatcher_misconfig'`. This is sufficient for V1 because the 503 path only fires on a one-shot misconfig (operator forgot to set `NARRATIVE_SCANNER_HMAC_SECRET`) — discovery latency = "operator next runs journalctl" ≈ minutes to hours, acceptable for a should-not-recur condition.
+
+**Hermes-first basis for the deferred decision (2026-05-13):** Focused check across installed VPS skills under `/home/gecko-agent/.hermes/skills/` + public Hermes docs hub found no Telegram / Slack / Discord / outbound-webhook / operator-alert primitives. `webhook-subscriptions` confirmed INBOUND-only. gecko-agent's `~/.hermes/.env` lacks TG credentials. Path A (use existing primitive) is closed. Path C1 below is the next-best option but requires real new work, not 5-minute wire-up.
+
+**Scope (Path C1 wire-up):**
+- New `scout/api/internal_alert.py` with `POST /api/internal/operator-alert` endpoint on gecko-alpha
+- Reuse existing `NARRATIVE_SCANNER_HMAC_SECRET` for auth (no new credential setup)
+- HMAC scheme identical to `narrative.py` (same canonical-string format, same replay LRU)
+- Endpoint calls `scout.alerter.send_telegram_message(parse_mode=None, ...)` — per §2.9 parse-mode hygiene
+- Update dispatcher SKILL.md on srilu: replace `narrative_dispatcher_misconfig` log-only with the triplet pattern (`alert_dispatched` + `alert_delivered` + `alert_failed`) per CLAUDE.md §12b
+- Tests: HMAC fixed-vector + parse_mode integration test + delivery-failure path
+
+**Trigger condition (evidence-gated, NOT calendar-gated):** Path C1 wire-up fires only when narrative_scanner has produced **≥10 narrative_alerts_inbound rows** since activation. The 10-row threshold is the floor at which "the system is actually running" stops being conjectural and becomes empirical. If activation produces zero rows for 30 days due to unrelated bugs, Path C1 does NOT fire — that's correct because operator-alert work isn't load-bearing if the system isn't generating events to alert about.
+
+**Verification query (run periodically post-activation):**
+```sql
+SELECT COUNT(*) FROM narrative_alerts_inbound;
+-- Trigger Path C1 when this returns ≥ 10
+```
+
+**Kill criterion:** If narrative_scanner is deprecated or replaced before reaching 10 rows in `narrative_alerts_inbound`, this entry closes as obsolete without action. Prevents indefinite-open backlog drift if V1 doesn't pan out.
+
+**References:**
+- Deployed Path B SKILL.md: `/home/gecko-agent/.hermes/skills/narrative_alert_dispatcher/SKILL.md` on srilu-vps
+- Design doc 503 behavior: `tasks/design_crypto_narrative_scanner.md:89` (V1.1 update + BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE reference inline)
+- CLAUDE.md §12b: automated state-reversal alerts must emit `*_dispatched` + `*_delivered` log triplet
+- §2.9 parse-mode hygiene: signal-name strings to `send_telegram_message` require `parse_mode=None`
+
+**Drift verdict:** NET-NEW. No existing primitive covers cross-host operator-alert delivery with HMAC auth.
+**Hermes verdict:** ✅ Hermes-first check done 2026-05-13 — none of 687 skill-hub entries cover Telegram/Slack/Discord/email/webhook-out from a Hermes skill. Wiring into gecko-alpha's existing `scout.alerter` is the cheapest correct path.
+
+**Estimate:** ~30-60 min code (new endpoint mirroring narrative.py pattern) + ~30 min tests + review cycle.
+
 ---
 
 ## P2 — BL-064 follow-ups (TG social signals deployed 2026-04-27)
