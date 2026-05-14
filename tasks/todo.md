@@ -4,6 +4,7 @@ Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvemen
 
 ## Active Work: 2026-05-14 gecko-alpha improvement run
 
+- [x] Follow-up - BL-NEW-INGEST-WATCHDOG implemented on `codex/ingest-watchdog`. Drift check found no existing per-source starvation state. Hermes-first found `webhook-subscriptions` notification-adjacent only; custom in-process detector justified while reusing `scout.alerter.send_telegram_message(parse_mode=None)`. Design captured in `tasks/design_ingest_watchdog.md`; focused suite 85 passed.
 - [x] Item 1 - PR #119 merged: Hermes crypto-skill tracking + backlog rescope landed as `acf4b8e`. CI on PR #119 failed on unrelated baseline tests (8 failures across BL064 reload, calibration scheduler, heartbeat mcap, narrative token-id, signal-param revival); docs-only diff was merged with that caveat recorded in merge message.
 - [x] Item 2 - BL-NEW-HERMES-FIRST-DEBT-AUDIT findings drafted in `tasks/findings_hermes_first_debt_audit_2026_05.md`.
 - [x] Item 2 - backlog updated: BL-NEW-HERMES-FIRST-DEBT-AUDIT marked SHIPPED with priority follow-ups.

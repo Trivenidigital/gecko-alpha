@@ -12,6 +12,7 @@ from scout.ingestion.coingecko import (
     fetch_trending,
     fetch_by_volume,
     fetch_midcap_gainers,
+    get_last_watchdog_samples,
     _reset_midcap_scan_cycle_counter_for_tests,
 )
 from scout.ratelimit import coingecko_limiter
@@ -485,6 +486,11 @@ async def test_fetch_midcap_gainers_filters_rank_band_and_sorts(settings_factory
         "playnance-like",
         "safebit-like",
     ]
+    samples = get_last_watchdog_samples()
+    assert samples[-1].source == "coingecko:midcap"
+    assert samples[-1].expected is True
+    assert samples[-1].raw_count == 4
+    assert samples[-1].usable_count == 2
 
 
 @pytest.mark.asyncio
@@ -576,6 +582,30 @@ async def test_fetch_midcap_gainers_off_cadence_clears_raw_cache(settings_factor
     assert tokens == []
     assert cg_module.last_raw_midcap_gainers == []
     assert len(mocked.requests) == 0
+    samples = get_last_watchdog_samples()
+    assert samples[-1].source == "coingecko:midcap"
+    assert samples[-1].expected is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_top_movers_watchdog_uses_raw_count_not_candidate_count(
+    settings_factory,
+):
+    """Healthy raw fetch with zero usable candidates must not look starved."""
+    settings = settings_factory(MIN_MARKET_CAP=999_999_999)
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, payload=COINS_MARKETS_RESPONSE)
+        mocked.get(MARKETS_PATTERN, payload=[])
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_top_movers(session, settings)
+
+    assert tokens == []
+    sample = next(
+        s for s in get_last_watchdog_samples() if s.source == "coingecko:markets"
+    )
+    assert sample.source == "coingecko:markets"
+    assert sample.raw_count == len(COINS_MARKETS_RESPONSE)
+    assert sample.usable_count == 0
 
 
 @pytest.mark.asyncio

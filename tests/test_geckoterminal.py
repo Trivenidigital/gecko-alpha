@@ -7,7 +7,7 @@ from structlog.testing import capture_logs
 from yarl import URL
 
 import scout.ingestion.geckoterminal as geckoterminal
-from scout.ingestion.geckoterminal import fetch_trending_pools
+from scout.ingestion.geckoterminal import fetch_trending_pools, get_last_watchdog_samples
 
 
 @pytest.fixture
@@ -65,6 +65,11 @@ async def test_fetch_trending_pools_multiple_chains(mock_aiohttp, settings_facto
         tokens = await fetch_trending_pools(session, settings)
 
     assert len(tokens) == 1
+    samples = {sample.source: sample for sample in get_last_watchdog_samples()}
+    assert samples["geckoterminal:solana"].raw_count == 1
+    assert samples["geckoterminal:solana"].usable_count == 1
+    assert samples["geckoterminal:eth"].raw_count == 0
+    assert samples["geckoterminal:eth"].usable_count == 0
 
 
 async def test_fetch_trending_pools_filters_market_cap(mock_aiohttp, settings_factory):
@@ -100,6 +105,10 @@ async def test_fetch_trending_pools_exhausts_5xx_retries(
             tokens = await fetch_trending_pools(session, settings)
 
     assert tokens == []
+    samples = get_last_watchdog_samples()
+    assert samples[-1].source == "geckoterminal:solana"
+    assert samples[-1].raw_count == 0
+    assert samples[-1].error == "http_500"
     assert _request_count(mock_aiohttp, url) == 3
     assert geckoterminal_sleep_spy == [1, 2]
     assert logs[-1] == {

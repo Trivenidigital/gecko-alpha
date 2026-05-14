@@ -10,6 +10,7 @@ null/0 but current_price was positive. Surfaces the silent-rejection
 rate at the mcap=0 floor that caused the RIV (riv-coin) miss.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import structlog
@@ -29,6 +30,31 @@ _heartbeat_stats: dict = {
     "slow_burn_coins_skipped_total": 0,
     "last_heartbeat_at": None,
 }
+
+_ingest_watchdog_state: dict[str, dict] = {}
+
+
+@dataclass(frozen=True)
+class IngestSourceSample:
+    """One ingestion-source health sample for the current pipeline cycle."""
+
+    source: str
+    raw_count: int
+    usable_count: int | None = None
+    expected: bool = True
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class IngestWatchdogEvent:
+    """State transition emitted by the ingestion watchdog."""
+
+    kind: str
+    source: str
+    consecutive_empty_cycles: int
+    threshold: int
+    last_success_at: str | None
+    error: str | None = None
 
 
 def _reset_heartbeat_stats() -> None:
@@ -50,6 +76,82 @@ def _reset_heartbeat_stats() -> None:
         slow_burn_coins_skipped_total=0,
         last_heartbeat_at=None,
     )
+    _ingest_watchdog_state.clear()
+
+
+def observe_ingest_sources(
+    samples: list[IngestSourceSample],
+    settings,
+    *,
+    now: datetime | None = None,
+) -> list[IngestWatchdogEvent]:
+    """Update per-source starvation state and return transition events."""
+    if getattr(settings, "INGEST_WATCHDOG_ENABLED", True) is False:
+        return []
+
+    try:
+        threshold = int(getattr(settings, "INGEST_STARVATION_THRESHOLD_CYCLES", 5))
+    except (TypeError, ValueError):
+        threshold = 5
+    threshold = max(1, threshold)
+    observed_at = now or datetime.now(timezone.utc)
+    events: list[IngestWatchdogEvent] = []
+
+    for sample in samples:
+        if not sample.expected:
+            continue
+
+        state = _ingest_watchdog_state.setdefault(
+            sample.source,
+            {"consecutive_empty": 0, "alerted": False, "last_success_at": None},
+        )
+
+        if sample.raw_count > 0:
+            if state["alerted"]:
+                event = IngestWatchdogEvent(
+                    kind="recovered",
+                    source=sample.source,
+                    consecutive_empty_cycles=0,
+                    threshold=threshold,
+                    last_success_at=observed_at.isoformat(),
+                    error=None,
+                )
+                events.append(event)
+                logger.warning(
+                    "ingest_source_recovered",
+                    source=sample.source,
+                    raw_count=sample.raw_count,
+                    usable_count=sample.usable_count,
+                    threshold=threshold,
+                    last_success_at=event.last_success_at,
+                )
+            state["consecutive_empty"] = 0
+            state["alerted"] = False
+            state["last_success_at"] = observed_at.isoformat()
+            continue
+
+        state["consecutive_empty"] += 1
+        if state["consecutive_empty"] >= threshold and not state["alerted"]:
+            event = IngestWatchdogEvent(
+                kind="starved",
+                source=sample.source,
+                consecutive_empty_cycles=state["consecutive_empty"],
+                threshold=threshold,
+                last_success_at=state["last_success_at"],
+                error=sample.error,
+            )
+            events.append(event)
+            state["alerted"] = True
+            logger.warning(
+                "ingest_source_starved",
+                source=sample.source,
+                consecutive_empty_cycles=state["consecutive_empty"],
+                threshold=threshold,
+                last_success_at=state["last_success_at"],
+                error=sample.error,
+            )
+
+    return events
 
 
 def increment_mcap_null_with_price() -> None:
