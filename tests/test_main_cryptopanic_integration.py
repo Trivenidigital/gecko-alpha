@@ -118,6 +118,82 @@ async def test_run_cycle_cryptopanic_disabled_skips_fetch():
     assert stats["tokens_scanned"] == 1
 
 
+async def test_run_cycle_includes_midcap_gainers_in_aggregate_and_raw_cache():
+    """Midcap rows reach both candidate scoring and raw-market signal surfaces."""
+    midcap = _mk_token(
+        contract_address="playnance-like",
+        chain="coingecko",
+        token_name="PlaynanceLike",
+        ticker="GCOIN",
+        market_cap_usd=90_000_000,
+        volume_24h_usd=840_000,
+        price_change_24h=96.4,
+    )
+    db = _mk_db()
+    settings = _mk_settings(
+        VOLUME_SPIKE_ENABLED=True,
+        GAINERS_TRACKER_ENABLED=True,
+        MOMENTUM_7D_ENABLED=True,
+    )
+    session = AsyncMock()
+
+    with (
+        patch("scout.main.fetch_trending", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "scout.main.fetch_trending_pools", new_callable=AsyncMock, return_value=[]
+        ),
+        patch(
+            "scout.main.cg_fetch_top_movers", new_callable=AsyncMock, return_value=[]
+        ),
+        patch("scout.main.cg_fetch_trending", new_callable=AsyncMock, return_value=[]),
+        patch("scout.main.cg_fetch_by_volume", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "scout.main.cg_fetch_midcap_gainers",
+            new_callable=AsyncMock,
+            return_value=[midcap],
+        ),
+        patch(
+            "scout.main.fetch_held_position_prices",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
+        patch(
+            "scout.main._cg_module.last_raw_markets",
+            [],
+        ),
+        patch("scout.main._cg_module.last_raw_trending", []),
+        patch("scout.main._cg_module.last_raw_by_volume", []),
+        patch(
+            "scout.main._cg_module.last_raw_midcap_gainers",
+            [{"id": "playnance-like", "price_change_percentage_24h": 96.4}],
+        ),
+        patch("scout.main.record_volume", new_callable=AsyncMock) as mock_record_volume,
+        patch("scout.main.detect_spikes", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "scout.main.store_top_gainers", new_callable=AsyncMock, return_value=1
+        ) as mock_store_top_gainers,
+        patch("scout.main.detect_7d_momentum", new_callable=AsyncMock, return_value=[]),
+        patch("scout.main.aggregate", return_value=[midcap]) as mock_aggregate,
+        patch(
+            "scout.main.enrich_holders",
+            new_callable=AsyncMock,
+            side_effect=lambda t, s, st: t,
+        ),
+        patch("scout.main.score", return_value=(40, [])),
+    ):
+        stats = await run_cycle(settings, db, session, dry_run=True)
+
+    aggregate_tokens = mock_aggregate.call_args.args[0]
+    assert [t.contract_address for t in aggregate_tokens] == ["playnance-like"]
+    mock_record_volume.assert_awaited_once()
+    assert mock_record_volume.call_args.args[1][0]["id"] == "playnance-like"
+    mock_store_top_gainers.assert_awaited_once()
+    assert mock_store_top_gainers.call_args.args[1][0]["id"] == "playnance-like"
+    db.cache_prices.assert_awaited_once()
+    assert db.cache_prices.call_args.args[0][0]["id"] == "playnance-like"
+    assert stats["tokens_scanned"] == 1
+
+
 async def test_run_cycle_cryptopanic_enabled_persists_and_tags():
     """With CRYPTOPANIC_ENABLED=True, fetched posts are persisted and candidates are tagged."""
     token = _mk_token(ticker="PEPE")

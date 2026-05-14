@@ -30,6 +30,7 @@ from scout.heartbeat import (
 from scout.ingestion.coingecko import fetch_top_movers as cg_fetch_top_movers
 from scout.ingestion.coingecko import fetch_trending as cg_fetch_trending
 from scout.ingestion.coingecko import fetch_by_volume as cg_fetch_by_volume
+from scout.ingestion.coingecko import fetch_midcap_gainers as cg_fetch_midcap_gainers
 from scout.ingestion import coingecko as _cg_module
 from scout.ingestion.dexscreener import fetch_trending
 from scout.ingestion.geckoterminal import fetch_trending_pools
@@ -500,6 +501,7 @@ async def run_cycle(
         cg_movers,
         cg_trending,
         cg_by_volume,
+        cg_midcap_gainers,
         held_position_raw,
     ) = await asyncio.gather(
         fetch_trending(session, settings),
@@ -507,6 +509,7 @@ async def run_cycle(
         cg_fetch_top_movers(session, settings),
         cg_fetch_trending(session, settings),
         cg_fetch_by_volume(session, settings),
+        cg_fetch_midcap_gainers(session, settings),
         fetch_held_position_prices(session, settings, db),
         return_exceptions=True,
     )
@@ -526,6 +529,11 @@ async def run_cycle(
     if isinstance(cg_by_volume, Exception):
         logger.warning("CoinGecko volume scan failed", error=str(cg_by_volume))
         cg_by_volume = []
+    if isinstance(cg_midcap_gainers, Exception):
+        logger.warning(
+            "CoinGecko midcap gainer scan failed", error=str(cg_midcap_gainers)
+        )
+        cg_midcap_gainers = []
     if isinstance(held_position_raw, Exception):
         logger.warning("held_position_refresh failed", error=str(held_position_raw))
         held_position_raw = []
@@ -536,6 +544,8 @@ async def run_cycle(
         all_raw.extend(_cg_module.last_raw_trending)
     if _cg_module.last_raw_by_volume:
         all_raw.extend(_cg_module.last_raw_by_volume)
+    if _cg_module.last_raw_midcap_gainers:
+        all_raw.extend(_cg_module.last_raw_midcap_gainers)
     if held_position_raw:
         all_raw.extend(held_position_raw)
     if all_raw:
@@ -551,6 +561,7 @@ async def run_cycle(
         _cg_module.last_raw_markets,
         _cg_module.last_raw_trending,
         _cg_module.last_raw_by_volume,
+        _cg_module.last_raw_midcap_gainers,
     )
 
     # Volume Spike Detection (zero extra API calls -- uses cached data)
@@ -693,6 +704,7 @@ async def run_cycle(
         + list(cg_movers)
         + list(cg_trending)
         + list(cg_by_volume)
+        + list(cg_midcap_gainers)
     )
     stats["tokens_scanned"] = len(all_candidates)
 

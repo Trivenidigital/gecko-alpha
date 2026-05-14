@@ -7,7 +7,13 @@ import aiohttp
 from aioresponses import aioresponses
 
 from scout.ingestion import coingecko as cg_module
-from scout.ingestion.coingecko import fetch_top_movers, fetch_trending, fetch_by_volume
+from scout.ingestion.coingecko import (
+    fetch_top_movers,
+    fetch_trending,
+    fetch_by_volume,
+    fetch_midcap_gainers,
+    _reset_midcap_scan_cycle_counter_for_tests,
+)
 from scout.ratelimit import coingecko_limiter
 
 # -- Fixtures --
@@ -57,8 +63,10 @@ TRENDING_PATTERN = re.compile(r"https://api\.coingecko\.com/api/v3/search/trendi
 async def _clear_rate_limit():
     """Clear shared rate limiter state between tests."""
     await coingecko_limiter.reset()
+    _reset_midcap_scan_cycle_counter_for_tests()
     yield
     await coingecko_limiter.reset()
+    _reset_midcap_scan_cycle_counter_for_tests()
 
 
 # -- Tests --
@@ -398,6 +406,176 @@ async def test_fetch_by_volume_outage_returns_empty(settings_factory):
             tokens = await fetch_by_volume(session, settings)
 
     assert tokens == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_midcap_gainers_filters_rank_band_and_sorts(settings_factory):
+    """Rank-band scan keeps only quality 24h gainers and stores gated raw rows."""
+    cg_module.last_raw_midcap_gainers.clear()
+    settings = settings_factory(
+        COINGECKO_MIDCAP_SCAN_ENABLED=True,
+        COINGECKO_MIDCAP_SCAN_INTERVAL_CYCLES=1,
+        COINGECKO_MIDCAP_SCAN_START_PAGE=2,
+        COINGECKO_MIDCAP_SCAN_PAGES=2,
+        COINGECKO_MIDCAP_SCAN_MIN_RANK=251,
+        COINGECKO_MIDCAP_SCAN_MAX_RANK=1000,
+        COINGECKO_MIDCAP_SCAN_MIN_24H_CHANGE=25.0,
+        COINGECKO_MIDCAP_SCAN_MIN_VOLUME=250_000.0,
+        COINGECKO_MIDCAP_SCAN_MIN_MCAP=10_000_000.0,
+        COINGECKO_MIDCAP_SCAN_MAX_MCAP=500_000_000.0,
+        COINGECKO_MIDCAP_SCAN_MAX_TOKENS_PER_CYCLE=2,
+    )
+    page2 = [
+        {
+            "id": "playnance-like",
+            "symbol": "gcoin",
+            "name": "PlaynanceLike",
+            "market_cap_rank": 520,
+            "market_cap": 90_000_000,
+            "total_volume": 840_000,
+            "current_price": 0.0023,
+            "price_change_percentage_1h_in_currency": 3.0,
+            "price_change_percentage_24h": 96.4,
+            "price_change_percentage_7d_in_currency": 407.5,
+        },
+        {
+            "id": "weak-gainer",
+            "symbol": "weak",
+            "name": "WeakGainer",
+            "market_cap_rank": 600,
+            "market_cap": 50_000_000,
+            "total_volume": 900_000,
+            "current_price": 0.02,
+            "price_change_percentage_24h": 12.0,
+        },
+    ]
+    page3 = [
+        {
+            "id": "safebit-like",
+            "symbol": "safe",
+            "name": "SAFEbitLike",
+            "market_cap_rank": 683,
+            "market_cap": 55_000_000,
+            "total_volume": 860_000,
+            "current_price": 0.084,
+            "price_change_percentage_1h_in_currency": 1.2,
+            "price_change_percentage_24h": 34.6,
+            "price_change_percentage_7d_in_currency": 47.4,
+        },
+        {
+            "id": "thin-volume",
+            "symbol": "thin",
+            "name": "ThinVolume",
+            "market_cap_rank": 650,
+            "market_cap": 40_000_000,
+            "total_volume": 100_000,
+            "current_price": 0.01,
+            "price_change_percentage_24h": 80.0,
+        },
+    ]
+
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, payload=page2)
+        mocked.get(MARKETS_PATTERN, payload=page3)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_midcap_gainers(session, settings)
+
+    assert [t.contract_address for t in tokens] == ["playnance-like", "safebit-like"]
+    assert [row["id"] for row in cg_module.last_raw_midcap_gainers] == [
+        "playnance-like",
+        "safebit-like",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_midcap_gainers_page_failure_preserves_success(settings_factory):
+    """A failed rank-band page does not discard successful pages."""
+    settings = settings_factory(
+        COINGECKO_MIDCAP_SCAN_ENABLED=True,
+        COINGECKO_MIDCAP_SCAN_INTERVAL_CYCLES=1,
+        COINGECKO_MIDCAP_SCAN_START_PAGE=2,
+        COINGECKO_MIDCAP_SCAN_PAGES=2,
+        COINGECKO_MIDCAP_SCAN_MIN_RANK=251,
+        COINGECKO_MIDCAP_SCAN_MAX_RANK=1000,
+        COINGECKO_MIDCAP_SCAN_MIN_24H_CHANGE=25.0,
+        COINGECKO_MIDCAP_SCAN_MIN_VOLUME=250_000.0,
+        COINGECKO_MIDCAP_SCAN_MIN_MCAP=10_000_000.0,
+        COINGECKO_MIDCAP_SCAN_MAX_MCAP=500_000_000.0,
+    )
+    page2 = [
+        {
+            "id": "survivor",
+            "symbol": "srv",
+            "name": "Survivor",
+            "market_cap_rank": 550,
+            "market_cap": 60_000_000,
+            "total_volume": 500_000,
+            "current_price": 0.06,
+            "price_change_percentage_24h": 25.0,
+        }
+    ]
+
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, payload=page2)
+        mocked.get(MARKETS_PATTERN, status=500)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_midcap_gainers(session, settings)
+
+    assert [t.contract_address for t in tokens] == ["survivor"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_midcap_gainers_no_data_clears_stale_raw_cache(settings_factory):
+    """Total outage clears stale raw rows so they cannot replay next cycle."""
+    cg_module.last_raw_midcap_gainers[:] = [{"id": "stale"}]
+    settings = settings_factory(
+        COINGECKO_MIDCAP_SCAN_ENABLED=True,
+        COINGECKO_MIDCAP_SCAN_INTERVAL_CYCLES=1,
+        COINGECKO_MIDCAP_SCAN_START_PAGE=2,
+        COINGECKO_MIDCAP_SCAN_PAGES=1,
+    )
+
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, status=500)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_midcap_gainers(session, settings)
+
+    assert tokens == []
+    assert cg_module.last_raw_midcap_gainers == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_midcap_gainers_disabled_clears_raw_cache(settings_factory):
+    """Disabled scan makes no HTTP call and clears stale raw rows."""
+    cg_module.last_raw_midcap_gainers[:] = [{"id": "stale"}]
+    settings = settings_factory(COINGECKO_MIDCAP_SCAN_ENABLED=False)
+
+    with aioresponses() as mocked:
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_midcap_gainers(session, settings)
+
+    assert tokens == []
+    assert cg_module.last_raw_midcap_gainers == []
+    assert len(mocked.requests) == 0
+
+
+@pytest.mark.asyncio
+async def test_fetch_midcap_gainers_off_cadence_clears_raw_cache(settings_factory):
+    """Cadence gating prevents extra calls and clears stale raw rows."""
+    _reset_midcap_scan_cycle_counter_for_tests()
+    cg_module.last_raw_midcap_gainers[:] = [{"id": "stale"}]
+    settings = settings_factory(
+        COINGECKO_MIDCAP_SCAN_ENABLED=True,
+        COINGECKO_MIDCAP_SCAN_INTERVAL_CYCLES=3,
+    )
+
+    with aioresponses() as mocked:
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_midcap_gainers(session, settings)
+
+    assert tokens == []
+    assert cg_module.last_raw_midcap_gainers == []
+    assert len(mocked.requests) == 0
 
 
 @pytest.mark.asyncio
