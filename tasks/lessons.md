@@ -3,6 +3,7 @@
 ## Hermes-first applies to existing custom-code debt, not only future diffs
 
 - When the operator says the project is bearing too much custom code despite Hermes-first pressure, do not only strengthen future plan templates. Run a backlog/shipped-module comparison against current installed VPS skills/plugins and the public Hermes/agent-skills ecosystem. Classify existing items as `KEEP_CUSTOM`, `USE_SKILL_AS_REFERENCE`, `REPLACE_WITH_HERMES`, `BRIDGE_TO_HERMES`, or `DELETE_OR_DEFER`, then update the backlog so stale "none found" conclusions do not keep driving new custom work.
+- The debt audit should preserve project-owned runtime boundaries. A skill can replace workflow intelligence or serve as API-reference without replacing gecko-alpha's durable DB writes, scoring, watchdogs, dashboards, or operator audit trail.
 
 ## Hermes-first review scope
 
