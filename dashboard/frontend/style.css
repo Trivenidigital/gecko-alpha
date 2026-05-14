@@ -759,6 +759,14 @@ body {
   text-decoration: underline;
 }
 
+.x-asset-link {
+  text-decoration: none;
+}
+
+.x-asset-link:hover {
+  text-decoration: underline;
+}
+
 .x-contract {
   display: inline-block;
   max-width: 118px;
