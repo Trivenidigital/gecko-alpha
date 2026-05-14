@@ -14,6 +14,9 @@ logger = structlog.get_logger()
 GECKO_BASE = "https://api.geckoterminal.com/api/v2"
 MAX_ATTEMPTS = 3
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
+GECKOTERMINAL_NETWORK_BY_CHAIN = {
+    "ethereum": "eth",
+}
 _last_watchdog_samples: list[IngestSourceSample] = []
 _last_error_by_chain: dict[str, str] = {}
 
@@ -25,6 +28,10 @@ def get_last_watchdog_samples() -> list[IngestSourceSample]:
 def clear_watchdog_samples() -> None:
     _last_watchdog_samples.clear()
     _last_error_by_chain.clear()
+
+
+def _geckoterminal_network_for_chain(chain: str) -> str:
+    return GECKOTERMINAL_NETWORK_BY_CHAIN.get(chain, chain)
 
 
 async def _get_json(
@@ -93,7 +100,8 @@ async def fetch_trending_pools(
     _last_watchdog_samples.clear()
 
     for chain in settings.CHAINS:
-        url = f"{GECKO_BASE}/networks/{chain}/trending_pools"
+        network = _geckoterminal_network_for_chain(chain)
+        url = f"{GECKO_BASE}/networks/{network}/trending_pools"
         data = await _get_json(session, url, chain=chain)
         if not isinstance(data, dict):
             _last_watchdog_samples.append(

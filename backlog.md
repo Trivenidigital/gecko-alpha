@@ -850,8 +850,8 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 **decision-by:** 2 weeks.
 
 ### BL-NEW-GT-ETH-ENDPOINT-404
-**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B3-side (~40 GeckoTerminal 404 errors/hr for ethereum chain).
-**Action:** investigate whether the trending-pools URL changed upstream OR the chain identifier is stale; cheap test fetch suffices.
+**Status:** PR-READY 2026-05-14 on `codex/gt-eth-endpoint-404` — root cause confirmed: gecko-alpha's canonical chain label is `ethereum`, but GeckoTerminal's provider network id is `eth`. Live cheap fetch: `/networks/ethereum/trending_pools` -> 404; `/networks/eth/trending_pools` -> 200; official GT `/networks` metadata lists `id="eth"` with `coingecko_asset_platform_id="ethereum"`. Fix aliases only the provider URL while preserving project label/watchdog source as `ethereum`. Design: `tasks/design_bl_new_gt_eth_endpoint_404.md`.
+**Action:** merge and deploy the alias fix; post-deploy verify no fresh `networks/ethereum/trending_pools` 404s and that `geckoterminal:ethereum` samples still exist.
 **decision-by:** 4 weeks.
 
 ### BL-NEW-HELIUS-PLAN-AUDIT
