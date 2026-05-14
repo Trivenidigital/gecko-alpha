@@ -64,11 +64,26 @@ class Settings(BaseSettings):
     MIN_VOL_ACCEL_RATIO: float = 5.0
     COINGECKO_API_KEY: str = ""
     COINGECKO_RATE_LIMIT_PER_MIN: int = 25  # buffer under 30/min free tier
-    # Default keeps the main-cycle scheduled CoinGecko calls at 6/min:
+    # Default keeps the main-cycle scheduled CoinGecko calls at about 8/min:
     # top_movers uses 2, trending hydration uses 2, volume scan uses 3,
-    # and held-position refresh can add 1 when enabled. Raise only with
-    # rate-budget review against the 25/min limiter.
+    # held-position refresh can add 1 when enabled, and midcap scan averages
+    # +1/min under its default 3-cycle cadence. Raise only with rate-budget
+    # review against the 25/min limiter.
     COINGECKO_VOLUME_SCAN_PAGES: int = 3
+    # BL-NEW-COINGECKO-MIDCAP-GAINER-SCAN: rank-band scan for CoinGecko
+    # gainers that are not top-volume and not trending. Cadence and output cap
+    # keep this quality-first under the free-tier limiter.
+    COINGECKO_MIDCAP_SCAN_ENABLED: bool = True
+    COINGECKO_MIDCAP_SCAN_INTERVAL_CYCLES: int = 3
+    COINGECKO_MIDCAP_SCAN_START_PAGE: int = 2
+    COINGECKO_MIDCAP_SCAN_PAGES: int = 3
+    COINGECKO_MIDCAP_SCAN_MIN_RANK: int = 251
+    COINGECKO_MIDCAP_SCAN_MAX_RANK: int = 1000
+    COINGECKO_MIDCAP_SCAN_MIN_24H_CHANGE: float = 25.0
+    COINGECKO_MIDCAP_SCAN_MIN_VOLUME: float = 250_000.0
+    COINGECKO_MIDCAP_SCAN_MIN_MCAP: float = 10_000_000.0
+    COINGECKO_MIDCAP_SCAN_MAX_MCAP: float = 500_000_000.0
+    COINGECKO_MIDCAP_SCAN_MAX_TOKENS_PER_CYCLE: int = 20
 
     # Held-position price-refresh lane (§12c-narrow remediation).
     # See tasks/plan_held_position_price_freshness.md and
