@@ -35,6 +35,7 @@ summary is captured in the table above.
 | GoldRush Hermes MCP integration | [GoldRush Hermes guide](https://goldrush.dev/agents/hermes-agent/) | Hermes can connect GoldRush through MCP for wallet monitoring, token holders, transfers, OHLCV, DEX pairs, and scheduled on-chain analysis. | Candidate future capability for on-chain validation and whale/holder analysis. Requires API key or x402 decision; not free custom code replacement today. |
 | HermesHub | [amanning3390/hermeshub](https://github.com/amanning3390/hermeshub) | Early curated Hermes skill registry. Lists skills such as `relay-for-telegram`, `slack-bot`, `data-analyst`, `scrapling`, and x402 marketplace primitives. | Add to future Hermes-first search surface. Useful discovery layer, but no specific CoinGecko breadth skill found. |
 | awesome-hermes-agent | [0xNyk/awesome-hermes-agent](https://github.com/0xNyk/awesome-hermes-agent) | Curated ecosystem list. Newly relevant entries include `chainlink-agent-skills`, `ripley-xmr-gateway`, `AgentCash`, HermesHub, and Hermes payment/search plugins. | Keep in mandatory Hermes-first checks. Chainlink/ripley are not current fit; AgentCash/x402 may matter if paid data APIs become desirable. |
+| PRB agent-skills | [PaulRBerg/agent-skills](https://github.com/PaulRBerg/agent-skills) | Cross-agent personal skill collection with `coingecko-cli`, `coingecko-historical`, `etherscan-api`, and `evm-chains`. | Low-provenance compared with first-party CoinGecko/GoldRush. Track as secondary reference only; do not install into production without a concrete design. |
 
 ## Hermes-first decision for the Top Gainers gap work
 
@@ -53,6 +54,17 @@ market-breadth ingestion, persistence, scoring, or signal observability.
 One-sentence verdict: for the current Top Gainers miss, Hermes-first does not
 justify a runtime handoff, but it does require using CoinGecko's first-party
 SKILL/API docs as design-review input before changing custom ingestion code.
+
+## Backlog impact analysis
+
+| Backlog area | New discovery impact | Decision |
+|---|---|---|
+| `BL-032` social signal source | Existing VPS Hermes X path now covers KOL/X narrative ingestion (`xurl`, `kol_watcher`, `narrative_classifier`, `narrative_alert_dispatcher`). | Re-scope away from new custom Twitter/LunarCrush code. First evaluate whether Hermes X rows can populate or replace `social_mentions_24h`. |
+| `BL-043` Prometheus/Grafana | HermesHub and BL-073 Phase 2 communication/ops skills may reduce custom monitoring surface, but gecko-alpha still needs DB freshness/watchdog primitives. | Keep deferred. Do not build full Prometheus stack until Hermes ops path is accepted/rejected. |
+| `BL-073` Hermes roadmap | Phase 0 is no longer a one-time May 3 browse; ecosystem changed materially by May 14. | Add recurring ecosystem refresh and backlog-debt audit to avoid stale "none found" claims. |
+| `BL-075` slow-burn watcher | CoinGecko SKILL helps endpoint correctness; GoldRush can later validate on-chain accumulation. | Keep custom gecko-alpha signal persistence, but design must cite CoinGecko SKILL and defer on-chain enrichment to GoldRush/provider audit. |
+| `BL-NEW-HELIUS-PLAN-AUDIT` and `BL-NEW-MORALIS-PLAN-AUDIT` | GoldRush MCP/skills may replace or consolidate some Helius/Moralis enrichment use cases. | Do not upgrade or add custom throttles until the audit compares existing provider calls against GoldRush capabilities/costs. |
+| Virality / Early Detection roadmaps | Old roadmap overweights custom LunarCrush/Twitter/Dune/Nansen builds. | Add a 2026-05-14 overlay: Hermes X first for social, CoinGecko SKILL for market data, GoldRush first for on-chain, custom only after residual gap is explicit. |
 
 ## Follow-up tracking
 
