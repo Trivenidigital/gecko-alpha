@@ -187,7 +187,7 @@ async def test_calibration_dryrun_scheduler_happy_path_fires_alert(
 
     sent_messages = []
 
-    async def _fake_send(msg, session, settings):
+    async def _fake_send(msg, session, settings, **kwargs):
         sent_messages.append(msg)
 
     monkeypatch.setattr("scout.trading.calibrate.build_diffs", _fake_build_diffs)
@@ -308,7 +308,7 @@ async def test_calibration_dryrun_scheduler_idempotency(monkeypatch, settings_fa
 
     sent_messages = []
 
-    async def _fake_send(msg, session, settings):
+    async def _fake_send(msg, session, settings, **kwargs):
         sent_messages.append(msg)
 
     async def _fake_build_diffs(*a, **kw):

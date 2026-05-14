@@ -216,13 +216,14 @@ async def test_empty_or_whitespace_coin_id_rejected(db, settings_factory):
 async def test_resolution_check_error_fails_closed(db, settings_factory, monkeypatch):
     """T2d (adv-M2) — coin_id_resolves raises → fail-CLOSED with
     reason=resolution_check_error; engine NOT called."""
+    from scout.db import CoinIdResolutionError
     from scout.trading.signals import trade_predictions
 
     settings = settings_factory()
     engine = _StubEngine()
 
     async def _broken_resolves(coin_id):
-        raise RuntimeError("simulated DB outage")
+        raise CoinIdResolutionError("simulated DB outage")
 
     monkeypatch.setattr(db, "coin_id_resolves", _broken_resolves)
     pred = _make_pred(coin_id="some-coin")
@@ -233,6 +234,25 @@ async def test_resolution_check_error_fails_closed(db, settings_factory, monkeyp
     ]
     assert len(skip_events) == 1
     assert skip_events[0]["reason"] == "resolution_check_error"
+    assert engine.opened == []
+
+
+@_SKIP_AIOHTTP
+@pytest.mark.asyncio
+async def test_resolution_contract_drift_fails_loud(db, settings_factory, monkeypatch):
+    """Programmer/schema drift from the resolver must not be downgraded to skip."""
+    from scout.trading.signals import trade_predictions
+
+    settings = settings_factory()
+    engine = _StubEngine()
+
+    async def _broken_resolves(coin_id):
+        raise TypeError("simulated helper contract drift")
+
+    monkeypatch.setattr(db, "coin_id_resolves", _broken_resolves)
+    pred = _make_pred(coin_id="some-coin")
+    with pytest.raises(TypeError, match="contract drift"):
+        await trade_predictions(engine, db, [pred], settings=settings)
     assert engine.opened == []
 
 

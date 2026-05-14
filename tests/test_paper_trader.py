@@ -311,6 +311,7 @@ async def test_execute_partial_sell_idempotent_on_double_call(tmp_path):
     assert row[0] == pytest.approx(210.0, rel=1e-6)
     # realized_pnl_usd accumulated only once: 300 * 0.30 * 0.25 = 22.50
     assert row[1] == pytest.approx(22.50, rel=1e-6)
+    assert db._conn.in_transaction is False
     await db.close()
 
 
@@ -353,4 +354,70 @@ async def test_execute_sell_peak_fade_sets_closed_peak_fade_status(
     status, reason = await cur.fetchone()
     assert status == "closed_peak_fade"
     assert reason == "peak_fade"
+    await db.close()
+
+
+async def test_execute_sell_after_partial_uses_remaining_qty_and_realized_pnl(
+    tmp_path,
+):
+    """Final close must include realized ladder legs without re-selling them."""
+    from scout.db import Database
+    from scout.trading.paper import PaperTrader
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    trader = PaperTrader()
+    trade_id = await trader.execute_buy(
+        db=db,
+        token_id="tok-ladder",
+        symbol="LAD",
+        name="Ladder",
+        chain="coingecko",
+        signal_type="gainers_early",
+        signal_data={},
+        current_price=1.0,
+        amount_usd=100.0,
+        tp_pct=40.0,
+        sl_pct=15.0,
+        slippage_bps=0,
+        signal_combo="gainers_early",
+    )
+    ok = await trader.execute_partial_sell(
+        db=db,
+        trade_id=trade_id,
+        leg=1,
+        sell_qty_frac=0.30,
+        current_price=1.20,
+        slippage_bps=0,
+    )
+    assert ok is True
+
+    closed = await trader.execute_sell(
+        db=db,
+        trade_id=trade_id,
+        current_price=1.10,
+        reason="peak_fade",
+        slippage_bps=0,
+    )
+    assert closed is True
+
+    cur = await db._conn.execute(
+        "SELECT pnl_usd, pnl_pct, remaining_qty FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    pnl_usd, pnl_pct, remaining_qty = await cur.fetchone()
+    # Leg 1: 30 units * $0.20 = $6. Final leg: 70 units * $0.10 = $7.
+    assert pnl_usd == pytest.approx(13.0)
+    assert pnl_pct == pytest.approx(13.0)
+    assert remaining_qty == pytest.approx(0.0)
+
+    closed_again = await trader.execute_sell(
+        db=db,
+        trade_id=trade_id,
+        current_price=1.10,
+        reason="peak_fade",
+        slippage_bps=0,
+    )
+    assert closed_again is False
+    assert db._conn.in_transaction is False
     await db.close()

@@ -2,27 +2,28 @@
 
 Last updated: 2026-05-09 (autonomous build: BL-NEW-QUOTE-PAIR plan + design + impl + tests; PR pending)
 
-## Active Work: BL-NEW-GT-429-HANDLER
+## Active Work: Overnight gecko-alpha repo review
 
-- [x] Isolated worktree created: `C:\projects\gecko-alpha-gt-429-handler` on `codex/gt-429-handler`
-- [x] Drift check: GeckoTerminal lacks 429/5xx retry; DexScreener has the in-tree retry pattern to reuse
-- [x] Hermes-first check: no installed VPS/public Hermes skill covers GeckoTerminal aiohttp ingestion retry
-- [x] Baseline relevant tests: `tests/test_geckoterminal.py tests/test_dexscreener.py` -> 8 passed using pre-provisioned project venv
-- [x] Plan drafted: `tasks/plan_bl_new_gt_429_handler.md`
-- [x] Plan review by two parallel reviewers
-- [x] Fold plan-review findings
-- [x] Design drafted: `tasks/design_bl_new_gt_429_handler.md`
-- [x] Design review by two parallel reviewers (one completed with findings; second timed out and was closed)
-- [x] Fold design-review findings
-- [x] TDD build
-- [x] PR-review fix: convert legacy 500 test into explicit 5xx exhaustion coverage
-- [x] PR-review fix: add multi-chain continuation after retry exhaustion
-- [x] PR-review fix: assert structured fields on exhaustion telemetry
-- [x] Targeted verification rerun: `tests/test_geckoterminal.py tests/test_geckoterminal_rank.py tests/test_dexscreener.py tests/test_coingecko.py` -> 28 passed
-- [x] PR creation: https://github.com/Trivenidigital/gecko-alpha/pull/115
-- [x] Three-reviewer PR pass (two completed; operational/Hermes reviewer timed out and was closed)
-- [x] Merge: PR #115 squash-merged as `30b588a`
-- [x] Deploy to VPS: `master` at `30b588a`, `gecko-pipeline` active, `geckoterminal_non_retryable_status` observed for known ethereum 404
+- [x] Isolated worktree created: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-overnight-repo-review` on `codex/overnight-repo-review`
+- [x] Baseline verification: full suite via main venv -> 16 failed, 2049 passed, 39 skipped; fresh `uv` setup blocked by local PyPI certificate issue
+- [x] Static scan: inspect suspicious patterns with `rg` and focused file reads
+- [x] Runtime-boundary scan: reviewed external-service, DB, alerting/live-order, and test-contract paths for silent-failure risks
+- [x] Drift/Hermes-first gate: fixes reuse in-tree primitives; no new external/Hermes-replaceable primitive introduced
+- [x] Create review findings file: `tasks/review_gecko_alpha_overnight_2026_05_14.md`
+- [x] Fix high-confidence issues that are scoped enough to repair safely
+  - [x] CoinGecko stale raw globals can fresh-stamp old prices
+  - [x] `trade_predictions` unexpected resolution DB errors do not fail closed
+  - [x] Paper-trade race-lost DML paths leave transactions open
+  - [x] Final ladder close computes PnL on original quantity instead of remaining quantity + realized legs
+  - [x] Stale tests instantiate bare `Settings()` without required env
+  - [x] Live Binance `signal_type` attribution blank in pending rows
+  - [x] `signal_params` revive audit hardcodes old `tg_alert_eligible`
+  - [x] Reviewer fold: make resolver contract drift fail loud
+  - [x] Reviewer fold: make live `OrderRequest.signal_type` mandatory and assert adapter persistence
+  - [x] Reviewer fold: add trending stale-cache, scorer point-value, transaction-closure, and config override tests
+- [x] Run targeted and full verification after fixes: targeted 13 passed after reviewer folds; full suite 2072 passed, 39 skipped
+- [x] Request reviewer pass before PR if fixes land: two reviewers returned, findings folded
+- [ ] Create PR if the branch contains code/docs changes worth merging
 
 ## BL-NEW-QUOTE-PAIR soak (post-deploy)
 

@@ -12,6 +12,7 @@ the env var to skip cleanly instead of crashing the test process.
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 import pytest
@@ -166,7 +167,7 @@ async def test_fetch_top_movers_increments_counter(settings_factory):
     ]
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/markets",
+            re.compile(r"https://api\.coingecko\.com/api/v3/coins/markets"),
             payload=payload,
             status=200,
             repeat=True,
@@ -210,7 +211,7 @@ async def test_fetch_by_volume_increments_counter(settings_factory):
     ]
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/markets",
+            re.compile(r"https://api\.coingecko\.com/api/v3/coins/markets"),
             payload=payload,
             status=200,
             repeat=True,

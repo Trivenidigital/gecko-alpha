@@ -686,12 +686,10 @@ async def trade_predictions(
                 reason="empty_or_whitespace_coin_id",
             )
             continue
-        # PR #72 H1: narrowed exception handling. asyncio.CancelledError
-        # MUST propagate (don't swallow shutdown); AttributeError MUST
-        # propagate (helper signature drift). Only the documented raises
-        # (DbNotInitializedError + CoinIdResolutionError) trigger the
-        # fail-CLOSED reject path. PR #72 H2: distinct reason field per
-        # exception class for catastrophic-vs-transient paging.
+        # asyncio.CancelledError MUST propagate (don't swallow shutdown);
+        # AttributeError MUST propagate (helper signature drift). Runtime DB
+        # failures still fail CLOSED so one bad resolution probe does not crash
+        # the whole signal loop.
         from scout.db import (
             CoinIdResolutionError,
             DbNotInitializedError,
@@ -723,6 +721,8 @@ async def trade_predictions(
                 error=str(exc),
             )
             continue
+        except AttributeError:
+            raise
         if not resolves:
             logger.info(
                 "signal_skipped_synthetic_token_id",

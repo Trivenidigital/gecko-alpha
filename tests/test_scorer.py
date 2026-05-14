@@ -598,14 +598,17 @@ class TestCoinGeckoSignals:
             price_change_24h=12.0,
             volume_24h_usd=1000,
             liquidity_usd=20000,
-            market_cap_usd=999999,
+            market_cap_usd=1_000_000_000,
             holder_growth_1h=0,
             token_age_days=30,
             social_mentions_24h=0,
+            chain="ethereum",
         )
         # ratio = 8/12 = 0.67 > 0.6
         points, signals = score(token, _settings())
         assert "momentum_ratio" in signals
+        # raw=20, normalized=int(20*100/208)=9, no multiplier (1 signal)
+        assert points == 9
 
     def test_momentum_ratio_none_safe(self):
         """price_change_1h=None -> 0 pts, no exception."""
@@ -627,15 +630,18 @@ class TestCoinGeckoSignals:
         token = _make_token(
             volume_24h_usd=500_000,
             vol_7d_avg=80_000,
-            liquidity_usd=20000,
-            market_cap_usd=999999,
+            liquidity_usd=200_000,
+            market_cap_usd=1_000_000_000,
             holder_growth_1h=0,
             token_age_days=30,
             social_mentions_24h=0,
+            chain="ethereum",
         )
         # ratio = 500k/80k = 6.25 > 5.0
         points, signals = score(token, _settings())
         assert "vol_acceleration" in signals
+        # raw=25, normalized=int(25*100/208)=12, no multiplier (1 signal)
+        assert points == 12
 
     def test_cg_trending_rank_signal_fires(self):
         """cg_trending_rank=5 (<=10) -> +15 pts."""
@@ -643,13 +649,16 @@ class TestCoinGeckoSignals:
             cg_trending_rank=5,
             volume_24h_usd=1000,
             liquidity_usd=20000,
-            market_cap_usd=999999,
+            market_cap_usd=1_000_000_000,
             holder_growth_1h=0,
             token_age_days=30,
             social_mentions_24h=0,
+            chain="ethereum",
         )
         points, signals = score(token, _settings())
         assert "cg_trending_rank" in signals
+        # raw=15, normalized=int(15*100/208)=7, no multiplier (1 signal)
+        assert points == 7
 
     def test_cg_trending_rank_over_10(self):
         """cg_trending_rank=11 (>10) -> 0 pts."""
