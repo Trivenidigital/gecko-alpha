@@ -3873,7 +3873,8 @@ class Database:
         try:
             await conn.execute("BEGIN EXCLUSIVE")
             cur = await conn.execute(
-                "SELECT enabled FROM signal_params WHERE signal_type = ?",
+                "SELECT enabled, tg_alert_eligible "
+                "FROM signal_params WHERE signal_type = ?",
                 (signal_type,),
             )
             row = await cur.fetchone()
@@ -3883,6 +3884,7 @@ class Database:
                 await conn.execute("ROLLBACK")
                 raise ValueError(f"unknown signal_type: {signal_type}")
             old_enabled = row[0]
+            old_tg_alert_eligible = row[1]
 
             # R2-I1 design fold: restore tg_alert_eligible=1 jointly with
             # enabled if signal is in DEFAULT_ALLOW_SIGNALS. Auto-suspend
@@ -3923,9 +3925,10 @@ class Database:
                 """INSERT INTO signal_params_audit
                    (signal_type, field_name, old_value, new_value,
                     reason, applied_by, applied_at)
-                   VALUES (?, 'tg_alert_eligible', '0', ?, ?, ?, ?)""",
+                   VALUES (?, 'tg_alert_eligible', ?, ?, ?, ?, ?)""",
                 (
                     signal_type,
+                    str(old_tg_alert_eligible),
                     str(restore_eligible),
                     f"revive joint flag: {audit_reason}",
                     operator,

@@ -445,7 +445,7 @@ async def test_revive_signal_with_baseline_stamps_baseline_and_audit(
     cur = await db._conn.execute(
         "SELECT field_name, old_value, new_value, applied_by, reason "
         "FROM signal_params_audit WHERE signal_type='gainers_early' "
-        "ORDER BY applied_at DESC LIMIT 1"
+        "AND field_name='enabled' ORDER BY applied_at DESC LIMIT 1"
     )
     field, old, new, by, reason = await cur.fetchone()
     assert field == "enabled"
@@ -605,7 +605,8 @@ async def test_revive_signal_with_baseline_on_already_enabled_signal(
 
     cur = await db._conn.execute(
         "SELECT old_value, new_value FROM signal_params_audit "
-        "WHERE signal_type='gainers_early' ORDER BY applied_at DESC LIMIT 1"
+        "WHERE signal_type='gainers_early' AND field_name='enabled' "
+        "ORDER BY applied_at DESC LIMIT 1"
     )
     old, new = await cur.fetchone()
     assert old == "1"  # was already enabled
@@ -1039,8 +1040,7 @@ async def test_hard_loss_alert_uses_plain_text_and_traces(
     ), "hard_loss path must fire for n=20 / net=-$1000 cohort"
 
     assert len(captured_kwargs) == 1, (
-        f"expected exactly 1 send_telegram_message call; got "
-        f"{len(captured_kwargs)}"
+        f"expected exactly 1 send_telegram_message call; got " f"{len(captured_kwargs)}"
     )
     payload = captured_kwargs[0]
     assert payload.get("parse_mode") is None, (

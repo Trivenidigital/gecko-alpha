@@ -389,6 +389,7 @@ class LiveEngine:
             side="buy",
             size_usd=float(size_usd),
             intent_uuid=intent_uuid,
+            signal_type=paper_trade.signal_type,
         )
         # R1-C2 fix: derive same cid the adapter writes to live_trades.
         cid = make_client_order_id(paper_trade.id, intent_uuid)

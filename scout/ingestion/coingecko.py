@@ -69,6 +69,8 @@ async def fetch_top_movers(
     Union both lists before applying market cap filter.
     """
     logger.info("cg_fetch_attempted", endpoint="coins/markets")
+    global last_raw_markets
+    last_raw_markets = []
 
     base_params = {
         "vs_currency": "usd",
@@ -105,7 +107,6 @@ async def fetch_top_movers(
         return []
 
     # Store raw response for price cache consumption by main.py
-    global last_raw_markets
     last_raw_markets = list(raw_by_id.values())
 
     tokens: list[CandidateToken] = []
@@ -145,6 +146,7 @@ async def fetch_trending(
     signal regardless of cap. The scorer's market_cap_range signal naturally
     handles filtering at the scoring stage.
     """
+    last_raw_trending.clear()
     data = await _get_with_backoff(session, f"{CG_BASE}/search/trending")
     if not data or not isinstance(data, dict):
         logger.warning("cg_no_data", endpoint="search/trending")
@@ -153,7 +155,6 @@ async def fetch_trending(
     coins = data.get("coins", [])
     tokens: list[CandidateToken] = []
     # Also extract raw price data for price_cache enrichment
-    last_raw_trending.clear()
     for rank, entry in enumerate(coins[:15]):
         item = entry.get("item", {})
         cg_id = item.get("id", "unknown")
@@ -202,6 +203,8 @@ async def fetch_by_volume(
     strict MAX_MARKET_CAP used for the main pipeline.
     """
     logger.info("cg_fetch_attempted", endpoint="coins/markets:volume_desc")
+    global last_raw_by_volume
+    last_raw_by_volume = []
 
     base_params = {
         "vs_currency": "usd",
@@ -237,7 +240,6 @@ async def fetch_by_volume(
         return []
 
     # Store raw response for price cache & losers/gainers tracker
-    global last_raw_by_volume
     last_raw_by_volume = list(raw_by_id.values())
 
     tokens: list[CandidateToken] = []

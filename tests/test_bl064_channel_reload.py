@@ -201,8 +201,11 @@ async def test_reload_disabled_when_interval_is_zero(db, settings_factory):
         db, client, settings, channels_holder, initial_handler
     )
     with capture_logs() as logs:
-        # Heartbeat returns immediately when interval=0 (no infinite loop)
-        await asyncio.wait_for(heartbeat(), timeout=2.0)
+        task = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
     events = [e.get("event") for e in logs]
     assert "tg_social_channel_reload_disabled" in events
 

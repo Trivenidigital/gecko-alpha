@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock
 
 from scout.config import Settings
 from scout.db import Database
+from scout.live.adapter_base import OrderConfirmation
 from scout.live.config import LiveConfig
 from scout.live.engine import LiveEngine
 from scout.live.kill_switch import KillSwitch
@@ -71,7 +72,9 @@ def _settings(**overrides):
     return Settings(**base)
 
 
-def _make_engine(db, *, settings=None, depth=None, venue=None, fetch_depth_exc=None):
+def _make_engine(
+    db, *, settings=None, depth=None, venue=None, fetch_depth_exc=None, routing=None
+):
     s = settings or _settings()
     config = LiveConfig(s)
 
@@ -101,6 +104,7 @@ def _make_engine(db, *, settings=None, depth=None, venue=None, fetch_depth_exc=N
         adapter=adapter,
         db=db,
         kill_switch=ks,
+        routing=routing,
     )
 
 
@@ -360,4 +364,48 @@ async def test_happy_path_writes_open_row(tmp_path):
     assert Decimal(size) == Decimal("100")
 
     assert await _metric_value(db, "shadow_orders_opened") == 1
+    await db.close()
+
+
+async def test_live_dispatch_preserves_signal_type_in_order_request(tmp_path):
+    """Live routing path must preserve signal_type for live_trades attribution."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        LIVE_MODE="live",
+        LIVE_USE_ROUTING_LAYER=True,
+        LIVE_USE_REAL_SIGNED_REQUESTS=True,
+        LIVE_SIGNAL_ALLOWLIST="volume_spike",
+    )
+    adapter = AsyncMock()
+    adapter.fetch_depth = AsyncMock(return_value=_depth())
+    adapter.fetch_account_balance = AsyncMock(return_value=1000.0)
+    adapter.place_order_request = AsyncMock(return_value="venue-order-1")
+    adapter.await_fill_confirmation = AsyncMock(
+        return_value=OrderConfirmation(
+            venue="binance",
+            venue_order_id="venue-order-1",
+            client_order_id="cid",
+            status="filled",
+            filled_qty=1.0,
+            fill_price=100.0,
+            raw_response={},
+        )
+    )
+    routing = AsyncMock()
+    routing.get_candidates = AsyncMock(
+        return_value=[
+            types.SimpleNamespace(venue="binance", venue_pair="TUSDT"),
+        ]
+    )
+    engine = _make_engine(db, settings=settings, depth=_depth(), routing=routing)
+    engine._adapter = adapter
+    engine._gates._adapter = adapter
+    engine._routing = routing
+    pt = await _seed_paper_trade(db, signal_type="volume_spike")
+
+    await engine.on_paper_trade_opened(pt)
+
+    request = adapter.place_order_request.await_args.args[0]
+    assert request.signal_type == "volume_spike"
     await db.close()

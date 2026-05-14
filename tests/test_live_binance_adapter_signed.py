@@ -257,6 +257,7 @@ async def test_place_order_request_dedup_returns_existing(tmp_path):
         side="buy",
         size_usd=50.0,
         intent_uuid=intent_uuid,
+        signal_type="first_signal",
     )
     with aioresponses() as m:
         order_id = await adapter.place_order_request(request)
@@ -297,12 +298,13 @@ async def test_place_order_request_first_attempt_records_then_submits(tmp_path):
             side="buy",
             size_usd=50.0,
             intent_uuid=intent_uuid,
+            signal_type="first_signal",
         )
         order_id = await adapter.place_order_request(request)
         assert order_id == "88888"
 
     cur = await db._conn.execute(
-        "SELECT client_order_id, status, entry_order_id FROM live_trades "
+        "SELECT client_order_id, status, entry_order_id, signal_type FROM live_trades "
         "WHERE paper_trade_id = ?",
         (paper_id,),
     )
@@ -310,6 +312,7 @@ async def test_place_order_request_first_attempt_records_then_submits(tmp_path):
     assert row is not None
     assert row[1] == "open"
     assert row[2] == "88888"
+    assert row[3] == "first_signal"
     await adapter.close()
     await db.close()
 
@@ -352,6 +355,7 @@ async def test_place_order_request_recovers_from_2010(tmp_path):
             side="buy",
             size_usd=50.0,
             intent_uuid=intent_uuid,
+            signal_type="first_signal",
         )
         order_id = await adapter.place_order_request(request)
         assert order_id == "77777"
@@ -393,6 +397,7 @@ async def test_place_order_request_rejects_empty_order_id(tmp_path):
             side="buy",
             size_usd=50.0,
             intent_uuid=intent_uuid,
+            signal_type="first_signal",
         )
         with pytest.raises(VenueTransientError, match="missing orderId"):
             await adapter.place_order_request(request)
@@ -414,6 +419,7 @@ async def test_place_order_request_raises_when_signed_disabled(tmp_path):
         side="buy",
         size_usd=50.0,
         intent_uuid="abcd1234-ef56-7890-abcd-ef0123456789",
+        signal_type="first_signal",
     )
     with pytest.raises(NotImplementedError, match="emergency-revert"):
         await adapter.place_order_request(request)

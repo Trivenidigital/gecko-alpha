@@ -344,6 +344,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
 
         cursor_upd = await conn.execute(updates, params)
         if cursor_upd.rowcount == 0:
+            await conn.commit()
             log.warning("partial_sell_race_lost", trade_id=trade_id, leg=leg)
             return False
         await conn.commit()
@@ -387,7 +388,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             raise RuntimeError("Database not initialized.")
 
         cursor = await conn.execute(
-            "SELECT entry_price, amount_usd, quantity FROM paper_trades WHERE id = ?",
+            "SELECT entry_price, amount_usd, quantity, remaining_qty, realized_pnl_usd "
+            "FROM paper_trades WHERE id = ?",
             (trade_id,),
         )
         row = await cursor.fetchone()
@@ -398,6 +400,12 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         entry_price = float(row[0])
         amount_usd = float(row[1])
         quantity = float(row[2])
+        remaining_qty = row[3]
+        realized_pnl_usd = row[4]
+        close_qty = float(remaining_qty) if remaining_qty is not None else quantity
+        realized_so_far = (
+            float(realized_pnl_usd) if realized_pnl_usd is not None else 0.0
+        )
 
         effective_exit = current_price * (1 - slippage_bps / 10000)
         if entry_price <= 0:
@@ -405,8 +413,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             pnl_pct = 0.0
             pnl_usd = 0.0
         else:
-            pnl_pct = ((effective_exit - entry_price) / entry_price) * 100
-            pnl_usd = quantity * (effective_exit - entry_price)
+            final_leg_pnl = close_qty * (effective_exit - entry_price)
+            pnl_usd = realized_so_far + final_leg_pnl
+            pnl_pct = (pnl_usd / amount_usd) * 100 if amount_usd else 0.0
         now = datetime.now(timezone.utc).isoformat()
 
         if reason == "take_profit" and pnl_usd < 0:
@@ -435,11 +444,16 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         cursor_upd = await conn.execute(
             """UPDATE paper_trades
                SET status = ?, exit_price = ?, exit_reason = ?,
-                   pnl_usd = ?, pnl_pct = ?, closed_at = ?
+                   pnl_usd = ?, pnl_pct = ?, closed_at = ?,
+                   remaining_qty = CASE
+                       WHEN remaining_qty IS NULL THEN remaining_qty
+                       ELSE 0
+                   END
                WHERE id = ? AND status = 'open'""",
             (status, effective_exit, reason, pnl_usd, round(pnl_pct, 4), now, trade_id),
         )
         if cursor_upd.rowcount == 0:
+            await conn.commit()
             log.warning("trade_already_closed", trade_id=trade_id)
             return False
         await conn.commit()

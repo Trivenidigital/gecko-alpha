@@ -526,7 +526,7 @@ class BinanceSpotAdapter(ExchangeAdapter):
                 symbol=request.canonical,
                 venue=self.venue_name,
                 pair=request.venue_pair,
-                signal_type="",  # filled by engine layer
+                signal_type=request.signal_type,
                 size_usd=str(request.size_usd),
                 mid_at_entry=mid_str,
             )

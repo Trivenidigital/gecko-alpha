@@ -83,6 +83,22 @@ def test_coingecko_config_defaults():
     assert s.MIN_VOL_ACCEL_RATIO == 5.0
 
 
+def test_coingecko_config_env_overrides(monkeypatch):
+    """CoinGecko scoring knobs are environment-overridable."""
+    monkeypatch.setenv("MOMENTUM_RATIO_THRESHOLD", "0.75")
+    monkeypatch.setenv("MIN_VOL_ACCEL_RATIO", "7.5")
+
+    s = Settings(
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        _env_file=None,
+    )
+
+    assert s.MOMENTUM_RATIO_THRESHOLD == 0.75
+    assert s.MIN_VOL_ACCEL_RATIO == 7.5
+
+
 def test_settings_weight_sum_validation():
     with pytest.raises(ValueError, match="must sum to 1.0"):
         Settings(

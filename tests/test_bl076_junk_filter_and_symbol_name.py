@@ -27,6 +27,13 @@ from structlog.testing import capture_logs
 
 from scout.trading.signals import _is_junk_coinid
 
+
+def _test_settings():
+    from scout.config import Settings
+
+    return Settings(TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k")
+
+
 # ---------------------------------------------------------------------------
 # Task 1: junk filter — `test-` prefix
 # ---------------------------------------------------------------------------
@@ -79,7 +86,7 @@ async def test_open_trade_logs_warning_when_symbol_and_name_both_empty(tmp_path)
     db_path = str(tmp_path / "t.db")
     sd = Database(db_path)
     await sd.initialize()
-    settings = Settings()
+    settings = _test_settings()
     engine = TradingEngine("paper", sd, settings)
     with capture_logs() as captured:
         await engine.open_trade(
@@ -122,7 +129,7 @@ async def test_open_trade_warning_fires_even_during_warmup(tmp_path, monkeypatch
     db_path = str(tmp_path / "t.db")
     sd = Database(db_path)
     await sd.initialize()
-    settings = Settings()
+    settings = _test_settings()
     monkeypatch.setattr(settings, "PAPER_STARTUP_WARMUP_SECONDS", 10)
     engine = TradingEngine("paper", sd, settings)
     with capture_logs() as captured:
@@ -167,7 +174,7 @@ async def test_trade_volume_spikes_passes_symbol_and_name_to_engine(tmp_path):
     db_path = str(tmp_path / "t.db")
     sd = Database(db_path)
     await sd.initialize()
-    settings = Settings()
+    settings = _test_settings()
     captured = {}
 
     class FakeEngine:
@@ -222,7 +229,7 @@ async def test_trade_predictions_passes_symbol_and_name_to_engine(tmp_path):
         (now,),
     )
     await sd._conn.commit()
-    settings = Settings()
+    settings = _test_settings()
     captured = []
 
     class FakeEngine:
@@ -416,7 +423,7 @@ async def test_chain_completed_orphan_does_not_trigger_engine_warning(tmp_path):
         (now, now, now),
     )
     await sd._conn.commit()
-    settings = Settings()
+    settings = _test_settings()
     # Use REAL TradingEngine so engine WARNING actually fires when called
     # without the sentinel — this is the bug we're guarding against.
     engine = TradingEngine("paper", sd, settings)
@@ -453,7 +460,7 @@ async def test_open_trade_with_expected_empty_metadata_suppresses_warnings(tmp_p
     db_path = str(tmp_path / "t.db")
     sd = Database(db_path)
     await sd.initialize()
-    settings = Settings()
+    settings = _test_settings()
     engine = TradingEngine("paper", sd, settings)
 
     # Sentinel ON: WARNING + INFO MUST NOT fire
@@ -579,7 +586,7 @@ async def test_trade_chain_completions_uses_lookup_helper_for_metadata(tmp_path)
         (now,),
     )
     await sd._conn.commit()
-    settings = Settings()
+    settings = _test_settings()
     captured = []
 
     class FakeEngine:
@@ -629,7 +636,7 @@ async def test_trade_chain_completions_falls_back_to_empty_when_no_snapshot(tmp_
         (now, now, now),
     )
     await sd._conn.commit()
-    settings = Settings()
+    settings = _test_settings()
     captured = []
 
     class FakeEngine:

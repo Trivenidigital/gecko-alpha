@@ -35,6 +35,7 @@ class OrderRequest:
     side: str  # 'buy' | 'sell'
     size_usd: float
     intent_uuid: str  # gecko-side; populates client_order_id
+    signal_type: str
 
 
 @dataclass(frozen=True)

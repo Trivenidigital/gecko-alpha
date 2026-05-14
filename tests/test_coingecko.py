@@ -2,11 +2,12 @@
 
 import re
 
-import pytest
 import aiohttp
+import pytest
 from aioresponses import aioresponses
 
-from scout.ingestion.coingecko import fetch_top_movers, fetch_trending, fetch_by_volume
+import scout.ingestion.coingecko as coingecko
+from scout.ingestion.coingecko import fetch_by_volume, fetch_top_movers, fetch_trending
 from scout.ratelimit import coingecko_limiter
 
 # -- Fixtures --
@@ -147,6 +148,21 @@ async def test_coingecko_outage_does_not_crash_pipeline(settings_factory):
     assert tokens == []
 
 
+@pytest.mark.asyncio
+async def test_fetch_top_movers_outage_clears_previous_raw_cache(settings_factory):
+    """Failed current-cycle fetches must not fresh-stamp stale prices."""
+    settings = settings_factory()
+    coingecko.last_raw_markets = [{"id": "stale", "current_price": 9.99}]
+
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, status=500)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_top_movers(session, settings)
+
+    assert tokens == []
+    assert coingecko.last_raw_markets == []
+
+
 # -- Volume scan tests --
 
 VOLUME_RESPONSE = [
@@ -199,6 +215,21 @@ async def test_fetch_by_volume_filters_below_min_mcap(settings_factory):
     # Only high-vol-token (50M mcap) passes the 1M threshold
     assert len(tokens) == 1
     assert tokens[0].ticker == "hvt"
+
+
+@pytest.mark.asyncio
+async def test_fetch_by_volume_outage_clears_previous_raw_cache(settings_factory):
+    """Volume-scan outage must not leave old raw rows for main.py cache write."""
+    settings = settings_factory()
+    coingecko.last_raw_by_volume = [{"id": "stale-volume", "current_price": 4.2}]
+
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, status=500)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_by_volume(session, settings)
+
+    assert tokens == []
+    assert coingecko.last_raw_by_volume == []
 
 
 @pytest.mark.asyncio
@@ -289,3 +320,18 @@ async def test_fetch_trending_outage_returns_empty(settings_factory):
             tokens = await fetch_trending(session, settings)
 
     assert tokens == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_trending_outage_clears_previous_raw_cache(settings_factory):
+    """Trending outage must not leave stale raw price rows for main.py cache write."""
+    settings = settings_factory()
+    coingecko.last_raw_trending[:] = [{"id": "stale-trending", "current_price": 1.23}]
+
+    with aioresponses() as mocked:
+        mocked.get(TRENDING_PATTERN, status=500)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_trending(session, settings)
+
+    assert tokens == []
+    assert coingecko.last_raw_trending == []
