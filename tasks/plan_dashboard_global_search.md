@@ -292,14 +292,20 @@ class QueryTooShortError(ValueError):
     """Query must be at least 2 non-whitespace characters."""
 
 
+# Strip control characters (\x00-\x1f) — design-review-1 backend SHOULD-FIX
+# #S3. Not a security issue (LIKE matches literally) but garbage matches and
+# log-injection vectors otherwise.
+_CTRL_TABLE = {i: None for i in range(0x20)}
+
+
 def normalize_query(raw: str) -> str:
-    """Strip whitespace, lowercase, strip leading $/# ticker sigils.
+    """Strip whitespace + control chars, lowercase, strip leading $/# sigils.
 
     Raises QueryTooShortError for queries < 2 chars after normalization.
     """
     if raw is None:
         raise QueryTooShortError("query required")
-    q = raw.strip()
+    q = raw.translate(_CTRL_TABLE).strip()
     if q.startswith("$") or q.startswith("#"):
         q = q[1:]
     q = q.lower()
@@ -440,14 +446,21 @@ _MATCH_QUALITY_RANK = {
 
 
 async def search_candidates(db_path: str, q: str, limit: int) -> list[SearchHit]:
-    """Search candidates table on contract_address, token_name, ticker."""
+    """Search candidates table on contract_address, token_name, ticker.
+
+    Note: `contract_address` is matched case-sensitively for Solana base58
+    addresses (which are case-sensitive by spec) and case-insensitively for
+    EVM 0x addresses (which are case-insensitive by spec). We achieve this by
+    matching the raw column for contract AND a lowered alias for name/ticker.
+    Design-review-1 SHOULD-FIX #S2.
+    """
     pattern = f"%{q}%"
     async with _ro_db(db_path) as conn:
         cur = await conn.execute(
             """SELECT contract_address, chain, token_name, ticker,
                       market_cap_usd, first_seen_at, alerted_at
                FROM candidates
-               WHERE lower(contract_address) LIKE ?
+               WHERE contract_address LIKE ?
                   OR lower(token_name) LIKE ?
                   OR lower(ticker) LIKE ?
                ORDER BY first_seen_at DESC
@@ -1073,6 +1086,11 @@ async def test_run_search_sql_injection_attempt(tmp_path):
 ```python
 # Append to dashboard/search.py
 import asyncio
+import time
+
+import structlog
+
+_log = structlog.get_logger()
 
 
 async def _safe_call(coro):
@@ -1086,6 +1104,7 @@ async def _safe_call(coro):
 async def run_search(db_path: str, raw_q: str, limit: int = 50) -> SearchResponse:
     """Orchestrate all per-table searches in parallel, dedup by canonical_id."""
     q = normalize_query(raw_q)
+    _t0 = time.monotonic()
     # Each per-table search pulls up to `limit` so aggregate dedup still
     # gives `limit` distinct entities most of the time.
     coros = [
@@ -1104,11 +1123,15 @@ async def run_search(db_path: str, raw_q: str, limit: int = 50) -> SearchRespons
         _safe_call(search_narrative_inbound(db_path, q, limit)),
     ]
     results = await asyncio.gather(*coros, return_exceptions=False)
-    # Flatten + dedup
-    by_id: dict[str, SearchHit] = {}
+    # Flatten + dedup.
+    # Dedup key includes (canonical_id, entity_kind, chain) — design-review-1
+    # backend MUST-FIX #M2. Short canonical_ids ("q" for Quack AI on CG) would
+    # otherwise collide with any future 1-char slug of a different token.
+    # tg_msg / x_alert hits are kept distinct by their unique synthetic IDs.
+    by_id: dict[tuple, SearchHit] = {}
     for hits in results:
         for h in hits:
-            cid = h.canonical_id
+            cid = (h.canonical_id, h.entity_kind, h.chain or "")
             if cid not in by_id:
                 by_id[cid] = h
                 continue
@@ -1147,6 +1170,19 @@ async def run_search(db_path: str, raw_q: str, limit: int = 50) -> SearchRespons
     # Pre-slice total for honest truncation flag (plan-review-1 NICE-TO-HAVE #12).
     total_pre_slice = len(merged)
     merged = merged[:limit]
+    # Telemetry — design-review-1 SHOULD-FIX #S4. Log only q_len (NOT raw query)
+    # to avoid persisting KOL handles / contract addresses in journalctl.
+    _dur_ms = int((time.monotonic() - _t0) * 1000)
+    _log.info(
+        "dashboard_search",
+        q_len=len(q),
+        hits=len(merged),
+        pre_slice=total_pre_slice,
+        truncated=total_pre_slice > limit,
+        dur_ms=_dur_ms,
+    )
+    if _dur_ms > 2000:
+        _log.warning("dashboard_search_slow", q_len=len(q), dur_ms=_dur_ms)
     return SearchResponse(
         query=q,
         total_hits=len(merged),
@@ -1241,7 +1277,10 @@ Insert after the `/api/win-rate` endpoint (around line 114):
 ```python
     @app.get("/api/search", response_model=None)
     async def get_search(
-        q: str = Query(..., min_length=1, max_length=128),
+        # min_length=2 fail-fast at the validator; normalize_query is the
+        # second line of defense (handles sigil-only inputs like "$" or "##").
+        # Design-review-1 SHOULD-FIX #S5.
+        q: str = Query(..., min_length=2, max_length=128),
         limit: int = Query(50, ge=1, le=200),
     ):
         from fastapi.responses import JSONResponse
@@ -1405,7 +1444,11 @@ export default function GlobalSearch() {
 
   const hits = results?.hits || []
 
-  // Arrow-key navigation through results (review SHOULD-FIX #6)
+  // Arrow-key navigation through results (review SHOULD-FIX #6).
+  // Enter delegates to TokenLink anchor click so URL logic is identical
+  // between mouse-click and keyboard paths (design-review-1 MUST-FIX #M1).
+  // Previously this reimplemented routing inline and mis-routed Solana
+  // base58 contracts to CoinGecko (404) instead of DexScreener.
   const onInputKeyDown = useCallback((e) => {
     if (!open || hits.length === 0) return
     if (e.key === 'ArrowDown') {
@@ -1415,15 +1458,12 @@ export default function GlobalSearch() {
       e.preventDefault()
       setActiveIdx((i) => Math.max(i - 1, 0))
     } else if (e.key === 'Enter' && activeIdx >= 0) {
-      const h = hits[activeIdx]
-      // Only open external link for real token hits — non-token hits (tg_msg,
-      // x_alert) have no useful external URL.
-      if (h && h.entity_kind === 'token') {
-        const tokenId = h.contract_address || h.canonical_id
-        const target = h.chain === 'coingecko' || !tokenId.startsWith('0x')
-          ? `https://www.coingecko.com/en/coins/${tokenId}`
-          : `https://dexscreener.com/${h.chain}/${tokenId}`
-        window.open(target, '_blank', 'noopener,noreferrer')
+      // Trigger a click on the active row's anchor — TokenLink owns the URL.
+      // Non-token hits don't render an anchor; no-op for those (no useful URL).
+      const row = dropdownRef.current?.querySelector(`#gs-hit-${activeIdx} a`)
+      if (row) {
+        e.preventDefault()
+        row.click()
       }
     }
   }, [open, hits, activeIdx])
@@ -1454,12 +1494,20 @@ export default function GlobalSearch() {
         aria-controls="gs-listbox"
         aria-activedescendant={activeIdx >= 0 ? `gs-hit-${activeIdx}` : undefined}
       />
+      {/* Screen-reader-only live region — announces result count changes
+          per design-review-1 frontend MUST-FIX #2. */}
+      <div className="sr-only" role="status" aria-live="polite">
+        {results && q.length >= 2
+          ? `${results.total_hits} result${results.total_hits === 1 ? '' : 's'} for ${q}`
+          : ''}
+      </div>
       {open && q.length >= 2 && (
         <div
           className="global-search-dropdown"
           role="listbox"
           id="gs-listbox"
           ref={dropdownRef}
+          tabIndex={-1}
           onMouseDown={onDropdownMouseDown}
         >
           {loading && <div className="gs-state">Searching...</div>}
@@ -1514,7 +1562,7 @@ export default function GlobalSearch() {
             </div>
           ))}
           {!loading && !errored && results && results.truncated && (
-            <div className="gs-state gs-truncated">Showing first {hits.length} results — refine query for more.</div>
+            <div className="gs-state gs-truncated">Showing first {hits.length} matches — type more characters to narrow.</div>
           )}
         </div>
       )}
@@ -1617,6 +1665,11 @@ Append to `dashboard/frontend/style.css`:
 .gs-pnl-neg { background: rgba(248,81,73,0.15); color: var(--color-accent-red); }
 .gs-hit-meta { font-size: 10px; color: var(--color-text-secondary); margin-top: 4px; }
 .gs-truncated { font-style: italic; }
+/* Screen-reader-only live region (design-review-1 frontend MUST-FIX #2) */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
 @media (max-width: 600px) {
   .global-search { max-width: none; }
 }

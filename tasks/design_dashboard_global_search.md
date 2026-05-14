@@ -258,6 +258,8 @@ Each item maps to a Plan task or a verification step:
 - [ ] No header overflow on 1024px / 600px viewport widths
 - [ ] CSS variables resolve (no fallback to browser default)
 - [ ] Read-only DB connection — try a SQL injection that would write and confirm zero impact
+- [ ] **Browser UAT step (added per design-review-1 frontend SHOULD-FIX #7):** open dashboard at `http://srilu-vps:8000` in Firefox + Chrome. From the Pipeline tab while a `<select>` element has focus, press Ctrl+K. Verify focus moves to search input (NOT the browser URL bar). Type "chip". Verify ≤3 row dropdown renders within 500ms. Press ArrowDown twice then Enter — verify the highlighted Solana CHIP hit (if any) opens a DexScreener page in a new tab (NOT a CoinGecko 404).
+- [ ] **Screen reader smoke test:** with VoiceOver (macOS) or NVDA (Windows) enabled, type "chip" — verify the live region announces "3 results for chip" without interrupting the input echo.
 
 ## 10. Open questions deferred
 
