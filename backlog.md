@@ -475,6 +475,17 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 **Verification:** TDD red/green for trending hydration, hydration-failure fallback, configurable volume page count, and raw-row combiner. Focused regression: `tests/test_coingecko.py tests/test_main.py tests/test_main_cryptopanic_integration.py tests/test_gainers_tracker.py tests/test_spikes_detector.py tests/test_slow_burn_detector.py` -> 77 passed. Broader run including `tests/test_heartbeat_mcap_missing.py` still shows the known baseline aioresponses URL-matching failures from PR #119, not a regression in this branch.
 
+### BL-NEW-COINGECKO-MIDCAP-GAINER-SCAN: free-tier market-rank scan for low-volume gainers
+**Status:** PROPOSED 2026-05-14 - see `tasks/findings_top_gainers_gap_2026_05_14.md`.
+**Tag:** `signals` `coingecko` `gainers` `quality-over-quantity` `hermes-first`
+**Why:** Exact-ID Top Gainers audit found the remaining misses (Playnance `playnance`, Bityuan `bityuan`, SAFEbit `safecoin`) are mid-cap CoinGecko tokens around rank 470-680 with low absolute volume. They were not top-1000 by volume in the audit sample and were not trending, so neither `fetch_by_volume` nor PR #121's trending hydration can catch them reliably.
+
+**Hermes-first result:** No installed Hermes runtime skill replaces this. CoinGecko Agent SKILL/API docs can guide endpoint use; gecko-alpha should keep persistence, dedupe, signal tables, and dashboards.
+
+**Candidate design:** Fetch `/coins/markets` ordered by `market_cap_desc` for a bounded rank band (for example pages 2-4 or 2-5), locally sort by 24h gain, then feed only quality-gated rows into the existing raw-market surfaces. Gates should include minimum 24h gain, minimum 24h volume, max market cap, and dedupe by CoinGecko ID. Keep disabled or narrow until backtest estimates added signal/trade volume.
+
+**Acceptance:** A backtest over recent DB snapshots plus a one-cycle dry run show the rank-band scan would have surfaced at least 2 of the 3 missed mid-cap gainers without increasing candidate/paper-trade volume beyond a pre-registered threshold.
+
 ### BL-074: Minara as live-execution layer (post-BL-055 unlock)
 **Status:** PHASE 0 Option A SHIPPED 2026-05-11 — see BL-NEW-M1.5C below. Subsequent phases (Option B execution-on-VPS + adapter shape decision) remain gated on BL-055 unlock. Captured 2026-05-03.
 **Tag:** `phase-0-shipped` `gated-on-BL-055` `live-execution` `minara` `hermes-ecosystem`
