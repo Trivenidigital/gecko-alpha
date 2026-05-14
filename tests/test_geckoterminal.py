@@ -72,6 +72,27 @@ async def test_fetch_trending_pools_multiple_chains(mock_aiohttp, settings_facto
     assert samples["geckoterminal:eth"].usable_count == 0
 
 
+async def test_fetch_trending_pools_maps_ethereum_to_eth_provider_network(
+    mock_aiohttp, settings_factory
+):
+    url = f"{GECKO_BASE}/networks/eth/trending_pools"
+    mock_aiohttp.get(url, payload={"data": [SAMPLE_POOL]})
+
+    settings = settings_factory(
+        CHAINS=["ethereum"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000
+    )
+    async with aiohttp.ClientSession() as session:
+        tokens = await fetch_trending_pools(session, settings)
+
+    assert len(tokens) == 1
+    assert tokens[0].chain == "ethereum"
+    assert _request_count(mock_aiohttp, url) == 1
+    samples = get_last_watchdog_samples()
+    assert samples[-1].source == "geckoterminal:ethereum"
+    assert samples[-1].raw_count == 1
+    assert samples[-1].usable_count == 1
+
+
 async def test_fetch_trending_pools_filters_market_cap(mock_aiohttp, settings_factory):
     big_pool = {
         **SAMPLE_POOL,
@@ -251,11 +272,11 @@ async def test_fetch_trending_pools_continues_after_chain_retry_exhaustion(
 async def test_fetch_trending_pools_does_not_retry_404(
     mock_aiohttp, settings_factory, geckoterminal_sleep_spy
 ):
-    url = f"{GECKO_BASE}/networks/ethereum/trending_pools"
+    url = f"{GECKO_BASE}/networks/unknown-chain/trending_pools"
     mock_aiohttp.get(url, status=404)
 
     settings = settings_factory(
-        CHAINS=["ethereum"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000
+        CHAINS=["unknown-chain"], MIN_MARKET_CAP=10000, MAX_MARKET_CAP=500000
     )
     with capture_logs() as logs:
         async with aiohttp.ClientSession() as session:
@@ -266,7 +287,7 @@ async def test_fetch_trending_pools_does_not_retry_404(
     assert geckoterminal_sleep_spy == []
     assert logs == [
         {
-            "chain": "ethereum",
+            "chain": "unknown-chain",
             "url": url,
             "status": 404,
             "event": "geckoterminal_non_retryable_status",
