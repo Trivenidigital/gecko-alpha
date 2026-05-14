@@ -232,7 +232,8 @@ Read-only feature. Rollback steps:
 
 1. `git revert <merge-sha>` on master
 2. `git push origin master`
-3. On srilu-vps: `cd /root/gecko-alpha && git pull && systemctl restart gecko-dashboard`
+3. On srilu-vps: `cd /root/gecko-alpha && git pull && find . -name __pycache__ -exec rm -rf {} + ; systemctl restart gecko-dashboard`
+   (pycache cleanup mandatory per memory `feedback_clear_pycache_on_deploy.md` — without it stale `.pyc` for `dashboard/search.py` will linger; cosmetic only since no live importer, but keeps runbooks consistent — pr-review-1 deploy SHOULD-FIX #2.)
 
 No data to clean up, no migrations to undo. The `/api/search` route disappears, the frontend dist regenerates without the search box, and the operator's bookmark URL still works (dashboard root renders the existing tabs).
 

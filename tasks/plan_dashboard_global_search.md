@@ -1745,7 +1745,7 @@ git commit -m "build(dashboard): regenerate dist for GlobalSearch component"
 1. PR review (3 parallel reviewers — see workflow above)
 2. Merge to master
 3. `ssh root@89.167.116.187 'cd /root/gecko-alpha && git pull && find . -name __pycache__ -exec rm -rf {} +; systemctl restart gecko-dashboard'`
-4. Verify: `curl http://localhost:8000/api/search?q=troll&limit=5`
+4. Verify (note URL is quoted to escape the shell `&` metachar — pr-review-1 deploy NICE-TO-HAVE #4): `curl 'http://localhost:8000/api/search?q=troll&limit=5'`
 5. Operator UAT: open dashboard, Ctrl+K, search 'chip'
 
 ## Rollback

@@ -40,6 +40,9 @@ export default function GlobalSearch() {
   const [errored, setErrored] = useState(false)
   const [open, setOpen] = useState(false)
   const [activeIdx, setActiveIdx] = useState(-1)
+  // Announce-once-per-result-set to avoid hammering screen-reader output on
+  // every keystroke (pr-review-1 frontend SHOULD-FIX #6).
+  const [announcedFor, setAnnouncedFor] = useState(null)
   const inputRef = useRef(null)
   const dropdownRef = useRef(null)
   const abortRef = useRef(null)
@@ -78,6 +81,10 @@ export default function GlobalSearch() {
 
   useEffect(() => {
     if (q.trim().length < 2) {
+      // Explicit abort of any in-flight request — pr-review-1 frontend
+      // SHOULD-FIX #7. Without this, a stale response after clearing the
+      // input can call setResults on a re-rendered dropdown.
+      if (abortRef.current) abortRef.current.abort()
       setResults(null)
       setErrored(false)
       return undefined
@@ -88,7 +95,12 @@ export default function GlobalSearch() {
 
   useEffect(() => {
     setActiveIdx(results && results.hits && results.hits.length > 0 ? 0 : -1)
-  }, [results])
+    // Announce only when a result-set transition happens (hits-count changed
+    // OR query changed). Prevents per-keystroke screen-reader spam.
+    if (results) {
+      setAnnouncedFor(`${q}|${results.total_hits}`)
+    }
+  }, [results, q])
 
   useEffect(() => {
     const onKey = (e) => {
@@ -154,10 +166,14 @@ export default function GlobalSearch() {
         onKeyDown={onInputKeyDown}
         aria-autocomplete="list"
         aria-controls="gs-listbox"
-        aria-activedescendant={activeIdx >= 0 ? `gs-hit-${activeIdx}` : undefined}
+        aria-activedescendant={
+          open && hits.length > 0 && activeIdx >= 0
+            ? `gs-hit-${activeIdx}`
+            : undefined
+        }
       />
       <div className="sr-only" role="status" aria-live="polite">
-        {results && q.length >= 2
+        {announcedFor && results && q.length >= 2
           ? `${results.total_hits} result${results.total_hits === 1 ? '' : 's'} for ${q}`
           : ''}
       </div>
