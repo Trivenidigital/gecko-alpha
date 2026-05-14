@@ -9,7 +9,7 @@ Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvemen
 - [x] Item 2 - backlog updated: BL-NEW-HERMES-FIRST-DEBT-AUDIT marked SHIPPED with priority follow-ups.
 - [x] Item 3 - CoinGecko breadth + trending hydration fix implemented on `codex/coingecko-breadth-hydration`; PR-ready after 77 focused tests passed. Known unrelated heartbeat/aioresponses failures remain from PR #119 baseline.
 - [x] Item 4 - BL-032 social signal audit drafted in `tasks/findings_bl032_social_signal_audit_2026_05_14.md`; backlog rescope closes custom Twitter/LunarCrush direction and adds scorer-denominator follow-up.
-- [ ] Item 5 - signal-quality gap report for Top Gainers misses.
+- [x] Item 5 - signal-quality gap report drafted in `tasks/findings_top_gainers_gap_2026_05_14.md`; backlog adds BL-NEW-COINGECKO-MIDCAP-GAINER-SCAN for the exact miss class.
 
 ## Completed: BL-NEW-GT-429-HANDLER
 
