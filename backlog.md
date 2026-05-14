@@ -213,20 +213,28 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Changes:** Graduated scoring: 8 pts for $10K-$100K, 5 pts for $100K-$250K, 2 pts for $250K-$500K
 
 ### BL-032: Social signal source decision (consolidates old BL-032 + BL-041)
-**Status:** RESCOPED 2026-05-14 — Hermes X/KOL path exists; evaluate reuse before any new custom social-source code
-**Tag:** `decision-pending` `dead-signal` `consolidates-BL-041` `hermes-first-rescope`
+**Status:** AUDITED 2026-05-14 - see `tasks/findings_bl032_social_signal_audit_2026_05_14.md`.
+**Tag:** `audited` `dead-signal` `consolidates-BL-041` `hermes-first-rescope`
 **Files (eventual):** `scout/ingestion/`, `scout/models.py`, `scout/scorer.py`
 **Why:** `social_mentions_24h` is a 15-point signal that has never fired in production — code review found it's never populated. The old 2026-05-03 conclusion ("Hermes route is closed") is stale after narrative-scanner activation work: installed VPS Hermes now has `social-media/xurl`, `kol_watcher`, `narrative_classifier`, and `narrative_alert_dispatcher`. That path does NOT automatically produce generic social-volume counts, but it does cover the highest-value X/KOL narrative stream. Do not build custom Twitter/LunarCrush code until this existing Hermes path is evaluated against the dead scorer field.
 
-**Current options, in order:**
-- **(a) Reuse existing social rows first.** Compute a cheap `mentions_24h` proxy from existing Telegram curator rows (`tg_social_messages`) plus X narrative rows (`narrative_alerts_inbound` / dispatcher payloads) after verifying schemas and live row rates. No new external dependency.
-- **(b) Re-map the scorer feature.** Replace `social_mentions_24h` with a more honest `narrative_mentions_24h` / `kol_mentions_24h` feature sourced from Hermes and Telegram. This preserves the intent (social confirmation) without pretending it is full-market social volume.
-- **(c) Third-party social API only after proof of residual gap.** LunarCrush / Defined.fi / similar sources require a fresh Hermes-first and cost check. They are not first-line while Hermes X is live.
-- **(d) Honest delete.** Remove `social_mentions_24h`, drop the 15 points from the scorer, lower `SCORER_MAX_RAW`, and document as won't-fix if existing social rows cannot provide a reliable feature.
+**Audit result:** Do NOT build custom Twitter/LunarCrush now. Prod verification found `candidates.social_mentions_24h` is zero for all 1,543 candidates, `social_signals` / `social_baselines` / `social_credit_ledger` are empty, TG social is active (421 messages and 164 signals in 7d), and Hermes X is active but immature (6 `narrative_alerts_inbound` rows, 0 resolved). Telegram rows are curated-call signals, not market-wide social volume; X rows are narrative alerts, not generic social counts. Keep both as first-class surfaces rather than stuffing them into `social_mentions_24h`.
 
-**Acceptance:** (a) or (b) ships and the signal fires non-zero on real tokens from existing rows, OR (d) ships and the dead-signal surface is removed. Option (c) requires a separate approved design with residual-gap evidence.
-**Estimate:** (a)/(b) 0.5–1d after schema audit, (d) 0.25d, (c) provider-dependent.
+**Decision:** Close the "build social API" direction. The remaining residual gap is scorer calibration: `social_mentions_24h` is an unwired 15-point feature inside `SCORER_MAX_RAW`, so removing/replacing it requires backtest rather than casual cleanup.
+
+**Follow-up:** BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT below.
 **Note on consolidation:** This entry replaces the prior separate BL-032 + BL-041 (X/Twitter monitoring). They were two pending entries for the same dead-signal problem; merged 2026-05-03.
+
+### BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT: backtest dead social signal removal/replacement
+**Status:** PROPOSED 2026-05-14.
+**Tag:** `scoring` `dead-signal` `calibration` `hermes-first`
+**Why:** `social_mentions_24h` never fires in production but contributes 15 points to `SCORER_MAX_RAW`. Removing it would raise normalized scores for every candidate, so the correct next move is a backtest/calibration pass, not an inline cleanup.
+
+**Scope:** Compare current scoring denominator against: (1) remove `social_mentions_24h` from scoring/max raw, (2) replace with an evidence-gated `narrative_mentions_24h` / `kol_mentions_24h` sourced from Hermes X + TG only after production row thresholds are met, and (3) leave as-is until X narrative rows mature.
+
+**Hermes-first basis:** Installed Hermes X/KOL path exists and should be the first social source. Third-party social APIs remain deferred unless this audit proves a residual gap.
+
+**Evidence gates before bridge-to-scoring:** at least 50 `narrative_alerts_inbound` rows, at least 20 resolved rows or an explicit symbol-resolution design, and attribution analysis showing X/TG rows improve early signal quality versus existing gainers/trending/momentum surfaces.
 
 ### BL-033: Add heartbeat logging every 5 minutes
 **Status:** DONE — heartbeat logging implemented (PR #7)
