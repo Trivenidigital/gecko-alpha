@@ -64,3 +64,25 @@ class FunnelResponse(BaseModel):
     safety_passed: int = 0
     mirofish_run: int = 0
     alerted: int = 0
+
+
+class SearchHit(BaseModel):
+    canonical_id: str
+    entity_kind: str = "token"
+    symbol: str | None = None
+    name: str | None = None
+    chain: str | None = None
+    contract_address: str | None = None
+    sources: list[str] = []
+    source_counts: dict[str, int] = {}
+    first_seen_at: str | None = None
+    last_seen_at: str | None = None
+    match_quality: str
+    best_paper_trade_pnl_pct: float | None = None
+
+
+class SearchResponse(BaseModel):
+    query: str
+    total_hits: int = 0
+    hits: list[SearchHit] = []
+    truncated: bool = False

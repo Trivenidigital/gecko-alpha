@@ -11,6 +11,7 @@ import HealthTab from './components/HealthTab.jsx'
 import BriefingTab from './components/BriefingTab.jsx'
 import TGAlertsTab from './components/TGAlertsTab.jsx'
 import XAlertsTab from './components/XAlertsTab.jsx'
+import GlobalSearch from './components/GlobalSearch.jsx'
 
 const DEFAULT_STATUS = {
   pipeline_status: 'connecting',
@@ -113,6 +114,7 @@ export default function App() {
     <div className="dashboard">
       <div className="header">
         <h1>Gecko-Alpha Dashboard</h1>
+        <GlobalSearch />
         <div className="live-indicator">
           <div className={`live-dot ${connected ? '' : 'disconnected'}`} />
           <span>{connected ? 'Live' : 'Reconnecting...'}</span>

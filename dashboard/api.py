@@ -113,6 +113,23 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def get_win_rate():
         return await db.get_win_rate(_db_path)
 
+    # --- Global cross-table search ---
+
+    @app.get("/api/search", response_model=None)
+    async def get_search(
+        q: str = Query(..., min_length=2, max_length=128),
+        limit: int = Query(50, ge=1, le=200),
+    ):
+        from fastapi.responses import JSONResponse
+
+        from dashboard.search import QueryTooShortError, run_search
+
+        try:
+            resp = await run_search(_db_path, q, limit=limit)
+        except QueryTooShortError as e:
+            return JSONResponse(status_code=400, content={"detail": str(e)})
+        return resp.model_dump()
+
     # --- Narrative rotation endpoints ---
 
     @app.get("/api/narrative/heating")
