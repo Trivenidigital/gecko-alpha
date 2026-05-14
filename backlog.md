@@ -400,6 +400,23 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 **Adapted from `Trivenidigital/shift-agent` analysis:** the inspiration for BL-072 + BL-073 was `shift-agent`'s `docs/hermes-alignment.md` + `CLAUDE.md` "Hermes-first" rules. shift-agent **runs on Hermes** as its production runtime; gecko-alpha does NOT (vanilla async Python pipeline). The adaptation is structural — we kept the 4-part doc shape and the read-deployed-code rule, dropped the Hermes-specific drift-tag vocabulary as cargo-cult, and replaced it with the more answerable single-line `**New primitives introduced:** [list or NONE]` declaration.
 
+### BL-NEW-HERMES-CRYPTO-SKILLS-TRACKING: track crypto-relevant Hermes ecosystem capabilities
+**Status:** PROPOSED 2026-05-14 - research note captured at `tasks/research_hermes_crypto_skills_2026_05_14.md`.
+**Tag:** `hermes-first` `crypto-skills` `research-gated` `agent-framework-integrations`
+**Why:** The Top Gainers gap investigation found new crypto-relevant skill surfaces outside the original May 3 Hermes pass: CoinGecko's first-party Agent SKILL, GoldRush/Covalent agent skills + Hermes MCP path, HermesHub as an early registry, and updated awesome-hermes-agent entries. These are not runtime replacements for gecko-alpha ingestion today, but they must be tracked so future custom-code proposals do not skip cheaper skill/API-reference paths.
+
+**Tracked findings:**
+- CoinGecko Agent SKILL (`coingecko/skills`) - first-party SKILL-compatible API knowledge for CoinGecko endpoints and workflows. Use as API-reference input for CoinGecko ingestion designs.
+- GoldRush Agent Skills (`covalenthq/goldrush-agent-skills`) + GoldRush Hermes MCP guide - candidate future path for wallet/holder/transfer/DEX-pair intelligence, not a CoinGecko breadth replacement.
+- HermesHub (`amanning3390/hermeshub`) - early curated Hermes skill registry; add to future Hermes-first search surface.
+- Existing VPS Hermes install still has project-owned X/KOL skills (`kol_watcher`, `narrative_classifier`, `narrative_alert_dispatcher`, `xurl`) but no installed CoinGecko/GeckoTerminal market-breadth runtime skill.
+
+**Decision:** For the current Top Gainers miss, do not hand off runtime ingestion to Hermes. Instead, cite the CoinGecko SKILL/API docs in the forthcoming CoinGecko breadth/hydration design and keep gecko-alpha responsible for persistence, dedupe, signal tables, watchdogs, and dashboards.
+
+**Trigger to revisit:** Any future proposal that adds paid market-data APIs, on-chain holder/wallet analysis, x402/AgentCash spend, or new Hermes-installed skills/plugins for crypto data. Re-run installed-VPS inventory + public ecosystem check before coding.
+
+**Kill criterion:** If no crypto-relevant Hermes ecosystem change is adopted by 2026-08-14 and no new custom market-data primitive is proposed before then, close this tracking entry as superseded by the standing AGENTS.md Hermes-first rule.
+
 ### BL-074: Minara as live-execution layer (post-BL-055 unlock)
 **Status:** PHASE 0 Option A SHIPPED 2026-05-11 — see BL-NEW-M1.5C below. Subsequent phases (Option B execution-on-VPS + adapter shape decision) remain gated on BL-055 unlock. Captured 2026-05-03.
 **Tag:** `phase-0-shipped` `gated-on-BL-055` `live-execution` `minara` `hermes-ecosystem`
