@@ -432,7 +432,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Kill criterion:** If no crypto-relevant Hermes ecosystem change is adopted by 2026-08-14 and no new custom market-data primitive is proposed before then, close this tracking entry as superseded by the standing AGENTS.md Hermes-first rule.
 
 ### BL-NEW-HERMES-FIRST-DEBT-AUDIT: classify existing custom-code debt against current Hermes ecosystem
-**Status:** PROPOSED 2026-05-14.
+**Status:** SHIPPED 2026-05-14 - findings doc at `tasks/findings_hermes_first_debt_audit_2026_05.md`.
 **Tag:** `hermes-first` `custom-code-debt` `audit` `debt-reduction`
 **Why:** The project already carries substantial custom code written before the Hermes-first discipline was consistently enforced. Future-only Hermes checks are not enough; the existing backlog and shipped modules need a one-time classification so the project stops adding custom surfaces where a skill/plugin can now own the workflow.
 
@@ -450,7 +450,11 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 - `BRIDGE_TO_HERMES` - gecko-alpha emits/consumes a narrow interface while Hermes owns the workflow.
 - `DELETE_OR_DEFER` - backlog item is stale or no longer worth building.
 
-**Acceptance:** At least the entries named in the 2026-05-14 matrix above are classified with file/backlog references and a recommended next action. No code changes in the audit PR.
+**Result:** Classified market ingestion, CoinGecko hydration, X/KOL social, Telegram social, narrative scanner, Helius/Moralis, Dune/Nansen/pump.fun roadmap, Prometheus/Grafana, watchdogs, operator alerts, Minara/live execution, and GEPA/eval. Highest-priority follow-ups:
+1. CoinGecko breadth + trending hydration fix stays custom but must cite CoinGecko SKILL/API docs.
+2. BL-032 must audit existing Hermes X + Telegram rows before any LunarCrush/custom Twitter work.
+3. Helius/Moralis audits become provider-consolidation comparisons that include GoldRush.
+4. Old LunarCrush/Santiment/Nansen/Dune/pump.fun roadmap entries are historical unless a new residual-gap design revives them.
 
 ### BL-074: Minara as live-execution layer (post-BL-055 unlock)
 **Status:** PHASE 0 Option A SHIPPED 2026-05-11 — see BL-NEW-M1.5C below. Subsequent phases (Option B execution-on-VPS + adapter shape decision) remain gated on BL-055 unlock. Captured 2026-05-03.

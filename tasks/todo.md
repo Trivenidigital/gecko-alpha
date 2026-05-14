@@ -1,8 +1,17 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-09 (autonomous build: BL-NEW-QUOTE-PAIR plan + design + impl + tests; PR pending)
+Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvement run)
 
-## Active Work: BL-NEW-GT-429-HANDLER
+## Active Work: 2026-05-14 gecko-alpha improvement run
+
+- [x] Item 1 - PR #119 merged: Hermes crypto-skill tracking + backlog rescope landed as `acf4b8e`. CI on PR #119 failed on unrelated baseline tests (8 failures across BL064 reload, calibration scheduler, heartbeat mcap, narrative token-id, signal-param revival); docs-only diff was merged with that caveat recorded in merge message.
+- [x] Item 2 - BL-NEW-HERMES-FIRST-DEBT-AUDIT findings drafted in `tasks/findings_hermes_first_debt_audit_2026_05.md`.
+- [x] Item 2 - backlog updated: BL-NEW-HERMES-FIRST-DEBT-AUDIT marked SHIPPED with priority follow-ups.
+- [ ] Item 3 - CoinGecko breadth + trending hydration fix.
+- [ ] Item 4 - BL-032 social signal audit against Hermes X/KOL + Telegram rows.
+- [ ] Item 5 - signal-quality gap report for Top Gainers misses.
+
+## Completed: BL-NEW-GT-429-HANDLER
 
 - [x] Isolated worktree created: `C:\projects\gecko-alpha-gt-429-handler` on `codex/gt-429-handler`
 - [x] Drift check: GeckoTerminal lacks 429/5xx retry; DexScreener has the in-tree retry pattern to reuse
