@@ -6,9 +6,11 @@ import structlog
 
 from scout import heartbeat as heartbeat_module
 from scout.heartbeat import (
+    IngestSourceSample,
     _heartbeat_stats,
     _maybe_emit_heartbeat,
     _reset_heartbeat_stats,
+    observe_ingest_sources,
 )
 
 
@@ -122,6 +124,107 @@ def test_custom_interval_respected(monkeypatch):
     emitted = _maybe_emit_heartbeat(_FastSettings())
     assert emitted is True
     assert captured[0][0] == "heartbeat"
+
+
+def test_ingest_watchdog_alerts_once_at_threshold(monkeypatch):
+    _reset_heartbeat_stats()
+    captured = _capture_logs(monkeypatch)
+
+    class _Settings:
+        INGEST_WATCHDOG_ENABLED = True
+        INGEST_STARVATION_THRESHOLD_CYCLES = 3
+
+    for _ in range(2):
+        assert observe_ingest_sources(
+            [IngestSourceSample(source="coingecko:markets", raw_count=0)],
+            _Settings(),
+        ) == []
+
+    events = observe_ingest_sources(
+        [IngestSourceSample(source="coingecko:markets", raw_count=0)],
+        _Settings(),
+    )
+    assert len(events) == 1
+    assert events[0].kind == "starved"
+    assert events[0].source == "coingecko:markets"
+    assert events[0].consecutive_empty_cycles == 3
+
+    assert observe_ingest_sources(
+        [IngestSourceSample(source="coingecko:markets", raw_count=0)],
+        _Settings(),
+    ) == []
+    assert [event for event, _ in captured].count("ingest_source_starved") == 1
+
+
+def test_ingest_watchdog_recovers_and_resets_episode(monkeypatch):
+    _reset_heartbeat_stats()
+    captured = _capture_logs(monkeypatch)
+
+    class _Settings:
+        INGEST_WATCHDOG_ENABLED = True
+        INGEST_STARVATION_THRESHOLD_CYCLES = 2
+
+    observe_ingest_sources(
+        [IngestSourceSample(source="dexscreener:boosts", raw_count=0)],
+        _Settings(),
+    )
+    observe_ingest_sources(
+        [IngestSourceSample(source="dexscreener:boosts", raw_count=0)],
+        _Settings(),
+    )
+
+    events = observe_ingest_sources(
+        [IngestSourceSample(source="dexscreener:boosts", raw_count=4)],
+        _Settings(),
+    )
+
+    assert len(events) == 1
+    assert events[0].kind == "recovered"
+    assert events[0].source == "dexscreener:boosts"
+    assert any(event == "ingest_source_recovered" for event, _ in captured)
+
+    observe_ingest_sources(
+        [IngestSourceSample(source="dexscreener:boosts", raw_count=0)],
+        _Settings(),
+    )
+    events = observe_ingest_sources(
+        [IngestSourceSample(source="dexscreener:boosts", raw_count=0)],
+        _Settings(),
+    )
+    assert len(events) == 1
+    assert events[0].kind == "starved"
+
+
+def test_ingest_watchdog_ignores_not_expected_samples():
+    _reset_heartbeat_stats()
+
+    class _Settings:
+        INGEST_WATCHDOG_ENABLED = True
+        INGEST_STARVATION_THRESHOLD_CYCLES = 1
+
+    events = observe_ingest_sources(
+        [IngestSourceSample(source="coingecko:midcap", raw_count=0, expected=False)],
+        _Settings(),
+    )
+    assert events == []
+
+
+def test_reset_heartbeat_clears_ingest_watchdog_state():
+    class _Settings:
+        INGEST_WATCHDOG_ENABLED = True
+        INGEST_STARVATION_THRESHOLD_CYCLES = 1
+
+    assert observe_ingest_sources(
+        [IngestSourceSample(source="geckoterminal:ethereum", raw_count=0)],
+        _Settings(),
+    )
+    _reset_heartbeat_stats()
+
+    # If reset failed, this would be suppressed as a duplicate same episode.
+    assert observe_ingest_sources(
+        [IngestSourceSample(source="geckoterminal:ethereum", raw_count=0)],
+        _Settings(),
+    )
 
 
 def test_memecoin_and_narrative_counters_independent(monkeypatch):

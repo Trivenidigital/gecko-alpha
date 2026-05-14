@@ -4,7 +4,7 @@ import pytest
 import aiohttp
 from aioresponses import aioresponses
 
-from scout.ingestion.dexscreener import fetch_trending
+from scout.ingestion.dexscreener import fetch_trending, get_last_watchdog_samples
 
 
 @pytest.fixture
@@ -78,6 +78,10 @@ async def test_fetch_trending_filters_by_market_cap(mock_aiohttp, settings_facto
         tokens = await fetch_trending(session, settings)
 
     assert len(tokens) == 0
+    samples = {sample.source: sample for sample in get_last_watchdog_samples()}
+    assert samples["dexscreener:boosts"].raw_count == 1
+    assert samples["dexscreener:tokens"].raw_count == 1
+    assert samples["dexscreener:tokens"].usable_count == 0
 
 
 async def test_fetch_trending_handles_empty_response(mock_aiohttp, settings_factory):
@@ -92,6 +96,42 @@ async def test_fetch_trending_handles_empty_response(mock_aiohttp, settings_fact
         tokens = await fetch_trending(session, settings)
 
     assert tokens == []
+    sample = get_last_watchdog_samples()[-1]
+    assert sample.source == "dexscreener:boosts"
+    assert sample.raw_count == 0
+    assert sample.error == "no_boosts_or_fetch_failed"
+
+
+async def test_fetch_trending_token_detail_outage_samples_token_starvation(
+    mock_aiohttp, settings_factory
+):
+    mock_aiohttp.get(
+        DEXSCREENER_TRENDING_URL,
+        payload=[
+            {"tokenAddress": "0xabc", "chainId": "solana"},
+            {"tokenAddress": "0xdef", "chainId": "solana"},
+        ],
+    )
+    mock_aiohttp.get("https://api.dexscreener.com/tokens/v1/solana/0xabc", status=500)
+    mock_aiohttp.get("https://api.dexscreener.com/tokens/v1/solana/0xabc", status=500)
+    mock_aiohttp.get("https://api.dexscreener.com/tokens/v1/solana/0xabc", status=500)
+    mock_aiohttp.get("https://api.dexscreener.com/tokens/v1/solana/0xdef", status=500)
+    mock_aiohttp.get("https://api.dexscreener.com/tokens/v1/solana/0xdef", status=500)
+    mock_aiohttp.get("https://api.dexscreener.com/tokens/v1/solana/0xdef", status=500)
+
+    settings = settings_factory(
+        MIN_MARKET_CAP=10000,
+        MAX_MARKET_CAP=500000,
+        MAX_TOKEN_AGE_DAYS=7,
+    )
+    async with aiohttp.ClientSession() as session:
+        tokens = await fetch_trending(session, settings)
+
+    assert tokens == []
+    samples = {sample.source: sample for sample in get_last_watchdog_samples()}
+    assert samples["dexscreener:boosts"].raw_count == 2
+    assert samples["dexscreener:tokens"].raw_count == 0
+    assert samples["dexscreener:tokens"].error == "no_detail_payloads"
 
 
 async def test_fetch_trending_handles_429_with_backoff(

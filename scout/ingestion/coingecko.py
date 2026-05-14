@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import aiohttp
 import structlog
 
-from scout.heartbeat import increment_mcap_null_with_price
+from scout.heartbeat import IngestSourceSample, increment_mcap_null_with_price
 from scout.models import CandidateToken
 from scout.ratelimit import coingecko_limiter
 
@@ -32,6 +32,21 @@ last_raw_by_volume: list[dict] = []
 # and raw-market signal surfaces.
 last_raw_midcap_gainers: list[dict] = []
 _midcap_scan_cycle_counter: int = 0
+_last_watchdog_samples: dict[str, IngestSourceSample] = {}
+
+
+def _set_watchdog_sample(sample: IngestSourceSample) -> None:
+    _last_watchdog_samples[sample.source] = sample
+
+
+def get_last_watchdog_samples() -> list[IngestSourceSample]:
+    """Return latest CoinGecko source-health samples for the current cycle."""
+    return list(_last_watchdog_samples.values())
+
+
+def clear_watchdog_samples() -> None:
+    """Clear cycle-local source-health samples before a new run_cycle gather."""
+    _last_watchdog_samples.clear()
 
 
 async def _get_with_backoff(
@@ -73,6 +88,11 @@ async def fetch_top_movers(
     Union both lists before applying market cap filter.
     """
     logger.info("cg_fetch_attempted", endpoint="coins/markets")
+    global last_raw_markets
+    last_raw_markets = []
+    _set_watchdog_sample(
+        IngestSourceSample(source="coingecko:markets", raw_count=0, error="pending")
+    )
 
     base_params = {
         "vs_currency": "usd",
@@ -105,11 +125,18 @@ async def fetch_top_movers(
                 raw_by_id[cg_id] = raw
 
     if not raw_by_id:
+        _set_watchdog_sample(
+            IngestSourceSample(
+                source="coingecko:markets",
+                raw_count=0,
+                usable_count=0,
+                error="no_raw_data",
+            )
+        )
         logger.warning("cg_no_data", endpoint="coins/markets")
         return []
 
     # Store raw response for price cache consumption by main.py
-    global last_raw_markets
     last_raw_markets = list(raw_by_id.values())
 
     tokens: list[CandidateToken] = []
@@ -135,6 +162,13 @@ async def fetch_top_movers(
         raw_fetched=len(raw_by_id),
         has_api_key=bool(settings.COINGECKO_API_KEY),
     )
+    _set_watchdog_sample(
+        IngestSourceSample(
+            source="coingecko:markets",
+            raw_count=len(raw_by_id),
+            usable_count=len(tokens),
+        )
+    )
     return tokens
 
 
@@ -149,6 +183,11 @@ async def fetch_trending(
     signal regardless of cap. The scorer's market_cap_range signal naturally
     handles filtering at the scoring stage.
     """
+    global last_raw_trending
+    last_raw_trending = []
+    _set_watchdog_sample(
+        IngestSourceSample(source="coingecko:trending", raw_count=0, error="pending")
+    )
     params: dict[str, str] = {}
     if settings.COINGECKO_API_KEY:
         params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
@@ -157,6 +196,14 @@ async def fetch_trending(
         session, f"{CG_BASE}/search/trending", params or None
     )
     if not data or not isinstance(data, dict):
+        _set_watchdog_sample(
+            IngestSourceSample(
+                source="coingecko:trending",
+                raw_count=0,
+                usable_count=0,
+                error="no_raw_data",
+            )
+        )
         logger.warning("cg_no_data", endpoint="search/trending")
         return []
 
@@ -227,10 +274,16 @@ async def fetch_trending(
                 )
         tokens.append(token)
 
-    global last_raw_trending
     last_raw_trending = raw_trending
 
     logger.info("cg_candidates_fetched", count=len(tokens), source="search/trending")
+    _set_watchdog_sample(
+        IngestSourceSample(
+            source="coingecko:trending",
+            raw_count=len(coins),
+            usable_count=len(tokens),
+        )
+    )
     return tokens
 
 
@@ -251,6 +304,11 @@ async def fetch_by_volume(
     strict MAX_MARKET_CAP used for the main pipeline.
     """
     logger.info("cg_fetch_attempted", endpoint="coins/markets:volume_desc")
+    global last_raw_by_volume
+    last_raw_by_volume = []
+    _set_watchdog_sample(
+        IngestSourceSample(source="coingecko:volume", raw_count=0, error="pending")
+    )
 
     base_params = {
         "vs_currency": "usd",
@@ -285,11 +343,18 @@ async def fetch_by_volume(
                 raw_by_id[cg_id] = raw
 
     if not raw_by_id:
+        _set_watchdog_sample(
+            IngestSourceSample(
+                source="coingecko:volume",
+                raw_count=0,
+                usable_count=0,
+                error="no_raw_data",
+            )
+        )
         logger.warning("cg_no_data", endpoint="coins/markets:volume_desc")
         return []
 
     # Store raw response for price cache & losers/gainers tracker
-    global last_raw_by_volume
     last_raw_by_volume = list(raw_by_id.values())
 
     tokens: list[CandidateToken] = []
@@ -314,6 +379,13 @@ async def fetch_by_volume(
         source="coins/markets:volume_desc",
         raw_fetched=len(raw_by_id),
     )
+    _set_watchdog_sample(
+        IngestSourceSample(
+            source="coingecko:volume",
+            raw_count=len(raw_by_id),
+            usable_count=len(tokens),
+        )
+    )
     return tokens
 
 
@@ -337,6 +409,9 @@ async def fetch_midcap_gainers(
     """
     global last_raw_midcap_gainers, _midcap_scan_cycle_counter
     last_raw_midcap_gainers = []
+    _set_watchdog_sample(
+        IngestSourceSample(source="coingecko:midcap", raw_count=0, expected=False)
+    )
 
     if getattr(settings, "COINGECKO_MIDCAP_SCAN_ENABLED", False) is not True:
         return []
@@ -353,6 +428,9 @@ async def fetch_midcap_gainers(
         return []
 
     logger.info("cg_fetch_attempted", endpoint="coins/markets:market_cap_desc_midcap")
+    _set_watchdog_sample(
+        IngestSourceSample(source="coingecko:midcap", raw_count=0, error="pending")
+    )
 
     base_params = {
         "vs_currency": "usd",
@@ -388,6 +466,14 @@ async def fetch_midcap_gainers(
                 raw_by_id[cg_id] = raw
 
     if not raw_by_id:
+        _set_watchdog_sample(
+            IngestSourceSample(
+                source="coingecko:midcap",
+                raw_count=0,
+                usable_count=0,
+                error="no_raw_data",
+            )
+        )
         logger.warning("cg_no_data", endpoint="coins/markets:market_cap_desc_midcap")
         return []
 
@@ -441,6 +527,13 @@ async def fetch_midcap_gainers(
         missing_rank_count=missing_rank_count,
         max_tokens=max_tokens,
     )
+    _set_watchdog_sample(
+        IngestSourceSample(
+            source="coingecko:midcap",
+            raw_count=len(raw_by_id),
+            usable_count=len(tokens),
+        )
+    )
     return tokens
 
 
@@ -448,3 +541,4 @@ def _reset_midcap_scan_cycle_counter_for_tests() -> None:
     """Test-only helper. Production code never calls this."""
     global _midcap_scan_cycle_counter
     _midcap_scan_cycle_counter = 0
+    _last_watchdog_samples.pop("coingecko:midcap", None)

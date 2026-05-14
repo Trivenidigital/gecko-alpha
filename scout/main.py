@@ -23,15 +23,20 @@ from scout.counter.scorer import score_counter_memecoin
 from scout.db import Database
 from scout.gate import evaluate
 from scout.heartbeat import (
+    IngestSourceSample,
+    IngestWatchdogEvent,
     _heartbeat_stats,
     _maybe_emit_heartbeat,
     _reset_heartbeat_stats,
+    observe_ingest_sources,
 )
 from scout.ingestion.coingecko import fetch_top_movers as cg_fetch_top_movers
 from scout.ingestion.coingecko import fetch_trending as cg_fetch_trending
 from scout.ingestion.coingecko import fetch_by_volume as cg_fetch_by_volume
 from scout.ingestion.coingecko import fetch_midcap_gainers as cg_fetch_midcap_gainers
 from scout.ingestion import coingecko as _cg_module
+from scout.ingestion import dexscreener as _dex_module
+from scout.ingestion import geckoterminal as _gt_module
 from scout.ingestion.dexscreener import fetch_trending
 from scout.ingestion.geckoterminal import fetch_trending_pools
 from scout.ingestion.held_position_prices import fetch_held_position_prices
@@ -119,6 +124,125 @@ def _clear_calibration_dryrun_date_for_tests() -> None:
     sentinel to today) doesn't poison T8/T0."""
     global _last_calibration_dryrun_date
     _last_calibration_dryrun_date = ""
+
+
+def _format_ingest_watchdog_event(event: IngestWatchdogEvent) -> str:
+    if event.kind == "recovered":
+        return (
+            "Gecko-Alpha ingestion recovered\n"
+            f"source={event.source}\n"
+            f"last_success_at={event.last_success_at or '-'}"
+        )
+    return (
+        "Gecko-Alpha ingestion starvation\n"
+        f"source={event.source}\n"
+        f"empty_cycles={event.consecutive_empty_cycles}\n"
+        f"threshold={event.threshold}\n"
+        f"last_success_at={event.last_success_at or '-'}\n"
+        f"error={event.error or '-'}"
+    )
+
+
+async def _dispatch_ingest_watchdog_events(
+    events: list[IngestWatchdogEvent],
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    *,
+    dry_run: bool,
+) -> None:
+    for event in events:
+        body = _format_ingest_watchdog_event(event)
+        if dry_run:
+            logger.info(
+                "ingest_watchdog_alert_dry_run",
+                kind=event.kind,
+                source=event.source,
+                consecutive_empty_cycles=event.consecutive_empty_cycles,
+                threshold=event.threshold,
+                last_success_at=event.last_success_at,
+                error=event.error,
+            )
+            continue
+        logger.info(
+            "ingest_watchdog_alert_dispatched",
+            kind=event.kind,
+            source=event.source,
+        )
+        try:
+            await alerter.send_telegram_message(
+                body,
+                session,
+                settings,
+                parse_mode=None,
+                raise_on_failure=True,
+            )
+            logger.info(
+                "ingest_watchdog_alert_delivered",
+                kind=event.kind,
+                source=event.source,
+            )
+        except Exception as exc:
+            logger.warning(
+                "ingest_watchdog_alert_failed",
+                kind=event.kind,
+                source=event.source,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+
+
+def _ingest_watchdog_samples_from_cycle(
+    *,
+    settings: Settings,
+    dex_error: Exception | None,
+    gecko_error: Exception | None,
+    cg_movers_error: Exception | None,
+    cg_trending_error: Exception | None,
+    cg_by_volume_error: Exception | None,
+    cg_midcap_error: Exception | None,
+) -> list[IngestSourceSample]:
+    samples: list[IngestSourceSample] = []
+    if dex_error is not None:
+        samples.append(
+            IngestSourceSample(
+                source="dexscreener:boosts",
+                raw_count=0,
+                error=str(dex_error),
+            )
+        )
+    else:
+        samples.extend(_dex_module.get_last_watchdog_samples())
+
+    if gecko_error is not None:
+        for chain in getattr(settings, "CHAINS", []):
+            samples.append(
+                IngestSourceSample(
+                    source=f"geckoterminal:{chain}",
+                    raw_count=0,
+                    error=str(gecko_error),
+                )
+            )
+    else:
+        samples.extend(_gt_module.get_last_watchdog_samples())
+
+    cg_errors = [
+        ("coingecko:markets", cg_movers_error),
+        ("coingecko:trending", cg_trending_error),
+        ("coingecko:volume", cg_by_volume_error),
+        ("coingecko:midcap", cg_midcap_error),
+    ]
+    error_sources = {source for source, exc in cg_errors if exc is not None}
+    for source, exc in cg_errors:
+        if exc is not None:
+            samples.append(
+                IngestSourceSample(source=source, raw_count=0, error=str(exc))
+            )
+    samples.extend(
+        sample
+        for sample in _cg_module.get_last_watchdog_samples()
+        if sample.source not in error_sources
+    )
+    return samples
 
 
 async def _run_feedback_schedulers(
@@ -495,6 +619,9 @@ async def run_cycle(
     # Refreshes price_cache for tokens currently in open paper_trades regardless
     # of whether they appear in any other ingestion lane. See
     # tasks/plan_held_position_price_freshness.md.
+    _dex_module.clear_watchdog_samples()
+    _gt_module.clear_watchdog_samples()
+    _cg_module.clear_watchdog_samples()
     (
         dex_tokens,
         gecko_tokens,
@@ -514,6 +641,14 @@ async def run_cycle(
         return_exceptions=True,
     )
     # Handle exceptions from gather
+    dex_error = dex_tokens if isinstance(dex_tokens, Exception) else None
+    gecko_error = gecko_tokens if isinstance(gecko_tokens, Exception) else None
+    cg_movers_error = cg_movers if isinstance(cg_movers, Exception) else None
+    cg_trending_error = cg_trending if isinstance(cg_trending, Exception) else None
+    cg_by_volume_error = cg_by_volume if isinstance(cg_by_volume, Exception) else None
+    cg_midcap_error = (
+        cg_midcap_gainers if isinstance(cg_midcap_gainers, Exception) else None
+    )
     if isinstance(dex_tokens, Exception):
         logger.warning("DexScreener ingestion failed", error=str(dex_tokens))
         dex_tokens = []
@@ -537,6 +672,26 @@ async def run_cycle(
     if isinstance(held_position_raw, Exception):
         logger.warning("held_position_refresh failed", error=str(held_position_raw))
         held_position_raw = []
+
+    ingest_watchdog_events = observe_ingest_sources(
+        _ingest_watchdog_samples_from_cycle(
+            settings=settings,
+            dex_error=dex_error,
+            gecko_error=gecko_error,
+            cg_movers_error=cg_movers_error,
+            cg_trending_error=cg_trending_error,
+            cg_by_volume_error=cg_by_volume_error,
+            cg_midcap_error=cg_midcap_error,
+        ),
+        settings,
+    )
+    if ingest_watchdog_events:
+        await _dispatch_ingest_watchdog_events(
+            ingest_watchdog_events,
+            session,
+            settings,
+            dry_run=dry_run,
+        )
 
     # Cache raw CoinGecko prices for dashboard (zero extra API calls)
     all_raw = list(_cg_module.last_raw_markets)

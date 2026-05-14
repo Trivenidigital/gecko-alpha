@@ -83,6 +83,26 @@ def test_coingecko_config_defaults():
     assert s.MIN_VOL_ACCEL_RATIO == 5.0
 
 
+def test_ingest_watchdog_config_defaults():
+    s = Settings(
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.INGEST_WATCHDOG_ENABLED is True
+    assert s.INGEST_STARVATION_THRESHOLD_CYCLES == 5
+
+
+def test_ingest_watchdog_threshold_validator():
+    with pytest.raises(ValueError, match="INGEST_STARVATION_THRESHOLD_CYCLES"):
+        Settings(
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            INGEST_STARVATION_THRESHOLD_CYCLES=0,
+        )
+
+
 def test_settings_weight_sum_validation():
     with pytest.raises(ValueError, match="must sum to 1.0"):
         Settings(

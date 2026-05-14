@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     # See tasks/findings_cycle_change_audit_2026_05_13.md sec 5.
     SCAN_INTERVAL_SECONDS: int = 60
     HEARTBEAT_INTERVAL_SECONDS: int = 300  # BL-033: periodic heartbeat summary
+    INGEST_WATCHDOG_ENABLED: bool = True
+    INGEST_STARVATION_THRESHOLD_CYCLES: int = 5
     MIN_SCORE: int = 60
     CONVICTION_THRESHOLD: int = 70
     QUANT_WEIGHT: float = 0.6
@@ -842,6 +844,13 @@ class Settings(BaseSettings):
     def _validate_heartbeat(cls, v: int) -> int:
         if v <= 0:
             return 300  # default fallback
+        return v
+
+    @field_validator("INGEST_STARVATION_THRESHOLD_CYCLES")
+    @classmethod
+    def _validate_ingest_starvation_threshold(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("INGEST_STARVATION_THRESHOLD_CYCLES must be >= 1")
         return v
 
     @model_validator(mode="after")
