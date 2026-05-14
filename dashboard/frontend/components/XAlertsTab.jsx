@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react'
+import TokenLink from './TokenLink.jsx'
 
 function fmtTime(iso) {
   if (!iso) return '-'
@@ -20,13 +21,29 @@ function fmtConfidence(v) {
 
 function AlertAsset({ alert }) {
   if (alert.extracted_cashtag) {
-    return <span className="tg-badge tg-badge-info">{alert.extracted_cashtag}</span>
+    const cashtag = alert.extracted_cashtag.startsWith('$')
+      ? alert.extracted_cashtag
+      : `$${alert.extracted_cashtag}`
+    return (
+      <a
+        className="tg-badge tg-badge-info x-asset-link"
+        href={`https://x.com/search?q=${encodeURIComponent(cashtag)}&src=typed_query&f=live`}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={`Search ${cashtag} on X`}
+      >
+        {cashtag}
+      </a>
+    )
   }
   if (alert.extracted_ca) {
     return (
-      <span className="x-contract" title={alert.extracted_ca}>
-        {alert.extracted_ca.slice(0, 8)}...{alert.extracted_ca.slice(-6)}
-      </span>
+      <TokenLink
+        tokenId={alert.extracted_ca}
+        symbol={`${alert.extracted_ca.slice(0, 8)}...${alert.extracted_ca.slice(-6)}`}
+        pipeline="memecoin"
+        chain={alert.extracted_chain}
+      />
     )
   }
   return <span className="tg-badge tg-badge-muted">none</span>
