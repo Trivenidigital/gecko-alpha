@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     MIN_VOL_ACCEL_RATIO: float = 5.0
     COINGECKO_API_KEY: str = ""
     COINGECKO_RATE_LIMIT_PER_MIN: int = 25  # buffer under 30/min free tier
+    # Default keeps the main-cycle scheduled CoinGecko calls at 6/min:
+    # top_movers uses 2, trending hydration uses 2, volume scan uses 3,
+    # and held-position refresh can add 1 when enabled. Raise only with
+    # rate-budget review against the 25/min limiter.
+    COINGECKO_VOLUME_SCAN_PAGES: int = 3
 
     # Held-position price-refresh lane (§12c-narrow remediation).
     # See tasks/plan_held_position_price_freshness.md and

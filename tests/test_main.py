@@ -43,6 +43,20 @@ def mock_session():
     return AsyncMock()
 
 
+def test_combine_coin_market_rows_includes_trending_and_dedupes():
+    """Raw-market fan-in includes hydrated trending rows for signal surfaces."""
+    from scout.main import _combine_coin_market_rows
+
+    top_movers = [{"id": "alpha", "source": "top"}]
+    trending = [{"id": "beta", "source": "trending"}, {"id": "alpha", "source": "late"}]
+    by_volume = [{"id": "gamma", "source": "volume"}]
+
+    combined = _combine_coin_market_rows(top_movers, trending, by_volume)
+
+    assert [row["id"] for row in combined] == ["alpha", "beta", "gamma"]
+    assert combined[0]["source"] == "top"
+
+
 async def test_run_cycle_dry_run(mock_db, mock_session, mock_settings):
     """Dry-run mode: pipeline runs but no alerts are sent."""
     from scout.models import CandidateToken

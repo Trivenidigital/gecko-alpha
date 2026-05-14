@@ -6,6 +6,7 @@ import pytest
 import aiohttp
 from aioresponses import aioresponses
 
+from scout.ingestion import coingecko as cg_module
 from scout.ingestion.coingecko import fetch_top_movers, fetch_trending, fetch_by_volume
 from scout.ratelimit import coingecko_limiter
 
@@ -95,6 +96,96 @@ async def test_fetch_trending_populates_rank(settings_factory):
     assert len(tokens) > 0
     assert tokens[0].cg_trending_rank == 1  # 1-indexed
     assert tokens[1].cg_trending_rank == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_trending_hydrates_market_rows_and_preserves_rank(settings_factory):
+    """Trending IDs are hydrated via /coins/markets for downstream raw-market signals."""
+    cg_module.last_raw_trending.clear()
+    settings = settings_factory(MIN_MARKET_CAP=1000, MAX_MARKET_CAP=5_000_000)
+    trending = {
+        "coins": [
+            {"item": {"id": "alpha", "symbol": "alp", "name": "Alpha", "score": 0}},
+            {"item": {"id": "beta", "symbol": "bet", "name": "Beta", "score": 1}},
+        ]
+    }
+    hydrated = [
+        {
+            "id": "alpha",
+            "symbol": "alp",
+            "name": "Alpha",
+            "current_price": 0.01,
+            "market_cap": 1_000_000,
+            "total_volume": 250_000,
+            "price_change_percentage_1h_in_currency": 12.0,
+            "price_change_percentage_24h": 45.0,
+            "price_change_percentage_7d_in_currency": 80.0,
+        },
+        {
+            "id": "beta",
+            "symbol": "bet",
+            "name": "Beta",
+            "current_price": 0.02,
+            "market_cap": 2_000_000,
+            "total_volume": 350_000,
+            "price_change_percentage_1h_in_currency": 5.0,
+            "price_change_percentage_24h": 22.0,
+            "price_change_percentage_7d_in_currency": 40.0,
+        },
+    ]
+
+    with aioresponses() as mocked:
+        mocked.get(TRENDING_PATTERN, payload=trending)
+        mocked.get(MARKETS_PATTERN, payload=hydrated)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_trending(session, settings)
+
+    assert [(t.contract_address, t.cg_trending_rank) for t in tokens] == [
+        ("alpha", 1),
+        ("beta", 2),
+    ]
+    assert tokens[0].market_cap_usd == 1_000_000
+    assert tokens[0].volume_24h_usd == 250_000
+    assert [row["id"] for row in cg_module.last_raw_trending] == ["alpha", "beta"]
+    assert cg_module.last_raw_trending[0]["market_cap"] == 1_000_000
+
+
+@pytest.mark.asyncio
+async def test_fetch_trending_hydration_failure_keeps_rank_without_fake_mcap(
+    settings_factory,
+):
+    """market_cap_rank is rank metadata, not a market cap fallback."""
+    cg_module.last_raw_trending.clear()
+    settings = settings_factory()
+    trending = {
+        "coins": [
+            {
+                "item": {
+                    "id": "rank-only",
+                    "symbol": "ro",
+                    "name": "RankOnly",
+                    "market_cap_rank": 123,
+                    "data": {
+                        "price": 0.03,
+                        "price_change_percentage_24h": {"usd": 31.0},
+                    },
+                }
+            }
+        ]
+    }
+
+    with aioresponses() as mocked:
+        mocked.get(TRENDING_PATTERN, payload=trending)
+        mocked.get(MARKETS_PATTERN, status=500)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_trending(session, settings)
+
+    assert len(tokens) == 1
+    assert tokens[0].contract_address == "rank-only"
+    assert tokens[0].cg_trending_rank == 1
+    assert tokens[0].market_cap_usd == 0
+    assert cg_module.last_raw_trending[0]["id"] == "rank-only"
+    assert cg_module.last_raw_trending[0].get("market_cap") is None
 
 
 @pytest.mark.asyncio
@@ -240,6 +331,36 @@ async def test_fetch_by_volume_unions_page1_and_page2(settings_factory):
 
     tickers = {t.ticker for t in tokens}
     assert tickers == {"p1", "p2"}, f"expected both pages unioned, got {tickers}"
+
+
+@pytest.mark.asyncio
+async def test_fetch_by_volume_uses_configured_page_count(settings_factory):
+    """Configured breadth controls how many volume_desc pages are scanned."""
+    settings = settings_factory(
+        MIN_MARKET_CAP=1_000,
+        COINGECKO_VOLUME_SCAN_PAGES=3,
+    )
+    pages = [
+        [
+            {
+                "id": f"page-{page}",
+                "symbol": f"p{page}",
+                "name": f"Page{page}",
+                "market_cap": 1_000_000 + page,
+                "total_volume": 10_000_000 - page,
+                "price_change_percentage_24h": 20.0 + page,
+            }
+        ]
+        for page in range(1, 4)
+    ]
+
+    with aioresponses() as mocked:
+        for payload in pages:
+            mocked.get(MARKETS_PATTERN, payload=payload)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_by_volume(session, settings)
+
+    assert {t.contract_address for t in tokens} == {"page-1", "page-2", "page-3"}
 
 
 @pytest.mark.asyncio

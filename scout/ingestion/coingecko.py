@@ -136,7 +136,7 @@ async def fetch_top_movers(
 
 async def fetch_trending(
     session: aiohttp.ClientSession,
-    settings: Settings,  # kept for interface consistency with other ingestion sources
+    settings: Settings,
 ) -> list[CandidateToken]:
     """Poll /search/trending. Returns tokens with cg_trending_rank set.
 
@@ -145,41 +145,86 @@ async def fetch_trending(
     signal regardless of cap. The scorer's market_cap_range signal naturally
     handles filtering at the scoring stage.
     """
-    data = await _get_with_backoff(session, f"{CG_BASE}/search/trending")
+    params: dict[str, str] = {}
+    if settings.COINGECKO_API_KEY:
+        params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
+
+    data = await _get_with_backoff(
+        session, f"{CG_BASE}/search/trending", params or None
+    )
     if not data or not isinstance(data, dict):
         logger.warning("cg_no_data", endpoint="search/trending")
         return []
 
     coins = data.get("coins", [])
-    tokens: list[CandidateToken] = []
-    # Also extract raw price data for price_cache enrichment
-    last_raw_trending.clear()
-    for rank, entry in enumerate(coins[:15]):
+    ranked_items: list[tuple[int, dict]] = []
+    ids: list[str] = []
+    for rank, entry in enumerate(coins[:15], start=1):
         item = entry.get("item", {})
-        cg_id = item.get("id", "unknown")
-        token = CandidateToken(
-            contract_address=cg_id,
-            chain="coingecko",
-            token_name=item.get("name", "Unknown"),
-            ticker=item.get("symbol", "???"),
-            cg_trending_rank=rank + 1,  # 1-indexed: position 1 = most trending
-            holder_count=0,
-            holder_growth_1h=0,
+        cg_id = item.get("id")
+        if not cg_id:
+            continue
+        ranked_items.append((rank, item))
+        ids.append(cg_id)
+
+    market_rows_by_id: dict[str, dict] = {}
+    if ids:
+        market_params = {
+            "vs_currency": "usd",
+            "ids": ",".join(ids),
+            "sparkline": "false",
+            "price_change_percentage": "1h,24h,7d",
+        }
+        if settings.COINGECKO_API_KEY:
+            market_params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
+        market_data = await _get_with_backoff(
+            session, f"{CG_BASE}/coins/markets", market_params
         )
-        tokens.append(token)
-        # Extract price data from item.data for price_cache
-        item_data = item.get("data", {})
-        if item_data:
-            last_raw_trending.append(
-                {
-                    "id": cg_id,
-                    "current_price": item_data.get("price"),
-                    "price_change_percentage_24h": item_data.get(
-                        "price_change_percentage_24h", {}
-                    ).get("usd"),
-                    "market_cap": item.get("market_cap_rank"),
-                }
+        if isinstance(market_data, list):
+            market_rows_by_id = {
+                raw["id"]: raw
+                for raw in market_data
+                if isinstance(raw, dict) and raw.get("id")
+            }
+
+    tokens: list[CandidateToken] = []
+    raw_trending: list[dict] = []
+    for rank, item in ranked_items:
+        cg_id = item.get("id", "unknown")
+        raw = market_rows_by_id.get(cg_id)
+        if raw:
+            token = CandidateToken.from_coingecko(raw).model_copy(
+                update={"cg_trending_rank": rank}
             )
+            raw_trending.append(raw)
+        else:
+            token = CandidateToken(
+                contract_address=cg_id,
+                chain="coingecko",
+                token_name=item.get("name", "Unknown"),
+                ticker=item.get("symbol", "???"),
+                cg_trending_rank=rank,
+                holder_count=0,
+                holder_growth_1h=0,
+            )
+            item_data = item.get("data", {})
+            if item_data:
+                raw_trending.append(
+                    {
+                        "id": cg_id,
+                        "symbol": item.get("symbol"),
+                        "name": item.get("name"),
+                        "current_price": item_data.get("price"),
+                        "price_change_percentage_24h": item_data.get(
+                            "price_change_percentage_24h", {}
+                        ).get("usd"),
+                        "market_cap": None,
+                    }
+                )
+        tokens.append(token)
+
+    global last_raw_trending
+    last_raw_trending = raw_trending
 
     logger.info("cg_candidates_fetched", count=len(tokens), source="search/trending")
     return tokens
@@ -213,18 +258,21 @@ async def fetch_by_volume(
     if settings.COINGECKO_API_KEY:
         base_params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
 
-    data_p1, data_p2 = await asyncio.gather(
-        _get_with_backoff(
-            session, f"{CG_BASE}/coins/markets", {**base_params, "page": "1"}
-        ),
-        _get_with_backoff(
-            session, f"{CG_BASE}/coins/markets", {**base_params, "page": "2"}
-        ),
+    page_count = max(1, int(settings.COINGECKO_VOLUME_SCAN_PAGES))
+    pages = await asyncio.gather(
+        *[
+            _get_with_backoff(
+                session,
+                f"{CG_BASE}/coins/markets",
+                {**base_params, "page": str(page)},
+            )
+            for page in range(1, page_count + 1)
+        ],
         return_exceptions=True,
     )
 
     raw_by_id: dict[str, dict] = {}
-    for data in (data_p1, data_p2):
+    for data in pages:
         if isinstance(data, Exception) or not data or not isinstance(data, list):
             continue
         for raw in data:

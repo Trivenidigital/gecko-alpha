@@ -7,7 +7,7 @@ Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvemen
 - [x] Item 1 - PR #119 merged: Hermes crypto-skill tracking + backlog rescope landed as `acf4b8e`. CI on PR #119 failed on unrelated baseline tests (8 failures across BL064 reload, calibration scheduler, heartbeat mcap, narrative token-id, signal-param revival); docs-only diff was merged with that caveat recorded in merge message.
 - [x] Item 2 - BL-NEW-HERMES-FIRST-DEBT-AUDIT findings drafted in `tasks/findings_hermes_first_debt_audit_2026_05.md`.
 - [x] Item 2 - backlog updated: BL-NEW-HERMES-FIRST-DEBT-AUDIT marked SHIPPED with priority follow-ups.
-- [ ] Item 3 - CoinGecko breadth + trending hydration fix.
+- [x] Item 3 - CoinGecko breadth + trending hydration fix implemented on `codex/coingecko-breadth-hydration`; PR-ready after 77 focused tests passed. Known unrelated heartbeat/aioresponses failures remain from PR #119 baseline.
 - [ ] Item 4 - BL-032 social signal audit against Hermes X/KOL + Telegram rows.
 - [ ] Item 5 - signal-quality gap report for Top Gainers misses.
 
