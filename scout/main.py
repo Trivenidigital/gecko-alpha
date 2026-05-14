@@ -463,6 +463,19 @@ async def _maybe_enrich_perp(tokens, *, db, settings):
     return await enrich_candidates_with_perp_anomalies(tokens, db, settings)
 
 
+def _combine_coin_market_rows(*raw_lists: list[dict]) -> list[dict]:
+    """Combine /coins/markets-shaped rows with first-seen dedupe by CG id."""
+    combined: list[dict] = []
+    seen_ids: set[str] = set()
+    for raw_list in raw_lists:
+        for coin in raw_list:
+            cid = coin.get("id", "")
+            if cid and cid not in seen_ids:
+                seen_ids.add(cid)
+                combined.append(coin)
+    return combined
+
+
 async def run_cycle(
     settings: Settings,
     db: Database,
@@ -532,15 +545,13 @@ async def run_cycle(
         except Exception:
             logger.exception("price_cache_error")
 
-    # Combine raw market data from both movers and volume scans (dedup by id)
-    _raw_markets_combined: list[dict] = []
-    _seen_ids: set[str] = set()
-    for raw_list in [_cg_module.last_raw_markets, _cg_module.last_raw_by_volume]:
-        for coin in raw_list:
-            cid = coin.get("id", "")
-            if cid and cid not in _seen_ids:
-                _seen_ids.add(cid)
-                _raw_markets_combined.append(coin)
+    # Combine raw market data from movers, hydrated trending, and volume scans.
+    # Held-position rows refresh price_cache only; they should not create new signals.
+    _raw_markets_combined = _combine_coin_market_rows(
+        _cg_module.last_raw_markets,
+        _cg_module.last_raw_trending,
+        _cg_module.last_raw_by_volume,
+    )
 
     # Volume Spike Detection (zero extra API calls -- uses cached data)
     if settings.VOLUME_SPIKE_ENABLED and _raw_markets_combined:

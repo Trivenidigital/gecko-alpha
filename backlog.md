@@ -456,6 +456,17 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 3. Helius/Moralis audits become provider-consolidation comparisons that include GoldRush.
 4. Old LunarCrush/Santiment/Nansen/Dune/pump.fun roadmap entries are historical unless a new residual-gap design revives them.
 
+### BL-NEW-COINGECKO-BREADTH-HYDRATION: widen CoinGecko signal discovery without new provider debt
+**Status:** PR READY 2026-05-14 - branch `codex/coingecko-breadth-hydration`.
+**Tag:** `signals` `coingecko` `breadth` `hydration` `hermes-first`
+**Why:** Top Gainers audit showed the system can catch winners when they reach existing tables, but some CoinGecko-listed movers never enter `gainers_snapshots`, `volume_history_cg`, `momentum_7d`, `slow_burn_candidates`, or `velocity_alerts`. Two concrete gaps were found: `/search/trending` rows carried rank but not true market data, and the volume scan only covered the top 500 by volume.
+
+**Drift/Hermes-first result:** Existing `scout/ingestion/coingecko.py` and `scout/main.py` already own CoinGecko ingestion and raw-market fan-in. Installed VPS Hermes skills/plugins do not include CoinGecko, GoldRush, market-breadth, top-gainer, or trending-hydration runtime skills. Public CoinGecko Agent SKILL is used as API-reference only; gecko-alpha keeps DB writes, scoring, watchdogs, and dashboards.
+
+**What changed:** `fetch_trending` now hydrates trending IDs through one `/coins/markets?ids=...` request, preserving `cg_trending_rank` while populating true market cap, volume, price, and change fields. `fetch_by_volume` honors new `COINGECKO_VOLUME_SCAN_PAGES` (default 3; raises volume breadth from 500 to 750 while keeping main-cycle scheduled CoinGecko calls well under the 25/min limiter). `run_cycle` now feeds hydrated trending raw rows into the existing gainers/spikes/momentum/slow-burn/velocity raw-market surfaces.
+
+**Verification:** TDD red/green for trending hydration, hydration-failure fallback, configurable volume page count, and raw-row combiner. Focused regression: `tests/test_coingecko.py tests/test_main.py tests/test_main_cryptopanic_integration.py tests/test_gainers_tracker.py tests/test_spikes_detector.py tests/test_slow_burn_detector.py` -> 77 passed. Broader run including `tests/test_heartbeat_mcap_missing.py` still shows the known baseline aioresponses URL-matching failures from PR #119, not a regression in this branch.
+
 ### BL-074: Minara as live-execution layer (post-BL-055 unlock)
 **Status:** PHASE 0 Option A SHIPPED 2026-05-11 — see BL-NEW-M1.5C below. Subsequent phases (Option B execution-on-VPS + adapter shape decision) remain gated on BL-055 unlock. Captured 2026-05-03.
 **Tag:** `phase-0-shipped` `gated-on-BL-055` `live-execution` `minara` `hermes-ecosystem`
