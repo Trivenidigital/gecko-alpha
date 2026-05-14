@@ -19,6 +19,8 @@ Grepped `dashboard/` + `scout/` for `/search`, `search?`, `q=` patterns 2026-05-
 | `dashboard/api.py:444` | Fallback `for pcid, pdata in symbol_map.items(): if pcid.startswith(sym)` — substring lookup inside `gainers_comparisons` enrichment | NO — internal helper, not exposed, only searches `price_cache`. Closes 0% of proposal scope. |
 | `dashboard/frontend/components/TokenLink.jsx:32` | DexScreener external URL `dexscreener.com/search?q=...` | NO — outbound link, not local search. |
 | `scout/resolver/*` | `symbol_aliases` resolver (current row count: **0**) | NO — different domain (venue-symbol normalization), table is empty. |
+| `scout/api/narrative.py` (drift-check addendum 2026-05-14 post plan-review-1) | Inbound HMAC-gated webhook from Hermes that writes to `narrative_alerts_inbound` only. Grep hits on `search` are unrelated (canonical-query-string for HMAC, journalctl-searchability comment). | NO — write-side webhook, not a read-side search endpoint. |
+| `dashboard/db.py` | All existing per-feature query helpers (`get_candidates`, `get_recent_alerts`, etc.) — no cross-table search shape. | NO — single-table reads. |
 
 No existing global-search primitive in tree. Proposal proceeds.
 
@@ -76,10 +78,15 @@ No existing global-search primitive in tree. Proposal proceeds.
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │ Frontend: GlobalSearch.jsx (in App.jsx header)                  │
-│  - debounced input (300ms)                                      │
-│  - Ctrl+K focus, Esc clear                                      │
+│  - debounced input (300ms, skipped on q<2)                      │
+│  - Ctrl+K / "/" focus (guarded vs other editable elements)      │
+│  - Esc clears + blurs                                           │
+│  - Arrow keys navigate results; Enter opens hit                 │
+│  - ARIA combobox/listbox semantics                              │
 │  - fetch('/api/search?q=' + encodeURIComponent(q))              │
-│  - render grouped result list, each row = TokenLink + meta      │
+│  - render grouped result list                                   │
+│  - Renders TokenLink ONLY when canonical_id is a real token     │
+│    identifier (NOT tg_msg:* or x_alert:*)                       │
 └─────────────────────────────────────────────────────────────────┘
                             │
                             ▼
@@ -93,18 +100,25 @@ No existing global-search primitive in tree. Proposal proceeds.
 │ dashboard/search.py — orchestrator                              │
 │  run_search(db_path, q, limit) -> SearchResponse                │
 │   1. Normalize q (strip, lower, reject empty/whitespace-only)   │
-│   2. Open read-only conn (db._ro_db pattern)                    │
+│   2. Each per-table search fn opens its own read-only conn via  │
+│      `dashboard.db._ro_db(db_path)` — same pattern as every     │
+│      other dashboard query. URI mode=ro at the driver level     │
+│      makes accidental writes impossible.                        │
 │   3. Parallel `asyncio.gather()` over per-table search fns      │
 │   4. Each fn returns list[SearchHit]                            │
 │   5. Group by (canonical_id = contract_address or coin_id),     │
 │      collapse multiple hits per entity into one SearchHit with  │
 │      `sources: list[str]` and `first_seen / last_seen` window   │
-│   6. Rank: exact symbol match > prefix match > substring        │
+│   6. Rank: exact symbol > exact contract > prefix > substring   │
 │   7. Apply limit, return SearchResponse                         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**SQL safety invariant:** every query in `search.py` uses parameterized `?` placeholders. The query string is interpolated ONLY into the `?`-bound LIKE pattern after being wrapped as `f"%{q}%"` (FastAPI/Pydantic validates length); never concatenated into raw SQL.
+**SQL safety invariant:** every query in `search.py` uses parameterized `?` placeholders. The query string is interpolated ONLY into the `?`-bound LIKE pattern after being wrapped as `f"%{q}%"` (FastAPI/Pydantic validates length 1-128); never concatenated into raw SQL. Plus every connection opens in **URI read-only mode** (`?mode=ro`) — even if a SQL-injection bypass were found, the driver rejects writes at the kernel level.
+
+**Performance budget (revised after plan-review-1 measurement):** one LIKE query on prod `gainers_snapshots` (87k rows) measured at 61ms. SQLite serializes 13 parallel connections through the file lock, so realistic warm fan-out is **150-300ms**, cold ~300-500ms. Acceptable for a 300ms-debounced interactive search but the original "<50ms" estimate was wrong. Mitigation: per-source `LIMIT limit` keeps per-query cost bounded; `lower(symbol) = ?` exact-match fast path runs first (uses no index but is O(N) without LIKE meta-char overhead); add no new indexes (would require migration; 87k rows is already small).
+
+**Deferred refactor (plan-review-1 SHOULD-FIX #9 — explicitly NOT in this PR):** shared single read-only connection passed to all per-table functions would save ~13× connection-open overhead (~5-10ms each warm). Deferred because (a) it changes every per-table function signature, expanding test surface; (b) the saved ~65-130ms is below the 300ms debounce floor and operator-imperceptible; (c) it's a clean follow-up if perf monitoring shows actual cost.
 
 ## File structure
 
@@ -165,6 +179,12 @@ Expected: `ImportError: cannot import name 'SearchHit' from 'dashboard.models'`
 # Append to dashboard/models.py
 class SearchHit(BaseModel):
     canonical_id: str
+    # entity_kind: "token" for real on-chain tokens / coingecko coins (renders as TokenLink);
+    # "tg_msg" for a single TG message (canonical_id like tg_msg:<id>);
+    # "x_alert" for an unresolved X alert (canonical_id like x_alert:<id>).
+    # Frontend uses this to decide whether to render TokenLink — avoids broken URLs
+    # like coingecko.com/en/coins/tg_msg:123 (plan-review-1 frontend MUST-FIX #4).
+    entity_kind: str = "token"
     symbol: str | None = None
     name: str | None = None
     chain: str | None = None
@@ -256,9 +276,16 @@ uv run pytest tests/test_dashboard_search.py::test_normalize_strips_whitespace -
 
 Read-only. All queries are parameterized — query string NEVER concatenated
 into SQL (only ever bound via `?` placeholders inside `%q%` LIKE patterns).
+All connections open in URI read-only mode (`?mode=ro`) via
+`dashboard.db._ro_db` for defense-in-depth (plan-review-1 backend MUST-FIX #2).
 """
 
 from __future__ import annotations
+
+import aiosqlite
+
+from dashboard.db import _ro_db
+from dashboard.models import SearchHit, SearchResponse
 
 
 class QueryTooShortError(ValueError):
@@ -383,10 +410,6 @@ uv run pytest tests/test_dashboard_search.py::test_search_candidates_exact_symbo
 
 ```python
 # Append to dashboard/search.py
-from dashboard.models import SearchHit
-import aiosqlite
-
-
 def _classify_match(q: str, *fields: str | None) -> str:
     """Return 'exact_symbol', 'exact_contract', 'prefix', or 'substring'."""
     q_lower = q.lower()
@@ -419,8 +442,7 @@ _MATCH_QUALITY_RANK = {
 async def search_candidates(db_path: str, q: str, limit: int) -> list[SearchHit]:
     """Search candidates table on contract_address, token_name, ticker."""
     pattern = f"%{q}%"
-    async with aiosqlite.connect(db_path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with _ro_db(db_path) as conn:
         cur = await conn.execute(
             """SELECT contract_address, chain, token_name, ticker,
                       market_cap_usd, first_seen_at, alerted_at
@@ -438,6 +460,7 @@ async def search_candidates(db_path: str, q: str, limit: int) -> list[SearchHit]
         mq = _classify_match(q, r["contract_address"], r["token_name"], r["ticker"])
         hits.append(SearchHit(
             canonical_id=r["contract_address"],
+            entity_kind="token",
             symbol=r["ticker"],
             name=r["token_name"],
             chain=r["chain"],
@@ -451,6 +474,8 @@ async def search_candidates(db_path: str, q: str, limit: int) -> list[SearchHit]
     hits.sort(key=lambda h: _MATCH_QUALITY_RANK[h.match_quality])
     return hits
 ```
+
+> **Note: test fixture must seed candidates schema with `aiosqlite.connect`-write (NOT `_ro_db`).** The `_ro_db` helper exists in `dashboard/db.py` and only opens connections; tests use the standard `aiosqlite.connect` to seed test fixtures. The plan's test code at Step 3.1 already does this correctly.
 
 - [ ] **Step 3.4: Run tests — expect PASS**
 
@@ -548,8 +573,7 @@ async def test_search_alerts(tmp_path):
 # Append to dashboard/search.py
 async def search_paper_trades(db_path: str, q: str, limit: int) -> list[SearchHit]:
     pattern = f"%{q}%"
-    async with aiosqlite.connect(db_path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with _ro_db(db_path) as conn:
         cur = await conn.execute(
             """SELECT token_id, symbol, name, chain,
                       MIN(opened_at) AS first_seen,
@@ -571,6 +595,7 @@ async def search_paper_trades(db_path: str, q: str, limit: int) -> list[SearchHi
         mq = _classify_match(q, r["symbol"], r["name"], r["token_id"])
         hits.append(SearchHit(
             canonical_id=r["token_id"],
+            entity_kind="token",
             symbol=r["symbol"],
             name=r["name"],
             chain=r["chain"],
@@ -585,17 +610,24 @@ async def search_paper_trades(db_path: str, q: str, limit: int) -> list[SearchHi
 
 
 async def search_alerts(db_path: str, q: str, limit: int) -> list[SearchHit]:
+    """Search alerts. LEFT JOIN candidates so older alert rows (which have NULL
+    ticker/token_name from the pre-migration era) still match queries against
+    the joined candidates row's ticker/token_name. Per plan-review-1 backend
+    SHOULD-FIX #7 — without this join, prod's 2/2 alerts rows are unsearchable
+    by ticker."""
     pattern = f"%{q}%"
-    async with aiosqlite.connect(db_path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with _ro_db(db_path) as conn:
         cur = await conn.execute(
-            """SELECT contract_address, chain, conviction_score, alert_market_cap,
-                      alerted_at, token_name, ticker
-               FROM alerts
-               WHERE lower(contract_address) LIKE ?
-                  OR lower(token_name) LIKE ?
-                  OR lower(ticker) LIKE ?
-               ORDER BY alerted_at DESC
+            """SELECT a.contract_address, a.chain, a.conviction_score, a.alert_market_cap,
+                      a.alerted_at,
+                      COALESCE(a.token_name, c.token_name) AS token_name,
+                      COALESCE(a.ticker, c.ticker) AS ticker
+               FROM alerts a
+               LEFT JOIN candidates c ON a.contract_address = c.contract_address
+               WHERE lower(a.contract_address) LIKE ?
+                  OR lower(COALESCE(a.token_name, c.token_name, '')) LIKE ?
+                  OR lower(COALESCE(a.ticker, c.ticker, '')) LIKE ?
+               ORDER BY a.alerted_at DESC
                LIMIT ?""",
             (pattern, pattern, pattern, limit),
         )
@@ -605,6 +637,7 @@ async def search_alerts(db_path: str, q: str, limit: int) -> list[SearchHit]:
         mq = _classify_match(q, r["contract_address"], r["token_name"], r["ticker"])
         hits.append(SearchHit(
             canonical_id=r["contract_address"],
+            entity_kind="token",
             symbol=r["ticker"],
             name=r["token_name"],
             chain=r["chain"],
@@ -617,6 +650,8 @@ async def search_alerts(db_path: str, q: str, limit: int) -> list[SearchHit]:
         ))
     return hits
 ```
+
+> **Test addendum (plan-review-1 backend SHOULD-FIX #7):** add a test that exercises the LEFT JOIN by inserting an alerts row with `token_name=NULL, ticker=NULL` and a matching candidates row with `ticker='CHIP'`. Confirm the query still returns the alert when searched for 'chip'.
 
 - [ ] **Step 4.4: Run — PASS**
 
@@ -717,15 +752,17 @@ async def search_snapshots(
         ORDER BY last_seen DESC
         LIMIT ?
     """
-    async with aiosqlite.connect(db_path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with _ro_db(db_path) as conn:
         cur = await conn.execute(sql, (pattern, pattern, pattern, limit))
         rows = await cur.fetchall()
     hits = []
     for r in rows:
+        # Some snapshot tables allow nullable name (e.g. slow_burn_candidates.name).
+        # _classify_match tolerates None fields — defensive.
         mq = _classify_match(q, r["symbol"], r["name"], r["coin_id"])
         hits.append(SearchHit(
             canonical_id=r["coin_id"],
+            entity_kind="token",
             symbol=r["symbol"],
             name=r["name"],
             chain="coingecko",
@@ -836,8 +873,7 @@ async def test_search_narrative_inbound_finds_tweet(tmp_path):
 # Append to dashboard/search.py
 async def search_tg_messages(db_path: str, q: str, limit: int) -> list[SearchHit]:
     pattern = f"%{q}%"
-    async with aiosqlite.connect(db_path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with _ro_db(db_path) as conn:
         cur = await conn.execute(
             """SELECT id, channel_handle, posted_at, sender, text, cashtags, contracts
                FROM tg_social_messages
@@ -852,9 +888,11 @@ async def search_tg_messages(db_path: str, q: str, limit: int) -> list[SearchHit
     hits = []
     for r in rows:
         # tg_social_messages doesn't have a canonical token id — use msg id
-        # so dedup at orchestrator level won't collapse distinct messages
+        # so dedup at orchestrator level won't collapse distinct messages.
+        # entity_kind="tg_msg" tells the frontend NOT to render a TokenLink.
         hits.append(SearchHit(
             canonical_id=f"tg_msg:{r['id']}",
+            entity_kind="tg_msg",
             symbol=None,
             name=f"{r['channel_handle']} #{r['id']}",
             chain=None,
@@ -869,8 +907,7 @@ async def search_tg_messages(db_path: str, q: str, limit: int) -> list[SearchHit
 
 async def search_tg_signals(db_path: str, q: str, limit: int) -> list[SearchHit]:
     pattern = f"%{q}%"
-    async with aiosqlite.connect(db_path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with _ro_db(db_path) as conn:
         cur = await conn.execute(
             """SELECT token_id, symbol, contract_address, chain,
                       MIN(created_at) AS first_seen,
@@ -891,6 +928,7 @@ async def search_tg_signals(db_path: str, q: str, limit: int) -> list[SearchHit]
         mq = _classify_match(q, r["symbol"], r["token_id"], r["contract_address"])
         hits.append(SearchHit(
             canonical_id=r["token_id"],
+            entity_kind="token",
             symbol=r["symbol"],
             chain=r["chain"],
             contract_address=r["contract_address"],
@@ -905,8 +943,7 @@ async def search_tg_signals(db_path: str, q: str, limit: int) -> list[SearchHit]
 
 async def search_narrative_inbound(db_path: str, q: str, limit: int) -> list[SearchHit]:
     pattern = f"%{q}%"
-    async with aiosqlite.connect(db_path) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with _ro_db(db_path) as conn:
         cur = await conn.execute(
             """SELECT id, tweet_author, tweet_ts, tweet_text,
                       extracted_cashtag, resolved_coin_id, received_at
@@ -922,12 +959,23 @@ async def search_narrative_inbound(db_path: str, q: str, limit: int) -> list[Sea
         rows = await cur.fetchall()
     hits = []
     for r in rows:
-        canonical = r["resolved_coin_id"] or f"x_alert:{r['id']}"
+        # If the X-narrative classifier resolved the tweet to a coin_id, render
+        # it as a token (TokenLink links to CoinGecko). Otherwise the canonical
+        # is a synthetic x_alert:<id> — entity_kind suppresses the TokenLink.
+        if r["resolved_coin_id"]:
+            canonical = r["resolved_coin_id"]
+            kind = "token"
+            chain = "coingecko"
+        else:
+            canonical = f"x_alert:{r['id']}"
+            kind = "x_alert"
+            chain = None
         hits.append(SearchHit(
             canonical_id=canonical,
+            entity_kind=kind,
             symbol=(r["extracted_cashtag"] or "").lstrip("$") or None,
             name=f"@{r['tweet_author']} (X)",
-            chain="coingecko" if r["resolved_coin_id"] else None,
+            chain=chain,
             sources=["narrative_alerts_inbound"],
             source_counts={"narrative_alerts_inbound": 1},
             first_seen_at=r["received_at"],
@@ -1025,14 +1073,13 @@ async def test_run_search_sql_injection_attempt(tmp_path):
 ```python
 # Append to dashboard/search.py
 import asyncio
-from dashboard.models import SearchResponse
 
 
 async def _safe_call(coro):
     """Wrap a search coroutine so a missing table or other DB error returns []."""
     try:
         return await coro
-    except aiosqlite.OperationalError:
+    except (aiosqlite.OperationalError, FileNotFoundError):
         return []
 
 
@@ -1090,17 +1137,33 @@ async def run_search(db_path: str, raw_q: str, limit: int = 50) -> SearchRespons
             ):
                 existing.best_paper_trade_pnl_pct = h.best_paper_trade_pnl_pct
     merged = list(by_id.values())
+    # Stable sort: match_quality (best first), source count (more sources first),
+    # then last_seen_at DESC. Negate for DESC ordering on the score tuple.
     merged.sort(key=lambda h: (_MATCH_QUALITY_RANK[h.match_quality],
                                 -(len(h.sources)),
-                                h.last_seen_at or ""))
-    truncated = len(merged) > limit
+                                # Latest-seen first: empty strings sort last
+                                # via the trailing negation trick.
+                                -(int(_ts_to_int(h.last_seen_at)))))
+    # Pre-slice total for honest truncation flag (plan-review-1 NICE-TO-HAVE #12).
+    total_pre_slice = len(merged)
     merged = merged[:limit]
     return SearchResponse(
         query=q,
         total_hits=len(merged),
         hits=merged,
-        truncated=truncated,
+        truncated=total_pre_slice > limit,
     )
+
+
+def _ts_to_int(ts: str | None) -> int:
+    """Map ISO timestamp to a sortable int (epoch-seconds). None → 0."""
+    if not ts:
+        return 0
+    try:
+        from datetime import datetime
+        return int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
+    except (ValueError, AttributeError):
+        return 0
 ```
 
 - [ ] **Step 7.4: Run — PASS**
@@ -1114,18 +1177,35 @@ git commit -m "feat(dashboard-search): orchestrator with dedup, ranking, SQL-inj
 
 ---
 
-### Task 8: API route
+### Task 8: API route + module-global test isolation
 
 **Files:**
 - Modify: `dashboard/api.py`
-- Test: `tests/test_dashboard_search.py` (append integration test)
+- Test: `tests/test_dashboard_search.py` (append integration test + fixture)
 
-- [ ] **Step 8.1: Write failing integration test**
+> **Plan-review-1 backend MUST-FIX #1:** `dashboard/api.py` uses module-level globals `_db_path` and `_scout_db` (api.py:47-50). Successive `create_app(db_path=...)` calls in different tests leak state — the cached `_scout_db` from test A is reused by test B against a different DB. The fix is a pytest fixture that resets both module-globals after each test.
+
+- [ ] **Step 8.1: Add the isolation fixture + write failing integration test**
 
 ```python
+# Prepend to tests/test_dashboard_search.py imports section
+import pytest
 from fastapi.testclient import TestClient
 
 
+@pytest.fixture(autouse=True)
+def _reset_dashboard_module_globals():
+    """Reset module-level state in dashboard.api between tests.
+    Required because create_app() mutates module globals (api.py:47-50)."""
+    import dashboard.api as _api
+    saved_db_path = _api._db_path
+    saved_scout_db = _api._scout_db
+    yield
+    _api._db_path = saved_db_path
+    _api._scout_db = saved_scout_db
+
+
+# Append to tests/test_dashboard_search.py
 async def test_search_endpoint_returns_results(tmp_path):
     db_path = str(tmp_path / "scout.db")
     await _seed_candidates(db_path)
@@ -1143,6 +1223,8 @@ async def test_search_endpoint_returns_results(tmp_path):
 
 async def test_search_endpoint_rejects_short_query(tmp_path):
     db_path = str(tmp_path / "scout.db")
+    # _seed_candidates required because _ro_db checks file existence.
+    await _seed_candidates(db_path)
     from dashboard.api import create_app
     app = create_app(db_path=db_path)
     client = TestClient(app)
@@ -1190,7 +1272,7 @@ git commit -m "feat(dashboard-search): wire /api/search route"
 - Modify: `dashboard/frontend/App.jsx`
 - Modify: `dashboard/frontend/style.css`
 
-- [ ] **Step 9.1: Create GlobalSearch.jsx**
+- [ ] **Step 9.1: Create GlobalSearch.jsx (folds plan-review-1 frontend MUST-FIX 1-5 + SHOULD-FIX 6,7,8,9,10,12,17)**
 
 ```jsx
 import React, { useState, useEffect, useRef, useCallback } from 'react'
@@ -1212,52 +1294,107 @@ const SOURCE_LABELS = {
   narrative_alerts_inbound: 'X',
 }
 
+// Map underscore-style match-quality values to dash-style CSS class suffixes
+// (existing project CSS convention is kebab-case throughout — review SHOULD-FIX #8).
+function qualityClass(mq) {
+  return `gs-quality-${(mq || 'substring').replace(/_/g, '-')}`
+}
+
+function fmtTs(ts) {
+  return ts ? ts.slice(0, 16).replace('T', ' ') : ''
+}
+
+// True if the focused element is an input/textarea/contenteditable — used to
+// avoid hijacking "/" while the user is typing into another input on the page
+// (review MUST-FIX #2).
+function isTypingInEditableElement(el) {
+  if (!el) return false
+  const tag = el.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
+  if (el.isContentEditable) return true
+  return false
+}
+
 export default function GlobalSearch() {
   const [q, setQ] = useState('')
   const [results, setResults] = useState(null)
   const [loading, setLoading] = useState(false)
+  const [errored, setErrored] = useState(false)
   const [open, setOpen] = useState(false)
+  const [activeIdx, setActiveIdx] = useState(-1)
   const inputRef = useRef(null)
+  const dropdownRef = useRef(null)
   const abortRef = useRef(null)
 
   const doSearch = useCallback(async (query) => {
     if (!query || query.trim().length < 2) {
       setResults(null)
+      setErrored(false)
       return
     }
     if (abortRef.current) abortRef.current.abort()
     const ctrl = new AbortController()
     abortRef.current = ctrl
     setLoading(true)
+    setErrored(false)
     try {
       const r = await fetch(`/api/search?q=${encodeURIComponent(query)}`, { signal: ctrl.signal })
       if (r.ok) {
         const body = await r.json()
         setResults(body)
       } else if (r.status === 400) {
-        setResults({ query, total_hits: 0, hits: [] })
+        setResults({ query, total_hits: 0, hits: [], truncated: false })
+      } else {
+        setErrored(true)
+        setResults(null)
       }
     } catch (e) {
-      if (e.name !== 'AbortError') setResults(null)
+      if (e.name !== 'AbortError') {
+        setErrored(true)
+        setResults(null)
+      }
     } finally {
       setLoading(false)
     }
   }, [])
 
-  // Debounced search on q change
+  // Debounced search — but skip the timer entirely on <2 chars (review SHOULD-FIX #9, #12).
   useEffect(() => {
+    if (q.trim().length < 2) {
+      setResults(null)
+      setErrored(false)
+      return undefined
+    }
     const t = setTimeout(() => doSearch(q), 300)
     return () => clearTimeout(t)
   }, [q, doSearch])
 
-  // Ctrl+K / Cmd+K to focus
+  // Reset highlight when results change
+  useEffect(() => {
+    setActiveIdx(results && results.hits && results.hits.length > 0 ? 0 : -1)
+  }, [results])
+
+  // Global hotkeys: Ctrl/Cmd+K focuses; "/" focuses when NOT typing in another
+  // input (review MUST-FIX #2 + SHOULD-FIX #6).
   useEffect(() => {
     const onKey = (e) => {
+      // Ctrl/Cmd + K: focus search regardless of where user is typing
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault()
         inputRef.current?.focus()
         setOpen(true)
-      } else if (e.key === 'Escape') {
+        return
+      }
+      // Bare "/" only when user is NOT in another editable element
+      if (e.key === '/' && !isTypingInEditableElement(document.activeElement)) {
+        e.preventDefault()
+        inputRef.current?.focus()
+        setOpen(true)
+        return
+      }
+      // Escape: close + abort in-flight (review MUST-FIX #2 + SHOULD-FIX #10)
+      if (e.key === 'Escape' && document.activeElement === inputRef.current) {
+        if (abortRef.current) abortRef.current.abort()
         setOpen(false)
         inputRef.current?.blur()
       }
@@ -1266,56 +1403,118 @@ export default function GlobalSearch() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
+  const hits = results?.hits || []
+
+  // Arrow-key navigation through results (review SHOULD-FIX #6)
+  const onInputKeyDown = useCallback((e) => {
+    if (!open || hits.length === 0) return
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      setActiveIdx((i) => Math.min(i + 1, hits.length - 1))
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      setActiveIdx((i) => Math.max(i - 1, 0))
+    } else if (e.key === 'Enter' && activeIdx >= 0) {
+      const h = hits[activeIdx]
+      // Only open external link for real token hits — non-token hits (tg_msg,
+      // x_alert) have no useful external URL.
+      if (h && h.entity_kind === 'token') {
+        const tokenId = h.contract_address || h.canonical_id
+        const target = h.chain === 'coingecko' || !tokenId.startsWith('0x')
+          ? `https://www.coingecko.com/en/coins/${tokenId}`
+          : `https://dexscreener.com/${h.chain}/${tokenId}`
+        window.open(target, '_blank', 'noopener,noreferrer')
+      }
+    }
+  }, [open, hits, activeIdx])
+
+  // onMouseDown on dropdown prevents the input from blurring before our click
+  // handler resolves — fixes the TokenLink click race (review MUST-FIX #3).
+  const onDropdownMouseDown = (e) => { e.preventDefault() }
+
   return (
-    <div className="global-search">
+    <div
+      className="global-search"
+      role="combobox"
+      aria-haspopup="listbox"
+      aria-expanded={open && hits.length > 0}
+      aria-owns="gs-listbox"
+    >
       <input
         ref={inputRef}
         className="global-search-input"
         type="text"
-        placeholder="Search tokens, alerts, KOL msgs... (Ctrl+K)"
+        placeholder='Search tokens, alerts, KOL msgs... (Ctrl+K or "/")'
         value={q}
         onChange={(e) => { setQ(e.target.value); setOpen(true) }}
         onFocus={() => setOpen(true)}
-        onBlur={() => setTimeout(() => setOpen(false), 200)}
+        onBlur={() => { /* dropdown's onMouseDown handles click-through */ }}
+        onKeyDown={onInputKeyDown}
+        aria-autocomplete="list"
+        aria-controls="gs-listbox"
+        aria-activedescendant={activeIdx >= 0 ? `gs-hit-${activeIdx}` : undefined}
       />
       {open && q.length >= 2 && (
-        <div className="global-search-dropdown">
+        <div
+          className="global-search-dropdown"
+          role="listbox"
+          id="gs-listbox"
+          ref={dropdownRef}
+          onMouseDown={onDropdownMouseDown}
+        >
           {loading && <div className="gs-state">Searching...</div>}
-          {!loading && results && results.total_hits === 0 && (
+          {!loading && errored && <div className="gs-state gs-error">Search request failed — try again.</div>}
+          {!loading && !errored && results && results.total_hits === 0 && (
             <div className="gs-state">No results for "{q}"</div>
           )}
-          {!loading && results && results.hits.map((h) => (
-            <div key={h.canonical_id} className="gs-hit">
+          {!loading && !errored && hits.map((h, idx) => (
+            <div
+              key={h.canonical_id}
+              id={`gs-hit-${idx}`}
+              role="option"
+              aria-selected={idx === activeIdx}
+              className={`gs-hit ${idx === activeIdx ? 'gs-hit-active' : ''}`}
+              onMouseEnter={() => setActiveIdx(idx)}
+            >
               <div className="gs-hit-main">
-                <TokenLink
-                  tokenId={h.contract_address || h.canonical_id}
-                  symbol={h.symbol || h.name}
-                  chain={h.chain}
-                />
-                <span className="gs-hit-name">{h.name}</span>
-                <span className={`gs-hit-quality gs-quality-${h.match_quality}`}>{h.match_quality}</span>
+                {/* Render TokenLink only for real token entities — prevents broken
+                    coingecko.com/coins/tg_msg:123 URLs (review MUST-FIX #4). */}
+                {h.entity_kind === 'token' ? (
+                  <TokenLink
+                    tokenId={h.contract_address || h.canonical_id}
+                    symbol={h.symbol || h.name}
+                    chain={h.chain}
+                  />
+                ) : (
+                  <span className="gs-non-token">{h.symbol || h.name || h.canonical_id}</span>
+                )}
+                <span className="gs-hit-name">{h.entity_kind !== 'token' ? '' : h.name}</span>
+                <span className={`gs-hit-quality ${qualityClass(h.match_quality)}`}>{h.match_quality}</span>
               </div>
               <div className="gs-hit-sources">
                 {h.sources.map((src) => (
                   <span key={src} className="gs-source-badge" title={`${src}: ${h.source_counts[src] || 1}`}>
-                    {SOURCE_LABELS[src] || src} {h.source_counts[src] > 1 ? `×${h.source_counts[src]}` : ''}
+                    {SOURCE_LABELS[src] || src}{h.source_counts[src] > 1 ? ` ×${h.source_counts[src]}` : ''}
                   </span>
                 ))}
                 {h.best_paper_trade_pnl_pct != null && (
-                  <span className="gs-pnl-badge" title="best paper-trade pnl%">
+                  <span
+                    className={`gs-pnl-badge ${h.best_paper_trade_pnl_pct >= 0 ? 'gs-pnl-pos' : 'gs-pnl-neg'}`}
+                    title="best paper-trade pnl%"
+                  >
                     PnL {h.best_paper_trade_pnl_pct >= 0 ? '+' : ''}{h.best_paper_trade_pnl_pct.toFixed(1)}%
                   </span>
                 )}
               </div>
               <div className="gs-hit-meta">
-                {h.first_seen_at && <span>first: {h.first_seen_at.slice(0, 16).replace('T', ' ')}</span>}
+                {h.first_seen_at && <span>first: {fmtTs(h.first_seen_at)}</span>}
                 {h.last_seen_at && h.last_seen_at !== h.first_seen_at &&
-                  <span> · last: {h.last_seen_at.slice(0, 16).replace('T', ' ')}</span>}
+                  <span> · last: {fmtTs(h.last_seen_at)}</span>}
               </div>
             </div>
           ))}
-          {results && results.truncated && (
-            <div className="gs-state gs-truncated">Showing first {results.hits.length} results — refine query for more.</div>
+          {!loading && !errored && results && results.truncated && (
+            <div className="gs-state gs-truncated">Showing first {hits.length} results — refine query for more.</div>
           )}
         </div>
       )}
@@ -1324,7 +1523,7 @@ export default function GlobalSearch() {
 }
 ```
 
-- [ ] **Step 9.2: Mount in App.jsx header**
+- [ ] **Step 9.2: Mount in App.jsx header (with safe layout — review frontend MUST-FIX #5)**
 
 In `dashboard/frontend/App.jsx`, after the import block add:
 
@@ -1345,37 +1544,82 @@ And modify the header (line 113-120) to:
 </div>
 ```
 
-- [ ] **Step 9.3: Add CSS to style.css**
+Layout safety comes from CSS in Step 9.3 — `.header { flex-wrap: wrap }`, `.global-search { min-width: 0 }`, and a `@media (max-width: 600px)` rule.
+
+- [ ] **Step 9.3: Add CSS to style.css (review frontend MUST-FIX #1, #5 + SHOULD-FIX #8)**
 
 Append to `dashboard/frontend/style.css`:
 
 ```css
 /* --- Global Search --- */
-.global-search { position: relative; flex: 0 1 380px; margin: 0 16px; }
+/* Layout safety: header wraps on narrow viewports; min-width:0 lets flex
+   children shrink below their intrinsic width (review MUST-FIX #5). */
+.header { flex-wrap: wrap; gap: 12px; }
+.global-search {
+  position: relative;
+  flex: 1 1 280px;
+  min-width: 0;
+  max-width: 480px;
+}
 .global-search-input {
   width: 100%; box-sizing: border-box; padding: 8px 12px;
-  background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.15);
-  border-radius: 6px; color: var(--color-text); font-size: 13px;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  color: var(--color-text-primary);  /* review MUST-FIX #1 — exact var name */
+  font-size: 13px;
 }
-.global-search-input:focus { outline: 1px solid #4fc3f7; }
+.global-search-input:focus {
+  outline: none;
+  border-color: var(--color-accent-blue);
+  box-shadow: 0 0 0 2px rgba(88,166,255,0.25);
+}
+.global-search-input::placeholder { color: var(--color-text-secondary); }
 .global-search-dropdown {
   position: absolute; top: 100%; left: 0; right: 0; margin-top: 4px;
-  background: #161b22; border: 1px solid rgba(255,255,255,0.15);
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
   border-radius: 6px; max-height: 480px; overflow-y: auto; z-index: 100;
   box-shadow: 0 8px 24px rgba(0,0,0,0.4);
 }
 .gs-state { padding: 12px; color: var(--color-text-secondary); font-size: 12px; }
-.gs-hit { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+.gs-error { color: var(--color-accent-red); }
+.gs-hit {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--color-border);
+  cursor: default;
+}
 .gs-hit:last-child { border-bottom: none; }
-.gs-hit-main { display: flex; gap: 8px; align-items: baseline; }
+.gs-hit-active { background: rgba(88,166,255,0.08); }
+.gs-hit-main { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.gs-non-token { color: var(--color-text-primary); font-weight: 600; }
 .gs-hit-name { color: var(--color-text-secondary); font-size: 12px; flex: 1; }
-.gs-hit-quality { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: rgba(255,255,255,0.08); color: var(--color-text-secondary); }
-.gs-quality-exact_symbol, .gs-quality-exact_contract { background: rgba(79,195,247,0.2); color: #4fc3f7; }
+.gs-hit-quality {
+  font-size: 10px; padding: 1px 6px; border-radius: 8px;
+  background: var(--color-bar-bg);
+  color: var(--color-text-secondary);
+}
+/* Class suffixes use dash-not-underscore (review SHOULD-FIX #8) */
+.gs-quality-exact-symbol, .gs-quality-exact-contract {
+  background: rgba(88,166,255,0.18);
+  color: var(--color-accent-blue);
+}
 .gs-hit-sources { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
-.gs-source-badge { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: rgba(255,255,255,0.08); color: var(--color-text-secondary); }
-.gs-pnl-badge { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: rgba(76,217,100,0.15); color: #4cd964; }
+.gs-source-badge {
+  font-size: 10px; padding: 1px 6px; border-radius: 8px;
+  background: var(--color-bar-bg);
+  color: var(--color-text-secondary);
+}
+.gs-pnl-badge {
+  font-size: 10px; padding: 1px 6px; border-radius: 8px;
+}
+.gs-pnl-pos { background: rgba(29,158,117,0.15); color: var(--color-accent-green); }
+.gs-pnl-neg { background: rgba(248,81,73,0.15); color: var(--color-accent-red); }
 .gs-hit-meta { font-size: 10px; color: var(--color-text-secondary); margin-top: 4px; }
 .gs-truncated { font-style: italic; }
+@media (max-width: 600px) {
+  .global-search { max-width: none; }
+}
 ```
 
 - [ ] **Step 9.4: Verify visually with `npm run dev`**
