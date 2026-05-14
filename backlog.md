@@ -213,15 +213,19 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Changes:** Graduated scoring: 8 pts for $10K-$100K, 5 pts for $100K-$250K, 2 pts for $250K-$500K
 
 ### BL-032: Social signal source decision (consolidates old BL-032 + BL-041)
-**Status:** DECISION-PENDING — three options below; pick one before any code lands
-**Tag:** `decision-pending` `dead-signal` `consolidates-BL-041`
+**Status:** RESCOPED 2026-05-14 — Hermes X/KOL path exists; evaluate reuse before any new custom social-source code
+**Tag:** `decision-pending` `dead-signal` `consolidates-BL-041` `hermes-first-rescope`
 **Files (eventual):** `scout/ingestion/`, `scout/models.py`, `scout/scorer.py`
-**Why:** `social_mentions_24h` is a 15-point signal that has never fired in production — code review found it's never populated. Hermes findings 2026-05-03 confirmed the 671-skill hub has **no** Twitter/X, social-volume, or LunarCrush-equivalent skill, so the Hermes route is closed. Three real options remain:
-- **(a) Reuse BL-064 listener data.** Compute `mentions_24h` per `coin_id` from the existing `tg_social_messages` table (1,019+ messages already ingested). Cheapest path; data is already on disk; chain-agnostic; no new dependency. Limitation: Telegram-only, not full social graph.
-- **(b) Third-party API.** LunarCrush ($24/mo) was the leading candidate but is in the "do not propose" list (see memory `feedback_lunarcrush_dropped.md`). Other options: Defined.fi (free tier), CryptoPanic social signal (already integrated for news). Cost vs. coverage trade-off; another monthly subscription.
-- **(c) Honest delete.** Remove the `social_mentions_24h` field from `CandidateToken`, drop the 15 points from the scorer, lower `SCORER_MAX_RAW` accordingly, document as won't-fix. Cleanest if no source ever ships.
-**Acceptance:** Either (a) or (b) ships and the signal fires non-zero on real tokens, OR (c) ships and the dead-signal surface is removed from the codebase.
-**Estimate:** (a) 0.5–1d, (b) depends on source, (c) 0.25d.
+**Why:** `social_mentions_24h` is a 15-point signal that has never fired in production — code review found it's never populated. The old 2026-05-03 conclusion ("Hermes route is closed") is stale after narrative-scanner activation work: installed VPS Hermes now has `social-media/xurl`, `kol_watcher`, `narrative_classifier`, and `narrative_alert_dispatcher`. That path does NOT automatically produce generic social-volume counts, but it does cover the highest-value X/KOL narrative stream. Do not build custom Twitter/LunarCrush code until this existing Hermes path is evaluated against the dead scorer field.
+
+**Current options, in order:**
+- **(a) Reuse existing social rows first.** Compute a cheap `mentions_24h` proxy from existing Telegram curator rows (`tg_social_messages`) plus X narrative rows (`narrative_alerts_inbound` / dispatcher payloads) after verifying schemas and live row rates. No new external dependency.
+- **(b) Re-map the scorer feature.** Replace `social_mentions_24h` with a more honest `narrative_mentions_24h` / `kol_mentions_24h` feature sourced from Hermes and Telegram. This preserves the intent (social confirmation) without pretending it is full-market social volume.
+- **(c) Third-party social API only after proof of residual gap.** LunarCrush / Defined.fi / similar sources require a fresh Hermes-first and cost check. They are not first-line while Hermes X is live.
+- **(d) Honest delete.** Remove `social_mentions_24h`, drop the 15 points from the scorer, lower `SCORER_MAX_RAW`, and document as won't-fix if existing social rows cannot provide a reliable feature.
+
+**Acceptance:** (a) or (b) ships and the signal fires non-zero on real tokens from existing rows, OR (d) ships and the dead-signal surface is removed. Option (c) requires a separate approved design with residual-gap evidence.
+**Estimate:** (a)/(b) 0.5–1d after schema audit, (d) 0.25d, (c) provider-dependent.
 **Note on consolidation:** This entry replaces the prior separate BL-032 + BL-041 (X/Twitter monitoring). They were two pending entries for the same dead-signal problem; merged 2026-05-03.
 
 ### BL-033: Add heartbeat logging every 5 minutes
@@ -399,6 +403,54 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Honest reject reasons logged in Phase 0:** `chainlink-agent-skills` (wrong oracle model), `hxsteric/mercury` (wrong problem — execution routing, not signals), `ripley-xmr-gateway` (wrong chain), no paper-trade skill exists, no CoinGecko/DexScreener-specific skill, no SQLite-audit-log skill.
 
 **Adapted from `Trivenidigital/shift-agent` analysis:** the inspiration for BL-072 + BL-073 was `shift-agent`'s `docs/hermes-alignment.md` + `CLAUDE.md` "Hermes-first" rules. shift-agent **runs on Hermes** as its production runtime; gecko-alpha does NOT (vanilla async Python pipeline). The adaptation is structural — we kept the 4-part doc shape and the read-deployed-code rule, dropped the Hermes-specific drift-tag vocabulary as cargo-cult, and replaced it with the more answerable single-line `**New primitives introduced:** [list or NONE]` declaration.
+
+### BL-NEW-HERMES-CRYPTO-SKILLS-TRACKING: track crypto-relevant Hermes ecosystem capabilities
+**Status:** PROPOSED 2026-05-14 - research note captured at `tasks/research_hermes_crypto_skills_2026_05_14.md`.
+**Tag:** `hermes-first` `crypto-skills` `research-gated` `agent-framework-integrations`
+**Why:** The Top Gainers gap investigation found new crypto-relevant skill surfaces outside the original May 3 Hermes pass: CoinGecko's first-party Agent SKILL, GoldRush/Covalent agent skills + Hermes MCP path, HermesHub as an early registry, and updated awesome-hermes-agent entries. These are not runtime replacements for gecko-alpha ingestion today, but they must be tracked so future custom-code proposals do not skip cheaper skill/API-reference paths.
+
+**Tracked findings:**
+- CoinGecko Agent SKILL (`coingecko/skills`) - first-party SKILL-compatible API knowledge for CoinGecko endpoints and workflows. Use as API-reference input for CoinGecko ingestion designs.
+- GoldRush Agent Skills (`covalenthq/goldrush-agent-skills`) + GoldRush Hermes MCP guide - candidate future path for wallet/holder/transfer/DEX-pair intelligence, not a CoinGecko breadth replacement.
+- HermesHub (`amanning3390/hermeshub`) - early curated Hermes skill registry; add to future Hermes-first search surface.
+- Existing VPS Hermes install still has project-owned X/KOL skills (`kol_watcher`, `narrative_classifier`, `narrative_alert_dispatcher`, `xurl`) but no installed CoinGecko/GeckoTerminal market-breadth runtime skill.
+
+**Decision:** For the current Top Gainers miss, do not hand off runtime ingestion to Hermes. Instead, cite the CoinGecko SKILL/API docs in the forthcoming CoinGecko breadth/hydration design and keep gecko-alpha responsible for persistence, dedupe, signal tables, watchdogs, and dashboards.
+
+**Backlog replacement / re-scope matrix (2026-05-14):**
+
+| Existing backlog area | Skill discovery impact | Decision |
+|---|---|---|
+| BL-032 social signal source | Hermes X/KOL path is now installed and live-adjacent (`xurl`, `kol_watcher`, `narrative_classifier`, `narrative_alert_dispatcher`). | Re-scope away from new custom Twitter/LunarCrush code. First evaluate existing Hermes/Telegram rows as the source for a social-confirmation feature. |
+| BL-043 Prometheus/Grafana | HermesHub communication skills and BL-073 Phase 2 ops-agent path may cover some operator-facing monitoring. | Keep deferred; do not build full custom metrics stack until Hermes ops path is accepted/rejected. DB freshness/watchdog primitives remain gecko-alpha-owned. |
+| BL-075 slow-burn watcher | CoinGecko SKILL improves API correctness; GoldRush can later validate on-chain accumulation. | Keep gecko-alpha-owned signal persistence, but require CoinGecko SKILL citation in the design and defer on-chain enrichment to a provider audit. |
+| BL-NEW-HELIUS-PLAN-AUDIT / BL-NEW-MORALIS-PLAN-AUDIT | GoldRush MCP/skills overlap with wallet, holder, transfer, price, DEX-pair, and security-data use cases. | Compare against GoldRush before spending time on provider-specific throttles/upgrades or new custom enrichment code. |
+| Virality / Early Detection roadmaps | Old roadmap overweighted custom LunarCrush, Twitter, Dune, Nansen, and pump.fun builds. | Add Hermes-first overlay: Hermes X first for social, CoinGecko SKILL first for market-data design, GoldRush first for on-chain, custom only for residual runtime gaps. |
+
+**Trigger to revisit:** Any future proposal that adds paid market-data APIs, on-chain holder/wallet analysis, x402/AgentCash spend, or new Hermes-installed skills/plugins for crypto data. Re-run installed-VPS inventory + public ecosystem check before coding.
+
+**Kill criterion:** If no crypto-relevant Hermes ecosystem change is adopted by 2026-08-14 and no new custom market-data primitive is proposed before then, close this tracking entry as superseded by the standing AGENTS.md Hermes-first rule.
+
+### BL-NEW-HERMES-FIRST-DEBT-AUDIT: classify existing custom-code debt against current Hermes ecosystem
+**Status:** PROPOSED 2026-05-14.
+**Tag:** `hermes-first` `custom-code-debt` `audit` `debt-reduction`
+**Why:** The project already carries substantial custom code written before the Hermes-first discipline was consistently enforced. Future-only Hermes checks are not enough; the existing backlog and shipped modules need a one-time classification so the project stops adding custom surfaces where a skill/plugin can now own the workflow.
+
+**Scope:** Audit backlog + shipped modules across five domains:
+- Market data: CoinGecko, GeckoTerminal, DexScreener, CoinMarketCap-like fallbacks.
+- Social/narrative: Telegram, X/KOL, `social_mentions_24h`, narrative classifier/dispatcher.
+- On-chain enrichment: Helius, Moralis, holder/wallet/transfer/security checks, Dune/Nansen-style analytics.
+- Ops/monitoring: watchdogs, dashboards, Prometheus/Grafana, operator notifications.
+- Execution: Minara, live adapters, approval/dispatch boundaries.
+
+**Output:** `tasks/findings_hermes_first_debt_audit_2026_05.md` with each item classified as:
+- `KEEP_CUSTOM` - durable runtime/persistence/scoring primitive that gecko-alpha should own.
+- `USE_SKILL_AS_REFERENCE` - skill improves API correctness/review, but runtime remains gecko-alpha.
+- `REPLACE_WITH_HERMES` - existing/future custom code should be retired in favor of installed/upstream skill.
+- `BRIDGE_TO_HERMES` - gecko-alpha emits/consumes a narrow interface while Hermes owns the workflow.
+- `DELETE_OR_DEFER` - backlog item is stale or no longer worth building.
+
+**Acceptance:** At least the entries named in the 2026-05-14 matrix above are classified with file/backlog references and a recommended next action. No code changes in the audit PR.
 
 ### BL-074: Minara as live-execution layer (post-BL-055 unlock)
 **Status:** PHASE 0 Option A SHIPPED 2026-05-11 — see BL-NEW-M1.5C below. Subsequent phases (Option B execution-on-VPS + adapter shape decision) remain gated on BL-055 unlock. Captured 2026-05-03.
@@ -771,11 +823,13 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 ### BL-NEW-HELIUS-PLAN-AUDIT
 **Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B5 (Broken-if-free / Phantom-if-paid).
 **Action:** confirm prod Helius plan tier; if free: add per-cycle throttle OR move enrichment behind a wall-clock interval (e.g., 30 min per-token cache).
+**2026-05-14 Hermes-first overlay:** before adding provider-specific throttles or upgrading, compare the specific Helius use cases against GoldRush MCP/agent skills and installed optional Hermes `blockchain/solana` support. If GoldRush covers the same wallet/holder/transfer/security data with better operational fit, re-scope this from "Helius plan audit" to "on-chain provider consolidation audit."
 **decision-by:** 1 week (Broken-if-free severity).
 
 ### BL-NEW-MORALIS-PLAN-AUDIT
 **Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B6 (Broken-if-legacy-free; 25× over-cap math: 994k/month vs 40k/month).
 **Action:** confirm prod Moralis plan tier; if legacy-free: throttle OR upgrade.
+**2026-05-14 Hermes-first overlay:** before custom throttling or paid upgrade, compare Moralis calls against GoldRush MCP/agent skills and optional Hermes `blockchain/base` / `blockchain/solana` skills. If the overlap is strong, prefer one consolidated on-chain provider path over parallel custom integrations.
 **decision-by:** 1 week (Broken-if-free severity).
 
 ### BL-NEW-ANTHROPIC-SPEND-TARGET
@@ -1023,6 +1077,12 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 
 ## Virality Detection Roadmap — Multi-Source (Apr 2026)
 
+**2026-05-14 Hermes-first overlay:** This roadmap predates the live Hermes X/KOL narrative path and the May 14 crypto-skill discovery pass. Treat the ranked rollout below as historical context, not execution order. Updated discipline:
+- Social/influencer work: use installed Hermes `xurl` + `kol_watcher` + `narrative_classifier` + `narrative_alert_dispatcher` first; do not start custom Twitter/LunarCrush code until residual gaps are proven.
+- Market-data work: use CoinGecko's first-party Agent SKILL/API docs as review input, but keep gecko-alpha responsible for durable ingestion, signal persistence, and dashboards.
+- On-chain work: compare Dune/Nansen/Helius/Moralis/pump.fun proposals against GoldRush MCP/agent skills before building provider-specific custom code.
+- Meta-classification work: if BL-073 Phase 1 ships, prefer the Hermes self-evolution/eval harness over a fresh custom classifier.
+
 **Context:** ASTEROID (+114775% / +50036.5%) exposed the limit of CoinGecko-only detection. Price/volume is the *symptom* of virality, not the cause. No amount of ML on price history predicts a Musk tweet. Detection scales with **data sources**, not with model training. Each new source unlocks a distinct virality trigger class.
 
 **Trigger taxonomy → data source → lead time:**
@@ -1089,8 +1149,10 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 
 > **NOTE (Apr 2026):** The CoinGecko Trending Tracker (PR #12) + Volume Spike Detector (PR #15) now serve as the primary early detection layer, using FREE CoinGecko data. LunarCrush/Santiment/Nansen phases are DEFERRED — the free approach achieved 56/61 (91.8%) trending hit rate with 62.4h avg lead time.
 
+> **NOTE (2026-05-14):** The "Phase 1 LunarCrush CURRENT" label below is stale. The current first-line path is: fix CoinGecko breadth/hydration using CoinGecko SKILL/API docs as reference, reuse Hermes X/KOL narrative signals for social confirmation, and compare any on-chain provider work against GoldRush before building custom integrations.
+
 ### Phase 1: LunarCrush Social Velocity ($24/mo) — CURRENT
-**Status:** In design
+**Status:** STALE / DO NOT START WITHOUT NEW HERMES-FIRST REVIEW
 **Rationale:** Social mention velocity is the #1 input to CoinGecko's trending algorithm. LunarCrush aggregates Twitter + Reddit + Telegram into a single API. Cheapest way to validate the thesis.
 **Modules:**
 - `scout/early/lunarcrush.py` — API client, fetch Galaxy Score + social volume
