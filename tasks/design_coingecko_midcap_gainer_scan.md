@@ -46,9 +46,10 @@ knowledge for CoinGecko API usage.
 
 ## Runtime-state check
 
-VPS `.env` has `COINGECKO_API_KEY` set. No midcap-scan env overrides exist yet.
-That means the code must have safe defaults and remain within the existing
-CoinGecko limiter budget.
+VPS `/root/gecko-alpha/.env` does not currently set `COINGECKO_API_KEY`, and
+the running `gecko-pipeline` service sees the key as empty. No midcap-scan env
+overrides exist yet. That means the code must have safe public-endpoint
+defaults and remain within the existing CoinGecko limiter budget.
 
 ## Proposed implementation
 
