@@ -172,6 +172,11 @@ async def test_x_alerts_endpoint_returns_latest_rows_and_rollup(client, db):
     }
     assert [row["event_id"] for row in body["alerts"]] == ["evt-new", "evt-old"]
     assert body["alerts"][0]["tweet_url"] == "https://x.com/_Shadow36/status/222"
+    assert (
+        body["alerts"][0]["asset_url"]
+        == "https://dexscreener.com/base/0xABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD"
+    )
+    assert body["alerts"][0]["asset_url_source"] == "dexscreener_contract"
     assert body["alerts"][0]["text_preview"].startswith("_Shadow36 called")
     assert body["alerts"][0]["classifier_version"] == "narrative_classifier-v1.1"
 
@@ -211,6 +216,8 @@ async def test_x_alerts_endpoint_adds_outcome_for_resolved_coin(client, db):
     alert = resp.json()["alerts"][0]
     assert alert["outcome_investment_usd"] == 300.0
     assert alert["outcome_coin_id"] == "goblin"
+    assert alert["asset_url"] == "https://www.coingecko.com/en/coins/goblin"
+    assert alert["asset_url_source"] == "coingecko_resolved"
     assert alert["entry_price_usd"] == 1.0
     assert alert["current_price_usd"] == 1.5
     assert alert["gain_pct_since_alert"] == 50.0
@@ -251,6 +258,8 @@ async def test_x_alerts_endpoint_values_unique_cashtag_match(client, db):
     assert resp.status_code == 200
     alert = resp.json()["alerts"][0]
     assert alert["outcome_coin_id"] == "troll"
+    assert alert["asset_url"] == "https://www.coingecko.com/en/coins/troll"
+    assert alert["asset_url_source"] == "coingecko_resolved"
     assert alert["entry_price_usd"] == 0.10
     assert alert["current_price_usd"] == 0.08
     assert alert["gain_pct_since_alert"] == -20.0
@@ -292,6 +301,8 @@ async def test_x_alerts_endpoint_leaves_ambiguous_cashtag_unpriced(client, db):
     assert resp.status_code == 200
     alert = resp.json()["alerts"][0]
     assert alert["outcome_status"] == "ambiguous_symbol"
+    assert alert["asset_url"] is None
+    assert alert["asset_url_source"] == "ambiguous_symbol"
     assert alert["outcome_coin_id"] is None
     assert alert["entry_price_usd"] is None
     assert alert["current_price_usd"] is None

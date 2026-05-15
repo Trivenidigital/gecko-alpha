@@ -785,6 +785,17 @@ body {
   white-space: nowrap;
 }
 
+.x-asset-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.x-asset-link:hover .tg-badge,
+.x-asset-link:hover .x-contract {
+  border-color: var(--color-accent-blue);
+  color: var(--color-accent-blue);
+}
+
 .x-outcome-positive {
   color: var(--color-accent-green);
   font-weight: 700;

@@ -1536,10 +1536,37 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
             base["outcome_status"] = "priced"
             return base
 
+        def _asset_link(row: aiosqlite.Row, outcome: dict) -> dict:
+            ca = row["extracted_ca"]
+            chain = row["extracted_chain"]
+            if ca:
+                if chain and chain != "coingecko":
+                    return {
+                        "asset_url": f"https://dexscreener.com/{chain}/{ca}",
+                        "asset_url_source": "dexscreener_contract",
+                    }
+                return {
+                    "asset_url": f"https://dexscreener.com/search?q={ca}",
+                    "asset_url_source": "dexscreener_search",
+                }
+
+            coin_id = outcome.get("outcome_coin_id") or row["resolved_coin_id"]
+            if coin_id:
+                return {
+                    "asset_url": f"https://www.coingecko.com/en/coins/{coin_id}",
+                    "asset_url_source": "coingecko_resolved",
+                }
+
+            return {
+                "asset_url": None,
+                "asset_url_source": outcome.get("outcome_status") or "unresolved",
+            }
+
         alerts = []
         for row in rows:
             text = row["tweet_text"] or ""
             outcome = await _outcome(row)
+            asset_link = _asset_link(row, outcome)
             alerts.append(
                 {
                     "id": row["id"],
@@ -1558,6 +1585,7 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                     "classifier_confidence": row["classifier_confidence"],
                     "classifier_version": row["classifier_version"],
                     "received_at": row["received_at"],
+                    **asset_link,
                     **outcome,
                 }
             )

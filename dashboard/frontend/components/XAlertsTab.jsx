@@ -42,11 +42,26 @@ function fmtUsd(v) {
 }
 
 function AlertAsset({ alert }) {
+  const wrap = (node) => {
+    if (!alert.asset_url) return node
+    return (
+      <a
+        className="x-asset-link"
+        href={alert.asset_url}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={alert.asset_url_source || alert.asset_url}
+      >
+        {node}
+      </a>
+    )
+  }
+
   if (alert.extracted_cashtag) {
-    return <span className="tg-badge tg-badge-info">{alert.extracted_cashtag}</span>
+    return wrap(<span className="tg-badge tg-badge-info">{alert.extracted_cashtag}</span>)
   }
   if (alert.extracted_ca) {
-    return (
+    return wrap(
       <span className="x-contract" title={alert.extracted_ca}>
         {alert.extracted_ca.slice(0, 8)}...{alert.extracted_ca.slice(-6)}
       </span>

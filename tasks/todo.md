@@ -10,6 +10,7 @@ Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvemen
 - [x] TDD: add endpoint coverage for $300 flat-investment outcome fields
 - [x] Implement backend valuation with conservative unresolved/ambiguous fallback
 - [x] Add X Alerts table columns for entry price, current price, % since alert, and $ P/L @ $300
+- [x] Follow-up: make X Alert asset values clickable, using DexScreener for contract rows and CoinGecko for confidently resolved coin ids
 - [x] Verify focused backend tests and frontend build: `tests/test_x_alerts_dashboard.py tests/test_dashboard_search.py` -> 34 passed; `npm run build` -> Vite production build passed
 - [x] PR created: https://github.com/Trivenidigital/gecko-alpha/pull/133
 
