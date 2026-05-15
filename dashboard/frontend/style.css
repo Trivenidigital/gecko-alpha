@@ -739,14 +739,31 @@ body {
 
 .x-alert-table th:nth-child(4),
 .x-alert-table td:nth-child(4) {
-  width: 78px;
+  width: 70px;
+}
+
+.x-alert-table th:nth-child(7),
+.x-alert-table td:nth-child(7),
+.x-alert-table th:nth-child(8),
+.x-alert-table td:nth-child(8),
+.x-alert-table th:nth-child(9),
+.x-alert-table td:nth-child(9),
+.x-alert-table th:nth-child(10),
+.x-alert-table td:nth-child(10),
+.x-alert-table th:nth-child(11),
+.x-alert-table td:nth-child(11) {
+  width: 96px;
+  white-space: nowrap;
 }
 
 .x-alert-table th:nth-child(6),
-.x-alert-table td:nth-child(6),
-.x-alert-table th:nth-child(7),
-.x-alert-table td:nth-child(7) {
-  width: 110px;
+.x-alert-table td:nth-child(6) {
+  width: 88px;
+}
+
+.x-alert-table th:nth-child(12),
+.x-alert-table td:nth-child(12) {
+  width: 130px;
 }
 
 .x-author-link {
@@ -766,6 +783,20 @@ body {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 12px;
   white-space: nowrap;
+}
+
+.x-outcome-positive {
+  color: var(--color-accent-green);
+  font-weight: 700;
+}
+
+.x-outcome-negative {
+  color: var(--color-accent-red);
+  font-weight: 700;
+}
+
+.x-outcome-muted {
+  color: var(--color-text-secondary);
 }
 
 /* --- Global Search --- */

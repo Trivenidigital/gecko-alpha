@@ -2,6 +2,16 @@
 
 Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvement run)
 
+## Active Work: X Alerts outcome columns
+
+- [x] Isolated worktree created: `C:\projects\gecko-alpha-x-alert-outcome` on `codex/x-alert-outcome`
+- [x] Drift check: existing X Alerts dashboard reads `narrative_alerts_inbound`; existing market tables include `price_cache`, `gainers_snapshots`, `volume_history_cg`, `volume_spikes`, and `momentum_7d`
+- [x] Hermes-first check: existing Hermes `xurl` / `narrative_classifier` / `narrative_alert_dispatcher` path remains the source of X signals; this change adds dashboard-side valuation only, so no new Hermes/custom ingestion primitive is introduced
+- [x] TDD: add endpoint coverage for $300 flat-investment outcome fields
+- [x] Implement backend valuation with conservative unresolved/ambiguous fallback
+- [x] Add X Alerts table columns for entry price, current price, % since alert, and $ P/L @ $300
+- [x] Verify focused backend tests and frontend build: `tests/test_x_alerts_dashboard.py tests/test_dashboard_search.py` -> 34 passed; `npm run build` -> Vite production build passed
+
 ## Active Work: BL-NEW-CG-RATE-LIMITER-BURST-PROFILE
 
 - [x] Isolated worktree created: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-cg-burst-smoothing` on `codex/cg-burst-smoothing`

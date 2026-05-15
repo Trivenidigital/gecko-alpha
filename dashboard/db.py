@@ -1339,9 +1339,207 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                 return None
             return f"https://x.com/{author}/status/{tweet_id}"
 
+        async def _safe_fetchall(sql: str, params: tuple = ()) -> list[aiosqlite.Row]:
+            try:
+                cur = await conn.execute(sql, params)
+                return await cur.fetchall()
+            except aiosqlite.OperationalError as exc:
+                structlog.get_logger().debug(
+                    "dashboard_x_alerts_outcome_source_unavailable",
+                    err=str(exc),
+                )
+                return []
+
+        async def _resolve_coin_id_for_outcome(row: aiosqlite.Row) -> tuple[str | None, str]:
+            resolved = row["resolved_coin_id"]
+            if resolved:
+                return resolved, "resolved_coin_id"
+
+            ca = row["extracted_ca"]
+            chain = row["extracted_chain"]
+            if ca and chain:
+                matches = await _safe_fetchall(
+                    """SELECT DISTINCT coingecko_id AS coin_id
+                       FROM candidates
+                       WHERE LOWER(contract_address) = LOWER(?)
+                         AND chain = ?
+                         AND COALESCE(coingecko_id, '') != ''""",
+                    (ca, chain),
+                )
+                coin_ids = sorted({r["coin_id"] for r in matches if r["coin_id"]})
+                if len(coin_ids) == 1:
+                    return coin_ids[0], "contract_match"
+                if len(coin_ids) > 1:
+                    return None, "ambiguous_contract"
+
+            cashtag = row["extracted_cashtag"]
+            symbol = (cashtag or "").strip().lstrip("$").upper()
+            if not symbol:
+                return None, "unresolved"
+
+            symbol_rows: list[aiosqlite.Row] = []
+            for table, time_col in (
+                ("gainers_snapshots", "snapshot_at"),
+                ("volume_history_cg", "recorded_at"),
+                ("volume_spikes", "detected_at"),
+                ("momentum_7d", "detected_at"),
+            ):
+                symbol_rows.extend(
+                    await _safe_fetchall(
+                        f"""SELECT DISTINCT coin_id
+                            FROM {table}
+                            WHERE UPPER(symbol) = ?
+                              AND COALESCE(coin_id, '') != ''
+                            ORDER BY datetime({time_col}) DESC
+                            LIMIT 25""",
+                        (symbol,),
+                    )
+                )
+
+            coin_ids = sorted({r["coin_id"] for r in symbol_rows if r["coin_id"]})
+            if len(coin_ids) == 1:
+                return coin_ids[0], "unique_symbol"
+            if len(coin_ids) > 1:
+                return None, "ambiguous_symbol"
+            return None, "unresolved_symbol"
+
+        async def _price_at_alert(coin_id: str, received_at: str) -> float | None:
+            def _parse_ts(value: str | None) -> datetime | None:
+                if not value:
+                    return None
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    return parsed
+                except ValueError:
+                    return None
+
+            received_dt = _parse_ts(received_at)
+            sources: list[tuple[datetime, float]] = []
+            source_queries = (
+                (
+                    "gainers_snapshots",
+                    "snapshot_at",
+                    "price_at_snapshot",
+                    """SELECT snapshot_at AS ts, price_at_snapshot AS price
+                       FROM gainers_snapshots
+                       WHERE coin_id = ?
+                         AND price_at_snapshot IS NOT NULL
+                         AND datetime(snapshot_at) BETWEEN datetime(?, '-24 hours')
+                                                    AND datetime(?, '+24 hours')""",
+                ),
+                (
+                    "losers_snapshots",
+                    "snapshot_at",
+                    "price_at_snapshot",
+                    """SELECT snapshot_at AS ts, price_at_snapshot AS price
+                       FROM losers_snapshots
+                       WHERE coin_id = ?
+                         AND price_at_snapshot IS NOT NULL
+                         AND datetime(snapshot_at) BETWEEN datetime(?, '-24 hours')
+                                                    AND datetime(?, '+24 hours')""",
+                ),
+                (
+                    "volume_history_cg",
+                    "recorded_at",
+                    "price",
+                    """SELECT recorded_at AS ts, price AS price
+                       FROM volume_history_cg
+                       WHERE coin_id = ?
+                         AND price IS NOT NULL
+                         AND datetime(recorded_at) BETWEEN datetime(?, '-24 hours')
+                                                     AND datetime(?, '+24 hours')""",
+                ),
+                (
+                    "volume_spikes",
+                    "detected_at",
+                    "price",
+                    """SELECT detected_at AS ts, price AS price
+                       FROM volume_spikes
+                       WHERE coin_id = ?
+                         AND price IS NOT NULL
+                         AND datetime(detected_at) BETWEEN datetime(?, '-24 hours')
+                                                     AND datetime(?, '+24 hours')""",
+                ),
+                (
+                    "momentum_7d",
+                    "detected_at",
+                    "current_price",
+                    """SELECT detected_at AS ts, current_price AS price
+                       FROM momentum_7d
+                       WHERE coin_id = ?
+                         AND current_price IS NOT NULL
+                         AND datetime(detected_at) BETWEEN datetime(?, '-24 hours')
+                                                     AND datetime(?, '+24 hours')""",
+                ),
+            )
+            for _table, _time_col, _price_col, sql in source_queries:
+                for price_row in await _safe_fetchall(sql, (coin_id, received_at, received_at)):
+                    parsed_ts = _parse_ts(price_row["ts"])
+                    if parsed_ts and price_row["price"] and price_row["price"] > 0:
+                        sources.append((parsed_ts, float(price_row["price"])))
+
+            if not sources:
+                return None
+
+            if received_dt is None:
+                return sorted(sources, key=lambda item: item[0], reverse=True)[0][1]
+
+            before = [(ts, price) for ts, price in sources if ts <= received_dt]
+            if before:
+                return sorted(before, key=lambda item: item[0], reverse=True)[0][1]
+            return sorted(sources, key=lambda item: item[0])[0][1]
+
+        async def _current_price(coin_id: str) -> float | None:
+            rows = await _safe_fetchall(
+                """SELECT current_price
+                   FROM price_cache
+                   WHERE coin_id = ? AND current_price IS NOT NULL
+                   LIMIT 1""",
+                (coin_id,),
+            )
+            if rows and rows[0]["current_price"] and rows[0]["current_price"] > 0:
+                return float(rows[0]["current_price"])
+            return None
+
+        async def _outcome(row: aiosqlite.Row) -> dict:
+            investment = 300.0
+            coin_id, status = await _resolve_coin_id_for_outcome(row)
+            base = {
+                "outcome_investment_usd": investment,
+                "outcome_coin_id": coin_id,
+                "entry_price_usd": None,
+                "current_price_usd": None,
+                "gain_pct_since_alert": None,
+                "profit_usd_at_300": None,
+                "outcome_status": status,
+            }
+            if not coin_id:
+                return base
+
+            entry = await _price_at_alert(coin_id, row["received_at"])
+            current = await _current_price(coin_id)
+            base["entry_price_usd"] = entry
+            base["current_price_usd"] = current
+
+            if entry is None:
+                base["outcome_status"] = "no_entry_price"
+                return base
+            if current is None:
+                base["outcome_status"] = "no_current_price"
+                return base
+
+            gain_pct = ((current - entry) / entry) * 100
+            base["gain_pct_since_alert"] = round(gain_pct, 4)
+            base["profit_usd_at_300"] = round(investment * (gain_pct / 100), 2)
+            base["outcome_status"] = "priced"
+            return base
+
         alerts = []
         for row in rows:
             text = row["tweet_text"] or ""
+            outcome = await _outcome(row)
             alerts.append(
                 {
                     "id": row["id"],
@@ -1360,6 +1558,7 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                     "classifier_confidence": row["classifier_confidence"],
                     "classifier_version": row["classifier_version"],
                     "received_at": row["received_at"],
+                    **outcome,
                 }
             )
 

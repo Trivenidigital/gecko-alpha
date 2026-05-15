@@ -76,6 +76,50 @@ async def _insert_x_alert(
     await conn.commit()
 
 
+async def _insert_price_cache(
+    conn,
+    *,
+    coin_id: str,
+    current_price: float,
+    updated_at: str,
+):
+    await conn.execute(
+        """INSERT OR REPLACE INTO price_cache
+           (coin_id, current_price, price_change_24h, price_change_7d,
+            market_cap, updated_at)
+           VALUES (?, ?, NULL, NULL, NULL, ?)""",
+        (coin_id, current_price, updated_at),
+    )
+    await conn.commit()
+
+
+async def _insert_gainers_snapshot(
+    conn,
+    *,
+    coin_id: str,
+    symbol: str,
+    price_at_snapshot: float,
+    snapshot_at: str,
+):
+    await conn.execute(
+        """INSERT INTO gainers_snapshots (
+               coin_id, symbol, name, price_change_24h, market_cap,
+               volume_24h, price_at_snapshot, snapshot_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            coin_id,
+            symbol,
+            f"{symbol.title()} Token",
+            10.0,
+            1_000_000.0,
+            250_000.0,
+            price_at_snapshot,
+            snapshot_at,
+        ),
+    )
+    await conn.commit()
+
+
 async def test_x_alerts_endpoint_returns_latest_rows_and_rollup(client, db):
     c = client
     d, _db_path = db
@@ -130,6 +174,129 @@ async def test_x_alerts_endpoint_returns_latest_rows_and_rollup(client, db):
     assert body["alerts"][0]["tweet_url"] == "https://x.com/_Shadow36/status/222"
     assert body["alerts"][0]["text_preview"].startswith("_Shadow36 called")
     assert body["alerts"][0]["classifier_version"] == "narrative_classifier-v1.1"
+
+
+async def test_x_alerts_endpoint_adds_outcome_for_resolved_coin(client, db):
+    c = client
+    d, _db_path = db
+    alert_time = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    await _insert_x_alert(
+        d._conn,
+        event_id="evt-valued",
+        tweet_author="trade",
+        tweet_id="444",
+        received_at=alert_time.isoformat(),
+        extracted_cashtag="$GOBLIN",
+        resolved_coin_id="goblin",
+        classifier_confidence=0.88,
+    )
+    await _insert_gainers_snapshot(
+        d._conn,
+        coin_id="goblin",
+        symbol="GOBLIN",
+        price_at_snapshot=1.00,
+        snapshot_at=(alert_time - timedelta(minutes=5)).isoformat(),
+    )
+    await _insert_price_cache(
+        d._conn,
+        coin_id="goblin",
+        current_price=1.50,
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    resp = await c.get("/api/x_alerts?limit=1")
+
+    assert resp.status_code == 200
+    alert = resp.json()["alerts"][0]
+    assert alert["outcome_investment_usd"] == 300.0
+    assert alert["outcome_coin_id"] == "goblin"
+    assert alert["entry_price_usd"] == 1.0
+    assert alert["current_price_usd"] == 1.5
+    assert alert["gain_pct_since_alert"] == 50.0
+    assert alert["profit_usd_at_300"] == 150.0
+    assert alert["outcome_status"] == "priced"
+
+
+async def test_x_alerts_endpoint_values_unique_cashtag_match(client, db):
+    c = client
+    d, _db_path = db
+    alert_time = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    await _insert_x_alert(
+        d._conn,
+        event_id="evt-cashtag",
+        tweet_author="_Shadow36",
+        tweet_id="555",
+        received_at=alert_time.isoformat(),
+        extracted_cashtag="$TROLL",
+        classifier_confidence=0.90,
+    )
+    await _insert_gainers_snapshot(
+        d._conn,
+        coin_id="troll",
+        symbol="TROLL",
+        price_at_snapshot=0.10,
+        snapshot_at=(alert_time + timedelta(minutes=4)).isoformat(),
+    )
+    await _insert_price_cache(
+        d._conn,
+        coin_id="troll",
+        current_price=0.08,
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    resp = await c.get("/api/x_alerts?limit=1")
+
+    assert resp.status_code == 200
+    alert = resp.json()["alerts"][0]
+    assert alert["outcome_coin_id"] == "troll"
+    assert alert["entry_price_usd"] == 0.10
+    assert alert["current_price_usd"] == 0.08
+    assert alert["gain_pct_since_alert"] == -20.0
+    assert alert["profit_usd_at_300"] == -60.0
+    assert alert["outcome_status"] == "priced"
+
+
+async def test_x_alerts_endpoint_leaves_ambiguous_cashtag_unpriced(client, db):
+    c = client
+    d, _db_path = db
+    alert_time = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    await _insert_x_alert(
+        d._conn,
+        event_id="evt-ambiguous",
+        tweet_author="trade",
+        tweet_id="666",
+        received_at=alert_time.isoformat(),
+        extracted_cashtag="$CAT",
+        classifier_confidence=0.77,
+    )
+    for coin_id in ("cat-token", "cat-in-a-dogs-world"):
+        await _insert_gainers_snapshot(
+            d._conn,
+            coin_id=coin_id,
+            symbol="CAT",
+            price_at_snapshot=1.0,
+            snapshot_at=alert_time.isoformat(),
+        )
+        await _insert_price_cache(
+            d._conn,
+            coin_id=coin_id,
+            current_price=2.0,
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    resp = await c.get("/api/x_alerts?limit=1")
+
+    assert resp.status_code == 200
+    alert = resp.json()["alerts"][0]
+    assert alert["outcome_status"] == "ambiguous_symbol"
+    assert alert["outcome_coin_id"] is None
+    assert alert["entry_price_usd"] is None
+    assert alert["current_price_usd"] is None
+    assert alert["gain_pct_since_alert"] is None
+    assert alert["profit_usd_at_300"] is None
 
 
 async def test_x_alerts_endpoint_clamps_limit_and_handles_empty(client):

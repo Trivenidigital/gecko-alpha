@@ -18,6 +18,29 @@ function fmtConfidence(v) {
   return `${Math.round(Number(v) * 100)}%`
 }
 
+function fmtPrice(v) {
+  if (v == null) return '-'
+  const n = Number(v)
+  if (!Number.isFinite(n)) return '-'
+  if (n >= 1) return `$${n.toFixed(4)}`
+  if (n >= 0.01) return `$${n.toFixed(5)}`
+  return `$${n.toPrecision(4)}`
+}
+
+function fmtPct(v) {
+  if (v == null) return '-'
+  const n = Number(v)
+  if (!Number.isFinite(n)) return '-'
+  return `${n > 0 ? '+' : ''}${n.toFixed(1)}%`
+}
+
+function fmtUsd(v) {
+  if (v == null) return '-'
+  const n = Number(v)
+  if (!Number.isFinite(n)) return '-'
+  return `${n >= 0 ? '+' : '-'}$${Math.abs(n).toFixed(2)}`
+}
+
 function AlertAsset({ alert }) {
   if (alert.extracted_cashtag) {
     return <span className="tg-badge tg-badge-info">{alert.extracted_cashtag}</span>
@@ -30,6 +53,16 @@ function AlertAsset({ alert }) {
     )
   }
   return <span className="tg-badge tg-badge-muted">none</span>
+}
+
+function OutcomeCell({ value, kind = 'number' }) {
+  const priced = value != null
+  const cls = priced && Number(value) > 0
+    ? 'x-outcome-positive'
+    : priced && Number(value) < 0
+      ? 'x-outcome-negative'
+      : 'x-outcome-muted'
+  return <span className={cls}>{kind === 'usd' ? fmtUsd(value) : kind === 'pct' ? fmtPct(value) : fmtPrice(value)}</span>
 }
 
 function UrgencyBadge({ value }) {
@@ -132,6 +165,10 @@ export default function XAlertsTab() {
                 <th>Theme</th>
                 <th>Urgency</th>
                 <th>Confidence</th>
+                <th>Entry</th>
+                <th>Current</th>
+                <th>Gain</th>
+                <th>P/L @ $300</th>
                 <th>Resolved</th>
                 <th>Tweet</th>
               </tr>
@@ -154,6 +191,10 @@ export default function XAlertsTab() {
                   <td>{a.narrative_theme || '-'}</td>
                   <td><UrgencyBadge value={a.urgency_signal} /></td>
                   <td>{fmtConfidence(a.classifier_confidence)}</td>
+                  <td title={a.outcome_status || ''}><OutcomeCell value={a.entry_price_usd} /></td>
+                  <td><OutcomeCell value={a.current_price_usd} /></td>
+                  <td><OutcomeCell value={a.gain_pct_since_alert} kind="pct" /></td>
+                  <td><OutcomeCell value={a.profit_usd_at_300} kind="usd" /></td>
                   <td>{a.resolved_coin_id || '-'}</td>
                   <td className="tg-text-cell">{a.text_preview || '(empty)'}</td>
                 </tr>
