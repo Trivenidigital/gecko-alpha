@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from scout.main import run_cycle
+from scout.main import _fetch_coingecko_lanes, run_cycle
 
 
 @pytest.fixture
@@ -55,6 +55,41 @@ def test_combine_coin_market_rows_includes_trending_and_dedupes():
 
     assert [row["id"] for row in combined] == ["alpha", "beta", "gamma"]
     assert combined[0]["source"] == "top"
+
+
+async def test_fetch_coingecko_lanes_stops_after_backoff(monkeypatch, mock_db):
+    """Main-cycle CoinGecko orchestration stops lower-priority lanes after 429."""
+    calls = []
+
+    class FakeLimiter:
+        def __init__(self):
+            self.backing_off = False
+
+        def is_backing_off(self):
+            return self.backing_off
+
+    limiter = FakeLimiter()
+
+    async def _top_movers(session, settings):
+        calls.append("top_movers")
+        limiter.backing_off = True
+        return []
+
+    async def _unexpected(*args):
+        calls.append("unexpected")
+        return []
+
+    monkeypatch.setattr("scout.main.coingecko_limiter", limiter)
+    monkeypatch.setattr("scout.main.cg_fetch_top_movers", _top_movers)
+    monkeypatch.setattr("scout.main.cg_fetch_trending", _unexpected)
+    monkeypatch.setattr("scout.main.cg_fetch_by_volume", _unexpected)
+    monkeypatch.setattr("scout.main.cg_fetch_midcap_gainers", _unexpected)
+    monkeypatch.setattr("scout.main.fetch_held_position_prices", _unexpected)
+
+    result = await _fetch_coingecko_lanes(AsyncMock(), MagicMock(), mock_db)
+
+    assert result == ([], [], [], [], [])
+    assert calls == ["top_movers"]
 
 
 async def test_run_cycle_dry_run(mock_db, mock_session, mock_settings):

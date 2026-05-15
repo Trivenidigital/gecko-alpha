@@ -41,6 +41,8 @@ Root cause 1: `_get_with_backoff()` retried each CoinGecko 429 up to four times 
 
 Post-PR #130 deploy evidence showed root cause 2: retry amplification was gone (`cg_429_backoff` had `attempt=0` only), but concurrent `asyncio.gather()` fan-out had sibling requests already queued behind the shared limiter when a 429 arrived. Because `RateLimiter.acquire()` intentionally holds the lock during spacing sleeps, `report_429()` could not preempt those queued requests quickly enough. Fix: make CoinGecko strategy/page fan-out sequential and stop the current lane when `coingecko_limiter.is_backing_off()` becomes true.
 
+Post-PR #131 deploy evidence showed root cause 3: `main.py` still launched separate CoinGecko lanes (`top_movers`, `trending`, `by_volume`, `midcap`, held-position prices) concurrently with each other. Fix: orchestrate CoinGecko lanes through one sequential helper in `main.py`, while keeping non-CoinGecko DexScreener and GeckoTerminal ingestion parallel.
+
 ## Design
 
 Add three settings:
@@ -59,6 +61,8 @@ On CoinGecko 429, do not retry immediately inside the same cycle. Log `cg_429_ba
 Any CoinGecko call site outside `scout.ingestion.coingecko` must also use the same limiter. The Telegram social resolver acquires the shared limiter before `api.coingecko.com` calls and reports 429s into the global cooldown. The second-wave CoinGecko markets path already acquires the limiter and now reports 429s as well.
 
 Expose `RateLimiter.is_backing_off()` for same-lane callers. `fetch_top_movers()`, `fetch_by_volume()`, and `fetch_midcap_gainers()` issue CoinGecko requests sequentially; after any 429-triggered cooldown, they stop the remaining same-cycle strategy/page requests and return whatever rows were already fetched. This preserves prior successful rows while preventing 429 fan-out inside the same cycle.
+
+At the pipeline boundary, `run_cycle()` calls `_fetch_coingecko_lanes()` as one gathered task. That helper runs top movers, CoinGecko trending, volume scan, midcap scan, and held-position prices sequentially, stopping lower-priority CoinGecko lanes if the shared limiter enters backoff. DexScreener and GeckoTerminal still run in parallel with the single CoinGecko lane.
 
 In `RateLimiter.acquire()`:
 
@@ -81,6 +85,7 @@ Use lock-held sleep intentionally: this limiter is a shared per-provider gate, s
 - Add a regression test proving a 429 produces one provider request, enters global cooldown, and does not retry inside the same cycle.
 - Add a resolver regression test proving Telegram social resolver CoinGecko calls acquire the shared limiter and report 429s.
 - Add regression tests proving top-mover and volume-scan fan-out stop remaining same-cycle requests once the shared limiter is backing off.
+- Add a main-cycle regression test proving lower-priority CoinGecko lanes are skipped when an earlier CoinGecko lane trips shared backoff.
 - Run focused verification:
   - `tests/test_ratelimit.py`
   - `tests/test_config.py`

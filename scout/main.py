@@ -47,6 +47,7 @@ from scout.news.cryptopanic import (
     fetch_cryptopanic_posts,
 )
 from scout.news.schemas import classify_macro, classify_sentiment
+from scout.ratelimit import coingecko_limiter
 from scout.safety import is_safe
 from scout.scorer import score
 from scout.spikes.detector import (
@@ -601,6 +602,48 @@ def _combine_coin_market_rows(*raw_lists: list[dict]) -> list[dict]:
     return combined
 
 
+async def _fetch_coingecko_lanes(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    db: Database,
+) -> tuple[list, list, list, list, list]:
+    """Run CoinGecko lanes sequentially so 429 cooldown stops lower-priority fan-out."""
+
+    async def _call(name: str, fn, *args):
+        try:
+            return await fn(*args)
+        except Exception as exc:
+            logger.warning("coingecko_lane_failed", lane=name, error=str(exc))
+            return exc
+
+    cg_movers = await _call("top_movers", cg_fetch_top_movers, session, settings)
+    if coingecko_limiter.is_backing_off():
+        logger.warning("coingecko_lanes_stopped_for_backoff", after="top_movers")
+        return cg_movers, [], [], [], []
+
+    cg_trending = await _call("trending", cg_fetch_trending, session, settings)
+    if coingecko_limiter.is_backing_off():
+        logger.warning("coingecko_lanes_stopped_for_backoff", after="trending")
+        return cg_movers, cg_trending, [], [], []
+
+    cg_by_volume = await _call("by_volume", cg_fetch_by_volume, session, settings)
+    if coingecko_limiter.is_backing_off():
+        logger.warning("coingecko_lanes_stopped_for_backoff", after="by_volume")
+        return cg_movers, cg_trending, cg_by_volume, [], []
+
+    cg_midcap_gainers = await _call(
+        "midcap_gainers", cg_fetch_midcap_gainers, session, settings
+    )
+    if coingecko_limiter.is_backing_off():
+        logger.warning("coingecko_lanes_stopped_for_backoff", after="midcap_gainers")
+        return cg_movers, cg_trending, cg_by_volume, cg_midcap_gainers, []
+
+    held_position_raw = await _call(
+        "held_position_prices", fetch_held_position_prices, session, settings, db
+    )
+    return cg_movers, cg_trending, cg_by_volume, cg_midcap_gainers, held_position_raw
+
+
 async def run_cycle(
     settings: Settings,
     db: Database,
@@ -622,24 +665,26 @@ async def run_cycle(
     _dex_module.clear_watchdog_samples()
     _gt_module.clear_watchdog_samples()
     _cg_module.clear_watchdog_samples()
-    (
-        dex_tokens,
-        gecko_tokens,
-        cg_movers,
-        cg_trending,
-        cg_by_volume,
-        cg_midcap_gainers,
-        held_position_raw,
-    ) = await asyncio.gather(
+    dex_tokens, gecko_tokens, cg_results = await asyncio.gather(
         fetch_trending(session, settings),
         fetch_trending_pools(session, settings),
-        cg_fetch_top_movers(session, settings),
-        cg_fetch_trending(session, settings),
-        cg_fetch_by_volume(session, settings),
-        cg_fetch_midcap_gainers(session, settings),
-        fetch_held_position_prices(session, settings, db),
+        _fetch_coingecko_lanes(session, settings, db),
         return_exceptions=True,
     )
+    if isinstance(cg_results, Exception):
+        cg_movers = cg_results
+        cg_trending = cg_results
+        cg_by_volume = cg_results
+        cg_midcap_gainers = cg_results
+        held_position_raw = cg_results
+    else:
+        (
+            cg_movers,
+            cg_trending,
+            cg_by_volume,
+            cg_midcap_gainers,
+            held_position_raw,
+        ) = cg_results
     # Handle exceptions from gather
     dex_error = dex_tokens if isinstance(dex_tokens, Exception) else None
     gecko_error = gecko_tokens if isinstance(gecko_tokens, Exception) else None
