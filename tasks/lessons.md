@@ -1,5 +1,17 @@
 # Lessons
 
+## X Alerts asset links must cover unresolved cashtags
+
+- 2026-05-15 correction: I treated "clickable Asset column" as only safe for
+  confidently resolved assets. That left the common V1 X-alert case
+  (unresolved cashtag-only rows like `$GIGA`, `$PRIMIS`, `$NOTHING`) unlinked
+  even though the user expected every visible asset chip to be clickable.
+- Rule: when adding dashboard links for signal assets, provide a conservative
+  search fallback for unresolved display identifiers. Use exact market pages
+  when the backend has a confident `resolved_coin_id` or contract+chain; use a
+  search page when confidence is lower. Do not silently render the primary
+  visible asset as inert unless there is no identifier at all.
+
 ## Hermes-first applies to existing custom-code debt, not only future diffs
 
 - When the operator says the project is bearing too much custom code despite Hermes-first pressure, do not only strengthen future plan templates. Run a backlog/shipped-module comparison against current installed VPS skills/plugins and the public Hermes/agent-skills ecosystem. Classify existing items as `KEEP_CUSTOM`, `USE_SKILL_AS_REFERENCE`, `REPLACE_WITH_HERMES`, `BRIDGE_TO_HERMES`, or `DELETE_OR_DEFER`, then update the backlog so stale "none found" conclusions do not keep driving new custom work.

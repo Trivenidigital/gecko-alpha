@@ -301,13 +301,37 @@ async def test_x_alerts_endpoint_leaves_ambiguous_cashtag_unpriced(client, db):
     assert resp.status_code == 200
     alert = resp.json()["alerts"][0]
     assert alert["outcome_status"] == "ambiguous_symbol"
-    assert alert["asset_url"] is None
+    assert alert["asset_url"] == "https://www.coingecko.com/en/search?query=CAT"
     assert alert["asset_url_source"] == "ambiguous_symbol"
     assert alert["outcome_coin_id"] is None
     assert alert["entry_price_usd"] is None
     assert alert["current_price_usd"] is None
     assert alert["gain_pct_since_alert"] is None
     assert alert["profit_usd_at_300"] is None
+
+
+async def test_x_alerts_endpoint_links_unresolved_cashtag_to_coingecko_search(client, db):
+    c = client
+    d, _db_path = db
+    alert_time = datetime.now(timezone.utc) - timedelta(minutes=15)
+
+    await _insert_x_alert(
+        d._conn,
+        event_id="evt-unresolved-search",
+        tweet_author="CrashiusClay69",
+        tweet_id="777",
+        received_at=alert_time.isoformat(),
+        extracted_cashtag="$GIGA",
+        classifier_confidence=0.80,
+    )
+
+    resp = await c.get("/api/x_alerts?limit=1")
+
+    assert resp.status_code == 200
+    alert = resp.json()["alerts"][0]
+    assert alert["outcome_status"] == "unresolved_symbol"
+    assert alert["asset_url"] == "https://www.coingecko.com/en/search?query=GIGA"
+    assert alert["asset_url_source"] == "unresolved_symbol"
 
 
 async def test_x_alerts_endpoint_clamps_limit_and_handles_empty(client):
