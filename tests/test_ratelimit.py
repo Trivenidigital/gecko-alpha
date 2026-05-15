@@ -74,6 +74,21 @@ async def test_report_429_without_override_uses_configured_cooldown():
     assert elapsed >= 0.25, f"expected >=0.25s wait, got {elapsed:.3f}s"
 
 
+async def test_is_backing_off_reflects_reported_429():
+    limiter = RateLimiter(
+        max_calls=100,
+        period=60.0,
+        default_429_backoff_seconds=0.3,
+    )
+
+    assert limiter.is_backing_off() is False
+    await limiter.report_429()
+    assert limiter.is_backing_off() is True
+
+    await limiter.reset()
+    assert limiter.is_backing_off() is False
+
+
 async def test_reset_clears_state():
     """reset() clears timestamps and backoff so a fresh acquire is instant."""
     limiter = RateLimiter(max_calls=2, period=60.0)

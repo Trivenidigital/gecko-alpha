@@ -98,15 +98,19 @@ async def fetch_top_movers(
     if settings.COINGECKO_API_KEY:
         base_params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
 
-    # Two parallel queries: smallest coins + highest volume
+    # Query sequentially so a provider 429 can stop same-cycle fan-out before
+    # queued requests consume more of the exhausted IP/key budget.
     params_small = {**base_params, "order": "market_cap_asc"}
     params_volume = {**base_params, "order": "volume_desc"}
 
-    data_small, data_volume = await asyncio.gather(
-        _get_with_backoff(session, f"{CG_BASE}/coins/markets", params_small),
-        _get_with_backoff(session, f"{CG_BASE}/coins/markets", params_volume),
-        return_exceptions=True,
+    data_small = await _get_with_backoff(
+        session, f"{CG_BASE}/coins/markets", params_small
     )
+    data_volume = None
+    if not coingecko_limiter.is_backing_off():
+        data_volume = await _get_with_backoff(
+            session, f"{CG_BASE}/coins/markets", params_volume
+        )
 
     # Union both result sets, dedup by CG id
     raw_by_id: dict[str, dict] = {}
@@ -315,17 +319,17 @@ async def fetch_by_volume(
         base_params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
 
     page_count = max(1, int(settings.COINGECKO_VOLUME_SCAN_PAGES))
-    pages = await asyncio.gather(
-        *[
-            _get_with_backoff(
+    pages = []
+    for page in range(1, page_count + 1):
+        pages.append(
+            await _get_with_backoff(
                 session,
                 f"{CG_BASE}/coins/markets",
                 {**base_params, "page": str(page)},
             )
-            for page in range(1, page_count + 1)
-        ],
-        return_exceptions=True,
-    )
+        )
+        if coingecko_limiter.is_backing_off():
+            break
 
     raw_by_id: dict[str, dict] = {}
     for data in pages:
@@ -438,17 +442,17 @@ async def fetch_midcap_gainers(
 
     start_page = max(1, int(settings.COINGECKO_MIDCAP_SCAN_START_PAGE))
     page_count = max(1, int(settings.COINGECKO_MIDCAP_SCAN_PAGES))
-    pages = await asyncio.gather(
-        *[
-            _get_with_backoff(
+    pages = []
+    for page in range(start_page, start_page + page_count):
+        pages.append(
+            await _get_with_backoff(
                 session,
                 f"{CG_BASE}/coins/markets",
                 {**base_params, "page": str(page)},
             )
-            for page in range(start_page, start_page + page_count)
-        ],
-        return_exceptions=True,
-    )
+        )
+        if coingecko_limiter.is_backing_off():
+            break
 
     raw_by_id: dict[str, dict] = {}
     for data in pages:
