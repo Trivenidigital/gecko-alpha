@@ -81,6 +81,8 @@ def test_coingecko_config_defaults():
     )
     assert s.MOMENTUM_RATIO_THRESHOLD == 0.6
     assert s.MIN_VOL_ACCEL_RATIO == 5.0
+    assert s.COINGECKO_MIN_REQUEST_INTERVAL_SEC == 0.75
+    assert s.COINGECKO_REQUEST_JITTER_SEC == 0.25
 
 
 def test_ingest_watchdog_config_defaults():

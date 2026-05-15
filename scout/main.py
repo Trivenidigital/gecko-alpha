@@ -1344,7 +1344,7 @@ async def main(argv: list[str] | None = None) -> int:
         settings.MIN_SCORE = args.min_score_override
         logger.info("MIN_SCORE overridden", min_score=settings.MIN_SCORE)
 
-    # Honour COINGECKO_RATE_LIMIT_PER_MIN from config.
+    # Honour CoinGecko rolling-cap and burst-profile settings from config.
     from scout.ratelimit import configure_from_settings as _cg_ratelimit_configure
 
     _cg_ratelimit_configure(settings)
