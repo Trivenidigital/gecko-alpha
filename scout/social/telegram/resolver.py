@@ -20,6 +20,7 @@ import aiohttp
 import structlog
 
 from scout.config import Settings
+from scout.ratelimit import coingecko_limiter
 from scout.safety import is_safe_strict
 from scout.social.telegram.models import (
     ContractRef,
@@ -64,6 +65,9 @@ async def _get_json(
     """Single GET returning (outcome, body). Caller decides retry semantics
     based on the outcome rather than guessing from None."""
     try:
+        is_coingecko = url.startswith(CG_BASE)
+        if is_coingecko:
+            await coingecko_limiter.acquire()
         async with session.get(
             url, params=params, timeout=aiohttp.ClientTimeout(total=10)
         ) as resp:
@@ -77,6 +81,8 @@ async def _get_json(
                 log.warning("resolver_auth_error", url=url, status=resp.status)
                 return (_Outcome.AUTH_ERROR, None)
             if resp.status == 429 or resp.status >= 500:
+                if resp.status == 429 and is_coingecko:
+                    await coingecko_limiter.report_429()
                 log.warning("resolver_transient", url=url, status=resp.status)
                 return (_Outcome.TRANSIENT, None)
             log.warning("resolver_unexpected_status", url=url, status=resp.status)

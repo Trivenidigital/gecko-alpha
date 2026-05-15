@@ -165,9 +165,7 @@ async def fetch_current_prices(
             headers=headers,
         ) as resp:
             if resp.status == 429:
-                # The shared limiter does not yet expose a report_429()
-                # hook, so log loudly and abort this cycle — the next cycle
-                # will naturally back off via the token bucket.
+                await coingecko_limiter.report_429()
                 logger.warning(
                     "secondwave_cg_markets_429",
                     message="CoinGecko 429 — backing off until next cycle",

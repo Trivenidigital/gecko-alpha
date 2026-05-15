@@ -18,7 +18,6 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 CG_BASE = "https://api.coingecko.com/api/v3"
-MAX_RETRIES = 3
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
 # Module-level store for raw /coins/markets responses.
@@ -54,26 +53,21 @@ async def _get_with_backoff(
     url: str,
     params: dict | None = None,
 ) -> dict | list | None:
-    """GET with exponential backoff on 429. Returns parsed JSON or None."""
-    for attempt in range(MAX_RETRIES + 1):
-        await coingecko_limiter.acquire()
-        try:
-            async with session.get(url, params=params, timeout=REQUEST_TIMEOUT) as resp:
-                if resp.status == 429:
-                    backoff = 2 ** (attempt + 1)
-                    logger.warning("cg_429_backoff", attempt=attempt, backoff_s=backoff)
-                    await coingecko_limiter.report_429(backoff_seconds=float(backoff))
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(backoff)
-                        continue
-                    return None
-                if resp.status >= 400:
-                    logger.warning("cg_http_error", status=resp.status, url=url)
-                    return None
-                return await resp.json()
-        except Exception as exc:
-            logger.warning("cg_request_error", error=str(exc), url=url)
-            return None
+    """GET with shared limiter/cooldown. Returns parsed JSON or None."""
+    await coingecko_limiter.acquire()
+    try:
+        async with session.get(url, params=params, timeout=REQUEST_TIMEOUT) as resp:
+            if resp.status == 429:
+                logger.warning("cg_429_backoff", attempt=0)
+                await coingecko_limiter.report_429()
+                return None
+            if resp.status >= 400:
+                logger.warning("cg_http_error", status=resp.status, url=url)
+                return None
+            return await resp.json()
+    except Exception as exc:
+        logger.warning("cg_request_error", error=str(exc), url=url)
+        return None
     return None
 
 

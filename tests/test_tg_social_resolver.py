@@ -19,6 +19,7 @@ from scout.social.telegram.resolver import (
     CG_BASE,
     DEXSCREENER_BASE,
     _Outcome,
+    _get_json,
     resolve_and_enrich,
 )
 
@@ -204,3 +205,33 @@ async def test_cashtag_5xx_promotes_to_transient(settings_factory):
                 [], ["WIF"], session=session, settings=s, is_retry=False
             )
     assert result.state == ResolutionState.UNRESOLVED_TRANSIENT
+
+
+@pytest.mark.asyncio
+async def test_resolver_coingecko_429_uses_shared_limiter(monkeypatch):
+    """Resolver CoinGecko calls share the global CG limiter and report 429s."""
+    calls = {"acquire": 0, "report_429": 0}
+
+    class FakeLimiter:
+        async def acquire(self):
+            calls["acquire"] += 1
+
+        async def report_429(self):
+            calls["report_429"] += 1
+
+    monkeypatch.setattr(
+        "scout.social.telegram.resolver.coingecko_limiter",
+        FakeLimiter(),
+        raising=False,
+    )
+
+    async with aiohttp.ClientSession() as session:
+        with aioresponses() as m:
+            m.get(f"{CG_BASE}/search?query=WIF", status=429)
+            outcome, data = await _get_json(
+                session, f"{CG_BASE}/search", params={"query": "WIF"}
+            )
+
+    assert outcome == _Outcome.TRANSIENT
+    assert data is None
+    assert calls == {"acquire": 1, "report_429": 1}

@@ -60,6 +60,20 @@ async def test_report_429_forces_global_backoff():
     assert elapsed >= 0.25, f"expected >=0.25s wait, got {elapsed:.3f}s"
 
 
+async def test_report_429_without_override_uses_configured_cooldown():
+    limiter = RateLimiter(
+        max_calls=100,
+        period=60.0,
+        default_429_backoff_seconds=0.3,
+    )
+    await limiter.report_429()
+
+    start = time.monotonic()
+    await limiter.acquire()
+    elapsed = time.monotonic() - start
+    assert elapsed >= 0.25, f"expected >=0.25s wait, got {elapsed:.3f}s"
+
+
 async def test_reset_clears_state():
     """reset() clears timestamps and backoff so a fresh acquire is instant."""
     limiter = RateLimiter(max_calls=2, period=60.0)
@@ -143,6 +157,7 @@ def test_configure_from_settings_threads_spacing_knobs_without_rebinding():
         COINGECKO_RATE_LIMIT_PER_MIN=17,
         COINGECKO_MIN_REQUEST_INTERVAL_SEC=0.4,
         COINGECKO_REQUEST_JITTER_SEC=0.1,
+        COINGECKO_429_COOLDOWN_SEC=123.0,
     )
 
     try:
@@ -152,5 +167,6 @@ def test_configure_from_settings_threads_spacing_knobs_without_rebinding():
         assert ratelimit.coingecko_limiter._max_calls == 17
         assert ratelimit.coingecko_limiter._min_interval_seconds == 0.4
         assert ratelimit.coingecko_limiter._jitter_seconds == 0.1
+        assert ratelimit.coingecko_limiter._default_429_backoff_seconds == 123.0
     finally:
         ratelimit.coingecko_limiter = old_limiter
