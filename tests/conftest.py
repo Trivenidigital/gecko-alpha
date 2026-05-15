@@ -2,6 +2,7 @@
 
 import aiosqlite.core
 import pytest
+import sys
 
 from scout.config import Settings
 from scout.models import CandidateToken
@@ -54,6 +55,38 @@ def _reset_signal_sources_cache():
     except ImportError:
         pass
     yield
+
+
+@pytest.fixture(autouse=True)
+async def _reset_coingecko_limiter_state():
+    """Keep shared CoinGecko cooldown state from leaking between tests."""
+
+    async def _reset_known_limiters() -> None:
+        from scout import ratelimit
+
+        limiters = {ratelimit.coingecko_limiter}
+        for module_name in (
+            "scout.ingestion.coingecko",
+            "scout.social.telegram.resolver",
+            "scout.secondwave.detector",
+            "scout.counter.detail",
+            "scout.narrative.evaluator",
+            "scout.narrative.observer",
+            "scout.narrative.predictor",
+        ):
+            module = sys.modules.get(module_name)
+            limiter = getattr(module, "coingecko_limiter", None) if module else None
+            if limiter is not None:
+                limiters.add(limiter)
+
+        for limiter in limiters:
+            reset = getattr(limiter, "reset", None)
+            if reset is not None:
+                await reset()
+
+    await _reset_known_limiters()
+    yield
+    await _reset_known_limiters()
 
 
 @pytest.fixture

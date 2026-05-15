@@ -13,6 +13,7 @@ from scout.ingestion.coingecko import (
     fetch_by_volume,
     fetch_midcap_gainers,
     get_last_watchdog_samples,
+    _get_with_backoff,
     _reset_midcap_scan_cycle_counter_for_tests,
 )
 from scout.ratelimit import coingecko_limiter
@@ -198,26 +199,25 @@ async def test_fetch_trending_hydration_failure_keeps_rank_without_fake_mcap(
 
 
 @pytest.mark.asyncio
-async def test_429_triggers_backoff(settings_factory, patch_module_sleep):
-    """FR-03: HTTP 429 triggers exponential backoff, retries, and eventually succeeds.
+async def test_429_enters_global_cooldown_without_retry_amplification(
+    patch_module_sleep,
+):
+    """A 429 should not be retried inside the same cycle.
 
-    Sleep is short-circuited locally via ``patch_module_sleep`` so this test
-    does not rely on real 2s backoffs — CI runners under load can stretch the
-    combined (per-module backoff + rate-limiter global backoff) sleeps past
-    the per-test timeout.
+    Runtime evidence showed one logical request could become four provider
+    429s. On 429 we now trip the shared cooldown and fail soft for this call;
+    the next cycle gets the next chance.
     """
     patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
 
-    settings = settings_factory(MIN_MARKET_CAP=1000, MAX_MARKET_CAP=1_000_000)
     with aioresponses() as mocked:
-        # First call: 429, second call: 200
         mocked.get(MARKETS_PATTERN, status=429)
         mocked.get(MARKETS_PATTERN, payload=COINS_MARKETS_RESPONSE)
         async with aiohttp.ClientSession() as session:
-            tokens = await fetch_top_movers(session, settings)
+            data = await _get_with_backoff(session, f"{CG_BASE}/coins/markets")
 
-    assert len(tokens) == 1
-    assert tokens[0].ticker == "pump"
+    assert data is None
+    assert len(mocked.requests) == 1
 
 
 @pytest.mark.asyncio

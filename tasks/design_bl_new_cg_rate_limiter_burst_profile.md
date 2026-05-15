@@ -1,4 +1,4 @@
-**New primitives introduced:** Configurable minimum inter-request spacing and optional per-request jitter in the shared CoinGecko async rate limiter.
+**New primitives introduced:** Configurable minimum inter-request spacing, optional per-request jitter, configurable shared 429 cooldown, and no-immediate-retry CoinGecko behavior in the shared async rate limiter path.
 
 ## Hermes-first analysis
 
@@ -29,17 +29,32 @@ Post-deploy logs showed active CoinGecko throttling after the ingestion watchdog
 
 The symptom is not "too many average requests per minute"; it is burst profile plus synchronized retry waves.
 
+Post-PR #129 follow-up evidence (2026-05-15) showed throttling persisted even after conservative VPS tuning (`COINGECKO_RATE_LIMIT_PER_MIN=6`, `COINGECKO_MIN_REQUEST_INTERVAL_SEC=8.0`, `COINGECKO_REQUEST_JITTER_SEC=2.0`). A 30-minute production log window still had:
+
+- `cg_429_backoff=131`
+- `rate_limiter_spacing=116`
+- `rate_limiter_global_backoff=27`
+- `resolver_transient=4`
+- `coingecko_429_retry=6`
+
+Root cause: `_get_with_backoff()` retried each CoinGecko 429 up to four times inside the same cycle, so one logical request could become four provider-visible 429s. Secondary gap: the Telegram social resolver used CoinGecko directly without acquiring/reporting through the shared limiter.
+
 ## Design
 
-Add two settings:
+Add three settings:
 
 - `COINGECKO_MIN_REQUEST_INTERVAL_SEC`: default `0.75`
 - `COINGECKO_REQUEST_JITTER_SEC`: default `0.25`
+- `COINGECKO_429_COOLDOWN_SEC`: default `120.0`
 
-Thread both through `configure_from_settings()` into the shared `RateLimiter`.
+Thread all three through `configure_from_settings()` into the shared `RateLimiter`.
 `configure_from_settings()` must mutate the existing singleton in place rather
 than rebinding it, because `scout.main` imports CoinGecko modules before startup
 configuration and those modules hold `coingecko_limiter` by value.
+
+On CoinGecko 429, do not retry immediately inside the same cycle. Log `cg_429_backoff`, call `coingecko_limiter.report_429()` with the configured default cooldown, and return `None` so the logical call fails soft while the provider lane cools down globally.
+
+Any CoinGecko call site outside `scout.ingestion.coingecko` must also use the same limiter. The Telegram social resolver acquires the shared limiter before `api.coingecko.com` calls and reports 429s into the global cooldown. The second-wave CoinGecko markets path already acquires the limiter and now reports 429s as well.
 
 In `RateLimiter.acquire()`:
 
@@ -59,6 +74,8 @@ Use lock-held sleep intentionally: this limiter is a shared per-provider gate, s
 - Add a singleton-identity regression test so startup configuration reaches
   modules that imported `coingecko_limiter` before `configure_from_settings()`.
 - Add config/default tests for the new settings.
+- Add a regression test proving a 429 produces one provider request, enters global cooldown, and does not retry inside the same cycle.
+- Add a resolver regression test proving Telegram social resolver CoinGecko calls acquire the shared limiter and report 429s.
 - Run focused verification:
   - `tests/test_ratelimit.py`
   - `tests/test_config.py`

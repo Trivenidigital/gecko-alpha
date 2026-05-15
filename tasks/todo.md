@@ -16,6 +16,12 @@ Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvemen
 - [x] Verification: `tests/test_ratelimit.py tests/test_config.py tests/test_coingecko.py` -> 58 passed; wider CoinGecko-consumer suite -> 147 passed
 - [x] Backlog closeout updated for PR-ready state
 - [x] PR created: https://github.com/Trivenidigital/gecko-alpha/pull/129
+- [x] Follow-up isolated worktree created: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-cg-throttle-fix` on `codex/cg-throttle-fix`
+- [x] Runtime follow-up verified: throttles persisted after PR #129 spacing and conservative VPS tuning (`6/min`, `8s` min spacing, `2s` jitter)
+- [x] Root cause pinned: `_get_with_backoff()` retried each 429 up to four times inside one cycle; Telegram social resolver also bypassed the shared CoinGecko limiter
+- [x] TDD red: tests captured no-immediate-retry behavior, configurable default 429 cooldown, and resolver shared-limiter reporting
+- [x] Implementation: CoinGecko 429 now trips global cooldown and fails soft without same-cycle retry; resolver and second-wave paths report 429s into the shared limiter
+- [x] Verification: `tests/test_ratelimit.py tests/test_config.py tests/test_coingecko.py tests/test_tg_social_resolver.py::test_resolver_coingecko_429_uses_shared_limiter` -> 60 passed; adjacent suite -> 159 passed
 
 ## Active Work: 2026-05-14 gecko-alpha improvement run
 

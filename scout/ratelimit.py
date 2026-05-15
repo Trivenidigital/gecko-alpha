@@ -25,6 +25,7 @@ class RateLimiter:
         *,
         min_interval_seconds: float = 0.0,
         jitter_seconds: float = 0.0,
+        default_429_backoff_seconds: float = 30.0,
         random_fn: Callable[[], float] = random.random,
     ):
         """Allow max_calls within period seconds. Default: 25/min (buffer under 30/min limit)."""
@@ -32,6 +33,7 @@ class RateLimiter:
         self._period = period
         self._min_interval_seconds = max(0.0, float(min_interval_seconds))
         self._jitter_seconds = max(0.0, float(jitter_seconds))
+        self._default_429_backoff_seconds = max(0.0, float(default_429_backoff_seconds))
         self._random_fn = random_fn
         self._timestamps: deque[float] = deque()
         self._lock = asyncio.Lock()
@@ -45,12 +47,14 @@ class RateLimiter:
         period: float,
         min_interval_seconds: float,
         jitter_seconds: float,
+        default_429_backoff_seconds: float,
     ) -> None:
         """Reconfigure in place so modules holding this singleton see new settings."""
         self._max_calls = max_calls
         self._period = period
         self._min_interval_seconds = max(0.0, float(min_interval_seconds))
         self._jitter_seconds = max(0.0, float(jitter_seconds))
+        self._default_429_backoff_seconds = max(0.0, float(default_429_backoff_seconds))
         self._timestamps.clear()
         self._backoff_until = 0.0
         self._last_acquire_at = None
@@ -103,8 +107,10 @@ class RateLimiter:
             self._last_acquire_at = time.monotonic()
             self._timestamps.append(self._last_acquire_at)
 
-    async def report_429(self, backoff_seconds: float = 30.0) -> None:
+    async def report_429(self, backoff_seconds: float | None = None) -> None:
         """Called by any caller that received a 429. Forces all callers to back off."""
+        if backoff_seconds is None:
+            backoff_seconds = self._default_429_backoff_seconds
         async with self._lock:
             self._backoff_until = max(
                 self._backoff_until,
@@ -136,4 +142,5 @@ def configure_from_settings(settings) -> None:
         period=60.0,
         min_interval_seconds=settings.COINGECKO_MIN_REQUEST_INTERVAL_SEC,
         jitter_seconds=settings.COINGECKO_REQUEST_JITTER_SEC,
+        default_429_backoff_seconds=settings.COINGECKO_429_COOLDOWN_SEC,
     )

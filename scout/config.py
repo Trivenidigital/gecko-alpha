@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     # burst/concurrency throttles, not only the rolling minute cap.
     COINGECKO_MIN_REQUEST_INTERVAL_SEC: float = 0.75
     COINGECKO_REQUEST_JITTER_SEC: float = 0.25
+    # Provider-side 429 means the shared IP/key budget is exhausted. Do not
+    # retry immediately inside the same cycle; pause the whole CG lane instead.
+    COINGECKO_429_COOLDOWN_SEC: float = 120.0
     # Default keeps the main-cycle scheduled CoinGecko calls at about 8/min:
     # top_movers uses 2, trending hydration uses 2, volume scan uses 3,
     # held-position refresh can add 1 when enabled, and midcap scan averages
@@ -860,6 +863,7 @@ class Settings(BaseSettings):
     @field_validator(
         "COINGECKO_MIN_REQUEST_INTERVAL_SEC",
         "COINGECKO_REQUEST_JITTER_SEC",
+        "COINGECKO_429_COOLDOWN_SEC",
     )
     @classmethod
     def _validate_coingecko_burst_profile(cls, v: float) -> float:
