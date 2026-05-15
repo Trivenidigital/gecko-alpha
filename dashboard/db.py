@@ -1557,6 +1557,14 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                     "asset_url_source": "coingecko_resolved",
                 }
 
+            cashtag = row["extracted_cashtag"]
+            symbol = (cashtag or "").strip().lstrip("$").upper()
+            if symbol:
+                return {
+                    "asset_url": f"https://www.coingecko.com/en/search?query={symbol}",
+                    "asset_url_source": outcome.get("outcome_status") or "coingecko_search",
+                }
+
             return {
                 "asset_url": None,
                 "asset_url_source": outcome.get("outcome_status") or "unresolved",
