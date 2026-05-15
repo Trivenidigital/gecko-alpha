@@ -25,6 +25,9 @@ Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvemen
 - [x] Post-PR #130 deploy observation: retry ladder removed, but concurrent CoinGecko fan-out could still queue sibling requests before `report_429()` preempted them
 - [x] Follow-up implementation: expose `RateLimiter.is_backing_off()` and make top-mover, volume-scan, and midcap CoinGecko lanes stop remaining same-cycle requests after a 429 cooldown is active
 - [x] Follow-up verification: targeted throttle suite -> 63 passed; adjacent CoinGecko/social/second-wave suite -> 162 passed
+- [x] Post-PR #131 deploy observation: `main.py` still launched separate CoinGecko lanes concurrently, so cross-lane fan-out persisted after a 429
+- [x] Final fold: add `_fetch_coingecko_lanes()` in `main.py` to run CoinGecko lanes sequentially while DexScreener/GeckoTerminal remain parallel
+- [x] Final fold verification: main/CoinGecko targeted suite -> 68 passed; adjacent suite -> 167 passed
 
 ## Active Work: 2026-05-14 gecko-alpha improvement run
 
