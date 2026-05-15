@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     MIN_VOL_ACCEL_RATIO: float = 5.0
     COINGECKO_API_KEY: str = ""
     COINGECKO_RATE_LIMIT_PER_MIN: int = 25  # buffer under 30/min free tier
+    # Smooth concurrent CoinGecko lanes so the scanner stays under provider
+    # burst/concurrency throttles, not only the rolling minute cap.
+    COINGECKO_MIN_REQUEST_INTERVAL_SEC: float = 0.75
+    COINGECKO_REQUEST_JITTER_SEC: float = 0.25
     # Default keeps the main-cycle scheduled CoinGecko calls at about 8/min:
     # top_movers uses 2, trending hydration uses 2, volume scan uses 3,
     # held-position refresh can add 1 when enabled, and midcap scan averages
@@ -851,6 +855,16 @@ class Settings(BaseSettings):
     def _validate_ingest_starvation_threshold(cls, v: int) -> int:
         if v < 1:
             raise ValueError("INGEST_STARVATION_THRESHOLD_CYCLES must be >= 1")
+        return v
+
+    @field_validator(
+        "COINGECKO_MIN_REQUEST_INTERVAL_SEC",
+        "COINGECKO_REQUEST_JITTER_SEC",
+    )
+    @classmethod
+    def _validate_coingecko_burst_profile(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("CoinGecko burst-profile settings must be >= 0")
         return v
 
     @model_validator(mode="after")

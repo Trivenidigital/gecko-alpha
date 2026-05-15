@@ -2,9 +2,11 @@
 
 import asyncio
 import time
+from types import SimpleNamespace
 
 import pytest
 
+import scout.ratelimit as ratelimit
 from scout.ratelimit import RateLimiter
 
 
@@ -71,3 +73,84 @@ async def test_reset_clears_state():
     await limiter.acquire()
     elapsed = time.monotonic() - start
     assert elapsed < 0.1
+
+
+async def test_min_interval_spaces_consecutive_acquires(monkeypatch):
+    """Consecutive acquires should be released at a provider-friendly cadence."""
+    sleeps: list[float] = []
+    now = 100.0
+
+    def fake_monotonic() -> float:
+        return now
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    monkeypatch.setattr(ratelimit.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(ratelimit.asyncio, "sleep", fake_sleep)
+
+    limiter = RateLimiter(
+        max_calls=10,
+        period=60.0,
+        min_interval_seconds=0.75,
+        jitter_seconds=0.0,
+    )
+
+    await limiter.acquire()
+    await limiter.acquire()
+    await limiter.acquire()
+
+    assert sleeps == [pytest.approx(0.75), pytest.approx(0.75)]
+
+
+async def test_jitter_extends_spacing_deterministically(monkeypatch):
+    """Jitter should be injectable so tests can pin the burst profile."""
+    sleeps: list[float] = []
+    now = 200.0
+
+    def fake_monotonic() -> float:
+        return now
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    monkeypatch.setattr(ratelimit.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(ratelimit.asyncio, "sleep", fake_sleep)
+
+    limiter = RateLimiter(
+        max_calls=10,
+        period=60.0,
+        min_interval_seconds=0.5,
+        jitter_seconds=0.2,
+        random_fn=lambda: 0.5,
+    )
+
+    await limiter.acquire()
+    await limiter.acquire()
+
+    assert sleeps == [pytest.approx(0.6)]
+
+
+def test_configure_from_settings_threads_spacing_knobs_without_rebinding():
+    old_limiter = ratelimit.coingecko_limiter
+    observed_limiter = RateLimiter()
+    ratelimit.coingecko_limiter = observed_limiter
+    settings = SimpleNamespace(
+        COINGECKO_RATE_LIMIT_PER_MIN=17,
+        COINGECKO_MIN_REQUEST_INTERVAL_SEC=0.4,
+        COINGECKO_REQUEST_JITTER_SEC=0.1,
+    )
+
+    try:
+        ratelimit.configure_from_settings(settings)
+
+        assert ratelimit.coingecko_limiter is observed_limiter
+        assert ratelimit.coingecko_limiter._max_calls == 17
+        assert ratelimit.coingecko_limiter._min_interval_seconds == 0.4
+        assert ratelimit.coingecko_limiter._jitter_seconds == 0.1
+    finally:
+        ratelimit.coingecko_limiter = old_limiter

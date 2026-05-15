@@ -2,6 +2,21 @@
 
 Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvement run)
 
+## Active Work: BL-NEW-CG-RATE-LIMITER-BURST-PROFILE
+
+- [x] Isolated worktree created: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-cg-burst-smoothing` on `codex/cg-burst-smoothing`
+- [x] Runtime symptom verified: post-deploy CoinGecko 429 backoffs are slowing 60s cycles into ~101s average / ~263s max intervals
+- [x] Drift check: existing `scout.ratelimit.RateLimiter` caps rolling request count, but has no inter-request spacing or jitter to smooth concurrent CoinGecko lanes
+- [x] Hermes-first check: public Hermes skill hub / awesome-hermes-agent search found CoinGecko API reference and optional blockchain skills, but no installed/public Hermes runtime primitive for smoothing gecko-alpha's aiohttp CoinGecko calls
+- [x] Baseline relevant tests: `tests/test_ratelimit.py tests/test_config.py` -> 35 passed
+- [x] Design drafted: `tasks/design_bl_new_cg_rate_limiter_burst_profile.md`
+- [x] TDD red: limiter tests prove consecutive calls are not currently spaced
+- [x] Implementation: add configurable spacing/jitter to the shared CoinGecko limiter
+- [x] Self-review fold: `configure_from_settings()` now mutates the limiter singleton in place so pre-imported CoinGecko modules receive the new burst profile
+- [x] Verification: `tests/test_ratelimit.py tests/test_config.py tests/test_coingecko.py` -> 58 passed; wider CoinGecko-consumer suite -> 147 passed
+- [x] Backlog closeout updated for PR-ready state
+- [x] PR created: https://github.com/Trivenidigital/gecko-alpha/pull/129
+
 ## Active Work: 2026-05-14 gecko-alpha improvement run
 
 - [x] Follow-up - BL-NEW-GT-ETH-ENDPOINT-404 on `codex/gt-eth-endpoint-404`: root cause pinned as GeckoTerminal provider id mismatch (`ethereum` project label vs `eth` GT network id). Design drafted in `tasks/design_bl_new_gt_eth_endpoint_404.md`; TDD red/green verified; focused GT/config tests 44 passed. Design reviewers timed out and were closed with no findings returned.

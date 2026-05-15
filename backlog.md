@@ -840,8 +840,8 @@ SELECT COUNT(*) FROM narrative_alerts_inbound;
 All 13 entries below were surfaced by the cycle-change audit findings doc and stubbed here per the actionability discipline (PR-review fold). Each carries a `decision-by` field; the audit's next-audit trigger (2026-11-13) measures shipped vs drifted ratio.
 
 ### BL-NEW-CG-RATE-LIMITER-BURST-PROFILE
-**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B1 (Borderline; 1.30× headroom against 30/min CG free tier; ~138 actual 429s/24h).
-**Action:** investigate `cg_429_backoff` burst pattern; consider lowering `COINGECKO_RATE_LIMIT_PER_MIN` from 25 to 20 OR adding inter-call jitter in `_get_with_backoff`.
+**Current status:** PR-READY 2026-05-15 on `codex/cg-burst-smoothing` - runtime follow-up confirmed active post-deploy throttling: recent cycles averaged ~101s with max ~263s against `SCAN_INTERVAL_SECONDS=60`, while logs showed repeated `cg_429_backoff` and `rate_limiter_global_backoff`. Drift check found the shared `RateLimiter` only enforced rolling 25/min windows, not provider-friendly inter-request spacing. Fix adds `COINGECKO_MIN_REQUEST_INTERVAL_SEC=0.75` and `COINGECKO_REQUEST_JITTER_SEC=0.25`, threaded through in-place `configure_from_settings()` mutation into `scout.ratelimit.RateLimiter`, preserving scanner breadth and rolling cap while smoothing concurrent CoinGecko lanes. Design: `tasks/design_bl_new_cg_rate_limiter_burst_profile.md`. Verification: `tests/test_ratelimit.py tests/test_config.py tests/test_coingecko.py` -> 58 passed; wider CoinGecko-consumer suite -> 147 passed.
+**Action:** ship shared CoinGecko limiter spacing/jitter, then post-deploy compare `cg_429_backoff`, `rate_limiter_global_backoff`, and cycle intervals against the pre-fix log window. If throttles persist, next knob is lowering `COINGECKO_RATE_LIMIT_PER_MIN` from 25 to 20 or adding a free Demo API key.
 **decision-by:** 2 weeks (per design v2 §4 Borderline urgency mapping).
 
 ### BL-NEW-GT-429-HANDLER
