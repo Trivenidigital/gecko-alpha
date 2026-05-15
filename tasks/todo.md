@@ -15,7 +15,7 @@ Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvemen
 - [x] Self-review fold: `configure_from_settings()` now mutates the limiter singleton in place so pre-imported CoinGecko modules receive the new burst profile
 - [x] Verification: `tests/test_ratelimit.py tests/test_config.py tests/test_coingecko.py` -> 58 passed; wider CoinGecko-consumer suite -> 147 passed
 - [x] Backlog closeout updated for PR-ready state
-- [ ] PR
+- [x] PR created: https://github.com/Trivenidigital/gecko-alpha/pull/129
 
 ## Active Work: 2026-05-14 gecko-alpha improvement run
 
