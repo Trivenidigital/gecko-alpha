@@ -118,6 +118,10 @@ class RateLimiter:
             )
         logger.warning("rate_limiter_429_reported", backoff=backoff_seconds)
 
+    def is_backing_off(self) -> bool:
+        """Return True when a reported 429 cooldown is currently active."""
+        return self._backoff_until > time.monotonic()
+
     async def reset(self) -> None:
         """Clear all tracked timestamps and backoff state. For tests only."""
         async with self._lock:

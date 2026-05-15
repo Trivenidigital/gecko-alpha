@@ -221,6 +221,24 @@ async def test_429_enters_global_cooldown_without_retry_amplification(
 
 
 @pytest.mark.asyncio
+async def test_top_movers_stops_second_strategy_after_429(
+    patch_module_sleep, settings_factory
+):
+    """A 429 in one strategy should stop same-cycle CoinGecko fan-out."""
+    patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
+    settings = settings_factory(MIN_MARKET_CAP=1000, MAX_MARKET_CAP=1_000_000)
+
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, status=429)
+        mocked.get(MARKETS_PATTERN, payload=COINS_MARKETS_RESPONSE)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_top_movers(session, settings)
+
+    assert tokens == []
+    assert sum(len(calls) for calls in mocked.requests.values()) == 1
+
+
+@pytest.mark.asyncio
 async def test_market_cap_filter_applied(settings_factory):
     """FR-01: Tokens outside MIN/MAX_MARKET_CAP are excluded."""
     settings = settings_factory(MIN_MARKET_CAP=100_000, MAX_MARKET_CAP=300_000)
@@ -370,6 +388,48 @@ async def test_fetch_by_volume_uses_configured_page_count(settings_factory):
             tokens = await fetch_by_volume(session, settings)
 
     assert {t.contract_address for t in tokens} == {"page-1", "page-2", "page-3"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_by_volume_stops_remaining_pages_after_429(
+    patch_module_sleep, settings_factory
+):
+    """A volume-scan 429 should preserve prior rows but skip remaining pages."""
+    patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
+    settings = settings_factory(
+        MIN_MARKET_CAP=1_000,
+        COINGECKO_VOLUME_SCAN_PAGES=3,
+    )
+    page1 = [
+        {
+            "id": "page-1",
+            "symbol": "p1",
+            "name": "Page1",
+            "market_cap": 1_000_001,
+            "total_volume": 10_000_000,
+            "price_change_percentage_24h": 21.0,
+        }
+    ]
+    page3 = [
+        {
+            "id": "page-3",
+            "symbol": "p3",
+            "name": "Page3",
+            "market_cap": 1_000_003,
+            "total_volume": 9_999_997,
+            "price_change_percentage_24h": 23.0,
+        }
+    ]
+
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, payload=page1)
+        mocked.get(MARKETS_PATTERN, status=429)
+        mocked.get(MARKETS_PATTERN, payload=page3)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_by_volume(session, settings)
+
+    assert {t.contract_address for t in tokens} == {"page-1"}
+    assert sum(len(calls) for calls in mocked.requests.values()) == 2
 
 
 @pytest.mark.asyncio

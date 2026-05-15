@@ -37,7 +37,9 @@ Post-PR #129 follow-up evidence (2026-05-15) showed throttling persisted even af
 - `resolver_transient=4`
 - `coingecko_429_retry=6`
 
-Root cause: `_get_with_backoff()` retried each CoinGecko 429 up to four times inside the same cycle, so one logical request could become four provider-visible 429s. Secondary gap: the Telegram social resolver used CoinGecko directly without acquiring/reporting through the shared limiter.
+Root cause 1: `_get_with_backoff()` retried each CoinGecko 429 up to four times inside the same cycle, so one logical request could become four provider-visible 429s. Secondary gap: the Telegram social resolver used CoinGecko directly without acquiring/reporting through the shared limiter.
+
+Post-PR #130 deploy evidence showed root cause 2: retry amplification was gone (`cg_429_backoff` had `attempt=0` only), but concurrent `asyncio.gather()` fan-out had sibling requests already queued behind the shared limiter when a 429 arrived. Because `RateLimiter.acquire()` intentionally holds the lock during spacing sleeps, `report_429()` could not preempt those queued requests quickly enough. Fix: make CoinGecko strategy/page fan-out sequential and stop the current lane when `coingecko_limiter.is_backing_off()` becomes true.
 
 ## Design
 
@@ -55,6 +57,8 @@ configuration and those modules hold `coingecko_limiter` by value.
 On CoinGecko 429, do not retry immediately inside the same cycle. Log `cg_429_backoff`, call `coingecko_limiter.report_429()` with the configured default cooldown, and return `None` so the logical call fails soft while the provider lane cools down globally.
 
 Any CoinGecko call site outside `scout.ingestion.coingecko` must also use the same limiter. The Telegram social resolver acquires the shared limiter before `api.coingecko.com` calls and reports 429s into the global cooldown. The second-wave CoinGecko markets path already acquires the limiter and now reports 429s as well.
+
+Expose `RateLimiter.is_backing_off()` for same-lane callers. `fetch_top_movers()`, `fetch_by_volume()`, and `fetch_midcap_gainers()` issue CoinGecko requests sequentially; after any 429-triggered cooldown, they stop the remaining same-cycle strategy/page requests and return whatever rows were already fetched. This preserves prior successful rows while preventing 429 fan-out inside the same cycle.
 
 In `RateLimiter.acquire()`:
 
@@ -76,6 +80,7 @@ Use lock-held sleep intentionally: this limiter is a shared per-provider gate, s
 - Add config/default tests for the new settings.
 - Add a regression test proving a 429 produces one provider request, enters global cooldown, and does not retry inside the same cycle.
 - Add a resolver regression test proving Telegram social resolver CoinGecko calls acquire the shared limiter and report 429s.
+- Add regression tests proving top-mover and volume-scan fan-out stop remaining same-cycle requests once the shared limiter is backing off.
 - Run focused verification:
   - `tests/test_ratelimit.py`
   - `tests/test_config.py`

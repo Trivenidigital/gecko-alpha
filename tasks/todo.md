@@ -22,6 +22,9 @@ Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvemen
 - [x] TDD red: tests captured no-immediate-retry behavior, configurable default 429 cooldown, and resolver shared-limiter reporting
 - [x] Implementation: CoinGecko 429 now trips global cooldown and fails soft without same-cycle retry; resolver and second-wave paths report 429s into the shared limiter
 - [x] Verification: `tests/test_ratelimit.py tests/test_config.py tests/test_coingecko.py tests/test_tg_social_resolver.py::test_resolver_coingecko_429_uses_shared_limiter` -> 60 passed; adjacent suite -> 159 passed
+- [x] Post-PR #130 deploy observation: retry ladder removed, but concurrent CoinGecko fan-out could still queue sibling requests before `report_429()` preempted them
+- [x] Follow-up implementation: expose `RateLimiter.is_backing_off()` and make top-mover, volume-scan, and midcap CoinGecko lanes stop remaining same-cycle requests after a 429 cooldown is active
+- [x] Follow-up verification: targeted throttle suite -> 63 passed; adjacent CoinGecko/social/second-wave suite -> 162 passed
 
 ## Active Work: 2026-05-14 gecko-alpha improvement run
 
