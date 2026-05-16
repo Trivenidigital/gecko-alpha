@@ -3660,14 +3660,35 @@ class Database:
             )
 
     async def _migrate_scanned_at_index(
-        self, *, table: str, index_name: str, migration_name: str
+        self,
+        *,
+        table: str,
+        column: str = "scanned_at",
+        index_name: str,
+        migration_name: str,
     ) -> None:
-        """Add single-column scanned_at index for hourly prune coverage.
+        """Add single-column timestamp index for hourly prune coverage.
 
-        Helper for BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING.
+        Used by BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING
+        (cycle 1, column='scanned_at') and BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION
+        (cycle 2, 5 tables with column in
+        {'detected_at','snapshot_at','created_at','scanned_at'}).
+
         Each table gets its own paper_migrations entry (V4#3 fold) so disk
-        failure on one doesn't roll back the other.
+        failure on one doesn't roll back the others. V4#2 fold: PRAGMA
+        busy_timeout=90000 covers concurrent readers waiting on the
+        EXCLUSIVE write lock during index build.
+
+        D8 plan-review fold (cycle 2): `column` kwarg parameterizes the
+        index target; log events become 'index_migrated' /
+        'index_migration_failed' (was hardcoded 'scanned_at_idx_*') so
+        cycle-2 columns are grep-able via the `column=` field.
         """
+        # D8 SHOULD-FIX #4: defensive guard — `column` is code-supplied
+        # in all current callers, but the helper is reusable across cycles.
+        # Reject anything that isn't a SQL-safe identifier.
+        assert column.replace("_", "").isalnum(), f"unsafe column={column!r}"
+
         if self._conn is None:
             raise RuntimeError("Database not initialized.")
         conn = self._conn
@@ -3687,7 +3708,7 @@ class Database:
                 await conn.execute("COMMIT")
                 return
             await conn.execute(
-                f"CREATE INDEX IF NOT EXISTS {index_name} ON {table}(scanned_at)"
+                f"CREATE INDEX IF NOT EXISTS {index_name} ON {table}({column})"
             )
             await conn.execute(
                 "INSERT INTO paper_migrations(name, cutover_ts) VALUES (?, ?)",
@@ -3695,7 +3716,10 @@ class Database:
             )
             await conn.execute("COMMIT")
             _db_log.info(
-                "scanned_at_idx_migrated", table=table, migration=migration_name
+                "index_migrated",
+                table=table,
+                column=column,
+                migration=migration_name,
             )
         except Exception:
             try:
@@ -3703,11 +3727,17 @@ class Database:
             except Exception:
                 pass
             _db_log.exception(
-                "scanned_at_idx_migration_failed",
+                "index_migration_failed",
                 table=table,
+                column=column,
                 migration=migration_name,
             )
-            _db_log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)
+            _db_log.error(
+                "SCHEMA_DRIFT_DETECTED",
+                table=table,
+                column=column,
+                migration=migration_name,
+            )
             raise
 
     async def _migrate_score_history_scanned_at_index(self) -> None:
