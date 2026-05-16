@@ -216,13 +216,14 @@ async def test_empty_or_whitespace_coin_id_rejected(db, settings_factory):
 async def test_resolution_check_error_fails_closed(db, settings_factory, monkeypatch):
     """T2d (adv-M2) — coin_id_resolves raises → fail-CLOSED with
     reason=resolution_check_error; engine NOT called."""
+    from scout.db import CoinIdResolutionError
     from scout.trading.signals import trade_predictions
 
     settings = settings_factory()
     engine = _StubEngine()
 
     async def _broken_resolves(coin_id):
-        raise RuntimeError("simulated DB outage")
+        raise CoinIdResolutionError("simulated DB outage")
 
     monkeypatch.setattr(db, "coin_id_resolves", _broken_resolves)
     pred = _make_pred(coin_id="some-coin")

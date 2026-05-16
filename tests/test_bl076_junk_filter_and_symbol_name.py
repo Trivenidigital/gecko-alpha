@@ -61,7 +61,9 @@ def test_is_junk_coinid_does_not_overreach_on_test_substrings():
 
 
 @pytest.mark.asyncio
-async def test_open_trade_logs_warning_when_symbol_and_name_both_empty(tmp_path):
+async def test_open_trade_logs_warning_when_symbol_and_name_both_empty(
+    tmp_path, settings_factory
+):
     """T2 — engine-level defense-in-depth: log WARNING when caller
     forgets to pass symbol+name. Bug 2 evidence: 150+ paper trades
     across 3 dispatcher paths had empty symbol+name; operator audit
@@ -79,7 +81,7 @@ async def test_open_trade_logs_warning_when_symbol_and_name_both_empty(tmp_path)
     db_path = str(tmp_path / "t.db")
     sd = Database(db_path)
     await sd.initialize()
-    settings = Settings()
+    settings = settings_factory()
     engine = TradingEngine("paper", sd, settings)
     with capture_logs() as captured:
         await engine.open_trade(
@@ -110,7 +112,9 @@ async def test_open_trade_logs_warning_when_symbol_and_name_both_empty(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_open_trade_warning_fires_even_during_warmup(tmp_path, monkeypatch):
+async def test_open_trade_warning_fires_even_during_warmup(
+    tmp_path, monkeypatch, settings_factory
+):
     """T2b — pins F9 mitigation. Engine WARNING placement BEFORE
     PAPER_STARTUP_WARMUP_SECONDS gate. Asserts both WARNING + warmup-skip
     events fire; warmup-skip alone (without WARNING) means the placement
@@ -122,7 +126,7 @@ async def test_open_trade_warning_fires_even_during_warmup(tmp_path, monkeypatch
     db_path = str(tmp_path / "t.db")
     sd = Database(db_path)
     await sd.initialize()
-    settings = Settings()
+    settings = settings_factory()
     monkeypatch.setattr(settings, "PAPER_STARTUP_WARMUP_SECONDS", 10)
     engine = TradingEngine("paper", sd, settings)
     with capture_logs() as captured:
@@ -155,7 +159,9 @@ async def test_open_trade_warning_fires_even_during_warmup(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_trade_volume_spikes_passes_symbol_and_name_to_engine(tmp_path):
+async def test_trade_volume_spikes_passes_symbol_and_name_to_engine(
+    tmp_path, settings_factory
+):
     """T3 — pins Bug 2 for volume_spike path. VolumeSpike Pydantic model
     carries symbol+name; trade_volume_spikes was calling open_trade
     without them, leaving empty strings in paper_trades."""
@@ -167,7 +173,7 @@ async def test_trade_volume_spikes_passes_symbol_and_name_to_engine(tmp_path):
     db_path = str(tmp_path / "t.db")
     sd = Database(db_path)
     await sd.initialize()
-    settings = Settings()
+    settings = settings_factory()
     captured = {}
 
     class FakeEngine:
@@ -202,7 +208,9 @@ async def test_trade_volume_spikes_passes_symbol_and_name_to_engine(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_trade_predictions_passes_symbol_and_name_to_engine(tmp_path):
+async def test_trade_predictions_passes_symbol_and_name_to_engine(
+    tmp_path, settings_factory
+):
     """T4 — same fix shape as T3 but for narrative_prediction path.
     NarrativePrediction Pydantic model has symbol+name; dispatcher
     was discarding them."""
@@ -222,7 +230,7 @@ async def test_trade_predictions_passes_symbol_and_name_to_engine(tmp_path):
         (now,),
     )
     await sd._conn.commit()
-    settings = Settings()
+    settings = settings_factory()
     captured = []
 
     class FakeEngine:
@@ -378,7 +386,9 @@ async def test_lookup_symbol_name_handles_empty_or_none_coin_id(tmp_path, bad_co
 
 
 @pytest.mark.asyncio
-async def test_chain_completed_orphan_does_not_trigger_engine_warning(tmp_path):
+async def test_chain_completed_orphan_does_not_trigger_engine_warning(
+    tmp_path, settings_factory
+):
     """T5f'' — MF-2 fix (PR #67 silent-failure-hunter): when chain
     resolver returns ("", ""), dispatcher passes
     expected_empty_metadata=True so the engine WARNING + INFO events
@@ -416,7 +426,7 @@ async def test_chain_completed_orphan_does_not_trigger_engine_warning(tmp_path):
         (now, now, now),
     )
     await sd._conn.commit()
-    settings = Settings()
+    settings = settings_factory()
     # Use REAL TradingEngine so engine WARNING actually fires when called
     # without the sentinel — this is the bug we're guarding against.
     engine = TradingEngine("paper", sd, settings)
@@ -441,7 +451,9 @@ async def test_chain_completed_orphan_does_not_trigger_engine_warning(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_open_trade_with_expected_empty_metadata_suppresses_warnings(tmp_path):
+async def test_open_trade_with_expected_empty_metadata_suppresses_warnings(
+    tmp_path, settings_factory
+):
     """T2c — MF-2 sentinel direct test: open_trade with
     expected_empty_metadata=True + empty symbol+name MUST NOT log the
     WARNING or INFO events. With the sentinel False (default), the
@@ -453,7 +465,7 @@ async def test_open_trade_with_expected_empty_metadata_suppresses_warnings(tmp_p
     db_path = str(tmp_path / "t.db")
     sd = Database(db_path)
     await sd.initialize()
-    settings = Settings()
+    settings = settings_factory()
     engine = TradingEngine("paper", sd, settings)
 
     # Sentinel ON: WARNING + INFO MUST NOT fire
@@ -536,7 +548,9 @@ async def test_lookup_symbol_name_logs_breadcrumb_on_operational_error(
 
 
 @pytest.mark.asyncio
-async def test_trade_chain_completions_uses_lookup_helper_for_metadata(tmp_path):
+async def test_trade_chain_completions_uses_lookup_helper_for_metadata(
+    tmp_path, settings_factory
+):
     """T5f — trade_chain_completions calls Database.lookup_symbol_name_by_coin_id
     and passes the result through to engine.open_trade.
 
@@ -579,7 +593,7 @@ async def test_trade_chain_completions_uses_lookup_helper_for_metadata(tmp_path)
         (now,),
     )
     await sd._conn.commit()
-    settings = Settings()
+    settings = settings_factory()
     captured = []
 
     class FakeEngine:
@@ -595,7 +609,9 @@ async def test_trade_chain_completions_uses_lookup_helper_for_metadata(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_trade_chain_completions_falls_back_to_empty_when_no_snapshot(tmp_path):
+async def test_trade_chain_completions_falls_back_to_empty_when_no_snapshot(
+    tmp_path, settings_factory
+):
     """T5f' — orphan chain coin (no row in any snapshot table). Helper
     returns ('', ''), dispatcher logs `chain_completed_no_metadata`,
     AND open_trade still fires (the trade is real; we just lack metadata).
@@ -629,7 +645,7 @@ async def test_trade_chain_completions_falls_back_to_empty_when_no_snapshot(tmp_
         (now, now, now),
     )
     await sd._conn.commit()
-    settings = Settings()
+    settings = settings_factory()
     captured = []
 
     class FakeEngine:

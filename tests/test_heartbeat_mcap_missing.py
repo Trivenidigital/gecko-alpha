@@ -12,6 +12,7 @@ the env var to skip cleanly instead of crashing the test process.
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 import pytest
@@ -22,6 +23,8 @@ from scout.heartbeat import (
     _reset_heartbeat_stats,
     increment_mcap_null_with_price,
 )
+
+MARKETS_PATTERN = re.compile(r"https://api\.coingecko\.com/api/v3/coins/markets")
 
 _SKIP_AIOHTTP = pytest.mark.skipif(
     sys.platform == "win32" and os.environ.get("SKIP_AIOHTTP_TESTS") == "1",
@@ -166,7 +169,7 @@ async def test_fetch_top_movers_increments_counter(settings_factory):
     ]
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/markets",
+            MARKETS_PATTERN,
             payload=payload,
             status=200,
             repeat=True,
@@ -210,7 +213,7 @@ async def test_fetch_by_volume_increments_counter(settings_factory):
     ]
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/markets",
+            MARKETS_PATTERN,
             payload=payload,
             status=200,
             repeat=True,

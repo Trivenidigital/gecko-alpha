@@ -445,6 +445,7 @@ async def test_revive_signal_with_baseline_stamps_baseline_and_audit(
     cur = await db._conn.execute(
         "SELECT field_name, old_value, new_value, applied_by, reason "
         "FROM signal_params_audit WHERE signal_type='gainers_early' "
+        "AND field_name='enabled' "
         "ORDER BY applied_at DESC LIMIT 1"
     )
     field, old, new, by, reason = await cur.fetchone()
@@ -453,6 +454,16 @@ async def test_revive_signal_with_baseline_stamps_baseline_and_audit(
     assert new == "1"
     assert by == "operator"
     assert "post-fix revival" in reason
+    cur = await db._conn.execute(
+        "SELECT old_value, new_value, applied_by FROM signal_params_audit "
+        "WHERE signal_type='gainers_early' "
+        "AND field_name='tg_alert_eligible' "
+        "ORDER BY applied_at DESC LIMIT 1"
+    )
+    tg_old, tg_new, tg_by = await cur.fetchone()
+    assert tg_old == "0"
+    assert tg_new == "1"
+    assert tg_by == "operator"
     await db.close()
 
 
@@ -605,7 +616,8 @@ async def test_revive_signal_with_baseline_on_already_enabled_signal(
 
     cur = await db._conn.execute(
         "SELECT old_value, new_value FROM signal_params_audit "
-        "WHERE signal_type='gainers_early' ORDER BY applied_at DESC LIMIT 1"
+        "WHERE signal_type='gainers_early' AND field_name='enabled' "
+        "ORDER BY applied_at DESC LIMIT 1"
     )
     old, new = await cur.fetchone()
     assert old == "1"  # was already enabled
