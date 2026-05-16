@@ -1240,6 +1240,36 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
         except Exception:
             logger.exception("cryptopanic_prune_failed")
 
+    # BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING:
+    # parameterized + decoupled from narrative daily loop. Follow cryptopanic
+    # pattern (V4#4 fold): info-when-rows>0, silent-when-zero — structlog at
+    # main.py has no filter_by_level so debug would still emit.
+    try:
+        pruned_sh = await db.prune_score_history(
+            keep_days=settings.SCORE_HISTORY_RETENTION_DAYS
+        )
+        if pruned_sh:
+            logger.info(
+                "score_history_pruned",
+                rows_deleted=pruned_sh,
+                keep_days=settings.SCORE_HISTORY_RETENTION_DAYS,
+            )
+    except Exception:
+        logger.exception("score_history_prune_failed")
+
+    try:
+        pruned_vs = await db.prune_volume_snapshots(
+            keep_days=settings.VOLUME_SNAPSHOTS_RETENTION_DAYS
+        )
+        if pruned_vs:
+            logger.info(
+                "volume_snapshots_pruned",
+                rows_deleted=pruned_vs,
+                keep_days=settings.VOLUME_SNAPSHOTS_RETENTION_DAYS,
+            )
+    except Exception:
+        logger.exception("volume_snapshots_prune_failed")
+
 
 async def _maybe_announce_tg_alerts(db, session, settings) -> None:
     """BL-NEW-TG-ALERT-ALLOWLIST: first-deploy operator announcement.
