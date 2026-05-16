@@ -4874,6 +4874,82 @@ class Database:
         return cur.rowcount or 0
 
     # ------------------------------------------------------------------
+    # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 6 prune methods
+    # ------------------------------------------------------------------
+
+    async def prune_volume_spikes(self, *, keep_days: int) -> int:
+        """Delete volume_spikes rows older than ``keep_days``. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM volume_spikes WHERE detected_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_momentum_7d(self, *, keep_days: int) -> int:
+        """Delete momentum_7d rows older than ``keep_days``. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM momentum_7d WHERE detected_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_trending_snapshots(self, *, keep_days: int) -> int:
+        """Delete trending_snapshots rows older than ``keep_days``. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM trending_snapshots WHERE snapshot_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_learn_logs(self, *, keep_days: int) -> int:
+        """Delete learn_logs rows older than ``keep_days``. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM learn_logs WHERE created_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_chain_matches(self, *, keep_days: int) -> int:
+        """Delete chain_matches rows older than ``keep_days``. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM chain_matches WHERE completed_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_holder_snapshots(self, *, keep_days: int) -> int:
+        """Delete holder_snapshots rows older than ``keep_days``. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM holder_snapshots WHERE scanned_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    # ------------------------------------------------------------------
     # CryptoPanic posts
     # ------------------------------------------------------------------
 

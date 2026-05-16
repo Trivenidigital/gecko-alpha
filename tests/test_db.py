@@ -200,6 +200,163 @@ async def test_narrative_table_prune_uses_new_index(db, table, column, index):
     assert index in plan_str, f"{index} not used: {plan_str}"
 
 
+# ---------------------------------------------------------------------------
+# BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2) prune-method tests
+# ---------------------------------------------------------------------------
+
+
+async def test_prune_volume_spikes_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    for tag, age_days in [("RECENT", 5), ("OLD", 50)]:
+        await db._conn.execute(
+            """INSERT INTO volume_spikes (coin_id, symbol, name, current_volume,
+                avg_volume_7d, spike_ratio, detected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                f"c-{tag.lower()}",
+                tag,
+                tag,
+                1000.0,
+                500.0,
+                2.0,
+                (now - timedelta(days=age_days)).isoformat(),
+            ),
+        )
+    await db._conn.commit()
+    deleted = await db.prune_volume_spikes(keep_days=45)
+    assert deleted == 1
+
+
+async def test_prune_volume_spikes_empty_returns_zero(db):
+    assert await db.prune_volume_spikes(keep_days=45) == 0
+
+
+async def test_prune_momentum_7d_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    for tag, age_days in [("RECENT", 5), ("OLD", 50)]:
+        await db._conn.execute(
+            """INSERT INTO momentum_7d (coin_id, symbol, name, price_change_7d, detected_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                f"c-{tag.lower()}",
+                tag,
+                tag,
+                100.0,
+                (now - timedelta(days=age_days)).isoformat(),
+            ),
+        )
+    await db._conn.commit()
+    deleted = await db.prune_momentum_7d(keep_days=30)
+    assert deleted == 1
+
+
+async def test_prune_momentum_7d_empty_returns_zero(db):
+    assert await db.prune_momentum_7d(keep_days=30) == 0
+
+
+async def test_prune_trending_snapshots_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    for tag, age_days in [("RECENT", 5), ("OLD", 50)]:
+        await db._conn.execute(
+            """INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at)
+               VALUES (?, ?, ?, ?)""",
+            (
+                f"c-{tag.lower()}",
+                tag,
+                tag,
+                (now - timedelta(days=age_days)).isoformat(),
+            ),
+        )
+    await db._conn.commit()
+    deleted = await db.prune_trending_snapshots(keep_days=30)
+    assert deleted == 1
+
+
+async def test_prune_trending_snapshots_empty_returns_zero(db):
+    assert await db.prune_trending_snapshots(keep_days=30) == 0
+
+
+async def test_prune_learn_logs_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    for n, age_days in [(1, 5), (2, 100)]:
+        await db._conn.execute(
+            """INSERT INTO learn_logs (cycle_number, cycle_type, reflection_text,
+                changes_made, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                n,
+                "daily",
+                f"reflection {n}",
+                f"changes {n}",
+                (now - timedelta(days=age_days)).isoformat(),
+            ),
+        )
+    await db._conn.commit()
+    deleted = await db.prune_learn_logs(keep_days=90)
+    assert deleted == 1
+
+
+async def test_prune_learn_logs_empty_returns_zero(db):
+    assert await db.prune_learn_logs(keep_days=90) == 0
+
+
+async def test_prune_chain_matches_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    # chain_matches.pattern_id is FK to chain_patterns; seed parent row first.
+    await db._conn.execute(
+        """INSERT INTO chain_patterns (name, description, steps_json, min_steps_to_trigger)
+           VALUES (?, ?, ?, ?)""",
+        ("test_pattern", "test", '["x"]', 1),
+    )
+    pattern_id_row = await (
+        await db._conn.execute("SELECT id FROM chain_patterns LIMIT 1")
+    ).fetchone()
+    pattern_id = pattern_id_row[0]
+    for tag, age_days in [("RECENT", 5), ("OLD", 60)]:
+        await db._conn.execute(
+            """INSERT INTO chain_matches (token_id, pipeline, pattern_id, pattern_name,
+                steps_matched, total_steps, anchor_time, completed_at,
+                chain_duration_hours, conviction_boost)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                f"t-{tag.lower()}",
+                "memecoin",
+                pattern_id,
+                "test_pattern",
+                1,
+                1,
+                (now - timedelta(days=age_days, hours=1)).isoformat(),
+                (now - timedelta(days=age_days)).isoformat(),
+                1.0,
+                0,
+            ),
+        )
+    await db._conn.commit()
+    deleted = await db.prune_chain_matches(keep_days=45)
+    assert deleted == 1
+
+
+async def test_prune_chain_matches_empty_returns_zero(db):
+    assert await db.prune_chain_matches(keep_days=45) == 0
+
+
+async def test_prune_holder_snapshots_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    for tag, age_days in [("RECENT", 5), ("OLD", 30)]:
+        await db._conn.execute(
+            """INSERT INTO holder_snapshots (contract_address, holder_count, scanned_at)
+               VALUES (?, ?, ?)""",
+            (f"0x{tag}", 100, (now - timedelta(days=age_days)).isoformat()),
+        )
+    await db._conn.commit()
+    deleted = await db.prune_holder_snapshots(keep_days=14)
+    assert deleted == 1
+
+
+async def test_prune_holder_snapshots_empty_returns_zero(db):
+    assert await db.prune_holder_snapshots(keep_days=14) == 0
+
+
 async def test_migration_idempotent_on_second_initialize(tmp_path):
     """V6 fold: migration idempotency via paper_migrations row check.
 
