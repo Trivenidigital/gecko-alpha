@@ -529,3 +529,147 @@ def test_channel_reload_interval_accepts_60_and_above():
             TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC=good_value,
         )
         assert s.TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC == good_value
+
+
+# ---------------------------------------------------------------------------
+# BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING
+# ---------------------------------------------------------------------------
+
+
+def test_score_history_retention_default():
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.SCORE_HISTORY_RETENTION_DAYS == 21
+
+
+def test_volume_snapshots_retention_default():
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.VOLUME_SNAPSHOTS_RETENTION_DAYS == 21
+
+
+def test_score_history_retention_env_override():
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        SCORE_HISTORY_RETENTION_DAYS=30,
+    )
+    assert s.SCORE_HISTORY_RETENTION_DAYS == 30
+
+
+def test_retention_must_exceed_secondwave_cooldown():
+    """V2#3 fold: setting retention below SECONDWAVE_COOLDOWN_MAX_DAYS must raise."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="must be >= SECONDWAVE_COOLDOWN_MAX_DAYS"):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            SCORE_HISTORY_RETENTION_DAYS=7,
+            SECONDWAVE_COOLDOWN_MAX_DAYS=14,
+        )
+
+
+def test_retention_volume_must_exceed_secondwave_cooldown():
+    """V2#3 fold: same check applies to volume retention."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="must be >= SECONDWAVE_COOLDOWN_MAX_DAYS"):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            VOLUME_SNAPSHOTS_RETENTION_DAYS=7,
+            SECONDWAVE_COOLDOWN_MAX_DAYS=14,
+        )
+
+
+def test_load_settings_logs_validation_error_before_raise():
+    """V4#1 fold: load_settings() must emit structured logger.error before
+    re-raising ValidationError, so the systemd Restart=always crash-loop has
+    a journalctl-visible cause line."""
+    import structlog
+    from pydantic import ValidationError as _VE
+    from scout.config import load_settings
+
+    with structlog.testing.capture_logs() as cap_logs:
+        with pytest.raises(_VE):
+            load_settings(
+                _env_file=None,
+                TELEGRAM_BOT_TOKEN="t",
+                TELEGRAM_CHAT_ID="c",
+                ANTHROPIC_API_KEY="k",
+                SCORE_HISTORY_RETENTION_DAYS=7,
+                SECONDWAVE_COOLDOWN_MAX_DAYS=14,
+            )
+
+    error_events = [
+        e for e in cap_logs if e.get("event") == "settings_validation_failed"
+    ]
+    assert len(error_events) == 1, f"expected 1 event, got {len(error_events)}: {cap_logs}"
+    assert "error" in error_events[0]
+    assert "SCORE_HISTORY_RETENTION_DAYS" in error_events[0]["error"]
+
+
+def test_load_settings_returns_normally_on_valid_input():
+    """load_settings() preserves Settings() return-value semantics when valid."""
+    from scout.config import load_settings
+
+    s = load_settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.SCORE_HISTORY_RETENTION_DAYS == 21
+    assert s.VOLUME_SNAPSHOTS_RETENTION_DAYS == 21
+
+
+def test_retention_equality_to_cooldown_passes():
+    """V6 fold: retention == cooldown should pass (validator uses < not <=).
+
+    Locks in the "must be >=" boundary semantic. Future PR flipping < to <=
+    would break operators setting retention exactly to cooldown.
+    """
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        SCORE_HISTORY_RETENTION_DAYS=14,
+        VOLUME_SNAPSHOTS_RETENTION_DAYS=14,
+        SECONDWAVE_COOLDOWN_MAX_DAYS=14,
+    )
+    assert s.SCORE_HISTORY_RETENTION_DAYS == 14
+    assert s.VOLUME_SNAPSHOTS_RETENTION_DAYS == 14
+
+
+def test_retention_validator_raises_when_both_below_cooldown():
+    """V6 SHOULD-FIX: confirm validator catches at least one violation when
+    both are below cooldown. Pydantic v2 short-circuits on first error so we
+    only assert SOMETHING was raised, not exhaustive enumeration."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="must be >= SECONDWAVE_COOLDOWN_MAX_DAYS"):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            SCORE_HISTORY_RETENTION_DAYS=7,
+            VOLUME_SNAPSHOTS_RETENTION_DAYS=7,
+            SECONDWAVE_COOLDOWN_MAX_DAYS=14,
+        )

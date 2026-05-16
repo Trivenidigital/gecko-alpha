@@ -247,6 +247,14 @@ class Settings(BaseSettings):
     SECONDWAVE_DEDUP_DAYS: int = 7
     SECONDWAVE_MIN_VOLUME_POINTS: int = 2
 
+    # -------- Score / Volume history retention (BL-NEW-SCORE-HISTORY-PRUNING
+    # + BL-NEW-VOLUME-SNAPSHOTS-PRUNING) --------
+    # Hourly prune cutoff applied by main._run_hourly_maintenance. Must be
+    # >= SECONDWAVE_COOLDOWN_MAX_DAYS to avoid truncating secondwave's
+    # evidence window. Validator below enforces.
+    SCORE_HISTORY_RETENTION_DAYS: int = 21
+    VOLUME_SNAPSHOTS_RETENTION_DAYS: int = 21
+
     # -------- LunarCrush Social-Velocity Alerter --------
     # Research-only social-velocity signals (Telegram plain-text, no paper
     # trade dispatch). Double kill-switch: either LUNARCRUSH_ENABLED=false or
@@ -764,6 +772,29 @@ class Settings(BaseSettings):
         return v
 
     @model_validator(mode="after")
+    def _validate_retention_covers_secondwave_window(self) -> "Settings":
+        """V2#3 fold: prevent silent mis-config where prune retention <
+        secondwave's evidence-window upper bound. The secondwave detector
+        JOINs score_history / volume_snapshots for alerts in
+        [SECONDWAVE_COOLDOWN_MIN_DAYS, SECONDWAVE_COOLDOWN_MAX_DAYS]; if the
+        hourly prune at retention=R deletes rows older than R days and
+        R < MAX_DAYS, the older end of the evidence window is silently
+        truncated. Fail-fast at config load.
+        """
+        for field_name in (
+            "SCORE_HISTORY_RETENTION_DAYS",
+            "VOLUME_SNAPSHOTS_RETENTION_DAYS",
+        ):
+            value = getattr(self, field_name)
+            if value < self.SECONDWAVE_COOLDOWN_MAX_DAYS:
+                raise ValueError(
+                    f"{field_name}={value} must be >= "
+                    f"SECONDWAVE_COOLDOWN_MAX_DAYS={self.SECONDWAVE_COOLDOWN_MAX_DAYS}. "
+                    f"Lower retention silently truncates secondwave's evidence window."
+                )
+        return self
+
+    @model_validator(mode="after")
     def _validate_live_caps_relation(self) -> "Settings":
         """V1 reviewer I4: prevent cap-relation footgun. Operator could
         configure LIVE_TRADE_AMOUNT_USD > LIVE_MAX_EXPOSURE_USD which
@@ -1151,3 +1182,29 @@ def configure_cache(settings: "Settings") -> None:
     """Pre-populate the settings cache at startup to avoid races."""
     global _CACHED_SETTINGS
     _CACHED_SETTINGS = settings
+
+
+def load_settings(**kwargs) -> "Settings":
+    """Construct Settings() but emit structured logger.error before re-raise on
+    ValidationError, so the systemd Restart=always crash-loop has a
+    journalctl-visible cause line.
+
+    V4#1 review fold (tasks/design_score_volume_pruning_harden.md §D2):
+    operators running with bad .env see a clear ``settings_validation_failed``
+    event in journalctl rather than a bare Pydantic stack trace inside an
+    infinite 10s respawn loop. Curl-direct active-push alert is deferred to
+    BL-NEW-SETTINGS-VALIDATION-ALERT.
+
+    ``**kwargs`` are forwarded to ``Settings(...)`` so tests can inject
+    deliberate validator violations without env-mutation side effects.
+    """
+    import structlog  # local import — config.py stays structlog-free at module load
+    from pydantic import ValidationError as _ValidationError
+
+    try:
+        return Settings(**kwargs)
+    except _ValidationError as exc:
+        structlog.get_logger().error(
+            "settings_validation_failed", error=str(exc)
+        )
+        raise

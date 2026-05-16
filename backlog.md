@@ -1419,3 +1419,39 @@ scout/trading/
 - MEZO: caught 8h early
 - RaveDAO: caught 33h early, +5333% 7d
 - Gap: 2 tokens missed (aPriori, Bedrock) — individual breakouts without category momentum. Volume Spike Detector (PR #15) designed to catch these going forward.
+
+---
+
+## Follow-ups filed 2026-05-16 from BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING PR
+
+These four entries were surfaced during the score/volume pruning PR's plan/design review cycle (V1+V2 plan, V3+V4 design). Filed per actionability discipline.
+
+### BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION: parameterize + decouple remaining 6 narrative-owned prunes
+**Status:** PROPOSED 2026-05-16 — residual from `feat/score-volume-pruning-harden` PR's §7a partial-match reframe.
+**Why:** Score+volume PR extracted those 2 tables from `_run_extra_table_prune` in `scout/narrative/agent.py` and parameterized them via Settings (`SCORE_HISTORY_RETENTION_DAYS`, `VOLUME_SNAPSHOTS_RETENTION_DAYS`). The remaining 6 tables (`volume_spikes`, `momentum_7d`, `trending_snapshots`, `learn_logs`, `chain_matches`, `holder_snapshots`) still use hardcoded retention values and run only inside the narrative daily-learn loop. Same defect class — violates "no hardcoded thresholds" rule.
+**Action:** 6 Settings fields + 6 prune methods on Database + hourly wiring (mirror the score/volume pattern).
+**decision-by:** 6 weeks (lower urgency — slower write rates).
+
+### BL-NEW-SETTINGS-VALIDATION-ALERT: curl-direct Telegram on settings_validation_failed
+**Status:** PROPOSED 2026-05-16 — V4#1 review deferred from `feat/score-volume-pruning-harden` PR.
+**Why:** `load_settings()` in `scout/config.py` emits structured `logger.error("settings_validation_failed", ...)` before re-raising ValidationError. systemd `Restart=always`+`RestartSec=10` (verified on srilu) means a bad `.env` triggers a 10s crash-loop visible in journalctl but with no active Telegram push. Curl-direct push (mirroring `gecko-backup-watchdog` from memory `project_vps_backup_rotation_2026_05_09.md`) requires first-time-only file marker + dedup to avoid 360 msg/hr storm.
+**Action:** `.startup_alert_sent` file marker + curl-direct send in `load_settings()` exception path, marker deleted on successful load. Tests cover first-fail-only behavior.
+**decision-by:** 4 weeks.
+
+### BL-NEW-SCORE-VOLUME-PRUNE-ALERT: §12b active alert on score/volume prune failure
+**Status:** PROPOSED 2026-05-16 — V4#6 review deferred from `feat/score-volume-pruning-harden` PR.
+**Why:** `_run_hourly_maintenance` logs `logger.exception("score_history_prune_failed")` (and volume) but does NOT actively push an alert. If pruning silently fails for 7+ days, the table grows unbounded and operator only sees it via `du -sh scout.db` spot check. Evidence-gated.
+**Action:** §12b active-alert path (TG curl-direct OR `scout.alerter` with `parse_mode=None`) in the exception branches. Likely shipped together with `BL-NEW-SETTINGS-VALIDATION-ALERT` (same alert-infrastructure shape).
+**decision-by:** evidence-gated on first prod failure (no calendar trigger).
+
+### BL-NEW-SETTINGS-IMMUTABILITY: prevent post-construction Settings mutation bypassing validators
+**Status:** PROPOSED 2026-05-16 — V6 PR-review NOTE finding from `feat/score-volume-pruning-harden`.
+**Why:** Pydantic v2 `Settings` is NOT frozen by default. `s.SCORE_HISTORY_RETENTION_DAYS = 5` post-construction silently bypasses the `_validate_retention_covers_secondwave_window` (and `_validate_live_caps_relation`) validator. Any code path that mutates settings after construction breaks the cooldown invariant invisibly. The prune helper trusts `settings.SCORE_HISTORY_RETENTION_DAYS` at call time, so the symptom would be "secondwave evidence window silently truncated" — exact failure mode the validator exists to prevent.
+**Action:** add `model_config = SettingsConfigDict(..., frozen=True)` OR a wrapping read-only proxy. Audit existing in-tree mutation paths first (e.g., `scout/main.py:1388 settings.MIN_SCORE = args.min_score_override` — that's a legitimate mutation that would need refactoring before frozen=True works). Scope: cross-codebase impact assessment + frozen flip OR proxy pattern.
+**decision-by:** 6 weeks (audit-first, then implement).
+
+### BL-NEW-SYSTEMD-UNIT-IN-REPO: systemd units must be repo-tracked
+**Status:** PROPOSED 2026-05-16 — V4 NOTE finding from `feat/score-volume-pruning-harden` PR design review.
+**Why:** `/etc/systemd/system/gecko-pipeline.service` and `gecko-dashboard.service` exist only on srilu-vps, not in the `systemd/` directory of this repo. Any drift between repo and prod (e.g., `Restart=always` policy, `RestartSec`, environment overrides) is invisible to PR reviewers. Substrate-finding shape — config-not-in-git is the same class that drove the 2026-05-16 backlog drift audit.
+**Action:** capture live unit files from srilu, commit to `systemd/gecko-pipeline.service` + `systemd/gecko-dashboard.service`, document the deploy workflow that copies repo → `/etc/systemd/system/`.
+**decision-by:** 4 weeks (documentation+capture exercise).

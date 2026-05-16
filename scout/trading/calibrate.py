@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 
-from scout.config import Settings
+from scout.config import Settings, load_settings
 from scout.db import Database
 from scout.trading.params import (
     CALIBRATION_EXCLUDE_SIGNALS,
@@ -492,7 +492,7 @@ def telegram_token_looks_real(settings: Settings) -> bool:
 
 
 async def _main_async(args: argparse.Namespace) -> int:
-    settings = Settings()
+    settings = load_settings()
 
     if not settings.SIGNAL_PARAMS_ENABLED and not args.force:
         print(

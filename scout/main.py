@@ -16,7 +16,7 @@ from scout.alerter import format_daily_summary, send_alert, send_telegram_messag
 from scout.chains.events import safe_emit
 from scout.chains.patterns import seed_built_in_patterns
 from scout.chains.tracker import run_chain_tracker
-from scout.config import Settings, configure_cache
+from scout.config import Settings, configure_cache, load_settings
 from scout.counter.detail import fetch_coin_detail, extract_counter_data
 from scout.counter.flags import compute_memecoin_flags
 from scout.counter.scorer import score_counter_memecoin
@@ -1193,6 +1193,84 @@ async def check_outcomes(
     return recorded
 
 
+async def _run_hourly_maintenance(db, session, settings, logger) -> None:
+    """Hourly maintenance: outcome check + table prunes.
+
+    Extracted from inline run_pipeline loop for testability (V1#7 fold).
+    No behavior change vs the inline form. ``args`` was unused in the
+    original block (V3 NICE-TO-HAVE fold) — signature drops it.
+    """
+    try:
+        outcomes_recorded = await check_outcomes(db, session)
+        if outcomes_recorded:
+            logger.info("Outcomes checked", recorded=outcomes_recorded)
+    except Exception as e:
+        logger.warning("Outcome check error", error=str(e))
+
+    # Prune old candidates if DB > 500MB
+    try:
+        db_size = (
+            settings.DB_PATH.stat().st_size if settings.DB_PATH.exists() else 0
+        )
+        if db_size > 500_000_000:
+            pruned = await db.prune_old_candidates(keep_days=7)
+            logger.info(
+                "db_pruned",
+                rows_deleted=pruned,
+                db_size_mb=round(db_size / 1e6, 1),
+            )
+    except Exception as e:
+        logger.warning("DB prune error", error=str(e))
+
+    try:
+        await db.prune_perp_anomalies(
+            keep_days=settings.PERP_ANOMALY_RETENTION_DAYS
+        )
+    except Exception as e:
+        logger.warning("perp_anomaly_prune_error", error=str(e))
+
+    # BL-053: prune CryptoPanic posts older than retention cap
+    if settings.CRYPTOPANIC_ENABLED:
+        try:
+            pruned_cp = await db.prune_cryptopanic_posts(
+                keep_days=settings.CRYPTOPANIC_RETENTION_DAYS
+            )
+            if pruned_cp:
+                logger.info("cryptopanic_pruned", rows_deleted=pruned_cp)
+        except Exception:
+            logger.exception("cryptopanic_prune_failed")
+
+    # BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING:
+    # parameterized + decoupled from narrative daily loop. Follow cryptopanic
+    # pattern (V4#4 fold): info-when-rows>0, silent-when-zero — structlog at
+    # main.py has no filter_by_level so debug would still emit.
+    try:
+        pruned_sh = await db.prune_score_history(
+            keep_days=settings.SCORE_HISTORY_RETENTION_DAYS
+        )
+        if pruned_sh:
+            logger.info(
+                "score_history_pruned",
+                rows_deleted=pruned_sh,
+                keep_days=settings.SCORE_HISTORY_RETENTION_DAYS,
+            )
+    except Exception:
+        logger.exception("score_history_prune_failed")
+
+    try:
+        pruned_vs = await db.prune_volume_snapshots(
+            keep_days=settings.VOLUME_SNAPSHOTS_RETENTION_DAYS
+        )
+        if pruned_vs:
+            logger.info(
+                "volume_snapshots_pruned",
+                rows_deleted=pruned_vs,
+                keep_days=settings.VOLUME_SNAPSHOTS_RETENTION_DAYS,
+            )
+    except Exception:
+        logger.exception("volume_snapshots_prune_failed")
+
+
 async def _maybe_announce_tg_alerts(db, session, settings) -> None:
     """BL-NEW-TG-ALERT-ALLOWLIST: first-deploy operator announcement.
 
@@ -1356,7 +1434,7 @@ async def main(argv: list[str] | None = None) -> int:
     # --check-config runs BEFORE any DB / HTTP / live subsystem wiring so
     # operators can introspect resolved live-trading knobs on a stopped host.
     if args.check_config:
-        s = Settings()
+        s = load_settings()
         lc = LiveConfig(s)
         print(f"LIVE_MODE={lc.mode}")
         print(f"live_signal_allowlist_set={sorted(s.live_signal_allowlist_set)}")
@@ -1381,7 +1459,7 @@ async def main(argv: list[str] | None = None) -> int:
         logger_factory=structlog.PrintLoggerFactory(),
     )
 
-    settings = Settings()
+    settings = load_settings()
     # Pre-populate the module-level settings cache to avoid async race
     # on first lazy get_settings() call during startup.
     configure_cache(settings)
@@ -1701,53 +1779,7 @@ async def main(argv: list[str] | None = None) -> int:
 
                     # Hourly tasks: outcome check + DB prune
                     if now - last_outcome_check >= outcome_check_interval:
-                        try:
-                            outcomes_recorded = await check_outcomes(db, session)
-                            if outcomes_recorded:
-                                logger.info(
-                                    "Outcomes checked", recorded=outcomes_recorded
-                                )
-                        except Exception as e:
-                            logger.warning("Outcome check error", error=str(e))
-
-                        # Prune old candidates if DB > 500MB
-                        try:
-                            db_size = (
-                                settings.DB_PATH.stat().st_size
-                                if settings.DB_PATH.exists()
-                                else 0
-                            )
-                            if db_size > 500_000_000:
-                                pruned = await db.prune_old_candidates(keep_days=7)
-                                logger.info(
-                                    "db_pruned",
-                                    rows_deleted=pruned,
-                                    db_size_mb=round(db_size / 1e6, 1),
-                                )
-                        except Exception as e:
-                            logger.warning("DB prune error", error=str(e))
-
-                        try:
-                            await db.prune_perp_anomalies(
-                                keep_days=settings.PERP_ANOMALY_RETENTION_DAYS
-                            )
-                        except Exception as e:
-                            logger.warning("perp_anomaly_prune_error", error=str(e))
-
-                        # BL-053: prune CryptoPanic posts older than retention cap
-                        if settings.CRYPTOPANIC_ENABLED:
-                            try:
-                                pruned_cp = await db.prune_cryptopanic_posts(
-                                    keep_days=settings.CRYPTOPANIC_RETENTION_DAYS
-                                )
-                                if pruned_cp:
-                                    logger.info(
-                                        "cryptopanic_pruned",
-                                        rows_deleted=pruned_cp,
-                                    )
-                            except Exception:
-                                logger.exception("cryptopanic_prune_failed")
-
+                        await _run_hourly_maintenance(db, session, settings, logger)
                         last_outcome_check = now
 
                     # Daily summary at midnight UTC

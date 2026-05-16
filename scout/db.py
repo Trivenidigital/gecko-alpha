@@ -106,6 +106,8 @@ class Database:
         await self._migrate_tg_alert_log_m1_5c_outcome()
         await self._migrate_narrative_scanner_v1()
         await self._migrate_minara_alert_emissions_v1()
+        await self._migrate_score_history_scanned_at_index()
+        await self._migrate_volume_snapshots_scanned_at_index()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -3657,6 +3659,73 @@ class Database:
                 "bl_minara_alert_emissions_v1 tg_alert_log_id partial index missing"
             )
 
+    async def _migrate_scanned_at_index(
+        self, *, table: str, index_name: str, migration_name: str
+    ) -> None:
+        """Add single-column scanned_at index for hourly prune coverage.
+
+        Helper for BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING.
+        Each table gets its own paper_migrations entry (V4#3 fold) so disk
+        failure on one doesn't roll back the other.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+
+        try:
+            await conn.execute("PRAGMA busy_timeout = 90000")
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?", (migration_name,)
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                await conn.execute("COMMIT")
+                return
+            await conn.execute(
+                f"CREATE INDEX IF NOT EXISTS {index_name} ON {table}(scanned_at)"
+            )
+            await conn.execute(
+                "INSERT INTO paper_migrations(name, cutover_ts) VALUES (?, ?)",
+                (migration_name, datetime.now(timezone.utc).isoformat()),
+            )
+            await conn.execute("COMMIT")
+            _db_log.info(
+                "scanned_at_idx_migrated", table=table, migration=migration_name
+            )
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            _db_log.exception(
+                "scanned_at_idx_migration_failed",
+                table=table,
+                migration=migration_name,
+            )
+            _db_log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)
+            raise
+
+    async def _migrate_score_history_scanned_at_index(self) -> None:
+        """BL-NEW-SCORE-HISTORY-PRUNING migration entry point."""
+        await self._migrate_scanned_at_index(
+            table="score_history",
+            index_name="idx_score_history_scanned_at",
+            migration_name="score_history_scanned_at_idx_v1",
+        )
+
+    async def _migrate_volume_snapshots_scanned_at_index(self) -> None:
+        """BL-NEW-VOLUME-SNAPSHOTS-PRUNING migration entry point."""
+        await self._migrate_scanned_at_index(
+            table="volume_snapshots",
+            index_name="idx_volume_snapshots_scanned_at",
+            migration_name="volume_snapshots_scanned_at_idx_v1",
+        )
+
     async def record_minara_alert_emission(
         self,
         *,
@@ -4694,6 +4763,30 @@ class Database:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
         cur = await self._conn.execute(
             "DELETE FROM perp_anomalies WHERE observed_at <= ?", (cutoff,)
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_score_history(self, *, keep_days: int) -> int:
+        """Delete ``score_history`` rows older than ``keep_days``. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM score_history WHERE scanned_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_volume_snapshots(self, *, keep_days: int) -> int:
+        """Delete ``volume_snapshots`` rows older than ``keep_days``. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM volume_snapshots WHERE scanned_at <= ?",
+            (cutoff,),
         )
         await self._conn.commit()
         return cur.rowcount or 0
