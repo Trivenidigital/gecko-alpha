@@ -124,7 +124,7 @@ uv run pytest tests/test_config.py::test_score_history_retention_default tests/t
 
 Expected: FAIL with `AttributeError: 'Settings' object has no attribute 'SCORE_HISTORY_RETENTION_DAYS'`.
 
-- [ ] **Step 1.3: Add the Settings fields + field_validator**
+- [ ] **Step 1.3: Add the Settings fields + model_validator + startup guard in main.py**
 
 In `scout/config.py`, in the appropriate section (likely after `CRYPTOPANIC_RETENTION_DAYS`):
 
@@ -154,6 +154,22 @@ And add a model_validator (Pydantic v2 idiom; `@model_validator(mode='after')`) 
 **Why default 21d not 14d** (V2#1 fold): srilu currently runs `SECONDWAVE_COOLDOWN_MAX_DAYS=14` (default). The `secondwave` detector at `scout/db.py:4285-4324` JOINs `score_history` for alerts in the `[3, MAX]` day window. At retention = cooldown exactly (14d), the hourly prune races the JOIN: rows just over the boundary get deleted before secondwave's scan reaches them. Bumping default retention to 21d (cooldown + 7d buffer) eliminates the race. Disk impact: ~6M rows → ~9M rows; ~600MB extra at full steady-state. Negligible vs cost of silent secondwave undercounts.
 
 **Migration risk** (V2#2 refuted; documented for record): per §9a runtime verification, narrative loop has been pruning to 14d on srilu. Bumping retention to 21d means rows that would have been deleted by the next narrative pass survive an extra 7 days. First main.py prune pass at 21d deletes 0 rows. No backlog spike.
+
+**Startup-failure guard** (V4#1 fold — partial): wrap `Settings()` construction at `scout/main.py:1384` (and the 3 other sites V3 identified: `main.py:1359` `--check-config`, `social/telegram/cli.py:45`, `trading/calibrate.py:495`) with `try/except ValidationError` to emit a structured `logger.error("settings_validation_failed", error=str(exc))` BEFORE re-raising. This makes journalctl-visible during the systemd `Restart=always` respawn loop instead of relying on the operator to decode a raw Pydantic stack. Example for main.py:
+
+```python
+from pydantic import ValidationError
+try:
+    settings = Settings()
+except ValidationError as exc:
+    # V4#1 fold: surface startup config failure loudly before re-raise.
+    # systemd Restart=always will retry every 10s; this log makes the
+    # cause visible in journalctl -u gecko-pipeline.
+    logger.error("settings_validation_failed", error=str(exc))
+    raise
+```
+
+**Curl-direct Telegram on startup-fail is DEFERRED** to a separate item `BL-NEW-SETTINGS-VALIDATION-ALERT`. Per-restart curl would emit ~360 msg/hr without file-based dedup. Worth doing right (markers + first-time-only) in a focused PR, not gold-plating this one.
 
 - [ ] **Step 1.4: Run to verify pass**
 
@@ -218,12 +234,15 @@ Expected: FAIL — indexes don't exist yet.
 In `scout/db.py`, after `_migrate_minara_alert_emissions_v1` (~line 3432), add:
 
 ```python
-    async def _migrate_score_volume_prune_indexes(self) -> None:
-        """Add scanned_at indexes for hourly prune DELETE coverage.
+    async def _migrate_score_history_scanned_at_index(self) -> None:
+        """V4#3 fold: split per-index migration so partial success is durable.
 
-        Existing idx_score_hist_addr / idx_volume_snap_addr have
-        contract_address as leading column — unusable for time-only
-        predicate in DELETE WHERE scanned_at <= ?.
+        Disk pressure during the second index build doesn't roll back the
+        first one. Each index gets its own paper_migrations entry.
+
+        V4#2 fold: PRAGMA busy_timeout = 90000 covers concurrent readers
+        (dashboard service) waiting on the EXCLUSIVE write lock during
+        index build (~30-60s on 6M rows).
         """
         import structlog
 
@@ -231,9 +250,10 @@ In `scout/db.py`, after `_migrate_minara_alert_emissions_v1` (~line 3432), add:
         if self._conn is None:
             raise RuntimeError("Database not initialized.")
         conn = self._conn
-        migration_name = "score_volume_prune_indexes_v1"
+        migration_name = "score_history_scanned_at_idx_v1"
 
         try:
+            await conn.execute("PRAGMA busy_timeout = 90000")
             await conn.execute("BEGIN EXCLUSIVE")
             cur = await conn.execute(
                 "SELECT 1 FROM paper_migrations WHERE name = ?", (migration_name,)
@@ -247,6 +267,41 @@ In `scout/db.py`, after `_migrate_minara_alert_emissions_v1` (~line 3432), add:
                 "ON score_history(scanned_at)"
             )
             await conn.execute(
+                "INSERT INTO paper_migrations(name, cutover_ts) VALUES (?, ?)",
+                (migration_name, datetime.now(timezone.utc).isoformat()),
+            )
+            await conn.execute("COMMIT")
+            _log.info("score_history_scanned_at_idx_migrated")
+        except Exception:
+            await conn.execute("ROLLBACK")
+            _log.exception("score_history_scanned_at_idx_migration_failed")
+            raise
+
+    async def _migrate_volume_snapshots_scanned_at_index(self) -> None:
+        """V4#3 fold: companion migration to score_history index.
+
+        Independent paper_migrations entry — disk failure on this one
+        leaves the score_history index intact.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "volume_snapshots_scanned_at_idx_v1"
+
+        try:
+            await conn.execute("PRAGMA busy_timeout = 90000")
+            await conn.execute("BEGIN EXCLUSIVE")
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?", (migration_name,)
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                await conn.execute("COMMIT")
+                return
+            await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_volume_snapshots_scanned_at "
                 "ON volume_snapshots(scanned_at)"
             )
@@ -255,17 +310,18 @@ In `scout/db.py`, after `_migrate_minara_alert_emissions_v1` (~line 3432), add:
                 (migration_name, datetime.now(timezone.utc).isoformat()),
             )
             await conn.execute("COMMIT")
-            _log.info("score_volume_prune_indexes_migrated")
+            _log.info("volume_snapshots_scanned_at_idx_migrated")
         except Exception:
             await conn.execute("ROLLBACK")
-            _log.exception("score_volume_prune_indexes_migration_failed")
+            _log.exception("volume_snapshots_scanned_at_idx_migration_failed")
             raise
 ```
 
 Then in `initialize()` after `await self._migrate_minara_alert_emissions_v1()` (~line 108), add:
 
 ```python
-        await self._migrate_score_volume_prune_indexes()
+        await self._migrate_score_history_scanned_at_index()
+        await self._migrate_volume_snapshots_scanned_at_index()
 ```
 
 - [ ] **Step 1.5.4: Run to verify pass**
@@ -507,10 +563,12 @@ git commit -m "feat(db): prune_volume_snapshots method with TDD coverage"
 
 - [ ] **Step 4.1: Extract the hourly block (refactor commit — no behavior change)**
 
-In `scout/main.py`, extract the block at lines 1702-1751 into a helper at module level (NOT inside `run_pipeline`):
+In `scout/main.py`, extract the block at lines 1702-1751 into a helper at module level (NOT inside `run_pipeline`).
+
+**V3 NICE-TO-HAVE fold:** drop `args` from the signature — verified via grep that the hourly block at 1702-1751 does not reference `args` (the dry-run gate lives only in the daily-summary block at line 1759, not in scope of this extraction).
 
 ```python
-async def _run_hourly_maintenance(db, session, settings, args, logger) -> None:
+async def _run_hourly_maintenance(db, session, settings, logger) -> None:
     """Hourly maintenance tasks: outcome check + table prune.
 
     Extracted from inline run_pipeline loop for testability. No behavior
@@ -562,7 +620,7 @@ Replace the inline block at line 1702-1751 with:
 
 ```python
                     if now - last_outcome_check >= outcome_check_interval:
-                        await _run_hourly_maintenance(db, session, settings, args, logger)
+                        await _run_hourly_maintenance(db, session, settings, logger)
                         last_outcome_check = now
 ```
 
@@ -600,11 +658,10 @@ async def test_run_hourly_maintenance_calls_score_history_prune(tmp_path):
     db.prune_score_history = AsyncMock(return_value=0)
     db.prune_volume_snapshots = AsyncMock(return_value=0)
     session = MagicMock()
-    args = MagicMock(dry_run=False)
     logger = MagicMock()
 
     # check_outcomes will fail (no real db) — caught by the outer try
-    await _run_hourly_maintenance(db, session, settings, args, logger)
+    await _run_hourly_maintenance(db, session, settings, logger)
 
     db.prune_score_history.assert_awaited_once_with(
         keep_days=settings.SCORE_HISTORY_RETENTION_DAYS
@@ -637,12 +694,6 @@ After the existing cryptopanic block inside `_run_hourly_maintenance`, add:
                 rows_deleted=pruned_sh,
                 keep_days=settings.SCORE_HISTORY_RETENTION_DAYS,
             )
-        else:
-            logger.debug(
-                "score_history_pruned",
-                rows_deleted=0,
-                keep_days=settings.SCORE_HISTORY_RETENTION_DAYS,
-            )
     except Exception:
         logger.exception("score_history_prune_failed")
 
@@ -656,15 +707,11 @@ After the existing cryptopanic block inside `_run_hourly_maintenance`, add:
                 rows_deleted=pruned_vs,
                 keep_days=settings.VOLUME_SNAPSHOTS_RETENTION_DAYS,
             )
-        else:
-            logger.debug(
-                "volume_snapshots_pruned",
-                rows_deleted=0,
-                keep_days=settings.VOLUME_SNAPSHOTS_RETENTION_DAYS,
-            )
     except Exception:
         logger.exception("volume_snapshots_prune_failed")
 ```
+
+**V4#4 fold — log-level discipline corrected:** drop the `else: logger.debug(...)` branch entirely. structlog at `scout/main.py:1373-1382` has no `filter_by_level` processor, so `logger.debug(...)` would emit to journalctl just like `info`. Follow the in-tree `prune_cryptopanic_posts` pattern at `main.py:1747-1748` (info-when-rows>0, silent-when-zero) for journalctl hygiene. Operator visibility of "did the prune run?" comes from the migration-time + service-start logs + spot-check via `journalctl -u gecko-pipeline | grep _pruned`. The 7d-ramp silent-zero period is acceptable (visible row-count change on prod DB inspection).
 
 **Transaction note** (V1#9 fold): each prune commits independently; the two consecutive prune calls are NOT wrapped in a single transaction. This is intentional — the operations are independent of each other, and concurrent INSERTs from the scorer loop should be allowed to interleave. SQLite WAL mode + per-DELETE commit handles writer contention without batched-txn complexity.
 
@@ -856,14 +903,15 @@ git commit -m "docs(backlog): file BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION residu
 
 ## Test plan summary
 
-- 4 config tests (3 settings defaults/override + 1 field-validator)
+- 4 config tests (3 settings defaults/override + 1 model-validator)
+- 1 startup-guard test (`test_main_logs_settings_validation_error_before_raise` — V4#1 fold)
 - 2 index EXPLAIN tests (score + volume use the new `idx_*_scanned_at`)
 - 6 db prune tests (prune_score_history: keeps_recent, empty, keep_days_zero, tie-on-cutoff; prune_volume_snapshots: keeps_recent, empty)
 - 1 narrative test (silent-except → structured-log, asserts count=6 per-table)
 - 1 integration test (`_run_hourly_maintenance` calls both prune methods with Settings values)
 - Full regression must pass (or baseline-only failures called out in PR description)
 
-Total: 14 new tests + full regression.
+Total: 15 new tests + full regression.
 
 ---
 
