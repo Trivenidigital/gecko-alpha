@@ -137,6 +137,79 @@ async def test_run_hourly_maintenance_calls_narrative_table_prune(
     getattr(db, prune_method).assert_awaited_once_with(keep_days=expected_keep_days)
 
 
+@pytest.mark.parametrize(
+    "failing_method,event_base,subsequent_methods",
+    [
+        (
+            "prune_volume_spikes",
+            "volume_spikes",
+            [
+                "prune_momentum_7d",
+                "prune_trending_snapshots",
+                "prune_learn_logs",
+                "prune_chain_matches",
+                "prune_holder_snapshots",
+            ],
+        ),
+        (
+            "prune_momentum_7d",
+            "momentum_7d",
+            [
+                "prune_trending_snapshots",
+                "prune_learn_logs",
+                "prune_chain_matches",
+                "prune_holder_snapshots",
+            ],
+        ),
+        (
+            "prune_trending_snapshots",
+            "trending_snapshots",
+            ["prune_learn_logs", "prune_chain_matches", "prune_holder_snapshots"],
+        ),
+        (
+            "prune_learn_logs",
+            "learn_logs",
+            ["prune_chain_matches", "prune_holder_snapshots"],
+        ),
+        ("prune_chain_matches", "chain_matches", ["prune_holder_snapshots"]),
+        ("prune_holder_snapshots", "holder_snapshots", []),
+    ],
+)
+async def test_narrative_prune_loop_fault_isolation(
+    tmp_path, failing_method, event_base, subsequent_methods
+):
+    """V11 PR-review MUST-FIX: cycle 2's tight-loop pattern in
+    _run_hourly_maintenance is NEW; one prune raising must NOT halt the
+    subsequent prunes in the loop.
+
+    For each of the 6 new prune methods, inject side_effect=RuntimeError
+    and verify:
+      (a) logger.exception emits f'{event_base}_prune_failed' for the failing one
+      (b) every subsequent method in the loop is still awaited
+    """
+    settings = _make_settings(tmp_path)
+    db = _make_db_mock()
+    setattr(db, failing_method, AsyncMock(side_effect=RuntimeError("simulated")))
+    session = MagicMock()
+    logger = MagicMock()
+
+    await _run_hourly_maintenance(db, session, settings, logger)
+
+    # (a) failure is logged structurally
+    exception_events = [
+        call.args[0] for call in logger.exception.call_args_list if call.args
+    ]
+    assert f"{event_base}_prune_failed" in exception_events, (
+        f"Expected '{event_base}_prune_failed' in {exception_events}"
+    )
+
+    # (b) subsequent methods in the loop were still awaited
+    for method_name in subsequent_methods:
+        getattr(db, method_name).assert_awaited(), (
+            f"Loop halted after {failing_method} raised; {method_name} not called"
+        )
+
+
 async def test_run_hourly_maintenance_exception_path_logs_structured(tmp_path):
     """logger.exception('score_history_prune_failed') on exception, not silent."""
     settings = _make_settings(tmp_path)

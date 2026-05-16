@@ -108,14 +108,18 @@ class Database:
         await self._migrate_minara_alert_emissions_v1()
         await self._migrate_score_history_scanned_at_index()
         await self._migrate_volume_snapshots_scanned_at_index()
-        # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 5 narrative-owned
+        # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 6 narrative-owned
         # tables. Same pattern as cycle 1, parameterized via _migrate_scanned_at_index
         # `column` kwarg (D3 plan-review fold). Order: alphabetical by table.
-        await self._migrate_volume_spikes_detected_at_index()
+        # V12 PR-review SHOULD-FIX #1: chain_matches index promoted from
+        # deferred (V9 NICE-TO-HAVE) — 5-line cost vs structural table-scan
+        # on every hourly prune.
+        await self._migrate_chain_matches_completed_at_index()
+        await self._migrate_holder_snapshots_scanned_at_index()
+        await self._migrate_learn_logs_created_at_index()
         await self._migrate_momentum_7d_detected_at_index()
         await self._migrate_trending_snapshots_snapshot_at_index()
-        await self._migrate_learn_logs_created_at_index()
-        await self._migrate_holder_snapshots_scanned_at_index()
+        await self._migrate_volume_spikes_detected_at_index()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -3692,10 +3696,13 @@ class Database:
         'index_migration_failed' (was hardcoded 'scanned_at_idx_*') so
         cycle-2 columns are grep-able via the `column=` field.
         """
-        # D8 SHOULD-FIX #4: defensive guard — `column` is code-supplied
-        # in all current callers, but the helper is reusable across cycles.
-        # Reject anything that isn't a SQL-safe identifier.
-        assert column.replace("_", "").isalnum(), f"unsafe column={column!r}"
+        # D8 SHOULD-FIX #4 + V10 NICE-TO-HAVE: defensive guard — `column` is
+        # code-supplied in all current callers, but the helper is reusable
+        # across cycles. Reject anything that isn't a SQL-safe identifier.
+        # Promoted from `assert` to `raise` so the guard survives `python -O`
+        # (asserts are stripped under optimization).
+        if not column.replace("_", "").isalnum():
+            raise ValueError(f"unsafe column={column!r}")
 
         if self._conn is None:
             raise RuntimeError("Database not initialized.")
@@ -3774,6 +3781,17 @@ class Database:
             column="detected_at",
             index_name="idx_volume_spikes_detected_at",
             migration_name="volume_spikes_detected_at_idx_v1",
+        )
+
+    async def _migrate_chain_matches_completed_at_index(self) -> None:
+        """V12 PR-review SHOULD-FIX #1 fold: chain_matches index promoted
+        from V9 NICE-TO-HAVE deferral. Cost is 5 lines; hourly prune was
+        structurally table-scanning otherwise."""
+        await self._migrate_scanned_at_index(
+            table="chain_matches",
+            column="completed_at",
+            index_name="idx_chain_matches_completed_at",
+            migration_name="chain_matches_completed_at_idx_v1",
         )
 
     async def _migrate_momentum_7d_detected_at_index(self) -> None:
@@ -4878,7 +4896,7 @@ class Database:
     # ------------------------------------------------------------------
 
     async def prune_volume_spikes(self, *, keep_days: int) -> int:
-        """Delete volume_spikes rows older than ``keep_days``. Returns rowcount."""
+        """Delete ``volume_spikes`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
@@ -4890,7 +4908,7 @@ class Database:
         return cur.rowcount or 0
 
     async def prune_momentum_7d(self, *, keep_days: int) -> int:
-        """Delete momentum_7d rows older than ``keep_days``. Returns rowcount."""
+        """Delete ``momentum_7d`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
@@ -4902,7 +4920,7 @@ class Database:
         return cur.rowcount or 0
 
     async def prune_trending_snapshots(self, *, keep_days: int) -> int:
-        """Delete trending_snapshots rows older than ``keep_days``. Returns rowcount."""
+        """Delete ``trending_snapshots`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
@@ -4914,7 +4932,7 @@ class Database:
         return cur.rowcount or 0
 
     async def prune_learn_logs(self, *, keep_days: int) -> int:
-        """Delete learn_logs rows older than ``keep_days``. Returns rowcount."""
+        """Delete ``learn_logs`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
@@ -4926,7 +4944,7 @@ class Database:
         return cur.rowcount or 0
 
     async def prune_chain_matches(self, *, keep_days: int) -> int:
-        """Delete chain_matches rows older than ``keep_days``. Returns rowcount."""
+        """Delete ``chain_matches`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
@@ -4938,7 +4956,7 @@ class Database:
         return cur.rowcount or 0
 
     async def prune_holder_snapshots(self, *, keep_days: int) -> int:
-        """Delete holder_snapshots rows older than ``keep_days``. Returns rowcount."""
+        """Delete ``holder_snapshots`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()

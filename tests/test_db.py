@@ -178,6 +178,128 @@ async def test_prune_score_history_future_dated_rows_survive_keep_days_zero(db):
 
 
 @pytest.mark.parametrize(
+    "prune_method,table,column,fk_seed_sql,fk_seed_params,insert_sql,insert_extra_cols",
+    [
+        (
+            "prune_volume_spikes",
+            "volume_spikes",
+            "detected_at",
+            None,
+            None,
+            (
+                "INSERT INTO volume_spikes (coin_id, symbol, name, current_volume,"
+                " avg_volume_7d, spike_ratio, detected_at) VALUES (?,?,?,?,?,?,?)"
+            ),
+            ("c-tie", "TIE", "TIE", 1000.0, 500.0, 2.0),
+        ),
+        (
+            "prune_momentum_7d",
+            "momentum_7d",
+            "detected_at",
+            None,
+            None,
+            "INSERT INTO momentum_7d (coin_id, symbol, name, price_change_7d, detected_at) VALUES (?,?,?,?,?)",
+            ("c-tie", "TIE", "TIE", 100.0),
+        ),
+        (
+            "prune_trending_snapshots",
+            "trending_snapshots",
+            "snapshot_at",
+            None,
+            None,
+            "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?,?,?,?)",
+            ("c-tie", "TIE", "TIE"),
+        ),
+        (
+            "prune_learn_logs",
+            "learn_logs",
+            "created_at",
+            None,
+            None,
+            "INSERT INTO learn_logs (cycle_number, cycle_type, reflection_text, changes_made, created_at) VALUES (?,?,?,?,?)",
+            (1, "daily", "r", "c"),
+        ),
+        (
+            "prune_chain_matches",
+            "chain_matches",
+            "completed_at",
+            "INSERT INTO chain_patterns (name, description, steps_json, min_steps_to_trigger) VALUES (?,?,?,?)",
+            ("tie_pattern", "tie", '["x"]', 1),
+            (
+                "INSERT INTO chain_matches (token_id, pipeline, pattern_id, pattern_name,"
+                " steps_matched, total_steps, anchor_time, chain_duration_hours,"
+                " conviction_boost, completed_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
+            ),
+            ("t-tie", "memecoin", 1, "tie_pattern", 1, 1, "2026-01-01T00:00:00+00:00", 1.0, 0),
+        ),
+        (
+            "prune_holder_snapshots",
+            "holder_snapshots",
+            "scanned_at",
+            None,
+            None,
+            "INSERT INTO holder_snapshots (contract_address, holder_count, scanned_at) VALUES (?,?,?)",
+            ("0xTIE", 100),
+        ),
+    ],
+)
+async def test_narrative_prune_tie_on_cutoff_deletes(
+    db,
+    prune_method,
+    table,
+    column,
+    fk_seed_sql,
+    fk_seed_params,
+    insert_sql,
+    insert_extra_cols,
+):
+    """V11 PR-review SHOULD-FIX: parity with cycle 1's
+    test_prune_score_history_tie_on_cutoff_deletes for all 6 cycle 2 tables.
+
+    Locks in <= boundary semantic per V1#11 cycle 1 convention. Future PR
+    flipping <= to < on any of the 6 tables gets caught here.
+    """
+    if fk_seed_sql:
+        await db._conn.execute(fk_seed_sql, fk_seed_params)
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    await db._conn.execute(insert_sql, (*insert_extra_cols, cutoff_iso))
+    await db._conn.commit()
+
+    deleted = await getattr(db, prune_method)(keep_days=30)
+    assert deleted == 1
+
+
+async def test_migration_idempotency_records_all_seven_cycle_1_and_2(tmp_path):
+    """V11 SHOULD-FIX: cycle 1's idempotency test asserts via set-equality
+    (after_first == after_second) but doesn't EXPLICITLY assert all 7
+    cycle-1+2 migration rows are present. If a cycle-2 migration silently
+    failed to INSERT into paper_migrations, set-equality would pass vacuously
+    (both empty/missing the row) and a subsequent restart would re-run the
+    CREATE INDEX — blocking dashboard for 30-60s.
+    """
+    db = Database(str(tmp_path / "explicit_idempotency.db"))
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT name FROM paper_migrations WHERE name LIKE '%_idx_v1'"
+    )
+    names = {row[0] for row in await cur.fetchall()}
+    await db.close()
+
+    expected = {
+        "score_history_scanned_at_idx_v1",
+        "volume_snapshots_scanned_at_idx_v1",
+        "volume_spikes_detected_at_idx_v1",
+        "momentum_7d_detected_at_idx_v1",
+        "trending_snapshots_snapshot_at_idx_v1",
+        "learn_logs_created_at_idx_v1",
+        "holder_snapshots_scanned_at_idx_v1",
+        "chain_matches_completed_at_idx_v1",
+    }
+    missing = expected - names
+    assert not missing, f"Missing paper_migrations rows after initialize(): {missing}"
+
+
+@pytest.mark.parametrize(
     "table,column,index",
     [
         ("volume_spikes", "detected_at", "idx_volume_spikes_detected_at"),
@@ -185,6 +307,7 @@ async def test_prune_score_history_future_dated_rows_survive_keep_days_zero(db):
         ("trending_snapshots", "snapshot_at", "idx_trending_snapshots_snapshot_at"),
         ("learn_logs", "created_at", "idx_learn_logs_created_at"),
         ("holder_snapshots", "scanned_at", "idx_holder_snapshots_scanned_at"),
+        ("chain_matches", "completed_at", "idx_chain_matches_completed_at"),
     ],
 )
 async def test_narrative_table_prune_uses_new_index(db, table, column, index):
