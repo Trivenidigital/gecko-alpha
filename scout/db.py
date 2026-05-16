@@ -108,6 +108,14 @@ class Database:
         await self._migrate_minara_alert_emissions_v1()
         await self._migrate_score_history_scanned_at_index()
         await self._migrate_volume_snapshots_scanned_at_index()
+        # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 5 narrative-owned
+        # tables. Same pattern as cycle 1, parameterized via _migrate_scanned_at_index
+        # `column` kwarg (D3 plan-review fold). Order: alphabetical by table.
+        await self._migrate_volume_spikes_detected_at_index()
+        await self._migrate_momentum_7d_detected_at_index()
+        await self._migrate_trending_snapshots_snapshot_at_index()
+        await self._migrate_learn_logs_created_at_index()
+        await self._migrate_holder_snapshots_scanned_at_index()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -3754,6 +3762,50 @@ class Database:
             table="volume_snapshots",
             index_name="idx_volume_snapshots_scanned_at",
             migration_name="volume_snapshots_scanned_at_idx_v1",
+        )
+
+    # ------------------------------------------------------------------
+    # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2) — 5 migration entry points
+    # ------------------------------------------------------------------
+
+    async def _migrate_volume_spikes_detected_at_index(self) -> None:
+        await self._migrate_scanned_at_index(
+            table="volume_spikes",
+            column="detected_at",
+            index_name="idx_volume_spikes_detected_at",
+            migration_name="volume_spikes_detected_at_idx_v1",
+        )
+
+    async def _migrate_momentum_7d_detected_at_index(self) -> None:
+        await self._migrate_scanned_at_index(
+            table="momentum_7d",
+            column="detected_at",
+            index_name="idx_momentum_7d_detected_at",
+            migration_name="momentum_7d_detected_at_idx_v1",
+        )
+
+    async def _migrate_trending_snapshots_snapshot_at_index(self) -> None:
+        await self._migrate_scanned_at_index(
+            table="trending_snapshots",
+            column="snapshot_at",
+            index_name="idx_trending_snapshots_snapshot_at",
+            migration_name="trending_snapshots_snapshot_at_idx_v1",
+        )
+
+    async def _migrate_learn_logs_created_at_index(self) -> None:
+        await self._migrate_scanned_at_index(
+            table="learn_logs",
+            column="created_at",
+            index_name="idx_learn_logs_created_at",
+            migration_name="learn_logs_created_at_idx_v1",
+        )
+
+    async def _migrate_holder_snapshots_scanned_at_index(self) -> None:
+        await self._migrate_scanned_at_index(
+            table="holder_snapshots",
+            column="scanned_at",
+            index_name="idx_holder_snapshots_scanned_at",
+            migration_name="holder_snapshots_scanned_at_idx_v1",
         )
 
     async def record_minara_alert_emission(

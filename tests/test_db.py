@@ -177,6 +177,29 @@ async def test_prune_score_history_future_dated_rows_survive_keep_days_zero(db):
     assert [r[0] for r in rows] == ["0xFUTURE"]
 
 
+@pytest.mark.parametrize(
+    "table,column,index",
+    [
+        ("volume_spikes", "detected_at", "idx_volume_spikes_detected_at"),
+        ("momentum_7d", "detected_at", "idx_momentum_7d_detected_at"),
+        ("trending_snapshots", "snapshot_at", "idx_trending_snapshots_snapshot_at"),
+        ("learn_logs", "created_at", "idx_learn_logs_created_at"),
+        ("holder_snapshots", "scanned_at", "idx_holder_snapshots_scanned_at"),
+    ],
+)
+async def test_narrative_table_prune_uses_new_index(db, table, column, index):
+    """BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (V9 plan-review fold): each
+    of the 5 new tables must have a usable single-column index for the
+    prune DELETE's time-only WHERE clause."""
+    cur = await db._conn.execute(
+        f"EXPLAIN QUERY PLAN DELETE FROM {table} WHERE {column} <= ?",
+        ("2026-01-01T00:00:00+00:00",),
+    )
+    plan = await cur.fetchall()
+    plan_str = " ".join(str(row[3]) for row in plan)
+    assert index in plan_str, f"{index} not used: {plan_str}"
+
+
 async def test_migration_idempotent_on_second_initialize(tmp_path):
     """V6 fold: migration idempotency via paper_migrations row check.
 
