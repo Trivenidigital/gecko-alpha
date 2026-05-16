@@ -255,6 +255,19 @@ class Settings(BaseSettings):
     SCORE_HISTORY_RETENTION_DAYS: int = 21
     VOLUME_SNAPSHOTS_RETENTION_DAYS: int = 21
 
+    # -------- Narrative-owned table retention (BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION) --------
+    # Hourly prune via main._run_hourly_maintenance. V8 plan-review fold:
+    # volume_spikes / trending_snapshots / chain_matches defaults set to >= 30
+    # to cover backtest CLI default --days=30 + 15d headroom (where applicable);
+    # validator enforces 30d floor below. Per-table reader-window analysis
+    # in tasks/plan_narrative_prune_scope_expansion.md.
+    VOLUME_SPIKES_RETENTION_DAYS: int = 45
+    MOMENTUM_7D_RETENTION_DAYS: int = 30
+    TRENDING_SNAPSHOTS_RETENTION_DAYS: int = 30
+    LEARN_LOGS_RETENTION_DAYS: int = 90
+    CHAIN_MATCHES_RETENTION_DAYS: int = 45
+    HOLDER_SNAPSHOTS_RETENTION_DAYS: int = 14
+
     # -------- LunarCrush Social-Velocity Alerter --------
     # Research-only social-velocity signals (Telegram plain-text, no paper
     # trade dispatch). Double kill-switch: either LUNARCRUSH_ENABLED=false or
@@ -770,6 +783,26 @@ class Settings(BaseSettings):
         if v < 1:
             raise ValueError(f"LIVE_MAX_OPEN_POSITIONS_PER_TOKEN must be >= 1; got={v}")
         return v
+
+    @model_validator(mode="after")
+    def _validate_backtest_cli_retention_floor(self) -> "Settings":
+        """V8 plan-review fold: backtest CLI tools default --days=30 against
+        trending_snapshots / chain_matches / volume_spikes. Retention below 30
+        silently truncates the backtest cohort at the CLI default."""
+        backtest_floor = 30
+        for field_name in (
+            "TRENDING_SNAPSHOTS_RETENTION_DAYS",
+            "CHAIN_MATCHES_RETENTION_DAYS",
+            "VOLUME_SPIKES_RETENTION_DAYS",
+        ):
+            value = getattr(self, field_name)
+            if value < backtest_floor:
+                raise ValueError(
+                    f"{field_name}={value} must be >= {backtest_floor} to cover "
+                    f"backtest CLI default --days=30. Lower retention silently "
+                    f"truncates backtest cohorts."
+                )
+        return self
 
     @model_validator(mode="after")
     def _validate_retention_covers_secondwave_window(self) -> "Settings":
