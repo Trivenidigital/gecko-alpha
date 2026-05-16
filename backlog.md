@@ -243,7 +243,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Changes:** Track cumulative stats, log summary every 5 min (or every N cycles)
 
 ### BL-NEW-INGEST-WATCHDOG: Per-source ingestion starvation alert
-**Status:** IN PR BUILD — 2026-05-14 on `codex/ingest-watchdog`. Design in `tasks/design_ingest_watchdog.md`; implementation uses raw-source health samples rather than post-filter candidate counts.
+**Status:** SHIPPED 2026-05-15 — commit `479e6c7 feat(observability): add ingestion starvation watchdog`. Status updated per `tasks/findings_backlog_drift_audit_2026_05_16.md`. Design in `tasks/design_ingest_watchdog.md`; implementation uses raw-source health samples rather than post-filter candidate counts.
 **Tag:** `observability` `silent-failure` `tg-alert`
 **Files:** scout/heartbeat.py (per-source consecutive-empty counter), scout/main.py (cycle-loop instrumentation + TG dispatch), scout/ingestion/{coingecko,dexscreener,geckoterminal}.py (raw-source samples), tests/test_{heartbeat,ingest_watchdog,coingecko,dexscreener,geckoterminal,config}.py.
 **Why:** When a single ingestion source (CoinGecko / DexScreener / GeckoTerminal chain) stops returning raw upstream data, the pipeline silently keeps running on remaining sources. Memory `feedback_clear_pycache_on_deploy.md` and the BL-066' incident showed the operator only learns about silent ingestion failures via downstream symptoms (e.g., paper-trade volume drop). Industry-standard ops pattern.
@@ -413,7 +413,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Adapted from `Trivenidigital/shift-agent` analysis:** the inspiration for BL-072 + BL-073 was `shift-agent`'s `docs/hermes-alignment.md` + `CLAUDE.md` "Hermes-first" rules. shift-agent **runs on Hermes** as its production runtime; gecko-alpha does NOT (vanilla async Python pipeline). The adaptation is structural — we kept the 4-part doc shape and the read-deployed-code rule, dropped the Hermes-specific drift-tag vocabulary as cargo-cult, and replaced it with the more answerable single-line `**New primitives introduced:** [list or NONE]` declaration.
 
 ### BL-NEW-HERMES-CRYPTO-SKILLS-TRACKING: track crypto-relevant Hermes ecosystem capabilities
-**Status:** PROPOSED 2026-05-14 - research note captured at `tasks/research_hermes_crypto_skills_2026_05_14.md`.
+**Status:** SHIPPED-RESEARCH 2026-05-14 — commit `acf4b8e docs(hermes): track crypto skill ecosystem and debt audit (#119)`. Research note at `tasks/research_hermes_crypto_skills_2026_05_14.md`. Ongoing-tracking entry; not "closed" but no further build action queued. Status updated per `tasks/findings_backlog_drift_audit_2026_05_16.md`.
 **Tag:** `hermes-first` `crypto-skills` `research-gated` `agent-framework-integrations`
 **Why:** The Top Gainers gap investigation found new crypto-relevant skill surfaces outside the original May 3 Hermes pass: CoinGecko's first-party Agent SKILL, GoldRush/Covalent agent skills + Hermes MCP path, HermesHub as an early registry, and updated awesome-hermes-agent entries. These are not runtime replacements for gecko-alpha ingestion today, but they must be tracked so future custom-code proposals do not skip cheaper skill/API-reference paths.
 
@@ -465,7 +465,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 4. Old LunarCrush/Santiment/Nansen/Dune/pump.fun roadmap entries are historical unless a new residual-gap design revives them.
 
 ### BL-NEW-COINGECKO-BREADTH-HYDRATION: widen CoinGecko signal discovery without new provider debt
-**Status:** PR READY 2026-05-14 - branch `codex/coingecko-breadth-hydration`.
+**Status:** SHIPPED 2026-05-14 — commits `2487ad7` (impl) + `5e3417b feat(coingecko): hydrate trending and widen breadth (#121)` (PR merge). Status updated per `tasks/findings_backlog_drift_audit_2026_05_16.md`.
 **Tag:** `signals` `coingecko` `breadth` `hydration` `hermes-first`
 **Why:** Top Gainers audit showed the system can catch winners when they reach existing tables, but some CoinGecko-listed movers never enter `gainers_snapshots`, `volume_history_cg`, `momentum_7d`, `slow_burn_candidates`, or `velocity_alerts`. Two concrete gaps were found: `/search/trending` rows carried rank but not true market data, and the volume scan only covered the top 500 by volume.
 
@@ -476,7 +476,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Verification:** TDD red/green for trending hydration, hydration-failure fallback, configurable volume page count, and raw-row combiner. Focused regression: `tests/test_coingecko.py tests/test_main.py tests/test_main_cryptopanic_integration.py tests/test_gainers_tracker.py tests/test_spikes_detector.py tests/test_slow_burn_detector.py` -> 77 passed. Broader run including `tests/test_heartbeat_mcap_missing.py` still shows the known baseline aioresponses URL-matching failures from PR #119, not a regression in this branch.
 
 ### BL-NEW-COINGECKO-MIDCAP-GAINER-SCAN: free-tier market-rank scan for low-volume gainers
-**Status:** IMPLEMENTED 2026-05-14 - branch `codex/coingecko-midcap-gainer-scan`; see `tasks/design_coingecko_midcap_gainer_scan.md`.
+**Status:** SHIPPED 2026-05-14 — commit `4860692 feat(coingecko): scan midcap gainers (#124)` + docs follow-up `0ce1540`. Design at `tasks/design_coingecko_midcap_gainer_scan.md`. Status updated per `tasks/findings_backlog_drift_audit_2026_05_16.md`.
 **Tag:** `signals` `coingecko` `gainers` `quality-over-quantity` `hermes-first`
 **Why:** Exact-ID Top Gainers audit found the remaining misses (Playnance `playnance`, Bityuan `bityuan`, SAFEbit `safecoin`) are mid-cap CoinGecko tokens around rank 470-680 with low absolute volume. They were not top-1000 by volume in the audit sample and were not trending, so neither `fetch_by_volume` nor PR #121's trending hydration can catch them reliably.
 
@@ -719,7 +719,9 @@ ssh root@89.167.116.187 "sqlite3 /root/gecko-alpha/scout.db \"SELECT COUNT(*) FR
 **3-vector PR review caught 3 CRITICAL pre-merge** (folded in commit `fff3658` pre-rebase): base58 SPL shape validation (V1-I1 + V2-I2 convergence), CancelledError sentinel-stuck (V2-I1), isinstance(dict) guard for CG schema drift (V1-I1).
 
 ### BL-NEW-MINARA-DB-PERSISTENCE: persist `minara_alert_command_emitted` events to DB for D+14 kill-criterion eval
-**Status:** PROPOSED 2026-05-13 — surfaced during D+2 Minara verification on srilu-vps. M1.5c is operationally healthy (10 emissions in 48h covering 9 unique Solana tokens including `goblincoin`, `chill-guy`, `troll-2`, `useless-3`), but the V3-strategy kill-criterion at D+14 (2026-05-25) depends on counting `minara_alert_command_emitted` events vs operator self-reported manual paste count — and that event currently has **no DB-side persistence**, only structured logs in journalctl. journalctl retention defaults to ~30 days on systemd but can rotate earlier under disk pressure. The kill-criterion eval is one journalctl rotation away from being unverifiable.
+**Status:** SHIPPED 2026-05-13/14 — commits `6e65e2e feat(minara): persist alert emissions` + `e628097 Merge pull request #112 from Trivenidigital/codex/minara-db-persistence`. Status updated per `tasks/findings_backlog_drift_audit_2026_05_16.md`. Original PROPOSED note retained below for context.
+
+**Original status (now historical):** PROPOSED 2026-05-13 — surfaced during D+2 Minara verification on srilu-vps. M1.5c is operationally healthy (10 emissions in 48h covering 9 unique Solana tokens including `goblincoin`, `chill-guy`, `troll-2`, `useless-3`), but the V3-strategy kill-criterion at D+14 (2026-05-25) depends on counting `minara_alert_command_emitted` events vs operator self-reported manual paste count — and that event currently has **no DB-side persistence**, only structured logs in journalctl. journalctl retention defaults to ~30 days on systemd but can rotate earlier under disk pressure. The kill-criterion eval is one journalctl rotation away from being unverifiable.
 
 **Tag:** `silent-failure-class-1` `minara` `m1_5c` `kill-criterion-substrate` `observability`
 
@@ -840,7 +842,9 @@ SELECT COUNT(*) FROM narrative_alerts_inbound;
 All 13 entries below were surfaced by the cycle-change audit findings doc and stubbed here per the actionability discipline (PR-review fold). Each carries a `decision-by` field; the audit's next-audit trigger (2026-11-13) measures shipped vs drifted ratio.
 
 ### BL-NEW-CG-RATE-LIMITER-BURST-PROFILE
-**Current status:** THIRD FOLLOW-UP PR-READY 2026-05-15 on `codex/cg-throttle-serialize` - PR #129 spacing/jitter shipped, PR #130 removed in-call retry amplification, and PR #131 stopped same-function page/strategy fan-out. Post-PR #131 logs still showed cross-lane fan-out because `main.py` launched separate CoinGecko lanes concurrently. Root causes now covered: (1) `_get_with_backoff()` no longer retries each 429 up to four times; (2) Telegram social resolver and second-wave paths report 429s into the shared limiter; (3) `RateLimiter.is_backing_off()` lets same-function CoinGecko lanes stop remaining strategy/page requests; (4) `main.py::_fetch_coingecko_lanes()` now runs top movers, CoinGecko trending, volume, midcap, and held-position price refresh sequentially, stopping lower-priority CoinGecko lanes when backoff is active while preserving DexScreener/GeckoTerminal parallelism. Design updated: `tasks/design_bl_new_cg_rate_limiter_burst_profile.md`. Verification: main/CoinGecko targeted suite -> 68 passed; adjacent CoinGecko/social/second-wave suite -> 167 passed.
+**Status:** SHIPPED 2026-05-15 — commit chain `7f1a174 fix(coingecko): smooth shared rate limiter bursts (#129)` + `a08d9ef fix(coingecko): stop 429 retry amplification` + `f45e598 fix(coingecko): stop same-cycle 429 fanout` + `d1cf96b fix(coingecko): serialize main CoinGecko lane`. Design at `tasks/design_bl_new_cg_rate_limiter_burst_profile.md`. **Residual:** deploy-verification only — compare post-restart `cg_429_backoff` / `rate_limiter_global_backoff` / `resolver_transient` / cycle intervals against 30-min pre-fix baseline. Status updated per `tasks/findings_backlog_drift_audit_2026_05_16.md`.
+
+**Original status (now historical):** THIRD FOLLOW-UP PR-READY 2026-05-15 on `codex/cg-throttle-serialize` - PR #129 spacing/jitter shipped, PR #130 removed in-call retry amplification, and PR #131 stopped same-function page/strategy fan-out. Post-PR #131 logs still showed cross-lane fan-out because `main.py` launched separate CoinGecko lanes concurrently. Root causes now covered: (1) `_get_with_backoff()` no longer retries each 429 up to four times; (2) Telegram social resolver and second-wave paths report 429s into the shared limiter; (3) `RateLimiter.is_backing_off()` lets same-function CoinGecko lanes stop remaining strategy/page requests; (4) `main.py::_fetch_coingecko_lanes()` now runs top movers, CoinGecko trending, volume, midcap, and held-position price refresh sequentially, stopping lower-priority CoinGecko lanes when backoff is active while preserving DexScreener/GeckoTerminal parallelism. Design updated: `tasks/design_bl_new_cg_rate_limiter_burst_profile.md`. Verification: main/CoinGecko targeted suite -> 68 passed; adjacent CoinGecko/social/second-wave suite -> 167 passed.
 **Action:** merge/deploy orchestrator serialization follow-up, then compare post-restart `cg_429_backoff`, `rate_limiter_global_backoff`, `resolver_transient`, and cycle intervals against the 30-minute pre-fix window. If throttles persist with cross-lane fan-out stopped, next investigation is provider identity/keying: configure a CoinGecko Demo API key/header or reduce optional CoinGecko lanes before reducing scanner breadth.
 **decision-by:** 2 weeks (per design v2 §4 Borderline urgency mapping).
 
@@ -850,7 +854,9 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 **decision-by:** 2 weeks.
 
 ### BL-NEW-GT-ETH-ENDPOINT-404
-**Status:** PR-READY 2026-05-14 on `codex/gt-eth-endpoint-404` — root cause confirmed: gecko-alpha's canonical chain label is `ethereum`, but GeckoTerminal's provider network id is `eth`. Live cheap fetch: `/networks/ethereum/trending_pools` -> 404; `/networks/eth/trending_pools` -> 200; official GT `/networks` metadata lists `id="eth"` with `coingecko_asset_platform_id="ethereum"`. Fix aliases only the provider URL while preserving project label/watchdog source as `ethereum`. Design: `tasks/design_bl_new_gt_eth_endpoint_404.md`.
+**Status:** SHIPPED 2026-05-15 — commit `e0e51c8 fix(geckoterminal): map ethereum chain to eth network id`. Status updated per `tasks/findings_backlog_drift_audit_2026_05_16.md`. Design at `tasks/design_bl_new_gt_eth_endpoint_404.md`. **Residual:** post-deploy verify no fresh `networks/ethereum/trending_pools` 404s + `geckoterminal:ethereum` samples still exist.
+
+**Original status (now historical):** PR-READY 2026-05-14 on `codex/gt-eth-endpoint-404` — root cause confirmed: gecko-alpha's canonical chain label is `ethereum`, but GeckoTerminal's provider network id is `eth`. Live cheap fetch: `/networks/ethereum/trending_pools` -> 404; `/networks/eth/trending_pools` -> 200; official GT `/networks` metadata lists `id="eth"` with `coingecko_asset_platform_id="ethereum"`.
 **Action:** merge and deploy the alias fix; post-deploy verify no fresh `networks/ethereum/trending_pools` 404s and that `geckoterminal:ethereum` samples still exist.
 **decision-by:** 4 weeks.
 
@@ -878,9 +884,16 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 **decision-by:** 2 weeks filing; implementation gated on daemon.
 
 ### BL-NEW-SCORE-HISTORY-PRUNING
-**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-score (17,325 rows/hr × 24 = ~415k rows/day = ~12.5M rows/30d; no pruning rule in tree).
-**Action:** add per-token rolling retention (e.g., keep last N=10 scores per `contract_address`) OR time-based pruning (e.g., keep last 30 days).
+**Status:** DRIFT-PARTIAL 2026-05-16 — surfaced during audit 2026-05-16. 14-day time-based pruning EXISTS at `scout/narrative/agent.py:687-689` (was missed at original filing). Status updated per `tasks/findings_backlog_drift_audit_2026_05_16.md`.
+**Residual gaps (file:line):**
+- Hardcoded 14d retention violates project "no hardcoded thresholds" rule
+- Coupling to narrative daily-learn loop: disabling narrative silently disables pruning
+- `except Exception: pass` at `agent.py:695-696` = Class 1 silent-failure (§12a)
+- No row-count telemetry per pass
+**Reframed action:** harden existing pruning — parameterize via `SCORE_HISTORY_RETENTION_DAYS` setting, decouple from narrative loop, replace silent-except with structured log, add row-count telemetry. Combined PR with BL-NEW-VOLUME-SNAPSHOTS-PRUNING (same shape).
 **decision-by:** 2 weeks (independently actionable; no daemon dependency).
+
+**Original status (now historical):** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-score (17,325 rows/hr × 24 = ~415k rows/day = ~12.5M rows/30d; no pruning rule in tree). Original filing missed the in-tree implementation at `agent.py:687-689`.
 
 ### BL-NEW-VOLUME-SNAPSHOTS-WATCHDOG-SLO
 **Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-volume (same shape as C2-score).
@@ -888,9 +901,10 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 **decision-by:** 2 weeks filing; implementation gated on daemon.
 
 ### BL-NEW-VOLUME-SNAPSHOTS-PRUNING
-**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-volume.
-**Action:** same pruning rule pattern as BL-NEW-SCORE-HISTORY-PRUNING.
+**Status:** DRIFT-PARTIAL 2026-05-16 — same shape as BL-NEW-SCORE-HISTORY-PRUNING. 14-day pruning EXISTS at `scout/narrative/agent.py:688`. Same residual gaps; same reframed action. Combined PR with BL-NEW-SCORE-HISTORY-PRUNING. Status updated per `tasks/findings_backlog_drift_audit_2026_05_16.md`.
 **decision-by:** 2 weeks.
+
+**Original status (now historical):** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-volume. Original filing missed the in-tree implementation at `agent.py:688`.
 
 ### BL-NEW-CALIBRATION-ERA-DOC
 **Status:** SHIPPED-WITH-AUDIT 2026-05-13 — surfaced by cycle-change audit Tier F; 1-line code comments documenting cycle-era assumption shipped as part of PR #114. Comment text: `# calibration era: undocumented — see BL-NEW-CALIBRATION-ERA-DOC`. 7 settings tagged: VELOCITY_DEDUP_HOURS, LUNARCRUSH_DEDUP_HOURS, SLOW_BURN_DEDUP_DAYS, SECONDWAVE_DEDUP_DAYS, FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN, PAPER_STARTUP_WARMUP_SECONDS, CACHE_TTL_SECONDS.
