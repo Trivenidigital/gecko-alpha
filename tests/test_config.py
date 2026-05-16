@@ -582,6 +582,104 @@ def test_retention_must_exceed_secondwave_cooldown():
         )
 
 
+def test_narrative_table_retention_defaults():
+    """BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION: 6 new retention defaults.
+
+    Three are bumped per V8 plan-review fold to cover backtest CLI --days=30:
+    volume_spikes 30->45, trending_snapshots 7->30, chain_matches 30->45.
+    Three preserve in-tree values: momentum_7d 30, learn_logs 90, holder_snapshots 14.
+    """
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.VOLUME_SPIKES_RETENTION_DAYS == 45
+    assert s.MOMENTUM_7D_RETENTION_DAYS == 30
+    assert s.TRENDING_SNAPSHOTS_RETENTION_DAYS == 30
+    assert s.LEARN_LOGS_RETENTION_DAYS == 90
+    assert s.CHAIN_MATCHES_RETENTION_DAYS == 45
+    assert s.HOLDER_SNAPSHOTS_RETENTION_DAYS == 14
+
+
+def test_narrative_table_retention_env_override():
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        VOLUME_SPIKES_RETENTION_DAYS=60,
+        LEARN_LOGS_RETENTION_DAYS=120,
+    )
+    assert s.VOLUME_SPIKES_RETENTION_DAYS == 60
+    assert s.LEARN_LOGS_RETENTION_DAYS == 120
+
+
+def test_backtest_cli_retention_floor_validator_trending():
+    """V8 fold: trending_snapshots retention < 30 must raise.
+
+    Backtest CLI default --days=30 reads trending_snapshots; lower retention
+    silently truncates the cohort.
+    """
+    from pydantic import ValidationError
+
+    with pytest.raises(
+        ValidationError, match="must be >= 30 to cover backtest CLI"
+    ):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            TRENDING_SNAPSHOTS_RETENTION_DAYS=14,
+        )
+
+
+def test_backtest_cli_retention_floor_validator_chain_matches():
+    from pydantic import ValidationError
+
+    with pytest.raises(
+        ValidationError, match="must be >= 30 to cover backtest CLI"
+    ):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            CHAIN_MATCHES_RETENTION_DAYS=20,
+        )
+
+
+def test_backtest_cli_retention_floor_validator_volume_spikes():
+    from pydantic import ValidationError
+
+    with pytest.raises(
+        ValidationError, match="must be >= 30 to cover backtest CLI"
+    ):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            VOLUME_SPIKES_RETENTION_DAYS=25,
+        )
+
+
+def test_backtest_cli_retention_floor_at_30_passes():
+    """Equality boundary: retention == 30 must pass (validator uses < not <=)."""
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        TRENDING_SNAPSHOTS_RETENTION_DAYS=30,
+        CHAIN_MATCHES_RETENTION_DAYS=30,
+        VOLUME_SPIKES_RETENTION_DAYS=30,
+    )
+    assert s.TRENDING_SNAPSHOTS_RETENTION_DAYS == 30
+
+
 def test_retention_volume_must_exceed_secondwave_cooldown():
     """V2#3 fold: same check applies to volume retention."""
     from pydantic import ValidationError

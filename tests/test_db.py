@@ -177,6 +177,387 @@ async def test_prune_score_history_future_dated_rows_survive_keep_days_zero(db):
     assert [r[0] for r in rows] == ["0xFUTURE"]
 
 
+@pytest.mark.parametrize(
+    "prune_method,table,column,fk_seed_sql,fk_seed_params,insert_sql,insert_extra_cols",
+    [
+        (
+            "prune_volume_spikes",
+            "volume_spikes",
+            "detected_at",
+            None,
+            None,
+            (
+                "INSERT INTO volume_spikes (coin_id, symbol, name, current_volume,"
+                " avg_volume_7d, spike_ratio, detected_at) VALUES (?,?,?,?,?,?,?)"
+            ),
+            ("c-tie", "TIE", "TIE", 1000.0, 500.0, 2.0),
+        ),
+        (
+            "prune_momentum_7d",
+            "momentum_7d",
+            "detected_at",
+            None,
+            None,
+            "INSERT INTO momentum_7d (coin_id, symbol, name, price_change_7d, detected_at) VALUES (?,?,?,?,?)",
+            ("c-tie", "TIE", "TIE", 100.0),
+        ),
+        (
+            "prune_trending_snapshots",
+            "trending_snapshots",
+            "snapshot_at",
+            None,
+            None,
+            "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?,?,?,?)",
+            ("c-tie", "TIE", "TIE"),
+        ),
+        # learn_logs intentionally OMITTED from this parametrize:
+        # its DEFAULT format is SQLite-style (YYYY-MM-DD HH:MM:SS) while the
+        # other 5 tables use ISO. The dedicated mixed-format regression test
+        # `test_prune_learn_logs_mixed_format_boundary_regression` covers
+        # learn_logs' boundary behavior in its native format.
+        (
+            "prune_chain_matches",
+            "chain_matches",
+            "completed_at",
+            "INSERT INTO chain_patterns (name, description, steps_json, min_steps_to_trigger) VALUES (?,?,?,?)",
+            ("tie_pattern", "tie", '["x"]', 1),
+            (
+                "INSERT INTO chain_matches (token_id, pipeline, pattern_id, pattern_name,"
+                " steps_matched, total_steps, anchor_time, chain_duration_hours,"
+                " conviction_boost, completed_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
+            ),
+            ("t-tie", "memecoin", 1, "tie_pattern", 1, 1, "2026-01-01T00:00:00+00:00", 1.0, 0),
+        ),
+        (
+            "prune_holder_snapshots",
+            "holder_snapshots",
+            "scanned_at",
+            None,
+            None,
+            "INSERT INTO holder_snapshots (contract_address, holder_count, scanned_at) VALUES (?,?,?)",
+            ("0xTIE", 100),
+        ),
+    ],
+)
+async def test_narrative_prune_tie_on_cutoff_deletes(
+    db,
+    prune_method,
+    table,
+    column,
+    fk_seed_sql,
+    fk_seed_params,
+    insert_sql,
+    insert_extra_cols,
+):
+    """V11 PR-review SHOULD-FIX: parity with cycle 1's
+    test_prune_score_history_tie_on_cutoff_deletes for all 6 cycle 2 tables.
+
+    Locks in <= boundary semantic per V1#11 cycle 1 convention. Future PR
+    flipping <= to < on any of the 6 tables gets caught here.
+    """
+    if fk_seed_sql:
+        await db._conn.execute(fk_seed_sql, fk_seed_params)
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    await db._conn.execute(insert_sql, (*insert_extra_cols, cutoff_iso))
+    await db._conn.commit()
+
+    deleted = await getattr(db, prune_method)(keep_days=30)
+    assert deleted == 1
+
+
+async def test_migration_idempotency_records_all_seven_cycle_1_and_2(tmp_path):
+    """V11 SHOULD-FIX: cycle 1's idempotency test asserts via set-equality
+    (after_first == after_second) but doesn't EXPLICITLY assert all 7
+    cycle-1+2 migration rows are present. If a cycle-2 migration silently
+    failed to INSERT into paper_migrations, set-equality would pass vacuously
+    (both empty/missing the row) and a subsequent restart would re-run the
+    CREATE INDEX — blocking dashboard for 30-60s.
+    """
+    db = Database(str(tmp_path / "explicit_idempotency.db"))
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT name FROM paper_migrations WHERE name LIKE '%_idx_v1'"
+    )
+    names = {row[0] for row in await cur.fetchall()}
+    await db.close()
+
+    expected = {
+        "score_history_scanned_at_idx_v1",
+        "volume_snapshots_scanned_at_idx_v1",
+        "volume_spikes_detected_at_idx_v1",
+        "momentum_7d_detected_at_idx_v1",
+        "trending_snapshots_snapshot_at_idx_v1",
+        "learn_logs_created_at_idx_v1",
+        "holder_snapshots_scanned_at_idx_v1",
+        "chain_matches_completed_at_idx_v1",
+    }
+    missing = expected - names
+    assert not missing, f"Missing paper_migrations rows after initialize(): {missing}"
+
+
+@pytest.mark.parametrize(
+    "table,column,index",
+    [
+        ("volume_spikes", "detected_at", "idx_volume_spikes_detected_at"),
+        ("momentum_7d", "detected_at", "idx_momentum_7d_detected_at"),
+        ("trending_snapshots", "snapshot_at", "idx_trending_snapshots_snapshot_at"),
+        ("learn_logs", "created_at", "idx_learn_logs_created_at"),
+        ("holder_snapshots", "scanned_at", "idx_holder_snapshots_scanned_at"),
+        ("chain_matches", "completed_at", "idx_chain_matches_completed_at"),
+    ],
+)
+async def test_narrative_table_prune_uses_new_index(db, table, column, index):
+    """BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (V9 plan-review fold): each
+    of the 5 new tables must have a usable single-column index for the
+    prune DELETE's time-only WHERE clause."""
+    cur = await db._conn.execute(
+        f"EXPLAIN QUERY PLAN DELETE FROM {table} WHERE {column} <= ?",
+        ("2026-01-01T00:00:00+00:00",),
+    )
+    plan = await cur.fetchall()
+    plan_str = " ".join(str(row[3]) for row in plan)
+    assert index in plan_str, f"{index} not used: {plan_str}"
+
+
+# ---------------------------------------------------------------------------
+# BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2) prune-method tests
+# ---------------------------------------------------------------------------
+
+
+async def test_prune_volume_spikes_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    for tag, age_days in [("RECENT", 5), ("OLD", 50)]:
+        await db._conn.execute(
+            """INSERT INTO volume_spikes (coin_id, symbol, name, current_volume,
+                avg_volume_7d, spike_ratio, detected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                f"c-{tag.lower()}",
+                tag,
+                tag,
+                1000.0,
+                500.0,
+                2.0,
+                (now - timedelta(days=age_days)).isoformat(),
+            ),
+        )
+    await db._conn.commit()
+    deleted = await db.prune_volume_spikes(keep_days=45)
+    assert deleted == 1
+
+
+async def test_prune_volume_spikes_empty_returns_zero(db):
+    assert await db.prune_volume_spikes(keep_days=45) == 0
+
+
+async def test_prune_momentum_7d_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    for tag, age_days in [("RECENT", 5), ("OLD", 50)]:
+        await db._conn.execute(
+            """INSERT INTO momentum_7d (coin_id, symbol, name, price_change_7d, detected_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                f"c-{tag.lower()}",
+                tag,
+                tag,
+                100.0,
+                (now - timedelta(days=age_days)).isoformat(),
+            ),
+        )
+    await db._conn.commit()
+    deleted = await db.prune_momentum_7d(keep_days=30)
+    assert deleted == 1
+
+
+async def test_prune_momentum_7d_empty_returns_zero(db):
+    assert await db.prune_momentum_7d(keep_days=30) == 0
+
+
+async def test_prune_trending_snapshots_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    for tag, age_days in [("RECENT", 5), ("OLD", 50)]:
+        await db._conn.execute(
+            """INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at)
+               VALUES (?, ?, ?, ?)""",
+            (
+                f"c-{tag.lower()}",
+                tag,
+                tag,
+                (now - timedelta(days=age_days)).isoformat(),
+            ),
+        )
+    await db._conn.commit()
+    deleted = await db.prune_trending_snapshots(keep_days=30)
+    assert deleted == 1
+
+
+async def test_prune_trending_snapshots_empty_returns_zero(db):
+    assert await db.prune_trending_snapshots(keep_days=30) == 0
+
+
+async def test_prune_learn_logs_keeps_recent(db):
+    """learn_logs.created_at uses SQLite-format DEFAULT (`YYYY-MM-DD HH:MM:SS`),
+    so the test must seed in that format to mirror production rows."""
+    now = datetime.now(timezone.utc)
+    for n, age_days in [(1, 5), (2, 100)]:
+        await db._conn.execute(
+            """INSERT INTO learn_logs (cycle_number, cycle_type, reflection_text,
+                changes_made, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                n,
+                "daily",
+                f"reflection {n}",
+                f"changes {n}",
+                (now - timedelta(days=age_days)).strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+    await db._conn.commit()
+    deleted = await db.prune_learn_logs(keep_days=90)
+    assert deleted == 1
+
+
+async def test_prune_learn_logs_mixed_format_boundary_regression(db):
+    """PR-review fold (user-found bug 2026-05-16): pre-fix, raw lexical
+    comparison against an ISO cutoff would delete same-day rows because
+    space (0x20) sorts before 'T' (0x54).
+
+    Reproduction: insert two SQLite-format rows (matching production
+    DEFAULT) — one well into "today" relative to "now - keep_days", and
+    one comfortably old. With keep_days=1, only the old row should be
+    deleted. Pre-fix bug: BOTH would be deleted because the today-23:59:59
+    row lexically compares LESS than an ISO cutoff like 2026-05-15T<time>.
+    Post-fix: cutoff in SQLite format → correct.
+    """
+    now = datetime.now(timezone.utc)
+    # Row 1: SAME-DAY-LATE — would lexically compare < ISO cutoff (the bug)
+    today_late = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    await db._conn.execute(
+        """INSERT INTO learn_logs (cycle_number, cycle_type, reflection_text,
+            changes_made, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (
+            1,
+            "daily",
+            "today-23:59",
+            "{}",
+            today_late.strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    # Row 2: comfortably old (10 days back) — should always be deleted
+    old = now - timedelta(days=10)
+    await db._conn.execute(
+        """INSERT INTO learn_logs (cycle_number, cycle_type, reflection_text,
+            changes_made, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (
+            2,
+            "daily",
+            "10-days-old",
+            "{}",
+            old.strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    await db._conn.commit()
+
+    # keep_days=1: cutoff = now - 1 day. Today's row (newer than cutoff) must survive.
+    deleted = await db.prune_learn_logs(keep_days=1)
+
+    assert deleted == 1, f"Expected only the 10-day-old row deleted; got {deleted}"
+    cur = await db._conn.execute(
+        "SELECT reflection_text FROM learn_logs ORDER BY created_at DESC"
+    )
+    remaining = [row[0] for row in await cur.fetchall()]
+    assert remaining == ["today-23:59"]
+
+
+async def test_prune_learn_logs_uses_default_format_when_no_created_at_supplied(db):
+    """Production rows are inserted via the DEFAULT (writers at
+    ``scout/narrative/learner.py:291,436`` don't pass ``created_at``).
+    Verify the prune still operates correctly on DEFAULT-formatted rows."""
+    # No created_at supplied — SQLite fills via datetime('now') DEFAULT
+    await db._conn.execute(
+        """INSERT INTO learn_logs (cycle_number, cycle_type, reflection_text,
+            changes_made) VALUES (?, ?, ?, ?)""",
+        (99, "daily", "today-DEFAULT", "{}"),
+    )
+    await db._conn.commit()
+
+    # keep_days=0 — cutoff is now, the just-inserted row should NOT yet be
+    # past the cutoff (datetime('now') and Python now() are at-or-before the
+    # cutoff by microseconds, but both formats agree at YYYY-MM-DD HH:MM:SS
+    # granularity; this test asserts no false-deletion when same-second).
+    # Use a higher keep_days for safety to assert non-deletion of fresh row.
+    deleted = await db.prune_learn_logs(keep_days=1)
+    assert deleted == 0
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM learn_logs WHERE reflection_text = 'today-DEFAULT'"
+    )
+    row = await cur.fetchone()
+    assert row[0] == 1, "DEFAULT-formatted row should not be deleted with keep_days=1"
+
+
+async def test_prune_learn_logs_empty_returns_zero(db):
+    assert await db.prune_learn_logs(keep_days=90) == 0
+
+
+async def test_prune_chain_matches_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    # chain_matches.pattern_id is FK to chain_patterns; seed parent row first.
+    await db._conn.execute(
+        """INSERT INTO chain_patterns (name, description, steps_json, min_steps_to_trigger)
+           VALUES (?, ?, ?, ?)""",
+        ("test_pattern", "test", '["x"]', 1),
+    )
+    pattern_id_row = await (
+        await db._conn.execute("SELECT id FROM chain_patterns LIMIT 1")
+    ).fetchone()
+    pattern_id = pattern_id_row[0]
+    for tag, age_days in [("RECENT", 5), ("OLD", 60)]:
+        await db._conn.execute(
+            """INSERT INTO chain_matches (token_id, pipeline, pattern_id, pattern_name,
+                steps_matched, total_steps, anchor_time, completed_at,
+                chain_duration_hours, conviction_boost)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                f"t-{tag.lower()}",
+                "memecoin",
+                pattern_id,
+                "test_pattern",
+                1,
+                1,
+                (now - timedelta(days=age_days, hours=1)).isoformat(),
+                (now - timedelta(days=age_days)).isoformat(),
+                1.0,
+                0,
+            ),
+        )
+    await db._conn.commit()
+    deleted = await db.prune_chain_matches(keep_days=45)
+    assert deleted == 1
+
+
+async def test_prune_chain_matches_empty_returns_zero(db):
+    assert await db.prune_chain_matches(keep_days=45) == 0
+
+
+async def test_prune_holder_snapshots_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    for tag, age_days in [("RECENT", 5), ("OLD", 30)]:
+        await db._conn.execute(
+            """INSERT INTO holder_snapshots (contract_address, holder_count, scanned_at)
+               VALUES (?, ?, ?)""",
+            (f"0x{tag}", 100, (now - timedelta(days=age_days)).isoformat()),
+        )
+    await db._conn.commit()
+    deleted = await db.prune_holder_snapshots(keep_days=14)
+    assert deleted == 1
+
+
+async def test_prune_holder_snapshots_empty_returns_zero(db):
+    assert await db.prune_holder_snapshots(keep_days=14) == 0
+
+
 async def test_migration_idempotent_on_second_initialize(tmp_path):
     """V6 fold: migration idempotency via paper_migrations row check.
 

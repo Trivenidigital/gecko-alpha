@@ -8,6 +8,8 @@ run_pipeline path.
 
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from scout.config import Settings
 from scout.main import _run_hourly_maintenance
 
@@ -29,6 +31,13 @@ def _make_db_mock(score_pruned: int = 0, volume_pruned: int = 0) -> MagicMock:
     db.prune_cryptopanic_posts = AsyncMock(return_value=0)
     db.prune_score_history = AsyncMock(return_value=score_pruned)
     db.prune_volume_snapshots = AsyncMock(return_value=volume_pruned)
+    # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION cycle 2: 6 new prune methods
+    db.prune_volume_spikes = AsyncMock(return_value=0)
+    db.prune_momentum_7d = AsyncMock(return_value=0)
+    db.prune_trending_snapshots = AsyncMock(return_value=0)
+    db.prune_learn_logs = AsyncMock(return_value=0)
+    db.prune_chain_matches = AsyncMock(return_value=0)
+    db.prune_holder_snapshots = AsyncMock(return_value=0)
     return db
 
 
@@ -97,6 +106,108 @@ async def test_run_hourly_maintenance_silent_when_zero_rows(tmp_path):
     ]
     assert "score_history_pruned" not in debug_events
     assert "volume_snapshots_pruned" not in debug_events
+
+
+@pytest.mark.parametrize(
+    "prune_method,retention_attr",
+    [
+        ("prune_volume_spikes", "VOLUME_SPIKES_RETENTION_DAYS"),
+        ("prune_momentum_7d", "MOMENTUM_7D_RETENTION_DAYS"),
+        ("prune_trending_snapshots", "TRENDING_SNAPSHOTS_RETENTION_DAYS"),
+        ("prune_learn_logs", "LEARN_LOGS_RETENTION_DAYS"),
+        ("prune_chain_matches", "CHAIN_MATCHES_RETENTION_DAYS"),
+        ("prune_holder_snapshots", "HOLDER_SNAPSHOTS_RETENTION_DAYS"),
+    ],
+)
+async def test_run_hourly_maintenance_calls_narrative_table_prune(
+    tmp_path, prune_method, retention_attr
+):
+    """BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION cycle 2: _run_hourly_maintenance
+    must call each of the 6 new prune methods with the configured Settings
+    retention.
+    """
+    settings = _make_settings(tmp_path)
+    db = _make_db_mock()
+    session = MagicMock()
+    logger = MagicMock()
+
+    await _run_hourly_maintenance(db, session, settings, logger)
+
+    expected_keep_days = getattr(settings, retention_attr)
+    getattr(db, prune_method).assert_awaited_once_with(keep_days=expected_keep_days)
+
+
+@pytest.mark.parametrize(
+    "failing_method,event_base,subsequent_methods",
+    [
+        (
+            "prune_volume_spikes",
+            "volume_spikes",
+            [
+                "prune_momentum_7d",
+                "prune_trending_snapshots",
+                "prune_learn_logs",
+                "prune_chain_matches",
+                "prune_holder_snapshots",
+            ],
+        ),
+        (
+            "prune_momentum_7d",
+            "momentum_7d",
+            [
+                "prune_trending_snapshots",
+                "prune_learn_logs",
+                "prune_chain_matches",
+                "prune_holder_snapshots",
+            ],
+        ),
+        (
+            "prune_trending_snapshots",
+            "trending_snapshots",
+            ["prune_learn_logs", "prune_chain_matches", "prune_holder_snapshots"],
+        ),
+        (
+            "prune_learn_logs",
+            "learn_logs",
+            ["prune_chain_matches", "prune_holder_snapshots"],
+        ),
+        ("prune_chain_matches", "chain_matches", ["prune_holder_snapshots"]),
+        ("prune_holder_snapshots", "holder_snapshots", []),
+    ],
+)
+async def test_narrative_prune_loop_fault_isolation(
+    tmp_path, failing_method, event_base, subsequent_methods
+):
+    """V11 PR-review MUST-FIX: cycle 2's tight-loop pattern in
+    _run_hourly_maintenance is NEW; one prune raising must NOT halt the
+    subsequent prunes in the loop.
+
+    For each of the 6 new prune methods, inject side_effect=RuntimeError
+    and verify:
+      (a) logger.exception emits f'{event_base}_prune_failed' for the failing one
+      (b) every subsequent method in the loop is still awaited
+    """
+    settings = _make_settings(tmp_path)
+    db = _make_db_mock()
+    setattr(db, failing_method, AsyncMock(side_effect=RuntimeError("simulated")))
+    session = MagicMock()
+    logger = MagicMock()
+
+    await _run_hourly_maintenance(db, session, settings, logger)
+
+    # (a) failure is logged structurally
+    exception_events = [
+        call.args[0] for call in logger.exception.call_args_list if call.args
+    ]
+    assert f"{event_base}_prune_failed" in exception_events, (
+        f"Expected '{event_base}_prune_failed' in {exception_events}"
+    )
+
+    # (b) subsequent methods in the loop were still awaited
+    for method_name in subsequent_methods:
+        getattr(db, method_name).assert_awaited(), (
+            f"Loop halted after {failing_method} raised; {method_name} not called"
+        )
 
 
 async def test_run_hourly_maintenance_exception_path_logs_structured(tmp_path):

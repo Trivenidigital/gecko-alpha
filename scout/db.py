@@ -108,6 +108,18 @@ class Database:
         await self._migrate_minara_alert_emissions_v1()
         await self._migrate_score_history_scanned_at_index()
         await self._migrate_volume_snapshots_scanned_at_index()
+        # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 6 narrative-owned
+        # tables. Same pattern as cycle 1, parameterized via _migrate_scanned_at_index
+        # `column` kwarg (D3 plan-review fold). Order: alphabetical by table.
+        # V12 PR-review SHOULD-FIX #1: chain_matches index promoted from
+        # deferred (V9 NICE-TO-HAVE) — 5-line cost vs structural table-scan
+        # on every hourly prune.
+        await self._migrate_chain_matches_completed_at_index()
+        await self._migrate_holder_snapshots_scanned_at_index()
+        await self._migrate_learn_logs_created_at_index()
+        await self._migrate_momentum_7d_detected_at_index()
+        await self._migrate_trending_snapshots_snapshot_at_index()
+        await self._migrate_volume_spikes_detected_at_index()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -3660,14 +3672,38 @@ class Database:
             )
 
     async def _migrate_scanned_at_index(
-        self, *, table: str, index_name: str, migration_name: str
+        self,
+        *,
+        table: str,
+        column: str = "scanned_at",
+        index_name: str,
+        migration_name: str,
     ) -> None:
-        """Add single-column scanned_at index for hourly prune coverage.
+        """Add single-column timestamp index for hourly prune coverage.
 
-        Helper for BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING.
+        Used by BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING
+        (cycle 1, column='scanned_at') and BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION
+        (cycle 2, 5 tables with column in
+        {'detected_at','snapshot_at','created_at','scanned_at'}).
+
         Each table gets its own paper_migrations entry (V4#3 fold) so disk
-        failure on one doesn't roll back the other.
+        failure on one doesn't roll back the others. V4#2 fold: PRAGMA
+        busy_timeout=90000 covers concurrent readers waiting on the
+        EXCLUSIVE write lock during index build.
+
+        D8 plan-review fold (cycle 2): `column` kwarg parameterizes the
+        index target; log events become 'index_migrated' /
+        'index_migration_failed' (was hardcoded 'scanned_at_idx_*') so
+        cycle-2 columns are grep-able via the `column=` field.
         """
+        # D8 SHOULD-FIX #4 + V10 NICE-TO-HAVE: defensive guard — `column` is
+        # code-supplied in all current callers, but the helper is reusable
+        # across cycles. Reject anything that isn't a SQL-safe identifier.
+        # Promoted from `assert` to `raise` so the guard survives `python -O`
+        # (asserts are stripped under optimization).
+        if not column.replace("_", "").isalnum():
+            raise ValueError(f"unsafe column={column!r}")
+
         if self._conn is None:
             raise RuntimeError("Database not initialized.")
         conn = self._conn
@@ -3687,7 +3723,7 @@ class Database:
                 await conn.execute("COMMIT")
                 return
             await conn.execute(
-                f"CREATE INDEX IF NOT EXISTS {index_name} ON {table}(scanned_at)"
+                f"CREATE INDEX IF NOT EXISTS {index_name} ON {table}({column})"
             )
             await conn.execute(
                 "INSERT INTO paper_migrations(name, cutover_ts) VALUES (?, ?)",
@@ -3695,7 +3731,10 @@ class Database:
             )
             await conn.execute("COMMIT")
             _db_log.info(
-                "scanned_at_idx_migrated", table=table, migration=migration_name
+                "index_migrated",
+                table=table,
+                column=column,
+                migration=migration_name,
             )
         except Exception:
             try:
@@ -3703,11 +3742,17 @@ class Database:
             except Exception:
                 pass
             _db_log.exception(
-                "scanned_at_idx_migration_failed",
+                "index_migration_failed",
                 table=table,
+                column=column,
                 migration=migration_name,
             )
-            _db_log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)
+            _db_log.error(
+                "SCHEMA_DRIFT_DETECTED",
+                table=table,
+                column=column,
+                migration=migration_name,
+            )
             raise
 
     async def _migrate_score_history_scanned_at_index(self) -> None:
@@ -3724,6 +3769,61 @@ class Database:
             table="volume_snapshots",
             index_name="idx_volume_snapshots_scanned_at",
             migration_name="volume_snapshots_scanned_at_idx_v1",
+        )
+
+    # ------------------------------------------------------------------
+    # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2) — 5 migration entry points
+    # ------------------------------------------------------------------
+
+    async def _migrate_volume_spikes_detected_at_index(self) -> None:
+        await self._migrate_scanned_at_index(
+            table="volume_spikes",
+            column="detected_at",
+            index_name="idx_volume_spikes_detected_at",
+            migration_name="volume_spikes_detected_at_idx_v1",
+        )
+
+    async def _migrate_chain_matches_completed_at_index(self) -> None:
+        """V12 PR-review SHOULD-FIX #1 fold: chain_matches index promoted
+        from V9 NICE-TO-HAVE deferral. Cost is 5 lines; hourly prune was
+        structurally table-scanning otherwise."""
+        await self._migrate_scanned_at_index(
+            table="chain_matches",
+            column="completed_at",
+            index_name="idx_chain_matches_completed_at",
+            migration_name="chain_matches_completed_at_idx_v1",
+        )
+
+    async def _migrate_momentum_7d_detected_at_index(self) -> None:
+        await self._migrate_scanned_at_index(
+            table="momentum_7d",
+            column="detected_at",
+            index_name="idx_momentum_7d_detected_at",
+            migration_name="momentum_7d_detected_at_idx_v1",
+        )
+
+    async def _migrate_trending_snapshots_snapshot_at_index(self) -> None:
+        await self._migrate_scanned_at_index(
+            table="trending_snapshots",
+            column="snapshot_at",
+            index_name="idx_trending_snapshots_snapshot_at",
+            migration_name="trending_snapshots_snapshot_at_idx_v1",
+        )
+
+    async def _migrate_learn_logs_created_at_index(self) -> None:
+        await self._migrate_scanned_at_index(
+            table="learn_logs",
+            column="created_at",
+            index_name="idx_learn_logs_created_at",
+            migration_name="learn_logs_created_at_idx_v1",
+        )
+
+    async def _migrate_holder_snapshots_scanned_at_index(self) -> None:
+        await self._migrate_scanned_at_index(
+            table="holder_snapshots",
+            column="scanned_at",
+            index_name="idx_holder_snapshots_scanned_at",
+            migration_name="holder_snapshots_scanned_at_idx_v1",
         )
 
     async def record_minara_alert_emission(
@@ -4786,6 +4886,98 @@ class Database:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
         cur = await self._conn.execute(
             "DELETE FROM volume_snapshots WHERE scanned_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    # ------------------------------------------------------------------
+    # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 6 prune methods
+    # ------------------------------------------------------------------
+
+    async def prune_volume_spikes(self, *, keep_days: int) -> int:
+        """Delete ``volume_spikes`` rows older than ``keep_days``. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM volume_spikes WHERE detected_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_momentum_7d(self, *, keep_days: int) -> int:
+        """Delete ``momentum_7d`` rows older than ``keep_days``. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM momentum_7d WHERE detected_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_trending_snapshots(self, *, keep_days: int) -> int:
+        """Delete ``trending_snapshots`` rows older than ``keep_days``. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM trending_snapshots WHERE snapshot_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_learn_logs(self, *, keep_days: int) -> int:
+        """Delete ``learn_logs`` rows older than ``keep_days``. Returns rowcount.
+
+        PR-review fold: unlike the other narrative-owned tables (which all
+        write Python ``.isoformat()`` strings, e.g. ``2026-05-16T20:03:22+00:00``),
+        ``learn_logs.created_at`` defaults to SQLite's ``datetime('now')`` at
+        schema declaration (``YYYY-MM-DD HH:MM:SS``, space separator, no tz).
+        Both narrative learner writers at ``scout/narrative/learner.py:291,436``
+        rely on the DEFAULT and don't pass ``created_at`` explicitly. Mixed
+        formats break raw lexical comparison: space (0x20) sorts before 'T'
+        (0x54), so ``"2026-05-16 23:59:59"`` is lexically LESS than
+        ``"2026-05-16T20:03:22..."`` and a same-day-later row would be deleted
+        early. Emit the cutoff in the SQLite format so both sides match;
+        lexical order then equals chronological order and the
+        ``idx_learn_logs_created_at`` index is still usable.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        cur = await self._conn.execute(
+            "DELETE FROM learn_logs WHERE created_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_chain_matches(self, *, keep_days: int) -> int:
+        """Delete ``chain_matches`` rows older than ``keep_days``. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM chain_matches WHERE completed_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_holder_snapshots(self, *, keep_days: int) -> int:
+        """Delete ``holder_snapshots`` rows older than ``keep_days``. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM holder_snapshots WHERE scanned_at <= ?",
             (cutoff,),
         )
         await self._conn.commit()
