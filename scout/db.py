@@ -4932,10 +4932,26 @@ class Database:
         return cur.rowcount or 0
 
     async def prune_learn_logs(self, *, keep_days: int) -> int:
-        """Delete ``learn_logs`` rows older than ``keep_days``. Returns rowcount."""
+        """Delete ``learn_logs`` rows older than ``keep_days``. Returns rowcount.
+
+        PR-review fold: unlike the other narrative-owned tables (which all
+        write Python ``.isoformat()`` strings, e.g. ``2026-05-16T20:03:22+00:00``),
+        ``learn_logs.created_at`` defaults to SQLite's ``datetime('now')`` at
+        schema declaration (``YYYY-MM-DD HH:MM:SS``, space separator, no tz).
+        Both narrative learner writers at ``scout/narrative/learner.py:291,436``
+        rely on the DEFAULT and don't pass ``created_at`` explicitly. Mixed
+        formats break raw lexical comparison: space (0x20) sorts before 'T'
+        (0x54), so ``"2026-05-16 23:59:59"`` is lexically LESS than
+        ``"2026-05-16T20:03:22..."`` and a same-day-later row would be deleted
+        early. Emit the cutoff in the SQLite format so both sides match;
+        lexical order then equals chronological order and the
+        ``idx_learn_logs_created_at`` index is still usable.
+        """
         if self._conn is None:
             raise RuntimeError("Database not initialized")
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
         cur = await self._conn.execute(
             "DELETE FROM learn_logs WHERE created_at <= ?",
             (cutoff,),
