@@ -153,12 +153,14 @@ Total estimated LOC: ~250 added, ~50 removed (helper deletion).
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Migration cost on srilu | Low | Low | All 5 tables are tiny vs cycle 1's 6M rows. Aggregate <15s estimated. Single short EXCLUSIVE per migration; `PRAGMA busy_timeout=90000` inherited |
-| Validator breaks operator's `.env` if explicit override below 30d | Low | Medium | All new defaults ≥ 30d on the 3 validated fields. Validator surfaces clear error via cycle 1's `load_settings()` guard (visible in journalctl) |
-| `momentum_7d` writer rate ≠ estimated → larger table than expected | Low | Low | Index migration is `IF NOT EXISTS`; can re-run if perf degrades; existing prune already keeps table ≤30d |
-| Backtest scripts use `--days > 45` → silent truncation | Medium | Low | Operator-visible at script run time. Document in code comment next to retention defaults; reviewer may suggest doc-string for backtest scripts |
-| Codex session's in-flight baseline-test fixes conflict with this PR | Medium | Low | Codex working on `tests/test_bl064_*`, `tests/conftest.py`, etc. — different files from this PR. Verify post-merge via `git diff codex/fix-baseline-test-failures..feat/narrative-prune-scope-expansion -- tests/` to confirm no overlap |
-| CRLF regression on test files (cycle 1 fold-time hit) | Medium | Low | Operator caught it on cycle 1 PR review. This cycle: `git -c core.autocrlf=false` on every Edit-then-stage operation; `git ls-files --eol` spot-check before push |
+| Migration cost on srilu | Low | Low | All 5 tables are tiny vs cycle 1's 6M rows. Realistic aggregate ~1-2s (D8 NICE-TO-HAVE #6 tightened); previous 5-15s claim was conservative. Single short EXCLUSIVE per migration; `PRAGMA busy_timeout=90000` inherited |
+| Validator breaks operator's `.env` if explicit override below 30d | Low | Medium | All new defaults ≥ 30d on validated fields. Pydantic v2 aggregates cycle 1 + cycle 2 validator errors into one `ValidationError` (D9 SHOULD-FIX #3) — operator sees both via cycle 1's `load_settings()` guard |
+| `momentum_7d` writer rate ≠ estimated → larger table than expected | Low | Low | Index migration is `IF NOT EXISTS`; can re-run if perf degrades |
+| Backtest scripts use `--days > 45` → silent truncation | Medium | Low | Operator-visible at script run time. Document in code comment next to retention defaults |
+| Codex session's in-flight work conflicts with this PR | Low | Low | User-created `codex/fix-baseline-test-failures-clean` at master SHA, working-tree changes in `tests/conftest.py` + `tests/test_bl064_*` + `tests/test_bl076_*` + `tests/test_calibration_dryrun_scheduler.py` + `tests/test_heartbeat_mcap_missing.py` + `tests/test_narrative_prediction_token_id.py` + `tests/test_signal_params_auto_suspend.py`. This PR adds to `tests/test_config.py`, `tests/test_db.py`, `tests/test_hourly_maintenance.py`, replaces `tests/test_narrative_agent_prune.py`. **Zero file-level overlap.** D9 reviewer initially mis-identified `codex/overnight-repo-review` (2-day-stale 7,000-line revert from May 14) as the relevant branch — that's NOT the user's clean branch and is irrelevant to this PR. |
+| CRLF regression on test files | Medium | Low | Operator caught it on cycle 1 PR review. This cycle: `git -c core.autocrlf=false` on every Edit-then-stage; `git ls-files --eol` spot-check before push |
+| Migration sequence halts on first failure | Low | Medium | **Explicit non-goal (D8 NICE-TO-HAVE #7):** migrations halt on first failure by design. Loud failure visible via `load_settings()` guard + systemd respawn. No try/except around `_migrate_*` calls in `initialize()` `db.py:81-110`; operator re-deploys after fixing root cause |
+| Cumulative WAL pressure from 11 prunes/hour | Low | Low | Pre-cycle-2: 5 prunes/hour. Post: 11, all bounded by indexes. **Forward note (D9 NICE-TO-HAVE #4):** if `journalctl --since "2 hours ago" \| grep -c "_prune_failed"` is non-zero, signal to pace. File as `BL-NEW-PRUNE-PACING-FOLLOWUP` post-merge |
 
 ---
 
@@ -176,10 +178,11 @@ Total estimated LOC: ~250 added, ~50 removed (helper deletion).
 
 After merge + deploy:
 
-1. `journalctl -u gecko-pipeline | grep -E "(volume_spikes|momentum_7d|trending_snapshots|learn_logs|holder_snapshots)_scanned_at_idx_migrated|_detected_at_idx_migrated|_created_at_idx_migrated|_snapshot_at_idx_migrated"` — expect 5 migration entries
+1. `journalctl -u gecko-pipeline | grep '"event": "index_migrated"' | jq -r '.table'` — expect 5 cycle-2 tables present (volume_spikes, momentum_7d, trending_snapshots, learn_logs, holder_snapshots). The event name is `"index_migrated"` (column-agnostic) per D3 fold; the table identity is in the `table` structured field.
 2. `sqlite3 scout.db ".indexes <table>"` for each of the 5 tables — confirm new index present
 3. Wait 1-2h for first hourly maintenance
 4. `journalctl -u gecko-pipeline --since "2 hours ago" | grep -E "(volume_spikes|momentum_7d|trending_snapshots|learn_logs|chain_matches|holder_snapshots)_pruned"` — expect rows_deleted=0 silent for first pass at the new (potentially higher) retention defaults; info-emit if existing rows exceed the new retention
 5. `sqlite3 scout.db "SELECT COUNT(*) FROM <table>"` for each table — confirm bounded growth at new defaults
 6. Verify validator wired: operator runs `python -m scout.main --check-config` — should succeed; if they set `TRENDING_SNAPSHOTS_RETENTION_DAYS=7` in `.env` and re-run, should fail with `settings_validation_failed` (cycle 1's load_settings guard) + clear ValidationError message
-7. Revert path: per-table `.env` `<TABLE>_RETENTION_DAYS=365` (must keep trending/chain/volume ≥ 30d per validator); full rollback = revert PR
+7. **D9 SHOULD-FIX #3 verification:** test validator aggregation — set both `SCORE_HISTORY_RETENTION_DAYS=7` (cycle 1 validator) AND `TRENDING_SNAPSHOTS_RETENTION_DAYS=7` (cycle 2 validator) in `.env`, run `--check-config`. Expect BOTH violations reported in the same Pydantic `ValidationError` (Pydantic v2 aggregates after-validators). Confirms operator sees full picture when multiple validators fail
+8. Revert path: per-table `.env` `<TABLE>_RETENTION_DAYS=365` (must keep trending/chain/volume ≥ 30d per validator); full rollback = revert PR
