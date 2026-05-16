@@ -186,9 +186,11 @@ async def test_calibration_dryrun_scheduler_happy_path_fires_alert(
         return [actionable_diff]
 
     sent_messages = []
+    sent_kwargs = []
 
-    async def _fake_send(msg, session, settings):
+    async def _fake_send(msg, session, settings, **kwargs):
         sent_messages.append(msg)
+        sent_kwargs.append(kwargs)
 
     monkeypatch.setattr("scout.trading.calibrate.build_diffs", _fake_build_diffs)
     monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
@@ -219,6 +221,7 @@ async def test_calibration_dryrun_scheduler_happy_path_fires_alert(
         len(sent_messages) == 1
     ), f"expected 1 send_telegram_message call; got {len(sent_messages)}"
     assert "Weekly calibration dry-run" in sent_messages[0]
+    assert sent_kwargs[0].get("parse_mode") is None
     events = [e.get("event") for e in logs]
     assert "calibration_dryrun_pass" in events
     # Sentinel advanced
@@ -308,7 +311,7 @@ async def test_calibration_dryrun_scheduler_idempotency(monkeypatch, settings_fa
 
     sent_messages = []
 
-    async def _fake_send(msg, session, settings):
+    async def _fake_send(msg, session, settings, **kwargs):
         sent_messages.append(msg)
 
     async def _fake_build_diffs(*a, **kw):
@@ -367,7 +370,7 @@ async def test_calibration_dryrun_scheduler_skips_telegram_on_placeholder_token(
 
     sent_messages = []
 
-    async def _fake_send(msg, session, settings):
+    async def _fake_send(msg, session, settings, **kwargs):
         sent_messages.append(msg)
 
     async def _fake_build_diffs(*a, **kw):
@@ -460,7 +463,7 @@ async def test_calibration_dryrun_scheduler_disabled_when_killswitch_off(
 
     sent_messages = []
 
-    async def _fake_send(msg, session, settings):
+    async def _fake_send(msg, session, settings, **kwargs):
         sent_messages.append(msg)
 
     async def _fake_build_diffs(*a, **kw):

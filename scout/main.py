@@ -294,6 +294,7 @@ async def _run_feedback_schedulers(
                             f"in a row — check logs.",
                             session,
                             settings,
+                            parse_mode=None,
                         )
                 except Exception:
                     logger.exception("combo_refresh_streak_alert_dispatch_error")
@@ -474,7 +475,9 @@ async def briefing_loop(
                     # Send to Telegram
                     if settings.BRIEFING_TELEGRAM_ENABLED:
                         for chunk in split_message(synthesis, 4096):
-                            await send_telegram_message(chunk, session, settings)
+                            await send_telegram_message(
+                                chunk, session, settings, parse_mode=None
+                            )
 
                     last_briefing_at = now
                     logger.info("briefing_delivered", type=briefing_type)
@@ -557,7 +560,7 @@ async def _safe_counter_followup(token, session, settings, db=None):
                 f"{flag_lines}\n"
                 f'"{counter.counter_argument}"'
             )
-            await send_telegram_message(msg, session, settings)
+            await send_telegram_message(msg, session, settings, parse_mode=None)
 
         _heartbeat_stats["counter_scores_memecoin"] += 1
         logger.info(
@@ -1790,7 +1793,7 @@ async def main(argv: list[str] | None = None) -> int:
                             summary_text = format_daily_summary(summary_data)
                             if not args.dry_run:
                                 await send_telegram_message(
-                                    summary_text, session, settings
+                                    summary_text, session, settings, parse_mode=None
                                 )
                             logger.info(
                                 "Daily summary sent",

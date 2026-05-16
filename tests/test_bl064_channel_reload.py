@@ -187,9 +187,8 @@ async def test_reload_detects_removed_channel_and_re_binds(db):
 @pytest.mark.asyncio
 async def test_reload_disabled_when_interval_is_zero(db, settings_factory):
     """T4 (rewritten v2) — settings.TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC=0
-    → heartbeat returns immediately + emits tg_social_channel_reload_disabled.
-    This now WORKS because the validator was amended to allow 0 as the
-    explicit opt-out (PR-review adv-M1)."""
+    → heartbeat emits tg_social_channel_reload_disabled and stays alive to
+    re-log disabled state until lifecycle cancellation."""
     from scout.social.telegram.listener import _make_channel_reload_heartbeat
 
     settings = settings_factory(TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC=0)
@@ -201,10 +200,21 @@ async def test_reload_disabled_when_interval_is_zero(db, settings_factory):
         db, client, settings, channels_holder, initial_handler
     )
     with capture_logs() as logs:
-        # Heartbeat returns immediately when interval=0 (no infinite loop)
-        await asyncio.wait_for(heartbeat(), timeout=2.0)
-    events = [e.get("event") for e in logs]
-    assert "tg_social_channel_reload_disabled" in events
+        task = asyncio.create_task(heartbeat())
+        try:
+            for _ in range(20):
+                if any(
+                    e.get("event") == "tg_social_channel_reload_disabled"
+                    for e in logs
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            events = [e.get("event") for e in logs]
+            assert "tg_social_channel_reload_disabled" in events
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
 
 # ---------------------------------------------------------------------------

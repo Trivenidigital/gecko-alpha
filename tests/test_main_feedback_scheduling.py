@@ -108,9 +108,11 @@ async def test_refresh_failure_streak_alerts_telegram(
     monkeypatch.setattr(main_mod._combo_refresh, "refresh_all", _boom)
 
     sent: list = []
+    sent_kwargs: list[dict] = []
 
-    async def _capture_tg(text, session, settings):
+    async def _capture_tg(text, session, settings, **kwargs):
         sent.append(text)
+        sent_kwargs.append(kwargs)
 
     monkeypatch.setattr(main_mod.alerter, "send_telegram_message", _capture_tg)
 
@@ -137,6 +139,7 @@ async def test_refresh_failure_streak_alerts_telegram(
     assert any(
         "combo_refresh" in t.lower() for t in sent
     ), "expected a Telegram alert after 3 consecutive failures"
+    assert sent_kwargs[0].get("parse_mode") is None
 
     # Dedup guard: 5 consecutive failures should produce exactly one alert,
     # not one per loop iteration after the streak crosses 3.
@@ -230,9 +233,11 @@ async def test_streak_alert_counter_resets_after_success(
     monkeypatch.setattr(main_mod._combo_refresh, "refresh_all", _seq)
 
     sent: list = []
+    sent_kwargs: list[dict] = []
 
-    async def _capture_tg(text, session, settings):
+    async def _capture_tg(text, session, settings, **kwargs):
         sent.append(text)
+        sent_kwargs.append(kwargs)
 
     monkeypatch.setattr(main_mod.alerter, "send_telegram_message", _capture_tg)
 
@@ -263,6 +268,7 @@ async def test_streak_alert_counter_resets_after_success(
         f"expected 2 alerts (one per 3-failure streak with a success between), "
         f"got {len(sent)}: {sent}"
     )
+    assert all(kwargs.get("parse_mode") is None for kwargs in sent_kwargs)
     # Counter was cleared by the day-4 success.
     assert main_mod._combo_refresh_failure_streak == 3
     await db.close()

@@ -2,6 +2,21 @@
 
 Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvement run)
 
+## Active Work: baseline test failures after PR #136 review
+
+- [x] Reproduced current red subset: 17 failures in BL-064 reload, BL-076 metadata, calibration dry-run, mcap heartbeat, narrative token-id, parse-mode hygiene, and signal revival tests
+- [x] Root-cause clustered failures into test-harness drift vs production hygiene fixes
+- [x] Plan drafted: `tasks/plan_fix_baseline_test_failures_2026_05_16.md`
+- [x] Implement plan task-by-task
+- [x] Verify original 17-test subset is green: `17 passed in 8.06s`
+- [x] Run adjacent suites and full suite with redirected output: adjacent `113 passed in 25.25s`; full `2159 passed, 39 skipped, 12 warnings in 463.12s`
+- [x] Document final verification results here
+
+Review:
+- Fixed env-coupled tests by routing BL-076 through `settings_factory(_env_file=None)`.
+- Updated stale test harnesses for long-lived BL-064 disabled heartbeat, calibration/feedback Telegram kwargs, CoinGecko query-param mocks, narrative resolution exception type, and signal-revival audit row selection.
+- Production fix: pinned `parse_mode=None` at four `scout/main.py` Telegram dispatch sites flagged by the parse-mode hygiene audit.
+
 ## Active Work: X Alerts outcome columns
 
 - [x] Isolated worktree created: `C:\projects\gecko-alpha-x-alert-outcome` on `codex/x-alert-outcome`
