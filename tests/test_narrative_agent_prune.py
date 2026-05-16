@@ -1,90 +1,45 @@
-"""Tests for scout.narrative.agent._run_extra_table_prune.
+"""Regression test for BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION cycle 2.
 
-V1#1 + V1#2 + V1#8 review fold: structured logging replaces silent except
-for the 6 narrative-pruned tables.
+The cycle 1 file at this path tested ``_run_extra_table_prune`` in
+``scout/narrative/agent.py``. Cycle 2 deletes that helper after migrating
+all 6 narrative-owned tables to ``scout.main._run_hourly_maintenance``
+via Settings-parameterized prune methods on ``Database``.
+
+This file is replaced with a single regression test (per D8 plan-review
+MUST-FIX #2 fold) that locks in BOTH halves of the migration:
+
+1. The helper is gone (regression: reintroducing it duplicates work).
+2. All 6 prune methods exist on ``Database`` (regression: dropping one
+   silently leaves a table unpruned).
 """
 
-from unittest.mock import AsyncMock, MagicMock
 
-import structlog
+def test_extra_table_prune_helper_removed_and_methods_exist_on_database():
+    """BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION cycle 2 regression guard.
 
-
-async def test_run_extra_table_prune_logs_per_table_error():
-    """V1#8 fold: when EVERY table DELETE fails, expect EXACTLY 6 structured
-    error events (one per remaining table after score/volume extraction).
-    Fault isolation: errors don't break the loop.
+    D8 plan-review MUST-FIX #2: dropping the cycle 1 tests removed the only
+    regression guard for "score_history NOT in narrative loop" and "6-table
+    set is exact." Replacement test locks in both halves of the cycle 2
+    migration so a future PR can't quietly reintroduce the helper or drop
+    a prune method.
     """
-    db = MagicMock()
-    db._conn = MagicMock()
-    db._conn.execute = AsyncMock(side_effect=RuntimeError("simulated table missing"))
-    db._conn.commit = AsyncMock()
+    import scout.narrative.agent as narrative_agent
+    from scout.db import Database
 
-    from scout.narrative.agent import _run_extra_table_prune
-
-    with structlog.testing.capture_logs() as cap_logs:
-        await _run_extra_table_prune(db)
-
-    error_logs = [e for e in cap_logs if e.get("event") == "extra_prune_table_error"]
-    assert len(error_logs) == 6, (
-        f"Expected 6 (one per narrative-owned table), got {len(error_logs)}"
+    assert not hasattr(narrative_agent, "_run_extra_table_prune"), (
+        "Helper was migrated out in cycle 2; reintroducing it suggests "
+        "a regression — narrative daily loop should not prune tables directly."
     )
-    seen_tables = {e["table"] for e in error_logs}
-    assert seen_tables == {
-        "volume_spikes",
-        "momentum_7d",
-        "trending_snapshots",
-        "learn_logs",
-        "chain_matches",
-        "holder_snapshots",
-    }
-
-
-async def test_run_extra_table_prune_does_not_include_score_volume():
-    """Regression test: score_history and volume_snapshots must NOT be pruned
-    here — they're owned by scout.main._run_hourly_maintenance now.
-
-    V6 SHOULD-FIX: assert positive table count (==6) in addition to negative
-    membership; catches reintroduction via different SQL phrasing or
-    parameterized table name.
-    """
-    db = MagicMock()
-    db._conn = MagicMock()
-    db._conn.execute = AsyncMock()
-    db._conn.commit = AsyncMock()
-
-    from scout.narrative.agent import _run_extra_table_prune
-
-    await _run_extra_table_prune(db)
-
-    executed_sql = [
-        call.args[0] for call in db._conn.execute.call_args_list if call.args
-    ]
-    # Positive: exactly 6 DELETE statements emitted (one per remaining table)
-    delete_stmts = [s for s in executed_sql if "DELETE FROM" in s]
-    assert len(delete_stmts) == 6, f"Expected 6 DELETEs, got {len(delete_stmts)}"
-    # Negative: score_history and volume_snapshots never appear in any stmt
-    for stmt in executed_sql:
-        assert "score_history" not in stmt, (
-            f"score_history must not be pruned here: {stmt}"
+    for method in (
+        "prune_volume_spikes",
+        "prune_momentum_7d",
+        "prune_trending_snapshots",
+        "prune_learn_logs",
+        "prune_chain_matches",
+        "prune_holder_snapshots",
+    ):
+        assert hasattr(Database, method), (
+            f"Database.{method} missing — narrative loop's table was "
+            f"migrated out but no replacement prune method exists. "
+            f"Table will accumulate rows unbounded."
         )
-        assert "volume_snapshots" not in stmt, (
-            f"volume_snapshots must not be pruned here: {stmt}"
-        )
-
-
-async def test_run_extra_table_prune_commit_error_is_structured():
-    """If commit() raises, the helper must logger.exception, not silent-swallow."""
-    db = MagicMock()
-    db._conn = MagicMock()
-    db._conn.execute = AsyncMock()
-    db._conn.commit = AsyncMock(side_effect=RuntimeError("commit failed"))
-
-    from scout.narrative.agent import _run_extra_table_prune
-
-    with structlog.testing.capture_logs() as cap_logs:
-        await _run_extra_table_prune(db)
-
-    commit_errors = [
-        e for e in cap_logs if e.get("event") == "extra_prune_commit_error"
-    ]
-    assert len(commit_errors) == 1
