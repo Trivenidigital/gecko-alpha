@@ -8,6 +8,8 @@ run_pipeline path.
 
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from scout.config import Settings
 from scout.main import _run_hourly_maintenance
 
@@ -133,9 +135,6 @@ async def test_run_hourly_maintenance_calls_narrative_table_prune(
 
     expected_keep_days = getattr(settings, retention_attr)
     getattr(db, prune_method).assert_awaited_once_with(keep_days=expected_keep_days)
-
-
-import pytest  # placed at end intentionally to keep diff small
 
 
 async def test_run_hourly_maintenance_exception_path_logs_structured(tmp_path):
