@@ -529,3 +529,69 @@ def test_channel_reload_interval_accepts_60_and_above():
             TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC=good_value,
         )
         assert s.TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC == good_value
+
+
+# ---------------------------------------------------------------------------
+# BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING
+# ---------------------------------------------------------------------------
+
+
+def test_score_history_retention_default():
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.SCORE_HISTORY_RETENTION_DAYS == 21
+
+
+def test_volume_snapshots_retention_default():
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.VOLUME_SNAPSHOTS_RETENTION_DAYS == 21
+
+
+def test_score_history_retention_env_override():
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        SCORE_HISTORY_RETENTION_DAYS=30,
+    )
+    assert s.SCORE_HISTORY_RETENTION_DAYS == 30
+
+
+def test_retention_must_exceed_secondwave_cooldown():
+    """V2#3 fold: setting retention below SECONDWAVE_COOLDOWN_MAX_DAYS must raise."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="must be >= SECONDWAVE_COOLDOWN_MAX_DAYS"):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            SCORE_HISTORY_RETENTION_DAYS=7,
+            SECONDWAVE_COOLDOWN_MAX_DAYS=14,
+        )
+
+
+def test_retention_volume_must_exceed_secondwave_cooldown():
+    """V2#3 fold: same check applies to volume retention."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="must be >= SECONDWAVE_COOLDOWN_MAX_DAYS"):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            VOLUME_SNAPSHOTS_RETENTION_DAYS=7,
+            SECONDWAVE_COOLDOWN_MAX_DAYS=14,
+        )
