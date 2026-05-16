@@ -3659,28 +3659,18 @@ class Database:
                 "bl_minara_alert_emissions_v1 tg_alert_log_id partial index missing"
             )
 
-    async def _migrate_score_history_scanned_at_index(self) -> None:
-        """BL-NEW-SCORE-HISTORY-PRUNING: add single-column scanned_at index.
+    async def _migrate_scanned_at_index(
+        self, *, table: str, index_name: str, migration_name: str
+    ) -> None:
+        """Add single-column scanned_at index for hourly prune coverage.
 
-        Existing idx_score_hist_addr (contract_address, scanned_at) is leading-
-        column-mismatched for the prune DELETE's time-only predicate. Without
-        this single-column index SQLite table-scans 6M rows hourly. Per memory
-        feedback_ddl_before_alter.md, must use migration step (not
-        _create_tables, which is a no-op for existing tables).
-
-        V4#2 fold: PRAGMA busy_timeout = 90000 covers gecko-dashboard.service
-        concurrent reads during the ~30-60s O(N log N) index build.
-
-        V4#3 fold: split per-index so disk failure on the second one doesn't
-        roll back the first.
+        Helper for BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING.
+        Each table gets its own paper_migrations entry (V4#3 fold) so disk
+        failure on one doesn't roll back the other.
         """
-        import structlog
-
-        _log = structlog.get_logger()
         if self._conn is None:
             raise RuntimeError("Database not initialized.")
         conn = self._conn
-        migration_name = "score_history_scanned_at_idx_v1"
 
         try:
             await conn.execute("PRAGMA busy_timeout = 90000")
@@ -3697,66 +3687,44 @@ class Database:
                 await conn.execute("COMMIT")
                 return
             await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_score_history_scanned_at "
-                "ON score_history(scanned_at)"
+                f"CREATE INDEX IF NOT EXISTS {index_name} ON {table}(scanned_at)"
             )
             await conn.execute(
                 "INSERT INTO paper_migrations(name, cutover_ts) VALUES (?, ?)",
                 (migration_name, datetime.now(timezone.utc).isoformat()),
             )
             await conn.execute("COMMIT")
-            _log.info("score_history_scanned_at_idx_migrated")
+            _db_log.info(
+                "scanned_at_idx_migrated", table=table, migration=migration_name
+            )
         except Exception:
             try:
                 await conn.execute("ROLLBACK")
             except Exception:
                 pass
-            _log.exception("score_history_scanned_at_idx_migration_failed")
+            _db_log.exception(
+                "scanned_at_idx_migration_failed",
+                table=table,
+                migration=migration_name,
+            )
+            _db_log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)
             raise
+
+    async def _migrate_score_history_scanned_at_index(self) -> None:
+        """BL-NEW-SCORE-HISTORY-PRUNING migration entry point."""
+        await self._migrate_scanned_at_index(
+            table="score_history",
+            index_name="idx_score_history_scanned_at",
+            migration_name="score_history_scanned_at_idx_v1",
+        )
 
     async def _migrate_volume_snapshots_scanned_at_index(self) -> None:
-        """BL-NEW-VOLUME-SNAPSHOTS-PRUNING: companion to
-        _migrate_score_history_scanned_at_index. Same shape, independent
-        paper_migrations entry per V4#3 fold."""
-        import structlog
-
-        _log = structlog.get_logger()
-        if self._conn is None:
-            raise RuntimeError("Database not initialized.")
-        conn = self._conn
-        migration_name = "volume_snapshots_scanned_at_idx_v1"
-
-        try:
-            await conn.execute("PRAGMA busy_timeout = 90000")
-            await conn.execute("BEGIN EXCLUSIVE")
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS paper_migrations (
-                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
-            )
-            cur = await conn.execute(
-                "SELECT 1 FROM paper_migrations WHERE name = ?", (migration_name,)
-            )
-            row = await cur.fetchone()
-            if row is not None:
-                await conn.execute("COMMIT")
-                return
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_volume_snapshots_scanned_at "
-                "ON volume_snapshots(scanned_at)"
-            )
-            await conn.execute(
-                "INSERT INTO paper_migrations(name, cutover_ts) VALUES (?, ?)",
-                (migration_name, datetime.now(timezone.utc).isoformat()),
-            )
-            await conn.execute("COMMIT")
-            _log.info("volume_snapshots_scanned_at_idx_migrated")
-        except Exception:
-            try:
-                await conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            _log.exception("volume_snapshots_scanned_at_idx_migration_failed")
-            raise
+        """BL-NEW-VOLUME-SNAPSHOTS-PRUNING migration entry point."""
+        await self._migrate_scanned_at_index(
+            table="volume_snapshots",
+            index_name="idx_volume_snapshots_scanned_at",
+            migration_name="volume_snapshots_scanned_at_idx_v1",
+        )
 
     async def record_minara_alert_emission(
         self,
@@ -4800,17 +4768,7 @@ class Database:
         return cur.rowcount or 0
 
     async def prune_score_history(self, *, keep_days: int) -> int:
-        """Delete ``score_history`` rows older than ``keep_days``. Returns rowcount.
-
-        BL-NEW-SCORE-HISTORY-PRUNING. Uses ``<=`` so that scanned_at == cutoff
-        prunes (matches ``prune_cryptopanic_posts`` boundary semantic at
-        db.py:4754-4758 — keep_days=0 means "retain nothing as old as now").
-
-        Return-type contract (V1#3 fold): ``cur.rowcount or 0`` — matches
-        sibling ``prune_perp_anomalies`` above. Diverges from
-        ``prune_cryptopanic_posts`` (no ``or 0``); existing inconsistency in
-        the codebase. We follow the safer coalesce-to-zero form.
-        """
+        """Delete ``score_history`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
@@ -4822,11 +4780,7 @@ class Database:
         return cur.rowcount or 0
 
     async def prune_volume_snapshots(self, *, keep_days: int) -> int:
-        """Delete ``volume_snapshots`` rows older than ``keep_days``. Returns rowcount.
-
-        BL-NEW-VOLUME-SNAPSHOTS-PRUNING. Same shape + contract as
-        ``prune_score_history`` above.
-        """
+        """Delete ``volume_snapshots`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()

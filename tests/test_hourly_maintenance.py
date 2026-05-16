@@ -6,10 +6,7 @@ _run_hourly_maintenance directly rather than going through the full
 run_pipeline path.
 """
 
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
-
-import pytest
 
 from scout.config import Settings
 from scout.main import _run_hourly_maintenance

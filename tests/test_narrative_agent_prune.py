@@ -6,7 +6,6 @@ for the 6 narrative-pruned tables.
 
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 import structlog
 
 
@@ -43,6 +42,10 @@ async def test_run_extra_table_prune_logs_per_table_error():
 async def test_run_extra_table_prune_does_not_include_score_volume():
     """Regression test: score_history and volume_snapshots must NOT be pruned
     here — they're owned by scout.main._run_hourly_maintenance now.
+
+    V6 SHOULD-FIX: assert positive table count (==6) in addition to negative
+    membership; catches reintroduction via different SQL phrasing or
+    parameterized table name.
     """
     db = MagicMock()
     db._conn = MagicMock()
@@ -56,6 +59,10 @@ async def test_run_extra_table_prune_does_not_include_score_volume():
     executed_sql = [
         call.args[0] for call in db._conn.execute.call_args_list if call.args
     ]
+    # Positive: exactly 6 DELETE statements emitted (one per remaining table)
+    delete_stmts = [s for s in executed_sql if "DELETE FROM" in s]
+    assert len(delete_stmts) == 6, f"Expected 6 DELETEs, got {len(delete_stmts)}"
+    # Negative: score_history and volume_snapshots never appear in any stmt
     for stmt in executed_sql:
         assert "score_history" not in stmt, (
             f"score_history must not be pruned here: {stmt}"

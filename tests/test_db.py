@@ -133,6 +133,77 @@ async def test_prune_volume_snapshots_empty_table_returns_zero(db):
     assert deleted == 0
 
 
+async def test_prune_volume_snapshots_tie_on_cutoff_deletes(db):
+    """V6 fold: parity with prune_score_history tie-on-cutoff test.
+
+    Locks in <= semantic on volume side. Without this, a future PR could
+    flip score to keep <= while flipping volume to <, and only the score
+    test would catch it.
+    """
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(days=14)
+    cutoff_iso = cutoff_dt.isoformat()
+    await db._conn.execute(
+        "INSERT INTO volume_snapshots (contract_address, volume_24h_usd, scanned_at) VALUES (?, ?, ?)",
+        ("0xTIE", 100000.0, cutoff_iso),
+    )
+    await db._conn.commit()
+    deleted = await db.prune_volume_snapshots(keep_days=14)
+    assert deleted == 1
+
+
+async def test_prune_score_history_future_dated_rows_survive_keep_days_zero(db):
+    """V6 fold: keep_days=0 must NOT delete future-dated rows (clock skew /
+    test seed). cutoff = now, predicate is scanned_at <= cutoff — future
+    scanned_at > now > cutoff → must survive.
+    """
+    now = datetime.now(timezone.utc)
+    future = (now + timedelta(hours=1)).isoformat()
+    past = (now - timedelta(seconds=1)).isoformat()
+    await db._conn.execute(
+        "INSERT INTO score_history (contract_address, score, scanned_at) VALUES (?, ?, ?)",
+        ("0xFUTURE", 50.0, future),
+    )
+    await db._conn.execute(
+        "INSERT INTO score_history (contract_address, score, scanned_at) VALUES (?, ?, ?)",
+        ("0xPAST", 50.0, past),
+    )
+    await db._conn.commit()
+
+    deleted = await db.prune_score_history(keep_days=0)
+
+    assert deleted == 1
+    cur = await db._conn.execute("SELECT contract_address FROM score_history")
+    rows = await cur.fetchall()
+    assert [r[0] for r in rows] == ["0xFUTURE"]
+
+
+async def test_migration_idempotent_on_second_initialize(tmp_path):
+    """V6 fold: migration idempotency via paper_migrations row check.
+
+    A future refactor breaking the SELECT 1 FROM paper_migrations guard
+    would cause CREATE INDEX to re-run on every restart, blocking dashboard
+    reads for 30-60s. This test calls initialize() twice on the same DB
+    and asserts the second pass skips the CREATE INDEX execution.
+    """
+    db = Database(str(tmp_path / "idempotent.db"))
+    await db.initialize()
+    # Snapshot paper_migrations rows after first init
+    cur = await db._conn.execute("SELECT name FROM paper_migrations")
+    after_first = {row[0] for row in await cur.fetchall()}
+    await db.close()
+
+    # Re-init — second pass should skip the score/volume migrations
+    db2 = Database(str(tmp_path / "idempotent.db"))
+    await db2.initialize()
+    cur = await db2._conn.execute("SELECT name FROM paper_migrations")
+    after_second = {row[0] for row in await cur.fetchall()}
+    await db2.close()
+
+    assert "score_history_scanned_at_idx_v1" in after_first
+    assert "volume_snapshots_scanned_at_idx_v1" in after_first
+    assert after_first == after_second  # no rows added on re-init
+
+
 async def test_upsert_and_retrieve(db, token_factory):
     token = token_factory(quant_score=75)
     await db.upsert_candidate(token)

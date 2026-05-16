@@ -1430,6 +1430,12 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **Action:** §12b active-alert path (TG curl-direct OR `scout.alerter` with `parse_mode=None`) in the exception branches. Likely shipped together with `BL-NEW-SETTINGS-VALIDATION-ALERT` (same alert-infrastructure shape).
 **decision-by:** evidence-gated on first prod failure (no calendar trigger).
 
+### BL-NEW-SETTINGS-IMMUTABILITY: prevent post-construction Settings mutation bypassing validators
+**Status:** PROPOSED 2026-05-16 — V6 PR-review NOTE finding from `feat/score-volume-pruning-harden`.
+**Why:** Pydantic v2 `Settings` is NOT frozen by default. `s.SCORE_HISTORY_RETENTION_DAYS = 5` post-construction silently bypasses the `_validate_retention_covers_secondwave_window` (and `_validate_live_caps_relation`) validator. Any code path that mutates settings after construction breaks the cooldown invariant invisibly. The prune helper trusts `settings.SCORE_HISTORY_RETENTION_DAYS` at call time, so the symptom would be "secondwave evidence window silently truncated" — exact failure mode the validator exists to prevent.
+**Action:** add `model_config = SettingsConfigDict(..., frozen=True)` OR a wrapping read-only proxy. Audit existing in-tree mutation paths first (e.g., `scout/main.py:1388 settings.MIN_SCORE = args.min_score_override` — that's a legitimate mutation that would need refactoring before frozen=True works). Scope: cross-codebase impact assessment + frozen flip OR proxy pattern.
+**decision-by:** 6 weeks (audit-first, then implement).
+
 ### BL-NEW-SYSTEMD-UNIT-IN-REPO: systemd units must be repo-tracked
 **Status:** PROPOSED 2026-05-16 — V4 NOTE finding from `feat/score-volume-pruning-harden` PR design review.
 **Why:** `/etc/systemd/system/gecko-pipeline.service` and `gecko-dashboard.service` exist only on srilu-vps, not in the `systemd/` directory of this repo. Any drift between repo and prod (e.g., `Restart=always` policy, `RestartSec`, environment overrides) is invisible to PR reviewers. Substrate-finding shape — config-not-in-git is the same class that drove the 2026-05-16 backlog drift audit.

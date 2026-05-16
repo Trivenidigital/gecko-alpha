@@ -636,3 +636,40 @@ def test_load_settings_returns_normally_on_valid_input():
     )
     assert s.SCORE_HISTORY_RETENTION_DAYS == 21
     assert s.VOLUME_SNAPSHOTS_RETENTION_DAYS == 21
+
+
+def test_retention_equality_to_cooldown_passes():
+    """V6 fold: retention == cooldown should pass (validator uses < not <=).
+
+    Locks in the "must be >=" boundary semantic. Future PR flipping < to <=
+    would break operators setting retention exactly to cooldown.
+    """
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        SCORE_HISTORY_RETENTION_DAYS=14,
+        VOLUME_SNAPSHOTS_RETENTION_DAYS=14,
+        SECONDWAVE_COOLDOWN_MAX_DAYS=14,
+    )
+    assert s.SCORE_HISTORY_RETENTION_DAYS == 14
+    assert s.VOLUME_SNAPSHOTS_RETENTION_DAYS == 14
+
+
+def test_retention_validator_raises_when_both_below_cooldown():
+    """V6 SHOULD-FIX: confirm validator catches at least one violation when
+    both are below cooldown. Pydantic v2 short-circuits on first error so we
+    only assert SOMETHING was raised, not exhaustive enumeration."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="must be >= SECONDWAVE_COOLDOWN_MAX_DAYS"):
+        Settings(
+            _env_file=None,
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            SCORE_HISTORY_RETENTION_DAYS=7,
+            VOLUME_SNAPSHOTS_RETENTION_DAYS=7,
+            SECONDWAVE_COOLDOWN_MAX_DAYS=14,
+        )
