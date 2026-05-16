@@ -65,6 +65,44 @@ from scout.trending.tracker import (
 logger = structlog.get_logger()
 
 
+async def _run_extra_table_prune(db) -> None:
+    """Prune the 6 narrative-owned tables on the daily-learn loop.
+
+    Score history + volume snapshots used to live in this list at 14d
+    hardcoded, but were extracted to scout.main._run_hourly_maintenance as
+    parameterized prunes (BL-NEW-SCORE-HISTORY-PRUNING +
+    BL-NEW-VOLUME-SNAPSHOTS-PRUNING).
+
+    The remaining 6 tables (volume_spikes / momentum_7d / trending_snapshots
+    / learn_logs / chain_matches / holder_snapshots) stay here with hardcoded
+    retention pending parameterize+decouple in follow-up
+    BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION.
+
+    V1#2 + V1#8 review fold: per-table try/except with structured
+    ``logger.exception("extra_prune_table_error", ...)`` replaces the
+    previous ``except Exception: pass`` Class-1 silent-failure surface
+    (CLAUDE.md §12a).
+    """
+    for table, col, days in [
+        ("volume_spikes", "detected_at", 30),
+        ("momentum_7d", "detected_at", 30),
+        ("trending_snapshots", "snapshot_at", 7),
+        ("learn_logs", "created_at", 90),
+        ("chain_matches", "completed_at", 30),
+        ("holder_snapshots", "scanned_at", 14),
+    ]:
+        try:
+            await db._conn.execute(
+                f"DELETE FROM {table} WHERE datetime({col}) < datetime('now', '-{days} days')"
+            )
+        except Exception:
+            logger.exception("extra_prune_table_error", table=table, days=days)
+    try:
+        await db._conn.commit()
+    except Exception:
+        logger.exception("extra_prune_commit_error")
+
+
 async def narrative_agent_loop(
     session: aiohttp.ClientSession,
     settings: Settings,
@@ -676,27 +714,11 @@ async def narrative_agent_loop(
                         )
                     except Exception:
                         logger.exception("tracker_prune_error")
-                    # Prune old data from tables that had no pruning (H6)
-                    try:
-                        for table, col, days in [
-                            ("volume_spikes", "detected_at", 30),
-                            ("momentum_7d", "detected_at", 30),
-                            ("trending_snapshots", "snapshot_at", 7),
-                            ("learn_logs", "created_at", 90),
-                            ("chain_matches", "completed_at", 30),
-                            ("holder_snapshots", "scanned_at", 14),
-                            ("volume_snapshots", "scanned_at", 14),
-                            ("score_history", "scanned_at", 14),
-                        ]:
-                            try:
-                                await db._conn.execute(
-                                    f"DELETE FROM {table} WHERE datetime({col}) < datetime('now', '-{days} days')"
-                                )
-                            except Exception:
-                                pass
-                        await db._conn.commit()
-                    except Exception:
-                        logger.exception("extra_prune_error")
+                    # Prune narrative-owned tables (H6 + V1#2 fold).
+                    # score_history + volume_snapshots are pruned hourly by
+                    # scout.main._run_hourly_maintenance via Settings
+                    # retention; not in this list.
+                    await _run_extra_table_prune(db)
                     last_daily_learn_at = now
                     await strategy.set_timestamp("last_daily_learn_at", now)
                     logger.info("narrative.daily_learn_complete")
