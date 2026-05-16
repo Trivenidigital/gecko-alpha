@@ -1427,10 +1427,9 @@ scout/trading/
 These four entries were surfaced during the score/volume pruning PR's plan/design review cycle (V1+V2 plan, V3+V4 design). Filed per actionability discipline.
 
 ### BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION: parameterize + decouple remaining 6 narrative-owned prunes
-**Status:** PROPOSED 2026-05-16 — residual from `feat/score-volume-pruning-harden` PR's §7a partial-match reframe.
-**Why:** Score+volume PR extracted those 2 tables from `_run_extra_table_prune` in `scout/narrative/agent.py` and parameterized them via Settings (`SCORE_HISTORY_RETENTION_DAYS`, `VOLUME_SNAPSHOTS_RETENTION_DAYS`). The remaining 6 tables (`volume_spikes`, `momentum_7d`, `trending_snapshots`, `learn_logs`, `chain_matches`, `holder_snapshots`) still use hardcoded retention values and run only inside the narrative daily-learn loop. Same defect class — violates "no hardcoded thresholds" rule.
-**Action:** 6 Settings fields + 6 prune methods on Database + hourly wiring (mirror the score/volume pattern).
-**decision-by:** 6 weeks (lower urgency — slower write rates).
+**Status:** SHIPPED 2026-05-16 — branch `feat/narrative-prune-scope-expansion` (10 commits + V8/V9 plan fold + D8/D9 design fold; PR pending). All 6 tables (`volume_spikes`, `momentum_7d`, `trending_snapshots`, `learn_logs`, `chain_matches`, `holder_snapshots`) parameterized via Settings + hourly-pruned via `scout.main._run_hourly_maintenance`. Narrative loop helper `_run_extra_table_prune` deleted; daily-learn block no longer prunes tables directly. 5 new indexes (`idx_*_detected_at|snapshot_at|created_at|scanned_at`) added via cycle 1's extended `_migrate_scanned_at_index` helper (`column` kwarg + dynamic log events). `_validate_backtest_cli_retention_floor` model_validator added enforcing 30d floor on trending/chain/volume (V8 fold). chain_matches index deferred (V9 NICE-TO-HAVE — slow growth, EXPLAIN-gate at PR-stage). Filed follow-up: `BL-NEW-PRUNE-PACING-FOLLOWUP` (D9 fold — 11 prunes/hour WAL pressure check post-deploy).
+
+**Original status (now historical):** PROPOSED 2026-05-16 — residual from `feat/score-volume-pruning-harden` PR's §7a partial-match reframe.
 
 ### BL-NEW-SETTINGS-VALIDATION-ALERT: curl-direct Telegram on settings_validation_failed
 **Status:** PROPOSED 2026-05-16 — V4#1 review deferred from `feat/score-volume-pruning-harden` PR.
