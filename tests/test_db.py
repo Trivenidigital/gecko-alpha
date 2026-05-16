@@ -1,5 +1,7 @@
 """Tests for scout.db module."""
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from scout.db import Database
@@ -11,6 +13,42 @@ async def db(tmp_path):
     await database.initialize()
     yield database
     await database.close()
+
+
+# ---------------------------------------------------------------------------
+# BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING — index + prune
+# ---------------------------------------------------------------------------
+
+
+async def test_prune_score_history_uses_scanned_at_index(db):
+    """V1#5 / V2#5 / V4#3 fold: DELETE WHERE scanned_at <= ? must use the
+    new single-column idx_score_history_scanned_at, not table-scan.
+
+    Existing idx_score_hist_addr (contract_address, scanned_at) cannot serve
+    the time-only predicate because contract_address is the leading column.
+    """
+    cur = await db._conn.execute(
+        "EXPLAIN QUERY PLAN DELETE FROM score_history WHERE scanned_at <= ?",
+        ("2026-01-01T00:00:00+00:00",),
+    )
+    plan = await cur.fetchall()
+    plan_str = " ".join(str(row[3]) for row in plan)
+    assert (
+        "idx_score_history_scanned_at" in plan_str
+    ), f"Index not used: {plan_str}"
+
+
+async def test_prune_volume_snapshots_uses_scanned_at_index(db):
+    """Same as above for volume_snapshots."""
+    cur = await db._conn.execute(
+        "EXPLAIN QUERY PLAN DELETE FROM volume_snapshots WHERE scanned_at <= ?",
+        ("2026-01-01T00:00:00+00:00",),
+    )
+    plan = await cur.fetchall()
+    plan_str = " ".join(str(row[3]) for row in plan)
+    assert (
+        "idx_volume_snapshots_scanned_at" in plan_str
+    ), f"Index not used: {plan_str}"
 
 
 async def test_upsert_and_retrieve(db, token_factory):

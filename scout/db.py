@@ -106,6 +106,8 @@ class Database:
         await self._migrate_tg_alert_log_m1_5c_outcome()
         await self._migrate_narrative_scanner_v1()
         await self._migrate_minara_alert_emissions_v1()
+        await self._migrate_score_history_scanned_at_index()
+        await self._migrate_volume_snapshots_scanned_at_index()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -3656,6 +3658,105 @@ class Database:
             raise RuntimeError(
                 "bl_minara_alert_emissions_v1 tg_alert_log_id partial index missing"
             )
+
+    async def _migrate_score_history_scanned_at_index(self) -> None:
+        """BL-NEW-SCORE-HISTORY-PRUNING: add single-column scanned_at index.
+
+        Existing idx_score_hist_addr (contract_address, scanned_at) is leading-
+        column-mismatched for the prune DELETE's time-only predicate. Without
+        this single-column index SQLite table-scans 6M rows hourly. Per memory
+        feedback_ddl_before_alter.md, must use migration step (not
+        _create_tables, which is a no-op for existing tables).
+
+        V4#2 fold: PRAGMA busy_timeout = 90000 covers gecko-dashboard.service
+        concurrent reads during the ~30-60s O(N log N) index build.
+
+        V4#3 fold: split per-index so disk failure on the second one doesn't
+        roll back the first.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "score_history_scanned_at_idx_v1"
+
+        try:
+            await conn.execute("PRAGMA busy_timeout = 90000")
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?", (migration_name,)
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                await conn.execute("COMMIT")
+                return
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_score_history_scanned_at "
+                "ON score_history(scanned_at)"
+            )
+            await conn.execute(
+                "INSERT INTO paper_migrations(name, cutover_ts) VALUES (?, ?)",
+                (migration_name, datetime.now(timezone.utc).isoformat()),
+            )
+            await conn.execute("COMMIT")
+            _log.info("score_history_scanned_at_idx_migrated")
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            _log.exception("score_history_scanned_at_idx_migration_failed")
+            raise
+
+    async def _migrate_volume_snapshots_scanned_at_index(self) -> None:
+        """BL-NEW-VOLUME-SNAPSHOTS-PRUNING: companion to
+        _migrate_score_history_scanned_at_index. Same shape, independent
+        paper_migrations entry per V4#3 fold."""
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "volume_snapshots_scanned_at_idx_v1"
+
+        try:
+            await conn.execute("PRAGMA busy_timeout = 90000")
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?", (migration_name,)
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                await conn.execute("COMMIT")
+                return
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_volume_snapshots_scanned_at "
+                "ON volume_snapshots(scanned_at)"
+            )
+            await conn.execute(
+                "INSERT INTO paper_migrations(name, cutover_ts) VALUES (?, ?)",
+                (migration_name, datetime.now(timezone.utc).isoformat()),
+            )
+            await conn.execute("COMMIT")
+            _log.info("volume_snapshots_scanned_at_idx_migrated")
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            _log.exception("volume_snapshots_scanned_at_idx_migration_failed")
+            raise
 
     async def record_minara_alert_emission(
         self,
