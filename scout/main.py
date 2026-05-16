@@ -1193,6 +1193,54 @@ async def check_outcomes(
     return recorded
 
 
+async def _run_hourly_maintenance(db, session, settings, logger) -> None:
+    """Hourly maintenance: outcome check + table prunes.
+
+    Extracted from inline run_pipeline loop for testability (V1#7 fold).
+    No behavior change vs the inline form. ``args`` was unused in the
+    original block (V3 NICE-TO-HAVE fold) — signature drops it.
+    """
+    try:
+        outcomes_recorded = await check_outcomes(db, session)
+        if outcomes_recorded:
+            logger.info("Outcomes checked", recorded=outcomes_recorded)
+    except Exception as e:
+        logger.warning("Outcome check error", error=str(e))
+
+    # Prune old candidates if DB > 500MB
+    try:
+        db_size = (
+            settings.DB_PATH.stat().st_size if settings.DB_PATH.exists() else 0
+        )
+        if db_size > 500_000_000:
+            pruned = await db.prune_old_candidates(keep_days=7)
+            logger.info(
+                "db_pruned",
+                rows_deleted=pruned,
+                db_size_mb=round(db_size / 1e6, 1),
+            )
+    except Exception as e:
+        logger.warning("DB prune error", error=str(e))
+
+    try:
+        await db.prune_perp_anomalies(
+            keep_days=settings.PERP_ANOMALY_RETENTION_DAYS
+        )
+    except Exception as e:
+        logger.warning("perp_anomaly_prune_error", error=str(e))
+
+    # BL-053: prune CryptoPanic posts older than retention cap
+    if settings.CRYPTOPANIC_ENABLED:
+        try:
+            pruned_cp = await db.prune_cryptopanic_posts(
+                keep_days=settings.CRYPTOPANIC_RETENTION_DAYS
+            )
+            if pruned_cp:
+                logger.info("cryptopanic_pruned", rows_deleted=pruned_cp)
+        except Exception:
+            logger.exception("cryptopanic_prune_failed")
+
+
 async def _maybe_announce_tg_alerts(db, session, settings) -> None:
     """BL-NEW-TG-ALERT-ALLOWLIST: first-deploy operator announcement.
 
@@ -1701,53 +1749,7 @@ async def main(argv: list[str] | None = None) -> int:
 
                     # Hourly tasks: outcome check + DB prune
                     if now - last_outcome_check >= outcome_check_interval:
-                        try:
-                            outcomes_recorded = await check_outcomes(db, session)
-                            if outcomes_recorded:
-                                logger.info(
-                                    "Outcomes checked", recorded=outcomes_recorded
-                                )
-                        except Exception as e:
-                            logger.warning("Outcome check error", error=str(e))
-
-                        # Prune old candidates if DB > 500MB
-                        try:
-                            db_size = (
-                                settings.DB_PATH.stat().st_size
-                                if settings.DB_PATH.exists()
-                                else 0
-                            )
-                            if db_size > 500_000_000:
-                                pruned = await db.prune_old_candidates(keep_days=7)
-                                logger.info(
-                                    "db_pruned",
-                                    rows_deleted=pruned,
-                                    db_size_mb=round(db_size / 1e6, 1),
-                                )
-                        except Exception as e:
-                            logger.warning("DB prune error", error=str(e))
-
-                        try:
-                            await db.prune_perp_anomalies(
-                                keep_days=settings.PERP_ANOMALY_RETENTION_DAYS
-                            )
-                        except Exception as e:
-                            logger.warning("perp_anomaly_prune_error", error=str(e))
-
-                        # BL-053: prune CryptoPanic posts older than retention cap
-                        if settings.CRYPTOPANIC_ENABLED:
-                            try:
-                                pruned_cp = await db.prune_cryptopanic_posts(
-                                    keep_days=settings.CRYPTOPANIC_RETENTION_DAYS
-                                )
-                                if pruned_cp:
-                                    logger.info(
-                                        "cryptopanic_pruned",
-                                        rows_deleted=pruned_cp,
-                                    )
-                            except Exception:
-                                logger.exception("cryptopanic_prune_failed")
-
+                        await _run_hourly_maintenance(db, session, settings, logger)
                         last_outcome_check = now
 
                     # Daily summary at midnight UTC
