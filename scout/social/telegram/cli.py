@@ -28,7 +28,7 @@ import yaml
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
-from scout.config import Settings
+from scout.config import Settings, load_settings
 from scout.db import Database
 from scout.exceptions import TgSocialAuthError
 from scout.social.telegram.client import _resolve_secret
@@ -42,7 +42,7 @@ def _get_settings() -> Settings:
     # construct Settings manually with the flag forced True ONLY for the
     # auth-creds validator — the actual file-touching commands check creds
     # explicitly below.
-    s = Settings()
+    s = load_settings()
     return s
 
 

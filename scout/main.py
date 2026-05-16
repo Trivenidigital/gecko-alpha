@@ -16,7 +16,7 @@ from scout.alerter import format_daily_summary, send_alert, send_telegram_messag
 from scout.chains.events import safe_emit
 from scout.chains.patterns import seed_built_in_patterns
 from scout.chains.tracker import run_chain_tracker
-from scout.config import Settings, configure_cache
+from scout.config import Settings, configure_cache, load_settings
 from scout.counter.detail import fetch_coin_detail, extract_counter_data
 from scout.counter.flags import compute_memecoin_flags
 from scout.counter.scorer import score_counter_memecoin
@@ -1356,7 +1356,7 @@ async def main(argv: list[str] | None = None) -> int:
     # --check-config runs BEFORE any DB / HTTP / live subsystem wiring so
     # operators can introspect resolved live-trading knobs on a stopped host.
     if args.check_config:
-        s = Settings()
+        s = load_settings()
         lc = LiveConfig(s)
         print(f"LIVE_MODE={lc.mode}")
         print(f"live_signal_allowlist_set={sorted(s.live_signal_allowlist_set)}")
@@ -1381,7 +1381,7 @@ async def main(argv: list[str] | None = None) -> int:
         logger_factory=structlog.PrintLoggerFactory(),
     )
 
-    settings = Settings()
+    settings = load_settings()
     # Pre-populate the module-level settings cache to avoid async race
     # on first lazy get_settings() call during startup.
     configure_cache(settings)

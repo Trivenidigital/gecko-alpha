@@ -595,3 +595,44 @@ def test_retention_volume_must_exceed_secondwave_cooldown():
             VOLUME_SNAPSHOTS_RETENTION_DAYS=7,
             SECONDWAVE_COOLDOWN_MAX_DAYS=14,
         )
+
+
+def test_load_settings_logs_validation_error_before_raise():
+    """V4#1 fold: load_settings() must emit structured logger.error before
+    re-raising ValidationError, so the systemd Restart=always crash-loop has
+    a journalctl-visible cause line."""
+    import structlog
+    from pydantic import ValidationError as _VE
+    from scout.config import load_settings
+
+    with structlog.testing.capture_logs() as cap_logs:
+        with pytest.raises(_VE):
+            load_settings(
+                _env_file=None,
+                TELEGRAM_BOT_TOKEN="t",
+                TELEGRAM_CHAT_ID="c",
+                ANTHROPIC_API_KEY="k",
+                SCORE_HISTORY_RETENTION_DAYS=7,
+                SECONDWAVE_COOLDOWN_MAX_DAYS=14,
+            )
+
+    error_events = [
+        e for e in cap_logs if e.get("event") == "settings_validation_failed"
+    ]
+    assert len(error_events) == 1, f"expected 1 event, got {len(error_events)}: {cap_logs}"
+    assert "error" in error_events[0]
+    assert "SCORE_HISTORY_RETENTION_DAYS" in error_events[0]["error"]
+
+
+def test_load_settings_returns_normally_on_valid_input():
+    """load_settings() preserves Settings() return-value semantics when valid."""
+    from scout.config import load_settings
+
+    s = load_settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.SCORE_HISTORY_RETENTION_DAYS == 21
+    assert s.VOLUME_SNAPSHOTS_RETENTION_DAYS == 21

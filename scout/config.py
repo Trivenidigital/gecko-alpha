@@ -1182,3 +1182,29 @@ def configure_cache(settings: "Settings") -> None:
     """Pre-populate the settings cache at startup to avoid races."""
     global _CACHED_SETTINGS
     _CACHED_SETTINGS = settings
+
+
+def load_settings(**kwargs) -> "Settings":
+    """Construct Settings() but emit structured logger.error before re-raise on
+    ValidationError, so the systemd Restart=always crash-loop has a
+    journalctl-visible cause line.
+
+    V4#1 review fold (tasks/design_score_volume_pruning_harden.md §D2):
+    operators running with bad .env see a clear ``settings_validation_failed``
+    event in journalctl rather than a bare Pydantic stack trace inside an
+    infinite 10s respawn loop. Curl-direct active-push alert is deferred to
+    BL-NEW-SETTINGS-VALIDATION-ALERT.
+
+    ``**kwargs`` are forwarded to ``Settings(...)`` so tests can inject
+    deliberate validator violations without env-mutation side effects.
+    """
+    import structlog  # local import — config.py stays structlog-free at module load
+    from pydantic import ValidationError as _ValidationError
+
+    try:
+        return Settings(**kwargs)
+    except _ValidationError as exc:
+        structlog.get_logger().error(
+            "settings_validation_failed", error=str(exc)
+        )
+        raise
