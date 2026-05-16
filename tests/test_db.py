@@ -51,6 +51,88 @@ async def test_prune_volume_snapshots_uses_scanned_at_index(db):
     ), f"Index not used: {plan_str}"
 
 
+async def test_prune_score_history_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    recent = (now - timedelta(days=5)).isoformat()
+    old = (now - timedelta(days=20)).isoformat()
+    await db._conn.execute(
+        "INSERT INTO score_history (contract_address, score, scanned_at) VALUES (?, ?, ?)",
+        ("0xRECENT", 50.0, recent),
+    )
+    await db._conn.execute(
+        "INSERT INTO score_history (contract_address, score, scanned_at) VALUES (?, ?, ?)",
+        ("0xOLD", 50.0, old),
+    )
+    await db._conn.commit()
+
+    deleted = await db.prune_score_history(keep_days=14)
+
+    assert deleted == 1
+    cur = await db._conn.execute("SELECT contract_address FROM score_history")
+    rows = await cur.fetchall()
+    assert [r[0] for r in rows] == ["0xRECENT"]
+
+
+async def test_prune_score_history_empty_table_returns_zero(db):
+    deleted = await db.prune_score_history(keep_days=14)
+    assert deleted == 0
+
+
+async def test_prune_score_history_keep_days_zero_deletes_all(db):
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        "INSERT INTO score_history (contract_address, score, scanned_at) VALUES (?, ?, ?)",
+        ("0xANY", 50.0, now),
+    )
+    await db._conn.commit()
+    deleted = await db.prune_score_history(keep_days=0)
+    assert deleted == 1
+
+
+async def test_prune_score_history_tie_on_cutoff_deletes(db):
+    """V1#11 fold: lock in <= semantic. Row with scanned_at == cutoff must be pruned.
+
+    Matches cryptopanic_posts boundary semantic at db.py:4754-4758 (Windows
+    clock-tie). If a future PR flips to <, this test catches it.
+    """
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(days=14)
+    cutoff_iso = cutoff_dt.isoformat()
+    await db._conn.execute(
+        "INSERT INTO score_history (contract_address, score, scanned_at) VALUES (?, ?, ?)",
+        ("0xTIE", 50.0, cutoff_iso),
+    )
+    await db._conn.commit()
+    deleted = await db.prune_score_history(keep_days=14)
+    assert deleted == 1
+
+
+async def test_prune_volume_snapshots_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    recent = (now - timedelta(days=5)).isoformat()
+    old = (now - timedelta(days=20)).isoformat()
+    await db._conn.execute(
+        "INSERT INTO volume_snapshots (contract_address, volume_24h_usd, scanned_at) VALUES (?, ?, ?)",
+        ("0xRECENT", 100000.0, recent),
+    )
+    await db._conn.execute(
+        "INSERT INTO volume_snapshots (contract_address, volume_24h_usd, scanned_at) VALUES (?, ?, ?)",
+        ("0xOLD", 100000.0, old),
+    )
+    await db._conn.commit()
+
+    deleted = await db.prune_volume_snapshots(keep_days=14)
+
+    assert deleted == 1
+    cur = await db._conn.execute("SELECT contract_address FROM volume_snapshots")
+    rows = await cur.fetchall()
+    assert [r[0] for r in rows] == ["0xRECENT"]
+
+
+async def test_prune_volume_snapshots_empty_table_returns_zero(db):
+    deleted = await db.prune_volume_snapshots(keep_days=14)
+    assert deleted == 0
+
+
 async def test_upsert_and_retrieve(db, token_factory):
     token = token_factory(quant_score=75)
     await db.upsert_candidate(token)

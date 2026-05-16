@@ -4799,6 +4799,44 @@ class Database:
         await self._conn.commit()
         return cur.rowcount or 0
 
+    async def prune_score_history(self, *, keep_days: int) -> int:
+        """Delete ``score_history`` rows older than ``keep_days``. Returns rowcount.
+
+        BL-NEW-SCORE-HISTORY-PRUNING. Uses ``<=`` so that scanned_at == cutoff
+        prunes (matches ``prune_cryptopanic_posts`` boundary semantic at
+        db.py:4754-4758 — keep_days=0 means "retain nothing as old as now").
+
+        Return-type contract (V1#3 fold): ``cur.rowcount or 0`` — matches
+        sibling ``prune_perp_anomalies`` above. Diverges from
+        ``prune_cryptopanic_posts`` (no ``or 0``); existing inconsistency in
+        the codebase. We follow the safer coalesce-to-zero form.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM score_history WHERE scanned_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_volume_snapshots(self, *, keep_days: int) -> int:
+        """Delete ``volume_snapshots`` rows older than ``keep_days``. Returns rowcount.
+
+        BL-NEW-VOLUME-SNAPSHOTS-PRUNING. Same shape + contract as
+        ``prune_score_history`` above.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM volume_snapshots WHERE scanned_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
     # ------------------------------------------------------------------
     # CryptoPanic posts
     # ------------------------------------------------------------------
