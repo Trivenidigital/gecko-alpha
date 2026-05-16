@@ -29,6 +29,13 @@ def _make_db_mock(score_pruned: int = 0, volume_pruned: int = 0) -> MagicMock:
     db.prune_cryptopanic_posts = AsyncMock(return_value=0)
     db.prune_score_history = AsyncMock(return_value=score_pruned)
     db.prune_volume_snapshots = AsyncMock(return_value=volume_pruned)
+    # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION cycle 2: 6 new prune methods
+    db.prune_volume_spikes = AsyncMock(return_value=0)
+    db.prune_momentum_7d = AsyncMock(return_value=0)
+    db.prune_trending_snapshots = AsyncMock(return_value=0)
+    db.prune_learn_logs = AsyncMock(return_value=0)
+    db.prune_chain_matches = AsyncMock(return_value=0)
+    db.prune_holder_snapshots = AsyncMock(return_value=0)
     return db
 
 
@@ -97,6 +104,38 @@ async def test_run_hourly_maintenance_silent_when_zero_rows(tmp_path):
     ]
     assert "score_history_pruned" not in debug_events
     assert "volume_snapshots_pruned" not in debug_events
+
+
+@pytest.mark.parametrize(
+    "prune_method,retention_attr",
+    [
+        ("prune_volume_spikes", "VOLUME_SPIKES_RETENTION_DAYS"),
+        ("prune_momentum_7d", "MOMENTUM_7D_RETENTION_DAYS"),
+        ("prune_trending_snapshots", "TRENDING_SNAPSHOTS_RETENTION_DAYS"),
+        ("prune_learn_logs", "LEARN_LOGS_RETENTION_DAYS"),
+        ("prune_chain_matches", "CHAIN_MATCHES_RETENTION_DAYS"),
+        ("prune_holder_snapshots", "HOLDER_SNAPSHOTS_RETENTION_DAYS"),
+    ],
+)
+async def test_run_hourly_maintenance_calls_narrative_table_prune(
+    tmp_path, prune_method, retention_attr
+):
+    """BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION cycle 2: _run_hourly_maintenance
+    must call each of the 6 new prune methods with the configured Settings
+    retention.
+    """
+    settings = _make_settings(tmp_path)
+    db = _make_db_mock()
+    session = MagicMock()
+    logger = MagicMock()
+
+    await _run_hourly_maintenance(db, session, settings, logger)
+
+    expected_keep_days = getattr(settings, retention_attr)
+    getattr(db, prune_method).assert_awaited_once_with(keep_days=expected_keep_days)
+
+
+import pytest  # placed at end intentionally to keep diff small
 
 
 async def test_run_hourly_maintenance_exception_path_logs_structured(tmp_path):

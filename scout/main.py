@@ -1270,6 +1270,33 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
     except Exception:
         logger.exception("volume_snapshots_prune_failed")
 
+    # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 6 narrative-owned
+    # tables parameterized + decoupled from narrative daily loop.
+    # NOTE: cycle 1's score_history + volume_snapshots prunes above are
+    # intentionally kept as explicit blocks. Cycle 2's 6-table loop below
+    # uses the DRYer form. Do NOT collapse them — bisect-friendly cycle-1
+    # history (D8 SHOULD-FIX #5 fold).
+    for prune_name, retention_attr in [
+        ("prune_volume_spikes", "VOLUME_SPIKES_RETENTION_DAYS"),
+        ("prune_momentum_7d", "MOMENTUM_7D_RETENTION_DAYS"),
+        ("prune_trending_snapshots", "TRENDING_SNAPSHOTS_RETENTION_DAYS"),
+        ("prune_learn_logs", "LEARN_LOGS_RETENTION_DAYS"),
+        ("prune_chain_matches", "CHAIN_MATCHES_RETENTION_DAYS"),
+        ("prune_holder_snapshots", "HOLDER_SNAPSHOTS_RETENTION_DAYS"),
+    ]:
+        event_base = prune_name.removeprefix("prune_")
+        try:
+            keep_days = getattr(settings, retention_attr)
+            rows = await getattr(db, prune_name)(keep_days=keep_days)
+            if rows:
+                logger.info(
+                    f"{event_base}_pruned",
+                    rows_deleted=rows,
+                    keep_days=keep_days,
+                )
+        except Exception:
+            logger.exception(f"{event_base}_prune_failed")
+
 
 async def _maybe_announce_tg_alerts(db, session, settings) -> None:
     """BL-NEW-TG-ALERT-ALLOWLIST: first-deploy operator announcement.
