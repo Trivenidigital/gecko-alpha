@@ -1,4 +1,4 @@
-**New primitives introduced:** `Database.probe_wal_state()` method returning `dict` with `wal_size_bytes`, `wal_pages`, `db_size_bytes`, `freelist_count`, `journal_mode`, `wal_autocheckpoint`. Structured log events `sqlite_wal_probe` (info, hourly) and `sqlite_wal_bloat_observed` (warning, threshold breach). New `SQLITE_WAL_PROFILE_ENABLED: bool = True` Settings flag + `SQLITE_WAL_BLOAT_BYTES: int = 50_000_000` threshold setting. Hourly hook in `_run_hourly_maintenance`. Operator helper `scripts/wal_summary.sh` (mirrors cycle 3's `tg_burst_summary.sh` shape). Filed follow-up `BL-NEW-SQLITE-WAL-TUNING-DECISION` with pre-registered criteria.
+**New primitives introduced:** `Database.probe_wal_state()` method returning `dict` with `wal_size_bytes`, `wal_pages`, `shm_size_bytes` (V20#3 fold), `db_size_bytes`, `freelist_count`, `journal_mode`, `wal_autocheckpoint`. Structured log events `sqlite_wal_probe` (debug, hourly — V21 fold log-level parity with cycle 3) and `sqlite_wal_bloat_observed` (warning, threshold breach). New `SQLITE_WAL_PROFILE_ENABLED: bool = True` Settings flag + `SQLITE_WAL_BLOAT_BYTES: int = 50_000_000` threshold setting. Hourly hook in `_run_hourly_maintenance`. Operator helper `scripts/wal_summary.sh` with longest-consecutive-run aggregator (V20 SHOULD-FIX fold) + `scripts/wal_archive.sh` weekly cron. Filed follow-up `BL-NEW-SQLITE-WAL-TUNING-DECISION` with pre-registered criteria. Week-1 baseline-calibration documented (V21#2 fold) — operator reads steady-state from probes then tunes `SQLITE_WAL_BLOAT_BYTES` to ~1.5×p95.
 
 # Plan: BL-NEW-SQLITE-WAL-PROFILE — instrument SQLite WAL bloat
 
@@ -10,16 +10,27 @@
 
 **Tech Stack:** aiosqlite (existing), structlog, Pydantic Settings.
 
+## Week-1 baseline calibration (V21 MUST-FIX #2 fold)
+
+The `SQLITE_WAL_BLOAT_BYTES = 50_000_000` default is a Rorschach threshold without empirical baseline. **Operator procedure:**
+
+1. Deploy with default. `sqlite_wal_probe` events emit at DEBUG every hour for week 1.
+2. After 168 probes (~1 week): `scripts/wal_summary.sh 168` reports `p50 / p95 / max wal_size_bytes`.
+3. Operator sets `SQLITE_WAL_BLOAT_BYTES` in `.env` to `ceil(p95 × 1.5)` rounded to nearest 5MB. Restarts service.
+4. Weeks 2-4 run with the tuned threshold; `sqlite_wal_bloat_observed` now meaningful.
+
+If operator skips calibration: default 50MB stays in effect. False-positive rate depends on actual baseline; document in the BL follow-up.
+
 ## Decision criteria (pre-registered per V14 anchor)
 
-After the 4-week measurement window (~2026-06-14):
+After the full 4-week measurement window (~2026-06-14) with the operator-tuned threshold from Week-1 calibration:
 
 | Condition | Action |
 |---|---|
-| `sqlite_wal_bloat_observed` fires sustained (≥12 consecutive hourly probes with wal_size_bytes > `SQLITE_WAL_BLOAT_BYTES`) | **TUNE** — lower `wal_autocheckpoint` from default 1000 pages OR add explicit `PRAGMA wal_checkpoint(TRUNCATE)` after each hourly prune |
-| Any single probe shows wal_size_bytes > 500MB | **TUNE-IMMEDIATELY** — escalate, runaway WAL |
-| freelist_count > 10% of total db pages sustained | **VACUUM scheduled** (separate scope) |
-| Zero bloat events in 4 weeks | **ACCEPT** (default config sufficient at observed load) |
+| **WAL bloat sustained**: `sqlite_wal_bloat_observed` fires on ≥12 STRICTLY consecutive hourly probes (V21#3 fold — any dip below threshold resets the streak; `wal_summary.sh` reports max consecutive-run length per the awk-aggregator, V20 SHOULD-FIX fold) | **TUNE** — lower `wal_autocheckpoint` from default 1000 pages OR add explicit `PRAGMA wal_checkpoint(TRUNCATE)` after each hourly prune |
+| **Runaway WAL**: any single probe shows `wal_size_bytes > 500MB` | **TUNE-IMMEDIATELY** — escalate; runaway detection |
+| **DB-file fragmentation**: `freelist_count > 0.10 × page_count` on ANY single probe (V21#1 fold — freelist is monotonic-until-VACUUM, "sustained" was operationally undefined; one-shot trigger is the right shape) | **VACUUM scheduled** (separate scope; file BL-NEW-SQLITE-VACUUM-SCHEDULE) |
+| **Zero events**: zero `sqlite_wal_bloat_observed` AND zero freelist-trip AND zero runaway events in the 4-week window after Week-1 calibration | **ACCEPT** (default config sufficient at observed load) |
 
 Filed `BL-NEW-SQLITE-WAL-TUNING-DECISION` with these criteria + memory checkpoint for 2026-06-14.
 
@@ -41,6 +52,17 @@ awesome-hermes-agent: 404 (consistent). **Verdict:** custom-code path; mirror cy
 - `scout/db.py:86 PRAGMA journal_mode=WAL` already enabled at initialize. Default `wal_autocheckpoint = 1000 pages`; default `journal_size_limit = -1` (no limit). Net-new instrumentation surface.
 
 Backlog: `BL-NEW-SQLITE-WAL-PROFILE` filed 2026-05-13 from BL-NEW-CYCLE-CHANGE-AUDIT. decision-by 8 weeks. This PR measures; the follow-up `BL-NEW-SQLITE-WAL-TUNING-DECISION` files the decision.
+
+## Reader-window analysis (V21 SHOULD-FIX fold)
+
+| Consumer | What it reads | Window |
+|---|---|---|
+| Operator (manual) | `journalctl ... \| grep sqlite_wal_probe` (DEBUG-level — requires `-p debug` flag) | journalctl default ~30d retention |
+| Operator (manual) | `journalctl ... \| grep sqlite_wal_bloat_observed` (WARNING — always visible) | same |
+| `scripts/wal_summary.sh` aggregator | both events from journalctl + archive | 4-week window via archive |
+| Follow-up TUNE decision (out of scope) | aggregated event counts | TBD post-measurement |
+
+No code consumer. Same shape as cycle 3 — operator-only via journalctl + archive.
 
 ---
 
@@ -96,14 +118,25 @@ async def db(tmp_path):
 
 async def test_probe_wal_state_returns_required_fields(db):
     state = await db.probe_wal_state()
-    assert "wal_size_bytes" in state
-    assert "wal_pages" in state
-    assert "db_size_bytes" in state
-    assert "freelist_count" in state
-    assert "journal_mode" in state
-    assert state["journal_mode"] == "wal"  # PRAGMA journal_mode=WAL set in initialize
-    assert "wal_autocheckpoint" in state
+    # V20 SHOULD-FIX: explicit type assertions catch future PRAGMA driver
+    # changes (e.g., None returns) that would otherwise be papered over.
+    assert isinstance(state["wal_size_bytes"], int)
+    assert isinstance(state["wal_pages"], int)
+    assert isinstance(state["shm_size_bytes"], int)
+    assert isinstance(state["db_size_bytes"], int)
+    assert isinstance(state["page_count"], int)
+    assert isinstance(state["page_size"], int)
+    assert isinstance(state["freelist_count"], int)
     assert isinstance(state["wal_autocheckpoint"], int)
+    # V20 MUST-FIX #2: defensive lowercase compare
+    assert state["journal_mode"] == "wal", (
+        f"journal_mode={state['journal_mode']!r} — WAL mode silently rejected? "
+        f"PRAGMA journal_mode=WAL is set in Database.initialize()"
+    )
+    # Non-negative sanity
+    assert state["wal_size_bytes"] >= 0
+    assert state["shm_size_bytes"] >= 0
+    assert state["page_count"] > 0  # tables exist post-initialize
 
 
 async def test_probe_wal_state_after_writes(db, token_factory):
@@ -148,14 +181,24 @@ async def test_probe_wal_state_wal_file_size_matches_stat(db):
 - [ ] **Step 1.4: Add `Database.probe_wal_state()`** in `scout/db.py` (near `prune_score_history`):
 
 ```python
+    # ------------------------------------------------------------------
+    # Observability — measurement-only methods (no DB mutations)
+    # ------------------------------------------------------------------
+
     async def probe_wal_state(self) -> dict:
         """Read SQLite WAL + DB size pragmas for observability.
 
         BL-NEW-SQLITE-WAL-PROFILE cycle 4. Called hourly from
         scout.main._run_hourly_maintenance to detect WAL bloat. Returns
-        structured dict for log emission; does NOT trigger checkpoints
-        (measurement only — operator decides TUNE-vs-ACCEPT after 4-week
-        soak per BL-NEW-SQLITE-WAL-TUNING-DECISION).
+        a structured dict for log emission; values are near-real-time and
+        may lag pending writes by ms-scale (V20 fold concurrency note).
+
+        V20 PR-review MUST-FIX #1: `PRAGMA wal_autocheckpoint` (no arg)
+        has a documented checkpoint side-effect — it triggers a passive
+        checkpoint if the page-count threshold is currently exceeded.
+        We use the table-valued `pragma_wal_autocheckpoint` form to read
+        the value WITHOUT side effects. Per SQLite docs:
+        https://www.sqlite.org/pragma.html#pragma_wal_autocheckpoint
         """
         if self._conn is None:
             raise RuntimeError("Database not initialized")
@@ -166,25 +209,42 @@ async def test_probe_wal_state_wal_file_size_matches_stat(db):
             row = await cur.fetchone()
             return row[0] if row else None
 
-        journal_mode = await _pragma("journal_mode")
+        # `journal_mode` is a pure read when called with no argument; SQLite
+        # returns the mode normalized to lowercase. Apply .lower() defensively
+        # in case driver normalization differs (V20 MUST-FIX #2).
+        jm_raw = await _pragma("journal_mode")
+        journal_mode = str(jm_raw).lower() if jm_raw is not None else None
         page_count = int(await _pragma("page_count") or 0)
         page_size = int(await _pragma("page_size") or 4096)
         freelist_count = int(await _pragma("freelist_count") or 0)
-        wal_autocheckpoint = int(await _pragma("wal_autocheckpoint") or 0)
 
-        # WAL file size from filesystem (sidecar `<db>-wal`)
+        # V20 MUST-FIX #1: read autocheckpoint via table-valued function form
+        # (pure read, no side effect) instead of `PRAGMA wal_autocheckpoint`
+        # which can trigger a checkpoint as a side effect.
+        cur = await self._conn.execute("SELECT * FROM pragma_wal_autocheckpoint")
+        ac_row = await cur.fetchone()
+        wal_autocheckpoint = int(ac_row[0]) if ac_row else 0
+
+        # WAL + SHM file sizes from filesystem (sidecars `<db>-wal`, `<db>-shm`)
         wal_path = self._db_path + "-wal"
+        shm_path = self._db_path + "-shm"
         wal_size_bytes = (
             os.path.getsize(wal_path) if os.path.exists(wal_path) else 0
+        )
+        shm_size_bytes = (
+            os.path.getsize(shm_path) if os.path.exists(shm_path) else 0
         )
         wal_pages = wal_size_bytes // page_size if page_size else 0
 
         return {
             "wal_size_bytes": wal_size_bytes,
             "wal_pages": wal_pages,
+            "shm_size_bytes": shm_size_bytes,  # V20#3 fold
             "db_size_bytes": page_count * page_size,
+            "page_count": page_count,
+            "page_size": page_size,
             "freelist_count": freelist_count,
-            "journal_mode": str(journal_mode) if journal_mode else None,
+            "journal_mode": journal_mode,
             "wal_autocheckpoint": wal_autocheckpoint,
         }
 ```
@@ -249,10 +309,13 @@ async def test_run_hourly_maintenance_skips_wal_probe_when_disabled(tmp_path):
 
 ```python
     # BL-NEW-SQLITE-WAL-PROFILE cycle 4: hourly WAL state probe.
+    # V21 SHOULD-FIX fold: emit at DEBUG to keep journalctl clean
+    # (matches cycle 3 tg_dispatch_observed downgrade rationale). Bloat
+    # event stays at WARNING — that's the actionable signal.
     if settings.SQLITE_WAL_PROFILE_ENABLED:
         try:
             state = await db.probe_wal_state()
-            logger.info("sqlite_wal_probe", **state)
+            logger.debug("sqlite_wal_probe", **state)
             if state.get("wal_size_bytes", 0) > settings.SQLITE_WAL_BLOAT_BYTES:
                 logger.warning(
                     "sqlite_wal_bloat_observed",
@@ -271,7 +334,58 @@ async def test_run_hourly_maintenance_skips_wal_probe_when_disabled(tmp_path):
 
 **Files:** `scripts/wal_summary.sh`, `scripts/wal_archive.sh`
 
-Mirror cycle 3's `tg_burst_summary.sh` + `tg_burst_archive.sh` shape. Archive: weekly cron, dated filename rotation, same-day re-run appends `.N` suffix, 8-week retention. Summary: time-of-day histogram, max WAL size, percent-of-probes-over-threshold.
+Mirror cycle 3's `tg_burst_summary.sh` + `tg_burst_archive.sh` shape. Archive: weekly cron, dated filename rotation, same-day re-run appends `.N` suffix, 8-week retention, filename-date-based rotation (not mtime). Summary script reads journalctl `-p debug` AND archive (since probe is DEBUG-level per V21 fold).
+
+**V20 SHOULD-FIX fold — longest-consecutive-run aggregator in `wal_summary.sh`:**
+
+```bash
+# Compute longest consecutive-run of bloat events from journalctl/archive.
+# Pre-registered TUNE criterion (≥12 strictly consecutive hourly probes) per
+# plan §Decision criteria. Each hourly probe is ~1h apart; "consecutive"
+# means gap ≤ 90 minutes between sorted timestamps.
+COMBINED_BLOAT=$(printf "%s\n" "$COMBINED" | grep '"event": "sqlite_wal_bloat_observed"' | jq -r '.timestamp' | sort)
+MAX_RUN=$(printf "%s\n" "$COMBINED_BLOAT" | awk '
+BEGIN { run = 0; max = 0; prev = 0 }
+{
+    cmd = "date -d \"" $0 "\" +%s"
+    cmd | getline ts
+    close(cmd)
+    if (prev == 0 || ts - prev <= 5400) {
+        run++
+    } else {
+        if (run > max) max = run
+        run = 1
+    }
+    prev = ts
+}
+END {
+    if (run > max) max = run
+    print max
+}')
+echo "Longest consecutive-run of bloat events: $MAX_RUN"
+echo "(Pre-registered TUNE threshold: ≥12 consecutive)"
+```
+
+Output gives operator a one-line answer to the TUNE criterion.
+
+- [ ] Add Week-1 baseline section to `wal_summary.sh` for first-pass calibration:
+
+```bash
+echo "--- Week-1 baseline calibration ---"
+# p50/p95/max wal_size_bytes from sqlite_wal_probe events
+P_OUTPUT=$(printf "%s\n" "$COMBINED" | grep '"event": "sqlite_wal_probe"' | jq -r '.wal_size_bytes' | sort -n)
+if [[ -n "$P_OUTPUT" ]]; then
+    N=$(printf "%s\n" "$P_OUTPUT" | wc -l)
+    P50=$(printf "%s\n" "$P_OUTPUT" | awk -v n="$N" 'NR == int(n/2)+1')
+    P95=$(printf "%s\n" "$P_OUTPUT" | awk -v n="$N" 'NR == int(n*0.95)+1')
+    MAX=$(printf "%s\n" "$P_OUTPUT" | tail -1)
+    echo "  p50 wal_size_bytes: $P50"
+    echo "  p95 wal_size_bytes: $P95"
+    echo "  max wal_size_bytes: $MAX"
+    SUGGESTED=$(awk -v p="$P95" 'BEGIN { print int((p * 1.5 + 4999999) / 5000000) * 5000000 }')
+    echo "  Suggested SQLITE_WAL_BLOAT_BYTES (~1.5× p95, rounded to 5MB): $SUGGESTED"
+fi
+```
 
 - [ ] Implement + chmod +x + commit
 
@@ -301,10 +415,11 @@ Total: 8 new tests.
 
 1. journalctl retention probe (informational; archive cron runs regardless)
 2. Install `wal_archive.sh` cron unconditionally + mkdir/chmod
-3. Restart + verify `sqlite_wal_probe` fires within first hour
+3. Restart + verify `sqlite_wal_probe` (DEBUG) emits within first hour: `journalctl -u gecko-pipeline --since "5 minutes ago" -p debug | grep sqlite_wal_probe | head -3`
 4. `wal_summary.sh 1` smoke test
 5. Memory checkpoint already filed pre-merge
-6. Pre-registered review at 2026-06-14
+6. **Week-1 baseline calibration reminder** in memory checkpoint + BL follow-up: at ~2026-05-24 (7 days post-deploy), operator runs `wal_summary.sh 168` and sets `SQLITE_WAL_BLOAT_BYTES` per the script's suggested value
+7. Pre-registered review at 2026-06-14
 
 ---
 
