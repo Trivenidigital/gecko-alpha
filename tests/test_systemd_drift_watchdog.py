@@ -33,7 +33,7 @@ WATCHDOG_SCRIPT = REPO_ROOT / "scripts" / "systemd-drift-watchdog.sh"
 def _make_uv_stub(tmp_path: Path) -> tuple[Path, Path]:
     """Mirrors tests/test_backup_rotate_script.py:354-364 verbatim."""
     stub_dir = tmp_path / "stubs"
-    stub_dir.mkdir()
+    stub_dir.mkdir(exist_ok=True)
     stub = stub_dir / "uv"
     marker = tmp_path / "alert_marker"
     quoted_marker = shlex.quote(str(marker))
