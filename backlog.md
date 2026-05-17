@@ -1507,10 +1507,25 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **decision-by:** 6 weeks (audit-first task; doc-only outputs).
 
 ### BL-NEW-CHAIN-COMPLETED-SILENCE-AUDIT: investigate 10+ day chain_completed silence
-**Status:** PROPOSED 2026-05-17 — Finding 1 from BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT (cycle 7).
-**Why:** `chain_completed` is Tier 1a "strongest cohort" but last opened a trade 2026-05-07 (10+ days dead). Either: (a) chain-pattern detector regression in `scout/scoring/chain_completed.py` or upstream `chain_matches` writer; (b) genuinely quiet 10-day window for the pattern; (c) auto-suspend (would show in `signal_params` table).
-**Action:** ~1h. (i) `journalctl -g chain_completed --since "10 days ago"` for the window; (ii) `SELECT COUNT(*), MAX(completed_at) FROM chain_matches WHERE completed_at >= '2026-05-07'` — empty result = detection broke; (iii) `SELECT * FROM signal_params WHERE signal_type='chain_completed' AND enabled=0` — non-empty = auto-suspended. If (i)/(ii) reveal regression, file fix as separate item.
-**decision-by:** 2 weeks (low cost; high-tier signal silence shouldn't sit unresolved).
+**Status:** SHIPPED-WITH-FINDING 2026-05-17 — branch `feat/chain-completed-silence-audit` (cycle 8, audit-only). Findings doc: `tasks/findings_chain_completed_silence_2026_05_17.md`. **Confirmed regression:** chain_matches narrative pipeline silent 5.5d (last 2026-05-11T16:43Z); memecoin pipeline silent 13d (last 2026-05-04T00:51Z). active_chains MAX(anchor_time)=2026-05-11T16:42Z (no new anchors); signal_params enabled=1 (NOT auto-suspended); code path unchanged in May. Mechanism per §9c: visible levers (enabled=1, code unchanged) ≠ controlling lever (something stopped creating new active_chains rows). Surfaced as HIGH-priority fix item `BL-NEW-CHAIN-ANCHOR-PIPELINE-FIX`. Second chain-pipeline silence in ~6 weeks (prior: 2026-04-14→2026-05-01, 17d, fixed PR #60/#61); same substrate class.
+
+**Original status (now historical):** PROPOSED 2026-05-17 — Finding 1 from BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT (cycle 7).
+
+### BL-NEW-CHAIN-ANCHOR-PIPELINE-FIX: restore chain-anchor matching (regression inside `_check_active_chains`)
+**Status:** PROPOSED 2026-05-17 — surfaced by BL-NEW-CHAIN-COMPLETED-SILENCE-AUDIT (cycle 8) as HIGH-priority follow-up. **V37 audit-review fold:** mechanism updated.
+**Tag:** `regression` `silent-failure` `tier-1a-down` `chain-detection` `recurrence`
+**Why:** Tier 1a's strongest signal (`chain_completed`) has been STRUCTURALLY DEAD for 5.5+ days. `active_chains` MAX(anchor_time)=2026-05-11T16:42Z; no new anchors since.
+**Mechanism per §9c (V37-corrected):** narrative pipeline anchor event `category_heating` IS firing today (1,805 lifetime events; last 2026-05-17T07:04Z, 7min before this audit). ALL upstream step events for narrative are LIVE. So the break is NOT upstream — it's INSIDE the chain-step-matching logic in `chains.tracker._check_active_chains` OR the `active_chains` writer. Possible mechanisms: (a) anchor match logic recently rejects what used to match (payload schema drift), (b) `INSERT INTO active_chains` silently fails (cooldown dedup, conviction_boost gate), (c) anchors are created but immediately marked complete with 0 steps and pruned. **Truncate/prune ruled out** by per-day rowcount (`SELECT substr(anchor_time,1,10), COUNT(*) FROM active_chains GROUP BY 1` shows zero new rows post-2026-05-11, not declining-over-time).
+**Action:** ~3-5h diagnostic + fix.
+(i) **Memecoin pipeline diagnostic** (dead 13+d, since 2026-05-04T00:26Z): disjoint anchor event set from narrative. Two different last-fire dates from two different upstream emitter sets → likely TWO separate failures. Drill each separately:
+   - For memecoin: confirm memecoin pattern's step-1 anchor event_type by reading `scout/chains/patterns.py`; verify those event_types fire in signal_events post-2026-05-04.
+   - For narrative: anchor `category_heating` fires today; instrument `chains.tracker._check_active_chains` to log step-1 match attempts + reasons-for-non-match.
+(ii) Trace `_record_anchor` (or equivalent): is the INSERT executing? Cooldown dedup query result?
+(iii) Compare pattern step-1 payload at 2026-05-11T16:42Z (last working) vs current — schema drift?
+(iv) Add `active_chains_write_rate` watchdog SLO as part of fix.
+**Cheap interim check (V37 SHOULD-FIX):** operator runs `SELECT event_type, pipeline, MAX(created_at) FROM signal_events GROUP BY 1,2` in morning checks — surfaces continued silence at signal-event granularity.
+**Recurrence prior art:** `project_chain_revival_2026_05_03.md` — April 14 → May 1 (17 days dead). Same substrate class. PR #60/#61 fix history may guide diagnosis.
+**decision-by:** 1 week (HIGH priority — Tier 1a outage; cohort digest (cycle 5) renders `chain_completed` as `near-identical` so the digest doesn't even surface the outage at the cohort-comparison layer).
 
 ### BL-NEW-FIRST-SIGNAL-RETIREMENT-DECISION: decide whether first_signal stays or retires
 **Status:** PROPOSED 2026-05-17 — Finding 3 from BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT (cycle 7, post-V36 fold).
