@@ -23,6 +23,31 @@ awesome-hermes-agent: 404 (consistent). **Verdict:** custom-code path is the rig
 
 Per-`chat_id`-only aggregation loses callsite attribution. With 13+ dispatch sites all writing to the same `TELEGRAM_CHAT_ID`, the operator can't tell whether a burst came from BL-064 social fan-out, daily-summary, or auto-suspend. Keying the counter on `(chat_id, source)` keeps the rolling-window semantics per-callsite. `source:` kwarg added to `send_telegram_message` with default `"unattributed"` for legacy callers — hot callsites get explicit labels in a follow-up commit (see plan Task 3 step 3.3).
 
+**V15 S1 fold — caller audit recorded:** all 6 representative callers verified to use 3-positional + keyword form (no positional-collision risk on the new `source` kwarg):
+
+| Site | Pattern |
+|---|---|
+| `scout/trading/auto_suspend.py:266-273, 322-328` | `send_telegram_message(text, session, settings, parse_mode=None)` |
+| `scout/main.py:1526-1537` (daily summary) | `(text, session, settings, parse_mode=None)` |
+| `scout/trading/calibrate.py:354-359` | `(text, session, settings, parse_mode=None)` |
+| `scout/trading/weekly_digest.py:335-337, 342-347` (chunked) | `(chunk, session, settings, parse_mode=None)` |
+| `scout/secondwave/detector.py:283-285` | `(text, session, settings, parse_mode=None)` |
+| `scout/trading/tg_alert_dispatch.py:333-339` | `(text, session, settings, parse_mode=None)` |
+
+All six pass `parse_mode` as keyword (post §2.9 fix). Adding `source:` keyword-only is contract-safe.
+
+### D1b. Known false-positive: `weekly_digest` multi-chunk loop (V15 S2 fold)
+
+`scout/trading/weekly_digest.py:334-337` loops `for chunk in chunks: await send_telegram_message(...)`. Each iteration acquires the lock and counts; two consecutive chunks within <1s trip `breached_1s` deterministically every Friday. Same shape applies to any future chunked sender (`scout/main.py:351,434` daily summary).
+
+**Decision:** do NOT suppress at counter-emit time. Document in the decision-criteria table (D5 + plan):
+
+- `breached_1s` events on `source` ∈ {`weekly-digest`, `daily-summary`} are EXPECTED — not a pacing trigger.
+- The pre-registered PACE criteria (D5) require either a 429 OR >50/week sustained group-chat bursts, both of which exclude single-source chunk-loop noise.
+- Operator analysis via `tg_burst_summary.sh` can `grep -v 'source.*weekly-digest'` if the noise distracts.
+
+This is lighter than implementing suppression and respects the discipline "instrument first, decide later" — we want to SEE the chunked behavior in the data, not hide it.
+
 ### D2. Log-level discipline (V13 fold)
 
 `scout/main.py:1373` configures structlog without `filter_by_level` — every level emits to journalctl. Cycle 1 V4#4 fold established the pattern: emit only at INFO+ for routinely-fired events that shouldn't spam.
@@ -52,14 +77,44 @@ Telegram's 20/min limit applies to **group chats** (`chat_id` starts with `-`). 
 
 PACE-vs-ACCEPT thresholds anchored in the plan's "Decision criteria" section. Filed as `BL-NEW-TG-PACING-DECISION` with `decision-by: 2026-06-14` to ensure the measurement has a clear destination per memory `feedback_pre_registered_hypothesis_anchoring.md` ("measurement-only PRs ship telemetry no one ever queries" failure mode).
 
-### D6. 429 hook is separate from dispatch hook (V14 fold)
+### D6. 429 hook is separate from dispatch hook (V14 fold + V15 M2/M3 fold)
 
 `record_dispatch()` measures intent (call rate). `record_429()` measures Telegram's punishment response. The two are separate concerns:
 
 - Intent → bursts can happen without 429 if Telegram is lenient at that exact moment
 - Punishment → a single 429 is the only firm pacing trigger per V14 review
 
-Alerter calls `record_dispatch()` BEFORE the HTTP request (instrument the call) AND `record_429()` AFTER the response IF status == 429.
+**V15 M3 fold — response-stream ordering.** The alerter must `await resp.read()` ONCE (returning bytes), then parse json from those bytes for `retry_after`, then decode-for-logging. Calling both `resp.json()` and `resp.text()` would double-consume the stream.
+
+**V15 M2 fold — instrumentation can't crash the alerter.** Wrap the `record_429()` call in its own `try/except Exception: logger.exception("record_429_failed")` so a structlog regression or import failure in the observability module doesn't poison the existing alerter response handler. The outer alerter-wide try/except would catch it but mis-categorize as a Telegram-side error.
+
+**Final shape inside `send_telegram_message`:**
+
+```python
+async with session.post(url, json=payload) as resp:
+    body_bytes = await resp.read() if resp.status != 200 else None
+    if resp.status == 429 and body_bytes is not None:
+        retry_after = None
+        try:
+            body_json = json.loads(body_bytes)
+            retry_after = body_json.get("parameters", {}).get("retry_after")
+        except (json.JSONDecodeError, ValueError):
+            pass
+        if settings.TG_BURST_PROFILE_ENABLED:
+            try:
+                record_429(
+                    str(settings.TELEGRAM_CHAT_ID),
+                    source=source,
+                    retry_after=retry_after,
+                )
+            except Exception:
+                logger.exception("record_429_failed")
+    if resp.status != 200:
+        body = (
+            body_bytes.decode("utf-8", errors="replace")[:200] if body_bytes else ""
+        )
+        logger.warning(...)
+```
 
 ### D7. journalctl + archive script (V14#3 fold)
 
@@ -127,9 +182,32 @@ If the operator chooses to PACE after 4 weeks, that PR will introduce persistent
 
 ## Deployment verification (autonomous post-3-reviewer-fold)
 
-Already in plan §Deployment. Key checks:
+V16 fold — the cron install MUST be unconditional (not gated on the operator's read of the retention check). Sequence is:
 
-1. **journalctl retention sanity** before deploy: `ssh srilu-vps 'journalctl --disk-usage; systemctl show systemd-journald | grep -E "MaxRetention|MaxUse"'` → confirm at least 28d.
-2. Post-restart: `journalctl -u gecko-pipeline --since "5 minutes ago" -p debug | grep '"event": "tg_dispatch_observed"' | head -3` (note `-p debug`).
-3. Install archive cron on srilu.
-4. Pre-registered review at 2026-06-14 per `BL-NEW-TG-PACING-DECISION` criteria.
+1. **journalctl retention probe** (informational, not a gate):
+   ```
+   ssh srilu-vps 'systemctl show systemd-journald | awk -F= "/SystemMaxRetentionUsec|SystemMaxUse/ {print}"'
+   ```
+   Print result for the deploy log. If retention is unset (default), document the observed disk-usage. The archive cron runs regardless (V16 fold), so a low-retention journald doesn't block the deploy.
+
+2. **Install archive cron unconditionally** (V16 MUST-FIX #1):
+   ```
+   ssh srilu-vps 'crontab -l 2>/dev/null | grep -v tg_burst_archive | { cat; echo "30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh"; } | crontab -'
+   ssh srilu-vps 'mkdir -p /var/log/gecko-alpha/tg-burst-archive && chmod 0755 /var/log/gecko-alpha/tg-burst-archive'
+   ```
+
+3. **Restart + verify hook fires:**
+   ```
+   ssh srilu-vps 'systemctl restart gecko-pipeline && sleep 5 && systemctl is-active gecko-pipeline'
+   ssh srilu-vps 'journalctl -u gecko-pipeline --since "5 minutes ago" -p debug | grep "\"event\": \"tg_dispatch_observed\"" | head -3'
+   ```
+   Note `-p debug` since `tg_dispatch_observed` is DEBUG-level (V13 fold).
+
+4. **Smoke test the summary script:**
+   ```
+   ssh srilu-vps '/root/gecko-alpha/scripts/tg_burst_summary.sh 1'
+   ```
+
+5. **File memory checkpoint** (V16 MUST-FIX #2) — `project_tg_burst_pacing_checkpoint_2026_06_14.md` in `~/.claude/projects/.../memory/` with the pre-registered criteria + summary-script command + archive-dir pointer.
+
+6. **Pre-registered review at 2026-06-14** per `BL-NEW-TG-PACING-DECISION` criteria.

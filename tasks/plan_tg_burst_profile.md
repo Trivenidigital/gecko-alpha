@@ -449,64 +449,142 @@ from scout.alerter and scout.main to keep imports light."""
 
 **Files:** `scout/alerter.py`
 
-- [ ] **Step 3.1: Failing integration test in `tests/test_alerter.py`** (or new file `tests/test_alerter_tg_burst_hook.py`):
+- [ ] **Step 3.1: Failing integration test in `tests/test_alerter.py`** (extend existing file — uses the `aioresponses` idiom already established at `tests/test_alerter.py:5,12,100,194`):
 
 ```python
+# Append to tests/test_alerter.py — uses aioresponses + real aiohttp.ClientSession.
+# V15 M1 fold: do NOT use MagicMock for session — aiohttp's async context manager
+# semantics require AsyncMock chains that are easy to get wrong; aioresponses
+# is the project idiom and matches existing test_alerter.py tests.
+import aiohttp
 import pytest
 import structlog
-from unittest.mock import AsyncMock, MagicMock
+from aioresponses import aioresponses
 
 from scout.alerter import send_telegram_message
+from scout.config import Settings
 from scout.observability.tg_dispatch_counter import reset_for_tests
+
+
+def _settings(enabled: bool = True) -> Settings:
+    """Spec-aware Settings (catches typos in new field name via attribute check)."""
+    return Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="6337722878",   # DM — matches prod
+        ANTHROPIC_API_KEY="k",
+        TG_BURST_PROFILE_ENABLED=enabled,
+    )
 
 
 @pytest.mark.asyncio
 async def test_send_telegram_message_records_dispatch_when_enabled():
-    """When TG_BURST_PROFILE_ENABLED=True, every send emits tg_dispatch_observed."""
+    """V15 M1 fold: aioresponses + real ClientSession matches project test idiom."""
     reset_for_tests()
-    session = MagicMock()
-    session.post.return_value.__aenter__.return_value = MagicMock(status=200)
-    settings = MagicMock(
-        TELEGRAM_BOT_TOKEN="t",
-        TELEGRAM_CHAT_ID="chat-X",
-        TG_BURST_PROFILE_ENABLED=True,
-    )
+    settings = _settings(enabled=True)
+    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
 
-    with structlog.testing.capture_logs() as logs:
-        await send_telegram_message("hello", session, settings, parse_mode=None)
+    with aioresponses() as m:
+        m.post(url, status=200, payload={"ok": True})
+        async with aiohttp.ClientSession() as session:
+            with structlog.testing.capture_logs() as logs:
+                await send_telegram_message(
+                    "hello", session, settings,
+                    parse_mode=None, source="test-suite",
+                )
 
     observed = [e for e in logs if e.get("event") == "tg_dispatch_observed"]
     assert len(observed) == 1
-    assert observed[0]["chat_id"] == "chat-X"
+    assert observed[0]["chat_id"] == "6337722878"
+    assert observed[0]["source"] == "test-suite"
 
 
 @pytest.mark.asyncio
 async def test_send_telegram_message_skips_counter_when_disabled():
     reset_for_tests()
-    session = MagicMock()
-    session.post.return_value.__aenter__.return_value = MagicMock(status=200)
-    settings = MagicMock(
-        TELEGRAM_BOT_TOKEN="t",
-        TELEGRAM_CHAT_ID="chat-X",
-        TG_BURST_PROFILE_ENABLED=False,
-    )
+    settings = _settings(enabled=False)
+    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
 
-    with structlog.testing.capture_logs() as logs:
-        await send_telegram_message("hello", session, settings, parse_mode=None)
+    with aioresponses() as m:
+        m.post(url, status=200, payload={"ok": True})
+        async with aiohttp.ClientSession() as session:
+            with structlog.testing.capture_logs() as logs:
+                await send_telegram_message(
+                    "hello", session, settings, parse_mode=None
+                )
 
     observed = [e for e in logs if e.get("event") == "tg_dispatch_observed"]
     assert observed == []
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_message_records_429_with_retry_after():
+    """V14 MUST-FIX + V15 M3 fold: 429 response captures retry_after BEFORE
+    body is consumed by error-path logging."""
+    reset_for_tests()
+    settings = _settings(enabled=True)
+    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    with aioresponses() as m:
+        m.post(url, status=429, payload={
+            "ok": False,
+            "error_code": 429,
+            "description": "Too Many Requests",
+            "parameters": {"retry_after": 15},
+        })
+        async with aiohttp.ClientSession() as session:
+            with structlog.testing.capture_logs() as logs:
+                await send_telegram_message(
+                    "hello", session, settings,
+                    parse_mode=None, source="429-test",
+                )
+
+    rejected = [e for e in logs if e.get("event") == "tg_dispatch_rejected_429"]
+    assert len(rejected) == 1
+    assert rejected[0]["retry_after"] == 15
+    assert rejected[0]["source"] == "429-test"
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_message_instrumentation_failure_is_isolated(monkeypatch):
+    """V15 M2 fold: if record_429 raises (instrumentation regression),
+    the alerter must NOT swallow it under the outer try/except — must emit
+    a distinct logger.exception so operators can spot instrumentation drift."""
+    reset_for_tests()
+    settings = _settings(enabled=True)
+    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    import scout.alerter as alerter_mod
+    monkeypatch.setattr(
+        alerter_mod, "record_429",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("instr broken")),
+    )
+
+    with aioresponses() as m:
+        m.post(url, status=429, payload={
+            "ok": False, "parameters": {"retry_after": 5},
+        })
+        async with aiohttp.ClientSession() as session:
+            with structlog.testing.capture_logs() as logs:
+                await send_telegram_message(
+                    "hello", session, settings, parse_mode=None,
+                )
+
+    # Should emit the dedicated record_429_failed exception event
+    iso_failed = [e for e in logs if e.get("event") == "record_429_failed"]
+    assert len(iso_failed) == 1
 ```
 
 - [ ] **Step 3.2: Run → FAIL**
 
-- [ ] **Step 3.3: Modify `scout/alerter.py:send_telegram_message`** — add `source:` kwarg + record both intent-to-dispatch AND 429 response.
+- [ ] **Step 3.3: Modify `scout/alerter.py:send_telegram_message`** — add `source:` kwarg + record both intent-to-dispatch AND 429 response. V15 M3 fold: read body bytes ONCE before parsing for either path (avoids `resp.json()`+`resp.text()` double-consume). V15 M2 fold: wrap `record_429` call in its own try/except so instrumentation failure can't poison the alerter's existing 429 handling.
 
 ```python
 # At top of scout/alerter.py:
+import json   # for body parsing in 429 path
 from scout.observability.tg_dispatch_counter import record_dispatch, record_429
 
-# Modify signature:
+# Modify signature (add source kwarg-only):
 async def send_telegram_message(
     text: str,
     session: aiohttp.ClientSession,
@@ -521,19 +599,36 @@ async def send_telegram_message(
 if settings.TG_BURST_PROFILE_ENABLED:
     record_dispatch(str(settings.TELEGRAM_CHAT_ID), source=source)
 
-# In the response handler, on 429:
+# Modify the response-handling block — read body bytes once:
 async with session.post(url, json=payload) as resp:
-    if resp.status == 429:
+    body_bytes = await resp.read() if resp.status != 200 else None
+    if resp.status == 429 and body_bytes is not None:
         retry_after = None
         try:
-            body_json = await resp.json()
+            body_json = json.loads(body_bytes)
             retry_after = body_json.get("parameters", {}).get("retry_after")
-        except Exception:
+        except (json.JSONDecodeError, ValueError):
             pass
         if settings.TG_BURST_PROFILE_ENABLED:
-            record_429(str(settings.TELEGRAM_CHAT_ID), source=source, retry_after=retry_after)
-        # existing 429 handling continues below
+            try:
+                record_429(
+                    str(settings.TELEGRAM_CHAT_ID),
+                    source=source,
+                    retry_after=retry_after,
+                )
+            except Exception:
+                logger.exception("record_429_failed")
+    if resp.status != 200:
+        body = (
+            body_bytes.decode("utf-8", errors="replace")[:200] if body_bytes else ""
+        )
+        logger.warning(
+            "Telegram daily summary failed", status=resp.status, body=body
+        )
+        # ...rest of existing non-200 handling preserved
 ```
+
+Callers that pass a `source=` label get attribution; legacy callers default to `"unattributed"`. Hot callsites to label in a separate doc-only follow-up commit (see V15 S1 caller audit in design D1).
 
 Callers that pass a `source=` label get attribution; legacy callers default to `"unattributed"`. Hot callers to label in a separate doc-only follow-up commit: `daily-summary` (main.py:1521), `auto-suspend` (trading/auto_suspend.py:272,327), `calibrate-dryrun` (trading/calibrate.py:354), `bl-064-social` (social/telegram/listener.py:*), `narrative-learn` (narrative/agent.py:557,715), `secondwave` (secondwave/detector.py:285), `weekly-digest` (trading/weekly_digest.py:335,340), `velocity` (velocity/detector.py:193). Operator can grep journalctl by `source` once the labels are passed.
 
@@ -636,16 +731,33 @@ printf "%s\n" "$COMBINED" \
 #!/usr/bin/env bash
 # tg_burst_archive.sh — dump TG burst events to disk weekly.
 # Insurance against journalctl rotation under burst load (V14 fold).
-# Install: weekly cron, e.g. `30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh`
+# Install: weekly cron under ROOT crontab on srilu — service unit is
+# root-owned, journalctl -u gecko-pipeline requires root or systemd-journal
+# group membership.
+#   30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh
 set -euo pipefail
 ARCHIVE_DIR="/var/log/gecko-alpha/tg-burst-archive"
 mkdir -p "$ARCHIVE_DIR"
+chmod 0755 "$ARCHIVE_DIR"
 OUT="$ARCHIVE_DIR/$(date +%Y-%m-%d).jsonl.gz"
-journalctl -u gecko-pipeline --since "1 week ago" 2>/dev/null \
+# V16 SHOULD-FIX #3 fold: 2-week window with overlap so a missed weekly run
+# self-recovers next week. Storage cost ~1 MB extra per week (negligible).
+journalctl -u gecko-pipeline --since "2 weeks ago" 2>/dev/null \
     | grep -E '"event": "(tg_dispatch_observed|tg_burst_observed|tg_dispatch_rejected_429)"' \
     | gzip > "$OUT"
-# Retention: keep last 8 weeks (covers 4-week soak + 4-week buffer)
-find "$ARCHIVE_DIR" -name '*.jsonl.gz' -mtime +56 -delete
+chmod 0644 "$OUT"
+# V16 NICE-TO-HAVE #5 fold: rotate by filename-date, not mtime (rsync/backup
+# tools can touch mtimes; filename is the authoritative cohort).
+cutoff_epoch=$(date -d "56 days ago" +%s)
+for f in "$ARCHIVE_DIR"/*.jsonl.gz; do
+    [[ -f "$f" ]] || continue
+    base=$(basename "$f" .jsonl.gz)
+    # base is YYYY-MM-DD; date -d handles ISO dates portably
+    file_epoch=$(date -d "$base" +%s 2>/dev/null || echo 0)
+    if [[ "$file_epoch" -gt 0 && "$file_epoch" -lt "$cutoff_epoch" ]]; then
+        rm -f "$f"
+    fi
+done
 ```
 
 - [ ] **Step 4.2: Commit**
@@ -685,21 +797,36 @@ find "$ARCHIVE_DIR" -name '*.jsonl.gz' -mtime +56 -delete
   - DM does NOT trigger 1m burst (V13 fold)
   - group chat DOES trigger 1m burst >20 (V13 fold)
   - 429 record emits rejected event (V14#2 fold)
-- 2 alerter integration tests (records when enabled, skips when disabled)
+- 4 alerter integration tests (V15 M1 fold — uses aioresponses, project idiom):
+  - records when enabled
+  - skips when disabled
+  - 429 response captures retry_after (V14 + V15 M3)
+  - instrumentation failure isolated (V15 M2)
 - Full regression must pass
 
-Total: 12 new tests.
+Total: 14 new tests.
 
 ---
 
 ## Deployment verification (autonomous post-3-reviewer-fold)
 
-1. **Verify journalctl retention on srilu** (V14#3 fold): `ssh srilu-vps 'journalctl --disk-usage; systemctl show systemd-journald | grep -E "MaxRetention|MaxUse"'` — confirm at least 28d retention. If <28d, the archive script becomes mandatory; if ≥30d, archive is insurance.
-2. `journalctl -u gecko-pipeline --since "5 minutes ago" -p debug | grep '"event": "tg_dispatch_observed"' | head -3` — note `-p debug` since the observed events are DEBUG-level (V13 fold). Confirm structured logs after restart (any TG dispatch within 5min should show).
-3. `./scripts/tg_burst_summary.sh 1` — operator-friendly summary
-4. Install archive cron on srilu: `sudo crontab -l | { cat; echo "30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh"; } | sudo crontab -`
-5. Pre-registered review at 2026-06-14: run `tg_burst_summary.sh 672` (4 weeks of hours = 28×24=672) + apply decision criteria from § Decision criteria.
-6. Revert path: `TG_BURST_PROFILE_ENABLED=False` in `.env` + restart — disables the counter call. Full revert = revert PR.
+V16 fold: cron install is UNCONDITIONAL (don't gate on operator's interpretation of retention probe). Sequence:
+
+1. **journalctl retention probe** (informational, not a gate): `ssh srilu-vps 'systemctl show systemd-journald | awk -F= "/SystemMaxRetentionUsec|SystemMaxUse/ {print}"'`. Log result for the deploy record. Archive script runs regardless.
+2. **Install archive cron unconditionally** (V16 MUST-FIX #1):
+   ```
+   ssh srilu-vps 'mkdir -p /var/log/gecko-alpha/tg-burst-archive && chmod 0755 /var/log/gecko-alpha/tg-burst-archive'
+   ssh srilu-vps 'crontab -l 2>/dev/null | grep -v tg_burst_archive | { cat; echo "30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh"; } | crontab -'
+   ```
+3. **Restart + verify hook fires:**
+   ```
+   ssh srilu-vps 'systemctl restart gecko-pipeline && sleep 5 && systemctl is-active gecko-pipeline'
+   ssh srilu-vps 'journalctl -u gecko-pipeline --since "5 minutes ago" -p debug | grep "\"event\": \"tg_dispatch_observed\"" | head -3'
+   ```
+4. Smoke test summary: `ssh srilu-vps '/root/gecko-alpha/scripts/tg_burst_summary.sh 1'`
+5. **File memory checkpoint** (V16 MUST-FIX #2): write `~/.claude/projects/.../memory/project_tg_burst_pacing_checkpoint_2026_06_14.md` with the pre-registered criteria + `tg_burst_summary.sh 672` invocation + archive dir pointer (cycle 1 pattern from `project_backlog_reaudit_checkpoint_2026_06_13.md`).
+6. **Pre-registered review at 2026-06-14** per `BL-NEW-TG-PACING-DECISION` criteria.
+7. Revert path: `TG_BURST_PROFILE_ENABLED=False` in `.env` + restart — disables the counter call. Full revert = revert PR.
 
 ---
 
