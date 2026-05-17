@@ -97,21 +97,29 @@ Deploy script (replaces inline grep -v path-prefix; preserves any operator-added
 ```bash
 #!/usr/bin/env bash
 # cron/deploy.sh — idempotent crontab merge between sentinels
+# V54 MUST-FIX folded:
+#   (1) `matched=1` set inside /BEGIN/ rule so END guard works correctly
+#       (without it, subsequent deploys would APPEND a second fragment copy)
+#   (2) Tempfile staging via mktemp + trap so `crontab` install is atomic;
+#       pipe-to-`crontab -` could partial-install on awk mid-stream failure
 set -euo pipefail
 FRAGMENT="$(cat /root/gecko-alpha/cron/gecko-alpha.crontab)"
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
 crontab -l 2>/dev/null \
     | awk -v fragment="$FRAGMENT" '
-        /^# === BEGIN gecko-alpha managed block/ { skip=1; print fragment; next }
+        /^# === BEGIN gecko-alpha managed block/ { skip=1; matched=1; print fragment; next }
         /^# === END gecko-alpha managed block/ { skip=0; next }
         !skip
         END { if (!matched) { print fragment } }
     ' \
-    | crontab -
+    > "$TMP"
+crontab "$TMP"
 echo "OK: gecko-alpha cron block updated"
-crontab -l
+crontab -l || true   # V54 SHOULD-FIX: guard empty-crontab nonzero exit
 ```
 
-Operator runs: `bash /root/gecko-alpha/cron/deploy.sh`. Idempotent: re-running yields same crontab.
+Operator runs: `bash /root/gecko-alpha/cron/deploy.sh`. Idempotent: re-running yields same crontab. V54 invariant: on second deploy, the BEGIN rule fires, sets `matched=1`, prints the fragment ONCE, sets `skip=1`. END block sees `matched=1`, does NOT append. Crontab stable.
 
 ### Task 2: findings doc
 
