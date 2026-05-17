@@ -29,7 +29,7 @@
 ## Recommendation: Option B (remove + recalibrate gates)
 
 Rationale:
-1. **Empirical: 0-flip blast radius** across 6,096,576 historical scoring rows (Q3 in audit queries)
+1. **Closed-form approximate 0-flip blast radius** across 6,096,576 historical scoring rows (Q3 in audit queries; see TL;DR caveat — `score_history` stores only post-multiplier final score, so this is a closed-form approximation, not an exact re-score)
 2. **Removes 15-point intellectual debt** from `SCORER_MAX_RAW=208`; future engineers reading `scorer.py:121` no longer see a phantom signal
 3. **Closes Variant C stealth-suppression**: gate recalibration maintains intentional friction that Variant C would silently widen
 
@@ -65,7 +65,7 @@ Rationale:
 #### Variant B (RECOMMENDED): remove Signal 5 + recalibrate gates 60→65 + 70→75
 - 0 demoted at MIN_SCORE; 0 promoted at MIN_SCORE
 - 0 demoted at CONVICTION; 0 promoted at CONVICTION
-- **0-flip across 6,096,576 rows** (Q3)
+- **0-flip under closed-form approximation across 6,096,576 rows** (Q3; see TL;DR caveat — exact re-score not feasible from stored final scores)
 
 #### Variant C: remove Signal 5 + DO NOT recalibrate gates (let inflation through)
 - 35 newly pass MIN_SCORE=60 (historical 58s → 62 under MAX_RAW=193)

@@ -4,7 +4,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Empirically determine whether `social_mentions_24h` should remain in the scorer denominator, be removed (with downstream gate recalibration), or be replaced later by Hermes X / TG narrative evidence. Ship a findings doc with quantitative recommendation. Reviewer-1 BLOCK was on CRITICAL empirical errors (wrong MIN_SCORE value, wrong dispatch path); both corrected below. New recommendation: **Variant B (remove + recalibrate gates) is preferred over Variant A (defer)** — bounded 0-flip blast radius across 6M+ historical scoring rows + removes 15-point phantom + closes Variant C's 35-candidate stealth-suppression. Code change deferred to explicit operator approval; findings doc + cleanup comment + backlog flip + memory ship this PR.
+**Goal:** Empirically determine whether `social_mentions_24h` should remain in the scorer denominator, be removed (with downstream gate recalibration), or be replaced later by Hermes X / TG narrative evidence. Ship a findings doc with quantitative recommendation. Reviewer-1 BLOCK was on CRITICAL empirical errors (wrong MIN_SCORE value, wrong dispatch path); both corrected below. New recommendation: **Variant B (remove + recalibrate gates) is preferred over Variant A (defer)** — closed-form approximate 0-flip blast radius across 6M+ historical scoring rows (caveat: `score_history` stores only post-multiplier final score; closed-form approximation not exact re-score) + removes 15-point phantom + closes Variant C's 35-candidate stealth-suppression. Code change deferred to explicit operator approval; findings doc + cleanup comment + backlog flip + memory ship this PR.
 
 **Architecture:** Read-only audit (one optional one-line annotation). SQL queries against srilu prod `scout.db` (HEAD = `a20891f` = origin/master, includes PR #150). NO test files, NO new code modules.
 
@@ -77,7 +77,7 @@ Closed-form on full `score_history` (6,096,576 rows):
 - 0 promoted at MIN_SCORE: no candidate flips
 - 0 demoted at CONVICTION (70 → 75): no candidate flips
 - 0 promoted at CONVICTION: no candidate flips
-- **Net effect: 0-flip across 6M+ historical rows.** Honest accounting + zero blast radius.
+- **Net effect: closed-form approximate 0-flip across 6M+ historical rows.** Honest accounting + bounded approximate blast radius (exact re-score from raw inputs not feasible — `score_history` stores only post-multiplier final score).
 
 ### Variant C: remove Signal 5, DO NOT recalibrate gates (let inflation through)
 
@@ -97,7 +97,7 @@ Closed-form on full `score_history` (6,096,576 rows):
 **Primary: Option B (remove + recalibrate gates).** Recommended for next code-change cycle pending explicit operator approval.
 
 Why B over A:
-1. **Empirical: 0-flip blast radius** verified across 6M+ historical rows. No candidate's MiroFish/CONVICTION eligibility changes.
+1. **Closed-form approximate 0-flip blast radius** across 6M+ historical rows. No candidate's MiroFish/CONVICTION eligibility changes under the approximation; exact re-score from raw points + signal list not feasible (not stored in `score_history`).
 2. **Removes 15-point intellectual debt** from SCORER_MAX_RAW. Future engineers reading scorer.py:121 no longer see a phantom signal.
 3. **Closes the Variant C stealth-suppression**: without recalibrating gates, removal of Signal 5 would automatically promote 35 historical scores past MIN_SCORE; gate recalibration restores intentional friction.
 4. **Per CLAUDE.md §9a runtime-state verification**: the dead field is structurally certain (max=0 across all 1,671 prod candidates AND max_signal_fires=0 historically).
