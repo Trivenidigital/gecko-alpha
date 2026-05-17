@@ -53,7 +53,35 @@ if [[ -d "$ARCHIVE_DIR" ]]; then
             || true)
     fi
 fi
-COMBINED=$(printf "%s\n%s" "$JOURNAL_EVENTS" "$ARCHIVE_EVENTS" | grep -v '^$' || true)
+# Post-cycle-4 review fix: dedup journal + archive overlap. wal_archive.sh
+# uses a rolling 2-week window for missed-run self-recovery, so events that
+# are still in journald retention ALSO appear in the latest archive .jsonl.gz.
+# Without dedup, downstream aggregators (PROBES/BLOATS counts, consecutive-
+# bloat-run-length, p95 baseline) inflate by ~2x for the journal-AND-archive
+# overlap region and produce false tuning recommendations. Dedup key is the
+# JSON `"timestamp"` field — structlog writes ISO-8601 with microseconds so
+# collisions across distinct events are negligible. awk first-seen filter
+# avoids the jq slurp-into-memory cost on multi-week windows.
+COMBINED=$(printf "%s\n%s" "$JOURNAL_EVENTS" "$ARCHIVE_EVENTS" | grep -v '^$' \
+    | awk '
+        match($0, /"timestamp": "[^"]+"/) {
+            ts = substr($0, RSTART, RLENGTH)
+            # Reviewer-non-blocking tightening: include event name in the
+            # dedup key so two distinct event types emitted in the same
+            # microsecond do not collapse. structlog writes both fields
+            # in both journal and archive line shapes.
+            ev = ""
+            if (match($0, /"event": "[^"]+"/)) {
+                ev = substr($0, RSTART, RLENGTH)
+            }
+            key = ts "|" ev
+            if (!seen[key]++) print $0
+            next
+        }
+        # Lines without a timestamp field (defensive — should not occur for
+        # gecko-pipeline structlog) pass through unfiltered.
+        { print $0 }
+    ' || true)
 
 if [[ -z "$COMBINED" ]]; then
     echo "(no events in window — is journald debug retention on? sqlite_wal_probe is DEBUG-level)"
