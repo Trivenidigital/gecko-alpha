@@ -15,7 +15,7 @@ Production unit files for the gecko-alpha services. Captured verbatim from `sril
 
 ## Deploy workflow
 
-After pulling a PR that touches anything in `systemd/`:
+After pulling a PR that touches anything in `systemd/` (or `cron/` per cycle 11):
 
 ```bash
 ssh root@srilu-vps
@@ -29,6 +29,9 @@ sudo find systemd -maxdepth 1 -type f \( -name "*.service" -o -name "*.timer" \)
     -exec cp -t /etc/systemd/system/ {} +
 sudo systemctl daemon-reload
 sudo systemctl restart gecko-pipeline gecko-dashboard
+
+# Cron entries — see cron/README.md (cycle 11):
+bash cron/deploy.sh
 ```
 
 **Restart blast-radius (V35 fold):**
