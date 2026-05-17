@@ -41,6 +41,12 @@ Mirrors cycle 3's `tg_dispatch_observed` (debug) / `tg_burst_observed` (warning)
 
 Threshold `SQLITE_WAL_BLOAT_BYTES=50MB` is a starting point, not empirically derived. The plan's deployment-verification step #6 instructs operator to run `wal_summary.sh 168` after 7 days, read suggested-threshold value from output (`~1.5×p95` rounded to 5MB), set `.env` override, restart. This avoids building a complex "baseline mode then promote" state machine for what is a one-time calibration. Memory checkpoint file includes the calibration reminder.
 
+**V23 M2 fold — post-crash WAL inheritance contamination.** If the process restarts during Week 1 (deploy, OOM, host reboot), the first probe after restart may report a WAL inherited from pre-crash state — SQLite replays+truncates on open, but if the crash left 100-200MB unreplayed, the first probe captures it, polluting p95 and skewing the suggested threshold upward. **Mitigation:** `wal_summary.sh` Week-1 baseline section drops the first probe-event after each process start (detect via gap >90min between consecutive probes — same heuristic as the consecutive-run detector). Operator-facing message: "if any restart occurred during week 1, re-run after 168 clean probes" (data-bound, not calendar-bound per CLAUDE.md §11).
+
+### D5b. `shm_size_bytes` is informational only (V23 M1 fold)
+
+`shm_size_bytes` reports the `-shm` shared-memory sidecar. SQLite grows it in 32KB increments tracking concurrent reader count; it is NOT WAL bloat. The bloat trigger (`sqlite_wal_bloat_observed`) gates only on `wal_size_bytes`. Operator reading raw probe output during incident must not conflate `shm_size_bytes ≠ 0` with bloat. The `probe_wal_state` docstring carries an explicit warning; `wal_summary.sh` header output prints the same caveat.
+
 ### D6. Decision criteria are strict + single-event-aware (V21#M1, M3 folds)
 
 - WAL bloat: ≥12 **STRICTLY consecutive** hourly probes above threshold → TUNE (any dip resets the streak)
@@ -50,9 +56,13 @@ Threshold `SQLITE_WAL_BLOAT_BYTES=50MB` is a starting point, not empirically der
 
 `wal_summary.sh` includes an awk-aggregator computing max consecutive-run-length so operator gets a one-line answer to the streak criterion.
 
-### D7. Single hook in `_run_hourly_maintenance`
+### D7. Single hook in `_run_hourly_maintenance` — 13th SQL hop, post-prune (V22 fold)
 
-Adds a 12th call to the hourly maintenance loop (after cycle 3's TG-burst counter doesn't fire here — the WAL probe is independent). Sub-millisecond overhead per probe at expected scale. Pattern-consistent with cycle 1/2/3.
+V22 M1 fold: precise count — current hourly maintenance issues **12 SQL hops** today (check_outcomes + db_size stat + 3 cycle-0 prunes + 2 cycle-1 prunes + 6 cycle-2 narrative prunes). Adding `probe_wal_state` makes the **13th SQL hop**.
+
+V22 S1 fold: probe runs AFTER all 12 prunes so the captured `wal_size_bytes` reflects peak WAL pressure within the hour. DELETEs write tombstones into the WAL; probing AFTER captures the realistic peak that drives the bloat threshold. A pre-prune probe would miss the DELETE-driven WAL growth that's the most relevant signal. Single post-prune probe matches cycle 3's single-hook pattern.
+
+V22 S2 fold: total `_run_hourly_maintenance` cost post-cycle-4 is well under 50ms at srilu scale — each cycle-2 prune is sub-ms (verified via cycle 2 acceptance), and cycle 4 contributes 5 PRAGMA reads + 2 `os.path.getsize` syscalls = ~1ms total.
 
 ---
 
@@ -66,6 +76,9 @@ Adds a 12th call to the hourly maintenance loop (after cycle 3's TG-burst counte
 | Bloat event fires only above `SQLITE_WAL_BLOAT_BYTES` | Hourly hook conditional | `test_run_hourly_maintenance_emits_bloat_observed_above_threshold` |
 | Flag default is True | `scout/config.py` field default | `test_sqlite_wal_profile_enabled_default_true` |
 | All probe fields are typed | Type assertions in test | `test_probe_wal_state_returns_required_fields` |
+| `shm_size_bytes` is NOT part of bloat-trigger calc | Hourly hook reads `wal_size_bytes` only | Implicit via the threshold test |
+| WAL-file-missing branch returns 0 (V23 SHOULD-FIX fold) | `os.path.exists()` guard in `probe_wal_state` | `test_probe_wal_state_wal_file_missing_returns_zero` (new) |
+| structlog emits ordered within hourly block (V22 N2 fold) | Single event loop; emits are sequential | Implicit via cycle 1+2+3+4 hourly tests all passing |
 
 ---
 
@@ -76,7 +89,7 @@ Adds a 12th call to the hourly maintenance loop (after cycle 3's TG-burst counte
 1. `feat(config): SQLITE_WAL_PROFILE_ENABLED + SQLITE_WAL_BLOAT_BYTES settings`
 2. `feat(db): probe_wal_state() observability method`
 3. `feat(main): hourly WAL probe via _run_hourly_maintenance`
-4. `feat(scripts): wal_summary.sh + wal_archive.sh operator tools`
+4. `feat(scripts): wal_summary.sh + wal_archive.sh operator tools` **— includes creating the memory checkpoint file `project_sqlite_wal_tuning_checkpoint_2026_06_14.md` per V22 M2 fold (not assumed extant)**
 5. `docs(backlog): close BL-NEW-SQLITE-WAL-PROFILE + file BL-NEW-SQLITE-WAL-TUNING-DECISION`
 
 ---
