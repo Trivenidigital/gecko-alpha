@@ -920,9 +920,21 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 **decision-by:** 8 weeks.
 
 ### BL-NEW-TG-BURST-PROFILE
-**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit Telegram-burst reclassification (Phantom-fragile; 13+ dispatch sites point at one chat; coincident-burst probability unmeasured).
-**Action:** instrument per-cycle Telegram dispatch volume; measure burst frequency vs 1/sec same-chat and 20/min same-group limits.
-**decision-by:** 4 weeks.
+**Status:** SHIPPED 2026-05-17 — branch `feat/tg-burst-profile` (5 commits + plan/design folds). `TGDispatchCounter` in `scout/observability/tg_dispatch_counter.py`; `record_dispatch()` + `record_429()` hooks wired into `scout.alerter.send_telegram_message`; `source:` kwarg added for callsite attribution (V14 fold); group-vs-DM 20/min threshold guard (V13 fold — current prod chat is DM); `scripts/tg_burst_summary.sh` + `scripts/tg_burst_archive.sh` operator helpers (weekly cron, 8-week retention, filename-date rotation). 12 counter+integration tests pass locally; alerter integration tests verified on srilu (Windows OPENSSL workaround). Pre-registered decision criteria documented in `tasks/plan_tg_burst_profile.md` § Decision criteria; filed follow-up `BL-NEW-TG-PACING-DECISION`. Memory checkpoint: `project_tg_burst_pacing_checkpoint_2026_06_14.md`.
+
+**Original status (now historical):** PROPOSED 2026-05-13 — surfaced by cycle-change audit Telegram-burst reclassification (Phantom-fragile; 13+ dispatch sites point at one chat; coincident-burst probability unmeasured). Action: instrument per-cycle Telegram dispatch volume; measure burst frequency vs 1/sec same-chat and 20/min same-group limits.
+
+### BL-NEW-TG-PACING-DECISION: act on TG-burst-profile data after 4-week soak
+**Status:** PROPOSED 2026-05-17 — filed concurrent with BL-NEW-TG-BURST-PROFILE shipping. Evidence-gated on the 4-week measurement window.
+**Trigger:** 2026-06-14 (4 weeks post-deploy).
+**Pre-registered criteria** (per `tasks/plan_tg_burst_profile.md` § Decision criteria):
+- PACE if any `tg_dispatch_rejected_429` event observed in the 4-week window
+- PACE if `tg_burst_observed` (group-chat callsite) >50/week sustained
+- ACCEPT if zero burst OR 429 events in 4 weeks
+- DM-only bursts with zero 429 → ACCEPT (1-on-1 DMs tolerate ~30/sec)
+- weekly_digest/daily_summary multi-chunk `breached_1s` events are EXPECTED noise; exclude via `grep -v 'source.*weekly-digest'`
+**Decision artifact:** findings doc + backlog flip to SHIPPED/ACCEPT
+**decision-by:** 2026-06-14
 
 ---
 
