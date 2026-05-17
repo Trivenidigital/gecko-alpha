@@ -1300,6 +1300,23 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
         except Exception:
             logger.exception(f"{event_base}_prune_failed")
 
+    # BL-NEW-SQLITE-WAL-PROFILE cycle 4: hourly WAL state probe.
+    # Runs AFTER all 12 prunes so wal_size_bytes reflects DELETE-driven
+    # peak. DEBUG level keeps default-INFO journalctl clean
+    # (cycle 3 tg_dispatch_observed parity). Bloat at WARNING.
+    if settings.SQLITE_WAL_PROFILE_ENABLED:
+        try:
+            state = await db.probe_wal_state()
+            logger.debug("sqlite_wal_probe", **state)
+            if state.get("wal_size_bytes", 0) > settings.SQLITE_WAL_BLOAT_BYTES:
+                logger.warning(
+                    "sqlite_wal_bloat_observed",
+                    threshold_bytes=settings.SQLITE_WAL_BLOAT_BYTES,
+                    **state,
+                )
+        except Exception:
+            logger.exception("sqlite_wal_probe_failed")
+
 
 async def _maybe_announce_tg_alerts(db, session, settings) -> None:
     """BL-NEW-TG-ALERT-ALLOWLIST: first-deploy operator announcement.
