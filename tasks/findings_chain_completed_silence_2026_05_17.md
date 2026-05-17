@@ -22,17 +22,47 @@
 | Recent `chain_event_emitted` events | YES — last 2026-05-17T01:21:55Z (6h ago at audit time); event emitter functioning |
 | Code changes in scout/chains/ during May | **NONE** — no commits modify the chain code path |
 
-### Mechanism (per CLAUDE.md §9c — visible lever ≠ controlling lever)
+### Mechanism (per CLAUDE.md §9c — visible lever ≠ controlling lever) — V37 fold
 
-The visible levers (signal_params enabled=1, code path unchanged) suggest "nothing should be broken." But the actual data path:
+**V37 MUST-FIX correction (2026-05-17 review of this audit):** the earlier draft said "candidate_scored events still firing — event emitter works; anchor-creation doesn't." That framing conflated event-emission with anchor-eligibility. The narrative `full_conviction` pattern (per `scout/chains/patterns.py:64-86`) anchors at step 1 on `event_type="category_heating"`, NOT on `candidate_scored` — `candidate_scored` is step 4.
 
-1. Scorer emits `candidate_scored` events → still firing (confirmed via journalctl)
-2. `chains.tracker._check_active_chains` reads events to match against patterns → **not advancing**
-3. `active_chains` table has rows but `MAX(anchor_time) = 2026-05-11T16:42Z` → no new anchors
-4. Without new anchors, no chain can complete → no `chain_matches` row written
-5. Without `chain_matches`, no `chain_completed` paper trade fires
+Re-running the diagnostic correctly:
 
-Step (3) is the controlling lever. Something stopped creating new `active_chains` rows on 2026-05-11T16:42Z for the narrative pipeline (and on 2026-05-04T00:51Z for the memecoin pipeline). Code is unchanged, so the change must be in data shape (event payload schema), data rate (event types stopped firing for the patterns the anchor matcher looks for), or runtime config (`.env` flag).
+**signal_events table — last-firing per (event_type, pipeline):**
+
+| pipeline | event_type | n | last_fire |
+|---|---|---:|---|
+| memecoin | conviction_gated | 138,083 | 2026-05-17T07:23Z (LIVE) |
+| memecoin | candidate_scored | 7,898,791 | 2026-05-17T07:23Z (LIVE) |
+| memecoin | chain_complete | 146 | **2026-05-04T00:26Z (13d dead)** |
+| memecoin | counter_scored | 2 | 2026-05-02 (effectively never used) |
+| narrative | category_heating | 1,805 | 2026-05-17T07:04Z (LIVE — anchor IS firing) |
+| narrative | laggard_picked | 434 | 2026-05-17T07:04Z (LIVE) |
+| narrative | narrative_scored | 431 | 2026-05-17T07:04Z (LIVE) |
+| narrative | counter_scored | 435 | 2026-05-17T07:04Z (LIVE) |
+| narrative | chain_complete | 109 | **2026-05-11T16:43Z (5.5d dead)** |
+
+**This is the revised attribution:** the narrative pipeline's anchor event (`category_heating`) is firing 7 minutes ago at audit time. ALL upstream step events (laggard_picked / narrative_scored / counter_scored) are firing today. The data path INTO the anchor matcher is intact.
+
+The break is INSIDE the chain-step-matching layer or the `active_chains` writer. Possible mechanisms:
+
+(a) `chains.tracker._check_active_chains` matches the anchor event but `INSERT INTO active_chains` silently fails or short-circuits (cooldown dedup, conviction_boost gate, etc.)
+(b) Step-1 pattern match logic recently rejects what used to match (regex/payload schema drift)
+(c) Anchors ARE created but immediately marked complete with 0 steps and pruned before counted
+
+**active_chains rowcount per day (last 14d):**
+
+| date | anchors_created |
+|---|---:|
+| 2026-05-11 | 4 |
+| 2026-05-07 | 12 |
+| 2026-05-06 | 63 |
+| 2026-05-05 | 16 |
+| (no rows post-2026-05-11) | 0 |
+
+Rules out the truncate/prune hypothesis (V37 SHOULD-FIX): pruning `_prune_stale` only deletes `is_complete=1 AND completed_at<cutoff` OR stale incomplete past `CHAIN_ACTIVE_RETENTION_DAYS` — not enough to explain the cliff at 2026-05-11. Falsified.
+
+Memecoin chain_complete died 2026-05-04 (13d ago) — earlier than narrative's 2026-05-11 (5.5d). **V37 SHOULD-FIX:** memecoin and narrative pipelines use disjoint event sets at the anchor; two different last-fire dates from two different upstream emitter sets are MORE LIKELY two separate failures with different proximate causes. The fix item should split diagnostics.
 
 ### Prior art (memory `project_chain_revival_2026_05_03.md`)
 
@@ -57,13 +87,27 @@ The April 14–May 1 incident was 17 days of silence; this one is 5.5 days (narr
 ## Empirical reproducibility
 
 ```sql
+-- (a) The headline result — chain_matches dead per pipeline
 SELECT pipeline, COUNT(*), MIN(completed_at), MAX(completed_at)
 FROM chain_matches GROUP BY pipeline;
 
+-- (b) Confirm no new anchors
 SELECT COUNT(*), MIN(anchor_time), MAX(anchor_time) FROM active_chains;
 
+-- (c) Confirm not auto-suspended
 SELECT signal_type, enabled FROM signal_params WHERE signal_type='chain_completed';
+
+-- (d) V37 fold: localize the regression to inside the chain-matcher
+-- (NOT upstream event emitters — those fire today)
+SELECT event_type, pipeline, COUNT(*) AS n, MAX(created_at) AS last_fire
+FROM signal_events GROUP BY event_type, pipeline ORDER BY pipeline, last_fire DESC;
+
+-- (e) V37 fold: rule out truncate/prune via daily anchor count
+SELECT substr(anchor_time,1,10) AS day, COUNT(*)
+FROM active_chains GROUP BY day ORDER BY day DESC LIMIT 14;
 ```
+
+**Operator cheap interim check (V37 SHOULD-FIX):** add the (d) query to morning checks — 5min, surfaces continued silence at signal-event granularity without waiting for the BL-NEW-CHAIN-ANCHOR-PIPELINE-FIX investigation.
 
 ## Decision
 
