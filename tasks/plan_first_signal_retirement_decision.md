@@ -76,7 +76,7 @@ Net EV per trade: ≈ -$0.52 (slightly negative)
 cumul_pnl @ 2026-05-02T01:00:18Z = -$57.85
 ```
 
-The `max_drawdown = -$593` figure means the cohort dipped TO -$593 at some peak-loss point, even though net was -$57.85 at suspend time (a substantial intra-window recovery).
+**V39 SHOULD-FIX precision:** `max_drawdown` per `auto_suspend.py:86-94` is the **peak-to-trough drop in running cumulative PnL** within the rolling window — NOT the absolute trough. The reason field's `$-593` figure means cumulative PnL fell $593 from its running peak. At suspend time the net was -$57.85, so the trough sat near (peak - $593) with subsequent intra-window recovery of $535 back toward zero. Doesn't change the gate-fires conclusion (the second arm reads `max_drawdown ≤ hard_loss` directly).
 
 ## The critical context — pre-PR-#79 vs current auto-suspend logic
 
@@ -98,7 +98,24 @@ If first_signal were re-evaluated TODAY under the current combined gate:
 - `net_pnl < -$200`? `-132 < -200`? **NO** (second arm fails)
 - Combined: NEITHER arm fires → **would NOT auto-suspend today**
 
+**MIN_TRADES floor (V39 SHOULD-FIX note):** `SIGNAL_SUSPEND_MIN_TRADES=50` gates ONLY the `pnl_threshold` rule path (`auto_suspend.py:298`); both arms of `fires_hard_loss` bypass it. At n=256, MIN_TRADES is moot for either path — the conclusion is robust to that parameter.
+
 **Conclusion:** first_signal's suspension is an artifact of pre-fix auto-suspend over-aggression, NOT a current-rules violation.
+
+## Why keep paper-trading first_signal? (V38 MUST-FIX — affirmative argument)
+
+The pure "false-positive suspension" argument explains WHY suspension was unjust; it doesn't explain WHY revival is worth a paper-slot. The affirmative case:
+
+| Tail | n | total | avg/trade |
+|---|---:|---:|---:|
+| Positive (`closed_tp + closed_trailing_stop + moonshot_trail + peak_fade`) | 44 | **+$2,003.30** | **+$45.53** |
+| Negative (`closed_expired + closed_sl`) | 212 | **-$2,135.50** | **-$10.07** |
+
+The signal has a real positive-tail edge — winners average +$45 per trade (concentrated in `closed_tp` $85 + `closed_trailing_stop` $37). The drag comes from `closed_expired` (198 trades × -$6.13 each = -$1,213) — i.e., trades that ride out the full `max_duration_hours=168` without hitting TP or SL. That's a tail-decay problem, not a "the signal picks losers" problem.
+
+This makes first_signal a regime-dependent edge worth observing under the new combined gate: if the post-revival expired-rate stays comparable to pre-suspend, EV stays slightly negative and Option B (retire) becomes data-supported. If expired-rate drops (e.g., market becomes more directional), EV could flip positive. The 14d soak window IS the measurement.
+
+If the soak confirms regression, the cycle-9 finding establishes a clean retirement record. If the soak surfaces regime improvement, the operator has a paper-validated re-entry. Either way, Option A produces durable evidence that pure DEFER (Option C) cannot.
 
 ## Decision tree
 
@@ -131,43 +148,54 @@ Rationale:
 - [ ] Flip `BL-NEW-FIRST-SIGNAL-RETIREMENT-DECISION` to SHIPPED-WITH-DECISION
 - [ ] Memory checkpoint `project_first_signal_revival_decision_2026_05_31.md` with revival query, soak window, decision criteria
 
-### Task 3 (deferred to operator): execute revival
+### Task 3 (deferred to operator): execute revival via the helper
 
-```sql
--- Operator-only, NOT part of this PR. After PR merge:
+**V38 MUST-FIX:** use `Database.revive_signal_with_baseline` (`scout/db.py:4056`) instead of raw SQL. The helper enforces (a) the `SIGNAL_REVIVAL_MIN_SOAK_DAYS=7` cool-off (irrelevant for first revival but sets the right precedent), (b) joint `tg_alert_eligible` restore via `DEFAULT_ALLOW_SIGNALS` lookup at `db.py:4204-4216` (for first_signal, `restored_to=0` is logged since it's not in DEFAULT_ALLOW_SIGNALS — that's correct existing behavior, but the helper handles the decision atomically), (c) `BEGIN EXCLUSIVE` transaction wrapping, (d) audit row written with consistent format, (e) `signal_revived_tg_eligible` + `revive_signal_force_*` structlog observability hooks.
+
+```bash
+# Operator-only, NOT part of this PR. After PR merge:
 ssh root@srilu-vps
-sqlite3 /root/gecko-alpha/scout.db <<EOF
--- Revival via the helper (post-PR-#79 path) — drawdown baseline reset to now.
-UPDATE signal_params SET
-    enabled = 1,
-    suspended_at = NULL,
-    suspended_reason = NULL,
-    drawdown_baseline_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-    updated_by = 'operator_manual_revival_per_cycle9_decision'
-WHERE signal_type = 'first_signal';
-
-INSERT INTO signal_params_audit
-    (signal_type, field_name, old_value, new_value, reason, applied_by, applied_at)
-VALUES
-    ('first_signal', 'enabled', '0', '1',
-     'cycle9 revive-and-soak — pre-PR-#79 false-positive; 14d soak ends 2026-05-31',
-     'operator_manual',
-     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-EOF
-sudo systemctl restart gecko-pipeline  # pick up new signal_params row
+cd /root/gecko-alpha
+/root/.local/bin/uv run python -c "
+import asyncio
+from scout.db import Database
+from scout.config import get_settings
+async def revive():
+    db = Database('/root/gecko-alpha/scout.db')
+    await db.connect()
+    await db.revive_signal_with_baseline(
+        'first_signal',
+        reason='cycle9 revive-and-soak — pre-PR-#79 false-positive; 14d soak ends 2026-05-31',
+        operator='operator_cycle9_manual',
+        settings=get_settings(),
+    )
+    await db.close()
+asyncio.run(revive())
+"
+sudo systemctl restart gecko-pipeline   # pick up enabled=1 in the live process
 ```
 
-(Operator runs this manually; not auto-applied by the PR.)
+(Operator runs this manually; the PR ships the findings doc, not the action.)
 
-## Pre-registered re-evaluation criteria at 2026-05-31
+The helper logs `signal_revived_tg_eligible` with `restored_to=0` for first_signal (not in DEFAULT_ALLOW_SIGNALS); confirms operator opted out of TG alerts on this signal pre-existing.
 
-| Observation over 14d post-revival | Verdict | Action |
+## Pre-registered re-evaluation criteria at 2026-05-31 (V38 SHOULD-FIX folds: data-bound + reframed KEEP threshold)
+
+**Expected fire-count at 14d (V38 §11 fold):** pre-suspend rate was 5 trades in the 3.5 days before suspend (1.43/day). At that rate, **14d expected n ≈ 20**. The new combined gate doesn't gate trade-firing (only auto-suspend), so the dispatcher-fire rate is determined by upstream candidate availability — pre-suspend rate is the best estimator. Per CLAUDE.md §11 (soak windows are data-bound, not calendar-bound):
+
+- If `n < 10` at 14d → **auto-EXTEND to 28d** (data threshold not met; n too low to verdict)
+- If `n ≥ 10` at 14d → run the verdict table below
+
+| Observation @ 14d post-revival (n ≥ 10) | Verdict | Action |
 |---|---|---|
-| `first_signal` auto-suspends again | RETIRE (Option B confirmed) | File `BL-NEW-FIRST-SIGNAL-RETIRE-CODE` |
-| Cumulative PnL ≥ +$200 OR ≥ 50 trades with net positive | KEEP-PAPER (validated research surface) | Close cycle 9 cleanly |
-| Cumulative PnL between -$200 and +$200 (noisy) | EXTEND-SOAK 14d | File `BL-NEW-FIRST-SIGNAL-EXTEND-SOAK` |
-| No trades fire (zero-dispatch in 14d) | RETIRE (Option B) — dispatcher broken or candidates absent | File investigation |
+| `first_signal` auto-suspends again under current gate | RETIRE (Option B confirmed) | File `BL-NEW-FIRST-SIGNAL-RETIRE-CODE`; the signal genuinely regressed beyond pre-suspend |
+| Cumulative PnL ≥ 0 AND positive-tail win rate ≥ 17% (no regression vs all-time) | KEEP-PAPER (validated research surface) | Close cycle 9 cleanly |
+| Cumulative PnL ≥ +$200 AND positive-tail win rate ≥ 17% AND avg winner ≥ +$30 | KEEP-PAPER + flag for live-trading roadmap revisit | Memory note |
+| Cumulative PnL < 0 BUT positive-tail win rate ≥ 17% (in-line with all-time edge) | EXTEND-SOAK 14d | File `BL-NEW-FIRST-SIGNAL-EXTEND-SOAK` |
+| Cumulative PnL < 0 AND positive-tail win rate < 17% (regressing) | RETIRE (Option B) | File `BL-NEW-FIRST-SIGNAL-RETIRE-CODE` |
+| No trades fire (`n == 0` in 14d) | INVESTIGATE then RETIRE | File dispatcher-availability investigation |
+
+**V38 SHOULD-FIX rationale:** the threshold "Cumulative PnL ≥ 0 AND positive-tail win rate ≥ 17%" demands the signal NOT REGRESS vs its all-time profile. The prior "Cumulative PnL ≥ +$200" threshold sat ~7σ above EV per V38's note and mechanically biased toward retirement. The "≥ 17%" floor matches the all-time positive-tail rate; "≥ 0 cumulative PnL" demands non-regression. The +$200 threshold is preserved as the HIGHER bar that escalates to "flag for live-roadmap revisit."
 
 ## Risk register
 
