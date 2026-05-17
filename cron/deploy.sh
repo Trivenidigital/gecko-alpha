@@ -25,6 +25,14 @@ crontab -l 2>/dev/null \
     | awk -v fragment="$FRAGMENT" '
         /^# === BEGIN gecko-alpha managed block/ { skip=1; matched=1; print fragment; next }
         /^# === END gecko-alpha managed block/ { skip=0; next }
+        # Build-time discovery: existing srilu crontab has the 2 gecko
+        # entries WITHOUT sentinel bracketing. The plain `!skip` rule
+        # would preserve them, then END appends the fragment, producing
+        # DUPLICATES. Strip any `/root/gecko-alpha/scripts/` line found
+        # OUTSIDE the sentinel block — those belong inside the managed
+        # block, which the fragment replaces atomically. Operator manual
+        # entries pointing to other paths (polymarket, etc.) are preserved.
+        !skip && /\/root\/gecko-alpha\/scripts\// { next }
         !skip
         END { if (!matched) { print fragment } }
     ' \

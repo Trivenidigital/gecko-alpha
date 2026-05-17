@@ -25,7 +25,7 @@ The deploy script:
 - Reads `cron/gecko-alpha.crontab` (the sentinel-bracketed managed block)
 - Reads current crontab via `crontab -l`
 - Replaces the existing managed block (if present) OR appends if first deploy
-- Preserves ANY operator-added entries OUTSIDE the sentinels (e.g., polymarket cron entry)
+- **First-deploy migration:** strips any `/root/gecko-alpha/scripts/` line found OUTSIDE the sentinel block — those existed pre-cycle-11 unbracketed; the new managed block replaces them. Operator manual entries pointing to OTHER paths (polymarket, etc.) are preserved.
 - Stages to tempfile, then atomically installs via `crontab <tempfile>`
 
 Idempotent: re-running `cron/deploy.sh` produces an identical crontab.
