@@ -1,0 +1,4 @@
+# === BEGIN gecko-alpha managed block (do not edit between sentinels) ===
+30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh
+45 3 * * 0 /root/gecko-alpha/scripts/wal_archive.sh
+# === END gecko-alpha managed block ===

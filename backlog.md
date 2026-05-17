@@ -1512,10 +1512,59 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **Decision-by:** 8 weeks (depends on §12a daemon implementation; can be deferred until the daemon exists).
 
 ### BL-NEW-OTHER-PROD-CONFIG-AUDIT: sweep srilu for other repo-untracked prod config
-**Status:** PROPOSED 2026-05-17 — V35 PR-review FOLLOW-UP from BL-NEW-SYSTEMD-UNIT-IN-REPO (PR #142).
-**Why:** systemd units were just the obvious instance. Same substrate class likely covers: cron entries (`crontab -l`), `/etc/sudoers.d/`, drop-in dirs under `/etc/systemd/system/*.service.d/`, nginx/caddy config, journald.conf overrides, env files outside `.env`. One audit pass forecloses future "we have a third one of these" findings.
-**Action:** ssh root@srilu-vps; enumerate each category above; commit anything operator-meaningful to repo OR document why explicitly omitted (e.g., secrets, host-specific paths).
-**decision-by:** 6 weeks (audit-first task; doc-only outputs).
+**Status:** SHIPPED-WITH-FINDINGS 2026-05-17 — branch `feat/other-prod-config-audit` (cycle 11). Findings doc: `tasks/findings_other_prod_config_audit_2026_05_17.md`. Of 17 categories swept, only 1 gap (gecko cron entries repo-untracked at schedule level) — closed via new `cron/` directory (sentinel-bracketed managed block + idempotent `cron/deploy.sh` per V54 fold). Apache "Possible Gap" withdrawn after drill (not installed). VPS multi-tenant inventory documented (gecko-alpha + polymarket-ml-signal + btc15minutebot + shift-agent). 4 follow-ups filed (cron drift watchdog, cron-to-timer decision, drift-watchdog archive, firewall decision 2026-06-14, polymarket-verify); 1 withdrawn (Apache). Memory checkpoint: `project_prod_config_audit_2026_05_17.md`.
+
+### BL-NEW-CRON-DRIFT-WATCHDOG: bash watchdog for crontab drift (cycle 11 follow-up)
+**Status:** PROPOSED 2026-05-17 — cycle 11 follow-up to BL-NEW-OTHER-PROD-CONFIG-AUDIT.
+**Why:** Cycle 11 ships repo-tracked cron entries via `cron/deploy.sh`. Mirror cycle 10's `systemd-drift-watchdog.sh` pattern for cron: daily check that `crontab -l` matches `cron/gecko-alpha.crontab` between sentinels.
+**Action:** ~2-3h build. Mirror `scripts/systemd-drift-watchdog.sh` shape: extract managed block from `crontab -l`, diff against repo fragment, alert on drift via curl-direct TG. Include sha256 ack-tombstone for alert dedup (per cycle-10 V46 pattern).
+**Pattern:** parallels `scripts/systemd-drift-watchdog.sh` (cycle 10).
+**decision-by:** 4 weeks (low priority; cron block is short + stable).
+
+### BL-NEW-CRON-TO-SYSTEMD-TIMER: convert 2 weekly cron entries to systemd timers (cycle 11 follow-up)
+**Status:** PROPOSED 2026-05-17 — cycle 11 design-tension follow-up (V53 fold).
+**Why:** Cycle 10 canonicalized the systemd-timer pattern (drift-watchdog runs as timer). Cycle 11 ships 2 weekly cron entries (`tg_burst_archive.sh` Sun 03:30, `wal_archive.sh` Sun 03:45). Inconsistency: should these be systemd timers too?
+**Expected disposition (V55 SHOULD-FIX):** likely close as no-op. Cron is simpler for weekly schedules; cycle-10's systemd-timer canon applies more naturally to high-cadence triggers. Filing only to document the tension was considered.
+**Action:** ~30min decision + (if convert) ~2h build. Decision criteria: does any operational need require systemd-timer features (RandomizedDelaySec, Conditions, OnUnitActiveSec)? If yes, convert. If no, close.
+**decision-by:** 2026-06-14.
+
+### BL-NEW-DRIFT-WATCHDOG-ARCHIVE: extend wal_archive.sh shape for systemd-drift-watchdog events (cycle 11 follow-up)
+**Status:** PROPOSED 2026-05-17 — cycle 11 follow-up to BL-NEW-OTHER-PROD-CONFIG-AUDIT (V53 fold).
+**Why:** Cycle 10's `systemd-drift-watchdog.sh` emits plain-text `echo` lines (`OK: 0 drifts...`, `ALERTED: HTTP 200; hash=...`), not structured `"event":` fields. Cycles 3+4 archive scripts (`tg_burst_archive.sh`, `wal_archive.sh`) grep for `"event":` JSON, so they DON'T capture drift-watchdog output. Default journald retention may drop it. Operationally needed only if drift-watchdog history matters for post-incident review.
+**Action:** ~1h. Mirror `wal_archive.sh` shape: weekly cron, filename-date rotation, 8-week retention. Grep filter is `systemctl status systemd-drift-watchdog.service` OR `grep "systemd-drift-watchdog.sh"` (the echo output is unstructured plain text).
+**decision-by:** evidence-gated — file only if drift-watchdog history becomes operationally needed (e.g., investigating a past drift event that's been pruned).
+
+### BL-NEW-FIREWALL-DECISION: operator review of srilu ACCEPT-policy at 2026-06-14 (cycle 11 follow-up)
+**Status:** PROPOSED 2026-05-17 — cycle 11 follow-up; pre-registered review.
+**Why:** Cycle 11 audit found UFW inactive + iptables INPUT policy ACCEPT (no rules). Security-posture choice; documented unchanged. Pre-registered review at 2026-06-14 per CLAUDE.md §11 data-bound-not-calendar-bound discipline.
+**Kill-criterion (locked):** if srilu remains single-tenant-by-app AND no inbound attack surface change observed, accept ACCEPT-policy and close. Otherwise: file `BL-NEW-FIREWALL-ENABLE` to switch on UFW with allowlist (ssh + port 8000 for dashboard).
+**Verification command:**
+```bash
+ssh root@srilu-vps 'crontab -l | grep -v "/root/gecko-alpha"; ls /opt/ 2>&1; ls /etc/logrotate.d/; ss -tlnp'
+```
+Expected: known 4-app tenant set unchanged; no unexpected listening ports.
+**decision-by:** 2026-06-14.
+
+### BL-NEW-AUDIT-SURFACE-ADDENDUM: 5-category mini-sweep next cycle (cycle 11 follow-up)
+**Status:** PROPOSED 2026-05-17 — cycle 11 V58 PR-review FOLLOW-UP from BL-NEW-OTHER-PROD-CONFIG-AUDIT.
+**Why:** Cycle 11 covered the backlog-listed 17 categories. V58 surfaced 5 additional surfaces (nginx/caddy explicit probe, `/etc/systemd/system.conf`, `/etc/apt/sources.list.d/`, docker/containerd, complete systemd unit inventory) that are operationally meaningful but not in the original backlog scope.
+**Action:** ~3min mini-sweep + ~5min findings doc update OR ~30min full follow-up cycle if anything surfaces:
+```bash
+ssh root@srilu-vps '
+systemctl is-enabled nginx caddy 2>&1
+grep -v "^#\|^$" /etc/systemd/system.conf
+ls /etc/apt/sources.list.d/
+systemctl is-enabled docker containerd 2>&1
+systemctl list-units --type=service --all | grep -v "@\.service$" | head -40
+'
+```
+**Decision-by:** 4 weeks (low priority; mini-sweep is cheap).
+
+### BL-NEW-POLYMARKET-VERIFY: operator confirms polymarket-ml-signal path validity (cycle 11 follow-up)
+**Status:** PROPOSED 2026-05-17 — cycle 11 follow-up (V52 + V53 fold).
+**Why:** Cycle 11 sweep showed crontab references `/opt/polymarket-ml-signal/scripts/extract_data.sh` every 6h, but `ls /opt/` returned empty. Possible explanations: (a) polymarket dir was deleted, (b) sweep redirect collapsed output, (c) different path layout. Informational; no gecko impact.
+**Action:** ~5min operator confirmation: `ssh root@srilu-vps 'ls -la /opt/polymarket-ml-signal/ 2>&1; ls -la /opt/ 2>&1'`. If path valid → confirm inventory accurate. If absent → remove the stale cron entry (`crontab -e`).
+**decision-by:** 4 weeks (low priority; informational only).
 
 ### BL-NEW-CHAIN-COMPLETED-SILENCE-AUDIT: investigate 10+ day chain_completed silence
 **Status:** SHIPPED-WITH-FINDING 2026-05-17 — branch `feat/chain-completed-silence-audit` (cycle 8, audit-only). Findings doc: `tasks/findings_chain_completed_silence_2026_05_17.md`. **Confirmed regression:** chain_matches narrative pipeline silent 5.5d (last 2026-05-11T16:43Z); memecoin pipeline silent 13d (last 2026-05-04T00:51Z). active_chains MAX(anchor_time)=2026-05-11T16:42Z (no new anchors); signal_params enabled=1 (NOT auto-suspended); code path unchanged in May. Mechanism per §9c: visible levers (enabled=1, code unchanged) ≠ controlling lever (something stopped creating new active_chains rows). Surfaced as HIGH-priority fix item `BL-NEW-CHAIN-ANCHOR-PIPELINE-FIX`. Second chain-pipeline silence in ~6 weeks (prior: 2026-04-14→2026-05-01, 17d, fixed PR #60/#61); same substrate class.
