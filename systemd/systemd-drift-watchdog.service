@@ -1,0 +1,23 @@
+[Unit]
+Description=Systemd unit-file drift watchdog for gecko-alpha
+# V51 SHOULD-FIX: network-online.target instead of network.target so a
+# Persistent=true catch-up fire at boot-time waits for network before
+# attempting Telegram delivery via curl.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/gecko-alpha
+ExecStart=/root/gecko-alpha/scripts/systemd-drift-watchdog.sh
+# V51 SHOULD-FIX: exit 1 == drift detected + alert sent (NORMAL operation,
+# not a service failure). Without SuccessExitStatus, `systemctl status`
+# shows Active: failed on every drift day, breeding alarm fatigue and
+# masking real failures. Exit 7 (HTTP failure) DOES remain a real failure
+# state — keep that as failed.
+SuccessExitStatus=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

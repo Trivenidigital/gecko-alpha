@@ -11,6 +11,7 @@ Production unit files for the gecko-alpha services. Captured verbatim from `sril
 | `gecko-backup.service` + `.timer` | daily backup at 03:00 | runs `scripts/backup_db.sh` |
 | `gecko-backup-watchdog.service` + `.timer` | stale-heartbeat watchdog | 09:00 daily |
 | `minara-emission-persistence-watchdog.service` + `.timer` | Minara emission persistence freshness | hourly |
+| `systemd-drift-watchdog.service` + `.timer` | repo↔prod unit-file drift detection + drop-in enumeration | daily 09:30 UTC; alerts via TG; ack-tombstone suppresses re-alert on unchanged drift-set; manual override `rm /var/lib/gecko-alpha/systemd-drift-watchdog/last_alerted_hash` |
 
 ## Deploy workflow
 
@@ -33,6 +34,21 @@ sudo systemctl restart gecko-pipeline gecko-dashboard
 **Restart blast-radius (V35 fold):**
 
 `sudo systemctl restart gecko-pipeline` interrupts the scout pipeline for ~10-20s — that window costs missed CG scan cycles, missed paper-trade evaluations, and may trip the ingestion-starvation watchdog and the 09:00 stale-heartbeat watchdog. Prefer windows between scan cycles. `gecko-dashboard` restart drops in-flight HTTP connections (operator-facing, less critical).
+
+**First-time activation of `systemd-drift-watchdog.timer` (cycle 10 V51 fold):**
+
+On first merge of the drift-watchdog units, additionally:
+
+```bash
+# Pre-flight: verify the new units are byte-identical post-cp
+diff -q systemd/systemd-drift-watchdog.service /etc/systemd/system/systemd-drift-watchdog.service
+diff -q systemd/systemd-drift-watchdog.timer   /etc/systemd/system/systemd-drift-watchdog.timer
+
+sudo systemctl enable --now systemd-drift-watchdog.timer
+sudo systemctl start systemd-drift-watchdog.service  # smoke test
+journalctl -u systemd-drift-watchdog.service --since "1 minute ago" --no-pager
+# Expected: "OK: 0 drifts, 0 drop-ins, 0 untracked prod units"
+```
 
 **Reload semantics (V35 fold):**
 

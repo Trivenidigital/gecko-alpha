@@ -1494,11 +1494,22 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **Original status (now historical):** PROPOSED 2026-05-16 — V4 NOTE finding from `feat/score-volume-pruning-harden` PR design review. `/etc/systemd/system/gecko-pipeline.service` and `gecko-dashboard.service` exist only on srilu-vps, not in `systemd/` directory of this repo. Substrate-finding shape — config-not-in-git is the same class that drove the 2026-05-16 backlog drift audit.
 
 ### BL-NEW-SYSTEMD-DRIFT-PRECOMMIT-HOOK: prevent recurrence via automated drift detection
-**Status:** PROPOSED 2026-05-17 — V35 PR-review FOLLOW-UP from BL-NEW-SYSTEMD-UNIT-IN-REPO (PR #142).
-**Why:** Capturing unit files (cycle 6 above) closes the capture gap but not the recurrence gap. An operator can `sudo systemctl edit <unit>` or directly `vim /etc/systemd/system/...` at any time; the audit one-liner only catches drift if someone runs it. Substrate-finding recurrence is the same class.
-**Action:** Either (a) daily cron on srilu running `scripts/check_systemd_drift.sh` + Telegram alert on DRIFT, OR (b) pre-commit hook running `diff systemd/*.{service,timer} /etc/systemd/system/*` and warning. (a) is the better fit since drift is operator-introduced on the deploy host, not at commit time on the dev machine.
-**Pattern:** parallels existing `scripts/pre-commit-dist-consistency.sh`.
-**decision-by:** 4 weeks (small mechanical task; defer until BL-NEW-OTHER-PROD-CONFIG-AUDIT sweeps the broader surface).
+**Status:** SHIPPED 2026-05-17 — branch `feat/systemd-drift-precommit-hook` (cycle 10). Daily TG-alert watchdog via `scripts/systemd-drift-watchdog.sh` + `systemd/systemd-drift-watchdog.{service,timer}` (09:30 UTC fire, staggered after 09:00 gecko-backup-watchdog). Option (a) chosen over (b) pre-commit per backlog rationale: drift is operator-introduced on deploy host, not at commit time. Implementation per V47/V48-folded design: bi-directional enumeration (repo→prod drift + drop-ins; prod→repo UNTRACKED PROD UNIT for `gecko-*` / `minara-*` / `systemd-drift-watchdog.*`); sha256 ack-tombstone with pre-hash sort for filesystem-order independence; HTTP-failure path leaves ACK_FILE unwritten (intentional re-alert); flock + heartbeat-file on CLEAN. 13 tests with module-level `skipif win32`. Two follow-ups filed: BL-NEW-DRIFT-STALE-REMINDER (suppress-counter elevation if 180-day silent suppress matters in practice) + BL-NEW-WATCHDOG-META-WATCHDOG (the §12a daemon should monitor this watchdog's own freshness).
+
+**Original status (now historical):** PROPOSED 2026-05-17 — V35 PR-review FOLLOW-UP from BL-NEW-SYSTEMD-UNIT-IN-REPO (PR #142). Action: Either (a) daily cron + Telegram alert on DRIFT, OR (b) pre-commit hook. (a) chosen because drift is operator-introduced on deploy host.
+
+### BL-NEW-DRIFT-STALE-REMINDER: elevate long-running systemd-drift silent_suppress to operator-visible
+**Status:** PROPOSED 2026-05-17 — V48 SHOULD-FIX FOLLOW-UP from BL-NEW-SYSTEMD-DRIFT-PRECOMMIT-HOOK (cycle 10).
+**Why:** When drift state is stable (e.g., one-time `systemctl edit` experiment the operator forgot to revert), cycle 10's ack-tombstone suppresses re-alerts. Designed to prevent alert fatigue. But: a 180-day silent_suppress is operator-invisible — DEBUG-level journalctl event only. Operator who set `--priority info` filter misses it entirely. Conditional on whether prolonged silent_suppress observed in practice.
+**Action:** ~30min. Persist a counter alongside the hash in `last_alerted_hash` (2-line format: `hash\ncount`); at counter milestones (7d, 30d, 90d) emit a single soft TG reminder. Alternative: elevate `systemd_drift_silent_suppress_same_drift_set` event to INFO with `suppressed_count` field.
+**Decision-by:** 8 weeks (evidence-gated — file if cycle-10 watchdog ever silent-suppresses for >14 consecutive days in practice).
+
+### BL-NEW-WATCHDOG-META-WATCHDOG: monitor the watchdogs themselves
+**Status:** PROPOSED 2026-05-17 — V46 SHOULD-FIX FOLLOW-UP from BL-NEW-SYSTEMD-DRIFT-PRECOMMIT-HOOK (cycle 10).
+**Why:** Cycle 10's drift watchdog exits 4-7 silently to journalctl when env-file / token / Telegram-API fails. No alert reaches the operator. Same applies to gecko-backup-watchdog, held-position-price-watchdog, minara-emission-persistence-watchdog. The §12a daemon proposal is the structural fix.
+**Action:** Implement the §12a freshness-SLO daemon to monitor each watchdog's heartbeat file with an SLO (e.g., "systemd-drift-watchdog heartbeat updated within last 26h" — 24h cadence + 2h slack). Alert via separate TG dispatch on SLO breach. Out-of-scope for cycle 10.
+**Pattern:** §12a generic daemon from `findings_silent_failure_audit_2026_05_11.md` closing notes.
+**Decision-by:** 8 weeks (depends on §12a daemon implementation; can be deferred until the daemon exists).
 
 ### BL-NEW-OTHER-PROD-CONFIG-AUDIT: sweep srilu for other repo-untracked prod config
 **Status:** PROPOSED 2026-05-17 — V35 PR-review FOLLOW-UP from BL-NEW-SYSTEMD-UNIT-IN-REPO (PR #142).
