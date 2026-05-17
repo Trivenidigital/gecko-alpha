@@ -915,9 +915,21 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 **decision-by:** 4 weeks.
 
 ### BL-NEW-SQLITE-WAL-PROFILE
-**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit non-external-constraint sub-scan.
-**Action:** measure SQLite WAL bloat at 17k+ writes/hr (combined score_history + volume_snapshots + upsert_candidate); add WAL checkpoint cadence tuning if bloat is observed.
-**decision-by:** 8 weeks.
+**Status:** SHIPPED 2026-05-17 — branch `feat/sqlite-wal-profile` (5 commits + plan/design folds). `Database.probe_wal_state()` in `scout/db.py` (5 PRAGMA reads + 2 `os.path.getsize` syscalls, using `pragma_wal_autocheckpoint` table-valued form for pure-read semantics with Windows-stdlib fallback); 13th SQL hop in `_run_hourly_maintenance` AFTER all 12 prunes so `wal_size_bytes` captures DELETE-driven peak. Log levels: `sqlite_wal_probe` DEBUG / `sqlite_wal_bloat_observed` WARNING / `sqlite_wal_probe_failed` exception. Settings: `SQLITE_WAL_PROFILE_ENABLED: bool = True`, `SQLITE_WAL_BLOAT_BYTES: int = 50_000_000`. Operator scripts: `scripts/wal_summary.sh` (consecutive-bloat-run aggregator + runaway-WAL/freelist single-event checks + Week-1 baseline calibration with V23 M2 restart-bracket drop) + `scripts/wal_archive.sh` (weekly cron, filename-date rotation, 8w retention, same-day .N suffix, 2-week overlap). 4 probe tests + 3 hourly-hook integration tests + 3 config tests pass locally; full regression validated on srilu (Windows OPENSSL workaround per memory `reference_windows_openssl_workaround.md`). Pre-registered decision criteria documented in `tasks/plan_sqlite_wal_profile.md` § Decision criteria; filed follow-up `BL-NEW-SQLITE-WAL-TUNING-DECISION`. Memory checkpoint: `project_sqlite_wal_tuning_checkpoint_2026_06_14.md`.
+
+**Original status (now historical):** PROPOSED 2026-05-13 — surfaced by cycle-change audit non-external-constraint sub-scan. Action: measure SQLite WAL bloat at 17k+ writes/hr (combined score_history + volume_snapshots + upsert_candidate); add WAL checkpoint cadence tuning if bloat is observed.
+
+### BL-NEW-SQLITE-WAL-TUNING-DECISION: act on SQLite-WAL-profile data after 4-week soak
+**Status:** PROPOSED 2026-05-17 — filed concurrent with BL-NEW-SQLITE-WAL-PROFILE shipping. Evidence-gated on 4-week measurement window.
+**Trigger:** 2026-06-14 (4 weeks post-deploy). Week-1 calibration at 2026-05-24.
+**Pre-registered criteria** (per `tasks/plan_sqlite_wal_profile.md` § Decision criteria):
+- TUNE if ≥12 STRICTLY consecutive hourly probes `wal_size_bytes > SQLITE_WAL_BLOAT_BYTES` (`wal_summary.sh` aggregator prints "TUNE criterion MET")
+- TUNE-IMMEDIATELY if any single probe `wal_size_bytes > 500MB`
+- VACUUM-schedule (file `BL-NEW-SQLITE-VACUUM-SCHEDULE`) if any single probe `freelist_count > 0.10 × page_count`
+- ACCEPT if zero of the above for 4 weeks (close as no-action)
+**Week-1 calibration procedure:** `./scripts/wal_summary.sh 168` on srilu reads suggested `SQLITE_WAL_BLOAT_BYTES` (~1.5×p95 rounded to 5MB, floor 50MB); operator sets `.env` override + restarts. Restart-bracket samples are dropped automatically (gap >90min heuristic).
+**Decision artifact:** findings doc + backlog flip to SHIPPED/ACCEPT
+**decision-by:** 2026-06-14
 
 ### BL-NEW-TG-BURST-PROFILE
 **Status:** SHIPPED 2026-05-17 — branch `feat/tg-burst-profile` (5 commits + plan/design folds). `TGDispatchCounter` in `scout/observability/tg_dispatch_counter.py`; `record_dispatch()` + `record_429()` hooks wired into `scout.alerter.send_telegram_message`; `source:` kwarg added for callsite attribution (V14 fold); group-vs-DM 20/min threshold guard (V13 fold — current prod chat is DM); `scripts/tg_burst_summary.sh` + `scripts/tg_burst_archive.sh` operator helpers (weekly cron, 8-week retention, filename-date rotation). 12 counter+integration tests pass locally; alerter integration tests verified on srilu (Windows OPENSSL workaround). Pre-registered decision criteria documented in `tasks/plan_tg_burst_profile.md` § Decision criteria; filed follow-up `BL-NEW-TG-PACING-DECISION`. Memory checkpoint: `project_tg_burst_pacing_checkpoint_2026_06_14.md`.
