@@ -1591,3 +1591,39 @@ systemctl list-units --type=service --all | grep -v "@\.service$" | head -40
 **Status:** SHIPPED-WITH-DECISION 2026-05-17 — branch `feat/first-signal-retirement-decision` (cycle 9, analysis-only). Findings doc: `tasks/findings_first_signal_retirement_decision_2026_05_17.md`. **Decision: Option A REVIVE-AND-SOAK** with 14d window ending 2026-05-31. Root cause was AUTO-SUSPEND on 2026-05-02T01:00:18Z under PRE-PR-#79 logic; under current combined-gate logic the suspension would NOT fire (`net_pnl = -$132 > -$200` per V38/V39 verified). Operator runs revival via `Database.revive_signal_with_baseline` helper (`scout/db.py:4056`) with `operator='operator'` (V40 MUST-FIX — cool-off filter compatibility) and `systemctl stop`/`start` around the python invocation (V41 SHOULD-FIX — avoid BEGIN EXCLUSIVE race). Memory checkpoint: `project_first_signal_revival_decision_2026_05_31.md`. Pre-registered verdict criteria + n≥10 trip-wire + 28d auto-extend + early-halt at n≥20 per CLAUDE.md §11. 1 follow-up STAGED conditionally (to be filed at 2026-05-31 decision time): BL-NEW-FIRST-SIGNAL-RETIRE-CODE (if revival fires hard_loss or regresses).
 
 **Original status (now historical):** PROPOSED 2026-05-17 — Finding 3 from BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT (cycle 7, post-V36 fold). Cycle 9 drilled the root cause beyond the 3 hypotheses (a/b/c) in the original action list.
+
+### BL-NEW-LOSERS-CONTRARIAN-REVIVAL-CRITERIA-TIGHTENING: regime-stratified revival gate for losers_contrarian (and revival-criteria template for all signals)
+**Status:** PR-OPEN / PENDING-MERGE 2026-05-17 — PR #150 (`feat/lc-revival-criteria-tightening`) awaits operator merge decision. Flip to SHIPPED only after merge to master. New module `scout/trading/revival_criteria.py` (~650 LOC) enforces n≥100 floor + cutover-stratified two-window + Wilson-LB + bootstrap-LB + 2 secondary diagnostic gates. Verdict renamed `keep_on_permanent` → `keep_on_provisional_until_<iso>` (30d expiry default) to embed revocability. 49 unit tests pass on srilu Python 3.12.3; 506 adjacent regression tests pass. Full Plan→Design→Build→PR reviewer cycle: 2 plan reviewers + 2 design reviewers + 3 PR reviewers; all CRITICAL + IMPORTANT folded. Empirical evaluation against srilu prod scout.db (4 signals): losers_contrarian=STRATIFICATION_INFEASIBLE (cutover 0d ago, correct), gainers_early=FAIL contradicting 2026-05-13 audit-id=24, chain_completed + volume_spike = BELOW_MIN_TRADES (correct refusal at low n). Memory checkpoint: `project_lc_revival_criteria_shipped_2026_05_17.md`.
+
+**Original status (now historical):** PROPOSED 2026-05-17 — surfaced by drill on losers_contrarian post-soak bleed (5/13 → 5/17). Filed concurrent with auto-suspend firing 2026-05-17T01:02:46Z (audit ids 26/27). Backlog scope item 5 ("post-verdict monitoring") implemented as `keep_on_provisional_until_<iso>` verdict rename (revocable by structural expiry); active watchdog enforcement deferred to `BL-NEW-REVIVAL-VERDICT-WATCHDOG` follow-up below.
+
+**Post-merge action (operator):** flip status above from `PR-OPEN / PENDING-MERGE` to `SHIPPED <merge-date>` once PR #150 lands on master. Re-link to merged commit SHA.
+
+### BL-NEW-REVIVAL-VERDICT-WATCHDOG: active enforcement of keep_on_provisional_until_<iso> expiry
+**Status:** PROPOSED 2026-05-17 — filed concurrent with BL-NEW-LC-REVIVAL-CRITERIA-TIGHTENING shipping. Carves out the "active enforcement" half of the originating backlog scope item 5.
+**Tag:** `revival` `watchdog` `silent-failure-prevention`
+**Why:** PR #150 ships the verdict-stamp machinery (`keep_on_provisional_until_<iso>`) but does NOT actively enforce the expiry. Operator runs the evaluator manually; if the operator forgets to re-run at expiry, the audit row sits as a stale "valid" verdict. Per CLAUDE.md §12-style silent-non-failure rule: if it looks like a primitive but doesn't fire, the operator's mental model is wrong about the system.
+**Action:** ~6-8h implementation. Daily cron job that scans `signal_params_audit` for the most-recent `field_name='soak_verdict'` row per signal_type whose `new_value LIKE 'keep_on_provisional_until_%'`; if the parsed expiry timestamp is in the past, either (a) emit operator alert "verdict expired, re-run evaluator" or (b) auto-write a revoke row. Recommend (a) — operator decision-point preserved.
+**Decision-by:** 4 weeks from PR #150 merge.
+
+### BL-NEW-REVIVAL-CRITERIA-QUARTERLY-RECALIBRATION: periodic re-derivation of healthy-signal baselines
+**Status:** PROPOSED 2026-05-17 — PR-stage reviewer #3 finding #10 follow-up.
+**Tag:** `revival` `recalibration` `defer-flag`
+**Why:** `Settings.REVIVAL_CRITERIA_*` thresholds derive from 2026-05-17 healthy-signal baselines (chain_completed n=12, volume_spike n=36, narrative_prediction n=185). Signal regimes shift over time; baselines drift. The `EXIT_MACHINERY_MIN=0.70` anchor in particular is small-sample-dependent.
+**Trigger conditions** (per `tasks/baselines_revival_criteria_2026_05_17.md` defer-flag): re-derive whenever (a) 90d elapsed since last derivation, OR (b) any signal-set change, OR (c) any FAIL verdict whose failure_reasons list contains ONLY `exit_machinery_contribution` (suggests the threshold is biting on a healthy signal).
+**Action:** ~30min — re-run the baseline SQL queries from `tasks/baselines_revival_criteria_2026_05_17.md` against current scout.db; if any baseline shifts >10%, update `Settings` defaults via .env override.
+**Decision-by:** Calendar-bound at 2026-08-17 (90d) OR data-bound on trigger.
+
+### BL-NEW-EVALUATION-HISTORY-PERSISTENCE: persist evaluator runs to DB beyond structlog
+**Status:** PROPOSED 2026-05-17 — PR-stage reviewer #2 finding #16 + reviewer #3 finding #11 follow-up.
+**Tag:** `revival` `observability` `forensics`
+**Why:** PR #150's evaluator emits `revival_criteria_evaluated` structlog events only. journalctl on srilu retains them, but cross-evaluation analysis ("what verdicts has gainers_early received over time?") requires reading structured logs which is inconvenient. A dedicated `revival_criteria_runs` table would persist verdicts + diagnostics + cutover info per evaluation.
+**Action:** ~3-4h. Add table to db.py schema with columns (id, signal_type, evaluated_at, verdict, n_trades, cutover_at, cutover_source, cutover_age_days, window_a_*, window_b_*, failure_reasons_json). Wire write in `evaluate_revival_criteria`. Dashboard surface optional.
+**Decision-by:** 8 weeks from PR #150 merge.
+
+### BL-NEW-REVIVAL-CRITERIA-PER-SIGNAL-TUNING: per-signal Settings overrides for revival criteria
+**Status:** PROPOSED 2026-05-17 — PR-stage reviewer #1 + #3 finding #7 follow-up.
+**Tag:** `revival` `per-signal-tuning`
+**Why:** Global thresholds (n≥100, Wilson LB ≥55%, etc.) may be too strict/lenient for specific signal classes. chain_completed at n=12 with +$108/trade × 83% win is a strong signal but the n=100 floor blocks evaluation for ~205 days at current fire rate. If operator concludes the floor is structurally too high for low-fire-rate / high-EV signal classes, a per-signal override mechanism unblocks the evaluator without weakening the floor for noisy signals.
+**Action:** ~4-6h. Add `signal_revival_criteria_overrides` table (signal_type, key, value); evaluator consults overrides first, falls back to Settings defaults. CLI flag `--show-overrides` for transparency.
+**Decision-by:** Conditional — file only when operator has observed a specific case where global thresholds are demonstrably inappropriate. May never fire.
