@@ -3822,6 +3822,20 @@ class Database:
                 await conn.execute("COMMIT")
                 return
 
+            # PR-review V31/V32/V33 fold: paper_trades.closed_at must exist
+            # before the partial index. Pre-BL055 prod-snapshot test seeds
+            # paper_trades WITHOUT closed_at; _create_tables is a no-op for
+            # the existing table; no prior migration ADD-COLUMNs closed_at.
+            # Add it idempotently here so the index step is safe across
+            # upgrade paths. Real prod (srilu) already has the column from
+            # _create_tables fresh-install path — ALTER is a no-op there.
+            cur = await conn.execute("PRAGMA table_info(paper_trades)")
+            paper_cols = {row[1] for row in await cur.fetchall()}
+            if "closed_at" not in paper_cols:
+                await conn.execute(
+                    "ALTER TABLE paper_trades ADD COLUMN closed_at TEXT"
+                )
+
             await conn.execute(
                 """CREATE TABLE IF NOT EXISTS cohort_digest_state (
                     marker INTEGER PRIMARY KEY DEFAULT 1,

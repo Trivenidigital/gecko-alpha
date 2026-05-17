@@ -40,47 +40,51 @@ async def test_refresh_fires_once_per_day_at_configured_hour(
 
     # 02:59 — neither fires.
     now = datetime(2026, 4, 19, 2, 59, 0)  # Sunday
-    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+    last_refresh, last_digest, _last_cohort = await main_mod._run_feedback_schedulers(
         db,
         s,
         last_refresh,
         last_digest,
+        "",
         now,
-    )
+        )
     assert refresh_mock.call_count == 0
 
     # 03:00 — refresh fires.
     now = datetime(2026, 4, 19, 3, 0, 0)
-    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+    last_refresh, last_digest, _last_cohort = await main_mod._run_feedback_schedulers(
         db,
         s,
         last_refresh,
         last_digest,
+        "",
         now,
-    )
+        )
     assert refresh_mock.call_count == 1
     assert last_refresh == "2026-04-19"
 
     # 03:30 same day — must NOT fire again.
     now = datetime(2026, 4, 19, 3, 30, 0)
-    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+    last_refresh, last_digest, _last_cohort = await main_mod._run_feedback_schedulers(
         db,
         s,
         last_refresh,
         last_digest,
+        "",
         now,
-    )
+        )
     assert refresh_mock.call_count == 1
 
     # 09:00 Sunday — digest fires.
     now = datetime(2026, 4, 19, 9, 0, 0)  # weekday() == 6
-    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+    last_refresh, last_digest, _last_cohort = await main_mod._run_feedback_schedulers(
         db,
         s,
         last_refresh,
         last_digest,
+        "",
         now,
-    )
+        )
     assert digest_mock.call_count == 1
     assert last_digest == "2026-04-19"
     await db.close()
@@ -124,13 +128,14 @@ async def test_refresh_failure_streak_alerts_telegram(
     last_digest = ""
     for day in range(1, 6):  # 5 days: failures on days 1-5 → streak hits 3 on day 3
         now = datetime(2026, 4, day, 3, 0, 0)
-        last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+        last_refresh, last_digest, _last_cohort = await main_mod._run_feedback_schedulers(
             db,
             s,
             last_refresh,
             last_digest,
+            "",
             now,
-        )
+            )
         # Fix 3: last_refresh_date must NOT advance when refresh_all fails.
         assert (
             last_refresh == ""
@@ -184,9 +189,9 @@ async def test_transient_failure_allows_same_hour_retry(
 
     # 03:00 — fails → sentinel stays ''
     now = datetime(2026, 4, 19, 3, 0, 0)
-    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
-        db, s, last_refresh, last_digest, now
-    )
+    last_refresh, last_digest, _last_cohort = await main_mod._run_feedback_schedulers(
+        db, s, last_refresh, last_digest, "", now
+        )
     assert (
         last_refresh == ""
     ), f"Sentinel must not advance on failure, got {last_refresh!r}"
@@ -194,9 +199,9 @@ async def test_transient_failure_allows_same_hour_retry(
 
     # 03:01 — same hour, sentinel still '' → scheduler fires again → succeeds
     now = datetime(2026, 4, 19, 3, 1, 0)
-    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
-        db, s, last_refresh, last_digest, now
-    )
+    last_refresh, last_digest, _last_cohort = await main_mod._run_feedback_schedulers(
+        db, s, last_refresh, last_digest, "", now
+        )
     assert (
         last_refresh == "2026-04-19"
     ), f"Sentinel must advance on success, got {last_refresh!r}"
@@ -248,13 +253,14 @@ async def test_streak_alert_counter_resets_after_success(
     last_digest = ""
     for day in range(1, 8):
         now = datetime(2026, 4, day, 3, 0, 0)
-        last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+        last_refresh, last_digest, _last_cohort = await main_mod._run_feedback_schedulers(
             db,
             s,
             last_refresh,
             last_digest,
+            "",
             now,
-        )
+            )
         # After the day-4 success, both counters must be zero so that the
         # next 3-failure streak can re-alert. Checking streak alone isn't
         # enough — a regression that zeros streak but leaves last_alerted
@@ -303,13 +309,14 @@ async def test_dst_fall_back_does_not_double_fire(
 
     # First 01:30:00 (pre-fall-back instant — EDT on the wall clock).
     now = datetime(2026, 11, 1, 1, 30, 0)
-    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+    last_refresh, last_digest, _last_cohort = await main_mod._run_feedback_schedulers(
         db,
         s,
         last_refresh,
         last_digest,
+        "",
         now,
-    )
+        )
     assert refresh_mock.call_count == 1
     assert last_refresh == "2026-11-01"
 
@@ -317,13 +324,14 @@ async def test_dst_fall_back_does_not_double_fire(
     # instant (01:45:15, post-fall-back EST), same local date and same hour.
     # Must be deduped despite being a genuinely later clock observation.
     now = datetime(2026, 11, 1, 1, 45, 15)
-    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+    last_refresh, last_digest, _last_cohort = await main_mod._run_feedback_schedulers(
         db,
         s,
         last_refresh,
         last_digest,
+        "",
         now,
-    )
+        )
     assert (
         refresh_mock.call_count == 1
     ), "refresh_all must not fire a second time during the repeated DST hour"
@@ -356,22 +364,24 @@ async def test_dst_spring_forward_gapped_hour_skips_silently(
 
     # 01:59 — below target hour.
     now = datetime(2026, 3, 8, 1, 59, 0)  # US spring-forward
-    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+    last_refresh, last_digest, _last_cohort = await main_mod._run_feedback_schedulers(
         db,
         s,
         last_refresh,
         last_digest,
+        "",
         now,
-    )
+        )
     # 03:00 — clock jumped past the target hour.
     now = datetime(2026, 3, 8, 3, 0, 0)
-    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+    last_refresh, last_digest, _last_cohort = await main_mod._run_feedback_schedulers(
         db,
         s,
         last_refresh,
         last_digest,
+        "",
         now,
-    )
+        )
     assert refresh_mock.call_count == 0, (
         "spring-forward gapped hour: refresh must not fire when the loop "
         "never observes hour == target"
@@ -383,13 +393,14 @@ async def test_dst_spring_forward_gapped_hour_skips_silently(
     ), f"sentinel must not advance on gap-skip, got {last_refresh!r}"
     # Next day at the configured hour — fires normally.
     now = datetime(2026, 3, 9, 2, 0, 0)
-    last_refresh, last_digest = await main_mod._run_feedback_schedulers(
+    last_refresh, last_digest, _last_cohort = await main_mod._run_feedback_schedulers(
         db,
         s,
         last_refresh,
         last_digest,
+        "",
         now,
-    )
+        )
     assert refresh_mock.call_count == 1
     assert last_refresh == "2026-03-09"
     await db.close()
