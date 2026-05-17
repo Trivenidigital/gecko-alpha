@@ -300,6 +300,73 @@ async def test_run_hourly_maintenance_skips_wal_probe_when_disabled(tmp_path):
     db.probe_wal_state.assert_not_called()
 
 
+async def test_run_hourly_maintenance_wal_probe_exception_swallowed_and_logged(tmp_path):
+    """V25 MUST-ADD: probe raising emits sqlite_wal_probe_failed via
+    logger.exception, does NOT fire sqlite_wal_bloat_observed, and does
+    NOT propagate out of the hourly helper.
+    """
+    settings = _make_settings(tmp_path)
+    db = _make_db_mock()
+    db.probe_wal_state = AsyncMock(side_effect=RuntimeError("probe-broke"))
+    session = MagicMock()
+    logger = MagicMock()
+
+    # Must NOT raise
+    await _run_hourly_maintenance(db, session, settings, logger)
+
+    exception_events = [
+        call.args[0] for call in logger.exception.call_args_list if call.args
+    ]
+    assert "sqlite_wal_probe_failed" in exception_events
+
+    warning_events = [
+        call.args[0] for call in logger.warning.call_args_list if call.args
+    ]
+    assert "sqlite_wal_bloat_observed" not in warning_events
+
+
+async def test_run_hourly_maintenance_wal_bloat_strict_inequality_boundary(tmp_path):
+    """V25 MUST-ADD: bloat-trigger uses STRICT `>` per design §D6.
+    Probe returning wal_size_bytes == SQLITE_WAL_BLOAT_BYTES must NOT
+    emit sqlite_wal_bloat_observed (locks in strict-not-equal-or-greater).
+    """
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        DB_PATH=tmp_path / "scout.db",
+        SQLITE_WAL_BLOAT_BYTES=50_000_000,
+    )
+    db = _make_db_mock()
+    db.probe_wal_state = AsyncMock(return_value={
+        "wal_size_bytes": 50_000_000,  # exactly equal — strict `>` must NOT fire
+        "wal_pages": 12207,
+        "shm_size_bytes": 32768,
+        "db_size_bytes": 4096,
+        "page_count": 1,
+        "page_size": 4096,
+        "freelist_count": 0,
+        "journal_mode": "wal",
+        "wal_autocheckpoint": 1000,
+    })
+    session = MagicMock()
+    logger = MagicMock()
+
+    await _run_hourly_maintenance(db, session, settings, logger)
+
+    warning_events = [
+        call.args[0] for call in logger.warning.call_args_list if call.args
+    ]
+    assert "sqlite_wal_bloat_observed" not in warning_events
+
+    # Probe DEBUG event still emits
+    debug_events = [
+        call.args[0] for call in logger.debug.call_args_list if call.args
+    ]
+    assert "sqlite_wal_probe" in debug_events
+
+
 async def test_run_hourly_maintenance_exception_path_logs_structured(tmp_path):
     """logger.exception('score_history_prune_failed') on exception, not silent."""
     settings = _make_settings(tmp_path)

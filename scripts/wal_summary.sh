@@ -26,6 +26,12 @@ JOURNAL_EVENTS=$(journalctl -u gecko-pipeline --since "$SINCE" 2>/dev/null \
 ARCHIVE_EVENTS=""
 if [[ -d "$ARCHIVE_DIR" ]]; then
     cutoff_epoch=$(date -d "$HOURS hours ago" +%s 2>/dev/null || echo 0)
+    if [[ "$cutoff_epoch" -eq 0 ]]; then
+        # V24 SHOULD-FIX: don't silently expand the archive window. A
+        # cutoff_epoch=0 would include every archive file regardless of
+        # the requested HOURS — the operator must see this degradation.
+        echo "WARN: cutoff parse failed for '$HOURS hours ago'; archive window UNBOUNDED" >&2
+    fi
     selected_files=()
     for f in "$ARCHIVE_DIR"/*.jsonl.gz; do
         [[ -f "$f" ]] || continue
@@ -129,7 +135,7 @@ if [[ "$FAILS" -gt 0 ]]; then
     echo "--- Probe failures (raw) ---"
     printf "%s\n" "$COMBINED" \
         | grep '"event": "sqlite_wal_probe_failed"' \
-        | jq -r '"\(.timestamp) \(.exc_info // .exception // \"unknown\")"' 2>/dev/null \
+        | jq -r '"\(.timestamp) \(.exception // "unknown")"' 2>/dev/null \
         | head -10
     echo
 fi

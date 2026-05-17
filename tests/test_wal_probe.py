@@ -60,30 +60,56 @@ async def test_probe_wal_state_wal_file_size_matches_stat(db):
 
 
 async def test_probe_wal_state_wal_file_missing_returns_zero(db, monkeypatch):
-    """V23 SHOULD-FIX: directly test the os.path.exists() = False branch.
+    """V23 SHOULD-FIX (V24 fold update): directly test the WAL-missing branch.
 
-    Mock `os.path.exists` to return False for the WAL path; verify probe
-    returns wal_size_bytes=0 + wal_pages=0 without raising. Uses mocking
-    rather than file-deletion because Windows can't unlink files held open
-    by SQLite (works on Linux but flaky cross-platform).
+    After the TOCTOU fix the probe uses try/except around os.path.getsize
+    rather than exists()+getsize, so the test now mocks getsize to raise
+    FileNotFoundError for the WAL path. Verify probe returns
+    wal_size_bytes=0 + wal_pages=0 without raising. Uses mocking rather
+    than file-deletion because Windows can't unlink files held open by
+    SQLite (works on Linux but flaky cross-platform).
     """
     import os as _os
 
-    real_exists = _os.path.exists
+    real_getsize = _os.path.getsize
     wal_path = db._db_path + "-wal"
     shm_path = db._db_path + "-shm"
 
-    def _no_wal_exists(p):
+    def _no_wal_getsize(p):
         if p == wal_path:
-            return False
-        return real_exists(p)
+            raise FileNotFoundError(p)
+        return real_getsize(p)
 
-    monkeypatch.setattr("os.path.exists", _no_wal_exists)
+    monkeypatch.setattr("os.path.getsize", _no_wal_getsize)
 
     state = await db.probe_wal_state()
     assert state["wal_size_bytes"] == 0
     assert state["wal_pages"] == 0
     # SHM path still exists (shm sidecar still on disk); only WAL is "missing"
+    real_exists = _os.path.exists
     assert state["shm_size_bytes"] == (
-        _os.path.getsize(shm_path) if real_exists(shm_path) else 0
+        real_getsize(shm_path) if real_exists(shm_path) else 0
     )
+
+
+async def test_probe_wal_state_falls_back_to_plain_pragma_wal_autocheckpoint(db):
+    """V25 MUST-ADD: when `SELECT * FROM pragma_wal_autocheckpoint` raises
+    (e.g., SQLite build without SQLITE_INTROSPECTION_PRAGMAS, like Python
+    stdlib on some Windows distros), the probe must fall back to plain
+    `PRAGMA wal_autocheckpoint` and still return a valid int.
+    """
+    original_execute = db._conn.execute
+
+    async def _execute_with_fallback(query, *args, **kwargs):
+        if "pragma_wal_autocheckpoint" in query.lower():
+            raise Exception("simulated: introspection pragma unavailable")
+        return await original_execute(query, *args, **kwargs)
+
+    db._conn.execute = _execute_with_fallback
+    try:
+        state = await db.probe_wal_state()
+    finally:
+        db._conn.execute = original_execute
+
+    assert isinstance(state["wal_autocheckpoint"], int)
+    assert state["wal_autocheckpoint"] >= 0  # default is 1000 in SQLite

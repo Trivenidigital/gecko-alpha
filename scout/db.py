@@ -4952,15 +4952,22 @@ class Database:
             ac_val = await _pragma("wal_autocheckpoint")
             wal_autocheckpoint = int(ac_val) if ac_val is not None else 0
 
-        # WAL + SHM sidecar sizes from filesystem (atomic stat syscalls)
+        # WAL + SHM sidecar sizes from filesystem (atomic stat syscalls).
+        # V24 SHOULD-FIX: single try/except getsize avoids TOCTOU race —
+        # SQLite autocheckpoint can truncate/remove the -wal sidecar between
+        # exists() and getsize(); the two-stage check turns a benign race into
+        # an OSError that bubbles to the hourly hook's try-except and emits a
+        # spurious sqlite_wal_probe_failed event each hour under churn.
         wal_path = self._db_path + "-wal"
         shm_path = self._db_path + "-shm"
-        wal_size_bytes = (
-            os.path.getsize(wal_path) if os.path.exists(wal_path) else 0
-        )
-        shm_size_bytes = (
-            os.path.getsize(shm_path) if os.path.exists(shm_path) else 0
-        )
+        try:
+            wal_size_bytes = os.path.getsize(wal_path)
+        except OSError:
+            wal_size_bytes = 0
+        try:
+            shm_size_bytes = os.path.getsize(shm_path)
+        except OSError:
+            shm_size_bytes = 0
         wal_pages = wal_size_bytes // page_size if page_size else 0
 
         return {
