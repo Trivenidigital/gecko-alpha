@@ -226,15 +226,40 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Note on consolidation:** This entry replaces the prior separate BL-032 + BL-041 (X/Twitter monitoring). They were two pending entries for the same dead-signal problem; merged 2026-05-03.
 
 ### BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT: backtest dead social signal removal/replacement
-**Status:** PROPOSED 2026-05-14.
-**Tag:** `scoring` `dead-signal` `calibration` `hermes-first`
-**Why:** `social_mentions_24h` never fires in production but contributes 15 points to `SCORER_MAX_RAW`. Removing it would raise normalized scores for every candidate, so the correct next move is a backtest/calibration pass, not an inline cleanup.
+**Status:** AUDITED 2026-05-17 — see `tasks/findings_social_mentions_denominator_audit_2026_05_17.md`. Full Plan→2-reviewers→Design→2-reviewers cycle completed. **Recommendation: Option B (remove + recalibrate gates 60→65 / 70→75); 0-flip blast radius across 6,096,576 score_history rows.** Code change DEFERRED to explicit operator approval per scope constraint. PR ships findings doc + audit_v2_queries.sql for re-evaluation + one-line `# DEAD SIGNAL` annotation on scorer.py:121 (zero behavior change; 69/69 scorer tests pass). Hermes X bridge (0/126 resolved) and TG bridge (6 distinct contracts/24h) both data-not-ready; both deferred. 3 follow-up items filed below.
+**Tag:** `scoring` `dead-signal` `calibration` `hermes-first` `audited`
 
-**Scope:** Compare current scoring denominator against: (1) remove `social_mentions_24h` from scoring/max raw, (2) replace with an evidence-gated `narrative_mentions_24h` / `kol_mentions_24h` sourced from Hermes X + TG only after production row thresholds are met, and (3) leave as-is until X narrative rows mature.
+**Original status (now historical):** PROPOSED 2026-05-14. Originating scope: Compare current scoring denominator against (1) remove `social_mentions_24h` from scoring/max raw, (2) replace with evidence-gated `narrative_mentions_24h` / `kol_mentions_24h` from Hermes X + TG, (3) leave as-is until X narrative rows mature.
 
-**Hermes-first basis:** Installed Hermes X/KOL path exists and should be the first social source. Third-party social APIs remain deferred unless this audit proves a residual gap.
+**Hermes-first verdict (post-audit):** Category-exhaustive WebFetch on Hermes skill hub (Social Media category, 7 skills listed) returned no per-token mention-aggregation primitives. awesome-hermes 404 consistent with cycles 7/8/9. Build deferred.
 
-**Evidence gates before bridge-to-scoring:** at least 50 `narrative_alerts_inbound` rows, at least 20 resolved rows or an explicit symbol-resolution design, and attribution analysis showing X/TG rows improve early signal quality versus existing gainers/trending/momentum surfaces.
+**Re-evaluation triggers** (operator runs `tasks/audit_v2_queries.sql` when ANY fires):
+1. `narrative_alerts_inbound.resolved_coin_id` ≥ 20 in any 30d window (currently 0/126)
+2. `tg_social_messages` distinct-contract 24h rollup ≥ 50 (currently 6)
+3. `scorer.py` signal weight change OR `SCORER_MAX_RAW` change (invalidates Variant B's 0-flip math)
+4. 2026-08-17 (90d calendar backstop per cycle-9 `keep_on_provisional_until_<iso>` convention)
+5. Operator explicit request
+
+### BL-NEW-SOCIAL-DENOMINATOR-RE-EVAL-WATCHDOG: daily cron for re-eval triggers 1+2
+**Status:** PROPOSED 2026-05-17 — filed concurrent with BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT findings.
+**Tag:** `observability` `audit-watchdog` `silent-failure-prevention`
+**Why:** Re-eval triggers 1+2 (`narrative_alerts_inbound.resolved_coin_id` ≥ 20 in 30d; `tg_social_messages` distinct-contract 24h ≥ 50) are operator-memory-dependent. Per CLAUDE.md §12a (freshness SLO + watchdog rule), decision-bearing thresholds need automated detection or they silently never fire — same shape as `BL-NEW-REVIVAL-VERDICT-WATCHDOG` from cycle-9. The 2c (TG rollup) and 2a (resolution rate) follow-ups merged into this single watchdog per design-review fold R1 #5 (both query the same `narrative_alerts_inbound` + `tg_social_messages` surface).
+**Action:** Daily cron query against `narrative_alerts_inbound` resolution-count (30d window) AND `tg_social_messages` distinct-contract 24h rollup; TG alert ("revival_criteria-style") when either threshold crossed.
+**Decision-by:** 4 weeks from PR merge (2026-06-14). Match cycle-9 watchdog calendar discipline.
+
+### BL-NEW-SCORER-DEAD-SIGNAL-COMMENT-CONVENTION: codify the `# DEAD SIGNAL` annotation pattern
+**Status:** PROPOSED 2026-05-17 — filed concurrent with BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT findings.
+**Tag:** `scoring` `code-convention` `intellectual-debt-prevention`
+**Why:** Per design-review fold R2 §2: Signal 13 (CryptoPanic) at `scorer.py:184-198` has a documented gated-comment convention; Signal 5 (Social Mentions) lacked one until this audit added it. Future scorer audits will repeat this work unless the convention is codified.
+**Action:** One-line style-guide addition: "Any scorer signal that hasn't fired in the last 7d production window MUST carry a `# DEAD SIGNAL` or `# GATED — pending <BL ticket>` comment immediately above the threshold check." Bundle with next scorer.py touch.
+**Decision-by:** 8 weeks from PR merge (2026-07-12). Calendar-bound.
+
+### BL-NEW-SOCIAL-DENOMINATOR-OPERATOR-PREFERENCE: B vs C decision for next-cycle code change
+**Status:** PROPOSED 2026-05-17 — surfaced as Open Question 1 in audit findings.
+**Tag:** `operator-decision` `awaiting-response`
+**Why:** Audit recommends Variant B (remove + recalibrate gates 60→65 / 70→75) with 0-flip blast radius. Variant C (remove WITHOUT recalibrating) widens MiroFish funnel by 35 historical candidates — operator may value this if recall > precision.
+**Action:** Operator responds via PR comment OR `tasks/findings_social_mentions_denominator_operator_decision.md` follow-up commit. On response: close this entry; file `BL-NEW-SOCIAL-DENOMINATOR-VARIANT-{B,C}-IMPL` for the code-change PR.
+**Decision-by:** 4 weeks from PR merge (2026-06-14). If no response by then, default action = stamp interim Option A + auto-re-file at 2026-08-17 backstop.
 
 ### BL-033: Add heartbeat logging every 5 minutes
 **Status:** DONE — heartbeat logging implemented (PR #7)
