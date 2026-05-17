@@ -1487,7 +1487,6 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **decision-by:** 6 weeks (audit-first, then implement).
 
 ### BL-NEW-SYSTEMD-UNIT-IN-REPO: systemd units must be repo-tracked
-**Status:** PROPOSED 2026-05-16 — V4 NOTE finding from `feat/score-volume-pruning-harden` PR design review.
-**Why:** `/etc/systemd/system/gecko-pipeline.service` and `gecko-dashboard.service` exist only on srilu-vps, not in the `systemd/` directory of this repo. Any drift between repo and prod (e.g., `Restart=always` policy, `RestartSec`, environment overrides) is invisible to PR reviewers. Substrate-finding shape — config-not-in-git is the same class that drove the 2026-05-16 backlog drift audit.
-**Action:** capture live unit files from srilu, commit to `systemd/gecko-pipeline.service` + `systemd/gecko-dashboard.service`, document the deploy workflow that copies repo → `/etc/systemd/system/`.
-**decision-by:** 4 weeks (documentation+capture exercise).
+**Status:** SHIPPED 2026-05-17 — branch `feat/systemd-units-in-repo` (cycle 6). Captured `gecko-pipeline.service` + `gecko-dashboard.service` verbatim from srilu `/etc/systemd/system/` into `systemd/`. `systemd/README.md` documents deploy workflow + drift-audit one-liner. No drop-in directories on srilu (`/etc/systemd/system/<unit>.service.d/` absent for both units; full capture is the 2 files). Operator deploy workflow: pull → `sudo cp systemd/*.service /etc/systemd/system/` → `sudo systemctl daemon-reload` → `sudo systemctl restart gecko-pipeline gecko-dashboard`.
+
+**Original status (now historical):** PROPOSED 2026-05-16 — V4 NOTE finding from `feat/score-volume-pruning-harden` PR design review. `/etc/systemd/system/gecko-pipeline.service` and `gecko-dashboard.service` exist only on srilu-vps, not in `systemd/` directory of this repo. Substrate-finding shape — config-not-in-git is the same class that drove the 2026-05-16 backlog drift audit.
