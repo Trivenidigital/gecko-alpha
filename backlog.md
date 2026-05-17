@@ -1487,7 +1487,19 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **decision-by:** 6 weeks (audit-first, then implement).
 
 ### BL-NEW-SYSTEMD-UNIT-IN-REPO: systemd units must be repo-tracked
-**Status:** PROPOSED 2026-05-16 — V4 NOTE finding from `feat/score-volume-pruning-harden` PR design review.
-**Why:** `/etc/systemd/system/gecko-pipeline.service` and `gecko-dashboard.service` exist only on srilu-vps, not in the `systemd/` directory of this repo. Any drift between repo and prod (e.g., `Restart=always` policy, `RestartSec`, environment overrides) is invisible to PR reviewers. Substrate-finding shape — config-not-in-git is the same class that drove the 2026-05-16 backlog drift audit.
-**Action:** capture live unit files from srilu, commit to `systemd/gecko-pipeline.service` + `systemd/gecko-dashboard.service`, document the deploy workflow that copies repo → `/etc/systemd/system/`.
-**decision-by:** 4 weeks (documentation+capture exercise).
+**Status:** SHIPPED 2026-05-17 — branch `feat/systemd-units-in-repo` (cycle 6). Captured `gecko-pipeline.service` + `gecko-dashboard.service` verbatim from srilu `/etc/systemd/system/` into `systemd/`. `systemd/README.md` documents deploy workflow + drift-audit one-liner. No drop-in directories on srilu (`/etc/systemd/system/<unit>.service.d/` absent for both units; full capture is the 2 files). V34/V35 PR-review folds: wildcard `cp systemd/*.{service,timer}` (scales to future units), drop-in enumeration in audit one-liner, `systemctl edit` warning, restart blast-radius callout, reload-semantics clarification (long-running needs explicit restart; timers don't unless schedule changed).
+
+**Original status (now historical):** PROPOSED 2026-05-16 — V4 NOTE finding from `feat/score-volume-pruning-harden` PR design review. `/etc/systemd/system/gecko-pipeline.service` and `gecko-dashboard.service` exist only on srilu-vps, not in `systemd/` directory of this repo. Substrate-finding shape — config-not-in-git is the same class that drove the 2026-05-16 backlog drift audit.
+
+### BL-NEW-SYSTEMD-DRIFT-PRECOMMIT-HOOK: prevent recurrence via automated drift detection
+**Status:** PROPOSED 2026-05-17 — V35 PR-review FOLLOW-UP from BL-NEW-SYSTEMD-UNIT-IN-REPO (PR #142).
+**Why:** Capturing unit files (cycle 6 above) closes the capture gap but not the recurrence gap. An operator can `sudo systemctl edit <unit>` or directly `vim /etc/systemd/system/...` at any time; the audit one-liner only catches drift if someone runs it. Substrate-finding recurrence is the same class.
+**Action:** Either (a) daily cron on srilu running `scripts/check_systemd_drift.sh` + Telegram alert on DRIFT, OR (b) pre-commit hook running `diff systemd/*.{service,timer} /etc/systemd/system/*` and warning. (a) is the better fit since drift is operator-introduced on the deploy host, not at commit time on the dev machine.
+**Pattern:** parallels existing `scripts/pre-commit-dist-consistency.sh`.
+**decision-by:** 4 weeks (small mechanical task; defer until BL-NEW-OTHER-PROD-CONFIG-AUDIT sweeps the broader surface).
+
+### BL-NEW-OTHER-PROD-CONFIG-AUDIT: sweep srilu for other repo-untracked prod config
+**Status:** PROPOSED 2026-05-17 — V35 PR-review FOLLOW-UP from BL-NEW-SYSTEMD-UNIT-IN-REPO (PR #142).
+**Why:** systemd units were just the obvious instance. Same substrate class likely covers: cron entries (`crontab -l`), `/etc/sudoers.d/`, drop-in dirs under `/etc/systemd/system/*.service.d/`, nginx/caddy config, journald.conf overrides, env files outside `.env`. One audit pass forecloses future "we have a third one of these" findings.
+**Action:** ssh root@srilu-vps; enumerate each category above; commit anything operator-meaningful to repo OR document why explicitly omitted (e.g., secrets, host-specific paths).
+**decision-by:** 6 weeks (audit-first task; doc-only outputs).

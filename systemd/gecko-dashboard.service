@@ -1,0 +1,14 @@
+[Unit]
+Description=Gecko Alpha Dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/gecko-alpha
+ExecStart=/root/.local/bin/uv run uvicorn dashboard.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=10
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

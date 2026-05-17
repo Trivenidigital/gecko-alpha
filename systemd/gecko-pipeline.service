@@ -1,0 +1,14 @@
+[Unit]
+Description=Gecko Alpha Pipeline
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/gecko-alpha
+ExecStart=/root/.local/bin/uv run python -m scout.main
+Restart=always
+RestartSec=10
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
