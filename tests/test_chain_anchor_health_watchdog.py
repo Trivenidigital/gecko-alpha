@@ -142,6 +142,56 @@ async def test_watchdog_fails_when_anchor_eligible_events_but_active_chains_stal
 
     assert result["ok"] is False
     assert "active_chains_stale" in result["reasons"]
+    assert "narrative:full_conviction" in result["active_chains_stale_keys"]
+
+
+async def test_watchdog_fails_when_one_pattern_stale_even_if_another_is_fresh(
+    db, tmp_path
+):
+    env = _write_env(tmp_path / ".env")
+    now = datetime.now(timezone.utc)
+    stale = now - timedelta(hours=30)
+    await _insert_signal_event(
+        db,
+        token_id="cat-ai",
+        pipeline="narrative",
+        event_type="category_heating",
+        data={"acceleration": 8},
+        when=now,
+    )
+    await _insert_signal_event(
+        db,
+        token_id="0xabc",
+        pipeline="memecoin",
+        event_type="candidate_scored",
+        data={"signal_count": 2},
+        when=now,
+    )
+    await _insert_active_chain(
+        db,
+        token_id="0xabc",
+        pipeline="memecoin",
+        pattern_name="volume_breakout",
+        when=now,
+    )
+    await _insert_active_chain(
+        db,
+        token_id="cat-old",
+        pipeline="narrative",
+        pattern_name="full_conviction",
+        when=stale,
+    )
+
+    result = check_chain_anchor_health(
+        db._db_path,
+        env_path=env,
+        active_stale_hours=24,
+    )
+
+    assert result["ok"] is False
+    assert "active_chains_stale" in result["reasons"]
+    assert "narrative:full_conviction" in result["active_chains_stale_keys"]
+    assert "memecoin:volume_breakout" not in result["active_chains_stale_keys"]
 
 
 async def test_watchdog_ignores_memecoin_candidate_below_anchor_condition(db, tmp_path):
@@ -160,3 +210,35 @@ async def test_watchdog_ignores_memecoin_candidate_below_anchor_condition(db, tm
 
     assert result["ok"] is True
     assert result["recent_anchor_events"] == 0
+
+
+async def test_watchdog_missing_db_does_not_create_file(tmp_path):
+    env = _write_env(tmp_path / ".env")
+    missing = tmp_path / "missing.db"
+
+    result = check_chain_anchor_health(missing, env_path=env)
+
+    assert result["ok"] is False
+    assert "db_missing" in result["reasons"]
+    assert not missing.exists()
+
+
+async def test_watchdog_schema_pending_is_ok_before_migration(tmp_path):
+    import sqlite3
+
+    env = _write_env(tmp_path / ".env")
+    path = tmp_path / "old.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """CREATE TABLE chain_patterns (
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                steps_json TEXT,
+                is_active INTEGER
+            )"""
+        )
+
+    result = check_chain_anchor_health(path, env_path=env)
+
+    assert result["ok"] is True
+    assert result["status"] == "schema_pending"

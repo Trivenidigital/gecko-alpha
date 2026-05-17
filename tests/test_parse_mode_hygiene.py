@@ -172,7 +172,6 @@ def _direct_post_has_parse_mode(call: ast.Call, name_map: dict[str, ast.AST]) ->
 # 10 sites below fall into:
 #  - send_telegram_message dispatch sites (LOW/MEDIUM per audit, body
 #    shape unlikely to mangle):
-#      scout/chains/alerts.py:59
 #      scout/trading/suppression.py:186
 #      scout/live/loops.py:251
 #      scout/main.py:166 (combo_refresh failure)
@@ -200,7 +199,6 @@ def _direct_post_has_parse_mode(call: ast.Call, name_map: dict[str, ast.AST]) ->
 # Follow-up PRs remove entries from this set; a NEW dispatch site that's
 # not in this allowlist will be caught at CI time.
 _ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE: set[tuple[str, int]] = {
-    ("scout/chains/alerts.py", 59),
     ("scout/trading/suppression.py", 186),
     ("scout/live/loops.py", 251),
     ("scout/main.py", 166),

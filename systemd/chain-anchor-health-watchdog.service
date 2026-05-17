@@ -1,6 +1,6 @@
 [Unit]
 Description=Gecko-Alpha - Chain anchor health watchdog
-After=network-online.target
+After=network-online.target gecko-pipeline.service
 Wants=network-online.target
 
 [Service]
@@ -15,6 +15,9 @@ Environment=GECKO_PYTHON=/root/gecko-alpha/.venv/bin/python
 Environment=CHAIN_ANCHOR_WATCHDOG_ANCHOR_WINDOW_HOURS=24
 Environment=CHAIN_ANCHOR_WATCHDOG_ACTIVE_STALE_HOURS=24
 ExecStartPre=/usr/bin/test -x /root/gecko-alpha/scripts/chain-anchor-health-watchdog.sh
+# Avoid deploy-time false alerts before gecko-pipeline has applied migrations
+# and reconciled built-in chain patterns.
+ExecStartPre=/usr/bin/systemctl is-active --quiet gecko-pipeline.service
 ExecStart=/root/gecko-alpha/scripts/chain-anchor-health-watchdog.sh
 # Exit 1 = unhealthy condition detected and Telegram alert delivered.
 SuccessExitStatus=1

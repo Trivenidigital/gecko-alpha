@@ -145,10 +145,11 @@ Logic:
 3. Find recent anchor-eligible events by loading protected active patterns and applying their step-1 event type and condition with `evaluate_condition()`:
    - narrative examples: `category_heating`
    - memecoin example: `candidate_scored` with `signal_count >= 2`
-4. Find `MAX(anchor_time)` from `active_chains`.
+4. Find `MAX(anchor_time)` from `active_chains` per `(pipeline, pattern_name)`.
 5. Fail if active protected built-ins count is 0.
-6. Fail if recent anchor events exist and `active_chains` max is missing or older than `--active-stale-hours`.
-7. Return JSON with `ok`, `status`, `active_protected_patterns`, `recent_anchor_events`, `active_chains_max_anchor_time`, and `reasons`.
+6. Fail if recent anchor events exist for a specific `(pipeline, pattern_name)` and that key's `active_chains` max is missing or older than `--active-stale-hours`.
+7. Open SQLite read-only and return `status="schema_pending"` without alert if the provenance migration has not run yet; this avoids deploy-time false positives before `gecko-pipeline` applies migrations.
+8. Return JSON with `ok`, `status`, `active_protected_patterns`, `recent_anchor_events`, `recent_anchor_event_keys`, `active_chains_max_anchor_time`, `active_chains_missing_keys`, `active_chains_stale_keys`, and `reasons`.
 
 The watchdog deliberately does not alert on stale `chain_matches`. Completions require later step sequences and are a signal-quality metric, not a table-writer health SLO.
 
@@ -225,7 +226,7 @@ C:\projects\gecko-alpha\.venv\Scripts\python.exe -m pytest `
 1. Merge PR.
 2. Pull on VPS.
 3. Restart `gecko-pipeline`.
-4. Install watchdog service/timer.
+4. Install watchdog service/timer: `systemctl enable --now chain-anchor-health-watchdog.timer`.
 5. Verify:
 
 ```bash

@@ -222,6 +222,41 @@ async def test_lifecycle_retires_non_builtin_pattern(db, settings):
     assert row["disabled_at"] is not None
 
 
+async def test_lifecycle_preserves_operator_disabled_non_builtin_pattern(db, settings):
+    await db._conn.execute(
+        """INSERT INTO chain_patterns
+           (name, description, steps_json, min_steps_to_trigger,
+            conviction_boost, alert_priority, is_active, is_protected_builtin,
+            disabled_reason, disabled_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "experimental_operator_disabled",
+            "test pattern",
+            '[{"step_number":1,"event_type":"candidate_scored","condition":null,"max_hours_after_anchor":0.0,"max_hours_after_previous":null}]',
+            1,
+            1,
+            "low",
+            0,
+            0,
+            "operator_disabled",
+            "2026-05-17T00:00:00+00:00",
+        ),
+    )
+    await db._conn.commit()
+    await _seed_matches(
+        db, "experimental_operator_disabled", "memecoin", n_hits=1, n_misses=14
+    )
+
+    await run_pattern_lifecycle(db, settings)
+
+    async with db._conn.execute(
+        "SELECT is_active, disabled_reason FROM chain_patterns WHERE name='experimental_operator_disabled'"
+    ) as cur:
+        row = await cur.fetchone()
+    assert row["is_active"] == 0
+    assert row["disabled_reason"] == "operator_disabled"
+
+
 async def test_update_chain_outcomes_from_predictions(db, settings):
     """Chain outcomes (narrative pipeline) are hydrated from predictions."""
     async with db._conn.execute(

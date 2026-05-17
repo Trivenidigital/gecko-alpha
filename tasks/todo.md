@@ -16,11 +16,16 @@ Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvemen
 - [x] Fresh focused verification: `tests/test_chains_patterns.py tests/test_chains_learn.py tests/test_chains_tracker.py tests/test_chain_pattern_provenance_migration.py tests/test_chain_anchor_health_watchdog.py` -> 49 passed
 - [x] Fresh wider chain verification: `tests/test_chains_events.py tests/test_chains_db.py tests/test_chains_patterns.py tests/test_chains_tracker.py tests/test_chains_integration.py tests/test_chains_learn.py tests/test_chain_outcomes_hydration.py tests/test_narrative_chain_coherence.py` -> 79 passed, 1 skipped
 - [x] Full-suite verification after rebase + parse-mode harness line-drift fix: `2316 passed, 39 skipped, 12 warnings in 330.87s`
-- [ ] Create PR and run three parallel PR reviews
+- [x] PR created: https://github.com/Trivenidigital/gecko-alpha/pull/146
+- [x] Three parallel PR reviews dispatched; first batch timed out, replacement reviewers returned structural/deploy/observability findings
+- [x] Fold PR-review findings: per-pattern watchdog freshness, read-only DB check + schema-pending state, concrete timer enable docs, chain alert `parse_mode=None`, non-built-in operator/code disable preservation
+- [x] Review-fold verification: watchdog/lifecycle/chain-alert/parse-mode targeted suite -> 24 passed; broader chain suite -> 94 passed, 1 skipped
+- [ ] Final full-suite verification after PR-review fold
 
 Review:
 - Fixed the actual runtime lever, not only the original `_check_active_chains` hypothesis: protected built-in `chain_patterns` can no longer be lifecycle-retired into complete anchor starvation, and exact known prod legacy retirement state is recoverable without reversing unknown/operator-disabled rows.
 - Added recurrence coverage with `scripts/check_chain_anchor_health.py`, `scripts/chain-anchor-health-watchdog.sh`, and hourly systemd units that alert only when active protected patterns are missing or anchor-eligible upstream events are present while `active_chains` is stale.
+- Pushed back on the partial-snapshot reactivation suggestion: all-or-nothing exact prod snapshot recovery is intentional per design because broadening inference can reverse unknown operator intent. The watchdog/logs surface non-matching inactive states for manual decision.
 
 ## Active Work: baseline test failures after PR #136 review
 

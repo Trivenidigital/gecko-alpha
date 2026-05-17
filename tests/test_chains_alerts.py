@@ -1,8 +1,11 @@
 """Tests for chain alert formatting."""
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
-from scout.chains.alerts import format_chain_alert
+import pytest
+
+from scout.chains.alerts import format_chain_alert, send_chain_alert
 from scout.chains.models import ActiveChain, ChainPattern, ChainStep
 
 
@@ -57,3 +60,38 @@ def test_format_chain_alert_contains_required_fields():
     assert "3/4" in msg
     assert "+25" in msg
     assert "42" in msg
+
+
+@pytest.mark.asyncio
+async def test_send_chain_alert_uses_plain_text_parse_mode(monkeypatch):
+    now = datetime.now(timezone.utc)
+    chain = ActiveChain(
+        token_id="0xabc",
+        pipeline="memecoin",
+        pattern_id=1,
+        pattern_name="full_conviction",
+        steps_matched=[1, 2, 3],
+        step_events={1: 10, 2: 11, 3: 12},
+        anchor_time=now,
+        last_step_time=now + timedelta(hours=3),
+        is_complete=True,
+        completed_at=now + timedelta(hours=3),
+        created_at=now,
+    )
+    captured = {}
+
+    async def _send(text, session, settings, **kwargs):
+        captured["text"] = text
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _send)
+
+    await send_chain_alert(
+        db=SimpleNamespace(),
+        chain=chain,
+        pattern=_make_pattern(),
+        settings=SimpleNamespace(),
+    )
+
+    assert "full_conviction" in captured["text"]
+    assert captured["kwargs"]["parse_mode"] is None

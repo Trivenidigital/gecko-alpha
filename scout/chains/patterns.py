@@ -402,7 +402,9 @@ async def run_pattern_lifecycle(db: Database, settings: Settings) -> None:
 
         if s["total_evaluated"] >= settings.CHAIN_MIN_TRIGGERS_FOR_STATS:
             if s["hit_rate"] < _RETIREMENT_HIT_RATE:
-                if is_protected_builtin:
+                if disabled_by_operator_or_code:
+                    pass
+                elif is_protected_builtin:
                     if is_active:
                         logger.info(
                             "chain_pattern_retirement_blocked_protected",

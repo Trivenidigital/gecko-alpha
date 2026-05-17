@@ -36,7 +36,7 @@ def _parse_time(value: str | None) -> datetime | None:
 
 def _load_protected_anchor_steps(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
-        """SELECT steps_json
+        """SELECT name, steps_json
            FROM chain_patterns
            WHERE is_active = 1 AND is_protected_builtin = 1"""
     ).fetchall()
@@ -51,6 +51,7 @@ def _load_protected_anchor_steps(conn: sqlite3.Connection) -> list[dict[str, Any
             continue
         steps.append(
             {
+                "pattern_name": row["name"],
                 "pipeline": None,
                 "event_type": first["event_type"],
                 "condition": first.get("condition"),
@@ -59,14 +60,14 @@ def _load_protected_anchor_steps(conn: sqlite3.Connection) -> list[dict[str, Any
     return steps
 
 
-def _count_recent_anchor_events(
+def _count_recent_anchor_events_by_pattern(
     conn: sqlite3.Connection,
     *,
     since: datetime,
-) -> int:
+) -> dict[tuple[str, str], int]:
     steps = _load_protected_anchor_steps(conn)
     if not steps:
-        return 0
+        return {}
     event_types = sorted({step["event_type"] for step in steps})
     placeholders = ",".join("?" for _ in event_types)
     rows = conn.execute(
@@ -77,7 +78,7 @@ def _count_recent_anchor_events(
         (since.isoformat(), *event_types),
     ).fetchall()
 
-    count = 0
+    counts: dict[tuple[str, str], int] = {}
     for row in rows:
         data = json.loads(row["event_data"])
         for step in steps:
@@ -86,9 +87,20 @@ def _count_recent_anchor_events(
             if step["pipeline"] is not None and step["pipeline"] != row["pipeline"]:
                 continue
             if evaluate_condition(step["condition"], data):
-                count += 1
-                break
-    return count
+                key = (step["pattern_name"], row["pipeline"])
+                counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _has_chain_pattern_provenance_schema(conn: sqlite3.Connection) -> bool:
+    rows = conn.execute("PRAGMA table_info(chain_patterns)").fetchall()
+    cols = {row["name"] for row in rows}
+    return {"is_protected_builtin", "disabled_reason", "disabled_at"} <= cols
+
+
+def _connect_readonly(db_path: Path) -> sqlite3.Connection:
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    return sqlite3.connect(uri, uri=True)
 
 
 def check_chain_anchor_health(
@@ -103,11 +115,27 @@ def check_chain_anchor_health(
     if not _parse_env_bool(env, "CHAINS_ENABLED", True):
         return {"ok": True, "status": "disabled", "reasons": []}
 
+    path = Path(db_path)
+    if not path.exists():
+        return {
+            "ok": False,
+            "status": "alert",
+            "reasons": ["db_missing"],
+            "db_path": str(path),
+        }
+
     now = datetime.now(timezone.utc)
     since = now - timedelta(hours=anchor_window_hours)
     reasons: list[str] = []
-    with sqlite3.connect(db_path) as conn:
+    with _connect_readonly(path) as conn:
         conn.row_factory = sqlite3.Row
+        if not _has_chain_pattern_provenance_schema(conn):
+            return {
+                "ok": True,
+                "status": "schema_pending",
+                "reasons": [],
+                "db_path": str(path),
+            }
         active_protected = conn.execute(
             """SELECT COUNT(*)
                FROM chain_patterns
@@ -116,21 +144,46 @@ def check_chain_anchor_health(
         if active_protected == 0:
             reasons.append("no_active_protected_patterns")
 
-        recent_anchor_events = _count_recent_anchor_events(conn, since=since)
-        row = conn.execute("SELECT MAX(anchor_time) FROM active_chains").fetchone()
-        max_anchor = _parse_time(row[0] if row else None)
-        if recent_anchor_events > 0:
+        recent_by_key = _count_recent_anchor_events_by_pattern(conn, since=since)
+        active_rows = conn.execute(
+            """SELECT pattern_name, pipeline, MAX(anchor_time) AS max_anchor
+               FROM active_chains
+               GROUP BY pattern_name, pipeline"""
+        ).fetchall()
+        max_by_key = {
+            (row["pattern_name"], row["pipeline"]): _parse_time(row["max_anchor"])
+            for row in active_rows
+        }
+        stale_keys: list[str] = []
+        missing_keys: list[str] = []
+        for key, count in recent_by_key.items():
+            if count <= 0:
+                continue
+            max_anchor = max_by_key.get(key)
             if max_anchor is None:
-                reasons.append("active_chains_missing")
+                missing_keys.append(f"{key[1]}:{key[0]}")
             elif (now - max_anchor).total_seconds() / 3600.0 > active_stale_hours:
-                reasons.append("active_chains_stale")
+                stale_keys.append(f"{key[1]}:{key[0]}")
+        if missing_keys:
+            reasons.append("active_chains_missing")
+        if stale_keys:
+            reasons.append("active_chains_stale")
+
+        max_anchor_values = [dt for dt in max_by_key.values() if dt is not None]
+        max_anchor = max(max_anchor_values) if max_anchor_values else None
 
     return {
         "ok": not reasons,
         "status": "ok" if not reasons else "alert",
         "active_protected_patterns": active_protected,
-        "recent_anchor_events": recent_anchor_events,
+        "recent_anchor_events": sum(recent_by_key.values()),
+        "recent_anchor_event_keys": {
+            f"{pipeline}:{pattern_name}": count
+            for (pattern_name, pipeline), count in sorted(recent_by_key.items())
+        },
         "active_chains_max_anchor_time": max_anchor.isoformat() if max_anchor else None,
+        "active_chains_missing_keys": missing_keys,
+        "active_chains_stale_keys": stale_keys,
         "reasons": reasons,
     }
 
