@@ -722,6 +722,28 @@ def test_load_settings_logs_validation_error_before_raise():
     assert "SCORE_HISTORY_RETENTION_DAYS" in error_events[0]["error"]
 
 
+def test_tg_burst_profile_enabled_default_true():
+    """BL-NEW-TG-BURST-PROFILE cycle 3: default True for the 4-week measurement window."""
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.TG_BURST_PROFILE_ENABLED is True
+
+
+def test_tg_burst_profile_enabled_env_override():
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        TG_BURST_PROFILE_ENABLED=False,
+    )
+    assert s.TG_BURST_PROFILE_ENABLED is False
+
+
 def test_load_settings_returns_normally_on_valid_input():
     """load_settings() preserves Settings() return-value semantics when valid."""
     from scout.config import load_settings

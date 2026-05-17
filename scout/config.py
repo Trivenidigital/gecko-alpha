@@ -268,6 +268,14 @@ class Settings(BaseSettings):
     CHAIN_MATCHES_RETENTION_DAYS: int = 45
     HOLDER_SNAPSHOTS_RETENTION_DAYS: int = 14
 
+    # BL-NEW-TG-BURST-PROFILE: per-call instrumentation for TG dispatch
+    # frequency. Default True for the 4-week measurement window; toggle
+    # False via .env to disable if instrumentation overhead surfaces.
+    # Counter is in-memory deque (collections.deque + threading.Lock);
+    # logs at debug (per-call) + warning (burst/429). See
+    # tasks/plan_tg_burst_profile.md for pre-registered decision criteria.
+    TG_BURST_PROFILE_ENABLED: bool = True
+
     # -------- LunarCrush Social-Velocity Alerter --------
     # Research-only social-velocity signals (Telegram plain-text, no paper
     # trade dispatch). Double kill-switch: either LUNARCRUSH_ENABLED=false or

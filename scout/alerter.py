@@ -8,6 +8,7 @@ import aiohttp
 from scout.config import Settings
 from scout.exceptions import AlertDeliveryError
 from scout.models import CandidateToken
+from scout.observability.tg_dispatch_counter import record_dispatch, record_429
 
 logger = structlog.get_logger()
 
@@ -141,6 +142,7 @@ async def send_telegram_message(
     *,
     parse_mode: str | None = "Markdown",
     raise_on_failure: bool = False,
+    source: str = "unattributed",
 ) -> None:
     """Send a Telegram message.
 
@@ -150,6 +152,11 @@ async def send_telegram_message(
     e.g., calibrate dry-run alerts whose body contains `[reason]`
     brackets that the Markdown parser would mis-handle as link
     anchors → silent 400 BAD_REQUEST per PR #76 silent-failure C1).
+
+    `source` is a callsite label for TG-burst attribution
+    (BL-NEW-TG-BURST-PROFILE, cycle 3). Legacy callers default to
+    `"unattributed"`; explicit labels enable `tg_burst_summary.sh`
+    top-K analysis.
     """
     text = _truncate(text)
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -159,16 +166,52 @@ async def send_telegram_message(
     }
     if parse_mode is not None:
         payload["parse_mode"] = parse_mode
+
+    # BL-NEW-TG-BURST-PROFILE cycle 3: record intent-to-dispatch BEFORE
+    # the HTTP call (burst pressure is about call rate, not delivery).
+    if settings.TG_BURST_PROFILE_ENABLED:
+        try:
+            record_dispatch(str(settings.TELEGRAM_CHAT_ID), source=source)
+        except Exception:
+            logger.exception("record_dispatch_failed")
+
     try:
         async with session.post(url, json=payload) as resp:
+            # V15 M3 fold: read body bytes ONCE, parse for both 429
+            # retry_after AND non-200 logging. resp.json()+resp.text()
+            # would double-consume the stream.
+            body_bytes = await resp.read() if resp.status != 200 else None
+            if resp.status == 429 and body_bytes is not None:
+                retry_after = None
+                try:
+                    body_json = json.loads(body_bytes)
+                    retry_after = body_json.get("parameters", {}).get("retry_after")
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                # V15 M2 fold: wrap record_429 in its own try/except so
+                # instrumentation failure can't be mis-attributed by the
+                # outer try/except as a Telegram-side error.
+                if settings.TG_BURST_PROFILE_ENABLED:
+                    try:
+                        record_429(
+                            str(settings.TELEGRAM_CHAT_ID),
+                            source=source,
+                            retry_after=retry_after,
+                        )
+                    except Exception:
+                        logger.exception("record_429_failed")
             if resp.status != 200:
-                body = await resp.text()
+                body = (
+                    body_bytes.decode("utf-8", errors="replace")[:200]
+                    if body_bytes
+                    else ""
+                )
                 logger.warning(
-                    "Telegram daily summary failed", status=resp.status, body=body[:200]
+                    "Telegram daily summary failed", status=resp.status, body=body
                 )
                 if raise_on_failure:
                     raise RuntimeError(
-                        f"telegram send failed status={resp.status} body={body[:200]}"
+                        f"telegram send failed status={resp.status} body={body}"
                     )
     except Exception as e:
         logger.warning("Telegram daily summary error", error=str(e))
