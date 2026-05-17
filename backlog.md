@@ -1507,10 +1507,23 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **decision-by:** 6 weeks (audit-first task; doc-only outputs).
 
 ### BL-NEW-CHAIN-COMPLETED-SILENCE-AUDIT: investigate 10+ day chain_completed silence
-**Status:** PROPOSED 2026-05-17 — Finding 1 from BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT (cycle 7).
-**Why:** `chain_completed` is Tier 1a "strongest cohort" but last opened a trade 2026-05-07 (10+ days dead). Either: (a) chain-pattern detector regression in `scout/scoring/chain_completed.py` or upstream `chain_matches` writer; (b) genuinely quiet 10-day window for the pattern; (c) auto-suspend (would show in `signal_params` table).
-**Action:** ~1h. (i) `journalctl -g chain_completed --since "10 days ago"` for the window; (ii) `SELECT COUNT(*), MAX(completed_at) FROM chain_matches WHERE completed_at >= '2026-05-07'` — empty result = detection broke; (iii) `SELECT * FROM signal_params WHERE signal_type='chain_completed' AND enabled=0` — non-empty = auto-suspended. If (i)/(ii) reveal regression, file fix as separate item.
-**decision-by:** 2 weeks (low cost; high-tier signal silence shouldn't sit unresolved).
+**Status:** SHIPPED-WITH-FINDING 2026-05-17 — branch `feat/chain-completed-silence-audit` (cycle 8, audit-only). Findings doc: `tasks/findings_chain_completed_silence_2026_05_17.md`. **Confirmed regression:** chain_matches narrative pipeline silent 5.5d (last 2026-05-11T16:43Z); memecoin pipeline silent 13d (last 2026-05-04T00:51Z). active_chains MAX(anchor_time)=2026-05-11T16:42Z (no new anchors); signal_params enabled=1 (NOT auto-suspended); code path unchanged in May. Mechanism per §9c: visible levers (enabled=1, code unchanged) ≠ controlling lever (something stopped creating new active_chains rows). Surfaced as HIGH-priority fix item `BL-NEW-CHAIN-ANCHOR-PIPELINE-FIX`. Second chain-pipeline silence in ~6 weeks (prior: 2026-04-14→2026-05-01, 17d, fixed PR #60/#61); same substrate class.
+
+**Original status (now historical):** PROPOSED 2026-05-17 — Finding 1 from BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT (cycle 7).
+
+### BL-NEW-CHAIN-ANCHOR-PIPELINE-FIX: restore chain-anchor creation (active_chains writer dead since 2026-05-11T16:42Z)
+**Status:** PROPOSED 2026-05-17 — surfaced by BL-NEW-CHAIN-COMPLETED-SILENCE-AUDIT (cycle 8) as HIGH-priority follow-up.
+**Tag:** `regression` `silent-failure` `tier-1a-down` `chain-detection` `recurrence`
+**Why:** Tier 1a's strongest signal (`chain_completed`) has been STRUCTURALLY DEAD for 5.5+ days. `active_chains` MAX(anchor_time)=2026-05-11T16:42Z; no new anchors since. Code unchanged in scout/chains/ during May; signal_params shows enabled=1. The controlling lever is upstream of `chains.tracker._check_active_chains` — something stopped feeding new chain-step matches that would create the anchor.
+**Mechanism per §9c:** candidate_scored events still firing every cycle (verified journalctl), but `active_chains` table doesn't receive new rows. Either: (a) chain pattern step-1 matcher excludes recent events, (b) ingest path that publishes anchor-eligible events stopped, (c) cleanup/expiry deletes anchors faster than they're created.
+**Action:** ~3-5h diagnostic + fix.
+(i) Trace event flow: `scout/chains/tracker.py` `_check_active_chains` — what event_type triggers anchor creation? Are those events firing?
+(ii) Inspect active_chains writer queue: is there an unconsumed-events backlog?
+(iii) Compare narrative pipeline state at 2026-05-11T16:42Z (last anchor) vs 2026-05-11T16:43Z (first silence): what changed in the upstream feed?
+(iv) Memecoin pipeline died 2026-05-04T00:51Z — 6+ days BEFORE the narrative pipeline. Separate root cause OR cascading failure? Investigate jointly.
+(v) Fix root cause; add an `active_chains_write_rate` watchdog SLO as part of fix.
+**Recurrence prior art:** `project_chain_revival_2026_05_03.md` — April 14 → May 1 (17 days dead). Same substrate class. PR #60/#61 fix history may guide diagnosis.
+**decision-by:** 1 week (HIGH priority — Tier 1a outage; cohort digest (cycle 5) will show `chain_completed` as `near-identical` with no eligible trades to compare).
 
 ### BL-NEW-FIRST-SIGNAL-RETIREMENT-DECISION: decide whether first_signal stays or retires
 **Status:** PROPOSED 2026-05-17 — Finding 3 from BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT (cycle 7, post-V36 fold).
