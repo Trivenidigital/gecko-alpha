@@ -733,6 +733,38 @@ def test_tg_burst_profile_enabled_default_true():
     assert s.TG_BURST_PROFILE_ENABLED is True
 
 
+def test_sqlite_wal_profile_enabled_default_true():
+    """BL-NEW-SQLITE-WAL-PROFILE cycle 4: default True for 4-week measurement."""
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.SQLITE_WAL_PROFILE_ENABLED is True
+
+
+def test_sqlite_wal_bloat_bytes_default_50mb():
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.SQLITE_WAL_BLOAT_BYTES == 50_000_000
+
+
+def test_sqlite_wal_bloat_bytes_env_override():
+    s = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        SQLITE_WAL_BLOAT_BYTES=30_000_000,
+    )
+    assert s.SQLITE_WAL_BLOAT_BYTES == 30_000_000
+
+
 def test_tg_burst_profile_enabled_env_override():
     s = Settings(
         _env_file=None,

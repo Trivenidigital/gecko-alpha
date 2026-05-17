@@ -4892,6 +4892,97 @@ class Database:
         return cur.rowcount or 0
 
     # ------------------------------------------------------------------
+    # Observability — measurement-only methods (no DB mutations)
+    # BL-NEW-SQLITE-WAL-PROFILE (cycle 4)
+    # ------------------------------------------------------------------
+
+    async def probe_wal_state(self) -> dict:
+        """Read SQLite WAL + DB size pragmas for observability.
+
+        BL-NEW-SQLITE-WAL-PROFILE cycle 4. Called hourly from
+        scout.main._run_hourly_maintenance to detect WAL bloat. Returns
+        a structured dict for log emission; values are near-real-time and
+        may lag pending writes by ms-scale.
+
+        V20 PR-review MUST-FIX #1: `PRAGMA wal_autocheckpoint` (no arg)
+        has a documented checkpoint side effect — it triggers a passive
+        checkpoint if the page-count threshold is currently exceeded.
+        We use the table-valued `pragma_wal_autocheckpoint` form to read
+        the value WITHOUT side effects. Per SQLite docs:
+        https://www.sqlite.org/pragma.html#pragma_wal_autocheckpoint
+
+        V23 M1 fold: `shm_size_bytes` is INFORMATIONAL ONLY. SQLite
+        resizes the -shm sidecar in 32KB increments tracking concurrent
+        reader count; it does NOT indicate WAL bloat and is NOT part of
+        the TUNE trigger. The `sqlite_wal_bloat_observed` event in
+        scout.main gates only on `wal_size_bytes`.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        import os
+
+        async def _pragma(name: str) -> object:
+            cur = await self._conn.execute(f"PRAGMA {name}")
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+        # V20 MUST-FIX #2: defensive .lower() in case driver normalization
+        # differs from SQLite's documented lowercase return.
+        jm_raw = await _pragma("journal_mode")
+        journal_mode = str(jm_raw).lower() if jm_raw is not None else None
+        page_count = int(await _pragma("page_count") or 0)
+        page_size = int(await _pragma("page_size") or 4096)
+        freelist_count = int(await _pragma("freelist_count") or 0)
+
+        # V20 MUST-FIX #1: prefer the table-valued `pragma_wal_autocheckpoint`
+        # form (pure read, no side effect). Fall back to `PRAGMA wal_autocheckpoint`
+        # (which can trigger a passive checkpoint as a side effect, per
+        # SQLite docs) on builds compiled without SQLITE_INTROSPECTION_PRAGMAS
+        # (e.g., Python stdlib sqlite3 on some Windows distributions). The
+        # fallback's side-effect is the same passive checkpoint that fires
+        # at the 1000-page autocheckpoint threshold anyway — just clock-shifted
+        # to the hourly probe moment. Acceptable per V20's fold note.
+        try:
+            cur = await self._conn.execute(
+                "SELECT * FROM pragma_wal_autocheckpoint"
+            )
+            ac_row = await cur.fetchone()
+            wal_autocheckpoint = int(ac_row[0]) if ac_row else 0
+        except Exception:
+            ac_val = await _pragma("wal_autocheckpoint")
+            wal_autocheckpoint = int(ac_val) if ac_val is not None else 0
+
+        # WAL + SHM sidecar sizes from filesystem (atomic stat syscalls).
+        # V24 SHOULD-FIX: single try/except getsize avoids TOCTOU race —
+        # SQLite autocheckpoint can truncate/remove the -wal sidecar between
+        # exists() and getsize(); the two-stage check turns a benign race into
+        # an OSError that bubbles to the hourly hook's try-except and emits a
+        # spurious sqlite_wal_probe_failed event each hour under churn.
+        wal_path = self._db_path + "-wal"
+        shm_path = self._db_path + "-shm"
+        try:
+            wal_size_bytes = os.path.getsize(wal_path)
+        except OSError:
+            wal_size_bytes = 0
+        try:
+            shm_size_bytes = os.path.getsize(shm_path)
+        except OSError:
+            shm_size_bytes = 0
+        wal_pages = wal_size_bytes // page_size if page_size else 0
+
+        return {
+            "wal_size_bytes": wal_size_bytes,
+            "wal_pages": wal_pages,
+            "shm_size_bytes": shm_size_bytes,
+            "db_size_bytes": page_count * page_size,
+            "page_count": page_count,
+            "page_size": page_size,
+            "freelist_count": freelist_count,
+            "journal_mode": journal_mode,
+            "wal_autocheckpoint": wal_autocheckpoint,
+        }
+
+    # ------------------------------------------------------------------
     # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 6 prune methods
     # ------------------------------------------------------------------
 
