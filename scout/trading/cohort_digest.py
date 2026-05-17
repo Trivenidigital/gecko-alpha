@@ -64,6 +64,9 @@ def _classify_verdict(
         strong_wr_gap_pp / strong_pnl_floor_usd / moderate_wr_gap_pp:
             dashboard-equivalent thresholds (settable via Settings)
     """
+    # V31 NIT fold: structural label intentionally bypasses the n-gate —
+    # chain_completed (Tier 1a) has eligible ≈ full by construction; divergence
+    # verdicts are not informative regardless of cohort size.
     if signal_type in _NEAR_IDENTICAL_COHORTS:
         return "near-identical"
     if eN == 0:

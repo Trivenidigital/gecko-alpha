@@ -872,3 +872,37 @@ def test_cohort_digest_env_override():
     assert s.COHORT_DIGEST_ENABLED is False
     assert s.COHORT_DIGEST_N_GATE == 20
     assert s.COHORT_DIGEST_STRONG_WR_GAP_PP == 12.0
+
+
+def test_cohort_digest_full_env_override_coverage():
+    """V32 SHOULD-ADD #6: round-trip every overridable field. Catches
+    Pydantic v2 parser regressions especially on date type."""
+    from datetime import date
+    s = Settings(
+        _env_file=None, TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k",
+        COHORT_DIGEST_ENABLED=True,
+        COHORT_DIGEST_N_GATE=15,
+        COHORT_DIGEST_DAY_OF_WEEK=3,
+        COHORT_DIGEST_HOUR=11,
+        COHORT_DIGEST_FINAL_DATE=date(2026, 7, 1),
+        COHORT_DIGEST_STRONG_WR_GAP_PP=12.0,
+        COHORT_DIGEST_STRONG_PNL_FLOOR_USD=150.0,
+        COHORT_DIGEST_MODERATE_WR_GAP_PP=3.0,
+    )
+    assert s.COHORT_DIGEST_DAY_OF_WEEK == 3
+    assert s.COHORT_DIGEST_HOUR == 11
+    assert s.COHORT_DIGEST_FINAL_DATE == date(2026, 7, 1)
+    assert s.COHORT_DIGEST_STRONG_PNL_FLOOR_USD == 150.0
+    assert s.COHORT_DIGEST_MODERATE_WR_GAP_PP == 3.0
+
+
+def test_cohort_digest_final_date_rejects_non_iso_string():
+    """Pydantic v2 should reject non-ISO date strings for COHORT_DIGEST_FINAL_DATE."""
+    import pytest
+    from pydantic import ValidationError
+    with pytest.raises((ValidationError, ValueError)):
+        Settings(
+            _env_file=None, TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            COHORT_DIGEST_FINAL_DATE="not-a-date",
+        )

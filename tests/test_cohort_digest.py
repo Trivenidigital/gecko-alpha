@@ -32,6 +32,18 @@ def test_classify_verdict_strong_pattern_all_four_conditions():
     assert v == "strong-pattern (exploratory)"
 
 
+def test_classify_verdict_no_signflip_blocks_strong_pattern():
+    """V32 MUST-ADD: AND-conjunction regression catcher. Both PnL positive
+    + |wrDelta|>15 + both above floor → no signFlip → moderate, NOT
+    strong-pattern. Catches a future refactor flipping `signFlipRaw and ...`
+    to `signFlipRaw or ...` in _classify_verdict."""
+    v = _classify_verdict(
+        eN=15, fN=30, wrDelta=20.0, fPnl=300, ePnl=250,
+        signal_type="gainers_early", n_gate=10,
+    )
+    assert v == "moderate"
+
+
 def test_classify_verdict_strict_inequality_at_15pp_falls_to_moderate():
     """exactly 15pp does NOT qualify (STRICT >); falls to moderate via |wrDelta|>5."""
     v = _classify_verdict(

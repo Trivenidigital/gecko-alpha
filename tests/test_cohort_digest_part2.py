@@ -115,6 +115,17 @@ def test_detect_verdict_flip_same_label_no_flip():
     assert flips == []
 
 
+def test_detect_verdict_flip_skips_signal_absent_from_previous():
+    """V32 SHOULD-ADD #2: first-ever digest has empty `previous`; missing
+    signal returns no flip. Catches a refactor that would crash on None."""
+    flips = _detect_verdict_flip(
+        current={"gainers_early": {"verdict": "moderate", "eN": 14}},
+        previous={},
+        n_gate=10,
+    )
+    assert flips == []
+
+
 # ---------------------------------------------------------------------------
 # build_cohort_digest
 # ---------------------------------------------------------------------------
@@ -302,3 +313,127 @@ async def test_send_cohort_digest_stamps_last_digest_date_after_dispatch(
         await send_cohort_digest(db, settings)
     state = await db.cohort_digest_read_state()
     assert state["last_digest_date"] == date.today().isoformat()
+
+
+async def test_build_cohort_digest_emits_flip_line_with_real_data(
+    db_with_paper_trades, tmp_path,
+):
+    """V32 MUST-ADD #2: end-to-end flip wiring. Seed week-N-1 to produce
+    'tracking' (positive PnL both sides) + week-N to produce 'moderate'
+    (sign-flip eligible-vs-full). Assert 'FLIPS THIS WEEK' line includes
+    the transition. Catches a wiring bug between _compute_all_cohorts_stats
+    + _classify_all + _detect_verdict_flip silently.
+    """
+    settings = _make_settings(tmp_path)
+    db = db_with_paper_trades
+    # Week N-1 [May 3 → May 10): 11 eligible + 1 non-eligible all winners
+    # → both cohorts positive PnL, no flip, |wrDelta| small → tracking.
+    for i in range(11):
+        await _insert_paper_trade(
+            db, token_id=f"prev_elig_{i}", signal_type="gainers_early",
+            status="closed_tp", pnl_usd=15, would_be_live=1,
+            closed_at=f"2026-05-0{4 + i % 6}T0{i % 9}:00:00+00:00",
+        )
+    await _insert_paper_trade(
+        db, token_id="prev_full_only", signal_type="gainers_early",
+        status="closed_tp", pnl_usd=12, would_be_live=0,
+        closed_at="2026-05-06T09:00:00+00:00",
+    )
+    # Week N [May 10 → May 17): eligible-cohort loses (negative PnL),
+    # full-cohort wins (positive PnL) → sign-flip; |wrDelta| > 5 → moderate.
+    for i in range(11):
+        await _insert_paper_trade(
+            db, token_id=f"curr_elig_{i}", signal_type="gainers_early",
+            status="closed_sl", pnl_usd=-15, would_be_live=1,
+            closed_at=f"2026-05-1{i % 4}T0{i % 9}:00:00+00:00",
+        )
+    # 5 full-cohort-only winners pull full PnL positive
+    for i in range(5):
+        await _insert_paper_trade(
+            db, token_id=f"curr_full_only_{i}", signal_type="gainers_early",
+            status="closed_tp", pnl_usd=100, would_be_live=0,
+            closed_at=f"2026-05-1{i % 4}T1{i}:00:00+00:00",
+        )
+
+    text = await build_cohort_digest(db, date(2026, 5, 17), settings)
+    assert text is not None
+    assert "FLIPS THIS WEEK" in text
+    assert "gainers_early" in text
+    # Should be a transition involving moderate
+    assert "moderate" in text
+
+
+async def test_send_cohort_digest_stamps_final_block_and_strips_sentinel(
+    db_with_paper_trades, tmp_path, monkeypatch,
+):
+    """V32 MUST-ADD #3: final-block stamp + sentinel-stripped dispatch.
+    Patches date.today() to 2026-06-08 (the lock date); after dispatch
+    asserts (a) last_final_block_fired_at non-None, (b) the dispatched
+    text does NOT contain the __FINAL_BLOCK_INCLUDED__ marker.
+    """
+    settings = _make_settings(tmp_path)
+    db = db_with_paper_trades
+    for i in range(11):
+        await _insert_paper_trade(
+            db, token_id=f"t{i}", signal_type="gainers_early",
+            status="closed_tp", pnl_usd=10, would_be_live=1,
+            closed_at=f"2026-06-0{1 + i % 7}T0{i % 9}:00:00+00:00",
+        )
+
+    # Patch date.today() inside the cohort_digest module to 2026-06-08.
+    class _FixedDate(date):
+        @classmethod
+        def today(cls):
+            return date(2026, 6, 8)
+
+    monkeypatch.setattr("scout.trading.cohort_digest.date", _FixedDate)
+
+    captured_messages: list[str] = []
+
+    async def _capture(chunk, session, settings, parse_mode=None):
+        captured_messages.append(chunk)
+
+    with patch(
+        "scout.trading.cohort_digest.alerter.send_telegram_message",
+        new=_capture,
+    ):
+        await send_cohort_digest(db, settings)
+
+    state = await db.cohort_digest_read_state()
+    assert state["last_final_block_fired_at"] is not None
+    # Sentinel must NOT appear in dispatched chunks
+    for chunk in captured_messages:
+        assert "__FINAL_BLOCK_INCLUDED__" not in chunk
+    # Decision-recommendation block IS in the dispatched text
+    assert any("4-week decision point" in c for c in captured_messages)
+
+
+async def test_send_cohort_digest_failed_build_dispatches_fallback(
+    db_with_paper_trades, tmp_path,
+):
+    """V32 SHOULD-ADD #5: outer except path dispatches fallback message.
+    Per memory feedback_resilience_layered_failure_modes — every resilience
+    addition extends a failure surface, so the failure surface itself is
+    tested."""
+    settings = _make_settings(tmp_path)
+    db = db_with_paper_trades
+
+    captured: list[str] = []
+
+    async def _capture(chunk, session, settings, parse_mode=None):
+        # parse_mode=None on the fallback path too (Class-3 hygiene)
+        assert parse_mode is None
+        captured.append(chunk)
+
+    with patch(
+        "scout.trading.cohort_digest.build_cohort_digest",
+        new=AsyncMock(side_effect=RuntimeError("simulated build failure")),
+    ):
+        with patch(
+            "scout.trading.cohort_digest.alerter.send_telegram_message",
+            new=_capture,
+        ):
+            await send_cohort_digest(db, settings)
+
+    assert len(captured) == 1
+    assert "Cohort digest failed:" in captured[0]
