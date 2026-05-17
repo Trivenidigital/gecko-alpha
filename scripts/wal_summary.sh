@@ -66,7 +66,16 @@ COMBINED=$(printf "%s\n%s" "$JOURNAL_EVENTS" "$ARCHIVE_EVENTS" | grep -v '^$' \
     | awk '
         match($0, /"timestamp": "[^"]+"/) {
             ts = substr($0, RSTART, RLENGTH)
-            if (!seen[ts]++) print $0
+            # Reviewer-non-blocking tightening: include event name in the
+            # dedup key so two distinct event types emitted in the same
+            # microsecond do not collapse. structlog writes both fields
+            # in both journal and archive line shapes.
+            ev = ""
+            if (match($0, /"event": "[^"]+"/)) {
+                ev = substr($0, RSTART, RLENGTH)
+            }
+            key = ts "|" ev
+            if (!seen[key]++) print $0
             next
         }
         # Lines without a timestamp field (defensive — should not occur for
