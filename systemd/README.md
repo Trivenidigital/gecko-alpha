@@ -11,7 +11,8 @@ Production unit files for the gecko-alpha services. Captured verbatim from `sril
 | `gecko-backup.service` + `.timer` | daily backup at 03:00 | runs `scripts/backup_db.sh` |
 | `gecko-backup-watchdog.service` + `.timer` | stale-heartbeat watchdog | 09:00 daily |
 | `minara-emission-persistence-watchdog.service` + `.timer` | Minara emission persistence freshness | hourly |
-| `systemd-drift-watchdog.service` + `.timer` | repo↔prod unit-file drift detection + drop-in enumeration | daily 09:30 UTC; alerts via TG; ack-tombstone suppresses re-alert on unchanged drift-set; manual override `rm /var/lib/gecko-alpha/systemd-drift-watchdog/last_alerted_hash` |
+| `systemd-drift-watchdog.service` + `.timer` | repo-prod unit-file drift detection + drop-in enumeration | daily 09:30 UTC; alerts via TG; ack-tombstone suppresses re-alert on unchanged drift-set; manual override `rm /var/lib/gecko-alpha/systemd-drift-watchdog/last_alerted_hash` |
+| `chain-anchor-health-watchdog.service` + `.timer` | chain-pattern anchor freshness watchdog | hourly; alerts when protected built-ins are inactive or anchor-eligible events are present while matching `active_chains` rows are stale |
 
 ## Deploy workflow
 
@@ -30,13 +31,16 @@ sudo find systemd -maxdepth 1 -type f \( -name "*.service" -o -name "*.timer" \)
 sudo systemctl daemon-reload
 sudo systemctl restart gecko-pipeline gecko-dashboard
 
-# Cron entries — see cron/README.md (cycle 11):
+# Cron entries - see cron/README.md (cycle 11):
 bash cron/deploy.sh
+
+sudo systemctl enable --now gecko-backup.timer gecko-backup-watchdog.timer \
+    minara-emission-persistence-watchdog.timer chain-anchor-health-watchdog.timer
 ```
 
 **Restart blast-radius (V35 fold):**
 
-`sudo systemctl restart gecko-pipeline` interrupts the scout pipeline for ~10-20s — that window costs missed CG scan cycles, missed paper-trade evaluations, and may trip the ingestion-starvation watchdog and the 09:00 stale-heartbeat watchdog. Prefer windows between scan cycles. `gecko-dashboard` restart drops in-flight HTTP connections (operator-facing, less critical).
+`sudo systemctl restart gecko-pipeline` interrupts the scout pipeline for ~10-20s - that window costs missed CG scan cycles, missed paper-trade evaluations, and may trip the ingestion-starvation watchdog and the 09:00 stale-heartbeat watchdog. Prefer windows between scan cycles. `gecko-dashboard` restart drops in-flight HTTP connections (operator-facing, less critical).
 
 **First-time activation of `systemd-drift-watchdog.timer` (cycle 10 V51 fold):**
 
@@ -55,8 +59,9 @@ journalctl -u systemd-drift-watchdog.service --since "1 minute ago" --no-pager
 
 **Reload semantics (V35 fold):**
 
-- Long-running services (`gecko-pipeline`, `gecko-dashboard`) — `daemon-reload` re-reads unit files, but the running process keeps the OLD definitions until **explicit `restart`**.
-- Timer-triggered oneshot services (`gecko-backup`, `gecko-backup-watchdog`, `minara-emission-persistence-watchdog`) — pick up changes on next fire after `daemon-reload`; no restart needed.
+- Long-running services (`gecko-pipeline`, `gecko-dashboard`) - `daemon-reload` re-reads unit files, but the running process keeps the OLD definitions until **explicit `restart`**.
+- Timer-triggered oneshot services (`gecko-backup`, `gecko-backup-watchdog`, `minara-emission-persistence-watchdog`) - pick up changes on next fire after `daemon-reload`; no restart needed.
+- New timer units must be explicitly enabled with `systemctl enable --now <unit>.timer`; copying a timer into `/etc/systemd/system/` and running `daemon-reload` does not schedule it.
 - If a `.timer` schedule (`OnCalendar=` / `OnUnitActiveSec=`) changes, additionally `systemctl restart <unit>.timer`.
 
 ## Drift audit
@@ -88,7 +93,7 @@ while IFS= read -r -d '' f; do
 done < <(find systemd -maxdepth 1 -type f \( -name "*.service" -o -name "*.timer" \) -print0)
 ```
 
-**Do NOT use `sudo systemctl edit <unit>` (V34 fold)** — it writes a drop-in under `/etc/systemd/system/<unit>.service.d/override.conf`, which bypasses this audit and re-introduces the very drift this directory is meant to prevent. Any future change must go via repo PR + the deploy workflow above.
+**Do NOT use `sudo systemctl edit <unit>` (V34 fold)** - it writes a drop-in under `/etc/systemd/system/<unit>.service.d/override.conf`, which bypasses this audit and re-introduces the very drift this directory is meant to prevent. Any future change must go via repo PR + the deploy workflow above.
 
 ## Why this exists
 

@@ -103,6 +103,7 @@ async def check_chains(
     transaction so that writes across helpers commit atomically."""
     patterns = await load_active_patterns(db)
     if not patterns:
+        logger.error("chain_no_active_patterns", chains_enabled=settings.CHAINS_ENABLED)
         return
 
     events = await load_recent_events(db, max_hours=settings.CHAIN_MAX_WINDOW_HOURS)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import operator
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 import structlog
 
@@ -167,6 +167,8 @@ BUILT_IN_PATTERNS: list[ChainPattern] = [
     ),
 ]
 
+BUILT_IN_PATTERN_NAMES = frozenset(p.name for p in BUILT_IN_PATTERNS)
+
 
 # ---------------------------------------------------------------------------
 # DB helpers
@@ -183,6 +185,9 @@ def _pattern_to_row(p: ChainPattern) -> tuple:
         p.conviction_boost,
         p.alert_priority,
         1 if p.is_active else 0,
+        1,
+        p.disabled_reason,
+        p.disabled_at.isoformat() if p.disabled_at else None,
     )
 
 
@@ -198,6 +203,11 @@ def _row_to_pattern(row) -> ChainPattern:
         conviction_boost=row["conviction_boost"],
         alert_priority=row["alert_priority"],
         is_active=bool(row["is_active"]),
+        is_protected_builtin=bool(row["is_protected_builtin"]),
+        disabled_reason=row["disabled_reason"],
+        disabled_at=(
+            datetime.fromisoformat(row["disabled_at"]) if row["disabled_at"] else None
+        ),
         historical_hit_rate=row["historical_hit_rate"],
         total_triggers=row["total_triggers"] or 0,
         total_hits=row["total_hits"] or 0,
@@ -211,26 +221,70 @@ def _row_to_pattern(row) -> ChainPattern:
 
 
 async def seed_built_in_patterns(db: Database) -> int:
-    """Insert BUILT_IN_PATTERNS if they are not already present. Idempotent."""
+    """Insert or reconcile BUILT_IN_PATTERNS. Idempotent."""
     conn = db._conn
     if conn is None:
         raise RuntimeError("Database not initialized")
-    async with conn.execute("SELECT name FROM chain_patterns") as cur:
-        existing = {row["name"] for row in await cur.fetchall()}
+    async with conn.execute("SELECT * FROM chain_patterns") as cur:
+        existing = {row["name"]: row for row in await cur.fetchall()}
 
     inserted = 0
+    synced = 0
+    reactivated = 0
     for pattern in BUILT_IN_PATTERNS:
-        if pattern.name in existing:
+        row = existing.get(pattern.name)
+        if row is None:
+            await conn.execute(
+                """INSERT INTO chain_patterns
+                   (name, description, steps_json, min_steps_to_trigger,
+                    conviction_boost, alert_priority, is_active,
+                    is_protected_builtin, disabled_reason, disabled_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                _pattern_to_row(pattern),
+            )
+            inserted += 1
             continue
+
+        steps_json = json.dumps([s.model_dump() for s in pattern.steps])
+        disabled_reason = row["disabled_reason"]
+        disabled_at = row["disabled_at"]
+        is_active = int(row["is_active"])
+        if disabled_reason in ("legacy_lifecycle_retired", "lifecycle_retired"):
+            is_active = 1
+            disabled_reason = None
+            disabled_at = None
+            reactivated += 1
         await conn.execute(
-            """INSERT INTO chain_patterns
-               (name, description, steps_json, min_steps_to_trigger,
-                conviction_boost, alert_priority, is_active)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            _pattern_to_row(pattern),
+            """UPDATE chain_patterns
+               SET description = ?,
+                   steps_json = ?,
+                   min_steps_to_trigger = ?,
+                   conviction_boost = ?,
+                   is_protected_builtin = 1,
+                   is_active = ?,
+                   disabled_reason = ?,
+                   disabled_at = ?,
+                   updated_at = datetime('now')
+               WHERE name = ?""",
+            (
+                pattern.description,
+                steps_json,
+                pattern.min_steps_to_trigger,
+                pattern.conviction_boost,
+                is_active,
+                disabled_reason,
+                disabled_at,
+                pattern.name,
+            ),
         )
-        inserted += 1
+        synced += 1
     await conn.commit()
+    logger.info(
+        "chain_patterns_seeded_or_synced",
+        inserted=inserted,
+        synced=synced,
+        reactivated=reactivated,
+    )
     if inserted:
         logger.info("chains_seeded_built_in_patterns", count=inserted)
     return inserted
@@ -244,6 +298,7 @@ async def load_active_patterns(db: Database) -> list[ChainPattern]:
     async with conn.execute(
         """SELECT id, name, description, steps_json, min_steps_to_trigger,
                   conviction_boost, alert_priority, is_active,
+                  is_protected_builtin, disabled_reason, disabled_at,
                   historical_hit_rate, total_triggers, total_hits,
                   created_at, updated_at
            FROM chain_patterns
@@ -325,7 +380,9 @@ async def run_pattern_lifecycle(db: Database, settings: Settings) -> None:
     conn = db._conn
     for pid, s in by_pattern.items():
         async with conn.execute(
-            "SELECT alert_priority, is_active FROM chain_patterns WHERE id = ?",
+            """SELECT alert_priority, is_active, is_protected_builtin,
+                      disabled_reason, disabled_at
+               FROM chain_patterns WHERE id = ?""",
             (pid,),
         ) as cur:
             row = await cur.fetchone()
@@ -333,18 +390,42 @@ async def run_pattern_lifecycle(db: Database, settings: Settings) -> None:
             continue
         prio = row["alert_priority"]
         is_active = bool(row["is_active"])
+        is_protected_builtin = bool(row["is_protected_builtin"])
         new_prio = prio
         new_active = is_active
+        new_disabled_reason = row["disabled_reason"]
+        new_disabled_at = row["disabled_at"]
+        disabled_by_operator_or_code = new_disabled_reason in (
+            "operator_disabled",
+            "code_disabled",
+        )
 
         if s["total_evaluated"] >= settings.CHAIN_MIN_TRIGGERS_FOR_STATS:
             if s["hit_rate"] < _RETIREMENT_HIT_RATE:
-                new_active = False
-                logger.info(
-                    "chain_pattern_retired",
-                    pattern=s["pattern_name"],
-                    hit_rate=s["hit_rate"],
-                )
-            elif prio == "low" and s["hit_rate"] >= settings.CHAIN_PROMOTION_THRESHOLD:
+                if disabled_by_operator_or_code:
+                    pass
+                elif is_protected_builtin:
+                    if is_active:
+                        logger.info(
+                            "chain_pattern_retirement_blocked_protected",
+                            pattern=s["pattern_name"],
+                            hit_rate=s["hit_rate"],
+                            total_evaluated=s["total_evaluated"],
+                        )
+                else:
+                    new_active = False
+                    new_disabled_reason = "lifecycle_retired"
+                    new_disabled_at = datetime.now(timezone.utc).isoformat()
+                    logger.info(
+                        "chain_pattern_retired",
+                        pattern=s["pattern_name"],
+                        hit_rate=s["hit_rate"],
+                    )
+            elif (
+                not disabled_by_operator_or_code
+                and prio == "low"
+                and s["hit_rate"] >= settings.CHAIN_PROMOTION_THRESHOLD
+            ):
                 new_prio = "medium"
                 logger.info(
                     "chain_pattern_promoted",
@@ -355,6 +436,8 @@ async def run_pattern_lifecycle(db: Database, settings: Settings) -> None:
                 )
 
         if (
+            not disabled_by_operator_or_code
+            and
             prio == "medium"
             and s["total_evaluated"] >= settings.CHAIN_GRADUATION_MIN_TRIGGERS
             and s["hit_rate"] >= settings.CHAIN_GRADUATION_HIT_RATE
@@ -370,6 +453,8 @@ async def run_pattern_lifecycle(db: Database, settings: Settings) -> None:
             """UPDATE chain_patterns
                SET alert_priority = ?,
                    is_active      = ?,
+                   disabled_reason = ?,
+                   disabled_at     = ?,
                    historical_hit_rate = ?,
                    total_triggers = ?,
                    total_hits     = ?,
@@ -378,6 +463,8 @@ async def run_pattern_lifecycle(db: Database, settings: Settings) -> None:
             (
                 new_prio,
                 1 if new_active else 0,
+                new_disabled_reason,
+                new_disabled_at,
                 s["hit_rate"],
                 s["total_evaluated"],
                 s["hits"],

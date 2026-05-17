@@ -1,5 +1,17 @@
 # Lessons
 
+## Rebase PR branches after adjacent backlog PRs land
+
+- 2026-05-17 correction: I left PR #146 based on `63aa13b` after #147 and
+  #148 merged to `master`. The PR then appeared to delete the newly merged
+  systemd drift-watchdog files and first-signal findings, and to revert the
+  shipped backlog status for `BL-NEW-SYSTEMD-DRIFT-PRECOMMIT-HOOK`.
+- Rule: before final PR-ready status on an active backlog branch, run
+  `git fetch origin`, verify `git merge-base HEAD origin/master` is current,
+  and inspect `git diff --name-status origin/master..HEAD` for accidental
+  deletions/reverts of newly merged work. If the branch is stale, rebase before
+  asking for merge review.
+
 ## X Alerts asset links must cover unresolved cashtags
 
 - 2026-05-15 correction: I treated "clickable Asset column" as only safe for

@@ -146,10 +146,115 @@ async def test_pattern_retirement(db, settings):
     await _seed_matches(db, "full_conviction", "memecoin", n_hits=1, n_misses=14)
     await run_pattern_lifecycle(db, settings)
     async with db._conn.execute(
-        "SELECT is_active FROM chain_patterns WHERE name='full_conviction'"
+        "SELECT is_active, disabled_reason FROM chain_patterns WHERE name='full_conviction'"
     ) as cur:
-        active = (await cur.fetchone())[0]
-    assert active == 0
+        row = await cur.fetchone()
+    assert row["is_active"] == 1
+    assert row["disabled_reason"] is None
+
+
+async def test_lifecycle_preserves_operator_disabled_builtin(db, settings):
+    await db._conn.execute(
+        """UPDATE chain_patterns
+           SET is_active = 0, disabled_reason = 'operator_disabled'
+           WHERE name = 'full_conviction'"""
+    )
+    await db._conn.commit()
+    await _seed_matches(db, "full_conviction", "memecoin", n_hits=1, n_misses=14)
+
+    await run_pattern_lifecycle(db, settings)
+
+    async with db._conn.execute(
+        "SELECT is_active, disabled_reason FROM chain_patterns WHERE name='full_conviction'"
+    ) as cur:
+        row = await cur.fetchone()
+    assert row["is_active"] == 0
+    assert row["disabled_reason"] == "operator_disabled"
+
+
+async def test_lifecycle_preserves_code_disabled_builtin(db, settings):
+    await db._conn.execute(
+        """UPDATE chain_patterns
+           SET is_active = 0, disabled_reason = 'code_disabled'
+           WHERE name = 'full_conviction'"""
+    )
+    await db._conn.commit()
+    await _seed_matches(db, "full_conviction", "memecoin", n_hits=1, n_misses=14)
+
+    await run_pattern_lifecycle(db, settings)
+
+    async with db._conn.execute(
+        "SELECT is_active, disabled_reason FROM chain_patterns WHERE name='full_conviction'"
+    ) as cur:
+        row = await cur.fetchone()
+    assert row["is_active"] == 0
+    assert row["disabled_reason"] == "code_disabled"
+
+
+async def test_lifecycle_retires_non_builtin_pattern(db, settings):
+    await db._conn.execute(
+        """INSERT INTO chain_patterns
+           (name, description, steps_json, min_steps_to_trigger,
+            conviction_boost, alert_priority, is_active, is_protected_builtin)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "experimental_bad",
+            "test pattern",
+            '[{"step_number":1,"event_type":"candidate_scored","condition":null,"max_hours_after_anchor":0.0,"max_hours_after_previous":null}]',
+            1,
+            1,
+            "low",
+            1,
+            0,
+        ),
+    )
+    await db._conn.commit()
+    await _seed_matches(db, "experimental_bad", "memecoin", n_hits=1, n_misses=14)
+
+    await run_pattern_lifecycle(db, settings)
+
+    async with db._conn.execute(
+        "SELECT is_active, disabled_reason, disabled_at FROM chain_patterns WHERE name='experimental_bad'"
+    ) as cur:
+        row = await cur.fetchone()
+    assert row["is_active"] == 0
+    assert row["disabled_reason"] == "lifecycle_retired"
+    assert row["disabled_at"] is not None
+
+
+async def test_lifecycle_preserves_operator_disabled_non_builtin_pattern(db, settings):
+    await db._conn.execute(
+        """INSERT INTO chain_patterns
+           (name, description, steps_json, min_steps_to_trigger,
+            conviction_boost, alert_priority, is_active, is_protected_builtin,
+            disabled_reason, disabled_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "experimental_operator_disabled",
+            "test pattern",
+            '[{"step_number":1,"event_type":"candidate_scored","condition":null,"max_hours_after_anchor":0.0,"max_hours_after_previous":null}]',
+            1,
+            1,
+            "low",
+            0,
+            0,
+            "operator_disabled",
+            "2026-05-17T00:00:00+00:00",
+        ),
+    )
+    await db._conn.commit()
+    await _seed_matches(
+        db, "experimental_operator_disabled", "memecoin", n_hits=1, n_misses=14
+    )
+
+    await run_pattern_lifecycle(db, settings)
+
+    async with db._conn.execute(
+        "SELECT is_active, disabled_reason FROM chain_patterns WHERE name='experimental_operator_disabled'"
+    ) as cur:
+        row = await cur.fetchone()
+    assert row["is_active"] == 0
+    assert row["disabled_reason"] == "operator_disabled"
 
 
 async def test_update_chain_outcomes_from_predictions(db, settings):
@@ -308,7 +413,5 @@ async def test_lifecycle_still_retires_bad_pattern_when_others_have_hits(db, set
         rows = {r[0]: r[1] for r in await cur.fetchall()}
 
     assert rows["full_conviction"] == 1, "healthy pattern must stay active"
-    assert (
-        rows["narrative_momentum"] == 0
-    ), "bad pattern must retire when others have hits"
-    assert rows["volume_breakout"] == 0, "bad pattern must retire when others have hits"
+    assert rows["narrative_momentum"] == 1, "protected built-in must stay active"
+    assert rows["volume_breakout"] == 1, "protected built-in must stay active"

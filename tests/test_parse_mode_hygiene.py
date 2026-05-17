@@ -172,7 +172,6 @@ def _direct_post_has_parse_mode(call: ast.Call, name_map: dict[str, ast.AST]) ->
 # 10 sites below fall into:
 #  - send_telegram_message dispatch sites (LOW/MEDIUM per audit, body
 #    shape unlikely to mangle):
-#      scout/chains/alerts.py:59
 #      scout/trading/suppression.py:186
 #      scout/live/loops.py:251
 #      scout/main.py:166 (combo_refresh failure)
@@ -184,13 +183,14 @@ def _direct_post_has_parse_mode(call: ast.Call, name_map: dict[str, ast.AST]) ->
 #      scout/main.py:1537 (daily summary)
 #  - direct session.post(.../sendMessage) sites (caught by the resolver-
 #    aware second AST arm — both are intentionally parse_mode-less):
-#      scout/alerter.py:163 — INSIDE send_telegram_message itself; the
+#      scout/alerter.py send_telegram_message() — INSIDE send_telegram_message itself; the
 #        function takes parse_mode as a parameter and adds it to the
 #        payload conditionally (`if parse_mode is not None: payload[...]
 #        = parse_mode`). The walker can't see the dynamic dict insert,
-#        but the function's caller-passes-kwarg contract is the design
-#        intent and is enforced by every CALL site (which the first AST
-#        arm checks). Self-referential allowlist entry.
+#        but the function's caller-passes-kwarg contract is the design intent
+#        and is enforced by every CALL site (which the first AST arm checks).
+#        This is allowed by function name below instead of line number because
+#        instrumentation inside the helper can move the session.post line.
 #      scout/social/telegram/listener.py:123 — intentional plain-text
 #        Telegram dispatch (channel-listener auth flow). Payload at
 #        :120-121 builds {chat_id, text} with NO parse_mode field;
@@ -199,7 +199,6 @@ def _direct_post_has_parse_mode(call: ast.Call, name_map: dict[str, ast.AST]) ->
 # Follow-up PRs remove entries from this set; a NEW dispatch site that's
 # not in this allowlist will be caught at CI time.
 _ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE: set[tuple[str, int]] = {
-    ("scout/chains/alerts.py", 59),
     ("scout/trading/suppression.py", 186),
     ("scout/live/loops.py", 251),
     ("scout/main.py", 166),
@@ -207,7 +206,6 @@ _ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE: set[tuple[str, int]] = {
     ("scout/main.py", 351),
     ("scout/main.py", 434),
     ("scout/main.py", 1537),
-    ("scout/alerter.py", 163),
     ("scout/social/telegram/listener.py", 123),
 }
 
@@ -279,6 +277,11 @@ def test_all_dispatch_sites_pin_parse_mode():
                     continue
                 # Telegram dispatch -- check allowlist + parse_mode resolution
                 site = (rel_path, call.lineno)
+                if (
+                    rel_path == "scout/alerter.py"
+                    and func_node.name == "send_telegram_message"
+                ):
+                    continue
                 if site in _ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE:
                     continue
                 if _direct_post_has_parse_mode(call, name_map):
