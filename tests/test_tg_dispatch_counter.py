@@ -138,6 +138,33 @@ def test_group_chat_triggers_1m_burst_above_20(monkeypatch):
     assert burst_events[-1]["is_group"] is True
 
 
+def test_group_chat_count_1m_eq_20_no_burst(monkeypatch):
+    """V18 PR-review MUST-FIX #1: lock in exact boundary semantic.
+
+    Code is `count_1m > 20` (strict). Exactly 20 dispatches in a 60s window
+    MUST NOT emit a burst event. A future flip to `>= 20` would emit every
+    routine 20-msg/min dispatch as a false-positive WARNING, drowning the
+    observability signal.
+    """
+    import scout.observability.tg_dispatch_counter as mod
+
+    mod.reset_for_tests()
+    t0 = [1000.0]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: t0[0])
+
+    with structlog.testing.capture_logs() as logs:
+        for i in range(20):  # exactly 20 — boundary
+            t0[0] = 1000.0 + i * 1.2  # 1.2s apart — no 1s breach
+            mod.record_dispatch("-1001234567890", source="test")
+
+    burst_events = [e for e in logs if e.get("event") == "tg_burst_observed"]
+    assert burst_events == [], (
+        f"count_1m == 20 must NOT emit burst (strict >, not >=). Got: {burst_events}"
+    )
+    observed = [e for e in logs if e.get("event") == "tg_dispatch_observed"]
+    assert observed[-1]["count_1m"] == 20
+
+
 def test_record_429_emits_rejected_event():
     """V14 fold MUST-FIX #2: 429-from-Telegram is the firm pacing trigger."""
     from scout.observability.tg_dispatch_counter import record_429, reset_for_tests

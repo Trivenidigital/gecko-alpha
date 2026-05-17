@@ -21,11 +21,30 @@ JOURNAL_EVENTS=$(journalctl -u gecko-pipeline --since "$SINCE" 2>/dev/null \
     || true)
 ARCHIVE_EVENTS=""
 if [[ -d "$ARCHIVE_DIR" ]]; then
-    # Pull last N week-files; jq filters by event types.
-    ARCHIVE_EVENTS=$(find "$ARCHIVE_DIR" -name '*.jsonl.gz' -mtime "-$((HOURS / 24 + 1))" 2>/dev/null \
-        | xargs -r zcat 2>/dev/null \
-        | jq -c 'select(.event | test("tg_dispatch_observed|tg_burst_observed|tg_dispatch_rejected_429"))' 2>/dev/null \
-        || true)
+    # V17 PR-review NICE-TO-HAVE #2: filter archives by FILENAME-DATE
+    # (consistent with tg_burst_archive.sh rotation discipline).
+    # mtime filtering is broken by rsync/backup mtime touching.
+    cutoff_epoch=$(date -d "$HOURS hours ago" +%s 2>/dev/null || echo 0)
+    selected_files=()
+    for f in "$ARCHIVE_DIR"/*.jsonl.gz; do
+        [[ -f "$f" ]] || continue
+        fname=$(basename "$f" .jsonl.gz)
+        base="${fname%.*}"
+        if [[ "$base" == "$fname" ]]; then
+            date_str="$fname"
+        else
+            date_str="$base"
+        fi
+        file_epoch=$(date -d "$date_str" +%s 2>/dev/null || echo 0)
+        if [[ "$file_epoch" -gt "$cutoff_epoch" ]]; then
+            selected_files+=("$f")
+        fi
+    done
+    if [[ ${#selected_files[@]} -gt 0 ]]; then
+        ARCHIVE_EVENTS=$(zcat "${selected_files[@]}" 2>/dev/null \
+            | jq -c 'select(.event | test("tg_dispatch_observed|tg_burst_observed|tg_dispatch_rejected_429"))' 2>/dev/null \
+            || true)
+    fi
 fi
 COMBINED=$(printf "%s\n%s" "$JOURNAL_EVENTS" "$ARCHIVE_EVENTS" | grep -v '^$' || true)
 
