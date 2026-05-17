@@ -40,6 +40,9 @@ class ChainPattern(BaseModel):
     conviction_boost: int
     alert_priority: str  # "high" | "medium" | "low"
     is_active: bool = True
+    is_protected_builtin: bool = False
+    disabled_reason: str | None = None
+    disabled_at: datetime | None = None
     historical_hit_rate: float | None = None
     total_triggers: int = 0
     total_hits: int = 0

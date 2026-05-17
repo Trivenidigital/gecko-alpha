@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from structlog.testing import capture_logs
 
 from scout.chains.patterns import seed_built_in_patterns
 from scout.chains.tracker import check_chains, get_active_boosts
@@ -67,6 +68,16 @@ async def _count_matches(db, token_id=None):
 async def test_no_events_no_chains(db, settings):
     await check_chains(db, settings)
     assert await _count_matches(db) == 0
+
+
+async def test_no_active_patterns_logs_error(db, settings):
+    await db._conn.execute("UPDATE chain_patterns SET is_active = 0")
+    await db._conn.commit()
+
+    with capture_logs() as logs:
+        await check_chains(db, settings)
+
+    assert any(entry.get("event") == "chain_no_active_patterns" for entry in logs)
 
 
 async def test_chain_starts_on_anchor(db, settings):

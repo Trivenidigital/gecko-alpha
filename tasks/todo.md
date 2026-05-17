@@ -2,6 +2,25 @@
 
 Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvement run)
 
+## Active Work: BL-NEW-CHAIN-ANCHOR-PIPELINE-FIX
+
+- [x] Isolated worktree created: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-chain-anchor-pipeline-fix` on `codex/chain-anchor-pipeline-fix`
+- [x] Drift/runtime check started from `BL-NEW-CHAIN-COMPLETED-SILENCE-AUDIT`; confirmed prod still has no `active_chains` writes after 2026-05-11 and no `chain_matches` after 2026-05-11 narrative / 2026-05-04 memecoin
+- [x] Runtime lever correction: all three prod `chain_patterns` rows are currently `is_active=0`, so `load_active_patterns()` returns empty and the tracker exits before matching anchors
+- [x] Hermes-first check started: installed VPS skills show no chain-pattern lifecycle primitive; public Hermes bundled/optional skills provide blockchain query tools but not gecko-alpha DB pattern retirement/revival semantics
+- [x] Draft plan with drift + Hermes-first analysis: `tasks/plan_bl_new_chain_anchor_pipeline_fix.md`
+- [x] Run two parallel plan reviews and fold findings: preserved learned `alert_priority`, added pattern provenance to avoid reversing operator disables, narrowed watchdog to active-chain writer health, and added Hermes URLs
+- [x] Draft design with test matrix: `tasks/design_bl_new_chain_anchor_pipeline_fix.md`
+- [x] Run two parallel design reviews and fold findings: snapshot-gated legacy recovery, lifecycle preservation of operator/code disables, migration tests, condition-aware watchdog anchors, deploy kill-switch check, rollback SQL
+- [x] Build with TDD: provenance migration, safe built-in reconciliation, protected lifecycle guard, empty-pattern tracker log, chain-anchor health checker, shell wrapper, and systemd timer
+- [x] Fresh focused verification: `tests/test_chains_patterns.py tests/test_chains_learn.py tests/test_chains_tracker.py tests/test_chain_pattern_provenance_migration.py tests/test_chain_anchor_health_watchdog.py` -> 49 passed
+- [x] Fresh wider chain verification: `tests/test_chains_events.py tests/test_chains_db.py tests/test_chains_patterns.py tests/test_chains_tracker.py tests/test_chains_integration.py tests/test_chains_learn.py tests/test_chain_outcomes_hydration.py tests/test_narrative_chain_coherence.py` -> 79 passed, 1 skipped
+- [ ] Create PR and run three parallel PR reviews
+
+Review:
+- Fixed the actual runtime lever, not only the original `_check_active_chains` hypothesis: protected built-in `chain_patterns` can no longer be lifecycle-retired into complete anchor starvation, and exact known prod legacy retirement state is recoverable without reversing unknown/operator-disabled rows.
+- Added recurrence coverage with `scripts/check_chain_anchor_health.py`, `scripts/chain-anchor-health-watchdog.sh`, and hourly systemd units that alert only when active protected patterns are missing or anchor-eligible upstream events are present while `active_chains` is stale.
+
 ## Active Work: baseline test failures after PR #136 review
 
 - [x] Reproduced current red subset: 17 failures in BL-064 reload, BL-076 metadata, calibration dry-run, mcap heartbeat, narrative token-id, parse-mode hygiene, and signal revival tests

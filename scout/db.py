@@ -106,6 +106,7 @@ class Database:
         await self._migrate_tg_alert_log_m1_5c_outcome()
         await self._migrate_narrative_scanner_v1()
         await self._migrate_minara_alert_emissions_v1()
+        await self._migrate_chain_pattern_provenance_v1()
         await self._migrate_score_history_scanned_at_index()
         await self._migrate_volume_snapshots_scanned_at_index()
         # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 6 narrative-owned
@@ -519,6 +520,9 @@ class Database:
                 conviction_boost     INTEGER NOT NULL DEFAULT 0,
                 alert_priority       TEXT NOT NULL DEFAULT 'low',
                 is_active            INTEGER NOT NULL DEFAULT 1,
+                is_protected_builtin INTEGER NOT NULL DEFAULT 0,
+                disabled_reason      TEXT,
+                disabled_at          TEXT,
                 historical_hit_rate  REAL,
                 total_triggers       INTEGER DEFAULT 0,
                 total_hits           INTEGER DEFAULT 0,
@@ -3930,6 +3934,103 @@ class Database:
             index_name="idx_chain_matches_completed_at",
             migration_name="chain_matches_completed_at_idx_v1",
         )
+
+    async def _migrate_chain_pattern_provenance_v1(self) -> None:
+        """Add chain-pattern state provenance for protected built-ins.
+
+        Migration is intentionally narrow: only the known 2026-05-17 prod
+        snapshot is stamped as legacy lifecycle retirement. Other unknown
+        inactive built-ins remain inactive with NULL reason so startup cannot
+        infer operator intent from incomplete old schema state.
+        """
+        conn = self._conn
+        if conn is None:
+            raise RuntimeError("Database not initialized.")
+        migration_name = "bl_chain_pattern_provenance_v1"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await conn.execute(
+            """CREATE TABLE IF NOT EXISTS paper_migrations (
+                name TEXT PRIMARY KEY,
+                cutover_ts TEXT NOT NULL
+            )"""
+        )
+        await conn.execute(
+            """CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL,
+                description TEXT NOT NULL
+            )"""
+        )
+        cur = await conn.execute("PRAGMA table_info(chain_patterns)")
+        cols = {row[1] for row in await cur.fetchall()}
+        if "is_protected_builtin" not in cols:
+            await conn.execute(
+                "ALTER TABLE chain_patterns ADD COLUMN "
+                "is_protected_builtin INTEGER NOT NULL DEFAULT 0"
+            )
+        if "disabled_reason" not in cols:
+            await conn.execute("ALTER TABLE chain_patterns ADD COLUMN disabled_reason TEXT")
+        if "disabled_at" not in cols:
+            await conn.execute("ALTER TABLE chain_patterns ADD COLUMN disabled_at TEXT")
+
+        builtins = ("full_conviction", "narrative_momentum", "volume_breakout")
+        await conn.execute(
+            f"""UPDATE chain_patterns
+                SET is_protected_builtin = 1
+                WHERE name IN ({','.join('?' for _ in builtins)})""",
+            builtins,
+        )
+
+        snapshot = {
+            "full_conviction": (52, 2),
+            "narrative_momentum": (58, 2),
+            "volume_breakout": (70, 3),
+        }
+        cur = await conn.execute(
+            f"""SELECT name, is_active, total_triggers, total_hits, updated_at,
+                       disabled_reason
+                FROM chain_patterns
+                WHERE name IN ({','.join('?' for _ in builtins)})
+                ORDER BY name""",
+            builtins,
+        )
+        rows = await cur.fetchall()
+        by_name = {row[0]: row for row in rows}
+        snapshot_matches = len(by_name) == 3
+        for name, (triggers, hits) in snapshot.items():
+            row = by_name.get(name)
+            snapshot_matches = snapshot_matches and row is not None
+            if row is None:
+                continue
+            snapshot_matches = (
+                snapshot_matches
+                and int(row[1]) == 0
+                and int(row[2] or 0) == triggers
+                and int(row[3] or 0) == hits
+                and str(row[4]) == "2026-05-17 01:24:59"
+                and row[5] is None
+            )
+        if snapshot_matches:
+            await conn.execute(
+                f"""UPDATE chain_patterns
+                    SET disabled_reason = 'legacy_lifecycle_retired',
+                        disabled_at = COALESCE(updated_at, ?)
+                    WHERE name IN ({','.join('?' for _ in builtins)})
+                      AND disabled_reason IS NULL""",
+                (now_iso, *builtins),
+            )
+
+        await conn.execute(
+            "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) VALUES (?, ?)",
+            (migration_name, now_iso),
+        )
+        await conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at, description) "
+            "VALUES (?, ?, ?)",
+            (20260520, now_iso, migration_name),
+        )
+        await conn.commit()
+        _db_log.info("chain_pattern_provenance_migrated", migration=migration_name)
 
     async def _migrate_momentum_7d_detected_at_index(self) -> None:
         await self._migrate_scanned_at_index(
