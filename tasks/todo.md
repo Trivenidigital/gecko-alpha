@@ -19,7 +19,7 @@ Last updated: 2026-05-17 (BL-NEW-LC-REVIVAL-CRITERIA-TIGHTENING PR #150 shipped)
 - [x] 3 parallel PR reviewers dispatched (statistical/safety, code-structural, strategy/UX); 0 CRITICAL + 5 IMPORTANT + 7 MINOR; all MUST/SHOULD folded into commit `3d8bf02`
 - [x] PR description updated with full reviewer fold history table
 - [x] backlog.md status flip PROPOSED → PR-OPEN / PENDING-MERGE + 4 follow-up items filed (BL-NEW-REVIVAL-VERDICT-WATCHDOG, BL-NEW-REVIVAL-CRITERIA-QUARTERLY-RECALIBRATION, BL-NEW-EVALUATION-HISTORY-PERSISTENCE, BL-NEW-REVIVAL-CRITERIA-PER-SIGNAL-TUNING)
-- [ ] **Post-merge:** flip backlog status to `SHIPPED <merge-date>` with merge SHA
+- [x] **Post-merge:** PR #150 squash-merged to master at `a20891f` (2026-05-17T21:48:57Z). backlog.md status flipped PR-OPEN / PENDING-MERGE → SHIPPED 2026-05-17 with merge SHA.
 
 Review:
 - Read-only evaluator ships without any production-runtime side-effects; revive_signal_with_baseline / auto_suspend / main.py / calibrate.py all untouched
