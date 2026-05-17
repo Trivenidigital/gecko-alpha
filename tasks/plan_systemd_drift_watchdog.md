@@ -64,7 +64,10 @@ Per CLAUDE.md §7b, the Hermes-first check must be done as evidence not assumpti
 - [ ] **Step 10 (V45 SHOULD-FIX):** `test_payload_truncation_under_4096` — synthesize 100 fake drifts; alert body is truncated with trailing `(N more drifts truncated — see journalctl)` and total length ≤ 4096 chars
 - [ ] **Step 11 (V46 MUST-FIX — ack tombstone):** `test_unchanged_drift_set_suppresses_re_alert` — first run with drift writes hash to tombstone + alerts; second run with SAME drift state reads tombstone, hash matches, exits 1 silently (no stub call)
 - [ ] **Step 12 (V46 MUST-FIX — ack tombstone, changed):** `test_changed_drift_set_re_alerts` — first run drifts on `foo.service`; second run drifts on `bar.service` → hash differs, alerts AGAIN
-- [ ] **Step 13:** Run, expect all 12 fail (script doesn't exist yet). Commit failing tests.
+- [ ] **Step 13 (V48 MUST-FIX — stable hash):** `test_stable_hash_under_filesystem_order_perturbation` — create 2 drifts; mock filesystem order to return reverse order on second run; hash must remain identical (regression-locks pre-hash sort)
+- [ ] **Step 14 (V48 MUST-FIX — HTTP-fail no-ack):** extend `test_telegram_http_failure_exits_7` to assert `ACK_FILE` is absent post-failure (next-day re-alert intended)
+- [ ] **Step 15 (V48 SHOULD-FIX — CLEAN heartbeat):** extend `test_clean_returns_zero` to assert heartbeat-file path exists post-run
+- [ ] **Step 16:** Run, expect all 14 fail (script doesn't exist yet). Commit failing tests.
 
 ### Task 2: watchdog script
 
