@@ -21,9 +21,18 @@ FRAGMENT="$(cat "$REPO_DIR/cron/gecko-alpha.crontab")"
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
-crontab -l 2>/dev/null \
+# V56 MUST-FIX — empty-crontab pipefail. On a fresh host with no crontab,
+# `crontab -l` exits nonzero. Without the `|| true`, `set -o pipefail` makes
+# the whole pipeline fail and `set -e` aborts BEFORE the `crontab "$TMP"`
+# install. Fragment is staged but never installed. The `|| true` makes the
+# pipeline-left-side succeed on empty crontab; awk processes empty input
+# and the END rule appends the fragment.
+( crontab -l 2>/dev/null || true ) \
     | awk -v fragment="$FRAGMENT" '
-        /^# === BEGIN gecko-alpha managed block/ { skip=1; matched=1; print fragment; next }
+        # V56 SHOULD-FIX — nested-sentinel guard. If a malformed crontab has
+        # a stray BEGIN inside an already-open block (operator error), only
+        # the OUTER BEGIN should emit the fragment. `if (!skip)` guards.
+        /^# === BEGIN gecko-alpha managed block/ { if (!skip) { skip=1; matched=1; print fragment } next }
         /^# === END gecko-alpha managed block/ { skip=0; next }
         # Build-time discovery: existing srilu crontab has the 2 gecko
         # entries WITHOUT sentinel bracketing. The plain `!skip` rule

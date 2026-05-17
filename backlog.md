@@ -1545,6 +1545,21 @@ ssh root@srilu-vps 'crontab -l | grep -v "/root/gecko-alpha"; ls /opt/ 2>&1; ls 
 Expected: known 4-app tenant set unchanged; no unexpected listening ports.
 **decision-by:** 2026-06-14.
 
+### BL-NEW-AUDIT-SURFACE-ADDENDUM: 5-category mini-sweep next cycle (cycle 11 follow-up)
+**Status:** PROPOSED 2026-05-17 — cycle 11 V58 PR-review FOLLOW-UP from BL-NEW-OTHER-PROD-CONFIG-AUDIT.
+**Why:** Cycle 11 covered the backlog-listed 17 categories. V58 surfaced 5 additional surfaces (nginx/caddy explicit probe, `/etc/systemd/system.conf`, `/etc/apt/sources.list.d/`, docker/containerd, complete systemd unit inventory) that are operationally meaningful but not in the original backlog scope.
+**Action:** ~3min mini-sweep + ~5min findings doc update OR ~30min full follow-up cycle if anything surfaces:
+```bash
+ssh root@srilu-vps '
+systemctl is-enabled nginx caddy 2>&1
+grep -v "^#\|^$" /etc/systemd/system.conf
+ls /etc/apt/sources.list.d/
+systemctl is-enabled docker containerd 2>&1
+systemctl list-units --type=service --all | grep -v "@\.service$" | head -40
+'
+```
+**Decision-by:** 4 weeks (low priority; mini-sweep is cheap).
+
 ### BL-NEW-POLYMARKET-VERIFY: operator confirms polymarket-ml-signal path validity (cycle 11 follow-up)
 **Status:** PROPOSED 2026-05-17 — cycle 11 follow-up (V52 + V53 fold).
 **Why:** Cycle 11 sweep showed crontab references `/opt/polymarket-ml-signal/scripts/extract_data.sh` every 6h, but `ls /opt/` returned empty. Possible explanations: (a) polymarket dir was deleted, (b) sweep redirect collapsed output, (c) different path layout. Informational; no gecko impact.

@@ -8,7 +8,7 @@
 
 Of the 17 config categories swept, **only 1 had a clear gap**: 2 gecko-alpha cron entries (`tg_burst_archive.sh`, `wal_archive.sh`) existed on srilu but were repo-untracked at the schedule level. **Fixed in this PR via `cron/` directory + sentinel-bracketed managed block + idempotent `cron/deploy.sh`.**
 
-4 follow-ups filed; 1 originally-suspected item withdrawn after drill (Apache).
+5 follow-ups filed (V57 fold — was 4; missed POLYMARKET-VERIFY); 1 originally-suspected item withdrawn after drill (Apache). V58 fold: 5 additional sweep gaps noted as addendum; filed BL-NEW-AUDIT-SURFACE-ADDENDUM.
 
 ## Sweep results
 
@@ -221,6 +221,20 @@ No Hermes skill for host-config-audit / cron-as-code. Custom audit doc. awesome-
 ## Drift verdict
 
 NET-NEW. No prior `tasks/findings_*prod_config*`. Branch `feat/other-prod-config-audit` off master HEAD `256b169` post-cycle-10.
+
+## Surface-completeness addendum (V58 SHOULD-FIX)
+
+The 17-category sweep covers the backlog-listed scope. Five additional surfaces are operationally meaningful but were NOT swept in cycle 11 (each is ≤30s SSH; all gated to next cycle's mini-sweep):
+
+| Category | Why it might matter | Probe |
+|---|---|---|
+| `nginx` + `caddy` (explicit, beyond Apache) | Undocumented reverse proxy could be enabled | `systemctl is-enabled nginx caddy 2>&1` |
+| `/etc/systemd/system.conf` | `DefaultTimeoutStartSec` / `DefaultLimitNOFILE` affect gecko-pipeline restart timing | `grep -v "^#\|^$" /etc/systemd/system.conf` |
+| `/etc/apt/sources.list.d/` | 3rd-party apt repos pin/gate package availability (e.g. uv source) | `ls /etc/apt/sources.list.d/` |
+| `docker` / `containerd` | Undocumented co-tenant container runtime | `systemctl is-enabled docker containerd 2>&1` |
+| Complete systemd unit inventory | Locks the "4 projects" tenant count | `systemctl list-units --type=service --all \| grep -v "@\.service$"` |
+
+Filed as `BL-NEW-AUDIT-SURFACE-ADDENDUM` for the next cycle. Acknowledged here so the V58 finding doesn't get silently absorbed.
 
 ## Reproducibility
 
