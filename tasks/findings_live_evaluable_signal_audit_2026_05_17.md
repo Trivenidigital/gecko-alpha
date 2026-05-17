@@ -45,8 +45,8 @@ Pre-cutover-only signals (last `opened_at` < 2026-05-11): `first_signal` (last 2
 |---|---|---:|---|---|
 | `gainers_early` | Tier 2b (mcap + 24h gates) OR Tier 1b (stack≥3) | 3 observed | `{price_change_24h, mcap}` | **LIVE-ELIGIBLE** under Tier 2b gates; 28.2% post-cutover |
 | `volume_spike` | Tier 2a (always) | 0-1 | `{spike_ratio}` | **LIVE-ELIGIBLE** unconditionally — 100% post-cutover |
-| `chain_completed` | Tier 1a (always) | 0 | `{pattern, boost}` | **LIVE-ELIGIBLE** structurally — but 0 trades post-cutover (see Finding 1) |
-| `first_signal` | Tier 1b (stack≥3) ONLY | 2 (`momentum_ratio + cg_trending_rank` pair) by design | `{quant_score, signals}` | **STRUCTURALLY NON-ELIGIBLE** — admission rule (`FIRST_SIGNAL_MIN_SIGNAL_COUNT=2`) caps stack at 2; signal is currently inactive (last 2026-05-01) |
+| `chain_completed` | Tier 1a (always) | 0 | `{pattern, boost}` | **LIVE-ELIGIBLE** structurally (Tier 1a unconditional). All-time table shows 0/18 eligible, but ALL 18 rows opened pre-cutover (last 2026-05-07; writer 2026-05-11) → `would_be_live` is NULL by `feedback_mid_flight_flag_migration.md`. "0/18" is a NULL artifact, NOT an eligibility hole. Separate concern: 0 trades post-cutover (see Finding 1). |
+| `first_signal` | Tier 1b (stack≥3) potentially | 3 observed (1 trade), so structurally reachable | `{quant_score, signals}` | **TIER 1b ELIGIBLE** when conviction-stack reaches 3 — one such trade observed. Eligibility writer NULL-blanket post-cutover-only means we can't confirm whether the 1 stack-3 trade would have stamped =1; it predates 2026-05-11 cutover. Signal currently inactive (last 2026-05-01); see Finding 3. **V36 MUST-FIX fold:** earlier draft claimed "max stack=2 by design" from `FIRST_SIGNAL_MIN_SIGNAL_COUNT=2` — that gate controls *admission* via `len(signals_fired)` at signals.py:327, NOT the runtime `conviction_stack` (BL-067's cross-signal-type 504h co-firing count at `conviction.py:265`). The two are mechanistically distinct. |
 | `trending_catch` | Tier 1b (stack≥3) ONLY | 1 by design (fires alone) | `{source, mcap_rank}` | **STRUCTURALLY NON-ELIGIBLE** — single-source from `trending_snapshot`; auto-killed 2026-05-11 |
 | `losers_contrarian` | Tier 1b (stack≥3) ONLY | 0 observed | `{price_change_24h, mcap}` | **STRUCTURALLY NON-ELIGIBLE** — fires alone from gainers/losers scanner; no path to stack≥3 |
 | `narrative_prediction` | Tier 1b (stack≥3) ONLY | 0 observed | `{fit, category, mcap}` | **STRUCTURALLY NON-ELIGIBLE** — fires alone from narrative scanner; no path to stack≥3 |
@@ -58,6 +58,8 @@ Pre-cutover-only signals (last `opened_at` < 2026-05-11): `first_signal` (last 2
 The 3 structurally-eligible signal_types account for **41 of 41 = 100%** of post-cutover eligible trades. The structurally-non-eligible signal_types contribute **0 of 118 = 0%** eligible trades (94 `losers_contrarian` + 24 `narrative_prediction`).
 
 This is the load-bearing empirical confirmation of the structural argument: writers correctly stamp 0% eligible for the structurally-non-eligible signal_types — they would never have made it past the Tier-1/2 filter regardless of paper performance.
+
+**Caveat (V36 fold):** "0% eligible" for `losers_contrarian` + `narrative_prediction` is a STRUCTURAL result. "0% eligible all-time" for `chain_completed` is a CUTOVER ARTIFACT (all 18 trades pre-2026-05-11; writer not running, would_be_live NULL). The two have the same surface number but different mechanisms — readers should not confuse the structural verdict with the NULL artifact.
 
 ## Finding 1: `chain_completed` silence post-cutover
 
@@ -71,12 +73,12 @@ This is the load-bearing empirical confirmation of the structural argument: writ
 
 ## Finding 2: Resource consumption by structurally-non-eligible signals
 
-Post-cutover trade contribution by structurally-non-eligible types:
+Post-cutover trade contribution by structurally-non-eligible types (V36 fold — precise arithmetic; total post-cutover n = 248):
 
-- `losers_contrarian`: 94 trades (40% of post-cutover paper volume; eligible 0)
-- `narrative_prediction`: 24 trades (10% of post-cutover paper volume; eligible 0)
+- `losers_contrarian`: 94 trades (~38% of post-cutover paper volume; eligible 0)
+- `narrative_prediction`: 24 trades (~10% of post-cutover paper volume; eligible 0)
 
-Combined: **50% of post-cutover paper trades are from signal_types that can never go live under current Tier rules.** Operator resources consumed:
+Combined: **~48% (118/248) of post-cutover paper trades are from signal_types that can never go live under current Tier rules.** Operator resources consumed:
 
 - Paper slots (up to 50 simultaneous per cap)
 - Telegram alerts (each open + each close)
@@ -86,14 +88,19 @@ Combined: **50% of post-cutover paper trades are from signal_types that can neve
 
 **Not a recommendation to disable** — paper trades on non-eligible signals still validate the scoring model and produce per-signal PnL evidence. But at the next live-trading roadmap revisit, the operator should explicitly choose: (a) keep paper-trading non-eligible signals as a research surface, (b) add a settings-driven allowlist that excludes them from auto-suspend/calibration/alert calculations, (c) demote them to the lower-cost `narrative` event stream without trade dispatch.
 
-## Finding 3: `first_signal` is effectively dead
+## Finding 3: `first_signal` is effectively dead (cause undetermined)
 
-Last opened 2026-05-01 — 16 days ago. The admission rule caps stack at 2 (`FIRST_SIGNAL_MIN_SIGNAL_COUNT=2`); pre-cutover 256 trades, 0 eligible. Either:
+Last opened 2026-05-01 — 16 days ago. **V36 MUST-FIX fold:** the pre-cutover 256-trades-0-eligible figure is a NULL artifact (writer wasn't running), NOT a structural verdict. The 1 row with `conviction_locked_stack ≥ 3` proves Tier 1b is reachable.
 
-- The 2-signal admission threshold has stopped firing (upstream momentum-ratio + cg_trending_rank pair no longer co-occur for fresh candidates)
-- A configuration change retired the signal (no audit evidence)
+Either:
 
-**Recommended follow-up:** file `BL-NEW-FIRST-SIGNAL-RETIREMENT-DECISION` to confirm whether `first_signal` should be retired in code or revived via lowered admission gates. Filing-only; no immediate action.
+- The first_signal dispatcher's admission rule (`len(signals_fired) >= FIRST_SIGNAL_MIN_SIGNAL_COUNT=2`) has stopped firing — upstream momentum-ratio + cg_trending_rank pair no longer co-occur for fresh candidates
+- A silent configuration retirement
+- Genuine 16-day quiet window
+
+**Open question deferred to follow-up:** the 1 first_signal trade with `conviction_locked_stack=3` — pre-cutover (NULL), slot-cap-rejected, or writer-bug-skipped? Not drilled in this audit.
+
+**Recommended follow-up:** `BL-NEW-FIRST-SIGNAL-RETIREMENT-DECISION` reframed: confirm whether `first_signal` should be retired in code, revived via lowered admission gates, OR investigated as a dispatcher-side regression. Filing-only; no immediate action.
 
 ## Recommended follow-ups (to file as net-new backlog entries)
 
