@@ -821,6 +821,14 @@ def test_parse_cutover_iso_rejects_empty_and_garbage():
         _parse_cutover_iso("not-an-iso")
 
 
+def test_parse_cutover_iso_normalizes_naive_to_utc():
+    """PR-stage reviewer #2 finding #19: naive ISO must become tz-aware
+    so downstream subtraction against tz-aware audit cutovers doesn't crash."""
+    dt = _parse_cutover_iso("2026-05-01T00:00:00")
+    assert dt.tzinfo is not None
+    assert dt == datetime(2026, 5, 1, tzinfo=timezone.utc)
+
+
 def test_emit_sql_returns_none_on_fail():
     result = RevivalCriteriaResult(
         signal_type="losers_contrarian",
@@ -873,3 +881,6 @@ def test_emit_sql_returns_safe_insert_on_pass():
     assert "keep_on_provisional_until_2026-06-16" in sql
     assert "losers_contrarian" in sql
     assert "BL-NEW-REVIVAL-COOLOFF" in sql
+    # PR-stage reviewer #3 finding #4: microsecond truncation in verdict string
+    assert ".000000" not in sql
+    assert ".703324" not in sql

@@ -11,7 +11,7 @@
 
 ## TL;DR
 
-The new evaluator correctly rejects two of the four signals it was run against (`gainers_early` FAIL, `losers_contrarian` STRATIFICATION_INFEASIBLE) and produces clear "wait" verdicts for the other two (`chain_completed` and `volume_spike`, both BELOW_MIN_TRADES). The headline finding: the 2026-05-13 `keep_on_permanent` audit-id=24 verdict on `gainers_early` is **contradicted** by the new evaluator — both stratified windows show negative bootstrap-LB per-trade-pnl, and the ATTENTION block fires automatically printing the revoke SQL.
+The new evaluator correctly rejects two of the four signals it was run against (`gainers_early` FAIL, `losers_contrarian` STRATIFICATION_INFEASIBLE — **LC was suspended today, so post-cutover regime cannot yet be evaluated; re-run in ≥7d**) and produces clear "wait" verdicts for the other two (`chain_completed` and `volume_spike`, both BELOW_MIN_TRADES). The headline finding: the 2026-05-13 `keep_on_permanent` audit-id=24 verdict on `gainers_early` is **contradicted** by the new evaluator — both stratified windows show negative bootstrap-LB per-trade-pnl, and the ATTENTION block fires automatically printing the revoke SQL.
 
 ## losers_contrarian evaluation
 
@@ -31,6 +31,9 @@ Failure reasons:
 If operator wants to evaluate against an earlier cutover (e.g., the 2026-05-06T02:13Z LC operator-revival), they can pass `--cutover-iso 2026-05-06T02:13:00Z`. But per design-review fold C#6, operator-revival rows are EXCLUDED from automatic cutover-detection because they're outcomes of regime decisions, not regime decisions themselves.
 
 ## gainers_early evaluation (FALSIFICATION-RISK ANALYSIS — DO NOT ACT)
+
+> **>>> WARNING (re-stated next to the SQL below) <<<**
+> The FAIL output for `gainers_early` below CONTAINS A `sqlite3 INSERT` revoke statement. Per operator constraint, **do NOT paste** it. The signal is heading the right direction (per-trade improved $-3.13 → $-0.70 across the cutover); auto-revocation would be premature. The evaluator provides evidence; the operator chooses whether to act.
 
 ```
 === Revival criteria evaluation: gainers_early ===

@@ -43,6 +43,10 @@ The plan v3 PROVISIONAL defaults (`MAX_NO_BREAKOUT_AND_LOSS=0.25`, `EXIT_MACHINE
 
 Stop_loss and expired_loss frequencies are NOT gated directly — they vary too widely across healthy signals (sl 0.011-0.167; exp 0.0-0.427) to set a defensible threshold. They remain in `WindowDiagnostics` for operator visibility but do NOT trip FAIL. (Plan v3 Task 10 `_evaluate_window_gates` reflects this: only the 4 primary gates fire FAIL — Wilson LB, bootstrap LB, no_breakout_and_loss, exit_machinery.)
 
+## Defer-flag (per PR-stage reviewer #3 finding #14)
+
+The `EXIT_MACHINERY_MIN=0.70` threshold is anchored to `narrative_prediction`'s 0.756 baseline. chain_completed's contribution to the healthy set (0.991 at n=12) is small-sample and is NOT the anchor. **If any future FAIL verdict is attributed SOLELY to `exit_machinery_contribution` (i.e., all other gates pass), the operator should re-derive baselines.** This is the trigger condition for `BL-NEW-REVIVAL-CRITERIA-QUARTERLY-RECALIBRATION`; document it in the next quarterly review.
+
 ## Cross-check against LC (control)
 
 LC's aggregate metrics (nb_loss 0.33, exit_machinery 0.85) sit WITHIN healthy range — confirming the failure mode is NOT in the secondary diagnostics. The bleed is in the per-trade-pnl tail (Wilson LB / bootstrap LB) which the plan v3 §1b family-wise disclosure already addresses as the primary gate. The secondary diagnostics are sanity-check guardrails; the primary statistical gates are where signal-quality FAIL actually triggers.

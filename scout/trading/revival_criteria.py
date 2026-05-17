@@ -561,15 +561,23 @@ def _sql_escape(s: str) -> str:
 
 
 def _parse_cutover_iso(s: str) -> datetime:
-    """Per design-review fold C#14: argparse type validator with friendly error."""
+    """Per design-review fold C#14: argparse type validator with friendly error.
+
+    Per PR-stage reviewer #2 finding #19: normalize naive input to UTC.
+    Otherwise downstream arithmetic with tz-aware audit cutovers raises
+    TypeError ("can't subtract offset-naive and offset-aware datetimes").
+    """
     if not s:
         raise argparse.ArgumentTypeError("--cutover-iso cannot be empty")
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError as e:
         raise argparse.ArgumentTypeError(
             f"--cutover-iso must be a valid ISO 8601 timestamp; got={s!r} ({e})"
         )
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 async def _query_cool_off_status(
@@ -649,7 +657,15 @@ def _print_verdict(
             f"\n>>> ATTENTION: existing soak_verdict={keep_value!r} at {keep_iso} "
             f"is CONTRADICTED by current FAIL."
         )
-        print(">>> To revoke, run:")
+        print(">>> To revoke (DO NOT PASTE WITHOUT REVIEWING:")
+        # Per PR-stage reviewer #3 finding #2: safety comment ahead of revoke SQL
+        print(
+            "    - cycle-9 precedent for this signal class, AND"
+        )
+        print(
+            "    - existing keep_value above (may be older verdict, not the one to revoke)"
+        )
+        print(">>> ):")
         revoke_sql = (
             f"sqlite3 <db> \"INSERT INTO signal_params_audit"
             f"(signal_type, field_name, old_value, new_value, reason, applied_by, applied_at) "
@@ -697,9 +713,12 @@ def _emit_soak_verdict_sql(
     _validate_signal_type(operator)
     sig = _sql_escape(result.signal_type)
     op = _sql_escape(operator)
-    expiry_at = result.evaluated_at + timedelta(
-        days=settings.REVIVAL_CRITERIA_VERDICT_EXPIRY_DAYS
-    )
+    # Per PR-stage reviewer #3 finding #4: truncate microseconds — the
+    # 30-day expiry is day-precision, and the watchdog will need to parse
+    # this back. Microsecond noise makes value visually unscannable.
+    expiry_at = (
+        result.evaluated_at + timedelta(days=settings.REVIVAL_CRITERIA_VERDICT_EXPIRY_DAYS)
+    ).replace(microsecond=0)
     verdict_str = f"keep_on_provisional_until_{expiry_at.isoformat()}"
     reason = _sql_escape(
         f"PASS: n={result.n_trades}, cutover={result.cutover_at.isoformat()} "
@@ -748,14 +767,30 @@ async def _main_async(args: argparse.Namespace) -> int:
             db, args.signal_type, settings, cutover_override=args.cutover_iso
         )
 
+        # Per PR-stage reviewer #3 finding #6: fire OVERRIDE WARNING whenever
+        # --cutover-iso is used, regardless of audit match. One-sided warning
+        # made operator-gaming via override invisible when no audit existed.
         if args.cutover_iso is not None:
             audit_cutover, _ = await find_latest_regime_cutover(db, args.signal_type)
-            if audit_cutover is not None and audit_cutover != args.cutover_iso:
+            if audit_cutover is None:
+                print(
+                    f">>> OVERRIDE WARNING: --cutover-iso "
+                    f"{args.cutover_iso.isoformat()} used; no audit-derived "
+                    f"cutover exists for {args.signal_type}",
+                    file=sys.stderr,
+                )
+            elif audit_cutover != args.cutover_iso:
                 delta = (args.cutover_iso - audit_cutover).days
                 print(
                     f">>> OVERRIDE WARNING: audit-derived cutover was "
                     f"{audit_cutover.isoformat()}; operator override is "
                     f"{args.cutover_iso.isoformat()} (delta={delta}d)",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f">>> OVERRIDE WARNING: --cutover-iso matches "
+                    f"audit-derived cutover; override is redundant but logged",
                     file=sys.stderr,
                 )
 
@@ -781,6 +816,15 @@ async def _main_async(args: argparse.Namespace) -> int:
         if sql is not None:
             print("\n--- Operator may paste the following SQL to write the audit row ---")
             print(sql)
+            # Per PR-stage reviewer #3 finding #11: advisory-verdict caveat —
+            # the keep_on_provisional_until_<iso> verdict expires structurally
+            # but nothing enforces the expiry yet (watchdog deferred to
+            # BL-NEW-REVIVAL-VERDICT-WATCHDOG follow-up). Operator must re-run
+            # this evaluator at expiry; the verdict is advisory, not enforcing.
+            print(
+                ">>> NOTE: verdict expiry is advisory (no active watchdog yet — "
+                "see BL-NEW-REVIVAL-VERDICT-WATCHDOG). Re-run evaluator at expiry."
+            )
 
     log.info(
         "revival_criteria_evaluated",
@@ -801,7 +845,14 @@ async def _main_async(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="revival_criteria")
+    p = argparse.ArgumentParser(
+        prog="revival_criteria",
+        epilog=(
+            "Exit codes: 0=PASS, 1=FAIL, "
+            "2=BELOW_MIN_TRADES or STRATIFICATION_INFEASIBLE, "
+            "3=signal_type not found in signal_params."
+        ),
+    )
     p.add_argument("signal_type", help="signal_type to evaluate")
     p.add_argument("--db", default="scout.db", help="path to scout.db")
     p.add_argument(
