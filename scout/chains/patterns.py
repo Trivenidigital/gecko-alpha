@@ -86,13 +86,14 @@ BUILT_IN_PATTERNS: list[ChainPattern] = [
         ],
         min_steps_to_trigger=3,
         conviction_boost=25,
-        # BL-NEW-CHAIN-COHERENCE 2026-05-06: bumped low→medium so the first
-        # post-fix completion produces a Telegram alert. Pre-fix this
-        # pattern matched 0 times in production despite 2,770 anchor
-        # candidates (token_id keying bug). Operator needs ambient
-        # confirmation that the per-laggard fix unblocked matching;
-        # falls back to "low" once observability is no longer load-bearing.
-        alert_priority="medium",
+        # BL-NEW-CHAIN-COHERENCE 2026-05-06: bumped low→medium for first-fire
+        # observability post per-laggard fix. Reverted to "low" 2026-05-17
+        # after post-PR-#146 runtime confirmed pattern firing healthily
+        # (201 chain_matches lifetime; 12 chain_completed paper trades in
+        # 14d, +$1,034 net, +$207/trade). Observability bump served its
+        # purpose; prod DB was already at "low" via PR #146 snapshot
+        # restore, so this is also a code-vs-prod-state alignment.
+        alert_priority="low",
     ),
     ChainPattern(
         name="narrative_momentum",
@@ -127,8 +128,11 @@ BUILT_IN_PATTERNS: list[ChainPattern] = [
         min_steps_to_trigger=3,
         conviction_boost=15,
         # BL-NEW-CHAIN-COHERENCE 2026-05-06: bumped low→medium for the
-        # same observability reason as full_conviction above.
-        alert_priority="medium",
+        # same observability reason as full_conviction above. Reverted to
+        # "low" 2026-05-17: 210 chain_matches lifetime; pattern firing
+        # healthily post-PR-#146. Code-vs-prod-state alignment (prod was
+        # already at "low" via PR #146 snapshot restore).
+        alert_priority="low",
     ),
     ChainPattern(
         name="volume_breakout",
