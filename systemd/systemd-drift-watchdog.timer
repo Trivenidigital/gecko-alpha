@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily timer for systemd-drift-watchdog
+Requires=systemd-drift-watchdog.service
+
+[Timer]
+OnCalendar=*-*-* 09:30:00
+Persistent=true
+Unit=systemd-drift-watchdog.service
+
+[Install]
+WantedBy=timers.target

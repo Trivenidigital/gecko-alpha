@@ -11,6 +11,7 @@ Production unit files for the gecko-alpha services. Captured verbatim from `sril
 | `gecko-backup.service` + `.timer` | daily backup at 03:00 | runs `scripts/backup_db.sh` |
 | `gecko-backup-watchdog.service` + `.timer` | stale-heartbeat watchdog | 09:00 daily |
 | `minara-emission-persistence-watchdog.service` + `.timer` | Minara emission persistence freshness | hourly |
+| `systemd-drift-watchdog.service` + `.timer` | repo↔prod unit-file drift detection + drop-in enumeration | daily 09:30 UTC; alerts via TG; ack-tombstone suppresses re-alert on unchanged drift-set; manual override `rm /var/lib/gecko-alpha/systemd-drift-watchdog/last_alerted_hash` |
 
 ## Deploy workflow
 

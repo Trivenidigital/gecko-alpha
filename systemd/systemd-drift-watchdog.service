@@ -1,0 +1,13 @@
+[Unit]
+Description=Systemd unit-file drift watchdog for gecko-alpha
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/gecko-alpha
+ExecStart=/root/gecko-alpha/scripts/systemd-drift-watchdog.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
