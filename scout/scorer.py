@@ -118,6 +118,9 @@ def score(
     # > 7 days: 0 pts
 
     # Signal 5: Social Mentions -- 15 points (optional)
+    # DEAD SIGNAL — pending BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT re-eval
+    # (2026-05-17 audit confirmed 0 fires across 6,096,576 score_history rows;
+    # max social_mentions_24h = 0 across 1,671 candidates; Variant B 0-flip).
     if token.social_mentions_24h > 50:
         points += 15
         signals.append("social_mentions")

@@ -1,6 +1,36 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-17 (BL-NEW-LC-REVIVAL-CRITERIA-TIGHTENING PR #150 shipped)
+Last updated: 2026-05-17 (BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT findings shipped; BL-NEW-LC-REVIVAL-CRITERIA-TIGHTENING PR #150 merged at a20891f)
+
+## Active Work: BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT
+
+- [x] Isolated worktree: `.claude/worktrees/feat+social-mentions-denominator-audit`
+- [x] Drift-check: `git fetch origin && git log -10 origin/master` confirms HEAD=`a20891f` (zero divergence, includes merged PR #150). 19 files match `social_mentions_24h|SOCIAL_MENTIONS`: scorer.py:121 (live consumer), models.py, db.py, dashboard surfaces, 4 test files, 4 doc files. No drift — field is wired as documented in originating backlog entry L228
+- [x] Hermes-first: Hermes skill hub WebFetch (category-exhaustive: Social Media 7 skills) returns no per-token mention-aggregation skills. awesome-hermes 404 consistent. Bridge not eligible (Hermes X 0/126 resolved; TG 6 distinct tokens/24h)
+- [x] Runtime-state verification (per CLAUDE.md §9a): `social_mentions_24h = 0 across all 1,671 candidates`, max=0; full `score_history` (6,096,576 rows) max=58; gte_60=0; gte_70=0; paper dispatch bypasses CONVICTION (`signals.py:325 quant_score > 0`)
+- [x] Plan v2 (post-2-reviewer fold): `tasks/plan_social_mentions_denominator_audit.md`
+- [x] 2 parallel plan reviewers: empirical-rigor (BLOCK on MIN_SCORE=60-not-25 CRITICAL + paper-dispatch-bypasses-CONVICTION CRITICAL) + strategy/deferral-risk (APPROVE-WITH-FIXES, multiple IMPORTANT); ALL CRITICAL + IMPORTANT folded into v2
+- [x] Design v1: `tasks/design_social_mentions_denominator_audit.md`
+- [x] 2 parallel design reviewers: operator-UX (3 CRITICAL: TL;DR overload, uncommitted queries, wrong PR number) + risk/deferral-discipline (1 CRITICAL: operator-response no SLA + multiple IMPORTANT); ALL CRITICAL + IMPORTANT folded into findings doc + design v2 by inline
+- [x] `tasks/audit_v2_queries.sql` shipped for operator re-evaluation (per design-review folds)
+- [x] Findings doc shipped: `tasks/findings_social_mentions_denominator_audit_2026_05_17.md` (recommendation: Option B; deferred to operator approval)
+- [x] One-line `# DEAD SIGNAL` annotation on `scorer.py:121` (zero behavior change; 69/69 scorer tests pass on srilu)
+- [x] backlog.md status flip PROPOSED → AUDITED 2026-05-17 + 5 follow-up entries filed (BL-NEW-SOCIAL-DENOMINATOR-RE-EVAL-WATCHDOG, BL-NEW-SCORER-DEAD-SIGNAL-COMMENT-CONVENTION, BL-NEW-SOCIAL-DENOMINATOR-OPERATOR-PREFERENCE, BL-NEW-SOCIAL-DENOMINATOR-VARIANT-B-IMPL, BL-NEW-SOCIAL-DENOMINATOR-VARIANT-C-IMPL — last 2 PENDING-OPERATOR-DECISION per PR-review fold R3 #4)
+- [x] todo.md Active Work entry (this section)
+- [x] PR #152 created + 3 parallel PR-stage reviewers dispatched (statistical-defensibility + structural + strategy-deferral-risk); 1 CRITICAL + 10 IMPORTANT folded into commit `5894352`
+- [x] Reviewer 1 post-merge-review fold (commit pending): awesome-hermes-agent stale-404 claim corrected (x-twitter-scraper exists; doesn't cover per-token aggregation); 0-flip claim downgraded to "closed-form approximation"; todo checkboxes + counts corrected
+- [ ] Post-merge bookkeeping: flip status to `SHIPPED-AS-AUDIT-FINDINGS <merge-date> <merge-SHA>` per PR #150 Reviewer 1 convention
+- [ ] Operator response to Open Question 1 (B vs C): file as PR comment or follow-up commit; trigger next-cycle implementation (BL-NEW-SOCIAL-DENOMINATOR-VARIANT-{B,C}-IMPL pre-filed)
+
+Review:
+- The originating concern (15-point dead phantom in SCORER_MAX_RAW=208) is empirically confirmed across 6,096,576 historical scoring rows (max=58, never reaches MIN_SCORE=60)
+- Variant B (recommended) has 0-flip blast radius — gate recalibration from 60/70 to 65/75 preserves current friction
+- Variant C unlocks 35 historical candidates at MIN_SCORE — operator preference question for funnel-widening
+- Variant D (Hermes/TG bridge) deferred per data-readiness gate (Hermes 0/126 resolved; TG 6/24h distinct tokens)
+- Plan-stage reviewer #1 caught CRITICAL: I had MIN_SCORE wrong (60 not 25); all backtest numbers re-computed against correct gates
+- Per-trade dispatch path (`signals.py:325`) bypasses CONVICTION entirely — reframed blast-radius analysis to MiroFish-alert path
+- Per CLAUDE.md §10 heuristic-invocation: full Plan→2-reviewers→Design→2-reviewers chain justified because findings-doc-only audit's deferral has highest rot risk; cycle-9 calendar discipline applied to all 3 follow-ups
+- Per CLAUDE.md §11b: Wilson UB applied to 0/126 resolved claim (2.91% one-sided UB; negligible)
 
 ## Active Work: BL-NEW-LOSERS-CONTRARIAN-REVIVAL-CRITERIA-TIGHTENING
 

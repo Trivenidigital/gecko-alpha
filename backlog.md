@@ -226,15 +226,56 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Note on consolidation:** This entry replaces the prior separate BL-032 + BL-041 (X/Twitter monitoring). They were two pending entries for the same dead-signal problem; merged 2026-05-03.
 
 ### BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT: backtest dead social signal removal/replacement
-**Status:** PROPOSED 2026-05-14.
-**Tag:** `scoring` `dead-signal` `calibration` `hermes-first`
-**Why:** `social_mentions_24h` never fires in production but contributes 15 points to `SCORER_MAX_RAW`. Removing it would raise normalized scores for every candidate, so the correct next move is a backtest/calibration pass, not an inline cleanup.
+**Status:** AUDITED 2026-05-17 — see `tasks/findings_social_mentions_denominator_audit_2026_05_17.md`. Full Plan→2-reviewers→Design→2-reviewers→PR→3-reviewers cycle completed. **Recommendation: Option B (remove + recalibrate gates 60→65 / 70→75); closed-form approximate 0-flip blast radius across 6,096,576 score_history rows** (closed-form because `score_history` stores only post-multiplier final score; exact re-score from raw points + signal list not feasible). Code change DEFERRED to explicit operator approval per scope constraint. PR ships findings doc + audit_v2_queries.sql for re-evaluation + one-line `# DEAD SIGNAL` annotation on scorer.py:121 (zero behavior change; 69/69 scorer tests pass). Hermes X bridge (0/131 resolved 7d) and TG bridge (6 distinct contracts/24h) both data-not-ready; both deferred. 5 follow-up items filed below (3 audit + 2 VARIANT-{B,C}-IMPL PENDING-OPERATOR-DECISION).
+**Tag:** `scoring` `dead-signal` `calibration` `hermes-first` `audited`
 
-**Scope:** Compare current scoring denominator against: (1) remove `social_mentions_24h` from scoring/max raw, (2) replace with an evidence-gated `narrative_mentions_24h` / `kol_mentions_24h` sourced from Hermes X + TG only after production row thresholds are met, and (3) leave as-is until X narrative rows mature.
+**Original status (now historical):** PROPOSED 2026-05-14. Originating scope: Compare current scoring denominator against (1) remove `social_mentions_24h` from scoring/max raw, (2) replace with evidence-gated `narrative_mentions_24h` / `kol_mentions_24h` from Hermes X + TG, (3) leave as-is until X narrative rows mature.
 
-**Hermes-first basis:** Installed Hermes X/KOL path exists and should be the first social source. Third-party social APIs remain deferred unless this audit proves a residual gap.
+**Hermes-first verdict (post-audit, corrected 2026-05-17 PR-stage):** Hermes skill hub Social Media category (7 skills) + awesome-hermes-agent ecosystem BOTH checked. awesome-hermes-agent IS reachable (prior cycle-7/8/9 "404 consistent" claim was stale — corrected). `x-twitter-scraper` exists at `https://github.com/Xquik-dev/x-twitter-scraper` (typed X/Twitter API: search, timelines, mentions, trends, monitors, webhooks) but does NOT cover per-token 24h aggregation. Audit verdict unchanged (no drop-in primitive); diligence framing corrected.
 
-**Evidence gates before bridge-to-scoring:** at least 50 `narrative_alerts_inbound` rows, at least 20 resolved rows or an explicit symbol-resolution design, and attribution analysis showing X/TG rows improve early signal quality versus existing gainers/trending/momentum surfaces.
+**Re-evaluation triggers** (operator runs `tasks/audit_v2_queries.sql` when ANY fires):
+1. `narrative_alerts_inbound.resolved_coin_id` ≥ 20 in any 30d window (currently 0/126)
+2. `tg_social_messages` distinct-contract 24h rollup ≥ 50 (currently 6)
+3. `scorer.py` signal weight change OR `SCORER_MAX_RAW` change (invalidates Variant B's 0-flip math)
+4. 2026-08-17 (90d calendar backstop per cycle-9 `keep_on_provisional_until_<iso>` convention)
+5. Operator explicit request
+
+### BL-NEW-SOCIAL-DENOMINATOR-RE-EVAL-WATCHDOG: daily cron for re-eval triggers 1+2
+**Status:** PROPOSED 2026-05-17 — filed concurrent with BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT findings.
+**Tag:** `observability` `audit-watchdog` `silent-failure-prevention`
+**Why:** Re-eval triggers 1+2 (`narrative_alerts_inbound.resolved_coin_id` ≥ 20 in 30d; `tg_social_messages` distinct-contract 24h ≥ 50) are operator-memory-dependent. Per CLAUDE.md §12a (freshness SLO + watchdog rule), decision-bearing thresholds need automated detection or they silently never fire — same shape as `BL-NEW-REVIVAL-VERDICT-WATCHDOG` from cycle-9. The 2c (TG rollup) and 2a (resolution rate) follow-ups merged into this single watchdog per design-review fold R1 #5 (both query the same `narrative_alerts_inbound` + `tg_social_messages` surface).
+**Action:** Daily cron query against `narrative_alerts_inbound` resolution-count (30d window) AND `tg_social_messages` distinct-contract 24h rollup; TG alert ("revival_criteria-style") when either threshold crossed. **Owner:** operator or next-cycle infrastructure work assignee — to be claimed on PR merge.
+**Decision-by:** 4 weeks from PR merge. **If not implemented by that date, audit must be re-run manually on 2026-08-17** (90d backstop is the load-bearing safety net; watchdog is the convenience layer). Per PR-review fold R3 #2 + R2 #5.
+
+### BL-NEW-SCORER-DEAD-SIGNAL-COMMENT-CONVENTION: codify the `# DEAD SIGNAL` annotation pattern
+**Status:** PROPOSED 2026-05-17 — filed concurrent with BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT findings.
+**Tag:** `scoring` `code-convention` `intellectual-debt-prevention`
+**Why:** Per design-review fold R2 §2: Signal 13 (CryptoPanic) at `scorer.py:184-198` has a documented gated-comment convention; Signal 5 (Social Mentions) lacked one until this audit added it. Future scorer audits will repeat this work unless the convention is codified.
+**Action:** One-line style-guide addition: "Any scorer signal that hasn't fired in the last 7d production window MUST carry a `# DEAD SIGNAL` or `# GATED — pending <BL ticket>` comment immediately above the threshold check." Bundle with next scorer.py touch.
+**Decision-by:** 8 weeks from PR merge. Calendar-bound; if no scorer.py PR by then, file standalone PR. Per PR-review fold R2 #5.
+
+### BL-NEW-SOCIAL-DENOMINATOR-OPERATOR-PREFERENCE: B vs C decision for next-cycle code change
+**Status:** PROPOSED 2026-05-17 — surfaced as Open Question 1 in audit findings.
+**Tag:** `operator-decision` `awaiting-response`
+**Why:** Audit recommends Variant B (remove + recalibrate gates 60→65 / 70→75) with closed-form approximate 0-flip blast radius (caveat: `score_history` stores only post-multiplier final score; closed-form approximation not exact re-score). Variant C (remove WITHOUT recalibrating) widens MiroFish funnel by 35 historical candidates — operator may value this if recall > precision.
+**Action:** Operator responds via PR comment OR `tasks/findings_social_mentions_denominator_operator_decision.md` follow-up commit. On response: close this entry; promote pre-filed `BL-NEW-SOCIAL-DENOMINATOR-VARIANT-B-IMPL` or `-VARIANT-C-IMPL` below from PENDING-OPERATOR-DECISION to PROPOSED for next-cycle code change.
+**Decision-by:** 4 weeks from PR merge. **If no response by then, entry remains PROPOSED until 2026-08-17 backstop run resurfaces for human triage.** (Per PR-review fold R3 #1: the prior "default action = stamp interim Option A" had no actor and was itself a silent-non-trigger — the exact failure mode this audit exists to prevent. Removed.)
+
+### BL-NEW-SOCIAL-DENOMINATOR-VARIANT-B-IMPL: implement Option B (remove + recalibrate gates)
+**Status:** PENDING-OPERATOR-DECISION 2026-05-17 — pre-filed per PR-review fold R3 #4 so operator's "approve B" comment lands on a real backlog row.
+**Tag:** `scoring` `code-change` `gate-recalibration` `pending-decision`
+**Why:** Audit-recommended path. Removes Signal 5 from scorer.py + drops SCORER_MAX_RAW 208→193 + raises MIN_SCORE 60→65 + raises CONVICTION_THRESHOLD 70→75. Closed-form approximate 0-flip blast radius across 6M+ historical rows (audit Q3; closed-form because `score_history` stores only post-multiplier final score). Pre-implementation step: re-score against fresh srilu DB to confirm approximation still holds.
+**Action:** ~2h. Edit scorer.py:120-127 (remove Signal 5 block) + scorer.py:37 (208→193) + config.py:27-28 (60→65, 70→75). Update test_scorer.py for new max-raw. Smoke-test on srilu.
+**Promotion trigger:** Operator approves Option B in BL-NEW-SOCIAL-DENOMINATOR-OPERATOR-PREFERENCE → promote this to PROPOSED; close `-VARIANT-C-IMPL` below.
+**Decision-by:** Conditional on operator decision; not calendar-bound on its own.
+
+### BL-NEW-SOCIAL-DENOMINATOR-VARIANT-C-IMPL: implement Option C (remove without recalibrating)
+**Status:** PENDING-OPERATOR-DECISION 2026-05-17 — pre-filed per PR-review fold R3 #4.
+**Tag:** `scoring` `code-change` `funnel-widening` `pending-decision`
+**Why:** Variant C path. Removes Signal 5 from scorer.py + drops SCORER_MAX_RAW 208→193 but KEEPS gates at 60/70. Widens MiroFish funnel by 35 historical candidates (audit Q4) — operator preference if recall > precision.
+**Action:** ~1h. Edit scorer.py:120-127 (remove Signal 5 block) + scorer.py:37 (208→193). Update test_scorer.py for new max-raw. NO config.py change. Smoke-test on srilu.
+**Promotion trigger:** Operator approves Option C in BL-NEW-SOCIAL-DENOMINATOR-OPERATOR-PREFERENCE → promote this to PROPOSED; close `-VARIANT-B-IMPL` above.
+**Decision-by:** Conditional on operator decision; not calendar-bound on its own.
 
 ### BL-033: Add heartbeat logging every 5 minutes
 **Status:** DONE — heartbeat logging implemented (PR #7)
