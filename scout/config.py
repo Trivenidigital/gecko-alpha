@@ -276,6 +276,14 @@ class Settings(BaseSettings):
     # tasks/plan_tg_burst_profile.md for pre-registered decision criteria.
     TG_BURST_PROFILE_ENABLED: bool = True
 
+    # BL-NEW-SQLITE-WAL-PROFILE cycle 4: hourly WAL state probe.
+    # Default True for 4-week measurement; threshold default 50MB is a
+    # starting point — operator runs scripts/wal_summary.sh 168 after
+    # Week 1 and sets SQLITE_WAL_BLOAT_BYTES to ~1.5x observed p95 in
+    # .env. See tasks/plan_sqlite_wal_profile.md § Week-1 baseline.
+    SQLITE_WAL_PROFILE_ENABLED: bool = True
+    SQLITE_WAL_BLOAT_BYTES: int = 50_000_000
+
     # -------- LunarCrush Social-Velocity Alerter --------
     # Research-only social-velocity signals (Telegram plain-text, no paper
     # trade dispatch). Double kill-switch: either LUNARCRUSH_ENABLED=false or
