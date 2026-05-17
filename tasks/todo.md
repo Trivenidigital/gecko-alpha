@@ -15,6 +15,7 @@ Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvemen
 - [x] Build with TDD: provenance migration, safe built-in reconciliation, protected lifecycle guard, empty-pattern tracker log, chain-anchor health checker, shell wrapper, and systemd timer
 - [x] Fresh focused verification: `tests/test_chains_patterns.py tests/test_chains_learn.py tests/test_chains_tracker.py tests/test_chain_pattern_provenance_migration.py tests/test_chain_anchor_health_watchdog.py` -> 49 passed
 - [x] Fresh wider chain verification: `tests/test_chains_events.py tests/test_chains_db.py tests/test_chains_patterns.py tests/test_chains_tracker.py tests/test_chains_integration.py tests/test_chains_learn.py tests/test_chain_outcomes_hydration.py tests/test_narrative_chain_coherence.py` -> 79 passed, 1 skipped
+- [x] Full-suite verification after rebase + parse-mode harness line-drift fix: `2316 passed, 39 skipped, 12 warnings in 330.87s`
 - [ ] Create PR and run three parallel PR reviews
 
 Review:
