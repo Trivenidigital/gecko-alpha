@@ -20,7 +20,7 @@ Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvemen
 - [x] Three parallel PR reviews dispatched; first batch timed out, replacement reviewers returned structural/deploy/observability findings
 - [x] Fold PR-review findings: per-pattern watchdog freshness, read-only DB check + schema-pending state, concrete timer enable docs, chain alert `parse_mode=None`, non-built-in operator/code disable preservation
 - [x] Review-fold verification: watchdog/lifecycle/chain-alert/parse-mode targeted suite -> 24 passed; broader chain suite -> 94 passed, 1 skipped
-- [ ] Final full-suite verification after PR-review fold
+- [x] Final full-suite verification after PR-review fold: `2321 passed, 39 skipped, 12 warnings in 347.90s`
 
 Review:
 - Fixed the actual runtime lever, not only the original `_check_active_chains` hypothesis: protected built-in `chain_patterns` can no longer be lifecycle-retired into complete anchor starvation, and exact known prod legacy retirement state is recoverable without reversing unknown/operator-disabled rows.
