@@ -20,19 +20,20 @@ After pulling a PR that touches anything in `systemd/`:
 ssh root@srilu-vps
 cd /root/gecko-alpha
 git pull
-sudo cp systemd/gecko-pipeline.service /etc/systemd/system/
-sudo cp systemd/gecko-dashboard.service /etc/systemd/system/
-sudo cp systemd/gecko-backup.service /etc/systemd/system/
-sudo cp systemd/gecko-backup.timer /etc/systemd/system/
-sudo cp systemd/gecko-backup-watchdog.service /etc/systemd/system/
-sudo cp systemd/gecko-backup-watchdog.timer /etc/systemd/system/
-sudo cp systemd/minara-emission-persistence-watchdog.service /etc/systemd/system/
-sudo cp systemd/minara-emission-persistence-watchdog.timer /etc/systemd/system/
+sudo cp systemd/*.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl restart gecko-pipeline gecko-dashboard
 ```
 
-Timers don't need restart unless their schedule changed; `daemon-reload` is sufficient.
+**Restart blast-radius (V35 fold):**
+
+`sudo systemctl restart gecko-pipeline` interrupts the scout pipeline for ~10-20s — that window costs missed CG scan cycles, missed paper-trade evaluations, and may trip the ingestion-starvation watchdog and the 09:00 stale-heartbeat watchdog. Prefer windows between scan cycles. `gecko-dashboard` restart drops in-flight HTTP connections (operator-facing, less critical).
+
+**Reload semantics (V35 fold):**
+
+- Long-running services (`gecko-pipeline`, `gecko-dashboard`) — `daemon-reload` re-reads unit files, but the running process keeps the OLD definitions until **explicit `restart`**.
+- Timer-triggered oneshot services (`gecko-backup`, `gecko-backup-watchdog`, `minara-emission-persistence-watchdog`) — pick up changes on next fire after `daemon-reload`; no restart needed.
+- If a `.timer` schedule (`OnCalendar=` / `OnUnitActiveSec=`) changes, additionally `systemctl restart <unit>.timer`.
 
 ## Drift audit
 
@@ -46,9 +47,18 @@ for f in systemd/*.service systemd/*.timer; do
         diff "$f" "/etc/systemd/system/$name"
     fi
 done
+# Drop-in enumeration (V34 fold): surface any drop-ins for tracked units
+# so the next PR can capture them. systemctl edit creates these invisibly.
+for f in systemd/*.service systemd/*.timer; do
+    name=$(basename "$f")
+    if compgen -G "/etc/systemd/system/${name}.d/*.conf" >/dev/null 2>&1; then
+        echo "DROP-IN PRESENT: ${name}.d/"
+        ls -la "/etc/systemd/system/${name}.d/"
+    fi
+done
 ```
 
-Drop-ins (`/etc/systemd/system/<unit>.service.d/*.conf`) are NOT tracked in repo. If you add a drop-in, surface it here for a follow-up PR.
+**Do NOT use `sudo systemctl edit <unit>` (V34 fold)** — it writes a drop-in under `/etc/systemd/system/<unit>.service.d/override.conf`, which bypasses this audit and re-introduces the very drift this directory is meant to prevent. Any future change must go via repo PR + the deploy workflow above.
 
 ## Why this exists
 
