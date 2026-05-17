@@ -155,7 +155,13 @@ Rationale:
 ```bash
 # Operator-only, NOT part of this PR. After PR merge:
 ssh root@srilu-vps
-cd /root/gecko-alpha
+cd /root/gecko-alpha   # required: get_settings() reads .env from cwd (V41 SHOULD-FIX)
+
+# V41 SHOULD-FIX: stop the service BEFORE revival to avoid SQLite BEGIN
+# EXCLUSIVE racing with live writers (default aiosqlite ~5s busy timeout
+# could yield 'database is locked' exception otherwise).
+sudo systemctl stop gecko-pipeline
+
 /root/.local/bin/uv run python -c "
 import asyncio
 from scout.db import Database
@@ -163,16 +169,21 @@ from scout.config import get_settings
 async def revive():
     db = Database('/root/gecko-alpha/scout.db')
     await db.connect()
+    # V40 MUST-FIX: operator='operator' (helper default) so the cool-off
+    # SELECT at db.py:4113 (filtered on literal applied_by='operator')
+    # WILL see this row as a prior revival for any FUTURE revival's
+    # cool-off check. Cycle9 context lives in the reason= field only.
     await db.revive_signal_with_baseline(
         'first_signal',
         reason='cycle9 revive-and-soak — pre-PR-#79 false-positive; 14d soak ends 2026-05-31',
-        operator='operator_cycle9_manual',
+        operator='operator',
         settings=get_settings(),
     )
     await db.close()
 asyncio.run(revive())
 "
-sudo systemctl restart gecko-pipeline   # pick up enabled=1 in the live process
+
+sudo systemctl start gecko-pipeline   # restart picks up enabled=1; clears in-process params cache
 ```
 
 (Operator runs this manually; the PR ships the findings doc, not the action.)

@@ -25,7 +25,11 @@ Plan's V38 fold established the affirmative case: positive-tail edge ($45/winner
 
 Per V38 MUST-FIX: raw SQL bypasses (a) cool-off check, (b) joint `tg_alert_eligible` restore via DEFAULT_ALLOW_SIGNALS lookup, (c) `BEGIN EXCLUSIVE` atomicity, (d) consistent audit row, (e) structlog observability hooks. The helper exists at `scout/db.py:4056` for exactly this case.
 
-The PR ships the doc + the operator invocation block; the actual revival is operator-manual to preserve audit-trail integrity (`applied_by='operator_cycle9_manual'` distinguishes from auto-suspend's `'auto_suspend'` and from the helper's default `'operator'`).
+The PR ships the doc + the operator invocation block; the actual revival is operator-manual.
+
+**V40 MUST-FIX:** `applied_by='operator'` (helper default), NOT `'operator_cycle9_manual'`. The cool-off SELECT at `db.py:4113` filters on the literal string `'operator'`. Using a custom marker would silently bypass `BL-NEW-REVIVAL-COOLOFF` for any FUTURE revival (the marker row wouldn't match the cool-off filter). Cycle 9 context lives in the `reason=` field instead.
+
+**V41 SHOULD-FIX:** the operator block now `systemctl stop`s the service BEFORE the revival python and `start`s AFTER (instead of post-only `restart`). Prevents the helper's `BEGIN EXCLUSIVE` from racing with live writers + hitting aiosqlite's default ~5s busy timeout. `cd /root/gecko-alpha` is required so `get_settings()` reads `.env` from cwd.
 
 ### D3. Decision criteria are pre-registered + data-bound
 
@@ -35,9 +39,17 @@ Per CLAUDE.md §11 (data-bound, not calendar-bound). Threshold table in plan §P
 - KEEP demands NON-REGRESSION (PnL ≥ 0 AND positive-tail win rate ≥ 17%), not spontaneous profitability
 - Escalation threshold (live-roadmap revisit) sits HIGHER at PnL ≥ +$200 + avg winner ≥ +$30
 
-### D4. Memory checkpoint anchors the future decision
+### D4. Memory checkpoint anchors the future decision (V40 SHOULD-FIX — must be self-sufficient)
 
-`~/.claude/projects/C--projects-gecko-alpha/memory/project_first_signal_revival_decision_2026_05_31.md` records the revival query, the soak window, and the pre-registered criteria so the future-self at 2026-05-31 doesn't have to re-derive the threshold rationale.
+`~/.claude/projects/C--projects-gecko-alpha/memory/project_first_signal_revival_decision_2026_05_31.md` is the SINGLE-SOURCE-OF-TRUTH for future-self at 2026-05-31. Must include:
+
+- The complete operator revival block (verbatim, copy-paste runnable — not "see plan")
+- The complete verdict table inline (not "see plan")
+- The cool-off filter pin: `applied_by='operator'` (helper default; using anything else silently bypasses cool-off for future revivals)
+- The `n ≥ 10` trip-wire + 28d auto-extend rule
+- The four CLEAN invariants (helper signature, tg_alert restore, combined gate, audit schema)
+
+If the plan/design files are renamed/moved, the memory file is still operational.
 
 ### D5. No code change in this PR
 
@@ -53,11 +65,13 @@ Pure decision artifact. The plan correctly defers the actual revival to operator
 
 | Invariant | Source | Verification |
 |---|---|---|
-| Helper exists with current signature | `scout/db.py:4056-4108` | Read at audit time; signature: `revive_signal_with_baseline(self, signal_type, *, reason, operator, force=False, settings=None)` |
-| Helper restores `tg_alert_eligible` via `DEFAULT_ALLOW_SIGNALS` | `scout/db.py:4204-4216` | `first_signal` ∉ `DEFAULT_ALLOW_SIGNALS` → `restored_to=0`; logged as `signal_revived_tg_eligible` |
+| Helper exists with current signature | `scout/db.py:4056-4108` | Pinned by `tests/test_signal_params_auto_suspend.py:414+` (signature drift fails CI, not at 2026-05-31 runtime) |
+| Helper restores `tg_alert_eligible` via `DEFAULT_ALLOW_SIGNALS` lookup at EXECUTION time | `scout/db.py:4198` does `from scout.trading.tg_alert_dispatch import DEFAULT_ALLOW_SIGNALS` inside the function body (V40 CLEAN) | `first_signal` ∉ `DEFAULT_ALLOW_SIGNALS` → `restored_to=0`; logged as `signal_revived_tg_eligible`. A future PR adding `first_signal` to `DEFAULT_ALLOW_SIGNALS` would be picked up at operator-run time without code change |
 | Combined-gate logic unchanged from PR #79 | `scout/trading/auto_suspend.py:236-237` | V38+V39 both verified |
-| `signal_params_audit` schema supports the helper's audit row | `applied_at TEXT NOT NULL`, `applied_by TEXT NOT NULL` | Verified at q3 SSH query |
-| `SIGNAL_REVIVAL_MIN_SOAK_DAYS` cool-off setting exists | `scout/config.py` | Helper reads `settings.SIGNAL_REVIVAL_MIN_SOAK_DAYS`; default 7 |
+| `signal_params_audit` schema supports the helper's audit row; only 3 INSERT paths (`auto_suspend.py:143/152`, `db.py:4222/4229`, `calibrate.py:330`) all stamp `applied_at` | V40 CLEAN | No bypass path |
+| `SIGNAL_REVIVAL_MIN_SOAK_DAYS` cool-off setting exists | `scout/config.py:612` with validator at `:806-811` (allows 0 to disable) | Helper reads `settings.SIGNAL_REVIVAL_MIN_SOAK_DAYS`; default 7. Operator override to 0 is supported behavior (documented), not a footgun |
+| **V40 SHOULD-FIX add — cache invalidation requires service restart** | Helper does NOT call `bump_cache_version()` (cf. `calibrate.py:373`, `auto_suspend.py:352`); in-process `signal_params` cache (5min TTL at `scout/trading/params.py`) would otherwise stall up to 5min after the UPDATE | Operator block prescribes `systemctl stop`/`start` around the revival; that clears the cache. Restart is the ONLY mechanism that guarantees enabled=1 is picked up promptly |
+| **V40 SHOULD-FIX add — calibration race** | `auto_suspend.py:88-90` window floor is `MAX(last_calibration_at, drawdown_baseline_at, 30d_default)` | Helper stamps `drawdown_baseline_at=NOW()` but NOT `last_calibration_at`. If calibrate runs between revival and next auto_suspend check, `last_calibration_at` may exceed `drawdown_baseline_at` — benign (window shrinks → more conservative, NOT undone). MAX(...) construction means revival baseline can never be silently undone |
 
 ## Commit sequence (3 commits, bisect-safe)
 
@@ -71,9 +85,11 @@ Pure decision artifact. The plan correctly defers the actual revival to operator
 |---|---|---|---|
 | Operator forgets to run revival post-merge | Medium | Low | Memory checkpoint reminds at 2026-05-31; findings doc has operator instruction block |
 | Cool-off check trips on revival (first revival → impossible) | Refuted | — | `signal_params_audit` has only auto_suspend row + a `sync_to_env` row (operator) + `conviction_lock_enabled` change — no prior `enabled` revival, so the cool-off SELECT returns no row, no check fires |
-| Helper signature changes before operator runs revival | Very Low | Low | Operator block cites current signature; deviations would be caught at runtime |
+| Helper signature changes before operator runs revival | Very Low | Low | Pinned by `tests/test_signal_params_auto_suspend.py` (V40 fold); signature drift fails CI at PR time, not at 2026-05-31 runtime |
 | Pre-existing `tg_alert_eligible=0` confuses interpretation | Refuted | — | Helper logs `restored_to=0` for first_signal explicitly; matches existing operator opt-out |
 | 14d soak ambiguous outcome | Medium | Low | Verdict table includes EXTEND-SOAK + n<10 auto-extend trip-wire |
+| **V41 SHOULD-FIX add — `BEGIN EXCLUSIVE` racing with live writers** | Medium | Low | Operator block prescribes `systemctl stop` BEFORE revival python, `start` AFTER. Avoids aiosqlite's default ~5s busy timeout hitting `database is locked` exception |
+| **V40 MUST-FIX add — custom `applied_by` value silently bypasses cool-off** | Refuted | — | Operator block uses helper default `operator='operator'`. Cycle9 context in `reason=` field only |
 
 ## Out of scope
 
