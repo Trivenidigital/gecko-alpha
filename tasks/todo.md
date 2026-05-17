@@ -19,7 +19,7 @@ Last updated: 2026-05-17 (BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT findings ship
 - [x] todo.md Active Work entry (this section)
 - [x] PR #152 created + 3 parallel PR-stage reviewers dispatched (statistical-defensibility + structural + strategy-deferral-risk); 1 CRITICAL + 10 IMPORTANT folded into commit `5894352`
 - [x] Reviewer 1 post-merge-review fold (commit pending): awesome-hermes-agent stale-404 claim corrected (x-twitter-scraper exists; doesn't cover per-token aggregation); 0-flip claim downgraded to "closed-form approximation"; todo checkboxes + counts corrected
-- [ ] Post-merge bookkeeping: flip status to `SHIPPED-AS-AUDIT-FINDINGS <merge-date> <merge-SHA>` per PR #150 Reviewer 1 convention
+- [x] Post-merge bookkeeping: PR #152 squash-merged to master at `e174a3d` (2026-05-17T23:39:11Z) per Reviewer 1 signoff; backlog status stamped with merge SHA + date
 - [ ] Operator response to Open Question 1 (B vs C): file as PR comment or follow-up commit; trigger next-cycle implementation (BL-NEW-SOCIAL-DENOMINATOR-VARIANT-{B,C}-IMPL pre-filed)
 
 Review:
