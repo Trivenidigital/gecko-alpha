@@ -23,8 +23,8 @@
 |---|---|---|
 | Quantifies score/ranking impact of removing the dead 15-point feature | ✓ (closed-form approximation; see TL;DR caveat) | Variant B: 0 flips / 6,098,976 rows under closed-form truncation AND rounding (Q3 + Q3b); approximation valid because Signal 5 contributes 0 to all candidates (multiplier eligibility unaffected). Variant C: 35 score-instances promoted at MIN_SCORE (~0.0006% of corpus = 4 distinct contracts per Q4b); Variant A: no change (status quo) |
 | Identifies whether any profitable/missed signals would change ranking materially | ✓ | Top-10 score_history rows all = 58.0; under Variant B/C inflation → 62. **No candidate reaches CONVICTION=70 under any variant** (max stays at 62). **Q4b: 0 of 4 distinct Variant-C-promoted contracts had paper_trade outcomes** — no missed profitable signals |
-| Documents Hermes-first result | ✓ | Category-exhaustive WebFetch (Social Media, 7 listed); no skills match. awesome-hermes 404 consistent. Bridge gate not met (0/126 resolved + 6 distinct TG contracts/24h) |
-| Updates backlog/todo/memory/context | ✓ | backlog status AUDITED 2026-05-17 + 3 follow-ups filed; todo board entry; memory checkpoint outside repo |
+| Documents Hermes-first result | ✓ | Hermes skill hub Social Media category (7 listed) + awesome-hermes-agent BOTH checked. **awesome-hermes IS reachable** (prior cycle-7/8/9 "404 consistent" claim was stale — corrected); `x-twitter-scraper` exists but does not cover per-token 24h aggregation. Bridge gate not met (0/131 resolved 7d + 6 distinct TG contracts/24h) |
+| Updates backlog/todo/memory/context | ✓ | backlog status AUDITED 2026-05-17 + 5 follow-ups filed (3 audit + 2 VARIANT-{B,C}-IMPL PENDING-OPERATOR-DECISION); todo board entry; memory checkpoint outside repo |
 
 ## Recommendation: Option B (remove + recalibrate gates)
 

@@ -41,11 +41,12 @@
 
 | Domain | Hermes skill found? | Decision |
 |---|---|---|
-| Per-token social mention aggregation (24h) | None (Hermes skill hub WebFetch 2026-05-17 — Social Media category enumerated, 7 skills, none crypto-mention; **category-exhaustive, not name-exhaustive across all 689**) | Defer; no Hermes primitive bridge available |
-| Narrative mention counting | None | Hermes X consumer side exists (narrative_alerts_inbound 126 rows) but resolution is 0/126 — bridge data not ready |
-| KOL signal rollup | None at aggregate-by-token | TG path (tg_social_messages) has per-message contract extraction but only 6 distinct contracts in 24h rollup — insufficient for replacement |
+| Per-token social mention aggregation (24h) | None (Hermes skill hub Social Media category 7 skills + awesome-hermes-agent x-twitter-scraper checked) | Defer; no drop-in Hermes primitive |
+| Raw X/Twitter API access | YES — `x-twitter-scraper` at `https://github.com/Xquik-dev/x-twitter-scraper` (43 SKILL.md folders: search, timelines, mentions, trends, monitors, webhooks) | Could serve as raw data source for a custom aggregation layer; out of scope for this audit |
+| Narrative mention counting | None at aggregate-by-token | Hermes X consumer side exists (`narrative_alerts_inbound` 131 rows 7d) but resolution is 0/131 — bridge data not ready |
+| KOL signal rollup | None at aggregate-by-token | TG path (`tg_social_messages`) has per-message contract extraction but only 6 distinct contracts in 24h rollup |
 
-awesome-hermes-agent ecosystem 404 consistent. Verdict: **no Hermes primitive applies; bridge to Hermes X/TG defer until resolution rate or per-token TG rate matures.**
+**Hermes-first staleness corrected (post-merge fold):** prior cycle-7/8/9 "awesome-hermes-agent 404 consistent" claim was incorrect — the repo IS reachable and lists `x-twitter-scraper`. Audit verdict UNCHANGED: no drop-in primitive for per-token 24h aggregation. But the diligence framing is honest now. Verdict: **no Hermes primitive applies; bridge to Hermes X/TG defer until resolution rate or per-token TG rate matures.**
 
 ## Drift-check (per CLAUDE.md §7a)
 
