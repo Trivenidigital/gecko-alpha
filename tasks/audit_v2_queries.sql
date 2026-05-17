@@ -28,6 +28,25 @@
 --   - narrative_alerts_inbound.received_at, .resolved_coin_id (Q5)
 --   - tg_social_messages.parsed_at, .contracts (Q6)
 --   - social_signals / social_baselines / social_credit_ledger (Q7)
+--
+-- CLOSED-FORM CAVEAT (per PR-stage Reviewer 1 finding P1):
+-- Q3/Q4/Q3b reverse-map `score_history.score` to a hypothetical raw via
+-- `score * 208 / 100`. But scorer.py:256-262 applies the co-occurrence
+-- multiplier AFTER raw normalization:
+--     points = min(100, int(points * 100 / SCORER_MAX_RAW))   # normalize
+--     if len(signals) >= CO_OCCURRENCE_MIN_SIGNALS:
+--         points = int(points * CO_OCCURRENCE_MULTIPLIER)     # multiplier
+--     points = min(points, 100)                                # clamp
+-- score_history stores ONLY the final clamped value. Raw points + signal
+-- list are LOST. The closed-form is mathematically sound IF Signal 5
+-- contributes 0 to all candidates (verified: social_mentions_24h = 0 for
+-- all 1,672 candidates → Signal 5 never in signals list → multiplier
+-- eligibility unaffected by removal), but double-truncation interactions
+-- can still produce off-by-one flips. Q3b (+0.5 rounding) is a sensitivity
+-- check; it produced identical 0/0/0/0, which is suggestive but not proof.
+-- An exact re-score requires materializing raw points + signal list per
+-- candidate at scoring time, which we don't currently persist.
+-- Treat results as closed-form APPROXIMATION, not hard backtest.
 
 .headers on
 .mode column

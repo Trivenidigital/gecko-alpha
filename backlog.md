@@ -231,7 +231,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 **Original status (now historical):** PROPOSED 2026-05-14. Originating scope: Compare current scoring denominator against (1) remove `social_mentions_24h` from scoring/max raw, (2) replace with evidence-gated `narrative_mentions_24h` / `kol_mentions_24h` from Hermes X + TG, (3) leave as-is until X narrative rows mature.
 
-**Hermes-first verdict (post-audit):** Category-exhaustive WebFetch on Hermes skill hub (Social Media category, 7 skills listed) returned no per-token mention-aggregation primitives. awesome-hermes 404 consistent with cycles 7/8/9. Build deferred.
+**Hermes-first verdict (post-audit, corrected 2026-05-17 PR-stage):** Hermes skill hub Social Media category (7 skills) + awesome-hermes-agent ecosystem BOTH checked. awesome-hermes-agent IS reachable (prior cycle-7/8/9 "404 consistent" claim was stale — corrected). `x-twitter-scraper` exists at `https://github.com/Xquik-dev/x-twitter-scraper` (typed X/Twitter API: search, timelines, mentions, trends, monitors, webhooks) but does NOT cover per-token 24h aggregation. Audit verdict unchanged (no drop-in primitive); diligence framing corrected.
 
 **Re-evaluation triggers** (operator runs `tasks/audit_v2_queries.sql` when ANY fires):
 1. `narrative_alerts_inbound.resolved_coin_id` ≥ 20 in any 30d window (currently 0/126)

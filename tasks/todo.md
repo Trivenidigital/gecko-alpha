@@ -15,11 +15,12 @@ Last updated: 2026-05-17 (BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT findings ship
 - [x] `tasks/audit_v2_queries.sql` shipped for operator re-evaluation (per design-review folds)
 - [x] Findings doc shipped: `tasks/findings_social_mentions_denominator_audit_2026_05_17.md` (recommendation: Option B; deferred to operator approval)
 - [x] One-line `# DEAD SIGNAL` annotation on `scorer.py:121` (zero behavior change; 69/69 scorer tests pass on srilu)
-- [x] backlog.md status flip PROPOSED → AUDITED 2026-05-17 + 3 follow-up entries filed (BL-NEW-SOCIAL-DENOMINATOR-RE-EVAL-WATCHDOG, BL-NEW-SCORER-DEAD-SIGNAL-COMMENT-CONVENTION, BL-NEW-SOCIAL-DENOMINATOR-OPERATOR-PREFERENCE)
+- [x] backlog.md status flip PROPOSED → AUDITED 2026-05-17 + 5 follow-up entries filed (BL-NEW-SOCIAL-DENOMINATOR-RE-EVAL-WATCHDOG, BL-NEW-SCORER-DEAD-SIGNAL-COMMENT-CONVENTION, BL-NEW-SOCIAL-DENOMINATOR-OPERATOR-PREFERENCE, BL-NEW-SOCIAL-DENOMINATOR-VARIANT-B-IMPL, BL-NEW-SOCIAL-DENOMINATOR-VARIANT-C-IMPL — last 2 PENDING-OPERATOR-DECISION per PR-review fold R3 #4)
 - [x] todo.md Active Work entry (this section)
-- [ ] PR creation + 3 parallel reviewers (statistical-defensibility + structural + strategy-deferral-risk)
+- [x] PR #152 created + 3 parallel PR-stage reviewers dispatched (statistical-defensibility + structural + strategy-deferral-risk); 1 CRITICAL + 10 IMPORTANT folded into commit `5894352`
+- [x] Reviewer 1 post-merge-review fold (commit pending): awesome-hermes-agent stale-404 claim corrected (x-twitter-scraper exists; doesn't cover per-token aggregation); 0-flip claim downgraded to "closed-form approximation"; todo checkboxes + counts corrected
 - [ ] Post-merge bookkeeping: flip status to `SHIPPED-AS-AUDIT-FINDINGS <merge-date> <merge-SHA>` per PR #150 Reviewer 1 convention
-- [ ] Operator response to Open Question 1 (B vs C): file as PR comment or follow-up commit; trigger next-cycle implementation
+- [ ] Operator response to Open Question 1 (B vs C): file as PR comment or follow-up commit; trigger next-cycle implementation (BL-NEW-SOCIAL-DENOMINATOR-VARIANT-{B,C}-IMPL pre-filed)
 
 Review:
 - The originating concern (15-point dead phantom in SCORER_MAX_RAW=208) is empirically confirmed across 6,096,576 historical scoring rows (max=58, never reaches MIN_SCORE=60)
