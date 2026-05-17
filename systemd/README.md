@@ -20,7 +20,12 @@ After pulling a PR that touches anything in `systemd/`:
 ssh root@srilu-vps
 cd /root/gecko-alpha
 git pull
-sudo cp systemd/*.{service,timer} /etc/systemd/system/
+# Post-cycle-6 review fix: enumerate via `find` instead of brace+glob.
+# `cp systemd/*.{service,timer} ...` leaves the literal pattern when
+# either glob has zero matches in default bash, causing cp to fail.
+# `find` no-ops safely when a category is empty.
+sudo find systemd -maxdepth 1 -type f \( -name "*.service" -o -name "*.timer" \) \
+    -exec cp -t /etc/systemd/system/ {} +
 sudo systemctl daemon-reload
 sudo systemctl restart gecko-pipeline gecko-dashboard
 ```
@@ -40,22 +45,28 @@ sudo systemctl restart gecko-pipeline gecko-dashboard
 One-liner to spot drift:
 
 ```bash
-for f in systemd/*.service systemd/*.timer; do
+# Post-cycle-6 review fix: same `find` enumeration as the deploy command.
+# With raw globs, when a `*.timer` glob has zero matches the literal
+# `systemd/*.timer` flows into the loop and the diff produces a false
+# DRIFT line (basename `*.timer`, diff of nonexistent paths). `find -print0`
+# + `read -d ''` is robust to empty categories AND filenames-with-spaces.
+while IFS= read -r -d '' f; do
     name=$(basename "$f")
     if ! diff -q "$f" "/etc/systemd/system/$name" >/dev/null 2>&1; then
         echo "DRIFT: $name"
         diff "$f" "/etc/systemd/system/$name"
     fi
-done
+done < <(find systemd -maxdepth 1 -type f \( -name "*.service" -o -name "*.timer" \) -print0)
+
 # Drop-in enumeration (V34 fold): surface any drop-ins for tracked units
 # so the next PR can capture them. systemctl edit creates these invisibly.
-for f in systemd/*.service systemd/*.timer; do
+while IFS= read -r -d '' f; do
     name=$(basename "$f")
     if compgen -G "/etc/systemd/system/${name}.d/*.conf" >/dev/null 2>&1; then
         echo "DROP-IN PRESENT: ${name}.d/"
         ls -la "/etc/systemd/system/${name}.d/"
     fi
-done
+done < <(find systemd -maxdepth 1 -type f \( -name "*.service" -o -name "*.timer" \) -print0)
 ```
 
 **Do NOT use `sudo systemctl edit <unit>` (V34 fold)** — it writes a drop-in under `/etc/systemd/system/<unit>.service.d/override.conf`, which bypasses this audit and re-introduces the very drift this directory is meant to prevent. Any future change must go via repo PR + the deploy workflow above.
