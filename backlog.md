@@ -571,7 +571,9 @@ ssh root@89.167.116.187 "sqlite3 /root/gecko-alpha/scout.db \"SELECT MIN(opened_
 - Make race-strict (wrap SELECT+INSERT under `db._txn_lock`) once live trading routes through this filter
 
 ### BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT: structural live-evaluability per signal_type
-**Status:** PROPOSED — surfaced 2026-05-12 during Step 1 verification of "(2) would auto-suspend-against-=1-cohort have spared trending_catch / first_signal." Filing now while the structural finding is fresh; implementation deferred to next live-trading roadmap revisit.
+**Status:** SHIPPED 2026-05-17 — branch `feat/live-evaluable-signal-audit` (cycle 7, analysis-only; V36 fold). Findings in `tasks/findings_live_evaluable_signal_audit_2026_05_17.md`. Key conclusions: 3 of 9 observed signal_types are structurally live-eligible (`chain_completed` Tier 1a, `volume_spike` Tier 2a, `gainers_early` Tier 2b). Post-cutover (≥ 2026-05-11T13:52Z) empirical confirmation: `gainers_early` 28.2% eligible, `volume_spike` 100%, `losers_contrarian` + `narrative_prediction` 0% (structurally non-eligible — ~48% (118/248) of post-cutover paper volume from types that can never go live). `first_signal` Tier 1b reachable in principle (1 stack-3 trade pre-cutover); separate follow-up to drill cause of 16-day silence. 2 surface findings filed as follow-ups: BL-NEW-CHAIN-COMPLETED-SILENCE-AUDIT + BL-NEW-FIRST-SIGNAL-RETIREMENT-DECISION.
+
+**Original status (now historical):** PROPOSED — surfaced 2026-05-12 during Step 1 verification of "(2) would auto-suspend-against-=1-cohort have spared trending_catch / first_signal." Implementation deferred to next live-trading roadmap revisit.
 **Tag:** `observability` `live-roadmap-input` `structural-evaluability` `tier-rule-coverage`
 **Why:** Both trending_catch and first_signal are **structurally non-eligible** under current Tier 1/2 rules — their signal_data shape caps the stack count below the Tier-1b threshold of 3. This is the load-bearing argument; the empirical data corroborates it but cannot prove it on its own:
 
@@ -1503,3 +1505,18 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **Why:** systemd units were just the obvious instance. Same substrate class likely covers: cron entries (`crontab -l`), `/etc/sudoers.d/`, drop-in dirs under `/etc/systemd/system/*.service.d/`, nginx/caddy config, journald.conf overrides, env files outside `.env`. One audit pass forecloses future "we have a third one of these" findings.
 **Action:** ssh root@srilu-vps; enumerate each category above; commit anything operator-meaningful to repo OR document why explicitly omitted (e.g., secrets, host-specific paths).
 **decision-by:** 6 weeks (audit-first task; doc-only outputs).
+
+### BL-NEW-CHAIN-COMPLETED-SILENCE-AUDIT: investigate 10+ day chain_completed silence
+**Status:** PROPOSED 2026-05-17 — Finding 1 from BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT (cycle 7).
+**Why:** `chain_completed` is Tier 1a "strongest cohort" but last opened a trade 2026-05-07 (10+ days dead). Either: (a) chain-pattern detector regression in `scout/scoring/chain_completed.py` or upstream `chain_matches` writer; (b) genuinely quiet 10-day window for the pattern; (c) auto-suspend (would show in `signal_params` table).
+**Action:** ~1h. (i) `journalctl -g chain_completed --since "10 days ago"` for the window; (ii) `SELECT COUNT(*), MAX(completed_at) FROM chain_matches WHERE completed_at >= '2026-05-07'` — empty result = detection broke; (iii) `SELECT * FROM signal_params WHERE signal_type='chain_completed' AND enabled=0` — non-empty = auto-suspended. If (i)/(ii) reveal regression, file fix as separate item.
+**decision-by:** 2 weeks (low cost; high-tier signal silence shouldn't sit unresolved).
+
+### BL-NEW-FIRST-SIGNAL-RETIREMENT-DECISION: decide whether first_signal stays or retires
+**Status:** PROPOSED 2026-05-17 — Finding 3 from BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT (cycle 7, post-V36 fold).
+**Why:** `first_signal` last opened 2026-05-01 — 16+ days dead. **V36 correction:** earlier framing claimed `FIRST_SIGNAL_MIN_SIGNAL_COUNT=2` caps stack at 2 (structurally non-eligible) — that's WRONG. The admission rule gates `len(signals_fired)`; the runtime `conviction_stack` (BL-067 cross-signal-type 504h co-firing count at `scout/trading/conviction.py:265`) is separate and unbounded by the admission rule. 1 first_signal trade with `conviction_locked_stack=3` IS observed all-time, so Tier 1b is reachable in principle.
+**Action:** ~1-2h trace + decision.
+(i) Drill the 1 stack≥3 first_signal trade: pre-cutover NULL, slot-cap-rejected, or writer-bug-skipped? `SELECT id, opened_at, conviction_locked_stack, would_be_live FROM paper_trades WHERE signal_type='first_signal' AND conviction_locked_stack >= 3`.
+(ii) Confirm the dispatcher's `len(signals_fired) >= 2` gate hasn't silently broken (search `journalctl -g first_signal --since "20 days ago"` for any dispatch attempts that failed admission).
+(iii) Decide: retire in code OR revive via lowered admission gates OR file for live-trading-roadmap revisit.
+**decision-by:** 4 weeks (low priority; not blocking anything).
