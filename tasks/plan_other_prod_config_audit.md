@@ -31,12 +31,48 @@ NET-NEW. No prior `tasks/findings_*prod_config*` or `*config_audit*`. Branch `fe
 | **/etc/cron.daily/{weekly,monthly}/** | Stock OS only (`apport`, `apt-compat`, `dpkg`, `logrotate`, `man-db`, `sysstat`) | OK — no gecko content |
 | **/etc/sudoers.d/** | Only `90-cloud-init-users` + `README` (stock cloud-init) | OK |
 | **systemd drop-ins** `*.service.d/`, `*.timer.d/` | EMPTY (the cycle-10 drift watchdog will catch any future drop-ins) | OK |
-| **journald.conf** | Defaults only (`[Journal]` header, no overrides) | **NOTE** — DEBUG events expire on default retention. Cycle 3 TG-burst archive + cycle 4 WAL archive already mitigate via weekly `.jsonl.gz` capture. Adequate. |
+| **journald.conf** | Defaults only (`[Journal]` header, no overrides) | **OMIT (accepted; partial mitigation only — V53 fold)** — Cycles 3+4 archive scripts capture `sqlite_wal_*` + `tg_dispatch_*` events specifically. Cycle 10 drift-watchdog emits PLAIN-TEXT `echo` lines (not structured `"event":` fields) so NEITHER archive captures it. Accept loss of drift-watchdog journal events beyond default journald retention; if needed later, file follow-up `BL-NEW-DRIFT-WATCHDOG-ARCHIVE` (cheap, mirrors wal_archive.sh shape). |
 | **Env files outside .env** | Only `/root/gecko-alpha/.env` | OK |
-| **Reverse-proxy / web server** | Apache present at `/etc/apache2/` | **POSSIBLE-GAP** — but `gecko-dashboard.service` (cycle 6) uses uvicorn directly on port 8000 without a reverse proxy. Apache may be vestigial / unused. Operator verification needed before any action. |
+| **Reverse-proxy / web server** | Apache NOT INSTALLED (V52 MUST-FIX drill 2026-05-17: `systemctl is-enabled apache2` = `not-found`; `is-active` = `inactive`; no listening sockets; no `sites-enabled/`). Only `/etc/apache2/conf-available/` directory remnant. | OK (no action) — earlier "Apache present" framing was misleading; the conf-available dir is apt-package stub. BL-NEW-APACHE-AUDIT follow-up **NOT NEEDED**, withdrawn. |
 | **/etc/hostname /etc/timezone** | `ubuntu-4gb-hel1-1` / `Etc/UTC` | OK — TZ is UTC; explicitly documented in cycle 10 V46/V51 timezone surfacing |
 | **SSH authorized_keys** | 1 key in `/root/.ssh/authorized_keys` | OK — single operator access; doesn't belong in repo (secret) |
-| **Firewall (UFW + iptables)** | UFW inactive; iptables INPUT policy = ACCEPT (no rules) | **OPERATOR-DECISION-PENDING** — no firewall is a security posture choice. Doc but don't change without operator greenlight |
+| **Firewall (UFW + iptables)** | UFW inactive; iptables INPUT policy = ACCEPT (no rules) | **OPERATOR-DECISION-PENDING (V53 fold — decision-by 2026-06-14)** — no firewall is a security posture choice. Doc but don't change without operator greenlight. Re-review at 2026-06-14 (4w); kill-criterion: if srilu remains single-tenant-by-app *AND* no inbound attack surface change, accept ACCEPT-policy and close. |
+
+### Extended sweep (V52 SHOULD-FIX — additional categories)
+
+| Category | State | Disposition |
+|---|---|---|
+| `/etc/logrotate.d/` | Contains `btc15minutebot` + `shift-agent` entries (additional projects on srilu) + stock OS. **NO gecko-alpha entry.** | OK — gecko-pipeline logs flow through journald, NOT logrotate. Cycles 3+4 archive scripts handle gecko-specific retention. Intentional, not gap. |
+| `/etc/sysctl.d/` | 10 stock kernel-hardening files (`10-bufferbloat.conf`, `10-kernel-hardening.conf`, etc.) + `99-sysctl.conf`. **No gecko-specific tuning.** | OK — no gecko-relevant network/IO tuning observed |
+| `/etc/security/limits.d/` | (no result — empty or absent) | OK — gecko-pipeline runs as root via systemd; no ulimit collision |
+| `/etc/profile.d/` | 8 stock entries (locale, bash_completion, byobu, cloud-init). **No gecko shell init.** | OK |
+| `/etc/environment` | Sets PATH only, no env overrides | OK — no shadow of `.env` |
+| `/etc/hosts` | Stock loopback + `ubuntu-4gb-hel1-1` self-hostname. No DNS overrides. | OK |
+| `/etc/ssh/sshd_config.d/` | Only `50-cloud-init.conf` (stock) | OK |
+| `/opt/` (multi-tenant check) | Empty in second sweep — earlier crontab referenced `/opt/polymarket-ml-signal/` but actual dir may not exist OR was deleted. Worth operator confirmation. | NOTE — polymarket cron entry may point at non-existent path; operator-decision (file BL-NEW-POLYMARKET-VERIFY if needed) |
+
+### VPS inventory (V52 SHOULD-FIX)
+
+srilu is **multi-tenant**. Beyond gecko-alpha, evidence of:
+- **polymarket-ml-signal** (crontab entry every 6h to `/opt/polymarket-ml-signal/scripts/extract_data.sh`)
+- **btc15minutebot** (logrotate.d entry)
+- **shift-agent** (logrotate.d entry — Hermes-related per memory `handoff_vps_swap_completed_2026_05_13.md`)
+- gecko-alpha (this project)
+
+Operator-visible inventory artifact filed at `tasks/findings_other_prod_config_audit_2026_05_17.md` so future audits start from a single source.
+
+### Schedule contention check (V52 SHOULD-FIX)
+
+| When | What |
+|---|---|
+| `00:00, 06:00, 12:00, 18:00` daily | polymarket extract_data.sh |
+| `Sun 03:30` | gecko `tg_burst_archive.sh` |
+| `Sun 03:45` | gecko `wal_archive.sh` |
+| `09:00` daily | gecko-backup-watchdog.timer |
+| `09:30` daily | systemd-drift-watchdog.timer (cycle 10) |
+| `Sun 03:00` daily | gecko-backup.timer (via gecko-backup.service) |
+
+No minute-level overlaps. polymarket runs hourly-aligned; gecko runs offset minutes. No collision risk observed.
 
 ## Tasks
 
@@ -47,26 +83,51 @@ NET-NEW. No prior `tasks/findings_*prod_config*` or `*config_audit*`. Branch `fe
 - Create: `cron/README.md` — deploy workflow mirroring `systemd/README.md`
 - Modify: `systemd/README.md` deploy block — mention cron deploy alongside systemd unit deploy (so future operator following the deploy block doesn't miss cron)
 
-Crontab fragment content:
+Crontab fragment content (V53 MUST-FIX — sentinel-bracketed managed block):
 
 ```
-# gecko-alpha crontab fragment. Deploy via:
-#   crontab -l | grep -v '/root/gecko-alpha/scripts/' > /tmp/cron.tmp
-#   cat /root/gecko-alpha/cron/gecko-alpha.crontab >> /tmp/cron.tmp
-#   crontab /tmp/cron.tmp && rm /tmp/cron.tmp
+# === BEGIN gecko-alpha managed block (do not edit between sentinels) ===
 30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh
 45 3 * * 0 /root/gecko-alpha/scripts/wal_archive.sh
+# === END gecko-alpha managed block ===
 ```
+
+Deploy script (replaces inline grep -v path-prefix; preserves any operator-added manual entries OUTSIDE the sentinels):
+
+```bash
+#!/usr/bin/env bash
+# cron/deploy.sh — idempotent crontab merge between sentinels
+set -euo pipefail
+FRAGMENT="$(cat /root/gecko-alpha/cron/gecko-alpha.crontab)"
+crontab -l 2>/dev/null \
+    | awk -v fragment="$FRAGMENT" '
+        /^# === BEGIN gecko-alpha managed block/ { skip=1; print fragment; next }
+        /^# === END gecko-alpha managed block/ { skip=0; next }
+        !skip
+        END { if (!matched) { print fragment } }
+    ' \
+    | crontab -
+echo "OK: gecko-alpha cron block updated"
+crontab -l
+```
+
+Operator runs: `bash /root/gecko-alpha/cron/deploy.sh`. Idempotent: re-running yields same crontab.
 
 ### Task 2: findings doc
 
 **Files:**
 - Create: `tasks/findings_other_prod_config_audit_2026_05_17.md` — enumerate each category from the table above with state + disposition
 
-### Task 3: backlog close + 2 follow-ups
+### Task 3: backlog close + follow-ups
 
 **Files:**
-- Modify: `backlog.md` — flip `BL-NEW-OTHER-PROD-CONFIG-AUDIT` to SHIPPED-WITH-FINDINGS; file BL-NEW-APACHE-AUDIT (verify vestigial) + BL-NEW-CRON-DRIFT-WATCHDOG (mirror cycle-10 watchdog for cron entries)
+- Modify: `backlog.md` — flip `BL-NEW-OTHER-PROD-CONFIG-AUDIT` to SHIPPED-WITH-FINDINGS; file:
+  - **BL-NEW-CRON-DRIFT-WATCHDOG** (mirror cycle-10 watchdog for cron entries — needs to grep crontab -l, find managed block, diff vs `cron/gecko-alpha.crontab`)
+  - **BL-NEW-CRON-TO-SYSTEMD-TIMER** (V53 SHOULD-FIX design-tension fold — convert the 2 weekly cron entries to systemd timers for consistency with cycle-10 canon; alternative: keep cron for simplicity. Decision-by 2026-06-14)
+  - **BL-NEW-DRIFT-WATCHDOG-ARCHIVE** (V53 SHOULD-FIX — extend wal_archive.sh shape to capture systemd-drift-watchdog journal events before default retention drops them)
+  - **BL-NEW-FIREWALL-DECISION** (V53 — pre-registered 2026-06-14 review of ACCEPT-policy)
+  - **BL-NEW-POLYMARKET-VERIFY** (V52/V53 — operator confirms `/opt/polymarket-ml-signal/` path exists or polymarket cron is stale; informational, no gecko impact)
+  - ~~BL-NEW-APACHE-AUDIT~~ WITHDRAWN (V52 fold: Apache confirmed not installed; only conf-available dir remnant)
 - Create: `~/.claude/.../memory/project_prod_config_audit_2026_05_17.md`
 
 ## Pre-registered decision criteria
