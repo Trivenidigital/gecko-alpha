@@ -227,13 +227,20 @@ async def test_run_hourly_maintenance_emits_sqlite_wal_probe_when_enabled(tmp_pa
     settings = _make_settings(tmp_path)
     db = _make_db_mock()
     session = MagicMock()
-    import structlog
-    with structlog.testing.capture_logs() as logs:
-        await _run_hourly_maintenance(db, session, settings, MagicMock())
-    probe_events = [e for e in logs if e.get("event") == "sqlite_wal_probe"]
-    assert len(probe_events) == 1
-    assert probe_events[0]["wal_size_bytes"] == 1024
-    assert probe_events[0]["journal_mode"] == "wal"
+    logger = MagicMock()
+
+    await _run_hourly_maintenance(db, session, settings, logger)
+
+    db.probe_wal_state.assert_awaited_once()
+    debug_events = [
+        (call.args[0], call.kwargs)
+        for call in logger.debug.call_args_list
+        if call.args
+    ]
+    probe_calls = [(evt, kw) for evt, kw in debug_events if evt == "sqlite_wal_probe"]
+    assert len(probe_calls) == 1
+    assert probe_calls[0][1]["wal_size_bytes"] == 1024
+    assert probe_calls[0][1]["journal_mode"] == "wal"
 
 
 async def test_run_hourly_maintenance_emits_bloat_above_threshold(tmp_path):
@@ -259,13 +266,21 @@ async def test_run_hourly_maintenance_emits_bloat_above_threshold(tmp_path):
         "wal_autocheckpoint": 1000,
     })
     session = MagicMock()
-    import structlog
-    with structlog.testing.capture_logs() as logs:
-        await _run_hourly_maintenance(db, session, settings, MagicMock())
-    bloat = [e for e in logs if e.get("event") == "sqlite_wal_bloat_observed"]
+    logger = MagicMock()
+
+    await _run_hourly_maintenance(db, session, settings, logger)
+
+    warning_events = [
+        (call.args[0], call.kwargs)
+        for call in logger.warning.call_args_list
+        if call.args
+    ]
+    bloat = [
+        (evt, kw) for evt, kw in warning_events if evt == "sqlite_wal_bloat_observed"
+    ]
     assert len(bloat) == 1
-    assert bloat[0]["wal_size_bytes"] == 1_000_000
-    assert bloat[0]["threshold_bytes"] == 1000
+    assert bloat[0][1]["wal_size_bytes"] == 1_000_000
+    assert bloat[0][1]["threshold_bytes"] == 1000
 
 
 async def test_run_hourly_maintenance_skips_wal_probe_when_disabled(tmp_path):
