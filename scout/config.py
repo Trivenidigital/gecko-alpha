@@ -610,6 +610,19 @@ class Settings(BaseSettings):
     # per-call with force=True (logs revive_signal_force_bypass WARNING
     # and tags the audit row).
     SIGNAL_REVIVAL_MIN_SOAK_DAYS: int = 7
+    # BL-NEW-LOSERS-CONTRARIAN-REVIVAL-CRITERIA-TIGHTENING: thresholds for
+    # the read-only revival_criteria evaluator. Defaults derived from
+    # healthy-signal baselines in tasks/baselines_revival_criteria_2026_05_17.md;
+    # operator may override via .env. No production-runtime side-effects.
+    REVIVAL_CRITERIA_MIN_TRADES: int = 100
+    REVIVAL_CRITERIA_MIN_WINDOW_DAYS: int = 7
+    REVIVAL_CRITERIA_MIN_WINDOW_TRADES: int = 50
+    REVIVAL_CRITERIA_NO_BREAKOUT_PEAK_PCT: float = 5.0
+    REVIVAL_CRITERIA_MAX_NO_BREAKOUT_AND_LOSS: float = 0.40  # healthy_max + margin
+    REVIVAL_CRITERIA_EXIT_MACHINERY_MIN: float = 0.70         # healthy_min - margin
+    REVIVAL_CRITERIA_WIN_WILSON_LB_MIN: float = 0.55          # not coin-flip per design D#3
+    REVIVAL_CRITERIA_BOOTSTRAP_RESAMPLES: int = 10_000
+    REVIVAL_CRITERIA_VERDICT_EXPIRY_DAYS: int = 30            # keep_on_provisional_until_<iso>
     # Calibration — dry-run by default; --apply gated on Telegram health
     # unless --force-no-alert. Trade-count floor mirrors suspension floor
     # so we don't tune on noise.
@@ -808,6 +821,41 @@ class Settings(BaseSettings):
     def _validate_revival_min_soak_days(cls, v: int) -> int:
         if v < 0:
             raise ValueError(f"SIGNAL_REVIVAL_MIN_SOAK_DAYS must be >= 0; got={v}")
+        return v
+
+    @field_validator(
+        "REVIVAL_CRITERIA_MIN_TRADES",
+        "REVIVAL_CRITERIA_MIN_WINDOW_TRADES",
+        "REVIVAL_CRITERIA_MIN_WINDOW_DAYS",
+        "REVIVAL_CRITERIA_BOOTSTRAP_RESAMPLES",
+        "REVIVAL_CRITERIA_VERDICT_EXPIRY_DAYS",
+    )
+    @classmethod
+    def _validate_revival_positive_int(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(
+                f"revival-criteria count/days thresholds must be >= 1; got={v}"
+            )
+        return v
+
+    @field_validator(
+        "REVIVAL_CRITERIA_MAX_NO_BREAKOUT_AND_LOSS",
+        "REVIVAL_CRITERIA_EXIT_MACHINERY_MIN",
+        "REVIVAL_CRITERIA_WIN_WILSON_LB_MIN",
+    )
+    @classmethod
+    def _validate_revival_ratio(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"revival-criteria ratio must be in [0,1]; got={v}")
+        return v
+
+    @field_validator("REVIVAL_CRITERIA_NO_BREAKOUT_PEAK_PCT")
+    @classmethod
+    def _validate_revival_peak_pct(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError(
+                f"REVIVAL_CRITERIA_NO_BREAKOUT_PEAK_PCT must be >= 0; got={v}"
+            )
         return v
 
     @field_validator("LIVE_MAX_OPEN_POSITIONS_PER_TOKEN")
