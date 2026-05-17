@@ -215,7 +215,8 @@ async def test_calibration_dryrun_scheduler_happy_path_fires_alert(
             settings=settings,
             last_refresh_date="",
             last_digest_date="",
-            now_local=now_local,
+            last_cohort_digest_date="",
+        now_local=now_local,
         )
     assert (
         len(sent_messages) == 1
@@ -287,6 +288,7 @@ async def test_calibration_dryrun_passes_parse_mode_none_to_telegram(
         settings=settings,
         last_refresh_date="",
         last_digest_date="",
+        last_cohort_digest_date="",
         now_local=now_local,
     )
     assert len(captured_kwargs) == 1
@@ -337,6 +339,7 @@ async def test_calibration_dryrun_scheduler_idempotency(monkeypatch, settings_fa
         settings=settings,
         last_refresh_date="",
         last_digest_date="",
+        last_cohort_digest_date="",
         now_local=now_local,
     )
     assert len(sent_messages) == 1
@@ -346,6 +349,7 @@ async def test_calibration_dryrun_scheduler_idempotency(monkeypatch, settings_fa
         settings=settings,
         last_refresh_date="",
         last_digest_date="",
+        last_cohort_digest_date="",
         now_local=now_local,
     )
     assert len(sent_messages) == 1, "duplicate alert fired same day"
@@ -396,7 +400,8 @@ async def test_calibration_dryrun_scheduler_skips_telegram_on_placeholder_token(
             settings=settings,
             last_refresh_date="",
             last_digest_date="",
-            now_local=now_local,
+            last_cohort_digest_date="",
+        now_local=now_local,
         )
     assert sent_messages == [], "placeholder-token: send must NOT fire"
     events = [e.get("event") for e in logs]
@@ -439,7 +444,8 @@ async def test_calibration_dryrun_scheduler_catches_build_diffs_error(
             settings=settings,
             last_refresh_date="",
             last_digest_date="",
-            now_local=now_local,
+            last_cohort_digest_date="",
+        now_local=now_local,
         )
     events = [e.get("event") for e in logs]
     assert "calibration_dryrun_loop_error" in events
@@ -488,7 +494,8 @@ async def test_calibration_dryrun_scheduler_disabled_when_killswitch_off(
             settings=settings,
             last_refresh_date="",
             last_digest_date="",
-            now_local=now_local,
+            last_cohort_digest_date="",
+        now_local=now_local,
         )
     assert sent_messages == []
     # Sentinel does NOT advance when disabled

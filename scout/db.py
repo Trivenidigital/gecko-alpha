@@ -120,6 +120,9 @@ class Database:
         await self._migrate_momentum_7d_detected_at_index()
         await self._migrate_trending_snapshots_snapshot_at_index()
         await self._migrate_volume_spikes_detected_at_index()
+        # BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST (cycle 5): cohort_digest_state
+        # singleton + paper_trades(closed_at) partial index.
+        await self._migrate_cohort_digest_state_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -3782,6 +3785,140 @@ class Database:
             index_name="idx_volume_spikes_detected_at",
             migration_name="volume_spikes_detected_at_idx_v1",
         )
+
+    async def _migrate_cohort_digest_state_v1(self) -> None:
+        """BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST (cycle 5) — adds:
+
+        1. ``cohort_digest_state`` singleton table holding ``last_digest_date``
+           + ``last_final_block_fired_at``. CHECK constraint enforces single
+           row. Seeded with NULL+NULL on first migration so the stamp helpers
+           can use ``INSERT OR REPLACE`` safely (V30 MUST-FIX).
+        2. ``idx_paper_trades_closed_at`` partial index — covers the cohort
+           digest's window query. Partial WHERE ``closed_at IS NOT NULL``
+           skips open trades (~60-80% rowcount reduction). Custom migration
+           because :meth:`_migrate_scanned_at_index` doesn't support partial
+           indexes (V30 MUST-FIX).
+
+        Both DDL statements run inside one BEGIN EXCLUSIVE; matches the
+        ``_migrate_*`` pattern (single migration_name in paper_migrations).
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "cohort_digest_state_v1"
+
+        try:
+            await conn.execute("PRAGMA busy_timeout = 90000")
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?", (migration_name,)
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                await conn.execute("COMMIT")
+                return
+
+            # PR-review V31/V32/V33 fold: paper_trades.closed_at must exist
+            # before the partial index. Pre-BL055 prod-snapshot test seeds
+            # paper_trades WITHOUT closed_at; _create_tables is a no-op for
+            # the existing table; no prior migration ADD-COLUMNs closed_at.
+            # Add it idempotently here so the index step is safe across
+            # upgrade paths. Real prod (srilu) already has the column from
+            # _create_tables fresh-install path — ALTER is a no-op there.
+            cur = await conn.execute("PRAGMA table_info(paper_trades)")
+            paper_cols = {row[1] for row in await cur.fetchall()}
+            if "closed_at" not in paper_cols:
+                await conn.execute(
+                    "ALTER TABLE paper_trades ADD COLUMN closed_at TEXT"
+                )
+
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS cohort_digest_state (
+                    marker INTEGER PRIMARY KEY DEFAULT 1,
+                    last_digest_date TEXT,
+                    last_final_block_fired_at TEXT,
+                    CHECK (marker = 1)
+                )"""
+            )
+            await conn.execute(
+                """INSERT OR IGNORE INTO cohort_digest_state
+                   (marker, last_digest_date, last_final_block_fired_at)
+                   VALUES (1, NULL, NULL)"""
+            )
+            await conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_paper_trades_closed_at
+                   ON paper_trades(closed_at)
+                   WHERE closed_at IS NOT NULL"""
+            )
+            await conn.execute(
+                "INSERT INTO paper_migrations(name, cutover_ts) VALUES (?, ?)",
+                (migration_name, datetime.now(timezone.utc).isoformat()),
+            )
+            await conn.execute("COMMIT")
+            _db_log.info(
+                "cohort_digest_state_migrated", migration=migration_name
+            )
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            _db_log.exception(
+                "cohort_digest_state_migration_failed", migration=migration_name
+            )
+            _db_log.error(
+                "SCHEMA_DRIFT_DETECTED", migration=migration_name
+            )
+            raise
+
+    # --- cohort_digest state helpers (D5 fold) -------------------------------
+
+    async def cohort_digest_read_state(self) -> dict:
+        """Return current singleton-row contents.
+
+        Returns dict with ``last_digest_date`` and ``last_final_block_fired_at``
+        (both nullable). Returns NULL+NULL if the row is missing.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        cur = await self._conn.execute(
+            "SELECT last_digest_date, last_final_block_fired_at "
+            "FROM cohort_digest_state WHERE marker = 1"
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return {"last_digest_date": None, "last_final_block_fired_at": None}
+        return {"last_digest_date": row[0], "last_final_block_fired_at": row[1]}
+
+    async def cohort_digest_stamp_last_digest_date(self, date_iso: str) -> None:
+        """Stamp ``last_digest_date`` on the singleton row, preserving the
+        other field (V30 MUST-FIX — sub-SELECT prevents NULL clobber)."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        await self._conn.execute(
+            "INSERT OR REPLACE INTO cohort_digest_state "
+            "(marker, last_digest_date, last_final_block_fired_at) VALUES (1, ?, "
+            "(SELECT last_final_block_fired_at FROM cohort_digest_state WHERE marker = 1))",
+            (date_iso,),
+        )
+        await self._conn.commit()
+
+    async def cohort_digest_stamp_final_block_fired(self, ts_iso: str) -> None:
+        """Stamp ``last_final_block_fired_at`` on the singleton row,
+        preserving the other field."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        await self._conn.execute(
+            "INSERT OR REPLACE INTO cohort_digest_state "
+            "(marker, last_digest_date, last_final_block_fired_at) VALUES (1, "
+            "(SELECT last_digest_date FROM cohort_digest_state WHERE marker = 1), ?)",
+            (ts_iso,),
+        )
+        await self._conn.commit()
 
     async def _migrate_chain_matches_completed_at_index(self) -> None:
         """V12 PR-review SHOULD-FIX #1 fold: chain_matches index promoted

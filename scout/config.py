@@ -1,5 +1,6 @@
 """Application configuration via Pydantic BaseSettings."""
 
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -574,6 +575,22 @@ class Settings(BaseSettings):
     FEEDBACK_WEEKLY_DIGEST_WEEKDAY: int = 6
     FEEDBACK_WEEKLY_DIGEST_HOUR: int = 9
     FEEDBACK_COMBO_REFRESH_HOUR: int = 3
+
+    # BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST (cycle 5). Weekly cohort-comparison
+    # digest paralleling weekly_digest.py — would_be_live=1 cohort vs full
+    # cohort per signal_type, with sign-flip detection + final-window
+    # decision-recommendation block. Decision criteria pre-registered in
+    # tasks/plan_live_eligible_weekly_digest.md. Verdict thresholds mirror
+    # dashboard/frontend/components/TradingTab.jsx — operator retunes both
+    # surfaces in lockstep via .env override + restart.
+    COHORT_DIGEST_ENABLED: bool = True
+    COHORT_DIGEST_N_GATE: int = 10
+    COHORT_DIGEST_DAY_OF_WEEK: int = 0  # Monday
+    COHORT_DIGEST_HOUR: int = 9
+    COHORT_DIGEST_FINAL_DATE: date = date(2026, 6, 8)
+    COHORT_DIGEST_STRONG_WR_GAP_PP: float = 15.0  # mirrors dashboard
+    COHORT_DIGEST_STRONG_PNL_FLOOR_USD: float = 200.0  # mirrors dashboard
+    COHORT_DIGEST_MODERATE_WR_GAP_PP: float = 5.0  # mirrors dashboard
     FEEDBACK_FALLBACK_ALERT_THRESHOLD: int = 5
     FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC: int = 900
 

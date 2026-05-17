@@ -251,8 +251,9 @@ async def _run_feedback_schedulers(
     settings,
     last_refresh_date: str,
     last_digest_date: str,
+    last_cohort_digest_date: str,
     now_local: datetime,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """Run the nightly combo refresh and weekly digest if their windows fire.
 
     Pure side-effecting helper (no loop state) — the caller passes
@@ -328,6 +329,25 @@ async def _run_feedback_schedulers(
             last_digest_date = today_iso
         except Exception:
             logger.exception("weekly_digest_loop_error")
+
+    # BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST (cycle 5): cohort digest on
+    # COHORT_DIGEST_DAY_OF_WEEK at COHORT_DIGEST_HOUR (local). Mirrors
+    # weekly_digest gate; uses send_cohort_digest's internal idempotency
+    # against cohort_digest_state.last_digest_date too — same-day re-fire
+    # is prevented even if in-process sentinel is reset on restart.
+    if (
+        settings.COHORT_DIGEST_ENABLED
+        and now_local.weekday() == settings.COHORT_DIGEST_DAY_OF_WEEK
+        and now_local.hour == settings.COHORT_DIGEST_HOUR
+        and last_cohort_digest_date != today_iso
+    ):
+        try:
+            from scout.trading import cohort_digest as _cohort_digest
+
+            await _cohort_digest.send_cohort_digest(db, settings)
+            last_cohort_digest_date = today_iso
+        except Exception:
+            logger.exception("cohort_digest_loop_error")
 
     # Weekly calibration dry-run alert
     # (CALIBRATION_DRY_RUN_WEEKDAY/_HOUR local; gated on
@@ -408,7 +428,7 @@ async def _run_feedback_schedulers(
             # we retry next minute within the hour window.
             logger.exception("calibration_dryrun_loop_error")
 
-    return last_refresh_date, last_digest_date
+    return last_refresh_date, last_digest_date, last_cohort_digest_date
 
 
 async def briefing_loop(
@@ -1752,6 +1772,14 @@ async def main(argv: list[str] | None = None) -> int:
     last_summary_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     last_combo_refresh_date = ""  # empty so the first eligible hour fires
     last_weekly_digest_date = ""
+    # BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST: init from cohort_digest_state so a
+    # same-day process restart does NOT re-fire the digest. V29 MUST-FIX fold.
+    try:
+        _cohort_state = await db.cohort_digest_read_state()
+        last_cohort_digest_date = _cohort_state.get("last_digest_date") or ""
+    except Exception:
+        logger.exception("cohort_digest_state_read_failed_at_startup")
+        last_cohort_digest_date = ""
     outcome_check_interval = 3600  # 1 hour
     _reset_heartbeat_stats()
 
@@ -1777,6 +1805,7 @@ async def main(argv: list[str] | None = None) -> int:
                 nonlocal cycle_count
                 nonlocal last_outcome_check, last_summary_date
                 nonlocal last_combo_refresh_date, last_weekly_digest_date
+                nonlocal last_cohort_digest_date
 
                 while not shutdown_event.is_set():
                     try:
@@ -1848,15 +1877,18 @@ async def main(argv: list[str] | None = None) -> int:
                             logger.warning("Daily summary failed", error=str(e))
                         last_summary_date = current_date
 
-                    # Nightly combo refresh + weekly digest scheduling
-                    last_combo_refresh_date, last_weekly_digest_date = (
-                        await _run_feedback_schedulers(
-                            db,
-                            settings,
-                            last_combo_refresh_date,
-                            last_weekly_digest_date,
-                            datetime.now(),
-                        )
+                    # Nightly combo refresh + weekly digest + cohort digest scheduling
+                    (
+                        last_combo_refresh_date,
+                        last_weekly_digest_date,
+                        last_cohort_digest_date,
+                    ) = await _run_feedback_schedulers(
+                        db,
+                        settings,
+                        last_combo_refresh_date,
+                        last_weekly_digest_date,
+                        last_cohort_digest_date,
+                        datetime.now(),
                     )
 
                     if args.cycles > 0 and cycle_count >= args.cycles:

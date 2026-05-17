@@ -825,3 +825,84 @@ def test_retention_validator_raises_when_both_below_cooldown():
             VOLUME_SNAPSHOTS_RETENTION_DAYS=7,
             SECONDWAVE_COOLDOWN_MAX_DAYS=14,
         )
+
+
+# BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST cycle 5: cohort digest settings
+
+def test_cohort_digest_enabled_default():
+    s = Settings(_env_file=None, TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k")
+    assert s.COHORT_DIGEST_ENABLED is True
+
+
+def test_cohort_digest_n_gate_default():
+    s = Settings(_env_file=None, TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k")
+    assert s.COHORT_DIGEST_N_GATE == 10
+
+
+def test_cohort_digest_day_of_week_default():
+    s = Settings(_env_file=None, TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k")
+    assert s.COHORT_DIGEST_DAY_OF_WEEK == 0  # Monday
+
+
+def test_cohort_digest_hour_default():
+    s = Settings(_env_file=None, TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k")
+    assert s.COHORT_DIGEST_HOUR == 9
+
+
+def test_cohort_digest_final_date_default():
+    from datetime import date
+    s = Settings(_env_file=None, TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k")
+    assert s.COHORT_DIGEST_FINAL_DATE == date(2026, 6, 8)
+
+
+def test_cohort_digest_thresholds_mirror_dashboard():
+    """V28 fold: thresholds match dashboard/frontend/components/TradingTab.jsx:161-162.
+    Any drift here must be reconciled with the dashboard in lockstep."""
+    s = Settings(_env_file=None, TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k")
+    assert s.COHORT_DIGEST_STRONG_WR_GAP_PP == 15.0
+    assert s.COHORT_DIGEST_STRONG_PNL_FLOOR_USD == 200.0
+    assert s.COHORT_DIGEST_MODERATE_WR_GAP_PP == 5.0
+
+
+def test_cohort_digest_env_override():
+    """Operator can retune thresholds via .env without code change."""
+    s = Settings(_env_file=None, TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k",
+                 COHORT_DIGEST_ENABLED=False, COHORT_DIGEST_N_GATE=20,
+                 COHORT_DIGEST_STRONG_WR_GAP_PP=12.0)
+    assert s.COHORT_DIGEST_ENABLED is False
+    assert s.COHORT_DIGEST_N_GATE == 20
+    assert s.COHORT_DIGEST_STRONG_WR_GAP_PP == 12.0
+
+
+def test_cohort_digest_full_env_override_coverage():
+    """V32 SHOULD-ADD #6: round-trip every overridable field. Catches
+    Pydantic v2 parser regressions especially on date type."""
+    from datetime import date
+    s = Settings(
+        _env_file=None, TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k",
+        COHORT_DIGEST_ENABLED=True,
+        COHORT_DIGEST_N_GATE=15,
+        COHORT_DIGEST_DAY_OF_WEEK=3,
+        COHORT_DIGEST_HOUR=11,
+        COHORT_DIGEST_FINAL_DATE=date(2026, 7, 1),
+        COHORT_DIGEST_STRONG_WR_GAP_PP=12.0,
+        COHORT_DIGEST_STRONG_PNL_FLOOR_USD=150.0,
+        COHORT_DIGEST_MODERATE_WR_GAP_PP=3.0,
+    )
+    assert s.COHORT_DIGEST_DAY_OF_WEEK == 3
+    assert s.COHORT_DIGEST_HOUR == 11
+    assert s.COHORT_DIGEST_FINAL_DATE == date(2026, 7, 1)
+    assert s.COHORT_DIGEST_STRONG_PNL_FLOOR_USD == 150.0
+    assert s.COHORT_DIGEST_MODERATE_WR_GAP_PP == 3.0
+
+
+def test_cohort_digest_final_date_rejects_non_iso_string():
+    """Pydantic v2 should reject non-ISO date strings for COHORT_DIGEST_FINAL_DATE."""
+    import pytest
+    from pydantic import ValidationError
+    with pytest.raises((ValidationError, ValueError)):
+        Settings(
+            _env_file=None, TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c",
+            ANTHROPIC_API_KEY="k",
+            COHORT_DIGEST_FINAL_DATE="not-a-date",
+        )

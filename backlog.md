@@ -623,7 +623,9 @@ Without Q2's answer, the 4-week dashboard verdict still leaves the operator with
 **Estimate:** ~6-8 hours simulator + ~2 hours findings doc.
 
 ### BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST: scheduled-summary shape for the 4-week evidence window
-**Status:** PROPOSED — surfaced 2026-05-12 during Vector C strategy/framing review of the dashboard cohort view PR. Filed as a UX-shape improvement; doesn't block the dashboard.
+**Status:** SHIPPED 2026-05-17 — branch `feat/live-eligible-weekly-digest` (5 commits + plan + design + V27/V28/V29/V30 folds). `scout/trading/cohort_digest.py` (`build_cohort_digest` + `send_cohort_digest` + `_compute_signal_cohort_stats` + `_compute_all_cohorts_stats` + `_classify_verdict` + `_detect_verdict_flip` + `_build_final_block`). Verdict-classification logic mirrors `dashboard/frontend/components/TradingTab.jsx:389-425` verbatim (`STRONG_WR_GAP_PP=15.0` STRICT >, `STRONG_PNL_FLOOR_USD=200.0` both cohorts, sign-flip required for strong-pattern, symmetric `|wrDelta|>5` moderate band, near-identical/INSUFFICIENT_DATA labels). Singleton state via `cohort_digest_state` (V30 INSERT OR REPLACE + sub-SELECT preserves other field). `paper_trades.closed_at` partial index added (V30 MUST-FIX). 8 Settings: `COHORT_DIGEST_ENABLED/N_GATE/DAY_OF_WEEK/HOUR/FINAL_DATE/STRONG_WR_GAP_PP/STRONG_PNL_FLOOR_USD/MODERATE_WR_GAP_PP`. `_run_feedback_schedulers` extended to `tuple[str,str,str]`; `last_cohort_digest_date` initialized from `cohort_digest_state.last_digest_date` on startup so same-day restart does NOT re-fire (V29 MUST-FIX). Pre-registered decision criteria in `tasks/plan_live_eligible_weekly_digest.md` § Decision criteria; filed follow-up `BL-NEW-COHORT-DIGEST-DECISION`. Memory checkpoint: `project_cohort_digest_decision_2026_06_08.md`.
+
+**Original status (now historical):** PROPOSED — surfaced 2026-05-12 during Vector C strategy/framing review of the dashboard cohort view PR. Filed as a UX-shape improvement; doesn't block the dashboard.
 **Tag:** `evaluation-framework` `attention-budget` `scheduled-summary` `digest-shape`
 **Why:** The dashboard cohort view requires the operator to glance at it ~3× per day for 4 weeks looking for a low-probability divergence event across ~7 signal_types. That's a high vigilance cost for a small expected output. A scheduled weekly summary alert ("Week 2 of 4: gainers_early eligible n=14, wrΔ=+4pp, no sign-flip — tracking") followed by a single end-of-window verdict alert produces the same evidence at &lt;10% of the attention cost, with the dashboard available for ad-hoc drill-in when the operator chooses.
 
@@ -636,6 +638,17 @@ Without Q2's answer, the 4-week dashboard verdict still leaves the operator with
 **Sequence:** can ship anytime after the dashboard view. Independent of Q1 outcome.
 
 **Estimate:** ~3-4 hours weekly digest + cron + tests.
+
+### BL-NEW-COHORT-DIGEST-DECISION: act on cohort-digest 4-week evidence
+**Status:** PROPOSED 2026-05-17 — filed concurrent with BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST shipping. Evidence-gated on the 4-week measurement window.
+**Trigger:** 2026-06-08 (anchor — first eligible Monday at or after). Per V28 SHOULD-FIX fallback: digest fires on first eligible run with `end_date >= COHORT_DIGEST_FINAL_DATE AND last_final_block_fired_at IS NULL`.
+**Pre-registered criteria** (per `tasks/plan_live_eligible_weekly_digest.md` § Decision criteria):
+- EXTEND if per-signal flip events ≥ 2 within window (instability) — file `BL-NEW-COHORT-DIGEST-DECISION-EXTENDED`
+- RECOMMEND-LIVE-REVIEW (exploratory) if 4 stable weekly digests AND any enumerated signal classifies "strong-pattern (exploratory)" — BL-055 gates auto-promote
+- TRACK-WIDER if 4 stable weekly digests AND every signal is "moderate"/"tracking" — file `BL-NEW-COHORT-DIGEST-EXTEND-4w`
+- INCONCLUSIVE if all signals stuck at INSUFFICIENT_DATA at 2026-06-08 — file `BL-NEW-COHORT-DIGEST-INCONCLUSIVE`
+**Decision artifact:** findings doc + backlog flip + memory checkpoint update.
+**decision-by:** 2026-06-08
 
 ### BL-NEW-HPF-RE-EVALUATION: re-evaluate `PAPER_HIGH_PEAK_FADE_DRY_RUN` flip decision at n≥20
 **Status:** ACTIVE — D+7 review closed 2026-05-13T04:05Z (audit row id=25, `signal_params_audit.field_name='soak_verdict'`, value `dry_run_continued`). HPF dry-run produced n=7 would-fires by 2026-05-13; pre-registered criterion was ambiguous and aggregate counter-factual was −$45 vs actuals, so the flip is deferred rather than acted on. Continue accumulating toward n≥20.
