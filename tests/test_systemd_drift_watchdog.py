@@ -417,9 +417,11 @@ def test_stable_hash_under_filesystem_order_perturbation(tmp_path):
     """Two drifts that get serialized in different filesystem-orders across
     runs must produce identical hashes → silent suppression on second run.
 
-    Implementation strategy: create 2 drifts, run once, snapshot ACK_FILE;
-    rename files to provoke different inode-order, run again, verify
-    SAME hash + silent-suppress (stub NOT called second time).
+    V50 SHOULD-FIX — stronger perturbation: `touch` updates mtime/atime but
+    does NOT reorder ext4/xfs directory entries (find defaults to readdir
+    order). Use delete + re-create-in-reverse-order to force a directory-
+    entry rewrite, which CAN change readdir() order. This actually
+    exercises the pre-hash `sort` at scripts/systemd-drift-watchdog.sh:111.
     """
     repo = _make_fake_repo(tmp_path)
     prod = _make_fake_prod_systemd(tmp_path)
@@ -436,14 +438,28 @@ def test_stable_hash_under_filesystem_order_perturbation(tmp_path):
     assert ack_file.exists()
     first_hash = ack_file.read_text().strip()
 
-    # Provoke order perturbation: touch each file to update inode times
-    import time as _time
-    _time.sleep(0.05)
-    (prod / "gecko-zzz.service").touch()
-    _time.sleep(0.05)
-    (prod / "gecko-aaa.service").touch()
+    # V50 SHOULD-FIX — force directory-entry reshuffle by recreating files
+    # in reverse insertion order. ext4/xfs readdir() order tracks insertion
+    # order at the directory-entry level; touch alone is insufficient.
+    aaa_repo_body = (repo / "systemd" / "gecko-aaa.service").read_bytes()
+    aaa_prod_body = (prod / "gecko-aaa.service").read_bytes()
+    zzz_repo_body = (repo / "systemd" / "gecko-zzz.service").read_bytes()
+    zzz_prod_body = (prod / "gecko-zzz.service").read_bytes()
+    # Delete in one order, re-create in reverse — different entry order
+    for p in [
+        repo / "systemd" / "gecko-aaa.service",
+        repo / "systemd" / "gecko-zzz.service",
+        prod / "gecko-aaa.service",
+        prod / "gecko-zzz.service",
+    ]:
+        p.unlink()
+    # Re-create zzz first, then aaa (reverse of original insertion)
+    (prod / "gecko-zzz.service").write_bytes(zzz_prod_body)
+    (repo / "systemd" / "gecko-zzz.service").write_bytes(zzz_repo_body)
+    (prod / "gecko-aaa.service").write_bytes(aaa_prod_body)
+    (repo / "systemd" / "gecko-aaa.service").write_bytes(aaa_repo_body)
 
-    # Second run — same content, possibly different filesystem-order
+    # Second run — same content, different filesystem entry order
     res2, marker2 = _run_watchdog(tmp_path, repo, prod)
     assert res2.returncode == 1
     second_hash = ack_file.read_text().strip()
@@ -454,3 +470,46 @@ def test_stable_hash_under_filesystem_order_perturbation(tmp_path):
     # And stub must NOT be re-invoked
     second_size = marker2.stat().st_size
     assert second_size == first_size, "Same drift set must not re-alert"
+
+
+def test_self_reset_on_clean_after_drift(tmp_path):
+    """V49 SHOULD-FIX — state 3 self-reset (ACK present + drift now clean):
+    the watchdog must rm $ACK_FILE on CLEAN so the NEXT re-emergence of
+    drift A re-alerts (instead of silent-suppressing forever).
+
+    Sequence: drift → run (writes ACK) → operator fixes → run (CLEAN +
+    rm ACK) → drift returns → run (alerts again because ACK absent).
+    """
+    repo = _make_fake_repo(tmp_path)
+    prod = _make_fake_prod_systemd(tmp_path)
+    _write_unit(repo / "systemd", "gecko-foo.service", "[Unit]\nDescription=v1\n")
+    _write_unit(prod, "gecko-foo.service", "[Unit]\nDescription=prod-drift\n")
+
+    ack_file = tmp_path / "ack" / "last_alerted_hash"
+
+    # 1) Drift run — ACK written
+    res1, marker1 = _run_watchdog(tmp_path, repo, prod)
+    assert res1.returncode == 1
+    assert ack_file.exists()
+    first_size = marker1.stat().st_size
+
+    # 2) Operator fixes drift — prod now matches repo
+    _write_unit(prod, "gecko-foo.service", "[Unit]\nDescription=v1\n")
+
+    # 3) Clean run — ACK must be removed (state-3 self-reset)
+    res2, marker2 = _run_watchdog(tmp_path, repo, prod)
+    assert res2.returncode == 0
+    assert not ack_file.exists(), "ACK_FILE must be removed on CLEAN-after-drift"
+    # Stub NOT called on clean run
+    second_size = marker2.stat().st_size if marker2.exists() else 0
+    assert second_size == first_size, "Clean run must not invoke stub"
+
+    # 4) Drift returns (regression) — must re-alert
+    _write_unit(prod, "gecko-foo.service", "[Unit]\nDescription=prod-drift\n")
+    res3, marker3 = _run_watchdog(tmp_path, repo, prod)
+    assert res3.returncode == 1
+    assert ack_file.exists(), "ACK_FILE must be re-written on regression alert"
+    third_size = marker3.stat().st_size
+    assert third_size > first_size, (
+        "Stub MUST be called on regression after self-reset"
+    )

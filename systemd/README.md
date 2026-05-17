@@ -35,6 +35,21 @@ sudo systemctl restart gecko-pipeline gecko-dashboard
 
 `sudo systemctl restart gecko-pipeline` interrupts the scout pipeline for ~10-20s — that window costs missed CG scan cycles, missed paper-trade evaluations, and may trip the ingestion-starvation watchdog and the 09:00 stale-heartbeat watchdog. Prefer windows between scan cycles. `gecko-dashboard` restart drops in-flight HTTP connections (operator-facing, less critical).
 
+**First-time activation of `systemd-drift-watchdog.timer` (cycle 10 V51 fold):**
+
+On first merge of the drift-watchdog units, additionally:
+
+```bash
+# Pre-flight: verify the new units are byte-identical post-cp
+diff -q systemd/systemd-drift-watchdog.service /etc/systemd/system/systemd-drift-watchdog.service
+diff -q systemd/systemd-drift-watchdog.timer   /etc/systemd/system/systemd-drift-watchdog.timer
+
+sudo systemctl enable --now systemd-drift-watchdog.timer
+sudo systemctl start systemd-drift-watchdog.service  # smoke test
+journalctl -u systemd-drift-watchdog.service --since "1 minute ago" --no-pager
+# Expected: "OK: 0 drifts, 0 drop-ins, 0 untracked prod units"
+```
+
 **Reload semantics (V35 fold):**
 
 - Long-running services (`gecko-pipeline`, `gecko-dashboard`) — `daemon-reload` re-reads unit files, but the running process keeps the OLD definitions until **explicit `restart`**.
