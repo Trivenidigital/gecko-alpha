@@ -9,16 +9,18 @@
 
 ## TL;DR
 
-`social_mentions_24h` is **structurally dead**: 0 of 1,671 candidates have nonzero values, 0 of 6,096,576 historical scoring rows would trigger Signal 5. The 15-point contribution to `SCORER_MAX_RAW=208` is a phantom. Removing it (+ recalibrating gates 60→65 / 70→75) produces **0 candidate flips across the full 6M+ row history**. Hermes X bridge is not data-ready (0/126 resolved); TG bridge is not data-ready (6 distinct contracts/24h).
+`social_mentions_24h` is **structurally dead**: 0 of 1,672 candidates have nonzero values, 0 of 6,098,976 scoring rows over the 15d retention window would trigger Signal 5. The 15-point contribution to `SCORER_MAX_RAW=208` is a phantom. Removing it (+ recalibrating gates 60→65 / 70→75) produces **0 candidate flips across 6M+ rows under both truncation AND rounding** (Q3 + Q3b sensitivity check). Variant C would promote 35 score-instances (=4 distinct candidates) past MIN_SCORE; **0 of those 4 had paper_trade outcomes** (Q4b) — no missed profitable signals. Hermes X bridge not data-ready (0/131 resolved 7d); TG bridge not data-ready (6 distinct contracts/24h).
 
-**Recommendation: Option B — remove + recalibrate gates.** Code change DEFERRED to explicit operator approval per scope constraint "no live config flips this PR." This PR ships findings + one-line `# DEAD SIGNAL` annotation + backlog flip + follow-ups.
+**Operator decision required by 2026-06-14:** confirm Option B (recommended) or override to Option C.
+
+**Recommendation: Option B — remove + recalibrate gates.** Code change DEFERRED to explicit operator approval per scope constraint "no live config flips this PR." This PR ships findings + one-line `# DEAD SIGNAL` annotation + backlog flip + follow-ups + `tasks/audit_v2_queries.sql` (with SCHEMA/COUPLING blocks, sensitivity Q3b, paper-trade attribution Q4b).
 
 ## Operator acceptance criteria verification
 
 | Criterion (from operator scope) | Met? | Evidence |
 |---|---|---|
-| Quantifies score/ranking impact of removing the dead 15-point feature | ✓ | Variant B: 0 flips / 6,096,576 rows; Variant C: 35 candidates promoted at MIN_SCORE (~0.0006% of corpus); Variant A: no change (status quo) |
-| Identifies whether any profitable/missed signals would change ranking materially | ✓ | Top-10 historical scores = 58.0; under Variant B/C inflation → 62. **No candidate reaches CONVICTION=70 under any variant** (max stays at 62 post-inflation). 35 candidates currently below MIN_SCORE=60 by 2 points would be silently unlocked under Variant C (operator preference question) |
+| Quantifies score/ranking impact of removing the dead 15-point feature | ✓ | Variant B: 0 flips / 6,098,976 rows under truncation AND rounding (Q3 + Q3b); Variant C: 35 score-instances promoted at MIN_SCORE (~0.0006% of corpus = 4 distinct contracts per Q4b); Variant A: no change (status quo) |
+| Identifies whether any profitable/missed signals would change ranking materially | ✓ | Top-10 score_history rows all = 58.0; under Variant B/C inflation → 62. **No candidate reaches CONVICTION=70 under any variant** (max stays at 62). **Q4b: 0 of 4 distinct Variant-C-promoted contracts had paper_trade outcomes** — no missed profitable signals |
 | Documents Hermes-first result | ✓ | Category-exhaustive WebFetch (Social Media, 7 listed); no skills match. awesome-hermes 404 consistent. Bridge gate not met (0/126 resolved + 6 distinct TG contracts/24h) |
 | Updates backlog/todo/memory/context | ✓ | backlog status AUDITED 2026-05-17 + 3 follow-ups filed; todo board entry; memory checkpoint outside repo |
 
@@ -43,12 +45,15 @@ Rationale:
 
 | Assumption | Result | Source |
 |---|---|---|
-| `social_mentions_24h` is structurally dead | total=1,671, would_fire_signal_5 (>50) = **0**, nonzero = **0**, max = **0** | Q1 |
-| Max historical score across full corpus | **58.0** (across 6,096,576 rows); gte60=0; gte70=0 | Q2 |
+| `social_mentions_24h` is structurally dead | total=1,672, would_fire_signal_5 (>50) = **0**, nonzero = **0**, max = **0** | Q1 |
+| Max score over score_history retention window | **58.0** (across 6,098,976 rows over 15d window 2026-05-02→2026-05-17); gte60=0; gte70=0 | Q2 + Q2b |
+| `score_history` retention window | **2026-05-02 → 2026-05-17 (15 days)** — claim is recent-data observation, not project-lifetime (per PR-review fold R1 #6) | Q2b |
+| Variant B rounding sensitivity | rounded version produces **identical** numbers (0/0/0/0) — 0-flip claim survives both truncation AND rounding (per PR-review fold R1 #1) | Q3b |
 | Paper-trade dispatch path | `signals.py:325` gates on `quant_score > 0` — bypasses CONVICTION_THRESHOLD entirely | code read |
-| Hermes X resolution rate | 0/126 (Wilson 95% one-sided UB ≈ 2.91%) | Q5 |
+| Hermes X resolution rate (7d) | 0/131 (Wilson 95% two-sided UB ≈ 2.86%) | Q5 |
 | TG per-token rollup 24h | 6 distinct contracts / 6 messages — insufficient for replacement | Q6 |
 | social_signals / social_baselines / social_credit_ledger row counts | 0 / 0 / 0 | Q7 |
+| **Variant C 35-candidate paper-trade attribution** | 4 distinct contracts, **0 with paper_trade outcomes** — no missed profitable signals (per PR-review fold R1 #7) | Q4b |
 
 ### Backtest variants (closed-form over 6,096,576 score_history rows)
 
@@ -74,11 +79,12 @@ Rationale:
 
 Re-run `tasks/audit_v2_queries.sql` when ANY trigger fires (first-fire wins; if multiple fire same window, run once and address all):
 
-1. `narrative_alerts_inbound.resolved_coin_id` populated count ≥ 20 in any 30d window (currently 0/126)
+1. `narrative_alerts_inbound.resolved_coin_id` populated count ≥ 20 in any 30d window (currently 0/131)
 2. `tg_social_messages` distinct-contract 24h rollup ≥ 50 (currently 6)
 3. **`scorer.py` signal weight change OR `SCORER_MAX_RAW` change** (per design-review fold R2 #5 — invalidates Variant B's 0-flip math)
-4. **2026-08-17** (90d calendar backstop, per cycle-9 `keep_on_provisional_until_<iso>` convention)
+4. **2026-08-17** (calendar backstop, ~90d from 2026-05-17, per cycle-9 `keep_on_provisional_until_<iso>` convention)
 5. Operator explicit request
+6. **Any 30d window with top-10 `score_history` scores ≥ 60** (forward-stability detector per PR-review fold R3 #5 — current 5-point headroom 58→60 shrinks to 0)
 
 The watchdog for triggers 1+2 is filed as `BL-NEW-SOCIAL-DENOMINATOR-RE-EVAL-WATCHDOG` (single follow-up, merged per design-review fold R1 #5).
 

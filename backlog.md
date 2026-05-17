@@ -244,22 +244,38 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Status:** PROPOSED 2026-05-17 — filed concurrent with BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT findings.
 **Tag:** `observability` `audit-watchdog` `silent-failure-prevention`
 **Why:** Re-eval triggers 1+2 (`narrative_alerts_inbound.resolved_coin_id` ≥ 20 in 30d; `tg_social_messages` distinct-contract 24h ≥ 50) are operator-memory-dependent. Per CLAUDE.md §12a (freshness SLO + watchdog rule), decision-bearing thresholds need automated detection or they silently never fire — same shape as `BL-NEW-REVIVAL-VERDICT-WATCHDOG` from cycle-9. The 2c (TG rollup) and 2a (resolution rate) follow-ups merged into this single watchdog per design-review fold R1 #5 (both query the same `narrative_alerts_inbound` + `tg_social_messages` surface).
-**Action:** Daily cron query against `narrative_alerts_inbound` resolution-count (30d window) AND `tg_social_messages` distinct-contract 24h rollup; TG alert ("revival_criteria-style") when either threshold crossed.
-**Decision-by:** 4 weeks from PR merge (2026-06-14). Match cycle-9 watchdog calendar discipline.
+**Action:** Daily cron query against `narrative_alerts_inbound` resolution-count (30d window) AND `tg_social_messages` distinct-contract 24h rollup; TG alert ("revival_criteria-style") when either threshold crossed. **Owner:** operator or next-cycle infrastructure work assignee — to be claimed on PR merge.
+**Decision-by:** 4 weeks from PR merge. **If not implemented by that date, audit must be re-run manually on 2026-08-17** (90d backstop is the load-bearing safety net; watchdog is the convenience layer). Per PR-review fold R3 #2 + R2 #5.
 
 ### BL-NEW-SCORER-DEAD-SIGNAL-COMMENT-CONVENTION: codify the `# DEAD SIGNAL` annotation pattern
 **Status:** PROPOSED 2026-05-17 — filed concurrent with BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT findings.
 **Tag:** `scoring` `code-convention` `intellectual-debt-prevention`
 **Why:** Per design-review fold R2 §2: Signal 13 (CryptoPanic) at `scorer.py:184-198` has a documented gated-comment convention; Signal 5 (Social Mentions) lacked one until this audit added it. Future scorer audits will repeat this work unless the convention is codified.
 **Action:** One-line style-guide addition: "Any scorer signal that hasn't fired in the last 7d production window MUST carry a `# DEAD SIGNAL` or `# GATED — pending <BL ticket>` comment immediately above the threshold check." Bundle with next scorer.py touch.
-**Decision-by:** 8 weeks from PR merge (2026-07-12). Calendar-bound.
+**Decision-by:** 8 weeks from PR merge. Calendar-bound; if no scorer.py PR by then, file standalone PR. Per PR-review fold R2 #5.
 
 ### BL-NEW-SOCIAL-DENOMINATOR-OPERATOR-PREFERENCE: B vs C decision for next-cycle code change
 **Status:** PROPOSED 2026-05-17 — surfaced as Open Question 1 in audit findings.
 **Tag:** `operator-decision` `awaiting-response`
 **Why:** Audit recommends Variant B (remove + recalibrate gates 60→65 / 70→75) with 0-flip blast radius. Variant C (remove WITHOUT recalibrating) widens MiroFish funnel by 35 historical candidates — operator may value this if recall > precision.
-**Action:** Operator responds via PR comment OR `tasks/findings_social_mentions_denominator_operator_decision.md` follow-up commit. On response: close this entry; file `BL-NEW-SOCIAL-DENOMINATOR-VARIANT-{B,C}-IMPL` for the code-change PR.
-**Decision-by:** 4 weeks from PR merge (2026-06-14). If no response by then, default action = stamp interim Option A + auto-re-file at 2026-08-17 backstop.
+**Action:** Operator responds via PR comment OR `tasks/findings_social_mentions_denominator_operator_decision.md` follow-up commit. On response: close this entry; promote pre-filed `BL-NEW-SOCIAL-DENOMINATOR-VARIANT-B-IMPL` or `-VARIANT-C-IMPL` below from PENDING-OPERATOR-DECISION to PROPOSED for next-cycle code change.
+**Decision-by:** 4 weeks from PR merge. **If no response by then, entry remains PROPOSED until 2026-08-17 backstop run resurfaces for human triage.** (Per PR-review fold R3 #1: the prior "default action = stamp interim Option A" had no actor and was itself a silent-non-trigger — the exact failure mode this audit exists to prevent. Removed.)
+
+### BL-NEW-SOCIAL-DENOMINATOR-VARIANT-B-IMPL: implement Option B (remove + recalibrate gates)
+**Status:** PENDING-OPERATOR-DECISION 2026-05-17 — pre-filed per PR-review fold R3 #4 so operator's "approve B" comment lands on a real backlog row.
+**Tag:** `scoring` `code-change` `gate-recalibration` `pending-decision`
+**Why:** Audit-recommended path. Removes Signal 5 from scorer.py + drops SCORER_MAX_RAW 208→193 + raises MIN_SCORE 60→65 + raises CONVICTION_THRESHOLD 70→75. 0-flip blast radius across 6M+ historical rows (audit Q3).
+**Action:** ~2h. Edit scorer.py:120-127 (remove Signal 5 block) + scorer.py:37 (208→193) + config.py:27-28 (60→65, 70→75). Update test_scorer.py for new max-raw. Smoke-test on srilu.
+**Promotion trigger:** Operator approves Option B in BL-NEW-SOCIAL-DENOMINATOR-OPERATOR-PREFERENCE → promote this to PROPOSED; close `-VARIANT-C-IMPL` below.
+**Decision-by:** Conditional on operator decision; not calendar-bound on its own.
+
+### BL-NEW-SOCIAL-DENOMINATOR-VARIANT-C-IMPL: implement Option C (remove without recalibrating)
+**Status:** PENDING-OPERATOR-DECISION 2026-05-17 — pre-filed per PR-review fold R3 #4.
+**Tag:** `scoring` `code-change` `funnel-widening` `pending-decision`
+**Why:** Variant C path. Removes Signal 5 from scorer.py + drops SCORER_MAX_RAW 208→193 but KEEPS gates at 60/70. Widens MiroFish funnel by 35 historical candidates (audit Q4) — operator preference if recall > precision.
+**Action:** ~1h. Edit scorer.py:120-127 (remove Signal 5 block) + scorer.py:37 (208→193). Update test_scorer.py for new max-raw. NO config.py change. Smoke-test on srilu.
+**Promotion trigger:** Operator approves Option C in BL-NEW-SOCIAL-DENOMINATOR-OPERATOR-PREFERENCE → promote this to PROPOSED; close `-VARIANT-B-IMPL` above.
+**Decision-by:** Conditional on operator decision; not calendar-bound on its own.
 
 ### BL-033: Add heartbeat logging every 5 minutes
 **Status:** DONE — heartbeat logging implemented (PR #7)
