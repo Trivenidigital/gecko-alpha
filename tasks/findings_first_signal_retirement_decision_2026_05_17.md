@@ -86,6 +86,14 @@ Settings:
 | B: RETIRE in code | Premature without soak — the false-positive suspension prevented current-rules evaluation | — |
 | C: DEFER until live-roadmap | Wastes the chance to gather post-fix data; dispatcher path stays live anyway | — |
 
+**V42 SHOULD-FIX — argument independence:** the recommendation rests on FOUR arguments but they're not independent. (a) "suspension was a pre-fix false-positive" is the NECESSARY condition — if rejected (e.g., operator argues the pre-fix gate caught a real regression), Option A collapses to Option C. (b) positive-tail edge ($45/winner) and (d) current-gate-wouldn't-re-fire are re-slicings of the same all-time data. (c) drag-in-expired (tail-decay vs picks-losers) is the only genuinely independent observation; alone it is too thin to outweigh -$0.52 EV. Net: Option A requires (a) to hold; (b)–(d) are sufficiency conditions conditional on (a).
+
+**V42 SHOULD-FIX — paper-slot opportunity cost:** Cycle 7 found `losers_contrarian` + `narrative_prediction` already consume ~48% of post-cutover paper volume at 0% live-eligibility. Reviving first_signal compounds the drag at expected n≈20 over 14d (~1.4 trades/day) — small relative to total paper throughput, but real. If the operator is paper-slot constrained, DEFER becomes relatively more attractive. For the current operator (PAPER_LIVE_ELIGIBLE_SLOTS unchanged, no slot pressure surfaced), this cost is acceptable.
+
+**V42 SHOULD-FIX — KEEP threshold rationale:** "PnL ≥ 0 AND positive-tail win rate ≥ 17%" anchors on NON-REGRESSION. The null hypothesis under Option A is "the signal is its pre-suspend self" (because the suspension was a false-positive, not a regime change). Reject the null only if the soak shows the signal got WORSE; do not require it to spontaneously improve. The higher +$200 + avg-winner ≥ $30 bar is preserved as the SEPARATE escalation gate for live-roadmap revisit.
+
+**V44 SHOULD-FIX — joint reliance on n=1 trade.** Cycle 7's V36 fold and cycle 9's "Tier 1b reachable in principle" both rest on the SAME single observation (trade id=1375, `conviction_locked_stack=3`). The structural argument has not strengthened over the cycle 7 → cycle 9 chain; only the empirical PnL evidence will at the 2026-05-31 verdict. Future-self should recognize that if the soak produces zero new stack≥3 trades, the cycle 7 + cycle 9 framing rests on a single observation in perpetuity.
+
 ## Operator action (post-merge, operator-manual)
 
 Per V40 MUST-FIX: use the helper, NOT raw SQL. Per V41 SHOULD-FIX: stop service first to avoid `BEGIN EXCLUSIVE` racing with live writers.
@@ -117,7 +125,14 @@ asyncio.run(revive())
 "
 
 sudo systemctl start gecko-pipeline   # clears in-process signal_params cache; picks up enabled=1
+# V43 SHOULD-FIX: if the revival python raises (.env mis-config, BEGIN EXCLUSIVE timeout,
+# DB integrity check), STILL run `sudo systemctl start gecko-pipeline` before debugging
+# — otherwise the service stays stopped until the 09:00 stale-heartbeat watchdog notices.
 ```
+
+**V43 SHOULD-FIX — `systemctl stop` blast radius:** the ~3-5s window halts the narrative scanner, paper-trade evaluator, cohort_digest hook, and heartbeats. A position hitting TP/SL during the window is benign — the evaluator re-runs every cycle on resume; no checkpoint is lost. The only operator-facing artifact is one missed heartbeat event.
+
+**V43 SHOULD-FIX — adding first_signal to TG alerts during soak:** the helper sets `tg_alert_eligible=0` (first_signal ∉ `DEFAULT_ALLOW_SIGNALS`). If the operator wants TG alerts on first_signal trades during the soak, run separately: `sqlite3 /root/gecko-alpha/scout.db "UPDATE signal_params SET tg_alert_eligible=1 WHERE signal_type='first_signal'"` + restart. (This is OUT-OF-SCOPE of the revival decision; the helper's default opt-out preserves existing operator preference.)
 
 The helper:
 - `BEGIN EXCLUSIVE` atomic transaction
@@ -130,9 +145,11 @@ The helper:
 
 **Expected fire-count at 14d:** pre-suspend rate was 5 trades in 3.5 days = 1.43/day → 14d expected n ≈ 20.
 
-| Observation @ 14d post-revival | Verdict | Action |
+**V42 SHOULD-FIX — early-halt per CLAUDE.md §11c:** if `n ≥ 20` is reached BEFORE the 14d calendar boundary, evaluate immediately rather than running to calendar completion. The soak gate is data-bound on BOTH floor and ceiling.
+
+| Observation post-revival | Verdict | Action |
 |---|---|---|
-| `n < 10` (data threshold not met) | EXTEND-SOAK to 28d (data-bound per §11) | Continue soak; re-evaluate at 2026-06-14 |
+| `n < 10` at 14d (data threshold not met) | EXTEND-SOAK to 28d (data-bound per §11) | Continue soak; re-evaluate at 2026-06-14 |
 | `first_signal` auto-suspends again under current gate | RETIRE (Option B confirmed) | File `BL-NEW-FIRST-SIGNAL-RETIRE-CODE` |
 | `n ≥ 10` AND `Cumulative PnL ≥ 0` AND `positive-tail win rate ≥ 17%` | KEEP-PAPER (validated research surface) | Close cycle 9 cleanly |
 | `n ≥ 10` AND `Cumulative PnL ≥ +$200` AND `avg winner ≥ +$30` | KEEP-PAPER + flag for live-roadmap revisit | Memory note |
