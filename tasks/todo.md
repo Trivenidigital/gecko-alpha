@@ -1,6 +1,33 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-14 (Hermes-first debt audit + today's five-item improvement run)
+Last updated: 2026-05-17 (BL-NEW-LC-REVIVAL-CRITERIA-TIGHTENING PR #150 shipped)
+
+## Active Work: BL-NEW-LOSERS-CONTRARIAN-REVIVAL-CRITERIA-TIGHTENING
+
+- [x] Isolated worktree: `.claude/worktrees/feat+lc-revival-criteria-tightening`
+- [x] Drift-check: `git fetch origin && git log -10 origin/master` confirms HEAD=`5860d17` (zero divergence); 15 files match adjacent primitives (revival_cooloff, autosuspend_fix, first_signal_retirement — all SHIPPED via PRs #79/#81/#147); ZERO files match new diagnostic surface (`no_breakout_and_loss|exit_machinery_contribution|wilson_lb|bootstrap_lb_per_trade|keep_on_provisional`)
+- [x] Hermes-first check: Hermes skill hub returns no trading-signal-revival skills; awesome-hermes-agent 404 consistent across cycles 7/8/9; custom build justified
+- [x] Plan v3 drafted with `**New primitives introduced:**` header per CLAUDE.md gate: `tasks/plan_lc_revival_criteria_tightening.md`
+- [x] 2 parallel plan reviewers dispatched (statistical/methodology + structural/integration vectors); 5 CRITICAL + 5 IMPORTANT folded into v2 → v3
+- [x] Design v1 drafted as companion: `tasks/design_lc_revival_criteria_tightening.md`
+- [x] 2 parallel design reviewers dispatched (integration-choreography + strategy-safety vectors); 4 CRITICAL + 9 IMPORTANT folded
+- [x] Task 0 empirical baseline derivation against srilu prod: `tasks/baselines_revival_criteria_2026_05_17.md` (chain_completed n=12, volume_spike n=36, narrative_prediction n=185; healthy max nb_loss=0.368, healthy min exit_machinery=0.756)
+- [x] TDD build: 49 unit tests on srilu Python 3.12.3 + pytest 8.4.2 (was 48 + 1 added at PR-fold for naive-ISO tz normalization)
+- [x] Adjacent regression: 506 tests pass; 3 pre-existing env-coupled failures unrelated
+- [x] Findings doc: `tasks/findings_lc_revival_criteria_tightening_2026_05_17.md` — 4 prod signals evaluated. LC=STRATIFICATION_INFEASIBLE (cutover today, correct); gainers_early=FAIL (contradicting 2026-05-13 audit-id=24); chain_completed + volume_spike=BELOW_MIN_TRADES (correct refusal at low n)
+- [x] PR #150 created: https://github.com/Trivenidigital/gecko-alpha/pull/150
+- [x] 3 parallel PR reviewers dispatched (statistical/safety, code-structural, strategy/UX); 0 CRITICAL + 5 IMPORTANT + 7 MINOR; all MUST/SHOULD folded into commit `3d8bf02`
+- [x] PR description updated with full reviewer fold history table
+- [x] backlog.md status flip PROPOSED → PR-OPEN / PENDING-MERGE + 4 follow-up items filed (BL-NEW-REVIVAL-VERDICT-WATCHDOG, BL-NEW-REVIVAL-CRITERIA-QUARTERLY-RECALIBRATION, BL-NEW-EVALUATION-HISTORY-PERSISTENCE, BL-NEW-REVIVAL-CRITERIA-PER-SIGNAL-TUNING)
+- [ ] **Post-merge:** flip backlog status to `SHIPPED <merge-date>` with merge SHA
+
+Review:
+- Read-only evaluator ships without any production-runtime side-effects; revive_signal_with_baseline / auto_suspend / main.py / calibrate.py all untouched
+- Originating-failure prevention test (n=55 LC on 2026-05-13 under new criteria → BELOW_MIN_TRADES, refuses to emit PASS): structural prevention confirmed
+- gainers_early FAIL verdict produced concrete contradiction evidence for 2026-05-13 audit-id=24; operator decision deferred per scope ("do not change gainers_early behavior unless evidence clearly supports it")
+- §11b bootstrap CI + Wilson LB are first-class primary gates; secondary diagnostic gates (no_breakout_and_loss, exit_machinery_contribution) are derived from healthy-signal baselines, not fit-to-instance
+- §9c lever-vs-data-path memory pattern is now instance #6 (the 5/13 verdict attributed soak success to the mechanism; mechanism didn't break; the input regime feeding the mechanism changed)
+- No live config flips this PR. `keep_on_provisional_until_<iso>` (30d default) embeds structural revocability; active watchdog enforcement deferred to follow-up
 
 ## Active Work: BL-NEW-CHAIN-ANCHOR-PIPELINE-FIX
 
