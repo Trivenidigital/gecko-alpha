@@ -15,7 +15,11 @@ Last updated: 2026-05-18 (cycle 14: CG budget attribution + stale PR triage)
 - [x] PR #170 opened against master.
 - [x] CI green: GitHub Actions Tests workflow `SUCCESS` on `feat/cg-budget-attribution`.
 - [x] Reviewer 1 doc/status fold applied: fresh Hermes-first check (3 surfaces clean on 2026-05-18) + backlog flipped PROPOSED→PR-OPEN + this CI box.
-- [ ] Post-deploy validation: held_position_refresh_summary.refreshed_count > 0 for ≥3 consecutive cycles outside fresh 429 cooldown windows; simple_price_missing_ids shrinks toward []; scanner lanes not chronically starved.
+- [x] PR #170 merged at `47f0835` on 2026-05-18T18:38:58Z; deployed to srilu-vps at 18:39:46Z (pycache cleared + restart).
+- [x] 3-consecutive-clean gate met: cycles 1-3 post-deploy (18:41-18:47Z) `refreshed=148/147/147`; `simple_price_missing_ids=[]`.
+- [x] Backlog flipped PR-OPEN → SHIPPED with post-deploy evidence summary; follow-up filed (BL-NEW-CG-FREE-TIER-DEMO-API-KEY).
+- [ ] **Residual:** cycles 4-8 of the 30min sample window (18:50-18:59Z) showed wholesale failure recurrence during a sustained CG IP-rate-limit cooldown; held_position now hits 5/13 `coingecko_lanes_stopped_for_backoff` events (separate counter from 12 `cg_429_backoff` events — lane-stop fires at each cycle-lane boundary where the limiter is still in cooldown, so a single 429 can produce multiple lane-stop detections). Net success rate ~55% (vs ~10% pre-fix) — material improvement but partial fix. Next: operator-only Demo API key registration per BL-NEW-CG-FREE-TIER-DEMO-API-KEY.
+- [ ] **#158 24h validation:** STILL OPEN — extended journal evidence outside sustained 429 windows required.
 
 ## Stale PR triage (2026-05-18)
 
