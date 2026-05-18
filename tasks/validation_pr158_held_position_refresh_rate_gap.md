@@ -4,10 +4,11 @@ Purpose: collect evidence for `BL-NEW-HELD-POSITION-REFRESH-RATE-GAP` after PR #
 
 Do not mark 24h validation complete until journal evidence exists.
 
-Current deployment check on 2026-05-18:
-- VPS `/root/gecko-alpha` was on `master` at `cdeb31f`, not PR #158.
-- No post-deploy journal evidence was collected.
-- This file is prep-only until #158 is deployed.
+Deployment checks on 2026-05-18:
+- Initial prep check: VPS `/root/gecko-alpha` was on `master` at `cdeb31f`, not PR #158.
+- Post-merge deploy check: VPS reached master `147cba4`; `gecko-pipeline` and `gecko-dashboard` were active after restart.
+- Validation is blocked because effective config has held-position refresh disabled: `.env` has no `HELD_POSITION_PRICE_REFRESH_*` keys, systemd has no override, and `scout/config.py` defaults `HELD_POSITION_PRICE_REFRESH_ENABLED=False`.
+- No post-deploy `held_position_refresh_summary`, `simple_price_missing_ids`, or `held_position_token_persistently_stale` evidence was collected. Do not mark 24h validation complete.
 
 ## Known Stale Cohort
 
@@ -52,6 +53,14 @@ Get-Content .ssh_pr158_deploy_check.txt
 ```
 
 Proceed only if `HEAD` is the deployed PR #158 merge commit or contains PR #158's fields.
+
+Also confirm the held-position refresh lane is enabled before waiting for journal evidence:
+
+```bash
+ssh root@srilu-vps 'cd /root/gecko-alpha; grep -e ^HELD_POSITION_PRICE_REFRESH_ENABLED= -e ^HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES= -e ^HELD_POSITION_STALE_WARN_HOURS= .env || true; systemctl show gecko-pipeline --property=Environment --no-pager' > .ssh_pr158_effective_config.txt 2>&1
+```
+
+If `HELD_POSITION_PRICE_REFRESH_ENABLED` is absent and there is no systemd override, the effective default is `False`; stop and ask the operator to enable the lane before collecting cycle evidence.
 
 ## Step 2: Collect One-Cycle Journal Evidence
 

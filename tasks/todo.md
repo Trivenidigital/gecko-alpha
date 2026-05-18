@@ -20,7 +20,7 @@ Last updated: 2026-05-18 (cycle 14 overnight — PR #158 for BL-NEW-HELD-POSITIO
 - [x] TDD: 27/27 tests pass on srilu Python 3.12.3 (21 existing + 6 new using `structlog.testing.capture_logs()`)
 - [x] Findings doc with empirical evidence + post-deploy soak plan
 - [x] backlog.md: new entry filed with PR-OPEN/SCRIPT-READY status + 2 evidence-gated follow-ups (`BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT` + `BL-NEW-HELD-POSITION-STALE-COUNT-ALERT`)
-- [x] 2026-05-18 validation deployment check: VPS `/root/gecko-alpha` is still `master` at `cdeb31f`, so #158 is not deployed; no journal evidence collected and 24h validation remains incomplete.
+- [x] 2026-05-18 validation deployment check: VPS `/root/gecko-alpha` reached master `147cba4`, but validation is blocked because effective config has `HELD_POSITION_PRICE_REFRESH_ENABLED=False` (no `.env` or systemd override); no `held_position_refresh_summary` / `simple_price_missing_ids` evidence collected and 24h validation remains incomplete.
 - [x] Validation prep doc added via PR #163: `tasks/validation_pr158_held_position_refresh_rate_gap.md` with two-step SSH commands, required journal fields, stale-cohort overlap comparison, and `/coins/{id}` fallback promotion gate.
 - [x] PR #158 created + 3 PR reviewers folded; operator P1/P2 false-positive/tz-normalization fold landed.
 - [x] Post-merge: bookkeeping flip per cycle-12+13 convention (`SHIPPED 2026-05-18 — PR #158 merged a649032`)
