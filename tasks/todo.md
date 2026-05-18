@@ -13,6 +13,43 @@ Last updated: 2026-05-18 (cycle 14 overnight — PR TBD BL-NEW-SETTINGS-VALIDATI
 - [ ] PR creation + 3 PR reviewers
 - [ ] Post-merge: bookkeeping flip
 
+## Active Work: BL-NEW-CRON-DRIFT-WATCHDOG-ENV-WHITESPACE-TOLERANCE
+
+- [x] Isolated worktree: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-cron-env-whitespace` on `codex/cron-env-whitespace-tolerance`
+- [x] Merge/bookkeeping hygiene: PRs #158/#159/#160 checked via `gh pr view`; all remain OPEN, so no status-flip PR is applicable yet.
+- [x] Dependency check: target script exists on `origin/feat/cron-drift-watchdog` / PR #156, not on `origin/master`; this PR is stacked on PR #156 rather than duplicating the cron watchdog on master.
+- [x] Drift-check: `rg`/`git grep` found no existing `BL-NEW-CRON-DRIFT-WATCHDOG-ENV-WHITESPACE-TOLERANCE`; `scripts/cron-drift-watchdog.sh` still uses strict `^TELEGRAM_*=` parsing while PR #159's `scripts/systemd-drift-watchdog.sh` uses `[[:space:]]*` tolerance.
+- [x] Hermes-first: Hermes Cron supports scheduled script-only jobs and Telegram delivery, but does not replace gecko-alpha's repo-vs-live crontab diff or `.env` credential parsing. Hermes Watchers cover RSS/JSON/GitHub watermarks, not local crontab drift. awesome-hermes-agent has no crontab-drift parser replacement. Verdict: small in-tree parity fix.
+- [x] Write failing test for leading-whitespace `.env` token/chat parsing on the cron watchdog prod curl path.
+- [x] Implement minimal parsing parity with PR #159's systemd watchdog.
+- [x] Verify targeted tests and source-level parse-mode guard.
+- [x] Update backlog/memory review notes, commit, push, and create stacked PR: #161 (`https://github.com/Trivenidigital/gecko-alpha/pull/161`).
+
+Review:
+- TDD red evidence: Git Bash stub run with indented `TELEGRAM_*` keys exited before curl (`rc=1`, empty stderr/stdout) under the strict parser.
+- Root-cause addendum: strict `grep` under `set -euo pipefail` also exited before the documented exit-5 error branch when Telegram keys were absent; added `test_prod_env_missing_telegram_keys_exits_5`.
+- Green evidence: Git Bash stub run with indented keys now reaches curl and emits `ALERTED: HTTP 200`; missing-key stub run now exits 5 with `TELEGRAM_BOT_TOKEN missing/placeholder`.
+- Windows pytest evidence: `python -m pytest tests/test_cron_drift_watchdog.py -q` reports `22 skipped` because this watchdog suite is module-skipped on win32.
+- Parse-mode guard: source grep for `parse_mode` in `scripts/cron-drift-watchdog.sh` returns no matches.
+
+## Active Work: BL-NEW-CRON-DRIFT-WATCHDOG (item 3, PR #156)
+
+- [x] Isolated worktree: `.claude/worktrees/feat+cron-drift-watchdog`
+- [x] Drift-check: HEAD = `cdeb31f` = origin/master (zero divergence; includes PRs #150-#154). Grep for `cron-drift-watchdog` returns ZERO files — net-new.
+- [x] Hermes-first: no per-token Hermes primitive for crontab drift; reuse in-tree curl-direct Telegram pattern. awesome-hermes-agent reachable; x-twitter-scraper exists but unrelated.
+- [x] Plan v2 (post-2-reviewer fold): `tasks/plan_cron_drift_watchdog.md` — 14 reviewer findings folded (1 CRITICAL + 8 IMPORTANT + 5 MINOR across 2 reviewers).
+- [x] Design consolidated into plan v2 per CLAUDE.md §10 (fold table + code blocks specify all design decisions; separate design doc would duplicate).
+- [x] Build: `scripts/cron-drift-watchdog.sh` (~215 LOC mirroring cycle-10 systemd-drift-watchdog with reviewer-fold improvements) + `tests/test_cron_drift_watchdog.py` (14 tests).
+- [x] TDD: 14/14 tests pass on srilu Python 3.12.3 / pytest 8.4.2. Mid-build bug caught: `diff -u` includes tempfile mtime headers, breaking sha256 ack stability. Fixed via `--label`.
+- [x] Prod-crontab dry-run: CLEAN (managed block matches repo fragment).
+- [x] backlog.md status: PROPOSED → PR-OPEN / SCRIPT-READY / SCHEDULING-PENDING-OPERATOR (per Reviewer 1 PR-review-3 P2: "SHIPPED" wording reserved for post-merge state; pre-merge says SCRIPT-READY) + 2 follow-ups filed
+- [x] PR + 3 parallel PR-stage reviewers → all CRITICAL+IMPORTANT folded (commit 9e9a208)
+- [x] Reviewer-2 PR-review fold: ACK_DIR mkdir failure now exits 9 with clear message (vs prior warn-then-fail-cryptically); test_ack_dir_unwritable_exits_9 added; 20/20 tests pass on srilu
+- [x] Reviewer-2 PR-review fold: scope trim — BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT now systemd-only (cron-watchdog ships ACK_DIR-exit-9 fix)
+- [x] Reviewer-3 PR-review fold: backlog wording corrected — "SCRIPT-SHIPPED" was premature pre-merge; renamed pre-merge state to "PR-OPEN / SCRIPT-READY / SCHEDULING-PENDING-OPERATOR"; post-merge action text updated with 3-stage convention (PR merge → SCRIPT-SHIPPED with SHA → operator scheduling → SHIPPED/SCHEDULED)
+- [ ] Post-merge stage 1 (bookkeeping): flip PR-OPEN/SCRIPT-READY → SCRIPT-SHIPPED + merge SHA
+- [ ] Post-merge stage 2 (operator scheduling, separate): operator adds cron line via cron/README §Setup; then flip → SHIPPED/SCHEDULED
+
 ## Active Work: BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT
 
 - [x] Isolated worktree: `.claude/worktrees/feat+social-mentions-denominator-audit`
