@@ -81,6 +81,8 @@ def _run_watchdog(
     env = os.environ.copy()
     env["PATH"] = f"{stub.parent}:" + env.get("PATH", "")
     env["UV_BIN"] = str(stub)
+    # PR-#159 backport: UV_BIN-refuse guard requires explicit opt-in for tests.
+    env["GECKO_WATCHDOG_ALLOW_UV_STUB"] = "1"
     env["GECKO_REPO"] = str(repo)
     env["PROD_SYSTEMD_DIR"] = str(prod)
     env["SYSTEMD_DRIFT_ACK_DIR"] = str(ack_dir)
@@ -513,3 +515,157 @@ def test_self_reset_on_clean_after_drift(tmp_path):
     assert third_size > first_size, (
         "Stub MUST be called on regression after self-reset"
     )
+
+
+# ----------------------------------------------------------------------
+# BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT — PR-#156 hardening
+# ----------------------------------------------------------------------
+
+
+def test_ack_dir_unwritable_exits_9(tmp_path):
+    """Backport of PR-#156 review-2 P2 fold (cron-drift-watchdog parity).
+    Previously `mkdir -p $ACK_DIR` failure only warned, then the next
+    `exec 9>"$LOCK_FILE"` would fail abruptly under `set -e` with a bash
+    error harder to grep than a controlled exit. Now exit 9 with clear
+    stderr message.
+
+    Force failure by pointing SYSTEMD_DRIFT_ACK_DIR at a path under a
+    regular file (mkdir -p cannot create a directory under a file).
+    """
+    repo = _make_fake_repo(tmp_path)
+    prod = _make_fake_prod_systemd(tmp_path)
+    _write_unit(repo / "systemd", "gecko-foo.service", "[Unit]\nDescription=v1\n")
+    _write_unit(prod, "gecko-foo.service", "[Unit]\nDescription=v1\n")
+    sentinel_file = tmp_path / "sentinel-as-file"
+    sentinel_file.write_text("not a directory")
+    res = subprocess.run(
+        ["bash", str(WATCHDOG_SCRIPT)],
+        env={
+            **os.environ,
+            "GECKO_REPO": str(repo),
+            "PROD_SYSTEMD_DIR": str(prod),
+            "SYSTEMD_DRIFT_ACK_DIR": str(sentinel_file / "ack"),
+            "SYSTEMD_DRIFT_HEARTBEAT_FILE": str(tmp_path / "heartbeat"),
+            "GECKO_ENV_FILE": "/dev/null",
+            "UV_BIN": "",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert res.returncode == 9, (
+        f"expected exit 9 (ACK_DIR unwritable); got {res.returncode}; "
+        f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    )
+    assert "failed to mkdir" in res.stderr
+    assert "cannot proceed" in res.stderr
+
+
+def test_uv_bin_set_without_opt_in_refuses_prod_silent_suppression(tmp_path):
+    """Backport of PR-#156 R1 #15 fold. UV_BIN accidentally set in prod
+    (e.g., operator profile exports UV_BIN into cron environment) would
+    silently absorb the alert delivery and write ACK files, creating a
+    false-clean signal. Require explicit GECKO_WATCHDOG_ALLOW_UV_STUB=1
+    opt-in for stub path.
+    """
+    repo = _make_fake_repo(tmp_path)
+    prod = _make_fake_prod_systemd(tmp_path)
+    _write_unit(repo / "systemd", "gecko-foo.service", "[Unit]\nDescription=v1\n")
+    _write_unit(prod, "gecko-foo.service", "[Unit]\nDescription=v2\n")
+    res = subprocess.run(
+        ["bash", str(WATCHDOG_SCRIPT)],
+        env={
+            **os.environ,
+            "GECKO_REPO": str(repo),
+            "PROD_SYSTEMD_DIR": str(prod),
+            "SYSTEMD_DRIFT_ACK_DIR": str(tmp_path / "ack"),
+            "SYSTEMD_DRIFT_HEARTBEAT_FILE": str(tmp_path / "heartbeat"),
+            "GECKO_ENV_FILE": "/dev/null",
+            "UV_BIN": str(tmp_path / "stubs" / "fake-uv"),  # path doesn't need to exist
+            # GECKO_WATCHDOG_ALLOW_UV_STUB DELIBERATELY OMITTED
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert res.returncode == 6, (
+        f"expected exit 6 (UV_BIN refuse); got {res.returncode}; "
+        f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    )
+    assert "UV_BIN set" in res.stderr
+    assert "refusing stub path" in res.stderr
+
+
+def test_response_file_uses_mktemp_not_pid():
+    """Backport of PR-#156 R2 #4 fold. Response file path must use mktemp
+    (symlink-attack-safe), not the predictable PID-based /tmp/.gecko-*-resp.$$
+    pattern. Source-grep — same shape as cron-drift counterpart.
+    """
+    script_src = WATCHDOG_SCRIPT.read_text()
+    assert "mktemp -t gecko-systemd-drift-resp" in script_src
+    assert "/tmp/.gecko-drift-resp.$$" not in script_src
+
+
+def test_curl_uses_max_time():
+    """Backport of PR-#156 R2 #12 fold. curl must use --max-time to bound
+    the held-lock window (otherwise a Telegram API hang would hold the
+    flock indefinitely and block subsequent timer fires).
+    """
+    script_src = WATCHDOG_SCRIPT.read_text()
+    assert "--max-time 30" in script_src, (
+        "curl invocation must bound execution to prevent stale flock-held alerts"
+    )
+
+
+def test_leading_whitespace_in_env_parsed_correctly(tmp_path):
+    """Backport of PR-#156 .env-tolerance hardening. Lines with leading
+    whitespace before TELEGRAM_BOT_TOKEN= / TELEGRAM_CHAT_ID= must be
+    parsed; previous strict `^TELEGRAM_` regex silently treated indented
+    keys as missing (exit 5 false negative).
+    """
+    repo = _make_fake_repo(tmp_path)
+    prod = _make_fake_prod_systemd(tmp_path)
+    _write_unit(repo / "systemd", "gecko-foo.service", "[Unit]\nDescription=v1\n")
+    _write_unit(prod, "gecko-foo.service", "[Unit]\nDescription=v2\n")
+    env_file = tmp_path / ".env"
+    # Leading whitespace on both keys
+    env_file.write_text(
+        "  TELEGRAM_BOT_TOKEN=8000000000:AAreal_looking_token_format\n"
+        "\tTELEGRAM_CHAT_ID=12345\n"
+    )
+    # curl stub that returns HTTP 200 so we reach the parse-success path
+    stub_dir = tmp_path / "curl-stubs"
+    stub_dir.mkdir()
+    curl_stub = stub_dir / "curl"
+    curl_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "for arg in \"$@\"; do\n"
+        "  if [[ \"$arg\" == -o ]]; then OUT_NEXT=1; continue; fi\n"
+        "  if [[ -n \"${OUT_NEXT:-}\" ]]; then echo '{\"ok\":true}' > \"$arg\"; OUT_NEXT=; fi\n"
+        "done\n"
+        "echo 200\n"
+    )
+    curl_stub.chmod(0o755)
+    ack_dir = tmp_path / "ack"
+    res = subprocess.run(
+        ["bash", str(WATCHDOG_SCRIPT)],
+        env={
+            **os.environ,
+            "PATH": f"{stub_dir}:" + os.environ.get("PATH", ""),
+            "GECKO_REPO": str(repo),
+            "PROD_SYSTEMD_DIR": str(prod),
+            "SYSTEMD_DRIFT_ACK_DIR": str(ack_dir),
+            "SYSTEMD_DRIFT_HEARTBEAT_FILE": str(tmp_path / "heartbeat"),
+            "GECKO_ENV_FILE": str(env_file),
+            "UV_BIN": "",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    # Should reach exit 1 (ALERTED), NOT exit 5 (placeholder/missing token)
+    assert res.returncode == 1, (
+        f"expected exit 1 (ALERTED via curl-stub); got {res.returncode}; "
+        f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    )
+    assert "ALERTED" in res.stdout

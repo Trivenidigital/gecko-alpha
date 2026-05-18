@@ -8,13 +8,25 @@
 # scripts/gecko-backup-watchdog.sh (curl-direct Telegram path; UV_BIN stub
 # testability seam at line 27 there).
 #
+# BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT (cycle 14) — backport of
+# PR-#156 cron-drift-watchdog hardening for parity:
+#  - mktemp response file (R2 #4 — symlink-attack hardening)
+#  - curl --max-time 30 (R2 #12 — bounds held-lock window if Telegram hangs)
+#  - ACK_DIR unwritable → exit 9 (cron-PR review-2 P2 — replaces silent WARN
+#    that would then bash-crash under set -e on `exec 9>"$LOCK_FILE"`)
+#  - UV_BIN refuse-in-prod guard (cron-PR R1 #15 — accidental UV_BIN in
+#    prod env would silently absorb alerts; opt-in via env)
+#  - leading-whitespace tolerance in .env parsing (false-negative exit 5
+#    when an operator indents the keys)
+#
 # Exit codes:
 #   0  CLEAN (no drift; heartbeat-file touched)
 #   1  DRIFT alerted (or silently suppressed via tombstone match)
 #   4  ENV_FILE missing (UV_BIN empty path only)
 #   5  TELEGRAM_BOT_TOKEN / CHAT_ID missing or placeholder
-#   6  no python3 for JSON encoding
+#   6  no python3 for JSON encoding OR UV_BIN set without opt-in
 #   7  Telegram HTTP_STATUS != 200 (ACK NOT written — re-alerts next fire)
+#   9  ACK_DIR cannot be created (state-dir unwritable; cannot operate)
 #
 # V47/V48 design folds applied:
 # - Process substitution `while ... done < <(find ... -print0 | sort -z)`
@@ -46,10 +58,23 @@ DIRB_PATTERNS=(
 
 # --- Bootstrap ----------------------------------------------------------
 
-# V47 SHOULD-FIX — mkdir failure must NOT kill before alert fires. mkdir -p
-# also does NOT chmod existing dirs, so set perm explicitly.
+# BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT (cron-PR R1 #15 fold):
+# refuse stub path in prod. UV_BIN accidentally set in operator env would
+# silently absorb alert delivery, write ACK, never notify Telegram.
+# Tests opt-in via GECKO_WATCHDOG_ALLOW_UV_STUB=1.
+if [[ -n "$UV_BIN" && -z "${GECKO_WATCHDOG_ALLOW_UV_STUB:-}" ]]; then
+    echo "ERROR: UV_BIN set ($UV_BIN) but GECKO_WATCHDOG_ALLOW_UV_STUB not opted-in; refusing stub path to prevent silent alert suppression in prod" >&2
+    exit 6
+fi
+
+# BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT (cron-PR review-2 P2 fold):
+# previously `mkdir -p` failure only warned, but the subsequent
+# `exec 9>"$LOCK_FILE"` would fail abruptly under set -e with a bash error
+# message harder to grep than a controlled exit. Now exit 9 with a clear
+# stderr message.
 if ! mkdir -p "$ACK_DIR" 2>/dev/null; then
-    echo "WARN: failed to mkdir $ACK_DIR; ack-tombstone will be unavailable; alert may re-fire daily" >&2
+    echo "ERROR: failed to mkdir $ACK_DIR; cannot proceed without ack-tombstone state" >&2
+    exit 9
 fi
 chmod 0700 "$ACK_DIR" 2>/dev/null || true
 
@@ -159,8 +184,10 @@ if [[ ! -f "$ENV_FILE" ]]; then
     exit 4
 fi
 
-TELEGRAM_BOT_TOKEN="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
-TELEGRAM_CHAT_ID="$(grep -E '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
+# BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT: tolerate leading whitespace
+# on .env lines (previously a stray indent caused a silent exit-5 false negative).
+TELEGRAM_BOT_TOKEN="$(grep -E '^[[:space:]]*TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | head -1 | sed -E 's/^[[:space:]]*TELEGRAM_BOT_TOKEN=//' | tr -d '"' | tr -d "'")"
+TELEGRAM_CHAT_ID="$(grep -E '^[[:space:]]*TELEGRAM_CHAT_ID=' "$ENV_FILE" | head -1 | sed -E 's/^[[:space:]]*TELEGRAM_CHAT_ID=//' | tr -d '"' | tr -d "'")"
 
 if [[ -z "$TELEGRAM_BOT_TOKEN" || "$TELEGRAM_BOT_TOKEN" == "placeholder" ]]; then
     echo "ERROR: TELEGRAM_BOT_TOKEN missing/placeholder in $ENV_FILE" >&2
@@ -182,7 +209,13 @@ import json, os
 print(json.dumps({"chat_id": os.environ["GECKO_TG_CHAT"], "text": os.environ["GECKO_TG_TEXT"]}))
 ')"
 
-HTTP_STATUS="$(curl -s -o "/tmp/.gecko-drift-resp.$$" -w '%{http_code}' \
+# BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT (R2 #4 + #12):
+# mktemp-based response file (symlink-attack-safe; replaces predictable PID path)
+# + curl --max-time 30 (bounds held-lock window if Telegram hangs).
+RESP_FILE="$(mktemp -t gecko-systemd-drift-resp.XXXXXX)"
+trap 'rm -f "$RESP_FILE"' EXIT
+
+HTTP_STATUS="$(curl -s --max-time 30 -o "$RESP_FILE" -w '%{http_code}' \
     -X POST \
     -H 'Content-Type: application/json' \
     -d "$PAYLOAD" \
@@ -190,15 +223,12 @@ HTTP_STATUS="$(curl -s -o "/tmp/.gecko-drift-resp.$$" -w '%{http_code}' \
 
 if [[ "$HTTP_STATUS" != "200" ]]; then
     echo "ERROR: Telegram delivery failed (HTTP $HTTP_STATUS); ACK_FILE NOT written; next fire will re-alert" >&2
-    if [[ -f "/tmp/.gecko-drift-resp.$$" ]]; then
-        echo "RESPONSE: $(cat /tmp/.gecko-drift-resp.$$ | head -c 500)" >&2
-        rm -f "/tmp/.gecko-drift-resp.$$"
+    if [[ -s "$RESP_FILE" ]]; then
+        echo "RESPONSE: $(cat "$RESP_FILE" | head -c 500)" >&2
     fi
     # V48 MUST-FIX — DO NOT write ACK_FILE on HTTP failure
     exit 7
 fi
-
-rm -f "/tmp/.gecko-drift-resp.$$"
 
 # Alert succeeded — write ack. V48 SHOULD-FIX: warn-but-don't-kill if
 # ack-write fails (e.g. disk full); the alert was delivered, so the
