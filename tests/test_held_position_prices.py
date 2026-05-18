@@ -348,12 +348,27 @@ def test_held_position_settings_default_warn_hours():
 
 def test_held_position_settings_warn_hours_validator():
     from scout.config import Settings
-    with pytest.raises(ValueError, match=">= 1"):
+    # Floor: rejects v < 1
+    with pytest.raises(ValueError, match=r"\[1, 168\]"):
         Settings(
             TELEGRAM_BOT_TOKEN="x",
             TELEGRAM_CHAT_ID="y",
             HELD_POSITION_STALE_WARN_HOURS=0,
         )
+    # PR-#158 R2 IMPORTANT 2 fold: ceiling — rejects v > 168 (silent-suppress prevention)
+    with pytest.raises(ValueError, match=r"\[1, 168\]"):
+        Settings(
+            TELEGRAM_BOT_TOKEN="x",
+            TELEGRAM_CHAT_ID="y",
+            HELD_POSITION_STALE_WARN_HOURS=999,
+        )
+    # Boundary: 168 inside range
+    s = Settings(
+        TELEGRAM_BOT_TOKEN="x",
+        TELEGRAM_CHAT_ID="y",
+        HELD_POSITION_STALE_WARN_HOURS=168,
+    )
+    assert s.HELD_POSITION_STALE_WARN_HOURS == 168
 
 
 @pytest.mark.asyncio
@@ -451,3 +466,163 @@ async def test_stale_count_failure_does_not_block_summary_log(
     summary = [e for e in captured if e.get("event") == "held_position_refresh_summary"]
     assert len(summary) == 1
     assert summary[0]["stale_open_count"] is None
+
+
+# ----------------------------------------------------------------------
+# PR-#158 reviewer-fold tests (R1 C1, R2 IMPORTANT 1, R3 I2)
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_warn_payload_includes_paper_trade_id_symbol_and_consequence(
+    db, settings_factory, patch_module_sleep
+):
+    """PR-#158 R3 I2 fold: WARN must include paper_trade_id + symbol +
+    consequence so operator at 3am knows what is actually broken downstream."""
+    patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
+    await _insert_open_trade(db, "ancient-coin", "AC")
+    from datetime import datetime, timezone, timedelta
+    ancient_iso = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) VALUES (?, ?, ?)",
+        ("ancient-coin", 1.0, ancient_iso),
+    )
+    await db._conn.commit()
+    settings = settings_factory(HELD_POSITION_PRICE_REFRESH_ENABLED=True)
+
+    from structlog.testing import capture_logs
+    with capture_logs() as captured:
+        async with aiohttp.ClientSession() as session:
+            with aioresponses() as m:
+                m.get(SIMPLE_PRICE_PATTERN, payload={"ancient-coin": {"usd": 1.0}})
+                await fetch_held_position_prices(session, settings, db)
+
+    warn_events = [
+        e for e in captured if e.get("event") == "held_position_token_persistently_stale"
+    ]
+    assert len(warn_events) == 1
+    evt = warn_events[0]
+    assert evt["token_id"] == "ancient-coin"
+    assert evt["paper_trade_id"] is not None and isinstance(evt["paper_trade_id"], int)
+    assert evt["symbol"] == "AC"
+    assert evt["consequence"] == "trailing_stop_evaluator_cannot_fire_price_exits"
+
+
+@pytest.mark.asyncio
+async def test_simple_price_missing_ids_surfaced_in_summary(
+    db, settings_factory, patch_module_sleep
+):
+    """PR-#158 R1 C1 fold: surface the specific token_ids /simple/price did
+    not return, so post-deploy data discriminates stale-source vs other
+    hypotheses (truncation, ID-mismatch, transient-failure).
+    """
+    patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
+    await _insert_open_trade(db, "returned-coin", "R1")
+    await _insert_open_trade(db, "missing-coin-a", "MA")
+    await _insert_open_trade(db, "missing-coin-b", "MB")
+    settings = settings_factory(HELD_POSITION_PRICE_REFRESH_ENABLED=True)
+
+    from structlog.testing import capture_logs
+    with capture_logs() as captured:
+        async with aiohttp.ClientSession() as session:
+            with aioresponses() as m:
+                # CG returns only one of the three requested IDs
+                m.get(SIMPLE_PRICE_PATTERN, payload={"returned-coin": {"usd": 1.0}})
+                await fetch_held_position_prices(session, settings, db)
+
+    summary = [e for e in captured if e.get("event") == "held_position_refresh_summary"]
+    assert len(summary) == 1
+    missing = summary[0]["simple_price_missing_ids"]
+    assert sorted(missing) == ["missing-coin-a", "missing-coin-b"]
+    assert summary[0]["not_found_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_warned_today_prunes_entries_older_than_7d(
+    db, settings_factory, patch_module_sleep
+):
+    """PR-#158 R2 IMPORTANT 1 fold: _warned_today must prune entries
+    older than 7d to bound memory growth from closed-position residue.
+    """
+    patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
+    await _insert_open_trade(db, "fresh-token", "FT")
+    settings = settings_factory(HELD_POSITION_PRICE_REFRESH_ENABLED=True)
+
+    import scout.ingestion.held_position_prices as mod
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    # Seed _warned_today with an 8d-old entry for a token NOT in the open cohort
+    mod._warned_today["closed-position-residue"] = now - timedelta(days=8)
+    mod._warned_today["recent-entry"] = now - timedelta(days=2)
+
+    async with aiohttp.ClientSession() as session:
+        with aioresponses() as m:
+            m.get(SIMPLE_PRICE_PATTERN, payload={"fresh-token": {"usd": 1.0}})
+            await fetch_held_position_prices(session, settings, db)
+
+    # 8d entry pruned; 2d entry retained
+    assert "closed-position-residue" not in mod._warned_today
+    assert "recent-entry" in mod._warned_today
+
+
+@pytest.mark.asyncio
+async def test_get_held_trade_metadata_returns_id_and_symbol(db):
+    """PR-#158 R3 I2 fold: helper returns one (paper_trade_id, symbol) per
+    open token_id; tokens with no open trade are absent from result."""
+    from scout.ingestion.held_position_prices import _get_held_trade_metadata
+    await _insert_open_trade(db, "alpha-coin", "ALPHA")
+    await _insert_open_trade(db, "beta-coin", "BETA")
+    meta = await _get_held_trade_metadata(db, ["alpha-coin", "beta-coin", "not-open"])
+    assert "alpha-coin" in meta
+    assert meta["alpha-coin"][1] == "ALPHA"
+    assert isinstance(meta["alpha-coin"][0], int)
+    assert "beta-coin" in meta
+    assert meta["beta-coin"][1] == "BETA"
+    assert "not-open" not in meta
+
+
+@pytest.mark.asyncio
+async def test_get_held_trade_metadata_empty_input(db):
+    from scout.ingestion.held_position_prices import _get_held_trade_metadata
+    assert await _get_held_trade_metadata(db, []) == {}
+
+
+@pytest.mark.asyncio
+async def test_metadata_query_failure_does_not_block_warn(
+    db, settings_factory, patch_module_sleep, monkeypatch
+):
+    """PR-#158 R3 NIT fold: metadata query failure must NOT break the WARN
+    block — pre-fetched as empty dict, downstream uses (None, None) fallback.
+    """
+    patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
+    await _insert_open_trade(db, "ancient-coin", "AC")
+    from datetime import datetime, timezone, timedelta
+    ancient_iso = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) VALUES (?, ?, ?)",
+        ("ancient-coin", 1.0, ancient_iso),
+    )
+    await db._conn.commit()
+
+    import scout.ingestion.held_position_prices as mod
+    async def _broken(*args, **kwargs):
+        raise RuntimeError("simulated metadata DB failure")
+    monkeypatch.setattr(mod, "_get_held_trade_metadata", _broken)
+
+    settings = settings_factory(HELD_POSITION_PRICE_REFRESH_ENABLED=True)
+    from structlog.testing import capture_logs
+    with capture_logs() as captured:
+        async with aiohttp.ClientSession() as session:
+            with aioresponses() as m:
+                m.get(SIMPLE_PRICE_PATTERN, payload={"ancient-coin": {"usd": 1.0}})
+                await fetch_held_position_prices(session, settings, db)
+
+    warn_events = [
+        e for e in captured if e.get("event") == "held_position_token_persistently_stale"
+    ]
+    assert len(warn_events) == 1
+    # Metadata query failed → paper_trade_id + symbol fall back to None
+    assert warn_events[0]["paper_trade_id"] is None
+    assert warn_events[0]["symbol"] is None
+    # consequence still present
+    assert warn_events[0]["consequence"] == "trailing_stop_evaluator_cannot_fire_price_exits"

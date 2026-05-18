@@ -847,8 +847,15 @@ class Settings(BaseSettings):
     @field_validator("HELD_POSITION_STALE_WARN_HOURS")
     @classmethod
     def _validate_held_position_stale_warn_hours(cls, v: int) -> int:
-        if v < 1:
-            raise ValueError(f"HELD_POSITION_STALE_WARN_HOURS must be >= 1; got={v}")
+        # PR-#158 R2 IMPORTANT 2 fold: also reject absurdly large values that
+        # would silently suppress all WARNs on a system the operator believes
+        # is monitored — Class-3-adjacent silent-failure. 168h (1 week) is the
+        # operational ceiling beyond which a stale held position is no longer
+        # actionable (trade has materially aged past expected horizon).
+        if v < 1 or v > 168:
+            raise ValueError(
+                f"HELD_POSITION_STALE_WARN_HOURS must be in [1, 168]; got={v}"
+            )
         return v
 
     @field_validator(

@@ -6,9 +6,13 @@
 
 ## TL;DR
 
-14% silent miss-rate on held-position price refresh confirmed (21/148 open paper_trades with `price_cache` rows > 24h stale). **Root cause empirically confirmed as stale-source behavior**: the 21 stale tokens are CG-lane-EXCLUSIVE (0/21 in gainers_snapshots or trending_snapshots over last 24h despite 4617+645 total entries). The held-position lane IS firing — 127/148 are fresh — but CoinGecko `/simple/price` returns no data for these specific 21 tokens, so their cache rows freeze. Most plausible explanation: tokens delisted from CG free tier OR renamed in CG OR fell out of CG's active set.
+14% silent miss-rate on held-position price refresh confirmed (21/148 open paper_trades with `price_cache` rows > 24h stale). **Root cause is SUSPECTED stale-source behavior** (revised per PR-#158 R1 C1 fold; original "empirically confirmed" framing softened — see "Diagnosis caveat" below). The held-position lane IS firing — 127/148 are fresh — but CoinGecko `/simple/price` returns no data for these specific 21 tokens, so their cache rows freeze. Most plausible explanation: tokens delisted from CG free tier OR renamed in CG OR fell out of CG's active set.
 
-**Ship**: visibility-first (gauge + per-token WARN) so operator confirms the per-token list + decides per-token action. **Defer**: `/coins/{id}` fallback (Task 4 descoped pending empirical verification — CG returned HTTP 429 to direct curl during this audit; can't confirm the fallback would recover any tokens).
+**Diagnosis caveat (R1 C1 fold)**: the lane-exclusivity finding ("0/21 in gainers_snapshots / trending_snapshots") is consistent with stale-source but does NOT empirically rule out other hypotheses, because `gainers_snapshots` only stores top-20 tokens with `price_change_24h ≥ 20%` AND `market_cap < $500M` (filtered cohort) and `trending_snapshots` only ~15 CG-trending tokens per fetch (filtered cohort). A held token whose `/simple/price` returns data perfectly fine but isn't currently pumping or trending would also be absent from those tables. Stronger evidence requires either (a) per-cycle `requested - returned` log diagnostic from `_fetch_simple_price_batch` (NOTE: `not_found_count` field on `held_position_refresh_summary` already provides aggregate count of this, and this PR adds `simple_price_missing_ids` for the per-token list), OR (b) operator manual-curl of the 21 specific token-IDs once CG rate-limit clears. The post-deploy soak plan below executes (a) automatically per cycle.
+
+**Ship**: visibility-first (gauge + per-token WARN + `simple_price_missing_ids` aggregator) so operator confirms the per-token list + decides per-token action. **Defer**: `/coins/{id}` fallback (Task 4 descoped pending empirical verification — CG returned HTTP 429 to direct curl during this audit; can't confirm the fallback would recover any tokens).
+
+**Operator commitment (R1 I4 fold)**: per §12a, this PR ships visibility without an active TG alert; the trade-off is acceptable IF operator runs the post-deploy step-2 grep within 24h of merge. Otherwise the deferred alert (`BL-NEW-HELD-POSITION-STALE-COUNT-ALERT`) becomes a forever-deferred alert and stale tokens silently continue to fail trailing-stop evaluation.
 
 ## Diagnosis evidence
 
@@ -58,14 +62,14 @@
 | CRCLON | circle-internet-group-ondo-tokenized-stock | 32.2 | 2026-05-16T17:44Z |
 | FOLKS | folks | 29.7 | 2026-05-16T20:14Z |
 
-### Critical lane-exclusivity check (R1 #1 fold)
+### Lane-exclusivity check (qualified per PR-#158 R1 C1)
 
 | Stale token | gainers_snapshots last 24h | trending_snapshots last 24h |
 |---|---|---|
 | ALL 21 | **0** | **0** |
 | Other tokens in those tables | 4617 | 645 |
 
-This empirically rules out the alternative "rate-limit-truncation" hypothesis (which would imply OTHER lanes are also missing these tokens for an unrelated reason). The 21 are CG-lane-exclusive AND consistently missing.
+This is **consistent with** (but does not empirically prove) the stale-source hypothesis. `gainers_snapshots` only stores top-20 tokens with `price_change_24h ≥ 20%` AND `market_cap < $500M` (filtered cohort); `trending_snapshots` only ~15 CG-trending per fetch. A held token whose `/simple/price` works fine but isn't currently in those narrow cohorts would also be absent. Empirical validation of the stale-source root cause requires the post-deploy `simple_price_missing_ids` log field (introduced in this PR) OR operator manual-curl of specific token IDs once CG rate-limit clears.
 
 ### Direct CG endpoint test
 
@@ -79,12 +83,13 @@ CG free-tier rate limit blocked direct verification. The `/coins/{id}` fallback 
 
 | Hypothesis | Empirical signal | Verdict |
 |---|---|---|
-| Refresh interval too long | Interval=1 cycle (minimum); 127/148 fresh ≤24h | RULED OUT |
+| Refresh interval too long (aggregate) | Interval=1 cycle (minimum); 127/148 fresh ≤24h | RULED OUT (aggregate) |
+| Refresh interval too long (subset) | _is_cg_coin_id check on all 21 token_ids: all pass (R1 I1 fold) | RULED OUT |
 | LIFO/FIFO ordering starvation | Lane uses `SELECT DISTINCT`; no ordering | RULED OUT |
 | Rate-limiter contention | Would affect ALL tokens equally; 85% fresh | RULED OUT |
 | Token filtering (`_is_cg_coin_id`) | Stale tokens ARE CG-shaped per heuristic | RULED OUT |
-| Failed writes | Would be random across days, not same-21 | RULED OUT |
-| **Stale-source (CG returns empty)** | **0/21 in other CG surfaces; cache_last consistent across days** | **CONFIRMED (most likely)** |
+| Failed writes | Would be random across days, not same-21 | WEAK rule-out (a conditional write-failure path would also produce stable same-set; only the post-deploy `simple_price_missing_ids` log discriminates) |
+| **Stale-source (CG returns empty)** | Cache_last consistent across days; lane-exclusivity (caveated above) | **SUSPECTED (most likely; awaiting post-deploy empirical validation)** |
 
 ## What this PR ships
 
@@ -128,7 +133,7 @@ ssh srilu-vps 'journalctl -u gecko-pipeline --since "24 hours ago" | grep held_p
 
 3. **Verify list overlap** with the 21 known stale tokens above. If overlap > 80%, the diagnosis is confirmed; promote `BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT` to PROPOSED for the next cycle.
 
-4. **Alternate-diagnosis fallback (R1 #11 fold):** if post-soak WARN list shows > 25% turnover (different token_ids than the 21), the stale-source hypothesis is falsified; re-investigate rate-limit-mid-batch via `cg_429_backoff` log counts.
+4. **Alternate-diagnosis fallback (PR-#158 R1 I2 fold)**: rather than a fixed 25% turnover threshold (which conflates portfolio-rotation churn with stale-source turnover), compare the post-deploy 24h WARN list to the original 21 documented above as a sanity check. If overlap is high (e.g., ≥15 of 21), stale-source is consistent. If overlap is low (e.g., <5 of 21), investigate via `cg_429_backoff` log counts AND inspect `simple_price_missing_ids` aggregate counts per cycle.
 
 5. **Once CG rate-limit subsides**, operator manual-curls `/coins/pythia`, `/coins/iagon`, `/coins/kekius-maximus` (3 of the 21) to confirm whether `/coins/{id}` returns data when `/simple/price` doesn't. Result drives the `BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT` decision (ship if recovers, skip if also empty).
 

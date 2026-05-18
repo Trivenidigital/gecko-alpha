@@ -47,7 +47,10 @@ _cycle_counter: int = 0
 # pipeline restart so post-deploy/post-restart re-emits a fresh snapshot
 # (operator wants "what's stale right now," not "what was stale before
 # the last restart that we already alerted on but you forgot about").
+# Pruned to ≥7d-old entries each refresh (R2 IMPORTANT 1 fold) to bound
+# memory growth from stale entries of closed positions.
 _warned_today: dict[str, datetime] = {}
+_WARNED_PRUNE_AGE = timedelta(days=7)
 
 # /simple/price accepts up to ~250 ids per call. Current production cohort
 # is ~150 held positions, well within one batch. If the cohort grows past
@@ -92,6 +95,32 @@ async def _get_held_token_ids(db: "Database") -> list[str]:
     )
     rows = await cursor.fetchall()
     return [r[0] for r in rows if r[0]]
+
+
+async def _get_held_trade_metadata(
+    db: "Database", coin_ids: list[str]
+) -> dict[str, tuple[int, str | None]]:
+    """Return token_id → (paper_trade_id, symbol) for open paper_trades.
+
+    Picks ONE trade per token_id arbitrarily (a token may back multiple
+    concurrent paper_trades; the WARN only needs one identifier to anchor
+    operator navigation). Symbols can be NULL in paper_trades, propagated
+    as None.
+
+    Used by the BL-NEW-HELD-POSITION-REFRESH-RATE-GAP per-token persistent-
+    stale WARN payload (R3 I2 fold).
+    """
+    if db._conn is None or not coin_ids:
+        return {}
+    placeholders = ",".join("?" * len(coin_ids))
+    sql = (
+        f"SELECT token_id, MIN(id), MIN(symbol) FROM paper_trades "
+        f"WHERE status = 'open' AND token_id IN ({placeholders}) "
+        f"GROUP BY token_id"
+    )
+    cur = await db._conn.execute(sql, coin_ids)
+    rows = await cur.fetchall()
+    return {r[0]: (r[1], r[2]) for r in rows if r[0] and r[1] is not None}
 
 
 async def _get_cached_price_ages(
@@ -251,69 +280,110 @@ async def fetch_held_position_prices(
     except Exception:
         logger.exception("held_position_refresh_drift_telemetry_failed")
 
-    # BL-NEW-HELD-POSITION-REFRESH-RATE-GAP (cycle 13): stale-open gauge +
-    # per-token persistent-stale WARN. Both wrap in their own try/except
-    # so a failure here NEVER blocks the existing summary log emission.
-    stale_open_count: int | None = None
-    stale_open_pct: float | None = None
+    # BL-NEW-HELD-POSITION-REFRESH-RATE-GAP (cycle 13): visibility block —
+    # stale-open gauge + per-token persistent-stale WARN. Refactored per
+    # PR-#158 R3-NIT fold: pre-fetch helpers ONCE with explicit `{}` defaults
+    # on failure (eliminates the brittle `locals()` re-fetch); both
+    # downstream sub-blocks become pure consumers wrapped in own try/except.
+    ages_for_held: dict[str, datetime] = {}
+    held_metadata: dict[str, tuple[int, str | None]] = {}
+    ages_query_succeeded = False
     try:
         ages_for_held = await _get_cached_price_ages(db, held_ids)
-        now_utc = datetime.now(timezone.utc)
-        stale_threshold_hours = 24
-        stale_count = 0
-        for tid in held_ids:
-            age = ages_for_held.get(tid)
-            if age is None:
-                stale_count += 1
-                continue
-            if (now_utc - age).total_seconds() / 3600 > stale_threshold_hours:
-                stale_count += 1
-        stale_open_count = stale_count
-        if held_ids:
-            stale_open_pct = round(100.0 * stale_count / len(held_ids), 1)
+        ages_query_succeeded = True
     except Exception:
-        logger.exception("held_position_stale_count_failed")
-
-    # Per-token WARN with 24h dedup. Separate try/except for the same
-    # reason — never block the summary log.
+        logger.exception("held_position_stale_visibility_ages_query_failed")
     try:
-        now_utc = datetime.now(timezone.utc)
-        threshold_hours = settings.HELD_POSITION_STALE_WARN_HOURS
-        dedup_cutoff = now_utc - timedelta(hours=24)
-        # Re-fetch ages if the gauge block failed and ages_for_held is missing
-        if "ages_for_held" not in locals():
-            ages_for_held = await _get_cached_price_ages(db, held_ids)
-        for tid in held_ids:
-            age = ages_for_held.get(tid)
-            if age is None:
-                cache_age_hours: float | None = None
-                is_stale = True
-            else:
-                cache_age_hours = (now_utc - age).total_seconds() / 3600
-                is_stale = cache_age_hours >= threshold_hours
-            if not is_stale:
-                continue
-            last_warn = _warned_today.get(tid)
-            if last_warn is not None and last_warn > dedup_cutoff:
-                continue
-            logger.warning(
-                "held_position_token_persistently_stale",
-                token_id=tid,
-                cache_age_hours=(
-                    round(cache_age_hours, 1) if cache_age_hours is not None else None
-                ),
-                cache_last=age.isoformat() if age is not None else None,
-                warn_threshold_hours=threshold_hours,
-            )
-            _warned_today[tid] = now_utc
+        held_metadata = await _get_held_trade_metadata(db, held_ids)
     except Exception:
-        logger.exception("held_position_persistent_stale_warn_failed")
+        logger.exception("held_position_stale_visibility_metadata_query_failed")
+
+    # PR-#158 R1-C1 fold: surface the specific token_ids `/simple/price`
+    # didn't return so post-deploy data discriminates "stale source" vs
+    # "rate-limit batch truncation" vs "ID-mismatch in CG." Capped at 25
+    # to bound log line size.
+    raw_coin_ids = {c["id"] for c in raw_coins}
+    simple_price_missing_ids: list[str] = [
+        cid for cid in cg_ids if cid not in raw_coin_ids
+    ][:25]
+
+    stale_open_count: int | None = None
+    stale_open_pct: float | None = None
+    # Only emit gauge when we actually have the data — a failed ages query
+    # would otherwise be indistinguishable from "everything stale" (every
+    # held_id missing from the empty fallback dict). False-alarm-safe.
+    if ages_query_succeeded:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            stale_threshold_hours = 24
+            stale_count = 0
+            for tid in held_ids:
+                age = ages_for_held.get(tid)
+                if age is None:
+                    stale_count += 1
+                    continue
+                if (now_utc - age).total_seconds() / 3600 > stale_threshold_hours:
+                    stale_count += 1
+            stale_open_count = stale_count
+            if held_ids:
+                stale_open_pct = round(100.0 * stale_count / len(held_ids), 1)
+        except Exception:
+            logger.exception("held_position_stale_count_failed")
+
+    # Per-token WARN with 24h dedup. R3 I2 fold: include paper_trade_id +
+    # symbol + the load-bearing consequence so an operator reading the
+    # alert at 3am knows what's actually broken downstream (trailing-stop
+    # evaluator can't fire price exits on these positions). R2 IMPORTANT 1
+    # fold: prune dict entries older than 7d to bound memory growth.
+    #
+    # Gated on ages_query_succeeded same as the gauge: if the query failed,
+    # the empty fallback dict would make every token look stale and trigger
+    # one WARN per held position (alert-noise hazard).
+    if ages_query_succeeded:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            threshold_hours = settings.HELD_POSITION_STALE_WARN_HOURS
+            dedup_cutoff = now_utc - timedelta(hours=24)
+            prune_cutoff = now_utc - _WARNED_PRUNE_AGE
+            for stale_tid in list(_warned_today.keys()):
+                if _warned_today[stale_tid] < prune_cutoff:
+                    del _warned_today[stale_tid]
+            for tid in held_ids:
+                age = ages_for_held.get(tid)
+                if age is None:
+                    cache_age_hours: float | None = None
+                    is_stale = True
+                else:
+                    cache_age_hours = (now_utc - age).total_seconds() / 3600
+                    is_stale = cache_age_hours >= threshold_hours
+                if not is_stale:
+                    continue
+                last_warn = _warned_today.get(tid)
+                if last_warn is not None and last_warn > dedup_cutoff:
+                    continue
+                meta = held_metadata.get(tid, (None, None))
+                logger.warning(
+                    "held_position_token_persistently_stale",
+                    token_id=tid,
+                    paper_trade_id=meta[0],
+                    symbol=meta[1],
+                    cache_age_hours=(
+                        round(cache_age_hours, 1) if cache_age_hours is not None else None
+                    ),
+                    cache_last=age.isoformat() if age is not None else None,
+                    warn_threshold_hours=threshold_hours,
+                    consequence="trailing_stop_evaluator_cannot_fire_price_exits",
+                )
+                _warned_today[tid] = now_utc
+        except Exception:
+            logger.exception("held_position_persistent_stale_warn_failed")
 
     logger.info(
         "held_position_refresh_summary",
         refreshed_count=len(raw_coins),
         skipped_contract_addr_count=skipped_contract_addr,
         not_found_count=len(cg_ids) - len(raw_coins),
+        simple_price_missing_ids=simple_price_missing_ids,
         material_drift_count=material_drift_count,
         largest_drift_pct=(
             round(largest_drift_pct, 2) if largest_drift_pct is not None else None
