@@ -8,7 +8,7 @@ Last updated: 2026-05-18 (cycle 14 overnight — PR #158 for BL-NEW-HELD-POSITIO
 - [x] Manual VPS probe after rate-limit window: `pythia` and `iagon` returned HTTP 200 with USD prices; `superwalk` hit HTTP 429.
 - [x] Hermes-first: optional Hermes blockchain skills use CoinGecko-backed price lookup, but no skill replaces gecko-alpha's in-process held-position `price_cache` fallback.
 - [x] Minimal fallback design added to PR #163: `tasks/design_held_position_fallback_coins_endpoint.md`.
-- [x] Backlog status updated to `PR-OPEN / DESIGN-READY`; implementation remains gated on PR #158 post-deploy `simple_price_missing_ids` evidence.
+- [x] Backlog status updated to `DESIGN-READY 2026-05-18 — PR #163 merged 2f8f187`; implementation remains gated on PR #158 post-deploy `simple_price_missing_ids` evidence.
 
 ## Active Work: BL-NEW-HELD-POSITION-REFRESH-RATE-GAP (PR #158)
 
@@ -23,7 +23,7 @@ Last updated: 2026-05-18 (cycle 14 overnight — PR #158 for BL-NEW-HELD-POSITIO
 - [x] 2026-05-18 validation deployment check: VPS `/root/gecko-alpha` is still `master` at `cdeb31f`, so #158 is not deployed; no journal evidence collected and 24h validation remains incomplete.
 - [x] Validation prep doc added via PR #163: `tasks/validation_pr158_held_position_refresh_rate_gap.md` with two-step SSH commands, required journal fields, stale-cohort overlap comparison, and `/coins/{id}` fallback promotion gate.
 - [x] PR #158 created + 3 PR reviewers folded; operator P1/P2 false-positive/tz-normalization fold landed.
-- [ ] Post-merge: bookkeeping flip per cycle-12+13 convention
+- [x] Post-merge: bookkeeping flip per cycle-12+13 convention (`SHIPPED 2026-05-18 — PR #158 merged a649032`)
 
 ## Active Work: BL-NEW-PARSE-MODE-AUDIT-EXTEND-URLLIB-DISPATCH
 
@@ -36,6 +36,7 @@ Last updated: 2026-05-18 (cycle 14 overnight — PR #158 for BL-NEW-HELD-POSITIO
 - [x] Extend AST scanner to resolve urllib `Request` + `urlopen` dispatch payloads and enforce plain-text/no `parse_mode`.
 - [x] Verify parse-mode and config-alert targeted tests.
 - [x] Update backlog/memory review notes, commit, push, and create stacked PR: #162 (`https://github.com/Trivenidigital/gecko-alpha/pull/162`).
+- [x] Post-merge: PR #162 squash-merged to master at `54da462` on 2026-05-18; backlog status flipped to `SHIPPED`.
 
 Review:
 - TDD red: `test_config_alert_urllib_dispatch_is_structurally_audited_as_plain_text` first failed because `_find_urllib_telegram_dispatches` did not exist, then failed with `len(dispatches) == 0` until module-level constants were added to the resolver.
@@ -43,7 +44,7 @@ Review:
 - Verification: `python -m pytest tests/test_parse_mode_hygiene.py tests/test_config_alert.py -q` -> `34 passed, 3 warnings`.
 - `git diff --check` clean. `python -m black tests/test_parse_mode_hygiene.py --check` could not run because this Python environment does not have `black` installed.
 
-## Active Work: BL-NEW-SETTINGS-VALIDATION-ALERT (PR TBD)
+## Active Work: BL-NEW-SETTINGS-VALIDATION-ALERT (PR #160)
 
 - [x] Isolated worktree: `.claude/worktrees/feat-settings-validation-alert`
 - [x] Drift-check + Hermes-first (Hermes has no python-stdlib Telegram-push primitive; in-tree curl-direct pattern)
@@ -51,8 +52,8 @@ Review:
 - [x] TDD: 18 tests RED (ModuleNotFoundError) → implement `scout/config_alert.py` + wire `scout/config.py:load_settings()` → 18/18 GREEN on srilu Python 3.12.3
 - [x] Existing `tests/test_config.py` regression-free (75/77 pass; 2 fails are pre-existing `test_coingecko_config_defaults` — verified on origin/master)
 - [x] `backlog.md` PROPOSED → PR-OPEN
-- [ ] PR creation + 3 PR reviewers
-- [ ] Post-merge: bookkeeping flip
+- [x] PR #160 created + reviewers folded; squash-merged to master at `788059a` on 2026-05-18
+- [x] Post-merge: bookkeeping flip (`SHIPPED 2026-05-18 — PR #160 merged 788059a`)
 
 ## Active Work: BL-NEW-CRON-DRIFT-WATCHDOG-ENV-WHITESPACE-TOLERANCE
 
@@ -65,6 +66,7 @@ Review:
 - [x] Implement minimal parsing parity with PR #159's systemd watchdog.
 - [x] Verify targeted tests and source-level parse-mode guard.
 - [x] Update backlog/memory review notes, commit, push, and create stacked PR: #161 (`https://github.com/Trivenidigital/gecko-alpha/pull/161`).
+- [x] Post-merge: PR #161 squash-merged to master at `01efcbd` on 2026-05-18; backlog status flipped to `SHIPPED`.
 
 Review:
 - TDD red evidence: Git Bash stub run with indented `TELEGRAM_*` keys exited before curl (`rc=1`, empty stderr/stdout) under the strict parser.
@@ -88,7 +90,7 @@ Review:
 - [x] Reviewer-2 PR-review fold: ACK_DIR mkdir failure now exits 9 with clear message (vs prior warn-then-fail-cryptically); test_ack_dir_unwritable_exits_9 added; 20/20 tests pass on srilu
 - [x] Reviewer-2 PR-review fold: scope trim — BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT now systemd-only (cron-watchdog ships ACK_DIR-exit-9 fix)
 - [x] Reviewer-3 PR-review fold: backlog wording corrected — "SCRIPT-SHIPPED" was premature pre-merge; renamed pre-merge state to "PR-OPEN / SCRIPT-READY / SCHEDULING-PENDING-OPERATOR"; post-merge action text updated with 3-stage convention (PR merge → SCRIPT-SHIPPED with SHA → operator scheduling → SHIPPED/SCHEDULED)
-- [ ] Post-merge stage 1 (bookkeeping): flip PR-OPEN/SCRIPT-READY → SCRIPT-SHIPPED + merge SHA
+- [x] Post-merge stage 1 (bookkeeping): flipped PR-OPEN/SCRIPT-READY → SCRIPT-SHIPPED with PR #156 merge SHA `7f9aee6`
 - [ ] Post-merge stage 2 (operator scheduling, separate): operator adds cron line via cron/README §Setup; then flip → SHIPPED/SCHEDULED
 
 ## Active Work: BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT
