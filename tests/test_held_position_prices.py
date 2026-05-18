@@ -375,6 +375,11 @@ def test_held_position_settings_warn_hours_validator():
 async def test_stale_open_count_gauge_in_summary_log(
     db, settings_factory, patch_module_sleep
 ):
+    """P1-fold (operator 2026-05-18): tokens stale-before-cycle that
+    `/simple/price` does NOT return remain stale post-write; tokens stale
+    before but returned this cycle are about to be refreshed by main.py's
+    cache_prices(all_raw) write — must NOT count toward stale_open_count.
+    """
     patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
     await _insert_open_trade(db, "fresh-1", "F1")
     await _insert_open_trade(db, "fresh-2", "F2")
@@ -403,14 +408,16 @@ async def test_stale_open_count_gauge_in_summary_log(
     with capture_logs() as captured:
         async with aiohttp.ClientSession() as session:
             with aioresponses() as m:
+                # Only fresh-1 and fresh-2 are returned. stale-1 + no-cache-1
+                # are absent — they REMAIN stale post-write (correct false-positive-free
+                # gauge behavior).
                 m.get(SIMPLE_PRICE_PATTERN,
-                      payload={"fresh-1": {"usd": 1.0}, "fresh-2": {"usd": 1.0},
-                               "stale-1": {"usd": 1.0}, "no-cache-1": {"usd": 1.0}})
+                      payload={"fresh-1": {"usd": 1.0}, "fresh-2": {"usd": 1.0}})
                 await fetch_held_position_prices(session, settings, db)
 
     summary = [e for e in captured if e.get("event") == "held_position_refresh_summary"]
     assert len(summary) == 1
-    assert summary[0]["stale_open_count"] == 2
+    assert summary[0]["stale_open_count"] == 2  # stale-1 + no-cache-1
     assert summary[0]["stale_open_pct"] == 50.0
 
 
@@ -418,6 +425,10 @@ async def test_stale_open_count_gauge_in_summary_log(
 async def test_persistently_stale_token_emits_warn_once_per_day(
     db, settings_factory, patch_module_sleep
 ):
+    """P1-fold (operator 2026-05-18): WARN must NOT fire for a stale token
+    that `/simple/price` is about to refresh this cycle. Use a payload
+    that omits the token so it remains stale post-write.
+    """
     patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
     await _insert_open_trade(db, "ancient-coin", "AC")
     from datetime import datetime, timezone, timedelta
@@ -433,7 +444,9 @@ async def test_persistently_stale_token_emits_warn_once_per_day(
     with capture_logs() as captured:
         async with aiohttp.ClientSession() as session:
             with aioresponses() as m:
-                m.get(SIMPLE_PRICE_PATTERN, payload={"ancient-coin": {"usd": 1.0}}, repeat=True)
+                # CG returns EMPTY — ancient-coin remains stale post-write,
+                # so the WARN correctly fires.
+                m.get(SIMPLE_PRICE_PATTERN, payload={}, repeat=True)
                 await fetch_held_position_prices(session, settings, db)
                 await fetch_held_position_prices(session, settings, db)
 
@@ -494,7 +507,10 @@ async def test_warn_payload_includes_paper_trade_id_symbol_and_consequence(
     with capture_logs() as captured:
         async with aiohttp.ClientSession() as session:
             with aioresponses() as m:
-                m.get(SIMPLE_PRICE_PATTERN, payload={"ancient-coin": {"usd": 1.0}})
+                # P1 fold: must NOT include ancient-coin in /simple/price
+                # response; otherwise the WARN would be a false positive
+                # (cache will be fresh post-cache_prices write).
+                m.get(SIMPLE_PRICE_PATTERN, payload={})
                 await fetch_held_position_prices(session, settings, db)
 
     warn_events = [
@@ -614,7 +630,9 @@ async def test_metadata_query_failure_does_not_block_warn(
     with capture_logs() as captured:
         async with aiohttp.ClientSession() as session:
             with aioresponses() as m:
-                m.get(SIMPLE_PRICE_PATTERN, payload={"ancient-coin": {"usd": 1.0}})
+                # P1 fold: omit ancient-coin so it remains stale post-write
+                # (otherwise WARN would be a false positive).
+                m.get(SIMPLE_PRICE_PATTERN, payload={})
                 await fetch_held_position_prices(session, settings, db)
 
     warn_events = [
@@ -626,3 +644,123 @@ async def test_metadata_query_failure_does_not_block_warn(
     assert warn_events[0]["symbol"] is None
     # consequence still present
     assert warn_events[0]["consequence"] == "trailing_stop_evaluator_cannot_fire_price_exits"
+
+
+# ----------------------------------------------------------------------
+# Operator-flagged fold (2026-05-18): stale-before-cache-write false positives
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stale_before_refresh_but_returned_by_simple_price_does_NOT_warn(
+    db, settings_factory, patch_module_sleep
+):
+    """Operator-flagged P1 (2026-05-18): a token that was stale BEFORE this
+    cycle but `/simple/price` returned data for THIS cycle will be cache-
+    fresh after main.py's `db.cache_prices(all_raw)` write. The visibility
+    block must NOT count it toward stale_open_count nor fire the WARN —
+    doing so would be a false positive because the consequence
+    (`trailing_stop_evaluator_cannot_fire_price_exits`) does not hold.
+    """
+    patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
+    await _insert_open_trade(db, "will-be-refreshed", "REF")
+    from datetime import datetime, timezone, timedelta
+    ancient_iso = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) VALUES (?, ?, ?)",
+        ("will-be-refreshed", 1.0, ancient_iso),
+    )
+    await db._conn.commit()
+    settings = settings_factory(HELD_POSITION_PRICE_REFRESH_ENABLED=True)
+
+    from structlog.testing import capture_logs
+    with capture_logs() as captured:
+        async with aiohttp.ClientSession() as session:
+            with aioresponses() as m:
+                # CG DOES return data for the stale token — it's about to be refreshed.
+                m.get(
+                    SIMPLE_PRICE_PATTERN,
+                    payload={"will-be-refreshed": {"usd": 2.0}},
+                )
+                await fetch_held_position_prices(session, settings, db)
+
+    # No WARN — the token is being refreshed this cycle.
+    warn_events = [
+        e for e in captured if e.get("event") == "held_position_token_persistently_stale"
+    ]
+    assert warn_events == [], (
+        "Stale token returned by /simple/price this cycle must NOT warn (false positive)"
+    )
+    # Gauge count is 0 — the only held token is being refreshed.
+    summary = [e for e in captured if e.get("event") == "held_position_refresh_summary"]
+    assert len(summary) == 1
+    assert summary[0]["stale_open_count"] == 0
+    assert summary[0]["stale_open_pct"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_stale_before_refresh_and_missing_from_simple_price_warns(
+    db, settings_factory, patch_module_sleep
+):
+    """Operator-flagged P1 (2026-05-18): a token that was stale BEFORE this
+    cycle AND is absent from `/simple/price` response IS still stale post-write.
+    WARN must fire and gauge must count it. This is the TRUE positive case.
+    """
+    patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
+    await _insert_open_trade(db, "still-stale", "SS")
+    from datetime import datetime, timezone, timedelta
+    ancient_iso = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) VALUES (?, ?, ?)",
+        ("still-stale", 1.0, ancient_iso),
+    )
+    await db._conn.commit()
+    settings = settings_factory(HELD_POSITION_PRICE_REFRESH_ENABLED=True)
+
+    from structlog.testing import capture_logs
+    with capture_logs() as captured:
+        async with aiohttp.ClientSession() as session:
+            with aioresponses() as m:
+                # CG does NOT return — token remains stale post-write.
+                m.get(SIMPLE_PRICE_PATTERN, payload={})
+                await fetch_held_position_prices(session, settings, db)
+
+    warn_events = [
+        e for e in captured if e.get("event") == "held_position_token_persistently_stale"
+    ]
+    assert len(warn_events) == 1
+    assert warn_events[0]["token_id"] == "still-stale"
+    summary = [e for e in captured if e.get("event") == "held_position_refresh_summary"]
+    assert summary[0]["stale_open_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_cached_price_ages_normalizes_naive_isoformat_to_utc(db):
+    """Operator-flagged P2 (2026-05-18): SQLite-style `datetime('now')`
+    produces an ISO string with NO timezone offset. `datetime.fromisoformat`
+    on such a value returns a naive datetime. Subtracting naive from
+    tz-aware `datetime.now(timezone.utc)` raises TypeError, which the
+    outer try/except would silently swallow → stale_open_count=None.
+
+    Helper must mirror evaluator.py:74-77 — attach UTC when tzinfo missing.
+    """
+    from scout.ingestion.held_position_prices import _get_cached_price_ages
+    from datetime import datetime, timezone
+    # SQLite-style naive ISO (no offset)
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) VALUES (?, ?, ?)",
+        ("naive-coin", 1.0, "2026-05-18 10:00:00"),
+    )
+    # Python-style aware ISO (+00:00 suffix)
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) VALUES (?, ?, ?)",
+        ("aware-coin", 1.0, "2026-05-18T10:00:00+00:00"),
+    )
+    await db._conn.commit()
+    ages = await _get_cached_price_ages(db, ["naive-coin", "aware-coin"])
+    assert ages["naive-coin"].tzinfo is not None
+    assert ages["aware-coin"].tzinfo is not None
+    # Both must be subtractable from a tz-aware now without raising.
+    now = datetime.now(timezone.utc)
+    _ = (now - ages["naive-coin"]).total_seconds()
+    _ = (now - ages["aware-coin"]).total_seconds()
