@@ -194,8 +194,16 @@ if [[ ! -f "$ENV_FILE" ]]; then
     exit 4
 fi
 
-TELEGRAM_BOT_TOKEN="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
-TELEGRAM_CHAT_ID="$(grep -E '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")"
+# BL-NEW-CRON-DRIFT-WATCHDOG-ENV-WHITESPACE-TOLERANCE: match
+# systemd-drift-watchdog's PR #159 parsing tolerance. Operators sometimes
+# indent .env keys; leading whitespace should not false-fail before alerting.
+read_env_value() {
+    local key="$1"
+    sed -n -E "/^[[:space:]]*${key}=/{s/^[[:space:]]*${key}=//; p; q;}" "$ENV_FILE" | tr -d '"' | tr -d "'"
+}
+
+TELEGRAM_BOT_TOKEN="$(read_env_value TELEGRAM_BOT_TOKEN)"
+TELEGRAM_CHAT_ID="$(read_env_value TELEGRAM_CHAT_ID)"
 
 if [[ -z "$TELEGRAM_BOT_TOKEN" || "$TELEGRAM_BOT_TOKEN" == "placeholder" ]]; then
     echo "ERROR: TELEGRAM_BOT_TOKEN missing/placeholder in $ENV_FILE" >&2

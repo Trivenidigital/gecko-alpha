@@ -1556,7 +1556,7 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **Status:** SHIPPED-WITH-FINDINGS 2026-05-17 — branch `feat/other-prod-config-audit` (cycle 11). Findings doc: `tasks/findings_other_prod_config_audit_2026_05_17.md`. Of 17 categories swept, only 1 gap (gecko cron entries repo-untracked at schedule level) — closed via new `cron/` directory (sentinel-bracketed managed block + idempotent `cron/deploy.sh` per V54 fold). Apache "Possible Gap" withdrawn after drill (not installed). VPS multi-tenant inventory documented (gecko-alpha + polymarket-ml-signal + btc15minutebot + shift-agent). 4 follow-ups filed (cron drift watchdog, cron-to-timer decision, drift-watchdog archive, firewall decision 2026-06-14, polymarket-verify); 1 withdrawn (Apache). Memory checkpoint: `project_prod_config_audit_2026_05_17.md`.
 
 ### BL-NEW-CRON-DRIFT-WATCHDOG: bash watchdog for crontab drift (cycle 11 follow-up)
-**Status:** PR-OPEN / SCRIPT-READY / SCHEDULING-PENDING-OPERATOR 2026-05-18 — PR #156. **`scripts/cron-drift-watchdog.sh` script ready (not yet merged); the cron schedule entry is NOT added to `cron/gecko-alpha.crontab` in this PR** (per "do not change live config without explicit operator approval" — adding to the managed-block fragment would auto-fire daily after the next `bash cron/deploy.sh`). Operator chooses when to schedule per `cron/README.md` §"Setup (one-time, opt-in to scheduled firing)". Runtime protection is GATED on (a) PR merge AND (b) operator scheduling action. Script verified via prod-crontab dry-run CLEAN + 20/20 tests on srilu. 2-reviewer plan-fold + 3-reviewer PR-fold + 1-reviewer post-review fold complete. Filed 2 follow-ups (HEARTBEAT-MONITOR + WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT scoped to systemd-watchdog only, since cron-watchdog already has the mktemp + max-time + ACK_DIR-exit-9 fixes).
+**Status:** PR-OPEN / SCRIPT-READY / SCHEDULING-PENDING-OPERATOR 2026-05-18 — PR #156. **`scripts/cron-drift-watchdog.sh` script ready (not yet merged); the cron schedule entry is NOT added to `cron/gecko-alpha.crontab` in this PR** (per "do not change live config without explicit operator approval" — adding to the managed-block fragment would auto-fire daily after the next `bash cron/deploy.sh`). Operator chooses when to schedule per `cron/README.md` §"Setup (one-time, opt-in to scheduled firing)". Runtime protection is GATED on (a) PR merge AND (b) operator scheduling action. Script verified via prod-crontab dry-run CLEAN + 20/20 tests on srilu. 2-reviewer plan-fold + 3-reviewer PR-fold + 1-reviewer post-review fold complete. Filed 3 follow-ups (HEARTBEAT-MONITOR + WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT scoped to systemd-watchdog only, since cron-watchdog already has the mktemp + max-time + ACK_DIR-exit-9 fixes + ENV-WHITESPACE-TOLERANCE parity with PR #159's systemd-watchdog follow-up).
 
 **Original status (now historical):** PROPOSED 2026-05-17 — cycle 11 follow-up to BL-NEW-OTHER-PROD-CONFIG-AUDIT.
 
@@ -1568,6 +1568,22 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **Why:** `scripts/cron-drift-watchdog.sh` writes `/var/lib/gecko-alpha/cron-drift-watchdog/heartbeat` on CLEAN runs but no separate monitor checks the heartbeat's freshness. If the watchdog itself stops running (cron line removed, script broken, etc.), the operator has no signal.
 **Action:** ~1h. Extend existing `scripts/gecko-backup-watchdog.sh` (or create `scripts/cron-drift-stale-heartbeat-watchdog.sh` modeled on it) to alert when the cron-drift-watchdog heartbeat is older than N hours (default 25h to cover a daily cron firing 1-hour-late). Add to cron managed block in `cron/gecko-alpha.crontab`. Until shipped, operator runs the one-liner in `cron/README.md` §"Heartbeat freshness check".
 **Decision-by:** 2026-06-15 (4 weeks from PR #156 merge).
+
+### BL-NEW-CRON-DRIFT-WATCHDOG-ENV-WHITESPACE-TOLERANCE: tolerate indented Telegram keys in cron-drift-watchdog `.env`
+**Status:** PR-OPEN 2026-05-18 — PR #161, stacked on PR #156 (`feat/cron-drift-watchdog`) because `scripts/cron-drift-watchdog.sh` is not yet on `master`.
+**Tag:** `watchdog` `env-parsing` `parity-hardening`
+**Drift-check:** no existing BL entry or implementation matched this exact parity gap. PR #159's `scripts/systemd-drift-watchdog.sh` tolerates leading whitespace in `.env` credential lines via `^[[:space:]]*TELEGRAM_*=`; PR #156's `scripts/cron-drift-watchdog.sh` still uses strict `^TELEGRAM_*=` and can fail before alert delivery if an operator indents the key.
+**Hermes-first analysis:**
+
+| Domain | Hermes skill found? | Decision |
+|---|---|---|
+| Scheduled watchdog execution | yes — Hermes Cron / no-agent script jobs (`https://hermes-agent.nousresearch.com/docs/user-guide/features/cron/`) | not a replacement; scheduling primitive does not patch gecko-alpha's in-repo watchdog parser |
+| Polling/watchers | yes — devops/watchers (`https://hermes-agent.nousresearch.com/docs/user-guide/skills/optional/devops/devops-watchers`) | not applicable; covers RSS/JSON/GitHub watermark polling, not local crontab drift or `.env` credential extraction |
+| Crontab drift + Telegram credential parsing | none found | build the 2-line in-tree parity fix with regression coverage |
+
+awesome-hermes-agent ecosystem check: reviewed `https://github.com/0xNyk/awesome-hermes-agent`; no listed skill/plugin replaces gecko-alpha's local crontab diff watchdog or its `.env` parsing. Verdict: custom fix is justified and minimal.
+**Why:** This is the cron-side sibling of PR #159's systemd-watchdog false-negative fix. A stray indent before `TELEGRAM_BOT_TOKEN=` or `TELEGRAM_CHAT_ID=` should not suppress alert delivery.
+**Action:** replace strict `grep -E '^TELEGRAM_*=' ... cut -d= -f2-` parsing with a small `sed` extractor that tolerates leading whitespace and does not trip `set -euo pipefail` before the documented exit-5 branch. Add prod-path tests with a curl stub proving indented keys deliver and missing keys exit 5.
 
 ### BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT: backport mktemp + curl --max-time + ACK_DIR-exit fixes to systemd-watchdog
 **Status:** PROPOSED 2026-05-18 — PR-stage R2 #4 + #12 + #16 fold from BL-NEW-CRON-DRIFT-WATCHDOG (PR #156). Re-scoped post-PR-review-2 P2: cron-watchdog already shipped the ACK_DIR-exit-9 fix; backport applies only to systemd-watchdog now.
