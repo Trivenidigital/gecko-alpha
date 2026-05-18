@@ -893,10 +893,10 @@ ssh root@89.167.116.187 "journalctl -u gecko-pipeline --since '<post-merge times
 **Drift verdict:** existing primitive `_fetch_coingecko_lanes` modified in place; no new primitives introduced.
 
 ### BL-NEW-CG-FREE-TIER-DEMO-API-KEY: register and configure CoinGecko Demo API key to lift IP-rate-limit ceiling
-**Status:** PROPOSED 2026-05-18 — direct follow-up to BL-NEW-CG-LANE-ORDER-HELD-POSITION-FIRST partial-effectiveness.
-**Tag:** `coingecko-budget` `rate-limit` `evidence-gated` `small-fix` `config-only`
+**Status:** RUNBOOK-READY 2026-05-18 — runbook at `tasks/runbook_cg_demo_api_key_2026_05_18.md` covers pre-flight baseline / register / `.env` edit / restart / rollback / 2h validation. Direct follow-up to BL-NEW-CG-LANE-ORDER-HELD-POSITION-FIRST partial-effectiveness.
+**Tag:** `coingecko-budget` `rate-limit` `evidence-gated` `small-fix` `config-only` `operator-gated`
 **Why:** Post-#170 deploy evidence shows lane reorder lifts held_position success rate from ~10% to ~55%, but 5/11 cycles in the 30min sample still hit `coingecko_lanes_stopped_for_backoff after="held_position_prices"`. The binding constraint is CG's IP-rate-limit ceiling, not local lane ordering. PR #129's deploy notes already flagged Demo API key as the next escalation after conservative tuning if throttles persist.
-**Action:** ~30min, operator-only. Register a Demo API key at `coingecko.com/en/api`, set `COINGECKO_API_KEY=<key>` in srilu `.env`, restart pipeline. Code already threads the key via `params["x_cg_demo_api_key"]` in `fetch_top_movers`, `fetch_trending`, `fetch_by_volume`, `fetch_midcap_gainers`, and `_fetch_simple_price_batch` — no in-tree change needed.
+**Action:** ~30min, operator-only. See `tasks/runbook_cg_demo_api_key_2026_05_18.md` for exact steps. Code already threads the key via `params["x_cg_demo_api_key"]` in 5 ingestion sites (coingecko.py + held_position_prices.py) plus the HTTP-header form `x-cg-demo-api-key` in secondwave/detector.py and indirect threading in narrative/agent.py, briefing/collector.py, minara_alert.py, trending/tracker.py — 16 call sites across 8 modules. No in-tree change needed.
 **Validation gate:** post-deploy 2h window must show `cg_429_backoff` count drops materially (target: ≥50% reduction) AND `held_position_refresh_summary.refreshed_count > 0` for ≥10 consecutive cycles without intermittent failure-windows.
 **Hermes-first:** N/A — operator credential registration. The optional Hermes blockchain skills reference CoinGecko for pricing but don't supply a key.
 **Drift-check:** API-key param path already exists in code (`scout/ingestion/coingecko.py:99,191,228,319,441` + `scout/ingestion/held_position_prices.py:182-183`). Config-only enablement.
