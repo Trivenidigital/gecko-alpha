@@ -65,6 +65,27 @@ def test_builtin_patterns_count_and_fields():
         assert p.steps[0].max_hours_after_anchor == 0.0
 
 
+def test_builtin_patterns_alert_priority_post_observability_revert():
+    """Post-2026-05-17 closure of BL-NEW-CHAIN-COHERENCE observability bump.
+
+    full_conviction + narrative_momentum were bumped low→medium 2026-05-06 for
+    first-fire visibility after the per-laggard fix. After PR #146 restored the
+    chain anchor pipeline + 201/210 lifetime matches + 12 chain_completed paper
+    trades in 14d (+$1,034 net) confirmed firing, both reverted to "low" to
+    match prod DB state (which already held "low" via PR #146 snapshot restore).
+
+    If a future PR re-introduces the bump, update this test alongside the
+    reasoning comment in chains/patterns.py so the closure decision stays
+    legible.
+    """
+    priorities = {p.name: p.alert_priority for p in BUILT_IN_PATTERNS}
+    assert priorities == {
+        "full_conviction": "low",
+        "narrative_momentum": "low",
+        "volume_breakout": "low",
+    }
+
+
 async def test_seed_built_in_patterns_idempotent(db):
     await seed_built_in_patterns(db)
     await seed_built_in_patterns(db)
