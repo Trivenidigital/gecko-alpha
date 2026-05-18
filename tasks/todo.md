@@ -7,6 +7,18 @@ Last updated: 2026-05-18 (overnight audit closures + cycle 14 held-position refr
 - [x] **Item 1: BL-NEW-AUDIT-SURFACE-ADDENDUM**: 5-category mini-sweep clean (nginx/caddy not-found, /etc/systemd/system.conf only [Manager], /etc/apt/sources.list.d/ minimal, docker/containerd not-found, systemd inventory matches cycle-6 captures). Status PROPOSED → AUDITED 2026-05-18. Findings: `tasks/findings_audit_surface_addendum_2026_05_18.md`.
 - [x] **Item 2: BL-NEW-POLYMARKET-VERIFY**: `/opt/polymarket-ml-signal/` does NOT exist; stale cron entry confirmed (outside gecko-alpha managed block, silently failing every 6h). Status PROPOSED → AUDITED 2026-05-18. Findings: `tasks/findings_polymarket_verify_2026_05_18.md`. Operator-pastable removal command embedded.
 
+## Active Work: items 4 + 5 (PR #157) — BL-NEW-SETTINGS-IMMUTABILITY + BL-NEW-DEX-PRICE-COVERAGE audit findings
+
+- [x] Isolated worktree
+- [x] Drift-check + Hermes-first
+- [x] Cross-tree mutation-site grep: 1 production (main.py:1534 CLI override) + ~10 test + 1 monkeypatch + ~25 Settings(**defaults) constructors
+- [x] Classification: 0 unsafe mutations of validator-relevant fields
+- [x] Recommendation: do NOT implement frozen=True (cost > benefit; hypothetical-only protection)
+- [x] DEX coverage audit: pure-DEX/contract-address held cohort remains empty; refresh-rate gap follow-up is superseded by shipped PR #158.
+- [x] Findings docs + backlog flip + follow-up filing
+- [x] PR #157 opened
+- [ ] Post-merge bookkeeping
+
 ## Active Work: BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT
 
 - [x] Evidence gate respected: no implementation started before manual `/coins/{id}` probe.
