@@ -1,6 +1,17 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-17 (BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT findings shipped; BL-NEW-LC-REVIVAL-CRITERIA-TIGHTENING PR #150 merged at a20891f)
+Last updated: 2026-05-18 (cycle 14 overnight — PR TBD BL-NEW-SETTINGS-VALIDATION-ALERT alongside PRs #158/#159)
+
+## Active Work: BL-NEW-SETTINGS-VALIDATION-ALERT (PR TBD)
+
+- [x] Isolated worktree: `.claude/worktrees/feat-settings-validation-alert`
+- [x] Drift-check + Hermes-first (Hermes has no python-stdlib Telegram-push primitive; in-tree curl-direct pattern)
+- [x] Plan + 2-reviewer fold (R1 timeout-3s + os.environ caveat; R2 CRITICAL mock-target specification + hashlib scope + 4 coverage adds + autouse fixture)
+- [x] TDD: 18 tests RED (ModuleNotFoundError) → implement `scout/config_alert.py` + wire `scout/config.py:load_settings()` → 18/18 GREEN on srilu Python 3.12.3
+- [x] Existing `tests/test_config.py` regression-free (75/77 pass; 2 fails are pre-existing `test_coingecko_config_defaults` — verified on origin/master)
+- [x] `backlog.md` PROPOSED → PR-OPEN
+- [ ] PR creation + 3 PR reviewers
+- [ ] Post-merge: bookkeeping flip
 
 ## Active Work: BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT
 

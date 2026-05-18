@@ -1512,10 +1512,10 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **Original status (now historical):** PROPOSED 2026-05-16 — residual from `feat/score-volume-pruning-harden` PR's §7a partial-match reframe.
 
 ### BL-NEW-SETTINGS-VALIDATION-ALERT: curl-direct Telegram on settings_validation_failed
-**Status:** PROPOSED 2026-05-16 — V4#1 review deferred from `feat/score-volume-pruning-harden` PR.
-**Why:** `load_settings()` in `scout/config.py` emits structured `logger.error("settings_validation_failed", ...)` before re-raising ValidationError. systemd `Restart=always`+`RestartSec=10` (verified on srilu) means a bad `.env` triggers a 10s crash-loop visible in journalctl but with no active Telegram push. Curl-direct push (mirroring `gecko-backup-watchdog` from memory `project_vps_backup_rotation_2026_05_09.md`) requires first-time-only file marker + dedup to avoid 360 msg/hr storm.
-**Action:** `.startup_alert_sent` file marker + curl-direct send in `load_settings()` exception path, marker deleted on successful load. Tests cover first-fail-only behavior.
-**decision-by:** 4 weeks.
+**Status:** PR-OPEN 2026-05-18 — PR (TBD). New `scout/config_alert.py` module wired into `scout/config.py:load_settings()`. urllib.request (stdlib only) curl-direct alert; SHA256 content-hash dedup via state file `/var/lib/gecko-alpha/settings-validation-watchdog/last_alerted_hash`; 3s timeout (avoids doubling systemd crash-loop period); plain text / no parse_mode (§12b). 18/18 tests pass on srilu Python 3.12.3.
+**Original status (now historical):** PROPOSED 2026-05-16 — V4#1 review deferred from `feat/score-volume-pruning-harden` PR.
+**Why:** `load_settings()` in `scout/config.py` emits structured `logger.error("settings_validation_failed", ...)` before re-raising ValidationError. systemd `Restart=always`+`RestartSec=10` (verified on srilu) means a bad `.env` triggers a 10s crash-loop visible in journalctl but with no active Telegram push. Curl-direct push (mirroring `gecko-backup-watchdog` from memory `project_vps_backup_rotation_2026_05_09.md`) requires content-hash dedup to avoid 360 msg/hr storm.
+**Post-merge action (operator):** flip status to `SHIPPED <merge-date> — merged <sha>`. Update PR number from "TBD" to actual after `gh pr create`.
 
 ### BL-NEW-SCORE-VOLUME-PRUNE-ALERT: §12b active alert on score/volume prune failure
 **Status:** PROPOSED 2026-05-16 — V4#6 review deferred from `feat/score-volume-pruning-harden` PR.
