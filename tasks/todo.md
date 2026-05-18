@@ -6,7 +6,7 @@ Last updated: 2026-05-18 (cycle 14: Helius + Moralis plan audits + CG budget att
 
 - [x] Drift-check: `scout/ingestion/holder_enricher.py:32-68` (Solana branch + `_enrich_solana` JSON-RPC `getTokenAccounts`) + `scout/config.py:129` + per-cycle fan-out at `main.py:944-948`. No throttle/cache/interval primitives.
 - [x] Runtime-state verification (srilu-vps): `HELIUS_API_KEY=` empty; 0 Helius log hits in 24h; `holder_snapshots` table = 0 rows total.
-- [x] Cohort calibration (24h DB): 177 Solana candidates; 7d = 621. If-enabled projection at today's 12 cycles/hr × audit's 121 solana/cycle figure: ~35k/day. **Under Helius ~100k/day free-tier cap by ~3×.** Risk surfaces only if cycle rate climbs to ≥30/hr.
+- [x] Cohort calibration (24h DB): 177 Solana candidates; 7d = 621. If-enabled projection at today's 12 cycles/hr × audit's 121 solana/cycle figure: ~35k/day × 30 ≈ **~1.05M/month**. Helius Free plan = **1M monthly credits** per current docs (Reviewer 1 P1 correction — earlier ~100k/day reference was stale). At-or-marginally-above the cap at today's rate; ~2.6× over at 30 cycles/hr; ~5.2× over at audit's 60 cycles/hr. Rate-limit envelope (10 req/s) is not binding.
 - [x] Hermes-first (4 surfaces, 2026-05-18): installed VPS skills (0 helius/Solana-holder hits), Hermes optional-skills catalog `blockchain/solana` (partial top-5 holders only, no `getTokenAccounts` full-count, not installed), awesome-hermes-agent (no Helius/Solana RPC entry), GoldRush/Covalent (no SPL holder enumeration). Verdict: keep in-tree path.
 - [x] Findings doc: `tasks/findings_helius_plan_audit_2026_05_18.md`.
 - [x] Backlog flipped PROPOSED → AUDITED-PHANTOM with full evidence + rate-dependent nuance.

@@ -7,10 +7,16 @@ Status: AUDITED — phantom under current configuration; if-enabled within free-
 ## Executive summary
 
 The cycle-change audit (2026-05-13, B5) flagged Helius Solana holder
-enrichment as `Broken-if-free / Phantom-if-paid` with a projected
-~174k/day call rate vs Helius free-tier ~100k/day cap. That projection
-was contingent on `HELIUS_API_KEY` being set AND the audit's assumed
-60 cycles/hr rate. Both assumptions need verification.
+enrichment as `Broken-if-free / Phantom-if-paid` using a stale
+~100k/day free-tier cap reference. Current Helius docs (Reviewer 1
+correction): **Free plan = 1M monthly credits**, with Standard RPC
+calls costing 1 credit and Free RPC rate-limited to 10 req/s
+(sources: [Helius Credits](https://www.helius.dev/docs/billing/credits),
+[plans/rate-limits](https://www.helius.dev/docs/billing/plans-and-rate-limits)).
+The binding cap is **monthly credits**, not daily calls. Rate-limit
+(10 req/s ≈ 864k/day theoretical max) is far above any realistic
+gecko-alpha cohort × cycle-rate combination and is therefore not the
+binding constraint.
 
 **Verified phantom under current configuration.** Three independent surfaces:
 
@@ -21,21 +27,27 @@ was contingent on `HELIUS_API_KEY` being set AND the audit's assumed
 
 Early-return guard at `scout/ingestion/holder_enricher.py:33-34`
 (`if not settings.HELIUS_API_KEY: return token`) prevents any Helius
-HTTP call when the key is empty. **Today the path is dead. The
-"Broken-if-free" classification cannot fire.**
+HTTP call when the key is empty. **Today the path is dead.**
 
-**If-enabled projection at today's rate is WITHIN free-tier.** Audit's
-60 cycles/hr was the rate before the lane-reorder fix. Today's rate is
-~12 cycles/hr post-#170 deploy. Recalibration: 121 solana/cycle × 12
-cycles/hr × 24h ≈ **35k/day**, well under the Helius ~100k/day free-tier
-cap. This is materially different from the Moralis result (5-7× over
-legacy-free).
+**If-enabled at today's rate is at-or-slightly-above the Free monthly
+allocation.** Today's measured cycle rate is ~12 cycles/hr post-#170
+(audit's 60 cycles/hr was pre-#129/130/131 burst). Recalibration:
+
+```
+121 solana/cycle × 12 cycles/hr × 24h ≈ 35k/day
+35k/day × 30 days ≈ 1.05M/month
+```
+
+That sits **at or slightly above** the Helius Free 1M monthly credit
+allocation, BEFORE accounting for any other Helius usage (e.g., manual
+RPC calls outside gecko-alpha). The audit's "Broken-if-free" direction
+holds — the magnitude was stale (audit referenced ~100k/day cap; actual
+binding cap is 1M/month). Recalibrated at today's rate, the projection
+is borderline, not safe.
 
 **Recommendation:** AUDITED-PHANTOM close + conditional guardrail. No
-code change. The guardrail differs from Moralis's: at today's rate
-Helius enablement is safe on free-tier; the risk surfaces only if the
-cycle rate climbs back toward the audit's original 60 cycles/hr
-(e.g., after Demo API key lifts the CG ceiling).
+code change. The guardrail's enablement check is **monthly-credit
+projection vs 1M Free allocation**, not the stale daily-cap framing.
 
 ## Drift-check (against master `ef0a64a`)
 
@@ -113,16 +125,22 @@ Solana candidates by `first_seen_at` (srilu DB):
 The audit's "121 solana/cycle" figure came from `tokens_per_cycle=289 × ~42% solana`. At today's measured 12 cycles/hr (post-#170 conservative CG limiter), if-enabled projection:
 
 ```
-121 solana/cycle × 12 cycles/hr × 24h × 1 credit/call = ~34,848 credits/day
+121 solana/cycle × 12 cycles/hr × 24h × 1 credit/call ≈ 35k credits/day
+35k credits/day × 30 days ≈ 1.05M credits/month
 ```
 
-**~35k/day vs Helius free-tier ~100k/day = within cap by ~3×.**
+**Helius Free 1M monthly credit allocation:** ~35k/day projects to
+~1.05M/month, which is **at or slightly above the Free cap**, before
+accounting for any other Helius usage (manual RPC calls, future skills
+that consume Helius, etc.).
 
-If the cycle rate climbs back to the audit's assumed 60 cycles/hr (e.g.,
-post-Demo-API-key when the CG ceiling lifts), projection scales to
-~174k/day, returning to the audit's original "Broken-if-free" zone.
+Rate-limit envelope check: 10 req/s Free RPC ≈ 864k/day theoretical max.
+Even at the audit's 60 cycles/hr rate, peak is ~7,260 req/hr ≈ 2 req/s.
+Rate-limit is not the binding constraint at any plausible gecko-alpha
+cohort × cycle rate. **The binding constraint is monthly credits.**
 
-**The risk is rate-dependent and currently inert.**
+**The risk is rate-dependent (monthly), borderline at today's cycle
+rate, and currently inert because the key is empty.**
 
 ## Hermes-first (fresh check 2026-05-18, 4 surfaces)
 
@@ -182,17 +200,26 @@ case. In-tree path stays correct in shape.
 
 ## Risk classification
 
-| Scenario | Today's state | Hazard |
-|---|---|---|
-| `HELIUS_API_KEY=""` (default) | **CURRENT** | None. Path dead. |
-| Key set, today's 12 cycles/hr cadence | Hypothetical | **Safe** — projected ~35k/day < ~100k free cap |
-| Key set, cycle rate climbs to ~30 cycles/hr (e.g., post-Demo-API-key partial relief) | Hypothetical | **Borderline** — projected ~87k/day approaches free-tier cap |
-| Key set, cycle rate climbs to audit's 60 cycles/hr | Hypothetical | **Broken-if-free** — projected ~174k/day (1.7× over free cap) |
+Helius Free plan = **1M monthly credits** (1 credit per Standard RPC
+call; 10 req/s rate limit which is not binding at any plausible
+gecko-alpha rate). Projection table at 121 solana/cycle:
 
-Helius risk is **rate-dependent** in a way Moralis's was not. The
-binding variable is cycle rate, which is itself a function of CG
-rate-limit headroom (more headroom → faster cycles → more Helius
-calls if enabled).
+| Scenario | Today's state | Daily | Monthly | Hazard vs 1M Free cap |
+|---|---|---|---|---|
+| `HELIUS_API_KEY=""` (default) | **CURRENT** | 0 | 0 | None. Path dead. |
+| Key set, today's 12 cycles/hr | Hypothetical | ~35k/day | **~1.05M/month** | **At or slightly above cap** (~5% over before other Helius usage) |
+| Key set, ~30 cycles/hr (e.g., post-Demo-API-key partial relief) | Hypothetical | ~87k/day | ~2.61M/month | **~2.6× over** |
+| Key set, audit's 60 cycles/hr | Hypothetical | ~174k/day | ~5.22M/month | **~5.2× over** |
+
+Even at today's cycle rate, enabling Helius would land projected usage
+**at or marginally above** the 1M/month Free allocation — leaving zero
+headroom for ambient Helius usage outside gecko-alpha (manual RPC
+queries, future Hermes skills that consume Helius, etc.).
+
+Helius risk is **rate-dependent (monthly)** in a way Moralis's was not.
+The binding variable is monthly credits, which scale linearly with
+cycle rate. Cycle rate itself depends on CG rate-limit headroom (more
+headroom → faster cycles → more Helius credits consumed if enabled).
 
 ## Recommendation
 
@@ -221,18 +248,27 @@ guardrail. No code change in this PR.
 `BL-NEW-HELIUS-ENABLEMENT-GUARDRAIL` — operator-gated. Before setting
 `HELIUS_API_KEY` on prod:
 
-1. Confirm plan tier (free vs paid) via Helius dashboard.
-2. Confirm current cycle rate via `journalctl ... | grep -c
-   secondwave_cycle_complete` over a recent 1h window. If still ≤15
-   cycles/hr: free-tier likely safe at observed cohort. If ≥30
-   cycles/hr: add per-token holder cache (24h TTL) before enabling.
+1. Confirm plan tier (Free vs paid) via Helius dashboard. Free = 1M
+   monthly credits; paid plans have higher allocations.
+2. Project monthly credit consumption at enablement time:
+   - Count current `secondwave_cycle_complete` events over a recent 1h
+     window via journalctl.
+   - Multiply by 24 × 30 × (typical solana-cohort per cycle, ~121 from
+     the audit; re-measure if cohort has shifted materially).
+   - Compare against the Free 1M cap with explicit headroom for
+     ambient Helius usage outside gecko-alpha.
+   - If projection > 1M/month (Free) without paid uplift: add per-token
+     `holder_count` cache (24h TTL suggested) AND/OR throttle the
+     `enrich_holders` fan-out before enabling. Today's ~12 cycles/hr
+     already projects ~1.05M/month — borderline-not-safe.
 3. Capture pre-enablement baseline + post-enablement 2h validation
    window (mirrors `runbook_cg_demo_api_key_2026_05_18.md` structure):
-   verify `holder_snapshots` row-rate, log absence of `cg_429_backoff`-
-   equivalent (Helius 429s would surface as `Helius holder lookup failed`),
-   confirm credit-usage at the Helius dashboard.
+   verify `holder_snapshots` row-rate, log absence of `Helius holder
+   lookup failed` entries, confirm credit-usage tracking at the Helius
+   dashboard.
 4. Re-check Hermes-first / GoldRush at enablement time — by then a
-   Solana-specific holder skill may exist and become preferable.
+   Solana-specific full-holder-enumeration skill may exist and become
+   preferable.
 
 ## Differences from Moralis audit (worth documenting)
 
@@ -241,13 +277,17 @@ guardrail. No code change in this PR.
 | Provider type | REST | JSON-RPC |
 | Method | `GET /erc20/{addr}/owners` | `POST getTokenAccounts` |
 | Auth shape | `X-API-Key` header | Query-param `?api-key=KEY` |
-| Free-tier cap | 40k/month | ~100k/day (~3M/month) |
-| If-enabled projection at today's rate | ~200-260k/month = **5-7× over** | ~35k/day = **0.35× of cap (under)** |
-| Risk shape | Always over-cap if enabled | **Rate-dependent** — currently safe; climbs back to risk if cycles speed up |
+| Free-tier cap | 40k/month (legacy free) | **1M monthly credits** (current Free plan; 1 credit per Standard RPC call; 10 req/s rate-limit floor) |
+| If-enabled projection at today's rate | ~200-260k/month = **5-7× over** | ~1.05M/month = **at/marginally above cap** (~5% over before ambient usage) |
+| Risk shape | Always over-cap if enabled (legacy free) | **Rate-dependent (monthly)** — at-or-above-cap today, climbs faster as cycles speed up |
+| Binding constraint if enabled | Monthly request quota | Monthly credits (rate-limit envelope 10 req/s not binding at any plausible rate) |
 
-The risk profiles are materially different. Helius is safer-by-luck
-under today's degraded cycle rate. Moralis is structurally over-cap on
-legacy-free.
+The risk profiles differ in magnitude but not in direction: both
+projections exceed the respective Free caps if enabled at today's rate.
+Helius is closer to the cap (5% over before ambient usage) than Moralis
+(5-7× over), but neither is "safely under." The prior framing of Helius
+as "safe by luck under degraded cycle rate" was incorrect — it relied
+on a stale daily-cap reference.
 
 ## What this doc is NOT
 
