@@ -11,8 +11,10 @@ Last updated: 2026-05-18 (cycle 14: narrative-operator-alert-wire + chain-anchor
 - [x] Dashboard wiring: `dashboard/api.py` mounts the new router with the same stub-503 pattern as the narrative router.
 - [x] Tests: `tests/test_internal_alert_api.py` covers 503 (disabled), 401 (missing headers), 403 (bad sig), 409 (replay), 400 (bad payload), 200 (delivery success + log triplet order), 502 (delivery failure + failed log), and 4 secret-leakage scans (success / auth-fail / delivery-fail / disabled paths).
 - [x] Backlog status flipped PROPOSED → PR-OPEN.
+- [x] **Reviewer 1 P1 fold:** new `OPERATOR_ALERT_HMAC_SECRET` Settings field; `_verify_hmac` parameterized via `secret_field` / `feature_label` kwargs with narrative defaults preserved; internal-alert endpoint authenticates against its own secret so it can still raise alerts when `NARRATIVE_SCANNER_HMAC_SECRET` is missing/broken (the exact failure mode this endpoint exists to surface). 4 new tests cover gate-independence + 503 detail accuracy + narrative-default-preserved regression.
 - [ ] CI green on the new code + tests commit.
 - [ ] **Phased post-merge status (Reviewer 1 P2 fold):** flip backlog to `ENDPOINT-SHIPPED / HERMES-SKILL-PENDING` on PR merge — NOT full SHIPPED. The Hermes-side dispatcher still uses Path B log-only until the SKILL.md update lands.
+- [ ] Operator sets `OPERATOR_ALERT_HMAC_SECRET` on srilu `.env` (32-byte hex, e.g. via `python3 -c "import secrets; print(secrets.token_hex(32))"`) AND configures the Hermes dispatcher's SKILL.md with the same value.
 - [ ] Operator runs SKILL.md update on srilu (`/home/gecko-agent/.hermes/skills/narrative_alert_dispatcher/SKILL.md`) to switch dispatcher from `narrative_dispatcher_misconfig` log-only to the active endpoint — out of repo, operator action after PR merges.
 - [ ] Operator runs smoke test confirming the dispatcher's HMAC POST reaches `/api/internal/operator-alert` and `operator_alert_dispatched` fires on gecko-alpha. Only then flip to `SHIPPED`.
 

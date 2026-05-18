@@ -6,9 +6,14 @@ POST to in order to surface an operator-visible Telegram message.
 
     POST /api/internal/operator-alert
         Persists an operator alert by dispatching it through the existing
-        scout.alerter.send_telegram_message infrastructure. HMAC-authed using
-        the same NARRATIVE_SCANNER_HMAC_SECRET as scout/api/narrative.py;
-        verified via the shared _verify_hmac helper.
+        scout.alerter.send_telegram_message infrastructure. HMAC-authed via
+        the shared ``_verify_hmac`` helper from ``scout/api/narrative.py``
+        BUT against an independent secret ``OPERATOR_ALERT_HMAC_SECRET`` —
+        Reviewer 1 P1 fold: using the same secret as the narrative endpoint
+        would mean the dispatcher could not raise a Telegram alert in the
+        exact failure mode this endpoint exists to surface (missing/broken
+        ``NARRATIVE_SCANNER_HMAC_SECRET``). Independent secrets break that
+        circular dependency.
 
 Evidence trigger (per backlog): activated 2026-05-18 after
 narrative_alerts_inbound reached 204 rows (gate was >=10). The Hermes
@@ -74,7 +79,10 @@ def create_router(settings: Settings) -> APIRouter:
         """HMAC-authed dispatcher for operator-visible Telegram alerts.
 
         Flow per CLAUDE.md §12b:
-            1. HMAC verify (raises 401/403/409/413/503 on failure)
+            1. HMAC verify against OPERATOR_ALERT_HMAC_SECRET (raises
+               401/403/409/413/503 on failure). Independent of
+               NARRATIVE_SCANNER_HMAC_SECRET so this endpoint can still
+               authenticate even when the narrative endpoint is gated off.
             2. Parse payload (raises 400 on shape failure)
             3. Emit ``operator_alert_dispatched`` (BEFORE delivery)
             4. Call ``send_telegram_message`` with ``parse_mode=None``
@@ -88,7 +96,12 @@ def create_router(settings: Settings) -> APIRouter:
             HTTPException 502 on Telegram delivery failure (Hermes side
             sees a non-2xx so the alert isn't silently swallowed).
         """
-        body = await _verify_hmac(request, settings)
+        body = await _verify_hmac(
+            request,
+            settings,
+            secret_field="OPERATOR_ALERT_HMAC_SECRET",
+            feature_label="internal_alert",
+        )
         try:
             payload = OperatorAlertIn.model_validate_json(body)
         except Exception as exc:  # noqa: BLE001 — surface to operator as 400
