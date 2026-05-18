@@ -13,7 +13,8 @@ Last updated: 2026-05-18 (cycle 14: CG budget attribution + stale PR triage)
 - [x] Findings doc: `tasks/findings_cg_budget_attribution_2026_05_18.md`.
 - [x] Backlog entry: `BL-NEW-CG-LANE-ORDER-HELD-POSITION-FIRST` filed.
 - [x] PR #170 opened against master.
-- [ ] CI green (in flight at PR creation time).
+- [x] CI green: GitHub Actions Tests workflow `SUCCESS` on `feat/cg-budget-attribution`.
+- [x] Reviewer 1 doc/status fold applied: fresh Hermes-first check (3 surfaces clean on 2026-05-18) + backlog flipped PROPOSED→PR-OPEN + this CI box.
 - [ ] Post-deploy validation: held_position_refresh_summary.refreshed_count > 0 for ≥3 consecutive cycles outside fresh 429 cooldown windows; simple_price_missing_ids shrinks toward []; scanner lanes not chronically starved.
 
 ## Stale PR triage (2026-05-18)

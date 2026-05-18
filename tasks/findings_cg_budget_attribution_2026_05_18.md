@@ -41,22 +41,51 @@ Verdict: existing primitive, modify in place. No new primitives introduced.
 
 ## Hermes-first (§7b)
 
-Same domain as `BL-NEW-CG-RATE-LIMITER-BURST-PROFILE`. The Hermes-first
-analysis in `tasks/design_bl_new_cg_rate_limiter_burst_profile.md` checked
-the Hermes skill hub and awesome-hermes-agent ecosystem for async Python
-rate-limiter / lane-orchestration primitives and found none applicable to
-gecko-alpha's aiohttp CoinGecko scheduling. That verdict carries forward —
-this fix extends the existing in-tree primitive, not a new domain.
+Fresh check performed 2026-05-18 (not carry-forward) per the reviewer
+discipline correction on recent stale Hermes claims.
 
-| Domain | Hermes skill found? | Decision |
+### Surface 1: installed VPS skills on srilu-vps
+
+`ls /home/gecko-agent/.hermes/skills/` returned 28 skill directories:
+apple, autonomous-ai-agents, coin_resolver, creative, crypto_narrative_scanner,
+data-science, devops, diagramming, dogfood, domain, email, gaming, gifs,
+github, inference-sh, kol_watcher, mcp, media, mlops, narrative_alert_dispatcher,
+narrative_classifier, note-taking, productivity, red-teaming, research,
+smart-home, social-media, software-development, yuanbao.
+
+`/home/gecko-agent/.hermes/plugins/` is empty.
+
+`grep -ril "coingecko\|rate.?limit\|lane.?order\|simple_price\|burst"` across
+all installed SKILL.md files: 0 substantive hits. Returned matches are
+tangential (airtable productivity, p5js/touchdesigner creative templates) —
+none cover async lane orchestration or CG rate-limit priority.
+
+### Surface 2: Hermes optional-skills catalog (skill hub)
+
+`https://hermes-agent.nousresearch.com/docs/reference/optional-skills-catalog/`
+fetched 2026-05-18. Catalog covers categories autonomous-ai-agents, blockchain
+(evm/hyperliquid/solana), communication, creative, devops, dogfood, email,
+finance, health, mcp, migration, mlops, productivity, research, security,
+software-development, web-development. Zero skills cover async lane
+orchestration, rate-limiter priority, inter-lane budget reservation, or
+CoinGecko lane scheduling for an API consumer.
+
+### Surface 3: awesome-hermes-agent ecosystem
+
+`https://github.com/0xNyk/awesome-hermes-agent` fetched 2026-05-18. Zero
+entries cover async lane orchestration, rate-limiter priority, or CG lane
+scheduling.
+
+### Verdict table
+
+| Domain | Hermes skill found 2026-05-18? | Decision |
 |---|---|---|
-| Async lane orchestration / per-lane budget reservation | No installed/public Hermes skill found | Reorder existing `_fetch_coingecko_lanes` |
-| CoinGecko `/simple/price` priority routing | No Hermes skill found | Same — in-tree lane order is the lever |
-
-awesome-hermes-agent ecosystem check: no CoinGecko lane-scheduling primitive.
+| Async lane orchestration / per-lane budget reservation | No (3 surfaces clean) | Reorder existing `_fetch_coingecko_lanes` |
+| CoinGecko `/simple/price` priority routing | No (3 surfaces clean) | Same — in-tree lane order is the lever |
+| Generic rate-limiter helper for Python aiohttp | Carry-forward negative from `BL-NEW-CG-RATE-LIMITER-BURST-PROFILE` design; re-confirmed today against installed skill set | Extend `scout.ratelimit.RateLimiter` family in-tree |
 
 One-sentence verdict: extend in-tree `_fetch_coingecko_lanes` ordering; no
-Hermes path applies.
+Hermes path applies. Fresh check against all three Hermes surfaces is clean.
 
 ## Evidence
 
