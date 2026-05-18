@@ -24,6 +24,19 @@
   deletions/reverts of newly merged work. If the branch is stale, rebase before
   asking for merge review.
 
+## PR review must compare against current base, not only merge-base intent
+
+- 2026-05-17 correction: I reviewed PR #138's intended diff from its merge-base
+  and missed that current `origin/master` already contained the same squashed
+  feature plus later cycles. The PR was obsolete and conflict-prone even though
+  the implementation itself looked sound.
+- Rule: for every PR review, fetch current base and check both
+  `git log --left-right --cherry-pick origin/master...origin/pr/<n>` and
+  `git merge-tree origin/master origin/pr/<n>` before judging mergeability.
+  If the feature primitives already exist on current master, treat the PR as
+  stale/superseded and recommend close/rebase instead of approving the
+  merge-base diff.
+
 ## X Alerts asset links must cover unresolved cashtags
 
 - 2026-05-15 correction: I treated "clickable Asset column" as only safe for
