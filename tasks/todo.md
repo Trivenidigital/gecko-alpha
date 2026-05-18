@@ -1,6 +1,24 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-17 (BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT findings shipped; BL-NEW-LC-REVIVAL-CRITERIA-TIGHTENING PR #150 merged at a20891f)
+Last updated: 2026-05-18 (cycle 13 overnight — per-item sections below for PRs #155+#156+#157)
+
+## Active Work: BL-NEW-CRON-DRIFT-WATCHDOG (item 3, PR #156)
+
+- [x] Isolated worktree: `.claude/worktrees/feat+cron-drift-watchdog`
+- [x] Drift-check: HEAD = `cdeb31f` = origin/master (zero divergence; includes PRs #150-#154). Grep for `cron-drift-watchdog` returns ZERO files — net-new.
+- [x] Hermes-first: no per-token Hermes primitive for crontab drift; reuse in-tree curl-direct Telegram pattern. awesome-hermes-agent reachable; x-twitter-scraper exists but unrelated.
+- [x] Plan v2 (post-2-reviewer fold): `tasks/plan_cron_drift_watchdog.md` — 14 reviewer findings folded (1 CRITICAL + 8 IMPORTANT + 5 MINOR across 2 reviewers).
+- [x] Design consolidated into plan v2 per CLAUDE.md §10 (fold table + code blocks specify all design decisions; separate design doc would duplicate).
+- [x] Build: `scripts/cron-drift-watchdog.sh` (~215 LOC mirroring cycle-10 systemd-drift-watchdog with reviewer-fold improvements) + `tests/test_cron_drift_watchdog.py` (14 tests).
+- [x] TDD: 14/14 tests pass on srilu Python 3.12.3 / pytest 8.4.2. Mid-build bug caught: `diff -u` includes tempfile mtime headers, breaking sha256 ack stability. Fixed via `--label`.
+- [x] Prod-crontab dry-run: CLEAN (managed block matches repo fragment).
+- [x] backlog.md status: PROPOSED → PR-OPEN / SCRIPT-READY / SCHEDULING-PENDING-OPERATOR (per Reviewer 1 PR-review-3 P2: "SHIPPED" wording reserved for post-merge state; pre-merge says SCRIPT-READY) + 2 follow-ups filed
+- [x] PR + 3 parallel PR-stage reviewers → all CRITICAL+IMPORTANT folded (commit 9e9a208)
+- [x] Reviewer-2 PR-review fold: ACK_DIR mkdir failure now exits 9 with clear message (vs prior warn-then-fail-cryptically); test_ack_dir_unwritable_exits_9 added; 20/20 tests pass on srilu
+- [x] Reviewer-2 PR-review fold: scope trim — BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT now systemd-only (cron-watchdog ships ACK_DIR-exit-9 fix)
+- [x] Reviewer-3 PR-review fold: backlog wording corrected — "SCRIPT-SHIPPED" was premature pre-merge; renamed pre-merge state to "PR-OPEN / SCRIPT-READY / SCHEDULING-PENDING-OPERATOR"; post-merge action text updated with 3-stage convention (PR merge → SCRIPT-SHIPPED with SHA → operator scheduling → SHIPPED/SCHEDULED)
+- [ ] Post-merge stage 1 (bookkeeping): flip PR-OPEN/SCRIPT-READY → SCRIPT-SHIPPED + merge SHA
+- [ ] Post-merge stage 2 (operator scheduling, separate): operator adds cron line via cron/README §Setup; then flip → SHIPPED/SCHEDULED
 
 ## Active Work: BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT
 

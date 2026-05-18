@@ -1556,11 +1556,25 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **Status:** SHIPPED-WITH-FINDINGS 2026-05-17 — branch `feat/other-prod-config-audit` (cycle 11). Findings doc: `tasks/findings_other_prod_config_audit_2026_05_17.md`. Of 17 categories swept, only 1 gap (gecko cron entries repo-untracked at schedule level) — closed via new `cron/` directory (sentinel-bracketed managed block + idempotent `cron/deploy.sh` per V54 fold). Apache "Possible Gap" withdrawn after drill (not installed). VPS multi-tenant inventory documented (gecko-alpha + polymarket-ml-signal + btc15minutebot + shift-agent). 4 follow-ups filed (cron drift watchdog, cron-to-timer decision, drift-watchdog archive, firewall decision 2026-06-14, polymarket-verify); 1 withdrawn (Apache). Memory checkpoint: `project_prod_config_audit_2026_05_17.md`.
 
 ### BL-NEW-CRON-DRIFT-WATCHDOG: bash watchdog for crontab drift (cycle 11 follow-up)
-**Status:** PROPOSED 2026-05-17 — cycle 11 follow-up to BL-NEW-OTHER-PROD-CONFIG-AUDIT.
-**Why:** Cycle 11 ships repo-tracked cron entries via `cron/deploy.sh`. Mirror cycle 10's `systemd-drift-watchdog.sh` pattern for cron: daily check that `crontab -l` matches `cron/gecko-alpha.crontab` between sentinels.
-**Action:** ~2-3h build. Mirror `scripts/systemd-drift-watchdog.sh` shape: extract managed block from `crontab -l`, diff against repo fragment, alert on drift via curl-direct TG. Include sha256 ack-tombstone for alert dedup (per cycle-10 V46 pattern).
-**Pattern:** parallels `scripts/systemd-drift-watchdog.sh` (cycle 10).
-**decision-by:** 4 weeks (low priority; cron block is short + stable).
+**Status:** PR-OPEN / SCRIPT-READY / SCHEDULING-PENDING-OPERATOR 2026-05-18 — PR #156. **`scripts/cron-drift-watchdog.sh` script ready (not yet merged); the cron schedule entry is NOT added to `cron/gecko-alpha.crontab` in this PR** (per "do not change live config without explicit operator approval" — adding to the managed-block fragment would auto-fire daily after the next `bash cron/deploy.sh`). Operator chooses when to schedule per `cron/README.md` §"Setup (one-time, opt-in to scheduled firing)". Runtime protection is GATED on (a) PR merge AND (b) operator scheduling action. Script verified via prod-crontab dry-run CLEAN + 20/20 tests on srilu. 2-reviewer plan-fold + 3-reviewer PR-fold + 1-reviewer post-review fold complete. Filed 2 follow-ups (HEARTBEAT-MONITOR + WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT scoped to systemd-watchdog only, since cron-watchdog already has the mktemp + max-time + ACK_DIR-exit-9 fixes).
+
+**Original status (now historical):** PROPOSED 2026-05-17 — cycle 11 follow-up to BL-NEW-OTHER-PROD-CONFIG-AUDIT.
+
+**Post-merge action (operator):** flip status above from `PR-OPEN / SCRIPT-READY / SCHEDULING-PENDING-OPERATOR` → `SCRIPT-SHIPPED / SCHEDULING-PENDING-OPERATOR <merge-date> — merged <sha>`. After the operator's separate scheduling-opt-in action (adding the cron line to `cron/gecko-alpha.crontab` and running `bash cron/deploy.sh`), flip once more to `SHIPPED / SCHEDULED <date>`. Three-stage convention reflects the two independent gates: PR merge AND operator scheduling.
+
+### BL-NEW-CRON-DRIFT-WATCHDOG-HEARTBEAT-MONITOR: wire stale-heartbeat detector for cron-drift-watchdog
+**Status:** PROPOSED 2026-05-18 — PR-stage R2 #13 fold from BL-NEW-CRON-DRIFT-WATCHDOG. CLAUDE.md §12a compliance: shipping a new heartbeat-writing watchdog without a stale-detector is the silent-failure surface §12a exists to prevent.
+**Tag:** `observability` `watchdog` `silent-failure-prevention`
+**Why:** `scripts/cron-drift-watchdog.sh` writes `/var/lib/gecko-alpha/cron-drift-watchdog/heartbeat` on CLEAN runs but no separate monitor checks the heartbeat's freshness. If the watchdog itself stops running (cron line removed, script broken, etc.), the operator has no signal.
+**Action:** ~1h. Extend existing `scripts/gecko-backup-watchdog.sh` (or create `scripts/cron-drift-stale-heartbeat-watchdog.sh` modeled on it) to alert when the cron-drift-watchdog heartbeat is older than N hours (default 25h to cover a daily cron firing 1-hour-late). Add to cron managed block in `cron/gecko-alpha.crontab`. Until shipped, operator runs the one-liner in `cron/README.md` §"Heartbeat freshness check".
+**Decision-by:** 2026-06-15 (4 weeks from PR #156 merge).
+
+### BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT: backport mktemp + curl --max-time + ACK_DIR-exit fixes to systemd-watchdog
+**Status:** PROPOSED 2026-05-18 — PR-stage R2 #4 + #12 + #16 fold from BL-NEW-CRON-DRIFT-WATCHDOG (PR #156). Re-scoped post-PR-review-2 P2: cron-watchdog already shipped the ACK_DIR-exit-9 fix; backport applies only to systemd-watchdog now.
+**Tag:** `security-hardening` `watchdog` `tech-debt`
+**Why:** PR #156 (cron-drift-watchdog) fixed three latent issues that ALSO exist in `scripts/systemd-drift-watchdog.sh`: (a) `/tmp/.gecko-drift-resp.$$` is a predictable PID-based tmp path — symlink-attack surface; (b) `curl` without `--max-time` can hold the flock indefinitely on hung network; (c) `mkdir -p $ACK_DIR` failure only warns then `exec 9>$LOCK_FILE` fails abruptly under set -e. Same fixes apply.
+**Action:** ~45min. Apply to `scripts/systemd-drift-watchdog.sh`: (1) `mktemp -t gecko-systemd-drift-resp.XXXXXX`, (2) `curl --max-time 30`, (3) `exit 9` on ACK_DIR mkdir failure (vs current "warn-then-die-cryptically"). Add 3 regression-style tests. Optionally: (d) `.env` leading-whitespace token-grep tolerance.
+**Decision-by:** 2026-06-15 (4 weeks from PR #156 merge).
 
 ### BL-NEW-CRON-TO-SYSTEMD-TIMER: convert 2 weekly cron entries to systemd timers (cycle 11 follow-up)
 **Status:** PROPOSED 2026-05-17 — cycle 11 design-tension follow-up (V53 fold).
