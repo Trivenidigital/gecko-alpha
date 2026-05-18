@@ -3,7 +3,7 @@
 Date: 2026-05-18
 Backlog: BL-NEW-HELD-POSITION-REFRESH-RATE-GAP
 Related PRs (all merged this session): #158, #161, #162, #163, #166
-Status: cycle-1 evidence captured; 24h validation window OPEN
+Status: cycle-1 evidence captured; follow-up cycles show CG 429/backoff; 24h validation window OPEN
 
 This is a follow-up evidence record. PR #158 (stale_open_count gauge + per-token
 WARN) merged to master as `a649032` at 2026-05-18T15:24:26Z; PR #163 (validation
@@ -64,6 +64,54 @@ Pre-restart baseline (1h window before flip): 0 summary events. Confirms the
 refresh lane was effectively off prior to the flip — matches the `.env` having
 no `HELD_POSITION_*` keys.
 
+## Follow-up cycles: active but rate-limited
+
+Additional journal evidence collected after the first clean cycle shows the
+refresh lane stayed active, but CoinGecko rate limiting dominated later cycles.
+VPS state at collection time:
+
+- Prod `/root/gecko-alpha` HEAD: `147cba4`.
+- `gecko-pipeline`: active, PID 2523485, active since `2026-05-18 16:11:21 UTC`.
+- `.env`: `HELD_POSITION_PRICE_REFRESH_ENABLED=True` and
+  `HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES=1`.
+
+Held-position summaries since the flip:
+
+| Timestamp UTC | refreshed_count | not_found_count | simple_price_missing_ids count | stale_open_count |
+|---|---:|---:|---:|---:|
+| 2026-05-18T16:16:07.761267Z | 150 | 0 | 0 | 0 |
+| 2026-05-18T16:18:40.608514Z | 0 | 146 | 25 | 0 |
+| 2026-05-18T16:41:27.010022Z | 0 | 147 | 25 | 0 |
+| 2026-05-18T17:04:50.816374Z | 0 | 145 | 25 | 0 |
+| 2026-05-18T17:08:00.607798Z | 0 | 147 | 25 | 0 |
+
+Union of later `simple_price_missing_ids`:
+
+`akash-network`, `argentine-football-association-fan-token`, `catizen`,
+`circle-internet-group-ondo-tokenized-stock`, `circle-xstock`,
+`constitutiondao`, `fartboy`, `gnosis`, `iagon`, `keeta`, `medibloc`,
+`melania-meme`, `moviebloc`, `my-neighbor-alice`, `non-playable-coin`,
+`paal-ai`, `paris-saint-germain-fan-token`, `pieverse`, `pippin`, `pythia`,
+`qubic-network`, `sapien-2`, `solv-protocol`, `superfortune`, `talus`,
+`wayfinder`.
+
+Adjacent journal evidence over `2026-05-18T16:15:00Z` to `17:12:00Z` shows
+the missing-id cycles aligned with repeated CoinGecko rate limiting:
+
+- `cg_429_backoff`: 21
+- `rate_limiter_429_reported`: 24
+- `coingecko_lanes_stopped_for_backoff`: 17
+- `rate_limiter_global_backoff`: 20
+- `ingest_source_starved`: 1, followed by `ingest_source_recovered`: 1
+- `cg_detail_rate_limited`: 1
+
+Interpretation: the lane is no longer blocked by config, but
+`HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES=1` is too aggressive under current
+CoinGecko budget when combined with the rest of the ingestion lanes. The later
+`simple_price_missing_ids` are real evidence for partial refresh failure, but
+the simultaneous 429/backoff evidence means the `/coins/{id}` fallback
+promotion gate is not met: the rate-limit budget is already saturated.
+
 ## Cohort overlap (runbook Step 3)
 
 Known stale 21-token cohort from
@@ -96,15 +144,16 @@ lever, so the lever was misattributed as the failure point.
 ## Fallback design — NOT backed out
 
 `BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT` is **not** retired by this
-evidence. The runbook's promotion gate requires `/simple/price` to miss AND
-`/coins/{id}` to recover. Cycle-1 shows `/simple/price` missing nothing, so
-the gate did not fire — but a single cycle is not the evidence needed to retire
-a fallback design.
+evidence. The runbook's promotion gate requires `/simple/price` to miss,
+`/coins/{id}` to recover, and CoinGecko budget to tolerate the added fallback
+calls.
 
-Decision: keep PR #163's fallback design on file. If the 24h window stays clean
-with `simple_price_missing_ids=[]` and zero WARNs, file a small follow-up to
-mark `BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT` deferred / superseded-by-
-evidence — do not implement it.
+Follow-up cycles now show `/simple/price` missing IDs, but they also show
+repeated 429/backoff across the CoinGecko lanes. Manual `/coins/{id}` probes
+should wait until the rate-limit window clears; probing during active 429s would
+only worsen the budget condition. Decision: keep PR #163's fallback design on
+file, but do **not** implement it from the current evidence. First resolve or
+baseline the rate-limit pressure from interval-per-cycle refresh.
 
 ## Material drift side-finding
 
@@ -125,9 +174,9 @@ Open items:
 
 - Confirm `held_position_refresh_summary` fires reliably across a full 24h
   window of varying CG rate-limit conditions.
-- Confirm `simple_price_missing_ids` stays empty OR identify any tokens that
-  recur in it — those are the only candidates that would re-motivate the
-  `/coins/{id}` fallback.
+- Confirm whether recurring `simple_price_missing_ids` persist outside active
+  429/backoff windows. Only those misses can re-motivate the `/coins/{id}`
+  fallback.
 - Confirm `stale_open_count` stays at 0 OR identify drift conditions that push
   it positive (proves the gauge is exercised, not just floored).
 - Confirm `held_position_token_persistently_stale` WARNs only fire when there
