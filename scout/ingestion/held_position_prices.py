@@ -22,6 +22,7 @@ listing) are skipped — tracked as follow-up BL-NEW-DEX-PRICE-COVERAGE.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 import aiohttp
@@ -39,6 +40,14 @@ logger = structlog.get_logger()
 # to fetch_held_position_prices() regardless of whether refresh fires; refresh
 # fires when (counter % HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES) == 0.
 _cycle_counter: int = 0
+
+# BL-NEW-HELD-POSITION-REFRESH-RATE-GAP (cycle 13): module-level dedup for
+# the per-token persistent-stale WARN. Keyed by token_id, value = last warn
+# UTC timestamp. 24h dedup window. In-memory by design — resets on
+# pipeline restart so post-deploy/post-restart re-emits a fresh snapshot
+# (operator wants "what's stale right now," not "what was stale before
+# the last restart that we already alerted on but you forgot about").
+_warned_today: dict[str, datetime] = {}
 
 # /simple/price accepts up to ~250 ids per call. Current production cohort
 # is ~150 held positions, well within one batch. If the cohort grows past
@@ -83,6 +92,32 @@ async def _get_held_token_ids(db: "Database") -> list[str]:
     )
     rows = await cursor.fetchall()
     return [r[0] for r in rows if r[0]]
+
+
+async def _get_cached_price_ages(
+    db: "Database", coin_ids: list[str]
+) -> dict[str, datetime]:
+    """Direct query of `price_cache.updated_at` for the given coin_ids.
+
+    Returns tz-aware datetimes keyed by coin_id. Coins absent from the cache
+    are absent from the returned dict (caller treats missing as "needs refresh").
+
+    Avoids touching scout/db.py — the existing `Database.get_cached_prices`
+    helper does NOT return updated_at, so a direct SQL hop is the minimum
+    shape. Used by the BL-NEW-HELD-POSITION-REFRESH-RATE-GAP gauge + per-token
+    persistent-stale WARN paths.
+    """
+    if db._conn is None or not coin_ids:
+        return {}
+    placeholders = ",".join("?" * len(coin_ids))
+    sql = f"SELECT coin_id, updated_at FROM price_cache WHERE coin_id IN ({placeholders})"
+    cur = await db._conn.execute(sql, coin_ids)
+    rows = await cur.fetchall()
+    return {
+        r[0]: datetime.fromisoformat(r[1])
+        for r in rows
+        if r[1] is not None
+    }
 
 
 async def _fetch_simple_price_batch(
@@ -216,6 +251,64 @@ async def fetch_held_position_prices(
     except Exception:
         logger.exception("held_position_refresh_drift_telemetry_failed")
 
+    # BL-NEW-HELD-POSITION-REFRESH-RATE-GAP (cycle 13): stale-open gauge +
+    # per-token persistent-stale WARN. Both wrap in their own try/except
+    # so a failure here NEVER blocks the existing summary log emission.
+    stale_open_count: int | None = None
+    stale_open_pct: float | None = None
+    try:
+        ages_for_held = await _get_cached_price_ages(db, held_ids)
+        now_utc = datetime.now(timezone.utc)
+        stale_threshold_hours = 24
+        stale_count = 0
+        for tid in held_ids:
+            age = ages_for_held.get(tid)
+            if age is None:
+                stale_count += 1
+                continue
+            if (now_utc - age).total_seconds() / 3600 > stale_threshold_hours:
+                stale_count += 1
+        stale_open_count = stale_count
+        if held_ids:
+            stale_open_pct = round(100.0 * stale_count / len(held_ids), 1)
+    except Exception:
+        logger.exception("held_position_stale_count_failed")
+
+    # Per-token WARN with 24h dedup. Separate try/except for the same
+    # reason — never block the summary log.
+    try:
+        now_utc = datetime.now(timezone.utc)
+        threshold_hours = settings.HELD_POSITION_STALE_WARN_HOURS
+        dedup_cutoff = now_utc - timedelta(hours=24)
+        # Re-fetch ages if the gauge block failed and ages_for_held is missing
+        if "ages_for_held" not in locals():
+            ages_for_held = await _get_cached_price_ages(db, held_ids)
+        for tid in held_ids:
+            age = ages_for_held.get(tid)
+            if age is None:
+                cache_age_hours: float | None = None
+                is_stale = True
+            else:
+                cache_age_hours = (now_utc - age).total_seconds() / 3600
+                is_stale = cache_age_hours >= threshold_hours
+            if not is_stale:
+                continue
+            last_warn = _warned_today.get(tid)
+            if last_warn is not None and last_warn > dedup_cutoff:
+                continue
+            logger.warning(
+                "held_position_token_persistently_stale",
+                token_id=tid,
+                cache_age_hours=(
+                    round(cache_age_hours, 1) if cache_age_hours is not None else None
+                ),
+                cache_last=age.isoformat() if age is not None else None,
+                warn_threshold_hours=threshold_hours,
+            )
+            _warned_today[tid] = now_utc
+    except Exception:
+        logger.exception("held_position_persistent_stale_warn_failed")
+
     logger.info(
         "held_position_refresh_summary",
         refreshed_count=len(raw_coins),
@@ -226,6 +319,8 @@ async def fetch_held_position_prices(
             round(largest_drift_pct, 2) if largest_drift_pct is not None else None
         ),
         held_total=len(held_ids),
+        stale_open_count=stale_open_count,
+        stale_open_pct=stale_open_pct,
     )
     return raw_coins
 
@@ -234,3 +329,9 @@ def _reset_cycle_counter_for_tests() -> None:
     """Test-only helper. Production code never calls this."""
     global _cycle_counter
     _cycle_counter = 0
+
+
+def _reset_warned_today_for_tests() -> None:
+    """Test-only helper. Mirrors _reset_cycle_counter_for_tests pattern."""
+    global _warned_today
+    _warned_today = {}

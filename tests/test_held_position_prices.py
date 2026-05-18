@@ -13,8 +13,10 @@ from aioresponses import aioresponses
 
 from scout.db import Database
 from scout.ingestion.held_position_prices import (
+    _get_cached_price_ages,
     _is_cg_coin_id,
     _reset_cycle_counter_for_tests,
+    _reset_warned_today_for_tests,
     _shape_for_cache_prices,
     fetch_held_position_prices,
 )
@@ -35,6 +37,16 @@ def _reset_counter():
     _reset_cycle_counter_for_tests()
     yield
     _reset_cycle_counter_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _reset_warned_today():
+    """BL-NEW-HELD-POSITION-REFRESH-RATE-GAP: per-token WARN dedup is in-memory
+    module-level state; reset between tests to prevent order-dependent
+    flakes."""
+    _reset_warned_today_for_tests()
+    yield
+    _reset_warned_today_for_tests()
 
 
 @pytest.fixture
@@ -295,3 +307,147 @@ async def test_429_handled_gracefully(db, settings_factory, patch_module_sleep):
     # _get_with_backoff returns None on persistent 429 → empty response
     # → _shape_for_cache_prices returns []
     assert result == []
+
+
+# ---------------------------------------------------------------------------
+# BL-NEW-HELD-POSITION-REFRESH-RATE-GAP (cycle 13)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_cached_price_ages_returns_aware_datetimes(db):
+    from datetime import datetime, timezone
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) VALUES (?, ?, ?)",
+        ("fresh-coin", 1.0, "2026-05-18T00:00:00+00:00"),
+    )
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) VALUES (?, ?, ?)",
+        ("stale-coin", 2.0, "2026-05-10T00:00:00+00:00"),
+    )
+    await db._conn.commit()
+    ages = await _get_cached_price_ages(db, ["fresh-coin", "stale-coin", "missing-coin"])
+    assert "fresh-coin" in ages
+    assert "stale-coin" in ages
+    assert "missing-coin" not in ages
+    assert ages["fresh-coin"].tzinfo is not None
+    assert ages["fresh-coin"] == datetime(2026, 5, 18, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_get_cached_price_ages_empty_input(db):
+    ages = await _get_cached_price_ages(db, [])
+    assert ages == {}
+
+
+def test_held_position_settings_default_warn_hours():
+    from scout.config import Settings
+    s = Settings(TELEGRAM_BOT_TOKEN="x", TELEGRAM_CHAT_ID="y")
+    assert s.HELD_POSITION_STALE_WARN_HOURS == 24
+
+
+def test_held_position_settings_warn_hours_validator():
+    from scout.config import Settings
+    with pytest.raises(ValueError, match=">= 1"):
+        Settings(
+            TELEGRAM_BOT_TOKEN="x",
+            TELEGRAM_CHAT_ID="y",
+            HELD_POSITION_STALE_WARN_HOURS=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_stale_open_count_gauge_in_summary_log(
+    db, settings_factory, patch_module_sleep
+):
+    patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
+    await _insert_open_trade(db, "fresh-1", "F1")
+    await _insert_open_trade(db, "fresh-2", "F2")
+    await _insert_open_trade(db, "stale-1", "S1")
+    await _insert_open_trade(db, "no-cache-1", "NC1")
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    fresh_iso = (now - timedelta(hours=1)).isoformat()
+    stale_iso = (now - timedelta(hours=48)).isoformat()
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) VALUES (?, ?, ?)",
+        ("fresh-1", 1.0, fresh_iso),
+    )
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) VALUES (?, ?, ?)",
+        ("fresh-2", 1.0, fresh_iso),
+    )
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) VALUES (?, ?, ?)",
+        ("stale-1", 1.0, stale_iso),
+    )
+    await db._conn.commit()
+    settings = settings_factory(HELD_POSITION_PRICE_REFRESH_ENABLED=True)
+
+    from structlog.testing import capture_logs
+    with capture_logs() as captured:
+        async with aiohttp.ClientSession() as session:
+            with aioresponses() as m:
+                m.get(SIMPLE_PRICE_PATTERN,
+                      payload={"fresh-1": {"usd": 1.0}, "fresh-2": {"usd": 1.0},
+                               "stale-1": {"usd": 1.0}, "no-cache-1": {"usd": 1.0}})
+                await fetch_held_position_prices(session, settings, db)
+
+    summary = [e for e in captured if e.get("event") == "held_position_refresh_summary"]
+    assert len(summary) == 1
+    assert summary[0]["stale_open_count"] == 2
+    assert summary[0]["stale_open_pct"] == 50.0
+
+
+@pytest.mark.asyncio
+async def test_persistently_stale_token_emits_warn_once_per_day(
+    db, settings_factory, patch_module_sleep
+):
+    patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
+    await _insert_open_trade(db, "ancient-coin", "AC")
+    from datetime import datetime, timezone, timedelta
+    ancient_iso = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) VALUES (?, ?, ?)",
+        ("ancient-coin", 1.0, ancient_iso),
+    )
+    await db._conn.commit()
+    settings = settings_factory(HELD_POSITION_PRICE_REFRESH_ENABLED=True)
+
+    from structlog.testing import capture_logs
+    with capture_logs() as captured:
+        async with aiohttp.ClientSession() as session:
+            with aioresponses() as m:
+                m.get(SIMPLE_PRICE_PATTERN, payload={"ancient-coin": {"usd": 1.0}}, repeat=True)
+                await fetch_held_position_prices(session, settings, db)
+                await fetch_held_position_prices(session, settings, db)
+
+    warn_events = [e for e in captured if e.get("event") == "held_position_token_persistently_stale"]
+    assert len(warn_events) == 1
+    assert warn_events[0]["token_id"] == "ancient-coin"
+    assert warn_events[0]["cache_age_hours"] >= 71.5
+    assert warn_events[0]["warn_threshold_hours"] == 24
+
+
+@pytest.mark.asyncio
+async def test_stale_count_failure_does_not_block_summary_log(
+    db, settings_factory, patch_module_sleep, monkeypatch
+):
+    patch_module_sleep("scout.ingestion.coingecko", "scout.ratelimit")
+    await _insert_open_trade(db, "test-coin", "TC")
+    settings = settings_factory(HELD_POSITION_PRICE_REFRESH_ENABLED=True)
+    import scout.ingestion.held_position_prices as mod
+    async def _broken(*args, **kwargs):
+        raise RuntimeError("simulated DB failure")
+    monkeypatch.setattr(mod, "_get_cached_price_ages", _broken)
+
+    from structlog.testing import capture_logs
+    with capture_logs() as captured:
+        async with aiohttp.ClientSession() as session:
+            with aioresponses() as m:
+                m.get(SIMPLE_PRICE_PATTERN, payload={"test-coin": {"usd": 1.0}})
+                await fetch_held_position_prices(session, settings, db)
+
+    summary = [e for e in captured if e.get("event") == "held_position_refresh_summary"]
+    assert len(summary) == 1
+    assert summary[0]["stale_open_count"] is None
