@@ -1306,8 +1306,12 @@ def load_settings(**kwargs) -> "Settings":
     V4#1 review fold (tasks/design_score_volume_pruning_harden.md §D2):
     operators running with bad .env see a clear ``settings_validation_failed``
     event in journalctl rather than a bare Pydantic stack trace inside an
-    infinite 10s respawn loop. Curl-direct active-push alert is deferred to
-    BL-NEW-SETTINGS-VALIDATION-ALERT.
+    infinite 10s respawn loop.
+
+    BL-NEW-SETTINGS-VALIDATION-ALERT (cycle 14): also fires a best-effort
+    curl-direct Telegram alert via ``scout.config_alert`` so operators get
+    an active push instead of having to grep journalctl. The alert is
+    fully wrapped in try/except — NEVER blocks the re-raise.
 
     ``**kwargs`` are forwarded to ``Settings(...)`` so tests can inject
     deliberate validator violations without env-mutation side effects.
@@ -1321,4 +1325,19 @@ def load_settings(**kwargs) -> "Settings":
         structlog.get_logger().error(
             "settings_validation_failed", error=str(exc)
         )
+        # BL-NEW-SETTINGS-VALIDATION-ALERT (cycle 14): best-effort TG alert.
+        # Helper catches its own exceptions; outer try is defense-in-depth
+        # against the import itself failing (corrupted bytecode, etc.).
+        # PR-#160 R2 MINOR-2 fold: log the helper return value so the
+        # silent-skip path (e.g. "skipped:no_creds") is visible in journalctl
+        # — otherwise operator can't distinguish "alert delivered" from
+        # "alert path never engaged" from a missing TG message alone.
+        try:
+            from scout.config_alert import _send_validation_alert_best_effort
+            _alert_outcome = _send_validation_alert_best_effort(str(exc))
+            structlog.get_logger().error(
+                "settings_validation_alert_dispatched", outcome=_alert_outcome
+            )
+        except Exception:
+            pass
         raise

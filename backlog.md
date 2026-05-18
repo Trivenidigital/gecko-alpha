@@ -1511,11 +1511,25 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 
 **Original status (now historical):** PROPOSED 2026-05-16 — residual from `feat/score-volume-pruning-harden` PR's §7a partial-match reframe.
 
+### BL-NEW-CRON-DRIFT-WATCHDOG-ENV-WHITESPACE-TOLERANCE: backport .env leading-whitespace tolerance into cron-drift-watchdog.sh
+**Status:** PROPOSED 2026-05-18 — sibling-symmetry follow-up surfaced by PR #159 R1 IMPORTANT review.
+**Tag:** `cron-drift-watchdog` `env-parsing` `backport` `sibling-symmetry` `silent-failure-prevention`
+**Why:** PR #159 (cycle 14) added `^[[:space:]]*` tolerance + sed-strip to `scripts/systemd-drift-watchdog.sh` so an indented `TELEGRAM_BOT_TOKEN=` in `.env` doesn't trigger silent exit-5 false negative. The sibling `scripts/cron-drift-watchdog.sh:197-198` (shipped in PR #156) still uses strict `^TELEGRAM_BOT_TOKEN=` regex. Inverts source-of-truth assumption (cron-drift was supposed to be the canonical pattern; systemd PR adopted a SUPERSET).
+**Action:** ~1h. Edit `scripts/cron-drift-watchdog.sh:197-198` to use same regex+sed pattern as systemd PR #159. Mirror the `test_leading_whitespace_in_env_parsed_correctly` test from PR #159 into `tests/test_cron_drift_watchdog.py`. Single-commit PR.
+**Decision-by:** within 2 weeks of PR #156 merge (operator can also choose to delay until next cycle's watchdog work).
+
+### BL-NEW-PARSE-MODE-AUDIT-EXTEND-URLLIB-DISPATCH: extend AST sweep to urllib.request dispatch sites
+**Status:** PROPOSED 2026-05-18 — surfaced by PR #160 R2 MINOR-1 review.
+**Tag:** `parse-mode-hygiene` `silent-failure-prevention` `class-3` `ast-sweep` `coverage`
+**Why:** `tests/test_parse_mode_hygiene.py:213` walks `scout/` for direct `.post(.../sendMessage)` calls and resolves payload dicts to assert `parse_mode` is absent or escape-coverage is present. PR #160's new `scout/config_alert.py` uses `urllib.request.urlopen(req)` — NOT `.post()` — so the sweep does NOT cover it. The unit-test assertion at `test_config_alert.py:78` is sufficient for current scope, but future urllib-direct dispatch sites would be uncovered.
+**Action:** ~2h. Extend the AST sweep to also walk `urllib.request.urlopen(Request(...sendMessage...))` patterns. Resolve the Request data argument back to a json.dumps dict literal where possible; assert `parse_mode` absent or escape-coverage present, same as the existing `.post` arm.
+**Decision-by:** within 4 weeks (low urgency — current sweep covers 95% of dispatch sites).
+
 ### BL-NEW-SETTINGS-VALIDATION-ALERT: curl-direct Telegram on settings_validation_failed
-**Status:** PROPOSED 2026-05-16 — V4#1 review deferred from `feat/score-volume-pruning-harden` PR.
-**Why:** `load_settings()` in `scout/config.py` emits structured `logger.error("settings_validation_failed", ...)` before re-raising ValidationError. systemd `Restart=always`+`RestartSec=10` (verified on srilu) means a bad `.env` triggers a 10s crash-loop visible in journalctl but with no active Telegram push. Curl-direct push (mirroring `gecko-backup-watchdog` from memory `project_vps_backup_rotation_2026_05_09.md`) requires first-time-only file marker + dedup to avoid 360 msg/hr storm.
-**Action:** `.startup_alert_sent` file marker + curl-direct send in `load_settings()` exception path, marker deleted on successful load. Tests cover first-fail-only behavior.
-**decision-by:** 4 weeks.
+**Status:** PR-OPEN 2026-05-18 — PR (TBD). New `scout/config_alert.py` module wired into `scout/config.py:load_settings()`. urllib.request (stdlib only) curl-direct alert; SHA256 content-hash dedup via state file `/var/lib/gecko-alpha/settings-validation-watchdog/last_alerted_hash`; 3s timeout (avoids doubling systemd crash-loop period); plain text / no parse_mode (§12b). 18/18 tests pass on srilu Python 3.12.3.
+**Original status (now historical):** PROPOSED 2026-05-16 — V4#1 review deferred from `feat/score-volume-pruning-harden` PR.
+**Why:** `load_settings()` in `scout/config.py` emits structured `logger.error("settings_validation_failed", ...)` before re-raising ValidationError. systemd `Restart=always`+`RestartSec=10` (verified on srilu) means a bad `.env` triggers a 10s crash-loop visible in journalctl but with no active Telegram push. Curl-direct push (mirroring `gecko-backup-watchdog` from memory `project_vps_backup_rotation_2026_05_09.md`) requires content-hash dedup to avoid 360 msg/hr storm.
+**Post-merge action (operator):** flip status to `SHIPPED <merge-date> — merged <sha>`. Update PR number from "TBD" to actual after `gh pr create`.
 
 ### BL-NEW-SCORE-VOLUME-PRUNE-ALERT: §12b active alert on score/volume prune failure
 **Status:** PROPOSED 2026-05-16 — V4#6 review deferred from `feat/score-volume-pruning-harden` PR.
