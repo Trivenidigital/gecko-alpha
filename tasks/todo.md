@@ -2,6 +2,24 @@
 
 Last updated: 2026-05-18 (cycle 14 overnight — PR TBD BL-NEW-SETTINGS-VALIDATION-ALERT alongside PRs #158/#159)
 
+## Active Work: BL-NEW-PARSE-MODE-AUDIT-EXTEND-URLLIB-DISPATCH
+
+- [x] Isolated worktree: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-urllib-parse-mode` on `codex/urllib-parse-mode-audit`
+- [x] Dependency check: `scout/config_alert.py` exists on PR #160 / `origin/feat/settings-validation-alert`, not on `origin/master`; this PR is stacked on PR #160.
+- [x] Drift-check: PR #160 already filed the follow-up at `backlog.md` (`BL-NEW-PARSE-MODE-AUDIT-EXTEND-URLLIB-DISPATCH`). Current AST harness covers `send_telegram_message(...)` and `.post(.../sendMessage)` but not `urllib.request.urlopen(Request(...sendMessage...))`.
+- [x] Hermes-first: Hermes messaging/gateway docs cover Telegram as a platform, but no Hermes skill replaces gecko-alpha's Python AST parse-mode hygiene test. awesome-hermes-agent lists messaging integrations, not in-repo AST audit enforcement. Verdict: extend the local test harness.
+- [x] Baseline: `python -m pytest tests/test_parse_mode_hygiene.py tests/test_config_alert.py -q` -> `33 passed, 3 warnings`.
+- [x] Write failing regression proving `config_alert.py`'s urllib `Request(...sendMessage...)` site is audited structurally.
+- [x] Extend AST scanner to resolve urllib `Request` + `urlopen` dispatch payloads and enforce plain-text/no `parse_mode`.
+- [x] Verify parse-mode and config-alert targeted tests.
+- [x] Update backlog/memory review notes, commit, push, and create stacked PR: #162 (`https://github.com/Trivenidigital/gecko-alpha/pull/162`).
+
+Review:
+- TDD red: `test_config_alert_urllib_dispatch_is_structurally_audited_as_plain_text` first failed because `_find_urllib_telegram_dispatches` did not exist, then failed with `len(dispatches) == 0` until module-level constants were added to the resolver.
+- Implementation: `tests/test_parse_mode_hygiene.py` now resolves `urllib.request.urlopen(req)` where `req` is a `urllib.request.Request(...)`, resolves `ALERT_URL_FMT.format(...)`, unwraps `json.dumps({...}).encode("utf-8")`, and fails if the Telegram payload is unresolved or contains `parse_mode`.
+- Verification: `python -m pytest tests/test_parse_mode_hygiene.py tests/test_config_alert.py -q` -> `34 passed, 3 warnings`.
+- `git diff --check` clean. `python -m black tests/test_parse_mode_hygiene.py --check` could not run because this Python environment does not have `black` installed.
+
 ## Active Work: BL-NEW-SETTINGS-VALIDATION-ALERT (PR TBD)
 
 - [x] Isolated worktree: `.claude/worktrees/feat-settings-validation-alert`

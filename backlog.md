@@ -1519,8 +1519,17 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **Decision-by:** within 2 weeks of PR #156 merge (operator can also choose to delay until next cycle's watchdog work).
 
 ### BL-NEW-PARSE-MODE-AUDIT-EXTEND-URLLIB-DISPATCH: extend AST sweep to urllib.request dispatch sites
-**Status:** PROPOSED 2026-05-18 — surfaced by PR #160 R2 MINOR-1 review.
+**Status:** PR-OPEN 2026-05-18 — PR #162, stacked on PR #160 (`feat/settings-validation-alert`); surfaced by PR #160 R2 MINOR-1 review.
 **Tag:** `parse-mode-hygiene` `silent-failure-prevention` `class-3` `ast-sweep` `coverage`
+**Hermes-first analysis:**
+
+| Domain | Hermes skill found? | Decision |
+|---|---|---|
+| Telegram/messaging delivery | yes — Hermes messaging gateway docs (`https://hermes-agent.nousresearch.com/docs/user-guide/messaging`) | not a replacement; this is an in-repo AST regression harness for gecko-alpha source |
+| Scheduled/script alerting | yes — Hermes Cron/no-agent jobs (`https://hermes-agent.nousresearch.com/docs/guides/cron-script-only`) | not applicable; no scheduling primitive replaces Python source auditing |
+| Python Telegram parse-mode static audit | none found | extend existing `tests/test_parse_mode_hygiene.py` scanner |
+
+awesome-hermes-agent ecosystem check: reviewed `https://github.com/0xNyk/awesome-hermes-agent`; no listed skill/plugin provides project-local AST enforcement for Telegram `parse_mode`. Verdict: custom test-harness extension is justified.
 **Why:** `tests/test_parse_mode_hygiene.py:213` walks `scout/` for direct `.post(.../sendMessage)` calls and resolves payload dicts to assert `parse_mode` is absent or escape-coverage is present. PR #160's new `scout/config_alert.py` uses `urllib.request.urlopen(req)` — NOT `.post()` — so the sweep does NOT cover it. The unit-test assertion at `test_config_alert.py:78` is sufficient for current scope, but future urllib-direct dispatch sites would be uncovered.
 **Action:** ~2h. Extend the AST sweep to also walk `urllib.request.urlopen(Request(...sendMessage...))` patterns. Resolve the Request data argument back to a json.dumps dict literal where possible; assert `parse_mode` absent or escape-coverage present, same as the existing `.post` arm.
 **Decision-by:** within 4 weeks (low urgency — current sweep covers 95% of dispatch sites).
