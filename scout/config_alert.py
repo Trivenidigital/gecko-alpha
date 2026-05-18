@@ -28,7 +28,13 @@ import urllib.request
 from pathlib import Path
 
 DEFAULT_STATE_DIR = Path("/var/lib/gecko-alpha/settings-validation-watchdog")
-DEFAULT_ENV_FILE = Path("/root/gecko-alpha/.env")
+# PR-#160 R1 I1 fold: derive .env default from this module's location (walk up
+# two levels: scout/config_alert.py → scout/ → project root) instead of
+# hardcoding /root/gecko-alpha/.env. Hardcoded path silently breaks on any
+# non-srilu-VPS deploy (dev box, second VPS, CI runner, /opt/* installs); the
+# `.env` fallback is the ONLY working creds source under systemd (no
+# EnvironmentFile= directive), so a wrong default == feature silently inert.
+DEFAULT_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 ALERT_URL_FMT = "https://api.telegram.org/bot{token}/sendMessage"
 # Plan R1 I1 fold: 3s ceiling. systemd Restart=always+RestartSec=10 means
 # a longer timeout would double the crash-loop period (10s sleep + 10s

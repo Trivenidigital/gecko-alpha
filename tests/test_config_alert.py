@@ -361,6 +361,36 @@ def test_load_settings_invokes_alert_helper_on_validation_error(monkeypatch, tmp
     assert "HELD_POSITION_STALE_WARN_HOURS" in captured[0]
 
 
+def test_load_settings_logs_alert_outcome_on_validation_error(monkeypatch, tmp_path):
+    """PR-#160 R2 MINOR-2 fold: outcome of _send_validation_alert_best_effort
+    must be logged as a structured event (`settings_validation_alert_dispatched`)
+    so silent-skip paths (e.g. "skipped:no_creds") are visible in journalctl,
+    not lost.
+    """
+    import structlog
+    from pydantic import ValidationError
+    from scout.config import load_settings
+
+    monkeypatch.setattr(
+        "scout.config_alert._send_validation_alert_best_effort",
+        lambda err: "skipped:no_creds",
+    )
+    with structlog.testing.capture_logs() as cap_logs:
+        with pytest.raises(ValidationError):
+            load_settings(
+                _env_file=None,
+                TELEGRAM_BOT_TOKEN="t",
+                TELEGRAM_CHAT_ID="c",
+                HELD_POSITION_STALE_WARN_HOURS=99999,
+            )
+    dispatched = [
+        e for e in cap_logs
+        if e.get("event") == "settings_validation_alert_dispatched"
+    ]
+    assert len(dispatched) == 1
+    assert dispatched[0]["outcome"] == "skipped:no_creds"
+
+
 def test_load_settings_does_NOT_invoke_alert_helper_on_success(monkeypatch, tmp_path):
     """Negative path: successful Settings() construction must NOT trigger alert."""
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)

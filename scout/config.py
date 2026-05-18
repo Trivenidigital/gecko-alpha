@@ -1328,9 +1328,16 @@ def load_settings(**kwargs) -> "Settings":
         # BL-NEW-SETTINGS-VALIDATION-ALERT (cycle 14): best-effort TG alert.
         # Helper catches its own exceptions; outer try is defense-in-depth
         # against the import itself failing (corrupted bytecode, etc.).
+        # PR-#160 R2 MINOR-2 fold: log the helper return value so the
+        # silent-skip path (e.g. "skipped:no_creds") is visible in journalctl
+        # — otherwise operator can't distinguish "alert delivered" from
+        # "alert path never engaged" from a missing TG message alone.
         try:
             from scout.config_alert import _send_validation_alert_best_effort
-            _send_validation_alert_best_effort(str(exc))
+            _alert_outcome = _send_validation_alert_best_effort(str(exc))
+            structlog.get_logger().error(
+                "settings_validation_alert_dispatched", outcome=_alert_outcome
+            )
         except Exception:
             pass
         raise
