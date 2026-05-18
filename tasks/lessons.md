@@ -1,5 +1,17 @@
 # Lessons
 
+## Memory updates must target the operator's active memory store
+
+- 2026-05-18 correction: I claimed "memory files were updated" after writing
+  notes under `~/.Codex/projects/C--projects-gecko-alpha/memory`, but the
+  reviewer checked the operator's active Claude memory store at
+  `~/.claude/projects/C--projects-gecko-alpha/memory` and found no new files.
+- Rule: when reporting that "memory" was updated, verify which memory store the
+  project/session actually uses. For gecko-alpha handoffs that may be resumed
+  by Claude, write or copy the note to
+  `~/.claude/projects/C--projects-gecko-alpha/memory` as well, then verify with
+  a directory listing before claiming memory persistence.
+
 ## Rebase PR branches after adjacent backlog PRs land
 
 - 2026-05-17 correction: I left PR #146 based on `63aa13b` after #147 and
