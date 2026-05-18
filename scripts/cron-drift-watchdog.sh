@@ -22,6 +22,7 @@
 #   6  required binary (python3 / crontab) missing
 #   7  Telegram HTTP_STATUS != 200 (ACK NOT written — re-alerts next fire)
 #   8  FRAGMENT_FILE missing
+#   9  ACK_DIR cannot be created (state-dir unwritable; cannot operate)
 #   99 (test stub only) unexpected `crontab` subcommand
 
 set -euo pipefail
@@ -52,8 +53,14 @@ if [[ -n "$UV_BIN" && -z "${GECKO_WATCHDOG_ALLOW_UV_STUB:-}" ]]; then
     exit 6
 fi
 
+# PR review-2 P2 fold: previously `mkdir -p` failure only warned, but the
+# subsequent `exec 9>"$LOCK_FILE"` would fail abruptly under set -e with a
+# bash error message that's harder to grep than a controlled exit. Now
+# exit 9 with a clear stderr message. Tested via
+# test_ack_dir_unwritable_exits_9.
 if ! mkdir -p "$ACK_DIR" 2>/dev/null; then
-    echo "WARN: failed to mkdir $ACK_DIR; ack-tombstone unavailable; alert may re-fire daily" >&2
+    echo "ERROR: failed to mkdir $ACK_DIR; cannot proceed without ack-tombstone state" >&2
+    exit 9
 fi
 chmod 0700 "$ACK_DIR" 2>/dev/null || true
 

@@ -340,6 +340,38 @@ def test_curl_uses_max_time(tmp_path):
         "curl invocation must bound execution to prevent stale flock-held alerts"
 
 
+def test_ack_dir_unwritable_exits_9(tmp_path):
+    """PR review-2 P2 fold: previously `mkdir -p $ACK_DIR` failure only
+    warned, then the next `exec 9>"$LOCK_FILE"` would fail abruptly under
+    `set -e`. Now we exit 9 with a clear message.
+
+    To force the failure, point CRON_DRIFT_ACK_DIR at a path under a
+    non-existent + non-creatable parent (a read-only filesystem mount or
+    a path under an existing FILE). We use the latter: create a file at
+    `tmp_path/sentinel`, then set CRON_DRIFT_ACK_DIR=tmp_path/sentinel/x.
+    `mkdir -p` cannot create a directory under a regular file.
+    """
+    body = "30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh"
+    _make_fragment(tmp_path, body)
+    # Create a regular file where the script will try to mkdir
+    sentinel_file = tmp_path / "sentinel-as-file"
+    sentinel_file.write_text("not a directory")
+    env = os.environ.copy()
+    env["CRON_DRIFT_ACK_DIR"] = str(sentinel_file / "ack")  # parent is a file
+    env["GECKO_REPO"] = str(tmp_path / "repo")
+    env["GECKO_ENV_FILE"] = "/dev/null"
+    # Need a crontab stub so we get past the command -v check
+    crontab_stub = _make_crontab_stub(tmp_path, "")
+    env["CRONTAB_BIN"] = str(crontab_stub)
+    r = subprocess.run(
+        ["bash", str(WATCHDOG_SCRIPT)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode == 9, f"expected exit 9 (ACK_DIR unwritable); got {r.returncode}; stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "failed to mkdir" in r.stderr
+    assert "cannot proceed" in r.stderr
+
+
 # ---------------------------------------------------------------------------
 # PR-stage 3-reviewer fold tests
 # ---------------------------------------------------------------------------
