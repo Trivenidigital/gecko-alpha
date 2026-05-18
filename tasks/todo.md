@@ -1,6 +1,14 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-18 (cycle 14: Helius + Moralis plan audits + CG budget attribution + stale PR triage)
+Last updated: 2026-05-18 (cycle 14: chain-anchor status correction + Helius + Moralis plan audits + CG budget attribution + stale PR triage)
+
+## Active Work: BL-NEW-CHAIN-ANCHOR-PIPELINE-FIX — SHIPPED (backlog status correction)
+
+- [x] Drift-check post-Helius-audit: `active_chains` rows/day = 11 → 104 → 117 across 2026-05-16/17/18 (vs audit's claimed MAX 2026-05-11T16:42Z). Symptom resolved.
+- [x] PR-history check found PR #146 (`5860d17`) merged 2026-05-17T16:50:40Z — the causal fix. Backlog entry was stale at `PR-READY`; flipped to `SHIPPED`.
+- [x] Verified `chain-anchor-health-watchdog.{sh,service,timer}` shipped with PR #146 in `scripts/` and `systemd/` directories on master.
+- [x] Findings doc: `tasks/findings_chain_anchor_resolved_2026_05_18.md` — status correction + post-deploy verification + §9c near-miss note (drift-check almost filed a duplicate watchdog follow-up).
+- [x] **No follow-up filed.** Recurrence-prevention watchdog already shipped via PR #146. If a future audit shows the watchdog is missing a surface or threshold, file the gap then.
 
 ## Active Work: BL-NEW-HELIUS-PLAN-AUDIT — AUDITED-PHANTOM
 
