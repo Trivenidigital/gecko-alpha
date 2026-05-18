@@ -965,10 +965,25 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 **decision-by:** 4 weeks.
 
 ### BL-NEW-HELIUS-PLAN-AUDIT
-**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B5 (Broken-if-free / Phantom-if-paid).
-**Action:** confirm prod Helius plan tier; if free: add per-cycle throttle OR move enrichment behind a wall-clock interval (e.g., 30 min per-token cache).
-**2026-05-14 Hermes-first overlay:** before adding provider-specific throttles or upgrading, compare the specific Helius use cases against GoldRush MCP/agent skills and installed optional Hermes `blockchain/solana` support. If GoldRush covers the same wallet/holder/transfer/security data with better operational fit, re-scope this from "Helius plan audit" to "on-chain provider consolidation audit."
-**decision-by:** 1 week (Broken-if-free severity).
+**Status:** AUDITED-PHANTOM 2026-05-18 — findings at `tasks/findings_helius_plan_audit_2026_05_18.md`. Same shape as Moralis (PR #173): three independent surfaces confirm the path is dead under current configuration: (1) `HELIUS_API_KEY=` empty on srilu .env; (2) 0 Helius log hits in 24h; (3) `holder_snapshots` table = 0 rows total. Early-return guard at `scout/ingestion/holder_enricher.py:33-34` prevents any Helius HTTP call when the key is empty. No code change. Conditional guardrail filed below as `BL-NEW-HELIUS-ENABLEMENT-GUARDRAIL`.
+
+**Notable nuance vs Moralis:** at today's measured 12 cycles/hr (post-#170 conservative CG limiter), if-enabled projection is **~35k/day vs Helius free-tier ~100k/day cap — UNDER the cap by ~3×**. The "Broken-if-free" classification was contingent on the audit's assumed 60 cycles/hr; at the audit's rate (or any rate ≥ 30 cycles/hr) the projection would return to the over-cap zone. **Helius risk is rate-dependent in a way Moralis's was not** — the binding variable is cycle rate, which itself depends on CG rate-limit headroom.
+
+**Hermes-first 2026-05-18 (fresh, 4 surfaces):** (1) installed VPS skills (28 dirs, 0 helius/getTokenAccounts/Solana-holder hits); (2) Hermes optional-skills catalog `blockchain/solana` covers wallet/balance/top-5-holders + transactions but NOT `getTokenAccounts` full-count (and not installed); (3) awesome-hermes-agent has no Helius/Solana RPC entry; (4) GoldRush/Covalent agent-skills cover balances/transactions/NFTs/prices but no SPL holder enumeration. No installed or external primitive replaces the in-tree path.
+
+### BL-NEW-HELIUS-ENABLEMENT-GUARDRAIL: gate operator enablement of Helius behind plan-tier + cycle-rate check
+**Status:** PROPOSED 2026-05-18 — conditional follow-up to AUDITED-PHANTOM closure of BL-NEW-HELIUS-PLAN-AUDIT. Only fires if/when operator decides to set `HELIUS_API_KEY` on prod.
+**Tag:** `holder-enrichment` `evidence-gated` `operator-gated` `pre-enablement-guardrail` `conditional` `rate-dependent`
+**Why:** Audit (2026-05-18) confirmed the path is dead under current config and would project ~35k/day at today's 12 cycles/hr (under Helius free 100k/day cap). However, if cycle rate climbs back to ≥30 cycles/hr (e.g., post-Demo-API-key partial relief on CG ceiling), projection enters the over-cap zone. Enablement decision must consider both plan tier AND projected cycle rate at enablement time.
+**Trigger condition (NOT calendar-gated):** operator intent to enable Helius. If no intent in 6mo, close as inert.
+**Action checklist (operator-only when triggered):**
+1. Confirm plan tier via Helius dashboard (free vs paid).
+2. Confirm current cycle rate via `journalctl ... | grep -c secondwave_cycle_complete` over a recent 1h window. If ≤15 cycles/hr: free-tier likely safe at observed cohort. If ≥30 cycles/hr: add per-token holder cache (24h TTL suggested) before enabling.
+3. Capture pre-enablement baseline + post-enablement 2h validation window (mirrors `runbook_cg_demo_api_key_2026_05_18.md` structure): verify `holder_snapshots` row-rate, check for `Helius holder lookup failed` entries, confirm credit usage at Helius dashboard.
+4. Re-check Hermes-first / GoldRush at enablement time — a Solana-specific holder skill may have shipped by then.
+**Hermes-first 2026-05-18:** carry-forward of the audit's negative result across 4 surfaces; re-check at enablement time.
+**Drift verdict:** NET-NEW guardrail; conditional follow-up to AUDITED-PHANTOM closure. Mirrors `BL-NEW-MORALIS-ENABLEMENT-GUARDRAIL` shape but with rate-dependent cap evaluation step.
+**Decision-by:** evidence-gated (6mo backstop) — close as inert if no operator intent to enable Helius.
 
 ### BL-NEW-MORALIS-PLAN-AUDIT
 **Status:** AUDITED-PHANTOM 2026-05-18 — findings at `tasks/findings_moralis_plan_audit_2026_05_18.md`. Three independent surfaces confirm the path is dead under current configuration: (1) `MORALIS_API_KEY=` empty on srilu .env; (2) 0 Moralis log hits across 24h + 7d windows; (3) `holder_snapshots` table = 0 rows total. Early-return guard at `scout/ingestion/holder_enricher.py:37-38` prevents any Moralis HTTP call when the key is empty. The cycle-change audit's 25× over-cap projection was contingent on the key being set; with the key empty the risk is phantom. No code change. Conditional guardrail filed below as `BL-NEW-MORALIS-ENABLEMENT-GUARDRAIL`.
