@@ -132,27 +132,49 @@ the key. Without a baseline, the 2h post-key window can't be evaluated.
 
 ## Step 2 — set the key on srilu-vps
 
-SSH into the VPS and append the line to `/root/gecko-alpha/.env`. Take a
-backup first.
+SSH into the VPS with a TTY allocated so `read -rsp` can prompt for the
+key without echoing it back. Take a backup first, then write the key via
+the prompt — the key value never appears in your command, shell history,
+or terminal scrollback.
 
 ```bash
-ssh root@srilu-vps '
+ssh -t root@srilu-vps '
 cd /root/gecko-alpha
 cp .env .env.bak.pre-cg-demo-key-2026-05-18
-echo "" >> .env
-echo "# CoinGecko Demo API key (BL-NEW-CG-FREE-TIER-DEMO-API-KEY)" >> .env
-echo "COINGECKO_API_KEY=PASTE_KEY_HERE" >> .env
+printf "\n# CoinGecko Demo API key (BL-NEW-CG-FREE-TIER-DEMO-API-KEY)\n" >> .env
+# read -rsp: -r preserves backslashes, -s suppresses echo, -p shows prompt
+read -rsp "CoinGecko Demo API key: " CG_KEY
+printf "\nCOINGECKO_API_KEY=%s\n" "$CG_KEY" >> .env
+unset CG_KEY
+echo
 echo "===VERIFY==="
-grep -nE "^COINGECKO_API_KEY=" .env
+# Show line numbers + redact the value so the key is never printed back.
+grep -nE "^COINGECKO_API_KEY=" .env | sed "s/=.*/=<redacted>/"
 '
 ```
 
-Replace `PASTE_KEY_HERE` interactively in the SSH session — do NOT include
-the actual key value in any saved bash script, command history, or commit.
+`-t` forces a TTY so the interactive prompt works through SSH. `read -rsp`
+reads the line silently — nothing appears on screen as you paste, and the
+key never lands in any history file because it's only ever held in the
+shell variable `CG_KEY`, which `unset` discards before SSH exits.
 
-Confirm via the verify block that the line is present and that no
-duplicate `COINGECKO_API_KEY=` rows exist (an earlier empty default may
-shadow the new one; if so, delete the empty one).
+Confirm via the verify block:
+- Exactly one `COINGECKO_API_KEY=` line is present.
+- The value column shows `<redacted>`, not the actual key.
+- No duplicate `COINGECKO_API_KEY=` rows exist. An earlier empty default may
+  shadow the new one; if a duplicate appears, edit `.env` to delete the
+  empty line (use an editor that doesn't echo file contents back into your
+  scrollback — `vi /root/gecko-alpha/.env`, locate the empty line, remove
+  it, save).
+
+**Operational hygiene:**
+- Do NOT `cat .env`, `tail .env`, or `grep COINGECKO_API_KEY .env` without
+  the `sed` redaction. The raw grep prints the key.
+- Do NOT paste the key into any chat / commit / PR / scratch file. The
+  only place it should live is `/root/gecko-alpha/.env` (mode 0600 by
+  convention; verify with `ls -la /root/gecko-alpha/.env`).
+- If you accidentally echo the key to your terminal, treat it as compromised
+  — rotate via the CoinGecko dashboard and re-run Step 2 with the new key.
 
 ## Step 3 — restart the pipeline
 
@@ -291,8 +313,11 @@ coingecko_lanes_stopped_for_backoff distribution:
 ```
 
 If the post-key window looks more like the pre-key window, suspect:
-- Key not loaded (re-grep `.env`, confirm Pydantic loaded it; check
-  `cg_candidates_returned.has_api_key` field — should be `true` post-key).
+- Key not loaded. Primary signal: `cg_candidates_returned.has_api_key`
+  field in the journal should be `true` post-key. If it's `false`, the
+  Pydantic Settings load missed the line. Re-verify the `.env` presence
+  with the redacted grep from Step 2 (`grep ... | sed "s/=.*/=<redacted>/"`),
+  never the raw grep — the key must not be printed back.
 - Key invalid (CG returns 401/403; look for `cg_http_error` events).
 - IP-rate-limit issue persists despite the key (escalate; this would
   indicate the binding constraint is not the per-IP free pool).
