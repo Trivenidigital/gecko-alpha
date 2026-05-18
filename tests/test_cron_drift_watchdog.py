@@ -106,6 +106,9 @@ def _run_watchdog(
     env["GECKO_ENV_FILE"] = "/dev/null"  # unused on stub path
     if uv_stub:
         env["UV_BIN"] = str(uv_stub)
+        # PR R1 #15 fold: tests must opt-in to stub path so prod accidental
+        # UV_BIN doesn't silently absorb alerts.
+        env["GECKO_WATCHDOG_ALLOW_UV_STUB"] = "1"
     if crontab_stub:
         env["CRONTAB_BIN"] = str(crontab_stub)
     elif omit_crontab:
@@ -335,3 +338,114 @@ def test_curl_uses_max_time(tmp_path):
     script_src = WATCHDOG_SCRIPT.read_text()
     assert "--max-time 30" in script_src, \
         "curl invocation must bound execution to prevent stale flock-held alerts"
+
+
+# ---------------------------------------------------------------------------
+# PR-stage 3-reviewer fold tests
+# ---------------------------------------------------------------------------
+
+
+def test_uv_bin_set_without_opt_in_refuses_prod_silent_suppression(tmp_path):
+    """PR R1 #15 fold: UV_BIN accidentally set in prod must NOT silently
+    absorb the alert; require explicit GECKO_WATCHDOG_ALLOW_UV_STUB=1
+    opt-in.
+
+    Without this guard, an operator who sources a shell profile that
+    exports UV_BIN into cron environment would silently lose all alert
+    delivery while writing ACK files (false-clean signal).
+    """
+    body = "30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh"
+    _make_fragment(tmp_path, body)
+    live = f"{SENTINEL_START}\n# wrong content\n{SENTINEL_END}\n"
+    crontab_stub = _make_crontab_stub(tmp_path, live)
+    # uv_stub passed but GECKO_WATCHDOG_ALLOW_UV_STUB not set (env_extras
+    # would normally include it via _run_watchdog; we manually construct
+    # the env to demonstrate the guard fires).
+    env = os.environ.copy()
+    env["CRON_DRIFT_ACK_DIR"] = str(tmp_path / "ack")
+    env["GECKO_REPO"] = str(tmp_path / "repo")
+    env["GECKO_ENV_FILE"] = "/dev/null"
+    env["CRONTAB_BIN"] = str(crontab_stub)
+    env["UV_BIN"] = str(tmp_path / "stubs" / "fake-uv")  # path doesn't need to exist
+    # Deliberately omit GECKO_WATCHDOG_ALLOW_UV_STUB
+    r = subprocess.run(
+        ["bash", str(WATCHDOG_SCRIPT)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode == 6, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "UV_BIN set" in r.stderr
+    assert "refusing stub path" in r.stderr
+
+
+def test_alert_body_includes_actionable_next_step(tmp_path):
+    """PR R3 #1 fold: alert body must tell operator what to do."""
+    body = "30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh"
+    _make_fragment(tmp_path, body)
+    live = f"{SENTINEL_START}\n# wrong content\n{SENTINEL_END}\n"
+    crontab_stub = _make_crontab_stub(tmp_path, live)
+    uv_stub, marker = _make_uv_stub(tmp_path)
+    _run_watchdog(tmp_path, crontab_stub=crontab_stub, uv_stub=uv_stub)
+    body_text = marker.read_text()
+    assert "ACTION:" in body_text
+    assert "cron/deploy.sh" in body_text
+
+
+def test_sentinel_typo_diagnostic_includes_expected_form(tmp_path):
+    """PR R3 #2 fold: typo diagnostic must show expected form, not just
+    the wrong line found."""
+    body = "30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh"
+    _make_fragment(tmp_path, body)
+    live = (
+        "# === BEGIN gecko-alpha  managed block (do not edit between sentinels) ===\n"
+        f"{body}\n"
+        f"{SENTINEL_END}\n"
+    )
+    crontab_stub = _make_crontab_stub(tmp_path, live)
+    uv_stub, marker = _make_uv_stub(tmp_path)
+    _run_watchdog(tmp_path, crontab_stub=crontab_stub, uv_stub=uv_stub)
+    body_text = marker.read_text()
+    assert "expected:" in body_text
+    assert "got:" in body_text
+
+
+def test_malformed_sentinel_diagnostic_includes_inspect_command(tmp_path):
+    """PR R3 #3 fold: malformed-sentinel diagnostic must include the
+    inspect command operator can paste."""
+    body = "30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh"
+    _make_fragment(tmp_path, body)
+    live = f"{SENTINEL_START}\n{body}\n"  # missing END
+    crontab_stub = _make_crontab_stub(tmp_path, live)
+    uv_stub, marker = _make_uv_stub(tmp_path)
+    _run_watchdog(tmp_path, crontab_stub=crontab_stub, uv_stub=uv_stub)
+    body_text = marker.read_text()
+    assert "inspect with: crontab -l" in body_text
+
+
+def test_diff_body_lines_preserve_order_in_alert(tmp_path):
+    """PR R1 #7 fold: DIFF_BODY +/- lines must NOT be sorted into the
+    DRIFT_MARKERS pool (would scramble the unified diff into nonsense)."""
+    # Create a multi-line drift so the diff has clear `+`/`-`/`@@` lines
+    body = (
+        "30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh\n"
+        "45 3 * * 0 /root/gecko-alpha/scripts/wal_archive.sh\n"
+        "0 4 * * 0 /root/gecko-alpha/scripts/cron-drift-watchdog.sh"
+    )
+    _make_fragment(tmp_path, body)
+    # Live has the lines in DIFFERENT order — diff would naturally
+    # produce `-` and `+` pairs
+    live = (
+        f"{SENTINEL_START}\n"
+        "0 4 * * 0 /root/gecko-alpha/scripts/cron-drift-watchdog.sh\n"
+        "45 3 * * 0 /root/gecko-alpha/scripts/wal_archive.sh\n"
+        "30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh\n"
+        f"{SENTINEL_END}\n"
+    )
+    crontab_stub = _make_crontab_stub(tmp_path, live)
+    uv_stub, marker = _make_uv_stub(tmp_path)
+    _run_watchdog(tmp_path, crontab_stub=crontab_stub, uv_stub=uv_stub)
+    body_text = marker.read_text()
+    # Headers should appear in the alert
+    assert "--- repo:cron/gecko-alpha.crontab" in body_text
+    assert "+++ live:crontab -l" in body_text
+    # A `@@` hunk header should be present (proves diff structure preserved)
+    assert "@@" in body_text

@@ -44,6 +44,14 @@ if ! command -v "$CRONTAB_BIN" >/dev/null 2>&1; then
     exit 6
 fi
 
+# PR R1 #15 fold: refuse stub path in prod (UV_BIN accidentally set in
+# operator env would silently absorb alert delivery, write ACK, never
+# notify Telegram). Tests opt-in via GECKO_WATCHDOG_ALLOW_UV_STUB=1.
+if [[ -n "$UV_BIN" && -z "${GECKO_WATCHDOG_ALLOW_UV_STUB:-}" ]]; then
+    echo "ERROR: UV_BIN set ($UV_BIN) but GECKO_WATCHDOG_ALLOW_UV_STUB not opted-in; refusing stub path to prevent silent alert suppression in prod" >&2
+    exit 6
+fi
+
 if ! mkdir -p "$ACK_DIR" 2>/dev/null; then
     echo "WARN: failed to mkdir $ACK_DIR; ack-tombstone unavailable; alert may re-fire daily" >&2
 fi
@@ -91,7 +99,8 @@ printf '%s\n' "$LIVE_BLOCK" > "$LIVE_FILE"
 DRIFT_LINES=()
 
 if [[ "$BEGIN_COUNT" != "1" || "$END_COUNT" != "1" ]]; then
-    DRIFT_LINES+=("DRIFT: malformed sentinel structure (begin=$BEGIN_COUNT end=$END_COUNT)")
+    # R3 #3 fold: include inspect command so operator can investigate directly
+    DRIFT_LINES+=("DRIFT: malformed sentinel structure (begin=$BEGIN_COUNT end=$END_COUNT); inspect with: crontab -l | grep -n 'gecko-alpha managed block'")
 fi
 
 # --- Sentinel-text-typo detector (R1 #8) --------------------------------
@@ -99,7 +108,8 @@ fi
 if [[ "$BEGIN_COUNT" == "0" ]]; then
     LOOSE_BEGIN="$(printf '%s\n' "$LIVE_FULL" | grep -i 'BEGIN gecko-alpha' | head -1 || true)"
     if [[ -n "$LOOSE_BEGIN" ]]; then
-        DRIFT_LINES+=("DRIFT: sentinel text does not match canonical form: $LOOSE_BEGIN")
+        # R3 #2 fold: include both expected + actual for operator-clarity
+        DRIFT_LINES+=("DRIFT: sentinel text does not match canonical form. expected: '# === BEGIN gecko-alpha managed block (do not edit between sentinels) ===' got: '$LOOSE_BEGIN'")
     fi
 fi
 
@@ -113,23 +123,30 @@ elif ! diff -q "$EXPECTED_FILE" "$LIVE_FILE" >/dev/null 2>&1; then
     # paths + mtimes which vary between runs and would break sha256 ack
     # tombstone dedup — same drift would re-alert every run).
     DIFF_BODY="$(diff -u --label "repo:cron/gecko-alpha.crontab" --label "live:crontab -l" "$EXPECTED_FILE" "$LIVE_FILE" 2>/dev/null || true)"
-    if [[ -n "$DIFF_BODY" ]]; then
-        DRIFT_LINES+=("$DIFF_BODY")
-    fi
+    # R1 #7 fold: DIFF_BODY stays in its own variable (NOT appended to
+    # DRIFT_LINES), so the downstream `sort` over DRIFT_LINES doesn't
+    # scramble its `+`/`-`/`@@` lines. Appended back at report-assembly time.
 fi
 
 # --- Hash + ack-tombstone -----------------------------------------------
+#
+# R1 #7 fold: sort ONLY the single-line drift markers; append DIFF_BODY
+# (multi-line unified diff) unsorted afterward so operator can still read
+# the +/- structure in the Telegram alert. Hash is computed over the
+# combined report — deterministic across runs because DIFF_BODY uses
+# stable --label per the diff step above.
 
-DRIFT_REPORT_SORTED="$(printf '%s\n' "${DRIFT_LINES[@]:-}" | grep -v '^$' | sort || true)"
+DRIFT_MARKERS_SORTED="$(printf '%s\n' "${DRIFT_LINES[@]:-}" | grep -v '^$' | sort || true)"
+DRIFT_REPORT="${DRIFT_MARKERS_SORTED}${DIFF_BODY:+$'\n'$DIFF_BODY}"
 
-if [[ -z "$DRIFT_REPORT_SORTED" ]]; then
+if [[ -z "$DRIFT_REPORT" ]]; then
     touch "$HEARTBEAT_FILE" 2>/dev/null || true
     rm -f "$ACK_FILE" 2>/dev/null || true
     echo "OK: 0 drifts (managed block matches repo fragment)"
     exit 0
 fi
 
-DRIFT_HASH=$(printf '%s' "$DRIFT_REPORT_SORTED" | sha256sum | awk '{print $1}')
+DRIFT_HASH=$(printf '%s' "$DRIFT_REPORT" | sha256sum | awk '{print $1}')
 
 if [[ -f "$ACK_FILE" ]]; then
     PRIOR_HASH=$(cat "$ACK_FILE" 2>/dev/null || true)
@@ -143,13 +160,17 @@ fi
 
 MAX_BODY=3500
 TRUNC_FOOTER=""
-if [[ "${#DRIFT_REPORT_SORTED}" -gt "$MAX_BODY" ]]; then
-    DRIFT_REPORT_SORTED="${DRIFT_REPORT_SORTED:0:$MAX_BODY}"
+if [[ "${#DRIFT_REPORT}" -gt "$MAX_BODY" ]]; then
+    DRIFT_REPORT="${DRIFT_REPORT:0:$MAX_BODY}"
     TRUNC_FOOTER=$'\n(more drifts truncated — see journalctl for cron-drift-watchdog)'
 fi
 
+# R3 #1 fold: append actionable next-step so operator-on-Telegram-at-3am
+# knows what to do without reading the script source.
+ACTION_LINE=$'\nACTION: run `bash /root/gecko-alpha/cron/deploy.sh` to revert to repo state, OR commit the change to cron/gecko-alpha.crontab if intentional.'
+
 ALERT_BODY="⚠️ cron-drift-watchdog: drift detected
-$DRIFT_REPORT_SORTED$TRUNC_FOOTER"
+$DRIFT_REPORT$TRUNC_FOOTER$ACTION_LINE"
 
 # UV_BIN stub path (tests)
 if [[ -n "$UV_BIN" ]]; then

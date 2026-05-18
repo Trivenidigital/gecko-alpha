@@ -1566,15 +1566,15 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **Status:** PROPOSED 2026-05-18 — PR-stage R2 #13 fold from BL-NEW-CRON-DRIFT-WATCHDOG. CLAUDE.md §12a compliance: shipping a new heartbeat-writing watchdog without a stale-detector is the silent-failure surface §12a exists to prevent.
 **Tag:** `observability` `watchdog` `silent-failure-prevention`
 **Why:** `scripts/cron-drift-watchdog.sh` writes `/var/lib/gecko-alpha/cron-drift-watchdog/heartbeat` on CLEAN runs but no separate monitor checks the heartbeat's freshness. If the watchdog itself stops running (cron line removed, script broken, etc.), the operator has no signal.
-**Action:** ~1h. Extend existing `scripts/gecko-backup-watchdog.sh` (or create `scripts/cron-drift-stale-heartbeat-watchdog.sh` modeled on it) to alert when the cron-drift-watchdog heartbeat is older than N hours (default 25h to cover a daily cron firing 1-hour-late). Add to cron managed block in `cron/gecko-alpha.crontab`.
-**Decision-by:** 4 weeks from PR #156 merge.
+**Action:** ~1h. Extend existing `scripts/gecko-backup-watchdog.sh` (or create `scripts/cron-drift-stale-heartbeat-watchdog.sh` modeled on it) to alert when the cron-drift-watchdog heartbeat is older than N hours (default 25h to cover a daily cron firing 1-hour-late). Add to cron managed block in `cron/gecko-alpha.crontab`. Until shipped, operator runs the one-liner in `cron/README.md` §"Heartbeat freshness check".
+**Decision-by:** 2026-06-15 (4 weeks from PR #156 merge).
 
 ### BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT: backport mktemp + curl --max-time fixes to systemd-watchdog
 **Status:** PROPOSED 2026-05-18 — PR-stage R2 #4 + #12 fold from BL-NEW-CRON-DRIFT-WATCHDOG.
 **Tag:** `security-hardening` `watchdog` `tech-debt`
 **Why:** PR #156 (cron-drift-watchdog) fixed two latent issues that also exist in `scripts/systemd-drift-watchdog.sh`: (a) `/tmp/.gecko-drift-resp.$$` is a predictable PID-based tmp path — symlink-attack surface if local non-root user pre-creates the symlink; (b) `curl` without `--max-time` can hold the flock indefinitely on hung network. Same fixes apply.
-**Action:** ~30min. Apply `mktemp -t gecko-systemd-drift-resp.XXXXXX` + `curl --max-time 30` to `scripts/systemd-drift-watchdog.sh`. Add regression-style tests for both.
-**Decision-by:** 4 weeks from PR #156 merge.
+**Action:** ~30min. Apply `mktemp -t gecko-systemd-drift-resp.XXXXXX` + `curl --max-time 30` to `scripts/systemd-drift-watchdog.sh`. Add regression-style tests for both. Plus 2 precedent issues caught by PR #156 R2 review: (a) ACK_DIR mkdir failure + flock attempt fails confusingly (script L51-59); (b) leading-whitespace `.env` token-grep silently skips entries with leading space. Bundle all 4 hardening items.
+**Decision-by:** 2026-06-15 (4 weeks from PR #156 merge).
 
 ### BL-NEW-CRON-TO-SYSTEMD-TIMER: convert 2 weekly cron entries to systemd timers (cycle 11 follow-up)
 **Status:** PROPOSED 2026-05-17 — cycle 11 design-tension follow-up (V53 fold).
