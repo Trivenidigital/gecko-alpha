@@ -630,7 +630,14 @@ async def _fetch_coingecko_lanes(
     settings: Settings,
     db: Database,
 ) -> tuple[list, list, list, list, list]:
-    """Run CoinGecko lanes sequentially so 429 cooldown stops lower-priority fan-out."""
+    """Run CoinGecko lanes sequentially so 429 cooldown stops lower-priority fan-out.
+
+    held_position runs FIRST: it is the smallest budget footprint (1 call) and
+    the most operationally critical surface (live trailing-stop evaluator
+    depends on fresh price_cache rows). When the rolling-window budget is
+    tight, placing it after the larger scanner lanes structurally starves it
+    — see `tasks/findings_cg_budget_attribution_2026_05_18.md`.
+    """
 
     async def _call(name: str, fn, *args):
         try:
@@ -639,30 +646,32 @@ async def _fetch_coingecko_lanes(
             logger.warning("coingecko_lane_failed", lane=name, error=str(exc))
             return exc
 
+    held_position_raw = await _call(
+        "held_position_prices", fetch_held_position_prices, session, settings, db
+    )
+    if coingecko_limiter.is_backing_off():
+        logger.warning(
+            "coingecko_lanes_stopped_for_backoff", after="held_position_prices"
+        )
+        return [], [], [], [], held_position_raw
+
     cg_movers = await _call("top_movers", cg_fetch_top_movers, session, settings)
     if coingecko_limiter.is_backing_off():
         logger.warning("coingecko_lanes_stopped_for_backoff", after="top_movers")
-        return cg_movers, [], [], [], []
+        return cg_movers, [], [], [], held_position_raw
 
     cg_trending = await _call("trending", cg_fetch_trending, session, settings)
     if coingecko_limiter.is_backing_off():
         logger.warning("coingecko_lanes_stopped_for_backoff", after="trending")
-        return cg_movers, cg_trending, [], [], []
+        return cg_movers, cg_trending, [], [], held_position_raw
 
     cg_by_volume = await _call("by_volume", cg_fetch_by_volume, session, settings)
     if coingecko_limiter.is_backing_off():
         logger.warning("coingecko_lanes_stopped_for_backoff", after="by_volume")
-        return cg_movers, cg_trending, cg_by_volume, [], []
+        return cg_movers, cg_trending, cg_by_volume, [], held_position_raw
 
     cg_midcap_gainers = await _call(
         "midcap_gainers", cg_fetch_midcap_gainers, session, settings
-    )
-    if coingecko_limiter.is_backing_off():
-        logger.warning("coingecko_lanes_stopped_for_backoff", after="midcap_gainers")
-        return cg_movers, cg_trending, cg_by_volume, cg_midcap_gainers, []
-
-    held_position_raw = await _call(
-        "held_position_prices", fetch_held_position_prices, session, settings, db
     )
     return cg_movers, cg_trending, cg_by_volume, cg_midcap_gainers, held_position_raw
 
