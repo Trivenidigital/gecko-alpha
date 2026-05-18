@@ -376,6 +376,16 @@ class Settings(BaseSettings):
     # so attackers without secret can't flood with multi-MB bodies.
     # (Vector B D5 fold.) 16KB comfortably fits a max-length tweet + metadata.
     NARRATIVE_SCANNER_MAX_BODY_BYTES: int = 16 * 1024
+    # BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE Reviewer 1 P1 fold: separate secret
+    # for the internal operator-alert endpoint so the dispatcher can still
+    # raise a Telegram alert when NARRATIVE_SCANNER_HMAC_SECRET is missing
+    # (the exact failure mode the operator-alert endpoint exists to surface).
+    # Same shape rules as NARRATIVE_SCANNER_HMAC_SECRET — empty (feature off)
+    # or >= 32 chars. The internal-alert endpoint gates 503 when this is
+    # empty. Body-size cap + replay-window settings are shared with the
+    # narrative endpoint (they're generic HMAC mechanics, not narrative-
+    # specific).
+    OPERATOR_ALERT_HMAC_SECRET: str = ""
     # NOTE: rate-limit middleware (slowapi) deferred to Day 2 — see
     # tasks/design_crypto_narrative_scanner.md §8. PR #110 V1-I1 fold:
     # the unused NARRATIVE_SCANNER_RATE_LIMIT_PER_MIN setting was removed
@@ -747,6 +757,20 @@ class Settings(BaseSettings):
         if v and len(v) < 32:
             raise ValueError(
                 "NARRATIVE_SCANNER_HMAC_SECRET must be empty (feature off) "
+                f"or >= 32 chars (got len={len(v)}). Generate via "
+                '`python3 -c "import secrets; print(secrets.token_hex(32))"` '
+                "for a 64-char hex secret."
+            )
+        return v
+
+    @field_validator("OPERATOR_ALERT_HMAC_SECRET")
+    @classmethod
+    def _validate_operator_alert_hmac_secret(cls, v: str) -> str:
+        """Mirror NARRATIVE_SCANNER_HMAC_SECRET's empty-or->=32-chars rule
+        (Reviewer 1 P1 fold)."""
+        if v and len(v) < 32:
+            raise ValueError(
+                "OPERATOR_ALERT_HMAC_SECRET must be empty (feature off) "
                 f"or >= 32 chars (got len={len(v)}). Generate via "
                 '`python3 -c "import secrets; print(secrets.token_hex(32))"` '
                 "for a 64-char hex secret."

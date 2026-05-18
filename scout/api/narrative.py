@@ -118,15 +118,36 @@ def _reject(status_code: int, reason: str, detail: str) -> HTTPException:
     return HTTPException(status_code=status_code, detail=detail)
 
 
-async def _verify_hmac(request: Request, settings: Settings) -> bytes:
+async def _verify_hmac(
+    request: Request,
+    settings: Settings,
+    *,
+    secret_field: str = "NARRATIVE_SCANNER_HMAC_SECRET",
+    feature_label: str = "narrative_scanner",
+) -> bytes:
     """Verify HMAC headers; raise 401/403/409/413/503 on any failure.
 
     Returns the request body bytes on success (caller doesn't need to re-read).
-    Feature gate: empty ``NARRATIVE_SCANNER_HMAC_SECRET`` → 503.
+    Feature gate: empty secret (read from ``settings`` via ``secret_field``)
+    → 503.
+
+    BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE Reviewer 1 P1 fold: caller supplies
+    the Settings attribute name holding the relevant HMAC secret, so a
+    second consumer (operator-alert) can authenticate against
+    ``OPERATOR_ALERT_HMAC_SECRET`` independently of
+    ``NARRATIVE_SCANNER_HMAC_SECRET``. Default arguments preserve the
+    existing narrative-router behavior bit-for-bit.
+
+    Body-size cap (``NARRATIVE_SCANNER_MAX_BODY_BYTES``) and replay window
+    (``NARRATIVE_SCANNER_REPLAY_WINDOW_SEC``) are shared across consumers —
+    they encode generic HMAC mechanics (DoS protection + replay), not
+    narrative-specific values.
     """
-    if not settings.NARRATIVE_SCANNER_HMAC_SECRET:
-        # V2-PR-review B-D1 fold: drop env-var name from detail (info-leak hardening).
-        raise _reject(503, "disabled", "narrative_scanner: feature disabled")
+    secret = getattr(settings, secret_field, "")
+    if not secret:
+        # V2-PR-review B-D1 fold: drop env-var name from detail (info-leak
+        # hardening). ``feature_label`` provides per-caller context.
+        raise _reject(503, "disabled", f"{feature_label}: feature disabled")
 
     # Body-size cap BEFORE reading body or computing HMAC.
     # V2-PR-review B-D5 fold: prevents body-flood DoS by unauthenticated clients.
@@ -180,7 +201,7 @@ async def _verify_hmac(request: Request, settings: Settings) -> bytes:
         )
 
     expected = _compute_signature(
-        settings.NARRATIVE_SCANNER_HMAC_SECRET,
+        secret,
         request.method,
         request.url.path,
         request.url.query,  # V2-PR-review B-C1 fold: bind query string

@@ -87,6 +87,19 @@ def create_app(db_path: str | None = None) -> FastAPI:
     else:
         app.include_router(_create_narrative_stub())
 
+    # BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE: mount internal-alert router.
+    # Reuses the same HMAC secret + verifier as the narrative router; gates
+    # on the same Settings load. See scout/api/internal_alert.py.
+    from scout.api.internal_alert import create_router as _create_internal_alert_router
+    from scout.api.internal_alert import (
+        create_stub_router as _create_internal_alert_stub,
+    )
+
+    if _DASHBOARD_SETTINGS is not None:
+        app.include_router(_create_internal_alert_router(_DASHBOARD_SETTINGS))
+    else:
+        app.include_router(_create_internal_alert_stub())
+
     # --- REST endpoints ---
 
     @app.get("/api/candidates", response_model=list[CandidateResponse])
