@@ -17,7 +17,7 @@ Last updated: 2026-05-18 (overnight audit closures + cycle 14 held-position refr
 - [x] DEX coverage audit: pure-DEX/contract-address held cohort remains empty; refresh-rate gap follow-up is superseded by shipped PR #158.
 - [x] Findings docs + backlog flip + follow-up filing
 - [x] PR #157 opened
-- [ ] Post-merge bookkeeping
+- [x] Post-merge bookkeeping: PR #157 squash-merged to master at `be36bfb` on 2026-05-18; audit findings are now landed.
 
 ## Active Work: BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT
 
@@ -26,6 +26,7 @@ Last updated: 2026-05-18 (overnight audit closures + cycle 14 held-position refr
 - [x] Hermes-first: optional Hermes blockchain skills use CoinGecko-backed price lookup, but no skill replaces gecko-alpha's in-process held-position `price_cache` fallback.
 - [x] Minimal fallback design added to PR #163: `tasks/design_held_position_fallback_coins_endpoint.md`.
 - [x] Backlog status updated to `DESIGN-READY 2026-05-18 — PR #163 merged 2f8f187`; implementation remains gated on PR #158 post-deploy `simple_price_missing_ids` evidence.
+- [x] 2026-05-18 post-flip follow-up: `simple_price_missing_ids` now appears during active CoinGecko 429/backoff, so fallback implementation remains blocked until misses recur outside rate-limit windows and `/coins/{id}` probes fit the budget.
 
 ## Active Work: BL-NEW-HELD-POSITION-REFRESH-RATE-GAP (PR #158)
 
@@ -38,6 +39,7 @@ Last updated: 2026-05-18 (overnight audit closures + cycle 14 held-position refr
 - [x] Findings doc with empirical evidence + post-deploy soak plan
 - [x] backlog.md: new entry filed with PR-OPEN/SCRIPT-READY status + 2 evidence-gated follow-ups (`BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT` + `BL-NEW-HELD-POSITION-STALE-COUNT-ALERT`)
 - [x] 2026-05-18 validation deployment check: VPS `/root/gecko-alpha` reached master `147cba4`, but validation is blocked because effective config has `HELD_POSITION_PRICE_REFRESH_ENABLED=False` (no `.env` or systemd override); no `held_position_refresh_summary` / `simple_price_missing_ids` evidence collected and 24h validation remains incomplete.
+- [x] 2026-05-18 operator flip: VPS `.env` now has `HELD_POSITION_PRICE_REFRESH_ENABLED=True` + `HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES=1`; first cycle refreshed 150/150, later cycles hit repeated CG 429/backoff with `refreshed_count=0` and 25-26 `simple_price_missing_ids`; 24h validation remains incomplete.
 - [x] Validation prep doc added via PR #163: `tasks/validation_pr158_held_position_refresh_rate_gap.md` with two-step SSH commands, required journal fields, stale-cohort overlap comparison, and `/coins/{id}` fallback promotion gate.
 - [x] PR #158 created + 3 PR reviewers folded; operator P1/P2 false-positive/tz-normalization fold landed.
 - [x] Post-merge: bookkeeping flip per cycle-12+13 convention (`SHIPPED 2026-05-18 — PR #158 merged a649032`)
@@ -108,6 +110,7 @@ Review:
 - [x] Reviewer-2 PR-review fold: scope trim — BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT now systemd-only (cron-watchdog ships ACK_DIR-exit-9 fix)
 - [x] Reviewer-3 PR-review fold: backlog wording corrected — "SCRIPT-SHIPPED" was premature pre-merge; renamed pre-merge state to "PR-OPEN / SCRIPT-READY / SCHEDULING-PENDING-OPERATOR"; post-merge action text updated with 3-stage convention (PR merge → SCRIPT-SHIPPED with SHA → operator scheduling → SHIPPED/SCHEDULED)
 - [x] Post-merge stage 1 (bookkeeping): flipped PR-OPEN/SCRIPT-READY → SCRIPT-SHIPPED with PR #156 merge SHA `7f9aee6`
+- [x] Post-merge follow-up: PR #159 squash-merged to master at `63aeef0` on 2026-05-18; backlog status for BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT flipped to SHIPPED.
 - [ ] Post-merge stage 2 (operator scheduling, separate): operator adds cron line via cron/README §Setup; then flip → SHIPPED/SCHEDULED
 
 ## Active Work: BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT
