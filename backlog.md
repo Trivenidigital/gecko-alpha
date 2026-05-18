@@ -880,6 +880,16 @@ ssh root@89.167.116.187 "journalctl -u gecko-pipeline --since '<post-merge times
 **Action:** ~1.5h. Add curl-direct TG alert path inside `fetch_held_position_prices` after the gauge computation; reuse cycle-12 `parse_mode=None` pattern; 24h dedup matching `_warned_today`.
 **Decision-by:** 2026-06-15 (4 weeks from PR #158 merge; baseline window must close first).
 
+### BL-NEW-CG-LANE-ORDER-HELD-POSITION-FIRST: reorder _fetch_coingecko_lanes so held_position runs first
+**Status:** PR-OPEN 2026-05-18 — PR #170 (`feat/cg-budget-attribution`, base master); CI green (Tests workflow SUCCESS); Reviewer 1 code-path approved, doc/status fold applied. Post-merge flip: update this entry to `SHIPPED 2026-05-18 — PR #170 merged <sha>` and add `tasks/findings_cg_budget_attribution_2026_05_18.md` reference if it lands at a different SHA. Post-deploy: run the validation-gate block from the findings doc against srilu-vps before flipping #158 24h validation complete.
+**Tag:** `coingecko-budget` `lane-ordering` `held-position-refresh` `silent-failure-prevention` `small-fix`
+**Why:** After PR #158 enabled the held-position refresh lane on 2026-05-18T16:09:51Z, cycle 1 refreshed all 150 held positions cleanly but every subsequent cycle showed `refreshed_count=0` / `not_found_count=145-147`. Diagnosis traces to lane ordering: `_fetch_coingecko_lanes` runs scanner lanes (top_movers, trending, by_volume, midcap_gainers) FIRST, consuming ~7-10 calls of the conservative 6/min budget, then held_position fires its 1 /simple/price call against an exhausted CG IP-rate-limit window → 429 → 120s cooldown → next cycle repeats. See `tasks/findings_cg_budget_attribution_2026_05_18.md`.
+**Action:** reorder `_fetch_coingecko_lanes` so `fetch_held_position_prices` runs FIRST. Single-function move (~10 line net change) + test update. Held is 1 call vs 7-10 for scanners; protecting the smallest, most operationally critical lane (live trailing-stop evaluator depends on fresh `price_cache` rows) is asymmetric-risk favorable.
+**Validation gate:** post-deploy 2h window must show (a) `held_position_refresh_summary.refreshed_count > 0` for ≥3 consecutive cycles outside fresh 429 cooldown windows AND (b) `simple_price_missing_ids` shrinks toward `[]` for the steady-state cohort. Scanner-side 429 may rise slightly; should NOT fully starve any single scanner.
+**Hermes-first:** same domain as BL-NEW-CG-RATE-LIMITER-BURST-PROFILE; no Hermes lane-orchestration primitive exists (verified via design doc's prior check).
+**Drift verdict:** existing primitive `_fetch_coingecko_lanes` modified in place; no new primitives introduced.
+**Decision-by:** 2 weeks (mirrors BL-NEW-CG-RATE-LIMITER-BURST-PROFILE cadence).
+
 ### BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE: wire push-notification for narrative_alert_dispatcher 503 misconfig (Path C1)
 **Status:** PROPOSED 2026-05-13 — filed alongside narrative-scanner V1.1 dispatcher ship. Replaces V1.1's Path B (log-only) 503 alert semantics with active push delivery.
 **Tag:** `narrative-scanner` `path-c1` `operator-alert` `post-activation` `evidence-gated`

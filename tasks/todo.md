@@ -1,6 +1,34 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-18 (overnight audit closures + cycle 14 held-position refresh follow-up)
+Last updated: 2026-05-18 (cycle 14: CG budget attribution + stale PR triage)
+
+## Active Work: BL-NEW-CG-LANE-ORDER-HELD-POSITION-FIRST (PR #170)
+
+- [x] Drift-check: existing primitive `_fetch_coingecko_lanes` in scout/main.py:628-667; ratified shape from PR #131; no new primitive needed.
+- [x] Hermes-first: same domain as BL-NEW-CG-RATE-LIMITER-BURST-PROFILE; design doc's prior negative check (no Hermes lane-orchestration primitive) carries forward.
+- [x] VPS log attribution (2h window): 9 cycles; 42 `cg_429_backoff`; 9 `coingecko_lanes_stopped_for_backoff`. Cycle 1 (post-flip) succeeded due to fortuitous 40.9s pre-cycle backoff; cycles 2+ failed wholesale (refreshed_count=0, not_found_count=145-147).
+- [x] Root cause: held_position runs LAST in `_fetch_coingecko_lanes`; scanner lanes consume ~7-10 calls of the 6/min budget before /simple/price fires; CG IP-rate-limit window is saturated by the time held_position arrives.
+- [x] Code fix: reorder so `fetch_held_position_prices` runs FIRST; preserve `held_position_raw` in every stop-on-backoff early-return path.
+- [x] Tests: 3 new tests in `tests/test_main.py` covering (held-first happy path / scanner-skipped-when-held-trips-backoff / scanner-backoff-after-held-preserves-payload).
+- [x] Findings doc: `tasks/findings_cg_budget_attribution_2026_05_18.md`.
+- [x] Backlog entry: `BL-NEW-CG-LANE-ORDER-HELD-POSITION-FIRST` filed.
+- [x] PR #170 opened against master.
+- [x] CI green: GitHub Actions Tests workflow `SUCCESS` on `feat/cg-budget-attribution`.
+- [x] Reviewer 1 doc/status fold applied: fresh Hermes-first check (3 surfaces clean on 2026-05-18) + backlog flipped PROPOSED→PR-OPEN + this CI box.
+- [ ] Post-deploy validation: held_position_refresh_summary.refreshed_count > 0 for ≥3 consecutive cycles outside fresh 429 cooldown windows; simple_price_missing_ids shrinks toward []; scanner lanes not chronically starved.
+
+## Stale PR triage (2026-05-18)
+
+| PR | Verdict | Action |
+|---|---|---|
+| #117 (overnight repo review findings) | OBSOLETE | CLOSED with evidence |
+| #118 (clickable X alert assets) | SUPERSEDED (already on master) | CLOSED with evidence |
+| #32 (LunarCrush drop + Sprint 1 promotion) | SUPERSEDED (already on master via #152) | CLOSED with evidence |
+| #105 (Phase B daily audit snapshot, WIP) | STILL VALUABLE | COMMENTED with rebase recommendation; left open |
+| #34 (BL-051 DexScreener top-boosts) | STILL VALUABLE | COMMENTED with rebase recommendation; left open |
+| #33 (BL-050 paper-trade edge detection) | STILL VALUABLE | COMMENTED with rebase recommendation; left open |
+
+Triage rationale: STILL VALUABLE entries are not small per operator guardrail ("rebase/build only if clearly still valuable and small"). Conflict surfaces span schema migrations, scorer refactors, cron-layout pattern changes — operator decides rebase priority.
 
 ## Active Work: items 1 + 2 (PR #155) — BL-NEW-AUDIT-SURFACE-ADDENDUM + BL-NEW-POLYMARKET-VERIFY
 

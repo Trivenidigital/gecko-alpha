@@ -57,21 +57,117 @@ def test_combine_coin_market_rows_includes_trending_and_dedupes():
     assert combined[0]["source"] == "top"
 
 
-async def test_fetch_coingecko_lanes_stops_after_backoff(monkeypatch, mock_db):
-    """Main-cycle CoinGecko orchestration stops lower-priority lanes after 429."""
+class _FakeLimiter:
+    def __init__(self):
+        self.backing_off = False
+
+    def is_backing_off(self):
+        return self.backing_off
+
+
+async def test_fetch_coingecko_lanes_runs_held_position_first(monkeypatch, mock_db):
+    """Lane order invariant: held_position is FIRST so its 1 /simple/price call
+    is not starved by the 7-10 calls/cycle scanner lanes consume.
+
+    See `tasks/findings_cg_budget_attribution_2026_05_18.md`.
+    """
     calls = []
+    limiter = _FakeLimiter()
 
-    class FakeLimiter:
-        def __init__(self):
-            self.backing_off = False
-
-        def is_backing_off(self):
-            return self.backing_off
-
-    limiter = FakeLimiter()
+    async def _held_position(session, settings, db):
+        calls.append("held_position_prices")
+        return [{"id": "held-1", "current_price": 1.0}]
 
     async def _top_movers(session, settings):
         calls.append("top_movers")
+        return []
+
+    async def _trending(session, settings):
+        calls.append("trending")
+        return []
+
+    async def _by_volume(session, settings):
+        calls.append("by_volume")
+        return []
+
+    async def _midcap(session, settings):
+        calls.append("midcap_gainers")
+        return []
+
+    monkeypatch.setattr("scout.main.coingecko_limiter", limiter)
+    monkeypatch.setattr("scout.main.fetch_held_position_prices", _held_position)
+    monkeypatch.setattr("scout.main.cg_fetch_top_movers", _top_movers)
+    monkeypatch.setattr("scout.main.cg_fetch_trending", _trending)
+    monkeypatch.setattr("scout.main.cg_fetch_by_volume", _by_volume)
+    monkeypatch.setattr("scout.main.cg_fetch_midcap_gainers", _midcap)
+
+    cg_movers, cg_trending, cg_by_volume, cg_midcap, held = (
+        await _fetch_coingecko_lanes(AsyncMock(), MagicMock(), mock_db)
+    )
+
+    # Lane order: held_position must be the first lane invoked.
+    assert calls[0] == "held_position_prices"
+    # All five lanes run when no backoff.
+    assert calls == [
+        "held_position_prices",
+        "top_movers",
+        "trending",
+        "by_volume",
+        "midcap_gainers",
+    ]
+    # Held result preserved.
+    assert held == [{"id": "held-1", "current_price": 1.0}]
+
+
+async def test_fetch_coingecko_lanes_stops_scanners_when_held_position_triggers_backoff(
+    monkeypatch, mock_db
+):
+    """If held_position itself trips the shared limiter into backoff, scanner
+    lanes are skipped but the held_position_raw payload is preserved in
+    tuple position 4."""
+    calls = []
+    limiter = _FakeLimiter()
+
+    async def _held_position(session, settings, db):
+        calls.append("held_position_prices")
+        limiter.backing_off = True
+        return [{"id": "held-1"}]
+
+    async def _unexpected(*args):
+        calls.append("unexpected")
+        return []
+
+    monkeypatch.setattr("scout.main.coingecko_limiter", limiter)
+    monkeypatch.setattr("scout.main.fetch_held_position_prices", _held_position)
+    monkeypatch.setattr("scout.main.cg_fetch_top_movers", _unexpected)
+    monkeypatch.setattr("scout.main.cg_fetch_trending", _unexpected)
+    monkeypatch.setattr("scout.main.cg_fetch_by_volume", _unexpected)
+    monkeypatch.setattr("scout.main.cg_fetch_midcap_gainers", _unexpected)
+
+    result = await _fetch_coingecko_lanes(AsyncMock(), MagicMock(), mock_db)
+
+    assert result == ([], [], [], [], [{"id": "held-1"}])
+    assert calls == ["held_position_prices"]
+
+
+async def test_fetch_coingecko_lanes_preserves_held_when_scanner_triggers_backoff(
+    monkeypatch, mock_db
+):
+    """The lane-reorder fix's intent: scanner-triggered backoff AFTER
+    held_position must not lose the held_position payload. Under the prior
+    ordering (held last), this scenario produced 0 refreshed."""
+    calls = []
+    limiter = _FakeLimiter()
+
+    async def _held_position(session, settings, db):
+        calls.append("held_position_prices")
+        return [{"id": "held-x"}]
+
+    async def _top_movers(session, settings):
+        calls.append("top_movers")
+        # Simulate scanner triggering 429 cooldown — under the prior order
+        # this would have starved held_position; under the new order it
+        # only stops the remaining scanner cascade.
         limiter.backing_off = True
         return []
 
@@ -80,16 +176,20 @@ async def test_fetch_coingecko_lanes_stops_after_backoff(monkeypatch, mock_db):
         return []
 
     monkeypatch.setattr("scout.main.coingecko_limiter", limiter)
+    monkeypatch.setattr("scout.main.fetch_held_position_prices", _held_position)
     monkeypatch.setattr("scout.main.cg_fetch_top_movers", _top_movers)
     monkeypatch.setattr("scout.main.cg_fetch_trending", _unexpected)
     monkeypatch.setattr("scout.main.cg_fetch_by_volume", _unexpected)
     monkeypatch.setattr("scout.main.cg_fetch_midcap_gainers", _unexpected)
-    monkeypatch.setattr("scout.main.fetch_held_position_prices", _unexpected)
 
-    result = await _fetch_coingecko_lanes(AsyncMock(), MagicMock(), mock_db)
+    cg_movers, cg_trending, cg_by_volume, cg_midcap, held = (
+        await _fetch_coingecko_lanes(AsyncMock(), MagicMock(), mock_db)
+    )
 
-    assert result == ([], [], [], [], [])
-    assert calls == ["top_movers"]
+    # Held data preserved even after scanner triggered backoff.
+    assert held == [{"id": "held-x"}]
+    # Remaining scanners after top_movers were skipped per backoff cascade.
+    assert calls == ["held_position_prices", "top_movers"]
 
 
 async def test_run_cycle_dry_run(mock_db, mock_session, mock_settings):
