@@ -1,6 +1,11 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-17 (BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT findings shipped; BL-NEW-LC-REVIVAL-CRITERIA-TIGHTENING PR #150 merged at a20891f)
+Last updated: 2026-05-18 (overnight closures: BL-NEW-AUDIT-SURFACE-ADDENDUM + BL-NEW-POLYMARKET-VERIFY → AUDITED 2026-05-18)
+
+## Active Work: Overnight closures 2026-05-18 — items 1 + 2
+
+- [x] **Item 1: BL-NEW-AUDIT-SURFACE-ADDENDUM**: 5-category mini-sweep clean (nginx/caddy not-found, /etc/systemd/system.conf only [Manager], /etc/apt/sources.list.d/ minimal, docker/containerd not-found, systemd inventory matches cycle-6 captures). Status PROPOSED → AUDITED 2026-05-18. Findings: `tasks/findings_audit_surface_addendum_2026_05_18.md`.
+- [x] **Item 2: BL-NEW-POLYMARKET-VERIFY**: `/opt/polymarket-ml-signal/` does NOT exist; stale cron entry confirmed (outside gecko-alpha managed block, silently failing every 6h). Status PROPOSED → AUDITED 2026-05-18. Findings: `tasks/findings_polymarket_verify_2026_05_18.md`. Operator-pastable removal command embedded.
 
 ## Active Work: BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT
 

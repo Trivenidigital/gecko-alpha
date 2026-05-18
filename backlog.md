@@ -1587,9 +1587,11 @@ Expected: known 4-app tenant set unchanged; no unexpected listening ports.
 **decision-by:** 2026-06-14.
 
 ### BL-NEW-AUDIT-SURFACE-ADDENDUM: 5-category mini-sweep next cycle (cycle 11 follow-up)
-**Status:** PROPOSED 2026-05-17 — cycle 11 V58 PR-review FOLLOW-UP from BL-NEW-OTHER-PROD-CONFIG-AUDIT.
-**Why:** Cycle 11 covered the backlog-listed 17 categories. V58 surfaced 5 additional surfaces (nginx/caddy explicit probe, `/etc/systemd/system.conf`, `/etc/apt/sources.list.d/`, docker/containerd, complete systemd unit inventory) that are operationally meaningful but not in the original backlog scope.
-**Action:** ~3min mini-sweep + ~5min findings doc update OR ~30min full follow-up cycle if anything surfaces:
+**Status:** AUDITED 2026-05-18 — see `tasks/findings_audit_surface_addendum_2026_05_18.md`. All 5 categories clean: nginx/caddy not-found, /etc/systemd/system.conf only `[Manager]`, /etc/apt/sources.list.d/ minimal (nodesource + ubuntu), docker/containerd not-found, systemd inventory matches captured cycle-6 units. No follow-ups filed.
+
+**Original status (now historical):** PROPOSED 2026-05-17 — cycle 11 V58 PR-review FOLLOW-UP from BL-NEW-OTHER-PROD-CONFIG-AUDIT. V58 surfaced 5 additional surfaces (nginx/caddy explicit probe, `/etc/systemd/system.conf`, `/etc/apt/sources.list.d/`, docker/containerd, complete systemd unit inventory) that are operationally meaningful but not in the original backlog scope.
+
+**Re-run** (when srilu infrastructure shifts):
 ```bash
 ssh root@srilu-vps '
 systemctl is-enabled nginx caddy 2>&1
@@ -1599,13 +1601,16 @@ systemctl is-enabled docker containerd 2>&1
 systemctl list-units --type=service --all | grep -v "@\.service$" | head -40
 '
 ```
-**Decision-by:** 4 weeks (low priority; mini-sweep is cheap).
 
 ### BL-NEW-POLYMARKET-VERIFY: operator confirms polymarket-ml-signal path validity (cycle 11 follow-up)
-**Status:** PROPOSED 2026-05-17 — cycle 11 follow-up (V52 + V53 fold).
-**Why:** Cycle 11 sweep showed crontab references `/opt/polymarket-ml-signal/scripts/extract_data.sh` every 6h, but `ls /opt/` returned empty. Possible explanations: (a) polymarket dir was deleted, (b) sweep redirect collapsed output, (c) different path layout. Informational; no gecko impact.
-**Action:** ~5min operator confirmation: `ssh root@srilu-vps 'ls -la /opt/polymarket-ml-signal/ 2>&1; ls -la /opt/ 2>&1'`. If path valid → confirm inventory accurate. If absent → remove the stale cron entry (`crontab -e`).
-**decision-by:** 4 weeks (low priority; informational only).
+**Status:** AUDITED 2026-05-18 — see `tasks/findings_polymarket_verify_2026_05_18.md`. Path `/opt/polymarket-ml-signal/` does NOT exist; `/opt/` empty. Stale cron line confirmed (outside gecko-alpha managed block, silently failing every 6h). Findings doc emits operator-pastable removal command + safety bounds. Cycle-11 V52+V53 hypothesis (b) "sweep redirect collapsed output" eliminated; (a) "polymarket dir was deleted" or never-installed confirmed.
+
+**Original status (now historical):** PROPOSED 2026-05-17 — cycle 11 follow-up (V52 + V53 fold). Cycle 11 sweep showed crontab references `/opt/polymarket-ml-signal/scripts/extract_data.sh` every 6h, but `ls /opt/` returned empty.
+
+**Operator action (one-line, scoped, reversible):**
+```bash
+ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
+```
 
 ### BL-NEW-CHAIN-COMPLETED-SILENCE-AUDIT: investigate 10+ day chain_completed silence
 **Status:** SHIPPED-WITH-FINDING 2026-05-17 — branch `feat/chain-completed-silence-audit` (cycle 8, audit-only). Findings doc: `tasks/findings_chain_completed_silence_2026_05_17.md`. **Confirmed regression:** chain_matches narrative pipeline silent 5.5d (last 2026-05-11T16:43Z); memecoin pipeline silent 13d (last 2026-05-04T00:51Z). active_chains MAX(anchor_time)=2026-05-11T16:42Z (no new anchors); signal_params enabled=1 (NOT auto-suspended); code path unchanged in May. Mechanism per §9c: visible levers (enabled=1, code unchanged) ≠ controlling lever (something stopped creating new active_chains rows). Surfaced as HIGH-priority fix item `BL-NEW-CHAIN-ANCHOR-PIPELINE-FIX`. Second chain-pipeline silence in ~6 weeks (prior: 2026-04-14→2026-05-01, 17d, fixed PR #60/#61); same substrate class.
