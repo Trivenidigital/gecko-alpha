@@ -108,6 +108,12 @@ class Settings(BaseSettings):
     # AUTOSUSPEND-FIX soak close). Revert via _ENABLED=False.
     HELD_POSITION_PRICE_REFRESH_ENABLED: bool = False
     HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES: int = 1
+    # BL-NEW-HELD-POSITION-REFRESH-RATE-GAP (cycle 13): per-token persistent-
+    # stale WARN threshold. ≥ this many hours of cache staleness on an open
+    # paper_trade emits one WARN/24h to journalctl (in-memory dedup; resets on
+    # pipeline restart). Default 24 aligns with the stale_open_count gauge
+    # threshold (single semantic across both surfaces).
+    HELD_POSITION_STALE_WARN_HOURS: int = 24
 
     # MiroFish
     MIROFISH_URL: str = "http://localhost:5001"
@@ -835,6 +841,20 @@ class Settings(BaseSettings):
         if v < 1:
             raise ValueError(
                 f"revival-criteria count/days thresholds must be >= 1; got={v}"
+            )
+        return v
+
+    @field_validator("HELD_POSITION_STALE_WARN_HOURS")
+    @classmethod
+    def _validate_held_position_stale_warn_hours(cls, v: int) -> int:
+        # PR-#158 R2 IMPORTANT 2 fold: also reject absurdly large values that
+        # would silently suppress all WARNs on a system the operator believes
+        # is monitored — Class-3-adjacent silent-failure. 168h (1 week) is the
+        # operational ceiling beyond which a stale held position is no longer
+        # actionable (trade has materially aged past expected horizon).
+        if v < 1 or v > 168:
+            raise ValueError(
+                f"HELD_POSITION_STALE_WARN_HOURS must be in [1, 168]; got={v}"
             )
         return v
 

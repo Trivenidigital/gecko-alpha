@@ -854,6 +854,29 @@ ssh root@89.167.116.187 "journalctl -u gecko-pipeline --since '<post-merge times
 **Acceptance:** With the fallback shipped, every open paper_trade has a `price_cache` row that's < N minutes old regardless of whether the underlying token has a CG listing.
 **Estimate:** 2-4 hours including DexScreener client wiring + tests.
 
+### BL-NEW-HELD-POSITION-REFRESH-RATE-GAP: 14% of open paper_trades have stale_gt_24h price_cache rows (separate from DEX-coverage)
+**Status:** PR-OPEN 2026-05-18 — PR #158. Visibility-first fix: stale_open_count gauge + per-token persistent-stale WARN (paper_trade_id + symbol + consequence per R3 I2 fold; 24h dedup; 7d prune) + `_get_cached_price_ages` + `_get_held_trade_metadata` helpers + `simple_price_missing_ids` log diagnostic. Root cause SUSPECTED stale-source behavior (softened per R1 C1 — empirical validation deferred to post-deploy via the new `simple_price_missing_ids` log field). 33/33 tests pass on srilu Python 3.12.3. Task 4 (`/coins/{id}` fallback) descoped pending CG-rate-limit-clear + manual-curl verification. Filed `BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT` + `BL-NEW-HELD-POSITION-STALE-COUNT-ALERT` as evidence-gated/baseline-first follow-ups. See `tasks/findings_held_position_refresh_rate_gap_2026_05_18.md`.
+
+**Originating context:** 2026-05-18 cycle-12 PR #157 audit (`tasks/findings_dex_price_coverage_audit_2026_05_18.md`) surfaced 21/148 open paper_trades with `price_cache > 24h` stale. All 21 are cg-coin-id shape (NOT DEX-coverage class). Trailing-stop/peak-fade evaluators can't fire correctly on stale prices; 14% silent miss-rate is material.
+
+**Post-merge action (operator):** flip status above from `PR-OPEN / SCRIPT-READY` → `SHIPPED <merge-date> — merged <sha>`. After 24h soak, capture per-token WARN list + verify overlap with the 21 known stale tokens documented in findings doc; decide whether to ship `BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT` based on operator manual-curl of `/coins/{id}` for ≥1 stale token.
+
+### BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT: `/coins/{id}` second-pass for tokens missed by `/simple/price`
+**Status:** PROPOSED 2026-05-18 — evidence-gated follow-up to BL-NEW-HELD-POSITION-REFRESH-RATE-GAP. Descoped from PR #158 because CG returned HTTP 429 during direct-curl verification window; cannot confirm `/coins/{id}` recovers stale tokens.
+**Tag:** `held-position-refresh` `fallback` `evidence-gated` `cg-rate-limit-sensitive`
+**Why:** PR #158 confirms 21 of 148 open paper_trades have stale `price_cache` because CG `/simple/price` returns no data for them. `/coins/{id}` is plausibly more complete (returns per-token detail) but unverified.
+**Verification gate:** Operator manual-curls `https://api.coingecko.com/api/v3/coins/{tid}` for ≥3 of these 21 stale tokens (`pythia`, `iagon`, `kekius-maximus`). If ≥1 returns `market_data` payload, ship the fallback. If 0/3 return data (delisted from both endpoints), close as no-op (operator can manually retire affected signals).
+**Action (if ship):** ~2h. Cap `MAX_FALLBACK_PER_CYCLE=5` (CG free-tier 30/min budget; avoid burning quota); `coingecko_limiter.is_backing_off()` precheck before each call; reuse `_shape_for_cache_prices`-compatible dict shape per existing pattern.
+**Decision-by:** evidence-gated (CG-rate-limit-clearance window required); if no operator verification by 2026-06-30, close as inconclusive.
+
+### BL-NEW-HELD-POSITION-STALE-COUNT-ALERT: threshold-driven TG alert on stale_open_count
+**Status:** PROPOSED 2026-05-18 — baseline-first follow-up to BL-NEW-HELD-POSITION-REFRESH-RATE-GAP. Closes the §12a residual (operator-grep-required gauge → automated alert).
+**Tag:** `held-position-refresh` `observability` `silent-failure-prevention` `baseline-first`
+**Why:** PR #158 ships `stale_open_count` gauge in structured log + per-token WARN. Gauge is operator-grep-dependent. Per CLAUDE.md §12a, threshold-driven alert closes the silent-failure surface.
+**Threshold suggestion:** `stale_open_count > max(5, 0.05 * held_total)` for ≥3 consecutive cycles (hysteresis matching cycle-9 patterns). Specific threshold TBD after 7d post-deploy baseline measurement.
+**Action:** ~1.5h. Add curl-direct TG alert path inside `fetch_held_position_prices` after the gauge computation; reuse cycle-12 `parse_mode=None` pattern; 24h dedup matching `_warned_today`.
+**Decision-by:** 2026-06-15 (4 weeks from PR #158 merge; baseline window must close first).
+
 ### BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE: wire push-notification for narrative_alert_dispatcher 503 misconfig (Path C1)
 **Status:** PROPOSED 2026-05-13 — filed alongside narrative-scanner V1.1 dispatcher ship. Replaces V1.1's Path B (log-only) 503 alert semantics with active push delivery.
 **Tag:** `narrative-scanner` `path-c1` `operator-alert` `post-activation` `evidence-gated`

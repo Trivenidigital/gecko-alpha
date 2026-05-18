@@ -1,6 +1,19 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-18 (cycle 14 overnight — PR TBD BL-NEW-SETTINGS-VALIDATION-ALERT alongside PRs #158/#159)
+Last updated: 2026-05-18 (cycle 14 overnight — PR (TBD #158) for BL-NEW-HELD-POSITION-REFRESH-RATE-GAP visibility-first fix)
+
+## Active Work: BL-NEW-HELD-POSITION-REFRESH-RATE-GAP (PR TBD #158)
+
+- [x] Isolated worktree
+- [x] Drift-check + Hermes-first (no relevant Hermes primitive)
+- [x] Empirical diagnosis via srilu SQL: 21/148 stale opens are CG-lane-EXCLUSIVE (0/21 in gainers_snapshots or trending_snapshots over 24h with 4617+645 entries). Stale-source hypothesis confirmed.
+- [x] Plan v2 (post-2-reviewer fold): all CRITICAL findings folded (KeyError on updated_at via new `_get_cached_price_ages` helper, `parse_iso` → `datetime.fromisoformat`, Task 4 descoped pending CG-rate-limit-clear verification)
+- [x] Build: `_get_cached_price_ages` helper + `stale_open_count` gauge + per-token persistent-stale WARN with 24h dedup + 1 new Settings key + `_reset_warned_today_for_tests`
+- [x] TDD: 27/27 tests pass on srilu Python 3.12.3 (21 existing + 6 new using `structlog.testing.capture_logs()`)
+- [x] Findings doc with empirical evidence + post-deploy soak plan
+- [x] backlog.md: new entry filed with PR-OPEN/SCRIPT-READY status + 2 evidence-gated follow-ups (`BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT` + `BL-NEW-HELD-POSITION-STALE-COUNT-ALERT`)
+- [ ] PR creation + 3 PR reviewers
+- [ ] Post-merge: bookkeeping flip per cycle-12+13 convention
 
 ## Active Work: BL-NEW-PARSE-MODE-AUDIT-EXTEND-URLLIB-DISPATCH
 
