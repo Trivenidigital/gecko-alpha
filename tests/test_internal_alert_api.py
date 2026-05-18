@@ -167,8 +167,19 @@ async def test_bad_signature_403(client_with_secret):
     assert "mismatch" in resp.json()["detail"].lower()
 
 
-async def test_replay_409(client_with_secret):
-    """Same (timestamp, signature) replayed → 409."""
+async def test_replay_409(client_with_secret, monkeypatch):
+    """Same (timestamp, signature) replayed → 409.
+
+    Reviewer 1 P2 fold: monkeypatch the alerter to a no-op so the first call
+    is deterministically 200, and the assertion that the second identical
+    call returns 409 is independent of any network / Telegram-token state.
+    """
+
+    async def _fake_send(text, session, settings, **kwargs):
+        pass  # deterministic no-op delivery
+
+    monkeypatch.setattr("scout.api.internal_alert.send_telegram_message", _fake_send)
+
     payload = _valid_payload()
     body = json.dumps(payload).encode("utf-8")
     ts = str(int(time.time()))
@@ -179,13 +190,14 @@ async def test_replay_409(client_with_secret):
         "Content-Type": "application/json",
     }
 
-    # First call: succeeds if alerter is mocked; fails on delivery otherwise.
-    # We don't care about the first call's status for this test — only that
-    # the second identical call is rejected as replay BEFORE reaching the
-    # alerter (replay-cache hit at the HMAC layer).
-    await client_with_secret.post(
+    # First call: 200 (HMAC ok + alerter mocked no-op).
+    resp1 = await client_with_secret.post(
         "/api/internal/operator-alert", content=body, headers=headers
     )
+    assert resp1.status_code == 200, resp1.text
+
+    # Second identical call: replay-cache hit at the HMAC layer → 409
+    # BEFORE the alerter is reached again.
     resp2 = await client_with_secret.post(
         "/api/internal/operator-alert", content=body, headers=headers
     )

@@ -12,7 +12,9 @@ Last updated: 2026-05-18 (cycle 14: narrative-operator-alert-wire + chain-anchor
 - [x] Tests: `tests/test_internal_alert_api.py` covers 503 (disabled), 401 (missing headers), 403 (bad sig), 409 (replay), 400 (bad payload), 200 (delivery success + log triplet order), 502 (delivery failure + failed log), and 4 secret-leakage scans (success / auth-fail / delivery-fail / disabled paths).
 - [x] Backlog status flipped PROPOSED → PR-OPEN.
 - [ ] CI green on the new code + tests commit.
+- [ ] **Phased post-merge status (Reviewer 1 P2 fold):** flip backlog to `ENDPOINT-SHIPPED / HERMES-SKILL-PENDING` on PR merge — NOT full SHIPPED. The Hermes-side dispatcher still uses Path B log-only until the SKILL.md update lands.
 - [ ] Operator runs SKILL.md update on srilu (`/home/gecko-agent/.hermes/skills/narrative_alert_dispatcher/SKILL.md`) to switch dispatcher from `narrative_dispatcher_misconfig` log-only to the active endpoint — out of repo, operator action after PR merges.
+- [ ] Operator runs smoke test confirming the dispatcher's HMAC POST reaches `/api/internal/operator-alert` and `operator_alert_dispatched` fires on gecko-alpha. Only then flip to `SHIPPED`.
 
 ## Active Work: BL-NEW-CHAIN-ANCHOR-PIPELINE-FIX — SHIPPED (backlog status correction)
 
