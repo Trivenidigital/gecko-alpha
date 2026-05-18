@@ -82,6 +82,37 @@ def _make_crontab_stub(tmp_path: Path, content: str) -> Path:
     return stub
 
 
+def _make_curl_stub(tmp_path: Path) -> tuple[Path, Path]:
+    """curl stub for prod-path Telegram delivery tests.
+
+    It records the JSON payload passed via `-d`, writes a small response body
+    to the `-o` path, and prints HTTP 200 to mimic `curl -w '%{http_code}'`.
+    """
+    stub_dir = tmp_path / "stubs"
+    stub_dir.mkdir(exist_ok=True)
+    stub = stub_dir / "curl"
+    marker = tmp_path / "curl_payload.json"
+    qm = shlex.quote(str(marker))
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "out=''\n"
+        "payload=''\n"
+        "while [[ $# -gt 0 ]]; do\n"
+        "  case \"$1\" in\n"
+        "    -o) out=\"$2\"; shift 2 ;;\n"
+        "    -d) payload=\"$2\"; shift 2 ;;\n"
+        "    *) shift ;;\n"
+        "  esac\n"
+        "done\n"
+        f"printf '%s\\n' \"$payload\" > {qm}\n"
+        "if [[ -n \"$out\" ]]; then printf '{\"ok\":true}' > \"$out\"; fi\n"
+        "printf '200'\n"
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+    return stub, marker
+
+
 def _make_fragment(tmp_path: Path, body: str) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir(exist_ok=True)
@@ -276,6 +307,61 @@ def test_payload_does_not_set_parse_mode(tmp_path):
     # Defense-in-depth: payload literal is `{"chat_id": ..., "text": ...}`
     assert '"chat_id"' in script_src
     assert '"text"' in script_src
+
+
+def test_prod_env_parsing_tolerates_leading_whitespace(tmp_path):
+    """Parity with PR #159 systemd-watchdog: indented .env keys should not
+    false-exit 5 before the curl-direct Telegram dispatch path."""
+    body = "30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh"
+    _make_fragment(tmp_path, body)
+    live = f"{SENTINEL_START}\n# wrong content\n{SENTINEL_END}\n"
+    crontab_stub = _make_crontab_stub(tmp_path, live)
+    curl_stub, marker = _make_curl_stub(tmp_path)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "  TELEGRAM_BOT_TOKEN='token-with-indent'\n"
+        "\tTELEGRAM_CHAT_ID=\"chat-with-indent\"\n"
+    )
+
+    r = _run_watchdog(
+        tmp_path,
+        crontab_stub=crontab_stub,
+        env_extras={
+            "GECKO_ENV_FILE": str(env_file),
+            "PATH": f"{curl_stub.parent}:{os.environ.get('PATH', '')}",
+        },
+    )
+
+    assert r.returncode == 1, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "ALERTED: HTTP 200" in r.stdout
+    payload = json.loads(marker.read_text())
+    assert payload["chat_id"] == "chat-with-indent"
+    assert "cron-drift-watchdog: drift detected" in payload["text"]
+
+
+def test_prod_env_missing_telegram_keys_exits_5(tmp_path):
+    """Documented exit 5 must be reached instead of set-e exiting early when
+    `.env` lacks Telegram credentials."""
+    body = "30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh"
+    _make_fragment(tmp_path, body)
+    live = f"{SENTINEL_START}\n# wrong content\n{SENTINEL_END}\n"
+    crontab_stub = _make_crontab_stub(tmp_path, live)
+    curl_stub, marker = _make_curl_stub(tmp_path)
+    env_file = tmp_path / ".env"
+    env_file.write_text("OTHER_SETTING=1\n")
+
+    r = _run_watchdog(
+        tmp_path,
+        crontab_stub=crontab_stub,
+        env_extras={
+            "GECKO_ENV_FILE": str(env_file),
+            "PATH": f"{curl_stub.parent}:{os.environ.get('PATH', '')}",
+        },
+    )
+
+    assert r.returncode == 5, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "TELEGRAM_BOT_TOKEN missing/placeholder" in r.stderr
+    assert not marker.exists()
 
 
 def test_fragment_file_missing_exits_8(tmp_path):

@@ -2,6 +2,25 @@
 
 Last updated: 2026-05-18 (cycle 13 overnight — per-item sections below for PRs #155+#156+#157)
 
+## Active Work: BL-NEW-CRON-DRIFT-WATCHDOG-ENV-WHITESPACE-TOLERANCE
+
+- [x] Isolated worktree: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-cron-env-whitespace` on `codex/cron-env-whitespace-tolerance`
+- [x] Merge/bookkeeping hygiene: PRs #158/#159/#160 checked via `gh pr view`; all remain OPEN, so no status-flip PR is applicable yet.
+- [x] Dependency check: target script exists on `origin/feat/cron-drift-watchdog` / PR #156, not on `origin/master`; this PR is stacked on PR #156 rather than duplicating the cron watchdog on master.
+- [x] Drift-check: `rg`/`git grep` found no existing `BL-NEW-CRON-DRIFT-WATCHDOG-ENV-WHITESPACE-TOLERANCE`; `scripts/cron-drift-watchdog.sh` still uses strict `^TELEGRAM_*=` parsing while PR #159's `scripts/systemd-drift-watchdog.sh` uses `[[:space:]]*` tolerance.
+- [x] Hermes-first: Hermes Cron supports scheduled script-only jobs and Telegram delivery, but does not replace gecko-alpha's repo-vs-live crontab diff or `.env` credential parsing. Hermes Watchers cover RSS/JSON/GitHub watermarks, not local crontab drift. awesome-hermes-agent has no crontab-drift parser replacement. Verdict: small in-tree parity fix.
+- [x] Write failing test for leading-whitespace `.env` token/chat parsing on the cron watchdog prod curl path.
+- [x] Implement minimal parsing parity with PR #159's systemd watchdog.
+- [x] Verify targeted tests and source-level parse-mode guard.
+- [ ] Update backlog/memory review notes, commit, push, and create stacked PR.
+
+Review:
+- TDD red evidence: Git Bash stub run with indented `TELEGRAM_*` keys exited before curl (`rc=1`, empty stderr/stdout) under the strict parser.
+- Root-cause addendum: strict `grep` under `set -euo pipefail` also exited before the documented exit-5 error branch when Telegram keys were absent; added `test_prod_env_missing_telegram_keys_exits_5`.
+- Green evidence: Git Bash stub run with indented keys now reaches curl and emits `ALERTED: HTTP 200`; missing-key stub run now exits 5 with `TELEGRAM_BOT_TOKEN missing/placeholder`.
+- Windows pytest evidence: `python -m pytest tests/test_cron_drift_watchdog.py -q` reports `22 skipped` because this watchdog suite is module-skipped on win32.
+- Parse-mode guard: source grep for `parse_mode` in `scripts/cron-drift-watchdog.sh` returns no matches.
+
 ## Active Work: BL-NEW-CRON-DRIFT-WATCHDOG (item 3, PR #156)
 
 - [x] Isolated worktree: `.claude/worktrees/feat+cron-drift-watchdog`
