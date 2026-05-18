@@ -12,7 +12,7 @@ Last updated: 2026-05-18 (cycle 14 overnight — PR TBD BL-NEW-SETTINGS-VALIDATI
 - [x] Write failing regression proving `config_alert.py`'s urllib `Request(...sendMessage...)` site is audited structurally.
 - [x] Extend AST scanner to resolve urllib `Request` + `urlopen` dispatch payloads and enforce plain-text/no `parse_mode`.
 - [x] Verify parse-mode and config-alert targeted tests.
-- [ ] Update backlog/memory review notes, commit, push, and create stacked PR.
+- [x] Update backlog/memory review notes, commit, push, and create stacked PR: #162 (`https://github.com/Trivenidigital/gecko-alpha/pull/162`).
 
 Review:
 - TDD red: `test_config_alert_urllib_dispatch_is_structurally_audited_as_plain_text` first failed because `_find_urllib_telegram_dispatches` did not exist, then failed with `len(dispatches) == 0` until module-level constants were added to the resolver.

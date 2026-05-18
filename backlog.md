@@ -1519,7 +1519,7 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **Decision-by:** within 2 weeks of PR #156 merge (operator can also choose to delay until next cycle's watchdog work).
 
 ### BL-NEW-PARSE-MODE-AUDIT-EXTEND-URLLIB-DISPATCH: extend AST sweep to urllib.request dispatch sites
-**Status:** PROPOSED 2026-05-18 — surfaced by PR #160 R2 MINOR-1 review.
+**Status:** PR-OPEN 2026-05-18 — PR #162, stacked on PR #160 (`feat/settings-validation-alert`); surfaced by PR #160 R2 MINOR-1 review.
 **Tag:** `parse-mode-hygiene` `silent-failure-prevention` `class-3` `ast-sweep` `coverage`
 **Hermes-first analysis:**
 
