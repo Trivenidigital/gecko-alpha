@@ -859,7 +859,7 @@ ssh root@89.167.116.187 "journalctl -u gecko-pipeline --since '<post-merge times
 
 **Originating context:** 2026-05-18 cycle-12 PR #157 audit (`tasks/findings_dex_price_coverage_audit_2026_05_18.md`) surfaced 21/148 open paper_trades with `price_cache > 24h` stale. All 21 are cg-coin-id shape (NOT DEX-coverage class). Trailing-stop/peak-fade evaluators can't fire correctly on stale prices; 14% silent miss-rate is material.
 
-**Post-merge action (operator):** flip status above from `PR-OPEN / SCRIPT-READY` → `SHIPPED <merge-date> — merged <sha>`. After 24h soak, capture per-token WARN list + verify overlap with the 21 known stale tokens documented in findings doc; decide whether to ship `BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT` based on operator manual-curl of `/coins/{id}` for ≥1 stale token.
+**Post-merge action (operator):** flip status above from `PR-OPEN / SCRIPT-READY` → `SHIPPED <merge-date> — merged <sha>`. After deployment and at least one pipeline cycle, run `tasks/validation_pr158_held_position_refresh_rate_gap.md`; do NOT mark 24h validation complete until journal evidence exists. After 24h soak, capture per-token WARN list + verify overlap with the 21 known stale tokens documented in findings doc; decide whether to ship `BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT` based on operator manual-curl of `/coins/{id}` for ≥1 stale token.
 
 ### BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT: `/coins/{id}` second-pass for tokens missed by `/simple/price`
 **Status:** PROPOSED 2026-05-18 — evidence-gated follow-up to BL-NEW-HELD-POSITION-REFRESH-RATE-GAP. Descoped from PR #158 because CG returned HTTP 429 during direct-curl verification window; cannot confirm `/coins/{id}` recovers stale tokens.

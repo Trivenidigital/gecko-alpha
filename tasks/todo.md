@@ -1,8 +1,8 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-18 (cycle 14 overnight — PR (TBD #158) for BL-NEW-HELD-POSITION-REFRESH-RATE-GAP visibility-first fix)
+Last updated: 2026-05-18 (cycle 14 overnight — PR #158 for BL-NEW-HELD-POSITION-REFRESH-RATE-GAP visibility-first fix)
 
-## Active Work: BL-NEW-HELD-POSITION-REFRESH-RATE-GAP (PR TBD #158)
+## Active Work: BL-NEW-HELD-POSITION-REFRESH-RATE-GAP (PR #158)
 
 - [x] Isolated worktree
 - [x] Drift-check + Hermes-first (no relevant Hermes primitive)
@@ -12,7 +12,9 @@ Last updated: 2026-05-18 (cycle 14 overnight — PR (TBD #158) for BL-NEW-HELD-P
 - [x] TDD: 27/27 tests pass on srilu Python 3.12.3 (21 existing + 6 new using `structlog.testing.capture_logs()`)
 - [x] Findings doc with empirical evidence + post-deploy soak plan
 - [x] backlog.md: new entry filed with PR-OPEN/SCRIPT-READY status + 2 evidence-gated follow-ups (`BL-NEW-HELD-POSITION-FALLBACK-COINS-ENDPOINT` + `BL-NEW-HELD-POSITION-STALE-COUNT-ALERT`)
-- [ ] PR creation + 3 PR reviewers
+- [x] 2026-05-18 validation deployment check: VPS `/root/gecko-alpha` is still `master` at `cdeb31f`, so #158 is not deployed; no journal evidence collected and 24h validation remains incomplete.
+- [x] Validation prep doc added: `tasks/validation_pr158_held_position_refresh_rate_gap.md` with two-step SSH commands, required journal fields, stale-cohort overlap comparison, and `/coins/{id}` fallback promotion gate.
+- [x] PR #158 created + 3 PR reviewers folded; operator P1/P2 false-positive/tz-normalization fold landed.
 - [ ] Post-merge: bookkeeping flip per cycle-12+13 convention
 
 ## Active Work: BL-NEW-PARSE-MODE-AUDIT-EXTEND-URLLIB-DISPATCH
