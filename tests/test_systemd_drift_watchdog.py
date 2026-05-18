@@ -567,21 +567,30 @@ def test_uv_bin_set_without_opt_in_refuses_prod_silent_suppression(tmp_path):
     silently absorb the alert delivery and write ACK files, creating a
     false-clean signal. Require explicit GECKO_WATCHDOG_ALLOW_UV_STUB=1
     opt-in for stub path.
+
+    PR-#159 R3 I1 fold: also asserts no-ACK-written + no-stub-invocation
+    (which is the LOAD-BEARING invariant the guard exists to enforce; a
+    future refactor that reordered the guard AFTER alert dispatch would
+    still pass an exit-6 check while having already leaked the silent
+    absorption bug).
     """
     repo = _make_fake_repo(tmp_path)
     prod = _make_fake_prod_systemd(tmp_path)
     _write_unit(repo / "systemd", "gecko-foo.service", "[Unit]\nDescription=v1\n")
     _write_unit(prod, "gecko-foo.service", "[Unit]\nDescription=v2\n")
+    # Real stub that writes a marker if invoked — proves stub was/was-not called
+    stub, marker = _make_uv_stub(tmp_path)
+    ack_dir = tmp_path / "ack"
     res = subprocess.run(
         ["bash", str(WATCHDOG_SCRIPT)],
         env={
             **os.environ,
             "GECKO_REPO": str(repo),
             "PROD_SYSTEMD_DIR": str(prod),
-            "SYSTEMD_DRIFT_ACK_DIR": str(tmp_path / "ack"),
+            "SYSTEMD_DRIFT_ACK_DIR": str(ack_dir),
             "SYSTEMD_DRIFT_HEARTBEAT_FILE": str(tmp_path / "heartbeat"),
             "GECKO_ENV_FILE": "/dev/null",
-            "UV_BIN": str(tmp_path / "stubs" / "fake-uv"),  # path doesn't need to exist
+            "UV_BIN": str(stub),
             # GECKO_WATCHDOG_ALLOW_UV_STUB DELIBERATELY OMITTED
         },
         capture_output=True,
@@ -594,6 +603,14 @@ def test_uv_bin_set_without_opt_in_refuses_prod_silent_suppression(tmp_path):
     )
     assert "UV_BIN set" in res.stderr
     assert "refusing stub path" in res.stderr
+    # R3 I1 load-bearing assertions: guard must exit BEFORE alert side-effects
+    assert not marker.exists(), (
+        "stub must NOT be invoked when guard fires (silent-absorption bug guard)"
+    )
+    ack_file = ack_dir / "last_alerted_hash"
+    assert not ack_file.exists(), (
+        "ACK must NOT be written when guard fires (false-clean signal guard)"
+    )
 
 
 def test_response_file_uses_mktemp_not_pid():

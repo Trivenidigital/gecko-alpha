@@ -212,8 +212,12 @@ print(json.dumps({"chat_id": os.environ["GECKO_TG_CHAT"], "text": os.environ["GE
 # BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT (R2 #4 + #12):
 # mktemp-based response file (symlink-attack-safe; replaces predictable PID path)
 # + curl --max-time 30 (bounds held-lock window if Telegram hangs).
+# PR-#159 R2 M1 fold: trap registered BEFORE mktemp via ${RESP_FILE:+...} idiom
+# (matches cron-drift-watchdog.sh pattern); eliminates the microsecond
+# trap-not-yet-set leak window if SIGTERM arrives mid-mktemp.
+RESP_FILE=""
+trap 'rm -f ${RESP_FILE:+"$RESP_FILE"}' EXIT
 RESP_FILE="$(mktemp -t gecko-systemd-drift-resp.XXXXXX)"
-trap 'rm -f "$RESP_FILE"' EXIT
 
 HTTP_STATUS="$(curl -s --max-time 30 -o "$RESP_FILE" -w '%{http_code}' \
     -X POST \
