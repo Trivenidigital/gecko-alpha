@@ -7,7 +7,7 @@ Last updated: 2026-05-18 (cycle 14 overnight — PR (TBD #158) for BL-NEW-HELD-P
 - [x] Evidence gate respected: no implementation started before manual `/coins/{id}` probe.
 - [x] Manual VPS probe after rate-limit window: `pythia` and `iagon` returned HTTP 200 with USD prices; `superwalk` hit HTTP 429.
 - [x] Hermes-first: optional Hermes blockchain skills use CoinGecko-backed price lookup, but no skill replaces gecko-alpha's in-process held-position `price_cache` fallback.
-- [x] Minimal fallback design added: `tasks/design_held_position_fallback_coins_endpoint.md`.
+- [x] Minimal fallback design added via PR #164: `tasks/design_held_position_fallback_coins_endpoint.md`.
 - [x] Backlog status updated to `DESIGN-READY`; implementation remains gated on PR #158 post-deploy `simple_price_missing_ids` evidence.
 
 ## Active Work: BL-NEW-HELD-POSITION-REFRESH-RATE-GAP (PR TBD #158)
