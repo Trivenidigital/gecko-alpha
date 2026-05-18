@@ -971,10 +971,26 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 **decision-by:** 1 week (Broken-if-free severity).
 
 ### BL-NEW-MORALIS-PLAN-AUDIT
-**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B6 (Broken-if-legacy-free; 25× over-cap math: 994k/month vs 40k/month).
-**Action:** confirm prod Moralis plan tier; if legacy-free: throttle OR upgrade.
-**2026-05-14 Hermes-first overlay:** before custom throttling or paid upgrade, compare Moralis calls against GoldRush MCP/agent skills and optional Hermes `blockchain/base` / `blockchain/solana` skills. If the overlap is strong, prefer one consolidated on-chain provider path over parallel custom integrations.
-**decision-by:** 1 week (Broken-if-free severity).
+**Status:** AUDITED-PHANTOM 2026-05-18 — findings at `tasks/findings_moralis_plan_audit_2026_05_18.md`. Three independent surfaces confirm the path is dead under current configuration: (1) `MORALIS_API_KEY=` empty on srilu .env; (2) 0 Moralis log hits across 24h + 7d windows; (3) `holder_snapshots` table = 0 rows total. Early-return guard at `scout/ingestion/holder_enricher.py:37-38` prevents any Moralis HTTP call when the key is empty. The cycle-change audit's 25× over-cap projection was contingent on the key being set; with the key empty the risk is phantom. No code change. Conditional guardrail filed below as `BL-NEW-MORALIS-ENABLEMENT-GUARDRAIL`.
+
+**Hermes-first 2026-05-18 (fresh, 4 surfaces):** (1) installed VPS skills (28 dirs, 0 hits on holder/Moralis/EVM patterns); (2) Hermes optional-skills catalog (closest is `blockchain/evm` — wallet/tokens/gas, not holders; not installed); (3) awesome-hermes-agent (no holder skill); (4) GoldRush/Covalent agent-skills (4 skills: foundational REST, streaming, CLI, x402 — none cover ERC20 holder enumeration). Verdict: no installed or external primitive replaces the current in-tree Moralis use case.
+
+**Cohort calibration (24h, srilu DB):** EVM-mappable candidates = 30 (12 ethereum + 18 base + 0 polygon). If enabled at current cohort × observed 12 cycles/hr: ~200-260k calls/month — exceeds Moralis legacy-free 40k/mo by 5-7×, consistent with the original audit's direction even with updated rate.
+
+### BL-NEW-MORALIS-ENABLEMENT-GUARDRAIL: gate operator enablement of Moralis behind plan-tier + throttle decision
+**Status:** PROPOSED 2026-05-18 — conditional follow-up to AUDITED-PHANTOM closure of BL-NEW-MORALIS-PLAN-AUDIT. Only fires if/when operator decides to set `MORALIS_API_KEY` on prod.
+**Tag:** `holder-enrichment` `evidence-gated` `operator-gated` `pre-enablement-guardrail` `conditional`
+**Why:** Audit (2026-05-18) confirmed the path is dead under current config but would project to 5-7× over Moralis legacy-free cap if enabled at current cohort. Without a plan-tier check + throttle/cache decision BEFORE the key is set, enablement would silently exceed budget on legacy-free or rack up CU-based bills.
+**Trigger condition (NOT calendar-gated):** operator intent to enable Moralis. If no intent in 6mo, close as inert.
+**Action checklist (operator-only when triggered):**
+1. Confirm plan tier via Moralis dashboard (legacy-free vs CU-based vs paid).
+2. If legacy-free: add per-token `holder_count` cache (24h TTL suggested) + hard daily call cap before enabling.
+3. If CU-based paid: set budget alert; project worst-case monthly spend at observed EVM cohort × cycle rate.
+4. Re-check Hermes-first / GoldRush. By enablement time, holder coverage may have shifted; prefer consolidated provider if available.
+5. Capture pre-enablement baseline + post-enablement 2h validation window (mirrors BL-NEW-CG-FREE-TIER-DEMO-API-KEY runbook shape).
+**Hermes-first 2026-05-18:** carry-forward of the audit's negative result across 4 surfaces; re-check at enablement time.
+**Drift verdict:** NET-NEW guardrail; conditional follow-up to AUDITED-PHANTOM closure.
+**Decision-by:** evidence-gated (6mo backstop) — close as inert if no operator intent to enable Moralis.
 
 ### BL-NEW-ANTHROPIC-SPEND-TARGET
 **Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B11 (Unfalsifiable-by-policy; current baseline ~$0.06/day).

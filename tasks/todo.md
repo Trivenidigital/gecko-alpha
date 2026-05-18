@@ -1,6 +1,17 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-18 (cycle 14: CG budget attribution + stale PR triage)
+Last updated: 2026-05-18 (cycle 14: Moralis plan audit + CG budget attribution + stale PR triage)
+
+## Active Work: BL-NEW-MORALIS-PLAN-AUDIT — AUDITED-PHANTOM
+
+- [x] Drift-check: `scout/ingestion/holder_enricher.py:13-95` + `scout/config.py:130` + per-cycle fan-out at `main.py:944-948`. No throttle/cache/interval primitives.
+- [x] Runtime-state verification (srilu-vps): `MORALIS_API_KEY=` empty; 0 Moralis log hits in 24h and 7d; `holder_snapshots` table = 0 rows total.
+- [x] Cohort calibration (24h DB): 12 ethereum + 18 base + 0 polygon = 30 EVM-mappable tokens. If-enabled projection: ~200-260k calls/month (5-7× over legacy-free 40k cap; lower than audit's original 25× projection because actual cycle rate is ~12/hr not 60/hr).
+- [x] Hermes-first (4 surfaces, 2026-05-18): installed VPS skills (0 hits across 28 dirs), Hermes optional-skills catalog (`blockchain/evm` not installed, doesn't cover holders), awesome-hermes-agent (no holder skill), GoldRush/Covalent agent-skills (4 skills surveyed; no ERC20 holder-count capability). Verdict: keep in-tree path.
+- [x] Findings doc: `tasks/findings_moralis_plan_audit_2026_05_18.md`.
+- [x] Backlog flipped PROPOSED → AUDITED-PHANTOM with full evidence summary.
+- [x] Conditional follow-up filed: BL-NEW-MORALIS-ENABLEMENT-GUARDRAIL (trigger = operator intent to enable; 6mo backstop).
+- [ ] Cross-finding (separate task): BL-NEW-HELIUS-PLAN-AUDIT likely same shape — `HELIUS_API_KEY=` also empty, `holder_snapshots` covers both chains. Out of scope for this audit per assignment guardrail.
 
 ## Active Work: BL-NEW-CG-LANE-ORDER-HELD-POSITION-FIRST (PR #170)
 
