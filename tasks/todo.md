@@ -12,7 +12,7 @@ Last updated: 2026-05-18 (cycle 13 overnight — per-item sections below for PRs
 - [x] Write failing test for leading-whitespace `.env` token/chat parsing on the cron watchdog prod curl path.
 - [x] Implement minimal parsing parity with PR #159's systemd watchdog.
 - [x] Verify targeted tests and source-level parse-mode guard.
-- [ ] Update backlog/memory review notes, commit, push, and create stacked PR.
+- [x] Update backlog/memory review notes, commit, push, and create stacked PR: #161 (`https://github.com/Trivenidigital/gecko-alpha/pull/161`).
 
 Review:
 - TDD red evidence: Git Bash stub run with indented `TELEGRAM_*` keys exited before curl (`rc=1`, empty stderr/stdout) under the strict parser.

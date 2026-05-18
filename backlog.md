@@ -1570,7 +1570,7 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **Decision-by:** 2026-06-15 (4 weeks from PR #156 merge).
 
 ### BL-NEW-CRON-DRIFT-WATCHDOG-ENV-WHITESPACE-TOLERANCE: tolerate indented Telegram keys in cron-drift-watchdog `.env`
-**Status:** PR-OPEN 2026-05-18 — stacked on PR #156 (`feat/cron-drift-watchdog`) because `scripts/cron-drift-watchdog.sh` is not yet on `master`.
+**Status:** PR-OPEN 2026-05-18 — PR #161, stacked on PR #156 (`feat/cron-drift-watchdog`) because `scripts/cron-drift-watchdog.sh` is not yet on `master`.
 **Tag:** `watchdog` `env-parsing` `parity-hardening`
 **Drift-check:** no existing BL entry or implementation matched this exact parity gap. PR #159's `scripts/systemd-drift-watchdog.sh` tolerates leading whitespace in `.env` credential lines via `^[[:space:]]*TELEGRAM_*=`; PR #156's `scripts/cron-drift-watchdog.sh` still uses strict `^TELEGRAM_*=` and can fail before alert delivery if an operator indents the key.
 **Hermes-first analysis:**
