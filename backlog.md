@@ -1534,11 +1534,34 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 
 **Original status (now historical):** PROPOSED 2026-05-16 — residual from `feat/score-volume-pruning-harden` PR's §7a partial-match reframe.
 
+### BL-NEW-CRON-DRIFT-WATCHDOG-ENV-WHITESPACE-TOLERANCE: backport .env leading-whitespace tolerance into cron-drift-watchdog.sh
+**Status:** PROPOSED 2026-05-18 — sibling-symmetry follow-up surfaced by PR #159 R1 IMPORTANT review.
+**Tag:** `cron-drift-watchdog` `env-parsing` `backport` `sibling-symmetry` `silent-failure-prevention`
+**Why:** PR #159 (cycle 14) added `^[[:space:]]*` tolerance + sed-strip to `scripts/systemd-drift-watchdog.sh` so an indented `TELEGRAM_BOT_TOKEN=` in `.env` doesn't trigger silent exit-5 false negative. The sibling `scripts/cron-drift-watchdog.sh:197-198` (shipped in PR #156) still uses strict `^TELEGRAM_BOT_TOKEN=` regex. Inverts source-of-truth assumption (cron-drift was supposed to be the canonical pattern; systemd PR adopted a SUPERSET).
+**Action:** ~1h. Edit `scripts/cron-drift-watchdog.sh:197-198` to use same regex+sed pattern as systemd PR #159. Mirror the `test_leading_whitespace_in_env_parsed_correctly` test from PR #159 into `tests/test_cron_drift_watchdog.py`. Single-commit PR.
+**Decision-by:** within 2 weeks of PR #156 merge (operator can also choose to delay until next cycle's watchdog work).
+
+### BL-NEW-PARSE-MODE-AUDIT-EXTEND-URLLIB-DISPATCH: extend AST sweep to urllib.request dispatch sites
+**Status:** PR-OPEN 2026-05-18 — PR #162, stacked on PR #160 (`feat/settings-validation-alert`); surfaced by PR #160 R2 MINOR-1 review.
+**Tag:** `parse-mode-hygiene` `silent-failure-prevention` `class-3` `ast-sweep` `coverage`
+**Hermes-first analysis:**
+
+| Domain | Hermes skill found? | Decision |
+|---|---|---|
+| Telegram/messaging delivery | yes — Hermes messaging gateway docs (`https://hermes-agent.nousresearch.com/docs/user-guide/messaging`) | not a replacement; this is an in-repo AST regression harness for gecko-alpha source |
+| Scheduled/script alerting | yes — Hermes Cron/no-agent jobs (`https://hermes-agent.nousresearch.com/docs/guides/cron-script-only`) | not applicable; no scheduling primitive replaces Python source auditing |
+| Python Telegram parse-mode static audit | none found | extend existing `tests/test_parse_mode_hygiene.py` scanner |
+
+awesome-hermes-agent ecosystem check: reviewed `https://github.com/0xNyk/awesome-hermes-agent`; no listed skill/plugin provides project-local AST enforcement for Telegram `parse_mode`. Verdict: custom test-harness extension is justified.
+**Why:** `tests/test_parse_mode_hygiene.py:213` walks `scout/` for direct `.post(.../sendMessage)` calls and resolves payload dicts to assert `parse_mode` is absent or escape-coverage is present. PR #160's new `scout/config_alert.py` uses `urllib.request.urlopen(req)` — NOT `.post()` — so the sweep does NOT cover it. The unit-test assertion at `test_config_alert.py:78` is sufficient for current scope, but future urllib-direct dispatch sites would be uncovered.
+**Action:** ~2h. Extend the AST sweep to also walk `urllib.request.urlopen(Request(...sendMessage...))` patterns. Resolve the Request data argument back to a json.dumps dict literal where possible; assert `parse_mode` absent or escape-coverage present, same as the existing `.post` arm.
+**Decision-by:** within 4 weeks (low urgency — current sweep covers 95% of dispatch sites).
+
 ### BL-NEW-SETTINGS-VALIDATION-ALERT: curl-direct Telegram on settings_validation_failed
-**Status:** PROPOSED 2026-05-16 — V4#1 review deferred from `feat/score-volume-pruning-harden` PR.
-**Why:** `load_settings()` in `scout/config.py` emits structured `logger.error("settings_validation_failed", ...)` before re-raising ValidationError. systemd `Restart=always`+`RestartSec=10` (verified on srilu) means a bad `.env` triggers a 10s crash-loop visible in journalctl but with no active Telegram push. Curl-direct push (mirroring `gecko-backup-watchdog` from memory `project_vps_backup_rotation_2026_05_09.md`) requires first-time-only file marker + dedup to avoid 360 msg/hr storm.
-**Action:** `.startup_alert_sent` file marker + curl-direct send in `load_settings()` exception path, marker deleted on successful load. Tests cover first-fail-only behavior.
-**decision-by:** 4 weeks.
+**Status:** PR-OPEN 2026-05-18 — PR (TBD). New `scout/config_alert.py` module wired into `scout/config.py:load_settings()`. urllib.request (stdlib only) curl-direct alert; SHA256 content-hash dedup via state file `/var/lib/gecko-alpha/settings-validation-watchdog/last_alerted_hash`; 3s timeout (avoids doubling systemd crash-loop period); plain text / no parse_mode (§12b). 18/18 tests pass on srilu Python 3.12.3.
+**Original status (now historical):** PROPOSED 2026-05-16 — V4#1 review deferred from `feat/score-volume-pruning-harden` PR.
+**Why:** `load_settings()` in `scout/config.py` emits structured `logger.error("settings_validation_failed", ...)` before re-raising ValidationError. systemd `Restart=always`+`RestartSec=10` (verified on srilu) means a bad `.env` triggers a 10s crash-loop visible in journalctl but with no active Telegram push. Curl-direct push (mirroring `gecko-backup-watchdog` from memory `project_vps_backup_rotation_2026_05_09.md`) requires content-hash dedup to avoid 360 msg/hr storm.
+**Post-merge action (operator):** flip status to `SHIPPED <merge-date> — merged <sha>`. Update PR number from "TBD" to actual after `gh pr create`.
 
 ### BL-NEW-SCORE-VOLUME-PRUNE-ALERT: §12b active alert on score/volume prune failure
 **Status:** PROPOSED 2026-05-16 — V4#6 review deferred from `feat/score-volume-pruning-harden` PR.
@@ -1579,11 +1602,41 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **Status:** SHIPPED-WITH-FINDINGS 2026-05-17 — branch `feat/other-prod-config-audit` (cycle 11). Findings doc: `tasks/findings_other_prod_config_audit_2026_05_17.md`. Of 17 categories swept, only 1 gap (gecko cron entries repo-untracked at schedule level) — closed via new `cron/` directory (sentinel-bracketed managed block + idempotent `cron/deploy.sh` per V54 fold). Apache "Possible Gap" withdrawn after drill (not installed). VPS multi-tenant inventory documented (gecko-alpha + polymarket-ml-signal + btc15minutebot + shift-agent). 4 follow-ups filed (cron drift watchdog, cron-to-timer decision, drift-watchdog archive, firewall decision 2026-06-14, polymarket-verify); 1 withdrawn (Apache). Memory checkpoint: `project_prod_config_audit_2026_05_17.md`.
 
 ### BL-NEW-CRON-DRIFT-WATCHDOG: bash watchdog for crontab drift (cycle 11 follow-up)
-**Status:** PROPOSED 2026-05-17 — cycle 11 follow-up to BL-NEW-OTHER-PROD-CONFIG-AUDIT.
-**Why:** Cycle 11 ships repo-tracked cron entries via `cron/deploy.sh`. Mirror cycle 10's `systemd-drift-watchdog.sh` pattern for cron: daily check that `crontab -l` matches `cron/gecko-alpha.crontab` between sentinels.
-**Action:** ~2-3h build. Mirror `scripts/systemd-drift-watchdog.sh` shape: extract managed block from `crontab -l`, diff against repo fragment, alert on drift via curl-direct TG. Include sha256 ack-tombstone for alert dedup (per cycle-10 V46 pattern).
-**Pattern:** parallels `scripts/systemd-drift-watchdog.sh` (cycle 10).
-**decision-by:** 4 weeks (low priority; cron block is short + stable).
+**Status:** PR-OPEN / SCRIPT-READY / SCHEDULING-PENDING-OPERATOR 2026-05-18 — PR #156. **`scripts/cron-drift-watchdog.sh` script ready (not yet merged); the cron schedule entry is NOT added to `cron/gecko-alpha.crontab` in this PR** (per "do not change live config without explicit operator approval" — adding to the managed-block fragment would auto-fire daily after the next `bash cron/deploy.sh`). Operator chooses when to schedule per `cron/README.md` §"Setup (one-time, opt-in to scheduled firing)". Runtime protection is GATED on (a) PR merge AND (b) operator scheduling action. Script verified via prod-crontab dry-run CLEAN + 20/20 tests on srilu. 2-reviewer plan-fold + 3-reviewer PR-fold + 1-reviewer post-review fold complete. Filed 3 follow-ups (HEARTBEAT-MONITOR + WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT scoped to systemd-watchdog only, since cron-watchdog already has the mktemp + max-time + ACK_DIR-exit-9 fixes + ENV-WHITESPACE-TOLERANCE parity with PR #159's systemd-watchdog follow-up).
+
+**Original status (now historical):** PROPOSED 2026-05-17 — cycle 11 follow-up to BL-NEW-OTHER-PROD-CONFIG-AUDIT.
+
+**Post-merge action (operator):** flip status above from `PR-OPEN / SCRIPT-READY / SCHEDULING-PENDING-OPERATOR` → `SCRIPT-SHIPPED / SCHEDULING-PENDING-OPERATOR <merge-date> — merged <sha>`. After the operator's separate scheduling-opt-in action (adding the cron line to `cron/gecko-alpha.crontab` and running `bash cron/deploy.sh`), flip once more to `SHIPPED / SCHEDULED <date>`. Three-stage convention reflects the two independent gates: PR merge AND operator scheduling.
+
+### BL-NEW-CRON-DRIFT-WATCHDOG-HEARTBEAT-MONITOR: wire stale-heartbeat detector for cron-drift-watchdog
+**Status:** PROPOSED 2026-05-18 — PR-stage R2 #13 fold from BL-NEW-CRON-DRIFT-WATCHDOG. CLAUDE.md §12a compliance: shipping a new heartbeat-writing watchdog without a stale-detector is the silent-failure surface §12a exists to prevent.
+**Tag:** `observability` `watchdog` `silent-failure-prevention`
+**Why:** `scripts/cron-drift-watchdog.sh` writes `/var/lib/gecko-alpha/cron-drift-watchdog/heartbeat` on CLEAN runs but no separate monitor checks the heartbeat's freshness. If the watchdog itself stops running (cron line removed, script broken, etc.), the operator has no signal.
+**Action:** ~1h. Extend existing `scripts/gecko-backup-watchdog.sh` (or create `scripts/cron-drift-stale-heartbeat-watchdog.sh` modeled on it) to alert when the cron-drift-watchdog heartbeat is older than N hours (default 25h to cover a daily cron firing 1-hour-late). Add to cron managed block in `cron/gecko-alpha.crontab`. Until shipped, operator runs the one-liner in `cron/README.md` §"Heartbeat freshness check".
+**Decision-by:** 2026-06-15 (4 weeks from PR #156 merge).
+
+### BL-NEW-CRON-DRIFT-WATCHDOG-ENV-WHITESPACE-TOLERANCE: tolerate indented Telegram keys in cron-drift-watchdog `.env`
+**Status:** PR-OPEN 2026-05-18 — PR #161, stacked on PR #156 (`feat/cron-drift-watchdog`) because `scripts/cron-drift-watchdog.sh` is not yet on `master`.
+**Tag:** `watchdog` `env-parsing` `parity-hardening`
+**Drift-check:** no existing BL entry or implementation matched this exact parity gap. PR #159's `scripts/systemd-drift-watchdog.sh` tolerates leading whitespace in `.env` credential lines via `^[[:space:]]*TELEGRAM_*=`; PR #156's `scripts/cron-drift-watchdog.sh` still uses strict `^TELEGRAM_*=` and can fail before alert delivery if an operator indents the key.
+**Hermes-first analysis:**
+
+| Domain | Hermes skill found? | Decision |
+|---|---|---|
+| Scheduled watchdog execution | yes — Hermes Cron / no-agent script jobs (`https://hermes-agent.nousresearch.com/docs/user-guide/features/cron/`) | not a replacement; scheduling primitive does not patch gecko-alpha's in-repo watchdog parser |
+| Polling/watchers | yes — devops/watchers (`https://hermes-agent.nousresearch.com/docs/user-guide/skills/optional/devops/devops-watchers`) | not applicable; covers RSS/JSON/GitHub watermark polling, not local crontab drift or `.env` credential extraction |
+| Crontab drift + Telegram credential parsing | none found | build the 2-line in-tree parity fix with regression coverage |
+
+awesome-hermes-agent ecosystem check: reviewed `https://github.com/0xNyk/awesome-hermes-agent`; no listed skill/plugin replaces gecko-alpha's local crontab diff watchdog or its `.env` parsing. Verdict: custom fix is justified and minimal.
+**Why:** This is the cron-side sibling of PR #159's systemd-watchdog false-negative fix. A stray indent before `TELEGRAM_BOT_TOKEN=` or `TELEGRAM_CHAT_ID=` should not suppress alert delivery.
+**Action:** replace strict `grep -E '^TELEGRAM_*=' ... cut -d= -f2-` parsing with a small `sed` extractor that tolerates leading whitespace and does not trip `set -euo pipefail` before the documented exit-5 branch. Add prod-path tests with a curl stub proving indented keys deliver and missing keys exit 5.
+
+### BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT: backport mktemp + curl --max-time + ACK_DIR-exit fixes to systemd-watchdog
+**Status:** PROPOSED 2026-05-18 — PR-stage R2 #4 + #12 + #16 fold from BL-NEW-CRON-DRIFT-WATCHDOG (PR #156). Re-scoped post-PR-review-2 P2: cron-watchdog already shipped the ACK_DIR-exit-9 fix; backport applies only to systemd-watchdog now.
+**Tag:** `security-hardening` `watchdog` `tech-debt`
+**Why:** PR #156 (cron-drift-watchdog) fixed three latent issues that ALSO exist in `scripts/systemd-drift-watchdog.sh`: (a) `/tmp/.gecko-drift-resp.$$` is a predictable PID-based tmp path — symlink-attack surface; (b) `curl` without `--max-time` can hold the flock indefinitely on hung network; (c) `mkdir -p $ACK_DIR` failure only warns then `exec 9>$LOCK_FILE` fails abruptly under set -e. Same fixes apply.
+**Action:** ~45min. Apply to `scripts/systemd-drift-watchdog.sh`: (1) `mktemp -t gecko-systemd-drift-resp.XXXXXX`, (2) `curl --max-time 30`, (3) `exit 9` on ACK_DIR mkdir failure (vs current "warn-then-die-cryptically"). Add 3 regression-style tests. Optionally: (d) `.env` leading-whitespace token-grep tolerance.
+**Decision-by:** 2026-06-15 (4 weeks from PR #156 merge).
 
 ### BL-NEW-CRON-TO-SYSTEMD-TIMER: convert 2 weekly cron entries to systemd timers (cycle 11 follow-up)
 **Status:** PROPOSED 2026-05-17 — cycle 11 design-tension follow-up (V53 fold).

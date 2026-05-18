@@ -54,6 +54,52 @@ Future high-cadence triggers should prefer `systemd/*.timer` (cycle 10 canon) ov
 
 Cycle 11 audit (`tasks/findings_other_prod_config_audit_2026_05_17.md`) found these 2 cron entries existed on srilu but were repo-untracked at the schedule level. The shell scripts were in repo, but their cron schedule was operator-only. Same substrate class as cycle 6 (BL-NEW-SYSTEMD-UNIT-IN-REPO).
 
-## Drift detection
+## Drift detection (BL-NEW-CRON-DRIFT-WATCHDOG, cycle 12)
 
-Cycle 11 follow-up `BL-NEW-CRON-DRIFT-WATCHDOG` (TBD) will add a daily watchdog mirroring cycle 10's `systemd-drift-watchdog.sh` for cron entries.
+`scripts/cron-drift-watchdog.sh` detects post-deploy operator edits to the managed block. Runs ad-hoc OR scheduled.
+
+### Setup (one-time, opt-in to scheduled firing)
+
+```bash
+# 1. Add to cron managed block
+echo "0 4 * * * /root/gecko-alpha/scripts/cron-drift-watchdog.sh >> /var/log/cron-drift-watchdog.log 2>&1" \
+    >> cron/gecko-alpha.crontab
+# 2. Commit + push the change
+# 3. Deploy
+bash cron/deploy.sh
+# 4. Verify
+crontab -l | grep cron-drift-watchdog
+```
+
+### Disable / revert
+
+If the watchdog itself misfires or floods Telegram:
+
+```bash
+# Fast disable: strip from live crontab
+crontab -l | grep -v cron-drift-watchdog | crontab -
+
+# OR clean revert: remove from cron/gecko-alpha.crontab and redeploy
+sed -i '/cron-drift-watchdog/d' cron/gecko-alpha.crontab
+bash cron/deploy.sh
+```
+
+### Heartbeat freshness check (until `BL-NEW-CRON-DRIFT-WATCHDOG-HEARTBEAT-MONITOR` ships)
+
+```bash
+# Flag if heartbeat > 25h old (covers daily cron + 1h slack)
+find /var/lib/gecko-alpha/cron-drift-watchdog/heartbeat -mmin +1500 -type f \
+    -exec echo "STALE: cron-drift-watchdog heartbeat > 25h" \;
+```
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | CLEAN — managed block matches repo fragment; heartbeat touched |
+| 1 | DRIFT alerted OR silently suppressed (sha256 ack match) |
+| 4 | `.env` missing |
+| 5 | `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` missing/placeholder |
+| 6 | required binary missing (`crontab` or `python3`) OR `UV_BIN` set without test opt-in |
+| 7 | Telegram HTTP delivery failed; ACK NOT written; next fire re-alerts |
+| 8 | `cron/gecko-alpha.crontab` fragment missing in repo |

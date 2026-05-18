@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import inspect
 import pathlib
+from typing import NamedTuple
 
 import pytest
 
@@ -70,6 +71,12 @@ def _resolve_string_literal(expr: ast.AST, name_map: dict[str, ast.AST]) -> str 
             seen.add(id(expr))
             expr = name_map[expr.id]
             continue
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Attribute)
+            and expr.func.attr == "format"
+        ):
+            return _resolve_string_literal(expr.func.value, name_map)
         return None
 
 
@@ -97,6 +104,22 @@ def _build_name_map(
     """
     name_map: dict[str, ast.AST] = {}
     for stmt in ast.walk(ast.Module(body=body, type_ignores=[])):
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    name_map[target.id] = stmt.value
+        elif isinstance(stmt, ast.AnnAssign):
+            if isinstance(stmt.target, ast.Name) and stmt.value is not None:
+                name_map[stmt.target.id] = stmt.value
+    return name_map
+
+
+def _build_module_name_map(tree: ast.AST) -> dict[str, ast.AST]:
+    """Build a top-level {name: value} map for module constants."""
+    if not isinstance(tree, ast.Module):
+        return {}
+    name_map: dict[str, ast.AST] = {}
+    for stmt in tree.body:
         if isinstance(stmt, ast.Assign):
             for target in stmt.targets:
                 if isinstance(target, ast.Name):
@@ -165,6 +188,145 @@ def _direct_post_has_parse_mode(call: ast.Call, name_map: dict[str, ast.AST]) ->
         if isinstance(k, ast.Constant) and k.value == "parse_mode":
             return True
     return False
+
+
+class _UrllibTelegramDispatch(NamedTuple):
+    call: ast.Call
+    payload_dict: ast.Dict | None
+    has_parse_mode: bool
+
+
+def _resolve_name(expr: ast.AST, name_map: dict[str, ast.AST]) -> ast.AST:
+    """Resolve a simple Name through the current function name_map."""
+    seen: set[str] = set()
+    while isinstance(expr, ast.Name) and expr.id in name_map:
+        if expr.id in seen:
+            break
+        seen.add(expr.id)
+        expr = name_map[expr.id]
+    return expr
+
+
+def _is_urllib_request_call(expr: ast.AST) -> bool:
+    if not isinstance(expr, ast.Call):
+        return False
+    func = expr.func
+    if isinstance(func, ast.Name):
+        return func.id == "Request"
+    if isinstance(func, ast.Attribute):
+        return func.attr == "Request"
+    return False
+
+
+def _is_urlopen_call(expr: ast.AST) -> bool:
+    if not isinstance(expr, ast.Call):
+        return False
+    func = expr.func
+    if isinstance(func, ast.Name):
+        return func.id == "urlopen"
+    if isinstance(func, ast.Attribute):
+        return func.attr == "urlopen"
+    return False
+
+
+def _request_url_expr(call: ast.Call) -> ast.AST | None:
+    if call.args:
+        return call.args[0]
+    for kw in call.keywords:
+        if kw.arg in ("url", "full_url"):
+            return kw.value
+    return None
+
+
+def _request_data_expr(call: ast.Call) -> ast.AST | None:
+    if len(call.args) >= 2:
+        return call.args[1]
+    for kw in call.keywords:
+        if kw.arg == "data":
+            return kw.value
+    return None
+
+
+def _resolve_json_payload_dict(
+    expr: ast.AST | None, name_map: dict[str, ast.AST]
+) -> ast.Dict | None:
+    if expr is None:
+        return None
+    expr = _resolve_name(expr, name_map)
+    if isinstance(expr, ast.Dict):
+        return expr
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "encode"
+    ):
+        expr = expr.func.value
+    expr = _resolve_name(expr, name_map)
+    if not isinstance(expr, ast.Call):
+        return None
+    func = expr.func
+    if not (isinstance(func, ast.Attribute) and func.attr == "dumps"):
+        return None
+    if expr.args:
+        return _resolve_dict(expr.args[0], name_map)
+    for kw in expr.keywords:
+        if kw.arg == "obj":
+            return _resolve_dict(kw.value, name_map)
+    return None
+
+
+def _dict_has_parse_mode(payload_dict: ast.Dict | None) -> bool:
+    if payload_dict is None:
+        return False
+    for key in payload_dict.keys:
+        if isinstance(key, ast.Constant) and key.value == "parse_mode":
+            return True
+    return False
+
+
+def _find_urllib_telegram_dispatches(tree: ast.AST) -> list[_UrllibTelegramDispatch]:
+    """Find urllib.request.urlopen(Request(...sendMessage...)) dispatches.
+
+    This covers stdlib curl-direct paths such as scout/config_alert.py, where
+    the Telegram Request object is assigned to a local name before urlopen().
+    """
+    dispatches: list[_UrllibTelegramDispatch] = []
+    module_name_map = _build_module_name_map(tree)
+    for func_node in ast.walk(tree):
+        if not isinstance(func_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        name_map = {**module_name_map, **_build_name_map(func_node.body)}
+        for call in ast.walk(func_node):
+            if not _is_urlopen_call(call):
+                continue
+            request_expr: ast.AST | None = call.args[0] if call.args else None
+            if request_expr is None:
+                for kw in call.keywords:
+                    if kw.arg in ("url", "full_url"):
+                        request_expr = kw.value
+                        break
+            if request_expr is None:
+                continue
+            request_expr = _resolve_name(request_expr, name_map)
+            if not _is_urllib_request_call(request_expr):
+                continue
+            url_expr = _request_url_expr(request_expr)
+            if url_expr is None:
+                continue
+            url_str = _resolve_string_literal(url_expr, name_map)
+            if not (url_str and "/sendMessage" in url_str):
+                continue
+            payload_dict = _resolve_json_payload_dict(
+                _request_data_expr(request_expr), name_map
+            )
+            dispatches.append(
+                _UrllibTelegramDispatch(
+                    call=call,
+                    payload_dict=payload_dict,
+                    has_parse_mode=_dict_has_parse_mode(payload_dict),
+                )
+            )
+    return dispatches
 
 
 # Allowlist of currently-known sites that DO NOT explicitly pin parse_mode.
@@ -290,10 +452,43 @@ def test_all_dispatch_sites_pin_parse_mode():
                     f"{rel_path}:{call.lineno} direct session.post(.../sendMessage) "
                     f"without parse_mode in payload (and not allowlisted)"
                 )
+        # Third arm: urllib.request.urlopen(Request(.../sendMessage...)).
+        # PR #160 introduced this stdlib curl-direct shape in config_alert.py;
+        # it must remain structurally visible to the parse-mode audit even
+        # though it does not use aiohttp/requests-style .post().
+        for dispatch in _find_urllib_telegram_dispatches(tree):
+            if dispatch.payload_dict is None:
+                offenders.append(
+                    f"{rel_path}:{dispatch.call.lineno} urllib.request.urlopen("
+                    "Request(.../sendMessage...)) payload could not be resolved"
+                )
+                continue
+            if dispatch.has_parse_mode:
+                offenders.append(
+                    f"{rel_path}:{dispatch.call.lineno} urllib.request.urlopen("
+                    "Request(.../sendMessage...)) payload includes parse_mode; "
+                    "stdlib direct dispatches must stay plain text unless "
+                    "escape coverage is added explicitly"
+                )
     assert not offenders, (
         "Telegram dispatch sites missing parse_mode "
         "(see BL-NEW-PARSE-MODE-AUDIT + CLAUDE.md §12b):\n  " + "\n  ".join(offenders)
     )
+
+
+def test_config_alert_urllib_dispatch_is_structurally_audited_as_plain_text():
+    """BL-NEW-PARSE-MODE-AUDIT-EXTEND-URLLIB-DISPATCH: the AST sweep must
+    see urllib.request.urlopen(Request(...sendMessage...)) sites, not only
+    aiohttp/requests-style .post(...sendMessage) calls.
+    """
+    py_path = SCOUT_DIR / "config_alert.py"
+    tree = ast.parse(py_path.read_text(encoding="utf-8"))
+
+    dispatches = _find_urllib_telegram_dispatches(tree)
+
+    assert len(dispatches) == 1
+    assert dispatches[0].payload_dict is not None
+    assert not dispatches[0].has_parse_mode
 
 
 # ---------------------------------------------------------------------
