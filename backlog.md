@@ -965,10 +965,25 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 **decision-by:** 4 weeks.
 
 ### BL-NEW-HELIUS-PLAN-AUDIT
-**Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit B5 (Broken-if-free / Phantom-if-paid).
-**Action:** confirm prod Helius plan tier; if free: add per-cycle throttle OR move enrichment behind a wall-clock interval (e.g., 30 min per-token cache).
-**2026-05-14 Hermes-first overlay:** before adding provider-specific throttles or upgrading, compare the specific Helius use cases against GoldRush MCP/agent skills and installed optional Hermes `blockchain/solana` support. If GoldRush covers the same wallet/holder/transfer/security data with better operational fit, re-scope this from "Helius plan audit" to "on-chain provider consolidation audit."
-**decision-by:** 1 week (Broken-if-free severity).
+**Status:** AUDITED-PHANTOM 2026-05-18 — findings at `tasks/findings_helius_plan_audit_2026_05_18.md`. Same shape as Moralis (PR #173): three independent surfaces confirm the path is dead under current configuration: (1) `HELIUS_API_KEY=` empty on srilu .env; (2) 0 Helius log hits in 24h; (3) `holder_snapshots` table = 0 rows total. Early-return guard at `scout/ingestion/holder_enricher.py:33-34` prevents any Helius HTTP call when the key is empty. No code change. Conditional guardrail filed below as `BL-NEW-HELIUS-ENABLEMENT-GUARDRAIL`.
+
+**Notable nuance vs Moralis (Reviewer 1 P1 correction — stale daily cap):** Helius Free plan = **1M monthly credits** per current docs (1 credit per Standard RPC call; 10 req/s rate limit which is not binding at any plausible gecko-alpha cohort × cycle rate). The audit's ~100k/day reference was stale. Recalibrated at today's measured 12 cycles/hr: ~35k/day × 30 ≈ **~1.05M/month — at or marginally above the 1M Free cap before any ambient Helius usage outside gecko-alpha**. At ~30 cycles/hr (e.g., post-Demo-API-key partial relief): ~2.61M/month (~2.6× over). At audit's 60 cycles/hr: ~5.22M/month (~5.2× over). **Helius risk is rate-dependent (monthly)** in a way Moralis's was not; binding constraint is monthly credits, not daily calls.
+
+**Hermes-first 2026-05-18 (fresh, 4 surfaces):** (1) installed VPS skills (28 dirs, 0 helius/getTokenAccounts/Solana-holder hits); (2) Hermes optional-skills catalog `blockchain/solana` covers wallet/balance/top-5-holders + transactions but NOT `getTokenAccounts` full-count (and not installed); (3) awesome-hermes-agent has no Helius/Solana RPC entry; (4) GoldRush/Covalent agent-skills cover balances/transactions/NFTs/prices but no SPL holder enumeration. No installed or external primitive replaces the in-tree path.
+
+### BL-NEW-HELIUS-ENABLEMENT-GUARDRAIL: gate operator enablement of Helius behind plan-tier + cycle-rate check
+**Status:** PROPOSED 2026-05-18 — conditional follow-up to AUDITED-PHANTOM closure of BL-NEW-HELIUS-PLAN-AUDIT. Only fires if/when operator decides to set `HELIUS_API_KEY` on prod.
+**Tag:** `holder-enrichment` `evidence-gated` `operator-gated` `pre-enablement-guardrail` `conditional` `rate-dependent`
+**Why:** Audit (2026-05-18) confirmed the path is dead under current config; if-enabled at today's 12 cycles/hr projects ~1.05M/month against the Helius Free 1M monthly credit allocation (at-or-marginally-above the cap before ambient usage). If cycle rate climbs to ≥30 cycles/hr (e.g., post-Demo-API-key partial relief on CG ceiling), projection scales to ~2.6M/month (~2.6× over). Enablement decision must include a monthly-credit projection step before setting the key.
+**Trigger condition (NOT calendar-gated):** operator intent to enable Helius. If no intent in 6mo, close as inert.
+**Action checklist (operator-only when triggered):**
+1. Confirm plan tier via Helius dashboard. Free plan = 1M monthly credits; paid tiers higher.
+2. **Project monthly credit consumption** at enablement time: count `secondwave_cycle_complete` events over a recent 1h window, multiply by 24 × 30 × ~121 solana/cycle (or re-measured cohort). Compare against the Free 1M cap with explicit headroom for ambient Helius usage. **If projection > 1M/month without paid uplift:** add per-token `holder_count` cache (24h TTL suggested) AND/OR throttle the `enrich_holders` fan-out before enabling. Today's ~12 cycles/hr already projects ~1.05M/month — borderline-not-safe.
+3. Capture pre-enablement baseline + post-enablement 2h validation window (mirrors `runbook_cg_demo_api_key_2026_05_18.md` structure): verify `holder_snapshots` row-rate, check for `Helius holder lookup failed` entries, confirm credit usage at Helius dashboard.
+4. Re-check Hermes-first / GoldRush at enablement time — a Solana-specific full-holder-enumeration skill may have shipped by then.
+**Hermes-first 2026-05-18:** carry-forward of the audit's negative result across 4 surfaces; re-check at enablement time.
+**Drift verdict:** NET-NEW guardrail; conditional follow-up to AUDITED-PHANTOM closure. Mirrors `BL-NEW-MORALIS-ENABLEMENT-GUARDRAIL` shape but with rate-dependent cap evaluation step.
+**Decision-by:** evidence-gated (6mo backstop) — close as inert if no operator intent to enable Helius.
 
 ### BL-NEW-MORALIS-PLAN-AUDIT
 **Status:** AUDITED-PHANTOM 2026-05-18 — findings at `tasks/findings_moralis_plan_audit_2026_05_18.md`. Three independent surfaces confirm the path is dead under current configuration: (1) `MORALIS_API_KEY=` empty on srilu .env; (2) 0 Moralis log hits across 24h + 7d windows; (3) `holder_snapshots` table = 0 rows total. Early-return guard at `scout/ingestion/holder_enricher.py:37-38` prevents any Moralis HTTP call when the key is empty. The cycle-change audit's 25× over-cap projection was contingent on the key being set; with the key empty the risk is phantom. No code change. Conditional guardrail filed below as `BL-NEW-MORALIS-ENABLEMENT-GUARDRAIL`.
