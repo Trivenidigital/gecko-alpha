@@ -1,6 +1,18 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-18 (cycle 14: chain-anchor status correction + Helius + Moralis plan audits + CG budget attribution + stale PR triage)
+Last updated: 2026-05-18 (cycle 14: narrative-operator-alert-wire + chain-anchor status correction + Helius + Moralis plan audits + CG budget attribution + stale PR triage)
+
+## Active Work: BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE (PR-OPEN)
+
+- [x] Drift-check: existing `_verify_hmac` in `scout/api/narrative.py:121` is already V2-PR-review hardened (query-string binding, body-size cap, timestamp window, replay LRU, structured rejection logs). Reuse; no duplicate hardening.
+- [x] Hermes-first re-check 2026-05-18 (4 surfaces): installed VPS skills (0 hits), Hermes optional-skills catalog (`telephony` exists but is SMS/voice not chat/webhook-out), awesome-hermes-agent (`hermes-ai-infrastructure-monitoring-toolkit` candidate 404'd + per its description is a standalone cron toolkit, not an importable library), `devops/webhook-subscriptions` confirmed INBOUND-only. Verdict carry-forward from 2026-05-13: no Hermes path. Wire into in-tree `scout.alerter`.
+- [x] Evidence gate verified: `SELECT COUNT(*) FROM narrative_alerts_inbound` returned 204 vs ≥10 threshold (gate fired 20×).
+- [x] Implementation: `scout/api/internal_alert.py` (new). POST `/api/internal/operator-alert`. Reuses `_verify_hmac` + `_reject` from narrative.py. Calls `send_telegram_message(parse_mode=None, raise_on_failure=True)`. §12b log triplet: `operator_alert_dispatched` (before TG call) → `operator_alert_delivered` (on success) OR `operator_alert_failed` (on exception). 502 to caller on delivery failure so the Hermes side doesn't silently swallow.
+- [x] Dashboard wiring: `dashboard/api.py` mounts the new router with the same stub-503 pattern as the narrative router.
+- [x] Tests: `tests/test_internal_alert_api.py` covers 503 (disabled), 401 (missing headers), 403 (bad sig), 409 (replay), 400 (bad payload), 200 (delivery success + log triplet order), 502 (delivery failure + failed log), and 4 secret-leakage scans (success / auth-fail / delivery-fail / disabled paths).
+- [x] Backlog status flipped PROPOSED → PR-OPEN.
+- [ ] CI green on the new code + tests commit.
+- [ ] Operator runs SKILL.md update on srilu (`/home/gecko-agent/.hermes/skills/narrative_alert_dispatcher/SKILL.md`) to switch dispatcher from `narrative_dispatcher_misconfig` log-only to the active endpoint — out of repo, operator action after PR merges.
 
 ## Active Work: BL-NEW-CHAIN-ANCHOR-PIPELINE-FIX — SHIPPED (backlog status correction)
 
