@@ -121,13 +121,15 @@ The audit's "23 EVM/cycle × 60 cycles/hr = 33k/day" math counted
 per-cycle fan-out, not unique tokens. With ~12 cycles/hr observed today
 (post-#170 deploy under conservative CG limiter) and ~30 unique
 EVM-mappable tokens hydrated each cycle (estimate from 30 unique tokens
-seen at least once in 24h), the realistic if-enabled rate is:
+seen at least once in 24h), the realistic if-enabled rate is a range:
 
-- **Lower bound:** 30 unique × 12 cycles/hr × 24h = 8,640 calls/day = **~260k/month**
-- **Upper bound** (matching audit's per-cycle fan-out estimate): 23 × 12 × 24 = 6,624/day = **~200k/month**
+- 23 EVM/cycle × 12 cycles/hr × 24h × 30d = ~200k/month (matches the audit's per-cycle fan-out estimate)
+- 30 EVM/cycle × 12 cycles/hr × 24h × 30d = ~260k/month (uses today's observed unique-EVM count as per-cycle proxy)
 
-Both bounds **exceed Moralis legacy-free 40k/month** (5-7× over) but are
-lower than the audit's original 25× projection (which assumed 60 cycles/hr).
+**Range: ~200k-260k/month, or 5-7× over the Moralis legacy-free 40k/month
+cap.** Both endpoints of the range exceed the cap; magnitude is lower
+than the audit's original 25× projection (which assumed 60 cycles/hr)
+because actual cycle rate is currently ~12/hr.
 
 **Direction confirmed:** if the key were enabled today on legacy-free,
 the budget would be exceeded. The audit's conclusion shape is correct
