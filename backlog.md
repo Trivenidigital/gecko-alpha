@@ -1556,11 +1556,25 @@ These four entries were surfaced during the score/volume pruning PR's plan/desig
 **Status:** SHIPPED-WITH-FINDINGS 2026-05-17 — branch `feat/other-prod-config-audit` (cycle 11). Findings doc: `tasks/findings_other_prod_config_audit_2026_05_17.md`. Of 17 categories swept, only 1 gap (gecko cron entries repo-untracked at schedule level) — closed via new `cron/` directory (sentinel-bracketed managed block + idempotent `cron/deploy.sh` per V54 fold). Apache "Possible Gap" withdrawn after drill (not installed). VPS multi-tenant inventory documented (gecko-alpha + polymarket-ml-signal + btc15minutebot + shift-agent). 4 follow-ups filed (cron drift watchdog, cron-to-timer decision, drift-watchdog archive, firewall decision 2026-06-14, polymarket-verify); 1 withdrawn (Apache). Memory checkpoint: `project_prod_config_audit_2026_05_17.md`.
 
 ### BL-NEW-CRON-DRIFT-WATCHDOG: bash watchdog for crontab drift (cycle 11 follow-up)
-**Status:** PROPOSED 2026-05-17 — cycle 11 follow-up to BL-NEW-OTHER-PROD-CONFIG-AUDIT.
-**Why:** Cycle 11 ships repo-tracked cron entries via `cron/deploy.sh`. Mirror cycle 10's `systemd-drift-watchdog.sh` pattern for cron: daily check that `crontab -l` matches `cron/gecko-alpha.crontab` between sentinels.
-**Action:** ~2-3h build. Mirror `scripts/systemd-drift-watchdog.sh` shape: extract managed block from `crontab -l`, diff against repo fragment, alert on drift via curl-direct TG. Include sha256 ack-tombstone for alert dedup (per cycle-10 V46 pattern).
-**Pattern:** parallels `scripts/systemd-drift-watchdog.sh` (cycle 10).
-**decision-by:** 4 weeks (low priority; cron block is short + stable).
+**Status:** PR-OPEN / PENDING-MERGE 2026-05-18 — PR #156. Shipped `scripts/cron-drift-watchdog.sh` (~215 LOC) mirroring cycle-10 `systemd-drift-watchdog.sh` with 2-reviewer plan-fold improvements (tempfile-based diff for newline-asymmetry false-positive fix, mktemp for response file, `--max-time 30` curl, sentinel-count guard, sentinel-text-typo detector, distinct exit codes). 14/14 tests pass on srilu Python 3.12.3. Prod-crontab dry-run: CLEAN (managed block matches repo fragment). Filed 2 follow-ups: `BL-NEW-CRON-DRIFT-WATCHDOG-HEARTBEAT-MONITOR` (R2 #13 §12a compliance) + `BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT` (backport mktemp + max-time fixes to systemd-watchdog).
+
+**Original status (now historical):** PROPOSED 2026-05-17 — cycle 11 follow-up to BL-NEW-OTHER-PROD-CONFIG-AUDIT.
+
+**Post-merge action (operator):** flip status above from `PR-OPEN / PENDING-MERGE` to `SHIPPED <date>` with merge SHA per PR #150 Reviewer 1 convention.
+
+### BL-NEW-CRON-DRIFT-WATCHDOG-HEARTBEAT-MONITOR: wire stale-heartbeat detector for cron-drift-watchdog
+**Status:** PROPOSED 2026-05-18 — PR-stage R2 #13 fold from BL-NEW-CRON-DRIFT-WATCHDOG. CLAUDE.md §12a compliance: shipping a new heartbeat-writing watchdog without a stale-detector is the silent-failure surface §12a exists to prevent.
+**Tag:** `observability` `watchdog` `silent-failure-prevention`
+**Why:** `scripts/cron-drift-watchdog.sh` writes `/var/lib/gecko-alpha/cron-drift-watchdog/heartbeat` on CLEAN runs but no separate monitor checks the heartbeat's freshness. If the watchdog itself stops running (cron line removed, script broken, etc.), the operator has no signal.
+**Action:** ~1h. Extend existing `scripts/gecko-backup-watchdog.sh` (or create `scripts/cron-drift-stale-heartbeat-watchdog.sh` modeled on it) to alert when the cron-drift-watchdog heartbeat is older than N hours (default 25h to cover a daily cron firing 1-hour-late). Add to cron managed block in `cron/gecko-alpha.crontab`.
+**Decision-by:** 4 weeks from PR #156 merge.
+
+### BL-NEW-WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT: backport mktemp + curl --max-time fixes to systemd-watchdog
+**Status:** PROPOSED 2026-05-18 — PR-stage R2 #4 + #12 fold from BL-NEW-CRON-DRIFT-WATCHDOG.
+**Tag:** `security-hardening` `watchdog` `tech-debt`
+**Why:** PR #156 (cron-drift-watchdog) fixed two latent issues that also exist in `scripts/systemd-drift-watchdog.sh`: (a) `/tmp/.gecko-drift-resp.$$` is a predictable PID-based tmp path — symlink-attack surface if local non-root user pre-creates the symlink; (b) `curl` without `--max-time` can hold the flock indefinitely on hung network. Same fixes apply.
+**Action:** ~30min. Apply `mktemp -t gecko-systemd-drift-resp.XXXXXX` + `curl --max-time 30` to `scripts/systemd-drift-watchdog.sh`. Add regression-style tests for both.
+**Decision-by:** 4 weeks from PR #156 merge.
 
 ### BL-NEW-CRON-TO-SYSTEMD-TIMER: convert 2 weekly cron entries to systemd timers (cycle 11 follow-up)
 **Status:** PROPOSED 2026-05-17 — cycle 11 design-tension follow-up (V53 fold).

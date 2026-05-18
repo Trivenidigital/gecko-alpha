@@ -1,6 +1,20 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-17 (BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT findings shipped; BL-NEW-LC-REVIVAL-CRITERIA-TIGHTENING PR #150 merged at a20891f)
+Last updated: 2026-05-18 (overnight cycle 13: PRs #155 (items 1+2 audit) + #156 (item 3 cron-drift-watchdog) opened)
+
+## Active Work: BL-NEW-CRON-DRIFT-WATCHDOG (item 3)
+
+- [x] Isolated worktree: `.claude/worktrees/feat+cron-drift-watchdog`
+- [x] Drift-check: HEAD = `cdeb31f` = origin/master (zero divergence; includes PRs #150-#154). Grep for `cron-drift-watchdog` returns ZERO files — net-new.
+- [x] Hermes-first: no per-token Hermes primitive for crontab drift; reuse in-tree curl-direct Telegram pattern. awesome-hermes-agent reachable; x-twitter-scraper exists but unrelated.
+- [x] Plan v2 (post-2-reviewer fold): `tasks/plan_cron_drift_watchdog.md` — 14 reviewer findings folded (1 CRITICAL + 8 IMPORTANT + 5 MINOR across 2 reviewers).
+- [x] Design consolidated into plan v2 per CLAUDE.md §10 (fold table + code blocks specify all design decisions; separate design doc would duplicate).
+- [x] Build: `scripts/cron-drift-watchdog.sh` (~215 LOC mirroring cycle-10 systemd-drift-watchdog with reviewer-fold improvements) + `tests/test_cron_drift_watchdog.py` (14 tests).
+- [x] TDD: 14/14 tests pass on srilu Python 3.12.3 / pytest 8.4.2. Mid-build bug caught: `diff -u` includes tempfile mtime headers, breaking sha256 ack stability. Fixed via `--label`.
+- [x] Prod-crontab dry-run: CLEAN (managed block matches repo fragment).
+- [x] backlog.md status flip PROPOSED → PR-OPEN/PENDING-MERGE + 2 follow-ups filed (HEARTBEAT-MONITOR per R2 #13; WATCHDOG-SYMLINK-AND-MAXTIME-BACKPORT per R2 #4 + R2 #12).
+- [ ] PR + 3 parallel PR-stage reviewers (in progress)
+- [ ] Post-merge: bookkeeping flip per PR #150 convention
 
 ## Active Work: BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT
 
