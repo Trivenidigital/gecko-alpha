@@ -103,3 +103,60 @@ find /var/lib/gecko-alpha/cron-drift-watchdog/heartbeat -mmin +1500 -type f \
 | 6 | required binary missing (`crontab` or `python3`) OR `UV_BIN` set without test opt-in |
 | 7 | Telegram HTTP delivery failed; ACK NOT written; next fire re-alerts |
 | 8 | `cron/gecko-alpha.crontab` fragment missing in repo |
+
+## Revival-verdict-watchdog (BL-NEW-REVIVAL-VERDICT-WATCHDOG)
+
+`scripts/revival-verdict-watchdog.sh` alerts when a
+`signal_params_audit` row of the form
+`keep_on_provisional_until_<iso>` has passed its embedded expiry
+without a fresh operator verdict. **Status: SCRIPT-SHIPPED /
+SCHEDULING-PENDING-OPERATOR.** The script lives in the repo; the
+cron entry is NOT installed by default.
+
+Design: `tasks/plan_revival_verdict_watchdog_2026_05_19.md` (PR #185).
+
+### Smoke test (no scheduling)
+
+```bash
+ssh root@srilu-vps
+cd /root/gecko-alpha
+git pull
+bash scripts/revival-verdict-watchdog.sh
+# Expected on prod today (0 provisional rows): exit 0,
+# stdout "revival_verdict_watchdog_run expired_count=0".
+```
+
+### Setup (one-time, opt-in to scheduled firing — operator approval required)
+
+```bash
+# 1. Add to cron managed block
+echo "30 9 * * * /root/gecko-alpha/scripts/revival-verdict-watchdog.sh >> /var/log/revival-verdict-watchdog.log 2>&1" \
+    >> cron/gecko-alpha.crontab
+# 2. Commit + push the change
+# 3. Deploy
+bash cron/deploy.sh
+# 4. Verify
+crontab -l | grep revival-verdict-watchdog
+```
+
+### Disable / revert
+
+```bash
+# Fast disable: strip from live crontab
+crontab -l | grep -v revival-verdict-watchdog | crontab -
+
+# Clean revert: remove from cron/gecko-alpha.crontab and redeploy
+sed -i '/revival-verdict-watchdog/d' cron/gecko-alpha.crontab
+bash cron/deploy.sh
+```
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | No expired provisional verdicts, OR alert suppressed by per-signal re-alert window |
+| 1 | Alert delivered |
+| 4 | DB not found / SQL error / malformed ISO in `new_value` |
+| 5 | Telegram token / chat_id missing or placeholder |
+| 6 | `python3` not available (JSON encoding) |
+| 7 | Telegram HTTP delivery failed |

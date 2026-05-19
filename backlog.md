@@ -1833,11 +1833,13 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 **Post-merge action (operator):** ✅ COMPLETED 2026-05-17. PR #150 merged at `a20891f` (2026-05-17T21:48:57Z) per Reviewer 1 signoff. Status above flipped from `PR-OPEN / PENDING-MERGE` → `SHIPPED <date>` with merge SHA.
 
 ### BL-NEW-REVIVAL-VERDICT-WATCHDOG: active enforcement of keep_on_provisional_until_<iso> expiry
-**Status:** PROPOSED 2026-05-17 — filed concurrent with BL-NEW-LC-REVIVAL-CRITERIA-TIGHTENING shipping. Carves out the "active enforcement" half of the originating backlog scope item 5.
+**Status:** SCRIPT-SHIPPED / SCHEDULING-PENDING-OPERATOR 2026-05-19 — design PR #185 reviewed and folded; implementation PR opened against branch `codex/revival-verdict-watchdog-impl`. 18/18 tests passing. Cron entry NOT installed; activation requires explicit operator approval (see `cron/README.md` "Revival-verdict-watchdog" section). Matches BL-NEW-CRON-DRIFT-WATCHDOG precedent.
 **Tag:** `revival` `watchdog` `silent-failure-prevention`
 **Why:** PR #150 ships the verdict-stamp machinery (`keep_on_provisional_until_<iso>`) but does NOT actively enforce the expiry. Operator runs the evaluator manually; if the operator forgets to re-run at expiry, the audit row sits as a stale "valid" verdict. Per CLAUDE.md §12-style silent-non-failure rule: if it looks like a primitive but doesn't fire, the operator's mental model is wrong about the system.
-**Action:** ~6-8h implementation. Daily cron job that scans `signal_params_audit` for the most-recent `field_name='soak_verdict'` row per signal_type whose `new_value LIKE 'keep_on_provisional_until_%'`; if the parsed expiry timestamp is in the past, either (a) emit operator alert "verdict expired, re-run evaluator" or (b) auto-write a revoke row. Recommend (a) — operator decision-point preserved.
-**Decision-by:** 4 weeks from PR #150 merge.
+**Action:** ~6-8h implementation. Daily cron job that scans `signal_params_audit` for the most-recent `field_name='soak_verdict'` row per signal_type whose `new_value LIKE 'keep_on_provisional_until_%'`; if the parsed expiry timestamp is in the past, either (a) emit operator alert "verdict expired, re-run evaluator" or (b) auto-write a revoke row. **Implemented as (a)** — operator decision-point preserved.
+**Approach implemented:** (a) alert-only. Auto-revoke (b) explicitly rejected as a §12b "automated state reversal of operator-applied state" case.
+**Post-merge action (operator):** smoke-test the script on srilu (`bash scripts/revival-verdict-watchdog.sh` — expected exit 0 on prod today since 0 provisional rows exist). When ready, follow the activation runbook in `cron/README.md` to install the daily cron entry.
+**Decision-by:** 4 weeks from PR #150 merge (2026-06-14).
 
 ### BL-NEW-REVIVAL-CRITERIA-QUARTERLY-RECALIBRATION: periodic re-derivation of healthy-signal baselines
 **Status:** PROPOSED 2026-05-17 — PR-stage reviewer #3 finding #10 follow-up.
