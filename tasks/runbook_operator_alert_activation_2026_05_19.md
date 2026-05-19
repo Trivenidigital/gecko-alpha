@@ -66,25 +66,67 @@ Do NOT echo or print it again after this step.
 ## Step 2 — set the secret on srilu `.env`
 
 SSH with TTY so `read -rsp` can prompt silently. Same secret-hygiene
-pattern as `tasks/runbook_cg_demo_api_key_2026_05_18.md`.
+pattern as `tasks/runbook_cg_demo_api_key_2026_05_18.md`, with two
+additions:
+
+1. **Idempotent.** If `OPERATOR_ALERT_HMAC_SECRET=` already exists in
+   `.env` (e.g., a prior failed attempt), the line is replaced. If
+   absent, it is appended. No risk of duplicate rows that Pydantic would
+   pick the wrong one of.
+2. **Secret never appears on any command line.** The pasted value is
+   written to a `umask 077` tmpfile and read by awk via filename — no
+   shell-variable interpolation into the awk command line, no `set` /
+   `ps` exposure beyond the brief `read -rsp` window.
 
 ```bash
 ssh -t root@srilu-vps '
 cd /root/gecko-alpha
 cp .env .env.bak.pre-operator-alert-2026-05-19
-printf "\n# OPERATOR_ALERT_HMAC_SECRET (BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE)\n" >> .env
+
+# Read the secret silently into a shell variable and immediately write
+# it to a 0600-mode tmpfile so the rest of the flow can pass it via
+# filename, never via shell interpolation.
 read -rsp "OPERATOR_ALERT_HMAC_SECRET (paste, will not echo): " OP_KEY
-printf "\nOPERATOR_ALERT_HMAC_SECRET=%s\n" "$OP_KEY" >> .env
-unset OP_KEY
 echo
+umask 077
+printf "%s\n" "$OP_KEY" > .op_secret.tmp
+unset OP_KEY
+
+# Idempotent in-place edit. awk reads the new value from
+# .op_secret.tmp (filename only on the command line). If the key
+# already exists in .env, the line is replaced; otherwise append a
+# comment block + the line.
+awk -v new_secret_file=".op_secret.tmp" '"'"'
+BEGIN {
+    getline new_value < new_secret_file
+    close(new_secret_file)
+    found = 0
+}
+/^OPERATOR_ALERT_HMAC_SECRET=/ {
+    print "OPERATOR_ALERT_HMAC_SECRET=" new_value
+    found = 1
+    next
+}
+{ print }
+END {
+    if (!found) {
+        print ""
+        print "# OPERATOR_ALERT_HMAC_SECRET (BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE)"
+        print "OPERATOR_ALERT_HMAC_SECRET=" new_value
+    }
+}
+'"'"' .env > .env.update.tmp && mv .env.update.tmp .env
+rm -f .op_secret.tmp
+
 echo "===VERIFY==="
 grep -nE "^OPERATOR_ALERT_HMAC_SECRET=" .env | sed "s/=.*/=<redacted>/"
 '
 ```
 
-The verify line should show exactly one row, `<redacted>` after the `=`.
-If two rows appear, edit `.env` (use `vi /root/gecko-alpha/.env`, do NOT
-`cat`) and remove the empty earlier entry.
+The verify line should show **exactly one** row, `<redacted>` after the
+`=`. If two rows appear, the idempotent logic failed; investigate
+before continuing. If zero rows appear, the tmpfile was empty or
+unreadable.
 
 ## Step 3 — restart gecko-pipeline so Pydantic picks up the new secret
 
@@ -196,16 +238,22 @@ Expected: `<empty>`.
 
 ### Step 6c — restart so the empty narrative secret takes effect
 
+Write the restart timestamp to a tmpfile on the VPS so Step 6d can
+read it without manual copy-paste of a placeholder.
+
 ```bash
 ssh root@srilu-vps '
-date -u +"restart_at=%Y-%m-%dT%H:%M:%SZ"
+date -u +"%Y-%m-%dT%H:%M:%SZ" > /tmp/operator_alert_smoke_test_start.txt
+echo "restart_at=$(cat /tmp/operator_alert_smoke_test_start.txt)"
 systemctl restart gecko-pipeline
 sleep 3
 systemctl is-active gecko-pipeline
 '
 ```
 
-Record `restart_at` — this is the smoke-test window start.
+The `restart_at` line is echoed back for your terminal record;
+`/tmp/operator_alert_smoke_test_start.txt` is the authoritative copy
+that Step 6d reads.
 
 ### Step 6d — observe the dispatcher fire its operator alert
 
@@ -216,7 +264,10 @@ should detect that POSTs to `/api/narrative-alert` are returning 503
 
 ```bash
 ssh root@srilu-vps '
-SINCE="<restart_at from step 6c>"
+SINCE=$(cat /tmp/operator_alert_smoke_test_start.txt)
+echo "===WINDOW_START==="
+echo "since=$SINCE"
+echo
 echo "===OPERATOR_ALERT_DISPATCHED==="
 journalctl -u gecko-pipeline --since "$SINCE" --no-pager 2>/dev/null \
   | grep -E "\"event\": \"operator_alert_(dispatched|delivered|failed)\""
@@ -247,23 +298,42 @@ from Step 5.
 
 ### Step 6e — restore the narrative secret
 
-This step is mandatory and must run regardless of smoke-test outcome.
+This step is **mandatory and must run regardless of smoke-test outcome**.
+
+The restore uses awk reading the backup file directly — the secret
+never enters a shell variable or a sed substitution string, so there's
+no shell-history / `set` / `ps`-line exposure of the secret, and no
+risk of sed mis-handling regex special characters in the value.
 
 ```bash
 ssh root@srilu-vps '
 cd /root/gecko-alpha
-NARRATIVE_LINE=$(cat .narrative_secret_backup.tmp)
-sed -i "s/^NARRATIVE_SCANNER_HMAC_SECRET=.*/$NARRATIVE_LINE/" .env
+
+# awk reads .narrative_secret_backup.tmp (containing the full
+# "NARRATIVE_SCANNER_HMAC_SECRET=<secret>" line from Step 6a) and the
+# current .env. For each .env line matching NARRATIVE_SCANNER_HMAC_SECRET=,
+# print the backup line as-is; otherwise pass through. The secret never
+# enters a shell variable or sed substitution string.
+awk '"'"'
+    NR==FNR { backup = $0; next }
+    /^NARRATIVE_SCANNER_HMAC_SECRET=/ { print backup; next }
+    { print }
+'"'"' .narrative_secret_backup.tmp .env > .env.restore.tmp \
+  && mv .env.restore.tmp .env
+
+rm -f .narrative_secret_backup.tmp /tmp/operator_alert_smoke_test_start.txt
+
 echo "===VERIFY==="
 grep -nE "^NARRATIVE_SCANNER_HMAC_SECRET=" .env | sed "s/=.*/=<redacted>/"
-rm -f .narrative_secret_backup.tmp
+
 systemctl restart gecko-pipeline
 sleep 3
 systemctl is-active gecko-pipeline
 '
 ```
 
-Expected: `<redacted>` shown, service `active`.
+Expected: `<redacted>` shown, service `active`. Also clears the
+`/tmp/operator_alert_smoke_test_start.txt` timestamp file from Step 6c.
 
 ## Step 7 — flip backlog to full SHIPPED
 
