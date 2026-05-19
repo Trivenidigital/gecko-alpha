@@ -547,6 +547,14 @@ function PnlBySignalPanel({ bySignal, cohort, cohortView, setCohortView }) {
   const renderRow = (s, i, opts = {}) => {
     const pnl = s.total_pnl_usd ?? s.total_pnl ?? s.pnl ?? 0
     const wr = s.win_rate_pct ?? s.win_rate ?? (s.trades > 0 ? ((s.wins / s.trades) * 100) : 0)
+    const trades = s.trades ?? s.total_trades ?? 0
+    // Per-row low-n caveat (BL-NEW-DASHBOARD-SIGNAL-QUALITY-LEADERBOARD
+    // / assignment P3.5): inline badge so a trader doesn't anchor on
+    // a +PnL row with n=2. The signal-type-level verdict already
+    // applies a minN threshold to the cohort-comparison; this badge
+    // applies to the individual row in either cohort view.
+    const lowN = trades > 0 && trades < minN
+    const veryLowN = trades > 0 && trades < 5
     const rowBg = pnl > 0
       ? 'rgba(76, 175, 80, 0.07)'
       : pnl < 0
@@ -580,7 +588,41 @@ function PnlBySignalPanel({ bySignal, cohort, cohortView, setCohortView }) {
             </div>
           )}
         </td>
-        <td>{s.trades ?? s.total_trades ?? 0}</td>
+        <td style={{ whiteSpace: 'nowrap' }}>
+          {trades}
+          {veryLowN && (
+            <span
+              title={`Very low sample (n=${trades}). Treat the PnL/win-rate columns as exploratory only — they are not proven evidence for or against this cohort.`}
+              style={{
+                marginLeft: 6,
+                padding: '1px 5px',
+                fontSize: 10,
+                fontWeight: 700,
+                borderRadius: 3,
+                background: 'rgba(239, 83, 80, 0.18)',
+                color: 'var(--color-accent-red, #ef5350)',
+              }}
+            >
+              very low n ⚠
+            </span>
+          )}
+          {!veryLowN && lowN && (
+            <span
+              title={`Below verdict threshold (n=${trades}, need ≥${minN}). Treat as exploratory; do NOT promote a low-n cohort.`}
+              style={{
+                marginLeft: 6,
+                padding: '1px 5px',
+                fontSize: 10,
+                fontWeight: 700,
+                borderRadius: 3,
+                background: 'rgba(255, 183, 77, 0.18)',
+                color: 'var(--color-accent-amber)',
+              }}
+            >
+              low n ⚠
+            </span>
+          )}
+        </td>
         <td>{s.wins ?? 0}</td>
         <td style={{ fontWeight: 700, color: pnlColor(pnl) }}>{fmtUsd(pnl)}</td>
         <td>{Number(wr).toFixed(1)}%</td>
