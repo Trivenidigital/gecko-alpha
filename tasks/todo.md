@@ -67,6 +67,19 @@ Review:
 - Worst current-regime signal types/cells: `losers_contrarian` (-$803.22 / n=146), `gainers_early` (-$382.93 / n=252), `gainers_early + mcap:5-10m` (-$701.77 / n=49), `gainers_early + confluence:3` (-$468.14 / n=37).
 - Data gaps: X handle and liquidity are not rankable from closed trade outcomes; X alerts have 215 rows but 0 priced outcomes due unresolved `resolved_coin_id`; TG channel has only 2 current-regime closed linked trades.
 
+## Active Work: BL-NEW-ACTIONABILITY-GATE-V1
+
+- [x] Isolated worktree created: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-actionability-gate-v1` on `codex/actionability-gate-v1`
+- [x] Audit artifacts cherry-picked from `3fb6084`
+- [x] Baseline relevant suite via shared venv: `51 passed, 1 skipped, 1 warning`
+- [x] Drift check: existing `would_be_live` is live-slot eligibility, not actionability
+- [x] Hermes-first check: no actionability-gate primitive; reuse Hermes X/KOL only as raw telemetry
+- [x] Plan drafted: `tasks/plan_actionability_gate_v1.md`
+- [ ] Plan reviewed by 2 parallel agents
+- [ ] Design drafted and reviewed by 2 parallel agents
+- [ ] TDD implementation complete
+- [ ] PR opened and reviewed by 3 parallel agents
+
 Last updated: 2026-05-18 (cycle 14: narrative-operator-alert-wire + chain-anchor status correction + Helius + Moralis plan audits + CG budget attribution + stale PR triage)
 
 ## Active Work: BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE (ENDPOINT-SHIPPED / HERMES-SKILL-PENDING)
