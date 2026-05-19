@@ -73,7 +73,7 @@ Review:
 - [x] Baseline relevant suite: `42 passed`.
 - [x] PR #181 deployed to srilu-vps: `/root/gecko-alpha` fast-forwarded `ec4f35c` -> `7506adc`; `gecko-pipeline` and `gecko-dashboard` active.
 - [x] DB migration verified on srilu-vps: `paper_trades.actionable`, `actionability_reason`, and `actionability_version` present; marker `bl_new_actionability_gate_v1` cut over at `2026-05-19T11:39:09.121422+00:00`.
-- [ ] Fresh post-deploy paper-trade row stamp verified.
+- [x] Fresh post-deploy paper-trade row stamp verified.
 - [x] Plan drafted: `tasks/plan_actionability_visibility_validation.md`.
 - [x] TDD backend dashboard API support complete.
 - [x] Dashboard UI support complete.
@@ -82,7 +82,7 @@ Review:
 - [x] PR opened: https://github.com/Trivenidigital/gecko-alpha/pull/182
 
 Review:
-- Fresh-row verification is not an implementation blocker: immediately after deploy, `COUNT(*) FROM paper_trades WHERE opened_at >= '2026-05-19T11:37:26+00:00'` returned `0`.
+- Fresh-row verification: post-deploy rows `2206`, `2207`, and `2208` all stamped `actionable`, `actionability_reason`, and `actionability_version='v1'`; row `2208` is actionable (`v1_pass_core_signal_mcap_10_50m`), rows `2206`/`2207` are exploratory (`v1_block_tg_social_low_n`).
 - Backend red/green: 4 new tests failed before implementation, then passed after adding row fields, history filter/count semantics, and `/api/trading/actionability`.
 - Full dashboard API test file after backend slice: `24 passed`.
 - Frontend build after Trading tab UI change: `npm run build` passed; Vite emitted `dist/assets/index-Ca4N1ClP.js`.
