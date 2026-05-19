@@ -547,6 +547,14 @@ function PnlBySignalPanel({ bySignal, cohort, cohortView, setCohortView }) {
   const renderRow = (s, i, opts = {}) => {
     const pnl = s.total_pnl_usd ?? s.total_pnl ?? s.pnl ?? 0
     const wr = s.win_rate_pct ?? s.win_rate ?? (s.trades > 0 ? ((s.wins / s.trades) * 100) : 0)
+    const trades = s.trades ?? s.total_trades ?? 0
+    // Per-row low-n caveat (BL-NEW-DASHBOARD-SIGNAL-QUALITY-LEADERBOARD
+    // / assignment P3.5): inline badge so a trader doesn't anchor on
+    // a +PnL row with n=2. The signal-type-level verdict already
+    // applies a minN threshold to the cohort-comparison; this badge
+    // applies to the individual row in either cohort view.
+    const lowN = trades > 0 && trades < minN
+    const veryLowN = trades > 0 && trades < 5
     const rowBg = pnl > 0
       ? 'rgba(76, 175, 80, 0.07)'
       : pnl < 0
@@ -580,7 +588,53 @@ function PnlBySignalPanel({ bySignal, cohort, cohortView, setCohortView }) {
             </div>
           )}
         </td>
-        <td>{s.trades ?? s.total_trades ?? 0}</td>
+        <td style={{ whiteSpace: 'nowrap' }}>
+          {trades}
+          {/*
+            Low-sample badges: low-n is a "do not trust yet" state,
+            NOT a "bad cohort" state. Per reviewer fold 2026-05-19:
+            the prior red color implied bad; both tiers now use
+            muted neutral tones (italic, low-contrast) — the badge
+            tells the trader "ignore this row's PnL/WR for verdict
+            purposes" rather than "this row is wrong."
+          */}
+          {veryLowN && (
+            <span
+              title={`Too small to interpret (n=${trades}). The PnL/win-rate columns are not yet evidence for or against this cohort — wait for more samples.`}
+              style={{
+                marginLeft: 6,
+                padding: '1px 5px',
+                fontSize: 10,
+                fontWeight: 600,
+                fontStyle: 'italic',
+                borderRadius: 3,
+                background: 'var(--color-bar-bg, #1a1a1a)',
+                color: 'var(--color-text-secondary)',
+                border: '1px solid var(--color-border)',
+              }}
+            >
+              n={trades} · too small to interpret
+            </span>
+          )}
+          {!veryLowN && lowN && (
+            <span
+              title={`Below verdict threshold (n=${trades}, need ≥${minN}). Treat as exploratory; do not promote a low-n cohort.`}
+              style={{
+                marginLeft: 6,
+                padding: '1px 5px',
+                fontSize: 10,
+                fontWeight: 600,
+                fontStyle: 'italic',
+                borderRadius: 3,
+                background: 'rgba(255, 183, 77, 0.10)',
+                color: 'var(--color-accent-amber)',
+                border: '1px solid rgba(255, 183, 77, 0.30)',
+              }}
+            >
+              low n · do not trust yet
+            </span>
+          )}
+        </td>
         <td>{s.wins ?? 0}</td>
         <td style={{ fontWeight: 700, color: pnlColor(pnl) }}>{fmtUsd(pnl)}</td>
         <td>{Number(wr).toFixed(1)}%</td>
