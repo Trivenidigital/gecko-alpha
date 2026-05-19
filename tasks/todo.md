@@ -137,6 +137,23 @@ Review:
 
 Last updated: 2026-05-18 (cycle 14: narrative-operator-alert-wire + chain-anchor status correction + Helius + Moralis plan audits + CG budget attribution + stale PR triage)
 
+## Active Work: BL-NEW-PEAK-GIVEBACK-FRESHNESS-FILTER-AUDIT
+
+- [x] Isolated worktree created: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-peak-giveback-freshness-audit` on `analysis/peak-giveback-freshness-audit-2026-05-19`
+- [x] Guardrail accepted: no suppression, entry-rule, sizing, capital-allocation, live-trading, or gate-threshold changes before the 24h actionability validation
+- [x] Drift check: existing `scripts/analyze_profit_patterns.py` and `tasks/findings_profit_patterns_2026_05_19.md` cover broad profit buckets but not a pre-entry TTL/giveback threshold sweep
+- [x] Production schema checked read-only for `paper_trades` and snapshot price sources
+- [x] Run read-only stale-entry threshold sweep on production `scout.db`
+- [x] Draft findings doc with proposed V2 gate candidates only
+- [x] Verify script syntax/output and document verification limits
+
+Review:
+
+- `python -m py_compile scripts/audit_peak_giveback_freshness.py` passed locally.
+- `git diff --check` passed.
+- Production read-only audit ran against `/root/gecko-alpha/scout.db` for both current-regime and all-history windows; output captured locally in ignored `.ssh_out_peak_audit_*.txt` files.
+- `uv run pytest tests/test_trading_db.py -q` did not reach tests in the fresh worktree because uv failed to fetch `hatchling` from PyPI due `invalid peer certificate: UnknownIssuer`.
+
 ## Active Work: BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE (ENDPOINT-SHIPPED / HERMES-SKILL-PENDING)
 
 - [x] Drift-check: existing `_verify_hmac` in `scout/api/narrative.py:121` is already V2-PR-review hardened (query-string binding, body-size cap, timestamp window, replay LRU, structured rejection logs). Reuse; no duplicate hardening.
