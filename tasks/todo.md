@@ -86,12 +86,12 @@ Review:
 - Folded into `tasks/plan_actionability_gate_v1.md`: DB mcap enrichment, chain-completed missing-mcap exception, gainers_early `10-50m` observe block, nullable actionability columns, marker idempotence tests, and real engine-path fallback tests.
 - Design reviewers both returned `APPROVE_WITH_CHANGES`; folded volume-spike mcap carry-forward, stack-failure fail-closed metadata for `gainers_early`, non-suppressing actionability exception policy, existing-DB upgrade test, and persisted `signal_data` immutability test.
 - Implementation commits:
-  - `12d41cf` `feat: add actionability gate classifier`
-  - `5974ba4` `feat: add actionability paper-trade columns`
-  - `c4c9559` `feat: stamp paper-trade actionability`
+  - `008b734` `feat: add actionability gate classifier`
+  - `14fa4c0` `feat: add actionability paper-trade columns`
+  - `bd3b3fe` `feat: stamp paper-trade actionability`
 - Verification:
-  - Focused suite: `82 passed, 1 skipped, 1 warning`
-  - Adjacent trading suite: `329 passed, 1 skipped, 1 warning`
+  - Post-rebase focused suite: `82 passed, 1 skipped, 1 warning`
+  - Post-rebase adjacent trading suite: `329 passed, 1 skipped, 1 warning`
   - Warning is the existing `aiosqlite` event-loop-closed thread warning from `tests/test_trading_db_migration.py::test_post_migration_assertion_raises_on_incomplete_schema`.
 - Deferrals: X/TG ranking waits for outcome linkage; `peak_pct < 5` risk handling waits for a separate exit-policy design; dashboard UI deferred; live trading policy unchanged.
 
