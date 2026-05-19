@@ -13,6 +13,10 @@ import structlog
 from scout.config import Settings
 from scout.db import Database
 from scout.exceptions import MoonshotArmFailed
+from scout.trading.actionability import (
+    ActionabilityDecision,
+    evaluate_actionability_v1,
+)
 from scout.trading.conviction import compute_stack
 from scout.trading.live_eligibility import compute_would_be_live
 
@@ -39,6 +43,64 @@ class _PaperTradeHandoff:
     signal_type: str
     symbol: str
     coin_id: str
+
+
+def _has_mcap(signal_data: dict) -> bool:
+    for key in (
+        "mcap",
+        "market_cap",
+        "market_cap_usd",
+        "mcap_at_sighting",
+        "alert_market_cap",
+    ):
+        value = signal_data.get(key)
+        if value not in (None, ""):
+            return True
+    return False
+
+
+async def _enrich_actionability_signal_data(
+    db: Database,
+    *,
+    token_id: str,
+    signal_type: str,
+    signal_data: dict,
+) -> dict:
+    enriched = dict(signal_data)
+    if _has_mcap(enriched):
+        return enriched
+
+    conn = db._conn
+    if conn is None:
+        return enriched
+
+    try:
+        if signal_type == "chain_completed":
+            cur = await conn.execute(
+                "SELECT mcap_at_completion FROM chain_matches "
+                "WHERE token_id=? AND mcap_at_completion IS NOT NULL "
+                "ORDER BY datetime(completed_at) DESC LIMIT 1",
+                (token_id,),
+            )
+            row = await cur.fetchone()
+            if row and row[0] not in (None, ""):
+                enriched["mcap"] = row[0]
+                return enriched
+
+        cur = await conn.execute(
+            "SELECT market_cap FROM price_cache WHERE coin_id=?",
+            (token_id,),
+        )
+        row = await cur.fetchone()
+        if row and row[0] not in (None, ""):
+            enriched["mcap"] = row[0]
+    except Exception:
+        log.exception(
+            "actionability_mcap_enrichment_failed",
+            token_id=token_id,
+            signal_type=signal_type,
+        )
+    return enriched
 
 
 class PaperTrader:
@@ -100,18 +162,57 @@ class PaperTrader:
         # volume_spike (unconditionally Tier 1a/2a; stack value unused).
         # Other signal_types may pass via Tier 1b (stack ≥ 3) OR Tier 2b
         # (gainers_early thresholds), so stack must be computed.
+        actionability: ActionabilityDecision | None = None
+        stack_for_actionability = 0
+        try:
+            if signal_type not in ("chain_completed", "volume_spike"):
+                stack_for_actionability = await compute_stack(db, token_id, now)
+        except Exception:
+            log.exception(
+                "actionability_stack_compute_failed",
+                token_id=token_id,
+                signal_type=signal_type,
+            )
+            if signal_type == "gainers_early":
+                actionability = ActionabilityDecision(
+                    False, "v1_block_gainers_early_stack_unavailable", "v1"
+                )
+            stack_for_actionability = 0
+
+        if actionability is None:
+            try:
+                actionability_signal_data = await _enrich_actionability_signal_data(
+                    db,
+                    token_id=token_id,
+                    signal_type=signal_type,
+                    signal_data=signal_data,
+                )
+                actionability = evaluate_actionability_v1(
+                    signal_type=signal_type,
+                    signal_data=actionability_signal_data,
+                    signal_combo=signal_combo,
+                    conviction_stack=stack_for_actionability,
+                )
+            except Exception:
+                log.exception(
+                    "actionability_gate_failed",
+                    token_id=token_id,
+                    signal_type=signal_type,
+                )
+                actionability = ActionabilityDecision(False, "v1_error", "v1")
+
+        actionable_value = 1 if actionability.actionable else 0
+        actionability_reason = actionability.reason
+        actionability_version = actionability.version
+
         would_be_live = 0
         if settings is not None:
             try:
-                if signal_type in ("chain_completed", "volume_spike"):
-                    stack = 0
-                else:
-                    stack = await compute_stack(db, token_id, now)
                 would_be_live = await compute_would_be_live(
                     db,
                     signal_type=signal_type,
                     signal_data=signal_data,
-                    conviction_stack=stack,
+                    conviction_stack=stack_for_actionability,
                     settings=settings,
                 )
             except Exception:
@@ -129,9 +230,10 @@ INSERT INTO paper_trades
    tp_pct, sl_pct, tp_price, sl_price,
    status, opened_at,
    signal_combo, lead_time_vs_trending_min, lead_time_vs_trending_status,
-   remaining_qty, floor_armed, realized_pnl_usd, would_be_live)
+   remaining_qty, floor_armed, realized_pnl_usd, would_be_live,
+   actionable, actionability_reason, actionability_version)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
-        ?, 0, 0.0, ?)
+        ?, 0, 0.0, ?, ?, ?, ?)
 """
         cursor = await conn.execute(
             INSERT_SQL,
@@ -155,6 +257,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
                 lead_time_vs_trending_status,
                 quantity,  # remaining_qty = full qty at open
                 would_be_live,
+                actionable_value,
+                actionability_reason,
+                actionability_version,
             ),
         )
         trade_id = cursor.lastrowid
@@ -171,6 +276,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             tp_price=tp_price,
             sl_price=sl_price,
             would_be_live=would_be_live,
+            actionable=actionable_value,
+            actionability_reason=actionability_reason,
+            actionability_version=actionability_version,
         )
 
         # BL-055 chokepoint: fire-and-forget handoff to LiveEngine when injected

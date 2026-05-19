@@ -56,7 +56,10 @@ async def trade_volume_spikes(
                 name=spike.name,  # BL-076 Bug 2 fix
                 chain="coingecko",
                 signal_type="volume_spike",
-                signal_data={"spike_ratio": spike.spike_ratio},
+                signal_data={
+                    "spike_ratio": spike.spike_ratio,
+                    "mcap": spike.market_cap,
+                },
                 entry_price=spike.price,
                 signal_combo=combo_key,
             )

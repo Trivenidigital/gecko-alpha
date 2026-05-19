@@ -14,6 +14,7 @@ import pytest
 
 from scout.config import Settings
 from scout.db import Database
+from scout.spikes.models import VolumeSpike
 from scout.trading.engine import TradingEngine
 from scout.trading.signals import (
     trade_first_signals,
@@ -21,6 +22,7 @@ from scout.trading.signals import (
     trade_losers,
     trade_predictions,
     trade_trending,
+    trade_volume_spikes,
 )
 
 
@@ -116,6 +118,31 @@ async def _open_count(db):
 
 
 # ---------------- trade_gainers --------------------------------------------
+
+
+async def test_trade_volume_spikes_passes_mcap_to_actionability_signal_data(
+    db, settings
+):
+    captured = {}
+
+    class EngineSpy:
+        async def open_trade(self, **kwargs):
+            captured.update(kwargs)
+            return 1
+
+    spike = VolumeSpike(
+        coin_id="vol-mcap",
+        symbol="VM",
+        name="VolMcap",
+        current_volume=600_000,
+        avg_volume_7d=100_000,
+        spike_ratio=6.0,
+        market_cap=20_000_000,
+        price=1.0,
+        detected_at=datetime.now(timezone.utc),
+    )
+    await trade_volume_spikes(EngineSpy(), db, [spike], settings)
+    assert captured["signal_data"]["mcap"] == 20_000_000
 
 
 async def test_trade_gainers_opens_trade_when_mcap_above_min(db, engine, settings):
