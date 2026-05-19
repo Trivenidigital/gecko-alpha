@@ -78,7 +78,7 @@ Review:
 - [x] Plan reviewed by 2 parallel agents; structural BLOCK folded into revised plan
 - [x] Design drafted and reviewed by 2 parallel agents; integration findings folded
 - [x] TDD implementation complete
-- [ ] PR opened and reviewed by 3 parallel agents
+- [x] PR opened and reviewed by 3 parallel agents
 
 Review:
 - Plan reviewer A (`APPROVE_WITH_CHANGES`) flagged chain-completed mcap support and gainers_early mcap ambiguity.
@@ -102,6 +102,12 @@ Review:
 - Post-review fix verification:
   - Focused suite: `84 passed, 1 skipped, 1 warning`
   - Adjacent trading suite: `331 passed, 1 skipped, 1 warning`
+- PR #181 pre-merge status: CI `test` green; merge state clean; no unresolved GitHub comments.
+- Post-merge follow-ups for next session:
+  - Deploy and verify one fresh paper-trade open has `actionable`, `actionability_reason`, and `actionability_version`.
+  - Add small dashboard/reporting pass: actionable vs exploratory counts, reasons, and table filter by actionable status.
+  - Run 24-48h post-deploy comparison: actionable cohort PnL, exploratory cohort PnL, and false negatives among exploratory winners.
+  - Do not tighten live/paper entry suppression yet; let the classifier collect evidence first.
 
 Last updated: 2026-05-18 (cycle 14: narrative-operator-alert-wire + chain-anchor status correction + Helius + Moralis plan audits + CG budget attribution + stale PR triage)
 

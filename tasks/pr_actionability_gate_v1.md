@@ -28,3 +28,10 @@ Warning: existing `aiosqlite` event-loop-closed thread warning from `tests/test_
 - `would_be_live` remains live-slot eligibility.
 - Actionability is metadata only; it does not suppress paper rows or change live handoff allowlist behavior.
 - X/TG ranking, peak/no-peak exit handling, dashboard UI, and live-readiness policy changes are deferred.
+
+## Post-Merge Follow-Ups
+
+- Deploy and verify one fresh paper-trade open has `actionable`, `actionability_reason`, and `actionability_version`.
+- Add dashboard/reporting for actionable vs exploratory counts, reasons, and filtering by actionable status.
+- Run a 24-48h post-deploy comparison of actionable cohort PnL, exploratory cohort PnL, and false negatives among exploratory winners.
+- Do not tighten live/paper entry suppression yet; collect classifier evidence first.
