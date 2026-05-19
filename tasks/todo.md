@@ -76,14 +76,19 @@ Review:
 - [ ] Fresh post-deploy paper-trade row stamp verified.
 - [x] Plan drafted: `tasks/plan_actionability_visibility_validation.md`.
 - [x] TDD backend dashboard API support complete.
-- [ ] Dashboard UI support complete.
-- [ ] Validation runbook complete.
-- [ ] Verification complete.
+- [x] Dashboard UI support complete.
+- [x] Validation runbook complete.
+- [x] Verification complete.
 
 Review:
 - Fresh-row verification is not an implementation blocker: immediately after deploy, `COUNT(*) FROM paper_trades WHERE opened_at >= '2026-05-19T11:37:26+00:00'` returned `0`.
 - Backend red/green: 4 new tests failed before implementation, then passed after adding row fields, history filter/count semantics, and `/api/trading/actionability`.
 - Full dashboard API test file after backend slice: `24 passed`.
+- Frontend build after Trading tab UI change: `npm run build` passed; Vite emitted `dist/assets/index-Ca4N1ClP.js`.
+- Local dashboard smoke: temp-DB server on `127.0.0.1:8765` returned 200 for `/` and `/api/trading/actionability`.
+- Final targeted suite: `46 passed`.
+- Final diff hygiene: `git diff --check` clean.
+- Validation runbook drafted: `tasks/runbook_actionability_validation_2026_05_19.md`.
 - Scope remains visibility + validation only. Do not suppress exploratory paper trades or change live/capital allocation in this slice.
 
 ## Active Work: BL-NEW-ACTIONABILITY-GATE-V1
