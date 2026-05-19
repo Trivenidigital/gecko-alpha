@@ -102,6 +102,29 @@ function getCategory(p) {
   }
 }
 
+// Mcap bucket extracted from signal_data.mcap when available. Returns
+// {label, color} for badge rendering, or null when mcap is unknown.
+// Buckets match the actionability classifier's bands (scout/trading/actionability.py:34-52):
+//   <$5M  → "<$5M (junk)"     red
+//   $5M-$10M → "$5–10M"       amber
+//   $10M-$50M → "$10–50M"     green (core actionable band)
+//   ≥$50M → "≥$50M"           green
+function getMcapBucket(p) {
+  try {
+    const sd = typeof p.signal_data === 'string' ? JSON.parse(p.signal_data) : p.signal_data
+    const raw = sd?.mcap ?? sd?.market_cap ?? sd?.market_cap_usd
+    if (raw == null) return null
+    const v = Number(raw)
+    if (!Number.isFinite(v) || v <= 0) return null
+    if (v < 5e6) return { label: '<$5M', color: 'var(--color-accent-red, #ef5350)' }
+    if (v < 10e6) return { label: '$5–10M', color: 'var(--color-accent-amber)' }
+    if (v < 50e6) return { label: '$10–50M', color: 'var(--color-accent-green)' }
+    return { label: '≥$50M', color: 'var(--color-accent-green)' }
+  } catch {
+    return null
+  }
+}
+
 function getTokenLabel(p) {
   if (p.symbol && p.symbol.trim()) return p.symbol.toUpperCase()
   if (p.name && p.name.trim()) return p.name
@@ -224,29 +247,49 @@ const STRONG_PATTERN_PNL_FLOOR = 200
 const WRITER_DEPLOY_ISO = '2026-05-11T13:22:00Z'
 const WARMING_WINDOW_DAYS = 14
 
-function ActionabilitySummaryPanel({ summary }) {
+function ActionabilitySummaryPanel({
+  summary,
+  activeCohort,
+  onCohortClick,
+  activeReason,
+  onReasonClick,
+}) {
   if (!summary) return null
   const open = summary.open_counts || {}
   const cohorts = summary.closed_cohorts || []
   const reasons = summary.top_reasons || []
   const byState = Object.fromEntries(cohorts.map(c => [c.state, c]))
-  // card(): cohort summary card. `sub` is the primary subtitle (closed
-  // PnL / count); `tag` is the cohort-meaning line that distinguishes
-  // exploratory (intentional low-confidence) from unknown (not rankable
-  // yet) so unstamped trades are not silently read as neutral.
+  // card(): cohort summary card. Click toggles the drilldown filter for
+  // the Open Positions table. `activeCohort` highlights the currently-
+  // filtered state; `onCohortClick` receives the state string and is
+  // expected to toggle (click same card again to clear).
   const card = (label, state, count, sub) => {
     const color = cohortColor(state)
+    const isActive = activeCohort === state
+    const clickable = typeof onCohortClick === 'function'
     return (
       <div
-        title={cohortSubtitle(state)}
+        title={`${cohortSubtitle(state)}${clickable ? ' — click to filter open positions' : ''}`}
+        role={clickable ? 'button' : undefined}
+        tabIndex={clickable ? 0 : undefined}
+        aria-pressed={clickable ? isActive : undefined}
+        onClick={clickable ? () => onCohortClick(state) : undefined}
+        onKeyDown={clickable ? (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            onCohortClick(state)
+          }
+        } : undefined}
         style={{
           padding: '12px 14px',
-          border: '1px solid var(--color-border)',
+          border: isActive ? `2px solid ${color}` : '1px solid var(--color-border)',
           borderRadius: 4,
-          background: 'var(--color-bar-bg, #1a1a1a)',
+          background: isActive ? 'rgba(76, 175, 80, 0.06)' : 'var(--color-bar-bg, #1a1a1a)',
+          cursor: clickable ? 'pointer' : 'default',
+          transition: 'border-color 80ms, background 80ms',
         }}>
         <div style={{ fontSize: 10, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>
-          {label}
+          {label}{isActive ? ' ✓' : ''}
         </div>
         <div style={{ fontSize: 24, fontWeight: 700, color }}>{count ?? 0}</div>
         <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginTop: 2 }}>{sub}</div>
@@ -289,16 +332,32 @@ function ActionabilitySummaryPanel({ summary }) {
               </tr>
             </thead>
             <tbody>
-              {reasons.slice(0, 6).map((r) => (
-                <tr key={r.reason}>
-                  <td style={{ maxWidth: 360, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.reason}>
-                    {formatActionabilityReason(r.reason)}
-                  </td>
-                  <td>{r.trades ?? 0}</td>
-                  <td>{r.closed_trades ?? 0}</td>
-                  <td style={{ fontWeight: 700, color: pnlColor(r.closed_pnl_usd) }}>{fmtUsd(r.closed_pnl_usd ?? 0)}</td>
-                </tr>
-              ))}
+              {reasons.slice(0, 6).map((r) => {
+                const isActive = activeReason === r.reason
+                const clickable = typeof onReasonClick === 'function'
+                return (
+                  <tr
+                    key={r.reason}
+                    onClick={clickable ? () => onReasonClick(r.reason) : undefined}
+                    title={
+                      clickable
+                        ? `${r.reason} — click to filter open positions to this reason`
+                        : r.reason
+                    }
+                    style={{
+                      cursor: clickable ? 'pointer' : 'default',
+                      background: isActive ? 'rgba(74, 144, 226, 0.12)' : undefined,
+                    }}
+                  >
+                    <td style={{ maxWidth: 360, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {isActive ? '✓ ' : ''}{formatActionabilityReason(r.reason)}
+                    </td>
+                    <td>{r.trades ?? 0}</td>
+                    <td>{r.closed_trades ?? 0}</td>
+                    <td style={{ fontWeight: 700, color: pnlColor(r.closed_pnl_usd) }}>{fmtUsd(r.closed_pnl_usd ?? 0)}</td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </div>
@@ -684,6 +743,14 @@ export default function TradingTab() {
   const [cohortView, setCohortView] = useState('full') // 'full' | 'eligible' | 'side-by-side'
   const [actionabilitySummary, setActionabilitySummary] = useState(null)
   const [actionabilityFilter, setActionabilityFilter] = useState('all') // all | actionable | exploratory | unknown
+  // BL-NEW-DASHBOARD-ACTIONABILITY-DRILLDOWN: clicking a cohort card in
+  // the Actionability summary panel sets `openCohortFilter`; clicking a
+  // Top Reason row sets `openReasonFilter`. Both gate the Open Positions
+  // table client-side over the data already returned by
+  // /api/trading/positions — no new endpoint, no behavior change.
+  // Clicking the same target again toggles the filter off.
+  const [openCohortFilter, setOpenCohortFilter] = useState('all') // all | actionable | exploratory | unknown
+  const [openReasonFilter, setOpenReasonFilter] = useState(null)
   const [positions, setPositions] = useState([])
   const [history, setHistory] = useState([])
   const [closedPage, setClosedPageState] = useState(_readStoredPage)
@@ -800,9 +867,37 @@ export default function TradingTab() {
     }
   }
 
+  // Drilldown filter pipeline (BL-NEW-DASHBOARD-ACTIONABILITY-DRILLDOWN):
+  //   positions
+  //     → cohortFiltered (by Actionability cohort: actionable/exploratory/unknown)
+  //     → reasonFiltered (by Top Reason row, if active)
+  //     → filteredPositions (apply live-eligible toggle as the last gate)
+  // Each stage runs only when the corresponding filter is active so the
+  // default 'all' view is exactly the pre-drilldown behavior.
+  const cohortFilteredPositions = openCohortFilter === 'all'
+    ? positions
+    : positions.filter((p) => actionabilityState(p.actionable) === openCohortFilter)
+  const reasonFilteredPositions = openReasonFilter
+    ? cohortFilteredPositions.filter((p) => p.actionability_reason === openReasonFilter)
+    : cohortFilteredPositions
   const filteredPositions = showOnlyEligibleOpen
-    ? positions.filter((p) => p.would_be_live === 1)
-    : positions
+    ? reasonFilteredPositions.filter((p) => p.would_be_live === 1)
+    : reasonFilteredPositions
+  const drilldownActive = openCohortFilter !== 'all' || openReasonFilter != null
+  const clearDrilldown = useCallback(() => {
+    setOpenCohortFilter('all')
+    setOpenReasonFilter(null)
+  }, [])
+  const handleCohortClick = useCallback((state) => {
+    // Toggle: clicking the active cohort clears the filter.
+    setOpenCohortFilter((prev) => (prev === state ? 'all' : state))
+    // Reason filter is cohort-scoped — switching cohorts clears it so
+    // the user doesn't end up with an empty intersection by accident.
+    setOpenReasonFilter(null)
+  }, [])
+  const handleReasonClick = useCallback((reason) => {
+    setOpenReasonFilter((prev) => (prev === reason ? null : reason))
+  }, [])
   const sortedPositions = [...filteredPositions].sort((a, b) => {
     let va, vb
     switch (sortCol) {
@@ -916,7 +1011,13 @@ export default function TradingTab() {
       </div>
 
       {/* Section 2: PnL by Signal Type — cohort-toggle view (BL-NEW-LIVE-ELIGIBLE follow-up) */}
-      <ActionabilitySummaryPanel summary={actionabilitySummary} />
+      <ActionabilitySummaryPanel
+        summary={actionabilitySummary}
+        activeCohort={openCohortFilter}
+        onCohortClick={handleCohortClick}
+        activeReason={openReasonFilter}
+        onReasonClick={handleReasonClick}
+      />
 
       <PnlBySignalPanel
         bySignal={bySignal}
@@ -927,15 +1028,19 @@ export default function TradingTab() {
 
 
       {/* Section 3: Open Positions */}
-      <div className="panel" style={{ marginBottom: 16 }}>
+      <div className="panel" style={{ marginBottom: 16 }} data-testid="open-positions-panel">
         <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
             Open Positions
           </span>
           {positions.length > 0 && (
-            <div className="summary-line" style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
-              {showOnlyEligibleOpen
-                ? `${filteredPositions.length} of ${positions.length} active (live-eligible)`
+            <div
+              className="summary-line"
+              data-testid="open-positions-summary"
+              style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}
+            >
+              {drilldownActive || showOnlyEligibleOpen
+                ? `${filteredPositions.length} of ${positions.length} active`
                 : `${positions.length} active`}
             </div>
           )}
@@ -948,18 +1053,84 @@ export default function TradingTab() {
             Show only live-eligible
           </label>
         </div>
+        {drilldownActive && (
+          // Active filter chip — explicit, dismissable so a stale filter
+          // is never invisible. Reads "Cohort: actionable" or "Reason: …"
+          // (or both joined by `·`); click × to clear all open filters.
+          <div
+            data-testid="drilldown-chip"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              padding: '6px 10px',
+              margin: '0 0 8px 0',
+              background: 'rgba(74, 144, 226, 0.08)',
+              borderLeft: '3px solid var(--color-accent-blue, #4a90e2)',
+              borderRadius: 3,
+              fontSize: 12,
+              flexWrap: 'wrap',
+            }}
+          >
+            <span style={{ color: 'var(--color-text-secondary)', fontWeight: 600 }}>
+              Drilldown:
+            </span>
+            {openCohortFilter !== 'all' && (
+              <span style={{ color: cohortColor(openCohortFilter), fontWeight: 700 }}>
+                {cohortLabel(openCohortFilter)} ({openCohortFilter})
+              </span>
+            )}
+            {openReasonFilter && (
+              <span style={{ color: 'var(--color-text-primary)' }}>
+                · reason: {formatActionabilityReason(openReasonFilter)}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={clearDrilldown}
+              data-testid="drilldown-clear"
+              style={{
+                marginLeft: 'auto',
+                border: 'none',
+                background: 'transparent',
+                color: 'var(--color-accent-blue, #4a90e2)',
+                cursor: 'pointer',
+                fontSize: 12,
+                textDecoration: 'underline',
+                padding: 0,
+              }}
+            >
+              clear ×
+            </button>
+          </div>
+        )}
         {positions.length === 0 ? (
           <div className="empty-state">No open positions.</div>
         ) : filteredPositions.length === 0 ? (
           <div className="empty-state">
-            No live-eligible open positions.{' '}
-            <button
-              type="button"
-              onClick={() => setShowOnlyEligibleOpen(false)}
-              style={{ border: 'none', background: 'transparent', color: 'var(--color-accent-blue, #4a90e2)', cursor: 'pointer', fontSize: 12, textDecoration: 'underline', padding: 0 }}
-            >
-              Show all positions
-            </button>
+            {drilldownActive ? (
+              <>
+                No open positions match the active drilldown.{' '}
+                <button
+                  type="button"
+                  onClick={clearDrilldown}
+                  style={{ border: 'none', background: 'transparent', color: 'var(--color-accent-blue, #4a90e2)', cursor: 'pointer', fontSize: 12, textDecoration: 'underline', padding: 0 }}
+                >
+                  Clear drilldown
+                </button>
+              </>
+            ) : (
+              <>
+                No live-eligible open positions.{' '}
+                <button
+                  type="button"
+                  onClick={() => setShowOnlyEligibleOpen(false)}
+                  style={{ border: 'none', background: 'transparent', color: 'var(--color-accent-blue, #4a90e2)', cursor: 'pointer', fontSize: 12, textDecoration: 'underline', padding: 0 }}
+                >
+                  Show all positions
+                </button>
+              </>
+            )}
           </div>
         ) : (
           <div style={{ overflowX: 'auto' }}>
@@ -971,6 +1142,7 @@ export default function TradingTab() {
                   <th title="Live-eligible: would this trade have been opened under live FCFS-20-slots capital constraints? See tasks/findings_open_position_price_freshness_2026_05_12.md.">Eligible</th>
                   <th title="Actionability Gate v1 metadata. This does not suppress paper/live entry.">Actionability</th>
                   <SortHeader col="category" label="Category" />
+                  <th title="Market cap bucket at trade-open time. Bands match the v1 actionability classifier (<$5M = junk; $5–10M = exploratory; $10–50M / ≥$50M = actionable when paired with a core signal).">Mcap</th>
                   <SortHeader col="entry" label="Entry" />
                   <SortHeader col="amount" label="Amount" />
                   <SortHeader col="current" label="Current" />
@@ -1021,6 +1193,15 @@ export default function TradingTab() {
                       </td>
                       <td style={{ fontSize: 11, maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {getCategory(p)}
+                      </td>
+                      <td style={{ whiteSpace: 'nowrap', fontSize: 11 }}>
+                        {(() => {
+                          const b = getMcapBucket(p)
+                          if (!b) return <span style={{ color: 'var(--color-text-secondary)' }}>-</span>
+                          return (
+                            <span style={{ fontWeight: 700, color: b.color }}>{b.label}</span>
+                          )
+                        })()}
                       </td>
                       <td style={{ whiteSpace: 'nowrap' }}>{fmtPrice(p.entry_price)}</td>
                       <td style={{ whiteSpace: 'nowrap' }}>{fmtUsd(p.amount_usd)}</td>
