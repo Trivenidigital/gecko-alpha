@@ -79,6 +79,7 @@ Review:
 - [x] Dashboard UI support complete.
 - [x] Validation runbook complete.
 - [x] Verification complete.
+- [x] PR opened: https://github.com/Trivenidigital/gecko-alpha/pull/182
 
 Review:
 - Fresh-row verification is not an implementation blocker: immediately after deploy, `COUNT(*) FROM paper_trades WHERE opened_at >= '2026-05-19T11:37:26+00:00'` returned `0`.
@@ -89,6 +90,7 @@ Review:
 - Final targeted suite: `46 passed`.
 - Final diff hygiene: `git diff --check` clean.
 - Validation runbook drafted: `tasks/runbook_actionability_validation_2026_05_19.md`.
+- PR #182 CI `test` passed in `3m56s`.
 - Scope remains visibility + validation only. Do not suppress exploratory paper trades or change live/capital allocation in this slice.
 
 ## Active Work: BL-NEW-ACTIONABILITY-GATE-V1
