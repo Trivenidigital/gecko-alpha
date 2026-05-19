@@ -11,7 +11,7 @@ $env:PYTHONPATH=(Get-Location).Path
 C:\projects\gecko-alpha\.venv\Scripts\python.exe -m pytest tests/test_actionability.py tests/test_paper_actionability.py tests/test_live_eligibility.py tests/test_trading_engine.py tests/test_trading_db_migration.py tests/live/test_paper_chokepoint.py --tb=short -q
 ```
 
-Result: `82 passed, 1 skipped, 1 warning`
+Result: `84 passed, 1 skipped, 1 warning`
 
 ```powershell
 $env:PYTHONPATH=(Get-Location).Path
@@ -19,7 +19,7 @@ $trading = Get-ChildItem -Path tests -Filter 'test_trading_*.py' | ForEach-Objec
 C:\projects\gecko-alpha\.venv\Scripts\python.exe -m pytest $trading tests/live/test_paper_chokepoint.py tests/test_live_eligibility.py tests/test_actionability.py tests/test_paper_actionability.py --tb=short -q
 ```
 
-Result: `329 passed, 1 skipped, 1 warning`
+Result: `331 passed, 1 skipped, 1 warning`
 
 Warning: existing `aiosqlite` event-loop-closed thread warning from `tests/test_trading_db_migration.py::test_post_migration_assertion_raises_on_incomplete_schema`.
 

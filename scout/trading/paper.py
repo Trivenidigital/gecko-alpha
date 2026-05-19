@@ -45,7 +45,7 @@ class _PaperTradeHandoff:
     coin_id: str
 
 
-def _has_mcap(signal_data: dict) -> bool:
+def _has_usable_mcap(signal_data: dict) -> bool:
     for key in (
         "mcap",
         "market_cap",
@@ -54,8 +54,13 @@ def _has_mcap(signal_data: dict) -> bool:
         "alert_market_cap",
     ):
         value = signal_data.get(key)
-        if value not in (None, ""):
+        if value in (None, ""):
+            continue
+        try:
+            float(value)
             return True
+        except (TypeError, ValueError):
+            continue
     return False
 
 
@@ -67,7 +72,7 @@ async def _enrich_actionability_signal_data(
     signal_data: dict,
 ) -> dict:
     enriched = dict(signal_data)
-    if _has_mcap(enriched):
+    if _has_usable_mcap(enriched):
         return enriched
 
     conn = db._conn

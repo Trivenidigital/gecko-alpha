@@ -164,6 +164,42 @@ async def test_actionability_enrichment_does_not_mutate_persisted_signal_data(db
 
 
 @pytest.mark.asyncio
+async def test_invalid_mcap_key_falls_back_to_db_enrichment(db):
+    await db._conn.execute(
+        "INSERT OR REPLACE INTO price_cache "
+        "(coin_id, current_price, market_cap, updated_at) VALUES (?, ?, ?, ?)",
+        ("invalid-mcap", 1.0, 20_000_000, datetime.now(timezone.utc).isoformat()),
+    )
+    await db._conn.commit()
+    trade_id = await PaperTrader().execute_buy(
+        db=db,
+        token_id="invalid-mcap",
+        symbol="IM",
+        name="Invalid Mcap",
+        chain="coingecko",
+        signal_type="volume_spike",
+        signal_data={"mcap": "unknown", "spike_ratio": 12.3},
+        current_price=1.0,
+        amount_usd=300.0,
+        tp_pct=20.0,
+        sl_pct=10.0,
+        signal_combo="volume_spike",
+    )
+    cur = await db._conn.execute(
+        "SELECT signal_data, actionable, actionability_reason "
+        "FROM paper_trades WHERE id=?",
+        (trade_id,),
+    )
+    row = await cur.fetchone()
+    assert json.loads(row["signal_data"]) == {
+        "mcap": "unknown",
+        "spike_ratio": 12.3,
+    }
+    assert row["actionable"] == 1
+    assert row["actionability_reason"] == "v1_pass_core_signal_mcap_10_50m"
+
+
+@pytest.mark.asyncio
 async def test_gainers_early_stack_failure_fails_closed_but_opens(db, monkeypatch):
     async def boom(*args, **kwargs):
         raise RuntimeError("forced stack failure")

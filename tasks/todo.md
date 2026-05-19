@@ -94,6 +94,14 @@ Review:
   - Post-rebase adjacent trading suite: `329 passed, 1 skipped, 1 warning`
   - Warning is the existing `aiosqlite` event-loop-closed thread warning from `tests/test_trading_db_migration.py::test_post_migration_assertion_raises_on_incomplete_schema`.
 - Deferrals: X/TG ranking waits for outcome linkage; `peak_pct < 5` risk handling waits for a separate exit-policy design; dashboard UI deferred; live trading policy unchanged.
+- PR #181 opened: https://github.com/Trivenidigital/gecko-alpha/pull/181
+- PR review:
+  - Structural/migration reviewer: `APPROVE`, no findings; targeted `75 passed, 1 skipped, 1 warning`; full suite with dummy secrets `2455 passed, 80 skipped, 12 warnings`.
+  - Operational/silent-failure reviewer: `APPROVE`, no findings; targeted `24 passed`; full suite with `UV_NATIVE_TLS=true` + dummy secrets `2455 passed, 80 skipped, 12 warnings`.
+  - Behavioral reviewer: `APPROVE_WITH_CHANGES`; fixed invalid non-numeric mcap key skipping DB enrichment and added `tg_social` classifier coverage.
+- Post-review fix verification:
+  - Focused suite: `84 passed, 1 skipped, 1 warning`
+  - Adjacent trading suite: `331 passed, 1 skipped, 1 warning`
 
 Last updated: 2026-05-18 (cycle 14: narrative-operator-alert-wire + chain-anchor status correction + Helius + Moralis plan audits + CG budget attribution + stale PR triage)
 

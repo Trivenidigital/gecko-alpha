@@ -46,6 +46,12 @@ def test_trending_catch_is_non_actionable_by_default():
     assert d.reason == "v1_block_trending_catch_low_n"
 
 
+def test_tg_social_is_non_actionable_by_default():
+    d = _decision("tg_social", signal_data={"mcap": 20_000_000})
+    assert d.actionable is False
+    assert d.reason == "v1_block_tg_social_low_n"
+
+
 def test_gainers_early_blocks_5_to_10m():
     d = _decision("gainers_early", signal_data={"mcap": 7_000_000})
     assert d.actionable is False
