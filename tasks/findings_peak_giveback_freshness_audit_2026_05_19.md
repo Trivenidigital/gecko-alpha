@@ -211,3 +211,102 @@ After the 24h actionability validation:
   these stale-entry fields to discovery-vs-entry attribution first.
 
 No runtime change should be made from this audit alone.
+
+## Coverage Appendix — Per-Signal-Type Missing Cohort
+
+Review fold (2026-05-19) — addresses the question "could the omitted price
+sources bias the V2 thresholds?"
+
+The audit script consults five price-history tables:
+`gainers_snapshots.price_at_snapshot`, `losers_snapshots.price_at_snapshot`,
+`volume_history_cg.price`, `volume_spikes.price`, and
+`momentum_7d.current_price`. A trade falls into the "missing pre-entry path"
+bucket when none of these tables has a row for `(token_id, ts < opened_at)`
+with a non-NULL price.
+
+### Per-signal-type breakdown (current regime, since 2026-05-01 14:06Z)
+
+| Signal | Total closed | Covered | Missing | Missing % |
+|---|---:|---:|---:|---:|
+| gainers_early | 279 | 179 | 100 | 35.8% |
+| narrative_prediction | 92 | 14 | 78 | 84.8% |
+| losers_contrarian | 151 | 120 | 31 | 20.5% |
+| chain_completed | 17 | 9 | 8 | 47.1% |
+| trending_catch | 7 | 3 | 4 | 57.1% |
+| tg_social | 3 | 0 | 3 | 100% |
+| first_signal | 2 | 1 | 1 | 50.0% |
+| volume_spike | 29 | 29 | 0 | 0% |
+
+Source: `sqlite3 scout.db` on prod (srilu-vps `/root/gecko-alpha/scout.db`)
+on 2026-05-19, using EXISTS subqueries against the same five tables the
+audit script uses.
+
+### `trending_snapshots` is not a price source
+
+A review question asked whether `trending_snapshots.current_price` was
+intentionally excluded. **The column does not exist.** Verified schema on
+both source (`scout/db.py:606-615`) and prod DB (7,125 rows, schema dump):
+
+```
+trending_snapshots(id, coin_id, symbol, name, market_cap_rank,
+                   trending_score, snapshot_at, created_at)
+```
+
+`trending_snapshots` is a discovery-of-existence table — it records whether
+a coin was on the CoinGecko trending list at a given timestamp, plus its
+rank and a heuristic trending score — not a price timeline. Folding it into
+the audit price path would contribute zero price data.
+
+### The missing cohort is coverage-limited, not bias-prone
+
+`narrative_prediction` (78 missing, 84.8%) and `gainers_early` (100 missing,
+35.8%) dominate the missing cohort. For these:
+
+- `narrative_prediction` is opened by the internal narrative predictor
+  (`scout/trading/signals.py:686-763`), which sources prices from
+  `price_cache` (single-row-per-coin, current-state, not historical) and
+  `score_history` (no price column at all). No in-tree timeline source
+  exists for these trades' pre-entry prices.
+- `gainers_early` *should* have rows in `gainers_snapshots`, but for ~36% of
+  trades the snapshot was either retention-evicted or the coin was
+  surfaced via a sibling watcher (momentum_7d / volume_spikes) before it
+  appeared on the gainers list. Verified `price_cache.coin_id` is a single
+  current-state row — no historical timeline.
+- `tg_social` (3 missing, 100%) — the TG resolver dispatches via cashtag
+  resolution and does not write to gainers/losers/volume_history; no in-tree
+  timeline source covers these trades.
+
+Schemas of the relevant tables (verified on prod 2026-05-19):
+
+```
+price_cache(coin_id PK, current_price, price_change_24h, price_change_7d,
+            market_cap, updated_at)             -- current-state only
+score_history(id, contract_address, score, scanned_at)  -- no price
+candidates(contract_address PK, ...)             -- one row per coin
+```
+
+### Why this does not bias the V2 thresholds
+
+The 340 covered trades (current regime) are the basis for the threshold
+sweep. The 204 missing trades are **excluded from the sweep**, not
+mis-classified. Two corollaries:
+
+1. The V2 candidate (`pre_entry_peak_gain_pct >= 40%` AND
+   `pre_entry_giveback_ratio >= 0.50`) was selected on the covered cohort.
+   The missing cohort would need a separate, source-specific telemetry
+   stamping to evaluate — which is exactly what design doc step 1.2
+   already prescribes ("stamp these fields at trade-open time").
+2. If V2 is ever implemented, it must gate on **`pre_entry_giveback_ratio
+   IS NOT NULL`** rather than implicitly defaulting NULL to "passes the
+   filter." Otherwise the 78 narrative_prediction and 3 tg_social trades
+   (which today have no pre-entry path) would either all-pass or all-fail
+   depending on the NULL handling, with no empirical basis.
+
+### Bottom-line revision
+
+The reviewer's underlying concern — coverage limitation should be
+documented — is folded above. The cited table (`trending_snapshots.current_price`)
+does not exist and is not a viable source. The threshold sweep remains
+valid on the 340-trade covered cohort, with the explicit constraint that
+V2 implementation must require pre-entry telemetry to be stamped at
+trade-open time and must gate on non-NULL telemetry.
