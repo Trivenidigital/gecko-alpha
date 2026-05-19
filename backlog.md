@@ -1632,6 +1632,66 @@ scout/trading/
 
 ---
 
+## Follow-ups filed 2026-05-19 from trader-cockpit overnight assignment (#194 / #195)
+
+Six entries surfaced during the dashboard cockpit overnight assignment. **All file-only, no implementation.** Operator scope: file for visibility / future scheduling; implementation requires separate approval. Pair with PR #194 (Trader Action Queue) + #195 (Trade Detail Drawer) which already covered the cheap drilldown surface.
+
+### BL-NEW-DASHBOARD-TG-SOURCE-QUALITY: per-TG-channel leaderboard
+**Status:** PROPOSED 2026-05-19 — surfaced during PR #195's trade-detail drawer work; the "Related mentions → TG / X" row currently shows a placeholder because no aggregation endpoint exists.
+**Tag:** `dashboard` `tg_social` `leaderboard` `read-only` `evidence-gated`
+**Why:** Operator wants to answer "is this TG channel trustworthy?" Existing data spans `tg_social_channels`, `tg_social_messages`, `tg_social_signals` (which already has `paper_trade_id` FK), and `paper_trades`. A per-channel leaderboard reading from these tables would surface: messages, resolved cashtag/CA, dispatched trades, closed PnL, win rate, unresolved/spam rate. **Read-only aggregation** — no new schema or trading behavior.
+**Action:** ~3-5h. Add `GET /api/tg_social/channel_leaderboard?since=...` returning per-channel rollup. Render in TG tab or a new TG Source Quality panel. No new schema.
+**Decision-by:** evidence-gated on operator wanting TG source ranking surfaced.
+
+### BL-NEW-DASHBOARD-X-SOURCE-QUALITY: per-X-KOL leaderboard
+**Status:** PROPOSED 2026-05-19 — same context as TG-source-quality above.
+**Tag:** `dashboard` `x_alerts` `leaderboard` `read-only` `evidence-gated`
+**Why:** Same shape for X handles. Data: `narrative_alerts_inbound` already has `tweet_author`. The outcome side is `paper_trades` but linkage is missing until `BL-NEW-X-OUTCOME-LINKAGE` / PR #184 ships. **Without linkage, the leaderboard can only show ingestion-side stats**: alerts emitted per handle, priced-vs-unresolved rate, duplicate-shill count. PnL per handle requires the linkage; show "linkage-pending" honestly.
+**Action:** ~3-5h. Add `GET /api/x_alerts/handle_leaderboard?since=...` returning per-`tweet_author` rollup. Render in X Alerts tab as a separate panel. **Linkage-dependent fields rendered as honest placeholders until PR #184 lands.**
+**Decision-by:** evidence-gated on operator + dependent on PR #184 for outcome-side fields.
+
+### BL-NEW-DASHBOARD-TOKEN-DEDUPE-CONFLUENCE-VIEW: unified token drawer/page
+**Status:** PROPOSED 2026-05-19 — surfaced from the "Related mentions → Confluence" placeholder in PR #195's drawer.
+**Tag:** `dashboard` `token-drawer` `read-only` `confluence` `evidence-gated`
+**Why:** Clicking a token symbol should land on a page showing everything known about it: signals fired, trading state, TG mentions, X mentions, pipeline appearances, price-freshness, and any cohort/actionability stamps. Today the trader has to bounce between Signals / Trading / TG / X tabs to assemble this picture. A unified token drawer/page would compose existing endpoints client-side (or a single new aggregating endpoint).
+**Action:** ~6-10h. Two paths:
+  - (a) Frontend-only: `/token/<coin_id>` route that fans out to existing endpoints (`/api/candidates`, `/api/signals/quality`, `/api/trading/positions` filtered, `/api/x_alerts` filtered, `/api/tg_social/alerts` filtered, `/api/gainers/comparisons` filtered) and composes a unified panel.
+  - (b) Backend-aggregating: single `GET /api/token/<coin_id>/everything` returning one composed payload. Faster page-load but locks the shape.
+Recommend (a) first; (b) only if (a)'s 6-fetch fan-out is too slow.
+**Decision-by:** evidence-gated.
+
+### BL-NEW-DASHBOARD-PEAK-GIVEBACK-RISK-BADGE: visual badge for stale-momentum tokens
+**Status:** PROPOSED 2026-05-19 — surfaced from #195's "Exit risk → Giveback" pp display (which already exists per-position; the proposal here is to also surface it on candidate / signal rows BEFORE trade-open).
+**Tag:** `dashboard` `risk-badge` `peak-giveback` `read-only` `evidence-gated`
+**Why:** Audit findings from #183 (still draft, actionability-runbook-gated) identify `pre_entry_peak_gain_pct >= 40%` AND `pre_entry_giveback_ratio >= 0.50` as a candidate stale-entry V2 gate. Even as visibility-only (NOT as a suppression), surfacing this as a badge on Signals / Top Gainers / Pipeline rows would let the trader avoid stale-momentum tokens manually. The labels should be **risk indicators only** — not behavior-altering filters.
+**Action:** ~3-4h. Read-only: derive `pre_entry_peak_gain_pct` from existing snapshot history (gainers_snapshots, volume_history_cg, etc.) at row-fetch time; attach as field. Render as badge: "FRESH" (no giveback signal) / "STALE PEAK ⚠" (≥40% / 50% giveback) / "MID-CYCLE" (between). NO behavior change; pure presentation. **Gated on PR #183's audit findings landing or being accepted as a risk-labeling source.**
+**Decision-by:** gated on #183's actionability-runbook readout.
+
+### BL-NEW-DASHBOARD-WHAT-CHANGED-SINCE-LAST-VISIT: session-aware "what's new" panel
+**Status:** PROPOSED 2026-05-19 — surfaced from the operator's "What changed since I last looked?" cockpit question.
+**Tag:** `dashboard` `delta-view` `session-state` `read-only` `evidence-gated`
+**Why:** Trader returns to the dashboard hours later. The cockpit should surface: new actionable trades since last visit, newly closed trades, biggest PnL swings, new TG/X mentions on currently-open positions, health regressions that affect trading. Without this, the trader has to scan everything to find what's new.
+**Action:** ~4-6h. Frontend-only initially:
+  1. Local `lastVisitTs` stored in `localStorage` on page unload.
+  2. On page load, render a "Since X ago" panel summarizing diffs computed client-side against the existing endpoints.
+  3. Server-side variant possible later if client-side reconstruction is too slow.
+No schema or backend change for the MVP.
+**Decision-by:** evidence-gated.
+
+### BL-NEW-DASHBOARD-HEALTH-TRADER-IMPACT: convert health signals into trading consequences
+**Status:** PROPOSED 2026-05-19 — surfaced from the operator's "Can I trust the data right now?" cockpit question.
+**Tag:** `dashboard` `health` `trader-impact` `read-only` `evidence-gated`
+**Why:** Today's Health tab shows freshness rows for ~15 tables — but the trader has to translate "category_snapshots last 12h ago" into "category heating is stale, narrative_prediction trades opened in the last 12h may have used pre-stale categorization." A second view should translate raw freshness rows into trading-impact statements:
+  - price_cache stale → trailing stops cannot trigger on stale-priced positions
+  - X resolver stale → X-derived outcome links may regress
+  - TG listener stale → TG-social signal_type intake may regress
+  - MiroFish cap exhausted → narrative ranking may be partially uncached
+  - CG rate-limit elevated → price/actionability validation latency rises
+**Action:** ~4-6h. Add a "Trading Impact" panel to the Health tab. Read existing `/api/system/health` + add small per-table impact-mapping table on the frontend. **No new endpoint required for the MVP.**
+**Decision-by:** evidence-gated.
+
+---
+
 ## Follow-ups filed 2026-05-19 from dashboard work (#189 / #190 + overnight triage)
 
 Four entries surfaced during PR #190's X Alerts perf investigation and the overnight dashboard triage pass. **All file-only, no implementation.** Operator scope: file for visibility / future scheduling; do not start implementation until separately approved.
