@@ -1,4 +1,4 @@
-# CoinPump Scout — Backlog
+# gecko-alpha — Backlog
 
 ## Priority Legend
 - **P0** — Blocking: must complete before first live run
@@ -23,17 +23,17 @@
 **Plan:** `tasks/plan_actionability_gate_v1.md`
 
 ### BL-NEW-X-OUTCOME-LINKAGE
-**Status:** PROPOSED
+**Status:** DESIGN-DRAFT / ACTIONABILITY-RUNBOOK-GATED 2026-05-19 — design doc shipped on draft PR #184 (`analysis/tg-x-outcome-linkage-design-2026-05-19`, head `da5a1a7`). Design covers schema/fields/joins, two implementation options (nullable FK column vs separate linkage table), backfill strategy, dashboard/API surface (split into no-auth dashboard endpoints vs HMAC-internal). Implementation is explicitly gated on the 24h actionability validation runbook (`tasks/runbook_actionability_validation_2026_05_19.md`); no merge / no implementation until that readout decides direction.
 **Why:** X handle ranking is blocked: 215 X alerts had 0 priced outcomes because `resolved_coin_id`/pricing linkage is missing.
 **Scope:** Persist `resolved_coin_id`, `x_handle`, outcome status, entry/current price, and $300 notional P&L.
 
 ### BL-NEW-TG-OUTCOME-LINKAGE
-**Status:** PROPOSED
+**Status:** DESIGN-DRAFT / ACTIONABILITY-RUNBOOK-GATED 2026-05-19 — design doc shipped on draft PR #184 (same design as BL-NEW-X-OUTCOME-LINKAGE; TG side is already structurally FK-linked via `tg_social_signals.paper_trade_id`, the design covers the `linkage_state` disambiguator + backfill + unified view). Gated on the 24h actionability runbook.
 **Why:** TG channel ranking is blocked: only 2 current-regime closed linked trades, both low-n losses.
 **Scope:** Persist and dashboard `tg_channel`, `resolution_state`, `posted_at`, `paper_trade_id`, and `mcap_at_sighting`.
 
 ### BL-NEW-NO-PEAK-RISK-HANDLING
-**Status:** PROPOSED
+**Status:** AUDIT-DRAFT / ACTIONABILITY-RUNBOOK-GATED 2026-05-19 — peak-giveback / freshness historical audit shipped on draft PR #183 (`analysis/peak-giveback-freshness-audit-2026-05-19`, head `932cc78`). V2 candidate identified: `pre_entry_peak_gain_pct >= 40%` AND `pre_entry_giveback_ratio >= 0.50` (current-regime −$962/52 trades; all-history −$1,034/66). Implementation gated on the 24h actionability validation runbook; V2 gate must additionally require `pre_entry_giveback_ratio IS NOT NULL` per the audit's coverage appendix.
 **Why:** `no_peak_<5` current-regime bucket is deeply negative (-$6,090.86 / n=99), but `peak_pct` is not available at trade-open time.
 **Scope:** Design a peak<5 early-exit or hard-risk policy separately; do not mix exit/risk handling into Actionability Gate v1.
 
@@ -839,7 +839,9 @@ GROUP BY day ORDER BY day;
 **Estimate:** ~2-3 hours for migration + write logic + backfill script + tests + PR review + deploy. Should ship before 2026-05-22 (D+11) to leave 3-day buffer for the D+14 query to have clean data.
 
 ### BL-NEW-MINARA-COOLDOWN-REVERIFY: re-verify Minara per-coin cooldown after parallel-session soak merges
-**Status:** PROPOSED 2026-05-13 — filed defensively during D+2 Minara verification. Observation flagged + clarified, but the parallel-session PR is not yet visible from gecko-alpha master, so re-verify is appropriate once it lands.
+**Status:** AUDITED-NO-VIOLATION 2026-05-19 — runtime verification on srilu-vps (`journalctl -u gecko-pipeline --since 2026-05-11 | grep minara_alert_command_emitted`) returned 54 total emits across 10 distinct multi-emit coins; **0 intra-coin gaps under 6h**. Shortest observed gap was `goblincoin` at ~17.5h (2026-05-11T22:26 → 2026-05-12T15:57), well above the 6h cooldown documented in BL-NEW-M1.5C. Empirical observation of `goblincoin` double-emit referenced in the original filing was already legitimate under the current cooldown. The conditional re-verify trigger ("parallel-session cooldown PR lands on gecko-alpha master") has not fired — no Minara cooldown PR is visible in `git log -- scout/trading/minara_alert.py scout/trading/tg_alert_dispatch.py` since 2026-05-13. Closing as AUDITED-NO-VIOLATION; reopen only if a parallel-session cooldown PR later lands on master AND a new audit returns gaps under the new threshold.
+
+**Original status (now historical):** PROPOSED 2026-05-13 — filed defensively during D+2 Minara verification. Observation flagged + clarified, but the parallel-session PR is not yet visible from gecko-alpha master, so re-verify is appropriate once it lands.
 
 **Tag:** `defensive-filing` `minara` `m1_5c` `cooldown` `parallel-session-coordination`
 
@@ -1064,16 +1066,14 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 **decision-by:** 2 weeks filing; implementation gated on daemon.
 
 ### BL-NEW-SCORE-HISTORY-PRUNING
-**Status:** DRIFT-PARTIAL 2026-05-16 — surfaced during audit 2026-05-16. 14-day time-based pruning EXISTS at `scout/narrative/agent.py:687-689` (was missed at original filing). Status updated per `tasks/findings_backlog_drift_audit_2026_05_16.md`.
-**Residual gaps (file:line):**
-- Hardcoded 14d retention violates project "no hardcoded thresholds" rule
-- Coupling to narrative daily-learn loop: disabling narrative silently disables pruning
-- `except Exception: pass` at `agent.py:695-696` = Class 1 silent-failure (§12a)
-- No row-count telemetry per pass
-**Reframed action:** harden existing pruning — parameterize via `SCORE_HISTORY_RETENTION_DAYS` setting, decouple from narrative loop, replace silent-except with structured log, add row-count telemetry. Combined PR with BL-NEW-VOLUME-SNAPSHOTS-PRUNING (same shape).
-**decision-by:** 2 weeks (independently actionable; no daemon dependency).
+**Status:** SHIPPED 2026-05-16 — PR #136 merged `00abaa7`. All 4 residual DRIFT-PARTIAL gaps closed:
+- Parameterized via `Settings.SCORE_HISTORY_RETENTION_DAYS` (default 21d) — `scout/config.py:262`.
+- Decoupled from the narrative daily-learn loop; pruning now lives in `scout/main.py:1280-1290` inside `_run_hourly_maintenance` (independent of `scout/narrative/agent.py`).
+- Silent `except: pass` replaced with `logger.exception("score_history_prune_failed")` at `scout/main.py:1289-1290`.
+- Row-count telemetry: `logger.info("score_history_pruned", rows_deleted=..., keep_days=...)` at `scout/main.py:1283-1288` (cryptopanic pattern — info-when-rows>0, silent-when-zero).
+- Test coverage: `tests/test_hourly_maintenance.py` + `tests/test_db.py` + `tests/test_config.py` + `tests/test_narrative_agent_prune.py`.
 
-**Original status (now historical):** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-score (17,325 rows/hr × 24 = ~415k rows/day = ~12.5M rows/30d; no pruning rule in tree). Original filing missed the in-tree implementation at `agent.py:687-689`.
+**Original status (now historical):** DRIFT-PARTIAL 2026-05-16 (per `tasks/findings_backlog_drift_audit_2026_05_16.md`) — 14-day time-based pruning EXISTED at `scout/narrative/agent.py:687-689` at filing time; 4 residual gaps documented. PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-score.
 
 ### BL-NEW-VOLUME-SNAPSHOTS-WATCHDOG-SLO
 **Status:** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-volume (same shape as C2-score).
@@ -1081,10 +1081,14 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 **decision-by:** 2 weeks filing; implementation gated on daemon.
 
 ### BL-NEW-VOLUME-SNAPSHOTS-PRUNING
-**Status:** DRIFT-PARTIAL 2026-05-16 — same shape as BL-NEW-SCORE-HISTORY-PRUNING. 14-day pruning EXISTS at `scout/narrative/agent.py:688`. Same residual gaps; same reframed action. Combined PR with BL-NEW-SCORE-HISTORY-PRUNING. Status updated per `tasks/findings_backlog_drift_audit_2026_05_16.md`.
-**decision-by:** 2 weeks.
+**Status:** SHIPPED 2026-05-16 — PR #136 merged `00abaa7` (combined with BL-NEW-SCORE-HISTORY-PRUNING). Same residual-gap closures:
+- Parameterized via `Settings.VOLUME_SNAPSHOTS_RETENTION_DAYS` (default 21d) — `scout/config.py:263`.
+- Decoupled from narrative loop into `scout/main.py:1292-1303` inside `_run_hourly_maintenance`.
+- Silent `except: pass` replaced with `logger.exception("volume_snapshots_prune_failed")` at `scout/main.py:1302-1303`.
+- Row-count telemetry: `logger.info("volume_snapshots_pruned", rows_deleted=..., keep_days=...)` at `scout/main.py:1296-1301`.
+- Test coverage: `tests/test_hourly_maintenance.py` + `tests/test_db.py` + `tests/test_config.py`.
 
-**Original status (now historical):** PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-volume. Original filing missed the in-tree implementation at `agent.py:688`.
+**Original status (now historical):** DRIFT-PARTIAL 2026-05-16 — same shape as BL-NEW-SCORE-HISTORY-PRUNING. PROPOSED 2026-05-13 — surfaced by cycle-change audit C2-volume.
 
 ### BL-NEW-CALIBRATION-ERA-DOC
 **Status:** SHIPPED-WITH-AUDIT 2026-05-13 — surfaced by cycle-change audit Tier F; 1-line code comments documenting cycle-era assumption shipped as part of PR #114. Comment text: `# calibration era: undocumented — see BL-NEW-CALIBRATION-ERA-DOC`. 7 settings tagged: VELOCITY_DEDUP_HOURS, LUNARCRUSH_DEDUP_HOURS, SLOW_BURN_DEDUP_DAYS, SECONDWAVE_DEDUP_DAYS, FEEDBACK_PIPELINE_GAP_THRESHOLD_MIN, PAPER_STARTUP_WARMUP_SECONDS, CACHE_TTL_SECONDS.
@@ -1633,7 +1637,9 @@ scout/trading/
 These four entries were surfaced during the score/volume pruning PR's plan/design review cycle (V1+V2 plan, V3+V4 design). Filed per actionability discipline.
 
 ### BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION: parameterize + decouple remaining 6 narrative-owned prunes
-**Status:** SHIPPED 2026-05-16 — branch `feat/narrative-prune-scope-expansion` (10 commits + V8/V9 plan fold + D8/D9 design fold; PR pending). All 6 tables (`volume_spikes`, `momentum_7d`, `trending_snapshots`, `learn_logs`, `chain_matches`, `holder_snapshots`) parameterized via Settings + hourly-pruned via `scout.main._run_hourly_maintenance`. Narrative loop helper `_run_extra_table_prune` deleted; daily-learn block no longer prunes tables directly. 5 new indexes (`idx_*_detected_at|snapshot_at|created_at|scanned_at`) added via cycle 1's extended `_migrate_scanned_at_index` helper (`column` kwarg + dynamic log events). `_validate_backtest_cli_retention_floor` model_validator added enforcing 30d floor on trending/chain/volume (V8 fold). chain_matches index deferred (V9 NICE-TO-HAVE — slow growth, EXPLAIN-gate at PR-stage). Filed follow-up: `BL-NEW-PRUNE-PACING-FOLLOWUP` (D9 fold — 11 prunes/hour WAL pressure check post-deploy).
+**Status:** SHIPPED 2026-05-16 — PR #138 merged `c4d0859`. All 6 tables (`volume_spikes`, `momentum_7d`, `trending_snapshots`, `learn_logs`, `chain_matches`, `holder_snapshots`) parameterized via Settings + hourly-pruned via `scout.main._run_hourly_maintenance`. Narrative loop helper `_run_extra_table_prune` deleted; daily-learn block no longer prunes tables directly. 5 new indexes (`idx_*_detected_at|snapshot_at|created_at|scanned_at`) added via cycle 1's extended `_migrate_scanned_at_index` helper (`column` kwarg + dynamic log events). `_validate_backtest_cli_retention_floor` model_validator added enforcing 30d floor on trending/chain/volume (V8 fold). chain_matches index deferred (V9 NICE-TO-HAVE — slow growth, EXPLAIN-gate at PR-stage).
+
+**Conditional follow-up identified, NOT filed as a separate backlog entry:** `BL-NEW-PRUNE-PACING-FOLLOWUP` was surfaced during the D9 design fold (11 prunes/hour WAL pressure check post-deploy). It is evidence-gated: only worth filing as a real entry if post-deploy observation surfaces actual WAL contention. No standalone `BL-NEW-PRUNE-PACING-FOLLOWUP` entry exists below; treat the placeholder reference here as a conditional follow-up that has not been filed.
 
 **Original status (now historical):** PROPOSED 2026-05-16 — residual from `feat/score-volume-pruning-harden` PR's §7a partial-match reframe.
 
