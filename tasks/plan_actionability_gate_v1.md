@@ -83,6 +83,7 @@ Rules:
 
 Market-cap buckets are computed from enriched open-time metadata:
 - first, `signal_data` keys already present in production data (`mcap`, `market_cap`, `market_cap_usd`, `mcap_at_sighting`, `alert_market_cap`);
+- `trade_volume_spikes` must carry `VolumeSpike.market_cap` into `signal_data` as `mcap`;
 - for `chain_completed`, latest `chain_matches.mcap_at_completion` before generic cache fallback;
 - then `price_cache.market_cap` for the token.
 
@@ -105,6 +106,7 @@ Two independent plan reviewers completed on 2026-05-19.
 
 - Statistical/product review verdict: `APPROVE_WITH_CHANGES`. Folded changes: clarified `gainers_early` only passes at `>=50m`; added the chain-completed missing-mcap exception because total chain-completed edge is strong but bucket coverage is incomplete; kept X/TG/no-peak deferrals.
 - Structural/API review verdict: `BLOCK`. Folded changes: added DB-side market-cap enrichment before classification; changed schema from `NOT NULL DEFAULT 1` to nullable/no default so historical rows are not falsely evaluated; added required migration-marker post-assertion and timestamp-preservation tests; added engine-path tests with real signal-data shapes.
+- Design review verdicts: both `APPROVE_WITH_CHANGES`. Folded changes: carry volume-spike mcap at dispatch; make enrichment catch query failures internally; fail closed for `gainers_early` stack-compute failures without suppressing paper opens; document `actionability_reason` as first matching `TEXT` reason; add upgrade, stack-failure, and persisted-signal-data immutability tests.
 
 ## Task 1: Backlog And Todo Fold
 
@@ -498,6 +500,46 @@ async def test_actionability_columns_preserve_pre_cutover_nulls(tmp_path):
     assert row[1] is None
     assert row[2] is None
     await db.close()
+
+
+async def test_initialize_upgrades_pre_actionability_db(tmp_path):
+    db_path = tmp_path / "pre_actionability.db"
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.executescript("""
+            CREATE TABLE paper_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                chain TEXT NOT NULL,
+                signal_type TEXT NOT NULL,
+                signal_data TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                amount_usd REAL NOT NULL,
+                quantity REAL NOT NULL,
+                tp_pct REAL NOT NULL DEFAULT 20.0,
+                sl_pct REAL NOT NULL DEFAULT 10.0,
+                tp_price REAL NOT NULL,
+                sl_price REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                opened_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                would_be_live INTEGER
+            );
+        """)
+        await conn.commit()
+
+    db = Database(db_path)
+    await db.initialize()
+    cur = await db._conn.execute("PRAGMA table_info(paper_trades)")
+    cols = {row[1] for row in await cur.fetchall()}
+    assert {"actionable", "actionability_reason", "actionability_version"} <= cols
+    cur = await db._conn.execute(
+        "SELECT 1 FROM paper_migrations WHERE name=?",
+        ("bl_new_actionability_gate_v1",),
+    )
+    assert await cur.fetchone() is not None
+    await db.close()
 ```
 
 - [ ] **Step 2: Verify red**
@@ -505,7 +547,7 @@ async def test_actionability_columns_preserve_pre_cutover_nulls(tmp_path):
 Run:
 
 ```bash
-python -m pytest tests/test_trading_db_migration.py::test_migration_adds_actionability_columns tests/test_trading_db_migration.py::test_migration_records_actionability_marker tests/test_trading_db_migration.py::test_actionability_marker_timestamp_preserved_on_reinitialize tests/test_trading_db_migration.py::test_actionability_columns_preserve_pre_cutover_nulls --tb=short -q
+python -m pytest tests/test_trading_db_migration.py::test_migration_adds_actionability_columns tests/test_trading_db_migration.py::test_migration_records_actionability_marker tests/test_trading_db_migration.py::test_actionability_marker_timestamp_preserved_on_reinitialize tests/test_trading_db_migration.py::test_actionability_columns_preserve_pre_cutover_nulls tests/test_trading_db_migration.py::test_initialize_upgrades_pre_actionability_db --tb=short -q
 ```
 
 Expected: columns/marker missing.
@@ -547,7 +589,7 @@ and to the `missing_migrations` set. This keeps the migration consistent with th
 
 - [ ] **Step 4: Verify green**
 
-Run the four migration tests again. Expected: pass.
+Run the five migration tests again. Expected: pass.
 
 - [ ] **Step 5: Commit**
 
@@ -560,6 +602,8 @@ git commit -m "feat: add actionability paper-trade columns"
 
 **Files:**
 - Modify: `scout/trading/paper.py`
+- Modify: `scout/trading/signals.py`
+- Modify: `tests/test_trading_signals.py`
 - Modify: `tests/test_live_eligibility.py` or create `tests/test_paper_actionability.py`
 
 - [ ] **Step 1: Write failing paper-stamp tests**
@@ -691,6 +735,63 @@ async def test_execute_buy_without_settings_still_classifies_long_hold_non_actio
     assert row["actionable"] == 0
     assert row["actionability_reason"] == "v1_block_unknown_signal_type"
     assert row["actionability_version"] == "v1"
+
+
+@pytest.mark.asyncio
+async def test_actionability_enrichment_does_not_mutate_persisted_signal_data(db):
+    await db._conn.execute(
+        "INSERT OR REPLACE INTO price_cache "
+        "(coin_id, current_price, market_cap, updated_at) VALUES (?, ?, ?, ?)",
+        ("immut", 1.0, 20_000_000, datetime.now(timezone.utc).isoformat()),
+    )
+    await db._conn.commit()
+    trade_id = await PaperTrader().execute_buy(
+        db=db,
+        token_id="immut",
+        symbol="IMM",
+        name="Immutable",
+        chain="coingecko",
+        signal_type="volume_spike",
+        signal_data={"spike_ratio": 12.3},
+        current_price=1.0,
+        amount_usd=300.0,
+        tp_pct=20.0,
+        sl_pct=10.0,
+        signal_combo="volume_spike",
+    )
+    cur = await db._conn.execute(
+        "SELECT signal_data, actionable FROM paper_trades WHERE id=?",
+        (trade_id,),
+    )
+    row = await cur.fetchone()
+    assert json.loads(row["signal_data"]) == {"spike_ratio": 12.3}
+    assert row["actionable"] == 1
+```
+
+Add a signal dispatch test in `tests/test_trading_signals.py`:
+
+```python
+async def test_trade_volume_spikes_passes_mcap_to_actionability_signal_data(db, settings):
+    captured = {}
+
+    class EngineSpy:
+        async def open_trade(self, **kwargs):
+            captured.update(kwargs)
+            return 1
+
+    spike = VolumeSpike(
+        coin_id="vol-mcap",
+        symbol="VM",
+        name="VolMcap",
+        current_volume=600_000,
+        avg_volume_7d=100_000,
+        spike_ratio=6.0,
+        market_cap=20_000_000,
+        price=1.0,
+        detected_at=datetime.now(timezone.utc),
+    )
+    await trade_volume_spikes(EngineSpy(), db, [spike], settings)
+    assert captured["signal_data"]["mcap"] == 20_000_000
 ```
 
 Add an engine-level test in `tests/test_trading_engine.py` proving actionability metadata does not block exploratory paper:
@@ -748,6 +849,39 @@ async def test_open_trade_enriches_actionability_mcap_from_price_cache(engine, d
     row = await cursor.fetchone()
     assert row["actionable"] == 1
     assert row["actionability_reason"] == "v1_pass_core_signal_mcap_10_50m"
+```
+
+Add a stack-failure regression in `tests/test_paper_actionability.py`:
+
+```python
+@pytest.mark.asyncio
+async def test_gainers_early_stack_failure_fails_closed_but_opens(db, monkeypatch):
+    async def boom(*args, **kwargs):
+        raise RuntimeError("forced stack failure")
+
+    monkeypatch.setattr("scout.trading.paper.compute_stack", boom)
+    trade_id = await PaperTrader().execute_buy(
+        db=db,
+        token_id="stack-fail",
+        symbol="SF",
+        name="Stack Fail",
+        chain="coingecko",
+        signal_type="gainers_early",
+        signal_data={"mcap": 80_000_000},
+        current_price=1.0,
+        amount_usd=300.0,
+        tp_pct=20.0,
+        sl_pct=10.0,
+        signal_combo="gainers_early",
+    )
+    assert trade_id is not None
+    cur = await db._conn.execute(
+        "SELECT actionable, actionability_reason FROM paper_trades WHERE id=?",
+        (trade_id,),
+    )
+    row = await cur.fetchone()
+    assert row["actionable"] == 0
+    assert row["actionability_reason"] == "v1_block_gainers_early_stack_unavailable"
 ```
 
 Add a live-handoff regression in `tests/live/test_paper_chokepoint.py`:
@@ -827,29 +961,36 @@ async def _enrich_actionability_signal_data(
     if conn is None:
         return enriched
 
-    if signal_type == "chain_completed":
+    try:
+        if signal_type == "chain_completed":
+            cur = await conn.execute(
+                "SELECT mcap_at_completion FROM chain_matches "
+                "WHERE token_id=? AND mcap_at_completion IS NOT NULL "
+                "ORDER BY datetime(completed_at) DESC LIMIT 1",
+                (token_id,),
+            )
+            row = await cur.fetchone()
+            if row and row[0] not in (None, ""):
+                enriched["mcap"] = row[0]
+                return enriched
+
         cur = await conn.execute(
-            "SELECT mcap_at_completion FROM chain_matches "
-            "WHERE token_id=? AND mcap_at_completion IS NOT NULL "
-            "ORDER BY datetime(completed_at) DESC LIMIT 1",
+            "SELECT market_cap FROM price_cache WHERE coin_id=?",
             (token_id,),
         )
         row = await cur.fetchone()
         if row and row[0] not in (None, ""):
             enriched["mcap"] = row[0]
-            return enriched
-
-    cur = await conn.execute(
-        "SELECT market_cap FROM price_cache WHERE coin_id=?",
-        (token_id,),
-    )
-    row = await cur.fetchone()
-    if row and row[0] not in (None, ""):
-        enriched["mcap"] = row[0]
+    except Exception:
+        log.exception(
+            "actionability_mcap_enrichment_failed",
+            token_id=token_id,
+            signal_type=signal_type,
+        )
     return enriched
 ```
 
-The helper should continue gracefully on query failure by logging `actionability_mcap_enrichment_failed` and returning the original payload. This keeps paper opening non-blocking.
+The helper catches query failures internally, logs `actionability_mcap_enrichment_failed`, and returns the original payload. This keeps paper opening non-blocking and preserves the `chain_completed` missing-mcap exception.
 
 ```python
 stack_for_actionability = 0
@@ -862,22 +1003,26 @@ except Exception:
         token_id=token_id,
         signal_type=signal_type,
     )
+    if signal_type == "gainers_early":
+        actionability = ActionabilityDecision(
+            False, "v1_block_gainers_early_stack_unavailable", "v1"
+        )
     stack_for_actionability = 0
 
-actionability = ActionabilityDecision(False, "v1_error", "v1")
 try:
-    actionability_signal_data = await _enrich_actionability_signal_data(
-        db,
-        token_id=token_id,
-        signal_type=signal_type,
-        signal_data=signal_data,
-    )
-    actionability = evaluate_actionability_v1(
-        signal_type=signal_type,
-        signal_data=actionability_signal_data,
-        signal_combo=signal_combo,
-        conviction_stack=stack_for_actionability,
-    )
+    if actionability is None:
+        actionability_signal_data = await _enrich_actionability_signal_data(
+            db,
+            token_id=token_id,
+            signal_type=signal_type,
+            signal_data=signal_data,
+        )
+        actionability = evaluate_actionability_v1(
+            signal_type=signal_type,
+            signal_data=actionability_signal_data,
+            signal_combo=signal_combo,
+            conviction_stack=stack_for_actionability,
+        )
 except Exception:
     log.exception(
         "actionability_gate_failed",
@@ -886,6 +1031,8 @@ except Exception:
     )
     actionability = ActionabilityDecision(False, "v1_error", "v1")
 ```
+
+Initialize `actionability: ActionabilityDecision | None = None` before stack computation. Any actionability exception must be caught and converted to metadata; it must never prevent the paper row insert.
 
 Then compute `would_be_live` using `stack_for_actionability` when needed so stack is not recomputed:
 
@@ -937,7 +1084,7 @@ actionability_version=actionability_version,
 Run:
 
 ```bash
-python -m pytest tests/test_actionability.py tests/test_paper_actionability.py tests/test_live_eligibility.py tests/test_trading_engine.py::test_open_trade_stamps_non_actionable_but_still_opens tests/test_trading_engine.py::test_open_trade_enriches_actionability_mcap_from_price_cache tests/live/test_paper_chokepoint.py::test_actionability_stamp_does_not_change_live_handoff --tb=short -q
+python -m pytest tests/test_actionability.py tests/test_paper_actionability.py tests/test_live_eligibility.py tests/test_trading_signals.py::test_trade_volume_spikes_passes_mcap_to_actionability_signal_data tests/test_trading_engine.py::test_open_trade_stamps_non_actionable_but_still_opens tests/test_trading_engine.py::test_open_trade_enriches_actionability_mcap_from_price_cache tests/live/test_paper_chokepoint.py::test_actionability_stamp_does_not_change_live_handoff --tb=short -q
 ```
 
 Expected: pass.
@@ -945,7 +1092,7 @@ Expected: pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add scout/trading/paper.py tests/test_paper_actionability.py tests/test_trading_engine.py tests/live/test_paper_chokepoint.py
+git add scout/trading/paper.py scout/trading/signals.py tests/test_paper_actionability.py tests/test_trading_signals.py tests/test_trading_engine.py tests/live/test_paper_chokepoint.py
 git commit -m "feat: stamp paper-trade actionability"
 ```
 
