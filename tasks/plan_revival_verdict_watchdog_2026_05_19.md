@@ -291,6 +291,13 @@ Modeled on `held-position-price-watchdog.sh`:
   `cron/deploy.sh`.
 - Cron-fragment SENTINEL: `# BL-NEW-REVIVAL-VERDICT-WATCHDOG-START` /
   `# BL-NEW-REVIVAL-VERDICT-WATCHDOG-END` per established pattern.
+- **Status at implementation-PR ship time: STAGED, NOT INSTALLED.** The
+  cron fragment lands under `cron/` for review but is NOT activated by
+  `cron/deploy.sh` until operator explicitly approves the schedule.
+  This matches the precedent established by
+  `BL-NEW-CRON-DRIFT-WATCHDOG` (`SCRIPT-SHIPPED /
+  SCHEDULING-PENDING-OPERATOR`). Operator can install with a single
+  `cron/deploy.sh` invocation when ready.
 
 ## Failure Modes Pre-empted
 
@@ -305,8 +312,9 @@ Per CLAUDE.md §9 and §12 disciplines.
 | §12b — Class-3 silent rendering corruption | `parse_mode=None` on the Telegram call; signal_type underscores cannot be eaten. |
 | Self-disabling failure: watchdog cron fragment silently removed | The cron-drift-watchdog from BL-NEW-CRON-DRIFT-WATCHDOG already catches drift on the cron file. No new primitive needed. |
 | State-dir loss (`/var/lib/gecko-alpha/revival-verdict-watchdog/` wiped) | First-run behavior triggers: a single audit alert summarizes expired signals; not a regression. |
-| Clock skew on srilu-vps | `date -u` is the source of "now"; SQLite `datetime('now')` is UTC. ISO timestamps in `new_value` are explicitly UTC per the emitter at `revival_criteria.py:722`. No timezone conversion in the watchdog. |
-| Microsecond residue in the ISO timestamp | Emitter truncates microseconds at write time (`revival_criteria.py:719-721`). Watchdog parser must tolerate either with-microseconds or without. |
+| Clock skew on srilu-vps | `date -u` is the source of "now"; SQLite `datetime('now')` is UTC. ISO timestamps in `new_value` are **by convention UTC** — the emitter at `revival_criteria.py:719-722` adds a `timedelta` to `result.evaluated_at` and calls `.isoformat()`; the result is a naive ISO without `Z` or `+00:00`. Watchdog parses as naive UTC and compares to `date -u`-derived `now`. If a future contributor introduces tz-aware ISO emission (`+05:30` etc.), the parser must be revisited — see §9c lever-vs-data-path note. |
+| Microsecond residue in the ISO timestamp | Emitter truncates microseconds at write time (`revival_criteria.py:719-721`). Watchdog parser tolerates either form per criterion 7a. |
+| Future `applied_by='auto_*'` soak_verdict rows | Defensive note: the watchdog filters by `field_name='soak_verdict'` only, not by `applied_by`. Today the emitter at `revival_criteria.py:744-746` always uses `applied_by='<operator>'`. If a future automated path ever writes a `soak_verdict` row with `applied_by='auto_*'`, it would be treated as authoritative by this watchdog. Per CLAUDE.md §12b such an automated row would itself need an alert at write-time; the present watchdog does not need to handle that case, but the future emitter must. |
 
 ## Pre-registered Acceptance Criteria
 
@@ -320,6 +328,10 @@ implementation PR can be reviewed against them.
    `expired_count=0`.
 2. With 1 expired provisional row and clean state dir → alert sent,
    exit 1, last-alert state file written for that signal_type.
+2a. With N ≥ 2 expired provisional rows AND empty state dir (true first
+   deploy OR state-dir-loss recovery) → exactly **one** summary alert
+   whose body lists all N signal_types, exit 1, all N last-alert state
+   files written. No per-signal alert spam at first-run.
 3. With 1 expired row and last-alert state file written within
    re-alert window → exit 0, no alert sent, log
    `revival_verdict_watchdog_realert_skipped`.
@@ -332,6 +344,20 @@ implementation PR can be reviewed against them.
 7. With malformed ISO timestamp in `new_value` → exit 4 (treat as
    schema/data corruption, not a watchdog false-negative), structured
    log identifies the offending row id.
+7a. **ISO-shape tolerance matrix.** Parser must produce the listed
+   outcome for each of the 5 operator-typable ISO shapes:
+
+   | # | `new_value` after the `keep_on_provisional_until_` prefix | Expected |
+   |---|---|---|
+   | i  | `2026-06-16T12:34:56` (naive, no microseconds — current emitter output) | Parse as UTC; compare to `date -u` now. |
+   | ii | `2026-06-16T12:34:56Z` (Z suffix) | Strip `Z`, parse as UTC. |
+   | iii | `2026-06-16T12:34:56+00:00` (explicit zero offset) | Strip `+00:00`, parse as UTC. |
+   | iv | `2026-06-16T12:34:56.123456` (microseconds, naive) | Parse as UTC; microseconds discarded for day-precision comparison. |
+   | v  | `2026-06-16T12:34:56.123456Z` (microseconds + Z) | Strip `Z`, parse as UTC; microseconds discarded. |
+
+   Anything not matching one of the above (garbled date, missing T,
+   trailing whitespace not handled by `xargs`, alternate timezone like
+   `+05:30`) → criterion 7 path (exit 4 + structured log).
 8. With operator emitting a fresh `keep_on_provisional_until_<iso>` row
    after a previous alert → watchdog correctly recognizes the new row
    as the current verdict and resets idempotency for that signal_type
@@ -362,8 +388,8 @@ implementation PR can be reviewed against them.
    defaults.
 2. **Implementation PR ships:** script + tests + cron fragment +
    runbook.
-3. **Deploy to srilu-vps:** install cron via `cron/deploy.sh`. First
-   run is clean no-op (0 provisional rows).
+3. **Stage to srilu-vps (script only):** ship `scripts/revival-verdict-watchdog.sh` and the `cron/` fragment, BUT do NOT activate the cron entry. Operator-driven manual smoke-run (`bash scripts/revival-verdict-watchdog.sh`) confirms clean no-op (0 provisional rows on prod today).
+3a. **Operator approves scheduling:** when operator is satisfied with the smoke run, they invoke `cron/deploy.sh` to activate the cron fragment. Status flips from `SCRIPT-SHIPPED / SCHEDULING-PENDING-OPERATOR` to `SCHEDULED`.
 4. **First provisional-verdict event:** when operator runs the evaluator
    and emits a `keep_on_provisional_until_<iso>` row, watchdog tracks
    it.
