@@ -1,6 +1,55 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-18 (cycle 14: narrative-operator-alert-wire + chain-anchor status correction + Helius + Moralis plan audits + CG budget attribution + stale PR triage)
+Last updated: 2026-05-19 (cycle 15: overnight drift-cleanup audit — closed 12 stale items with inline evidence citations; 4 items annotated as STILL OPEN or MERGED-DEPLOY-UNVERIFIED with elapsed-date flags; PR-stage R3 fold downgraded KEEP-ON verdicts to docs-only-PRESUMED per §9a)
+
+## Audit closure (2026-05-19)
+
+**Scope:** docs-only; no code, schema, scripts, settings, live config, or secrets touched. Per operator's overnight assignment Priority 1: "Create a docs-only PR that marks stale items closed/superseded or moves still-live items into a clear current section."
+
+**Runtime-state caveat (per CLAUDE.md §9a):** All `ELAPSED-WITHOUT-REVERT` and `KEEP-ON-*` closures below rely on docs-only evidence (backlog.md entries, memory checkpoints, inline sneak-peek decisions). Prod runtime state on srilu (e.g., whether `STABLE_PAIRED_BONUS` was reverted, whether `.env` widened-lifecycle settings were rolled back) was NOT SSH-verified in this audit per scope. Closure verdicts express "no revert documented in source-of-truth surfaces I can read" — not "revert provably did not happen." Operator can disconfirm any closure by surfacing runtime evidence to the contrary.
+
+**Closed in this audit (12 items, line numbers reflect post-edit positions; verdict downgraded from CONFIRMED→PRESUMED per PR-stage R3 fold + §9a):**
+- BL-NEW-HELIUS cross-finding marker inside Moralis audit (L94) — Helius audit shipped AUDITED-PHANTOM 2026-05-18 per `backlog.md:981-986`.
+- BL-NEW-QUOTE-PAIR D+3 mid-soak (L413) — ELAPSED-WITHOUT-REVERT (docs-only).
+- BL-NEW-QUOTE-PAIR D+7 soak end (L414) — ELAPSED-WITHOUT-REVERT (docs-only).
+- Paper-lifecycle widening soak end (L420) — KEEP-ON-PRESUMED (docs-only).
+- PR #59 strategy tuning soak end (L421) — KEEP-ON-PRESUMED-PERMANENT (docs-only); commit `3c83fb7`.
+- gainers_early reversal re-soak 7d (L422) — ELAPSED-AUTO-SUSPENDED per `backlog.md:1797-1798` (event-evidenced, not just docs-only).
+- PR #59 duplicate re-check entry (L461) — duplicate of L421 head closure.
+- BL-063 moonshot soak (L463) — duplicate of L419 head closure (KEEP-ON-PRESUMED-PERMANENT docs-only).
+- BL-064 14d TG social soak (L464) — ELAPSED-OPERATIONAL-GAP; superseded by Narrative Scanner V1.1.
+- Paper-lifecycle widening duplicate (L465) — duplicate of L420 head closure.
+- narrative_prediction token_id divergence (L516) — duplicate of L521 head closure (PR #80 `eaf3523`, event-evidenced via commit SHA).
+- first_signal revival decision (L524) — DECIDED-REVIVE-AND-SOAK per `backlog.md:1791`; 14d soak ends 2026-05-31 (operator-gated, do not pre-close).
+
+**Reverted from [x] to [ ] per PR-stage R3 CRITICAL fold (1 item):**
+- PR #82 BL-NEW-MOONSHOT-OPT-OUT deploy (L426) — MERGED-DEPLOY-UNVERIFIED. PR merged 2026-05-06 but srilu deploy state not SSH-verified per scope. Closure of this item gated on operator-verified migration evidence. Leaving `[ ]` so future sessions do NOT assume deploy is operator-confirmed.
+
+**Still open at audit time (4 items, intentionally not closed; line numbers post-edit):**
+- 2026-05-15 RE-SCOPED system health checkpoint (L433) — checkpoint date elapsed; operator-driven 3-question review still owed.
+- PR #58 BL-064 lenient-safety soak (L459) — re-check window elapsed; closure deferred to operator-initiated retrospective.
+- Audit fix #4 24h hard-exit (L518) — operator-deferred "accumulate more data first".
+- PR #82 BL-NEW-MOONSHOT-OPT-OUT deploy (L426) — MERGED-DEPLOY-UNVERIFIED per R3 fold (see above).
+
+**Live operator-gated items NOT touched (per scope, no audit needed; line numbers post-edit):**
+- BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE operator action (L63-65).
+- BL-NEW-CG-LANE-ORDER-HELD-POSITION-FIRST residual + #158 24h validation (L112-113) — evidence-gated per assignment guardrail.
+- BL-NEW-CRON-DRIFT-WATCHDOG operator scheduling (L237) — operator-gated.
+- BL-NEW-SOCIAL-MENTIONS-DENOMINATOR operator B-vs-C response (L257) — operator-gated.
+
+**Methodology:**
+- Drift-check per CLAUDE.md §7a before each closure (no closure without file:line / PR / commit / memory / backlog evidence).
+- Lever-vs-data-path attribution per CLAUDE.md §9c (gainers_early closure: visible lever was 2026-05-13 audit-id=24 KEEP-ON memory; controlling lever was PR #150 new evaluator contradicting it 2026-05-17).
+- Conservative "leave-as-is and document" bias on operator-decision items.
+
+**Reviewer signals:** plan-stage 2 reviewers (evidence-rigor + scope/blast-radius) flagged 2 CRITICAL (bulk-delete assumption + phantom PR #82 backlog grep) and 2 IMPORTANT (gainers_early disambiguation + line-number staleness); v2 plan folded all four before edits. See `tasks/plan_drift_cleanup_2026_05_19.md` for the full fold history.
+
+**Findings-only audits (Priority 4, no code change per scope):**
+
+- **BL-NEW-BL060-CYCLE-VERIFY:** AUDITED-CYCLE-INDEPENDENT 2026-05-19. Pacing is event-driven (per-trade-open) not time-driven. `scout/trading/paper.py:110` + `scout/trading/live_eligibility.py:104` (`WHERE would_be_live=1 AND status='open'` against `PAPER_LIVE_ELIGIBLE_SLOTS`). Comment at `live_eligibility.py:31-32`: "quality subset, not a FCFS-20 cap on the firehose." backlog.md flipped PROPOSED → AUDITED-CYCLE-INDEPENDENT in this PR.
+- **BL-NEW-REVIVAL-VERDICT-WATCHDOG:** PROPOSED (unchanged). Drift-check: no existing primitive in `scripts/`, `systemd/`, `cron/`, or `dashboard/` matches `keep_on_provisional_until` or `soak_verdict`. Status accurate; build correctly deferred per operator scope ("touches trading decision hygiene; build only after plan + review").
+- **BL-NEW-SOCIAL-DENOMINATOR-RE-EVAL-WATCHDOG:** PROPOSED (unchanged). Drift-check: `dashboard/db.py:1284-1319` + `dashboard/api.py:973,1013` + `dashboard/search.py:263` read `narrative_alerts_inbound` and `tg_social_messages` for display, but no watchdog primitive in `scripts/` or `cron/` covers the re-eval triggers. Status accurate; tied to operator B-vs-C decision per scope.
+- **BL-NEW-SCORER-DEAD-SIGNAL-COMMENT-CONVENTION:** PROPOSED (unchanged). Drift-check: `scout/scorer.py:121` already carries `# DEAD SIGNAL — pending BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT re-eval` and `scorer.py` has the original Signal 13 (CryptoPanic) gated-comment precedent. The convention is *in-tree by example* but not yet codified as a style-guide rule. Status accurate; defer to next scorer-touch PR per operator scope.
 
 ## Active Work: BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE (ENDPOINT-SHIPPED / HERMES-SKILL-PENDING)
 
@@ -45,7 +94,7 @@ Last updated: 2026-05-18 (cycle 14: narrative-operator-alert-wire + chain-anchor
 - [x] Findings doc: `tasks/findings_moralis_plan_audit_2026_05_18.md`.
 - [x] Backlog flipped PROPOSED → AUDITED-PHANTOM with full evidence summary.
 - [x] Conditional follow-up filed: BL-NEW-MORALIS-ENABLEMENT-GUARDRAIL (trigger = operator intent to enable; 6mo backstop).
-- [ ] Cross-finding (separate task): BL-NEW-HELIUS-PLAN-AUDIT likely same shape — `HELIUS_API_KEY=` also empty, `holder_snapshots` covers both chains. Out of scope for this audit per assignment guardrail.
+- [x] Cross-finding (separate task): BL-NEW-HELIUS-PLAN-AUDIT likely same shape — `HELIUS_API_KEY=` also empty, `holder_snapshots` covers both chains. Out of scope for this audit per assignment guardrail. **CLOSED 2026-05-19 (audit): BL-NEW-HELIUS-PLAN-AUDIT shipped AUDITED-PHANTOM 2026-05-18 via PR #174 per `backlog.md:981-986`. The "same shape" hypothesis was confirmed (key empty, 0 log hits, 0 `holder_snapshots` rows). Conditional follow-up filed as BL-NEW-HELIUS-ENABLEMENT-GUARDRAIL.**
 
 ## Active Work: BL-NEW-CG-LANE-ORDER-HELD-POSITION-FIRST (PR #170)
 
@@ -364,27 +413,27 @@ Review:
 
 ## BL-NEW-QUOTE-PAIR soak (post-deploy)
 
-- [ ] **D+3 mid-soak verification** — query `candidates` table for fraction satisfying `quote_symbol ∈ stables AND liquidity_usd >= 50K`. Threshold: < 40% to keep current bonus magnitude. Query in `docs/runbook_high_peak_fade.md`-adjacent runbook if needed.
-- [ ] **D+7 soak end** — alert volume must not exceed +10% baseline. Revert via `STABLE_PAIRED_BONUS=0` env override if breached.
+- [x] **D+3 mid-soak verification** — query `candidates` table for fraction satisfying `quote_symbol ∈ stables AND liquidity_usd >= 50K`. Threshold: < 40% to keep current bonus magnitude. Query in `docs/runbook_high_peak_fade.md`-adjacent runbook if needed. **CLOSED 2026-05-19 (audit): ELAPSED-WITHOUT-REVERT. D+3 was 2026-05-12 (7d before audit). Per `backlog.md` §BL-NEW-QUOTE-PAIR (SHIPPED 2026-05-09 PR #85 `3774591`, magnitude `+5 raw / +2 normalized`), no revert trigger fired in source-of-truth docs; STABLE_PAIRED_BONUS remains at default. Memory `project_bl_quote_pair_2026_05_09.md` confirms 7d soak ended 2026-05-16.**
+- [x] **D+7 soak end** — alert volume must not exceed +10% baseline. Revert via `STABLE_PAIRED_BONUS=0` env override if breached. **CLOSED 2026-05-19 (audit): ELAPSED-WITHOUT-REVERT. D+7 was 2026-05-16 (3d before audit). Same evidence chain as D+3 above.**
 
 ## Pending verifications (time-gated)
 
 - [x] **2026-05-04 ~01:09Z+ — BL-071 guard verification (24h check).** **PASS (with caveat).** Verified 2026-05-04T15:35Z. `full_conviction` + `narrative_momentum` still `is_active=1` ✓. `volume_breakout` retired 2026-05-04T01:01:48Z via the `chain_pattern_retired` path (hit_rate=1.82%, 1 hit in 55 attempts) — legitimate individual underperformance, NOT a guard failure. The guard only short-circuits on `total_hits_across_all == 0`; with non-zero hits on at least one pattern, individual retirement is allowed (correct behavior). chain_completed paper_trades count: 7 → 10 in 24h (+3 new). Chain dispatch alive. No action needed.
 - [x] **2026-05-04 13:58Z — BL-063 moonshot soak ends. DECISION: keep on permanently.** Verified 2026-05-04T15:35Z. Moonshot path: **19 closes / +$2,232.86 net / +$117.52/trade / 100% win**. Regular-trail comparison (peak ≥30, no moonshot armed): 13 closes / +$773.52 net / +$59.50/trade / 100% win. Moonshot delta = +$1,459.34 net — exceeds the +$1,420 sneak-peek prediction by ~3% and ~3× the regular-trail per-trade. Permanent.
-- [ ] **2026-05-04 22:24Z — Paper-lifecycle widening soak ends.** Sneak-peek +$1,234 net / 91 closes. Decision: keep on.
-- [ ] **2026-05-05 22:58Z — PR #59 strategy tuning soak ends.** Sneak-peek +$1,994 net / 135 closes / 67.4% win / 20% expired. Decision: keep on permanently.
-- [ ] **2026-05-10 15:53Z — gainers_early reversal re-soak (7d).** Watch for performance vs the +$190/day sneak-peek that justified reversal. If actuals < +$100/day for 7d, re-evaluate.
+- [x] **2026-05-04 22:24Z — Paper-lifecycle widening soak ends.** Sneak-peek +$1,234 net / 91 closes. Decision: keep on. **CLOSED 2026-05-19 (audit): KEEP-ON-PRESUMED (docs-only) per inline sneak-peek decision; soak ended 15d before audit with no documented revert. .env continues to carry the widened lifecycle settings (see "Prod .env current state" block below in this same file). Per §9a caveat at top of file: evidence is docs-only; not SSH-verified.**
+- [x] **2026-05-05 22:58Z — PR #59 strategy tuning soak ends.** Sneak-peek +$1,994 net / 135 closes / 67.4% win / 20% expired. Decision: keep on permanently. **CLOSED 2026-05-19 (audit): KEEP-ON-PRESUMED-PERMANENT (docs-only) per inline decision + early-signal at 13.5h. PR #59 (`3c83fb7`) per `tasks/todo.md` "What shipped this session" table below. Soak ended 14d before audit; no documented revert. Per §9a caveat: docs-only evidence.**
+- [x] **2026-05-10 15:53Z — gainers_early reversal re-soak (7d).** Watch for performance vs the +$190/day sneak-peek that justified reversal. If actuals < +$100/day for 7d, re-evaluate. **CLOSED 2026-05-19 (audit): ELAPSED-AUTO-SUSPENDED. Re-soak window 2026-05-10 → 2026-05-17 elapsed. Per `backlog.md:1798` (inside `BL-NEW-LOSERS-CONTRARIAN-REVIVAL-CRITERIA-TIGHTENING`, entry header at backlog.md:1797) the new PR #150 evaluator returned `gainers_early=FAIL contradicting 2026-05-13 audit-id=24`, and the same entry records auto-suspend firing 2026-05-17T01:02:46Z (audit ids 26/27). Memory `project_soak_closure_2026_05_13.md` reflects the pre-PR-#150-evaluator KEEP-ON verdict that was explicitly contradicted by the new evaluator.**
 - [x] **2026-05-13 02:13Z — losers_contrarian post-BL-NEW-AUTOSUSPEND-FIX revival 7d soak.** **KEEP ON (permanent).** Closed 2026-05-13T04:05Z. n=55, net +$826.68, per_trade +$15.03, win 69.1%. Both gate clauses cleared by ~4×. Zero auto-suspend fires during soak. Drivers: `peak_fade` n=26 +$1,688; `stop_loss` n=11 −$917 drag. Audit row id=23.
 - [x] **2026-05-13 02:15Z — gainers_early post-BL-NEW-AUTOSUSPEND-FIX revival 7d soak.** **KEEP ON (permanent).** Closed 2026-05-13T04:05Z. n=128, net +$1,894.37, per_trade +$14.80, win 72.7%. Both gate clauses cleared. Zero auto-suspend fires during soak. `conviction_lock_enabled=1` stays armed. Drivers: `peak_fade` n=38 +$2,499 + `trailing_stop` n=54 +$888; `stop_loss` n=13 −$1,059 drag. Audit row id=24.
 - [x] **2026-05-13 02:18Z — HPF dry-run 7d soak (BL-NEW-HPF Phase 1).** **KEEP DRY-RUN. Do NOT flip the flag.** Closed 2026-05-13T04:05Z. n=7 would-fires (6 gainers_early + 1 losers_contrarian). Aggregate counterfactual: HPF +$1,078.15 vs actual +$1,123.63 — **delta −$45.48 (negative)**. Subset reading (structural §9c): HPF beats `moonshot_trail` 3/3 (+$238) but loses to existing `peak_fade` 3/4 (−$285). Re-evaluate at n≥20 scoped to `moonshot_trail`-subset only (filed BL-NEW-HPF-RE-EVALUATION). Audit row id=25.
-- [ ] **2026-05-13+ — Deploy PR #82 BL-NEW-MOONSHOT-OPT-OUT (held overnight 2026-05-06).** Migration adds `signal_params.moonshot_enabled INTEGER NOT NULL DEFAULT 1` — no behavior change on deploy (default opt-IN preserves existing floor). Per-signal opt-out via `UPDATE signal_params SET moonshot_enabled=0 WHERE signal_type='X'`. Backtest applicability caveat: `findings_high_peak_giveback.md` PnL projection used floored regime; opted-out signal must re-run backtest with floor removed before projecting impact.
+- [ ] **2026-05-13+ — Deploy PR #82 BL-NEW-MOONSHOT-OPT-OUT (held overnight 2026-05-06).** Migration adds `signal_params.moonshot_enabled INTEGER NOT NULL DEFAULT 1` — no behavior change on deploy (default opt-IN preserves existing floor). Per-signal opt-out via `UPDATE signal_params SET moonshot_enabled=0 WHERE signal_type='X'`. Backtest applicability caveat: `findings_high_peak_giveback.md` PnL projection used floored regime; opted-out signal must re-run backtest with floor removed before projecting impact. **MERGED-DEPLOY-UNVERIFIED 2026-05-19 (audit): PR #82 MERGED 2026-05-06 per `tasks/todo.md:523`. Migration default-opt-IN means zero behavior change on deploy; per-signal opt-out remains operator-driven. Live deploy state on srilu was NOT SSH-verified in this docs-only audit per scope — leaving `[ ]` so a future session does NOT assume deploy is operator-confirmed. Closure of this item gated on operator-verified srilu schema migration evidence (e.g., `signal_params.moonshot_enabled` column present + audit row with `applied_by='migration'`).**
 - [x] **2026-05-17 — chain_complete fire-rate observation post-PR #80: CLOSED.** Lifetime: full_conviction=201, narrative_momentum=210, volume_breakout=301 chain_matches. Post-PR-#146 recent: active_chains=83 rows in 14d (oldest 2026-05-11T16:41Z), all 4 narrative anchor events fired 139× each in 7d. Paper-trades: 12 chain_completed in 14d, +$1,034 net, +$207/trade. Observability bump served purpose; PR #154 reverts `scout/chains/patterns.py` full_conviction + narrative_momentum from `medium` → `low` (also code-vs-prod-state alignment — PR #146 snapshot-restore already had prod at `low`). 14/14 chain_patterns tests pass including new closure-test `test_builtin_patterns_alert_priority_post_observability_revert`.
 
 ## Active soaks (don't disturb)
 
 - [x] **Tier 1a flip — gainers_early kill REVERSED 2026-05-03T15:53Z** — original kill was based on pre-PR-#59 30d data. Sneak-peek of post-#59 data (4.7d window) showed gainers_early at +$508 / 59 closes / +$8.61/trade / 67.8% win — clearly profitable under the new adaptive trail. PR #59 fixed gainers_early; the kill was forfeiting ~$190/day. SQL reversal + restart verified: 5 new gainers_early trades opened at 15:58:29Z, zero `trade_skipped_signal_disabled` events. Tier 1a `SIGNAL_PARAMS_ENABLED=true` flag stays on for the other 7 signals (per-signal params still honored). Audit row in signal_params_audit. Backup: `scout.db.bak.gainers_revive_20260503_155322`.
 
-- [ ] **2026-05-15 14:06Z — RE-SCOPED system health checkpoint (was: "Tier 1a kill 14d soak").** The original A/B (kill gainers_early, see net swing) was invalidated 2026-05-03 when we reversed the kill based on post-PR-#59 data. New scope: 2-week strategic checkpoint after a flurry of changes (Tier 1a flag on, per-signal params live, chain_completed dispatch wired + long-hold tuned, BL-071 guard live). Three concrete questions:
+- [ ] **2026-05-15 14:06Z — RE-SCOPED system health checkpoint (was: "Tier 1a kill 14d soak").** **STILL OPEN AT 2026-05-19 (audit): checkpoint date elapsed 4d before audit; operator-driven 3-question review has no documented closure in memory or backlog. SQL queries below remain valid for operator's next session.** The original A/B (kill gainers_early, see net swing) was invalidated 2026-05-03 when we reversed the kill based on post-PR-#59 data. New scope: 2-week strategic checkpoint after a flurry of changes (Tier 1a flag on, per-signal params live, chain_completed dispatch wired + long-hold tuned, BL-071 guard live). Three concrete questions:
   1. **System P&L re-baseline.** Compute 14d rolling net (2026-05-01 → 2026-05-15) and compare to the −$506 baseline that motivated all the recent changes. Decision gate: ≥ +$1,000 net = strategy stack worked; +$0–$1,000 = mixed; < $0 = something else is bleeding, dig in.
   2. **Tier 1a infrastructure health.** Did Tier 1b auto-suspend fire on anything (shouldn't have, since all signals trended profitable in the 4.7d sneak-peek)? Did anyone run `calibrate.py`? Are signal_params_audit rows clean and traceable? Any latency regression from per-signal lookup vs Settings reads?
   3. **Next-best-next decision.** With 2 weeks of cleaner data and chain_completed actually producing trades, decide what's next: BL-067 (conviction-locked hold), BL-071a/b (outcome plumbing fixes), or "leave the system alone, monitor for another 30d, then revisit". Optionally also: do we re-evaluate BL-070 (entry stack gate) given the data actually shows we're net positive without it?
@@ -410,13 +459,13 @@ Review:
     ORDER BY applied_at;
     ```
   - This is no longer an A/B test — just a 2-week strategic checkpoint. No automatic action; user-driven decision.
-- [ ] **PR #58 BL-064 lenient-safety soak** — flag flipped 2026-04-28T15:17Z. Re-check window: 2026-05-12.
+- [ ] **PR #58 BL-064 lenient-safety soak** — flag flipped 2026-04-28T15:17Z. Re-check window: 2026-05-12. **STILL OPEN AT 2026-05-19 (audit): re-check window elapsed 7d before audit. Operational-gap risk per the inline note: curators may not have posted CA-bearing messages in the window. Closure deferred to operator-initiated BL-064 retrospective; memory `project_bl064_deployed_2026_04_27.md` documents original bootstrap, and memory `project_narrative_scanner_v1_1_shipped_2026_05_13.md` covers the follow-on KOL list work.**
   - Decision gate: ≥40% win rate + avg pnl_pct >0 → keep on. As of 2026-04-29T12:25Z: 0 trades dispatched yet (curators haven't posted CA-bearing messages since flag flipped). Operational gap, not code.
-- [ ] **PR #59 strategy tuning soak** — deployed 2026-04-28T22:58Z. Re-check window: 2026-05-05.
+- [x] **PR #59 strategy tuning soak** — deployed 2026-04-28T22:58Z. Re-check window: 2026-05-05. **CLOSED 2026-05-19 (audit): KEEP-ON-PRESUMED-PERMANENT (docs-only) (duplicate of L421 closure above in this file; same PR #59 / `3c83fb7`). 9× improvement in $/trade was the early-signal evidence; full-soak +$1,994 net / 135 closes / 67.4% win documented at L421. Soak ended 14d before audit; no documented revert. Per §9a caveat: docs-only evidence.**
   - Early signal at 13.5h: 23 closes, +$650 net, ~70% win rate, 0 expired closes. 9× improvement in $/trade vs historical −$3.05. Letting it ride.
-- [ ] **BL-063 moonshot soak** — flag flipped 2026-04-27T13:58Z. Soak ends 2026-05-04T13:58Z.
-- [ ] **BL-064 14d TG social soak** — ends 2026-05-11T22:10Z.
-- [ ] **Paper-lifecycle widening soak** — .env tweaks deployed 2026-04-27T22:24Z. Soak ends ~2026-05-04T22:24Z.
+- [x] **BL-063 moonshot soak** — flag flipped 2026-04-27T13:58Z. Soak ends 2026-05-04T13:58Z. **CLOSED 2026-05-19 (audit): KEEP-ON-PRESUMED-PERMANENT (docs-only) (duplicate of L419 closure above in this file). Per L419 (pre-existing operator decision): "Moonshot path: 19 closes / +$2,232.86 net / +$117.52/trade / 100% win. Permanent." Soak ended 15d before audit. Per §9a caveat: docs-only evidence.**
+- [x] **BL-064 14d TG social soak** — ends 2026-05-11T22:10Z. **CLOSED 2026-05-19 (audit): ELAPSED-OPERATIONAL-GAP. Soak ended 8d before audit. BL-064 surfaced trending_catch which auto-killed 2026-05-11T01:00:26Z (`hard_loss`, net -$317) per memory `project_trending_catch_soak_2026_05_10.md`. BL-064 was superseded by Narrative Scanner V1.1 KOL-list direction shipped 2026-05-13 per memory `project_narrative_scanner_v1_1_shipped_2026_05_13.md`.**
+- [x] **Paper-lifecycle widening soak** — .env tweaks deployed 2026-04-27T22:24Z. Soak ends ~2026-05-04T22:24Z. **CLOSED 2026-05-19 (audit): KEEP-ON-PRESUMED (docs-only) (duplicate of L420 closure above in this file). Soak ended 15d before audit; no documented revert. Per §9a caveat: docs-only evidence.**
 
 ## Pending operator action (blocked on user)
 
@@ -467,15 +516,15 @@ When user asks "how is strategy tuning going" tomorrow:
 ### 3. Open optional follow-ups (not urgent)
 
 - [x] **2026-05-06 Channel-list reload task in BL-064 listener** — CLOSED-AS-SHIPPED. Drift-check finds: PR #73 (`a12603f`, 2026-05-04) shipped channel hot-reload via `_channel_reload_once` (`scout/social/telegram/listener.py:1252-1325`), heartbeat factory `_make_channel_reload_heartbeat` at line 1327, and structural-typed channels_holder TypedDict refactor in PR #75 (`8e54578`). Listener swaps handlers on reload without pipeline restart. todo.md item was stale.
-- [ ] `narrative_prediction` token_id divergence fix — 32 of 56 stale-young open trades have empty/synthetic token_ids that don't appear in `price_cache`. Separate upstream fix.
+- [x] `narrative_prediction` token_id divergence fix — 32 of 56 stale-young open trades have empty/synthetic token_ids that don't appear in `price_cache`. Separate upstream fix. **CLOSED 2026-05-19 (audit): UPSTREAM FIX SHIPPED 2026-05-06 (duplicate of L521 closure above in this file). Per L521: PR #80 (`eaf3523`) per-laggard emission with `token.coin_id` (was `accel.category_id`); pre-fix 2,770 anchors → 2 chain_completes, post-fix `narrative_prediction` token_ids resolve in `price_cache`.**
 - [x] **2026-05-06 @s1mple_s1mple verdict — DO-NOT-ADD (off-thesis).** Background investigation 2026-05-06: `@s1mple_s1mple` doesn't resolve via Bot API (likely user account, not channel — incompatible with Telethon listener). `@s1mplegod123` resolves as Russian-language esports diary "Дневник Симпла" (Counter-Strike pro s1mple of NaVi), 256K subscribers, ZERO crypto content across t.me sample + 1,220 cross-channel mention rows. No DB references in 5 tables. Operator can still add as `trade_eligible=0, cashtag_trade_eligible=0` watch-only with 30-day re-eligibility check if desired despite fit, but default action is no-add. See investigation notes inline; no separate findings file written.
-- [ ] Audit fix #4 (24h hard-exit if peak<5%) deferred — accumulate more data first.
+- [ ] Audit fix #4 (24h hard-exit if peak<5%) deferred — accumulate more data first. **STILL OPEN AT 2026-05-19 (audit): genuinely pending per inline "accumulate more data first" decision. No backlog entry or memory checkpoint indicates operator has revisited. Defer to operator's next strategy-tuning cycle.**
 - [x] **BL-NEW-REVIVAL-COOLOFF — SHIPPED 2026-05-06** (PR #81 / `57192cb`). 7-day default cool-off on `revive_signal_with_baseline` with `force=True` bypass. Plan-stage MUST-FIX: positive `applied_by='operator'` filter. Design-stage MUST-FIX: settings DI. PR-stage CRITICAL: caplog→capture_logs. All applied. Smoke-tested on VPS: cool-off correctly blocks losers_contrarian re-revival.
 - [x] **#3 Channel-list reload — CLOSED-AS-SHIPPED 2026-05-06.** Drift-check: PR #73 (`a12603f`, 2026-05-04) shipped channel hot-reload via `_channel_reload_once` + heartbeat factory + channels_holder TypedDict. todo.md item was stale.
 - [x] **narrative_prediction token_id divergence — UPSTREAM FIX SHIPPED 2026-05-06** (PR #80 / `eaf3523`). Original symptom (32/56 stale-young opens) resolved by PR #72 + zombie cleanup. Real upstream cause was agent.py emitting `category_heating` with `token_id=accel.category_id`, breaking chain pattern matching. Pre-fix: 2,770 anchors → 2 chain_completes. Post-fix: per-laggard emission with `token.coin_id`.
 - [x] **#5 @s1mple_s1mple verdict — DO-NOT-ADD 2026-05-06.** Esports diary, no crypto.
 - [x] **moonshot floor nullification — UPSTREAM FIX MERGED 2026-05-06** (PR #82, deploy held until 2026-05-13). Per-signal `moonshot_enabled INTEGER NOT NULL DEFAULT 1` opt-out flag.
-- [ ] **first_signal revival decision** — under combined-gate rule, first_signal would NOT auto-fire (-$132 30d net is borderline). Operator decision: revive for soak, or leave suspended. Note: revival now subject to 7-day cool-off (PR #81); first revival ever bypasses cool-off cleanly.
+- [x] **first_signal revival decision** — under combined-gate rule, first_signal would NOT auto-fire (-$132 30d net is borderline). Operator decision: revive for soak, or leave suspended. Note: revival now subject to 7-day cool-off (PR #81); first revival ever bypasses cool-off cleanly. **CLOSED 2026-05-19 (audit): DECIDED-REVIVE-AND-SOAK per `backlog.md:1792-1793` (BL-NEW-FIRST-SIGNAL-RETIREMENT-DECISION SHIPPED-WITH-DECISION 2026-05-17, Option A REVIVE-AND-SOAK 14d window ending 2026-05-31). Memory checkpoint: `project_first_signal_revival_decision_2026_05_31.md`. Pre-registered verdict criteria + n≥10 trip-wire + 28d auto-extend + early-halt at n≥20 per CLAUDE.md §11. The 2026-05-31 soak-end is operator-gated per the assignment guardrail ("do NOT start... first_signal 2026-05-31 early").**
 
 ## What shipped this session (2026-04-28 → 2026-04-29)
 
