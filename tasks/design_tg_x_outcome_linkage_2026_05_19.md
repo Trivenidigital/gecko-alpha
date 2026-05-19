@@ -301,26 +301,71 @@ rows). When auto-trade lands, re-state the criteria.
    `source_kind` discriminator (`'tg'` or `'x'`). This is the view the
    future source-quality ledger queries.
 
-### API endpoints (proposed, not implemented)
+### API endpoints — two distinct audiences
 
-- `GET /api/internal/outcomes/tg?since=...&channel=...` — paginated
-  read-only join surface for TG.
-- `GET /api/internal/outcomes/x?since=...&handle=...` — same for X.
-- `GET /api/internal/outcomes/by-source?source_kind=...&id=...` — unified
-  per-source query. Returns the same fields regardless of source.
+Review fold (2026-05-19): the original draft mixed HMAC-authed internal
+endpoints with browser-dashboard consumption. A browser cannot practically
+sign HMAC without exposing the secret. Splitting the surface explicitly.
 
-All endpoints are read-only, HMAC-authed (reuse
-`scout/api/narrative._verify_hmac` per BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE).
-No write endpoints. No execution endpoints. No live-trade endpoints.
+**Audit of existing patterns (verified 2026-05-19):**
+
+- `dashboard/api.py` exposes plain `@app.get("/api/...")` routes with no
+  authentication. Comment at `dashboard/api.py:300`:
+  `# No auth required -- paper trading uses simulated money.`. The
+  dashboard runs locally / operator-only; this is the established
+  read-only pattern.
+- `scout/api/narrative.py` exposes HMAC-authed `/api/internal/narrative-alert`
+  for the Hermes scanner producer (server-to-server). HMAC verification
+  helper: `scout/api/narrative._verify_hmac`.
+
+These two are different audiences with different threat models. The
+outcome-linkage design must reflect that.
+
+#### (a) Dashboard-facing — no auth, follows `dashboard/api.py` pattern
+
+These endpoints serve the existing browser dashboard. Read-only. No
+authentication (consistent with the rest of `dashboard/api.py`).
+
+- `GET /api/outcomes/tg?since=...&channel=...` — paginated TG join surface.
+- `GET /api/outcomes/x?since=...&handle=...` — paginated X join surface.
+- `GET /api/outcomes/by-source?source_kind=...&id=...` — unified per-source
+  query with the `source_kind` discriminator (`'tg'` or `'x'`).
+
+These are what the cohort-view dashboard cards will call.
+
+#### (b) Server-side internal — HMAC-authed, agent producers/consumers only
+
+These endpoints exist for agent-side / server-to-server consumers
+(future automation, cross-host ledger sync, Hermes producers wanting to
+reconcile their own emitted events against gecko-alpha outcomes). They
+are **not used by the browser dashboard**.
+
+- `GET /api/internal/outcomes/tg?since=...&channel=...`
+- `GET /api/internal/outcomes/x?since=...&handle=...`
+- `GET /api/internal/outcomes/by-source?source_kind=...&id=...`
+
+HMAC verification reuses `scout/api/narrative._verify_hmac` per the
+BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE contract. Same response shape as
+the dashboard endpoints.
+
+#### Implementation policy
+
+- Implement (a) first. (b) is optional and ships only if a concrete
+  agent-side consumer requires it.
+- Both share a single backing query layer (the `v_unified_source_outcomes`
+  view) — no logic divergence between auth tiers.
+- No write endpoints in either tier. No execution endpoints. No
+  live-trade endpoints.
 
 ### Dashboard impact
 
 - The actionability dashboard (BL-NEW-ACTIONABILITY) already groups by
-  `signal_type`. Add an optional per-source breakout when `signal_type IN
-  ('tg_social','narrative_prediction')` using the linkage columns.
+  `signal_type` and consumes `dashboard/api.py` routes. Add an optional
+  per-source breakout when `signal_type IN ('tg_social','narrative_prediction')`
+  using the new no-auth endpoints from (a).
 - New cohort view (out of scope here): per-channel / per-handle outcomes
   with n-gate ≥ 10 and INSUFFICIENT_DATA fallback (per
-  `feedback_n_gate_verdicts_against_dashboard_noise.md`).
+  `feedback_n_gate_verdicts_against_dashboard_noise.md`). Consumes (a).
 
 ## Failure Modes To Pre-empt
 
