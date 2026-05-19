@@ -590,36 +590,48 @@ function PnlBySignalPanel({ bySignal, cohort, cohortView, setCohortView }) {
         </td>
         <td style={{ whiteSpace: 'nowrap' }}>
           {trades}
+          {/*
+            Low-sample badges: low-n is a "do not trust yet" state,
+            NOT a "bad cohort" state. Per reviewer fold 2026-05-19:
+            the prior red color implied bad; both tiers now use
+            muted neutral tones (italic, low-contrast) — the badge
+            tells the trader "ignore this row's PnL/WR for verdict
+            purposes" rather than "this row is wrong."
+          */}
           {veryLowN && (
             <span
-              title={`Very low sample (n=${trades}). Treat the PnL/win-rate columns as exploratory only — they are not proven evidence for or against this cohort.`}
+              title={`Too small to interpret (n=${trades}). The PnL/win-rate columns are not yet evidence for or against this cohort — wait for more samples.`}
               style={{
                 marginLeft: 6,
                 padding: '1px 5px',
                 fontSize: 10,
-                fontWeight: 700,
+                fontWeight: 600,
+                fontStyle: 'italic',
                 borderRadius: 3,
-                background: 'rgba(239, 83, 80, 0.18)',
-                color: 'var(--color-accent-red, #ef5350)',
+                background: 'var(--color-bar-bg, #1a1a1a)',
+                color: 'var(--color-text-secondary)',
+                border: '1px solid var(--color-border)',
               }}
             >
-              very low n ⚠
+              n={trades} · too small to interpret
             </span>
           )}
           {!veryLowN && lowN && (
             <span
-              title={`Below verdict threshold (n=${trades}, need ≥${minN}). Treat as exploratory; do NOT promote a low-n cohort.`}
+              title={`Below verdict threshold (n=${trades}, need ≥${minN}). Treat as exploratory; do not promote a low-n cohort.`}
               style={{
                 marginLeft: 6,
                 padding: '1px 5px',
                 fontSize: 10,
-                fontWeight: 700,
+                fontWeight: 600,
+                fontStyle: 'italic',
                 borderRadius: 3,
-                background: 'rgba(255, 183, 77, 0.18)',
+                background: 'rgba(255, 183, 77, 0.10)',
                 color: 'var(--color-accent-amber)',
+                border: '1px solid rgba(255, 183, 77, 0.30)',
               }}
             >
-              low n ⚠
+              low n · do not trust yet
             </span>
           )}
         </td>
