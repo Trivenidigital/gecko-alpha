@@ -71,6 +71,15 @@ Cache TTL 5 minutes, version-bumped on `bump_cache_version()` after `--apply`/`a
 
 Three layers compose without interference — outer wins by short-circuiting before the DB check.
 
+### Scorer dormant-signal comments
+
+Any scorer signal that has not fired in the last 7d production window MUST carry a comment immediately above the threshold check. Use:
+
+- `# DEAD SIGNAL — pending <BL ticket> <short reason>` when runtime evidence says the signal is inert today.
+- `# GATED — pending <BL ticket or config> <short reason>` when the code path is intentionally blocked by config, feature activation, or an external dependency.
+
+The comment should name the backlog ticket and, when known, the re-eval trigger that removes the comment. This prevents future scorer audits from mistaking dormant code for an active contributor. Current examples: Signal 5 social mentions carries `# DEAD SIGNAL — pending BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT re-eval` in `scout/scorer.py`; Signal 13 CryptoPanic documents its gated status in the same file.
+
 ### Chain pattern lifecycle
 
 `scout/chains/patterns.py:run_pattern_lifecycle` retires patterns when `total_evaluated >= CHAIN_MIN_TRIGGERS_FOR_STATS=10` AND `hit_rate < _RETIREMENT_HIT_RATE=0.20`. **BL-071 systemic-zero-hits guard** at lines 308-315: if ALL patterns show 0 hits across the trigger floor, short-circuit before retirement (the cause is upstream telemetry failure, not pattern quality). Guard verified by 2 unit tests in `tests/test_chains_learn.py`.
