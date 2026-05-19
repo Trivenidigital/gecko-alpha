@@ -902,7 +902,10 @@ async def _get_trading_positions_inner(db) -> list[dict]:
                   remaining_qty,
                   realized_pnl_usd,
                   floor_armed,
-                  would_be_live
+                  would_be_live,
+                  actionable,
+                  actionability_reason,
+                  actionability_version
            FROM paper_trades
            WHERE status = 'open'
            ORDER BY opened_at DESC"""
@@ -960,25 +963,30 @@ async def _get_trading_positions_inner(db) -> list[dict]:
 
 
 async def get_trading_history(
-    db_path: str, limit: int = 50, offset: int = 0
+    db_path: str, limit: int = 50, offset: int = 0, actionability: str = "all"
 ) -> list[dict]:
     """Closed paper trades, paginated."""
     async with _ro_db(db_path) as db:
         try:
+            filter_sql, filter_params = _actionability_filter_sql(actionability)
             cursor = await db.execute(
-                """SELECT id, token_id, symbol, name, chain, signal_type, signal_data,
+                f"""SELECT id, token_id, symbol, name, chain, signal_type, signal_data,
                           entry_price, exit_price, amount_usd, quantity,
                           pnl_usd, pnl_pct, exit_reason, status,
                           peak_price, peak_pct,
                           checkpoint_1h_pct, checkpoint_6h_pct,
                           checkpoint_24h_pct, checkpoint_48h_pct,
                           opened_at, closed_at,
-                          would_be_live
+                          would_be_live,
+                          actionable,
+                          actionability_reason,
+                          actionability_version
                    FROM paper_trades
                    WHERE status != 'open'
+                     {filter_sql}
                    ORDER BY closed_at DESC
                    LIMIT ? OFFSET ?""",
-                (limit, offset),
+                (*filter_params, limit, offset),
             )
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
@@ -986,7 +994,22 @@ async def get_trading_history(
             return []  # table doesn't exist yet
 
 
-async def get_trading_history_count(db_path: str) -> int:
+def _actionability_filter_sql(actionability: str) -> tuple[str, tuple]:
+    """Return SQL fragment for actionability state filter.
+
+    API validation constrains values before this helper is called. The fallback
+    to no filter keeps direct internal callers backwards-compatible.
+    """
+    if actionability == "actionable":
+        return "AND actionable = 1", ()
+    if actionability == "exploratory":
+        return "AND actionable = 0", ()
+    if actionability == "unknown":
+        return "AND actionable IS NULL", ()
+    return "", ()
+
+
+async def get_trading_history_count(db_path: str, actionability: str = "all") -> int:
     """Total count of closed paper trades (status != 'open').
 
     Read by /api/trading/history/count for frontend pagination math.
@@ -995,13 +1018,146 @@ async def get_trading_history_count(db_path: str) -> int:
     """
     async with _ro_db(db_path) as db:
         try:
+            filter_sql, filter_params = _actionability_filter_sql(actionability)
             cursor = await db.execute(
-                "SELECT COUNT(*) FROM paper_trades WHERE status != 'open'"
+                f"SELECT COUNT(*) FROM paper_trades WHERE status != 'open' {filter_sql}",
+                filter_params,
             )
             row = await cursor.fetchone()
             return int(row[0]) if row else 0
         except Exception:
             return 0  # table doesn't exist yet
+
+
+def _empty_actionability_summary(days: int) -> dict:
+    return {
+        "window_days": days,
+        "open_counts": {
+            "actionable": 0,
+            "exploratory": 0,
+            "unknown": 0,
+            "total": 0,
+        },
+        "closed_cohorts": [
+            _empty_actionability_cohort("actionable"),
+            _empty_actionability_cohort("exploratory"),
+            _empty_actionability_cohort("unknown"),
+        ],
+        "top_reasons": [],
+        "policy_note": (
+            "Actionability is metadata only. Exploratory paper trades are not "
+            "suppressed in this view."
+        ),
+    }
+
+
+def _empty_actionability_cohort(state: str) -> dict:
+    return {
+        "state": state,
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "total_pnl_usd": 0.0,
+        "avg_pnl_pct": 0.0,
+        "win_rate_pct": 0.0,
+    }
+
+
+def _actionability_state(value) -> str:
+    if value == 1:
+        return "actionable"
+    if value == 0:
+        return "exploratory"
+    return "unknown"
+
+
+async def get_trading_actionability_summary(db_path: str, days: int = 7) -> dict:
+    """Read-only actionability rollup for the Trading dashboard."""
+    if days < 1:
+        days = 1
+    window = f"-{days} days"
+    summary = _empty_actionability_summary(days)
+
+    async with _ro_db(db_path) as db:
+        try:
+            cursor = await db.execute(
+                """SELECT actionable, COUNT(*) AS n
+                   FROM paper_trades
+                   WHERE status = 'open'
+                   GROUP BY actionable"""
+            )
+            open_rows = await cursor.fetchall()
+
+            cursor = await db.execute(
+                """SELECT actionable,
+                          COUNT(*) AS trades,
+                          SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
+                          SUM(CASE WHEN pnl_usd <= 0 THEN 1 ELSE 0 END) AS losses,
+                          COALESCE(SUM(pnl_usd), 0) AS pnl,
+                          COALESCE(AVG(pnl_pct), 0) AS avg_pct
+                   FROM paper_trades
+                   WHERE status != 'open'
+                     AND closed_at >= datetime('now', ?)
+                   GROUP BY actionable""",
+                (window,),
+            )
+            closed_rows = await cursor.fetchall()
+
+            cursor = await db.execute(
+                """SELECT COALESCE(actionability_reason, 'unknown') AS reason,
+                          COUNT(*) AS trades,
+                          SUM(CASE WHEN status != 'open' THEN 1 ELSE 0 END) AS closed_trades,
+                          COALESCE(SUM(CASE WHEN status != 'open' THEN pnl_usd ELSE 0 END), 0)
+                              AS closed_pnl
+                   FROM paper_trades
+                   WHERE actionability_reason IS NOT NULL
+                     AND (
+                       (status = 'open' AND opened_at >= datetime('now', ?))
+                       OR (status != 'open' AND closed_at >= datetime('now', ?))
+                     )
+                   GROUP BY actionability_reason
+                   ORDER BY trades DESC, reason ASC
+                   LIMIT 10""",
+                (window, window),
+            )
+            reason_rows = await cursor.fetchall()
+        except Exception:
+            return summary
+
+    for row in open_rows:
+        state = _actionability_state(row["actionable"])
+        n = int(row["n"] or 0)
+        summary["open_counts"][state] = n
+        summary["open_counts"]["total"] += n
+
+    by_state = {row["state"]: row for row in summary["closed_cohorts"]}
+    for row in closed_rows:
+        state = _actionability_state(row["actionable"])
+        trades = int(row["trades"] or 0)
+        wins = int(row["wins"] or 0)
+        by_state[state].update(
+            {
+                "trades": trades,
+                "wins": wins,
+                "losses": int(row["losses"] or 0),
+                "total_pnl_usd": round(row["pnl"] or 0, 2),
+                "avg_pnl_pct": round(row["avg_pct"] or 0, 2),
+                "win_rate_pct": round((wins / trades) * 100, 1)
+                if trades > 0
+                else 0.0,
+            }
+        )
+
+    summary["top_reasons"] = [
+        {
+            "reason": row["reason"],
+            "trades": int(row["trades"] or 0),
+            "closed_trades": int(row["closed_trades"] or 0),
+            "closed_pnl_usd": round(row["closed_pnl"] or 0, 2),
+        }
+        for row in reason_rows
+    ]
+    return summary
 
 
 async def get_trading_stats(db_path: str, days: int = 7) -> dict:

@@ -46,6 +46,9 @@ async def _insert_trade(
     pnl_pct=None,
     would_be_live=None,
     conviction_locked_stack=None,
+    actionable=None,
+    actionability_reason=None,
+    actionability_version=None,
 ):
     now = datetime.now(timezone.utc)
     opened = (now - timedelta(hours=2)).isoformat()
@@ -55,8 +58,9 @@ async def _insert_trade(
            (token_id, symbol, name, chain, signal_type, signal_data,
             entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, sl_price,
             status, pnl_usd, pnl_pct, opened_at, closed_at,
-            would_be_live, conviction_locked_stack)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            would_be_live, conviction_locked_stack,
+            actionable, actionability_reason, actionability_version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             token_id,
             symbol,
@@ -78,6 +82,9 @@ async def _insert_trade(
             closed,
             would_be_live,
             conviction_locked_stack,
+            actionable,
+            actionability_reason,
+            actionability_version,
         ),
     )
     await conn.commit()
@@ -265,6 +272,218 @@ async def test_positions_and_history_include_would_be_live(client):
     by_token = {h["token_id"]: h for h in history}
     assert by_token["closed-not-eligible"]["would_be_live"] == 0
     assert by_token["closed-pre-writer"]["would_be_live"] is None
+
+
+async def test_positions_and_history_include_actionability_metadata(client):
+    """Trading row payloads expose actionability metadata separately from
+    would_be_live so the dashboard can show decision-quality labels without
+    confusing them with live-slot eligibility.
+    """
+    c, db = client
+    await _insert_trade(
+        db._conn,
+        "open-actionable",
+        "OPENA",
+        "volume_spike",
+        "open",
+        actionable=1,
+        actionability_reason="v1_pass_core_signal_mcap_10_50m",
+        actionability_version="v1",
+        would_be_live=0,
+    )
+    await _insert_trade(
+        db._conn,
+        "closed-exploratory",
+        "CEXP",
+        "losers_contrarian",
+        "closed_sl",
+        pnl_usd=-12.0,
+        pnl_pct=-1.2,
+        actionable=0,
+        actionability_reason="v1_block_losers_contrarian_exploratory",
+        actionability_version="v1",
+        would_be_live=1,
+    )
+
+    pos_resp = await c.get("/api/trading/positions")
+    assert pos_resp.status_code == 200
+    pos = {p["token_id"]: p for p in pos_resp.json()}["open-actionable"]
+    assert pos["actionable"] == 1
+    assert pos["actionability_reason"] == "v1_pass_core_signal_mcap_10_50m"
+    assert pos["actionability_version"] == "v1"
+    assert pos["would_be_live"] == 0
+
+    hist_resp = await c.get("/api/trading/history?limit=20&offset=0")
+    assert hist_resp.status_code == 200
+    hist = {h["token_id"]: h for h in hist_resp.json()}["closed-exploratory"]
+    assert hist["actionable"] == 0
+    assert hist["actionability_reason"] == "v1_block_losers_contrarian_exploratory"
+    assert hist["actionability_version"] == "v1"
+    assert hist["would_be_live"] == 1
+
+
+async def test_history_actionability_filter_and_count_share_semantics(client):
+    """The history filter is server-side so pagination/count totals match the
+    rows being displayed. Unknown means pre-cutover or unstamped rows.
+    """
+    c, db = client
+    await _insert_trade(
+        db._conn,
+        "act",
+        "ACT",
+        "volume_spike",
+        "closed_tp",
+        pnl_usd=30.0,
+        pnl_pct=3.0,
+        actionable=1,
+        actionability_reason="v1_pass_core_signal_mcap_10_50m",
+        actionability_version="v1",
+    )
+    await _insert_trade(
+        db._conn,
+        "explore",
+        "EXP",
+        "gainers_early",
+        "closed_sl",
+        pnl_usd=-20.0,
+        pnl_pct=-2.0,
+        actionable=0,
+        actionability_reason="v1_block_gainers_early_mcap_5_10m",
+        actionability_version="v1",
+    )
+    await _insert_trade(
+        db._conn,
+        "unknown",
+        "UNK",
+        "volume_spike",
+        "closed_tp",
+        pnl_usd=10.0,
+        pnl_pct=1.0,
+        actionable=None,
+        actionability_reason=None,
+        actionability_version=None,
+    )
+
+    cases = {
+        "all": {"act", "explore", "unknown"},
+        "actionable": {"act"},
+        "exploratory": {"explore"},
+        "unknown": {"unknown"},
+    }
+    for actionability, expected_tokens in cases.items():
+        hist_resp = await c.get(
+            f"/api/trading/history?limit=20&offset=0&actionability={actionability}"
+        )
+        assert hist_resp.status_code == 200
+        assert {row["token_id"] for row in hist_resp.json()} == expected_tokens
+
+        count_resp = await c.get(
+            f"/api/trading/history/count?actionability={actionability}"
+        )
+        assert count_resp.status_code == 200
+        assert count_resp.json() == {"total": len(expected_tokens)}
+
+
+async def test_history_rejects_unknown_actionability_filter(client):
+    c, _ = client
+    resp = await c.get("/api/trading/history?actionability=maybe")
+    assert resp.status_code == 422
+
+
+async def test_actionability_summary_counts_reasons_and_closed_pnl(client):
+    c, db = client
+    await _insert_trade(
+        db._conn,
+        "open-act",
+        "OACT",
+        "volume_spike",
+        "open",
+        actionable=1,
+        actionability_reason="v1_pass_core_signal_mcap_10_50m",
+        actionability_version="v1",
+    )
+    await _insert_trade(
+        db._conn,
+        "open-exp",
+        "OEXP",
+        "losers_contrarian",
+        "open",
+        actionable=0,
+        actionability_reason="v1_block_losers_contrarian_exploratory",
+        actionability_version="v1",
+    )
+    await _insert_trade(
+        db._conn,
+        "closed-act-win",
+        "CAW",
+        "chain_completed",
+        "closed_tp",
+        pnl_usd=100.0,
+        pnl_pct=10.0,
+        actionable=1,
+        actionability_reason="v1_pass_core_signal_mcap_50m_plus",
+        actionability_version="v1",
+    )
+    await _insert_trade(
+        db._conn,
+        "closed-act-loss",
+        "CAL",
+        "volume_spike",
+        "closed_sl",
+        pnl_usd=-40.0,
+        pnl_pct=-4.0,
+        actionable=1,
+        actionability_reason="v1_pass_core_signal_mcap_10_50m",
+        actionability_version="v1",
+    )
+    await _insert_trade(
+        db._conn,
+        "closed-exp-win",
+        "CEW",
+        "gainers_early",
+        "closed_tp",
+        pnl_usd=75.0,
+        pnl_pct=7.5,
+        actionable=0,
+        actionability_reason="v1_block_gainers_early_mcap_5_10m",
+        actionability_version="v1",
+    )
+    await _insert_trade(
+        db._conn,
+        "closed-unknown",
+        "CUN",
+        "volume_spike",
+        "closed_tp",
+        pnl_usd=10.0,
+        pnl_pct=1.0,
+        actionable=None,
+        actionability_reason=None,
+        actionability_version=None,
+    )
+
+    resp = await c.get("/api/trading/actionability?days=7")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["window_days"] == 7
+    assert data["open_counts"] == {
+        "actionable": 1,
+        "exploratory": 1,
+        "unknown": 0,
+        "total": 2,
+    }
+
+    closed = {row["state"]: row for row in data["closed_cohorts"]}
+    assert closed["actionable"]["trades"] == 2
+    assert closed["actionable"]["wins"] == 1
+    assert closed["actionable"]["total_pnl_usd"] == 60.0
+    assert closed["actionable"]["win_rate_pct"] == 50.0
+    assert closed["exploratory"]["trades"] == 1
+    assert closed["exploratory"]["total_pnl_usd"] == 75.0
+    assert closed["unknown"]["trades"] == 1
+
+    reasons = {row["reason"]: row for row in data["top_reasons"]}
+    assert reasons["v1_pass_core_signal_mcap_10_50m"]["trades"] == 2
+    assert reasons["v1_block_gainers_early_mcap_5_10m"]["closed_pnl_usd"] == 75.0
 
 
 async def test_stats_by_signal_cohort_excludes_non_stackable(client):

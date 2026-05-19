@@ -67,6 +67,25 @@ Review:
 - Worst current-regime signal types/cells: `losers_contrarian` (-$803.22 / n=146), `gainers_early` (-$382.93 / n=252), `gainers_early + mcap:5-10m` (-$701.77 / n=49), `gainers_early + confluence:3` (-$468.14 / n=37).
 - Data gaps: X handle and liquidity are not rankable from closed trade outcomes; X alerts have 215 rows but 0 priced outcomes due unresolved `resolved_coin_id`; TG channel has only 2 current-regime closed linked trades.
 
+## Active Work: BL-NEW-ACTIONABILITY-VISIBILITY-VALIDATION
+
+- [x] Isolated worktree created: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-actionability-visibility-validation` on `codex/actionability-visibility-validation`.
+- [x] Baseline relevant suite: `42 passed`.
+- [x] PR #181 deployed to srilu-vps: `/root/gecko-alpha` fast-forwarded `ec4f35c` -> `7506adc`; `gecko-pipeline` and `gecko-dashboard` active.
+- [x] DB migration verified on srilu-vps: `paper_trades.actionable`, `actionability_reason`, and `actionability_version` present; marker `bl_new_actionability_gate_v1` cut over at `2026-05-19T11:39:09.121422+00:00`.
+- [ ] Fresh post-deploy paper-trade row stamp verified.
+- [x] Plan drafted: `tasks/plan_actionability_visibility_validation.md`.
+- [x] TDD backend dashboard API support complete.
+- [ ] Dashboard UI support complete.
+- [ ] Validation runbook complete.
+- [ ] Verification complete.
+
+Review:
+- Fresh-row verification is not an implementation blocker: immediately after deploy, `COUNT(*) FROM paper_trades WHERE opened_at >= '2026-05-19T11:37:26+00:00'` returned `0`.
+- Backend red/green: 4 new tests failed before implementation, then passed after adding row fields, history filter/count semantics, and `/api/trading/actionability`.
+- Full dashboard API test file after backend slice: `24 passed`.
+- Scope remains visibility + validation only. Do not suppress exploratory paper trades or change live/capital allocation in this slice.
+
 ## Active Work: BL-NEW-ACTIONABILITY-GATE-V1
 
 - [x] Isolated worktree created: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-actionability-gate-v1` on `codex/actionability-gate-v1`
