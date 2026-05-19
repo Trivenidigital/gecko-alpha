@@ -402,6 +402,58 @@ async def test_open_trade_with_entry_price_skips_cache(engine, db):
     assert row[0] == pytest.approx(0.0042, rel=0.01)
 
 
+async def test_open_trade_stamps_non_actionable_but_still_opens(engine, db):
+    trade_id = await engine.open_trade(
+        token_id="loser-probe",
+        symbol="LP",
+        name="LoserProbe",
+        chain="coingecko",
+        signal_type="losers_contrarian",
+        signal_data={"mcap": 20_000_000},
+        entry_price=1.0,
+        signal_combo="losers_contrarian",
+    )
+    assert trade_id is not None
+    cursor = await db._conn.execute(
+        "SELECT actionable, actionability_reason, actionability_version "
+        "FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    row = await cursor.fetchone()
+    assert row["actionable"] == 0
+    assert row["actionability_reason"] == "v1_block_losers_contrarian_exploratory"
+    assert row["actionability_version"] == "v1"
+
+
+async def test_open_trade_enriches_actionability_mcap_from_price_cache(engine, db):
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        "INSERT OR REPLACE INTO price_cache "
+        "(coin_id, current_price, market_cap, updated_at) VALUES (?, ?, ?, ?)",
+        ("vol-no-mcap", 1.0, 20_000_000, now),
+    )
+    await db._conn.commit()
+
+    trade_id = await engine.open_trade(
+        token_id="vol-no-mcap",
+        symbol="VNM",
+        name="VolumeNoMcap",
+        chain="coingecko",
+        signal_type="volume_spike",
+        signal_data={"spike_ratio": 12.3},
+        entry_price=1.0,
+        signal_combo="volume_spike",
+    )
+    assert trade_id is not None
+    cursor = await db._conn.execute(
+        "SELECT actionable, actionability_reason FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    row = await cursor.fetchone()
+    assert row["actionable"] == 1
+    assert row["actionability_reason"] == "v1_pass_core_signal_mcap_10_50m"
+
+
 async def test_open_trade_entry_price_zero_falls_back_to_cache(engine, db):
     """entry_price=0 is treated as missing and falls back to price_cache."""
     # No cache entry -> should be skipped

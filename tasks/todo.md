@@ -50,6 +50,66 @@ Last updated: 2026-05-19 (cycle 15: overnight drift-cleanup audit — closed 12 
 - **BL-NEW-REVIVAL-VERDICT-WATCHDOG:** PROPOSED (unchanged). Drift-check: no existing primitive in `scripts/`, `systemd/`, `cron/`, or `dashboard/` matches `keep_on_provisional_until` or `soak_verdict`. Status accurate; build correctly deferred per operator scope ("touches trading decision hygiene; build only after plan + review").
 - **BL-NEW-SOCIAL-DENOMINATOR-RE-EVAL-WATCHDOG:** PROPOSED (unchanged). Drift-check: `dashboard/db.py:1284-1319` + `dashboard/api.py:973,1013` + `dashboard/search.py:263` read `narrative_alerts_inbound` and `tg_social_messages` for display, but no watchdog primitive in `scripts/` or `cron/` covers the re-eval triggers. Status accurate; tied to operator B-vs-C decision per scope.
 - **BL-NEW-SCORER-DEAD-SIGNAL-COMMENT-CONVENTION:** PROPOSED (unchanged). Drift-check: `scout/scorer.py:121` already carries `# DEAD SIGNAL — pending BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT re-eval` and `scorer.py` has the original Signal 13 (CryptoPanic) gated-comment precedent. The convention is *in-tree by example* but not yet codified as a style-guide rule. Status accurate; defer to next scorer-touch PR per operator scope.
+## Active Work: 2026-05-19 profit-pattern segmentation
+
+- [x] Review project lessons and isolate branch for analysis
+- [x] Confirm local `scout.db` is schema-only and not usable for outcome segmentation
+- [x] Pull production outcome aggregates without modifying prod DB
+- [x] Segment profitable and junk patterns across requested dimensions
+- [x] Propose Actionability Gate v1, dashboard fields, and paper-trade rule changes
+- [x] Record final verification/results here
+
+Review:
+- Findings written to `tasks/findings_profit_patterns_2026_05_19.md`.
+- Prod analysis used read-only SQLite access through `/tmp/analyze_profit_patterns.py`; no production DB writes.
+- Primary cohort: 531 current-regime closed trades since `2026-05-01 14:06:00`, +$1,545.85 net, +$2.91/trade, 58.8% win.
+- Best current-regime signal types: `narrative_prediction` (+$1,294.96 / n=78), `chain_completed` (+$1,123.15 / n=16), `volume_spike` (+$593.88 / n=28).
+- Worst current-regime signal types/cells: `losers_contrarian` (-$803.22 / n=146), `gainers_early` (-$382.93 / n=252), `gainers_early + mcap:5-10m` (-$701.77 / n=49), `gainers_early + confluence:3` (-$468.14 / n=37).
+- Data gaps: X handle and liquidity are not rankable from closed trade outcomes; X alerts have 215 rows but 0 priced outcomes due unresolved `resolved_coin_id`; TG channel has only 2 current-regime closed linked trades.
+
+## Active Work: BL-NEW-ACTIONABILITY-GATE-V1
+
+- [x] Isolated worktree created: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-actionability-gate-v1` on `codex/actionability-gate-v1`
+- [x] Audit artifacts cherry-picked from `3fb6084`
+- [x] Baseline relevant suite via shared venv: `51 passed, 1 skipped, 1 warning`
+- [x] Drift check: existing `would_be_live` is live-slot eligibility, not actionability
+- [x] Hermes-first check: no actionability-gate primitive; reuse Hermes X/KOL only as raw telemetry
+- [x] Plan drafted: `tasks/plan_actionability_gate_v1.md`
+- [x] Plan reviewed by 2 parallel agents; structural BLOCK folded into revised plan
+- [x] Design drafted and reviewed by 2 parallel agents; integration findings folded
+- [x] TDD implementation complete
+- [x] PR opened and reviewed by 3 parallel agents
+
+Review:
+- Plan reviewer A (`APPROVE_WITH_CHANGES`) flagged chain-completed mcap support and gainers_early mcap ambiguity.
+- Plan reviewer B (`BLOCK`) flagged engine signal-data mismatch, nullable schema semantics, missing migration marker assertion, and insufficient engine-path tests.
+- Folded into `tasks/plan_actionability_gate_v1.md`: DB mcap enrichment, chain-completed missing-mcap exception, gainers_early `10-50m` observe block, nullable actionability columns, marker idempotence tests, and real engine-path fallback tests.
+- Design reviewers both returned `APPROVE_WITH_CHANGES`; folded volume-spike mcap carry-forward, stack-failure fail-closed metadata for `gainers_early`, non-suppressing actionability exception policy, existing-DB upgrade test, and persisted `signal_data` immutability test.
+- Implementation commits:
+  - `008b734` `feat: add actionability gate classifier`
+  - `14fa4c0` `feat: add actionability paper-trade columns`
+  - `bd3b3fe` `feat: stamp paper-trade actionability`
+- Verification:
+  - Post-rebase focused suite: `82 passed, 1 skipped, 1 warning`
+  - Post-rebase adjacent trading suite: `329 passed, 1 skipped, 1 warning`
+  - Warning is the existing `aiosqlite` event-loop-closed thread warning from `tests/test_trading_db_migration.py::test_post_migration_assertion_raises_on_incomplete_schema`.
+- Deferrals: X/TG ranking waits for outcome linkage; `peak_pct < 5` risk handling waits for a separate exit-policy design; dashboard UI deferred; live trading policy unchanged.
+- PR #181 opened: https://github.com/Trivenidigital/gecko-alpha/pull/181
+- PR review:
+  - Structural/migration reviewer: `APPROVE`, no findings; targeted `75 passed, 1 skipped, 1 warning`; full suite with dummy secrets `2455 passed, 80 skipped, 12 warnings`.
+  - Operational/silent-failure reviewer: `APPROVE`, no findings; targeted `24 passed`; full suite with `UV_NATIVE_TLS=true` + dummy secrets `2455 passed, 80 skipped, 12 warnings`.
+  - Behavioral reviewer: `APPROVE_WITH_CHANGES`; fixed invalid non-numeric mcap key skipping DB enrichment and added `tg_social` classifier coverage.
+- Post-review fix verification:
+  - Focused suite: `84 passed, 1 skipped, 1 warning`
+  - Adjacent trading suite: `331 passed, 1 skipped, 1 warning`
+- PR #181 pre-merge status: CI `test` green; merge state clean; no unresolved GitHub comments.
+- Post-merge follow-ups for next session:
+  - Deploy and verify one fresh paper-trade open has `actionable`, `actionability_reason`, and `actionability_version`.
+  - Add small dashboard/reporting pass: actionable vs exploratory counts, reasons, and table filter by actionable status.
+  - Run 24-48h post-deploy comparison: actionable cohort PnL, exploratory cohort PnL, and false negatives among exploratory winners.
+  - Do not tighten live/paper entry suppression yet; let the classifier collect evidence first.
+
+Last updated: 2026-05-18 (cycle 14: narrative-operator-alert-wire + chain-anchor status correction + Helius + Moralis plan audits + CG budget attribution + stale PR triage)
 
 ## Active Work: BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE (ENDPOINT-SHIPPED / HERMES-SKILL-PENDING)
 

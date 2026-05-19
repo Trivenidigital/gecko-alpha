@@ -65,6 +65,36 @@ async def test_paper_trader_dispatches_to_live_engine_when_allowlisted(tmp_path)
     await db.close()
 
 
+async def test_actionability_stamp_does_not_change_live_handoff(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    le = AsyncMock()
+    le.is_eligible = lambda st: True
+    pt = PaperTrader(live_engine=le)
+    trade_id = await pt.execute_buy(
+        db=db,
+        token_id="non-actionable-live-handoff",
+        symbol="NAL",
+        name="Non Actionable Live Handoff",
+        chain="coingecko",
+        signal_type="losers_contrarian",
+        signal_data={"mcap": 20_000_000},
+        current_price=1.0,
+        amount_usd=300,
+        tp_pct=20,
+        sl_pct=10,
+        signal_combo="losers_contrarian",
+        lead_time_vs_trending_min=None,
+        lead_time_vs_trending_status=None,
+    )
+    await asyncio.sleep(0)
+    assert trade_id is not None
+    le.on_paper_trade_opened.assert_called_once()
+    handoff = le.on_paper_trade_opened.call_args.args[0]
+    assert handoff.id == trade_id
+    await db.close()
+
+
 async def test_paper_trader_skips_dispatch_when_not_eligible(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()

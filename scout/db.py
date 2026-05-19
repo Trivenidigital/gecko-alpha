@@ -817,6 +817,9 @@ class Database:
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
 
                 would_be_live INTEGER,
+                actionable INTEGER,
+                actionability_reason TEXT,
+                actionability_version TEXT,
 
                 UNIQUE(token_id, signal_type, opened_at)
             );
@@ -1091,6 +1094,9 @@ class Database:
                 "lead_time_vs_trending_min": "REAL",
                 "lead_time_vs_trending_status": "TEXT",
                 "would_be_live": "INTEGER",
+                "actionable": "INTEGER",
+                "actionability_reason": "TEXT",
+                "actionability_version": "TEXT",
                 # BL-061 ladder state
                 "leg_1_filled_at": "TEXT",
                 "leg_1_exit_price": "REAL",
@@ -1386,6 +1392,14 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_paper_trades_would_be_live_status "
                 "ON paper_trades(would_be_live, status)"
             )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (
+                    "bl_new_actionability_gate_v1",
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
 
             # POST-ASSERTION — run BEFORE commit so a failure triggers ROLLBACK
             # (per D18: partial schema must not persist on assertion failure).
@@ -1404,7 +1418,8 @@ class Database:
                 "'bl064_tg_social', 'bl064_safety_required_per_channel', "
                 "'bl071b_unstamp_expired_narrative', "
                 "'bl071a_chain_matches_mcap_at_completion', "
-                "'bl065_cashtag_trade_eligible')"
+                "'bl065_cashtag_trade_eligible', "
+                "'bl_new_actionability_gate_v1')"
             )
             recorded = {row[0] for row in await cur.fetchall()}
             missing_migrations = {
@@ -1416,6 +1431,7 @@ class Database:
                 "bl071b_unstamp_expired_narrative",
                 "bl071a_chain_matches_mcap_at_completion",
                 "bl065_cashtag_trade_eligible",
+                "bl_new_actionability_gate_v1",
             } - recorded
             if missing_migrations:
                 raise RuntimeError(

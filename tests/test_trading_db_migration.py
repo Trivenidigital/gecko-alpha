@@ -351,6 +351,132 @@ async def test_initialize_upgrades_pre_bl060_db(tmp_path):
     await db.close()
 
 
+async def test_migration_adds_actionability_columns(tmp_path):
+    db = Database(tmp_path / "actionability.db")
+    await db.initialize()
+    cur = await db._conn.execute("PRAGMA table_info(paper_trades)")
+    cols = {row[1]: row for row in await cur.fetchall()}
+    assert "actionable" in cols
+    assert "actionability_reason" in cols
+    assert "actionability_version" in cols
+    assert cols["actionable"][2] == "INTEGER"
+    assert cols["actionable"][3] == 0
+    assert cols["actionable"][4] is None
+    await db.close()
+
+
+async def test_migration_records_actionability_marker(tmp_path):
+    db = Database(tmp_path / "actionability_marker.db")
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT cutover_ts FROM paper_migrations WHERE name=?",
+        ("bl_new_actionability_gate_v1",),
+    )
+    assert await cur.fetchone() is not None
+    await db.close()
+
+
+async def test_actionability_marker_timestamp_preserved_on_reinitialize(tmp_path):
+    db_path = tmp_path / "actionability_marker_idempotent.db"
+    db = Database(db_path)
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT cutover_ts FROM paper_migrations WHERE name=?",
+        ("bl_new_actionability_gate_v1",),
+    )
+    first = (await cur.fetchone())[0]
+    await db.close()
+
+    db2 = Database(db_path)
+    await db2.initialize()
+    cur = await db2._conn.execute(
+        "SELECT cutover_ts FROM paper_migrations WHERE name=?",
+        ("bl_new_actionability_gate_v1",),
+    )
+    second = (await cur.fetchone())[0]
+    assert second == first
+    await db2.close()
+
+
+async def test_actionability_columns_preserve_pre_cutover_nulls(tmp_path):
+    db = Database(tmp_path / "actionability_precutover.db")
+    await db.initialize()
+    await db._conn.execute(
+        "INSERT INTO paper_trades "
+        "(token_id, symbol, name, chain, signal_type, signal_data, "
+        "entry_price, amount_usd, quantity, tp_pct, sl_pct, "
+        "tp_price, sl_price, status, opened_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "legacy",
+            "LEG",
+            "Legacy",
+            "coingecko",
+            "gainers_early",
+            "{}",
+            1.0,
+            300.0,
+            300.0,
+            20.0,
+            10.0,
+            1.2,
+            0.9,
+            "open",
+            "2026-05-01T00:00:00+00:00",
+        ),
+    )
+    await db._conn.commit()
+    cur = await db._conn.execute(
+        "SELECT actionable, actionability_reason, actionability_version "
+        "FROM paper_trades WHERE token_id='legacy'"
+    )
+    row = await cur.fetchone()
+    assert row[0] is None
+    assert row[1] is None
+    assert row[2] is None
+    await db.close()
+
+
+async def test_initialize_upgrades_pre_actionability_db(tmp_path):
+    db_path = tmp_path / "pre_actionability.db"
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.executescript("""
+            CREATE TABLE paper_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                chain TEXT NOT NULL,
+                signal_type TEXT NOT NULL,
+                signal_data TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                amount_usd REAL NOT NULL,
+                quantity REAL NOT NULL,
+                tp_pct REAL NOT NULL DEFAULT 20.0,
+                sl_pct REAL NOT NULL DEFAULT 10.0,
+                tp_price REAL NOT NULL,
+                sl_price REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                opened_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                would_be_live INTEGER
+            );
+        """)
+        await conn.commit()
+
+    db = Database(db_path)
+    await db.initialize()
+    cur = await db._conn.execute("PRAGMA table_info(paper_trades)")
+    cols = {row[1] for row in await cur.fetchall()}
+    assert {"actionable", "actionability_reason", "actionability_version"} <= cols
+    cur = await db._conn.execute(
+        "SELECT 1 FROM paper_migrations WHERE name=?",
+        ("bl_new_actionability_gate_v1",),
+    )
+    assert await cur.fetchone() is not None
+    await db.close()
+
+
 # ---------------------------------------------------------------------------
 # BL-061: ladder state columns + paper_migrations cutover table
 # ---------------------------------------------------------------------------
