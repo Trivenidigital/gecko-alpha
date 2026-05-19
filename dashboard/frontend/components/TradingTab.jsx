@@ -10,6 +10,13 @@ import {
   formatActionabilityReason,
   reasonWhy,
 } from './actionability.js'
+import {
+  TRADER_BUCKETS,
+  computeTraderBuckets,
+  filterPositionsByBucket,
+  bucketToneColor,
+  bucketToneBg,
+} from './traderQueue.js'
 
 const CLOSED_PER_PAGE = 20  // closed-trades pagination size
 
@@ -246,6 +253,130 @@ const STRONG_PATTERN_PNL_FLOOR = 200
 // finding: the surface displays accurate data, the natural inference is wrong.
 const WRITER_DEPLOY_ISO = '2026-05-11T13:22:00Z'
 const WARMING_WINDOW_DAYS = 14
+
+// TraderActionQueue — top-of-Trading-tab panel surfacing the rows the
+// trader should look at first. Read-only client-side partition over the
+// existing /api/trading/positions payload. Buckets defined in
+// dashboard/frontend/components/traderQueue.js. Each bucket card is
+// clickable; click sets `activeBucket` and the Open Positions table
+// filters to the bucket's predicate.
+//
+// BL-NEW-DASHBOARD-TRADER-ACTION-QUEUE.
+function TraderActionQueue({ positions, activeBucket, onBucketClick }) {
+  if (!Array.isArray(positions) || positions.length === 0) return null
+  const buckets = computeTraderBuckets(positions)
+  // Hide buckets with zero matches so the panel doesn't get noisy on a
+  // quiet day. Always show at least one card so the section header is
+  // never orphaned.
+  const nonEmpty = buckets.filter((b) => b.count > 0)
+  if (nonEmpty.length === 0) return null
+
+  return (
+    <div className="panel" style={{ marginBottom: 16 }} data-testid="trader-action-queue">
+      <div
+        className="panel-header"
+        style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}
+      >
+        <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
+          Trader Action Queue
+        </span>
+        <span
+          style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}
+          title="Read-only summary of which open positions need attention. Click a card to filter Open Positions to that bucket. Bucket thresholds (near-stop margin, winner-forming pp, oldest-position floor) are presentation-only — they do NOT change trade behavior."
+        >
+          What to inspect right now · click to drill
+        </span>
+        <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--color-text-secondary)' }}>
+          {positions.length} open
+        </span>
+      </div>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+          gap: 10,
+        }}
+      >
+        {nonEmpty.map(({ key, def, count, top }) => {
+          const isActive = activeBucket === key
+          const color = bucketToneColor(def.tone)
+          const bg = bucketToneBg(def.tone, isActive)
+          return (
+            <div
+              key={key}
+              role="button"
+              tabIndex={0}
+              aria-pressed={isActive}
+              data-testid={`trader-bucket-${key}`}
+              onClick={() => onBucketClick(key)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  onBucketClick(key)
+                }
+              }}
+              title={
+                `${def.label}: ${def.sublabel}` +
+                (top.length
+                  ? `\n${top.map((p) => getTokenLabel(p)).join(', ')}`
+                  : '')
+              }
+              style={{
+                padding: '10px 12px',
+                border: isActive ? `2px solid ${color}` : '1px solid var(--color-border)',
+                borderRadius: 4,
+                background: bg,
+                cursor: 'pointer',
+                transition: 'border-color 80ms, background 80ms',
+              }}
+            >
+              <div
+                style={{
+                  fontSize: 10,
+                  color: 'var(--color-text-secondary)',
+                  textTransform: 'uppercase',
+                  letterSpacing: 0.5,
+                  marginBottom: 4,
+                  display: 'flex',
+                  gap: 6,
+                  alignItems: 'center',
+                }}
+              >
+                <span>{def.label}</span>
+                {isActive ? <span style={{ color }}>✓</span> : null}
+              </div>
+              <div style={{ fontSize: 22, fontWeight: 700, color }}>{count}</div>
+              <div
+                style={{
+                  fontSize: 10,
+                  color: 'var(--color-text-secondary)',
+                  marginTop: 2,
+                  fontStyle: 'italic',
+                }}
+              >
+                {def.sublabel}
+              </div>
+              {top.length > 0 && (
+                <div
+                  style={{
+                    fontSize: 11,
+                    color: 'var(--color-text-primary)',
+                    marginTop: 6,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {top.map((p) => getTokenLabel(p)).join(' · ')}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
 
 function ActionabilitySummaryPanel({
   summary,
@@ -751,6 +882,11 @@ export default function TradingTab() {
   // Clicking the same target again toggles the filter off.
   const [openCohortFilter, setOpenCohortFilter] = useState('all') // all | actionable | exploratory | unknown
   const [openReasonFilter, setOpenReasonFilter] = useState(null)
+  // Trader Action Queue bucket filter (BL-NEW-DASHBOARD-TRADER-ACTION-QUEUE).
+  // Mutually exclusive with the cohort/reason filters — picking a bucket
+  // clears cohort+reason, and vice versa. This keeps the drilldown chip
+  // unambiguous and prevents accidental empty intersections.
+  const [openBucketFilter, setOpenBucketFilter] = useState(null)
   const [positions, setPositions] = useState([])
   const [history, setHistory] = useState([])
   const [closedPage, setClosedPageState] = useState(_readStoredPage)
@@ -874,29 +1010,51 @@ export default function TradingTab() {
   //     → filteredPositions (apply live-eligible toggle as the last gate)
   // Each stage runs only when the corresponding filter is active so the
   // default 'all' view is exactly the pre-drilldown behavior.
+  // Bucket filter is the highest-priority drilldown — when active it
+  // takes the cohort + reason filter slots over. The Trader Action Queue
+  // panel's bucket cards are mutually exclusive with the cohort cards;
+  // picking a bucket clears cohort+reason and vice versa.
+  // filterPositionsByBucket respects each bucket's `cap` field so
+  // "magnitude" buckets (largest losses, oldest open) yield the top-N
+  // rather than the full predicate-match set. Per reviewer fold
+  // 2026-05-19: previously the 'Largest open losses' bucket filtered
+  // 138 → 121 (87% of the book), which is not a useful trader-action
+  // surface. With the cap, the same click now filters 138 → 5.
+  const bucketFilteredPositions = openBucketFilter
+    ? filterPositionsByBucket(positions, openBucketFilter)
+    : positions
   const cohortFilteredPositions = openCohortFilter === 'all'
-    ? positions
-    : positions.filter((p) => actionabilityState(p.actionable) === openCohortFilter)
+    ? bucketFilteredPositions
+    : bucketFilteredPositions.filter((p) => actionabilityState(p.actionable) === openCohortFilter)
   const reasonFilteredPositions = openReasonFilter
     ? cohortFilteredPositions.filter((p) => p.actionability_reason === openReasonFilter)
     : cohortFilteredPositions
   const filteredPositions = showOnlyEligibleOpen
     ? reasonFilteredPositions.filter((p) => p.would_be_live === 1)
     : reasonFilteredPositions
-  const drilldownActive = openCohortFilter !== 'all' || openReasonFilter != null
+  const drilldownActive =
+    openCohortFilter !== 'all' || openReasonFilter != null || openBucketFilter != null
   const clearDrilldown = useCallback(() => {
     setOpenCohortFilter('all')
     setOpenReasonFilter(null)
+    setOpenBucketFilter(null)
   }, [])
   const handleCohortClick = useCallback((state) => {
     // Toggle: clicking the active cohort clears the filter.
     setOpenCohortFilter((prev) => (prev === state ? 'all' : state))
-    // Reason filter is cohort-scoped — switching cohorts clears it so
-    // the user doesn't end up with an empty intersection by accident.
     setOpenReasonFilter(null)
+    // Switching to a cohort exits any bucket selection so the chip is
+    // unambiguous.
+    setOpenBucketFilter(null)
   }, [])
   const handleReasonClick = useCallback((reason) => {
     setOpenReasonFilter((prev) => (prev === reason ? null : reason))
+    setOpenBucketFilter(null)
+  }, [])
+  const handleBucketClick = useCallback((key) => {
+    setOpenBucketFilter((prev) => (prev === key ? null : key))
+    setOpenCohortFilter('all')
+    setOpenReasonFilter(null)
   }, [])
   const sortedPositions = [...filteredPositions].sort((a, b) => {
     let va, vb
@@ -1011,6 +1169,11 @@ export default function TradingTab() {
       </div>
 
       {/* Section 2: PnL by Signal Type — cohort-toggle view (BL-NEW-LIVE-ELIGIBLE follow-up) */}
+      <TraderActionQueue
+        positions={positions}
+        activeBucket={openBucketFilter}
+        onBucketClick={handleBucketClick}
+      />
       <ActionabilitySummaryPanel
         summary={actionabilitySummary}
         activeCohort={openCohortFilter}
@@ -1075,6 +1238,16 @@ export default function TradingTab() {
             <span style={{ color: 'var(--color-text-secondary)', fontWeight: 600 }}>
               Drilldown:
             </span>
+            {openBucketFilter && (
+              <span
+                style={{
+                  color: bucketToneColor(TRADER_BUCKETS[openBucketFilter]?.tone),
+                  fontWeight: 700,
+                }}
+              >
+                bucket: {TRADER_BUCKETS[openBucketFilter]?.label ?? openBucketFilter}
+              </span>
+            )}
             {openCohortFilter !== 'all' && (
               <span style={{ color: cohortColor(openCohortFilter), fontWeight: 700 }}>
                 {cohortLabel(openCohortFilter)} ({openCohortFilter})
