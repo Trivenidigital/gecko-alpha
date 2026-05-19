@@ -13,6 +13,7 @@ import {
 import {
   TRADER_BUCKETS,
   computeTraderBuckets,
+  filterPositionsByBucket,
   bucketToneColor,
   bucketToneBg,
 } from './traderQueue.js'
@@ -1013,8 +1014,14 @@ export default function TradingTab() {
   // takes the cohort + reason filter slots over. The Trader Action Queue
   // panel's bucket cards are mutually exclusive with the cohort cards;
   // picking a bucket clears cohort+reason and vice versa.
+  // filterPositionsByBucket respects each bucket's `cap` field so
+  // "magnitude" buckets (largest losses, oldest open) yield the top-N
+  // rather than the full predicate-match set. Per reviewer fold
+  // 2026-05-19: previously the 'Largest open losses' bucket filtered
+  // 138 → 121 (87% of the book), which is not a useful trader-action
+  // surface. With the cap, the same click now filters 138 → 5.
   const bucketFilteredPositions = openBucketFilter
-    ? positions.filter(TRADER_BUCKETS[openBucketFilter]?.predicate ?? (() => true))
+    ? filterPositionsByBucket(positions, openBucketFilter)
     : positions
   const cohortFilteredPositions = openCohortFilter === 'all'
     ? bucketFilteredPositions

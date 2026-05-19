@@ -13,6 +13,12 @@
 //   - predicate:   row → bool; rows for which this bucket applies
 //   - sort:        optional comparator for the preview list
 //   - topN:        preview size (default 3)
+//   - cap:         if set, BOTH the card count AND the bucket-filter
+//                  result are limited to the top-N after sort. Used
+//                  for "magnitude" buckets where the predicate alone
+//                  is too broad (e.g., "negative PnL" matches the
+//                  majority of open positions, but a trader wants the
+//                  N worst, not all of them).
 //
 // All thresholds are presentation-only defaults. They do NOT change
 // trade behavior, exits, scoring, or actionability classification.
@@ -80,12 +86,20 @@ export const TRADER_BUCKETS = {
   },
   largest_open_losses: {
     label: 'Largest open losses',
-    sublabel: 'sorted by realized + unrealized PnL',
+    sublabel: 'top 5 worst by realized + unrealized PnL',
     tone: 'risk',
+    // Predicate is broad ("any negative PnL") because the bucket-
+    // defining property is the magnitude, not the negativity. With
+    // `cap: 5` the bucket card AND the bucket-filter result are both
+    // limited to the 5 most-negative positions. This is what a
+    // trader actually wants from a "Largest open losses" surface;
+    // the un-capped 121-of-138 set is just "the book minus the few
+    // winners" and isn't useful for prioritization.
     predicate: (p) =>
       p.total_pnl_usd != null && Number(p.total_pnl_usd) < 0,
     sort: (a, b) => Number(a.total_pnl_usd ?? 0) - Number(b.total_pnl_usd ?? 0),
     topN: 5,
+    cap: 5,
   },
   no_current_price: {
     label: 'No current price',
@@ -96,8 +110,11 @@ export const TRADER_BUCKETS = {
   },
   oldest_open: {
     label: 'Oldest open positions',
-    sublabel: `older than ${OLD_POSITION_DAYS}d still open`,
+    sublabel: `top 5 oldest (≥ ${OLD_POSITION_DAYS}d old)`,
     tone: 'neutral',
+    // 14d threshold + cap at 5 — without the cap a long-running book
+    // could show dozens of "old" rows; the trader wants the five
+    // most-stale to triage first.
     predicate: (p) => {
       if (!p.opened_at) return false
       const opened = Date.parse(p.opened_at)
@@ -106,6 +123,7 @@ export const TRADER_BUCKETS = {
       return ageMs >= OLD_POSITION_DAYS * 24 * 60 * 60 * 1000
     },
     sort: (a, b) => (a.opened_at || '').localeCompare(b.opened_at || ''),
+    cap: 5,
   },
   unknown_unstamped: {
     label: 'Unknown / unstamped',
@@ -132,9 +150,28 @@ export function computeTraderBuckets(positions) {
     const def = TRADER_BUCKETS[key]
     const matched = positions.filter(def.predicate)
     const sorted = def.sort ? matched.slice().sort(def.sort) : matched
-    const top = sorted.slice(0, def.topN ?? 3)
-    return { key, def, count: matched.length, top }
+    // If `cap` is set, the bucket's "size" is the capped subset, not
+    // the raw predicate-match count. This matches the bucket-filter
+    // semantic in TradingTab: cap applies to BOTH the card count and
+    // the filtered Open Positions table. Without this, the count on
+    // the card lied (showed N total matches) even though the filter
+    // surfaced only the top-N.
+    const capped = def.cap != null ? sorted.slice(0, def.cap) : sorted
+    const top = capped.slice(0, def.topN ?? 3)
+    return { key, def, count: capped.length, top }
   })
+}
+
+// Apply a bucket's filter semantic to a positions list. Used by
+// TradingTab's bucket-filter pipeline. Equivalent to
+// computeTraderBuckets()[key].cappedRows but returns the rows
+// directly. Returns the full predicate-match set when no cap is set.
+export function filterPositionsByBucket(positions, key) {
+  const def = TRADER_BUCKETS[key]
+  if (!def) return positions
+  const matched = positions.filter(def.predicate)
+  const sorted = def.sort ? matched.slice().sort(def.sort) : matched
+  return def.cap != null ? sorted.slice(0, def.cap) : sorted
 }
 
 export function bucketToneColor(tone) {
