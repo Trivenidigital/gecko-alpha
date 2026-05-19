@@ -1566,12 +1566,9 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                 return []
 
         # Per-request memoization caches. Many X alerts share the same
-        # `extracted_ca` / `extracted_cashtag` (multiple tweets about the
-        # same token). Without these caches the endpoint ran 80 × 11 ≈
-        # 880 sequential sqlite queries and timed out at >12s for limit=80
-        # (verified 2026-05-19). With caches the dominant cost reduces
-        # to ~unique-tokens × 11, typically halving the wall time.
-        ca_chain_cache: dict[tuple[str, str], tuple[str | None, str]] = {}
+        # `extracted_cashtag` (multiple tweets about the same token).
+        # Without these caches the endpoint ran 80 × N sequential sqlite
+        # queries and timed out at >12s for limit=80 (verified 2026-05-19).
         symbol_cache: dict[str, tuple[str | None, str]] = {}
         current_price_cache: dict[str, float | None] = {}
 
@@ -1580,40 +1577,22 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
             if resolved:
                 return resolved, "resolved_coin_id"
 
-            ca = row["extracted_ca"]
-            chain = row["extracted_chain"]
-            if ca and chain:
-                ca_key = (ca.lower(), chain)
-                if ca_key in ca_chain_cache:
-                    cached = ca_chain_cache[ca_key]
-                    # `None` sentinel = the CA didn't match candidates;
-                    # caller should fall through to the cashtag path.
-                    if cached is not None:
-                        return cached
-                else:
-                    matches = await _safe_fetchall(
-                        """SELECT DISTINCT coingecko_id AS coin_id
-                           FROM candidates
-                           WHERE LOWER(contract_address) = LOWER(?)
-                             AND chain = ?
-                             AND COALESCE(coingecko_id, '') != ''""",
-                        (ca, chain),
-                    )
-                    coin_ids = sorted({r["coin_id"] for r in matches if r["coin_id"]})
-                    if len(coin_ids) == 1:
-                        result = (coin_ids[0], "contract_match")
-                    elif len(coin_ids) > 1:
-                        result = (None, "ambiguous_contract")
-                    else:
-                        result = None  # fall through to symbol path
-                    # Cache every outcome including the None
-                    # fall-through and the ambiguous_contract sentinel.
-                    # Reviewer R2 important fold: N rows sharing the same
-                    # not-yet-ingested CA were running N redundant
-                    # `candidates` scans on the dominant slow path.
-                    ca_chain_cache[ca_key] = result
-                    if result is not None:
-                        return result
+            # Contract-match path removed 2026-05-19 per
+            # BL-NEW-DASHBOARD-X-ALERTS-RESOLVER-SCHEMA-ALIGN.
+            # The previous branch queried `candidates.coingecko_id`, but
+            # that column has never existed on the `candidates` table
+            # (verified via PRAGMA table_info(candidates) on prod and via
+            # the schema definition in scout/db.py CREATE TABLE
+            # candidates — no ALTER ever added it). _safe_fetchall
+            # silently caught the OperationalError on every request and
+            # emitted `dashboard_x_alerts_outcome_source_unavailable`
+            # log spam. All rows fell through to the cashtag / symbol
+            # path anyway. Removing the dead branch is honest about the
+            # current behavior; if a future fix wants contract→coin_id
+            # resolution it must either (a) add the column to candidates
+            # with a population path, or (b) use `second_wave_candidates`
+            # which does carry coingecko_id (narrow population semantic).
+            # See BL-NEW-DASHBOARD-X-ALERTS-RESOLVER-SCHEMA-ALIGN.
 
             cashtag = row["extracted_cashtag"]
             symbol = (cashtag or "").strip().lstrip("$").upper()
