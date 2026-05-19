@@ -1829,3 +1829,49 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 **Why:** Global thresholds (n≥100, Wilson LB ≥55%, etc.) may be too strict/lenient for specific signal classes. chain_completed at n=12 with +$108/trade × 83% win is a strong signal but the n=100 floor blocks evaluation for ~205 days at current fire rate. If operator concludes the floor is structurally too high for low-fire-rate / high-EV signal classes, a per-signal override mechanism unblocks the evaluator without weakening the floor for noisy signals.
 **Action:** ~4-6h. Add `signal_revival_criteria_overrides` table (signal_type, key, value); evaluator consults overrides first, falls back to Settings defaults. CLI flag `--show-overrides` for transparency.
 **Decision-by:** Conditional — file only when operator has observed a specific case where global thresholds are demonstrably inappropriate. May never fire.
+
+### BL-NEW-ACTIONABILITY-GATE-V1-IMPLEMENT: paper-trade actionable/exploratory split + signal×mcap allowlist
+**Status:** PROPOSED 2026-05-19 — surfaced by operator's profit-pattern audit (commit `3fb6084` on `analysis/profit-pattern-combos-2026-05-19`); findings doc at `tasks/findings_profit_patterns_2026_05_19.md` (not yet on master — referenced via that branch). Operator direction post-PR-#179: "Next real work should return to Actionability Gate v1 from the profit-pattern audit, not more cleanup."
+**Tag:** `paper-trading` `actionability` `entry-gate` `exit-overlay` `schema-change` `live-readiness`
+**Why:** Current paper-trade dispatch is "all dispatched signals go in." Profit-pattern audit (n=531 closed trades since 2026-05-01 14:06Z) shows aggregate result is positive (+$1,545.85 net, +$2.91/trade, 58.8% win), but profitability concentrates in 3 signal types × specific market-cap buckets, with junk dragging the bottom. Live-readiness requires distinguishing "actionable cohort" from "exploratory cohort" so live-eligible decisions read the clean subset. Compose with existing `would_be_live` machinery (BL-060, `scout/trading/live_eligibility.py`) which already implements an event-driven Tier 1/2 subset — Actionability Gate v1 is a *finer* gate inside the would_be_live boundary, not a replacement.
+
+**Drift verdict (pre-plan):** existing `would_be_live` boolean on `paper_trades` (`scout/db.py:819`) partially overlaps but is signal-class-only, not signal × mcap-bucket × exit-state. NET-NEW for the cross-product gate.
+
+**Hermes-first (pre-plan):** none of the audited Hermes skill surfaces (catalog / installed VPS skills / awesome-hermes-agent / blockchain optional-skills) cover decision-gating against gecko-alpha's own scout.db paper-trade history. Build in-tree.
+
+**Proposed primitives (from findings doc §"Actionability Gate v1"):**
+
+1. **5-rule entry gate**:
+   - Allow `narrative_prediction` / `chain_completed` / `volume_spike` by default.
+   - Require usable mcap at entry. Strong bucket: `10-50m`. Watch: `>50m`. Block / exploratory-only: unknown / `<1m` / `5-10m` unless signal-specific exception.
+   - Signal-specific exceptions: `gainers_early` block `mcap:5-10m` + `confluence:3`, only `10-50m+` actionable; `losers_contrarian` block `10-50m` and `>50m`; `trending_catch` exploratory-only n<20; `tg_social` exploratory-only per-channel n<20.
+   - Do NOT use raw source confluence as a positive gate.
+   - Exit overlay: peak_pct<5% → close/cut; peak unknown → telemetry-broken; tune trails toward giveback ≤15pp.
+
+2. **5 paper-trade rule changes:**
+   - Split paper trades into `actionable=true/false`; only actionable cohort feeds live-readiness.
+   - Add `actionability_reason` JSON/list for audit.
+   - Persist segmentation fields at trade-open: `mcap_at_entry`, `mcap_bucket`, `liquidity_at_entry`, `liquidity_bucket`, `token_age_days`, `freshness_minutes` etc.
+   - Add `peak_stale` / `peak_unknown_exit` rule (unknown peak is a loss bucket, not neutral).
+   - Continue X/TG data collection but do NOT rank by profitability until outcome linkage fixes (`x_handle` is `unknown` on all 531 trades; 0 X alerts priced; only 4 TG signals linked).
+
+3. **Dashboard fields needed** (per findings doc): `signal_type`, `detected_by_combo`, `source_confluence_count`, `mcap_at_entry`, `mcap_bucket`, `liquidity_at_entry`, `liquidity_bucket`, `token_age_days`, `freshness_minutes`, `peak_pct`, `pnl_pct`, `peak_giveback_pp`, giveback bucket, `exit_reason`, X-outcome chain, TG-link chain, coverage badges per cohort.
+
+**Scope sizing:** substantial. Schema migration (1+ new column on `paper_trades` + JSON `actionability_reason` + segmentation fields) + `scout/trading/paper.py` open-time computation + evaluator/dispatch consumption + `scout/trading/cohort_digest.py` update + dashboard fields. Likely 2 PRs: (a) schema + open-time stamping + dashboard read-side; (b) live-readiness consumption + cohort_digest wiring.
+
+**Pipeline (mandatory, per project convention):** drift-check + Hermes-first → plan + 2 reviewers (orthogonal: statistical-rigor + structural) → fold → design + 2 reviewers (test-discipline + operational) → fold → TDD build → PR + 3 reviewers (code-quality + silent-failure + type/integration).
+
+**Pre-conditions:**
+- `analysis/profit-pattern-combos-2026-05-19` (commit `3fb6084`) should land on master so the findings doc + `scripts/analyze_profit_patterns.py` are reproducible from master. OR the audit must be re-run against fresh srilu data during plan-stage Task 0 baseline.
+- Re-derive findings against current srilu DB at plan-time — the original analysis is 0d old at filing but may be 1-2w old by build-time.
+
+**Risks (memory-referenced):**
+- Over-fit to one regime: findings are from 2026-05-01-2026-05-19 (18d window). Per CLAUDE.md §11, regime-stratification needed (sweep across cutover boundaries).
+- Schema migration: adds nullable columns + JSON column; pre-cutover rows = NULL per memory `feedback_mid_flight_flag_migration.md`. Index creation in migration step not `_create_tables` per memory `feedback_ddl_before_alter.md`.
+- Compose with `would_be_live`: must NOT clobber existing FCFS-20 boundary. Memory `project_two_corpus_architecture.md` is the related pattern.
+- Verdict-language hardening (cycle-15 PR-stage R3 lesson): the `actionable=true/false` flag is an event-evidenced classifier when computed from at-entry data, but downstream consumers MUST treat docs-only-derived rules as PRESUMED until SSH-verified runtime evidence confirms (per `~/.claude/projects/C--projects-gecko-alpha/memory/project_drift_cleanup_audit_2026_05_19.md`).
+
+**Decision-by:** 4 weeks (plan/design/build cycle for substantial primitive). Calendar-bound at 2026-06-16 OR earlier on next-session pickup.
+
+**Pipeline owner:** to be claimed at next-session start.
+**Memory checkpoint at filing:** `~/.claude/projects/C--projects-gecko-alpha/memory/project_drift_cleanup_audit_2026_05_19.md` documents the cycle-15 audit footprint that surfaces this entry as the next substantial item.
