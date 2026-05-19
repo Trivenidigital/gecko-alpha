@@ -133,15 +133,21 @@ export default function XAlertsTab() {
     }
   }, [])
 
-  if (error) {
-    return (
-      <div className="panel">
-        <div className="panel-header">X Alerts</div>
-        <div className="empty-state">Failed to load: {error}</div>
-      </div>
-    )
-  }
+  // If no data has ever loaded, render the empty/error state inline.
+  // If data WAS loaded previously and we're now in an error state (e.g.
+  // a single poll-cycle timeout), keep the previously-loaded table
+  // visible and render the error as a banner above it. Pre-PR a slow
+  // poll showed stale data silently; the timeout we added would have
+  // wiped the table on transient slowness — reviewer R1 important fold.
   if (!data) {
+    if (error) {
+      return (
+        <div className="panel">
+          <div className="panel-header">X Alerts</div>
+          <div className="empty-state">Failed to load: {error}</div>
+        </div>
+      )
+    }
     return (
       <div className="panel">
         <div className="panel-header">X Alerts</div>
@@ -150,11 +156,31 @@ export default function XAlertsTab() {
     )
   }
 
+  const errorBanner = error ? (
+    <div
+      className="panel"
+      style={{
+        marginBottom: 8,
+        padding: '8px 12px',
+        background: 'rgba(255, 183, 77, 0.12)',
+        color: 'var(--color-accent-amber)',
+        border: '1px solid var(--color-accent-amber)',
+        borderRadius: 4,
+        fontSize: 12,
+        fontWeight: 600,
+      }}
+      title="Latest refresh failed; table below shows the previous successful load."
+    >
+      ⚠ Latest refresh failed: {error}. Showing previous data.
+    </div>
+  ) : null
+
   const stats = data.stats_24h || {}
   const alerts = data.alerts || []
 
   return (
     <div className="x-alerts">
+      {errorBanner}
       <div className="panel">
         <div className="panel-header">X Alerts - last 24h rollup</div>
         <div className="tg-stat-row x-stat-row">

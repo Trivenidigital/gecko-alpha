@@ -1585,25 +1585,35 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
             if ca and chain:
                 ca_key = (ca.lower(), chain)
                 if ca_key in ca_chain_cache:
-                    return ca_chain_cache[ca_key]
-                matches = await _safe_fetchall(
-                    """SELECT DISTINCT coingecko_id AS coin_id
-                       FROM candidates
-                       WHERE LOWER(contract_address) = LOWER(?)
-                         AND chain = ?
-                         AND COALESCE(coingecko_id, '') != ''""",
-                    (ca, chain),
-                )
-                coin_ids = sorted({r["coin_id"] for r in matches if r["coin_id"]})
-                if len(coin_ids) == 1:
-                    result = (coin_ids[0], "contract_match")
-                elif len(coin_ids) > 1:
-                    result = (None, "ambiguous_contract")
+                    cached = ca_chain_cache[ca_key]
+                    # `None` sentinel = the CA didn't match candidates;
+                    # caller should fall through to the cashtag path.
+                    if cached is not None:
+                        return cached
                 else:
-                    result = None  # fall through to symbol path
-                if result is not None:
+                    matches = await _safe_fetchall(
+                        """SELECT DISTINCT coingecko_id AS coin_id
+                           FROM candidates
+                           WHERE LOWER(contract_address) = LOWER(?)
+                             AND chain = ?
+                             AND COALESCE(coingecko_id, '') != ''""",
+                        (ca, chain),
+                    )
+                    coin_ids = sorted({r["coin_id"] for r in matches if r["coin_id"]})
+                    if len(coin_ids) == 1:
+                        result = (coin_ids[0], "contract_match")
+                    elif len(coin_ids) > 1:
+                        result = (None, "ambiguous_contract")
+                    else:
+                        result = None  # fall through to symbol path
+                    # Cache every outcome including the None
+                    # fall-through and the ambiguous_contract sentinel.
+                    # Reviewer R2 important fold: N rows sharing the same
+                    # not-yet-ingested CA were running N redundant
+                    # `candidates` scans on the dominant slow path.
                     ca_chain_cache[ca_key] = result
-                    return result
+                    if result is not None:
+                        return result
 
             cashtag = row["extracted_cashtag"]
             symbol = (cashtag or "").strip().lstrip("$").upper()
@@ -1646,6 +1656,14 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
             return result
 
         async def _price_at_alert(coin_id: str, received_at: str) -> float | None:
+            # NOTE on `received_at` shape heterogeneity: rows ingested via
+            # the SQL DEFAULT (datetime('now')) at scout/db.py:3432
+            # arrive as '2026-05-19 12:34:56' (space-separated, no tz, no
+            # microseconds). Rows that flow through Python writers arrive
+            # as ISO-T with `+00:00` suffix and microseconds. Python's
+            # fromisoformat accepts both since 3.11; the explicit
+            # tzinfo-stamp below normalizes the naive-UTC path so the
+            # downstream isoformat() bound computation is consistent.
             def _parse_ts(value: str | None) -> datetime | None:
                 if not value:
                     return None
