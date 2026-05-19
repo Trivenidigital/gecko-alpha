@@ -342,3 +342,71 @@ async def test_x_alerts_endpoint_clamps_limit_and_handles_empty(client):
     assert body["alerts"] == []
     assert body["stats_24h"]["alerts"] == 0
     assert body["stats_24h"]["avg_confidence"] is None
+
+
+async def test_x_alerts_resolver_does_not_query_candidates_coingecko_id(
+    client, db, monkeypatch
+):
+    """Regression test for BL-NEW-DASHBOARD-X-ALERTS-RESOLVER-SCHEMA-ALIGN.
+
+    The `candidates` table on prod has no `coingecko_id` column; the old
+    resolver issued a SELECT against it, which `_safe_fetchall` caught
+    silently as `OperationalError`. Verified prod failure mode by the
+    repeated `dashboard_x_alerts_outcome_source_unavailable err=no such
+    column: coingecko_id` log line on srilu (post-PR #190 deploy).
+
+    This test (a) confirms the request succeeds against a fresh schema
+    (which is what prod looks like), and (b) asserts no SQL containing
+    `candidates` AND `coingecko_id` is executed during the request. If a
+    future change reintroduces the dead branch, this test fails.
+    """
+    import dashboard.db as ddb
+
+    c = client
+    d, _db_path = db
+
+    captured_sql: list[str] = []
+    original_execute = ddb.aiosqlite.Connection.execute
+
+    async def _spy_execute(self, sql, *args, **kwargs):
+        captured_sql.append(sql)
+        return await original_execute(self, sql, *args, **kwargs)
+
+    monkeypatch.setattr(ddb.aiosqlite.Connection, "execute", _spy_execute)
+
+    # Insert one alert that WOULD have hit the contract-match path:
+    # extracted_ca + extracted_chain are present, resolved_coin_id is NULL,
+    # extracted_cashtag is NULL. The legacy code would have queried
+    # candidates.coingecko_id; the new code skips that step entirely.
+    received_at = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    await _insert_x_alert(
+        d._conn,
+        event_id="schema-align-1",
+        tweet_author="testuser",
+        tweet_id="999000111",
+        received_at=received_at,
+        extracted_ca="0xdeadbeef",
+        extracted_chain="ethereum",
+        extracted_cashtag=None,
+        resolved_coin_id=None,
+    )
+
+    resp = await c.get("/api/x_alerts?limit=10")
+    assert resp.status_code == 200
+
+    offending = [
+        s
+        for s in captured_sql
+        if ("candidates" in s.lower() and "coingecko_id" in s.lower())
+    ]
+    assert not offending, (
+        f"resolver issued SQL referencing nonexistent candidates.coingecko_id: "
+        f"{offending}"
+    )
+
+    # Also assert the request returned the unresolved-symbol outcome for
+    # the CA-only alert (no cashtag → falls through to 'unresolved').
+    alert = next(
+        a for a in resp.json()["alerts"] if a["event_id"] == "schema-align-1"
+    )
+    assert alert["outcome_status"] in {"unresolved", "no_entry_price", "no_current_price"}
