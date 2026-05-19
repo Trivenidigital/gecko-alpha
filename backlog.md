@@ -11,15 +11,15 @@
 ## Active Findings
 
 ### BL-NEW-ACTIONABILITY-GATE
-**Status:** FINDINGS-READY 2026-05-19
+**Status:** SHIPPED 2026-05-19 — implemented by PR #181 (`7506adc`) and deployed to srilu; visibility follow-up shipped by PR #182 (`32df89d`).
 **Why:** Current paper trades mix decision-bearing and exploratory cohorts. The 2026-05-19 profit-pattern analysis found sharp separation between profitable current-regime patterns (`narrative_prediction`, `chain_completed`, `volume_spike`) and junk/exploratory patterns (`losers_contrarian`, weak `gainers_early`, low-n `trending_catch`).
 **Evidence:** `tasks/findings_profit_patterns_2026_05_19.md`
-**Decision:** Implement an explicit actionability flag for paper-trade cohorts; do not suppress raw signal collection.
+**Decision:** Complete. `paper_trades.actionable`, `actionability_reason`, and `actionability_version` now mark decision-bearing vs exploratory cohorts without suppressing raw signal collection. 24h validation remains a separate evidence gate in `tasks/runbook_actionability_validation_2026_05_19.md`.
 
 ### BL-NEW-ACTIONABILITY-GATE-V1-IMPLEMENT
-**Status:** PLANNED
+**Status:** SHIPPED 2026-05-19 — PR #181 merged `7506adc`; deployed to srilu and verified with fresh stamped rows 2206-2208. PR #182 merged/deployed `32df89d` for dashboard/API visibility.
 **Why:** Paper/live-readiness decisions need a cohort marker separate from `would_be_live`, which answers live-slot eligibility rather than audit-derived actionability.
-**Scope:** Add nullable `paper_trades.actionable`, `actionability_reason`, and `actionability_version`; stamp via a pure classifier at open time after DB-side market-cap enrichment; keep exploratory paper rows.
+**Scope:** Complete. Nullable `paper_trades.actionable`, `actionability_reason`, and `actionability_version`; pure classifier at open time after DB-side market-cap enrichment; exploratory paper rows retained. No suppression or capital allocation change shipped.
 **Plan:** `tasks/plan_actionability_gate_v1.md`
 
 ### BL-NEW-X-OUTCOME-LINKAGE
@@ -279,11 +279,11 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Decision-by:** 4 weeks from PR merge. **If not implemented by that date, audit must be re-run manually on 2026-08-17** (90d backstop is the load-bearing safety net; watchdog is the convenience layer). Per PR-review fold R3 #2 + R2 #5.
 
 ### BL-NEW-SCORER-DEAD-SIGNAL-COMMENT-CONVENTION: codify the `# DEAD SIGNAL` annotation pattern
-**Status:** PROPOSED 2026-05-17 — filed concurrent with BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT findings.
+**Status:** SHIPPED 2026-05-19 — style-guide convention codified in `docs/gecko-alpha-alignment.md` on branch `codex/scorer-dead-signal-comment-convention`.
 **Tag:** `scoring` `code-convention` `intellectual-debt-prevention`
 **Why:** Per design-review fold R2 §2: Signal 13 (CryptoPanic) at `scorer.py:184-198` has a documented gated-comment convention; Signal 5 (Social Mentions) lacked one until this audit added it. Future scorer audits will repeat this work unless the convention is codified.
-**Action:** One-line style-guide addition: "Any scorer signal that hasn't fired in the last 7d production window MUST carry a `# DEAD SIGNAL` or `# GATED — pending <BL ticket>` comment immediately above the threshold check." Bundle with next scorer.py touch.
-**Decision-by:** 8 weeks from PR merge. Calendar-bound; if no scorer.py PR by then, file standalone PR. Per PR-review fold R2 #5.
+**Action:** Complete. Alignment doc now requires dormant scorer signals to carry `# DEAD SIGNAL — pending <BL ticket>` or `# GATED — pending <BL ticket or config>` immediately above the threshold check, with ticket and re-eval trigger where known.
+**Evidence:** `docs/gecko-alpha-alignment.md` § "Scorer dormant-signal comments"; existing examples remain `scout/scorer.py` Signal 5 social mentions and Signal 13 CryptoPanic.
 
 ### BL-NEW-SOCIAL-DENOMINATOR-OPERATOR-PREFERENCE: B vs C decision for next-cycle code change
 **Status:** PROPOSED 2026-05-17 — surfaced as Open Question 1 in audit findings.
