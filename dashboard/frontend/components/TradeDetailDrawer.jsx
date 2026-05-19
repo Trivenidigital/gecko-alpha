@@ -312,24 +312,27 @@ export default function TradeDetailDrawer({ position: p, colSpan }) {
             </Row>
           </Group>
 
-          <Group title="Related mentions">
+          <Group title="Related mentions (linkage pending — placeholder)">
             <Row label="TG / X">
               <Dim>
-                Not yet joined — pending BL-NEW-DASHBOARD-TG-SOURCE-QUALITY +
+                No data joined to this position yet. Linkage pending —
+                BL-NEW-DASHBOARD-TG-SOURCE-QUALITY +
                 BL-NEW-DASHBOARD-X-SOURCE-QUALITY. The X-side schema linkage
                 also depends on PR #184.
               </Dim>
             </Row>
             <Row label="Confluence">
               <Dim>
-                Detected-by booleans live on gainers_comparisons rows, not
-                paper_trades. Pending BL-NEW-DASHBOARD-TOKEN-DEDUPE-CONFLUENCE-VIEW.
+                No data joined to this position yet. Detected-by booleans
+                live on gainers_comparisons rows, not paper_trades. Linkage
+                pending — BL-NEW-DASHBOARD-TOKEN-DEDUPE-CONFLUENCE-VIEW.
               </Dim>
             </Row>
             <Row label="Price freshness">
               <Dim>
-                price_cache.updated_at is not exposed on this endpoint;
-                fresh/stale not directly knowable from this row alone.
+                Not exposed on /api/trading/positions. price_cache.updated_at
+                would need to be added to know fresh-vs-stale from this row
+                alone.
               </Dim>
             </Row>
           </Group>
