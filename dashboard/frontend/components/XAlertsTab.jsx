@@ -86,6 +86,14 @@ function UrgencyBadge({ value }) {
   return <span className={`tg-badge ${cls}`}>{value || 'unknown'}</span>
 }
 
+// 2026-05-19: the previous default `limit=80` produced an 8s-per-row server
+// scan; the page sat in 'Loading...' indefinitely because there was no
+// client-side timeout. Cap at 30 (matches the natural panel size, two
+// scrolls of context) and abort any request that runs past 12s so the
+// UI flips to a useful error state.
+const X_ALERTS_DEFAULT_LIMIT = 30
+const X_ALERTS_FETCH_TIMEOUT_MS = 12_000
+
 export default function XAlertsTab() {
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
@@ -93,8 +101,13 @@ export default function XAlertsTab() {
   useEffect(() => {
     let cancelled = false
     async function load() {
+      const ac = new AbortController()
+      const timeoutId = setTimeout(() => ac.abort(), X_ALERTS_FETCH_TIMEOUT_MS)
       try {
-        const res = await fetch('/api/x_alerts?limit=80')
+        const res = await fetch(
+          `/api/x_alerts?limit=${X_ALERTS_DEFAULT_LIMIT}`,
+          { signal: ac.signal },
+        )
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const json = await res.json()
         if (!cancelled) {
@@ -102,7 +115,14 @@ export default function XAlertsTab() {
           setError(null)
         }
       } catch (e) {
-        if (!cancelled) setError(String(e))
+        if (cancelled) return
+        if (e?.name === 'AbortError') {
+          setError(`Request timed out after ${X_ALERTS_FETCH_TIMEOUT_MS / 1000}s — endpoint slow or unreachable`)
+        } else {
+          setError(String(e))
+        }
+      } finally {
+        clearTimeout(timeoutId)
       }
     }
     load()
