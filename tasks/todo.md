@@ -67,6 +67,32 @@ Review:
 - Worst current-regime signal types/cells: `losers_contrarian` (-$803.22 / n=146), `gainers_early` (-$382.93 / n=252), `gainers_early + mcap:5-10m` (-$701.77 / n=49), `gainers_early + confluence:3` (-$468.14 / n=37).
 - Data gaps: X handle and liquidity are not rankable from closed trade outcomes; X alerts have 215 rows but 0 priced outcomes due unresolved `resolved_coin_id`; TG channel has only 2 current-regime closed linked trades.
 
+## Active Work: BL-NEW-ACTIONABILITY-VISIBILITY-VALIDATION
+
+- [x] Isolated worktree created: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-actionability-visibility-validation` on `codex/actionability-visibility-validation`.
+- [x] Baseline relevant suite: `42 passed`.
+- [x] PR #181 deployed to srilu-vps: `/root/gecko-alpha` fast-forwarded `ec4f35c` -> `7506adc`; `gecko-pipeline` and `gecko-dashboard` active.
+- [x] DB migration verified on srilu-vps: `paper_trades.actionable`, `actionability_reason`, and `actionability_version` present; marker `bl_new_actionability_gate_v1` cut over at `2026-05-19T11:39:09.121422+00:00`.
+- [x] Fresh post-deploy paper-trade row stamp verified.
+- [x] Plan drafted: `tasks/plan_actionability_visibility_validation.md`.
+- [x] TDD backend dashboard API support complete.
+- [x] Dashboard UI support complete.
+- [x] Validation runbook complete.
+- [x] Verification complete.
+- [x] PR opened: https://github.com/Trivenidigital/gecko-alpha/pull/182
+
+Review:
+- Fresh-row verification: post-deploy rows `2206`, `2207`, and `2208` all stamped `actionable`, `actionability_reason`, and `actionability_version='v1'`; row `2208` is actionable (`v1_pass_core_signal_mcap_10_50m`), rows `2206`/`2207` are exploratory (`v1_block_tg_social_low_n`).
+- Backend red/green: 4 new tests failed before implementation, then passed after adding row fields, history filter/count semantics, and `/api/trading/actionability`.
+- Full dashboard API test file after backend slice: `24 passed`.
+- Frontend build after Trading tab UI change: `npm run build` passed; Vite emitted `dist/assets/index-Ca4N1ClP.js`.
+- Local dashboard smoke: temp-DB server on `127.0.0.1:8765` returned 200 for `/` and `/api/trading/actionability`.
+- Final targeted suite: `46 passed`.
+- Final diff hygiene: `git diff --check` clean.
+- Validation runbook drafted: `tasks/runbook_actionability_validation_2026_05_19.md`.
+- PR #182 CI `test` passed in `3m56s`.
+- Scope remains visibility + validation only. Do not suppress exploratory paper trades or change live/capital allocation in this slice.
+
 ## Active Work: BL-NEW-ACTIONABILITY-GATE-V1
 
 - [x] Isolated worktree created: `C:\Users\srini\.config\superpowers\worktrees\gecko-alpha\codex-actionability-gate-v1` on `codex/actionability-gate-v1`

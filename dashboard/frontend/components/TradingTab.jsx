@@ -110,6 +110,51 @@ function reasonBadge(reason) {
   return <span className="outcome-badge">{reason}</span>
 }
 
+function actionabilityState(value) {
+  if (value === 1) return 'actionable'
+  if (value === 0) return 'exploratory'
+  return 'unknown'
+}
+
+function formatActionabilityReason(reason) {
+  if (!reason) return 'unstamped'
+  return String(reason).replace(/^v1_/, '').replaceAll('_', ' ')
+}
+
+function ActionabilityBadge({ value, reason, version }) {
+  const state = actionabilityState(value)
+  const label = state === 'actionable' ? 'Actionable' : state === 'exploratory' ? 'Exploratory' : 'Unknown'
+  const color = state === 'actionable'
+    ? 'var(--color-accent-green)'
+    : state === 'exploratory'
+      ? 'var(--color-accent-amber)'
+      : 'var(--color-text-secondary)'
+  const bg = state === 'actionable'
+    ? 'rgba(76, 175, 80, 0.12)'
+    : state === 'exploratory'
+      ? 'rgba(255, 183, 77, 0.12)'
+      : 'var(--color-bar-bg, #1a1a1a)'
+  return (
+    <span
+      title={`${label}: ${reason || 'pre-cutover / unstamped'}${version ? ` (${version})` : ''}`}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        maxWidth: 150,
+        padding: '2px 7px',
+        borderRadius: 4,
+        background: bg,
+        color,
+        fontSize: 11,
+        fontWeight: 700,
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {label}
+    </span>
+  )
+}
+
 // Live-eligibility indicator for per-trade rows.
 // Source: paper_trades.would_be_live (0 / 1 / NULL). NULL = pre-writer-deploy
 // trade (writer shipped 2026-05-11); these are permanently un-classifiable.
@@ -170,6 +215,88 @@ const STRONG_PATTERN_PNL_FLOOR = 200
 // finding: the surface displays accurate data, the natural inference is wrong.
 const WRITER_DEPLOY_ISO = '2026-05-11T13:22:00Z'
 const WARMING_WINDOW_DAYS = 14
+
+function ActionabilitySummaryPanel({ summary }) {
+  if (!summary) return null
+  const open = summary.open_counts || {}
+  const cohorts = summary.closed_cohorts || []
+  const reasons = summary.top_reasons || []
+  const byState = Object.fromEntries(cohorts.map(c => [c.state, c]))
+  const card = (label, state, count, sub) => {
+    const color = state === 'actionable'
+      ? 'var(--color-accent-green)'
+      : state === 'exploratory'
+        ? 'var(--color-accent-amber)'
+        : 'var(--color-text-secondary)'
+    return (
+      <div style={{
+        padding: '12px 14px',
+        border: '1px solid var(--color-border)',
+        borderRadius: 4,
+        background: 'var(--color-bar-bg, #1a1a1a)',
+      }}>
+        <div style={{ fontSize: 10, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>
+          {label}
+        </div>
+        <div style={{ fontSize: 24, fontWeight: 700, color }}>{count ?? 0}</div>
+        <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginTop: 2 }}>{sub}</div>
+      </div>
+    )
+  }
+  return (
+    <div className="panel" style={{ marginBottom: 16 }}>
+      <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>
+          Actionability
+        </span>
+        <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
+          Metadata only; exploratory trades are still collected.
+        </span>
+        <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--color-text-secondary)' }}>
+          {summary.window_days || 7}d closed window
+        </span>
+      </div>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
+        gap: 10,
+        marginBottom: 12,
+      }}>
+        {card('Open actionable', 'actionable', open.actionable, `${fmtUsd(byState.actionable?.total_pnl_usd ?? 0)} closed PnL`)}
+        {card('Open exploratory', 'exploratory', open.exploratory, `${fmtUsd(byState.exploratory?.total_pnl_usd ?? 0)} closed PnL`)}
+        {card('Open unknown', 'unknown', open.unknown, `${byState.unknown?.trades ?? 0} closed unstamped`)}
+      </div>
+      {reasons.length > 0 ? (
+        <div style={{ overflowX: 'auto' }}>
+          <table className="candidates-table">
+            <thead>
+              <tr>
+                <th>Top Reason</th>
+                <th>Rows</th>
+                <th>Closed</th>
+                <th>Closed PnL</th>
+              </tr>
+            </thead>
+            <tbody>
+              {reasons.slice(0, 6).map((r) => (
+                <tr key={r.reason}>
+                  <td style={{ maxWidth: 360, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.reason}>
+                    {formatActionabilityReason(r.reason)}
+                  </td>
+                  <td>{r.trades ?? 0}</td>
+                  <td>{r.closed_trades ?? 0}</td>
+                  <td style={{ fontWeight: 700, color: pnlColor(r.closed_pnl_usd) }}>{fmtUsd(r.closed_pnl_usd ?? 0)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="empty-state">No stamped actionability rows yet.</div>
+      )}
+    </div>
+  )
+}
 
 function PnlBySignalPanel({ bySignal, cohort, cohortView, setCohortView }) {
   // Prefer the cohort endpoint's full_cohort (carries win_rate_pct/avg_pnl_pct
@@ -544,6 +671,8 @@ export default function TradingTab() {
   // smaller-n eligible view is opt-in to avoid anchoring on wide CIs.
   const [bySignalCohort, setBySignalCohort] = useState(null)
   const [cohortView, setCohortView] = useState('full') // 'full' | 'eligible' | 'side-by-side'
+  const [actionabilitySummary, setActionabilitySummary] = useState(null)
+  const [actionabilityFilter, setActionabilityFilter] = useState('all') // all | actionable | exploratory | unknown
   const [positions, setPositions] = useState([])
   const [history, setHistory] = useState([])
   const [closedPage, setClosedPageState] = useState(_readStoredPage)
@@ -577,13 +706,15 @@ export default function TradingTab() {
     const signal = ac.signal
     try {
       const offset = closedPage * CLOSED_PER_PAGE
-      const [statsRes, sigRes, cohortRes, posRes, histRes, countRes] = await Promise.all([
+      const actionabilityParam = encodeURIComponent(actionabilityFilter)
+      const [statsRes, sigRes, cohortRes, actionabilityRes, posRes, histRes, countRes] = await Promise.all([
         fetch('/api/trading/stats', { signal }),
         fetch('/api/trading/stats/by-signal', { signal }),
         fetch('/api/trading/stats/by-signal-cohort', { signal }),
+        fetch('/api/trading/actionability', { signal }),
         fetch('/api/trading/positions', { signal }),
-        fetch(`/api/trading/history?limit=${CLOSED_PER_PAGE}&offset=${offset}`, { signal }),
-        fetch('/api/trading/history/count', { signal }),
+        fetch(`/api/trading/history?limit=${CLOSED_PER_PAGE}&offset=${offset}&actionability=${actionabilityParam}`, { signal }),
+        fetch(`/api/trading/history/count?actionability=${actionabilityParam}`, { signal }),
       ])
       // R1-I1 timeline-race guard: catches "5 fetches resolved cleanly +
       // a subsequent fetchAll already called ac.abort() before we wrote
@@ -595,6 +726,7 @@ export default function TradingTab() {
         setBySignal(Array.isArray(sig) ? sig : Object.entries(sig).map(([k, v]) => ({ signal_type: k, ...v })))
       }
       if (cohortRes.ok) setBySignalCohort(await cohortRes.json())
+      if (actionabilityRes.ok) setActionabilitySummary(await actionabilityRes.json())
       if (posRes.ok) setPositions(await posRes.json())
       let histRows = null
       if (histRes.ok) {
@@ -614,7 +746,7 @@ export default function TradingTab() {
       if (e?.name === 'AbortError') return  // expected on page-change race
       // API not available yet
     }
-  }, [closedPage])
+  }, [closedPage, actionabilityFilter])
 
   // R2-I2 fold: decouple polling timer from page change so rapid
   // pagination doesn't starve the 30s polling refresh of stats /
@@ -624,6 +756,10 @@ export default function TradingTab() {
 
   // Effect 1: immediate refetch when closedPage changes.
   useEffect(() => { fetchAll() }, [fetchAll])
+
+  useEffect(() => {
+    setClosedPage(0)
+  }, [actionabilityFilter, setClosedPage])
 
   // Effect 2: 30s polling — runs once at mount, never resets.
   useEffect(() => {
@@ -707,6 +843,7 @@ export default function TradingTab() {
     _pnl_pct: h.pnl_pct ?? h.realized_pnl_pct ?? null,
     _category: getCategory(h),
     _token: (h.symbol || h.name || h.token_id || '').toLowerCase(),
+    _actionability: actionabilityState(h.actionable),
   })), [history])
 
   const filteredHistory = React.useMemo(
@@ -768,6 +905,8 @@ export default function TradingTab() {
       </div>
 
       {/* Section 2: PnL by Signal Type — cohort-toggle view (BL-NEW-LIVE-ELIGIBLE follow-up) */}
+      <ActionabilitySummaryPanel summary={actionabilitySummary} />
+
       <PnlBySignalPanel
         bySignal={bySignal}
         cohort={bySignalCohort}
@@ -819,6 +958,7 @@ export default function TradingTab() {
                   <SortHeader col="pnl_pct" label="Rank" />
                   <SortHeader col="token" label="Token" />
                   <th title="Live-eligible: would this trade have been opened under live FCFS-20-slots capital constraints? See tasks/findings_open_position_price_freshness_2026_05_12.md.">Eligible</th>
+                  <th title="Actionability Gate v1 metadata. This does not suppress paper/live entry.">Actionability</th>
                   <SortHeader col="category" label="Category" />
                   <SortHeader col="entry" label="Entry" />
                   <SortHeader col="amount" label="Amount" />
@@ -854,6 +994,19 @@ export default function TradingTab() {
                       </td>
                       <td style={{ textAlign: 'center' }}>
                         <EligibilityIcon value={p.would_be_live} />
+                      </td>
+                      <td style={{ maxWidth: 190 }}>
+                        <ActionabilityBadge
+                          value={p.actionable}
+                          reason={p.actionability_reason}
+                          version={p.actionability_version}
+                        />
+                        <div
+                          title={p.actionability_reason || 'unstamped'}
+                          style={{ fontSize: 10, color: 'var(--color-text-secondary)', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2 }}
+                        >
+                          {formatActionabilityReason(p.actionability_reason)}
+                        </div>
                       </td>
                       <td style={{ fontSize: 11, maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {getCategory(p)}
@@ -960,7 +1113,29 @@ export default function TradingTab() {
               // when N=10) doesn't render nonsensical "1999981–10".
               : `Showing ${Math.min(closedPage * CLOSED_PER_PAGE + 1, closedTotal)}–${Math.min((closedPage + 1) * CLOSED_PER_PAGE, closedTotal)} of ${closedTotal}${closedTotal > CLOSED_PER_PAGE ? ' (sort applies to current page only)' : ''}`}
           </span>
-          <label style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--color-text-secondary)', cursor: 'pointer' }}>
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+            {['all', 'actionable', 'exploratory', 'unknown'].map((id) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setActionabilityFilter(id)}
+                style={{
+                  padding: '4px 8px',
+                  fontSize: 11,
+                  fontWeight: 600,
+                  border: '1px solid var(--color-border)',
+                  background: actionabilityFilter === id ? 'var(--color-accent-blue, #4a90e2)' : 'transparent',
+                  color: actionabilityFilter === id ? '#fff' : 'var(--color-text-secondary)',
+                  borderRadius: 4,
+                  cursor: 'pointer',
+                  textTransform: 'capitalize',
+                }}
+              >
+                {id}
+              </button>
+            ))}
+          </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--color-text-secondary)', cursor: 'pointer' }}>
             <input
               type="checkbox"
               checked={showOnlyEligibleClosed}
@@ -989,6 +1164,7 @@ export default function TradingTab() {
                 <tr>
                   <SharedSortHeader col="_token" label="Token" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
                   <th title="Live-eligible: would this trade have been opened under live FCFS-20-slots capital constraints? See tasks/findings_open_position_price_freshness_2026_05_12.md.">Eligible</th>
+                  <SharedSortHeader col="_actionability" label="Actionability" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
                   <SharedSortHeader col="_category" label="Category" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
                   <SharedSortHeader col="entry_price" label="Entry / Exit" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
                   <SharedSortHeader col="amount_usd" label="Amount" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
@@ -1018,6 +1194,19 @@ export default function TradingTab() {
                       </td>
                       <td style={{ textAlign: 'center' }}>
                         <EligibilityIcon value={h.would_be_live} />
+                      </td>
+                      <td style={{ maxWidth: 190 }}>
+                        <ActionabilityBadge
+                          value={h.actionable}
+                          reason={h.actionability_reason}
+                          version={h.actionability_version}
+                        />
+                        <div
+                          title={h.actionability_reason || 'unstamped'}
+                          style={{ fontSize: 10, color: 'var(--color-text-secondary)', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 2 }}
+                        >
+                          {formatActionabilityReason(h.actionability_reason)}
+                        </div>
                       </td>
                       <td style={{ fontSize: 11, maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {getCategory(h)}

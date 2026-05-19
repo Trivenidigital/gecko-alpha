@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from datetime import timedelta
+from typing import Literal
 
 import aiosqlite
 import structlog
@@ -259,19 +260,38 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def get_trading_history_endpoint(
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
+        actionability: Literal["all", "actionable", "exploratory", "unknown"] = Query(
+            "all"
+        ),
     ):
-        return await db.get_trading_history(_db_path, limit=limit, offset=offset)
+        return await db.get_trading_history(
+            _db_path, limit=limit, offset=offset, actionability=actionability
+        )
 
     @app.get("/api/trading/history/count")
-    async def get_trading_history_count_endpoint():
+    async def get_trading_history_count_endpoint(
+        actionability: Literal["all", "actionable", "exploratory", "unknown"] = Query(
+            "all"
+        ),
+    ):
         """Total count of closed paper trades — for frontend pagination."""
-        return {"total": await db.get_trading_history_count(_db_path)}
+        return {
+            "total": await db.get_trading_history_count(
+                _db_path, actionability=actionability
+            )
+        }
 
     @app.get("/api/trading/stats")
     async def get_trading_stats_endpoint(
         days: int = Query(7, ge=1, le=365),
     ):
         return await db.get_trading_stats(_db_path, days=days)
+
+    @app.get("/api/trading/actionability")
+    async def get_trading_actionability_endpoint(
+        days: int = Query(7, ge=1, le=365),
+    ):
+        return await db.get_trading_actionability_summary(_db_path, days=days)
 
     @app.post("/api/trading/close/{trade_id}")
     async def close_trade(trade_id: int):
