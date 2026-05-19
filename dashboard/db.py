@@ -994,6 +994,65 @@ async def get_trading_history(
             return []  # table doesn't exist yet
 
 
+async def get_outcomes_by_token_ids(
+    db_path: str, token_ids: list[str]
+) -> dict[str, dict]:
+    """Most-recent paper_trade per token_id, returned as {token_id: outcome}.
+
+    Read-only join surface for the Top Gainers / candidate views to render
+    "this candidate has a linked paper_trade" badges without exposing full
+    trade history. Returns {} for an empty input list.
+
+    Per-token outcome shape:
+        paper_trade_id: int
+        status: 'open' | 'closed_tp' | 'closed_sl' | 'closed_trail' | ...
+        actionable: 1 | 0 | None
+        actionability_reason: str | None
+        actionability_version: str | None
+        pnl_usd: float | None  (NULL while open)
+        opened_at: ISO timestamp
+
+    Tokens without any paper_trade row are simply absent from the returned
+    dict (caller must default to None / "no trade yet" badge). Per-token
+    selection uses ROW_NUMBER OVER (PARTITION BY ... ORDER BY opened_at DESC)
+    so the most-recent trade wins regardless of open/closed status.
+    """
+    if not token_ids:
+        return {}
+    async with _ro_db(db_path) as db:
+        try:
+            placeholders = ",".join("?" for _ in token_ids)
+            cursor = await db.execute(
+                f"""
+                SELECT token_id, paper_trade_id, status, actionable,
+                       actionability_reason, actionability_version,
+                       pnl_usd, opened_at
+                FROM (
+                    SELECT token_id,
+                           id AS paper_trade_id,
+                           status,
+                           actionable,
+                           actionability_reason,
+                           actionability_version,
+                           pnl_usd,
+                           opened_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY token_id
+                               ORDER BY opened_at DESC, id DESC
+                           ) AS rn
+                    FROM paper_trades
+                    WHERE token_id IN ({placeholders})
+                )
+                WHERE rn = 1
+                """,
+                tuple(token_ids),
+            )
+            rows = await cursor.fetchall()
+            return {row["token_id"]: dict(row) for row in rows}
+        except Exception:
+            return {}
+
+
 def _actionability_filter_sql(actionability: str) -> tuple[str, tuple]:
     """Return SQL fragment for actionability state filter.
 

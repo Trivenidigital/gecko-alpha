@@ -671,6 +671,43 @@ def create_app(db_path: str | None = None) -> FastAPI:
             else:
                 c["price_at_detection"] = None
 
+        # Triage enrichments (read-only, no behavior change):
+        #
+        # 1. sources_count — explicit confluence count from the four
+        #    `detected_by_*` booleans. Surfaces the existing "Narrative +
+        #    Pipeline" combo as a sortable integer 0..4.
+        # 2. paper_trade_outcome — most-recent paper_trade linked by coin_id.
+        #    None if the gainer was never traded. Lets the Top Gainers view
+        #    show "Unlinked — not rankable yet" vs an actionability badge.
+        for c in comparisons:
+            c["sources_count"] = sum(
+                1 if c.get(key) else 0
+                for key in (
+                    "detected_by_narrative",
+                    "detected_by_pipeline",
+                    "detected_by_chains",
+                    "detected_by_spikes",
+                )
+            )
+
+        outcome_token_ids = [c["coin_id"] for c in comparisons if c.get("coin_id")]
+        outcomes = await db.get_outcomes_by_token_ids(_db_path, outcome_token_ids)
+        for c in comparisons:
+            cid = c.get("coin_id")
+            outcome = outcomes.get(cid) if cid else None
+            if outcome is None:
+                c["paper_trade_outcome"] = None
+            else:
+                c["paper_trade_outcome"] = {
+                    "paper_trade_id": outcome.get("paper_trade_id"),
+                    "status": outcome.get("status"),
+                    "actionable": outcome.get("actionable"),
+                    "actionability_reason": outcome.get("actionability_reason"),
+                    "actionability_version": outcome.get("actionability_version"),
+                    "pnl_usd": outcome.get("pnl_usd"),
+                    "opened_at": outcome.get("opened_at"),
+                }
+
         return comparisons
 
     @app.get("/api/gainers/stats")

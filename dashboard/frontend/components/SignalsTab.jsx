@@ -1,6 +1,91 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react'
 import TokenLink from './TokenLink'
 import { useSort, SortHeader } from './useSort.jsx'
+import {
+  actionabilityState,
+  cohortLabel,
+  cohortColor,
+  cohortBg,
+  cohortSubtitle,
+  formatActionabilityReason,
+  reasonWhy,
+} from './actionability.js'
+
+// Render PnL number with sign and color. Used inside outcome badges so
+// closed-trade win/loss is visible at a glance on the Top Gainers row.
+function fmtPnl(n) {
+  if (n == null) return null
+  const v = Number(n)
+  const sign = v >= 0 ? '+' : ''
+  return `${sign}$${v.toFixed(2)}`
+}
+
+// OutcomeLinkBadge: candidate-row badge showing whether the row has a
+// linked paper_trade and, if so, the actionability + closed PnL of that
+// trade. NULL outcome (no linked trade) renders an explicit "Unlinked —
+// not rankable yet" badge in a subdued/dashed style so the row is NOT
+// silently read as neutral. See CLAUDE.md §9c (lever-vs-data-path) and
+// the dashboard triage assignment 2026-05-19.
+function OutcomeLinkBadge({ outcome }) {
+  if (!outcome) {
+    return (
+      <span
+        title="Unlinked: no paper_trade has been opened for this token yet — outcome cohort cannot be ranked."
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          padding: '2px 7px',
+          borderRadius: 4,
+          border: '1px dashed var(--color-border)',
+          background: 'transparent',
+          color: 'var(--color-text-secondary)',
+          fontSize: 11,
+          fontWeight: 600,
+          fontStyle: 'italic',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        Unlinked — not rankable
+      </span>
+    )
+  }
+  const state = actionabilityState(outcome.actionable)
+  const label = cohortLabel(state)
+  const color = cohortColor(state)
+  const bg = cohortBg(state)
+  const reasonLabel = formatActionabilityReason(outcome.actionability_reason)
+  const why = reasonWhy(outcome.actionability_reason)
+  const closed = outcome.status && outcome.status !== 'open'
+  const pnl = fmtPnl(outcome.pnl_usd)
+  const inner = closed && pnl != null ? `${label} · ${pnl}` : label
+  const tooltip = [
+    `${label}: ${reasonLabel}`,
+    why,
+    cohortSubtitle(state),
+    closed ? `status: ${outcome.status}` : 'status: open',
+    outcome.actionability_version ? `(${outcome.actionability_version})` : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+  return (
+    <span
+      title={tooltip}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        padding: '2px 7px',
+        borderRadius: 4,
+        background: bg,
+        color,
+        fontSize: 11,
+        fontWeight: 700,
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {inner}
+    </span>
+  )
+}
 
 function fmtNum(n) {
   if (n == null) return '-'
@@ -247,6 +332,8 @@ export default function SignalsTab() {
                   <SortHeader col="_lead_minutes" label="Lead Time" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
                   <SortHeader col="appeared_on_gainers_at" label="Gained At" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
                   <th>Detected By</th>
+                  <SortHeader col="sources_count" label="Sources" sortCol={gainersSort.sortCol} sortDir={gainersSort.sortDir} onSort={gainersSort.handleSort} />
+                  <th title="Outcome of the most-recent linked paper_trade. 'Unlinked' means this token has no paper_trade yet — not rankable as actionable/exploratory.">Outcome</th>
                 </tr>
               </thead>
               <tbody>
@@ -303,6 +390,12 @@ export default function SignalsTab() {
                         {fmtDate(c.appeared_on_gainers_at)}
                       </td>
                       <td style={{ fontSize: 12 }}>{detectedBy}</td>
+                      <td style={{ fontSize: 12, fontWeight: 700, textAlign: 'center' }}>
+                        {c.sources_count != null ? c.sources_count : methods.length}
+                      </td>
+                      <td>
+                        <OutcomeLinkBadge outcome={c.paper_trade_outcome} />
+                      </td>
                     </tr>
                   )
                 })}

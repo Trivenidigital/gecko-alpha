@@ -1,6 +1,15 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import TokenLink from './TokenLink'
 import { useSort, SortHeader as SharedSortHeader } from './useSort.jsx'
+import {
+  actionabilityState,
+  cohortLabel,
+  cohortColor,
+  cohortBg,
+  cohortSubtitle,
+  formatActionabilityReason,
+  reasonWhy,
+} from './actionability.js'
 
 const CLOSED_PER_PAGE = 20  // closed-trades pagination size
 
@@ -110,33 +119,32 @@ function reasonBadge(reason) {
   return <span className="outcome-badge">{reason}</span>
 }
 
-function actionabilityState(value) {
-  if (value === 1) return 'actionable'
-  if (value === 0) return 'exploratory'
-  return 'unknown'
-}
-
-function formatActionabilityReason(reason) {
-  if (!reason) return 'unstamped'
-  return String(reason).replace(/^v1_/, '').replaceAll('_', ' ')
-}
+// actionabilityState, formatActionabilityReason, reasonWhy, cohortLabel,
+// cohortColor, cohortBg, cohortSubtitle are imported from ./actionability.js
+// at the top of this file. v1 reason codes now resolve to human-readable
+// labels with hover 'why' text.
 
 function ActionabilityBadge({ value, reason, version }) {
   const state = actionabilityState(value)
-  const label = state === 'actionable' ? 'Actionable' : state === 'exploratory' ? 'Exploratory' : 'Unknown'
-  const color = state === 'actionable'
-    ? 'var(--color-accent-green)'
-    : state === 'exploratory'
-      ? 'var(--color-accent-amber)'
-      : 'var(--color-text-secondary)'
-  const bg = state === 'actionable'
-    ? 'rgba(76, 175, 80, 0.12)'
-    : state === 'exploratory'
-      ? 'rgba(255, 183, 77, 0.12)'
-      : 'var(--color-bar-bg, #1a1a1a)'
+  const label = cohortLabel(state)
+  const color = cohortColor(state)
+  const bg = cohortBg(state)
+  // Tooltip combines the short label, human-readable reason, the long-form
+  // 'why' (when available), and version. Distinct from "bad" — exploratory
+  // is intentional low-confidence, unknown is not-rankable-yet.
+  const reasonLabel = formatActionabilityReason(reason)
+  const why = reasonWhy(reason)
+  const tooltip = [
+    `${label}: ${reasonLabel}`,
+    why,
+    cohortSubtitle(state),
+    version ? `(${version})` : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
   return (
     <span
-      title={`${label}: ${reason || 'pre-cutover / unstamped'}${version ? ` (${version})` : ''}`}
+      title={tooltip}
       style={{
         display: 'inline-flex',
         alignItems: 'center',
@@ -222,24 +230,27 @@ function ActionabilitySummaryPanel({ summary }) {
   const cohorts = summary.closed_cohorts || []
   const reasons = summary.top_reasons || []
   const byState = Object.fromEntries(cohorts.map(c => [c.state, c]))
+  // card(): cohort summary card. `sub` is the primary subtitle (closed
+  // PnL / count); `tag` is the cohort-meaning line that distinguishes
+  // exploratory (intentional low-confidence) from unknown (not rankable
+  // yet) so unstamped trades are not silently read as neutral.
   const card = (label, state, count, sub) => {
-    const color = state === 'actionable'
-      ? 'var(--color-accent-green)'
-      : state === 'exploratory'
-        ? 'var(--color-accent-amber)'
-        : 'var(--color-text-secondary)'
+    const color = cohortColor(state)
     return (
-      <div style={{
-        padding: '12px 14px',
-        border: '1px solid var(--color-border)',
-        borderRadius: 4,
-        background: 'var(--color-bar-bg, #1a1a1a)',
-      }}>
+      <div
+        title={cohortSubtitle(state)}
+        style={{
+          padding: '12px 14px',
+          border: '1px solid var(--color-border)',
+          borderRadius: 4,
+          background: 'var(--color-bar-bg, #1a1a1a)',
+        }}>
         <div style={{ fontSize: 10, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>
           {label}
         </div>
         <div style={{ fontSize: 24, fontWeight: 700, color }}>{count ?? 0}</div>
         <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginTop: 2 }}>{sub}</div>
+        <div style={{ fontSize: 10, color: 'var(--color-text-secondary)', marginTop: 2, fontStyle: 'italic' }}>{cohortSubtitle(state)}</div>
       </div>
     )
   }
