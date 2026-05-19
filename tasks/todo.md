@@ -50,6 +50,24 @@ Last updated: 2026-05-19 (cycle 15: overnight drift-cleanup audit — closed 12 
 - **BL-NEW-REVIVAL-VERDICT-WATCHDOG:** PROPOSED (unchanged). Drift-check: no existing primitive in `scripts/`, `systemd/`, `cron/`, or `dashboard/` matches `keep_on_provisional_until` or `soak_verdict`. Status accurate; build correctly deferred per operator scope ("touches trading decision hygiene; build only after plan + review").
 - **BL-NEW-SOCIAL-DENOMINATOR-RE-EVAL-WATCHDOG:** PROPOSED (unchanged). Drift-check: `dashboard/db.py:1284-1319` + `dashboard/api.py:973,1013` + `dashboard/search.py:263` read `narrative_alerts_inbound` and `tg_social_messages` for display, but no watchdog primitive in `scripts/` or `cron/` covers the re-eval triggers. Status accurate; tied to operator B-vs-C decision per scope.
 - **BL-NEW-SCORER-DEAD-SIGNAL-COMMENT-CONVENTION:** PROPOSED (unchanged). Drift-check: `scout/scorer.py:121` already carries `# DEAD SIGNAL — pending BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT re-eval` and `scorer.py` has the original Signal 13 (CryptoPanic) gated-comment precedent. The convention is *in-tree by example* but not yet codified as a style-guide rule. Status accurate; defer to next scorer-touch PR per operator scope.
+## Active Work: 2026-05-19 profit-pattern segmentation
+
+- [x] Review project lessons and isolate branch for analysis
+- [x] Confirm local `scout.db` is schema-only and not usable for outcome segmentation
+- [x] Pull production outcome aggregates without modifying prod DB
+- [x] Segment profitable and junk patterns across requested dimensions
+- [x] Propose Actionability Gate v1, dashboard fields, and paper-trade rule changes
+- [x] Record final verification/results here
+
+Review:
+- Findings written to `tasks/findings_profit_patterns_2026_05_19.md`.
+- Prod analysis used read-only SQLite access through `/tmp/analyze_profit_patterns.py`; no production DB writes.
+- Primary cohort: 531 current-regime closed trades since `2026-05-01 14:06:00`, +$1,545.85 net, +$2.91/trade, 58.8% win.
+- Best current-regime signal types: `narrative_prediction` (+$1,294.96 / n=78), `chain_completed` (+$1,123.15 / n=16), `volume_spike` (+$593.88 / n=28).
+- Worst current-regime signal types/cells: `losers_contrarian` (-$803.22 / n=146), `gainers_early` (-$382.93 / n=252), `gainers_early + mcap:5-10m` (-$701.77 / n=49), `gainers_early + confluence:3` (-$468.14 / n=37).
+- Data gaps: X handle and liquidity are not rankable from closed trade outcomes; X alerts have 215 rows but 0 priced outcomes due unresolved `resolved_coin_id`; TG channel has only 2 current-regime closed linked trades.
+
+Last updated: 2026-05-18 (cycle 14: narrative-operator-alert-wire + chain-anchor status correction + Helius + Moralis plan audits + CG budget attribution + stale PR triage)
 
 ## Active Work: BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE (ENDPOINT-SHIPPED / HERMES-SKILL-PENDING)
 
