@@ -86,6 +86,14 @@ function UrgencyBadge({ value }) {
   return <span className={`tg-badge ${cls}`}>{value || 'unknown'}</span>
 }
 
+// 2026-05-19: the previous default `limit=80` produced an 8s-per-row server
+// scan; the page sat in 'Loading...' indefinitely because there was no
+// client-side timeout. Cap at 30 (matches the natural panel size, two
+// scrolls of context) and abort any request that runs past 12s so the
+// UI flips to a useful error state.
+const X_ALERTS_DEFAULT_LIMIT = 30
+const X_ALERTS_FETCH_TIMEOUT_MS = 12_000
+
 export default function XAlertsTab() {
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
@@ -93,8 +101,13 @@ export default function XAlertsTab() {
   useEffect(() => {
     let cancelled = false
     async function load() {
+      const ac = new AbortController()
+      const timeoutId = setTimeout(() => ac.abort(), X_ALERTS_FETCH_TIMEOUT_MS)
       try {
-        const res = await fetch('/api/x_alerts?limit=80')
+        const res = await fetch(
+          `/api/x_alerts?limit=${X_ALERTS_DEFAULT_LIMIT}`,
+          { signal: ac.signal },
+        )
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const json = await res.json()
         if (!cancelled) {
@@ -102,7 +115,14 @@ export default function XAlertsTab() {
           setError(null)
         }
       } catch (e) {
-        if (!cancelled) setError(String(e))
+        if (cancelled) return
+        if (e?.name === 'AbortError') {
+          setError(`Request timed out after ${X_ALERTS_FETCH_TIMEOUT_MS / 1000}s — endpoint slow or unreachable`)
+        } else {
+          setError(String(e))
+        }
+      } finally {
+        clearTimeout(timeoutId)
       }
     }
     load()
@@ -113,15 +133,21 @@ export default function XAlertsTab() {
     }
   }, [])
 
-  if (error) {
-    return (
-      <div className="panel">
-        <div className="panel-header">X Alerts</div>
-        <div className="empty-state">Failed to load: {error}</div>
-      </div>
-    )
-  }
+  // If no data has ever loaded, render the empty/error state inline.
+  // If data WAS loaded previously and we're now in an error state (e.g.
+  // a single poll-cycle timeout), keep the previously-loaded table
+  // visible and render the error as a banner above it. Pre-PR a slow
+  // poll showed stale data silently; the timeout we added would have
+  // wiped the table on transient slowness — reviewer R1 important fold.
   if (!data) {
+    if (error) {
+      return (
+        <div className="panel">
+          <div className="panel-header">X Alerts</div>
+          <div className="empty-state">Failed to load: {error}</div>
+        </div>
+      )
+    }
     return (
       <div className="panel">
         <div className="panel-header">X Alerts</div>
@@ -130,11 +156,31 @@ export default function XAlertsTab() {
     )
   }
 
+  const errorBanner = error ? (
+    <div
+      className="panel"
+      style={{
+        marginBottom: 8,
+        padding: '8px 12px',
+        background: 'rgba(255, 183, 77, 0.12)',
+        color: 'var(--color-accent-amber)',
+        border: '1px solid var(--color-accent-amber)',
+        borderRadius: 4,
+        fontSize: 12,
+        fontWeight: 600,
+      }}
+      title="Latest refresh failed; table below shows the previous successful load."
+    >
+      ⚠ Latest refresh failed: {error}. Showing previous data.
+    </div>
+  ) : null
+
   const stats = data.stats_24h || {}
   const alerts = data.alerts || []
 
   return (
     <div className="x-alerts">
+      {errorBanner}
       <div className="panel">
         <div className="panel-header">X Alerts - last 24h rollup</div>
         <div className="tg-stat-row x-stat-row">

@@ -2,7 +2,7 @@
 
 import json
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 import structlog
@@ -1565,6 +1565,16 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                 )
                 return []
 
+        # Per-request memoization caches. Many X alerts share the same
+        # `extracted_ca` / `extracted_cashtag` (multiple tweets about the
+        # same token). Without these caches the endpoint ran 80 × 11 ≈
+        # 880 sequential sqlite queries and timed out at >12s for limit=80
+        # (verified 2026-05-19). With caches the dominant cost reduces
+        # to ~unique-tokens × 11, typically halving the wall time.
+        ca_chain_cache: dict[tuple[str, str], tuple[str | None, str]] = {}
+        symbol_cache: dict[str, tuple[str | None, str]] = {}
+        current_price_cache: dict[str, float | None] = {}
+
         async def _resolve_coin_id_for_outcome(row: aiosqlite.Row) -> tuple[str | None, str]:
             resolved = row["resolved_coin_id"]
             if resolved:
@@ -1573,24 +1583,44 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
             ca = row["extracted_ca"]
             chain = row["extracted_chain"]
             if ca and chain:
-                matches = await _safe_fetchall(
-                    """SELECT DISTINCT coingecko_id AS coin_id
-                       FROM candidates
-                       WHERE LOWER(contract_address) = LOWER(?)
-                         AND chain = ?
-                         AND COALESCE(coingecko_id, '') != ''""",
-                    (ca, chain),
-                )
-                coin_ids = sorted({r["coin_id"] for r in matches if r["coin_id"]})
-                if len(coin_ids) == 1:
-                    return coin_ids[0], "contract_match"
-                if len(coin_ids) > 1:
-                    return None, "ambiguous_contract"
+                ca_key = (ca.lower(), chain)
+                if ca_key in ca_chain_cache:
+                    cached = ca_chain_cache[ca_key]
+                    # `None` sentinel = the CA didn't match candidates;
+                    # caller should fall through to the cashtag path.
+                    if cached is not None:
+                        return cached
+                else:
+                    matches = await _safe_fetchall(
+                        """SELECT DISTINCT coingecko_id AS coin_id
+                           FROM candidates
+                           WHERE LOWER(contract_address) = LOWER(?)
+                             AND chain = ?
+                             AND COALESCE(coingecko_id, '') != ''""",
+                        (ca, chain),
+                    )
+                    coin_ids = sorted({r["coin_id"] for r in matches if r["coin_id"]})
+                    if len(coin_ids) == 1:
+                        result = (coin_ids[0], "contract_match")
+                    elif len(coin_ids) > 1:
+                        result = (None, "ambiguous_contract")
+                    else:
+                        result = None  # fall through to symbol path
+                    # Cache every outcome including the None
+                    # fall-through and the ambiguous_contract sentinel.
+                    # Reviewer R2 important fold: N rows sharing the same
+                    # not-yet-ingested CA were running N redundant
+                    # `candidates` scans on the dominant slow path.
+                    ca_chain_cache[ca_key] = result
+                    if result is not None:
+                        return result
 
             cashtag = row["extracted_cashtag"]
             symbol = (cashtag or "").strip().lstrip("$").upper()
             if not symbol:
                 return None, "unresolved"
+            if symbol in symbol_cache:
+                return symbol_cache[symbol]
 
             symbol_rows: list[aiosqlite.Row] = []
             for table, time_col in (
@@ -1599,13 +1629,17 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                 ("volume_spikes", "detected_at"),
                 ("momentum_7d", "detected_at"),
             ):
+                # Drop the `datetime()` wrapper on the indexed column —
+                # ORDER BY column directly so SQLite can use existing
+                # (coin_id, time_col) indexes. ISO-8601 strings sort
+                # lexicographically the same as parsed datetimes.
                 symbol_rows.extend(
                     await _safe_fetchall(
                         f"""SELECT DISTINCT coin_id
                             FROM {table}
                             WHERE UPPER(symbol) = ?
                               AND COALESCE(coin_id, '') != ''
-                            ORDER BY datetime({time_col}) DESC
+                            ORDER BY {time_col} DESC
                             LIMIT 25""",
                         (symbol,),
                     )
@@ -1613,12 +1647,23 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
 
             coin_ids = sorted({r["coin_id"] for r in symbol_rows if r["coin_id"]})
             if len(coin_ids) == 1:
-                return coin_ids[0], "unique_symbol"
-            if len(coin_ids) > 1:
-                return None, "ambiguous_symbol"
-            return None, "unresolved_symbol"
+                result = (coin_ids[0], "unique_symbol")
+            elif len(coin_ids) > 1:
+                result = (None, "ambiguous_symbol")
+            else:
+                result = (None, "unresolved_symbol")
+            symbol_cache[symbol] = result
+            return result
 
         async def _price_at_alert(coin_id: str, received_at: str) -> float | None:
+            # NOTE on `received_at` shape heterogeneity: rows ingested via
+            # the SQL DEFAULT (datetime('now')) at scout/db.py:3432
+            # arrive as '2026-05-19 12:34:56' (space-separated, no tz, no
+            # microseconds). Rows that flow through Python writers arrive
+            # as ISO-T with `+00:00` suffix and microseconds. Python's
+            # fromisoformat accepts both since 3.11; the explicit
+            # tzinfo-stamp below normalizes the naive-UTC path so the
+            # downstream isoformat() bound computation is consistent.
             def _parse_ts(value: str | None) -> datetime | None:
                 if not value:
                     return None
@@ -1631,6 +1676,18 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                     return None
 
             received_dt = _parse_ts(received_at)
+            # Compute the ISO-8601 bounds once instead of per-query.
+            # All time columns in the source tables store ISO-8601 strings
+            # which sort lexicographically the same as parsed datetimes —
+            # so we can compare strings directly, letting SQLite use the
+            # existing (coin_id, time_col) indexes. The previous
+            # `datetime(snapshot_at) BETWEEN ...` form defeated index use.
+            if received_dt is not None:
+                lo_iso = (received_dt - timedelta(hours=24)).isoformat()
+                hi_iso = (received_dt + timedelta(hours=24)).isoformat()
+            else:
+                lo_iso = None
+                hi_iso = None
             sources: list[tuple[datetime, float]] = []
             source_queries = (
                 (
@@ -1641,8 +1698,7 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                        FROM gainers_snapshots
                        WHERE coin_id = ?
                          AND price_at_snapshot IS NOT NULL
-                         AND datetime(snapshot_at) BETWEEN datetime(?, '-24 hours')
-                                                    AND datetime(?, '+24 hours')""",
+                         AND snapshot_at BETWEEN ? AND ?""",
                 ),
                 (
                     "losers_snapshots",
@@ -1652,8 +1708,7 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                        FROM losers_snapshots
                        WHERE coin_id = ?
                          AND price_at_snapshot IS NOT NULL
-                         AND datetime(snapshot_at) BETWEEN datetime(?, '-24 hours')
-                                                    AND datetime(?, '+24 hours')""",
+                         AND snapshot_at BETWEEN ? AND ?""",
                 ),
                 (
                     "volume_history_cg",
@@ -1663,8 +1718,7 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                        FROM volume_history_cg
                        WHERE coin_id = ?
                          AND price IS NOT NULL
-                         AND datetime(recorded_at) BETWEEN datetime(?, '-24 hours')
-                                                     AND datetime(?, '+24 hours')""",
+                         AND recorded_at BETWEEN ? AND ?""",
                 ),
                 (
                     "volume_spikes",
@@ -1674,8 +1728,7 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                        FROM volume_spikes
                        WHERE coin_id = ?
                          AND price IS NOT NULL
-                         AND datetime(detected_at) BETWEEN datetime(?, '-24 hours')
-                                                     AND datetime(?, '+24 hours')""",
+                         AND detected_at BETWEEN ? AND ?""",
                 ),
                 (
                     "momentum_7d",
@@ -1685,12 +1738,18 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                        FROM momentum_7d
                        WHERE coin_id = ?
                          AND current_price IS NOT NULL
-                         AND datetime(detected_at) BETWEEN datetime(?, '-24 hours')
-                                                     AND datetime(?, '+24 hours')""",
+                         AND detected_at BETWEEN ? AND ?""",
                 ),
             )
+            if lo_iso is None or hi_iso is None:
+                # received_at unparseable — preserve old behavior of
+                # passing the raw value to the BETWEEN bounds, which the
+                # original sqlite `datetime(?,'-24 hours')` form would
+                # have produced as None and matched nothing. Return None
+                # so the caller's "no_entry_price" path fires.
+                return None
             for _table, _time_col, _price_col, sql in source_queries:
-                for price_row in await _safe_fetchall(sql, (coin_id, received_at, received_at)):
+                for price_row in await _safe_fetchall(sql, (coin_id, lo_iso, hi_iso)):
                     parsed_ts = _parse_ts(price_row["ts"])
                     if parsed_ts and price_row["price"] and price_row["price"] > 0:
                         sources.append((parsed_ts, float(price_row["price"])))
@@ -1707,6 +1766,10 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
             return sorted(sources, key=lambda item: item[0])[0][1]
 
         async def _current_price(coin_id: str) -> float | None:
+            # Per-request cache. Multiple alerts about the same token
+            # share a single price_cache lookup.
+            if coin_id in current_price_cache:
+                return current_price_cache[coin_id]
             rows = await _safe_fetchall(
                 """SELECT current_price
                    FROM price_cache
@@ -1715,7 +1778,10 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                 (coin_id,),
             )
             if rows and rows[0]["current_price"] and rows[0]["current_price"] > 0:
-                return float(rows[0]["current_price"])
+                price = float(rows[0]["current_price"])
+                current_price_cache[coin_id] = price
+                return price
+            current_price_cache[coin_id] = None
             return None
 
         async def _outcome(row: aiosqlite.Row) -> dict:
