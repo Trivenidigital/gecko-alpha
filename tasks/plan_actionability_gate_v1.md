@@ -1,4 +1,4 @@
-**New primitives introduced:** `scout.trading.actionability.ActionabilityDecision`; `scout.trading.actionability.evaluate_actionability_v1`; three `paper_trades` columns (`actionable`, `actionability_reason`, `actionability_version`); migration marker `bl_new_actionability_gate_v1`; follow-up backlog entries for X/TG outcome linkage and no-peak risk handling.
+**New primitives introduced:** `scout.trading.actionability.ActionabilityDecision`; `scout.trading.actionability.evaluate_actionability_v1`; `PaperTrader` actionability market-cap enrichment helper; three `paper_trades` columns (`actionable`, `actionability_reason`, `actionability_version`); migration marker `bl_new_actionability_gate_v1`; follow-up backlog entries for X/TG outcome linkage and no-peak risk handling.
 
 # Actionability Gate v1 Implementation Plan
 
@@ -18,16 +18,22 @@
 - Existing paper-trade open path:
   - `scout/trading/engine.py::TradingEngine.open_trade` receives `signal_type`, `signal_data`, `signal_combo`, and optional `entry_price`.
   - `scout/trading/paper.py::PaperTrader.execute_buy` computes `would_be_live`, inserts `paper_trades`, then optionally hands off to live/shadow systems.
+- Existing signal-data contract is inconsistent for market cap:
+  - `trade_gainers`, `trade_losers`, `trade_predictions`, and `tg_social` already pass market cap in `signal_data`.
+  - `trade_volume_spikes` currently passes only `{"spike_ratio": ...}` even though `VolumeSpike`/DB-side data has market-cap context elsewhere.
+  - `trade_chain_completions` currently passes only pattern/boost; chain matches may have `mcap_at_completion`, and `price_cache.market_cap` may also be available.
+  - Therefore the implementation must enrich market cap at the paper-trade edge from existing DB sources before evaluating v1; direct `signal_data` extraction alone is not enough.
 - Existing schema migration hook: `scout/db.py::_migrate_feedback_loop_schema` additively manages `paper_trades` columns and indexes.
 - No existing `actionable`, `actionability_reason`, or `actionability_version` columns/functions were found.
 - `peak_pct` is not available at trade-open time; it is populated by evaluator after monitoring, so no-peak/peak-giveback changes are a separate exit/risk follow-up, not part of Actionability Gate v1.
+- `signal_combo` is not a reliable raw-confluence source by itself. `build_combo_key` caps combinations at `signal_type + one extra signal`, and `gainers_early` currently calls that helper with `signals=None`. The audit's `confluence:3` bucket used `max(parsed_combo_count, conviction_locked_stack)`, so v1 must pass open-time `conviction_stack` into the classifier and gate on `max(parsed_combo_count, conviction_stack)`.
 - `x_handle`, `tg_channel`, and liquidity are not reliable closed-trade segmentation fields yet per `tasks/findings_profit_patterns_2026_05_19.md`; v1 must not rank by those fields.
 
 ## Hermes-First Analysis
 
 | Domain | Hermes skill found? | Decision |
 |---|---|---|
-| Paper-trade actionability attribution | none found in installed VPS skills or public Skills Hub | build from scratch; this is gecko-alpha DB row metadata and cohort logic |
+| Paper-trade actionability attribution | none found in installed VPS skills or public Skills Hub (`https://hermes-agent.nousresearch.com/docs/skills`) | build from scratch; this is gecko-alpha DB row metadata and cohort logic |
 | X/KOL signal source | yes - installed `social-media/xurl`, `kol_watcher`, `narrative_classifier`, `narrative_alert_dispatcher` | reuse as raw signal source only; do not add social ingestion or rank handles until outcome linkage exists |
 | Crypto market data/trading skills | public ecosystem has crypto/trading-adjacent skills/tools, but no gecko-alpha paper-trade actionability gate | do not replace project DB/scoring/trading surfaces |
 | Dashboard/reporting | no Hermes primitive for this repo's `paper_trades` dashboard columns | defer dashboard UI unless implementation finishes cleanly |
@@ -64,19 +70,41 @@ ActionabilityDecision(
 ```
 
 Rules:
-- `narrative_prediction`: actionable when entry market cap is usable and not below floor.
-- `chain_completed`: actionable when entry market cap is usable and not below floor.
-- `volume_spike`: actionable when entry market cap is usable and not below floor.
-- `gainers_early`: non-actionable for `5m <= mcap < 10m`; non-actionable when source confluence count is at least 3; actionable only when `mcap >= 50m`.
+- `narrative_prediction`: actionable when enriched entry market cap is usable and not below $10M.
+- `chain_completed`: actionable when enriched entry market cap is usable and not below $10M; if market cap remains missing after DB fallback, v1 permits it with explicit `v1_pass_chain_completed_mcap_unknown_exception` because the total current-regime chain-completed cohort is strongly positive and this source has a known metadata gap. This exception must be reviewed once chain-completed mcap buckets are available.
+- `volume_spike`: actionable when enriched entry market cap is usable and not below $10M.
+- `gainers_early`: non-actionable for `5m <= mcap < 10m`; non-actionable when source confluence count is at least 3; non-actionable for `10m <= mcap < 50m` as `v1_block_gainers_early_mcap_10_50m_observe`; actionable only when `mcap >= 50m`.
 - `losers_contrarian`: non-actionable by default.
 - `trending_catch`: non-actionable by default.
 - `tg_social`: non-actionable by default.
-- Unknown/missing market cap: non-actionable with explicit reason.
+- Unknown/missing market cap: non-actionable with explicit reason, except the explicit `chain_completed` carve-out above.
 - Unknown signal types: non-actionable with explicit reason.
+- Core-signal market cap below $10M: non-actionable by conservative v1 policy. The audit strongly supports `10-50m` and current-regime `>50m`; sub-$10M cells are too thin/unstable for a first actionability pass.
 
-Market-cap buckets are computed from `signal_data` using keys already present in production data (`mcap`, `market_cap`, `market_cap_usd`, `mcap_at_sighting`, `alert_market_cap`).
+Market-cap buckets are computed from enriched open-time metadata:
+- first, `signal_data` keys already present in production data (`mcap`, `market_cap`, `market_cap_usd`, `mcap_at_sighting`, `alert_market_cap`);
+- for `chain_completed`, latest `chain_matches.mcap_at_completion` before generic cache fallback;
+- then `price_cache.market_cap` for the token.
 
-Source confluence count is derived from `signal_combo` split on `+`, `|`, `/`, `,`, semicolon, or whitespace; if empty, count is 1.
+Source confluence count is `max(parsed signal_combo parts, conviction_stack)`. Combo parts are derived from `signal_combo` split on `+`, `|`, `/`, `,`, semicolon, or whitespace; if empty, count is 1.
+
+Actionability is separate from existing live eligibility:
+- `would_be_live=1` remains the live-evaluable/live-slot cohort.
+- `actionable=1 AND actionability_version='v1'` means the row passed this audit-derived paper actionability classifier.
+- A future live-readiness predicate, if needed, must combine both: `would_be_live=1 AND actionable=1 AND actionability_version='v1'`.
+- `narrative_prediction` can be actionability-positive while `would_be_live=0`; that is intentional because it is profitable in paper but structurally not live-eligible under current Tier 1/2 rules.
+
+Schema cohort predicate:
+- Legacy/raw/unclassified rows must not silently enter the v1 cohort.
+- `paper_trades.actionable` will be nullable with no default.
+- Queries must use `actionable = 1 AND actionability_version = 'v1'` for the v1 actionable cohort.
+
+## Plan Review Fold
+
+Two independent plan reviewers completed on 2026-05-19.
+
+- Statistical/product review verdict: `APPROVE_WITH_CHANGES`. Folded changes: clarified `gainers_early` only passes at `>=50m`; added the chain-completed missing-mcap exception because total chain-completed edge is strong but bucket coverage is incomplete; kept X/TG/no-peak deferrals.
+- Structural/API review verdict: `BLOCK`. Folded changes: added DB-side market-cap enrichment before classification; changed schema from `NOT NULL DEFAULT 1` to nullable/no default so historical rows are not falsely evaluated; added required migration-marker post-assertion and timestamp-preservation tests; added engine-path tests with real signal-data shapes.
 
 ## Task 1: Backlog And Todo Fold
 
@@ -108,7 +136,7 @@ Add a `BL-NEW-ACTIONABILITY-GATE` entry if absent, otherwise update the existing
 ```markdown
 ### BL-NEW-ACTIONABILITY-GATE-V1-IMPLEMENT
 **Status:** PLANNED
-**Why:** Current paper trades mix actionable and exploratory cohorts. Recent findings show profitable and junk patterns differ sharply; paper/live-readiness decisions need an explicit actionability flag.
+**Why:** Current paper trades mix actionable and exploratory cohorts. Recent findings show profitable and junk patterns differ sharply; paper decision-quality cohorts need an explicit actionability flag. This is separate from `would_be_live` live-slot eligibility.
 **Scope:** Add `paper_trades.actionable`, `actionability_reason`, and `actionability_version`; stamp via a pure classifier at open time; keep exploratory paper rows.
 ```
 
@@ -161,6 +189,7 @@ def _decision(signal_type, *, signal_data=None, signal_combo=None):
         signal_type=signal_type,
         signal_data=signal_data or {},
         signal_combo=signal_combo or signal_type,
+        conviction_stack=0,
     )
 
 
@@ -175,6 +204,12 @@ def test_chain_completed_passes_with_over_50m_mcap():
     d = _decision("chain_completed", signal_data={"market_cap": 75_000_000})
     assert d.actionable is True
     assert d.reason == "v1_pass_core_signal_mcap_50m_plus"
+
+
+def test_chain_completed_missing_mcap_uses_explicit_exception():
+    d = _decision("chain_completed", signal_data={})
+    assert d.actionable is True
+    assert d.reason == "v1_pass_chain_completed_mcap_unknown_exception"
 
 
 def test_volume_spike_passes_with_10_50m_mcap():
@@ -210,16 +245,42 @@ def test_gainers_early_blocks_confluence_3():
     assert d.reason == "v1_block_gainers_early_confluence_3"
 
 
+def test_gainers_early_blocks_conviction_stack_3_when_combo_is_pair_capped():
+    d = evaluate_actionability_v1(
+        signal_type="gainers_early",
+        signal_data={"mcap": 80_000_000},
+        signal_combo="gainers_early+momentum_ratio",
+        conviction_stack=3,
+    )
+    assert d.actionable is False
+    assert d.reason == "v1_block_gainers_early_confluence_3"
+
+
 def test_gainers_early_over_50m_passes_when_confluence_below_3():
     d = _decision("gainers_early", signal_data={"mcap": 80_000_000})
     assert d.actionable is True
     assert d.reason == "v1_pass_gainers_early_mcap_50m_plus"
 
 
-def test_unknown_mcap_blocks_explicitly():
+def test_gainers_early_10_to_50m_blocks_as_observe():
+    d = _decision("gainers_early", signal_data={"mcap": 20_000_000})
+    assert d.actionable is False
+    assert d.reason == "v1_block_gainers_early_mcap_10_50m_observe"
+
+
+def test_unknown_mcap_blocks_explicitly_for_non_chain_signal():
     d = _decision("narrative_prediction", signal_data={})
     assert d.actionable is False
     assert d.reason == "v1_block_missing_mcap"
+
+
+def test_mcap_extraction_continues_after_invalid_candidate_key():
+    d = _decision(
+        "volume_spike",
+        signal_data={"mcap": "unknown", "market_cap_usd": 12_000_000},
+    )
+    assert d.actionable is True
+    assert d.reason == "v1_pass_core_signal_mcap_10_50m"
 
 
 def test_unknown_signal_blocks_explicitly():
@@ -261,12 +322,20 @@ def evaluate_actionability_v1(
     signal_type: str,
     signal_data: dict[str, Any],
     signal_combo: str | None,
+    conviction_stack: int = 0,
 ) -> ActionabilityDecision:
     mcap = _extract_mcap(signal_data)
     if mcap is None or mcap <= 0:
+        if signal_type == "chain_completed":
+            return ActionabilityDecision(
+                True, "v1_pass_chain_completed_mcap_unknown_exception"
+            )
         return ActionabilityDecision(False, "v1_block_missing_mcap")
 
-    confluence = _source_confluence_count(signal_combo or signal_type)
+    confluence = max(
+        _source_confluence_count(signal_combo or signal_type),
+        int(conviction_stack or 0),
+    )
 
     if signal_type in {"narrative_prediction", "chain_completed", "volume_spike"}:
         if 10_000_000 <= mcap < 50_000_000:
@@ -282,6 +351,10 @@ def evaluate_actionability_v1(
             return ActionabilityDecision(False, "v1_block_gainers_early_confluence_3")
         if mcap >= 50_000_000:
             return ActionabilityDecision(True, "v1_pass_gainers_early_mcap_50m_plus")
+        if mcap >= 10_000_000:
+            return ActionabilityDecision(
+                False, "v1_block_gainers_early_mcap_10_50m_observe"
+            )
         return ActionabilityDecision(False, "v1_block_gainers_early_not_50m_plus")
 
     if signal_type == "losers_contrarian":
@@ -302,7 +375,7 @@ def _extract_mcap(signal_data: dict[str, Any]) -> float | None:
         try:
             return float(value)
         except (TypeError, ValueError):
-            return None
+            continue
     return None
 
 
@@ -350,8 +423,8 @@ async def test_migration_adds_actionability_columns(tmp_path):
     assert "actionability_reason" in cols
     assert "actionability_version" in cols
     assert cols["actionable"][2] == "INTEGER"
-    assert cols["actionable"][3] == 1
-    assert cols["actionable"][4] == "1"
+    assert cols["actionable"][3] == 0
+    assert cols["actionable"][4] is None
     await db.close()
 
 
@@ -364,6 +437,67 @@ async def test_migration_records_actionability_marker(tmp_path):
     )
     assert await cur.fetchone() is not None
     await db.close()
+
+
+async def test_actionability_marker_timestamp_preserved_on_reinitialize(tmp_path):
+    db_path = tmp_path / "actionability_marker_idempotent.db"
+    db = Database(db_path)
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT cutover_ts FROM paper_migrations WHERE name=?",
+        ("bl_new_actionability_gate_v1",),
+    )
+    first = (await cur.fetchone())[0]
+    await db.close()
+
+    db2 = Database(db_path)
+    await db2.initialize()
+    cur = await db2._conn.execute(
+        "SELECT cutover_ts FROM paper_migrations WHERE name=?",
+        ("bl_new_actionability_gate_v1",),
+    )
+    second = (await cur.fetchone())[0]
+    assert second == first
+    await db2.close()
+
+
+async def test_actionability_columns_preserve_pre_cutover_nulls(tmp_path):
+    db = Database(tmp_path / "actionability_precutover.db")
+    await db.initialize()
+    await db._conn.execute(
+        "INSERT INTO paper_trades "
+        "(token_id, symbol, name, chain, signal_type, signal_data, "
+        "entry_price, amount_usd, quantity, tp_pct, sl_pct, "
+        "tp_price, sl_price, status, opened_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "legacy",
+            "LEG",
+            "Legacy",
+            "coingecko",
+            "gainers_early",
+            "{}",
+            1.0,
+            300.0,
+            300.0,
+            20.0,
+            10.0,
+            1.2,
+            0.9,
+            "open",
+            "2026-05-01T00:00:00+00:00",
+        ),
+    )
+    await db._conn.commit()
+    cur = await db._conn.execute(
+        "SELECT actionable, actionability_reason, actionability_version "
+        "FROM paper_trades WHERE token_id='legacy'"
+    )
+    row = await cur.fetchone()
+    assert row[0] is None
+    assert row[1] is None
+    assert row[2] is None
+    await db.close()
 ```
 
 - [ ] **Step 2: Verify red**
@@ -371,7 +505,7 @@ async def test_migration_records_actionability_marker(tmp_path):
 Run:
 
 ```bash
-python -m pytest tests/test_trading_db_migration.py::test_migration_adds_actionability_columns tests/test_trading_db_migration.py::test_migration_records_actionability_marker --tb=short -q
+python -m pytest tests/test_trading_db_migration.py::test_migration_adds_actionability_columns tests/test_trading_db_migration.py::test_migration_records_actionability_marker tests/test_trading_db_migration.py::test_actionability_marker_timestamp_preserved_on_reinitialize tests/test_trading_db_migration.py::test_actionability_columns_preserve_pre_cutover_nulls --tb=short -q
 ```
 
 Expected: columns/marker missing.
@@ -381,7 +515,7 @@ Expected: columns/marker missing.
 Update `scout/db.py::_create_tables` `paper_trades` schema with:
 
 ```sql
-actionable INTEGER NOT NULL DEFAULT 1,
+actionable INTEGER,
 actionability_reason TEXT,
 actionability_version TEXT,
 ```
@@ -389,7 +523,7 @@ actionability_version TEXT,
 Update `_migrate_feedback_loop_schema.expected_cols` with:
 
 ```python
-"actionable": "INTEGER NOT NULL DEFAULT 1",
+"actionable": "INTEGER",
 "actionability_reason": "TEXT",
 "actionability_version": "TEXT",
 ```
@@ -403,9 +537,17 @@ await conn.execute(
 )
 ```
 
+Also add `bl_new_actionability_gate_v1` to the hardcoded migration post-assertion list:
+
+```python
+"'bl_new_actionability_gate_v1')"
+```
+
+and to the `missing_migrations` set. This keeps the migration consistent with the existing defensive marker assertion pattern.
+
 - [ ] **Step 4: Verify green**
 
-Run the two migration tests again. Expected: pass.
+Run the four migration tests again. Expected: pass.
 
 - [ ] **Step 5: Commit**
 
@@ -500,7 +642,7 @@ async def test_execute_buy_stamps_actionable_false_for_gainers_early_5_10m(db):
 
 
 @pytest.mark.asyncio
-async def test_execute_buy_without_settings_defaults_existing_rows_actionable(db):
+async def test_execute_buy_without_settings_still_classifies_actionability(db):
     trade_id = await PaperTrader().execute_buy(
         db=db,
         token_id="compat",
@@ -521,9 +663,131 @@ async def test_execute_buy_without_settings_defaults_existing_rows_actionable(db
     )
     row = await cur.fetchone()
     assert row["actionable"] == 1
-    assert row["actionability_reason"] is None
-    assert row["actionability_version"] is None
+    assert row["actionability_reason"] == "v1_pass_core_signal_mcap_10_50m"
+    assert row["actionability_version"] == "v1"
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_without_settings_still_classifies_long_hold_non_actionable(db):
+    trade_id = await PaperTrader().execute_buy(
+        db=db,
+        token_id="long-hold",
+        symbol="LH",
+        name="Long Hold",
+        chain="coingecko",
+        signal_type="long_hold",
+        signal_data={"mcap": 20_000_000},
+        current_price=1.0,
+        amount_usd=300.0,
+        tp_pct=20.0,
+        sl_pct=10.0,
+        signal_combo="long_hold",
+    )
+    cur = await db._conn.execute(
+        "SELECT actionable, actionability_reason, actionability_version FROM paper_trades WHERE id=?",
+        (trade_id,),
+    )
+    row = await cur.fetchone()
+    assert row["actionable"] == 0
+    assert row["actionability_reason"] == "v1_block_unknown_signal_type"
+    assert row["actionability_version"] == "v1"
 ```
+
+Add an engine-level test in `tests/test_trading_engine.py` proving actionability metadata does not block exploratory paper:
+
+```python
+async def test_open_trade_stamps_non_actionable_but_still_opens(engine, db):
+    trade_id = await engine.open_trade(
+        token_id="loser-probe",
+        symbol="LP",
+        name="LoserProbe",
+        chain="coingecko",
+        signal_type="losers_contrarian",
+        signal_data={"mcap": 20_000_000},
+        entry_price=1.0,
+        signal_combo="losers_contrarian",
+    )
+    assert trade_id is not None
+    cursor = await db._conn.execute(
+        "SELECT actionable, actionability_reason, actionability_version FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    row = await cursor.fetchone()
+    assert row["actionable"] == 0
+    assert row["actionability_reason"] == "v1_block_losers_contrarian_exploratory"
+    assert row["actionability_version"] == "v1"
+```
+
+Add an engine-level DB-fallback test in `tests/test_trading_engine.py` proving real signal-data shapes are enriched before classification:
+
+```python
+async def test_open_trade_enriches_actionability_mcap_from_price_cache(engine, db):
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        "INSERT OR REPLACE INTO price_cache "
+        "(coin_id, current_price, market_cap, updated_at) VALUES (?, ?, ?, ?)",
+        ("vol-no-mcap", 1.0, 20_000_000, now),
+    )
+    await db._conn.commit()
+
+    trade_id = await engine.open_trade(
+        token_id="vol-no-mcap",
+        symbol="VNM",
+        name="VolumeNoMcap",
+        chain="coingecko",
+        signal_type="volume_spike",
+        signal_data={"spike_ratio": 12.3},
+        entry_price=1.0,
+        signal_combo="volume_spike",
+    )
+    assert trade_id is not None
+    cursor = await db._conn.execute(
+        "SELECT actionable, actionability_reason FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    row = await cursor.fetchone()
+    assert row["actionable"] == 1
+    assert row["actionability_reason"] == "v1_pass_core_signal_mcap_10_50m"
+```
+
+Add a live-handoff regression in `tests/live/test_paper_chokepoint.py`:
+
+```python
+class _LiveEngineSpy:
+    def __init__(self):
+        self.handoffs = []
+
+    def is_eligible(self, signal_type):
+        return True
+
+    async def on_paper_trade_opened(self, handoff):
+        self.handoffs.append(handoff)
+
+
+async def test_actionability_stamp_does_not_change_live_handoff(db):
+    live = _LiveEngineSpy()
+    trader = PaperTrader(live_engine=live)
+    trade_id = await trader.execute_buy(
+        db=db,
+        token_id="non-actionable-live-handoff",
+        symbol="NAL",
+        name="Non Actionable Live Handoff",
+        chain="coingecko",
+        signal_type="losers_contrarian",
+        signal_data={"mcap": 20_000_000},
+        current_price=1.0,
+        amount_usd=300.0,
+        tp_pct=20.0,
+        sl_pct=10.0,
+        signal_combo="losers_contrarian",
+        settings=_settings(),
+    )
+    await asyncio.sleep(0)
+    assert trade_id is not None
+    assert [h.id for h in live.handoffs] == [trade_id]
+```
+
+This locks the invariant: v1 actionability metadata does not suppress exploratory paper opens or alter the existing live handoff allowlist behavior.
 
 - [ ] **Step 2: Verify red**
 
@@ -543,24 +807,105 @@ Import:
 from scout.trading.actionability import ActionabilityDecision, evaluate_actionability_v1
 ```
 
-Before `INSERT_SQL`, compute:
+Before `INSERT_SQL`, compute actionability unconditionally. Reuse the same `stack` already needed by `compute_would_be_live`; if `settings is None`, still compute stack for actionability because the classifier is pure and production has a direct `PaperTrader.execute_buy` caller for `long_hold` without settings.
+
+Add a private async helper near `execute_buy` to enrich market cap without changing the pure classifier:
 
 ```python
-actionability = ActionabilityDecision(True, "v1_not_evaluated", "v1")
+async def _enrich_actionability_signal_data(
+    db: Database,
+    *,
+    token_id: str,
+    signal_type: str,
+    signal_data: dict,
+) -> dict:
+    enriched = dict(signal_data)
+    if _has_mcap(enriched):
+        return enriched
+
+    conn = db._conn
+    if conn is None:
+        return enriched
+
+    if signal_type == "chain_completed":
+        cur = await conn.execute(
+            "SELECT mcap_at_completion FROM chain_matches "
+            "WHERE token_id=? AND mcap_at_completion IS NOT NULL "
+            "ORDER BY datetime(completed_at) DESC LIMIT 1",
+            (token_id,),
+        )
+        row = await cur.fetchone()
+        if row and row[0] not in (None, ""):
+            enriched["mcap"] = row[0]
+            return enriched
+
+    cur = await conn.execute(
+        "SELECT market_cap FROM price_cache WHERE coin_id=?",
+        (token_id,),
+    )
+    row = await cur.fetchone()
+    if row and row[0] not in (None, ""):
+        enriched["mcap"] = row[0]
+    return enriched
+```
+
+The helper should continue gracefully on query failure by logging `actionability_mcap_enrichment_failed` and returning the original payload. This keeps paper opening non-blocking.
+
+```python
+stack_for_actionability = 0
+try:
+    if signal_type not in ("chain_completed", "volume_spike"):
+        stack_for_actionability = await compute_stack(db, token_id, now)
+except Exception:
+    log.exception(
+        "actionability_stack_compute_failed",
+        token_id=token_id,
+        signal_type=signal_type,
+    )
+    stack_for_actionability = 0
+
+actionability = ActionabilityDecision(False, "v1_error", "v1")
+try:
+    actionability_signal_data = await _enrich_actionability_signal_data(
+        db,
+        token_id=token_id,
+        signal_type=signal_type,
+        signal_data=signal_data,
+    )
+    actionability = evaluate_actionability_v1(
+        signal_type=signal_type,
+        signal_data=actionability_signal_data,
+        signal_combo=signal_combo,
+        conviction_stack=stack_for_actionability,
+    )
+except Exception:
+    log.exception(
+        "actionability_gate_failed",
+        token_id=token_id,
+        signal_type=signal_type,
+    )
+    actionability = ActionabilityDecision(False, "v1_error", "v1")
+```
+
+Then compute `would_be_live` using `stack_for_actionability` when needed so stack is not recomputed:
+
+```python
 if settings is not None:
     try:
-        actionability = evaluate_actionability_v1(
+        would_be_live = await compute_would_be_live(
+            db,
             signal_type=signal_type,
             signal_data=signal_data,
-            signal_combo=signal_combo,
+            conviction_stack=stack_for_actionability,
+            settings=settings,
         )
     except Exception:
         log.exception(
-            "actionability_gate_failed",
+            "would_be_live_stamp_failed",
             token_id=token_id,
             signal_type=signal_type,
         )
-        actionability = ActionabilityDecision(False, "v1_error", "v1")
+        would_be_live = 0
 ```
 
 Extend insert columns/values:
@@ -572,18 +917,12 @@ actionable, actionability_reason, actionability_version
 with values:
 
 ```python
-1 if actionability.actionable else 0,
-actionability.reason,
-actionability.version,
+actionable_value = 1 if actionability.actionable else 0
+actionability_reason = actionability.reason
+actionability_version = actionability.version
 ```
 
-For `settings is None`, use database defaults by setting:
-
-```python
-actionable_value = 1
-actionability_reason = None
-actionability_version = None
-```
+There is no `settings is None` bypass for actionability. Raw SQL/backward-compat rows can remain `NULL`, but the main `PaperTrader` writer must stamp explicit `0/1`, reason, and version.
 
 Add structured log fields to `paper_trade_opened`:
 
@@ -598,7 +937,7 @@ actionability_version=actionability_version,
 Run:
 
 ```bash
-python -m pytest tests/test_actionability.py tests/test_paper_actionability.py tests/test_live_eligibility.py --tb=short -q
+python -m pytest tests/test_actionability.py tests/test_paper_actionability.py tests/test_live_eligibility.py tests/test_trading_engine.py::test_open_trade_stamps_non_actionable_but_still_opens tests/test_trading_engine.py::test_open_trade_enriches_actionability_mcap_from_price_cache tests/live/test_paper_chokepoint.py::test_actionability_stamp_does_not_change_live_handoff --tb=short -q
 ```
 
 Expected: pass.
@@ -606,7 +945,7 @@ Expected: pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add scout/trading/paper.py tests/test_paper_actionability.py
+git add scout/trading/paper.py tests/test_paper_actionability.py tests/test_trading_engine.py tests/live/test_paper_chokepoint.py
 git commit -m "feat: stamp paper-trade actionability"
 ```
 
@@ -622,7 +961,7 @@ Use the provisioned project venv if `uv` cannot build in this worktree:
 
 ```powershell
 $env:PYTHONPATH=(Get-Location).Path
-C:\projects\gecko-alpha\.venv\Scripts\python.exe -m pytest tests/test_actionability.py tests/test_paper_actionability.py tests/test_live_eligibility.py tests/test_trading_engine.py tests/test_trading_db_migration.py --tb=short -q
+C:\projects\gecko-alpha\.venv\Scripts\python.exe -m pytest tests/test_actionability.py tests/test_paper_actionability.py tests/test_live_eligibility.py tests/test_trading_engine.py tests/test_trading_db_migration.py tests/live/test_paper_chokepoint.py --tb=short -q
 ```
 
 Expected: relevant tests pass. Record exact counts.
@@ -631,7 +970,7 @@ Expected: relevant tests pass. Record exact counts.
 
 ```powershell
 $env:PYTHONPATH=(Get-Location).Path
-C:\projects\gecko-alpha\.venv\Scripts\python.exe -m pytest tests/test_trading_*.py tests/test_live_eligibility.py tests/test_actionability.py tests/test_paper_actionability.py --tb=short -q
+C:\projects\gecko-alpha\.venv\Scripts\python.exe -m pytest tests/test_trading_*.py tests/live/test_paper_chokepoint.py tests/test_live_eligibility.py tests/test_actionability.py tests/test_paper_actionability.py --tb=short -q
 ```
 
 Expected: pass or document unrelated baseline failures with evidence.

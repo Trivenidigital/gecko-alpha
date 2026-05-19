@@ -75,10 +75,15 @@ Review:
 - [x] Drift check: existing `would_be_live` is live-slot eligibility, not actionability
 - [x] Hermes-first check: no actionability-gate primitive; reuse Hermes X/KOL only as raw telemetry
 - [x] Plan drafted: `tasks/plan_actionability_gate_v1.md`
-- [ ] Plan reviewed by 2 parallel agents
+- [x] Plan reviewed by 2 parallel agents; structural BLOCK folded into revised plan
 - [ ] Design drafted and reviewed by 2 parallel agents
 - [ ] TDD implementation complete
 - [ ] PR opened and reviewed by 3 parallel agents
+
+Review:
+- Plan reviewer A (`APPROVE_WITH_CHANGES`) flagged chain-completed mcap support and gainers_early mcap ambiguity.
+- Plan reviewer B (`BLOCK`) flagged engine signal-data mismatch, nullable schema semantics, missing migration marker assertion, and insufficient engine-path tests.
+- Folded into `tasks/plan_actionability_gate_v1.md`: DB mcap enrichment, chain-completed missing-mcap exception, gainers_early `10-50m` observe block, nullable actionability columns, marker idempotence tests, and real engine-path fallback tests.
 
 Last updated: 2026-05-18 (cycle 14: narrative-operator-alert-wire + chain-anchor status correction + Helius + Moralis plan audits + CG budget attribution + stale PR triage)
 

@@ -8,6 +8,37 @@
 
 ---
 
+## Active Findings
+
+### BL-NEW-ACTIONABILITY-GATE
+**Status:** FINDINGS-READY 2026-05-19
+**Why:** Current paper trades mix decision-bearing and exploratory cohorts. The 2026-05-19 profit-pattern analysis found sharp separation between profitable current-regime patterns (`narrative_prediction`, `chain_completed`, `volume_spike`) and junk/exploratory patterns (`losers_contrarian`, weak `gainers_early`, low-n `trending_catch`).
+**Evidence:** `tasks/findings_profit_patterns_2026_05_19.md`
+**Decision:** Implement an explicit actionability flag for paper-trade cohorts; do not suppress raw signal collection.
+
+### BL-NEW-ACTIONABILITY-GATE-V1-IMPLEMENT
+**Status:** PLANNED
+**Why:** Paper/live-readiness decisions need a cohort marker separate from `would_be_live`, which answers live-slot eligibility rather than audit-derived actionability.
+**Scope:** Add nullable `paper_trades.actionable`, `actionability_reason`, and `actionability_version`; stamp via a pure classifier at open time after DB-side market-cap enrichment; keep exploratory paper rows.
+**Plan:** `tasks/plan_actionability_gate_v1.md`
+
+### BL-NEW-X-OUTCOME-LINKAGE
+**Status:** PROPOSED
+**Why:** X handle ranking is blocked: 215 X alerts had 0 priced outcomes because `resolved_coin_id`/pricing linkage is missing.
+**Scope:** Persist `resolved_coin_id`, `x_handle`, outcome status, entry/current price, and $300 notional P&L.
+
+### BL-NEW-TG-OUTCOME-LINKAGE
+**Status:** PROPOSED
+**Why:** TG channel ranking is blocked: only 2 current-regime closed linked trades, both low-n losses.
+**Scope:** Persist and dashboard `tg_channel`, `resolution_state`, `posted_at`, `paper_trade_id`, and `mcap_at_sighting`.
+
+### BL-NEW-NO-PEAK-RISK-HANDLING
+**Status:** PROPOSED
+**Why:** `no_peak_<5` current-regime bucket is deeply negative (-$6,090.86 / n=99), but `peak_pct` is not available at trade-open time.
+**Scope:** Design a peak<5 early-exit or hard-risk policy separately; do not mix exit/risk handling into Actionability Gate v1.
+
+---
+
 ## Design Decisions (Locked In)
 
 These decisions were reviewed and approved. Reference them when implementing P1 items.
