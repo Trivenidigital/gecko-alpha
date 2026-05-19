@@ -1632,6 +1632,41 @@ scout/trading/
 
 ---
 
+## Follow-ups filed 2026-05-19 from dashboard work (#189 / #190 + overnight triage)
+
+Four entries surfaced during PR #190's X Alerts perf investigation and the overnight dashboard triage pass. **All file-only, no implementation.** Operator scope: file for visibility / future scheduling; do not start implementation until separately approved.
+
+### BL-NEW-DASHBOARD-X-ALERTS-RESOLVER-SCHEMA-ALIGN: reconcile `_resolve_coin_id_for_outcome` against the actual `candidates` schema
+**Status:** PROPOSED 2026-05-19 — surfaced post-deploy of PR #190 (`c99051f`). Live journal on srilu shows `dashboard_x_alerts_outcome_source_unavailable err=no such column: coingecko_id` firing on every `/api/x_alerts` request.
+**Tag:** `dashboard` `x_alerts` `schema-drift` `silent-degradation`
+**Why:** `dashboard/db.py:get_x_alerts._resolve_coin_id_for_outcome` runs `SELECT DISTINCT coingecko_id AS coin_id FROM candidates WHERE LOWER(contract_address) = LOWER(?) AND chain = ? AND COALESCE(coingecko_id, '') != ''` for every row whose contract address was extracted. Verified prod schema (`PRAGMA table_info(candidates)`): no `coingecko_id` column exists; the column-list ends at `quote_symbol`. The query raises `OperationalError`, caught silently by `_safe_fetchall` and returned as `[]`. **Every X alert with a contract falls through to the slower symbol-table scan path.** The original intent of the contract-match path is bypassed in 100% of cases.
+**Action:** ~2-4h. Decide between (a) DROP the `coingecko_id` reference from the resolver query (acknowledge that `candidates` no longer carries a CoinGecko ID mapping; rely on symbol-fallback only — affects per-request perf if symbol path is also slow) OR (b) ADD a `coingecko_id` column to `candidates` schema + backfill from existing ingest paths (schema migration). Recommend (a) for scope conservatism; (b) only if the contract → coingecko_id mapping is needed elsewhere.
+**Decision-by:** within 4 weeks of PR #190 merge (2026-06-16). Conditional on operator deciding to invest in X Alerts perf vs. accept the current "fail fast + retry" timeout behavior.
+
+### BL-NEW-DASHBOARD-X-ALERTS-SYMBOL-INDEX: add `(symbol)` indexes to the 4 symbol-fallback source tables
+**Status:** PROPOSED 2026-05-19 — surfaced post-deploy of PR #190. Same investigation as the RESOLVER-SCHEMA-ALIGN entry above.
+**Tag:** `dashboard` `x_alerts` `performance` `schema-migration`
+**Why:** When the contract-match path falls through (per the RESOLVER-SCHEMA-ALIGN entry's observation: 100% of the time today), `_resolve_coin_id_for_outcome` queries 4 source tables (`gainers_snapshots`, `volume_history_cg`, `volume_spikes`, `momentum_7d`) with `WHERE UPPER(symbol) = ? AND COALESCE(coin_id, '') != '' ORDER BY time_col DESC LIMIT 25`. None of these tables have an index on `symbol` — every query is a full-table scan. With PR #190's per-symbol cache the cost is unique-symbols × 4 scans, not per-row × 4. But under concurrent dashboard load, 4 full-table scans × 15-30 unique symbols still pushes the endpoint past the 12s frontend timeout. ASGI smoke in isolation: limit=30 = ~9s (acceptable); under live dashboard load: 13-30s+ (timeout).
+**Action:** ~1-2h schema migration. Add `idx_<table>_symbol(UPPER(symbol))` to all 4 tables (or just `(symbol)` if SQLite's expression-index requirement is lifted by the writer normalizing case). Verify each writer site upcases consistently. Indexed scan should drop the symbol-path cost ~10x. **Schema migration — gated on operator approval.** Pairs naturally with RESOLVER-SCHEMA-ALIGN; ship together or in sequence.
+**Decision-by:** within 4 weeks of PR #190 merge (2026-06-16). Conditional on operator approving schema migration scope.
+
+### BL-NEW-DASHBOARD-TG-CONVERSION-FUNNEL-ENDPOINT: read-only TG conversion-funnel aggregation endpoint
+**Status:** PROPOSED 2026-05-19 — surfaced from overnight dashboard triage; assignment item 7. Filed as a backend instrumentation task, NOT a UI fix.
+**Tag:** `dashboard` `tg_social` `funnel` `observability`
+**Why:** Operator wants a TG conversion funnel visible in the dashboard: `messages → CA/cashtag → resolved → trade dispatched → linked outcome`. Existing source data is spread across `tg_social_messages` (raw ingest), `tg_social_signals` (resolved cashtag/CA + `paper_trade_id` FK), and `paper_trades` (outcome). A simple JOIN can produce per-window counts, but no endpoint surfaces it today. The TG/X linkage design in PR #184 covers schema-shape changes; this entry is the **read-only aggregation endpoint that consumes existing schema and feeds a UI panel**, distinct from #184 scope.
+**Action:** ~4-6h. Add `GET /api/tg_social/funnel?since=...&channel=...` to `dashboard/api.py` returning `{window_start, window_end, messages_total, with_cashtag, with_ca, resolved, dispatched, linked_outcome_open, linked_outcome_closed, closed_actionable, closed_exploratory}`. Single composite query against the 3 tables. Read-only. Add a Signals or TG tab panel rendering the funnel stages with row counts + drop-off percentages. No new schema.
+**Decision-by:** evidence-gated on operator wanting TG funnel visibility prioritized over other dashboard work. Pairs with PR #184 outcome — if TG linkage gets implementation approval, this should ship in the same cycle.
+
+### BL-NEW-DASHBOARD-PIPELINE-GATE-BLOCKER-COUNTS: per-gate blocker telemetry + pipeline tab explanations
+**Status:** PROPOSED 2026-05-19 — surfaced from overnight dashboard triage; assignment item 9. Filed as a backend instrumentation task, NOT a UI fix.
+**Tag:** `dashboard` `pipeline` `observability` `gate-blockers`
+**Why:** Operator wants the Pipeline tab to show blocker/explanation counts: below score, safety blocked, MiroFish cap, alert gate, rate-limit/cooldown, etc. Existing `/api/funnel/latest` returns per-stage row counts but no per-gate blocker attribution. The actual gate-blocking sites in `scout/main.py`, `scout/gate.py`, `scout/safety.py`, `scout/mirofish/`, etc. emit structlog events on block but do NOT persist a counter that the dashboard can read. Without backend instrumentation, the dashboard can only show "blocker counts not available" honestly — which is the right empty-state per assignment scope.
+**Action:** ~6-10h. Two-part work:
+  1. **Backend instrumentation:** add a `pipeline_gate_blocks` table (or extend `signal_events`) capturing `(gate_name, candidate_id, blocked_at, reason)` at each block site. Persist per-cycle aggregates to a `pipeline_gate_block_counters` rollup table so the dashboard reads a single small table.
+  2. **Dashboard endpoint:** `GET /api/pipeline/gate_blockers?since=...` reading the rollup. Pipeline tab renders per-gate bar with block count + percentage of candidates blocked.
+Schema migration — gated on operator approval. Honest fallback today: explicit "Per-gate blocker counts not available — pending BL-NEW-DASHBOARD-PIPELINE-GATE-BLOCKER-COUNTS" empty-state in the Pipeline tab.
+**Decision-by:** evidence-gated on operator wanting pipeline-attribution visibility prioritized. Schema migration scope; ship in a dedicated cycle.
+
 ## Follow-ups filed 2026-05-16 from BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING PR
 
 These four entries were surfaced during the score/volume pruning PR's plan/design review cycle (V1+V2 plan, V3+V4 design). Filed per actionability discipline.
