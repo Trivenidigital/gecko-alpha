@@ -1,6 +1,6 @@
 # Backlog — gecko-alpha
 
-Last updated: 2026-05-19 (cycle 15: overnight drift-cleanup audit — closed 12 stale items with inline evidence citations; 4 items annotated as STILL OPEN or MERGED-DEPLOY-UNVERIFIED with elapsed-date flags; PR-stage R3 fold downgraded KEEP-ON verdicts to docs-only-PRESUMED per §9a)
+Last updated: 2026-05-19 (cycle 15: overnight drift-cleanup audit — closed 12 stale items with inline evidence citations; 3 items annotated as STILL OPEN with elapsed-date flags after PR #82 was DEPLOY-VERIFIED 2026-05-19 via runtime srilu schema evidence; PR-stage R3 fold downgraded KEEP-ON verdicts to docs-only-PRESUMED per §9a)
 
 ## Audit closure (2026-05-19)
 
