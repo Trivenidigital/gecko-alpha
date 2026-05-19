@@ -17,6 +17,7 @@ import {
   bucketToneColor,
   bucketToneBg,
 } from './traderQueue.js'
+import TradeDetailDrawer from './TradeDetailDrawer.jsx'
 
 const CLOSED_PER_PAGE = 20  // closed-trades pagination size
 
@@ -887,6 +888,13 @@ export default function TradingTab() {
   // clears cohort+reason, and vice versa. This keeps the drilldown chip
   // unambiguous and prevents accidental empty intersections.
   const [openBucketFilter, setOpenBucketFilter] = useState(null)
+  // BL-NEW-DASHBOARD-TRADE-DETAIL-DRILLDOWN: clicking the chevron on an
+  // open-positions row toggles `expandedPositionId` to that row's id.
+  // Renders an inline TradeDetailDrawer beneath the row.
+  const [expandedPositionId, setExpandedPositionId] = useState(null)
+  const toggleExpandedPosition = useCallback((id) => {
+    setExpandedPositionId((prev) => (prev === id ? null : id))
+  }, [])
   const [positions, setPositions] = useState([])
   const [history, setHistory] = useState([])
   const [closedPage, setClosedPageState] = useState(_readStoredPage)
@@ -1336,12 +1344,33 @@ export default function TradingTab() {
                   // coherent story even after partial fills.
                   const pnlUsd = p.total_pnl_usd
                   const pnlPct = p.total_pnl_pct
+                  const isExpanded = expandedPositionId != null && expandedPositionId === p.id
                   return (
-                    <tr key={p.id || i}>
+                    <React.Fragment key={p.id || i}>
+                    <tr data-testid={`open-position-row-${p.id}`}>
                       <td className="rank-cell" style={{ whiteSpace: 'nowrap', textAlign: 'center', fontWeight: 600, fontSize: 13 }}>
                         {p.total_pnl_pct == null ? '—' : (pnlRankMap.get(p.id) ?? '—')}
                       </td>
                       <td>
+                        <button
+                          type="button"
+                          onClick={() => toggleExpandedPosition(p.id)}
+                          aria-label={isExpanded ? 'Collapse detail' : 'Expand detail'}
+                          aria-expanded={isExpanded}
+                          data-testid={`open-position-expand-${p.id}`}
+                          title={isExpanded ? 'Collapse trade detail' : 'Show trade detail (entry/exit risk/source)'}
+                          style={{
+                            background: 'transparent',
+                            border: 'none',
+                            color: 'var(--color-text-secondary)',
+                            cursor: 'pointer',
+                            fontSize: 12,
+                            padding: '0 6px 0 0',
+                            verticalAlign: 'middle',
+                          }}
+                        >
+                          {isExpanded ? '▾' : '▸'}
+                        </button>
                         <TokenLink
                           tokenId={p.coin_id || p.token_id}
                           symbol={getTokenLabel(p)}
@@ -1453,6 +1482,10 @@ export default function TradingTab() {
                         </button>
                       </td>
                     </tr>
+                    {isExpanded && (
+                      <TradeDetailDrawer position={p} colSpan={16} />
+                    )}
+                    </React.Fragment>
                   )
                 })}
               </tbody>
