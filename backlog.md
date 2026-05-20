@@ -44,10 +44,25 @@
 **Scope:** wrap each unbounded `{e}` site with `type(e).__name__` + `str(e)[:120]` pattern. ~6 line edits in run-scanner-cycle.py. VPS-only.
 
 ### BL-NEW-HERMES-CRON-SUBPROCESS-LIFECYCLE-AUDIT
-**Status:** PROPOSED 2026-05-20.
-**Why:** Step 1 instrumentation revealed that Hermes cron's `subprocess.run(timeout=120)` does NOT actually kill the Python sub-subprocess when the wrapper SIGTERM fires at 120s — the Python orphans to PID 1 and continues running. Currently OK at hourly schedule (234s peak << 3600s gap), but if cycle runtime ever overlaps the next cron tick, stacked orphans could exhaust CPU/memory. Hermes-platform-side issue, not gecko-alpha-side.
-**Scope:** audit hermes-agent `scheduler.py` subprocess-lifecycle to determine whether the daemon SHOULD propagate SIGTERM/SIGKILL to the process group (using `preexec_fn=os.setsid` + `os.killpg`). If yes, file upstream feedback. If acceptable as-is, document the orphaned-Python-completes-work pattern so future operators don't misread `last_status=error` as "work failed."
-**Surfaced by:** Vector A M1 finding during PR #201 review.
+**Status:** AUDITED-DEFERRED 2026-05-20 (post-PR-#204 audit completed).
+**Why:** Step 1 instrumentation revealed that Hermes cron's `subprocess.run(timeout=120)` does NOT actually kill the Python sub-subprocess when the wrapper SIGTERM fires at 120s — the Python orphans to PID 1 and continues running.
+**Audit findings (P3 audit, 6h-block 2026-05-20):**
+
+1. **Wrapper structure analysis:** `/home/gecko-agent/.hermes/scripts/gecko_x_narrative_scanner.sh` spawns Python synchronously and does post-processing (grep + printf) AFTER Python exits. The post-processing produces the cron job's stdout (which becomes Telegram message body). `exec` is NOT viable without restructuring the wrapper's grep step.
+
+2. **Overlap risk post-PR-#204:** The fcntl.flock guard at script entry (Python-level) blocks duplicate-Python execution. Even if Hermes cron starts two wrappers within the same hour, only ONE Python runs; the second emits `SCANNER-CYCLE-SKIP-OVERLAP` + exits 0. Effective overlap-stacking risk eliminated.
+
+3. **Orphan completes work + cron records error:** This is COSMETIC, not functional. The Python orphan keeps writing to its open file descriptor and the cycle-report log captures everything. `jobs.json.last_status=error` is misleading but the work IS happening. Operators can verify via the cycle-report log.
+
+4. **Concurrency=3 cuts typical cycles to ~79s** — orphan behavior only manifests on cycles that exceed 120s (now rare). The high-impact path is closed.
+
+**Verdict:** Current behavior acceptable. No tiny safe fix exists (`exec` requires wrapper restructure; `trap SIGTERM + killpg` adds complexity without clear win). Restructure deferred unless:
+- Sustained cycles > 120s become common despite parallelization
+- Operator-facing `jobs.json.last_status` reliability becomes a hard requirement
+- Resource pressure manifests from accumulated orphans (currently no observed orphan processes)
+
+**Recommendation:** keep wrapper as-is. Revisit if any of the above conditions develop. File deferred design as separate effort if triggered.
+**Surfaced by:** Vector A M1 finding during PR #201 review. **Audited by:** P3 audit in 6h-block 2026-05-20T05:13Z.
 
 ### BL-NEW-HERMES-NARRATIVE-DEFERRED-RESOLUTION-SWEEP
 **Status:** PROPOSED 2026-05-20.
