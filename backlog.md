@@ -34,9 +34,12 @@
 **Fallback:** if parallelization hits OpenRouter rate-limit ceiling, fall back to verdict (a) timeout extension via systemd `HERMES_CRON_SCRIPT_TIMEOUT=240` (subject to the plan v3 hard cap: `min(2×p95, 1800s)`).
 
 ### BL-NEW-HERMES-CRON-NO-AGENT-FLAG-WATCHDOG
-**Status:** PROPOSED 2026-05-20.
+**Status:** SHIPPED 2026-05-20 — `scripts/hermes-no-agent-flag-check.sh` landed via this PR. Operator-runnable on-demand or schedulable via cron. No alerting wired (operator pipes stderr to their preferred channel).
 **Why:** `jobs.json` `no_agent: true` flag is what keeps the historical 2026-05-15 prompt-injection failure mode resolved. If a future PR or operator accidentally flips it, the May 15 issue returns silently. Programmatic guardrail needed.
-**Scope:** extend the existing cron watchdog (landed PR #156/#161) to assert `.jobs[] | select(.id=="c849fffec986") | .no_agent == true` and alert to Telegram on flip. Single-line jq extraction. Cheap.
+**Implementation:** Standalone bash script in `scripts/` validating 5 invariants from `/home/gecko-agent/.hermes/cron/jobs.json`: (1) file readable, (2) job `gecko-x-narrative-scanner` (id `c849fffec986`) present, (3) `no_agent == true`, (4) `enabled == true`, (5) `script` path non-empty. Distinct exit codes (0/1/2/3/4/5/6) for each failure class. Structured JSON event on stderr. Tests under `tests/test_hermes_no_agent_flag_check.py` (skipped on Windows per `test_cron_drift_watchdog.py` precedent).
+**Smoke-tested on prod 2026-05-20T04:53Z:** happy path emits `HERMES-NO-AGENT-CHECK-OK ... no_agent=true ...` exit 0; missing jobs.json emits structured JSON failure exit 1.
+**Operator action (optional):** schedule via cron if desired:
+`0 */2 * * * /root/gecko-alpha/scripts/hermes-no-agent-flag-check.sh --quiet || /path/to/alerter`
 
 ### BL-NEW-SCANNER-EXISTING-EXCEPTION-BOUNDING
 **Status:** PROPOSED 2026-05-20.
