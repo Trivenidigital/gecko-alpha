@@ -568,3 +568,143 @@ async def test_11_duplicate_stamp_raises(db):
             settings=_settings(),
         )
     assert "UNIQUE" in str(excinfo.value) or "PRIMARY KEY" in str(excinfo.value) or "constraint" in str(excinfo.value).lower()
+
+
+# -- Tests for Vector B I-B1 + I-B2 folds (post-impl-review) ---------------
+
+
+async def test_ib1_unparseable_audit_does_not_leak_current_signal_params(db):
+    """Vector B I-B1 fold: when an audit row exists at applied_at <= opened_at
+    but new_value is unparseable, _read_trail_at_entry returns None instead
+    of silently falling through to current signal_params (which would leak
+    post-open recalibrations)."""
+    pre_open_iso = "2026-05-19T23:00:00+00:00"
+
+    # Single pre-open audit row with unparseable new_value (e.g., a buggy
+    # writer storing "None" or "40%" instead of "40.0")
+    await db._conn.execute(
+        "INSERT INTO signal_params_audit "
+        "(signal_type, field_name, old_value, new_value, reason, "
+        "applied_by, applied_at) VALUES "
+        "('narrative_prediction', 'trail_pct', '30.0', '40%', "
+        "'buggy unit suffix', 'test', ?)",
+        (pre_open_iso,),
+    )
+    await db._conn.commit()
+
+    # Mutate current signal_params.trail_pct to a value that, if leaked,
+    # would be detectable.
+    await db._conn.execute(
+        "UPDATE signal_params SET trail_pct=99.9 WHERE signal_type='narrative_prediction'"
+    )
+    await db._conn.commit()
+
+    trade_id = await _open_with_full_signal(
+        PaperTrader(), db, token_id="ib1-tok"
+    )
+    cur = await db._conn.execute(
+        "SELECT trail_pct_at_entry, entry_snapshot_complete, "
+        "entry_snapshot_missing_fields "
+        "FROM paper_trade_entry_snapshots WHERE paper_trade_id=?",
+        (trade_id,),
+    )
+    trail, complete, missing_json = await cur.fetchone()
+    # Unparseable audit row → return None. MUST NOT be 99.9 (current
+    # signal_params value, which would mean the post-open leak fired).
+    assert trail is None, (
+        f"unparseable audit row leaked current signal_params: trail={trail!r} "
+        f"(expected None; 99.9 would indicate I-B1 leak)"
+    )
+    assert complete == 0
+    missing = json.loads(missing_json)
+    assert "trail_pct_at_entry" in missing
+
+
+async def test_ib1_no_audit_history_falls_back_to_signal_params(db):
+    """Vector B I-B1 control: when NO audit history exists for a field, the
+    seed-baseline fallback (read current signal_params) IS used. The
+    seed-baseline read is correct because nothing has changed since seed."""
+    cur = await db._conn.execute(
+        "SELECT trail_pct FROM signal_params WHERE signal_type='narrative_prediction'"
+    )
+    seed_trail = (await cur.fetchone())[0]
+    assert seed_trail is not None  # sanity
+
+    trade_id = await _open_with_full_signal(
+        PaperTrader(), db, token_id="ib1-control-tok"
+    )
+    cur = await db._conn.execute(
+        "SELECT trail_pct_at_entry FROM paper_trade_entry_snapshots "
+        "WHERE paper_trade_id=?",
+        (trade_id,),
+    )
+    (trail,) = await cur.fetchone()
+    assert trail == seed_trail
+
+
+async def test_ib1_field_name_whitelist_enforced():
+    """Vector A Minor #3 fold: _read_trail_at_entry rejects unknown field
+    names to close the f-string SQL injection surface for future callers."""
+    from scout.trading.entry_snapshot import _read_trail_at_entry
+
+    with pytest.raises(ValueError, match="field_name"):
+        await _read_trail_at_entry(
+            None,
+            signal_type="narrative_prediction",
+            field_name="trail_pct; DROP TABLE paper_trades; --",
+            opened_at="2026-05-20T00:00:00+00:00",
+        )
+
+
+async def test_ib2_enriched_mcap_landed_in_snapshot(db):
+    """Vector B I-B2 fold: for a chain_completed trade where signal_data
+    lacks mcap but chain_matches has mcap_at_completion, the snapshot must
+    capture the SAME enriched mcap the classifier saw, not None."""
+    # Seed a chain_patterns parent row + chain_matches row supplying the
+    # enrichment value
+    cur = await db._conn.execute(
+        "INSERT INTO chain_patterns (name, description, steps_json, "
+        "min_steps_to_trigger) VALUES ('p2', 'test', '[]', 2)"
+    )
+    pattern_id = cur.lastrowid
+    await db._conn.execute(
+        "INSERT INTO chain_matches "
+        "(token_id, pipeline, pattern_id, pattern_name, steps_matched, "
+        "total_steps, anchor_time, completed_at, chain_duration_hours, "
+        "conviction_boost, mcap_at_completion) "
+        "VALUES ('chain-tok', 'p1', ?, 'p2', 2, 2, "
+        "'2026-05-19T23:00:00+00:00', '2026-05-19T23:30:00+00:00', "
+        "0.5, 5, 15000000)",
+        (pattern_id,),
+    )
+    await db._conn.commit()
+
+    # Open a chain_completed trade with EMPTY signal_data (no mcap)
+    trade_id = await PaperTrader().execute_buy(
+        db=db,
+        token_id="chain-tok",
+        symbol="CHAIN",
+        name="Chain Tok",
+        chain="coingecko",
+        signal_type="chain_completed",
+        signal_data={},
+        current_price=1.0,
+        amount_usd=300.0,
+        tp_pct=20.0,
+        sl_pct=10.0,
+        signal_combo="chain_completed",
+        settings=_settings(),
+    )
+    assert trade_id is not None
+
+    cur = await db._conn.execute(
+        "SELECT mcap_usd_at_entry, mcap_bucket_at_entry "
+        "FROM paper_trade_entry_snapshots WHERE paper_trade_id=?",
+        (trade_id,),
+    )
+    mcap, bucket = await cur.fetchone()
+    assert mcap == 15_000_000, (
+        f"enriched mcap did not land in snapshot: got {mcap!r} "
+        f"(expected 15_000_000 from chain_matches enrichment path)"
+    )
+    assert bucket == "10_50m"

@@ -164,24 +164,67 @@ async def _read_tg_channel_at_entry(
     return row[0] if row else None
 
 
+_TRAIL_FIELDS_ALLOWED: frozenset[str] = frozenset(
+    {"trail_pct", "trail_pct_low_peak"}
+)
+
+
 async def _read_trail_at_entry(
     db, *, signal_type: str, field_name: str, opened_at: str
 ) -> float | None:
     """Vector B C2 fix: audit-replay against signal_params_audit with
     applied_at <= opened_at bound. Falls back to current signal_params
-    only when no audit history exists (seed-baseline case)."""
+    ONLY when no audit row exists with applied_at <= opened_at — never
+    when an audit row exists but its new_value is unparseable (Vector B
+    I-B1 fix: unparseable-fallback would silently leak post-open
+    signal_params, defeating the temporal bound)."""
+    # Whitelist guard (Vector A Minor #3): only known trail fields allowed
+    # in the f-string SQL site below.
+    if field_name not in _TRAIL_FIELDS_ALLOWED:
+        raise ValueError(
+            f"_read_trail_at_entry: field_name={field_name!r} not in "
+            f"{_TRAIL_FIELDS_ALLOWED}"
+        )
+
+    # Use COUNT-then-fetch so we distinguish "no audit history" (→ fallback
+    # to seed) from "audit row exists but unparseable" (→ return None, no
+    # fallback).
     cur = await db._conn.execute(
-        "SELECT new_value FROM signal_params_audit "
-        "WHERE signal_type=? AND field_name=? AND applied_at <= ? "
-        "ORDER BY applied_at DESC LIMIT 1",
+        "SELECT COUNT(*) FROM signal_params_audit "
+        "WHERE signal_type=? AND field_name=? AND applied_at <= ?",
         (signal_type, field_name, opened_at),
     )
-    row = await cur.fetchone()
-    if row is not None and row[0] is not None:
+    audit_count = (await cur.fetchone())[0]
+
+    if audit_count > 0:
+        # Audit history exists at-or-before opened_at; the at-entry value
+        # MUST come from there. If the latest row is unparseable, return
+        # None (the unparseable-fallback to current signal_params would
+        # leak post-open recalibrations).
+        cur = await db._conn.execute(
+            "SELECT new_value FROM signal_params_audit "
+            "WHERE signal_type=? AND field_name=? AND applied_at <= ? "
+            "ORDER BY applied_at DESC LIMIT 1",
+            (signal_type, field_name, opened_at),
+        )
+        row = await cur.fetchone()
+        if row is None or row[0] is None:
+            return None
         try:
             return float(row[0])
         except (TypeError, ValueError):
-            pass
+            log.warning(
+                "entry_snapshot_trail_unparseable",
+                signal_type=signal_type,
+                field_name=field_name,
+                opened_at=opened_at,
+                raw=row[0],
+            )
+            return None
+
+    # No audit history → seed-baseline still in effect; signal_params holds
+    # the seed value, which provably equals the at-entry value because
+    # nothing has changed since seed.
     cur = await db._conn.execute(
         f"SELECT {field_name} FROM signal_params WHERE signal_type=?",
         (signal_type,),
