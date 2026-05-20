@@ -1680,6 +1680,150 @@ Two entries surfaced during the 2026-05-19 trader/strategist brainstorm synthesi
 
 ---
 
+## Follow-ups filed 2026-05-20 from entry-snapshot impl-review pass (PR #200)
+
+Seven entries surfaced during the two-vector reviewer pass against PR #200's
+implementation. The two Vector B Important findings (I-B1 + I-B2) were folded
+into PR #200 (`affafec`); these are the residual Minor / out-of-scope items.
+
+### BL-NEW-ACTIONABILITY-CANDIDATES-FIRST-SEEN-PRESERVE: stop overwriting first_seen_at on re-ingest
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `data-integrity` `candidates` `ingestion` `actionability`
+**Why:** `_upsert_candidate` at `scout/db.py:4495` uses `INSERT OR REPLACE`,
+and `CandidateToken.first_seen_at` defaults to `now()` on construction
+(`scout/models.py:75`). When a token is re-ingested in a later cycle, the row
+is replaced including `first_seen_at` — overwriting the earliest sighting with
+the most-recent. Downstream consumers reading `first_seen_at` (now including
+`paper_trade_entry_snapshots.first_seen_at_at_entry` via this PR) see a
+lower-bound near-zero value instead of true age, especially for micro-cap
+re-rotations. Surfaced as Vector B I-B3 against PR #200.
+
+**Scope:** Either (a) change `upsert_candidate` to use a SQL `COALESCE`
+pattern that preserves the earlier `first_seen_at` value, OR (b) split into
+explicit `insert_candidate_if_new` + `update_candidate` paths so the writer
+intent is explicit. Add a regression test that exercises the re-ingest path
+and asserts `first_seen_at` does NOT change.
+
+**Constraints:** Must NOT break existing test fixtures that rely on the
+upsert semantics. Audit the data-on-disk for tokens with implausibly recent
+`first_seen_at` (suspected re-ingestion drift) and decide whether to backfill
+from `score_history.scanned_at` MIN.
+
+**Acceptance:** `first_seen_at` is monotonic per `(contract_address, chain)`.
+Regression test asserts. Documentation in `docs/gecko-alpha-alignment.md`
+captures the contract.
+
+### BL-NEW-ACTIONABILITY-MIGRATION-SCHEMA-DRIFT-DETECTED-LOG: parity with minara migration helper
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `migration` `observability` `actionability`
+**Why:** `_migrate_actionability_entry_snapshot_v1` ROLLBACK except-block omits
+the `SCHEMA_DRIFT_DETECTED` operational log that the sibling
+`_migrate_minara_alert_emissions_v1` emits at `scout/db.py:3554`. Operator
+monitoring that greps `SCHEMA_DRIFT_DETECTED` won't catch a failure of the
+new migration. Surfaced as Vector A Minor #1 against PR #200.
+
+**Scope:** Add `_log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)`
+to the except block at `scout/db.py:3650-3661`. Two-line change.
+
+**Acceptance:** Sibling-migration parity; greppable from monitoring.
+
+### BL-NEW-ACTIONABILITY-MIGRATION-ASSERT-SCHEMA: post-migration shape assert
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `migration` `schema-drift` `actionability`
+**Why:** The sibling minara migration has `_assert_minara_alert_emissions_schema`
+(2-pass: before-index and after-index) that catches CHECK/column drift at
+migration time. The new actionability migration has no equivalent. If a
+future operator runs an `ALTER TABLE` on prod and the helper migrates a
+partially-correct shape, drift surfaces at INSERT time (loud) instead of
+migration time (loudest). Surfaced as Vector A Minor #2 against PR #200.
+
+**Scope:** Add `_assert_paper_trade_entry_snapshots_schema` matching the
+sibling shape. Wire into the migration helper. Add a test that mutates the
+table (drops the CHECK constraint, removes a column) + re-invokes initialize()
++ asserts the assert raises with a clear error.
+
+**Acceptance:** Drift surfaces at migration time, not INSERT time.
+
+### BL-NEW-ACTIONABILITY-CANDIDATES-CASE-FIDELITY: test fixture vs prod data mismatch
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `test-fidelity` `actionability`
+**Why:** `tests/test_entry_snapshot.py::_ensure_candidate_row` lowercases the
+contract_address before inserting (`contract_address.lower()`). Real-world
+prod data carries checksummed mixed-case addresses (ETH/BSC). The
+`_read_first_seen_at` query at `entry_snapshot.py:128` uses
+`LOWER(contract_address)=LOWER(?)` to handle this, but the test fixture
+data is degenerate for the case-fold path. Surfaced as Vector A Minor #4
+against PR #200.
+
+**Scope:** Add a single test that seeds a mixed-case `contract_address` (e.g.,
+`0xAbCdEf...`) and asserts the LOWER() lookup resolves. Optional: audit
+existing fixtures for similar degeneracy.
+
+**Acceptance:** Case-fold path is structurally exercised in tests.
+
+### BL-NEW-ACTIONABILITY-TG-SIGNAL-TYPES-EXPANSION: applicable-fields semantic re-check
+**Status:** PROPOSED 2026-05-20 (evidence-gated).
+**Tag:** `actionability` `entry-snapshot` `signal-types`
+**Why:** `_applicable_optional_fields` at `entry_snapshot.py:45-47` hardcodes
+the `tg_social` branch as the only signal_type for which `tg_channel_at_entry`
+is required. Future TG-relay variants (`tg_kol`, `tg_dao_calls`, etc.) would
+silently be marked `complete=1` with NULL channel, breaking source-quality
+analyses that filter on tg_channel. Surfaced as Vector B Minor #2 against
+PR #200.
+
+**Scope:** Trigger condition — at the time a NEW tg_* signal_type is added
+to `DEFAULT_SIGNAL_TYPES`. Audit + extend `_applicable_optional_fields` to
+include the new variant. File this entry so the cross-reference exists.
+
+**Constraints:** Evidence-gated; do NOT pre-emptively widen the branch
+beyond actual signal_types.
+
+**Acceptance:** When a new tg_* signal_type lands, the applicable-fields
+function is updated in the SAME PR.
+
+### BL-NEW-ACTIONABILITY-CANDIDATES-CROSS-CHAIN-FIRST-SEEN: cross-chain rediscovery
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `data-integrity` `candidates` `actionability`
+**Why:** `_read_first_seen_at` at `entry_snapshot.py:128` filters by
+`(contract_address, chain)`. For tokens later re-indexed under a different
+chain label (e.g., a Solana token rediscovered as `chain="coingecko"`), the
+query returns None even when an earlier candidates row exists under the
+original chain. Surfaced as Vector B Minor #1 against PR #200.
+
+**Scope:** Decide policy — match-by-contract-only (collapse chain
+distinctions for `first_seen_at`) vs match-by-(contract, chain) (current).
+Coordinate with BL-NEW-ACTIONABILITY-CANDIDATES-FIRST-SEEN-PRESERVE — both
+modify the same read pattern.
+
+**Acceptance:** Documented policy + matching read query in
+`entry_snapshot.py`.
+
+### BL-NEW-DASHBOARD-ENTRY-SNAPSHOT-DRAWER: surface *_at_entry in TradeDetailDrawer
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `dashboard` `actionability` `entry-snapshot`
+**Why:** PR #200 ships the substrate (`paper_trade_entry_snapshots` sidecar)
+but no dashboard surface consumes it yet. The TradeDetailDrawer (PR #195)
+already has a "Source / confluence" group — extending it to show
+`*_at_entry` fields when present, and "pre-cutover (no snapshot)" when
+absent, is the minimum-viable read.
+
+**Scope:**
+- `dashboard/db.py:get_open_positions` adds
+  `LEFT JOIN paper_trade_entry_snapshots s ON s.paper_trade_id = pt.id`
+  (NOT `USING (paper_trade_id)` — `paper_trades` column is `id`, not
+  `paper_trade_id`).
+- Drawer rendering of new fields + pre-cutover label.
+- Dist rebuild + commit per
+  `feedback_vite_dist_index_html_commit_discipline.md`.
+
+**Constraints:** Visibility-only; no behavior changes.
+
+**Acceptance:** Drawer shows snapshot values for post-cutover trades and a
+clear "pre-cutover" subtitle for older trades. Playwright smoke verifies
+no console errors + correct labeling.
+
+---
+
 ## Follow-ups filed 2026-05-19 from trader-cockpit overnight assignment (#194 / #195)
 
 Six entries surfaced during the dashboard cockpit overnight assignment. **All file-only, no implementation.** Operator scope: file for visibility / future scheduling; implementation requires separate approval. Pair with PR #194 (Trader Action Queue) + #195 (Trade Detail Drawer) which already covered the cheap drilldown surface.
