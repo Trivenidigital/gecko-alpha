@@ -2,6 +2,31 @@
 
 # Design: BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-FIX (Step 1: Instrumentation)
 
+## Design-review fold log (2026-05-20)
+
+Two reviewer vectors completed against design v1. **1 Critical + 4 Important folded.**
+
+| Finding | Vector | Status |
+|---|---|---|
+| C1: `finally` block does NOT fire under SIGKILL (cron timeout sequence: SIGTERM → grace → SIGKILL is uncatchable). In-flight stage at kill time won't emit, contradicting Gate 2 wording. | A | FOLDED — `_stage()` adds `SCANNER-STAGE-START` emit BEFORE the try block (captures stage entry even when killed mid-stage); Gate 2 wording updated to "≥N completed-stage emits where N = stages completed pre-kill, plus matching number of start emits" |
+| I1: Use `time.monotonic()` not `time.time()` for elapsed-duration measurement (NTP-immune, monotonic-correct) | A | FOLDED |
+| I2: `Colors.BLUE/RED` ANSI prepend on JSON emits makes report-file JSON harder to grep. (Note: wrapper's sed-strip extracts only the summary line for Telegram; full ANSI body stays in the report file — so this is a report-file cleanliness fix, not a Telegram-body fix.) | A | FOLDED — drop the Colors argument on JSON emits; use plain `print()` instead of `log()` for the SCANNER-STAGE-START/TIMING/CYCLE-SUMMARY lines |
+| I3 + F8: Counter `openrouter_other_error` is mis-attributed — broad `except` catches JSON parse, `KeyError`, `verify_hard_extraction_invariant` raises (NOT just OpenRouter). | A + B | FOLDED — rename to `classification_other_error`; OpenRouter-specific counters stay as `openrouter_4xx` and `openrouter_5xx` |
+| I4: `_stage()` mutates module-global `state` via closure — acceptable but worth a comment | A | FOLDED — comment added |
+| F1: Existing `log(f"... {e}")` callsites unbounded — new code stricter than surrounding | B | NOT FOLDED — out-of-scope per "additive, not boil-ocean"; filed as follow-up `BL-NEW-SCANNER-EXISTING-EXCEPTION-BOUNDING` |
+| F10: `print()` callsites in main() FINAL REPORT section inconsistent with `log()` | B | NOT FOLDED — pre-existing, not regressed; filed as follow-up `BL-NEW-SCANNER-PRINT-TO-LOG-CONSISTENCY` |
+| M1-M7 (A), M2-M11 (B) | both | Noted; not blocking. M6 (importlib smoke-import) added to pre-deploy syntax check below. |
+
+## Key correctness insight from design review
+
+**SIGKILL is uncatchable.** The cron timeout sequence is SIGTERM (graceful, `finally` fires) → grace period → SIGKILL (uncatchable). If a 136s-cycle hits the 120s budget mid-stage, SIGTERM gives some seconds of grace; if not handled in time, SIGKILL fires. Under SIGKILL, no Python cleanup runs.
+
+The fix: emit a `SCANNER-STAGE-START` line BEFORE the `try:` block in `_stage()`. This captures the moment a stage begins, before any work runs. So even if the stage is killed mid-execution, the report file shows which stage was running at kill time. The completed-stage `SCANNER-STAGE-TIMING` emit (from `finally`) still fires for stages that completed before SIGTERM; SIGKILL stages emit only START (no TIMING).
+
+Operator-readable verification: count of START lines = stages reached; count of TIMING lines = stages completed. Difference = stage in-flight at kill time.
+
+## Scope decision (operator-aligned per plan v3 §"Open questions" #3)
+
 ## Scope decision (operator-aligned per plan v3 §"Open questions" #3)
 
 This PR ships **Step 1 (instrumentation) + Step 1.5 (wrapper hardening) ONLY**. Step 4 (the actual fix shape) is DEFERRED to a follow-up PR (`BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-APPLY`) after Step 2 profiling produces 3-5 cycles of per-stage timing evidence.
@@ -40,10 +65,10 @@ Append (inside `__init__` before `state = CycleState()`):
         # additive observability for per-stage timing diagnosis.
         # JSON-encoded structured emit + kebab-case stage names to avoid
         # MarkdownV1 mangling under deliver=local Telegram path.
-        self.stage_timings = {}          # stage-name → elapsed_sec (float)
-        self.openrouter_4xx = 0          # 4xx error count from OpenRouter
-        self.openrouter_5xx = 0          # 5xx error count from OpenRouter
-        self.openrouter_other_error = 0  # connection/timeout/json-parse errors
+        self.stage_timings = {}            # stage-name → elapsed_sec (float)
+        self.openrouter_4xx = 0            # 4xx error count from OpenRouter HTTP response
+        self.openrouter_5xx = 0            # 5xx error count from OpenRouter HTTP response
+        self.classification_other_error = 0  # JSON parse, KeyError, invariant-violation, connection errors (Vector A/B I3/F8 fold)
 ```
 
 ### Hunk 1.2 — Add a `_stage()` wrapper helper
@@ -52,12 +77,29 @@ Insert immediately after the `log()` function (around line 45):
 
 ```python
 def _stage(name, fn, *args, **kwargs):
-    """Time a pipeline stage and emit a structured log line.
+    """Time a pipeline stage and emit structured log lines.
+
+    Design-review C1 fold: SIGKILL is uncatchable, so a `finally`-only
+    pattern misses the in-flight stage at kill time. We emit a START
+    line BEFORE the try block so the report-file shows which stage was
+    running even if the process is killed mid-stage. The END line emits
+    from `finally` for SIGTERM-or-clean exits.
+
+    Design-review I1 fold: time.monotonic() not time.time() (NTP-safe).
+    Design-review I2 fold: plain print() (no ANSI Colors) keeps the JSON
+    grep-clean in the report file.
+    Design-review I4 fold: `state` is module-global; this helper relies
+    on that. If ever moved to a module, inject `state` explicitly.
 
     Stage name MUST be kebab-case to avoid MarkdownV1 italics mangling
-    under deliver=local Telegram path (Vector A C2 fold)."""
+    under any future deliver-local Telegram path (Vector A C2 fold).
+    """
     import time as _t
-    t0 = _t.time()
+    print(json.dumps({
+        "event": "SCANNER-STAGE-START",
+        "stage": name,
+    }))
+    t0 = _t.monotonic()
     status = "success"
     error_type = None
     try:
@@ -68,7 +110,7 @@ def _stage(name, fn, *args, **kwargs):
         error_type = type(e).__name__
         raise
     finally:
-        elapsed = _t.time() - t0
+        elapsed = _t.monotonic() - t0
         state.stage_timings[name] = round(elapsed, 2)
         rec = {
             "event": "SCANNER-STAGE-TIMING",
@@ -78,9 +120,8 @@ def _stage(name, fn, *args, **kwargs):
         }
         if error_type:
             rec["error-type"] = error_type
-        # log() prepends a timestamp prefix; JSON payload is the message.
         # NEVER include args, kwargs, result, or any os.environ value.
-        log(json.dumps(rec), Colors.BLUE if status == "success" else Colors.RED)
+        print(json.dumps(rec))
 ```
 
 ### Hunk 1.3 — Wrap pipeline calls with `_stage()`
@@ -124,12 +165,13 @@ Replace with:
                 elif response.status_code >= 500:
                     state.openrouter_5xx += 1
                 else:
-                    state.openrouter_other_error += 1
+                    # <400 — likely a redirect or odd status code
+                    state.classification_other_error += 1
                 # NEVER log response.text or response.headers (Vector B I4).
-                log(json.dumps({
+                print(json.dumps({
                     "event": "SCANNER-OPENROUTER-ERROR",
                     "status-code": response.status_code,
-                }), Colors.RED)
+                }))
                 state.skips += 1
                 continue
 ```
@@ -154,12 +196,17 @@ Replace with (preserves existing behavior, adds counter):
             # NEVER include args/kwargs/headers/response-body in this log.
             # Exception message is bounded to type+truncated-str to prevent
             # accidental leakage if a downstream stack-frame held a secret.
-            state.openrouter_other_error += 1
-            log(json.dumps({
+            # Vector A/B I3/F8 fold: counter renamed to
+            # classification_other_error since this branch catches JSON
+            # parse errors, KeyErrors on result['choices'], and
+            # verify_hard_extraction_invariant raises — NOT just
+            # OpenRouter network/transport failures.
+            state.classification_other_error += 1
+            print(json.dumps({
                 "event": "SCANNER-CLASSIFICATION-ERROR",
                 "error-type": type(e).__name__,
                 "error-msg-truncated": str(e)[:120],
-            }), Colors.RED)
+            }))
             import traceback
             traceback.print_exc()
             state.skips += 1
@@ -175,7 +222,7 @@ Find the FINAL REPORT section (around line 690-720, where `SCANNER_CYCLE:` is em
     # JSON-encoded summary for greppability without parsing the colored
     # human-readable section.
     total_duration = (datetime.utcnow() - state.start_time).total_seconds()
-    log(json.dumps({
+    print(json.dumps({
         "event": "SCANNER-CYCLE-SUMMARY",
         "duration-sec": round(total_duration, 2),
         "stage-timings": state.stage_timings,
@@ -188,9 +235,9 @@ Find the FINAL REPORT section (around line 690-720, where `SCANNER_CYCLE:` is em
         "speculative-cas-scrubbed": state.speculative_cas_scrubbed,
         "openrouter-4xx": state.openrouter_4xx,
         "openrouter-5xx": state.openrouter_5xx,
-        "openrouter-other-error": state.openrouter_other_error,
+        "classification-other-error": state.classification_other_error,
         "blockers": state.blockers,
-    }), Colors.GREEN, bold=True)
+    }))
 ```
 
 Leave the existing colored `SCANNER_CYCLE: ...` line in place — it remains the operator-paste-friendly summary; the new JSON line is the machine-grep surface.
@@ -260,9 +307,14 @@ This is a VPS-only operational fix; no repo unit tests apply. Verification is vi
 
 ```bash
 # 1. Upload new file to /tmp/run-scanner-cycle.py.new on VPS via scp
-# 2. Syntax-check before atomic replace
-ssh srilu-vps 'python3 -m py_compile /tmp/run-scanner-cycle.py.new && python3 -c "import ast; ast.parse(open(\"/tmp/run-scanner-cycle.py.new\").read())" && echo SYNTAX_OK' > /tmp/syntax_check.txt
-# Read /tmp/syntax_check.txt — MUST show SYNTAX_OK before proceeding
+# 2. Three-step syntax + import-time check before atomic replace
+ssh srilu-vps 'python3 -m py_compile /tmp/run-scanner-cycle.py.new \
+  && python3 -c "import ast; ast.parse(open(\"/tmp/run-scanner-cycle.py.new\").read())" \
+  && python3 -c "import importlib.util; spec=importlib.util.spec_from_file_location(\"x\",\"/tmp/run-scanner-cycle.py.new\"); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)" 2>&1 \
+  && echo SYNTAX_OK' > /tmp/syntax_check.txt
+# Read /tmp/syntax_check.txt — MUST show SYNTAX_OK before proceeding.
+# The importlib step catches missing deps / top-level NameErrors that
+# py_compile + ast.parse miss (Vector A M6 fold).
 ```
 
 If SYNTAX_OK is not present, halt deploy.
@@ -297,9 +349,9 @@ All 11 invariants from plan v3 hold. Highlights for this design's specifics:
 
 For the SUBSEQUENT cron tick after deploy:
 
-1. **Gate 1 (instrumentation count):** the cycle-report log contains AT LEAST 4 `SCANNER-STAGE-TIMING` lines (one per stage) AND 1 `SCANNER-CYCLE-SUMMARY` line.
+1. **Gate 1 (instrumentation completeness):** for a CLEAN cycle (no timeout): the cycle-report log contains EXACTLY 4 `SCANNER-STAGE-START` lines AND 4 `SCANNER-STAGE-TIMING` lines (matching pairs, one per stage) AND 1 `SCANNER-CYCLE-SUMMARY` line. For a KILLED cycle (cron timeout): `count(START) > count(TIMING)` — the difference is the stage that was in-flight at kill time. SIGKILL skips `finally` (Vector A C1 finding), so the in-flight stage emits START but no TIMING.
 
-2. **Gate 2 (last_status flip):** `jobs.json` shows `last_status="success"` (or, if a 136s+ cycle hits the 120s timeout AGAIN, `last_status="error"` is expected pending Step 4 fix — but log content must still show all 4 stage-timing emits up to the point of SIGTERM).
+2. **Gate 2 (last_status semantics):** `jobs.json` `last_status="success"` is the goal for clean cycles. If a 136s+ cycle still hits the 120s budget (Step 4 fix not yet applied), `last_status="error"` is expected — but the cycle-report log MUST show ≥1 `SCANNER-STAGE-START` line and the count(START)-count(TIMING) delta correctly identifies the killed stage.
 
 3. **Gate 3 (no prompt-injection regression):** zero matches for `prompt.injection|exfil_curl_auth` in journal since fix-deploy-ts.
 
