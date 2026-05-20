@@ -184,6 +184,12 @@ class PaperTrader:
                 )
             stack_for_actionability = 0
 
+        # BL-NEW-ACTIONABILITY-ENTRY-SNAPSHOT-FOUNDATION (Vector B I-B2 fold):
+        # default the snapshot-input signal_data to the raw signal_data; if
+        # enrichment runs successfully, switch to the enriched dict so the
+        # snapshot captures the SAME mcap the classifier saw.
+        snapshot_signal_data = signal_data
+
         if actionability is None:
             try:
                 actionability_signal_data = await _enrich_actionability_signal_data(
@@ -192,6 +198,7 @@ class PaperTrader:
                     signal_type=signal_type,
                     signal_data=signal_data,
                 )
+                snapshot_signal_data = actionability_signal_data
                 actionability = evaluate_actionability_v1(
                     signal_type=signal_type,
                     signal_data=actionability_signal_data,
@@ -269,6 +276,40 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         )
         trade_id = cursor.lastrowid
         await conn.commit()
+
+        # BL-NEW-ACTIONABILITY-ENTRY-SNAPSHOT-FOUNDATION: metadata-only stamp
+        # of point-in-time entry facts. Wrapped so any failure degrades to a
+        # structured log and never blocks the trade-open contract (the trade
+        # is already committed at this point).
+        try:
+            from scout.trading.entry_snapshot import stamp_entry_snapshot
+
+            await stamp_entry_snapshot(
+                db,
+                trade_id=trade_id,
+                opened_at=now,
+                signal_type=signal_type,
+                # Vector B I-B2 fold: pass enriched signal_data so the
+                # snapshot captures the SAME mcap the classifier saw.
+                # Falls back to raw signal_data on enrichment failure.
+                signal_data=snapshot_signal_data,
+                signal_combo=signal_combo,
+                tp_pct=tp_pct,
+                sl_pct=sl_pct,
+                actionable_value=actionable_value,
+                actionability_reason=actionability_reason,
+                actionability_version=actionability_version,
+                contract_address=token_id,
+                chain=chain,
+                settings=settings,
+            )
+        except Exception:
+            log.exception(
+                "entry_snapshot_stamp_failed",
+                trade_id=trade_id,
+                token_id=token_id,
+                signal_type=signal_type,
+            )
 
         log.info(
             "paper_trade_opened",

@@ -106,6 +106,10 @@ class Database:
         await self._migrate_tg_alert_log_m1_5c_outcome()
         await self._migrate_narrative_scanner_v1()
         await self._migrate_minara_alert_emissions_v1()
+        # BL-NEW-ACTIONABILITY-ENTRY-SNAPSHOT-FOUNDATION (2026-05-20):
+        # ordered AFTER minara_alert_emissions so the paper_trades FK target
+        # is guaranteed to exist + already-migrated (Vector A I4).
+        await self._migrate_actionability_entry_snapshot_v1()
         await self._migrate_chain_pattern_provenance_v1()
         await self._migrate_score_history_scanned_at_index()
         await self._migrate_volume_snapshots_scanned_at_index()
@@ -3552,6 +3556,108 @@ class Database:
             except Exception:
                 pass
             _log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)
+            raise
+
+    async def _migrate_actionability_entry_snapshot_v1(self) -> None:
+        """BL-NEW-ACTIONABILITY-ENTRY-SNAPSHOT-FOUNDATION: durable at-entry
+        snapshot sidecar for paper_trades. See PR #199 design doc and the
+        review-fold log. Pattern mirrors _migrate_minara_alert_emissions_v1."""
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "bl_actionability_entry_snapshot_v1"
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info(
+                    "bl_actionability_entry_snapshot_v1_migration_skip_already_applied"
+                )
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_trade_entry_snapshots (
+                    paper_trade_id INTEGER PRIMARY KEY,
+                    entry_snapshot_version TEXT NOT NULL,
+                    entry_snapshot_complete INTEGER NOT NULL
+                        CHECK (entry_snapshot_complete IN (0, 1)),
+                    entry_snapshot_missing_fields TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    signal_type TEXT,
+                    mcap_usd_at_entry REAL,
+                    mcap_bucket_at_entry TEXT,
+                    liquidity_usd_at_entry REAL,
+                    token_age_days_at_entry REAL,
+                    first_seen_at_at_entry TEXT,
+                    detected_by_combo_at_entry TEXT,
+                    source_confluence_count_at_entry INTEGER,
+                    tg_channel_at_entry TEXT,
+                    actionability_version_at_entry TEXT,
+                    actionability_reason_at_entry TEXT,
+                    actionable_at_entry INTEGER,
+                    tp_pct_at_entry REAL,
+                    sl_pct_at_entry REAL,
+                    trail_pct_at_entry REAL,
+                    trail_pct_low_peak_at_entry REAL,
+                    FOREIGN KEY (paper_trade_id)
+                        REFERENCES paper_trades(id) ON DELETE RESTRICT
+                )
+                """
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ptes_version "
+                "ON paper_trade_entry_snapshots(entry_snapshot_version)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ptes_complete "
+                "ON paper_trade_entry_snapshots(entry_snapshot_complete)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260520, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "bl_actionability_entry_snapshot_v1_migration_complete",
+                table="paper_trade_entry_snapshots",
+            )
+        except BaseException as e:
+            _log.exception(
+                "bl_actionability_entry_snapshot_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                pass
             raise
 
     async def _assert_minara_alert_emissions_schema(
