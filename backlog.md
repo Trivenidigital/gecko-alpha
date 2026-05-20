@@ -1632,6 +1632,198 @@ scout/trading/
 
 ---
 
+## Actionability measurement substrate 2026-05-20
+
+Two entries surfaced during the 2026-05-19 trader/strategist brainstorm synthesis: the next quality jump for actionability is durable point-in-time entry facts plus an operator feedback loop — NOT a smarter composite score. Both filed PROPOSED; implementation of `FOUNDATION` happens in its own design-then-implementation PR. `OPERATOR-FEEDBACK-MARKS` is a separate sequel and **must not be bundled** with the foundation implementation.
+
+### BL-NEW-ACTIONABILITY-ENTRY-SNAPSHOT-FOUNDATION: stamp point-in-time entry facts for future V2
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `actionability` `measurement-substrate` `paper-trading` `schema` `analytics`
+**Why:** Actionability V2, source quality, and profit-pattern analysis should not reconstruct entry context from mutable/current tables. Reconstructed features can leak future state, vary by coverage, and smear stamped rows with historical rows. The next serious quality improvement is a measurement substrate, not a smarter-looking score.
+
+**Core principle:** persist point-in-time entry facts at paper-trade open. This is metadata only: no classifier changes, no suppression, no capital allocation, and no paper-trade open/exit behavior changes beyond durable stamping.
+
+**Must-have today-computable fields:**
+- `entry_snapshot_version`
+- `entry_snapshot_complete`
+- `entry_snapshot_missing_fields`
+- `signal_type`
+- `mcap_usd_at_entry`
+- `mcap_bucket_at_entry`
+- `liquidity_usd_at_entry` when present in signal data
+- `token_age_days_at_entry` or `first_seen_at_entry` when available
+- `detected_by_combo_at_entry` when available
+- `source_confluence_count_at_entry` when available
+- `tg_channel_at_entry` for `tg_social` when available
+- `actionability_version`
+- `actionability_reason`
+- active exit params at entry (`tp_pct_at_entry`, `sl_pct_at_entry`, and trail / peak-fade params if present in current signal params)
+
+**Explicitly deferred fields:** `x_handle_at_entry` (pending PR #184 / X linkage design), `price_freshness_seconds_at_entry` (pending price-cache writer/hot-path instrumentation), richer resolver confidence/linkage state (partial today; should not block foundation).
+
+**Coverage contract:** If all required today-computable fields are present, mark `entry_snapshot_complete=true`. Missing optional/deferred fields must not fail paper-trade open; record them in `entry_snapshot_missing_fields`. Dashboard/backtests must distinguish fully stamped rows, partially stamped rows, and pre-cutover/reconstructed historical rows.
+
+**Design requirement:** Compare wide `paper_trades` columns vs a `paper_trade_entry_snapshots` sidecar table keyed by `paper_trade_id`. Prefer the shape that minimizes hot-path risk while keeping snapshot growth manageable. If unsure, stop at design PR rather than forcing a late-night migration.
+
+**Acceptance:** New paper trades have durable entry snapshots with explicit coverage state. Historical/reconstructed rows cannot be silently mixed with complete stamped rows in actionability/V2 analysis.
+
+### BL-NEW-ACTIONABILITY-OPERATOR-FEEDBACK-MARKS: dashboard learning-loop annotations
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `actionability` `operator-feedback` `dashboard` `learning-loop`
+**Why:** The false-negative explorer can surface exploratory winners, but without an operator mark there is no feedback loop from "this was real" back into future V2 design. Human review should be captured as durable metadata before it becomes tuning input.
+
+**Scope:** From the trade detail drawer, allow the operator to mark a trade/signal as `real_winner`, `false_positive`, `interesting_but_late`, `bad_source_noisy`, or `ignore`, with an optional note. This should be a separate primitive from entry snapshots.
+
+**Constraints:** No classifier changes, no suppression, no live/capital behavior, and no automated V2 learning from marks until separately designed. Implement after `BL-NEW-ACTIONABILITY-ENTRY-SNAPSHOT-FOUNDATION` or as a separate reviewed PR.
+
+**Acceptance:** Operator feedback is persisted, visible in dashboard/read models, and exportable for later V2 review without changing trading behavior.
+
+---
+
+## Follow-ups filed 2026-05-20 from entry-snapshot impl-review pass (PR #200)
+
+Seven entries surfaced during the two-vector reviewer pass against PR #200's
+implementation. The two Vector B Important findings (I-B1 + I-B2) were folded
+into PR #200 (`affafec`); these are the residual Minor / out-of-scope items.
+
+### BL-NEW-ACTIONABILITY-CANDIDATES-FIRST-SEEN-PRESERVE: stop overwriting first_seen_at on re-ingest
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `data-integrity` `candidates` `ingestion` `actionability`
+**Why:** `_upsert_candidate` at `scout/db.py:4495` uses `INSERT OR REPLACE`,
+and `CandidateToken.first_seen_at` defaults to `now()` on construction
+(`scout/models.py:75`). When a token is re-ingested in a later cycle, the row
+is replaced including `first_seen_at` — overwriting the earliest sighting with
+the most-recent. Downstream consumers reading `first_seen_at` (now including
+`paper_trade_entry_snapshots.first_seen_at_at_entry` via this PR) see a
+lower-bound near-zero value instead of true age, especially for micro-cap
+re-rotations. Surfaced as Vector B I-B3 against PR #200.
+
+**Scope:** Either (a) change `upsert_candidate` to use a SQL `COALESCE`
+pattern that preserves the earlier `first_seen_at` value, OR (b) split into
+explicit `insert_candidate_if_new` + `update_candidate` paths so the writer
+intent is explicit. Add a regression test that exercises the re-ingest path
+and asserts `first_seen_at` does NOT change.
+
+**Constraints:** Must NOT break existing test fixtures that rely on the
+upsert semantics. Audit the data-on-disk for tokens with implausibly recent
+`first_seen_at` (suspected re-ingestion drift) and decide whether to backfill
+from `score_history.scanned_at` MIN.
+
+**Acceptance:** `first_seen_at` is monotonic per `(contract_address, chain)`.
+Regression test asserts. Documentation in `docs/gecko-alpha-alignment.md`
+captures the contract.
+
+### BL-NEW-ACTIONABILITY-MIGRATION-SCHEMA-DRIFT-DETECTED-LOG: parity with minara migration helper
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `migration` `observability` `actionability`
+**Why:** `_migrate_actionability_entry_snapshot_v1` ROLLBACK except-block omits
+the `SCHEMA_DRIFT_DETECTED` operational log that the sibling
+`_migrate_minara_alert_emissions_v1` emits at `scout/db.py:3554`. Operator
+monitoring that greps `SCHEMA_DRIFT_DETECTED` won't catch a failure of the
+new migration. Surfaced as Vector A Minor #1 against PR #200.
+
+**Scope:** Add `_log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)`
+to the except block at `scout/db.py:3650-3661`. Two-line change.
+
+**Acceptance:** Sibling-migration parity; greppable from monitoring.
+
+### BL-NEW-ACTIONABILITY-MIGRATION-ASSERT-SCHEMA: post-migration shape assert
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `migration` `schema-drift` `actionability`
+**Why:** The sibling minara migration has `_assert_minara_alert_emissions_schema`
+(2-pass: before-index and after-index) that catches CHECK/column drift at
+migration time. The new actionability migration has no equivalent. If a
+future operator runs an `ALTER TABLE` on prod and the helper migrates a
+partially-correct shape, drift surfaces at INSERT time (loud) instead of
+migration time (loudest). Surfaced as Vector A Minor #2 against PR #200.
+
+**Scope:** Add `_assert_paper_trade_entry_snapshots_schema` matching the
+sibling shape. Wire into the migration helper. Add a test that mutates the
+table (drops the CHECK constraint, removes a column) + re-invokes initialize()
++ asserts the assert raises with a clear error.
+
+**Acceptance:** Drift surfaces at migration time, not INSERT time.
+
+### BL-NEW-ACTIONABILITY-CANDIDATES-CASE-FIDELITY: test fixture vs prod data mismatch
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `test-fidelity` `actionability`
+**Why:** `tests/test_entry_snapshot.py::_ensure_candidate_row` lowercases the
+contract_address before inserting (`contract_address.lower()`). Real-world
+prod data carries checksummed mixed-case addresses (ETH/BSC). The
+`_read_first_seen_at` query at `entry_snapshot.py:128` uses
+`LOWER(contract_address)=LOWER(?)` to handle this, but the test fixture
+data is degenerate for the case-fold path. Surfaced as Vector A Minor #4
+against PR #200.
+
+**Scope:** Add a single test that seeds a mixed-case `contract_address` (e.g.,
+`0xAbCdEf...`) and asserts the LOWER() lookup resolves. Optional: audit
+existing fixtures for similar degeneracy.
+
+**Acceptance:** Case-fold path is structurally exercised in tests.
+
+### BL-NEW-ACTIONABILITY-TG-SIGNAL-TYPES-EXPANSION: applicable-fields semantic re-check
+**Status:** PROPOSED 2026-05-20 (evidence-gated).
+**Tag:** `actionability` `entry-snapshot` `signal-types`
+**Why:** `_applicable_optional_fields` at `entry_snapshot.py:45-47` hardcodes
+the `tg_social` branch as the only signal_type for which `tg_channel_at_entry`
+is required. Future TG-relay variants (`tg_kol`, `tg_dao_calls`, etc.) would
+silently be marked `complete=1` with NULL channel, breaking source-quality
+analyses that filter on tg_channel. Surfaced as Vector B Minor #2 against
+PR #200.
+
+**Scope:** Trigger condition — at the time a NEW tg_* signal_type is added
+to `DEFAULT_SIGNAL_TYPES`. Audit + extend `_applicable_optional_fields` to
+include the new variant. File this entry so the cross-reference exists.
+
+**Constraints:** Evidence-gated; do NOT pre-emptively widen the branch
+beyond actual signal_types.
+
+**Acceptance:** When a new tg_* signal_type lands, the applicable-fields
+function is updated in the SAME PR.
+
+### BL-NEW-ACTIONABILITY-CANDIDATES-CROSS-CHAIN-FIRST-SEEN: cross-chain rediscovery
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `data-integrity` `candidates` `actionability`
+**Why:** `_read_first_seen_at` at `entry_snapshot.py:128` filters by
+`(contract_address, chain)`. For tokens later re-indexed under a different
+chain label (e.g., a Solana token rediscovered as `chain="coingecko"`), the
+query returns None even when an earlier candidates row exists under the
+original chain. Surfaced as Vector B Minor #1 against PR #200.
+
+**Scope:** Decide policy — match-by-contract-only (collapse chain
+distinctions for `first_seen_at`) vs match-by-(contract, chain) (current).
+Coordinate with BL-NEW-ACTIONABILITY-CANDIDATES-FIRST-SEEN-PRESERVE — both
+modify the same read pattern.
+
+**Acceptance:** Documented policy + matching read query in
+`entry_snapshot.py`.
+
+### BL-NEW-DASHBOARD-ENTRY-SNAPSHOT-DRAWER: surface *_at_entry in TradeDetailDrawer
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `dashboard` `actionability` `entry-snapshot`
+**Why:** PR #200 ships the substrate (`paper_trade_entry_snapshots` sidecar)
+but no dashboard surface consumes it yet. The TradeDetailDrawer (PR #195)
+already has a "Source / confluence" group — extending it to show
+`*_at_entry` fields when present, and "pre-cutover (no snapshot)" when
+absent, is the minimum-viable read.
+
+**Scope:**
+- `dashboard/db.py:get_open_positions` adds
+  `LEFT JOIN paper_trade_entry_snapshots s ON s.paper_trade_id = pt.id`
+  (NOT `USING (paper_trade_id)` — `paper_trades` column is `id`, not
+  `paper_trade_id`).
+- Drawer rendering of new fields + pre-cutover label.
+- Dist rebuild + commit per
+  `feedback_vite_dist_index_html_commit_discipline.md`.
+
+**Constraints:** Visibility-only; no behavior changes.
+
+**Acceptance:** Drawer shows snapshot values for post-cutover trades and a
+clear "pre-cutover" subtitle for older trades. Playwright smoke verifies
+no console errors + correct labeling.
+
+---
+
 ## Follow-ups filed 2026-05-19 from trader-cockpit overnight assignment (#194 / #195)
 
 Six entries surfaced during the dashboard cockpit overnight assignment. **All file-only, no implementation.** Operator scope: file for visibility / future scheduling; implementation requires separate approval. Pair with PR #194 (Trader Action Queue) + #195 (Trade Detail Drawer) which already covered the cheap drilldown surface.
