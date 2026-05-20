@@ -55,6 +55,11 @@
 **Scope:** add a "deferred resolution sweep" pass at the start of each cron cycle that re-queries `/api/coin/lookup` for `narrative_alerts_inbound` rows with `extracted_ca IS NOT NULL AND resolved_coin_id IS NULL AND received_at > now() - 7d`. Update via separate `/api/narrative-alert-resolve` PATCH endpoint or PUT replacement.
 **Constraint:** the design doc §3 already specifies this behavior ("deferred resolution pass at next cycle"); current implementation appears to not have it. Verify against design intent before adding the sweep.
 
+### BL-NEW-SCANNER-DATETIME-UTCNOW-DEPRECATION
+**Status:** PROPOSED 2026-05-20.
+**Why:** `/home/gecko-agent/run-scanner-cycle.py` uses `datetime.utcnow()` which emits a DeprecationWarning under Python 3.12+. The warning text leaks into the cycle-report log via the `2>&1` redirect, occasionally interleaving mid-line with stdout content (per Vector A M2 + Vector B M1 at PR #204 review). Not a security issue (warning text is constant); cosmetic log hygiene.
+**Scope:** swap `datetime.utcnow()` → `datetime.now(timezone.utc)`. `timezone` already imported. Touchpoints: state.start_time (CycleState.__init__), `cutoff_time = datetime.now(timezone.utc) - timedelta(...)` already uses correct form; only `state.start_time` needs the swap.
+
 ### BL-NEW-SCANNER-PRINT-TO-LOG-CONSISTENCY
 **Status:** PROPOSED 2026-05-20.
 **Why:** Vector B F10 finding during design review: `/home/gecko-agent/run-scanner-cycle.py:691-713` (FINAL REPORT section) uses raw `print()` calls; the rest of the script uses the wrapped `log()` helper. Inconsistency is not a leak (current interpolations are counters/lengths) but is a future-maintenance trap.

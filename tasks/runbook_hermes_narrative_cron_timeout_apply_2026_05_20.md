@@ -87,4 +87,23 @@ Total reversion: <1 minute. Next cron tick uses sequential pre-fix behavior.
 
 - **None required.** The fix is live and self-verified.
 - **Recommended:** monitor `openrouter-429-burst-count` field in SCANNER-CYCLE-SUMMARY over next 24h. If consistently > 0, do NOT promote concurrency=3→5 until OpenRouter tier is confirmed.
-- **Optional follow-up:** the `BL-NEW-HERMES-CRON-NO-AGENT-FLAG-WATCHDOG` script (separate PR) can be scheduled via cron for periodic guardrail validation.
+- **Optional follow-up:** the `BL-NEW-HERMES-CRON-NO-AGENT-FLAG-WATCHDOG` script (PR #203, merged at `59e1eee`) can be scheduled via cron for periodic guardrail validation.
+
+## PR-review fold log (2026-05-20)
+
+Two reviewer vectors at PR-stage. **0 Critical + 0 Important + 3 Minor**:
+
+| Finding | Vector | Status |
+|---|---|---|
+| Deployed file mode 0664 → 0640 | A M1 | **FOLDED on VPS 2026-05-20T05:11Z** (one-line chmod; no PR needed) |
+| `datetime.utcnow()` DeprecationWarning leaks into log | A M2 + B M1 | NOT FOLDED — filed as `BL-NEW-SCANNER-DATETIME-UTCNOW-DEPRECATION` follow-up |
+| Design doc count drift (9 vs 8 log() calls) | B M2 | NOT FOLDED — pure doc-only; not worth a re-edit |
+
+**Vector A also confirmed empirically:**
+- All Critical + Important folds from plan + design stages are PRESENT in deployed code with line refs
+- Tweet-19 JSONDecodeError was a real test of the broad-except fold: 1 tweet's malformed response → caught + skipped + counter incremented + structured log + return None. Batch unaffected. Healthy validation.
+
+**Vector B also confirmed:**
+- All new JSON emits field-by-field secret-clean
+- Lock file present + mode 0640 + zero content
+- 1 classification-other-error attributed to JSONDecodeError (bounded message, no secret leak)
