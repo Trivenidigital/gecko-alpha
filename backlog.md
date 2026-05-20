@@ -8,6 +8,29 @@
 
 ---
 
+## Active Work: 2026-05-20 source-call outcome ledger
+
+### BL-NEW-SOURCE-CALL-OUTCOME-LEDGER: durable TG/X per-call outcome substrate
+**Status:** IMPLEMENTATION-IN-PROGRESS 2026-05-20 — branch `feat/source-call-outcome-ledger-2026-05-20`; plan/design reviewer folds landed before build.
+**Tag:** `source-quality` `tg_social` `x_alerts` `measurement-substrate` `hermes-first`
+**Why:** Operator wants quality over quantity from TG/X sources: repeated noisy TG calls and expensive X/KOL calls need evidence at the source level. Existing tables store source events (`tg_social_signals`, `narrative_alerts_inbound`) and paper trades, but no durable per-call ledger ties each call to forward returns, duplicate clustering, missing-data reasons, and paper-trade linkage.
+**Action:** Ship `source_calls` sidecar table, idempotent TG/X backfill helper, bounded forward-window outcome computation from existing CG snapshot tables, low-n/coverage-aware summary helper, and §12a lag watchdog. No trading behavior changes, no source suppression, no dashboard endpoint in this PR.
+**Hermes-first summary:** use Hermes for X/KOL collection/classification; keep custom durable attribution and summary because no Hermes skill owns gecko-alpha source-call outcomes. Full table in `tasks/plan_source_call_outcome_ledger_2026_05_20.md` and `tasks/design_source_call_outcome_ledger_2026_05_20.md`.
+
+### BL-NEW-DASHBOARD-SOURCE-CALL-QUALITY-SURFACE: dashboard surface over `source_calls`
+**Status:** PROPOSED 2026-05-20 — follow-up after BL-NEW-SOURCE-CALL-OUTCOME-LEDGER ships and accumulates/backfills rows.
+**Tag:** `dashboard` `source-quality` `read-only` `trader-cockpit`
+**Why:** The ledger is a substrate, not a trader-facing cockpit. The trader still needs a view that answers: which TG channels/X handles are rankable, which are noisy repeaters, which have low coverage, and which are linkage-pending versus actually bad.
+**Action:** Add read-only endpoint(s) and dashboard panel(s) backed by `compute_source_quality_summary`, with explicit low-n, biased-low-coverage, unresolvable, duplicate-rate, and linkage-confidence labels. Extend rather than duplicate existing `TGAlertsTab` / `XAlertsTab`.
+**Decision-by:** after source_calls backfill/runbook evidence is available.
+
+### BL-NEW-X-KOL-COST-GOVERNOR: evidence-backed X/KOL pruning and budget guardrails
+**Status:** PROPOSED 2026-05-20 — strategy follow-up; do not implement until source-call outcome coverage exists.
+**Tag:** `x_alerts` `cost-governance` `kol-list` `evidence-gated`
+**Why:** X is a paid input stream. Underperforming handles should not remain indefinitely, but pruning before the source-call ledger has enough rankable coverage risks cutting useful discovery sources based on noise.
+**Action:** After `source_calls` has rankable X-handle cohorts, design a review workflow for prune/keep/watch decisions. Require sample/coverage gates and operator approval; no automatic handle removal in the first pass.
+**Decision-by:** evidence-gated on source-call ledger coverage and operator cost tolerance.
+
 ## Active Findings
 
 ### BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-FIX

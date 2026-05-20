@@ -112,7 +112,7 @@ CREATE TABLE source_calls (
         CHECK (json_valid(missing_fields) AND json_type(missing_fields) = 'array'),
     created_at               TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at               TEXT NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (linked_paper_trade_id) REFERENCES paper_trades(id) ON DELETE SET NULL,
+    FOREIGN KEY (linked_paper_trade_id) REFERENCES paper_trades(id) ON DELETE RESTRICT,
     UNIQUE (source_type, source_event_id)
 );
 CREATE INDEX idx_source_calls_source_ts ON source_calls(source_type, source_id, call_ts);
@@ -131,7 +131,7 @@ CREATE INDEX idx_source_calls_outcome ON source_calls(outcome_status, call_ts);
 ### Idempotency
 
 - `UNIQUE(source_type, source_event_id)` PK enforces 1 row per upstream event.
-- Backfill uses `INSERT OR IGNORE` for the row-creation pass, then `UPDATE` to refresh outcomes.
+- Backfill uses `INSERT ... ON CONFLICT(source_type, source_event_id) DO UPDATE SET ...` so mutable source-derived fields can refresh while preserving the original `created_at`.
 - Re-running backfill is safe; the latest forward-window resolution wins (via `updated_at`).
 
 ### Duplicate clustering
@@ -183,7 +183,7 @@ When computing `price_at_call`, `mcap_at_call`, and forward windows:
 3. **Forward-window pass**: for each row, query snapshot tables; populate forward fields where possible; set `outcome_status` accordingly.
 4. **Paper-trade linkage pass**: for TG copy `paper_trade_id`; for X run temporal correlation.
 
-Backfill is rerunnable. Each pass uses `INSERT OR IGNORE` for new rows + `UPDATE` for refresh.
+Backfill is rerunnable. Each pass uses SQLite UPSERT for new rows + refresh.
 
 ### Low-n discipline
 
@@ -221,7 +221,7 @@ A source can be high-quality at discovery (great early calls) but the gate may s
 2. **CHECK constraints enforced** — INSERT with invalid `source_type` or `outcome_status` raises sqlite3.IntegrityError.
 3. **TG backfill from `tg_social_signals`** — synthetic seeded rows are inserted exactly once; `posted_at` populates `call_ts`; `source_id`/`source_event_id` are correct. Live row counts are smoke evidence only, not unit-test fixtures.
 4. **X backfill from `narrative_alerts_inbound`** — synthetic seeded rows are inserted exactly once; `tweet_ts` populates `call_ts`; `received_at` is used only for strategy-linkage eligibility. Live row counts are smoke evidence only.
-5. **`UNIQUE(source_type, source_event_id)` enforced** — rerunning backfill is a no-op (INSERT OR IGNORE).
+5. **`UNIQUE(source_type, source_event_id)` enforced** — rerunning backfill does not create duplicates and refreshes mutable fields via UPSERT.
 6. **Duplicate cluster key correctness** — same (source, cluster_identity, date_utc) → same cluster_key; unresolved rows use the documented fallback identity; `duplicate_rank_in_cluster` monotonically assigned by call_ts.
 7. **Forward-window leakage prevention** — for a synthetic row with `call_ts=T`, tests verify: mixed timestamp formats parse to the same UTC timeline; pre-window rows (`T` to `T+30m`) do not satisfy `forward_30m`; too-late rows outside tolerance do not satisfy the window; 24h extrema ignore rows after `T+24h`; horizon-specific stale at-call prices suppress affected metrics.
 8. **Paper-trade linkage — TG path** — `source_calls.linked_paper_trade_id` matches `tg_social_signals.paper_trade_id` 1:1 post-backfill.
@@ -235,7 +235,7 @@ A source can be high-quality at discovery (great early calls) but the gate may s
 
 ## Test plan
 
-`tests/test_source_call_outcome_ledger.py` covers all 13 criteria above. Migration test uses tmp_path Database fixture (same pattern as `tests/test_entry_snapshot.py`).
+`tests/test_source_call_outcome_ledger.py` covers the pre-registered criteria above. Migration test uses tmp_path Database fixture (same pattern as `tests/test_entry_snapshot.py`).
 
 ## Rollback
 
