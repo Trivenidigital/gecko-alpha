@@ -8,7 +8,7 @@
 - [x] Write focused RED tests for migration, TG/X backfill, bounded outcomes, summaries, and §12a lag watchdog
 - [x] Implement `source_calls` migration + source-quality helpers + watchdog scripts
 - [x] Run focused and adjacent verification
-- [ ] Open draft PR
+- [x] Open draft PR #206
 - [ ] Get PR reviewed by 2 parallel agents and fold Critical/Important findings
 
 Review notes:

@@ -11,7 +11,7 @@
 ## Active Work: 2026-05-20 source-call outcome ledger
 
 ### BL-NEW-SOURCE-CALL-OUTCOME-LEDGER: durable TG/X per-call outcome substrate
-**Status:** IMPLEMENTATION-IN-PROGRESS 2026-05-20 — branch `feat/source-call-outcome-ledger-2026-05-20`; plan/design reviewer folds landed before build.
+**Status:** PR-OPEN 2026-05-20 — draft PR #206 (`feat/source-call-outcome-ledger-2026-05-20`); plan/design reviewer folds landed before build.
 **Tag:** `source-quality` `tg_social` `x_alerts` `measurement-substrate` `hermes-first`
 **Why:** Operator wants quality over quantity from TG/X sources: repeated noisy TG calls and expensive X/KOL calls need evidence at the source level. Existing tables store source events (`tg_social_signals`, `narrative_alerts_inbound`) and paper trades, but no durable per-call ledger ties each call to forward returns, duplicate clustering, missing-data reasons, and paper-trade linkage.
 **Action:** Ship `source_calls` sidecar table, idempotent TG/X backfill helper, bounded forward-window outcome computation from existing CG snapshot tables, low-n/coverage-aware summary helper, and §12a lag watchdog. No trading behavior changes, no source suppression, no dashboard endpoint in this PR.
