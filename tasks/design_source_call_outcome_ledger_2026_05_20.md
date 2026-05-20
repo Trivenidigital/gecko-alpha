@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS source_calls (
     linkage_method TEXT NOT NULL DEFAULT 'none'
         CHECK (linkage_method IN ('none','direct_tg','heuristic_x')),
     linkage_confidence TEXT NOT NULL DEFAULT 'none'
-        CHECK (linkage_confidence IN ('none','direct','heuristic')),
+        CHECK (linkage_confidence IN ('none','direct','heuristic','conflict')),
     outcome_status TEXT NOT NULL
         CHECK (outcome_status IN ('pending','partial','complete','unresolvable')),
     missing_fields TEXT NOT NULL
@@ -172,13 +172,15 @@ Paper-trade linkage is heuristic only:
 - require `paper_trades.opened_at <= narrative_alerts_inbound.received_at + 1 hour`
 - choose the smallest matching `paper_trades.id`
 - set `linkage_method = 'heuristic_x'`
-- set `linkage_confidence = 'heuristic'`
+- set `linkage_confidence = 'heuristic'` only when exactly one candidate trade exists
 - store `linkage_candidate_count`
-- store `linkage_conflict_count = max(0, candidate_count - 1)`
+- if more than one candidate trade exists, leave `linked_paper_trade_id` null,
+  set `linkage_confidence = 'conflict'`, and store
+  `linkage_conflict_count = candidate_count - 1`
 
 Discovery-quality windows use `call_ts`. Strategy-linkage uses `received_at`, because gecko-alpha cannot act before it receives the alert.
 
-Heuristic X links with `linkage_conflict_count > 0` are non-rankable for strategy-PnL summaries. Direct TG links remain separate from heuristic X links.
+Heuristic X rows with `linkage_conflict_count > 0` are non-rankable for strategy-PnL summaries and do not store a concrete `linked_paper_trade_id`. Direct TG links remain separate from heuristic X links.
 
 ## Duplicate clusters
 

@@ -106,7 +106,7 @@ CREATE TABLE source_calls (
     linkage_method           TEXT NOT NULL DEFAULT 'none'
         CHECK (linkage_method IN ('none','direct_tg','heuristic_x')),
     linkage_confidence       TEXT NOT NULL DEFAULT 'none'
-        CHECK (linkage_confidence IN ('none','direct','heuristic')),
+        CHECK (linkage_confidence IN ('none','direct','heuristic','conflict')),
     outcome_status           TEXT NOT NULL CHECK (outcome_status IN ('pending','partial','complete','unresolvable')),
     missing_fields           TEXT NOT NULL
         CHECK (json_valid(missing_fields) AND json_type(missing_fields) = 'array'),
@@ -173,7 +173,7 @@ When computing `price_at_call`, `mcap_at_call`, and forward windows:
 ### Linked-paper-trade strategy
 
 - TG: `tg_social_signals.paper_trade_id` already exists → copy directly into `source_calls.linked_paper_trade_id` with `linkage_method='direct_tg'` and `linkage_confidence='direct'`.
-- X: NO existing column. Use temporal-windowed correlation: a paper_trade is linked to an X call if `paper_trades.token_id == narrative_alerts_inbound.resolved_coin_id` (when resolved) AND `narrative_alerts_inbound.received_at <= paper_trades.opened_at <= narrative_alerts_inbound.received_at + 1h`. **First match wins** (linked_paper_trade_id = MIN(paper_trades.id) satisfying both criteria). Discovery-quality forward windows still use `call_ts=tweet_ts`; strategy linkage uses `received_at` because gecko-alpha cannot act before receiving the alert. Mark these links `linkage_method='heuristic_x'` and `linkage_confidence='heuristic'`.
+- X: NO existing column. Use temporal-windowed correlation: a paper_trade is linked to an X call if `paper_trades.token_id == narrative_alerts_inbound.resolved_coin_id` (when resolved) AND `narrative_alerts_inbound.received_at <= paper_trades.opened_at <= narrative_alerts_inbound.received_at + 1h`. Exactly one match writes `linked_paper_trade_id` and marks `linkage_method='heuristic_x'`, `linkage_confidence='heuristic'`. Multiple matches write no concrete paper-trade id, mark `linkage_confidence='conflict'`, and expose `linkage_conflict_count`. Discovery-quality forward windows still use `call_ts=tweet_ts`; strategy linkage uses `received_at` because gecko-alpha cannot act before receiving the alert.
 - Do NOT denormalize paper-trade PnL into `source_calls`. Summary helpers join `paper_trades.pnl_usd` at read time so paper-trade close writers stay unchanged.
 
 ### Backfill strategy
@@ -211,7 +211,7 @@ A source can be high-quality at discovery (great early calls) but the gate may s
 
 `source_calls` is a new pipeline table. Per §12a: every new pipeline table MUST ship with a freshness SLO + watchdog. This PR includes the check, not a deferred placeholder.
 
-1. **Per-pass freshness counter**: backfill helper emits `source_calls_backfill_summary` with `inserted`, `updated`, `tg_seen`, `x_seen`, `unledgered_tg`, and `unledgered_x`.
+1. **Per-pass freshness counter**: backfill helper emits `source_calls_backfill_summary` with `inserted`, `updated`, `tg_seen`, and `x_seen`. Unledgered lag is reported by the dedicated watchdog.
 2. **Lag watchdog**: add `scripts/check_source_calls_lag.py` returning JSON plus `scripts/source-calls-lag-watchdog.sh` wrapper. It exits non-zero if any upstream `tg_social_signals` / `narrative_alerts_inbound` row older than 30 minutes is missing a corresponding `source_calls` row. This monitors upstream-to-ledger lag, not `MAX(updated_at)` alone, so quiet periods do not false-alert.
 3. **SLO**: when source-call backfill is scheduled, ledger lag must be under 30 minutes for all upstream rows. Initial PR does not schedule it; the runbook states "not scheduled" explicitly and the watchdog is operator-runnable before scheduling.
 

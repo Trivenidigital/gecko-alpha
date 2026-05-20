@@ -334,6 +334,40 @@ async def test_stale_at_call_price_suppresses_short_horizons(db):
     assert {"field": "forward_30m_pct", "reason": "stale_at_call"} in missing
 
 
+async def test_stale_at_call_price_suppresses_24h_extrema(db):
+    await db._conn.execute(
+        "INSERT INTO narrative_alerts_inbound "
+        "(event_id, tweet_id, tweet_author, tweet_ts, tweet_text, tweet_text_hash, "
+        "extracted_cashtag, resolved_coin_id, narrative_theme, urgency_signal, "
+        "classifier_version, received_at) "
+        "VALUES ('evt-stale-extrema', 'tw-extrema', 'kol_x', "
+        "'2026-05-20T00:00:00+00:00', 'watch $TOK', 'hash-extrema', 'TOK', "
+        "'coin-extrema', 'ai', 'high', 'v1', '2026-05-20T00:01:00+00:00')"
+    )
+    await _insert_gainer_price(
+        db._conn, "coin-extrema", 1.0, "2026-05-19T22:30:00+00:00"
+    )
+    await _insert_gainer_price(
+        db._conn, "coin-extrema", 4.0, "2026-05-20T03:00:00+00:00"
+    )
+    await db._conn.commit()
+
+    await backfill_source_calls(db._conn)
+    await refresh_source_call_outcomes(
+        db._conn, now=datetime(2026, 5, 21, 2, tzinfo=timezone.utc)
+    )
+    row = await _fetchone(
+        db._conn,
+        "SELECT max_favorable_pct_24h, max_adverse_pct_24h, time_to_peak_min, "
+        "missing_fields FROM source_calls WHERE source_event_id='evt-stale-extrema'",
+    )
+    assert row["max_favorable_pct_24h"] is None
+    assert row["max_adverse_pct_24h"] is None
+    assert row["time_to_peak_min"] is None
+    missing = json.loads(row["missing_fields"])
+    assert {"field": "max_favorable_pct_24h", "reason": "stale_at_call"} in missing
+
+
 async def test_summary_uses_distinct_eligible_clusters_and_coverage_gate(db):
     call_ts = datetime(2026, 5, 20, tzinfo=timezone.utc)
     for idx in range(12):
@@ -392,6 +426,71 @@ async def test_summary_uses_distinct_eligible_clusters_and_coverage_gate(db):
     assert by_source[("tg", "@quality")].eligible_distinct_clusters == 10
     assert by_source[("tg", "@quality")].coverage_rate == pytest.approx(10 / 12)
     assert by_source[("x", "small_kol")].rank_status == "insufficient_sample"
+
+
+async def test_summary_averages_use_first_duplicate_cluster_only(db):
+    trade_1 = await _insert_trade(
+        db._conn, "coin-dup", "2026-05-20T00:05:00+00:00", pnl_usd=10.0
+    )
+    trade_2 = await _insert_trade(
+        db._conn, "coin-dup", "2026-05-20T00:10:00+00:00", pnl_usd=-90.0
+    )
+    await db._conn.execute(
+        "INSERT INTO source_calls "
+        "(source_type, source_id, source_event_id, token_id, symbol, call_ts, "
+        "call_kind, cluster_identity, cluster_identity_kind, duplicate_cluster_key, "
+        "duplicate_rank_in_cluster, resolved_state, forward_30m_pct, "
+        "linked_paper_trade_id, linkage_method, linkage_confidence, outcome_status, "
+        "missing_fields) VALUES "
+        "('tg', '@dup', 'dup-1', 'coin-dup', 'DUP', '2026-05-20T00:00:00+00:00', "
+        "'ca_call', 'coin-dup', 'token_id', 'dup-cluster', 1, 'resolved', 10, ?, "
+        "'direct_tg', 'direct', 'complete', '[]'), "
+        "('tg', '@dup', 'dup-2', 'coin-dup', 'DUP', '2026-05-20T00:01:00+00:00', "
+        "'ca_call', 'coin-dup', 'token_id', 'dup-cluster', 2, 'resolved', 1000, ?, "
+        "'direct_tg', 'direct', 'complete', '[]')",
+        (trade_1, trade_2),
+    )
+    await db._conn.commit()
+
+    rows = await compute_source_quality_summary(
+        db._conn, min_sample=1, min_coverage_rate=0.0
+    )
+    row = {(r.source_type, r.source_id): r for r in rows}[("tg", "@dup")]
+    assert row.eligible_distinct_clusters == 1
+    assert row.avg_forward_30m_pct == 10.0
+    assert row.avg_strategy_pnl_usd == 10.0
+
+
+async def test_x_conflict_linkage_does_not_choose_concrete_trade(db):
+    await _insert_trade(
+        db._conn, "coin-conflict", "2026-05-20T00:10:00+00:00", pnl_usd=10.0
+    )
+    await _insert_trade(
+        db._conn, "coin-conflict", "2026-05-20T00:20:00+00:00", pnl_usd=20.0
+    )
+    await db._conn.execute(
+        "INSERT INTO narrative_alerts_inbound "
+        "(event_id, tweet_id, tweet_author, tweet_ts, tweet_text, tweet_text_hash, "
+        "extracted_cashtag, resolved_coin_id, narrative_theme, urgency_signal, "
+        "classifier_version, received_at) "
+        "VALUES ('evt-conflict', 'tw-conflict', 'kol_x', "
+        "'2026-05-20T00:00:00+00:00', 'watch $TOK', 'hash-conflict', 'TOK', "
+        "'coin-conflict', 'ai', 'high', 'v1', '2026-05-20T00:00:00+00:00')"
+    )
+    await db._conn.commit()
+
+    await backfill_source_calls(db._conn)
+    row = await _fetchone(
+        db._conn,
+        "SELECT linked_paper_trade_id, linkage_candidate_count, "
+        "linkage_conflict_count, linkage_method, linkage_confidence "
+        "FROM source_calls WHERE source_event_id='evt-conflict'",
+    )
+    assert row["linked_paper_trade_id"] is None
+    assert row["linkage_candidate_count"] == 2
+    assert row["linkage_conflict_count"] == 1
+    assert row["linkage_method"] == "heuristic_x"
+    assert row["linkage_confidence"] == "conflict"
 
 
 async def test_source_calls_lag_watchdog_fails_matches_and_passes_quiet_period(db):

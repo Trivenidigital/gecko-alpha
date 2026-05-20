@@ -224,7 +224,12 @@ def _compute_outcome(
     max_favorable = None
     max_adverse = None
     time_to_peak = None
-    if price_at_call and extrema_rows:
+    if (
+        price_at_call
+        and price_age_sec is not None
+        and price_age_sec <= 60 * 60
+        and extrema_rows
+    ):
         pct_rows = [
             (((row["price"] - price_at_call) / price_at_call) * 100.0, row)
             for row in extrema_rows
@@ -234,6 +239,15 @@ def _compute_outcome(
         max_favorable = max_pct
         max_adverse = min_pct
         time_to_peak = (peak_row["snapshot_at"] - call_ts).total_seconds() / 60.0
+    elif now >= call_ts + timedelta(hours=24):
+        reason = "no_time_series" if not price_rows else "stale_at_call"
+        missing.extend(
+            [
+                _missing("max_favorable_pct_24h", reason),
+                _missing("max_adverse_pct_24h", reason),
+                _missing("time_to_peak_min", reason),
+            ]
+        )
 
     status = _status_from_missing(
         now=now,
@@ -365,10 +379,14 @@ async def _build_base_payload(
         candidate_count = 1
     elif row["source_type"] == "x":
         paper_trade_id, candidate_count = await _find_x_trade_link(conn, row)
-        if paper_trade_id is not None:
+        if candidate_count > 1:
+            paper_trade_id = None
+            linkage_method = "heuristic_x"
+            linkage_confidence = "conflict"
+            conflict_count = candidate_count - 1
+        elif paper_trade_id is not None:
             linkage_method = "heuristic_x"
             linkage_confidence = "heuristic"
-            conflict_count = max(0, candidate_count - 1)
 
     call_kind = "unknown"
     if row.get("contract_address"):
@@ -550,10 +568,13 @@ async def compute_source_quality_summary(
         coverage_rate = (
             0.0 if not cluster_keys else len(eligible_clusters) / len(cluster_keys)
         )
-        avg_forward = _avg(row["forward_30m_pct"] for row in rows)
+        first_cluster_rows = [
+            row for row in rows if row["duplicate_rank_in_cluster"] == 1
+        ]
+        avg_forward = _avg(row["forward_30m_pct"] for row in first_cluster_rows)
         pnl_rows = [
             row["strategy_pnl_usd"]
-            for row in rows
+            for row in first_cluster_rows
             if row["strategy_pnl_usd"] is not None
             and not (stype == "x" and row["linkage_conflict_count"] > 0)
         ]
@@ -563,7 +584,7 @@ async def compute_source_quality_summary(
                 reason = str(item.get("reason", "unknown"))
                 missing_counts[reason] = missing_counts.get(reason, 0) + 1
         horizon_counts = {
-            field: sum(1 for row in rows if row[field] is not None)
+            field: sum(1 for row in first_cluster_rows if row[field] is not None)
             for field in FORWARD_FIELDS
         }
         if len(eligible_clusters) < min_sample:

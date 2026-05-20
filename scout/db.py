@@ -3772,7 +3772,8 @@ class Database:
                     linkage_method TEXT NOT NULL DEFAULT 'none'
                         CHECK (linkage_method IN ('none','direct_tg','heuristic_x')),
                     linkage_confidence TEXT NOT NULL DEFAULT 'none'
-                        CHECK (linkage_confidence IN ('none','direct','heuristic')),
+                        CHECK (linkage_confidence IN ('none','direct','heuristic',
+                                                      'conflict')),
                     outcome_status TEXT NOT NULL
                         CHECK (outcome_status IN ('pending','partial','complete',
                                                   'unresolvable')),
