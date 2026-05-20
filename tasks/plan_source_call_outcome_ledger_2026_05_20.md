@@ -87,7 +87,7 @@ CREATE TABLE source_calls (
     call_kind                TEXT NOT NULL CHECK (call_kind IN ('first_mention','repeat_mention','ca_call','cashtag_only','unknown')),
     cluster_identity         TEXT NOT NULL,
     cluster_identity_kind    TEXT NOT NULL CHECK (cluster_identity_kind IN ('token_id','contract','symbol','source_event')),
-    duplicate_cluster_key    TEXT,                -- sha256(source_type|source_id|coin_id|date_bucket) for cluster grouping
+    duplicate_cluster_key    TEXT NOT NULL,       -- sha256(source_type|source_id|cluster_identity|date_bucket) for cluster grouping
     duplicate_rank_in_cluster INTEGER NOT NULL DEFAULT 1,
     resolved_state           TEXT NOT NULL,       -- mirrors upstream resolution_state / resolved_coin_id presence
     price_at_call            REAL,
@@ -154,7 +154,12 @@ where `date_bucket_utc = strftime('%Y-%m-%d', call_ts)`.
 
 When computing `price_at_call`, `mcap_at_call`, and forward windows:
 
-1. Read `gainers_snapshots`/`losers_snapshots` rows with `snapshot_at <= call_ts` for the at-call value (use most-recent ≤ call_ts) ONLY if `call_ts - snapshot_at <= 6h`. Store `price_at_call_snapshot_at`, `price_source`, and `price_age_sec`; otherwise leave price fields missing.
+0. Normalize all timestamps through Python UTC datetime parsing before comparisons. Do not rely on SQLite lexical ordering across `...Z`, `+00:00`, and `YYYY-MM-DD HH:MM:SS` formats.
+1. Read `gainers_snapshots`/`losers_snapshots` rows with `snapshot_at <= call_ts` for the at-call value (use most-recent ≤ call_ts) with horizon-specific freshness:
+   - 30m metric: at-call price age <= 15m
+   - 1h metric: at-call price age <= 30m
+   - 6h/24h/extrema metrics: at-call price age <= 60m
+   Store `price_at_call_snapshot_at`, `price_source`, and `price_age_sec`; otherwise suppress the affected metric(s).
 2. Read snapshots within bounded forward windows:
    - 30m: `[T+30m, T+45m]`
    - 1h: `[T+1h, T+90m]`
@@ -182,7 +187,7 @@ Backfill is rerunnable. Each pass uses `INSERT OR IGNORE` for new rows + `UPDATE
 
 ### Low-n discipline
 
-Source-quality summaries that group by `source_id` MUST suppress (or visually-tag) any source with fewer than 10 **eligible distinct clusters** as "insufficient sample." Raw call count alone is not enough because repeat spam can inflate sample size. Summaries must expose:
+Source-quality summaries that group by `source_id` MUST suppress ranking unless both gates pass: at least 10 **eligible distinct clusters** and a configured minimum resolvable coverage rate (default 0.50). Raw call count alone is not enough because repeat spam can inflate sample size. Summaries must expose:
 
 - raw call count
 - distinct cluster count
@@ -190,6 +195,7 @@ Source-quality summaries that group by `source_id` MUST suppress (or visually-ta
 - duplicate rate
 - resolvable coverage rate
 - unresolvable rate
+- `rank_status` (`insufficient_sample`, `biased_low_coverage`, `rankable_resolvable_cg_board_cohort`)
 
 Aligns with `memory/feedback_n_gate_verdicts_against_dashboard_noise.md`.
 
@@ -206,8 +212,8 @@ A source can be high-quality at discovery (great early calls) but the gate may s
 `source_calls` is a new pipeline table. Per §12a: every new pipeline table MUST ship with a freshness SLO + watchdog. This PR includes the check, not a deferred placeholder.
 
 1. **Per-pass freshness counter**: backfill helper emits `source_calls_backfill_summary` with `inserted`, `updated`, `tg_seen`, `x_seen`, `unledgered_tg`, and `unledgered_x`.
-2. **Lag watchdog**: add `scripts/source-calls-lag-watchdog.sh` (or equivalent Python check if simpler) that exits non-zero if any upstream `tg_social_signals` / `narrative_alerts_inbound` row older than 30 minutes is missing a corresponding `source_calls` row. This monitors upstream-to-ledger lag, not `MAX(updated_at)` alone, so quiet periods do not false-alert.
-3. **SLO**: when source-call backfill is scheduled, ledger lag must be under 30 minutes for all upstream rows. If the ledger remains manual/backfill-only in the initial PR, the runbook must state "not scheduled" explicitly and the watchdog is operator-runnable before scheduling.
+2. **Lag watchdog**: add `scripts/check_source_calls_lag.py` returning JSON plus `scripts/source-calls-lag-watchdog.sh` wrapper. It exits non-zero if any upstream `tg_social_signals` / `narrative_alerts_inbound` row older than 30 minutes is missing a corresponding `source_calls` row. This monitors upstream-to-ledger lag, not `MAX(updated_at)` alone, so quiet periods do not false-alert.
+3. **SLO**: when source-call backfill is scheduled, ledger lag must be under 30 minutes for all upstream rows. Initial PR does not schedule it; the runbook states "not scheduled" explicitly and the watchdog is operator-runnable before scheduling.
 
 ## Acceptance criteria (pre-registered)
 
@@ -217,13 +223,13 @@ A source can be high-quality at discovery (great early calls) but the gate may s
 4. **X backfill from `narrative_alerts_inbound`** — synthetic seeded rows are inserted exactly once; `tweet_ts` populates `call_ts`; `received_at` is used only for strategy-linkage eligibility. Live row counts are smoke evidence only.
 5. **`UNIQUE(source_type, source_event_id)` enforced** — rerunning backfill is a no-op (INSERT OR IGNORE).
 6. **Duplicate cluster key correctness** — same (source, cluster_identity, date_utc) → same cluster_key; unresolved rows use the documented fallback identity; `duplicate_rank_in_cluster` monotonically assigned by call_ts.
-7. **Forward-window leakage prevention** — for a synthetic row with `call_ts=T`, tests verify: pre-window rows (`T` to `T+30m`) do not satisfy `forward_30m`; too-late rows outside tolerance do not satisfy the window; 24h extrema ignore rows after `T+24h`; stale at-call prices older than 6h are missing.
+7. **Forward-window leakage prevention** — for a synthetic row with `call_ts=T`, tests verify: mixed timestamp formats parse to the same UTC timeline; pre-window rows (`T` to `T+30m`) do not satisfy `forward_30m`; too-late rows outside tolerance do not satisfy the window; 24h extrema ignore rows after `T+24h`; horizon-specific stale at-call prices suppress affected metrics.
 8. **Paper-trade linkage — TG path** — `source_calls.linked_paper_trade_id` matches `tg_social_signals.paper_trade_id` 1:1 post-backfill.
 9. **Paper-trade linkage — X path heuristic** — temporal correlation matches a known paper-trade where applicable; row is unlinked when no candidate paper_trade exists.
 10. **Coverage contract** — `outcome_status='complete'` implies `missing_fields='[]'`; `outcome_status` in {'pending','partial','unresolvable'} implies non-empty `missing_fields`.
 11. **No regression** — `tg_social_signals` / `narrative_alerts_inbound` / `paper_trades` writers unchanged; all adjacent tests pass.
 12. **Low-n summary helper** — `compute_source_quality_summary(min_sample=10)` excludes sources with <10 eligible distinct clusters, not <10 raw calls.
-13. **No future leakage / no survivorship hiding in summary** — summary computes forward metrics only from rows with metric-present outcomes, but always reports all-call denominator, resolvable coverage rate, unresolvable rate, and duplicate rate. Rankings are labeled `resolvable_cg_board_cohort` until broader historical pricing exists.
+13. **No future leakage / no survivorship hiding in summary** — summary computes forward metrics only from rows with metric-present outcomes, but always reports all-call denominator, resolvable coverage rate, unresolvable rate, and duplicate rate. Rankings are disabled unless sample and coverage gates pass; any ranking is labeled `rankable_resolvable_cg_board_cohort` until broader historical pricing exists.
 14. **§12a lag watchdog** — seeded upstream rows older than threshold with no ledger row make the watchdog fail; matching ledger rows make it pass; quiet periods with no upstream rows do not fail.
 15. **Migration sentinel uniqueness** — migration uses `paper_migrations.name='bl_source_calls_v1'` plus `schema_version.version=20260522` (or next available version verified at build time); running twice creates exactly one sentinel in each table. Rollback deletes by the version primary key, not free-text description.
 

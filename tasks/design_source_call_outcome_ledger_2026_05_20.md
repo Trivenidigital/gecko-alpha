@@ -54,6 +54,8 @@ CREATE TABLE IF NOT EXISTS source_calls (
     contract_address TEXT,
     chain TEXT,
     call_ts TEXT NOT NULL,
+    observed_at TEXT,
+    ingest_delay_sec INTEGER,
     call_kind TEXT NOT NULL CHECK (
         call_kind IN ('first_mention','repeat_mention','ca_call','cashtag_only','unknown')
     ),
@@ -68,6 +70,14 @@ CREATE TABLE IF NOT EXISTS source_calls (
     price_at_call_snapshot_at TEXT,
     price_source TEXT,
     price_age_sec INTEGER,
+    forward_30m_snapshot_at TEXT,
+    forward_30m_observed_horizon_sec INTEGER,
+    forward_1h_snapshot_at TEXT,
+    forward_1h_observed_horizon_sec INTEGER,
+    forward_6h_snapshot_at TEXT,
+    forward_6h_observed_horizon_sec INTEGER,
+    forward_24h_snapshot_at TEXT,
+    forward_24h_observed_horizon_sec INTEGER,
     mcap_at_call REAL,
     forward_30m_pct REAL,
     forward_1h_pct REAL,
@@ -77,6 +87,8 @@ CREATE TABLE IF NOT EXISTS source_calls (
     max_adverse_pct_24h REAL,
     time_to_peak_min REAL,
     linked_paper_trade_id INTEGER,
+    linkage_candidate_count INTEGER NOT NULL DEFAULT 0,
+    linkage_conflict_count INTEGER NOT NULL DEFAULT 0,
     linkage_method TEXT NOT NULL DEFAULT 'none'
         CHECK (linkage_method IN ('none','direct_tg','heuristic_x')),
     linkage_confidence TEXT NOT NULL DEFAULT 'none'
@@ -87,7 +99,7 @@ CREATE TABLE IF NOT EXISTS source_calls (
         CHECK (json_valid(missing_fields) AND json_type(missing_fields) = 'array'),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    FOREIGN KEY (linked_paper_trade_id) REFERENCES paper_trades(id) ON DELETE SET NULL,
+    FOREIGN KEY (linked_paper_trade_id) REFERENCES paper_trades(id) ON DELETE RESTRICT,
     UNIQUE (source_type, source_event_id)
 );
 ```
@@ -126,6 +138,8 @@ Mapping:
 - `source_id = tg_social_signals.source_channel_handle`
 - `source_event_id = CAST(tg_social_signals.id AS TEXT)`
 - `call_ts = tg_social_messages.posted_at`
+- `observed_at = tg_social_signals.created_at`
+- `ingest_delay_sec = observed_at - call_ts`
 - `token_id`, `symbol`, `contract_address`, `chain`, `mcap_at_call` from `tg_social_signals`
 - `linked_paper_trade_id = tg_social_signals.paper_trade_id`
 - `linkage_method = 'direct_tg'` when linked
@@ -143,6 +157,8 @@ Mapping:
 - `source_id = narrative_alerts_inbound.tweet_author`
 - `source_event_id = narrative_alerts_inbound.event_id`
 - `call_ts = narrative_alerts_inbound.tweet_ts`
+- `observed_at = narrative_alerts_inbound.received_at`
+- `ingest_delay_sec = observed_at - call_ts`
 - `token_id = resolved_coin_id`
 - `symbol = extracted_cashtag` normalized without `$` when unresolved
 - `contract_address = extracted_ca`
@@ -157,8 +173,12 @@ Paper-trade linkage is heuristic only:
 - choose the smallest matching `paper_trades.id`
 - set `linkage_method = 'heuristic_x'`
 - set `linkage_confidence = 'heuristic'`
+- store `linkage_candidate_count`
+- store `linkage_conflict_count = max(0, candidate_count - 1)`
 
 Discovery-quality windows use `call_ts`. Strategy-linkage uses `received_at`, because gecko-alpha cannot act before it receives the alert.
+
+Heuristic X links with `linkage_conflict_count > 0` are non-rankable for strategy-PnL summaries. Direct TG links remain separate from heuristic X links.
 
 ## Duplicate clusters
 
@@ -190,12 +210,17 @@ Not supported for price:
 - `score_history` because it has no price column.
 - `price_cache` for historical outcomes because it is current-state only.
 
+All timestamp comparisons parse source strings to UTC datetimes in Python before comparison. The implementation must not rely on lexical ordering because the DB contains mixed formats: `...Z`, `+00:00`, and SQLite `YYYY-MM-DD HH:MM:SS`.
+
 At-call price:
 
 - choose most recent snapshot where `snapshot_at <= call_ts`
-- require `call_ts - snapshot_at <= 6 hours`
+- require horizon-specific freshness:
+  - 30m metric: price age <= 15 minutes
+  - 1h metric: price age <= 30 minutes
+  - 6h, 24h, and extrema metrics: price age <= 60 minutes
 - store `price_at_call_snapshot_at`, `price_source`, `price_age_sec`
-- if stale or absent, mark price fields missing
+- if stale or absent, suppress only the affected metric(s) and record structured missing reasons
 
 Forward windows:
 
@@ -213,16 +238,31 @@ Forward windows:
 
 If no bounded window row exists, leave that field null and list it in `missing_fields`.
 
+For every populated forward field, store its `forward_*_snapshot_at` and `forward_*_observed_horizon_sec`. This makes the actual observed horizon auditable and prevents a sparse 30m metric from quietly becoming a 6h metric.
+
 ## Coverage contract
 
-`missing_fields` is a JSON array and is internally consistent with null outcome fields.
+`missing_fields` is a JSON array of structured objects and is internally consistent with null outcome fields:
+
+```json
+[{"field": "forward_30m_pct", "reason": "pending_window"}]
+```
+
+Allowed reason examples:
+
+- `identity_unresolved`
+- `no_time_series`
+- `stale_at_call`
+- `pending_window`
+- `sparse_forward_window`
+- `not_applicable`
 
 Rules:
 
-- `complete`: all required forward fields present and `missing_fields = []`
-- `partial`: at least one forward field present and at least one missing
 - `pending`: the call is too recent for one or more forward windows
+- `partial`: all required windows are mature, at least one forward field is present, and at least one field is missing due to coverage
 - `unresolvable`: no supported price timeline exists for the call
+- `complete`: all mature required forward fields exist and `missing_fields = []`
 
 Summaries must show:
 
@@ -233,6 +273,8 @@ Summaries must show:
 - duplicate rate
 - resolvable coverage rate
 - unresolvable rate
+- missing counts by reason (`identity_unresolved`, `no_time_series`, `stale_at_call`, `pending_window`, `sparse_forward_window`)
+- per-horizon eligible counts
 
 Forward-return ranking is labeled `resolvable_cg_board_cohort` until broader historical price coverage exists.
 
@@ -245,6 +287,7 @@ compute_source_quality_summary(
     conn,
     *,
     min_sample: int = 10,
+    min_coverage_rate: float = 0.50,
     source_type: str | None = None,
 ) -> list[SourceQualityRow]
 ```
@@ -257,7 +300,10 @@ The helper:
 - joins `paper_trades` for linked strategy PnL at read time
 - does not denormalize PnL into `source_calls`
 - marks low-n rows as `insufficient_sample`
-- avoids ranking rows with low coverage
+- marks rows below coverage threshold as `biased_low_coverage`
+- only ranks rows with `rank_status = 'rankable_resolvable_cg_board_cohort'`
+- does not rank heuristic X strategy PnL when `linkage_conflict_count > 0`
+- defers global cross-source ranking until broad historical pricing exists (for example, GoldRush/pair-mapped OHLCV) or the per-source coverage gates prove cohort adequacy
 
 No HTTP endpoint ships in this PR.
 
@@ -275,7 +321,7 @@ Passes:
 
 Rerun behavior:
 
-- row creation uses `INSERT OR IGNORE`
+- row creation uses `INSERT ... ON CONFLICT(source_type, source_event_id) DO UPDATE SET ...` for mutable source-derived fields, preserving `created_at`
 - outcome/linkage updates are deterministic refreshes
 - `updated_at` changes when a row is refreshed
 
@@ -286,6 +332,7 @@ Because `source_calls` is a pipeline table, the PR includes a read-only watchdog
 Initial form:
 
 ```text
+scripts/check_source_calls_lag.py --db scout.db --threshold-minutes 30
 scripts/source-calls-lag-watchdog.sh [--db scout.db] [--threshold-minutes 30]
 ```
 
@@ -309,14 +356,17 @@ Focused tests:
 5. `UNIQUE(source_type, source_event_id)` rerun idempotency
 6. duplicate identity fallback and duplicate rank
 7. stale at-call price rejected
-8. bounded 30m/1h/6h/24h windows
-9. 24h extrema do not read beyond 24h
-10. TG direct paper-trade linkage
-11. X heuristic linkage
-12. summary low-n uses eligible distinct clusters
-13. summary exposes coverage and duplicate denominators
-14. lag watchdog fails/pass/quiet-period cases
-15. adjacent TG/X/paper-trading tests continue to pass
+8. mixed timestamp formats normalize to UTC before comparison
+9. horizon-specific stale at-call price suppression
+10. bounded 30m/1h/6h/24h windows
+11. 24h extrema do not read beyond 24h
+12. pending/partial/complete/unresolvable precedence
+13. TG direct paper-trade linkage
+14. X heuristic linkage with conflict counts
+15. summary low-n uses eligible distinct clusters and coverage-rate gates
+16. summary exposes coverage, duplicate, and missing-reason denominators
+17. lag watchdog fails/pass/quiet-period cases
+18. adjacent TG/X/paper-trading tests continue to pass
 
 ## Rollback
 
@@ -335,11 +385,14 @@ Plan reviewers found and this design folds:
 - sparse forward-window leakage
 - survivorship bias from covered-only rankings
 - duplicate spam inflating sample size
+- mixed timestamp-format comparisons
+- pending/partial ambiguity
 - nullable cluster identity collapse
 - stale at-call prices
 - §12a watchdog deferral
 - endpoint/read-model scope contradiction
 - migration sentinel ambiguity
 - optional FK semantics
+- X heuristic linkage conflict counts
 - denormalized PnL conflict
 - live row counts in unit-test criteria
