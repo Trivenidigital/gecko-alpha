@@ -10,6 +10,56 @@
 
 ## Active Findings
 
+### BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-FIX
+**Status:** PARTIAL-SHIPPED 2026-05-20 — Step 1 instrumentation deployed on srilu-vps (commit `3af48d9`); the actual Step 4 timeout/runtime fix is filed as separate follow-up `BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-APPLY` pending operator decision on which path (parallelize vs extend) based on the empirical evidence.
+**Why:** Hermes narrative scanner cron (`gecko-x-narrative-scanner`) hits the 120s `_get_script_timeout()` budget on busy cycles. Pre-instrumentation evidence: ~40% of recent cycles exceeded 120s. The pre-existing log only emitted `Duration: 136.0s` without per-stage attribution — making any fix shape speculative.
+**Original target name:** `BL-NEW-HERMES-NARRATIVE-CRON-PROMPT-INJECTION-FIX` was stale (last actual prompt-injection block was 2026-05-15 14:00 UTC; resolved by the May 15 refactor to `no_agent: true` shell-script mode). Renamed per `memory/feedback_jobs_json_canonical_for_cron_diagnosis.md` — jobs.json `last_error` is the canonical current state.
+**Evidence (Step 1 first instrumented cycle, 2026-05-20T04:00:53Z, full final state):** 4 `SCANNER-STAGE-START` + 4 `SCANNER-STAGE-TIMING` + 1 `SCANNER-CYCLE-SUMMARY`. Total cycle duration 234.28s. Per-stage timing: kol-watcher 12.11s, narrative-classifier **222.14s (95% of total, BOTTLENECK CONFIRMED)**, coin-resolver 0.00s, narrative-alert-dispatcher 0.02s. 2 alerts dispatched. Non-trivial operational insight: `jobs.json` records `last_status=error` ("timed out after 120s") but the Python sub-subprocess survives the wrapper SIGTERM (orphaned to PID 1), continues writing to its open file descriptor, and completes the work — the cron timeout flag is currently misleading. (Initial pre-cycle-completion read showed 2/1/0 due to log capture mid-write; corrected post-cycle.)
+**Scope (this PR — docs-only):**
+- VPS instrumentation deployed to `/home/gecko-agent/run-scanner-cycle.py` + wrapper `gecko_x_narrative_scanner.sh`
+- Per-stage JSON-encoded structured emits (`SCANNER-STAGE-START` / `SCANNER-STAGE-TIMING` / `SCANNER-CYCLE-SUMMARY`)
+- OpenRouter 4xx/5xx counters + `classification_other_error` for invariant/parse/connection failures
+- Wrapper hardened: `umask 0027` + explicit `chmod 0640` on log file
+- One-shot `chmod 0640` on existing world-readable cycle reports
+- Backups: `*.bak.3af48d9-1779249120` at mode 0600
+**Plan:** `tasks/plan_hermes_narrative_cron_fix_2026_05_20.md`
+**Design:** `tasks/design_hermes_narrative_cron_fix_2026_05_20.md`
+**Runbook:** `tasks/runbook_hermes_narrative_cron_instrumentation_2026_05_20.md`
+
+### BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-APPLY
+**Status:** PROPOSED 2026-05-20 (depends on `-RUNTIME-TIMEOUT-FIX` Step 1 ≥3 cycles of profile data).
+**Why:** Step 1 instrumentation empirically attributed the 120s timeout to the `narrative-classifier` stage (>108s of the cycle). Per the plan's pre-registered decision rubric §Step 3, this lands in verdict (b) — single dominant stage IS reducible. The fix is to parallelize the OpenRouter classifier loop via `concurrent.futures.ThreadPoolExecutor` at concurrency=5 (or whatever OpenRouter's rate limit supports), compressing 27×~4s sequential calls to ~5 batches of ~4s parallel = ~20-30s total.
+**Constraint:** must preserve the 0.6 confidence floor, hard-extraction-invariant verification, and per-tweet sequential ordering of `state.skips`/`state.openrouter_*` counters (use a lock OR aggregate after gather).
+**Acceptance:** 3 consecutive cycles complete under 120s with classifier stage <60s. `jobs.json` `last_status="success"`.
+**Fallback:** if parallelization hits OpenRouter rate-limit ceiling, fall back to verdict (a) timeout extension via systemd `HERMES_CRON_SCRIPT_TIMEOUT=240` (subject to the plan v3 hard cap: `min(2×p95, 1800s)`).
+
+### BL-NEW-HERMES-CRON-NO-AGENT-FLAG-WATCHDOG
+**Status:** PROPOSED 2026-05-20.
+**Why:** `jobs.json` `no_agent: true` flag is what keeps the historical 2026-05-15 prompt-injection failure mode resolved. If a future PR or operator accidentally flips it, the May 15 issue returns silently. Programmatic guardrail needed.
+**Scope:** extend the existing cron watchdog (landed PR #156/#161) to assert `.jobs[] | select(.id=="c849fffec986") | .no_agent == true` and alert to Telegram on flip. Single-line jq extraction. Cheap.
+
+### BL-NEW-SCANNER-EXISTING-EXCEPTION-BOUNDING
+**Status:** PROPOSED 2026-05-20.
+**Why:** Vector B F1 finding during design review: existing `log(f"... {e}")` callsites in `/home/gecko-agent/run-scanner-cycle.py` (lines 65, 112, 285, 476, 650, 716) interpolate exception messages without bounding. New instrumentation hunks added `str(e)[:120]` truncation per Invariant 2 — but the existing sites are asymmetric. Not regressive; consistency cleanup.
+**Scope:** wrap each unbounded `{e}` site with `type(e).__name__` + `str(e)[:120]` pattern. ~6 line edits in run-scanner-cycle.py. VPS-only.
+
+### BL-NEW-HERMES-CRON-SUBPROCESS-LIFECYCLE-AUDIT
+**Status:** PROPOSED 2026-05-20.
+**Why:** Step 1 instrumentation revealed that Hermes cron's `subprocess.run(timeout=120)` does NOT actually kill the Python sub-subprocess when the wrapper SIGTERM fires at 120s — the Python orphans to PID 1 and continues running. Currently OK at hourly schedule (234s peak << 3600s gap), but if cycle runtime ever overlaps the next cron tick, stacked orphans could exhaust CPU/memory. Hermes-platform-side issue, not gecko-alpha-side.
+**Scope:** audit hermes-agent `scheduler.py` subprocess-lifecycle to determine whether the daemon SHOULD propagate SIGTERM/SIGKILL to the process group (using `preexec_fn=os.setsid` + `os.killpg`). If yes, file upstream feedback. If acceptable as-is, document the orphaned-Python-completes-work pattern so future operators don't misread `last_status=error` as "work failed."
+**Surfaced by:** Vector A M1 finding during PR #201 review.
+
+### BL-NEW-HERMES-NARRATIVE-DEFERRED-RESOLUTION-SWEEP
+**Status:** PROPOSED 2026-05-20.
+**Why:** Step 1 resolver-health re-check found 15 historical `narrative_alerts_inbound` rows with `extracted_ca IS NOT NULL` but `resolved_coin_id IS NULL`. Most likely cause: the gecko-alpha `/api/coin/lookup` endpoint returned `found=False` because those tokens hadn't been ingested by gecko-alpha at scan time (pre-CG-listing case — exactly the V1 structural limitation per design doc §3). The resolver only tries ONCE per CA; there's no re-resolution sweep when gecko-alpha later ingests the token.
+**Scope:** add a "deferred resolution sweep" pass at the start of each cron cycle that re-queries `/api/coin/lookup` for `narrative_alerts_inbound` rows with `extracted_ca IS NOT NULL AND resolved_coin_id IS NULL AND received_at > now() - 7d`. Update via separate `/api/narrative-alert-resolve` PATCH endpoint or PUT replacement.
+**Constraint:** the design doc §3 already specifies this behavior ("deferred resolution pass at next cycle"); current implementation appears to not have it. Verify against design intent before adding the sweep.
+
+### BL-NEW-SCANNER-PRINT-TO-LOG-CONSISTENCY
+**Status:** PROPOSED 2026-05-20.
+**Why:** Vector B F10 finding during design review: `/home/gecko-agent/run-scanner-cycle.py:691-713` (FINAL REPORT section) uses raw `print()` calls; the rest of the script uses the wrapped `log()` helper. Inconsistency is not a leak (current interpolations are counters/lengths) but is a future-maintenance trap.
+**Scope:** convert FINAL REPORT print() calls to log() (or vice versa for the new JSON-encoded summary emit). Trivial. VPS-only.
+
 ### BL-NEW-ACTIONABILITY-GATE
 **Status:** SHIPPED 2026-05-19 — implemented by PR #181 (`7506adc`) and deployed to srilu; visibility follow-up shipped by PR #182 (`32df89d`).
 **Why:** Current paper trades mix decision-bearing and exploratory cohorts. The 2026-05-19 profit-pattern analysis found sharp separation between profitable current-regime patterns (`narrative_prediction`, `chain_completed`, `volume_spike`) and junk/exploratory patterns (`losers_contrarian`, weak `gainers_early`, low-n `trending_catch`).
