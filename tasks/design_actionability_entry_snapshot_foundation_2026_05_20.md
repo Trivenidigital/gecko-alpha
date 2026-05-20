@@ -33,7 +33,7 @@ All Critical + Important findings folded into this revision before any implement
 | Finding | Vector | Fold |
 |---|---|---|
 | C1: `tg_channel_at_entry` query had no `created_at <= opened_at` bound; could pull post-open social rows | B Critical | Query gains `AND created_at <= ?` bound; `opened_at` passed from `paper.py:259` through to the writer; new test 5b asserts pre/post-open rows are disjoint |
-| C2: `trail_pct` was re-queried from mutable `signal_params` at stamp time; racy with operator/auto recalibration | B Critical | `trail_pct` + `trail_pct_low_peak` passed as inputs from gate-decision site; no `signal_params` read at stamp time; new test 7b asserts the stamp uses gate-decision value through a mid-flight mutation |
+| C2: `trail_pct` was re-queried from mutable `signal_params` at stamp time; racy with operator/auto recalibration | B Critical | Initial fold attempted "pass from gate-decision site" but verification of `paper.py` showed `trail_pct` is NOT in scope at trade-open (it's only used at exit-time in `evaluator.py`). Refolded to Vector B Option (b): audit-replay against `signal_params_audit` with `applied_at <= opened_at` bound, with seed-baseline fallback to `signal_params.<field>` when no audit history exists. New test 7b asserts a T+1h audit row does NOT contaminate a trade opened at T. Documented semantic-divergence caveat: at-entry trail_pct reflects operator config; evaluator may override at exit time. |
 | I1: `INSERT OR IGNORE` masked duplicate-PK error signal | B Important | Switched to plain `INSERT`; test 11 rewritten to assert IntegrityError raises into outer try/except; docstring + design narrative updated |
 | I2: `complete=0` pools all partial states; per-column `IS NOT NULL` re-introduces silent-NULL ambiguity | B Important | New "Downstream cohort-query rule" subsection mandates filtering via `entry_snapshot_missing_fields` JSON, not per-column IS NOT NULL |
 | I3: `v1` version literal not enforced in tests | B Important | New test 12 locks `ENTRY_SNAPSHOT_VERSION == "v1"` and asserts the stamped value |
@@ -47,7 +47,10 @@ All Critical + Important findings folded into this revision before any implement
 | M2: `entry_snapshot_missing_fields` should be NOT NULL | A Minor | Added NOT NULL to schema |
 | M3: `LEFT JOIN ... USING (paper_trade_id)` invalid (paper_trades column is `id`) | A Minor | Switched to explicit `ON s.paper_trade_id = pt.id` |
 
-No design changes were rejected. All findings folded as written; only minor wording adjustments to fit the surrounding narrative.
+No design changes were rejected. All findings folded; the C2 fold was
+adjusted after structural verification (`trail_pct` is not in scope at the
+trade-open call site, so Vector B's Option (a) "pass from gate" was
+infeasible; Option (b) "audit-replay with temporal bound" landed instead).
 
 ## Drift Check (§7a)
 
@@ -96,15 +99,22 @@ exact source of each must-have field:
 | `actionable_at_entry` | local var `actionable_value` (0/1) | mirrors `paper_trades.actionable`; redundancy is intentional so the sidecar is self-contained for cohort joins without needing to JOIN `paper_trades` |
 | `tp_pct_at_entry` | local var `tp_pct` | always present |
 | `sl_pct_at_entry` | local var `sl_pct` | always present |
-| `trail_pct_at_entry` | **passed as input** from the gate-decision site (the value the gate actually used) — NOT re-queried at stamp time | optional; eliminates race with operator/auto-recalibration of `signal_params` between gate and stamp |
-| `trail_pct_low_peak_at_entry` | same source as `trail_pct_at_entry` — passed as input | optional |
+| `trail_pct_at_entry` | audit-replay against `signal_params_audit`: latest `new_value` for `(signal_type, field_name='trail_pct', applied_at <= opened_at)`, else `signal_params.trail_pct` (seed-baseline fallback) | optional; temporal bound prevents post-open recalibrations from leaking into the at-entry value |
+| `trail_pct_low_peak_at_entry` | same pattern as `trail_pct_at_entry`, with `field_name='trail_pct_low_peak'` | optional |
 
-The only fields requiring extra-query are `first_seen_at_at_entry` (candidates)
-and `tg_channel_at_entry` (tg_social_signals, with `created_at <= trade_open_ts`
-bound). `trail_pct_at_entry` and `trail_pct_low_peak_at_entry` are passed as
-inputs from the gate-decision site (per Vector B C2 fold: reading mutable
-`signal_params` at stamp time would race with operator recalibration). All
-extra-query reads are optional and against tables that exist on master today.
+The fields requiring extra queries are `first_seen_at_at_entry` (candidates),
+`tg_channel_at_entry` (tg_social_signals — with the `created_at <= opened_at`
+bound from Vector B C1), and `trail_pct_*_at_entry` (signal_params_audit
+replay with `applied_at <= opened_at`, fallback to current signal_params seed).
+All extra-query reads are optional, temporally bounded against mutating tables,
+and against tables that exist on master today.
+
+**Note on `trail_pct_at_entry` semantic:** this is the operator-configured
+trail at trade-open. The evaluator may apply additional logic at exit time
+(moonshot-floor override at `evaluator.py:482`, conviction-lock overrides at
+`evaluator.py:237`) so the value the evaluator ACTUALLY uses can differ from
+`trail_pct_at_entry`. Documented in §"Failure modes pre-empted" as a known
+divergence, not a bug.
 
 ### Conflict check
 
@@ -228,14 +238,12 @@ try:
     await stamp_entry_snapshot(
         db,
         trade_id=trade_id,
-        opened_at=now,                # trade-open timestamp; bounds tg_channel query (Vector B C1)
+        opened_at=now,                # trade-open timestamp; bounds tg_channel + signal_params_audit queries (Vector B C1+C2)
         signal_type=signal_type,
         signal_data=signal_data,
         signal_combo=signal_combo,
         tp_pct=tp_pct,
         sl_pct=sl_pct,
-        trail_pct_at_entry=trail_pct,            # passed in; gate-decision value (Vector B C2)
-        trail_pct_low_peak_at_entry=trail_pct_low_peak,  # passed in (Vector B C2)
         actionable_value=actionable_value,
         actionability_reason=actionability_reason,
         actionability_version=actionability_version,
@@ -334,13 +342,10 @@ async def stamp_entry_snapshot(db, *, trade_id: int, opened_at: datetime, **inpu
 
 ### No future-state leakage
 
-The writer reads ONLY fields that reflect state at trade-open time:
+The writer reads ONLY fields that reflect state at-or-before trade-open time:
 
-- **Variables already in scope** (`signal_type`, `tp_pct`, `sl_pct`,
-  `trail_pct`, `trail_pct_low_peak`, etc.) — passed in directly from the
-  gate-decision site. `trail_pct` and `trail_pct_low_peak` are passed
-  as inputs precisely because `signal_params` is mutable (operator/auto
-  recalibration); re-reading at stamp time would race (Vector B C2 fix).
+- **Variables already in scope** (`signal_type`, `tp_pct`, `sl_pct`, etc.)
+  — passed in directly from the trade-open call site (`paper.py:243-271`).
 - **`signal_data`** (already serialized before INSERT).
 - **`candidates`** — append-only metadata about token discovery; rows are
   stable post-insert. Safe to read.
@@ -349,6 +354,14 @@ The writer reads ONLY fields that reflect state at trade-open time:
   post-open social signal from being picked as the "at-entry" channel
   (Vector B C1 fix). The trade-open timestamp `now` from `paper.py:259`
   is passed as the `opened_at` parameter.
+- **`signal_params_audit`** — append-only audit log. For
+  `trail_pct_at_entry` and `trail_pct_low_peak_at_entry`, the writer
+  reads the LATEST row with `applied_at <= opened_at` for the
+  `(signal_type, field_name)` pair (Vector B C2 fix — bounded replay
+  against the audit log, not a racy read of mutable `signal_params`).
+  Falls back to `signal_params.<field>` only when no audit row exists
+  (the seed-baseline case, where the current value provably equals the
+  at-entry value because nothing has changed).
 
 No reads against `paper_trades` for the trade we just inserted (would be a
 self-reference; not needed). No reads against price_cache (would leak
@@ -356,10 +369,9 @@ post-open prices) — `price_freshness_seconds_at_entry` is explicitly deferred.
 No reads against any post-open table (gainers_snapshots/momentum/etc) — those
 are signal sources, not entry-time receipt records.
 
-No reads against `signal_params` directly — values come in as gate-decision
-inputs so the recorded `trail_pct_at_entry` reflects what the gate actually
-used, not whatever value `signal_params` carries at stamp-time microseconds
-later (Vector B C2).
+No unbounded reads against `signal_params` — the audit-replay with
+`applied_at <= opened_at` is the temporally-correct way to recover the
+operator-configured trail at trade-open.
 
 ### No historical/reconstructed mixing
 
@@ -572,17 +584,20 @@ criteria here so the reviewer can match the impl against them.
    reason='v1_pass_core_signal_mcap_10_50m', version='v1')`. Assert the
    sidecar row's three `actionability_*_at_entry` fields match exactly.
 7. **Exit params copied correctly.** Open a trade with `tp_pct=20.0`,
-   `sl_pct=10.0`, `trail_pct=30.0`, `trail_pct_low_peak=20.0`. Assert
-   `tp_pct_at_entry=20.0`, `sl_pct_at_entry=10.0`, `trail_pct_at_entry=30.0`,
-   `trail_pct_low_peak_at_entry=20.0` — i.e., the values passed to
-   `stamp_entry_snapshot` from the gate-decision site, NOT whatever
-   `signal_params` carries at stamp time.
-7b. **trail_pct passed-as-input, not re-queried (Vector B C2).** With
-    `SIGNAL_PARAMS_ENABLED=True` and a `signal_params` row holding
-    `trail_pct=99.0`, open a trade where the gate decided
-    `trail_pct=30.0`. Between gate-decision and stamp, mutate the
-    `signal_params` row to `trail_pct=88.0`. Assert
-    `trail_pct_at_entry=30.0` (the gate-decision value), NOT 99 or 88.
+   `sl_pct=10.0`. With `SIGNAL_PARAMS_ENABLED=True` and a `signal_params`
+   row whose current `trail_pct=30.0` (no audit history, so the seed
+   value is canonical), assert `tp_pct_at_entry=20.0`,
+   `sl_pct_at_entry=10.0`, `trail_pct_at_entry=30.0` (fallback path —
+   no audit row means current signal_params value is correct).
+7b. **trail_pct audit-replay with temporal bound (Vector B C2).** Seed
+    `signal_params.trail_pct=30.0`. Insert audit rows:
+    `(signal_type, 'trail_pct', '30.0', '40.0', applied_at=T-1h)` and
+    `(signal_type, 'trail_pct', '40.0', '50.0', applied_at=T+1h)`.
+    Open a paper trade at `opened_at=T`. Assert
+    `trail_pct_at_entry=40.0` — the audit-replay reads the latest
+    row with `applied_at <= T`, NOT the later T+1h row. (Structural
+    guarantee that recalibrations applied after trade-open cannot
+    contaminate the at-entry value.)
 8. **Pre-cutover rows distinguishable.** Insert a paper_trade directly via
    SQL with no sidecar row. Query `SELECT entry_snapshot_version FROM
    paper_trades LEFT JOIN paper_trade_entry_snapshots ...` returns NULL.
