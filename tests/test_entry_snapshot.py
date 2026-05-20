@@ -656,6 +656,91 @@ async def test_ib1_field_name_whitelist_enforced():
         )
 
 
+async def test_postfold_a_tg_social_mcap_at_sighting_captured(db):
+    """Post-fold Vector A Important: tg_social dispatcher constructs
+    signal_data with `mcap_at_sighting` (NOT `mcap`). The actionability
+    classifier's _extract_mcap reads 5 keys (mcap / market_cap /
+    market_cap_usd / mcap_at_sighting / alert_market_cap). Pre-fold,
+    snapshot's _extract_mcap read only the first 3 — so every real tg_social
+    trade had mcap_usd_at_entry=None.
+
+    Fix: snapshot's _extract_mcap reuses actionability._extract_mcap to keep
+    the key list in lockstep. This test asserts mcap is captured when the
+    signal_data uses the `mcap_at_sighting` key (the tg_social shape)."""
+    await _seed_tg_signal(
+        db,
+        token_id="tg-mcap-tok",
+        channel="@kol",
+        created_at="2026-05-20T00:00:00+00:00",
+        msg_id=3001,
+    )
+
+    trade_id = await PaperTrader().execute_buy(
+        db=db,
+        token_id="tg-mcap-tok",
+        symbol="TG",
+        name="TG Mcap",
+        chain="coingecko",
+        signal_type="tg_social",
+        # Real tg_social dispatcher shape: mcap_at_sighting, not mcap
+        signal_data={
+            "channel_handle": "@kol",
+            "contract_address": "tg-mcap-tok",
+            "mcap_at_sighting": 18_000_000,
+        },
+        current_price=1.0,
+        amount_usd=300.0,
+        tp_pct=20.0,
+        sl_pct=10.0,
+        signal_combo="tg_social",
+        settings=_settings(),
+    )
+    assert trade_id is not None
+
+    cur = await db._conn.execute(
+        "SELECT mcap_usd_at_entry, mcap_bucket_at_entry "
+        "FROM paper_trade_entry_snapshots WHERE paper_trade_id=?",
+        (trade_id,),
+    )
+    mcap, bucket = await cur.fetchone()
+    assert mcap == 18_000_000, (
+        f"tg_social mcap_at_sighting did not land in snapshot: got {mcap!r} "
+        f"(expected 18_000_000 — Vector A post-fold key-list alignment)"
+    )
+    assert bucket == "10_50m"
+
+
+async def test_postfold_a_alert_market_cap_key_captured(db):
+    """Companion to the above: the 5th key actionability supports is
+    `alert_market_cap` (used by secondwave-style paths). Snapshot must
+    capture this too via the lockstep helper."""
+    trade_id = await PaperTrader().execute_buy(
+        db=db,
+        token_id="alert-mcap-tok",
+        symbol="ALR",
+        name="Alert Mcap",
+        chain="coingecko",
+        signal_type="narrative_prediction",
+        signal_data={"alert_market_cap": 12_000_000, "liquidity_usd": 200_000},
+        current_price=1.0,
+        amount_usd=300.0,
+        tp_pct=20.0,
+        sl_pct=10.0,
+        signal_combo="narrative_prediction",
+        settings=_settings(),
+    )
+    assert trade_id is not None
+
+    cur = await db._conn.execute(
+        "SELECT mcap_usd_at_entry, mcap_bucket_at_entry "
+        "FROM paper_trade_entry_snapshots WHERE paper_trade_id=?",
+        (trade_id,),
+    )
+    mcap, bucket = await cur.fetchone()
+    assert mcap == 12_000_000
+    assert bucket == "10_50m"
+
+
 async def test_ib2_enriched_mcap_landed_in_snapshot(db):
     """Vector B I-B2 fold: for a chain_completed trade where signal_data
     lacks mcap but chain_matches has mcap_at_completion, the snapshot must

@@ -91,14 +91,17 @@ def _mcap_bucket(mcap: float | None) -> str | None:
 
 
 def _extract_mcap(signal_data: dict[str, Any]) -> float | None:
-    for key in ("mcap", "market_cap", "market_cap_usd"):
-        value = signal_data.get(key)
-        if value is not None:
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-    return None
+    # Post-fold review Vector A Important finding: must read the SAME key
+    # list the actionability classifier reads, or the snapshot silently
+    # records mcap_usd_at_entry=None for any signal_data shape that uses
+    # the longer-tail keys. The most common case is tg_social, whose
+    # dispatcher constructs signal_data with `mcap_at_sighting` (not
+    # `mcap`). Reusing actionability._extract_mcap directly keeps the two
+    # in lockstep — any future key added to the classifier propagates
+    # automatically.
+    from scout.trading.actionability import _extract_mcap as _actionability_extract_mcap
+
+    return _actionability_extract_mcap(signal_data)
 
 
 def _extract_liquidity(signal_data: dict[str, Any]) -> float | None:
@@ -121,6 +124,13 @@ def _source_confluence_count(signal_combo: str | None) -> int | None:
 async def _read_first_seen_at(
     db, *, contract_address: str | None, chain: str | None
 ) -> str | None:
+    # Post-fold Vector B Minor #3: unbounded read of `candidates.first_seen_at`
+    # depends on the ingestion invariant that first_seen_at is monotonic
+    # per (contract_address, chain). This is NOT strictly enforced today —
+    # `_upsert_candidate` uses INSERT OR REPLACE and the model default is
+    # `now()` per construction (see BL-NEW-ACTIONABILITY-CANDIDATES-FIRST-
+    # SEEN-PRESERVE). For trades on tokens that have been re-ingested,
+    # `token_age_days_at_entry` is a LOWER BOUND, not the earliest sighting.
     if not contract_address or not chain:
         return None
     cur = await db._conn.execute(
@@ -336,6 +346,19 @@ async def stamp_entry_snapshot(
     `captured_at` is writer-time and slightly after `opened_at`; analytics
     should use paper_trades.opened_at when bucketing by trade time
     (Vector B M2).
+
+    Post-fold Vector B Minor #2: any enrichment read (chain_matches /
+    price_cache via paper._enrich_actionability_signal_data) runs at
+    T_enrich, which is microseconds AFTER opened_at. The captured mcap
+    reflects the value the CLASSIFIER saw, not the strictly-at-opened_at
+    value. The two are coupled (snapshot ↔ classifier coherence), which
+    is the intended I-B2 contract; if strict-at-opened_at is ever
+    required, both readers would need a temporal-snapshot table.
+
+    Post-fold Vector B Minor #1: if enrichment succeeds but the classifier
+    subsequently raises, the snapshot still captures the enriched mcap
+    while `actionability_reason_at_entry` is recorded as "v1_error".
+    This is internally consistent (both facts true) and intentional.
     """
     snapshot = await build_entry_snapshot(
         db,
