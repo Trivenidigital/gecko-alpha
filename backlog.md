@@ -27,11 +27,11 @@
 **Runbook:** `tasks/runbook_hermes_narrative_cron_instrumentation_2026_05_20.md`
 
 ### BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-APPLY
-**Status:** PROPOSED 2026-05-20 (depends on `-RUNTIME-TIMEOUT-FIX` Step 1 ≥3 cycles of profile data).
-**Why:** Step 1 instrumentation empirically attributed the 120s timeout to the `narrative-classifier` stage (>108s of the cycle). Per the plan's pre-registered decision rubric §Step 3, this lands in verdict (b) — single dominant stage IS reducible. The fix is to parallelize the OpenRouter classifier loop via `concurrent.futures.ThreadPoolExecutor` at concurrency=5 (or whatever OpenRouter's rate limit supports), compressing 27×~4s sequential calls to ~5 batches of ~4s parallel = ~20-30s total.
-**Constraint:** must preserve the 0.6 confidence floor, hard-extraction-invariant verification, and per-tweet sequential ordering of `state.skips`/`state.openrouter_*` counters (use a lock OR aggregate after gather).
-**Acceptance:** 3 consecutive cycles complete under 120s with classifier stage <60s. `jobs.json` `last_status="success"`.
-**Fallback:** if parallelization hits OpenRouter rate-limit ceiling, fall back to verdict (a) timeout extension via systemd `HERMES_CRON_SCRIPT_TIMEOUT=240` (subject to the plan v3 hard cap: `min(2×p95, 1800s)`).
+**Status:** SHIPPED 2026-05-20 — parallelized classifier deployed at concurrency=3 + fcntl.flock overlapping-cycle guard + per-worker 429 backoff. First post-fix cycle (05:00:54Z) completed in **79.27s** (was 234.28s) — 3.0× speedup, well under 120s. `jobs.json` `last_status=ok`. See `tasks/runbook_hermes_narrative_cron_timeout_apply_2026_05_20.md`.
+**Plan:** `tasks/plan_hermes_narrative_cron_timeout_apply_2026_05_20.md` (v2, post-fold)
+**Design:** `tasks/design_hermes_narrative_cron_timeout_apply_2026_05_20.md` (v2, post-fold)
+**Runbook:** `tasks/runbook_hermes_narrative_cron_timeout_apply_2026_05_20.md`
+**Concurrency tuning:** start at 3; promote to 5 only after ≥5 consecutive clean cycles + zero `openrouter-429-burst-count` + confirmed OpenRouter tier.
 
 ### BL-NEW-HERMES-CRON-NO-AGENT-FLAG-WATCHDOG
 **Status:** PROPOSED 2026-05-20.
