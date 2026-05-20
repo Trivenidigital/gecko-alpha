@@ -1632,6 +1632,54 @@ scout/trading/
 
 ---
 
+## Actionability measurement substrate 2026-05-20
+
+Two entries surfaced during the 2026-05-19 trader/strategist brainstorm synthesis: the next quality jump for actionability is durable point-in-time entry facts plus an operator feedback loop — NOT a smarter composite score. Both filed PROPOSED; implementation of `FOUNDATION` happens in its own design-then-implementation PR. `OPERATOR-FEEDBACK-MARKS` is a separate sequel and **must not be bundled** with the foundation implementation.
+
+### BL-NEW-ACTIONABILITY-ENTRY-SNAPSHOT-FOUNDATION: stamp point-in-time entry facts for future V2
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `actionability` `measurement-substrate` `paper-trading` `schema` `analytics`
+**Why:** Actionability V2, source quality, and profit-pattern analysis should not reconstruct entry context from mutable/current tables. Reconstructed features can leak future state, vary by coverage, and smear stamped rows with historical rows. The next serious quality improvement is a measurement substrate, not a smarter-looking score.
+
+**Core principle:** persist point-in-time entry facts at paper-trade open. This is metadata only: no classifier changes, no suppression, no capital allocation, and no paper-trade open/exit behavior changes beyond durable stamping.
+
+**Must-have today-computable fields:**
+- `entry_snapshot_version`
+- `entry_snapshot_complete`
+- `entry_snapshot_missing_fields`
+- `signal_type`
+- `mcap_usd_at_entry`
+- `mcap_bucket_at_entry`
+- `liquidity_usd_at_entry` when present in signal data
+- `token_age_days_at_entry` or `first_seen_at_entry` when available
+- `detected_by_combo_at_entry` when available
+- `source_confluence_count_at_entry` when available
+- `tg_channel_at_entry` for `tg_social` when available
+- `actionability_version`
+- `actionability_reason`
+- active exit params at entry (`tp_pct_at_entry`, `sl_pct_at_entry`, and trail / peak-fade params if present in current signal params)
+
+**Explicitly deferred fields:** `x_handle_at_entry` (pending PR #184 / X linkage design), `price_freshness_seconds_at_entry` (pending price-cache writer/hot-path instrumentation), richer resolver confidence/linkage state (partial today; should not block foundation).
+
+**Coverage contract:** If all required today-computable fields are present, mark `entry_snapshot_complete=true`. Missing optional/deferred fields must not fail paper-trade open; record them in `entry_snapshot_missing_fields`. Dashboard/backtests must distinguish fully stamped rows, partially stamped rows, and pre-cutover/reconstructed historical rows.
+
+**Design requirement:** Compare wide `paper_trades` columns vs a `paper_trade_entry_snapshots` sidecar table keyed by `paper_trade_id`. Prefer the shape that minimizes hot-path risk while keeping snapshot growth manageable. If unsure, stop at design PR rather than forcing a late-night migration.
+
+**Acceptance:** New paper trades have durable entry snapshots with explicit coverage state. Historical/reconstructed rows cannot be silently mixed with complete stamped rows in actionability/V2 analysis.
+
+### BL-NEW-ACTIONABILITY-OPERATOR-FEEDBACK-MARKS: dashboard learning-loop annotations
+**Status:** PROPOSED 2026-05-20.
+**Tag:** `actionability` `operator-feedback` `dashboard` `learning-loop`
+**Why:** The false-negative explorer can surface exploratory winners, but without an operator mark there is no feedback loop from "this was real" back into future V2 design. Human review should be captured as durable metadata before it becomes tuning input.
+
+**Scope:** From the trade detail drawer, allow the operator to mark a trade/signal as `real_winner`, `false_positive`, `interesting_but_late`, `bad_source_noisy`, or `ignore`, with an optional note. This should be a separate primitive from entry snapshots.
+
+**Constraints:** No classifier changes, no suppression, no live/capital behavior, and no automated V2 learning from marks until separately designed. Implement after `BL-NEW-ACTIONABILITY-ENTRY-SNAPSHOT-FOUNDATION` or as a separate reviewed PR.
+
+**Acceptance:** Operator feedback is persisted, visible in dashboard/read models, and exportable for later V2 review without changing trading behavior.
+
+---
+
 ## Follow-ups filed 2026-05-19 from trader-cockpit overnight assignment (#194 / #195)
 
 Six entries surfaced during the dashboard cockpit overnight assignment. **All file-only, no implementation.** Operator scope: file for visibility / future scheduling; implementation requires separate approval. Pair with PR #194 (Trader Action Queue) + #195 (Trade Detail Drawer) which already covered the cheap drilldown surface.
