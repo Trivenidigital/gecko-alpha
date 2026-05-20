@@ -110,6 +110,7 @@ class Database:
         # ordered AFTER minara_alert_emissions so the paper_trades FK target
         # is guaranteed to exist + already-migrated (Vector A I4).
         await self._migrate_actionability_entry_snapshot_v1()
+        await self._migrate_source_calls_v1()
         await self._migrate_chain_pattern_provenance_v1()
         await self._migrate_score_history_scanned_at_index()
         await self._migrate_volume_snapshots_scanned_at_index()
@@ -3658,6 +3659,165 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "bl_actionability_entry_snapshot_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    async def _migrate_source_calls_v1(self) -> None:
+        """BL-NEW-SOURCE-CALL-OUTCOME-LEDGER: durable TG/X call ledger."""
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "bl_source_calls_v1"
+        schema_version = 20260522
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("bl_source_calls_v1_migration_skip_already_applied")
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            cur = await conn.execute("SELECT json_valid('[]'), json_type('[]')")
+            json_probe = await cur.fetchone()
+            if json_probe is None or json_probe[0] != 1 or json_probe[1] != "array":
+                raise RuntimeError("SQLite JSON1 support required for source_calls")
+
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if existing_version is not None:
+                raise RuntimeError(
+                    "schema_version collision for bl_source_calls_v1: "
+                    f"version={schema_version} "
+                    f"description={existing_version['description']}"
+                )
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS source_calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_type TEXT NOT NULL CHECK (source_type IN ('tg', 'x')),
+                    source_id TEXT NOT NULL,
+                    source_event_id TEXT NOT NULL,
+                    token_id TEXT,
+                    symbol TEXT,
+                    contract_address TEXT,
+                    chain TEXT,
+                    call_ts TEXT NOT NULL,
+                    observed_at TEXT,
+                    ingest_delay_sec INTEGER,
+                    call_kind TEXT NOT NULL CHECK (
+                        call_kind IN ('first_mention','repeat_mention','ca_call',
+                                      'cashtag_only','unknown')
+                    ),
+                    cluster_identity TEXT NOT NULL,
+                    cluster_identity_kind TEXT NOT NULL CHECK (
+                        cluster_identity_kind IN ('token_id','contract','symbol',
+                                                  'source_event')
+                    ),
+                    duplicate_cluster_key TEXT NOT NULL,
+                    duplicate_rank_in_cluster INTEGER NOT NULL DEFAULT 1,
+                    resolved_state TEXT NOT NULL,
+                    price_at_call REAL,
+                    price_at_call_snapshot_at TEXT,
+                    price_source TEXT,
+                    price_age_sec INTEGER,
+                    forward_30m_snapshot_at TEXT,
+                    forward_30m_observed_horizon_sec INTEGER,
+                    forward_1h_snapshot_at TEXT,
+                    forward_1h_observed_horizon_sec INTEGER,
+                    forward_6h_snapshot_at TEXT,
+                    forward_6h_observed_horizon_sec INTEGER,
+                    forward_24h_snapshot_at TEXT,
+                    forward_24h_observed_horizon_sec INTEGER,
+                    mcap_at_call REAL,
+                    forward_30m_pct REAL,
+                    forward_1h_pct REAL,
+                    forward_6h_pct REAL,
+                    forward_24h_pct REAL,
+                    max_favorable_pct_24h REAL,
+                    max_adverse_pct_24h REAL,
+                    time_to_peak_min REAL,
+                    linked_paper_trade_id INTEGER,
+                    linkage_candidate_count INTEGER NOT NULL DEFAULT 0,
+                    linkage_conflict_count INTEGER NOT NULL DEFAULT 0,
+                    linkage_method TEXT NOT NULL DEFAULT 'none'
+                        CHECK (linkage_method IN ('none','direct_tg','heuristic_x')),
+                    linkage_confidence TEXT NOT NULL DEFAULT 'none'
+                        CHECK (linkage_confidence IN ('none','direct','heuristic',
+                                                      'conflict')),
+                    outcome_status TEXT NOT NULL
+                        CHECK (outcome_status IN ('pending','partial','complete',
+                                                  'unresolvable')),
+                    missing_fields TEXT NOT NULL
+                        CHECK (json_valid(missing_fields)
+                               AND json_type(missing_fields) = 'array'),
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY (linked_paper_trade_id)
+                        REFERENCES paper_trades(id) ON DELETE RESTRICT,
+                    UNIQUE (source_type, source_event_id)
+                )
+                """
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_source_calls_source_ts "
+                "ON source_calls(source_type, source_id, call_ts)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_source_calls_token_ts "
+                "ON source_calls(token_id, call_ts)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_source_calls_cluster "
+                "ON source_calls(duplicate_cluster_key)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_source_calls_outcome "
+                "ON source_calls(outcome_status, call_ts)"
+            )
+            await conn.execute(
+                "INSERT INTO paper_migrations (name, cutover_ts) VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT INTO schema_version (version, applied_at, description) "
+                "VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info("bl_source_calls_v1_migration_complete", table="source_calls")
+        except BaseException as e:
+            _log.exception(
+                "bl_source_calls_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,
