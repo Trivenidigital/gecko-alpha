@@ -1,5 +1,21 @@
 **New primitives introduced:** NONE (VPS-only — additive edit to `/home/gecko-agent/run-scanner-cycle.py` introducing `ThreadPoolExecutor`-based classifier parallelization at concurrency=3, `threading.Lock`-protected state mutations, per-worker 429 exponential backoff, fcntl.flock overlapping-cycle guard, refactor of `verify_hard_extraction_invariant` to return scrubbed count instead of mutating state; docs-only repo PR).
 
+# Design v2: BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-APPLY
+
+## Design-review fold log (2026-05-20)
+
+Two reviewer vectors returned **2 Critical (Vector A) + 0 Critical (Vector B)**. All folded into v2 below.
+
+| Finding | Vector | Status |
+|---|---|---|
+| A-RT1: `verify_hard_extraction_invariant` call NOT wrapped in try/except — `is_ca_in_text`/`extract_addresses_from_text` can raise; exception escapes worker; `future.result()` re-raises; `as_completed` loop dies | A | FOLDED — Hunk 5 wraps post-200 block (json parse + invariant + cleaned_items check) in a single broad-except |
+| A-RT2: `state.skips` not incremented on the escape path | A | FOLDED — broad-except increments classification_other_error + skips |
+| A-RT3: 429-cumulative-budget operationalize threshold | A | FOLDED — Acceptance criterion #5 already pins `< 0.2 × tweets_inspected` |
+| A-RT4-RT13: acceptable/minor | A | Documented inline |
+| B-M1: Inv 12 prose drift — Hunk 5 removes prod L505 traceback (improvement, not regression) | B | FOLDED — Inv 12 prose corrected |
+| B-M2: Inv 11 enumeration count drift (6 vs 7 vs actual 9+4) | B | FOLDED — replaced with structural statement "all log() carried 1:1 from prod" |
+| B-M3: keep human `log("No JSON found")` alongside JSON print | B | FOLDED — Hunk 5 NoJSONMatch path keeps both |
+
 # Design: BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-APPLY
 
 ## Drift-check against prod (Vector A I2 + M4 fold)
@@ -283,6 +299,12 @@ def _classify_one_with_backoff(idx, tweet, total):
         }))
         return None
 
+    # Design-review A-RT1 + A-RT2 fold: wrap the entire post-200 block in a
+    # single broad-except. verify_hard_extraction_invariant() may raise via
+    # is_ca_in_text/extract_addresses_from_text on malformed input; an
+    # uncaught exception would escape the worker, future.result() would
+    # re-raise, and the as_completed loop would die. This broad-except
+    # mirrors prod L489-507 semantics.
     try:
         result = response.json()
         content = result['choices'][0]['message']['content']
@@ -292,38 +314,45 @@ def _classify_one_with_backoff(idx, tweet, total):
             with _state_lock:
                 state.classification_other_error += 1
                 state.skips += 1
+            # Design-review B-M3 fold: keep prod's human-readable log alongside the JSON event.
+            log(f"  ✗ No JSON found in response", Colors.RED)
             print(json.dumps({
                 "event": "SCANNER-CLASSIFICATION-ERROR",
                 "error-type": "NoJSONMatch",
             }))
             return None
         classification = json.loads(json_match.group(0))
+
+        if classification.get('confidence', 0) < 0.6:
+            with _state_lock:
+                state.skips += 1
+            log(f"  ⏭️  Confidence {classification.get('confidence', 0):.2f} < 0.6, skipping", Colors.YELLOW)
+            return None
+
+        cleaned_class, scrubbed = verify_hard_extraction_invariant(classification, tweet['text'])
+        if scrubbed:
+            with _state_lock:
+                state.speculative_cas_scrubbed += scrubbed
+
+        if not cleaned_class.get('extracted_items'):
+            with _state_lock:
+                state.skips += 1
+            log(f"  ⏭️  No valid items after scrubbing", Colors.YELLOW)
+            return None
     except Exception as e:
+        # Catches: json parse, KeyError on result['choices'], IndexError,
+        # verify_hard_extraction_invariant raises (is_ca_in_text / regex).
+        # Vector A A-RT1+A-RT2 fold.
         with _state_lock:
             state.classification_other_error += 1
             state.skips += 1
+        # Vector B M1 fold: no traceback.print_exc() in worker — locals-via-
+        # traceback surface stays closed. Structured emit only.
         print(json.dumps({
             "event": "SCANNER-CLASSIFICATION-ERROR",
             "error-type": type(e).__name__,
             "error-msg-truncated": str(e)[:120],
         }))
-        return None
-
-    if classification.get('confidence', 0) < 0.6:
-        with _state_lock:
-            state.skips += 1
-        log(f"  ⏭️  Confidence {classification.get('confidence', 0):.2f} < 0.6, skipping", Colors.YELLOW)
-        return None
-
-    cleaned_class, scrubbed = verify_hard_extraction_invariant(classification, tweet['text'])
-    if scrubbed:
-        with _state_lock:
-            state.speculative_cas_scrubbed += scrubbed
-
-    if not cleaned_class.get('extracted_items'):
-        with _state_lock:
-            state.skips += 1
-        log(f"  ⏭️  No valid items after scrubbing", Colors.YELLOW)
         return None
 
     event = {
@@ -399,8 +428,8 @@ ssh srilu-vps 'nohup sudo -u gecko-agent /home/gecko-agent/.hermes/scripts/gecko
 All 12 invariants from plan v2 hold across these hunks. Critical checks:
 
 - **Inv 2 (no secret exposure):** New worker code at Hunk 5 emits only `status-code` + `error-type` + `str(e)[:120]`. The `Authorization: Bearer` header is in the `requests.post(...)` `headers` dict — NEVER logged. Inspect each hunk line-by-line; no `os.environ` interpolation in any new log() / print() call.
-- **Inv 11 (log surface locked):** Worker introduces NO new log() / print() call sites beyond the 7 existing ones already audited in plan-stage Vector B (the 6 enumerated + SCANNER-CYCLE-SKIP-OVERLAP for the fcntl.flock collision path).
-- **Inv 12 (traceback safety):** Hunk 5's broad-except uses `str(e)[:120]`-only emit. The script's existing `traceback.print_exc()` at prod line 488 remains as-is. If we wanted to harden further, replace with `traceback.format_exception_only(type(e), e)` — DEFER, recommend follow-up.
+- **Inv 11 (log surface locked):** Worker contains 9 `log()` call sites + 4 `print()` call sites. ALL 9 `log()` sites are 1:1 carried from prod L362-487 (Tweet idx/total + truncated text, Confidence-skip, No-valid-items, Classified, CA, Cashtag, No-JSON-found, Scrubbing-CA in `verify_hard_extraction_invariant`). The 4 `print(json.dumps(...))` sites are: SCANNER-OPENROUTER-ERROR (carried from prod L430), SCANNER-CLASSIFICATION-ERROR × 3 variants (requests.post except / NoJSONMatch / post-200 broad-except — all bounded to `type(e).__name__` + `str(e)[:120]` or constants), and SCANNER-CYCLE-SKIP-OVERLAP (new, constants only) in Hunk 4. **No new log payload field interpolates `os.environ`, `response.text/.headers`, `prompt`, or HMAC secret.** Field-by-field audit completed in Vector B design-stage review.
+- **Inv 12 (traceback safety):** Hunk 5 DROPS the prod L505 `traceback.print_exc()` inside the for-loop body (security improvement — closes locals-via-traceback surface in hot exception path). The remaining `traceback.print_exc()` lives at prod L827 in main()'s top-level `except` (now under flock-protected main()) and stays as-is.
 - **fcntl.flock invariant:** lock-fd is held for the entire main() body; kernel releases on process exit (whether clean, SIGTERM, or SIGKILL). No stale-lock leak.
 
 ## Reviewer focus for design-stage P1.5
