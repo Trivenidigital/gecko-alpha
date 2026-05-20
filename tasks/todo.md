@@ -9,11 +9,12 @@
 - [x] Implement `source_calls` migration + source-quality helpers + watchdog scripts
 - [x] Run focused and adjacent verification
 - [x] Open draft PR #206
-- [ ] Get PR reviewed by 2 parallel agents and fold Critical/Important findings
+- [x] Get PR reviewed by 2 parallel agents and fold Critical/Important findings
 
 Review notes:
 - Scope is measurement substrate only: no dashboard endpoint, no frontend, no X/TG pruning, no trading behavior change.
 - Hermes-first remains enforced: X/KOL collection/classification stays on Hermes; custom code only covers durable gecko-alpha attribution and summaries.
+- PR review folds: preserve refreshed outcomes on backfill rerun; watchdog refuses missing DB/read-only opens; duplicate rows no longer skew summary averages; stale at-call prices suppress extrema; conflicted X heuristic linkage does not write a concrete paper-trade id.
 
 Last updated: 2026-05-19 (cycle 15: overnight drift-cleanup audit — closed 12 stale items with inline evidence citations; 3 items annotated as STILL OPEN with elapsed-date flags after PR #82 was DEPLOY-VERIFIED 2026-05-19 via runtime srilu schema evidence; PR-stage R3 fold downgraded KEEP-ON verdicts to docs-only-PRESUMED per §9a)
 
