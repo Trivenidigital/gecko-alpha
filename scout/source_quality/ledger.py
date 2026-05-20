@@ -440,7 +440,10 @@ async def _upsert_source_call(
     columns = list(payload)
     placeholders = ", ".join("?" for _ in columns)
     update_columns = [
-        col for col in columns if col not in {"source_type", "source_event_id"}
+        col
+        for col in columns
+        if col
+        not in {"source_type", "source_event_id", "outcome_status", "missing_fields"}
     ]
     updates = ", ".join(f"{col}=excluded.{col}" for col in update_columns)
     await conn.execute(

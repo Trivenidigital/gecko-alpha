@@ -1,7 +1,11 @@
 import json
+import subprocess
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from scout.db import Database
@@ -87,6 +91,62 @@ async def test_migration_creates_source_calls_and_sentinels(db):
             "'unknown', 'e', 'source_event', 'k', 'unresolved', 'pending', '[]')"
         )
         await db._conn.commit()
+    await db._conn.rollback()
+
+
+async def test_migration_fails_on_schema_version_collision(tmp_path):
+    d = Database(tmp_path / "collision.db")
+    d._conn = await aiosqlite.connect(d._db_path)
+    d._conn.row_factory = aiosqlite.Row
+    try:
+        await d._conn.execute(
+            "CREATE TABLE paper_migrations (name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+        )
+        await d._conn.execute(
+            "CREATE TABLE schema_version "
+            "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, description TEXT NOT NULL)"
+        )
+        await d._conn.execute(
+            "INSERT INTO schema_version VALUES "
+            "(20260522, '2026-05-20T00:00:00+00:00', 'different_migration')"
+        )
+        await d._conn.commit()
+        with pytest.raises(RuntimeError, match="schema_version collision"):
+            await d._migrate_source_calls_v1()
+    finally:
+        await d._conn.close()
+
+
+async def test_source_calls_json_and_fk_constraints(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        await db._conn.execute(
+            "INSERT INTO source_calls "
+            "(source_type, source_id, source_event_id, call_ts, call_kind, "
+            "cluster_identity, cluster_identity_kind, duplicate_cluster_key, "
+            "resolved_state, outcome_status, missing_fields) "
+            "VALUES ('tg', '@a', 'bad-json', '2026-05-20T00:00:00+00:00', "
+            "'unknown', 'bad-json', 'source_event', 'k', 'unresolved', "
+            "'pending', '{}')"
+        )
+        await db._conn.commit()
+
+    trade_id = await _insert_trade(db._conn, "coin-fk", "2026-05-20T00:00:00+00:00")
+    await db._conn.execute(
+        "INSERT INTO source_calls "
+        "(source_type, source_id, source_event_id, token_id, call_ts, call_kind, "
+        "cluster_identity, cluster_identity_kind, duplicate_cluster_key, "
+        "resolved_state, linked_paper_trade_id, outcome_status, missing_fields) "
+        "VALUES ('tg', '@a', 'fk-row', 'coin-fk', '2026-05-20T00:00:00+00:00', "
+        "'unknown', 'coin-fk', 'token_id', 'fk-cluster', 'resolved', ?, "
+        "'pending', '[]')",
+        (trade_id,),
+    )
+    await db._conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        await db._conn.execute("DELETE FROM paper_trades WHERE id=?", (trade_id,))
+        await db._conn.commit()
+    await db._conn.rollback()
 
 
 async def test_backfill_tg_and_x_is_idempotent_and_links_without_future_leak(db):
@@ -197,6 +257,51 @@ async def test_outcomes_parse_mixed_timestamps_and_bound_forward_windows(db):
     missing = json.loads(row["missing_fields"])
     assert {m["field"] for m in missing} == {"forward_6h_pct"}
     assert missing[0]["reason"] == "sparse_forward_window"
+
+
+async def test_backfill_rerun_preserves_refreshed_outcome_state(db):
+    await db._conn.execute(
+        "INSERT INTO narrative_alerts_inbound "
+        "(event_id, tweet_id, tweet_author, tweet_ts, tweet_text, tweet_text_hash, "
+        "extracted_cashtag, resolved_coin_id, narrative_theme, urgency_signal, "
+        "classifier_version, received_at) "
+        "VALUES ('evt-preserve', 'tw-preserve', 'kol_x', '2026-05-20T00:00:00Z', "
+        "'watch $TOK', 'hash-preserve', 'TOK', 'coin-preserve', 'ai', 'high', "
+        "'v1', '2026-05-20T00:01:00+00:00')"
+    )
+    for price, snapshot_at in (
+        (1.0, "2026-05-19T23:59:00+00:00"),
+        (1.5, "2026-05-20T00:35:00+00:00"),
+        (2.0, "2026-05-20T01:15:00+00:00"),
+        (2.5, "2026-05-20T06:15:00+00:00"),
+        (3.0, "2026-05-21T00:00:00+00:00"),
+    ):
+        await _insert_gainer_price(db._conn, "coin-preserve", price, snapshot_at)
+    await db._conn.commit()
+
+    await backfill_source_calls(db._conn)
+    await refresh_source_call_outcomes(
+        db._conn, now=datetime(2026, 5, 22, tzinfo=timezone.utc)
+    )
+    before = await _fetchone(
+        db._conn,
+        "SELECT outcome_status, missing_fields, forward_30m_pct, created_at "
+        "FROM source_calls WHERE source_event_id='evt-preserve'",
+    )
+    assert before["outcome_status"] == "complete"
+    assert before["missing_fields"] == "[]"
+    assert before["forward_30m_pct"] == 50.0
+
+    await backfill_source_calls(db._conn)
+    after = await _fetchone(
+        db._conn,
+        "SELECT outcome_status, missing_fields, forward_30m_pct, created_at "
+        "FROM source_calls WHERE source_event_id='evt-preserve'",
+    )
+    assert after["outcome_status"] == "complete"
+    assert after["missing_fields"] == "[]"
+    assert after["forward_30m_pct"] == 50.0
+    assert after["created_at"] == before["created_at"]
 
 
 async def test_stale_at_call_price_suppresses_short_horizons(db):
@@ -323,3 +428,28 @@ async def test_source_calls_lag_watchdog_fails_matches_and_passes_quiet_period(d
         assert quiet.ok is True
     finally:
         await empty.close()
+
+
+async def test_lag_watchdog_script_refuses_missing_db(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "check_source_calls_lag.py"
+    )
+    missing_db = tmp_path / "does-not-exist.db"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--db",
+            str(missing_db),
+            "--threshold-minutes",
+            "30",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 3
+    assert not missing_db.exists()
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["error"] == "db_not_found"

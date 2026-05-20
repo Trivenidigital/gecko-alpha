@@ -8,6 +8,7 @@ import json
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 
 def _parse_utc(value: str | None) -> datetime | None:
@@ -45,14 +46,50 @@ def main() -> int:
 
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=args.threshold_minutes)
-    conn = sqlite3.connect(args.db)
+    db_path = Path(args.db).expanduser()
+    if not db_path.exists():
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "db_not_found",
+                    "db": str(db_path),
+                    "threshold_minutes": args.threshold_minutes,
+                    "unledgered_tg": None,
+                    "unledgered_x": None,
+                    "checked_at": now.isoformat(),
+                },
+                sort_keys=True,
+            )
+        )
+        return 3
+
+    conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
     try:
-        tg_rows = conn.execute(
-            "SELECT 'tg', CAST(id AS TEXT), created_at FROM tg_social_signals"
-        ).fetchall()
-        x_rows = conn.execute(
-            "SELECT 'x', event_id, received_at FROM narrative_alerts_inbound"
-        ).fetchall()
+        try:
+            tg_rows = conn.execute(
+                "SELECT 'tg', CAST(id AS TEXT), created_at FROM tg_social_signals"
+            ).fetchall()
+            x_rows = conn.execute(
+                "SELECT 'x', event_id, received_at FROM narrative_alerts_inbound"
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "schema_missing",
+                        "detail": str(exc)[:120],
+                        "db": str(db_path),
+                        "threshold_minutes": args.threshold_minutes,
+                        "unledgered_tg": None,
+                        "unledgered_x": None,
+                        "checked_at": now.isoformat(),
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 4
         unledgered_tg = _count_unledgered(conn, tg_rows, cutoff)
         unledgered_x = _count_unledgered(conn, x_rows, cutoff)
     finally:
