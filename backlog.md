@@ -1710,7 +1710,8 @@ scout/trading/
 Two entries surfaced during the 2026-05-19 trader/strategist brainstorm synthesis: the next quality jump for actionability is durable point-in-time entry facts plus an operator feedback loop — NOT a smarter composite score. Both filed PROPOSED; implementation of `FOUNDATION` happens in its own design-then-implementation PR. `OPERATOR-FEEDBACK-MARKS` is a separate sequel and **must not be bundled** with the foundation implementation.
 
 ### BL-NEW-ACTIONABILITY-ENTRY-SNAPSHOT-FOUNDATION: stamp point-in-time entry facts for future V2
-**Status:** PROPOSED 2026-05-20.
+**Status:** SHIPPED 2026-05-20 — PR #200 merged at `b9dda34`. `paper_trade_entry_snapshots` sidecar table + writer + tests deployed. As of 2026-05-20T13:17Z: 10 fresh paper_trades have 1:1 sidecar coverage; 0 `entry_snapshot_stamp_failed`; 0 `SCHEMA_DRIFT_DETECTED`. I-B2 enrichment fold empirically verified — `mcap_usd_at_entry` correctly populated from enriched signal_data on chain_completed trades. 7-invariant stamp-verification probe on fresh trade 2223 (2026-05-20T05:07:46Z) passed.
+**Original filed status:** PROPOSED 2026-05-20.
 **Tag:** `actionability` `measurement-substrate` `paper-trading` `schema` `analytics`
 **Why:** Actionability V2, source quality, and profit-pattern analysis should not reconstruct entry context from mutable/current tables. Reconstructed features can leak future state, vary by coverage, and smear stamped rows with historical rows. The next serious quality improvement is a measurement substrate, not a smarter-looking score.
 
