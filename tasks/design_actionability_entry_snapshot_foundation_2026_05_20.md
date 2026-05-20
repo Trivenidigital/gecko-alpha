@@ -21,6 +21,34 @@ This PR is design-only. Implementation lands in a separate PR after the design
 clears a two-vector reviewer pass (structural/schema + trading/analytics
 leakage).
 
+## Review fold log (2026-05-20)
+
+Two reviewer vectors completed against the v1 draft of this design:
+
+- **Vector A — structural/schema (storage, FK precedent, migration pattern, hot-path safety):** Verdict "design ready to implement" with 4 Important + 3 Minor items, no Criticals.
+- **Vector B — trading/analytics leakage (no future leakage, no historical mixing, score-creep):** Verdict "fold first" — 2 Critical leakage holes (C1 + C2) plus 3 Important + 2 Minor items.
+
+All Critical + Important findings folded into this revision before any implementation work begins. Each fold is annotated inline ("Vector B C1", "Vector A I3", etc.) so reviewers can grep the diff.
+
+| Finding | Vector | Fold |
+|---|---|---|
+| C1: `tg_channel_at_entry` query had no `created_at <= opened_at` bound; could pull post-open social rows | B Critical | Query gains `AND created_at <= ?` bound; `opened_at` passed from `paper.py:259` through to the writer; new test 5b asserts pre/post-open rows are disjoint |
+| C2: `trail_pct` was re-queried from mutable `signal_params` at stamp time; racy with operator/auto recalibration | B Critical | `trail_pct` + `trail_pct_low_peak` passed as inputs from gate-decision site; no `signal_params` read at stamp time; new test 7b asserts the stamp uses gate-decision value through a mid-flight mutation |
+| I1: `INSERT OR IGNORE` masked duplicate-PK error signal | B Important | Switched to plain `INSERT`; test 11 rewritten to assert IntegrityError raises into outer try/except; docstring + design narrative updated |
+| I2: `complete=0` pools all partial states; per-column `IS NOT NULL` re-introduces silent-NULL ambiguity | B Important | New "Downstream cohort-query rule" subsection mandates filtering via `entry_snapshot_missing_fields` JSON, not per-column IS NOT NULL |
+| I3: `v1` version literal not enforced in tests | B Important | New test 12 locks `ENTRY_SNAPSHOT_VERSION == "v1"` and asserts the stamped value |
+| I1: migration helper needs sibling pattern (BEGIN EXCLUSIVE + sentinel pre-check + ROLLBACK + log triplet) | A Important | Full migration helper sketched with the triplet; new test 13 |
+| I2: `schema_version` row missing | A Important | `schema_version` write added to migration helper; covered by test 13 |
+| I3: `CHECK (entry_snapshot_complete IN (0,1))` constraint missing | A Important | Added to schema; new test 14 |
+| I4: `initialize()` registration ordering not pinned | A Important | Migration section pins ordering with a comment-site convention |
+| M1: `actionable_at_entry` redundancy with `paper_trades.actionable` | B Minor | Documented as intentional in the field-source table |
+| M2: `captured_at` vs `paper_trades.opened_at` semantic | B Minor | Documented in `stamp_entry_snapshot` docstring |
+| M1: INSERT OR IGNORE docstring | A Minor | Subsumed by B I1 fold (no longer applicable) |
+| M2: `entry_snapshot_missing_fields` should be NOT NULL | A Minor | Added NOT NULL to schema |
+| M3: `LEFT JOIN ... USING (paper_trade_id)` invalid (paper_trades column is `id`) | A Minor | Switched to explicit `ON s.paper_trade_id = pt.id` |
+
+No design changes were rejected. All findings folded as written; only minor wording adjustments to fit the surrounding narrative.
+
 ## Drift Check (§7a)
 
 ### Pre-existing actionability stamping (PR #181)
@@ -62,19 +90,21 @@ exact source of each must-have field:
 | `first_seen_at_at_entry` | one extra query: `SELECT first_seen_at FROM candidates WHERE LOWER(contract_address)=LOWER(?) AND chain=? LIMIT 1` | optional; misses for cg-coin-id-only tokens |
 | `detected_by_combo_at_entry` | local var `signal_combo` (already computed at `paper.py:~150`) | string like `"narrative+pipeline"` |
 | `source_confluence_count_at_entry` | derived from `signal_combo` (split + dedup) — matches `scout/trading/actionability.py:_source_confluence_count` | derived |
-| `tg_channel_at_entry` | one extra query for `signal_type='tg_social'`: `SELECT source_channel_handle FROM tg_social_signals WHERE token_id=? ORDER BY created_at DESC LIMIT 1` | optional; only meaningful for tg_social |
+| `tg_channel_at_entry` | one extra query for `signal_type='tg_social'`: `SELECT source_channel_handle FROM tg_social_signals WHERE token_id=? AND created_at <= ? ORDER BY created_at DESC LIMIT 1` (bound: `now` at `paper.py:259`) | optional; only meaningful for tg_social; temporal bound forbids post-open contamination |
 | `actionability_version` | local var `actionability_version` | always present post-PR-#181 |
 | `actionability_reason` | local var `actionability_reason` | always present |
-| `actionable_at_entry` | local var `actionable_value` (0/1) | mirrors `paper_trades.actionable` |
+| `actionable_at_entry` | local var `actionable_value` (0/1) | mirrors `paper_trades.actionable`; redundancy is intentional so the sidecar is self-contained for cohort joins without needing to JOIN `paper_trades` |
 | `tp_pct_at_entry` | local var `tp_pct` | always present |
 | `sl_pct_at_entry` | local var `sl_pct` | always present |
-| `trail_pct_at_entry` | one extra query: `SELECT trail_pct FROM signal_params WHERE signal_type=?` when `SIGNAL_PARAMS_ENABLED=True`; else `settings.MOONSHOT_TRAIL_DRAWDOWN_PCT` / `settings.PAPER_TRAIL_DRAWDOWN_PCT` | optional; param-source recorded in coverage |
-| `trail_pct_low_peak_at_entry` | same source as `trail_pct_at_entry` | optional |
+| `trail_pct_at_entry` | **passed as input** from the gate-decision site (the value the gate actually used) — NOT re-queried at stamp time | optional; eliminates race with operator/auto-recalibration of `signal_params` between gate and stamp |
+| `trail_pct_low_peak_at_entry` | same source as `trail_pct_at_entry` — passed as input | optional |
 
-The only fields requiring extra-query are `first_seen_at_at_entry` (candidates),
-`tg_channel_at_entry` (tg_social_signals), and `trail_pct_*_at_entry`
-(signal_params). All three are optional and read-only against tables that exist
-on master today.
+The only fields requiring extra-query are `first_seen_at_at_entry` (candidates)
+and `tg_channel_at_entry` (tg_social_signals, with `created_at <= trade_open_ts`
+bound). `trail_pct_at_entry` and `trail_pct_low_peak_at_entry` are passed as
+inputs from the gate-decision site (per Vector B C2 fold: reading mutable
+`signal_params` at stamp time would race with operator recalibration). All
+extra-query reads are optional and against tables that exist on master today.
 
 ### Conflict check
 
@@ -104,8 +134,8 @@ The operator's design requirement: explicitly compare and recommend.
 CREATE TABLE paper_trade_entry_snapshots (
     paper_trade_id  INTEGER PRIMARY KEY,
     entry_snapshot_version    TEXT NOT NULL,
-    entry_snapshot_complete   INTEGER NOT NULL,
-    entry_snapshot_missing_fields TEXT,           -- JSON array; empty array when complete
+    entry_snapshot_complete   INTEGER NOT NULL CHECK (entry_snapshot_complete IN (0, 1)),
+    entry_snapshot_missing_fields TEXT NOT NULL,  -- JSON array; '[]' when complete (never NULL)
     captured_at               TEXT NOT NULL,
     signal_type               TEXT,
     mcap_usd_at_entry         REAL,
@@ -198,11 +228,14 @@ try:
     await stamp_entry_snapshot(
         db,
         trade_id=trade_id,
+        opened_at=now,                # trade-open timestamp; bounds tg_channel query (Vector B C1)
         signal_type=signal_type,
         signal_data=signal_data,
         signal_combo=signal_combo,
         tp_pct=tp_pct,
         sl_pct=sl_pct,
+        trail_pct_at_entry=trail_pct,            # passed in; gate-decision value (Vector B C2)
+        trail_pct_low_peak_at_entry=trail_pct_low_peak,  # passed in (Vector B C2)
         actionable_value=actionable_value,
         actionability_reason=actionability_reason,
         actionability_version=actionability_version,
@@ -261,26 +294,39 @@ OPTIONAL_FIELDS = (
     "trail_pct_low_peak_at_entry",
 )
 
-async def build_entry_snapshot(db, **inputs) -> dict:
+async def build_entry_snapshot(db, *, opened_at: datetime, **inputs) -> dict:
     """Compute the snapshot payload. Returns a dict with keys matching the
     sidecar columns. Optional fields are set to None when their source is
     unavailable; missing_fields list captures the names of any None
-    optional fields so coverage is auditable."""
+    optional fields so coverage is auditable.
+
+    `opened_at` is the authoritative trade-open timestamp; queries against
+    mutating tables (e.g., tg_social_signals) MUST bound `created_at <= opened_at`
+    so post-open rows cannot leak into the snapshot (Vector B C1)."""
     ...
 
-async def stamp_entry_snapshot(db, *, trade_id: int, **inputs) -> None:
-    """INSERT a row into paper_trade_entry_snapshots. Idempotent against
-    re-stamping (INSERT OR IGNORE on PRIMARY KEY paper_trade_id)."""
-    snapshot = await build_entry_snapshot(db, **inputs)
+async def stamp_entry_snapshot(db, *, trade_id: int, opened_at: datetime, **inputs) -> None:
+    """INSERT a row into paper_trade_entry_snapshots.
+
+    Uses plain INSERT (not INSERT OR IGNORE): the only legitimate caller is
+    the post-commit hot-path in paper.py, and `paper_trades.id` is AUTOINCREMENT,
+    so a duplicate-PK condition is structurally unreachable in the normal
+    path. If it ever fires (test fixture replay, future backfill PR forgetting
+    `v1-backfill`, retry loop), letting the PK collision raise into the
+    outer try/except preserves the error signal (Vector B I1).
+
+    `captured_at` reflects writer-time (slightly after `opened_at`); analytics
+    should use `opened_at` from paper_trades.opened_at when bucketing by trade
+    time (Vector B M2)."""
+    snapshot = await build_entry_snapshot(db, opened_at=opened_at, **inputs)
     snapshot["paper_trade_id"] = trade_id
-    snapshot["entry_snapshot_version"] = ENTRY_SNAPSHOT_VERSION
+    snapshot["entry_snapshot_version"] = ENTRY_SNAPSHOT_VERSION  # always "v1" from live writer
     snapshot["captured_at"] = datetime.now(timezone.utc).isoformat()
     missing = [k for k in OPTIONAL_FIELDS if snapshot.get(k) is None]
     snapshot["entry_snapshot_missing_fields"] = json.dumps(missing)
     snapshot["entry_snapshot_complete"] = 1 if not missing else 0
-    # INSERT OR IGNORE so a repeat-stamp on the same trade_id is a no-op
     await db._conn.execute(
-        "INSERT OR IGNORE INTO paper_trade_entry_snapshots (...) VALUES (...)",
+        "INSERT INTO paper_trade_entry_snapshots (...) VALUES (...)",
         tuple(snapshot[col] for col in COLUMN_ORDER),
     )
     await db._conn.commit()
@@ -288,17 +334,32 @@ async def stamp_entry_snapshot(db, *, trade_id: int, **inputs) -> None:
 
 ### No future-state leakage
 
-The writer reads ONLY fields that exist at trade-open time:
-- Variables already in scope (`signal_type`, `tp_pct`, `sl_pct`, etc.)
-- `signal_data` (already serialized before INSERT)
-- Read-only queries against `candidates`, `tg_social_signals`, `signal_params`
-  — all of which describe pre-existing state, not future state.
+The writer reads ONLY fields that reflect state at trade-open time:
+
+- **Variables already in scope** (`signal_type`, `tp_pct`, `sl_pct`,
+  `trail_pct`, `trail_pct_low_peak`, etc.) — passed in directly from the
+  gate-decision site. `trail_pct` and `trail_pct_low_peak` are passed
+  as inputs precisely because `signal_params` is mutable (operator/auto
+  recalibration); re-reading at stamp time would race (Vector B C2 fix).
+- **`signal_data`** (already serialized before INSERT).
+- **`candidates`** — append-only metadata about token discovery; rows are
+  stable post-insert. Safe to read.
+- **`tg_social_signals`** — rows grow monotonically during a trade's
+  lifetime. The query MUST bound `created_at <= opened_at` to forbid any
+  post-open social signal from being picked as the "at-entry" channel
+  (Vector B C1 fix). The trade-open timestamp `now` from `paper.py:259`
+  is passed as the `opened_at` parameter.
 
 No reads against `paper_trades` for the trade we just inserted (would be a
 self-reference; not needed). No reads against price_cache (would leak
 post-open prices) — `price_freshness_seconds_at_entry` is explicitly deferred.
 No reads against any post-open table (gainers_snapshots/momentum/etc) — those
 are signal sources, not entry-time receipt records.
+
+No reads against `signal_params` directly — values come in as gate-decision
+inputs so the recorded `trail_pct_at_entry` reflects what the gate actually
+used, not whatever value `signal_params` carries at stamp-time microseconds
+later (Vector B C2).
 
 ### No historical/reconstructed mixing
 
@@ -326,6 +387,28 @@ This means: presence of a sidecar row implies all required fields are present.
 Coverage is a single column (`complete`) on optional fields, not a complex
 per-row schema check.
 
+### Downstream cohort-query rule (Vector B I2)
+
+`entry_snapshot_complete = 0` pools ALL partial states — a query that wants
+"has mcap regardless of other missing fields" must NOT mix `IS NOT NULL` on
+per-column fields with the `complete` flag, because that re-introduces the
+silent-NULL ambiguity this design exists to prevent.
+
+The rule: downstream cohort queries MUST filter sub-cohorts by reading
+`entry_snapshot_missing_fields` JSON, not by per-column `IS NOT NULL`. Example:
+
+```sql
+-- CORRECT: filter by what was missing
+SELECT * FROM paper_trade_entry_snapshots
+WHERE entry_snapshot_version = 'v1'
+  AND entry_snapshot_missing_fields NOT LIKE '%liquidity_usd_at_entry%';
+
+-- INCORRECT: silently includes pre-cutover/partial via NULL match
+SELECT * FROM paper_trades pt
+LEFT JOIN paper_trade_entry_snapshots s ON s.paper_trade_id = pt.id
+WHERE s.liquidity_usd_at_entry IS NOT NULL;
+```
+
 ## Dashboard and backtest read semantics
 
 Two distinct surfaces.
@@ -335,11 +418,11 @@ Two distinct surfaces.
 `dashboard/db.py:get_open_positions` adds:
 
 ```sql
-LEFT JOIN paper_trade_entry_snapshots s USING (paper_trade_id)
+LEFT JOIN paper_trade_entry_snapshots s ON s.paper_trade_id = pt.id
 ```
 
-(adapter required since the existing query is on `paper_trades`; the join key
-is `paper_trades.id = paper_trade_entry_snapshots.paper_trade_id`)
+`USING (paper_trade_id)` cannot be used: `paper_trades` exposes the column as
+`id`, not `paper_trade_id`. The explicit `ON` clause is correct (Vector A M3).
 
 Returned per-row, new fields:
 - `entry_snapshot_version` (string or null)
@@ -379,13 +462,66 @@ cohorts.
 
 ### Migration
 
-Standard `Database._migrate_*` pattern in `scout/db.py`. Sentinel:
-`paper_migrations.name = 'bl_actionability_entry_snapshot_v1'`. Idempotent:
-`CREATE TABLE IF NOT EXISTS`. The migration runs on `Database.initialize()`
-like all sibling migrations. No coordination with the pipeline daemon
-required — the writer hot-path only reads the table when stamping a new
-trade, and the sidecar's absence on older DBs is caught by the outer
-try/except (degrades to `entry_snapshot_stamp_failed` log).
+Standard `Database._migrate_*` pattern in `scout/db.py`, matching the sibling
+helpers (`_migrate_minara_alert_emissions_v1` at `scout/db.py:3469`,
+`_migrate_narrative_scanner_v1` at `scout/db.py:3379`). Vector A I1-I4 folded:
+
+**Sentinel:** `paper_migrations.name = 'bl_actionability_entry_snapshot_v1'`.
+
+**Schema version row:** alongside the sentinel insert, write
+`schema_version (key='bl_actionability_entry_snapshot_v1', version=20260520)`
+matching the sibling-migration convention (Vector A I2). The integer is the
+ISO date the migration first ships; bumps require a new sentinel.
+
+**Transactional shape (Vector A I1):**
+
+```python
+async def _migrate_actionability_entry_snapshot_v1(self) -> None:
+    # 1. Sentinel pre-check
+    cur = await self._conn.execute(
+        "SELECT 1 FROM paper_migrations WHERE name = 'bl_actionability_entry_snapshot_v1'"
+    )
+    if await cur.fetchone():
+        log.info("bl_actionability_entry_snapshot_v1_migration_skip_already_applied")
+        return
+
+    try:
+        await self._conn.execute("BEGIN EXCLUSIVE")
+        await self._conn.execute("CREATE TABLE IF NOT EXISTS paper_trade_entry_snapshots (...)")
+        await self._conn.execute("CREATE INDEX IF NOT EXISTS idx_ptes_version ...")
+        await self._conn.execute("CREATE INDEX IF NOT EXISTS idx_ptes_complete ...")
+        await self._conn.execute(
+            "INSERT INTO paper_migrations (name, applied_at) VALUES (?, ?)",
+            ("bl_actionability_entry_snapshot_v1", datetime.now(timezone.utc).isoformat()),
+        )
+        await self._conn.execute(
+            "INSERT OR REPLACE INTO schema_version (key, version) VALUES (?, ?)",
+            ("bl_actionability_entry_snapshot_v1", 20260520),
+        )
+        await self._conn.commit()
+        log.info("bl_actionability_entry_snapshot_v1_migration_complete")
+    except Exception:
+        await self._conn.execute("ROLLBACK")
+        log.exception("bl_actionability_entry_snapshot_v1_migration_rollback")
+        raise
+```
+
+The log triplet (`_skip_already_applied` / `_complete` / `_rollback`) matches
+the sibling-migration convention so operator runbooks can grep uniformly.
+
+**initialize() ordering (Vector A I4):** register
+`_migrate_actionability_entry_snapshot_v1` AFTER any migration that touches
+`paper_trades` itself, so the FK target table is guaranteed to exist /
+already-migrated at sidecar-create time. Concretely: after the existing
+paper_trades migrations and after `_migrate_minara_alert_emissions_v1`
+(another paper_trade_id FK precedent). Document this pin with a comment at
+the registration site.
+
+The migration runs on `Database.initialize()` like all sibling migrations.
+No coordination with the pipeline daemon required — the writer hot-path
+only reads the table when stamping a new trade, and the sidecar's absence
+on older DBs is caught by the outer try/except (degrades to
+`entry_snapshot_stamp_failed` log).
 
 ### Backfill
 
@@ -424,14 +560,29 @@ criteria here so the reviewer can match the impl against them.
 5. **tg_social channel population.** Insert a `tg_social_signals` row with
    the same `token_id` shortly before opening a `signal_type='tg_social'`
    paper trade. Assert `tg_channel_at_entry` equals the channel handle.
+5b. **tg_social channel — no post-open leakage (Vector B C1).** Insert a
+    `tg_social_signals` row with `created_at = opened_at - 60s` and a
+    DIFFERENT row with `created_at = opened_at + 60s`. Open a tg_social
+    paper trade at `opened_at`. Assert `tg_channel_at_entry` equals the
+    PRE-open row's channel handle and NEVER the post-open row's. (This is
+    the structural guarantee that `tg_channel_at_entry` cannot be polluted
+    by later social activity on the same token.)
 6. **Actionability fields copied correctly.** Open a trade for which
    actionability classifier returns `(actionable=1,
    reason='v1_pass_core_signal_mcap_10_50m', version='v1')`. Assert the
    sidecar row's three `actionability_*_at_entry` fields match exactly.
 7. **Exit params copied correctly.** Open a trade with `tp_pct=20.0`,
-   `sl_pct=10.0`. Assert `tp_pct_at_entry=20.0`, `sl_pct_at_entry=10.0`.
-   When `SIGNAL_PARAMS_ENABLED=True` and the signal_params table has a
-   matching row, `trail_pct_at_entry` matches that row's `trail_pct`.
+   `sl_pct=10.0`, `trail_pct=30.0`, `trail_pct_low_peak=20.0`. Assert
+   `tp_pct_at_entry=20.0`, `sl_pct_at_entry=10.0`, `trail_pct_at_entry=30.0`,
+   `trail_pct_low_peak_at_entry=20.0` — i.e., the values passed to
+   `stamp_entry_snapshot` from the gate-decision site, NOT whatever
+   `signal_params` carries at stamp time.
+7b. **trail_pct passed-as-input, not re-queried (Vector B C2).** With
+    `SIGNAL_PARAMS_ENABLED=True` and a `signal_params` row holding
+    `trail_pct=99.0`, open a trade where the gate decided
+    `trail_pct=30.0`. Between gate-decision and stamp, mutate the
+    `signal_params` row to `trail_pct=88.0`. Assert
+    `trail_pct_at_entry=30.0` (the gate-decision value), NOT 99 or 88.
 8. **Pre-cutover rows distinguishable.** Insert a paper_trade directly via
    SQL with no sidecar row. Query `SELECT entry_snapshot_version FROM
    paper_trades LEFT JOIN paper_trade_entry_snapshots ...` returns NULL.
@@ -444,9 +595,31 @@ criteria here so the reviewer can match the impl against them.
     (e.g., monkey-patch the snapshot INSERT to raise). Assert the
     paper_trade row still exists, no sidecar row is created, and the
     `entry_snapshot_stamp_failed` log is emitted.
-11. **INSERT OR IGNORE idempotency.** Calling `stamp_entry_snapshot` twice
-    on the same `trade_id` (synthetic test) does not duplicate or modify
-    the existing row.
+11. **Duplicate stamp raises into outer try/except (Vector B I1).** Calling
+    `stamp_entry_snapshot` twice on the same `trade_id` (synthetic test
+    via direct call, not via the paper-trade hot-path which is
+    structurally unreachable for duplicate trade_ids) raises
+    `sqlite3.IntegrityError` (PRIMARY KEY violation). The outer try/except
+    in `paper.py` catches and logs `entry_snapshot_stamp_failed`; the
+    existing sidecar row is untouched. (We intentionally do NOT use
+    INSERT OR IGNORE — silencing the duplicate-PK signal would mask
+    incorrect callers.)
+12. **Version literal enforced (Vector B I3).** Open a trade. Read the
+    sidecar row. Assert `entry_snapshot_version == "v1"` exactly. Also
+    assert that the writer module-level constant `ENTRY_SNAPSHOT_VERSION`
+    equals `"v1"` (locks the literal so any future backfill PR must
+    explicitly add a new constant rather than reusing `v1` on
+    reconstructed data).
+13. **Migration helper idempotency + sentinel + schema_version (Vector A I1/I2).**
+    Run `_migrate_actionability_entry_snapshot_v1` twice. Assert: first
+    run logs `_migration_complete` + inserts a row in `paper_migrations`
+    with `name='bl_actionability_entry_snapshot_v1'` + inserts/replaces
+    `schema_version` row with `version=20260520`. Second run logs
+    `_migration_skip_already_applied` and does NOT re-write either row.
+14. **CHECK constraint on complete (Vector A I3).** Attempt to INSERT a
+    sidecar row with `entry_snapshot_complete=2`. Assert sqlite3
+    constraint error. (Trivial test guarding against future writer bugs
+    that compute the flag wrong.)
 
 ## Failure modes pre-empted
 
@@ -472,7 +645,8 @@ Conditional on this design clearing the two-vector reviewer pass.
    `stamp_entry_snapshot`.
 3. Add the try/except hook in `scout/trading/paper.py` after the existing
    commit at line 271.
-4. Add `tests/test_entry_snapshot.py` covering all 11 acceptance criteria.
+4. Add `tests/test_entry_snapshot.py` covering all 14 acceptance criteria
+   (1–11 + 5b + 7b + 12 + 13 + 14, per the Tests section).
 5. Extend `dashboard/db.py:get_open_positions` to LEFT JOIN
    `paper_trade_entry_snapshots`.
 6. Extend `dashboard/frontend/components/TradeDetailDrawer.jsx` "Source /
