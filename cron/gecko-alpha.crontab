@@ -1,4 +1,6 @@
 # === BEGIN gecko-alpha managed block (do not edit between sentinels) ===
 30 3 * * 0 /root/gecko-alpha/scripts/tg_burst_archive.sh
 45 3 * * 0 /root/gecko-alpha/scripts/wal_archive.sh
+*/5 * * * * /root/gecko-alpha/scripts/source-calls-live-writer.sh
+*/10 * * * * /root/gecko-alpha/scripts/source-calls-lag-watchdog.sh
 # === END gecko-alpha managed block ===
