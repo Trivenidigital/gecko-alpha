@@ -1,4 +1,26 @@
-**New primitives introduced:** NONE (this PR ships VPS-side parallelization of `narrative_classifier` calls inside `/home/gecko-agent/run-scanner-cycle.py` via `concurrent.futures.ThreadPoolExecutor`; docs-only repo PR with plan + design + runbook + backlog status flip).
+**New primitives introduced:** NONE (this PR ships VPS-side parallelization of `narrative_classifier` calls inside `/home/gecko-agent/run-scanner-cycle.py` via `concurrent.futures.ThreadPoolExecutor` with `threading.Lock`-protected state.* increments + `fcntl.flock` overlapping-cycle guard + per-worker exponential-backoff on 429; docs-only repo PR with plan + design + runbook + backlog status flip).
+
+# Plan v2: BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-APPLY
+
+## Plan-review fold log (2026-05-20)
+
+Two reviewer vectors returned **3 Critical + 5 Important findings**. All folded into v2 below.
+
+| Finding | Vector | Status |
+|---|---|---|
+| C1: concurrency=5 = ~43 req/min steady-state likely exceeds OpenRouter free-tier 20-60 req/min ceiling. Cascading 429 risk. | A | FOLDED — concurrency=**3** for first deploy (~26 req/min), promote only after ≥5 clean cycles + confirmed OpenRouter tier |
+| C2: ThreadPoolExecutor SIGTERM aggregation race — partial state at summary emit | A | FOLDED — switch from "aggregate-after-gather" to `threading.Lock`-protected in-future increments. `cancel_futures=True` on shutdown. |
+| C3: 5-way 429 cascade — all workers fail in burst, cycle reports clean but classifier output collapses | A | FOLDED — per-worker exponential backoff on 429 (2s/4s/8s, 3 retries); state counter `state.openrouter_429_burst_count` |
+| I1: state.new_tweets is mutated in kol_watcher (single-threaded), NOT classify_tweets — remove from "mutated under concurrency" list | A | FOLDED — clarified in §Step-2 below |
+| I2: Build-stage must include literal VPS-read of classify_tweets / verify_hard_extraction_invariant / build_event_id | A | FOLDED — added to Build deliverables |
+| I3: Overlapping-cycle risk — fcntl.flock guard at script entry | A | FOLDED — new §Step-1.5 |
+| I4: as_completed() exception semantics — pin explicit "continue, not abort" | A | FOLDED — §Step-4 |
+| I5: requests.Session reuse for connection pooling — defer | A | FOLDED — out-of-scope (filed as follow-up `BL-NEW-SCANNER-REQUESTS-SESSION-POOL`) |
+| B-I1: pre-existing `os.popen("xurl ...{handle}")` at :287/:305 — out of scope but acknowledge | B | FOLDED — §Out-of-scope note added |
+| B-M1: replace bare `traceback.print_exc()` with `traceback.format_exception_only(...)` for future-safety | B | FOLDED — added to Hunk 1.4 area |
+| B-M2: enumerate the 6 worker log call sites + lock log surface | B | FOLDED — Invariant 11 below |
+
+**Plan blockers resolved.** Ready for stage P1.4 (design) after one more clarification: the design-stage 2-vector review will verify the concurrency=3 choice + the threading.Lock implementation + the fcntl.flock against the live code.
 
 # Plan: BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-APPLY
 
@@ -80,37 +102,88 @@ that don't need order-dependency.
 
 ## Plan steps (in order)
 
-### Step 1 — Pick concurrency limit (pre-registered)
+### Step 1 — Pick concurrency limit (pre-registered, post-fold)
 
-Three candidate concurrency values evaluated:
+Three candidate concurrency values evaluated with Vector A's corrected
+rate-limit math:
 
-| Concurrency | Max tweets/cycle under 100s budget | Per-tweet OpenRouter pressure | Verdict |
-|---|---|---|---|
-| 1 (current) | ~14 (at 7s/tweet) | 1 in-flight | Insufficient — 20+ tweets common |
-| 5 | ~70 (at 7s/tweet × 5 = 35s budget) | 5 in-flight × ~0.7 req/sec each | **RECOMMENDED — comfortable headroom + safe rate-limit** |
-| 10 | ~140 | 10 in-flight × ~0.7 req/sec | Riskier rate-limit; not needed yet |
+| Concurrency | Max tweets / 60s classifier budget | Steady-state req/min | OpenRouter compatibility | Verdict |
+|---|---|---|---|---|
+| 1 (current) | ~8 (at 7s/tweet) | ~8.6 req/min | Safe but useless | Insufficient |
+| **3** | **~26 (3 × 60s/7s = 25.7)** | **~26 req/min** | **Comfortable under 60/min funded tier; tight against 20/min free tier — acceptable with backoff** | **RECOMMENDED for first deploy** |
+| 5 | ~43 | ~43 req/min | Risky — likely exceeds free-tier 20/min; possibly exceeds funded 60/min sustained | Promote-target only after ≥5 clean cycles @ concurrency=3 + tier confirmation |
+| 10 | ~85 | ~85 req/min | Almost certainly rate-limit exceeded | Out of scope |
 
-**Recommendation: concurrency = 5.** Adjustable via constant if profiling shows tightness.
+**Recommendation: concurrency = 3** for first deploy. Constant `CLASSIFIER_CONCURRENCY = 3`. Promote to 5 only after evidence-gated re-deploy.
 
-### Step 2 — Thread-safety design
+### Step 1.5 — fcntl.flock overlapping-cycle guard (Vector A I3 fold)
 
-`state.*` counters (`state.skips`, `state.openrouter_4xx`, `state.openrouter_5xx`,
-`state.classification_other_error`, `state.speculative_cas_scrubbed`,
-`state.duplicates`, `state.new_tweets`) are mutated inside the classifier loop.
+If a cycle orphans past 60min (e.g., a cluster of slow tweets pushes one cycle to 70 min), the next cron tick fires while the orphan still runs. Two simultaneous Python processes = 2× concurrency = 6 in-flight workers, doubling rate-limit pressure.
 
-**Three options:**
+Mitigation: take an `fcntl.flock(LOCK_EX | LOCK_NB)` on `/home/gecko-agent/.hermes/cron/gecko-x-narrative-scanner.lock` at script entry. If held by a still-running orphan, log `SCANNER-CYCLE-SKIP-OVERLAP` and exit clean (status=0). Hermes cron will retry next hour. No queue buildup; the locked-out cycle simply doesn't run.
 
-A. **`threading.Lock` around each increment** — verbose, ~7 lock acquisitions per
-tweet. Safe but adds latency.
+Lock file path: `/home/gecko-agent/.hermes/cron/gecko-x-narrative-scanner.lock`. Lock-fd held for the lifetime of the script (released on process exit; kernel-enforced).
 
-B. **Aggregate-after-gather** — each thread builds a LOCAL `LocalCycleState`
-dict, then merge into module-level `state` after ThreadPoolExecutor finishes.
-Clean, lock-free, mainstream.
+### Step 2 — Thread-safety design (Vector A C2 + I1 fold)
 
-C. **Use `atomic` counters from `collections.Counter` or `multiprocessing.Value`**
-— overkill for this use case.
+`state.*` counters mutated inside the classifier loop:
+- `state.skips`
+- `state.openrouter_4xx`
+- `state.openrouter_5xx`
+- `state.classification_other_error`
+- `state.speculative_cas_scrubbed`
+- `state.duplicates`
+- (NEW) `state.openrouter_429_burst_count` — per Vector A C3 fold
 
-**Recommendation: Option B.** Each future returns a `(classified_event_or_None, local_state_delta)` tuple; main thread aggregates after `concurrent.futures.as_completed()` iteration.
+**Vector A I1 clarification:** `state.new_tweets` is appended in
+`run_kol_watcher()` (single-threaded stage that runs BEFORE classify_tweets).
+The classifier consumes it as a frozen list. NOT in the mutation list above.
+
+**Decision (post-fold): Option A — `threading.Lock`-protected in-future
+increments.** Vector A C2 found that "aggregate-after-gather" (Option B in
+v1) creates a partial-aggregation race when SIGTERM hits mid-aggregation: the
+SCANNER-CYCLE-SUMMARY emit then under-counts vs the dispatcher's actual TG
+ground truth.
+
+Concrete shape:
+
+```python
+_state_lock = threading.Lock()
+
+def _classify_one(tweet):
+    """Worker: one classifier call. Mutates module-level state via
+    threading.Lock-protected increment block. Returns the classified_event
+    or None."""
+    # ... (POST to OpenRouter, parse, verify_hard_extraction_invariant) ...
+    # Increment counters atomically (one critical section per tweet,
+    # holding the lock for ~50µs of int increments):
+    with _state_lock:
+        if response.status_code != 200:
+            if 400 <= response.status_code < 500:
+                state.openrouter_4xx += 1
+            elif response.status_code >= 500:
+                state.openrouter_5xx += 1
+            else:
+                state.classification_other_error += 1
+            state.skips += 1
+        elif scrubbed:
+            state.speculative_cas_scrubbed += scrubbed
+    # outside lock — append/sort don't need atomicity for our use
+    return event_or_none
+```
+
+This means: SIGTERM at any point leaves `state.*` consistent with what the
+workers have ACTUALLY observed. The next operation is either a fresh
+increment under the lock (atomic) or a final summary read (which reflects
+the most-recent committed state). No partial-aggregation race.
+
+Cost: one lock acquisition per tweet (~50µs). At 30 tweets/cycle = 1.5ms of
+locking overhead. Negligible vs the 7s/tweet OpenRouter latency.
+
+Also: pass `cancel_futures=True` to `ThreadPoolExecutor.shutdown()` in the
+event-of-clean-exit path. On SIGTERM, the orphaned Python sub-subprocess
+continues per PR #201's observed behavior (still desirable — cycle-report
+keeps writing), but new futures don't queue once shutdown is signalled.
 
 ### Step 3 — Hard-extraction-invariant ordering preservation
 
@@ -141,44 +214,84 @@ contributing to the cycle's narrative-classifier stage telemetry. Not strictly
 needed for the fix but useful for future profiling. **Defer** — keep this PR
 scope tight; file as follow-up.
 
-### Step 6 — Fall-back behavior
+### Step 6 — Fall-back behavior (Vector A C3 + I4 fold)
 
 If `ThreadPoolExecutor` itself raises (rare; e.g., resource exhaustion), the
 existing top-level `try` block in `main()` catches and emits the
 `SCANNER-CYCLE-SUMMARY` with the partial state.
 
-If a single future raises an unhandled exception, `future.result()` re-raises;
-we catch and increment `state.classification_other_error`.
+If a single future raises an unhandled exception inside `future.result()`,
+we catch and **increment `state.classification_other_error` and continue the
+loop with remaining futures** — one tweet's failure NEVER aborts the batch
+(Vector A I4 explicit semantic).
 
-If OpenRouter rate-limits us mid-parallel-batch (HTTP 429), we get a burst of
-4xx counter increments; the cycle continues with remaining tweets. The `skips`
-counter accumulates and the cycle still emits a clean SUMMARY.
+**Vector A C3 fold — 429 cascade handling.** A naive "increment counter +
+continue" approach fails when ALL futures hit 429 in burst: the next futures
+launch immediately, hit 429 again, the entire cycle's classifier output
+collapses to zero alerts dispatched. Mitigation:
+
+Per-worker exponential backoff on HTTP 429:
+
+```python
+RETRY_429_DELAYS = [2.0, 4.0, 8.0]  # 3 retries; max 14s of extra wait per tweet
+
+def _classify_one_with_backoff(tweet):
+    for attempt, delay in enumerate([0] + RETRY_429_DELAYS):
+        if delay > 0:
+            time.sleep(delay)
+        response = requests.post(...)
+        if response.status_code != 429:
+            return _process(response)
+        with _state_lock:
+            state.openrouter_429_burst_count += 1
+    # 4 attempts exhausted (initial + 3 retries); count as 4xx
+    with _state_lock:
+        state.openrouter_4xx += 1
+        state.skips += 1
+    return None
+```
+
+This gives any single tweet up to 14s of backoff before giving up — well
+within the cycle budget given concurrency=3 (other workers continue
+classifying meanwhile). Also emits `state.openrouter_429_burst_count` for
+operator visibility.
+
+Burst-detection ratio in SCANNER-CYCLE-SUMMARY:
+- `openrouter-429-burst-count` field added to summary
+- Ratio against `tweets-inspected` tells operator if rate-limit is biting
+
+If `openrouter_429_burst_count > 0.5 × tweets_inspected`, operator should
+verify the API key tier and consider funding additional credits before
+promoting concurrency to 5.
 
 ## Safety invariants (MUST hold)
 
 1. **`no_agent: true` cron mode unchanged.**
 2. **No secret exposure.** No new `log()` interpolation of `os.environ`, response.text/.headers, HMAC payload, bearer tokens.
 3. **No classifier-threshold change.** 0.6 confidence floor preserved.
-4. **No `os.popen("curl -H ...")` patterns.** Same as PR #201 invariants.
+4. **No `os.popen("curl -H ...")` patterns introduced.** Existing pre-fix `xurl` shell-outs at `:287, :305` (Vector B I1) are pre-existing and out of scope for this PR; filed as follow-up.
 5. **`event_id` idempotency semantics unchanged.** No dispatcher-side change.
 6. **No DDL / database changes.** Pure Python script edit.
 7. **Existing SCANNER-* instrumentation preserved.** Per-stage timings continue to emit.
 8. **`hard_extraction_invariant` per-tweet check preserved.**
 9. **`narrative_alerts_inbound` write semantics unchanged** (dispatcher unchanged).
-10. **No regression for low-volume cycles** — concurrency=5 with <5 tweets just runs them in parallel; identical behavior to sequential for n=1.
+10. **No regression for low-volume cycles** — concurrency=3 with <3 tweets just runs them in parallel; identical behavior to sequential for n=1.
+11. **(NEW per B-M2 fold) Log surface locked.** Only the existing 6 worker log call sites at `:412/:421/:447/:458/:467/:469` may emit inside the threaded worker. No new threaded-worker log call sites introduced. Each enumerated call site has been audited field-by-field (PR #201 review + this plan's review).
+12. **(NEW per B-M1 fold) Traceback module no upgrade.** `traceback.print_exc()` at `:469` either stays as-is OR is replaced with `traceback.format_exception_only(type(e), e)` (locals-free); no upgrade to `cgitb`/`rich`/locals-printing tracebacks.
 
-## Acceptance criteria (pre-registered)
+## Acceptance criteria (pre-registered, post-fold)
 
-For the build (Step 1.7) + post-deploy verification (Step 1.8):
+For the build + post-deploy verification:
 
 1. **At least one cycle completes in <120s** with a representative classifier workload (20-30 tweets). Evidence: `SCANNER-CYCLE-SUMMARY` line shows `duration-sec < 120.0`.
 2. **`jobs.json` `last_status` flips to `"success"`** for the cycle in (1).
-3. **All 4 stages emit START + TIMING pairs** (no SIGKILL'd cycle expected; the OpenRouter calls don't take longer in parallel than they did in serial — they just overlap).
-4. **`narrative-classifier` stage duration** drops from ~222s to under ~50s (concurrency=5 with 20 tweets at ~10s each = 4 batches × 10s = ~40s).
-5. **`SCANNER-OPENROUTER-ERROR` rate** stays close to zero — concurrency=5 must not trigger OpenRouter rate-limiting.
+3. **All 4 stages emit START + TIMING pairs**.
+4. **`narrative-classifier` stage duration** drops from ~222s to under ~80s (concurrency=3 with 25 tweets at ~10s each = ceil(25/3)=9 batches × 10s = ~90s; allowing 1 retry-burst).
+5. **`openrouter-4xx` count** stays under 2 per cycle. `openrouter-429-burst-count` stays under `0.2 × tweets-inspected`.
 6. **`alerts-dispatched` count and `tweets-inspected` count are within expected ranges** — parallelization must not change behavior, only speed.
 7. **No prompt-injection regression.** Journal grep clean.
 8. **No secret leakage.** Cycle-report log grep clean.
+9. **`fcntl.flock` guard works** — exactly one process per cron-tick window. Simulate by manually launching two scanner invocations in parallel; the second exits immediately with status=0 and emits `SCANNER-CYCLE-SKIP-OVERLAP`.
 
 ## Out-of-scope (deferred)
 
