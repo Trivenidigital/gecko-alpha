@@ -3637,10 +3637,18 @@ class Database:
                 "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) VALUES (?, ?)",
                 (migration_name, now_iso),
             )
+            # 20260521 chosen to avoid collision with bl_chain_pattern_provenance_v1
+            # (already on master at 20260520). Both shipped 2026-05-20; the
+            # schema_version PRIMARY KEY is per-row unique. On prod (srilu-vps),
+            # the actionability sentinel was already written with 20260520 on
+            # initial deploy (2026-05-20T02:02Z); the sentinel-pre-check at the
+            # top of this migration returns early on subsequent initialize()s
+            # so the prod schema_version row stays as 20260520=actionability —
+            # a cosmetic mismatch documented in the PR. Fresh-DB tests pass.
             await conn.execute(
                 "INSERT OR IGNORE INTO schema_version "
                 "(version, applied_at, description) VALUES (?, ?, ?)",
-                (20260520, now_iso, migration_name),
+                (20260521, now_iso, migration_name),
             )
             await conn.commit()
             _log.info(
