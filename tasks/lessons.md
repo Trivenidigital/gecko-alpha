@@ -1,5 +1,30 @@
 # Lessons
 
+## Hermes cron diagnosis — read jobs.json before journal grep, and bound query windows
+
+- 2026-05-20 calibration: I diagnosed `gecko-x-narrative-scanner` failure as
+  "prompt-injection scanner blocking" because `journalctl -u hermes-gateway`
+  showed 8+ matching log lines. I pushed back on the operator's analyst who
+  reported "120s timeout." **The analyst was right; I was wrong.**
+- Root cause of the misdiagnosis: the prompt-injection events were from
+  2026-05-15 14:00 UTC — the day the failure mode existed. The operator
+  refactored the cron to `no_agent: true` shell-script mode at ~15:00 UTC
+  the same day, resolving the issue. The journal events I grepped were
+  HISTORICAL, not current.
+- The canonical CURRENT state is in `/home/gecko-agent/.hermes/cron/jobs.json`
+  — specifically the `last_status` + `last_error` fields per job. That file
+  showed `"Script timed out after 120s"` and `last_run_at` recent. The
+  journal events were from days earlier.
+- **Rule (Hermes cron diagnosis):**
+  1. ALWAYS read `~/.hermes/cron/jobs.json` for the job's `last_status` +
+     `last_error` + `last_run_at` BEFORE grepping `journalctl`.
+  2. When greping journal, ALWAYS bound the query window with
+     `--since "<date>"`. If the most recent matching log event is older
+     than the failure-mode change date, the pattern is HISTORICAL.
+  3. Compare timestamp ranges before declaring a log pattern current.
+     "Historical causal logs can survive in journal and look current if we
+     don't bound the query window" — operator framing 2026-05-20.
+
 ## Memory updates must target the operator's active memory store
 
 - 2026-05-18 correction: I claimed "memory files were updated" after writing

@@ -10,6 +10,44 @@
 
 ## Active Findings
 
+### BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-FIX
+**Status:** PARTIAL-SHIPPED 2026-05-20 — Step 1 instrumentation deployed on srilu-vps (commit `3af48d9`); the actual Step 4 timeout/runtime fix is filed as separate follow-up `BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-APPLY` pending operator decision on which path (parallelize vs extend) based on the empirical evidence.
+**Why:** Hermes narrative scanner cron (`gecko-x-narrative-scanner`) hits the 120s `_get_script_timeout()` budget on busy cycles. Pre-instrumentation evidence: ~40% of recent cycles exceeded 120s. The pre-existing log only emitted `Duration: 136.0s` without per-stage attribution — making any fix shape speculative.
+**Original target name:** `BL-NEW-HERMES-NARRATIVE-CRON-PROMPT-INJECTION-FIX` was stale (last actual prompt-injection block was 2026-05-15 14:00 UTC; resolved by the May 15 refactor to `no_agent: true` shell-script mode). Renamed per `memory/feedback_jobs_json_canonical_for_cron_diagnosis.md` — jobs.json `last_error` is the canonical current state.
+**Evidence (Step 1 first instrumented cycle, 2026-05-20T04:00:53Z):** 2 `SCANNER-STAGE-START` emits (kol-watcher + narrative-classifier), 1 `SCANNER-STAGE-TIMING` emit (kol-watcher, 12.11s, success), 0 SCANNER-CYCLE-SUMMARY (SIGKILL'd mid-classifier per design v2 C1 fold). Empirical attribution: kol-watcher = 12s (not bottleneck); narrative-classifier > 108s (bottleneck CONFIRMED, killed at 120s budget).
+**Scope (this PR — docs-only):**
+- VPS instrumentation deployed to `/home/gecko-agent/run-scanner-cycle.py` + wrapper `gecko_x_narrative_scanner.sh`
+- Per-stage JSON-encoded structured emits (`SCANNER-STAGE-START` / `SCANNER-STAGE-TIMING` / `SCANNER-CYCLE-SUMMARY`)
+- OpenRouter 4xx/5xx counters + `classification_other_error` for invariant/parse/connection failures
+- Wrapper hardened: `umask 0027` + explicit `chmod 0640` on log file
+- One-shot `chmod 0640` on existing world-readable cycle reports
+- Backups: `*.bak.3af48d9-1779249120` at mode 0600
+**Plan:** `tasks/plan_hermes_narrative_cron_fix_2026_05_20.md`
+**Design:** `tasks/design_hermes_narrative_cron_fix_2026_05_20.md`
+**Runbook:** `tasks/runbook_hermes_narrative_cron_instrumentation_2026_05_20.md`
+
+### BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-APPLY
+**Status:** PROPOSED 2026-05-20 (depends on `-RUNTIME-TIMEOUT-FIX` Step 1 ≥3 cycles of profile data).
+**Why:** Step 1 instrumentation empirically attributed the 120s timeout to the `narrative-classifier` stage (>108s of the cycle). Per the plan's pre-registered decision rubric §Step 3, this lands in verdict (b) — single dominant stage IS reducible. The fix is to parallelize the OpenRouter classifier loop via `concurrent.futures.ThreadPoolExecutor` at concurrency=5 (or whatever OpenRouter's rate limit supports), compressing 27×~4s sequential calls to ~5 batches of ~4s parallel = ~20-30s total.
+**Constraint:** must preserve the 0.6 confidence floor, hard-extraction-invariant verification, and per-tweet sequential ordering of `state.skips`/`state.openrouter_*` counters (use a lock OR aggregate after gather).
+**Acceptance:** 3 consecutive cycles complete under 120s with classifier stage <60s. `jobs.json` `last_status="success"`.
+**Fallback:** if parallelization hits OpenRouter rate-limit ceiling, fall back to verdict (a) timeout extension via systemd `HERMES_CRON_SCRIPT_TIMEOUT=240` (subject to the plan v3 hard cap: `min(2×p95, 1800s)`).
+
+### BL-NEW-HERMES-CRON-NO-AGENT-FLAG-WATCHDOG
+**Status:** PROPOSED 2026-05-20.
+**Why:** `jobs.json` `no_agent: true` flag is what keeps the historical 2026-05-15 prompt-injection failure mode resolved. If a future PR or operator accidentally flips it, the May 15 issue returns silently. Programmatic guardrail needed.
+**Scope:** extend the existing cron watchdog (landed PR #156/#161) to assert `.jobs[] | select(.id=="c849fffec986") | .no_agent == true` and alert to Telegram on flip. Single-line jq extraction. Cheap.
+
+### BL-NEW-SCANNER-EXISTING-EXCEPTION-BOUNDING
+**Status:** PROPOSED 2026-05-20.
+**Why:** Vector B F1 finding during design review: existing `log(f"... {e}")` callsites in `/home/gecko-agent/run-scanner-cycle.py` (lines 65, 112, 285, 476, 650, 716) interpolate exception messages without bounding. New instrumentation hunks added `str(e)[:120]` truncation per Invariant 2 — but the existing sites are asymmetric. Not regressive; consistency cleanup.
+**Scope:** wrap each unbounded `{e}` site with `type(e).__name__` + `str(e)[:120]` pattern. ~6 line edits in run-scanner-cycle.py. VPS-only.
+
+### BL-NEW-SCANNER-PRINT-TO-LOG-CONSISTENCY
+**Status:** PROPOSED 2026-05-20.
+**Why:** Vector B F10 finding during design review: `/home/gecko-agent/run-scanner-cycle.py:691-713` (FINAL REPORT section) uses raw `print()` calls; the rest of the script uses the wrapped `log()` helper. Inconsistency is not a leak (current interpolations are counters/lengths) but is a future-maintenance trap.
+**Scope:** convert FINAL REPORT print() calls to log() (or vice versa for the new JSON-encoded summary emit). Trivial. VPS-only.
+
 ### BL-NEW-ACTIONABILITY-GATE
 **Status:** SHIPPED 2026-05-19 — implemented by PR #181 (`7506adc`) and deployed to srilu; visibility follow-up shipped by PR #182 (`32df89d`).
 **Why:** Current paper trades mix decision-bearing and exploratory cohorts. The 2026-05-19 profit-pattern analysis found sharp separation between profitable current-regime patterns (`narrative_prediction`, `chain_completed`, `volume_spike`) and junk/exploratory patterns (`losers_contrarian`, weak `gainers_early`, low-n `trending_catch`).
