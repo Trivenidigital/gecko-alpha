@@ -88,13 +88,15 @@ ssh srilu-vps "
 
 First instrumented cron tick: **2026-05-20T04:00:53Z** (cycle completed at 04:02:53Z).
 
-### Gate 1 — instrumentation completeness — PASS
+### Gate 1 — instrumentation completeness — PASS (with corrected framing)
+
+**CORRECTION (post-PR-review fold):** My initial reading of the cycle log captured it WHILE THE CYCLE WAS STILL RUNNING (around 04:02Z), and at that moment only 2 STAGE-START + 1 STAGE-TIMING were emitted. The cycle ultimately completed at 04:04:48Z. Final state of the report file:
 
 Cycle report `/home/gecko-agent/scanner-cycle-report-20260520T040053Z.log`:
 
-- `SCANNER-STAGE-START` count: 2
-- `SCANNER-STAGE-TIMING` count: 1
-- `SCANNER-CYCLE-SUMMARY` count: 0
+- `SCANNER-STAGE-START` count: **4** (all four stages started)
+- `SCANNER-STAGE-TIMING` count: **4** (all four stages completed with status=success)
+- `SCANNER-CYCLE-SUMMARY` count: **1**
 
 Emit content:
 
@@ -102,15 +104,26 @@ Emit content:
 {"event": "SCANNER-STAGE-START", "stage": "kol-watcher"}
 {"event": "SCANNER-STAGE-TIMING", "stage": "kol-watcher", "elapsed-sec": 12.11, "status": "success"}
 {"event": "SCANNER-STAGE-START", "stage": "narrative-classifier"}
+{"event": "SCANNER-STAGE-TIMING", "stage": "narrative-classifier", "elapsed-sec": 222.14, "status": "success"}
+{"event": "SCANNER-STAGE-START", "stage": "coin-resolver"}
+{"event": "SCANNER-STAGE-TIMING", "stage": "coin-resolver", "elapsed-sec": 0.0, "status": "success"}
+{"event": "SCANNER-STAGE-START", "stage": "narrative-alert-dispatcher"}
+{"event": "SCANNER-STAGE-TIMING", "stage": "narrative-alert-dispatcher", "elapsed-sec": 0.02, "status": "success"}
+{"event": "SCANNER-CYCLE-SUMMARY", "duration-sec": 234.28, ...}
 ```
 
-This is the EXPECTED pattern for a SIGKILL'd cycle per design v2 §"Key correctness insight":
-- 2 starts, 1 end → in-flight stage at kill time was `narrative-classifier`
-- kol-watcher completed in 12.11s ✓
-- narrative-classifier started but did NOT emit TIMING (uncatchable SIGKILL)
-- coin-resolver + narrative-alert-dispatcher: never reached
+**What this reveals — non-trivial operational insight:**
 
-Without the C1 fix (START emit before try block), we'd have had only 1 TIMING and no way to know which stage was killed.
+The Hermes cron records `last_status="error"` and `last_error="Script timed out after 120s"` in `jobs.json`. But the Python process is NOT actually killed. Mechanism:
+
+1. At 120s, the Hermes cron-scheduler's `subprocess.run(timeout=120)` raises `TimeoutExpired`. The scheduler reports "error" to `jobs.json`.
+2. `TimeoutExpired` causes the wrapper shell process to be SIGTERM'd. But the Python sub-subprocess is parented to the wrapper; when the wrapper dies, the Python becomes ORPHANED to PID 1 (init).
+3. The Python process keeps running because its stdin/stdout/stderr remain valid file descriptors (Python's stdout was redirected to `"$out"` in the wrapper; that file descriptor stays open under the Python process even after the wrapper dies).
+4. The Python completes naturally — 234.28s end-to-end — and writes the full cycle report.
+
+**Implication:** the work IS happening (2 alerts dispatched, all 4 stages completing, cycle reports written), but cron's `last_status="error"` flag is misleading. This is a hermes-cron-side resource-leak risk if cycles get long enough to overlap (currently fine — hourly schedule with 234s peak gives 56-min idle headroom). Filed as `BL-NEW-HERMES-CRON-SUBPROCESS-LIFECYCLE-AUDIT` follow-up (Vector A M1).
+
+**Without the C1 fix (START emit before try block):** if a future cycle DID get SIGKILL'd genuinely (e.g., resource exhaustion, OOM, or hermes-cron is upgraded to actually kill the Python process via process-group propagation), we would have had only TIMING emits for completed stages and no way to know which stage was in-flight at kill time. The C1 fix protects against that future. Empirically, the current cycle did not exercise it — but the design pattern is correct for the future scenario.
 
 ### Gate 2 — `jobs.json` last_status — ERROR (expected)
 
@@ -150,16 +163,19 @@ All existing logs also flipped to 0640 by the one-shot chmod.
 
 ## Empirical attribution (BONUS — drives Step 4 fix)
 
-The instrumentation immediately validated my INFERRED hypothesis with EMPIRICAL evidence:
+The instrumentation immediately validated my INFERRED hypothesis with EMPIRICAL evidence (corrected per the post-cycle full log):
 
 | Stage | Observed | Verdict |
 |---|---|---|
 | kol-watcher | 12.11s success | NOT the bottleneck |
-| narrative-classifier | >108s KILLED in-flight | BOTTLENECK (CONFIRMED) |
-| coin-resolver | unobserved (downstream of classifier) | gated on classifier |
-| narrative-alert-dispatcher | unobserved (downstream) | gated on classifier |
+| narrative-classifier | 222.14s success | **BOTTLENECK CONFIRMED (95% of cycle)** |
+| coin-resolver | 0.00s success (no CAs to resolve — classifier emitted cashtag-only items this cycle) | OK |
+| narrative-alert-dispatcher | 0.02s success (2 alerts POSTed to gecko-alpha) | OK |
+| **Total cycle** | **234.28s** | Exceeds 120s cron budget but completes |
 
 This pins the Step 4 fix shape: **parallelize the OpenRouter classifier loop** per the plan's §Step 3 verdict (b) — single dominant stage IS reducible via concurrent.futures.ThreadPoolExecutor. Step 4 PR will land separately.
+
+**Resolver-health observation (Task #120):** The `coin-resolver` stage took 0.00s in this cycle — it had no `extracted_ca` to resolve. The classifier's 2 alerts this cycle were cashtag-only. Pre-existing data shows 15/305 historical rows DO have `extracted_ca` but ALL 15 have `resolved_coin_id IS NULL`. The most likely cause: the gecko-alpha `/api/coin/lookup` endpoint returned `data.get('found') == False` because gecko-alpha hasn't ingested those tokens (pre-CG-listing case — the structural V1 limitation per design doc §3). The resolver only tries ONCE per CA; there's no deferred re-resolution sweep when gecko-alpha later ingests the token. Filed as `BL-NEW-HERMES-NARRATIVE-DEFERRED-RESOLUTION-SWEEP` follow-up.
 
 ## Rollback
 
