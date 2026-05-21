@@ -386,6 +386,21 @@ class Settings(BaseSettings):
     # narrative endpoint (they're generic HMAC mechanics, not narrative-
     # specific).
     OPERATOR_ALERT_HMAC_SECRET: str = ""
+
+    # BL-NEW-SOURCE-CALL-CRON-TICK-WATCHDOG: writer heartbeat file path.
+    # When set, the source-calls writer cron touches this file on every
+    # successful run; the lag watchdog reads its mtime to detect cron
+    # outages independently of upstream traffic. Read directly by the
+    # bash wrappers (scripts/source-calls-live-writer.sh + lag-watchdog.sh)
+    # via shell env — declared here so Pydantic's `extra="forbid"`
+    # doesn't reject the .env line. Empty default keeps the feature off
+    # for back-compat; activation = operator sets in .env.
+    WRITER_HEARTBEAT_FILE: str = ""
+    # Optional override for the lag-watchdog's writer-staleness threshold
+    # (minutes). Default 20min = 4× the 5min writer cron cadence. Same
+    # bash-env-only consumption pattern as WRITER_HEARTBEAT_FILE.
+    WRITER_THRESHOLD_MINUTES: int = 20
+
     # NOTE: rate-limit middleware (slowapi) deferred to Day 2 — see
     # tasks/design_crypto_narrative_scanner.md §8. PR #110 V1-I1 fold:
     # the unused NARRATIVE_SCANNER_RATE_LIMIT_PER_MIN setting was removed
