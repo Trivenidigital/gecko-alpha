@@ -129,6 +129,10 @@ class Database:
         # BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST (cycle 5): cohort_digest_state
         # singleton + paper_trades(closed_at) partial index.
         await self._migrate_cohort_digest_state_v1()
+        # BL-NEW-DASHBOARD-X-ALERTS-RESOLVER-INDEX: functional indexes on
+        # UPPER(symbol) for volume_history_cg + gainers_snapshots so the
+        # x_alerts symbol resolver stops scanning 2.5M-row table.
+        await self._migrate_symbol_upper_indexes_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -4168,6 +4172,89 @@ class Database:
                 "SCHEMA_DRIFT_DETECTED", migration=migration_name
             )
             raise
+
+    async def _migrate_symbol_upper_indexes_v1(self) -> None:
+        """BL-NEW-DASHBOARD-X-ALERTS-RESOLVER-INDEX: functional indexes on
+        UPPER(symbol) for the two large symbol-resolver source tables.
+
+        Why: x_alerts dashboard endpoint's symbol resolver runs
+        ``SELECT DISTINCT coin_id FROM <table> WHERE UPPER(symbol) = ?``
+        which is non-sargable against the existing ``(coin_id, time)``
+        indexes — produces a SCAN of 2.5M-row volume_history_cg per
+        unresolved cashtag (~360ms each), times ~30 distinct cashtags per
+        request, totalling ~10s of the limit=80 response budget. With
+        functional indexes on UPPER(symbol), the same query becomes an
+        index lookup (~1-5ms).
+
+        Both tables get separate paper_migrations entries so disk failure
+        on one doesn't roll back the other. Single EXCLUSIVE transaction
+        per index (held during the build itself — ~1-5s on 2.5M rows in
+        WAL mode); ``busy_timeout=90000`` covers concurrent writer/reader
+        wait.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+
+        targets = [
+            ("volume_history_cg", "idx_vol_hist_cg_symbol_upper",
+             "vol_hist_cg_symbol_upper_idx_v1"),
+            ("gainers_snapshots", "idx_gainers_snap_symbol_upper",
+             "gainers_snap_symbol_upper_idx_v1"),
+        ]
+
+        for table, index_name, migration_name in targets:
+            try:
+                await conn.execute("PRAGMA busy_timeout = 90000")
+                await conn.execute("BEGIN EXCLUSIVE")
+                await conn.execute(
+                    """CREATE TABLE IF NOT EXISTS paper_migrations (
+                        name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
+                )
+                cur = await conn.execute(
+                    "SELECT 1 FROM paper_migrations WHERE name = ?",
+                    (migration_name,),
+                )
+                row = await cur.fetchone()
+                if row is not None:
+                    await conn.execute("COMMIT")
+                    continue
+                # Note: NOT a partial index — SQLite's planner has trouble
+                # matching `COALESCE(coin_id, '') != ''` against a
+                # `WHERE coin_id IS NOT NULL AND coin_id != ''` predicate
+                # in the index definition, causing it to fall back to
+                # SCAN. A full functional index on UPPER(symbol) matches
+                # the query shape exactly.
+                await conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS {index_name} "
+                    f"ON {table}(UPPER(symbol))"
+                )
+                await conn.execute(
+                    "INSERT INTO paper_migrations(name, cutover_ts) VALUES (?, ?)",
+                    (migration_name, datetime.now(timezone.utc).isoformat()),
+                )
+                await conn.execute("COMMIT")
+                _db_log.info(
+                    "symbol_upper_index_migrated",
+                    table=table,
+                    index_name=index_name,
+                    migration=migration_name,
+                )
+            except Exception:
+                try:
+                    await conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                _db_log.exception(
+                    "symbol_upper_index_migration_failed",
+                    table=table,
+                    migration=migration_name,
+                )
+                _db_log.error(
+                    "SCHEMA_DRIFT_DETECTED",
+                    migration=migration_name,
+                )
+                raise
 
     # --- cohort_digest state helpers (D5 fold) -------------------------------
 
