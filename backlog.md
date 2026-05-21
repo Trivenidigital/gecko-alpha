@@ -37,6 +37,17 @@
 **Kill criterion:** 2026-08-21 (90 days post-deploy) — revert via `unset WRITER_HEARTBEAT_FILE` if zero real `writer_stale`/`writer_heartbeat_missing`/`writer_never_fired` fires by that date; treat as infra-debt per CLAUDE.md §10. Operator may extend if observed reliability data warrants.
 **Files:** `scripts/source_calls_live_writer.py`, `scripts/source-calls-live-writer.sh`, `scripts/check_source_calls_lag.py`, `scripts/source-calls-lag-watchdog.sh`, `tests/test_source_calls_live_writer.py`, `tests/test_check_source_calls_lag.py` (new), `tests/test_source_calls_lag_watchdog.py`, `tasks/plan_source_call_cron_tick_watchdog.md`, `tasks/design_source_call_cron_tick_watchdog.md`.
 
+### BL-NEW-DASHBOARD-X-ALERTS-TIMEOUT-FIX: batched entry-price preload for /api/x_alerts
+**Status:** SHIPPED-IN-PR 2026-05-21 — refactor `dashboard.db.get_x_alerts` so the per-row 5-source-table BETWEEN sweep collapses to 5 batched queries (one per source table) for ALL resolved coin_ids across the union 24h window.
+**Tag:** `dashboard` `performance` `read-only` `visibility-only`
+**Why:** Prod 2026-05-21 timing: limit=10 → 1.47s, limit=40 → 5.73s, limit=80 → 9.30s. Pre-fix code ran O(N rows x 5 queries) entry-price lookups; aiosqlite serializes per-connection, so latency scaled linearly with limit and tripped the frontend 5s abort timeout (added in PR #190). Indexes `(coin_id, time_col)` already exist on all 5 source tables — the bottleneck was query *count*, not query cost.
+**Action:** Restructure `get_x_alerts` into two passes: (1) per-row coin_id resolution (existing `_resolve_coin_id_for_outcome` cached path), (2) one-shot `_preload_entry_price_data(coin_ids, window_lo, window_hi)` issuing 5 queries with `coin_id IN (?,...)` + global window, then per-row outcomes use the prebuilt `dict[coin_id, list[(ts, price)]]`. Preserves exact closest-prior-or-earliest-after semantics. No new index. No schema change. No new endpoint. No behavior change.
+**Tests:** 7 pre-existing tests preserved. 2 new regression guards: `test_x_alerts_entry_price_uses_batched_query_per_source` (asserts exactly 1 SELECT per source table for 5 rows referencing same coin_id), `test_x_alerts_entry_price_skips_preload_when_no_resolved_coins` (defensive: `IN ()` would be a syntax error).
+**Expected impact:** At limit=80, query count drops from ~400 entry-price queries to 5 entry-price queries. Per-row remaining cost is 4 coin_id-resolver queries × unique-symbol count (already cached) + 1 current_price query × unique coin_ids (already cached). Target <2s at limit=80 post-deploy.
+**Validation runbook:** post-deploy on srilu-vps: `time curl -s -o /dev/null -w "http=%{http_code} time=%{time_total}s\n" "http://localhost:8000/api/x_alerts?limit=80"`. Pre-fix baseline 9.3s. Acceptance: <2s p50.
+**Hermes-first:** N/A — pure local query optimization on existing read-only endpoint.
+**Files:** `dashboard/db.py` (refactor get_x_alerts), `tests/test_x_alerts_dashboard.py` (2 new regression tests).
+
 ### BL-NEW-DASHBOARD-SOURCE-CALL-QUALITY-SURFACE: dashboard surface over `source_calls`
 **Status:** PROPOSED 2026-05-20 — follow-up after BL-NEW-SOURCE-CALL-OUTCOME-LEDGER ships and accumulates/backfills rows.
 **Tag:** `dashboard` `source-quality` `read-only` `trader-cockpit`
