@@ -1,5 +1,37 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-21 evening — BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-GT (docs only)
+
+**Status:** PACKET-SHIPPED (PR pending). Docs only. No code. No vendor calls. No prod DB writes.
+
+Workflow followed:
+- [x] P0 state + drift-check (master HEAD `5ed9bdb`, source_calls 1323 rows, 0 forward coverage, no in-tree OHLCV client, no intraday table)
+- [x] P1 Hermes-first vendor docs eval (CG MCP, GT public, awesome-hermes-agent, srilu skills — 20+ installed, none own OHLCV)
+- [x] Plan v1 drafted
+- [x] Plan v1 review by 2 vectors: A (temporal integrity / measurement) + B (Hermes-first / cost / safety)
+- [x] Plan v2 — folded all Critical + Important findings (12+ folds)
+- [x] Design v1 drafted
+- [x] Design v1 review by 2 vectors: A (source identity / chain correctness, verdict REWORK) + B (impl risk / prod safety / rollback, verdict APPROVE_WITH_FOLDS)
+- [x] Design v2 — folded Reviewer A's REWORK on `reserve_in_usd` semantics + chain map gaps + 12 other findings
+- [x] Vendor decision packet written
+- [x] `.gitignore` entry for `tasks/vendor_samples/`
+- [x] Backlog entries filed (CG/GT sample + identity-resolution upstream + chain-map-extension)
+- [ ] PR opened
+- [ ] PR review by 2 parallel reviewers
+- [ ] Operator decision on 5 pre-sample items (§3 of packet)
+- [ ] Operator authorization of sample call (or not)
+
+Key findings surfaced (operator-facing):
+1. **30m horizon is NOT a native candle interval.** Design pre-registers 30m as a *return* between two 5m candles, NEVER an OHLCV composite. Operator must confirm before any code ships.
+2. **GT cannot return reserves at call_ts.** Pool selection is honestly downgraded to "current_reserve_proxy_v1" with `pool_drift_risk_flag` band based on `(now - call_ts).days`. Older call_ts → wider drift band.
+3. **~15% V1 eligible ceiling.** Only 202/1323 source_calls rows can EVER be backfilled regardless of vendor (the dex:chain:contract subset). Recommendation: ACCEPT 202-row V1 ceiling AND file `BL-NEW-SOURCE-CALL-IDENTITY-RESOLUTION` upstream BL to unlock the other 85%.
+4. **GT lookback cap unknown.** 7-month source-call corpus; sample probes the boundary via oldest-token (2025-10-20). Failure of criterion #7 → narrowed eligibility, operator-decided in follow-up plan.
+
+Operator-gated next steps:
+- Decisions §3 of packet (vendor target, ceiling acceptance, 30m policy, pool rule, sample budget)
+- Authorize sample call OR reject
+- If approved: future session writes `scripts/vendor_sample_gt.py` + runs ≤6 GT calls
+
 ## Active Work: 2026-05-21 autonomous build block (cockpit usability + silent-failure closure)
 
 **Status:** SHIPPED-DEPLOYED. 9 PRs merged + deployed to srilu-vps (HEAD `c73eacf`). P0 soak verified clean (zero post-restart errors; x_alerts limit=80 0.18s p50; heartbeat advancing; lag-watchdog quiet).
