@@ -1,6 +1,10 @@
 # Plan — Overnight Decision Harvest 2026-05-21
 
-**New primitives introduced:** NONE — plan document only. P5 may produce a docs-only PR with backlog status flips, stale closures, design-record disposition notes, and data-bound re-check gates; no code, schema, config, or runtime primitive in P5 either.
+**New primitives introduced:** NONE — plan document only. P5 docs-only PR (#210) carries backlog status flips, two new BL entries, todo.md cleanup; no code, schema, config, or runtime primitive.
+
+**Post-write status (Reviewer-V-B-I1 fold, written after execution):**
+- The merges this plan recommends (PRs #209, #183, #184) have already happened: master is at `2e2f506c` (PR #184 squash) with PR #183 at `4e672fe6` and PR #209 at `f4865c60`. The plan was written PRE-execution; status banners in `backlog.md` and `tasks/todo.md` reflect the POST-execution state.
+- The P5 docs-only PR is open as `#210` on branch `night/decision-harvest-2026-05-21`.
 
 ## Hermes-first table (P5 docs PR — no new runtime work proposed)
 
@@ -69,11 +73,17 @@ Reason-code distribution among exploratory (n=2): 1× `v1_block_tg_social_low_n`
 
 **Vector-A-C1 fold — symmetric re-check gate:** previous draft had asymmetric early-fire (1 exploratory winner triggered re-check but n=20+5 was required for confirmatory direction). Symmetric gate:
 
-**Pre-registered data-bound re-check gate (any one triggers):**
-1. **Primary:** n_actionable_closed ≥ 20 AND n_exploratory_closed ≥ 5 (symmetric power on both cohorts).
-2. **Early-fire (false-negative):** ≥1 exploratory closed with `pnl_usd > 0` (gate may be over-rejecting).
-3. **Early-fire (confirmatory loss):** n_exploratory ≥ 5 AND ≥4 losses with one-sided binomial 95% LB exceeding null (gate's stated thesis holds even on small n).
-4. **Early-fire (actionable drawdown):** n_actionable ≥ 15 AND cohort `total_pnl < -$50` (net negative survives sample growth).
+**Pre-registered data-bound re-check gate:**
+1. **Primary (implementation-eligibility consideration):** n_actionable_closed ≥ 20 AND n_exploratory_closed ≥ 5 (symmetric power on both cohorts).
+2. **Early-fire RE-EVALUATION trigger (false-negative):** ≥1 exploratory closed with `pnl_usd > 0` (gate may be over-rejecting).
+3. **Early-fire RE-EVALUATION trigger (confirmatory loss):** n_exploratory ≥ 5 AND ≥4 losses with one-sided binomial 95% LB exceeding null (loss-rate > 50% baseline).
+4. **Early-fire RE-EVALUATION trigger (actionable drawdown):** n_actionable ≥ 15 AND cohort `total_pnl < -$50` (net negative survives sample growth).
+
+**Reviewer-V-B-I2 fold:** clauses 2-4 are RE-EVALUATION triggers (run the validation pass again), NOT implementation greenlights. Only clause 1 (Primary) triggers an implementation-eligibility consideration, and even that requires re-validation pass confirming gate's stated thesis. The early-fire clauses exist to surface gate misalignment, not to lower the implementation bar.
+
+**Reviewer-V-A-I2 fold:** if multiple clauses fire, treat as independent investigation tracks, not summed evidence. Different remediations follow different clauses (clause 2 = gate over-rejects, clause 4 = gate under-rejects).
+
+**Reviewer-V-A-I3 acknowledgment:** Clause 4's `total_pnl < -$50` threshold is near-tripped at current n=7 (-$11.72); one additional outlier loss could push n_actionable past 15 with `total_pnl < -$50` and fire clause 4 within days. This is by construction the kind of failure clause 4 was designed to surface, and the operator should not be surprised.
 
 Vector-A-M1 fold: calendar floor removed. Re-check is fully data-bound.
 

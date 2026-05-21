@@ -716,11 +716,12 @@ Current resume hook (2026-05-21, post overnight decision-harvest):
    - PR #34 (BL-051 DexScreener velocity_boost): OPERATOR CLOSE recommended as PARKED-PENDING-PRICE-COVERAGE (substrate rejected by PR #208 design)
    - PR #105 (Phase B volume_history snapshot): OPERATOR CLOSE recommended as STALE-WIP (CI FAILED, body says "DO NOT MERGE", no updates since 2026-05-18)
 
-2. **Data-bound re-check triggers** (any one fires next-actionability-validation):
-   - n_actionable_closed≥20 AND n_exploratory_closed≥5
-   - OR ≥1 exploratory closed with `pnl_usd > 0` (false-negative)
-   - OR n_exploratory≥5 + ≥4 losses with binomial 95% LB exceeding null
-   - OR n_actionable≥15 + cohort `total_pnl<-$50`
+2. **Data-bound re-check triggers** (clauses 2-4 trigger a re-validation pass; only clause 1 triggers implementation-eligibility consideration):
+   - **Primary (implementation-eligibility):** n_actionable_closed≥20 AND n_exploratory_closed≥5
+   - **Early-fire re-evaluation (a):** ≥1 exploratory closed with `pnl_usd > 0` (false-negative signal)
+   - **Early-fire re-evaluation (b):** n_exploratory≥5 AND ≥4 losses with one-sided binomial 95% LB exceeding null (loss-rate > 50% baseline)
+   - **Early-fire re-evaluation (c):** n_actionable≥15 AND cohort `total_pnl<-$50`
+   - Multi-clause precedence: if multiple clauses fire, treat as independent investigation tracks, not summed evidence
 
 3. **Implementation gates** (none active tonight):
    - Price-coverage expansion (PR #208 design): operator-approved vendor sample call to GoldRush/Covalent/CoinGecko MCP
