@@ -695,8 +695,8 @@ PAPER_LADDER_LEG_1_QTY_FRAC=0.50
 PAPER_SIGNAL_LOSERS_CONTRARIAN_ENABLED=false
 PAPER_SIGNAL_TRENDING_CATCH_ENABLED=false
 TG_SOCIAL_ENABLED=True
-TELEGRAM_BOT_TOKEN=placeholder        # ⚠️ not real
-TELEGRAM_CHAT_ID=placeholder          # ⚠️ not real
+TELEGRAM_BOT_TOKEN=<wired 2026-05-06 — see project_telegram_wired_2026_05_06.md memory>
+TELEGRAM_CHAT_ID=<wired 2026-05-06 — same memory>
 ```
 
 Active TG channels (7):
@@ -705,11 +705,34 @@ Active TG channels (7):
 - `@cryptoyeezuscalls` `@Alt_Crypto_Gems` `@nebukadnaza` `@alohcooks` `@CallerFiona1` (alert-only, strict)
 - `@gem_detecter` (retired — typo, doesn't exist on Telegram)
 
-## Resume hook
+## Resume hook — superseded 2026-05-21
 
-When the user comes back, the obvious next move is one of:
-1. Approve the Tier 1a + 1b self-learning PR scope and start that work
-2. Re-run the post-deploy strategy check-in (24-36h window now)
-3. Set the real Telegram bot token + chat_id
+Prior "Resume hook" referred to pre-Telegram-wired state (placeholder bot token) and the Tier 1a+1b PR which has since shipped and been measured. That section was stale.
+
+Current resume hook (2026-05-21, post overnight decision-harvest):
+
+1. **Operator decisions pending** (not closed by night session):
+   - PR #33 (BL-050 first_signal edge detection): KEEP DRAFT recommended, re-evaluate at next data-sufficiency window
+   - PR #34 (BL-051 DexScreener velocity_boost): OPERATOR CLOSE recommended as PARKED-PENDING-PRICE-COVERAGE (substrate rejected by PR #208 design)
+   - PR #105 (Phase B volume_history snapshot): OPERATOR CLOSE recommended as STALE-WIP (CI FAILED, body says "DO NOT MERGE", no updates since 2026-05-18)
+
+2. **Data-bound re-check triggers** (clauses 2-4 trigger a re-validation pass; only clause 1 triggers implementation-eligibility consideration):
+   - **Primary (implementation-eligibility):** n_actionable_closed≥20 AND n_exploratory_closed≥5
+   - **Early-fire re-evaluation (a):** ≥1 exploratory closed with `pnl_usd > 0` (false-negative signal)
+   - **Early-fire re-evaluation (b):** n_exploratory≥5 AND ≥4 losses with one-sided binomial 95% LB exceeding null (loss-rate > 50% baseline)
+   - **Early-fire re-evaluation (c):** n_actionable≥15 AND cohort `total_pnl<-$50`
+   - Multi-clause precedence: if multiple clauses fire, treat as independent investigation tracks, not summed evidence
+
+3. **Implementation gates** (none active tonight):
+   - Price-coverage expansion (PR #208 design): operator-approved vendor sample call to GoldRush/Covalent/CoinGecko MCP
+   - Source-call ranking / pruning / dashboard "best source" surfaces: blocked until price coverage materially improves
+
+4. **Health surfaces** (verified clean tonight; re-check on next operator request):
+   - source_calls writer parity: 100% (tg=858/858, x=399/399)
+   - Hermes narrative cron: `last_status=ok`, 92 inbound rows/24h
+   - 0 `ALERT_SENT` in last 24h
+   - No exceptions, no service restarts
+
+Full state record: `tasks/findings_overnight_decision_harvest_2026_05_21.md` (this PR).
 
 Default suggestion if user opens with a generic "what's up": run the post-deploy check-in (option 2) — it's quick and gives them fresh data.
