@@ -128,17 +128,17 @@
 **Plan:** `tasks/plan_actionability_gate_v1.md`
 
 ### BL-NEW-X-OUTCOME-LINKAGE
-**Status:** DESIGN-DRAFT / ACTIONABILITY-RUNBOOK-GATED 2026-05-19 — design doc shipped on draft PR #184 (`analysis/tg-x-outcome-linkage-design-2026-05-19`, head `da5a1a7`). Design covers schema/fields/joins, two implementation options (nullable FK column vs separate linkage table), backfill strategy, dashboard/API surface (split into no-auth dashboard endpoints vs HMAC-internal). Implementation is explicitly gated on the 24h actionability validation runbook (`tasks/runbook_actionability_validation_2026_05_19.md`); no merge / no implementation until that readout decides direction.
+**Status:** DESIGN-MERGED / ACTIONABILITY-RUNBOOK-GATED / IMPLEMENTATION-PENDING-N-SUFFICIENT 2026-05-21 — design doc merged via PR #184 as `2e2f506c` (squash 2026-05-21). Re-check gate symmetric per overnight decision harvest: n_actionable_closed≥20 AND n_exploratory_closed≥5; OR ≥1 exploratory winner (false-negative); OR n_exploratory≥5 + ≥4 losses with binomial 95% LB; OR n_actionable≥15 + cohort `total_pnl<-$50`. Current n=7+2 (insufficient on all four clauses). Do not begin implementation until any clause triggers.
 **Why:** X handle ranking is blocked: 215 X alerts had 0 priced outcomes because `resolved_coin_id`/pricing linkage is missing.
 **Scope:** Persist `resolved_coin_id`, `x_handle`, outcome status, entry/current price, and $300 notional P&L.
 
 ### BL-NEW-TG-OUTCOME-LINKAGE
-**Status:** DESIGN-DRAFT / ACTIONABILITY-RUNBOOK-GATED 2026-05-19 — design doc shipped on draft PR #184 (same design as BL-NEW-X-OUTCOME-LINKAGE; TG side is already structurally FK-linked via `tg_social_signals.paper_trade_id`, the design covers the `linkage_state` disambiguator + backfill + unified view). Gated on the 24h actionability runbook.
+**Status:** DESIGN-MERGED / ACTIONABILITY-RUNBOOK-GATED / IMPLEMENTATION-PENDING-N-SUFFICIENT 2026-05-21 — same merge as BL-NEW-X-OUTCOME-LINKAGE; design doc in PR #184 (`2e2f506c`). Same symmetric re-check gate. TG side is already structurally FK-linked via `tg_social_signals.paper_trade_id`; the design covers the `linkage_state` disambiguator + backfill + unified view.
 **Why:** TG channel ranking is blocked: only 2 current-regime closed linked trades, both low-n losses.
 **Scope:** Persist and dashboard `tg_channel`, `resolution_state`, `posted_at`, `paper_trade_id`, and `mcap_at_sighting`.
 
 ### BL-NEW-NO-PEAK-RISK-HANDLING
-**Status:** AUDIT-DRAFT / ACTIONABILITY-RUNBOOK-GATED 2026-05-19 — peak-giveback / freshness historical audit shipped on draft PR #183 (`analysis/peak-giveback-freshness-audit-2026-05-19`, head `932cc78`). V2 candidate identified: `pre_entry_peak_gain_pct >= 40%` AND `pre_entry_giveback_ratio >= 0.50` (current-regime −$962/52 trades; all-history −$1,034/66). Implementation gated on the 24h actionability validation runbook; V2 gate must additionally require `pre_entry_giveback_ratio IS NOT NULL` per the audit's coverage appendix.
+**Status:** AUDIT-MERGED / ACTIONABILITY-RUNBOOK-GATED / IMPLEMENTATION-PENDING-N-SUFFICIENT 2026-05-21 — peak-giveback / freshness historical audit merged via PR #183 as `4e672fe6` (squash 2026-05-21). V2 candidate identified: `pre_entry_peak_gain_pct >= 40%` AND `pre_entry_giveback_ratio >= 0.50` (current-regime −$962/52 trades; all-history −$1,034/66). Same symmetric re-check gate as TG/X linkage. V2 gate must additionally require `pre_entry_giveback_ratio IS NOT NULL` per the audit's coverage appendix.
 **Why:** `no_peak_<5` current-regime bucket is deeply negative (-$6,090.86 / n=99), but `peak_pct` is not available at trade-open time.
 **Scope:** Design a peak<5 early-exit or hard-risk policy separately; do not mix exit/risk handling into Actionability Gate v1.
 
@@ -2282,3 +2282,20 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 1. New upstream rows get `source_calls` rows (`MAX(call_ts)` advances toward `MAX(posted_at)` / `MAX(tweet_ts)`).
 2. Lag watchdog returns `ok=true` on the next cron tick.
 3. No repeated Telegram alerts in journalctl for `source-calls-lag-watchdog`.
+
+### BL-NEW-SOURCE-CALL-CRON-TICK-WATCHDOG: writer-rate parity check independent of upstream-lag watchdog
+**Status:** PROPOSED 2026-05-21 — surfaced during overnight decision-harvest plan review (Vector-B-I1 §12a follow-on). Empirical: `*/5` writer cron fires irregularly — observed 52 fires in 6h vs expected 108 (~half-rate). The existing lag watchdog (`scripts/source-calls-lag-watchdog.sh`) measures upstream `observed_at` lag, not writer-tick parity. When upstream TG/X rows happen NOT to arrive during a writer skip window, the watchdog correctly sees no lag and stays silent — but the writer-skipping-when-no-upstream-rows mode is invisible to the existing observability surface. Classic §12a "watchdog cannot detect its own failure mode" shape.
+**Tag:** `source-quality` `silent-failure-prevention` `cron-health`
+**Why:** Per global CLAUDE.md §12a — every pipeline table needs both upstream-lag detection AND writer-rate detection. The lag watchdog is upstream-anchored; this BL adds a writer-rate-anchored watchdog. Without this, a sustained writer-cron daemon stall during a TG/X burst could lag pipelines silently until the upstream catches up (which would then trigger the lag watchdog — but by then the burst is already partly missed).
+**Scope:** Tiny — add a second `check_source_calls_writer_rate.py` (or extend the existing check) that asserts writer ticked ≥N times in the last M minutes (e.g., ≥2 ticks in 15min for `*/5` cron). Wire as a second cron entry every 10 min. Telegram-alert on rate-floor breach.
+**Non-goals:** No change to writer or watchdog wrapper. No source ranking. No price-coverage work.
+**Acceptance:** Watchdog fires Telegram alert when writer ticks fall below threshold for ≥2 consecutive 10-min cycles, independent of upstream activity. 7-day soak with zero false positives during normal operation.
+**Re-eval trigger:** Before any decision to debug the cron-daemon irregularity, run this watchdog for 7d to gather rate-distribution evidence; cron-daemon-side investigation only if rate-floor breaches with no obvious root cause.
+
+### BL-NEW-MIROFISH-DEBUG-NOISE-SUPPRESS: stop journal pollution from fallback_raw_response DEBUG events
+**Status:** PROPOSED 2026-05-21 — surfaced during overnight decision-harvest plan review (Vector-A-M2 follow-on). Empirical: journalctl audit found `{"event": "fallback_raw_response", ..., "level": "debug"}` events emitted on every Claude haiku fallback. Functionally fine — fallback works correctly — but accumulates noisy DEBUG-level lines that degrade the visibility surface when a real exception arrives. Per `feedback_resilience_layered_failure_modes.md` — every resilience addition must extend a visibility surface; DEBUG events buried under "known noise" defeat that.
+**Tag:** `observability` `journal-hygiene` `low-priority`
+**Why:** Operator-visible health checks (`journalctl --since X -iE error|exception|traceback`) currently must filter out MiroFish DEBUG noise manually. Suppressing the DEBUG-level emission OR promoting it to a separate counter would clean the operator-grep surface.
+**Scope:** Either (a) demote `fallback_raw_response` from DEBUG → TRACE (or remove if not consumed elsewhere); or (b) leave the event but route it via a structured-log filter that operators can mute. ~30min change.
+**Non-goals:** No fallback behavior change. No MiroFish client change.
+**Acceptance:** `journalctl -u gecko-pipeline --since 24h -iE error|exception|traceback` returns 0 hits when system is healthy, without manual filtering.
