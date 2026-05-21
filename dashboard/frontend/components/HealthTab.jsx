@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import TokenLink from './TokenLink'
+import SourceCallsHealthPanel from './SourceCallsHealthPanel.jsx'
 
 function relTime(iso) {
   if (!iso) return 'never'
@@ -135,6 +136,10 @@ export default function HealthTab() {
 
   return (
     <div>
+      {/* BL-NEW-DASHBOARD-SOURCE-CALL-HEALTH frontend panel — visibility-only.
+          Shows health + rankability blockers, never per-source rankings. */}
+      <SourceCallsHealthPanel />
+
       {/* Heartbeat stats */}
       <div className="stat-bar">
         <div className="stat-card">
