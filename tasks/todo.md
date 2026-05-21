@@ -1,5 +1,25 @@
 # Backlog — gecko-alpha
 
+## Active Work: BL-NEW-SOURCE-CALL-PRICE-COVERAGE-EXPANSION
+
+- [x] Create isolated worktree from `origin/master`: `C:\projects\gecko-alpha-bl-new-source-call-price-coverage` on `plan/bl-new-source-call-price-coverage`.
+- [x] Review `tasks/lessons.md` and apply Hermes-first installed-surface rule.
+- [x] Run in-tree drift-check for historical price/cache writers and `_fetch_snapshot_rows`.
+- [x] Query prod-copy `scout.db` for source-call coverage, identity, and table-shape evidence.
+- [x] Complete Hermes-first/vendor documentation matrix without paid API calls.
+- [x] Draft plan: `tasks/plan_source_call_price_coverage_expansion_2026_05_21.md`.
+- [x] Get plan reviewed by 2 parallel agents and fold Critical/Important findings.
+- [ ] Draft design only after plan-review folds.
+- [ ] Get design reviewed by 2 parallel agents and fold Critical/Important findings.
+- [ ] Build only if design proves implementation is trivial and reviewer-clean.
+- [ ] Open PR and record final verification/review results.
+
+Review:
+- Baseline `uv run pytest --tb=short -q` did not reach tests because `uv` failed fetching `hatchling` from PyPI with TLS `UnknownIssuer`.
+- Current prod-copy status: 1,253 `source_calls`; only 14 at-call prices; zero 1h/6h/24h forward returns; 1,237 unresolvable. No acceptance target is met today.
+- Plan-review folds: OHLCV availability semantics, identity-eligible denominator, horizon-specific coverage, trust-tier dimension separation, CoinGecko MCP correction, and explicit vendor cost budgets.
+- Scope remains plan/design-only unless reviewers explicitly clear a trivial implementation.
+
 ## Active Work: BL-NEW-SOURCE-CALL-OUTCOME-LEDGER
 
 - [x] Resume branch and verify plan/design folds are present
