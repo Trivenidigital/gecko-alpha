@@ -11,11 +11,20 @@
 ## Active Work: 2026-05-20 source-call outcome ledger
 
 ### BL-NEW-SOURCE-CALL-OUTCOME-LEDGER: durable TG/X per-call outcome substrate
-**Status:** PR-OPEN 2026-05-20 — draft PR #206 (`feat/source-call-outcome-ledger-2026-05-20`); plan/design reviewer folds landed before build.
+**Status:** SHIPPED 2026-05-20 - PR #206 merged (`aaffa6b0`) and PR #207 deployed/wired live writer + lag watchdog (`df76d851`).
 **Tag:** `source-quality` `tg_social` `x_alerts` `measurement-substrate` `hermes-first`
 **Why:** Operator wants quality over quantity from TG/X sources: repeated noisy TG calls and expensive X/KOL calls need evidence at the source level. Existing tables store source events (`tg_social_signals`, `narrative_alerts_inbound`) and paper trades, but no durable per-call ledger ties each call to forward returns, duplicate clustering, missing-data reasons, and paper-trade linkage.
 **Action:** Ship `source_calls` sidecar table, idempotent TG/X backfill helper, bounded forward-window outcome computation from existing CG snapshot tables, low-n/coverage-aware summary helper, and §12a lag watchdog. No trading behavior changes, no source suppression, no dashboard endpoint in this PR.
 **Hermes-first summary:** use Hermes for X/KOL collection/classification; keep custom durable attribution and summary because no Hermes skill owns gecko-alpha source-call outcomes. Full table in `tasks/plan_source_call_outcome_ledger_2026_05_20.md` and `tasks/design_source_call_outcome_ledger_2026_05_20.md`.
+
+| State | Current evidence |
+|---|---|
+| MERGED | PR #206 merge commit `aaffa6b0`; PR #207 merge commit `df76d851` on `origin/master` |
+| DEPLOYED | srilu `/root/gecko-alpha` HEAD `df76d85` |
+| BACKFILLED | prod `source_calls` has 1,254 rows as of 2026-05-21 check |
+| WRITER-LIVE | prod crontab has `*/5 * * * * /root/gecko-alpha/scripts/source-calls-live-writer.sh` |
+| WATCHDOG-LIVE | prod crontab has `*/10 * * * * /root/gecko-alpha/scripts/source-calls-lag-watchdog.sh` |
+| PRICE-COVERAGE-LIMITED | prod `source_calls`: 14 `price_at_call`, 0 rows with 1h/6h/24h forward pct; handled by `BL-NEW-SOURCE-CALL-PRICE-COVERAGE-EXPANSION` |
 
 ### BL-NEW-DASHBOARD-SOURCE-CALL-QUALITY-SURFACE: dashboard surface over `source_calls`
 **Status:** PROPOSED 2026-05-20 — follow-up after BL-NEW-SOURCE-CALL-OUTCOME-LEDGER ships and accumulates/backfills rows.
@@ -2254,19 +2263,13 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 **Decision-by:** Conditional — file only when operator has observed a specific case where global thresholds are demonstrably inappropriate. May never fire.
 
 ### BL-NEW-SOURCE-CALL-PRICE-COVERAGE-EXPANSION: extend forward-price substrate so TG/X source-call outcomes can resolve beyond top-board membership
-**Status:** PROPOSED 2026-05-20 — opened immediately after `source_calls` prod backfill (1,225 rows: 846 TG + 379 X). Refresh phase produced 1,215 `unresolvable` / 1,225 (99.2%), with `missing_reason_tally.no_time_series=7950`. Root cause is structural, not a bug: `scout/source_quality/ledger.py:144` (`_fetch_snapshot_rows`) queries only `gainers_snapshots` + `losers_snapshots` keyed by CoinGecko `coin_id`. TG/X-called tokens overwhelmingly fall outside top-gainers/losers boards by selection design — that is the value prop of KOL early-detection, not a price-coverage failure.
+**Status:** PLAN/DESIGN-IN-PR 2026-05-21 - current branch `plan/bl-new-source-call-price-coverage`; plan at `tasks/plan_source_call_price_coverage_expansion_2026_05_21.md`, design at `tasks/design_source_call_price_coverage_expansion_2026_05_21.md`. Prod check after PR #207: 1,254 `source_calls`, 14 `price_at_call`, 0 rows with 1h/6h/24h forward pct. Root cause is structural, not a bug: `scout/source_quality/ledger.py:142` (`_fetch_snapshot_rows`) queries only `gainers_snapshots` + `losers_snapshots` keyed by CoinGecko `coin_id`. TG/X-called tokens overwhelmingly fall outside top-gainers/losers boards by selection design - that is the value prop of KOL early-detection, not a price-coverage failure.
 **Tag:** `source-quality` `price-coverage` `tg-social` `x-alerts` `attribution`
 **Why:** With the current substrate the ledger functions as a **source-call coverage/duplication ledger** (duplicate_rate, cluster diversity, per-source raw volume) but cannot rank sources by forward PnL. The 99.2% unresolvable rate is honest truth, not failure — but it caps near-term ledger value to volume/duplication signals only.
-**Scope:** Extend `_fetch_snapshot_rows` to consult additional price sources beyond `gainers_snapshots` + `losers_snapshots`:
-- Held-position / current-price caches (`held_position_price_cache` or equivalent) where the snapshot timestamp is temporally valid for the requested forward window.
-- Token metadata price history if present (any per-token snapshot table not currently consulted).
-- GeckoTerminal / DexScreener historical or near-historical pool pricing if feasible (and rate-limit-compatible at backfill scale).
-- Token-id shape normalization where the upstream call carries a `dex:chain:contract` form but a CoinGecko `coin_id` is resolvable via existing tables.
-
-Keep coverage labels explicit — every additional source must produce a distinguishable `price_source` value so downstream consumers can stratify by substrate. Do NOT silently mix high-trust (CG-board) and lower-trust (DEX pool) prices into the same forward-window result without surfacing the source.
-**Hermes-first basis:** GoldRush MCP / agent skills expose historical pool pricing for EVM chains and could close part of the DexScreener/GeckoTerminal gap (see `tasks/findings_hermes_first_debt_audit_2026_05.md`). Evaluate GoldRush coverage against the gecko-alpha residual gap before building bespoke clients.
-**Non-goals:** No change to backfill or refresh control flow. No source ranking / pruning built off this. No change to interpretation lock: ledger remains a coverage/duplication artifact until price coverage materially improves AND a separate BL promotes it to PnL ranking.
-**Acceptance:** After implementation, re-running refresh on the existing 1,225 source_calls rows shifts the `unresolvable` rate below an explicit threshold (e.g., ≤80%) AND `per_horizon_eligible_counts` for at least one source reaches the `min_sample=10, coverage≥0.50` gate.
+**Current scope:** Do NOT extend `_fetch_snapshot_rows` in the first PR. Design a sidecar `source_call_price_observations` substrate with explicit trust tier, source family, aggregation mode, chain identity, candle availability semantics, liquidity evidence, and prod-copy preview workflow.
+**Hermes-first basis:** GoldRush/Covalent and CoinGecko MCP are both valid MCP-aligned historical-price candidates. Evaluate both against the gecko-alpha residual gap before building bespoke clients. DexScreener latest-spot API is rejected for historical coverage unless implemented later as a prospective cache.
+**Non-goals:** No source ranking / pruning built off this. No dashboard "best source" surface. No actionability consumption. No live config. No vendor call without explicit operator approval. Ledger remains a coverage/duplication artifact until price coverage materially improves AND a separate BL promotes it to PnL ranking.
+**Acceptance:** A future implementation must report total-population unresolved rate separately from an identity-eligible denominator; identity-eligible unresolvable rate must be <=80%; at least one source must reach `min_sample=10` and primary-horizon coverage >=0.50 with temporal integrity, trust-tier labeling, chain identity, and liquidity/pool context enforced. A coverage win bought by relaxing these invariants does not count.
 
 ### BL-NEW-SOURCE-CALL-LIVE-WRITER-WIRE: keep `source_calls` fresh as new TG/X rows land
 **Status:** SHIPPED-IN-PR 2026-05-20 — co-shipped with lag watchdog activation in branch `feat/source-calls-lag-watchdog-activate`. Path (i) cron entry: `*/5 * * * * scripts/source-calls-live-writer.sh` invoking `scripts/source_calls_live_writer.py`. Writer is idempotent, no Telegram dispatch (single alerter surface is the lag watchdog per §12a).
