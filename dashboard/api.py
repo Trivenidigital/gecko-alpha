@@ -1118,6 +1118,23 @@ def create_app(db_path: str | None = None) -> FastAPI:
         """
         return await db.get_x_alerts(_db_path, limit=limit)
 
+    @app.get("/api/source_calls/health")
+    async def get_source_calls_health():
+        """Read-only aggregate health of the source_calls ledger.
+
+        Surfaces row count, unresolvable rate, duplicate rate, outcome status
+        distribution, price coverage by horizon, and rankability rollup —
+        WITHOUT exposing per-source ranking. Per operator gates: source
+        ranking gated on BL-NEW-DASHBOARD-SOURCE-CALL-QUALITY-SURFACE +
+        BL-NEW-SOURCE-CALL-PRICE-COVERAGE-EXPANSION. The
+        `rankability.not_rankable_label` field communicates the gate
+        honestly to the operator.
+
+        Closes BL-NEW-DASHBOARD-SOURCE-CALL-HEALTH (P4 of 2026-05-21
+        autonomous build block).
+        """
+        return await db.get_source_calls_health(_db_path)
+
     @app.get("/api/tg_social/dlq")
     async def get_tg_social_dlq_endpoint(
         limit: int = Query(20, ge=1, le=100),

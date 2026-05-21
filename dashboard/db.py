@@ -2051,3 +2051,226 @@ async def get_tg_social_per_channel_cashtag_today(db_path: str) -> dict[str, int
                 count=unknown_count,
             )
         return result
+
+
+async def get_source_calls_health(db_path: str) -> dict:
+    """Read-only aggregate health of the source_calls ledger.
+
+    Surfaces what's visible WITHOUT inferring source quality / ranking.
+    Per operator gates (BL-NEW-SOURCE-CALL-CRON-TICK-WATCHDOG +
+    BL-NEW-SOURCE-CALL-PRICE-COVERAGE-EXPANSION): no per-source ranking
+    is exposed. The endpoint communicates "what's there + why it's not
+    rankable yet" honestly.
+
+    Returns dict with shape:
+        {
+          "row_count": int,
+          "row_count_by_source_type": {"tg": int, "x": int},
+          "unresolvable_rate": float | None,  # null if 0 rows
+          "duplicate_rate": float | None,
+          "outcome_status_counts": {<status>: int, ...},
+          "price_coverage": {
+              "with_price_at_call": int,
+              "with_forward_30m_pct": int,
+              "with_forward_1h_pct": int,
+              "with_forward_6h_pct": int,
+              "with_forward_24h_pct": int,
+          },
+          "rankability": {
+              "source_count": int,
+              "rankable": int,  # rank_status='rankable_resolvable_cg_board_cohort'
+              "insufficient_sample": int,
+              "biased_low_coverage": int,
+              "not_rankable_label": str,  # operator-facing prose
+          },
+          "writer_freshness": {
+              "max_observed_at": str | None,
+              "minutes_since_last_observed": float | None,
+              "lag_threshold_minutes": 30,
+          },
+          "checked_at": str  # ISO8601
+        }
+
+    Defensive: returns a "schema_missing"-flagged dict if the
+    source_calls table doesn't exist (fresh DB or pre-PR-#206 rollback).
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    base_response = {
+        "row_count": 0,
+        "row_count_by_source_type": {"tg": 0, "x": 0},
+        "unresolvable_rate": None,
+        "duplicate_rate": None,
+        "outcome_status_counts": {},
+        "price_coverage": {
+            "with_price_at_call": 0,
+            "with_forward_30m_pct": 0,
+            "with_forward_1h_pct": 0,
+            "with_forward_6h_pct": 0,
+            "with_forward_24h_pct": 0,
+        },
+        "rankability": {
+            "source_count": 0,
+            "rankable": 0,
+            "insufficient_sample": 0,
+            "biased_low_coverage": 0,
+            "not_rankable_label": "no source_calls rows yet",
+        },
+        "writer_freshness": {
+            "max_observed_at": None,
+            "minutes_since_last_observed": None,
+            "lag_threshold_minutes": 30,
+        },
+        "checked_at": now.isoformat(),
+    }
+
+    async with _ro_db(db_path) as conn:
+        try:
+            row = await (await conn.execute(
+                "SELECT COUNT(*) FROM source_calls"
+            )).fetchone()
+            row_count = row[0] if row else 0
+        except aiosqlite.OperationalError as exc:
+            msg = str(exc)
+            if "no such table" not in msg or "source_calls" not in msg:
+                raise
+            structlog.get_logger().warning(
+                "dashboard_source_calls_health_schema_missing",
+                err=msg,
+            )
+            base_response["rankability"]["not_rankable_label"] = (
+                "source_calls table does not exist on this DB "
+                "(fresh install or pre-PR-#206 rollback)"
+            )
+            return {**base_response, "schema_missing": True}
+
+        if row_count == 0:
+            return base_response
+
+        # Row counts by source_type
+        cur = await conn.execute(
+            "SELECT source_type, COUNT(*) FROM source_calls GROUP BY source_type"
+        )
+        for stype, cnt in await cur.fetchall():
+            if stype in ("tg", "x"):
+                base_response["row_count_by_source_type"][stype] = cnt
+        base_response["row_count"] = row_count
+
+        # Outcome status distribution
+        cur = await conn.execute(
+            "SELECT COALESCE(outcome_status, 'unknown'), COUNT(*) "
+            "FROM source_calls GROUP BY outcome_status"
+        )
+        status_counts = {row[0]: row[1] for row in await cur.fetchall()}
+        base_response["outcome_status_counts"] = status_counts
+
+        unresolvable = status_counts.get("unresolvable", 0)
+        base_response["unresolvable_rate"] = (
+            round(unresolvable / row_count, 4) if row_count else None
+        )
+
+        # Duplicate rate: rows where duplicate_rank_in_cluster > 1
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM source_calls "
+            "WHERE duplicate_rank_in_cluster IS NOT NULL "
+            "AND duplicate_rank_in_cluster > 1"
+        )
+        dup_row = await cur.fetchone()
+        duplicate_count = dup_row[0] if dup_row else 0
+        base_response["duplicate_rate"] = (
+            round(duplicate_count / row_count, 4) if row_count else None
+        )
+
+        # Price coverage by horizon
+        cur = await conn.execute("""
+            SELECT
+              SUM(CASE WHEN price_at_call IS NOT NULL THEN 1 ELSE 0 END),
+              SUM(CASE WHEN forward_30m_pct IS NOT NULL THEN 1 ELSE 0 END),
+              SUM(CASE WHEN forward_1h_pct IS NOT NULL THEN 1 ELSE 0 END),
+              SUM(CASE WHEN forward_6h_pct IS NOT NULL THEN 1 ELSE 0 END),
+              SUM(CASE WHEN forward_24h_pct IS NOT NULL THEN 1 ELSE 0 END)
+            FROM source_calls
+        """)
+        cov = await cur.fetchone()
+        if cov:
+            base_response["price_coverage"] = {
+                "with_price_at_call": cov[0] or 0,
+                "with_forward_30m_pct": cov[1] or 0,
+                "with_forward_1h_pct": cov[2] or 0,
+                "with_forward_6h_pct": cov[3] or 0,
+                "with_forward_24h_pct": cov[4] or 0,
+            }
+
+        # Rankability rollup: count sources at each rank_status, NOT exposing
+        # which sources are rankable. Per operator gate: no per-source ranking.
+        # Uses the same gate (min_sample=10, min_coverage_rate=0.50) as
+        # scout.source_quality.ledger.compute_source_quality_summary.
+        try:
+            from scout.source_quality.ledger import compute_source_quality_summary
+            summaries = await compute_source_quality_summary(conn)
+            rankable = sum(
+                1 for s in summaries
+                if s.rank_status == "rankable_resolvable_cg_board_cohort"
+            )
+            insufficient = sum(
+                1 for s in summaries if s.rank_status == "insufficient_sample"
+            )
+            biased = sum(
+                1 for s in summaries if s.rank_status == "biased_low_coverage"
+            )
+            source_count = len(summaries)
+            if rankable == 0:
+                reasons = []
+                if insufficient > 0:
+                    reasons.append(f"{insufficient} below min_sample=10")
+                if biased > 0:
+                    reasons.append(f"{biased} below min_coverage_rate=0.50")
+                label = (
+                    "no sources rankable yet — "
+                    + (", ".join(reasons) if reasons else "no qualifying sources")
+                )
+            else:
+                label = (
+                    f"{rankable}/{source_count} sources meet gate "
+                    "(min_sample=10 AND coverage>=0.50) — rankable cohort "
+                    "available but per-source ranking deliberately not "
+                    "exposed pending operator review (see "
+                    "BL-NEW-DASHBOARD-SOURCE-CALL-QUALITY-SURFACE)"
+                )
+            base_response["rankability"] = {
+                "source_count": source_count,
+                "rankable": rankable,
+                "insufficient_sample": insufficient,
+                "biased_low_coverage": biased,
+                "not_rankable_label": label,
+            }
+        except Exception as exc:
+            structlog.get_logger().warning(
+                "dashboard_source_calls_rankability_summary_failed",
+                err=str(exc)[:200],
+            )
+
+        # Writer freshness: max(observed_at) → minutes since.
+        cur = await conn.execute(
+            "SELECT MAX(observed_at) FROM source_calls"
+        )
+        max_row = await cur.fetchone()
+        max_observed = max_row[0] if max_row else None
+        if max_observed:
+            try:
+                last_dt = datetime.fromisoformat(
+                    max_observed.replace("Z", "+00:00")
+                )
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                age_min = (now - last_dt).total_seconds() / 60.0
+                base_response["writer_freshness"] = {
+                    "max_observed_at": max_observed,
+                    "minutes_since_last_observed": round(age_min, 1),
+                    "lag_threshold_minutes": 30,
+                }
+            except (ValueError, TypeError):
+                base_response["writer_freshness"]["max_observed_at"] = max_observed
+
+        return base_response

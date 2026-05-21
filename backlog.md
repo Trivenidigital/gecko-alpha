@@ -48,6 +48,16 @@
 **Hermes-first:** N/A — pure local query optimization on existing read-only endpoint.
 **Files:** `dashboard/db.py` (refactor get_x_alerts), `tests/test_x_alerts_dashboard.py` (2 new regression tests).
 
+### BL-NEW-DASHBOARD-SOURCE-CALL-HEALTH: read-only aggregate health endpoint for source_calls
+**Status:** SHIPPED-IN-PR 2026-05-21 — `GET /api/source_calls/health`, backend only (no frontend wiring).
+**Tag:** `dashboard` `read-only` `visibility-only` `operator-cockpit`
+**Why:** The cockpit needs a single endpoint where the operator can see "what's going on with source_calls" — row count, unresolvable rate, duplicate rate, outcome status distribution, price coverage by horizon, writer freshness, rankability rollup. Pre-fix the operator had to read backlog entries + run sqlite3 ad-hoc on prod. Now: one curl call.
+**Operator gates respected:** NO per-source ranking exposed. `rankability` is a rollup (`source_count`, `rankable`, `insufficient_sample`, `biased_low_coverage`) plus a `not_rankable_label` prose field. Regression test `test_health_endpoint_does_not_expose_per_source_ranking` asserts no source id leaks into the response.
+**Hermes-first:** N/A — pure local read-only summary of the existing source_calls table; uses existing `scout.source_quality.ledger.compute_source_quality_summary` helper. No external service.
+**Action:** New helper `dashboard.db.get_source_calls_health(db_path)` builds the aggregate dict. Wired into `dashboard/api.py` as `GET /api/source_calls/health`. Defensive on `schema_missing` (fresh DB / pre-PR-#206 rollback). 5 tests cover empty-state, aggregate stats, no-per-source-leak, "not rankable yet" gate label, writer freshness.
+**Follow-up:** `BL-NEW-DASHBOARD-SOURCE-CALL-QUALITY-SURFACE` covers eventual frontend panel; this endpoint provides the backend.
+**Files:** `dashboard/db.py` (+~180 LOC), `dashboard/api.py` (+18 LOC endpoint stub), `tests/test_source_calls_health_endpoint.py` (new, 5 tests).
+
 ### BL-NEW-DASHBOARD-SOURCE-CALL-QUALITY-SURFACE: dashboard surface over `source_calls`
 **Status:** PROPOSED 2026-05-20 — follow-up after BL-NEW-SOURCE-CALL-OUTCOME-LEDGER ships and accumulates/backfills rows.
 **Tag:** `dashboard` `source-quality` `read-only` `trader-cockpit`
