@@ -183,7 +183,12 @@ export default function SourceCallsHealthPanel() {
         )}
       </h3>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24, marginTop: 12 }}>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+        gap: 24,
+        marginTop: 12,
+      }}>
         {/* LEFT: rates + counts */}
         <div>
           <div style={{ marginBottom: 8 }}>
@@ -248,20 +253,51 @@ export default function SourceCallsHealthPanel() {
       {/* RANKABILITY BLOCKER BANNER — NOT a rank surface */}
       <div style={{
         marginTop: 16,
-        padding: '8px 12px',
+        padding: '10px 14px',
         background: rk.rankable > 0 ? '#2a3a2a' : '#3a2a2a',
         border: '1px solid ' + (rk.rankable > 0 ? '#4caf50' : '#d32f2f'),
         borderRadius: 4,
         fontSize: 13,
       }}>
-        <div style={{ fontWeight: 600, marginBottom: 4 }}>
-          Rankability — {rk.rankable ?? 0} / {rk.source_count ?? 0} sources meet gate
+        <div style={{
+          fontWeight: 600,
+          marginBottom: 4,
+          display: 'flex',
+          flexWrap: 'wrap',
+          alignItems: 'baseline',
+          gap: 6,
+        }}>
+          <span>Why ranking is blocked</span>
+          <span style={{ fontSize: 11, color: '#aaa' }}>
+            ({rk.rankable ?? 0} / {rk.source_count ?? 0} sources meet gate)
+          </span>
         </div>
-        <div style={{ color: '#ccc' }}>{rk.not_rankable_label ?? '—'}</div>
-        <div style={{ fontSize: 11, color: '#888', marginTop: 6 }}>
-          Per-source ranking deliberately not shown. Gate: min_sample=10 AND coverage≥0.50.
-          {rk.insufficient_sample > 0 && ` · ${rk.insufficient_sample} below sample.`}
-          {rk.biased_low_coverage > 0 && ` · ${rk.biased_low_coverage} below coverage.`}
+        <div style={{ color: '#ddd', lineHeight: 1.4 }}>
+          {rk.not_rankable_label ?? '—'}
+        </div>
+        <div style={{ fontSize: 11, color: '#888', marginTop: 8, lineHeight: 1.5 }}>
+          <div>
+            <strong style={{ color: '#bbb' }}>Gate:</strong>{' '}
+            each source needs ≥10 distinct cluster events AND ≥50% forward-window coverage to be ranked.
+          </div>
+          <div style={{ marginTop: 4 }}>
+            <strong style={{ color: '#bbb' }}>Why not show partial rankings:</strong>{' '}
+            sub-gate sources have too few samples or biased coverage; ranking them
+            below the gate would surface noise as signal.
+          </div>
+          {(rk.insufficient_sample > 0 || rk.biased_low_coverage > 0) && (
+            <div style={{ marginTop: 4 }}>
+              <strong style={{ color: '#bbb' }}>Current breakdown:</strong>{' '}
+              {rk.insufficient_sample > 0 && (
+                <span>{rk.insufficient_sample} source{rk.insufficient_sample !== 1 ? 's' : ''} below sample floor</span>
+              )}
+              {rk.insufficient_sample > 0 && rk.biased_low_coverage > 0 && ' · '}
+              {rk.biased_low_coverage > 0 && (
+                <span>{rk.biased_low_coverage} source{rk.biased_low_coverage !== 1 ? 's' : ''} below coverage floor</span>
+              )}
+              .
+            </div>
+          )}
         </div>
       </div>
     </div>

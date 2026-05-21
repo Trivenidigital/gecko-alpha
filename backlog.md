@@ -27,7 +27,7 @@
 | PRICE-COVERAGE-LIMITED | prod `source_calls`: 14 `price_at_call`, 0 rows with 1h/6h/24h forward pct; handled by `BL-NEW-SOURCE-CALL-PRICE-COVERAGE-EXPANSION` |
 
 ### BL-NEW-SOURCE-CALL-CRON-TICK-WATCHDOG: detect writer cron outages independently of upstream traffic
-**Status:** SHIPPED-IN-PR 2026-05-21 — folded into existing `scripts/source-calls-lag-watchdog.sh` via writer-heartbeat check (branch: `feat/source-call-cron-tick-watchdog`).
+**Status:** SHIPPED-DEPLOYED 2026-05-21 — PR #211 merged + activated on srilu-vps. Heartbeat advancing every 5min via cron; lag-watchdog quiet (writer-heartbeat branch active, status=ok). 3 hotfix PRs co-shipped: #216 (`Settings` field declaration, crash-loop fix), #217 (wrapper sources `.env` for cron's sparse env), #218 (env-source ordering so `DB_PATH=scout.db` from `.env` doesn't override the absolute fallback).
 **Tag:** `observability` `silent-failure-prevention` `cron` `section-12a`
 **Why:** `source-calls-lag-watchdog` reads `MAX(upstream_ts) - MAX(source_calls_ts)` — Class-1 silent-failure (CLAUDE.md §12a) when writer cron stops AND upstream is also quiet (both timestamps stale → lag delta stays small → no alert). Writer is idempotent and fires on empty upstream too, so writer-staleness IS independently detectable via heartbeat.
 **Action:** Add `--heartbeat-file` to `scripts/source_calls_live_writer.py` (touch on exit 0). Add `--writer-heartbeat-file` / `--writer-threshold-minutes` to `scripts/check_source_calls_lag.py` with three statuses: `writer_stale` (mtime > threshold), `writer_heartbeat_missing` (file absent + ledger has rows), `writer_heartbeat_pending` (file absent + empty ledger; alert-suppressed first-run with 6h escalation to `writer_never_fired`). Wire through `source-calls-lag-watchdog.sh` with differentiated plain-prose alert text + §12b `*_alert_dispatched/delivered/failed` log triplet.
@@ -38,7 +38,7 @@
 **Files:** `scripts/source_calls_live_writer.py`, `scripts/source-calls-live-writer.sh`, `scripts/check_source_calls_lag.py`, `scripts/source-calls-lag-watchdog.sh`, `tests/test_source_calls_live_writer.py`, `tests/test_check_source_calls_lag.py` (new), `tests/test_source_calls_lag_watchdog.py`, `tasks/plan_source_call_cron_tick_watchdog.md`, `tasks/design_source_call_cron_tick_watchdog.md`.
 
 ### BL-NEW-DASHBOARD-X-ALERTS-TIMEOUT-FIX: batched entry-price preload for /api/x_alerts
-**Status:** SHIPPED-IN-PR 2026-05-21 — refactor `dashboard.db.get_x_alerts` so the per-row 5-source-table BETWEEN sweep collapses to 5 batched queries (one per source table) for ALL resolved coin_ids across the union 24h window.
+**Status:** SHIPPED-DEPLOYED 2026-05-21 — PR #213 merged; combined with PR #215 (`UPPER(symbol)` functional indexes on `volume_history_cg` + `gainers_snapshots` to fix the dominant resolver SCAN that masked the entry-price batching win in post-deploy smoke). **Measured prod timing: limit=80 9.30s → 0.18s p50 (~50× faster).** No SQLite SCAN of the 2.5M-row volume_history_cg per resolved cashtag.
 **Tag:** `dashboard` `performance` `read-only` `visibility-only`
 **Why:** Prod 2026-05-21 timing: limit=10 → 1.47s, limit=40 → 5.73s, limit=80 → 9.30s. Pre-fix code ran O(N rows x 5 queries) entry-price lookups; aiosqlite serializes per-connection, so latency scaled linearly with limit and tripped the frontend 5s abort timeout (added in PR #190). Indexes `(coin_id, time_col)` already exist on all 5 source tables — the bottleneck was query *count*, not query cost.
 **Action:** Restructure `get_x_alerts` into two passes: (1) per-row coin_id resolution (existing `_resolve_coin_id_for_outcome` cached path), (2) one-shot `_preload_entry_price_data(coin_ids, window_lo, window_hi)` issuing 5 queries with `coin_id IN (?,...)` + global window, then per-row outcomes use the prebuilt `dict[coin_id, list[(ts, price)]]`. Preserves exact closest-prior-or-earliest-after semantics. No new index. No schema change. No new endpoint. No behavior change.
@@ -49,7 +49,7 @@
 **Files:** `dashboard/db.py` (refactor get_x_alerts), `tests/test_x_alerts_dashboard.py` (2 new regression tests).
 
 ### BL-NEW-DASHBOARD-SOURCE-CALL-HEALTH: read-only aggregate health endpoint for source_calls
-**Status:** SHIPPED-IN-PR 2026-05-21 — `GET /api/source_calls/health`, backend only (no frontend wiring).
+**Status:** SHIPPED-DEPLOYED 2026-05-21 — PR #214 backend (`GET /api/source_calls/health`, ~0.03s p50) + PR #219 frontend cockpit panel (`SourceCallsHealthPanel.jsx` in `HealthTab`, 30s auto-refresh). Operator gate intact: no per-source identifiers in API response; rankability rollup only.
 **Tag:** `dashboard` `read-only` `visibility-only` `operator-cockpit`
 **Why:** The cockpit needs a single endpoint where the operator can see "what's going on with source_calls" — row count, unresolvable rate, duplicate rate, outcome status distribution, price coverage by horizon, writer freshness, rankability rollup. Pre-fix the operator had to read backlog entries + run sqlite3 ad-hoc on prod. Now: one curl call.
 **Operator gates respected:** NO per-source ranking exposed. `rankability` is a rollup (`source_count`, `rankable`, `insufficient_sample`, `biased_low_coverage`) plus a `not_rankable_label` prose field. Regression test `test_health_endpoint_does_not_expose_per_source_ranking` asserts no source id leaks into the response.
@@ -57,6 +57,20 @@
 **Action:** New helper `dashboard.db.get_source_calls_health(db_path)` builds the aggregate dict. Wired into `dashboard/api.py` as `GET /api/source_calls/health`. Defensive on `schema_missing` (fresh DB / pre-PR-#206 rollback). 5 tests cover empty-state, aggregate stats, no-per-source-leak, "not rankable yet" gate label, writer freshness.
 **Follow-up:** `BL-NEW-DASHBOARD-SOURCE-CALL-QUALITY-SURFACE` covers eventual frontend panel; this endpoint provides the backend.
 **Files:** `dashboard/db.py` (+~180 LOC), `dashboard/api.py` (+18 LOC endpoint stub), `tests/test_source_calls_health_endpoint.py` (new, 5 tests).
+
+### BL-NEW-DASHBOARD-X-ALERTS-RESOLVER-INDEX: functional `UPPER(symbol)` indexes (PR #215)
+**Status:** SHIPPED-DEPLOYED 2026-05-21 — PR #215 merged + migration auto-applied at next gecko-pipeline restart. Two new functional indexes: `idx_vol_hist_cg_symbol_upper`, `idx_gainers_snap_symbol_upper`. Both via the `_migrate_*` pattern + `paper_migrations` idempotency.
+**Why surfaced separately from PR #213:** post-deploy smoke of #213 revealed the batched entry-price preload worked as designed but x_alerts at limit=80 still ran 9-16s. EXPLAIN QUERY PLAN confirmed `_resolve_coin_id_for_outcome` SCANned the 2.5M-row `volume_history_cg` per cashtag (~360ms × ~30 cashtags ≈ 10s of the budget). `UPPER(symbol) = ?` is non-sargable against the `(coin_id, time_col)` indexes. Filed + shipped same session.
+**Tag:** `dashboard` `performance` `migration` `visibility-only`
+**Net post-fix:** 0.20s p50 (vs 9.30s pre-fix; ~45× speedup).
+
+### BL-NEW-DASHBOARD-SOURCE-CALL-HEALTH-PANEL: V1 frontend cockpit panel (PR #219)
+**Status:** SHIPPED-DEPLOYED 2026-05-21 — PR #219. `dashboard/frontend/components/SourceCallsHealthPanel.jsx` slotted into `HealthTab` above the existing stat bar. Consumes `/api/source_calls/health`. 30s auto-refresh.
+**Surfaces:** writer freshness badge (fresh/lagging/STALE), row counts + tg/x split, unresolvable_rate + duplicate_rate (color-coded), outcome status distribution, price coverage by horizon (5 proportional bars), rankability rollup banner with `not_rankable_label` rendered verbatim from backend.
+**Operator gate respected:** zero per-source identifiers in component output; the API itself guards via `test_health_endpoint_does_not_expose_per_source_ranking`. Caption explicitly states "per-source ranking deliberately not shown".
+**Tag:** `dashboard` `frontend` `visibility-only` `operator-cockpit`
+**Vite build artifacts committed:** `dist/index.html` + `dist/assets/index-nifTXfDA.js` + `dist/assets/index-C5u4mHYq.css` (per CLAUDE.md memory `feedback_vite_dist_index_html_commit_discipline`).
+**Follow-up:** `BL-NEW-DASHBOARD-SOURCE-CALL-QUALITY-SURFACE` remains for any future per-source ranking surface (data-gated on source-call coverage; not this iteration).
 
 ### BL-NEW-DASHBOARD-SOURCE-CALL-QUALITY-SURFACE: dashboard surface over `source_calls`
 **Status:** PROPOSED 2026-05-20 — follow-up after BL-NEW-SOURCE-CALL-OUTCOME-LEDGER ships and accumulates/backfills rows.
