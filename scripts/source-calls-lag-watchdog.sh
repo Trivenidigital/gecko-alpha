@@ -38,6 +38,22 @@ DB_PATH="${REPO_ROOT}/scout.db"
 ENV_FILE="${GECKO_ENV_FILE:-${REPO_ROOT}/.env}"
 PYTHON="${GECKO_PYTHON:-${REPO_ROOT}/.venv/bin/python}"
 THRESHOLD_MINUTES="30"
+
+# Source .env EARLY so cron invocations pick up WRITER_HEARTBEAT_FILE,
+# WRITER_THRESHOLD_MINUTES, and Telegram credentials. Cron's default env
+# is sparse — without this early source the writer-heartbeat branch is
+# skipped entirely (Python check runs without --writer-heartbeat-file
+# args, so cron-tick detection is dead under cron). Discovered
+# 2026-05-21 post-deploy. The existing late-stage source for Telegram
+# creds is preserved as a fallback when --env-file is overridden at
+# the CLI after the early source.
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+
 WRITER_HEARTBEAT_FILE="${WRITER_HEARTBEAT_FILE:-}"
 WRITER_THRESHOLD_MINUTES="${WRITER_THRESHOLD_MINUTES:-20}"
 

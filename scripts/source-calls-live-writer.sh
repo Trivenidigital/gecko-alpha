@@ -21,6 +21,19 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 DB_PATH="${REPO_ROOT}/scout.db"
 PYTHON="${GECKO_PYTHON:-${REPO_ROOT}/.venv/bin/python}"
+
+# Source .env so cron invocations pick up WRITER_HEARTBEAT_FILE
+# (cron's default env is sparse — without this source, the wrapper
+# sees an empty WRITER_HEARTBEAT_FILE and skips the heartbeat touch,
+# defeating the cron-tick watchdog. Discovered 2026-05-21 post-deploy.)
+ENV_FILE="${GECKO_ENV_FILE:-${REPO_ROOT}/.env}"
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+
 HEARTBEAT_FILE="${WRITER_HEARTBEAT_FILE:-}"
 
 while [[ $# -gt 0 ]]; do
