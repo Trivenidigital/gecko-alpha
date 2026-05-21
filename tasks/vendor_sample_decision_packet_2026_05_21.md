@@ -1,42 +1,68 @@
 # Vendor Sample Decision Packet — Source-Call Price-Coverage Expansion
 
-**Date:** 2026-05-21
+**Date:** 2026-05-21 (revised after PR #220 reviewer correction)
 **BL:** `BL-NEW-SOURCE-CALL-PRICE-COVERAGE-EXPANSION` (DESIGN-SHIPPED, PR #208)
 **Status:** Implementation gated on this packet's operator decision.
-**Operator action required:** approve OR reject the single sample call described below. No code change ships from this packet itself.
+**Operator action required:** approve OR reject the **schema-verification** sample call described below. No code change ships from this packet itself.
 
-## Background (1 paragraph)
+## What changed in this revision
 
-PR #208 shipped a design for extending `source_calls` forward-window price coverage so per-source ranking has the data to be honest. Current prod state: 1316 `source_calls` rows, 14 with `price_at_call`, **zero** with `forward_30m_pct` / `forward_1h_pct` / `forward_6h_pct` / `forward_24h_pct`. The dashboard's `not_rankable_label` reads "no sources rankable yet — 20 below min_sample=10" — partly because no source has the required coverage. Per the design's plan/design review folds, the smallest reversible next step is one approved vendor sample call to validate timestamp semantics + candle availability before any persistent code lands.
+PR #220 reviewer flagged that an earlier draft of this packet:
+- claimed GoldRush exposes an "OHLCV GraphQL endpoint" with candle close + volume,
+- expected `data.items[].prices[].date` as a UTC ISO-8601 timestamp,
+- assumed 30m candle granularity.
 
-## The decision
+All three were wrong. Verified against:
+- [GoldRush schema-change page (2026-03-19)](https://goldrush.mintlify.app/changelog/20260319-api-schema-improvements-for-new-api-keys)
+- [QuickNode docs for `historical_by_addresses_v2`](https://www.quicknode.com/docs/ethereum/goldrush-wallet-api/v1-pricing-historical_by_addresses_v2-eth-quoteCurrency-contractAddress)
 
-**Authorize exactly ONE call to ONE vendor for the test payload below**, OR reject and re-park the design. The packet does not authorize a second call.
+Confirmed reality:
+1. **REST**, not GraphQL.
+2. **Response field path depends on key vintage:**
+   - Keys created **before 2026-04-01 16:00 UTC** → `data[].prices[]` (legacy schema).
+   - Keys created **on/after 2026-04-01 16:00 UTC** → `data[].items[]` (new canonical schema; `data[].prices` was removed for new keys).
+3. **`date` is date-only** (e.g., `"2025-04-29"`), NOT a UTC timestamp with `Z`/`+00:00`.
+4. **No OHLCV.** Each price record has `price` + `pretty_price` only. No open/high/low/close/volume.
+5. **Time range query params:** `from` / `to` (date strings) + `prices-at-asc=true|false`.
+6. **Cost per call:** not specified in QuickNode docs; the GoldRush rate sheet should be confirmed by the operator before any production-grade backfill.
 
-## Recommended primary vendor: GoldRush (formerly Covalent)
+## Implication for the design's 30m primary horizon
 
-Reasoning:
-- Both GoldRush and CoinGecko MCP/onchain are tier-2 candidates per the design's Hermes-first table. GoldRush's OHLCV GraphQL endpoint exposes both candle timestamps and explicit candle-boundary semantics in a single payload.
-- The design's plan review flagged "candle availability semantics" as the critical unknown that distinguishes acceptable from unacceptable vendors. GoldRush returns the candle boundary timestamp + close price + volume in a single record, which the design's `provider_timestamp_semantics` field needs to record verbatim.
-- Free tier covers ~100k credits/month; one sample call is rate-limit-safe.
-- API key required (operator-provisioned; not in this packet).
+The design (`tasks/design_source_call_price_coverage_expansion_2026_05_21.md`) commits to **30-minute as the primary horizon** for source-call forward returns. The GoldRush `historical_by_addresses_v2` endpoint **cannot satisfy this** — it returns daily price snapshots only.
 
-CoinGecko MCP/onchain remains the fallback if GoldRush sample fails validation.
+This forces a decision on the operator BEFORE any vendor sample call is authorized:
 
-## The exact sample call
+| Path | Implication |
+|---|---|
+| **A. Sample a different GoldRush endpoint that exposes intraday data** | GoldRush *does* publish per-token spot pricing (`/v1/pricing/spot_prices/`) for real-time, but for **backfilling forward windows on historical source-calls**, the operator needs to identify whether GoldRush has a separate intraday/OHLCV product covering Solana memecoin contracts. If not documented in the operator's onboarding, treat this path as blocked. |
+| **B. Re-scope the design's primary horizon to daily** | Forward_24h_pct is computable from `historical_by_addresses_v2`'s daily snapshots. Forward_30m / 1h / 6h would be dropped or marked permanently unavailable for the GoldRush path. Design + dashboard's `price_coverage` rendering would need a separate iteration. |
+| **C. Sample CoinGecko MCP / GeckoTerminal onchain instead** | The design's Hermes-first table lists this as the tier-2 alternative. CoinGecko/GeckoTerminal onchain endpoints expose pool-level intraday candles for many memecoin pairs. Needs its own packet — schema TBD. |
 
-### Endpoint
+**This packet recommends Path A's first step only:** verify whether GoldRush has a documented intraday endpoint the operator can sample, before any paid call. If no such endpoint exists in the operator's GoldRush plan, defer to Path B or C in a follow-up packet.
+
+## Schema-verification sample (Path A, step 1)
+
+**Goal of this sample:** verify the actual current response schema + temporal granularity of the GoldRush endpoint the operator's key targets. Decide whether daily granularity is acceptable before any production-grade plumbing.
+
+### Pre-sample question for the operator (no API call yet)
+
+> What is the creation date of your active GoldRush API key? This determines whether the response uses `data[].items[]` (≥2026-04-01) or `data[].prices[]` (legacy).
+
+If unknown: the sample script must accept BOTH paths and report which fired.
+
+### Endpoint to sample
+
 ```
 GET https://api.covalenthq.com/v1/pricing/historical_by_addresses_v2/{chain_name}/USD/{token_address}/
 ```
 
-### Single, concrete payload (operator may swap token_address if a different test target is preferred)
+### One concrete payload
 
 ```
 chain_name: solana-mainnet
-token_address: 5z3EqYQo9HiCEs3R84RCDMu2n7anpDMxRhdK8PSWmrRC   # POPCAT — a paper-trade winner present in prod's source_calls
-from: 2026-05-15T00:00:00Z
-to:   2026-05-15T00:30:00Z
+token_address: 5z3EqYQo9HiCEs3R84RCDMu2n7anpDMxRhdK8PSWmrRC   # POPCAT — present in prod's source_calls
+from: 2026-05-15
+to:   2026-05-15                                              # single-day window
 quote-currency: USD
 &prices-at-asc=true
 ```
@@ -46,62 +72,67 @@ Headers:
 Authorization: Bearer ${GOLDRUSH_API_KEY}
 ```
 
-### Expected single-call cost
-- 1 credit per address per quote-currency per day (per published rate sheet).
-- Token-address × 1 day × 1 quote → **1 credit**, well under free-tier daily budget.
+Note: `from` / `to` are date strings per QuickNode docs, not ISO-8601 timestamps.
 
-## Expected response fields (the 6 to validate)
+## Expected response fields — branch by key vintage
 
-| Field | Why critical |
+The sample script must inspect the response and report **which schema fired**, regardless of which the operator's key uses.
+
+### If new-key schema (`data[].items[]`)
+
+| Field | Purpose |
 |---|---|
-| `data.items[].contract_decimals` | Required to convert raw amounts. Must match prod's stored `decimals` for the token, or the price column needs a decimal-conversion step. |
-| `data.items[].prices[].date` | Candle boundary timestamp. **MUST be UTC ISO-8601.** This is the `provider_timestamp_semantics` validation. |
-| `data.items[].prices[].price` | The numeric price. Must be a number, not a string-wrapped number. |
-| `data.items[].prices[].source` | If absent: vendor doesn't expose per-candle source; we synthesize as "goldrush". If present: pass through to `trust_tier` derivation. |
-| `error` (top-level) | If `true`, we record `vendor_error` reason in the design's `missing_fields` JSON. |
-| HTTP rate-limit headers (`X-RateLimit-Remaining`, `X-RateLimit-Reset`) | Validates the free-tier budget model. |
+| `data[].items[].contract_decimals` | Validate decimal handling vs prod's stored decimals. |
+| `data[].items[].quote_currency` | Confirm USD. |
+| `data[].items[].prices` OR similar — verify by inspection | The schema-change page says `data[].items` is canonical but does not enumerate what's inside. The sample must record the exact JSON path to the price array. |
+| Each price record's date / timestamp field | **Most critical:** confirms whether new-key schema has full timestamps or also date-only. |
+| Each price record's price field | Verify numeric, > 0. |
+| HTTP `X-RateLimit-*` headers | Confirm cost model. |
+
+### If legacy-key schema (`data[].prices[]`)
+
+| Field | Purpose |
+|---|---|
+| `data[].contract_decimals` | Validate decimal handling. |
+| `data[].prices[].date` | Verify date-only string format (per QuickNode docs). |
+| `data[].prices[].price` | Verify numeric. |
+| `data[].prices[].pretty_price` | Display string, can ignore for our purposes. |
+| HTTP `X-RateLimit-*` headers | Confirm cost model. |
+
+## Accept / reject rubric
+
+Acceptance requires BOTH:
+
+1. **The sample response parses correctly** under either the new-key or legacy-key shape (recorded). No 4xx / 5xx.
+2. **At least one of:**
+   - (a) The response contains intraday timestamps (full ISO-8601 or epoch) AT MOST 30 minutes apart for the sampled day → 30m horizon is feasible; proceed to design implementation against this endpoint.
+   - (b) The response is daily-only (per current QuickNode docs) → 30m horizon is **NOT** feasible against this endpoint; operator must explicitly authorize one of (i) re-scoping design's primary horizon to daily, (ii) deferring to a different GoldRush endpoint if one exists with intraday data, (iii) shifting to the CoinGecko MCP / GeckoTerminal sample track.
+
+The decision in (b) is operator-only; the sample script returns the schema evidence and stops.
 
 ## Cost / rate-limit risk
 
 | Risk | Mitigation |
 |---|---|
-| Credit overrun (production-grade backfill needs ~10k credits) | This packet authorizes 1 call; the design's `--allow-network` + provider-specific budget flags gate the production path. The sample is not the backfill. |
-| Vendor API key leakage | Operator-side: paste into a 0600-mode tmpfile, never `echo`/`set` it. Sample script (when written) accepts key via stdin or file path, not CLI arg. |
-| Timezone drift (candle timestamps in local time) | Validation criterion below: reject sample if any timestamp lacks `Z` or `+00:00` suffix. |
-| Price = 0 or null for the sampled token at the sampled time | Re-run with a different token (e.g., SOL) before rejecting GoldRush entirely. |
-
-## Temporal-integrity validation criteria
-
-The sample is ACCEPTED only if all 5 hold:
-
-1. **Boundary timestamps are UTC.** `data.items[].prices[].date` parses as ISO-8601 with explicit `+00:00` or `Z`. No naïve datetimes.
-2. **Candle alignment matches the design's 30m primary horizon.** The sample's price list either includes a 00:30:00 boundary candle, OR the vendor explicitly documents the candle interval and the operator confirms the interval can map to 30m.
-3. **`contract_decimals` matches prod's stored decimals** for the sampled token (cross-checked via `sqlite3 scout.db "SELECT decimals FROM ... WHERE token_id='...'"`).
-4. **Price is numeric, > 0.** No string-wrapped numbers; no nulls for the sampled minute.
-5. **Rate-limit headers report remaining > 99% of daily budget after the call.** Confirms the cost model.
-
-## Accept / reject rubric
-
-| Outcome | Action |
-|---|---|
-| All 5 criteria pass | File a follow-up PR (design implementation, code) that wires GoldRush as the primary OHLCV provider. Implementation MUST gate on `--allow-network` + budget flags per the design doc. |
-| Criterion 1 fails (non-UTC) | Reject GoldRush. Sample the CoinGecko MCP/onchain endpoint instead. |
-| Criterion 2 fails (no 30m mapping) | Reject GoldRush for source-call horizons; consider for daily-only coverage in a later iteration. Re-park design. |
-| Criterion 3 fails (decimal mismatch) | Add a decimal-normalization layer to the design, then re-evaluate sample. |
-| Criterion 4 fails (price null / 0) | Re-run sample with SOL token. If still fails, reject GoldRush. |
-| Criterion 5 fails (budget burn > 1%) | Reject GoldRush — the cost model is wrong. |
+| Credit overrun | This packet authorizes **1 call**. Production-grade backfill needs orders of magnitude more (~1 credit/token/day across thousands of source-call tokens) and is separately gated. |
+| Vendor API key leakage | Sample script accepts key via stdin or 0600 tmpfile path, never CLI arg. Never `echo`/`set` it. Never write to git. |
+| Key-vintage assumption error | Sample script branches on response shape; doesn't assume vintage. Records which fired in cached JSON. |
+| Daily-only granularity surprises operator post-implementation | This packet now explicitly surfaces the issue. Path A step 1 confirms before any production-grade work. |
+| Cost model not documented in QuickNode | Operator confirms credit-per-call from their GoldRush rate sheet before authorizing the call. |
 
 ## What this packet does NOT do
 
 - Does not call any vendor API.
+- Does not assume the operator's key vintage.
+- Does not claim GoldRush has GraphQL, OHLCV, or volume data (it does not, per verified docs).
 - Does not commit any vendor key, sample response, or expected-hash to git.
-- Does not start implementation. The follow-up PR is gated on operator approval of this packet AND a successful sample evaluation.
+- Does not start implementation. The follow-up PR is gated on operator approval of this packet AND a successful sample evaluation AND (if daily-only) explicit horizon re-scope authorization.
 
 ## What changes if operator approves
 
-1. Operator provides `GOLDRUSH_API_KEY` via secret-hygiene (stdin / 0600 tmpfile, never CLI arg).
-2. Future session runs the sample script (TBD; ~30 LOC).
-3. Sample response cached under `tasks/vendor_samples/goldrush_popcat_2026_05_15_30m.json` (gitignored).
-4. Validation criteria 1-5 above evaluated; result documented in a follow-up note.
-5. If accepted: implementation PR begins from `tasks/design_source_call_price_coverage_expansion_2026_05_21.md` §implementation order.
-6. If rejected: re-park; consider CoinGecko MCP sample (new packet).
+1. Operator answers the pre-sample question (key vintage if known) + provides the credit-per-call cost from their rate sheet.
+2. Operator provides `GOLDRUSH_API_KEY` via secret-hygiene (stdin / 0600 tmpfile, never CLI arg).
+3. Future session writes the ~40 LOC sample script (`scripts/vendor_sample_goldrush.py`), invokes it once, records response under `tasks/vendor_samples/goldrush_popcat_2026_05_15.json` (gitignored).
+4. Schema is documented in a follow-up note; acceptance/rejection per the rubric above.
+5. If 30m horizon is feasible: implementation PR begins from the design doc.
+6. If 30m horizon is infeasible: operator decides between re-scoping to daily, sampling a different GoldRush endpoint, or shifting to CoinGecko MCP sample track.
