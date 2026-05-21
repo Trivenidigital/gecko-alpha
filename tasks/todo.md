@@ -1,5 +1,44 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-21 autonomous build block (cockpit usability + silent-failure closure)
+
+**Status:** SHIPPED-DEPLOYED. 9 PRs merged + deployed to srilu-vps (HEAD `c73eacf`). P0 soak verified clean (zero post-restart errors; x_alerts limit=80 0.18s p50; heartbeat advancing; lag-watchdog quiet).
+
+### Shipped PRs
+- [x] PR #211 — `feat(observability)`: writer cron-tick watchdog folded into existing lag-watchdog. Heartbeat-file mtime probe + three statuses + 6h `writer_never_fired` escalation. §12b log triplet + plain-prose remediation alert text.
+- [x] PR #212 — `docs(operator-alert)`: concrete SKILL.md patch addendum (Step 5). Reduces activation from shape-level design to copy-paste. Still operator-gated on `OPERATOR_ALERT_HMAC_SECRET`.
+- [x] PR #213 — `perf(dashboard)`: batched entry-price preload for `/api/x_alerts`. 400 queries → 5 queries. Set up the win; final 50× speedup landed with #215.
+- [x] PR #214 — `feat(dashboard)`: read-only `/api/source_calls/health` endpoint. Aggregate rollup, no per-source identifiers (regression-tested).
+- [x] PR #215 — `perf(dashboard)`: functional `UPPER(symbol)` indexes for x_alerts resolver. Post-deploy smoke revealed the resolver SCANning 2.5M-row volume_history_cg was the real bottleneck. Final: 9.30s → 0.18s p50 (~50× faster).
+- [x] PR #216 — `hotfix(config)`: declare `WRITER_HEARTBEAT_FILE` in Settings. Pydantic `extra="forbid"` was crash-looping pipeline post-activation. Caught + fixed during the activation cycle.
+- [x] PR #217 — `hotfix(wrappers)`: source `.env` early so cron's sparse env picks up `WRITER_HEARTBEAT_FILE`.
+- [x] PR #218 — `hotfix(wrappers)`: reorder `source .env` BEFORE setting `DB_PATH` default — `.env` had `DB_PATH=scout.db` (relative) which `set -a` was clobbering the wrapper's absolute fallback.
+- [x] PR #219 — `feat(dashboard)`: `SourceCallsHealthPanel.jsx` slotted into `HealthTab`. Renders writer freshness badge, counts, rates, outcome distribution, price-coverage bars, rankability blocker banner. 30s auto-refresh. Vite dist committed.
+
+### Workflow followed
+For each non-hotfix PR: plan → 2 parallel reviewers (orthogonal attack vectors) → fold Critical/Important → design → 2 parallel reviewers → fold → build → PR → 2 parallel reviewers → fold. Hotfix PRs shipped without the full workflow because they were 1-3 line fixes to flagged regressions, with explicit operator authorization ("execute all steps").
+
+### Operator gates respected
+- No trading-behavior changes
+- No classifier changes
+- No source ranking / pruning / "best source"
+- No price-coverage implementation (gated on vendor sample approval per PR #208)
+- No paid API calls
+- No live config changes beyond approved activation (writer heartbeat env line)
+
+### What's still operator-gated post-block
+- `OPERATOR_ALERT_HMAC_SECRET` absent on srilu-vps; Hermes SKILL.md unchanged. PR #176 (endpoint) + PR #212 (docs) are merged but the wire is dormant. Activation runbook: `tasks/runbook_operator_alert_activation_2026_05_19.md` + `tasks/runbook_operator_alert_skill_patch_2026_05_21.md`.
+- Source-call price-coverage implementation: gated on operator vendor-sample approval per PR #208's design doc.
+
+### Prod state @ 2026-05-21T18:07Z
+- HEAD `c73eacf`; gecko-pipeline + gecko-dashboard both `active`
+- `/api/x_alerts?limit=80`: 0.16-0.18s p50 (target <2s)
+- `/api/source_calls/health`: 0.03s
+- Heartbeat last touched 18:05:02 (3 min ago, cron tick)
+- Zero ALERT_SENT in last 1h
+- Zero post-restart errors since 17:35Z
+- 1316 source_calls rows; unresolvable_rate=98.78%; 0 sources rankable (20 below min_sample=10) — gate honestly surfaced via `not_rankable_label`
+
 ## Active Work: BL-NEW-SOURCE-CALL-PRICE-COVERAGE-EXPANSION post-merge status
 
 - [x] Create isolated worktree from `origin/master`: `C:\projects\gecko-alpha-bl-new-source-call-price-coverage` on `plan/bl-new-source-call-price-coverage`.
