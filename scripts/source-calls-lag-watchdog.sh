@@ -34,7 +34,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-DB_PATH="${REPO_ROOT}/scout.db"
 ENV_FILE="${GECKO_ENV_FILE:-${REPO_ROOT}/.env}"
 PYTHON="${GECKO_PYTHON:-${REPO_ROOT}/.venv/bin/python}"
 THRESHOLD_MINUTES="30"
@@ -44,9 +43,13 @@ THRESHOLD_MINUTES="30"
 # is sparse — without this early source the writer-heartbeat branch is
 # skipped entirely (Python check runs without --writer-heartbeat-file
 # args, so cron-tick detection is dead under cron). Discovered
-# 2026-05-21 post-deploy. The existing late-stage source for Telegram
-# creds is preserved as a fallback when --env-file is overridden at
-# the CLI after the early source.
+# 2026-05-21 post-deploy.
+#
+# .env contains `DB_PATH=scout.db` (relative). If sourced after the
+# wrapper sets DB_PATH, `set -a` auto-export clobbers the wrapper's
+# absolute path, breaking the check when invoked outside /root/
+# gecko-alpha. So .env is sourced BEFORE DB_PATH is set; the wrapper's
+# absolute fallback wins.
 if [[ -f "$ENV_FILE" ]]; then
     set -a
     # shellcheck disable=SC1090
@@ -54,6 +57,7 @@ if [[ -f "$ENV_FILE" ]]; then
     set +a
 fi
 
+DB_PATH="${REPO_ROOT}/scout.db"
 WRITER_HEARTBEAT_FILE="${WRITER_HEARTBEAT_FILE:-}"
 WRITER_THRESHOLD_MINUTES="${WRITER_THRESHOLD_MINUTES:-20}"
 

@@ -19,13 +19,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-DB_PATH="${REPO_ROOT}/scout.db"
 PYTHON="${GECKO_PYTHON:-${REPO_ROOT}/.venv/bin/python}"
 
-# Source .env so cron invocations pick up WRITER_HEARTBEAT_FILE
-# (cron's default env is sparse — without this source, the wrapper
-# sees an empty WRITER_HEARTBEAT_FILE and skips the heartbeat touch,
-# defeating the cron-tick watchdog. Discovered 2026-05-21 post-deploy.)
+# Source .env FIRST so cron invocations see WRITER_HEARTBEAT_FILE.
+# Cron's default env is sparse — without this source the wrapper would
+# evaluate WRITER_HEARTBEAT_FILE as empty and skip the heartbeat touch,
+# defeating the cron-tick watchdog. Discovered 2026-05-21 post-deploy.
+#
+# .env may contain a `DB_PATH=scout.db` (relative) line that, if
+# auto-exported via `set -a`, would clobber DB_PATH after the wrapper
+# sets it. So .env is sourced BEFORE local defaults, then DB_PATH is
+# set with an absolute fallback that wins over any .env value.
 ENV_FILE="${GECKO_ENV_FILE:-${REPO_ROOT}/.env}"
 if [[ -f "$ENV_FILE" ]]; then
     set -a
@@ -34,6 +38,7 @@ if [[ -f "$ENV_FILE" ]]; then
     set +a
 fi
 
+DB_PATH="${REPO_ROOT}/scout.db"
 HEARTBEAT_FILE="${WRITER_HEARTBEAT_FILE:-}"
 
 while [[ $# -gt 0 ]]; do
