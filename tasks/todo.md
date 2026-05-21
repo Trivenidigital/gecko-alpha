@@ -13,7 +13,7 @@
 - [x] Get design reviewed by 2 parallel agents and fold Critical/Important findings.
 - [x] Build gate evaluated: skipped implementation because design is not trivial and reviewers required non-code folds only.
 - [x] Docs/status cleanup: backlog now records SOURCE-CALL-OUTCOME-LEDGER as MERGED / DEPLOYED / BACKFILLED / WRITER-LIVE / WATCHDOG-LIVE / PRICE-COVERAGE-LIMITED.
-- [ ] Open PR and record final verification/review results.
+- [x] Open PR and record final verification/review results: https://github.com/Trivenidigital/gecko-alpha/pull/208
 
 Review:
 - Baseline `uv run pytest --tb=short -q` did not reach tests because `uv` failed fetching `hatchling` from PyPI with TLS `UnknownIssuer`.
@@ -22,6 +22,8 @@ Review:
 - Design drafted: `tasks/design_source_call_price_coverage_expansion_2026_05_21.md`; build decision is no code in this PR because the substrate is not trivial.
 - Design-review folds: as-of historical identity resolution, canonical/provider chain IDs, coverage label, liquidity evidence kind, idempotent observation key, canonical timestamp/epoch storage, valid-vs-missing CHECK constraints, 30m primary horizon, and migration idempotence requirements.
 - Backlog cleanup evidence: `origin/master` has PR #206 `aaffa6b0` and PR #207 `df76d851`; srilu `/root/gecko-alpha` HEAD is `df76d85`; prod crontab includes source-call live writer and lag watchdog; prod DB has 1,254 `source_calls`, 14 `price_at_call`, 0 forward coverage.
+- Verification: `git diff --check origin/master..HEAD` passed. `uv run pytest --tb=short -q` blocked before test collection because PyPI TLS `UnknownIssuer` prevented fetching `hatchling`.
+- PR #208 opened. No PR-review subagents were dispatched because no code was built.
 - Scope remains plan/design-only unless reviewers explicitly clear a trivial implementation.
 
 ## Active Work: BL-NEW-SOURCE-CALL-OUTCOME-LEDGER
