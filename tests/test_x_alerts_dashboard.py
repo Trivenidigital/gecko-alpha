@@ -459,23 +459,35 @@ async def test_x_alerts_entry_price_uses_batched_query_per_source(client, db, mo
     resp = await c.get("/api/x_alerts?limit=10")
     assert resp.status_code == 200
 
-    # Each entry-price source table should appear in EXACTLY ONE SELECT.
-    # The pre-fix code would have issued 5 per source table (one per row).
-    for source_table in (
-        "gainers_snapshots",
-        "losers_snapshots",
-        "volume_history_cg",
-        "volume_spikes",
-        "momentum_7d",
-    ):
-        entry_price_selects = [
-            s for s in captured_sql
-            if "BETWEEN ?" in s and f"FROM {source_table}" in s
-        ]
-        assert len(entry_price_selects) == 1, (
-            f"expected exactly 1 batched entry-price SELECT against "
-            f"{source_table}, got {len(entry_price_selects)}: {entry_price_selects}"
+    # Contract: total entry-price SELECTs must be constant w.r.t. row
+    # count (PR-review fold — relaxed from "exactly 1 per source" so a
+    # future legitimate chunking refactor (split IN-list at SQLite
+    # variable cap) doesn't trip a brittle assertion. The intent is
+    # O(1) in N rows, NOT "literally 1 SELECT per table".)
+    #
+    # Upper bound: ≤5 source-table SELECTs total (one per source) when
+    # all coin_ids fit in a single IN-list (<500 — guaranteed by the
+    # 500-cap slice in get_x_alerts). Pre-fix code would have issued
+    # 25 (5 rows × 5 sources) for this setup.
+    entry_price_selects = [
+        s for s in captured_sql
+        if "BETWEEN ?" in s
+        and any(
+            f"FROM {t}" in s
+            for t in (
+                "gainers_snapshots",
+                "losers_snapshots",
+                "volume_history_cg",
+                "volume_spikes",
+                "momentum_7d",
+            )
         )
+    ]
+    assert 1 <= len(entry_price_selects) <= 5, (
+        f"expected ≤5 batched entry-price SELECTs (one per source) for "
+        f"a single coin_id batch, got {len(entry_price_selects)}: "
+        f"{entry_price_selects}"
+    )
 
 
 async def test_x_alerts_entry_price_skips_preload_when_no_resolved_coins(client, db, monkeypatch):

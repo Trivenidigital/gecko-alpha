@@ -1874,9 +1874,20 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
             # Bound IN-list size to avoid SQLite SQLITE_MAX_VARIABLE_NUMBER
             # (default 999); each query consumes len(coin_ids)+2 binds.
             # In practice resolved_coin_ids fits in well under 100 even
-            # at limit=200; the slice is defensive.
+            # at limit=200; the slice is defensive. Cap-hit emits a
+            # structured warning so the silent-failure surface (rows
+            # 501+ would silently get no_entry_price) is observable.
+            preload_coin_ids = sorted(resolved_coin_ids)
+            if len(preload_coin_ids) > 500:
+                structlog.get_logger().warning(
+                    "x_alerts_preload_coin_id_cap_hit",
+                    n_resolved=len(preload_coin_ids),
+                    cap=500,
+                    n_truncated=len(preload_coin_ids) - 500,
+                )
+                preload_coin_ids = preload_coin_ids[:500]
             await _preload_entry_price_data(
-                sorted(resolved_coin_ids)[:500],
+                preload_coin_ids,
                 window_lo,
                 window_hi,
             )
