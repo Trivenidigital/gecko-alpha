@@ -410,3 +410,121 @@ async def test_x_alerts_resolver_does_not_query_candidates_coingecko_id(
         a for a in resp.json()["alerts"] if a["event_id"] == "schema-align-1"
     )
     assert alert["outcome_status"] in {"unresolved", "no_entry_price", "no_current_price"}
+
+
+async def test_x_alerts_entry_price_uses_batched_query_per_source(client, db, monkeypatch):
+    """Regression guard for BL-NEW-DASHBOARD-X-ALERTS-TIMEOUT-FIX.
+
+    The entry-price preload must issue EXACTLY ONE query per source
+    table for all resolved coin_ids — not one per row. Previously the
+    per-row 5-source-table BETWEEN sweep scaled at O(N rows x 5
+    queries) and tripped the 5s frontend timeout at limit=80 (prod
+    9.3s 2026-05-21). The batched form collapses to a constant 5
+    queries regardless of row count.
+
+    This test inserts multiple alerts referencing the same coin_id,
+    runs the endpoint, and asserts that each entry-price source
+    table appears in exactly one SELECT.
+    """
+    import dashboard.db as ddb
+
+    c = client
+    d, _db_path = db
+
+    # Insert 5 alerts with the same resolved_coin_id so the batched
+    # preload's win is exercised (5 rows -> would be 5x5=25 source
+    # queries pre-fix, but 5 total post-fix).
+    base = datetime.now(timezone.utc) - timedelta(hours=1)
+    for i in range(5):
+        await _insert_x_alert(
+            d._conn,
+            event_id=f"batch-{i}",
+            tweet_author="alice",
+            tweet_id=str(900 + i),
+            received_at=(base - timedelta(minutes=i * 10)).isoformat(),
+            extracted_cashtag="$BATCH",
+            resolved_coin_id="batch-coin",
+            classifier_confidence=0.80,
+        )
+
+    captured_sql: list[str] = []
+    original_execute = ddb.aiosqlite.Connection.execute
+
+    async def _spy_execute(self, sql, *args, **kwargs):
+        captured_sql.append(sql)
+        return await original_execute(self, sql, *args, **kwargs)
+
+    monkeypatch.setattr(ddb.aiosqlite.Connection, "execute", _spy_execute)
+
+    resp = await c.get("/api/x_alerts?limit=10")
+    assert resp.status_code == 200
+
+    # Each entry-price source table should appear in EXACTLY ONE SELECT.
+    # The pre-fix code would have issued 5 per source table (one per row).
+    for source_table in (
+        "gainers_snapshots",
+        "losers_snapshots",
+        "volume_history_cg",
+        "volume_spikes",
+        "momentum_7d",
+    ):
+        entry_price_selects = [
+            s for s in captured_sql
+            if "BETWEEN ?" in s and f"FROM {source_table}" in s
+        ]
+        assert len(entry_price_selects) == 1, (
+            f"expected exactly 1 batched entry-price SELECT against "
+            f"{source_table}, got {len(entry_price_selects)}: {entry_price_selects}"
+        )
+
+
+async def test_x_alerts_entry_price_skips_preload_when_no_resolved_coins(client, db, monkeypatch):
+    """Empty `resolved_coin_ids` set must NOT issue entry-price preload
+    queries (would be `coin_id IN ()` syntax error)."""
+    import dashboard.db as ddb
+
+    c = client
+    d, _db_path = db
+
+    # Insert one alert with no resolved coin (cashtag-only, unresolved).
+    await _insert_x_alert(
+        d._conn,
+        event_id="no-resolved",
+        tweet_author="bob",
+        tweet_id="800",
+        received_at=datetime.now(timezone.utc).isoformat(),
+        extracted_cashtag="$UNKNOWN",
+        resolved_coin_id=None,
+        classifier_confidence=0.50,
+    )
+
+    captured_sql: list[str] = []
+    original_execute = ddb.aiosqlite.Connection.execute
+
+    async def _spy_execute(self, sql, *args, **kwargs):
+        captured_sql.append(sql)
+        return await original_execute(self, sql, *args, **kwargs)
+
+    monkeypatch.setattr(ddb.aiosqlite.Connection, "execute", _spy_execute)
+
+    resp = await c.get("/api/x_alerts?limit=10")
+    assert resp.status_code == 200
+
+    # No preload queries should have fired — the cashtag/symbol resolver
+    # still runs but the entry-price BETWEEN ? sweep against the 5 source
+    # tables must NOT appear when no coin_ids resolved.
+    entry_price_selects = [
+        s for s in captured_sql
+        if "BETWEEN ?" in s
+        and any(t in s for t in (
+            "FROM gainers_snapshots",
+            "FROM losers_snapshots",
+            "FROM volume_history_cg",
+            "FROM volume_spikes",
+            "FROM momentum_7d",
+        ))
+    ]
+    assert entry_price_selects == [], (
+        f"entry-price preload should be skipped when no coin_ids resolve, "
+        f"got: {entry_price_selects}"
+    )

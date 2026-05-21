@@ -1569,8 +1569,15 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
         # `extracted_cashtag` (multiple tweets about the same token).
         # Without these caches the endpoint ran 80 × N sequential sqlite
         # queries and timed out at >12s for limit=80 (verified 2026-05-19).
+        #
+        # entry_price_data (added 2026-05-21 per BL-NEW-DASHBOARD-X-ALERTS-TIMEOUT-FIX):
+        # pre-loaded once per request as dict[coin_id, list[(ts, price)]]
+        # covering the global window across all resolved rows. Replaces the
+        # per-row 5-source-table BETWEEN queries that scaled at O(N rows
+        # x 5 queries) and tripped the 5s frontend timeout at limit=80.
         symbol_cache: dict[str, tuple[str | None, str]] = {}
         current_price_cache: dict[str, float | None] = {}
+        entry_price_data: dict[str, list[tuple[datetime, float]]] = {}
 
         async def _resolve_coin_id_for_outcome(row: aiosqlite.Row) -> tuple[str | None, str]:
             resolved = row["resolved_coin_id"]
@@ -1634,7 +1641,7 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
             symbol_cache[symbol] = result
             return result
 
-        async def _price_at_alert(coin_id: str, received_at: str) -> float | None:
+        def _parse_ts(value: str | None) -> datetime | None:
             # NOTE on `received_at` shape heterogeneity: rows ingested via
             # the SQL DEFAULT (datetime('now')) at scout/db.py:3432
             # arrive as '2026-05-19 12:34:56' (space-separated, no tz, no
@@ -1643,102 +1650,112 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
             # fromisoformat accepts both since 3.11; the explicit
             # tzinfo-stamp below normalizes the naive-UTC path so the
             # downstream isoformat() bound computation is consistent.
-            def _parse_ts(value: str | None) -> datetime | None:
-                if not value:
-                    return None
-                try:
-                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                    if parsed.tzinfo is None:
-                        parsed = parsed.replace(tzinfo=timezone.utc)
-                    return parsed
-                except ValueError:
-                    return None
-
-            received_dt = _parse_ts(received_at)
-            # Compute the ISO-8601 bounds once instead of per-query.
-            # All time columns in the source tables store ISO-8601 strings
-            # which sort lexicographically the same as parsed datetimes —
-            # so we can compare strings directly, letting SQLite use the
-            # existing (coin_id, time_col) indexes. The previous
-            # `datetime(snapshot_at) BETWEEN ...` form defeated index use.
-            if received_dt is not None:
-                lo_iso = (received_dt - timedelta(hours=24)).isoformat()
-                hi_iso = (received_dt + timedelta(hours=24)).isoformat()
-            else:
-                lo_iso = None
-                hi_iso = None
-            sources: list[tuple[datetime, float]] = []
-            source_queries = (
-                (
-                    "gainers_snapshots",
-                    "snapshot_at",
-                    "price_at_snapshot",
-                    """SELECT snapshot_at AS ts, price_at_snapshot AS price
-                       FROM gainers_snapshots
-                       WHERE coin_id = ?
-                         AND price_at_snapshot IS NOT NULL
-                         AND snapshot_at BETWEEN ? AND ?""",
-                ),
-                (
-                    "losers_snapshots",
-                    "snapshot_at",
-                    "price_at_snapshot",
-                    """SELECT snapshot_at AS ts, price_at_snapshot AS price
-                       FROM losers_snapshots
-                       WHERE coin_id = ?
-                         AND price_at_snapshot IS NOT NULL
-                         AND snapshot_at BETWEEN ? AND ?""",
-                ),
-                (
-                    "volume_history_cg",
-                    "recorded_at",
-                    "price",
-                    """SELECT recorded_at AS ts, price AS price
-                       FROM volume_history_cg
-                       WHERE coin_id = ?
-                         AND price IS NOT NULL
-                         AND recorded_at BETWEEN ? AND ?""",
-                ),
-                (
-                    "volume_spikes",
-                    "detected_at",
-                    "price",
-                    """SELECT detected_at AS ts, price AS price
-                       FROM volume_spikes
-                       WHERE coin_id = ?
-                         AND price IS NOT NULL
-                         AND detected_at BETWEEN ? AND ?""",
-                ),
-                (
-                    "momentum_7d",
-                    "detected_at",
-                    "current_price",
-                    """SELECT detected_at AS ts, current_price AS price
-                       FROM momentum_7d
-                       WHERE coin_id = ?
-                         AND current_price IS NOT NULL
-                         AND detected_at BETWEEN ? AND ?""",
-                ),
-            )
-            if lo_iso is None or hi_iso is None:
-                # received_at unparseable — preserve old behavior of
-                # passing the raw value to the BETWEEN bounds, which the
-                # original sqlite `datetime(?,'-24 hours')` form would
-                # have produced as None and matched nothing. Return None
-                # so the caller's "no_entry_price" path fires.
+            if not value:
                 return None
-            for _table, _time_col, _price_col, sql in source_queries:
-                for price_row in await _safe_fetchall(sql, (coin_id, lo_iso, hi_iso)):
-                    parsed_ts = _parse_ts(price_row["ts"])
-                    if parsed_ts and price_row["price"] and price_row["price"] > 0:
-                        sources.append((parsed_ts, float(price_row["price"])))
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed
+            except ValueError:
+                return None
 
+        # Per-source-table query templates for batch entry-price preload.
+        # `?` for the IN-list of coin_ids is filled at query time; the
+        # window bounds are the union of all per-row 24h windows.
+        entry_price_source_queries = (
+            (
+                "gainers_snapshots",
+                """SELECT coin_id, snapshot_at AS ts, price_at_snapshot AS price
+                   FROM gainers_snapshots
+                   WHERE coin_id IN ({placeholders})
+                     AND price_at_snapshot IS NOT NULL
+                     AND snapshot_at BETWEEN ? AND ?""",
+            ),
+            (
+                "losers_snapshots",
+                """SELECT coin_id, snapshot_at AS ts, price_at_snapshot AS price
+                   FROM losers_snapshots
+                   WHERE coin_id IN ({placeholders})
+                     AND price_at_snapshot IS NOT NULL
+                     AND snapshot_at BETWEEN ? AND ?""",
+            ),
+            (
+                "volume_history_cg",
+                """SELECT coin_id, recorded_at AS ts, price AS price
+                   FROM volume_history_cg
+                   WHERE coin_id IN ({placeholders})
+                     AND price IS NOT NULL
+                     AND recorded_at BETWEEN ? AND ?""",
+            ),
+            (
+                "volume_spikes",
+                """SELECT coin_id, detected_at AS ts, price AS price
+                   FROM volume_spikes
+                   WHERE coin_id IN ({placeholders})
+                     AND price IS NOT NULL
+                     AND detected_at BETWEEN ? AND ?""",
+            ),
+            (
+                "momentum_7d",
+                """SELECT coin_id, detected_at AS ts, current_price AS price
+                   FROM momentum_7d
+                   WHERE coin_id IN ({placeholders})
+                     AND current_price IS NOT NULL
+                     AND detected_at BETWEEN ? AND ?""",
+            ),
+        )
+
+        async def _preload_entry_price_data(
+            coin_ids: list[str],
+            window_lo: datetime,
+            window_hi: datetime,
+        ) -> None:
+            """One-shot batch load of entry-price source rows for all
+            resolved coin_ids over the union window. Mutates
+            `entry_price_data` in place. Indexes (coin_id, time_col)
+            on all 5 source tables make IN-list + BETWEEN fast.
+
+            Per BL-NEW-DASHBOARD-X-ALERTS-TIMEOUT-FIX 2026-05-21:
+            replaces O(N rows x 5 queries) with O(5 queries) total.
+            """
+            if not coin_ids:
+                return
+            placeholders = ",".join("?" * len(coin_ids))
+            lo_iso = window_lo.isoformat()
+            hi_iso = window_hi.isoformat()
+            for _table, sql_template in entry_price_source_queries:
+                sql = sql_template.format(placeholders=placeholders)
+                params = tuple(coin_ids) + (lo_iso, hi_iso)
+                for price_row in await _safe_fetchall(sql, params):
+                    parsed_ts = _parse_ts(price_row["ts"])
+                    price = price_row["price"]
+                    if parsed_ts and price and price > 0:
+                        entry_price_data.setdefault(
+                            price_row["coin_id"], []
+                        ).append((parsed_ts, float(price)))
+
+        async def _price_at_alert(coin_id: str, received_at: str) -> float | None:
+            """Closest-prior-snapshot if exists within ±24h of received_at,
+            else earliest-after within window. Reads from prebuilt
+            `entry_price_data` (no per-row SQL queries).
+            """
+            received_dt = _parse_ts(received_at)
+            if received_dt is None:
+                # received_at unparseable — preserve old behavior of
+                # returning None so the caller's "no_entry_price" path
+                # fires.
+                return None
+            window_lo = received_dt - timedelta(hours=24)
+            window_hi = received_dt + timedelta(hours=24)
+            all_sources = entry_price_data.get(coin_id) or []
+            sources = [
+                (ts, price)
+                for ts, price in all_sources
+                if window_lo <= ts <= window_hi
+            ]
             if not sources:
                 return None
-
-            if received_dt is None:
-                return sorted(sources, key=lambda item: item[0], reverse=True)[0][1]
-
             before = [(ts, price) for ts, price in sources if ts <= received_dt]
             if before:
                 return sorted(before, key=lambda item: item[0], reverse=True)[0][1]
@@ -1763,9 +1780,9 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
             current_price_cache[coin_id] = None
             return None
 
-        async def _outcome(row: aiosqlite.Row) -> dict:
+        async def _outcome(row: aiosqlite.Row, resolved: tuple[str | None, str]) -> dict:
             investment = 300.0
-            coin_id, status = await _resolve_coin_id_for_outcome(row)
+            coin_id, status = resolved
             base = {
                 "outcome_investment_usd": investment,
                 "outcome_coin_id": coin_id,
@@ -1830,10 +1847,45 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                 "asset_url_source": outcome.get("outcome_status") or "unresolved",
             }
 
-        alerts = []
+        # PASS 1: resolve coin_ids per row (cached via symbol_cache).
+        # Collect resolved (coin_id, received_at) tuples so the batched
+        # entry-price preload knows which coin_ids + window to fetch for.
+        resolutions: list[tuple[str | None, str]] = []
+        resolved_received_at: list[datetime] = []
+        resolved_coin_ids: set[str] = set()
         for row in rows:
+            res = await _resolve_coin_id_for_outcome(row)
+            resolutions.append(res)
+            coin_id_for_row, _status = res
+            if coin_id_for_row:
+                resolved_coin_ids.add(coin_id_for_row)
+                parsed_received = _parse_ts(row["received_at"])
+                if parsed_received is not None:
+                    resolved_received_at.append(parsed_received)
+
+        # Batched entry-price preload — one query per source table for
+        # ALL coin_ids across the union of per-row 24h windows. Replaces
+        # the per-row 5-source-table BETWEEN sweep that scaled at
+        # O(N rows x 5 queries) and tripped the 5s frontend timeout at
+        # limit=80 (verified prod 2026-05-21: 9.3s @ limit=80).
+        if resolved_coin_ids and resolved_received_at:
+            window_lo = min(resolved_received_at) - timedelta(hours=24)
+            window_hi = max(resolved_received_at) + timedelta(hours=24)
+            # Bound IN-list size to avoid SQLite SQLITE_MAX_VARIABLE_NUMBER
+            # (default 999); each query consumes len(coin_ids)+2 binds.
+            # In practice resolved_coin_ids fits in well under 100 even
+            # at limit=200; the slice is defensive.
+            await _preload_entry_price_data(
+                sorted(resolved_coin_ids)[:500],
+                window_lo,
+                window_hi,
+            )
+
+        # PASS 2: build outcomes + asset links + response rows.
+        alerts = []
+        for row, resolved in zip(rows, resolutions):
             text = row["tweet_text"] or ""
-            outcome = await _outcome(row)
+            outcome = await _outcome(row, resolved)
             asset_link = _asset_link(row, outcome)
             alerts.append(
                 {
