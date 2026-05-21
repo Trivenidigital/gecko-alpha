@@ -16,9 +16,9 @@ PR #220 found GoldRush `historical_by_addresses_v2` is daily-only. Operator lean
 - Minute-aggregate candles (1, 5, 15) — supports deriving 30m as a return between two 5m candles.
 
 **Critical pre-registrations (NOT vendor-flexible):**
-- 30m horizon is a **return between two 5m candles**, NEVER an OHLCV composite.
-- Pool selection uses **current `reserve_in_usd` as a proxy** for "primary pool at call_ts"; drift caveat surfaced in schema.
-- Only **~15% of source_calls** (the `dex:chain:contract` subset) are ever eligible regardless of vendor.
+- 30m horizon is a **return between two 5m candles**, NEVER an OHLCV composite. **Bucket convention is half-open `[start, start+300)`**; an instant T exactly on a 5m boundary belongs to the bucket starting at T, NOT the preceding one. Anchor = `floor(call_ts_unix / 300) * 300`.
+- Pool selection uses **current `reserve_in_usd` as a proxy** for "primary pool at call_ts"; drift caveat surfaced in schema (`pool_drift_risk_flag` banded by call_ts age; band thresholds flagged as `placeholder_pending_empirical_calibration` until a Phase-2 sweep calibrates them).
+- Only **~15% of source_calls** (the `dex:chain:contract` subset) are ever eligible regardless of vendor — and 202 is the **OPTIMISTIC upper bound**; the realistic floor will be observed empirically (subtracting pre-graduation, lookback-excluded, chain-map-unsupported).
 
 ## 2. What this packet IS and IS NOT
 
@@ -39,11 +39,11 @@ These MUST be answered before the sample script runs.
 
 | # | Decision | Notes |
 |---|---|---|
-| 1 | **Vendor target if sample passes:** GT free (no SLA, beta) OR CG Pro (paid Analyst+, SLA)? | If CG Pro, budget BEFORE sample run. Schema records vendor as a dimension; switch is reversible. |
-| 2 | **202-row V1 ceiling:** ACCEPT and file `BL-NEW-SOURCE-CALL-IDENTITY-RESOLUTION` upstream BL? OR reject this BL until identity is solved first? | Without identity work, dashboard's `not_rankable_label` may never flip. |
-| 3 | **30m derivation policy:** confirm pre-registration "close-at-5m-bucket return" — NEVER OHLCV composite. | Locks the measurement; future implementer cannot redefine. |
-| 4 | **Pool selection rule v2 (honest):** GT cannot return reserves AT call_ts. V1 uses *current* `reserve_in_usd` as a proxy + `pool_drift_risk_flag` band based on `(now - call_ts).days`. ACCEPT? | Alternative: require operator to manually-curate the pool per token (doesn't scale). |
-| 5 | **Sample call budget:** authorize **exactly 6 GT public API calls** (N=3 tokens × 2 calls each: oldest/median/newest `dex:*` `call_ts`)? OR scope down to 1 token (oldest only, 2 calls)? | 6-call budget is well under 30 req/min cap. |
+| 1 | **Vendor target if sample passes:** GT free (no SLA, beta) OR CG Pro (paid Analyst+, SLA)? | CG Pro Analyst tier is ~$129/mo (operator: verify current pricing — number is illustrative, not committed). Schema records vendor as a dimension; switch is reversible. If CG Pro, budget BEFORE sample run. |
+| 2 | **202-row OPTIMISTIC ceiling:** 202 is the upper bound assuming ALL pools resolve, ALL OHLCV returns, etc. Realistic floor (post pre-graduation, lookback-cap, chain-map-unsupported) could be <50. ACCEPT this ceiling + file `BL-NEW-SOURCE-CALL-IDENTITY-RESOLUTION` upstream BL? OR reject this BL until identity is solved first? | Without identity work, dashboard's `not_rankable_label` may never flip. Sample script will report empirical attenuation factor. |
+| 3 | **30m derivation policy:** confirm pre-registration "close-at-5m-bucket return" with half-open `[start, start+300)` convention + `floor(call_ts_unix / 300) * 300` anchor — NEVER OHLCV composite. | Locks the measurement; future implementer cannot redefine. |
+| 4 | **Pool selection rule v2 (honest):** GT cannot return reserves AT call_ts. V1 uses *current* `reserve_in_usd` as a proxy + `pool_drift_risk_flag` band based on `(now - call_ts).days`. Band thresholds are `placeholder_pending_empirical_calibration`. ACCEPT? | Alternative: require operator to manually-curate the pool per token (doesn't scale). Phase-2 BL will calibrate the bands. |
+| 5 | **Sample call budget:** authorize **exactly 6 GT public API calls** (N=3 tokens × 2 calls each: oldest/median/newest `dex:*` `call_ts`)? OR scope down to 1 token (oldest only, 2 calls)? **Note:** parent design `design_source_call_price_coverage_expansion_2026_05_21.md` §sample-budget pre-committed "max 1 approved call per vendor" — this packet proposes raising that to 6 because (a) GT is free / no credit cost, (b) narrow-only-oldest can't distinguish "GT broken" from "this one token broken." Operator approval at this row constitutes the override. | 6-call budget well under 30 req/min cap. |
 
 Sample script does not run until each is answered. The packet does not assume answers.
 
@@ -136,12 +136,12 @@ Sample is ACCEPTED only if all 7 hold:
 | Criterion 4 fails (5m not supported) | Re-scope: shift to 15m × 2 OR shift primary horizon to 15m. Re-park if neither works. |
 | Criterion 5 fails (no rate-limit observability) | Sharpen the script's clock-based pacing audit. Not a hard reject. |
 | Criterion 6 fails (round-trip uses wrong field) | Implementer error in v2 — fix script, re-run sample. Not a vendor problem. |
-| Criterion 7 fails (lookback cap shorter than 7mo) | Empirically record cap, narrow `eligible-row` set, recompute coverage ceiling. Operator-decided in follow-up plan. |
+| Criterion 7 fails (lookback cap shorter than 7mo) | Pre-registered shape: cap eligible rows to `call_ts >= (now - observed_cap_days)`. Sample script records `observed_cap_days` as the largest call_ts age for which OHLCV was non-empty. Numeric value still operator-decided in follow-up plan; the **shape** of the config is pre-registered here. |
 | 1-2/3 tokens resolve, 1-2/3 don't | Record attenuation factor. Proceed only if criterion 1 floor met (≥1). |
 
 ## 7. Pre-graduation Solana pump.fun token classification
 
-If a sampled token's contract suffix is `pump` (Solana pump.fun bonding-curve convention) AND `/pools` returns 0 pools, the script classifies as `bonding_curve_pre_graduation` — NOT `gt_no_coverage`. These are structurally unbackfillable on GT until the token graduates to Raydium. Distinct from delisted / lookback-cap failures.
+If a sampled token's contract suffix is `pump` (Solana pump.fun bonding-curve convention) AND `/pools` returns 0 pools, the script classifies as `bonding_curve_pre_graduation_unverified` — NOT `gt_no_coverage`, and NOT raw `bonding_curve_pre_graduation`. These are likely-but-not-confirmed structurally unbackfillable on GT until the token graduates to Raydium. The `_unverified` suffix surfaces the residual risk: a tiny fraction of non-pump tokens may share the `pump` address suffix, AND a token in the transient graduation window may show 0 pools momentarily. Operator follow-up may verify via DexScreener or Raydium-specific endpoint; sample script does NOT spend an extra call here.
 
 ## 8. Risks (operator visibility)
 
