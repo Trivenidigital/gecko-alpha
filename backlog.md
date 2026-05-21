@@ -26,6 +26,17 @@
 | WATCHDOG-LIVE | prod crontab has `*/10 * * * * /root/gecko-alpha/scripts/source-calls-lag-watchdog.sh` |
 | PRICE-COVERAGE-LIMITED | prod `source_calls`: 14 `price_at_call`, 0 rows with 1h/6h/24h forward pct; handled by `BL-NEW-SOURCE-CALL-PRICE-COVERAGE-EXPANSION` |
 
+### BL-NEW-SOURCE-CALL-CRON-TICK-WATCHDOG: detect writer cron outages independently of upstream traffic
+**Status:** SHIPPED-IN-PR 2026-05-21 — folded into existing `scripts/source-calls-lag-watchdog.sh` via writer-heartbeat check (branch: `feat/source-call-cron-tick-watchdog`).
+**Tag:** `observability` `silent-failure-prevention` `cron` `section-12a`
+**Why:** `source-calls-lag-watchdog` reads `MAX(upstream_ts) - MAX(source_calls_ts)` — Class-1 silent-failure (CLAUDE.md §12a) when writer cron stops AND upstream is also quiet (both timestamps stale → lag delta stays small → no alert). Writer is idempotent and fires on empty upstream too, so writer-staleness IS independently detectable via heartbeat.
+**Action:** Add `--heartbeat-file` to `scripts/source_calls_live_writer.py` (touch on exit 0). Add `--writer-heartbeat-file` / `--writer-threshold-minutes` to `scripts/check_source_calls_lag.py` with three statuses: `writer_stale` (mtime > threshold), `writer_heartbeat_missing` (file absent + ledger has rows), `writer_heartbeat_pending` (file absent + empty ledger; alert-suppressed first-run with 24h escalation to `writer_never_fired`). Wire through `source-calls-lag-watchdog.sh` with differentiated plain-prose alert text + §12b `*_alert_dispatched/delivered/failed` log triplet.
+**Hermes-first:** KEEP_CUSTOM — checked Hermes skill hub (`hermes-agent.nousresearch.com/docs/skills`) and `awesome-hermes-agent` topic; no cron/heartbeat/cadence-monitoring skill exists. webhook-subscriptions is event-driven push, not pull-cadence; weights-and-biases is MLOps experiment logging. Project-internal observability of a project-internal Python writer.
+**Cost:** ~120 LOC additive (no new bash script, no new cron line, no new state dir beyond writer-heartbeat path). 16 new tests across 3 test files; 5 pre-existing lag-watchdog tests preserved.
+**Activation:** operator sets `WRITER_HEARTBEAT_FILE=/var/lib/gecko-alpha/source-calls/writer-heartbeat` in `/root/gecko-alpha/.env` + `mkdir -p /var/lib/gecko-alpha/source-calls && chmod 0755 /var/lib/gecko-alpha/source-calls`. No `crontab` reload needed (no managed-block change).
+**Kill criterion:** 2026-08-21 (90 days post-deploy) — revert via `unset WRITER_HEARTBEAT_FILE` if zero real `writer_stale`/`writer_heartbeat_missing`/`writer_never_fired` fires by that date; treat as infra-debt per CLAUDE.md §10. Operator may extend if observed reliability data warrants.
+**Files:** `scripts/source_calls_live_writer.py`, `scripts/source-calls-live-writer.sh`, `scripts/check_source_calls_lag.py`, `scripts/source-calls-lag-watchdog.sh`, `tests/test_source_calls_live_writer.py`, `tests/test_check_source_calls_lag.py` (new), `tests/test_source_calls_lag_watchdog.py`, `tasks/plan_source_call_cron_tick_watchdog.md`, `tasks/design_source_call_cron_tick_watchdog.md`.
+
 ### BL-NEW-DASHBOARD-SOURCE-CALL-QUALITY-SURFACE: dashboard surface over `source_calls`
 **Status:** PROPOSED 2026-05-20 — follow-up after BL-NEW-SOURCE-CALL-OUTCOME-LEDGER ships and accumulates/backfills rows.
 **Tag:** `dashboard` `source-quality` `read-only` `trader-cockpit`

@@ -14,6 +14,12 @@ Operator-visible alerting is intentionally NOT here. The lag watchdog
 (scripts/source-calls-lag-watchdog.sh) owns Telegram dispatch; the writer
 emits stdout JSON for journal capture.
 
+Optional `--heartbeat-file PATH` touches the given path on success so the
+lag watchdog can detect writer-cron outages independently of upstream
+traffic. Touch failures are logged as a structured warning but do NOT
+fail the writer — the absent / stale heartbeat surfaces to the watchdog
+on its next tick as `writer_heartbeat_missing` / `writer_stale`.
+
 Exit codes:
   0 — success (zero inserts/updates is still success when upstream is empty)
   1 — DB missing or runtime error
@@ -62,9 +68,40 @@ async def _run(db_path: str) -> dict:
     }
 
 
+def _touch_heartbeat(path: Path) -> None:
+    """Best-effort heartbeat touch. Failures log but do not propagate.
+
+    Per CLAUDE.md memory `feedback_resilience_layered_failure_modes`:
+    failing to touch is observable to the lag watchdog (file mtime stays
+    stale -> alert fires), so best-effort here does NOT swallow the
+    failure — it relocates the operator-visible surface to the watchdog
+    read-path.
+    """
+    log = structlog.get_logger()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
+    except OSError as err:
+        log.warning(
+            "source_calls_heartbeat_touch_failed",
+            path=str(path),
+            errno=err.errno,
+            error=str(err),
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default="scout.db")
+    parser.add_argument(
+        "--heartbeat-file",
+        default=None,
+        help=(
+            "Optional. Touch this file on successful run (mtime = now). "
+            "Consumed by source-calls-lag-watchdog to detect writer cron "
+            "outages independently of upstream traffic."
+        ),
+    )
     args = parser.parse_args()
 
     db_path = Path(args.db).expanduser()
@@ -94,6 +131,8 @@ def main() -> int:
         return 1
 
     result["ok"] = True
+    if args.heartbeat_file:
+        _touch_heartbeat(Path(args.heartbeat_file).expanduser())
     print(json.dumps(result, sort_keys=True, default=str))
     return 0
 

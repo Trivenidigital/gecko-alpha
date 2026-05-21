@@ -9,6 +9,8 @@ Stubs:
     test-controlled exit code + JSON body on stdout.
   * curl — captures the args the wrapper would have sent to Telegram so the
     test can assert on the dispatched message (parse_mode=, chat_id, text).
+    Echoes a configurable HTTP code (default 200) to stdout for the
+    wrapper's -w "%{http_code}" capture.
 
 Fixture write strategy: write_bytes(content.encode()) — V45 SHOULD-FIX CRLF
 guard, mirrors test_systemd_drift_watchdog.py.
@@ -48,7 +50,8 @@ def _make_python_stub(tmp_path: Path, exit_code: int, stdout_body: str) -> Path:
     return stub
 
 
-def _make_curl_stub(tmp_path: Path) -> tuple[Path, Path]:
+def _make_curl_stub(tmp_path: Path, http_code: str = "200", exit_code: int = 0) -> tuple[Path, Path]:
+    """Mock curl: append args to marker, echo HTTP code to stdout."""
     stub_dir = tmp_path / "stubs"
     stub_dir.mkdir(exist_ok=True)
     stub = stub_dir / "curl"
@@ -58,7 +61,8 @@ def _make_curl_stub(tmp_path: Path) -> tuple[Path, Path]:
         (
             "#!/usr/bin/env bash\n"
             f"echo \"curl-args: $@\" >> {quoted}\n"
-            "exit 0\n"
+            f"echo {http_code}\n"
+            f"exit {exit_code}\n"
         ).encode()
     )
     stub.chmod(0o755)
@@ -79,6 +83,7 @@ def _run(
     env_file: Path | None,
     curl_stub: Path | None = None,
     extra_args: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     if curl_stub is not None:
@@ -86,6 +91,8 @@ def _run(
     env["GECKO_PYTHON"] = str(python_stub)
     if env_file is not None:
         env["GECKO_ENV_FILE"] = str(env_file)
+    if extra_env:
+        env.update(extra_env)
     args = ["bash", str(WATCHDOG_SCRIPT), "--db", "/dev/null"]
     if extra_args:
         args.extend(extra_args)
@@ -171,3 +178,225 @@ def test_unknown_argument_exits_64(tmp_path):
     )
     assert res.returncode == 64, (res.stdout, res.stderr)
     assert "unknown argument" in res.stderr
+
+
+# ----- Writer-side branch tests (new in BL-NEW-SOURCE-CALL-CRON-TICK-WATCHDOG) -----
+
+
+def test_writer_stale_alert_text_says_last_succeeded(tmp_path):
+    """When the Python check returns status=writer_stale, alert text must
+    use the honest 'last SUCCEEDED' wording, not 'last fired' — mtime only
+    advances on successful runs, so the operator-facing phrasing must
+    differentiate (Reviewer-A C2)."""
+    body = (
+        '{"ok":false,"status":"writer_stale","detail":{"age_minutes":47.2,'
+        '"threshold_minutes":20,"path":"/var/lib/heartbeat",'
+        '"last_writer_success_at":"2026-05-21T00:00:00+00:00"}}'
+    )
+    python_stub = _make_python_stub(tmp_path, exit_code=5, stdout_body=body)
+    env_file = _write_env_file(tmp_path, token="tok", chat_id="chat")
+    curl_stub, marker = _make_curl_stub(tmp_path)
+
+    res = _run(python_stub, env_file=env_file, curl_stub=curl_stub)
+
+    assert res.returncode == 1, (res.stdout, res.stderr)
+    assert marker.exists()
+    payload = marker.read_text()
+    assert "writer cron stale" in payload
+    assert "last SUCCEEDED" in payload, (
+        "Reviewer-A C2: must say 'last SUCCEEDED' not 'last fired' — "
+        "mtime advances only on success, so the wording must be honest "
+        "about the semantic distinction"
+    )
+
+
+def test_writer_heartbeat_missing_alert_text_explains_cause(tmp_path):
+    body = (
+        '{"ok":false,"status":"writer_heartbeat_missing","detail":{'
+        '"path":"/var/lib/heartbeat","ledger_has_rows":true}}'
+    )
+    python_stub = _make_python_stub(tmp_path, exit_code=5, stdout_body=body)
+    env_file = _write_env_file(tmp_path, token="tok", chat_id="chat")
+    curl_stub, marker = _make_curl_stub(tmp_path)
+
+    res = _run(python_stub, env_file=env_file, curl_stub=curl_stub)
+
+    assert res.returncode == 1, (res.stdout, res.stderr)
+    payload = marker.read_text()
+    assert "writer heartbeat missing" in payload
+    assert "ledger has rows" in payload, (
+        "alert body must explain why this is distinct from writer_stale"
+    )
+
+
+def test_writer_never_fired_alert_text_explains_24h_escalation(tmp_path):
+    body = (
+        '{"ok":false,"status":"writer_never_fired","detail":{'
+        '"path":"/var/lib/heartbeat","age_hours":25.0,"escalation_hours":24}}'
+    )
+    python_stub = _make_python_stub(tmp_path, exit_code=5, stdout_body=body)
+    env_file = _write_env_file(tmp_path, token="tok", chat_id="chat")
+    curl_stub, marker = _make_curl_stub(tmp_path)
+
+    res = _run(python_stub, env_file=env_file, curl_stub=curl_stub)
+
+    assert res.returncode == 1, (res.stdout, res.stderr)
+    payload = marker.read_text()
+    assert "writer never fired" in payload
+    assert ">24h" in payload, "alert must mention the 24h escalation threshold"
+
+
+def test_writer_pending_returns_zero_no_alert(tmp_path):
+    """First-run guard: heartbeat absent + ledger empty + age < 24h →
+    Python returns exit 0 with status=writer_heartbeat_pending → wrapper
+    treats as healthy, no Telegram dispatch."""
+    body = (
+        '{"ok":true,"status":"writer_heartbeat_pending","detail":{'
+        '"path":"/var/lib/heartbeat","ledger_has_rows":false,"alert_suppressed":true}}'
+    )
+    python_stub = _make_python_stub(tmp_path, exit_code=0, stdout_body=body)
+    env_file = _write_env_file(tmp_path, token="tok", chat_id="chat")
+    curl_stub, marker = _make_curl_stub(tmp_path)
+
+    res = _run(python_stub, env_file=env_file, curl_stub=curl_stub)
+
+    assert res.returncode == 0, (res.stdout, res.stderr)
+    assert not marker.exists()
+
+
+def test_telegram_delivery_failure_exits_7_emits_failed_log(tmp_path):
+    """Reviewer-B §12b triplet: HTTP non-200 → exit 7 + structured
+    alert_failed log line (NOT alert_delivered)."""
+    body = (
+        '{"ok":false,"status":"writer_stale","detail":{"age_minutes":50}}'
+    )
+    python_stub = _make_python_stub(tmp_path, exit_code=5, stdout_body=body)
+    env_file = _write_env_file(tmp_path, token="tok", chat_id="chat")
+    curl_stub, marker = _make_curl_stub(tmp_path, http_code="500", exit_code=0)
+
+    res = _run(python_stub, env_file=env_file, curl_stub=curl_stub)
+
+    assert res.returncode == 7, (res.stdout, res.stderr)
+    assert "ALERT_FAILED_DELIVERY:" in res.stderr
+    assert "source_calls_lag_alert_failed" in res.stderr
+    assert "source_calls_lag_alert_delivered" not in res.stderr
+    assert "source_calls_lag_alert_dispatched" in res.stderr
+
+
+def test_section_12b_log_triplet_on_success(tmp_path):
+    body = (
+        '{"ok":false,"status":"writer_stale","detail":{"age_minutes":50}}'
+    )
+    python_stub = _make_python_stub(tmp_path, exit_code=5, stdout_body=body)
+    env_file = _write_env_file(tmp_path, token="tok", chat_id="chat")
+    curl_stub, marker = _make_curl_stub(tmp_path, http_code="200")
+
+    res = _run(python_stub, env_file=env_file, curl_stub=curl_stub)
+
+    assert res.returncode == 1
+    # All three triplet lines must appear on stderr (journal capture).
+    assert "source_calls_lag_alert_dispatched" in res.stderr
+    assert "source_calls_lag_alert_delivered" in res.stderr
+    assert "source_calls_lag_alert_failed" not in res.stderr
+
+
+def test_writer_args_passed_through_to_python(tmp_path):
+    """Wrapper must pass --writer-heartbeat-file and --writer-threshold-minutes
+    through to the Python check."""
+    python_stub_dir = tmp_path / "stubs"
+    python_stub_dir.mkdir(exist_ok=True)
+    args_capture = tmp_path / "py_args_capture"
+    quoted = shlex.quote(str(args_capture))
+    python_stub = python_stub_dir / "python_stub"
+    python_stub.write_bytes(
+        (
+            "#!/usr/bin/env bash\n"
+            f"echo \"$@\" > {quoted}\n"
+            'echo \'{"ok":true,"unledgered_tg":0,"unledgered_x":0}\'\n'
+            "exit 0\n"
+        ).encode()
+    )
+    python_stub.chmod(0o755)
+
+    env = os.environ.copy()
+    env["GECKO_PYTHON"] = str(python_stub)
+    env["WRITER_HEARTBEAT_FILE"] = "/tmp/heartbeat"
+    env["WRITER_THRESHOLD_MINUTES"] = "30"
+
+    res = subprocess.run(
+        ["bash", str(WATCHDOG_SCRIPT), "--db", "/dev/null"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, (res.stdout, res.stderr)
+    captured = args_capture.read_text()
+    assert "--writer-heartbeat-file /tmp/heartbeat" in captured
+    assert "--writer-threshold-minutes 30" in captured
+
+
+def test_writer_branch_disabled_by_default(tmp_path):
+    """No WRITER_HEARTBEAT_FILE env → writer-branch args NOT passed to
+    Python (back-compat)."""
+    python_stub_dir = tmp_path / "stubs"
+    python_stub_dir.mkdir(exist_ok=True)
+    args_capture = tmp_path / "py_args_capture"
+    quoted = shlex.quote(str(args_capture))
+    python_stub = python_stub_dir / "python_stub"
+    python_stub.write_bytes(
+        (
+            "#!/usr/bin/env bash\n"
+            f"echo \"$@\" > {quoted}\n"
+            'echo \'{"ok":true,"unledgered_tg":0,"unledgered_x":0}\'\n'
+            "exit 0\n"
+        ).encode()
+    )
+    python_stub.chmod(0o755)
+
+    env = os.environ.copy()
+    env["GECKO_PYTHON"] = str(python_stub)
+    # Explicitly clear in case parent shell has it set
+    env.pop("WRITER_HEARTBEAT_FILE", None)
+
+    res = subprocess.run(
+        ["bash", str(WATCHDOG_SCRIPT), "--db", "/dev/null"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0
+    captured = args_capture.read_text()
+    assert "--writer-heartbeat-file" not in captured
+    assert "--writer-threshold-minutes" not in captured
+
+
+def test_alert_body_does_not_leak_raw_json_braces_in_writer_stale_text(tmp_path):
+    """Reviewer-A I3 regression guard: when alert text quotes detail=,
+    the operator sees the JSON appended for diagnosis, but the leading
+    text must be human-prose, not the JSON itself."""
+    body = (
+        '{"ok":false,"status":"writer_stale","detail":{"age_minutes":47.2}}'
+    )
+    python_stub = _make_python_stub(tmp_path, exit_code=5, stdout_body=body)
+    env_file = _write_env_file(tmp_path, token="tok", chat_id="chat")
+    curl_stub, marker = _make_curl_stub(tmp_path)
+
+    res = _run(python_stub, env_file=env_file, curl_stub=curl_stub)
+
+    assert res.returncode == 1
+    payload = marker.read_text()
+    # The alert body must START with human prose, not JSON
+    # Extract the "text=" arg value
+    import urllib.parse
+    # curl-args dump contains: --data-urlencode text=<the alert>
+    # Parse out the alert body
+    text_marker = "text="
+    text_idx = payload.find(text_marker)
+    assert text_idx != -1
+    alert_body = payload[text_idx + len(text_marker):].split("'")[0].split('"')[0]
+    # First 80 chars should be prose, not a brace
+    head = alert_body.strip()[:80]
+    assert "source-calls-lag-watchdog" in head
+    assert not head.startswith("{"), (
+        f"Alert body must lead with prose, not raw JSON. Got: {head!r}"
+    )

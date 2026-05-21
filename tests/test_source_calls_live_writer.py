@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -252,3 +253,138 @@ def test_wrapper_delegates_to_python_cli(tmp_path):
     body = json.loads(res.stdout)
     assert body["ok"] is True
     assert "backfill" in body and "refresh" in body
+
+
+# ----- Heartbeat-file tests (BL-NEW-SOURCE-CALL-CRON-TICK-WATCHDOG) -----
+
+
+def test_writer_touches_heartbeat_on_success(tmp_path):
+    """Happy path: writer succeeds → heartbeat mtime advances to now."""
+    db = tmp_path / "scout.db"
+    _build_minimal_schema(db)
+    heartbeat = tmp_path / "writer-heartbeat"
+
+    before = time.time()
+    res = subprocess.run(
+        [
+            sys.executable,
+            str(WRITER_PY),
+            "--db",
+            str(db),
+            "--heartbeat-file",
+            str(heartbeat),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    after = time.time()
+
+    assert res.returncode == 0, (res.stdout, res.stderr)
+    assert heartbeat.exists()
+    mtime = heartbeat.stat().st_mtime
+    assert before <= mtime <= after + 1
+
+
+def test_writer_does_not_touch_heartbeat_on_db_missing(tmp_path):
+    """DB not found → exit 1 → heartbeat NOT created."""
+    heartbeat = tmp_path / "writer-heartbeat"
+    res = subprocess.run(
+        [
+            sys.executable,
+            str(WRITER_PY),
+            "--db",
+            str(tmp_path / "nonexistent.db"),
+            "--heartbeat-file",
+            str(heartbeat),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 1
+    assert not heartbeat.exists()
+
+
+def test_writer_heartbeat_arg_omitted_is_back_compat(tmp_path):
+    """No --heartbeat-file → no touch, no error, exit 0."""
+    db = tmp_path / "scout.db"
+    _build_minimal_schema(db)
+    res = subprocess.run(
+        [sys.executable, str(WRITER_PY), "--db", str(db)],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, (res.stdout, res.stderr)
+    body = json.loads(res.stdout)
+    assert body["ok"] is True
+
+
+def test_writer_heartbeat_parent_created_recursively(tmp_path):
+    """Parent dir doesn't exist yet → writer creates it via parents=True."""
+    db = tmp_path / "scout.db"
+    _build_minimal_schema(db)
+    heartbeat = tmp_path / "nested" / "subdir" / "writer-heartbeat"
+    assert not heartbeat.parent.exists()
+
+    res = subprocess.run(
+        [
+            sys.executable,
+            str(WRITER_PY),
+            "--db",
+            str(db),
+            "--heartbeat-file",
+            str(heartbeat),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, (res.stdout, res.stderr)
+    assert heartbeat.exists()
+
+
+def test_writer_heartbeat_repeated_touches_advance_mtime(tmp_path):
+    """Two consecutive writer runs → heartbeat mtime advances each time."""
+    db = tmp_path / "scout.db"
+    _build_minimal_schema(db)
+    heartbeat = tmp_path / "writer-heartbeat"
+
+    # Touch heartbeat to some old time, then run writer
+    heartbeat.touch()
+    old = time.time() - 3600
+    os.utime(heartbeat, (old, old))
+    assert heartbeat.stat().st_mtime < time.time() - 100
+
+    res = subprocess.run(
+        [
+            sys.executable,
+            str(WRITER_PY),
+            "--db",
+            str(db),
+            "--heartbeat-file",
+            str(heartbeat),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0
+    # mtime advanced (within last 10s)
+    assert heartbeat.stat().st_mtime > time.time() - 10
+
+
+def test_wrapper_passes_heartbeat_arg_through(tmp_path):
+    """WRITER_HEARTBEAT_FILE env → wrapper passes --heartbeat-file to Python."""
+    db = tmp_path / "scout.db"
+    _build_minimal_schema(db)
+    heartbeat = tmp_path / "writer-heartbeat"
+
+    env = os.environ.copy()
+    env["GECKO_PYTHON"] = sys.executable
+    env["WRITER_HEARTBEAT_FILE"] = str(heartbeat)
+
+    res = subprocess.run(
+        ["bash", str(WRAPPER), "--db", str(db)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, (res.stdout, res.stderr)
+    assert heartbeat.exists()
