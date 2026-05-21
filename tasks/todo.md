@@ -1,6 +1,6 @@
 # Backlog — gecko-alpha
 
-## Active Work: BL-NEW-SOURCE-CALL-PRICE-COVERAGE-EXPANSION
+## Active Work: BL-NEW-SOURCE-CALL-PRICE-COVERAGE-EXPANSION post-merge status
 
 - [x] Create isolated worktree from `origin/master`: `C:\projects\gecko-alpha-bl-new-source-call-price-coverage` on `plan/bl-new-source-call-price-coverage`.
 - [x] Review `tasks/lessons.md` and apply Hermes-first installed-surface rule.
@@ -14,6 +14,7 @@
 - [x] Build gate evaluated: skipped implementation because design is not trivial and reviewers required non-code folds only.
 - [x] Docs/status cleanup: backlog now records SOURCE-CALL-OUTCOME-LEDGER as MERGED / DEPLOYED / BACKFILLED / WRITER-LIVE / WATCHDOG-LIVE / PRICE-COVERAGE-LIMITED.
 - [x] Open PR and record final verification/review results: https://github.com/Trivenidigital/gecko-alpha/pull/208
+- [x] Post-merge status update: PR #208 merged as design record; backlog now says DESIGN-SHIPPED / IMPLEMENTATION-GATED.
 
 Review:
 - Baseline `uv run pytest --tb=short -q` did not reach tests because `uv` failed fetching `hatchling` from PyPI with TLS `UnknownIssuer`.
@@ -24,6 +25,8 @@ Review:
 - Backlog cleanup evidence: `origin/master` has PR #206 `aaffa6b0` and PR #207 `df76d851`; srilu `/root/gecko-alpha` HEAD is `df76d85`; prod crontab includes source-call live writer and lag watchdog; prod DB has 1,254 `source_calls`, 14 `price_at_call`, 0 forward coverage.
 - Verification: `git diff --check origin/master..HEAD` passed. `uv run pytest --tb=short -q` blocked before test collection because PyPI TLS `UnknownIssuer` prevented fetching `hatchling`.
 - PR #208 opened. No PR-review subagents were dispatched because no code was built.
+- PR #208 merged on 2026-05-21 as `d57f6d59`; GitHub Actions `test` check passed.
+- Next implementation must not start until the operator explicitly authorizes the vendor sample/timestamp-semantics check.
 - Scope remains plan/design-only unless reviewers explicitly clear a trivial implementation.
 
 ## Active Work: BL-NEW-SOURCE-CALL-OUTCOME-LEDGER
