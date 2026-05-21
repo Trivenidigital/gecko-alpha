@@ -229,10 +229,10 @@ def test_writer_heartbeat_missing_alert_text_explains_cause(tmp_path):
     )
 
 
-def test_writer_never_fired_alert_text_explains_24h_escalation(tmp_path):
+def test_writer_never_fired_alert_text_explains_escalation_threshold(tmp_path):
     body = (
         '{"ok":false,"status":"writer_never_fired","detail":{'
-        '"path":"/var/lib/heartbeat","age_hours":25.0,"escalation_hours":24}}'
+        '"path":"/var/lib/heartbeat","age_hours":7.0,"escalation_hours":6}}'
     )
     python_stub = _make_python_stub(tmp_path, exit_code=5, stdout_body=body)
     env_file = _write_env_file(tmp_path, token="tok", chat_id="chat")
@@ -243,7 +243,7 @@ def test_writer_never_fired_alert_text_explains_24h_escalation(tmp_path):
     assert res.returncode == 1, (res.stdout, res.stderr)
     payload = marker.read_text()
     assert "writer never fired" in payload
-    assert ">24h" in payload, "alert must mention the 24h escalation threshold"
+    assert ">6h" in payload, "alert must mention the escalation threshold (6h, dropped from 24h per PR review fold)"
 
 
 def test_writer_pending_returns_zero_no_alert(tmp_path):

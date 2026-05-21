@@ -148,16 +148,22 @@ def test_writer_heartbeat_missing_with_empty_ledger_exits_0_pending(tmp_path):
     assert pending_since.exists()
 
 
-def test_pending_after_24h_escalates_to_writer_never_fired(tmp_path):
-    """Pending-since older than 24h → escalate to writer_never_fired alert."""
+def test_pending_after_escalation_threshold_escalates_to_writer_never_fired(tmp_path):
+    """Pending-since older than 6h escalation threshold → writer_never_fired alert.
+
+    Threshold chosen as 6h (not 24h) per PR review fold: fresh activation
+    where operator forgot to set the .env line should surface within a
+    half-business-day, not the next morning. Plan kill criterion +
+    activation runbook are now consistent with this threshold.
+    """
     db = tmp_path / "scout.db"
     _build_db(db, with_source_calls_rows=0)
     heartbeat = tmp_path / "heartbeat"
 
-    # Pre-create the pending-since marker 25h old.
+    # Pre-create the pending-since marker 7h old (just past 6h threshold).
     pending_since = heartbeat.with_name(heartbeat.name + ".pending-since")
     pending_since.touch()
-    past = time.time() - 25 * 3600
+    past = time.time() - 7 * 3600
     os.utime(pending_since, (past, past))
 
     res = _run_check(db, heartbeat=heartbeat, writer_threshold=20)
@@ -165,8 +171,8 @@ def test_pending_after_24h_escalates_to_writer_never_fired(tmp_path):
     body = json.loads(res.stdout)
     assert body["status"] == "writer_never_fired"
     assert body["ok"] is False
-    assert body["detail"]["age_hours"] >= 24
-    assert body["detail"]["escalation_hours"] == 24
+    assert body["detail"]["age_hours"] >= 6
+    assert body["detail"]["escalation_hours"] == 6
 
 
 def test_writer_recovery_clears_pending_since(tmp_path):

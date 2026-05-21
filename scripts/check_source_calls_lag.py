@@ -31,7 +31,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-PENDING_ESCALATION_HOURS = 24
+PENDING_ESCALATION_HOURS = 6
 
 
 def _parse_utc(value: str | None) -> datetime | None:
@@ -219,6 +219,11 @@ def main() -> int:
         )
         if writer_finding is not None:
             status, detail = writer_finding
+            # Clear pending-since marker when we're in any non-pending state:
+            # the pending tracking is only meaningful while we're actively
+            # observing a first-run-empty-ledger condition (Reviewer-B I1).
+            if status != "writer_heartbeat_pending" and status != "writer_never_fired":
+                _clear_pending_since(heartbeat_path)
             payload = {
                 "ok": status == "writer_heartbeat_pending",
                 "status": status,

@@ -11,7 +11,13 @@
 #   ledger_lag                — upstream lag (existing behavior, default)
 #   writer_stale              — writer heartbeat older than threshold
 #   writer_heartbeat_missing  — heartbeat absent, ledger has rows
-#   writer_never_fired        — heartbeat absent + ledger empty > 24h
+#   writer_never_fired        — heartbeat absent + ledger empty > 6h
+#
+# Sibling state file: when the writer is in `writer_heartbeat_pending`
+# (heartbeat absent + ledger empty), the Python check creates a
+# `<heartbeat>.pending-since` sibling file. mtime tracks first
+# observation; if it persists >6h the status escalates to
+# writer_never_fired. Cleared automatically on writer recovery.
 #
 # §12b alert hygiene: parse_mode= (plain text), structured-log triplet
 # (alert_dispatched/delivered/failed) around the curl call.
@@ -82,32 +88,43 @@ if [[ "$status" -eq 0 ]]; then
     exit 0
 fi
 
-# Extract structured status from JSON's "status" field (last non-empty line
-# is parsed defensively). Falls through to "unknown" -> ledger_lag text.
-parsed_status="$(echo "$result" | python3 -c '
+# Extract structured status + detail.path from JSON's body (last non-empty
+# line is parsed defensively). The path is used in remediation hints so
+# the operator sees the actual configured path, not a fallback default.
+# Falls through to "unknown" / empty path -> ledger_lag text.
+parse_output="$(echo "$result" | python3 -c '
 import json, sys
 lines = [l for l in sys.stdin.read().splitlines() if l.strip()]
 if not lines:
-    print("unknown")
+    print("unknown\t")
     sys.exit(0)
 try:
     d = json.loads(lines[-1])
-    print(d.get("status", "unknown"))
+    status = d.get("status", "unknown")
+    path = ""
+    detail = d.get("detail")
+    if isinstance(detail, dict):
+        path = detail.get("path", "") or ""
+    print(f"{status}\t{path}")
 except Exception:
-    print("unknown")
-' 2>/dev/null || echo unknown)"
+    print("unknown\t")
+' 2>/dev/null || echo "unknown	")"
+
+parsed_status="${parse_output%%	*}"
+parsed_path="${parse_output#*	}"
+remediation_path="${parsed_path:-${WRITER_HEARTBEAT_FILE:-/var/lib/gecko-alpha/source-calls/writer-heartbeat}}"
 
 # Build operator-facing alert text — plain prose with extracted fields.
 # Body is bounded to 3500 chars to stay under Telegram's 4096 limit.
 case "$parsed_status" in
     writer_stale)
-        text="source-calls-lag-watchdog: writer cron stale — last SUCCEEDED >${WRITER_THRESHOLD_MINUTES}min ago (threshold ${WRITER_THRESHOLD_MINUTES}min). Likely cause: source-calls-live-writer cron stopped or writer is failing on every tick. Check: systemctl status cron && journalctl --since '1h ago' | grep source_calls_live_writer | tail -20. status=${status} detail=${result}"
+        text="source-calls-lag-watchdog: writer cron stale — last SUCCEEDED >${WRITER_THRESHOLD_MINUTES}min ago (threshold ${WRITER_THRESHOLD_MINUTES}min). path=${remediation_path}. Likely cause: source-calls-live-writer cron stopped or writer is failing on every tick. Check: systemctl status cron && journalctl --since '1h ago' | grep source_calls_live_writer | tail -20. status=${status} detail=${result}"
         ;;
     writer_heartbeat_missing)
-        text="source-calls-lag-watchdog: writer heartbeat missing — ledger has rows but heartbeat file is gone. Likely cause: state-dir wiped, permission change, or WRITER_HEARTBEAT_FILE env var dropped. Check: ls -la \$(dirname ${WRITER_HEARTBEAT_FILE:-/var/lib/gecko-alpha/source-calls/writer-heartbeat}). status=${status} detail=${result}"
+        text="source-calls-lag-watchdog: writer heartbeat missing — ledger has rows but heartbeat file is gone. path=${remediation_path}. Likely cause: state-dir wiped, permission change, or WRITER_HEARTBEAT_FILE env var dropped. Check: ls -la \$(dirname ${remediation_path}). status=${status} detail=${result}"
         ;;
     writer_never_fired)
-        text="source-calls-lag-watchdog: writer never fired — heartbeat absent + ledger empty for >24h. Likely cause: writer cron line missing, .env unset, or wrapper exit on every run. Check: crontab -l | grep source-calls-live-writer && tail -50 /var/log/syslog | grep source_calls. status=${status} detail=${result}"
+        text="source-calls-lag-watchdog: writer never fired — heartbeat absent + ledger empty for >6h. path=${remediation_path}. Likely cause: writer cron line missing, .env unset, or wrapper exit on every run. Check: crontab -l | grep source-calls-live-writer && tail -50 /var/log/syslog | grep source_calls. status=${status} detail=${result}"
         ;;
     *)
         text="source-calls-lag-watchdog: source_calls ledger lagging or unreachable. status=${status} result=${result}"
