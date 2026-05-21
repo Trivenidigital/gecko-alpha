@@ -906,3 +906,34 @@ def test_cohort_digest_final_date_rejects_non_iso_string():
             ANTHROPIC_API_KEY="k",
             COHORT_DIGEST_FINAL_DATE="not-a-date",
         )
+
+
+def test_writer_heartbeat_file_field_accepted():
+    """Regression: BL-NEW-SOURCE-CALL-CRON-TICK-WATCHDOG activation puts
+    WRITER_HEARTBEAT_FILE in .env. Settings has extra='forbid' so the
+    field MUST be declared or pipeline crash-loops at startup."""
+    s = Settings(
+        _env_file=None, TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        WRITER_HEARTBEAT_FILE="/var/lib/gecko-alpha/source-calls/writer-heartbeat",
+    )
+    assert s.WRITER_HEARTBEAT_FILE == "/var/lib/gecko-alpha/source-calls/writer-heartbeat"
+
+
+def test_writer_heartbeat_file_default_empty():
+    """Default is empty (feature off / back-compat)."""
+    s = Settings(
+        _env_file=None, TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert s.WRITER_HEARTBEAT_FILE == ""
+    assert s.WRITER_THRESHOLD_MINUTES == 20
+
+
+def test_writer_threshold_minutes_override():
+    s = Settings(
+        _env_file=None, TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        WRITER_THRESHOLD_MINUTES=30,
+    )
+    assert s.WRITER_THRESHOLD_MINUTES == 30
