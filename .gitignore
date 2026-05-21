@@ -34,3 +34,9 @@ _*.py
 
 # BL-072 hook bypass audit log — local-only, not source-controlled
 .claude/hooks/bypass.log
+
+# BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-GT — vendor sample responses.
+# Operator-approved one-off API responses cached for audit. May contain
+# vendor-specific quirks; never commit. Sample script enforces a two-layer
+# pre-check before any call dispatches.
+tasks/vendor_samples/

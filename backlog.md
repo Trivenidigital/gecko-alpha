@@ -88,6 +88,31 @@
 
 ## Active Findings
 
+### BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-GT: vendor sample track for CG/GT (docs only)
+**Status:** PACKET-SHIPPED 2026-05-21 — operator-gated. Implementation gated on (a) 5 pre-sample operator decisions, (b) sample-call authorization, (c) sample-pass evidence.
+**Why:** PR #220 found GoldRush `historical_by_addresses_v2` is daily-only. Operator leans path C (CG/GT). This BL files the CoinGecko MCP / GeckoTerminal evaluation through Hermes-first lens + produces operator-facing decision packet.
+**Action:** Docs-only PR. Adds plan (`tasks/plan_source_call_price_coverage_sample_cg_gt_2026_05_21.md`), design (`tasks/design_source_call_price_coverage_sample_cg_gt_2026_05_21.md`), decision packet (`tasks/vendor_sample_decision_packet_cg_gt_2026_05_21.md`), `.gitignore` entry for `tasks/vendor_samples/`. No code. No vendor calls. No prod DB writes.
+**Hermes-first:** KEEP_CUSTOM — Hermes skill hub + awesome-hermes-agent ecosystem + srilu-installed skills (20+) all checked, none own OHLCV/historical-price. CG MCP server is an MCP protocol surface, not a Hermes-managed skill. GT public API (free, no key, 30 req/min) recommended as first sample.
+**Critical findings surfaced:**
+- 30m is NOT a native candle interval; design pre-registers 30m as a *return* between two 5m candles, NEVER an OHLCV composite.
+- GT's `reserve_in_usd` is current-state, not historical at call_ts → pool selection is honestly a "current_reserve_proxy_v1" rule with explicit drift caveat.
+- Only ~15% of source_calls (202 dex:chain:contract rows) are EVER eligible regardless of vendor; recommendation: ACCEPT 202-row V1 ceiling + file `BL-NEW-SOURCE-CALL-IDENTITY-RESOLUTION` upstream.
+- 7mo source-call corpus; sample probes GT lookback boundary via oldest-token-day; failure → narrowed eligibility, operator-decided.
+**Files:** `tasks/plan_*.md`, `tasks/design_*.md`, `tasks/vendor_sample_decision_packet_cg_gt_2026_05_21.md`, `.gitignore`.
+
+### BL-NEW-SOURCE-CALL-IDENTITY-RESOLUTION: resolve NULL / "(unresolved)" / non-dex source_calls token_ids
+**Status:** PROPOSED 2026-05-21 — surfaced by CG/GT sample track. Blocks dashboard's `not_rankable_label` from flipping to "rankable."
+**Why:** Of 1323 `source_calls` rows, only 202 (~15%) carry `dex:chain:contract` IDs that any vendor can backfill. 460 are NULL token_id, 578 are literal "(unresolved)", 83 are misc coin_ids. The vendor-side coverage problem cannot be solved by a better vendor — the upstream identity-resolution problem is the real blocker.
+**Action:** Future plan/design. Investigate why TG/X scrapers don't resolve contract addresses for ~85% of mentions. Probably needs (a) regex extraction improvement, (b) coin_resolver Hermes skill integration, (c) DexScreener / token-page lookup fallback. Out of scope for the CG/GT sample track.
+**Trigger condition:** evidence-gated. Plan starts after the CG/GT sample track produces ≥1 successful row in `source_call_price_observations` — i.e., when the vendor side is unblocked AND the identity side becomes the binding constraint.
+**Hermes-first:** likely use existing `coin_resolver` skill (already installed on srilu). KEEP_CUSTOM only for the gecko-alpha-side glue.
+
+### BL-NEW-GT-CHAIN-MAP-EXTENSION: extend `_geckoterminal_network_for_chain` to cover bsc / monad / hyperevm
+**Status:** PROPOSED 2026-05-21 — surfaced by CG/GT sample track Reviewer A.C2.
+**Why:** Source_calls `dex:*` rows include bsc=19, monad=2, hyperevm=1 which the in-tree GT chain mapper doesn't cover. Sample script will raise explicitly on these; production backfill would silently skip them.
+**Action:** Add network mappings (`bsc → "bsc"`, `monad → "monad"` if GT supports, etc.) to `scout/ingestion/geckoterminal.py:_geckoterminal_network_for_chain`. Verify each via a one-off GT `/networks` discovery call (free, ~2 calls).
+**Trigger condition:** evidence-gated. File after the CG/GT sample passes for solana/ethereum/base; the 22 affected rows are small enough that V1 backfill can proceed without them.
+
 ### BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-FIX
 **Status:** PARTIAL-SHIPPED 2026-05-20 — Step 1 instrumentation deployed on srilu-vps (commit `3af48d9`); the actual Step 4 timeout/runtime fix is filed as separate follow-up `BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-APPLY` pending operator decision on which path (parallelize vs extend) based on the empirical evidence.
 **Why:** Hermes narrative scanner cron (`gecko-x-narrative-scanner`) hits the 120s `_get_script_timeout()` budget on busy cycles. Pre-instrumentation evidence: ~40% of recent cycles exceeded 120s. The pre-existing log only emitted `Duration: 136.0s` without per-stage attribution — making any fix shape speculative.
