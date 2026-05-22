@@ -1,5 +1,28 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-22 — Historical pool-selection probe packet (operator-authorized)
+
+**Status:** PACKET-SHIPPED-AUTHORIZED. Operator authorized budget (max 10 GT free calls, 2-3 old tokens, findings-only). Packet: `tasks/probe_packet_historical_pool_selection_2026_05_22.md`.
+
+Target tokens (Solana-only, non-pump, oldest first):
+- A: 2025-10-20 CIPHER (cornerstone — same as failed oldest in PR #223 sample)
+- B: 2026-01-06 `3wh5z...` (~4mo old)
+- C: 2026-02-09 `J3DpH...` (~3mo old)
+
+Call allocation: 4 + 3 + 3 = 10 calls hard cap. Per-token: 1 `/pools` + 2-3 `/ohlcv` against non-top-reserve pools.
+
+**What ships in this PR:**
+- `tasks/probe_packet_historical_pool_selection_2026_05_22.md`
+- backlog status flip: `BL-NEW-SOURCE-CALL-HISTORICAL-POOL-SELECTION-PROBE` PROPOSED → **PACKET-SHIPPED-AUTHORIZED**
+- todo.md session record
+
+**What does NOT ship:**
+- No vendor calls (operator runs the probe script next)
+- No code change
+- No prod DB writes
+
+**Next:** operator runs the probe (~10 GT free calls); findings doc gets filed in a follow-up docs PR.
+
 ## Active Work: 2026-05-22 — GT findings correction + new historical-pool-selection BL
 
 **Trigger:** operator ran the authorized lookback-cap probe (`BL-NEW-SOURCE-CALL-GT-LOOKBACK-CAP-PROBE`). 3 GT free OHLCV calls. No prod writes. Temp files cleaned.
