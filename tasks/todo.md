@@ -1,5 +1,34 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-22 — GT sample-run findings (BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-GT)
+
+**Status:** SAMPLE-RUN-FAILED. 2/7 criteria failed (criterion 2 OHLCV-for-every-resolved + criterion 7 oldest-lookback). Implementation gate STAYS CLOSED. Findings recorded in `tasks/findings_source_call_gt_sample_2026_05_22.md`.
+
+### Sample inputs (3 dex:* rows)
+- Oldest 2025-10-20 Solana `Ciphern...` (non-pump): 20 pools resolved, OHLCV **401 / zero candles** → criterion 7 FAIL
+- Median 2026-04-27 Solana `*pump`: 6 pools resolved, OHLCV **300 5m candles**, epoch-second → clean pass
+- Newest 2026-05-21 Solana `*pump`: **0 pools** → classified `bonding_curve_pre_graduation_unverified` per packet §7
+
+### Headline finding
+GT free returns HTTP 401 on historical OHLCV beyond an undocumented recency cap. 7-month corpus cannot be backfilled via GT free as a single source.
+
+### Three forward paths (operator-decided)
+- [ ] Path 1: Narrow GT eligibility to recent call_ts only. Trigger: `BL-NEW-SOURCE-CALL-GT-LOOKBACK-CAP-PROBE` (binary-search GT cap, ~3 calls).
+- [ ] Path 2: Try CG Pro for older history. Trigger: `BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-PRO` (paid, ~$129/mo, packet TBD).
+- [ ] Path 3: Treat GT as forward-only. Trigger: `BL-NEW-SOURCE-CALL-FORWARD-ONLY-COVERAGE` (plan + design + impl).
+
+### What ships in this PR
+- `tasks/findings_source_call_gt_sample_2026_05_22.md` (the evidence doc)
+- backlog status flip for the parent BL (PACKET-SHIPPED → SAMPLE-RUN-FAILED)
+- 3 new BL entries for the three forward paths
+- todo.md session record
+
+### What does NOT ship
+- No `_fetch_snapshot_rows` change
+- No schema migration
+- No vendor calls (the sample script lives only in operator-local env)
+- No prod DB writes
+
 ## Active Work: 2026-05-21 evening — BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-GT (docs only)
 
 **Status:** PACKET-SHIPPED (PR pending). Docs only. No code. No vendor calls. No prod DB writes.

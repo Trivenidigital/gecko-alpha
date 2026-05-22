@@ -88,8 +88,8 @@
 
 ## Active Findings
 
-### BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-GT: vendor sample track for CG/GT (docs only)
-**Status:** PACKET-SHIPPED 2026-05-21 — operator-gated. Implementation gated on (a) 5 pre-sample operator decisions, (b) sample-call authorization, (c) sample-pass evidence.
+### BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-GT: vendor sample track for CG/GT
+**Status:** SAMPLE-RUN-FAILED 2026-05-22 — sample executed under conservative defaults; 2/7 criteria failed. Implementation gate STAYS CLOSED. See `tasks/findings_source_call_gt_sample_2026_05_22.md` for evidence. Original packet PR #222 merged `c08c910b` (docs-only). Three forward paths filed as separate BLs (GT-LOOKBACK-CAP-PROBE / SAMPLE-CG-PRO / FORWARD-ONLY-COVERAGE) — operator-decided.
 **Why:** PR #220 found GoldRush `historical_by_addresses_v2` is daily-only. Operator leans path C (CG/GT). This BL files the CoinGecko MCP / GeckoTerminal evaluation through Hermes-first lens + produces operator-facing decision packet.
 **Action:** Docs-only PR. Adds plan (`tasks/plan_source_call_price_coverage_sample_cg_gt_2026_05_21.md`), design (`tasks/design_source_call_price_coverage_sample_cg_gt_2026_05_21.md`), decision packet (`tasks/vendor_sample_decision_packet_cg_gt_2026_05_21.md`), `.gitignore` entry for `tasks/vendor_samples/`. No code. No vendor calls. No prod DB writes.
 **Hermes-first:** KEEP_CUSTOM — Hermes skill hub + awesome-hermes-agent ecosystem + srilu-installed skills (20+) all checked, none own OHLCV/historical-price. CG MCP server is an MCP protocol surface, not a Hermes-managed skill. GT public API (free, no key, 30 req/min) recommended as first sample.
@@ -99,6 +99,28 @@
 - Only ~15% of source_calls (202 dex:chain:contract rows) are EVER eligible regardless of vendor; recommendation: ACCEPT 202-row V1 ceiling + file `BL-NEW-SOURCE-CALL-IDENTITY-RESOLUTION` upstream.
 - 7mo source-call corpus; sample probes GT lookback boundary via oldest-token-day; failure → narrowed eligibility, operator-decided.
 **Files:** `tasks/plan_*.md`, `tasks/design_*.md`, `tasks/vendor_sample_decision_packet_cg_gt_2026_05_21.md`, `.gitignore`.
+
+### BL-NEW-SOURCE-CALL-GT-LOOKBACK-CAP-PROBE: empirically establish GT free's historical cap
+**Status:** PROPOSED 2026-05-22 — only run if operator picks Path 1 of `findings_source_call_gt_sample_2026_05_22.md`.
+**Why:** Sample run 2026-05-22 showed GT free returns HTTP 401 on OHLCV fetch for 2025-10-20 token, but works fine for 2026-04-27. The cap is between 1 and 7 months but exact boundary unknown.
+**Action:** 2-3 additional GT public API calls probing intermediate ages (e.g., 2 months, 4 months). Operator-authorized + budget-explicit. Output is empirical `observed_cap_days` value that the pre-registered eligibility-cap config can use.
+**Cost:** ~3 GT public API calls, free, no API key.
+**Trigger condition:** evidence-gated on operator picking Path 1.
+
+### BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-PRO: evaluate CG Pro's lookback vs GT free
+**Status:** PROPOSED 2026-05-22 — only file detailed packet if operator picks Path 2 of `findings_source_call_gt_sample_2026_05_22.md`.
+**Why:** GT free failed criterion 7 (oldest lookback). If CG Pro has deeper history, the older `source_calls` corpus becomes recoverable. Open question: is CG Pro's data the same GT data behind a Pro paywall (no lookback advantage), or does CG Pro maintain longer history independently?
+**Action:** Future packet (mirror of PR #222 shape) targeting CG Pro `/onchain/networks/{network}/pools/{pool_address}/ohlcv/{timeframe}`. Includes cost commitment (~$129/mo Analyst tier; verify current pricing). Sample call requires paid Pro API key.
+**Cost:** ~$129/mo subscription + 1 sample call. Operator pre-budget.
+**Trigger condition:** evidence-gated on operator picking Path 2.
+
+### BL-NEW-SOURCE-CALL-FORWARD-ONLY-COVERAGE: GT-free backfill from now onward, accept zero historical
+**Status:** PROPOSED 2026-05-22 — only plan if operator picks Path 3 of `findings_source_call_gt_sample_2026_05_22.md`.
+**Why:** GT free works for recent tokens. Treating coverage as forward-only (new `source_calls` rows get full coverage; older rows accept "no forward coverage" permanently) avoids vendor cost AND avoids waiting on identity-resolution upstream BL.
+**Action:** Plan + design + impl PR for `source_call_price_observations` write path that only fires on new rows. Schema records `coverage_eligibility_anchor_ts` so downstream consumers know "rows older than X have no coverage by design."
+**Cost:** Implementation effort (~design from parent PR #208 + GT-specific code). No vendor cost.
+**Trade-off:** Dashboard's `not_rankable_label` takes months to flip — coverage grows organically only on new rows. Acceptable IF operator prioritizes speed-of-shipping over historical-backfill.
+**Trigger condition:** evidence-gated on operator picking Path 3.
 
 ### BL-NEW-SOURCE-CALL-IDENTITY-RESOLUTION: resolve NULL / "(unresolved)" / non-dex source_calls token_ids
 **Status:** PROPOSED 2026-05-21 — surfaced by CG/GT sample track. Blocks dashboard's `not_rankable_label` from flipping to "rankable."
