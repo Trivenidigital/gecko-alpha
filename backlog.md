@@ -1,5 +1,49 @@
 # gecko-alpha — Backlog
 
+## Close-Development Park List 2026-05-22
+
+Operator close-development block 2026-05-22 explicitly parks the following items. **All entries listed below are PARKED — NOT FORGOTTEN.** They remain individually tracked in their existing locations; this section is the consolidated index so future sessions don't accidentally re-scope them.
+
+**Parked until price-coverage / probe decision:**
+- `BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-PRO` — gated on operator picking Path 2 (CG Pro paid)
+- `BL-NEW-SOURCE-CALL-FORWARD-ONLY-COVERAGE` — gated on operator picking Path 3 (GT-free forward-only)
+- `BL-NEW-DASHBOARD-SOURCE-CALL-QUALITY-SURFACE` — gated on source_calls having priced outcomes
+- `BL-NEW-X-KOL-COST-GOVERNOR` — gated on source_calls X-handle cohort rankability
+- Any KOL / TG / X ranking or pruning surface — gated on source_calls coverage
+
+**Parked until actionability data gate clears (`n_actionable >= 20 AND n_exploratory >= 5`):**
+- Actionability v2 (suppression policy, capital reallocation, classifier changes)
+- Source-quality gate consumption
+- Actionability classifier changes
+- Current n: actionable=21, exploratory=3. Next trigger: ~2026-05-25 to 2026-05-29. See `tasks/findings_actionability_gate_check_2026_05_22.md`.
+
+**Parked until operator decision (no engineering work pending):**
+- Operator-alert activation (`BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE` ENDPOINT-SHIPPED / HERMES-SKILL-PENDING — see runbook)
+- PR #33 design review (paper-trade edge detection)
+- Social denominator B / C variants
+- Cron / revival watchdog scheduling
+- First-signal soak until 2026-05-31 gate
+- CG Pro paid sample
+
+**Low-priority hygiene only (file when work resumes, do not pre-scope):**
+- MiroFish debug noise
+- Scanner exception bounding
+- `datetime.utcnow` deprecation cleanup
+- `print`/log consistency
+- Deploy CRLF / filemode hygiene (BL-NEW-DEPLOY-FILEMODE-CRLF-HYGIENE re-evaluated at next deploy per its own trigger gate)
+
+---
+
+## Open PRs Held for Design Review
+
+### BL-NEW-PR-33-DESIGN-REVIEW-REQUIRED: paper-trade edge detection PR pending design review
+**Status:** OPEN / DESIGN-REVIEW-REQUIRED / NO IMPLEMENTATION ACTION 2026-05-22 — PR #33 ("feat(bl-050): paper-trade edge detection — transition gate for first_signal entries"; +2654/-18 LOC; mergeStateStatus DIRTY since 2026-05-18) remains open per operator directive. Do not merge, do not close, do not rebase. Design-review session has not yet been scheduled. Touches `scout/main.py`, `scout/db.py`, `scout/config.py`, `scout/heartbeat.py`, `scout/trading/qualifier_state.py` (NEW), `scout/trading/signals.py`.
+**Why kept open:** transition-gate logic (open on entry into qualifier set, not current-state membership) is operator-validated as the right shape, but the implementation predates several upstream changes (BL-067 conviction-lock, actionability gate, BL-NEW-AUTOSUSPEND-FIX) and needs reconciliation. Operator decision: hold for dedicated design review, not implementation tweaks.
+**Action when authorized:** schedule design-review pass, rebase on master, reconcile against shipped primitives, re-test, then merge or re-design as warranted.
+**Hermes-first:** N/A — internal trading logic, no Hermes surface.
+
+---
+
 ## Priority Legend
 - **P0** — Blocking: must complete before first live run
 - **P1** — High: significantly improves signal quality or production readiness
@@ -234,6 +278,7 @@
 **Why:** Current paper trades mix decision-bearing and exploratory cohorts. The 2026-05-19 profit-pattern analysis found sharp separation between profitable current-regime patterns (`narrative_prediction`, `chain_completed`, `volume_spike`) and junk/exploratory patterns (`losers_contrarian`, weak `gainers_early`, low-n `trending_catch`).
 **Evidence:** `tasks/findings_profit_patterns_2026_05_19.md`
 **Decision:** Complete. `paper_trades.actionable`, `actionability_reason`, and `actionability_version` now mark decision-bearing vs exploratory cohorts without suppressing raw signal collection. 24h validation remains a separate evidence gate in `tasks/runbook_actionability_validation_2026_05_19.md`.
+**Data-gate check 2026-05-22 (close-dev block P4):** THIN. n_actionable_closed=21 (≥20 ✓), n_exploratory_closed=3 (<5 ✗); no early-fire trip; actionable cohort positive (+$224.58 / 19 wins / 2 losses / 90.5% WR). Next data-bound trigger: `n_exploratory_closed ≥ 5`, est. 2026-05-25 to 2026-05-29 at current exploratory closure rate (~0.92/day). No v2 / suppression action taken. See `tasks/findings_actionability_gate_check_2026_05_22.md`.
 
 ### BL-NEW-ACTIONABILITY-GATE-V1-IMPLEMENT
 **Status:** SHIPPED 2026-05-19 — PR #181 merged `7506adc`; deployed to srilu and verified with fresh stamped rows 2206-2208. PR #182 merged/deployed `32df89d` for dashboard/API visibility.
@@ -242,12 +287,12 @@
 **Plan:** `tasks/plan_actionability_gate_v1.md`
 
 ### BL-NEW-X-OUTCOME-LINKAGE
-**Status:** DESIGN-MERGED / ACTIONABILITY-RUNBOOK-GATED / IMPLEMENTATION-PENDING-N-SUFFICIENT 2026-05-21 — design doc merged via PR #184 as `2e2f506c` (squash 2026-05-21). Re-check gate symmetric per overnight decision harvest. **Primary (implementation-eligibility) clause:** n_actionable_closed≥20 AND n_exploratory_closed≥5. **Early-fire re-evaluation triggers** (any triggers a *re-validation pass*, not automatic implementation start): (a) ≥1 exploratory closed with `pnl_usd > 0` (false-negative signal); (b) n_exploratory≥5 AND ≥4 losses with one-sided binomial 95% LB exceeding null (loss-rate > 50% baseline); (c) n_actionable≥15 AND cohort `total_pnl<-$50`. **Multi-clause precedence:** if multiple clauses fire, treat as independent investigation tracks, not summed evidence. Current n=7+2 (insufficient on all four). Implementation does NOT start unless the primary clause triggers AND the re-validation pass confirms the gate's intent holds.
+**Status:** DESIGN-MERGED / ACTIONABILITY-RUNBOOK-GATED / IMPLEMENTATION-PENDING-N-SUFFICIENT 2026-05-21 — design doc merged via PR #184 as `2e2f506c` (squash 2026-05-21). Re-check gate symmetric per overnight decision harvest. **Primary (implementation-eligibility) clause:** n_actionable_closed≥20 AND n_exploratory_closed≥5. **Early-fire re-evaluation triggers** (any triggers a *re-validation pass*, not automatic implementation start): (a) ≥1 exploratory closed with `pnl_usd > 0` (false-negative signal); (b) n_exploratory≥5 AND ≥4 losses with one-sided binomial 95% LB exceeding null (loss-rate > 50% baseline); (c) n_actionable≥15 AND cohort `total_pnl<-$50`. **Multi-clause precedence:** if multiple clauses fire, treat as independent investigation tracks, not summed evidence. Current n (close-dev check 2026-05-22): **n_actionable=21, n_exploratory=3** — primary clause short by 2 exploratory closures; early-fire (a) fires weakly (1 exploratory win), early-fire (b) and (c) clearly NOT met (cohort is positive). Implementation does NOT start unless the primary clause triggers AND the re-validation pass confirms the gate's intent holds.
 **Why:** X handle ranking is blocked: 215 X alerts had 0 priced outcomes because `resolved_coin_id`/pricing linkage is missing.
 **Scope:** Persist `resolved_coin_id`, `x_handle`, outcome status, entry/current price, and $300 notional P&L.
 
 ### BL-NEW-TG-OUTCOME-LINKAGE
-**Status:** DESIGN-MERGED / ACTIONABILITY-RUNBOOK-GATED / IMPLEMENTATION-PENDING-N-SUFFICIENT 2026-05-21 — same merge as BL-NEW-X-OUTCOME-LINKAGE; design doc in PR #184 (`2e2f506c`). Same symmetric re-check gate. TG side is already structurally FK-linked via `tg_social_signals.paper_trade_id`; the design covers the `linkage_state` disambiguator + backfill + unified view.
+**Status:** DESIGN-MERGED / ACTIONABILITY-RUNBOOK-GATED / IMPLEMENTATION-PENDING-N-SUFFICIENT 2026-05-21 — same merge as BL-NEW-X-OUTCOME-LINKAGE; design doc in PR #184 (`2e2f506c`). Same symmetric re-check gate. **Current n (close-dev check 2026-05-22): n_actionable=21, n_exploratory=3 — gate not yet met.** TG side is already structurally FK-linked via `tg_social_signals.paper_trade_id`; the design covers the `linkage_state` disambiguator + backfill + unified view.
 **Why:** TG channel ranking is blocked: only 2 current-regime closed linked trades, both low-n losses.
 **Scope:** Persist and dashboard `tg_channel`, `resolution_state`, `posted_at`, `paper_trade_id`, and `mcap_at_sighting`.
 
@@ -1155,6 +1200,8 @@ ssh root@89.167.116.187 "journalctl -u gecko-pipeline --since '<post-merge times
 **Decision-by:** 2 weeks (mirrors BL-NEW-CG-RATE-LIMITER-BURST-PROFILE / BL-NEW-CG-LANE-ORDER-HELD-POSITION-FIRST cadence).
 
 ### BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE: wire push-notification for narrative_alert_dispatcher 503 misconfig (Path C1)
+**Close-dev 2026-05-22 status anchor:** OPERATOR-GATED — no operator authorization received in the 2026-05-22 close-development block. Cost-of-activation already reduced to "copy-paste 4 SKILL sections + set 2 env secrets" per `tasks/runbook_operator_alert_skill_patch_2026_05_21.md`. **Three concrete operator inputs blocking activation:** (1) `OPERATOR_ALERT_HMAC_SECRET` (generate via `python3 -c "import secrets; print(secrets.token_hex(32))"`), (2) set same value on srilu `/root/gecko-alpha/.env` AND `/home/gecko-agent/.hermes/.env`, (3) apply SKILL.md patch + restart relevant services + run smoke test (501→401 without HMAC, signed POST works, temporary narrative-secret failure triggers operator-alert delivery + Telegram landing, narrative secret restored). When authorized: flip to full SHIPPED after smoke confirms operator_alert_dispatched + operator_alert_delivered log triplet fires.
+
 **Status:** ENDPOINT-SHIPPED / HERMES-SKILL-PENDING 2026-05-18 — PR #176 merged `012e67c` at 2026-05-18T23:52:24Z. Gate fired at activation time (204 rows in `narrative_alerts_inbound` vs ≥10 threshold). `scout/api/internal_alert.py` adds POST `/api/internal/operator-alert`, HMAC-authed via the parameterized `_verify_hmac` from `scout/api/narrative.py` against the new independent `OPERATOR_ALERT_HMAC_SECRET` (Reviewer 1 P1 fold — breaks the circular gating that would have made the documented smoke-test impossible). Calls `scout.alerter.send_telegram_message(parse_mode=None, raise_on_failure=True)` with §12b dispatched / delivered / failed log triplet. Router wired into `dashboard/api.py` with the same stub-503 pattern as the narrative router. 17 tests in `tests/test_internal_alert_api.py` cover: feature-gate 503, missing-headers 401, bad-sig 403, replay 409, invalid-payload 400, delivery success 200, delivery failure 502, log-triplet ordering, four secret-leakage scans, and four gate-independence cases (Reviewer 1 P1 regression coverage). Original PROPOSED 2026-05-13.
 
 **Why ENDPOINT-SHIPPED instead of full SHIPPED (Reviewer 1 P2 phased discipline):** the gecko-alpha endpoint is live but the Hermes-side dispatcher still uses Path B log-only until both (a) `OPERATOR_ALERT_HMAC_SECRET` is set on srilu `.env`, (b) `/home/gecko-agent/.hermes/skills/narrative_alert_dispatcher/SKILL.md` is updated to POST to `/api/internal/operator-alert` with that secret, AND (c) a smoke test confirms the dispatcher's HMAC POST reaches the endpoint and `operator_alert_dispatched` fires on gecko-alpha. Smoke-test shape: unset `NARRATIVE_SCANNER_HMAC_SECRET` on gecko-alpha + restart + the dispatcher should detect the narrative-side 503 and POST to `/api/internal/operator-alert` — which works because it authenticates with the independent `OPERATOR_ALERT_HMAC_SECRET`. A Telegram alert should land. Flip to full `SHIPPED` only after that.
