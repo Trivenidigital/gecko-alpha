@@ -356,19 +356,30 @@ def test_locked_params_osmo_regression_pin():
 
 @pytest.mark.asyncio
 async def test_compute_stack_returns_int(db):
-    """T3c — compute_stack returns int >= 0; counts at least 1 source."""
+    """T3c — compute_stack returns int >= 0; counts at least 1 source.
+
+    Window: compute_stack uses [opened_at, min(opened_at + 504h, now)].
+    `opened_at` must be set dynamically so the inserted snapshot at
+    `now` falls within the 504h window. Previously hard-coded to
+    2026-05-01, which silently fell out of window once "now" crossed
+    2026-05-22 — caught by CI 2026-05-22.
+    """
     from scout.trading.conviction import compute_stack
 
-    now = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    # opened_at = 1h ago so the snapshot inserted at `now` is guaranteed
+    # to be within [opened_at, opened_at + 504h] regardless of calendar.
+    opened_at = (now_dt - timedelta(hours=1)).isoformat()
     await db._conn.execute(
         "INSERT INTO gainers_snapshots "
         "(coin_id, symbol, name, price_change_24h, market_cap, volume_24h, "
         " price_at_snapshot, snapshot_at) "
         "VALUES ('test-coin', 'TEST', 'Test', 12.0, 5000000, 1000, 1.0, ?)",
-        (now,),
+        (now_iso,),
     )
     await db._conn.commit()
-    n = await compute_stack(db, "test-coin", "2026-05-01T00:00:00+00:00")
+    n = await compute_stack(db, "test-coin", opened_at)
     assert isinstance(n, int)
     assert n >= 1
 
