@@ -2537,3 +2537,77 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 - Every candidate has a visible verdict, entry-quality label, evidence surfaces, risk badges, and refusal reason when rejected.
 - TG/X and KOL context remains excluded from rank/score until source-call coverage becomes rankable.
 - The endpoint is read-only and has tests proving no `paper_trades` / signal params / live execution writes.
+
+### BL-NEW-SIGNAL-TRUST-ROADMAP: convert Gecko-Alpha from signal collector to trustable signal system
+**Status:** PROPOSED 2026-05-22 - filed from trader-lens review. Core verdict: Gecko-Alpha is not yet trustable enough for blind live trading, but it is a credible experimental signal lab. The system can surface candidates worth investigating; it should not yet autonomously decide sizing, pruning, or live execution.
+**Tag:** `signals` `trust` `actionability` `hermes-first` `live-readiness`
+**Why:** The signal layer has uneven maturity. `chain_completed` and `volume_spike` currently feel more useful than raw TG/X noise; `actionable=1` and `would_be_live=1` are strong filters; source-call health correctly warns when KOL/TG/X is not rankable. But narrative predictions can still create paper trades while their own reasoning says "weak fit"; TG/X remains unresolved/noisy; and open paper trades are too broad to be treated as a trustable signal surface.
+
+**Trust boundary captured:**
+- Trust today: pipeline is observable, actionability stamps exist, `would_be_live=1` is a strong extra filter, chain_completed + volume_spike are useful, and the system can say "not rankable yet."
+- Do not trust today: TG/X as direct entries, KOL ranking, narrative predictions as standalone entries, broad open-paper-trade lists, automatic live allocation, or source pruning.
+- Target state: every signal family has an explicit maturity state and can be used only at its allowed maturity level.
+
+**Hermes-first posture:** Hermes should help classify, explain, compare, and summarize signal quality. Hermes must not be load-bearing for price truth, execution, PnL attribution, chain identity, or KOL ranking before price coverage is rankable.
+
+| Signal trust domain | Hermes role | Decision |
+|---|---|---|
+| Narrative quality and counter-risk | classify "weak fit", dead_project, weak_community, already_peaked, fake catalyst, copycat meta | BRIDGE_TO_HERMES / USE_AS_ENRICHMENT |
+| Trader-readable signal explanation | explain why a signal family fired and why it may be dangerous | BRIDGE_TO_HERMES if available; otherwise local prompt contract |
+| Similar historical winners/losers | summarize comparable prior cases using already-trusted DB facts | USE_AS_ENRICHMENT only |
+| Signal maturity, PnL cohorts, source ranking | none for truth computation | KEEP_CUSTOM |
+| Price, identity, execution, PnL | none | KEEP_CUSTOM |
+
+**Child backlog sequence:**
+
+1. **BL-NEW-SIGNAL-MATURITY-TAXONOMY** - Give every signal family an explicit maturity state.
+   - Example states: `trusted_experimental`, `context_only`, `data_insufficient`, `quarantined`, `retire_candidate`.
+   - Initial expected mapping: chain_completed and volume_spike are `trusted_experimental`; narrative_prediction is `needs_hard_filter`; TG/X is `context_only`; first_signal remains soak-gated until 2026-05-31.
+   - Must be derived from current prod evidence, not vibes.
+
+2. **BL-NEW-SIGNAL-FAMILY-SCORECARDS** - Build per-signal scorecards.
+   - For each signal_type: 7d/14d/30d opens, closes, net PnL, win rate, average PnL, median PnL, max loss, open count, actionable pass rate, would_be_live pass rate, and current maturity state.
+   - Include sample-size warnings and Wilson/bootstrap guards where useful.
+   - No automatic parameter changes in V1.
+
+3. **BL-NEW-ACTIONABLE-VS-WOULD-BE-LIVE-ARBITRATION** - Make disagreement explicit.
+   - Cases:
+     - `actionable=1` + `would_be_live=1`: strongest experimental candidate.
+     - `actionable=1` + `would_be_live=0`: metadata says plausible, live rules disagree; review only.
+     - `actionable=0` + `would_be_live=1`: investigate rule mismatch; do not silently trade.
+     - both false: reject unless operator explicitly overrides.
+   - Feed this into the live decision cockpit and signal scorecards.
+
+4. **BL-NEW-NARRATIVE-PREDICTION-HARD-FILTER** - Stop weak narrative predictions from becoming paper/live candidates without an explicit downgrade.
+   - If narrative reasoning or counter-risk contains weak fit, dead_project, weak_community, already_peaked, high counter-risk, or fit below configured floor, mark the candidate `watch` or `reject`.
+   - Use Hermes as enrichment/reference for semantic classification, but only structured fields may drive final filters.
+   - No suppression until plan/design verifies current prediction false-positive/false-negative cohorts.
+
+5. **BL-NEW-SIGNAL-QUARANTINE-RULES** - Formalize context-only and quarantine behavior.
+   - TG/X remains context-only until source-call price coverage and rankability gates pass.
+   - Signals with repeated stale/faded entries, unresolved identity, or missing price freshness become `quarantined` for candidate ranking but remain visible for observability.
+   - Quarantine must be reversible and operator-visible; no silent auto-disable in V1.
+
+6. **BL-NEW-SIGNAL-TRUST-DASHBOARD** - Add a signal trust panel.
+   - Show signal families by maturity state, recent PnL, sample size, actionability pass rate, `would_be_live` pass rate, current open exposure, and next data-bound gate.
+   - Avoid "best KOL" or source ranking until price coverage unlocks it.
+   - Link each signal family to examples of recent trade/watch/reject candidates.
+
+7. **BL-NEW-HERMES-SIGNAL-EXPLANATION-BRIDGE** - Use Hermes to generate concise "why this signal is interesting / dangerous" text.
+   - Inputs must be structured DB facts and current signal evidence.
+   - Output is explanation only; it cannot mutate score, price, identity, PnL, or live state.
+   - Include audit logs or cached explanation records only after a plan confirms cost/rate behavior and prompt-injection safety.
+
+**Plan/design gates before implementation:**
+1. Drift-check existing scorecard, actionability, live_eligibility, source_calls, and dashboard health surfaces.
+2. Hermes-first analysis must check installed VPS Hermes skills plus public Hermes skill hub and awesome-hermes-agent.
+3. Runtime-state verification: query current signal_params, recent per-signal PnL, actionability cohorts, source-call rankability, and prediction counter-risk fields.
+4. No live execution, sizing, pruning, auto-disable, KOL ranking, or source pruning in V1.
+5. Every signal maturity decision must include sample-size and data-quality caveats.
+
+**Acceptance for V1:**
+- Operator can answer "which signal families do I trust today?" in one panel or endpoint.
+- Every signal family has a maturity state, data-bound next gate, and refusal reason if not trusted.
+- Narrative predictions with explicit weak/unsafe reasoning are not treated as equally tradable.
+- TG/X remains context-only until price-coverage rankability unlocks source measurement.
+- Hermes explanations are present only as enrichment, never as price/PnL/identity/execution truth.

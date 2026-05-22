@@ -891,6 +891,7 @@ Current resume hook (2026-05-21, post overnight decision-harvest):
    - Price-coverage expansion (PR #208 design): operator-approved vendor sample call to GoldRush/Covalent/CoinGecko MCP
    - Source-call ranking / pruning / dashboard "best source" surfaces: blocked until price coverage materially improves
    - Live decision cockpit: BL-NEW-LIVE-DECISION-COCKPIT filed 2026-05-22 from trader-lens exercise. Goal is one per-token "trade / watch / reject / data insufficient" surface; V1 is read-only, Hermes-enriched but not Hermes-load-bearing, and must keep TG/X context-only until source-call price coverage becomes rankable.
+   - Signal trust roadmap: BL-NEW-SIGNAL-TRUST-ROADMAP filed 2026-05-22. Goal is per-signal maturity states, scorecards, actionability-vs-would_be_live arbitration, narrative hard filters, and Hermes explanation bridge. V1 is read-only and must not auto-disable, prune, size, rank KOLs, or execute.
 
 4. **Health surfaces** (verified clean tonight; re-check on next operator request):
    - source_calls writer parity: 100% (tg=858/858, x=399/399)
