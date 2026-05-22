@@ -80,6 +80,48 @@ Per parallel two-vector plan review (V-A measurement / V-B vendor-safety) on PR 
 
 **Structural observation:** GT free's 30/min limit was hit at call #8 — the prior 7 calls including 0.5s inter-call sleep fell within rate budget on this script alone, but srilu-vps may have had other concurrent traffic to GT (pipeline ingestion runs every cycle). Re-run feasibility: yes, but consumes additional budget; deferred since A and B already give a directional read.
 
+## 3.5. Pre-call_ts pool distribution (post-review tightening)
+
+Per V-A reviewer IMPORTANT findings I1/I2/I3, the inference "3-of-N probed and all negative ⇒ remaining N−3 unlikely to help" was load-bearing without a distribution check. Inspecting the cached `/pools` JSON for Tokens A and B (zero additional GT calls; data already in `tasks/vendor_samples/probe_pool_selection_2026_05_22/`):
+
+### Token A — CIPHER, 20 pools by `pool_created_at`
+
+| Bucket | Count | `pool_created_at` range | Probed? |
+|---|---|---|---|
+| Pre-call_ts | **14** | 2025-09-02 to 2025-10-15 | 3 (oldest) probed; 11 unprobed |
+| Post-call_ts | 6 | 2025-10-23 to 2026-02-26 | 0 (cannot have call_ts coverage by construction) |
+
+- Top-reserve pool (skipped, V1 already failed): `6H3u1xahPNY6...` created 2025-09-05, reserve $79,651 — PRE-call_ts, but excluded by packet §6.
+- 14 pre-call_ts pools, but 13 of them (including the 3 we probed) have reserves between $737 and $4,602 — consistent with abandoned launch-era pools. Only the V1-rule top-reserve pool ($79K, already failed) and one other (`3C8ir9H85oyJ` $4,602) exceed $4K.
+- **11 pre-call_ts pools remain unprobed**: 1 at $79K (V1, already failed), 10 at $700–$4,600. Probing all 10 would consume 10 additional GT calls — a full second budget — and the dominant-mode evidence is that the 3 probed in the same reserve-range (~$1K–$4K) all returned 401. The probability that the 10 unprobed pools in the same reserve-range behave differently is low but not zero.
+- **Honest residual ambiguity:** GT could conceivably index OHLCV for some `~$1K-reserve` pools but not others (e.g., based on listing-date-on-GT independent of pool-creation-date). The 3-of-13 negative is a strong but not exhaustive signal.
+
+### Token B — 2026-01-06, 10 pools by `pool_created_at`
+
+| Bucket | Count | `pool_created_at` range | Probed? |
+|---|---|---|---|
+| Pre-call_ts | **9** | 2025-12-23T00:06 to 2025-12-23T12:31 (single launch day) | 2 (oldest) probed; 7 unprobed |
+| Post-call_ts | 1 | 2026-04-08 | 0 (cannot cover call_ts by construction) |
+
+- 9 of 10 pools were created within a **12-hour window on 2025-12-23**, ~14 days before call_ts — this is a launch-day liquidity cluster.
+- Top-reserve pool (skipped, V1 already failed): `3GGNTHoRZmim...` created 2025-12-23T00:25, reserve $29,889 — PRE-call_ts but in the same launch-day cluster as the 2 we probed.
+- The 2 probed pools (`8H8xAu3q...` $0 and `6caaEuZs...` $6.29 reserve) returned data only from 2025-12-22 to 2025-12-25 — the launch-day cohort went mostly inactive by Christmas, 12+ days before call_ts.
+- **7 pre-call_ts pools remain unprobed**, all from the same 12-hour launch-day cluster. They are structurally similar to the 2 probed and to the V1-skipped pool. Whether any of them stayed active longer than 2025-12-25 is the open question.
+- **Alternative reading not refuted by current evidence (V-A I2):** "GT data-completeness gap for low-volume pools" cannot be ruled out from this data alone. The 2 probed pools had only 5 + 12 candles total over ~2 days — that low candle count is itself ambiguous between "the pool only traded for 2 days then died" (liveness) and "GT indexed only 5+12 candles of a continuously-traded pool" (completeness). The PR #224 lookback-cap probe found 137/110/239 candles at 180/120/60d back on one CIPHER pool, suggesting GT's indexing is dense on at least some pools — but that says nothing about the indexing density of *these specific* dust-reserve pools.
+
+### What this implies for the recommendation
+
+Tightening §5's "structural negative" claims:
+
+1. **Token A claim "GT free doesn't index OHLCV for old/abandoned pools at all"** — supported by 3-of-13 same-reserve-range pre-call_ts pools all returning 401. Not exhaustive; the 10 unprobed dust-reserve pools could conceivably break the pattern. Hedged to: "GT free does not index OHLCV for the dominant mode of CIPHER's pre-call_ts dust-reserve pools; the 10 unprobed same-cohort pools are likely-but-not-certainly the same."
+2. **Token B claim "pools went inactive ~14d before call_ts"** — supported by candle-ts evidence on 2 probed pools from the launch-day cluster. Alternative reading "GT incompletely indexes low-volume pools" not refuted. Hedged to: "pool activity (or GT-indexed activity, which the data cannot distinguish) ended ~14d before call_ts on 2 of 9 launch-day-cluster pools."
+3. **Token A claim about unprobed-pool distribution (V-A I3 shape applied to A):** All 11 truly-unprobed pre-call_ts pools sit in the same launch-window + same dust-reserve range as the 3 probed. Structural similarity strengthens but does not guarantee identical behavior.
+
+The recommendation in §7 (PARK) remains the right call given:
+- 13 of 14 pre-call_ts pools on Token A are dust-reserve, similar to the 3 probed (all 401).
+- All 9 pre-call_ts pools on Token B are from the same 12-hour launch-cluster, similar to the 2 probed (both data-ended ~14d pre-call_ts).
+- The "GT data-completeness gap" alternative reading (V-A I2) only argues for *more uncertainty*, not for a different recommendation — under uncertainty, the operator still chooses Path 2 (paid, definitive) or Path 3 (forward-only, no historical claim needed).
+
 ## 4. Coverage matrix
 
 | Token | call_ts age | Pools in GT | Probed | Pools with OHLCV ≥1 candle | Pools covering call_ts ± 30m |
@@ -102,10 +144,12 @@ PR #225 packet §7 defined three outcome rows. After folding the V-A reviewer am
 
 The "weakened" row 3 framing matters: we have **not exhaustively tested 20 / 10 pools per token**. Strictly, the conclusion is "0 of the 3-5 oldest pools by `pool_created_at` ASC cover call_ts" — a heuristic-driven negative, not an exhaustive negative.
 
-However, two pieces of evidence strengthen the negative beyond a pure budget-limited false-NO:
+However, two pieces of evidence strengthen the negative beyond a pure budget-limited false-NO (tightened in §3.5 against the cached `/pools` JSON):
 
-1. **Token A pattern is structurally suggestive, not just heuristic-driven.** All 3 probed pools existed *before* call_ts, yet GT returned 401 on all three regardless of time window. This is consistent with "GT free does not index OHLCV for old/abandoned pools at all," not "we picked the wrong pools." That pattern would not improve by probing the other 17.
-2. **Token B pattern is structurally informative.** The 2 oldest pools have data ending ~2 weeks *before* call_ts. The 8 unprobed pools are all newer (created after 2025-12-23). Newer pools cannot have call_ts coverage on a 4-month-old call_ts unless they were created in early January 2026 — which the top-reserve pool may have been, but that's the V1 rule which already fails. No middle-aged "Goldilocks pool" appears likely.
+1. **Token A pattern is structurally suggestive, not just heuristic-driven.** Per §3.5 distribution check, Token A has 14 pre-call_ts pools and 6 post-call_ts (which cannot cover call_ts by construction). Of the 14, 13 — including the 3 probed and the V1-skipped top-reserve pool — fall in a dust-reserve range ($737–$4,602 plus the V1 outlier at $79K). The 3 probed all returned 401. 10 of the remaining 11 are dust-reserve same-cohort pools; structural similarity suggests but does not exhaustively prove same behavior. **Hedge: "the dominant mode of pre-call_ts pools is not indexed by GT free; 10 same-cohort pools remain untested."**
+2. **Token B pattern is structurally informative.** Per §3.5, 9 of 10 pools are from a single 12-hour launch-day cluster on 2025-12-23 (14 days before call_ts). 2 of those 9 were probed; both have data ending 2025-12-25. The 7 unprobed pools sit in the same launch cluster and likely-but-not-certainly behave the same. **Hedge: "the launch-day cluster mostly went dormant before call_ts on the 2 of 9 probed pools."**
+
+The V-A reviewer's alternative reading "GT data-completeness gap for low-volume pools" (V-A I2) cannot be ruled out from this data alone — but it only argues for *more uncertainty*, not a different recommendation. Under uncertainty, the operator still chooses Path 2 (paid, definitive) or Path 3 (forward-only, no historical claim needed). See §3.5 closing paragraphs.
 
 ## 6. Closes-vs-keeps-open updates
 
