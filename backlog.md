@@ -143,6 +143,19 @@
 **Action:** Add network mappings (`bsc → "bsc"`, `monad → "monad"` if GT supports, etc.) to `scout/ingestion/geckoterminal.py:_geckoterminal_network_for_chain`. Verify each via a one-off GT `/networks` discovery call (free, ~2 calls).
 **Trigger condition:** evidence-gated. File after the CG/GT sample passes for solana/ethereum/base; the 22 affected rows are small enough that V1 backfill can proceed without them.
 
+### BL-NEW-DEPLOY-FILEMODE-CRLF-HYGIENE: stop chmod/line-ending churn from blocking pulls
+**Status:** PROPOSED 2026-05-21 — surfaced during PR #220 deploy. Build-decision gate: re-evaluate if the same friction occurs on the next deploy; if it does, this is a real recurring blocker worth fixing. Otherwise, leave PROPOSED.
+**Why:** Two chronic friction sources during every deploy to srilu-vps:
+1. **Exec bits.** `scripts/source-calls-live-writer.sh`, `scripts/source-calls-lag-watchdog.sh`, `scripts/source_calls_live_writer.py` are stored in the repo at mode `100644`. Cron requires `0755`. Prod has them at `0755` from previous deploys, so `git pull` reports them as locally modified (mode-only diff) and the pull is blocked until `git stash` or `git checkout --`. After every deploy I have to `chmod +x` them again.
+2. **CRLF on dist/index.html.** `core.autocrlf` rewrites the file on checkout; `git status` then reports it as modified. Pull blocked. Resolution required `rm` of the file so git restores it cleanly from the incoming master.
+**Action (when authorized):**
+- `git update-index --chmod=+x scripts/source-calls-live-writer.sh scripts/source-calls-lag-watchdog.sh scripts/source_calls_live_writer.py` (one-time normalize).
+- Add `.gitattributes` entry: `dashboard/frontend/dist/*.html text eol=lf` (or `binary` if line endings are irrelevant).
+- Smoke: clean deploy without `stash` / `rm` workarounds.
+**Hermes-first:** N/A — repo hygiene, no external service.
+**Drift-check:** No existing `.gitattributes` (or it doesn't cover these patterns). One-time normalize is the canonical fix; this isn't a per-deploy task.
+**Trigger condition:** re-evaluate at next deploy. If pull conflicts on the SAME files for the SAME reasons, the cost-of-fix (~10 LOC) is justified. If not (e.g., next deploy is clean because no script edits), defer indefinitely.
+
 ### BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-FIX
 **Status:** PARTIAL-SHIPPED 2026-05-20 — Step 1 instrumentation deployed on srilu-vps (commit `3af48d9`); the actual Step 4 timeout/runtime fix is filed as separate follow-up `BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-APPLY` pending operator decision on which path (parallelize vs extend) based on the empirical evidence.
 **Why:** Hermes narrative scanner cron (`gecko-x-narrative-scanner`) hits the 120s `_get_script_timeout()` budget on busy cycles. Pre-instrumentation evidence: ~40% of recent cycles exceeded 120s. The pre-existing log only emitted `Duration: 136.0s` without per-stage attribution — making any fix shape speculative.
