@@ -1,5 +1,23 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-22 — Close-development block (operator-authorized)
+
+**Status:** EXECUTED — paced through 7 phases (P0 state sync → P7 final report). All docs-only changes; no code shipped this block. Two PRs from this block: #221 (BL-NEW-DEPLOY-FILEMODE-CRLF-HYGIENE filed) MERGED, #226 (historical pool-selection probe NEGATIVE findings) OPEN/under review at session end.
+
+**Phases ran:**
+- P0 state sync: prod healthy (gecko-pipeline + gecko-dashboard active, x_alerts 305ms / source_calls 59ms, heartbeat fresh).
+- P1 #221 merged (squash, 9fb1e659) — backlog docs-only, no prod pull needed.
+- P2 #33: state verified DIRTY + 2654 LOC + 32d old; left OPEN per operator directive, no merge/close. Status anchor filed (see BL-NEW-PR-33-DESIGN-REVIEW-REQUIRED below).
+- P3 BL-NEW-SOURCE-CALL-HISTORICAL-POOL-SELECTION-PROBE: ran 8/10 GT free calls under operator-authorized packet; 0 of 5 informative pool-probes covered call_ts. Token A (CIPHER 7mo): 3 oldest pools all 401. Token B (4mo): 2 oldest pools have data only ~14d pre-call_ts. Token C (3mo): rate-limited. PR #226 recommends PARK historical GT backfill; operator picks Path 2 (CG Pro paid) or Path 3 (GT-free forward-only). Two-vector plan review + findings PR review folded (V-A I1/I2/I3 hedged via §3.5 distribution analysis).
+- P4 actionability data gate: THIN. n_actionable=21 (≥20 ✓) but n_exploratory=3 (<5 ✗); no early-fire trip; actionable cohort positive (+$224.58, 19/21 wins). Next data-bound trigger: n_exp≥5, est. 2026-05-25 to 2026-05-29. See `tasks/findings_actionability_gate_check_2026_05_22.md`.
+- P5 operator-alert activation: OPERATOR-GATED (no authorization received this block). All requirements documented in `tasks/runbook_operator_alert_activation_2026_05_19.md` + `tasks/runbook_operator_alert_skill_patch_2026_05_21.md`; status anchor added to BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE.
+- P6 park-list explicit: see new section in backlog.md.
+- P7 final close-dev report: delivered to operator in conversation; this todo entry is the persisted artifact.
+
+**Recommended final implementation path:** if historical-pool-selection probe finds confirmed by operator, then either Path 2 (CG Pro paid sample) or Path 3 (forward-only). Both deferred until operator decision; no implementation work scoped this block.
+
+**Hermes-first:** N/A — close-development docs block, no new external service integration.
+
 ## Active Work: 2026-05-22 — Historical pool-selection probe packet (operator-authorized)
 
 **Status:** PACKET-SHIPPED-AUTHORIZED. Operator authorized budget (max 10 GT free calls, 2-3 old tokens, findings-only). Packet: `tasks/probe_packet_historical_pool_selection_2026_05_22.md`.
