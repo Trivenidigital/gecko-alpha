@@ -89,7 +89,7 @@
 ## Active Findings
 
 ### BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-GT: vendor sample track for CG/GT
-**Status:** SAMPLE-RUN-FAILED 2026-05-22 — sample executed under conservative defaults; 2/7 criteria failed. Implementation gate STAYS CLOSED. See `tasks/findings_source_call_gt_sample_2026_05_22.md` for evidence. Original packet PR #222 merged `c08c910b` (docs-only). Three forward paths filed as separate BLs (GT-LOOKBACK-CAP-PROBE / SAMPLE-CG-PRO / FORWARD-ONLY-COVERAGE) — operator-decided.
+**Status:** SAMPLE-RUN-FAILED-WITH-CORRECTION 2026-05-22 — sample 2/7 criteria failed AND follow-up lookback-cap probe REFUTED the original "GT free has short lookback cap" interpretation. GT free supports ≥180d historical OHLCV on at least one pool. Real blocker is historical-pool-selection (V1 `current_reserve_proxy_v1` picks today's top-reserve, which may not have existed at `call_ts`). See `tasks/findings_source_call_gt_sample_2026_05_22.md` §11 correction. Implementation gate STAYS CLOSED but rationale shifted from "vendor inadequate" to "pool-at-call identity unsolved." Next deliverable: `BL-NEW-SOURCE-CALL-HISTORICAL-POOL-SELECTION-PROBE` (filed below).
 **Why:** PR #220 found GoldRush `historical_by_addresses_v2` is daily-only. Operator leans path C (CG/GT). This BL files the CoinGecko MCP / GeckoTerminal evaluation through Hermes-first lens + produces operator-facing decision packet.
 **Action:** Docs-only PR. Adds plan (`tasks/plan_source_call_price_coverage_sample_cg_gt_2026_05_21.md`), design (`tasks/design_source_call_price_coverage_sample_cg_gt_2026_05_21.md`), decision packet (`tasks/vendor_sample_decision_packet_cg_gt_2026_05_21.md`), `.gitignore` entry for `tasks/vendor_samples/`. No code. No vendor calls. No prod DB writes.
 **Hermes-first:** KEEP_CUSTOM — Hermes skill hub + awesome-hermes-agent ecosystem + srilu-installed skills (20+) all checked, none own OHLCV/historical-price. CG MCP server is an MCP protocol surface, not a Hermes-managed skill. GT public API (free, no key, 30 req/min) recommended as first sample.
@@ -101,11 +101,19 @@
 **Files:** `tasks/plan_*.md`, `tasks/design_*.md`, `tasks/vendor_sample_decision_packet_cg_gt_2026_05_21.md`, `.gitignore`.
 
 ### BL-NEW-SOURCE-CALL-GT-LOOKBACK-CAP-PROBE: empirically establish GT free's historical cap
-**Status:** PROPOSED 2026-05-22 — only run if operator picks Path 1 of `findings_source_call_gt_sample_2026_05_22.md`.
-**Why:** Sample run 2026-05-22 showed GT free returns HTTP 401 on OHLCV fetch for 2025-10-20 token, but works fine for 2026-04-27. The cap is between 1 and 7 months but exact boundary unknown.
-**Action:** 2-3 additional GT public API calls probing intermediate ages (e.g., 2 months, 4 months). Operator-authorized + budget-explicit. Output is empirical `observed_cap_days` value that the pre-registered eligibility-cap config can use.
-**Cost:** ~3 GT public API calls, free, no API key.
-**Trigger condition:** evidence-gated on operator picking Path 1.
+**Status:** PROBE-RUN-REFUTED 2026-05-22 — operator ran the 3-call probe; GT free returned 200 with 137 / 110 / 239 candles at 180d / 120d / 60d back on the same CIPHER pool that originally 401'd. The "lookback cap" hypothesis is **REFUTED**. GT free supports ≥180d depth. See `findings_source_call_gt_sample_2026_05_22.md` §11.
+**Closed-with-result:** the 401 on the original 2025-10-20 sample wasn't a global free-tier cap. The real blocker is historical-pool-selection — today's top-reserve pool ≠ call_ts's primary pool for old `source_calls`. Continues as `BL-NEW-SOURCE-CALL-HISTORICAL-POOL-SELECTION-PROBE`.
+
+### BL-NEW-SOURCE-CALL-HISTORICAL-POOL-SELECTION-PROBE: pool-at-call identity for old source_calls
+**Status:** PROPOSED 2026-05-22 — surfaced by the lookback-cap probe result. Next deliverable for the CG/GT track.
+**Why:** GT free works for ≥180d OHLCV (lookback-cap probe). The V1 `current_reserve_proxy_v1` pool-selection rule blindly picks today's top-reserve pool, which may not have existed at `call_ts` for old source_calls — that's the real cause of the original 401. For old source-calls, ANY pool with OHLCV coverage at `call_ts` may exist among the 20 pools returned by `/tokens/{address}/pools`, but the V1 rule discards them in favor of today's primary.
+**Action:** Findings-only probe. Operator-authorized + budget-explicit. For ≥1 old `source_calls` row (e.g., the same 2025-10-20 CIPHER), iterate through the `/pools` response and for each pool, ask GT whether OHLCV at `call_ts ± 30m` returns data. Record which pool (if any) covers the call. If multiple cover, record by-pool reserve at call_ts (if GT exposes it) OR pool-creation timestamp (if GT exposes it).
+**Cost:** ~5-10 GT public API calls (1 `/pools` + up to N `/ohlcv` lookups, with N = pool count truncated at ~5). Free, no API key.
+**Expected output:** confirms whether "old call_ts → at least one pool has OHLCV" is structurally possible. If yes: V1 pool-selection rule needs replacement (new rule shape TBD; possibly "first pool returned that has OHLCV coverage at call_ts"). If no: GT structurally can't cover the old corpus regardless of pool choice.
+**Trigger condition:** operator-authorization explicit + per-run budget.
+**Closes-vs-keeps-open:**
+- BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-PRO becomes less compelling if this probe confirms GT free covers old corpus with smarter pool selection (no need to pay for CG Pro depth).
+- BL-NEW-SOURCE-CALL-FORWARD-ONLY-COVERAGE stays as a scope-down option but is no longer the only tractable path.
 
 ### BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-PRO: evaluate CG Pro's lookback vs GT free
 **Status:** PROPOSED 2026-05-22 — only file detailed packet if operator picks Path 2 of `findings_source_call_gt_sample_2026_05_22.md`.
