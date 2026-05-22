@@ -52,6 +52,40 @@ Operator close-development block 2026-05-22 explicitly parks the following items
 
 ---
 
+## Current Final Backlog Snapshot (2026-05-22)
+
+This section is the operator-facing backlog after the 2026-05-22 trader-lens review. It compresses older dashboard/source-quality items into four tracks so future sessions do not build stale one-off surfaces.
+
+### Track 1 - Trader Decision Surface (buildable next)
+- `BL-NEW-LIVE-DECISION-COCKPIT` - highest product leverage. Build `/api/live_candidates` and a dashboard "Now Tradable" panel that turns existing evidence into `trade / watch / reject / data_insufficient`.
+- `BL-NEW-SIGNAL-TRUST-ROADMAP` - sibling trust layer. Build signal maturity states, scorecards, actionability-vs-`would_be_live` arbitration, narrative hard filters, and Hermes explanations.
+
+**Rule:** V1 is read-only. No live execution, no sizing, no KOL ranking, no source pruning, no automatic signal disable.
+
+### Track 2 - Source/KOL Measurement Enablers (gated)
+- `BL-NEW-SOURCE-CALL-HISTORICAL-POOL-SELECTION-PROBE` - next authorized probe. Determines whether GT free can recover old source-call OHLCV if pool-at-call selection is fixed.
+- `BL-NEW-SOURCE-CALL-PRICE-COVERAGE-EXPANSION` - implementation remains gated until sample/probe evidence proves temporal integrity, trust-tier labels, and chain identity.
+- `BL-NEW-SOURCE-CALL-IDENTITY-RESOLUTION` - needed because most TG/X calls do not yet carry vendor-resolvable identity.
+- `BL-NEW-GT-CHAIN-MAP-EXTENSION` - small follow-up after the solana/ethereum/base path proves useful.
+
+**Rule:** TG/X and KOLs stay context-only until this track makes source-call outcomes rankable.
+
+### Track 3 - Data-Gated Strategy Evidence (wait for triggers)
+- `BL-NEW-X-OUTCOME-LINKAGE`, `BL-NEW-TG-OUTCOME-LINKAGE`, and `BL-NEW-NO-PEAK-RISK-HANDLING` - designs/audits are merged but implementation waits for the actionability re-check gates.
+- `BL-NEW-COHORT-DIGEST-DECISION`, first_signal 2026-05-31 revival decision, and revival criteria follow-ups - data-bound decisions, not calendar-driven build work.
+- Social-denominator Option B/C - operator-choice item; now should be evaluated through the signal-trust roadmap rather than as an isolated scorer tweak.
+
+### Track 4 - Ops Hygiene (do opportunistically)
+- Scanner exception bounding, `datetime.utcnow` cleanup, print/log consistency, MiroFish DEBUG noise suppression.
+- Watchdog meta-watchdog / cron drift scheduling / stale reminder items.
+- Held-position fallback and stale-count alerts if price freshness again blocks trader-facing decisions.
+
+### Folded / Parked By This Review
+- Source-call quality dashboards, TG/X leaderboards, KOL cost governor, and source pruning are parked behind price coverage + signal trust.
+- Token confluence, peak-giveback badges, and health-to-trader-impact are folded into the live decision cockpit and entry-quality layer.
+- X-alerts timeout/index backlog is stale after PR #213/#215 unless fresh runtime evidence shows a regression.
+- Duplicate source-call cron-tick watchdog entry is superseded by PR #211/#216/#217/#218 deployment.
+
 ## Active Work: 2026-05-20 source-call outcome ledger
 
 ### BL-NEW-SOURCE-CALL-OUTCOME-LEDGER: durable TG/X per-call outcome substrate
@@ -117,18 +151,18 @@ Operator close-development block 2026-05-22 explicitly parks the following items
 **Follow-up:** `BL-NEW-DASHBOARD-SOURCE-CALL-QUALITY-SURFACE` remains for any future per-source ranking surface (data-gated on source-call coverage; not this iteration).
 
 ### BL-NEW-DASHBOARD-SOURCE-CALL-QUALITY-SURFACE: dashboard surface over `source_calls`
-**Status:** PROPOSED 2026-05-20 — follow-up after BL-NEW-SOURCE-CALL-OUTCOME-LEDGER ships and accumulates/backfills rows.
+**Status:** FOLDED / PRICE-COVERAGE-GATED 2026-05-22 - original per-source ranking surface is now parked behind `BL-NEW-SOURCE-CALL-PRICE-COVERAGE-EXPANSION` and folded into `BL-NEW-SIGNAL-TRUST-ROADMAP`. The shipped `/api/source_calls/health` + Health panel cover aggregate visibility; any future per-source quality surface must wait until source-call outcomes are rankable.
 **Tag:** `dashboard` `source-quality` `read-only` `trader-cockpit`
 **Why:** The ledger is a substrate, not a trader-facing cockpit. The trader still needs a view that answers: which TG channels/X handles are rankable, which are noisy repeaters, which have low coverage, and which are linkage-pending versus actually bad.
 **Action:** Add read-only endpoint(s) and dashboard panel(s) backed by `compute_source_quality_summary`, with explicit low-n, biased-low-coverage, unresolvable, duplicate-rate, and linkage-confidence labels. Extend rather than duplicate existing `TGAlertsTab` / `XAlertsTab`.
-**Decision-by:** after source_calls backfill/runbook evidence is available.
+**Decision-by:** after price coverage materially improves and at least one source reaches min_sample=10 with coverage >=0.50.
 
 ### BL-NEW-X-KOL-COST-GOVERNOR: evidence-backed X/KOL pruning and budget guardrails
-**Status:** PROPOSED 2026-05-20 — strategy follow-up; do not implement until source-call outcome coverage exists.
+**Status:** PARKED-PENDING-SOURCE-RANKABILITY 2026-05-22 - keep as a strategy concern, but do not build as a standalone governor. It is downstream of source-call price coverage, signal trust, and operator-approved source measurement.
 **Tag:** `x_alerts` `cost-governance` `kol-list` `evidence-gated`
 **Why:** X is a paid input stream. Underperforming handles should not remain indefinitely, but pruning before the source-call ledger has enough rankable coverage risks cutting useful discovery sources based on noise.
 **Action:** After `source_calls` has rankable X-handle cohorts, design a review workflow for prune/keep/watch decisions. Require sample/coverage gates and operator approval; no automatic handle removal in the first pass.
-**Decision-by:** evidence-gated on source-call ledger coverage and operator cost tolerance.
+**Decision-by:** evidence-gated on source-call ledger coverage, signal-trust registry maturity, and operator cost tolerance.
 
 ## Active Findings
 
@@ -943,7 +977,7 @@ The auto-suspends weren't wrong (paper losses were real), but they also weren't 
 **Estimate:** ~2 hours analysis + ~1 hour write-up. No code change for the audit itself.
 
 ### BL-NEW-Q2-SIMULATOR: paired counterfactual for the live-eligibility evaluation
-**Status:** PROPOSED — surfaced 2026-05-12 during Vector C strategy/framing review of the dashboard cohort view PR. The dashboard answers Q1 (cohort divergence empirical question); this item answers Q2 (worth the statistical cost?).
+**Status:** FOLDED-INTO-SIGNAL-TRUST-ROADMAP 2026-05-22 - still conceptually useful, but should be scoped inside signal-family scorecards / live-readiness evidence rather than as a standalone simulator first.
 **Tag:** `evaluation-framework` `q2-simulator` `live-roadmap-gate` `paired-counterfactual`
 **Why:** The dashboard cohort view (BL-NEW-LIVE-ELIGIBLE follow-up) measures whether the eligible cohort diverges from the full cohort. That answers Q1 (cohort identification). But the strategic question — Q2: *"is eligible-cohort evaluation worth the statistical cost of smaller n?"* — requires a different artifact entirely: a paired simulator that, for each historical operational decision made on the full cohort (auto-suspend fires, calibration parameter changes, alert routing thresholds), shows what the same decision would have been if made on the eligible subset.
 
@@ -2102,35 +2136,35 @@ no console errors + correct labeling.
 Six entries surfaced during the dashboard cockpit overnight assignment. **All file-only, no implementation.** Operator scope: file for visibility / future scheduling; implementation requires separate approval. Pair with PR #194 (Trader Action Queue) + #195 (Trade Detail Drawer) which already covered the cheap drilldown surface.
 
 ### BL-NEW-DASHBOARD-TG-SOURCE-QUALITY: per-TG-channel leaderboard
-**Status:** PROPOSED 2026-05-19 — surfaced during PR #195's trade-detail drawer work; the "Related mentions → TG / X" row currently shows a placeholder because no aggregation endpoint exists.
+**Status:** PARKED-PENDING-SOURCE-CALL-PRICE-COVERAGE 2026-05-22 - original leaderboard framing is premature. Fold future work into `BL-NEW-SIGNAL-TRUST-ROADMAP` / source-call rankability after price coverage improves.
 **Tag:** `dashboard` `tg_social` `leaderboard` `read-only` `evidence-gated`
 **Why:** Operator wants to answer "is this TG channel trustworthy?" Existing data spans `tg_social_channels`, `tg_social_messages`, `tg_social_signals` (which already has `paper_trade_id` FK), and `paper_trades`. A per-channel leaderboard reading from these tables would surface: messages, resolved cashtag/CA, dispatched trades, closed PnL, win rate, unresolved/spam rate. **Read-only aggregation** — no new schema or trading behavior.
 **Action:** ~3-5h. Add `GET /api/tg_social/channel_leaderboard?since=...` returning per-channel rollup. Render in TG tab or a new TG Source Quality panel. No new schema.
-**Decision-by:** evidence-gated on operator wanting TG source ranking surfaced.
+**Decision-by:** only after source-call coverage becomes rankable; until then TG remains context-only.
 
 ### BL-NEW-DASHBOARD-X-SOURCE-QUALITY: per-X-KOL leaderboard
-**Status:** PROPOSED 2026-05-19 — same context as TG-source-quality above.
+**Status:** PARKED-PENDING-SOURCE-CALL-PRICE-COVERAGE 2026-05-22 - original leaderboard framing is premature. Fold future work into `BL-NEW-SIGNAL-TRUST-ROADMAP` / source-call rankability after price coverage improves.
 **Tag:** `dashboard` `x_alerts` `leaderboard` `read-only` `evidence-gated`
 **Why:** Same shape for X handles. Data: `narrative_alerts_inbound` already has `tweet_author`. The outcome side is `paper_trades` but linkage is missing until `BL-NEW-X-OUTCOME-LINKAGE` / PR #184 ships. **Without linkage, the leaderboard can only show ingestion-side stats**: alerts emitted per handle, priced-vs-unresolved rate, duplicate-shill count. PnL per handle requires the linkage; show "linkage-pending" honestly.
 **Action:** ~3-5h. Add `GET /api/x_alerts/handle_leaderboard?since=...` returning per-`tweet_author` rollup. Render in X Alerts tab as a separate panel. **Linkage-dependent fields rendered as honest placeholders until PR #184 lands.**
-**Decision-by:** evidence-gated on operator + dependent on PR #184 for outcome-side fields.
+**Decision-by:** only after source-call coverage becomes rankable; until then X remains context-only.
 
 ### BL-NEW-DASHBOARD-TOKEN-DEDUPE-CONFLUENCE-VIEW: unified token drawer/page
-**Status:** PROPOSED 2026-05-19 — surfaced from the "Related mentions → Confluence" placeholder in PR #195's drawer.
+**Status:** FOLDED-INTO-LIVE-DECISION-COCKPIT 2026-05-22 - keep the need, but build it as `BL-NEW-PER-TOKEN-EVIDENCE-BUNDLE` inside `BL-NEW-LIVE-DECISION-COCKPIT`, not as a separate token page first.
 **Tag:** `dashboard` `token-drawer` `read-only` `confluence` `evidence-gated`
 **Why:** Clicking a token symbol should land on a page showing everything known about it: signals fired, trading state, TG mentions, X mentions, pipeline appearances, price-freshness, and any cohort/actionability stamps. Today the trader has to bounce between Signals / Trading / TG / X tabs to assemble this picture. A unified token drawer/page would compose existing endpoints client-side (or a single new aggregating endpoint).
 **Action:** ~6-10h. Two paths:
   - (a) Frontend-only: `/token/<coin_id>` route that fans out to existing endpoints (`/api/candidates`, `/api/signals/quality`, `/api/trading/positions` filtered, `/api/x_alerts` filtered, `/api/tg_social/alerts` filtered, `/api/gainers/comparisons` filtered) and composes a unified panel.
   - (b) Backend-aggregating: single `GET /api/token/<coin_id>/everything` returning one composed payload. Faster page-load but locks the shape.
 Recommend (a) first; (b) only if (a)'s 6-fetch fan-out is too slow.
-**Decision-by:** evidence-gated.
+**Decision-by:** live decision cockpit plan/design.
 
 ### BL-NEW-DASHBOARD-PEAK-GIVEBACK-RISK-BADGE: visual badge for stale-momentum tokens
-**Status:** PROPOSED 2026-05-19 — surfaced from #195's "Exit risk → Giveback" pp display (which already exists per-position; the proposal here is to also surface it on candidate / signal rows BEFORE trade-open).
+**Status:** FOLDED-INTO-ENTRY-QUALITY 2026-05-22 - keep the risk, but surface it through `BL-NEW-ENTRY-QUALITY-STATE` / live candidate risk badges rather than as a separate dashboard badge project.
 **Tag:** `dashboard` `risk-badge` `peak-giveback` `read-only` `evidence-gated`
 **Why:** Audit findings from #183 (still draft, actionability-runbook-gated) identify `pre_entry_peak_gain_pct >= 40%` AND `pre_entry_giveback_ratio >= 0.50` as a candidate stale-entry V2 gate. Even as visibility-only (NOT as a suppression), surfacing this as a badge on Signals / Top Gainers / Pipeline rows would let the trader avoid stale-momentum tokens manually. The labels should be **risk indicators only** — not behavior-altering filters.
 **Action:** ~3-4h. Read-only: derive `pre_entry_peak_gain_pct` from existing snapshot history (gainers_snapshots, volume_history_cg, etc.) at row-fetch time; attach as field. Render as badge: "FRESH" (no giveback signal) / "STALE PEAK ⚠" (≥40% / 50% giveback) / "MID-CYCLE" (between). NO behavior change; pure presentation. **Gated on PR #183's audit findings landing or being accepted as a risk-labeling source.**
-**Decision-by:** gated on #183's actionability-runbook readout.
+**Decision-by:** live decision cockpit entry-quality design plus #183 actionability evidence.
 
 ### BL-NEW-DASHBOARD-WHAT-CHANGED-SINCE-LAST-VISIT: session-aware "what's new" panel
 **Status:** PROPOSED 2026-05-19 — surfaced from the operator's "What changed since I last looked?" cockpit question.
@@ -2144,7 +2178,7 @@ No schema or backend change for the MVP.
 **Decision-by:** evidence-gated.
 
 ### BL-NEW-DASHBOARD-HEALTH-TRADER-IMPACT: convert health signals into trading consequences
-**Status:** PROPOSED 2026-05-19 — surfaced from the operator's "Can I trust the data right now?" cockpit question.
+**Status:** FOLDED-INTO-LIVE-DECISION-COCKPIT 2026-05-22 - remaining value should become candidate refusal/risk reasons and dashboard health captions, not a standalone health project unless cockpit design proves it needs a dedicated surface.
 **Tag:** `dashboard` `health` `trader-impact` `read-only` `evidence-gated`
 **Why:** Today's Health tab shows freshness rows for ~15 tables — but the trader has to translate "category_snapshots last 12h ago" into "category heating is stale, narrative_prediction trades opened in the last 12h may have used pre-stale categorization." A second view should translate raw freshness rows into trading-impact statements:
   - price_cache stale → trailing stops cannot trigger on stale-priced positions
@@ -2153,7 +2187,7 @@ No schema or backend change for the MVP.
   - MiroFish cap exhausted → narrative ranking may be partially uncached
   - CG rate-limit elevated → price/actionability validation latency rises
 **Action:** ~4-6h. Add a "Trading Impact" panel to the Health tab. Read existing `/api/system/health` + add small per-table impact-mapping table on the frontend. **No new endpoint required for the MVP.**
-**Decision-by:** evidence-gated.
+**Decision-by:** live decision cockpit plan/design.
 
 ---
 
@@ -2162,18 +2196,18 @@ No schema or backend change for the MVP.
 Four entries surfaced during PR #190's X Alerts perf investigation and the overnight dashboard triage pass. **All file-only, no implementation.** Operator scope: file for visibility / future scheduling; do not start implementation until separately approved.
 
 ### BL-NEW-DASHBOARD-X-ALERTS-RESOLVER-SCHEMA-ALIGN: reconcile `_resolve_coin_id_for_outcome` against the actual `candidates` schema
-**Status:** PROPOSED 2026-05-19 — surfaced post-deploy of PR #190 (`c99051f`). Live journal on srilu shows `dashboard_x_alerts_outcome_source_unavailable err=no such column: coingecko_id` firing on every `/api/x_alerts` request.
+**Status:** STALE-PENDING-DRIFT-CHECK 2026-05-22 - `/api/x_alerts?limit=80` is healthy after PR #213/#215 (~0.18-0.20s). Do not implement from the old diagnosis without first verifying current journal/runtime evidence still shows this schema path failing.
 **Tag:** `dashboard` `x_alerts` `schema-drift` `silent-degradation`
 **Why:** `dashboard/db.py:get_x_alerts._resolve_coin_id_for_outcome` runs `SELECT DISTINCT coingecko_id AS coin_id FROM candidates WHERE LOWER(contract_address) = LOWER(?) AND chain = ? AND COALESCE(coingecko_id, '') != ''` for every row whose contract address was extracted. Verified prod schema (`PRAGMA table_info(candidates)`): no `coingecko_id` column exists; the column-list ends at `quote_symbol`. The query raises `OperationalError`, caught silently by `_safe_fetchall` and returned as `[]`. **Every X alert with a contract falls through to the slower symbol-table scan path.** The original intent of the contract-match path is bypassed in 100% of cases.
 **Action:** ~2-4h. Decide between (a) DROP the `coingecko_id` reference from the resolver query (acknowledge that `candidates` no longer carries a CoinGecko ID mapping; rely on symbol-fallback only — affects per-request perf if symbol path is also slow) OR (b) ADD a `coingecko_id` column to `candidates` schema + backfill from existing ingest paths (schema migration). Recommend (a) for scope conservatism; (b) only if the contract → coingecko_id mapping is needed elsewhere.
-**Decision-by:** within 4 weeks of PR #190 merge (2026-06-16). Conditional on operator deciding to invest in X Alerts perf vs. accept the current "fail fast + retry" timeout behavior.
+**Decision-by:** close if next drift-check finds no live journal failures; reopen only on fresh runtime evidence.
 
 ### BL-NEW-DASHBOARD-X-ALERTS-SYMBOL-INDEX: add `(symbol)` indexes to the 4 symbol-fallback source tables
-**Status:** PROPOSED 2026-05-19 — surfaced post-deploy of PR #190. Same investigation as the RESOLVER-SCHEMA-ALIGN entry above.
+**Status:** SUPERSEDED 2026-05-22 - functional `UPPER(symbol)` indexes shipped via PR #215 and prod timing improved to ~0.18-0.20s for `/api/x_alerts?limit=80`. Keep this historical row only as context.
 **Tag:** `dashboard` `x_alerts` `performance` `schema-migration`
 **Why:** When the contract-match path falls through (per the RESOLVER-SCHEMA-ALIGN entry's observation: 100% of the time today), `_resolve_coin_id_for_outcome` queries 4 source tables (`gainers_snapshots`, `volume_history_cg`, `volume_spikes`, `momentum_7d`) with `WHERE UPPER(symbol) = ? AND COALESCE(coin_id, '') != '' ORDER BY time_col DESC LIMIT 25`. None of these tables have an index on `symbol` — every query is a full-table scan. With PR #190's per-symbol cache the cost is unique-symbols × 4 scans, not per-row × 4. But under concurrent dashboard load, 4 full-table scans × 15-30 unique symbols still pushes the endpoint past the 12s frontend timeout. ASGI smoke in isolation: limit=30 = ~9s (acceptable); under live dashboard load: 13-30s+ (timeout).
 **Action:** ~1-2h schema migration. Add `idx_<table>_symbol(UPPER(symbol))` to all 4 tables (or just `(symbol)` if SQLite's expression-index requirement is lifted by the writer normalizing case). Verify each writer site upcases consistently. Indexed scan should drop the symbol-path cost ~10x. **Schema migration — gated on operator approval.** Pairs naturally with RESOLVER-SCHEMA-ALIGN; ship together or in sequence.
-**Decision-by:** within 4 weeks of PR #190 merge (2026-06-16). Conditional on operator approving schema migration scope.
+**Decision-by:** none; superseded by PR #215 unless a fresh regression appears.
 
 ### BL-NEW-DASHBOARD-TG-CONVERSION-FUNNEL-ENDPOINT: read-only TG conversion-funnel aggregation endpoint
 **Status:** PROPOSED 2026-05-19 — surfaced from overnight dashboard triage; assignment item 7. Filed as a backend instrumentation task, NOT a UI fix.
@@ -2451,13 +2485,13 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 3. No repeated Telegram alerts in journalctl for `source-calls-lag-watchdog`.
 
 ### BL-NEW-SOURCE-CALL-CRON-TICK-WATCHDOG: writer-rate parity check independent of upstream-lag watchdog
-**Status:** PROPOSED 2026-05-21 — surfaced during overnight decision-harvest plan review (Vector-B-I1 §12a follow-on). Empirical: `*/5` writer cron fires irregularly — observed 52 fires in 6h vs expected 108 (~half-rate). The existing lag watchdog (`scripts/source-calls-lag-watchdog.sh`) measures upstream `observed_at` lag, not writer-tick parity. When upstream TG/X rows happen NOT to arrive during a writer skip window, the watchdog correctly sees no lag and stays silent — but the writer-skipping-when-no-upstream-rows mode is invisible to the existing observability surface. Classic §12a "watchdog cannot detect its own failure mode" shape.
+**Status:** SUPERSEDED / SHIPPED-DEPLOYED 2026-05-22 - duplicate row. The active shipped record is the top-level `BL-NEW-SOURCE-CALL-CRON-TICK-WATCHDOG: detect writer cron outages independently of upstream traffic`, shipped via PR #211 and activated with hotfixes #216/#217/#218.
 **Tag:** `source-quality` `silent-failure-prevention` `cron-health`
 **Why:** Per global CLAUDE.md §12a — every pipeline table needs both upstream-lag detection AND writer-rate detection. The lag watchdog is upstream-anchored; this BL adds a writer-rate-anchored watchdog. Without this, a sustained writer-cron daemon stall during a TG/X burst could lag pipelines silently until the upstream catches up (which would then trigger the lag watchdog — but by then the burst is already partly missed).
 **Scope:** Tiny — add a second `check_source_calls_writer_rate.py` (or extend the existing `scripts/check_source_calls_lag.py` lag-watchdog check) that asserts writer ticked ≥N times in the last M minutes (e.g., ≥2 ticks in 15min for `*/5` cron). Wire as a second cron entry every 10 min. Telegram-alert on rate-floor breach.
 **Non-goals:** No change to writer or watchdog wrapper. No source ranking. No price-coverage work.
 **Acceptance:** Watchdog fires Telegram alert when writer ticks fall below threshold for ≥2 consecutive 10-min cycles, independent of upstream activity. 7-day soak with zero false positives during normal operation.
-**Re-eval trigger:** Before any decision to debug the cron-daemon irregularity, run this watchdog for 7d to gather rate-distribution evidence; cron-daemon-side investigation only if rate-floor breaches with no obvious root cause.
+**Re-eval trigger:** use the shipped top-level row for any future 90-day kill/review decision.
 
 ### BL-NEW-MIROFISH-DEBUG-NOISE-SUPPRESS: stop journal pollution from fallback_raw_response DEBUG events
 **Status:** PROPOSED 2026-05-21 — surfaced during overnight decision-harvest plan review (Vector-A-M2 follow-on). Empirical: journalctl audit found `{"event": "fallback_raw_response", ..., "level": "debug"}` events emitted on every Claude haiku fallback. Functionally fine — fallback works correctly — but accumulates noisy DEBUG-level lines that degrade the visibility surface when a real exception arrives. Per `feedback_resilience_layered_failure_modes.md` — every resilience addition must extend a visibility surface; DEBUG events buried under "known noise" defeat that.
