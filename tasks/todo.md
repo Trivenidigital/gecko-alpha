@@ -1,5 +1,28 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-22 — GT findings correction + new historical-pool-selection BL
+
+**Trigger:** operator ran the authorized lookback-cap probe (`BL-NEW-SOURCE-CALL-GT-LOOKBACK-CAP-PROBE`). 3 GT free OHLCV calls. No prod writes. Temp files cleaned.
+
+**Result:** GT free returns 5m OHLCV at 60/120/180 days back for the CIPHER pool that originally 401'd. The "GT free has short lookback cap" diagnosis from §4 of the original findings is **REFUTED**.
+
+**Honest correction:** the original 401 was specifically about THIS pool's OHLCV history start, not a global free-tier cap. Real blocker is V1 `current_reserve_proxy_v1` rule picking today's top-reserve pool, which may not have existed at `call_ts` for old `source_calls`.
+
+**What ships in this PR:**
+- §11 CORRECTION section appended to `findings_source_call_gt_sample_2026_05_22.md` (original §1-§10 preserved unedited for audit trail; §11 supersedes §4 Interpretation and §7 sub-finding)
+- backlog status flip: `BL-NEW-SOURCE-CALL-GT-LOOKBACK-CAP-PROBE` → PROBE-RUN-REFUTED
+- backlog status flip: `BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-GT` → SAMPLE-RUN-FAILED-WITH-CORRECTION
+- new BL: `BL-NEW-SOURCE-CALL-HISTORICAL-POOL-SELECTION-PROBE` (next deliverable)
+- This todo.md entry
+
+**What does NOT ship:**
+- No code change
+- No vendor calls
+- No prod DB writes
+- No implementation work
+
+**Next:** await operator authorization for `BL-NEW-SOURCE-CALL-HISTORICAL-POOL-SELECTION-PROBE` (~5-10 GT free calls; findings-only).
+
 ## Active Work: 2026-05-22 — GT sample-run findings (BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-GT)
 
 **Status:** SAMPLE-RUN-FAILED. 2/7 criteria failed (criterion 2 OHLCV-for-every-resolved + criterion 7 oldest-lookback). Implementation gate STAYS CLOSED. Findings recorded in `tasks/findings_source_call_gt_sample_2026_05_22.md`.

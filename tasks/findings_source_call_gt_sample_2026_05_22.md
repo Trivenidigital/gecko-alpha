@@ -1,10 +1,12 @@
 # Findings — GeckoTerminal Sample Run (BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-GT)
 
+> **⚠ CORRECTION 2026-05-22 (post lookback-cap probe):** the original interpretation below — "GT free's historical-OHLCV cap is between 1 and 7 months" — is **REFUTED** by the follow-up lookback-cap probe. GT free returned 5m OHLCV at 60, 120, and 180 days back for the same CIPHER pool that originally 401'd. **Real blocker is historical-pool-selection, NOT a lookback cap.** See §11 Correction below for the empirical evidence + revised diagnosis. Original §1-§10 text preserved unedited for audit trail; §11 supersedes §4 Interpretation and §7 sub-finding on the 401 status.
+
 **Date:** 2026-05-22
 **Packet:** `tasks/vendor_sample_decision_packet_cg_gt_2026_05_21.md` (PR #222, merged `c08c910`)
 **Operator authorization:** sample run under conservative defaults (GT free target, 202-row ceiling accepted, 5m-bucket 30m policy locked, current-reserve proxy + drift flag accepted, bounded 6-call budget authorized).
 **Prod DB:** read-only throughout. **No prod writes.** Temp files cleaned.
-**Result:** **NOT PASSED.** 2 of 7 criteria failed. Implementation gate stays CLOSED.
+**Result:** **NOT PASSED.** 2 of 7 criteria failed. Implementation gate stays CLOSED. **(Reason for failure: §11 correction below.)**
 
 ## 1. Sample inputs
 
@@ -113,3 +115,55 @@ Sample script lives only in operator-local environment (not committed). Per pack
 ## 10. Bottom line for the operator
 
 GT free is **partial coverage**, not full coverage. The 7-month corpus cannot be backfilled via GT free. Three forward paths exist; each is a docs-only follow-up until operator picks one. Implementation gate stays CLOSED. No code change ships from this findings doc.
+
+## 11. CORRECTION 2026-05-22 — GT lookback-cap probe REFUTES the §4 interpretation
+
+Per operator's recommended sequence ("merge #223 → run GT lookback-cap probe"), the GT lookback-cap probe ran 2026-05-22 with exactly 3 GT free OHLCV calls (within `BL-NEW-SOURCE-CALL-GT-LOOKBACK-CAP-PROBE` budget). **No prod DB writes. Temp files cleaned.**
+
+### 11.1 Probe inputs
+Same CIPHER pool used by the original 2025-10-20 failure. Three OHLCV fetches at increasing historical depths:
+
+| Probe | Status | Candles returned |
+|---|---:|---:|
+| 180 days ago | **200** | 137 |
+| 120 days ago | **200** | 110 |
+| 60 days ago | **200** | 239 |
+
+### 11.2 What this changes
+
+- **§4 Interpretation REFUTED.** The previous claim "GT free returns HTTP 401 on historical OHLCV beyond an undocumented recency cap" is **NOT supported**. GT free returns clean 200/OHLCV at least **180 days back** for the same pool that 401'd at the 2025-10-20 call_ts.
+- **§7 sub-finding REFUTED.** The "401 hints at Pro-tier-required" reading is wrong. 401 in the original sample wasn't a global free-tier limit.
+
+### 11.3 What the actual blocker is
+
+The 401 on the 2025-10-20 oldest sample is more likely one of:
+1. The selected current-top-reserve pool did not yet have OHLCV at `call_ts = 2025-10-20`.
+2. The pool existed later than the source call (started trading after).
+3. `current_reserve_proxy_v1` picked the wrong historical pool (today's primary ≠ call_ts's primary).
+4. GT returns `401` (not `404`) specifically when querying before a *given* pool's OHLCV-history start.
+
+In all four shapes, the root cause is **historical-pool-selection / pool-at-call identity**, NOT a vendor lookback limit. This is consistent with the Reviewer A.C1 fold (`reserve_in_usd` is current-state, not historical at call_ts) being a real measurement issue, not a theoretical one.
+
+### 11.4 Implication for the three forward paths (§5)
+
+The three paths shift:
+
+| Original path | Status after correction |
+|---|---|
+| Path 1 — Narrow GT eligibility to recent call_ts only | **Less compelling.** GT free supports deep history *for the right pool*. The narrow-recent-only stance overcommits. |
+| Path 2 — Try CG Pro for older history | **Less compelling.** GT free already covers ≥180d for at least one pool; paying CG Pro doesn't obviously add depth — it adds SLA. |
+| Path 3 — Forward-only / prospective coverage | **Still on the table** as a scope-down option, but no longer the *only* tractable option. |
+
+### 11.5 New blocker and new BL
+
+The next investigation is: **for old `source_calls`, does ANY pool for that token have OHLCV covering `call_ts`?** This is a pool-identity question, separable from the vendor question.
+
+Filed: `BL-NEW-SOURCE-CALL-HISTORICAL-POOL-SELECTION-PROBE` (PROPOSED 2026-05-22). Goal: for old source-calls, for each `/pools` entry, ask whether GT has OHLCV covering `call_ts` — not blindly trust today's top-reserve pool. Findings-only. Small bounded call budget. Operator-authorization required per-run.
+
+If that probe shows that for old `source_calls`, *some* pool has OHLCV coverage even when the top-reserve-today pool doesn't, then GT free is a viable implementation path with a different pool-selection rule (the V1 rule needs replacement, not the vendor).
+
+### 11.6 Revised bottom line
+
+GT free is **deeper than originally believed** (≥180d on at least one pool). The original "GT free has a short lookback cap" framing was wrong. The real measurement-validity blocker is the V1 pool-selection rule — `current_reserve_proxy_v1` is brittle on historical calls because pools migrate / start at different times.
+
+Implementation gate STAYS CLOSED, but the rationale changes: not because GT is inadequate, but because pool-at-call identity is unsolved. Next docs deliverable is the `BL-NEW-SOURCE-CALL-HISTORICAL-POOL-SELECTION-PROBE` packet/findings, not a Path 1/2/3 decision.
