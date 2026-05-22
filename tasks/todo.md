@@ -876,7 +876,7 @@ Prior "Resume hook" referred to pre-Telegram-wired state (placeholder bot token)
 Current resume hook (2026-05-21, post overnight decision-harvest):
 
 1. **Operator decisions pending** (not closed by night session):
-   - PR #33 (BL-050 first_signal edge detection): KEEP DRAFT recommended, re-evaluate at next data-sufficiency window
+   - PR #33 (BL-050 first_signal edge detection): CLOSED 2026-05-22 as stale/superseded after relevance review; revisit only as fresh rewrite if first_signal survives the 2026-05-31 soak
    - PR #34 (BL-051 DexScreener velocity_boost): OPERATOR CLOSE recommended as PARKED-PENDING-PRICE-COVERAGE (substrate rejected by PR #208 design)
    - PR #105 (Phase B volume_history snapshot): OPERATOR CLOSE recommended as STALE-WIP (CI FAILED, body says "DO NOT MERGE", no updates since 2026-05-18)
 
@@ -890,6 +890,7 @@ Current resume hook (2026-05-21, post overnight decision-harvest):
 3. **Implementation gates** (none active tonight):
    - Price-coverage expansion (PR #208 design): operator-approved vendor sample call to GoldRush/Covalent/CoinGecko MCP
    - Source-call ranking / pruning / dashboard "best source" surfaces: blocked until price coverage materially improves
+   - Live decision cockpit: BL-NEW-LIVE-DECISION-COCKPIT filed 2026-05-22 from trader-lens exercise. Goal is one per-token "trade / watch / reject / data insufficient" surface; V1 is read-only, Hermes-enriched but not Hermes-load-bearing, and must keep TG/X context-only until source-call price coverage becomes rankable.
 
 4. **Health surfaces** (verified clean tonight; re-check on next operator request):
    - source_calls writer parity: 100% (tg=858/858, x=399/399)

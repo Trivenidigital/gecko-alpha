@@ -2466,3 +2466,74 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 **Scope:** Either (a) demote `fallback_raw_response` from DEBUG → TRACE (or remove if not consumed elsewhere); or (b) leave the event but route it via a structured-log filter that operators can mute. ~30min change.
 **Non-goals:** No fallback behavior change. No MiroFish client change.
 **Acceptance:** `journalctl -u gecko-pipeline --since 24h -iE error|exception|traceback` returns 0 hits when system is healthy, without manual filtering.
+
+### BL-NEW-LIVE-DECISION-COCKPIT: turn signal substrate into a trader-facing "trade / watch / reject" surface
+**Status:** PROPOSED 2026-05-22 — filed from live-pick exercise. Trader-lens verdict: Gecko-Alpha can produce a defensible tiny experimental basket, but the workflow is not smooth. The operator currently has to stitch together `paper_trades`, `actionability`, `would_be_live`, `price_cache`, `chain_matches`, `predictions`, X/TG alert health, and `source_calls` health manually. Gecko has signals, but not yet a trader-facing decision surface.
+**Tag:** `dashboard` `live-decision` `trader-cockpit` `actionability` `hermes-first`
+**Why:** The next leverage point is not another raw signal. It is a decision cockpit that collapses existing evidence into one per-token verdict with explicit reasons and refusal states. The useful current filters are `paper_trades` + current `price_cache`, `actionable=1`, `would_be_live=1`, fresh open-trade PnL vs entry, and source-call health warning when TG/X is not rankable. The friction is absence of a single "what can I trade now?" endpoint and UI.
+
+**Operator-trader diagnosis captured:**
+- Trustable today: pipeline health, actionability stamps, `would_be_live`, chain_completed + volume_spike, and explicit "not rankable yet" source-call health.
+- Not trustable today: TG/X direct trading input, KOL ranking, narrative predictions as standalone entries, broad open-paper-trade list as a cockpit, or automatic live allocation.
+- Product target: "Show me 3-5 candidates worth a tiny live experiment, with reasons and caveats."
+- Product non-target: blind live trading, auto-sizing, KOL/source pruning, actionability-v2 consumption, or autonomous execution.
+
+**Hermes-first posture:** Hermes should enrich and explain, not become the substrate. Before the plan/design PR, re-run the mandatory Hermes-first section and check in-tree drift first. Expected split:
+
+| Domain | Hermes role | Decision boundary |
+|---|---|---|
+| Trader-readable candidate explanation | summarize why a token is interesting/dangerous; convert raw evidence into "why trade / why avoid" | BRIDGE_TO_HERMES if an installed/public skill fits; otherwise keep prompt/output contract local |
+| Counter-risk interpretation | detect already_peaked, weak community, dead_project, fake catalyst, copycat meta from existing prediction/counter-risk fields | USE_AS_ENRICHMENT; never override price/actionability truth without structured evidence |
+| TG/X/KOL context | normalize call context and source narrative | CONTEXT_ONLY until source-call price coverage becomes rankable |
+| Price truth / PnL / identity / execution | none | KEEP_CUSTOM; Hermes must not be load-bearing for price, PnL attribution, chain identity, or order execution |
+
+**Child backlog sequence:**
+
+1. **BL-NEW-LIVE-CANDIDATES-ENDPOINT** — Add read-only `/api/live_candidates`.
+   - Return 10-20 per-token rows, not raw trades.
+   - Inputs: open/recent `paper_trades`, `price_cache`, actionability metadata, `would_be_live`, `chain_matches`, latest prediction/counter-risk fields, source-call health.
+   - Include token, symbol, name, current price, mcap, 24h change, open paper trade ids, signal surfaces, `actionable`, `would_be_live`, current-vs-entry %, inclusion reasons, exclusion/risk reasons, and `trade/watch/reject/data_insufficient`.
+   - No writes, no live execution, no suppression.
+
+2. **BL-NEW-TRADER-READINESS-SCORE** — Add a score separate from conviction.
+   - Positive factors: actionability pass, `would_be_live` pass, multiple independent surfaces, fresh signal age, current price still near entry, sane mcap/liquidity, no counter-risk flags, resolved identity.
+   - Negative factors: high counter-risk, already faded beyond threshold, already ran too far beyond entry, source not rankable, unresolved identity, TG/X-only context, stale price.
+   - Must emit factor breakdown; no opaque single number.
+
+3. **BL-NEW-PER-TOKEN-EVIDENCE-BUNDLE** — Collapse duplicate evidence by token.
+   - Example target: ALLO row shows `volume_spike` yesterday + `chain_completed` today + `actionable=1` + `would_be_live=1` instead of two disconnected trade rows.
+   - Evidence windows pre-registered (e.g. 36h primary, 7d historical support).
+   - Distinguish active evidence from historical color.
+
+4. **BL-NEW-ENTRY-QUALITY-STATE** — Separate "system says yes" from "entry is still good".
+   - Labels: `fresh_entry`, `acceptable_pullback`, `already_faded`, `already_ran`, `too_stale`, `already_stopped_out`, `data_insufficient`.
+   - Uses current price vs paper entry, signal age, checkpoint/peak context, and price freshness.
+   - Prevents `actionable=1` tokens that are already -10% or +25% from being silently treated as equally tradable.
+
+5. **BL-NEW-NARRATIVE-COUNTER-RISK-INTO-TRADE-VIEW** — Promote prediction warnings into the candidate row.
+   - Surface `dead_project`, `weak_community`, `already_peaked`, `narrative_mismatch`, low fit score, and counter-risk score as red/yellow badges.
+   - Narrative predictions can enrich or downgrade a candidate; they are not standalone live entries unless the scoring layer also passes entry-quality and actionability gates.
+
+6. **BL-NEW-DASHBOARD-NOW-TRADABLE-PANEL** — Build a dashboard panel backed by `/api/live_candidates`.
+   - Shows only assets a human might consider now.
+   - Top-level buckets: `trade small now`, `watch only`, `reject`, `data insufficient`.
+   - Each row links to paper trade detail and evidence bundle.
+   - Explicit caption: "TG/X context is excluded from ranking until source-call price coverage is rankable."
+
+7. **BL-NEW-TGX-CONTEXT-ONLY-GUARDRAIL** — Prevent unrankable TG/X from influencing live candidate labels.
+   - If `source_calls.rankability.rankable=0` or price coverage is below threshold, TG/X may appear as context badges only.
+   - It must not boost `trade` labels, KOL ranking, pruning, or actionability consumption.
+   - Unlock condition: source-call price coverage expansion ships and at least one source reaches `min_sample=10`, coverage >=0.50 with temporal integrity, trust-tier labeling, and chain identity enforced.
+
+**Plan/design gates before implementation:**
+1. Drift-check current dashboard/API first; close any child item that already exists.
+2. Hermes-first analysis documented near the top of the plan/design.
+3. Runtime-state verification: query current closed/open actionability cohorts, source-call rankability, and price freshness before scoring design.
+4. No live execution, order sizing, KOL pruning, or source-ranking consumption in V1.
+5. Treat disagreements between `actionable` and `would_be_live` explicitly; do not hide them behind the score.
+
+**Acceptance for V1:**
+- Operator can open one dashboard panel or call one endpoint and get 3-5 experimental candidates with reasons and caveats in under 30 seconds.
+- Every candidate has a visible verdict, entry-quality label, evidence surfaces, risk badges, and refusal reason when rejected.
+- TG/X and KOL context remains excluded from rank/score until source-call coverage becomes rankable.
+- The endpoint is read-only and has tests proving no `paper_trades` / signal params / live execution writes.
