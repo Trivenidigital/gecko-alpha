@@ -888,6 +888,7 @@ Current resume hook (2026-05-21, post overnight decision-harvest):
    - Multi-clause precedence: if multiple clauses fire, treat as independent investigation tracks, not summed evidence
 
 3. **Implementation gates** (none active tonight):
+   - Hermes + Codex operating model: BL-NEW-HERMES-CODEX-OPERATING-MODEL filed 2026-05-22. Direction: Hermes owns durable memory/orchestration/scheduling; Codex owns repo-grounded plan/design/build/review/verification; runtime evidence beats remembered state.
    - Price-coverage expansion (PR #208 design): operator-approved vendor sample call to GoldRush/Covalent/CoinGecko MCP
    - Source-call ranking / pruning / dashboard "best source" surfaces: blocked until price coverage materially improves
    - Live decision cockpit: BL-NEW-LIVE-DECISION-COCKPIT filed 2026-05-22 from trader-lens exercise. Goal is one per-token "trade / watch / reject / data insufficient" surface; V1 is read-only, Hermes-enriched but not Hermes-load-bearing, and must keep TG/X context-only until source-call price coverage becomes rankable.

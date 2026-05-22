@@ -56,6 +56,11 @@ Operator close-development block 2026-05-22 explicitly parks the following items
 
 This section is the operator-facing backlog after the 2026-05-22 trader-lens review. It compresses older dashboard/source-quality items into four tracks so future sessions do not build stale one-off surfaces.
 
+### Track 0 - Hermes + Codex Operating Model (direction of travel)
+- `BL-NEW-HERMES-CODEX-OPERATING-MODEL` - make Hermes the durable orchestration/memory/scheduling layer and Codex the repo-grounded execution worker.
+
+**Rule:** Hermes remembers, routes, schedules, and stores gates. Codex reads the repo/runtime, plans, implements, tests, reviews, and opens PRs. Runtime evidence beats both Hermes memory and Codex assumptions.
+
 ### Track 1 - Trader Decision Surface (buildable next)
 - `BL-NEW-LIVE-DECISION-COCKPIT` - highest product leverage. Build `/api/live_candidates` and a dashboard "Now Tradable" panel that turns existing evidence into `trade / watch / reject / data_insufficient`.
 - `BL-NEW-SIGNAL-TRUST-ROADMAP` - sibling trust layer. Build signal maturity states, scorecards, actionability-vs-`would_be_live` arbitration, narrative hard filters, and Hermes explanations.
@@ -85,6 +90,41 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 - Token confluence, peak-giveback badges, and health-to-trader-impact are folded into the live decision cockpit and entry-quality layer.
 - X-alerts timeout/index backlog is stale after PR #213/#215 unless fresh runtime evidence shows a regression.
 - Duplicate source-call cron-tick watchdog entry is superseded by PR #211/#216/#217/#218 deployment.
+
+### BL-NEW-HERMES-CODEX-OPERATING-MODEL: durable orchestration with Codex execution workers
+**Status:** PROPOSED 2026-05-22 - filed from operator strategy direction after Hermes+Codex architecture review. This is the working model for Gecko-Alpha going forward: Hermes is the orchestration/memory/scheduling layer; Codex is the coding/repo/runtime execution worker; the operator owns product and trading judgment.
+**Tag:** `operating-model` `hermes-first` `codex-worker` `workflow` `memory`
+**Why:** Gecko-Alpha has enough code velocity. The failure modes to solve are continuity, stale backlog, operator-gated decisions, evidence-bound soaks, runtime-state drift, and multi-session handoff. Hermes is the right layer for durable memory, scheduling, routing, and cross-session state. Codex is the right layer for repo-grounded plans, implementation, tests, runtime probes, PRs, and code review.
+
+**Role split:**
+
+| Layer | Owner | Notes |
+|---|---|---|
+| Durable goals / backlog memory | Hermes | Stores project state, parked items, gates, and next prompts |
+| Task routing / overnight orchestration | Hermes | Launches bounded Codex jobs; stores final artifacts |
+| Runtime reminders / soak wakeups | Hermes | Schedules data-bound rechecks and operator prompts |
+| Repo-grounded plan/design | Codex | Reads code, tests, backlog, runtime evidence; writes PR artifacts |
+| Implementation / refactor / debug | Codex | Edits files, runs tests, opens PRs |
+| PR review | Codex + reviewer agents | 2-vector review minimum for important work |
+| Product/trading judgment | Operator | Approves vendor samples, prod writes, live-trading changes, sizing, pruning |
+| Truth source | Runtime evidence | DB/journal/CI/prod state beats remembered state |
+
+**Canonical task workflow:**
+1. Operator sets direction.
+2. Hermes creates or updates durable task state.
+3. Hermes dispatches Codex with the exact bounded prompt.
+4. Codex runs: Plan -> 2 parallel reviewers -> folds -> Design -> 2 parallel reviewers -> folds -> Build -> PR -> 2 parallel PR reviewers -> folds -> verification.
+5. Codex returns PR/findings/no-build decision.
+6. Hermes stores the outcome, next gate, and next prompt.
+
+**Guardrails:**
+- Hermes-first does not mean Hermes-builds-everything. It means drift-check -> Hermes ecosystem check -> custom code only for residual gaps.
+- Hermes memory is not truth. Every build prompt must verify runtime assumptions before acting when DB rows, env vars, feature flags, approvals, or prod state matter.
+- No autonomous prod DB writes, vendor paid calls, live execution, sizing, source pruning, or signal retirement without explicit operator gate unless already covered by a shipped watchdog/runbook.
+- Every overnight job must end in one of: PR, findings doc, or explicit no-build decision with evidence.
+- Codex work should stay branch/PR/test based; Hermes work should stay durable-state/scheduler based.
+
+**Immediate application:** Use this model for `BL-NEW-LIVE-DECISION-COCKPIT` and `BL-NEW-SIGNAL-TRUST-ROADMAP`. Hermes tracks gates and memory; Codex builds the endpoint/panel/registry through PRs; the operator approves any move toward live execution, pruning, or paid vendor samples.
 
 ## Active Work: 2026-05-20 source-call outcome ledger
 
