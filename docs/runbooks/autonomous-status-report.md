@@ -33,6 +33,8 @@ Write to a file:
 node scripts/report_autonomous_status.mjs --since 2026-05-23T16:21:46.603Z --out tasks/autonomous_status_report_2026_05_23.md
 ```
 
+Safety note: `--out` only allows writing to `tasks/*.md` and refuses to overwrite tracked files.
+
 ## Interpreting the report
 
 - If “templates missing” appears: create/ship template pack first.
@@ -46,5 +48,4 @@ The reporter must remain:
 - no DB access
 - no `.env` / secrets reads
 - no SSH
-- no working-tree writes (except optional `--out`)
-
+- no working-tree writes (except optional `--out` to `tasks/*.md`, and it must not overwrite tracked files)

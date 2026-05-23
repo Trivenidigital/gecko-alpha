@@ -34,6 +34,45 @@ function runGit(args) {
   return execFileSync("git", args, { encoding: "utf8" }).trim();
 }
 
+function isPathWithinRoot(rootAbs, targetAbs) {
+  const rel = path.relative(rootAbs, targetAbs);
+  if (rel === "") return true;
+  if (rel.startsWith("..") || rel.includes(`..${path.sep}`)) return false;
+  return !path.isAbsolute(rel);
+}
+
+function isTrackedPath(repoRelativePath) {
+  try {
+    execFileSync("git", ["ls-files", "--error-unmatch", repoRelativePath], {
+      stdio: "ignore"
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validateOutPath(repoRootAbs, outArg) {
+  if (!outArg) return { ok: true, outAbs: null, outRel: null };
+
+  const outAbs = path.resolve(repoRootAbs, outArg);
+  if (!isPathWithinRoot(repoRootAbs, outAbs)) {
+    return { ok: false, error: `--out must be within repo root: ${repoRootAbs}` };
+  }
+
+  const outRel = path.relative(repoRootAbs, outAbs);
+  const tasksPrefix = `tasks${path.sep}`;
+  if (!outRel.startsWith(tasksPrefix) || !outRel.endsWith(".md")) {
+    return { ok: false, error: "--out must target a Markdown file under tasks/ (e.g. tasks/autonomous_status_report_YYYY_MM_DD.md)" };
+  }
+
+  if (isTrackedPath(outRel)) {
+    return { ok: false, error: `refusing to overwrite tracked file: ${outRel}` };
+  }
+
+  return { ok: true, outAbs, outRel };
+}
+
 function safeReadText(filePath) {
   return readFileSync(filePath, "utf8");
 }
@@ -168,6 +207,12 @@ if (args.help) {
 const repoRoot = runGit(["rev-parse", "--show-toplevel"]);
 process.chdir(repoRoot);
 
+const outCheck = validateOutPath(repoRoot, args.out);
+if (!outCheck.ok) {
+  process.stderr.write(`ERROR: ${outCheck.error}\n`);
+  process.exit(2);
+}
+
 const head = runGit(["log", "-1", "--pretty=format:%h %ad %s", "--date=iso-strict"]);
 const branch = runGit(["rev-parse", "--abbrev-ref", "HEAD"]);
 
@@ -265,6 +310,6 @@ lines.push("");
 
 const report = lines.join("\n") + "\n";
 if (args.out) {
-  writeFileSync(args.out, report, "utf8");
+  writeFileSync(outCheck.outAbs, report, "utf8");
 }
 process.stdout.write(report);
