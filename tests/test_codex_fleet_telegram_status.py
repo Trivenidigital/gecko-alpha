@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 from scripts.codex_fleet_telegram_status import (
     EventSummary,
     HostStatus,
+    branch_push_events_from_ref_commits,
     build_fleet_message,
     events_from_pr_list,
+    normalize_host_details,
     run_command,
     summarize_github_events,
     window_bounds,
@@ -132,6 +134,42 @@ def test_build_fleet_message_matches_operator_style():
     assert "parse_mode" not in message
 
 
+def test_build_fleet_message_pluralizes_zero_blockers_cleanly():
+    start = datetime(2026, 5, 23, 7, 41, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 23, 14, 41, tzinfo=timezone.utc)
+    summary = EventSummary(
+        distinct_prs=[],
+        pr_event_count=0,
+        unmatched_branch_pushes=[],
+        blocker_reports=[],
+        outside_recent_prs=[],
+        errors=[],
+    )
+
+    message = build_fleet_message(start, end, summary, [])
+
+    assert "0 runs produced blocker/no-PR reports." in message
+    assert "0 run produced a blocker/no-PR reports." not in message
+
+
+def test_normalize_remote_status_preserves_machine_readable_lines():
+    text = """**Status**
+hostname=srilu
+hermes-gateway=active
+failed_units=4
+disk=51% used,35G free
+**Risks**
+stale daily brief
+"""
+
+    assert normalize_host_details(text, remote_brief=True) == [
+        "hostname=srilu",
+        "hermes-gateway=active",
+        "failed_units=4",
+        "disk=51% used,35G free",
+    ]
+
+
 def test_run_command_timeout_returns_124_instead_of_raising():
     result = run_command(
         ["python", "-c", "import time; time.sleep(2)"],
@@ -166,3 +204,33 @@ def test_events_from_pr_list_synthesizes_open_and_update_events():
         "synchronize",
     ]
     assert events[-1]["payload"]["pull_request"]["head"]["ref"] == "codex/actionability"
+
+
+def test_branch_push_events_from_ref_commits_uses_commit_dates_in_window():
+    start = datetime(2026, 5, 23, 7, 41, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 23, 14, 41, tzinfo=timezone.utc)
+
+    events = branch_push_events_from_ref_commits(
+        "Trivenidigital/gecko-alpha",
+        [
+            {
+                "ref": "refs/heads/codex/manual-pr-needed",
+                "pushed_at": "2026-05-23T12:00:00Z",
+            },
+            {
+                "ref": "refs/heads/codex/outside",
+                "pushed_at": "2026-05-23T07:29:00Z",
+            },
+        ],
+        start,
+        end,
+    )
+
+    assert events == [
+        {
+            "type": "PushEvent",
+            "created_at": "2026-05-23T12:00:00Z",
+            "repo": {"name": "Trivenidigital/gecko-alpha"},
+            "payload": {"ref": "codex/manual-pr-needed"},
+        }
+    ]

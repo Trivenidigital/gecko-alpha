@@ -2,7 +2,7 @@
 
 ## Active Work: 2026-05-23 — Fleet Telegram status for 3 VPSes
 
-**Status:** IN-PROGRESS. Goal: configure Telegram status reporting for `main-vps`, `vpin-vps`, and `srilu-vps`: one central rolling 7-hour digest every 8 hours from Main VPS time, plus instant Telegram alerts for monitored Codex/Hermes systemd unit failures.
+**Status:** DEPLOYED 2026-05-23. Goal: configure Telegram status reporting for `main-vps`, `vpin-vps`, and `srilu-vps`: one central rolling 7-hour digest every 8 hours from Main VPS time, plus instant Telegram alerts for monitored Codex/Hermes systemd unit failures.
 
 Workflow checklist:
 - [x] Design approved in chat: central digest on main-vps + local instant failure hooks on each VPS
@@ -10,10 +10,17 @@ Workflow checklist:
 - [x] Existing ops surface discovered: daily `codex-readonly-operator-brief` on all 3, daily `codex-fleet-operator-brief` on main
 - [x] TDD red/green for digest formatter (`tests/test_codex_fleet_telegram_status.py`)
 - [x] Implementation plan saved: `docs/superpowers/plans/2026-05-23-fleet-telegram-status.md`
-- [ ] Deploy Telegram env + sender to all 3 VPSes
-- [ ] Deploy 8-hour fleet digest timer on main-vps
-- [ ] Deploy instant failure alert hooks on all 3 VPSes
-- [ ] Verify Telegram smoke messages, service success, timer status, and manual failure-alert path
+- [x] Deploy Telegram env + sender to all 3 VPSes
+- [x] Deploy 8-hour fleet digest timer on main-vps
+- [x] Deploy instant failure alert hooks on all 3 VPSes
+- [x] Verify Telegram smoke messages, service success, timer status, and manual failure-alert path
+
+Review:
+- Main timer: `codex-fleet-telegram-status.timer` enabled/active; next run observed at 2026-05-23 22:42 UTC, with `TimeoutStartSec=5min`.
+- Telegram verified: smoke messages sent from all 3 VPSes; synthetic `codex-systemd-failure-alert@...` units returned `Result=success` / `ExecMainStatus=0` on all 3.
+- Live status path: main collector forced-key entries on vpin/srilu now run `/usr/local/bin/codex-fleet-remote-status`, so every digest includes current `failed_units` instead of stale daily brief prose.
+- Current failures were reported once via Telegram during setup: main has 3 pre-existing failed units (`logrotate.service`, `prune-expense-receipts.service`, `shift-agent-backup.service`); srilu has 4 (`logrotate.service`, `prune-expense-receipts.service`, `send-routing-accuracy-summary-failure.service`, `send-routing-accuracy-summary.service`); vpin has 0.
+- Hygiene: removed stray `UNIT` line from `codex-production-push-loop-vpin.timer`; timer remained active/enabled after daemon reload.
 
 ## Active Work: 2026-05-23 — BL-NEW-LIVE-DECISION-COCKPIT (V1 live_candidates endpoint)
 

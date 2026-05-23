@@ -167,6 +167,35 @@ def events_from_pr_list(repo: str, prs: list[dict]) -> list[dict]:
     return sorted(events, key=lambda event: event.get("created_at", ""))
 
 
+def branch_push_events_from_ref_commits(
+    repo: str,
+    ref_commits: Iterable[dict],
+    start: datetime,
+    end: datetime,
+) -> list[dict]:
+    events: list[dict] = []
+    for item in ref_commits:
+        ref = str(item.get("ref") or "")
+        if not ref.startswith("refs/heads/"):
+            continue
+        branch = ref.removeprefix("refs/heads/")
+        pushed_at = item.get("pushed_at")
+        if not pushed_at:
+            continue
+        ts = parse_time(str(pushed_at))
+        if not start <= ts <= end:
+            continue
+        events.append(
+            {
+                "type": "PushEvent",
+                "created_at": fmt_time(ts),
+                "repo": {"name": repo},
+                "payload": {"ref": branch},
+            }
+        )
+    return sorted(events, key=lambda event: event.get("created_at", ""))
+
+
 def _pr_sort_key(value: str) -> tuple[str, int]:
     repo, _, number = value.partition("#")
     try:
@@ -186,6 +215,11 @@ def build_fleet_message(
     host_statuses: Iterable[HostStatus],
 ) -> str:
     prs = ", ".join(summary.distinct_prs) if summary.distinct_prs else "none"
+    blocker_count = len(summary.blocker_reports)
+    if blocker_count == 1:
+        blocker_line = "1 run produced a blocker/no-PR report."
+    else:
+        blocker_line = f"{blocker_count} runs produced blocker/no-PR reports."
     lines = [
         "Codex/Hermes fleet status",
         "",
@@ -200,10 +234,7 @@ def build_fleet_message(
             f"{len(summary.unmatched_branch_pushes)} branches were pushed but PR creation "
             "failed/awaits manual PR creation."
         ),
-        (
-            f"{len(summary.blocker_reports)} run {plural(len(summary.blocker_reports), 'produced', 'produced')} "
-            f"a blocker/no-PR {plural(len(summary.blocker_reports), 'report')}."
-        ),
+        blocker_line,
     ]
     if summary.outside_recent_prs:
         lines.append(
@@ -247,11 +278,12 @@ def run_command(command: list[str], timeout: int = 30) -> subprocess.CompletedPr
 
 def collect_repo_events(
     repos: Iterable[str],
-    since: datetime,
+    start: datetime,
+    end: datetime,
 ) -> tuple[dict[str, list[dict]], list[str]]:
     events: dict[str, list[dict]] = {}
     errors: list[str] = []
-    search_since = fmt_time(since - timedelta(minutes=20))
+    search_since = fmt_time(start - timedelta(minutes=20))
     for repo in repos:
         result = run_command(
             [
@@ -280,8 +312,60 @@ def collect_repo_events(
         except json.JSONDecodeError:
             errors.append(f"{repo}: gh pr list returned non-json")
             payload = []
-        events[repo] = events_from_pr_list(repo, payload if isinstance(payload, list) else [])
+        repo_events = events_from_pr_list(repo, payload if isinstance(payload, list) else [])
+        branch_events, branch_errors = collect_codex_branch_push_events(repo, start, end)
+        repo_events.extend(branch_events)
+        errors.extend(branch_errors)
+        events[repo] = sorted(repo_events, key=lambda event: event.get("created_at", ""))
     return events, errors
+
+
+def collect_codex_branch_push_events(
+    repo: str,
+    start: datetime,
+    end: datetime,
+) -> tuple[list[dict], list[str]]:
+    refs_result = run_command(
+        [
+            "gh",
+            "api",
+            f"repos/{repo}/git/matching-refs/heads/codex/",
+            "--paginate",
+        ],
+        timeout=25,
+    )
+    if refs_result.returncode != 0:
+        return [], [f"{repo}: gh refs scan failed rc={refs_result.returncode}"]
+    try:
+        refs_payload = json.loads(refs_result.stdout)
+    except json.JSONDecodeError:
+        return [], [f"{repo}: gh refs scan returned non-json"]
+    if not isinstance(refs_payload, list):
+        return [], [f"{repo}: gh refs scan returned unexpected payload"]
+
+    ref_commits: list[dict] = []
+    errors: list[str] = []
+    for ref in refs_payload[:80]:
+        branch_ref = ref.get("ref") if isinstance(ref, dict) else None
+        sha = ((ref.get("object") or {}).get("sha") if isinstance(ref, dict) else None)
+        if not branch_ref or not sha:
+            continue
+        commit_result = run_command(
+            [
+                "gh",
+                "api",
+                f"repos/{repo}/commits/{sha}",
+                "--jq",
+                ".commit.committer.date",
+            ],
+            timeout=12,
+        )
+        if commit_result.returncode != 0:
+            errors.append(f"{repo}:{branch_ref}: gh commit lookup failed rc={commit_result.returncode}")
+            continue
+        pushed_at = commit_result.stdout.strip()
+        ref_commits.append({"ref": branch_ref, "pushed_at": pushed_at})
+    return branch_push_events_from_ref_commits(repo, ref_commits, start, end), errors
 
 
 def collect_blocker_reports(start: datetime) -> list[str]:
@@ -326,7 +410,7 @@ def collect_host_statuses(hosts: Iterable[tuple[str, str]]) -> list[HostStatus]:
             )
             continue
         details = normalize_host_details(result.stdout, remote_brief=ssh_alias != "local")
-        errors = [line for line in details if line.endswith("=failed") or line == "failed_units=1"]
+        errors = [line for line in details if line.endswith("=failed")]
         failed_count = 0
         for line in details:
             if line.startswith("failed_units="):
@@ -334,6 +418,10 @@ def collect_host_statuses(hosts: Iterable[tuple[str, str]]) -> list[HostStatus]:
                     failed_count = int(line.split("=", 1)[1])
                 except ValueError:
                     failed_count = 1
+                if failed_count:
+                    errors.append(line)
+            elif line.startswith("failed_unit_list="):
+                errors.append(line)
         ok = failed_count == 0 and not any("=failed" in line for line in details)
         statuses.append(HostStatus(name=name, ok=ok, details=details, errors=errors))
     return statuses
@@ -353,8 +441,9 @@ def normalize_host_details(text: str, remote_brief: bool = False) -> list[str]:
             break
         if in_status:
             status_lines.append(line.strip("`"))
-    collapsed = " ".join(status_lines).replace("`", "")
-    return [collapsed[:500] if collapsed else "latest brief fetched"]
+    if status_lines:
+        return [line.replace("`", "")[:500] for line in status_lines]
+    return lines[:8] or ["latest brief fetched"]
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -402,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
     now = parse_time(args.now) if args.now else datetime.now(timezone.utc)
     start, end = window_bounds(now, hours=7)
     repos = tuple(args.repos or DEFAULT_REPOS)
-    events_by_repo, errors = collect_repo_events(repos, start)
+    events_by_repo, errors = collect_repo_events(repos, start, end)
     summary = summarize_github_events(events_by_repo, start, end)
     summary.errors.extend(errors)
     summary.blocker_reports.extend(collect_blocker_reports(start))
