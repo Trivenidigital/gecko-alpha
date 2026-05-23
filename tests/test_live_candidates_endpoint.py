@@ -273,6 +273,65 @@ async def test_live_candidates_empty_cohort_returns_envelope(client):
     assert payload["rows"] == []
 
 
+async def test_live_candidates_counter_flags_drops_garbage_items(client):
+    # Defensive: even if a historical predictions.counter_flags row stores a
+    # list with None/int/other primitive items, the loader must drop them
+    # rather than 500 the entire endpoint.
+    import json as _json
+
+    c, db = client
+    await _insert_open_trade(
+        db._conn,
+        token_id="litecoin",
+        symbol="LTC",
+        entry_price=50.0,
+        actionable=1,
+        would_be_live=1,
+    )
+    await _upsert_price_cache(db._conn, coin_id="litecoin", current_price=51.0)
+    # Raw JSON written into the predictions row — intentionally heterogeneous.
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO predictions
+           (category_id, category_name, coin_id, symbol, name,
+            market_cap_at_prediction, price_at_prediction,
+            narrative_fit_score, staying_power, confidence, reasoning,
+            strategy_snapshot, predicted_at, counter_flags)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "cat",
+            "test_category",
+            "litecoin",
+            "LTC",
+            "Litecoin",
+            1_000_000.0,
+            50.0,
+            55,
+            "medium",
+            "medium",
+            "test",
+            "{}",
+            now,
+            _json.dumps([
+                {"flag": "real_flag", "severity": "low", "detail": "ok"},
+                None,
+                42,
+                "legacy_string_flag",
+            ]),
+        ),
+    )
+    await db._conn.commit()
+
+    resp = await c.get("/api/live_candidates")
+    assert resp.status_code == 200, resp.text
+    row = next(r for r in resp.json()["rows"] if r["token_id"] == "litecoin")
+    # None and 42 dropped; dict + str kept.
+    assert row["counter_flags"] == [
+        {"flag": "real_flag", "severity": "low", "detail": "ok"},
+        "legacy_string_flag",
+    ]
+
+
 async def test_live_candidates_counter_flags_accepts_rich_dict_shape(client):
     # Regression: predictions.counter_flags in prod is a list of dicts
     # ({flag, severity, detail}) — model previously declared list[str] and
