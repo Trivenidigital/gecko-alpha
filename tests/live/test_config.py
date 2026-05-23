@@ -13,6 +13,7 @@ def _base_kwargs(**over):
         TELEGRAM_BOT_TOKEN="t",
         TELEGRAM_CHAT_ID="c",
         ANTHROPIC_API_KEY="k",
+        _env_file=None,
     )
     kw.update(over)
     return kw

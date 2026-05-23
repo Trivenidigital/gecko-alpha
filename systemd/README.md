@@ -13,6 +13,9 @@ Production unit files for the gecko-alpha services. Captured verbatim from `sril
 | `minara-emission-persistence-watchdog.service` + `.timer` | Minara emission persistence freshness | hourly |
 | `systemd-drift-watchdog.service` + `.timer` | repo-prod unit-file drift detection + drop-in enumeration | daily 09:30 UTC; alerts via TG; ack-tombstone suppresses re-alert on unchanged drift-set; manual override `rm /var/lib/gecko-alpha/systemd-drift-watchdog/last_alerted_hash` |
 | `chain-anchor-health-watchdog.service` + `.timer` | chain-pattern anchor freshness watchdog | hourly; alerts when protected built-ins are inactive or anchor-eligible events are present while matching `active_chains` rows are stale |
+| `codex-systemd-failure-alert@.service` | Telegram alert handler for failed Codex/Hermes units | template; uses `%i`, `Restart=no`; do not attach `OnFailure=` to this handler |
+| `codex-systemd-auto-remediate@.service` | guarded deterministic repair handler for failed Codex/Hermes units | template; uses `%i`, `Restart=no`; exact allowlist lives in `scripts/codex_systemd_auto_remediate.py` |
+| `codex-telegram-onfailure.conf` | drop-in fragment for monitored Codex/Hermes units | attaches both alert and remediation handlers; install with `scripts/install_codex_systemd_remediation.sh` |
 
 ## Deploy workflow
 
@@ -37,6 +40,17 @@ bash cron/deploy.sh
 sudo systemctl enable --now gecko-backup.timer gecko-backup-watchdog.timer \
     minara-emission-persistence-watchdog.timer chain-anchor-health-watchdog.timer
 ```
+
+**Codex/Hermes remediation templates:**
+
+The remediation templates are source-controlled here so reviewers can see the safety-critical `%i`, `Restart=no`, and no-handler-recursion behavior. Install them with explicit unit targets:
+
+```bash
+sudo bash scripts/install_codex_systemd_remediation.sh \
+    hermes-gateway.service gecko-pipeline.service gecko-dashboard.service
+```
+
+Do not pass `codex-systemd-failure-alert@*.service` or `codex-systemd-auto-remediate@*.service` to the installer; it refuses handler recursion.
 
 **Restart blast-radius (V35 fold):**
 

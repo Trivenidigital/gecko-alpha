@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -37,7 +38,7 @@ def _run(
     env["CLAUDE_FILE_PATH"] = file_path
     env["CLAUDE_TOOL_INPUT"] = json.dumps(tool_input)
     return subprocess.run(
-        ["python", str(HOOK_SCRIPT)],
+        [sys.executable, str(HOOK_SCRIPT)],
         env=env,
         cwd=str(cwd) if cwd else None,
         capture_output=True,
@@ -147,7 +148,7 @@ def test_malformed_tool_input_fails_closed():
     env["CLAUDE_FILE_PATH"] = "tasks/plan_bad.md"
     env["CLAUDE_TOOL_INPUT"] = "{not valid json"
     r = subprocess.run(
-        ["python", str(HOOK_SCRIPT)], env=env, capture_output=True, text=True
+        [sys.executable, str(HOOK_SCRIPT)], env=env, capture_output=True, text=True
     )
     assert r.returncode == 2
     assert "not valid JSON" in r.stderr
@@ -162,7 +163,7 @@ def test_empty_tool_name_on_gated_path_fails_closed():
         {"file_path": "tasks/plan_x.md", "content": "# foo"}
     )
     r = subprocess.run(
-        ["python", str(HOOK_SCRIPT)], env=env, capture_output=True, text=True
+        [sys.executable, str(HOOK_SCRIPT)], env=env, capture_output=True, text=True
     )
     assert r.returncode == 2
     assert "CLAUDE_TOOL_NAME env var was empty" in r.stderr
