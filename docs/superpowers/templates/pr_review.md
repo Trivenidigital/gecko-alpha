@@ -8,7 +8,7 @@ One paragraph: what changes and what explicitly does not change.
 
 ## Drift check (is this PR obsolete?)
 
-- Compare against current `origin/master` (not only merge-base intent).
+- Compare against current `origin/master` (not only merge-base intent). If `git fetch origin` cannot run (no credentials / restricted network), record the base SHA + timestamp used and treat drift-check conclusions as conditional until a successful fetch confirms freshness.
 - Identify any primitives already shipped on master.
 
 ## Hermes-first analysis (if PR introduces new primitives)
@@ -47,4 +47,3 @@ Confirm PR does NOT cross operator-only gates (or explicitly mark it blocked):
 - APPROVE / APPROVE_WITH_FOLDS / REWORK / BLOCK
 - Critical folds:
 - Important folds:
-
