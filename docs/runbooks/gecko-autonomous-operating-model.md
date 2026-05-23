@@ -63,6 +63,8 @@ Requires explicit operator approval:
 | .env / flags / secrets | production config | no | operator must verify |
 | Vendor quotas/billing | vendor account | no | operator must verify |
 
+**Freshness caveat:** when `git fetch origin` cannot run (no credentials / restricted network), any “compare against `origin/master`” drift-check may be stale. Record the base commit SHA + commit timestamp used for the session, and treat drift conclusions as conditional until a successful fetch confirms the base is current.
+
 ## Multi-vector review dispatch
 
 Trigger multi-vector review when:
@@ -79,4 +81,3 @@ Suggested orthogonal vectors:
 ## Dashboard safety note (read-only surfaces only)
 
 The dashboard server includes write endpoints; do not add UI affordances that could be mistaken for enabling writes unless auth/network restriction is explicitly verified by the operator.
-
