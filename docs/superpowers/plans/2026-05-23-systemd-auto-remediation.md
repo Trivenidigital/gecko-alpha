@@ -153,6 +153,10 @@ Run: `git add tasks/todo.md docs/superpowers/plans/2026-05-23-systemd-auto-remed
 - Deploy: `/usr/local/bin/codex-systemd-auto-remediate`
 - Deploy: `/etc/systemd/system/codex-systemd-failure-alert@.service`
 - Deploy: `/etc/systemd/system/codex-systemd-auto-remediate@.service`
+- Create: `systemd/codex-systemd-failure-alert@.service`
+- Create: `systemd/codex-systemd-auto-remediate@.service`
+- Create: `systemd/codex-telegram-onfailure.conf`
+- Create: `scripts/install_codex_systemd_remediation.sh`
 
 - [ ] **Step 1: Copy scripts to all VPSes**
 

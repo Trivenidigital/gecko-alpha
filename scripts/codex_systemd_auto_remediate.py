@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -51,6 +52,7 @@ class RemediationResult:
 class RemediationContext:
     host: str
     state_dir: Path
+    lock_dir: Path
     audit_path: Path
     runner: Callable[[list[str], int], str]
     sender: Callable[[str], None]
@@ -63,15 +65,19 @@ def fmt_time(value: datetime) -> str:
 
 
 def run_text(command: list[str], timeout: int = 15) -> str:
-    result = subprocess.run(
-        command,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout,
-        check=False,
-    )
-    return result.stdout
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+        )
+        return result.stdout
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout if isinstance(exc.stdout, str) else ""
+        raise RuntimeError(f"command timed out after {timeout}s: {' '.join(command)}\n{output}") from exc
 
 
 def send_telegram(message: str) -> None:
@@ -87,6 +93,7 @@ def default_context(host: str) -> RemediationContext:
     return RemediationContext(
         host=host,
         state_dir=Path("/var/lib/codex-remediation"),
+        lock_dir=Path("/run/codex-remediation"),
         audit_path=Path("/var/log/codex-remediation.log"),
         runner=run_text,
         sender=send_telegram,
@@ -112,29 +119,44 @@ def state_file_for(state_dir: Path, unit: str) -> Path:
     return state_dir / f"{unit}.last_attempt"
 
 
-def acquire_lock(unit: str) -> int | None:
-    lock_dir = Path("/run/codex-remediation")
+def lock_file_for(lock_dir: Path, unit: str) -> Path:
+    safe_unit = re.sub(r"[^A-Za-z0-9_.@-]", "_", unit)
+    return lock_dir / f"{safe_unit}.lock"
+
+
+def acquire_lock(unit: str, lock_dir: Path) -> int | None:
     try:
         lock_dir.mkdir(parents=True, exist_ok=True)
-        fd = os.open(lock_dir / f"{unit}.lock", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        os.write(fd, str(os.getpid()).encode("ascii"))
+        fd = os.open(lock_file_for(lock_dir, unit), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            import fcntl  # type: ignore[import-not-found]
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return None
+        except ImportError:
+            pass
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()} {datetime.now(timezone.utc).isoformat()}".encode("ascii"))
         return fd
-    except FileExistsError:
-        return None
     except OSError:
         return -1
 
 
-def release_lock(fd: int | None, unit: str) -> None:
+def release_lock(fd: int | None, unit: str, lock_dir: Path) -> None:
     if fd is None:
         return
     try:
+        try:
+            import fcntl  # type: ignore[import-not-found]
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except ImportError:
+            pass
         os.close(fd)
     finally:
-        try:
-            (Path("/run/codex-remediation") / f"{unit}.lock").unlink()
-        except FileNotFoundError:
-            pass
+        return
 
 
 def cooldown_remaining(
@@ -238,23 +260,26 @@ def validate_unit(
     if unit not in context_allowlist(context):
         return False, skip(unit, "skipped_unallowlisted", "unit is not in repair allowlist", context, telegram_errors), {}
 
-    show = parse_show_output(
-        context.runner(
-            [
-                "systemctl",
-                "show",
-                unit,
-                "-p",
-                "LoadState",
-                "-p",
-                "UnitFileState",
-                "-p",
-                "Type",
-                "--no-pager",
-            ],
-            15,
+    try:
+        show = parse_show_output(
+            context.runner(
+                [
+                    "systemctl",
+                    "show",
+                    unit,
+                    "-p",
+                    "LoadState",
+                    "-p",
+                    "UnitFileState",
+                    "-p",
+                    "Type",
+                    "--no-pager",
+                ],
+                15,
+            )
         )
-    )
+    except Exception as exc:
+        return False, skip(unit, "skipped_state_unavailable", f"systemctl show failed: {exc}", context, telegram_errors), {}
     if show.get("LoadState") != "loaded":
         return False, skip(unit, "skipped_bad_load_state", f"LoadState={show.get('LoadState', 'unknown')}", context, telegram_errors), show
     if show.get("UnitFileState") not in ALLOWED_UNIT_FILE_STATES:
@@ -275,7 +300,7 @@ def remediate_unit(
     if not ok:
         return early_result  # type: ignore[return-value]
 
-    lock_fd = acquire_lock(unit)
+    lock_fd = acquire_lock(unit, context.lock_dir)
     if lock_fd == -1:
         return skip(unit, "skipped_state_unavailable", "lock state unavailable", context, telegram_errors)
     if lock_fd is None:
@@ -296,11 +321,35 @@ def remediate_unit(
 
         started = RemediationResult(unit=unit, action="repair_started", reason="attempting reset-failed and start")
         send_best_effort(started, context, telegram_errors)
-        context.runner(["systemctl", "reset-failed", unit], 20)
-        context.runner(["systemctl", "start", unit], 60)
+        try:
+            context.runner(["systemctl", "reset-failed", unit], 20)
+            context.runner(["systemctl", "start", unit], 60)
+        except Exception as exc:
+            return finish(
+                RemediationResult(
+                    unit=unit,
+                    action="needs_operator_action",
+                    reason=f"systemctl repair command failed: {exc}",
+                    status="unknown",
+                ),
+                context,
+                telegram_errors,
+            )
         status = "unknown"
         for _ in range(policy.poll_attempts):
-            status = context.runner(["systemctl", "is-active", unit], 15).strip() or "unknown"
+            try:
+                status = context.runner(["systemctl", "is-active", unit], 15).strip() or "unknown"
+            except Exception as exc:
+                return finish(
+                    RemediationResult(
+                        unit=unit,
+                        action="needs_operator_action",
+                        reason=f"status poll failed: {exc}",
+                        status=status,
+                    ),
+                    context,
+                    telegram_errors,
+                )
             if status == "active":
                 return finish(
                     RemediationResult(unit=unit, action="repaired", reason="unit active after restart", status=status),
@@ -309,7 +358,10 @@ def remediate_unit(
                 )
             context.sleep(policy.poll_seconds)
 
-        journal = context.runner(["journalctl", "-u", unit, "-n", "20", "--no-pager"], 15).strip()
+        try:
+            journal = context.runner(["journalctl", "-u", unit, "-n", "20", "--no-pager"], 15).strip()
+        except Exception as exc:
+            journal = f"[journal unavailable: {exc}]"
         reason = "unit did not become active"
         if journal:
             reason += "; recent journal: " + journal[-1000:]
@@ -319,7 +371,7 @@ def remediate_unit(
             telegram_errors,
         )
     finally:
-        release_lock(lock_fd, unit)
+        release_lock(lock_fd, unit, context.lock_dir)
 
 
 def build_parser() -> argparse.ArgumentParser:

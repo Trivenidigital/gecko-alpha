@@ -7,6 +7,8 @@ from scripts.codex_systemd_failure_alert import build_failure_message, normalize
 from scripts.codex_systemd_auto_remediate import (
     RemediationContext,
     RemediationPolicy,
+    acquire_lock,
+    release_lock,
     remediate_unit,
     with_allowlist,
 )
@@ -80,6 +82,18 @@ class FakeRunner:
         return ""
 
 
+class RaisingRunner(FakeRunner):
+    def __init__(self, show: dict[str, str], raise_on: str):
+        super().__init__(show)
+        self.raise_on = raise_on
+
+    def __call__(self, command: list[str], timeout: int = 15) -> str:
+        self.commands.append(tuple(command))
+        if self.raise_on in command:
+            raise RuntimeError(f"{self.raise_on} exploded")
+        return super().__call__(command, timeout)
+
+
 def test_remediator_rejects_slash_unit_without_mutating_systemd(tmp_path):
     runner = FakeRunner(
         {
@@ -95,6 +109,7 @@ def test_remediator_rejects_slash_unit_without_mutating_systemd(tmp_path):
         RemediationContext(
             host="main-vps",
             state_dir=tmp_path,
+            lock_dir=tmp_path / "locks",
             audit_path=tmp_path / "audit.log",
             runner=runner,
             sender=sent.append,
@@ -123,6 +138,7 @@ def test_remediator_skips_unallowlisted_or_oneshot_units(tmp_path):
         RemediationContext(
             host="main-vps",
             state_dir=tmp_path,
+            lock_dir=tmp_path / "locks",
             audit_path=tmp_path / "audit.log",
             runner=runner,
             sender=sent.append,
@@ -149,6 +165,7 @@ def test_remediator_skips_unallowlisted_unit_before_show(tmp_path):
         RemediationContext(
             host="main-vps",
             state_dir=tmp_path,
+            lock_dir=tmp_path / "locks",
             audit_path=tmp_path / "audit.log",
             runner=runner,
             sender=lambda _: None,
@@ -175,6 +192,7 @@ def test_remediator_skips_static_not_found_or_generated_states(tmp_path):
             RemediationContext(
                 host="main-vps",
                 state_dir=tmp_path / state,
+                lock_dir=tmp_path / state / "locks",
                 audit_path=tmp_path / state / "audit.log",
                 runner=runner,
                 sender=lambda _: None,
@@ -201,6 +219,7 @@ def test_remediator_skips_handler_units_without_mutating(tmp_path):
         RemediationContext(
             host="main-vps",
             state_dir=tmp_path,
+            lock_dir=tmp_path / "locks",
             audit_path=tmp_path / "audit.log",
             runner=runner,
             sender=lambda _: None,
@@ -229,6 +248,7 @@ def test_remediator_persists_cooldown_before_reset_and_start(tmp_path):
         RemediationContext(
             host="main-vps",
             state_dir=tmp_path,
+            lock_dir=tmp_path / "locks",
             audit_path=tmp_path / "audit.log",
             runner=runner,
             sender=sent.append,
@@ -261,6 +281,7 @@ def test_remediator_cooldown_skips_without_mutating(tmp_path):
         RemediationContext(
             host="main-vps",
             state_dir=tmp_path,
+            lock_dir=tmp_path / "locks",
             audit_path=tmp_path / "audit.log",
             runner=runner,
             sender=lambda _: None,
@@ -292,6 +313,7 @@ def test_remediator_failed_cooldown_state_fails_closed(monkeypatch, tmp_path):
         RemediationContext(
             host="main-vps",
             state_dir=tmp_path,
+            lock_dir=tmp_path / "locks",
             audit_path=tmp_path / "audit.log",
             runner=runner,
             sender=lambda _: None,
@@ -322,6 +344,7 @@ def test_remediator_telegram_failure_does_not_block_repair(tmp_path):
         RemediationContext(
             host="main-vps",
             state_dir=tmp_path,
+            lock_dir=tmp_path / "locks",
             audit_path=tmp_path / "audit.log",
             runner=runner,
             sender=broken_sender,
@@ -350,6 +373,7 @@ def test_remediator_still_failed_needs_operator_action(tmp_path):
         RemediationContext(
             host="main-vps",
             state_dir=tmp_path,
+            lock_dir=tmp_path / "locks",
             audit_path=tmp_path / "audit.log",
             runner=runner,
             sender=lambda _: None,
@@ -376,6 +400,7 @@ def test_remediator_extra_allowlist_supports_disposable_verification(tmp_path):
         RemediationContext(
             host="main-vps",
             state_dir=tmp_path,
+            lock_dir=tmp_path / "locks",
             audit_path=tmp_path / "audit.log",
             runner=runner,
             sender=lambda _: None,
@@ -389,3 +414,75 @@ def test_remediator_extra_allowlist_supports_disposable_verification(tmp_path):
 
     assert result.action == "repaired"
     assert tuple(["systemctl", "start", "codex-remediation-flaky.service"]) in runner.commands
+
+
+def test_remediator_runner_exception_before_mutation_is_audited_skip(tmp_path):
+    runner = RaisingRunner(
+        {
+            "LoadState": "loaded",
+            "UnitFileState": "enabled",
+            "Type": "simple",
+        },
+        "show",
+    )
+
+    result = remediate_unit(
+        "hermes-gateway.service",
+        RemediationContext(
+            host="main-vps",
+            state_dir=tmp_path,
+            lock_dir=tmp_path / "locks",
+            audit_path=tmp_path / "audit.log",
+            runner=runner,
+            sender=lambda _: None,
+            now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
+            sleep=lambda _: None,
+        ),
+    )
+
+    assert result.action == "skipped_state_unavailable"
+    assert "systemctl show failed" in result.reason
+    assert "reset-failed" not in " ".join(" ".join(command) for command in runner.commands)
+    assert "skipped_state_unavailable" in (tmp_path / "audit.log").read_text(encoding="utf-8")
+
+
+def test_remediator_runner_exception_after_mutation_needs_operator_action(tmp_path):
+    runner = RaisingRunner(
+        {
+            "LoadState": "loaded",
+            "UnitFileState": "enabled",
+            "Type": "simple",
+        },
+        "start",
+    )
+
+    result = remediate_unit(
+        "hermes-gateway.service",
+        RemediationContext(
+            host="main-vps",
+            state_dir=tmp_path,
+            lock_dir=tmp_path / "locks",
+            audit_path=tmp_path / "audit.log",
+            runner=runner,
+            sender=lambda _: None,
+            now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
+            sleep=lambda _: None,
+        ),
+    )
+
+    assert result.action == "needs_operator_action"
+    assert tuple(["systemctl", "reset-failed", "hermes-gateway.service"]) in runner.commands
+    assert "start exploded" in (tmp_path / "audit.log").read_text(encoding="utf-8")
+
+
+def test_advisory_lock_allows_preexisting_unlocked_file(tmp_path):
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir()
+    (lock_dir / "hermes-gateway.service.lock").write_text("stale", encoding="utf-8")
+
+    fd = acquire_lock("hermes-gateway.service", lock_dir)
+    try:
+        assert isinstance(fd, int)
+    finally:
+        release_lock(fd, "hermes-gateway.service", lock_dir)
+
