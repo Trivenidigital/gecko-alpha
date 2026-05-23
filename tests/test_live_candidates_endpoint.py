@@ -98,6 +98,45 @@ async def _upsert_price_cache(
     await conn.commit()
 
 
+async def _insert_prediction(
+    conn,
+    *,
+    coin_id: str,
+    counter_flags: list,
+    narrative_fit_score: int = 50,
+    counter_risk_score: int = 30,
+):
+    """Minimal predictions insert covering only the columns the cockpit reads."""
+    now = datetime.now(timezone.utc).isoformat()
+    await conn.execute(
+        """INSERT INTO predictions
+           (category_id, category_name, coin_id, symbol, name,
+            market_cap_at_prediction, price_at_prediction,
+            narrative_fit_score, staying_power, confidence, reasoning,
+            strategy_snapshot, predicted_at,
+            counter_risk_score, counter_flags)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "cat",
+            "test_category",
+            coin_id,
+            coin_id.upper(),
+            coin_id.title(),
+            1_000_000.0,
+            1.0,
+            narrative_fit_score,
+            "medium",
+            "medium",
+            "test",
+            "{}",
+            now,
+            counter_risk_score,
+            json.dumps(counter_flags),
+        ),
+    )
+    await conn.commit()
+
+
 def _assert_envelope(payload: dict, *, expected_open_trades: int | None = None):
     assert "meta" in payload
     assert "rows" in payload
@@ -232,6 +271,41 @@ async def test_live_candidates_empty_cohort_returns_envelope(client):
     payload = resp.json()
     _assert_envelope(payload, expected_open_trades=0)
     assert payload["rows"] == []
+
+
+async def test_live_candidates_counter_flags_accepts_rich_dict_shape(client):
+    # Regression: predictions.counter_flags in prod is a list of dicts
+    # ({flag, severity, detail}) — model previously declared list[str] and
+    # 500'd on rows whose token had counter_flags rows.
+    c, db = client
+    await _insert_open_trade(
+        db._conn,
+        token_id="polkadot",
+        symbol="DOT",
+        entry_price=10.0,
+        actionable=1,
+        would_be_live=1,
+    )
+    await _upsert_price_cache(db._conn, coin_id="polkadot", current_price=10.4)
+    rich_flags = [
+        {"flag": "dead_project", "severity": "high",
+         "detail": "Zero commits in the last 4 weeks"},
+        {"flag": "weak_community", "severity": "high",
+         "detail": "Reddit subscribers (0) below 100"},
+    ]
+    await _insert_prediction(
+        db._conn,
+        coin_id="polkadot",
+        counter_flags=rich_flags,
+        counter_risk_score=72,
+    )
+
+    resp = await c.get("/api/live_candidates")
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    row = next(r for r in payload["rows"] if r["token_id"] == "polkadot")
+    assert row["counter_flags"] == rich_flags
+    assert row["counter_risk_score"] == 72
 
 
 async def test_live_candidates_query_caps(client):

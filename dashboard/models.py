@@ -132,7 +132,7 @@ class LiveCandidateResponse(BaseModel):
 
     narrative_fit_score: int | None = None
     counter_risk_score: int | None = None
-    counter_flags: list[str] = []
+    counter_flags: list[dict | str] = []
     latest_chain_match: dict | None = None
 
     entry_quality: LiveCandidateEntryQuality
