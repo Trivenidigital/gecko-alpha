@@ -982,25 +982,62 @@ def _parse_iso_dt(value: str | None) -> datetime | None:
         return None
 
 
+def _live_candidates_meta(
+    *,
+    limit: int,
+    window_hours: int,
+    open_trades_scanned: int,
+    rows_returned: int,
+    generated_at: str,
+) -> dict:
+    return {
+        "read_only": True,
+        "not_trade_advice": True,
+        "experimental": True,
+        "generated_at": generated_at,
+        "window_hours": window_hours,
+        "limit": limit,
+        "open_trades_scanned": open_trades_scanned,
+        "rows_returned": rows_returned,
+    }
+
+
 async def get_live_candidates(
     db_path: str, *, limit: int = 20, window_hours: int = 36
-) -> list[dict]:
+) -> dict:
     """Read-only per-token "live candidates" cockpit.
 
     V1 is deterministic and visibility-only: no writes, no execution, no LLM.
     Primary cohort is `paper_trades.status='open'`. Optional context looks back
     `window_hours` for recent trade ids + surfaces.
+
+    Returns an envelope ``{"meta": {...}, "rows": [...]}`` so consumers always
+    see the read-only / not-trade-advice flags + row counts, even when ``rows``
+    is empty.
     """
-    # Defensive clamps (FastAPI Query caps should prevent out-of-range).
     limit = max(1, min(int(limit), 50))
     window_hours = max(6, min(int(window_hours), 72))
 
     now = datetime.now(timezone.utc)
+    generated_at = now.isoformat()
     cutoff_iso = (now - timedelta(hours=window_hours)).isoformat()
 
     disclaimer = "read-only labels; not trading advice; triggers no actions"
     stale_warn_age = timedelta(hours=1)
     stale_hard_age = timedelta(hours=2)
+    log = structlog.get_logger()
+
+    def _envelope(rows: list[dict], scanned: int) -> dict:
+        return {
+            "meta": _live_candidates_meta(
+                limit=limit,
+                window_hours=window_hours,
+                open_trades_scanned=scanned,
+                rows_returned=len(rows),
+                generated_at=generated_at,
+            ),
+            "rows": rows,
+        }
 
     async with _ro_db(db_path) as db:
         try:
@@ -1016,11 +1053,14 @@ async def get_live_candidates(
             )
             open_rows = await cursor.fetchall()
         except aiosqlite.OperationalError:
-            # Fresh DB / feature off: no paper_trades table yet.
-            return []
+            log.warning(
+                "live_candidates_empty_cohort",
+                reason="paper_trades_table_missing",
+                rows_returned=0,
+                window_hours=window_hours,
+            )
+            return _envelope([], 0)
 
-        # Pick one canonical open trade per token (most-recent opened_at),
-        # while retaining *all* open trade ids in case the invariant breaks.
         open_primary_by_token: dict[str, dict] = {}
         open_ids_by_token: dict[str, list[int]] = {}
         token_order: list[str] = []
@@ -1034,7 +1074,14 @@ async def get_live_candidates(
                     break
 
         if not token_order:
-            return []
+            log.warning(
+                "live_candidates_empty_cohort",
+                reason="no_open_trades",
+                rows_returned=0,
+                open_trades_scanned=len(open_rows),
+                window_hours=window_hours,
+            )
+            return _envelope([], len(open_rows))
 
         # Recent context: ids + surfaces within the lookback window, restricted
         # to the token_ids already in the open set (bounded).
@@ -1236,11 +1283,14 @@ async def get_live_candidates(
         elif actionable == 0:
             verdict = "blocked"
             risk_reasons.append("not_actionable")
+        elif actionable is None:
+            verdict = "data_insufficient"
+            risk_reasons.append("actionable_null_pre_cutover")
         elif actionable == 1 and would_be_live == 1 and eq in (
             "fresh_entry",
             "acceptable_pullback",
         ):
-            verdict = "candidate"
+            verdict = "candidate_review"
         else:
             verdict = "watch"
 
@@ -1248,6 +1298,8 @@ async def get_live_candidates(
             inclusion_reasons.append("actionable=1")
         elif actionable == 0:
             inclusion_reasons.append("actionable=0")
+        elif actionable is None:
+            inclusion_reasons.append("actionable=null")
 
         if would_be_live == 1:
             inclusion_reasons.append("would_be_live=1")
@@ -1291,10 +1343,8 @@ async def get_live_candidates(
             }
         )
 
-    # Stable output ordering: candidate > watch > blocked > data_insufficient,
-    # then by opened_at desc when parseable.
     verdict_rank = {
-        "candidate": 0,
+        "candidate_review": 0,
         "watch": 1,
         "blocked": 2,
         "data_insufficient": 3,
@@ -1306,7 +1356,15 @@ async def get_live_candidates(
         return (verdict_rank.get(r.get("verdict"), 9), -ts)
 
     results.sort(key=_sort_key)
-    return results[:limit]
+    sliced = results[:limit]
+    log.info(
+        "live_candidates_returned",
+        open_trades_scanned=len(open_rows),
+        unique_tokens=len(token_order),
+        rows_returned=len(sliced),
+        window_hours=window_hours,
+    )
+    return _envelope(sliced, len(open_rows))
 
 
 async def get_trading_history(

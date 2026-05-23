@@ -90,7 +90,12 @@ class SearchResponse(BaseModel):
     truncated: bool = False
 
 
-LiveCandidateVerdict = Literal["candidate", "watch", "blocked", "data_insufficient"]
+LiveCandidateVerdict = Literal[
+    "candidate_review",
+    "watch",
+    "blocked",
+    "data_insufficient",
+]
 LiveCandidateEntryQuality = Literal[
     "fresh_entry",
     "acceptable_pullback",
@@ -102,7 +107,6 @@ LiveCandidateEntryQuality = Literal[
 
 
 class LiveCandidateResponse(BaseModel):
-    # Explicit per-row reminder: endpoint is visibility-only.
     disclaimer: str
 
     token_id: str
@@ -126,7 +130,6 @@ class LiveCandidateResponse(BaseModel):
     price_updated_at: str | None = None
     price_is_stale: bool = False
 
-    # Optional enrichments (best-effort; never required for correctness).
     narrative_fit_score: int | None = None
     counter_risk_score: int | None = None
     counter_flags: list[str] = []
@@ -136,3 +139,19 @@ class LiveCandidateResponse(BaseModel):
     verdict: LiveCandidateVerdict
     inclusion_reasons: list[str] = []
     risk_reasons: list[str] = []
+
+
+class LiveCandidateMeta(BaseModel):
+    read_only: bool = True
+    not_trade_advice: bool = True
+    experimental: bool = True
+    generated_at: str
+    window_hours: int
+    limit: int
+    open_trades_scanned: int
+    rows_returned: int
+
+
+class LiveCandidateCockpit(BaseModel):
+    meta: LiveCandidateMeta
+    rows: list[LiveCandidateResponse] = []

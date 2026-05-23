@@ -17,7 +17,7 @@ from dashboard.models import (
     AlertResponse,
     CandidateResponse,
     FunnelResponse,
-    LiveCandidateResponse,
+    LiveCandidateCockpit,
     SignalHitRate,
     StatusResponse,
     WinRateResponse,
@@ -253,14 +253,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     # --- Paper trading endpoints ---
 
-    @app.get("/api/live_candidates", response_model=list[LiveCandidateResponse])
+    @app.get("/api/live_candidates", response_model=LiveCandidateCockpit)
     async def get_live_candidates(
         limit: int = Query(20, ge=1, le=50),
         window_hours: int = Query(36, ge=6, le=72),
     ):
-        """Read-only per-token “live candidates” cockpit.
+        """Read-only per-token "live candidates" cockpit.
 
         Visibility-only labels: not trading advice; triggers no actions.
+        Returns `{meta: {...}, rows: [...]}`; the `meta` envelope always
+        carries `read_only=true`, `not_trade_advice=true`, `experimental=true`.
         """
         return await db.get_live_candidates(
             _db_path, limit=limit, window_hours=window_hours

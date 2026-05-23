@@ -98,6 +98,19 @@ async def _upsert_price_cache(
     await conn.commit()
 
 
+def _assert_envelope(payload: dict, *, expected_open_trades: int | None = None):
+    assert "meta" in payload
+    assert "rows" in payload
+    meta = payload["meta"]
+    assert meta["read_only"] is True
+    assert meta["not_trade_advice"] is True
+    assert meta["experimental"] is True
+    assert meta["rows_returned"] == len(payload["rows"])
+    assert meta["generated_at"]
+    if expected_open_trades is not None:
+        assert meta["open_trades_scanned"] == expected_open_trades
+
+
 async def test_live_candidates_candidate(client):
     c, db = client
     await _insert_open_trade(
@@ -112,11 +125,13 @@ async def test_live_candidates_candidate(client):
 
     resp = await c.get("/api/live_candidates")
     assert resp.status_code == 200
-    rows = resp.json()
+    payload = resp.json()
+    _assert_envelope(payload, expected_open_trades=1)
+    rows = payload["rows"]
     assert rows
     row = rows[0]
     assert row["token_id"] == "bitcoin"
-    assert row["verdict"] == "candidate"
+    assert row["verdict"] == "candidate_review"
     assert row["entry_quality"] in ("fresh_entry", "acceptable_pullback")
     assert row["disclaimer"]
 
@@ -133,7 +148,9 @@ async def test_live_candidates_missing_price_is_data_insufficient(client):
     )
     resp = await c.get("/api/live_candidates")
     assert resp.status_code == 200
-    rows = resp.json()
+    payload = resp.json()
+    _assert_envelope(payload, expected_open_trades=1)
+    rows = payload["rows"]
     assert rows
     row = next(r for r in rows if r["token_id"] == "ethereum")
     assert row["verdict"] == "data_insufficient"
@@ -157,7 +174,9 @@ async def test_live_candidates_extreme_stale_price_is_data_insufficient(client):
 
     resp = await c.get("/api/live_candidates")
     assert resp.status_code == 200
-    row = next(r for r in resp.json() if r["token_id"] == "solana")
+    payload = resp.json()
+    _assert_envelope(payload, expected_open_trades=1)
+    row = next(r for r in payload["rows"] if r["token_id"] == "solana")
     assert row["verdict"] == "data_insufficient"
     assert row["entry_quality"] == "too_stale"
 
@@ -176,8 +195,43 @@ async def test_live_candidates_actionable_zero_is_blocked(client):
 
     resp = await c.get("/api/live_candidates")
     assert resp.status_code == 200
-    row = next(r for r in resp.json() if r["token_id"] == "dogecoin")
+    payload = resp.json()
+    _assert_envelope(payload, expected_open_trades=1)
+    row = next(r for r in payload["rows"] if r["token_id"] == "dogecoin")
     assert row["verdict"] == "blocked"
+
+
+async def test_live_candidates_actionable_null_is_data_insufficient(client):
+    c, db = client
+    # actionable=NULL covers older pre-cutover rows; must not silently slip
+    # into "watch" or any positive verdict.
+    await _insert_open_trade(
+        db._conn,
+        token_id="cardano",
+        symbol="ADA",
+        entry_price=100.0,
+        actionable=None,
+        would_be_live=1,
+    )
+    await _upsert_price_cache(db._conn, coin_id="cardano", current_price=105.0)
+
+    resp = await c.get("/api/live_candidates")
+    assert resp.status_code == 200
+    payload = resp.json()
+    _assert_envelope(payload, expected_open_trades=1)
+    row = next(r for r in payload["rows"] if r["token_id"] == "cardano")
+    assert row["verdict"] == "data_insufficient"
+    assert "actionable_null_pre_cutover" in row["risk_reasons"]
+    assert "actionable=null" in row["inclusion_reasons"]
+
+
+async def test_live_candidates_empty_cohort_returns_envelope(client):
+    c, _ = client
+    resp = await c.get("/api/live_candidates")
+    assert resp.status_code == 200
+    payload = resp.json()
+    _assert_envelope(payload, expected_open_trades=0)
+    assert payload["rows"] == []
 
 
 async def test_live_candidates_query_caps(client):

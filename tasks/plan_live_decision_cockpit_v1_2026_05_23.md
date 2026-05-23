@@ -27,14 +27,24 @@ V1 is **visibility-only**: no live execution, no sizing, no suppression, no prun
 
 Drift-check above is negative, so proceed to Hermes ecosystem check.
 
+Domains checked against the public Skills Hub on 2026-05-23 (each named as a
+generic capability, not a project-specific contract — see global CLAUDE.md
+§7b):
+
 | Domain | Hermes skill found? | Decision |
 |---|---|---|
-| Trader-readable candidate explanation | None found on the public Skills Hub that is DB-contract-aware for gecko-alpha | Build from scratch; optional Hermes enrichment later |
-| Counter-risk interpretation | None found that can safely override structured DB fields | Use as enrichment only (future); V1 does not hard-gate on it |
-| TG/X/KOL context normalization | None found that maps source-call rankability/coverage into a trader cockpit | Keep context-only; do not rank/boost candidates in V1 |
-| Price truth / PnL / identity / execution | N/A (must not be Hermes-load-bearing) | Keep custom (DB truth only) |
+| Trader candidate explanation over structured DB rows | none found | Build from scratch; optional Hermes enrichment later |
+| Counter-risk interpretation over structured fields | none found | Use as enrichment only (future); V1 does not hard-gate on it |
+| Social/KOL context normalization into a trader cockpit | none found | Keep context-only; do not rank/boost candidates in V1 |
+| Price truth / PnL / identity / execution | N/A (must never be Hermes-load-bearing) | Keep custom (DB truth only) |
 
-Deployed-surface check (mandatory): in addition to the public hub, verify what is actually installed/available on the target VPS (skills/plugins + `.hermes` artifacts). This repo sandbox cannot query the VPS runtime; the operator must run the commands below on the deployment host before we claim “none found”.
+**Deployed-surface check (operator-gated, blocking before merge):** the
+public hub check above is necessary but not sufficient — `~/.hermes/skills`
+on the deployment host may contain an operator-installed skill that the hub
+does not list. The operator MUST paste the output of the commands below into
+the PR before merge; if any new skill name surfaces, this V1 design has to
+be re-checked against it. The repo sandbox cannot execute these commands
+itself.
 
 ```bash
 ls -la ~/.hermes || true
