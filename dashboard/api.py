@@ -3,7 +3,8 @@
 import asyncio
 import json
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Literal
 
 import aiosqlite
@@ -70,6 +71,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
         _db_path = db_path
 
     app = FastAPI(title="Gecko-Alpha Dashboard")
+    repo_root = Path(__file__).resolve().parent.parent
+
+    def _iso_utc(dt: datetime) -> str:
+        return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def _now_iso_utc() -> str:
+        return _iso_utc(datetime.now(timezone.utc))
 
     # BL-NEW-NARRATIVE-SCANNER (V1): mount narrative router for cross-VPS
     # Hermes integration. Endpoints are HMAC-gated; respond 503 when
@@ -127,6 +135,177 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/win-rate", response_model=WinRateResponse)
     async def get_win_rate():
         return await db.get_win_rate(_db_path)
+
+    @app.get("/api/signal_trust_registry", response_model=None)
+    async def get_signal_trust_registry():
+        """Read-only signal trust registry export (visibility-only).
+
+        This endpoint is a dashboard convenience surface for
+        docs/superpowers/registries/signal_trust_registry.v1.json.
+        It must remain visibility-only and must not be consumed for pruning,
+        auto-disable, sizing, or execution decisions.
+        """
+        from fastapi.responses import JSONResponse
+
+        generated_at = _now_iso_utc()
+        relative_path = "docs/superpowers/registries/signal_trust_registry.v1.json"
+        registry_path = repo_root / relative_path
+        override_path = os.environ.get("GECKO_SIGNAL_TRUST_REGISTRY_PATH")
+        if override_path:
+            registry_path = Path(override_path)
+
+        meta_base = {
+            "ok": False,
+            "generated_at": generated_at,
+            "registry_path": relative_path,
+            # Invariants are included even on error so the UI can keep the
+            # "visibility-only/not-for-pruning" banner visible.
+            "experimental": True,
+            "visibility_only": True,
+            "not_for_pruning": True,
+            "not_for_auto_disable": True,
+        }
+
+        headers = {"Cache-Control": "no-store"}
+
+        if not registry_path.is_file():
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": "60"},
+                content={
+                    "meta": meta_base,
+                    "error": {
+                        "code": "registry_missing",
+                        "message": "signal trust registry file not found",
+                    },
+                },
+            )
+
+        try:
+            raw = registry_path.read_text(encoding="utf-8")
+            doc = json.loads(raw)
+        except Exception as e:
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": "60"},
+                content={
+                    "meta": meta_base,
+                    "error": {"code": "registry_invalid", "message": f"invalid JSON: {e}"},
+                },
+            )
+
+        errors: list[str] = []
+
+        def is_plain_object(value) -> bool:
+            return value is not None and isinstance(value, dict)
+
+        def assert_(condition: bool, message: str) -> None:
+            if not condition:
+                errors.append(message)
+
+        assert_(is_plain_object(doc), "top-level must be an object")
+        assert_(doc.get("schema_version") == "signal_trust_registry.v1", "schema_version must be signal_trust_registry.v1")
+        assert_(doc.get("experimental") is True, "experimental must be true")
+        assert_(doc.get("visibility_only") is True, "visibility_only must be true")
+        assert_(doc.get("not_for_pruning") is True, "not_for_pruning must be true")
+        assert_(doc.get("not_for_auto_disable") is True, "not_for_auto_disable must be true")
+
+        notes = doc.get("notes")
+        assert_(isinstance(notes, str) and len(notes) > 0, "notes must be a non-empty string")
+
+        maturity_states = doc.get("maturity_states")
+        entries = doc.get("entries")
+        assert_(isinstance(maturity_states, list), "maturity_states must be an array")
+        assert_(isinstance(entries, list), "entries must be an array")
+
+        maturity_state_set = set(maturity_states) if isinstance(maturity_states, list) else set()
+        for required_state in ("trusted_experimental", "context_only", "data_insufficient"):
+            assert_(required_state in maturity_state_set, f"maturity_states must include {required_state}")
+
+        if isinstance(entries, list):
+            seen_signal_types: set[str] = set()
+            for idx, entry in enumerate(entries):
+                prefix = f"entries[{idx}]"
+                assert_(is_plain_object(entry), f"{prefix} must be an object")
+                if not is_plain_object(entry):
+                    continue
+
+                signal_type = entry.get("signal_type")
+                assert_(
+                    isinstance(signal_type, str) and len(signal_type) > 0,
+                    f"{prefix}.signal_type must be a non-empty string",
+                )
+                if isinstance(signal_type, str) and len(signal_type) > 0:
+                    if signal_type in seen_signal_types:
+                        errors.append(f"{prefix}.signal_type must be unique (duplicate: {signal_type})")
+                    seen_signal_types.add(signal_type)
+
+                maturity_state = entry.get("maturity_state")
+                assert_(
+                    isinstance(maturity_state, str) and maturity_state in maturity_state_set,
+                    f"{prefix}.maturity_state must be one of maturity_states",
+                )
+
+                data_quality = entry.get("data_quality")
+                assert_(is_plain_object(data_quality), f"{prefix}.data_quality must be an object")
+                if is_plain_object(data_quality) and "warning" in data_quality:
+                    warning = data_quality.get("warning")
+                    assert_(
+                        isinstance(warning, str) and len(warning) > 0,
+                        f"{prefix}.data_quality.warning must be a non-empty string when present",
+                    )
+
+                operator_gate = entry.get("operator_gate")
+                assert_(isinstance(operator_gate, list), f"{prefix}.operator_gate must be an array")
+                if isinstance(operator_gate, list):
+                    gates = set(operator_gate)
+                    for required_gate in ("visibility_only", "not_for_pruning", "not_for_auto_disable"):
+                        assert_(required_gate in gates, f"{prefix}.operator_gate must include {required_gate}")
+
+                next_gate = entry.get("next_gate")
+                assert_(is_plain_object(next_gate), f"{prefix}.next_gate must be an object")
+                if is_plain_object(next_gate):
+                    ng_type = next_gate.get("type")
+                    ng_threshold = next_gate.get("threshold")
+                    assert_(
+                        isinstance(ng_type, str) and len(ng_type) > 0,
+                        f"{prefix}.next_gate.type must be a non-empty string",
+                    )
+                    assert_(
+                        isinstance(ng_threshold, str) and len(ng_threshold) > 0,
+                        f"{prefix}.next_gate.threshold must be a non-empty string",
+                    )
+
+        if errors:
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": "60"},
+                content={
+                    "meta": meta_base,
+                    "error": {
+                        "code": "registry_invalid",
+                        "message": "registry failed validation",
+                        "errors": errors[:50],
+                    },
+                },
+            )
+
+        try:
+            mtime = _iso_utc(datetime.fromtimestamp(registry_path.stat().st_mtime, tz=timezone.utc))
+        except Exception:
+            mtime = None
+
+        meta = {
+            **meta_base,
+            "ok": True,
+            "registry_mtime": mtime,
+        }
+
+        return JSONResponse(
+            status_code=200,
+            headers=headers,
+            content={"meta": meta, "registry": doc},
+        )
 
     # --- Global cross-table search ---
 
