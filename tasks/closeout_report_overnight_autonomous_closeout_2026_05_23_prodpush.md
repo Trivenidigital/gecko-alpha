@@ -33,21 +33,16 @@ Limit:
 
 ## Commits
 
-All commits in this closeout branch since `origin/master` `5475e8d0`:
-- `fc87457a` docs(superpowers): add reusable session templates
-- `1d823f19` docs(runbooks): add autonomous operating model and status
-- `d6ae279a` feat(autonomy): add local status report and trust registry validator
-- `e871fad6` tasks(closeout): add 2026-05-23 closeout plan/design/findings
-- `ea837355` tasks(status): add autonomous status report snapshot
-- `17499317` tasks(closeout): add closeout report
-- `5a9d4f2b` docs(trust): add V1 runbook + Hermes-first notes
-- `03652455` chore(autonomy): harden status report output path
-- `f8d068ee` docs(runbooks): add drift freshness caveat
-- `b1d10b1f` docs(templates): add drift freshness caveat
-- `838144ee` chore(autonomy): narrow work-loop scan paths
-- `72ff80dd` chore(trust): tighten registry validation
-- `bdd1df58` docs(closeout): update report with review folds
-- `2e9bdad1` docs(findings): note watchdog env-file ordering gap
+Key commits in this branch:
+- Templates/runbooks/scripts pack landed as the initial series (`fc87457a`, `1d823f19`, `d6ae279a`).
+- Review folds (safer `--out`, freshness caveats, tighter validator) landed afterward.
+- Additional findings recorded: `tasks/findings_source_calls_lag_watchdog_env_file_ordering_2026_05_23.md`.
+
+For the full commit list from the base used in this sandbox (`5475e8d0`), run:
+
+```bash
+git log --oneline 5475e8d0..HEAD
+```
 
 ## Files to focus on
 
