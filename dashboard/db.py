@@ -962,6 +962,353 @@ async def _get_trading_positions_inner(db) -> list[dict]:
     return rows
 
 
+def _parse_iso_dt(value: str | None) -> datetime | None:
+    """Best-effort ISO8601 parser for DB timestamps.
+
+    Accepts `...Z` by rewriting to `...+00:00`. Returns timezone-aware UTC
+    datetimes when possible; returns None on parse failure.
+    """
+    if not value:
+        return None
+    try:
+        v = value.strip()
+        if v.endswith("Z"):
+            v = v[:-1] + "+00:00"
+        dt = datetime.fromisoformat(v)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+async def get_live_candidates(
+    db_path: str, *, limit: int = 20, window_hours: int = 36
+) -> list[dict]:
+    """Read-only per-token "live candidates" cockpit.
+
+    V1 is deterministic and visibility-only: no writes, no execution, no LLM.
+    Primary cohort is `paper_trades.status='open'`. Optional context looks back
+    `window_hours` for recent trade ids + surfaces.
+    """
+    # Defensive clamps (FastAPI Query caps should prevent out-of-range).
+    limit = max(1, min(int(limit), 50))
+    window_hours = max(6, min(int(window_hours), 72))
+
+    now = datetime.now(timezone.utc)
+    cutoff_iso = (now - timedelta(hours=window_hours)).isoformat()
+
+    disclaimer = "read-only labels; not trading advice; triggers no actions"
+    stale_warn_age = timedelta(hours=1)
+    stale_hard_age = timedelta(hours=2)
+
+    async with _ro_db(db_path) as db:
+        try:
+            cursor = await db.execute(
+                """SELECT id, token_id, symbol, name, chain,
+                          signal_type, entry_price, opened_at,
+                          would_be_live, actionable
+                     FROM paper_trades
+                    WHERE status = 'open'
+                    ORDER BY opened_at DESC
+                    LIMIT ?""",
+                (max(limit * 10, 200),),
+            )
+            open_rows = await cursor.fetchall()
+        except aiosqlite.OperationalError:
+            # Fresh DB / feature off: no paper_trades table yet.
+            return []
+
+        # Pick one canonical open trade per token (most-recent opened_at),
+        # while retaining *all* open trade ids in case the invariant breaks.
+        open_primary_by_token: dict[str, dict] = {}
+        open_ids_by_token: dict[str, list[int]] = {}
+        token_order: list[str] = []
+        for r in open_rows:
+            token_id = r["token_id"]
+            open_ids_by_token.setdefault(token_id, []).append(int(r["id"]))
+            if token_id not in open_primary_by_token:
+                open_primary_by_token[token_id] = dict(r)
+                token_order.append(token_id)
+                if len(token_order) >= limit:
+                    break
+
+        if not token_order:
+            return []
+
+        # Recent context: ids + surfaces within the lookback window, restricted
+        # to the token_ids already in the open set (bounded).
+        surfaces_by_token: dict[str, set[str]] = {
+            t: {open_primary_by_token[t]["signal_type"]} for t in token_order
+        }
+        recent_ids_by_token: dict[str, list[int]] = {t: [] for t in token_order}
+        placeholders = ",".join("?" * len(token_order))
+        try:
+            cursor = await db.execute(
+                f"""SELECT id, token_id, signal_type
+                      FROM paper_trades
+                     WHERE token_id IN ({placeholders})
+                       AND opened_at >= ?
+                     ORDER BY opened_at DESC""",
+                (*token_order, cutoff_iso),
+            )
+            recent_rows = await cursor.fetchall()
+            for rr in recent_rows:
+                tid = rr["token_id"]
+                if tid in recent_ids_by_token:
+                    recent_ids_by_token[tid].append(int(rr["id"]))
+                    st = rr["signal_type"]
+                    if st:
+                        surfaces_by_token[tid].add(st)
+        except aiosqlite.OperationalError:
+            # If opened_at column is missing (unexpected) or table missing, treat
+            # as "no context" rather than failing the cockpit.
+            pass
+
+        # Batch-fetch price snapshots (best-effort join on token_id == coin_id).
+        price_by_coin: dict[str, dict] = {}
+        try:
+            cursor = await db.execute(
+                f"""SELECT coin_id, current_price, market_cap, price_change_24h, updated_at
+                      FROM price_cache
+                     WHERE coin_id IN ({placeholders})""",
+                tuple(token_order),
+            )
+            for pr in await cursor.fetchall():
+                price_by_coin[pr["coin_id"]] = dict(pr)
+        except aiosqlite.OperationalError:
+            # price_cache missing -> everything is data_insufficient.
+            price_by_coin = {}
+
+        # Optional predictions enrichment (latest per coin_id).
+        pred_by_coin: dict[str, dict] = {}
+        try:
+            cursor = await db.execute(
+                f"""
+                SELECT coin_id, narrative_fit_score, counter_risk_score, counter_flags, predicted_at
+                  FROM (
+                        SELECT coin_id, narrative_fit_score, counter_risk_score, counter_flags, predicted_at, id,
+                               ROW_NUMBER() OVER (PARTITION BY coin_id ORDER BY predicted_at DESC, id DESC) AS rn
+                          FROM predictions
+                         WHERE coin_id IN ({placeholders})
+                       )
+                 WHERE rn = 1
+                """,
+                tuple(token_order),
+            )
+            for pr in await cursor.fetchall():
+                d = dict(pr)
+                raw = d.get("counter_flags")
+                if raw:
+                    try:
+                        d["counter_flags"] = json.loads(raw)
+                    except Exception:
+                        d["counter_flags"] = []
+                else:
+                    d["counter_flags"] = []
+                pred_by_coin[d["coin_id"]] = d
+        except aiosqlite.OperationalError as e:
+            msg = str(e).lower()
+            # Optional enrichment: degrade gracefully on missing table/columns,
+            # or in environments without window-function support.
+            if (
+                ("no such table" in msg and "predictions" in msg)
+                or "no such column" in msg
+                or "no such function" in msg
+            ):
+                pred_by_coin = {}
+            else:
+                raise
+
+        # Optional chain_matches enrichment (latest per token_id).
+        chain_by_token: dict[str, dict] = {}
+        try:
+            cursor = await db.execute(
+                f"""
+                SELECT token_id, pipeline, pattern_name, completed_at
+                  FROM (
+                        SELECT token_id, pipeline, pattern_name, completed_at, id,
+                               ROW_NUMBER() OVER (PARTITION BY token_id ORDER BY completed_at DESC, id DESC) AS rn
+                          FROM chain_matches
+                         WHERE token_id IN ({placeholders})
+                       )
+                 WHERE rn = 1
+                """,
+                tuple(token_order),
+            )
+            for cr in await cursor.fetchall():
+                chain_by_token[cr["token_id"]] = dict(cr)
+        except aiosqlite.OperationalError as e:
+            msg = str(e).lower()
+            if (
+                ("no such table" in msg and "chain_matches" in msg)
+                or "no such column" in msg
+                or "no such function" in msg
+            ):
+                chain_by_token = {}
+            else:
+                raise
+
+    def _entry_quality(pct: float | None) -> str:
+        if pct is None:
+            return "data_insufficient"
+        if pct < -10.0:
+            return "already_faded"
+        if pct > 25.0:
+            return "already_ran"
+        if -2.0 <= pct <= 8.0:
+            return "fresh_entry"
+        if -6.0 <= pct <= 15.0:
+            return "acceptable_pullback"
+        # No "borderline" label in V1: map remaining ranges to the nearest
+        # conservative bucket so the UI doesn't show "data_insufficient" for
+        # a perfectly valid price move.
+        if pct < -6.0:
+            return "already_faded"
+        return "already_ran"
+
+    results: list[dict] = []
+    for token_id in token_order:
+        base = open_primary_by_token[token_id]
+        price = price_by_coin.get(token_id)
+        pred = pred_by_coin.get(token_id)
+        chain = chain_by_token.get(token_id)
+
+        inclusion_reasons: list[str] = ["open_paper_trade"]
+        risk_reasons: list[str] = []
+
+        actionable = base.get("actionable")
+        would_be_live = base.get("would_be_live")
+
+        entry_price = base.get("entry_price")
+        entry_price = float(entry_price) if entry_price is not None else None
+        opened_at = base.get("opened_at")
+        if _parse_iso_dt(opened_at) is None:
+            risk_reasons.append("opened_at_unparseable")
+
+        current_price = None
+        market_cap = None
+        price_change_24h = None
+        price_updated_at = None
+        price_is_stale = False
+        price_age = None
+        if price:
+            current_price = price.get("current_price")
+            market_cap = price.get("market_cap")
+            price_change_24h = price.get("price_change_24h")
+            price_updated_at = price.get("updated_at")
+            upd_dt = _parse_iso_dt(price_updated_at)
+            if upd_dt is None:
+                risk_reasons.append("price_timestamp_unparseable")
+            else:
+                price_age = now - upd_dt
+                price_is_stale = price_age > stale_warn_age
+                if price_is_stale:
+                    risk_reasons.append("price_is_stale")
+        else:
+            risk_reasons.append("no_price_snapshot_for_token_id")
+
+        pct_from_entry = None
+        if current_price is not None and entry_price and entry_price > 0:
+            delta = (float(current_price) - entry_price) / entry_price * 100
+            pct_from_entry = round(delta, 2)
+        elif entry_price is None or entry_price <= 0:
+            risk_reasons.append("entry_price_missing_or_invalid")
+
+        eq = _entry_quality(pct_from_entry)
+        if price_age is not None and price_age > stale_hard_age:
+            eq = "too_stale"
+
+        verdict = "watch"
+        if price_age is not None and price_age > stale_hard_age:
+            verdict = "data_insufficient"
+        elif any(
+            r
+            in risk_reasons
+            for r in (
+                "no_price_snapshot_for_token_id",
+                "price_timestamp_unparseable",
+                "opened_at_unparseable",
+                "entry_price_missing_or_invalid",
+            )
+        ):
+            verdict = "data_insufficient"
+        elif actionable == 0:
+            verdict = "blocked"
+            risk_reasons.append("not_actionable")
+        elif actionable == 1 and would_be_live == 1 and eq in (
+            "fresh_entry",
+            "acceptable_pullback",
+        ):
+            verdict = "candidate"
+        else:
+            verdict = "watch"
+
+        if actionable == 1:
+            inclusion_reasons.append("actionable=1")
+        elif actionable == 0:
+            inclusion_reasons.append("actionable=0")
+
+        if would_be_live == 1:
+            inclusion_reasons.append("would_be_live=1")
+        elif would_be_live == 0:
+            risk_reasons.append("would_be_live=0")
+
+        counter_flags = pred.get("counter_flags") if pred else []
+        narrative_fit_score = pred.get("narrative_fit_score") if pred else None
+        counter_risk_score = pred.get("counter_risk_score") if pred else None
+        if counter_risk_score is not None:
+            risk_reasons.append("counter_risk_present_display_only_v1")
+
+        results.append(
+            {
+                "disclaimer": disclaimer,
+                "token_id": token_id,
+                "symbol": base.get("symbol"),
+                "name": base.get("name"),
+                "chain": base.get("chain"),
+                "open_trade_ids": open_ids_by_token.get(token_id, []),
+                "recent_trade_ids": recent_ids_by_token.get(token_id, []),
+                "surfaces": sorted(surfaces_by_token.get(token_id, set())),
+                "actionable": actionable,
+                "would_be_live": would_be_live,
+                "opened_at": opened_at,
+                "entry_price": entry_price,
+                "pct_from_entry": pct_from_entry,
+                "current_price": current_price,
+                "market_cap": market_cap,
+                "price_change_24h": price_change_24h,
+                "price_updated_at": price_updated_at,
+                "price_is_stale": bool(price_is_stale),
+                "narrative_fit_score": narrative_fit_score,
+                "counter_risk_score": counter_risk_score,
+                "counter_flags": counter_flags or [],
+                "latest_chain_match": chain,
+                "entry_quality": eq,
+                "verdict": verdict,
+                "inclusion_reasons": inclusion_reasons,
+                "risk_reasons": risk_reasons,
+            }
+        )
+
+    # Stable output ordering: candidate > watch > blocked > data_insufficient,
+    # then by opened_at desc when parseable.
+    verdict_rank = {
+        "candidate": 0,
+        "watch": 1,
+        "blocked": 2,
+        "data_insufficient": 3,
+    }
+
+    def _sort_key(r: dict):
+        dt = _parse_iso_dt(r.get("opened_at"))
+        ts = dt.timestamp() if dt else 0.0
+        return (verdict_rank.get(r.get("verdict"), 9), -ts)
+
+    results.sort(key=_sort_key)
+    return results[:limit]
+
+
 async def get_trading_history(
     db_path: str, limit: int = 50, offset: int = 0, actionability: str = "all"
 ) -> list[dict]:

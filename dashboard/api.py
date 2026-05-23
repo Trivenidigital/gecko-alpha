@@ -17,6 +17,7 @@ from dashboard.models import (
     AlertResponse,
     CandidateResponse,
     FunnelResponse,
+    LiveCandidateResponse,
     SignalHitRate,
     StatusResponse,
     WinRateResponse,
@@ -251,6 +252,19 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return await db.get_quality_signals(_db_path, max_mcap=max_mcap, limit=limit)
 
     # --- Paper trading endpoints ---
+
+    @app.get("/api/live_candidates", response_model=list[LiveCandidateResponse])
+    async def get_live_candidates(
+        limit: int = Query(20, ge=1, le=50),
+        window_hours: int = Query(36, ge=6, le=72),
+    ):
+        """Read-only per-token “live candidates” cockpit.
+
+        Visibility-only labels: not trading advice; triggers no actions.
+        """
+        return await db.get_live_candidates(
+            _db_path, limit=limit, window_hours=window_hours
+        )
 
     @app.get("/api/trading/positions")
     async def get_trading_positions_endpoint():
