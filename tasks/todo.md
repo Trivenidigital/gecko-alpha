@@ -924,3 +924,18 @@ Current resume hook (2026-05-21, post overnight decision-harvest):
 Full state record: `tasks/findings_overnight_decision_harvest_2026_05_21.md` (this PR).
 
 Default suggestion if user opens with a generic "what's up": run the post-deploy check-in (option 2) — it's quick and gives them fresh data.
+
+## Active Work: 2026-05-23 - Srilu/VPIN pytest gate repair
+
+- [x] Confirm target VPS roles and exclude Main Shift Agent from this repair pass.
+- [x] Create isolated branches on `srilu-vps:/root/gecko-alpha` and `vpin-vps:/opt/btc15minutebot`.
+- [x] Reproduce and cluster Srilu Gecko failures; preserve local unpushed commits while checking upstream drift.
+- [x] Reproduce and cluster VPIN BTC failures; first verify pytest environment before code edits.
+- [x] Apply smallest root-cause fixes and rerun focused plus full native pytest gates.
+- [x] Record final review / residual risks here before reporting.
+
+Review:
+- Srilu Gecko root causes: local checkout was 2 ahead / 5 behind origin; repo tests also leaked production `.env`, assumed a bare `python` executable, used SQLite numeric underscores unsupported on the VPS SQLite, and inherited production writer-heartbeat env in wrapper tests.
+- VPIN BTC root causes: venv lacked `pytest-asyncio` despite dev dependency declaration, causing broad async-test collapse; remaining failures were production `.env` leaking into unit-test defaults/dashboard auth.
+- Verification: Srilu `/root/gecko-alpha` full native suite passed: `2707 passed, 11 skipped, 11 warnings`. VPIN `/opt/btc15minutebot` non-integration suite passed: `2543 passed, 10 deselected, 217 warnings`.
+- Residual: BTC venv was repaired in-place with `pytest-asyncio`; pyproject already declares it under dev extras, so no dependency-file change was needed. Pre-existing VPIN untracked files `.env.bak.20260318_214429` and `scripts/per_hour_contrarian_analysis.sql` were left untouched.

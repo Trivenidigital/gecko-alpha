@@ -86,6 +86,7 @@ def _run(
     extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     env = os.environ.copy()
+    env["GECKO_ENV_FILE"] = "/tmp/gecko-alpha-test-missing.env"
     if curl_stub is not None:
         env["PATH"] = f"{curl_stub.parent}:" + env.get("PATH", "")
     env["GECKO_PYTHON"] = str(python_stub)
@@ -169,6 +170,7 @@ def test_missing_telegram_creds_exits_3_without_curl(tmp_path):
 def test_unknown_argument_exits_64(tmp_path):
     python_stub = _make_python_stub(tmp_path, exit_code=0, stdout_body="")
     env = os.environ.copy()
+    env["GECKO_ENV_FILE"] = str(tmp_path / "missing.env")
     env["GECKO_PYTHON"] = str(python_stub)
     res = subprocess.run(
         ["bash", str(WATCHDOG_SCRIPT), "--bogus-flag"],
@@ -319,6 +321,7 @@ def test_writer_args_passed_through_to_python(tmp_path):
     python_stub.chmod(0o755)
 
     env = os.environ.copy()
+    env["GECKO_ENV_FILE"] = str(tmp_path / "missing.env")
     env["GECKO_PYTHON"] = str(python_stub)
     env["WRITER_HEARTBEAT_FILE"] = "/tmp/heartbeat"
     env["WRITER_THRESHOLD_MINUTES"] = "30"
@@ -354,6 +357,7 @@ def test_writer_branch_disabled_by_default(tmp_path):
     python_stub.chmod(0o755)
 
     env = os.environ.copy()
+    env["GECKO_ENV_FILE"] = str(tmp_path / "missing.env")
     env["GECKO_PYTHON"] = str(python_stub)
     # Explicitly clear in case parent shell has it set
     env.pop("WRITER_HEARTBEAT_FILE", None)

@@ -16,6 +16,7 @@ def test_check_config_prints_resolved_values():
             "TELEGRAM_BOT_TOKEN": "t",
             "TELEGRAM_CHAT_ID": "c",
             "ANTHROPIC_API_KEY": "k",
+            "LIVE_MODE": "paper",
             # Ensure Windows-friendly: inherit SYSTEMROOT so subprocess can
             # spawn (Python needs it for random init on Windows).
             **{
