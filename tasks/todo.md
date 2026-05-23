@@ -1,5 +1,51 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-23 — Codex/Hermes systemd auto-remediation
+
+**Status:** IN-PROGRESS. Goal: convert Codex/Hermes systemd failure handling from alert-only to alert + guarded deterministic repair, with Telegram outcome updates.
+
+Workflow checklist:
+- [x] Root cause identified: alert template used `%I`, causing `hermes-gateway.service` to appear as invalid `hermes/gateway.service`.
+- [x] Drift check found alert helpers and manual runbook, no general auto-remediator.
+- [x] Hermes-first analysis recorded in `tasks/design_systemd_auto_remediation_2026_05_23.md`.
+- [x] Design drafted: `tasks/design_systemd_auto_remediation_2026_05_23.md`.
+- [x] Design reviewed by 2 parallel agents and Critical/Important folds applied.
+- [x] Build with TDD.
+- [x] Deploy to all 3 VPSes and verify Telegram outcome path.
+- [x] PR opened.
+- [x] PR reviewed by 2 parallel agents and Critical/Important folds applied.
+
+Review:
+- Local focused tests: `uv run pytest tests/test_codex_telegram_helpers.py tests/test_codex_fleet_telegram_status.py -q` passed with 23 tests.
+- Deployed `/usr/local/bin/codex-systemd-failure-alert` and `/usr/local/bin/codex-systemd-auto-remediate` to all 3 VPSes.
+- Handler templates now use `%i`, set `Restart=no`, and monitored units have `OnFailure=codex-systemd-failure-alert@%n.service codex-systemd-auto-remediate@%n.service`.
+- Disposable verification on main-vps proved `OnFailure` launches both handlers; unallowlisted disposable failure skipped safely; controlled flaky service repaired to `active` via explicit disposable `--allow-unit` verification.
+- `codex-fleet-telegram-status.timer` was restored to `enabled` / `active` after an external disable left it inactive during verification.
+- PR #236 review folds: source-controlled systemd templates/drop-in + installer, injectable advisory lock path, runner exception handling with audit/Telegram outcome, disabled/masked/lock/audit/command-order tests.
+- PR #236 CI: GitHub Actions `test` passed on head `ad67d9d4`.
+
+## Active Work: 2026-05-23 — Fleet Telegram status for 3 VPSes
+
+**Status:** DEPLOYED 2026-05-23. Goal: configure Telegram status reporting for `main-vps`, `vpin-vps`, and `srilu-vps`: one central rolling 7-hour digest every 8 hours from Main VPS time, plus instant Telegram alerts for monitored Codex/Hermes systemd unit failures.
+
+Workflow checklist:
+- [x] Design approved in chat: central digest on main-vps + local instant failure hooks on each VPS
+- [x] Host map verified from SSH config: `main-vps` (`46.62.206.192`), `vpin-vps` (`89.167.55.176`), `srilu-vps` (`89.167.116.187`)
+- [x] Existing ops surface discovered: daily `codex-readonly-operator-brief` on all 3, daily `codex-fleet-operator-brief` on main
+- [x] TDD red/green for digest formatter (`tests/test_codex_fleet_telegram_status.py`)
+- [x] Implementation plan saved: `docs/superpowers/plans/2026-05-23-fleet-telegram-status.md`
+- [x] Deploy Telegram env + sender to all 3 VPSes
+- [x] Deploy 8-hour fleet digest timer on main-vps
+- [x] Deploy instant failure alert hooks on all 3 VPSes
+- [x] Verify Telegram smoke messages, service success, timer status, and manual failure-alert path
+
+Review:
+- Main timer: `codex-fleet-telegram-status.timer` enabled/active; next run observed at 2026-05-23 22:42 UTC, with `TimeoutStartSec=5min`.
+- Telegram verified: smoke messages sent from all 3 VPSes; synthetic `codex-systemd-failure-alert@...` units returned `Result=success` / `ExecMainStatus=0` on all 3.
+- Live status path: main collector forced-key entries on vpin/srilu now run `/usr/local/bin/codex-fleet-remote-status`, so every digest includes current `failed_units` instead of stale daily brief prose.
+- Current failures were reported once via Telegram during setup: main has 3 pre-existing failed units (`logrotate.service`, `prune-expense-receipts.service`, `shift-agent-backup.service`); srilu has 4 (`logrotate.service`, `prune-expense-receipts.service`, `send-routing-accuracy-summary-failure.service`, `send-routing-accuracy-summary.service`); vpin has 0.
+- Hygiene: removed stray `UNIT` line from `codex-production-push-loop-vpin.timer`; timer remained active/enabled after daemon reload.
+
 ## Active Work: 2026-05-23 — BL-NEW-LIVE-DECISION-COCKPIT (V1 live_candidates endpoint)
 
 **Status:** SHIPPED-MERGED. Read-only `/api/live_candidates` shipped in
