@@ -35,6 +35,7 @@ class RemediationPolicy:
     cooldown_minutes: int = 30
     poll_attempts: int = 6
     poll_seconds: int = 10
+    repair_allowlist: frozenset[str] = frozenset(REPAIR_ALLOWLIST)
 
 
 @dataclass
@@ -214,6 +215,15 @@ def skip(unit: str, action: str, reason: str, context: RemediationContext, teleg
     return finish(RemediationResult(unit=unit, action=action, reason=reason), context, telegram_errors)
 
 
+def context_allowlist(context: RemediationContext) -> set[str]:
+    return getattr(context, "_repair_allowlist", set(REPAIR_ALLOWLIST))
+
+
+def with_allowlist(context: RemediationContext, allowlist: set[str]) -> RemediationContext:
+    setattr(context, "_repair_allowlist", allowlist)
+    return context
+
+
 def validate_unit(
     unit: str,
     context: RemediationContext,
@@ -225,7 +235,7 @@ def validate_unit(
         return False, skip(unit, "skipped_invalid_unit", "only .service units are repairable", context, telegram_errors), {}
     if is_handler_unit(unit):
         return False, skip(unit, "skipped_handler_unit", "handler units are never remediated", context, telegram_errors), {}
-    if unit not in REPAIR_ALLOWLIST:
+    if unit not in context_allowlist(context):
         return False, skip(unit, "skipped_unallowlisted", "unit is not in repair allowlist", context, telegram_errors), {}
 
     show = parse_show_output(
@@ -316,13 +326,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("unit")
     parser.add_argument("--host", default=socket.gethostname())
+    parser.add_argument(
+        "--allow-unit",
+        action="append",
+        default=[],
+        help="extra repair-allowed unit for disposable verification only",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    result = remediate_unit(args.unit, default_context(args.host))
-    return 0 if result.action in {"repaired", "repair_started"} or result.action.startswith("skipped_") else 1
+    allowlist = set(REPAIR_ALLOWLIST)
+    allowlist.update(args.allow_unit)
+    result = remediate_unit(args.unit, with_allowlist(default_context(args.host), allowlist))
+    return 0
 
 
 if __name__ == "__main__":

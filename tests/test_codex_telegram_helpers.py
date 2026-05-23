@@ -8,6 +8,7 @@ from scripts.codex_systemd_auto_remediate import (
     RemediationContext,
     RemediationPolicy,
     remediate_unit,
+    with_allowlist,
 )
 from scripts.codex_telegram_send import build_payload, load_env
 
@@ -68,9 +69,9 @@ class FakeRunner:
 
     def __call__(self, command: list[str], timeout: int = 15) -> str:
         self.commands.append(tuple(command))
-        if command[:3] == ["systemctl", "show", "hermes-gateway.service"]:
+        if command[:2] == ["systemctl", "show"]:
             return "\n".join(f"{k}={v}" for k, v in self.show.items())
-        if command[:3] == ["systemctl", "is-active", "hermes-gateway.service"]:
+        if command[:2] == ["systemctl", "is-active"]:
             if self.active_sequence:
                 return self.active_sequence.pop(0)
             return "failed"
@@ -359,3 +360,32 @@ def test_remediator_still_failed_needs_operator_action(tmp_path):
     )
 
     assert result.action == "needs_operator_action"
+
+
+def test_remediator_extra_allowlist_supports_disposable_verification(tmp_path):
+    runner = FakeRunner(
+        {
+            "LoadState": "loaded",
+            "UnitFileState": "enabled",
+            "Type": "simple",
+        },
+        active_sequence=["active"],
+    )
+
+    context = with_allowlist(
+        RemediationContext(
+            host="main-vps",
+            state_dir=tmp_path,
+            audit_path=tmp_path / "audit.log",
+            runner=runner,
+            sender=lambda _: None,
+            now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
+            sleep=lambda _: None,
+        ),
+        {"codex-remediation-flaky.service"},
+    )
+
+    result = remediate_unit("codex-remediation-flaky.service", context)
+
+    assert result.action == "repaired"
+    assert tuple(["systemctl", "start", "codex-remediation-flaky.service"]) in runner.commands
