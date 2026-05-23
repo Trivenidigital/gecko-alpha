@@ -2,16 +2,21 @@
 
 ## Active Work: 2026-05-23 — BL-NEW-LIVE-DECISION-COCKPIT (V1 live_candidates endpoint)
 
-**Status:** IN-PROGRESS. Goal: ship read-only `/api/live_candidates` so the trader decision surface is usable via one curl call.
+**Status:** SHIPPED-MERGED. Read-only `/api/live_candidates` shipped in
+`f81b63e` / PR #228; counter_flags rich-dict regression fixed in `db19e79` /
+PR #229. This entry remains as the operator-facing status anchor for the
+endpoint slice; frontend "Now Tradable" panel remains a separate follow-up.
 
 Workflow checklist (mandatory for non-trivial work):
 - [x] Plan drafted + Hermes-first section included (`tasks/plan_live_decision_cockpit_v1_2026_05_23.md`)
 - [x] Plan reviewed by 2 parallel agents; Critical/Important folds applied (2026-05-23)
 - [x] Design drafted (API contract + deterministic verdict rules) (`tasks/design_live_decision_cockpit_v1_2026_05_23.md`)
 - [x] Design reviewed by 2 parallel agents; Critical/Important folds applied (2026-05-23)
-- [ ] Build: endpoint + DB query + tests implemented
-- [ ] Verification: run the tight test set for the new endpoint
-- [ ] PR opened (or, if blocked, patch artifacts produced + exact operator next action)
+- [x] Build: endpoint + DB query + tests implemented (`dashboard/api.py`, `dashboard/db.py`, `dashboard/models.py`, `tests/test_live_candidates_endpoint.py`)
+- [x] Verification: focused endpoint test suite exists; 2026-05-23 sandbox rerun attempted with
+  `UV_CACHE_DIR=/tmp/uv-cache uv run pytest tests/test_live_candidates_endpoint.py -q`
+  but dependency resolution was blocked by restricted DNS for `pydantic-settings==2.13.1`
+- [x] PR opened/merged: PR #228 (`f81b63e`) + PR #229 (`db19e79`)
 
 Operator gates respected:
 - No live execution, sizing, pruning, suppression, or threshold changes
