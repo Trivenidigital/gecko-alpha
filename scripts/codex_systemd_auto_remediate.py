@@ -36,7 +36,6 @@ class RemediationPolicy:
     cooldown_minutes: int = 30
     poll_attempts: int = 6
     poll_seconds: int = 10
-    repair_allowlist: frozenset[str] = frozenset(REPAIR_ALLOWLIST)
 
 
 @dataclass
@@ -58,6 +57,7 @@ class RemediationContext:
     sender: Callable[[str], None]
     now: Callable[[], datetime]
     sleep: Callable[[float], None]
+    allow_lock_fallback: bool = False
 
 
 def fmt_time(value: datetime) -> str:
@@ -124,7 +124,7 @@ def lock_file_for(lock_dir: Path, unit: str) -> Path:
     return lock_dir / f"{safe_unit}.lock"
 
 
-def acquire_lock(unit: str, lock_dir: Path) -> int | None:
+def acquire_lock(unit: str, lock_dir: Path, allow_fallback: bool = False) -> int | None:
     try:
         lock_dir.mkdir(parents=True, exist_ok=True)
         fd = os.open(lock_file_for(lock_dir, unit), os.O_CREAT | os.O_RDWR, 0o644)
@@ -136,7 +136,9 @@ def acquire_lock(unit: str, lock_dir: Path) -> int | None:
             os.close(fd)
             return None
         except ImportError:
-            pass
+            if not allow_fallback and not os.environ.get("CODEX_REMEDIATION_ALLOW_LOCK_FALLBACK"):
+                os.close(fd)
+                return -1
         os.ftruncate(fd, 0)
         os.write(fd, f"{os.getpid()} {datetime.now(timezone.utc).isoformat()}".encode("ascii"))
         return fd
@@ -201,7 +203,9 @@ def send_best_effort(
     try:
         context.sender(build_message(result, context))
     except Exception as exc:  # pragma: no cover - exact sender failures vary
-        telegram_errors.append(str(exc))
+        message = str(exc)
+        if message not in telegram_errors:
+            telegram_errors.append(message)
 
 
 def append_audit(result: RemediationResult, context: RemediationContext) -> None:
@@ -300,7 +304,7 @@ def remediate_unit(
     if not ok:
         return early_result  # type: ignore[return-value]
 
-    lock_fd = acquire_lock(unit, context.lock_dir)
+    lock_fd = acquire_lock(unit, context.lock_dir, context.allow_lock_fallback)
     if lock_fd == -1:
         return skip(unit, "skipped_state_unavailable", "lock state unavailable", context, telegram_errors)
     if lock_fd is None:

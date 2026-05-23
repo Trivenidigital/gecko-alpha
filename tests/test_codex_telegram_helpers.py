@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 from scripts.codex_systemd_failure_alert import build_failure_message, normalize_alert_unit_name
 from scripts.codex_systemd_auto_remediate import (
@@ -115,6 +119,7 @@ def test_remediator_rejects_slash_unit_without_mutating_systemd(tmp_path):
             sender=sent.append,
             now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
             sleep=lambda _: None,
+            allow_lock_fallback=True,
         ),
     )
 
@@ -144,6 +149,7 @@ def test_remediator_skips_unallowlisted_or_oneshot_units(tmp_path):
             sender=sent.append,
             now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
             sleep=lambda _: None,
+            allow_lock_fallback=True,
         ),
     )
 
@@ -171,6 +177,7 @@ def test_remediator_skips_unallowlisted_unit_before_show(tmp_path):
             sender=lambda _: None,
             now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
             sleep=lambda _: None,
+            allow_lock_fallback=True,
         ),
     )
 
@@ -198,10 +205,40 @@ def test_remediator_skips_static_not_found_or_generated_states(tmp_path):
                 sender=lambda _: None,
                 now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
                 sleep=lambda _: None,
+                allow_lock_fallback=True,
             ),
         )
 
         assert result.action in {"skipped_bad_load_state", "skipped_unit_file_state"}
+        assert not any("reset-failed" in command or "start" in command for command in runner.commands)
+
+
+def test_remediator_skips_disabled_and_masked_units(tmp_path):
+    for state in ["disabled", "masked"]:
+        runner = FakeRunner(
+            {
+                "LoadState": "loaded",
+                "UnitFileState": state,
+                "Type": "simple",
+            }
+        )
+
+        result = remediate_unit(
+            "hermes-gateway.service",
+            RemediationContext(
+                host="main-vps",
+                state_dir=tmp_path / state,
+                lock_dir=tmp_path / state / "locks",
+                audit_path=tmp_path / state / "audit.log",
+                runner=runner,
+                sender=lambda _: None,
+                now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
+                sleep=lambda _: None,
+                allow_lock_fallback=True,
+            ),
+        )
+
+        assert result.action == "skipped_unit_file_state"
         assert not any("reset-failed" in command or "start" in command for command in runner.commands)
 
 
@@ -225,6 +262,7 @@ def test_remediator_skips_handler_units_without_mutating(tmp_path):
             sender=lambda _: None,
             now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
             sleep=lambda _: None,
+            allow_lock_fallback=True,
         ),
     )
 
@@ -254,6 +292,7 @@ def test_remediator_persists_cooldown_before_reset_and_start(tmp_path):
             sender=sent.append,
             now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
             sleep=lambda _: None,
+            allow_lock_fallback=True,
         ),
     )
 
@@ -263,6 +302,10 @@ def test_remediator_persists_cooldown_before_reset_and_start(tmp_path):
     assert tuple(["systemctl", "reset-failed", "hermes-gateway.service"]) in runner.commands
     assert tuple(["systemctl", "start", "hermes-gateway.service"]) in runner.commands
     assert "parse_mode" not in "\n".join(sent)
+    assert runner.commands.index(tuple(["systemctl", "reset-failed", "hermes-gateway.service"])) < runner.commands.index(
+        tuple(["systemctl", "start", "hermes-gateway.service"])
+    )
+    assert cooldown_path.stat().st_size > 0
 
 
 def test_remediator_cooldown_skips_without_mutating(tmp_path):
@@ -287,10 +330,44 @@ def test_remediator_cooldown_skips_without_mutating(tmp_path):
             sender=lambda _: None,
             now=lambda: now,
             sleep=lambda _: None,
+            allow_lock_fallback=True,
         ),
     )
 
     assert result.action == "skipped_cooldown"
+    assert not any("reset-failed" in command or "start" in command for command in runner.commands)
+
+
+def test_remediator_contended_lock_skips_without_mutating(tmp_path):
+    if os.name == "nt":
+        pytest.skip("fcntl advisory lock behavior is Linux-only")
+    first_fd = acquire_lock("hermes-gateway.service", tmp_path / "locks")
+    runner = FakeRunner(
+        {
+            "LoadState": "loaded",
+            "UnitFileState": "enabled",
+            "Type": "simple",
+        }
+    )
+    try:
+        result = remediate_unit(
+            "hermes-gateway.service",
+            RemediationContext(
+                host="main-vps",
+                state_dir=tmp_path,
+                lock_dir=tmp_path / "locks",
+                audit_path=tmp_path / "audit.log",
+                runner=runner,
+                sender=lambda _: None,
+                now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
+                sleep=lambda _: None,
+                allow_lock_fallback=True,
+            ),
+        )
+    finally:
+        release_lock(first_fd, "hermes-gateway.service", tmp_path / "locks")
+
+    assert result.action == "skipped_locked"
     assert not any("reset-failed" in command or "start" in command for command in runner.commands)
 
 
@@ -319,6 +396,7 @@ def test_remediator_failed_cooldown_state_fails_closed(monkeypatch, tmp_path):
             sender=lambda _: None,
             now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
             sleep=lambda _: None,
+            allow_lock_fallback=True,
         ),
     )
 
@@ -350,12 +428,18 @@ def test_remediator_telegram_failure_does_not_block_repair(tmp_path):
             sender=broken_sender,
             now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
             sleep=lambda _: None,
+            allow_lock_fallback=True,
         ),
     )
 
     assert result.action == "repaired"
     assert tuple(["systemctl", "reset-failed", "hermes-gateway.service"]) in runner.commands
     assert "telegram down" in (tmp_path / "audit.log").read_text(encoding="utf-8")
+    row = json.loads((tmp_path / "audit.log").read_text(encoding="utf-8").splitlines()[-1])
+    assert row["unit"] == "hermes-gateway.service"
+    assert row["action"] == "repaired"
+    assert row["status"] == "active"
+    assert row["telegram_errors"] == ["telegram down"]
 
 
 def test_remediator_still_failed_needs_operator_action(tmp_path):
@@ -379,6 +463,7 @@ def test_remediator_still_failed_needs_operator_action(tmp_path):
             sender=lambda _: None,
             now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
             sleep=lambda _: None,
+            allow_lock_fallback=True,
         ),
         policy=RemediationPolicy(poll_attempts=2, poll_seconds=1),
     )
@@ -406,6 +491,7 @@ def test_remediator_extra_allowlist_supports_disposable_verification(tmp_path):
             sender=lambda _: None,
             now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
             sleep=lambda _: None,
+            allow_lock_fallback=True,
         ),
         {"codex-remediation-flaky.service"},
     )
@@ -437,6 +523,7 @@ def test_remediator_runner_exception_before_mutation_is_audited_skip(tmp_path):
             sender=lambda _: None,
             now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
             sleep=lambda _: None,
+            allow_lock_fallback=True,
         ),
     )
 
@@ -467,6 +554,7 @@ def test_remediator_runner_exception_after_mutation_needs_operator_action(tmp_pa
             sender=lambda _: None,
             now=lambda: datetime(2026, 5, 23, 15, 54, tzinfo=timezone.utc),
             sleep=lambda _: None,
+            allow_lock_fallback=True,
         ),
     )
 
@@ -485,4 +573,5 @@ def test_advisory_lock_allows_preexisting_unlocked_file(tmp_path):
         assert isinstance(fd, int)
     finally:
         release_lock(fd, "hermes-gateway.service", lock_dir)
+
 
