@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Send a Telegram alert for a failed Codex/Hermes systemd unit."""
+
+from __future__ import annotations
+
+import argparse
+import socket
+import subprocess
+from datetime import datetime, timezone
+
+
+def fmt_time(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def build_failure_message(
+    unit: str,
+    host: str,
+    now: datetime,
+    status: str,
+    journal_tail: str,
+) -> str:
+    tail = journal_tail.strip()
+    if len(tail) > 2500:
+        tail = tail[-2500:]
+    return (
+        "Codex/Hermes unit failure\n\n"
+        f"time: {fmt_time(now)}\n"
+        f"host: {host}\n"
+        f"unit: {unit}\n"
+        f"status: {status}\n\n"
+        "Recent journal:\n"
+        f"{tail or '[no journal output]'}"
+    )
+
+
+def run_text(command: list[str], timeout: int = 15) -> str:
+    result = subprocess.run(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=timeout,
+        check=False,
+    )
+    return result.stdout
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("unit")
+    parser.add_argument("--host", default=socket.gethostname())
+    args = parser.parse_args(argv)
+
+    status = run_text(["systemctl", "is-active", args.unit]).strip() or "unknown"
+    journal = run_text(["journalctl", "-u", args.unit, "-n", "30", "--no-pager"])
+    message = build_failure_message(
+        unit=args.unit,
+        host=args.host,
+        now=datetime.now(timezone.utc),
+        status=status,
+        journal_tail=journal,
+    )
+    subprocess.run(
+        ["/usr/local/bin/codex-telegram-send"],
+        input=message,
+        text=True,
+        check=True,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
