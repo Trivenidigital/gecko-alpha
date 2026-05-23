@@ -1146,13 +1146,17 @@ async def get_live_candidates(
             for pr in await cursor.fetchall():
                 d = dict(pr)
                 raw = d.get("counter_flags")
+                items: list = []
                 if raw:
                     try:
-                        d["counter_flags"] = json.loads(raw)
+                        decoded = json.loads(raw)
+                        if isinstance(decoded, list):
+                            items = [
+                                x for x in decoded if isinstance(x, (dict, str))
+                            ]
                     except Exception:
-                        d["counter_flags"] = []
-                else:
-                    d["counter_flags"] = []
+                        items = []
+                d["counter_flags"] = items
                 pred_by_coin[d["coin_id"]] = d
         except aiosqlite.OperationalError as e:
             msg = str(e).lower()
