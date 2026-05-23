@@ -1,5 +1,6 @@
 {
   "schema_version": "signal_trust_registry.v1",
+  "experimental": true,
   "visibility_only": true,
   "not_for_pruning": true,
   "not_for_auto_disable": true,
@@ -110,4 +111,3 @@
     }
   ]
 }
-

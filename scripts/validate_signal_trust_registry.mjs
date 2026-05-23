@@ -53,6 +53,7 @@ try {
 const errors = [];
 assert(isPlainObject(doc), "top-level must be an object", errors);
 assert(doc.schema_version === "signal_trust_registry.v1", "schema_version must be signal_trust_registry.v1", errors);
+assert(doc.experimental === true, "experimental must be true", errors);
 assert(doc.visibility_only === true, "visibility_only must be true", errors);
 assert(doc.not_for_pruning === true, "not_for_pruning must be true", errors);
 assert(doc.not_for_auto_disable === true, "not_for_auto_disable must be true", errors);
