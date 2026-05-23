@@ -2,6 +2,10 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.uv-cache/
+.uv-appdata/
+.pytest-tmp/
+.pytest_out.txt
 .env
 scout.db
 *.db-shm

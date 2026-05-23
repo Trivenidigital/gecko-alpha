@@ -1,5 +1,21 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-23 — BL-NEW-LIVE-DECISION-COCKPIT (V1 live_candidates endpoint)
+
+**Status:** IN-PROGRESS. Goal: ship read-only `/api/live_candidates` so the trader decision surface is usable via one curl call.
+
+Workflow checklist (mandatory for non-trivial work):
+- [x] Plan drafted + Hermes-first section included (`tasks/plan_live_decision_cockpit_v1_2026_05_23.md`)
+- [x] Plan reviewed by 2 parallel agents; Critical/Important folds applied (2026-05-23)
+- [x] Design drafted (API contract + deterministic verdict rules) (`tasks/design_live_decision_cockpit_v1_2026_05_23.md`)
+- [x] Design reviewed by 2 parallel agents; Critical/Important folds applied (2026-05-23)
+- [ ] Build: endpoint + DB query + tests implemented
+- [ ] Verification: run the tight test set for the new endpoint
+- [ ] PR opened (or, if blocked, patch artifacts produced + exact operator next action)
+
+Operator gates respected:
+- No live execution, sizing, pruning, suppression, or threshold changes
+- TG/X remains context-only (no rank/boost) until source-call price coverage is rankable
 ## Active Work: 2026-05-22 — Close-development block (operator-authorized)
 
 **Status:** EXECUTED — paced through 7 phases (P0 state sync → P7 final report). All docs-only changes; no code shipped this block. Two PRs from this block: #221 (BL-NEW-DEPLOY-FILEMODE-CRLF-HYGIENE filed) MERGED, #226 (historical pool-selection probe NEGATIVE findings) OPEN/under review at session end.

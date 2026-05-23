@@ -1,5 +1,7 @@
 """Pydantic response models for dashboard API."""
 
+from typing import Literal
+
 from pydantic import BaseModel
 
 
@@ -86,3 +88,70 @@ class SearchResponse(BaseModel):
     total_hits: int = 0
     hits: list[SearchHit] = []
     truncated: bool = False
+
+
+LiveCandidateVerdict = Literal[
+    "candidate_review",
+    "watch",
+    "blocked",
+    "data_insufficient",
+]
+LiveCandidateEntryQuality = Literal[
+    "fresh_entry",
+    "acceptable_pullback",
+    "already_faded",
+    "already_ran",
+    "too_stale",
+    "data_insufficient",
+]
+
+
+class LiveCandidateResponse(BaseModel):
+    disclaimer: str
+
+    token_id: str
+    symbol: str | None = None
+    name: str | None = None
+    chain: str | None = None
+
+    open_trade_ids: list[int] = []
+    recent_trade_ids: list[int] = []
+    surfaces: list[str] = []
+    actionable: int | None = None
+    would_be_live: int | None = None
+
+    opened_at: str | None = None
+    entry_price: float | None = None
+    pct_from_entry: float | None = None
+
+    current_price: float | None = None
+    market_cap: float | None = None
+    price_change_24h: float | None = None
+    price_updated_at: str | None = None
+    price_is_stale: bool = False
+
+    narrative_fit_score: int | None = None
+    counter_risk_score: int | None = None
+    counter_flags: list[str] = []
+    latest_chain_match: dict | None = None
+
+    entry_quality: LiveCandidateEntryQuality
+    verdict: LiveCandidateVerdict
+    inclusion_reasons: list[str] = []
+    risk_reasons: list[str] = []
+
+
+class LiveCandidateMeta(BaseModel):
+    read_only: bool = True
+    not_trade_advice: bool = True
+    experimental: bool = True
+    generated_at: str
+    window_hours: int
+    limit: int
+    open_trades_scanned: int
+    rows_returned: int
+
+
+class LiveCandidateCockpit(BaseModel):
+    meta: LiveCandidateMeta
+    rows: list[LiveCandidateResponse] = []
