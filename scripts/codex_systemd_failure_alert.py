@@ -34,6 +34,12 @@ def build_failure_message(
     )
 
 
+def normalize_alert_unit_name(unit: str) -> str:
+    if "/" in unit and unit.endswith(".service"):
+        return unit.replace("/", "-")
+    return unit
+
+
 def run_text(command: list[str], timeout: int = 15) -> str:
     result = subprocess.run(
         command,
@@ -51,11 +57,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("unit")
     parser.add_argument("--host", default=socket.gethostname())
     args = parser.parse_args(argv)
+    unit = normalize_alert_unit_name(args.unit)
 
-    status = run_text(["systemctl", "is-active", args.unit]).strip() or "unknown"
-    journal = run_text(["journalctl", "-u", args.unit, "-n", "30", "--no-pager"])
+    status = run_text(["systemctl", "is-active", unit]).strip() or "unknown"
+    journal = run_text(["journalctl", "-u", unit, "-n", "30", "--no-pager"])
     message = build_failure_message(
-        unit=args.unit,
+        unit=unit,
         host=args.host,
         now=datetime.now(timezone.utc),
         status=status,

@@ -1,5 +1,20 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-23 — Codex/Hermes systemd auto-remediation
+
+**Status:** IN-PROGRESS. Goal: convert Codex/Hermes systemd failure handling from alert-only to alert + guarded deterministic repair, with Telegram outcome updates.
+
+Workflow checklist:
+- [x] Root cause identified: alert template used `%I`, causing `hermes-gateway.service` to appear as invalid `hermes/gateway.service`.
+- [x] Drift check found alert helpers and manual runbook, no general auto-remediator.
+- [x] Hermes-first analysis recorded in `tasks/design_systemd_auto_remediation_2026_05_23.md`.
+- [x] Design drafted: `tasks/design_systemd_auto_remediation_2026_05_23.md`.
+- [x] Design reviewed by 2 parallel agents and Critical/Important folds applied.
+- [ ] Build with TDD.
+- [ ] Deploy to all 3 VPSes and verify Telegram outcome path.
+- [ ] PR opened.
+- [ ] PR reviewed by 2 parallel agents and Critical/Important folds applied.
+
 ## Active Work: 2026-05-23 — Fleet Telegram status for 3 VPSes
 
 **Status:** DEPLOYED 2026-05-23. Goal: configure Telegram status reporting for `main-vps`, `vpin-vps`, and `srilu-vps`: one central rolling 7-hour digest every 8 hours from Main VPS time, plus instant Telegram alerts for monitored Codex/Hermes systemd unit failures.
