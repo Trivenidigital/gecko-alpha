@@ -6,6 +6,7 @@ from scripts.codex_fleet_telegram_status import (
     EventSummary,
     HostStatus,
     build_fleet_message,
+    events_from_pr_list,
     run_command,
     summarize_github_events,
     window_bounds,
@@ -139,3 +140,29 @@ def test_run_command_timeout_returns_124_instead_of_raising():
 
     assert result.returncode == 124
     assert "timed out" in result.stderr
+
+
+def test_events_from_pr_list_synthesizes_open_and_update_events():
+    prs = [
+        {
+            "number": 181,
+            "createdAt": "2026-05-23T08:00:00Z",
+            "updatedAt": "2026-05-23T09:00:00Z",
+            "headRefName": "codex/actionability",
+        },
+        {
+            "number": 180,
+            "createdAt": "2026-05-23T07:29:00Z",
+            "updatedAt": "2026-05-23T07:29:00Z",
+            "headRefName": "codex/outside",
+        },
+    ]
+
+    events = events_from_pr_list("Trivenidigital/gecko-alpha", prs)
+
+    assert [event["payload"]["action"] for event in events] == [
+        "opened",
+        "opened",
+        "synchronize",
+    ]
+    assert events[-1]["payload"]["pull_request"]["head"]["ref"] == "codex/actionability"

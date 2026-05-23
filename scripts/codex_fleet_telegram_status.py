@@ -132,6 +132,41 @@ def summarize_github_events(
     )
 
 
+def events_from_pr_list(repo: str, prs: list[dict]) -> list[dict]:
+    events: list[dict] = []
+    for pr in prs:
+        number = pr.get("number")
+        head_ref = pr.get("headRefName") or ""
+        created = pr.get("createdAt")
+        updated = pr.get("updatedAt")
+        if number is None or not created:
+            continue
+        payload = {
+            "pull_request": {
+                "number": number,
+                "head": {"ref": head_ref},
+            }
+        }
+        events.append(
+            {
+                "type": "PullRequestEvent",
+                "created_at": created,
+                "repo": {"name": repo},
+                "payload": {"action": "opened", **payload},
+            }
+        )
+        if updated and updated != created:
+            events.append(
+                {
+                    "type": "PullRequestEvent",
+                    "created_at": updated,
+                    "repo": {"name": repo},
+                    "payload": {"action": "synchronize", **payload},
+                }
+            )
+    return sorted(events, key=lambda event: event.get("created_at", ""))
+
+
 def _pr_sort_key(value: str) -> tuple[str, int]:
     repo, _, number = value.partition("#")
     try:
@@ -210,24 +245,42 @@ def run_command(command: list[str], timeout: int = 30) -> subprocess.CompletedPr
         return subprocess.CompletedProcess(command, 124, stdout, stderr)
 
 
-def collect_repo_events(repos: Iterable[str]) -> tuple[dict[str, list[dict]], list[str]]:
+def collect_repo_events(
+    repos: Iterable[str],
+    since: datetime,
+) -> tuple[dict[str, list[dict]], list[str]]:
     events: dict[str, list[dict]] = {}
     errors: list[str] = []
+    search_since = fmt_time(since - timedelta(minutes=20))
     for repo in repos:
         result = run_command(
-            ["gh", "api", f"repos/{repo}/events", "-F", "per_page=100"],
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "all",
+                "--search",
+                f"updated:>={search_since}",
+                "--json",
+                "number,createdAt,updatedAt,headRefName",
+                "--limit",
+                "100",
+            ],
             timeout=25,
         )
         if result.returncode != 0:
-            errors.append(f"{repo}: gh events failed rc={result.returncode}")
+            errors.append(f"{repo}: gh pr list failed rc={result.returncode}")
             events[repo] = []
             continue
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError:
-            errors.append(f"{repo}: gh events returned non-json")
+            errors.append(f"{repo}: gh pr list returned non-json")
             payload = []
-        events[repo] = payload if isinstance(payload, list) else []
+        events[repo] = events_from_pr_list(repo, payload if isinstance(payload, list) else [])
     return events, errors
 
 
@@ -272,7 +325,7 @@ def collect_host_statuses(hosts: Iterable[tuple[str, str]]) -> list[HostStatus]:
                 HostStatus(name=name, ok=False, details=[], errors=[f"status probe rc={result.returncode}"])
             )
             continue
-        details = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        details = normalize_host_details(result.stdout, remote_brief=ssh_alias != "local")
         errors = [line for line in details if line.endswith("=failed") or line == "failed_units=1"]
         failed_count = 0
         for line in details:
@@ -284,6 +337,24 @@ def collect_host_statuses(hosts: Iterable[tuple[str, str]]) -> list[HostStatus]:
         ok = failed_count == 0 and not any("=failed" in line for line in details)
         statuses.append(HostStatus(name=name, ok=ok, details=details, errors=errors))
     return statuses
+
+
+def normalize_host_details(text: str, remote_brief: bool = False) -> list[str]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not remote_brief:
+        return lines
+    status_lines: list[str] = []
+    in_status = False
+    for line in lines:
+        if line == "**Status**":
+            in_status = True
+            continue
+        if line.startswith("**") and in_status:
+            break
+        if in_status:
+            status_lines.append(line.strip("`"))
+    collapsed = " ".join(status_lines).replace("`", "")
+    return [collapsed[:500] if collapsed else "latest brief fetched"]
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -331,7 +402,7 @@ def main(argv: list[str] | None = None) -> int:
     now = parse_time(args.now) if args.now else datetime.now(timezone.utc)
     start, end = window_bounds(now, hours=7)
     repos = tuple(args.repos or DEFAULT_REPOS)
-    events_by_repo, errors = collect_repo_events(repos)
+    events_by_repo, errors = collect_repo_events(repos, start)
     summary = summarize_github_events(events_by_repo, start, end)
     summary.errors.extend(errors)
     summary.blocker_reports.extend(collect_blocker_reports(start))
