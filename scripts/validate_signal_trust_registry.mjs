@@ -66,14 +66,22 @@ for (const requiredState of ["trusted_experimental", "context_only", "data_insuf
 }
 
 if (Array.isArray(doc.entries)) {
+  const seenSignalTypes = new Set();
   doc.entries.forEach((entry, index) => {
     const prefix = `entries[${index}]`;
     assert(isPlainObject(entry), `${prefix} must be an object`, errors);
     if (!isPlainObject(entry)) return;
 
     assert(typeof entry.signal_type === "string" && entry.signal_type.length > 0, `${prefix}.signal_type must be a non-empty string`, errors);
+    if (typeof entry.signal_type === "string" && entry.signal_type.length > 0) {
+      if (seenSignalTypes.has(entry.signal_type)) errors.push(`${prefix}.signal_type must be unique (duplicate: ${entry.signal_type})`);
+      seenSignalTypes.add(entry.signal_type);
+    }
     assert(typeof entry.maturity_state === "string" && maturityStates.has(entry.maturity_state), `${prefix}.maturity_state must be one of maturity_states`, errors);
     assert(isPlainObject(entry.data_quality), `${prefix}.data_quality must be an object`, errors);
+    if (isPlainObject(entry.data_quality) && Object.prototype.hasOwnProperty.call(entry.data_quality, "warning")) {
+      assert(typeof entry.data_quality.warning === "string" && entry.data_quality.warning.length > 0, `${prefix}.data_quality.warning must be a non-empty string when present`, errors);
+    }
     assert(Array.isArray(entry.operator_gate), `${prefix}.operator_gate must be an array`, errors);
     if (Array.isArray(entry.operator_gate)) {
       const gates = new Set(entry.operator_gate);
@@ -92,4 +100,3 @@ if (Array.isArray(doc.entries)) {
 if (errors.length > 0) fail(errors);
 
 process.stdout.write(`OK: ${path.normalize(filePath)}\n`);
-
