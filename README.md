@@ -27,6 +27,16 @@ uv run uvicorn dashboard.main:app --port 8000
 # Open http://localhost:8000
 ```
 
+### Smoke-test the live-candidates cockpit contract
+
+With the dashboard running locally, validate the read-only `/api/live_candidates`
+response before building or shipping UI changes on top of it:
+
+```bash
+python scripts/check_live_candidates_contract.py --url http://localhost:8000
+python scripts/check_live_candidates_contract.py --url http://localhost:8000 --json
+```
+
 ### Run both at once
 
 ```bash
@@ -80,6 +90,7 @@ Telegram digest fires at midnight UTC with: alerts fired, win rate (4h+ window),
 uv run pytest --tb=short -q              # Full suite (148 tests)
 uv run pytest tests/test_scorer.py -v    # Scorer only
 uv run pytest tests/test_dashboard_api.py # Dashboard API only
+uv run pytest tests/test_check_live_candidates_contract.py -q # Live-candidates contract validator
 ```
 
 ### Perp Anomaly Detector (BL-054)
