@@ -20,6 +20,9 @@ Blocked / operator-gated:
 - No dashboard UI build (`npm ci && npm run build`) in this sandbox → no `dist/` update shipped
 - No GitHub HTTPS credentials in sandbox → cannot `git fetch`/push/open PR from here
 
+New finding (needs follow-up fix + verification):
+- `scripts/source-calls-lag-watchdog.sh` sources `.env` before parsing args, so `--env-file` cannot affect the sourced env file. Findings doc: `tasks/findings_source_calls_lag_watchdog_env_file_ordering_2026_05_23.md`.
+
 ## Verification evidence (sandbox)
 
 - `node scripts/validate_signal_trust_registry.mjs --path docs/superpowers/registries/signal_trust_registry.v1.json` → OK
@@ -52,6 +55,7 @@ All commits in this closeout branch since `origin/master` `5475e8d0`:
 - Trust V1 (read-only): `docs/superpowers/registries/signal_trust_registry.v1.json` + `scripts/validate_signal_trust_registry.mjs`
 - Trust V1 runbook: `docs/runbooks/signal-trust-roadmap-v1.md`
 - Cockpit UI guidance: `docs/runbooks/live-candidates-now-tradable-panel.md`
+- Findings: `tasks/findings_source_calls_lag_watchdog_env_file_ordering_2026_05_23.md`
 
 ## Exact next operator actions
 
