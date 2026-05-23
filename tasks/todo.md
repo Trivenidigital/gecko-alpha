@@ -12,7 +12,7 @@ Workflow checklist:
 - [x] Design reviewed by 2 parallel agents and Critical/Important folds applied.
 - [x] Build with TDD.
 - [x] Deploy to all 3 VPSes and verify Telegram outcome path.
-- [ ] PR opened.
+- [x] PR opened.
 - [ ] PR reviewed by 2 parallel agents and Critical/Important folds applied.
 
 Review:
