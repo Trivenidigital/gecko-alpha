@@ -46,6 +46,8 @@ All commits in this closeout branch since `origin/master` `5475e8d0`:
 - `b1d10b1f` docs(templates): add drift freshness caveat
 - `838144ee` chore(autonomy): narrow work-loop scan paths
 - `72ff80dd` chore(trust): tighten registry validation
+- `bdd1df58` docs(closeout): update report with review folds
+- `2e9bdad1` docs(findings): note watchdog env-file ordering gap
 
 ## Files to focus on
 
