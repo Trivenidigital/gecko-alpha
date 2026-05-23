@@ -241,6 +241,7 @@ def test_wrapper_delegates_to_python_cli(tmp_path):
     _build_minimal_schema(db)
 
     env = os.environ.copy()
+    env["GECKO_ENV_FILE"] = str(tmp_path / "missing.env")
     env["GECKO_PYTHON"] = sys.executable
 
     res = subprocess.run(
@@ -377,6 +378,7 @@ def test_wrapper_passes_heartbeat_arg_through(tmp_path):
     heartbeat = tmp_path / "writer-heartbeat"
 
     env = os.environ.copy()
+    env["GECKO_ENV_FILE"] = str(tmp_path / "missing.env")
     env["GECKO_PYTHON"] = sys.executable
     env["WRITER_HEARTBEAT_FILE"] = str(heartbeat)
 

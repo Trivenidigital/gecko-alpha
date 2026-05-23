@@ -1,0 +1,11 @@
+[Unit]
+Description=Telegram alert for failed systemd unit %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Restart=no
+ExecStart=/usr/local/bin/codex-systemd-failure-alert %i

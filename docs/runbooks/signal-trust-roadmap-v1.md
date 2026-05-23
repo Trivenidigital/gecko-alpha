@@ -23,6 +23,7 @@ V1 is **visibility-only**. It MUST NOT be used for pruning, suppression, auto-di
 ## Registry invariants (hard gates)
 
 The registry MUST keep these invariants true:
+- `experimental=true`
 - `visibility_only=true`
 - `not_for_pruning=true`
 - `not_for_auto_disable=true`
@@ -56,4 +57,3 @@ node scripts/validate_signal_trust_registry.mjs --path docs/superpowers/registri
 3. Keep `next_gate.threshold` explicit and data-bound (example: “verify 7d/14d/30d cohorts”; “min_sample>=10 and coverage>=0.50 with temporal integrity”).
 4. Run the validator.
 5. Record the evidence path (DB query, runbook, deploy SHA) in the session’s findings doc. Do not embed runtime “facts” into the registry without citing where they were verified.
-
