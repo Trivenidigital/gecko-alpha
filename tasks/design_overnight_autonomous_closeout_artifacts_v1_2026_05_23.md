@@ -7,7 +7,7 @@
 - `docs/runbooks/gecko-autonomous-operating-model.md`
 - `scripts/report_autonomous_status.mjs`
 - `docs/runbooks/autonomous-status-report.md`
-- (Optional) `docs/superpowers/registries/signal_trust_registry.v1.json` + `scripts/validate_signal_trust_registry.mjs`
+- (Optional) `docs/superpowers/registries/signal_trust_registry.v1.json` + `scripts/validate_signal_trust_registry.mjs` + `docs/runbooks/signal-trust-roadmap-v1.md`
 
 ## Goals
 
@@ -81,6 +81,7 @@
 ## Design: signal trust registry (optional V1)
 
 **File:** `docs/superpowers/registries/signal_trust_registry.v1.json`
+**Runbook:** `docs/runbooks/signal-trust-roadmap-v1.md`
 
 **Constraints:**
 - Read-only registry used for operator visibility only; **not consumed by production logic**.
@@ -97,4 +98,3 @@
 ## Required reviews
 
 - Design review by 2 parallel agents before landing non-trivial artifacts.
-
