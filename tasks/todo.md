@@ -13,7 +13,7 @@ Workflow checklist:
 - [x] Build with TDD.
 - [x] Deploy to all 3 VPSes and verify Telegram outcome path.
 - [x] PR opened.
-- [ ] PR reviewed by 2 parallel agents and Critical/Important folds applied.
+- [x] PR reviewed by 2 parallel agents and Critical/Important folds applied.
 
 Review:
 - Local focused tests: `uv run pytest tests/test_codex_telegram_helpers.py tests/test_codex_fleet_telegram_status.py -q` passed with 23 tests.
@@ -21,6 +21,8 @@ Review:
 - Handler templates now use `%i`, set `Restart=no`, and monitored units have `OnFailure=codex-systemd-failure-alert@%n.service codex-systemd-auto-remediate@%n.service`.
 - Disposable verification on main-vps proved `OnFailure` launches both handlers; unallowlisted disposable failure skipped safely; controlled flaky service repaired to `active` via explicit disposable `--allow-unit` verification.
 - `codex-fleet-telegram-status.timer` was restored to `enabled` / `active` after an external disable left it inactive during verification.
+- PR #236 review folds: source-controlled systemd templates/drop-in + installer, injectable advisory lock path, runner exception handling with audit/Telegram outcome, disabled/masked/lock/audit/command-order tests.
+- PR #236 CI: GitHub Actions `test` passed on head `ad67d9d4`.
 
 ## Active Work: 2026-05-23 — Fleet Telegram status for 3 VPSes
 
