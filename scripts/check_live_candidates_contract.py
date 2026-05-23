@@ -208,13 +208,17 @@ class Result:
 
 
 def _normalize_text(value: str) -> str:
-    """NFKC + casefold + collapse whitespace runs.
+    """NFKC + strip Cf format chars + casefold + collapse whitespace runs.
 
-    Defends against zero-width-space / homoglyph bypass attempts on the
-    banned-token scan.
+    Defends against zero-width-space / zero-width-joiner / homoglyph bypass
+    attempts on the banned-token scan. NFKC alone leaves U+200B etc.
+    intact (they're category Cf), so strip those explicitly before casefold.
     """
     normalized = unicodedata.normalize("NFKC", value)
-    folded = normalized.casefold()
+    stripped = "".join(
+        ch for ch in normalized if unicodedata.category(ch) != "Cf"
+    )
+    folded = stripped.casefold()
     collapsed = re.sub(r"\s+", " ", folded)
     return collapsed
 
