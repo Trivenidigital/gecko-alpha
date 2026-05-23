@@ -756,7 +756,7 @@ async def test_hydrator_rate_limited_excluded_from_session_health(
             0.0,
             0,
             None,
-            1_000_000.0,
+            1000000.0,
         )
         for i in range(5)
     ]
@@ -812,7 +812,7 @@ async def test_hydrator_session_unhealthy_fires_on_high_failure_rate(
             0.0,
             0,
             None,
-            1_000_000.0,
+            1000000.0,
         )
         for i in range(5)
     ]
@@ -869,7 +869,7 @@ async def test_hydrator_session_health_does_not_fire_below_threshold(
             0.0,
             0,
             None,
-            1_000_000.0,
+            1000000.0,
         )
         for i in range(3)
     ]
@@ -922,7 +922,7 @@ async def test_hydrator_coupling_guard(db, settings_factory):
             conviction_boost, outcome_class, mcap_at_completion)
            VALUES (?, 'memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, ?)""",
         [
-            ("0xpop1", long_ago, long_ago, 1_000_000.0),
+            ("0xpop1", long_ago, long_ago, 1000000.0),
             ("0xpop2", long_ago, long_ago, 500_000.0),
         ],
     )
@@ -963,7 +963,7 @@ async def test_hydrator_self_creates_session_when_none_provided(db, settings_fac
            (token_id, pipeline, pattern_id, pattern_name, steps_matched,
             total_steps, anchor_time, completed_at, chain_duration_hours,
             conviction_boost, outcome_class, mcap_at_completion)
-           VALUES ('0xnosess','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, 1_000_000.0)""",
+           VALUES ('0xnosess','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, 1000000.0)""",
         (long_ago, long_ago),
     )
     await db._conn.commit()
@@ -1011,7 +1011,7 @@ async def test_hydrator_persistent_failure_error_escalation_rate_limited(
            (token_id, pipeline, pattern_id, pattern_name, steps_matched,
             total_steps, anchor_time, completed_at, chain_duration_hours,
             conviction_boost, outcome_class, mcap_at_completion)
-           VALUES ('0xstuck','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, 1_000_000.0)""",
+           VALUES ('0xstuck','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, 1000000.0)""",
         (long_ago, long_ago),
     )
     await db._conn.commit()
@@ -1113,7 +1113,7 @@ async def test_hydrator_mixed_cycle_aggregates_use_correct_denominators(
            (token_id, pipeline, pattern_id, pattern_name, steps_matched,
             total_steps, anchor_time, completed_at, chain_duration_hours,
             conviction_boost, outcome_class, mcap_at_completion)
-           VALUES ('0xok','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, 1_000_000.0)""",
+           VALUES ('0xok','memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, 1000000.0)""",
         (long_ago, long_ago),
     )
     # 1 legacy NULL-mcap row (no outcomes data → unhydrateable)
@@ -1133,7 +1133,7 @@ async def test_hydrator_mixed_cycle_aggregates_use_correct_denominators(
             conviction_boost, outcome_class, mcap_at_completion)
            VALUES (?, 'memecoin', 1, 'p', 1, 2, ?, ?, 0.0, 0, NULL, ?)""",
         [
-            ("0xfail1", long_ago, long_ago, 1_000_000.0),
+            ("0xfail1", long_ago, long_ago, 1000000.0),
             ("0xfail2", long_ago, long_ago, 2_000_000.0),
         ],
     )
