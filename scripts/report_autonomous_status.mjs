@@ -134,8 +134,7 @@ function searchLoopRunnerHints() {
   const candidates = [
     "scripts",
     "docs",
-    "tasks",
-    ".claude"
+    "tasks"
   ];
   const needles = [
     "gecko-overnight-autonomous-closeout",
