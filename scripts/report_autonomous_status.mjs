@@ -1,0 +1,270 @@
+#!/usr/bin/env node
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+
+function parseArgs(argv) {
+  const args = { since: null, out: null };
+  for (let i = 2; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === "--since") {
+      const value = argv[i + 1];
+      if (!value) throw new Error("--since requires a value (ISO 8601)");
+      args.since = value;
+      i += 1;
+      continue;
+    }
+    if (token === "--out") {
+      const value = argv[i + 1];
+      if (!value) throw new Error("--out requires a value");
+      args.out = value;
+      i += 1;
+      continue;
+    }
+    if (token === "--help" || token === "-h") {
+      args.help = true;
+      continue;
+    }
+    throw new Error(`unknown arg: ${token}`);
+  }
+  return args;
+}
+
+function runGit(args) {
+  return execFileSync("git", args, { encoding: "utf8" }).trim();
+}
+
+function safeReadText(filePath) {
+  return readFileSync(filePath, "utf8");
+}
+
+function findBacklogStatus(backlogText, id) {
+  const lines = backlogText.split("\n");
+  const indices = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (lines[i].includes(id)) indices.push(i);
+  }
+  if (indices.length === 0) return null;
+
+  function pickBestIndex() {
+    const anchored = indices.filter((idx) => {
+      const line = lines[idx];
+      if (line.startsWith("###") && line.includes(id)) return true;
+      if (line.startsWith("## Active Work:") && line.includes(id)) return true;
+      return false;
+    });
+
+    const scanList = anchored.length ? anchored : indices;
+    for (const idx of scanList) {
+      const window = lines.slice(idx, Math.min(lines.length, idx + 40));
+      const statusLine =
+        window.find((l) => l.startsWith("**Status:**")) ??
+        window.find((l) => l.includes("**Status:**"));
+      if (statusLine) return { idx, statusLine };
+    }
+    return { idx: indices[0], statusLine: null };
+  }
+
+  const best = pickBestIndex();
+  return {
+    id,
+    found_at_line: best.idx + 1,
+    status_line: best.statusLine ?? "(status line not found near any occurrence window)"
+  };
+}
+
+function checkTemplates() {
+  const dir = "docs/superpowers/templates";
+  const required = [
+    "README.md",
+    "implementation_session.md",
+    "findings_only_session.md",
+    "runtime_state_verification.md",
+    "vendor_probe_packet.md",
+    "pr_review.md",
+    "no_build_decision.md",
+    "closeout_report.md"
+  ];
+
+  const exists = existsSync(dir);
+  const missing = required.filter((f) => !existsSync(path.join(dir, f)));
+  return { dir, exists, missing };
+}
+
+function searchLoopRunnerHints() {
+  const candidates = [
+    "scripts",
+    "docs",
+    "tasks",
+    ".claude"
+  ];
+  const needles = [
+    "gecko-overnight-autonomous-closeout",
+    "overnight autonomous closeout",
+    "autonomous closeout loop"
+  ];
+
+  // Cheap check: only scan a small number of known text files in those dirs.
+  const hitFiles = [];
+  for (const base of candidates) {
+    if (!existsSync(base)) continue;
+    const list = execFileSync(
+      "git",
+      ["ls-files", base],
+      { encoding: "utf8" }
+    )
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .filter((f) => f.endsWith(".md") || f.endsWith(".txt") || f.endsWith(".yml") || f.endsWith(".yaml") || f.endsWith(".json") || f.endsWith(".sh") || f.endsWith(".py") || f.endsWith(".mjs") || f.endsWith(".js"));
+
+    for (const filePath of list.slice(0, 1200)) {
+      // Bound scan time: skip large files.
+      try {
+        const text = safeReadText(filePath);
+        for (const needle of needles) {
+          if (text.includes(needle)) {
+            hitFiles.push({ file: filePath, needle });
+            break;
+          }
+        }
+      } catch {
+        // ignore unreadable files
+      }
+      if (hitFiles.length >= 20) break;
+    }
+    if (hitFiles.length >= 20) break;
+  }
+
+  return hitFiles;
+}
+
+function bestEffortChangesSince(sinceIso) {
+  const commits = runGit(["log", `--since=${sinceIso}`, "--pretty=format:%h %ad %s", "--date=iso-strict"]);
+  const list = commits.length ? commits.split("\n") : [];
+
+  let beforeCommit = "";
+  try {
+    beforeCommit = runGit(["rev-list", "-n", "1", `--before=${sinceIso}`, "HEAD"]);
+  } catch {
+    beforeCommit = "";
+  }
+
+  let changedFiles = [];
+  if (beforeCommit) {
+    const diff = runGit(["diff", "--name-status", `${beforeCommit}..HEAD`]);
+    changedFiles = diff.length ? diff.split("\n") : [];
+  }
+
+  return { beforeCommit: beforeCommit || null, commits: list, changedFiles };
+}
+
+const args = parseArgs(process.argv);
+if (args.help) {
+  process.stdout.write("Usage: node scripts/report_autonomous_status.mjs [--since <iso>] [--out <path>]\n");
+  process.exit(0);
+}
+
+const repoRoot = runGit(["rev-parse", "--show-toplevel"]);
+process.chdir(repoRoot);
+
+const head = runGit(["log", "-1", "--pretty=format:%h %ad %s", "--date=iso-strict"]);
+const branch = runGit(["rev-parse", "--abbrev-ref", "HEAD"]);
+
+const backlogPath = "backlog.md";
+const todoPath = "tasks/todo.md";
+const backlogExists = existsSync(backlogPath);
+const todoExists = existsSync(todoPath);
+
+const templateStatus = checkTemplates();
+
+const backlogText = backlogExists ? safeReadText(backlogPath) : "";
+const anchors = [
+  "BL-NEW-HERMES-CODEX-OPERATING-MODEL",
+  "BL-NEW-LIVE-DECISION-COCKPIT",
+  "BL-NEW-SIGNAL-TRUST-ROADMAP"
+].map((id) => (backlogExists ? findBacklogStatus(backlogText, id) : null));
+
+const loopRunnerHits = searchLoopRunnerHints();
+
+let changes = null;
+if (args.since) changes = bestEffortChangesSince(args.since);
+
+const lines = [];
+lines.push("# Gecko-Alpha autonomous status (local, read-only)");
+lines.push("");
+lines.push(`- Repo root: \`${repoRoot}\``);
+lines.push(`- Branch: \`${branch}\``);
+lines.push(`- HEAD: \`${head}\``);
+lines.push("");
+
+lines.push("## Key files present");
+lines.push("");
+lines.push(`- \`${backlogPath}\`: ${backlogExists ? "present" : "MISSING"}`);
+lines.push(`- \`${todoPath}\`: ${todoExists ? "present" : "MISSING"}`);
+lines.push("");
+
+lines.push("## Backlog anchors (best-effort)");
+lines.push("");
+if (!backlogExists) {
+  lines.push("- backlog.md missing; cannot extract statuses.");
+} else {
+  for (const anchor of anchors) {
+    if (!anchor) continue;
+    lines.push(`- \`${anchor.id}\` @ backlog.md:${anchor.found_at_line} — ${anchor.status_line}`);
+  }
+}
+lines.push("");
+
+lines.push("## Template coverage");
+lines.push("");
+lines.push(`- \`${templateStatus.dir}\`: ${templateStatus.exists ? "present" : "MISSING"}`);
+if (templateStatus.missing.length) {
+  lines.push(`- Missing templates: ${templateStatus.missing.map((f) => `\`${f}\``).join(", ")}`);
+} else if (templateStatus.exists) {
+  lines.push("- All required templates present.");
+}
+lines.push("");
+
+lines.push("## Closeout work-loop runner (drift-check)");
+lines.push("");
+if (loopRunnerHits.length === 0) {
+  lines.push("- No obvious in-tree runner artifacts found for `gecko-overnight-autonomous-closeout` (cheap scan). Treat this closeout loop as manual unless a scheduler integration is explicitly designed and operator-approved.");
+} else {
+  lines.push("- Potential references found (review manually; references do not imply a runner exists):");
+  for (const hit of loopRunnerHits) lines.push(`  - \`${hit.file}\` (matched: ${hit.needle})`);
+}
+lines.push("");
+
+if (changes) {
+  lines.push("## Changes since `--since`");
+  lines.push("");
+  lines.push(`- Since: \`${args.since}\``);
+  lines.push(`- Commit before since (best-effort): ${changes.beforeCommit ? `\`${changes.beforeCommit}\`` : "(none found)"}`);
+  lines.push("");
+  if (changes.commits.length === 0) {
+    lines.push("- No commits since that timestamp.");
+  } else {
+    lines.push("- Commits:");
+    for (const c of changes.commits.slice(0, 60)) lines.push(`  - \`${c}\``);
+    if (changes.commits.length > 60) lines.push(`  - ... (${changes.commits.length - 60} more)`);
+  }
+  lines.push("");
+  if (changes.changedFiles.length) {
+    lines.push("- Changed files (best-effort diff):");
+    for (const f of changes.changedFiles.slice(0, 120)) lines.push(`  - \`${f}\``);
+    if (changes.changedFiles.length > 120) lines.push(`  - ... (${changes.changedFiles.length - 120} more)`);
+  }
+  lines.push("");
+}
+
+lines.push("## Operator-only gates (reminder)");
+lines.push("");
+lines.push("- Paid APIs/vendor calls, live execution/sizing, pruning/suppression/auto-disable, destructive DB writes/migrations, secrets/external account state require explicit operator approval.");
+lines.push("");
+
+const report = lines.join("\n") + "\n";
+if (args.out) {
+  writeFileSync(args.out, report, "utf8");
+}
+process.stdout.write(report);

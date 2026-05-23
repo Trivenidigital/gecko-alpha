@@ -1,0 +1,113 @@
+{
+  "schema_version": "signal_trust_registry.v1",
+  "visibility_only": true,
+  "not_for_pruning": true,
+  "not_for_auto_disable": true,
+  "notes": "Read-only registry for operator visibility. This file is not consumed by production logic and must not be used for pruning, suppression, auto-disable, sizing, or live execution decisions.",
+  "maturity_states": [
+    "trusted_experimental",
+    "context_only",
+    "data_insufficient",
+    "quarantined",
+    "retire_candidate"
+  ],
+  "entries": [
+    {
+      "signal_type": "chain_completed",
+      "maturity_state": "trusted_experimental",
+      "data_quality": {
+        "warning": "Derived from backlog guidance only; verify recent cohorts from prod DB before changing any behavior."
+      },
+      "operator_gate": [
+        "visibility_only",
+        "not_for_pruning",
+        "not_for_auto_disable"
+      ],
+      "next_gate": {
+        "type": "runtime_state_verification_required",
+        "threshold": "verify 7d/14d/30d cohorts and actionability/would_be_live overlap"
+      }
+    },
+    {
+      "signal_type": "volume_spike",
+      "maturity_state": "trusted_experimental",
+      "data_quality": {
+        "warning": "Derived from backlog guidance only; verify cohorts from prod DB before changing any behavior."
+      },
+      "operator_gate": [
+        "visibility_only",
+        "not_for_pruning",
+        "not_for_auto_disable"
+      ],
+      "next_gate": {
+        "type": "runtime_state_verification_required",
+        "threshold": "verify 7d/14d/30d cohorts and actionability/would_be_live overlap"
+      }
+    },
+    {
+      "signal_type": "narrative_prediction",
+      "maturity_state": "data_insufficient",
+      "data_quality": {
+        "warning": "Narrative predictions may produce candidates while their own reasoning indicates weak fit/counter-risk. Treat as non-tradable until hard filters are verified."
+      },
+      "operator_gate": [
+        "visibility_only",
+        "not_for_pruning",
+        "not_for_auto_disable"
+      ],
+      "next_gate": {
+        "type": "design_and_runtime_verification_required",
+        "threshold": "hard-filter categories validated on recent cohorts; false-positive/false-negative analysis recorded"
+      }
+    },
+    {
+      "signal_type": "tg",
+      "maturity_state": "context_only",
+      "data_quality": {
+        "warning": "TG remains context-only until source-call price coverage is rankable; do not use for scoring/ranking/pruning."
+      },
+      "operator_gate": [
+        "visibility_only",
+        "not_for_pruning",
+        "not_for_auto_disable"
+      ],
+      "next_gate": {
+        "type": "price_coverage_unlock_required",
+        "threshold": "source_calls rankability + coverage unlock; min_sample>=10 and coverage>=0.50 with temporal integrity"
+      }
+    },
+    {
+      "signal_type": "x",
+      "maturity_state": "context_only",
+      "data_quality": {
+        "warning": "X remains context-only until source-call price coverage is rankable; do not use for scoring/ranking/pruning."
+      },
+      "operator_gate": [
+        "visibility_only",
+        "not_for_pruning",
+        "not_for_auto_disable"
+      ],
+      "next_gate": {
+        "type": "price_coverage_unlock_required",
+        "threshold": "source_calls rankability + coverage unlock; min_sample>=10 and coverage>=0.50 with temporal integrity"
+      }
+    },
+    {
+      "signal_type": "first_signal",
+      "maturity_state": "data_insufficient",
+      "data_quality": {
+        "warning": "Soak-gated per backlog; do not treat as mature until the soak gate clears and is verified with runtime evidence."
+      },
+      "operator_gate": [
+        "visibility_only",
+        "not_for_pruning",
+        "not_for_auto_disable"
+      ],
+      "next_gate": {
+        "type": "time_and_data_bound_gate",
+        "threshold": "soak gate (operator-defined) must be crossed with evidence; do not pre-approve"
+      }
+    }
+  ]
+}
+
