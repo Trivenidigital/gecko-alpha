@@ -6,6 +6,7 @@ from scripts.codex_fleet_telegram_status import (
     EventSummary,
     HostStatus,
     build_fleet_message,
+    run_command,
     summarize_github_events,
     window_bounds,
 )
@@ -128,3 +129,13 @@ def test_build_fleet_message_matches_operator_style():
     assert "Trivenidigital/gecko-alpha#180 at 2026-05-23T07:29:00Z was just outside the 7-hour window." in message
     assert "main-vps: OK" in message
     assert "parse_mode" not in message
+
+
+def test_run_command_timeout_returns_124_instead_of_raising():
+    result = run_command(
+        ["python", "-c", "import time; time.sleep(2)"],
+        timeout=1,
+    )
+
+    assert result.returncode == 124
+    assert "timed out" in result.stderr

@@ -194,14 +194,20 @@ def build_fleet_message(
 
 
 def run_command(command: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        command,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        stderr = (stderr + f"\ncommand timed out after {timeout}s").strip()
+        return subprocess.CompletedProcess(command, 124, stdout, stderr)
 
 
 def collect_repo_events(repos: Iterable[str]) -> tuple[dict[str, list[dict]], list[str]]:
