@@ -78,15 +78,33 @@ BANNED_IMPERATIVES_V1 = (
     "take profit",
     "lock in profit",
     "lock in gains",
+    "lock in",
     "secure profit",
     "cut losses",
     "stop loss now",
-    "accumulate",
     "load up",
     "loading bags",
     "bagging",
+    # V1 additions per Vector-B I3 (unambiguous trader-speak)
+    "secured",
+    "confirmed entry",
+    "entry point",
+    "cash out",
+    "take the w",
+    "pump and dump",
+    "paper hands",
+    "diamond hands",
+    "dip buy",
+    "dip-buying",
+    "dca in",
+    "dca-ing",
+    "bag the dip",
+    # Removed `accumulate` (Vector-B C3 dual-use: "accumulating losses" / "errors
+    # accumulating" are legitimate non-trading prose).
 )
 
+# "easy" / "easy money" prefix series — co-occurrence to reduce false-positive risk on
+# bare "easy" while keeping the actionable-tone leak surface covered.
 BANNED_HYPE_V1 = (
     "moon",
     "mooning",
@@ -102,10 +120,12 @@ BANNED_HYPE_V1 = (
     "last chance",
     "huge upside",
     "easy money",
+    "easy 10x",
+    "easy 100x",
     "free money",
     "bullish af",
-    "printing",
-    "winner",
+    "printing money",
+    "printing gains",
     "lambo",
     "top pick",
     "best buy",
@@ -114,6 +134,12 @@ BANNED_HYPE_V1 = (
     "floor is in",
     "breakout confirmed",
     "next leg up",
+    # Removed `printing` bare (Vector-B C2 dual-use: "tx receipt printing",
+    # "logger printing trace"). `printing money` / `printing gains` keep
+    # the actionable-tone coverage.
+    # Removed `winner` bare (Vector-B C1 false-positive on "category_winner"
+    # / "no clear winner among comparable pools"). `top_pick`, `best buy`,
+    # `strong buy`, `must buy` continue to cover the actionable-tone surface.
 )
 
 BANNED_TOKENS = tuple(BANNED_IMPERATIVES_V1) + tuple(BANNED_HYPE_V1)
@@ -132,19 +158,37 @@ SCAN_EXEMPT_STRING_FIELDS = frozenset({
     "price_updated_at",
 })
 
+# Per-source / KOL ranking field-name firewall. Matched via re.search against
+# lowercased key name (not fullmatch — Vector-A I2 + Vector-B I2 convergent:
+# `recommended` etc. would slip if only fullmatch is used since
+# `is_recommended` / `recommended_score` are stealth variants).
 KOL_RANKING_FIELD_PATTERNS = tuple(
     re.compile(p)
     for p in (
-        r"kol_(rank|score|weight)",
-        r"source_(rank|score|weight)",
-        r"channel_(rank|score|weight)",
-        r"tg_.*_(rank|score|weight)",
-        r"x_.*_(rank|score|weight)",
-        r"influencer_.*",
-        r"recommended",
-        r"top_pick",
-        r"top_n",
-        r"highest_(rank|score)",
+        r"^kol_(rank|score|weight)$",
+        r"^source_(rank|score|weight|priority)$",
+        r"^channel_(rank|score|weight|trust)$",
+        r"^tg_.*_(rank|score|weight)$",
+        r"^x_.*_(rank|score|weight)$",
+        r"^influencer_.*$",
+        # Vector-B I1 additions: caller/poster/account/tweet vocabulary
+        r"^caller_(rank|score|weight|authority|credibility|clout|list)$",
+        r"^top_callers$",
+        r"^poster_(rank|score|weight|reputation)$",
+        r"^account_(credibility|reputation|trust)$",
+        r"^tweet_(rank|score|credibility|weight)$",
+        r"^user_(reputation|credibility)$",
+        r"^narrative_call_(rank|score)$",
+        # Vector-A I2 + Vector-B I2: widen `recommended` to match prefixed/suffixed variants
+        r"^(is_)?recommend(ed|ation).*$",
+        r".*_recommended$",
+        # Closed-set markers for "top N picks" / ranks
+        r"^top_pick.*$",
+        r"^top_n$",
+        r"^highest_(rank|score).*$",
+        # Vector-B I1 extras: stealth weighting names
+        r"^weighted_by_kol$",
+        r"^kol_id_weighted$",
     )
 )
 
@@ -182,7 +226,7 @@ EXPECTED_ROW_KEYS = frozenset({
     "inclusion_reasons",
     "risk_reasons",
 })
-ALLOWED_SEVERITIES = {"high", "medium", "low", "info"}
+ALLOWED_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 
 
 class Result:
@@ -237,11 +281,17 @@ def _scan_string_for_banned(text: str, path: str, result: Result) -> None:
 
 
 def _walk_strings(value, path: str, result: Result) -> None:
-    """Recursively walk value; scan every string leaf except exempt fields."""
+    """Recursively walk value; scan every string leaf except exempt fields.
+
+    Per Vector-A I3: exemption applies to the FIELD regardless of value shape.
+    If a future change makes an exempt field (e.g. `chain`) structured (a dict),
+    we still skip the entire subtree — otherwise a chain name like "moonbeam"
+    inside `chain.name` would trip the banned-token scan.
+    """
     if isinstance(value, dict):
         for k, v in value.items():
             child_path = f"{path}.{k}" if path else k
-            if isinstance(v, str) and k in SCAN_EXEMPT_STRING_FIELDS:
+            if k in SCAN_EXEMPT_STRING_FIELDS:
                 continue
             _walk_strings(v, child_path, result)
     elif isinstance(value, list):
@@ -303,14 +353,24 @@ def _check_meta(meta, requested_limit: int, requested_window: int,
         else:
             result.ok()
 
+    # Per Vector-A I1: isinstance(True, int) is True in Python; explicitly
+    # exclude bool so `rows_returned=True` doesn't silently slip through.
     rows_returned = meta.get("rows_returned")
-    if not isinstance(rows_returned, int) or rows_returned < 0:
+    if (
+        not isinstance(rows_returned, int)
+        or isinstance(rows_returned, bool)
+        or rows_returned < 0
+    ):
         result.critical(
             f"meta.rows_returned must be int>=0 (got {rows_returned!r})"
         )
 
     open_scanned = meta.get("open_trades_scanned")
-    if not isinstance(open_scanned, int) or open_scanned < 0:
+    if (
+        not isinstance(open_scanned, int)
+        or isinstance(open_scanned, bool)
+        or open_scanned < 0
+    ):
         result.critical(
             f"meta.open_trades_scanned must be int>=0 (got {open_scanned!r})"
         )
@@ -333,13 +393,17 @@ def _check_row(row, idx: int, result: Result) -> None:
         result.critical(f"rows[{idx}] must be object; got {type(row).__name__}")
         return
 
-    # AC #14: KOL/source-ranking field firewall (regex on key name)
+    # AC #14: KOL/source-ranking field firewall (regex on key name).
+    # Uses re.search so the patterns can be either anchored (^...$ for exact
+    # match) or unanchored (.*_recommended$ for suffix variants). Per Vector-A
+    # I2 + Vector-B I2: fullmatch alone was too narrow for is_recommended /
+    # recommended_score / *_recommended variants.
     for key in row.keys():
         if not isinstance(key, str):
             continue
         lower = key.casefold()
         for pattern in KOL_RANKING_FIELD_PATTERNS:
-            if pattern.fullmatch(lower):
+            if pattern.search(lower):
                 result.critical(
                     f"rows[{idx}].{key}: per-source/KOL ranking field "
                     f"detected (matches {pattern.pattern!r}); operator's "
@@ -347,11 +411,18 @@ def _check_row(row, idx: int, result: Result) -> None:
                     f"price coverage becomes rankable"
                 )
 
-    # Unknown row keys → WARNING (closed-set drift, not CRITICAL)
+    # Per Vector-B C4: unknown row-level keys are CRITICAL, not WARNING.
+    # A creatively-named field like `caller_authority_score` could slip past
+    # the KOL regex set AND be silently demoted to WARNING — that's CRITICAL-
+    # equivalent risk demoted. Closed-set drift IS the operator's pinned risk
+    # model; new row keys require operator-signed schema bump + coordinated
+    # validator update.
     unknown_row_keys = set(row.keys()) - EXPECTED_ROW_KEYS
     if unknown_row_keys:
-        result.warn(
-            f"rows[{idx}]: unknown row-level keys {sorted(unknown_row_keys)!r}"
+        result.critical(
+            f"rows[{idx}]: unknown row-level keys {sorted(unknown_row_keys)!r} "
+            f"— closed-set drift requires operator-signed schema bump and "
+            f"coordinated validator update before merge"
         )
 
     token_id = row.get("token_id")
@@ -424,8 +495,9 @@ def _check_row(row, idx: int, result: Result) -> None:
         "market_cap", "price_change_24h",
     ):
         v = row.get(numeric_field)
-        if v is not None and not isinstance(v, (int, float)) or isinstance(v, bool):
-            # isinstance(True, int) is True in Python, so explicitly exclude bool
+        # isinstance(True, int) is True in Python, so explicitly exclude bool.
+        # Vector-A N1: parenthesize for style consistency with the int_or_none loop.
+        if v is not None and (not isinstance(v, (int, float)) or isinstance(v, bool)):
             result.critical(
                 f"rows[{idx}].{numeric_field} must be number|None "
                 f"(got {type(v).__name__})"
@@ -577,7 +649,11 @@ def fetch_and_validate(url: str, *, timeout_sec: float, slo_ms: int,
             status = resp.status
             body = resp.read()
     except urllib.error.HTTPError as e:
-        return Result(), EXIT_HTTP
+        # Per Vector-A C1: record the http error so --json mode shows a
+        # critical instead of an empty array with exit_code=2.
+        r = Result()
+        r.critical(f"http error {e.code}: {e.reason} (url={target})")
+        return r, EXIT_HTTP
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         r = Result()
         r.critical(f"http fetch failed: {e}")

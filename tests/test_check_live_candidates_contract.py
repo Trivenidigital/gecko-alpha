@@ -342,3 +342,178 @@ def test_latest_chain_match_string_critical():
     result = _MOD.validate_payload(payload)
     assert not result.is_clean
     assert any("latest_chain_match" in c for c in result.criticals)
+
+
+# --- Fold regression tests (PR #232 2-vector review) ---
+
+def test_unknown_row_level_key_is_critical_not_warning():
+    """Vector-B C4: unknown row keys are CRITICAL (was WARNING).
+
+    Stealth KOL-ranking fields that slip the regex set must still trip.
+    """
+    payload = _envelope(rows=[_row(**{"caller_authority_score": 0.9})])
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    # Either KOL-regex CRITICAL or unknown-row-key CRITICAL must fire.
+    assert any(
+        ("unknown row-level keys" in c) or ("ranking" in c)
+        for c in result.criticals
+    )
+
+
+def test_kol_caller_rank_pattern_critical():
+    """Vector-B I1: caller_rank pattern added."""
+    payload = _envelope(rows=[_row(**{"caller_rank": 1})])
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("caller_rank" in c and "ranking" in c for c in result.criticals)
+
+
+def test_kol_is_recommended_pattern_critical():
+    """Vector-A I2 + Vector-B I2: is_recommended must trip (regex widened)."""
+    payload = _envelope(rows=[_row(**{"is_recommended": True})])
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any(
+        "is_recommended" in c and "ranking" in c for c in result.criticals
+    )
+
+
+def test_kol_recommended_score_pattern_critical():
+    """Vector-A I2 + Vector-B I2: recommended_score variant must trip."""
+    payload = _envelope(rows=[_row(**{"recommended_score": 0.9})])
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any(
+        "recommended_score" in c and "ranking" in c for c in result.criticals
+    )
+
+
+def test_meta_rows_returned_true_bool_critical():
+    """Vector-A I1: rows_returned=True (bool, subtype of int) must trip."""
+    payload = _envelope(rows=[_row()])
+    payload["meta"]["rows_returned"] = True
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("rows_returned" in c for c in result.criticals)
+
+
+def test_meta_open_trades_scanned_false_bool_critical():
+    """Vector-A I1: open_trades_scanned=False must trip."""
+    payload = _envelope()
+    payload["meta"]["open_trades_scanned"] = False
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("open_trades_scanned" in c for c in result.criticals)
+
+
+def test_banned_secured_token_critical():
+    """Vector-B I3 V1 addition: 'secured' (as in 'secured 100x') must trip."""
+    payload = _envelope(rows=[_row(
+        risk_reasons=["secured a low-cap entry early"],
+    )])
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("secured" in c for c in result.criticals)
+
+
+def test_banned_confirmed_entry_critical():
+    """Vector-B I3 V1 addition."""
+    payload = _envelope(rows=[_row(
+        risk_reasons=["confirmed entry on chain"],
+    )])
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("confirmed entry" in c for c in result.criticals)
+
+
+def test_banned_take_the_w_critical():
+    """Vector-B I3 V1 addition."""
+    payload = _envelope(rows=[_row(
+        risk_reasons=["go take the w now"],
+    )])
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("take the w" in c for c in result.criticals)
+
+
+def test_legitimate_accumulating_losses_allowed():
+    """Vector-B C3: bare 'accumulate' removed; 'accumulating losses' fine."""
+    payload = _envelope(rows=[_row(
+        risk_reasons=["user has been accumulating losses"],
+    )])
+    result = _MOD.validate_payload(payload)
+    assert result.is_clean, result.criticals
+
+
+def test_legitimate_category_winner_allowed():
+    """Vector-B C1: 'winner' removed; 'category_winner' descriptor fine."""
+    payload = _envelope(rows=[_row(
+        risk_reasons=["no clear category_winner among comparable pools"],
+    )])
+    result = _MOD.validate_payload(payload)
+    assert result.is_clean, result.criticals
+
+
+def test_legitimate_receipt_printing_allowed():
+    """Vector-B C2: bare 'printing' removed; debug-language fine."""
+    payload = _envelope(rows=[_row(
+        risk_reasons=["debug_printing_enabled in logger trace"],
+    )])
+    result = _MOD.validate_payload(payload)
+    assert result.is_clean, result.criticals
+
+
+def test_printing_money_still_banned():
+    """Vector-B C2: 'printing money' (the actionable variant) must still trip."""
+    payload = _envelope(rows=[_row(
+        risk_reasons=["this token is printing money"],
+    )])
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("printing money" in c for c in result.criticals)
+
+
+def test_severity_critical_allowed():
+    """Vector-B I7: severity allowlist now includes 'critical'."""
+    payload = _envelope(rows=[_row(counter_flags=[
+        {"flag": "x", "severity": "critical", "detail": "broken pool"}
+    ])])
+    result = _MOD.validate_payload(payload)
+    assert result.is_clean, result.criticals
+
+
+def test_walk_strings_exempt_field_dict_value_skipped():
+    """Vector-A I3: exempt field skipped regardless of value shape.
+
+    If `chain` ever becomes a dict with a name like "Moonbeam Network",
+    the banned-word scan still skips it because `chain` is an exempt key.
+    """
+    payload = _envelope(rows=[_row(
+        chain={"name": "Moonbeam Network", "id": "moonbeam-1"},
+    )])
+    # chain dict→isinstance check on str fails so the row's chain check passes
+    # (the structural assertion is "str|None", strict). Override that check by
+    # putting moonbeam INSIDE a non-exempt structured key would trip — but the
+    # whole point is the exempt-key skip walks the subtree.
+    result = _MOD.validate_payload(payload)
+    # chain as dict fails the str|None type check (CRITICAL), but the
+    # banned-language scan must NOT additionally trip on "moonbeam".
+    assert any("chain must be str|None" in c for c in result.criticals)
+    assert not any("moonbeam" in c for c in result.criticals)
+
+
+def test_disclaimer_uppercase_accepted():
+    """Vector-A N3: case-insensitive disclaimer regex covers mixed case."""
+    payload = _envelope(rows=[_row(
+        disclaimer="READ-ONLY LABELS — Not Trading Advice; no actions taken",
+    )])
+    result = _MOD.validate_payload(payload)
+    assert result.is_clean, result.criticals
+
+
+def test_int_valued_price_accepted():
+    """Vector-A N2: integer-valued numeric field (not just float) accepted."""
+    payload = _envelope(rows=[_row(entry_price=100, current_price=101)])
+    result = _MOD.validate_payload(payload)
+    assert result.is_clean, result.criticals
