@@ -2072,7 +2072,53 @@ async def main(argv: list[str] | None = None) -> int:
             # Both loops share the same session and rate limiter intentionally.
             # The coingecko_limiter (25 req/min) coordinates access; that IS
             # the back-pressure mechanism.
-            await asyncio.gather(*tasks, return_exceptions=True)
+            #
+            # BL-NEW-PIPELINE-SIGTERM-HANDLER (PR #243): a bare
+            # `asyncio.gather(*tasks, return_exceptions=True)` here blocks
+            # until EVERY worker exits cleanly. Some worker loops (e.g.
+            # narrative_agent_loop, perp_watcher inside _maybe_start_perp_watcher,
+            # secondwave_loop) do not observe shutdown_event, so an
+            # operator-initiated SIGTERM left them running until systemd's
+            # 90s TimeoutStopSec elapsed and the process was SIGKILLed.
+            # That fired the OnFailure → Telegram chain on every restart.
+            # Pattern: wait for FIRST of {any worker, shutdown_waiter}, then
+            # cancel the rest with a bounded drain.
+            _shutdown_waiter = asyncio.create_task(
+                shutdown_event.wait(), name="_shutdown_waiter"
+            )
+            _wait_set = set(tasks) | {_shutdown_waiter}
+            # Include perp_task so SIGTERM cancels it in the same drain
+            # pass — without this, perp_watcher_stats keeps emitting until
+            # the dedicated cancel block below runs (post-gather), adding
+            # ~5s of noise after shutdown.
+            if perp_task is not None:
+                _wait_set.add(perp_task)
+            done, pending = await asyncio.wait(
+                _wait_set, return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # If a worker exited before shutdown_event fired, propagate
+            # shutdown so the rest cooperate on the way down.
+            if _shutdown_waiter not in done:
+                logger.warning(
+                    "worker_task_exited_triggering_shutdown",
+                    n_done=len(done),
+                )
+                shutdown_event.set()
+
+            # Cancel everything still running and drain with a bounded timeout.
+            for t in pending:
+                t.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=20.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "shutdown_drain_timeout",
+                    n_pending=sum(1 for t in pending if not t.done()),
+                )
 
             # Cancel any pending restart-task so it cannot spin up a fresh
             # social loop against the DB we're about to close.
