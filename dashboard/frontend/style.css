@@ -10,6 +10,7 @@
   --color-accent-blue: #58a6ff;
   --color-bar-bg: #21262d;
   --font: system-ui, -apple-system, sans-serif;
+  --dashboard-max-width: 1880px;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -23,7 +24,7 @@ body {
 }
 
 .dashboard {
-  max-width: 1400px;
+  max-width: min(var(--dashboard-max-width), calc(100vw - 32px));
   margin: 0 auto;
   padding: 16px;
 }
@@ -182,6 +183,20 @@ body {
 
 .candidates-table tr:last-child td {
   border-bottom: none;
+}
+
+.open-positions-scroll {
+  overflow-x: auto;
+}
+
+.open-positions-table {
+  table-layout: auto;
+}
+
+.open-positions-table th,
+.open-positions-table td {
+  padding-left: 8px;
+  padding-right: 8px;
 }
 
 /* Badges */
