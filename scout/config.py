@@ -5,7 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr, computed_field, field_validator, model_validator
+from pydantic import Field, SecretStr, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,12 +20,22 @@ class Settings(BaseSettings):
     # next-audit-trigger: 2026-11-13 OR SCAN_INTERVAL value change OR new external API OR
     # new *_CYCLES setting OR score_history/volume_snapshots write-rate +/- 2x.
     # See tasks/findings_cycle_change_audit_2026_05_13.md sec 5.
-    SCAN_INTERVAL_SECONDS: int = 60
-    HEARTBEAT_INTERVAL_SECONDS: int = 300  # BL-033: periodic heartbeat summary
+    # Bounds rationale: ge=1 (0 would be a tight-loop CPU burn); le=3600
+    # (1h ceiling — operator intent of slower cadence is fine, but >1h
+    # likely a misconfig that should fail-fast at startup).
+    SCAN_INTERVAL_SECONDS: int = Field(default=60, ge=1, le=3600)
+    HEARTBEAT_INTERVAL_SECONDS: int = Field(
+        default=300, ge=1, le=3600
+    )  # BL-033: periodic heartbeat summary
     INGEST_WATCHDOG_ENABLED: bool = True
-    INGEST_STARVATION_THRESHOLD_CYCLES: int = 5
-    MIN_SCORE: int = 60
-    CONVICTION_THRESHOLD: int = 70
+    INGEST_STARVATION_THRESHOLD_CYCLES: int = Field(default=5, ge=1, le=100)
+    # MIN_SCORE / CONVICTION_THRESHOLD are 0..100 scores in normal use,
+    # but tests + operator circuit-breakers use sentinel values like
+    # 999 to mean "disable this gate entirely". ge=0 catches sign typos;
+    # le=10_000 catches accidental "MIN_SCORE=9999999" while still
+    # admitting the deliberate-disable pattern.
+    MIN_SCORE: int = Field(default=60, ge=0, le=10_000)
+    CONVICTION_THRESHOLD: int = Field(default=70, ge=0, le=10_000)
     QUANT_WEIGHT: float = 0.6
     NARRATIVE_WEIGHT: float = 0.4
 
@@ -117,8 +127,10 @@ class Settings(BaseSettings):
 
     # MiroFish
     MIROFISH_URL: str = "http://localhost:5001"
-    MIROFISH_TIMEOUT_SEC: int = 180
-    MAX_MIROFISH_JOBS_PER_DAY: int = 50
+    # ge=1 — zero would trigger instant timeout on every call; le=600
+    # — MiroFish jobs taking >10min are a separate problem class.
+    MIROFISH_TIMEOUT_SEC: int = Field(default=180, ge=1, le=600)
+    MAX_MIROFISH_JOBS_PER_DAY: int = Field(default=50, ge=0, le=10_000)
 
     # Alerts
     TELEGRAM_BOT_TOKEN: str
@@ -174,11 +186,17 @@ class Settings(BaseSettings):
     CHAIN_OUTCOME_MIN_MCAP_USD: float = (
         1000.0  # writer skips dust mcap that would produce fake hits at hydrate
     )
-    CHAIN_OUTCOME_PERSISTENT_FAILURE_HOURS: float = (
-        1.0  # ERROR threshold for stuck-row aging
+    CHAIN_OUTCOME_PERSISTENT_FAILURE_HOURS: float = Field(
+        default=1.0,
+        gt=0,
+        le=168.0,  # 1 week ceiling — beyond is "stuck rows expected"
+        description="ERROR threshold for stuck-row aging",
     )
-    CHAIN_TRACKER_UNHEALTHY_FAILURE_RATE: float = (
-        0.5  # 50% of attempts → session-unhealthy ERROR
+    CHAIN_TRACKER_UNHEALTHY_FAILURE_RATE: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Failure-rate fraction (0..1); >=1 disables circuit-break",
     )
     CHAIN_TRACKER_UNHEALTHY_MIN_ATTEMPTS: int = 3  # floor — don't ERROR on 1-row cycles
 
@@ -302,8 +320,12 @@ class Settings(BaseSettings):
     LUNARCRUSH_POLL_INTERVAL_SOFT: int = 600  # 10 min (used after 80% credits)
     LUNARCRUSH_RATE_LIMIT_PER_MIN: int = 9  # under hard 10/min
     LUNARCRUSH_DAILY_CREDIT_BUDGET: int = 2000  # free tier cap
-    LUNARCRUSH_CREDIT_SOFT_PCT: float = 0.80  # downshift at 80%
-    LUNARCRUSH_CREDIT_HARD_PCT: float = 0.95  # stop at 95%
+    LUNARCRUSH_CREDIT_SOFT_PCT: float = Field(
+        default=0.80, ge=0.0, le=1.0, description="downshift threshold (0..1)"
+    )
+    LUNARCRUSH_CREDIT_HARD_PCT: float = Field(
+        default=0.95, ge=0.0, le=1.0, description="stop threshold (0..1)"
+    )
     LUNARCRUSH_SOCIAL_SPIKE_RATIO: float = 2.0
     LUNARCRUSH_GALAXY_JUMP: float = 10.0
     LUNARCRUSH_INTERACTIONS_ACCEL: float = 3.0
