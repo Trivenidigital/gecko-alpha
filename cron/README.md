@@ -44,11 +44,25 @@ The managed block is bracketed by:
 
 ## What's in scope
 
-Currently 2 weekly entries:
+Currently 4 entries:
 - `30 3 * * 0` — `scripts/tg_burst_archive.sh` (Sunday 03:30 UTC)
 - `45 3 * * 0` — `scripts/wal_archive.sh` (Sunday 03:45 UTC)
+- `*/5 * * * *` — `scripts/source-calls-live-writer.sh` (every 5 min)
+- `*/10 * * * *` — `scripts/source-calls-lag-watchdog.sh` (every 10 min)
 
-Future high-cadence triggers should prefer `systemd/*.timer` (cycle 10 canon) over cron. The 2 weekly entries stay as cron for simplicity (see BL-NEW-CRON-TO-SYSTEMD-TIMER decision-by 2026-06-14).
+Future high-cadence triggers should prefer `systemd/*.timer` (cycle 10 canon) over cron. The 4 entries above stay as cron for simplicity (see BL-NEW-CRON-TO-SYSTEMD-TIMER decision-by 2026-06-14).
+
+## Stderr redirection convention (Round 6 hardening)
+
+**Every managed-block cron line MUST redirect both stdout and stderr to
+`/var/log/gecko-alpha-<scriptname>.log` via `>> /var/log/... 2>&1`.** On
+srilu the local MTA is not configured, so cron's default behavior of
+mailing the job's stderr to `root` drops the output on the floor — any
+script failure becomes invisible. Per-job log files give the operator a
+journalctl-equivalent trail for these bash workloads.
+
+Static test `tests/test_cron_stderr_redirection.py` enforces this on
+every managed-block entry to prevent regression.
 
 ## Why this exists
 
