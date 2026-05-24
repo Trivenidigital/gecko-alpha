@@ -248,7 +248,13 @@ async def live_metrics_rollup_loop(
                 metric_count=len(rows),
             )
             try:
-                await send_telegram_message(body, session, settings)
+                # parse_mode=None — body contains metric names with `_`
+                # (e.g. shadow_evaluator_decisions_total) which Telegram
+                # MarkdownV1 would consume as italics markers, mangling the
+                # rendered text. CLAUDE.md §12b Class-3 silent-render rule.
+                await send_telegram_message(
+                    body, session, settings, parse_mode=None
+                )
             except Exception as send_exc:
                 log.warning("live_metrics_rollup_send_failed", error=str(send_exc))
         except asyncio.CancelledError:
