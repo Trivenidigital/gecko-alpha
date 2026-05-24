@@ -2,7 +2,7 @@
 
 ## Active Work: 2026-05-24 — Dashboard open-positions width fix
 
-**Status:** IN-PROGRESS. Goal: stop the Open Positions table from being horizontally cut off on wide screens by using the available left/right viewport space more effectively.
+**Status:** PR-READY. Goal: stop the Open Positions table from being horizontally cut off on wide screens by using the available left/right viewport space more effectively.
 
 Workflow checklist:
 - [x] Root cause confirmed from screenshot and frontend CSS.
@@ -10,7 +10,7 @@ Workflow checklist:
 - [x] Scoped layout fix implemented in dashboard frontend.
 - [x] Vite production build refreshed.
 - [x] Local verification completed with focused test/build/browser check.
-- [ ] PR opened and reviewed.
+- [x] PR opened and reviewed.
 - [ ] Other VPS PR status checked before deploy.
 - [ ] Clean deploy completed if merge gate is clear.
 
@@ -18,7 +18,8 @@ Review:
 - Root cause: global `.dashboard` width was capped at 1400px, leaving wide monitor space unused while the 16-column Open Positions table overflowed horizontally.
 - Fix: `.dashboard` now expands up to 1880px while preserving 16px viewport gutters; Open Positions gets a dedicated compact table class with 8px horizontal cell padding.
 - Regression: `tests/test_dashboard_frontend_layout.py` locks the wide dashboard width contract and Open Positions compact-layout hook.
-- Verification: `python -m pytest tests/test_dashboard_frontend_layout.py -q` passed; `npm run build:codex` passed via the existing local `node_modules` junction after `npm ci` was blocked by local npm/PyPI certificate failures; Chrome headless 1920px screenshot confirmed panels span the wider viewport.
+- PR: #241 (`fix/dashboard-open-positions-width`) opened and self-reviewed; diff is limited to dashboard source, regenerated Vite dist, task log, and static regression coverage.
+- Verification: `python -m pytest tests/test_dashboard_frontend_layout.py -q` passed; `python -m pytest tests/test_dashboard_frontend_layout.py tests/test_trading_dashboard.py -q` passed (`26 passed`); `npm run build:codex` passed via the existing local `node_modules` junction after `npm ci` was blocked by local npm/PyPI certificate failures; Chrome headless 1920px screenshot confirmed panels span the wider viewport; GitHub Actions `test` passed on PR #241.
 
 ## Active Work: 2026-05-23 — Codex/Hermes systemd auto-remediation
 
