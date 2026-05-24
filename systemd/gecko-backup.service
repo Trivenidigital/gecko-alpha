@@ -1,5 +1,5 @@
 [Unit]
-Description=Gecko-Alpha — rotate scout.db backups, keep top-N most-recent
+Description=Gecko-Alpha — create scout.db online backup + rotate to keep top-N
 
 [Service]
 Type=oneshot
@@ -7,11 +7,23 @@ User=root
 Group=root
 StateDirectory=gecko-alpha
 StateDirectoryMode=0750
+Environment=GECKO_DB_PATH=/root/gecko-alpha/scout.db
 Environment=GECKO_BACKUP_DIR=/root/gecko-alpha
 Environment=GECKO_BACKUP_KEEP=3
 Environment=GECKO_BACKUP_HEARTBEAT_FILE=/var/lib/gecko-alpha/backup-rotation/backup-last-ok
+Environment=GECKO_BACKUP_CREATE_HEARTBEAT_FILE=/var/lib/gecko-alpha/backup-rotation/create-last-ok
+ExecStartPre=/usr/bin/test -x /usr/local/bin/gecko-backup-create.sh
 ExecStartPre=/usr/bin/test -x /usr/local/bin/gecko-backup-rotate.sh
+# Round 11 — chained: create produces a fresh online backup
+# (sqlite3 .backup, lock-free against concurrent writers) AND verifies
+# integrity. Rotate then prunes to keep-N. Prior config ran only the
+# rotation step against a producer that never existed (found=0 every
+# day for weeks before discovery).
+ExecStart=/usr/local/bin/gecko-backup-create.sh
 ExecStart=/usr/local/bin/gecko-backup-rotate.sh
-TimeoutStartSec=120
+# Backup of a 5GB scout.db via sqlite3 .backup takes ~2-3 minutes on
+# the Hetzner cx21 disk; integrity_check adds another ~30s. 600s
+# gives 4× headroom for slower disks / larger DBs.
+TimeoutStartSec=600
 StandardOutput=journal
 StandardError=journal
