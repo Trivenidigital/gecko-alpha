@@ -11,12 +11,17 @@ Shipped (local commits; ready for PR from a credentialed environment):
 - Durable operating model runbook: Hermes orchestrator ↔ Codex worker ↔ operator gates + truth sources
 - Read-only local status surface: `node scripts/report_autonomous_status.mjs`
 - Read-only “Signal trust” V1 registry skeleton + validator (visibility-only; not for pruning/auto-disable)
+- Signal trust V1 runbook (read-only): `docs/runbooks/signal-trust-roadmap-v1.md`
 - Runbook notes for shipping a read-only “Now Tradable” panel later (UI build deferred due to sandbox constraints)
 
 Blocked / operator-gated:
 - No prod/SSH access in sandbox → no runtime-state verification of DB/env/service state
 - No paid API/vendor probes (operator approval required)
 - No dashboard UI build (`npm ci && npm run build`) in this sandbox → no `dist/` update shipped
+- No GitHub HTTPS credentials in sandbox → cannot `git fetch`/push/open PR from here
+
+New finding (needs follow-up fix + verification):
+- `scripts/source-calls-lag-watchdog.sh` sources `.env` before parsing args, so `--env-file` cannot affect the sourced env file. Findings doc: `tasks/findings_source_calls_lag_watchdog_env_file_ordering_2026_05_23.md`.
 
 ## Verification evidence (sandbox)
 
@@ -28,11 +33,16 @@ Limit:
 
 ## Commits
 
-- `ea837355` tasks(status): add autonomous status report snapshot
-- `e871fad6` tasks(closeout): add 2026-05-23 closeout plan/design/findings
-- `d6ae279a` feat(autonomy): add local status report and trust registry validator
-- `1d823f19` docs(runbooks): add autonomous operating model and status
-- `fc87457a` docs(superpowers): add reusable session templates
+Key commits in this branch:
+- Templates/runbooks/scripts pack landed as the initial series (`fc87457a`, `1d823f19`, `d6ae279a`).
+- Review folds (safer `--out`, freshness caveats, tighter validator) landed afterward.
+- Additional findings recorded: `tasks/findings_source_calls_lag_watchdog_env_file_ordering_2026_05_23.md`.
+
+For the full commit list from the base used in this sandbox (`5475e8d0`), run:
+
+```bash
+git log --oneline 5475e8d0..HEAD
+```
 
 ## Files to focus on
 
@@ -40,7 +50,9 @@ Limit:
 - Operating model: `docs/runbooks/gecko-autonomous-operating-model.md`
 - Status surface: `scripts/report_autonomous_status.mjs` + `docs/runbooks/autonomous-status-report.md`
 - Trust V1 (read-only): `docs/superpowers/registries/signal_trust_registry.v1.json` + `scripts/validate_signal_trust_registry.mjs`
+- Trust V1 runbook: `docs/runbooks/signal-trust-roadmap-v1.md`
 - Cockpit UI guidance: `docs/runbooks/live-candidates-now-tradable-panel.md`
+- Findings: `tasks/findings_source_calls_lag_watchdog_env_file_ordering_2026_05_23.md`
 
 ## Exact next operator actions
 
@@ -54,4 +66,3 @@ Limit:
 ## Prompt/work-loop adjustment suggestion
 
 The repo currently has no committed “overnight closeout runner” artifact. Keep treating this as a manual runbook-driven closeout until a runner’s home (Hermes cron vs systemd vs external orchestrator) is explicitly chosen and reviewed with runtime-state verification hooks.
-

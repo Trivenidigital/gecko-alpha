@@ -2564,10 +2564,11 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 **Child backlog sequence:**
 
 1. **BL-NEW-LIVE-CANDIDATES-ENDPOINT** — Add read-only `/api/live_candidates`.
-   - Return 10-20 per-token rows, not raw trades.
-   - Inputs: open/recent `paper_trades`, `price_cache`, actionability metadata, `would_be_live`, `chain_matches`, latest prediction/counter-risk fields, source-call health.
-   - Include token, symbol, name, current price, mcap, 24h change, open paper trade ids, signal surfaces, `actionable`, `would_be_live`, current-vs-entry %, inclusion reasons, exclusion/risk reasons, and `trade/watch/reject/data_insufficient`.
-   - No writes, no live execution, no suppression.
+   - **Status:** SHIPPED-MERGED 2026-05-23 — implemented in `f81b63ed` (PR #228) with counter_flags hotfix `db19e79a` (PR #229) and operator contract+smoke validator `0727e218` (PR #232).
+    - Return 10-20 per-token rows, not raw trades.
+    - Inputs: open/recent `paper_trades`, `price_cache`, actionability metadata, `would_be_live`, `chain_matches`, latest prediction/counter-risk fields, source-call health.
+    - Include token, symbol, name, current price, mcap, 24h change, open paper trade ids, signal surfaces, `actionable`, `would_be_live`, current-vs-entry %, inclusion reasons, exclusion/risk reasons, and `trade/watch/reject/data_insufficient`.
+    - No writes, no live execution, no suppression.
 
 2. **BL-NEW-TRADER-READINESS-SCORE** — Add a score separate from conviction.
    - Positive factors: actionability pass, `would_be_live` pass, multiple independent surfaces, fresh signal age, current price still near entry, sane mcap/liquidity, no counter-risk flags, resolved identity.
@@ -2589,10 +2590,11 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
    - Narrative predictions can enrich or downgrade a candidate; they are not standalone live entries unless the scoring layer also passes entry-quality and actionability gates.
 
 6. **BL-NEW-DASHBOARD-NOW-TRADABLE-PANEL** — Build a dashboard panel backed by `/api/live_candidates`.
-   - Shows only assets a human might consider now.
-   - Top-level buckets: `trade small now`, `watch only`, `reject`, `data insufficient`.
-   - Each row links to paper trade detail and evidence bundle.
-   - Explicit caption: "TG/X context is excluded from ranking until source-call price coverage is rankable."
+   - **Status:** PR OPEN 2026-05-23 — PR #239 adds a read-only “Now Tradable” tab + a read-only trust-registry tab; no execution/pruning affordances.
+    - Shows only assets a human might consider now.
+    - Top-level buckets: `trade small now`, `watch only`, `reject`, `data insufficient`.
+    - Each row links to paper trade detail and evidence bundle.
+    - Explicit caption: "TG/X context is excluded from ranking until source-call price coverage is rankable."
 
 7. **BL-NEW-TGX-CONTEXT-ONLY-GUARDRAIL** — Prevent unrankable TG/X from influencing live candidate labels.
    - If `source_calls.rankability.rankable=0` or price coverage is below threshold, TG/X may appear as context badges only.
@@ -2634,10 +2636,16 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 
 **Child backlog sequence:**
 
+**V1 visibility artifacts (already in-tree):**
+- Registry: `docs/superpowers/registries/signal_trust_registry.v1.json`
+- Validator: `scripts/validate_signal_trust_registry.mjs`
+- Runbook: `docs/runbooks/signal-trust-roadmap-v1.md`
+- **Status:** PR OPEN 2026-05-23 — PR #239 adds a read-only `GET /api/signal_trust_registry` export + dashboard tab (still visibility-only; not-for-pruning/not-for-auto-disable).
+
 1. **BL-NEW-SIGNAL-MATURITY-TAXONOMY** - Give every signal family an explicit maturity state.
-   - Example states: `trusted_experimental`, `context_only`, `data_insufficient`, `quarantined`, `retire_candidate`.
-   - Initial expected mapping: chain_completed and volume_spike are `trusted_experimental`; narrative_prediction is `needs_hard_filter`; TG/X is `context_only`; first_signal remains soak-gated until 2026-05-31.
-   - Must be derived from current prod evidence, not vibes.
+    - Example states: `trusted_experimental`, `context_only`, `data_insufficient`, `quarantined`, `retire_candidate`.
+    - Initial expected mapping: chain_completed and volume_spike are `trusted_experimental`; narrative_prediction is `needs_hard_filter`; TG/X is `context_only`; first_signal remains soak-gated until 2026-05-31.
+    - Must be derived from current prod evidence, not vibes.
 
 2. **BL-NEW-SIGNAL-FAMILY-SCORECARDS** - Build per-signal scorecards.
    - For each signal_type: 7d/14d/30d opens, closes, net PnL, win rate, average PnL, median PnL, max loss, open count, actionable pass rate, would_be_live pass rate, and current maturity state.
