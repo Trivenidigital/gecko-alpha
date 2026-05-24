@@ -3230,8 +3230,8 @@ class Database:
             )
             try:
                 await conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             _log.error("SCHEMA_DRIFT_DETECTED", migration="bl_tg_alert_eligible_v1")
             raise
 
@@ -3381,8 +3381,8 @@ class Database:
         except Exception:
             try:
                 await conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
 
     async def _migrate_narrative_scanner_v1(self) -> None:
@@ -3471,8 +3471,8 @@ class Database:
             )
             try:
                 await conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
 
     async def _migrate_minara_alert_emissions_v1(self) -> None:
@@ -3558,8 +3558,8 @@ class Database:
             )
             try:
                 await conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             _log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)
             raise
 
@@ -3669,8 +3669,8 @@ class Database:
             )
             try:
                 await conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
 
     async def _migrate_source_calls_v1(self) -> None:
@@ -3828,8 +3828,8 @@ class Database:
             )
             try:
                 await conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
 
     async def _assert_minara_alert_emissions_schema(
@@ -4040,8 +4040,8 @@ class Database:
         except Exception:
             try:
                 await conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            except Exception as rb_err:
+                _db_log.exception("schema_migration_rollback_failed", err=str(rb_err))
             _db_log.exception(
                 "index_migration_failed",
                 table=table,
@@ -4163,8 +4163,8 @@ class Database:
         except Exception:
             try:
                 await conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            except Exception as rb_err:
+                _db_log.exception("schema_migration_rollback_failed", err=str(rb_err))
             _db_log.exception(
                 "cohort_digest_state_migration_failed", migration=migration_name
             )
@@ -4243,8 +4243,8 @@ class Database:
             except Exception:
                 try:
                     await conn.execute("ROLLBACK")
-                except Exception:
-                    pass
+                except Exception as rb_err:
+                    _db_log.exception("schema_migration_rollback_failed", err=str(rb_err))
                 _db_log.exception(
                     "symbol_upper_index_migration_failed",
                     table=table,
@@ -4512,8 +4512,8 @@ class Database:
         except sqlite3.IntegrityError as exc:
             try:
                 await self._conn.rollback()
-            except Exception:
-                pass
+            except Exception as rb_err:
+                _db_log.exception("connection_rollback_failed", err=str(rb_err))
             msg = str(exc)
             if "UNIQUE constraint failed" in msg and (
                 "minara_alert_emissions.source_event_id" in msg
@@ -4524,8 +4524,8 @@ class Database:
         except BaseException:
             try:
                 await self._conn.rollback()
-            except Exception:
-                pass
+            except Exception as rb_err:
+                _db_log.exception("connection_rollback_failed", err=str(rb_err))
             raise
         finally:
             if lock_acquired:
@@ -4722,8 +4722,8 @@ class Database:
         except Exception:
             try:
                 await conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            except Exception as rb_err:
+                _db_log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
 
     # ------------------------------------------------------------------
