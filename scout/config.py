@@ -29,11 +29,13 @@ class Settings(BaseSettings):
     )  # BL-033: periodic heartbeat summary
     INGEST_WATCHDOG_ENABLED: bool = True
     INGEST_STARVATION_THRESHOLD_CYCLES: int = Field(default=5, ge=1, le=100)
-    # MIN_SCORE / CONVICTION_THRESHOLD are 0..100 scores; values outside
-    # that range silently bypass signal filtering or render all alerts
-    # unreachable. ge=0 / le=100 surfaces the misconfig at process start.
-    MIN_SCORE: int = Field(default=60, ge=0, le=100)
-    CONVICTION_THRESHOLD: int = Field(default=70, ge=0, le=100)
+    # MIN_SCORE / CONVICTION_THRESHOLD are 0..100 scores in normal use,
+    # but tests + operator circuit-breakers use sentinel values like
+    # 999 to mean "disable this gate entirely". ge=0 catches sign typos;
+    # le=10_000 catches accidental "MIN_SCORE=9999999" while still
+    # admitting the deliberate-disable pattern.
+    MIN_SCORE: int = Field(default=60, ge=0, le=10_000)
+    CONVICTION_THRESHOLD: int = Field(default=70, ge=0, le=10_000)
     QUANT_WEIGHT: float = 0.6
     NARRATIVE_WEIGHT: float = 0.4
 

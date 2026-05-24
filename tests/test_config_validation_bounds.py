@@ -49,8 +49,10 @@ class TestScannerBounds:
 
 
 class TestScoreBounds:
-    def test_min_score_above_100_rejected(self, _min_env, monkeypatch):
-        monkeypatch.setenv("MIN_SCORE", "150")
+    def test_min_score_obscenely_large_rejected(self, _min_env, monkeypatch):
+        # le=10_000 admits 999 (the test-sentinel for disable) but catches
+        # accidental "MIN_SCORE=99999999".
+        monkeypatch.setenv("MIN_SCORE", "99999999")
         with pytest.raises(ValidationError, match="MIN_SCORE"):
             Settings()
 
@@ -59,13 +61,21 @@ class TestScoreBounds:
         with pytest.raises(ValidationError, match="MIN_SCORE"):
             Settings()
 
-    def test_conviction_threshold_above_100_rejected(self, _min_env, monkeypatch):
-        monkeypatch.setenv("CONVICTION_THRESHOLD", "200")
+    def test_min_score_sentinel_disable_passes(self, _min_env, monkeypatch):
+        # 999 is the canonical "disable this gate" sentinel used in tests.
+        monkeypatch.setenv("MIN_SCORE", "999")
+        s = Settings()
+        assert s.MIN_SCORE == 999
+
+    def test_conviction_threshold_obscenely_large_rejected(
+        self, _min_env, monkeypatch
+    ):
+        monkeypatch.setenv("CONVICTION_THRESHOLD", "99999999")
         with pytest.raises(ValidationError, match="CONVICTION_THRESHOLD"):
             Settings()
 
     def test_conviction_threshold_at_boundary_passes(self, _min_env, monkeypatch):
-        for value in ("0", "50", "100"):
+        for value in ("0", "50", "100", "999"):
             monkeypatch.setenv("CONVICTION_THRESHOLD", value)
             s = Settings()
             assert s.CONVICTION_THRESHOLD == int(value)
