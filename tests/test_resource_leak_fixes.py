@@ -89,8 +89,8 @@ async def test_binance_reopen_task_completes_under_event_loop_pressure():
         # Force pause near-zero so test completes fast.
         adapter._RATE_LIMIT_PAUSE_SEC = 0.05
         adapter._rate_limit_gate.set()  # start open
-        # Trigger the gate-close path (weight >= _WEIGHT_GATE_CLOSE).
-        adapter._adjust_concurrency_for_weight(1140)
+        # Trigger the gate-close path (weight >= _WEIGHT_GATE_CLOSE=1140).
+        await adapter._update_weight_governor(1140)
         # Tracking-set must have the task.
         assert len(adapter._reopen_tasks) == 1
         # Wait for the reopen-task to fire and the discard callback to run.
