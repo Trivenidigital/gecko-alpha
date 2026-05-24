@@ -571,39 +571,54 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         No auth required -- paper trading uses simulated money.
         Double-click protection: checks trade is still open before processing.
+
+        DB errors (table missing, connection failure, etc.) are caught and
+        returned as 500 JSON rather than leaking stack traces to the
+        operator-facing UI.
         """
         from fastapi.responses import JSONResponse
         from scout.trading.paper import PaperTrader
 
-        sdb = await _get_scout_db(_db_path)
-        # Double-click protection: verify trade exists and is still open
-        cursor = await sdb._conn.execute(
-            "SELECT token_id, status FROM paper_trades WHERE id = ?", (trade_id,)
-        )
-        row = await cursor.fetchone()
-        if not row:
-            return JSONResponse(status_code=404, content={"error": "Trade not found"})
-        if row["status"] != "open":
-            return JSONResponse(
-                status_code=400, content={"error": "Trade already closed"}
+        try:
+            sdb = await _get_scout_db(_db_path)
+            # Double-click protection: verify trade exists and is still open
+            cursor = await sdb._conn.execute(
+                "SELECT token_id, status FROM paper_trades WHERE id = ?",
+                (trade_id,),
             )
+            row = await cursor.fetchone()
+            if not row:
+                return JSONResponse(
+                    status_code=404, content={"error": "Trade not found"}
+                )
+            if row["status"] != "open":
+                return JSONResponse(
+                    status_code=400, content={"error": "Trade already closed"}
+                )
 
-        token_id = row["token_id"]
-        pc = await sdb._conn.execute(
-            "SELECT current_price FROM price_cache WHERE coin_id = ?", (token_id,)
-        )
-        price_row = await pc.fetchone()
-        current_price = price_row[0] if price_row else 0
+            token_id = row["token_id"]
+            pc = await sdb._conn.execute(
+                "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                (token_id,),
+            )
+            price_row = await pc.fetchone()
+            current_price = price_row[0] if price_row else 0
 
-        trader = PaperTrader()
-        await trader.execute_sell(
-            db=sdb,
-            trade_id=trade_id,
-            current_price=current_price,
-            reason="manual",
-            slippage_bps=50,
-        )
-        return {"ok": True, "trade_id": trade_id}
+            trader = PaperTrader()
+            await trader.execute_sell(
+                db=sdb,
+                trade_id=trade_id,
+                current_price=current_price,
+                reason="manual",
+                slippage_bps=50,
+            )
+            return {"ok": True, "trade_id": trade_id}
+        except Exception:
+            _log.exception("close_trade_failed", trade_id=trade_id)
+            return JSONResponse(
+                status_code=500,
+                content={"error": "internal_error", "trade_id": trade_id},
+            )
 
     @app.get("/api/trading/stats/by-signal")
     async def get_trading_stats_by_signal_endpoint(
@@ -632,13 +647,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
     # --- Second-Wave Detection endpoints ---
 
     @app.get("/api/secondwave/candidates")
-    async def secondwave_candidates(days: int = 7, limit: int = 50):
+    async def secondwave_candidates(
+        days: int = Query(7, ge=1, le=90),
+        limit: int = Query(50, ge=1, le=500),
+    ):
         sdb = await _get_scout_db(_db_path)
         rows = await sdb.get_recent_secondwave_candidates(days=days)
         return rows[:limit]
 
     @app.get("/api/secondwave/stats")
-    async def secondwave_stats(days: int = 7):
+    async def secondwave_stats(days: int = Query(7, ge=1, le=90)):
         sdb = await _get_scout_db(_db_path)
         rows = await sdb.get_recent_secondwave_candidates(days=days)
         count = len(rows)
@@ -1382,7 +1400,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         }
 
     @app.get("/api/x_alerts")
-    async def get_x_alerts(limit: int = Query(80, ge=1)):
+    async def get_x_alerts(limit: int = Query(80, ge=1, le=500)):
         """Dashboard view of Hermes/xurl narrative alerts.
 
         Collection and classification live in Hermes skills. This endpoint only

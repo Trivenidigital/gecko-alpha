@@ -1,6 +1,7 @@
 """Read-only database queries for the dashboard against scout.db."""
 
 import json
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -591,8 +592,23 @@ async def get_chains_stats(db_path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+_SQL_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
 async def _table_stats(conn, table: str, time_col: str) -> dict:
-    """Return count and latest timestamp for a table; tolerate missing tables."""
+    """Return count and latest timestamp for a table; tolerate missing tables.
+
+    SQLite does not parametrise table/column names, so the f-string-built
+    queries below MUST validate identifiers at the call boundary. Today's
+    only caller (``get_system_health``) uses a hardcoded list, but the
+    regex guard makes the contract explicit and prevents future callers
+    from passing user input that smuggles SQL. Raises ``ValueError`` on
+    a non-identifier.
+    """
+    if not _SQL_IDENTIFIER_RE.match(table):
+        raise ValueError(f"invalid table identifier: {table!r}")
+    if not _SQL_IDENTIFIER_RE.match(time_col):
+        raise ValueError(f"invalid column identifier: {time_col!r}")
     try:
         cursor = await conn.execute(f"SELECT COUNT(*) FROM {table}")
         count = (await cursor.fetchone())[0]
