@@ -183,6 +183,11 @@ async def _record_fallback(combo_key: str, err: str, settings) -> None:
             # alert is acceptable vs. threading a long-lived session through
             # every dispatcher.
             async with aiohttp.ClientSession() as session:
-                await alerter.send_telegram_message(msg, session, settings)
+                # parse_mode=None — plain-text fail-open alert, no
+                # formatting; passing explicit keeps §12b discipline even
+                # when the message body looks safe today.
+                await alerter.send_telegram_message(
+                    msg, session, settings, parse_mode=None
+                )
         except Exception:
             log.exception("suppression_fallback_alert_dispatch_error")
