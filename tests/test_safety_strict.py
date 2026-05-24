@@ -170,11 +170,15 @@ async def test_strict_missing_record_returns_failed_closed():
 
 
 async def test_strict_client_error_returns_failed_closed():
-    """aiohttp.ClientError → (False, False)."""
+    """aiohttp.ClientError → (False, False).
+
+    Uses the base ClientError directly instead of ClientConnectorError —
+    the latter has a complex __str__ that walks _conn_key.ssl and fails
+    when constructed with stub args. The except clause in scout/safety.py
+    catches the base class, so coverage is equivalent.
+    """
     with aioresponses() as m:
-        m.get(GOPLUS_URL, exception=aiohttp.ClientConnectorError(
-            connection_key=object(), os_error=OSError("simulated network down")
-        ))
+        m.get(GOPLUS_URL, exception=aiohttp.ClientError("simulated network down"))
         async with aiohttp.ClientSession() as session:
             verdict, completed = await is_safe_strict(
                 "0xtest", "ethereum", session
