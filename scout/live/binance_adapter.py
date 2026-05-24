@@ -109,6 +109,12 @@ class BinanceSpotAdapter(ExchangeAdapter):
         # Shrinks to 3 at 80% weight usage (spec §9.1).
         self._current_semaphore_cap = 10
 
+        # Tracks the fire-and-forget rate-limit-gate-reopen tasks. Without
+        # storing references here, asyncio.create_task() in
+        # _adjust_concurrency_for_weight can be garbage-collected
+        # mid-flight, leaving the gate closed indefinitely.
+        self._reopen_tasks: set[asyncio.Task[None]] = set()
+
     # ------------------------------------------------------------------
     # HTTP core
     # ------------------------------------------------------------------
@@ -313,7 +319,12 @@ class BinanceSpotAdapter(ExchangeAdapter):
                     await asyncio.sleep(pause)
                     self._rate_limit_gate.set()
 
-                asyncio.create_task(_reopen_gate_later())
+                # Store the task reference so GC cannot collect it before
+                # _reopen_gate_later runs. discard-callback prevents
+                # unbounded set growth across many adjustments.
+                _task = asyncio.create_task(_reopen_gate_later())
+                self._reopen_tasks.add(_task)
+                _task.add_done_callback(self._reopen_tasks.discard)
             self._current_semaphore_cap = 3
         elif weight >= _WEIGHT_SHRINK:
             # 80%+ — shrink concurrency but keep gate open.

@@ -25,17 +25,25 @@ KNOWN_SIGNALS = [
 
 @asynccontextmanager
 async def _ro_db(db_path: str):
-    """Open a read-only connection to the database."""
+    """Open a read-only connection to the database.
+
+    Connection is acquired INSIDE the try block so any exception between
+    ``connect()`` returning and ``yield`` (e.g. failed row_factory
+    assignment) closes the connection cleanly. Previously the
+    row_factory line was outside try and would leak if it raised.
+    """
     import os
 
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Database file not found: {db_path}")
-    db = await aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True)
-    db.row_factory = aiosqlite.Row
+    db = None
     try:
+        db = await aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True)
+        db.row_factory = aiosqlite.Row
         yield db
     finally:
-        await db.close()
+        if db is not None:
+            await db.close()
 
 
 async def get_candidates(db_path: str, limit: int = 20) -> list[dict]:
@@ -186,13 +194,19 @@ async def get_status(db_path: str) -> dict:
 
 @asynccontextmanager
 async def _rw_db(db_path: str):
-    """Open a read-write connection to the database."""
-    conn = await aiosqlite.connect(db_path)
-    conn.row_factory = aiosqlite.Row
+    """Open a read-write connection to the database.
+
+    Same try-block guard as ``_ro_db`` — connection acquired inside try
+    so exceptions during ``connect()`` or ``row_factory`` cannot leak.
+    """
+    conn = None
     try:
+        conn = await aiosqlite.connect(db_path)
+        conn.row_factory = aiosqlite.Row
         yield conn
     finally:
-        await conn.close()
+        if conn is not None:
+            await conn.close()
 
 
 # ---------------------------------------------------------------------------

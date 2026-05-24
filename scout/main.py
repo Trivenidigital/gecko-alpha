@@ -97,6 +97,12 @@ logger = structlog.get_logger()
 # path can cancel them (preventing a fresh loop from spawning against a
 # closed DB). Also prevents detached tasks from being GC'd mid-flight.
 _social_restart_tasks: set[asyncio.Task] = set()
+
+# Same pattern for counter-score follow-up tasks fired from run_cycle. The
+# add_done_callback that swallows the exception only fires AFTER the task
+# completes — without a stored reference, the task can be GC'd mid-flight
+# and never reach the callback.
+_counter_followup_tasks: set[asyncio.Task] = set()
 # Shared counter for consecutive social-loop restarts; resets on any success
 # signal. Used by the done-callback to enforce LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS.
 _social_consecutive_restarts = [0]
@@ -1159,6 +1165,12 @@ async def run_cycle(
             task = asyncio.create_task(
                 _safe_counter_followup(gated_token, session, settings, db=db)
             )
+            # Track the task so it cannot be garbage-collected before the
+            # done-callback fires — the prior weak reference (`task = ...`
+            # bound to a local) allowed GC mid-flight in pathological
+            # event-loop scheduling.
+            _counter_followup_tasks.add(task)
+            task.add_done_callback(_counter_followup_tasks.discard)
             task.add_done_callback(
                 lambda t: t.exception() if not t.cancelled() else None
             )
