@@ -263,6 +263,11 @@ async def _get_current_regime(conn) -> str | None:
         row = await cursor.fetchone()
         return row[0] if row else None
     except Exception:
+        # Briefing collector tolerates partial-data failures so a single
+        # bad query doesn't kill the whole briefing. Silent `return None`
+        # hid disk/lock/WAL failures from operators; log so journalctl
+        # shows the regime path failed without breaking the briefing.
+        logger.exception("briefing_current_regime_query_failed")
         return None
 
 
@@ -278,6 +283,9 @@ async def _get_heating_categories(conn, hours: int = 12) -> list[dict]:
         )
         return [dict(r) for r in await cursor.fetchall()]
     except Exception:
+
+        logger.exception("briefing_heating_categories_query_failed")
+
         return []
 
 
@@ -293,6 +301,9 @@ async def _get_cooling_categories(conn, hours: int = 12) -> list[dict]:
         )
         return [dict(r) for r in await cursor.fetchall()]
     except Exception:
+
+        logger.exception("briefing_cooling_categories_query_failed")
+
         return []
 
 
@@ -309,6 +320,9 @@ async def _get_recent_catches(conn, hours: int = 12) -> list[dict]:
         )
         return [dict(r) for r in await cursor.fetchall()]
     except Exception:
+
+        logger.exception("briefing_recent_catches_query_failed")
+
         return []
 
 
@@ -325,6 +339,9 @@ async def _get_recent_predictions(conn, hours: int = 12) -> list[dict]:
         )
         return [dict(r) for r in await cursor.fetchall()]
     except Exception:
+
+        logger.exception("briefing_recent_predictions_query_failed")
+
         return []
 
 
@@ -353,6 +370,9 @@ async def _get_paper_summary(conn) -> dict | None:
             "by_signal_24h": by_signal,
         }
     except Exception:
+        # Same hygiene as _get_current_regime above — emit a structured
+        # log before the briefing-tolerant `return None`.
+        logger.exception("briefing_open_positions_query_failed")
         return None
 
 
@@ -367,6 +387,9 @@ async def _get_recent_spikes(conn, hours: int = 12) -> list[dict]:
         )
         return [dict(r) for r in await cursor.fetchall()]
     except Exception:
+
+        logger.exception("briefing_recent_spikes_query_failed")
+
         return []
 
 
@@ -382,6 +405,9 @@ async def _get_recent_chains(conn, hours: int = 12) -> list[dict]:
         )
         return [dict(r) for r in await cursor.fetchall()]
     except Exception:
+
+        logger.exception("briefing_recent_chains_query_failed")
+
         return []
 
 

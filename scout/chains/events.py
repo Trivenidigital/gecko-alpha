@@ -115,6 +115,11 @@ async def safe_emit(
         if not getattr(settings, "CHAINS_ENABLED", False):
             return None
     except Exception:
+        # If settings load fails we deliberately swallow so the
+        # pipeline-side chain emitter doesn't crash. But silent
+        # `return None` hid the config-load failure from operators —
+        # log so journalctl shows the path was hit and why.
+        logger.exception("chain_event_settings_load_failed")
         return None
     try:
         return await emit_event(
