@@ -5,7 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr, computed_field, field_validator, model_validator
+from pydantic import Field, SecretStr, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -33,11 +33,13 @@ class Settings(BaseSettings):
     MIN_MARKET_CAP: float = 10_000
     MAX_MARKET_CAP: float = 500_000
     MAX_TOKEN_AGE_DAYS: int = 7
-    MIN_LIQUIDITY_USD: float = 15_000
-    MIN_VOL_LIQ_RATIO: float = 5.0
-    BUY_PRESSURE_THRESHOLD: float = 0.65
-    CO_OCCURRENCE_MIN_SIGNALS: int = 3
-    CO_OCCURRENCE_MULTIPLIER: float = 1.15
+    MIN_LIQUIDITY_USD: float = Field(default=15_000, ge=0)
+    MIN_VOL_LIQ_RATIO: float = Field(default=5.0, ge=0)
+    # Fraction-domain threshold (0..1). Values outside that range either
+    # invert detection (negative) or never fire (>1). Fail-fast at startup.
+    BUY_PRESSURE_THRESHOLD: float = Field(default=0.65, ge=0.0, le=1.0)
+    CO_OCCURRENCE_MIN_SIGNALS: int = Field(default=3, ge=1, le=20)
+    CO_OCCURRENCE_MULTIPLIER: float = Field(default=1.15, ge=1.0, le=5.0)
 
     # BL-NEW-QUOTE-PAIR: stable-pair liquidity-quality signal.
     # Tokens whose DexScreener quoteToken.symbol is in STABLE_QUOTE_SYMBOLS AND
@@ -60,7 +62,8 @@ class Settings(BaseSettings):
     CHAINS: list[str] = ["solana", "base", "ethereum"]
 
     # CoinGecko
-    MOMENTUM_RATIO_THRESHOLD: float = 0.6
+    # Fraction-domain (0..1). 0 fires for any positive 1h move; >1 never fires.
+    MOMENTUM_RATIO_THRESHOLD: float = Field(default=0.6, ge=0.0, le=1.0)
     # Minimum absolute 24h price change (%) required for momentum_ratio to fire.
     # Prevents stablecoin peg-wobble (0.05%/0.08% -> ratio 0.625 > 0.6) from triggering.
     MOMENTUM_MIN_24H_CHANGE_PCT: float = 3.0
@@ -136,8 +139,10 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str
 
     # Narrative Rotation Agent
-    NARRATIVE_POLL_INTERVAL: int = 1800
-    NARRATIVE_EVAL_INTERVAL: int = 21600
+    # ge=60 — sub-minute polling is hostile to upstream APIs; le=86400 —
+    # cadences >24h are likely a misconfig (typo: 21600 vs 216000).
+    NARRATIVE_POLL_INTERVAL: int = Field(default=1800, ge=60, le=86_400)
+    NARRATIVE_EVAL_INTERVAL: int = Field(default=21_600, ge=60, le=604_800)
     NARRATIVE_DIGEST_HOUR_UTC: int = 0
     NARRATIVE_LEARN_HOUR_UTC: int = 1
     NARRATIVE_WEEKLY_LEARN_DAY: int = 6
@@ -152,11 +157,11 @@ class Settings(BaseSettings):
     COUNTER_SUPPRESS_THRESHOLD: int = 100
 
     # Conviction Chains
-    CHAIN_CHECK_INTERVAL_SEC: int = 300  # 5 minutes
-    CHAIN_MAX_WINDOW_HOURS: float = 24.0
-    CHAIN_COOLDOWN_HOURS: float = 12.0
-    CHAIN_EVENT_RETENTION_DAYS: int = 14
-    CHAIN_ACTIVE_RETENTION_DAYS: int = 7
+    CHAIN_CHECK_INTERVAL_SEC: int = Field(default=300, ge=1, le=3600)  # 5 minutes
+    CHAIN_MAX_WINDOW_HOURS: float = Field(default=24.0, gt=0, le=720.0)
+    CHAIN_COOLDOWN_HOURS: float = Field(default=12.0, ge=0, le=720.0)
+    CHAIN_EVENT_RETENTION_DAYS: int = Field(default=14, ge=1, le=365)
+    CHAIN_ACTIVE_RETENTION_DAYS: int = Field(default=7, ge=1, le=365)
     CHAIN_ALERT_ON_COMPLETE: bool = True
     CHAIN_TOTAL_BOOST_CAP: int = 30
     # CHAINS_ENABLED is a bool kill-switch. Pydantic v2 coerces env strings
@@ -759,6 +764,36 @@ class Settings(BaseSettings):
     def _validate_paper_sl_pct(cls, v: float) -> float:
         if v < 0:
             raise ValueError("sl_pct must be positive, e.g. 10.0 for 10% stop loss")
+        return v
+
+    @field_validator("MIROFISH_URL")
+    @classmethod
+    def _validate_mirofish_url(cls, v: str) -> str:
+        """Must be a `http(s)://` URL — empty value is NOT allowed (the
+        client would silently fall through to fallback on every call).
+        Catches misconfigs like `localhost:5001` (missing scheme) at
+        Settings() construction time.
+        """
+        if not v.startswith("http://") and not v.startswith("https://"):
+            raise ValueError(
+                f"MIROFISH_URL must start with http:// or https://; got={v!r}"
+            )
+        return v
+
+    @field_validator("DISCORD_WEBHOOK_URL")
+    @classmethod
+    def _validate_discord_webhook_url(cls, v: str) -> str:
+        """Empty string is allowed (Discord-disabled — Telegram-only).
+        Non-empty values must be `https://` Discord webhook URLs so we
+        fail-fast on typos rather than silently dropping alerts.
+        """
+        if v == "":
+            return v
+        if not v.startswith("https://"):
+            raise ValueError(
+                "DISCORD_WEBHOOK_URL must be empty or an https:// URL; "
+                f"got={v!r}"
+            )
         return v
 
     @field_validator("NARRATIVE_SCANNER_HMAC_SECRET")
