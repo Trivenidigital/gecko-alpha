@@ -121,7 +121,7 @@ def create_router(settings: Settings) -> APIRouter:
         # required >=10 narrative_alerts_inbound before this path activates;
         # operator-alert traffic is expected to be a small fraction of that
         # — single-digit alerts/day in steady state).
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
             try:
                 await send_telegram_message(
                     payload.message,

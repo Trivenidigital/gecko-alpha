@@ -546,7 +546,7 @@ async def _main_async(args: argparse.Namespace) -> int:
 
     import aiohttp  # local — avoids OpenSSL Applink at module-import time
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
         n_writes = await apply_diffs(
             db,
             diffs,

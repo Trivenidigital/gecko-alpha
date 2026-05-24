@@ -314,7 +314,7 @@ async def send_weekly_digest(db: Database, settings: Settings) -> None:
     Opens a single aiohttp.ClientSession for the lifetime of this dispatch.
     Matches alerter.send_telegram_message(text, session, settings) signature."""
     corr = f"wd-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{secrets.token_hex(2)}"
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
         try:
             text = await build_weekly_digest(db, date.today(), settings)
             if text is None:

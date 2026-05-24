@@ -55,7 +55,7 @@ async def send_chain_alert(
 
         from scout.alerter import send_telegram_message
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
             await send_telegram_message(message, session, settings, parse_mode=None)
     except Exception:
         logger.exception(
