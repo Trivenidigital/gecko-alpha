@@ -188,8 +188,12 @@ async def check_chains(
     except Exception:
         try:
             await conn.rollback()
-        except Exception:
-            pass
+        except Exception as rb_err:
+            # Don't mask the original chain_check_failed via the raise
+            # below, but emit a structured log so disk/lock/WAL failures
+            # during the cleanup are observable rather than silently
+            # swallowed. PR Round 4 silent-swallow sweep.
+            logger.exception("chain_check_rollback_failed", err=str(rb_err))
         logger.exception("chain_check_failed")
         raise
 
