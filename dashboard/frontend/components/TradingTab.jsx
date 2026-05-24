@@ -1368,8 +1368,8 @@ export default function TradingTab() {
             )}
           </div>
         ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table className="candidates-table">
+          <div className="open-positions-scroll">
+            <table className="candidates-table open-positions-table">
               <thead>
                 <tr>
                   <SortHeader col="pnl_pct" label="Rank" />
