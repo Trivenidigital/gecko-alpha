@@ -446,44 +446,58 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.put("/api/narrative/strategy/{key}")
     async def update_narrative_strategy(key: str, body: StrategyUpdate):
+        """Update a narrative strategy value with bounds + locked-key checks.
+
+        DB errors (table missing, connection failure, lock conflict) are
+        caught and returned as 500 JSON rather than leaking SQLite stack
+        traces to the operator-facing UI. Same pattern as
+        /api/trading/close/{trade_id} after PR #246.
+        """
         from fastapi.responses import JSONResponse
 
-        # Check if key is locked
-        strategy_rows = await db.get_narrative_strategy(_db_path)
-        row_map = {r["key"]: r for r in strategy_rows}
-        if key not in row_map:
-            return JSONResponse(
-                status_code=404, content={"detail": f"Key '{key}' not found"}
-            )
-        if row_map[key].get("locked"):
-            return JSONResponse(
-                status_code=403, content={"detail": f"Key '{key}' is locked"}
-            )
-
-        # Bounds validation
-        if key in STRATEGY_BOUNDS:
-            lo, hi = STRATEGY_BOUNDS[key]
-            try:
-                numeric_val = float(body.value)
-            except (ValueError, TypeError):
+        try:
+            # Check if key is locked
+            strategy_rows = await db.get_narrative_strategy(_db_path)
+            row_map = {r["key"]: r for r in strategy_rows}
+            if key not in row_map:
                 return JSONResponse(
-                    status_code=400,
-                    content={"detail": f"Value for '{key}' must be numeric"},
+                    status_code=404, content={"detail": f"Key '{key}' not found"}
                 )
-            if numeric_val < lo or numeric_val > hi:
+            if row_map[key].get("locked"):
                 return JSONResponse(
-                    status_code=400,
-                    content={
-                        "detail": f"Value for '{key}' must be between {lo} and {hi}"
-                    },
+                    status_code=403, content={"detail": f"Key '{key}' is locked"}
                 )
 
-        result = await db.update_narrative_strategy(_db_path, key, body.value)
-        if result is None:
+            # Bounds validation
+            if key in STRATEGY_BOUNDS:
+                lo, hi = STRATEGY_BOUNDS[key]
+                try:
+                    numeric_val = float(body.value)
+                except (ValueError, TypeError):
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail": f"Value for '{key}' must be numeric"},
+                    )
+                if numeric_val < lo or numeric_val > hi:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "detail": f"Value for '{key}' must be between {lo} and {hi}"
+                        },
+                    )
+
+            result = await db.update_narrative_strategy(_db_path, key, body.value)
+            if result is None:
+                return JSONResponse(
+                    status_code=404, content={"detail": f"Key '{key}' not found"}
+                )
+            return result
+        except Exception:
+            _log.exception("update_narrative_strategy_failed", key=key)
             return JSONResponse(
-                status_code=404, content={"detail": f"Key '{key}' not found"}
+                status_code=500,
+                content={"error": "internal_error", "key": key},
             )
-        return result
 
     @app.get("/api/narrative/learn-logs")
     async def get_narrative_learn_logs(limit: int = Query(20, ge=1, le=200)):

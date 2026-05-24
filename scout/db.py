@@ -293,10 +293,15 @@ class Database:
             "volume_history_cg",
             "volume_spikes",
         ):
-            assert table in _ALLOWED_TABLES, (
-                f"coin_id_resolves: table {table!r} not in allowlist; "
-                "settings-driven tables are forbidden (SQL injection risk)"
-            )
+            # Load-bearing identifier guard for the f-string SQL below.
+            # An `assert` here would be stripped under `python -O`,
+            # silently admitting any future-added table name without
+            # allowlist check. Explicit raise survives optimisation.
+            if table not in _ALLOWED_TABLES:
+                raise ValueError(
+                    f"coin_id_resolves: table {table!r} not in allowlist; "
+                    "settings-driven tables are forbidden (SQL injection risk)"
+                )
             try:
                 cur = await self._conn.execute(
                     f"SELECT 1 FROM {table} WHERE coin_id = ? LIMIT 1",

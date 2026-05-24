@@ -250,7 +250,17 @@ class BinanceSpotAdapter(ExchangeAdapter):
                     continue
                 raise last_exc
 
-        assert last_exc is not None
+        # Load-bearing post-loop check. `assert` would be stripped under
+        # `python -O`, and `raise None` (if last_exc were ever None)
+        # would TypeError instead of surfacing the actual control-flow
+        # bug. Explicit guard so operators see "unreachable" if
+        # _BACKOFFS is ever emptied accidentally rather than a cryptic
+        # TypeError on raise.
+        if last_exc is None:
+            raise RuntimeError(
+                "binance_adapter._request: retry loop exited without "
+                "raising or returning — _BACKOFFS likely empty"
+            )
         raise last_exc
 
     async def _http_get(
