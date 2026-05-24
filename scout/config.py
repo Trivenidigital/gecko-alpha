@@ -9,6 +9,14 @@ from pydantic import Field, SecretStr, computed_field, field_validator, model_va
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# Repo root, derived once at import time. Anchors TG_SOCIAL_SESSION_PATH /
+# CHANNELS_FILE defaults so they don't depend on CWD ("./tg_social.session"
+# resolves differently for systemd starts vs ad-hoc CLI invocations). The
+# environment-variable overrides for these fields still take precedence —
+# this only fixes the DEFAULT.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -515,8 +523,8 @@ class Settings(BaseSettings):
     TG_SOCIAL_API_ID: int = 0
     TG_SOCIAL_API_HASH: SecretStr | None = None
     TG_SOCIAL_PHONE_NUMBER: str = ""
-    TG_SOCIAL_SESSION_PATH: Path = Path("./tg_social.session")
-    TG_SOCIAL_CHANNELS_FILE: Path = Path("./channels.yml")
+    TG_SOCIAL_SESSION_PATH: Path = _REPO_ROOT / "tg_social.session"
+    TG_SOCIAL_CHANNELS_FILE: Path = _REPO_ROOT / "channels.yml"
     TG_SOCIAL_MAX_OPEN_TRADES: int = 5
     PAPER_TG_SOCIAL_TRADE_AMOUNT_USD: float = 300.0
     # BL-065 v3 (Bundle B 2026-05-04): cashtag-only dispatch tunables.
