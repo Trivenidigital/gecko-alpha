@@ -152,7 +152,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
         registry_path = repo_root / relative_path
         override_path = os.environ.get("GECKO_SIGNAL_TRUST_REGISTRY_PATH")
         if override_path:
-            registry_path = Path(override_path)
+            override_candidate = Path(override_path)
+            if not override_candidate.is_absolute():
+                override_candidate = repo_root / override_candidate
+            registry_path = override_candidate.resolve()
 
         meta_base = {
             "ok": False,
@@ -168,6 +171,26 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         headers = {"Cache-Control": "no-store"}
 
+        def _is_under_repo_root(p: Path) -> bool:
+            try:
+                p.resolve().relative_to(repo_root.resolve())
+                return True
+            except Exception:
+                return False
+
+        if override_path and not _is_under_repo_root(registry_path):
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": "60"},
+                content={
+                    "meta": meta_base,
+                    "error": {
+                        "code": "registry_override_outside_repo_root",
+                        "message": "registry override path must be within repo root",
+                    },
+                },
+            )
+
         if not registry_path.is_file():
             return JSONResponse(
                 status_code=503,
@@ -182,17 +205,48 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
 
         try:
-            raw = registry_path.read_text(encoding="utf-8")
-            doc = json.loads(raw)
-        except Exception as e:
+            size_bytes = registry_path.stat().st_size
+        except Exception:
+            size_bytes = None
+
+        max_size_bytes = 256_000
+        if isinstance(size_bytes, int) and size_bytes > max_size_bytes:
             return JSONResponse(
                 status_code=503,
                 headers={**headers, "Retry-After": "60"},
                 content={
                     "meta": meta_base,
-                    "error": {"code": "registry_invalid", "message": f"invalid JSON: {e}"},
+                    "error": {
+                        "code": "registry_too_large",
+                        "message": "signal trust registry file exceeds size limit",
+                    },
                 },
             )
+
+        try:
+            raw = registry_path.read_text(encoding="utf-8")
+        except Exception:
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": "60"},
+                content={
+                    "meta": meta_base,
+                    "error": {"code": "registry_unreadable", "message": "signal trust registry file could not be read"},
+                },
+            )
+
+        try:
+            doc = json.loads(raw)
+        except Exception:
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": "60"},
+                content={
+                    "meta": meta_base,
+                    "error": {"code": "registry_invalid", "message": "signal trust registry contains invalid JSON"},
+                },
+            )
+
 
         errors: list[str] = []
 
