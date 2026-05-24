@@ -74,7 +74,7 @@ async def run_chain_tracker(db: Database, settings: Settings) -> None:
         "chain_tracker_started",
         interval_sec=settings.CHAIN_CHECK_INTERVAL_SEC,
     )
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
         while True:
             try:
                 await check_chains(db, settings, session=session)
@@ -679,7 +679,7 @@ async def update_chain_outcomes(
     if own_session:
         import aiohttp  # lazy — Windows OpenSSL workaround
 
-        session = aiohttp.ClientSession()
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
     try:
         return await _update_chain_outcomes_inner(
             conn,

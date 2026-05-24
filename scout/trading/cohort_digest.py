@@ -424,7 +424,7 @@ async def send_cohort_digest(db: Database, settings: Settings) -> None:
 
     corr = f"cd-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{secrets.token_hex(2)}"
     today = date.today()
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
         try:
             text = await build_cohort_digest(db, today, settings)
             if text is None:

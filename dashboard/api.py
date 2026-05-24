@@ -1081,7 +1081,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             from scout.briefing.synthesizer import synthesize_briefing
             import json as _json
 
-            async with _aio.ClientSession() as session:
+            async with _aio.ClientSession(timeout=_aio.ClientTimeout(total=15)) as session:
                 raw = await collect_briefing_data(session, sdb, settings)
                 synthesis = await synthesize_briefing(
                     raw, settings.ANTHROPIC_API_KEY, settings.BRIEFING_MODEL

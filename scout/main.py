@@ -340,7 +340,7 @@ async def _run_feedback_schedulers(
                 _combo_refresh_streak_last_alerted = _combo_refresh_failure_streak
                 # Fire once per streak (reset when refresh succeeds).
                 try:
-                    async with aiohttp.ClientSession() as session:
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
                         await alerter.send_telegram_message(
                             f"⚠ combo_refresh failed {_combo_refresh_failure_streak}× "
                             f"in a row — check logs.",
@@ -361,7 +361,7 @@ async def _run_feedback_schedulers(
         try:
             from scout.trading.auto_suspend import maybe_suspend_signals
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
                 suspended = await maybe_suspend_signals(db, settings, session=session)
             if suspended:
                 logger.info("auto_suspend_pass", count=len(suspended))
@@ -1638,7 +1638,7 @@ async def main(argv: list[str] | None = None) -> int:
     # alarming) and shouldn't generate a "master kill OFF" alert.
     if getattr(settings, "LIVE_TRADING_ENABLED", False) and live_config.mode == "live":
         try:
-            async with aiohttp.ClientSession() as _startup_session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as _startup_session:
                 await alerter.send_telegram_message(
                     (
                         "[live-trading] master kill OFF — "
@@ -1863,7 +1863,7 @@ async def main(argv: list[str] | None = None) -> int:
     _reset_heartbeat_stats()
 
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
             # BL-NEW-TG-ALERT-ALLOWLIST (R1-I3+I5 design fold): wire the
             # session into trading_engine for TG alert dispatch. Engine was
             # constructed pre-session-context above; set_tg_session is the
