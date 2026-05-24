@@ -34,6 +34,19 @@ SAMPLE_POOL = {
 }
 
 
+@pytest.mark.parametrize(
+    ("chain", "expected_network"),
+    [
+        ("ethereum", "eth"),
+        ("eth", "eth"),
+        ("solana", "solana"),
+        ("base", "base"),
+    ],
+)
+def test_geckoterminal_network_mapper_current_contract(chain, expected_network):
+    assert geckoterminal._geckoterminal_network_for_chain(chain) == expected_network
+
+
 async def test_fetch_trending_pools_returns_candidates(mock_aiohttp, settings_factory):
     url = f"{GECKO_BASE}/networks/solana/trending_pools"
     mock_aiohttp.get(url, payload={"data": [SAMPLE_POOL]})
