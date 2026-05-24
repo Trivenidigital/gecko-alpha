@@ -558,7 +558,10 @@ async def briefing_loop(
         except Exception:
             logger.exception("briefing_loop_tick_error")
 
-        await asyncio.sleep(60)
+        # BL-NEW-BRIEFING-LOOP-INTERVAL-TUNABLE (Round 10): operator-tunable
+        # poll cadence (was hardcoded 60). Default still 60, bounded
+        # 10..3600 per scout/config.py BRIEFING_LOOP_POLL_INTERVAL_SEC.
+        await asyncio.sleep(settings.BRIEFING_LOOP_POLL_INTERVAL_SEC)
 
 
 async def _safe_counter_followup(token, session, settings, db=None):

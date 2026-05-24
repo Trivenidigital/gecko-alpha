@@ -218,6 +218,11 @@ class Settings(BaseSettings):
     BRIEFING_HOURS_UTC: str = "6,18"  # comma-separated hours (6am + 6pm)
     BRIEFING_MODEL: str = "claude-sonnet-4-6"
     BRIEFING_TELEGRAM_ENABLED: bool = True
+    # Cadence at which briefing_loop polls "is now in BRIEFING_HOURS_UTC?".
+    # ge=10 — sub-10s polls thrash on a sleep-heavy loop; le=3600 — beyond
+    # 1h the trigger window may close before the next poll fires. Default
+    # 60s matches the prior hardcoded value at scout/main.py:561.
+    BRIEFING_LOOP_POLL_INTERVAL_SEC: int = Field(default=60, ge=10, le=3600)
     COINGLASS_API_KEY: str = ""  # free tier, register at coinglass.com
 
     # -------- 7-Day Momentum Scanner --------
