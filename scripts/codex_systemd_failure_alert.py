@@ -68,11 +68,17 @@ def main(argv: list[str] | None = None) -> int:
         status=status,
         journal_tail=journal,
     )
+    # 30s timeout bounds the OnFailure-alert chain. codex-telegram-send
+    # has its own 20s urlopen timeout, but a caller-side bound protects
+    # against pathological Python startup / binary-replacement scenarios
+    # where the inner timeout doesn't fire fast enough. Without this
+    # bound, systemd OnFailure handlers could hang indefinitely.
     subprocess.run(
         ["/usr/local/bin/codex-telegram-send"],
         input=message,
         text=True,
         check=True,
+        timeout=30,
     )
     return 0
 

@@ -81,11 +81,16 @@ def run_text(command: list[str], timeout: int = 15) -> str:
 
 
 def send_telegram(message: str) -> None:
+    # 30s timeout bounds the OnFailure-alert chain. codex-telegram-send
+    # has its own 20s urlopen timeout, but a caller-side bound protects
+    # against pathological Python startup / binary-replacement scenarios
+    # where the inner timeout doesn't fire fast enough.
     subprocess.run(
         ["/usr/local/bin/codex-telegram-send"],
         input=message,
         text=True,
         check=True,
+        timeout=30,
     )
 
 
