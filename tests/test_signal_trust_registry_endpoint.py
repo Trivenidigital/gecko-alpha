@@ -24,6 +24,8 @@ async def client(tmp_path, monkeypatch):
     app = create_app(db_path=str(db_path))
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
+        # Allow tests to point the registry export at temp files outside repo_root.
+        monkeypatch.setenv("GECKO_ALLOW_ARBITRARY_SIGNAL_TRUST_REGISTRY_PATH", "1")
         yield c, monkeypatch
 
     if api_mod._scout_db is not None:
@@ -111,4 +113,3 @@ async def test_registry_valid_returns_200(client, tmp_path):
     assert payload["meta"]["ok"] is True
     assert payload["registry"]["schema_version"] == "signal_trust_registry.v1"
     assert payload["meta"]["registry_mtime"]
-

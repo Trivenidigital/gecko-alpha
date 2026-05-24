@@ -152,7 +152,38 @@ def create_app(db_path: str | None = None) -> FastAPI:
         registry_path = repo_root / relative_path
         override_path = os.environ.get("GECKO_SIGNAL_TRUST_REGISTRY_PATH")
         if override_path:
-            registry_path = Path(override_path)
+            allow_arbitrary = os.environ.get("GECKO_ALLOW_ARBITRARY_SIGNAL_TRUST_REGISTRY_PATH") == "1"
+            candidate_path = Path(override_path)
+            if not candidate_path.is_absolute():
+                candidate_path = repo_root / candidate_path
+            try:
+                resolved_candidate = candidate_path.resolve()
+                resolved_repo_root = repo_root.resolve()
+            except Exception:
+                resolved_candidate = candidate_path
+                resolved_repo_root = repo_root
+
+            if (not allow_arbitrary) and (not resolved_candidate.is_relative_to(resolved_repo_root)):
+                return JSONResponse(
+                    status_code=503,
+                    headers={"Cache-Control": "no-store", "Retry-After": "60"},
+                    content={
+                        "meta": {
+                            "ok": False,
+                            "generated_at": generated_at,
+                            "registry_path": relative_path,
+                            "experimental": True,
+                            "visibility_only": True,
+                            "not_for_pruning": True,
+                            "not_for_auto_disable": True,
+                        },
+                        "error": {
+                            "code": "registry_invalid",
+                            "message": "override path must be within repo root",
+                        },
+                    },
+                )
+            registry_path = resolved_candidate
 
         meta_base = {
             "ok": False,
@@ -182,17 +213,63 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
 
         try:
+            file_size = registry_path.stat().st_size
+        except Exception:
+            file_size = None
+
+        max_registry_bytes = 1_000_000
+        if file_size is not None and file_size > max_registry_bytes:
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": "300"},
+                content={
+                    "meta": meta_base,
+                    "error": {
+                        "code": "registry_invalid",
+                        "message": f"registry too large (max_bytes={max_registry_bytes})",
+                    },
+                },
+            )
+
+        try:
             raw = registry_path.read_text(encoding="utf-8")
-            doc = json.loads(raw)
-        except Exception as e:
+        except Exception:
             return JSONResponse(
                 status_code=503,
                 headers={**headers, "Retry-After": "60"},
                 content={
                     "meta": meta_base,
-                    "error": {"code": "registry_invalid", "message": f"invalid JSON: {e}"},
+                    "error": {"code": "registry_invalid", "message": "unable to read registry file"},
                 },
             )
+
+        try:
+            doc = json.loads(raw)
+        except json.JSONDecodeError:
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": "60"},
+                content={
+                    "meta": meta_base,
+                    "error": {"code": "registry_invalid", "message": "invalid JSON"},
+                },
+            )
+
+        max_entries = 1_000
+        if isinstance(doc, dict):
+            maybe_entries = doc.get("entries")
+            if isinstance(maybe_entries, list) and len(maybe_entries) > max_entries:
+                return JSONResponse(
+                    status_code=503,
+                    headers={**headers, "Retry-After": "300"},
+                    content={
+                        "meta": meta_base,
+                        "error": {
+                            "code": "registry_invalid",
+                            "message": f"registry too many entries (max_entries={max_entries})",
+                        },
+                    },
+                )
 
         errors: list[str] = []
 
