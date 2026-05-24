@@ -318,8 +318,12 @@ async def test_fallback_counter_alerts_at_threshold(
 
     sent: list[tuple] = []
 
-    async def _capture(text, session, settings):
-        # Real alerter.send_telegram_message signature: (text, session, settings).
+    async def _capture(text, session, settings, **_kwargs):
+        # Real alerter.send_telegram_message accepts (text, session, settings,
+        # *, parse_mode=..., ...) — accept **kwargs so the suppression.py
+        # callsite passing parse_mode=None (per §12b hygiene) doesn't
+        # break the mock with a TypeError that the production try/except
+        # would then silently swallow.
         sent.append((text, session, settings))
 
     import scout.alerter as _alerter

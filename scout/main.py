@@ -133,6 +133,51 @@ def _clear_calibration_dryrun_date_for_tests() -> None:
     _last_calibration_dryrun_date = ""
 
 
+def _runtime_version() -> str:
+    """Return the gecko-alpha package version from importlib.metadata.
+
+    Returns the literal string ``"unknown"`` if metadata is unavailable
+    (e.g. running from a source checkout without editable-install). Never
+    raises — startup banner must not be able to fail-and-mask the rest of
+    the startup sequence.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+        try:
+            return _pkg_version("gecko-alpha")
+        except PackageNotFoundError:
+            return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _runtime_git_sha() -> str:
+    """Return the short git SHA of the current checkout, or ``"unknown"``.
+
+    Cheap subprocess to ``git rev-parse --short HEAD``. Bounded to 2s so a
+    pathological repo state cannot block the pipeline startup. Returns
+    ``"unknown"`` on any failure (no git, not a repo, command timeout,
+    permission denied). Never raises — same rationale as
+    :func:`_runtime_version`.
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            cwd=__file__.rsplit("/", 2)[0] if "/" in __file__ else None,
+            check=False,
+        )
+        sha = (proc.stdout or "").strip()
+        return sha or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def _format_ingest_watchdog_event(event: IngestWatchdogEvent) -> str:
     if event.kind == "recovered":
         return (
@@ -1551,6 +1596,19 @@ async def main(argv: list[str] | None = None) -> int:
     # Pre-populate the module-level settings cache to avoid async race
     # on first lazy get_settings() call during startup.
     configure_cache(settings)
+
+    # Startup banner — surfaces version + git SHA at process start so
+    # journalctl postmortems can correlate behavior to a specific commit.
+    # Operator-initiated restarts (whether deploy or manual) all leave
+    # this signature in the log, even when the process exits abnormally
+    # before any other event fires.
+    logger.info(
+        "scanner_starting",
+        version=_runtime_version(),
+        git_sha=_runtime_git_sha(),
+        dry_run=args.dry_run,
+        cycles=args.cycles,
+    )
     if args.min_score_override is not None:
         settings.MIN_SCORE = args.min_score_override
         logger.info("MIN_SCORE overridden", min_score=settings.MIN_SCORE)

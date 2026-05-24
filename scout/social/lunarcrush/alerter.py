@@ -141,7 +141,15 @@ async def send_social_alert(
 
     text = format_social_alert(alerts)
     try:
-        await send_telegram_message(text, session, settings)
+        # parse_mode="Markdown" is intentional here — format_social_alert
+        # emits `*bold*` headers and `_render_alert` already escapes
+        # symbol/name fields via _escape_md. Making the intent explicit so
+        # the call doesn't silently break if alerter's default parse_mode
+        # is ever flipped. CLAUDE.md §12b — intentional formatting with
+        # tested escape coverage.
+        await send_telegram_message(
+            text, session, settings, parse_mode="Markdown"
+        )
         return True, None
     except Exception as exc:
         logger.exception("social_alert_send_failed", count=len(alerts))
