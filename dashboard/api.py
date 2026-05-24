@@ -10,6 +10,7 @@ from typing import Literal
 import aiosqlite
 import structlog
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import Path as FPath
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -566,7 +567,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return await db.get_trading_actionability_summary(_db_path, days=days)
 
     @app.post("/api/trading/close/{trade_id}")
-    async def close_trade(trade_id: int):
+    async def close_trade(trade_id: int = FPath(..., ge=1)):
         """Manually close a paper trade.
 
         No auth required -- paper trading uses simulated money.
