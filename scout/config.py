@@ -1455,5 +1455,13 @@ def load_settings(**kwargs) -> "Settings":
                 "settings_validation_alert_dispatched", outcome=_alert_outcome
             )
         except Exception:
-            pass
+            # Settings validation already failed; we don't want a
+            # broken validation-alert path to mask the original error
+            # via `raise` below. But silent `pass` leaves the operator
+            # with NO trace of the alert-path failure either. Log
+            # structurally so a double-failure is observable in
+            # journalctl. PR Round 4 silent-swallow sweep.
+            structlog.get_logger().exception(
+                "settings_validation_alert_dispatch_error"
+            )
         raise

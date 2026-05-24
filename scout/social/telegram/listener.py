@@ -557,8 +557,13 @@ async def _persist_message_with_watermark(
         except Exception:
             try:
                 await conn.rollback()
-            except Exception:
-                pass
+            except Exception as rb_err:
+                # Don't mask the outer write-failure via `raise` below,
+                # but emit a structured log so disk/lock/WAL failures
+                # during cleanup are observable. PR Round 4 sweep.
+                log.exception(
+                    "tg_social_message_rollback_failed", err=str(rb_err)
+                )
             raise
 
 
@@ -1107,7 +1112,13 @@ async def _run_listener_body(
                         f"FloodWait {fwe.seconds}s > cap {cap}s. Restart to resume.",
                     )
                 except Exception:
-                    pass
+                    # Don't mask the FloodWait raise below, but a silent
+                    # `pass` here hides the double-failure (FloodWait +
+                    # circuit-break-alert delivery failed). Surface it.
+                    log.exception(
+                        "tg_social_catchup_circuit_break_alert_failed",
+                        channel=ch,
+                    )
                 raise
             await asyncio.sleep(min(fwe.seconds + 1, cap))
         except AuthKeyError as e:
@@ -1174,7 +1185,11 @@ async def _run_listener_body(
                         f"{fwe.seconds}s exceeded cap {cap}s. Restart pipeline to resume.",
                     )
                 except Exception:
-                    pass
+                    # Surface double-failure (FloodWait + alert delivery).
+                    # The outer raise below still propagates the FloodWait.
+                    log.exception(
+                        "tg_social_listener_circuit_break_alert_failed",
+                    )
                 raise
             await asyncio.sleep(sleep_for)
         except AuthKeyError as e:
@@ -1193,7 +1208,10 @@ async def _run_listener_body(
                     f"Run: python -m scout.social.telegram.cli bootstrap",
                 )
             except Exception:
-                pass
+                # AuthKeyError is critical; the operator MUST re-bootstrap.
+                # If our alert ALSO fails the operator may not realise the
+                # listener has stopped — surface the double-failure.
+                log.exception("tg_social_auth_lost_alert_failed")
             raise
         except Exception as e:
             # Catch-all so unanticipated bugs land in DLQ rather than
