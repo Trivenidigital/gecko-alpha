@@ -14,6 +14,7 @@ import XAlertsTab from './components/XAlertsTab.jsx'
 import GlobalSearch from './components/GlobalSearch.jsx'
 import NowTradableTab from './components/NowTradableTab.jsx'
 import SignalTrustTab from './components/SignalTrustTab.jsx'
+import TradeInboxTab from './components/TradeInboxTab.jsx'
 
 const DEFAULT_STATUS = {
   pipeline_status: 'connecting',
@@ -137,6 +138,12 @@ export default function App() {
           Trading
         </button>
         <button
+          className={`tab-btn ${activeTab === 'trade_inbox' ? 'active' : ''}`}
+          onClick={() => setActiveTab('trade_inbox')}
+        >
+          Trade Inbox
+        </button>
+        <button
           className={`tab-btn ${activeTab === 'now_tradable' ? 'active' : ''}`}
           onClick={() => setActiveTab('now_tradable')}
         >
@@ -183,6 +190,8 @@ export default function App() {
       {activeTab === 'signals' && <SignalsTab />}
 
       {activeTab === 'trading' && <TradingTab />}
+
+      {activeTab === 'trade_inbox' && <TradeInboxTab />}
 
       {activeTab === 'now_tradable' && <NowTradableTab />}
 
