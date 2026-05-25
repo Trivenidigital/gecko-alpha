@@ -2,7 +2,7 @@
 
 ## Active Work: 2026-05-25 — Trade Opportunity Inbox
 
-**Status:** PLANNING. Goal: turn high-volume early detections into a trader-facing read-only queue: Act Now, Watch, Already Ran, Blocked.
+**Status:** DESIGN REVIEW COMPLETE. Goal: turn high-volume early detections into a trader-facing read-only queue: Act Now, Watch, Already Ran, Blocked.
 
 Workflow checklist:
 - [x] Trader-lens problem framed from screenshot: TOES was detected early but buried in historical/evidence tables.
@@ -10,7 +10,8 @@ Workflow checklist:
 - [x] Hermes-first analysis recorded in `tasks/plan_trade_opportunity_inbox_2026_05_25.md`.
 - [x] Plan drafted: `tasks/plan_trade_opportunity_inbox_2026_05_25.md`.
 - [x] Plan reviewed by 2 parallel agents and Critical/Important folds applied.
-- [ ] Design drafted and reviewed by 2 parallel agents.
+- [x] Design drafted: `tasks/design_trade_opportunity_inbox_2026_05_25.md`.
+- [x] Design reviewed by 2 parallel agents and Critical/Important folds applied.
 - [ ] Build with TDD.
 - [ ] PR opened.
 - [ ] PR reviewed by 2 parallel agents and folds applied.
@@ -18,6 +19,7 @@ Workflow checklist:
 Review notes:
 - Read-only only: no execution, sizing, pruning, signal suppression, or config changes.
 - Plan review folds: group before per-group slice using broad cohort; add TOES-shaped regression; exact score table/sort key; stale warning vs hard-stale routing; audit fields retained; client-local new/seen/changed state; mandatory static frontend wiring test; full pytest verification.
+- Design review folds: visible per-group overflow/show-more; source_limit/source_truncated diagnostics; Review Now display label; novelty not cleared on background render; dismissed restore; diagnostic empty states; exact builder counters/signature; exact sort_key encoding; score pseudocode; stale boundary tests; read-only `_ro_db` guard.
 
 ## Active Work: 2026-05-25 — Live candidates determinism + contract delta
 
