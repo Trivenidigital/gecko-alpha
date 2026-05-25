@@ -61,6 +61,15 @@ function ageLabel(sec) {
   return `${Math.floor(s / 86400)}d ago`
 }
 
+function fmtBytes(n) {
+  if (n == null) return '-'
+  const b = Number(n)
+  if (b >= 1e9) return (b / 1e9).toFixed(1) + ' GB'
+  if (b >= 1e6) return (b / 1e6).toFixed(1) + ' MB'
+  if (b >= 1e3) return (b / 1e3).toFixed(1) + ' KB'
+  return `${b} B`
+}
+
 function statusBadge(ok, okLabel, badLabel) {
   const bg = ok ? '#1b5e20' : '#5d1414'
   const color = ok ? '#a5d6a7' : '#ef9a9a'
@@ -242,6 +251,28 @@ export default function HealthTab() {
                 </td>
                 <td style={{ color: 'var(--color-text-secondary)' }}>
                   {ageLabel(system.create_heartbeat_age_sec)}
+                </td>
+              </tr>
+              {/* Round 19 — file-evidence (count + latest age + size) from R18 /health fields. */}
+              <tr>
+                <td style={{ fontWeight: 600 }}>Backup — files</td>
+                <td>
+                  {statusBadge(
+                    system.latest_backup_fresh,
+                    'FRESH',
+                    'STALE',
+                  )}
+                </td>
+                <td style={{ color: 'var(--color-text-secondary)' }}>
+                  {system.backup_file_count != null
+                    ? `${system.backup_file_count} file${system.backup_file_count === 1 ? '' : 's'}`
+                    : '0 files'}
+                  {system.latest_backup_age_sec != null && (
+                    <span>, latest {ageLabel(system.latest_backup_age_sec)}</span>
+                  )}
+                  {system.latest_backup_size_bytes != null && (
+                    <span>, {fmtBytes(system.latest_backup_size_bytes)}</span>
+                  )}
                 </td>
               </tr>
             </tbody>
