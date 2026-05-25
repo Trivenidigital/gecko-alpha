@@ -1,5 +1,24 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-25 — Trade Opportunity Inbox
+
+**Status:** PLANNING. Goal: turn high-volume early detections into a trader-facing read-only queue: Act Now, Watch, Already Ran, Blocked.
+
+Workflow checklist:
+- [x] Trader-lens problem framed from screenshot: TOES was detected early but buried in historical/evidence tables.
+- [x] Drift-check found `/api/live_candidates`, Now Tradable, and Top Gainers Tracker; residual gap is prioritization, not raw detection.
+- [x] Hermes-first analysis recorded in `tasks/plan_trade_opportunity_inbox_2026_05_25.md`.
+- [x] Plan drafted: `tasks/plan_trade_opportunity_inbox_2026_05_25.md`.
+- [x] Plan reviewed by 2 parallel agents and Critical/Important folds applied.
+- [ ] Design drafted and reviewed by 2 parallel agents.
+- [ ] Build with TDD.
+- [ ] PR opened.
+- [ ] PR reviewed by 2 parallel agents and folds applied.
+
+Review notes:
+- Read-only only: no execution, sizing, pruning, signal suppression, or config changes.
+- Plan review folds: group before per-group slice using broad cohort; add TOES-shaped regression; exact score table/sort key; stale warning vs hard-stale routing; audit fields retained; client-local new/seen/changed state; mandatory static frontend wiring test; full pytest verification.
+
 ## Active Work: 2026-05-25 — Live candidates determinism + contract delta
 
 **Status:** PR-READY (local commit). Goal: make `/api/live_candidates` deterministic (backend ordering + frontend keys) and extend the contract validator to enforce deterministic ordering + uniqueness.
