@@ -51,6 +51,35 @@ function pipelineLabel(pipeline, chain) {
   return { text: 'DEX', cls: 'memecoin' }
 }
 
+// Round 15 — render the /health backup-heartbeat fields.
+function ageLabel(sec) {
+  if (sec == null) return 'never'
+  const s = Number(sec)
+  if (s < 60) return `${Math.floor(s)}s ago`
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`
+  return `${Math.floor(s / 86400)}d ago`
+}
+
+function statusBadge(ok, okLabel, badLabel) {
+  const bg = ok ? '#1b5e20' : '#5d1414'
+  const color = ok ? '#a5d6a7' : '#ef9a9a'
+  return (
+    <span
+      style={{
+        padding: '2px 8px',
+        borderRadius: 4,
+        background: bg,
+        color,
+        fontSize: 11,
+        fontWeight: 600,
+      }}
+    >
+      {ok ? okLabel : badLabel}
+    </span>
+  )
+}
+
 const TABLE_LABELS = {
   category_snapshots: 'Category Snapshots',
   narrative_signals: 'Narrative Signals',
@@ -83,10 +112,12 @@ export default function HealthTab() {
   // Active Chains state
   const [activeChains, setActiveChains] = useState([])
   const [chainsOpen, setChainsOpen] = useState(false)
+  // Round 15 — surface /health (system + backup heartbeats) at the top of the tab.
+  const [system, setSystem] = useState(null)
 
   const fetchAll = useCallback(async () => {
     try {
-      const [hRes, sRes, stRes, lRes, swsRes, swcRes, acRes] = await Promise.all([
+      const [hRes, sRes, stRes, lRes, swsRes, swcRes, acRes, sysRes] = await Promise.all([
         fetch('/api/system/health'),
         fetch('/api/status'),
         fetch('/api/narrative/strategy'),
@@ -94,6 +125,7 @@ export default function HealthTab() {
         fetch('/api/secondwave/stats'),
         fetch('/api/secondwave/candidates?days=7&limit=50'),
         fetch('/api/chains/active'),
+        fetch('/health'),
       ])
       if (hRes.ok) setHealth(await hRes.json())
       if (sRes.ok) setStatus(await sRes.json())
@@ -102,6 +134,7 @@ export default function HealthTab() {
       if (swsRes.ok) setSwStats(await swsRes.json())
       if (swcRes.ok) setSwCandidates(await swcRes.json())
       if (acRes.ok) setActiveChains(await acRes.json())
+      if (sysRes.ok) setSystem(await sysRes.json())
     } catch (e) {
       // ignore
     }
@@ -163,6 +196,58 @@ export default function HealthTab() {
           </div>
         </div>
       </div>
+
+      {/* Round 15 — System health & backup heartbeats (from /health). */}
+      {system && (
+        <div className="panel" style={{ marginBottom: 16 }}>
+          <div className="panel-header">System Health</div>
+          <table className="candidates-table">
+            <tbody>
+              <tr>
+                <td style={{ fontWeight: 600 }}>Pipeline running</td>
+                <td>{statusBadge(system.pipeline_running, 'ACTIVE', 'STALE')}</td>
+                <td style={{ color: 'var(--color-text-secondary)' }}>
+                  last cycle:{' '}
+                  {system.last_cycle_at ? relTime(system.last_cycle_at) : 'never'}
+                </td>
+              </tr>
+              <tr>
+                <td style={{ fontWeight: 600 }}>Database</td>
+                <td>{statusBadge(system.db_reachable, 'REACHABLE', 'UNREACHABLE')}</td>
+                <td style={{ color: 'var(--color-text-secondary)' }}>
+                  status: {system.status}
+                </td>
+              </tr>
+              <tr>
+                <td style={{ fontWeight: 600 }}>Backup — rotate</td>
+                <td>
+                  {statusBadge(
+                    system.rotate_heartbeat_fresh,
+                    'FRESH',
+                    'STALE',
+                  )}
+                </td>
+                <td style={{ color: 'var(--color-text-secondary)' }}>
+                  {ageLabel(system.rotate_heartbeat_age_sec)}
+                </td>
+              </tr>
+              <tr>
+                <td style={{ fontWeight: 600 }}>Backup — create</td>
+                <td>
+                  {statusBadge(
+                    system.create_heartbeat_fresh,
+                    'FRESH',
+                    'STALE',
+                  )}
+                </td>
+                <td style={{ color: 'var(--color-text-secondary)' }}>
+                  {ageLabel(system.create_heartbeat_age_sec)}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
 
       {/* System health grid */}
       <div className="panel" style={{ marginBottom: 16 }}>
