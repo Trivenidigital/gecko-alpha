@@ -1071,15 +1071,22 @@ async def get_live_candidates(
 
     async with _ro_db(db_path) as db:
         try:
+            # NOTE: `opened_at` is stored as TEXT; historical rows may contain
+            # dirty / non-ISO values. Keep the bounded SQL scan aligned with
+            # the public contract before LIMIT applies: parseable timestamps
+            # first, newest first, deterministic id tie-break.
+            scan_cap = max(limit * 20, 400)
             cursor = await db.execute(
                 """SELECT id, token_id, symbol, name, chain,
                           signal_type, entry_price, opened_at,
                           would_be_live, actionable
                      FROM paper_trades
                     WHERE status = 'open'
-                    ORDER BY opened_at DESC
+                    ORDER BY datetime(opened_at) IS NULL ASC,
+                             datetime(opened_at) DESC,
+                             id DESC
                     LIMIT ?""",
-                (max(limit * 10, 200),),
+                (scan_cap,),
             )
             open_rows = await cursor.fetchall()
         except aiosqlite.OperationalError:
@@ -1091,10 +1098,20 @@ async def get_live_candidates(
             )
             return _envelope([], 0)
 
+        def _open_row_sort_key(r: dict) -> tuple:
+            dt = _parse_iso_dt(r.get("opened_at"))
+            # Null / unparseable opened_at sorts last for selection.
+            is_missing = dt is None
+            ts = dt.timestamp() if dt else 0.0
+            # opened_at desc, id desc
+            return (is_missing, -ts, -int(r["id"]))
+
+        open_rows_sorted = sorted([dict(x) for x in open_rows], key=_open_row_sort_key)
+
         open_primary_by_token: dict[str, dict] = {}
         open_ids_by_token: dict[str, list[int]] = {}
         token_order: list[str] = []
-        for r in open_rows:
+        for r in open_rows_sorted:
             token_id = r["token_id"]
             open_ids_by_token.setdefault(token_id, []).append(int(r["id"]))
             if token_id not in open_primary_by_token:
@@ -1126,7 +1143,7 @@ async def get_live_candidates(
                       FROM paper_trades
                      WHERE token_id IN ({placeholders})
                        AND opened_at >= ?
-                     ORDER BY opened_at DESC""",
+                     ORDER BY opened_at DESC, id DESC""",
                 (*token_order, cutoff_iso),
             )
             recent_rows = await cursor.fetchall()
@@ -1264,8 +1281,12 @@ async def get_live_candidates(
         entry_price = base.get("entry_price")
         entry_price = float(entry_price) if entry_price is not None else None
         opened_at = base.get("opened_at")
-        if _parse_iso_dt(opened_at) is None:
+        opened_dt = _parse_iso_dt(opened_at)
+        if opened_dt is None:
             risk_reasons.append("opened_at_unparseable")
+            opened_at = None
+        else:
+            opened_at = opened_dt.isoformat()
 
         current_price = None
         market_cap = None
@@ -1281,7 +1302,9 @@ async def get_live_candidates(
             upd_dt = _parse_iso_dt(price_updated_at)
             if upd_dt is None:
                 risk_reasons.append("price_timestamp_unparseable")
+                price_updated_at = None
             else:
+                price_updated_at = upd_dt.isoformat()
                 price_age = now - upd_dt
                 price_is_stale = price_age > stale_warn_age
                 if price_is_stale:
@@ -1353,8 +1376,8 @@ async def get_live_candidates(
                 "symbol": base.get("symbol"),
                 "name": base.get("name"),
                 "chain": base.get("chain"),
-                "open_trade_ids": open_ids_by_token.get(token_id, []),
-                "recent_trade_ids": recent_ids_by_token.get(token_id, []),
+                "open_trade_ids": sorted(open_ids_by_token.get(token_id, []), reverse=True),
+                "recent_trade_ids": sorted(recent_ids_by_token.get(token_id, []), reverse=True),
                 "surfaces": sorted(surfaces_by_token.get(token_id, set())),
                 "actionable": actionable,
                 "would_be_live": would_be_live,
@@ -1386,8 +1409,11 @@ async def get_live_candidates(
 
     def _sort_key(r: dict):
         dt = _parse_iso_dt(r.get("opened_at"))
+        # opened_at null/unparseable sorts last within the verdict bucket.
+        is_missing = dt is None
         ts = dt.timestamp() if dt else 0.0
-        return (verdict_rank.get(r.get("verdict"), 9), -ts)
+        token_id = r.get("token_id") or ""
+        return (verdict_rank.get(r.get("verdict"), 9), is_missing, -ts, token_id)
 
     results.sort(key=_sort_key)
     sliced = results[:limit]

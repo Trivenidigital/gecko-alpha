@@ -2,6 +2,9 @@
 
 import json
 from datetime import datetime, timedelta, timezone
+import importlib.util
+import sys
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -9,6 +12,15 @@ from httpx import ASGITransport, AsyncClient
 from dashboard.api import create_app
 from scout.db import Database
 
+_SPEC = importlib.util.spec_from_file_location(
+    "check_live_candidates_contract",
+    Path(__file__).resolve().parent.parent
+    / "scripts"
+    / "check_live_candidates_contract.py",
+)
+_CHECKER = importlib.util.module_from_spec(_SPEC)
+sys.modules["check_live_candidates_contract"] = _CHECKER
+_SPEC.loader.exec_module(_CHECKER)
 
 @pytest.fixture
 async def db(tmp_path):
@@ -371,3 +383,116 @@ async def test_live_candidates_query_caps(client):
     c, _ = client
     resp = await c.get("/api/live_candidates?limit=999")
     assert resp.status_code == 422
+
+
+async def test_live_candidates_tie_break_orders_by_token_id(client):
+    c, db = client
+    opened = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+
+    # Insert in alpha->zeta order so DB ids are increasing. Without the
+    # token_id tie-break, stable ordering under opened_at ties would follow
+    # id DESC (zeta first) rather than token_id ASC (alpha first).
+    await _insert_open_trade(
+        db._conn,
+        token_id="alpha",
+        symbol="ALPHA",
+        entry_price=100.0,
+        actionable=1,
+        would_be_live=1,
+        opened_at=opened,
+    )
+    await _insert_open_trade(
+        db._conn,
+        token_id="zeta",
+        symbol="ZETA",
+        entry_price=100.0,
+        actionable=1,
+        would_be_live=1,
+        opened_at=opened,
+    )
+    await _upsert_price_cache(db._conn, coin_id="alpha", current_price=100.0)
+    await _upsert_price_cache(db._conn, coin_id="zeta", current_price=100.0)
+
+    resp = await c.get("/api/live_candidates?limit=2")
+    assert resp.status_code == 200
+    token_ids = [r["token_id"] for r in resp.json()["rows"]]
+    assert token_ids == ["alpha", "zeta"]
+
+
+async def test_live_candidates_timestamp_coercion_to_null(client):
+    c, db = client
+    await _insert_open_trade(
+        db._conn,
+        token_id="dirtyts",
+        symbol="DTS",
+        entry_price=100.0,
+        actionable=1,
+        would_be_live=1,
+        opened_at="not-iso",
+    )
+    await _upsert_price_cache(
+        db._conn, coin_id="dirtyts", current_price=100.0, updated_at="not-iso"
+    )
+
+    resp = await c.get("/api/live_candidates?limit=1")
+    assert resp.status_code == 200
+    row = resp.json()["rows"][0]
+    assert row["opened_at"] is None
+    assert row["price_updated_at"] is None
+    assert "opened_at_unparseable" in row["risk_reasons"]
+    assert "price_timestamp_unparseable" in row["risk_reasons"]
+
+
+async def test_live_candidates_sql_scan_cap_sorts_dirty_timestamps_last(client):
+    c, db = client
+
+    for i in range(410):
+        token_id = f"dirty-{i:03d}"
+        await _insert_open_trade(
+            db._conn,
+            token_id=token_id,
+            symbol=f"D{i:03d}",
+            entry_price=100.0,
+            actionable=1,
+            would_be_live=1,
+            opened_at=f"zz-not-iso-{i:03d}",
+        )
+
+    valid_opened = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    await _insert_open_trade(
+        db._conn,
+        token_id="valid-candidate",
+        symbol="VALID",
+        entry_price=100.0,
+        actionable=1,
+        would_be_live=1,
+        opened_at=valid_opened,
+    )
+    await _upsert_price_cache(
+        db._conn, coin_id="valid-candidate", current_price=100.0
+    )
+
+    resp = await c.get("/api/live_candidates?limit=1")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["rows"][0]["token_id"] == "valid-candidate"
+
+
+async def test_live_candidates_endpoint_payload_passes_contract_validator(client):
+    c, db = client
+    await _insert_open_trade(
+        db._conn,
+        token_id="bitcoin",
+        symbol="BTC",
+        entry_price=100.0,
+        actionable=1,
+        would_be_live=1,
+    )
+    await _upsert_price_cache(db._conn, coin_id="bitcoin", current_price=100.0)
+
+    resp = await c.get("/api/live_candidates?limit=1&window_hours=36")
+    assert resp.status_code == 200
+    payload = resp.json()
+
+    result = _CHECKER.validate_payload(payload, requested_limit=1, requested_window=36)
+    assert result.is_clean, result.criticals
