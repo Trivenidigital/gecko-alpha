@@ -23,6 +23,7 @@ Review notes:
 - Build: added `/api/trade_inbox`, grouped read-only backend scoring, Trade Inbox tab, static wiring guard, focused endpoint coverage, and refreshed frontend dist.
 - Verification: red tests first (`/api/trade_inbox` 404 and missing `TradeInboxTab.jsx`), then `21 passed` for focused trade inbox/live candidates/frontend layout tests; `npm.cmd run build:codex` passed; `git diff --check` clean; full suite passed with dummy required secrets (`2736 passed, 158 skipped`). Full suite without dummy secrets failed only on pre-existing `Settings()` required env validation for Telegram/Anthropic keys.
 - PR review folds: token-level session keys for changed-group detection; blocked rows render primary block/risk diagnostics before why-now text; source-truncated banner exposes max-scan action; malformed `price_updated_at` is data-insufficient/blocked; SQL scan-cap truncation sets `source_truncated`.
+- Refinement round: kept `new` row status visible for a 10-minute review window so auto-refresh/render effects do not immediately erase novelty before the operator scans the queue.
 
 ## Active Work: 2026-05-25 — Live candidates determinism + contract delta
 

@@ -49,6 +49,18 @@ function saveSeen(value) {
   } catch {}
 }
 
+function rowStatus(row, seenRecord) {
+  if (!seenRecord) return 'new'
+  if (seenRecord.previous_group && seenRecord.previous_group !== row.group) {
+    return 'changed_group'
+  }
+  const firstSeenMs = Date.parse(seenRecord.first_seen_at)
+  if (Number.isFinite(firstSeenMs) && Date.now() - firstSeenMs < 10 * 60 * 1000) {
+    return 'new'
+  }
+  return 'seen_this_session'
+}
+
 export default function TradeInboxTab() {
   const [payload, setPayload] = useState(null)
   const [error, setError] = useState(null)
@@ -199,7 +211,6 @@ export default function TradeInboxTab() {
                       const key = rowKey(row)
                       const dKey = dismissKey(row)
                       const wasSeen = seen[key]
-                      const changed = wasSeen && wasSeen.previous_group && wasSeen.previous_group !== row.group
                       const reasonText = row.block_reason_primary
                         ? [row.block_reason_primary, ...(row.risk_reasons || [])].slice(0, 4).join(' | ')
                         : ((row.why_now || []).slice(0, 4).join(' | ') || '-')
@@ -207,7 +218,7 @@ export default function TradeInboxTab() {
                         <tr key={dKey}>
                           <td>
                             <TokenLink tokenId={row.token_id} symbol={row.symbol || row.name} chain={row.chain} />
-                            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>{changed ? 'changed_group' : wasSeen ? 'seen_this_session' : 'new'}</div>
+                            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>{rowStatus(row, wasSeen)}</div>
                           </td>
                           <td style={{ fontWeight: 700 }}>{row.action_label}</td>
                           <td>{row.window_state}</td>

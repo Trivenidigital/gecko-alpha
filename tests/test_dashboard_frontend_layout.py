@@ -40,3 +40,5 @@ def test_trade_inbox_tab_is_wired_to_dashboard():
     assert "row.block_reason_primary" in tab
     assert "return row.token_id" in tab
     assert "previous_group" in tab
+    assert "function rowStatus" in tab
+    assert "10 * 60 * 1000" in tab
