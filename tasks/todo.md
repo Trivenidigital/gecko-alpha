@@ -2,7 +2,7 @@
 
 ## Active Work: 2026-05-25 — Trade Opportunity Inbox
 
-**Status:** BUILD VERIFIED. Goal: turn high-volume early detections into a trader-facing read-only queue: Review Now, Watch, Moved Already, Blocked.
+**Status:** SHIPPED-MERGED 2026-05-25 (PR #273). Goal: turn high-volume early detections into a trader-facing read-only queue: Review Now, Watch, Moved Already, Blocked.
 
 Workflow checklist:
 - [x] Trader-lens problem framed from screenshot: TOES was detected early but buried in historical/evidence tables.
@@ -27,7 +27,7 @@ Review notes:
 
 ## Active Work: 2026-05-25 — Live candidates determinism + contract delta
 
-**Status:** PR-READY (local commit). Goal: make `/api/live_candidates` deterministic (backend ordering + frontend keys) and extend the contract validator to enforce deterministic ordering + uniqueness.
+**Status:** SHIPPED-MERGED 2026-05-25 (PR #270). Goal: make `/api/live_candidates` deterministic (backend ordering + frontend keys) and extend the contract validator to enforce deterministic ordering + uniqueness.
 
 Workflow checklist:
 - [x] Drift-check (confirm current gaps vs V1 shipped)
@@ -35,14 +35,14 @@ Workflow checklist:
 - [x] Design drafted + reviewed by 2 parallel agents
 - [x] Build (backend ordering + validator checks + UI keys)
 - [x] Focused verification (pytest + frontend build)
-- [ ] PR opened (blocked: GitHub creds unavailable in this sandbox)
-- [ ] PR reviewed by 2 parallel agents and folds applied
+- [x] PR opened: #270 (`feat(cockpit): deterministic live_candidates contract delta`).
+- [x] PR reviewed by 2 parallel agents and folds applied
 
 Review notes (live):
 - Plan doc: `tasks/plan_live_candidates_determinism_contract_delta_2026_05_25.md`
 - Design doc: `tasks/design_live_candidates_determinism_contract_delta_2026_05_25.md`
 - Branch: `feat/live-candidates-determinism-contract-delta`
-- Commit: local branch tip after review folds
+- Commit: merged to `master` via PR #270
 
 ## Active Work: 2026-05-24 — Dashboard open-positions width fix
 
