@@ -28,6 +28,10 @@ function fmtPct(n) {
 }
 
 function rowKey(row) {
+  return row.token_id
+}
+
+function dismissKey(row) {
   return `${row.group}:${row.token_id}`
 }
 
@@ -91,6 +95,14 @@ export default function TradeInboxTab() {
             last_seen_group: row.group,
             last_seen_score: row.trade_score,
           }
+        } else if (next[key].last_seen_group !== row.group || next[key].last_seen_score !== row.trade_score) {
+          next[key] = {
+            ...next[key],
+            previous_group: next[key].last_seen_group,
+            previous_score: next[key].last_seen_score,
+            last_seen_group: row.group,
+            last_seen_score: row.trade_score,
+          }
         }
       }
     }
@@ -104,7 +116,7 @@ export default function TradeInboxTab() {
   const visibleGroups = useMemo(() => {
     const out = {}
     for (const [group] of GROUPS) {
-      out[group] = (payload?.groups?.[group] || []).filter(row => !dismissed[rowKey(row)])
+      out[group] = (payload?.groups?.[group] || []).filter(row => !dismissed[dismissKey(row)])
     }
     return out
   }, [payload, dismissed])
@@ -136,6 +148,10 @@ export default function TradeInboxTab() {
           {meta.source_truncated ? (
             <div style={{ marginTop: 8, color: 'var(--color-accent-amber)' }}>
               Source truncated at {meta.source_limit}; older open trades may not be represented.
+              {' '}
+              <button className="tab-btn" onClick={() => setLimit(100)} style={{ padding: '2px 8px', fontSize: 12 }}>
+                Max scan
+              </button>
             </div>
           ) : null}
           {error ? <div style={{ marginTop: 8, color: 'var(--color-accent-red)' }}>Error: {error}</div> : null}
@@ -181,10 +197,14 @@ export default function TradeInboxTab() {
                   <tbody>
                     {rows.map(row => {
                       const key = rowKey(row)
+                      const dKey = dismissKey(row)
                       const wasSeen = seen[key]
-                      const changed = wasSeen && wasSeen.last_seen_group && wasSeen.last_seen_group !== row.group
+                      const changed = wasSeen && wasSeen.previous_group && wasSeen.previous_group !== row.group
+                      const reasonText = row.block_reason_primary
+                        ? [row.block_reason_primary, ...(row.risk_reasons || [])].slice(0, 4).join(' | ')
+                        : ((row.why_now || []).slice(0, 4).join(' | ') || '-')
                       return (
-                        <tr key={key}>
+                        <tr key={dKey}>
                           <td>
                             <TokenLink tokenId={row.token_id} symbol={row.symbol || row.name} chain={row.chain} />
                             <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>{changed ? 'changed_group' : wasSeen ? 'seen_this_session' : 'new'}</div>
@@ -196,10 +216,10 @@ export default function TradeInboxTab() {
                           <td>{fmtPct(row.price_change_24h)}</td>
                           <td>{fmtUsd(row.market_cap)}</td>
                           <td style={{ color: 'var(--color-text-secondary)', fontSize: 12 }}>
-                            {(row.why_now || []).slice(0, 4).join(' | ') || row.block_reason_primary || '-'}
+                            {reasonText}
                           </td>
                           <td>
-                            <button className="tab-btn" onClick={() => setDismissed(d => ({ ...d, [key]: true }))} style={{ padding: '2px 8px', fontSize: 12 }}>
+                            <button className="tab-btn" onClick={() => setDismissed(d => ({ ...d, [dKey]: true }))} style={{ padding: '2px 8px', fontSize: 12 }}>
                               Dismiss
                             </button>
                           </td>

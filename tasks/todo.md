@@ -13,8 +13,8 @@ Workflow checklist:
 - [x] Design drafted: `tasks/design_trade_opportunity_inbox_2026_05_25.md`.
 - [x] Design reviewed by 2 parallel agents and Critical/Important folds applied.
 - [x] Build with TDD.
-- [ ] PR opened.
-- [ ] PR reviewed by 2 parallel agents and folds applied.
+- [x] PR opened: #273 (`feat(dashboard): add trade opportunity inbox`).
+- [x] PR reviewed by 2 parallel agents and folds applied.
 
 Review notes:
 - Read-only only: no execution, sizing, pruning, signal suppression, or config changes.
@@ -22,6 +22,7 @@ Review notes:
 - Design review folds: visible per-group overflow/show-more; source_limit/source_truncated diagnostics; Review Now display label; novelty not cleared on background render; dismissed restore; diagnostic empty states; exact builder counters/signature; exact sort_key encoding; score pseudocode; stale boundary tests; read-only `_ro_db` guard.
 - Build: added `/api/trade_inbox`, grouped read-only backend scoring, Trade Inbox tab, static wiring guard, focused endpoint coverage, and refreshed frontend dist.
 - Verification: red tests first (`/api/trade_inbox` 404 and missing `TradeInboxTab.jsx`), then `21 passed` for focused trade inbox/live candidates/frontend layout tests; `npm.cmd run build:codex` passed; `git diff --check` clean; full suite passed with dummy required secrets (`2736 passed, 158 skipped`). Full suite without dummy secrets failed only on pre-existing `Settings()` required env validation for Telegram/Anthropic keys.
+- PR review folds: token-level session keys for changed-group detection; blocked rows render primary block/risk diagnostics before why-now text; source-truncated banner exposes max-scan action; malformed `price_updated_at` is data-insufficient/blocked; SQL scan-cap truncation sets `source_truncated`.
 
 ## Active Work: 2026-05-25 — Live candidates determinism + contract delta
 

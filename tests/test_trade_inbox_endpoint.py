@@ -206,6 +206,11 @@ async def test_trade_inbox_stale_boundaries_and_bad_data(client):
         token_id="stale-120",
         updated_at=(now - timedelta(minutes=120)).isoformat(),
     )
+    await _insert_open_trade(
+        db._conn,
+        token_id="bad-price-time",
+        updated_at="not-iso",
+    )
 
     resp = await c.get("/api/trade_inbox?limit_per_group=10&window_hours=36")
 
@@ -215,6 +220,8 @@ async def test_trade_inbox_stale_boundaries_and_bad_data(client):
     watch = {r["token_id"]: r for r in payload["groups"]["watch"]}
     assert blocked["no-price"]["block_reason_primary"] == "NO_PRICE"
     assert blocked["bad-time"]["block_reason_primary"] == "BAD_TIMESTAMP"
+    assert blocked["bad-price-time"]["block_reason_primary"] == "DATA_INSUFFICIENT"
+    assert "price_timestamp_unparseable" in blocked["bad-price-time"]["risk_reasons"]
     assert blocked["stale-120"]["block_reason_primary"] == "STALE_PRICE"
     assert watch["stale-60"]["price_is_stale"] is True
     assert payload["meta"]["stale_warning_count"] >= 1

@@ -1054,6 +1054,8 @@ def _trade_window_state(row: dict) -> str:
 def _trade_block_reason(row: dict) -> str | None:
     if row.get("current_price") is None or row.get("pct_from_entry") is None:
         return "NO_PRICE"
+    if "price_timestamp_unparseable" in set(row.get("risk_reasons") or []):
+        return "DATA_INSUFFICIENT"
     if (
         row.get("price_staleness_minutes") is not None
         and row["price_staleness_minutes"] >= 120
@@ -1190,6 +1192,8 @@ async def get_trade_inbox(
             open_rows = []
 
         open_trades_scanned = len(open_rows)
+        if len(open_rows) >= scan_cap:
+            source_truncated = True
         open_rows.sort(
             key=lambda r: (
                 _parse_iso_dt(r.get("opened_at")) is None,
@@ -1333,6 +1337,7 @@ async def get_trade_inbox(
             current_price is None
             or opened_at is None
             or actionable is None
+            or "price_timestamp_unparseable" in set(risk_reasons)
             or (price_staleness_minutes is not None and price_staleness_minutes >= 120)
         ):
             verdict = "data_insufficient"

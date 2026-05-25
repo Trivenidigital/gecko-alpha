@@ -36,3 +36,7 @@ def test_trade_inbox_tab_is_wired_to_dashboard():
     assert "/api/trade_inbox" in tab
     assert "Review Now" in tab
     assert "Show more" in tab
+    assert "Max scan" in tab
+    assert "row.block_reason_primary" in tab
+    assert "return row.token_id" in tab
+    assert "previous_group" in tab
