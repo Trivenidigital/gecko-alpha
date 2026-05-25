@@ -1579,6 +1579,31 @@ async def main(argv: list[str] | None = None) -> int:
         settings.MIN_SCORE = args.min_score_override
         logger.info("MIN_SCORE overridden", min_score=settings.MIN_SCORE)
 
+    # Round 17 — top-level config summary at startup so operators see
+    # at-a-glance what's enabled in this deploy. Mirrors the existing
+    # paper_trading_config_resolved event (logged later from
+    # TradingEngine init). No secrets logged — booleans + thresholds
+    # only. Operators can grep `journalctl -u gecko-pipeline.service |
+    # grep pipeline_config_resolved` to verify a deploy applied
+    # expected flags.
+    logger.info(
+        "pipeline_config_resolved",
+        scan_interval_seconds=settings.SCAN_INTERVAL_SECONDS,
+        heartbeat_interval_seconds=settings.HEARTBEAT_INTERVAL_SECONDS,
+        min_score=settings.MIN_SCORE,
+        conviction_threshold=settings.CONVICTION_THRESHOLD,
+        chains_enabled=settings.CHAINS_ENABLED,
+        narrative_enabled=settings.NARRATIVE_ENABLED,
+        secondwave_enabled=settings.SECONDWAVE_ENABLED,
+        briefing_enabled=settings.BRIEFING_ENABLED,
+        tg_social_enabled=settings.TG_SOCIAL_ENABLED,
+        lunarcrush_enabled=getattr(settings, "LUNARCRUSH_ENABLED", False),
+        cryptopanic_enabled=getattr(settings, "CRYPTOPANIC_ENABLED", False),
+        live_trading_enabled=getattr(settings, "LIVE_TRADING_ENABLED", False),
+        ingest_watchdog_enabled=settings.INGEST_WATCHDOG_ENABLED,
+        counter_enabled=settings.COUNTER_ENABLED,
+    )
+
     # Honour CoinGecko rolling-cap and burst-profile settings from config.
     from scout.ratelimit import configure_from_settings as _cg_ratelimit_configure
 
