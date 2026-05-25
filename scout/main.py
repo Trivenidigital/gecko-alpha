@@ -1838,16 +1838,44 @@ async def main(argv: list[str] | None = None) -> int:
 
     shutdown_event = asyncio.Event()
 
-    def _shutdown(sig, frame):
+    def _shutdown(sig: int) -> None:
         logger.info("Shutdown signal received", signal=sig)
         shutdown_event.set()
 
-    # Register signal handlers for graceful shutdown
-    signal.signal(signal.SIGINT, _shutdown)
+    # Register signal handlers for graceful shutdown.
+    #
+    # Round 12 (post-R11 deploy regression): prefer
+    # ``loop.add_signal_handler`` over the prior ``signal.signal``. The
+    # synchronous handler can be delayed up to TimeoutStopSec (90s) when
+    # the loop is blocked in a long ``await`` — observed on srilu
+    # 2026-05-24T23:08 when SIGTERM arrived mid-46.6s CG rate-limiter
+    # backoff and the OLD pipeline never logged "Shutdown signal received"
+    # before systemd SIGKILLed it. ``loop.add_signal_handler`` wakes the
+    # selector directly, so the handler fires on the next select-loop
+    # iteration (typically within milliseconds) regardless of what
+    # coroutine is currently awaited.
+    #
+    # ``add_signal_handler`` is NotImplemented on Windows
+    # ProactorEventLoop; fall back to ``signal.signal`` there (Linux is
+    # the only production target — fallback is only for Windows dev/CI).
     try:
-        signal.signal(signal.SIGTERM, _shutdown)
-    except (OSError, ValueError):
-        pass  # SIGTERM not supported on Windows
+        _loop = asyncio.get_running_loop()
+        _loop.add_signal_handler(signal.SIGINT, _shutdown, signal.SIGINT)
+        try:
+            _loop.add_signal_handler(signal.SIGTERM, _shutdown, signal.SIGTERM)
+        except (OSError, ValueError):
+            pass  # SIGTERM not supported on the current platform
+    except NotImplementedError:
+        # Windows fallback — synchronous signal.signal works, just with
+        # the latency caveat documented above.
+        def _shutdown_sync(sig, frame):
+            _shutdown(sig)
+
+        signal.signal(signal.SIGINT, _shutdown_sync)
+        try:
+            signal.signal(signal.SIGTERM, _shutdown_sync)
+        except (OSError, ValueError):
+            pass
 
     cycle_count = 0
     last_outcome_check = time.monotonic()
