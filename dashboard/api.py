@@ -1201,6 +1201,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "rotate_heartbeat_fresh": False,
             "create_heartbeat_age_sec": None,
             "create_heartbeat_fresh": False,
+            # Round 18 — file-evidence fields. Heartbeats track the
+            # LAST RUN of the rotate/create script, but the file itself
+            # is the authoritative proof a backup exists. A silently-
+            # deleted .bak (operator cleanup, disk-full truncate, etc.)
+            # leaves the heartbeat fresh while the backup is gone.
+            "backup_file_count": 0,
+            "latest_backup_age_sec": None,
+            "latest_backup_fresh": False,
+            "latest_backup_size_bytes": None,
         }
         now_ts = datetime.now(timezone.utc).timestamp()
         for env_key, age_key, fresh_key, default_path in (
@@ -1228,6 +1237,37 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 # Missing / unreadable / non-numeric content — leave
                 # age=None, fresh=False so uptime monitors alert on it.
                 pass
+
+        # Round 18 — count actual backup files and find the newest. The
+        # rotate-script glob is `scout.db.bak.*` and `scout.db.bak-*`;
+        # match both. If GECKO_BACKUP_DIR is unset, fall back to the
+        # production default.
+        backup_dir = Path(
+            os.environ.get("GECKO_BACKUP_DIR", "/root/gecko-alpha")
+        )
+        try:
+            files = sorted(
+                (
+                    p
+                    for pattern in ("scout.db.bak.*", "scout.db.bak-*")
+                    for p in backup_dir.glob(pattern)
+                    if p.is_file()
+                ),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            backup_status["backup_file_count"] = len(files)
+            if files:
+                newest = files[0]
+                stat = newest.stat()
+                age = int(now_ts - stat.st_mtime)
+                backup_status["latest_backup_age_sec"] = age
+                backup_status["latest_backup_fresh"] = age <= stale_after_sec
+                backup_status["latest_backup_size_bytes"] = stat.st_size
+        except OSError:
+            # Backup dir missing / unreadable — leave defaults so
+            # uptime monitors alert on backup_file_count=0.
+            pass
 
         return {
             "status": "ok" if db_ok else "degraded",
