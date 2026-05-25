@@ -2590,7 +2590,7 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
    - Narrative predictions can enrich or downgrade a candidate; they are not standalone live entries unless the scoring layer also passes entry-quality and actionability gates.
 
 6. **BL-NEW-DASHBOARD-NOW-TRADABLE-PANEL** — Build a dashboard panel backed by `/api/live_candidates`.
-   - **Status:** PR OPEN 2026-05-23 — PR #239 adds a read-only “Now Tradable” tab + a read-only trust-registry tab; no execution/pruning affordances.
+   - **Status:** MERGED-IN-TREE 2026-05-24 — PR #239 merged (merge commit `050fe12b`): adds read-only “Now Tradable (V1)” + “Signal Trust (V1)” tabs; no execution/pruning affordances.
     - Shows only assets a human might consider now.
     - Top-level buckets: `trade small now`, `watch only`, `reject`, `data insufficient`.
     - Each row links to paper trade detail and evidence bundle.
@@ -2640,7 +2640,7 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 - Registry: `docs/superpowers/registries/signal_trust_registry.v1.json`
 - Validator: `scripts/validate_signal_trust_registry.mjs`
 - Runbook: `docs/runbooks/signal-trust-roadmap-v1.md`
-- **Status:** PR OPEN 2026-05-23 — PR #239 adds a read-only `GET /api/signal_trust_registry` export + dashboard tab (still visibility-only; not-for-pruning/not-for-auto-disable).
+- **Status:** MERGED-IN-TREE 2026-05-24 — PR #239 merged (merge commit `050fe12b`): adds read-only `GET /api/signal_trust_registry` export + dashboard tab (still visibility-only; not-for-pruning/not-for-auto-disable).
 
 1. **BL-NEW-SIGNAL-MATURITY-TAXONOMY** - Give every signal family an explicit maturity state.
     - Example states: `trusted_experimental`, `context_only`, `data_insufficient`, `quarantined`, `retire_candidate`.

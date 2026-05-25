@@ -8,6 +8,7 @@ V1 is **visibility-only**. It MUST NOT be used for pruning, suppression, auto-di
 
 - Registry (JSON): `docs/superpowers/registries/signal_trust_registry.v1.json`
 - Validator (Node): `scripts/validate_signal_trust_registry.mjs`
+- Read-only export + dashboard tab: `GET /api/signal_trust_registry` + "Signal Trust (V1)" (merged in-tree via PR #239, merge commit `050fe12b`; does not assert prod deployment)
 
 ## What V1 is (and is not)
 
@@ -54,6 +55,6 @@ node scripts/validate_signal_trust_registry.mjs --path docs/superpowers/registri
 
 1. Make the smallest possible edit to the JSON.
 2. Add or update the `data_quality.warning` field with the uncertainty and the missing evidence.
-3. Keep `next_gate.threshold` explicit and data-bound (example: “verify 7d/14d/30d cohorts”; “min_sample>=10 and coverage>=0.50 with temporal integrity”).
+3. Keep `next_gate.threshold` explicit and data-bound (example: "verify 7d/14d/30d cohorts"; "min_sample>=10 and coverage>=0.50 with temporal integrity").
 4. Run the validator.
-5. Record the evidence path (DB query, runbook, deploy SHA) in the session’s findings doc. Do not embed runtime “facts” into the registry without citing where they were verified.
+5. Record the evidence path (DB query, runbook, deploy SHA) in the session's findings doc. Do not embed runtime "facts" into the registry without citing where they were verified.
