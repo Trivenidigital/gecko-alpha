@@ -1162,7 +1162,21 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/health")
     async def health_check():
-        """Health check endpoint for uptime monitoring."""
+        """Health check endpoint for uptime monitoring.
+
+        Round 14: also surfaces backup-heartbeat freshness for both the
+        rotate and create steps (PR #245, R11/R13). Operators previously
+        had to ssh + journalctl to verify R11/R13 backups were
+        producing. /health now reports both heartbeat ages so an uptime
+        monitor pointed at this endpoint catches the same conditions
+        as the gecko-backup-watchdog Telegram alert path.
+
+        Missing / unreadable / non-numeric heartbeat → age=None,
+        fresh=False so monitors alert on it.
+        """
+        from datetime import datetime, timezone
+        from pathlib import Path
+
         db_ok = False
         last_cycle = None
         pipeline_running = False
@@ -1173,18 +1187,54 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 row = await cursor.fetchone()
                 last_cycle = row[0] if row and row[0] else None
                 if last_cycle:
-                    from datetime import datetime, timezone
-
                     last_dt = datetime.fromisoformat(last_cycle.replace("Z", "+00:00"))
                     age = (datetime.now(timezone.utc) - last_dt).total_seconds()
                     pipeline_running = age < 180  # 3x 60s scan interval
         except Exception:
             pass
+
+        stale_after_sec = int(
+            os.environ.get("GECKO_BACKUP_STALE_AFTER_SEC", "172800")
+        )
+        backup_status: dict[str, object] = {
+            "rotate_heartbeat_age_sec": None,
+            "rotate_heartbeat_fresh": False,
+            "create_heartbeat_age_sec": None,
+            "create_heartbeat_fresh": False,
+        }
+        now_ts = datetime.now(timezone.utc).timestamp()
+        for env_key, age_key, fresh_key, default_path in (
+            (
+                "GECKO_BACKUP_HEARTBEAT_FILE",
+                "rotate_heartbeat_age_sec",
+                "rotate_heartbeat_fresh",
+                "/var/lib/gecko-alpha/backup-rotation/backup-last-ok",
+            ),
+            (
+                "GECKO_BACKUP_CREATE_HEARTBEAT_FILE",
+                "create_heartbeat_age_sec",
+                "create_heartbeat_fresh",
+                "/var/lib/gecko-alpha/backup-rotation/create-last-ok",
+            ),
+        ):
+            path = Path(os.environ.get(env_key, default_path))
+            try:
+                raw = path.read_text(encoding="utf-8").strip()
+                ts = int(raw)
+                age = int(now_ts - ts)
+                backup_status[age_key] = age
+                backup_status[fresh_key] = age <= stale_after_sec
+            except (FileNotFoundError, ValueError, OSError):
+                # Missing / unreadable / non-numeric content — leave
+                # age=None, fresh=False so uptime monitors alert on it.
+                pass
+
         return {
             "status": "ok" if db_ok else "degraded",
             "pipeline_running": pipeline_running,
             "last_cycle_at": last_cycle,
             "db_reachable": db_ok,
+            **backup_status,
         }
 
     # --- WebSocket ---
