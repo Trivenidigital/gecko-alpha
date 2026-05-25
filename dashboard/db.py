@@ -1032,6 +1032,430 @@ def _live_candidates_meta(
     }
 
 
+TRADE_INBOX_GROUPS = ("act_now", "watch", "already_ran", "blocked")
+WINDOW_RANK = {"open": 0, "closing": 1, "unknown": 2, "late": 3, "closed": 4}
+
+
+def _trade_window_state(row: dict) -> str:
+    if row.get("current_price") is None:
+        return "unknown"
+    pct = row.get("pct_from_entry")
+    if pct is None:
+        return "unknown"
+    if pct < -10:
+        return "closed"
+    if pct <= 8:
+        return "open"
+    if pct <= 25:
+        return "closing"
+    return "late"
+
+
+def _trade_block_reason(row: dict) -> str | None:
+    if row.get("current_price") is None or row.get("pct_from_entry") is None:
+        return "NO_PRICE"
+    if (
+        row.get("price_staleness_minutes") is not None
+        and row["price_staleness_minutes"] >= 120
+    ):
+        return "STALE_PRICE"
+    if row.get("actionable") == 0:
+        return "NOT_ACTIONABLE"
+    if row.get("opened_at") is None:
+        return "BAD_TIMESTAMP"
+    if row.get("verdict") == "data_insufficient":
+        return "DATA_INSUFFICIENT"
+    return None
+
+
+def _trade_score(row: dict) -> float:
+    score = 0.0
+    window_state = row["window_state"]
+    stale_minutes = row.get("price_staleness_minutes")
+    if row.get("verdict") == "candidate_review":
+        score += 35
+    if row.get("actionable") == 1:
+        score += 25
+    if row.get("would_be_live") == 1:
+        score += 10
+    if row.get("entry_quality") == "fresh_entry":
+        score += 15
+    elif row.get("entry_quality") == "acceptable_pullback":
+        score += 8
+    if window_state == "open":
+        score += 15
+    elif window_state == "closing":
+        score += 6
+    if stale_minutes is not None and stale_minutes < 60:
+        score += 8
+    extra_surfaces = max(0, len(set(row.get("surfaces") or [])) - 1)
+    score += min(3, extra_surfaces) * 2
+    momentum = row.get("price_change_24h")
+    if momentum is not None and momentum > 0:
+        score += min(10, momentum / 5)
+    if stale_minutes is not None and 60 <= stale_minutes < 120:
+        score -= 12
+    score -= min(5, len(set(row.get("risk_reasons") or []))) * 3
+    if window_state == "late":
+        score -= 35
+    elif window_state == "closed":
+        score -= 50
+    return round(max(0, min(100, score)), 1)
+
+
+def _trade_sort_key(row: dict) -> list:
+    opened_dt = _parse_iso_dt(row.get("opened_at"))
+    opened_missing = 1 if opened_dt is None else 0
+    opened_epoch = opened_dt.timestamp() if opened_dt else 0
+    return [
+        WINDOW_RANK.get(row.get("window_state"), 9),
+        -float(row.get("trade_score") or 0),
+        opened_missing,
+        -opened_epoch,
+        row.get("token_id") or "",
+    ]
+
+
+def _trade_why_now(row: dict) -> list[str]:
+    reasons: list[str] = []
+    window = row.get("window_state")
+    if window == "open":
+        reasons.append("open_window")
+    elif window == "closing":
+        reasons.append("closing_window")
+    elif (
+        row.get("price_staleness_minutes") is not None
+        and row["price_staleness_minutes"] >= 60
+    ):
+        reasons.append("stale_warning")
+    elif len(set(row.get("surfaces") or [])) > 1:
+        reasons.append("multi_surface")
+    else:
+        reasons.append("fresh_price")
+    reasons.append(f"window={window}")
+    if row.get("entry_quality") in ("fresh_entry", "acceptable_pullback"):
+        reasons.append(row["entry_quality"])
+    if row.get("actionable") == 1:
+        reasons.append("actionable=1")
+    if row.get("would_be_live") == 1:
+        reasons.append("would_be_live=1")
+    if (
+        row.get("price_staleness_minutes") is not None
+        and row["price_staleness_minutes"] < 60
+    ):
+        reasons.append("price_fresh")
+    if row.get("price_change_24h") is not None and row["price_change_24h"] > 0:
+        reasons.append("momentum_24h_positive")
+    surfaces = len(set(row.get("surfaces") or []))
+    if surfaces:
+        reasons.append(f"surfaces={surfaces}")
+    return reasons[:6]
+
+
+async def get_trade_inbox(
+    db_path: str, *, limit_per_group: int = 10, window_hours: int = 36
+) -> dict:
+    """Read-only grouped trader-review inbox over open paper trades."""
+    limit_per_group = max(1, min(int(limit_per_group), 100))
+    window_hours = max(6, min(int(window_hours), 72))
+    source_limit = max(500, limit_per_group * 40)
+    scan_cap = max(source_limit * 20, 400)
+    now = datetime.now(timezone.utc)
+    generated_at = now.isoformat()
+
+    groups: dict[str, list[dict]] = {g: [] for g in TRADE_INBOX_GROUPS}
+    open_trades_scanned = 0
+    source_rows_considered = 0
+    source_truncated = False
+    block_reason_counts: dict[str, int] = {}
+    stale_warning_count = 0
+    hard_stale_count = 0
+
+    async with _ro_db(db_path) as db:
+        try:
+            cursor = await db.execute(
+                """SELECT id, token_id, symbol, name, chain,
+                          signal_type, entry_price, opened_at,
+                          would_be_live, actionable
+                     FROM paper_trades
+                    WHERE status = 'open'
+                    ORDER BY datetime(opened_at) IS NULL ASC,
+                             datetime(opened_at) DESC,
+                             id DESC
+                    LIMIT ?""",
+                (scan_cap,),
+            )
+            open_rows = [dict(x) for x in await cursor.fetchall()]
+        except aiosqlite.OperationalError:
+            open_rows = []
+
+        open_trades_scanned = len(open_rows)
+        open_rows.sort(
+            key=lambda r: (
+                _parse_iso_dt(r.get("opened_at")) is None,
+                -(
+                    _parse_iso_dt(r.get("opened_at")).timestamp()
+                    if _parse_iso_dt(r.get("opened_at"))
+                    else 0
+                ),
+                -int(r["id"]),
+            )
+        )
+
+        primary: dict[str, dict] = {}
+        open_ids: dict[str, list[int]] = {}
+        token_order: list[str] = []
+        for r in open_rows:
+            token_id = r["token_id"]
+            open_ids.setdefault(token_id, []).append(int(r["id"]))
+            if token_id not in primary:
+                if len(token_order) >= source_limit:
+                    source_truncated = True
+                    continue
+                primary[token_id] = r
+                token_order.append(token_id)
+
+        if token_order:
+            placeholders = ",".join("?" * len(token_order))
+            cutoff_iso = (now - timedelta(hours=window_hours)).isoformat()
+            surfaces_by_token = {t: {primary[t]["signal_type"]} for t in token_order}
+            recent_ids_by_token = {t: [] for t in token_order}
+            try:
+                cursor = await db.execute(
+                    f"""SELECT id, token_id, signal_type
+                          FROM paper_trades
+                         WHERE token_id IN ({placeholders})
+                           AND opened_at >= ?
+                         ORDER BY opened_at DESC, id DESC""",
+                    (*token_order, cutoff_iso),
+                )
+                for rr in await cursor.fetchall():
+                    tid = rr["token_id"]
+                    if tid in recent_ids_by_token:
+                        recent_ids_by_token[tid].append(int(rr["id"]))
+                        if rr["signal_type"]:
+                            surfaces_by_token[tid].add(rr["signal_type"])
+            except aiosqlite.OperationalError:
+                pass
+
+            price_by_coin: dict[str, dict] = {}
+            try:
+                cursor = await db.execute(
+                    f"""SELECT coin_id, current_price, market_cap, price_change_24h, updated_at
+                          FROM price_cache
+                         WHERE coin_id IN ({placeholders})""",
+                    tuple(token_order),
+                )
+                price_by_coin = {r["coin_id"]: dict(r) for r in await cursor.fetchall()}
+            except aiosqlite.OperationalError:
+                price_by_coin = {}
+        else:
+            surfaces_by_token = {}
+            recent_ids_by_token = {}
+            price_by_coin = {}
+
+    for token_id in token_order:
+        base = primary[token_id]
+        price = price_by_coin.get(token_id)
+        risk_reasons: list[str] = []
+        inclusion_reasons: list[str] = ["open_paper_trade"]
+        opened_dt = _parse_iso_dt(base.get("opened_at"))
+        opened_at = opened_dt.isoformat() if opened_dt else None
+        if opened_dt is None:
+            risk_reasons.append("opened_at_unparseable")
+        opened_age_hours = (
+            round((now - opened_dt).total_seconds() / 3600, 2) if opened_dt else None
+        )
+
+        entry_price = base.get("entry_price")
+        entry_price = float(entry_price) if entry_price is not None else None
+        current_price = (
+            float(price["current_price"])
+            if price and price.get("current_price") is not None
+            else None
+        )
+        pct_from_entry = None
+        if current_price is not None and entry_price and entry_price > 0:
+            pct_from_entry = round((current_price - entry_price) / entry_price * 100, 2)
+        elif current_price is None:
+            risk_reasons.append("no_price_snapshot_for_token_id")
+        else:
+            risk_reasons.append("entry_price_missing_or_invalid")
+
+        price_updated_at = None
+        price_staleness_minutes = None
+        if price:
+            upd_dt = _parse_iso_dt(price.get("updated_at"))
+            if upd_dt:
+                price_updated_at = upd_dt.isoformat()
+                price_staleness_minutes = round((now - upd_dt).total_seconds() / 60, 2)
+            else:
+                risk_reasons.append("price_timestamp_unparseable")
+
+        entry_quality = "data_insufficient"
+        if pct_from_entry is not None:
+            if pct_from_entry < -10:
+                entry_quality = "already_faded"
+            elif pct_from_entry > 25:
+                entry_quality = "already_ran"
+            elif -2 <= pct_from_entry <= 8:
+                entry_quality = "fresh_entry"
+            elif -6 <= pct_from_entry <= 15:
+                entry_quality = "acceptable_pullback"
+            elif pct_from_entry < -6:
+                entry_quality = "already_faded"
+            else:
+                entry_quality = "already_ran"
+
+        window_state = _trade_window_state(
+            {"current_price": current_price, "pct_from_entry": pct_from_entry}
+        )
+        if price_staleness_minutes is not None and price_staleness_minutes >= 60:
+            risk_reasons.append("price_is_stale")
+            if price_staleness_minutes >= 120:
+                entry_quality = "too_stale"
+
+        actionable = base.get("actionable")
+        would_be_live = base.get("would_be_live")
+        if actionable == 1:
+            inclusion_reasons.append("actionable=1")
+        elif actionable == 0:
+            inclusion_reasons.append("actionable=0")
+            risk_reasons.append("not_actionable")
+        elif actionable is None:
+            inclusion_reasons.append("actionable=null")
+            risk_reasons.append("actionable_null_pre_cutover")
+        if would_be_live == 1:
+            inclusion_reasons.append("would_be_live=1")
+
+        verdict = "watch"
+        if (
+            current_price is None
+            or opened_at is None
+            or actionable is None
+            or (price_staleness_minutes is not None and price_staleness_minutes >= 120)
+        ):
+            verdict = "data_insufficient"
+        elif actionable == 0:
+            verdict = "blocked"
+        elif (
+            actionable == 1
+            and would_be_live == 1
+            and entry_quality
+            in (
+                "fresh_entry",
+                "acceptable_pullback",
+            )
+        ):
+            verdict = "candidate_review"
+
+        row = {
+            "token_id": token_id,
+            "symbol": base.get("symbol"),
+            "name": base.get("name"),
+            "chain": base.get("chain"),
+            "open_trade_ids": sorted(open_ids.get(token_id, []), reverse=True),
+            "recent_trade_ids": sorted(
+                recent_ids_by_token.get(token_id, []), reverse=True
+            ),
+            "surfaces": sorted(surfaces_by_token.get(token_id, set())),
+            "actionable": actionable,
+            "would_be_live": would_be_live,
+            "opened_at": opened_at,
+            "opened_age_hours": opened_age_hours,
+            "pct_from_entry": pct_from_entry,
+            "current_price": current_price,
+            "market_cap": price.get("market_cap") if price else None,
+            "price_change_24h": price.get("price_change_24h") if price else None,
+            "price_updated_at": price_updated_at,
+            "price_is_stale": bool(
+                price_staleness_minutes is not None and price_staleness_minutes >= 60
+            ),
+            "price_staleness_minutes": price_staleness_minutes,
+            "entry_quality": entry_quality,
+            "verdict": verdict,
+            "inclusion_reasons": inclusion_reasons,
+            "risk_reasons": risk_reasons,
+            "window_state": window_state,
+        }
+        block_reason = _trade_block_reason(row)
+        row["block_reason_primary"] = block_reason
+        old_low_movement = bool(
+            opened_age_hours is not None
+            and opened_age_hours > window_hours
+            and abs(pct_from_entry or 0) <= 8
+        )
+        if block_reason:
+            group = "blocked"
+            action = (
+                "DATA_MISSING"
+                if block_reason in ("NO_PRICE", "BAD_TIMESTAMP", "DATA_INSUFFICIENT")
+                else "BLOCKED"
+            )
+            block_reason_counts[block_reason] = (
+                block_reason_counts.get(block_reason, 0) + 1
+            )
+        elif window_state in ("late", "closed"):
+            group = "already_ran"
+            action = "TOO_LATE"
+        elif (
+            verdict == "candidate_review"
+            and window_state in ("open", "closing")
+            and not row["price_is_stale"]
+            and not old_low_movement
+        ):
+            group = "act_now"
+            action = "REVIEW_NOW"
+        else:
+            group = "watch"
+            action = "WATCH_PULLBACK"
+        if row["price_is_stale"]:
+            if price_staleness_minutes is not None and price_staleness_minutes >= 120:
+                hard_stale_count += 1
+            else:
+                stale_warning_count += 1
+        row["group"] = group
+        row["action_label"] = action
+        row["trade_score"] = _trade_score(row)
+        row["sort_key"] = _trade_sort_key(row)
+        row["why_now"] = _trade_why_now(row)
+        groups[group].append(row)
+        source_rows_considered += 1
+
+    for rows in groups.values():
+        rows.sort(key=lambda r: r["sort_key"])
+
+    group_counts = {g: len(groups[g]) for g in TRADE_INBOX_GROUPS}
+    sliced_groups = {g: groups[g][:limit_per_group] for g in TRADE_INBOX_GROUPS}
+    group_hidden_counts = {
+        g: max(0, group_counts[g] - len(sliced_groups[g])) for g in TRADE_INBOX_GROUPS
+    }
+    rows_returned = sum(len(v) for v in sliced_groups.values())
+
+    return {
+        "meta": {
+            "read_only": True,
+            "not_trade_advice": True,
+            "experimental": True,
+            "generated_at": generated_at,
+            "window_hours": window_hours,
+            "limit_per_group": limit_per_group,
+            "rows_returned": rows_returned,
+            "source_limit": source_limit,
+            "source_rows_considered": source_rows_considered,
+            "open_trades_scanned": open_trades_scanned,
+            "source_truncated": source_truncated,
+            "group_counts": group_counts,
+            "group_hidden_counts": group_hidden_counts,
+            "block_reason_counts": block_reason_counts,
+            "stale_warning_count": stale_warning_count,
+            "hard_stale_count": hard_stale_count,
+            "source": "live_candidates",
+        },
+        "groups": sliced_groups,
+    }
+
+
 async def get_live_candidates(
     db_path: str, *, limit: int = 20, window_hours: int = 36
 ) -> dict:
@@ -1198,9 +1622,7 @@ async def get_live_candidates(
                     try:
                         decoded = json.loads(raw)
                         if isinstance(decoded, list):
-                            items = [
-                                x for x in decoded if isinstance(x, (dict, str))
-                            ]
+                            items = [x for x in decoded if isinstance(x, (dict, str))]
                     except Exception:
                         items = []
                 d["counter_flags"] = items
@@ -1327,8 +1749,7 @@ async def get_live_candidates(
         if price_age is not None and price_age > stale_hard_age:
             verdict = "data_insufficient"
         elif any(
-            r
-            in risk_reasons
+            r in risk_reasons
             for r in (
                 "no_price_snapshot_for_token_id",
                 "price_timestamp_unparseable",
@@ -1343,9 +1764,14 @@ async def get_live_candidates(
         elif actionable is None:
             verdict = "data_insufficient"
             risk_reasons.append("actionable_null_pre_cutover")
-        elif actionable == 1 and would_be_live == 1 and eq in (
-            "fresh_entry",
-            "acceptable_pullback",
+        elif (
+            actionable == 1
+            and would_be_live == 1
+            and eq
+            in (
+                "fresh_entry",
+                "acceptable_pullback",
+            )
         ):
             verdict = "candidate_review"
         else:
@@ -1376,8 +1802,12 @@ async def get_live_candidates(
                 "symbol": base.get("symbol"),
                 "name": base.get("name"),
                 "chain": base.get("chain"),
-                "open_trade_ids": sorted(open_ids_by_token.get(token_id, []), reverse=True),
-                "recent_trade_ids": sorted(recent_ids_by_token.get(token_id, []), reverse=True),
+                "open_trade_ids": sorted(
+                    open_ids_by_token.get(token_id, []), reverse=True
+                ),
+                "recent_trade_ids": sorted(
+                    recent_ids_by_token.get(token_id, []), reverse=True
+                ),
                 "surfaces": sorted(surfaces_by_token.get(token_id, set())),
                 "actionable": actionable,
                 "would_be_live": would_be_live,
@@ -1604,12 +2034,10 @@ async def get_trading_actionability_summary(db_path: str, days: int = 7) -> dict
 
     async with _ro_db(db_path) as db:
         try:
-            cursor = await db.execute(
-                """SELECT actionable, COUNT(*) AS n
+            cursor = await db.execute("""SELECT actionable, COUNT(*) AS n
                    FROM paper_trades
                    WHERE status = 'open'
-                   GROUP BY actionable"""
-            )
+                   GROUP BY actionable""")
             open_rows = await cursor.fetchall()
 
             cursor = await db.execute(
@@ -1666,9 +2094,7 @@ async def get_trading_actionability_summary(db_path: str, days: int = 7) -> dict
                 "losses": int(row["losses"] or 0),
                 "total_pnl_usd": round(row["pnl"] or 0, 2),
                 "avg_pnl_pct": round(row["avg_pct"] or 0, 2),
-                "win_rate_pct": round((wins / trades) * 100, 1)
-                if trades > 0
-                else 0.0,
+                "win_rate_pct": round((wins / trades) * 100, 1) if trades > 0 else 0.0,
             }
         )
 
@@ -2044,7 +2470,9 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
         current_price_cache: dict[str, float | None] = {}
         entry_price_data: dict[str, list[tuple[datetime, float]]] = {}
 
-        async def _resolve_coin_id_for_outcome(row: aiosqlite.Row) -> tuple[str | None, str]:
+        async def _resolve_coin_id_for_outcome(
+            row: aiosqlite.Row,
+        ) -> tuple[str | None, str]:
             resolved = row["resolved_coin_id"]
             if resolved:
                 return resolved, "resolved_coin_id"
@@ -2196,9 +2624,9 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
                     parsed_ts = _parse_ts(price_row["ts"])
                     price = price_row["price"]
                     if parsed_ts and price and price > 0:
-                        entry_price_data.setdefault(
-                            price_row["coin_id"], []
-                        ).append((parsed_ts, float(price)))
+                        entry_price_data.setdefault(price_row["coin_id"], []).append(
+                            (parsed_ts, float(price))
+                        )
 
         async def _price_at_alert(coin_id: str, received_at: str) -> float | None:
             """Closest-prior-snapshot if exists within ±24h of received_at,
@@ -2215,9 +2643,7 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
             window_hi = received_dt + timedelta(hours=24)
             all_sources = entry_price_data.get(coin_id) or []
             sources = [
-                (ts, price)
-                for ts, price in all_sources
-                if window_lo <= ts <= window_hi
+                (ts, price) for ts, price in all_sources if window_lo <= ts <= window_hi
             ]
             if not sources:
                 return None
@@ -2245,7 +2671,9 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
             current_price_cache[coin_id] = None
             return None
 
-        async def _outcome(row: aiosqlite.Row, resolved: tuple[str | None, str]) -> dict:
+        async def _outcome(
+            row: aiosqlite.Row, resolved: tuple[str | None, str]
+        ) -> dict:
             investment = 300.0
             coin_id, status = resolved
             base = {
@@ -2304,7 +2732,8 @@ async def get_x_alerts(db_path: str, limit: int = 80) -> dict:
             if symbol:
                 return {
                     "asset_url": f"https://www.coingecko.com/en/search?query={symbol}",
-                    "asset_url_source": outcome.get("outcome_status") or "coingecko_search",
+                    "asset_url_source": outcome.get("outcome_status")
+                    or "coingecko_search",
                 }
 
             return {
@@ -2592,9 +3021,9 @@ async def get_source_calls_health(db_path: str) -> dict:
 
     async with _ro_db(db_path) as conn:
         try:
-            row = await (await conn.execute(
-                "SELECT COUNT(*) FROM source_calls"
-            )).fetchone()
+            row = await (
+                await conn.execute("SELECT COUNT(*) FROM source_calls")
+            ).fetchone()
             row_count = row[0] if row else 0
         except aiosqlite.OperationalError as exc:
             msg = str(exc)
@@ -2673,17 +3102,17 @@ async def get_source_calls_health(db_path: str) -> dict:
         # scout.source_quality.ledger.compute_source_quality_summary.
         try:
             from scout.source_quality.ledger import compute_source_quality_summary
+
             summaries = await compute_source_quality_summary(conn)
             rankable = sum(
-                1 for s in summaries
+                1
+                for s in summaries
                 if s.rank_status == "rankable_resolvable_cg_board_cohort"
             )
             insufficient = sum(
                 1 for s in summaries if s.rank_status == "insufficient_sample"
             )
-            biased = sum(
-                1 for s in summaries if s.rank_status == "biased_low_coverage"
-            )
+            biased = sum(1 for s in summaries if s.rank_status == "biased_low_coverage")
             source_count = len(summaries)
             if rankable == 0:
                 reasons = []
@@ -2691,9 +3120,8 @@ async def get_source_calls_health(db_path: str) -> dict:
                     reasons.append(f"{insufficient} below min_sample=10")
                 if biased > 0:
                     reasons.append(f"{biased} below min_coverage_rate=0.50")
-                label = (
-                    "no sources rankable yet — "
-                    + (", ".join(reasons) if reasons else "no qualifying sources")
+                label = "no sources rankable yet — " + (
+                    ", ".join(reasons) if reasons else "no qualifying sources"
                 )
             else:
                 label = (
@@ -2717,16 +3145,12 @@ async def get_source_calls_health(db_path: str) -> dict:
             )
 
         # Writer freshness: max(observed_at) → minutes since.
-        cur = await conn.execute(
-            "SELECT MAX(observed_at) FROM source_calls"
-        )
+        cur = await conn.execute("SELECT MAX(observed_at) FROM source_calls")
         max_row = await cur.fetchone()
         max_observed = max_row[0] if max_row else None
         if max_observed:
             try:
-                last_dt = datetime.fromisoformat(
-                    max_observed.replace("Z", "+00:00")
-                )
+                last_dt = datetime.fromisoformat(max_observed.replace("Z", "+00:00"))
                 if last_dt.tzinfo is None:
                     last_dt = last_dt.replace(tzinfo=timezone.utc)
                 age_min = (now - last_dt).total_seconds() / 60.0

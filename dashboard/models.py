@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class CandidateResponse(BaseModel):
@@ -155,3 +155,74 @@ class LiveCandidateMeta(BaseModel):
 class LiveCandidateCockpit(BaseModel):
     meta: LiveCandidateMeta
     rows: list[LiveCandidateResponse] = []
+
+
+TradeInboxGroup = Literal["act_now", "watch", "already_ran", "blocked"]
+TradeInboxWindowState = Literal["open", "closing", "late", "closed", "unknown"]
+TradeInboxActionLabel = Literal[
+    "REVIEW_NOW",
+    "WATCH_PULLBACK",
+    "TOO_LATE",
+    "BLOCKED",
+    "DATA_MISSING",
+]
+
+
+class TradeInboxRow(BaseModel):
+    token_id: str
+    symbol: str | None = None
+    name: str | None = None
+    chain: str | None = None
+
+    group: TradeInboxGroup
+    action_label: TradeInboxActionLabel
+    window_state: TradeInboxWindowState
+    trade_score: float
+    sort_key: list[str | float | int] = Field(default_factory=list)
+    why_now: list[str] = Field(default_factory=list)
+
+    inclusion_reasons: list[str] = Field(default_factory=list)
+    risk_reasons: list[str] = Field(default_factory=list)
+    surfaces: list[str] = Field(default_factory=list)
+    open_trade_ids: list[int] = Field(default_factory=list)
+    recent_trade_ids: list[int] = Field(default_factory=list)
+    actionable: int | None = None
+    would_be_live: int | None = None
+    block_reason_primary: str | None = None
+
+    opened_at: str | None = None
+    opened_age_hours: float | None = None
+    pct_from_entry: float | None = None
+    price_change_24h: float | None = None
+    market_cap: float | None = None
+    current_price: float | None = None
+    entry_quality: str | None = None
+    verdict: str | None = None
+    price_updated_at: str | None = None
+    price_is_stale: bool = False
+    price_staleness_minutes: float | None = None
+
+
+class TradeInboxMeta(BaseModel):
+    read_only: bool = True
+    not_trade_advice: bool = True
+    experimental: bool = True
+    generated_at: str
+    window_hours: int
+    limit_per_group: int
+    rows_returned: int
+    source_limit: int
+    source_rows_considered: int
+    open_trades_scanned: int
+    source_truncated: bool = False
+    group_counts: dict[str, int] = Field(default_factory=dict)
+    group_hidden_counts: dict[str, int] = Field(default_factory=dict)
+    block_reason_counts: dict[str, int] = Field(default_factory=dict)
+    stale_warning_count: int = 0
+    hard_stale_count: int = 0
+    source: str = "live_candidates"
+
+
+class TradeInboxResponse(BaseModel):
+    meta: TradeInboxMeta
+    groups: dict[TradeInboxGroup, list[TradeInboxRow]]

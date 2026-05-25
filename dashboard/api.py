@@ -22,6 +22,7 @@ from dashboard.models import (
     LiveCandidateCockpit,
     SignalHitRate,
     StatusResponse,
+    TradeInboxResponse,
     WinRateResponse,
 )
 
@@ -537,6 +538,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
         """
         return await db.get_live_candidates(
             _db_path, limit=limit, window_hours=window_hours
+        )
+
+    @app.get("/api/trade_inbox", response_model=TradeInboxResponse)
+    async def get_trade_inbox(
+        limit_per_group: int = Query(10, ge=1, le=100),
+        window_hours: int = Query(36, ge=6, le=72),
+    ):
+        """Read-only grouped trader-review inbox over open paper trades."""
+        return await db.get_trade_inbox(
+            _db_path, limit_per_group=limit_per_group, window_hours=window_hours
         )
 
     @app.get("/api/trading/positions")
