@@ -275,6 +275,37 @@ export default function HealthTab() {
                   )}
                 </td>
               </tr>
+              {/* Round 21 — off-host shipping status from R20 /health fields.
+                  Tri-state: DISABLED (operator hasn't enabled — neutral grey)
+                  vs FRESH (configured + recent) vs STALE (configured + stale). */}
+              <tr>
+                <td style={{ fontWeight: 600 }}>Backup — off-host</td>
+                <td>
+                  {system.offhost_configured
+                    ? statusBadge(system.offhost_heartbeat_fresh, 'FRESH', 'STALE')
+                    : (
+                      <span
+                        style={{
+                          padding: '2px 8px',
+                          borderRadius: 4,
+                          background: '#333',
+                          color: '#aaa',
+                          fontSize: 11,
+                          fontWeight: 600,
+                        }}
+                      >
+                        DISABLED
+                      </span>
+                    )}
+                </td>
+                <td style={{ color: 'var(--color-text-secondary)' }}>
+                  {!system.offhost_configured
+                    ? 'set GECKO_OFFHOST_BACKUP_DEST to enable'
+                    : system.offhost_heartbeat_age_sec != null
+                      ? `last ok ${ageLabel(system.offhost_heartbeat_age_sec)}`
+                      : 'no successful runs yet'}
+                </td>
+              </tr>
             </tbody>
           </table>
         </div>
