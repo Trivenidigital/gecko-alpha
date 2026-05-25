@@ -54,18 +54,48 @@ def test_pipeline_config_resolved_includes_top_level_flags():
 
 
 def test_pipeline_config_resolved_does_not_log_secrets():
-    """Static guard: never log SECRET / TOKEN / API_KEY fields."""
-    src = inspect.getsource(scout_main.main)
-    # Find the pipeline_config_resolved block.
-    start = src.find('"pipeline_config_resolved"')
-    assert start != -1
-    # Block runs to next `logger.info(` or to end of function.
-    block_end = src.find("logger.info", start + 10)
-    block = src[start : block_end if block_end > 0 else start + 2000]
+    """Static guard via AST: never log SECRET / TOKEN / API_KEY fields.
+
+    Walks the AST for the pipeline_config_resolved Call node and checks
+    every kwarg name + every string-literal value for forbidden
+    substrings. Future kwarg additions cannot accidentally leak secrets.
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path(scout_main.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    # Find the specific logger.info("pipeline_config_resolved", ...) call.
+    target: ast.Call | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and node.args:
+            first = node.args[0]
+            if (
+                isinstance(first, ast.Constant)
+                and first.value == "pipeline_config_resolved"
+            ):
+                target = node
+                break
+    assert target is not None, "pipeline_config_resolved log call not found"
 
     forbidden_substrings = ["TOKEN", "SECRET", "API_KEY", "PASSWORD", "PRIVATE"]
-    for needle in forbidden_substrings:
-        assert needle not in block.upper(), (
-            f"pipeline_config_resolved block references {needle!r} — "
-            "config-summary log must NEVER include secret fields"
-        )
+    offenders: list[str] = []
+    for kw in target.keywords:
+        kw_name = (kw.arg or "").upper()
+        for needle in forbidden_substrings:
+            if needle in kw_name:
+                offenders.append(f"kwarg name {kw.arg!r}")
+        # Also check string-literal values inside getattr() calls.
+        if isinstance(kw.value, ast.Call):
+            for sub in ast.walk(kw.value):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    for needle in forbidden_substrings:
+                        if needle in sub.value.upper():
+                            offenders.append(
+                                f"literal {sub.value!r} in {kw.arg!r}"
+                            )
+    assert not offenders, (
+        "pipeline_config_resolved kwargs reference secret-shaped names: "
+        + ", ".join(offenders)
+    )
