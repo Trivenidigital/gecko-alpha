@@ -146,8 +146,8 @@ export default function NowTradableTab() {
                 </tr>
               </thead>
               <tbody>
-                {rows.map((r, idx) => (
-                  <tr key={idx}>
+                {rows.map((r) => (
+                  <tr key={r.token_id}>
                     <td>
                       <TokenLink tokenId={r.token_id} symbol={r.symbol || r.name} chain={r.chain} />
                       {r.name ? <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>{r.name}</div> : null}

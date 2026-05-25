@@ -258,6 +258,29 @@ def test_source_score_field_firewall_critical():
                for c in result.criticals)
 
 
+def test_duplicate_token_id_critical():
+    payload = _envelope(rows=[
+        _row(token_id="bitcoin", verdict="watch", actionable=1, would_be_live=0),
+        _row(token_id="bitcoin", verdict="blocked", actionable=0, would_be_live=1,
+             risk_reasons=["not_actionable"]),
+    ])
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("token_id must be unique" in c for c in result.criticals)
+
+
+def test_rows_not_sorted_critical():
+    ts = _now_iso()
+    rows = [
+        _row(token_id="zeta", verdict="watch", actionable=1, would_be_live=0, opened_at=ts),
+        _row(token_id="alpha", verdict="watch", actionable=1, would_be_live=0, opened_at=ts),
+    ]
+    payload = _envelope(rows=rows)
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("not sorted" in c for c in result.criticals)
+
+
 def test_counter_flags_severity_extreme_warning():
     payload = _envelope(rows=[_row(counter_flags=[
         {"flag": "x", "severity": "extreme", "detail": "test"}

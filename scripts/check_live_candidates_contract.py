@@ -228,6 +228,13 @@ EXPECTED_ROW_KEYS = frozenset({
 })
 ALLOWED_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 
+VERDICT_RANK = {
+    "candidate_review": 0,
+    "watch": 1,
+    "blocked": 2,
+    "data_insufficient": 3,
+}
+
 
 class Result:
     """Accumulator for contract checks."""
@@ -631,6 +638,33 @@ def validate_payload(payload, *, requested_limit: int = 20,
 
     for i, row in enumerate(rows):
         _check_row(row, i, result)
+
+    # Determinism + identity invariants are checked after the row schema checks
+    # so we can safely assume required fields exist with correct types.
+    token_ids = [r.get("token_id") for r in rows if isinstance(r, dict)]
+    if len(token_ids) != len(set(token_ids)):
+        result.critical("rows[*].token_id must be unique across the response")
+    else:
+        result.ok()
+
+    def _row_sort_key(r: dict) -> tuple:
+        verdict = r.get("verdict")
+        rank = VERDICT_RANK.get(verdict, 9)
+        dt = _parse_iso(r.get("opened_at"))
+        is_missing = dt is None
+        ts = dt.timestamp() if dt else 0.0
+        token_id = r.get("token_id") or ""
+        return (rank, is_missing, -ts, token_id)
+
+    # Rows must be sorted by the pinned total-order key.
+    keys = [_row_sort_key(r) for r in rows if isinstance(r, dict)]
+    if keys != sorted(keys):
+        result.critical(
+            "rows are not sorted by the pinned total-order key "
+            "(verdict_rank asc, opened_at desc null-last, token_id asc)"
+        )
+    else:
+        result.ok()
 
     # Recursive banned-language scan on the entire payload.
     # AC #11: applies uniformly regardless of verdict.

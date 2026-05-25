@@ -1,5 +1,24 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-25 — Live candidates determinism + contract delta
+
+**Status:** PR-READY (local commit). Goal: make `/api/live_candidates` deterministic (backend ordering + frontend keys) and extend the contract validator to enforce deterministic ordering + uniqueness.
+
+Workflow checklist:
+- [x] Drift-check (confirm current gaps vs V1 shipped)
+- [x] Plan drafted + reviewed by 2 parallel agents
+- [x] Design drafted + reviewed by 2 parallel agents
+- [x] Build (backend ordering + validator checks + UI keys)
+- [x] Focused verification (pytest + frontend build)
+- [ ] PR opened (blocked: GitHub creds unavailable in this sandbox)
+- [ ] PR reviewed by 2 parallel agents and folds applied
+
+Review notes (live):
+- Plan doc: `tasks/plan_live_candidates_determinism_contract_delta_2026_05_25.md`
+- Design doc: `tasks/design_live_candidates_determinism_contract_delta_2026_05_25.md`
+- Branch: `feat/live-candidates-determinism-contract-delta`
+- Commit: local branch tip after review folds
+
 ## Active Work: 2026-05-24 — Dashboard open-positions width fix
 
 **Status:** PR-READY. Goal: stop the Open Positions table from being horizontally cut off on wide screens by using the available left/right viewport space more effectively.
