@@ -133,49 +133,12 @@ def _clear_calibration_dryrun_date_for_tests() -> None:
     _last_calibration_dryrun_date = ""
 
 
-def _runtime_version() -> str:
-    """Return the gecko-alpha package version from importlib.metadata.
-
-    Returns the literal string ``"unknown"`` if metadata is unavailable
-    (e.g. running from a source checkout without editable-install). Never
-    raises — startup banner must not be able to fail-and-mask the rest of
-    the startup sequence.
-    """
-    try:
-        from importlib.metadata import PackageNotFoundError, version as _pkg_version
-
-        try:
-            return _pkg_version("gecko-alpha")
-        except PackageNotFoundError:
-            return "unknown"
-    except Exception:
-        return "unknown"
-
-
-def _runtime_git_sha() -> str:
-    """Return the short git SHA of the current checkout, or ``"unknown"``.
-
-    Cheap subprocess to ``git rev-parse --short HEAD``. Bounded to 2s so a
-    pathological repo state cannot block the pipeline startup. Returns
-    ``"unknown"`` on any failure (no git, not a repo, command timeout,
-    permission denied). Never raises — same rationale as
-    :func:`_runtime_version`.
-    """
-    import subprocess
-
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=2.0,
-            cwd=__file__.rsplit("/", 2)[0] if "/" in __file__ else None,
-            check=False,
-        )
-        sha = (proc.stdout or "").strip()
-        return sha or "unknown"
-    except Exception:
-        return "unknown"
+# Round 16: helpers moved to scout/version.py so scout/heartbeat.py can
+# import them without a main → heartbeat circular dependency. Backward-
+# compatible aliases retained for any in-tree caller still referencing
+# the private names.
+from scout.version import runtime_git_sha as _runtime_git_sha
+from scout.version import runtime_version as _runtime_version
 
 
 def _format_ingest_watchdog_event(event: IngestWatchdogEvent) -> str:

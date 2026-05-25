@@ -179,9 +179,17 @@ def _maybe_emit_heartbeat(settings) -> bool:
     if elapsed < settings.HEARTBEAT_INTERVAL_SECONDS:
         return False
     uptime_minutes = (now - _heartbeat_stats["started_at"]).total_seconds() / 60
+    # Round 16: include version + git_sha on every heartbeat. Operators
+    # can grep any heartbeat in the journal and see which commit was
+    # running when behavior diverged — cheaper than walking back to the
+    # nearest scanner_starting banner from PR #247.
+    from scout.version import runtime_git_sha, runtime_version
+
     logger.info(
         "heartbeat",
         uptime_minutes=round(uptime_minutes, 1),
+        version=runtime_version(),
+        git_sha=runtime_git_sha(),
         tokens_scanned=_heartbeat_stats["tokens_scanned"],
         candidates_promoted=_heartbeat_stats["candidates_promoted"],
         alerts_fired=_heartbeat_stats["alerts_fired"],
