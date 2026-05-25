@@ -72,7 +72,8 @@ Review:
 **Status:** SHIPPED-MERGED. Read-only `/api/live_candidates` shipped in
 `f81b63e` / PR #228; counter_flags rich-dict regression fixed in `db19e79` /
 PR #229. This entry remains as the operator-facing status anchor for the
-endpoint slice; frontend "Now Tradable" panel remains a separate follow-up.
+endpoint slice; dashboard "Now Tradable (V1)" + "Signal Trust (V1)" tabs merged
+in PR #239 (merge commit `050fe12b`) and remain visibility-only.
 
 Workflow checklist (mandatory for non-trivial work):
 - [x] Plan drafted + Hermes-first section included (`tasks/plan_live_decision_cockpit_v1_2026_05_23.md`)

@@ -70,10 +70,11 @@ These are **available** for Hermes invocations but not currently load-bearing fo
 | Gateway warning-only state | **Hermes (latent substrate)** | systemd active but no platforms enabled; reserved for future enrichment routing |
 | Backlog state / priority / pinning | **Operator memory + Codex** | `backlog.md` + `tasks/todo.md`; Hermes does not write/read backlog state |
 
-## What is still only planned (not in either system today)
+## Addendum (repo drift as of 2026-05-25)
 
-- **Frontend cockpit panel** — gated on `/api/live_candidates` 24-48h soak ending ~2026-05-25 (PR #228 + #229 deploy reference)
-- **Signal Trust Roadmap V1** — read-only signal-maturity registry; deferred per operator priority order
+- This snapshot was taken on 2026-05-23. Later repo history landed the frontend cockpit tabs:
+  - PR #239 merged (merge commit `050fe12b`) adds "Now Tradable (V1)" and "Signal Trust (V1)" tabs.
+- This addendum is **repo truth only**; it does not assert production deployment state.
 - **Hermes-side enrichment for candidate explanation** — explicitly captured as enrichment-only in cockpit V1 design; no current loader
 - **Gateway-routed message delivery** — gateway runs but warns "no platforms enabled"; Codex `scout/alerter.py` is the only delivery path today
 

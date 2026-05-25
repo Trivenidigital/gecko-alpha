@@ -2,13 +2,17 @@
 
 **Branch:** `codex/overnight-autonomous-closeout-20260523` (clean local clone)
 
+## Addendum (repo drift after 2026-05-23)
+
+- As of 2026-05-24, PR #239 merged (merge commit `050fe12b`) and adds dashboard tabs: "Now Tradable (V1)" and "Signal Trust (V1)" (repo truth; does not assert prod deployment).
+
 **New primitives introduced:**
 - `docs/superpowers/templates/*` + `docs/superpowers/templates/README.md` — reusable Gecko session templates
 - `docs/runbooks/gecko-autonomous-operating-model.md` — durable role map + operator gates + runtime truth sources
 - `scripts/report_autonomous_status.mjs` — read-only local status report generator (repo + docs + backlog state)
 - `docs/runbooks/autonomous-status-report.md` — operator-facing “how to run + interpret” for the status report
 - (Optional, read-only, docs-only) `docs/superpowers/registries/signal_trust_registry.v1.json` + `scripts/validate_signal_trust_registry.mjs` + `docs/runbooks/signal-trust-roadmap-v1.md`
-- (Deferred by sandbox constraints) Dashboard “Now Tradable” panel for `/api/live_candidates` — requires `npm ci && npm run build` and committing updated `dashboard/frontend/dist/` from a credentialed environment
+- (Historical note) Dashboard “Now Tradable” panel for `/api/live_candidates` required `npm ci && npm run build` and committing updated `dashboard/frontend/dist/` from a credentialed environment (later merged in PR #239; see addendum).
 
 ## Drift-check (in-tree reality)
 
