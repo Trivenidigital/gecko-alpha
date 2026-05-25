@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
-# gecko-backup-watchdog — alert if rotation hasn't run successfully in 48h.
+# gecko-backup-watchdog — alert if EITHER the rotation OR the create step
+# hasn't run successfully in 48h.
+#
+# Round 13 extension: Round 11 added a second heartbeat for the create
+# step (gecko-backup-create.sh writes /var/lib/.../create-last-ok after
+# integrity_check passes). The original watchdog only checked the rotate
+# heartbeat, leaving a blind spot: if create starts failing (sqlite3
+# missing, integrity check fail, disk full), rotate may STILL run
+# against an empty dir and update its own heartbeat — exactly the
+# pre-R11 pathology that left srilu with zero backups for weeks while
+# the watchdog stayed green. Checking BOTH heartbeats closes the gap.
 #
 # Telegram delivery path is direct via the bot HTTP API (not via
 # scout.alerter.send_telegram_message). Rationale per R6 PR review CRITICAL:
@@ -18,7 +28,15 @@
 
 set -euo pipefail
 
-HEARTBEAT_FILE="${GECKO_BACKUP_HEARTBEAT_FILE:-/var/lib/gecko-alpha/backup-rotation/backup-last-ok}"
+ROTATE_HEARTBEAT_FILE="${GECKO_BACKUP_HEARTBEAT_FILE:-/var/lib/gecko-alpha/backup-rotation/backup-last-ok}"
+# Round 13 — create-heartbeat is OPTIONAL (empty-default). The systemd
+# unit sets it explicitly in production via
+# GECKO_BACKUP_CREATE_HEARTBEAT_FILE; bare-CLI invocations and the
+# existing test suite (which only override the rotate heartbeat) skip
+# the create check via the empty-default below. To enable the
+# dual-check, set GECKO_BACKUP_CREATE_HEARTBEAT_FILE in the env or
+# systemd unit.
+CREATE_HEARTBEAT_FILE="${GECKO_BACKUP_CREATE_HEARTBEAT_FILE:-}"
 STALE_AFTER_SEC="${GECKO_BACKUP_STALE_AFTER_SEC:-172800}"  # 48h
 GECKO_REPO="${GECKO_REPO:-/root/gecko-alpha}"
 ENV_FILE="${GECKO_ENV_FILE:-$GECKO_REPO/.env}"
@@ -27,34 +45,69 @@ ENV_FILE="${GECKO_ENV_FILE:-$GECKO_REPO/.env}"
 UV_BIN="${UV_BIN:-}"
 
 now=$(date +%s)
-is_stale=0  # R6 NIT: initialize before branches to avoid set -u trap.
 
-if [[ ! -f "$HEARTBEAT_FILE" ]]; then
-    age_msg="heartbeat file MISSING ($HEARTBEAT_FILE)"
-    is_stale=1
-else
-    last_ok=$(cat "$HEARTBEAT_FILE" 2>/dev/null || true)
+# Returns "OK | STALE_MISSING | STALE_CORRUPT | STALE_AGE:<sec>" + age_sec
+# via stdout (single line). Caller parses.
+check_heartbeat() {
+    local file="$1"
+    if [[ ! -f "$file" ]]; then
+        echo "STALE_MISSING"
+        return
+    fi
+    local last_ok
+    last_ok=$(cat "$file" 2>/dev/null || true)
     # R5 + R6 CRITICAL: validate heartbeat content. Empty / non-numeric
     # (corrupt mid-write, manual `: > heartbeat`, fs full) must NOT die in
     # bash arithmetic — instead treat as MISSING and alert.
     if [[ ! "$last_ok" =~ ^[0-9]+$ ]]; then
-        age_msg="heartbeat file CORRUPT ($HEARTBEAT_FILE: $(printf '%q' "$last_ok"))"
-        is_stale=1
-    else
-        age_sec=$(( now - last_ok ))
-        age_msg="last_ok=${age_sec}s ago"
-        if (( age_sec > STALE_AFTER_SEC )); then
-            is_stale=1
-        fi
+        echo "STALE_CORRUPT:${last_ok}"
+        return
     fi
+    local age_sec=$(( now - last_ok ))
+    if (( age_sec > STALE_AFTER_SEC )); then
+        echo "STALE_AGE:${age_sec}"
+    else
+        echo "OK:${age_sec}"
+    fi
+}
+
+rotate_result="$(check_heartbeat "$ROTATE_HEARTBEAT_FILE")"
+if [[ -n "$CREATE_HEARTBEAT_FILE" ]]; then
+    create_result="$(check_heartbeat "$CREATE_HEARTBEAT_FILE")"
+else
+    create_result="SKIPPED"
 fi
 
+format_msg() {
+    local label="$1"
+    local file="$2"
+    local result="$3"
+    case "$result" in
+        OK:*)            echo "${label} last_ok=${result#OK:}s ago" ;;
+        STALE_MISSING)   echo "${label} heartbeat MISSING (${file})" ;;
+        STALE_CORRUPT:*) echo "${label} heartbeat CORRUPT (${file}: ${result#STALE_CORRUPT:})" ;;
+        STALE_AGE:*)     echo "${label} last_ok=${result#STALE_AGE:}s ago (STALE)" ;;
+        SKIPPED)         echo "${label} check skipped (env unset)" ;;
+        *)               echo "${label} UNKNOWN_RESULT=${result}" ;;
+    esac
+}
+
+rotate_msg="$(format_msg "rotate" "$ROTATE_HEARTBEAT_FILE" "$rotate_result")"
+create_msg="$(format_msg "create" "$CREATE_HEARTBEAT_FILE" "$create_result")"
+
+is_stale=0
+case "$rotate_result" in OK:*) ;; *) is_stale=1 ;; esac
+# SKIPPED is intentionally NOT treated as stale — see CREATE_HEARTBEAT_FILE comment.
+case "$create_result" in OK:*|SKIPPED) ;; *) is_stale=1 ;; esac
+
+age_msg="${rotate_msg}; ${create_msg}"
+
 if (( is_stale == 0 )); then
-    echo "OK: gecko-backup-rotate ran within ${STALE_AFTER_SEC}s ($age_msg)"
+    echo "OK: gecko-backup heartbeats both fresh within ${STALE_AFTER_SEC}s — ${age_msg}"
     exit 0
 fi
 
-echo "STALE: gecko-backup-rotate has not run successfully — $age_msg"
+echo "STALE: gecko-backup heartbeat check FAILED — ${age_msg}"
 
 # --- Alert delivery ---------------------------------------------------------
 
@@ -80,7 +133,7 @@ if [[ -z "$TELEGRAM_CHAT_ID" || "$TELEGRAM_CHAT_ID" == "placeholder" ]]; then
     exit 5
 fi
 
-TEXT="⚠️ gecko-backup-watchdog: rotation stale — ${age_msg}. Check journalctl -u gecko-backup.service."
+TEXT="⚠️ gecko-backup-watchdog: heartbeat stale — ${age_msg}. Check journalctl -u gecko-backup.service."
 
 PYTHON_BIN="$(command -v python3 || command -v python || true)"
 if [[ -z "$PYTHON_BIN" ]]; then

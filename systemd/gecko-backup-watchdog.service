@@ -9,6 +9,12 @@ User=root
 Group=root
 Environment=GECKO_BACKUP_STALE_AFTER_SEC=172800
 Environment=GECKO_BACKUP_HEARTBEAT_FILE=/var/lib/gecko-alpha/backup-rotation/backup-last-ok
+# Round 13 — also monitor the create-step heartbeat from R11's
+# gecko-backup-create.sh. Without this, a silently-failing producer
+# (sqlite3 missing, integrity_check fail, disk full) leaves the rotate
+# heartbeat green while no actual backup exists — the exact pre-R11
+# pathology that left srilu with zero backups for weeks.
+Environment=GECKO_BACKUP_CREATE_HEARTBEAT_FILE=/var/lib/gecko-alpha/backup-rotation/create-last-ok
 Environment=GECKO_REPO=/root/gecko-alpha
 Environment=HOME=/root
 Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
