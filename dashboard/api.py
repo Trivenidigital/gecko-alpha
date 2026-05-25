@@ -1210,6 +1210,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "latest_backup_age_sec": None,
             "latest_backup_fresh": False,
             "latest_backup_size_bytes": None,
+            # Round 20 — off-host backup status. R18 confirms local
+            # files exist, but VPS filesystem destruction wipes
+            # everything (live DB + .bak files together). The off-host
+            # script ships the newest backup elsewhere; this triplet
+            # surfaces whether that lane is running.
+            "offhost_configured": False,
+            "offhost_heartbeat_age_sec": None,
+            "offhost_heartbeat_fresh": False,
         }
         now_ts = datetime.now(timezone.utc).timestamp()
         for env_key, age_key, fresh_key, default_path in (
@@ -1268,6 +1276,29 @@ def create_app(db_path: str | None = None) -> FastAPI:
             # Backup dir missing / unreadable — leave defaults so
             # uptime monitors alert on backup_file_count=0.
             pass
+
+        # Round 20 — off-host heartbeat. `configured` separates
+        # "operator hasn't enabled this" (False) from "enabled but
+        # stale" (True + fresh=False). Treating unconfigured as fresh
+        # would mask a regression where the env was unset by accident.
+        if os.environ.get("GECKO_OFFHOST_BACKUP_DEST", "").strip():
+            backup_status["offhost_configured"] = True
+            offhost_hb = Path(
+                os.environ.get(
+                    "GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE",
+                    "/var/lib/gecko-alpha/backup-rotation/offhost-last-ok",
+                )
+            )
+            try:
+                raw = offhost_hb.read_text(encoding="utf-8").strip()
+                ts = int(raw)
+                age = int(now_ts - ts)
+                backup_status["offhost_heartbeat_age_sec"] = age
+                backup_status["offhost_heartbeat_fresh"] = age <= stale_after_sec
+            except (FileNotFoundError, ValueError, OSError):
+                # Missing / corrupt heartbeat with the env enabled is
+                # an alert-worthy state — leave age=None, fresh=False.
+                pass
 
         return {
             "status": "ok" if db_ok else "degraded",
