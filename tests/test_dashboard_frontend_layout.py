@@ -52,6 +52,9 @@ def test_trade_inbox_tab_is_wired_to_dashboard():
     assert "Counter-risk context" in tab
     assert "Counter-risk unavailable" in tab
     assert "counterRiskText(row)" in tab
+    assert "trade[\\s_-]*now" in tab
+    assert "watch[\\s_-]*breakout" in tab
+    assert "return ''" in tab
     without_counter_block = re.sub(
         r"function counterRiskText\(row\).*?^}",
         "",

@@ -82,7 +82,11 @@ function flagText(flag) {
       text = `${primary}: ${detail}`
     }
   }
-  return text.trim().slice(0, 80)
+  const trimmed = text.trim().slice(0, 80)
+  if (/(?:\bhigh\b|\blow\b|\burgent\b|\balert\b|trade[\s_-]*now|watch[\s_-]*breakout|research[\s_-]*only)/i.test(trimmed)) {
+    return ''
+  }
+  return trimmed
 }
 
 function counterRiskText(row) {
