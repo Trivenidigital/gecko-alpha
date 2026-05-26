@@ -26,10 +26,20 @@ export default function SignalTrustTab() {
   const [scorecards, setScorecards] = useState(null)
   const [scorecardsError, setScorecardsError] = useState(null)
 
+  const currencyFmt0 = useMemo(
+    () => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }),
+    []
+  )
+  const currencyFmt2 = useMemo(
+    () => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }),
+    []
+  )
+
   const fetchNow = useCallback(async () => {
     setLoading(true)
     setError(null)
     setScorecardsError(null)
+    setScorecards(null)
     try {
       const res = await fetch('/api/signal_trust_registry')
       const data = await res.json()
@@ -136,7 +146,7 @@ export default function SignalTrustTab() {
               </thead>
               <tbody>
                 {entries.map((e, idx) => (
-                  <tr key={e.signal_type || idx}>
+                  <tr key={`${e.signal_type || 'unknown'}:${idx}`}>
                     <td style={{ fontWeight: 700 }}>{e.signal_type || '-'}</td>
                     <td style={{ fontSize: 12 }}>{e.maturity_state || '-'}</td>
                     <td style={{ fontSize: 12, color: 'var(--color-text-secondary)', maxWidth: 520 }}>
@@ -165,7 +175,11 @@ export default function SignalTrustTab() {
             </div>
           ) : null}
         </div>
-        {scRows.length === 0 ? (
+        {scorecardsError ? (
+          <div className="empty-state" style={{ padding: 16 }}>
+            Scorecards unavailable (see error above). Visibility-only.
+          </div>
+        ) : scRows.length === 0 ? (
           <div className="empty-state" style={{ padding: 16 }}>
             No scorecards rows (DB may be missing or empty). Visibility-only.
           </div>
@@ -189,21 +203,25 @@ export default function SignalTrustTab() {
                   const w14 = win(14)
                   const w30 = win(30)
                   const fmt = (w) => {
-                    if (!w || !w.closed) return '–'
+                    if (!w || !w.closed) return '—'
                     const n = w.closed.closed_n ?? 0
+                    if (n === 0) return '—'
                     const wr = w.closed.win_rate_pct ?? 0
                     const pnl = w.closed.total_pnl_usd ?? 0
                     const warns = Array.isArray(w.warnings) && w.warnings.length ? ` (${w.warnings.join(',')})` : ''
-                    return `n=${n} wr=${wr}% pnl=$${pnl}${warns}`
+                    const wrTxt = Number.isFinite(wr) ? `${Math.round(wr)}%` : '—'
+                    const pnlTxt = Number.isFinite(pnl) ? currencyFmt2.format(pnl) : '—'
+                    return `n=${n} wr=${wrTxt} pnl=${pnlTxt}${warns}`
                   }
-                  const maturity = r.registry?.maturity_state || '–'
+                  const maturity = r.registry?.maturity_state || '—'
                   const openCount = r.open?.open_count ?? 0
                   const openExp = r.open?.open_exposure_usd ?? 0
+                  const openExpTxt = Number.isFinite(openExp) ? currencyFmt0.format(openExp) : '—'
                   return (
                     <tr key={r.signal_type}>
                       <td style={{ fontWeight: 700 }}>{r.signal_type}</td>
                       <td style={{ fontSize: 12 }}>{maturity}</td>
-                      <td style={{ fontSize: 12 }}>{`n=${openCount} $${openExp}`}</td>
+                      <td style={{ fontSize: 12 }}>{`n=${openCount} ${openExpTxt}`}</td>
                       <td style={{ fontSize: 12 }}>{fmt(w7)}</td>
                       <td style={{ fontSize: 12 }}>{fmt(w14)}</td>
                       <td style={{ fontSize: 12 }}>{fmt(w30)}</td>

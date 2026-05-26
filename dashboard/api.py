@@ -404,6 +404,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 headers={**headers, "Retry-After": "60"},
                 content={
                     "meta": meta,
+                    "rows": payload.get("rows") or [],
                     "error": payload.get("error")
                     or {
                         "code": "unknown",
