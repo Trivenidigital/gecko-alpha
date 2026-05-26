@@ -29,6 +29,74 @@ function fmtIso(iso) {
   }
 }
 
+function riskBucket(score) {
+  const n = Number(score)
+  if (!Number.isFinite(n)) return null
+  if (n < 30) return 'low'
+  if (n <= 60) return 'mid'
+  return 'high'
+}
+
+function normalizeCounterFlags(v) {
+  if (!v || !Array.isArray(v)) return []
+  const out = []
+  for (const item of v) {
+    if (typeof item === 'string') {
+      const label = item.trim()
+      if (label) out.push({ label, severity: null, detail: null })
+      continue
+    }
+    if (item && typeof item === 'object') {
+      const label = typeof item.flag === 'string' ? item.flag.trim() : ''
+      if (!label) continue
+      const severity =
+        item.severity === 'high' || item.severity === 'medium' || item.severity === 'low'
+          ? item.severity
+          : null
+      const detail = typeof item.detail === 'string' ? item.detail : null
+      out.push({ label, severity, detail })
+    }
+  }
+  const sevRank = { high: 0, medium: 1, low: 2, null: 3 }
+  out.sort((a, b) => {
+    const ar = sevRank[a.severity ?? 'null'] ?? 3
+    const br = sevRank[b.severity ?? 'null'] ?? 3
+    if (ar !== br) return ar - br
+    return String(a.label).localeCompare(String(b.label))
+  })
+  return out
+}
+
+function renderCounterRiskCell(row) {
+  const score = row?.counter_risk_score
+  const bucket = riskBucket(score)
+  const flags = normalizeCounterFlags(row?.counter_flags)
+  const scoreOk = Number.isFinite(Number(score))
+  const showScore = scoreOk && bucket
+  const showFlags = flags.length > 0
+  if (!showScore && !showFlags) return <span style={{ color: 'var(--color-text-secondary)' }}>-</span>
+
+  const tooltip = [
+    showScore ? `Counter-risk (enrichment-only; does not change verdict): ${Number(score).toFixed(0)}` : null,
+    flags.length
+      ? `Flags: ${flags.map(f => (f.detail ? `${f.label} — ${f.detail}` : f.label)).slice(0, 20).join(' | ')}`
+      : null,
+  ].filter(Boolean).join('\n')
+
+  return (
+    <span className="cr-cell" title={tooltip}>
+      {showScore ? (
+        <span className={`risk-badge ${bucket}`}>CR {Number(score).toFixed(0)}</span>
+      ) : null}
+      {showFlags ? (
+        <span className="flag-badge neutral" style={{ marginLeft: showScore ? 6 : 0 }}>
+          +{flags.length}
+        </span>
+      ) : null}
+    </span>
+  )
+}
+
 function summarizePriceFreshness(rows) {
   const times = rows.map(r => r?.price_updated_at).filter(Boolean).map(t => new Date(t).getTime()).filter(Number.isFinite)
   if (times.length === 0) return 'price_updated_at: n/a'
@@ -141,6 +209,7 @@ export default function NowTradableTab() {
                   <th>From Entry</th>
                   <th>Entry</th>
                   <th>Verdict</th>
+                  <th title="Counter-risk (enrichment-only; does not change verdict).">CR</th>
                   <th>Price Updated</th>
                   <th>Reasons</th>
                 </tr>
@@ -159,11 +228,14 @@ export default function NowTradableTab() {
                     </td>
                     <td style={{ fontSize: 12 }}>{r.entry_quality || '-'}</td>
                     <td style={{ fontSize: 12, fontWeight: 700 }}>{r.verdict || '-'}</td>
+                    <td style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                      {renderCounterRiskCell(r)}
+                    </td>
                     <td style={{ fontSize: 12 }}>
                       {fmtIso(r.price_updated_at)} {r.price_is_stale ? <span style={{ color: 'var(--color-accent-amber)' }}>(stale)</span> : null}
                     </td>
                     <td style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
-                      {[...(r.inclusion_reasons || []), ...(r.risk_reasons || [])].slice(0, 6).join(' · ') || '-'}
+                      {[...(r.inclusion_reasons || []), ...((r.risk_reasons || []).filter(x => x !== 'counter_risk_present_display_only_v1'))].slice(0, 6).join(' · ') || '-'}
                     </td>
                   </tr>
                 ))}

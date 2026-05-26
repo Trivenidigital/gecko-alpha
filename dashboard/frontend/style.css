@@ -185,6 +185,54 @@ body {
   border-bottom: none;
 }
 
+.risk-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  background: var(--color-bar-bg);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+.risk-badge.low {
+  background: rgba(29, 158, 117, 0.20);
+  color: var(--color-accent-green);
+}
+
+.risk-badge.mid {
+  background: rgba(210, 153, 34, 0.20);
+  color: var(--color-accent-amber);
+}
+
+.risk-badge.high {
+  background: rgba(248, 81, 73, 0.16);
+  color: var(--color-accent-red);
+}
+
+.flag-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 700;
+  background: var(--color-bar-bg);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+.flag-badge.neutral {
+  opacity: 0.9;
+}
+
+.cr-cell {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
 .open-positions-scroll {
   overflow-x: auto;
 }
