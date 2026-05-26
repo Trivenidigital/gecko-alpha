@@ -28,9 +28,21 @@ Review notes:
 Follow-up filed 2026-05-26:
 - [ ] **BL-NEW-GAINERS-EARLY-2026-05-19-AUTOSUSPEND-ATTRIBUTION**: before building tracker-to-inbox promotion, attribute why `gainers_early` moved from 2026-05-13 KEEP-ON (`+$1,894`, `n=128`, `72.7%` win rate) to 2026-05-19 hard-loss auto-suspension. Separate real regime shift, hard-loss gate over-fire, code/config change, and distorted data path. This does not block PR #277, but should shape the build PR framing.
 
+## Active Work: 2026-05-26 â€” Now Tradable counter-risk badges
+
+**Status:** PR OPEN (#278). Goal: surface `counter_risk_score` + `counter_flags` in the Now Tradable (V1) cockpit table to reduce cross-tab context switching.
+
+Workflow checklist:
+- [x] Drift-check: backend already exports fields; UI does not render them.
+- [x] Plan drafted + reviewed by 2 parallel agents: `tasks/plan_now_tradable_counter_risk_badges_2026_05_26.md`
+- [x] Design drafted + reviewed by 2 parallel agents: `tasks/design_now_tradable_counter_risk_badges_2026_05_26.md`
+- [x] Build: add narrow CR column + tooltip flags; rebuild frontend dist.
+- [x] PR opened: #278 (`feat(dashboard): show counter-risk badges in Now Tradable`)
+- [ ] PR reviewed by 2 parallel agents and folds applied
+
 ## Active Work: 2026-05-25 — Live candidates determinism + contract delta
 
-**Status:** PR-READY (local commit). Goal: make `/api/live_candidates` deterministic (backend ordering + frontend keys) and extend the contract validator to enforce deterministic ordering + uniqueness.
+**Status:** SHIPPED-MERGED (drift-closed). Goal: make `/api/live_candidates` deterministic (backend ordering + frontend keys) and extend the contract validator to enforce deterministic ordering + uniqueness.
 
 Workflow checklist:
 - [x] Drift-check (confirm current gaps vs V1 shipped)
@@ -38,8 +50,8 @@ Workflow checklist:
 - [x] Design drafted + reviewed by 2 parallel agents
 - [x] Build (backend ordering + validator checks + UI keys)
 - [x] Focused verification (pytest + frontend build)
-- [ ] PR opened (blocked: GitHub creds unavailable in this sandbox)
-- [ ] PR reviewed by 2 parallel agents and folds applied
+- [x] PR opened
+- [x] PR reviewed by 2 parallel agents and folds applied
 
 Review notes (live):
 - Plan doc: `tasks/plan_live_candidates_determinism_contract_delta_2026_05_25.md`
