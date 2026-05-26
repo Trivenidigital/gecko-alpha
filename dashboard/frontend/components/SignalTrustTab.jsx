@@ -23,10 +23,13 @@ export default function SignalTrustTab() {
   const [payload, setPayload] = useState(null)
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(false)
+  const [scorecards, setScorecards] = useState(null)
+  const [scorecardsError, setScorecardsError] = useState(null)
 
   const fetchNow = useCallback(async () => {
     setLoading(true)
     setError(null)
+    setScorecardsError(null)
     try {
       const res = await fetch('/api/signal_trust_registry')
       const data = await res.json()
@@ -36,6 +39,22 @@ export default function SignalTrustTab() {
         throw new Error(msg)
       }
       setPayload(data)
+
+      // Scorecards are best-effort: registry may exist even when DB tables are missing.
+      try {
+        const sc = await fetch('/api/signal_trust/scorecards')
+        const scData = await sc.json()
+        if (!sc.ok) {
+          const msg2 = scData?.error?.message || scData?.detail || `HTTP ${sc.status}`
+          setScorecards(null)
+          setScorecardsError(msg2)
+        } else {
+          setScorecards(scData)
+        }
+      } catch (e2) {
+        setScorecards(null)
+        setScorecardsError(String(e2 && e2.message ? e2.message : e2))
+      }
     } catch (e) {
       setError(String(e && e.message ? e.message : e))
     } finally {
@@ -50,6 +69,8 @@ export default function SignalTrustTab() {
   const meta = payload?.meta || {}
   const registry = payload?.registry || null
   const entries = Array.isArray(registry?.entries) ? registry.entries : []
+  const scRows = Array.isArray(scorecards?.rows) ? scorecards.rows : []
+  const scMeta = scorecards?.meta || {}
 
   const banner = useMemo(() => {
     const parts = [
@@ -115,7 +136,7 @@ export default function SignalTrustTab() {
               </thead>
               <tbody>
                 {entries.map((e, idx) => (
-                  <tr key={idx}>
+                  <tr key={e.signal_type || idx}>
                     <td style={{ fontWeight: 700 }}>{e.signal_type || '-'}</td>
                     <td style={{ fontSize: 12 }}>{e.maturity_state || '-'}</td>
                     <td style={{ fontSize: 12, color: 'var(--color-text-secondary)', maxWidth: 520 }}>
@@ -126,6 +147,69 @@ export default function SignalTrustTab() {
                     </td>
                   </tr>
                 ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div className="panel" style={{ marginTop: 16 }}>
+        <div className="panel-header">Scorecards (read-only)</div>
+        <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', fontSize: 12 }}>
+          <div>
+            windows_days={Array.isArray(scMeta.windows_days) ? scMeta.windows_days.join(',') : '?'} {scMeta.generated_at ? `generated_at=${scMeta.generated_at}` : ''}
+          </div>
+          {scorecardsError ? (
+            <div style={{ marginTop: 8, color: 'var(--color-accent-amber)' }}>
+              Scorecards error: {scorecardsError}
+            </div>
+          ) : null}
+        </div>
+        {scRows.length === 0 ? (
+          <div className="empty-state" style={{ padding: 16 }}>
+            No scorecards rows (DB may be missing or empty). Visibility-only.
+          </div>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table className="candidates-table">
+              <thead>
+                <tr>
+                  <th>Signal</th>
+                  <th>Maturity</th>
+                  <th>Open</th>
+                  <th>7d</th>
+                  <th>14d</th>
+                  <th>30d</th>
+                </tr>
+              </thead>
+              <tbody>
+                {scRows.map((r) => {
+                  const win = (days) => (Array.isArray(r.windows) ? r.windows.find(w => w.days === days) : null)
+                  const w7 = win(7)
+                  const w14 = win(14)
+                  const w30 = win(30)
+                  const fmt = (w) => {
+                    if (!w || !w.closed) return '–'
+                    const n = w.closed.closed_n ?? 0
+                    const wr = w.closed.win_rate_pct ?? 0
+                    const pnl = w.closed.total_pnl_usd ?? 0
+                    const warns = Array.isArray(w.warnings) && w.warnings.length ? ` (${w.warnings.join(',')})` : ''
+                    return `n=${n} wr=${wr}% pnl=$${pnl}${warns}`
+                  }
+                  const maturity = r.registry?.maturity_state || '–'
+                  const openCount = r.open?.open_count ?? 0
+                  const openExp = r.open?.open_exposure_usd ?? 0
+                  return (
+                    <tr key={r.signal_type}>
+                      <td style={{ fontWeight: 700 }}>{r.signal_type}</td>
+                      <td style={{ fontSize: 12 }}>{maturity}</td>
+                      <td style={{ fontSize: 12 }}>{`n=${openCount} $${openExp}`}</td>
+                      <td style={{ fontSize: 12 }}>{fmt(w7)}</td>
+                      <td style={{ fontSize: 12 }}>{fmt(w14)}</td>
+                      <td style={{ fontSize: 12 }}>{fmt(w30)}</td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
