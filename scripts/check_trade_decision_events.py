@@ -18,7 +18,7 @@ from pathlib import Path
 
 def _iso_cutoff(minutes: float) -> str:
     return (
-        datetime.now(timezone.utc)
+        (datetime.now(timezone.utc) - timedelta(minutes=minutes))
         .replace(microsecond=0)
         .replace(tzinfo=None)
         .isoformat(sep=" ")

@@ -3,7 +3,12 @@
   "experimental": true,
   "visibility_only": true,
   "not_for_pruning": true,
+  "not_for_suppression": true,
   "not_for_auto_disable": true,
+  "not_for_sizing": true,
+  "not_for_execution": true,
+  "not_for_alerting": true,
+  "not_for_source_ranking": true,
   "notes": "Read-only registry for operator visibility. This file is not consumed by production logic and must not be used for pruning, suppression, auto-disable, sizing, or live execution decisions.",
   "maturity_states": [
     "trusted_experimental",
@@ -22,7 +27,12 @@
       "operator_gate": [
         "visibility_only",
         "not_for_pruning",
-        "not_for_auto_disable"
+        "not_for_suppression",
+        "not_for_auto_disable",
+        "not_for_sizing",
+        "not_for_execution",
+        "not_for_alerting",
+        "not_for_source_ranking"
       ],
       "next_gate": {
         "type": "runtime_state_verification_required",
@@ -38,7 +48,12 @@
       "operator_gate": [
         "visibility_only",
         "not_for_pruning",
-        "not_for_auto_disable"
+        "not_for_suppression",
+        "not_for_auto_disable",
+        "not_for_sizing",
+        "not_for_execution",
+        "not_for_alerting",
+        "not_for_source_ranking"
       ],
       "next_gate": {
         "type": "runtime_state_verification_required",
@@ -54,7 +69,12 @@
       "operator_gate": [
         "visibility_only",
         "not_for_pruning",
-        "not_for_auto_disable"
+        "not_for_suppression",
+        "not_for_auto_disable",
+        "not_for_sizing",
+        "not_for_execution",
+        "not_for_alerting",
+        "not_for_source_ranking"
       ],
       "next_gate": {
         "type": "design_and_runtime_verification_required",
@@ -70,7 +90,12 @@
       "operator_gate": [
         "visibility_only",
         "not_for_pruning",
-        "not_for_auto_disable"
+        "not_for_suppression",
+        "not_for_auto_disable",
+        "not_for_sizing",
+        "not_for_execution",
+        "not_for_alerting",
+        "not_for_source_ranking"
       ],
       "next_gate": {
         "type": "price_coverage_unlock_required",
@@ -86,7 +111,12 @@
       "operator_gate": [
         "visibility_only",
         "not_for_pruning",
-        "not_for_auto_disable"
+        "not_for_suppression",
+        "not_for_auto_disable",
+        "not_for_sizing",
+        "not_for_execution",
+        "not_for_alerting",
+        "not_for_source_ranking"
       ],
       "next_gate": {
         "type": "price_coverage_unlock_required",
@@ -102,7 +132,12 @@
       "operator_gate": [
         "visibility_only",
         "not_for_pruning",
-        "not_for_auto_disable"
+        "not_for_suppression",
+        "not_for_auto_disable",
+        "not_for_sizing",
+        "not_for_execution",
+        "not_for_alerting",
+        "not_for_source_ranking"
       ],
       "next_gate": {
         "type": "time_and_data_bound_gate",

@@ -224,8 +224,17 @@ class SignalTrustScorecardsMeta(BaseModel):
     ok: bool = True
     read_only: bool = True
     not_for_pruning: bool = True
+    not_for_suppression: bool = True
     not_for_auto_disable: bool = True
+    not_for_sizing: bool = True
+    not_for_execution: bool = True
+    not_for_alerting: bool = True
+    not_for_source_ranking: bool = True
     experimental: bool = True
+    visibility_only: bool = True
+    not_live_eligibility_verdict: bool = True
+    cohort_policy: str = "full_closed_paper_trades"
+    sort_policy: str = "signal_type_asc_not_ranked"
     generated_at: str
     windows_days: list[int] = Field(default_factory=list)
     data_missing_reason: str | None = None

@@ -109,6 +109,7 @@ export default function SignalTrustTab() {
           <div style={{ marginBottom: 8 }}>
             {gateBadge('visibility_only')}
             {gateBadge('not_for_pruning')}
+            {gateBadge('not_for_alerting')}
             {gateBadge('not_for_auto_disable')}
           </div>
           <div>{banner}</div>
@@ -164,10 +165,13 @@ export default function SignalTrustTab() {
       </div>
 
       <div className="panel" style={{ marginTop: 16 }}>
-        <div className="panel-header">Scorecards (read-only)</div>
+        <div className="panel-header">Closed paper-trade evidence (read-only)</div>
         <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', fontSize: 12 }}>
           <div>
-            windows_days={Array.isArray(scMeta.windows_days) ? scMeta.windows_days.join(',') : '?'} {scMeta.generated_at ? `generated_at=${scMeta.generated_at}` : ''}
+            read_only={String(scMeta.read_only ?? '?')} not_for_pruning={String(scMeta.not_for_pruning ?? '?')} not_for_auto_disable={String(scMeta.not_for_auto_disable ?? '?')} not_live_eligibility_verdict={String(scMeta.not_live_eligibility_verdict ?? '?')}
+          </div>
+          <div style={{ marginTop: 4 }}>
+            cohort={scMeta.cohort_policy || 'full_closed_paper_trades'} sort={scMeta.sort_policy || 'signal_type_asc_not_ranked'} windows_days={Array.isArray(scMeta.windows_days) ? scMeta.windows_days.join(',') : '?'} {scMeta.generated_at ? `generated_at=${scMeta.generated_at}` : ''}
           </div>
           {scorecardsError ? (
             <div style={{ marginTop: 8, color: 'var(--color-accent-amber)' }}>
@@ -191,9 +195,9 @@ export default function SignalTrustTab() {
                   <th>Signal</th>
                   <th>Maturity</th>
                   <th>Open</th>
-                  <th>7d</th>
-                  <th>14d</th>
-                  <th>30d</th>
+                  <th>7d closed paper</th>
+                  <th>14d closed paper</th>
+                  <th>30d closed paper</th>
                 </tr>
               </thead>
               <tbody>
@@ -211,7 +215,7 @@ export default function SignalTrustTab() {
                     const warns = Array.isArray(w.warnings) && w.warnings.length ? ` (${w.warnings.join(',')})` : ''
                     const wrTxt = Number.isFinite(wr) ? `${Math.round(wr)}%` : '—'
                     const pnlTxt = Number.isFinite(pnl) ? currencyFmt2.format(pnl) : '—'
-                    return `n=${n} wr=${wrTxt} pnl=${pnlTxt}${warns}`
+                    return `n=${n} win=${wrTxt} pnl=${pnlTxt}${warns}`
                   }
                   const maturity = r.registry?.maturity_state || '—'
                   const openCount = r.open?.open_count ?? 0

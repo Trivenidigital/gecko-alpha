@@ -44,3 +44,20 @@ def test_trade_inbox_tab_is_wired_to_dashboard():
     assert "previous_group" in tab
     assert "function rowStatus" in tab
     assert "10 * 60 * 1000" in tab
+
+
+def test_committed_dashboard_dist_references_existing_signal_trust_bundle():
+    index_html = (ROOT / "dashboard" / "frontend" / "dist" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    matches = re.findall(r'src="/assets/([^"]+\.js)"', index_html)
+    assert matches
+
+    bundle_text = ""
+    for asset in matches:
+        path = ROOT / "dashboard" / "frontend" / "dist" / "assets" / asset
+        assert path.is_file(), f"dist bundle referenced by index.html is missing: {asset}"
+        bundle_text += path.read_text(encoding="utf-8", errors="ignore")
+
+    assert "/api/signal_trust/scorecards" in bundle_text
+    assert "Closed paper-trade evidence" in bundle_text

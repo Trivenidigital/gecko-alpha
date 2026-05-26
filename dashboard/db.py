@@ -4,8 +4,6 @@ import json
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-import os
 
 import aiosqlite
 import structlog
@@ -1055,10 +1053,10 @@ def _trade_window_state(row: dict) -> str:
 
 def _trade_block_reason(row: dict) -> str | None:
     if row.get("current_price") is None or row.get("pct_from_entry") is None:
-        if (
-            row.get("current_price") is not None
-            and "detected_price_missing_or_invalid"
-            in set(row.get("risk_reasons") or [])
+        if row.get(
+            "current_price"
+        ) is not None and "detected_price_missing_or_invalid" in set(
+            row.get("risk_reasons") or []
         ):
             return "DATA_INSUFFICIENT"
         return "NO_PRICE"
@@ -2433,7 +2431,14 @@ def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-async def get_signal_trust_scorecards(db_path: str) -> dict:
+def _is_missing_column(err: aiosqlite.OperationalError, names: tuple[str, ...]) -> bool:
+    msg = str(err).lower()
+    return "no such column" in msg and any(name.lower() in msg for name in names)
+
+
+async def get_signal_trust_scorecards(
+    db_path: str, registry_entries: list[dict] | None = None
+) -> dict:
     """Read-only scorecards joining trust registry + paper_trades cohort evidence.
 
     V1 contract:
@@ -2484,8 +2489,17 @@ async def get_signal_trust_scorecards(db_path: str) -> dict:
                         "ok": False,
                         "read_only": True,
                         "not_for_pruning": True,
+                        "not_for_suppression": True,
                         "not_for_auto_disable": True,
+                        "not_for_sizing": True,
+                        "not_for_execution": True,
+                        "not_for_alerting": True,
+                        "not_for_source_ranking": True,
                         "experimental": True,
+                        "visibility_only": True,
+                        "not_live_eligibility_verdict": True,
+                        "cohort_policy": "full_closed_paper_trades",
+                        "sort_policy": "signal_type_asc_not_ranked",
                         "generated_at": generated_at,
                         "windows_days": windows_days,
                         "data_missing_reason": "paper_trades_missing",
@@ -2497,18 +2511,16 @@ async def get_signal_trust_scorecards(db_path: str) -> dict:
                     },
                 }
 
-            # Other OE (missing column, etc.) should degrade later; leave open stats empty.
-            open_by_signal = {}
+            log.warning("signal_trust_scorecards_open_query_failed", err=str(e))
+            raise
 
         # Discover any signal_types present in closed rows (helps union-of-keys).
         try:
-            cursor2 = await db.execute(
-                """SELECT DISTINCT signal_type
+            cursor2 = await db.execute("""SELECT DISTINCT signal_type
                      FROM paper_trades
                     WHERE closed_at IS NOT NULL
                       AND status!='open'
-                    LIMIT 5000"""
-            )
+                    LIMIT 5000""")
             for r in await cursor2.fetchall():
                 st = r["signal_type"]
                 if st:
@@ -2544,19 +2556,13 @@ async def get_signal_trust_scorecards(db_path: str) -> dict:
                 )
                 stamp_rows = await cursor3.fetchall()
             except aiosqlite.OperationalError as e:
-                msg = str(e).lower()
-                if "no such column" in msg and (
-                    "actionable" in msg or "would_be_live" in msg
-                ):
+                if _is_missing_column(e, ("actionable", "would_be_live")):
                     stamps_available = False
                     stamps_reason = "stamps_unavailable"
                     stamp_by_window = {}
                     break
-                # Unknown OE: treat as stamps unavailable rather than breaking dashboard.
-                stamps_available = False
-                stamps_reason = "stamps_unavailable"
-                stamp_by_window = {}
-                break
+                log.warning("signal_trust_scorecards_stamp_query_failed", err=str(e))
+                raise
 
             by_signal: dict[str, dict] = {}
             for r in stamp_rows:
@@ -2622,25 +2628,8 @@ async def get_signal_trust_scorecards(db_path: str) -> dict:
             }
         closed_stats_by_window[days] = by_signal
 
-    # Registry: load from shipped JSON file (same as /api/signal_trust_registry).
-    registry_path = os.environ.get("GECKO_SIGNAL_TRUST_REGISTRY_PATH")
-    if not registry_path:
-        registry_path = str(
-            Path(__file__).resolve().parent.parent
-            / "docs"
-            / "superpowers"
-            / "registries"
-            / "signal_trust_registry.v1.json"
-        )
-    try:
-        doc = json.loads(Path(registry_path).read_text(encoding="utf-8"))
-        entries = doc.get("entries") if isinstance(doc, dict) else None
-        entry_list = entries if isinstance(entries, list) else []
-    except Exception:
-        entry_list = []
-
     registry_by_signal: dict[str, dict] = {}
-    for e in entry_list:
+    for e in registry_entries or []:
         if not isinstance(e, dict):
             continue
         st = e.get("signal_type")
@@ -2675,7 +2664,11 @@ async def get_signal_trust_scorecards(db_path: str) -> dict:
             stamps = None
             if stamps_available:
                 stamps = stamp_by_window.get(days, {}).get(st)
-                if stamps is not None and win_closed_n > 0 and stamps.get("both_known_n", 0) == 0:
+                if (
+                    stamps is not None
+                    and win_closed_n > 0
+                    and stamps.get("both_known_n", 0) == 0
+                ):
                     warnings.append("no_stamps")
             row["windows"].append(
                 {
@@ -2684,7 +2677,9 @@ async def get_signal_trust_scorecards(db_path: str) -> dict:
                         "closed_n": win_closed_n,
                         "wins": int(closed_stats.get("wins") or 0),
                         "win_rate_pct": float(closed_stats.get("win_rate_pct") or 0.0),
-                        "total_pnl_usd": float(closed_stats.get("total_pnl_usd") or 0.0),
+                        "total_pnl_usd": float(
+                            closed_stats.get("total_pnl_usd") or 0.0
+                        ),
                         "avg_pnl_pct": float(closed_stats.get("avg_pnl_pct") or 0.0),
                     },
                     "stamps": stamps,
@@ -2697,13 +2692,23 @@ async def get_signal_trust_scorecards(db_path: str) -> dict:
         "ok": True,
         "read_only": True,
         "not_for_pruning": True,
+        "not_for_suppression": True,
         "not_for_auto_disable": True,
+        "not_for_sizing": True,
+        "not_for_execution": True,
+        "not_for_alerting": True,
+        "not_for_source_ranking": True,
         "experimental": True,
+        "visibility_only": True,
+        "not_live_eligibility_verdict": True,
+        "cohort_policy": "full_closed_paper_trades",
+        "sort_policy": "signal_type_asc_not_ranked",
         "generated_at": generated_at,
         "windows_days": windows_days,
         "data_missing_reason": None if stamps_available else stamps_reason,
     }
     return {"meta": meta, "rows": rows}
+
 
 # Tier 1a/2a/2b enumerated types per scout.trading.live_eligibility.
 # Kept in sync with matches_tier_1_or_2(); a signal_type in this set is
