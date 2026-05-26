@@ -1,13 +1,35 @@
 """Tests for the read-only trade opportunity inbox."""
 
 import json
+import importlib.util
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from dashboard.api import create_app
 from scout.db import Database
+
+_CHECK_SPEC = importlib.util.spec_from_file_location(
+    "check_trade_inbox_contract",
+    Path(__file__).resolve().parent.parent
+    / "scripts"
+    / "check_trade_inbox_contract.py",
+)
+_CHECKER = importlib.util.module_from_spec(_CHECK_SPEC)
+sys.modules["check_trade_inbox_contract"] = _CHECKER
+_CHECK_SPEC.loader.exec_module(_CHECKER)
+
+
+def _assert_trade_inbox_contract(payload: dict, *, limit_per_group: int, window_hours: int = 36) -> None:
+    result = _CHECKER.validate_payload(
+        payload,
+        requested_limit_per_group=limit_per_group,
+        requested_window=window_hours,
+    )
+    assert result.is_clean, result.criticals
 
 
 @pytest.fixture
@@ -163,6 +185,7 @@ async def test_trade_inbox_groups_shape_and_read_only(client):
     assert resp.status_code == 200, resp.text
     assert after == before
     payload = resp.json()
+    _assert_trade_inbox_contract(payload, limit_per_group=10)
     assert set(payload["groups"]) == {"act_now", "watch", "already_ran", "blocked"}
     assert payload["meta"]["read_only"] is True
     assert payload["meta"]["not_trade_advice"] is True
@@ -193,6 +216,7 @@ async def test_trade_inbox_promotes_tracker_only_gainer_to_watch(client):
     assert resp.status_code == 200, resp.text
     assert after == before
     payload = resp.json()
+    _assert_trade_inbox_contract(payload, limit_per_group=10)
     rows = payload["groups"]["watch"]
     assert [r["token_id"] for r in rows] == ["toes"]
     row = rows[0]
@@ -225,6 +249,7 @@ async def test_trade_inbox_dedupes_tracker_row_behind_open_paper_trade(client):
 
     assert resp.status_code == 200, resp.text
     payload = resp.json()
+    _assert_trade_inbox_contract(payload, limit_per_group=10)
     all_rows = [r for rows in payload["groups"].values() for r in rows]
     toes_rows = [r for r in all_rows if r["token_id"] == "toes"]
     assert len(toes_rows) == 1
@@ -265,6 +290,7 @@ async def test_trade_inbox_suppresses_tracker_row_when_matching_open_paper_is_be
 
     assert resp.status_code == 200, resp.text
     payload = resp.json()
+    _assert_trade_inbox_contract(payload, limit_per_group=1)
     all_rows = [r for rows in payload["groups"].values() for r in rows]
     assert all(r["token_id"] != "older-paper" for r in all_rows)
     assert payload["meta"]["tracker_rows_considered"] == 1
@@ -302,6 +328,7 @@ async def test_trade_inbox_scans_past_tracker_duplicates_to_promote_tracker_only
 
     assert resp.status_code == 200, resp.text
     payload = resp.json()
+    _assert_trade_inbox_contract(payload, limit_per_group=1)
     all_rows = [r for rows in payload["groups"].values() for r in rows]
     promoted = [r for r in all_rows if r["token_id"] == "tracker-only-after-dupes"]
     assert len(promoted) == 1
@@ -325,6 +352,7 @@ async def test_trade_inbox_tracker_row_without_price_is_data_missing(client):
 
     assert resp.status_code == 200, resp.text
     payload = resp.json()
+    _assert_trade_inbox_contract(payload, limit_per_group=10)
     row = payload["groups"]["blocked"][0]
     assert row["token_id"] == "no-price-gainer"
     assert row["source_corpus"] == "tracker"
@@ -350,6 +378,7 @@ async def test_trade_inbox_tracker_row_with_current_price_but_no_detected_price_
 
     assert resp.status_code == 200, resp.text
     payload = resp.json()
+    _assert_trade_inbox_contract(payload, limit_per_group=10)
     row = payload["groups"]["blocked"][0]
     assert row["token_id"] == "missing-entry-price"
     assert row["source_corpus"] == "tracker"
@@ -383,6 +412,7 @@ async def test_trade_inbox_broad_cohort_surfaces_toes_beyond_raw_limit(client):
 
     assert resp.status_code == 200, resp.text
     payload = resp.json()
+    _assert_trade_inbox_contract(payload, limit_per_group=5)
     assert [r["token_id"] for r in payload["groups"]["act_now"]] == ["toes"]
     assert payload["meta"]["source_rows_considered"] >= 15
 
@@ -410,7 +440,9 @@ async def test_trade_inbox_score_sort_key_and_why_now_are_deterministic(client):
     resp = await c.get("/api/trade_inbox?limit_per_group=10&window_hours=36")
 
     assert resp.status_code == 200, resp.text
-    rows = resp.json()["groups"]["act_now"]
+    payload = resp.json()
+    _assert_trade_inbox_contract(payload, limit_per_group=10)
+    rows = payload["groups"]["act_now"]
     assert [r["token_id"] for r in rows] == ["alpha", "zeta"]
     assert rows[0]["trade_score"] == 100.0
     assert rows[0]["sort_key"] == rows[1]["sort_key"][:-1] + ["alpha"]
@@ -446,6 +478,7 @@ async def test_trade_inbox_stale_boundaries_and_bad_data(client):
 
     assert resp.status_code == 200, resp.text
     payload = resp.json()
+    _assert_trade_inbox_contract(payload, limit_per_group=10)
     blocked = {r["token_id"]: r for r in payload["groups"]["blocked"]}
     watch = {r["token_id"]: r for r in payload["groups"]["watch"]}
     assert blocked["no-price"]["block_reason_primary"] == "NO_PRICE"
@@ -472,6 +505,7 @@ async def test_trade_inbox_overflow_meta_exposes_hidden_rows(client):
 
     assert resp.status_code == 200, resp.text
     payload = resp.json()
+    _assert_trade_inbox_contract(payload, limit_per_group=3)
     assert len(payload["groups"]["act_now"]) == 3
     assert payload["meta"]["group_counts"]["act_now"] == 7
     assert payload["meta"]["group_hidden_counts"]["act_now"] == 4
