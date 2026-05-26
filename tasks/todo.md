@@ -2,7 +2,7 @@
 
 ## Active Work: 2026-05-26 - Dashboard Contract Smoke Gate
 
-**Status:** BUILD IN PROGRESS. Goal: make the dashboard contract firewalls
+**Status:** DEPLOYED 2026-05-26. Goal: make the dashboard contract firewalls
 observable as a single smoke command and a named CI gate, while preserving the
 anti-scope boundaries from the Trade Inbox work.
 
@@ -16,17 +16,33 @@ Workflow checklist:
   resolver out of buildable-next index, copy exact tracker-promotion soak gate
   into the deferred alert ticket, specify active memory note content, add
   failure JSON/text tests, and clarify import/argparse behavior.
-- [ ] Build with TDD: aggregate checker, explicit CI step, backlog/lesson/memory
+- [x] Build with TDD: aggregate checker, explicit CI step, backlog/lesson/memory
   updates.
-- [ ] Focused verification.
-- [ ] PR opened, reviewed by 2 parallel agents, merged, and deployed.
+- [x] Focused verification.
+- [x] PR opened (#284), reviewed by 2 parallel agents, merged, and deployed.
+
+Verification:
+- Red: `uv run pytest -q tests/test_check_dashboard_contracts.py` failed
+  because `scripts/check_dashboard_contracts.py` did not exist.
+- Focused gate: `uv run pytest -q tests/test_check_dashboard_contracts.py
+  tests/test_check_live_candidates_contract.py tests/test_live_candidates_endpoint.py
+  tests/test_check_trade_inbox_contract.py tests/test_trade_inbox_endpoint.py` =>
+  `112 passed`.
+- Full suite with dummy required secrets:
+  `uv run pytest --tb=short -q --timeout=180 --timeout-method=thread` =>
+  `2798 passed, 158 skipped, 11 warnings`.
+- CI: PR #284 GitHub Actions `test` passed.
+- Deploy: srilu fast-forwarded `9916199` -> `7b37334`; post-deploy
+  `.venv/bin/python scripts/check_dashboard_contracts.py --url
+  http://localhost:8000 --json` returned `status=ok`, exit `0`, and zero
+  criticals/warnings for both `live_candidates` and `trade_inbox`.
 
 Anti-scope notes:
 - No Telegram sends, urgency tiers, alert qualification, ranking, cross-id
   resolver behavior, dashboard producers, execution paths, or new DB writer
   table in this branch.
 - The read-only firewall's anti-rot path is named CI coverage plus a single
-  post-deploy smoke command, not a §12a table freshness watchdog.
+  post-deploy smoke command, not a �12a table freshness watchdog.
 
 ## Active Work: 2026-05-26 - Trade Inbox Contract Firewall
 
@@ -439,7 +455,7 @@ Review:
 - [x] Resume branch and verify plan/design folds are present
 - [x] Plan reviewed by 2 parallel agents; Critical/Important findings folded
 - [x] Design reviewed by 2 parallel agents; Critical/Important findings folded
-- [x] Write focused RED tests for migration, TG/X backfill, bounded outcomes, summaries, and §12a lag watchdog
+- [x] Write focused RED tests for migration, TG/X backfill, bounded outcomes, summaries, and �12a lag watchdog
 - [x] Implement `source_calls` migration + source-quality helpers + watchdog scripts
 - [x] Run focused and adjacent verification
 - [x] Open draft PR #206
