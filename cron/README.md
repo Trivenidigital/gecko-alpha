@@ -197,3 +197,8 @@ The script intentionally requires `first_runner_at > closed_at` for stop-loss
 false negatives. The 2026-05-26 cleanup found 15/42 historical
 `gainers_early` rows where the runner-board event preceded stop close, which
 overstated the old false-negative bucket.
+
+Residual §12a surface: the daily cron writes a heartbeat at
+`/var/lib/gecko-alpha/stop-loss-fn-audit/heartbeat`, but no stale-heartbeat
+watchdog is wired yet. Because this gate has a 2026-08-26 backstop, that is
+accepted as low-priority unless this pattern becomes a longer-lived monitor.

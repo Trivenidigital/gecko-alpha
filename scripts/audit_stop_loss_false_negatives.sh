@@ -149,6 +149,7 @@ if [[ "$ALERT" != "1" ]]; then
 fi
 
 mkdir -p "$STATE_DIR"
+printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE_DIR/heartbeat"
 
 TSV="$(sqlite3 -noheader -separator $'\t' "$DB_PATH" "$SQL_QUERY")"
 IFS=$'\t' read -r audit_utc held_at maturity_h all_n all_threshold ge_n ge_threshold broad_n broad_threshold backstop stop_status broad_status <<< "$TSV"
