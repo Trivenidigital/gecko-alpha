@@ -203,6 +203,15 @@ def test_banned_language_value_is_critical():
     assert any("buy now" in c for c in result.criticals)
 
 
+def test_banned_language_separator_variants_are_critical():
+    groups = _empty_groups()
+    groups["watch"].append(_tracker_row(risk_reasons=["buy_now", "strong-buy"]))
+    result = _MOD.validate_payload(_envelope(groups))
+    assert not result.is_clean
+    assert any("buy" in c and "now" in c for c in result.criticals)
+    assert any("strong" in c and "buy" in c for c in result.criticals)
+
+
 def test_identifier_fields_exempt_from_banned_language():
     groups = _empty_groups()
     groups["watch"].append(
@@ -221,12 +230,28 @@ def test_surfaces_are_identifier_values_not_banned_language():
 
 def test_surfaces_still_reject_forbidden_contract_tokens():
     groups = _empty_groups()
-    groups["watch"].append(_tracker_row(surfaces=["recommended_by_kol", "watch_breakout", "alert_level"]))
+    groups["watch"].append(
+        _tracker_row(
+            surfaces=[
+                "recommended_by_kol",
+                "watch_breakout",
+                "alert_level",
+                "urgency_high",
+                "priority_high",
+                "alert_high",
+                "source_rank_high",
+            ]
+        )
+    )
     result = _MOD.validate_payload(_envelope(groups))
     assert not result.is_clean
     assert any("recommended_by_kol" in c for c in result.criticals)
     assert any("watch_breakout" in c for c in result.criticals)
     assert any("alert_level" in c for c in result.criticals)
+    assert any("urgency" in c for c in result.criticals)
+    assert any("priority" in c for c in result.criticals)
+    assert any("alert_high" in c for c in result.criticals)
+    assert any("source" in c and "rank" in c for c in result.criticals)
 
 
 def test_value_firewall_rejects_separator_variants():
@@ -339,6 +364,33 @@ def test_block_reason_counts_must_cover_returned_blocked_rows():
     assert any("block_reason_counts" in c for c in result.criticals)
 
 
+def test_block_reason_counts_must_cover_returned_reasons_when_hidden_exists():
+    groups = _empty_groups()
+    groups["blocked"].append(
+        _tracker_row(
+            group="blocked",
+            action_label="DATA_MISSING",
+            block_reason_primary="NO_PRICE",
+            risk_reasons=[
+                "tracker_only_no_paper_trade",
+                "no_price_snapshot_for_token_id",
+            ],
+        )
+    )
+    payload = _envelope(
+        groups,
+        group_counts={"act_now": 0, "watch": 0, "already_ran": 0, "blocked": 2},
+        group_hidden_counts={"act_now": 0, "watch": 0, "already_ran": 0, "blocked": 1},
+        source_rows_considered=2,
+        tracker_rows_considered=2,
+        tracker_rows_promoted=2,
+        block_reason_counts={"NOT_ACTIONABLE": 1},
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("NO_PRICE" in c for c in result.criticals)
+
+
 def test_impossible_source_counters_are_critical():
     payload = _envelope(tracker_rows_considered=0, tracker_rows_promoted=1)
     result = _MOD.validate_payload(payload)
@@ -379,6 +431,10 @@ def test_meta_source_value_pinned():
     result = _MOD.validate_payload(payload)
     assert not result.is_clean
     assert any("meta.source" in c for c in result.criticals)
+
+
+def test_cli_default_matches_endpoint_default_limit_per_group():
+    assert _MOD._DEFAULT_LIMIT_PER_GROUP == 10
 
 
 def test_fetch_target_uses_limit_per_group(monkeypatch):
