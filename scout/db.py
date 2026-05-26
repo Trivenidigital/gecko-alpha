@@ -135,6 +135,7 @@ class Database:
         await self._migrate_symbol_upper_indexes_v1()
         await self._migrate_gainers_comparisons_appeared_idx_v1()
         await self._migrate_trade_decision_events_v1()
+        await self._migrate_predictions_coin_predicted_id_idx_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -145,6 +146,47 @@ class Database:
         if self._conn:
             await self._conn.close()
             self._conn = None
+
+    async def _migrate_predictions_coin_predicted_id_idx_v1(self) -> None:
+        """Index latest-prediction lookups used by Trade Inbox context."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "predictions_coin_predicted_id_idx_v1"
+
+        try:
+            await conn.execute("PRAGMA busy_timeout = 90000")
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?", (migration_name,)
+            )
+            if await cur.fetchone():
+                await conn.execute("COMMIT")
+                return
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_predictions_coin_predicted_id "
+                "ON predictions(coin_id, predicted_at DESC, id DESC)"
+            )
+            await conn.execute(
+                "INSERT INTO paper_migrations(name, cutover_ts) VALUES (?, ?)",
+                (migration_name, datetime.now(timezone.utc).isoformat()),
+            )
+            await conn.execute("COMMIT")
+            _db_log.info(
+                "index_migrated",
+                table="predictions",
+                column="coin_id,predicted_at,id",
+                migration=migration_name,
+            )
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _db_log.exception("index_migration_rollback_failed", err=str(rb_err))
+            _db_log.exception("index_migration_failed", migration=migration_name)
+            raise
 
     async def _migrate_trade_decision_events_v1(self) -> None:
         """Append-only trading admission/skip decision log.
@@ -641,6 +683,8 @@ class Database:
                 ON predictions(predicted_at);
             CREATE INDEX IF NOT EXISTS idx_pred_outcome
                 ON predictions(outcome_class);
+            CREATE INDEX IF NOT EXISTS idx_predictions_coin_predicted_id
+                ON predictions(coin_id, predicted_at DESC, id DESC);
 
             CREATE TABLE IF NOT EXISTS agent_strategy (
                 key        TEXT PRIMARY KEY,
@@ -3758,8 +3802,7 @@ class Database:
                 "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
                 "description TEXT NOT NULL)"
             )
-            await conn.execute(
-                """
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS paper_trade_entry_snapshots (
                     paper_trade_id INTEGER PRIMARY KEY,
                     entry_snapshot_version TEXT NOT NULL,
@@ -3786,8 +3829,7 @@ class Database:
                     FOREIGN KEY (paper_trade_id)
                         REFERENCES paper_trades(id) ON DELETE RESTRICT
                 )
-                """
-            )
+                """)
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_ptes_version "
                 "ON paper_trade_entry_snapshots(entry_snapshot_version)"
@@ -3882,8 +3924,7 @@ class Database:
                     f"description={existing_version['description']}"
                 )
 
-            await conn.execute(
-                """
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS source_calls (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     source_type TEXT NOT NULL CHECK (source_type IN ('tg', 'x')),
@@ -3948,8 +3989,7 @@ class Database:
                         REFERENCES paper_trades(id) ON DELETE RESTRICT,
                     UNIQUE (source_type, source_event_id)
                 )
-                """
-            )
+                """)
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_source_calls_source_ts "
                 "ON source_calls(source_type, source_id, call_ts)"
@@ -4170,10 +4210,8 @@ class Database:
         try:
             await conn.execute("PRAGMA busy_timeout = 90000")
             await conn.execute("BEGIN EXCLUSIVE")
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS paper_migrations (
-                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
-            )
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
             cur = await conn.execute(
                 "SELECT 1 FROM paper_migrations WHERE name = ?", (migration_name,)
             )
@@ -4266,10 +4304,8 @@ class Database:
         try:
             await conn.execute("PRAGMA busy_timeout = 90000")
             await conn.execute("BEGIN EXCLUSIVE")
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS paper_migrations (
-                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
-            )
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
             cur = await conn.execute(
                 "SELECT 1 FROM paper_migrations WHERE name = ?", (migration_name,)
             )
@@ -4288,36 +4324,26 @@ class Database:
             cur = await conn.execute("PRAGMA table_info(paper_trades)")
             paper_cols = {row[1] for row in await cur.fetchall()}
             if "closed_at" not in paper_cols:
-                await conn.execute(
-                    "ALTER TABLE paper_trades ADD COLUMN closed_at TEXT"
-                )
+                await conn.execute("ALTER TABLE paper_trades ADD COLUMN closed_at TEXT")
 
-            await conn.execute(
-                """CREATE TABLE IF NOT EXISTS cohort_digest_state (
+            await conn.execute("""CREATE TABLE IF NOT EXISTS cohort_digest_state (
                     marker INTEGER PRIMARY KEY DEFAULT 1,
                     last_digest_date TEXT,
                     last_final_block_fired_at TEXT,
                     CHECK (marker = 1)
-                )"""
-            )
-            await conn.execute(
-                """INSERT OR IGNORE INTO cohort_digest_state
+                )""")
+            await conn.execute("""INSERT OR IGNORE INTO cohort_digest_state
                    (marker, last_digest_date, last_final_block_fired_at)
-                   VALUES (1, NULL, NULL)"""
-            )
-            await conn.execute(
-                """CREATE INDEX IF NOT EXISTS idx_paper_trades_closed_at
+                   VALUES (1, NULL, NULL)""")
+            await conn.execute("""CREATE INDEX IF NOT EXISTS idx_paper_trades_closed_at
                    ON paper_trades(closed_at)
-                   WHERE closed_at IS NOT NULL"""
-            )
+                   WHERE closed_at IS NOT NULL""")
             await conn.execute(
                 "INSERT INTO paper_migrations(name, cutover_ts) VALUES (?, ?)",
                 (migration_name, datetime.now(timezone.utc).isoformat()),
             )
             await conn.execute("COMMIT")
-            _db_log.info(
-                "cohort_digest_state_migrated", migration=migration_name
-            )
+            _db_log.info("cohort_digest_state_migrated", migration=migration_name)
         except Exception:
             try:
                 await conn.execute("ROLLBACK")
@@ -4326,9 +4352,7 @@ class Database:
             _db_log.exception(
                 "cohort_digest_state_migration_failed", migration=migration_name
             )
-            _db_log.error(
-                "SCHEMA_DRIFT_DETECTED", migration=migration_name
-            )
+            _db_log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)
             raise
 
     async def _migrate_symbol_upper_indexes_v1(self) -> None:
@@ -4355,20 +4379,24 @@ class Database:
         conn = self._conn
 
         targets = [
-            ("volume_history_cg", "idx_vol_hist_cg_symbol_upper",
-             "vol_hist_cg_symbol_upper_idx_v1"),
-            ("gainers_snapshots", "idx_gainers_snap_symbol_upper",
-             "gainers_snap_symbol_upper_idx_v1"),
+            (
+                "volume_history_cg",
+                "idx_vol_hist_cg_symbol_upper",
+                "vol_hist_cg_symbol_upper_idx_v1",
+            ),
+            (
+                "gainers_snapshots",
+                "idx_gainers_snap_symbol_upper",
+                "gainers_snap_symbol_upper_idx_v1",
+            ),
         ]
 
         for table, index_name, migration_name in targets:
             try:
                 await conn.execute("PRAGMA busy_timeout = 90000")
                 await conn.execute("BEGIN EXCLUSIVE")
-                await conn.execute(
-                    """CREATE TABLE IF NOT EXISTS paper_migrations (
-                        name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"""
-                )
+                await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                        name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
                 cur = await conn.execute(
                     "SELECT 1 FROM paper_migrations WHERE name = ?",
                     (migration_name,),
@@ -4402,7 +4430,9 @@ class Database:
                 try:
                     await conn.execute("ROLLBACK")
                 except Exception as rb_err:
-                    _db_log.exception("schema_migration_rollback_failed", err=str(rb_err))
+                    _db_log.exception(
+                        "schema_migration_rollback_failed", err=str(rb_err)
+                    )
                 _db_log.exception(
                     "symbol_upper_index_migration_failed",
                     table=table,
@@ -4492,19 +4522,15 @@ class Database:
             raise RuntimeError("Database not initialized.")
         migration_name = "bl_chain_pattern_provenance_v1"
         now_iso = datetime.now(timezone.utc).isoformat()
-        await conn.execute(
-            """CREATE TABLE IF NOT EXISTS paper_migrations (
+        await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
                 name TEXT PRIMARY KEY,
                 cutover_ts TEXT NOT NULL
-            )"""
-        )
-        await conn.execute(
-            """CREATE TABLE IF NOT EXISTS schema_version (
+            )""")
+        await conn.execute("""CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER PRIMARY KEY,
                 applied_at TEXT NOT NULL,
                 description TEXT NOT NULL
-            )"""
-        )
+            )""")
         cur = await conn.execute("PRAGMA table_info(chain_patterns)")
         cols = {row[1] for row in await cur.fetchall()}
         if "is_protected_builtin" not in cols:
@@ -4513,7 +4539,9 @@ class Database:
                 "is_protected_builtin INTEGER NOT NULL DEFAULT 0"
             )
         if "disabled_reason" not in cols:
-            await conn.execute("ALTER TABLE chain_patterns ADD COLUMN disabled_reason TEXT")
+            await conn.execute(
+                "ALTER TABLE chain_patterns ADD COLUMN disabled_reason TEXT"
+            )
         if "disabled_at" not in cols:
             await conn.execute("ALTER TABLE chain_patterns ADD COLUMN disabled_at TEXT")
 
@@ -5725,9 +5753,7 @@ class Database:
         # at the 1000-page autocheckpoint threshold anyway — just clock-shifted
         # to the hourly probe moment. Acceptable per V20's fold note.
         try:
-            cur = await self._conn.execute(
-                "SELECT * FROM pragma_wal_autocheckpoint"
-            )
+            cur = await self._conn.execute("SELECT * FROM pragma_wal_autocheckpoint")
             ac_row = await cur.fetchone()
             wal_autocheckpoint = int(ac_row[0]) if ac_row else 0
         except Exception:

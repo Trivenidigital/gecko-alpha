@@ -1,5 +1,61 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-26 - Trade Inbox Counter-Risk Context
+
+**Status:** BUILD VERIFYING. Goal: supersede stale Now Tradable-only PR #278
+by exposing existing narrative counter-risk context in the primary trader
+surface, `/api/trade_inbox`, without changing ranking, grouping, sorting,
+execution, alerts, or urgency tiers.
+
+Workflow checklist:
+- [x] Backlog eligibility check: PR #278 remains relevant as an idea but targets
+  stale surface `NowTradableTab.jsx`; current primary trader surface is Trade
+  Inbox.
+- [x] Plan drafted:
+  `tasks/plan_trade_inbox_counter_risk_2026_05_26.md`.
+- [x] Plan reviewed by 2 parallel agents and folds applied: neutral UI wording,
+  unavailable tracker state, prediction freshness timestamp, fail-soft optional
+  enrichment, latest-prediction index, live-candidates-style flag validation,
+  and executable no-ranking/no-sort regression.
+- [x] Design drafted:
+  `tasks/design_trade_inbox_counter_risk_2026_05_26.md`.
+- [x] Design reviewed by 2 parallel agents and folds applied: exact plain-text
+  flag rendering rules, tracker-row null/empty contract invariant,
+  display-only static helper guard, `paper_migrations` sentinel, and DESC index
+  order matching the query.
+- [x] TDD red:
+  `uv run pytest -q tests/test_check_trade_inbox_contract.py
+  tests/test_trade_inbox_endpoint.py tests/test_dashboard_frontend_layout.py`
+  failed because the contract rejected the new fields, endpoint rows omitted
+  them, and the UI counter-risk block did not exist.
+- [x] Build: added Trade Inbox counter-risk fields, latest prediction enrichment
+  for paper rows, tracker null/empty invariants, prediction lookup index
+  migration, neutral UI context block, refreshed dist, and focused tests.
+- [x] Focused verification:
+  `uv run pytest -q tests/test_check_trade_inbox_contract.py
+  tests/test_trade_inbox_endpoint.py tests/test_dashboard_frontend_layout.py
+  tests/test_db.py::test_predictions_coin_predicted_id_index_migration` =>
+  `54 passed`.
+- [x] Frontend build:
+  `$env:NODE_OPTIONS='--use-system-ca'; npm.cmd --prefix dashboard/frontend
+  run build:codex` => passed.
+- [x] Broader dashboard contract verification:
+  `uv run pytest --tb=short -q tests/test_check_dashboard_contracts.py
+  tests/test_check_trade_inbox_contract.py tests/test_trade_inbox_endpoint.py
+  tests/test_live_candidates_endpoint.py tests/test_dashboard_frontend_layout.py
+  tests/test_db.py::test_predictions_coin_predicted_id_index_migration` =>
+  `75 passed`.
+- [x] Full suite with dummy required secrets:
+  `uv run pytest --tb=short -q --timeout=180 --timeout-method=thread` =>
+  `2822 passed, 158 skipped, 12 warnings`.
+- [ ] PR, two PR reviews, merge, deploy, smoke, and close/supersede
+  PR #278.
+
+Non-scope:
+- No row ranking, sorting, score, group, action-label, dispatch, Telegram alert,
+  alert qualification, urgency tier, cross-id resolver, signal parameter,
+  auto-suspend, execution, pruning, or paper-trade policy changes.
+
 ## Active Work: 2026-05-26 - Signal Trust Scorecards Refresh
 
 **Status:** BUILD VERIFYING / REVIEW FOLDS APPLIED. Goal: finish the eligible `BL-NEW-SIGNAL-FAMILY-SCORECARDS`

@@ -1012,6 +1012,19 @@ def _parse_iso_dt(value: str | None) -> datetime | None:
         return None
 
 
+def _parse_counter_flags(raw) -> list[dict | str]:
+    """Defensively parse predictions.counter_flags for dashboard display."""
+    if not raw:
+        return []
+    try:
+        decoded = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [item for item in decoded if isinstance(item, (dict, str))]
+
+
 def _live_candidates_meta(
     *,
     limit: int,
@@ -1236,6 +1249,7 @@ async def get_trade_inbox(
             placeholders = ",".join("?" * len(token_order))
             surfaces_by_token = {t: {primary[t]["signal_type"]} for t in token_order}
             recent_ids_by_token = {t: [] for t in token_order}
+            pred_by_coin: dict[str, dict] = {}
             try:
                 cursor = await db.execute(
                     f"""SELECT id, token_id, signal_type
@@ -1265,10 +1279,44 @@ async def get_trade_inbox(
                 price_by_coin = {r["coin_id"]: dict(r) for r in await cursor.fetchall()}
             except aiosqlite.OperationalError:
                 price_by_coin = {}
+
+            try:
+                cursor = await db.execute(
+                    f"""
+                    SELECT coin_id, counter_risk_score, counter_flags, predicted_at
+                      FROM (
+                            SELECT coin_id, counter_risk_score, counter_flags, predicted_at, id,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY coin_id
+                                       ORDER BY predicted_at DESC, id DESC
+                                   ) AS rn
+                              FROM predictions
+                             WHERE coin_id IN ({placeholders})
+                           )
+                     WHERE rn = 1
+                    """,
+                    tuple(token_order),
+                )
+                for pr in await cursor.fetchall():
+                    d = dict(pr)
+                    d["counter_flags"] = _parse_counter_flags(d.get("counter_flags"))
+                    pred_by_coin[d["coin_id"]] = d
+            except aiosqlite.OperationalError as e:
+                msg = str(e).lower()
+                if (
+                    ("no such table" in msg and "predictions" in msg)
+                    or "no such column" in msg
+                    or "no such function" in msg
+                    or 'near "("' in msg
+                ):
+                    pred_by_coin = {}
+                else:
+                    raise
         else:
             surfaces_by_token = {}
             recent_ids_by_token = {}
             price_by_coin = {}
+            pred_by_coin = {}
 
         tracker_scan_cap = max(source_limit * 3, source_limit + 500)
         try:
@@ -1322,6 +1370,7 @@ async def get_trade_inbox(
     for token_id in token_order:
         base = primary[token_id]
         price = price_by_coin.get(token_id)
+        pred = pred_by_coin.get(token_id)
         risk_reasons: list[str] = []
         inclusion_reasons: list[str] = ["open_paper_trade"]
         opened_dt = _parse_iso_dt(base.get("opened_at"))
@@ -1443,6 +1492,13 @@ async def get_trade_inbox(
             "verdict": verdict,
             "inclusion_reasons": inclusion_reasons,
             "risk_reasons": risk_reasons,
+            "counter_risk_score": pred.get("counter_risk_score") if pred else None,
+            "counter_flags": pred.get("counter_flags") if pred else [],
+            "counter_risk_predicted_at": (
+                _parse_iso_dt(pred.get("predicted_at")).isoformat()
+                if pred and _parse_iso_dt(pred.get("predicted_at"))
+                else None
+            ),
             "window_state": window_state,
         }
         block_reason = _trade_block_reason(row)
@@ -1606,6 +1662,9 @@ async def get_trade_inbox(
             "verdict": verdict,
             "inclusion_reasons": inclusion_reasons,
             "risk_reasons": risk_reasons,
+            "counter_risk_score": None,
+            "counter_flags": [],
+            "counter_risk_predicted_at": None,
             "window_state": window_state,
         }
         block_reason = _trade_block_reason(row)

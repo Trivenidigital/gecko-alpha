@@ -33,9 +33,7 @@ async def test_prune_score_history_uses_scanned_at_index(db):
     )
     plan = await cur.fetchall()
     plan_str = " ".join(str(row[3]) for row in plan)
-    assert (
-        "idx_score_history_scanned_at" in plan_str
-    ), f"Index not used: {plan_str}"
+    assert "idx_score_history_scanned_at" in plan_str, f"Index not used: {plan_str}"
 
 
 async def test_prune_volume_snapshots_uses_scanned_at_index(db):
@@ -46,9 +44,7 @@ async def test_prune_volume_snapshots_uses_scanned_at_index(db):
     )
     plan = await cur.fetchall()
     plan_str = " ".join(str(row[3]) for row in plan)
-    assert (
-        "idx_volume_snapshots_scanned_at" in plan_str
-    ), f"Index not used: {plan_str}"
+    assert "idx_volume_snapshots_scanned_at" in plan_str, f"Index not used: {plan_str}"
 
 
 async def test_prune_score_history_keeps_recent(db):
@@ -226,7 +222,17 @@ async def test_prune_score_history_future_dated_rows_survive_keep_days_zero(db):
                 " steps_matched, total_steps, anchor_time, chain_duration_hours,"
                 " conviction_boost, completed_at) VALUES (?,?,?,?,?,?,?,?,?,?)"
             ),
-            ("t-tie", "memecoin", 1, "tie_pattern", 1, 1, "2026-01-01T00:00:00+00:00", 1.0, 0),
+            (
+                "t-tie",
+                "memecoin",
+                1,
+                "tie_pattern",
+                1,
+                1,
+                "2026-01-01T00:00:00+00:00",
+                1.0,
+                0,
+            ),
         ),
         (
             "prune_holder_snapshots",
@@ -293,6 +299,30 @@ async def test_migration_idempotency_records_all_seven_cycle_1_and_2(tmp_path):
     }
     missing = expected - names
     assert not missing, f"Missing paper_migrations rows after initialize(): {missing}"
+
+
+async def test_predictions_coin_predicted_id_index_migration(tmp_path):
+    db = Database(str(tmp_path / "pred_index.db"))
+    await db.initialize()
+
+    cur = await db._conn.execute(
+        "SELECT 1 FROM paper_migrations WHERE name = ?",
+        ("predictions_coin_predicted_id_idx_v1",),
+    )
+    assert await cur.fetchone()
+    cur = await db._conn.execute("PRAGMA index_info(idx_predictions_coin_predicted_id)")
+    columns = [row[2] for row in await cur.fetchall()]
+    assert columns == ["coin_id", "predicted_at", "id"]
+    cur = await db._conn.execute("""EXPLAIN QUERY PLAN
+           SELECT coin_id, counter_risk_score, counter_flags, predicted_at
+             FROM predictions
+            WHERE coin_id IN ('token-a')
+            ORDER BY predicted_at DESC, id DESC
+            LIMIT 1""")
+    plan = " ".join(row["detail"] for row in await cur.fetchall()).lower()
+    assert "idx_predictions_coin_predicted_id" in plan
+
+    await db.close()
 
 
 @pytest.mark.parametrize(

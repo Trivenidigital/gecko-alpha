@@ -39,6 +39,9 @@ def _paper_row(**overrides):
         "inclusion_reasons": ["open_paper_trade", "actionable=1", "would_be_live=1"],
         "risk_reasons": [],
         "surfaces": ["volume_spike", "top_gainers_tracker"],
+        "counter_risk_score": 42,
+        "counter_flags": [],
+        "counter_risk_predicted_at": _now_iso(),
         "open_trade_ids": [1],
         "recent_trade_ids": [1],
         "actionable": 1,
@@ -76,6 +79,9 @@ def _tracker_row(**overrides):
         "inclusion_reasons": ["tracker_promotion", "top_gainers_tracker"],
         "risk_reasons": ["tracker_only_no_paper_trade"],
         "surfaces": ["top_gainers_tracker"],
+        "counter_risk_score": None,
+        "counter_flags": [],
+        "counter_risk_predicted_at": None,
         "open_trade_ids": [],
         "recent_trade_ids": [],
         "actionable": None,
@@ -107,10 +113,16 @@ def _envelope(rows_by_group=None, **meta_overrides):
     group_counts = {g: len(rows_by_group[g]) for g in _MOD.EXPECTED_GROUPS}
     group_hidden_counts = {g: 0 for g in _MOD.EXPECTED_GROUPS}
     returned_paper = sum(
-        1 for rows in rows_by_group.values() for r in rows if r["source_corpus"] == "paper"
+        1
+        for rows in rows_by_group.values()
+        for r in rows
+        if r["source_corpus"] == "paper"
     )
     returned_tracker = sum(
-        1 for rows in rows_by_group.values() for r in rows if r["source_corpus"] == "tracker"
+        1
+        for rows in rows_by_group.values()
+        for r in rows
+        if r["source_corpus"] == "tracker"
     )
     meta = {
         "read_only": True,
@@ -175,6 +187,54 @@ def test_unknown_row_key_is_critical():
     result = _MOD.validate_payload(_envelope(groups))
     assert not result.is_clean
     assert any("unknown row keys" in c for c in result.criticals)
+
+
+def test_counter_flags_accept_rich_dict_and_string_items():
+    groups = _empty_groups()
+    groups["act_now"].append(
+        _paper_row(
+            counter_flags=[
+                "thin liquidity",
+                {
+                    "type": "holder_concentration",
+                    "severity": "warning",
+                    "detail": "top holders clustered",
+                },
+            ],
+            counter_risk_score=77,
+        )
+    )
+    result = _MOD.validate_payload(_envelope(groups))
+    assert result.is_clean, result.criticals
+
+
+def test_counter_flags_reject_garbage_items():
+    groups = _empty_groups()
+    groups["act_now"].append(_paper_row(counter_flags=[None]))
+    result = _MOD.validate_payload(_envelope(groups))
+    assert not result.is_clean
+    assert any("counter_flags" in c for c in result.criticals)
+
+
+def test_tracker_row_rejects_counter_risk_context():
+    groups = _empty_groups()
+    groups["watch"].append(
+        _tracker_row(
+            counter_risk_score=55,
+            counter_flags=["paper-only context"],
+            counter_risk_predicted_at=_now_iso(),
+        )
+    )
+    result = _MOD.validate_payload(_envelope(groups))
+    assert not result.is_clean
+    assert any(
+        "tracker row counter_risk_score must be None" in c for c in result.criticals
+    )
+    assert any("tracker row counter_flags must be []" in c for c in result.criticals)
+    assert any(
+        "tracker row counter_risk_predicted_at must be None" in c
+        for c in result.criticals
+    )
 
 
 def test_nested_ranking_key_is_critical():
@@ -269,7 +329,9 @@ def test_value_firewall_rejects_separator_variants():
 def test_tracker_in_act_now_is_critical():
     groups = _empty_groups()
     groups["act_now"].append(
-        _tracker_row(group="act_now", action_label="REVIEW_NOW", verdict="candidate_review")
+        _tracker_row(
+            group="act_now", action_label="REVIEW_NOW", verdict="candidate_review"
+        )
     )
     result = _MOD.validate_payload(_envelope(groups))
     assert not result.is_clean
@@ -311,9 +373,7 @@ def test_paper_without_open_trade_ids_is_critical():
 
 def test_paper_with_tracker_only_reason_is_critical():
     groups = _empty_groups()
-    groups["act_now"].append(
-        _paper_row(risk_reasons=["tracker_only_no_paper_trade"])
-    )
+    groups["act_now"].append(_paper_row(risk_reasons=["tracker_only_no_paper_trade"]))
     result = _MOD.validate_payload(_envelope(groups))
     assert not result.is_clean
     assert any("tracker_only_no_paper_trade" in c for c in result.criticals)

@@ -61,6 +61,56 @@ function rowStatus(row, seenRecord) {
   return 'seen_this_session'
 }
 
+function compactDate(value) {
+  if (!value) return null
+  const ms = Date.parse(value)
+  if (!Number.isFinite(ms)) return null
+  return new Date(ms).toISOString().slice(0, 16).replace('T', ' ')
+}
+
+function flagText(flag) {
+  let text = ''
+  if (typeof flag === 'string') {
+    text = flag
+  } else if (flag && typeof flag === 'object') {
+    const primary = ['label', 'type', 'name', 'reason']
+      .map(key => flag[key])
+      .find(value => typeof value === 'string' && value.trim())
+    const detail = typeof flag.detail === 'string' ? flag.detail.trim() : ''
+    text = primary || detail
+    if (primary && detail && `${primary}: ${detail}`.length <= 80) {
+      text = `${primary}: ${detail}`
+    }
+  }
+  return text.trim().slice(0, 80)
+}
+
+function counterRiskText(row) {
+  const parts = []
+  if (row.counter_risk_score != null && Number.isFinite(Number(row.counter_risk_score))) {
+    parts.push(`score ${Number(row.counter_risk_score)}`)
+  }
+  const predictedAt = compactDate(row.counter_risk_predicted_at)
+  if (predictedAt) parts.push(`from ${predictedAt}`)
+  return parts.join(' | ')
+}
+
+function renderCounterRisk(row) {
+  const metaText = counterRiskText(row)
+  const flags = Array.isArray(row.counter_flags)
+    ? row.counter_flags.map(flagText).filter(Boolean).slice(0, 2)
+    : []
+  if (!metaText && flags.length === 0) {
+    return <div style={{ marginTop: 6 }}>Counter-risk unavailable</div>
+  }
+  return (
+    <div style={{ marginTop: 6 }}>
+      <div>Counter-risk context{metaText ? ` | ${metaText}` : ''}</div>
+      {flags.length ? <div>{flags.join(' | ')}</div> : null}
+    </div>
+  )
+}
+
 export default function TradeInboxTab() {
   const [payload, setPayload] = useState(null)
   const [error, setError] = useState(null)
@@ -235,6 +285,7 @@ export default function TradeInboxTab() {
                           <td>{fmtUsd(row.market_cap)}</td>
                           <td style={{ color: 'var(--color-text-secondary)', fontSize: 12 }}>
                             {reasonText}
+                            {renderCounterRisk(row)}
                           </td>
                           <td>
                             <button className="tab-btn" onClick={() => setDismissed(d => ({ ...d, [dKey]: true }))} style={{ padding: '2px 8px', fontSize: 12 }}>

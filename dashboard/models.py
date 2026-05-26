@@ -280,6 +280,9 @@ class TradeInboxRow(BaseModel):
     inclusion_reasons: list[str] = Field(default_factory=list)
     risk_reasons: list[str] = Field(default_factory=list)
     surfaces: list[str] = Field(default_factory=list)
+    counter_risk_score: int | None = None
+    counter_flags: list[dict | str] = Field(default_factory=list)
+    counter_risk_predicted_at: str | None = None
     open_trade_ids: list[int] = Field(default_factory=list)
     recent_trade_ids: list[int] = Field(default_factory=list)
     actionable: int | None = None

@@ -44,6 +44,51 @@ def test_trade_inbox_tab_is_wired_to_dashboard():
     assert "previous_group" in tab
     assert "function rowStatus" in tab
     assert "10 * 60 * 1000" in tab
+    assert "function counterRiskText" in tab
+    assert "function renderCounterRisk" in tab
+    assert "counter_risk_score" in tab
+    assert "counter_flags" in tab
+    assert "counter_risk_predicted_at" in tab
+    assert "Counter-risk context" in tab
+    assert "Counter-risk unavailable" in tab
+    assert "counterRiskText(row)" in tab
+    without_counter_block = re.sub(
+        r"function counterRiskText\(row\).*?^}",
+        "",
+        tab,
+        flags=re.S | re.M,
+    )
+    without_counter_block = re.sub(
+        r"function renderCounterRisk\(row\).*?^}",
+        "",
+        without_counter_block,
+        flags=re.S | re.M,
+    )
+    assert "counter_risk_score" not in without_counter_block
+
+
+def test_trade_inbox_counter_risk_block_stays_neutral():
+    tab = (
+        ROOT / "dashboard" / "frontend" / "components" / "TradeInboxTab.jsx"
+    ).read_text(encoding="utf-8")
+    block = re.search(
+        r"function renderCounterRisk\(row\).*?^}",
+        tab,
+        flags=re.S | re.M,
+    )
+    assert block, "renderCounterRisk block missing"
+    text = block.group(0).lower()
+    for forbidden in (
+        "high",
+        "low",
+        "urgent",
+        "alert",
+        "trade now",
+        "trade_now",
+        "watch_breakout",
+        "research_only",
+    ):
+        assert forbidden not in text
 
 
 def test_committed_dashboard_dist_references_existing_signal_trust_bundle():
@@ -56,7 +101,9 @@ def test_committed_dashboard_dist_references_existing_signal_trust_bundle():
     bundle_text = ""
     for asset in matches:
         path = ROOT / "dashboard" / "frontend" / "dist" / "assets" / asset
-        assert path.is_file(), f"dist bundle referenced by index.html is missing: {asset}"
+        assert (
+            path.is_file()
+        ), f"dist bundle referenced by index.html is missing: {asset}"
         bundle_text += path.read_text(encoding="utf-8", errors="ignore")
 
     assert "/api/signal_trust/scorecards" in bundle_text
