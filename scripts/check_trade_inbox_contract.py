@@ -25,61 +25,68 @@ _DEFAULT_WINDOW_HOURS = 36
 
 EXPECTED_GROUPS = ("act_now", "watch", "already_ran", "blocked")
 EXPECTED_TOP_LEVEL_KEYS = frozenset({"meta", "groups"})
-EXPECTED_META_KEYS = frozenset({
-    "read_only",
-    "not_trade_advice",
-    "experimental",
-    "generated_at",
-    "window_hours",
-    "limit_per_group",
-    "rows_returned",
-    "source_limit",
-    "source_rows_considered",
-    "open_trades_scanned",
-    "paper_rows_considered",
-    "tracker_rows_considered",
-    "tracker_rows_promoted",
-    "tracker_source_truncated",
-    "source_truncated",
-    "group_counts",
-    "group_hidden_counts",
-    "block_reason_counts",
-    "stale_warning_count",
-    "hard_stale_count",
-    "source",
-})
-EXPECTED_ROW_KEYS = frozenset({
-    "token_id",
-    "symbol",
-    "name",
-    "chain",
-    "source_corpus",
-    "group",
-    "action_label",
-    "window_state",
-    "trade_score",
-    "sort_key",
-    "why_now",
-    "inclusion_reasons",
-    "risk_reasons",
-    "surfaces",
-    "open_trade_ids",
-    "recent_trade_ids",
-    "actionable",
-    "would_be_live",
-    "block_reason_primary",
-    "opened_at",
-    "opened_age_hours",
-    "pct_from_entry",
-    "price_change_24h",
-    "market_cap",
-    "current_price",
-    "entry_quality",
-    "verdict",
-    "price_updated_at",
-    "price_is_stale",
-    "price_staleness_minutes",
-})
+EXPECTED_META_KEYS = frozenset(
+    {
+        "read_only",
+        "not_trade_advice",
+        "experimental",
+        "generated_at",
+        "window_hours",
+        "limit_per_group",
+        "rows_returned",
+        "source_limit",
+        "source_rows_considered",
+        "open_trades_scanned",
+        "paper_rows_considered",
+        "tracker_rows_considered",
+        "tracker_rows_promoted",
+        "tracker_source_truncated",
+        "source_truncated",
+        "group_counts",
+        "group_hidden_counts",
+        "block_reason_counts",
+        "stale_warning_count",
+        "hard_stale_count",
+        "source",
+    }
+)
+EXPECTED_ROW_KEYS = frozenset(
+    {
+        "token_id",
+        "symbol",
+        "name",
+        "chain",
+        "source_corpus",
+        "group",
+        "action_label",
+        "window_state",
+        "trade_score",
+        "sort_key",
+        "why_now",
+        "inclusion_reasons",
+        "risk_reasons",
+        "surfaces",
+        "counter_risk_score",
+        "counter_flags",
+        "counter_risk_predicted_at",
+        "open_trade_ids",
+        "recent_trade_ids",
+        "actionable",
+        "would_be_live",
+        "block_reason_primary",
+        "opened_at",
+        "opened_age_hours",
+        "pct_from_entry",
+        "price_change_24h",
+        "market_cap",
+        "current_price",
+        "entry_quality",
+        "verdict",
+        "price_updated_at",
+        "price_is_stale",
+        "price_staleness_minutes",
+    }
+)
 
 ALLOWED_SOURCE_CORPUS = {"paper", "tracker"}
 ALLOWED_ACTION_LABELS = {
@@ -106,6 +113,7 @@ ALLOWED_VERDICTS = {
     "blocked",
     "data_insufficient",
 }
+ALLOWED_SEVERITIES = {"info", "low", "medium", "warning", "high", "critical"}
 
 BANNED_TOKENS = (
     "buy now",
@@ -142,23 +150,25 @@ BANNED_TOKEN_PATTERNS = tuple(
     for token in BANNED_TOKENS
 )
 
-SCAN_EXEMPT_STRING_FIELDS = frozenset({
-    "token_id",
-    "symbol",
-    "name",
-    "chain",
-    "source_corpus",
-    "group",
-    "action_label",
-    "window_state",
-    "entry_quality",
-    "verdict",
-    "opened_at",
-    "price_updated_at",
-    "generated_at",
-    "source",
-    "surfaces",
-})
+SCAN_EXEMPT_STRING_FIELDS = frozenset(
+    {
+        "token_id",
+        "symbol",
+        "name",
+        "chain",
+        "source_corpus",
+        "group",
+        "action_label",
+        "window_state",
+        "entry_quality",
+        "verdict",
+        "opened_at",
+        "price_updated_at",
+        "generated_at",
+        "source",
+        "surfaces",
+    }
+)
 
 FORBIDDEN_FIELD_PATTERNS = tuple(
     re.compile(p)
@@ -345,14 +355,18 @@ def _walk_forbidden_contract_values(value, path: str, result: Result) -> None:
                 )
 
 
-def _check_exact_keys(obj: dict, expected: frozenset[str], path: str, result: Result) -> None:
+def _check_exact_keys(
+    obj: dict, expected: frozenset[str], path: str, result: Result
+) -> None:
     keys = set(obj.keys())
     missing = expected - keys
     unknown = keys - expected
     if missing:
         result.critical(f"{path}: missing keys {sorted(missing)!r}")
     if unknown:
-        label = "row keys" if path.startswith("groups.") else f"{path.split('.')[-1]} keys"
+        label = (
+            "row keys" if path.startswith("groups.") else f"{path.split('.')[-1]} keys"
+        )
         result.critical(f"{path}: unknown {label} {sorted(unknown)!r}")
 
 
@@ -374,7 +388,9 @@ def _check_group_count_map(value, path: str, result: Result) -> dict[str, int] |
     return cleaned
 
 
-def _check_meta(meta, *, requested_limit_per_group: int, requested_window: int, result: Result) -> None:
+def _check_meta(
+    meta, *, requested_limit_per_group: int, requested_window: int, result: Result
+) -> None:
     if not isinstance(meta, dict):
         result.critical(f"meta must be object; got {type(meta).__name__}")
         return
@@ -385,7 +401,9 @@ def _check_meta(meta, *, requested_limit_per_group: int, requested_window: int, 
             result.critical(f"meta.{flag} must be True (got {meta.get(flag)!r})")
 
     if _parse_iso(meta.get("generated_at")) is None:
-        result.critical(f"meta.generated_at must be ISO8601 (got {meta.get('generated_at')!r})")
+        result.critical(
+            f"meta.generated_at must be ISO8601 (got {meta.get('generated_at')!r})"
+        )
 
     if meta.get("window_hours") != requested_window:
         result.critical(
@@ -399,7 +417,9 @@ def _check_meta(meta, *, requested_limit_per_group: int, requested_window: int, 
         result.critical("meta.limit is not part of /api/trade_inbox contract")
 
     if meta.get("source") != "live_candidates":
-        result.critical(f"meta.source must be 'live_candidates' (got {meta.get('source')!r})")
+        result.critical(
+            f"meta.source must be 'live_candidates' (got {meta.get('source')!r})"
+        )
 
     for field in (
         "rows_returned",
@@ -421,7 +441,9 @@ def _check_meta(meta, *, requested_limit_per_group: int, requested_window: int, 
             result.critical(f"meta.{field} must be bool (got {meta.get(field)!r})")
 
     _check_group_count_map(meta.get("group_counts"), "group_counts", result)
-    _check_group_count_map(meta.get("group_hidden_counts"), "group_hidden_counts", result)
+    _check_group_count_map(
+        meta.get("group_hidden_counts"), "group_hidden_counts", result
+    )
 
     block_counts = meta.get("block_reason_counts")
     if not isinstance(block_counts, dict):
@@ -458,6 +480,10 @@ def _check_row_types(row: dict, path: str, result: Result) -> None:
         if value is not None and _parse_iso(value) is None:
             result.critical(f"{path}.{field} {value!r} is not ISO8601")
 
+    value = row.get("counter_risk_predicted_at")
+    if value is not None and _parse_iso(value) is None:
+        result.critical(f"{path}.counter_risk_predicted_at {value!r} is not ISO8601")
+
     for field in (
         "trade_score",
         "opened_age_hours",
@@ -473,6 +499,34 @@ def _check_row_types(row: dict, path: str, result: Result) -> None:
 
     if not isinstance(row.get("price_is_stale"), bool):
         result.critical(f"{path}.price_is_stale must be bool")
+
+    counter_risk_score = row.get("counter_risk_score")
+    if counter_risk_score is not None and (
+        not _is_non_bool_int(counter_risk_score)
+        or counter_risk_score < 0
+        or counter_risk_score > 100
+    ):
+        result.critical(f"{path}.counter_risk_score must be int 0..100|None")
+
+    counter_flags = row.get("counter_flags")
+    if not isinstance(counter_flags, list):
+        result.critical(
+            f"{path}.counter_flags must be list (got {type(counter_flags).__name__})"
+        )
+    else:
+        for j, item in enumerate(counter_flags):
+            if not isinstance(item, (dict, str)):
+                result.critical(
+                    f"{path}.counter_flags[{j}] must be dict|str "
+                    f"(got {type(item).__name__})"
+                )
+            if isinstance(item, dict):
+                sev = item.get("severity")
+                if sev is not None and sev not in ALLOWED_SEVERITIES:
+                    result.warn(
+                        f"{path}.counter_flags[{j}].severity {sev!r} "
+                        f"not in {sorted(ALLOWED_SEVERITIES)!r}"
+                    )
 
     for field in ("open_trade_ids", "recent_trade_ids"):
         value = row.get(field)
@@ -522,7 +576,11 @@ def _check_row(row, group: str, idx: int, result: Result) -> None:
     if row.get("verdict") not in ALLOWED_VERDICTS:
         result.critical(f"{path}.verdict {row.get('verdict')!r} invalid")
 
-    inclusion = row.get("inclusion_reasons") if isinstance(row.get("inclusion_reasons"), list) else []
+    inclusion = (
+        row.get("inclusion_reasons")
+        if isinstance(row.get("inclusion_reasons"), list)
+        else []
+    )
     risk = row.get("risk_reasons") if isinstance(row.get("risk_reasons"), list) else []
     surfaces = row.get("surfaces") if isinstance(row.get("surfaces"), list) else []
 
@@ -532,7 +590,9 @@ def _check_row(row, group: str, idx: int, result: Result) -> None:
         if "open_paper_trade" not in inclusion:
             result.critical(f"{path}: paper row must include open_paper_trade")
         if "tracker_only_no_paper_trade" in risk:
-            result.critical(f"{path}: paper row cannot carry tracker_only_no_paper_trade")
+            result.critical(
+                f"{path}: paper row cannot carry tracker_only_no_paper_trade"
+            )
 
     if row.get("source_corpus") == "tracker":
         if row.get("open_trade_ids") != []:
@@ -540,17 +600,32 @@ def _check_row(row, group: str, idx: int, result: Result) -> None:
         if row.get("recent_trade_ids") != []:
             result.critical(f"{path}: tracker row must have recent_trade_ids == []")
         if "top_gainers_tracker" not in surfaces:
-            result.critical(f"{path}: tracker row must include top_gainers_tracker surface")
-        if "tracker_promotion" not in inclusion or "top_gainers_tracker" not in inclusion:
+            result.critical(
+                f"{path}: tracker row must include top_gainers_tracker surface"
+            )
+        if (
+            "tracker_promotion" not in inclusion
+            or "top_gainers_tracker" not in inclusion
+        ):
             result.critical(
                 f"{path}: tracker row must include tracker_promotion and top_gainers_tracker"
             )
         if "tracker_only_no_paper_trade" not in risk:
-            result.critical(f"{path}: tracker row must include tracker_only_no_paper_trade")
+            result.critical(
+                f"{path}: tracker row must include tracker_only_no_paper_trade"
+            )
         if row.get("actionable") is not None:
             result.critical(f"{path}: tracker row actionable must be None")
         if row.get("would_be_live") is not None:
             result.critical(f"{path}: tracker row would_be_live must be None")
+        if row.get("counter_risk_score") is not None:
+            result.critical(f"{path}: tracker row counter_risk_score must be None")
+        if row.get("counter_flags") != []:
+            result.critical(f"{path}: tracker row counter_flags must be []")
+        if row.get("counter_risk_predicted_at") is not None:
+            result.critical(
+                f"{path}: tracker row counter_risk_predicted_at must be None"
+            )
         if group == "act_now":
             result.critical(f"{path}: tracker row cannot be in act_now")
 
@@ -586,15 +661,23 @@ def _check_group_meta(payload: dict, flat_rows: list[dict], result: Result) -> N
             actual = len(groups.get(group) or [])
             if group in group_counts and group in group_hidden:
                 if group_hidden[group] != group_counts[group] - actual:
-                    result.critical(f"meta.group_hidden_counts.{group} does not match count minus returned")
+                    result.critical(
+                        f"meta.group_hidden_counts.{group} does not match count minus returned"
+                    )
         if all(_is_non_bool_int(group_counts.get(g)) for g in EXPECTED_GROUPS):
-            if sum(group_counts[g] for g in EXPECTED_GROUPS) != meta.get("source_rows_considered"):
-                result.critical("sum(group_counts) must equal meta.source_rows_considered")
+            if sum(group_counts[g] for g in EXPECTED_GROUPS) != meta.get(
+                "source_rows_considered"
+            ):
+                result.critical(
+                    "sum(group_counts) must equal meta.source_rows_considered"
+                )
         if all(_is_non_bool_int(group_hidden.get(g)) for g in EXPECTED_GROUPS):
             if sum(group_hidden[g] for g in EXPECTED_GROUPS) != (
                 meta.get("source_rows_considered") - rows_returned
             ):
-                result.critical("sum(group_hidden_counts) must equal source_rows_considered - rows_returned")
+                result.critical(
+                    "sum(group_hidden_counts) must equal source_rows_considered - rows_returned"
+                )
 
     paper_considered = meta.get("paper_rows_considered")
     tracker_promoted = meta.get("tracker_rows_promoted")
@@ -602,9 +685,14 @@ def _check_group_meta(payload: dict, flat_rows: list[dict], result: Result) -> N
     tracker_considered = meta.get("tracker_rows_considered")
     open_scanned = meta.get("open_trades_scanned")
 
-    if all(_is_non_bool_int(v) for v in (paper_considered, tracker_promoted, source_considered)):
+    if all(
+        _is_non_bool_int(v)
+        for v in (paper_considered, tracker_promoted, source_considered)
+    ):
         if paper_considered + tracker_promoted != source_considered:
-            result.critical("paper_rows_considered + tracker_rows_promoted must equal source_rows_considered")
+            result.critical(
+                "paper_rows_considered + tracker_rows_promoted must equal source_rows_considered"
+            )
     if _is_non_bool_int(tracker_promoted) and tracker_promoted < returned_tracker:
         result.critical("tracker_rows_promoted must be >= returned tracker rows")
     if all(_is_non_bool_int(v) for v in (tracker_considered, tracker_promoted)):
@@ -617,7 +705,11 @@ def _check_group_meta(payload: dict, flat_rows: list[dict], result: Result) -> N
         result.critical("paper_rows_considered must be >= returned paper rows")
 
     block_counts = meta.get("block_reason_counts")
-    if isinstance(block_counts, dict) and isinstance(group_counts, dict) and isinstance(group_hidden, dict):
+    if (
+        isinstance(block_counts, dict)
+        and isinstance(group_counts, dict)
+        and isinstance(group_hidden, dict)
+    ):
         total_block_reasons = sum(
             v for v in block_counts.values() if _is_non_bool_int(v)
         )
@@ -631,9 +723,17 @@ def _check_group_meta(payload: dict, flat_rows: list[dict], result: Result) -> N
                     f"meta.block_reason_counts[{reason!r}] must be >= returned blocked rows for that reason"
                 )
         blocked_group_count = group_counts.get("blocked")
-        if _is_non_bool_int(blocked_group_count) and total_block_reasons > blocked_group_count:
-            result.critical("meta.block_reason_counts total cannot exceed group_counts.blocked")
-        if group_hidden.get("blocked") == 0 and block_counts != returned_blocked_reason_counts:
+        if (
+            _is_non_bool_int(blocked_group_count)
+            and total_block_reasons > blocked_group_count
+        ):
+            result.critical(
+                "meta.block_reason_counts total cannot exceed group_counts.blocked"
+            )
+        if (
+            group_hidden.get("blocked") == 0
+            and block_counts != returned_blocked_reason_counts
+        ):
             result.critical(
                 "meta.block_reason_counts must exactly match returned blocked reasons when no blocked rows are hidden"
             )
@@ -681,9 +781,7 @@ def validate_payload(
                 flat_rows.append(row)
 
     token_ids = [
-        row.get("token_id")
-        for row in flat_rows
-        if isinstance(row.get("token_id"), str)
+        row.get("token_id") for row in flat_rows if isinstance(row.get("token_id"), str)
     ]
     if len(token_ids) != len(set(token_ids)):
         result.critical("duplicate token_id rows are not allowed in Trade Inbox")
@@ -710,10 +808,12 @@ def fetch_and_validate(
     limit_per_group: int = 20,
     window_hours: int = 36,
 ) -> tuple[Result, int]:
-    query = urlencode({
-        "limit_per_group": limit_per_group,
-        "window_hours": window_hours,
-    })
+    query = urlencode(
+        {
+            "limit_per_group": limit_per_group,
+            "window_hours": window_hours,
+        }
+    )
     target = f"{url.rstrip('/')}/api/trade_inbox?{query}"
     started = time.monotonic()
     try:
@@ -748,7 +848,9 @@ def fetch_and_validate(
     )
     elapsed_ms = (time.monotonic() - started) * 1000
     if elapsed_ms > 3000:
-        result.warn(f"response latency {elapsed_ms:.0f}ms exceeds provisional 3000ms SLO")
+        result.warn(
+            f"response latency {elapsed_ms:.0f}ms exceeds provisional 3000ms SLO"
+        )
     return result, EXIT_OK if result.is_clean else EXIT_CRITICAL
 
 
@@ -778,18 +880,26 @@ def main(argv=None) -> int:
         window_hours=args.window_hours,
     )
     if args.json:
-        print(json.dumps({
-            "status": "ok" if exit_code == EXIT_OK else "fail",
-            "exit_code": exit_code,
-            "critical_count": len(result.criticals),
-            "warning_count": len(result.warnings),
-            "criticals": result.criticals,
-            "warnings": result.warnings,
-            "passed": result.passed,
-        }, indent=2, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "status": "ok" if exit_code == EXIT_OK else "fail",
+                    "exit_code": exit_code,
+                    "critical_count": len(result.criticals),
+                    "warning_count": len(result.warnings),
+                    "criticals": result.criticals,
+                    "warnings": result.warnings,
+                    "passed": result.passed,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
     else:
         label = "OK" if exit_code == EXIT_OK else "FAIL"
-        print(f"{label}: {len(result.criticals)} critical(s), {len(result.warnings)} warning(s)")
+        print(
+            f"{label}: {len(result.criticals)} critical(s), {len(result.warnings)} warning(s)"
+        )
         if args.verbose or exit_code != EXIT_OK:
             for msg in result.criticals:
                 print(f"CRITICAL: {msg}")

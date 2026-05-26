@@ -2,6 +2,7 @@
 
 import json
 import importlib.util
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,13 +24,36 @@ sys.modules["check_trade_inbox_contract"] = _CHECKER
 _CHECK_SPEC.loader.exec_module(_CHECKER)
 
 
-def _assert_trade_inbox_contract(payload: dict, *, limit_per_group: int, window_hours: int = 36) -> None:
+def _assert_trade_inbox_contract(
+    payload: dict, *, limit_per_group: int, window_hours: int = 36
+) -> None:
     result = _CHECKER.validate_payload(
         payload,
         requested_limit_per_group=limit_per_group,
         requested_window=window_hours,
     )
     assert result.is_clean, result.criticals
+
+
+def test_trade_inbox_counter_risk_is_display_only_in_backend_helpers():
+    source = (Path(__file__).resolve().parent.parent / "dashboard" / "db.py").read_text(
+        encoding="utf-8"
+    )
+    for helper in (
+        "_trade_block_reason",
+        "_trade_score",
+        "_trade_sort_key",
+        "_trade_why_now",
+    ):
+        match = re.search(
+            rf"def {helper}\(row: dict\).*?(?=^(?:async )?def |\Z)",
+            source,
+            flags=re.S | re.M,
+        )
+        assert match, f"{helper} not found"
+        body = match.group(0)
+        assert "counter_risk" not in body
+        assert "counter_flags" not in body
 
 
 @pytest.fixture
@@ -160,6 +184,46 @@ async def _insert_gainers_comparison(
     await conn.commit()
 
 
+async def _insert_prediction(
+    conn,
+    *,
+    coin_id: str,
+    predicted_at: str | None = None,
+    counter_risk_score: int = 30,
+    counter_flags: list | str | None = None,
+):
+    now = datetime.now(timezone.utc).isoformat()
+    flags = counter_flags if counter_flags is not None else []
+    flags_text = flags if isinstance(flags, str) else json.dumps(flags)
+    await conn.execute(
+        """INSERT INTO predictions
+           (category_id, category_name, coin_id, symbol, name,
+            market_cap_at_prediction, price_at_prediction,
+            narrative_fit_score, staying_power, confidence, reasoning,
+            strategy_snapshot, predicted_at,
+            counter_risk_score, counter_flags)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "test",
+            "Test Category",
+            coin_id,
+            coin_id.upper()[:8],
+            coin_id.title(),
+            1_000_000.0,
+            1.0,
+            50,
+            "medium",
+            "medium",
+            "test prediction",
+            "{}",
+            predicted_at or now,
+            counter_risk_score,
+            flags_text,
+        ),
+    )
+    await conn.commit()
+
+
 async def test_trade_inbox_groups_shape_and_read_only(client):
     c, db = client
     now = datetime.now(timezone.utc)
@@ -229,9 +293,104 @@ async def test_trade_inbox_promotes_tracker_only_gainer_to_watch(client):
     assert row["action_label"] == "WATCH_PULLBACK"
     assert "tracker_promotion" in row["inclusion_reasons"]
     assert "tracker_only_no_paper_trade" in row["risk_reasons"]
+    assert row["counter_risk_score"] is None
+    assert row["counter_flags"] == []
+    assert row["counter_risk_predicted_at"] is None
     assert payload["meta"]["tracker_rows_considered"] == 1
     assert payload["meta"]["tracker_rows_promoted"] == 1
     assert payload["meta"]["paper_rows_considered"] == 0
+
+
+async def test_trade_inbox_paper_row_includes_latest_counter_risk_context(client):
+    c, db = client
+    old_ts = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    new_ts = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+    await _insert_open_trade(db._conn, token_id="risk-token", current_price=103.0)
+    await _insert_prediction(
+        db._conn,
+        coin_id="risk-token",
+        predicted_at=old_ts,
+        counter_risk_score=10,
+        counter_flags=["old flag"],
+    )
+    rich_flags = [
+        "thin liquidity",
+        {
+            "type": "holder_concentration",
+            "severity": "warning",
+            "detail": "clustered holders",
+        },
+        None,
+    ]
+    await _insert_prediction(
+        db._conn,
+        coin_id="risk-token",
+        predicted_at=new_ts,
+        counter_risk_score=72,
+        counter_flags=rich_flags,
+    )
+
+    resp = await c.get("/api/trade_inbox?limit_per_group=10&window_hours=36")
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    _assert_trade_inbox_contract(payload, limit_per_group=10)
+    row = next(r for r in payload["groups"]["act_now"] if r["token_id"] == "risk-token")
+    assert row["counter_risk_score"] == 72
+    assert row["counter_flags"] == rich_flags[:2]
+    assert row["counter_risk_predicted_at"] == new_ts
+
+
+async def test_trade_inbox_counter_risk_does_not_affect_group_score_or_sort(client):
+    c, db = client
+    opened_a = (datetime.now(timezone.utc) - timedelta(hours=1, minutes=1)).isoformat()
+    opened_b = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    await _insert_open_trade(
+        db._conn,
+        token_id="plain-risk",
+        current_price=103.0,
+        opened_at=opened_a,
+    )
+    await _insert_open_trade(
+        db._conn,
+        token_id="high-risk",
+        current_price=103.0,
+        opened_at=opened_b,
+    )
+    await _insert_prediction(
+        db._conn,
+        coin_id="plain-risk",
+        counter_risk_score=5,
+        counter_flags=[],
+    )
+    await _insert_prediction(
+        db._conn,
+        coin_id="high-risk",
+        counter_risk_score=99,
+        counter_flags=[{"type": "risk", "severity": "warning"}],
+    )
+
+    resp = await c.get("/api/trade_inbox?limit_per_group=10&window_hours=36")
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    _assert_trade_inbox_contract(payload, limit_per_group=10)
+    rows = [
+        r
+        for r in payload["groups"]["act_now"]
+        if r["token_id"] in {"plain-risk", "high-risk"}
+    ]
+    assert [r["token_id"] for r in rows] == ["high-risk", "plain-risk"]
+    by_token = {r["token_id"]: r for r in rows}
+    assert (
+        by_token["plain-risk"]["group"] == by_token["high-risk"]["group"] == "act_now"
+    )
+    assert (
+        by_token["plain-risk"]["action_label"]
+        == by_token["high-risk"]["action_label"]
+        == "REVIEW_NOW"
+    )
+    assert by_token["plain-risk"]["trade_score"] == by_token["high-risk"]["trade_score"]
 
 
 async def test_trade_inbox_dedupes_tracker_row_behind_open_paper_trade(client):
