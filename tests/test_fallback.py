@@ -4,6 +4,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import structlog.testing
 
 from scout.mirofish.fallback import score_narrative_fallback, FallbackScoringError
 from scout.models import MiroFishResult
@@ -53,6 +54,31 @@ async def test_fallback_parses_json_response():
 
 
 @pytest.mark.asyncio
+async def test_fallback_success_does_not_log_raw_response():
+    response_json = json.dumps(
+        {
+            "narrative_score": 65,
+            "virality_class": "Medium",
+            "summary": "Moderate viral potential.",
+        }
+    )
+
+    mock_client = AsyncMock()
+    mock_client.messages.create.return_value = _mock_anthropic_response(response_json)
+
+    with structlog.testing.capture_logs() as logs:
+        result = await score_narrative_fallback(
+            SAMPLE_SEED, "test-api-key", client=mock_client
+        )
+
+    assert result.narrative_score == 65
+    assert all(entry.get("event") != "fallback_raw_response" for entry in logs)
+    assert all(
+        response_json not in str(value) for entry in logs for value in entry.values()
+    )
+
+
+@pytest.mark.asyncio
 async def test_fallback_extracts_json_from_markdown():
     """Claude sometimes wraps JSON in ```json code blocks."""
     content = '```json\n{"narrative_score": 80, "virality_class": "High", "summary": "Very viral."}\n```'
@@ -98,6 +124,21 @@ async def test_fallback_raises_on_invalid_json():
 
     with pytest.raises(FallbackScoringError):
         await score_narrative_fallback(SAMPLE_SEED, "test-api-key", client=mock_client)
+
+
+@pytest.mark.asyncio
+async def test_fallback_error_keeps_truncated_raw_text():
+    invalid_text = ("A" * 200) + "TAIL_SENTINEL_AFTER_200"
+    mock_client = AsyncMock()
+    mock_client.messages.create.return_value = _mock_anthropic_response(invalid_text)
+
+    with pytest.raises(FallbackScoringError) as excinfo:
+        await score_narrative_fallback(SAMPLE_SEED, "test-api-key", client=mock_client)
+
+    message = str(excinfo.value)
+    assert "Raw text:" in message
+    assert "A" * 200 in message
+    assert "TAIL_SENTINEL_AFTER_200" not in message
 
 
 @pytest.mark.asyncio

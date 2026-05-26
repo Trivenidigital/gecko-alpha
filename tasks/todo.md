@@ -1,5 +1,40 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-26 - MiroFish Debug Noise Suppress
+
+**Status:** BUILD IN PROGRESS. Goal: remove successful Anthropic fallback raw
+response DEBUG logs that pollute operator journal health greps, without
+changing fallback scoring behavior or parse-failure visibility.
+
+Workflow checklist:
+- [x] Drift/runtime check: one producer at `scout/mirofish/fallback.py`; prod
+  baseline on srilu at `a455365` showed `fallback_raw_response_24h=50`,
+  `fallback_raw_response_7d=350`, and broad health grep saw `4` hits involving
+  this event in 24h.
+- [x] Plan drafted: `tasks/plan_mirofish_debug_noise_suppress_2026_05_26.md`.
+- [x] Plan reviewed by 2 parallel agents and folds applied: post-deploy smoke
+  distinguishes no fallback observed vs fallback fired, broad health grep is
+  the acceptance surface, and tests must use `structlog.testing.capture_logs`.
+- [x] Design drafted: `tasks/design_mirofish_debug_noise_suppress_2026_05_26.md`.
+- [x] Design reviewed by 2 parallel agents; code/test fold applied to assert raw
+  response text is absent from captured log fields and use a unique tail
+  sentinel for the truncation boundary.
+- [x] TDD red: new fallback no-raw-response test failed on existing
+  `fallback_raw_response` event.
+- [x] Build verified.
+- [ ] PR opened, reviewed by 2 parallel agents, merged, and deployed.
+
+Verification:
+- Red: `uv run pytest -q tests/test_fallback.py` failed because successful
+  fallback still emitted `fallback_raw_response`.
+- Green: `uv run pytest -q tests/test_fallback.py tests/test_gate.py` =>
+  `13 passed`.
+- Hygiene: `git diff --check` clean.
+
+Non-scope:
+- No MiroFish client, prompt, model, score, gate, alert, DB, cron, dashboard, or
+  broad structlog configuration changes.
+
 ## Active Work: 2026-05-26 - Dashboard Contract Smoke Gate
 
 **Status:** DEPLOYED 2026-05-26. Goal: make the dashboard contract firewalls
