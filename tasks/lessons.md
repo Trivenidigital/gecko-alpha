@@ -60,6 +60,14 @@
   `~/.claude/projects/C--projects-gecko-alpha/memory` as well, then verify with
   a directory listing before claiming memory persistence.
 
+## Before proposing a new trader surface, audit the existing surface on motivating tokens
+
+- 2026-05-26 correction: I proposed a `Trade Now / Watch / Research` surface for noisy signal compression without first drift-checking the already-shipped trader cockpit, Action Queue, actionability drilldowns, N-gate verdicts, and Top Gainers source/outcome columns. That risks rebuilding primitives that already exist while missing the real residual gap.
+- Rule: before scoping a new trader-facing signal surface, build a gate-vs-existing-primitive matrix with file:line or PR evidence. Classify each gate as `tighten-existing`, `build-new`, or `not-needed`.
+- Rule: verify the diagnosis on the motivating tokens first. For TOES/BSB/BILL/UB/TROLL-style examples, query the cockpit/actionability history at the actionable window and record bucket, filter, block reason, and transition timing. If the token was visible but not acted on, the gap is urgency/action copy; if it was hidden, the gap is gate/ranking; if the system lacked history, the gap is observability.
+- Rule: treat urgency-state classification as its own scoped design, not a bullet. Break out breakout-level computation, pullback policy, too-late definition, and alert hysteresis. Offline runner labels may evaluate the classifier only after pinning the universe and enforcing `runner_board_ts > snapshot_ts`.
+- Rule: "no paper-trade/cockpit row" is not a root cause. Path-trace each motivating token through detector hit, scorer-corpus eligibility, conviction gate, dispatch/live-slot decision, paper-trade insert, and cockpit verdict. Separate corpus mismatch, gate block, slot-full, missing dispatch path, and race/pipeline gaps before scoping promotion, urgency, or ranking work.
+
 ## Rebase PR branches after adjacent backlog PRs land
 
 - 2026-05-17 correction: I left PR #146 based on `63aa13b` after #147 and
