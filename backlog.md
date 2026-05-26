@@ -11,11 +11,9 @@ Operator close-development block 2026-05-22 explicitly parks the following items
 - `BL-NEW-X-KOL-COST-GOVERNOR` — gated on source_calls X-handle cohort rankability
 - Any KOL / TG / X ranking or pruning surface — gated on source_calls coverage
 
-**Parked until actionability data gate clears (`n_actionable >= 20 AND n_exploratory >= 5`):**
-- Actionability v2 (suppression policy, capital reallocation, classifier changes)
-- Source-quality gate consumption
-- Actionability classifier changes
-- Current n: actionable=21, exploratory=3. Next trigger: ~2026-05-25 to 2026-05-29. See `tasks/findings_actionability_gate_check_2026_05_22.md`.
+**Actionability data gate status (`n_actionable >= 20 AND n_exploratory >= 5`):**
+- CLEARED 2026-05-26: actionable=55, exploratory=16, zero malformed stamped rows. See `tasks/findings_actionability_gate_revalidation_2026_05_26.md`.
+- This clears the stale row-count wait, not the policy evidence bar. Actionability v2, suppression, source-quality gate consumption, and classifier changes still require their own fresh drift/runtime re-scope and separate plan/design before implementation.
 
 **Parked until operator decision (no engineering work pending):**
 - Operator-alert activation (`BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE` ENDPOINT-SHIPPED / HERMES-SKILL-PENDING — see runbook)
@@ -104,8 +102,8 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 
 **Rule:** TG/X and KOLs stay context-only until this track makes source-call outcomes rankable.
 
-### Track 3 - Data-Gated Strategy Evidence (wait for triggers)
-- `BL-NEW-X-OUTCOME-LINKAGE`, `BL-NEW-TG-OUTCOME-LINKAGE`, and `BL-NEW-NO-PEAK-RISK-HANDLING` - designs/audits are merged but implementation waits for the actionability re-check gates.
+### Track 3 - Data-Gated Strategy Evidence (actionability gate cleared; re-scope before build)
+- `BL-NEW-X-OUTCOME-LINKAGE`, `BL-NEW-TG-OUTCOME-LINKAGE`, and `BL-NEW-NO-PEAK-RISK-HANDLING` - no longer blocked by the `20/5` actionability row-count gate as of `tasks/findings_actionability_gate_revalidation_2026_05_26.md`, but each still needs a fresh drift/runtime re-scope before implementation.
 - `BL-NEW-COHORT-DIGEST-DECISION`, first_signal 2026-05-31 revival decision, and revival criteria follow-ups - data-bound decisions, not calendar-driven build work.
 - Social-denominator Option B/C - operator-choice item; now should be evaluated through the signal-trust roadmap rather than as an isolated scorer tweak.
 
@@ -383,7 +381,7 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 **Why:** Current paper trades mix decision-bearing and exploratory cohorts. The 2026-05-19 profit-pattern analysis found sharp separation between profitable current-regime patterns (`narrative_prediction`, `chain_completed`, `volume_spike`) and junk/exploratory patterns (`losers_contrarian`, weak `gainers_early`, low-n `trending_catch`).
 **Evidence:** `tasks/findings_profit_patterns_2026_05_19.md`
 **Decision:** Complete. `paper_trades.actionable`, `actionability_reason`, and `actionability_version` now mark decision-bearing vs exploratory cohorts without suppressing raw signal collection. 24h validation remains a separate evidence gate in `tasks/runbook_actionability_validation_2026_05_19.md`.
-**Data-gate check 2026-05-22 (close-dev block P4):** THIN. n_actionable_closed=21 (≥20 ✓), n_exploratory_closed=3 (<5 ✗); no early-fire trip; actionable cohort positive (+$224.58 / 19 wins / 2 losses / 90.5% WR). Next data-bound trigger: `n_exploratory_closed ≥ 5`, est. 2026-05-25 to 2026-05-29 at current exploratory closure rate (~0.92/day). No v2 / suppression action taken. See `tasks/findings_actionability_gate_check_2026_05_22.md`.
+**Data-gate revalidation 2026-05-26:** CLEARED / no immediate implementation authorized. v1 closed rows now actionable=55 (+$335.53 / 43 wins / 12 losses) and exploratory=16 (-$385.63 / 7 wins / 9 losses), with zero malformed stamped rows and no mixed-version/pre-cutover anomaly. The row-count wait is closed, but exploratory n remains below 20 and exit-shape dominates PnL, so no v2 / suppression / source-quality consumption action is taken in this PR. See `tasks/findings_actionability_gate_revalidation_2026_05_26.md`.
 
 ### BL-NEW-ACTIONABILITY-GATE-V1-IMPLEMENT
 **Status:** SHIPPED 2026-05-19 — PR #181 merged `7506adc`; deployed to srilu and verified with fresh stamped rows 2206-2208. PR #182 merged/deployed `32df89d` for dashboard/API visibility.
@@ -392,17 +390,17 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 **Plan:** `tasks/plan_actionability_gate_v1.md`
 
 ### BL-NEW-X-OUTCOME-LINKAGE
-**Status:** DESIGN-MERGED / ACTIONABILITY-RUNBOOK-GATED / IMPLEMENTATION-PENDING-N-SUFFICIENT 2026-05-21 — design doc merged via PR #184 as `2e2f506c` (squash 2026-05-21). Re-check gate symmetric per overnight decision harvest. **Primary (implementation-eligibility) clause:** n_actionable_closed≥20 AND n_exploratory_closed≥5. **Early-fire re-evaluation triggers** (any triggers a *re-validation pass*, not automatic implementation start): (a) ≥1 exploratory closed with `pnl_usd > 0` (false-negative signal); (b) n_exploratory≥5 AND ≥4 losses with one-sided binomial 95% LB exceeding null (loss-rate > 50% baseline); (c) n_actionable≥15 AND cohort `total_pnl<-$50`. **Multi-clause precedence:** if multiple clauses fire, treat as independent investigation tracks, not summed evidence. Current n (close-dev check 2026-05-22): **n_actionable=21, n_exploratory=3** — primary clause short by 2 exploratory closures; early-fire (a) fires weakly (1 exploratory win), early-fire (b) and (c) clearly NOT met (cohort is positive). Implementation does NOT start unless the primary clause triggers AND the re-validation pass confirms the gate's intent holds.
+**Status:** DESIGN-MERGED / RE-SCOPE-ELIGIBLE-AFTER-ACTIONABILITY-REVALIDATION 2026-05-26 - design doc merged via PR #184 as `2e2f506c` (squash 2026-05-21). The actionability `20/5` row-count gate cleared in `tasks/findings_actionability_gate_revalidation_2026_05_26.md`; implementation still must start with a fresh drift/runtime re-scope and must not treat the actionability finding as automatic approval.
 **Why:** X handle ranking is blocked: 215 X alerts had 0 priced outcomes because `resolved_coin_id`/pricing linkage is missing.
 **Scope:** Persist `resolved_coin_id`, `x_handle`, outcome status, entry/current price, and $300 notional P&L.
 
 ### BL-NEW-TG-OUTCOME-LINKAGE
-**Status:** DESIGN-MERGED / ACTIONABILITY-RUNBOOK-GATED / IMPLEMENTATION-PENDING-N-SUFFICIENT 2026-05-21 — same merge as BL-NEW-X-OUTCOME-LINKAGE; design doc in PR #184 (`2e2f506c`). Same symmetric re-check gate. **Current n (close-dev check 2026-05-22): n_actionable=21, n_exploratory=3 — gate not yet met.** TG side is already structurally FK-linked via `tg_social_signals.paper_trade_id`; the design covers the `linkage_state` disambiguator + backfill + unified view.
+**Status:** DESIGN-MERGED / RE-SCOPE-ELIGIBLE-AFTER-ACTIONABILITY-REVALIDATION 2026-05-26 - same merge as BL-NEW-X-OUTCOME-LINKAGE; design doc in PR #184 (`2e2f506c`). The actionability `20/5` row-count gate cleared in `tasks/findings_actionability_gate_revalidation_2026_05_26.md`; implementation still needs fresh drift/runtime re-scope. TG side is already structurally FK-linked via `tg_social_signals.paper_trade_id`; the design covers the `linkage_state` disambiguator + backfill + unified view.
 **Why:** TG channel ranking is blocked: only 2 current-regime closed linked trades, both low-n losses.
 **Scope:** Persist and dashboard `tg_channel`, `resolution_state`, `posted_at`, `paper_trade_id`, and `mcap_at_sighting`.
 
 ### BL-NEW-NO-PEAK-RISK-HANDLING
-**Status:** AUDIT-MERGED / ACTIONABILITY-RUNBOOK-GATED / IMPLEMENTATION-PENDING-N-SUFFICIENT 2026-05-21 — peak-giveback / freshness historical audit merged via PR #183 as `4e672fe6` (squash 2026-05-21). V2 candidate identified: `pre_entry_peak_gain_pct >= 40%` AND `pre_entry_giveback_ratio >= 0.50` (current-regime −$962/52 trades; all-history −$1,034/66). Same symmetric re-check gate as BL-NEW-X-OUTCOME-LINKAGE (primary clause = n_actionable≥20 AND n_exploratory≥5; clauses a/b/c are early-fire RE-EVALUATION triggers, not implementation greenlights). V2 gate must additionally require `pre_entry_giveback_ratio IS NOT NULL` per the audit's coverage appendix.
+**Status:** AUDIT-MERGED / RE-SCOPE-ELIGIBLE-AFTER-ACTIONABILITY-REVALIDATION 2026-05-26 - peak-giveback / freshness historical audit merged via PR #183 as `4e672fe6` (squash 2026-05-21). V2 candidate identified: `pre_entry_peak_gain_pct >= 40%` AND `pre_entry_giveback_ratio >= 0.50` (current-regime -$962/52 trades; all-history -$1,034/66). The actionability `20/5` row-count gate cleared in `tasks/findings_actionability_gate_revalidation_2026_05_26.md`; implementation still needs fresh drift/runtime re-scope and the V2 gate must require `pre_entry_giveback_ratio IS NOT NULL` per the audit coverage appendix.
 **Why:** `no_peak_<5` current-regime bucket is deeply negative (-$6,090.86 / n=99), but `peak_pct` is not available at trade-open time.
 **Scope:** Design a peak<5 early-exit or hard-risk policy separately; do not mix exit/risk handling into Actionability Gate v1.
 
