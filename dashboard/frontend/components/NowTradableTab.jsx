@@ -32,6 +32,7 @@ function fmtIso(iso) {
 function riskBucket(score) {
   const n = Number(score)
   if (!Number.isFinite(n)) return null
+  if (n < 0 || n > 100) return null
   if (n < 30) return 'low'
   if (n <= 60) return 'mid'
   return 'high'
