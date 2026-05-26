@@ -67,6 +67,7 @@
 - Rule: verify the diagnosis on the motivating tokens first. For TOES/BSB/BILL/UB/TROLL-style examples, query the cockpit/actionability history at the actionable window and record bucket, filter, block reason, and transition timing. If the token was visible but not acted on, the gap is urgency/action copy; if it was hidden, the gap is gate/ranking; if the system lacked history, the gap is observability.
 - Rule: treat urgency-state classification as its own scoped design, not a bullet. Break out breakout-level computation, pullback policy, too-late definition, and alert hysteresis. Offline runner labels may evaluate the classifier only after pinning the universe and enforcing `runner_board_ts > snapshot_ts`.
 - Rule: "no paper-trade/cockpit row" is not a root cause. Path-trace each motivating token through detector hit, scorer-corpus eligibility, conviction gate, dispatch/live-slot decision, paper-trade insert, and cockpit verdict. Separate corpus mismatch, gate block, slot-full, missing dispatch path, and race/pipeline gaps before scoping promotion, urgency, or ranking work.
+- Rule: instrument decision-support promotion/blocks before expanding the promotion surface. If promotion ships before structured decision events, future "why did X surface or not surface?" audits fall back to journal archaeology and repeat the same failure mode.
 
 ## Rebase PR branches after adjacent backlog PRs land
 

@@ -105,14 +105,17 @@ same missing corpus would not have surfaced TOES.
 
 Smallest build, if we choose to build:
 
+0. **Gate-decision event log first.**
+   Ship structured promotion/block events before expanding the promotion
+   surface. Otherwise future audits of "why was X promoted/blocked?" fall back
+   to journal grep, which is the failure mode this diagnostic had to unwind.
+   Backfill what is cheap from existing journal evidence, but treat live
+   write-time events as the durable source going forward.
 1. **Tracker-to-Trade-Inbox promotion path, read-only / watch-only.**
    Add Top Gainers comparison rows as a second source corpus for the existing
    Trade Inbox even when paper trading is disabled or no paper row exists. Label
-   them separately from paper-backed candidates.
-2. **Persist gate-decision events.**
-   For each promoted/blocked tracker candidate, record why it is present or
-   absent: disabled signal, stale price, late-pump filter, missing price, no
-   source confidence, duplicate open position, or not enough metadata.
+   them separately from paper-backed candidates and write the decision event
+   from day one.
 3. **Only after promotion produces enough rows, scope urgency.**
    Gate urgency-state design on a measured queue fire rate, for example
    `>= N promoted tracker candidates/day` or `>= N concurrent watch candidates`
@@ -120,6 +123,44 @@ Smallest build, if we choose to build:
 
 Do not re-enable `gainers_early` or loosen paper-trade policy from this finding
 alone. The point is trader visibility of detector wins, not automatic entry.
+
+## Follow-Up Attribution: `gainers_early` Auto-Suspension
+
+This diagnostic found that `gainers_early` was disabled on 2026-05-19, but does
+not decide whether that auto-suspension was correct. File
+`BL-NEW-GAINERS-EARLY-2026-05-19-AUTOSUSPEND-ATTRIBUTION` before the build PR
+frames tracker promotion as the only fix.
+
+Question to answer: why did `gainers_early` move from the 2026-05-13 KEEP-ON
+state (`+$1,894`, `n=128`, `72.7%` win rate per memory) to hard-loss
+auto-suspension six days later?
+
+Candidate causes to separate:
+
+- Real regime shift.
+- Hard-loss gate over-fire or threshold defect.
+- Code/config change between 2026-05-13 and 2026-05-19 changed signal behavior.
+- Data-path issue that made the hard-loss gate see a distorted cohort.
+
+If the auto-suspension was correct, tracker promotion should decouple
+decision-support visibility from auto-trading state. If it was incorrect, the
+build may need to compose with an auto-suspend fix rather than treating disabled
+paper entry as a stable fact.
+
+## Pre-Pinned Build Defaults
+
+- **Endpoint shape:** unresolved operator decision. Weak prior: separate
+  `/api/tracker_candidates` or an explicitly separate source corpus inside
+  `/api/trade_inbox`, so paper-backed and tracker-only rows remain visibly
+  distinct.
+- **Retention window:** measure tracker dwell-time distribution first; set
+  retention slightly longer than median with an explicit cap. Do not pick a
+  number before measuring.
+- **Alerting:** dashboard-only first. Do not add Telegram alerts until the
+  promotion fire rate is measured and the operator chooses an alert threshold.
+- **Plan/design requirements for build PR:** include `**New primitives
+  introduced:**`, a Hermes-first analysis section, and an explicit §12a stance
+  for any new event table or heartbeat.
 
 ## Follow-Up Questions Before Build
 

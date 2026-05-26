@@ -25,6 +25,9 @@ Review notes:
 - PR review folds: token-level session keys for changed-group detection; blocked rows render primary block/risk diagnostics before why-now text; source-truncated banner exposes max-scan action; malformed `price_updated_at` is data-insufficient/blocked; SQL scan-cap truncation sets `source_truncated`.
 - Refinement round: kept `new` row status visible for a 10-minute review window so auto-refresh/render effects do not immediately erase novelty before the operator scans the queue.
 
+Follow-up filed 2026-05-26:
+- [ ] **BL-NEW-GAINERS-EARLY-2026-05-19-AUTOSUSPEND-ATTRIBUTION**: before building tracker-to-inbox promotion, attribute why `gainers_early` moved from 2026-05-13 KEEP-ON (`+$1,894`, `n=128`, `72.7%` win rate) to 2026-05-19 hard-loss auto-suspension. Separate real regime shift, hard-loss gate over-fire, code/config change, and distorted data path. This does not block PR #277, but should shape the build PR framing.
+
 ## Active Work: 2026-05-25 — Live candidates determinism + contract delta
 
 **Status:** PR-READY (local commit). Goal: make `/api/live_candidates` deterministic (backend ordering + frontend keys) and extend the contract validator to enforce deterministic ordering + uniqueness.
