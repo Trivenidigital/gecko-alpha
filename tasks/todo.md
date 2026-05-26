@@ -2,7 +2,7 @@
 
 ## Active Work: 2026-05-26 - MiroFish Debug Noise Suppress
 
-**Status:** BUILD IN PROGRESS. Goal: remove successful Anthropic fallback raw
+**Status:** DEPLOYED 2026-05-26. Goal: remove successful Anthropic fallback raw
 response DEBUG logs that pollute operator journal health greps, without
 changing fallback scoring behavior or parse-failure visibility.
 
@@ -22,13 +22,21 @@ Workflow checklist:
 - [x] TDD red: new fallback no-raw-response test failed on existing
   `fallback_raw_response` event.
 - [x] Build verified.
-- [ ] PR opened, reviewed by 2 parallel agents, merged, and deployed.
+- [x] PR opened (#286), reviewed by 2 parallel agents, merged, and deployed.
 
 Verification:
 - Red: `uv run pytest -q tests/test_fallback.py` failed because successful
   fallback still emitted `fallback_raw_response`.
 - Green: `uv run pytest -q tests/test_fallback.py tests/test_gate.py` =>
   `13 passed`.
+- Full suite with dummy required secrets:
+  `uv run pytest --tb=short -q --timeout=180 --timeout-method=thread` =>
+  `2801 passed, 158 skipped, 11 warnings`.
+- CI: PR #286 GitHub Actions `test` passed.
+- Deploy: srilu fast-forwarded `a455365` -> `8e799ea` and
+  `gecko-pipeline` was restarted. Deploy-window smoke:
+  `fallback_attempts=0`, `fallback_failures=0`, `raw_response_events=0`,
+  `broad_health_hits=0`; recorded as clean no-live-fallback-observed smoke.
 - Hygiene: `git diff --check` clean.
 
 Non-scope:
