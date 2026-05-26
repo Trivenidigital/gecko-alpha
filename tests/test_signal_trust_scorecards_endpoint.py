@@ -191,12 +191,16 @@ async def test_scorecards_degrades_when_stamps_columns_missing(tmp_path):
                  signal_type TEXT,
                  status TEXT,
                  closed_at TEXT,
-                 amount_usd REAL
+                 opened_at TEXT,
+                 symbol TEXT,
+                 amount_usd REAL,
+                 pnl_usd REAL,
+                 pnl_pct REAL
                )"""
         )
         conn.execute(
-            """INSERT INTO paper_trades (signal_type, status, closed_at, amount_usd)
-               VALUES ('volume_spike', 'open', NULL, 123.0)"""
+            """INSERT INTO paper_trades (signal_type, status, closed_at, opened_at, symbol, amount_usd, pnl_usd, pnl_pct)
+               VALUES ('volume_spike', 'open', NULL, datetime('now'), 'V', 123.0, NULL, NULL)"""
         )
         conn.commit()
     finally:
@@ -249,12 +253,16 @@ async def test_scorecards_union_of_keys_includes_registry_only_and_db_only(tmp_p
                  signal_type TEXT,
                  status TEXT,
                  closed_at TEXT,
-                 amount_usd REAL
+                 opened_at TEXT,
+                 symbol TEXT,
+                 amount_usd REAL,
+                 pnl_usd REAL,
+                 pnl_pct REAL
                )"""
         )
         conn.execute(
-            """INSERT INTO paper_trades (signal_type, status, closed_at, amount_usd)
-               VALUES ('db_only_signal', 'open', NULL, 10.0)"""
+            """INSERT INTO paper_trades (signal_type, status, closed_at, opened_at, symbol, amount_usd, pnl_usd, pnl_pct)
+               VALUES ('db_only_signal', 'open', NULL, datetime('now'), 'D', 10.0, NULL, NULL)"""
         )
         conn.commit()
     finally:
@@ -269,3 +277,55 @@ async def test_scorecards_union_of_keys_includes_registry_only_and_db_only(tmp_p
     assert "registry_only_signal" in signal_types
     assert "db_only_signal" in signal_types
     assert signal_types == sorted(signal_types)
+
+
+async def test_scorecards_window_boundary_respects_time_of_day_for_isoformat_closed_at(client):
+    from datetime import datetime, timedelta, timezone
+
+    c, d = client
+    conn = d._conn
+    assert conn is not None
+
+    # Craft a closed_at slightly BEFORE the 7d cutoff; this should be excluded from 7d stats.
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    closed_at = (cutoff - timedelta(hours=2)).isoformat()
+
+    await conn.execute(
+        """INSERT INTO paper_trades
+           (token_id, symbol, name, chain, signal_type, signal_data,
+            entry_price, amount_usd, quantity,
+            tp_pct, sl_pct, tp_price, sl_price,
+            status, opened_at, closed_at,
+            pnl_usd, pnl_pct,
+            would_be_live, actionable)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "t4",
+            "T4",
+            "t4",
+            "coingecko",
+            "volume_spike",
+            "{}",
+            1.0,
+            10.0,
+            1.0,
+            20.0,
+            10.0,
+            1.2,
+            0.9,
+            "closed",
+            datetime.now(timezone.utc).isoformat(),
+            closed_at,
+            1.0,
+            5.0,
+            1,
+            1,
+        ),
+    )
+    await conn.commit()
+
+    resp = await c.get("/api/signal_trust/scorecards")
+    assert resp.status_code == 200
+    row = next(r for r in resp.json()["rows"] if r["signal_type"] == "volume_spike")
+    w7 = next(w for w in row["windows"] if w["days"] == 7)
+    assert w7["closed"]["closed_n"] == 0
