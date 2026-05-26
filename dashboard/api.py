@@ -20,6 +20,7 @@ from dashboard.models import (
     CandidateResponse,
     FunnelResponse,
     LiveCandidateCockpit,
+    SignalTrustScorecardsResponse,
     SignalHitRate,
     StatusResponse,
     TradeInboxResponse,
@@ -385,6 +386,33 @@ def create_app(db_path: str | None = None) -> FastAPI:
             headers=headers,
             content={"meta": meta, "registry": doc},
         )
+
+    @app.get(
+        "/api/signal_trust/scorecards", response_model=SignalTrustScorecardsResponse
+    )
+    async def get_signal_trust_scorecards():
+        from fastapi.responses import JSONResponse
+
+        payload = await db.get_signal_trust_scorecards(_db_path)
+        meta = payload.get("meta") or {}
+
+        headers = {"Cache-Control": "no-store"}
+
+        if meta.get("ok") is False:
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": "60"},
+                content={
+                    "meta": meta,
+                    "error": payload.get("error")
+                    or {
+                        "code": "unknown",
+                        "message": "scorecards unavailable",
+                    },
+                },
+            )
+
+        return JSONResponse(status_code=200, headers=headers, content=payload)
 
     # --- Global cross-table search ---
 

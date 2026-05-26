@@ -4,6 +4,8 @@ import json
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import os
 
 import aiosqlite
 import structlog
@@ -2417,6 +2419,294 @@ async def get_trading_stats_by_signal(db_path: str, days: int = 7) -> dict:
             }
         return result
 
+
+# --- Signal trust scorecards (read-only) ---
+
+
+def _safe_rate(numer: int, denom: int) -> float | None:
+    if denom <= 0:
+        return None
+    return numer / denom
+
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def get_signal_trust_scorecards(db_path: str) -> dict:
+    """Read-only scorecards joining trust registry + paper_trades cohort evidence.
+
+    V1 contract:
+      - fixed windows_days = [7, 14, 30]
+      - closed-trade stats anchored on closed_at window (via existing helper)
+      - open stats are current-state status='open' (not windowed)
+      - stamp/confusion metrics are additive and must not treat NULL as false
+    """
+    windows_days = [7, 14, 30]
+    generated_at = _now_utc_iso()
+    log = structlog.get_logger()
+
+    # Open stats (current-state), plus signal universe seeds from DB.
+    open_by_signal: dict[str, dict] = {}
+    db_signal_types: set[str] = set()
+
+    async with _ro_db(db_path) as db:
+        try:
+            cursor = await db.execute(
+                """SELECT signal_type,
+                          COUNT(*) AS open_count,
+                          COALESCE(SUM(amount_usd), 0) AS open_exposure_usd
+                     FROM paper_trades
+                    WHERE status='open'
+                      AND closed_at IS NULL
+                    GROUP BY signal_type""",
+            )
+            rows = await cursor.fetchall()
+            for r in rows:
+                st = r["signal_type"]
+                if not st:
+                    continue
+                db_signal_types.add(st)
+                open_by_signal[st] = {
+                    "open_count": int(r["open_count"] or 0),
+                    "open_exposure_usd": float(r["open_exposure_usd"] or 0.0),
+                }
+        except aiosqlite.OperationalError as e:
+            # If paper_trades is missing, treat as a hard data-missing error.
+            msg = str(e).lower()
+            if "no such table" in msg and "paper_trades" in msg:
+                log.warning(
+                    "signal_trust_scorecards_data_missing",
+                    reason="paper_trades_missing",
+                )
+                return {
+                    "meta": {
+                        "ok": False,
+                        "read_only": True,
+                        "not_for_pruning": True,
+                        "not_for_auto_disable": True,
+                        "experimental": True,
+                        "generated_at": generated_at,
+                        "windows_days": windows_days,
+                        "data_missing_reason": "paper_trades_missing",
+                    },
+                    "rows": [],
+                    "error": {
+                        "code": "paper_trades_missing",
+                        "message": "paper_trades table missing; scorecards unavailable",
+                    },
+                }
+
+            # Other OE (missing column, etc.) should degrade later; leave open stats empty.
+            open_by_signal = {}
+
+        # Discover any signal_types present in closed rows (helps union-of-keys).
+        try:
+            cursor2 = await db.execute(
+                """SELECT DISTINCT signal_type
+                     FROM paper_trades
+                    WHERE closed_at IS NOT NULL
+                      AND status!='open'
+                    LIMIT 5000"""
+            )
+            for r in await cursor2.fetchall():
+                st = r["signal_type"]
+                if st:
+                    db_signal_types.add(st)
+        except aiosqlite.OperationalError:
+            pass
+
+        # Stamp/confusion stats by window.
+        stamp_by_window: dict[int, dict[str, dict]] = {}
+        stamps_available = True
+        stamps_reason: str | None = None
+        for days in windows_days:
+            try:
+                cursor3 = await db.execute(
+                    """SELECT signal_type,
+                              COUNT(*) AS closed_n,
+                              SUM(CASE WHEN actionable IS NOT NULL THEN 1 ELSE 0 END) AS actionable_known_n,
+                              SUM(CASE WHEN would_be_live IS NOT NULL THEN 1 ELSE 0 END) AS would_be_live_known_n,
+                              SUM(CASE WHEN actionable IS NOT NULL AND would_be_live IS NOT NULL THEN 1 ELSE 0 END) AS both_known_n,
+                              SUM(CASE WHEN (actionable IS NULL) != (would_be_live IS NULL) THEN 1 ELSE 0 END) AS null_mismatch_n,
+                              SUM(CASE WHEN actionable=1 THEN 1 ELSE 0 END) AS actionable_ones,
+                              SUM(CASE WHEN would_be_live=1 THEN 1 ELSE 0 END) AS would_be_live_ones,
+                              SUM(CASE WHEN actionable=1 AND would_be_live=1 THEN 1 ELSE 0 END) AS a1_w1,
+                              SUM(CASE WHEN actionable=1 AND would_be_live=0 THEN 1 ELSE 0 END) AS a1_w0,
+                              SUM(CASE WHEN actionable=0 AND would_be_live=1 THEN 1 ELSE 0 END) AS a0_w1,
+                              SUM(CASE WHEN actionable=0 AND would_be_live=0 THEN 1 ELSE 0 END) AS a0_w0
+                         FROM paper_trades
+                        WHERE closed_at IS NOT NULL
+                          AND status!='open'
+                          AND closed_at >= datetime('now', ?)
+                        GROUP BY signal_type""",
+                    (f"-{days} days",),
+                )
+                stamp_rows = await cursor3.fetchall()
+            except aiosqlite.OperationalError as e:
+                msg = str(e).lower()
+                if "no such column" in msg and (
+                    "actionable" in msg or "would_be_live" in msg
+                ):
+                    stamps_available = False
+                    stamps_reason = "stamps_unavailable"
+                    stamp_by_window = {}
+                    break
+                # Unknown OE: treat as stamps unavailable rather than breaking dashboard.
+                stamps_available = False
+                stamps_reason = "stamps_unavailable"
+                stamp_by_window = {}
+                break
+
+            by_signal: dict[str, dict] = {}
+            for r in stamp_rows:
+                st = r["signal_type"]
+                if not st:
+                    continue
+                db_signal_types.add(st)
+                closed_n = int(r["closed_n"] or 0)
+                actionable_known_n = int(r["actionable_known_n"] or 0)
+                would_be_live_known_n = int(r["would_be_live_known_n"] or 0)
+                both_known_n = int(r["both_known_n"] or 0)
+                null_mismatch_n = int(r["null_mismatch_n"] or 0)
+
+                actionable_ones = int(r["actionable_ones"] or 0)
+                would_be_live_ones = int(r["would_be_live_ones"] or 0)
+                a1_w1 = int(r["a1_w1"] or 0)
+                a1_w0 = int(r["a1_w0"] or 0)
+                a0_w1 = int(r["a0_w1"] or 0)
+                a0_w0 = int(r["a0_w0"] or 0)
+                disagree_n = a1_w0 + a0_w1
+
+                by_signal[st] = {
+                    "closed_n": closed_n,
+                    "both_known_n": both_known_n,
+                    "null_mismatch_n": null_mismatch_n,
+                    "unknown_n": max(0, closed_n - both_known_n),
+                    "actionable_known_n": actionable_known_n,
+                    "actionable_unknown_n": max(0, closed_n - actionable_known_n),
+                    "actionable_rate": _safe_rate(actionable_ones, actionable_known_n),
+                    "would_be_live_known_n": would_be_live_known_n,
+                    "would_be_live_unknown_n": max(0, closed_n - would_be_live_known_n),
+                    "would_be_live_rate": _safe_rate(
+                        would_be_live_ones, would_be_live_known_n
+                    ),
+                    "confusion": {
+                        "a1_w1": a1_w1,
+                        "a1_w0": a1_w0,
+                        "a0_w1": a0_w1,
+                        "a0_w0": a0_w0,
+                    },
+                    "disagree_n": disagree_n,
+                    "disagree_rate": _safe_rate(disagree_n, both_known_n),
+                }
+            stamp_by_window[days] = by_signal
+
+    # Closed-trade stats: reuse existing helper (avoid metric drift).
+    closed_stats_by_window: dict[int, dict[str, dict]] = {}
+    for days in windows_days:
+        try:
+            cohort = await get_trading_stats_by_signal_cohort(db_path, days=days)
+        except Exception:
+            cohort = {}
+        full_rows = cohort.get("full_cohort") or []
+        by_signal: dict[str, dict] = {}
+        for r in full_rows:
+            st = r.get("signal_type")
+            if not st:
+                continue
+            db_signal_types.add(st)
+            by_signal[st] = {
+                "closed_n": int(r.get("trades") or 0),
+                "wins": int(r.get("wins") or 0),
+                "win_rate_pct": float(r.get("win_rate_pct") or 0.0),
+                "total_pnl_usd": float(r.get("total_pnl_usd") or 0.0),
+                "avg_pnl_pct": float(r.get("avg_pnl_pct") or 0.0),
+            }
+        closed_stats_by_window[days] = by_signal
+
+    # Registry: load from shipped JSON file (same as /api/signal_trust_registry).
+    registry_path = os.environ.get("GECKO_SIGNAL_TRUST_REGISTRY_PATH")
+    if not registry_path:
+        registry_path = str(
+            Path(__file__).resolve().parent.parent
+            / "docs"
+            / "superpowers"
+            / "registries"
+            / "signal_trust_registry.v1.json"
+        )
+    try:
+        doc = json.loads(Path(registry_path).read_text(encoding="utf-8"))
+        entries = doc.get("entries") if isinstance(doc, dict) else None
+        entry_list = entries if isinstance(entries, list) else []
+    except Exception:
+        entry_list = []
+
+    registry_by_signal: dict[str, dict] = {}
+    for e in entry_list:
+        if not isinstance(e, dict):
+            continue
+        st = e.get("signal_type")
+        if not isinstance(st, str) or not st:
+            continue
+        dq = e.get("data_quality") if isinstance(e.get("data_quality"), dict) else {}
+        ng = e.get("next_gate") if isinstance(e.get("next_gate"), dict) else {}
+        registry_by_signal[st] = {
+            "maturity_state": e.get("maturity_state"),
+            "data_quality_warning": dq.get("warning"),
+            "next_gate_type": ng.get("type"),
+            "next_gate_threshold": ng.get("threshold"),
+        }
+
+    # Union-of-keys contract: registry ∪ db
+    all_signal_types = sorted(set(registry_by_signal.keys()) | db_signal_types)
+
+    rows: list[dict] = []
+    for st in all_signal_types:
+        row = {
+            "signal_type": st,
+            "registry": registry_by_signal.get(st),
+            "open": open_by_signal.get(st, {"open_count": 0, "open_exposure_usd": 0.0}),
+            "windows": [],
+        }
+        for days in windows_days:
+            closed_stats = closed_stats_by_window.get(days, {}).get(st, {})
+            win_closed_n = int(closed_stats.get("closed_n") or 0)
+            warnings: list[str] = []
+            if win_closed_n > 0 and win_closed_n < 10:
+                warnings.append("low_n")
+            stamps = None
+            if stamps_available:
+                stamps = stamp_by_window.get(days, {}).get(st)
+                if stamps is not None and win_closed_n > 0 and stamps.get("both_known_n", 0) == 0:
+                    warnings.append("no_stamps")
+            row["windows"].append(
+                {
+                    "days": days,
+                    "closed": {
+                        "closed_n": win_closed_n,
+                        "wins": int(closed_stats.get("wins") or 0),
+                        "win_rate_pct": float(closed_stats.get("win_rate_pct") or 0.0),
+                        "total_pnl_usd": float(closed_stats.get("total_pnl_usd") or 0.0),
+                        "avg_pnl_pct": float(closed_stats.get("avg_pnl_pct") or 0.0),
+                    },
+                    "stamps": stamps,
+                    "warnings": warnings,
+                }
+            )
+        rows.append(row)
+
+    meta = {
+        "ok": True,
+        "read_only": True,
+        "not_for_pruning": True,
+        "not_for_auto_disable": True,
+        "experimental": True,
+        "generated_at": generated_at,
+        "windows_days": windows_days,
+        "data_missing_reason": None if stamps_available else stamps_reason,
+    }
+    return {"meta": meta, "rows": rows}
 
 # Tier 1a/2a/2b enumerated types per scout.trading.live_eligibility.
 # Kept in sync with matches_tier_1_or_2(); a signal_type in this set is
