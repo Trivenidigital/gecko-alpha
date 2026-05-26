@@ -1,5 +1,33 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-26 - Dashboard Contract Smoke Gate
+
+**Status:** BUILD IN PROGRESS. Goal: make the dashboard contract firewalls
+observable as a single smoke command and a named CI gate, while preserving the
+anti-scope boundaries from the Trade Inbox work.
+
+Workflow checklist:
+- [x] Plan drafted: `tasks/plan_dashboard_contract_smoke_gate_2026_05_26.md`.
+- [x] Plan reviewed by 2 parallel agents and folds applied: CI anti-rot
+  channel, non-fail-fast aggregate runner, exit-code priority, aggregate test in
+  the named CI step, and future alert-urgency coupling.
+- [x] Design drafted: `tasks/design_dashboard_contract_smoke_gate_2026_05_26.md`.
+- [x] Design reviewed by 2 parallel agents and folds applied: demote cross-id
+  resolver out of buildable-next index, copy exact tracker-promotion soak gate
+  into the deferred alert ticket, specify active memory note content, add
+  failure JSON/text tests, and clarify import/argparse behavior.
+- [ ] Build with TDD: aggregate checker, explicit CI step, backlog/lesson/memory
+  updates.
+- [ ] Focused verification.
+- [ ] PR opened, reviewed by 2 parallel agents, merged, and deployed.
+
+Anti-scope notes:
+- No Telegram sends, urgency tiers, alert qualification, ranking, cross-id
+  resolver behavior, dashboard producers, execution paths, or new DB writer
+  table in this branch.
+- The read-only firewall's anti-rot path is named CI coverage plus a single
+  post-deploy smoke command, not a §12a table freshness watchdog.
+
 ## Active Work: 2026-05-26 - Trade Inbox Contract Firewall
 
 **Status:** BUILD VERIFIED. Goal: freeze the operator-facing `/api/trade_inbox`
