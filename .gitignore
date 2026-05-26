@@ -22,6 +22,11 @@ dashboard/frontend/node_modules/
 *.ssh_out*
 _*.py
 
+# Local TLS MITM debug artifacts (never commit)
+__*.cer
+__*.pem
+__git_ca_bundle_plus_*.crt
+
 # SSH two-step diagnostic dumps (the bash→file→read pattern per CLAUDE.md)
 # Accumulate as `.ssh_<topic>.txt` during investigation sessions; never tracked
 .ssh_*.txt
