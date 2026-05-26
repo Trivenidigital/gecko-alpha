@@ -21,6 +21,20 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras
 
+      - name: Dashboard contract firewalls
+        timeout-minutes: 5
+        run: >
+          uv run pytest --tb=short -q
+          tests/test_check_dashboard_contracts.py
+          tests/test_check_live_candidates_contract.py
+          tests/test_live_candidates_endpoint.py
+          tests/test_check_trade_inbox_contract.py
+          tests/test_trade_inbox_endpoint.py
+        env:
+          TELEGRAM_BOT_TOKEN: test
+          TELEGRAM_CHAT_ID: test
+          ANTHROPIC_API_KEY: test
+
       - name: Run tests
         timeout-minutes: 15
         run: uv run pytest --tb=short -q --timeout=180 --timeout-method=thread

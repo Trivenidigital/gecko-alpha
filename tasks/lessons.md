@@ -1,5 +1,22 @@
 # Lessons
 
+## Encode anti-scope as runtime contracts when possible
+
+- 2026-05-26 correction: the Trade Inbox plan said "no urgency tiers, no alert
+  qualification, no ranking, no cross-id resolver," but prose alone decays.
+  The operator called out the stronger pattern: turn anti-scope into runtime or
+  CI assertions when it is technically possible.
+- Rule: when a plan/design commits to anti-scope, ask whether that boundary can
+  be enforced as a contract checker, lint rule, schema test, CI gate, or
+  post-deploy smoke command. If yes, encode it. The plan explains why; the
+  executable check enforces it.
+- Example: `/api/trade_inbox` forbids urgency, alert, ranking, and resolver
+  semantics through the contract firewall, and this branch adds a named CI
+  dashboard-contract gate plus one aggregate post-deploy smoke command.
+- Future alert qualification should either use a separate endpoint such as
+  `/api/trade_alert_intent`, or deliberately relax the Trade Inbox firewall in
+  its own contract PR with new invariants.
+
 ## Complete trader surfaces before ranking or urgency tiers
 
 - 2026-05-26 correction: when the operator asked for fewer, better trading

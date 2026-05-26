@@ -64,20 +64,34 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 ### Track 1 - Trader Decision Surface (buildable next)
 - `BL-NEW-LIVE-DECISION-COCKPIT` - highest product leverage. Build `/api/live_candidates` and a dashboard "Now Tradable" panel that turns existing evidence into `trade / watch / reject / data_insufficient`.
 - `BL-NEW-SIGNAL-TRUST-ROADMAP` - sibling trust layer. Build signal maturity states, scorecards, actionability-vs-`would_be_live` arbitration, narrative hard filters, and Hermes explanations.
-- `BL-NEW-CROSS-IDENTIFIER-RESOLVER-TRACKER-PAPER` - follow-up after tracker-to-inbox promotion. Resolve CoinGecko ids from tracker rows against contract-address paper rows so the Trade Inbox can collapse visually duplicate paper/tracker entries without hiding provenance.
+- `BL-NEW-CROSS-IDENTIFIER-RESOLVER-TRACKER-PAPER` - AUDITED-PHANTOM after 2026-05-26 runtime baseline. Do not build until the re-audit trigger fires and paper/tracker overlap proves operator-visible noise.
+- `BL-NEW-TG-ALERT-QUALIFICATION-DESIGN` - gated design only after tracker-promotion soak clears; keep urgency/alert intent out of `/api/trade_inbox` by default.
 
 **Rule:** V1 is read-only. No live execution, no sizing, no KOL ranking, no source pruning, no automatic signal disable.
 
 ### BL-NEW-CROSS-IDENTIFIER-RESOLVER-TRACKER-PAPER: collapse paper/tracker duplicates across identifier forms
-**Status:** PROPOSED 2026-05-26 - filed from PR #281 deploy-risk review.
+**Status:** AUDITED-PHANTOM 2026-05-26 - runtime baseline found `0` current true cross-id candidate pairs; do not implement until the trigger below fires.
 **Tag:** `trader-surface` `identity-resolution` `trade-inbox` `top-gainers`
 **Why:** PR #281 intentionally dedupes tracker-promoted rows only when `gainers_comparisons.coin_id` matches `paper_trades.token_id`. In prod, many paper rows use contract addresses while tracker rows use CoinGecko ids, so the same asset can appear twice: one `source_corpus=paper`, one `source_corpus=tracker`. Source labels make this decodable but still visually noisy.
 
-**Scope:** Build or reuse an identity resolver that can map open paper-trade token ids to CoinGecko ids for dashboard dedupe/enrichment. Preserve provenance: collapsed rows must still show both paper and tracker surfaces.
+**Audit evidence:** 2026-05-26 pre-work runtime baseline found `paper_open=144`, `tracker_36h=70`, same-id overlap `10`, strict symbol+name overlap `10`, and same-symbol different-identifier raw pairs `0`. No current true cross-id candidate cohort exists.
+
+**Re-audit trigger:** reopen only if same-symbol different-identifier candidate rate exceeds `3` per UTC day for two consecutive UTC days, or the operator captures at least `3` visible duplicate rows in one Trade Inbox review window with paper/tracker identity evidence.
+
+**Conditional guardrail:** do not implement a resolver until the trigger fires and the re-audit proves operator-visible noise. If it fires, prefer deterministic provider/contract mapping; do not build a symbol-only merge.
 
 **Non-scope:** no alerting, ranking, source pruning, execution changes, or hidden suppression of unmatched rows.
 
-**Pre-work runtime baseline:** before scoping, measure current overlap between `paper_trades.status='open'` and recent `gainers_comparisons` using both same-id match and any available contract/CG resolver candidate. Record the expected duplicate-noise reduction before implementing.
+### BL-NEW-TG-ALERT-QUALIFICATION-DESIGN: qualify Telegram alerts over the complete trader surface
+**Status:** GATED 2026-05-26 - deferred until tracker-to-cockpit promotion soak clears.
+**Tag:** `telegram` `alerts` `trade-inbox` `decision-support` `anti-scope`
+**Why:** Telegram alert qualification should run over the complete decision-support universe. A gate built before tracker-promoted candidates are measured would miss the TOES/BILL/UB-style tracker wins that motivated the trader-surface work.
+
+**Hard dependency:** PR #281 tracker-to-cockpit promotion must remain deployed and the request-independent soak metric must clear: `>= 5` unique tracker-promoted `coin_id`s/day for `>= 3` mature UTC days, measured with `scripts/trade_inbox_tracker_promotion_soak.sql`, or the 14-day calendar backstop must close with an explicit low-volume decision.
+
+**Design checklist when unlocked:** drift-check all current Telegram alert surfaces; quantify 14-day alert volume and operator-action baseline; pin "qualified" without future-runner lookahead; decide corpus scope; include parse-mode hygiene and dispatched/delivered logs; add an auditable alert-decision event surface if a new writer ships; prove scarcity can compress the observed tracker-promotion baseline before any TG send.
+
+**Anti-scope:** urgency tiers, TRADE_NOW/WATCH_BREAKOUT labels, and alert intent stay out of `/api/trade_inbox`. Default future shape is a separate `/api/trade_alert_intent`-style endpoint. Relax the Trade Inbox firewall only via a deliberate contract PR with new invariants.
 
 ### Track 2 - Source/KOL Measurement Enablers (gated)
 - `BL-NEW-SOURCE-CALL-HISTORICAL-POOL-SELECTION-PROBE` - next authorized probe. Determines whether GT free can recover old source-call OHLCV if pool-at-call selection is fixed.
