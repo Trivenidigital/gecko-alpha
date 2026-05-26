@@ -15,6 +15,7 @@ from scout.trading.params import (
     UnknownSignalType,
     get_params,
 )
+from scout.trading.decision_events import emit_trade_decision
 
 log = structlog.get_logger()
 
@@ -194,6 +195,34 @@ class TradingEngine:
         if conn is None:
             raise RuntimeError("Database not initialized.")
 
+        async def _emit_decision(
+            decision: str,
+            reason: str,
+            *,
+            paper_trade_id: int | None = None,
+            **extra,
+        ) -> None:
+            event_data = {
+                "chain": chain,
+                "symbol": symbol,
+                "name": name,
+                "amount_usd": amount_usd,
+                "entry_price": entry_price,
+                "signal_data": signal_data,
+                **extra,
+            }
+            await emit_trade_decision(
+                self.db,
+                token_id=token_id,
+                signal_type=signal_type,
+                decision=decision,
+                reason=reason,
+                source_module="scout.trading.engine",
+                signal_combo=signal_combo,
+                paper_trade_id=paper_trade_id,
+                event_data=event_data,
+            )
+
         # 0a. Startup warmup — coarsest gate (no DB, no allocations).
         # Runs before signal_params lookup so we don't hit the DB for
         # every rejected-by-warmup call in the first N seconds after boot.
@@ -207,6 +236,12 @@ class TradingEngine:
                     signal_type=signal_type,
                     elapsed=round(elapsed, 1),
                     warmup=warmup,
+                )
+                await _emit_decision(
+                    "blocked",
+                    "warmup",
+                    elapsed_seconds=round(elapsed, 1),
+                    warmup_seconds=warmup,
                 )
                 return None
 
@@ -225,6 +260,11 @@ class TradingEngine:
                 signal_type=signal_type,
                 known=sorted(DEFAULT_SIGNAL_TYPES),
             )
+            await _emit_decision(
+                "blocked",
+                "unknown_signal_type",
+                known_signal_types=sorted(DEFAULT_SIGNAL_TYPES),
+            )
             return None
         if not signal_params.enabled:
             log.info(
@@ -232,6 +272,11 @@ class TradingEngine:
                 token_id=token_id,
                 signal_type=signal_type,
                 source=signal_params.source,
+            )
+            await _emit_decision(
+                "blocked",
+                "signal_disabled",
+                signal_params_source=signal_params.source,
             )
             return None
 
@@ -242,6 +287,7 @@ class TradingEngine:
             price_row = await self._get_current_price_with_age(token_id)
             if price_row is None:
                 log.info("trade_skipped_no_price", token_id=token_id)
+                await _emit_decision("blocked", "no_price")
                 return None
 
             current_price, price_age_seconds = price_row
@@ -250,6 +296,12 @@ class TradingEngine:
                     "trade_skipped_stale_price",
                     token_id=token_id,
                     price_age_seconds=round(price_age_seconds, 1),
+                )
+                await _emit_decision(
+                    "blocked",
+                    "stale_price",
+                    price_age_seconds=round(price_age_seconds, 1),
+                    max_price_age_seconds=_MAX_PRICE_AGE_SECONDS,
                 )
                 return None
 
@@ -270,6 +322,11 @@ class TradingEngine:
                 token_id=token_id,
                 signal_type=signal_type,
             )
+            await _emit_decision(
+                "blocked",
+                "open_position",
+                open_position_count=row[0],
+            )
             return None
 
         # 2b. Per-signal-type cooldown — block re-entry within 48h for the
@@ -287,6 +344,7 @@ class TradingEngine:
             log.info(
                 "trade_skipped_cooldown", token_id=token_id, signal_type=signal_type
             )
+            await _emit_decision("blocked", "cooldown", cooldown_count=row[0])
             return None
 
         # 2c. Hard cap on concurrent open positions — prevents restart-bursts.
@@ -304,6 +362,12 @@ class TradingEngine:
                     open_count=row[0],
                     max_open=max_open,
                 )
+                await _emit_decision(
+                    "blocked",
+                    "max_open_trades",
+                    open_count=row[0],
+                    max_open=max_open,
+                )
                 return None
 
         # 3. Check max exposure
@@ -317,6 +381,13 @@ class TradingEngine:
             log.warning(
                 "trade_rejected_max_exposure",
                 token_id=token_id,
+                current_exposure=current_exposure,
+                new_amount=trade_amount,
+                max_exposure=self.settings.PAPER_MAX_EXPOSURE_USD,
+            )
+            await _emit_decision(
+                "blocked",
+                "max_exposure",
                 current_exposure=current_exposure,
                 new_amount=trade_amount,
                 max_exposure=self.settings.PAPER_MAX_EXPOSURE_USD,
@@ -355,6 +426,16 @@ class TradingEngine:
             # BL-NEW-TG-ALERT-ALLOWLIST: post-open Telegram alert hook.
             # Fire-and-forget; never blocks paper-trade success path.
             if trade_id is not None:
+                await _emit_decision(
+                    "opened",
+                    "paper_trade_opened",
+                    paper_trade_id=trade_id,
+                    effective_entry_price=current_price,
+                    trade_amount_usd=trade_amount,
+                    lead_time_vs_trending_min=lead_time_min,
+                    lead_time_vs_trending_status=lead_time_status,
+                    signal_params_source=signal_params.source,
+                )
                 await self._spawn_tg_alert(
                     trade_id=trade_id,
                     signal_type=signal_type,
@@ -366,6 +447,7 @@ class TradingEngine:
             return trade_id
 
         log.warning("trade_mode_not_supported", mode=self.mode)
+        await _emit_decision("blocked", "trade_mode_not_supported", mode=self.mode)
         return None
 
     async def _spawn_tg_alert(

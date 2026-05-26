@@ -133,6 +133,7 @@ class Database:
         # UPPER(symbol) for volume_history_cg + gainers_snapshots so the
         # x_alerts symbol resolver stops scanning 2.5M-row table.
         await self._migrate_symbol_upper_indexes_v1()
+        await self._migrate_trade_decision_events_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -143,6 +144,157 @@ class Database:
         if self._conn:
             await self._conn.close()
             self._conn = None
+
+    async def _migrate_trade_decision_events_v1(self) -> None:
+        """Append-only trading admission/skip decision log.
+
+        Kept separate from signal_events because tracker comparison code treats
+        signal_events as chain-detection evidence.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "trade_decision_events_v1"
+        schema_version = 20260526
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                await self._assert_trade_decision_events_schema(conn)
+                _db_log.info("trade_decision_events_v1_migration_skip_already_applied")
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version = ?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if existing_version is not None and existing_version[0] != migration_name:
+                raise RuntimeError(
+                    "trade_decision_events_v1 schema_version description mismatch - "
+                    f"version {schema_version} already owned by "
+                    f"{existing_version[0]!r}"
+                )
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS trade_decision_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token_id TEXT NOT NULL,
+                    signal_type TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    source_module TEXT NOT NULL,
+                    signal_combo TEXT,
+                    paper_trade_id INTEGER,
+                    event_data TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (paper_trade_id)
+                        REFERENCES paper_trades(id) ON DELETE SET NULL
+                )
+                """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tde_token_created "
+                "ON trade_decision_events(token_id, created_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tde_signal_created "
+                "ON trade_decision_events(signal_type, created_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tde_decision_reason_created "
+                "ON trade_decision_events(decision, reason, created_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            await self._assert_trade_decision_events_schema(conn)
+            _db_log.info(
+                "trade_decision_events_v1_migration_complete",
+                table="trade_decision_events",
+            )
+        except BaseException as e:
+            _db_log.exception(
+                "schema_migration_failed",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _db_log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _db_log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)
+            raise
+
+    async def _assert_trade_decision_events_schema(self, conn) -> None:
+        required_columns = {
+            "id",
+            "token_id",
+            "signal_type",
+            "decision",
+            "reason",
+            "source_module",
+            "signal_combo",
+            "paper_trade_id",
+            "event_data",
+            "created_at",
+        }
+        cur = await conn.execute("PRAGMA table_info(trade_decision_events)")
+        columns = {row[1] for row in await cur.fetchall()}
+        missing = sorted(required_columns - columns)
+        if missing:
+            raise RuntimeError(
+                f"trade_decision_events_v1 missing columns: {', '.join(missing)}"
+            )
+
+        cur = await conn.execute("PRAGMA index_list(trade_decision_events)")
+        indexes = {row[1] for row in await cur.fetchall()}
+        required_indexes = {
+            "idx_tde_token_created",
+            "idx_tde_signal_created",
+            "idx_tde_decision_reason_created",
+        }
+        missing_indexes = sorted(required_indexes - indexes)
+        if missing_indexes:
+            raise RuntimeError(
+                "trade_decision_events_v1 missing indexes: "
+                + ", ".join(missing_indexes)
+            )
+
+        cur = await conn.execute(
+            "SELECT description FROM schema_version WHERE version = ?",
+            (20260526,),
+        )
+        row = await cur.fetchone()
+        if row is None or row[0] != "trade_decision_events_v1":
+            found = None if row is None else row[0]
+            raise RuntimeError(
+                "trade_decision_events_v1 schema_version description mismatch - "
+                f"found {found!r}"
+            )
 
     # ------------------------------------------------------------------
     # BL-076: shared metadata resolver

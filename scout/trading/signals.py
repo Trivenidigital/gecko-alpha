@@ -14,9 +14,40 @@ import structlog
 from scout.db import Database
 from scout.spikes.models import VolumeSpike
 from scout.trading.combo_key import build_combo_key
+from scout.trading.decision_events import emit_trade_decision
 from scout.trading.suppression import should_open
 
 logger = structlog.get_logger()
+
+
+async def _emit_dispatch_decision(
+    db: Database,
+    *,
+    row,
+    signal_type: str,
+    decision: str,
+    reason: str,
+    signal_combo: str | None = None,
+    **extra,
+) -> None:
+    """Emit pre-engine dispatcher decisions without affecting dispatch flow."""
+    await emit_trade_decision(
+        db,
+        token_id=row["coin_id"],
+        signal_type=signal_type,
+        decision=decision,
+        reason=reason,
+        source_module="scout.trading.signals",
+        signal_combo=signal_combo,
+        event_data={
+            "symbol": row["symbol"],
+            "name": row["name"],
+            "market_cap": row["market_cap"],
+            "price_change_24h": row["price_change_24h"],
+            "price_at_snapshot": row["price_at_snapshot"],
+            **extra,
+        },
+    )
 
 
 async def trade_volume_spikes(
@@ -139,10 +170,37 @@ async def trade_gainers(
                     symbol=g["symbol"],
                     signal_type="gainers_early",
                 )
+                await _emit_dispatch_decision(
+                    db,
+                    row=g,
+                    signal_type="gainers_early",
+                    decision="blocked",
+                    reason="junk_candidate",
+                )
                 continue
             if (g["market_cap"] or 0) < min_mcap:
+                await _emit_dispatch_decision(
+                    db,
+                    row=g,
+                    signal_type="gainers_early",
+                    decision="blocked",
+                    reason=(
+                        "missing_market_cap"
+                        if g["market_cap"] is None
+                        else "below_min_market_cap"
+                    ),
+                    min_mcap=min_mcap,
+                )
                 continue
             if max_mcap is not None and (g["market_cap"] or 0) > max_mcap:
+                await _emit_dispatch_decision(
+                    db,
+                    row=g,
+                    signal_type="gainers_early",
+                    decision="blocked",
+                    reason="above_max_market_cap",
+                    max_mcap=max_mcap,
+                )
                 continue
             change_24h = g["price_change_24h"]
             if max_24h > 0:
@@ -151,6 +209,16 @@ async def trade_gainers(
                 # current schema; this guard is cheap defense-in-depth against a
                 # future schema change that nullifies the column.
                 if change_24h is None or change_24h > max_24h:
+                    await _emit_dispatch_decision(
+                        db,
+                        row=g,
+                        signal_type="gainers_early",
+                        decision="blocked",
+                        reason=(
+                            "missing_24h_change" if change_24h is None else "late_pump"
+                        ),
+                        max_24h_pct=max_24h,
+                    )
                     continue
             try:
                 combo_key = build_combo_key(signal_type="gainers_early", signals=None)
@@ -162,6 +230,15 @@ async def trade_gainers(
                         reason=reason,
                         coin_id=g["coin_id"],
                         signal_type="gainers_early",
+                    )
+                    await _emit_dispatch_decision(
+                        db,
+                        row=g,
+                        signal_type="gainers_early",
+                        decision="blocked",
+                        reason="suppressed",
+                        signal_combo=combo_key,
+                        suppression_reason=reason,
                     )
                     continue
                 await engine.open_trade(
