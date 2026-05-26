@@ -157,6 +157,101 @@ class LiveCandidateCockpit(BaseModel):
     rows: list[LiveCandidateResponse] = []
 
 
+class SignalTrustScorecardsRegistry(BaseModel):
+    maturity_state: str | None = None
+    data_quality_warning: str | None = None
+    next_gate_type: str | None = None
+    next_gate_threshold: str | None = None
+
+
+class SignalTrustScorecardsOpen(BaseModel):
+    open_count: int = 0
+    open_exposure_usd: float = 0.0
+
+
+class SignalTrustScorecardsClosed(BaseModel):
+    closed_n: int = 0
+    wins: int = 0
+    win_rate_pct: float = 0.0
+    total_pnl_usd: float = 0.0
+    avg_pnl_pct: float = 0.0
+
+
+class SignalTrustScorecardsConfusion(BaseModel):
+    a1_w1: int = 0
+    a1_w0: int = 0
+    a0_w1: int = 0
+    a0_w0: int = 0
+
+
+class SignalTrustScorecardsStamps(BaseModel):
+    both_known_n: int = 0
+    null_mismatch_n: int = 0
+    unknown_n: int = 0
+
+    actionable_known_n: int = 0
+    actionable_unknown_n: int = 0
+    actionable_rate: float | None = None
+
+    would_be_live_known_n: int = 0
+    would_be_live_unknown_n: int = 0
+    would_be_live_rate: float | None = None
+
+    confusion: SignalTrustScorecardsConfusion = Field(
+        default_factory=SignalTrustScorecardsConfusion
+    )
+    disagree_n: int = 0
+    disagree_rate: float | None = None
+
+
+class SignalTrustScorecardsWindow(BaseModel):
+    days: int
+    closed: SignalTrustScorecardsClosed = Field(
+        default_factory=SignalTrustScorecardsClosed
+    )
+    stamps: SignalTrustScorecardsStamps | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class SignalTrustScorecardsRow(BaseModel):
+    signal_type: str
+    registry: SignalTrustScorecardsRegistry | None = None
+    open: SignalTrustScorecardsOpen = Field(default_factory=SignalTrustScorecardsOpen)
+    windows: list[SignalTrustScorecardsWindow] = Field(default_factory=list)
+
+
+class SignalTrustScorecardsMeta(BaseModel):
+    ok: bool = True
+    read_only: bool = True
+    not_for_pruning: bool = True
+    not_for_suppression: bool = True
+    not_for_auto_disable: bool = True
+    not_for_sizing: bool = True
+    not_for_execution: bool = True
+    not_for_alerting: bool = True
+    not_for_source_ranking: bool = True
+    experimental: bool = True
+    visibility_only: bool = True
+    not_live_eligibility_verdict: bool = True
+    cohort_policy: str = "full_closed_paper_trades"
+    sort_policy: str = "signal_type_asc_not_ranked"
+    generated_at: str
+    windows_days: list[int] = Field(default_factory=list)
+    data_missing_reason: str | None = None
+
+
+class ApiError(BaseModel):
+    code: str
+    message: str
+    errors: list[str] | None = None
+
+
+class SignalTrustScorecardsResponse(BaseModel):
+    meta: SignalTrustScorecardsMeta
+    rows: list[SignalTrustScorecardsRow] = Field(default_factory=list)
+    error: ApiError | None = None
+
+
 TradeInboxGroup = Literal["act_now", "watch", "already_ran", "blocked"]
 TradeInboxWindowState = Literal["open", "closing", "late", "closed", "unknown"]
 TradeInboxActionLabel = Literal[

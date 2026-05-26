@@ -1,5 +1,59 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-26 - Signal Trust Scorecards Refresh
+
+**Status:** BUILD VERIFYING / REVIEW FOLDS APPLIED. Goal: finish the eligible `BL-NEW-SIGNAL-FAMILY-SCORECARDS`
+child of `BL-NEW-SIGNAL-TRUST-ROADMAP` by rebasing PR #276 onto current
+`origin/master`, preserving read-only/not-for-pruning scope, and shipping the
+Signal Trust scorecards endpoint/UI.
+
+Workflow checklist:
+- [x] Backlog eligibility check: PR #276 remains relevant; PR #288 marked it
+  `OPEN-PR / NEEDS-REBASE`.
+- [x] Fresh branch from `origin/master`: `feat/signal-trust-scorecards-v1-refresh`.
+- [x] Replayed PR #276 source commits; skipped stale generated `dist` asset
+  conflict and rebuilt `dist` from current source.
+- [x] Plan/design docs retained and normalized with required top-line
+  `**New primitives introduced:**` marker.
+- [x] Plan sent to two parallel reviewers.
+- [x] Focused backend verification:
+  `uv run pytest -q tests/test_signal_trust_scorecards_endpoint.py` =>
+  `7 passed`.
+- [x] Adjacent dashboard verification:
+  `uv run pytest -q tests/test_signal_trust_registry_endpoint.py
+  tests/test_dashboard_frontend_layout.py` => `7 passed`.
+- [x] Frontend build:
+  `$env:NODE_OPTIONS='--use-system-ca'; npm.cmd --prefix dashboard/frontend
+  run build:codex` => passed.
+- [x] Fold plan/design review recommendations:
+  - shared validated registry loader for registry + scorecards,
+  - required-schema failures return 503 instead of false zeroes,
+  - machine-readable anti-scope metadata,
+  - executable anti-scope consumer scan,
+  - UI copy labels values as closed paper-trade evidence, not ranking,
+  - design Hermes-first section added,
+  - rebuilt JS bundle and new registry helper included in tracked branch.
+- [x] Fold PR review / CI findings:
+  - added machine-readable and visible `not_for_alerting`,
+  - expanded anti-consumption scanner for direct helper imports/calls,
+  - fixed CI-only trade-decision watchdog cutoff bug (`_iso_cutoff` now
+    subtracts `lookback_minutes`).
+- [x] Final focused verification:
+  `uv run pytest --tb=short -q tests/test_check_dashboard_contracts.py
+  tests/test_check_live_candidates_contract.py tests/test_live_candidates_endpoint.py
+  tests/test_check_trade_inbox_contract.py tests/test_trade_inbox_endpoint.py
+  tests/test_signal_trust_scorecards_endpoint.py
+  tests/test_signal_trust_registry_endpoint.py tests/test_dashboard_frontend_layout.py`
+  => `132 passed`.
+- [x] Full suite with dummy required secrets:
+  `uv run pytest --tb=short -q --timeout=180 --timeout-method=thread` =>
+  `2814 passed, 158 skipped, 11 warnings`.
+- [ ] Open replacement PR, review by two parallel agents, merge, deploy.
+
+Non-scope:
+- No pruning, auto-disable, execution, sizing, alerting, source ranking, TG alert
+  qualification, or signal parameter changes.
+
 ## Active Work: 2026-05-26 - Backlog Current-State Audit
 
 **Status:** DOCS CLEANUP COMPLETE. Goal: retire backlog/todo items already

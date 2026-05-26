@@ -20,11 +20,13 @@ from dashboard.models import (
     CandidateResponse,
     FunnelResponse,
     LiveCandidateCockpit,
+    SignalTrustScorecardsResponse,
     SignalHitRate,
     StatusResponse,
     TradeInboxResponse,
     WinRateResponse,
 )
+from dashboard.signal_trust_registry import load_signal_trust_registry_payload
 
 _log = structlog.get_logger()
 
@@ -76,7 +78,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
     repo_root = Path(__file__).resolve().parent.parent
 
     def _iso_utc(dt: datetime) -> str:
-        return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        return (
+            dt.astimezone(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
 
     def _now_iso_utc() -> str:
         return _iso_utc(datetime.now(timezone.utc))
@@ -150,241 +157,118 @@ def create_app(db_path: str | None = None) -> FastAPI:
         from fastapi.responses import JSONResponse
 
         generated_at = _now_iso_utc()
-        relative_path = "docs/superpowers/registries/signal_trust_registry.v1.json"
-        registry_path = repo_root / relative_path
-        override_path = os.environ.get("GECKO_SIGNAL_TRUST_REGISTRY_PATH")
-        if override_path:
-            allow_arbitrary = os.environ.get("GECKO_ALLOW_ARBITRARY_SIGNAL_TRUST_REGISTRY_PATH") == "1"
-            candidate_path = Path(override_path)
-            if not candidate_path.is_absolute():
-                candidate_path = repo_root / candidate_path
-            try:
-                resolved_candidate = candidate_path.resolve()
-                resolved_repo_root = repo_root.resolve()
-            except Exception:
-                resolved_candidate = candidate_path
-                resolved_repo_root = repo_root
+        headers = {"Cache-Control": "no-store"}
+        status_code, payload, retry_after = load_signal_trust_registry_payload(
+            repo_root, generated_at
+        )
+        if retry_after is not None:
+            headers = {**headers, "Retry-After": str(retry_after)}
+        return JSONResponse(
+            status_code=status_code,
+            headers=headers,
+            content=payload,
+        )
 
-            if (not allow_arbitrary) and (not resolved_candidate.is_relative_to(resolved_repo_root)):
-                return JSONResponse(
-                    status_code=503,
-                    headers={"Cache-Control": "no-store", "Retry-After": "60"},
-                    content={
-                        "meta": {
-                            "ok": False,
-                            "generated_at": generated_at,
-                            "registry_path": relative_path,
-                            "experimental": True,
-                            "visibility_only": True,
-                            "not_for_pruning": True,
-                            "not_for_auto_disable": True,
-                        },
-                        "error": {
-                            "code": "registry_invalid",
-                            "message": "override path must be within repo root",
-                        },
-                    },
-                )
-            registry_path = resolved_candidate
+    @app.get(
+        "/api/signal_trust/scorecards", response_model=SignalTrustScorecardsResponse
+    )
+    async def get_signal_trust_scorecards():
+        from fastapi.responses import JSONResponse
 
-        meta_base = {
-            "ok": False,
-            "generated_at": generated_at,
-            "registry_path": relative_path,
-            # Invariants are included even on error so the UI can keep the
-            # "visibility-only/not-for-pruning" banner visible.
-            "experimental": True,
-            "visibility_only": True,
-            "not_for_pruning": True,
-            "not_for_auto_disable": True,
-        }
+        def scorecards_error_meta(reason: str) -> dict:
+            return {
+                "ok": False,
+                "read_only": True,
+                "not_for_pruning": True,
+                "not_for_suppression": True,
+                "not_for_auto_disable": True,
+                "not_for_sizing": True,
+                "not_for_execution": True,
+                "not_for_alerting": True,
+                "not_for_source_ranking": True,
+                "experimental": True,
+                "visibility_only": True,
+                "not_live_eligibility_verdict": True,
+                "cohort_policy": "full_closed_paper_trades",
+                "sort_policy": "signal_type_asc_not_ranked",
+                "generated_at": _now_iso_utc(),
+                "windows_days": [7, 14, 30],
+                "data_missing_reason": reason,
+            }
 
         headers = {"Cache-Control": "no-store"}
 
-        if not registry_path.is_file():
-            return JSONResponse(
-                status_code=503,
-                headers={**headers, "Retry-After": "60"},
-                content={
-                    "meta": meta_base,
-                    "error": {
-                        "code": "registry_missing",
-                        "message": "signal trust registry file not found",
-                    },
-                },
-            )
-
-        try:
-            file_size = registry_path.stat().st_size
-        except Exception:
-            file_size = None
-
-        max_registry_bytes = 1_000_000
-        if file_size is not None and file_size > max_registry_bytes:
-            return JSONResponse(
-                status_code=503,
-                headers={**headers, "Retry-After": "300"},
-                content={
-                    "meta": meta_base,
-                    "error": {
-                        "code": "registry_invalid",
-                        "message": f"registry too large (max_bytes={max_registry_bytes})",
-                    },
-                },
-            )
-
-        try:
-            raw = registry_path.read_text(encoding="utf-8")
-        except Exception:
-            return JSONResponse(
-                status_code=503,
-                headers={**headers, "Retry-After": "60"},
-                content={
-                    "meta": meta_base,
-                    "error": {"code": "registry_invalid", "message": "unable to read registry file"},
-                },
-            )
-
-        try:
-            doc = json.loads(raw)
-        except json.JSONDecodeError:
-            return JSONResponse(
-                status_code=503,
-                headers={**headers, "Retry-After": "60"},
-                content={
-                    "meta": meta_base,
-                    "error": {"code": "registry_invalid", "message": "invalid JSON"},
-                },
-            )
-
-        max_entries = 1_000
-        if isinstance(doc, dict):
-            maybe_entries = doc.get("entries")
-            if isinstance(maybe_entries, list) and len(maybe_entries) > max_entries:
-                return JSONResponse(
-                    status_code=503,
-                    headers={**headers, "Retry-After": "300"},
-                    content={
-                        "meta": meta_base,
-                        "error": {
-                            "code": "registry_invalid",
-                            "message": f"registry too many entries (max_entries={max_entries})",
-                        },
-                    },
-                )
-
-        errors: list[str] = []
-
-        def is_plain_object(value) -> bool:
-            return value is not None and isinstance(value, dict)
-
-        def assert_(condition: bool, message: str) -> None:
-            if not condition:
-                errors.append(message)
-
-        assert_(is_plain_object(doc), "top-level must be an object")
-        assert_(doc.get("schema_version") == "signal_trust_registry.v1", "schema_version must be signal_trust_registry.v1")
-        assert_(doc.get("experimental") is True, "experimental must be true")
-        assert_(doc.get("visibility_only") is True, "visibility_only must be true")
-        assert_(doc.get("not_for_pruning") is True, "not_for_pruning must be true")
-        assert_(doc.get("not_for_auto_disable") is True, "not_for_auto_disable must be true")
-
-        notes = doc.get("notes")
-        assert_(isinstance(notes, str) and len(notes) > 0, "notes must be a non-empty string")
-
-        maturity_states = doc.get("maturity_states")
-        entries = doc.get("entries")
-        assert_(isinstance(maturity_states, list), "maturity_states must be an array")
-        assert_(isinstance(entries, list), "entries must be an array")
-
-        maturity_state_set = set(maturity_states) if isinstance(maturity_states, list) else set()
-        for required_state in ("trusted_experimental", "context_only", "data_insufficient"):
-            assert_(required_state in maturity_state_set, f"maturity_states must include {required_state}")
-
-        if isinstance(entries, list):
-            seen_signal_types: set[str] = set()
-            for idx, entry in enumerate(entries):
-                prefix = f"entries[{idx}]"
-                assert_(is_plain_object(entry), f"{prefix} must be an object")
-                if not is_plain_object(entry):
-                    continue
-
-                signal_type = entry.get("signal_type")
-                assert_(
-                    isinstance(signal_type, str) and len(signal_type) > 0,
-                    f"{prefix}.signal_type must be a non-empty string",
-                )
-                if isinstance(signal_type, str) and len(signal_type) > 0:
-                    if signal_type in seen_signal_types:
-                        errors.append(f"{prefix}.signal_type must be unique (duplicate: {signal_type})")
-                    seen_signal_types.add(signal_type)
-
-                maturity_state = entry.get("maturity_state")
-                assert_(
-                    isinstance(maturity_state, str) and maturity_state in maturity_state_set,
-                    f"{prefix}.maturity_state must be one of maturity_states",
-                )
-
-                data_quality = entry.get("data_quality")
-                assert_(is_plain_object(data_quality), f"{prefix}.data_quality must be an object")
-                if is_plain_object(data_quality) and "warning" in data_quality:
-                    warning = data_quality.get("warning")
-                    assert_(
-                        isinstance(warning, str) and len(warning) > 0,
-                        f"{prefix}.data_quality.warning must be a non-empty string when present",
-                    )
-
-                operator_gate = entry.get("operator_gate")
-                assert_(isinstance(operator_gate, list), f"{prefix}.operator_gate must be an array")
-                if isinstance(operator_gate, list):
-                    gates = set(operator_gate)
-                    for required_gate in ("visibility_only", "not_for_pruning", "not_for_auto_disable"):
-                        assert_(required_gate in gates, f"{prefix}.operator_gate must include {required_gate}")
-
-                next_gate = entry.get("next_gate")
-                assert_(is_plain_object(next_gate), f"{prefix}.next_gate must be an object")
-                if is_plain_object(next_gate):
-                    ng_type = next_gate.get("type")
-                    ng_threshold = next_gate.get("threshold")
-                    assert_(
-                        isinstance(ng_type, str) and len(ng_type) > 0,
-                        f"{prefix}.next_gate.type must be a non-empty string",
-                    )
-                    assert_(
-                        isinstance(ng_threshold, str) and len(ng_threshold) > 0,
-                        f"{prefix}.next_gate.threshold must be a non-empty string",
-                    )
-
-        if errors:
-            return JSONResponse(
-                status_code=503,
-                headers={**headers, "Retry-After": "60"},
-                content={
-                    "meta": meta_base,
-                    "error": {
-                        "code": "registry_invalid",
-                        "message": "registry failed validation",
-                        "errors": errors[:50],
-                    },
-                },
-            )
-
-        try:
-            mtime = _iso_utc(datetime.fromtimestamp(registry_path.stat().st_mtime, tz=timezone.utc))
-        except Exception:
-            mtime = None
-
-        meta = {
-            **meta_base,
-            "ok": True,
-            "registry_mtime": mtime,
-        }
-
-        return JSONResponse(
-            status_code=200,
-            headers=headers,
-            content={"meta": meta, "registry": doc},
+        generated_at = _now_iso_utc()
+        registry_status, registry_payload, registry_retry_after = (
+            load_signal_trust_registry_payload(repo_root, generated_at)
         )
+
+        if registry_status != 200:
+            retry_after = str(registry_retry_after or 60)
+            error_payload = {
+                "meta": scorecards_error_meta("registry_unavailable"),
+                "rows": [],
+                "error": registry_payload.get("error")
+                or {
+                    "code": "registry_unavailable",
+                    "message": "signal trust registry unavailable",
+                },
+            }
+            error_payload = SignalTrustScorecardsResponse.model_validate(
+                error_payload
+            ).model_dump(mode="json")
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": retry_after},
+                content=error_payload,
+            )
+
+        registry_doc = registry_payload.get("registry") or {}
+        registry_entries = registry_doc.get("entries") or []
+
+        try:
+            payload = await db.get_signal_trust_scorecards(
+                _db_path, registry_entries=registry_entries
+            )
+        except Exception as e:
+            _log.warning("signal_trust_scorecards_failed", err=str(e))
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": "60"},
+                content={
+                    "meta": scorecards_error_meta("scorecards_query_failed"),
+                    "rows": [],
+                    "error": {
+                        "code": "scorecards_query_failed",
+                        "message": "signal trust scorecards query failed",
+                    },
+                },
+            )
+        meta = payload.get("meta") or {}
+
+        if meta.get("ok") is False:
+            error_payload = {
+                "meta": meta,
+                "rows": payload.get("rows") or [],
+                "error": payload.get("error")
+                or {
+                    "code": "unknown",
+                    "message": "scorecards unavailable",
+                },
+            }
+            error_payload = SignalTrustScorecardsResponse.model_validate(
+                error_payload
+            ).model_dump(mode="json")
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": "60"},
+                content=error_payload,
+            )
+
+        content = SignalTrustScorecardsResponse.model_validate(payload).model_dump(
+            mode="json"
+        )
+        return JSONResponse(status_code=200, headers=headers, content=content)
 
     # --- Global cross-table search ---
 
@@ -1107,7 +991,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
             from scout.briefing.synthesizer import synthesize_briefing
             import json as _json
 
-            async with _aio.ClientSession(timeout=_aio.ClientTimeout(total=15)) as session:
+            async with _aio.ClientSession(
+                timeout=_aio.ClientTimeout(total=15)
+            ) as session:
                 raw = await collect_briefing_data(session, sdb, settings)
                 synthesis = await synthesize_briefing(
                     raw, settings.ANTHROPIC_API_KEY, settings.BRIEFING_MODEL
@@ -1204,9 +1090,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         except Exception:
             pass
 
-        stale_after_sec = int(
-            os.environ.get("GECKO_BACKUP_STALE_AFTER_SEC", "172800")
-        )
+        stale_after_sec = int(os.environ.get("GECKO_BACKUP_STALE_AFTER_SEC", "172800"))
         backup_status: dict[str, object] = {
             "rotate_heartbeat_age_sec": None,
             "rotate_heartbeat_fresh": False,
@@ -1261,9 +1145,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         # rotate-script glob is `scout.db.bak.*` and `scout.db.bak-*`;
         # match both. If GECKO_BACKUP_DIR is unset, fall back to the
         # production default.
-        backup_dir = Path(
-            os.environ.get("GECKO_BACKUP_DIR", "/root/gecko-alpha")
-        )
+        backup_dir = Path(os.environ.get("GECKO_BACKUP_DIR", "/root/gecko-alpha"))
         try:
             files = sorted(
                 (
