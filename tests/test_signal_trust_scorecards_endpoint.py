@@ -52,67 +52,67 @@ async def test_scorecards_returns_200_with_invariants(client):
 
 async def test_scorecards_ordering_is_deterministic(client):
     c, d = client
-    async with d._conn() as conn:
-        # Create two open trades with distinct signal types so union-of-keys is non-empty.
-        await conn.execute(
-            """INSERT INTO paper_trades
-               (token_id, symbol, name, chain, signal_type, signal_data,
-                entry_price, amount_usd, quantity,
-                tp_pct, sl_pct, tp_price, sl_price,
-                status, opened_at,
-                would_be_live, actionable)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)""",
-            (
-                "t1",
-                "T1",
-                "t1",
-                "coingecko",
-                "volume_spike",
-                "{}",
-                1.0,
-                100.0,
-                10.0,
-                20.0,
-                10.0,
-                1.2,
-                0.9,
-                "open",
-                1,
-                1,
-            ),
-        )
-        await conn.execute(
-            """INSERT INTO paper_trades
-               (token_id, symbol, name, chain, signal_type, signal_data,
-                entry_price, amount_usd, quantity,
-                tp_pct, sl_pct, tp_price, sl_price,
-                status, opened_at,
-                would_be_live, actionable)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)""",
-            (
-                "t2",
-                "T2",
-                "t2",
-                "coingecko",
-                "chain_completed",
-                "{}",
-                1.0,
-                100.0,
-                10.0,
-                20.0,
-                10.0,
-                1.2,
-                0.9,
-                "open",
-                1,
-                1,
-            ),
-        )
-        await conn.commit()
+    conn = d._conn
+    assert conn is not None
+    # Create two open trades with distinct signal types so union-of-keys is non-empty.
+    await conn.execute(
+        """INSERT INTO paper_trades
+           (token_id, symbol, name, chain, signal_type, signal_data,
+            entry_price, amount_usd, quantity,
+            tp_pct, sl_pct, tp_price, sl_price,
+            status, opened_at,
+            would_be_live, actionable)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)""",
+        (
+            "t1",
+            "T1",
+            "t1",
+            "coingecko",
+            "volume_spike",
+            "{}",
+            1.0,
+            100.0,
+            10.0,
+            20.0,
+            10.0,
+            1.2,
+            0.9,
+            "open",
+            1,
+            1,
+        ),
+    )
+    await conn.execute(
+        """INSERT INTO paper_trades
+           (token_id, symbol, name, chain, signal_type, signal_data,
+            entry_price, amount_usd, quantity,
+            tp_pct, sl_pct, tp_price, sl_price,
+            status, opened_at,
+            would_be_live, actionable)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)""",
+        (
+            "t2",
+            "T2",
+            "t2",
+            "coingecko",
+            "chain_completed",
+            "{}",
+            1.0,
+            100.0,
+            10.0,
+            20.0,
+            10.0,
+            1.2,
+            0.9,
+            "open",
+            1,
+            1,
+        ),
+    )
+    await conn.commit()
 
     resp = await c.get("/api/signal_trust/scorecards")
     assert resp.status_code == 200
     rows = resp.json()["rows"]
     signal_types = [r["signal_type"] for r in rows]
     assert signal_types == sorted(signal_types)
-
