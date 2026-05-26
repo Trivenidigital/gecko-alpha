@@ -64,6 +64,8 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 ### Track 1 - Trader Decision Surface (buildable next)
 - `BL-NEW-LIVE-DECISION-COCKPIT` - highest product leverage. Build `/api/live_candidates` and a dashboard "Now Tradable" panel that turns existing evidence into `trade / watch / reject / data_insufficient`.
 - `BL-NEW-SIGNAL-TRUST-ROADMAP` - sibling trust layer. Build signal maturity states, scorecards, actionability-vs-`would_be_live` arbitration, narrative hard filters, and Hermes explanations.
+- `BL-NEW-TRACKER-COCKPIT-PROMOTION-PATH` - next build target. Promote Top Gainers / tracker-watcher wins into the trader cockpit even when no paper trade is opened because the paper signal is disabled, outside scorer corpus, slot-full, or otherwise blocked.
+- `BL-NEW-TG-ALERT-QUALIFICATION-DESIGN` - deferred design, hard-gated on `BL-NEW-TRACKER-COCKPIT-PROMOTION-PATH` plus its pre-registered queue-volume measurement. Do not design urgency tiers before the complete surface is promoted and measured.
 
 **Rule:** V1 is read-only. No live execution, no sizing, no KOL ranking, no source pruning, no automatic signal disable.
 
@@ -90,6 +92,53 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 - Token confluence, peak-giveback badges, and health-to-trader-impact are folded into the live decision cockpit and entry-quality layer.
 - X-alerts timeout/index backlog is stale after PR #213/#215 unless fresh runtime evidence shows a regression.
 - Duplicate source-call cron-tick watchdog entry is superseded by PR #211/#216/#217/#218 deployment.
+
+### BL-NEW-TRACKER-COCKPIT-PROMOTION-PATH: promote watcher/tracker wins into trader cockpit
+**Status:** PROPOSED 2026-05-26 - next implementation target after PR #277 diagnostic and PR #279 trade-decision event log.
+**Tag:** `trader-surface` `top-gainers` `promotion-path` `two-corpus` `decision-support`
+**Hard predecessor:** PR #279 trade-decision event log merged/deployed; structured admission/skip rows are available for promotion/block audits.
+**Why:** PR #277 path-traced TOES / BSB / BILL / UB / TROLL / ASTEROID-style examples and found that tracker/watcher wins can be real opportunities but never enter paper-trade-backed cockpit surfaces when the paper signal is disabled or outside the scorer/paper path. Alert qualification and urgency tiers built before this promotion would still miss the motivating cases.
+
+**Scope:** Build a read-only tracker-to-cockpit promotion path. Promotion means "candidate appears in the trader cockpit / Trade Inbox decision-support surface with provenance and block reasons"; it does NOT mean paper trade dispatch, live execution, signal re-enable, or Telegram alerting.
+
+**Promotion universe pin:** a promoted candidate is a tracker/watcher row from the broad watcher corpus (`Top Gainers` / related tracker snapshots, up to the existing $10K-$500M watcher range) that is recent enough for trader review, has enough token identity to render, and is not already represented by an open paper-trade cockpit row for the same token.
+
+**Soak metric to define in the promotion PR plan/design, before implementation:**
+- Count promoted candidates per UTC day across both corpora: scorer/paper-backed rows and watcher/tracker-promoted rows.
+- Record family/source, market-cap bucket, actionability bucket, and terminal block/surface reason for each promoted candidate.
+- Pre-commit the alert-design trigger, for example: "alert qualification design may start only after >=N promoted candidates/day for >=M mature days across both corpora, or after the calendar backstop closes with lower observed volume."
+- Apply lookback maturity before judging queue volume or missed opportunities. Use the same maturity discipline from the stop-loss audit: rows whose later outcome window has not had enough time to mature are counted as volume but not as outcome evidence.
+- Include a calendar backstop so the measurement gate does not remain open indefinitely if fire rate is low.
+
+**Anti-scope:** no urgency classifier, no `TRADE_NOW` / `WATCH_BREAKOUT` tiers, no Telegram alerts, no source/KOL pruning, no re-enable of `gainers_early` or other disabled paper signals.
+
+**Design requirements when work starts:** include New Primitives header, Hermes-first section, drift-check against Trade Inbox / live candidates / Top Gainers Tracker, and runtime verification of current tracker volume.
+
+### BL-NEW-TG-ALERT-QUALIFICATION-DESIGN: qualified Telegram trading alerts over complete cockpit surface
+**Status:** DEFERRED 2026-05-26 - design only; do not implement before promotion path and volume measurement.
+**Tag:** `telegram` `alert-quality` `trader-surface` `deferred-design` `anti-urgency-smuggling`
+**Hard dependency:** `BL-NEW-TRACKER-COCKPIT-PROMOTION-PATH` shipped and deployed.
+**Soft dependency / trigger:** the promotion PR's pre-registered soak window reaches its queue-volume threshold across both paper/scorer and watcher/tracker corpora, or hits its calendar backstop with an explicit no-build / low-volume decision.
+
+**Why:** Operator wants Telegram to carry only high-quality trading signals from the recent trader-surface improvements. The correct alert universe is the complete cockpit surface, not the current paper-trade-backed subset. Designing alert tiers before tracker-to-cockpit promotion repeats the urgency-classifier-before-promotion sequencing error caught in PR #277.
+
+**Pre-pinned diagnostic/design PR structure:**
+1. Pre-register the hypothesis: "current TG alerts are too noisy because X" with X as a concrete, measurable claim.
+2. Drift-check all existing Telegram alert surfaces with file:line evidence: `tg_alert_eligible` paper-trade alerts, Minara append, auto-suspend/state-reversal alerts, backup/cron/watchdog health alerts, narrative operator-alert wire, weekly digest, source-call watchdog, and any direct `send_telegram_message` / `sendMessage` callers.
+3. Baseline last-14d alert volume by surface, signal/source, and outcome where available; separate sent, blocked_eligibility, blocked_cooldown, dispatch_failed, and health/system messages.
+4. Run §9c attribution on "TG alerts are noisy": identify which surfaces contribute the noise and whether the cause is source quality, paper-trade eligibility, missing promotion, duplicate/cooldown policy, or operator-action mismatch.
+5. Pin the "qualified" universe without lookahead labels. Candidate definition must use data available at alert time; future-runner outcomes are offline evaluation only.
+6. Pin corpus scope explicitly: scorer/paper corpus, watcher/tracker corpus, or both. Default expectation after promotion is both corpora.
+7. Commit the sequencing decision in the design. Urgency tiers are deferred until measured queue volume justifies them.
+8. Declare build primitives up front. Likely primitive: `alert_decision_events` or a scoped extension of PR #279's decision-event pattern so every send/suppress decision is auditable from day 1.
+
+**Mandatory design constraints:**
+- Parse-mode hygiene: new Telegram calls must use `parse_mode=None` or explicit escaping, with tests.
+- §12b visibility: any new alert send path must emit dispatched / delivered / failed structured logs so successful delivery is not silent.
+- §12a visibility: alert suppressions must be auditable; "why did I not see X?" needs a structured answer.
+- No `TRADE_NOW`, `WATCH_BREAKOUT`, or `RESEARCH_ONLY` urgency tiers until promotion volume proves a ranking/tiering problem exists.
+
+**Anti-scope:** no immediate TG threshold changes, no raw TG/X/KOL source pruning, no urgency classifier, no live execution/sizing changes, and no re-enabling disabled paper signals.
 
 ### BL-NEW-HERMES-CODEX-OPERATING-MODEL: durable orchestration with Codex execution workers
 **Status:** PROPOSED 2026-05-22 - filed from operator strategy direction after Hermes+Codex architecture review. This is the working model for Gecko-Alpha going forward: Hermes is the orchestration/memory/scheduling layer; Codex is the coding/repo/runtime execution worker; the operator owns product and trading judgment.
