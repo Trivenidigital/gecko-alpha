@@ -1,5 +1,37 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-26 - Backlog Current-State Audit
+
+**Status:** DOCS CLEANUP COMPLETE. Goal: retire backlog/todo items already
+absorbed by shipped PRs, keep genuinely gated work discoverable, and triage old
+open PRs against current `origin/master`.
+
+Workflow checklist:
+- [x] Reviewed `origin/master` through PR #287 (`c924fa9`).
+- [x] Cross-checked current dashboard/API state: `/api/live_candidates`,
+  `/api/trade_inbox`, tracker promotion counters, Trade Inbox source labels,
+  Signal Trust registry, source-call health, X Alerts perf path, and dashboard
+  contract CI gate.
+- [x] Triaged open PRs:
+  - PR #276 Signal Trust scorecards: relevant, CI green, needs rebase.
+  - PR #278 Now Tradable counter-risk badges: relevant idea, needs re-scope
+    because Trade Inbox is now the primary trader surface.
+  - PR #280 TG alert parking docs: superseded by current backlog/lessons state;
+    closed rather than merged.
+  - PR #274 Windows GitHub TLS MITM helper: dev hygiene, not signal-quality
+    backlog; optional later cleanup.
+- [x] Runtime checked tracker-promotion soak on prod:
+  `scripts/trade_inbox_tracker_promotion_soak.sql` returned
+  `2026-05-25|49` and `2026-05-26|12`. Volume is high, but the `>= 3`
+  mature UTC-day gate has not cleared, so TG alert qualification remains
+  parked.
+- [x] Updated `backlog.md` to archive the Live Decision Cockpit parent, mark
+  Signal Trust as partially shipped/open-PR, keep TG alerts gated, and remove
+  MiroFish debug noise from low-priority hygiene.
+
+Verification:
+- `git diff --check -- backlog.md tasks/todo.md` => clean.
+
 ## Active Work: 2026-05-26 - MiroFish Debug Noise Suppress
 
 **Status:** DEPLOYED 2026-05-26. Goal: remove successful Anthropic fallback raw
@@ -87,9 +119,9 @@ Anti-scope notes:
 - The read-only firewall's anti-rot path is named CI coverage plus a single
   post-deploy smoke command, not a �12a table freshness watchdog.
 
-## Active Work: 2026-05-26 - Trade Inbox Contract Firewall
+## Historical Work: 2026-05-26 - Trade Inbox Contract Firewall
 
-**Status:** BUILD VERIFIED. Goal: freeze the operator-facing `/api/trade_inbox`
+**Status:** MERGED / DEPLOYED 2026-05-26. Goal: freeze the operator-facing `/api/trade_inbox`
 contract after tracker promotion, without adding alerting, urgency tiers,
 ranking, execution, or cross-identifier resolver behavior.
 
@@ -114,6 +146,7 @@ Workflow checklist:
   pinned `meta.source`.
 - [x] Build with TDD: `scripts/check_trade_inbox_contract.py`,
   `tests/test_check_trade_inbox_contract.py`, and endpoint validator coverage.
+- [x] PR merged/deployed via the PR #282/#283/#284 cockpit contract sequence.
 
 Verification:
 - Red: `uv run pytest -q tests/test_check_trade_inbox_contract.py` failed
@@ -133,9 +166,9 @@ Review/anti-scope notes:
   looking rows during smoke should produce findings/backlog evidence, not a
   resolver implementation in this branch.
 
-## Active Work: 2026-05-26 - Tracker Cockpit Promotion Path
+## Historical Work: 2026-05-26 - Tracker Cockpit Promotion Path
 
-**Status:** IN PROGRESS. Goal: promote recent Top Gainers tracker/watch rows into the existing read-only Trade Inbox so detector wins can be reviewed even when no paper trade is opened.
+**Status:** MERGED / DEPLOYED 2026-05-26. Goal: promote recent Top Gainers tracker/watch rows into the existing read-only Trade Inbox so detector wins can be reviewed even when no paper trade is opened.
 
 Workflow checklist:
 - [x] Drift-check: `/api/trade_inbox` exists and is the right surface; residual gap is input corpus because it scans only `paper_trades.status='open'`.
@@ -146,6 +179,8 @@ Workflow checklist:
 - [x] Focused verification and frontend build.
 - [x] PR opened: #281 (`feat(dashboard): promote tracker wins to Trade Inbox`).
 - [x] PR reviewed by 2 parallel agents and folds applied.
+- [x] PR merged/deployed; smoke confirmed in-window motivating tracker wins
+  surfaced with `source_corpus=tracker`.
 
 Soak pre-commit:
 - A promoted candidate is a recent `gainers_comparisons` row within the Trade Inbox window, with non-empty `coin_id` and display identity, and no already-open paper-backed row for that token.
@@ -160,12 +195,12 @@ Review/verification notes:
 
 Follow-up / deploy smoke:
 - [x] Filed **BL-NEW-CROSS-IDENTIFIER-RESOLVER-TRACKER-PAPER**: source labels make paper/tracker duplicate rows decodable, but contract-address paper rows and CoinGecko-id tracker rows can still duplicate visually.
-- [ ] Pre-deploy smoke: count same-id overlap between `paper_trades.status='open'` and recent `gainers_comparisons`; if available, also count likely cross-id overlap via existing resolver candidates. Use this as the at-launch duplicate-noise baseline.
-- [ ] Post-deploy smoke: query `/api/trade_inbox?limit_per_group=100&window_hours=36` and confirm fresh tracker wins surface with `source_corpus=tracker`; if TOES/BSB/BILL/UB/TROLL/ASTEROID are outside the 36h window, use the newest Top Gainers tracker batch.
+- [x] Pre-deploy smoke: same-id/cross-id duplicate baseline was recorded; no true cross-id candidate cohort found.
+- [x] Post-deploy smoke: `/api/trade_inbox?limit_per_group=100&window_hours=36` showed recent motivating tracker wins with `source_corpus=tracker`; older examples outside the 36h window were correctly excluded.
 
-## Active Work: 2026-05-25 — Trade Opportunity Inbox
+## Historical Work: 2026-05-25 — Trade Opportunity Inbox
 
-**Status:** BUILD VERIFIED. Goal: turn high-volume early detections into a trader-facing read-only queue: Review Now, Watch, Moved Already, Blocked.
+**Status:** MERGED / DEPLOYED 2026-05-25. Goal: turn high-volume early detections into a trader-facing read-only queue: Review Now, Watch, Moved Already, Blocked.
 
 Workflow checklist:
 - [x] Trader-lens problem framed from screenshot: TOES was detected early but buried in historical/evidence tables.
@@ -178,6 +213,7 @@ Workflow checklist:
 - [x] Build with TDD.
 - [x] PR opened: #273 (`feat(dashboard): add trade opportunity inbox`).
 - [x] PR reviewed by 2 parallel agents and folds applied.
+- [x] PR merged/deployed; later PR #281 extended the inbox with tracker-promoted rows.
 
 Review notes:
 - Read-only only: no execution, sizing, pruning, signal suppression, or config changes.
@@ -192,9 +228,9 @@ Follow-up filed 2026-05-26:
 - [x] **BL-NEW-GAINERS-EARLY-2026-05-19-AUTOSUSPEND-ATTRIBUTION**: before building tracker-to-inbox promotion, gather enough attribution to frame the build PR without re-enabling `gainers_early`. 2026-05-26 prod SQL: `signal_params.enabled=0`, `suspended_reason=hard_loss`, `updated_at=2026-05-19T01:02:14.744149+00:00`; post-KEEP_ON/pre-disable closed cohort `123` closes / `-$2,262.70` net / `43.1%` win, with `stop_loss` `32` rows / `-$2,632.15`. Framing decision: do not re-enable `gainers_early`; build visibility instrumentation first, then promotion. Deeper separation of regime shift vs hard-loss threshold over-fire remains a separate policy-analysis task if re-enable is reconsidered.
 - [x] **BL-NEW-TRADE-DECISION-EVENT-LOG**: implemented standalone structured admission/skip event log for trade dispatch decisions before tracker-to-inbox promotion. Plan: `tasks/plan_trade_decision_event_log_2026_05_26.md`. Commits `8e6d85b` + review fold: new `trade_decision_events` table, fail-soft emitter under `db._txn_lock`, `trade_gainers` pre-engine filter events, `TradingEngine.open_trade` admission/opened events, `scripts/check_trade_decision_events.py` freshness watchdog, and managed cron log surfacing. Review folds: schema-version collision assertion, datetime-based checker comparisons, scheduled watchdog visibility, and softer `gainers_early` attribution wording. Verification: focused red/green, `uv run pytest -q tests/test_trade_decision_events.py tests/test_trading_engine.py tests/test_trading_signals.py tests/test_cron_stderr_redirection.py tests/test_db.py` => `167 passed`; review-regression sweep including silent-swallow check => `169 passed`; full suite with dummy required settings env => `2753 passed, 158 skipped`.
 
-## Active Work: 2026-05-25 — Live candidates determinism + contract delta
+## Historical Work: 2026-05-25 — Live candidates determinism + contract delta
 
-**Status:** PR-READY (local commit). Goal: make `/api/live_candidates` deterministic (backend ordering + frontend keys) and extend the contract validator to enforce deterministic ordering + uniqueness.
+**Status:** MERGED / DEPLOYED via PR #270. Goal: make `/api/live_candidates` deterministic (backend ordering + frontend keys) and extend the contract validator to enforce deterministic ordering + uniqueness.
 
 Workflow checklist:
 - [x] Drift-check (confirm current gaps vs V1 shipped)
@@ -202,8 +238,7 @@ Workflow checklist:
 - [x] Design drafted + reviewed by 2 parallel agents
 - [x] Build (backend ordering + validator checks + UI keys)
 - [x] Focused verification (pytest + frontend build)
-- [ ] PR opened (blocked: GitHub creds unavailable in this sandbox)
-- [ ] PR reviewed by 2 parallel agents and folds applied
+- [x] PR opened, reviewed, merged, and deployed.
 
 Review notes (live):
 - Plan doc: `tasks/plan_live_candidates_determinism_contract_delta_2026_05_25.md`
@@ -211,9 +246,9 @@ Review notes (live):
 - Branch: `feat/live-candidates-determinism-contract-delta`
 - Commit: local branch tip after review folds
 
-## Active Work: 2026-05-24 — Dashboard open-positions width fix
+## Historical Work: 2026-05-24 — Dashboard open-positions width fix
 
-**Status:** PR-READY. Goal: stop the Open Positions table from being horizontally cut off on wide screens by using the available left/right viewport space more effectively.
+**Status:** MERGED / DEPLOYED via PR #241. Goal: stop the Open Positions table from being horizontally cut off on wide screens by using the available left/right viewport space more effectively.
 
 Workflow checklist:
 - [x] Root cause confirmed from screenshot and frontend CSS.
@@ -222,8 +257,8 @@ Workflow checklist:
 - [x] Vite production build refreshed.
 - [x] Local verification completed with focused test/build/browser check.
 - [x] PR opened and reviewed.
-- [ ] Other VPS PR status checked before deploy.
-- [ ] Clean deploy completed if merge gate is clear.
+- [x] Other VPS PR status checked before deploy.
+- [x] Clean deploy completed.
 
 Review:
 - Root cause: global `.dashboard` width was capped at 1400px, leaving wide monitor space unused while the 16-column Open Positions table overflowed horizontally.
@@ -278,7 +313,7 @@ Review:
 - Current failures were reported once via Telegram during setup: main has 3 pre-existing failed units (`logrotate.service`, `prune-expense-receipts.service`, `shift-agent-backup.service`); srilu has 4 (`logrotate.service`, `prune-expense-receipts.service`, `send-routing-accuracy-summary-failure.service`, `send-routing-accuracy-summary.service`); vpin has 0.
 - Hygiene: removed stray `UNIT` line from `codex-production-push-loop-vpin.timer`; timer remained active/enabled after daemon reload.
 
-## Active Work: 2026-05-23 — BL-NEW-LIVE-DECISION-COCKPIT (V1 live_candidates endpoint)
+## Historical Work: 2026-05-23 — BL-NEW-LIVE-DECISION-COCKPIT (V1 live_candidates endpoint)
 
 **Status:** SHIPPED-MERGED. Read-only `/api/live_candidates` shipped in
 `f81b63e` / PR #228; counter_flags rich-dict regression fixed in `db19e79` /

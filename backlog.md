@@ -26,7 +26,6 @@ Operator close-development block 2026-05-22 explicitly parks the following items
 - CG Pro paid sample
 
 **Low-priority hygiene only (file when work resumes, do not pre-scope):**
-- MiroFish debug noise
 - Scanner exception bounding
 - `datetime.utcnow` deprecation cleanup
 - `print`/log consistency
@@ -52,20 +51,22 @@ Operator close-development block 2026-05-22 explicitly parks the following items
 
 ---
 
-## Current Final Backlog Snapshot (2026-05-22)
+## Current Final Backlog Snapshot (audited 2026-05-26)
 
-This section is the operator-facing backlog after the 2026-05-22 trader-lens review. It compresses older dashboard/source-quality items into four tracks so future sessions do not build stale one-off surfaces.
+This section is the operator-facing backlog after the 2026-05-22 trader-lens review, refreshed against shipped PRs through PR #287. It compresses older dashboard/source-quality items into four tracks so future sessions do not build stale one-off surfaces.
 
 ### Track 0 - Hermes + Codex Operating Model (direction of travel)
 - `BL-NEW-HERMES-CODEX-OPERATING-MODEL` - make Hermes the durable orchestration/memory/scheduling layer and Codex the repo-grounded execution worker.
 
 **Rule:** Hermes remembers, routes, schedules, and stores gates. Codex reads the repo/runtime, plans, implements, tests, reviews, and opens PRs. Runtime evidence beats both Hermes memory and Codex assumptions.
 
-### Track 1 - Trader Decision Surface (buildable next)
-- `BL-NEW-LIVE-DECISION-COCKPIT` - highest product leverage. Build `/api/live_candidates` and a dashboard "Now Tradable" panel that turns existing evidence into `trade / watch / reject / data_insufficient`.
-- `BL-NEW-SIGNAL-TRUST-ROADMAP` - sibling trust layer. Build signal maturity states, scorecards, actionability-vs-`would_be_live` arbitration, narrative hard filters, and Hermes explanations.
+### Track 1 - Trader Decision Surface (mostly shipped; child work only)
+- `BL-NEW-LIVE-DECISION-COCKPIT` - SHIPPED-PARTIAL / PARENT-ARCHIVED after PR #228/#229/#232/#239/#270/#273/#279/#281/#282/#284. Do not rebuild the parent cockpit; use child follow-ups only.
+- `BL-NEW-SIGNAL-TRUST-ROADMAP` - PARTIALLY-SHIPPED. Registry/tab shipped in PR #239; scorecards remain relevant via PR #276 but need rebase against current dashboard/dist.
 - `BL-NEW-CROSS-IDENTIFIER-RESOLVER-TRACKER-PAPER` - AUDITED-PHANTOM after 2026-05-26 runtime baseline. Do not build until the re-audit trigger fires and paper/tracker overlap proves operator-visible noise.
-- `BL-NEW-TG-ALERT-QUALIFICATION-DESIGN` - gated design only after tracker-promotion soak clears; keep urgency/alert intent out of `/api/trade_inbox` by default.
+- `BL-NEW-TG-ALERT-QUALIFICATION-DESIGN` - still gated. Prod soak on 2026-05-26 returned `2026-05-25=49`, `2026-05-26=12`; volume is high but the `>= 3` mature UTC-day gate has not cleared.
+- `PR #278 Now Tradable counter-risk badges` - relevant idea, but re-scope before merge: Trade Inbox is now the primary trader surface and does not expose `counter_risk_score` rows yet.
+- `PR #280 TG alert parking docs` - superseded by this backlog state and `tasks/lessons.md`; close rather than merge.
 
 **Rule:** V1 is read-only. No live execution, no sizing, no KOL ranking, no source pruning, no automatic signal disable.
 
@@ -88,6 +89,8 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 **Why:** Telegram alert qualification should run over the complete decision-support universe. A gate built before tracker-promoted candidates are measured would miss the TOES/BILL/UB-style tracker wins that motivated the trader-surface work.
 
 **Hard dependency:** PR #281 tracker-to-cockpit promotion must remain deployed and the request-independent soak metric must clear: `>= 5` unique tracker-promoted `coin_id`s/day for `>= 3` mature UTC days, measured with `scripts/trade_inbox_tracker_promotion_soak.sql`, or the 14-day calendar backstop must close with an explicit low-volume decision.
+
+**Current runtime gate check:** 2026-05-26 prod run of `scripts/trade_inbox_tracker_promotion_soak.sql` returned `2026-05-25|49` and `2026-05-26|12`. This confirms sufficient daily volume is likely, but the design remains locked until three mature UTC days are available.
 
 **Design checklist when unlocked:** drift-check all current Telegram alert surfaces; quantify 14-day alert volume and operator-action baseline; pin "qualified" without future-runner lookahead; decide corpus scope; include parse-mode hygiene and dispatched/delivered logs; add an auditable alert-decision event surface if a new writer ships; prove scarcity can compress the observed tracker-promotion baseline before any TG send.
 
@@ -2568,9 +2571,11 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 **Acceptance:** post-deploy journal window distinguishes "no live fallback observed" from "fallback fired"; when fallback fires, `fallback_raw_response=0`, no Anthropic fallback failures attributable to this change, and healthy broad grep no longer contains this event.
 
 ### BL-NEW-LIVE-DECISION-COCKPIT: turn signal substrate into a trader-facing "trade / watch / reject" surface
-**Status:** PROPOSED 2026-05-22 — filed from live-pick exercise. Trader-lens verdict: Gecko-Alpha can produce a defensible tiny experimental basket, but the workflow is not smooth. The operator currently has to stitch together `paper_trades`, `actionability`, `would_be_live`, `price_cache`, `chain_matches`, `predictions`, X/TG alert health, and `source_calls` health manually. Gecko has signals, but not yet a trader-facing decision surface.
+**Status:** SHIPPED-PARTIAL / PARENT-ARCHIVED 2026-05-26 — parent cockpit work is no longer buildable as a single backlog item. Core trader surfaces now exist: `/api/live_candidates`, Now Tradable, `/api/trade_inbox`, tracker-to-cockpit promotion, trade decision events, Trade Inbox contract firewall, and aggregate dashboard contract smoke. Future work must target specific residual child gaps instead of rebuilding the parent.
 **Tag:** `dashboard` `live-decision` `trader-cockpit` `actionability` `hermes-first`
 **Why:** The next leverage point is not another raw signal. It is a decision cockpit that collapses existing evidence into one per-token verdict with explicit reasons and refusal states. The useful current filters are `paper_trades` + current `price_cache`, `actionable=1`, `would_be_live=1`, fresh open-trade PnL vs entry, and source-call health warning when TG/X is not rankable. The friction is absence of a single "what can I trade now?" endpoint and UI.
+
+**2026-05-26 audit evidence:** shipped PR chain covers the parent surface: PR #228/#229/#232 (`/api/live_candidates` + counter_flags fix + contract smoke), PR #239 (Now Tradable and Signal Trust V1 tabs), PR #270 (deterministic live_candidates contract delta), PR #273 (Trade Inbox), PR #279 (trade decision events), PR #281 (tracker wins promoted to Trade Inbox), PR #282/#283 (Trade Inbox contract firewall/folds), PR #284/#285 (aggregate dashboard contract smoke + deploy record). Keep remaining work as child items such as signal trust scorecards, TG alert qualification after soak, or explicitly scoped entry/risk display deltas.
 
 **Operator-trader diagnosis captured:**
 - Trustable today: pipeline health, actionability stamps, `would_be_live`, chain_completed + volume_spike, and explicit "not rankable yet" source-call health.
@@ -2590,28 +2595,32 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 **Child backlog sequence:**
 
 1. **BL-NEW-LIVE-CANDIDATES-ENDPOINT** — Add read-only `/api/live_candidates`.
-   - **Status:** SHIPPED-MERGED 2026-05-23 — implemented in `f81b63ed` (PR #228) with counter_flags hotfix `db19e79a` (PR #229) and operator contract+smoke validator `0727e218` (PR #232).
+   - **Status:** SHIPPED-MERGED / CONTRACT-HARDENED 2026-05-26 — implemented in `f81b63ed` (PR #228) with counter_flags hotfix `db19e79a` (PR #229), operator contract+smoke validator `0727e218` (PR #232), and deterministic ordering/unique-token hardening via PR #270.
     - Return 10-20 per-token rows, not raw trades.
     - Inputs: open/recent `paper_trades`, `price_cache`, actionability metadata, `would_be_live`, `chain_matches`, latest prediction/counter-risk fields, source-call health.
     - Include token, symbol, name, current price, mcap, 24h change, open paper trade ids, signal surfaces, `actionable`, `would_be_live`, current-vs-entry %, inclusion reasons, exclusion/risk reasons, and `trade/watch/reject/data_insufficient`.
     - No writes, no live execution, no suppression.
 
 2. **BL-NEW-TRADER-READINESS-SCORE** — Add a score separate from conviction.
+   - **Status:** PARTIALLY-SHIPPED 2026-05-26 — Trade Inbox now emits `trade_score`, `action_label`, `window_state`, reasons, and refusal diagnostics. Do not re-open as a generic scoring system; any next work must be a measured refinement against Trade Inbox behavior.
    - Positive factors: actionability pass, `would_be_live` pass, multiple independent surfaces, fresh signal age, current price still near entry, sane mcap/liquidity, no counter-risk flags, resolved identity.
    - Negative factors: high counter-risk, already faded beyond threshold, already ran too far beyond entry, source not rankable, unresolved identity, TG/X-only context, stale price.
    - Must emit factor breakdown; no opaque single number.
 
 3. **BL-NEW-PER-TOKEN-EVIDENCE-BUNDLE** — Collapse duplicate evidence by token.
+   - **Status:** PARTIALLY-SHIPPED 2026-05-26 — Trade Inbox groups paper rows and tracker-promoted rows with provenance (`source_corpus`, `open_trade_ids`, `recent_trade_ids`, `surfaces`). A deeper token drawer remains optional, not parent-blocking.
    - Example target: ALLO row shows `volume_spike` yesterday + `chain_completed` today + `actionable=1` + `would_be_live=1` instead of two disconnected trade rows.
    - Evidence windows pre-registered (e.g. 36h primary, 7d historical support).
    - Distinguish active evidence from historical color.
 
 4. **BL-NEW-ENTRY-QUALITY-STATE** — Separate "system says yes" from "entry is still good".
+   - **Status:** SHIPPED-V1 2026-05-26 — `/api/live_candidates` and `/api/trade_inbox` expose entry/window state and already-ran/blocked routing. Future refinements should be scoped as explicit label semantics changes.
    - Labels: `fresh_entry`, `acceptable_pullback`, `already_faded`, `already_ran`, `too_stale`, `already_stopped_out`, `data_insufficient`.
    - Uses current price vs paper entry, signal age, checkpoint/peak context, and price freshness.
    - Prevents `actionable=1` tokens that are already -10% or +25% from being silently treated as equally tradable.
 
 5. **BL-NEW-NARRATIVE-COUNTER-RISK-INTO-TRADE-VIEW** — Promote prediction warnings into the candidate row.
+   - **Status:** PARTIALLY-SHIPPED / OPEN-PR 2026-05-26 — backend exposes `counter_risk_score` and `counter_flags` on live candidates; PR #278 proposes Now Tradable badges. Re-scope before merge because Trade Inbox is now the primary trader surface and lacks counter-risk fields.
    - Surface `dead_project`, `weak_community`, `already_peaked`, `narrative_mismatch`, low fit score, and counter-risk score as red/yellow badges.
    - Narrative predictions can enrich or downgrade a candidate; they are not standalone live entries unless the scoring layer also passes entry-quality and actionability gates.
 
@@ -2623,6 +2632,7 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
     - Explicit caption: "TG/X context is excluded from ranking until source-call price coverage is rankable."
 
 7. **BL-NEW-TGX-CONTEXT-ONLY-GUARDRAIL** — Prevent unrankable TG/X from influencing live candidate labels.
+   - **Status:** ENFORCED-BY-CONTRACT 2026-05-26 — Trade Inbox contract firewall and aggregate dashboard contract smoke guard against urgency/alert/ranking leakage. Future alert intent should use a separate endpoint unless a deliberate contract PR relaxes the firewall.
    - If `source_calls.rankability.rankable=0` or price coverage is below threshold, TG/X may appear as context badges only.
    - It must not boost `trade` labels, KOL ranking, pruning, or actionability consumption.
    - Unlock condition: source-call price coverage expansion ships and at least one source reaches `min_sample=10`, coverage >=0.50 with temporal integrity, trust-tier labeling, and chain identity enforced.
@@ -2634,14 +2644,10 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 4. No live execution, order sizing, KOL pruning, or source-ranking consumption in V1.
 5. Treat disagreements between `actionable` and `would_be_live` explicitly; do not hide them behind the score.
 
-**Acceptance for V1:**
-- Operator can open one dashboard panel or call one endpoint and get 3-5 experimental candidates with reasons and caveats in under 30 seconds.
-- Every candidate has a visible verdict, entry-quality label, evidence surfaces, risk badges, and refusal reason when rejected.
-- TG/X and KOL context remains excluded from rank/score until source-call coverage becomes rankable.
-- The endpoint is read-only and has tests proving no `paper_trades` / signal params / live execution writes.
+**Acceptance for V1:** MET for the parent cockpit as of 2026-05-26 except for optional refinements noted above. Operator has Now Tradable and Trade Inbox panels/endpoints, candidate labels and refusal reasons, tracker-promoted rows, read-only contract tests, and CI contract smoke. Keep TG/X and KOL context excluded from ranking until source-call coverage becomes rankable.
 
 ### BL-NEW-SIGNAL-TRUST-ROADMAP: convert Gecko-Alpha from signal collector to trustable signal system
-**Status:** PROPOSED 2026-05-22 - filed from trader-lens review. Core verdict: Gecko-Alpha is not yet trustable enough for blind live trading, but it is a credible experimental signal lab. The system can surface candidates worth investigating; it should not yet autonomously decide sizing, pruning, or live execution.
+**Status:** PARTIALLY-SHIPPED / OPEN-PR 2026-05-26 - registry and Signal Trust tab shipped; per-signal scorecards remain relevant in PR #276 but require rebase against current dashboard/dist before merge.
 **Tag:** `signals` `trust` `actionability` `hermes-first` `live-readiness`
 **Why:** The signal layer has uneven maturity. `chain_completed` and `volume_spike` currently feel more useful than raw TG/X noise; `actionable=1` and `would_be_live=1` are strong filters; source-call health correctly warns when KOL/TG/X is not rankable. But narrative predictions can still create paper trades while their own reasoning says "weak fit"; TG/X remains unresolved/noisy; and open paper trades are too broad to be treated as a trustable signal surface.
 
@@ -2674,6 +2680,7 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
     - Must be derived from current prod evidence, not vibes.
 
 2. **BL-NEW-SIGNAL-FAMILY-SCORECARDS** - Build per-signal scorecards.
+   - **Status:** OPEN-PR / NEEDS-REBASE 2026-05-26 — PR #276 implements `GET /api/signal_trust/scorecards`, dashboard rendering, and endpoint tests. CI is green, but `git merge-tree origin/master tmp-pr-276` shows conflicts in dashboard DB/models and generated dist after later cockpit PRs.
    - For each signal_type: 7d/14d/30d opens, closes, net PnL, win rate, average PnL, median PnL, max loss, open count, actionable pass rate, would_be_live pass rate, and current maturity state.
    - Include sample-size warnings and Wilson/bootstrap guards where useful.
    - No automatic parameter changes in V1.
