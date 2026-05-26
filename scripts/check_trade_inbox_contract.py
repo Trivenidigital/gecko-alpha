@@ -20,6 +20,9 @@ EXIT_HTTP = 2
 EXIT_JSON = 3
 EXIT_CONFIG = 4
 
+_DEFAULT_LIMIT_PER_GROUP = 10
+_DEFAULT_WINDOW_HOURS = 36
+
 EXPECTED_GROUPS = ("act_now", "watch", "already_ran", "blocked")
 EXPECTED_TOP_LEVEL_KEYS = frozenset({"meta", "groups"})
 EXPECTED_META_KEYS = frozenset({
@@ -134,6 +137,11 @@ BANNED_TOKENS = (
     "breakout confirmed",
 )
 
+BANNED_TOKEN_PATTERNS = tuple(
+    re.compile(r"\b" + r"[\s_-]*".join(map(re.escape, token.split())) + r"\b")
+    for token in BANNED_TOKENS
+)
+
 SCAN_EXEMPT_STRING_FIELDS = frozenset({
     "token_id",
     "symbol",
@@ -193,8 +201,12 @@ FORBIDDEN_VALUE_PATTERNS = tuple(
     re.compile(p)
     for p in (
         r"\bkol[\s_-]*rank\b",
+        r"\bsource[\s_-]*rank(?:\b|[\s_-])",
         r"\bsource[\s_-]*score\b",
         r"\bcaller[\s_-]*weight\b",
+        r"\burgency(?:\b|[\s_-])",
+        r"\bpriority(?:\b|[\s_-])",
+        r"\balert(?:\b|[\s_-])",
         r"\boperator[\s_-]*priority\b",
         r"\balert[\s_-]*level\b",
         r"\bnotify[\s_-]*candidate\b",
@@ -269,8 +281,8 @@ def _check_key_firewall(key: str, path: str, result: Result) -> None:
 
 def _scan_string_value(text: str, path: str, result: Result) -> None:
     normalized = _normalize_text(text)
-    for token in BANNED_TOKENS:
-        if token in normalized:
+    for token, pattern in zip(BANNED_TOKENS, BANNED_TOKEN_PATTERNS, strict=True):
+        if pattern.search(normalized):
             result.critical(
                 f"banned-language: token {token!r} found in {path} "
                 f"(normalized text: {normalized!r})"
@@ -612,6 +624,12 @@ def _check_group_meta(payload: dict, flat_rows: list[dict], result: Result) -> N
         returned_blocked_with_reason = sum(returned_blocked_reason_counts.values())
         if total_block_reasons < returned_blocked_with_reason:
             result.critical("meta.block_reason_counts must cover returned blocked rows")
+        for reason, returned_count in returned_blocked_reason_counts.items():
+            recorded_count = block_counts.get(reason)
+            if not _is_non_bool_int(recorded_count) or recorded_count < returned_count:
+                result.critical(
+                    f"meta.block_reason_counts[{reason!r}] must be >= returned blocked rows for that reason"
+                )
         blocked_group_count = group_counts.get("blocked")
         if _is_non_bool_int(blocked_group_count) and total_block_reasons > blocked_group_count:
             result.critical("meta.block_reason_counts total cannot exceed group_counts.blocked")
@@ -739,8 +757,8 @@ def main(argv=None) -> int:
         description="Runtime contract + smoke validator for /api/trade_inbox",
     )
     parser.add_argument("--url", default="http://localhost:8000")
-    parser.add_argument("--limit-per-group", type=int, default=20)
-    parser.add_argument("--window-hours", type=int, default=36)
+    parser.add_argument("--limit-per-group", type=int, default=_DEFAULT_LIMIT_PER_GROUP)
+    parser.add_argument("--window-hours", type=int, default=_DEFAULT_WINDOW_HOURS)
     parser.add_argument("--timeout-sec", type=float, default=10.0)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--verbose", action="store_true")
