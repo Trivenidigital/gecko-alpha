@@ -44,13 +44,16 @@ The managed block is bracketed by:
 
 ## What's in scope
 
-Currently 4 entries:
+Currently 5 entries:
 - `30 3 * * 0` — `scripts/tg_burst_archive.sh` (Sunday 03:30 UTC)
 - `45 3 * * 0` — `scripts/wal_archive.sh` (Sunday 03:45 UTC)
 - `*/5 * * * *` — `scripts/source-calls-live-writer.sh` (every 5 min)
 - `*/10 * * * *` — `scripts/source-calls-lag-watchdog.sh` (every 10 min)
+- `20 9 * * *` — `scripts/audit_stop_loss_false_negatives.sh --alert`
+  (daily stop-loss false-negative gate; logs every run and sends Telegram only
+  when status leaves `WAIT_MORE_MATURE_DATA`)
 
-Future high-cadence triggers should prefer `systemd/*.timer` (cycle 10 canon) over cron. The 4 entries above stay as cron for simplicity (see BL-NEW-CRON-TO-SYSTEMD-TIMER decision-by 2026-06-14).
+Future high-cadence triggers should prefer `systemd/*.timer` (cycle 10 canon) over cron. The 5 entries above stay as cron for simplicity (see BL-NEW-CRON-TO-SYSTEMD-TIMER decision-by 2026-06-14).
 
 ## Stderr redirection convention (Round 6 hardening)
 
@@ -174,3 +177,23 @@ bash cron/deploy.sh
 | 5 | Telegram token / chat_id missing or placeholder |
 | 6 | `python3` not available (JSON encoding) |
 | 7 | Telegram HTTP delivery failed |
+
+## Stop-loss false-negative audit gate
+
+`scripts/audit_stop_loss_false_negatives.sh` tracks the post-held-position-
+refresh stop-loss false-negative gate from the 2026-05-26 trading-signal
+quality audit.
+
+It is scheduled daily in the managed block. Normal state is log-only:
+`WAIT_MORE_MATURE_DATA`. Telegram fires only when either:
+- mature post-enable stop-loss false negatives reach `n>=30` across
+  `gainers_early`, `losers_contrarian`, and `trending_catch`;
+- mature post-enable stop-loss false negatives reach `n>=15` for
+  `gainers_early`;
+- the calendar backstop `2026-08-26` arrives; or
+- the broad post-enable mature `gainers_early` PnL cohort reaches `n>=20`.
+
+The script intentionally requires `first_runner_at > closed_at` for stop-loss
+false negatives. The 2026-05-26 cleanup found 15/42 historical
+`gainers_early` rows where the runner-board event preceded stop close, which
+overstated the old false-negative bucket.

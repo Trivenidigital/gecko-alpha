@@ -1,5 +1,28 @@
 # Lessons
 
+## Signal-quality proposals must quantify attribution before adding truth models
+
+- 2026-05-26 correction: I proposed a detector-credit / resurfaced-runner
+  architecture after observing screenshot examples where later runners had bad
+  or unknown paper outcomes. The operator correctly pointed out that this
+  bundled several unverified causes under "paper PnL is polluted" and risked
+  stacking truth models before tracing the data path.
+- Rule: before proposing a parallel truth model for trading signals, run a
+  post-hoc attribution audit that separates at least: stop exits with better
+  continuation, stale-price-cache exits/holds, known fixed bug windows, and
+  holding-window-vs-peak-time mismatch. If one fixable execution cause explains
+  the majority, fix that mechanism instead of adding a dashboard overlay.
+- Rule: future-runner labels are valid for offline evaluation and credit
+  attribution only. Do not let lookahead labels drive live ranking. Live ranking
+  must use only features available at decision time.
+- Rule: pin the universe before writing retention gates such as "retain 95% of
+  runners"; otherwise the gate can be vacuous or overbinding.
+- Follow-on pattern from the same exchange: after attribution identifies a
+  plausible mechanism, verify whether a recent fix already closed that hole
+  before scoping the next policy change. If a prior fix moved the metric to
+  noise floor, the right output is a mature-cohort re-audit gate with a
+  calendar backstop, not another feature or threshold change.
+
 ## Hermes cron diagnosis — read jobs.json before journal grep, and bound query windows
 
 - 2026-05-20 calibration: I diagnosed `gecko-x-narrative-scanner` failure as
