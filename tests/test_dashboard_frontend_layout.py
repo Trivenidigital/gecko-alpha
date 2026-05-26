@@ -38,7 +38,9 @@ def test_trade_inbox_tab_is_wired_to_dashboard():
     assert "Show more" in tab
     assert "Max scan" in tab
     assert "row.block_reason_primary" in tab
-    assert "return row.token_id" in tab
+    assert "return `${row.source_corpus || 'paper'}:${row.token_id}`" in tab
+    assert "`${row.group}:${row.source_corpus || 'paper'}:${row.token_id}`" in tab
+    assert "Source: {row.source_corpus || 'paper'}" in tab
     assert "previous_group" in tab
     assert "function rowStatus" in tab
     assert "10 * 60 * 1000" in tab

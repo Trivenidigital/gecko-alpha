@@ -1,5 +1,35 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-26 - Tracker Cockpit Promotion Path
+
+**Status:** IN PROGRESS. Goal: promote recent Top Gainers tracker/watch rows into the existing read-only Trade Inbox so detector wins can be reviewed even when no paper trade is opened.
+
+Workflow checklist:
+- [x] Drift-check: `/api/trade_inbox` exists and is the right surface; residual gap is input corpus because it scans only `paper_trades.status='open'`.
+- [x] Plan drafted: `tasks/plan_tracker_cockpit_promotion_path_2026_05_26.md`.
+- [x] Design drafted: `tasks/design_tracker_cockpit_promotion_path_2026_05_26.md`.
+- [x] Plan/design reviewed by 2 parallel agents and folds applied.
+- [x] Build with TDD.
+- [x] Focused verification and frontend build.
+- [x] PR opened: #281 (`feat(dashboard): promote tracker wins to Trade Inbox`).
+- [x] PR reviewed by 2 parallel agents and folds applied.
+
+Soak pre-commit:
+- A promoted candidate is a recent `gainers_comparisons` row within the Trade Inbox window, with non-empty `coin_id` and display identity, and no already-open paper-backed row for that token.
+- The promotion PR must expose live `tracker_rows_promoted` and `paper_rows_considered` counters, but the alert-design trigger must be request-independent: unique promoted `coin_id`s per UTC day from `appeared_on_gainers_at`, fixed `window_hours=36`, deduped from source rows rather than repeated API calls, and exported via `scripts/trade_inbox_tracker_promotion_soak.sql`.
+- Alert qualification design stays deferred until deployed data shows `>= 5` unique tracker-promoted `coin_id`s/day for `>= 3` mature UTC days, or the 14-day calendar backstop closes with an explicit low-volume decision.
+- No urgency tiers, ranking/sort tuning, Telegram alerts, paper dispatch changes, live execution, `gainers_early` re-enable, or cross-identifier resolver in this PR.
+
+Review/verification notes:
+- Plan/design review folds: request-independent soak counting with `scripts/trade_inbox_tracker_promotion_soak.sql`, no ranking/sort scope, paper-row tracker-surface enrichment before suppressing tracker-only duplicates, suppress against all scanned open paper rows, wider tracker scan past duplicates, missing detected-price rows route data-insufficient, identifier-mismatch residual risk, tracker-source truncation metadata, appeared-time index, and frontend seen/dismiss source keys.
+- TDD red/green: tracker-only row initially absent, `source_corpus` absent, no-price tracker row absent, frontend source-key static guard absent; implementation made the focused tests pass.
+- Verification: `uv run pytest --tb=short -q tests/test_trade_inbox_endpoint.py tests/test_dashboard_frontend_layout.py tests/test_symbol_upper_indexes_migration.py tests/test_live_candidates_endpoint.py tests/test_trade_decision_events.py` => `39 passed`; `$env:NODE_OPTIONS='--use-system-ca'; npm.cmd run build:codex` passed; full suite redirected with dummy required secrets => `2757 passed, 158 skipped, 11 warnings`.
+
+Follow-up / deploy smoke:
+- [x] Filed **BL-NEW-CROSS-IDENTIFIER-RESOLVER-TRACKER-PAPER**: source labels make paper/tracker duplicate rows decodable, but contract-address paper rows and CoinGecko-id tracker rows can still duplicate visually.
+- [ ] Pre-deploy smoke: count same-id overlap between `paper_trades.status='open'` and recent `gainers_comparisons`; if available, also count likely cross-id overlap via existing resolver candidates. Use this as the at-launch duplicate-noise baseline.
+- [ ] Post-deploy smoke: query `/api/trade_inbox?limit_per_group=100&window_hours=36` and confirm fresh tracker wins surface with `source_corpus=tracker`; if TOES/BSB/BILL/UB/TROLL/ASTEROID are outside the 36h window, use the newest Top Gainers tracker batch.
+
 ## Active Work: 2026-05-25 — Trade Opportunity Inbox
 
 **Status:** BUILD VERIFIED. Goal: turn high-volume early detections into a trader-facing read-only queue: Review Now, Watch, Moved Already, Blocked.

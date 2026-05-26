@@ -64,8 +64,20 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 ### Track 1 - Trader Decision Surface (buildable next)
 - `BL-NEW-LIVE-DECISION-COCKPIT` - highest product leverage. Build `/api/live_candidates` and a dashboard "Now Tradable" panel that turns existing evidence into `trade / watch / reject / data_insufficient`.
 - `BL-NEW-SIGNAL-TRUST-ROADMAP` - sibling trust layer. Build signal maturity states, scorecards, actionability-vs-`would_be_live` arbitration, narrative hard filters, and Hermes explanations.
+- `BL-NEW-CROSS-IDENTIFIER-RESOLVER-TRACKER-PAPER` - follow-up after tracker-to-inbox promotion. Resolve CoinGecko ids from tracker rows against contract-address paper rows so the Trade Inbox can collapse visually duplicate paper/tracker entries without hiding provenance.
 
 **Rule:** V1 is read-only. No live execution, no sizing, no KOL ranking, no source pruning, no automatic signal disable.
+
+### BL-NEW-CROSS-IDENTIFIER-RESOLVER-TRACKER-PAPER: collapse paper/tracker duplicates across identifier forms
+**Status:** PROPOSED 2026-05-26 - filed from PR #281 deploy-risk review.
+**Tag:** `trader-surface` `identity-resolution` `trade-inbox` `top-gainers`
+**Why:** PR #281 intentionally dedupes tracker-promoted rows only when `gainers_comparisons.coin_id` matches `paper_trades.token_id`. In prod, many paper rows use contract addresses while tracker rows use CoinGecko ids, so the same asset can appear twice: one `source_corpus=paper`, one `source_corpus=tracker`. Source labels make this decodable but still visually noisy.
+
+**Scope:** Build or reuse an identity resolver that can map open paper-trade token ids to CoinGecko ids for dashboard dedupe/enrichment. Preserve provenance: collapsed rows must still show both paper and tracker surfaces.
+
+**Non-scope:** no alerting, ranking, source pruning, execution changes, or hidden suppression of unmatched rows.
+
+**Pre-work runtime baseline:** before scoping, measure current overlap between `paper_trades.status='open'` and recent `gainers_comparisons` using both same-id match and any available contract/CG resolver candidate. Record the expected duplicate-noise reduction before implementing.
 
 ### Track 2 - Source/KOL Measurement Enablers (gated)
 - `BL-NEW-SOURCE-CALL-HISTORICAL-POOL-SELECTION-PROBE` - next authorized probe. Determines whether GT free can recover old source-call OHLCV if pool-at-call selection is fixed.
