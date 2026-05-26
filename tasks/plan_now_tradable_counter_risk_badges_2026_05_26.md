@@ -50,12 +50,11 @@ This is UI-only, but we still verify the runtime assumptions that would otherwis
 
 1. Define a minimal display contract in UI:
    - Render a small `CR <counter_risk_score>` badge when present (display-only; does not override verdict).
-   - Render `Fit <narrative_fit_score>` badge when present.
-   - Render up to 2 `counter_flags` chips with `+N` overflow indicator; full details in a tooltip.
+   - Render a `+N` flags badge when `counter_flags` is present; full details in a tooltip.
    - Defensive: `counter_flags` may contain `string` or `{flag,severity,detail}` dicts; never stringify whole dicts inline.
    - Unify counter-risk thresholds across the dashboard: `<30` (low/green), `30–60` (mid/amber), `>60` (high/red).
 2. Implement UI rendering in `dashboard/frontend/components/NowTradableTab.jsx`:
-   - Add a compact badges line inside the existing Reasons cell (avoid widening the table).
+   - Add a narrow CR column to keep the Reasons column stable.
    - Be defensive to `counter_flags` being a mix of strings and dicts.
    - Once CR/flags are displayed, filter the redundant reason `counter_risk_present_display_only_v1` from the reasons list to reduce noise.
 3. Add small CSS primitives in `dashboard/frontend/style.css`:
@@ -78,4 +77,3 @@ Revert the UI/CSS commit(s) touching:
 - `dashboard/frontend/components/NowTradableTab.jsx`
 - `dashboard/frontend/style.css`
 - `dashboard/frontend/dist/`
-

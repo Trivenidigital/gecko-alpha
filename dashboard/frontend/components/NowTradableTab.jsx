@@ -38,10 +38,36 @@ function riskBucket(score) {
   return 'high'
 }
 
+function clampRiskScore(score) {
+  const n = Number(score)
+  if (!Number.isFinite(n)) return null
+  if (n < 0) return 0
+  if (n > 100) return 100
+  return n
+}
+
+function _truncate(s, maxLen) {
+  if (!s) return ''
+  const t = String(s)
+  if (t.length <= maxLen) return t
+  return t.slice(0, Math.max(0, maxLen - 1)) + '…'
+}
+
 function normalizeCounterFlags(v) {
-  if (!v || !Array.isArray(v)) return []
+  let arr = null
+  if (!v) return []
+  if (Array.isArray(v)) arr = v
+  else if (typeof v === 'string') {
+    try {
+      const decoded = JSON.parse(v)
+      if (Array.isArray(decoded)) arr = decoded
+    } catch {
+      arr = null
+    }
+  }
+  if (!arr) return []
   const out = []
-  for (const item of v) {
+  for (const item of arr) {
     if (typeof item === 'string') {
       const label = item.trim()
       if (label) out.push({ label, severity: null, detail: null })
@@ -51,41 +77,54 @@ function normalizeCounterFlags(v) {
       const label = typeof item.flag === 'string' ? item.flag.trim() : ''
       if (!label) continue
       const severity =
-        item.severity === 'high' || item.severity === 'medium' || item.severity === 'low'
+        item.severity === 'critical' ||
+        item.severity === 'high' ||
+        item.severity === 'medium' ||
+        item.severity === 'low' ||
+        item.severity === 'info'
           ? item.severity
           : null
       const detail = typeof item.detail === 'string' ? item.detail : null
       out.push({ label, severity, detail })
     }
   }
-  const sevRank = { high: 0, medium: 1, low: 2, null: 3 }
+  const sevRank = { critical: 0, high: 1, medium: 2, low: 3, info: 4, null: 5 }
   out.sort((a, b) => {
     const ar = sevRank[a.severity ?? 'null'] ?? 3
     const br = sevRank[b.severity ?? 'null'] ?? 3
     if (ar !== br) return ar - br
-    return String(a.label).localeCompare(String(b.label))
+    const al = String(a.label)
+    const bl = String(b.label)
+    if (al === bl) return 0
+    return al < bl ? -1 : 1
   })
   return out
 }
 
 function renderCounterRiskCell(row) {
-  const score = row?.counter_risk_score
+  const rawScore = row?.counter_risk_score
+  const score = clampRiskScore(rawScore)
   const bucket = riskBucket(score)
   const flags = normalizeCounterFlags(row?.counter_flags)
-  const scoreOk = Number.isFinite(Number(score))
-  const showScore = scoreOk && bucket
+  const showScore = score != null && bucket
   const showFlags = flags.length > 0
   if (!showScore && !showFlags) return <span style={{ color: 'var(--color-text-secondary)' }}>-</span>
 
+  const MAX_FLAGS = 20
+  const MAX_SEG_LEN = 180
+  const flagSegments = flags
+    .slice(0, MAX_FLAGS)
+    .map(f => _truncate(f.detail ? `${f.label} — ${f.detail}` : f.label, MAX_SEG_LEN))
+  const flagsSuffix = flags.length > MAX_FLAGS ? ` …(+${flags.length - MAX_FLAGS} more)` : ''
   const tooltip = [
     showScore ? `Counter-risk (enrichment-only; does not change verdict): ${Number(score).toFixed(0)}` : null,
-    flags.length
-      ? `Flags: ${flags.map(f => (f.detail ? `${f.label} — ${f.detail}` : f.label)).slice(0, 20).join(' | ')}`
-      : null,
-  ].filter(Boolean).join('\n')
+    flags.length ? `Flags: ${flagSegments.join(' | ')}${flagsSuffix}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n')
 
   return (
-    <span className="cr-cell" title={tooltip}>
+    <span className="cr-cell" title={tooltip} aria-label={tooltip} tabIndex={0}>
       {showScore ? (
         <span className={`risk-badge ${bucket}`}>CR {Number(score).toFixed(0)}</span>
       ) : null}
