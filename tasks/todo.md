@@ -1,5 +1,51 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-26 - Trade Inbox Contract Firewall
+
+**Status:** BUILD VERIFIED. Goal: freeze the operator-facing `/api/trade_inbox`
+contract after tracker promotion, without adding alerting, urgency tiers,
+ranking, execution, or cross-identifier resolver behavior.
+
+Workflow checklist:
+- [x] Drift/runtime check: cross-id resolver baseline showed no measurable
+  current true cross-id duplicate cohort on prod (`paper_open=144`,
+  `tracker_36h=70`, same-id overlap `10`, strict symbol+name overlap `10`
+  with no cross-id samples, symbol-only cross-id raw pairs `0`).
+- [x] Branch decision: do not implement cross-id resolver in this branch;
+  keep it runtime-gated until a real candidate cohort or deterministic
+  contract-to-CoinGecko mapping exists.
+- [x] Plan drafted:
+  `tasks/plan_trade_inbox_contract_firewall_2026_05_26.md`.
+- [x] Plan reviewed by 2 parallel agents and folds applied: closed schema,
+  source-corpus bijections, counter math, recursive field firewall, and
+  endpoint coverage expansion.
+- [x] Design drafted:
+  `tasks/design_trade_inbox_contract_firewall_2026_05_26.md`.
+- [x] Design reviewed by 2 parallel agents and folds applied: impossible
+  source counters, value-level leakage checks, type matrix, duplicate identity
+  invariants, `surfaces` scan exemption, CLI `limit_per_group` semantics, and
+  pinned `meta.source`.
+- [x] Build with TDD: `scripts/check_trade_inbox_contract.py`,
+  `tests/test_check_trade_inbox_contract.py`, and endpoint validator coverage.
+
+Verification:
+- Red: `uv run pytest -q tests/test_check_trade_inbox_contract.py` failed
+  because `scripts/check_trade_inbox_contract.py` did not exist.
+- Green: `uv run pytest -q tests/test_check_trade_inbox_contract.py` =>
+  `24 passed`.
+- Focused integration: `uv run pytest -q tests/test_check_trade_inbox_contract.py
+  tests/test_trade_inbox_endpoint.py` => `35 passed`.
+
+Review/anti-scope notes:
+- Validator is closed-schema: unknown top-level/meta/group/row keys are
+  critical, so urgency/alert/ranking fields cannot be smuggled into the public
+  payload.
+- Paper/tracker semantics are bijective: tracker rows cannot carry paper ids or
+  actionable/live flags; paper rows must carry open paper provenance.
+- Cross-id resolver remains a separate runtime-gated backlog item. Duplicate-
+  looking rows during smoke should produce findings/backlog evidence, not a
+  resolver implementation in this branch.
+
 ## Active Work: 2026-05-26 - Tracker Cockpit Promotion Path
 
 **Status:** IN PROGRESS. Goal: promote recent Top Gainers tracker/watch rows into the existing read-only Trade Inbox so detector wins can be reviewed even when no paper trade is opened.
