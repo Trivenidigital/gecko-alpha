@@ -231,9 +231,16 @@ class SignalTrustScorecardsMeta(BaseModel):
     data_missing_reason: str | None = None
 
 
+class ApiError(BaseModel):
+    code: str
+    message: str
+    errors: list[str] | None = None
+
+
 class SignalTrustScorecardsResponse(BaseModel):
     meta: SignalTrustScorecardsMeta
     rows: list[SignalTrustScorecardsRow] = Field(default_factory=list)
+    error: ApiError | None = None
 
 
 TradeInboxGroup = Literal["act_now", "watch", "already_ran", "blocked"]
