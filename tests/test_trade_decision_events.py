@@ -122,6 +122,17 @@ async def test_trade_decision_events_table_created(db):
     }.issubset(columns)
 
 
+async def test_trade_decision_events_schema_version_collision_raises(db):
+    await db._conn.execute(
+        "UPDATE schema_version SET description = ? WHERE version = ?",
+        ("some_other_migration", 20260526),
+    )
+    await db._conn.commit()
+
+    with pytest.raises(RuntimeError, match="description mismatch"):
+        await db._migrate_trade_decision_events_v1()
+
+
 async def test_engine_emits_opened_trade_decision_event(engine, db):
     await _seed_price(db, "bitcoin", 50_000.0)
     trade_id = await engine.open_trade(
@@ -203,6 +214,29 @@ async def test_emit_trade_decision_fail_soft_when_db_closed(tmp_path):
     assert result is None
 
 
+async def test_emit_trade_decision_uses_txn_lock(db, monkeypatch):
+    from scout.trading.decision_events import emit_trade_decision
+
+    class ExplodingLock:
+        async def __aenter__(self):
+            raise RuntimeError("lock entered")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(db, "_txn_lock", ExplodingLock())
+
+    result = await emit_trade_decision(
+        db,
+        token_id="x",
+        signal_type="gainers_early",
+        decision="blocked",
+        reason="test",
+        source_module="test",
+    )
+    assert result is None
+
+
 def test_trade_decision_event_checker_fails_when_tracker_rows_have_no_decisions(
     tmp_path,
 ):
@@ -249,6 +283,64 @@ def test_trade_decision_event_checker_fails_when_tracker_rows_have_no_decisions(
 
     assert result.returncode == 2
     assert json.loads(result.stdout)["status"] == "missing_recent_decisions"
+
+
+def test_trade_decision_event_checker_uses_datetime_semantics(tmp_path):
+    db_path = tmp_path / "watchdog.db"
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE gainers_snapshots (coin_id TEXT, snapshot_at TEXT)")
+    conn.execute("""CREATE TABLE trade_decision_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_id TEXT NOT NULL,
+            signal_type TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            source_module TEXT NOT NULL,
+            signal_combo TEXT,
+            paper_trade_id INTEGER,
+            event_data TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+    fresh_offset_ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    conn.execute(
+        "INSERT INTO gainers_snapshots (coin_id, snapshot_at) VALUES (?, ?)",
+        ("toes", fresh_offset_ts),
+    )
+    conn.execute(
+        """INSERT INTO trade_decision_events
+           (token_id, signal_type, decision, reason, source_module, event_data, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "toes",
+            "gainers_early",
+            "blocked",
+            "signal_disabled",
+            "test",
+            "{}",
+            fresh_offset_ts,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path("scripts/check_trade_decision_events.py")),
+            "--db",
+            str(db_path),
+            "--lookback-minutes",
+            "15",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["status"] == "ok"
 
 
 def test_trade_decision_event_checker_ok_when_idle(tmp_path):

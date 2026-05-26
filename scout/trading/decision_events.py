@@ -31,7 +31,7 @@ async def emit_trade_decision(
     so the trading path keeps the exact pre-existing behavior.
     """
     conn = db._conn
-    if conn is None:
+    if conn is None or db._txn_lock is None:
         log.warning(
             "trade_decision_event_skipped_db_closed",
             token_id=token_id,
@@ -44,24 +44,25 @@ async def emit_trade_decision(
     payload = event_data or {}
     created_at = datetime.now(timezone.utc).isoformat()
     try:
-        cursor = await conn.execute(
-            """INSERT INTO trade_decision_events
-               (token_id, signal_type, decision, reason, source_module,
-                signal_combo, paper_trade_id, event_data, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                token_id,
-                signal_type,
-                decision,
-                reason,
-                source_module,
-                signal_combo,
-                paper_trade_id,
-                json.dumps(payload, sort_keys=True, default=str),
-                created_at,
-            ),
-        )
-        await conn.commit()
+        async with db._txn_lock:
+            cursor = await conn.execute(
+                """INSERT INTO trade_decision_events
+                   (token_id, signal_type, decision, reason, source_module,
+                    signal_combo, paper_trade_id, event_data, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    token_id,
+                    signal_type,
+                    decision,
+                    reason,
+                    source_module,
+                    signal_combo,
+                    paper_trade_id,
+                    json.dumps(payload, sort_keys=True, default=str),
+                    created_at,
+                ),
+            )
+            await conn.commit()
         event_id = int(cursor.lastrowid)
         log.debug(
             "trade_decision_event_emitted",
@@ -81,4 +82,15 @@ async def emit_trade_decision(
             reason=reason,
             error=str(exc),
         )
+        try:
+            await conn.rollback()
+        except Exception as rollback_exc:
+            log.warning(
+                "trade_decision_event_rollback_failed",
+                token_id=token_id,
+                signal_type=signal_type,
+                decision=decision,
+                reason=reason,
+                error=str(rollback_exc),
+            )
         return None

@@ -17,7 +17,12 @@ from pathlib import Path
 
 
 def _iso_cutoff(minutes: float) -> str:
-    return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .replace(tzinfo=None)
+        .isoformat(sep=" ")
+    )
 
 
 def check(db_path: Path, lookback_minutes: float) -> tuple[int, dict]:
@@ -31,14 +36,14 @@ def check(db_path: Path, lookback_minutes: float) -> tuple[int, dict]:
         tracker_count = conn.execute(
             """SELECT COUNT(*) AS n
                FROM gainers_snapshots
-               WHERE snapshot_at >= ?""",
+               WHERE datetime(snapshot_at) >= datetime(?)""",
             (cutoff,),
         ).fetchone()["n"]
         decision_count = conn.execute(
             """SELECT COUNT(*) AS n
                FROM trade_decision_events
                WHERE signal_type = 'gainers_early'
-                 AND created_at >= ?""",
+                 AND datetime(created_at) >= datetime(?)""",
             (cutoff,),
         ).fetchone()["n"]
     except sqlite3.Error as exc:

@@ -44,11 +44,13 @@ The managed block is bracketed by:
 
 ## What's in scope
 
-Currently 5 entries:
+Currently 6 entries:
 - `30 3 * * 0` — `scripts/tg_burst_archive.sh` (Sunday 03:30 UTC)
 - `45 3 * * 0` — `scripts/wal_archive.sh` (Sunday 03:45 UTC)
 - `*/5 * * * *` — `scripts/source-calls-live-writer.sh` (every 5 min)
 - `*/10 * * * *` — `scripts/source-calls-lag-watchdog.sh` (every 10 min)
+- `*/10 * * * *` — `scripts/check_trade_decision_events.py`
+  (every 10 min; logs `trade_decision_events` freshness status)
 - `20 9 * * *` — `scripts/audit_stop_loss_false_negatives.sh --alert`
   (daily stop-loss false-negative gate; logs every run and sends Telegram only
   when status leaves `WAIT_MORE_MATURE_DATA`)

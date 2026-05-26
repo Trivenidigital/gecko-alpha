@@ -1,4 +1,4 @@
-**New primitives introduced:** `trade_decision_events` SQLite table; `scout.trading.decision_events.emit_trade_decision`; `scripts/check_trade_decision_events.py` freshness watchdog.
+**New primitives introduced:** `trade_decision_events` SQLite table; `scout.trading.decision_events.emit_trade_decision`; `scripts/check_trade_decision_events.py` freshness watchdog; managed cron entry for trade-decision freshness logging.
 
 # Trade Decision Event Log Plan
 
@@ -26,13 +26,14 @@ Verdict: use a narrow in-repo implementation; no Hermes skill owns this audit tr
 2. Add a fail-soft emitter used by trading dispatch code.
 3. Instrument `trade_gainers` pre-engine filters and `TradingEngine.open_trade` admission decisions.
 4. Add a freshness checker that fails only when recent `gainers_snapshots` exist but no recent `gainers_early` decision events exist.
-5. Record this task and the attribution result in `tasks/todo.md`.
+5. Add a managed cron entry so the checker is observed on the same schedule class as other repo-tracked cron watchdogs.
+6. Record this task and the attribution result in `tasks/todo.md`.
 
 ## Non-Scope
 
 - Do not re-enable `gainers_early`.
 - Do not promote tracker rows into Trade Inbox yet.
-- Do not add Telegram alerting; dashboard/hand-run watchdog output first.
+- Do not add Telegram alerting; the initial watchdog is scheduled log output.
 - Do not implement urgency classification.
 
 ## Verification

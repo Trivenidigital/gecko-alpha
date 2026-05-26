@@ -3,5 +3,6 @@
 45 3 * * 0 /root/gecko-alpha/scripts/wal_archive.sh >> /var/log/gecko-alpha-wal-archive.log 2>&1
 */5 * * * * /root/gecko-alpha/scripts/source-calls-live-writer.sh >> /var/log/gecko-alpha-source-calls-live-writer.log 2>&1
 */10 * * * * /root/gecko-alpha/scripts/source-calls-lag-watchdog.sh >> /var/log/gecko-alpha-source-calls-lag-watchdog.log 2>&1
+*/10 * * * * cd /root/gecko-alpha && .venv/bin/python scripts/check_trade_decision_events.py --db /root/gecko-alpha/scout.db >> /var/log/gecko-alpha-trade-decision-events-watchdog.log 2>&1
 20 9 * * * /root/gecko-alpha/scripts/audit_stop_loss_false_negatives.sh --alert /root/gecko-alpha/scout.db >> /var/log/gecko-alpha-stop-loss-fn-audit.log 2>&1
 # === END gecko-alpha managed block ===
