@@ -39,6 +39,7 @@ Add only the residual gap:
 ```json
 {
   "meta": {
+    "ok": true,
     "read_only": true,
     "not_for_pruning": true,
     "not_for_auto_disable": true,
@@ -70,9 +71,14 @@ Add only the residual gap:
             "avg_pnl_pct": 4.56
           },
           "stamps": {
-            "stamped_n": 10,
+            "both_known_n": 10,
+            "null_mismatch_n": 1,
             "unknown_n": 2,
+            "actionable_known_n": 11,
+            "actionable_unknown_n": 1,
             "actionable_rate": 0.70,
+            "would_be_live_known_n": 10,
+            "would_be_live_unknown_n": 2,
             "would_be_live_rate": 0.60,
             "confusion": {
               "a1_w1": 5,
@@ -108,15 +114,34 @@ This avoids UI row jitter under ties and keeps the endpoint stable for contract 
 
 ### Win definition
 
-`wins = COUNT(where pnl_usd IS NOT NULL AND pnl_usd > 0)`.
+Adopt the in-tree cohort stats definition (avoid drift):
+
+- `trades = COUNT(*)` over the closed-trade cohort in-window
+- `wins = SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END)`
+
+Note: NULL `pnl_usd` counts toward `trades` but not `wins`, which is acceptable for visibility-only V1 as long as it is consistent across all endpoints.
 
 ### Stamp semantics (avoid NULL-as-false)
 
-Stamps are computed on the closed-trade cohort in-window:
+Stamps are computed on the closed-trade cohort in-window and must not treat NULL as false:
 
-- `stamped_n = COUNT(where actionable IS NOT NULL AND would_be_live IS NOT NULL)`
-- `unknown_n = closed_n - stamped_n`
-- Rates are computed over `stamped_n` only (return `null` when stamped_n=0).
+- For disagreement and the 2×2 confusion matrix:
+  - `both_known_n = COUNT(where actionable IS NOT NULL AND would_be_live IS NOT NULL)`
+  - confusion matrix keys are for **both-known rows only**:
+    - `a1_w1` => actionable=1 & would_be_live=1
+    - `a1_w0` => actionable=1 & would_be_live=0
+    - `a0_w1` => actionable=0 & would_be_live=1
+    - `a0_w0` => actionable=0 & would_be_live=0
+  - `disagree_n = a1_w0 + a0_w1`
+  - `disagree_rate = disagree_n / both_known_n` when both_known_n>0 else null
+- Coverage surface:
+  - `actionable_known_n = COUNT(where actionable IS NOT NULL)`
+  - `would_be_live_known_n = COUNT(where would_be_live IS NOT NULL)`
+  - `null_mismatch_n = COUNT(where (actionable IS NULL) != (would_be_live IS NULL))`
+  - `unknown_n = COUNT(*) - both_known_n` (kept as a coarse indicator)
+- Individual rates:
+  - `actionable_rate = COUNT(where actionable=1) / actionable_known_n` when actionable_known_n>0 else null
+  - `would_be_live_rate = COUNT(where would_be_live=1) / would_be_live_known_n` when would_be_live_known_n>0 else null
 - Confusion matrix keys are for stamped rows only:
   - `a1_w1` => actionable=1 & would_be_live=1
   - `a1_w0` => actionable=1 & would_be_live=0
@@ -142,7 +167,7 @@ Load the registry from the existing file path (same as `/api/signal_trust_regist
 
 One query:
 
-- `SELECT signal_type, COUNT(*) open_count, COALESCE(SUM(amount_usd), 0) open_exposure_usd FROM paper_trades WHERE status='open' GROUP BY signal_type`
+- `SELECT signal_type, COUNT(*) open_count, COALESCE(SUM(amount_usd), 0) open_exposure_usd FROM paper_trades WHERE status='open' AND closed_at IS NULL GROUP BY signal_type`
 
 ### Closed-trade window stats (per window)
 
@@ -150,7 +175,7 @@ Reuse `get_trading_stats_by_signal_cohort(db_path, days=...)` for:
 
 - closed_n (trades), wins, total_pnl_usd, win_rate_pct, avg_pnl_pct per `signal_type`
 
-Add one minimal aggregate per window for stamp/confusion stats (closed cohort only):
+Add one minimal aggregate per window for stamp/confusion stats (closed cohort only). Define the cohort primarily by `closed_at IS NOT NULL` (status as sanity only).
 
 - filter: `closed_at >= datetime('now', ?)` AND `closed_at IS NOT NULL` AND `status != 'open'`
 - compute:
@@ -160,9 +185,11 @@ Add one minimal aggregate per window for stamp/confusion stats (closed cohort on
 
 ### Failure modes
 
-- Missing `paper_trades` table or missing `would_be_live` / `actionable` columns:
-  - return 200 with empty `rows` and meta flags (visibility surface stays up)
-  - include a `meta.data_missing_reason` string for operator clarity
+- Missing `paper_trades` table:
+  - return `503` with `meta.ok=false` + structured `error.code="paper_trades_missing"`, while still including the read-only invariants in meta (mirror `/api/signal_trust_registry`).
+- Missing `actionable` and/or `would_be_live` columns:
+  - still return `200` with `meta.ok=true` and rows populated using registry + cohort stats + open stats;
+  - set stamp sub-objects to `null` (or all-zero counts + warnings) and include `meta.data_missing_reason="stamps_unavailable"` for operator clarity.
 
 ## Frontend
 
@@ -198,4 +225,3 @@ Revert commits touching:
 - tests + optional `dashboard/frontend/dist/`
 
 No DB migrations; rollback is source-only.
-
