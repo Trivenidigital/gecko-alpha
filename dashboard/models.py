@@ -173,6 +173,7 @@ class TradeInboxRow(BaseModel):
     symbol: str | None = None
     name: str | None = None
     chain: str | None = None
+    source_corpus: Literal["paper", "tracker"] = "paper"
 
     group: TradeInboxGroup
     action_label: TradeInboxActionLabel
@@ -214,6 +215,10 @@ class TradeInboxMeta(BaseModel):
     source_limit: int
     source_rows_considered: int
     open_trades_scanned: int
+    paper_rows_considered: int = 0
+    tracker_rows_considered: int = 0
+    tracker_rows_promoted: int = 0
+    tracker_source_truncated: bool = False
     source_truncated: bool = False
     group_counts: dict[str, int] = Field(default_factory=dict)
     group_hidden_counts: dict[str, int] = Field(default_factory=dict)

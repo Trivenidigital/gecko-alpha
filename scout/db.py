@@ -133,6 +133,7 @@ class Database:
         # UPPER(symbol) for volume_history_cg + gainers_snapshots so the
         # x_alerts symbol resolver stops scanning 2.5M-row table.
         await self._migrate_symbol_upper_indexes_v1()
+        await self._migrate_gainers_comparisons_appeared_idx_v1()
         await self._migrate_trade_decision_events_v1()
 
     async def connect(self) -> None:
@@ -4412,6 +4413,15 @@ class Database:
                     migration=migration_name,
                 )
                 raise
+
+    async def _migrate_gainers_comparisons_appeared_idx_v1(self) -> None:
+        """Index Top Gainers comparison recency for Trade Inbox promotion."""
+        await self._migrate_scanned_at_index(
+            table="gainers_comparisons",
+            column="appeared_on_gainers_at",
+            index_name="idx_gainers_comp_appeared_at",
+            migration_name="gainers_comp_appeared_at_idx_v1",
+        )
 
     # --- cohort_digest state helpers (D5 fold) -------------------------------
 

@@ -92,6 +92,52 @@ async def _insert_open_trade(
     await conn.commit()
 
 
+async def _insert_gainers_comparison(
+    conn,
+    *,
+    coin_id: str,
+    symbol: str | None = None,
+    name: str | None = None,
+    appeared_at: str | None = None,
+    price_change_24h: float = 24.0,
+    detected_price: float | None = 100.0,
+    current_price: float | None = 103.0,
+    price_updated_at: str | None = None,
+):
+    now = datetime.now(timezone.utc)
+    appeared = appeared_at or (now - timedelta(hours=1)).isoformat()
+    sym = symbol or coin_id.upper()[:8]
+    await conn.execute(
+        """INSERT INTO gainers_comparisons
+           (coin_id, symbol, name, price_change_24h, appeared_on_gainers_at,
+            detected_by_narrative, detected_by_pipeline, detected_by_chains,
+            detected_by_spikes, is_gap, detected_price)
+           VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 1, ?)""",
+        (
+            coin_id,
+            sym,
+            name or coin_id.title(),
+            price_change_24h,
+            appeared,
+            detected_price,
+        ),
+    )
+    if current_price is not None:
+        await conn.execute(
+            """INSERT OR REPLACE INTO price_cache
+               (coin_id, current_price, price_change_24h, market_cap, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                coin_id,
+                current_price,
+                price_change_24h,
+                75_000_000.0,
+                price_updated_at or now.isoformat(),
+            ),
+        )
+    await conn.commit()
+
+
 async def test_trade_inbox_groups_shape_and_read_only(client):
     c, db = client
     now = datetime.now(timezone.utc)
@@ -128,6 +174,190 @@ async def test_trade_inbox_groups_shape_and_read_only(client):
     assert payload["groups"]["watch"][0]["token_id"] == "stale-warning"
     assert payload["groups"]["already_ran"][0]["token_id"] == "moved"
     assert payload["groups"]["blocked"][0]["block_reason_primary"] == "NOT_ACTIONABLE"
+
+
+async def test_trade_inbox_promotes_tracker_only_gainer_to_watch(client):
+    c, db = client
+    before = await _paper_trade_count(db._conn)
+    await _insert_gainers_comparison(
+        db._conn,
+        coin_id="toes",
+        symbol="TOES",
+        detected_price=100.0,
+        current_price=104.0,
+    )
+
+    resp = await c.get("/api/trade_inbox?limit_per_group=10&window_hours=36")
+    after = await _paper_trade_count(db._conn)
+
+    assert resp.status_code == 200, resp.text
+    assert after == before
+    payload = resp.json()
+    rows = payload["groups"]["watch"]
+    assert [r["token_id"] for r in rows] == ["toes"]
+    row = rows[0]
+    assert row["source_corpus"] == "tracker"
+    assert row["open_trade_ids"] == []
+    assert row["recent_trade_ids"] == []
+    assert row["surfaces"] == ["top_gainers_tracker"]
+    assert row["actionable"] is None
+    assert row["would_be_live"] is None
+    assert row["action_label"] == "WATCH_PULLBACK"
+    assert "tracker_promotion" in row["inclusion_reasons"]
+    assert "tracker_only_no_paper_trade" in row["risk_reasons"]
+    assert payload["meta"]["tracker_rows_considered"] == 1
+    assert payload["meta"]["tracker_rows_promoted"] == 1
+    assert payload["meta"]["paper_rows_considered"] == 0
+
+
+async def test_trade_inbox_dedupes_tracker_row_behind_open_paper_trade(client):
+    c, db = client
+    await _insert_open_trade(db._conn, token_id="toes", symbol="TOES")
+    await _insert_gainers_comparison(
+        db._conn,
+        coin_id="toes",
+        symbol="TOES",
+        detected_price=100.0,
+        current_price=104.0,
+    )
+
+    resp = await c.get("/api/trade_inbox?limit_per_group=10&window_hours=36")
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    all_rows = [r for rows in payload["groups"].values() for r in rows]
+    toes_rows = [r for r in all_rows if r["token_id"] == "toes"]
+    assert len(toes_rows) == 1
+    assert toes_rows[0]["source_corpus"] == "paper"
+    assert toes_rows[0]["open_trade_ids"]
+    assert "top_gainers_tracker" in toes_rows[0]["surfaces"]
+    assert payload["meta"]["tracker_rows_considered"] == 1
+    assert payload["meta"]["tracker_rows_promoted"] == 0
+    assert payload["meta"]["paper_rows_considered"] == 1
+
+
+async def test_trade_inbox_suppresses_tracker_row_when_matching_open_paper_is_beyond_source_limit(
+    client,
+):
+    c, db = client
+    now = datetime.now(timezone.utc)
+    for i in range(500):
+        await _insert_open_trade(
+            db._conn,
+            token_id=f"paper-visible-{i:03d}",
+            opened_at=(now - timedelta(minutes=i)).isoformat(),
+        )
+    await _insert_open_trade(
+        db._conn,
+        token_id="older-paper",
+        symbol="OLDP",
+        opened_at=(now - timedelta(hours=20)).isoformat(),
+    )
+    await _insert_gainers_comparison(
+        db._conn,
+        coin_id="older-paper",
+        symbol="OLDP",
+        detected_price=100.0,
+        current_price=104.0,
+    )
+
+    resp = await c.get("/api/trade_inbox?limit_per_group=1&window_hours=36")
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    all_rows = [r for rows in payload["groups"].values() for r in rows]
+    assert all(r["token_id"] != "older-paper" for r in all_rows)
+    assert payload["meta"]["tracker_rows_considered"] == 1
+    assert payload["meta"]["tracker_rows_promoted"] == 0
+    assert payload["meta"]["source_truncated"] is True
+
+
+async def test_trade_inbox_scans_past_tracker_duplicates_to_promote_tracker_only_rows(
+    client,
+):
+    c, db = client
+    now = datetime.now(timezone.utc)
+    for i in range(500):
+        token_id = f"paper-dup-{i:03d}"
+        await _insert_open_trade(
+            db._conn,
+            token_id=token_id,
+            opened_at=(now - timedelta(minutes=i)).isoformat(),
+        )
+        await _insert_gainers_comparison(
+            db._conn,
+            coin_id=token_id,
+            appeared_at=(now - timedelta(minutes=i)).isoformat(),
+        )
+    await _insert_gainers_comparison(
+        db._conn,
+        coin_id="tracker-only-after-dupes",
+        symbol="TOAD",
+        appeared_at=(now - timedelta(hours=10)).isoformat(),
+        detected_price=100.0,
+        current_price=104.0,
+    )
+
+    resp = await c.get("/api/trade_inbox?limit_per_group=1&window_hours=36")
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    all_rows = [r for rows in payload["groups"].values() for r in rows]
+    promoted = [r for r in all_rows if r["token_id"] == "tracker-only-after-dupes"]
+    assert len(promoted) == 1
+    assert promoted[0]["source_corpus"] == "tracker"
+    assert payload["meta"]["tracker_rows_considered"] > 500
+    assert payload["meta"]["tracker_rows_promoted"] == 1
+    assert payload["meta"]["tracker_source_truncated"] is False
+
+
+async def test_trade_inbox_tracker_row_without_price_is_data_missing(client):
+    c, db = client
+    await _insert_gainers_comparison(
+        db._conn,
+        coin_id="no-price-gainer",
+        symbol="NPG",
+        detected_price=None,
+        current_price=None,
+    )
+
+    resp = await c.get("/api/trade_inbox?limit_per_group=10&window_hours=36")
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    row = payload["groups"]["blocked"][0]
+    assert row["token_id"] == "no-price-gainer"
+    assert row["source_corpus"] == "tracker"
+    assert row["action_label"] == "DATA_MISSING"
+    assert row["block_reason_primary"] == "NO_PRICE"
+    assert "no_price_snapshot_for_token_id" in row["risk_reasons"]
+    assert payload["meta"]["tracker_rows_promoted"] == 1
+
+
+async def test_trade_inbox_tracker_row_with_current_price_but_no_detected_price_is_data_missing(
+    client,
+):
+    c, db = client
+    await _insert_gainers_comparison(
+        db._conn,
+        coin_id="missing-entry-price",
+        symbol="MEP",
+        detected_price=None,
+        current_price=104.0,
+    )
+
+    resp = await c.get("/api/trade_inbox?limit_per_group=10&window_hours=36")
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    row = payload["groups"]["blocked"][0]
+    assert row["token_id"] == "missing-entry-price"
+    assert row["source_corpus"] == "tracker"
+    assert row["action_label"] == "DATA_MISSING"
+    assert row["block_reason_primary"] == "DATA_INSUFFICIENT"
+    assert row["entry_quality"] == "data_insufficient"
+    assert row["pct_from_entry"] is None
+    assert "detected_price_missing_or_invalid" in row["risk_reasons"]
 
 
 async def test_trade_inbox_broad_cohort_surfaces_toes_beyond_raw_limit(client):

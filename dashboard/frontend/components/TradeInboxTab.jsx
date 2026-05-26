@@ -28,11 +28,11 @@ function fmtPct(n) {
 }
 
 function rowKey(row) {
-  return row.token_id
+  return `${row.source_corpus || 'paper'}:${row.token_id}`
 }
 
 function dismissKey(row) {
-  return `${row.group}:${row.token_id}`
+  return `${row.group}:${row.source_corpus || 'paper'}:${row.token_id}`
 }
 
 function loadSeen() {
@@ -139,7 +139,7 @@ export default function TradeInboxTab() {
         <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>Trade Inbox</span>
           <span style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 400 }}>
-            Read-only review queue over open paper trades. Not execution advice.
+            Read-only review queue over open paper trades and promoted tracker rows. Not execution advice.
           </span>
           <span style={{ marginLeft: 'auto', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <button className="tab-btn" onClick={fetchInbox} disabled={loading} style={{ padding: '2px 8px', fontSize: 12 }}>
@@ -157,6 +157,7 @@ export default function TradeInboxTab() {
         </div>
         <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', fontSize: 12 }}>
           read_only={String(meta.read_only ?? '?')} not_trade_advice={String(meta.not_trade_advice ?? '?')} generated_at={meta.generated_at || '?'} source_rows={meta.source_rows_considered ?? '?'} scanned={meta.open_trades_scanned ?? '?'}
+          {' '}paper_rows={meta.paper_rows_considered ?? '?'} tracker_promoted={meta.tracker_rows_promoted ?? '?'}
           {meta.source_truncated ? (
             <div style={{ marginTop: 8, color: 'var(--color-accent-amber)' }}>
               Source truncated at {meta.source_limit}; older open trades may not be represented.
@@ -164,6 +165,11 @@ export default function TradeInboxTab() {
               <button className="tab-btn" onClick={() => setLimit(100)} style={{ padding: '2px 8px', fontSize: 12 }}>
                 Max scan
               </button>
+            </div>
+          ) : null}
+          {meta.tracker_source_truncated ? (
+            <div style={{ marginTop: 8, color: 'var(--color-accent-amber)' }}>
+              Tracker source truncated at {meta.source_limit}; older tracker rows may not be represented.
             </div>
           ) : null}
           {error ? <div style={{ marginTop: 8, color: 'var(--color-accent-red)' }}>Error: {error}</div> : null}
@@ -219,6 +225,7 @@ export default function TradeInboxTab() {
                           <td>
                             <TokenLink tokenId={row.token_id} symbol={row.symbol || row.name} chain={row.chain} />
                             <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>{rowStatus(row, wasSeen)}</div>
+                            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>Source: {row.source_corpus || 'paper'}</div>
                           </td>
                           <td style={{ fontWeight: 700 }}>{row.action_label}</td>
                           <td>{row.window_state}</td>

@@ -55,6 +55,20 @@ async def test_gainers_snapshots_symbol_upper_index_exists(db):
     assert "idx_gainers_snap_symbol_upper" in names
 
 
+async def test_gainers_comparisons_appeared_index_exists(db):
+    _d, db_path = db
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND tbl_name='gainers_comparisons'"
+        ).fetchall()
+    finally:
+        conn.close()
+    names = {r[0] for r in rows}
+    assert "idx_gainers_comp_appeared_at" in names
+
+
 async def test_volume_history_cg_resolver_query_uses_index(db):
     """Resolver query shape against volume_history_cg must SEARCH via the
     new functional index, not SCAN the 2.5M-row table.

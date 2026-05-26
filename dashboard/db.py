@@ -1053,6 +1053,12 @@ def _trade_window_state(row: dict) -> str:
 
 def _trade_block_reason(row: dict) -> str | None:
     if row.get("current_price") is None or row.get("pct_from_entry") is None:
+        if (
+            row.get("current_price") is not None
+            and "detected_price_missing_or_invalid"
+            in set(row.get("risk_reasons") or [])
+        ):
+            return "DATA_INSUFFICIENT"
         return "NO_PRICE"
     if "price_timestamp_unparseable" in set(row.get("risk_reasons") or []):
         return "DATA_INSUFFICIENT"
@@ -1167,6 +1173,10 @@ async def get_trade_inbox(
 
     groups: dict[str, list[dict]] = {g: [] for g in TRADE_INBOX_GROUPS}
     open_trades_scanned = 0
+    paper_rows_considered = 0
+    tracker_rows_considered = 0
+    tracker_rows_promoted = 0
+    tracker_source_truncated = False
     source_rows_considered = 0
     source_truncated = False
     block_reason_counts: dict[str, int] = {}
@@ -1208,9 +1218,11 @@ async def get_trade_inbox(
 
         primary: dict[str, dict] = {}
         open_ids: dict[str, list[int]] = {}
+        all_open_token_ids: set[str] = set()
         token_order: list[str] = []
         for r in open_rows:
             token_id = r["token_id"]
+            all_open_token_ids.add(token_id)
             open_ids.setdefault(token_id, []).append(int(r["id"]))
             if token_id not in primary:
                 if len(token_order) >= source_limit:
@@ -1219,9 +1231,9 @@ async def get_trade_inbox(
                 primary[token_id] = r
                 token_order.append(token_id)
 
+        cutoff_iso = (now - timedelta(hours=window_hours)).isoformat()
         if token_order:
             placeholders = ",".join("?" * len(token_order))
-            cutoff_iso = (now - timedelta(hours=window_hours)).isoformat()
             surfaces_by_token = {t: {primary[t]["signal_type"]} for t in token_order}
             recent_ids_by_token = {t: [] for t in token_order}
             try:
@@ -1257,6 +1269,55 @@ async def get_trade_inbox(
             surfaces_by_token = {}
             recent_ids_by_token = {}
             price_by_coin = {}
+
+        tracker_scan_cap = max(source_limit * 3, source_limit + 500)
+        try:
+            cursor = await db.execute(
+                """SELECT id, coin_id, symbol, name, price_change_24h,
+                          appeared_on_gainers_at, detected_price
+                     FROM gainers_comparisons
+                    WHERE appeared_on_gainers_at >= ?
+                      AND COALESCE(coin_id, '') != ''
+                      AND (COALESCE(symbol, '') != '' OR COALESCE(name, '') != '')
+                    ORDER BY appeared_on_gainers_at DESC, id DESC
+                    LIMIT ?""",
+                (cutoff_iso, tracker_scan_cap),
+            )
+            tracker_rows = [dict(x) for x in await cursor.fetchall()]
+        except aiosqlite.OperationalError:
+            tracker_rows = []
+
+        tracker_rows_considered = len(tracker_rows)
+        if len(tracker_rows) >= tracker_scan_cap:
+            tracker_source_truncated = True
+
+        tracker_by_token: dict[str, dict] = {}
+        for tr in tracker_rows:
+            token_id = tr.get("coin_id")
+            if token_id and token_id not in tracker_by_token:
+                tracker_by_token[token_id] = tr
+            if token_id in surfaces_by_token:
+                surfaces_by_token[token_id].add("top_gainers_tracker")
+
+        tracker_token_order = [
+            t for t in tracker_by_token.keys() if t not in all_open_token_ids
+        ][:source_limit]
+        if tracker_token_order:
+            tracker_placeholders = ",".join("?" * len(tracker_token_order))
+            try:
+                cursor = await db.execute(
+                    f"""SELECT coin_id, current_price, market_cap, price_change_24h, updated_at
+                          FROM price_cache
+                         WHERE coin_id IN ({tracker_placeholders})""",
+                    tuple(tracker_token_order),
+                )
+                tracker_price_by_coin = {
+                    r["coin_id"]: dict(r) for r in await cursor.fetchall()
+                }
+            except aiosqlite.OperationalError:
+                tracker_price_by_coin = {}
+        else:
+            tracker_price_by_coin = {}
 
     for token_id in token_order:
         base = primary[token_id]
@@ -1359,6 +1420,7 @@ async def get_trade_inbox(
             "symbol": base.get("symbol"),
             "name": base.get("name"),
             "chain": base.get("chain"),
+            "source_corpus": "paper",
             "open_trade_ids": sorted(open_ids.get(token_id, []), reverse=True),
             "recent_trade_ids": sorted(
                 recent_ids_by_token.get(token_id, []), reverse=True
@@ -1426,6 +1488,157 @@ async def get_trade_inbox(
         row["why_now"] = _trade_why_now(row)
         groups[group].append(row)
         source_rows_considered += 1
+        paper_rows_considered += 1
+
+    for token_id in tracker_token_order:
+        base = tracker_by_token[token_id]
+        price = tracker_price_by_coin.get(token_id)
+        risk_reasons: list[str] = ["tracker_only_no_paper_trade"]
+        inclusion_reasons: list[str] = ["tracker_promotion", "top_gainers_tracker"]
+        opened_dt = _parse_iso_dt(base.get("appeared_on_gainers_at"))
+        opened_at = opened_dt.isoformat() if opened_dt else None
+        if opened_dt is None:
+            risk_reasons.append("opened_at_unparseable")
+        opened_age_hours = (
+            round((now - opened_dt).total_seconds() / 3600, 2) if opened_dt else None
+        )
+
+        current_price = (
+            float(price["current_price"])
+            if price and price.get("current_price") is not None
+            else None
+        )
+        detected_price = base.get("detected_price")
+        entry_price = None
+        entry_price_missing = False
+        if detected_price is not None:
+            try:
+                detected_price = float(detected_price)
+                if detected_price > 0:
+                    entry_price = detected_price
+                else:
+                    risk_reasons.append("detected_price_missing_or_invalid")
+                    entry_price_missing = True
+            except (TypeError, ValueError):
+                risk_reasons.append("detected_price_missing_or_invalid")
+                entry_price_missing = True
+        else:
+            risk_reasons.append("detected_price_missing_or_invalid")
+            entry_price_missing = True
+        pct_from_entry = None
+        if current_price is not None and entry_price and entry_price > 0:
+            pct_from_entry = round((current_price - entry_price) / entry_price * 100, 2)
+        elif current_price is None:
+            risk_reasons.append("no_price_snapshot_for_token_id")
+        else:
+            risk_reasons.append("entry_price_missing_or_invalid")
+
+        price_updated_at = None
+        price_staleness_minutes = None
+        if price:
+            upd_dt = _parse_iso_dt(price.get("updated_at"))
+            if upd_dt:
+                price_updated_at = upd_dt.isoformat()
+                price_staleness_minutes = round((now - upd_dt).total_seconds() / 60, 2)
+            else:
+                risk_reasons.append("price_timestamp_unparseable")
+
+        entry_quality = "data_insufficient"
+        if pct_from_entry is not None:
+            if pct_from_entry < -10:
+                entry_quality = "already_faded"
+            elif pct_from_entry > 25:
+                entry_quality = "already_ran"
+            elif -2 <= pct_from_entry <= 8:
+                entry_quality = "fresh_entry"
+            elif -6 <= pct_from_entry <= 15:
+                entry_quality = "acceptable_pullback"
+            elif pct_from_entry < -6:
+                entry_quality = "already_faded"
+            else:
+                entry_quality = "already_ran"
+
+        window_state = _trade_window_state(
+            {"current_price": current_price, "pct_from_entry": pct_from_entry}
+        )
+        if price_staleness_minutes is not None and price_staleness_minutes >= 60:
+            risk_reasons.append("price_is_stale")
+            if price_staleness_minutes >= 120:
+                entry_quality = "too_stale"
+
+        verdict = "watch"
+        if (
+            current_price is None
+            or opened_at is None
+            or entry_price_missing
+            or "price_timestamp_unparseable" in set(risk_reasons)
+            or (price_staleness_minutes is not None and price_staleness_minutes >= 120)
+        ):
+            verdict = "data_insufficient"
+
+        row = {
+            "token_id": token_id,
+            "symbol": base.get("symbol"),
+            "name": base.get("name"),
+            "chain": "coingecko",
+            "source_corpus": "tracker",
+            "open_trade_ids": [],
+            "recent_trade_ids": [],
+            "surfaces": ["top_gainers_tracker"],
+            "actionable": None,
+            "would_be_live": None,
+            "opened_at": opened_at,
+            "opened_age_hours": opened_age_hours,
+            "pct_from_entry": pct_from_entry,
+            "current_price": current_price,
+            "market_cap": price.get("market_cap") if price else None,
+            "price_change_24h": (
+                price.get("price_change_24h")
+                if price and price.get("price_change_24h") is not None
+                else base.get("price_change_24h")
+            ),
+            "price_updated_at": price_updated_at,
+            "price_is_stale": bool(
+                price_staleness_minutes is not None and price_staleness_minutes >= 60
+            ),
+            "price_staleness_minutes": price_staleness_minutes,
+            "entry_quality": entry_quality,
+            "verdict": verdict,
+            "inclusion_reasons": inclusion_reasons,
+            "risk_reasons": risk_reasons,
+            "window_state": window_state,
+        }
+        block_reason = _trade_block_reason(row)
+        row["block_reason_primary"] = block_reason
+        if block_reason:
+            group = "blocked"
+            action = (
+                "DATA_MISSING"
+                if block_reason in ("NO_PRICE", "BAD_TIMESTAMP", "DATA_INSUFFICIENT")
+                else "BLOCKED"
+            )
+            block_reason_counts[block_reason] = (
+                block_reason_counts.get(block_reason, 0) + 1
+            )
+        elif window_state in ("late", "closed"):
+            group = "already_ran"
+            action = "TOO_LATE"
+        else:
+            group = "watch"
+            action = "WATCH_PULLBACK"
+        if row["price_is_stale"]:
+            if price_staleness_minutes is not None and price_staleness_minutes >= 120:
+                hard_stale_count += 1
+            else:
+                stale_warning_count += 1
+        row["group"] = group
+        row["action_label"] = action
+        row["trade_score"] = _trade_score(row)
+        row["sort_key"] = _trade_sort_key(row)
+        row["why_now"] = _trade_why_now(row)
+        groups[group].append(row)
+        source_rows_considered += 1
+        tracker_rows_promoted += 1
 
     for rows in groups.values():
         rows.sort(key=lambda r: r["sort_key"])
@@ -1449,6 +1662,10 @@ async def get_trade_inbox(
             "source_limit": source_limit,
             "source_rows_considered": source_rows_considered,
             "open_trades_scanned": open_trades_scanned,
+            "paper_rows_considered": paper_rows_considered,
+            "tracker_rows_considered": tracker_rows_considered,
+            "tracker_rows_promoted": tracker_rows_promoted,
+            "tracker_source_truncated": tracker_source_truncated,
             "source_truncated": source_truncated,
             "group_counts": group_counts,
             "group_hidden_counts": group_hidden_counts,

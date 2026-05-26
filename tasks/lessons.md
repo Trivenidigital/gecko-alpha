@@ -1,5 +1,21 @@
 # Lessons
 
+## Complete trader surfaces before ranking or urgency tiers
+
+- 2026-05-26 correction: when the operator asked for fewer, better trading
+  signals, I twice reached for ranking/tiering before the motivating tokens
+  were guaranteed to reach the trader surface. First this appeared as
+  detector-credit / resurfaced-runner queues; later it appeared as Telegram
+  `TRADE_NOW` / `WATCH_BREAKOUT` tiers.
+- Rule: operator frustration with trader-surface actionability should first
+  trigger surface-completeness and path-trace checks. Complete the promotion
+  surface, measure queue volume, then add ranking or urgency tiers only if the
+  measured queue volume justifies them.
+- Rule: alert qualification should run over the complete decision-support
+  universe. If watcher/tracker wins are not yet promoted into the cockpit, a
+  TG alert gate built on paper-trade-backed rows will miss the exact tokens
+  that motivated the work.
+
 ## Signal-quality proposals must quantify attribution before adding truth models
 
 - 2026-05-26 correction: I proposed a detector-credit / resurfaced-runner
