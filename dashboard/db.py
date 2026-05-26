@@ -2273,7 +2273,7 @@ async def get_trading_actionability_summary(db_path: str, days: int = 7) -> dict
                           COALESCE(AVG(pnl_pct), 0) AS avg_pct
                    FROM paper_trades
                    WHERE status != 'open'
-                     AND closed_at >= datetime('now', ?)
+                     AND julianday(closed_at) >= julianday('now', ?)
                    GROUP BY actionable""",
                 (window,),
             )
@@ -2287,10 +2287,10 @@ async def get_trading_actionability_summary(db_path: str, days: int = 7) -> dict
                               AS closed_pnl
                    FROM paper_trades
                    WHERE actionability_reason IS NOT NULL
-                     AND (
-                       (status = 'open' AND opened_at >= datetime('now', ?))
-                       OR (status != 'open' AND closed_at >= datetime('now', ?))
-                     )
+                      AND (
+                        (status = 'open' AND julianday(opened_at) >= julianday('now', ?))
+                        OR (status != 'open' AND julianday(closed_at) >= julianday('now', ?))
+                      )
                    GROUP BY actionability_reason
                    ORDER BY trades DESC, reason ASC
                    LIMIT 10""",
@@ -2359,9 +2359,9 @@ async def get_trading_stats(db_path: str, days: int = 7) -> dict:
                      COALESCE(AVG(pnl_pct), 0) as avg_pnl_pct,
                      MAX(pnl_usd) as best_trade,
                      MIN(pnl_usd) as worst_trade
-                   FROM paper_trades
-                   WHERE status != 'open'
-                     AND closed_at >= datetime('now', ?)""",
+                    FROM paper_trades
+                    WHERE status != 'open'
+                      AND julianday(closed_at) >= julianday('now', ?)""",
                 (f"-{days} days",),
             )
             row = await cursor.fetchone()
@@ -2401,7 +2401,7 @@ async def get_trading_stats_by_signal(db_path: str, days: int = 7) -> dict:
                      SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins
                    FROM paper_trades
                    WHERE status != 'open'
-                     AND closed_at >= datetime('now', ?)
+                     AND julianday(closed_at) >= julianday('now', ?)
                    GROUP BY signal_type""",
                 (f"-{days} days",),
             )
@@ -2538,7 +2538,7 @@ async def get_signal_trust_scorecards(db_path: str) -> dict:
                          FROM paper_trades
                         WHERE closed_at IS NOT NULL
                           AND status!='open'
-                          AND closed_at >= datetime('now', ?)
+                          AND julianday(closed_at) >= julianday('now', ?)
                         GROUP BY signal_type""",
                     (f"-{days} days",),
                 )
@@ -2605,10 +2605,7 @@ async def get_signal_trust_scorecards(db_path: str) -> dict:
     # Closed-trade stats: reuse existing helper (avoid metric drift).
     closed_stats_by_window: dict[int, dict[str, dict]] = {}
     for days in windows_days:
-        try:
-            cohort = await get_trading_stats_by_signal_cohort(db_path, days=days)
-        except Exception:
-            cohort = {}
+        cohort = await get_trading_stats_by_signal_cohort(db_path, days=days)
         full_rows = cohort.get("full_cohort") or []
         by_signal: dict[str, dict] = {}
         for r in full_rows:
@@ -2775,7 +2772,7 @@ async def get_trading_stats_by_signal_cohort(db_path: str, days: int = 7) -> dic
                           GROUP_CONCAT(symbol, '|')               AS symbols
                      FROM paper_trades
                     WHERE status != 'open'
-                      AND closed_at >= datetime('now', ?)
+                      AND julianday(closed_at) >= julianday('now', ?)
                     GROUP BY signal_type""",
                 (window,),
             )
@@ -2797,7 +2794,7 @@ async def get_trading_stats_by_signal_cohort(db_path: str, days: int = 7) -> dic
                           GROUP_CONCAT(symbol, '|')               AS symbols
                      FROM paper_trades
                     WHERE status != 'open'
-                      AND closed_at >= datetime('now', ?)
+                      AND julianday(closed_at) >= julianday('now', ?)
                       AND would_be_live = 1
                     GROUP BY signal_type""",
                 (window,),
