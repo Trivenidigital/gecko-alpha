@@ -27,7 +27,7 @@ Review notes:
 
 Follow-up filed 2026-05-26:
 - [x] **BL-NEW-GAINERS-EARLY-2026-05-19-AUTOSUSPEND-ATTRIBUTION**: before building tracker-to-inbox promotion, attribute why `gainers_early` moved from 2026-05-13 KEEP-ON (`+$1,894`, `n=128`, `72.7%` win rate) to 2026-05-19 hard-loss auto-suspension. 2026-05-26 prod SQL: `signal_params.enabled=0`, `suspended_reason=hard_loss`, `updated_at=2026-05-19T01:02:14.744149+00:00`; post-KEEP_ON/pre-disable closed cohort `123` closes / `-$2,262.70` net / `43.1%` win, with `stop_loss` `32` rows / `-$2,632.15`. Framing decision: do not re-enable `gainers_early`; build visibility instrumentation first, then promotion.
-- [ ] **BL-NEW-TRADE-DECISION-EVENT-LOG**: implement standalone structured admission/skip event log for trade dispatch decisions before tracker-to-inbox promotion. Plan: `tasks/plan_trade_decision_event_log_2026_05_26.md`.
+- [x] **BL-NEW-TRADE-DECISION-EVENT-LOG**: implemented standalone structured admission/skip event log for trade dispatch decisions before tracker-to-inbox promotion. Plan: `tasks/plan_trade_decision_event_log_2026_05_26.md`. Commit `8e6d85b`: new `trade_decision_events` table, fail-soft emitter, `trade_gainers` pre-engine filter events, `TradingEngine.open_trade` admission/opened events, and `scripts/check_trade_decision_events.py` freshness watchdog. Verification: focused red/green, `uv run pytest -q tests/test_trade_decision_events.py tests/test_trading_engine.py tests/test_trading_signals.py` => `115 passed`; full suite with dummy required settings env => `2750 passed, 158 skipped`.
 
 ## Active Work: 2026-05-25 — Live candidates determinism + contract delta
 
