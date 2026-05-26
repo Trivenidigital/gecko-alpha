@@ -2560,7 +2560,7 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 **Re-eval trigger:** use the shipped top-level row for any future 90-day kill/review decision.
 
 ### BL-NEW-MIROFISH-DEBUG-NOISE-SUPPRESS: stop journal pollution from fallback_raw_response DEBUG events
-**Status:** PR-OPEN 2026-05-26 — successful fallback raw-response logging removed in `scout/mirofish/fallback.py`; PR/deploy pending. Pre-work prod baseline on srilu at SHA `a455365`: `fallback_raw_response_24h=50`, `fallback_raw_response_7d=350`, broad health grep saw `4` hits involving this event in 24h.
+**Status:** SHIPPED 2026-05-26 - PR #286 merged/deployed at `8e799ea`; successful fallback raw-response logging removed in `scout/mirofish/fallback.py`. Pre-work prod baseline on srilu at SHA `a455365`: `fallback_raw_response_24h=50`, `fallback_raw_response_7d=350`, broad health grep saw `4` hits involving this event in 24h. Deploy-window smoke after pipeline restart: `fallback_attempts=0`, `fallback_failures=0`, `raw_response_events=0`, `broad_health_hits=0`; recorded as clean no-live-fallback-observed smoke.
 **Tag:** `observability` `journal-hygiene` `low-priority`
 **Why:** Operator-visible health checks (`journalctl --since X -iE error|exception|traceback`) currently must filter out MiroFish DEBUG noise manually. Suppressing the DEBUG-level emission OR promoting it to a separate counter would clean the operator-grep surface.
 **Scope:** Remove `fallback_raw_response` from successful Anthropic fallback responses. Parse failures still surface truncated raw text through `FallbackScoringError` and gate error logging.
