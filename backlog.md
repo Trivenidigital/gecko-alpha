@@ -103,7 +103,7 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 **Rule:** TG/X and KOLs stay context-only until this track makes source-call outcomes rankable.
 
 ### Track 3 - Data-Gated Strategy Evidence (actionability gate cleared; re-scope before build)
-- `BL-NEW-X-OUTCOME-LINKAGE`, `BL-NEW-TG-OUTCOME-LINKAGE`, and `BL-NEW-NO-PEAK-RISK-HANDLING` - no longer blocked by the `20/5` actionability row-count gate as of `tasks/findings_actionability_gate_revalidation_2026_05_26.md`, but each still needs a fresh drift/runtime re-scope before implementation.
+- `BL-NEW-X-OUTCOME-LINKAGE`, `BL-NEW-TG-OUTCOME-LINKAGE`, and `BL-NEW-NO-PEAK-RISK-HANDLING` - no longer blocked by the `20/5` actionability row-count gate as of `tasks/findings_actionability_gate_revalidation_2026_05_26.md`, but each still needs a stale-PR/current-base triage pass before action: fetch current master, check for shipped overlap, rebase/re-scope as needed, and re-verify runtime assumptions before implementation.
 - `BL-NEW-COHORT-DIGEST-DECISION`, first_signal 2026-05-31 revival decision, and revival criteria follow-ups - data-bound decisions, not calendar-driven build work.
 - Social-denominator Option B/C - operator-choice item; now should be evaluated through the signal-trust roadmap rather than as an isolated scorer tweak.
 

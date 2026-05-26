@@ -1,5 +1,22 @@
 # Lessons
 
+## Calibrate review depth to actual PR scope
+
+- 2026-05-26 correction: the actionability gate revalidation started as a
+  potentially policy-relevant branch decision, but the final PR was a
+  Markdown-only status/finding update. Running plan, design, and PR reviews
+  with two reviewers each was defensible while scope was still ambiguous, but
+  would be excessive if applied mechanically to routine docs-only status flips.
+- Rule: if a revalidation or stale-status cleanup is known upfront to be
+  Markdown-only and cannot change runtime behavior, default to 0-1 focused
+  review unless the finding is money/exits/schema-critical or the operator
+  explicitly asks for the full review chain.
+- Rule: if the work begins with broader policy/build implications, start with
+  the heavier review posture; once evidence collapses the output to docs-only,
+  do not carry the full machinery forward to every follow-up by habit. This is
+  CLAUDE.md section 10 in practice: discipline sections are heuristics, not
+  rituals.
+
 ## Encode anti-scope as runtime contracts when possible
 
 - 2026-05-26 correction: the Trade Inbox plan said "no urgency tiers, no alert
