@@ -2560,12 +2560,12 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 **Re-eval trigger:** use the shipped top-level row for any future 90-day kill/review decision.
 
 ### BL-NEW-MIROFISH-DEBUG-NOISE-SUPPRESS: stop journal pollution from fallback_raw_response DEBUG events
-**Status:** PROPOSED 2026-05-21 — surfaced during overnight decision-harvest plan review (Vector-A-M2 follow-on). Empirical: journalctl audit found `{"event": "fallback_raw_response", ..., "level": "debug"}` events emitted on every Claude haiku fallback. Functionally fine — fallback works correctly — but accumulates noisy DEBUG-level lines that degrade the visibility surface when a real exception arrives. Per `feedback_resilience_layered_failure_modes.md` — every resilience addition must extend a visibility surface; DEBUG events buried under "known noise" defeat that.
+**Status:** PR-OPEN 2026-05-26 — successful fallback raw-response logging removed in `scout/mirofish/fallback.py`; PR/deploy pending. Pre-work prod baseline on srilu at SHA `a455365`: `fallback_raw_response_24h=50`, `fallback_raw_response_7d=350`, broad health grep saw `4` hits involving this event in 24h.
 **Tag:** `observability` `journal-hygiene` `low-priority`
 **Why:** Operator-visible health checks (`journalctl --since X -iE error|exception|traceback`) currently must filter out MiroFish DEBUG noise manually. Suppressing the DEBUG-level emission OR promoting it to a separate counter would clean the operator-grep surface.
-**Scope:** Either (a) demote `fallback_raw_response` from DEBUG → TRACE (or remove if not consumed elsewhere); or (b) leave the event but route it via a structured-log filter that operators can mute. ~30min change.
+**Scope:** Remove `fallback_raw_response` from successful Anthropic fallback responses. Parse failures still surface truncated raw text through `FallbackScoringError` and gate error logging.
 **Non-goals:** No fallback behavior change. No MiroFish client change.
-**Acceptance:** `journalctl -u gecko-pipeline --since 24h -iE error|exception|traceback` returns 0 hits when system is healthy, without manual filtering.
+**Acceptance:** post-deploy journal window distinguishes "no live fallback observed" from "fallback fired"; when fallback fires, `fallback_raw_response=0`, no Anthropic fallback failures attributable to this change, and healthy broad grep no longer contains this event.
 
 ### BL-NEW-LIVE-DECISION-COCKPIT: turn signal substrate into a trader-facing "trade / watch / reject" surface
 **Status:** PROPOSED 2026-05-22 — filed from live-pick exercise. Trader-lens verdict: Gecko-Alpha can produce a defensible tiny experimental basket, but the workflow is not smooth. The operator currently has to stitch together `paper_trades`, `actionability`, `would_be_live`, `price_cache`, `chain_matches`, `predictions`, X/TG alert health, and `source_calls` health manually. Gecko has signals, but not yet a trader-facing decision surface.

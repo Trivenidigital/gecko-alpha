@@ -1,14 +1,11 @@
 """Anthropic fallback for narrative scoring when MiroFish is unavailable."""
 
 import json
-import structlog
 import re
 
 import anthropic
 
 from scout.models import MiroFishResult
-
-logger = structlog.get_logger()
 
 SYSTEM_PROMPT = (
     "You are a crypto meme token narrative analyst evaluating viral spread potential. "
@@ -59,7 +56,6 @@ async def score_narrative_fallback(
     )
 
     text = message.content[0].text
-    logger.debug("fallback_raw_response", text=text[:300])
 
     try:
         data = _extract_json(text)
