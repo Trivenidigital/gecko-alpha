@@ -1,5 +1,62 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-27 - Eligible Backlog Finish Current-State Sweep
+
+**Status:** PLANNING. Goal: finish every backlog item that is actually
+eligible now, retire stale active-work tails that already landed on
+`origin/master`, and keep gated items discoverable without rebuilding parked
+work.
+
+Workflow checklist:
+- [x] Isolated worktree:
+  `.claude/worktrees/eligible-backlog-finish-2026-05-27` on branch
+  `chore/eligible-backlog-finish-2026-05-27`.
+- [x] Current-state scan: no open GitHub PRs; Signal Trust scorecards and Trade
+  Inbox counter-risk code/tests are already present on current base.
+- [x] Runtime gate checks:
+  - tracker-promotion soak still has only two mature UTC days
+    (`2026-05-26|17`, `2026-05-25|50`);
+  - held-position 7d journal baseline is below the suggested alert threshold
+    (3,878 summary rows; `stale_open_count` min/p50/max `2/4/5`;
+    zero cycles exceeded `max(5, 0.05 * held_total)`);
+  - narrative deferred-resolution has only one candidate-matching CA and no
+    canonical `coingecko_id` target in `candidates`.
+- [x] Plan drafted:
+  `tasks/plan_eligible_backlog_finish_2026_05_27.md`.
+- [x] Plan review by two parallel agents and fold recommendations: correct
+  PR #33/#280 stale statuses, classify Track 3 as re-scope-eligible, avoid
+  closing held-position/narrative blocked items, add TG soak next-check and SQL
+  stability caveat.
+- [x] Design drafted:
+  `tasks/design_eligible_backlog_finish_2026_05_27.md`.
+- [x] Design review by two parallel agents and fold recommendations: verify
+  prod deploy/smoke for PR #289/#290 before marking shipped, update all PR
+  #33/#280 stale references, refresh backlog snapshot header through PR #294,
+  relabel TG soak as not yet auditable by current SQL, keep held-position
+  threshold operator-pending, strengthen narrative resolver evidence, and add
+  per-item Track 3 re-scope gates.
+- [x] Build docs/status PR: updated `backlog.md`, `tasks/todo.md`, and
+  findings/plan/design docs.
+- [x] PR review fold: corrected detailed roadmap stale statuses for
+  `BL-NEW-NARRATIVE-COUNTER-RISK-INTO-TRADE-VIEW` and
+  `BL-NEW-SIGNAL-TRUST-ROADMAP`, not only the top snapshot.
+- [x] Verification:
+  - `git diff --check` => clean.
+  - `$env:UV_NATIVE_TLS='true'; uv sync --extra dev --group dev` => installed
+    test extras in the isolated worktree after initial TLS/bootstrap failure.
+  - `$env:UV_NATIVE_TLS='true'; uv run python -m pytest -q
+    tests/test_signal_trust_scorecards_endpoint.py
+    tests/test_signal_trust_registry_endpoint.py
+    tests/test_trade_inbox_endpoint.py tests/test_check_trade_inbox_contract.py
+    tests/test_dashboard_frontend_layout.py` => `69 passed`.
+- [ ] Open PR and get two parallel PR reviews.
+
+Non-scope:
+- No Telegram alert qualification, urgency tiers, ranking, source pruning,
+  signal policy, paper-trade policy, live execution, sizing, new cron, new DB
+  table, vendor paid call, or non-canonical narrative `resolved_coin_id`
+  writeback.
+
 ## Active Work: 2026-05-27 - Eligible Scanner Hygiene Sweep
 
 **Status:** SHIPPED / PR REVIEW PASSED. Goal: finish the eligible
@@ -36,7 +93,7 @@ Workflow checklist:
 
 ## Active Work: 2026-05-26 - Trade Inbox Counter-Risk Context
 
-**Status:** BUILD VERIFYING. Goal: supersede stale Now Tradable-only PR #278
+**Status:** SHIPPED / DEPLOY-SMOKED 2026-05-27. Goal: supersede stale Now Tradable-only PR #278
 by exposing existing narrative counter-risk context in the primary trader
 surface, `/api/trade_inbox`, without changing ranking, grouping, sorting,
 execution, alerts, or urgency tiers.
@@ -82,8 +139,10 @@ Workflow checklist:
 - [x] Full suite with dummy required secrets:
   `uv run pytest --tb=short -q --timeout=180 --timeout-method=thread` =>
   `2822 passed, 158 skipped, 12 warnings`.
-- [ ] PR, two PR reviews, merge, deploy, smoke, and close/supersede
-  PR #278.
+- [x] PR #290 merged; PR #278 closed/superseded.
+- [x] Deploy/smoke verified on srilu: prod HEAD `2e8cf69`, `/api/trade_inbox`
+  returned HTTP 200, and sampled rows include `counter_risk_score`,
+  `counter_flags`, and `counter_risk_predicted_at`.
 
 Non-scope:
 - No row ranking, sorting, score, group, action-label, dispatch, Telegram alert,
@@ -92,14 +151,14 @@ Non-scope:
 
 ## Active Work: 2026-05-26 - Signal Trust Scorecards Refresh
 
-**Status:** BUILD VERIFYING / REVIEW FOLDS APPLIED. Goal: finish the eligible `BL-NEW-SIGNAL-FAMILY-SCORECARDS`
+**Status:** SHIPPED / DEPLOY-SMOKED 2026-05-27. Goal: finish the eligible `BL-NEW-SIGNAL-FAMILY-SCORECARDS`
 child of `BL-NEW-SIGNAL-TRUST-ROADMAP` by rebasing PR #276 onto current
 `origin/master`, preserving read-only/not-for-pruning scope, and shipping the
 Signal Trust scorecards endpoint/UI.
 
 Workflow checklist:
-- [x] Backlog eligibility check: PR #276 remains relevant; PR #288 marked it
-  `OPEN-PR / NEEDS-REBASE`.
+- [x] Backlog eligibility check: PR #276 was relevant at branch start; PR #289
+  replaced it and merged.
 - [x] Fresh branch from `origin/master`: `feat/signal-trust-scorecards-v1-refresh`.
 - [x] Replayed PR #276 source commits; skipped stale generated `dist` asset
   conflict and rebuilt `dist` from current source.
@@ -138,7 +197,10 @@ Workflow checklist:
 - [x] Full suite with dummy required secrets:
   `uv run pytest --tb=short -q --timeout=180 --timeout-method=thread` =>
   `2814 passed, 158 skipped, 11 warnings`.
-- [ ] Open replacement PR, review by two parallel agents, merge, deploy.
+- [x] Replacement PR #289 merged; original PR #276 closed/superseded.
+- [x] Deploy/smoke verified on srilu: prod HEAD `2e8cf69`,
+  `/api/signal_trust/scorecards` returned HTTP 200 with read-only
+  `not_for_alerting=true` metadata.
 
 Non-scope:
 - No pruning, auto-disable, execution, sizing, alerting, source ranking, TG alert
