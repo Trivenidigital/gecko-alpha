@@ -2,7 +2,7 @@
 
 ## Active Work: 2026-05-27 - Pending Trader-Surface Closeout
 
-**Status:** PR-READY. Goal: close the eight pending residuals from the
+**Status:** SHIPPED / DEPLOY-SMOKED 2026-05-27. Goal: close the eight pending residuals from the
 Today's Focus / Trade Inbox work without forcing gated policy work. Items 1-5
 are already closed by PR #298 and prod evidence; items 6-7 remain
 re-scope/gated; item 8 is the eligible code change.
@@ -56,7 +56,16 @@ Workflow checklist:
     `trending_catch` missing-decision coverage, assert loser/trending mcap
     decision-event rows, assert no false `missing_price` event, and clean stale
     cron README entry-count wording.
-- [ ] Open PR, merge, and deploy.
+- [x] PR, merge, and deploy:
+  - PR #299 opened, CI `test` passed, merged via API as squash commit
+    `876ae5e6` after local `gh pr merge` hit the known master-worktree
+    checkout conflict;
+  - deployed to srilu with fast-forward `1710a3a..876ae5e`, restarted
+    `gecko-pipeline`, service active;
+  - deployed watchdog smoke:
+    `.venv/bin/python scripts/check_trade_decision_events.py --db /root/gecko-alpha/scout.db --lookback-minutes 15`
+    => `ok=true`, `status=ok`, `trending_catch` source rows/decisions
+    `15/15`.
 
 Non-scope:
 - No Telegram alert qualification, alert sends, urgency tiers, ranking,
