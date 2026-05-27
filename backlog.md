@@ -62,6 +62,7 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 - `BL-NEW-SIGNAL-TRUST-ROADMAP` - PARTIALLY-SHIPPED. Registry/tab shipped in PR #239; scorecards shipped in PR #289. Remaining child work must be scoped from the roadmap below, not from stale PR #276.
 - `BL-NEW-CROSS-IDENTIFIER-RESOLVER-TRACKER-PAPER` - AUDITED-PHANTOM after 2026-05-26 runtime baseline. Do not build until the re-audit trigger fires and paper/tracker overlap proves operator-visible noise.
 - `BL-NEW-TG-ALERT-QUALIFICATION-DESIGN` - still gated. Prod soak on 2026-05-27 returned `2026-05-25=50`, `2026-05-26=17`; volume is high but the `>= 3` mature UTC-day gate has not cleared. Recheck on 2026-05-28 UTC.
+- `BL-NEW-KRAKEN-AUTOTRADE-PREP` - PROPOSED / OPERATOR-GATED. Prepare the ground for auto-trading only signals that are actually tradable on Kraken, using the VPS-installed Kraken MCP as a candidate execution/venue interface after runtime verification.
 - `BL-NEW-DECISION-EVENT-WATCHDOG-MULTI-SIGNAL` - SHIPPED-DEPLOYED 2026-05-27 via PR #299 (`876ae5e`). Extends the PR #279 `trade_decision_events` watchdog beyond `gainers_early` to enabled snapshot-backed paper dispatchers, and adds pre-engine decision events for `losers_contrarian` / `trending_catch` filter outcomes.
 - `PR #278 Now Tradable counter-risk badges` - CLOSED-SUPERSEDED by PR #290. Trade Inbox is now the primary trader surface and exposes display-only counter-risk context there.
 - `PR #280 TG alert parking docs` - CLOSED-SUPERSEDED 2026-05-26. Parking state is represented in this backlog and `tasks/lessons.md`.
@@ -95,6 +96,37 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 **Design checklist when unlocked:** drift-check all current Telegram alert surfaces; quantify 14-day alert volume and operator-action baseline; pin "qualified" without future-runner lookahead; decide corpus scope; include parse-mode hygiene and dispatched/delivered logs; add an auditable alert-decision event surface if a new writer ships; prove scarcity can compress the observed tracker-promotion baseline before any TG send.
 
 **Anti-scope:** urgency tiers, TRADE_NOW/WATCH_BREAKOUT labels, and alert intent stay out of `/api/trade_inbox`. Default future shape is a separate `/api/trade_alert_intent`-style endpoint. Relax the Trade Inbox firewall only via a deliberate contract PR with new invariants.
+
+### BL-NEW-KRAKEN-AUTOTRADE-PREP: prepare Kraken-eligible signal lane for future auto trading
+**Status:** PROPOSED / OPERATOR-GATED 2026-05-27 - backlog only. Do not implement order placement until live-execution gates, risk policy, and Kraken MCP runtime verification are complete.
+**Tag:** `kraken` `mcp` `live-execution` `venue-eligibility` `autotrade-prep` `operator-gated`
+**Goal:** Prepare a narrow, auditable path where Gecko-Alpha can identify signals that are actually tradable on Kraken and, later, convert approved high-quality signals into Kraken order intents. The first build should be venue-eligibility and shadow-readiness, not blind execution.
+**Why:** The operator wants to enable auto trading through the Kraken MCP already installed on the VPS. The immediate need is not simply to "separate Kraken coins" in the UI; it is to make the system execution-ready for the Kraken-listed subset while keeping non-Kraken candidates visible as decision-support only.
+
+**Required drift/runtime checks before any design PR:**
+- Verify the Kraken MCP is installed, reachable, authenticated, and scoped on srilu; record command, version, account mode, and permission surface. Do not assume the installed MCP can place orders.
+- Enumerate Kraken-supported spot pairs and map them to Gecko-Alpha identities (`coin_id`, symbol, contract when present). Avoid symbol-only mapping unless manually reviewed.
+- Measure overlap: last 14 days of Trade Inbox / Today's Focus / paper-trade candidates that map to Kraken spot pairs, split by signal type and actionability state.
+- Check existing live-trading substrate: `LIVE_TRADING_ENABLED`, kill switch, `live_eligible`, exposure caps, `live_orders` / `live_trades` tables, and reconciliation paths. Do not bypass BL-055 / live-hybrid gates.
+- Confirm whether Kraken MCP supports quote/preview/dry-run endpoints. If not, design a fail-closed shadow adapter before any order path.
+
+**Phased shape:**
+1. **Venue eligibility only:** add a read-only Kraken eligibility annotation (`kraken_pair`, `kraken_quote`, `kraken_eligible_reason`) to trader surfaces or a sidecar export. No ranking, no alerts, no order intents.
+2. **Shadow order intent:** for Kraken-eligible, operator-approved signals, create an auditable order-intent record with price, size, pair, source signal, idempotency key, and risk-gate verdict. No order submission.
+3. **MCP quote / dry-run smoke:** call Kraken MCP only for non-mutating pair metadata and quote/preview if available; record latency, failures, min size, precision, and fee/slippage assumptions.
+4. **Operator-approved live pilot:** only after explicit operator approval, hard notional caps, kill-switch smoke, idempotency, reconciliation, and Telegram/operator alerting are verified.
+
+**Safety gates before real orders:**
+- Explicit operator go/no-go for unattended vs attended execution.
+- Per-trade and daily notional caps, max open exposure, daily loss stop, and global kill switch.
+- Pair precision/min-size validation and insufficient-balance fail-closed behavior.
+- Idempotent client order IDs and duplicate-order prevention.
+- Reconciliation from Kraken fills back into Gecko-Alpha live-trade/PnL surfaces.
+- Plain-text Telegram/operator alert for every automated state change or order lifecycle transition.
+
+**Anti-scope:** no immediate order placement, no autonomous sizing, no source pruning, no signal auto-enable, no urgency-tier coupling, no Kraken-only suppression of non-Kraken candidates, no symbol-only execution mapping, and no use of Kraken MCP as price/PnL truth without a separate validation design.
+
+**Open product question:** should Kraken-eligible candidates be a separate dashboard lane, a filter on Today's Focus / Trade Inbox, or an execution-readiness badge? Default recommendation: badge/filter first; separate lane only if overlap volume is high enough to justify it.
 
 ### BL-NEW-DECISION-EVENT-WATCHDOG-MULTI-SIGNAL: cover all enabled snapshot-backed paper dispatchers in the decision-event watchdog
 **Status:** SHIPPED-DEPLOYED 2026-05-27 - PR #299 merged as `876ae5e` and deployed to srilu. The existing PR #279 watchdog was `gainers_early`-only; this follow-up extends coverage to enabled `losers_contrarian` and `trending_catch` dispatchers without changing trading behavior.
