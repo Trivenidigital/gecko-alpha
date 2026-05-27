@@ -388,11 +388,27 @@ def test_trade_decision_event_checker_ignores_already_open_source_rows(tmp_path)
     _create_watchdog_tables(conn)
     conn.execute(
         "INSERT INTO gainers_snapshots (coin_id, snapshot_at) VALUES (?, ?)",
-        ("already-open", datetime.now(timezone.utc).isoformat()),
+        ("already-open-gainer", datetime.now(timezone.utc).isoformat()),
+    )
+    conn.execute(
+        "INSERT INTO losers_snapshots (coin_id, snapshot_at) VALUES (?, ?)",
+        ("already-open-loser", datetime.now(timezone.utc).isoformat()),
+    )
+    conn.execute(
+        "INSERT INTO trending_snapshots (coin_id, snapshot_at) VALUES (?, ?)",
+        ("already-open-trend", datetime.now(timezone.utc).isoformat()),
     )
     conn.execute(
         "INSERT INTO paper_trades (token_id, signal_type, status) VALUES (?, ?, 'open')",
-        ("already-open", "gainers_early"),
+        ("already-open-gainer", "gainers_early"),
+    )
+    conn.execute(
+        "INSERT INTO paper_trades (token_id, signal_type, status) VALUES (?, ?, 'open')",
+        ("already-open-loser", "losers_contrarian"),
+    )
+    conn.execute(
+        "INSERT INTO paper_trades (token_id, signal_type, status) VALUES (?, ?, 'open')",
+        ("already-open-trend", "trending_catch"),
     )
     conn.commit()
     conn.close()
@@ -405,8 +421,6 @@ def test_trade_decision_event_checker_ignores_already_open_source_rows(tmp_path)
             str(db_path),
             "--lookback-minutes",
             "15",
-            "--signals",
-            "gainers_early",
         ],
         text=True,
         capture_output=True,
@@ -418,6 +432,8 @@ def test_trade_decision_event_checker_ignores_already_open_source_rows(tmp_path)
     assert result.returncode == 0
     assert payload["status"] == "idle_no_recent_source_rows"
     assert payload["signals"]["gainers_early"]["recent_source_rows"] == 0
+    assert payload["signals"]["losers_contrarian"]["recent_source_rows"] == 0
+    assert payload["signals"]["trending_catch"]["recent_source_rows"] == 0
 
 
 def test_trade_decision_event_checker_checks_requested_signal(tmp_path):
