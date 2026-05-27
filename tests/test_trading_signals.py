@@ -256,6 +256,35 @@ async def test_trade_losers_falls_back_to_price_cache(db, engine, settings):
     assert await _decision_count(db, "null-price", "missing_price") == 0
 
 
+async def test_trade_losers_no_price_path_does_not_emit_dispatch_missing_price(
+    db, engine, settings
+):
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO losers_snapshots
+           (coin_id, symbol, name, price_change_24h, market_cap, volume_24h,
+            price_at_snapshot, snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "no-price-loser",
+            "NPL",
+            "no-price-loser",
+            -25.0,
+            10_000_000,
+            100_000.0,
+            None,
+            now,
+        ),
+    )
+    await db._conn.commit()
+    await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
+    assert await _open_count(db) == 0
+    assert await _decision_count(db, "no-price-loser", "missing_price") == 0
+    row = await _latest_decision(db, "no-price-loser")
+    assert row["signal_type"] == "losers_contrarian"
+    assert row["reason"] == "no_price"
+
+
 async def test_trade_losers_emits_suppression_decision_event(db, engine, settings):
     await _insert_loser(db, "suppressed-dip", market_cap=10_000_000)
     await _suppress_combo(db, "losers_contrarian")
