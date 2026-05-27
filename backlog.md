@@ -17,7 +17,6 @@ Operator close-development block 2026-05-22 explicitly parks the following items
 
 **Parked until operator decision (no engineering work pending):**
 - Operator-alert activation (`BL-NEW-NARRATIVE-OPERATOR-ALERT-WIRE` ENDPOINT-SHIPPED / HERMES-SKILL-PENDING — see runbook)
-- PR #33 design review (paper-trade edge detection)
 - Social denominator B / C variants
 - Cron / revival watchdog scheduling
 - First-signal soak until 2026-05-31 gate
@@ -34,9 +33,9 @@ Operator close-development block 2026-05-22 explicitly parks the following items
 ## Open PRs Held for Design Review
 
 ### BL-NEW-PR-33-DESIGN-REVIEW-REQUIRED: paper-trade edge detection PR pending design review
-**Status:** OPEN / DESIGN-REVIEW-REQUIRED / NO IMPLEMENTATION ACTION 2026-05-22 — PR #33 ("feat(bl-050): paper-trade edge detection — transition gate for first_signal entries"; +2654/-18 LOC; mergeStateStatus DIRTY since 2026-05-18) remains open per operator directive. Do not merge, do not close, do not rebase. Design-review session has not yet been scheduled. Touches `scout/main.py`, `scout/db.py`, `scout/config.py`, `scout/heartbeat.py`, `scout/trading/qualifier_state.py` (NEW), `scout/trading/signals.py`.
-**Why kept open:** transition-gate logic (open on entry into qualifier set, not current-state membership) is operator-validated as the right shape, but the implementation predates several upstream changes (BL-067 conviction-lock, actionability gate, BL-NEW-AUTOSUSPEND-FIX) and needs reconciliation. Operator decision: hold for dedicated design review, not implementation tweaks.
-**Action when authorized:** schedule design-review pass, rebase on master, reconcile against shipped primitives, re-test, then merge or re-design as warranted.
+**Status:** CLOSED-SUPERSEDED 2026-05-27 - GitHub PR #33 is closed unmerged (`closedAt=2026-05-22T18:13:02Z`). The prior OPEN / DESIGN-REVIEW-REQUIRED text was stale. Revisit only as a fresh first_signal design after the 2026-05-31 first_signal decision gate, not by reviving the stale PR branch.
+**Why closed:** implementation predated later cockpit/actionability/autosuspend work and was already marked stale/superseded in `tasks/todo.md`. Current backlog should not route agents to an open-PR design review that no longer exists.
+**Action when authorized:** if first_signal survives the 2026-05-31 gate, start a fresh current-base plan/design and re-run drift/runtime checks.
 **Hermes-first:** N/A — internal trading logic, no Hermes surface.
 
 ---
@@ -51,7 +50,7 @@ Operator close-development block 2026-05-22 explicitly parks the following items
 
 ## Current Final Backlog Snapshot (audited 2026-05-26)
 
-This section is the operator-facing backlog after the 2026-05-22 trader-lens review, refreshed against shipped PRs through PR #287. It compresses older dashboard/source-quality items into four tracks so future sessions do not build stale one-off surfaces.
+This section is the operator-facing backlog after the 2026-05-22 trader-lens review, refreshed against shipped PRs through PR #294. It compresses older dashboard/source-quality items into four tracks so future sessions do not build stale one-off surfaces.
 
 ### Track 0 - Hermes + Codex Operating Model (direction of travel)
 - `BL-NEW-HERMES-CODEX-OPERATING-MODEL` - make Hermes the durable orchestration/memory/scheduling layer and Codex the repo-grounded execution worker.
@@ -60,11 +59,11 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 
 ### Track 1 - Trader Decision Surface (mostly shipped; child work only)
 - `BL-NEW-LIVE-DECISION-COCKPIT` - SHIPPED-PARTIAL / PARENT-ARCHIVED after PR #228/#229/#232/#239/#270/#273/#279/#281/#282/#284. Do not rebuild the parent cockpit; use child follow-ups only.
-- `BL-NEW-SIGNAL-TRUST-ROADMAP` - PARTIALLY-SHIPPED. Registry/tab shipped in PR #239; scorecards remain relevant via PR #276 but need rebase against current dashboard/dist.
+- `BL-NEW-SIGNAL-TRUST-ROADMAP` - PARTIALLY-SHIPPED. Registry/tab shipped in PR #239; scorecards shipped in PR #289. Remaining child work must be scoped from the roadmap below, not from stale PR #276.
 - `BL-NEW-CROSS-IDENTIFIER-RESOLVER-TRACKER-PAPER` - AUDITED-PHANTOM after 2026-05-26 runtime baseline. Do not build until the re-audit trigger fires and paper/tracker overlap proves operator-visible noise.
-- `BL-NEW-TG-ALERT-QUALIFICATION-DESIGN` - still gated. Prod soak on 2026-05-26 returned `2026-05-25=49`, `2026-05-26=12`; volume is high but the `>= 3` mature UTC-day gate has not cleared.
-- `PR #278 Now Tradable counter-risk badges` - relevant idea, but re-scope before merge: Trade Inbox is now the primary trader surface and does not expose `counter_risk_score` rows yet.
-- `PR #280 TG alert parking docs` - superseded by this backlog state and `tasks/lessons.md`; close rather than merge.
+- `BL-NEW-TG-ALERT-QUALIFICATION-DESIGN` - still gated. Prod soak on 2026-05-27 returned `2026-05-25=50`, `2026-05-26=17`; volume is high but the `>= 3` mature UTC-day gate has not cleared. Recheck on 2026-05-28 UTC.
+- `PR #278 Now Tradable counter-risk badges` - CLOSED-SUPERSEDED by PR #290. Trade Inbox is now the primary trader surface and exposes display-only counter-risk context there.
+- `PR #280 TG alert parking docs` - CLOSED-SUPERSEDED 2026-05-26. Parking state is represented in this backlog and `tasks/lessons.md`.
 
 **Rule:** V1 is read-only. No live execution, no sizing, no KOL ranking, no source pruning, no automatic signal disable.
 
@@ -82,13 +81,13 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 **Non-scope:** no alerting, ranking, source pruning, execution changes, or hidden suppression of unmatched rows.
 
 ### BL-NEW-TG-ALERT-QUALIFICATION-DESIGN: qualify Telegram alerts over the complete trader surface
-**Status:** GATED 2026-05-26 - deferred until tracker-to-cockpit promotion soak clears.
+**Status:** GATED / SOAK-METRIC-NOT-YET-AUDITABLE 2026-05-27 - deferred until tracker-to-cockpit promotion soak clears and the unlock metric is measured by a widened/fixed query or recorded daily artifacts.
 **Tag:** `telegram` `alerts` `trade-inbox` `decision-support` `anti-scope`
 **Why:** Telegram alert qualification should run over the complete decision-support universe. A gate built before tracker-promoted candidates are measured would miss the TOES/BILL/UB-style tracker wins that motivated the trader-surface work.
 
 **Hard dependency:** PR #281 tracker-to-cockpit promotion must remain deployed and the request-independent soak metric must clear: `>= 5` unique tracker-promoted `coin_id`s/day for `>= 3` mature UTC days, measured with `scripts/trade_inbox_tracker_promotion_soak.sql`, or the 14-day calendar backstop must close with an explicit low-volume decision.
 
-**Current runtime gate check:** 2026-05-26 prod run of `scripts/trade_inbox_tracker_promotion_soak.sql` returned `2026-05-25|49` and `2026-05-26|12`. This confirms sufficient daily volume is likely, but the design remains locked until three mature UTC days are available.
+**Current runtime gate check:** 2026-05-27 prod run of `scripts/trade_inbox_tracker_promotion_soak.sql` returned `2026-05-25|50` and `2026-05-26|17`. This confirms sufficient daily volume is likely, but the design remains locked. The current SQL scans only `datetime('now', '-36 hours')`, so a single run cannot prove three mature UTC days; it also suppresses tracker rows against current open paper rows, so historical counts can drift. Unlock requires either a widened/fixed SQL query covering at least four UTC days with point-in-time paper state, or three recorded daily artifacts with `run_at`, SQL hash, rows, and this caveat. The 14-day backstop remains 2026-06-09.
 
 **Design checklist when unlocked:** drift-check all current Telegram alert surfaces; quantify 14-day alert volume and operator-action baseline; pin "qualified" without future-runner lookahead; decide corpus scope; include parse-mode hygiene and dispatched/delivered logs; add an auditable alert-decision event surface if a new writer ships; prove scarcity can compress the observed tracker-promotion baseline before any TG send.
 
@@ -104,6 +103,7 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 
 ### Track 3 - Data-Gated Strategy Evidence (actionability gate cleared; re-scope before build)
 - `BL-NEW-X-OUTCOME-LINKAGE`, `BL-NEW-TG-OUTCOME-LINKAGE`, and `BL-NEW-NO-PEAK-RISK-HANDLING` - no longer blocked by the `20/5` actionability row-count gate as of `tasks/findings_actionability_gate_revalidation_2026_05_26.md`, but each still needs a stale-PR/current-base triage pass before action: fetch current master, check for shipped overlap, rebase/re-scope as needed, and re-verify runtime assumptions before implementation.
+- Re-scope gates: X linkage requires current-base drift plus unresolved/priced X counts; TG linkage requires current direct-FK/linkage-state counts and source-call overlap; no-peak risk requires current-regime replay, peak/giveback coverage, and an explicit `pre_entry_giveback_ratio IS NOT NULL` guard. The actionability row-count finding authorizes triage, not implementation.
 - `BL-NEW-COHORT-DIGEST-DECISION`, first_signal 2026-05-31 revival decision, and revival criteria follow-ups - data-bound decisions, not calendar-driven build work.
 - Social-denominator Option B/C - operator-choice item; now should be evaluated through the signal-trust roadmap rather than as an isolated scorer tweak.
 
@@ -362,10 +362,10 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 **Surfaced by:** Vector A M1 finding during PR #201 review. **Audited by:** P3 audit in 6h-block 2026-05-20T05:13Z.
 
 ### BL-NEW-HERMES-NARRATIVE-DEFERRED-RESOLUTION-SWEEP
-**Status:** PROPOSED 2026-05-20.
+**Status:** BLOCKED-CANONICAL-ID / SOURCE-CALL-IDENTITY-RESOLUTION 2026-05-27 - runtime re-check found unresolved CA rows still exist, but the naive sweep has no safe canonical `resolved_coin_id` target.
+**Runtime re-check 2026-05-27:** prod has 24 unresolved CA rows in the last 7d and 39 all-time; zero rows have `resolved_coin_id`. Only 3 recent rows match `candidates`, all for one Solana CA. `candidates` has no `coingecko_id`; `/api/coin/lookup` returns `coin_id=None` for `candidates` hits. Table audit found `coingecko_id` only on `second_wave_candidates`. Hermes cron `gecko-x-narrative-scanner` is enabled and last `ok`.
+**Constraint:** do not write `resolved_coin_id` with contract address, ticker, or any other surrogate; that would overstate source-call rankability and still not unlock price coverage. Reopen implementation only after a canonical CA-to-CoinGecko-id resolver or the broader `BL-NEW-SOURCE-CALL-IDENTITY-RESOLUTION` design exists.
 **Why:** Step 1 resolver-health re-check found 15 historical `narrative_alerts_inbound` rows with `extracted_ca IS NOT NULL` but `resolved_coin_id IS NULL`. Most likely cause: the gecko-alpha `/api/coin/lookup` endpoint returned `found=False` because those tokens hadn't been ingested by gecko-alpha at scan time (pre-CG-listing case — exactly the V1 structural limitation per design doc §3). The resolver only tries ONCE per CA; there's no re-resolution sweep when gecko-alpha later ingests the token.
-**Scope:** add a "deferred resolution sweep" pass at the start of each cron cycle that re-queries `/api/coin/lookup` for `narrative_alerts_inbound` rows with `extracted_ca IS NOT NULL AND resolved_coin_id IS NULL AND received_at > now() - 7d`. Update via separate `/api/narrative-alert-resolve` PATCH endpoint or PUT replacement.
-**Constraint:** the design doc §3 already specifies this behavior ("deferred resolution pass at next cycle"); current implementation appears to not have it. Verify against design intent before adding the sweep.
 
 ### BL-NEW-SCANNER-DATETIME-UTCNOW-DEPRECATION
 **Status:** SHIPPED 2026-05-27 via `tasks/findings_scanner_hygiene_2026_05_27.md`; deployed to `/home/gecko-agent/run-scanner-cycle.py` with backup `/home/gecko-agent/backups/run-scanner-cycle.py.20260527T010403Z`.
@@ -1276,11 +1276,13 @@ ssh root@89.167.116.187 "journalctl -u gecko-pipeline --since '<post-merge times
 **Decision-by:** evidence-gated (CG-rate-limit-clearance window required); if no operator verification by 2026-06-30, close as inconclusive.
 
 ### BL-NEW-HELD-POSITION-STALE-COUNT-ALERT: threshold-driven TG alert on stale_open_count
+**Status update 2026-05-27:** BASELINE-MEASURED / BELOW-SUGGESTED-THRESHOLD / OPERATOR-THRESHOLD-PENDING. The baseline-first follow-up remains open, but current data does not justify alert implementation under the suggested threshold.
 **Status:** PROPOSED 2026-05-18 — baseline-first follow-up to BL-NEW-HELD-POSITION-REFRESH-RATE-GAP. Closes the §12a residual (operator-grep-required gauge → automated alert).
 **Tag:** `held-position-refresh` `observability` `silent-failure-prevention` `baseline-first`
 **Why:** PR #158 ships `stale_open_count` gauge in structured log + per-token WARN. Gauge is operator-grep-dependent. Per CLAUDE.md §12a, threshold-driven alert closes the silent-failure surface.
 **Threshold suggestion:** `stale_open_count > max(5, 0.05 * held_total)` for ≥3 consecutive cycles (hysteresis matching cycle-9 patterns). Specific threshold TBD after 7d post-deploy baseline measurement.
 **Action:** ~1.5h. Add curl-direct TG alert path inside `fetch_held_position_prices` after the gauge computation; reuse cycle-12 `parse_mode=None` pattern; 24h dedup matching `_warned_today`.
+**Baseline 2026-05-27:** 3,878 `held_position_refresh_summary` rows across 2026-05-20T01:42:52Z through 2026-05-27T01:39:12Z. `stale_open_count` min/p50/max = `2/4/5`; `held_total` min/p50/max = `125/139/150`; zero cycles exceeded the suggested threshold (`>` not `>=`). Keep decision-by 2026-06-15 unless operator chooses a lower threshold.
 **Decision-by:** 2026-06-15 (4 weeks from PR #158 merge; baseline window must close first).
 
 ### BL-NEW-CG-LANE-ORDER-HELD-POSITION-FIRST: reorder _fetch_coingecko_lanes so held_position runs first
@@ -2681,7 +2683,7 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
     - Must be derived from current prod evidence, not vibes.
 
 2. **BL-NEW-SIGNAL-FAMILY-SCORECARDS** - Build per-signal scorecards.
-   - **Status:** OPEN-PR / NEEDS-REBASE 2026-05-26 — PR #276 implements `GET /api/signal_trust/scorecards`, dashboard rendering, and endpoint tests. CI is green, but `git merge-tree origin/master tmp-pr-276` shows conflicts in dashboard DB/models and generated dist after later cockpit PRs.
+   - **Status:** SHIPPED 2026-05-26 - replacement PR #289 merged `GET /api/signal_trust/scorecards`, dashboard rendering, anti-consumption metadata, and endpoint/contract tests. Original PR #276 is closed/superseded.
    - For each signal_type: 7d/14d/30d opens, closes, net PnL, win rate, average PnL, median PnL, max loss, open count, actionable pass rate, would_be_live pass rate, and current maturity state.
    - Include sample-size warnings and Wilson/bootstrap guards where useful.
    - No automatic parameter changes in V1.
