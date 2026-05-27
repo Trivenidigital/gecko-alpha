@@ -1,5 +1,37 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-27 - Today's Focus Trader UX Pass
+
+**Status:** PR-READY. Goal: fix the screenshot-visible Today's Focus usability
+gap where usage evidence dominated the first screen, rows did not lead with
+token identity, and the page felt visually broken below the first row.
+
+Workflow checklist:
+- [x] Isolated worktree:
+  `.codex-worktrees/todays-focus-ux-pass-20260527` on branch
+  `feat/todays-focus-ux-pass-20260527`.
+- [x] Reviewed screenshot `C:\Testing\11.png` and identified three concrete
+  defects: usage evidence above the queue, broken token identity rendering, and
+  excessive blank/overflow feel.
+- [x] Build:
+  - fix `TokenLink` wiring to pass `tokenId`, `symbol`, and `chain`;
+  - make rows identity-first with source badge, compact move/mcap facts, and
+    visible token name;
+  - move Usage evidence below the candidate list, collapsed by default;
+  - make the panel maintain the dark viewport and compact row grid.
+- [x] Verification:
+  - `uv run pytest -q tests/test_dashboard_frontend_layout.py
+    tests/test_todays_focus_endpoint.py tests/test_check_todays_focus_contract.py
+    tests/test_todays_focus_storage.py` => `26 passed`;
+  - `npm.cmd --prefix dashboard/frontend run build:codex` passed and refreshed
+    committed dist;
+  - headless Chrome smoke screenshot verified compact rows, identity-first
+    layout, collapsed Usage evidence, and dark viewport continuation.
+
+Non-scope:
+- No endpoint/schema changes, ranking, urgency tiers, Telegram alerts, execution,
+  sizing, signal policy, or server-side personal state.
+
 ## Active Work: 2026-05-27 - Pending Trader-Surface Closeout
 
 **Status:** SHIPPED / DEPLOY-SMOKED 2026-05-27. Goal: close the eight pending residuals from the

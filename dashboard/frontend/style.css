@@ -229,13 +229,29 @@ body {
 
 .todays-focus-panel {
   min-width: 0;
+  min-height: calc(100vh - 170px);
+  background: var(--color-bg-primary);
+}
+
+.todays-focus-shell {
+  margin-bottom: 12px;
 }
 
 .todays-focus-header {
   display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.todays-focus-heading,
+.todays-focus-header-actions {
+  display: flex;
+  align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+  min-width: 0;
 }
 
 .todays-focus-title {
@@ -262,7 +278,7 @@ body {
 
 .todays-focus-usage {
   padding: 8px 12px;
-  border-bottom: 1px solid var(--color-border);
+  border-top: 1px solid var(--color-border);
   color: var(--color-text-secondary);
   font-size: 12px;
 }
@@ -291,11 +307,36 @@ body {
 
 .todays-focus-list {
   display: grid;
-  gap: 8px;
+  gap: 6px;
+  padding: 8px;
 }
 
 .todays-focus-row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) minmax(220px, 0.32fr);
+  gap: 10px;
+  align-items: stretch;
   padding: 8px;
+  border: 1px solid rgba(48, 54, 61, 0.85);
+  border-radius: 6px;
+  background: rgba(13, 17, 23, 0.42);
+}
+
+.todays-focus-rank {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  min-height: 26px;
+  border-radius: 4px;
+  background: var(--color-bar-bg);
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.todays-focus-row-body {
+  min-width: 0;
 }
 
 .todays-focus-row-main,
@@ -318,14 +359,35 @@ body {
   font-weight: 600;
 }
 
+.todays-focus-name {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 260px;
+}
+
 .todays-focus-price {
   color: var(--color-text-secondary);
   font-size: 12px;
 }
 
+.todays-focus-price .move-pos {
+  color: var(--color-accent-green);
+  font-weight: 700;
+}
+
+.todays-focus-price .move-neg {
+  color: var(--color-accent-red);
+  font-weight: 700;
+}
+
 .todays-focus-facts {
   display: grid;
-  gap: 2px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 10px;
   margin-top: 6px;
   color: var(--color-text-secondary);
   font-size: 12px;
@@ -340,12 +402,15 @@ body {
 }
 
 .todays-focus-actions {
-  margin-top: 6px;
+  justify-content: flex-end;
+  align-content: start;
+  align-items: flex-start;
 }
 
 .todays-focus-actions input {
-  min-width: 140px;
-  flex: 1 1 180px;
+  width: 100%;
+  min-width: 0;
+  flex: 1 1 100%;
   background: var(--color-bg-primary);
   border: 1px solid var(--color-border);
   border-radius: 4px;
@@ -366,7 +431,17 @@ body {
   }
 
   .todays-focus-row {
+    grid-template-columns: 24px minmax(0, 1fr);
     padding: 8px;
+  }
+
+  .todays-focus-actions {
+    grid-column: 2;
+    justify-content: flex-start;
+  }
+
+  .todays-focus-facts {
+    grid-template-columns: 1fr;
   }
 
   .todays-focus-title {
