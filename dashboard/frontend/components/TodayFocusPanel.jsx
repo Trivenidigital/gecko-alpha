@@ -28,6 +28,12 @@ function fmtPct(n) {
   return v.toFixed(2) + '%'
 }
 
+function rowTitle(row) {
+  const symbol = row.symbol || row.token_id || '-'
+  const name = row.name && row.name !== symbol ? row.name : null
+  return { symbol, name }
+}
+
 function compactTime(value) {
   if (!value) return '-'
   const ms = Date.parse(value)
@@ -86,89 +92,109 @@ export default function TodayFocusPanel() {
 
   return (
     <div className="todays-focus-panel">
-      <div className="panel" style={{ marginBottom: 12 }}>
+      <div className="panel todays-focus-shell">
         <div className="panel-header todays-focus-header">
-          <span className="todays-focus-title">Today&apos;s Focus</span>
-          <span className="todays-focus-meta">
-            generated_at={meta.generated_at || '-'} last_refreshed_at={state.last_refreshed_at || '-'}
-          </span>
-          <button className="tab-btn" onClick={() => refreshFocus(true)} disabled={loading}>
-            {loading ? 'Refreshing...' : 'Refresh'}
-          </button>
-          {dismissedCount ? (
-            <button className="tab-btn" onClick={restoreDismissed}>
-              Restore {dismissedCount}
+          <div className="todays-focus-heading">
+            <span className="todays-focus-title">Today&apos;s Focus</span>
+            <span className="todays-focus-meta">
+              {meta.rows_returned ?? 0} rows from {meta.source_rows_considered ?? 0} candidates
+            </span>
+            <span className="todays-focus-meta">
+              refreshed {compactTime(state.last_refreshed_at || meta.generated_at)}
+            </span>
+          </div>
+          <div className="todays-focus-header-actions">
+            {dismissedCount ? (
+              <button className="tab-btn" onClick={restoreDismissed}>
+                Restore {dismissedCount}
+              </button>
+            ) : null}
+            <button className="tab-btn" onClick={() => refreshFocus(true)} disabled={loading}>
+              {loading ? 'Refreshing...' : 'Refresh'}
             </button>
-          ) : null}
+          </div>
         </div>
         <div className="todays-focus-status">
-          read_only={String(meta.read_only ?? '?')} visibility_only={String(meta.visibility_only ?? '?')} rows={meta.rows_returned ?? 0} source_rows={meta.source_rows_considered ?? 0}
+          read_only={String(meta.read_only ?? '?')} visibility_only={String(meta.visibility_only ?? '?')} not_for_execution={String(meta.not_for_execution ?? '?')}
           {error ? <span className="todays-focus-error"> last fetch error={error}</span> : null}
         </div>
+
+        {rows.length === 0 ? (
+          <div className="todays-focus-empty">
+            {meta.empty_state || "No eligible Trade Inbox rows are available for Today's Focus. Source window: 36h."}
+          </div>
+        ) : (
+          <div className="todays-focus-list">
+            {rows.map(row => {
+              const action = actions[row.row_key] || {}
+              const title = rowTitle(row)
+              return (
+                <div className="todays-focus-row" key={row.row_key}>
+                  <div className="todays-focus-rank">{row.source_corpus === 'paper' ? 'P' : 'T'}</div>
+                  <div className="todays-focus-row-body">
+                    <div className="todays-focus-row-main">
+                      <div className="todays-focus-token">
+                        <TokenLink
+                          tokenId={row.token_id}
+                          symbol={title.symbol}
+                          chain={row.chain || 'coingecko'}
+                          maxLen={18}
+                        />
+                        {title.name ? <span className="todays-focus-name">{title.name}</span> : null}
+                        <span className="chain-badge">{row.source_corpus}</span>
+                        {action.save_for_review ? <span className="signal-badge fired">saved</span> : null}
+                      </div>
+                      <div className="todays-focus-price">
+                        <span className={Number(row.current_move_pct) >= 0 ? 'move-pos' : 'move-neg'}>
+                          {fmtPct(row.current_move_pct)}
+                        </span>
+                        <span>{row.move_basis}</span>
+                        <span>{fmtUsd(row.market_cap)}</span>
+                      </div>
+                    </div>
+                    <div className="todays-focus-facts">
+                      <div>{joinFacts(row.entry_quality_facts)}</div>
+                      <div>{joinFacts(row.current_risk_facts)}</div>
+                      {row.counter_flag_facts?.length ? <div>{joinFacts(row.counter_flag_facts)}</div> : null}
+                    </div>
+                    <div className="todays-focus-diagnostics">
+                      <span>group={row.trade_inbox_group}</span>
+                      <span>state={row.window_state}</span>
+                      <span>seen={compactTime(row.opened_at)}</span>
+                      <span>price_at={compactTime(row.price_updated_at)}</span>
+                    </div>
+                  </div>
+                  <div className="todays-focus-actions">
+                    <button
+                      className="tab-btn"
+                      onClick={() => handleAction(row.row_key, { save_for_review: !action.save_for_review }, true)}
+                    >
+                      {action.save_for_review ? 'Saved' : 'Save'}
+                    </button>
+                    <button
+                      className="tab-btn"
+                      onClick={() => handleAction(row.row_key, { dismissed: true }, true)}
+                    >
+                      Dismiss
+                    </button>
+                    <input
+                      aria-label={`note ${row.row_key}`}
+                      value={action.note || ''}
+                      placeholder="Note"
+                      onChange={e => handleAction(row.row_key, { note: e.currentTarget.value })}
+                    />
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+
         <details className="todays-focus-usage">
           <summary>Usage evidence</summary>
           <pre>{JSON.stringify(usageExport, null, 2)}</pre>
         </details>
       </div>
-
-      {rows.length === 0 ? (
-        <div className="panel todays-focus-empty">
-          {meta.empty_state || "No eligible Trade Inbox rows are available for Today's Focus. Source window: 36h."}
-        </div>
-      ) : (
-        <div className="todays-focus-list">
-          {rows.map(row => {
-            const action = actions[row.row_key] || {}
-            return (
-              <div className="panel todays-focus-row" key={row.row_key}>
-                <div className="todays-focus-row-main">
-                  <div className="todays-focus-token">
-                    <TokenLink token={row} />
-                    <span className="chain-badge">{row.source_corpus}</span>
-                    {action.save_for_review ? <span className="signal-badge">saved</span> : null}
-                  </div>
-                  <div className="todays-focus-price">
-                    <span>{fmtPct(row.current_move_pct)}</span>
-                    <span>{row.move_basis}</span>
-                    <span>{fmtUsd(row.market_cap)}</span>
-                  </div>
-                </div>
-                <div className="todays-focus-facts">
-                  <div>{joinFacts(row.entry_quality_facts)}</div>
-                  <div>{joinFacts(row.current_risk_facts)}</div>
-                  {row.counter_flag_facts?.length ? <div>{joinFacts(row.counter_flag_facts)}</div> : null}
-                </div>
-                <div className="todays-focus-diagnostics">
-                  <span>group={row.trade_inbox_group}</span>
-                  <span>state={row.window_state}</span>
-                  <span>seen={compactTime(row.opened_at)}</span>
-                  <span>price_at={compactTime(row.price_updated_at)}</span>
-                </div>
-                <div className="todays-focus-actions">
-                  <button
-                    className="tab-btn"
-                    onClick={() => handleAction(row.row_key, { save_for_review: !action.save_for_review }, true)}
-                  >
-                    {action.save_for_review ? 'Saved' : 'Save'}
-                  </button>
-                  <button
-                    className="tab-btn"
-                    onClick={() => handleAction(row.row_key, { dismissed: true }, true)}
-                  >
-                    Dismiss
-                  </button>
-                  <input
-                    aria-label={`note ${row.row_key}`}
-                    value={action.note || ''}
-                    placeholder="Note"
-                    onChange={e => handleAction(row.row_key, { note: e.currentTarget.value })}
-                  />
-                </div>
-              </div>
-            )
-          })}
-        </div>
-      )}
     </div>
   )
 }

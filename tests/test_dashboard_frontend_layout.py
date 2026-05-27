@@ -118,6 +118,9 @@ def test_todays_focus_tab_is_wired_with_local_storage_only_state():
     assert "localStorage" in storage
     assert "Usage evidence" in panel
     assert "JSON.stringify(usageExport, null, 2)" in panel
+    assert "tokenId={row.token_id}" in panel
+    assert "symbol={title.symbol}" in panel
+    assert panel.index("todays-focus-list") < panel.index("todays-focus-usage")
     assert "save_for_review" in panel
     assert "dismiss" in panel
     assert "note" in panel
@@ -140,9 +143,13 @@ def test_todays_focus_mobile_constraints_and_no_table_layout():
     assert "<table" not in panel.lower()
     assert "@media (max-width: 480px)" in css
     assert ".todays-focus-row" in css
+    assert ".todays-focus-rank" in css
+    assert ".todays-focus-name" in css
     assert ".todays-focus-usage" in css
     assert "min-width: 0" in css
     assert "width: 100%" in css
+    assert "min-height: calc(100vh - 170px)" in css
+    assert "grid-template-columns: 28px minmax(0, 1fr) minmax(220px, 0.32fr)" in css
     assert re.search(r"\.todays-focus-row\s*\{[^}]*padding:\s*(?:8|10)px", css, re.S)
 
 
