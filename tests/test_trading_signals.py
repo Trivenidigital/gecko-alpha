@@ -8,6 +8,7 @@ mcap/rank must skip cleanly without raising.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -117,6 +118,46 @@ async def _open_count(db):
     return row[0]
 
 
+async def _latest_decision(db, token_id):
+    cur = await db._conn.execute(
+        """SELECT *
+           FROM trade_decision_events
+           WHERE token_id = ?
+           ORDER BY id DESC
+           LIMIT 1""",
+        (token_id,),
+    )
+    return await cur.fetchone()
+
+
+async def _decision_count(db, token_id, reason):
+    cur = await db._conn.execute(
+        """SELECT COUNT(*)
+           FROM trade_decision_events
+           WHERE token_id = ? AND reason = ?""",
+        (token_id, reason),
+    )
+    row = await cur.fetchone()
+    return row[0]
+
+
+def _decision_data(row):
+    return json.loads(row["event_data"])
+
+
+async def _suppress_combo(db, combo_key):
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT OR REPLACE INTO combo_performance
+           (combo_key, window, trades, wins, losses, total_pnl_usd, avg_pnl_pct,
+            win_rate_pct, suppressed, suppressed_at, parole_at,
+            parole_trades_remaining, refresh_failures, last_refreshed)
+           VALUES (?, '30d', 10, 0, 10, -100, -10, 0, 1, ?, NULL, NULL, 0, ?)""",
+        (combo_key, now, now),
+    )
+    await db._conn.commit()
+
+
 # ---------------- trade_gainers --------------------------------------------
 
 
@@ -183,12 +224,19 @@ async def test_trade_losers_skips_below_min_mcap(db, engine, settings):
     await _insert_loser(db, "micro-dip", market_cap=500_000)
     await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
     assert await _open_count(db) == 0
+    row = await _latest_decision(db, "micro-dip")
+    assert row["signal_type"] == "losers_contrarian"
+    assert row["decision"] == "blocked"
+    assert row["reason"] == "below_min_market_cap"
+    assert _decision_data(row)["min_mcap"] == 5_000_000
 
 
 async def test_trade_losers_skips_null_mcap(db, engine, settings):
     await _insert_loser(db, "null-dip", market_cap=None)
     await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
     assert await _open_count(db) == 0
+    row = await _latest_decision(db, "null-dip")
+    assert row["reason"] == "missing_market_cap"
 
 
 async def test_trade_losers_falls_back_to_price_cache(db, engine, settings):
@@ -205,6 +253,20 @@ async def test_trade_losers_falls_back_to_price_cache(db, engine, settings):
     await _seed_price(db, "null-price", price=0.042)
     await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
     assert await _open_count(db) == 1
+    assert await _decision_count(db, "null-price", "missing_price") == 0
+
+
+async def test_trade_losers_emits_suppression_decision_event(db, engine, settings):
+    await _insert_loser(db, "suppressed-dip", market_cap=10_000_000)
+    await _suppress_combo(db, "losers_contrarian")
+    await trade_losers(engine, db, min_mcap=5_000_000, settings=settings)
+    assert await _open_count(db) == 0
+    row = await _latest_decision(db, "suppressed-dip")
+    assert row["signal_type"] == "losers_contrarian"
+    assert row["decision"] == "blocked"
+    assert row["reason"] == "suppressed"
+    assert row["signal_combo"] == "losers_contrarian"
+    assert _decision_data(row)["suppression_reason"] == "suppressed"
 
 
 # ---------------- trade_trending -------------------------------------------
@@ -222,6 +284,14 @@ async def test_trade_trending_skips_above_rank_threshold(db, engine, settings):
     await _seed_price(db, "rank-2000", price=1.0)
     await trade_trending(engine, db, max_mcap_rank=1500, settings=settings)
     assert await _open_count(db) == 0
+    row = await _latest_decision(db, "rank-2000")
+    assert row["signal_type"] == "trending_catch"
+    assert row["decision"] == "blocked"
+    assert row["reason"] == "below_rank_threshold"
+    data = _decision_data(row)
+    assert data["market_cap_rank"] == 2000
+    assert data["price_change_24h"] is None
+    assert data["price_at_snapshot"] is None
 
 
 async def test_trade_trending_skips_null_rank(db, engine, settings):
@@ -229,6 +299,8 @@ async def test_trade_trending_skips_null_rank(db, engine, settings):
     await _seed_price(db, "no-rank", price=1.0)
     await trade_trending(engine, db, max_mcap_rank=1500, settings=settings)
     assert await _open_count(db) == 0
+    row = await _latest_decision(db, "no-rank")
+    assert row["reason"] == "missing_market_cap_rank"
 
 
 async def test_trade_trending_respects_threshold_override(db, engine, settings):
@@ -237,6 +309,20 @@ async def test_trade_trending_respects_threshold_override(db, engine, settings):
     # Tighter ceiling — should reject
     await trade_trending(engine, db, max_mcap_rank=1000, settings=settings)
     assert await _open_count(db) == 0
+
+
+async def test_trade_trending_emits_suppression_decision_event(db, engine, settings):
+    await _insert_trending(db, "suppressed-trend", market_cap_rank=50)
+    await _seed_price(db, "suppressed-trend", price=1.0, market_cap=10_000_000)
+    await _suppress_combo(db, "trending_catch")
+    await trade_trending(engine, db, max_mcap_rank=1500, settings=settings)
+    assert await _open_count(db) == 0
+    row = await _latest_decision(db, "suppressed-trend")
+    assert row["signal_type"] == "trending_catch"
+    assert row["decision"] == "blocked"
+    assert row["reason"] == "suppressed"
+    assert row["signal_combo"] == "trending_catch"
+    assert _decision_data(row)["suppression_reason"] == "suppressed"
 
 
 # ---------------- Datetime-window regression --------------------------------
@@ -389,6 +475,10 @@ async def test_trade_losers_skips_above_max_mcap(db, engine, settings):
         settings=settings,
     )
     assert await _open_count(db) == 0
+    row = await _latest_decision(db, "big-cap-loser")
+    assert row["signal_type"] == "losers_contrarian"
+    assert row["reason"] == "above_max_market_cap"
+    assert _decision_data(row)["max_mcap"] == 500_000_000
 
 
 async def test_trade_first_signals_skips_above_max_mcap(db, engine, settings):
@@ -444,6 +534,10 @@ async def test_trade_trending_skips_above_max_mcap(db, engine, settings):
         settings=settings,
     )
     assert await _open_count(db) == 0
+    row = await _latest_decision(db, "big-cap-trend")
+    assert row["signal_type"] == "trending_catch"
+    assert row["reason"] == "above_max_market_cap"
+    assert _decision_data(row)["max_mcap"] == 500_000_000
 
 
 async def test_trade_trending_skips_below_min_mcap(db, engine, settings):
@@ -467,6 +561,10 @@ async def test_trade_trending_skips_below_min_mcap(db, engine, settings):
         settings=settings,
     )
     assert await _open_count(db) == 0
+    row = await _latest_decision(db, "tiny-trend")
+    assert row["signal_type"] == "trending_catch"
+    assert row["reason"] == "below_min_market_cap"
+    assert _decision_data(row)["min_mcap"] == 5_000_000
 
 
 async def test_trade_trending_opens_when_mcap_in_range(db, engine, settings):

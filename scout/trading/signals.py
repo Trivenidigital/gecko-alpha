@@ -20,6 +20,13 @@ from scout.trading.suppression import should_open
 logger = structlog.get_logger()
 
 
+def _row_get(row, key: str):
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
+
+
 async def _emit_dispatch_decision(
     db: Database,
     *,
@@ -33,18 +40,20 @@ async def _emit_dispatch_decision(
     """Emit pre-engine dispatcher decisions without affecting dispatch flow."""
     await emit_trade_decision(
         db,
-        token_id=row["coin_id"],
+        token_id=_row_get(row, "coin_id"),
         signal_type=signal_type,
         decision=decision,
         reason=reason,
         source_module="scout.trading.signals",
         signal_combo=signal_combo,
         event_data={
-            "symbol": row["symbol"],
-            "name": row["name"],
-            "market_cap": row["market_cap"],
-            "price_change_24h": row["price_change_24h"],
-            "price_at_snapshot": row["price_at_snapshot"],
+            "symbol": _row_get(row, "symbol"),
+            "name": _row_get(row, "name"),
+            "market_cap": _row_get(row, "market_cap"),
+            "price_change_24h": _row_get(row, "price_change_24h"),
+            "price_at_snapshot": _row_get(row, "price_at_snapshot"),
+            "current_price": _row_get(row, "current_price"),
+            "market_cap_rank": _row_get(row, "market_cap_rank"),
             **extra,
         },
     )
@@ -321,10 +330,37 @@ async def trade_losers(
                     symbol=l["symbol"],
                     signal_type="losers_contrarian",
                 )
+                await _emit_dispatch_decision(
+                    db,
+                    row=l,
+                    signal_type="losers_contrarian",
+                    decision="blocked",
+                    reason="junk_candidate",
+                )
                 continue
             if (l["market_cap"] or 0) < min_mcap:
+                await _emit_dispatch_decision(
+                    db,
+                    row=l,
+                    signal_type="losers_contrarian",
+                    decision="blocked",
+                    reason=(
+                        "missing_market_cap"
+                        if l["market_cap"] is None
+                        else "below_min_market_cap"
+                    ),
+                    min_mcap=min_mcap,
+                )
                 continue
             if max_mcap is not None and (l["market_cap"] or 0) > max_mcap:
+                await _emit_dispatch_decision(
+                    db,
+                    row=l,
+                    signal_type="losers_contrarian",
+                    decision="blocked",
+                    reason="above_max_market_cap",
+                    max_mcap=max_mcap,
+                )
                 continue
             try:
                 combo_key = build_combo_key(
@@ -338,6 +374,15 @@ async def trade_losers(
                         reason=reason,
                         coin_id=l["coin_id"],
                         signal_type="losers_contrarian",
+                    )
+                    await _emit_dispatch_decision(
+                        db,
+                        row=l,
+                        signal_type="losers_contrarian",
+                        decision="blocked",
+                        reason="suppressed",
+                        signal_combo=combo_key,
+                        suppression_reason=reason,
                     )
                     continue
                 loser_price = l["price_at_snapshot"]
@@ -532,14 +577,51 @@ async def trade_trending(
                     symbol=t["symbol"],
                     signal_type="trending_catch",
                 )
+                await _emit_dispatch_decision(
+                    db,
+                    row=t,
+                    signal_type="trending_catch",
+                    decision="blocked",
+                    reason="junk_candidate",
+                )
                 continue
             rank = t["market_cap_rank"]
             if rank is None or rank > max_mcap_rank:
+                await _emit_dispatch_decision(
+                    db,
+                    row=t,
+                    signal_type="trending_catch",
+                    decision="blocked",
+                    reason=(
+                        "missing_market_cap_rank"
+                        if rank is None
+                        else "below_rank_threshold"
+                    ),
+                    max_mcap_rank=max_mcap_rank,
+                )
                 continue
             mcap = t["market_cap"]
             if mcap is None or mcap < min_mcap:
+                await _emit_dispatch_decision(
+                    db,
+                    row=t,
+                    signal_type="trending_catch",
+                    decision="blocked",
+                    reason=(
+                        "missing_market_cap" if mcap is None else "below_min_market_cap"
+                    ),
+                    min_mcap=min_mcap,
+                )
                 continue
             if max_mcap is not None and mcap > max_mcap:
+                await _emit_dispatch_decision(
+                    db,
+                    row=t,
+                    signal_type="trending_catch",
+                    decision="blocked",
+                    reason="above_max_market_cap",
+                    max_mcap=max_mcap,
+                )
                 continue
             try:
                 combo_key = build_combo_key(signal_type="trending_catch", signals=None)
@@ -551,6 +633,15 @@ async def trade_trending(
                         reason=reason,
                         coin_id=t["coin_id"],
                         signal_type="trending_catch",
+                    )
+                    await _emit_dispatch_decision(
+                        db,
+                        row=t,
+                        signal_type="trending_catch",
+                        decision="blocked",
+                        reason="suppressed",
+                        signal_combo=combo_key,
+                        suppression_reason=reason,
                     )
                     continue
                 trending_price = t["current_price"]

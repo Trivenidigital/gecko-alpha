@@ -62,6 +62,7 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 - `BL-NEW-SIGNAL-TRUST-ROADMAP` - PARTIALLY-SHIPPED. Registry/tab shipped in PR #239; scorecards shipped in PR #289. Remaining child work must be scoped from the roadmap below, not from stale PR #276.
 - `BL-NEW-CROSS-IDENTIFIER-RESOLVER-TRACKER-PAPER` - AUDITED-PHANTOM after 2026-05-26 runtime baseline. Do not build until the re-audit trigger fires and paper/tracker overlap proves operator-visible noise.
 - `BL-NEW-TG-ALERT-QUALIFICATION-DESIGN` - still gated. Prod soak on 2026-05-27 returned `2026-05-25=50`, `2026-05-26=17`; volume is high but the `>= 3` mature UTC-day gate has not cleared. Recheck on 2026-05-28 UTC.
+- `BL-NEW-DECISION-EVENT-WATCHDOG-MULTI-SIGNAL` - IMPLEMENTED-PENDING-PR 2026-05-27. Extends the PR #279 `trade_decision_events` watchdog beyond `gainers_early` to enabled snapshot-backed paper dispatchers, and adds pre-engine decision events for `losers_contrarian` / `trending_catch` filter outcomes.
 - `PR #278 Now Tradable counter-risk badges` - CLOSED-SUPERSEDED by PR #290. Trade Inbox is now the primary trader surface and exposes display-only counter-risk context there.
 - `PR #280 TG alert parking docs` - CLOSED-SUPERSEDED 2026-05-26. Parking state is represented in this backlog and `tasks/lessons.md`.
 
@@ -94,6 +95,13 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 **Design checklist when unlocked:** drift-check all current Telegram alert surfaces; quantify 14-day alert volume and operator-action baseline; pin "qualified" without future-runner lookahead; decide corpus scope; include parse-mode hygiene and dispatched/delivered logs; add an auditable alert-decision event surface if a new writer ships; prove scarcity can compress the observed tracker-promotion baseline before any TG send.
 
 **Anti-scope:** urgency tiers, TRADE_NOW/WATCH_BREAKOUT labels, and alert intent stay out of `/api/trade_inbox`. Default future shape is a separate `/api/trade_alert_intent`-style endpoint. Relax the Trade Inbox firewall only via a deliberate contract PR with new invariants.
+
+### BL-NEW-DECISION-EVENT-WATCHDOG-MULTI-SIGNAL: cover all enabled snapshot-backed paper dispatchers in the decision-event watchdog
+**Status:** IMPLEMENTED-PENDING-PR 2026-05-27 - the existing PR #279 watchdog was `gainers_early`-only; this follow-up extends coverage to enabled `losers_contrarian` and `trending_catch` dispatchers without changing trading behavior.
+**Tag:** `observability` `trade-decision-events` `silent-failure-prevention` `trader-surface`
+**Why:** `trade_decision_events` is now the structured substrate for explaining why a signal reached or missed trade dispatch. If `losers_contrarian` or `trending_catch` dispatcher instrumentation breaks, a gainers-only watchdog would stay green while those surfaces silently lose decision attribution.
+**Action:** Extend `scripts/check_trade_decision_events.py` with an enablement-aware static source mapping for `gainers_snapshots`, `losers_snapshots`, and `trending_snapshots`, excluding already-open paper rows to mirror dispatcher eligibility; add pre-engine fail-soft decision events for `losers_contrarian` / `trending_catch` filter and suppression branches; keep existing cron line and table schema unchanged.
+**Guardrails:** skip checks when `TRADING_ENABLED=False` or per-signal paper dispatch flags are disabled; do not emit misleading `missing_price` dispatcher events; no new alerting, ranking, urgency tiers, signal policy, DB table, or cron line.
 
 ### Track 2 - Source/KOL Measurement Enablers (gated)
 - `BL-NEW-SOURCE-CALL-HISTORICAL-POOL-SELECTION-PROBE` - next authorized probe. Determines whether GT free can recover old source-call OHLCV if pool-at-call selection is fixed.

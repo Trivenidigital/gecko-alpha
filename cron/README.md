@@ -6,7 +6,7 @@ Repo-tracked source-of-truth for the gecko-alpha crontab entries on srilu. Mirro
 
 | File | Purpose |
 |---|---|
-| `gecko-alpha.crontab` | Sentinel-bracketed managed block with the 2 weekly archive cron entries |
+| `gecko-alpha.crontab` | Sentinel-bracketed managed block with the scheduled gecko-alpha cron entries |
 | `deploy.sh` | Idempotent awk-based merge script |
 
 ## Deploy
@@ -50,12 +50,13 @@ Currently 6 entries:
 - `*/5 * * * *` — `scripts/source-calls-live-writer.sh` (every 5 min)
 - `*/10 * * * *` — `scripts/source-calls-lag-watchdog.sh` (every 10 min)
 - `*/10 * * * *` — `scripts/check_trade_decision_events.py`
-  (every 10 min; logs `trade_decision_events` freshness status)
+  (every 10 min; logs enablement-aware multi-signal
+  `trade_decision_events` freshness status)
 - `20 9 * * *` — `scripts/audit_stop_loss_false_negatives.sh --alert`
   (daily stop-loss false-negative gate; logs every run and sends Telegram only
   when status leaves `WAIT_MORE_MATURE_DATA`)
 
-Future high-cadence triggers should prefer `systemd/*.timer` (cycle 10 canon) over cron. The 5 entries above stay as cron for simplicity (see BL-NEW-CRON-TO-SYSTEMD-TIMER decision-by 2026-06-14).
+Future high-cadence triggers should prefer `systemd/*.timer` (cycle 10 canon) over cron. The managed entries above stay as cron for simplicity (see BL-NEW-CRON-TO-SYSTEMD-TIMER decision-by 2026-06-14).
 
 ## Stderr redirection convention (Round 6 hardening)
 
