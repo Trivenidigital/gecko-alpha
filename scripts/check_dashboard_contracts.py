@@ -29,8 +29,15 @@ def _load_checker(module_name: str, filename: str):
     return module
 
 
-_LIVE_CHECKER = _load_checker("check_live_candidates_contract", "check_live_candidates_contract.py")
-_TRADE_CHECKER = _load_checker("check_trade_inbox_contract", "check_trade_inbox_contract.py")
+_LIVE_CHECKER = _load_checker(
+    "check_live_candidates_contract", "check_live_candidates_contract.py"
+)
+_TRADE_CHECKER = _load_checker(
+    "check_trade_inbox_contract", "check_trade_inbox_contract.py"
+)
+_FOCUS_CHECKER = _load_checker(
+    "check_todays_focus_contract", "check_todays_focus_contract.py"
+)
 
 
 def _result_summary(result, exit_code: int) -> dict:
@@ -59,7 +66,10 @@ def _aggregate_exit_code(exit_codes: list[int]) -> int:
 def _print_text(summary: dict, *, verbose: bool) -> None:
     exit_code = summary["exit_code"]
     if exit_code == EXIT_OK:
-        print("OK: dashboard contracts clean (live_candidates=0, trade_inbox=0)")
+        print(
+            "OK: dashboard contracts clean "
+            "(live_candidates=0, trade_inbox=0, todays_focus=0)"
+        )
         if not verbose:
             return
     else:
@@ -113,8 +123,13 @@ def main(argv=None) -> int:
         limit_per_group=args.trade_limit_per_group,
         window_hours=args.window_hours,
     )
+    focus_result, focus_exit = _FOCUS_CHECKER.fetch_and_validate(
+        args.url,
+        timeout_sec=args.timeout_sec,
+        window_hours=args.window_hours,
+    )
 
-    exit_code = _aggregate_exit_code([live_exit, trade_exit])
+    exit_code = _aggregate_exit_code([live_exit, trade_exit, focus_exit])
     summary = {
         "status": "ok" if exit_code == EXIT_OK else "fail",
         "exit_code": exit_code,
@@ -122,6 +137,7 @@ def main(argv=None) -> int:
         "checks": {
             "live_candidates": _result_summary(live_result, live_exit),
             "trade_inbox": _result_summary(trade_result, trade_exit),
+            "todays_focus": _result_summary(focus_result, focus_exit),
         },
     }
 

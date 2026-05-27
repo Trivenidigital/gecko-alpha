@@ -94,6 +94,77 @@ def test_trade_inbox_counter_risk_block_stays_neutral():
         assert forbidden not in text
 
 
+def test_todays_focus_tab_is_wired_with_local_storage_only_state():
+    app = (ROOT / "dashboard" / "frontend" / "App.jsx").read_text(encoding="utf-8")
+    panel_path = ROOT / "dashboard" / "frontend" / "components" / "TodayFocusPanel.jsx"
+    storage_path = ROOT / "dashboard" / "frontend" / "todayFocusStorage.js"
+
+    assert panel_path.exists()
+    assert storage_path.exists()
+    panel = panel_path.read_text(encoding="utf-8")
+    storage = storage_path.read_text(encoding="utf-8")
+
+    assert "TodayFocusPanel" in app
+    assert "todays_focus" in app
+    assert "<TodayFocusPanel />" in app
+    assert "/api/todays_focus?window_hours=36" in panel
+    assert "gecko.todaysFocus.v0" in storage
+    assert "schema_version" in storage
+    assert "cached_payload" in storage
+    assert "actions_by_row_key" in storage
+    assert "usage_counters" in storage
+    assert "localStorage" in storage
+    assert "save_for_review" in panel
+    assert "dismiss" in panel
+    assert "note" in panel
+    assert "I'm in" not in panel
+    assert "I’m in" not in panel
+    assert not re.search(
+        r"fetch\([^)]*,\s*\{[^}]*(?:POST|PUT|PATCH|DELETE)", panel, re.S
+    )
+
+
+def test_todays_focus_mobile_constraints_and_no_table_layout():
+    css = (ROOT / "dashboard" / "frontend" / "style.css").read_text(encoding="utf-8")
+    panel = (
+        ROOT / "dashboard" / "frontend" / "components" / "TodayFocusPanel.jsx"
+    ).read_text(encoding="utf-8")
+
+    assert "todays-focus-panel" in panel
+    assert "<table" not in panel.lower()
+    assert "@media (max-width: 480px)" in css
+    assert ".todays-focus-row" in css
+    assert "min-width: 0" in css
+    assert "width: 100%" in css
+    assert re.search(r"\.todays-focus-row\s*\{[^}]*padding:\s*(?:8|10)px", css, re.S)
+
+
+def test_todays_focus_frontend_copy_stays_factual():
+    paths = [
+        ROOT / "dashboard" / "frontend" / "components" / "TodayFocusPanel.jsx",
+        ROOT / "dashboard" / "frontend" / "todayFocusStorage.js",
+    ]
+    text = "\n".join(p.read_text(encoding="utf-8") for p in paths if p.exists()).lower()
+    for forbidden in (
+        r"\btrade\s+now\b",
+        r"\bwatch\s+breakout\b",
+        r"\bentry\s+is\s+late\b",
+        r"\bconsider\b",
+        r"\bbuy\b",
+        r"\bsell\b",
+        r"\bshould\b",
+        r"\btarget\b",
+        r"\btake\s+profit\b",
+        r"\bstrong\s+buy\b",
+        r"\bact[_\s-]*now\b",
+        r"\baction[_\s-]*required\b",
+        r"\bacting\b",
+        r"\bnow[_\s-]*tradeable\b",
+        r"\btradeable[_\s-]*now\b",
+    ):
+        assert not re.search(forbidden, text)
+
+
 def test_committed_dashboard_dist_references_existing_signal_trust_bundle():
     index_html = (ROOT / "dashboard" / "frontend" / "dist" / "index.html").read_text(
         encoding="utf-8"

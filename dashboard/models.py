@@ -329,3 +329,74 @@ class TradeInboxMeta(BaseModel):
 class TradeInboxResponse(BaseModel):
     meta: TradeInboxMeta
     groups: dict[TradeInboxGroup, list[TradeInboxRow]]
+
+
+TodaysFocusSourceCorpus = Literal["paper", "tracker"]
+TodaysFocusMoveBasis = Literal["paper_entry", "tracker_detection"]
+TodaysFocusGroup = Literal["review", "followup", "moved", "blocked"]
+
+
+class TodaysFocusRow(BaseModel):
+    row_key: str
+    token_id: str
+    symbol: str | None = None
+    name: str | None = None
+    chain: str | None = None
+    source_corpus: TodaysFocusSourceCorpus
+
+    trade_inbox_group: TodaysFocusGroup
+    window_state: TradeInboxWindowState
+    verdict: str | None = None
+    entry_quality: str | None = None
+    surfaces: list[str] = Field(default_factory=list)
+
+    opened_at: str | None = None
+    opened_age_hours: float | None = None
+    current_price: float | None = None
+    market_cap: float | None = None
+    price_change_24h: float | None = None
+    price_updated_at: str | None = None
+    price_is_stale: bool = False
+    price_staleness_minutes: float | None = None
+    current_move_pct: float | None = None
+    move_basis: TodaysFocusMoveBasis
+
+    entry_quality_facts: list[str] = Field(default_factory=list)
+    current_risk_facts: list[str] = Field(default_factory=list)
+    counter_flag_facts: list[str] = Field(default_factory=list)
+
+    inclusion_reasons: list[str] = Field(default_factory=list)
+    risk_reasons: list[str] = Field(default_factory=list)
+    block_reason_primary: str | None = None
+
+
+class TodaysFocusMeta(BaseModel):
+    read_only: bool = True
+    not_trade_advice: bool = True
+    visibility_only: bool = True
+    experimental: bool = True
+    not_for_alerting: bool = True
+    not_for_execution: bool = True
+    not_for_sizing: bool = True
+    not_for_source_ranking: bool = True
+    generated_at: str
+    source_endpoint: str = "/api/trade_inbox"
+    source_window_hours: int
+    source_limit_per_group: int
+    source_rows_considered: int
+    source_group_counts: dict[str, int] = Field(default_factory=dict)
+    source_truncated: bool = False
+    tracker_source_truncated: bool = False
+    max_rows: int = 5
+    paper_target: int = 3
+    tracker_target: int = 2
+    cache_ttl_minutes: int = 60
+    curation_policy: str = "fixed_recipe_3_paper_2_tracker_no_score"
+    rows_returned: int
+    eligible_rows_considered: int
+    empty_state: str
+
+
+class TodaysFocusResponse(BaseModel):
+    meta: TodaysFocusMeta
+    rows: list[TodaysFocusRow] = Field(default_factory=list)

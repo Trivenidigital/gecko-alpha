@@ -2,6 +2,7 @@
 
 import json
 import re
+import unicodedata
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -1734,6 +1735,294 @@ async def get_trade_inbox(
             "source": "live_candidates",
         },
         "groups": sliced_groups,
+    }
+
+
+TODAYS_FOCUS_GROUP_ORDER = ("act_now", "watch", "already_ran", "blocked")
+TODAYS_FOCUS_GROUP_LABELS = {
+    "act_now": "review",
+    "watch": "followup",
+    "already_ran": "moved",
+    "blocked": "blocked",
+}
+TODAYS_FOCUS_BANNED_PATTERNS = tuple(
+    re.compile(pattern, re.I)
+    for pattern in (
+        r"\bbuy\b",
+        r"\bsell\b",
+        r"\bconsider\b",
+        r"\btrade[\s_-]*now\b",
+        r"\bwatch[\s_-]*breakout\b",
+        r"\bentry[\s_-]*is[\s_-]*late\b",
+        r"\bpullback\b",
+        r"\btarget\b",
+        r"\bshould\b",
+        r"\brecommend(?:ed|ation)?\b",
+        r"\bgo[\s_-]*long\b",
+        r"\benter[\s_-]*here\b",
+        r"\btake[\s_-]*profit\b",
+        r"\bstrong[\s_-]*buy\b",
+        r"\bmust[\s_-]*buy\b",
+        r"\bact[\s_-]*now\b",
+        r"\baction[\s_-]*required\b",
+        r"\bacting\b",
+        r"\bnow[\s_-]*tradeable\b",
+        r"\btradeable[\s_-]*now\b",
+        r"\burgency(?:\b|[\s_-])",
+        r"\bpriority(?:\b|[\s_-])",
+        r"\balert(?:\b|[\s_-])",
+        r"\bnotify(?:\b|[\s_-])",
+        r"\boperator[\s_-]*priority\b",
+        r"\bresearch[\s_-]*only\b",
+    )
+)
+
+
+def _today_focus_normalize_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    stripped = "".join(ch for ch in normalized if unicodedata.category(ch)[0] != "C")
+    folded = stripped.casefold()
+    return re.sub(r"\s+", " ", folded).strip()
+
+
+def _today_focus_clean_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text[:120]
+    normalized = _today_focus_normalize_text(text)
+    if any(pattern.search(normalized) for pattern in TODAYS_FOCUS_BANNED_PATTERNS):
+        return None
+    return text
+
+
+def _today_focus_fact(label: str, value: object) -> str | None:
+    clean = _today_focus_clean_text(value)
+    if clean is None:
+        return None
+    return f"{label}: {clean}"
+
+
+def _today_focus_counter_flag_facts(flags: object) -> list[str]:
+    if not isinstance(flags, list):
+        return []
+    facts: list[str] = []
+    for flag in flags:
+        text = ""
+        if isinstance(flag, str):
+            text = flag
+        elif isinstance(flag, dict):
+            primary = next(
+                (
+                    flag.get(k)
+                    for k in ("label", "type", "name", "reason")
+                    if isinstance(flag.get(k), str) and flag.get(k).strip()
+                ),
+                "",
+            )
+            detail = flag.get("detail") if isinstance(flag.get("detail"), str) else ""
+            if primary and detail:
+                text = f"{primary}: {detail}"
+            else:
+                text = primary or detail
+        clean = _today_focus_clean_text(text)
+        if clean:
+            facts.append(clean[:80])
+        elif text:
+            facts.append("Source text withheld by factual-copy firewall")
+        if len(facts) >= 2:
+            break
+    return facts
+
+
+def _today_focus_row(row: dict) -> dict:
+    source = row.get("source_corpus") or "paper"
+    move_basis = "paper_entry" if source == "paper" else "tracker_detection"
+    group_label = TODAYS_FOCUS_GROUP_LABELS.get(row.get("group"), "unknown")
+    entry_facts = [
+        _today_focus_fact("Trade Inbox bucket", group_label),
+        _today_focus_fact("Window state", row.get("window_state")),
+        _today_focus_fact("Verdict", row.get("verdict")),
+        _today_focus_fact("Entry quality", row.get("entry_quality")),
+    ]
+    if row.get("actionable") is not None:
+        entry_facts.append(_today_focus_fact("Actionable", row.get("actionable")))
+    if row.get("opened_age_hours") is not None:
+        entry_facts.append(
+            _today_focus_fact("Age hours", f"{float(row['opened_age_hours']):.2f}")
+        )
+    if row.get("pct_from_entry") is not None:
+        label = (
+            "Move since paper entry"
+            if source == "paper"
+            else "Move since tracker detection"
+        )
+        entry_facts.append(
+            _today_focus_fact(label, f"{float(row['pct_from_entry']):.2f}%")
+        )
+
+    risk_facts = [
+        _today_focus_fact(
+            "Price cache stale", str(bool(row.get("price_is_stale"))).lower()
+        ),
+    ]
+    if row.get("price_staleness_minutes") is not None:
+        risk_facts.append(
+            _today_focus_fact(
+                "Price cache age minutes",
+                f"{float(row['price_staleness_minutes']):.2f}",
+            )
+        )
+    if row.get("price_change_24h") is not None:
+        risk_facts.append(
+            _today_focus_fact("24h change", f"{float(row['price_change_24h']):.2f}%")
+        )
+    if row.get("block_reason_primary"):
+        risk_facts.append(
+            _today_focus_fact("Block reason", row.get("block_reason_primary"))
+        )
+
+    return {
+        "row_key": f"{source}:{row.get('token_id')}",
+        "token_id": row.get("token_id"),
+        "symbol": row.get("symbol"),
+        "name": row.get("name"),
+        "chain": row.get("chain"),
+        "source_corpus": source,
+        "trade_inbox_group": group_label,
+        "window_state": row.get("window_state"),
+        "verdict": row.get("verdict"),
+        "entry_quality": row.get("entry_quality"),
+        "surfaces": list(row.get("surfaces") or []),
+        "opened_at": row.get("opened_at"),
+        "opened_age_hours": row.get("opened_age_hours"),
+        "current_price": row.get("current_price"),
+        "market_cap": row.get("market_cap"),
+        "price_change_24h": row.get("price_change_24h"),
+        "price_updated_at": row.get("price_updated_at"),
+        "price_is_stale": bool(row.get("price_is_stale")),
+        "price_staleness_minutes": row.get("price_staleness_minutes"),
+        "current_move_pct": row.get("pct_from_entry"),
+        "move_basis": move_basis,
+        "entry_quality_facts": [x for x in entry_facts if x],
+        "current_risk_facts": [x for x in risk_facts if x],
+        "counter_flag_facts": _today_focus_counter_flag_facts(row.get("counter_flags")),
+        "inclusion_reasons": list(row.get("inclusion_reasons") or []),
+        "risk_reasons": list(row.get("risk_reasons") or []),
+        "block_reason_primary": row.get("block_reason_primary"),
+    }
+
+
+def _today_focus_candidate_rows(trade_payload: dict) -> list[dict]:
+    rows: list[dict] = []
+    groups = trade_payload.get("groups") or {}
+    for group in TODAYS_FOCUS_GROUP_ORDER:
+        for row in groups.get(group) or []:
+            token_id = row.get("token_id")
+            if not token_id:
+                continue
+            if not (row.get("symbol") or row.get("name")):
+                continue
+            rows.append(row)
+    return rows
+
+
+def _take_rows(
+    source_rows: list[dict],
+    *,
+    selected: list[dict],
+    seen: set[tuple[str, str]],
+    limit: int,
+    source_corpus: str | None = None,
+    groups: set[str] | None = None,
+) -> None:
+    for row in source_rows:
+        if len(selected) >= limit:
+            return
+        if source_corpus is not None and row.get("source_corpus") != source_corpus:
+            continue
+        if groups is not None and row.get("group") not in groups:
+            continue
+        key = (row.get("source_corpus") or "paper", row.get("token_id") or "")
+        if key[1] == "" or key in seen:
+            continue
+        selected.append(row)
+        seen.add(key)
+
+
+async def get_todays_focus(db_path: str, *, window_hours: int = 36) -> dict:
+    """Read-only scarce factual review queue over Trade Inbox rows."""
+    window_hours = max(6, min(int(window_hours), 72))
+    max_rows = 5
+    paper_target = 3
+    tracker_target = 2
+    source_limit_per_group = 20
+    trade_payload = await get_trade_inbox(
+        db_path, limit_per_group=source_limit_per_group, window_hours=window_hours
+    )
+    source_rows = _today_focus_candidate_rows(trade_payload)
+    selected: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    _take_rows(
+        source_rows,
+        selected=selected,
+        seen=seen,
+        limit=paper_target,
+        source_corpus="paper",
+        groups={"act_now", "watch"},
+    )
+    tracker_limit = len(selected) + tracker_target
+    _take_rows(
+        source_rows,
+        selected=selected,
+        seen=seen,
+        limit=min(max_rows, tracker_limit),
+        source_corpus="tracker",
+    )
+    _take_rows(source_rows, selected=selected, seen=seen, limit=max_rows)
+
+    rows = [_today_focus_row(row) for row in selected[:max_rows]]
+    trade_meta = trade_payload.get("meta") or {}
+    empty_state = (
+        f"No eligible Trade Inbox rows are available for Today's Focus. "
+        f"Source window: {window_hours}h."
+    )
+    return {
+        "meta": {
+            "read_only": True,
+            "not_trade_advice": True,
+            "visibility_only": True,
+            "experimental": True,
+            "not_for_alerting": True,
+            "not_for_execution": True,
+            "not_for_sizing": True,
+            "not_for_source_ranking": True,
+            "generated_at": trade_meta.get("generated_at")
+            or datetime.now(timezone.utc).isoformat(),
+            "source_endpoint": "/api/trade_inbox",
+            "source_window_hours": window_hours,
+            "source_limit_per_group": source_limit_per_group,
+            "source_rows_considered": int(
+                trade_meta.get("source_rows_considered") or 0
+            ),
+            "source_group_counts": dict(trade_meta.get("group_counts") or {}),
+            "source_truncated": bool(trade_meta.get("source_truncated")),
+            "tracker_source_truncated": bool(
+                trade_meta.get("tracker_source_truncated")
+            ),
+            "max_rows": max_rows,
+            "paper_target": paper_target,
+            "tracker_target": tracker_target,
+            "cache_ttl_minutes": 60,
+            "curation_policy": "fixed_recipe_3_paper_2_tracker_no_score",
+            "rows_returned": len(rows),
+            "eligible_rows_considered": len(source_rows),
+            "empty_state": empty_state,
+        },
+        "rows": rows,
     }
 
 

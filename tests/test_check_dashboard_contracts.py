@@ -23,7 +23,7 @@ class _FakeResult:
         self.passed = passed
 
 
-def test_main_json_ok_when_both_checkers_pass(monkeypatch, capsys):
+def test_main_json_ok_when_all_checkers_pass(monkeypatch, capsys):
     calls = []
 
     def fake_live_fetch(url, *, timeout_sec, slo_ms, limit, window_hours):
@@ -34,8 +34,13 @@ def test_main_json_ok_when_both_checkers_pass(monkeypatch, capsys):
         calls.append(("trade", url, timeout_sec, limit_per_group, window_hours))
         return _FakeResult(), 0
 
+    def fake_focus_fetch(url, *, timeout_sec, window_hours):
+        calls.append(("focus", url, timeout_sec, window_hours))
+        return _FakeResult(), 0
+
     monkeypatch.setattr(_MOD._LIVE_CHECKER, "fetch_and_validate", fake_live_fetch)
     monkeypatch.setattr(_MOD._TRADE_CHECKER, "fetch_and_validate", fake_trade_fetch)
+    monkeypatch.setattr(_MOD._FOCUS_CHECKER, "fetch_and_validate", fake_focus_fetch)
 
     exit_code = _MOD.main(["--url", "http://dash", "--json"])
 
@@ -43,10 +48,15 @@ def test_main_json_ok_when_both_checkers_pass(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "ok"
     assert payload["exit_code"] == 0
-    assert set(payload["checks"]) == {"live_candidates", "trade_inbox"}
+    assert set(payload["checks"]) == {
+        "live_candidates",
+        "trade_inbox",
+        "todays_focus",
+    }
     assert payload["checks"]["live_candidates"]["status"] == "ok"
     assert payload["checks"]["trade_inbox"]["status"] == "ok"
-    assert [call[0] for call in calls] == ["live", "trade"]
+    assert payload["checks"]["todays_focus"]["status"] == "ok"
+    assert [call[0] for call in calls] == ["live", "trade", "focus"]
 
 
 def test_main_runs_both_checks_even_when_live_fails(monkeypatch, capsys):
@@ -60,13 +70,18 @@ def test_main_runs_both_checks_even_when_live_fails(monkeypatch, capsys):
         calls.append("trade")
         return _FakeResult(), 0
 
+    def fake_focus_fetch(url, *, timeout_sec, window_hours):
+        calls.append("focus")
+        return _FakeResult(), 0
+
     monkeypatch.setattr(_MOD._LIVE_CHECKER, "fetch_and_validate", fake_live_fetch)
     monkeypatch.setattr(_MOD._TRADE_CHECKER, "fetch_and_validate", fake_trade_fetch)
+    monkeypatch.setattr(_MOD._FOCUS_CHECKER, "fetch_and_validate", fake_focus_fetch)
 
     exit_code = _MOD.main(["--url", "http://dash", "--json"])
 
     assert exit_code == 1
-    assert calls == ["live", "trade"]
+    assert calls == ["live", "trade", "focus"]
     payload = json.loads(capsys.readouterr().out)
     assert payload["checks"]["live_candidates"]["criticals"] == ["live contract drift"]
     assert payload["checks"]["trade_inbox"]["status"] == "ok"
@@ -74,17 +89,24 @@ def test_main_runs_both_checks_even_when_live_fails(monkeypatch, capsys):
 
 def test_failure_json_preserves_per_check_details(monkeypatch, capsys):
     def fake_live_fetch(url, *, timeout_sec, slo_ms, limit, window_hours):
-        return _FakeResult(
-            criticals=["live contract drift"],
-            warnings=["live slow"],
-            passed=0,
-        ), 1
+        return (
+            _FakeResult(
+                criticals=["live contract drift"],
+                warnings=["live slow"],
+                passed=0,
+            ),
+            1,
+        )
 
     def fake_trade_fetch(url, *, timeout_sec, limit_per_group, window_hours):
         return _FakeResult(warnings=["trade warning"], passed=1), 0
 
+    def fake_focus_fetch(url, *, timeout_sec, window_hours):
+        return _FakeResult(warnings=["focus warning"], passed=1), 0
+
     monkeypatch.setattr(_MOD._LIVE_CHECKER, "fetch_and_validate", fake_live_fetch)
     monkeypatch.setattr(_MOD._TRADE_CHECKER, "fetch_and_validate", fake_trade_fetch)
+    monkeypatch.setattr(_MOD._FOCUS_CHECKER, "fetch_and_validate", fake_focus_fetch)
 
     exit_code = _MOD.main(["--url", "http://dash", "--json"])
 
@@ -95,6 +117,7 @@ def test_failure_json_preserves_per_check_details(monkeypatch, capsys):
     assert payload["checks"]["live_candidates"]["criticals"] == ["live contract drift"]
     assert payload["checks"]["live_candidates"]["warnings"] == ["live slow"]
     assert payload["checks"]["trade_inbox"]["warnings"] == ["trade warning"]
+    assert payload["checks"]["todays_focus"]["warnings"] == ["focus warning"]
 
 
 def test_failure_text_prints_per_check_details(monkeypatch, capsys):
@@ -104,8 +127,12 @@ def test_failure_text_prints_per_check_details(monkeypatch, capsys):
     def fake_trade_fetch(url, *, timeout_sec, limit_per_group, window_hours):
         return _FakeResult(warnings=["trade warning"], passed=1), 0
 
+    def fake_focus_fetch(url, *, timeout_sec, window_hours):
+        return _FakeResult(warnings=["focus warning"], passed=1), 0
+
     monkeypatch.setattr(_MOD._LIVE_CHECKER, "fetch_and_validate", fake_live_fetch)
     monkeypatch.setattr(_MOD._TRADE_CHECKER, "fetch_and_validate", fake_trade_fetch)
+    monkeypatch.setattr(_MOD._FOCUS_CHECKER, "fetch_and_validate", fake_focus_fetch)
 
     exit_code = _MOD.main(["--url", "http://dash"])
 
@@ -114,6 +141,7 @@ def test_failure_text_prints_per_check_details(monkeypatch, capsys):
     assert "FAIL: dashboard contract smoke failed (exit 1)" in output
     assert "live_candidates CRITICAL: live contract drift" in output
     assert "trade_inbox WARNING: trade warning" in output
+    assert "todays_focus WARNING: focus warning" in output
 
 
 def test_verbose_success_text_prints_warnings(monkeypatch, capsys):
@@ -123,8 +151,12 @@ def test_verbose_success_text_prints_warnings(monkeypatch, capsys):
     def fake_trade_fetch(url, *, timeout_sec, limit_per_group, window_hours):
         return _FakeResult(warnings=["trade warning"], passed=1), 0
 
+    def fake_focus_fetch(url, *, timeout_sec, window_hours):
+        return _FakeResult(warnings=["focus warning"], passed=1), 0
+
     monkeypatch.setattr(_MOD._LIVE_CHECKER, "fetch_and_validate", fake_live_fetch)
     monkeypatch.setattr(_MOD._TRADE_CHECKER, "fetch_and_validate", fake_trade_fetch)
+    monkeypatch.setattr(_MOD._FOCUS_CHECKER, "fetch_and_validate", fake_focus_fetch)
 
     exit_code = _MOD.main(["--url", "http://dash", "--verbose"])
 
@@ -133,6 +165,7 @@ def test_verbose_success_text_prints_warnings(monkeypatch, capsys):
     assert "OK: dashboard contracts clean" in output
     assert "live_candidates WARNING: live slow" in output
     assert "trade_inbox WARNING: trade warning" in output
+    assert "todays_focus WARNING: focus warning" in output
 
 
 def test_exit_code_priority_prefers_contract_over_http(monkeypatch, capsys):
@@ -142,8 +175,12 @@ def test_exit_code_priority_prefers_contract_over_http(monkeypatch, capsys):
     def fake_trade_fetch(url, *, timeout_sec, limit_per_group, window_hours):
         return _FakeResult(criticals=["trade contract drift"], passed=0), 1
 
+    def fake_focus_fetch(url, *, timeout_sec, window_hours):
+        return _FakeResult(), 0
+
     monkeypatch.setattr(_MOD._LIVE_CHECKER, "fetch_and_validate", fake_live_fetch)
     monkeypatch.setattr(_MOD._TRADE_CHECKER, "fetch_and_validate", fake_trade_fetch)
+    monkeypatch.setattr(_MOD._FOCUS_CHECKER, "fetch_and_validate", fake_focus_fetch)
 
     exit_code = _MOD.main(["--url", "http://dash", "--json"])
 
@@ -152,6 +189,7 @@ def test_exit_code_priority_prefers_contract_over_http(monkeypatch, capsys):
     assert payload["exit_code"] == 1
     assert payload["checks"]["live_candidates"]["exit_code"] == 2
     assert payload["checks"]["trade_inbox"]["exit_code"] == 1
+    assert payload["checks"]["todays_focus"]["exit_code"] == 0
 
 
 def test_argument_forwarding_uses_endpoint_defaults(monkeypatch):
@@ -176,8 +214,17 @@ def test_argument_forwarding_uses_endpoint_defaults(monkeypatch):
         }
         return _FakeResult(), 0
 
+    def fake_focus_fetch(url, *, timeout_sec, window_hours):
+        calls["focus"] = {
+            "url": url,
+            "timeout_sec": timeout_sec,
+            "window_hours": window_hours,
+        }
+        return _FakeResult(), 0
+
     monkeypatch.setattr(_MOD._LIVE_CHECKER, "fetch_and_validate", fake_live_fetch)
     monkeypatch.setattr(_MOD._TRADE_CHECKER, "fetch_and_validate", fake_trade_fetch)
+    monkeypatch.setattr(_MOD._FOCUS_CHECKER, "fetch_and_validate", fake_focus_fetch)
 
     exit_code = _MOD.main(
         [
@@ -208,6 +255,11 @@ def test_argument_forwarding_uses_endpoint_defaults(monkeypatch):
         "limit_per_group": 8,
         "window_hours": 24,
     }
+    assert calls["focus"] == {
+        "url": "http://dash",
+        "timeout_sec": 1.5,
+        "window_hours": 24,
+    }
 
 
 def test_config_validation_rejects_bad_limits(monkeypatch, capsys):
@@ -216,6 +268,7 @@ def test_config_validation_rejects_bad_limits(monkeypatch, capsys):
 
     monkeypatch.setattr(_MOD._LIVE_CHECKER, "fetch_and_validate", fail_if_called)
     monkeypatch.setattr(_MOD._TRADE_CHECKER, "fetch_and_validate", fail_if_called)
+    monkeypatch.setattr(_MOD._FOCUS_CHECKER, "fetch_and_validate", fail_if_called)
 
     exit_code = _MOD.main(["--live-limit", "0"])
 
