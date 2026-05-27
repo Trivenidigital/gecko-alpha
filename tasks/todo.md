@@ -28,10 +28,28 @@ Workflow checklist:
   diagnostics, add anti-scope meta flags, clarify client-only dismiss overlay,
   preserve cached payload on fetch failure, and add frontend/dist static
   firewall plus compact mobile constraints.
-- [ ] TDD red for endpoint, contract checker, dashboard wiring, localStorage
+- [x] TDD red for endpoint, contract checker, dashboard wiring, localStorage
   state, factual-copy firewall, and mobile layout.
-- [ ] Build backend endpoint, contract checker, frontend panel, tests, and dist.
-- [ ] Verification, PR creation, and two parallel PR reviews.
+- [x] Build backend endpoint, contract checker, frontend panel, tests, and dist.
+- [x] Verification:
+  - TDD red: focused pytest failed because
+    `scripts/check_todays_focus_contract.py` was missing.
+  - `$env:UV_NATIVE_TLS='true'; uv run pytest -q
+    tests/test_todays_focus_endpoint.py tests/test_check_todays_focus_contract.py
+    tests/test_check_dashboard_contracts.py tests/test_dashboard_frontend_layout.py`
+    => `30 passed`.
+  - `$env:UV_NATIVE_TLS='true'; uv run pytest --tb=short -q
+    tests/test_trade_inbox_endpoint.py tests/test_check_trade_inbox_contract.py
+    tests/test_check_live_candidates_contract.py tests/test_live_candidates_endpoint.py
+    tests/test_todays_focus_endpoint.py tests/test_check_todays_focus_contract.py
+    tests/test_check_dashboard_contracts.py tests/test_dashboard_frontend_layout.py`
+    => `140 passed`.
+  - `$env:NODE_OPTIONS='--use-system-ca'; npm.cmd --prefix dashboard/frontend
+    run build:codex` => passed; dist regenerated.
+  - Vite dev server local smoke returned HTTP 200 at `http://127.0.0.1:5174/`.
+  - Full `black --check dashboard tests scripts` is not a clean repo baseline
+    in this worktree; touched Python files were formatted directly.
+- [ ] PR creation and two parallel PR reviews.
 
 Non-scope:
 - No Telegram alerts, alert qualification, urgency tiers, `TRADE_NOW`,

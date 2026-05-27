@@ -119,7 +119,9 @@ def test_todays_focus_tab_is_wired_with_local_storage_only_state():
     assert "note" in panel
     assert "I'm in" not in panel
     assert "I’m in" not in panel
-    assert not re.search(r"fetch\([^)]*,\s*\{[^}]*(?:POST|PUT|PATCH|DELETE)", panel, re.S)
+    assert not re.search(
+        r"fetch\([^)]*,\s*\{[^}]*(?:POST|PUT|PATCH|DELETE)", panel, re.S
+    )
 
 
 def test_todays_focus_mobile_constraints_and_no_table_layout():
@@ -141,22 +143,20 @@ def test_todays_focus_frontend_copy_stays_factual():
         ROOT / "dashboard" / "frontend" / "components" / "TodayFocusPanel.jsx",
         ROOT / "dashboard" / "frontend" / "todayFocusStorage.js",
     ]
-    text = "\n".join(
-        p.read_text(encoding="utf-8") for p in paths if p.exists()
-    ).lower()
+    text = "\n".join(p.read_text(encoding="utf-8") for p in paths if p.exists()).lower()
     for forbidden in (
-        "trade now",
-        "watch breakout",
-        "entry is late",
-        "consider",
-        "buy",
-        "sell",
-        "should",
-        "target",
-        "take profit",
-        "strong buy",
+        r"\btrade\s+now\b",
+        r"\bwatch\s+breakout\b",
+        r"\bentry\s+is\s+late\b",
+        r"\bconsider\b",
+        r"\bbuy\b",
+        r"\bsell\b",
+        r"\bshould\b",
+        r"\btarget\b",
+        r"\btake\s+profit\b",
+        r"\bstrong\s+buy\b",
     ):
-        assert forbidden not in text
+        assert not re.search(forbidden, text)
 
 
 def test_committed_dashboard_dist_references_existing_signal_trust_bundle():

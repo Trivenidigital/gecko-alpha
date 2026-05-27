@@ -15,6 +15,7 @@ import GlobalSearch from './components/GlobalSearch.jsx'
 import NowTradableTab from './components/NowTradableTab.jsx'
 import SignalTrustTab from './components/SignalTrustTab.jsx'
 import TradeInboxTab from './components/TradeInboxTab.jsx'
+import TodayFocusPanel from './components/TodayFocusPanel.jsx'
 
 const DEFAULT_STATUS = {
   pipeline_status: 'connecting',
@@ -138,6 +139,12 @@ export default function App() {
           Trading
         </button>
         <button
+          className={`tab-btn ${activeTab === 'todays_focus' ? 'active' : ''}`}
+          onClick={() => setActiveTab('todays_focus')}
+        >
+          Today&apos;s Focus
+        </button>
+        <button
           className={`tab-btn ${activeTab === 'trade_inbox' ? 'active' : ''}`}
           onClick={() => setActiveTab('trade_inbox')}
         >
@@ -190,6 +197,8 @@ export default function App() {
       {activeTab === 'signals' && <SignalsTab />}
 
       {activeTab === 'trading' && <TradingTab />}
+
+      {activeTab === 'todays_focus' && <TodayFocusPanel />}
 
       {activeTab === 'trade_inbox' && <TradeInboxTab />}
 

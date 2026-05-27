@@ -89,11 +89,14 @@ def test_main_runs_both_checks_even_when_live_fails(monkeypatch, capsys):
 
 def test_failure_json_preserves_per_check_details(monkeypatch, capsys):
     def fake_live_fetch(url, *, timeout_sec, slo_ms, limit, window_hours):
-        return _FakeResult(
-            criticals=["live contract drift"],
-            warnings=["live slow"],
-            passed=0,
-        ), 1
+        return (
+            _FakeResult(
+                criticals=["live contract drift"],
+                warnings=["live slow"],
+                passed=0,
+            ),
+            1,
+        )
 
     def fake_trade_fetch(url, *, timeout_sec, limit_per_group, window_hours):
         return _FakeResult(warnings=["trade warning"], passed=1), 0

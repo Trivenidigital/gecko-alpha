@@ -156,7 +156,9 @@ async def _insert_gainer(
 
 
 async def _insert_prediction(conn, *, coin_id: str, counter_flags: list | str):
-    flags_text = counter_flags if isinstance(counter_flags, str) else json.dumps(counter_flags)
+    flags_text = (
+        counter_flags if isinstance(counter_flags, str) else json.dumps(counter_flags)
+    )
     now = datetime.now(timezone.utc).isoformat()
     await conn.execute(
         """INSERT INTO predictions

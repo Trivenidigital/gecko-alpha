@@ -227,6 +227,138 @@ body {
   border: 1px solid transparent;
 }
 
+.todays-focus-panel {
+  min-width: 375px;
+}
+
+.todays-focus-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.todays-focus-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--color-text-primary);
+}
+
+.todays-focus-meta,
+.todays-focus-status,
+.todays-focus-diagnostics {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.todays-focus-meta {
+  margin-right: auto;
+}
+
+.todays-focus-status {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.todays-focus-error {
+  color: var(--color-accent-amber);
+}
+
+.todays-focus-empty {
+  padding: 12px;
+  color: var(--color-text-secondary);
+}
+
+.todays-focus-list {
+  display: grid;
+  gap: 8px;
+}
+
+.todays-focus-row {
+  padding: 8px;
+}
+
+.todays-focus-row-main,
+.todays-focus-token,
+.todays-focus-price,
+.todays-focus-diagnostics,
+.todays-focus-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.todays-focus-row-main {
+  justify-content: space-between;
+}
+
+.todays-focus-token {
+  min-width: 0;
+  font-weight: 600;
+}
+
+.todays-focus-price {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.todays-focus-facts {
+  display: grid;
+  gap: 2px;
+  margin-top: 6px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.todays-focus-facts div {
+  overflow-wrap: anywhere;
+}
+
+.todays-focus-diagnostics {
+  margin-top: 6px;
+}
+
+.todays-focus-actions {
+  margin-top: 6px;
+}
+
+.todays-focus-actions input {
+  min-width: 140px;
+  flex: 1 1 180px;
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  color: var(--color-text-primary);
+  padding: 4px 6px;
+  font: inherit;
+}
+
+@media (max-width: 480px) {
+  .dashboard {
+    max-width: 100vw;
+    padding: 8px;
+  }
+
+  .todays-focus-panel {
+    min-width: 375px;
+  }
+
+  .todays-focus-row {
+    padding: 8px;
+  }
+
+  .todays-focus-title {
+    font-size: 14px;
+  }
+
+  .todays-focus-facts,
+  .todays-focus-diagnostics,
+  .todays-focus-status {
+    font-size: 11px;
+  }
+}
+
 .signal-badge.fired {
   background: rgba(29, 158, 117, 0.35);
   color: #2ee8a5;

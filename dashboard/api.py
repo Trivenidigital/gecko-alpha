@@ -23,6 +23,7 @@ from dashboard.models import (
     SignalTrustScorecardsResponse,
     SignalHitRate,
     StatusResponse,
+    TodaysFocusResponse,
     TradeInboxResponse,
     WinRateResponse,
 )
@@ -433,6 +434,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return await db.get_trade_inbox(
             _db_path, limit_per_group=limit_per_group, window_hours=window_hours
         )
+
+    @app.get("/api/todays_focus", response_model=TodaysFocusResponse)
+    async def get_todays_focus(
+        window_hours: int = Query(36, ge=6, le=72),
+    ):
+        """Read-only scarce factual review queue over Trade Inbox rows."""
+        return await db.get_todays_focus(_db_path, window_hours=window_hours)
 
     @app.get("/api/trading/positions")
     async def get_trading_positions_endpoint():
