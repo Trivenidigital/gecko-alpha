@@ -49,7 +49,13 @@ Workflow checklist:
   - Vite dev server local smoke returned HTTP 200 at `http://127.0.0.1:5174/`.
   - Full `black --check dashboard tests scripts` is not a clean repo baseline
     in this worktree; touched Python files were formatted directly.
-- [ ] PR creation and two parallel PR reviews.
+- [x] PR creation and two parallel PR reviews:
+  PR #297 opened; review fixes folded for cache TTL reset, 375px overflow,
+  user-visible `act_now` leakage, and alert/source-rank diagnostic scanning.
+  Post-fix verification:
+  - focused Today’s Focus/dashboard tests => `31 passed`;
+  - broader dashboard slice => `141 passed`;
+  - frontend build regenerated dist.
 
 Non-scope:
 - No Telegram alerts, alert qualification, urgency tiers, `TRADE_NOW`,

@@ -333,6 +333,7 @@ class TradeInboxResponse(BaseModel):
 
 TodaysFocusSourceCorpus = Literal["paper", "tracker"]
 TodaysFocusMoveBasis = Literal["paper_entry", "tracker_detection"]
+TodaysFocusGroup = Literal["review", "followup", "moved", "blocked"]
 
 
 class TodaysFocusRow(BaseModel):
@@ -343,7 +344,7 @@ class TodaysFocusRow(BaseModel):
     chain: str | None = None
     source_corpus: TodaysFocusSourceCorpus
 
-    trade_inbox_group: TradeInboxGroup
+    trade_inbox_group: TodaysFocusGroup
     window_state: TradeInboxWindowState
     verdict: str | None = None
     entry_quality: str | None = None

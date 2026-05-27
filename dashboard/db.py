@@ -1739,6 +1739,12 @@ async def get_trade_inbox(
 
 
 TODAYS_FOCUS_GROUP_ORDER = ("act_now", "watch", "already_ran", "blocked")
+TODAYS_FOCUS_GROUP_LABELS = {
+    "act_now": "review",
+    "watch": "followup",
+    "already_ran": "moved",
+    "blocked": "blocked",
+}
 TODAYS_FOCUS_BANNED_PATTERNS = tuple(
     re.compile(pattern, re.I)
     for pattern in (
@@ -1829,8 +1835,9 @@ def _today_focus_counter_flag_facts(flags: object) -> list[str]:
 def _today_focus_row(row: dict) -> dict:
     source = row.get("source_corpus") or "paper"
     move_basis = "paper_entry" if source == "paper" else "tracker_detection"
+    group_label = TODAYS_FOCUS_GROUP_LABELS.get(row.get("group"), "unknown")
     entry_facts = [
-        _today_focus_fact("Trade Inbox group", row.get("group")),
+        _today_focus_fact("Trade Inbox bucket", group_label),
         _today_focus_fact("Window state", row.get("window_state")),
         _today_focus_fact("Verdict", row.get("verdict")),
         _today_focus_fact("Entry quality", row.get("entry_quality")),
@@ -1879,7 +1886,7 @@ def _today_focus_row(row: dict) -> dict:
         "name": row.get("name"),
         "chain": row.get("chain"),
         "source_corpus": source,
-        "trade_inbox_group": row.get("group"),
+        "trade_inbox_group": group_label,
         "window_state": row.get("window_state"),
         "verdict": row.get("verdict"),
         "entry_quality": row.get("entry_quality"),

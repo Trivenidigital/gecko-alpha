@@ -31,7 +31,7 @@ def _row(**overrides):
         "name": "Bitcoin",
         "chain": "coingecko",
         "source_corpus": "paper",
-        "trade_inbox_group": "act_now",
+        "trade_inbox_group": "review",
         "window_state": "open",
         "verdict": "candidate_review",
         "entry_quality": "fresh_entry",
@@ -46,7 +46,7 @@ def _row(**overrides):
         "price_staleness_minutes": 1.0,
         "current_move_pct": 3.0,
         "move_basis": "paper_entry",
-        "entry_quality_facts": ["Trade Inbox group: act_now"],
+        "entry_quality_facts": ["Trade Inbox bucket: review"],
         "current_risk_facts": ["Price cache stale: false"],
         "counter_flag_facts": [],
         "inclusion_reasons": ["open_paper_trade"],
@@ -130,6 +130,21 @@ def test_source_acceptable_pullback_enum_is_allowlisted_not_copy_scanned():
     payload = _payload([_row(entry_quality="acceptable_pullback")])
     result = _MOD.validate_payload(payload)
     assert result.is_clean, result.criticals
+
+
+def test_diagnostic_alert_and_source_rank_values_are_critical():
+    payload = _payload(
+        [
+            _row(
+                surfaces=["urgent_alert", "source_rank_1"],
+                inclusion_reasons=["source_score=1"],
+                risk_reasons=["notify_candidate"],
+            )
+        ]
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("forbidden alert/ranking diagnostic" in c for c in result.criticals)
 
 
 def test_forbidden_source_fields_are_critical():

@@ -84,7 +84,7 @@ EXPECTED_ROW_KEYS = frozenset(
 
 ALLOWED_SOURCE_CORPUS = {"paper", "tracker"}
 ALLOWED_WINDOW_STATES = {"open", "closing", "late", "closed", "unknown"}
-ALLOWED_GROUPS = set(EXPECTED_GROUPS)
+ALLOWED_GROUPS = {"review", "followup", "moved", "blocked"}
 ALLOWED_MOVE_BASIS = {"paper_entry", "tracker_detection"}
 ALLOWED_ENTRY_QUALITIES = {
     None,
@@ -143,6 +143,26 @@ BANNED_PATTERNS = tuple(
         r"\bnotify(?:\b|[\s_-])",
         r"\boperator[\s_-]*priority\b",
         r"\bresearch[\s_-]*only\b",
+    )
+)
+FORBIDDEN_DIAGNOSTIC_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\bsource[\s_-]*(?:rank|score|weight|priority|trust|confidence)\b",
+        r"\bsource[\s_-]*rank(?:\b|[\s_-])",
+        r"\bcaller[\s_-]*(?:rank|score|weight|authority|credibility|clout)\b",
+        r"\bchannel[\s_-]*(?:rank|score|weight|trust)\b",
+        r"\btweet[\s_-]*(?:rank|score|weight|credibility)\b",
+        r"\burgency(?:\b|[\s_-])",
+        r"\bpriority(?:\b|[\s_-])",
+        r"\balert(?:\b|[\s_-])",
+        r"\bnotify(?:\b|[\s_-])",
+        r"\boperator[\s_-]*priority\b",
+        r"\brecommend(?:ed|ation)?[\s_-]*(?:by[\s_-]*kol|action)?\b",
+        r"\btrade[\s_-]*now\b",
+        r"\bwatch[\s_-]*breakout\b",
+        r"\bresearch[\s_-]*only\b",
+        r"\bsignal[\s_-]*to[\s_-]*send\b",
     )
 )
 COPY_FIELDS = {
@@ -246,6 +266,16 @@ def _scan_copy(text: str, path: str, result: Result) -> None:
             )
 
 
+def _scan_diagnostic_value(text: str, path: str, result: Result) -> None:
+    normalized = _normalize_text(text)
+    for pattern in FORBIDDEN_DIAGNOSTIC_PATTERNS:
+        if pattern.search(normalized):
+            result.critical(
+                f"{path}: forbidden alert/ranking diagnostic "
+                f"matches {pattern.pattern!r} in {normalized!r}"
+            )
+
+
 def _walk_copy(value, path: str, result: Result) -> None:
     if isinstance(value, dict):
         for key, child in value.items():
@@ -260,6 +290,20 @@ def _walk_copy(value, path: str, result: Result) -> None:
         _scan_copy(value, path, result)
 
 
+def _walk_diagnostic_values(value, path: str, result: Result) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            if isinstance(key, str):
+                _check_key(key, child_path, result)
+            _walk_diagnostic_values(child, child_path, result)
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            _walk_diagnostic_values(child, f"{path}[{idx}]", result)
+    elif isinstance(value, str):
+        _scan_diagnostic_value(value, path, result)
+
+
 def _walk_keys(value, path: str, result: Result) -> None:
     if isinstance(value, dict):
         for key, child in value.items():
@@ -268,6 +312,8 @@ def _walk_keys(value, path: str, result: Result) -> None:
                 _check_key(key, child_path, result)
                 if key in COPY_FIELDS:
                     _walk_copy(child, child_path, result)
+                elif key in ENUM_OR_ID_FIELDS:
+                    _walk_diagnostic_values(child, child_path, result)
             _walk_keys(child, child_path, result)
     elif isinstance(value, list):
         for idx, child in enumerate(value):

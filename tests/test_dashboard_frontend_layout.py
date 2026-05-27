@@ -134,7 +134,8 @@ def test_todays_focus_mobile_constraints_and_no_table_layout():
     assert "<table" not in panel.lower()
     assert "@media (max-width: 480px)" in css
     assert ".todays-focus-row" in css
-    assert "min-width: 375px" in css
+    assert "min-width: 0" in css
+    assert "width: 100%" in css
     assert re.search(r"\.todays-focus-row\s*\{[^}]*padding:\s*(?:8|10)px", css, re.S)
 
 

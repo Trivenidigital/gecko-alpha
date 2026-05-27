@@ -228,7 +228,7 @@ body {
 }
 
 .todays-focus-panel {
-  min-width: 375px;
+  min-width: 0;
 }
 
 .todays-focus-header {
@@ -341,7 +341,8 @@ body {
   }
 
   .todays-focus-panel {
-    min-width: 375px;
+    min-width: 0;
+    width: 100%;
   }
 
   .todays-focus-row {

@@ -78,6 +78,7 @@ export function withCachedPayload(state, payload, nowIso = new Date().toISOStrin
     cached_payload: payload,
     cached_at: nowIso,
     last_refreshed_at: nowIso,
+    cache_expired: false,
   }
   saveTodayFocusState(next)
   return next
