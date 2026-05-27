@@ -2623,7 +2623,7 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
    - Prevents `actionable=1` tokens that are already -10% or +25% from being silently treated as equally tradable.
 
 5. **BL-NEW-NARRATIVE-COUNTER-RISK-INTO-TRADE-VIEW** — Promote prediction warnings into the candidate row.
-   - **Status:** PARTIALLY-SHIPPED / OPEN-PR 2026-05-26 — backend exposes `counter_risk_score` and `counter_flags` on live candidates; PR #278 proposes Now Tradable badges. Re-scope before merge because Trade Inbox is now the primary trader surface and lacks counter-risk fields.
+   - **Status:** SHIPPED-V1 2026-05-27 - backend exposes `counter_risk_score` and `counter_flags` on live candidates, and PR #290 exposes display-only counter-risk context in Trade Inbox (`counter_risk_score`, `counter_flags`, `counter_risk_predicted_at`). PR #278 is closed/superseded. Future refinements should target Trade Inbox label semantics, not the stale Now Tradable PR.
    - Surface `dead_project`, `weak_community`, `already_peaked`, `narrative_mismatch`, low fit score, and counter-risk score as red/yellow badges.
    - Narrative predictions can enrich or downgrade a candidate; they are not standalone live entries unless the scoring layer also passes entry-quality and actionability gates.
 
@@ -2650,7 +2650,7 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 **Acceptance for V1:** MET for the parent cockpit as of 2026-05-26 except for optional refinements noted above. Operator has Now Tradable and Trade Inbox panels/endpoints, candidate labels and refusal reasons, tracker-promoted rows, read-only contract tests, and CI contract smoke. Keep TG/X and KOL context excluded from ranking until source-call coverage becomes rankable.
 
 ### BL-NEW-SIGNAL-TRUST-ROADMAP: convert Gecko-Alpha from signal collector to trustable signal system
-**Status:** PARTIALLY-SHIPPED / OPEN-PR 2026-05-26 - registry and Signal Trust tab shipped; per-signal scorecards remain relevant in PR #276 but require rebase against current dashboard/dist before merge.
+**Status:** PARTIALLY-SHIPPED 2026-05-27 - registry and Signal Trust tab shipped in PR #239; per-signal scorecards shipped in replacement PR #289. PR #276 is closed/superseded. Remaining roadmap items below require fresh scope from current base.
 **Tag:** `signals` `trust` `actionability` `hermes-first` `live-readiness`
 **Why:** The signal layer has uneven maturity. `chain_completed` and `volume_spike` currently feel more useful than raw TG/X noise; `actionable=1` and `would_be_live=1` are strong filters; source-call health correctly warns when KOL/TG/X is not rankable. But narrative predictions can still create paper trades while their own reasoning says "weak fit"; TG/X remains unresolved/noisy; and open paper trades are too broad to be treated as a trustable signal surface.
 

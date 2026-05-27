@@ -37,6 +37,9 @@ Workflow checklist:
   per-item Track 3 re-scope gates.
 - [x] Build docs/status PR: updated `backlog.md`, `tasks/todo.md`, and
   findings/plan/design docs.
+- [x] PR review fold: corrected detailed roadmap stale statuses for
+  `BL-NEW-NARRATIVE-COUNTER-RISK-INTO-TRADE-VIEW` and
+  `BL-NEW-SIGNAL-TRUST-ROADMAP`, not only the top snapshot.
 - [x] Verification:
   - `git diff --check` => clean.
   - `$env:UV_NATIVE_TLS='true'; uv sync --extra dev --group dev` => installed
