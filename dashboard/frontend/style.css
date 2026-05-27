@@ -260,6 +260,26 @@ body {
   border-bottom: 1px solid var(--color-border);
 }
 
+.todays-focus-usage {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.todays-focus-usage summary {
+  cursor: pointer;
+  color: var(--color-text-primary);
+}
+
+.todays-focus-usage pre {
+  margin: 8px 0 0;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .todays-focus-error {
   color: var(--color-accent-amber);
 }
@@ -355,6 +375,7 @@ body {
 
   .todays-focus-facts,
   .todays-focus-diagnostics,
+  .todays-focus-usage,
   .todays-focus-status {
     font-size: 11px;
   }

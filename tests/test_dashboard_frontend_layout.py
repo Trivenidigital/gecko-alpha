@@ -113,10 +113,16 @@ def test_todays_focus_tab_is_wired_with_local_storage_only_state():
     assert "cached_payload" in storage
     assert "actions_by_row_key" in storage
     assert "usage_counters" in storage
+    assert "usage_started_at" in storage
+    assert "buildUsageExport" in storage
     assert "localStorage" in storage
+    assert "Usage evidence" in panel
+    assert "JSON.stringify(usageExport, null, 2)" in panel
     assert "save_for_review" in panel
     assert "dismiss" in panel
     assert "note" in panel
+    assert "note:" not in storage
+    assert "note," not in storage
     assert "I'm in" not in panel
     assert "I’m in" not in panel
     assert not re.search(
@@ -134,6 +140,7 @@ def test_todays_focus_mobile_constraints_and_no_table_layout():
     assert "<table" not in panel.lower()
     assert "@media (max-width: 480px)" in css
     assert ".todays-focus-row" in css
+    assert ".todays-focus-usage" in css
     assert "min-width: 0" in css
     assert "width: 100%" in css
     assert re.search(r"\.todays-focus-row\s*\{[^}]*padding:\s*(?:8|10)px", css, re.S)
