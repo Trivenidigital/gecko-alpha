@@ -2,7 +2,7 @@
 
 ## Active Work: 2026-05-27 - Eligible Scanner Hygiene Sweep
 
-**Status:** STAGED-FOR-DEPLOY / PR REVIEW PENDING. Goal: finish the eligible
+**Status:** SHIPPED / PR REVIEW PASSED. Goal: finish the eligible
 VPS scanner hygiene backlog items without changing signal policy, alert
 qualification, ranking, dispatch, paper-trade, or live-trading behavior.
 
@@ -28,10 +28,10 @@ Workflow checklist:
   `artifacts/scanner_hygiene_2026_05_27/run-scanner-cycle.after.py`.
 - [x] Findings/status record added:
   `tasks/findings_scanner_hygiene_2026_05_27.md`.
-- [ ] PR review approval of the staged diff.
-- [ ] Deploy exact reviewed artifact to srilu with checksum pinning, backup,
+- [x] PR review approval of the staged diff.
+- [x] Deploy exact reviewed artifact to srilu with checksum pinning, backup,
   stat preservation, no-side-effect syntax validation, and rollback path.
-- [ ] Flip the three backlog rows from `STAGED-FOR-DEPLOY` to `SHIPPED` with
+- [x] Flip the three backlog rows from `STAGED-FOR-DEPLOY` to `SHIPPED` with
   deploy evidence.
 
 ## Active Work: 2026-05-26 - Trade Inbox Counter-Risk Context

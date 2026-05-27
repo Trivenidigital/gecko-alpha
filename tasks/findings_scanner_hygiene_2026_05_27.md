@@ -106,11 +106,44 @@ The scoped final-report checker ignores the intentionally preserved
 `print(json.dumps(...))` structured cycle summary and the wrapper-dependent
 `SCANNER_CYCLE:` summary print.
 
+## Deploy Evidence
+
+Phase 2 deployed the reviewed artifact to srilu on 2026-05-27.
+
+Baseline pre-deploy:
+
+```text
+1000 1000 gecko-agent gecko-agent 640 41948 /home/gecko-agent/run-scanner-cycle.py
+ff66878f451eb781cd3ddb0d1e877b07cb637caef11d6e894be3407912a9786e  /home/gecko-agent/run-scanner-cycle.py
+```
+
+Backup:
+
+```text
+backup=/home/gecko-agent/backups/run-scanner-cycle.py.20260527T010403Z
+1000 1000 gecko-agent gecko-agent 640 41948 /home/gecko-agent/backups/run-scanner-cycle.py.20260527T010403Z
+backup_sha=ff66878f451eb781cd3ddb0d1e877b07cb637caef11d6e894be3407912a9786e
+```
+
+Post-deploy validation:
+
+```text
+1000 1000 gecko-agent gecko-agent 640 42082 /home/gecko-agent/run-scanner-cycle.py
+final_sha=a9b0746455458c950124e28c2fd65afc07201968e24fd0f99ad585bc8e229580
+syntax-ok /home/gecko-agent/run-scanner-cycle.py
+923:        print(f"{Colors.CYAN}{Colors.BOLD}{summary}{Colors.END}")
+```
+
+Negative post-deploy greps returned no matches for:
+
+- `datetime\.utcnow(`
+- `log(f.*{e}`
+- `state.blockers.append(f.*{e}`
+- `log("\n`
+- `log(f"\n`
+
+The candidate temp file was removed after install.
+
 ## Status
 
-Phase 1 is `STAGED-FOR-DEPLOY 2026-05-27`.
-
-The VPS file has not been replaced in this phase. Phase 2 may deploy only the
-reviewed `run-scanner-cycle.after.py` artifact with checksum
-`A9B0746455458C950124E28C2FD65AFC07201968E24FD0F99AD585BC8E229580`, after PR
-review approves the staged diff.
+`SHIPPED 2026-05-27`.
