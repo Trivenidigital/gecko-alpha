@@ -1,5 +1,45 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-27 - Today's Focus V0
+
+**Status:** PLANNING. Goal: add a scarce, factual, dashboard-only review queue
+that helps the trader inspect the highest-attention current rows without
+introducing urgency tiers, advice copy, alerting, ranking, execution, sizing, or
+server-side personal trade state.
+
+Workflow checklist:
+- [x] Isolated worktree:
+  `.claude/worktrees/todays-focus-v0` on branch `feat/todays-focus-v0`.
+- [x] Runtime actionability-reason audit: prod sample contains only machine
+  labels (`v1_block_core_signal_mcap_below_10m`,
+  `v1_block_tg_social_low_n`, `v1_pass_core_signal_mcap_10_50m`,
+  `v1_pass_core_signal_mcap_50m_plus`); endpoint will still withhold reason
+  text that violates the factual-copy firewall.
+- [x] Plan drafted:
+  `tasks/plan_todays_focus_v0_2026_05_27.md`.
+- [x] Plan reviewed by two parallel agents and recommendations folded:
+  closed eligibility, no `action_label`/`trade_score`/`sort_key`/`why_now`,
+  sanitized counter facts, exact schema keys, `save_for_review` instead of
+  `watch`, and explicit localStorage state machine.
+- [x] Design drafted:
+  `tasks/design_todays_focus_v0_2026_05_27.md`.
+- [x] Design reviewed by two parallel agents and recommendations folded:
+  allowlist enum fields instead of free-text scanning, carry source coverage
+  diagnostics, add anti-scope meta flags, clarify client-only dismiss overlay,
+  preserve cached payload on fetch failure, and add frontend/dist static
+  firewall plus compact mobile constraints.
+- [ ] TDD red for endpoint, contract checker, dashboard wiring, localStorage
+  state, factual-copy firewall, and mobile layout.
+- [ ] Build backend endpoint, contract checker, frontend panel, tests, and dist.
+- [ ] Verification, PR creation, and two parallel PR reviews.
+
+Non-scope:
+- No Telegram alerts, alert qualification, urgency tiers, `TRADE_NOW`,
+  `WATCH_BREAKOUT`, buy/sell/consider language, composite score, future-runner
+  labels, source ranking, signal policy, paper-trade policy, live execution,
+  sizing, server-side personal-position storage, new DB table, cron, or
+  watchdog.
+
 ## Active Work: 2026-05-27 - Eligible Backlog Finish Current-State Sweep
 
 **Status:** PLANNING. Goal: finish every backlog item that is actually
