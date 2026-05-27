@@ -335,9 +335,10 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 `0 */2 * * * /root/gecko-alpha/scripts/hermes-no-agent-flag-check.sh --quiet || /path/to/alerter`
 
 ### BL-NEW-SCANNER-EXISTING-EXCEPTION-BOUNDING
-**Status:** PROPOSED 2026-05-20.
+**Status:** STAGED-FOR-DEPLOY 2026-05-27 via `tasks/findings_scanner_hygiene_2026_05_27.md`; VPS file not replaced until reviewed artifact deploy phase.
 **Why:** Vector B F1 finding during design review: existing `log(f"... {e}")` callsites in `/home/gecko-agent/run-scanner-cycle.py` (lines 65, 112, 285, 476, 650, 716) interpolate exception messages without bounding. New instrumentation hunks added `str(e)[:120]` truncation per Invariant 2 — but the existing sites are asymmetric. Not regressive; consistency cleanup.
 **Scope:** wrap each unbounded `{e}` site with `type(e).__name__` + `str(e)[:120]` pattern. ~6 line edits in run-scanner-cycle.py. VPS-only.
+**Staged evidence:** candidate artifact `artifacts/scanner_hygiene_2026_05_27/run-scanner-cycle.after.py` replaces the six targeted scanner exception logs; `rg -n "log\(f.*\{e\}"` returns no staged matches.
 
 ### BL-NEW-HERMES-CRON-SUBPROCESS-LIFECYCLE-AUDIT
 **Status:** AUDITED-DEFERRED 2026-05-20 (post-PR-#204 audit completed).
@@ -367,14 +368,16 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 **Constraint:** the design doc §3 already specifies this behavior ("deferred resolution pass at next cycle"); current implementation appears to not have it. Verify against design intent before adding the sweep.
 
 ### BL-NEW-SCANNER-DATETIME-UTCNOW-DEPRECATION
-**Status:** PROPOSED 2026-05-20.
+**Status:** STAGED-FOR-DEPLOY 2026-05-27 via `tasks/findings_scanner_hygiene_2026_05_27.md`; VPS file not replaced until reviewed artifact deploy phase.
 **Why:** `/home/gecko-agent/run-scanner-cycle.py` uses `datetime.utcnow()` which emits a DeprecationWarning under Python 3.12+. The warning text leaks into the cycle-report log via the `2>&1` redirect, occasionally interleaving mid-line with stdout content (per Vector A M2 + Vector B M1 at PR #204 review). Not a security issue (warning text is constant); cosmetic log hygiene.
 **Scope:** swap `datetime.utcnow()` → `datetime.now(timezone.utc)`. `timezone` already imported. Touchpoints: state.start_time (CycleState.__init__), `cutoff_time = datetime.now(timezone.utc) - timedelta(...)` already uses correct form; only `state.start_time` needs the swap.
+**Staged evidence:** runtime drift found three same-class `datetime.utcnow()` sites (`state.start_time`, `log(...)` timestamp, final-report duration). Candidate artifact stages all three so duration math stays aware/aware; `rg -n "datetime\.utcnow"` returns no staged matches.
 
 ### BL-NEW-SCANNER-PRINT-TO-LOG-CONSISTENCY
-**Status:** PROPOSED 2026-05-20.
+**Status:** STAGED-FOR-DEPLOY 2026-05-27 via `tasks/findings_scanner_hygiene_2026_05_27.md`; VPS file not replaced until reviewed artifact deploy phase.
 **Why:** Vector B F10 finding during design review: `/home/gecko-agent/run-scanner-cycle.py:691-713` (FINAL REPORT section) uses raw `print()` calls; the rest of the script uses the wrapped `log()` helper. Inconsistency is not a leak (current interpolations are counters/lengths) but is a future-maintenance trap.
 **Scope:** convert FINAL REPORT print() calls to log() (or vice versa for the new JSON-encoded summary emit). Trivial. VPS-only.
+**Staged evidence:** candidate artifact converts human-readable final-report print calls to `log(...)` while preserving structured JSON `print(json.dumps(...))` emits and the `SCANNER_CYCLE:` summary content.
 
 ### BL-NEW-ACTIONABILITY-GATE
 **Status:** SHIPPED 2026-05-19 — implemented by PR #181 (`7506adc`) and deployed to srilu; visibility follow-up shipped by PR #182 (`32df89d`).

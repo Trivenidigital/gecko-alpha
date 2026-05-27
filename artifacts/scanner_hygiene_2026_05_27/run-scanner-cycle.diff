@@ -1,0 +1,196 @@
+diff --git "a/artifacts\\scanner_hygiene_2026_05_27\\run-scanner-cycle.before.py" "b/artifacts\\scanner_hygiene_2026_05_27\\run-scanner-cycle.after.py"
+index e70d7bff..c1a6fcd5 100644
+--- "a/artifacts\\scanner_hygiene_2026_05_27\\run-scanner-cycle.before.py"
++++ "b/artifacts\\scanner_hygiene_2026_05_27\\run-scanner-cycle.after.py"
+@@ -46,7 +46,7 @@ class CycleState:
+         self.queue_length = 0
+         self.total_ops = 0
+         self.blockers = []
+-        self.start_time = datetime.utcnow()
++        self.start_time = datetime.now(timezone.utc)
+         # BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-FIX (2026-05-20):
+         # additive observability for per-stage timing diagnosis. JSON-encoded
+         # structured emit + kebab-case stage names to keep report-file grep
+@@ -73,7 +73,7 @@ class Colors:
+ def log(msg, color=Colors.BLUE, bold=False):
+     prefix = Colors.BOLD if bold else ""
+     suffix = Colors.END
+-    print(f"{prefix}{color}[{datetime.utcnow().isoformat()}]{Colors.END} {msg}")
++    print(f"{prefix}{color}[{datetime.now(timezone.utc).isoformat()}]{Colors.END} {msg}")
+
+
+ def _stage(name, fn, *args, **kwargs):
+@@ -137,8 +137,8 @@ def load_env():
+                     os.environ[key] = value
+         log(f"✓ Loaded environment from {ENV_PATH}", Colors.GREEN)
+     except Exception as e:
+-        log(f"✗ Failed to load .env: {e}", Colors.RED)
+-        state.blockers.append(f"Cannot read .env: {e}")
++        log(f"✗ Failed to load .env: {type(e).__name__}: {str(e)[:120]}", Colors.RED)
++        state.blockers.append(f"Cannot read .env: {type(e).__name__}: {str(e)[:120]}")
+
+ def check_prereqs():
+     """Verify all prerequisites are met"""
+@@ -183,8 +183,8 @@ def load_kol_list():
+         state.handles_scanned = handles
+         return handles
+     except Exception as e:
+-        state.blockers.append(f"Failed to parse KOL list: {e}")
+-        log(f"✗ Failed to parse KOL list: {e}", Colors.RED)
++        state.blockers.append(f"Failed to parse KOL list: {type(e).__name__}: {str(e)[:120]}")
++        log(f"✗ Failed to parse KOL list: {type(e).__name__}: {str(e)[:120]}", Colors.RED)
+         return []
+
+ def load_seen_tweets():
+@@ -291,7 +291,7 @@ def verify_hard_extraction_invariant(classifier_output, tweet_text):
+ # Component 1: kol_watcher
+ def run_kol_watcher(handles, seen_ids):
+     """Poll X API for new tweets from KOL handles"""
+-    log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
++    log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
+     log("1. KOL WATCHER - Fetching new tweets", Colors.CYAN, bold=True)
+     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
+
+@@ -359,10 +359,10 @@ def run_kol_watcher(handles, seen_ids):
+             log(f"  ✓ @{handle} ({idx}/{len(handles)}): {len([t for t in tweets_data.get('data', []) if (datetime.fromisoformat(t['created_at'].replace('Z', '+00:00')) if datetime.fromisoformat(t['created_at'].replace('Z', '+00:00')).tzinfo else datetime.fromisoformat(t['created_at'].replace('Z', '+00:00')).replace(tzinfo=timezone.utc)) >= cutoff_time and t['id'] not in seen_ids])} new", Colors.GREEN)
+
+         except Exception as e:
+-            log(f"  ✗ Error processing @{handle}: {e}", Colors.RED)
++            log(f"  ✗ Error processing @{handle}: {type(e).__name__}: {str(e)[:120]}", Colors.RED)
+             continue
+
+-    log(f"\n📊 Summary: {len(new_tweets)} new tweets from {len(handles)} handles", Colors.BOLD)
++    log(f"📊 Summary: {len(new_tweets)} new tweets from {len(handles)} handles", Colors.BOLD)
+     log(f"   Inspected: {state.tweets_inspected}, Duplicates: {state.duplicates}", Colors.BOLD)
+
+     state.new_tweets = new_tweets
+@@ -417,7 +417,7 @@ def _classify_one_with_backoff(idx, tweet, total):
+     All state.* mutations protected by _state_lock. No new log() / print()
+     call sites beyond the prod-carried ones (per Invariant 11).
+     """
+-    log(f"\n  📄 Tweet {idx}/{total} (@{tweet['author']}):")
++    log(f"  📄 Tweet {idx}/{total} (@{tweet['author']}):")
+     log(f"  {tweet['text'][:100]}{'...' if len(tweet['text']) > 100 else ''}", Colors.BLUE)
+
+     prompt = _build_classifier_prompt(tweet)
+@@ -550,7 +550,7 @@ def classify_tweets(new_tweets):
+     """Classify tweets in parallel via ThreadPoolExecutor at concurrency=3.
+
+     BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-APPLY (2026-05-20)."""
+-    log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
++    log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
+     log("2. NARRATIVE CLASSIFIER - Analyzing tweets", Colors.CYAN, bold=True)
+     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
+
+@@ -579,7 +579,7 @@ def classify_tweets(new_tweets):
+ # Component 3: coin_resolver
+ def resolve_coins(classified_events):
+     """Resolve contract addresses via gecko-alpha API"""
+-    log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
++    log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
+     log("3. COIN RESOLVER - Resolving contract addresses", Colors.CYAN, bold=True)
+     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
+
+@@ -627,7 +627,7 @@ def resolve_coins(classified_events):
+                         item['resolved_coin_id'] = None
+
+                 except Exception as e:
+-                    log(f"  ✗ Resolution error: {e}", Colors.RED)
++                    log(f"  ✗ Resolution error: {type(e).__name__}: {str(e)[:120]}", Colors.RED)
+                     item['resolved_coin_id'] = None
+
+         resolved_events.append(event)
+@@ -637,7 +637,7 @@ def resolve_coins(classified_events):
+ # Component 4: narrative_alert_dispatcher
+ def dispatch_alerts(resolved_events):
+     """Dispatch narrative alerts to gecko-alpha API"""
+-    log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
++    log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
+     log("4. NARRATIVE ALERT DISPATCHER - Sending alerts", Colors.CYAN, bold=True)
+     log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
+
+@@ -801,11 +801,11 @@ def dispatch_alerts(resolved_events):
+                     telemetry['posts_dropped'] += 1
+
+             except Exception as e:
+-                log(f"  ✗ Dispatch error: {e}", Colors.RED)
++                log(f"  ✗ Dispatch error: {type(e).__name__}: {str(e)[:120]}", Colors.RED)
+                 telemetry['posts_queued'] += 1
+
+     # Log telemetry
+-    log(f"\n📊 Dispatch Telemetry:", Colors.BOLD)
++    log(f"📊 Dispatch Telemetry:", Colors.BOLD)
+     log(f"   Items in: {telemetry['items_in']}", Colors.BOLD)
+     log(f"   Attempted: {telemetry['posts_attempted']}", Colors.BOLD)
+     log(f"   Succeeded: {telemetry['posts_succeeded']}", Colors.GREEN)
+@@ -854,7 +854,7 @@ def main():
+
+         # Check prerequisites
+         if not check_prereqs():
+-            log("\n✗ Prerequisites check failed", Colors.RED, bold=True)
++            log("✗ Prerequisites check failed", Colors.RED, bold=True)
+             for blocker in state.blockers:
+                 log(f"  • {blocker}", Colors.RED)
+             sys.exit(1)
+@@ -871,29 +871,29 @@ def main():
+         _stage("narrative-alert-dispatcher", dispatch_alerts, resolved_events)
+
+         # Final report
+-        log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
++        log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
+         log("FINAL REPORT", Colors.CYAN, bold=True)
+         log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
+
+-        duration = (datetime.utcnow() - state.start_time).total_seconds()
++        duration = (datetime.now(timezone.utc) - state.start_time).total_seconds()
+
+-        print(f"\n{Colors.BOLD}📈 Cycle Statistics:{Colors.END}")
+-        print(f"{Colors.BOLD}   Duration: {duration:.1f}s{Colors.END}")
+-        print(f"{Colors.BOLD}   Handles scanned: {len(state.handles_scanned)}{Colors.END}")
+-        print(f"{Colors.BOLD}   Tweets inspected: {state.tweets_inspected}{Colors.END}")
+-        print(f"{Colors.BOLD}   New tweets: {len(state.new_tweets)}{Colors.END}")
+-        print(f"{Colors.BOLD}   Alerts dispatched: {state.alerts_dispatched}{Colors.END}")
+-        print(f"{Colors.BOLD}   Duplicates: {state.duplicates}{Colors.END}")
+-        print(f"{Colors.BOLD}   Skips (low confidence): {state.skips}{Colors.END}")
+-        print(f"{Colors.BOLD}   Speculative CAs scrubbed: {state.speculative_cas_scrubbed}{Colors.END}")
+-        print(f"{Colors.BOLD}   Queue length: {state.queue_length}{Colors.END}")
++        log("📈 Cycle Statistics:", Colors.BLUE, bold=True)
++        log(f"   Duration: {duration:.1f}s", Colors.BLUE, bold=True)
++        log(f"   Handles scanned: {len(state.handles_scanned)}", Colors.BLUE, bold=True)
++        log(f"   Tweets inspected: {state.tweets_inspected}", Colors.BLUE, bold=True)
++        log(f"   New tweets: {len(state.new_tweets)}", Colors.BLUE, bold=True)
++        log(f"   Alerts dispatched: {state.alerts_dispatched}", Colors.BLUE, bold=True)
++        log(f"   Duplicates: {state.duplicates}", Colors.BLUE, bold=True)
++        log(f"   Skips (low confidence): {state.skips}", Colors.BLUE, bold=True)
++        log(f"   Speculative CAs scrubbed: {state.speculative_cas_scrubbed}", Colors.BLUE, bold=True)
++        log(f"   Queue length: {state.queue_length}", Colors.BLUE, bold=True)
+
+         if state.blockers:
+-            print(f"\n{Colors.RED}{Colors.BOLD}⚠️  Blockers:{Colors.END}")
++            log("⚠️  Blockers:", Colors.RED, bold=True)
+             for blocker in state.blockers:
+-                print(f"{Colors.RED}   • {blocker}{Colors.END}")
++                log(f"   • {blocker}", Colors.RED)
+         else:
+-            print(f"\n{Colors.GREEN}{Colors.BOLD}✅ No blockers - cycle completed successfully{Colors.END}")
++            log("✅ No blockers - cycle completed successfully", Colors.GREEN, bold=True)
+
+         # BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-FIX: structured
+         # cycle summary for greppability without parsing the colored
+@@ -918,13 +918,13 @@ def main():
+
+         # Summary line for cron delivery (preserved verbatim — the wrapper
+         # script's `grep -a 'SCANNER_CYCLE:'` selector relies on this).
+-        print(f"\n{Colors.CYAN}{Colors.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Colors.END}")
++        log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
+         summary = f"SCANNER_CYCLE: {len(state.new_tweets)} new tweets, {state.alerts_dispatched} alerts dispatched, {len(state.blockers)} blockers"
+         print(f"{Colors.CYAN}{Colors.BOLD}{summary}{Colors.END}")
+-        print(f"{Colors.CYAN}{Colors.BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Colors.END}")
++        log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", Colors.CYAN, bold=True)
+
+     except Exception as e:
+-        log(f"\n✗ Fatal error: {e}", Colors.RED, bold=True)
++        log(f"✗ Fatal error: {type(e).__name__}: {str(e)[:120]}", Colors.RED, bold=True)
+         import traceback
+         traceback.print_exc()
+         sys.exit(1)

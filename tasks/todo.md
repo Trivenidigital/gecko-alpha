@@ -1,5 +1,39 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-27 - Eligible Scanner Hygiene Sweep
+
+**Status:** STAGED-FOR-DEPLOY / PR REVIEW PENDING. Goal: finish the eligible
+VPS scanner hygiene backlog items without changing signal policy, alert
+qualification, ranking, dispatch, paper-trade, or live-trading behavior.
+
+Workflow checklist:
+- [x] Eligibility narrowed to the three scanner hygiene rows:
+  `BL-NEW-SCANNER-EXISTING-EXCEPTION-BOUNDING`,
+  `BL-NEW-SCANNER-DATETIME-UTCNOW-DEPRECATION`, and
+  `BL-NEW-SCANNER-PRINT-TO-LOG-CONSISTENCY`.
+- [x] Plan drafted:
+  `tasks/plan_eligible_backlog_sweep_2026_05_27.md`.
+- [x] Plan reviewed by two parallel agents and folds applied: correct backlog
+  ID, exclude broad stale todo cleanup, stage artifact before prod replace,
+  preserve owner/mode, and require checksum/stat/syntax/rollback evidence.
+- [x] Design drafted:
+  `tasks/design_eligible_backlog_sweep_2026_05_27.md`.
+- [x] Design reviewed by two parallel agents and folds applied: checksum
+  pinning, no-side-effect syntax validation, backup equivalence, active-process
+  guard, numeric stat capture, two-phase status, and explicit gated rows not to
+  touch.
+- [x] Runtime scanner fetched from srilu and staged under
+  `artifacts/scanner_hygiene_2026_05_27/`.
+- [x] Candidate artifact built:
+  `artifacts/scanner_hygiene_2026_05_27/run-scanner-cycle.after.py`.
+- [x] Findings/status record added:
+  `tasks/findings_scanner_hygiene_2026_05_27.md`.
+- [ ] PR review approval of the staged diff.
+- [ ] Deploy exact reviewed artifact to srilu with checksum pinning, backup,
+  stat preservation, no-side-effect syntax validation, and rollback path.
+- [ ] Flip the three backlog rows from `STAGED-FOR-DEPLOY` to `SHIPPED` with
+  deploy evidence.
+
 ## Active Work: 2026-05-26 - Trade Inbox Counter-Risk Context
 
 **Status:** BUILD VERIFYING. Goal: supersede stale Now Tradable-only PR #278
