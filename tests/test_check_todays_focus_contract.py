@@ -111,6 +111,21 @@ def test_banned_copy_is_critical():
     assert any("banned-language" in c for c in result.criticals)
 
 
+def test_action_language_variants_are_critical_in_copy():
+    for phrase in (
+        "act_now",
+        "act now",
+        "action_required",
+        "acting",
+        "now_tradeable",
+        "tradeable_now",
+    ):
+        payload = _payload([_row(entry_quality_facts=[phrase])])
+        result = _MOD.validate_payload(payload)
+        assert not result.is_clean, phrase
+        assert any("banned-language" in c for c in result.criticals), phrase
+
+
 def test_word_boundaries_avoid_buyer_and_buyback_false_positives():
     payload = _payload(
         [
@@ -142,6 +157,13 @@ def test_diagnostic_alert_and_source_rank_values_are_critical():
             )
         ]
     )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("forbidden alert/ranking diagnostic" in c for c in result.criticals)
+
+
+def test_action_language_variants_are_critical_in_diagnostics():
+    payload = _payload([_row(surfaces=["action_required"], risk_reasons=["act_now"])])
     result = _MOD.validate_payload(payload)
     assert not result.is_clean
     assert any("forbidden alert/ranking diagnostic" in c for c in result.criticals)

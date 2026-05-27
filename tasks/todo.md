@@ -52,9 +52,13 @@ Workflow checklist:
 - [x] PR creation and two parallel PR reviews:
   PR #297 opened; review fixes folded for cache TTL reset, 375px overflow,
   user-visible `act_now` leakage, and alert/source-rank diagnostic scanning.
+  Fast follow-up fold added action-language variants (`act_now`, `act now`,
+  `action_required`, `acting`, `now_tradeable`, `tradeable_now`) to the
+  Today’s Focus copy/diagnostic firewall while keeping internal Trade Inbox
+  group-count keys valid.
   Post-fix verification:
-  - focused Today’s Focus/dashboard tests => `31 passed`;
-  - broader dashboard slice => `141 passed`;
+  - focused Today’s Focus/dashboard tests => `33 passed`;
+  - broader dashboard slice => `143 passed`;
   - frontend build regenerated dist.
 
 Non-scope:

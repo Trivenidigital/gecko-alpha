@@ -156,6 +156,11 @@ def test_todays_focus_frontend_copy_stays_factual():
         r"\btarget\b",
         r"\btake\s+profit\b",
         r"\bstrong\s+buy\b",
+        r"\bact[_\s-]*now\b",
+        r"\baction[_\s-]*required\b",
+        r"\bacting\b",
+        r"\bnow[_\s-]*tradeable\b",
+        r"\btradeable[_\s-]*now\b",
     ):
         assert not re.search(forbidden, text)
 

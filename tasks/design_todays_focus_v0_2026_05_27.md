@@ -156,6 +156,11 @@ Forbidden patterns use word/phrase boundaries:
 - `\btake[\s_-]*profit\b`
 - `\bstrong[\s_-]*buy\b`
 - `\bmust[\s_-]*buy\b`
+- `\bact[\s_-]*now\b`
+- `\baction[\s_-]*required\b`
+- `\bacting\b`
+- `\bnow[\s_-]*tradeable\b`
+- `\btradeable[\s_-]*now\b`
 - ranking/alert tokens already guarded by the Trade Inbox checker, including
   `urgency`, `priority`, `alert`, `notify`, `operator_priority`,
   `trade_now`, `watch_breakout`, and `research_only`.
@@ -166,6 +171,8 @@ The copy scanner applies to user-visible copy fields (`entry_quality_facts`,
 labels. Enum/provenance fields such as `entry_quality` are checked against
 allowlists instead of free-text scanned, so source values like
 `acceptable_pullback` do not fail solely because they contain `pullback`.
+Internal source coverage maps may still use canonical Trade Inbox keys such as
+`act_now` when they are not rendered as row labels or factual copy.
 
 Counter flags are not rendered as-is. The builder accepts strings or dicts,
 extracts neutral fields (`label`, `type`, `name`, `reason`, `detail`), strips

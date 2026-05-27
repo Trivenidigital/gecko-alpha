@@ -147,7 +147,11 @@ word/phrase boundary regexes, not substring matching, so `buy` is banned but
 The endpoint must not expose source fields that already encode action/urgency
 semantics: `action_label`, `trade_score`, `sort_key`, or `why_now`. Use factual
 aliases only: `trade_inbox_group`, `window_state`, `entry_quality`,
-`source_corpus`, and `move_basis`.
+`source_corpus`, and `move_basis`. User-visible copy and diagnostics also ban
+source-state action variants such as `act_now`, `act now`, `action_required`,
+`acting`, `now_tradeable`, and `tradeable_now`; internal source coverage maps
+may still use canonical Trade Inbox keys where they are not rendered as row
+labels.
 
 ## Contract Schema
 
