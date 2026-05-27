@@ -209,12 +209,19 @@ Behavior:
   - `cached_payload`;
   - `cached_at`;
   - `last_refreshed_at`;
+  - `usage_started_at`;
   - `actions_by_row_key`;
   - `usage_counters`.
 - cache TTL: 60 minutes;
 - manual refresh bypasses TTL and preserves actions/notes;
 - `save_for_review` and `dismiss` update localStorage and force-refresh;
 - `note` persists local text only;
+- usage evidence is rendered from localStorage as sanitized JSON with
+  `usage_started_at`, refresh/cache timestamps, counters, row-state counts, and
+  cached row count. It deliberately omits note text and is never sent to the
+  backend.
+- `notes_saved` counts first non-empty note creation per row, not each
+  keystroke; `row_state_counts.notes` exposes current non-empty note count.
 - no `I’m in` state, server write, alert hook, or backend effect.
 
 Client overlay:

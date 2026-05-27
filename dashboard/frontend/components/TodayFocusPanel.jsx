@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import TokenLink from './TokenLink'
 import {
+  buildUsageExport,
   clearDismissed,
   loadTodayFocusState,
   recordSession,
@@ -81,6 +82,7 @@ export default function TodayFocusPanel() {
 
   const meta = payload?.meta || {}
   const dismissedCount = Object.values(actions).filter(v => v?.dismissed).length
+  const usageExport = useMemo(() => buildUsageExport(state), [state])
 
   return (
     <div className="todays-focus-panel">
@@ -103,6 +105,10 @@ export default function TodayFocusPanel() {
           read_only={String(meta.read_only ?? '?')} visibility_only={String(meta.visibility_only ?? '?')} rows={meta.rows_returned ?? 0} source_rows={meta.source_rows_considered ?? 0}
           {error ? <span className="todays-focus-error"> last fetch error={error}</span> : null}
         </div>
+        <details className="todays-focus-usage">
+          <summary>Usage evidence</summary>
+          <pre>{JSON.stringify(usageExport, null, 2)}</pre>
+        </details>
       </div>
 
       {rows.length === 0 ? (

@@ -1,5 +1,48 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-27 - Today's Focus Residual Closure
+
+**Status:** PR-READY. Goal: close PR #297 residuals that are eligible now:
+confirm the action-language firewall, audit prod `actionability_reason` values,
+make usage-read evidence exportable from localStorage, and land the related
+memory hygiene.
+
+Workflow checklist:
+- [x] Isolated worktree:
+  `.codex-worktrees/todays-focus-residuals` on branch
+  `feat/todays-focus-residuals`.
+- [x] Residual 1 checked: Today's Focus firewall already bans `act_now`,
+  `act now`, `action_required`, `acting`, `now_tradeable`, and
+  `tradeable_now` in rendered copy and diagnostics while preserving internal
+  Trade Inbox group keys.
+- [x] Residual 2 checked: prod `paper_trades.actionability_reason` distinct
+  values are only machine labels:
+  `v1_block_core_signal_mcap_below_10m`, `v1_block_tg_social_low_n`,
+  `v1_pass_core_signal_mcap_10_50m`, and
+  `v1_pass_core_signal_mcap_50m_plus`.
+- [x] Residual 3 build: add local-only Today's Focus usage evidence export in
+  the dashboard from existing localStorage counters; excludes note text and
+  does not write server state. Review fold: `notes_saved` now counts first
+  non-empty note creation per row rather than every keystroke.
+- [x] Memory hygiene: extend anti-scope runtime-contract memory with meta-flag
+  addendum and add closed-loop smoke memory.
+- [x] Review folds:
+  - product/anti-scope reviewer found no issues;
+  - frontend/runtime reviewer found note keystrokes inflated `notes_saved`;
+    folded by counting only first non-empty note creation per row and adding a
+    Node-backed storage regression test.
+- [x] Verification:
+  - prod actionability-reason audit returned four neutral machine labels;
+  - `uv run pytest -q tests/test_todays_focus_storage.py
+    tests/test_dashboard_frontend_layout.py tests/test_todays_focus_endpoint.py
+    tests/test_check_todays_focus_contract.py tests/test_check_dashboard_contracts.py`
+    => `34 passed`;
+  - broader dashboard contract slice including Trade Inbox/live candidates and
+    Today’s Focus => `144 passed`;
+  - `npm.cmd --prefix dashboard/frontend run build:codex` passed and refreshed
+    committed dist;
+  - local Vite smoke at `http://127.0.0.1:5177/` returned HTTP 200.
+
 ## Active Work: 2026-05-27 - Today's Focus V0
 
 **Status:** PLANNING. Goal: add a scarce, factual, dashboard-only review queue

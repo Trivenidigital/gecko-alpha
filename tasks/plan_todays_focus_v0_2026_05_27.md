@@ -101,7 +101,12 @@ Ship Today’s Focus plus Phase 3 V0 local state together:
 - controls: `save_for_review`, `dismiss`, `note`;
 - explicitly no “I’m in” state in V0;
 - storage: browser `localStorage` only;
-- usage counters: sessions, watch/dismiss actions, notes saved.
+- usage counters: sessions, save/dismiss actions, notes saved.
+- usage evidence is visible in a local-only dashboard details block as sanitized
+  JSON: timestamps, counters, row-state counts, and cached row count. It excludes
+  note text and never posts to the server.
+- `notes_saved` counts first non-empty note creation per row, not keystrokes;
+  current noted rows are also exposed as `row_state_counts.notes`.
 - local state is never used by backend curation, scoring, ordering, alerts, or
   alert qualification.
 
@@ -109,7 +114,8 @@ Storage key/state machine:
 
 - key: `gecko.todaysFocus.v0`;
 - fields: `schema_version`, `cached_payload`, `cached_at`,
-  `last_refreshed_at`, `actions_by_row_key`, and `usage_counters`;
+  `last_refreshed_at`, `usage_started_at`, `actions_by_row_key`, and
+  `usage_counters`;
 - schema mismatch or corrupt JSON clears cache and starts fresh;
 - manual/forced refresh updates `cached_payload` and `last_refreshed_at` while
   preserving actions and notes;
