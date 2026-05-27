@@ -1,5 +1,68 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-27 - Pending Trader-Surface Closeout
+
+**Status:** PR-READY. Goal: close the eight pending residuals from the
+Today's Focus / Trade Inbox work without forcing gated policy work. Items 1-5
+are already closed by PR #298 and prod evidence; items 6-7 remain
+re-scope/gated; item 8 is the eligible code change.
+
+Workflow checklist:
+- [x] Isolated worktree:
+  `.codex-worktrees/pending-items-closeout-20260527` on branch
+  `feat/pending-items-closeout-20260527`.
+- [x] Current-state checks:
+  - Today's Focus firewall already bans `act_now`, `act now`,
+    `action_required`, `acting`, `now_tradeable`, and `tradeable_now`;
+  - prod `paper_trades.actionability_reason` values are neutral machine
+    labels only;
+  - Today's Focus usage export exists through localStorage evidence;
+  - anti-scope runtime-contract memory has ratchet and meta-flag addenda;
+  - closed-loop smoke memory exists;
+  - PR #183 and PR #184 are already merged docs/audit records, with
+    implementation now re-scope-eligible rather than build-ready;
+  - `BL-NEW-TG-ALERT-QUALIFICATION-DESIGN` remains gated by tracker-promotion
+    soak plus measurement inputs.
+- [x] Plan drafted:
+  `tasks/plan_pending_trader_surface_closeout_2026_05_27.md`.
+- [x] Plan reviewed by two parallel reviewers and folds applied:
+  keep no-ranking/no-urgency/no-cross-id anti-scope explicit; make the
+  trade-decision watchdog enablement-aware; add safe row-shape handling and
+  dispatcher-event tests.
+- [x] Design drafted:
+  `tasks/design_pending_trader_surface_closeout_2026_05_27.md`.
+- [x] Design reviewed by two parallel reviewers and folds applied:
+  do not emit misleading `missing_price` dispatcher events; accept repeated
+  blocked events for watchdog freshness; skip all checks when
+  `TRADING_ENABLED=False`; avoid full `Settings()` construction in the cron
+  checker.
+- [x] Build item 8:
+  - extend `scripts/check_trade_decision_events.py` to check enabled
+    `gainers_early`, `losers_contrarian`, and `trending_catch` source tables,
+    with already-open paper rows excluded to match dispatcher eligibility;
+  - add fail-soft pre-engine `trade_decision_events` for
+    `losers_contrarian` and `trending_catch` filter/suppression branches;
+  - make dispatcher event payload extraction safe across differing snapshot
+    row shapes;
+  - update cron docs to describe multi-signal coverage.
+- [x] Verification and review folds:
+  - focused decision-event/trading-signal slice after implementation =>
+    `105 passed`;
+  - broader watchdog/dispatcher/engine/cron slice after review folds =>
+    `128 passed`;
+  - `git diff --check` => clean;
+  - three-vector review folds: exclude already-open paper rows from watchdog
+    source counts, rename idle status to `idle_no_recent_source_rows`, add
+    `trending_catch` missing-decision coverage, assert loser/trending mcap
+    decision-event rows, assert no false `missing_price` event, and clean stale
+    cron README entry-count wording.
+- [ ] Open PR, merge, and deploy.
+
+Non-scope:
+- No Telegram alert qualification, alert sends, urgency tiers, ranking,
+  cross-identifier resolver, signal policy, paper-trade policy, live execution,
+  sizing, new DB table, new cron line, source pruning, or paid/vendor call.
+
 ## Active Work: 2026-05-27 - Today's Focus Residual Closure
 
 **Status:** PR-READY. Goal: close PR #297 residuals that are eligible now:

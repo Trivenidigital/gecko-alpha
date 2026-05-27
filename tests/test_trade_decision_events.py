@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -103,6 +104,38 @@ async def _latest_decision(db, token_id: str):
 
 def _event_data(row) -> dict:
     return json.loads(row["event_data"])
+
+
+def _watchdog_env(**overrides: str) -> dict[str, str]:
+    env = {
+        **os.environ,
+        "TRADING_ENABLED": "true",
+        "PAPER_SIGNAL_LOSERS_CONTRARIAN_ENABLED": "true",
+        "PAPER_SIGNAL_TRENDING_CATCH_ENABLED": "true",
+    }
+    env.update(overrides)
+    return env
+
+
+def _create_watchdog_tables(conn) -> None:
+    conn.execute("CREATE TABLE gainers_snapshots (coin_id TEXT, snapshot_at TEXT)")
+    conn.execute("CREATE TABLE losers_snapshots (coin_id TEXT, snapshot_at TEXT)")
+    conn.execute("CREATE TABLE trending_snapshots (coin_id TEXT, snapshot_at TEXT)")
+    conn.execute(
+        "CREATE TABLE paper_trades (token_id TEXT, signal_type TEXT, status TEXT)"
+    )
+    conn.execute("""CREATE TABLE trade_decision_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_id TEXT NOT NULL,
+            signal_type TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            source_module TEXT NOT NULL,
+            signal_combo TEXT,
+            paper_trade_id INTEGER,
+            event_data TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
 
 
 async def test_trade_decision_events_table_created(db):
@@ -244,22 +277,7 @@ def test_trade_decision_event_checker_fails_when_tracker_rows_have_no_decisions(
     import sqlite3
 
     conn = sqlite3.connect(db_path)
-    conn.execute("""CREATE TABLE gainers_snapshots (
-            coin_id TEXT,
-            snapshot_at TEXT
-        )""")
-    conn.execute("""CREATE TABLE trade_decision_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token_id TEXT NOT NULL,
-            signal_type TEXT NOT NULL,
-            decision TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            source_module TEXT NOT NULL,
-            signal_combo TEXT,
-            paper_trade_id INTEGER,
-            event_data TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )""")
+    _create_watchdog_tables(conn)
     conn.execute(
         "INSERT INTO gainers_snapshots (coin_id, snapshot_at) VALUES (?, ?)",
         ("toes", datetime.now(timezone.utc).isoformat()),
@@ -279,10 +297,12 @@ def test_trade_decision_event_checker_fails_when_tracker_rows_have_no_decisions(
         text=True,
         capture_output=True,
         check=False,
+        env=_watchdog_env(),
     )
 
     assert result.returncode == 2
     assert json.loads(result.stdout)["status"] == "missing_recent_decisions"
+    assert json.loads(result.stdout)["missing_signals"] == ["gainers_early"]
 
 
 def test_trade_decision_event_checker_uses_datetime_semantics(tmp_path):
@@ -290,19 +310,7 @@ def test_trade_decision_event_checker_uses_datetime_semantics(tmp_path):
     import sqlite3
 
     conn = sqlite3.connect(db_path)
-    conn.execute("CREATE TABLE gainers_snapshots (coin_id TEXT, snapshot_at TEXT)")
-    conn.execute("""CREATE TABLE trade_decision_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token_id TEXT NOT NULL,
-            signal_type TEXT NOT NULL,
-            decision TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            source_module TEXT NOT NULL,
-            signal_combo TEXT,
-            paper_trade_id INTEGER,
-            event_data TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )""")
+    _create_watchdog_tables(conn)
     fresh_offset_ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     conn.execute(
         "INSERT INTO gainers_snapshots (coin_id, snapshot_at) VALUES (?, ?)",
@@ -337,6 +345,7 @@ def test_trade_decision_event_checker_uses_datetime_semantics(tmp_path):
         text=True,
         capture_output=True,
         check=False,
+        env=_watchdog_env(),
     )
 
     assert result.returncode == 0
@@ -348,19 +357,7 @@ def test_trade_decision_event_checker_ok_when_idle(tmp_path):
     import sqlite3
 
     conn = sqlite3.connect(db_path)
-    conn.execute("CREATE TABLE gainers_snapshots (coin_id TEXT, snapshot_at TEXT)")
-    conn.execute("""CREATE TABLE trade_decision_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token_id TEXT NOT NULL,
-            signal_type TEXT NOT NULL,
-            decision TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            source_module TEXT NOT NULL,
-            signal_combo TEXT,
-            paper_trade_id INTEGER,
-            event_data TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )""")
+    _create_watchdog_tables(conn)
     conn.commit()
     conn.close()
 
@@ -376,7 +373,215 @@ def test_trade_decision_event_checker_ok_when_idle(tmp_path):
         text=True,
         capture_output=True,
         check=False,
+        env=_watchdog_env(),
     )
 
     assert result.returncode == 0
-    assert json.loads(result.stdout)["status"] == "idle_no_recent_tracker_rows"
+    assert json.loads(result.stdout)["status"] == "idle_no_recent_source_rows"
+
+
+def test_trade_decision_event_checker_ignores_already_open_source_rows(tmp_path):
+    db_path = tmp_path / "watchdog.db"
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    _create_watchdog_tables(conn)
+    conn.execute(
+        "INSERT INTO gainers_snapshots (coin_id, snapshot_at) VALUES (?, ?)",
+        ("already-open", datetime.now(timezone.utc).isoformat()),
+    )
+    conn.execute(
+        "INSERT INTO paper_trades (token_id, signal_type, status) VALUES (?, ?, 'open')",
+        ("already-open", "gainers_early"),
+    )
+    conn.commit()
+    conn.close()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path("scripts/check_trade_decision_events.py")),
+            "--db",
+            str(db_path),
+            "--lookback-minutes",
+            "15",
+            "--signals",
+            "gainers_early",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=_watchdog_env(),
+    )
+
+    payload = json.loads(result.stdout)
+    assert result.returncode == 0
+    assert payload["status"] == "idle_no_recent_source_rows"
+    assert payload["signals"]["gainers_early"]["recent_source_rows"] == 0
+
+
+def test_trade_decision_event_checker_checks_requested_signal(tmp_path):
+    db_path = tmp_path / "watchdog.db"
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    _create_watchdog_tables(conn)
+    conn.execute(
+        "INSERT INTO losers_snapshots (coin_id, snapshot_at) VALUES (?, ?)",
+        ("dip", datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path("scripts/check_trade_decision_events.py")),
+            "--db",
+            str(db_path),
+            "--lookback-minutes",
+            "15",
+            "--signals",
+            "losers_contrarian",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=_watchdog_env(),
+    )
+
+    payload = json.loads(result.stdout)
+    assert result.returncode == 2
+    assert payload["missing_signals"] == ["losers_contrarian"]
+    assert payload["signals"]["losers_contrarian"]["recent_source_rows"] == 1
+
+
+def test_trade_decision_event_checker_checks_trending_signal(tmp_path):
+    db_path = tmp_path / "watchdog.db"
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    _create_watchdog_tables(conn)
+    conn.execute(
+        "INSERT INTO trending_snapshots (coin_id, snapshot_at) VALUES (?, ?)",
+        ("trend", datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path("scripts/check_trade_decision_events.py")),
+            "--db",
+            str(db_path),
+            "--lookback-minutes",
+            "15",
+            "--signals",
+            "trending_catch",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=_watchdog_env(),
+    )
+
+    payload = json.loads(result.stdout)
+    assert result.returncode == 2
+    assert payload["missing_signals"] == ["trending_catch"]
+    assert payload["signals"]["trending_catch"]["recent_source_rows"] == 1
+
+
+def test_trade_decision_event_checker_skips_disabled_signal(tmp_path):
+    db_path = tmp_path / "watchdog.db"
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    _create_watchdog_tables(conn)
+    conn.execute(
+        "INSERT INTO trending_snapshots (coin_id, snapshot_at) VALUES (?, ?)",
+        ("trend", datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path("scripts/check_trade_decision_events.py")),
+            "--db",
+            str(db_path),
+            "--lookback-minutes",
+            "15",
+            "--signals",
+            "trending_catch",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=_watchdog_env(PAPER_SIGNAL_TRENDING_CATCH_ENABLED="false"),
+    )
+
+    payload = json.loads(result.stdout)
+    assert result.returncode == 0
+    assert payload["status"] == "all_requested_signals_disabled"
+    assert payload["skipped_disabled_signals"] == ["trending_catch"]
+
+
+def test_trade_decision_event_checker_skips_all_when_trading_disabled(tmp_path):
+    db_path = tmp_path / "watchdog.db"
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    _create_watchdog_tables(conn)
+    conn.execute(
+        "INSERT INTO gainers_snapshots (coin_id, snapshot_at) VALUES (?, ?)",
+        ("toes", datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path("scripts/check_trade_decision_events.py")),
+            "--db",
+            str(db_path),
+            "--lookback-minutes",
+            "15",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=_watchdog_env(TRADING_ENABLED="false"),
+    )
+
+    payload = json.loads(result.stdout)
+    assert result.returncode == 0
+    assert payload["status"] == "trading_disabled"
+    assert payload["checked_signals"] == []
+
+
+def test_trade_decision_event_checker_rejects_unknown_signal(tmp_path):
+    db_path = tmp_path / "watchdog.db"
+    db_path.touch()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path("scripts/check_trade_decision_events.py")),
+            "--db",
+            str(db_path),
+            "--signals",
+            "gainers_early,not_real",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=_watchdog_env(),
+    )
+
+    payload = json.loads(result.stdout)
+    assert result.returncode == 5
+    assert payload["status"] == "unknown_signal"
+    assert payload["unknown_signals"] == ["not_real"]
