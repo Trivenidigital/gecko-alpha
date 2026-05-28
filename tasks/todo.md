@@ -1769,11 +1769,14 @@ Trader-feedback review converged on a sequence: ship low-risk derived-from-exist
 - Coverage rule: if >=80% per primary chain, render with explicit `Liquidity: unavailable` fallback for missing rows. If <80%, file backfill work before shipping UI.
 - Anti-scope: do NOT imply tradability unless venue mapping is confirmed per row. Render `Venue: unresolved` rather than guessing.
 
-### BL-NEW-TODAYS-FOCUS-LIQUIDITY-COVERAGE-AUDIT (PROPOSED — prerequisite)
+### BL-NEW-TODAYS-FOCUS-LIQUIDITY-COVERAGE-AUDIT (SHIPPED 2026-05-28)
 
-- Read-only diagnostic. For last 36h of Today's Focus rows, report % with valid liquidity_usd, % with resolved venue, broken down by chain and source_corpus.
-- Deliverable: findings doc + decision (ship with `unavailable` fallback / file backfill first / defer entire field).
-- Small read-only PR; no UI / schema changes.
+- Script: `scripts/audit_liquidity_coverage.py` (read-only, consumes live `/api/todays_focus`, joins to `candidates`).
+- Plan: `tasks/plan_liquidity_coverage_audit_2026_05_28.md` (v2 — design-review folded).
+- Findings: `tasks/findings_liquidity_coverage_audit_2026_05_28.md` (snapshot pending follow-up commit post-deploy).
+- Key design-review finding: `paper_trades.token_id` is NOT necessarily `candidates.contract_address` — script reports `joinable_to_candidates` vs `unjoinable_to_candidates` as first-class fields so a low coverage rate is not silently attributed to "missing liquidity" when the truth is "unjoinable key space."
+- Tracker-corpus liquidity is structurally absent (no CG-coin_id-keyed table has a liquidity column). Confirmed at `PRAGMA table_info` runtime, not hard-coded.
+- Branch-decision logic (e.g., 80% coverage threshold for PR-B paper-side ship vs backfill-first) lives in PR-B's plan.
 
 ### BL-NEW-TODAYS-FOCUS-SPARKLINE (PROPOSED — gated)
 
