@@ -95,3 +95,125 @@ def test_todays_focus_research_links_are_deterministic_and_encoded():
         "search?q=0xabc123000000000000000000000000000000abcd"
     )
     assert links["unknownChain"]["chartLabel"] == "Dex search"
+
+
+def test_todays_focus_fact_labels_are_factual_and_deny_unknown_fallbacks():
+    script = textwrap.dedent(
+        """
+        import {
+          blockCauseLabel,
+          buildFocusDetailRows,
+          primaryBlockFacts,
+          reasonLabel,
+        } from './dashboard/frontend/todayFocusFacts.js';
+
+        const row = {
+          token_id: '0xabc123000000000000000000000000000000abcd',
+          symbol: 'LONGTOKEN',
+          name: 'Long Token',
+          chain: 'base',
+          source_corpus: 'tracker',
+          trade_inbox_group: 'blocked',
+          window_state: 'open',
+          verdict: 'blocked',
+          entry_quality: 'data_insufficient',
+          opened_at: '2026-05-28T01:00:00Z',
+          opened_age_hours: 2.25,
+          current_price: null,
+          market_cap: 16500000,
+          price_change_24h: 29.4,
+          price_updated_at: null,
+          price_is_stale: true,
+          price_staleness_minutes: 1500,
+          current_move_pct: 29.4,
+          move_basis: 'tracker_detection',
+          block_reason_primary: 'NO_PRICE',
+          block_cause: 'data_quality',
+          risk_reasons: [
+            'tracker_only_no_paper_trade',
+            'detected_price_missing_or_invalid',
+            'price_timestamp_unparseable',
+            'act_now',
+          ],
+          inclusion_reasons: ['tracker_recent'],
+          counter_flag_facts: ['Counter flag count: 2'],
+        };
+
+        const output = {
+          known: [
+            reasonLabel('NO_PRICE'),
+            reasonLabel('STALE_PRICE'),
+            reasonLabel('NOT_ACTIONABLE'),
+            reasonLabel('BAD_TIMESTAMP'),
+            reasonLabel('DATA_INSUFFICIENT'),
+            reasonLabel('tracker_only_no_paper_trade'),
+            reasonLabel('entry_price_missing_or_invalid'),
+            reasonLabel('no_price_snapshot_for_token_id'),
+          ],
+          unknown: reasonLabel('watch_breakout'),
+          block: blockCauseLabel('data_quality'),
+          primary: primaryBlockFacts(row),
+          details: buildFocusDetailRows(row),
+        };
+        console.log(JSON.stringify(output));
+        """
+    )
+
+    output = _run_node(script)
+    rendered = json.dumps(output).lower()
+
+    assert output["unknown"] == "Unmapped reason"
+    assert "Price snapshot missing" in output["known"]
+    assert "Tracker-only row; no open paper trade" in output["known"]
+    assert output["block"] == "Data quality"
+    assert any(item == "Block cause: Data quality" for item in output["primary"])
+    assert any(
+        item["label"] == "Block reason" and item["value"] == "Price snapshot missing"
+        for item in output["details"]
+    )
+    assert any(
+        item["label"] == "Reason 2" and item["value"] == "Detected price missing"
+        for item in output["details"]
+    )
+    for forbidden in (
+        "watch_breakout",
+        "act_now",
+        "missing_or_invalid",
+        "v1_",
+        "buy",
+        "sell",
+        "consider",
+        "trade now",
+        "action required",
+        "entry is late",
+    ):
+        assert forbidden not in rendered
+
+
+def test_todays_focus_fact_detail_rows_tolerate_null_heavy_payload():
+    script = textwrap.dedent(
+        """
+        import { buildFocusDetailRows, primaryBlockFacts } from './dashboard/frontend/todayFocusFacts.js';
+
+        const row = {
+          token_id: 'minimal',
+          source_corpus: 'paper',
+          trade_inbox_group: 'review',
+          move_basis: 'paper_entry',
+          risk_reasons: null,
+          inclusion_reasons: null,
+          counter_flag_facts: null,
+        };
+        console.log(JSON.stringify({
+          primary: primaryBlockFacts(row),
+          details: buildFocusDetailRows(row),
+        }));
+        """
+    )
+
+    output = _run_node(script)
+
+    assert output["primary"] == []
+    assert len(output["details"]) >= 8
+    assert all("label" in item and "value" in item for item in output["details"])
+    assert any(item["value"] == "-" for item in output["details"])

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import TokenLink from './TokenLink'
 import { researchLinks } from '../todayFocusLinks.js'
+import { buildFocusDetailRows, primaryBlockFacts } from '../todayFocusFacts.js'
 import {
   buildUsageExport,
   clearDismissed,
@@ -50,6 +51,7 @@ export default function TodayFocusPanel() {
   const [state, setState] = useState(() => recordSession(loadTodayFocusState()))
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
+  const [expandedRows, setExpandedRows] = useState(() => new Set())
 
   const payload = state.cached_payload
   const actions = state.actions_by_row_key || {}
@@ -81,6 +83,18 @@ export default function TodayFocusPanel() {
   const handleAction = (rowKey, patch, refresh = false) => {
     setState(prev => updateRowAction(prev, rowKey, patch))
     if (refresh) refreshFocus(true)
+  }
+
+  const toggleExpanded = (rowKey) => {
+    setExpandedRows(prev => {
+      const next = new Set(prev)
+      if (next.has(rowKey)) {
+        next.delete(rowKey)
+      } else {
+        next.add(rowKey)
+      }
+      return next
+    })
   }
 
   const restoreDismissed = () => {
@@ -130,6 +144,9 @@ export default function TodayFocusPanel() {
               const action = actions[row.row_key] || {}
               const title = rowTitle(row)
               const links = researchLinks(row)
+              const isExpanded = expandedRows.has(row.row_key)
+              const blockFactLines = primaryBlockFacts(row)
+              const detailRows = isExpanded ? buildFocusDetailRows(row) : []
               return (
                 <div className="todays-focus-row" key={row.row_key}>
                   <div className="todays-focus-rank">{row.source_corpus === 'paper' ? 'P' : 'T'}</div>
@@ -167,7 +184,12 @@ export default function TodayFocusPanel() {
                           ) : null}
                         </span>
                         {row.block_cause ? (
-                          <span className="todays-focus-block-cause">block={row.block_cause}</span>
+                          <span
+                            className="todays-focus-block-cause"
+                            data-block={row.block_cause}
+                          >
+                            {blockFactLines.length > 0 ? blockFactLines.join(' | ') : ''}
+                          </span>
                         ) : null}
                         {action.save_for_review ? <span className="signal-badge fired">saved</span> : null}
                       </div>
@@ -184,12 +206,19 @@ export default function TodayFocusPanel() {
                       <div>{joinFacts(row.current_risk_facts)}</div>
                       {row.counter_flag_facts?.length ? <div>{joinFacts(row.counter_flag_facts)}</div> : null}
                     </div>
-                    <div className="todays-focus-diagnostics">
-                      <span>group={row.trade_inbox_group}</span>
-                      <span>state={row.window_state}</span>
-                      <span>seen={compactTime(row.opened_at)}</span>
-                      <span>price_at={compactTime(row.price_updated_at)}</span>
-                    </div>
+                    {isExpanded ? (
+                      <div className="todays-focus-detail-grid">
+                        {detailRows.map((item, idx) => (
+                          <React.Fragment key={idx}>
+                            <div className="todays-focus-detail-label">{item.label}</div>
+                            <div className="todays-focus-detail-value">{item.value}</div>
+                          </React.Fragment>
+                        ))}
+                        {blockFactLines.length === 0 && !row.block_reason_primary ? (
+                          <div className="todays-focus-detail-empty">No block reason recorded</div>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </div>
                   <div className="todays-focus-actions">
                     <button
@@ -197,6 +226,13 @@ export default function TodayFocusPanel() {
                       onClick={() => handleAction(row.row_key, { save_for_review: !action.save_for_review }, true)}
                     >
                       {action.save_for_review ? 'Saved' : 'Save'}
+                    </button>
+                    <button
+                      className="tab-btn todays-focus-details-toggle"
+                      onClick={() => toggleExpanded(row.row_key)}
+                      aria-expanded={isExpanded ? 'true' : 'false'}
+                    >
+                      {isExpanded ? 'Hide' : 'Details'}
                     </button>
                     <button
                       className="tab-btn"
