@@ -131,6 +131,15 @@ def test_todays_focus_tab_is_wired_with_local_storage_only_state():
     assert "aria-label={`Open ${title.symbol} ${links.chartLabel}`}" in panel
     assert "aria-label={`Open ${title.symbol} ${links.cgLabel}`}" in panel
     assert "block={row.block_cause}" in panel
+    # PR #307 follow-up — a11y polish: Details button aria-controls the
+    # expanded detail panel by id; panel carries role="region".
+    assert "aria-controls={detailPanelId(row.row_key)}" in panel
+    assert "id={detailPanelId(row.row_key)}" in panel
+    assert "todays-focus-detail-panel-" in panel
+    assert 'role="region"' in panel
+    # PR #307 follow-up — dismiss clears stale expandedRows entry.
+    assert "patch.dismissed" in panel
+    assert "setExpandedRows" in panel
     assert panel.index("todays-focus-list") < panel.index("todays-focus-usage")
     assert "save_for_review" in panel
     assert "dismiss" in panel
