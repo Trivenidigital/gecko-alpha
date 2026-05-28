@@ -293,6 +293,43 @@ async def test_todays_focus_move_basis_is_explicit_for_paper_and_tracker(client)
     assert rows["tracker-move"]["move_basis"] == "tracker_detection"
 
 
+async def test_todays_focus_block_cause_reports_immediate_blocker(client):
+    c, db = client
+    now = datetime.now(timezone.utc)
+    await _insert_open_trade(
+        db._conn,
+        token_id="policy-stale",
+        actionable=0,
+        opened_at=(now - timedelta(hours=1)).isoformat(),
+        updated_at=(now - timedelta(hours=3)).isoformat(),
+    )
+    await _insert_gainer(
+        db._conn,
+        coin_id="structural-tracker",
+        detected_price=None,
+        current_price=103.0,
+        appeared_at=(now - timedelta(hours=1)).isoformat(),
+    )
+    await _insert_open_trade(
+        db._conn,
+        token_id="normal-paper",
+        opened_at=(now - timedelta(minutes=15)).isoformat(),
+    )
+
+    resp = await c.get("/api/todays_focus?window_hours=36")
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    _assert_todays_focus_contract(payload)
+    rows = {row["token_id"]: row for row in payload["rows"]}
+    assert rows["policy-stale"]["trade_inbox_group"] == "blocked"
+    assert rows["policy-stale"]["block_cause"] == "data_quality"
+    assert rows["structural-tracker"]["trade_inbox_group"] == "blocked"
+    assert rows["structural-tracker"]["block_cause"] == "data_quality"
+    assert "tracker_only_no_paper_trade" in rows["structural-tracker"]["risk_reasons"]
+    assert rows["normal-paper"]["block_cause"] is None
+
+
 async def test_todays_focus_sanitizes_counter_flag_copy(client):
     c, db = client
     await _insert_open_trade(db._conn, token_id="flagged")

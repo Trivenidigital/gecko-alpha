@@ -52,6 +52,7 @@ def _row(**overrides):
         "inclusion_reasons": ["open_paper_trade"],
         "risk_reasons": [],
         "block_reason_primary": None,
+        "block_cause": None,
     }
     base.update(overrides)
     return base
@@ -192,3 +193,12 @@ def test_duplicate_row_key_is_critical():
     result = _MOD.validate_payload(_payload([row, copy.deepcopy(row)]))
     assert not result.is_clean
     assert any("duplicate row_key" in c for c in result.criticals)
+
+
+def test_invalid_block_cause_is_critical():
+    payload = _payload([_row(block_cause="urgent")])
+
+    result = _MOD.validate_payload(payload)
+
+    assert not result.is_clean
+    assert any("block_cause" in c for c in result.criticals)

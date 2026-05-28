@@ -334,6 +334,7 @@ class TradeInboxResponse(BaseModel):
 TodaysFocusSourceCorpus = Literal["paper", "tracker"]
 TodaysFocusMoveBasis = Literal["paper_entry", "tracker_detection"]
 TodaysFocusGroup = Literal["review", "followup", "moved", "blocked"]
+TodaysFocusBlockCause = Literal["data_path", "data_quality", "unknown"]
 
 
 class TodaysFocusRow(BaseModel):
@@ -368,6 +369,7 @@ class TodaysFocusRow(BaseModel):
     inclusion_reasons: list[str] = Field(default_factory=list)
     risk_reasons: list[str] = Field(default_factory=list)
     block_reason_primary: str | None = None
+    block_cause: TodaysFocusBlockCause | None = None
 
 
 class TodaysFocusMeta(BaseModel):

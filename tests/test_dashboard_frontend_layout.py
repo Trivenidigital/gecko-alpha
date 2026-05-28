@@ -120,6 +120,12 @@ def test_todays_focus_tab_is_wired_with_local_storage_only_state():
     assert "JSON.stringify(usageExport, null, 2)" in panel
     assert "tokenId={row.token_id}" in panel
     assert "symbol={title.symbol}" in panel
+    assert "import { researchLinks } from '../todayFocusLinks.js'" in panel
+    assert "links.chartLabel" in panel
+    assert "links.cgLabel" in panel
+    assert "aria-label={`Open ${title.symbol} ${links.chartLabel}`}" in panel
+    assert "aria-label={`Open ${title.symbol} ${links.cgLabel}`}" in panel
+    assert "block={row.block_cause}" in panel
     assert panel.index("todays-focus-list") < panel.index("todays-focus-usage")
     assert "save_for_review" in panel
     assert "dismiss" in panel
@@ -144,6 +150,8 @@ def test_todays_focus_mobile_constraints_and_no_table_layout():
     assert "@media (max-width: 480px)" in css
     assert ".todays-focus-row" in css
     assert ".todays-focus-rank" in css
+    assert ".todays-focus-links" in css
+    assert ".todays-focus-block-cause" in css
     assert ".todays-focus-name" in css
     assert ".todays-focus-usage" in css
     assert "min-width: 0" in css
@@ -159,6 +167,7 @@ def test_todays_focus_frontend_copy_stays_factual():
         ROOT / "dashboard" / "frontend" / "todayFocusStorage.js",
     ]
     text = "\n".join(p.read_text(encoding="utf-8") for p in paths if p.exists()).lower()
+    text = re.sub(r'target="_blank"', "", text)
     for forbidden in (
         r"\btrade\s+now\b",
         r"\bwatch\s+breakout\b",

@@ -359,6 +359,38 @@ body {
   font-weight: 600;
 }
 
+.todays-focus-links {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.todays-focus-link-chip,
+.todays-focus-block-cause {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--color-border);
+  background: rgba(22, 27, 34, 0.88);
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.todays-focus-link-chip:hover {
+  color: var(--color-text-primary);
+  border-color: var(--color-accent-blue);
+}
+
+.todays-focus-block-cause {
+  color: var(--color-text-secondary);
+}
+
 .todays-focus-name {
   color: var(--color-text-secondary);
   font-size: 12px;
