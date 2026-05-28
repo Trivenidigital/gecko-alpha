@@ -435,11 +435,23 @@ def create_app(db_path: str | None = None) -> FastAPI:
             _db_path, limit_per_group=limit_per_group, window_hours=window_hours
         )
 
-    @app.get("/api/todays_focus", response_model=TodaysFocusResponse)
+    @app.get(
+        "/api/todays_focus",
+        response_model=TodaysFocusResponse,
+        response_model_exclude_none=True,
+    )
     async def get_todays_focus(
         window_hours: int = Query(36, ge=6, le=72),
     ):
-        """Read-only scarce factual review queue over Trade Inbox rows."""
+        """Read-only scarce factual review queue over Trade Inbox rows.
+
+        PR-C: response_model_exclude_none=True is critical so the optional
+        `price_path_points` field and `sparkline_is_visual_price_history_only`
+        meta flag are OMITTED entirely when None (absence semantic) rather
+        than serialized as JSON null. The contract firewall requires the
+        absence-vs-presence distinction; null would fail the strict-True
+        identity check.
+        """
         return await db.get_todays_focus(_db_path, window_hours=window_hours)
 
     @app.get("/api/trading/positions")
