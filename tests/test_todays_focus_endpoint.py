@@ -155,6 +155,22 @@ async def _insert_gainer(
     await conn.commit()
 
 
+async def _insert_volume_history_points(
+    conn, *, coin_id: str, n: int, now: datetime | None = None
+) -> None:
+    """PR-C: seed volume_history_cg with n recent price points for a coin_id."""
+    base = now or datetime.now(timezone.utc)
+    for i in range(n):
+        ts = (base - timedelta(hours=i * 1.5)).isoformat()
+        await conn.execute(
+            "INSERT INTO volume_history_cg "
+            "(coin_id, symbol, name, volume_24h, market_cap, price, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (coin_id, coin_id.upper()[:8], coin_id.title(), 1.0, 1.0, 100.0 + i, ts),
+        )
+    await conn.commit()
+
+
 async def _insert_prediction(conn, *, coin_id: str, counter_flags: list | str):
     flags_text = (
         counter_flags if isinstance(counter_flags, str) else json.dumps(counter_flags)
@@ -363,3 +379,74 @@ async def test_todays_focus_empty_state_is_factual(client):
     _assert_todays_focus_contract(payload)
     assert payload["rows"] == []
     assert payload["meta"]["empty_state"].startswith("No eligible Trade Inbox rows")
+
+
+# PR-C: sparkline regression tests. The Pydantic response_model strips
+# unknown fields by default; this caused the live API to omit sparkline
+# data even though dashboard/db.py populated it correctly. These tests
+# catch the model-vs-data drift at the endpoint layer.
+
+async def test_todays_focus_sparkline_field_survives_response_model(client):
+    c, db = client
+    await _insert_open_trade(db._conn, token_id="paper-sparkline")
+    await _insert_volume_history_points(
+        db._conn, coin_id="paper-sparkline", n=24
+    )
+
+    resp = await c.get("/api/todays_focus?window_hours=36")
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    paper_rows = [r for r in payload["rows"] if r["source_corpus"] == "paper"]
+    assert paper_rows, "expected at least one paper row in payload"
+    has_sparkline_row = any("price_path_points" in r for r in paper_rows)
+    assert has_sparkline_row, (
+        "TodaysFocusRow Pydantic model must allow price_path_points "
+        "to traverse the response_model serializer; see "
+        "feedback_response_model_vs_prod_data_shape memory."
+    )
+    sparkline_row = next(r for r in paper_rows if "price_path_points" in r)
+    assert len(sparkline_row["price_path_points"]) >= 12
+    for pair in sparkline_row["price_path_points"]:
+        assert isinstance(pair, list) and len(pair) == 2
+        assert isinstance(pair[0], int) and pair[0] > 0
+        assert isinstance(pair[1], (int, float)) and pair[1] > 0
+    assert (
+        payload["meta"].get("sparkline_is_visual_price_history_only") is True
+    )
+
+
+async def test_todays_focus_sparkline_omitted_below_density_floor(client):
+    """Below density floor: row has no price_path_points; meta flag absent."""
+    c, db = client
+    await _insert_open_trade(db._conn, token_id="paper-thin")
+    # Insert only 5 points — below the floor of 12.
+    await _insert_volume_history_points(db._conn, coin_id="paper-thin", n=5)
+
+    resp = await c.get("/api/todays_focus?window_hours=36")
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    for row in payload["rows"]:
+        # response_model_exclude_none=True must OMIT the field entirely
+        # (not serialize as null) for thin-density rows.
+        assert "price_path_points" not in row, (
+            f"price_path_points must be omitted (not null) below density "
+            f"floor; got {row.get('price_path_points')!r}"
+        )
+    # When no row has the field, meta flag must be absent (not False / null).
+    assert "sparkline_is_visual_price_history_only" not in payload["meta"]
+
+
+async def test_todays_focus_sparkline_field_is_none_excluded_not_null(client):
+    """response_model_exclude_none=True is the critical setting that prevents
+    Pydantic from serializing optional fields as JSON null. The contract
+    firewall requires absence (key missing), not presence-with-null."""
+    c, db = client
+    await _insert_open_trade(db._conn, token_id="paper-sparse")
+    # No volume_history_cg rows inserted at all.
+    resp = await c.get("/api/todays_focus?window_hours=36")
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    _assert_todays_focus_contract(payload)
+    for row in payload["rows"]:
+        assert "price_path_points" not in row
+    assert "sparkline_is_visual_price_history_only" not in payload["meta"]

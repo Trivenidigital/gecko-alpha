@@ -371,6 +371,13 @@ class TodaysFocusRow(BaseModel):
     block_reason_primary: str | None = None
     block_cause: TodaysFocusBlockCause | None = None
 
+    # PR-C: optional sparkline data. List of [unix_ts_int, price_float]
+    # pairs ordered ASC by recorded_at. Field is OMITTED when density is
+    # below SPARKLINE_DENSITY_FLOOR (signals "Sparkline unavailable" to
+    # client). exclude_none=True on the dump path is critical so the
+    # field disappears entirely when None — not serialized as null.
+    price_path_points: list[list[float]] | None = None
+
 
 class TodaysFocusMeta(BaseModel):
     read_only: bool = True
@@ -397,6 +404,11 @@ class TodaysFocusMeta(BaseModel):
     rows_returned: int
     eligible_rows_considered: int
     empty_state: str
+
+    # PR-C: optional sparkline meta flag. Present iff any row has
+    # price_path_points; strict-True identity (the contract firewall
+    # enforces this).
+    sparkline_is_visual_price_history_only: bool | None = None
 
 
 class TodaysFocusResponse(BaseModel):
