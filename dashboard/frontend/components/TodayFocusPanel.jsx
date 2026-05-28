@@ -82,6 +82,14 @@ export default function TodayFocusPanel() {
 
   const handleAction = (rowKey, patch, refresh = false) => {
     setState(prev => updateRowAction(prev, rowKey, patch))
+    if (patch && patch.dismissed) {
+      setExpandedRows(prev => {
+        if (!prev.has(rowKey)) return prev
+        const next = new Set(prev)
+        next.delete(rowKey)
+        return next
+      })
+    }
     if (refresh) refreshFocus(true)
   }
 
@@ -96,6 +104,8 @@ export default function TodayFocusPanel() {
       return next
     })
   }
+
+  const detailPanelId = (rowKey) => `todays-focus-detail-panel-${rowKey}`
 
   const restoreDismissed = () => {
     setState(prev => clearDismissed(prev))
@@ -207,9 +217,14 @@ export default function TodayFocusPanel() {
                       {row.counter_flag_facts?.length ? <div>{joinFacts(row.counter_flag_facts)}</div> : null}
                     </div>
                     {isExpanded ? (
-                      <div className="todays-focus-detail-grid">
+                      <div
+                        id={detailPanelId(row.row_key)}
+                        className="todays-focus-detail-grid"
+                        role="region"
+                        aria-label={`Inspection packet for ${title.symbol}`}
+                      >
                         {detailRows.map((item, idx) => (
-                          <React.Fragment key={idx}>
+                          <React.Fragment key={`${row.row_key}-${item.label}-${idx}`}>
                             <div className="todays-focus-detail-label">{item.label}</div>
                             <div className="todays-focus-detail-value">{item.value}</div>
                           </React.Fragment>
@@ -231,6 +246,7 @@ export default function TodayFocusPanel() {
                       className="tab-btn todays-focus-details-toggle"
                       onClick={() => toggleExpanded(row.row_key)}
                       aria-expanded={isExpanded ? 'true' : 'false'}
+                      aria-controls={detailPanelId(row.row_key)}
                     >
                       {isExpanded ? 'Hide' : 'Details'}
                     </button>

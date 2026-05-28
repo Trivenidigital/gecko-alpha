@@ -98,6 +98,43 @@ Forbidden examples (imperative + interpretive siblings — extended after design
 - `urgency`, `priority`, `alert`, `notify`
 - `watch breakout`, `entry is late`, `pullback`
 
+### Scope clarification (2026-05-28 follow-up to PR #307 review)
+
+The "Forbidden examples" list above is BROADER than the regex-enforced
+`BANNED_PATTERNS` list in `scripts/check_todays_focus_contract.py`. Two
+distinct surfaces, intentionally:
+
+1. **Regex-enforced `BANNED_PATTERNS`** (canonical, runtime-asserted):
+   - Source of truth: `scripts/check_todays_focus_contract.py` lines 124-153
+     (26 entries today).
+   - Mirrored verbatim in JS at `dashboard/frontend/todayFocusFacts.js` via
+     the shard array. `test_banned_patterns_python_and_js_lists_stay_in_sync`
+     enforces exact equality at runtime.
+   - These are the entries the contract firewall trips on (both server-side
+     JSON scan and client-side helper-output scan).
+   - Words on this list have low false-positive risk on factual phrases —
+     e.g., `\bbuy\b`, `\btrade[\s_-]*now\b`, `\bact[\s_-]*now\b`.
+
+2. **Plan-doc "Forbidden examples"** (human-review guidance, NOT regex-enforced):
+   - Includes interpretive siblings such as `recommend`, `suggest`,
+     `looks like`, `appears`, `opportunity`, `ripe`, `ready`, `primed`,
+     `soon`, `imminent`, `expected to`, `likely to`, `optimal`, `favorable`,
+     `good entry`, `bad entry`.
+   - Several of these have legitimate factual uses ("ready to query",
+     "soon after", "appears in tracker", "favorable spread") that would
+     generate false-positive scanner trips if regex-enforced.
+   - These are guardrails for content reviewers and PR reviewers: copy
+     under review SHOULD avoid these words unless the surrounding context
+     is unambiguously factual.
+
+**Promotion path:** if a new variant on the human-review list demonstrates
+low false-positive risk and high signal value (i.e., the word's
+interpretive use dominates its factual use in this codebase), it can be
+promoted to the regex-enforced list. Add it to BOTH
+`scripts/check_todays_focus_contract.py` AND
+`dashboard/frontend/todayFocusFacts.js` shard array in the same PR; the
+list-equality test catches one-sided drift.
+
 ## Single Source of Truth for Banned Tokens (design review blocker fold)
 
 The Python contract checker at `scripts/check_todays_focus_contract.py` only scans the `/api/todays_focus` JSON response. The new JS helpers produce CLIENT-side copy that never traverses that scanner. To prevent drift between the two banned lists:
