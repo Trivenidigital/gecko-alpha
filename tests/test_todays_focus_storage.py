@@ -1,5 +1,7 @@
+import importlib.util
 import json
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -217,3 +219,45 @@ def test_todays_focus_fact_detail_rows_tolerate_null_heavy_payload():
     assert len(output["details"]) >= 8
     assert all("label" in item and "value" in item for item in output["details"])
     assert any(item["value"] == "-" for item in output["details"])
+
+
+def test_banned_patterns_python_and_js_lists_stay_in_sync():
+    """Single-source-of-truth: Python BANNED_PATTERNS must match JS BANNED_PATTERNS.
+
+    The JS helpers in ``todayFocusFacts.js`` produce client-side copy that does
+    NOT traverse the Python ``check_todays_focus_contract.py`` JSON scanner.
+    The JS file therefore declares its own ``BANNED_PATTERNS`` shard array.
+    Drift between the two lists silently weakens the client-side firewall.
+
+    This test compiles both lists at runtime and asserts exact source-string
+    equality (the regex ``.pattern`` / ``.source`` representation).
+    """
+
+    spec = importlib.util.spec_from_file_location(
+        "check_todays_focus_contract",
+        ROOT / "scripts" / "check_todays_focus_contract.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["check_todays_focus_contract"] = module
+    spec.loader.exec_module(module)
+    py_sources = [p.pattern for p in module.BANNED_PATTERNS]
+
+    script = textwrap.dedent(
+        """
+        import { BANNED_PATTERNS } from './dashboard/frontend/todayFocusFacts.js';
+        console.log(JSON.stringify(BANNED_PATTERNS.map(r => r.source)));
+        """
+    )
+    js_sources = _run_node(script)
+
+    assert isinstance(js_sources, list)
+    assert len(js_sources) == len(py_sources), (
+        "BANNED_PATTERNS length drift: "
+        f"python={len(py_sources)} js={len(js_sources)}"
+    )
+    assert js_sources == py_sources, (
+        "BANNED_PATTERNS source-string drift between Python and JS:\n"
+        f"  python_only={[s for s in py_sources if s not in js_sources]}\n"
+        f"  js_only={[s for s in js_sources if s not in py_sources]}\n"
+        f"  order_or_value_mismatch={[(i, p, j) for i, (p, j) in enumerate(zip(py_sources, js_sources)) if p != j]}"
+    )
