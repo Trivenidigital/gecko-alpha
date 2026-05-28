@@ -1785,10 +1785,13 @@ Trader-feedback review converged on a sequence: ship low-risk derived-from-exist
 - Coverage rule: require >=N price points (TBD via audit; suggested floor >=12 over 24h = ~one per 2h) on >=80% of rows per chain.
 - Anti-scope: no fake sparklines from sparse cache. If data is too sparse, render explicit `Price path: insufficient data`. No color severity on the line (no green for up / red for down — uniform stroke).
 
-### BL-NEW-TODAYS-FOCUS-PRICE-PATH-COVERAGE-AUDIT (PROPOSED — prerequisite)
+### BL-NEW-TODAYS-FOCUS-PRICE-PATH-COVERAGE-AUDIT (SHIPPED 2026-05-28)
 
-- Read-only diagnostic. For last 36h of Today's Focus rows, report point density (avg points per 24h window) per chain + source_corpus.
-- Deliverable: findings doc + decision (ship sparkline / file price-path collection first / defer entire viz).
+- Script: `scripts/audit_price_path_coverage.py` (read-only, consumes live `/api/todays_focus`, counts price points in `volume_history_cg` within configurable lookback).
+- Plan: `tasks/plan_price_path_coverage_audit_2026_05_28.md` (4 design-review blockers folded: source-of-truth scope; clock-source pin; 7d retention ceiling on `--lookback-hours`; ISO cutoff format match writer).
+- Findings: `tasks/findings_price_path_coverage_audit_2026_05_28.md` (snapshot pending follow-up commit post-deploy).
+- Scope: `volume_history_cg` only — markets-watcher cadence source. Other price+timestamp tables (`gainers_snapshots`, `losers_snapshots`, `momentum_7d`, `slow_burn_candidates`, `volume_spikes`) documented in `alternate_price_history_tables_present` schema_findings field but NOT counted; PR-C decides whether to widen.
+- Branch-decision threshold logic (e.g., "≥12 points per row for ≥80% of cohort") lives in PR-C's plan.
 
 ### BL-NEW-TODAYS-FOCUS-MARKET-CONTEXT-STRIP (PROPOSED — gated, factual benchmarks only)
 
