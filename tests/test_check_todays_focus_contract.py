@@ -202,3 +202,113 @@ def test_invalid_block_cause_is_critical():
 
     assert not result.is_clean
     assert any("block_cause" in c for c in result.criticals)
+
+
+# PR-C: sparkline contract firewall tests.
+
+_VALID_PAIRS = [[1_716_000_000 + i * 600, 100.0 + i * 0.1] for i in range(12)]
+
+
+def test_valid_sparkline_payload_with_meta_flag_passes():
+    row = _row(price_path_points=_VALID_PAIRS)
+    payload = _payload([row], sparkline_is_visual_price_history_only=True)
+    result = _MOD.validate_payload(payload)
+    assert result.is_clean, result.criticals
+
+
+def test_sparkline_without_meta_flag_is_critical():
+    row = _row(price_path_points=_VALID_PAIRS)
+    payload = _payload([row])  # No flag in meta
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any(
+        "sparkline_is_visual_price_history_only must be present" in c
+        for c in result.criticals
+    )
+
+
+def test_sparkline_meta_flag_false_is_critical():
+    row = _row(price_path_points=_VALID_PAIRS)
+    payload = _payload([row], sparkline_is_visual_price_history_only=False)
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any(
+        "must be exactly" in c and "True" in c for c in result.criticals
+    )
+
+
+def test_sparkline_meta_flag_truthy_one_is_critical():
+    """Strict identity (is True), not truthiness — reject `1`."""
+    row = _row(price_path_points=_VALID_PAIRS)
+    payload = _payload([row], sparkline_is_visual_price_history_only=1)
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_sparkline_meta_flag_string_true_is_critical():
+    row = _row(price_path_points=_VALID_PAIRS)
+    payload = _payload([row], sparkline_is_visual_price_history_only="true")
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_meta_flag_present_without_any_sparkline_row_is_critical():
+    payload = _payload([_row()], sparkline_is_visual_price_history_only=True)
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("must be absent" in c for c in result.criticals)
+
+
+def test_sparkline_field_absent_without_meta_flag_passes():
+    """The standard cohort: no row has sparkline, no flag in meta. Clean."""
+    result = _MOD.validate_payload(_payload([_row()]))
+    assert result.is_clean, result.criticals
+
+
+def test_sparkline_point_with_string_element_is_critical():
+    row = _row(price_path_points=[[1_716_000_000, "not_a_number"]])
+    payload = _payload([row], sparkline_is_visual_price_history_only=True)
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("price_path_points" in c for c in result.criticals)
+
+
+def test_sparkline_three_element_pair_is_critical():
+    row = _row(price_path_points=[[1_716_000_000, 100.0, 999.0]])
+    payload = _payload([row], sparkline_is_visual_price_history_only=True)
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_sparkline_negative_price_is_critical():
+    row = _row(price_path_points=[[1_716_000_000, -5.0]])
+    payload = _payload([row], sparkline_is_visual_price_history_only=True)
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_sparkline_zero_price_is_critical():
+    row = _row(price_path_points=[[1_716_000_000, 0.0]])
+    payload = _payload([row], sparkline_is_visual_price_history_only=True)
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_sparkline_negative_ts_is_critical():
+    row = _row(price_path_points=[[-1, 100.0]])
+    payload = _payload([row], sparkline_is_visual_price_history_only=True)
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_sparkline_unavailable_suffixed_string_is_banned():
+    """Plan §3 banned: 'Sparkline unavailable:' or '-' suffixed variants
+    leak interpretation. Test via empty-state which is copy-scanned.
+    Critical message uses casefolded text, so assertion is lowercase."""
+    payload = _payload(
+        [_row()],
+        empty_state="No rows — Sparkline unavailable: data thin in 24h window.",
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any("sparkline unavailable" in c.lower() for c in result.criticals)

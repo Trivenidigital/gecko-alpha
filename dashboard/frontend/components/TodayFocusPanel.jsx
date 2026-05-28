@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import TokenLink from './TokenLink'
+import Sparkline from './Sparkline'
 import { researchLinks } from '../todayFocusLinks.js'
 import { buildFocusDetailRows, primaryBlockFacts } from '../todayFocusFacts.js'
 import { formatDetectionAge } from '../todayFocusAge.js'
@@ -238,6 +239,16 @@ export default function TodayFocusPanel() {
                         <span className="todays-focus-detected">
                           {formatDetectionAge(row.opened_age_hours)}
                         </span>
+                        {Array.isArray(row.price_path_points) && row.price_path_points.length >= 2 ? (
+                          <Sparkline points={row.price_path_points} />
+                        ) : (
+                          <span
+                            className="todays-focus-sparkline-unavailable"
+                            aria-label="Sparkline unavailable"
+                          >
+                            Sparkline unavailable
+                          </span>
+                        )}
                       </div>
                     </div>
                     <div className="todays-focus-facts">

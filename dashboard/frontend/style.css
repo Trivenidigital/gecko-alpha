@@ -500,6 +500,20 @@ body {
   border-radius: 3px;
 }
 
+.todays-focus-sparkline {
+  display: inline-block;
+  vertical-align: middle;
+  stroke: var(--color-text-secondary);
+  stroke-width: 1px;
+  fill: none;
+}
+
+.todays-focus-sparkline-unavailable {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 @media (max-width: 480px) {
   .dashboard {
     max-width: 100vw;
@@ -544,7 +558,8 @@ body {
   .todays-focus-usage,
   .todays-focus-status,
   .todays-focus-detected,
-  .todays-focus-new-marker {
+  .todays-focus-new-marker,
+  .todays-focus-sparkline-unavailable {
     font-size: 11px;
   }
 }
