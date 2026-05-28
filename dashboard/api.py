@@ -435,22 +435,23 @@ def create_app(db_path: str | None = None) -> FastAPI:
             _db_path, limit_per_group=limit_per_group, window_hours=window_hours
         )
 
-    @app.get(
-        "/api/todays_focus",
-        response_model=TodaysFocusResponse,
-        response_model_exclude_none=True,
-    )
+    @app.get("/api/todays_focus")
     async def get_todays_focus(
         window_hours: int = Query(36, ge=6, le=72),
     ):
         """Read-only scarce factual review queue over Trade Inbox rows.
 
-        PR-C: response_model_exclude_none=True is critical so the optional
-        `price_path_points` field and `sparkline_is_visual_price_history_only`
-        meta flag are OMITTED entirely when None (absence semantic) rather
-        than serialized as JSON null. The contract firewall requires the
-        absence-vs-presence distinction; null would fail the strict-True
-        identity check.
+        PR-C hotfix: response_model removed entirely. The Pydantic
+        TodaysFocusResponse model couldn't simultaneously (a) include
+        legacy nullable fields like block_cause as JSON null AND (b)
+        exclude new optional fields like price_path_points when absent.
+        response_model_exclude_none=True stripped EVERYTHING null;
+        response_model_exclude_none=False emitted price_path_points: null
+        which failed the contract firewall's identity check. The dict
+        from db.get_todays_focus() already has the correct
+        absence-vs-null semantics; FastAPI returns it as-is. The contract
+        firewall provides stricter structural validation than Pydantic.
+        See feedback_response_model_vs_prod_data_shape memory.
         """
         return await db.get_todays_focus(_db_path, window_hours=window_hours)
 
