@@ -1,5 +1,7 @@
+import importlib.util
 import json
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -95,3 +97,167 @@ def test_todays_focus_research_links_are_deterministic_and_encoded():
         "search?q=0xabc123000000000000000000000000000000abcd"
     )
     assert links["unknownChain"]["chartLabel"] == "Dex search"
+
+
+def test_todays_focus_fact_labels_are_factual_and_deny_unknown_fallbacks():
+    script = textwrap.dedent(
+        """
+        import {
+          blockCauseLabel,
+          buildFocusDetailRows,
+          primaryBlockFacts,
+          reasonLabel,
+        } from './dashboard/frontend/todayFocusFacts.js';
+
+        const row = {
+          token_id: '0xabc123000000000000000000000000000000abcd',
+          symbol: 'LONGTOKEN',
+          name: 'Long Token',
+          chain: 'base',
+          source_corpus: 'tracker',
+          trade_inbox_group: 'blocked',
+          window_state: 'open',
+          verdict: 'blocked',
+          entry_quality: 'data_insufficient',
+          opened_at: '2026-05-28T01:00:00Z',
+          opened_age_hours: 2.25,
+          current_price: null,
+          market_cap: 16500000,
+          price_change_24h: 29.4,
+          price_updated_at: null,
+          price_is_stale: true,
+          price_staleness_minutes: 1500,
+          current_move_pct: 29.4,
+          move_basis: 'tracker_detection',
+          block_reason_primary: 'NO_PRICE',
+          block_cause: 'data_quality',
+          risk_reasons: [
+            'tracker_only_no_paper_trade',
+            'detected_price_missing_or_invalid',
+            'price_timestamp_unparseable',
+            'act_now',
+          ],
+          inclusion_reasons: ['tracker_recent'],
+          counter_flag_facts: ['Counter flag count: 2'],
+        };
+
+        const output = {
+          known: [
+            reasonLabel('NO_PRICE'),
+            reasonLabel('STALE_PRICE'),
+            reasonLabel('NOT_ACTIONABLE'),
+            reasonLabel('BAD_TIMESTAMP'),
+            reasonLabel('DATA_INSUFFICIENT'),
+            reasonLabel('tracker_only_no_paper_trade'),
+            reasonLabel('entry_price_missing_or_invalid'),
+            reasonLabel('no_price_snapshot_for_token_id'),
+          ],
+          unknown: reasonLabel('watch_breakout'),
+          block: blockCauseLabel('data_quality'),
+          primary: primaryBlockFacts(row),
+          details: buildFocusDetailRows(row),
+        };
+        console.log(JSON.stringify(output));
+        """
+    )
+
+    output = _run_node(script)
+    rendered = json.dumps(output).lower()
+
+    assert output["unknown"] == "Unmapped reason"
+    assert "Price snapshot missing" in output["known"]
+    assert "Tracker-only row; no open paper trade" in output["known"]
+    assert output["block"] == "Data quality"
+    assert any(item == "Block cause: Data quality" for item in output["primary"])
+    assert any(
+        item["label"] == "Block reason" and item["value"] == "Price snapshot missing"
+        for item in output["details"]
+    )
+    assert any(
+        item["label"] == "Reason 2" and item["value"] == "Detected price missing"
+        for item in output["details"]
+    )
+    for forbidden in (
+        "watch_breakout",
+        "act_now",
+        "missing_or_invalid",
+        "v1_",
+        "buy",
+        "sell",
+        "consider",
+        "trade now",
+        "action required",
+        "entry is late",
+    ):
+        assert forbidden not in rendered
+
+
+def test_todays_focus_fact_detail_rows_tolerate_null_heavy_payload():
+    script = textwrap.dedent(
+        """
+        import { buildFocusDetailRows, primaryBlockFacts } from './dashboard/frontend/todayFocusFacts.js';
+
+        const row = {
+          token_id: 'minimal',
+          source_corpus: 'paper',
+          trade_inbox_group: 'review',
+          move_basis: 'paper_entry',
+          risk_reasons: null,
+          inclusion_reasons: null,
+          counter_flag_facts: null,
+        };
+        console.log(JSON.stringify({
+          primary: primaryBlockFacts(row),
+          details: buildFocusDetailRows(row),
+        }));
+        """
+    )
+
+    output = _run_node(script)
+
+    assert output["primary"] == []
+    assert len(output["details"]) >= 8
+    assert all("label" in item and "value" in item for item in output["details"])
+    assert any(item["value"] == "-" for item in output["details"])
+
+
+def test_banned_patterns_python_and_js_lists_stay_in_sync():
+    """Single-source-of-truth: Python BANNED_PATTERNS must match JS BANNED_PATTERNS.
+
+    The JS helpers in ``todayFocusFacts.js`` produce client-side copy that does
+    NOT traverse the Python ``check_todays_focus_contract.py`` JSON scanner.
+    The JS file therefore declares its own ``BANNED_PATTERNS`` shard array.
+    Drift between the two lists silently weakens the client-side firewall.
+
+    This test compiles both lists at runtime and asserts exact source-string
+    equality (the regex ``.pattern`` / ``.source`` representation).
+    """
+
+    spec = importlib.util.spec_from_file_location(
+        "check_todays_focus_contract",
+        ROOT / "scripts" / "check_todays_focus_contract.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["check_todays_focus_contract"] = module
+    spec.loader.exec_module(module)
+    py_sources = [p.pattern for p in module.BANNED_PATTERNS]
+
+    script = textwrap.dedent(
+        """
+        import { BANNED_PATTERNS } from './dashboard/frontend/todayFocusFacts.js';
+        console.log(JSON.stringify(BANNED_PATTERNS.map(r => r.source)));
+        """
+    )
+    js_sources = _run_node(script)
+
+    assert isinstance(js_sources, list)
+    assert len(js_sources) == len(py_sources), (
+        "BANNED_PATTERNS length drift: "
+        f"python={len(py_sources)} js={len(js_sources)}"
+    )
+    assert js_sources == py_sources, (
+        "BANNED_PATTERNS source-string drift between Python and JS:\n"
+        f"  python_only={[s for s in py_sources if s not in js_sources]}\n"
+        f"  js_only={[s for s in js_sources if s not in py_sources]}\n"
+        f"  order_or_value_mismatch={[(i, p, j) for i, (p, j) in enumerate(zip(py_sources, js_sources)) if p != j]}"
+    )

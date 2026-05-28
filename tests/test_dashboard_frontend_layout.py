@@ -121,8 +121,13 @@ def test_todays_focus_tab_is_wired_with_local_storage_only_state():
     assert "tokenId={row.token_id}" in panel
     assert "symbol={title.symbol}" in panel
     assert "import { researchLinks } from '../todayFocusLinks.js'" in panel
+    assert "import { buildFocusDetailRows, primaryBlockFacts } from '../todayFocusFacts.js'" in panel
     assert "links.chartLabel" in panel
     assert "links.cgLabel" in panel
+    assert "expandedRows" in panel
+    assert "todays-focus-details-toggle" in panel
+    assert "todays-focus-detail-grid" in panel
+    assert "todays-focus-detail-label" in panel
     assert "aria-label={`Open ${title.symbol} ${links.chartLabel}`}" in panel
     assert "aria-label={`Open ${title.symbol} ${links.cgLabel}`}" in panel
     assert "block={row.block_cause}" in panel
@@ -152,6 +157,9 @@ def test_todays_focus_mobile_constraints_and_no_table_layout():
     assert ".todays-focus-rank" in css
     assert ".todays-focus-links" in css
     assert ".todays-focus-block-cause" in css
+    assert ".todays-focus-detail-grid" in css
+    assert ".todays-focus-detail-label" in css
+    assert ".todays-focus-detail-value" in css
     assert ".todays-focus-name" in css
     assert ".todays-focus-usage" in css
     assert "min-width: 0" in css
@@ -159,12 +167,17 @@ def test_todays_focus_mobile_constraints_and_no_table_layout():
     assert "min-height: calc(100vh - 170px)" in css
     assert "grid-template-columns: 28px minmax(0, 1fr) minmax(220px, 0.32fr)" in css
     assert re.search(r"\.todays-focus-row\s*\{[^}]*padding:\s*(?:8|10)px", css, re.S)
+    mobile = re.search(r"@media \(max-width: 480px\).*", css, re.S)
+    assert mobile
+    assert ".todays-focus-detail-grid" in mobile.group(0)
+    assert "grid-template-columns: 1fr" in mobile.group(0)
 
 
 def test_todays_focus_frontend_copy_stays_factual():
     paths = [
         ROOT / "dashboard" / "frontend" / "components" / "TodayFocusPanel.jsx",
         ROOT / "dashboard" / "frontend" / "todayFocusStorage.js",
+        ROOT / "dashboard" / "frontend" / "todayFocusFacts.js",
     ]
     text = "\n".join(p.read_text(encoding="utf-8") for p in paths if p.exists()).lower()
     text = re.sub(r'target="_blank"', "", text)
@@ -205,3 +218,5 @@ def test_committed_dashboard_dist_references_existing_signal_trust_bundle():
 
     assert "/api/signal_trust/scorecards" in bundle_text
     assert "Closed paper-trade evidence" in bundle_text
+    assert "todays-focus-detail-grid" in bundle_text
+    assert "Price snapshot missing" in bundle_text
