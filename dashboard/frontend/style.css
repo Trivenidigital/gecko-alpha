@@ -485,6 +485,21 @@ body {
   white-space: nowrap;
 }
 
+.todays-focus-detected {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.todays-focus-new-marker {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  text-transform: lowercase;
+  padding: 0 4px;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+}
+
 @media (max-width: 480px) {
   .dashboard {
     max-width: 100vw;
@@ -527,7 +542,9 @@ body {
   .todays-focus-diagnostics,
   .todays-focus-detail-grid,
   .todays-focus-usage,
-  .todays-focus-status {
+  .todays-focus-status,
+  .todays-focus-detected,
+  .todays-focus-new-marker {
     font-size: 11px;
   }
 }
