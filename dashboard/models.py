@@ -376,7 +376,13 @@ class TodaysFocusRow(BaseModel):
     # below SPARKLINE_DENSITY_FLOOR (signals "Sparkline unavailable" to
     # client). exclude_none=True on the dump path is critical so the
     # field disappears entirely when None — not serialized as null.
-    price_path_points: list[list[float]] | None = None
+    #
+    # PR-C hotfix: declared as untyped `list[list]` rather than
+    # `list[list[float]]` because Pydantic v2 coerces inner element types,
+    # and `list[list[float]]` would float-cast the integer unix timestamp
+    # (1780010189 -> 1780010189.0). The contract firewall strict-checks
+    # `isinstance(ts, int)` so the float-coercion broke the contract.
+    price_path_points: list[list] | None = None
 
 
 class TodaysFocusMeta(BaseModel):
