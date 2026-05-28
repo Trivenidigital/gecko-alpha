@@ -61,7 +61,14 @@ Workflow checklist:
     earlier commit; current branch verified data-quality precedence at
     `dashboard/db.py`.
 - [x] CI: GitHub Actions `test` passed on run `26552939674`.
-- [ ] Merge, deploy, and smoke `/api/todays_focus`.
+- [x] Merge, deploy, and smoke `/api/todays_focus`:
+  - PR #304 merged via API as squash commit `31f11a4`;
+  - deployed to srilu with fast-forward `082f05a..31f11a4`;
+  - restarted `gecko-dashboard`, service active;
+  - smoke: dashboard HTTP 200; Today’s Focus contract `OK: 0 critical(s),
+    0 warning(s)`; `/api/todays_focus?window_hours=36` returned 5 rows from
+    175 source rows. Live top-five snapshot had no blocked rows, so
+    `block_cause=None` for all returned rows.
 
 Non-scope:
 - No ranking among the five rows, no urgency labels, no trade advice, no
