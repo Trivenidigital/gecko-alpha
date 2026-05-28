@@ -140,6 +140,16 @@ def test_todays_focus_tab_is_wired_with_local_storage_only_state():
     # PR #307 follow-up — dismiss clears stale expandedRows entry.
     assert "patch.dismissed" in panel
     assert "setExpandedRows" in panel
+    # PR-A — detection age cell + new-since-last-view counter/marker.
+    assert "import { formatDetectionAge } from '../todayFocusAge.js'" in panel
+    assert "countNewRowKeys" in panel
+    assert "isRowKeyNewSinceLastView" in panel
+    assert "markRowsSeen" in panel
+    assert "markCurrentRowsSeen" in panel
+    assert "todays-focus-detected" in panel
+    assert "todays-focus-new-marker" in panel
+    assert "new since last view" in panel
+    assert "formatDetectionAge(row.opened_age_hours)" in panel
     assert panel.index("todays-focus-list") < panel.index("todays-focus-usage")
     assert "save_for_review" in panel
     assert "dismiss" in panel
@@ -171,6 +181,9 @@ def test_todays_focus_mobile_constraints_and_no_table_layout():
     assert ".todays-focus-detail-value" in css
     assert ".todays-focus-name" in css
     assert ".todays-focus-usage" in css
+    # PR-A — detection age + new-since marker CSS classes present.
+    assert ".todays-focus-detected" in css
+    assert ".todays-focus-new-marker" in css
     assert "min-width: 0" in css
     assert "width: 100%" in css
     assert "min-height: calc(100vh - 170px)" in css
@@ -187,6 +200,8 @@ def test_todays_focus_frontend_copy_stays_factual():
         ROOT / "dashboard" / "frontend" / "components" / "TodayFocusPanel.jsx",
         ROOT / "dashboard" / "frontend" / "todayFocusStorage.js",
         ROOT / "dashboard" / "frontend" / "todayFocusFacts.js",
+        # PR-A — extend factual-copy scan to cover the relative-age formatter.
+        ROOT / "dashboard" / "frontend" / "todayFocusAge.js",
     ]
     text = "\n".join(p.read_text(encoding="utf-8") for p in paths if p.exists()).lower()
     text = re.sub(r'target="_blank"', "", text)
@@ -229,3 +244,10 @@ def test_committed_dashboard_dist_references_existing_signal_trust_bundle():
     assert "Closed paper-trade evidence" in bundle_text
     assert "todays-focus-detail-grid" in bundle_text
     assert "Price snapshot missing" in bundle_text
+    # PR-A — relative-age formatter strings + new-since marker class shipped.
+    assert "m ago" in bundle_text
+    assert "h ago" in bundle_text
+    assert "d ago" in bundle_text
+    assert "todays-focus-new-marker" in bundle_text
+    assert "todays-focus-detected" in bundle_text
+    assert "new since last view" in bundle_text

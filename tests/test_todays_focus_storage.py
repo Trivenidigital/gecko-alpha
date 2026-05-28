@@ -261,3 +261,168 @@ def test_banned_patterns_python_and_js_lists_stay_in_sync():
         f"  js_only={[s for s in js_sources if s not in py_sources]}\n"
         f"  order_or_value_mismatch={[(i, p, j) for i, (p, j) in enumerate(zip(py_sources, js_sources)) if p != j]}"
     )
+
+
+def test_format_detection_age_covers_pinned_format_table():
+    """PR-A: formatDetectionAge must follow the pinned format table exactly."""
+    script = textwrap.dedent(
+        """
+        import { formatDetectionAge } from './dashboard/frontend/todayFocusAge.js';
+        const cases = [null, undefined, NaN, -1, 0, 0.0, 0.01, 0.5, 0.99, 1.0, 1.04, 1.4, 13.74, 23.9, 24, 25.0, 38.0, 167.9, 168, 200];
+        const out = cases.map(v => [String(v), formatDetectionAge(v)]);
+        console.log(JSON.stringify(out));
+        """
+    )
+    pairs = dict(_run_node(script))
+    assert pairs["null"] == "-"
+    assert pairs["undefined"] == "-"
+    assert pairs["NaN"] == "-"
+    assert pairs["-1"] == "-"
+    assert pairs["0"] == "< 1m ago"
+    assert pairs["0.01"] == "1m ago"
+    assert pairs["0.5"] == "30m ago"
+    assert pairs["0.99"] == "59m ago"
+    # 1.0 boundary: MUST render as hours, NOT '60m ago'
+    assert pairs["1"] == "1.0h ago"
+    assert pairs["1.04"] == "1.0h ago"
+    assert pairs["1.4"] == "1.4h ago"
+    assert pairs["13.74"] == "13.7h ago"
+    assert pairs["23.9"] == "23.9h ago"
+    # 24h boundary -> 1.0d ago
+    assert pairs["24"] == "1.0d ago"
+    assert pairs["25"] == "1.0d ago"
+    assert pairs["38"] == "1.6d ago"
+    # 7d cap -> '7d+ ago'
+    assert pairs["167.9"] == "7.0d ago"
+    assert pairs["168"] == "7d+ ago"
+    assert pairs["200"] == "7d+ ago"
+
+
+def test_format_detection_age_outputs_never_match_banned_patterns():
+    """PR-A: every formatDetectionAge output for the format-table inputs must
+    not match any BANNED_PATTERNS entry. Catches accidental drift into
+    interpretive copy if the implementer changes the helper later."""
+
+    spec = importlib.util.spec_from_file_location(
+        "check_todays_focus_contract",
+        ROOT / "scripts" / "check_todays_focus_contract.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["check_todays_focus_contract"] = module
+    spec.loader.exec_module(module)
+
+    script = textwrap.dedent(
+        """
+        import { formatDetectionAge } from './dashboard/frontend/todayFocusAge.js';
+        const inputs = [null, undefined, NaN, -1, 0, 0.01, 0.5, 0.99, 1.0, 1.04, 1.4, 13.74, 23.9, 24, 25.0, 38.0, 167.9, 168, 200];
+        const outputs = Array.from(new Set(inputs.map(v => formatDetectionAge(v))));
+        console.log(JSON.stringify(outputs));
+        """
+    )
+    outputs = _run_node(script)
+    for output in outputs:
+        for pattern in module.BANNED_PATTERNS:
+            assert not pattern.search(output), (
+                f"formatDetectionAge output {output!r} matches banned pattern "
+                f"{pattern.pattern!r}"
+            )
+
+
+def test_last_seen_row_keys_default_empty_for_new_state():
+    script = textwrap.dedent(
+        """
+        import { blankState } from './dashboard/frontend/todayFocusStorage.js';
+        const s = blankState(Date.parse('2026-05-28T00:00:00Z'));
+        console.log(JSON.stringify(s));
+        """
+    )
+    state = _run_node(script)
+    assert state["last_seen_row_keys"] == []
+
+
+def test_mark_rows_seen_replaces_set_and_normalizes():
+    script = textwrap.dedent(
+        """
+        import {
+          blankState,
+          markRowsSeen,
+        } from './dashboard/frontend/todayFocusStorage.js';
+
+        globalThis.localStorage = { setItem() {}, getItem() { return null; } };
+
+        let s = blankState(Date.parse('2026-05-28T00:00:00Z'));
+        s = markRowsSeen(s, ['row-a', 'row-b', null, '', 'row-a', 'row-c']);
+        console.log(JSON.stringify(s.last_seen_row_keys));
+        """
+    )
+    keys = _run_node(script)
+    assert keys == ["row-a", "row-b", "row-c"]
+
+
+def test_count_new_row_keys_against_last_seen_baseline():
+    script = textwrap.dedent(
+        """
+        import {
+          blankState,
+          countNewRowKeys,
+          isRowKeyNewSinceLastView,
+          markRowsSeen,
+        } from './dashboard/frontend/todayFocusStorage.js';
+
+        globalThis.localStorage = { setItem() {}, getItem() { return null; } };
+
+        let s = blankState(Date.parse('2026-05-28T00:00:00Z'));
+        const initial = countNewRowKeys(s, ['row-a', 'row-b', 'row-c']);
+        const initialIsNew = isRowKeyNewSinceLastView(s, 'row-a');
+
+        s = markRowsSeen(s, ['row-a', 'row-b']);
+        const afterSeenCount = countNewRowKeys(s, ['row-a', 'row-b', 'row-c']);
+        const aIsNew = isRowKeyNewSinceLastView(s, 'row-a');
+        const cIsNew = isRowKeyNewSinceLastView(s, 'row-c');
+
+        s = markRowsSeen(s, []);
+        const afterClearCount = countNewRowKeys(s, ['row-a', 'row-b', 'row-c']);
+
+        console.log(JSON.stringify({
+          initial, initialIsNew,
+          afterSeenCount, aIsNew, cIsNew,
+          afterClearCount,
+        }));
+        """
+    )
+    out = _run_node(script)
+    # Empty baseline = all rows counted as new
+    assert out["initial"] == 3
+    assert out["initialIsNew"] is True
+    # After marking a + b seen, only c is new
+    assert out["afterSeenCount"] == 1
+    assert out["aIsNew"] is False
+    assert out["cIsNew"] is True
+    # Clearing baseline (markRowsSeen with []) makes everything new again
+    assert out["afterClearCount"] == 3
+
+
+def test_dismissed_then_reappearing_row_is_not_counted_as_new():
+    """PR-A reviewer Q: a row dismissed in session 1, present again in session 2,
+    should NOT be counted as 'new' once it was in the last_seen snapshot."""
+    script = textwrap.dedent(
+        """
+        import {
+          blankState,
+          countNewRowKeys,
+          markRowsSeen,
+        } from './dashboard/frontend/todayFocusStorage.js';
+
+        globalThis.localStorage = { setItem() {}, getItem() { return null; } };
+
+        let s = blankState(Date.parse('2026-05-28T00:00:00Z'));
+        // Session 1: user engaged with rows a, b
+        s = markRowsSeen(s, ['row-a', 'row-b']);
+        // Session 2: row-a still in payload (dismissed-then-reappeared scenario)
+        const count = countNewRowKeys(s, ['row-a', 'row-c']);
+        console.log(JSON.stringify({ count }));
+        """
+    )
+    out = _run_node(script)
+    # Only row-c is new; row-a was already seen
+    assert out["count"] == 1

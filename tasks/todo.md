@@ -1749,3 +1749,54 @@ Review:
 - VPIN BTC root causes: venv lacked `pytest-asyncio` despite dev dependency declaration, causing broad async-test collapse; remaining failures were production `.env` leaking into unit-test defaults/dashboard auth.
 - Verification: Srilu `/root/gecko-alpha` full native suite passed: `2707 passed, 11 skipped, 11 warnings`. VPIN `/opt/btc15minutebot` non-integration suite passed: `2543 passed, 10 deselected, 217 warnings`.
 - Residual: BTC venv was repaired in-place with `pytest-asyncio`; pyproject already declares it under dev extras, so no dependency-file change was needed. Pre-existing VPIN untracked files `.env.bak.20260318_214429` and `scripts/per_hour_contrarian_analysis.sql` were left untouched.
+
+## Today's Focus PR-A scope-reduction roadmap (2026-05-28)
+
+Trader-feedback review converged on a sequence: ship low-risk derived-from-existing-data improvements; gate data-dependent improvements on coverage audits; defer cohort-aggregate / regime-inference work.
+
+### BL-NEW-TODAYS-FOCUS-DETECTION-AGE-AND-NEW-SINCE — IN-FLIGHT as PR-A (2026-05-28)
+
+- Plan: `tasks/plan_todays_focus_detection_age_and_new_since_2026_05_28.md`
+- Status: IN-FLIGHT
+- Scope: main-row `Detected: Xh ago` cell + header `Y new since last view` counter + uniform per-row `new` marker. Engagement-driven baseline reset.
+- Anti-scope: no ranking, color severity, font-weight emphasis, sort changes, schema changes, or interpretive copy.
+- Closes on merge.
+
+### BL-NEW-TODAYS-FOCUS-LIQUIDITY-VENUE-FACTS (PROPOSED — gated)
+
+- Goal: surface chain + primary DEX/CEX venue + liquidity_usd + spread_pct on the main row.
+- **Gate:** depends on `BL-NEW-TODAYS-FOCUS-LIQUIDITY-COVERAGE-AUDIT`. Do not implement until coverage is measured per chain + per corpus over the last 36h.
+- Coverage rule: if >=80% per primary chain, render with explicit `Liquidity: unavailable` fallback for missing rows. If <80%, file backfill work before shipping UI.
+- Anti-scope: do NOT imply tradability unless venue mapping is confirmed per row. Render `Venue: unresolved` rather than guessing.
+
+### BL-NEW-TODAYS-FOCUS-LIQUIDITY-COVERAGE-AUDIT (PROPOSED — prerequisite)
+
+- Read-only diagnostic. For last 36h of Today's Focus rows, report % with valid liquidity_usd, % with resolved venue, broken down by chain and source_corpus.
+- Deliverable: findings doc + decision (ship with `unavailable` fallback / file backfill first / defer entire field).
+- Small read-only PR; no UI / schema changes.
+
+### BL-NEW-TODAYS-FOCUS-SPARKLINE (PROPOSED — gated)
+
+- Goal: inline 80px-wide 24h price sparkline per row to close ~50% of external chart-tab opens.
+- **Gate:** depends on `BL-NEW-TODAYS-FOCUS-PRICE-PATH-COVERAGE-AUDIT`.
+- Coverage rule: require >=N price points (TBD via audit; suggested floor >=12 over 24h = ~one per 2h) on >=80% of rows per chain.
+- Anti-scope: no fake sparklines from sparse cache. If data is too sparse, render explicit `Price path: insufficient data`. No color severity on the line (no green for up / red for down — uniform stroke).
+
+### BL-NEW-TODAYS-FOCUS-PRICE-PATH-COVERAGE-AUDIT (PROPOSED — prerequisite)
+
+- Read-only diagnostic. For last 36h of Today's Focus rows, report point density (avg points per 24h window) per chain + source_corpus.
+- Deliverable: findings doc + decision (ship sparkline / file price-path collection first / defer entire viz).
+
+### BL-NEW-TODAYS-FOCUS-MARKET-CONTEXT-STRIP (PROPOSED — gated, factual benchmarks only)
+
+- Goal: thin header strip showing benchmark deltas to give the trader regime context without leaving the dashboard.
+- Allowed content: `BTC 4h: +X.X% | SOL 4h: +X.X%` (and optionally ETH if operator wants). Factual benchmark deltas only.
+- **Forbidden content:** regime labels (`Regime: risk-on`), cohort aggregates (`Focus rows avg 24h +X%`), volatility labels (`high vol`, `quiet`), sentiment labels.
+- Reason: any aggregate over the Today's Focus cohort or interpretive label smuggles narrative — analyst caught this 2026-05-28.
+- Sequencing: small PR after PR-A measurement window clears. Requires deciding which benchmarks are stable (BTC + SOL are operator-known; SPX/ETH/DOGE require justification).
+
+### Cross-cutting discipline (applies to all four)
+
+- Measurement-first: most items wait for the 2-week usage read of Today's Focus V0 (target ~2026-06-11). PR-A is the exception because it's purely derived from existing payload fields and adds zero data-coverage dependencies.
+- Each subsequent PR must pin a curation rule, anti-scope, and merge gate in its plan doc, matching the discipline pattern from PR #297 / #307 / #308.
+- Coverage audits (BL-NEW-...-COVERAGE-AUDIT entries above) ship as their own small read-only PRs; their findings docs gate the corresponding build PRs.

@@ -11,12 +11,56 @@ export function blankState(nowMs = Date.now()) {
     last_refreshed_at: null,
     usage_started_at: nowIso,
     actions_by_row_key: {},
+    last_seen_row_keys: [],
     usage_counters: {
       sessions: 0,
       save_dismiss_actions: 0,
       notes_saved: 0,
     },
   }
+}
+
+function _normalizeRowKeys(input) {
+  if (!Array.isArray(input)) return []
+  const seen = new Set()
+  const out = []
+  for (const value of input) {
+    if (value == null) continue
+    const key = String(value)
+    if (!key.length || seen.has(key)) continue
+    seen.add(key)
+    out.push(key)
+  }
+  return out
+}
+
+export function markRowsSeen(state, rowKeys) {
+  const next = {
+    ...state,
+    last_seen_row_keys: _normalizeRowKeys(rowKeys),
+  }
+  saveTodayFocusState(next)
+  return next
+}
+
+export function countNewRowKeys(state, currentRowKeys) {
+  const seen = new Set(
+    Array.isArray(state?.last_seen_row_keys) ? state.last_seen_row_keys : []
+  )
+  const current = _normalizeRowKeys(currentRowKeys)
+  let count = 0
+  for (const key of current) {
+    if (!seen.has(key)) count += 1
+  }
+  return count
+}
+
+export function isRowKeyNewSinceLastView(state, rowKey) {
+  if (rowKey == null) return false
+  const key = String(rowKey)
+  if (!key.length) return false
+  const seen = Array.isArray(state?.last_seen_row_keys) ? state.last_seen_row_keys : []
+  return !seen.includes(key)
 }
 
 export function loadTodayFocusState(nowMs = Date.now()) {

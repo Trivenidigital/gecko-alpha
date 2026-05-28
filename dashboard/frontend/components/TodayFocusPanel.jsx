@@ -2,10 +2,14 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import TokenLink from './TokenLink'
 import { researchLinks } from '../todayFocusLinks.js'
 import { buildFocusDetailRows, primaryBlockFacts } from '../todayFocusFacts.js'
+import { formatDetectionAge } from '../todayFocusAge.js'
 import {
   buildUsageExport,
   clearDismissed,
+  countNewRowKeys,
+  isRowKeyNewSinceLastView,
   loadTodayFocusState,
+  markRowsSeen,
   recordSession,
   updateRowAction,
   withCachedPayload,
@@ -80,7 +84,13 @@ export default function TodayFocusPanel() {
     return (payload?.rows || []).filter(row => !actions[row.row_key]?.dismissed)
   }, [payload, actions])
 
+  const markCurrentRowsSeen = useCallback(() => {
+    const currentKeys = (payload?.rows || []).map(r => r.row_key)
+    setState(prev => markRowsSeen(prev, currentKeys))
+  }, [payload])
+
   const handleAction = (rowKey, patch, refresh = false) => {
+    markCurrentRowsSeen()
     setState(prev => updateRowAction(prev, rowKey, patch))
     if (patch && patch.dismissed) {
       setExpandedRows(prev => {
@@ -94,6 +104,7 @@ export default function TodayFocusPanel() {
   }
 
   const toggleExpanded = (rowKey) => {
+    markCurrentRowsSeen()
     setExpandedRows(prev => {
       const next = new Set(prev)
       if (next.has(rowKey)) {
@@ -108,12 +119,18 @@ export default function TodayFocusPanel() {
   const detailPanelId = (rowKey) => `todays-focus-detail-panel-${rowKey}`
 
   const restoreDismissed = () => {
+    markCurrentRowsSeen()
     setState(prev => clearDismissed(prev))
   }
 
   const meta = payload?.meta || {}
   const dismissedCount = Object.values(actions).filter(v => v?.dismissed).length
   const usageExport = useMemo(() => buildUsageExport(state), [state])
+  const currentRowKeys = useMemo(() => rows.map(r => r.row_key), [rows])
+  const newSinceCount = useMemo(
+    () => countNewRowKeys(state, currentRowKeys),
+    [state, currentRowKeys]
+  )
 
   return (
     <div className="todays-focus-panel">
@@ -127,6 +144,11 @@ export default function TodayFocusPanel() {
             <span className="todays-focus-meta">
               refreshed {compactTime(state.last_refreshed_at || meta.generated_at)}
             </span>
+            {newSinceCount > 0 ? (
+              <span className="todays-focus-meta">
+                {newSinceCount} new since last view
+              </span>
+            ) : null}
           </div>
           <div className="todays-focus-header-actions">
             {dismissedCount ? (
@@ -157,6 +179,7 @@ export default function TodayFocusPanel() {
               const isExpanded = expandedRows.has(row.row_key)
               const blockFactLines = primaryBlockFacts(row)
               const detailRows = isExpanded ? buildFocusDetailRows(row) : []
+              const isNewSinceLastView = isRowKeyNewSinceLastView(state, row.row_key)
               return (
                 <div className="todays-focus-row" key={row.row_key}>
                   <div className="todays-focus-rank">{row.source_corpus === 'paper' ? 'P' : 'T'}</div>
@@ -201,6 +224,9 @@ export default function TodayFocusPanel() {
                             {blockFactLines.length > 0 ? blockFactLines.join(' | ') : ''}
                           </span>
                         ) : null}
+                        {isNewSinceLastView ? (
+                          <span className="todays-focus-new-marker">new</span>
+                        ) : null}
                         {action.save_for_review ? <span className="signal-badge fired">saved</span> : null}
                       </div>
                       <div className="todays-focus-price">
@@ -209,6 +235,9 @@ export default function TodayFocusPanel() {
                         </span>
                         <span>{row.move_basis}</span>
                         <span>{fmtUsd(row.market_cap)}</span>
+                        <span className="todays-focus-detected">
+                          {formatDetectionAge(row.opened_age_hours)}
+                        </span>
                       </div>
                     </div>
                     <div className="todays-focus-facts">
