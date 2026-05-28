@@ -1885,7 +1885,55 @@ def _today_focus_block_cause(row: dict) -> str | None:
     return "unknown"
 
 
-def _today_focus_row(row: dict) -> dict:
+# PR-C: sparkline configuration constants. Density floor 12 pinned by plan
+# (below 12, the polyline interpolation gap exceeds 2h and the visual
+# misrepresents continuity). Lookback 24h is the standard sparkline window.
+SPARKLINE_DENSITY_FLOOR = 12
+SPARKLINE_LOOKBACK_HOURS = 24
+INFINITY_GUARD_MAX = 1e308
+
+
+async def _fetch_price_path_points(
+    db: "aiosqlite.Connection", coin_id: str, cutoff_iso: str
+) -> list[list]:
+    """Return list of [unix_ts: int, price: float] pairs for a coin_id.
+
+    Per PR-C: queries volume_history_cg with the same predicates as
+    audit_price_path_coverage.py (NULL/0/negative/Inf prices excluded;
+    boundary inclusive at cutoff). Unparseable recorded_at silently
+    skipped (defensive, matches audit behavior).
+    """
+    if not coin_id:
+        return []
+    try:
+        cursor = await db.execute(
+            "SELECT recorded_at, price FROM volume_history_cg "
+            "WHERE coin_id = ? AND recorded_at >= ? "
+            "AND price IS NOT NULL AND price > 0 AND price < ? "
+            "ORDER BY recorded_at ASC",
+            (coin_id, cutoff_iso, INFINITY_GUARD_MAX),
+        )
+        rows = await cursor.fetchall()
+    except Exception:
+        return []
+    out: list[list] = []
+    for r in rows:
+        try:
+            ts_str = r["recorded_at"] if "recorded_at" in r.keys() else r[0]
+            price = r["price"] if "price" in r.keys() else r[1]
+            ts_int = int(datetime.fromisoformat(ts_str).timestamp())
+            if ts_int <= 0:
+                continue
+            p = float(price)
+            if not (0 < p < INFINITY_GUARD_MAX):
+                continue
+            out.append([ts_int, p])
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return out
+
+
+def _today_focus_row(row: dict, *, price_path_points: list | None = None) -> dict:
     source = row.get("source_corpus") or "paper"
     move_basis = "paper_entry" if source == "paper" else "tracker_detection"
     group_label = TODAYS_FOCUS_GROUP_LABELS.get(row.get("group"), "unknown")
@@ -1932,7 +1980,7 @@ def _today_focus_row(row: dict) -> dict:
             _today_focus_fact("Block reason", row.get("block_reason_primary"))
         )
 
-    return {
+    out = {
         "row_key": f"{source}:{row.get('token_id')}",
         "token_id": row.get("token_id"),
         "symbol": row.get("symbol"),
@@ -1962,6 +2010,15 @@ def _today_focus_row(row: dict) -> dict:
         "block_reason_primary": row.get("block_reason_primary"),
         "block_cause": _today_focus_block_cause(row),
     }
+    # PR-C: optional price_path_points field. Included only when density
+    # is at or above the floor; absence signals "Sparkline unavailable"
+    # to the client (a separate semantic from empty array).
+    if (
+        price_path_points is not None
+        and len(price_path_points) >= SPARKLINE_DENSITY_FLOOR
+    ):
+        out["price_path_points"] = price_path_points
+    return out
 
 
 def _today_focus_candidate_rows(trade_payload: dict) -> list[dict]:
@@ -2033,46 +2090,74 @@ async def get_todays_focus(db_path: str, *, window_hours: int = 36) -> dict:
     )
     _take_rows(source_rows, selected=selected, seen=seen, limit=max_rows)
 
-    rows = [_today_focus_row(row) for row in selected[:max_rows]]
+    # PR-C: fetch price path points per row from volume_history_cg.
+    # Captured-once `now` matches the audit's clock-source pin.
+    now = datetime.now(timezone.utc)
+    cutoff_iso = (now - timedelta(hours=SPARKLINE_LOOKBACK_HOURS)).isoformat()
+    points_by_token: dict[str, list] = {}
+    try:
+        async with _ro_db(db_path) as sparkline_db:
+            for selected_row in selected[:max_rows]:
+                token_id = selected_row.get("token_id") or ""
+                if not token_id:
+                    continue
+                points_by_token[token_id] = await _fetch_price_path_points(
+                    sparkline_db, token_id, cutoff_iso
+                )
+    except Exception:
+        # Read-only fetch failure must not break the endpoint; rows just
+        # omit sparkline data (client renders "Sparkline unavailable").
+        points_by_token = {}
+
+    rows = [
+        _today_focus_row(
+            r,
+            price_path_points=points_by_token.get(r.get("token_id") or ""),
+        )
+        for r in selected[:max_rows]
+    ]
+    any_row_has_sparkline = any("price_path_points" in r for r in rows)
     trade_meta = trade_payload.get("meta") or {}
     empty_state = (
         f"No eligible Trade Inbox rows are available for Today's Focus. "
         f"Source window: {window_hours}h."
     )
-    return {
-        "meta": {
-            "read_only": True,
-            "not_trade_advice": True,
-            "visibility_only": True,
-            "experimental": True,
-            "not_for_alerting": True,
-            "not_for_execution": True,
-            "not_for_sizing": True,
-            "not_for_source_ranking": True,
-            "generated_at": trade_meta.get("generated_at")
-            or datetime.now(timezone.utc).isoformat(),
-            "source_endpoint": "/api/trade_inbox",
-            "source_window_hours": window_hours,
-            "source_limit_per_group": source_limit_per_group,
-            "source_rows_considered": int(
-                trade_meta.get("source_rows_considered") or 0
-            ),
-            "source_group_counts": dict(trade_meta.get("group_counts") or {}),
-            "source_truncated": bool(trade_meta.get("source_truncated")),
-            "tracker_source_truncated": bool(
-                trade_meta.get("tracker_source_truncated")
-            ),
-            "max_rows": max_rows,
-            "paper_target": paper_target,
-            "tracker_target": tracker_target,
-            "cache_ttl_minutes": 60,
-            "curation_policy": "fixed_recipe_3_paper_2_tracker_no_score",
-            "rows_returned": len(rows),
-            "eligible_rows_considered": len(source_rows),
-            "empty_state": empty_state,
-        },
-        "rows": rows,
+    meta = {
+        "read_only": True,
+        "not_trade_advice": True,
+        "visibility_only": True,
+        "experimental": True,
+        "not_for_alerting": True,
+        "not_for_execution": True,
+        "not_for_sizing": True,
+        "not_for_source_ranking": True,
+        "generated_at": trade_meta.get("generated_at")
+        or datetime.now(timezone.utc).isoformat(),
+        "source_endpoint": "/api/trade_inbox",
+        "source_window_hours": window_hours,
+        "source_limit_per_group": source_limit_per_group,
+        "source_rows_considered": int(
+            trade_meta.get("source_rows_considered") or 0
+        ),
+        "source_group_counts": dict(trade_meta.get("group_counts") or {}),
+        "source_truncated": bool(trade_meta.get("source_truncated")),
+        "tracker_source_truncated": bool(
+            trade_meta.get("tracker_source_truncated")
+        ),
+        "max_rows": max_rows,
+        "paper_target": paper_target,
+        "tracker_target": tracker_target,
+        "cache_ttl_minutes": 60,
+        "curation_policy": "fixed_recipe_3_paper_2_tracker_no_score",
+        "rows_returned": len(rows),
+        "eligible_rows_considered": len(source_rows),
+        "empty_state": empty_state,
     }
+    # PR-C: meta flag presence is conditional. Contract firewall enforces
+    # presence-iff-any-row-has-field with strict-True identity check.
+    if any_row_has_sparkline:
+        meta["sparkline_is_visual_price_history_only"] = True
+    return {"meta": meta, "rows": rows}
 
 
 async def get_live_candidates(

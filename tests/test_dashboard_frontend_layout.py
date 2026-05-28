@@ -150,6 +150,14 @@ def test_todays_focus_tab_is_wired_with_local_storage_only_state():
     assert "todays-focus-new-marker" in panel
     assert "new since last view" in panel
     assert "formatDetectionAge(row.opened_age_hours)" in panel
+    # PR-C — sparkline component import + per-row conditional render +
+    # factual "Sparkline unavailable" fallback string.
+    assert "import Sparkline from './Sparkline'" in panel
+    assert "row.price_path_points" in panel
+    assert "<Sparkline points={row.price_path_points} />" in panel
+    assert "todays-focus-sparkline-unavailable" in panel
+    assert "Sparkline unavailable" in panel
+    assert 'aria-label="Sparkline unavailable"' in panel
     assert panel.index("todays-focus-list") < panel.index("todays-focus-usage")
     assert "save_for_review" in panel
     assert "dismiss" in panel
@@ -184,6 +192,10 @@ def test_todays_focus_mobile_constraints_and_no_table_layout():
     # PR-A — detection age + new-since marker CSS classes present.
     assert ".todays-focus-detected" in css
     assert ".todays-focus-new-marker" in css
+    # PR-C — sparkline + fallback CSS classes present; mobile collapses them
+    # alongside the existing meta-chip font-size rule (no horizontal overflow).
+    assert ".todays-focus-sparkline" in css
+    assert ".todays-focus-sparkline-unavailable" in css
     assert "min-width: 0" in css
     assert "width: 100%" in css
     assert "min-height: calc(100vh - 170px)" in css
@@ -195,6 +207,38 @@ def test_todays_focus_mobile_constraints_and_no_table_layout():
     assert "grid-template-columns: 1fr" in mobile.group(0)
 
 
+def test_todays_focus_sparkline_component_has_no_banned_svg_substrings():
+    """PR-C strict structural guard: Sparkline.jsx source MUST contain only
+    `<polyline>` geometry. Banned tags (text/title/circle/rect/etc.) would
+    enable smuggling interpretation via SVG content; firewall is structural
+    by source-substring exclusion."""
+    sparkline = (
+        ROOT / "dashboard" / "frontend" / "components" / "Sparkline.jsx"
+    ).read_text(encoding="utf-8")
+    banned_tags = (
+        "<text",
+        "<tspan",
+        "<title",
+        "<desc",
+        "<foreignObject",
+        "<circle",
+        "<rect",
+        "<ellipse",
+        "<marker",
+        "<path",
+    )
+    for tag in banned_tags:
+        assert tag not in sparkline, (
+            f"Sparkline.jsx contains banned SVG tag substring {tag!r} — "
+            "anti-scope §4 (polyline-only)"
+        )
+    # aria-label is strict-pinned to the literal "Sparkline" — no other
+    # extension permitted. Test asserts the exact attribute string.
+    assert 'aria-label="Sparkline"' in sparkline
+    # Polyline is the only geometry permitted.
+    assert "<polyline" in sparkline
+
+
 def test_todays_focus_frontend_copy_stays_factual():
     paths = [
         ROOT / "dashboard" / "frontend" / "components" / "TodayFocusPanel.jsx",
@@ -202,6 +246,8 @@ def test_todays_focus_frontend_copy_stays_factual():
         ROOT / "dashboard" / "frontend" / "todayFocusFacts.js",
         # PR-A — extend factual-copy scan to cover the relative-age formatter.
         ROOT / "dashboard" / "frontend" / "todayFocusAge.js",
+        # PR-C — extend factual-copy scan to cover the Sparkline component.
+        ROOT / "dashboard" / "frontend" / "components" / "Sparkline.jsx",
     ]
     text = "\n".join(p.read_text(encoding="utf-8") for p in paths if p.exists()).lower()
     text = re.sub(r'target="_blank"', "", text)
@@ -251,3 +297,6 @@ def test_committed_dashboard_dist_references_existing_signal_trust_bundle():
     assert "todays-focus-new-marker" in bundle_text
     assert "todays-focus-detected" in bundle_text
     assert "new since last view" in bundle_text
+    # PR-C — sparkline className + fallback literal shipped to dist.
+    assert "todays-focus-sparkline" in bundle_text
+    assert "Sparkline unavailable" in bundle_text

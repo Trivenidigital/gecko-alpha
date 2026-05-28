@@ -60,6 +60,8 @@ const BANNED_PATTERN_SHARDS = [
   ['\\b', 'no', 'tify', '(?:\\b|[\\s_-])'],
   ['\\b', 'op', 'erator', '[\\s_-]*', 'pri', 'ority', '\\b'],
   ['\\b', 'res', 'earch', '[\\s_-]*', 'on', 'ly', '\\b'],
+  // PR-C: reject suffixed variants of the sparkline fallback string.
+  ['spark', 'line ', 'unav', 'ailable', '[:\\-]'],
 ]
 
 export const BANNED_PATTERNS = Object.freeze(

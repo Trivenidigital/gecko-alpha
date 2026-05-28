@@ -82,6 +82,14 @@ EXPECTED_ROW_KEYS = frozenset(
         "block_cause",
     }
 )
+# PR-C: keys allowed but not required. Their presence/absence is part of
+# the contract semantic (e.g., price_path_points absence signals
+# "unavailable" rather than empty). Adding to EXPECTED_ROW_KEYS would
+# force them mandatory; treating as OPTIONAL preserves the semantic.
+OPTIONAL_ROW_KEYS: frozenset[str] = frozenset({"price_path_points"})
+OPTIONAL_META_KEYS: frozenset[str] = frozenset(
+    {"sparkline_is_visual_price_history_only"}
+)
 
 ALLOWED_SOURCE_CORPUS = {"paper", "tracker"}
 ALLOWED_WINDOW_STATES = {"open", "closing", "late", "closed", "unknown"}
@@ -150,6 +158,11 @@ BANNED_PATTERNS = tuple(
         r"\bnotify(?:\b|[\s_-])",
         r"\boperator[\s_-]*priority\b",
         r"\bresearch[\s_-]*only\b",
+        # PR-C: reject suffixed variants of the sparkline fallback string.
+        # "Sparkline unavailable" (exact) is allowed by the frontend literal;
+        # any suffix like ": data thin", "- low density", etc., is banned.
+        # Pattern is lowercase to match _normalize_text casefolding.
+        r"sparkline unavailable[:\-]",
     )
 )
 FORBIDDEN_DIAGNOSTIC_PATTERNS = tuple(
@@ -261,7 +274,12 @@ def _is_number(value) -> bool:
 def _check_key(key: str, path: str, result: Result) -> None:
     if key in FORBIDDEN_KEYS:
         result.critical(f"{path}: forbidden source field {key!r}")
-    if key in EXPECTED_META_KEYS or key in EXPECTED_ROW_KEYS:
+    if (
+        key in EXPECTED_META_KEYS
+        or key in EXPECTED_ROW_KEYS
+        or key in OPTIONAL_ROW_KEYS
+        or key in OPTIONAL_META_KEYS
+    ):
         return
     lower = key.casefold()
     for pattern in FORBIDDEN_FIELD_PATTERNS:
@@ -334,11 +352,22 @@ def _walk_keys(value, path: str, result: Result) -> None:
 
 
 def _check_exact_keys(
-    obj: dict, expected: frozenset[str], path: str, result: Result
+    obj: dict,
+    expected: frozenset[str],
+    path: str,
+    result: Result,
+    *,
+    optional: frozenset[str] = frozenset(),
 ) -> None:
+    """Strict key-set check with optional-key support.
+
+    Required-but-absent keys (`expected - keys`) become critical findings.
+    Keys not in (`expected | optional`) become critical (unknown).
+    Keys in `optional` may be absent or present.
+    """
     keys = set(obj.keys())
     missing = expected - keys
-    unknown = keys - expected
+    unknown = keys - expected - optional
     if missing:
         result.critical(f"{path}: missing keys {sorted(missing)!r}")
     if unknown:
@@ -349,7 +378,9 @@ def _check_meta(meta, *, requested_window: int, result: Result) -> None:
     if not isinstance(meta, dict):
         result.critical(f"meta must be object; got {type(meta).__name__}")
         return
-    _check_exact_keys(meta, EXPECTED_META_KEYS, "meta", result)
+    _check_exact_keys(
+        meta, EXPECTED_META_KEYS, "meta", result, optional=OPTIONAL_META_KEYS
+    )
     for flag in (
         "read_only",
         "not_trade_advice",
@@ -411,7 +442,10 @@ def _check_row(row, idx: int, result: Result) -> None:
     if not isinstance(row, dict):
         result.critical(f"{path} must be object")
         return
-    _check_exact_keys(row, EXPECTED_ROW_KEYS, path, result)
+    _check_exact_keys(
+        row, EXPECTED_ROW_KEYS, path, result, optional=OPTIONAL_ROW_KEYS
+    )
+    _check_price_path_points(row, path, result)
 
     for field in ("row_key", "token_id", "source_corpus", "trade_inbox_group"):
         if not isinstance(row.get(field), str) or not row[field]:
@@ -482,6 +516,76 @@ def _check_row(row, idx: int, result: Result) -> None:
             result.critical(f"{path}.{field} must be list[str]")
 
 
+def _check_price_path_points(row: dict, path: str, result: Result) -> None:
+    """PR-C: validate the optional price_path_points field shape.
+
+    When present, must be a list of 2-element lists [int_ts, positive_finite_number].
+    Absence is allowed (signals "Sparkline unavailable" — handled client-side).
+    """
+    if "price_path_points" not in row:
+        return
+    points = row.get("price_path_points")
+    if not isinstance(points, list):
+        result.critical(f"{path}.price_path_points must be list")
+        return
+    for i, pair in enumerate(points):
+        if not isinstance(pair, list) or len(pair) != 2:
+            result.critical(
+                f"{path}.price_path_points[{i}] must be "
+                f"[int_ts, positive_finite_number]; got {pair!r}"
+            )
+            continue
+        ts, price = pair
+        if not isinstance(ts, int) or isinstance(ts, bool) or ts <= 0:
+            result.critical(
+                f"{path}.price_path_points[{i}][0] must be positive int; "
+                f"got {ts!r}"
+            )
+        if (
+            not isinstance(price, (int, float))
+            or isinstance(price, bool)
+            or not (0 < float(price) < 1e308)
+        ):
+            result.critical(
+                f"{path}.price_path_points[{i}][1] must be positive finite number; "
+                f"got {price!r}"
+            )
+
+
+def _check_sparkline_meta_flag(payload: dict, rows: list, result: Result) -> None:
+    """PR-C: when any row has price_path_points, meta flag must be exactly True.
+
+    Identity check (`is True`) — not truthiness — to reject `1`, `"true"`,
+    `1.0`, etc. When no row has the field, the flag MUST be absent (omitted),
+    not False.
+    """
+    any_row_has_points = any(
+        isinstance(r, dict) and "price_path_points" in r for r in rows
+    )
+    meta = payload.get("meta")
+    if not isinstance(meta, dict):
+        return
+    flag_present = "sparkline_is_visual_price_history_only" in meta
+    flag_value = meta.get("sparkline_is_visual_price_history_only")
+    if any_row_has_points:
+        if not flag_present:
+            result.critical(
+                "meta.sparkline_is_visual_price_history_only must be present "
+                "when any row has price_path_points"
+            )
+        elif flag_value is not True:
+            result.critical(
+                "meta.sparkline_is_visual_price_history_only must be exactly "
+                f"True (identity check); got {flag_value!r}"
+            )
+    else:
+        if flag_present:
+            result.critical(
+                "meta.sparkline_is_visual_price_history_only must be absent "
+                "when no row has price_path_points (omit rather than set False)"
+            )
+
+
 def validate_payload(payload, *, requested_window: int = 36) -> Result:
     result = Result()
     if not isinstance(payload, dict):
@@ -503,6 +607,7 @@ def validate_payload(payload, *, requested_window: int = 36) -> Result:
             row_keys.append(row["row_key"])
     if len(row_keys) != len(set(row_keys)):
         result.critical("duplicate row_key rows are not allowed")
+    _check_sparkline_meta_flag(payload, rows, result)
     meta = payload.get("meta")
     if isinstance(meta, dict):
         if meta.get("rows_returned") != len(rows):
