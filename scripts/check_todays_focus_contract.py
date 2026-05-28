@@ -79,6 +79,7 @@ EXPECTED_ROW_KEYS = frozenset(
         "inclusion_reasons",
         "risk_reasons",
         "block_reason_primary",
+        "block_cause",
     }
 )
 
@@ -96,6 +97,7 @@ ALLOWED_ENTRY_QUALITIES = {
     "data_insufficient",
 }
 ALLOWED_VERDICTS = {None, "candidate_review", "watch", "blocked", "data_insufficient"}
+ALLOWED_BLOCK_CAUSES = {None, "data_path", "data_quality", "unknown"}
 
 FORBIDDEN_KEYS = {
     "action_label",
@@ -192,6 +194,7 @@ ENUM_OR_ID_FIELDS = {
     "window_state",
     "verdict",
     "entry_quality",
+    "block_cause",
     "surfaces",
     "opened_at",
     "price_updated_at",
@@ -420,6 +423,7 @@ def _check_row(row, idx: int, result: Result) -> None:
         "verdict",
         "entry_quality",
         "block_reason_primary",
+        "block_cause",
     ):
         if row.get(field) is not None and not isinstance(row.get(field), str):
             result.critical(f"{path}.{field} must be str|None")
@@ -433,6 +437,12 @@ def _check_row(row, idx: int, result: Result) -> None:
         result.critical(f"{path}.entry_quality invalid")
     if row.get("verdict") not in ALLOWED_VERDICTS:
         result.critical(f"{path}.verdict invalid")
+    if row.get("block_cause") not in ALLOWED_BLOCK_CAUSES:
+        result.critical(f"{path}.block_cause invalid")
+    if row.get("trade_inbox_group") != "blocked" and row.get("block_cause") is not None:
+        result.critical(f"{path}.block_cause must be null for non-blocked rows")
+    if row.get("trade_inbox_group") == "blocked" and row.get("block_cause") is None:
+        result.critical(f"{path}.block_cause must be set for blocked rows")
     if row.get("move_basis") not in ALLOWED_MOVE_BASIS:
         result.critical(f"{path}.move_basis invalid")
     if row.get("source_corpus") == "paper" and row.get("move_basis") != "paper_entry":

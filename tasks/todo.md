@@ -1,5 +1,73 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-28 - Today's Focus Block Cause + Research Links
+
+**Status:** IN PROGRESS. Goal: make Today's Focus more useful from a trader
+seat by exposing direct research links and factual blocked-row cause
+without adding ranking, urgency tiers, advice, Telegram alerts, execution, or
+sizing.
+
+Workflow checklist:
+- [x] Isolated worktree:
+  `C:\Users\srini\.codex\worktrees\gecko-alpha-todays-focus-block-links-20260528`
+  on branch `feat/todays-focus-block-links`.
+- [x] Drift-check: `/api/todays_focus`, `TodayFocusPanel.jsx`,
+  `TokenLink.jsx`, and the Today's Focus contract firewall already exist.
+  Residual gap is inspection friction and generic `blocked` semantics.
+- [x] Plan drafted:
+  `tasks/plan_todays_focus_block_links_2026_05_28.md`.
+- [x] Design drafted:
+  `tasks/design_todays_focus_block_links_2026_05_28.md`.
+- [x] Plan/design review fold:
+  product reviewer flagged hidden advice risk in `structural` / `policy` and
+  "action link" wording. Folded to mechanical `block_cause=data_path |
+  data_quality | unknown`, research-link wording only, and explicit no-suitability
+  semantics. Runtime reviewer stalled; PR review will cover that vector.
+- [x] TDD build:
+  - added failing endpoint/contract/frontend tests for `block_cause` and
+    explicit `Chart` / `CG` research links;
+  - added backend `block_cause` classifier;
+  - extended Pydantic + contract firewall schema;
+  - added compact research-link and block-cause chips in Today’s Focus;
+  - removed raw action-coded group copy from the new surface by keeping
+    rendered labels mechanical.
+- [x] Runtime review folds:
+  - extracted deterministic research-link generation to `todayFocusLinks.js`;
+  - encoded URL path/query segments;
+  - routed unknown chains to DexScreener search fallback;
+  - used contract address, not symbol, for contract-row CoinGecko search;
+  - changed `block_cause` to report the immediate data-quality blocker before
+    tracker-only data-path context.
+  - renamed nondeterministic external targets to `Dex search` / `CG search`
+    and added row-specific aria labels for repeated links.
+- [x] Focused verification and frontend build:
+  - `uv run pytest -q tests/test_dashboard_frontend_layout.py
+    tests/test_todays_focus_endpoint.py tests/test_check_todays_focus_contract.py
+    tests/test_todays_focus_storage.py tests/test_check_dashboard_contracts.py`
+    => `36 passed`;
+  - `npm.cmd --prefix dashboard/frontend install` completed in the isolated
+    worktree;
+  - `npm.cmd --prefix dashboard/frontend run build:codex` passed and refreshed
+    committed dist;
+  - `git diff --check` clean.
+- [x] PR review by three parallel agents and folds:
+  - runtime/API reviewer flagged unsafe/ambiguous links and `data_path`
+    precedence; folded into encoded link helper, deterministic labels, and
+    immediate-blocker `block_cause`;
+  - frontend reviewer flagged nondeterministic search labels and repeated
+    accessible names; folded into `Dex search` / `CG search` labels and
+    row-specific aria labels;
+  - product reviewer repeated the pre-fold `data_path` concern against an
+    earlier commit; current branch verified data-quality precedence at
+    `dashboard/db.py`.
+- [x] CI: GitHub Actions `test` passed on run `26552939674`.
+- [ ] Merge, deploy, and smoke `/api/todays_focus`.
+
+Non-scope:
+- No ranking among the five rows, no urgency labels, no trade advice, no
+  Telegram alerting, no live execution/Kraken integration, no sizing, no
+  server-side personal state, and no cross-identifier resolver.
+
 ## Active Work: 2026-05-27 - Today's Focus Trader UX Pass
 
 **Status:** PR-READY. Goal: fix the screenshot-visible Today's Focus usability

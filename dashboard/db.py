@@ -1837,6 +1837,54 @@ def _today_focus_counter_flag_facts(flags: object) -> list[str]:
     return facts
 
 
+TODAYS_FOCUS_DATA_PATH_REASONS = {
+    "tracker_only_no_paper_trade",
+    "actionable_null_pre_cutover",
+    "would_be_live=0",
+}
+TODAYS_FOCUS_DATA_QUALITY_REASONS = {
+    "price_is_stale",
+    "not_actionable",
+    "opened_at_unparseable",
+    "price_timestamp_unparseable",
+    "detected_price_missing_or_invalid",
+    "entry_price_missing_or_invalid",
+    "no_price_snapshot_for_token_id",
+}
+TODAYS_FOCUS_DATA_QUALITY_BLOCKS = {
+    "NO_PRICE",
+    "STALE_PRICE",
+    "NOT_ACTIONABLE",
+    "BAD_TIMESTAMP",
+    "DATA_INSUFFICIENT",
+}
+
+
+def _today_focus_block_cause(row: dict) -> str | None:
+    if row.get("group") != "blocked" and not row.get("block_reason_primary"):
+        return None
+    reasons = {
+        str(reason)
+        for reason in (row.get("risk_reasons") or [])
+        + (row.get("inclusion_reasons") or [])
+        if reason is not None
+    }
+    lowered = {reason.casefold() for reason in reasons}
+    if (row.get("block_reason_primary") or "") in TODAYS_FOCUS_DATA_QUALITY_BLOCKS:
+        return "data_quality"
+    if lowered & TODAYS_FOCUS_DATA_QUALITY_REASONS:
+        return "data_quality"
+    if lowered & TODAYS_FOCUS_DATA_PATH_REASONS:
+        return "data_path"
+    if any(
+        marker in reason
+        for reason in lowered
+        for marker in ("corpus", "linkage", "identifier_mismatch")
+    ):
+        return "data_path"
+    return "unknown"
+
+
 def _today_focus_row(row: dict) -> dict:
     source = row.get("source_corpus") or "paper"
     move_basis = "paper_entry" if source == "paper" else "tracker_detection"
@@ -1912,6 +1960,7 @@ def _today_focus_row(row: dict) -> dict:
         "inclusion_reasons": list(row.get("inclusion_reasons") or []),
         "risk_reasons": list(row.get("risk_reasons") or []),
         "block_reason_primary": row.get("block_reason_primary"),
+        "block_cause": _today_focus_block_cause(row),
     }
 
 

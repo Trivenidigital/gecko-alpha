@@ -37,6 +37,16 @@ def _make_settings(tmp_path):
     )
 
 
+def _closed_at_in_digest_window(i: int, *, end_date: date | None = None) -> str:
+    """Return a timestamp inside build_cohort_digest's current 7d window."""
+    end = end_date or date.today()
+    day = end - timedelta(days=1 + (i % 4))
+    hour = i % 9
+    return datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc).replace(
+        hour=hour
+    ).isoformat()
+
+
 async def _insert_paper_trade(
     db, *, token_id, signal_type, status, pnl_usd, would_be_live,
     closed_at, opened_at=None,
@@ -231,7 +241,7 @@ async def test_build_cohort_digest_skips_final_block_before_lock_date(
         await _insert_paper_trade(
             db, token_id=f"t{i}", signal_type="gainers_early",
             status="closed_tp", pnl_usd=10, would_be_live=1,
-            closed_at=f"2026-05-1{i % 4}T0{i % 9}:00:00+00:00",
+            closed_at=_closed_at_in_digest_window(i, end_date=date(2026, 5, 17)),
         )
     text = await build_cohort_digest(db, date(2026, 5, 17), settings)
     assert text is not None
@@ -283,7 +293,7 @@ async def test_send_cohort_digest_passes_parse_mode_none(
         await _insert_paper_trade(
             db, token_id=f"t{i}", signal_type="gainers_early",
             status="closed_tp", pnl_usd=10, would_be_live=1,
-            closed_at=f"2026-05-1{i % 4}T0{i % 9}:00:00+00:00",
+            closed_at=_closed_at_in_digest_window(i),
         )
     with patch(
         "scout.trading.cohort_digest.alerter.send_telegram_message",
@@ -304,7 +314,7 @@ async def test_send_cohort_digest_stamps_last_digest_date_after_dispatch(
         await _insert_paper_trade(
             db, token_id=f"t{i}", signal_type="gainers_early",
             status="closed_tp", pnl_usd=10, would_be_live=1,
-            closed_at=f"2026-05-1{i % 4}T0{i % 9}:00:00+00:00",
+            closed_at=_closed_at_in_digest_window(i),
         )
     with patch(
         "scout.trading.cohort_digest.alerter.send_telegram_message",

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import TokenLink from './TokenLink'
+import { researchLinks } from '../todayFocusLinks.js'
 import {
   buildUsageExport,
   clearDismissed,
@@ -128,6 +129,7 @@ export default function TodayFocusPanel() {
             {rows.map(row => {
               const action = actions[row.row_key] || {}
               const title = rowTitle(row)
+              const links = researchLinks(row)
               return (
                 <div className="todays-focus-row" key={row.row_key}>
                   <div className="todays-focus-rank">{row.source_corpus === 'paper' ? 'P' : 'T'}</div>
@@ -142,6 +144,31 @@ export default function TodayFocusPanel() {
                         />
                         {title.name ? <span className="todays-focus-name">{title.name}</span> : null}
                         <span className="chain-badge">{row.source_corpus}</span>
+                        <span className="todays-focus-links">
+                          {links.chartHref ? (
+                            <a
+                              href={links.chartHref}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="todays-focus-link-chip"
+                              aria-label={`Open ${title.symbol} ${links.chartLabel}`}
+                            >
+                              {links.chartLabel}</a>
+                          ) : null}
+                          {links.cgHref ? (
+                            <a
+                              href={links.cgHref}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="todays-focus-link-chip"
+                              aria-label={`Open ${title.symbol} ${links.cgLabel}`}
+                            >
+                              {links.cgLabel}</a>
+                          ) : null}
+                        </span>
+                        {row.block_cause ? (
+                          <span className="todays-focus-block-cause">block={row.block_cause}</span>
+                        ) : null}
                         {action.save_for_review ? <span className="signal-badge fired">saved</span> : null}
                       </div>
                       <div className="todays-focus-price">
