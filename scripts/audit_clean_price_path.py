@@ -42,6 +42,20 @@ OFFLINE_ONLY_BANNER = (
     "ranking/curation/alerting/sizing. See BL-NEW-CLEAN-PRICE-PATH-AUDIT."
 )
 
+# Fold round 2: scope-limitation honesty must travel in the OUTPUT payload (JSON
+# + human), not only the module docstring. volume_history_cg retains ~7 days, so
+# genuine weeks-later catalysts land in no_significant_move (flat within their
+# observable window), NOT window_incomplete/insufficient_data.
+SCOPE_LIMITATION = (
+    "volume_history_cg retains ~7 days of price points (writer prunes older "
+    "rows). Genuine weeks-later catalysts are UNOBSERVABLE within this window: "
+    "a candidate flat for its whole observable window lands in "
+    "no_significant_move, NOT window_incomplete/insufficient_data. "
+    "unrelated_later_move captures only flat-then-run ENTIRELY WITHIN the 7-day "
+    "window; true weeks-later recurrence requires a longer-retention source "
+    "(out of V1 scope)."
+)
+
 # Closed bucket set.
 BUCKETS = (
     "continuous_move",
@@ -95,6 +109,17 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row[1] == column for row in cursor.fetchall())
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        cursor = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            (table,),
+        )
+    except sqlite3.Error:
+        return False
+    return cursor.fetchone() is not None
+
+
 def _identity_class(identity: str) -> str:
     """Cheap offline heuristic (no network): coarse identity-shape class."""
     s = (identity or "").strip()
@@ -127,16 +152,21 @@ def _price_series(
     """Valid price points in [start_dt, end_dt], inclusive both ends, sorted."""
     if not coin_id:
         return []
-    try:
-        cursor = conn.execute(
-            "SELECT recorded_at, price FROM volume_history_cg "
-            "WHERE coin_id = ? AND recorded_at >= ? AND recorded_at <= ? "
-            "AND price IS NOT NULL AND price > 0 AND price < ? "
-            "ORDER BY recorded_at ASC",
-            (coin_id, start_dt.isoformat(), end_dt.isoformat(), INFINITY_GUARD_MAX),
-        )
-    except sqlite3.Error:
-        return []
+    # NOTE (fold round 2 / Codex CRITICAL): do NOT swallow sqlite3.Error into []
+    # here. A missing/renamed table or any genuine query failure would otherwise
+    # masquerade as `insufficient_data` with exit 0 — a silent failure. The
+    # schema precondition in main() guarantees the table+columns exist before we
+    # get here, and any residual query-time sqlite error is allowed to propagate
+    # so the top-level handler maps it to stage="query" / exit 2. `insufficient_data`
+    # is reserved STRICTLY for "schema OK but this token has < min_points valid
+    # in-window points."
+    cursor = conn.execute(
+        "SELECT recorded_at, price FROM volume_history_cg "
+        "WHERE coin_id = ? AND recorded_at >= ? AND recorded_at <= ? "
+        "AND price IS NOT NULL AND price > 0 AND price < ? "
+        "ORDER BY recorded_at ASC",
+        (coin_id, start_dt.isoformat(), end_dt.isoformat(), INFINITY_GUARD_MAX),
+    )
     out: list[tuple[datetime, float]] = []
     for recorded_at, price in cursor.fetchall():
         if not _is_valid_price(price):
@@ -228,15 +258,39 @@ def _classify_one(
         return {**base, "bucket": "insufficient_data", "p0_basis": p0_basis}
 
     # ---- excursions ----
+    # MFE + time_to_peak are measured over the GLOBAL peak (peak_dt uses the
+    # earliest occurrence of the max price as an intentional tie-break, so
+    # time_to_peak reports the FIRST time the peak was reached).
     peak_price = max(p for _, p in series)
     peak_dt = next(dt for dt, p in series if p == peak_price)
     mfe_pct = (peak_price - p0) / p0 * 100.0
     time_to_peak_h = (peak_dt - detection_dt).total_seconds() / 3600.0
 
-    pre_peak = [(dt, p) for dt, p in series if dt <= peak_dt]
-    trough_price = min(p for _, p in pre_peak)
-    mae_before_favorable_pct = (p0 - trough_price) / p0 * 100.0
+    # MAE-before-favorable (fold round 2): the adverse dip the operator had to
+    # tolerate BEFORE the run actually started — i.e. the dip up to the FIRST
+    # point that crosses run_threshold, NOT the dip up to the global peak. This
+    # is what distinguishes continuous_move ("ran clean") from
+    # drawdown_then_recovery ("early but required drawdown tolerance"): a dip
+    # that happens AFTER the run already crossed the threshold is part of the
+    # run's give-back, not the entry drawdown, and must not reclassify the row.
+    first_run_dt = next(
+        (dt for dt, p in series if (p - p0) / p0 * 100.0 >= run_threshold),
+        None,
+    )
+    if first_run_dt is not None:
+        pre_run = [(dt, p) for dt, p in series if dt <= first_run_dt]
+        trough_price = min(p for _, p in pre_run)
+        # Floor at 0.0: when every pre-run point is at-or-above P0 there is no
+        # adverse excursion (never report a negative MAE).
+        mae_before_favorable_pct = max(0.0, (p0 - trough_price) / p0 * 100.0)
+    else:
+        # No run crossing in-window (no_significant_move path): fall back to the
+        # pre-peak trough so the metric is still meaningful for the row.
+        pre_peak_fallback = [(dt, p) for dt, p in series if dt <= peak_dt]
+        trough_price = min(p for _, p in pre_peak_fallback)
+        mae_before_favorable_pct = max(0.0, (p0 - trough_price) / p0 * 100.0)
 
+    pre_peak = [(dt, p) for dt, p in series if dt <= peak_dt]
     flat_gap_h = _longest_flat_run_hours(pre_peak, p0, flat_band_pct)
 
     metrics = {
@@ -275,6 +329,7 @@ def _gainers_crosscheck(
     by_id = {r["coin_id"]: r for r in per_row}
     compared = []
     audit_ran = stored_ran = agree = dis_no_yes = dis_yes_no = 0
+    audit_unjoinable = 0
     for cand in cohort_rows:
         if (cand.get("cohort_source") or "") != "gainers":
             continue
@@ -283,8 +338,29 @@ def _gainers_crosscheck(
             continue
         row = by_id.get(cand.get("coin_id"))
         audit_mfe = row.get("mfe") if row else None
-        a_ran = audit_mfe is not None and audit_mfe >= run_threshold
         s_ran = float(stored) >= run_threshold
+        # Fold round 2: rows where the audit produced no in-window MFE (no join /
+        # insufficient_data / window_incomplete) are UNJOINABLE, not a genuine
+        # audit-says-no disagreement. Folding them into
+        # disagree_audit_no_stored_yes manufactures a horizon artifact (stored
+        # peak uses full lifetime; audit MFE uses the <=7-day window). Count them
+        # separately so the disagreement counters reflect only rows the audit
+        # could actually evaluate.
+        if audit_mfe is None:
+            audit_unjoinable += 1
+            if s_ran:
+                stored_ran += 1
+            compared.append(
+                {
+                    "coin_id": cand.get("coin_id"),
+                    "audit_mfe": None,
+                    "stored_peak_gain_pct": float(stored),
+                    "audit_ran": None,
+                    "stored_ran": s_ran,
+                }
+            )
+            continue
+        a_ran = audit_mfe >= run_threshold
         if a_ran:
             audit_ran += 1
         if s_ran:
@@ -311,6 +387,14 @@ def _gainers_crosscheck(
         "agree_count": agree,
         "disagree_audit_no_stored_yes": dis_no_yes,
         "disagree_audit_yes_stored_no": dis_yes_no,
+        "audit_unjoinable": audit_unjoinable,
+        "caveat": (
+            "Stored peak_gain_pct is computed over the token's FULL lifetime; "
+            "audit MFE is computed only over the <=7-day post-detection window "
+            "(volume_history_cg retention). Disagreements partly reflect this "
+            "horizon mismatch. audit_unjoinable rows had no in-window audit MFE "
+            "and are excluded from the disagreement counters."
+        ),
         "per_row": compared,
     }
 
@@ -323,7 +407,11 @@ def _join_failure_breakdown(
 ) -> dict[str, Any]:
     by_source = {"paper": 0, "gainers": 0}
     by_class = {"cg_slug_like": 0, "contract_address_like": 0, "other": 0}
-    zero_in_window = 0
+    # Fold round 2 rename: this counter covers insufficient_data rows that DID
+    # resolve a P0 (from the ledger or first in-window point) but had fewer than
+    # min_points valid in-window points — i.e. 1..min_points-1 points, NOT
+    # strictly zero. Renamed from the misleading `zero_in_window_points`.
+    below_min_points_with_ledger_p0 = 0
     p0_unresolvable = 0
     cand_by_id = {c.get("coin_id"): c for c in cohort_rows}
     insufficient = [r for r in per_row if r["bucket"] == "insufficient_data"]
@@ -336,12 +424,12 @@ def _join_failure_breakdown(
         if r.get("p0_basis") is None:
             p0_unresolvable += 1
         else:
-            zero_in_window += 1
+            below_min_points_with_ledger_p0 += 1
     return {
         "insufficient_data_total": len(insufficient),
         "by_cohort_source": by_source,
         "by_identity_class": by_class,
-        "zero_in_window_points": zero_in_window,
+        "below_min_points_with_ledger_p0": below_min_points_with_ledger_p0,
         "p0_unresolvable": p0_unresolvable,
     }
 
@@ -453,6 +541,8 @@ def build_report(
     report: dict[str, Any] = {
         "audited_at": _utc_iso_z(now),
         "offline_only_banner": OFFLINE_ONLY_BANNER,
+        "scope_limitation": SCOPE_LIMITATION,
+        "retention_ceiling_hours": WINDOW_HOURS_CEILING,
         "params": {
             "cohort": cohort,
             "window_hours": window_hours,
@@ -592,6 +682,8 @@ def _format_human(report: dict[str, Any]) -> str:
     lines = [
         f"audited_at:    {report['audited_at']}",
         f"OFFLINE-ONLY:  {report['offline_only_banner']}",
+        f"SCOPE-LIMIT:   {report['scope_limitation']}",
+        f"retention_ceiling_hours: {report['retention_ceiling_hours']}",
         "params:",
     ]
     for k, v in report["params"].items():
@@ -626,8 +718,10 @@ def _format_human(report: dict[str, Any]) -> str:
         "agree_count",
         "disagree_audit_no_stored_yes",
         "disagree_audit_yes_stored_no",
+        "audit_unjoinable",
     ):
         lines.append(f"  {k} = {cc[k]}")
+    lines.append(f"  caveat = {cc['caveat']}")
     lines.append("")
     lines.append("PER ROW:")
     for r in report["per_row"]:
@@ -706,6 +800,16 @@ def main() -> int:
         return args_err("--min-points must be >= 2.")
     if maturity_hours <= 0:
         return args_err("--maturity-hours must be > 0.")
+    # Fold round 2 (Codex IMPORTANT): maturity must cover the full attribution
+    # window. A maturity shorter than the window would classify rows whose
+    # post-detection window has not fully elapsed, mislabeling still-developing
+    # paths. (The default maturity_hours == window_hours already satisfies this.)
+    if maturity_hours < args.window_hours:
+        return args_err(
+            "--maturity-hours must be >= --window-hours "
+            "(a candidate is only classifiable once its full post-detection "
+            "window has elapsed)."
+        )
     if args.lookback_days < 1:
         return args_err("--lookback-days must be >= 1.")
 
@@ -719,6 +823,35 @@ def main() -> int:
         )
 
     try:
+        # ---- schema precondition (stage="schema", exit 2) ----
+        # Fold round 2 (Codex CRITICAL): verify the price-series table + columns
+        # exist BEFORE building the report. Without this, a missing/renamed
+        # volume_history_cg (or its columns) would surface as every token landing
+        # in insufficient_data with exit 0 — a silent failure indistinguishable
+        # from "schema OK but sparse data."
+        if not _table_exists(conn, "volume_history_cg"):
+            return _err(
+                {
+                    "status": "error",
+                    "stage": "schema",
+                    "error": "required table 'volume_history_cg' is missing.",
+                },
+                args.json,
+            )
+        for required_col in ("coin_id", "price", "recorded_at"):
+            if not _column_exists(conn, "volume_history_cg", required_col):
+                return _err(
+                    {
+                        "status": "error",
+                        "stage": "schema",
+                        "error": (
+                            f"required column 'volume_history_cg.{required_col}' "
+                            "is missing."
+                        ),
+                    },
+                    args.json,
+                )
+
         try:
             cohort_rows = _build_cohort(conn, args.cohort, args.lookback_days, now)
         except sqlite3.Error as exc:
@@ -726,21 +859,30 @@ def main() -> int:
                 {"status": "error", "stage": "cohort", "error": str(exc)}, args.json
             )
 
-        report = build_report(
-            cohort_rows,
-            conn,
-            window_hours=args.window_hours,
-            run_threshold=args.run_threshold,
-            drawdown_threshold=args.drawdown_threshold,
-            flat_gap_hours=args.flat_gap_hours,
-            flat_band_pct=args.flat_band_pct,
-            min_points=args.min_points,
-            maturity_hours=maturity_hours,
-            now=now,
-            sensitivity=args.sensitivity,
-            cohort=args.cohort,
-            lookback_days=args.lookback_days,
-        )
+        # ---- report build (stage="query", exit 2 on sqlite error) ----
+        # Fold round 2: any genuine query-time sqlite error (e.g. _price_series
+        # against an unexpectedly-broken table) now propagates here and maps to
+        # exit 2 instead of being swallowed into a silent insufficient_data.
+        try:
+            report = build_report(
+                cohort_rows,
+                conn,
+                window_hours=args.window_hours,
+                run_threshold=args.run_threshold,
+                drawdown_threshold=args.drawdown_threshold,
+                flat_gap_hours=args.flat_gap_hours,
+                flat_band_pct=args.flat_band_pct,
+                min_points=args.min_points,
+                maturity_hours=maturity_hours,
+                now=now,
+                sensitivity=args.sensitivity,
+                cohort=args.cohort,
+                lookback_days=args.lookback_days,
+            )
+        except sqlite3.Error as exc:
+            return _err(
+                {"status": "error", "stage": "query", "error": str(exc)}, args.json
+            )
     finally:
         conn.close()
 

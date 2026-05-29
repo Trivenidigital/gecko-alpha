@@ -16,7 +16,7 @@ ecosystem check, even when the honest verdict is "build from scratch."
 |---|---|---|
 | Price-path / time-series shape classification (MFE/MAE, peak detection, flat-gap segmentation) | none found — Hermes skill hub exposes agent-orchestration / messaging / retrieval skills, not numeric intraday-series shape classifiers tied to a project's own sqlite | Build from scratch (offline, project-specific sqlite attribution; pure arithmetic over `volume_history_cg` rows — no external service adds value) |
 | Trade attribution / runner labeling | none found — no skill maps detection events to post-detection price outcomes against a local trade ledger | Build from scratch (joins `paper_trades` / `gainers_comparisons` to `volume_history_cg` by project-specific identity keys; CG-slug-vs-contract caveat is gecko-alpha-specific) |
-| Generic statistical summarization (quantiles, rate-or-null) | none found that is worth a network hop | Build from scratch (reuse the reference script's `_quantile` / `_rate_or_null` / `_points_distribution` helpers verbatim; tiny, deterministic, offline) |
+| Generic statistical summarization (rate-or-null) | none found that is worth a network hop | Build from scratch (the implemented script uses a small in-file `_rate_or_null` helper only; the reference's `_quantile` / `_points_distribution` helpers were evaluated and DROPPED as unnecessary for this audit — tiny, deterministic, offline) |
 
 **awesome-hermes-agent ecosystem check + verdict:** Surveyed the
 awesome-hermes-agent ecosystem categories (agent frameworks, tool/skill
@@ -521,7 +521,7 @@ rows split by cohort source and (where derivable) chain class:
     "contract_address_like": 24,         // 0x… / base58 → never joins (caveat)
     "other": 2
   },
-  "zero_in_window_points": 26,           // P0 may exist but 0 valid in-window pts
+  "below_min_points_with_ledger_p0": 26, // P0 resolved but 1..min_points-1 valid pts (NOT strictly zero)
   "p0_unresolvable": 4                   // P0 itself could not be established
 }
 ```
@@ -819,3 +819,62 @@ design pass.
    `bucket_rates_matured` block when the matured denominator < 5 (reference
    N<5 convention at the rate-denominator level), with explicit
    `matured_denominator` + suppression-reason fields. §2.5/§3.1/§3.3.
+
+---
+
+## 8b. Fold round 2 (post-code-review: 2 subagents APPROVE-WITH-FOLDS, Codex BLOCK)
+
+A second review round after the implementation landed (commit `fdc18ac`)
+produced one Codex BLOCK plus two APPROVE-WITH-FOLDS. The following six folds
+were applied (TDD: test pinned first, then implementation). All 44 tests pass.
+
+1. **[Codex CRITICAL — silent sqlite failure]** `_price_series` previously did
+   `except sqlite3.Error: return []`, so a missing/renamed `volume_history_cg`
+   (or any query failure) masqueraded as `insufficient_data` with exit 0 — a
+   silent failure. Fixes:
+   - **Schema precondition** added in `main()` BEFORE `build_report`: verify the
+     `volume_history_cg` table exists and has columns `coin_id`, `price`,
+     `recorded_at` (via new `_table_exists` + existing `_column_exists`). If
+     absent → `{"status":"error","stage":"schema",...}` (JSON) / stderr (human)
+     and **exit 2**. Pinned by `test_main_exit2_when_price_table_missing` and
+     `test_main_exit2_when_price_column_missing`.
+   - The bare `except sqlite3.Error: return []` was **removed** from
+     `_price_series`; a top-level `try/except sqlite3.Error` around
+     `build_report` in `main()` now maps any residual query-time error to
+     `{"stage":"query"}` / **exit 2**. `insufficient_data` is now reserved
+     STRICTLY for "schema OK but this token has < `min_points` valid in-window
+     points." Pinned by `test_main_query_time_sqlite_error_surfaces_exit2`.
+2. **[Codex IMPORTANT — maturity guard]** `main()` now rejects
+   `--maturity-hours < --window-hours` with `{"stage":"args"}` / exit 2 (a
+   candidate is only classifiable once its full post-detection window has
+   elapsed). Default `maturity_hours == window_hours` still satisfies this.
+   Pinned by `test_main_rejects_maturity_below_window`.
+3. **[Both subagents IMPORTANT + Codex NIT — mae_before_favorable semantics]**
+   MAE is now the dip BEFORE the FIRST point that crosses `run_threshold`
+   (`first_run_dt`), not the dip before the GLOBAL peak — this is the entry
+   drawdown the operator had to tolerate before the run started, which is what
+   separates `continuous_move` from `drawdown_then_recovery`. Floored at 0.0
+   (never negative). `mfe` and `time_to_peak` still use the GLOBAL peak. When no
+   in-window run crossing exists (`no_significant_move`), MAE falls back to the
+   pre-peak trough. Pinned by `test_mae_uses_first_run_crossing_not_global_peak`
+   (path 100→95→130→80→200 classifies `continuous_move`, MAE=5% not 20%) and
+   `test_mae_floored_at_zero_when_no_pre_run_dip`.
+4. **[Statistical subagent IMPORTANT — gainers crosscheck horizon artifact]** In
+   `_gainers_crosscheck`, rows where `audit_mfe is None` (unjoinable / no
+   in-window series) are now counted in a separate `audit_unjoinable` counter
+   instead of being folded into `disagree_audit_no_stored_yes`. A `caveat` field
+   notes that stored `peak_gain_pct` uses full lifetime while audit MFE uses the
+   ≤7-day window. Pinned by
+   `test_gainers_crosscheck_unjoinable_not_counted_as_disagreement`.
+5. **[Statistical subagent IMPORTANT — scope limitation in OUTPUT]** The report
+   dict now carries a `scope_limitation` string and `retention_ceiling_hours`
+   (168) stating weeks-later catalysts land in `no_significant_move` (not
+   `window_incomplete`) within the 7-day retention. Travels in BOTH the JSON
+   payload and the human output (not only the docstring). Pinned by
+   `test_report_includes_scope_limitation`.
+6. **[NITs]** Renamed `zero_in_window_points` → `below_min_points_with_ledger_p0`
+   (with a comment clarifying it covers 1..`min_points`-1, not strictly zero).
+   Added a comment that `peak_dt` uses earliest-occurrence tie-break
+   intentionally. Reconciled the stale Hermes-first row claiming reuse of the
+   reference's `_quantile` / `_points_distribution` helpers (those were dropped;
+   only `_rate_or_null` is used).

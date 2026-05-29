@@ -184,6 +184,49 @@ def test_drawdown_boundary_at_exactly_threshold_is_continuous(audit, db):
     assert row["bucket"] == "continuous_move"
 
 
+def test_mae_uses_first_run_crossing_not_global_peak(audit, db):
+    """Fold round 2: MAE is the dip BEFORE the first run-threshold crossing, not
+    before the global peak. Path: 100 -> 95 (5% dip) -> 130 (first crossing at
+    +30%) -> 80 (20% dip, AFTER crossing) -> 200 (global peak). The pre-crossing
+    dip is 5% (<= 15% drawdown_threshold) so this classifies continuous_move,
+    NOT drawdown_then_recovery. The 20% post-crossing dip must be ignored."""
+    path, conn = db
+    cid = "firstcross"
+    _insert_point(conn, cid, 100.0, 0)
+    _insert_point(conn, cid, 95.0, 2)  # 5% pre-run dip
+    _insert_point(conn, cid, 130.0, 4)  # first crossing at +30%
+    _insert_point(conn, cid, 80.0, 6)  # 20% dip AFTER the run started
+    _insert_point(conn, cid, 200.0, 8)  # global peak
+    conn.commit()
+    ro = _ro_conn(path)
+    try:
+        report = audit.build_report([_cohort_row(cid, 100.0)], ro, **DEFAULTS)
+    finally:
+        ro.close()
+    row = _bucket_of(report, cid)
+    assert row["mae"] == pytest.approx(5.0)  # pre-crossing dip, not 20%
+    assert row["bucket"] == "continuous_move"
+
+
+def test_mae_floored_at_zero_when_no_pre_run_dip(audit, db):
+    """Fold round 2: when all pre-run points are at-or-above P0, MAE floors at
+    0.0 (never negative). Monotonic climb 100 -> 110 -> 120 -> 130 -> 140."""
+    path, conn = db
+    cid = "nodip"
+    for i, p in enumerate([100.0, 110.0, 120.0, 130.0, 140.0]):
+        _insert_point(conn, cid, p, i * 2)
+    conn.commit()
+    ro = _ro_conn(path)
+    try:
+        report = audit.build_report([_cohort_row(cid, 100.0)], ro, **DEFAULTS)
+    finally:
+        ro.close()
+    row = _bucket_of(report, cid)
+    assert row["mae"] == pytest.approx(0.0)
+    assert row["mae"] >= 0.0
+    assert row["bucket"] == "continuous_move"
+
+
 def test_unrelated_later_move(audit, db):
     """Long flat span (>= flat_gap_hours) then a run => unrelated_later_move,
     winning over the dip-based split."""
@@ -523,6 +566,40 @@ def test_gainers_crosscheck_counts_both_disagreement_directions(audit, db):
     assert cc["disagree_audit_yes_stored_no"] == 1
 
 
+def test_gainers_crosscheck_unjoinable_not_counted_as_disagreement(audit, db):
+    """Fold round 2: a gainers row with NO in-window audit MFE (unjoinable /
+    insufficient_data) and a stored peak >= run_threshold must increment
+    audit_unjoinable, NOT disagree_audit_no_stored_yes (horizon artifact)."""
+    path, conn = db
+    # Joinable runner: audit MFE 50% (ran), stored 48% (ran) => agree.
+    for i, p in enumerate([100.0, 110.0, 120.0, 135.0, 150.0]):
+        _insert_point(conn, "joins", p, i * 2)
+    conn.commit()
+    rows = [
+        {
+            **_cohort_row("joins", 100.0, source="gainers"),
+            "stored_peak_gain_pct": 48.0,
+        },
+        # No price points for "ghostgain" => audit MFE None (unjoinable), but
+        # stored peak says it ran (60%).
+        {
+            **_cohort_row("ghostgain", None, source="gainers"),
+            "stored_peak_gain_pct": 60.0,
+        },
+    ]
+    ro = _ro_conn(path)
+    try:
+        report = audit.build_report(rows, ro, **DEFAULTS)
+    finally:
+        ro.close()
+    cc = report["gainers_runner_def_crosscheck"]
+    assert cc["rows_compared"] == 2
+    assert cc["audit_unjoinable"] == 1
+    assert cc["disagree_audit_no_stored_yes"] == 0
+    assert "caveat" in cc
+    assert "lifetime" in cc["caveat"]
+
+
 # ============================================================================
 # Fold #8 — matured-rate block N<5 suppression
 # ============================================================================
@@ -697,6 +774,102 @@ def test_main_smoke_empty_cohort_returns_0(audit, db, monkeypatch, capsys):
     assert payload["params"]["window_hours"] == 168
 
 
+def test_main_exit2_when_price_table_missing(audit, tmp_path, monkeypatch, capsys):
+    """Fold round 2 (Codex CRITICAL): volume_history_cg missing => stage=schema,
+    exit 2 — NOT a silent all-insufficient_data exit 0."""
+    path = tmp_path / "scout.db"
+    conn = sqlite3.connect(path)
+    # paper_trades exists but the price-series table does not.
+    conn.execute(
+        "CREATE TABLE paper_trades "
+        "(id INTEGER PRIMARY KEY, token_id TEXT, signal_type TEXT, "
+        "entry_price REAL, opened_at TEXT)"
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        sys, "argv", ["audit", "--db", str(path), "--cohort", "paper", "--json"]
+    )
+    rc = audit.main()
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 2
+    assert payload["stage"] == "schema"
+
+
+def test_main_exit2_when_price_column_missing(audit, tmp_path, monkeypatch, capsys):
+    """Fold round 2: volume_history_cg present but missing the `price` column =>
+    stage=schema, exit 2."""
+    path = tmp_path / "scout.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE volume_history_cg "
+        "(id INTEGER PRIMARY KEY, coin_id TEXT, recorded_at TEXT)"  # no price col
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(sys, "argv", ["audit", "--db", str(path), "--json"])
+    rc = audit.main()
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 2
+    assert payload["stage"] == "schema"
+    assert "price" in payload["error"]
+
+
+def test_main_query_time_sqlite_error_surfaces_exit2(audit, db, monkeypatch, capsys):
+    """Fold round 2 (Codex CRITICAL): a genuine query-time sqlite error inside
+    _price_series surfaces as stage='query'/exit 2, NOT a silent
+    insufficient_data bucket. Schema precondition passes (table+cols exist), then
+    the series query is forced to raise."""
+    path, conn = db
+    # Seed a normal runner so the cohort is non-empty and reaches _price_series.
+    for i, p in enumerate([100.0, 110.0, 120.0, 130.0, 140.0]):
+        _insert_point(conn, "qerr", p, i * 2)
+    conn.commit()
+
+    real_price_series = audit._price_series
+
+    def boom(conn_, coin_id, start_dt, end_dt):
+        raise sqlite3.OperationalError("forced query failure")
+
+    monkeypatch.setattr(audit, "_price_series", boom)
+    monkeypatch.setattr(
+        audit,
+        "_build_cohort",
+        lambda conn, cohort, lookback_days, now: [_cohort_row("qerr", 100.0)],
+    )
+    monkeypatch.setattr(sys, "argv", ["audit", "--db", str(path), "--json"])
+    rc = audit.main()
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 2
+    assert payload["stage"] == "query"
+    # restore (module-scoped fixture safety)
+    monkeypatch.setattr(audit, "_price_series", real_price_series)
+
+
+def test_main_rejects_maturity_below_window(audit, db, monkeypatch, capsys):
+    """Fold round 2 (Codex IMPORTANT): --maturity-hours < --window-hours =>
+    stage=args, exit 2."""
+    path, _ = db
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "audit",
+            "--db",
+            str(path),
+            "--window-hours",
+            "168",
+            "--maturity-hours",
+            "100",
+            "--json",
+        ],
+    )
+    rc = audit.main()
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 2
+    assert payload["stage"] == "args"
+
+
 def test_main_db_open_failure_returns_2(audit, tmp_path, monkeypatch, capsys):
     missing = tmp_path / "does_not_exist.db"
     monkeypatch.setattr(sys, "argv", ["audit", "--db", str(missing), "--json"])
@@ -707,9 +880,15 @@ def test_main_db_open_failure_returns_2(audit, tmp_path, monkeypatch, capsys):
 
 
 def test_main_cohort_query_failure_returns_2(audit, tmp_path, monkeypatch, capsys):
-    """DB exists but cohort table missing => stage='cohort', exit 2."""
+    """DB exists, price table present, but cohort table missing =>
+    stage='cohort', exit 2. (volume_history_cg must exist so the schema
+    precondition passes and we reach the cohort-build stage.)"""
     path = tmp_path / "scout.db"
     conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE volume_history_cg "
+        "(id INTEGER PRIMARY KEY, coin_id TEXT, price REAL, recorded_at TEXT)"
+    )
     conn.execute("CREATE TABLE unrelated (x INTEGER)")
     conn.commit()
     conn.close()
@@ -757,6 +936,28 @@ def test_offline_banner_present_in_json_and_human(audit, db, monkeypatch, capsys
 
 def test_offline_banner_in_module_docstring(audit):
     assert "OFFLINE-ONLY" in (audit.__doc__ or "")
+
+
+def test_report_includes_scope_limitation(audit, db, monkeypatch, capsys):
+    """Fold round 2: scope_limitation + retention_ceiling_hours travel in BOTH
+    the JSON payload and the human output, not only the docstring."""
+    path, _ = db
+    monkeypatch.setattr(
+        audit, "_build_cohort", lambda conn, cohort, lookback_days, now: []
+    )
+    # JSON
+    monkeypatch.setattr(sys, "argv", ["audit", "--db", str(path), "--json"])
+    assert audit.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "scope_limitation" in payload
+    assert "weeks-later" in payload["scope_limitation"]
+    assert payload["retention_ceiling_hours"] == 168
+    # Human
+    monkeypatch.setattr(sys, "argv", ["audit", "--db", str(path)])
+    assert audit.main() == 0
+    human = capsys.readouterr().out
+    assert "SCOPE-LIMIT" in human
+    assert "retention_ceiling_hours" in human
 
 
 def test_no_business_logic_imports(audit):
