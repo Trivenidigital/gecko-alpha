@@ -5090,11 +5090,37 @@ class Database:
     # ------------------------------------------------------------------
 
     async def upsert_candidate(self, token: CandidateToken) -> None:
-        """INSERT OR REPLACE candidate by contract_address."""
+        """Insert or update candidate by contract_address.
+
+        Uses SQLite UPSERT (``ON CONFLICT(contract_address) DO UPDATE``)
+        instead of ``INSERT OR REPLACE`` so that columns NOT present in
+        ``_CANDIDATE_COLUMNS`` are PRESERVED on conflict — specifically
+        the 4 liquidity-enrichment columns written by the Phase 1a-ii
+        cron (``liquidity_usd_enriched``, ``liquidity_enriched_source``,
+        ``liquidity_enriched_at``, ``liquidity_enriched_confidence``).
+
+        Before this change: ``INSERT OR REPLACE`` deleted the row and
+        re-inserted with only ``_CANDIDATE_COLUMNS``, silently clobbering
+        cron writes to NULL on every re-ingest. After this change: the
+        4 enrichment columns survive across re-ingest because they are
+        NOT in the ``DO UPDATE SET`` clause.
+
+        For first-insert (no conflict), enrichment columns get NULL —
+        correct (the cron has not visited yet). Existing behavior for
+        all ``_CANDIDATE_COLUMNS`` is preserved verbatim.
+
+        See ``tasks/design_liquidity_enrichment_b2_2026_05_29.md`` for
+        the decoupled-columns design rationale.
+        """
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         placeholders = ", ".join("?" for _ in _CANDIDATE_COLUMNS)
         cols = ", ".join(_CANDIDATE_COLUMNS)
+        # DO UPDATE SET excludes contract_address (PK) and the 4 enrichment
+        # columns (preserved). Every other _CANDIDATE_COLUMNS entry is
+        # set from `excluded.<col>` so existing semantics are unchanged.
+        update_cols = [c for c in _CANDIDATE_COLUMNS if c != "contract_address"]
+        update_clause = ", ".join(f"{c}=excluded.{c}" for c in update_cols)
         values = []
         for col in _CANDIDATE_COLUMNS:
             v = getattr(token, col)
@@ -5106,7 +5132,8 @@ class Database:
                 v = json.dumps(v)
             values.append(v)
         await self._conn.execute(
-            f"INSERT OR REPLACE INTO candidates ({cols}) VALUES ({placeholders})",
+            f"INSERT INTO candidates ({cols}) VALUES ({placeholders}) "
+            f"ON CONFLICT(contract_address) DO UPDATE SET {update_clause}",
             values,
         )
         await self._conn.commit()
