@@ -136,6 +136,13 @@ class Database:
         await self._migrate_gainers_comparisons_appeared_idx_v1()
         await self._migrate_trade_decision_events_v1()
         await self._migrate_predictions_coin_predicted_id_idx_v1()
+        # BL-NEW-TODAYS-FOCUS-LIQUIDITY-VENUE-FACTS Phase 1a-i (2026-05-29):
+        # 4 nullable enrichment columns on `candidates` + paper_migrations
+        # marker. Read-only writer (cron) populates later in Phase 1a-ii.
+        # No DEFAULT clauses — preserves absence-vs-zero semantics so the
+        # dashboard read path can distinguish "never written" from "written
+        # but resolved to no-match".
+        await self._migrate_liquidity_enrichment_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -3088,6 +3095,163 @@ class Database:
                 f"bl_quote_pair_v1 schema_version description mismatch — "
                 f"expected 'bl_quote_pair_v1_quote_symbol_dex_id', got {row[0]!r}. "
                 f"Possible version-collision; investigate before continuing."
+            )
+
+    async def _migrate_liquidity_enrichment_v1(self) -> None:
+        """BL-NEW-TODAYS-FOCUS-LIQUIDITY-VENUE-FACTS Phase 1a-i (2026-05-29):
+        add 4 nullable enrichment columns to ``candidates``.
+
+        Writer is read-only enrichment via DexScreener cron (Phase 1a-ii); this
+        migration only lands the persistence shape. All columns are nullable
+        with NO DEFAULT so the dashboard read path can distinguish three
+        states explicitly:
+
+        - column IS NULL: row never visited by the cron writer.
+        - column IS NOT NULL with ``confidence='dex_no_match'``: writer
+          visited, DexScreener returned no pair — display as "unavailable".
+        - column IS NOT NULL with ``confidence='definite'`` / ``'multi_chain'``:
+          writer succeeded; display the value with appropriate advisory.
+
+        Migration ``bl_new_liquidity_enrichment_v1``, schema_version 20260529.
+        Idempotent: PRAGMA-guarded ALTER mirrors ``_migrate_bl_quote_pair_v1``.
+
+        Both ``schema_version`` and ``paper_migrations`` rows are written —
+        the paper_migrations cutover_ts is the canonical reference point for
+        the Phase 1 measurement substrate per
+        ``tasks/design_liquidity_enrichment_b2_2026_05_29.md``.
+
+        Anti-scope: NO writer, NO ranking/filtering/alerting/sizing consumer,
+        NO modification of existing ``liquidity_usd`` semantics, NO dashboard
+        read change in this Phase 1a-i migration.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+
+            # Defensive create — mirrors _migrate_bl_quote_pair_v1.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )
+            """)
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+
+            # All columns nullable, no DEFAULT — preserves absence-vs-zero
+            # semantics per feedback_mid_flight_flag_migration.md.
+            expected_cols = {
+                "liquidity_usd_enriched": "REAL",
+                "liquidity_enriched_source": "TEXT",
+                "liquidity_enriched_at": "TEXT",
+                "liquidity_enriched_confidence": "TEXT",
+            }
+            cur_pragma = await conn.execute("PRAGMA table_info(candidates)")
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            for col, coltype in expected_cols.items():
+                if col in existing_cols:
+                    _log.info(
+                        "schema_migration_column_action",
+                        migration="bl_new_liquidity_enrichment_v1",
+                        col=col,
+                        action="skip_exists",
+                    )
+                else:
+                    await conn.execute(
+                        f"ALTER TABLE candidates ADD COLUMN {col} {coltype}"
+                    )
+                    _log.info(
+                        "schema_migration_column_action",
+                        migration="bl_new_liquidity_enrichment_v1",
+                        col=col,
+                        action="added",
+                    )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (
+                    20260529,
+                    now_iso,
+                    "bl_new_liquidity_enrichment_v1_candidates_enrichment_cols",
+                ),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations "
+                "(name, cutover_ts) VALUES (?, ?)",
+                ("bl_new_liquidity_enrichment_v1", now_iso),
+            )
+
+            await conn.commit()
+        except Exception as e:
+            _log.exception(
+                "schema_migration_failed",
+                migration="bl_new_liquidity_enrichment_v1",
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception(
+                    "schema_migration_rollback_failed",
+                    migration="bl_new_liquidity_enrichment_v1",
+                    err=str(rb_err),
+                    err_type=type(rb_err).__name__,
+                )
+            _log.error(
+                "SCHEMA_DRIFT_DETECTED",
+                migration="bl_new_liquidity_enrichment_v1",
+            )
+            raise
+
+        # Post-assertion mirrors _migrate_bl_quote_pair_v1 (R6 pattern).
+        cur = await conn.execute(
+            "SELECT description FROM schema_version WHERE version = ?",
+            (20260529,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "bl_new_liquidity_enrichment_v1 schema_version row "
+                "missing after migration"
+            )
+        if row[0] != "bl_new_liquidity_enrichment_v1_candidates_enrichment_cols":
+            raise RuntimeError(
+                "bl_new_liquidity_enrichment_v1 schema_version description "
+                "mismatch — expected "
+                "'bl_new_liquidity_enrichment_v1_candidates_enrichment_cols', "
+                f"got {row[0]!r}. Possible version-collision; investigate "
+                "before continuing."
+            )
+        cur = await conn.execute(
+            "SELECT cutover_ts FROM paper_migrations WHERE name = ?",
+            ("bl_new_liquidity_enrichment_v1",),
+        )
+        if (await cur.fetchone()) is None:
+            raise RuntimeError(
+                "bl_new_liquidity_enrichment_v1 paper_migrations row "
+                "missing after migration"
+            )
+
+        # Post-assertion 2: all 4 columns present in candidates.
+        cur = await conn.execute("PRAGMA table_info(candidates)")
+        final_cols = {row[1] for row in await cur.fetchall()}
+        missing = set(expected_cols.keys()) - final_cols
+        if missing:
+            raise RuntimeError(
+                "bl_new_liquidity_enrichment_v1 schema migration incomplete: "
+                f"missing columns {missing}"
             )
 
     async def _migrate_reject_reason_extend_v2(self) -> None:
