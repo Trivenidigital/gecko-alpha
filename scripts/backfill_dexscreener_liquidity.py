@@ -250,7 +250,8 @@ async def resolve_row(
             return liquidity, "dexscreener_v1", "definite"
         return None, "dexscreener_v1", "dex_no_match"
 
-    # CG slug → platforms mapping (deterministic; NEVER /dex/search?q=).
+    # CG slug → platforms mapping (deterministic resolution only;
+    # symbol-fuzzy endpoints are banned by the static scanner).
     platforms = await resolve_cg_slug_to_platforms(session, contract_address)
     if platforms is None:
         # Transient — let caller skip without clobbering prior write.
