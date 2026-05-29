@@ -130,9 +130,13 @@ async def resolve_cg_slug_to_platforms(
     ``localization``) to minimize bandwidth — only the small platforms
     block is needed.
     """
-    await coingecko_limiter.acquire()
+    # Check backoff BEFORE acquire so a known-throttled state doesn't
+    # waste a rate-budget slot. (Reviewer fold: previous order acquired
+    # the slot then no-op'd; harmless but less considerate to the
+    # shared CG budget.)
     if coingecko_limiter.is_backing_off():
         return None
+    await coingecko_limiter.acquire()
     url = f"{CG_BASE}/coins/{slug}"
     params = {
         "localization": "false",
