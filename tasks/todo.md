@@ -1839,3 +1839,30 @@ Tracker-promotion soak gate (PR #281) cleared 2026-05-29 with 14 mature days at 
 - Scarcity compression of 4-6× required (current 19.3/day vs 3-5/day target).
 - Tracker corpus currently produces 0 alerts/day; build PR may default to paper-only for first iteration and defer tracker-side alert work.
 - FastAPI wire-shape memory applies to all alert-intent surface work: no `response_model` on `/api/alert_intent`; bare-dict passthrough; contract firewall as source of truth.
+
+## gainers_early autosuspend §9c attribution (2026-05-29 — closed-with-verdict)
+
+### BL-NEW-GAINERS-EARLY-2026-05-19-AUTOSUSPEND-ATTRIBUTION (SHIPPED-WITH-VERDICT — autosuspend JUSTIFIED)
+
+- Findings: `tasks/findings_gainers_early_autosuspend_attribution_2026_05_29.md`
+- Pinned prod cutoffs: KEEP_ON 2026-05-13T04:05:02.142Z (audit id=24, n=128 +$894 net) → hard_loss 2026-05-19T01:02:14.744149+00:00 (audit id=28, n=251, net $-368, drawdown $-2509).
+- Cause-by-cause verdict:
+  - **Real regime shift: DOMINANT.** Every signal had negative net in window; losers_contrarian -$18.78/trade ~ gainers_early -$18.40/trade.
+  - **Hard-loss gate overfire: NOT supported.** Gate fired on real cumulative degradation, not phantom.
+  - **Code/config change: RULED OUT.** No commit between 2026-05-13 and 2026-05-19T01:02:14Z touched gainers_early entry, exit, or autosuspend gate logic. PR #170 (held-position-refresh) was the only mid-window trade-behavior change and IMPROVES outcomes post-fix.
+  - **Price/exit bug: NOT A BUG.** stop_loss correctly fired on 32 trades for -$2,632 net; peak_fade + trailing_stop produced +$1,612 net across 51 trades — exit logic was working.
+  - **Stale-price: MINOR (~14%).** 12 trades / -$327 attributable; held-position-refresh fix enabled mid-window at 2026-05-18T16:16:07Z and was already closing the cause as the window progressed.
+- Headline: the 2026-05-19T01:02:14Z auto-suspend was justified. No build-PR fix warranted; the underlying cause (regime shift) is not a code defect.
+
+### BL-NEW-AUTOSUSPEND-CROSS-SIGNAL-CALIBRATION-AUDIT (PROPOSED — low priority)
+
+- Goal: read-only audit answering "why did losers_contrarian (-$1,672 net in same window) NOT trigger hard_loss when its per-trade loss magnitude was nearly identical to gainers_early?"
+- Hypothesis: cumulative-pre-window state differential — losers_contrarian had a larger positive cushion, so the gate's net-floor check did not fire.
+- Sizing: read-only diagnostic with same shape as PR #310 (liquidity) / PR #312 (price-path) — query `paper_trades` + `signal_params_audit` per-signal, compute cumulative-pre-window state, compare gate trigger conditions.
+- Anti-scope: no gate threshold tuning, no re-enablement, no policy change.
+- Gating: low priority; the gainers_early auto-suspend findings already validate the gate fired correctly. This audit refines per-signal calibration understanding only.
+
+### Cross-cutting (re-enablement path)
+
+- Re-enabling gainers_early is OPERATOR-AUTHORIZED via the revival evaluator (PR #150), not via a fix-PR. Current signal_params still shows `enabled=0, suspended_reason=hard_loss, updated_at=2026-05-19T01:02:14.744149+00:00` as of audit at 2026-05-29.
+- Out of scope for this PR per operator constraint "no re-enable or policy change in the same PR."
