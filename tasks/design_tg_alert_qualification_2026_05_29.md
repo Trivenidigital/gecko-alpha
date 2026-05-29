@@ -94,6 +94,30 @@ The eventual build PR for `/api/alert_intent` MUST honor (each enforced via dedi
 6. Default `would_dispatch_alert: false` for every row until operator-action telemetry exists.
 7. Scarcity-target compression demonstrated against the 19.3/day baseline before any `would_dispatch_alert: true` is permitted in any row.
 
+### Wire-shape binding (forecloses the PR-C 3-hotfix pattern explicitly)
+
+The PR-C sparkline series required 3 hotfix PRs (#315/#316/#317) because the response envelope changed field semantics. The build PR MUST name and bind the three specific failure modes:
+
+8. **Absence-vs-null binding.** Optional row fields (`dispatch_blocked_reason`, and any other field whose semantic is "absent = green-state"):
+   - When present, the field carries factual value.
+   - When green-state, the field MUST be **absent** (key not in row), NOT serialized as `null`.
+   - Contract firewall asserts via `"dispatch_blocked_reason" not in row` when `row["would_dispatch_alert"] is True`.
+   - Conversely, `dispatch_blocked_reason` MUST be present (and a known enum string) when `would_dispatch_alert is False`.
+
+9. **Identity-True / Identity-False on booleans.** All boolean fields (`would_dispatch_alert`, `default_dispatch_blocked`, `operator_action_telemetry_available`, and any meta `not_for_*` flag):
+   - MUST be exactly Python `True` or `False` literals on the server.
+   - Contract firewall MUST use `is True` / `is False` identity checks, NOT truthiness. Reject `1`, `0`, `"true"`, `"false"`, `1.0`, `None`.
+   - The check pattern mirrors `_check_sparkline_meta_flag` and `_check_market_benchmarks` from existing firewall.
+
+10. **Numeric type fidelity.** Integer-semantic fields (`scarcity_target_per_day`, `scarcity_window_hours`, `rows_returned`, etc.):
+    - MUST be Python `int` (not `float`). Pydantic `list[list[float]]`-style coercion is BANNED.
+    - Contract firewall asserts `type(value) is int` for integer-semantic fields (NOT `isinstance(value, (int, float))` which would accept the float-coerced wire shape).
+    - Floats are permitted only for inherently fractional fields (e.g., per-coin deltas like `btc_4h_pct`).
+
+11. **No new fields added to `TodaysFocusMeta` or any other existing Pydantic model.** The alert-intent surface MUST be a NEW Pydantic model (if any) — and even then, per §5 above, ideally none.
+
+12. **No re-decoration of `/api/todays_focus` or `/api/trade_inbox` with `response_model=...`.** PR #317 removed this; future PRs MUST NOT re-add it.
+
 ## Migration Plan (from current `tg_alert_log` dispatch to design)
 
 The current dispatch path (`scout/alerter.py` + per-signal call sites) is NOT touched in this design. Migration is a deferred decision:
@@ -110,7 +134,7 @@ The build PR (`/api/alert_intent` endpoint + dashboard surface) is gated on:
 
 1. **`BL-NEW-TG-ALERT-OPERATOR-ACTION-TELEMETRY` shipped.** Without this, `default_dispatch_blocked: true` is permanent; the build PR's purpose evaporates.
 2. **Scarcity compression algorithm pinned** in the build PR's plan doc: which signals, which gates, which dedup window. Must demonstrate ≤5/day on backtest against the 14-day baseline.
-3. **Per-corpus decision pinned**: paper-only first vs paper+tracker simultaneously. Operator approval before build.
+3. **Per-corpus decision pinned with concrete criterion**: paper-only first OR paper+tracker simultaneously. Pin via a measurable criterion in the build PR's plan-doc (e.g., "paper-only iff tracker-corpus alerts-per-day projected ≥1 would consume scarcity budget paper needs"). Operator approval before build.
 4. **Contract firewall surface added** for `/api/alert_intent` (parallel structure to `check_todays_focus_contract.py`).
 5. **All anti-scope items above re-validated** at build-PR plan-review phase.
 
