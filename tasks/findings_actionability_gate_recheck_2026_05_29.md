@@ -14,7 +14,7 @@
 PRs #183 and #184 merged 2026-05-21 as docs-only. Three follow-up backlog items pinned implementation to a symmetric `n_actionable≥20 AND n_exploratory≥5` data gate. The 2026-05-26 re-validation found the row-count gate CLEARED (55+16) but the verdict was **"CLEARED / no immediate implementation authorized"** because:
 
 1. Exploratory `n=16` was below 20 for directional classifier-quality claims.
-2. The strongest false-negative lead — below-$10M `chain_completed` blocked by `v1_block_core_signal_mcap_below_10m` — was at `n=12` and still net negative.
+2. The strongest false-negative lead — below-$10M `chain_completed` blocked by `v1_block_core_signal_mcap_below_10m` — was at `n=12` (the chain_completed+below_10m pair; the reason `v1_block_core_signal_mcap_below_10m` summed across signals was `n=13` on 2026-05-26) and still net negative.
 3. Exit-shape dominated PnL across both cohorts.
 
 The 2026-05-26 follow-up trigger was: revisit the below-$10M `chain_completed` bucket "when that same signal/reason pair reaches at least `n=20` closed rows, or if the bucket turns positive after outlier checks." Today is +3 days; this finding tests that trigger.
@@ -74,7 +74,7 @@ Per today (n=92+30):
 
 ## Attribution — Regime Window Overlap
 
-The 3-day separation compression matches the 2026-05-13→2026-05-19 gainers_early auto-suspend regime window described in `tasks/findings_gainers_early_autosuspend_attribution_2026_05_29.md` (PR #320). The closing-trades window since 2026-05-26 partially overlaps with the regime-degradation tail. Per that finding, every signal had net loss in the window; per-trade losses were nearly identical across signals.
+The 3-day separation compression is attributable to market-wide regime degradation that began in the 2026-05-13→2026-05-19 gainers_early auto-suspend window and persisted through the post-2026-05-26 closing-trades window described here. The auto-suspend reversed (`tg_alert_eligible` flip) at 2026-05-19T01:02:14Z, but the underlying regime that drove the auto-suspend continued degrading PnL across all signals through this PR's window. Per `tasks/findings_gainers_early_autosuspend_attribution_2026_05_29.md` (PR #320), every signal had net loss in the original window with nearly identical per-trade losses across signals — the same pattern persists in today's refresh.
 
 This is structurally consistent with the 2026-05-26 finding's caveat that "exit policy dominates the PnL shape across both cohorts" — under a regime where the exit policy gets repeatedly tripped, both cohorts share the exposure.
 
