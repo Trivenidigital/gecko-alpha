@@ -450,3 +450,129 @@ async def test_todays_focus_sparkline_field_is_none_excluded_not_null(client):
     for row in payload["rows"]:
         assert "price_path_points" not in row
     assert "sparkline_is_visual_price_history_only" not in payload["meta"]
+
+
+# PR-D: market_benchmarks endpoint integration tests. Per the new
+# feedback_fastapi_wire_shape_reviewer_pattern memory, these tests catch
+# any future Pydantic re-introduction that would change the wire shape.
+
+
+async def test_todays_focus_benchmarks_present_when_btc_sol_have_points(client):
+    c, db = client
+    await _insert_open_trade(db._conn, token_id="paper-bench")
+    # Insert volume_history_cg points for both bitcoin and solana within 4h
+    # AND points for the paper row's token_id so the cohort renders.
+    await _insert_volume_history_points(db._conn, coin_id="paper-bench", n=24)
+    now = datetime.now(timezone.utc)
+    # Bitcoin: oldest at -3h, latest at -0.5h
+    for hours_ago, price in ((3.0, 60000.0), (2.0, 60500.0), (0.5, 61200.0)):
+        await db._conn.execute(
+            "INSERT INTO volume_history_cg "
+            "(coin_id, symbol, name, volume_24h, market_cap, price, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "bitcoin",
+                "BTC",
+                "Bitcoin",
+                1.0,
+                1.0,
+                price,
+                (now - timedelta(hours=hours_ago)).isoformat(),
+            ),
+        )
+    for hours_ago, price in ((3.5, 150.0), (1.0, 152.5)):
+        await db._conn.execute(
+            "INSERT INTO volume_history_cg "
+            "(coin_id, symbol, name, volume_24h, market_cap, price, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "solana",
+                "SOL",
+                "Solana",
+                1.0,
+                1.0,
+                price,
+                (now - timedelta(hours=hours_ago)).isoformat(),
+            ),
+        )
+    await db._conn.commit()
+
+    resp = await c.get("/api/todays_focus?window_hours=36")
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    _assert_todays_focus_contract(payload)
+
+    meta = payload["meta"]
+    assert "market_benchmarks" in meta
+    benchmarks = meta["market_benchmarks"]
+    assert "btc_4h_pct" in benchmarks
+    assert "sol_4h_pct" in benchmarks
+    # Per the new wire-shape memory: assert exact numeric type AND not bool.
+    btc = benchmarks["btc_4h_pct"]
+    sol = benchmarks["sol_4h_pct"]
+    assert isinstance(btc, (int, float)) and not isinstance(btc, bool)
+    assert isinstance(sol, (int, float)) and not isinstance(sol, bool)
+    # Delta sign sanity: btc is up, sol is up.
+    assert btc > 0
+    assert sol > 0
+    # Strict identity for the meta flag (matching the contract firewall).
+    assert meta.get("market_benchmarks_is_visual_context_only") is True
+
+
+async def test_todays_focus_benchmarks_omitted_when_no_data(client):
+    """Absence-vs-null semantic: both market_benchmarks AND the flag must
+    be KEY-ABSENT (not serialized as null) when no benchmark resolves.
+
+    This is exactly the regression the PR-C hotfix series surfaced.
+    """
+    c, db = client
+    await _insert_open_trade(db._conn, token_id="paper-no-bench")
+    # No bitcoin/solana volume_history_cg rows inserted; no paper-side
+    # sparkline rows either. Both optional surfaces should be absent.
+
+    resp = await c.get("/api/todays_focus?window_hours=36")
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    _assert_todays_focus_contract(payload)
+    meta = payload["meta"]
+    assert "market_benchmarks" not in meta, (
+        f"market_benchmarks must be key-absent (not null); "
+        f"got {meta.get('market_benchmarks')!r}"
+    )
+    assert "market_benchmarks_is_visual_context_only" not in meta, (
+        f"market_benchmarks_is_visual_context_only must be key-absent; "
+        f"got {meta.get('market_benchmarks_is_visual_context_only')!r}"
+    )
+
+
+async def test_todays_focus_benchmarks_only_btc_when_solana_missing(client):
+    """One benchmark resolves, one doesn't: only the present key included."""
+    c, db = client
+    await _insert_open_trade(db._conn, token_id="paper-half")
+    now = datetime.now(timezone.utc)
+    for hours_ago, price in ((3.0, 60000.0), (0.5, 60300.0)):
+        await db._conn.execute(
+            "INSERT INTO volume_history_cg "
+            "(coin_id, symbol, name, volume_24h, market_cap, price, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "bitcoin",
+                "BTC",
+                "Bitcoin",
+                1.0,
+                1.0,
+                price,
+                (now - timedelta(hours=hours_ago)).isoformat(),
+            ),
+        )
+    await db._conn.commit()
+
+    resp = await c.get("/api/todays_focus?window_hours=36")
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    _assert_todays_focus_contract(payload)
+    meta = payload["meta"]
+    assert "market_benchmarks" in meta
+    assert "btc_4h_pct" in meta["market_benchmarks"]
+    assert "sol_4h_pct" not in meta["market_benchmarks"]
+    assert meta.get("market_benchmarks_is_visual_context_only") is True

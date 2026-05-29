@@ -158,6 +158,16 @@ def test_todays_focus_tab_is_wired_with_local_storage_only_state():
     assert "todays-focus-sparkline-unavailable" in panel
     assert "Sparkline unavailable" in panel
     assert 'aria-label="Sparkline unavailable"' in panel
+    # PR-D — BTC + SOL benchmark strip imported and rendered inline
+    # within todays-focus-heading meta chips. Aria-label strict-pinned.
+    assert "import BtcSolBenchmarkStrip from './BtcSolBenchmarkStrip'" in panel
+    assert "<BtcSolBenchmarkStrip benchmarks={meta.market_benchmarks} />" in panel
+    # The strip lives inside .todays-focus-heading (siblings of
+    # todays-focus-meta chips), NOT as a banner above/below the rows.
+    heading_start = panel.find("<div className=\"todays-focus-heading\">")
+    heading_end = panel.find("</div>", heading_start)
+    assert heading_start != -1 and heading_end != -1
+    assert "BtcSolBenchmarkStrip" in panel[heading_start:heading_end]
     assert panel.index("todays-focus-list") < panel.index("todays-focus-usage")
     assert "save_for_review" in panel
     assert "dismiss" in panel
@@ -196,6 +206,33 @@ def test_todays_focus_mobile_constraints_and_no_table_layout():
     # alongside the existing meta-chip font-size rule (no horizontal overflow).
     assert ".todays-focus-sparkline" in css
     assert ".todays-focus-sparkline-unavailable" in css
+    # PR-D — benchmark chips uniformly styled (no sign-based color branch).
+    assert ".todays-focus-benchmark" in css
+    assert ".todays-focus-benchmark-group" in css
+    # Reviewer A B2 fold: ensure .todays-focus-benchmark rule body has
+    # exactly one `color:` declaration AND no `[data-sign]`, `:has(`,
+    # `:nth-child`, or `+ .` sibling selectors that could branch color.
+    benchmark_rule_match = re.search(
+        r"\.todays-focus-benchmark\s*\{([^}]*)\}", css, re.S
+    )
+    assert benchmark_rule_match
+    benchmark_rule_body = benchmark_rule_match.group(1)
+    color_decls = re.findall(r"\bcolor\s*:", benchmark_rule_body)
+    assert len(color_decls) == 1, (
+        f".todays-focus-benchmark must have exactly one color declaration; "
+        f"got {len(color_decls)}"
+    )
+    # No conditional / sibling / has selector should branch the benchmark color.
+    for forbidden in (
+        ".todays-focus-benchmark[data-sign",
+        ".todays-focus-benchmark:nth-child",
+        ".todays-focus-benchmark:has(",
+        ".todays-focus-benchmark + .",
+    ):
+        assert forbidden not in css, (
+            f"Forbidden conditional selector {forbidden!r} would branch "
+            "benchmark color by sign; ban via plan anti-scope §5."
+        )
     assert "min-width: 0" in css
     assert "width: 100%" in css
     assert "min-height: calc(100vh - 170px)" in css
@@ -205,6 +242,43 @@ def test_todays_focus_mobile_constraints_and_no_table_layout():
     assert mobile
     assert ".todays-focus-detail-grid" in mobile.group(0)
     assert "grid-template-columns: 1fr" in mobile.group(0)
+
+
+def test_todays_focus_benchmark_strip_has_no_regime_or_advice_vocabulary():
+    """PR-D Reviewer A N8 fold: static-scan BtcSolBenchmarkStrip.jsx for
+    regime/advice vocabulary. The strip emits only numeric deltas; any
+    sentiment/regime word in the source file is a smuggle attempt."""
+    strip = (
+        ROOT / "dashboard" / "frontend" / "components" / "BtcSolBenchmarkStrip.jsx"
+    ).read_text(encoding="utf-8")
+    banned_vocab = (
+        "risk-on",
+        "risk-off",
+        "range-bound",
+        "choppy",
+        "size up",
+        "sit out",
+        "take profit",
+        "trending",
+        "consolidating",
+        "blow-off",
+        "capitulation",
+        "fading",
+        "pumping",
+    )
+    lowered = strip.lower()
+    for token in banned_vocab:
+        assert token.lower() not in lowered, (
+            f"BtcSolBenchmarkStrip.jsx contains regime/advice token {token!r}"
+        )
+    # SVG anti-scope inherited from Sparkline pattern (defense in depth
+    # even though this component is text-only today).
+    for tag in ("<text", "<tspan", "<title", "<desc", "<circle", "<rect"):
+        assert tag not in strip, (
+            f"BtcSolBenchmarkStrip.jsx contains banned SVG tag {tag!r}"
+        )
+    # aria-label strict-pinned.
+    assert 'aria-label="BTC and SOL 4-hour deltas"' in strip
 
 
 def test_todays_focus_sparkline_component_has_no_banned_svg_substrings():
@@ -248,6 +322,8 @@ def test_todays_focus_frontend_copy_stays_factual():
         ROOT / "dashboard" / "frontend" / "todayFocusAge.js",
         # PR-C — extend factual-copy scan to cover the Sparkline component.
         ROOT / "dashboard" / "frontend" / "components" / "Sparkline.jsx",
+        # PR-D — extend factual-copy scan to cover the BTC + SOL benchmark strip.
+        ROOT / "dashboard" / "frontend" / "components" / "BtcSolBenchmarkStrip.jsx",
     ]
     text = "\n".join(p.read_text(encoding="utf-8") for p in paths if p.exists()).lower()
     text = re.sub(r'target="_blank"', "", text)
@@ -300,3 +376,7 @@ def test_committed_dashboard_dist_references_existing_signal_trust_bundle():
     # PR-C — sparkline className + fallback literal shipped to dist.
     assert "todays-focus-sparkline" in bundle_text
     assert "Sparkline unavailable" in bundle_text
+    # PR-D — benchmark chip className + literal labels shipped to dist.
+    assert "todays-focus-benchmark" in bundle_text
+    assert "BTC 4h" in bundle_text
+    assert "SOL 4h" in bundle_text

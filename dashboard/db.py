@@ -1893,6 +1893,55 @@ SPARKLINE_LOOKBACK_HOURS = 24
 INFINITY_GUARD_MAX = 1e308
 
 
+BENCHMARK_LOOKBACK_HOURS = 4
+BENCHMARK_COIN_IDS = ("bitcoin", "solana")
+
+
+async def _fetch_benchmark_delta_pct(
+    db: "aiosqlite.Connection", coin_id: str, cutoff_iso: str
+) -> float | None:
+    """Compute the 4h delta percentage for a benchmark coin.
+
+    Returns rounded `(latest - oldest) / oldest * 100` when both the
+    oldest and latest in-window prices are valid (0 < price < 1e308) AND
+    `volume_history_cg` returned at least 2 distinct rows. Returns None
+    otherwise. Read-only; no DB mutation.
+    """
+    if not coin_id:
+        return None
+    try:
+        cur = await db.execute(
+            "SELECT price FROM volume_history_cg "
+            "WHERE coin_id = ? AND recorded_at >= ? "
+            "AND price IS NOT NULL AND price > 0 AND price < ? "
+            "ORDER BY recorded_at ASC LIMIT 1",
+            (coin_id, cutoff_iso, INFINITY_GUARD_MAX),
+        )
+        oldest_row = await cur.fetchone()
+        if oldest_row is None:
+            return None
+        cur = await db.execute(
+            "SELECT price FROM volume_history_cg "
+            "WHERE coin_id = ? AND recorded_at >= ? "
+            "AND price IS NOT NULL AND price > 0 AND price < ? "
+            "ORDER BY recorded_at DESC LIMIT 1",
+            (coin_id, cutoff_iso, INFINITY_GUARD_MAX),
+        )
+        latest_row = await cur.fetchone()
+    except Exception:
+        return None
+    if oldest_row is None or latest_row is None:
+        return None
+    try:
+        oldest = float(oldest_row[0])
+        latest = float(latest_row[0])
+    except (TypeError, ValueError):
+        return None
+    if not (0 < oldest < INFINITY_GUARD_MAX) or not (0 < latest < INFINITY_GUARD_MAX):
+        return None
+    return round((latest - oldest) / oldest * 100.0, 2)
+
+
 async def _fetch_price_path_points(
     db: "aiosqlite.Connection", coin_id: str, cutoff_iso: str
 ) -> list[list]:
@@ -2091,23 +2140,39 @@ async def get_todays_focus(db_path: str, *, window_hours: int = 36) -> dict:
     _take_rows(source_rows, selected=selected, seen=seen, limit=max_rows)
 
     # PR-C: fetch price path points per row from volume_history_cg.
-    # Captured-once `now` matches the audit's clock-source pin.
+    # PR-D: also fetch BTC + SOL 4h benchmark deltas. Both share the same
+    # captured-once `now` (clock-source pin) and the same _ro_db
+    # connection block (reviewer correctness fold).
     now = datetime.now(timezone.utc)
     cutoff_iso = (now - timedelta(hours=SPARKLINE_LOOKBACK_HOURS)).isoformat()
+    benchmark_cutoff_iso = (
+        now - timedelta(hours=BENCHMARK_LOOKBACK_HOURS)
+    ).isoformat()
     points_by_token: dict[str, list] = {}
+    benchmarks: dict[str, float] = {}
     try:
-        async with _ro_db(db_path) as sparkline_db:
+        async with _ro_db(db_path) as conn:
             for selected_row in selected[:max_rows]:
                 token_id = selected_row.get("token_id") or ""
                 if not token_id:
                     continue
                 points_by_token[token_id] = await _fetch_price_path_points(
-                    sparkline_db, token_id, cutoff_iso
+                    conn, token_id, cutoff_iso
                 )
+            for benchmark_coin in BENCHMARK_COIN_IDS:
+                delta = await _fetch_benchmark_delta_pct(
+                    conn, benchmark_coin, benchmark_cutoff_iso
+                )
+                if delta is not None:
+                    # Key naming pinned: <coin>_4h_pct. Contract firewall
+                    # enforces allowed-keys subset {btc_4h_pct, sol_4h_pct}.
+                    key = "btc_4h_pct" if benchmark_coin == "bitcoin" else "sol_4h_pct"
+                    benchmarks[key] = delta
     except Exception:
-        # Read-only fetch failure must not break the endpoint; rows just
-        # omit sparkline data (client renders "Sparkline unavailable").
+        # Read-only fetch failure must not break the endpoint; sparkline
+        # rows omit their data, benchmarks omitted entirely.
         points_by_token = {}
+        benchmarks = {}
 
     rows = [
         _today_focus_row(
@@ -2157,6 +2222,11 @@ async def get_todays_focus(db_path: str, *, window_hours: int = 36) -> dict:
     # presence-iff-any-row-has-field with strict-True identity check.
     if any_row_has_sparkline:
         meta["sparkline_is_visual_price_history_only"] = True
+    # PR-D: same presence-iff-anything pattern for benchmarks. Contract
+    # firewall enforces strict-True identity AND absence-when-empty.
+    if benchmarks:
+        meta["market_benchmarks"] = benchmarks
+        meta["market_benchmarks_is_visual_context_only"] = True
     return {"meta": meta, "rows": rows}
 
 

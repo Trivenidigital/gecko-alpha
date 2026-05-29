@@ -88,8 +88,18 @@ EXPECTED_ROW_KEYS = frozenset(
 # force them mandatory; treating as OPTIONAL preserves the semantic.
 OPTIONAL_ROW_KEYS: frozenset[str] = frozenset({"price_path_points"})
 OPTIONAL_META_KEYS: frozenset[str] = frozenset(
-    {"sparkline_is_visual_price_history_only"}
+    {
+        "sparkline_is_visual_price_history_only",
+        # PR-D: BTC + SOL 4h benchmark strip (factual numeric only).
+        "market_benchmarks",
+        "market_benchmarks_is_visual_context_only",
+    }
 )
+# PR-D: strict-pinned allowed keys inside `meta.market_benchmarks`.
+# Operator-pinned to 2 benchmarks (2026-05-28). Any unknown sub-key
+# (including cohort-average smuggle attempts like focus_rows_avg_24h_pct)
+# fails critical.
+ALLOWED_BENCHMARK_KEYS: frozenset[str] = frozenset({"btc_4h_pct", "sol_4h_pct"})
 
 ALLOWED_SOURCE_CORPUS = {"paper", "tracker"}
 ALLOWED_WINDOW_STATES = {"open", "closing", "late", "closed", "unknown"}
@@ -586,6 +596,75 @@ def _check_sparkline_meta_flag(payload: dict, rows: list, result: Result) -> Non
             )
 
 
+def _check_market_benchmarks(payload: dict, result: Result) -> None:
+    """PR-D: validate optional `meta.market_benchmarks` + paired flag.
+
+    Same absence-iff-empty + strict-True identity discipline as the
+    sparkline meta flag. Allowed sub-keys strictly pinned to
+    `ALLOWED_BENCHMARK_KEYS`; cohort-average smuggle attempts (e.g.,
+    `focus_rows_avg_24h_pct`) fail critical here.
+    """
+    meta = payload.get("meta")
+    if not isinstance(meta, dict):
+        return
+    benchmarks_present = "market_benchmarks" in meta
+    flag_present = "market_benchmarks_is_visual_context_only" in meta
+    flag_value = meta.get("market_benchmarks_is_visual_context_only")
+
+    if not benchmarks_present:
+        if flag_present:
+            result.critical(
+                "meta.market_benchmarks_is_visual_context_only must be absent "
+                "when market_benchmarks is absent (omit rather than set False)"
+            )
+        return
+
+    # benchmarks present
+    benchmarks = meta.get("market_benchmarks")
+    if not isinstance(benchmarks, dict):
+        result.critical(
+            f"meta.market_benchmarks must be object; got "
+            f"{type(benchmarks).__name__}"
+        )
+        return
+    if not benchmarks:
+        result.critical(
+            "meta.market_benchmarks must contain at least one benchmark "
+            "(empty dict is not allowed)"
+        )
+    unknown = set(benchmarks.keys()) - ALLOWED_BENCHMARK_KEYS
+    if unknown:
+        result.critical(
+            f"meta.market_benchmarks: unknown keys {sorted(unknown)!r}; "
+            f"allowed keys are {sorted(ALLOWED_BENCHMARK_KEYS)!r}"
+        )
+    for key, value in benchmarks.items():
+        if key not in ALLOWED_BENCHMARK_KEYS:
+            continue  # already flagged above
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            result.critical(
+                f"meta.market_benchmarks.{key} must be numeric (int|float, "
+                f"not bool); got {value!r}"
+            )
+            continue
+        v = float(value)
+        if not (-1e308 < v < 1e308):
+            result.critical(
+                f"meta.market_benchmarks.{key} must be finite; got {value!r}"
+            )
+
+    if not flag_present:
+        result.critical(
+            "meta.market_benchmarks_is_visual_context_only must be present "
+            "when market_benchmarks is present"
+        )
+    elif flag_value is not True:
+        result.critical(
+            "meta.market_benchmarks_is_visual_context_only must be exactly "
+            f"True (identity check); got {flag_value!r}"
+        )
+
+
 def validate_payload(payload, *, requested_window: int = 36) -> Result:
     result = Result()
     if not isinstance(payload, dict):
@@ -608,6 +687,7 @@ def validate_payload(payload, *, requested_window: int = 36) -> Result:
     if len(row_keys) != len(set(row_keys)):
         result.critical("duplicate row_key rows are not allowed")
     _check_sparkline_meta_flag(payload, rows, result)
+    _check_market_benchmarks(payload, result)
     meta = payload.get("meta")
     if isinstance(meta, dict):
         if meta.get("rows_returned") != len(rows):
