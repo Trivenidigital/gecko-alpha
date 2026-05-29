@@ -136,6 +136,30 @@ class Settings(BaseSettings):
     # threshold (single semantic across both surfaces).
     HELD_POSITION_STALE_WARN_HOURS: int = 24
 
+    # BL-NEW-TODAYS-FOCUS-LIQUIDITY-VENUE-FACTS Phase 1a-i (2026-05-29):
+    # liquidity enrichment cron + watchdog. Writer ships in Phase 1a-ii.
+    # See tasks/design_liquidity_enrichment_b2_2026_05_29.md.
+    #
+    # DEFAULT IS FALSE — deploy-safe-by-default. Operator explicitly sets
+    # LIQUIDITY_ENRICHMENT_ENABLED=True on the VPS .env when ready to
+    # activate the cron after Phase 1a-ii lands. Watchdog respects the
+    # flag and suppresses staleness alerts when False (prevents pager
+    # fatigue during planned downtime per design's failure-mode table).
+    LIQUIDITY_ENRICHMENT_ENABLED: bool = False
+    # Per-row TTL: cron skips rows enriched within this window so a
+    # backlog drain doesn't re-hit healthy rows. 1800s (30 min) keeps
+    # data fresh enough for a 15-min cron cadence without thrashing.
+    LIQUIDITY_ENRICHMENT_TTL_SEC: int = Field(default=1800, ge=60, le=86400)
+    # Dashboard staleness gate: max(liquidity_enriched_at) older than
+    # this renders confidence='stale' regardless of stored value. 3600s
+    # (1h) is 4x the cron's per-row TTL — generous slack so transient
+    # cron-tick miss doesn't flap the UI.
+    LIQUIDITY_ENRICHMENT_STALE_SEC: int = Field(default=3600, ge=60, le=86400)
+    # Per-tick row cap. 50 rows × 4 ticks/hour = 200 rows/hour drain rate
+    # under the shared 25 req/min CG budget (each row = 1 CG call +
+    # 1-3 DexScreener calls). Initial 995-row backlog drains in ~5h.
+    LIQUIDITY_BACKFILL_BATCH_MAX: int = Field(default=50, ge=1, le=1000)
+
     # MiroFish
     MIROFISH_URL: str = "http://localhost:5001"
     # ge=1 — zero would trigger instant timeout on every call; le=600
