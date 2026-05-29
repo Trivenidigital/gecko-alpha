@@ -192,9 +192,10 @@ def test_killswitch_disabled_with_missing_schema_still_exits_0(tmp_path):
 
 def test_writer_branch_omitted_falls_through_to_row_slo(tmp_path):
     """No --writer-heartbeat-file → writer branch returns None →
-    row-rate SLO branch runs."""
+    row-rate SLO branch runs. Cohort: 2 unenriched + 8 enriched-fresh
+    out of 10 recent rows → 80% ratio, meets default 0.80 threshold."""
     db = tmp_path / "scout.db"
-    _build_db(db, recent_rows=10, recent_enriched_rows=8)
+    _build_db(db, recent_rows=2, recent_enriched_rows=8)
     res = _run_check(db, heartbeat=None)
     assert res.returncode == 0, (res.stdout, res.stderr)
     body = json.loads(res.stdout)
@@ -203,9 +204,10 @@ def test_writer_branch_omitted_falls_through_to_row_slo(tmp_path):
 
 
 def test_writer_heartbeat_fresh_falls_through_to_row_slo(tmp_path):
-    """Heartbeat present + fresh → writer branch returns None → row SLO runs."""
+    """Heartbeat present + fresh → writer branch returns None → row SLO runs.
+    Same 8/10 fresh-coverage cohort as above."""
     db = tmp_path / "scout.db"
-    _build_db(db, recent_rows=10, recent_enriched_rows=8)
+    _build_db(db, recent_rows=2, recent_enriched_rows=8)
     heartbeat = tmp_path / "heartbeat"
     heartbeat.touch()
 
@@ -290,9 +292,9 @@ def test_pending_past_escalation_threshold_escalates_to_never_fired(tmp_path):
 def test_writer_recovery_clears_pending_since(tmp_path):
     """When writer recovers (heartbeat fresh) the pending-since marker
     is removed so the next genuine pending observation gets a fresh
-    timer."""
+    timer. Cohort 5/5 enriched-fresh so row-SLO passes after fallthrough."""
     db = tmp_path / "scout.db"
-    _build_db(db, recent_rows=5)
+    _build_db(db, recent_enriched_rows=5)
     heartbeat = tmp_path / "heartbeat"
     pending_since = heartbeat.with_name(heartbeat.name + ".pending-since")
 
