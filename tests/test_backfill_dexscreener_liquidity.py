@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +12,18 @@ import aiohttp
 import pytest
 import aiosqlite
 from aioresponses import aioresponses
+
+
+def _cg_url(slug: str) -> "re.Pattern":
+    """CG /coins/{slug} URL pattern that ignores query params.
+
+    The cron passes localization/tickers/market_data/community_data/
+    developer_data/sparkline=false; aioresponses' default behavior
+    requires an exact URL match including query string. Pattern-match
+    keeps the test focused on the path."""
+    return re.compile(
+        rf"^https://api\.coingecko\.com/api/v3/coins/{re.escape(slug)}(\?.*)?$"
+    )
 
 from scripts.backfill_dexscreener_liquidity import (
     CG_PLATFORM_TO_DEX_CHAIN,
@@ -127,7 +140,7 @@ async def test_cg_slug_resolves_to_platforms():
     """Successful CG response with non-empty platforms returns the dict."""
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/spark-2",
+            _cg_url("spark-2"),
             payload={
                 "id": "spark-2",
                 "symbol": "spk",
@@ -146,7 +159,7 @@ async def test_cg_slug_resolves_to_platforms():
 async def test_cg_slug_404_returns_empty_dict():
     """CG 404 = slug no longer in CG → empty dict marker for unresolvable."""
     with aioresponses() as m:
-        m.get("https://api.coingecko.com/api/v3/coins/delisted", status=404)
+        m.get(_cg_url("delisted"), status=404)
         async with aiohttp.ClientSession() as session:
             result = await resolve_cg_slug_to_platforms(session, "delisted")
     assert result == {}
@@ -162,7 +175,7 @@ async def test_cg_slug_429_returns_none():
     don't assert backoff-state here because the test cooldown is 0.)"""
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/throttled", status=429
+            _cg_url("throttled"), status=429
         )
         async with aiohttp.ClientSession() as session:
             result = await resolve_cg_slug_to_platforms(
@@ -177,7 +190,7 @@ async def test_cg_slug_empty_platforms_returns_empty_dict():
     on-chain listing CG knows about. cg_slug_unresolvable in caller."""
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/abstractcoin",
+            _cg_url("abstractcoin"),
             payload={"id": "abstractcoin", "platforms": {}},
         )
         async with aiohttp.ClientSession() as session:
@@ -194,7 +207,7 @@ async def test_cg_slug_strips_empty_address_values():
     matches."""
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/halfdone",
+            _cg_url("halfdone"),
             payload={
                 "platforms": {
                     "ethereum": "0xreal",
@@ -306,7 +319,7 @@ async def test_resolve_row_dex_prefix_bypasses_cg_hop():
 async def test_resolve_row_single_chain_match_is_definite():
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/single-chain-tok",
+            _cg_url("single-chain-tok"),
             payload={"platforms": {"ethereum": "0xtokeneth"}},
         )
         m.get(
@@ -328,7 +341,7 @@ async def test_resolve_row_multi_chain_picks_highest_liquidity():
     cron picks the highest and marks `multi_chain`."""
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/multi-tok",
+            _cg_url("multi-tok"),
             payload={
                 "platforms": {
                     "ethereum": "0xeth",
@@ -357,7 +370,7 @@ async def test_resolve_row_multi_chain_picks_highest_liquidity():
 async def test_resolve_row_cg_empty_platforms_is_unresolvable():
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/abstract",
+            _cg_url("abstract"),
             payload={"platforms": {}},
         )
         async with aiohttp.ClientSession() as session:
@@ -373,7 +386,7 @@ async def test_resolve_row_cg_empty_platforms_is_unresolvable():
 async def test_resolve_row_cg_404_is_unresolvable():
     """Slug not in CG = cg_slug_unresolvable (not a transient skip)."""
     with aioresponses() as m:
-        m.get("https://api.coingecko.com/api/v3/coins/delisted", status=404)
+        m.get(_cg_url("delisted"), status=404)
         async with aiohttp.ClientSession() as session:
             liquidity, source, confidence = await resolve_row(
                 session, "delisted"
@@ -391,7 +404,7 @@ async def test_resolve_row_cg_429_returns_transient_skip():
     Per feedback_resilience_layered_failure_modes.md."""
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/throttled", status=429
+            _cg_url("throttled"), status=429
         )
         async with aiohttp.ClientSession() as session:
             liquidity, source, confidence = await resolve_row(
@@ -408,7 +421,7 @@ async def test_resolve_row_dex_no_match_when_dex_returns_empty():
     dex_no_match."""
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/no-dex",
+            _cg_url("no-dex"),
             payload={"platforms": {"ethereum": "0xeth"}},
         )
         m.get(
@@ -432,7 +445,7 @@ async def test_resolve_row_unmapped_cg_platform_falls_through_to_no_match():
     Honors operator guardrail #3: deterministic resolution only."""
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/exotic-chain-tok",
+            _cg_url("exotic-chain-tok"),
             payload={
                 "platforms": {
                     "kava": "0xkava",  # not in mapping
@@ -598,7 +611,7 @@ async def test_run_tick_writes_enrichment_and_touches_heartbeat(
     settings = cron_settings()
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/test-slug",
+            _cg_url("test-slug"),
             payload={"platforms": {"ethereum": "0xtest"}},
         )
         m.get(
@@ -721,7 +734,7 @@ async def test_run_tick_transient_cg_429_skips_row_without_clobbering(
 
     with aioresponses() as m:
         m.get(
-            "https://api.coingecko.com/api/v3/coins/throttle-tok",
+            _cg_url("throttle-tok"),
             status=429,
         )
         visited, enriched, errored = await run_tick(db, hb, settings)
@@ -753,7 +766,7 @@ async def test_run_tick_respects_batch_max(tmp_path, cron_settings):
         # Mock CG + DEX for first 3 rows (in fetch order, by slug name)
         for i in range(20):
             m.get(
-                f"https://api.coingecko.com/api/v3/coins/slug_{i}",
+                _cg_url(f"slug_{i}"),
                 payload={"platforms": {"ethereum": f"0x{i}"}},
             )
             m.get(

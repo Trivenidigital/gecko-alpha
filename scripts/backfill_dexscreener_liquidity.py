@@ -13,9 +13,10 @@ and populates the 4 Phase 1a-i columns by resolving via:
      address) pair. Confidence ``multi_chain`` when more than one
      chain resolves; the highest-liquidity match wins.
 
-**Deterministic resolution only.** Never calls DexScreener
-``/dex/search?q=`` — symbol-fuzzy resolution is structurally banned per
-the design (operator guardrail #3 + ``tests/test_no_symbol_fuzzy_resolution.py``).
+**Deterministic resolution only.** Never calls the DexScreener symbol-
+fuzzy lookup endpoint — symbol-fuzzy resolution is structurally banned
+per the design (operator guardrail #3). The boundary is mechanically
+enforced via the substring scanner in ``tests`` for the cron path.
 
 **Fail-soft per token.** One bad token cannot abort the batch — each
 row's resolution is wrapped in ``try/except``; on exception, the row is
