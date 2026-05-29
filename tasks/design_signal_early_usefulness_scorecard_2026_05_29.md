@@ -467,7 +467,7 @@ for each signal_type group:
            "actionable_rate": rate_or_null(...),
        },
        "appeared_on_gainers_timing": (                         # only if supported
-           {"before_peak":x,"after_peak":y,"surfaced_no_move":z,"not_surfaced":w}
+           {"before_peak":x,"after_peak":y,"surfaced_no_observed_move":z,"not_surfaced":w}
            if metric5_data_path_available else "unsupported_for_signal"),
     }
     emit { "status":"OK", "corpus":corpus, "n_total":n_total, "multi_fire_rows":multi_fire_rows,
@@ -594,7 +594,7 @@ against mis-attributing the outcome to the wrong lever.
           "liquidity_fact_rate": 0.55,
           "actionable_rate": 0.74
         },
-        "appeared_on_gainers_timing": {"before_peak":70,"after_peak":18,"surfaced_no_move":9,"not_surfaced":21}
+        "appeared_on_gainers_timing": {"before_peak":70,"after_peak":18,"surfaced_no_observed_move":9,"not_surfaced":21}
       }
     },
     "chain_completed": {
@@ -692,7 +692,7 @@ relative to `FIXED_NOW`.
 3. **Metric 5 — appeared-on-gainers timing + unsupported_for_signal**
    - `test_metric5_before_peak` / `test_metric5_after_peak` (gainers cohort,
      `appeared_on_gainers_at` vs peak).
-   - `test_metric5_surfaced_no_move`.
+   - `test_metric5_surfaced_no_observed_move`.
    - **`test_metric5_unsupported_for_non_gainers_signal`** (review fix 1) — a
      chain/momentum signal with no `gainers_comparisons` join ⇒
      `appeared_on_gainers_timing == "unsupported_for_signal"` and
@@ -764,6 +764,36 @@ relative to `FIXED_NOW`.
     - **`test_top_level_keys_allowlist_includes_total_rows`** (review fix 12) —
       keys ⊆ {audited_at, params, total_rows, signals, schema_findings}; none match
       the forbidden ranking/alert regex.
+
+---
+
+## 7b. Fold round 2 (post-Codex BLOCK, 2026-05-29)
+
+A second offline review round ran after the implementation: **Codex returned
+BLOCK** (2 CRITICAL silent-failure findings + 2 IMPORTANT), the statistical
+subagent returned APPROVE-WITH-FOLDS, and the structural subagent APPROVE. This
+round mirrors the precondition / exit-2 pattern that cleared Codex on the sibling
+`scripts/audit_clean_price_path.py`. Each fold is pinned by a test (TDD).
+
+| # | Finding (severity) | Fix | Pinning test(s) |
+|---|---|---|---|
+| 1 | `_load_price_path` swallowed `sqlite3.Error → []` → a missing/renamed `volume_history_cg` masqueraded as an unjoinable row with exit 0 (**Codex CRITICAL**) | Removed the swallow. Added a **schema precondition** in `main()` (`_schema_precondition_error`) verifying the REQUIRED `volume_history_cg` table + `coin_id`/`price`/`recorded_at` columns BEFORE `build_report`; absent → `{"status":"error","stage":"schema",...}` exit 2. `build_report` is wrapped in a top-level `try/except sqlite3.Error → stage="query"` exit 2. `INSUFFICIENT_DATA` now means ONLY "schema OK but `n_joinable < min_n`." | `test_main_exit2_when_price_table_missing`, `test_main_exit2_when_price_column_missing`, `test_query_time_error_surfaces_exit2`, `test_insufficient_data_only_means_schema_ok_low_n` |
+| 2 | A missing/renamed REQUIRED `paper_trades` column became an empty cohort with exit 0 (**Codex CRITICAL**) | Added `paper_trades` table + `entry_price`/`token_id`/`signal_type`/`opened_at` to the schema precondition → exit 2 stage="schema". Amended the pre-existing `test_schema_findings_pragma_runtime_missing_entry_price` to ALSO assert exit 2 through `main()` (the build_report-direct path still degrades gracefully via the schema_findings flag, since it is reached only AFTER the precondition in production). | `test_main_exit2_when_paper_trades_required_column_missing`, amended `test_schema_findings_pragma_runtime_missing_entry_price` (~tests:1104), amended `test_main_missing_required_tables_returns_schema_exit2` |
+| 3 | metric5 / snapshot loaders swallowed schema drift into semantic buckets — a missing `appeared_on_gainers_at` became a false `not_surfaced`; a snapshot drift became false fresh_price/liquidity (**Codex IMPORTANT**) | OPTIONAL-cohort tables now schema-guarded: `_gainers_metric5_schema_ok` / `_snapshot_schema_ok`. On drift, emit `metric5_data_path_available=False` + `unsupported_for_signal` (NOT `not_surfaced`), and at-detection facts collapse to None (NOT False). New per-signal `metric5_schema_unavailable` flag + top-level `schema_findings.metric5_schema_unavailable` / `snapshot_facts_schema_unavailable`. | `test_metric5_column_drift_is_unsupported_not_not_surfaced`, `test_snapshot_column_drift_facts_none_not_false` |
+| 4 | `favorable_reached_rate` gated only on overall n → confident rate from a tiny mature sample (**Codex IMPORTANT + statistical I2**) | `favorable_reached_rate` is now a self-reporting block via `_gated_rate`: gated on the MATURE max-horizon `n` with an explicit denominator + `immature_excluded` + `low_confidence`; the `rate` is suppressed to `None` when mature `n < min_n_dist`. | `test_favorable_reached_rate_low_confidence_on_tiny_mature_n`, `test_favorable_reached_rate_confident_on_large_mature_n`, amended `test_mae_full_window_when_never_favorable` |
+| 5 | price-table-absent not self-explaining (**statistical I1**) | Subsumed by fold 1's exit-2 precondition; ALSO added top-level `price_path_source_available` bool (belt-and-suspenders for the table-exists-but-empty case where all joins are zero). | `test_price_path_source_available_true_when_rows_present`, `test_price_path_source_available_false_when_table_empty` |
+| 6 | entry-snapshot coverage masked fresh-price reading (**statistical I3**) | Added per-signal `entry_snapshot_coverage_rate` alongside `had_fresh_price_at_detection`, so a low fresh-price rate attributable to MISSING snapshot writes (a data-path gap) is visible separately from a real detection-freshness fact. | `test_entry_snapshot_coverage_rate_surfaced_per_signal` |
+| 7 | NITs | (a) metric-5 bucket dict gains a `_denominator: "n_total (incl. unjoinable)"` note; (b) doc label drift `surfaced_no_move` → reconciled to code `surfaced_no_observed_move` throughout this doc; (c) collapsed the dead `if/else` in `build_report` that set `multi_fire_rows` identically in both branches. | covered by existing metric-5 + dedup tests (`test_metric5_*`, `test_dedup_*`) |
+
+**Top-level key allow-list update:** `price_path_source_available` was added to
+`ALLOWED_TOP_LEVEL_KEYS`; it does not match the forbidden ranking/alert regex, so
+the descriptive-only contract (§4 item 3) still holds.
+
+**REQUIRED vs OPTIONAL schema (the load-bearing distinction):** the precondition
+forces exit 2 ONLY for `volume_history_cg` + `paper_trades` (the tables every
+metric depends on). `gainers_comparisons` and `paper_trade_entry_snapshots` are
+OPTIONAL-cohort tables — their absence or column drift degrades gracefully via
+`schema_findings` flags + `unsupported`/None facts, never exit 2.
 
 ---
 

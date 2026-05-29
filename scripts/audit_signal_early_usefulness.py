@@ -52,6 +52,13 @@ VENUE_ROUTE_UNSUPPORTED_REASON = (
 
 COMPARABILITY_WARNING = "MFE/MAE comparable only within similar join-rate bands"
 
+# REQUIRED schema (fold round 2): absence of any of these forces a stage="schema"
+# exit 2 in main(), NOT a silent empty cohort / INSUFFICIENT_DATA. OPTIONAL-cohort
+# tables (gainers_comparisons, paper_trade_entry_snapshots) degrade gracefully via
+# schema_findings flags — they never force exit 2.
+REQUIRED_PRICE_PATH_COLUMNS = ("coin_id", "price", "recorded_at")
+REQUIRED_PAPER_TRADES_COLUMNS = ("token_id", "signal_type", "opened_at", "entry_price")
+
 
 # --------------------------------------------------------------------------
 # Time helpers
@@ -143,6 +150,27 @@ def _rate_or_null(num: int, denom: int) -> float | None:
     return round(num / denom, 4)
 
 
+def _gated_rate(
+    num: int, denom: int, *, min_n_dist: int, immature_excluded: int
+) -> dict[str, Any]:
+    """A rate that self-reports its denominator and suppresses on small mature n.
+
+    Fold round 2 (Codex IMPORTANT + statistical I2): a rate gated only on overall
+    n_joinable can print a confident number from a handful of mature rows. This
+    helper carries ``n`` (the mature denominator), an ``immature_excluded``
+    count, and a ``low_confidence`` flag; the ``rate`` is suppressed to None when
+    ``n < min_n_dist`` so a tiny mature sample never emits a confident rate.
+    """
+    low_confidence = denom < min_n_dist
+    return {
+        "rate": None if low_confidence else _rate_or_null(num, denom),
+        "n": denom,
+        "favorable_n": num,
+        "immature_excluded": immature_excluded,
+        "low_confidence": low_confidence,
+    }
+
+
 # --------------------------------------------------------------------------
 # Cohort + price-path loading
 # --------------------------------------------------------------------------
@@ -181,19 +209,26 @@ def _load_cohort(conn: sqlite3.Connection, cutoff_iso: str) -> list[dict[str, An
 def _load_price_path(
     conn: sqlite3.Connection, token_id: str, t0_iso: str, cutoff_hi_iso: str
 ) -> list[tuple[float, datetime]]:
-    """Return [(price, recorded_at)] within [t0, cutoff_hi], price-guarded."""
+    """Return [(price, recorded_at)] within [t0, cutoff_hi], price-guarded.
+
+    Fold round 2 (Codex CRITICAL): do NOT swallow sqlite3.Error into ``[]`` here.
+    A missing/renamed volume_history_cg table or any genuine query-time failure
+    would otherwise masquerade as an unjoinable row with exit 0 — a silent
+    failure indistinguishable from "schema OK but this token has no in-window
+    points." The schema precondition in main() guarantees the table + required
+    columns exist before we get here; any residual query error is allowed to
+    propagate so the top-level handler maps it to stage="query" / exit 2.
+    An empty path now means STRICTLY "schema OK but no joinable points."
+    """
     if not token_id:
         return []
-    try:
-        cursor = conn.execute(
-            "SELECT price, recorded_at FROM volume_history_cg "
-            "WHERE coin_id = ? AND recorded_at >= ? AND recorded_at <= ? "
-            "AND price IS NOT NULL AND price > 0 AND price < ? "
-            "ORDER BY recorded_at ASC",
-            (token_id, t0_iso, cutoff_hi_iso, INFINITY_GUARD_MAX),
-        )
-    except sqlite3.Error:
-        return []
+    cursor = conn.execute(
+        "SELECT price, recorded_at FROM volume_history_cg "
+        "WHERE coin_id = ? AND recorded_at >= ? AND recorded_at <= ? "
+        "AND price IS NOT NULL AND price > 0 AND price < ? "
+        "ORDER BY recorded_at ASC",
+        (token_id, t0_iso, cutoff_hi_iso, INFINITY_GUARD_MAX),
+    )
     path = []
     for price, recorded_at in cursor.fetchall():
         ts = _parse_iso(recorded_at)
@@ -203,36 +238,96 @@ def _load_price_path(
     return path
 
 
+def _gainers_metric5_schema_ok(conn: sqlite3.Connection) -> bool:
+    """True iff the metric-5 surface-timing column path is queryable.
+
+    Fold round 2 (Codex IMPORTANT + statistical I): if gainers_comparisons exists
+    but lacks ``appeared_on_gainers_at``, the surface-timing fact is unsupported.
+    We must NOT silently bucket every gainers row as ``not_surfaced`` (a
+    misleading semantic value); instead we record a ``metric5_schema_unavailable``
+    flag and emit ``unsupported_for_signal``.
+    """
+    return _table_exists(conn, "gainers_comparisons") and _column_exists(
+        conn, "gainers_comparisons", "appeared_on_gainers_at"
+    )
+
+
+def _price_path_has_any_row(conn: sqlite3.Connection) -> bool:
+    """True iff volume_history_cg holds at least one valid price row.
+
+    Fold round 2 / statistical I1: lets the report assert
+    ``price_path_source_available`` so all-zero joins are self-explaining (table
+    present but empty) rather than read as a per-signal fact. Not swallowed:
+    callers run after the schema precondition guarantees the table/columns exist.
+    """
+    cursor = conn.execute(
+        "SELECT 1 FROM volume_history_cg "
+        "WHERE price IS NOT NULL AND price > 0 LIMIT 1"
+    )
+    return cursor.fetchone() is not None
+
+
 def _load_gainer_surface_ts(conn: sqlite3.Connection, token_id: str) -> datetime | None:
+    """Earliest appeared_on_gainers_at for the token, or None if no such row.
+
+    Fold round 2: no longer swallows sqlite3.Error. Callers guard via
+    ``_gainers_metric5_schema_ok`` so the needed column is known to exist before
+    this is called; a residual query error propagates to the stage="query"
+    handler in main(). A None return now means STRICTLY "schema OK but this
+    token has no surface timestamp," never "column missing."
+    """
     if not token_id:
         return None
-    try:
-        cursor = conn.execute(
-            "SELECT appeared_on_gainers_at FROM gainers_comparisons "
-            "WHERE coin_id = ? ORDER BY appeared_on_gainers_at ASC LIMIT 1",
-            (token_id,),
-        )
-    except sqlite3.Error:
-        return None
+    cursor = conn.execute(
+        "SELECT appeared_on_gainers_at FROM gainers_comparisons "
+        "WHERE coin_id = ? ORDER BY appeared_on_gainers_at ASC LIMIT 1",
+        (token_id,),
+    )
     row = cursor.fetchone()
     if not row or row[0] is None:
         return None
     return _parse_iso(row[0])
 
 
+SNAPSHOT_FACT_COLUMNS = (
+    "liquidity_usd_at_entry",
+    "actionability_reason_at_entry",
+    "actionable_at_entry",
+)
+
+
+def _snapshot_schema_ok(conn: sqlite3.Connection) -> bool:
+    """True iff paper_trade_entry_snapshots is present with all fact columns.
+
+    Fold round 2 (Codex IMPORTANT): a snapshot-table schema drift (table present
+    but a fact column renamed/dropped) must NOT silently produce false
+    fresh_price / liquidity facts. When this returns False, the at-detection
+    facts collapse to None (schema-unavailable), surfaced via the
+    ``snapshot_facts_schema_unavailable`` flag in schema_findings.
+    """
+    if not _table_exists(conn, "paper_trade_entry_snapshots"):
+        return False
+    return all(
+        _column_exists(conn, "paper_trade_entry_snapshots", col)
+        for col in SNAPSHOT_FACT_COLUMNS
+    )
+
+
 def _load_snapshot(
     conn: sqlite3.Connection, paper_trade_id: int
 ) -> dict[str, Any] | None:
-    """Return the entry-snapshot row for a paper trade, or None if absent."""
-    try:
-        cursor = conn.execute(
-            "SELECT liquidity_usd_at_entry, actionability_reason_at_entry, "
-            "actionable_at_entry FROM paper_trade_entry_snapshots "
-            "WHERE paper_trade_id = ? LIMIT 1",
-            (paper_trade_id,),
-        )
-    except sqlite3.Error:
-        return None
+    """Return the entry-snapshot row for a paper trade, or None if absent.
+
+    Fold round 2: no longer swallows sqlite3.Error. Callers guard via
+    ``_snapshot_schema_ok`` so the table + fact columns are known to exist; a
+    residual query error propagates to the stage="query" handler in main().
+    """
+    cursor = conn.execute(
+        "SELECT liquidity_usd_at_entry, actionability_reason_at_entry, "
+        "actionable_at_entry FROM paper_trade_entry_snapshots "
+        "WHERE paper_trade_id = ? LIMIT 1",
+        (paper_trade_id,),
+    )
     row = cursor.fetchone()
     if not row:
         return None
@@ -370,6 +465,28 @@ def _compute_row(
     return result
 
 
+def _entry_snapshot_coverage_rate(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    *,
+    snapshots_present: bool,
+) -> float | None:
+    """Fraction of cohort rows that have an entry-snapshot row.
+
+    Fold round 2 / statistical I3: this is the data-path coverage denominator.
+    A low ``fresh_price_rate`` could mean either "detection genuinely lacked a
+    fresh price" or "the snapshot writer never wrote a row." Surfacing coverage
+    separately lets a reader attribute the gap correctly. None when the snapshot
+    schema is unavailable (there is nothing to cover).
+    """
+    if not snapshots_present:
+        return None
+    if not rows:
+        return None
+    covered = sum(1 for r in rows if _load_snapshot(conn, r["id"]) is not None)
+    return _rate_or_null(covered, len(rows))
+
+
 def _at_detection_facts(
     conn: sqlite3.Connection, row: dict[str, Any], *, snapshots_present: bool
 ) -> dict[str, Any]:
@@ -454,11 +571,16 @@ def _aggregate_signal(
     fav_eps: float,
     now: datetime,
     snapshots_present: bool,
+    metric5_schema_ok: bool,
 ) -> dict[str, Any]:
     corpus = _derive_corpus(rows)
     n_total = len(rows)
 
-    metric5_supported = any(
+    # Fold round 2: metric-5 support requires BOTH the schema (table + column)
+    # AND at least one row that actually joins gainers_comparisons. If the schema
+    # is unavailable, metric5 is unsupported regardless of cohort — we never
+    # probe rows against a missing column.
+    metric5_supported = metric5_schema_ok and any(
         _load_gainer_surface_ts(conn, r["token_id"]) is not None
         or _gainers_has_row(conn, r["token_id"])
         for r in rows
@@ -486,6 +608,17 @@ def _aggregate_signal(
         "n_joinable": n_joinable,
         "n_unjoinable": n_unjoinable,
         "metric5_data_path_available": metric5_supported,
+        # Fold round 2: True when gainers_comparisons exists but lacks the
+        # appeared_on_gainers_at column. Distinguishes "schema drift, fact
+        # unsupported" from "schema OK, token simply not_surfaced."
+        "metric5_schema_unavailable": (not metric5_schema_ok),
+        # Fold round 2 / statistical I3: entry-snapshot coverage as its OWN
+        # per-signal metric, so a low fresh-price rate attributable to MISSING
+        # snapshot writes (a data-path gap) is visible separately from a real
+        # detection-freshness fact. None when the snapshot schema is unavailable.
+        "entry_snapshot_coverage_rate": _entry_snapshot_coverage_rate(
+            conn, rows, snapshots_present=snapshots_present
+        ),
     }
 
     if n_joinable < min_n:
@@ -509,15 +642,18 @@ def _aggregate_signal(
 
 
 def _gainers_has_row(conn: sqlite3.Connection, token_id: str) -> bool:
+    """True iff the token has any gainers_comparisons row.
+
+    Fold round 2: no longer swallows sqlite3.Error. Callers guard via
+    ``_gainers_metric5_schema_ok`` (which confirms the table exists) before
+    invoking; a residual query error propagates to the stage="query" handler.
+    """
     if not token_id:
         return False
-    try:
-        cursor = conn.execute(
-            "SELECT 1 FROM gainers_comparisons WHERE coin_id = ? LIMIT 1",
-            (token_id,),
-        )
-    except sqlite3.Error:
-        return False
+    cursor = conn.execute(
+        "SELECT 1 FROM gainers_comparisons WHERE coin_id = ? LIMIT 1",
+        (token_id,),
+    )
     return cursor.fetchone() is not None
 
 
@@ -569,8 +705,16 @@ def _build_metrics(
             "dist": _float_distribution(mae_values, min_samples=min_n_dist),
         },
         "mae_immature_excluded": len(immature_max),
-        "favorable_reached_rate": _rate_or_null(
-            sum(1 for f in favorable_flags if f), len(favorable_flags)
+        # Fold round 2 (Codex IMPORTANT + statistical I2): favorable_reached_rate
+        # is gated on the MATURE max-horizon n (favorable_flags already excludes
+        # immature rows) and carries its denominator + a low_confidence flag when
+        # that mature n is small. A bare confident rate from a tiny mature sample
+        # is suppressed (rate=None) so the reader is not misled.
+        "favorable_reached_rate": _gated_rate(
+            sum(1 for f in favorable_flags if f),
+            len(favorable_flags),
+            min_n_dist=min_n_dist,
+            immature_excluded=len(immature_max),
         ),
     }
 
@@ -599,15 +743,19 @@ def _build_metrics(
 
     # ---- Metric 5 ----
     if metric5_supported:
-        buckets = {
+        buckets: dict[str, Any] = {
             "before_peak": 0,
             "after_peak": 0,
             "surfaced_no_observed_move": 0,
             "not_surfaced": 0,
+            # Fold round 2 (NIT): make the denominator explicit. not_surfaced
+            # counts ALL cohort rows (incl. unjoinable) without a surface ts, so
+            # the bucket totals are over n_total, not n_joinable.
+            "_denominator": "n_total (incl. unjoinable)",
         }
         for c in computed:
             timing = c["appeared_on_gainers_timing"]
-            if timing in buckets:
+            if timing in buckets and timing != "_denominator":
                 buckets[timing] += 1
         metrics["appeared_on_gainers_timing"] = buckets
     else:
@@ -634,6 +782,30 @@ def _aggregate_facts(computed: list[dict[str, Any]]) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 # schema_findings
 # --------------------------------------------------------------------------
+
+
+def _schema_precondition_error(conn: sqlite3.Connection) -> str | None:
+    """Return a stage="schema" error string, or None if REQUIRED schema is OK.
+
+    Fold round 2 (Codex CRITICAL x2): REQUIRED schema = the price-path table
+    (volume_history_cg) + its coin_id/price/recorded_at columns, AND the cohort
+    table (paper_trades) + its entry_price/token_id/signal_type/opened_at
+    columns. A missing REQUIRED table/column forces exit 2 rather than an empty
+    cohort / all-unjoinable report with exit 0. OPTIONAL-cohort tables
+    (gainers_comparisons, paper_trade_entry_snapshots) are NOT checked here —
+    they degrade gracefully via schema_findings.
+    """
+    if not _table_exists(conn, "volume_history_cg"):
+        return "required table 'volume_history_cg' is missing."
+    for col in REQUIRED_PRICE_PATH_COLUMNS:
+        if not _column_exists(conn, "volume_history_cg", col):
+            return f"required column 'volume_history_cg.{col}' is missing."
+    if not _table_exists(conn, "paper_trades"):
+        return "required table 'paper_trades' is missing."
+    for col in REQUIRED_PAPER_TRADES_COLUMNS:
+        if not _column_exists(conn, "paper_trades", col):
+            return f"required column 'paper_trades.{col}' is missing."
+    return None
 
 
 def _schema_findings(conn: sqlite3.Connection, *, lookback_days: int) -> dict[str, Any]:
@@ -671,6 +843,23 @@ def _schema_findings(conn: sqlite3.Connection, *, lookback_days: int) -> dict[st
         "ptes_has_liquidity_usd_at_entry": _column_exists(
             conn, "paper_trade_entry_snapshots", "liquidity_usd_at_entry"
         ),
+        # Fold round 2: explicit schema-drift flags for the OPTIONAL-cohort
+        # tables. True means the table exists but a needed column is absent, so
+        # the corresponding fact degrades to unsupported/None rather than a
+        # misleading semantic value (not_surfaced / false fresh_price).
+        "metric5_schema_unavailable": (
+            _table_exists(conn, "gainers_comparisons")
+            and not _column_exists(
+                conn, "gainers_comparisons", "appeared_on_gainers_at"
+            )
+        ),
+        "snapshot_facts_schema_unavailable": (
+            _table_exists(conn, "paper_trade_entry_snapshots")
+            and not all(
+                _column_exists(conn, "paper_trade_entry_snapshots", col)
+                for col in SNAPSHOT_FACT_COLUMNS
+            )
+        ),
         "venue_route_unsupported_reason": VENUE_ROUTE_UNSUPPORTED_REASON,
         "alternate_price_history_tables_present": {
             name: _table_exists(conn, name) for name in ALTERNATE_PRICE_HISTORY_TABLES
@@ -702,14 +891,26 @@ def build_report(
     # degrade gracefully: emit schema_findings with the False flag and an empty
     # cohort rather than crashing. A genuinely-missing paper_trades table still
     # raises sqlite3.Error -> surfaced as a stage:"query" failure by main().
-    required_cols = ("token_id", "signal_type", "opened_at", "entry_price")
     if _table_exists(conn, "paper_trades") and not all(
-        _column_exists(conn, "paper_trades", col) for col in required_cols
+        _column_exists(conn, "paper_trades", col)
+        for col in REQUIRED_PAPER_TRADES_COLUMNS
     ):
         cohort: list[dict[str, Any]] = []
     else:
         cohort = _load_cohort(conn, cutoff_iso)
-    snapshots_present = _table_exists(conn, "paper_trade_entry_snapshots")
+    # Fold round 2: snapshot "presence" now means the FULL fact schema is
+    # queryable (table + all fact columns), so a column-renamed table degrades to
+    # None facts instead of producing false fresh_price / liquidity values.
+    snapshots_present = _snapshot_schema_ok(conn)
+    metric5_schema_ok = _gainers_metric5_schema_ok(conn)
+    # Fold round 2 / statistical I1: belt-and-suspenders flag so a reader of the
+    # all-zero-join per-signal blocks is not misled when volume_history_cg exists
+    # but is EMPTY (the schema precondition only proves the table/columns exist).
+    price_path_source_available = (
+        _table_exists(conn, "volume_history_cg")
+        and _column_exists(conn, "volume_history_cg", "price")
+        and _price_path_has_any_row(conn)
+    )
 
     # Group by signal_type (never dedup across signals).
     by_signal: dict[str, list[dict[str, Any]]] = {}
@@ -729,15 +930,16 @@ def build_report(
             fav_eps=fav_eps,
             now=now,
             snapshots_present=snapshots_present,
+            metric5_schema_ok=metric5_schema_ok,
         )
-        if block.get("status") == "OK":
-            block["multi_fire_rows"] = multi_fire
-        else:
-            block["multi_fire_rows"] = multi_fire
+        # Fold round 2 (NIT): collapse the dead if/else that set multi_fire_rows
+        # identically in both branches.
+        block["multi_fire_rows"] = multi_fire
         signals[signal_type] = block
 
     return {
         "audited_at": _utc_iso_z(now),
+        "price_path_source_available": price_path_source_available,
         "params": {
             "horizons_h": horizons_h,
             "min_n": min_n,
@@ -763,6 +965,7 @@ def _format_human(report: dict[str, Any]) -> str:
     p = report["params"]
     lines = [
         f"audited_at:    {report['audited_at']}",
+        f"price_path_source_available: {report['price_path_source_available']}",
         f"horizons_h:    {p['horizons_h']}",
         f"min_n:         {p['min_n']}  min_n_dist: {p['min_n_dist']}",
         f"fav_eps:       {p['fav_eps']}  dedup: {p['dedup']}",
@@ -780,7 +983,12 @@ def _format_human(report: dict[str, Any]) -> str:
         )
         lines.append(
             f"    metric5_data_path_available="
-            f"{block['metric5_data_path_available']}"
+            f"{block['metric5_data_path_available']} "
+            f"metric5_schema_unavailable={block.get('metric5_schema_unavailable')}"
+        )
+        lines.append(
+            f"    entry_snapshot_coverage_rate="
+            f"{block.get('entry_snapshot_coverage_rate')}"
         )
         if block["status"] != "OK":
             continue
@@ -802,7 +1010,12 @@ def _format_human(report: dict[str, Any]) -> str:
         lines.append(
             f"    mae_before_favorable  = n={mae['n']}{mae_marker} dist={mae['dist']}"
         )
-        lines.append(f"    favorable_reached_rate= {metrics['favorable_reached_rate']}")
+        fav = metrics["favorable_reached_rate"]
+        fav_marker = " LOW_CONFIDENCE" if fav["low_confidence"] else ""
+        lines.append(
+            f"    favorable_reached_rate= rate={fav['rate']} n={fav['n']}"
+            f"{fav_marker}"
+        )
         lines.append(f"    at_detection_facts    = {metrics['at_detection_facts']}")
         lines.append(
             f"    appeared_on_gainers   = {metrics['appeared_on_gainers_timing']}"
@@ -888,20 +1101,34 @@ def main() -> int:
         conn.close()
         return _emit_error("db_open", str(exc), args.json)
 
-    # ---- Build report (stage: query) ----
     try:
-        report = build_report(
-            conn,
-            horizons_h=horizons_h,
-            min_n=args.min_n,
-            min_n_dist=args.min_n_dist,
-            fav_eps=args.fav_eps,
-            lookback_days=args.lookback_days,
-            dedup=not args.no_dedup,
-            now=now,
-        )
-    except sqlite3.Error as exc:
-        return _emit_error("query", str(exc), args.json)
+        # ---- Schema precondition (stage: schema, exit 2) ----
+        # Fold round 2 (Codex CRITICAL x2): verify the REQUIRED tables + columns
+        # exist BEFORE building the report. Without this, a missing/renamed
+        # volume_history_cg or a paper_trades column drift would surface as an
+        # empty / all-unjoinable report with exit 0 — a silent failure. After
+        # this gate, INSUFFICIENT_DATA means STRICTLY "schema OK but
+        # n_joinable < min_n," never "schema broken."
+        schema_error = _schema_precondition_error(conn)
+        if schema_error is not None:
+            return _emit_error("schema", schema_error, args.json)
+
+        # ---- Build report (stage: query, exit 2 on sqlite error) ----
+        # Fold round 2: any genuine query-time sqlite error now propagates here
+        # and maps to exit 2 instead of being swallowed into a silent bucket.
+        try:
+            report = build_report(
+                conn,
+                horizons_h=horizons_h,
+                min_n=args.min_n,
+                min_n_dist=args.min_n_dist,
+                fav_eps=args.fav_eps,
+                lookback_days=args.lookback_days,
+                dedup=not args.no_dedup,
+                now=now,
+            )
+        except sqlite3.Error as exc:
+            return _emit_error("query", str(exc), args.json)
     finally:
         conn.close()
 

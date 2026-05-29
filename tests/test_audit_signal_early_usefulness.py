@@ -24,6 +24,7 @@ FIXED_NOW = datetime(2026, 5, 29, 22, 0, 0, tzinfo=timezone.utc)
 # Allow-list of permitted top-level report keys (review fix 12: includes total_rows).
 ALLOWED_TOP_LEVEL_KEYS = {
     "audited_at",
+    "price_path_source_available",
     "params",
     "total_rows",
     "signals",
@@ -384,7 +385,11 @@ def test_mae_full_window_when_never_favorable(audit, db):
     report = _run(audit, db, min_n=1, min_n_dist=1)
     m = report["signals"]["gainers_early"]["metrics"]
     assert m["mae_before_favorable"]["dist"]["min"] == pytest.approx(-0.20)
-    assert m["favorable_reached_rate"] == pytest.approx(0.0)
+    # Fold round 2 (statistical I2): favorable_reached_rate is now a self-reporting
+    # block (rate + denominator + low_confidence), not a bare float. With min_n_dist=1
+    # the single mature row is confident, so the rate is the 0.0 value.
+    assert m["favorable_reached_rate"]["rate"] == pytest.approx(0.0)
+    assert m["favorable_reached_rate"]["n"] == 1
 
 
 # --------------------------------------------------------------------------
@@ -1027,8 +1032,13 @@ def test_main_db_open_failure_returns_2(audit, tmp_path, monkeypatch, capsys):
     assert json.loads(out)["stage"] == "db_open"
 
 
-def test_main_query_failure_returns_2(audit, tmp_path, monkeypatch, capsys):
-    # A valid DB file that lacks the paper_trades table -> query failure.
+def test_main_missing_required_tables_returns_schema_exit2(
+    audit, tmp_path, monkeypatch, capsys
+):
+    # Fold round 2: a DB lacking the REQUIRED tables is now caught by the schema
+    # precondition (stage="schema"), NOT a deeper query failure. Previously this
+    # asserted stage="query" — amended because the precondition now fires first,
+    # which is the correct, earlier, self-explaining failure.
     path = tmp_path / "scout.db"
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE unrelated (x INTEGER)")
@@ -1038,7 +1048,7 @@ def test_main_query_failure_returns_2(audit, tmp_path, monkeypatch, capsys):
     rc = audit.main()
     out = capsys.readouterr().out
     assert rc == 2
-    assert json.loads(out)["stage"] == "query"
+    assert json.loads(out)["stage"] == "schema"
 
 
 def test_main_smoke_empty_db_returns_0(audit, db, monkeypatch, capsys):
@@ -1102,6 +1112,13 @@ def test_module_imports_no_business_modules(audit):
 
 
 def test_schema_findings_pragma_runtime_missing_entry_price(audit, db):
+    # Fold round 2 (Codex CRITICAL): a REQUIRED paper_trades column drift
+    # (entry_price dropped) must NOT silently become an empty cohort with
+    # exit 0. Through main() it now surfaces as stage="schema" exit 2. The
+    # build_report-direct call still degrades gracefully (schema_findings flag
+    # False) because that entrypoint is reached only AFTER main()'s precondition
+    # passes — but a defensive empty-cohort there must never reach exit 0 via
+    # main().
     path, conn = db
     conn.execute("DROP TABLE paper_trades")
     conn.execute(
@@ -1110,8 +1127,20 @@ def test_schema_findings_pragma_runtime_missing_entry_price(audit, db):
         "signal_type TEXT NOT NULL, opened_at TEXT NOT NULL, chain TEXT NOT NULL)"
     )
     conn.commit()
+    # build_report-direct still degrades gracefully (the flag is the contract).
     report = _run(audit, db, min_n=1, min_n_dist=1)
     assert report["schema_findings"]["paper_trades_has_entry_price"] is False
+    # ...but through main() the same drift is a stage="schema" exit 2, NOT
+    # total_rows=0 / exit 0.
+    import sys as _sys
+
+    saved = _sys.argv
+    try:
+        _sys.argv = ["audit", "--db", str(path), "--json"]
+        rc = audit.main()
+    finally:
+        _sys.argv = saved
+    assert rc == 2
 
 
 def test_schema_findings_pragma_runtime_missing_price(audit, db):
@@ -1122,6 +1151,299 @@ def test_schema_findings_pragma_runtime_missing_price(audit, db):
     report = _run(audit, db, min_n=1, min_n_dist=1)
     assert report["schema_findings"]["volume_history_cg_has_price"] is False
     assert report["schema_findings"]["volume_history_cg_has_recorded_at"] is True
+
+
+# --------------------------------------------------------------------------
+# 13b. Fold round 2 — schema precondition + query-stage exit 2 (Codex CRITICAL)
+# --------------------------------------------------------------------------
+
+
+def test_main_exit2_when_price_table_missing(audit, tmp_path, monkeypatch, capsys):
+    # paper_trades present but volume_history_cg (REQUIRED price-path table) gone.
+    path = tmp_path / "scout.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE paper_trades ("
+        "id INTEGER PRIMARY KEY, token_id TEXT, signal_type TEXT, "
+        "opened_at TEXT, entry_price REAL)"
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(sys, "argv", ["audit", "--db", str(path), "--json"])
+    rc = audit.main()
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert json.loads(out)["stage"] == "schema"
+
+
+def test_main_exit2_when_price_column_missing(audit, tmp_path, monkeypatch, capsys):
+    # volume_history_cg present but missing the REQUIRED 'price' column.
+    path = tmp_path / "scout.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE paper_trades ("
+        "id INTEGER PRIMARY KEY, token_id TEXT, signal_type TEXT, "
+        "opened_at TEXT, entry_price REAL)"
+    )
+    conn.execute("CREATE TABLE volume_history_cg (coin_id TEXT, recorded_at TEXT)")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(sys, "argv", ["audit", "--db", str(path), "--json"])
+    rc = audit.main()
+    out = capsys.readouterr().out
+    assert rc == 2
+    payload = json.loads(out)
+    assert payload["stage"] == "schema"
+    assert "price" in payload["error"]
+
+
+def test_main_exit2_when_paper_trades_required_column_missing(
+    audit, tmp_path, monkeypatch, capsys
+):
+    # Fold round 2 (Codex CRITICAL #2): a REQUIRED paper_trades column drift
+    # must be a stage="schema" exit 2, not an empty cohort / exit 0.
+    path = tmp_path / "scout.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE volume_history_cg (coin_id TEXT, price REAL, recorded_at TEXT)"
+    )
+    # paper_trades WITHOUT entry_price.
+    conn.execute(
+        "CREATE TABLE paper_trades ("
+        "id INTEGER PRIMARY KEY, token_id TEXT, signal_type TEXT, opened_at TEXT)"
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(sys, "argv", ["audit", "--db", str(path), "--json"])
+    rc = audit.main()
+    out = capsys.readouterr().out
+    assert rc == 2
+    payload = json.loads(out)
+    assert payload["stage"] == "schema"
+    assert "entry_price" in payload["error"]
+
+
+def test_query_time_error_surfaces_exit2(audit, db, monkeypatch, capsys):
+    # A query-time sqlite error AFTER the schema precondition passes must map to
+    # stage="query" exit 2, NOT a silent INSUFFICIENT_DATA / unjoinable bucket.
+    path, conn = db
+    _insert_trade(
+        conn,
+        trade_id=1,
+        token_id="tok",
+        signal_type="gainers_early",
+        hours_before_now=48,
+        entry_price=100.0,
+    )
+    _insert_point(conn, "tok", 110.0, 48, 30)
+    conn.commit()
+
+    def _boom(*args, **kwargs):
+        raise sqlite3.OperationalError("simulated query-time failure")
+
+    monkeypatch.setattr(audit, "_load_price_path", _boom)
+    monkeypatch.setattr(sys, "argv", ["audit", "--db", str(path), "--json"])
+    rc = audit.main()
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert json.loads(out)["stage"] == "query"
+
+
+def test_insufficient_data_only_means_schema_ok_low_n(audit, db):
+    # Schema OK, just below min_n -> INSUFFICIENT_DATA (the ONLY meaning now).
+    _populate(db[1], "tok", "gainers_early", 2)
+    report = _run(audit, db, min_n=5, min_n_dist=10)
+    sig = report["signals"]["gainers_early"]
+    assert sig["status"] == "INSUFFICIENT_DATA"
+    assert sig["n_joinable"] == 2
+
+
+# --------------------------------------------------------------------------
+# 13c. Fold round 2 — OPTIONAL-table schema drift degrades, not misleads
+# --------------------------------------------------------------------------
+
+
+def test_metric5_column_drift_is_unsupported_not_not_surfaced(audit, db):
+    # gainers_comparisons exists but lacks appeared_on_gainers_at: metric5 must
+    # be unsupported / schema-unavailable, NOT a false not_surfaced bucket.
+    path, conn = db
+    conn.execute("DROP TABLE gainers_comparisons")
+    conn.execute(
+        "CREATE TABLE gainers_comparisons "
+        "(id INTEGER PRIMARY KEY, coin_id TEXT, detected_price REAL)"
+    )
+    _insert_trade(
+        conn,
+        trade_id=1,
+        token_id="ethereum",
+        signal_type="gainers_early",
+        hours_before_now=48,
+        entry_price=100.0,
+    )
+    _insert_point(conn, "ethereum", 110.0, 48, 30)
+    conn.commit()
+    report = _run(audit, db, min_n=1, min_n_dist=1)
+    sig = report["signals"]["gainers_early"]
+    assert sig["metric5_schema_unavailable"] is True
+    assert sig["metric5_data_path_available"] is False
+    assert sig["metrics"]["appeared_on_gainers_timing"] == "unsupported_for_signal"
+    assert sig["metrics"]["appeared_on_gainers_timing"] != "not_surfaced"
+    assert report["schema_findings"]["metric5_schema_unavailable"] is True
+
+
+def test_snapshot_column_drift_facts_none_not_false(audit, db):
+    # paper_trade_entry_snapshots exists but a fact column is missing: facts must
+    # collapse to None (schema-unavailable), NOT false fresh_price/liquidity.
+    path, conn = db
+    conn.execute("DROP TABLE paper_trade_entry_snapshots")
+    conn.execute(
+        "CREATE TABLE paper_trade_entry_snapshots "
+        "(paper_trade_id INTEGER PRIMARY KEY, liquidity_usd_at_entry REAL)"
+    )
+    _insert_trade(
+        conn,
+        trade_id=1,
+        token_id="tok",
+        signal_type="gainers_early",
+        hours_before_now=48,
+        entry_price=100.0,
+    )
+    _insert_point(conn, "tok", 110.0, 48, 30)
+    conn.commit()
+    report = _run(audit, db, min_n=1, min_n_dist=1)
+    facts = report["signals"]["gainers_early"]["metrics"]["at_detection_facts"]
+    # No false facts manufactured from a drifted snapshot schema.
+    assert facts["fresh_price_rate"] is None
+    assert facts["liquidity_fact_rate"] is None
+    assert report["schema_findings"]["snapshot_facts_schema_unavailable"] is True
+
+
+# --------------------------------------------------------------------------
+# 13d. Fold round 2 — mature-n gated favorable_reached_rate (statistical I2)
+# --------------------------------------------------------------------------
+
+
+def test_favorable_reached_rate_low_confidence_on_tiny_mature_n(audit, db):
+    # Mostly-immature cohort: only 1 mature row -> favorable_reached_rate must be
+    # low_confidence with a suppressed (None) rate and an explicit denominator.
+    path, conn = db
+    # 1 mature row (48h ago, all horizons mature)
+    _insert_trade(
+        conn,
+        trade_id=1,
+        token_id="mature",
+        signal_type="gainers_early",
+        hours_before_now=48,
+        entry_price=100.0,
+    )
+    _insert_point(conn, "mature", 120.0, 48, 30)
+    # 5 immature rows (2h ago, 24h max horizon not elapsed)
+    for i in range(5):
+        _insert_trade(
+            conn,
+            trade_id=10 + i,
+            token_id=f"imm-{i}",
+            signal_type="gainers_early",
+            hours_before_now=2,
+            entry_price=100.0,
+        )
+        _insert_point(conn, f"imm-{i}", 120.0, 2, 30)
+    conn.commit()
+    report = _run(audit, db, min_n=1, min_n_dist=10)
+    fav = report["signals"]["gainers_early"]["metrics"]["favorable_reached_rate"]
+    assert fav["low_confidence"] is True
+    assert fav["rate"] is None  # suppressed: tiny mature sample
+    assert fav["n"] == 1  # mature denominator only
+    assert fav["immature_excluded"] == 5
+
+
+def test_favorable_reached_rate_confident_on_large_mature_n(audit, db):
+    # 10 mature rows, all favorable -> confident rate 1.0, not low_confidence.
+    path, conn = db
+    for i in range(10):
+        _insert_trade(
+            conn,
+            trade_id=i + 1,
+            token_id=f"m-{i}",
+            signal_type="gainers_early",
+            hours_before_now=48,
+            entry_price=100.0,
+        )
+        _insert_point(conn, f"m-{i}", 120.0, 48, 30)
+    conn.commit()
+    report = _run(audit, db, min_n=1, min_n_dist=10)
+    fav = report["signals"]["gainers_early"]["metrics"]["favorable_reached_rate"]
+    assert fav["low_confidence"] is False
+    assert fav["rate"] == pytest.approx(1.0)
+    assert fav["n"] == 10
+
+
+# --------------------------------------------------------------------------
+# 13e. Fold round 2 — price_path_source_available + entry_snapshot_coverage
+# --------------------------------------------------------------------------
+
+
+def test_price_path_source_available_true_when_rows_present(audit, db):
+    path, conn = db
+    _insert_trade(
+        conn,
+        trade_id=1,
+        token_id="tok",
+        signal_type="gainers_early",
+        hours_before_now=48,
+        entry_price=100.0,
+    )
+    _insert_point(conn, "tok", 110.0, 48, 30)
+    report = _run(audit, db, min_n=1, min_n_dist=1)
+    assert report["price_path_source_available"] is True
+
+
+def test_price_path_source_available_false_when_table_empty(audit, db):
+    # Table exists (precondition would pass) but is EMPTY -> all-zero joins are
+    # self-explaining via the top-level boolean.
+    path, conn = db
+    _insert_trade(
+        conn,
+        trade_id=1,
+        token_id="tok",
+        signal_type="gainers_early",
+        hours_before_now=48,
+        entry_price=100.0,
+    )
+    # no volume_history_cg rows inserted
+    report = _run(audit, db, min_n=1, min_n_dist=1)
+    assert report["price_path_source_available"] is False
+    assert report["signals"]["gainers_early"]["n_joinable"] == 0
+
+
+def test_entry_snapshot_coverage_rate_surfaced_per_signal(audit, db):
+    # statistical I3: coverage rate visible alongside had_fresh_price_at_detection
+    # so a low fresh-price rate from MISSING snapshot writes is distinguishable.
+    path, conn = db
+    # 2 rows, only 1 has a snapshot -> coverage 0.5
+    _insert_trade(
+        conn,
+        trade_id=1,
+        token_id="a",
+        signal_type="gainers_early",
+        hours_before_now=48,
+        entry_price=100.0,
+    )
+    _insert_point(conn, "a", 110.0, 48, 30)
+    _insert_snapshot(conn, 1, liquidity=5000.0, actionable=1)
+    _insert_trade(
+        conn,
+        trade_id=2,
+        token_id="b",
+        signal_type="gainers_early",
+        hours_before_now=48,
+        entry_price=100.0,
+    )
+    _insert_point(conn, "b", 110.0, 48, 30)
+    # trade 2 has NO snapshot
+    report = _run(audit, db, min_n=1, min_n_dist=1)
+    sig = report["signals"]["gainers_early"]
+    assert sig["entry_snapshot_coverage_rate"] == pytest.approx(0.5)
 
 
 # --------------------------------------------------------------------------
