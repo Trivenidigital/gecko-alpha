@@ -312,3 +312,143 @@ def test_sparkline_unavailable_suffixed_string_is_banned():
     result = _MOD.validate_payload(payload)
     assert not result.is_clean
     assert any("sparkline unavailable" in c.lower() for c in result.criticals)
+
+
+# PR-D: market_benchmarks contract firewall tests.
+
+def test_valid_market_benchmarks_with_flag_passes():
+    payload = _payload(
+        [_row()],
+        market_benchmarks={"btc_4h_pct": -0.5, "sol_4h_pct": 1.2},
+        market_benchmarks_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert result.is_clean, result.criticals
+
+
+def test_market_benchmarks_with_only_btc_passes():
+    """One benchmark missing is fine; the present key is sufficient."""
+    payload = _payload(
+        [_row()],
+        market_benchmarks={"btc_4h_pct": 0.0},
+        market_benchmarks_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert result.is_clean, result.criticals
+
+
+def test_market_benchmarks_without_flag_is_critical():
+    payload = _payload([_row()], market_benchmarks={"btc_4h_pct": -0.5})
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_market_benchmarks_flag_false_is_critical():
+    payload = _payload(
+        [_row()],
+        market_benchmarks={"btc_4h_pct": -0.5},
+        market_benchmarks_is_visual_context_only=False,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_market_benchmarks_flag_truthy_one_is_critical():
+    payload = _payload(
+        [_row()],
+        market_benchmarks={"btc_4h_pct": -0.5},
+        market_benchmarks_is_visual_context_only=1,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_market_benchmarks_with_string_value_is_critical():
+    payload = _payload(
+        [_row()],
+        market_benchmarks={"btc_4h_pct": "-0.5%"},
+        market_benchmarks_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_market_benchmarks_empty_dict_is_critical():
+    """Empty dict + flag = no benchmarks; should not advertise via flag."""
+    payload = _payload(
+        [_row()],
+        market_benchmarks={},
+        market_benchmarks_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_market_benchmarks_unknown_key_is_critical():
+    payload = _payload(
+        [_row()],
+        market_benchmarks={"btc_4h_pct": -0.5, "eth_4h_pct": 1.0},
+        market_benchmarks_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_market_benchmarks_cohort_average_smuggle_is_critical():
+    """Reviewer A B3 fold: pin the specific cohort-average key name.
+
+    A future implementer reading the failure message sees exactly which
+    interpretive aggregate they tried to introduce.
+    """
+    payload = _payload(
+        [_row()],
+        market_benchmarks={
+            "btc_4h_pct": -0.5,
+            "focus_rows_avg_24h_pct": 1.0,
+        },
+        market_benchmarks_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+    assert any(
+        "focus_rows_avg_24h_pct" in c for c in result.criticals
+    ), result.criticals
+
+
+def test_market_benchmarks_more_than_two_keys_is_critical():
+    """Reviewer A N3 fold: defend the 2-benchmark pin against silent expansion."""
+    payload = _payload(
+        [_row()],
+        market_benchmarks={
+            "btc_4h_pct": -0.5,
+            "sol_4h_pct": 1.0,
+            "eth_4h_pct": 2.0,
+        },
+        market_benchmarks_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_market_benchmarks_flag_without_benchmarks_field_is_critical():
+    """Inverse-absence: flag set but benchmarks dict absent must fail."""
+    payload = _payload([_row()], market_benchmarks_is_visual_context_only=True)
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_market_benchmarks_both_absent_passes():
+    """Standard cohort: no benchmarks, no flag — clean payload."""
+    result = _MOD.validate_payload(_payload([_row()]))
+    assert result.is_clean, result.criticals
+
+
+def test_market_benchmarks_zero_delta_passes():
+    """Reviewer B N6 fold: 0.0 and -0.0 are valid finite numbers."""
+    payload = _payload(
+        [_row()],
+        market_benchmarks={"btc_4h_pct": 0.0, "sol_4h_pct": -0.0},
+        market_benchmarks_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert result.is_clean, result.criticals
