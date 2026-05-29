@@ -22,6 +22,8 @@ Elapsed: ~5 days 21 hours. New trades closed in window: 123.
 
 Net swing across the window (audit-cumulative): +$894 → -$368 = **-$1,262 net loss accumulated**, with peak-to-trough drawdown -$2,509 reported.
 
+**Reconciliation note:** The window-only query (123 closed trades, net -$2,263) and the cumulative-delta number (-$1,262) differ by ~$1,000 because the n=128→n=251 cohort math is over *trade-close* events. Trades opened pre-window but closed inside the window count toward window-close (123); trades opened inside the window but not yet closed are not included. The cumulative net peaked above +$894 (~+$2,141) before crashing — explaining how a -$2,263 window-only net produces a -$1,262 cumulative-delta with a -$2,509 drawdown.
+
 ## Cause-by-Cause Investigation
 
 ### Cause 1 — Real regime shift
@@ -97,7 +99,7 @@ Exit-reason breakdown in the window (gainers_early, 123 closed):
 
 12 trades exited via `expired_stale_price` for -$327 net (-$27.25/trade) — these are trades where the held-position price_cache went stale past the staleness threshold, causing forced exits.
 
-Held-position-refresh enable (per memory `project_bl067_deployed_2026_05_04.md` and the prior session's audit) was active starting **2026-05-18T16:16:07Z**, which falls INSIDE the window (~9 hours before the auto-suspend fire). PR #170 (lane-order fix) also landed mid-window.
+Held-position-refresh enable (per `tasks/plan_held_position_price_freshness.md` / `HELD_POSITION_PRICE_REFRESH_ENABLED`, operator-flipped per prior-session audit) was active starting **2026-05-18T16:16:07Z**, which falls INSIDE the window (~9 hours before the auto-suspend fire). PR #170 (lane-order fix) also landed mid-window.
 
 Implication: trades opened before 2026-05-18T16:16Z carry the stale-price exposure; trades opened after benefit from the fix. The 12 `expired_stale_price` exits are concentrated in the pre-fix portion of the window. This cause was structurally closing as the window progressed — it does not call for a NEW fix in this PR.
 
