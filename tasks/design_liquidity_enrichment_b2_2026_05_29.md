@@ -105,12 +105,15 @@ INSERT INTO paper_migrations (name, cutover_ts) VALUES (
 
 **Rate budget:**
 
-- CG: 30 req/min Demo cap. Shared with existing ingest; coordinated via `scout/ratelimit.py` token-bucket.
+- CG: 30 req/min Demo cap (= 0.5 req/s). Shared with existing ingest; coordinated via `scout/ratelimit.py` token-bucket. Cron must NOT monopolize the bucket.
 - DexScreener: 300 req/min documented public quota; the existing per-chain ingest uses semaphore=5 concurrent.
-- One-time backfill cost: 995 CG calls + up to ~1,500 DexScreener calls (some multi-chain). At a 5-req-burst-per-second pace (10% of CG cap), ~3.3 minutes of solid backfill, multiple cron ticks.
-- Steady-state cost: ~50-100 new CG-sourced candidates per day → 50-100 CG calls/day + same on DexScreener.
+- **Per-tick budget:** bounded by `LIQUIDITY_BACKFILL_BATCH_MAX=50` rows per 15-min tick. Each row consumes 1 CG call (slug resolution) + 1-3 DexScreener calls (per resolved chain). Worst-case per tick: 50 CG + 150 DexScreener calls over 15 minutes = ~3.3 CG req/min and ~10 DexScreener req/min, well within shared budgets.
+- **Backfill drain time:** at 50 rows/tick × 4 ticks/hour = 200 rows/hour. 995-row backlog drains in ~5 hours of cron running (multiple ticks; bounded by ratelimiter).
+- **Steady-state cost:** ~50-100 new CG-sourced candidates per day → 50-100 CG calls/day + 50-300 DexScreener calls/day. Absorbed in 1-2 cron ticks per day.
 
-**Cron cadence:** every 15 min. Per-tick: bounded batch size (default `LIQUIDITY_BACKFILL_BATCH_MAX=50`) to avoid blowing the CG budget on a backlog. Backlog drains over multiple ticks.
+**Cron cadence:** every 15 min. Per-tick batch bounded by `LIQUIDITY_BACKFILL_BATCH_MAX=50` to share CG budget with ingest. Backlog drains over ~5 hours of ticks for the one-time 995-row initial run; steady-state ticks process new rows under their per-tick budget.
+
+**Killswitch read at tick start:** the cron reads `settings.LIQUIDITY_ENRICHMENT_ENABLED` at the START of each 15-min tick (not just process-start). Toggling the flag in `.env` takes effect at the next tick without requiring service restart.
 
 ### Watchdog — `scripts/check_liquidity_enrichment_lag.py`
 
@@ -146,12 +149,33 @@ Contract firewall (`scripts/check_todays_focus_contract.py`): extend `OPTIONAL_R
 
 Per guardrail #6 ("No ranking, filtering, alerting, sizing, or execution based on liquidity until coverage/accuracy is measured"), Phase 1 must produce:
 
-- **Coverage metric:** `% of (post-deploy paper cohort rows that received any enrichment write) WHERE confidence IN ('definite', 'multi_chain')`. Pre-register: ≥70% before any downstream consumer is wired.
-- **Accuracy spot-check:** for rows where BOTH `liquidity_usd > 0` (DEX-sourced ingest) AND `liquidity_usd_enriched > 0` (cron write) populated: ratio of `enriched / ingest` should be within ±20% on ≥80% of samples. Pre-register: <20% within-band on ≥20 samples → halt before downstream consumer is wired.
-- **Multi-chain rate:** % rows with `confidence='multi_chain'`. Pre-register: track but no halt criterion; informational.
-- **Unresolvable rate:** % rows with `confidence IN ('cg_slug_unresolvable', 'dex_no_match')`. Pre-register: track; if >50%, surface as a design-revisit trigger.
+- **Coverage metric (named denominator).** Coverage is measured on the **paper cohort denominator**, defined as:
+  ```sql
+  -- Denominator: candidates rows joined to paper_trades opened post-cutover
+  SELECT c.* FROM candidates c
+  INNER JOIN paper_trades p ON LOWER(c.contract_address) = LOWER(p.token_id)
+  WHERE p.opened_at >= (SELECT cutover_ts FROM paper_migrations WHERE name='bl_new_liquidity_enrichment_v1')
+  ```
+  Numerator: same set WHERE `liquidity_enriched_confidence IN ('definite', 'multi_chain')`.
+  Pre-register: **≥70%** before any downstream consumer is wired.
 
-Measurement window: 14 calendar days post-Phase-1-deploy OR n=100 stamped paper rows, whichever comes first (per §11 data-bound gating).
+- **Accuracy spot-check (separate denominator, NOT the paper cohort).** The paper cohort is structurally CG-sourced with `liquidity_usd=0`, so paper-side overlap is ~0 by construction. Accuracy must be measured on the **broader candidates set** where the DEX-side ingest also writes:
+  ```sql
+  -- Denominator: candidates rows where BOTH writers populated > 0
+  SELECT contract_address, liquidity_usd, liquidity_usd_enriched
+  FROM candidates
+  WHERE liquidity_usd > 0
+    AND liquidity_usd_enriched > 0
+    AND liquidity_enriched_confidence = 'definite'
+  ```
+  Numerator: same set WHERE `ABS(liquidity_usd_enriched - liquidity_usd) / liquidity_usd <= 0.20`.
+  Pre-register: ≥20 samples; <80% within-band → halt before downstream consumer is wired.
+
+- **Multi-chain rate:** % paper cohort rows with `confidence='multi_chain'`. Pre-register: track but no halt criterion; informational.
+
+- **Unresolvable rate:** % paper cohort rows with `confidence IN ('cg_slug_unresolvable', 'dex_no_match')`. Pre-register: track; if >50%, surface as a design-revisit trigger (CG slug→platform mapping may be sparser than assumed).
+
+**Measurement window (data-bound per §11):** 14 calendar days post-Phase-1-deploy OR n=100 paper cohort rows with enrichment writes, whichever comes first. Halt-the-soak if data-bound criterion fires earlier; do not run to calendar completion if data threshold met.
 
 ## Phased Build Sequence
 
@@ -243,7 +267,9 @@ This PR is design-only. The following are EXPLICITLY OUT OF SCOPE for this PR:
 | Multi-chain token displayed as single-chain | `confidence='multi_chain'` advisory in rendered UI. |
 | Unresolvable CG slug (no `platforms`) | `confidence='cg_slug_unresolvable'` renders `Liquidity: unavailable`. |
 | Dashboard render-time external call | Architecturally prohibited — dashboard reads DB only. Enforced by guardrail #1 + no DexScreener/CG client import in `dashboard/` code paths. |
-| Killswitch needed mid-flight | `LIQUIDITY_ENRICHMENT_ENABLED=False` halts cron writes; existing rows preserved; dashboard renders `stale` after TTL passes; no rollback migration needed. |
+| Killswitch needed mid-flight | `LIQUIDITY_ENRICHMENT_ENABLED=False` halts cron writes; existing rows preserved; dashboard renders `stale` after TTL passes; no rollback migration needed. Killswitch read at the START of each 15-min tick — no restart required. |
+| Killswitch + watchdog interaction | Watchdog also reads `LIQUIDITY_ENRICHMENT_ENABLED`. If False, watchdog suppresses SLO-breach alerts (the cron is intentionally off). This prevents pager-fatigue during planned downtime. Operator MUST manually verify cron is off; the watchdog will not signal it. |
+| Symbol-fuzzy regression introduced by future edit | Phase 1a build PR ships `tests/test_no_symbol_fuzzy_resolution.py`: a static grep test that fails if `scripts/backfill_dexscreener_liquidity.py` (or any cron-related path) contains `dex/search?q=`. Turns guardrail #3 into a runtime CI contract per the anti-scope-as-contract pattern (see `feedback_anti_scope_as_runtime_contract.md`). |
 | §12b silent state-reversal pattern | Cron writes are not state reversals; no auto-suspend / auto-disable / kill-switch trip; no §12b alert wiring required. |
 
 ## Test Plan (for the Phase 1a/1b/1c build PRs, NOT this PR)
@@ -283,7 +309,7 @@ Killswitch (no rollback needed): set `LIQUIDITY_ENRICHMENT_ENABLED=False` in `.e
 
 The operator approves THIS DESIGN — that authorizes Phase 1a's build PR to be scoped against `tasks/plan_liquidity_enrichment_b2_phase_1a.md` (a separate, future PR). Each subsequent phase requires its own approval after the prior phase's success criteria are met:
 
-- **Phase 1a → 1b gate:** ≥24h of successful cron writes; ≥1 non-zero `liquidity_enriched_at` row.
+- **Phase 1a → 1b gate:** ≥24h of successful cron writes; ≥50 non-zero `liquidity_enriched_at` rows; watchdog has not breached SLO during the window. (≥50 — not ≥1 — so the dashboard contract test has real data to render against across all 5 confidence states.)
 - **Phase 1b → 1c gate:** Phase 1b dashboard surface rendering all 5 confidence states correctly on prod data.
 - **Phase 1c → Phase 2 gate:** ≥70% definite/multi-chain coverage on the post-deploy paper cohort over 14 days OR n=100 rows; accuracy spot-check passes ±20% on ≥80% of overlap samples.
 
