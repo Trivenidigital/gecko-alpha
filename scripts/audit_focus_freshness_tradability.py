@@ -75,10 +75,26 @@ GATE_FIELD = {
 
 
 def _rate_or_null(numerator: int, denominator: int) -> Optional[float]:
-    """Return numerator/denominator, or None when denominator is zero."""
+    """Return numerator/denominator (rounded 4dp), or None when denom is zero."""
     if denominator <= 0:
         return None
-    return numerator / denominator
+    return round(numerator / denominator, 4)
+
+
+def _coerce_number(value: Any) -> Optional[float]:
+    """Return ``value`` as a float, or None if missing / non-numeric.
+
+    A bool is intentionally rejected (a numeric gate over a bool would be
+    meaningless), so ``True``/``False`` are treated as non-numeric here. This
+    lets the numeric gates treat a non-numeric value (e.g. a stray string) as
+    "missing" — surfaced in field_findings — instead of crashing on a
+    comparison.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
 
 
 def _fetch_focus_rows(endpoint_url: str, timeout: float) -> list[dict]:
@@ -86,12 +102,39 @@ def _fetch_focus_rows(endpoint_url: str, timeout: float) -> list[dict]:
     req = urllib.request.Request(endpoint_url, headers={"Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
-    if isinstance(payload, dict):
-        rows = payload.get("rows", [])
-    else:
-        rows = payload
+    return _extract_rows(payload)
+
+
+def _extract_rows(payload: Any) -> list[dict]:
+    """Validate the parsed payload shape and return its ``rows`` list.
+
+    The endpoint envelope is ``{"meta": {...}, "rows": [...]}``. A payload whose
+    shape does NOT match this — a dict missing the ``rows`` key (a schema
+    change, a ``{"data": [...]}`` envelope, or a 200 *error* envelope), or a
+    ``rows`` value that is not a list (``null``, a string, an object) — is a
+    malformed/unexpected payload. It is a fetch/schema FAILURE (-> exit 2,
+    stage="fetch"), NOT a genuinely-empty cohort. Treating it as an empty
+    cohort would yield a silent all-zero report + exit 0, which is exactly the
+    silent-failure class this diagnostic exists to surface.
+
+    The single VALID empty case is ``{"rows": []}`` — the key is present and is
+    an empty list — which returns ``[]`` (exit 0, total_rows 0). The
+    distinction is "``rows`` key present AND is a list" (valid, possibly empty)
+    vs "``rows`` key absent OR ``rows`` not a list" (malformed -> raise).
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"endpoint returned a non-object payload ({type(payload).__name__}); "
+            "expected an object with a 'rows' list"
+        )
+    if "rows" not in payload:
+        raise ValueError(
+            "endpoint payload is missing the 'rows' key "
+            f"(keys present: {sorted(payload.keys())}) — unexpected/error envelope"
+        )
+    rows = payload["rows"]
     if not isinstance(rows, list):
-        raise ValueError("endpoint did not return a rows list")
+        raise ValueError(f"endpoint 'rows' is not a list ({type(rows).__name__})")
     return rows
 
 
@@ -103,15 +146,32 @@ def _fetch_focus_rows(endpoint_url: str, timeout: float) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 
-def _gate_stale_price(row: dict, *, stale_hours: float) -> Optional[bool]:
+def _stale_uses_bool_fallback(row: dict) -> bool:
+    """True iff the stale gate would fall back to the price_is_stale bool.
+
+    The bool fallback fires when the PRIMARY ``price_staleness_minutes`` field
+    is absent/None but ``price_is_stale`` is present (not absent/None). When it
+    fires, the ``--stale-hours`` threshold cannot be honoured (a bool carries no
+    minutes), so the threshold is effectively bypassed for that row — surfaced
+    in field_findings so the bypass is visible rather than silent.
+    """
+    if not isinstance(row, dict):
+        return False
     minutes = row.get("price_staleness_minutes", _MISSING)
-    if minutes is _MISSING:
-        # Fall back to the server's boolean staleness flag if present.
-        flag = row.get("price_is_stale", _MISSING)
-        if flag is _MISSING or flag is None:
-            return None
-        return bool(flag)
+    if minutes is not _MISSING and minutes is not None:
+        return False
+    flag = row.get("price_is_stale", _MISSING)
+    return flag is not _MISSING and flag is not None
+
+
+def _gate_stale_price(row: dict, *, stale_hours: float) -> Optional[bool]:
+    if not isinstance(row, dict):
+        return None
+    minutes = _coerce_number(row.get("price_staleness_minutes", _MISSING))
     if minutes is None:
+        # Primary absent/None/non-numeric -> fall back to the server's boolean
+        # staleness flag if present (the --stale-hours threshold is bypassed
+        # for this row; surfaced in field_findings via _stale_uses_bool_fallback).
         flag = row.get("price_is_stale", _MISSING)
         if flag is _MISSING or flag is None:
             return None
@@ -120,6 +180,8 @@ def _gate_stale_price(row: dict, *, stale_hours: float) -> Optional[bool]:
 
 
 def _gate_missing_detected_price(row: dict) -> Optional[bool]:
+    if not isinstance(row, dict):
+        return None
     move = row.get("current_move_pct", _MISSING)
     if move is _MISSING:
         return None
@@ -128,20 +190,35 @@ def _gate_missing_detected_price(row: dict) -> Optional[bool]:
 
 
 def _gate_too_old_since_detection(row: dict, *, max_age_hours: float) -> Optional[bool]:
-    age = row.get("opened_age_hours", _MISSING)
-    if age is _MISSING or age is None:
+    if not isinstance(row, dict):
+        return None
+    raw = row.get("opened_age_hours", _MISSING)
+    if raw is _MISSING:
+        return None
+    age = _coerce_number(raw)
+    if age is None:
+        # present-but-None or present-but-non-numeric -> not evaluable for this
+        # row (counted in field_findings, never crashes on the comparison).
         return None
     return age > max_age_hours
 
 
 def _gate_far_moved_from_detection(row: dict, *, max_move_pct: float) -> Optional[bool]:
-    move = row.get("current_move_pct", _MISSING)
-    if move is _MISSING or move is None:
+    if not isinstance(row, dict):
+        return None
+    raw = row.get("current_move_pct", _MISSING)
+    if raw is _MISSING or raw is None:
+        return None
+    move = _coerce_number(raw)
+    if move is None:
+        # present-but-non-numeric -> not evaluable for this row (no crash).
         return None
     return abs(move) > max_move_pct
 
 
 def _gate_no_venue_route(row: dict) -> Optional[bool]:
+    if not isinstance(row, dict):
+        return None
     # chart_url is NOT emitted on the focus row -> not-evaluable on every row.
     val = row.get("chart_url", _MISSING)
     if val is _MISSING:
@@ -150,6 +227,8 @@ def _gate_no_venue_route(row: dict) -> Optional[bool]:
 
 
 def _gate_liquidity_unavailable(row: dict) -> Optional[bool]:
+    if not isinstance(row, dict):
+        return None
     # liquidity_usd is NOT on the focus row -> not-evaluable on every row.
     val = row.get("liquidity_usd", _MISSING)
     if val is _MISSING:
@@ -200,6 +279,35 @@ def build_report(
     total = len(rows)
     top_denom = min(top_n, total)
 
+    # Count non-dict (malformed) row elements: a row that is not a dict cannot
+    # be evaluated by any gate (every predicate returns None for it) and would,
+    # before this guard, have crashed on row.get(...). Surface-and-count rather
+    # than crash (exit 1) or raise (exit 2) -> the more diagnostic option.
+    malformed_rows = sum(1 for row in rows if not isinstance(row, dict))
+
+    # Stale gate: rows where the PRIMARY price_staleness_minutes is absent/None
+    # but the price_is_stale bool fallback fires -> --stale-hours bypassed.
+    stale_bool_fallback_rows = sum(1 for row in rows if _stale_uses_bool_fallback(row))
+
+    # Numeric gates: rows where the field is present-but-non-numeric (treated as
+    # missing rather than crashing the comparison).
+    age_non_numeric = sum(
+        1
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("opened_age_hours", _MISSING) is not _MISSING
+        and row.get("opened_age_hours") is not None
+        and _coerce_number(row.get("opened_age_hours")) is None
+    )
+    move_non_numeric = sum(
+        1
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("current_move_pct", _MISSING) is not _MISSING
+        and row.get("current_move_pct") is not None
+        and _coerce_number(row.get("current_move_pct")) is None
+    )
+
     # Pre-evaluate every row once.
     evaluations: list[dict[str, Optional[bool]]] = [
         _evaluate_row(
@@ -223,20 +331,59 @@ def build_report(
         topn_removed = sum(1 for ev in top_evaluations if ev[gate] is True)
 
         status = "evaluable" if evaluable_count > 0 else "not_evaluable"
+        if status == "not_evaluable":
+            # The gate cannot be evaluated on any row, so its top-N removal is
+            # UNKNOWN, not zero. Report both topN_removed and topN_removed_rate
+            # as null -> a 0 / 0.0 would falsely read as "nothing removed in the
+            # top slice" when the truth is "we could not look".
+            topn_removed_out: Optional[int] = None
+            topn_removed_rate_out = None
+        else:
+            topn_removed_out = topn_removed
+            topn_removed_rate_out = _rate_or_null(topn_removed, top_denom)
+
         per_gate[gate] = {
             "excluded_count": excluded_count,
             "evaluable_count": evaluable_count,
             "excluded_rate": _rate_or_null(excluded_count, evaluable_count),
-            "topN_removed": topn_removed,
-            "topN_removed_rate": _rate_or_null(topn_removed, top_denom),
+            "topN_removed": topn_removed_out,
+            "topN_removed_rate": topn_removed_rate_out,
             "status": status,
         }
 
-        field_findings[gate] = {
+        gate_finding = {
             "field_checked": GATE_FIELD[gate],
             "rows_missing_field": missing_count,
             "rows_missing_rate": _rate_or_null(missing_count, total),
         }
+        if malformed_rows:
+            gate_finding["malformed_rows"] = malformed_rows
+        if gate == "stale_price" and stale_bool_fallback_rows:
+            gate_finding["primary_field_missing_used_bool_fallback"] = (
+                stale_bool_fallback_rows
+            )
+        if gate == "too_old_since_detection" and age_non_numeric:
+            gate_finding["rows_non_numeric"] = age_non_numeric
+        if gate == "far_moved_from_detection" and move_non_numeric:
+            gate_finding["rows_non_numeric"] = move_non_numeric
+        field_findings[gate] = gate_finding
+
+        if gate == "stale_price" and stale_bool_fallback_rows:
+            schema_findings.append(
+                f"gate 'stale_price': {stale_bool_fallback_rows}/{total} rows missing "
+                "primary 'price_staleness_minutes' -> used 'price_is_stale' bool "
+                "fallback (--stale-hours threshold bypassed for those rows)"
+            )
+        if gate == "too_old_since_detection" and age_non_numeric:
+            schema_findings.append(
+                f"gate 'too_old_since_detection': field 'opened_age_hours' "
+                f"non-numeric on {age_non_numeric}/{total} rows (treated as missing)"
+            )
+        if gate == "far_moved_from_detection" and move_non_numeric:
+            schema_findings.append(
+                f"gate 'far_moved_from_detection': field 'current_move_pct' "
+                f"non-numeric on {move_non_numeric}/{total} rows (treated as missing)"
+            )
 
         if missing_count == total and total > 0:
             schema_findings.append(
@@ -249,7 +396,9 @@ def build_report(
                 f"{missing_count}/{total} rows"
             )
 
-    # Combined survivors over EVALUABLE gates only.
+    # Combined survivors over EVALUABLE gates only. A non-dict (malformed) row
+    # has every gate == None, so it is never a survivor and is tallied in
+    # unknown_rows; it is additionally surfaced via combined.malformed_rows.
     survivors_count = 0
     unknown_rows = 0
     top_survivors = 0
@@ -269,7 +418,13 @@ def build_report(
         "dropped_count": total - survivors_count,
         "topN_survivors": top_survivors,
         "unknown_rows": unknown_rows,
+        "malformed_rows": malformed_rows,
     }
+    if malformed_rows:
+        schema_findings.append(
+            f"{malformed_rows}/{total} rows were non-dict (malformed) and could "
+            "not be evaluated by any gate (skipped, counted as unknown)"
+        )
 
     return {
         "audited_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),

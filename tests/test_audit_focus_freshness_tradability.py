@@ -531,5 +531,257 @@ def test_main_human_output(monkeypatch, capsys):
     assert "{" in out  # json block present
 
 
+# =========================================================================== #
+# FOLD ROUND 2 (post code-review)                                              #
+# =========================================================================== #
+
+
+# --------------------------------------------------------------------------- #
+# Fold 1 [CRITICAL] — malformed payload shape -> exit 2 (fetch), but a genuine #
+# {"rows": []} stays valid -> exit 0 total_rows 0.                             #
+# --------------------------------------------------------------------------- #
+
+
+def test_extract_rows_missing_rows_key_raises():
+    # dict without a rows key (e.g. {"data":[...]} or an error envelope)
+    with pytest.raises(ValueError):
+        mod._extract_rows({})
+    with pytest.raises(ValueError):
+        mod._extract_rows({"data": [{"x": 1}]})
+
+
+def test_extract_rows_rows_null_raises():
+    with pytest.raises(ValueError):
+        mod._extract_rows({"rows": None})
+
+
+def test_extract_rows_rows_non_list_raises():
+    with pytest.raises(ValueError):
+        mod._extract_rows({"rows": "x"})
+
+
+def test_extract_rows_non_object_payload_raises():
+    # a bare list payload is no longer silently accepted as the rows list
+    with pytest.raises(ValueError):
+        mod._extract_rows([{"a": 1}])
+
+
+def test_extract_rows_empty_list_is_valid():
+    # the ONE valid empty case: key present AND value is an (empty) list
+    assert mod._extract_rows({"rows": []}) == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"data": [{"x": 1}]}, {"rows": None}, {"rows": "x"}],
+)
+def test_main_malformed_payload_returns_2(monkeypatch, capsys, payload):
+    def _fetch(url, timeout):
+        return mod._extract_rows(payload)  # raises ValueError for malformed shapes
+
+    monkeypatch.setattr(mod, "_fetch_focus_rows", _fetch)
+    rc = mod.main(["--json"])
+    assert rc == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "error"
+    assert out["stage"] == "fetch"
+
+
+def test_main_genuinely_empty_rows_list_returns_0(monkeypatch, capsys):
+    def _fetch(url, timeout):
+        return mod._extract_rows({"rows": []})
+
+    monkeypatch.setattr(mod, "_fetch_focus_rows", _fetch)
+    rc = mod.main(["--json"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["total_rows"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Fold 2 [IMPORTANT] — non-dict row element: surface-and-count, do not crash.  #
+# --------------------------------------------------------------------------- #
+
+
+def test_non_dict_row_surfaced_not_crashed():
+    rows = [_row(), None, "garbage", 123]
+    report = _report(rows)  # must not raise
+    assert report["total_rows"] == 4
+    assert report["combined"]["malformed_rows"] == 3
+    # malformed rows are never survivors and are counted as unknown
+    assert report["combined"]["survivors_count"] == 1
+    assert report["combined"]["unknown_rows"] == 3
+    # surfaced per-gate in field_findings + in schema_findings
+    assert report["field_findings"]["stale_price"]["malformed_rows"] == 3
+    assert any("malformed" in line for line in report["schema_findings"])
+
+
+# --------------------------------------------------------------------------- #
+# Fold 3 [IMPORTANT] — not-evaluable gates: topN_removed AND topN_removed_rate #
+# are null (not 0 / 0.0).                                                      #
+# --------------------------------------------------------------------------- #
+
+
+def test_not_evaluable_gates_topn_null():
+    rows = [_row(), _row(), _row()]  # no chart_url / liquidity_usd on the surface
+    report = _report(rows)
+    for name in ("no_venue_route", "liquidity_unavailable"):
+        gate = report["per_gate"][name]
+        assert gate["status"] == "not_evaluable"
+        assert gate["topN_removed"] is None
+        assert gate["topN_removed_rate"] is None
+
+
+def test_evaluable_gate_topn_still_numeric():
+    # regression guard: an EVALUABLE gate keeps numeric topN values.
+    rows = [_row(price_staleness_minutes=STALE_HOURS * 60 + 1), _row()]
+    report = _report(rows)
+    gate = report["per_gate"]["stale_price"]
+    assert gate["status"] == "evaluable"
+    assert gate["topN_removed"] == 1
+    assert gate["topN_removed_rate"] == 0.5
+
+
+# --------------------------------------------------------------------------- #
+# Fold 4 [IMPORTANT] — stale primary field absent but bool present: surface    #
+# the missing primary field (so --stale-hours bypass is visible).             #
+# --------------------------------------------------------------------------- #
+
+
+def test_stale_primary_missing_bool_present_surfaced():
+    rows = [
+        {"price_is_stale": True, "opened_age_hours": 1.0, "current_move_pct": 5.0},
+        {"price_is_stale": False, "opened_age_hours": 1.0, "current_move_pct": 5.0},
+    ]
+    report = _report(rows)
+    gate = report["per_gate"]["stale_price"]
+    # fallback still works: one stale (excluded), one not.
+    assert gate["excluded_count"] == 1
+    assert gate["evaluable_count"] == 2
+    # the bypass is surfaced, not silent.
+    ff = report["field_findings"]["stale_price"]
+    assert ff["primary_field_missing_used_bool_fallback"] == 2
+    assert any(
+        "price_staleness_minutes" in line and "fallback" in line
+        for line in report["schema_findings"]
+    )
+
+
+def test_stale_primary_present_no_fallback_finding():
+    rows = [_row()]  # has price_staleness_minutes -> no fallback finding
+    report = _report(rows)
+    ff = report["field_findings"]["stale_price"]
+    assert "primary_field_missing_used_bool_fallback" not in ff
+
+
+# --------------------------------------------------------------------------- #
+# Fold 5 [NIT] — non-numeric numeric-gate value treated as missing, no crash.  #
+# --------------------------------------------------------------------------- #
+
+
+def test_numeric_gates_non_numeric_value_not_crashed():
+    rows = [
+        {
+            "opened_age_hours": "oops",
+            "current_move_pct": "nan",
+            "price_staleness_minutes": 1.0,
+        }
+    ]
+    report = _report(rows)  # must not raise
+    age = report["per_gate"]["too_old_since_detection"]
+    move = report["per_gate"]["far_moved_from_detection"]
+    # non-numeric -> not evaluable for that gate/row
+    assert age["evaluable_count"] == 0
+    assert move["evaluable_count"] == 0
+    # surfaced distinctly
+    assert report["field_findings"]["too_old_since_detection"]["rows_non_numeric"] == 1
+    assert report["field_findings"]["far_moved_from_detection"]["rows_non_numeric"] == 1
+    assert any("non-numeric" in line for line in report["schema_findings"])
+
+
+# --------------------------------------------------------------------------- #
+# Fold 6 [NIT] — anti-scope source-grep contract tests (lock §6).             #
+# --------------------------------------------------------------------------- #
+
+import re  # noqa: E402
+
+
+def _source_body() -> str:
+    """Module source with comment/docstring lines stripped.
+
+    The docstring intentionally PARAPHRASES the banned tokens (per the
+    self-referential-grep lesson); the executable body must contain none.
+    """
+    src = MODULE_PATH.read_text(encoding="utf-8")
+    out = []
+    in_doc = False
+    for line in src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('"""') or stripped.startswith("'''"):
+            # toggle for one-line or multi-line docstrings
+            if stripped.count('"""') == 1 and stripped.count("'''") == 0:
+                in_doc = not in_doc
+            elif stripped.count("'''") == 1 and stripped.count('"""') == 0:
+                in_doc = not in_doc
+            continue
+        if in_doc:
+            continue
+        if stripped.startswith("#"):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def test_anti_scope_no_db_writes():
+    body = _source_body()
+    assert not re.search(r"\bINSERT\b", body)
+    assert not re.search(r"\bUPDATE\b", body)
+    assert not re.search(r"\bDELETE\b", body)
+    assert ".commit(" not in body
+    assert ".post(" not in body  # no requests.post / session.post
+    # the only file open is read-only; no write-mode open
+    assert not re.search(r"open\([^)]*['\"][wa]", body)
+
+
+def test_anti_scope_no_dashboard_import():
+    body = _source_body()
+    assert "import dashboard" not in body
+    assert "from dashboard" not in body
+
+
+def test_anti_scope_no_web_framework_route():
+    body = _source_body()
+    assert "@app" not in body
+    assert "@router" not in body
+    assert "FastAPI" not in body
+    assert "APIRouter" not in body
+
+
+# --------------------------------------------------------------------------- #
+# Fold 7 [NIT] — generalized topN keys + combined.topN_survivors value + 4dp.  #
+# --------------------------------------------------------------------------- #
+
+
+def test_combined_topn_survivors_value():
+    # 6 rows, first 5 = top-N. rows[1] dropped (too old) -> 4 survivors in top-N.
+    rows = [
+        _row(),  # 0 survives
+        _row(opened_age_hours=MAX_AGE_HOURS + 5),  # 1 dropped (too old)
+        _row(),  # 2 survives
+        _row(),  # 3 survives
+        _row(),  # 4 survives
+        _row(),  # 5 outside top-N
+    ]
+    report = _report(rows, top_n=5)
+    assert report["combined"]["topN_survivors"] == 4
+    assert report["combined"]["survivors_count"] == 5
+
+
+def test_rate_rounded_to_4dp():
+    # 1/3 -> 0.3333 (4dp), not 0.3333333...
+    assert mod._rate_or_null(1, 3) == 0.3333
+    assert mod._rate_or_null(2, 3) == 0.6667
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main(["-q", __file__]))

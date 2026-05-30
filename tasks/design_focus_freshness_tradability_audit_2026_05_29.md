@@ -145,7 +145,7 @@ different, complementary surface.)
 "Current top-5" = the **first 5 rows in endpoint return order**. The audit makes
 **no assumption about and no change to** how the endpoint orders rows — it simply
 takes `rows[:TOP_N]` with `TOP_N = 5`. If the endpoint returns fewer than 5 rows,
-`top5_removed` counts are computed over the rows actually present (denominator =
+`topN_removed` counts are computed over the rows actually present (denominator =
 `min(5, total_rows)`), and rates are null-when-denominator-0 (§2b). `TOP_N` is a
 module constant, overridable via `--top-n` for forward-proofing, default 5.
 
@@ -238,8 +238,8 @@ For each gate over the FULL cohort:
 excluded_count   = number of rows with excluded(row) is True
 evaluable_count  = number of rows with excluded(row) in (True, False)   # not None
 excluded_rate    = _rate(excluded_count, evaluable_count)   # null when denom 0
-top5_removed     = number of rows in rows[:TOP_N] with excluded(row) is True
-top5_removed_rate= _rate(top5_removed, min(TOP_N, total_rows))
+topN_removed     = number of rows in rows[:TOP_N] with excluded(row) is True
+topN_removed_rate= _rate(topN_removed, min(TOP_N, total_rows))  # null if gate not_evaluable
 ```
 
 `_rate(num, denom)` returns `None` when `denom == 0`, else `num / denom`
@@ -301,19 +301,20 @@ Mirrors the reference (`audited_at` Z, `params`, totals, per-gate, findings):
   },
   "total_rows": 5,
   "per_gate": {
-    "stale_price":            {"excluded_count": 1, "evaluable_count": 5, "excluded_rate": 0.20, "top5_removed": 1, "top5_removed_rate": 0.20},
-    "missing_detected_price": {"excluded_count": 0, "evaluable_count": 5, "excluded_rate": 0.0,  "top5_removed": 0, "top5_removed_rate": 0.0},
-    "too_old_since_detection":{"excluded_count": 2, "evaluable_count": 5, "excluded_rate": 0.40, "top5_removed": 2, "top5_removed_rate": 0.40},
-    "far_moved_from_detection":{"excluded_count": 1,"evaluable_count": 4, "excluded_rate": 0.25, "top5_removed": 0, "top5_removed_rate": 0.0},
-    "no_venue_route":         {"excluded_count": 0, "evaluable_count": 0, "excluded_rate": null, "top5_removed": 0, "top5_removed_rate": 0.0},
-    "liquidity_unavailable":  {"excluded_count": 0, "evaluable_count": 0, "excluded_rate": null, "top5_removed": 0, "top5_removed_rate": 0.0}
+    "stale_price":            {"excluded_count": 1, "evaluable_count": 5, "excluded_rate": 0.2, "topN_removed": 1, "topN_removed_rate": 0.2, "status": "evaluable"},
+    "missing_detected_price": {"excluded_count": 0, "evaluable_count": 5, "excluded_rate": 0.0,  "topN_removed": 0, "topN_removed_rate": 0.0, "status": "evaluable"},
+    "too_old_since_detection":{"excluded_count": 2, "evaluable_count": 5, "excluded_rate": 0.4, "topN_removed": 2, "topN_removed_rate": 0.4, "status": "evaluable"},
+    "far_moved_from_detection":{"excluded_count": 1,"evaluable_count": 4, "excluded_rate": 0.25, "topN_removed": 0, "topN_removed_rate": 0.0, "status": "evaluable"},
+    "no_venue_route":         {"excluded_count": 0, "evaluable_count": 0, "excluded_rate": null, "topN_removed": null, "topN_removed_rate": null, "status": "not_evaluable"},
+    "liquidity_unavailable":  {"excluded_count": 0, "evaluable_count": 0, "excluded_rate": null, "topN_removed": null, "topN_removed_rate": null, "status": "not_evaluable"}
   },
   "combined": {
     "survivors_count": 1,
-    "survivors_rate": 0.20,
+    "survivors_rate": 0.2,
     "dropped_count": 4,
-    "top5_survivors": 1,
-    "unknown_rows": 1
+    "topN_survivors": 1,
+    "unknown_rows": 1,
+    "malformed_rows": 0
   },
   "field_findings": {
     "no_venue_route": {"field_checked": "chart_url", "rows_missing_field": 5, "rows_missing_rate": 1.0},
@@ -533,3 +534,80 @@ separate, out-of-scope, pipeline-affecting change.
 8. **Top-N default 5.** Brief says "current top-5 (or top-N as the endpoint orders
    them)". Default `--top-n 5`; overridable. Endpoint order taken as-is (no
    re-ordering — anti-scope C2).
+
+## 8. Fold round 2 (post code-review, 2026-05-29)
+
+Code review returned one Codex **BLOCK** (1 CRITICAL silent-failure + several
+IMPORTANTs) plus two **APPROVE-WITH-FOLDS** subagent reviews. Folds applied to
+`scripts/audit_focus_freshness_tradability.py` +
+`tests/test_audit_focus_freshness_tradability.py` (TDD: pinning test first):
+
+1. **[CRITICAL — silent empty cohort on shape change]** `_fetch_focus_rows`
+   used `payload.get("rows", [])`, so a dict payload WITHOUT a `rows` key (a
+   schema change, a `{"data": [...]}` envelope, or a 200 *error* envelope), or
+   a non-list `rows` value, silently yielded an empty cohort → exit-0 all-zero
+   report — exactly the silent-failure class this diagnostic exists to prevent.
+   Extracted `_extract_rows(payload)`: raises `ValueError` (→ `main()` maps to
+   exit 2, `stage="fetch"`) when the payload is not a dict, lacks `rows`, or
+   `rows` is not a list. A genuine `{"rows": []}` (key present, empty list)
+   stays valid → exit 0, `total_rows 0`. Distinction: "`rows` present AND a
+   list" (valid, possibly empty) vs "absent OR non-list" (malformed → raise).
+   A bare-list payload is no longer silently accepted either. Pinning tests:
+   `_extract_rows` unit cases (`{}`, `{"data":...}`, `{"rows": null}`,
+   `{"rows": "x"}`, bare list → raise; `{"rows": []}` → `[]`); `main()` end-to-
+   end (4 malformed shapes → exit 2 `stage=fetch`; `{"rows": []}` → exit 0).
+
+2. **[IMPORTANT — malformed row element]** A non-dict row element (e.g.
+   `{"rows": [null]}`) would crash gate evaluation with an uncaught traceback
+   (exit 1). Every gate predicate + the combined survivor pass now skip non-dict
+   rows; the count is surfaced as `combined.malformed_rows`, per-gate
+   `field_findings[...]["malformed_rows"]`, and a `schema_findings` line
+   (surface-and-count — the more diagnostic option). Pinning test:
+   `test_non_dict_row_surfaced_not_crashed`.
+
+3. **[IMPORTANT — not-evaluable gate topN rate]** NOT-EVALUABLE gates
+   (`no_venue_route`, `liquidity_unavailable`) reported `topN_removed_rate`
+   `0.0` even though the gate cannot be evaluated. Both `topN_removed` AND
+   `topN_removed_rate` are now `null` for not-evaluable gates — a `0` would
+   falsely read as "nothing removed in the top slice" when the truth is "we
+   could not look." Evaluable gates keep numeric topN values (regression-
+   guarded). Pinning tests: `test_not_evaluable_gates_topn_null`,
+   `test_evaluable_gate_topn_still_numeric`.
+
+4. **[IMPORTANT — price_staleness_minutes masking]** When the primary
+   `price_staleness_minutes` is absent/None but the `price_is_stale` bool
+   fallback fires, the stale gate now surfaces
+   `field_findings.stale_price.primary_field_missing_used_bool_fallback` + a
+   `schema_findings` line noting `--stale-hours` is bypassed for those rows
+   (a bool carries no minutes), rather than silently using the fallback.
+   Pinning tests: `test_stale_primary_missing_bool_present_surfaced`,
+   `test_stale_primary_present_no_fallback_finding`.
+
+5. **[NIT — malformed numeric value]** Added `_coerce_number`; the numeric
+   gates (`opened_age_hours`, `current_move_pct`) treat a present-but-non-
+   numeric value (e.g. a string) as missing (surfaced via
+   `field_findings[...]["rows_non_numeric"]` + `schema_findings`) instead of
+   crashing on the comparison. Pinning test:
+   `test_numeric_gates_non_numeric_value_not_crashed`.
+
+6. **[NIT — anti-scope source-grep tests]** §6's promised source-grep anti-
+   scope contract is now locked by `MODULE_PATH.read_text()` assertions over a
+   comment/docstring-stripped body: no `INSERT`/`UPDATE`/`DELETE`/`.commit(`/
+   `.post(`/write-mode `open(...)`; no `dashboard` import; no `@app`/`@router`/
+   `FastAPI`/`APIRouter`. The body is stripped so the intentionally-paraphrased
+   docstring (per the self-referential-grep lesson) does not trip its own
+   scanner. Pinning tests: `test_anti_scope_no_db_writes`,
+   `test_anti_scope_no_dashboard_import`, `test_anti_scope_no_web_framework_route`.
+
+7. **[NITs — doc + output consistency]** Reconciled this doc's `top5_*` → the
+   implemented generalized `topN_*` keys (incl. the §3 JSON sample, below);
+   added a `combined.topN_survivors` value assertion
+   (`test_combined_topn_survivors_value`); `_rate_or_null` now rounds to 4 dp
+   to match the reference (`test_rate_rounded_to_4dp`).
+
+> **Key-name reconciliation:** the IMPLEMENTED + TESTED keys are
+> `topN_removed`, `topN_removed_rate`, and `combined.topN_survivors` (top-slice
+> size `min(top_n, total_rows)`); §1b/§2b/§2c/§3 are updated to match. All rates
+> are rounded to 4 dp. Not-evaluable gates carry `topN_removed`/
+> `topN_removed_rate` as `null` (fold 3). `combined.malformed_rows` is new
+> (fold 2).
