@@ -16,6 +16,7 @@ import NowTradableTab from './components/NowTradableTab.jsx'
 import SignalTrustTab from './components/SignalTrustTab.jsx'
 import TradeInboxTab from './components/TradeInboxTab.jsx'
 import TodayFocusPanel from './components/TodayFocusPanel.jsx'
+import WhatChangedPanel from './components/WhatChangedPanel.jsx'
 
 const DEFAULT_STATUS = {
   pipeline_status: 'connecting',
@@ -145,6 +146,12 @@ export default function App() {
           Today&apos;s Focus
         </button>
         <button
+          className={`tab-btn ${activeTab === 'what_changed' ? 'active' : ''}`}
+          onClick={() => setActiveTab('what_changed')}
+        >
+          What Changed
+        </button>
+        <button
           className={`tab-btn ${activeTab === 'trade_inbox' ? 'active' : ''}`}
           onClick={() => setActiveTab('trade_inbox')}
         >
@@ -199,6 +206,8 @@ export default function App() {
       {activeTab === 'trading' && <TradingTab />}
 
       {activeTab === 'todays_focus' && <TodayFocusPanel />}
+
+      {activeTab === 'what_changed' && <WhatChangedPanel />}
 
       {activeTab === 'trade_inbox' && <TradeInboxTab />}
 
