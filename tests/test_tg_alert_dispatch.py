@@ -331,11 +331,15 @@ async def test_notify_handles_dispatch_failure_demotes_to_dispatch_failed(
 @pytest.mark.asyncio
 async def test_notify_concurrent_only_one_sent(tmp_path, monkeypatch):
     """R2-C2 fold: 3 concurrent dispatches for same token → exactly 1
-    'sent' + 2 'blocked_cooldown'. Atomic check-then-write under
-    db._txn_lock prevents race."""
+    'sent' + 2 suppressions. Atomic check-then-write under db._txn_lock
+    prevents race.
+
+    BL-NEW-TG-ALERT-NOISE-DEDUP: suppressions are now 'blocked_dedup_24h'
+    (the 24h dedup window is the live gate); the legacy cooldown field no
+    longer drives the decision."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    settings = _settings(TG_ALERT_PER_TOKEN_COOLDOWN_HOURS=6)
+    settings = _settings(TG_ALERT_DEDUP_WINDOW_HOURS=24)
     for tid in (1, 2, 3):
         await _insert_paper_trade(db, trade_id=tid)
 
@@ -343,6 +347,11 @@ async def test_notify_concurrent_only_one_sent(tmp_path, monkeypatch):
         await asyncio.sleep(0.01)  # simulate I/O so race window opens
 
     monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+
+    async def _no_minara(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _no_minara)
     # Spawn 3 concurrent dispatches for the same token
     await asyncio.gather(
         notify_paper_trade_opened(
@@ -388,7 +397,7 @@ async def test_notify_concurrent_only_one_sent(tmp_path, monkeypatch):
     )
     counts = dict(await cur.fetchall())
     assert counts.get("sent") == 1
-    assert counts.get("blocked_cooldown") == 2
+    assert counts.get("blocked_dedup_24h") == 2
     await db.close()
 
 
@@ -760,4 +769,299 @@ async def test_notify_does_not_demote_if_persistence_cancelled_after_send(
     outcome, detail = await cur.fetchone()
     assert outcome == "sent"
     assert detail is None
+    await db.close()
+
+
+# ---------- BL-NEW-TG-ALERT-NOISE-DEDUP: 24h strict dedup slice ----------
+
+
+async def _seed_sent(db: Database, token_id: str, *, age_hours: float) -> None:
+    """Insert a prior 'sent' tg_alert_log row aged `age_hours` in the past."""
+    ts = (datetime.now(timezone.utc) - timedelta(hours=age_hours)).isoformat()
+    await db._conn.execute(
+        "INSERT INTO tg_alert_log (paper_trade_id, signal_type, token_id, "
+        "alerted_at, outcome) VALUES (NULL, 'gainers_early', ?, ?, 'sent')",
+        (token_id, ts),
+    )
+    await db._conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_dedup_suppresses_within_24h(tmp_path, monkeypatch):
+    """A prior 'sent' row inside 24h suppresses the alert: records
+    'blocked_dedup_24h', does NOT send."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings()  # default TG_ALERT_DEDUP_WINDOW_HOURS=24
+    await _insert_paper_trade(db, trade_id=42)
+    await _seed_sent(db, "bitcoin", age_hours=5)  # inside 24h
+    sent = []
+
+    async def _fake_send(text, session, settings, parse_mode=None, **kwargs):
+        sent.append(text)
+
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+    await notify_paper_trade_opened(
+        db,
+        settings,
+        session=None,
+        paper_trade_id=42,
+        signal_type="gainers_early",
+        token_id="bitcoin",
+        symbol="BTC",
+        entry_price=50000.0,
+        amount_usd=100.0,
+        signal_data={"price_change_24h": 30.0, "mcap": 1_000_000},
+    )
+    assert len(sent) == 0  # suppressed, no TG send
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE paper_trade_id=42"
+    )
+    assert (await cur.fetchone())[0] == "blocked_dedup_24h"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_dedup_allows_after_24h(tmp_path, monkeypatch):
+    """A prior 'sent' row older than 24h does NOT suppress: sends."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings()
+    await _insert_paper_trade(db, trade_id=42)
+    await _seed_sent(db, "bitcoin", age_hours=25)  # outside 24h
+    sent = []
+
+    async def _fake_send(text, session, settings, parse_mode=None, **kwargs):
+        sent.append(text)
+
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+
+    async def _no_minara(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _no_minara)
+    await notify_paper_trade_opened(
+        db,
+        settings,
+        session=None,
+        paper_trade_id=42,
+        signal_type="gainers_early",
+        token_id="bitcoin",
+        symbol="BTC",
+        entry_price=50000.0,
+        amount_usd=100.0,
+        signal_data={"price_change_24h": 30.0, "mcap": 1_000_000},
+    )
+    assert len(sent) == 1
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE paper_trade_id=42"
+    )
+    assert (await cur.fetchone())[0] == "sent"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_dedup_first_alert_for_token_sends(tmp_path, monkeypatch):
+    """No prior row for the token -> sends (first alert in window)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings()
+    await _insert_paper_trade(db, trade_id=42)
+    sent = []
+
+    async def _fake_send(text, session, settings, parse_mode=None, **kwargs):
+        sent.append(text)
+
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+
+    async def _no_minara(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _no_minara)
+    await notify_paper_trade_opened(
+        db,
+        settings,
+        session=None,
+        paper_trade_id=42,
+        signal_type="gainers_early",
+        token_id="newtoken",
+        symbol="NEW",
+        entry_price=1.0,
+        amount_usd=100.0,
+        signal_data={"price_change_24h": 30.0, "mcap": 1_000_000},
+    )
+    assert len(sent) == 1
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE paper_trade_id=42"
+    )
+    assert (await cur.fetchone())[0] == "sent"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_dedup_window_zero_disables_dedup(tmp_path, monkeypatch):
+    """TG_ALERT_DEDUP_WINDOW_HOURS=0 disables dedup: always sends, even
+    with a prior 'sent' row seconds ago (clean revert, no off-by-one)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(TG_ALERT_DEDUP_WINDOW_HOURS=0)
+    await _insert_paper_trade(db, trade_id=42)
+    await _seed_sent(db, "bitcoin", age_hours=0.01)  # ~36s ago
+    sent = []
+
+    async def _fake_send(text, session, settings, parse_mode=None, **kwargs):
+        sent.append(text)
+
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+
+    async def _no_minara(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _no_minara)
+    await notify_paper_trade_opened(
+        db,
+        settings,
+        session=None,
+        paper_trade_id=42,
+        signal_type="gainers_early",
+        token_id="bitcoin",
+        symbol="BTC",
+        entry_price=50000.0,
+        amount_usd=100.0,
+        signal_data={"price_change_24h": 30.0, "mcap": 1_000_000},
+    )
+    assert len(sent) == 1
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE paper_trade_id=42"
+    )
+    assert (await cur.fetchone())[0] == "sent"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_dedup_suppression_does_not_touch_paper_trade(tmp_path, monkeypatch):
+    """Suppression skips ONLY the TG send; the paper_trades row is
+    untouched (it is opened upstream by the engine)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings()
+    await _insert_paper_trade(db, trade_id=42)  # token_id == 'coin-42'
+    await _seed_sent(db, "coin-42", age_hours=2)
+    sent = []
+
+    async def _fake_send(text, session, settings, parse_mode=None, **kwargs):
+        sent.append(text)
+
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+    await notify_paper_trade_opened(
+        db,
+        settings,
+        session=None,
+        paper_trade_id=42,
+        signal_type="gainers_early",
+        token_id="coin-42",
+        symbol="TST",
+        entry_price=1.0,
+        amount_usd=100.0,
+        signal_data={"price_change_24h": 30.0, "mcap": 1_000_000},
+    )
+    assert len(sent) == 0
+    # Anti-scope invariant: suppression skips ONLY the TG send. The
+    # paper_trades row must still exist, untouched — same row count, same
+    # 'open' status, same entry_price the engine committed upstream. The
+    # dispatcher only reads paper_trades + writes tg_alert_log; it must never
+    # delete or mutate the trade.
+    cur = await db._conn.execute("SELECT COUNT(*) FROM paper_trades WHERE id=42")
+    assert (await cur.fetchone())[0] == 1
+    cur = await db._conn.execute(
+        "SELECT status, entry_price FROM paper_trades WHERE id=42"
+    )
+    row = await cur.fetchone()
+    assert row[0] == "open"
+    assert row[1] == 100.0  # unchanged from _insert_paper_trade
+    # And the suppression IS audited (row written to tg_alert_log only).
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE paper_trade_id=42"
+    )
+    assert (await cur.fetchone())[0] == "blocked_dedup_24h"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_dedup_audit_logs_emitted_on_send(tmp_path, monkeypatch):
+    """tg_alert_dispatched (pre-send) + tg_alert_delivered (post-send)
+    structlog events are emitted around a successful send."""
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _fake_send(text, session, settings, parse_mode=None, **kwargs):
+        pass
+
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+
+    async def _no_minara(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _no_minara)
+    with capture_logs() as cap:
+        await notify_paper_trade_opened(
+            db,
+            settings,
+            session=None,
+            paper_trade_id=42,
+            signal_type="gainers_early",
+            token_id="bitcoin",
+            symbol="BTC",
+            entry_price=50000.0,
+            amount_usd=100.0,
+            signal_data={"price_change_24h": 30.0, "mcap": 1_000_000},
+        )
+    events = [e["event"] for e in cap]
+    assert "tg_alert_dispatched" in events
+    assert "tg_alert_delivered" in events
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_dedup_audit_log_emitted_on_suppress(tmp_path, monkeypatch):
+    """tg_alert_suppressed structlog event is emitted with the full field
+    set on the suppress path."""
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings()
+    await _insert_paper_trade(db, trade_id=42)
+    await _seed_sent(db, "bitcoin", age_hours=2)
+
+    async def _fake_send(text, session, settings, parse_mode=None, **kwargs):
+        raise AssertionError("send must not be called on suppress")
+
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+    with capture_logs() as cap:
+        await notify_paper_trade_opened(
+            db,
+            settings,
+            session=None,
+            paper_trade_id=42,
+            signal_type="gainers_early",
+            token_id="bitcoin",
+            symbol="BTC",
+            entry_price=50000.0,
+            amount_usd=100.0,
+            signal_data={"price_change_24h": 30.0, "mcap": 1_000_000},
+        )
+    suppressed = [e for e in cap if e["event"] == "tg_alert_suppressed"]
+    assert len(suppressed) == 1
+    ev = suppressed[0]
+    assert ev["token_id"] == "bitcoin"
+    assert ev["signal_type"] == "gainers_early"
+    assert ev["window_hours"] == 24
+    assert ev["dedup_window_hours"] == 24
+    assert ev["reason"] == "dedup_24h"
+    assert ev["prior_alerted_at"] is not None
     await db.close()
