@@ -121,7 +121,10 @@ def test_todays_focus_tab_is_wired_with_local_storage_only_state():
     assert "tokenId={row.token_id}" in panel
     assert "symbol={title.symbol}" in panel
     assert "import { researchLinks } from '../todayFocusLinks.js'" in panel
-    assert "import { buildFocusDetailRows, primaryBlockFacts } from '../todayFocusFacts.js'" in panel
+    assert (
+        "import { buildFocusDetailRows, primaryBlockFacts } from '../todayFocusFacts.js'"
+        in panel
+    )
     assert "links.chartLabel" in panel
     assert "links.cgLabel" in panel
     assert "expandedRows" in panel
@@ -164,7 +167,7 @@ def test_todays_focus_tab_is_wired_with_local_storage_only_state():
     assert "<BtcSolBenchmarkStrip benchmarks={meta.market_benchmarks} />" in panel
     # The strip lives inside .todays-focus-heading (siblings of
     # todays-focus-meta chips), NOT as a banner above/below the rows.
-    heading_start = panel.find("<div className=\"todays-focus-heading\">")
+    heading_start = panel.find('<div className="todays-focus-heading">')
     heading_end = panel.find("</div>", heading_start)
     assert heading_start != -1 and heading_end != -1
     assert "BtcSolBenchmarkStrip" in panel[heading_start:heading_end]
@@ -268,15 +271,15 @@ def test_todays_focus_benchmark_strip_has_no_regime_or_advice_vocabulary():
     )
     lowered = strip.lower()
     for token in banned_vocab:
-        assert token.lower() not in lowered, (
-            f"BtcSolBenchmarkStrip.jsx contains regime/advice token {token!r}"
-        )
+        assert (
+            token.lower() not in lowered
+        ), f"BtcSolBenchmarkStrip.jsx contains regime/advice token {token!r}"
     # SVG anti-scope inherited from Sparkline pattern (defense in depth
     # even though this component is text-only today).
     for tag in ("<text", "<tspan", "<title", "<desc", "<circle", "<rect"):
-        assert tag not in strip, (
-            f"BtcSolBenchmarkStrip.jsx contains banned SVG tag {tag!r}"
-        )
+        assert (
+            tag not in strip
+        ), f"BtcSolBenchmarkStrip.jsx contains banned SVG tag {tag!r}"
     # aria-label strict-pinned.
     assert 'aria-label="BTC and SOL 4-hour deltas"' in strip
 
@@ -324,6 +327,11 @@ def test_todays_focus_frontend_copy_stays_factual():
         ROOT / "dashboard" / "frontend" / "components" / "Sparkline.jsx",
         # PR-D — extend factual-copy scan to cover the BTC + SOL benchmark strip.
         ROOT / "dashboard" / "frontend" / "components" / "BtcSolBenchmarkStrip.jsx",
+        # BL-NEW-DASHBOARD-WHAT-CHANGED — extend factual-copy scan to cover the
+        # new What Changed panel + its storage + facts chokepoint.
+        ROOT / "dashboard" / "frontend" / "whatChangedStorage.js",
+        ROOT / "dashboard" / "frontend" / "whatChangedFacts.js",
+        ROOT / "dashboard" / "frontend" / "components" / "WhatChangedPanel.jsx",
     ]
     text = "\n".join(p.read_text(encoding="utf-8") for p in paths if p.exists()).lower()
     text = re.sub(r'target="_blank"', "", text)
@@ -362,6 +370,7 @@ def test_committed_dashboard_dist_references_existing_signal_trust_bundle():
         ), f"dist bundle referenced by index.html is missing: {asset}"
         bundle_text += path.read_text(encoding="utf-8", errors="ignore")
 
+    assert "What Changed" in bundle_text
     assert "/api/signal_trust/scorecards" in bundle_text
     assert "Closed paper-trade evidence" in bundle_text
     assert "todays-focus-detail-grid" in bundle_text
@@ -380,3 +389,64 @@ def test_committed_dashboard_dist_references_existing_signal_trust_bundle():
     assert "todays-focus-benchmark" in bundle_text
     assert "BTC 4h" in bundle_text
     assert "SOL 4h" in bundle_text
+
+
+def test_what_changed_files_exist():
+    assert (ROOT / "dashboard" / "frontend" / "whatChangedStorage.js").exists()
+    assert (ROOT / "dashboard" / "frontend" / "whatChangedFacts.js").exists()
+    assert (
+        ROOT / "dashboard" / "frontend" / "components" / "WhatChangedPanel.jsx"
+    ).exists()
+
+
+def test_what_changed_storage_exports_required_pure_helpers():
+    text = (ROOT / "dashboard" / "frontend" / "whatChangedStorage.js").read_text(
+        encoding="utf-8"
+    )
+    assert "gecko.whatChanged.v0" in text
+    # must NOT collide with the Today's-Focus key
+    assert "gecko.todaysFocus.v0" not in text
+    for symbol in (
+        "export const STORAGE_KEY",
+        "export function blankState",
+        "export function loadState",
+        "export function saveState",
+        "export function markCurrentRowsSeen",
+        "export function diffClosedTrades",
+        "export function diffPnlSwings",
+    ):
+        assert symbol in text, f"whatChangedStorage.js missing {symbol!r}"
+    # closed-id set must be length-capped to avoid unbounded growth (Codex NIT)
+    assert "MAX_CLOSED_IDS" in text
+    # never-crash contract: tolerant getters return sentinels, loader try/catch
+    assert "return null" in text
+    assert "try {" in text
+
+
+def test_what_changed_panel_first_visit_guard_present():
+    text = (
+        ROOT / "dashboard" / "frontend" / "components" / "WhatChangedPanel.jsx"
+    ).read_text(encoding="utf-8")
+    # baseline-write-before-render guard (no one-frame flash on first visit)
+    assert "baselineReady" in text
+
+
+def test_what_changed_tab_wired_in_app():
+    text = (ROOT / "dashboard" / "frontend" / "App.jsx").read_text(encoding="utf-8")
+    assert "import WhatChangedPanel" in text
+    assert "What Changed" in text
+    assert "activeTab === 'what_changed'" in text
+    assert "<WhatChangedPanel" in text
+
+
+def test_committed_dist_references_what_changed_bundle():
+    dist = ROOT / "dashboard" / "frontend" / "dist"
+    index_html = (dist / "index.html").read_text(encoding="utf-8")
+    matches = re.findall(r'src="/assets/([^"]+\.js)"', index_html)
+    assert matches, "dist/index.html must reference a hashed index-*.js bundle"
+    bundle_text = ""
+    for asset in matches:
+        path = dist / "assets" / asset
+        assert path.is_file(), f"referenced bundle missing on disk: {asset}"
+        bundle_text += path.read_text(encoding="utf-8", errors="ignore")
+    assert "What Changed" in bundle_text, "What Changed tab string missing from bundle"
