@@ -198,3 +198,22 @@ rewriting Python source files on Windows. A line-ending-normalization pass plus
 `Path.write_bytes` via a helper script preserved LF cleanly. For future
 multi-file edits on Windows, prefer byte-level Python helpers over the Edit tool
 when the file is being modified (not created fresh).
+
+### SSH alias multiplexing can route every alias to the first-connected host (2026-05-30)
+
+When probing multiple VPS hosts in one session via SSH aliases, connection
+multiplexing (`ControlMaster` / `ControlPath`) can cause later alias calls
+(e.g. `main-vps`) to reuse the first host's already-open socket
+(`srilu-vps`), so `hostname` returns the wrong host and per-host output is
+silently attributed to the wrong machine.
+
+**Rule:** always verify `hostname` (or another host-identity probe) matches
+the intended target before trusting per-host output. Run each host in a
+separate call and confirm identity; do not assume the alias resolved to a
+fresh connection. If host identity cannot be confirmed, treat that host as
+NOT verified rather than reporting its (possibly mis-attributed) output.
+
+**Worked example:** 2026-05-30 Kraken MCP probe — the `main-vps` alias
+returned `hostname` `srilu-vps` (multiplexed socket reuse). Only srilu-vps
+was definitively verified; main-vps / vpin-vps were reported as
+not-independently-verified this session.

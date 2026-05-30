@@ -1866,3 +1866,12 @@ Tracker-promotion soak gate (PR #281) cleared 2026-05-29 with 14 mature days at 
 
 - Re-enabling gainers_early is OPERATOR-AUTHORIZED via the revival evaluator (PR #150), not via a fix-PR. Current signal_params still shows `enabled=0, suspended_reason=hard_loss, updated_at=2026-05-19T01:02:14.744149+00:00` as of audit at 2026-05-29.
 - Out of scope for this PR per operator constraint "no re-enable or policy change in the same PR."
+
+## 2026-05-30 — autonomous backlog reconciliation
+
+Priority list items #1/#2/#4/#5/#6 already SHIPPED (PRs #290/#289/#329/#328/#326).
+#7 focus-dedup phantom/absent. #8 TG-alert-qualification soak gate not cleared.
+#9 source-call coverage gated on operator Path 2/3 pick (pool-selection probe NEGATIVE).
+#3 Kraken BLOCKED on phantom precondition (MCP absent on srilu — see backlog runtime note)
++ OPERATOR-GATED + BL-055 not unlocked. No buildable live item this session; stopped per
+"backlog moved → restate" rule.
