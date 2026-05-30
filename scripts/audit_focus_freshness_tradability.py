@@ -146,22 +146,39 @@ def _extract_rows(payload: Any) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 
-def _stale_uses_bool_fallback(row: dict) -> bool:
-    """True iff the stale gate would fall back to the price_is_stale bool.
+def _stale_fallback_kind(row: dict) -> Optional[str]:
+    """Classify how the stale gate falls back to the price_is_stale bool.
 
-    The bool fallback fires when the PRIMARY ``price_staleness_minutes`` field
-    is absent/None but ``price_is_stale`` is present (not absent/None). When it
-    fires, the ``--stale-hours`` threshold cannot be honoured (a bool carries no
-    minutes), so the threshold is effectively bypassed for that row — surfaced
-    in field_findings so the bypass is visible rather than silent.
+    The bool fallback fires whenever the PRIMARY ``price_staleness_minutes``
+    field does not yield a usable number AND ``price_is_stale`` is present (not
+    absent/None). When it fires, the ``--stale-hours`` threshold cannot be
+    honoured (a bool carries no minutes), so the threshold is effectively
+    bypassed for that row — surfaced in field_findings so the bypass is visible
+    rather than silent.
+
+    Returns:
+        ``"missing"``      — primary absent/None, bool fallback used.
+        ``"non_numeric"``  — primary PRESENT but non-numeric (e.g. a stray
+                             string), bool fallback used. Distinct from
+                             ``"missing"`` so the report can show the field WAS
+                             emitted but was unusable, vs simply absent.
+        ``None``           — no fallback (primary usable, or no bool to fall
+                             back to).
     """
     if not isinstance(row, dict):
-        return False
-    minutes = row.get("price_staleness_minutes", _MISSING)
-    if minutes is not _MISSING and minutes is not None:
-        return False
+        return None
     flag = row.get("price_is_stale", _MISSING)
-    return flag is not _MISSING and flag is not None
+    if flag is _MISSING or flag is None:
+        return None  # nothing to fall back to -> gate is just not-evaluable.
+    minutes = row.get("price_staleness_minutes", _MISSING)
+    if minutes is _MISSING or minutes is None:
+        return "missing"
+    if _coerce_number(minutes) is None:
+        # primary present but non-numeric (or a bool) -> coerces to None ->
+        # the gate falls back to the bool, bypassing --stale-hours silently
+        # unless surfaced here.
+        return "non_numeric"
+    return None  # primary is a usable number -> no fallback.
 
 
 def _gate_stale_price(row: dict, *, stale_hours: float) -> Optional[bool]:
@@ -285,9 +302,13 @@ def build_report(
     # than crash (exit 1) or raise (exit 2) -> the more diagnostic option.
     malformed_rows = sum(1 for row in rows if not isinstance(row, dict))
 
-    # Stale gate: rows where the PRIMARY price_staleness_minutes is absent/None
-    # but the price_is_stale bool fallback fires -> --stale-hours bypassed.
-    stale_bool_fallback_rows = sum(1 for row in rows if _stale_uses_bool_fallback(row))
+    # Stale gate: rows where the PRIMARY price_staleness_minutes does not yield
+    # a usable number but the price_is_stale bool fallback fires -> --stale-hours
+    # bypassed. Split by WHY the primary was unusable so the report distinguishes
+    # "field absent/None" from "field present but non-numeric".
+    stale_fallback_kinds = [_stale_fallback_kind(row) for row in rows]
+    stale_bool_fallback_missing_rows = stale_fallback_kinds.count("missing")
+    stale_bool_fallback_non_numeric_rows = stale_fallback_kinds.count("non_numeric")
 
     # Numeric gates: rows where the field is present-but-non-numeric (treated as
     # missing rather than crashing the comparison).
@@ -329,13 +350,20 @@ def build_report(
         evaluable_count = sum(1 for ev in evaluations if ev[gate] is not None)
         missing_count = sum(1 for ev in evaluations if ev[gate] is None)
         topn_removed = sum(1 for ev in top_evaluations if ev[gate] is True)
+        # Evaluability of the TOP-N SLICE specifically (not the global cohort):
+        # if none of the first top_n rows can be evaluated for this gate, the
+        # slice's removal count is UNKNOWN even when a later row makes the gate
+        # globally evaluable.
+        topn_slice_evaluable = sum(1 for ev in top_evaluations if ev[gate] is not None)
 
         status = "evaluable" if evaluable_count > 0 else "not_evaluable"
-        if status == "not_evaluable":
-            # The gate cannot be evaluated on any row, so its top-N removal is
-            # UNKNOWN, not zero. Report both topN_removed and topN_removed_rate
-            # as null -> a 0 / 0.0 would falsely read as "nothing removed in the
-            # top slice" when the truth is "we could not look".
+        if topn_slice_evaluable == 0:
+            # The top-N slice cannot be evaluated on any of its rows, so its
+            # removal is UNKNOWN, not zero. Report both topN_removed and
+            # topN_removed_rate as null -> a 0 / 0.0 would falsely read as
+            # "nothing removed in the top slice" when the truth is "we could not
+            # look at the top slice". This holds whether the gate is globally
+            # not_evaluable OR globally evaluable via a row beyond the top-N.
             topn_removed_out: Optional[int] = None
             topn_removed_rate_out = None
         else:
@@ -358,9 +386,13 @@ def build_report(
         }
         if malformed_rows:
             gate_finding["malformed_rows"] = malformed_rows
-        if gate == "stale_price" and stale_bool_fallback_rows:
+        if gate == "stale_price" and stale_bool_fallback_missing_rows:
             gate_finding["primary_field_missing_used_bool_fallback"] = (
-                stale_bool_fallback_rows
+                stale_bool_fallback_missing_rows
+            )
+        if gate == "stale_price" and stale_bool_fallback_non_numeric_rows:
+            gate_finding["primary_field_non_numeric_used_bool_fallback"] = (
+                stale_bool_fallback_non_numeric_rows
             )
         if gate == "too_old_since_detection" and age_non_numeric:
             gate_finding["rows_non_numeric"] = age_non_numeric
@@ -368,11 +400,18 @@ def build_report(
             gate_finding["rows_non_numeric"] = move_non_numeric
         field_findings[gate] = gate_finding
 
-        if gate == "stale_price" and stale_bool_fallback_rows:
+        if gate == "stale_price" and stale_bool_fallback_missing_rows:
             schema_findings.append(
-                f"gate 'stale_price': {stale_bool_fallback_rows}/{total} rows missing "
-                "primary 'price_staleness_minutes' -> used 'price_is_stale' bool "
-                "fallback (--stale-hours threshold bypassed for those rows)"
+                f"gate 'stale_price': {stale_bool_fallback_missing_rows}/{total} rows "
+                "missing primary 'price_staleness_minutes' -> used 'price_is_stale' "
+                "bool fallback (--stale-hours threshold bypassed for those rows)"
+            )
+        if gate == "stale_price" and stale_bool_fallback_non_numeric_rows:
+            schema_findings.append(
+                f"gate 'stale_price': {stale_bool_fallback_non_numeric_rows}/{total} "
+                "rows had non-numeric primary 'price_staleness_minutes' -> used "
+                "'price_is_stale' bool fallback (--stale-hours threshold bypassed "
+                "for those rows)"
             )
         if gate == "too_old_since_detection" and age_non_numeric:
             schema_findings.append(

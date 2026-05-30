@@ -783,5 +783,128 @@ def test_rate_rounded_to_4dp():
     assert mod._rate_or_null(2, 3) == 0.6667
 
 
+# =========================================================================== #
+# FOLD ROUND 3 (post code-review)                                              #
+# =========================================================================== #
+
+
+# --------------------------------------------------------------------------- #
+# Fold A [IMPORTANT] — primary price_staleness_minutes PRESENT but NON-NUMERIC #
+# still falls back to the price_is_stale bool; that bypass must be SURFACED in #
+# field_findings (not silent), distinctly from the absent/None fallback.       #
+# --------------------------------------------------------------------------- #
+
+
+def test_stale_primary_non_numeric_uses_bool_fallback_and_surfaced():
+    rows = [
+        {  # primary present-but-non-numeric -> fallback to bool (stale)
+            "price_staleness_minutes": "oops",
+            "price_is_stale": True,
+            "opened_age_hours": 1.0,
+            "current_move_pct": 5.0,
+        },
+        {  # primary present-but-non-numeric -> fallback to bool (not stale)
+            "price_staleness_minutes": "oops",
+            "price_is_stale": False,
+            "opened_age_hours": 1.0,
+            "current_move_pct": 5.0,
+        },
+    ]
+    report = _report(rows)
+    gate = report["per_gate"]["stale_price"]
+    # fallback fired -> the gate is still evaluable (bool drove it).
+    assert gate["evaluable_count"] == 2
+    assert gate["excluded_count"] == 1
+    # the bypass is SURFACED, not silent.
+    ff = report["field_findings"]["stale_price"]
+    assert ff["primary_field_non_numeric_used_bool_fallback"] == 2
+    assert any(
+        "price_staleness_minutes" in line
+        and "non-numeric" in line
+        and "fallback" in line
+        for line in report["schema_findings"]
+    )
+
+
+def test_stale_absent_none_fallback_still_works_and_distinct():
+    # regression: the existing absent/None fallback finding must keep working
+    # and remain DISTINCT from the new non-numeric finding.
+    rows = [
+        {  # primary absent -> bool fallback
+            "price_is_stale": True,
+            "opened_age_hours": 1.0,
+            "current_move_pct": 5.0,
+        },
+        {  # primary None -> bool fallback
+            "price_staleness_minutes": None,
+            "price_is_stale": False,
+            "opened_age_hours": 1.0,
+            "current_move_pct": 5.0,
+        },
+    ]
+    report = _report(rows)
+    ff = report["field_findings"]["stale_price"]
+    assert ff["primary_field_missing_used_bool_fallback"] == 2
+    # the non-numeric key is absent because no row was non-numeric.
+    assert "primary_field_non_numeric_used_bool_fallback" not in ff
+
+
+def test_stale_numeric_primary_no_fallback_findings():
+    # a fully-numeric primary produces NEITHER fallback finding.
+    rows = [_row()]
+    report = _report(rows)
+    ff = report["field_findings"]["stale_price"]
+    assert "primary_field_missing_used_bool_fallback" not in ff
+    assert "primary_field_non_numeric_used_bool_fallback" not in ff
+
+
+# --------------------------------------------------------------------------- #
+# Fold B [IMPORTANT] — top-N slice evaluability: when the first top_n rows are #
+# ALL unevaluable for a gate, topN_removed AND topN_removed_rate are null even #
+# if a later row makes the gate globally evaluable.                            #
+# --------------------------------------------------------------------------- #
+
+
+def test_topn_slice_unevaluable_nulls_topn_even_if_globally_evaluable():
+    # rows[0:5] miss chart_url; rows[5] has it -> no_venue_route is GLOBALLY
+    # evaluable (count>0) BUT its top-N slice (first 5) is all unevaluable.
+    rows = [
+        _row(),  # 0 no chart_url
+        _row(),  # 1 no chart_url
+        _row(),  # 2 no chart_url
+        _row(),  # 3 no chart_url
+        _row(),  # 4 no chart_url
+        _row(chart_url="https://dexscreener.com/x"),  # 5 has it (kept)
+    ]
+    report = _report(rows, top_n=5)
+    gate = report["per_gate"]["no_venue_route"]
+    # globally evaluable because row 5 backs the field.
+    assert gate["status"] == "evaluable"
+    assert gate["evaluable_count"] == 1
+    # but the top-N slice could not be looked at -> null, not 0/0.0.
+    assert gate["topN_removed"] is None
+    assert gate["topN_removed_rate"] is None
+
+
+def test_topn_slice_partially_evaluable_keeps_numeric():
+    # regression: if ANY of the top-N slice rows is evaluable, topN stays numeric.
+    rows = [
+        _row(chart_url=None),  # 0 evaluable -> excluded
+        _row(),  # 1 not evaluable (no chart_url key)
+        _row(),  # 2 not evaluable
+        _row(),  # 3 not evaluable
+        _row(),  # 4 not evaluable
+        _row(chart_url="https://x"),  # 5 outside top-N, kept
+    ]
+    report = _report(rows, top_n=5)
+    gate = report["per_gate"]["no_venue_route"]
+    assert gate["status"] == "evaluable"
+    # 1 of the 5 top-N rows is evaluable and excluded.
+    assert gate["topN_removed"] == 1
+    # denominator stays the slice size (min(top_n,total)=5), per existing
+    # convention; rate = 1/5 = 0.2.
+    assert gate["topN_removed_rate"] == 0.2
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main(["-q", __file__]))

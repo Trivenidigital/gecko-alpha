@@ -609,5 +609,46 @@ IMPORTANTs) plus two **APPROVE-WITH-FOLDS** subagent reviews. Folds applied to
 > `topN_removed`, `topN_removed_rate`, and `combined.topN_survivors` (top-slice
 > size `min(top_n, total_rows)`); §1b/§2b/§2c/§3 are updated to match. All rates
 > are rounded to 4 dp. Not-evaluable gates carry `topN_removed`/
-> `topN_removed_rate` as `null` (fold 3). `combined.malformed_rows` is new
-> (fold 2).
+> `topN_removed_rate` as `null` (round-2 fold 3; broadened by round-3 fold B
+> below). `combined.malformed_rows` is new (round-2 fold 2).
+
+## 9. Fold round 3 (post second code-review, 2026-05-30)
+
+The re-review of the round-2 HEAD returned two IMPORTANT residual gaps — both
+are silent-disclosure / evaluability holes one level deeper than round 2.
+Folds applied to `scripts/audit_focus_freshness_tradability.py` +
+`tests/test_audit_focus_freshness_tradability.py` (TDD: pinning test first):
+
+**A. [IMPORTANT — non-numeric staleness fallback was silently undisclosed].**
+Round 2's fallback DETECTOR (`_stale_uses_bool_fallback`) only flagged the
+absent/None primary case: it returned `False` when `price_staleness_minutes`
+was *present but non-numeric* (e.g. `"oops"`). But the GATE
+(`_gate_stale_price`) routes a non-numeric primary through `_coerce_number`
+→ `None` → it DID silently fall back to the `price_is_stale` bool, bypassing
+`--stale-hours` with no field-finding surfaced. Detector and gate disagreed.
+Fix: replaced the boolean detector with `_stale_fallback_kind(row)` returning
+`"missing"` | `"non_numeric"` | `None`, classifying *why* the primary was
+unusable. The report now carries two distinct keys —
+`field_findings.stale_price.primary_field_missing_used_bool_fallback` (absent/
+None) and `…primary_field_non_numeric_used_bool_fallback` (present but
+non-numeric) — each with its own `schema_findings` line. The existing
+absent/None finding is preserved unchanged. Pinning tests:
+`test_stale_primary_non_numeric_uses_bool_fallback_and_surfaced`,
+`test_stale_absent_none_fallback_still_works_and_distinct`,
+`test_stale_numeric_primary_no_fallback_findings`.
+
+**B. [IMPORTANT — top-N slice evaluability vs global evaluability].**
+Round 2 nulled `topN_removed`/`topN_removed_rate` only when the gate was
+GLOBALLY not_evaluable. If the first `top_n` rows were all unevaluable for a
+gate but a later (beyond-top-N) row made the gate globally evaluable, the
+top-N output reported `0`/`0.0` — falsely reading "nothing removed in the top
+slice" when the truth was "we could not look at the top slice." Fix: the
+null decision now keys on the evaluability of the TOP-N SLICE specifically
+(`topn_slice_evaluable = count of first top_n rows with a non-None verdict`);
+when that is zero, both `topN_removed` and `topN_removed_rate` are `null`
+regardless of global evaluability. Evaluable top-N slices keep numeric values
+(rate denominator unchanged: `min(top_n, total_rows)`). Pinning tests:
+`test_topn_slice_unevaluable_nulls_topn_even_if_globally_evaluable`,
+`test_topn_slice_partially_evaluable_keeps_numeric`.
+
+Local suite after round 3: **59 tests pass** (`pytest -q`). `black` clean.
