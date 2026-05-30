@@ -238,37 +238,66 @@ async def notify_paper_trade_opened(
             )
             return
 
-        # R2-C2 atomic claim
+        # R2-C2 atomic claim.
+        # BL-NEW-TG-ALERT-NOISE-DEDUP: the live per-token window is now the
+        # strict 24h dedup window (TG_ALERT_DEDUP_WINDOW_HOURS), which
+        # SUPERSEDES the legacy TG_ALERT_PER_TOKEN_COOLDOWN_HOURS as the
+        # single gate authority. `_check_cooldown` is retained (back-compat +
+        # 4 live tests) but is no longer consulted here. window==0 disables
+        # dedup entirely (clean revert), short-circuiting the prior-row
+        # query so there is no off-by-one. See
+        # tasks/design_tg_alert_24h_dedup_2026_05_30.md.
         sent_row_id = None
         if db._conn is None:
-            return
-        async with db._txn_lock:
-            cutoff = (
-                datetime.now(timezone.utc)
-                - timedelta(hours=settings.TG_ALERT_PER_TOKEN_COOLDOWN_HOURS)
-            ).isoformat()
-            cur = await db._conn.execute(
-                "SELECT 1 FROM tg_alert_log "
-                "WHERE token_id = ? AND outcome = 'sent' "
-                "AND alerted_at >= ? LIMIT 1",
-                (token_id, cutoff),
+            # §12b: previously a silent early-exit. Make it auditable.
+            log.warning(
+                "tg_alert_no_conn",
+                paper_trade_id=paper_trade_id,
+                signal_type=signal_type,
+                token_id=token_id,
             )
-            if await cur.fetchone():
-                await db._conn.execute(
-                    "INSERT INTO tg_alert_log "
-                    "(paper_trade_id, signal_type, token_id, alerted_at, "
-                    " outcome, detail) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        paper_trade_id,
-                        signal_type,
-                        token_id,
-                        datetime.now(timezone.utc).isoformat(),
-                        "blocked_cooldown",
-                        f"hours={settings.TG_ALERT_PER_TOKEN_COOLDOWN_HOURS}",
-                    ),
+            return
+        window_hours = settings.TG_ALERT_DEDUP_WINDOW_HOURS
+        async with db._txn_lock:
+            if window_hours > 0:
+                cutoff = (
+                    datetime.now(timezone.utc) - timedelta(hours=window_hours)
+                ).isoformat()
+                cur = await db._conn.execute(
+                    "SELECT alerted_at FROM tg_alert_log "
+                    "WHERE token_id = ? AND outcome = 'sent' "
+                    "AND alerted_at >= ? "
+                    "ORDER BY alerted_at DESC LIMIT 1",
+                    (token_id, cutoff),
                 )
-                await db._conn.commit()
-                return
+                prior = await cur.fetchone()
+                if prior is not None:
+                    await db._conn.execute(
+                        "INSERT INTO tg_alert_log "
+                        "(paper_trade_id, signal_type, token_id, alerted_at, "
+                        " outcome, detail) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            paper_trade_id,
+                            signal_type,
+                            token_id,
+                            datetime.now(timezone.utc).isoformat(),
+                            "blocked_dedup_24h",
+                            f"window_h={window_hours}",
+                        ),
+                    )
+                    await db._conn.commit()
+                    # §12b: audit the suppression. No TG send happens; the
+                    # paper_trades row is unaffected (opened upstream).
+                    log.info(
+                        "tg_alert_suppressed",
+                        token_id=token_id,
+                        signal_type=signal_type,
+                        window_hours=window_hours,
+                        prior_alerted_at=prior[0],
+                        reason="dedup_24h",
+                    )
+                    return
+            # No in-window prior (or dedup disabled): claim the send slot.
             cur = await db._conn.execute(
                 "INSERT INTO tg_alert_log "
                 "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
@@ -329,6 +358,15 @@ async def notify_paper_trade_opened(
                 signal_data=signal_data,
                 minara_command=minara_cmd,
             )
+            # §12b: emit a structured log BEFORE the send so every dispatch
+            # is traceable in journalctl regardless of delivery outcome (the
+            # default alerter logs only on failure — success was silent).
+            log.info(
+                "tg_alert_dispatched",
+                paper_trade_id=paper_trade_id,
+                signal_type=signal_type,
+                token_id=token_id,
+            )
             # R1-C1 fold: parse_mode=None to avoid Markdown 400 silent-fail
             await alerter.send_telegram_message(
                 body,
@@ -336,6 +374,15 @@ async def notify_paper_trade_opened(
                 settings,
                 parse_mode=None,
                 raise_on_failure=True,
+            )
+            # §12b: emit AFTER the send returns (delivery succeeded — the
+            # call raises on failure). Together with tg_alert_dispatched this
+            # makes "no logs" unambiguous between delivered vs skipped.
+            log.info(
+                "tg_alert_delivered",
+                paper_trade_id=paper_trade_id,
+                signal_type=signal_type,
+                token_id=token_id,
             )
         except asyncio.CancelledError:
             await _demote_sent_row(

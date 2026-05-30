@@ -104,6 +104,10 @@ class Database:
         await self._migrate_bl_slow_burn_v1()
         await self._migrate_tg_alert_eligible_v1()
         await self._migrate_tg_alert_log_m1_5c_outcome()
+        # BL-NEW-TG-ALERT-NOISE-DEDUP: widen outcome CHECK with
+        # 'blocked_dedup_24h'. MUST run AFTER the m1_5c widening so it
+        # operates on the already-widened CHECK and preserves all values.
+        await self._migrate_tg_alert_log_dedup_outcome()
         await self._migrate_narrative_scanner_v1()
         await self._migrate_minara_alert_emissions_v1()
         # BL-NEW-ACTIONABILITY-ENTRY-SNAPSHOT-FOUNDATION (2026-05-20):
@@ -3743,6 +3747,160 @@ class Database:
             _log.info(
                 "tg_alert_log_m1_5c_outcome_migration_complete",
                 m1_5b_sentinel_preserved=m1_5b_present,
+            )
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_tg_alert_log_dedup_outcome(self) -> None:
+        """BL-NEW-TG-ALERT-NOISE-DEDUP: extend tg_alert_log.outcome CHECK
+        to admit the 'blocked_dedup_24h' value (strict 24h per-token dedup).
+
+        Schema version 20260530. Mirrors _migrate_tg_alert_log_m1_5c_outcome
+        table-rebuild pattern exactly. Idempotent via paper_migrations
+        sentinel + sqlite_master.sql substring guard, both UNIQUE to this
+        migration (distinct from the m1_5c sentinel/guard). MUST run AFTER
+        the m1_5c widening so it preserves m1_5c_announcement_sent.
+
+        CRITICAL: the rebuilt CHECK preserves ALL existing values
+        (sent, blocked_eligibility, blocked_cooldown, dispatch_failed,
+        announcement_sent, m1_5c_announcement_sent) PLUS blocked_dedup_24h.
+        (Codex CRITICAL: a prior draft dropped m1_5c_announcement_sent.)
+        The index is recreated INSIDE this migration (the rebuild drops the
+        old table) per memory feedback_ddl_before_alter.
+        """
+        import re as _re
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                       name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
+
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                ("bl_tg_alert_log_dedup_outcome",),
+            )
+            if (await cur.fetchone()) is not None:
+                await conn.commit()
+                return
+
+            cur = await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                ("tg_alert_log",),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                await conn.execute("ROLLBACK")
+                raise RuntimeError(
+                    "bl_tg_alert_log_dedup_outcome: tg_alert_log missing; "
+                    "migration ordering bug"
+                )
+            table_sql = row[0] or ""
+
+            # Idempotency guard UNIQUE to this migration: skip if the CHECK
+            # already admits 'blocked_dedup_24h'.
+            if "blocked_dedup_24h" in table_sql:
+                await conn.execute(
+                    "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                    "VALUES (?, ?)",
+                    ("bl_tg_alert_log_dedup_outcome", now_iso),
+                )
+                await conn.commit()
+                return
+
+            cur = await conn.execute("PRAGMA table_info(tg_alert_log)")
+            cols = await cur.fetchall()
+            col_names = [c[1] for c in cols]
+            col_list = ", ".join(col_names)
+
+            # Preserve ALL existing values + add blocked_dedup_24h. The
+            # m1_5c migration already added m1_5c_announcement_sent; it MUST
+            # survive this rebuild (Codex CRITICAL: prior draft dropped it).
+            new_check = (
+                "CHECK (outcome IN ("
+                "'sent','blocked_eligibility',"
+                "'blocked_cooldown','dispatch_failed',"
+                "'announcement_sent','m1_5c_announcement_sent',"
+                "'blocked_dedup_24h'"
+                "))"
+            )
+
+            pattern = _re.compile(
+                r"outcome\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(\s*outcome\s+IN\s*\([^)]*\)\s*\)",
+                _re.IGNORECASE | _re.DOTALL,
+            )
+            new_table_sql = pattern.sub(
+                f"outcome     TEXT NOT NULL {new_check}", table_sql
+            )
+            if new_table_sql == table_sql:
+                _log.warning(
+                    "tg_alert_log_dedup_check_pattern_miss",
+                    sql_excerpt=table_sql[:200],
+                )
+                await conn.execute("ROLLBACK")
+                return
+
+            # Quoted-identifier hotfix regex (M1.5a precedent).
+            new_table_sql_renamed = _re.sub(
+                r'TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?tg_alert_log["`]?\s*\(',
+                "TABLE tg_alert_log_new (",
+                new_table_sql,
+                count=1,
+                flags=_re.IGNORECASE,
+            )
+            if new_table_sql_renamed == new_table_sql:
+                _log.warning(
+                    "tg_alert_log_dedup_rename_pattern_miss",
+                    sql_excerpt=new_table_sql[:200],
+                )
+                await conn.execute("ROLLBACK")
+                return
+
+            # No views depend on tg_alert_log (verified at m1_5c) — skip view-drop.
+            await conn.execute(new_table_sql_renamed)
+            await conn.execute(
+                f"INSERT INTO tg_alert_log_new ({col_list}) "
+                f"SELECT {col_list} FROM tg_alert_log"
+            )
+            await conn.execute("DROP TABLE tg_alert_log")
+            await conn.execute("ALTER TABLE tg_alert_log_new RENAME TO tg_alert_log")
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tg_alert_log_token "
+                "ON tg_alert_log(token_id, alerted_at)"
+            )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                ("bl_tg_alert_log_dedup_outcome", now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260530, now_iso, "bl_tg_alert_log_dedup_outcome"),
+            )
+
+            # Preserve the m1_5c sentinel value across this rebuild (audit).
+            cur = await conn.execute(
+                "SELECT 1 FROM tg_alert_log "
+                "WHERE outcome='m1_5c_announcement_sent' LIMIT 1"
+            )
+            m1_5c_present = (await cur.fetchone()) is not None
+
+            await conn.commit()
+            _log.info(
+                "tg_alert_log_dedup_outcome_migration_complete",
+                m1_5c_sentinel_preserved=m1_5c_present,
             )
         except Exception:
             try:

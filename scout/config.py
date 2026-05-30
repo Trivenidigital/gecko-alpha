@@ -8,7 +8,6 @@ from typing import Literal
 from pydantic import Field, SecretStr, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 # Repo root, derived once at import time. Anchors TG_SOCIAL_SESSION_PATH /
 # CHANNELS_FILE defaults so they don't depend on CWD ("./tg_social.session"
 # resolves differently for systemd starts vs ad-hoc CLI invocations). The
@@ -425,6 +424,16 @@ class Settings(BaseSettings):
     # different signals within the window only alerts once.
     TG_ALERT_PER_TOKEN_COOLDOWN_HOURS: int = 6
 
+    # BL-NEW-TG-ALERT-NOISE-DEDUP: strict 24h per-token dedup window for
+    # paper-trade-open TG alerts. Once a token's alert is SENT, further
+    # alerts for the same token_id are suppressed for this many hours. This
+    # SUPERSEDES TG_ALERT_PER_TOKEN_COOLDOWN_HOURS as the single live
+    # dispatch gate (see tasks/design_tg_alert_24h_dedup_2026_05_30.md);
+    # the legacy field is kept for back-compat but no longer drives the
+    # decision. 0 disables dedup entirely (clean revert), with no
+    # off-by-one. See global CLAUDE.md §12b for the co-shipped audit logs.
+    TG_ALERT_DEDUP_WINDOW_HOURS: int = Field(default=24, ge=0)
+
     # BL-NEW-NARRATIVE-SCANNER: Hermes-driven narrative pump scanner (V1).
     # Hermes (main-vps) emits structured events to gecko-alpha via HMAC-authed
     # HTTPS. Feature gated off when secret is empty (endpoints respond 503).
@@ -714,10 +723,10 @@ class Settings(BaseSettings):
     REVIVAL_CRITERIA_MIN_WINDOW_TRADES: int = 50
     REVIVAL_CRITERIA_NO_BREAKOUT_PEAK_PCT: float = 5.0
     REVIVAL_CRITERIA_MAX_NO_BREAKOUT_AND_LOSS: float = 0.40  # healthy_max + margin
-    REVIVAL_CRITERIA_EXIT_MACHINERY_MIN: float = 0.70         # healthy_min - margin
-    REVIVAL_CRITERIA_WIN_WILSON_LB_MIN: float = 0.55          # not coin-flip per design D#3
+    REVIVAL_CRITERIA_EXIT_MACHINERY_MIN: float = 0.70  # healthy_min - margin
+    REVIVAL_CRITERIA_WIN_WILSON_LB_MIN: float = 0.55  # not coin-flip per design D#3
     REVIVAL_CRITERIA_BOOTSTRAP_RESAMPLES: int = 10_000
-    REVIVAL_CRITERIA_VERDICT_EXPIRY_DAYS: int = 30            # keep_on_provisional_until_<iso>
+    REVIVAL_CRITERIA_VERDICT_EXPIRY_DAYS: int = 30  # keep_on_provisional_until_<iso>
     # Calibration — dry-run by default; --apply gated on Telegram health
     # unless --force-no-alert. Trade-count floor mirrors suspension floor
     # so we don't tune on noise.
@@ -850,8 +859,7 @@ class Settings(BaseSettings):
             return v
         if not v.startswith("https://"):
             raise ValueError(
-                "DISCORD_WEBHOOK_URL must be empty or an https:// URL; "
-                f"got={v!r}"
+                "DISCORD_WEBHOOK_URL must be empty or an https:// URL; " f"got={v!r}"
             )
         return v
 
@@ -1475,9 +1483,7 @@ def load_settings(**kwargs) -> "Settings":
     try:
         return Settings(**kwargs)
     except _ValidationError as exc:
-        structlog.get_logger().error(
-            "settings_validation_failed", error=str(exc)
-        )
+        structlog.get_logger().error("settings_validation_failed", error=str(exc))
         # BL-NEW-SETTINGS-VALIDATION-ALERT (cycle 14): best-effort TG alert.
         # Helper catches its own exceptions; outer try is defense-in-depth
         # against the import itself failing (corrupted bytecode, etc.).
@@ -1487,6 +1493,7 @@ def load_settings(**kwargs) -> "Settings":
         # "alert path never engaged" from a missing TG message alone.
         try:
             from scout.config_alert import _send_validation_alert_best_effort
+
             _alert_outcome = _send_validation_alert_best_effort(str(exc))
             structlog.get_logger().error(
                 "settings_validation_alert_dispatched", outcome=_alert_outcome
@@ -1498,7 +1505,5 @@ def load_settings(**kwargs) -> "Settings":
             # with NO trace of the alert-path failure either. Log
             # structurally so a double-failure is observable in
             # journalctl. PR Round 4 silent-swallow sweep.
-            structlog.get_logger().exception(
-                "settings_validation_alert_dispatch_error"
-            )
+            structlog.get_logger().exception("settings_validation_alert_dispatch_error")
         raise
