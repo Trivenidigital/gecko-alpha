@@ -888,6 +888,11 @@ def test_topn_slice_unevaluable_nulls_topn_even_if_globally_evaluable():
 
 def test_topn_slice_partially_evaluable_keeps_numeric():
     # regression: if ANY of the top-N slice rows is evaluable, topN stays numeric.
+    # FOLD ROUND 4 (Fix A): the rate denominator is now topN_evaluable (the
+    # number of EVALUABLE top-N rows), NOT the full slice size. With 1 evaluable
+    # top-N row (excluded), the rate is 1/1 = 1.0, and the 4 unknown top-N rows
+    # are disclosed via topN_evaluable=1 < top_n=5 — they are NOT treated as
+    # "not removed" (which would dilute the rate to 0.2).
     rows = [
         _row(chart_url=None),  # 0 evaluable -> excluded
         _row(),  # 1 not evaluable (no chart_url key)
@@ -901,9 +906,149 @@ def test_topn_slice_partially_evaluable_keeps_numeric():
     assert gate["status"] == "evaluable"
     # 1 of the 5 top-N rows is evaluable and excluded.
     assert gate["topN_removed"] == 1
-    # denominator stays the slice size (min(top_n,total)=5), per existing
-    # convention; rate = 1/5 = 0.2.
-    assert gate["topN_removed_rate"] == 0.2
+    # topN_evaluable discloses that only 1 of the 5 top-N rows was evaluable.
+    assert gate["topN_evaluable"] == 1
+    # rate = removed among EVALUABLE top-N = 1/1 = 1.0 (NOT 1/5 = 0.2).
+    assert gate["topN_removed_rate"] == 1.0
+
+
+# =========================================================================== #
+# FOLD ROUND 4 (post code-review)                                              #
+# =========================================================================== #
+
+
+# --------------------------------------------------------------------------- #
+# Fix A [IMPORTANT] — PARTIAL top-N slice under-disclosure. topN_removed_rate  #
+# must be "removed among EVALUABLE top-N" (denominator = topN_evaluable), and  #
+# the unknown top-N rows disclosed via topN_evaluable < top_n. A fully-        #
+# unevaluable slice keeps everything null.                                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_topn_partial_slice_rate_over_evaluable_not_slice_size():
+    # top_n=5: row 0 evaluable+excluded; rows 1-4 unevaluable for no_venue_route.
+    rows = [
+        _row(chart_url=None),  # 0 evaluable -> excluded (no venue)
+        _row(),  # 1 unevaluable (no chart_url key)
+        _row(),  # 2 unevaluable
+        _row(),  # 3 unevaluable
+        _row(),  # 4 unevaluable
+    ]
+    report = _report(rows, top_n=5)
+    gate = report["per_gate"]["no_venue_route"]
+    assert gate["topN_removed"] == 1
+    assert gate["topN_evaluable"] == 1
+    # rate is 1/1 = 1.0 (removed among evaluable), NOT 1/5 = 0.2.
+    assert gate["topN_removed_rate"] == 1.0
+    assert gate["topN_removed_rate"] != 0.2
+
+
+def test_topn_fully_unevaluable_slice_all_null():
+    # No top-N row is evaluable for no_venue_route -> all three null.
+    rows = [_row(), _row(), _row()]  # none carry chart_url
+    report = _report(rows, top_n=5)
+    gate = report["per_gate"]["no_venue_route"]
+    assert gate["topN_evaluable"] == 0
+    assert gate["topN_removed"] is None
+    assert gate["topN_removed_rate"] is None
+
+
+def test_topn_evaluable_present_on_evaluable_gate():
+    # regression: an EVALUABLE gate exposes topN_evaluable equal to the slice
+    # size when every top-N row is evaluable, and the rate uses it as denom.
+    rows = [
+        _row(price_staleness_minutes=STALE_HOURS * 60 + 1),  # excluded
+        _row(),  # kept
+    ]
+    report = _report(rows, top_n=5)
+    gate = report["per_gate"]["stale_price"]
+    assert gate["topN_evaluable"] == 2
+    assert gate["topN_removed"] == 1
+    assert gate["topN_removed_rate"] == 0.5  # 1/2 (both top-N rows evaluable)
+
+
+# --------------------------------------------------------------------------- #
+# Fix B [IMPORTANT] — non-bool price_is_stale fallback. A present-but-non-bool #
+# price_is_stale (e.g. the string "false") must NOT be silently bool()'d into  #
+# a stale exclusion; the staleness gate is unevaluable for that row AND the    #
+# non-bool fallback is surfaced (field_findings + schema_findings).            #
+# --------------------------------------------------------------------------- #
+
+
+def test_stale_non_bool_flag_not_silently_excluded_and_surfaced():
+    rows = [
+        {  # primary absent + price_is_stale is the STRING "false" (truthy!)
+            "price_staleness_minutes": None,
+            "price_is_stale": "false",
+            "opened_age_hours": 1.0,
+            "current_move_pct": 5.0,
+        },
+    ]
+    report = _report(rows)
+    gate = report["per_gate"]["stale_price"]
+    # the non-bool flag is NOT silently counted as a stale exclusion.
+    assert gate["excluded_count"] == 0
+    # and the gate is unevaluable for that row (no usable primary, no bool).
+    assert gate["evaluable_count"] == 0
+    # surfaced, not silent.
+    ff = report["field_findings"]["stale_price"]
+    assert ff["bool_fallback_non_bool"] == 1
+    assert any(
+        "price_is_stale" in line and "non-bool" in line
+        for line in report["schema_findings"]
+    )
+
+
+def test_stale_real_bool_flag_still_works():
+    # regression: a genuine bool fallback is unaffected by the non-bool guard.
+    rows = [
+        _row(price_staleness_minutes=None, price_is_stale=True),  # excluded
+        _row(price_staleness_minutes=None, price_is_stale=False),  # kept
+    ]
+    report = _report(rows)
+    gate = report["per_gate"]["stale_price"]
+    assert gate["excluded_count"] == 1
+    assert gate["evaluable_count"] == 2
+    ff = report["field_findings"]["stale_price"]
+    assert "bool_fallback_non_bool" not in ff
+
+
+# --------------------------------------------------------------------------- #
+# Fix C [NIT] — NaN/inf CLI float thresholds. argparse type=float accepts      #
+# "nan"/"inf"; the manual range check (<= 0) passes them. Require              #
+# math.isfinite -> exit 2 stage="args".                                        #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf"])
+def test_main_non_finite_max_move_returns_2(capsys, bad):
+    # NOTE: use "--flag=value" so argparse does not parse a leading-"-" value
+    # (e.g. "-inf") as another option.
+    rc = mod.main([f"--max-move-pct={bad}"])
+    assert rc == 2
+    assert "max-move-pct" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf"])
+def test_main_non_finite_stale_hours_returns_2(capsys, bad):
+    rc = mod.main(["--stale-hours", bad])
+    assert rc == 2
+    assert "stale-hours" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf"])
+def test_main_non_finite_max_age_returns_2(capsys, bad):
+    rc = mod.main(["--max-age-hours", bad])
+    assert rc == 2
+    assert "max-age-hours" in capsys.readouterr().err
+
+
+def test_main_non_finite_json_envelope_stage_args(capsys):
+    rc = mod.main(["--json", "--max-move-pct", "nan"])
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "error"
+    assert payload["stage"] == "args"
 
 
 if __name__ == "__main__":

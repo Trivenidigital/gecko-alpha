@@ -652,3 +652,51 @@ regardless of global evaluability. Evaluable top-N slices keep numeric values
 `test_topn_slice_partially_evaluable_keeps_numeric`.
 
 Local suite after round 3: **59 tests pass** (`pytest -q`). `black` clean.
+
+## 10. Fold round 4 (post third code-review, 2026-05-30)
+
+A fourth read-only review pass surfaced three diagnostic-accuracy folds — two
+IMPORTANT (under-disclosure / silent-acceptance) and one NIT (CLI hardening).
+Folds applied to `scripts/audit_focus_freshness_tradability.py` +
+`tests/test_audit_focus_freshness_tradability.py` (TDD: pinning test first):
+
+**A. [IMPORTANT — PARTIAL top-N slice under-disclosure].** Round 3 nulled the
+top-N output only when the slice was FULLY unevaluable
+(`topn_slice_evaluable == 0`). When the slice was PARTIALLY unevaluable (e.g. 1
+evaluable+removed row + 4 unevaluable rows in top-5), it still divided
+`topN_removed` by `top_denom = min(top_n, total)`, reporting 0.2 (1/5) — silently
+treating the 4 unknown rows as "not removed" and diluting the rate downward. Fix:
+added a `per_gate[*].topN_evaluable` count (number of first-`top_n` rows with a
+non-None verdict for that gate); `topN_removed_rate` now divides by
+`topN_evaluable` (removed-among-evaluable), giving 1.0 (1/1); the unknown top-N
+rows are disclosed via `topN_evaluable < top_n` instead of being absorbed into
+the denominator. A fully-unevaluable slice (`topN_evaluable == 0`) keeps
+`topN_removed` and `topN_removed_rate` `null` (unchanged from round 3). Pinning
+tests: `test_topn_partial_slice_rate_over_evaluable_not_slice_size`,
+`test_topn_fully_unevaluable_slice_all_null`,
+`test_topn_evaluable_present_on_evaluable_gate`, and an updated
+`test_topn_slice_partially_evaluable_keeps_numeric` (now asserts 1.0 + topN_evaluable=1).
+
+**B. [IMPORTANT — non-bool `price_is_stale` fallback silently accepted].** The
+bool fallback used `bool(flag)`, which silently accepts a truthy non-bool (e.g.
+the string `"false"`) as a stale exclusion. Fix: the fallback now requires
+`isinstance(flag, bool)`; a present-but-non-bool `price_is_stale` leaves the
+staleness gate UNEVALUABLE for that row (not silently excluded) AND is surfaced
+via `field_findings.stale_price.bool_fallback_non_bool` + a `schema_findings`
+line — symmetric with the existing non-numeric primary defense (round 3 A).
+`_stale_fallback_kind` gained a `"non_bool"` classification. Pinning tests:
+`test_stale_non_bool_flag_not_silently_excluded_and_surfaced`,
+`test_stale_real_bool_flag_still_works`.
+
+**C. [NIT — non-finite CLI float thresholds].** argparse `type=float` accepts
+`"nan"`/`"inf"`/`"-inf"`; the prior `<= 0` checks pass NaN (all NaN comparisons
+are False) and +inf, silently disabling a gate. Fix: `--stale-hours`,
+`--max-age-hours`, `--max-move-pct`, and `--timeout` now require
+`math.isfinite(x) and x > 0`, else exit 2 stage="args". Pinning tests:
+`test_main_non_finite_max_move_returns_2` (nan/inf/-inf, via `--flag=value` so
+argparse does not parse `-inf` as an option),
+`test_main_non_finite_stale_hours_returns_2`,
+`test_main_non_finite_max_age_returns_2`,
+`test_main_non_finite_json_envelope_stage_args`.
+
+Local suite after round 4: **all tests pass** (`pytest -q`). `black` clean.

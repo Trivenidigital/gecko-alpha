@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import urllib.error
 import urllib.request
@@ -162,6 +163,11 @@ def _stale_fallback_kind(row: dict) -> Optional[str]:
                              string), bool fallback used. Distinct from
                              ``"missing"`` so the report can show the field WAS
                              emitted but was unusable, vs simply absent.
+        ``"non_bool"``     — primary unusable AND ``price_is_stale`` is present
+                             but is NOT a bool (e.g. the string ``"false"``).
+                             The bool fallback REFUSES a non-bool value (it
+                             would be silently truthy), so the gate is
+                             unevaluable for that row — surfaced, not silent.
         ``None``           — no fallback (primary usable, or no bool to fall
                              back to).
     """
@@ -171,14 +177,24 @@ def _stale_fallback_kind(row: dict) -> Optional[str]:
     if flag is _MISSING or flag is None:
         return None  # nothing to fall back to -> gate is just not-evaluable.
     minutes = row.get("price_staleness_minutes", _MISSING)
+    primary_usable = (
+        minutes is not _MISSING
+        and minutes is not None
+        and _coerce_number(minutes) is not None
+    )
+    if primary_usable:
+        return None  # primary is a usable number -> no fallback.
+    # Primary is unusable -> we WOULD fall back to the bool. Classify the bool.
+    if not isinstance(flag, bool):
+        # price_is_stale present but NOT a bool (e.g. the string "false", which
+        # is truthy). bool(flag) here would silently mark the row stale; refuse
+        # the fallback and surface it instead -> gate unevaluable for this row.
+        return "non_bool"
     if minutes is _MISSING or minutes is None:
         return "missing"
-    if _coerce_number(minutes) is None:
-        # primary present but non-numeric (or a bool) -> coerces to None ->
-        # the gate falls back to the bool, bypassing --stale-hours silently
-        # unless surfaced here.
-        return "non_numeric"
-    return None  # primary is a usable number -> no fallback.
+    # primary present but non-numeric (or a bool) -> coerces to None -> the gate
+    # falls back to the bool, bypassing --stale-hours silently unless surfaced.
+    return "non_numeric"
 
 
 def _gate_stale_price(row: dict, *, stale_hours: float) -> Optional[bool]:
@@ -192,7 +208,13 @@ def _gate_stale_price(row: dict, *, stale_hours: float) -> Optional[bool]:
         flag = row.get("price_is_stale", _MISSING)
         if flag is _MISSING or flag is None:
             return None
-        return bool(flag)
+        if not isinstance(flag, bool):
+            # price_is_stale present but NOT a bool (e.g. the string "false",
+            # which is truthy). Refuse the fallback rather than silently bool()
+            # it into a stale exclusion -> gate unevaluable for this row,
+            # surfaced via field_findings.stale_price.bool_fallback_non_bool.
+            return None
+        return flag
     return minutes >= stale_hours * 60.0
 
 
@@ -309,6 +331,9 @@ def build_report(
     stale_fallback_kinds = [_stale_fallback_kind(row) for row in rows]
     stale_bool_fallback_missing_rows = stale_fallback_kinds.count("missing")
     stale_bool_fallback_non_numeric_rows = stale_fallback_kinds.count("non_numeric")
+    # Rows where price_is_stale is present but NOT a bool: the fallback is
+    # refused (gate unevaluable for the row) rather than silently bool()'d.
+    stale_bool_fallback_non_bool_rows = stale_fallback_kinds.count("non_bool")
 
     # Numeric gates: rows where the field is present-but-non-numeric (treated as
     # missing rather than crashing the comparison).
@@ -351,9 +376,9 @@ def build_report(
         missing_count = sum(1 for ev in evaluations if ev[gate] is None)
         topn_removed = sum(1 for ev in top_evaluations if ev[gate] is True)
         # Evaluability of the TOP-N SLICE specifically (not the global cohort):
-        # if none of the first top_n rows can be evaluated for this gate, the
-        # slice's removal count is UNKNOWN even when a later row makes the gate
-        # globally evaluable.
+        # how many of the first top_n rows carry a non-None verdict for this
+        # gate. If NONE are evaluable the slice's removal is UNKNOWN even when a
+        # later row makes the gate globally evaluable.
         topn_slice_evaluable = sum(1 for ev in top_evaluations if ev[gate] is not None)
 
         status = "evaluable" if evaluable_count > 0 else "not_evaluable"
@@ -367,14 +392,22 @@ def build_report(
             topn_removed_out: Optional[int] = None
             topn_removed_rate_out = None
         else:
+            # Rate is "removed among the EVALUABLE top-N rows", so the
+            # denominator is topn_slice_evaluable, NOT top_denom. A PARTIALLY
+            # unevaluable slice (e.g. 1 evaluable+removed + 4 unevaluable in
+            # top-5) over top_denom would dilute the rate to 0.2 and silently
+            # treat the 4 unknowns as "not removed". Over the evaluable subset it
+            # is 1/1 = 1.0; the unknown top-N rows are disclosed separately via
+            # topN_evaluable < top_n.
             topn_removed_out = topn_removed
-            topn_removed_rate_out = _rate_or_null(topn_removed, top_denom)
+            topn_removed_rate_out = _rate_or_null(topn_removed, topn_slice_evaluable)
 
         per_gate[gate] = {
             "excluded_count": excluded_count,
             "evaluable_count": evaluable_count,
             "excluded_rate": _rate_or_null(excluded_count, evaluable_count),
             "topN_removed": topn_removed_out,
+            "topN_evaluable": topn_slice_evaluable,
             "topN_removed_rate": topn_removed_rate_out,
             "status": status,
         }
@@ -394,6 +427,8 @@ def build_report(
             gate_finding["primary_field_non_numeric_used_bool_fallback"] = (
                 stale_bool_fallback_non_numeric_rows
             )
+        if gate == "stale_price" and stale_bool_fallback_non_bool_rows:
+            gate_finding["bool_fallback_non_bool"] = stale_bool_fallback_non_bool_rows
         if gate == "too_old_since_detection" and age_non_numeric:
             gate_finding["rows_non_numeric"] = age_non_numeric
         if gate == "far_moved_from_detection" and move_non_numeric:
@@ -412,6 +447,13 @@ def build_report(
                 "rows had non-numeric primary 'price_staleness_minutes' -> used "
                 "'price_is_stale' bool fallback (--stale-hours threshold bypassed "
                 "for those rows)"
+            )
+        if gate == "stale_price" and stale_bool_fallback_non_bool_rows:
+            schema_findings.append(
+                f"gate 'stale_price': {stale_bool_fallback_non_bool_rows}/{total} "
+                "rows had a non-bool 'price_is_stale' fallback value -> fallback "
+                "refused, gate NOT-EVALUABLE for those rows (a non-bool would be "
+                "silently truthy)"
             )
         if gate == "too_old_since_detection" and age_non_numeric:
             schema_findings.append(
@@ -521,16 +563,21 @@ def main(argv: list[str] | None = None) -> int:
         return _emit_error(
             "--window-hours must be in [6, 72]", stage="args", as_json=as_json
         )
-    if args.stale_hours <= 0:
-        return _emit_error("--stale-hours must be > 0", stage="args", as_json=as_json)
-    if args.max_age_hours <= 0:
-        return _emit_error("--max-age-hours must be > 0", stage="args", as_json=as_json)
-    if args.max_move_pct <= 0:
-        return _emit_error("--max-move-pct must be > 0", stage="args", as_json=as_json)
+    # Float thresholds must be FINITE and positive. argparse type=float happily
+    # accepts "nan"/"inf"/"-inf"; a bare `<= 0` check passes NaN (all NaN
+    # comparisons are False) and +inf, which would silently disable the gate.
+    for name, value in (
+        ("--stale-hours", args.stale_hours),
+        ("--max-age-hours", args.max_age_hours),
+        ("--max-move-pct", args.max_move_pct),
+        ("--timeout", args.timeout),
+    ):
+        if not (math.isfinite(value) and value > 0):
+            return _emit_error(
+                f"{name} must be a finite number > 0", stage="args", as_json=as_json
+            )
     if args.top_n <= 0:
         return _emit_error("--top-n must be > 0", stage="args", as_json=as_json)
-    if args.timeout <= 0:
-        return _emit_error("--timeout must be > 0", stage="args", as_json=as_json)
 
     endpoint_url = f"{args.url}{ENDPOINT_PATH}?window_hours={args.window_hours}"
     try:
