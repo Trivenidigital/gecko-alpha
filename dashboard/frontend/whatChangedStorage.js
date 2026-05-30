@@ -10,6 +10,10 @@ export const SCHEMA_VERSION = 1
 
 // Cap the persisted closed-id set so it cannot grow unbounded across many
 // visits (Codex NIT). Keep the most-recent ids.
+// INVARIANT: MAX_CLOSED_IDS (200) MUST stay >= the history page limit
+// (HISTORY_LIMIT = 50 in WhatChangedPanel.jsx). If it ever drops below the
+// page size, an evicted closed-id could reappear on the current page and be
+// falsely re-flagged as newly-closed (a resurrection false-positive).
 export const MAX_CLOSED_IDS = 200
 
 export function blankState(nowMs = Date.now()) {

@@ -89,3 +89,57 @@ def test_new_files_in_layout_copy_scan_paths():
     assert "whatChangedStorage.js" in text
     assert "whatChangedFacts.js" in text
     assert "WhatChangedPanel.jsx" in text
+
+
+def test_diff_closed_trades_net_realized_excludes_null_pnl():
+    """Structural I1: a closed trade with null pnl_usd must be EXCLUDED from the
+    net-realized sum AND counted toward the '(excludes K unavailable)'
+    disclosure -- never silently summed as 0.
+
+    Static source-assert (no JS runner in repo), consistent with the other
+    contract asserts in this file:
+      - storage's diffClosedTrades sums only finite pnl (Number.isFinite guard)
+      - it derives a net-unavailable count for the excluded null-pnl rows
+      - facts' closedHeadline wires the '(excludes ... unavailable)' disclosure
+    """
+    storage = _read(STORAGE)
+    assert "diffClosedTrades" in storage
+    # Only finite realized pnl is summed -- null-pnl rows are not added as 0.
+    assert (
+        "Number.isFinite" in storage
+    ), "diffClosedTrades must guard the net-realized sum with Number.isFinite"
+    assert (
+        "netRealizedSince" in storage
+    ), "diffClosedTrades must expose a net-realized sum"
+    assert (
+        "netUnavailableCount" in storage
+    ), "diffClosedTrades must count null-pnl rows as net-unavailable (not summed as 0)"
+
+    facts = _read(FACTS)
+    assert (
+        "netUnavailableCount" in facts
+    ), "closedHeadline must accept the net-unavailable count"
+    assert (
+        "excludes" in facts
+    ), "closedHeadline must wire the '(excludes K unavailable)' disclosure"
+
+
+def test_count_fetch_failure_footnote_degrades_gracefully():
+    """Structural I3: if /api/trading/history/count fails or yields no usable
+    total, the 'Showing N of M' footnote must DEGRADE gracefully -- it must not
+    render a 'of undefined' / 'of null' string.
+
+    Static source-assert: the count fetch resets historyTotal to null on
+    failure, and the footnote is gated on historyTotal != null so it is simply
+    omitted when the total is unavailable.
+    """
+    text = _read(PANEL)
+    assert "fetchHistoryCount" in text
+    # Failure path sets the total to null (no bogus value leaks to the footnote).
+    assert (
+        "setHistoryTotal(null)" in text
+    ), "count-fetch failure must reset historyTotal to null"
+    # Footnote is gated on a usable total, so it is omitted (not rendered broken).
+    assert (
+        "historyTotal != null" in text
+    ), "history-truncation footnote must be gated on a usable (non-null) total"
