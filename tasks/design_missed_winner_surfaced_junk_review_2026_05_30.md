@@ -15,6 +15,14 @@ Checked the Hermes skill hub (`hermes-agent.nousresearch.com/docs/skills`) + awe
 
 ---
 
+## SHELVED 2026-05-30 — structural data limit, not implementation gap
+
+Build deferred. Design review found a STRUCTURAL observability limit (not a fixable code gap): weeks-later winners are unobservable under the current ~7-day `volume_history_cg` retention; Today's Focus has no persisted surface-membership table (recomputed live + browser localStorage); block-cause / venue terminating levers are not persisted. A build now would be a narrower gainers-cohort-only tool with large `unobserved` mass — a real scope degradation.
+
+**Revisit trigger:** re-evaluate only when EITHER (a) a persisted Today's-Focus surface-membership table exists, OR (b) post-detection price retention exceeds 7 days. The §1/§3 gainers-cohort slices and the corrected gainers-direct data path (see review folds) remain valid starting points if revisited.
+
+---
+
 # Design: BL-NEW-MISSED-WINNER-SURFACED-JUNK-REVIEW
 
 **Date:** 2026-05-30
