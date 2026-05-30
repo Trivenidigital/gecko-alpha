@@ -128,6 +128,22 @@ This section is the operator-facing backlog after the 2026-05-22 trader-lens rev
 
 **Open product question:** should Kraken-eligible candidates be a separate dashboard lane, a filter on Today's Focus / Trade Inbox, or an execution-readiness badge? Default recommendation: badge/filter first; separate lane only if overlap volume is high enough to justify it.
 
+### Audit primitives (offline, read-only) — 2026-05-29 cohort
+
+Offline read-only analysis scripts scoped during the 2026-05-29 liquidity/focus audit session. No pipeline writes, no scoring/gate/trading-path changes. See design docs under `tasks/` for full specs.
+
+### BL-NEW-CLEAN-PRICE-PATH-AUDIT: distinguish usable runners from unrelated later moves
+**Status:** SHIPPED 2026-05-30 via PR #326 (squash `e0172706`). Offline read-only price-path classifier `scripts/audit_clean_price_path.py` separates continuous moves, drawdown-then-recovery, and unrelated later catalysts via `volume_history_cg` + `score_history` joins. No pipeline writes. Scope limit: 7-day `volume_history_cg` retention means weeks-later runups land in `no_significant_move` (documented). Design: `tasks/design_clean_price_path_audit_2026_05_29.md`.
+
+### BL-NEW-SIGNAL-EARLY-USEFULNESS-SCORECARD: measure early tradable usefulness by signal family
+**Status:** SHIPPED 2026-05-30 via PR #328 (squash `c74a23eb`). Per-signal scorecard `scripts/audit_signal_early_usefulness.py` measures signal families by early tradable usefulness, not only paper PnL. P0 anchor = `paper_trades.entry_price`; metric-5 rescoped to a gainers-only `appeared_on_gainers_at` proxy. Offline-only; no scoring/gate changes. Design: `tasks/design_signal_early_usefulness_scorecard_2026_05_29.md`.
+
+### BL-NEW-FOCUS-FRESHNESS-TRADABILITY-GATES: reduce Today's Focus noise with factual pre-filters
+**Status:** step-1 diagnostic SHIPPED 2026-05-30 via PR #329 (squash `3e3d5fcc`). `scripts/audit_focus_freshness_tradability.py` evaluates Today's Focus rows against freshness/tradability gates. 4 gates evaluable; `no_venue_route` (chart_url) + `liquidity_unavailable` (liquidity_usd) are NOT-EVALUABLE (absent from the persisted focus row) and surfaced in `field_findings`. Step 2 (live pre-curation filter in the pipeline) remains OUT-OF-SCOPE / future pipeline work. Design: `tasks/design_focus_freshness_tradability_audit_2026_05_29.md`.
+
+### BL-NEW-MISSED-WINNER-SURFACED-JUNK-REVIEW: offline review loop for signal quality
+**Status:** DESIGNED 2026-05-30, BUILD NOT STARTED (shelved pending operator decision). Design at `tasks/design_missed_winner_surfaced_junk_review_2026_05_30.md` (on branch `feat/missed-winner-surfaced-junk-review`, not merged). Honest finding: mostly NOT-BUILDABLE-OFFLINE — weeks-later winners unobservable (7-day retention), "surfaced" observable only for the gainers cohort (Today's Focus has no persisted membership), terminating levers (block_cause / venue) not persisted. A built version would be gainers-cohort-only with large `unobserved` counts. Must not feed live ranking without a separate no-lookahead design.
+
 ### BL-NEW-DECISION-EVENT-WATCHDOG-MULTI-SIGNAL: cover all enabled snapshot-backed paper dispatchers in the decision-event watchdog
 **Status:** SHIPPED-DEPLOYED 2026-05-27 - PR #299 merged as `876ae5e` and deployed to srilu. The existing PR #279 watchdog was `gainers_early`-only; this follow-up extends coverage to enabled `losers_contrarian` and `trending_catch` dispatchers without changing trading behavior.
 **Tag:** `observability` `trade-decision-events` `silent-failure-prevention` `trader-surface`
