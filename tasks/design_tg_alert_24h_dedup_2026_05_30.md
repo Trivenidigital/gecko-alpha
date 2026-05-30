@@ -1,5 +1,7 @@
 **New primitives introduced:** [config setting `TG_ALERT_DEDUP_WINDOW_HOURS` (int, default 24, ge=0); one new `tg_alert_log.outcome` string value `blocked_dedup_24h` (added via a table-rebuild CHECK-widening migration `_migrate_tg_alert_log_dedup_outcome` preserving ALL existing values); three structured log events `tg_alert_dispatched` (pre-send), `tg_alert_delivered` (post-send), `tg_alert_suppressed` (suppress path); a structured log on the previously-silent `db._conn is None` early-exit. NO new column, NO conviction sourcing, NO scoring change.]
 
+> Slice 1 = strict 24h dedup ONLY; conviction-margin re-alert override DEFERRED to BL-NEW-TG-CONVICTION-AVAILABILITY + a later override build.
+
 # Design: 24h per-token TG paper-trade-open strict dedup + audit log
 
 Date: 2026-05-30
@@ -197,6 +199,34 @@ the CoinGecko slug, not the on-chain address (memory
 the same underlying token appearing once as a CG slug and once as an on-chain
 address is treated as two tokens and not deduped against each other. **KNOWN
 ACCEPTED limitation, NOT fixed here.**
+
+## Known non-audited path (follow-up)
+
+`scout/trading/engine.py:_spawn_tg_alert` (≈engine.py:484) guards the dispatch
+on a usable entry price: it computes
+`effective_entry = trade.get("entry_price") or trade.get("price") or 0.0`,
+coerces to `float`, and on `effective_entry <= 0` returns early at ≈engine.py:500
+after emitting ONLY a `log.warning("tg_alert_skipped_invalid_entry", ...)`. On
+that early return `notify_paper_trade_opened` is never called, so **NO
+`tg_alert_log` row is written** — the drop is observable in journalctl but is
+NOT captured in the dispatch audit table the rest of this slice relies on. Every
+path INSIDE `notify_paper_trade_opened` (sent / blocked_eligibility /
+blocked_dedup_24h / dispatch_failed) writes a row; this one upstream
+invalid-entry-price early return is the single non-audited drop in the
+paper-trade-open alert path.
+
+This is a **pre-existing** gap, NOT introduced by this slice. Closing it
+requires an `engine.py` change (out of this slice's anti-scope — `engine.py` is
+explicitly forbidden below) plus a new `tg_alert_log.outcome` CHECK value (e.g.
+`blocked_invalid_entry`), which is a second table-rebuild migration. It is
+therefore documented here and deferred, NOT fixed in this slice.
+
+**BL-NEW-TG-ALERT-INVALID-ENTRY-AUDIT (PROPOSED)** — make the invalid-entry-price
+early return in `_spawn_tg_alert` auditable: write a `tg_alert_log` row with a new
+`blocked_invalid_entry` outcome (table-rebuild CHECK widening, preserving all
+existing values) instead of dropping silently with only a warning log. Scope: a
+1-line `engine.py` change at the early-return site + one migration + tests.
+Gated behind its own slice because it touches `engine.py` (anti-scope here).
 
 ## Anti-scope (runtime contract per memory `feedback_anti_scope_as_runtime_contract`)
 

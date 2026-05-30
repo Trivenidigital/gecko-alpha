@@ -966,8 +966,24 @@ async def test_dedup_suppression_does_not_touch_paper_trade(tmp_path, monkeypatc
         signal_data={"price_change_24h": 30.0, "mcap": 1_000_000},
     )
     assert len(sent) == 0
-    cur = await db._conn.execute("SELECT status FROM paper_trades WHERE id=42")
-    assert (await cur.fetchone())[0] == "open"
+    # Anti-scope invariant: suppression skips ONLY the TG send. The
+    # paper_trades row must still exist, untouched — same row count, same
+    # 'open' status, same entry_price the engine committed upstream. The
+    # dispatcher only reads paper_trades + writes tg_alert_log; it must never
+    # delete or mutate the trade.
+    cur = await db._conn.execute("SELECT COUNT(*) FROM paper_trades WHERE id=42")
+    assert (await cur.fetchone())[0] == 1
+    cur = await db._conn.execute(
+        "SELECT status, entry_price FROM paper_trades WHERE id=42"
+    )
+    row = await cur.fetchone()
+    assert row[0] == "open"
+    assert row[1] == 100.0  # unchanged from _insert_paper_trade
+    # And the suppression IS audited (row written to tg_alert_log only).
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE paper_trade_id=42"
+    )
+    assert (await cur.fetchone())[0] == "blocked_dedup_24h"
     await db.close()
 
 
