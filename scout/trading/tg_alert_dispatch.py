@@ -293,6 +293,7 @@ async def notify_paper_trade_opened(
                         token_id=token_id,
                         signal_type=signal_type,
                         window_hours=window_hours,
+                        dedup_window_hours=window_hours,
                         prior_alerted_at=prior[0],
                         reason="dedup_24h",
                     )

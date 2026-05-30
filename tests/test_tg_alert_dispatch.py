@@ -1061,6 +1061,7 @@ async def test_dedup_audit_log_emitted_on_suppress(tmp_path, monkeypatch):
     assert ev["token_id"] == "bitcoin"
     assert ev["signal_type"] == "gainers_early"
     assert ev["window_hours"] == 24
+    assert ev["dedup_window_hours"] == 24
     assert ev["reason"] == "dedup_24h"
     assert ev["prior_alerted_at"] is not None
     await db.close()
