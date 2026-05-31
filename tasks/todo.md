@@ -1,9 +1,10 @@
 # Backlog — gecko-alpha
 
-## Active Work: 2026-05-31 - Autonomous full code review
+## Completed Work: 2026-05-31 - Autonomous full code review
 
-**Status:** IN-PROGRESS. Goal: perform a repo-wide autonomous review pass,
-fix confirmed correctness/ops issues, and verify with focused + full tests.
+**Status:** SHIPPED 2026-05-31 - PR #342 squash `f453d5dd`. Performed a
+repo-wide autonomous review pass, fixed confirmed correctness/ops issues, and
+verified with focused + full tests.
 
 Workflow checklist:
 - [x] Fresh worktree/branch from `origin/master`.
@@ -29,7 +30,7 @@ Workflow checklist:
   3-vector review found one concrete audit-persistence concern; code already
   had the commit and an added close/reopen test now pins it. Final rerun
   passed.
-- [ ] PR, CI, merge.
+- [x] PR #342, CI green, squash-merged as `f453d5dd`.
 
 ## Active Work: 2026-05-31 - Dashboard entry snapshot drawer
 
