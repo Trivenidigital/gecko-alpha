@@ -117,6 +117,27 @@ async def test_migration_fails_on_schema_version_collision(tmp_path):
         await d._conn.close()
 
 
+async def test_migration_backfills_sentinel_when_schema_version_already_applied(
+    tmp_path,
+):
+    """Recover historical partial state: schema_version present, sentinel absent."""
+    d = Database(tmp_path / "partial_source_calls.db")
+    await d.initialize()
+    await d._conn.execute(
+        "DELETE FROM paper_migrations WHERE name='bl_source_calls_v1'"
+    )
+    await d._conn.commit()
+    await d.close()
+
+    d2 = Database(tmp_path / "partial_source_calls.db")
+    await d2.initialize()
+    cur = await d2._conn.execute(
+        "SELECT COUNT(*) FROM paper_migrations WHERE name='bl_source_calls_v1'"
+    )
+    assert (await cur.fetchone())[0] == 1
+    await d2.close()
+
+
 async def test_source_calls_json_and_fk_constraints(db):
     with pytest.raises(sqlite3.IntegrityError):
         await db._conn.execute(

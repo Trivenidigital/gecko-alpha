@@ -157,6 +157,45 @@ async def _suspend(
         )
 
 
+async def _send_suspend_alert(
+    *,
+    session,
+    settings,
+    signal_type: str,
+    reason: str,
+    body: str,
+) -> None:
+    if session is None:
+        return
+    from scout import alerter  # local import (Windows OpenSSL)
+
+    try:
+        log.info(
+            "auto_suspend_alert_dispatched",
+            signal_type=signal_type,
+            reason=reason,
+        )
+        await alerter.send_telegram_message(
+            body,
+            session,
+            settings,
+            parse_mode=None,
+        )
+        log.info(
+            "auto_suspend_alert_delivered",
+            signal_type=signal_type,
+            reason=reason,
+        )
+    except Exception as exc:
+        log.exception(
+            "auto_suspend_alert_failed",
+            signal_type=signal_type,
+            reason=reason,
+            err=str(exc),
+            err_type=type(exc).__name__,
+        )
+
+
 async def maybe_suspend_signals(
     db: Database,
     settings: Settings,
@@ -248,34 +287,6 @@ async def maybe_suspend_signals(
                     ),
                     now_iso=now_iso,
                 )
-                if session is not None:
-                    from scout import alerter  # local import (Windows OpenSSL)
-
-                    # parse_mode=None — signal names contain `_` (e.g.
-                    # `trending_catch`, `hard_loss`) which Telegram MarkdownV1
-                    # interprets as italics markers. Defaulting to Markdown
-                    # caused the §2.9 silent rendering on 2026-05-11T01:00:26Z
-                    # (trending_catch ID-22): API returned HTTP 200 with body
-                    # rendered as `trendingcatch ... (hardloss)` and italics
-                    # entities, operator did not recognize the alert.
-                    log.info(
-                        "auto_suspend_alert_dispatched",
-                        signal_type=signal_type,
-                        reason="hard_loss",
-                    )
-                    await alerter.send_telegram_message(
-                        f"⚠ signal {signal_type} auto-suspended (hard_loss): "
-                        f"net ${net_pnl:.0f}, drawdown ${max_drawdown:.0f}, "
-                        f"n={n}",
-                        session,
-                        settings,
-                        parse_mode=None,
-                    )
-                    log.info(
-                        "auto_suspend_alert_delivered",
-                        signal_type=signal_type,
-                        reason="hard_loss",
-                    )
                 await conn.commit()
             except Exception:
                 try:
@@ -283,6 +294,17 @@ async def maybe_suspend_signals(
                 except Exception as rb_err:
                     log.exception("auto_suspend_rollback_failed", err=str(rb_err))
                 raise
+            await _send_suspend_alert(
+                session=session,
+                settings=settings,
+                signal_type=signal_type,
+                reason="hard_loss",
+                body=(
+                    f"signal {signal_type} auto-suspended (hard_loss): "
+                    f"net ${net_pnl:.0f}, drawdown ${max_drawdown:.0f}, "
+                    f"n={n}"
+                ),
+            )
             suspended.append(
                 {
                     "signal_type": signal_type,
@@ -309,28 +331,6 @@ async def maybe_suspend_signals(
                 detail=f"net_pnl ${net_pnl:.0f} (n={n})",
                 now_iso=now_iso,
             )
-            if session is not None:
-                from scout import alerter  # local import (Windows OpenSSL)
-
-                # parse_mode=None — see hard_loss path above for rationale.
-                # Same underscore-in-signal-name silent-rendering bug applies.
-                log.info(
-                    "auto_suspend_alert_dispatched",
-                    signal_type=signal_type,
-                    reason="pnl_threshold",
-                )
-                await alerter.send_telegram_message(
-                    f"⚠ signal {signal_type} auto-suspended (pnl_threshold): "
-                    f"net ${net_pnl:.0f}, n={n}",
-                    session,
-                    settings,
-                    parse_mode=None,
-                )
-                log.info(
-                    "auto_suspend_alert_delivered",
-                    signal_type=signal_type,
-                    reason="pnl_threshold",
-                )
             await conn.commit()
         except Exception:
             try:
@@ -338,6 +338,16 @@ async def maybe_suspend_signals(
             except Exception as rb_err:
                 log.exception("auto_suspend_rollback_failed", err=str(rb_err))
             raise
+        await _send_suspend_alert(
+            session=session,
+            settings=settings,
+            signal_type=signal_type,
+            reason="pnl_threshold",
+            body=(
+                f"signal {signal_type} auto-suspended (pnl_threshold): "
+                f"net ${net_pnl:.0f}, n={n}"
+            ),
+        )
         suspended.append(
             {
                 "signal_type": signal_type,

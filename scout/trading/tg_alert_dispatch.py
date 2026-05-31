@@ -259,19 +259,41 @@ async def notify_paper_trade_opened(
             return
         window_hours = settings.TG_ALERT_DEDUP_WINDOW_HOURS
         async with db._txn_lock:
+            now_iso = datetime.now(timezone.utc).isoformat()
             if window_hours > 0:
                 cutoff = (
                     datetime.now(timezone.utc) - timedelta(hours=window_hours)
                 ).isoformat()
                 cur = await db._conn.execute(
-                    "SELECT alerted_at FROM tg_alert_log "
-                    "WHERE token_id = ? AND outcome = 'sent' "
-                    "AND alerted_at >= ? "
-                    "ORDER BY alerted_at DESC LIMIT 1",
-                    (token_id, cutoff),
+                    "INSERT INTO tg_alert_log "
+                    "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
+                    "SELECT ?, ?, ?, ?, 'sent' "
+                    "WHERE NOT EXISTS ("
+                    "  SELECT 1 FROM tg_alert_log "
+                    "  WHERE token_id = ? AND outcome = 'sent' "
+                    "  AND alerted_at >= ?"
+                    ") "
+                    "RETURNING id",
+                    (
+                        paper_trade_id,
+                        signal_type,
+                        token_id,
+                        now_iso,
+                        token_id,
+                        cutoff,
+                    ),
                 )
-                prior = await cur.fetchone()
-                if prior is not None:
+                claimed = await cur.fetchone()
+                if claimed is None:
+                    cur = await db._conn.execute(
+                        "SELECT alerted_at FROM tg_alert_log "
+                        "WHERE token_id = ? AND outcome = 'sent' "
+                        "AND alerted_at >= ? "
+                        "ORDER BY alerted_at DESC LIMIT 1",
+                        (token_id, cutoff),
+                    )
+                    prior = await cur.fetchone()
+                    prior_alerted_at = prior[0] if prior is not None else None
                     await db._conn.execute(
                         "INSERT INTO tg_alert_log "
                         "(paper_trade_id, signal_type, token_id, alerted_at, "
@@ -294,23 +316,26 @@ async def notify_paper_trade_opened(
                         signal_type=signal_type,
                         window_hours=window_hours,
                         dedup_window_hours=window_hours,
-                        prior_alerted_at=prior[0],
+                        prior_alerted_at=prior_alerted_at,
                         reason="dedup_24h",
                     )
                     return
-            # No in-window prior (or dedup disabled): claim the send slot.
-            cur = await db._conn.execute(
-                "INSERT INTO tg_alert_log "
-                "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
-                "VALUES (?, ?, ?, ?, 'sent')",
-                (
-                    paper_trade_id,
-                    signal_type,
-                    token_id,
-                    datetime.now(timezone.utc).isoformat(),
-                ),
-            )
-            sent_row_id = cur.lastrowid
+                sent_row_id = claimed[0]
+            else:
+                # Dedup disabled: direct claim, preserving the clean revert path.
+                cur = await db._conn.execute(
+                    "INSERT INTO tg_alert_log "
+                    "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
+                    "VALUES (?, ?, ?, ?, 'sent') RETURNING id",
+                    (
+                        paper_trade_id,
+                        signal_type,
+                        token_id,
+                        now_iso,
+                    ),
+                )
+                claimed = await cur.fetchone()
+                sent_row_id = claimed[0]
             await db._conn.commit()
 
         # M1.5c BL-NEW-M1.5C: Minara DEX-eligibility check. After cooldown

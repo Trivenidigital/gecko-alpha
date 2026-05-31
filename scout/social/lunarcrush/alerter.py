@@ -61,7 +61,7 @@ def _fmt_compact_number(value: Optional[float]) -> str:
 def _render_alert(alert: ResearchAlert) -> str:
     symbol = _escape_md(alert.symbol)
     name = _escape_md(alert.name)
-    kinds = ", ".join(k.value for k in alert.spike_kinds)
+    kinds = _escape_md(", ".join(k.value for k in alert.spike_kinds))
 
     # Galaxy / social-vol / interactions line
     galaxy = f"{int(alert.galaxy_score)}" if alert.galaxy_score is not None else "—"
@@ -147,9 +147,7 @@ async def send_social_alert(
         # the call doesn't silently break if alerter's default parse_mode
         # is ever flipped. CLAUDE.md §12b — intentional formatting with
         # tested escape coverage.
-        await send_telegram_message(
-            text, session, settings, parse_mode="Markdown"
-        )
+        await send_telegram_message(text, session, settings, parse_mode="Markdown")
         return True, None
     except Exception as exc:
         logger.exception("social_alert_send_failed", count=len(alerts))

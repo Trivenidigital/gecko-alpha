@@ -4,7 +4,12 @@ import pytest
 import aiohttp
 from aioresponses import aioresponses
 
-from scout.alerter import _escape_md, send_alert, format_alert_message
+from scout.alerter import (
+    _escape_md,
+    send_alert,
+    format_alert_message,
+    format_daily_summary,
+)
 
 
 @pytest.fixture
@@ -44,9 +49,9 @@ def test_format_alert_message_contains_required_fields(token_factory):
     assert "75" in msg  # narrative score
     assert "High" in msg  # virality class
     assert r"vol\_liq\_ratio" in msg
-    assert "[chart](https://dexscreener.com" in msg, (
-        "URL must be wrapped in [chart](url) so MarkdownV1 does not parse special chars inside the URL"
-    )
+    assert (
+        "[chart](https://dexscreener.com" in msg
+    ), "URL must be wrapped in [chart](url) so MarkdownV1 does not parse special chars inside the URL"
     assert "0xabc123" in msg
 
 
@@ -162,6 +167,30 @@ def test_escape_md_handles_none_and_non_string():
     """None returns empty string; ints/floats are coerced via str()."""
     assert _escape_md(None) == ""
     assert _escape_md(42) == "42"
+
+
+def test_daily_summary_is_plain_text_for_parse_mode_none():
+    """Daily summary is sent with parse_mode=None, so do not emit Markdown."""
+    msg = format_daily_summary(
+        {
+            "alerts_today": 2,
+            "outcomes_total": 1,
+            "outcomes_wins": 1,
+            "win_rate_pct": 100.0,
+            "top_signal_combo": '["gainers_early"]',
+            "top_tokens": [
+                {
+                    "token_name": "AS_ROID",
+                    "ticker": "AS_R",
+                    "conviction_score": 91.5,
+                    "quant_score": 90,
+                    "narrative_score": 93,
+                }
+            ],
+        }
+    )
+    assert "*" not in msg
+    assert "AS_ROID" in msg
 
 
 async def test_send_alert_telegram_and_discord(

@@ -3552,9 +3552,41 @@ class Database:
             "losers_contrarian",
             "volume_spike",
         )
+        migration_name = "bl_tg_alert_eligible_v1"
 
         try:
             await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?",
+                (migration_name,),
+            )
+            if await cur.fetchone():
+                await conn.commit()
+                return
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version = ?",
+                (20260516,),
+            )
+            existing_version = await cur.fetchone()
+            if existing_version is not None:
+                if existing_version[0] != migration_name:
+                    raise RuntimeError(
+                        "schema_version collision for bl_tg_alert_eligible_v1: "
+                        f"version=20260516 description={existing_version[0]}"
+                    )
+                await conn.execute(
+                    "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                    "VALUES (?, ?)",
+                    (migration_name, now_iso),
+                )
+                await conn.commit()
+                _log.info(
+                    "bl_tg_alert_eligible_v1_sentinel_backfilled",
+                    migration=migration_name,
+                )
+                return
             cur = await conn.execute("PRAGMA table_info(signal_params)")
             cols = {row[1] for row in await cur.fetchall()}
             if "tg_alert_eligible" not in cols:
@@ -3588,7 +3620,12 @@ class Database:
             await conn.execute(
                 "INSERT OR IGNORE INTO schema_version "
                 "(version, applied_at, description) VALUES (?, ?, ?)",
-                (20260516, now_iso, "bl_tg_alert_eligible_v1"),
+                (20260516, now_iso, migration_name),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
             )
             await conn.commit()
         except Exception as e:
@@ -4246,11 +4283,28 @@ class Database:
             )
             existing_version = await cur.fetchone()
             if existing_version is not None:
-                raise RuntimeError(
-                    "schema_version collision for bl_source_calls_v1: "
-                    f"version={schema_version} "
-                    f"description={existing_version['description']}"
+                if existing_version["description"] != migration_name:
+                    raise RuntimeError(
+                        "schema_version collision for bl_source_calls_v1: "
+                        f"version={schema_version} "
+                        f"description={existing_version['description']}"
+                    )
+                cur = await conn.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='source_calls'"
                 )
+                if await cur.fetchone():
+                    await conn.execute(
+                        "INSERT OR IGNORE INTO paper_migrations "
+                        "(name, cutover_ts) VALUES (?, ?)",
+                        (migration_name, now_iso),
+                    )
+                    await conn.commit()
+                    _log.info(
+                        "bl_source_calls_v1_sentinel_backfilled",
+                        migration=migration_name,
+                    )
+                    return
 
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS source_calls (
@@ -4335,11 +4389,11 @@ class Database:
                 "ON source_calls(outcome_status, call_ts)"
             )
             await conn.execute(
-                "INSERT INTO paper_migrations (name, cutover_ts) VALUES (?, ?)",
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) VALUES (?, ?)",
                 (migration_name, now_iso),
             )
             await conn.execute(
-                "INSERT INTO schema_version (version, applied_at, description) "
+                "INSERT OR IGNORE INTO schema_version (version, applied_at, description) "
                 "VALUES (?, ?, ?)",
                 (schema_version, now_iso, migration_name),
             )

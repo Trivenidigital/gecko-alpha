@@ -50,9 +50,11 @@ def test_multi_kind_lists_all_three():
         ]
     )
     msg = format_social_alert([alert])
-    assert "social_volume_24h" in msg
-    assert "galaxy_jump" in msg
-    assert "interactions_accel" in msg
+    assert r"social\_volume\_24h" in msg
+    assert r"galaxy\_jump" in msg
+    assert r"interactions\_accel" in msg
+    assert "social_volume_24h" not in msg
+    assert "interactions_accel" not in msg
 
 
 def test_markdown_escape_of_underscore_symbol():

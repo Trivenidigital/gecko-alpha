@@ -1,5 +1,36 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-31 - Autonomous full code review
+
+**Status:** IN-PROGRESS. Goal: perform a repo-wide autonomous review pass,
+fix confirmed correctness/ops issues, and verify with focused + full tests.
+
+Workflow checklist:
+- [x] Fresh worktree/branch from `origin/master`.
+- [x] Baseline verification: full pytest passed locally with dummy required
+  env; dashboard build passed after `npm ci --prefer-offline`.
+- [x] Claude review sweep: structural/runtime, migrations/tests, and
+  security/ops vectors.
+- [x] TDD/focused fixes for confirmed findings:
+  What-Changed count contract, TG dedup atomic claim, tg_social entry snapshot
+  candidate lookup, idempotent migration sentinels, auto-suspend alert
+  rollback isolation, LunarCrush Markdown escaping, daily-summary plain text,
+  dashboard test schema fidelity, and backup-watchdog token-in-argv exposure.
+- [x] Focused verification:
+  `python -m pytest ...` affected suites => `193 passed, 29 skipped`.
+- [x] Full pytest regression:
+  `python -m pytest --tb=short -q` => `3246 passed, 159 skipped`.
+- [x] Dashboard production build:
+  `npm run build` => passed.
+- [x] Dry-run/end-to-end smoke:
+  `python -m scout.main --dry-run --cycles 1` => exit 0; external DNS
+  warnings handled as non-fatal and cycle completed.
+- [x] Final Claude review on settled diff:
+  3-vector review found one concrete audit-persistence concern; code already
+  had the commit and an added close/reopen test now pins it. Final rerun
+  passed.
+- [ ] PR, CI, merge.
+
 ## Active Work: 2026-05-31 - Dashboard entry snapshot drawer
 
 **Status:** IN-PROGRESS. Goal: close
@@ -1992,3 +2023,15 @@ Priority list items #1/#2/#4/#5/#6 already SHIPPED (PRs #290/#289/#329/#328/#326
 #3 Kraken BLOCKED on phantom precondition (MCP absent on srilu — see backlog runtime note)
 + OPERATOR-GATED + BL-055 not unlocked. No buildable live item this session; stopped per
 "backlog moved → restate" rule.
+
+# 2026-05-31 autonomous full code review
+
+- [ ] Start from a clean isolated worktree at `origin/master`.
+- [ ] Run baseline verification: targeted tests, full test suite where feasible, dashboard build, and dry-run smoke.
+- [ ] Run broad static/code review sweeps over silent-failure classes: swallowed exceptions, schema/migration drift, Telegram alert hygiene, async/resource cleanup, dashboard/API contracts, and security/config footguns.
+- [ ] Dispatch local Claude Code review passes on orthogonal vectors after baseline artifacts exist:
+  - structural/runtime path review
+  - test/coverage and migration review
+  - security/ops and alerting review
+- [ ] Fix every confirmed issue autonomously with focused tests.
+- [ ] Re-run end-to-end verification, request final Claude review, and merge only if green.

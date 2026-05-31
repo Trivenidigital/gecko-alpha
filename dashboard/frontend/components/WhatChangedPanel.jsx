@@ -67,7 +67,7 @@ export default function WhatChangedPanel() {
       const res = await fetch('/api/trading/history/count?actionability=all')
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      const total = Number(data.count)
+      const total = Number(data.total)
       setHistoryTotal(Number.isFinite(total) ? total : null)
     } catch {
       setHistoryTotal(null)

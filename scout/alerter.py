@@ -92,16 +92,16 @@ def format_alert_message(token: CandidateToken, signals: list[str]) -> str:
 def format_daily_summary(data: dict) -> str:
     """Format the daily summary for Telegram."""
     lines: list[str] = []
-    lines.append("📊 *Gecko-Alpha Daily Summary*")
+    lines.append("Gecko-Alpha Daily Summary")
     lines.append("")
 
     # Alerts
-    lines.append(f"Alerts fired today: *{data['alerts_today']}*")
+    lines.append(f"Alerts fired today: {data['alerts_today']}")
 
     # Win rate
     if data["outcomes_total"] > 0:
         lines.append(
-            f"Win rate (4h+): *{data['win_rate_pct']}%* "
+            f"Win rate (4h+): {data['win_rate_pct']}% "
             f"({data['outcomes_wins']}/{data['outcomes_total']})"
         )
     else:
@@ -119,14 +119,14 @@ def format_daily_summary(data: dict) -> str:
     top = data.get("top_tokens", [])
     if top:
         lines.append("")
-        lines.append("*Top 3 Conviction Tokens:*")
+        lines.append("Top 3 Conviction Tokens:")
         for i, t in enumerate(top, 1):
             conv = t.get("conviction_score")
             conv_str = f"{conv:.1f}" if conv is not None else "–"
             narr = t.get("narrative_score")
             narr_str = str(narr) if narr is not None else "–"
             lines.append(
-                f"{i}. *{t['token_name']}* ({t['ticker']}) — "
+                f"{i}. {t['token_name']} ({t['ticker']}) - "
                 f"conv: {conv_str} | quant: {t.get('quant_score', '–')} | narr: {narr_str}"
             )
     else:

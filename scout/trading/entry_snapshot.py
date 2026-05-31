@@ -46,6 +46,7 @@ def _applicable_optional_fields(signal_type: str) -> tuple[str, ...]:
         return OPTIONAL_FIELDS
     return tuple(f for f in OPTIONAL_FIELDS if f != "tg_channel_at_entry")
 
+
 COLUMN_ORDER: tuple[str, ...] = (
     "paper_trade_id",
     "entry_snapshot_version",
@@ -159,9 +160,7 @@ def _token_age_days(opened_at: str, first_seen_at: str | None) -> float | None:
     return delta.total_seconds() / 86400.0
 
 
-async def _read_tg_channel_at_entry(
-    db, *, token_id: str, opened_at: str
-) -> str | None:
+async def _read_tg_channel_at_entry(db, *, token_id: str, opened_at: str) -> str | None:
     # Vector B C1 fix: temporal bound forbids post-open social-signal rows
     # from polluting the at-entry channel.
     cur = await db._conn.execute(
@@ -174,9 +173,7 @@ async def _read_tg_channel_at_entry(
     return row[0] if row else None
 
 
-_TRAIL_FIELDS_ALLOWED: frozenset[str] = frozenset(
-    {"trail_pct", "trail_pct_low_peak"}
-)
+_TRAIL_FIELDS_ALLOWED: frozenset[str] = frozenset({"trail_pct", "trail_pct_low_peak"})
 
 
 async def _read_trail_at_entry(
@@ -273,8 +270,13 @@ async def build_entry_snapshot(
     """
     mcap = _extract_mcap(signal_data)
     liquidity = _extract_liquidity(signal_data)
+    candidate_contract_address = contract_address
+    if signal_type == "tg_social":
+        raw_contract = signal_data.get("contract_address")
+        if isinstance(raw_contract, str) and raw_contract.strip():
+            candidate_contract_address = raw_contract.strip()
     first_seen = await _read_first_seen_at(
-        db, contract_address=contract_address, chain=chain
+        db, contract_address=candidate_contract_address, chain=chain
     )
     token_age = _token_age_days(opened_at, first_seen)
 
