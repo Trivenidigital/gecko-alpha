@@ -1,8 +1,35 @@
 # Backlog — gecko-alpha
 
-## Active Work: 2026-05-31 - Preserve candidate first_seen_at on re-ingest
+## Active Work: 2026-05-31 - Dashboard entry snapshot drawer
 
 **Status:** IN-PROGRESS. Goal: close
+`BL-NEW-DASHBOARD-ENTRY-SNAPSHOT-DRAWER` by surfacing the already-shipped
+`paper_trade_entry_snapshots` sidecar in the existing Trade Detail drawer.
+
+Workflow checklist:
+- [x] Drift-check: `paper_trade_entry_snapshots` exists and
+  `TradeDetailDrawer` did not yet consume any `*_at_entry` fields.
+- [x] Scope decision: read-only `/api/trading/positions` join + drawer
+  rendering only; no schema, trading behavior, or feedback workflow.
+- [x] Build: positions query left-joins the sidecar, drawer renders post-cutover
+  at-entry facts and explicit pre-cutover label.
+- [x] Focused verification:
+  `python -m pytest -q tests/test_trading_dashboard.py
+  tests/test_dashboard_frontend_layout.py` => `42 passed`;
+  `npm --prefix dashboard/frontend run build:codex` => passed;
+  `git diff --check` => clean.
+- [x] Claude review:
+  ultrareview unavailable (`Free ultrareviews used`); fallback
+  `claude -p --model sonnet` code review => no correctness bugs found.
+- [ ] PR, CI, merge.
+
+Non-scope:
+- No closed-history join, historical backfill, operator feedback marks,
+  trading policy, or source-quality ranking.
+
+## Completed Work: 2026-05-31 - Preserve candidate first_seen_at on re-ingest
+
+**Status:** SHIPPED 2026-05-31 - PR #340 squash `1361d939`. Closed
 `BL-NEW-ACTIONABILITY-CANDIDATES-FIRST-SEEN-PRESERVE` by making candidate
 re-ingest preserve the earliest point-in-time sighting instead of replacing it
 with the newest model default.
@@ -25,15 +52,15 @@ Workflow checklist:
 - [x] Claude review:
   ultrareview unavailable (`Free ultrareviews used`); fallback
   `claude -p --model sonnet` code review => no bugs found.
-- [ ] PR, CI, merge.
+- [x] PR #340, CI green, squash-merged as `1361d939`.
 
 Non-scope:
 - No backfill, schema migration, dashboard change, trading policy change, or
   cross-chain first-seen collapse.
 
-## Active Work: 2026-05-31 - Actionability entry-snapshot hardening
+## Completed Work: 2026-05-31 - Actionability entry-snapshot hardening
 
-**Status:** IN-PROGRESS. Goal: finish the autonomous PR #200 residuals that
+**Status:** SHIPPED 2026-05-31 - PR #339 squash `a127a6ac`. Finished the autonomous PR #200 residuals that
 do not require operator product judgment: migration schema-drift logging,
 entry-snapshot schema assertion, and mixed-case candidate lookup test
 fidelity.
@@ -54,7 +81,7 @@ Workflow checklist:
   tests/test_entry_snapshot.py` => passed; `git diff --check` => clean.
 - [x] Claude review:
   `claude ultrareview origin/master --timeout 20` => no findings.
-- [ ] PR, CI, merge.
+- [x] PR #339, CI green, squash-merged as `a127a6ac`.
 
 Non-scope:
 - No trading behavior, dashboard UI, new schema fields, operator feedback

@@ -963,25 +963,46 @@ async def get_trading_positions(db_path: str) -> list[dict]:
 async def _get_trading_positions_inner(db) -> list[dict]:
     """Inner implementation split out for M11 try/except wrapper."""
     cursor = await db.execute(
-        """SELECT id, token_id, symbol, name, chain, signal_type, signal_data,
-                  entry_price, amount_usd, quantity,
-                  tp_price, sl_price, tp_pct, sl_pct,
-                  peak_price, peak_pct,
-                  checkpoint_1h_pct, checkpoint_6h_pct,
-                  checkpoint_24h_pct, checkpoint_48h_pct,
-                  opened_at,
-                  leg_1_filled_at,
-                  leg_2_filled_at,
-                  remaining_qty,
-                  realized_pnl_usd,
-                  floor_armed,
-                  would_be_live,
-                  actionable,
-                  actionability_reason,
-                  actionability_version
-           FROM paper_trades
-           WHERE status = 'open'
-           ORDER BY opened_at DESC"""
+        """SELECT pt.id, pt.token_id, pt.symbol, pt.name, pt.chain,
+                  pt.signal_type, pt.signal_data,
+                  pt.entry_price, pt.amount_usd, pt.quantity,
+                  pt.tp_price, pt.sl_price, pt.tp_pct, pt.sl_pct,
+                  pt.peak_price, pt.peak_pct,
+                  pt.checkpoint_1h_pct, pt.checkpoint_6h_pct,
+                  pt.checkpoint_24h_pct, pt.checkpoint_48h_pct,
+                  pt.opened_at,
+                  pt.leg_1_filled_at,
+                  pt.leg_2_filled_at,
+                  pt.remaining_qty,
+                  pt.realized_pnl_usd,
+                  pt.floor_armed,
+                  pt.would_be_live,
+                  pt.actionable,
+                  pt.actionability_reason,
+                  pt.actionability_version,
+                  s.entry_snapshot_version,
+                  s.entry_snapshot_complete,
+                  s.entry_snapshot_missing_fields,
+                  s.captured_at AS entry_snapshot_captured_at,
+                  s.mcap_usd_at_entry,
+                  s.mcap_bucket_at_entry,
+                  s.liquidity_usd_at_entry,
+                  s.token_age_days_at_entry,
+                  s.first_seen_at_at_entry,
+                  s.detected_by_combo_at_entry,
+                  s.source_confluence_count_at_entry,
+                  s.tg_channel_at_entry,
+                  s.actionability_version_at_entry,
+                  s.actionability_reason_at_entry,
+                  s.actionable_at_entry,
+                  s.tp_pct_at_entry,
+                  s.sl_pct_at_entry,
+                  s.trail_pct_at_entry,
+                  s.trail_pct_low_peak_at_entry
+           FROM paper_trades pt
+           LEFT JOIN paper_trade_entry_snapshots s ON s.paper_trade_id = pt.id
+           WHERE pt.status = 'open'
+           ORDER BY pt.opened_at DESC"""
     )
     rows = [dict(r) for r in await cursor.fetchall()]
 
