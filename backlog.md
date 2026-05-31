@@ -2160,7 +2160,11 @@ Regression test asserts. Documentation in `docs/gecko-alpha-alignment.md`
 captures the contract.
 
 ### BL-NEW-ACTIONABILITY-MIGRATION-SCHEMA-DRIFT-DETECTED-LOG: parity with minara migration helper
-**Status:** PROPOSED 2026-05-20.
+**Status:** SHIPPED 2026-05-31 - PR #339. `_migrate_actionability_entry_snapshot_v1`
+now emits `SCHEMA_DRIFT_DETECTED` with the migration name on rollback, matching
+the sibling Minara migration pattern. Closed together with the schema-assert
+hardening below.
+**Original filed status:** PROPOSED 2026-05-20.
 **Tag:** `migration` `observability` `actionability`
 **Why:** `_migrate_actionability_entry_snapshot_v1` ROLLBACK except-block omits
 the `SCHEMA_DRIFT_DETECTED` operational log that the sibling
@@ -2174,7 +2178,11 @@ to the except block at `scout/db.py:3650-3661`. Two-line change.
 **Acceptance:** Sibling-migration parity; greppable from monitoring.
 
 ### BL-NEW-ACTIONABILITY-MIGRATION-ASSERT-SCHEMA: post-migration shape assert
-**Status:** PROPOSED 2026-05-20.
+**Status:** SHIPPED 2026-05-31 - PR #339. Added
+`_assert_paper_trade_entry_snapshots_schema`, wired it into fresh migrations
+and already-applied sentinel skips, and covered missing-column / missing-CHECK
+drift in `tests/test_entry_snapshot.py`.
+**Original filed status:** PROPOSED 2026-05-20.
 **Tag:** `migration` `schema-drift` `actionability`
 **Why:** The sibling minara migration has `_assert_minara_alert_emissions_schema`
 (2-pass: before-index and after-index) that catches CHECK/column drift at
@@ -2191,7 +2199,10 @@ table (drops the CHECK constraint, removes a column) + re-invokes initialize()
 **Acceptance:** Drift surfaces at migration time, not INSERT time.
 
 ### BL-NEW-ACTIONABILITY-CANDIDATES-CASE-FIDELITY: test fixture vs prod data mismatch
-**Status:** PROPOSED 2026-05-20.
+**Status:** SHIPPED 2026-05-31 - PR #339. Test fixtures now preserve contract
+case, and coverage asserts the `LOWER(contract_address)=LOWER(?)` first-seen
+lookup resolves a checksummed mixed-case candidate row.
+**Original filed status:** PROPOSED 2026-05-20.
 **Tag:** `test-fidelity` `actionability`
 **Why:** `tests/test_entry_snapshot.py::_ensure_candidate_row` lowercases the
 contract_address before inserting (`contract_address.lower()`). Real-world

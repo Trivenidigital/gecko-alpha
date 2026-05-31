@@ -1,8 +1,37 @@
 # Backlog — gecko-alpha
 
-## Active Work: 2026-05-31 - What Changed health status deltas
+## Active Work: 2026-05-31 - Actionability entry-snapshot hardening
 
-**Status:** IN-PROGRESS. Goal: finish the deferred Category-3 health-status
+**Status:** IN-PROGRESS. Goal: finish the autonomous PR #200 residuals that
+do not require operator product judgment: migration schema-drift logging,
+entry-snapshot schema assertion, and mixed-case candidate lookup test
+fidelity.
+
+Workflow checklist:
+- [x] Drift-check: PR #200 entry-snapshot substrate exists in `scout/db.py`
+  and `scout/trading/entry_snapshot.py`.
+- [x] Scope decision: bundle only the migration/test hardening residuals;
+  leave operator feedback marks, cross-chain first-seen policy, and TG signal
+  expansion out because they need product/policy or trigger evidence.
+- [x] TDD: add failing coverage for broken entry-snapshot schema detection and
+  mixed-case candidate lookup.
+- [x] Build: assert paper_trade_entry_snapshots shape during migration and emit
+  `SCHEMA_DRIFT_DETECTED` on rollback.
+- [x] Focused verification:
+  `python -m pytest -q tests/test_entry_snapshot.py tests/test_minara_alert.py tests/test_db.py`
+  => `92 passed`; `black --target-version py312 --check scout/db.py
+  tests/test_entry_snapshot.py` => passed; `git diff --check` => clean.
+- [x] Claude review:
+  `claude ultrareview origin/master --timeout 20` => no findings.
+- [ ] PR, CI, merge.
+
+Non-scope:
+- No trading behavior, dashboard UI, new schema fields, operator feedback
+  workflow, cross-chain first-seen policy, or TG signal-type expansion.
+
+## Completed Work: 2026-05-31 - What Changed health status deltas
+
+**Status:** SHIPPED 2026-05-31 - PR #338 squash `aac53556`. Finished the deferred Category-3 health-status
 delta for `BL-NEW-DASHBOARD-WHAT-CHANGED-SINCE-LAST-VISIT` now that PR #337
 ships authoritative `ok|degraded|down|unknown` values on `/api/system/health`.
 
@@ -19,12 +48,12 @@ Workflow checklist:
   `python -m pytest -q tests/test_what_changed_storage.py
   tests/test_what_changed_anti_scope.py tests/test_what_changed_copy_firewall.py
   tests/test_dashboard_frontend_layout.py tests/test_system_health_status.py`
-  => `47 passed`.
+  => `48 passed`.
 - [x] Frontend build:
   `npm --prefix dashboard/frontend run build:codex` => passed.
 - [x] Review and commit:
-  commit `bce95c49 feat(dashboard): show health changes in what changed`;
-  `claude ultrareview origin/master --timeout 10` => no findings.
+  PR #338 squash `aac53556`; `claude ultrareview origin/master --timeout 10`
+  => no findings.
 
 Non-scope:
 - No health SLO thresholds, collectors, alerting, status reinterpretation,
