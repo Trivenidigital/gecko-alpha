@@ -1992,3 +1992,15 @@ Priority list items #1/#2/#4/#5/#6 already SHIPPED (PRs #290/#289/#329/#328/#326
 #3 Kraken BLOCKED on phantom precondition (MCP absent on srilu — see backlog runtime note)
 + OPERATOR-GATED + BL-055 not unlocked. No buildable live item this session; stopped per
 "backlog moved → restate" rule.
+
+# 2026-05-31 autonomous full code review
+
+- [ ] Start from a clean isolated worktree at `origin/master`.
+- [ ] Run baseline verification: targeted tests, full test suite where feasible, dashboard build, and dry-run smoke.
+- [ ] Run broad static/code review sweeps over silent-failure classes: swallowed exceptions, schema/migration drift, Telegram alert hygiene, async/resource cleanup, dashboard/API contracts, and security/config footguns.
+- [ ] Dispatch local Claude Code review passes on orthogonal vectors after baseline artifacts exist:
+  - structural/runtime path review
+  - test/coverage and migration review
+  - security/ops and alerting review
+- [ ] Fix every confirmed issue autonomously with focused tests.
+- [ ] Re-run end-to-end verification, request final Claude review, and merge only if green.
