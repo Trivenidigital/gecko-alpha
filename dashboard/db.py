@@ -606,8 +606,21 @@ async def get_chains_stats(db_path: str) -> dict:
 # System health query
 # ---------------------------------------------------------------------------
 
+from dashboard.health_status import (  # noqa: E402  (grouped with its consumer)
+    READ_ERROR_COUNT_SENTINEL,
+    derive_subsystem_status,
+)
 
 _SQL_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+# Operator-fillable freshness SLO per system-health table, in minutes.
+# Ships EMPTY by deliberate design (operator decision D1): with no entries, every
+# readable table derives status "unknown" -- the honest ship-state, since we have
+# not yet justified a freshness budget for any of these tables. The operator adds
+# {table_name: minutes} entries here (reviewable in git) as evidence accrues; only
+# then do "ok"/"degraded" become reachable for that table. Do NOT pre-populate
+# with guessed thresholds. See tasks/design_api_system_health_status_enum_2026_05_30.md.
+HEALTH_FRESHNESS_SLO_MINUTES: dict[str, int] = {}
 
 
 async def _table_stats(conn, table: str, time_col: str) -> dict:
@@ -630,12 +643,35 @@ async def _table_stats(conn, table: str, time_col: str) -> dict:
         cursor = await conn.execute(f"SELECT MAX({time_col}) FROM {table}")
         latest = (await cursor.fetchone())[0]
         return {"count": count, "latest": latest}
+    except aiosqlite.Error:
+        # Genuine SQLite read error (missing/unreadable table, etc.). Return a
+        # DISTINGUISHABLE sentinel so callers can tell "unreadable" apart from
+        # "empty but present" (which is a successful read returning count == 0).
+        # The system-health status deriver maps count == -1 -> "down".
+        return {"count": READ_ERROR_COUNT_SENTINEL, "latest": None}
     except Exception:
+        # Non-DB failures (e.g. a None connection in unit tests) keep the
+        # historical zero-stats behavior so existing callers/tests are unaffected.
         return {"count": 0, "latest": None}
 
 
-async def get_system_health(db_path: str) -> dict:
-    """Row counts + last activity for major tables."""
+async def get_system_health(db_path: str, *, now: datetime | None = None) -> dict:
+    """Row counts + last activity for major tables, each with a derived status.
+
+    Each per-table value is ``{"count", "latest", "status"}`` where ``status`` is
+    one of ``ok``/``degraded``/``down``/``unknown`` derived purely from the
+    table's freshness vs ``HEALTH_FRESHNESS_SLO_MINUTES`` (which ships empty, so
+    readable tables report ``unknown`` until an SLO is added). ``count``/``latest``
+    keep their exact prior meaning and values; ``status`` is purely additive.
+
+    Args:
+        db_path: path to the SQLite database.
+        now: injected current time for deterministic status derivation; defaults
+            to ``datetime.now(timezone.utc)``. Optional so the existing call site
+            (``api.py``) works unchanged.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
     tables = [
         ("category_snapshots", "snapshot_at"),
         ("narrative_signals", "created_at"),
@@ -656,7 +692,13 @@ async def get_system_health(db_path: str) -> dict:
     result = {}
     async with _ro_db(db_path) as conn:
         for table, time_col in tables:
-            result[table] = await _table_stats(conn, table, time_col)
+            stats = await _table_stats(conn, table, time_col)
+            result[table] = {
+                **stats,
+                "status": derive_subsystem_status(
+                    stats, HEALTH_FRESHNESS_SLO_MINUTES.get(table), now
+                ),
+            }
     return result
 
 
@@ -2145,9 +2187,7 @@ async def get_todays_focus(db_path: str, *, window_hours: int = 36) -> dict:
     # connection block (reviewer correctness fold).
     now = datetime.now(timezone.utc)
     cutoff_iso = (now - timedelta(hours=SPARKLINE_LOOKBACK_HOURS)).isoformat()
-    benchmark_cutoff_iso = (
-        now - timedelta(hours=BENCHMARK_LOOKBACK_HOURS)
-    ).isoformat()
+    benchmark_cutoff_iso = (now - timedelta(hours=BENCHMARK_LOOKBACK_HOURS)).isoformat()
     points_by_token: dict[str, list] = {}
     benchmarks: dict[str, float] = {}
     try:
@@ -2201,14 +2241,10 @@ async def get_todays_focus(db_path: str, *, window_hours: int = 36) -> dict:
         "source_endpoint": "/api/trade_inbox",
         "source_window_hours": window_hours,
         "source_limit_per_group": source_limit_per_group,
-        "source_rows_considered": int(
-            trade_meta.get("source_rows_considered") or 0
-        ),
+        "source_rows_considered": int(trade_meta.get("source_rows_considered") or 0),
         "source_group_counts": dict(trade_meta.get("group_counts") or {}),
         "source_truncated": bool(trade_meta.get("source_truncated")),
-        "tracker_source_truncated": bool(
-            trade_meta.get("tracker_source_truncated")
-        ),
+        "tracker_source_truncated": bool(trade_meta.get("tracker_source_truncated")),
         "max_rows": max_rows,
         "paper_target": paper_target,
         "tracker_target": tracker_target,
