@@ -469,3 +469,17 @@ def test_committed_dist_references_what_changed_bundle():
         assert path.is_file(), f"referenced bundle missing on disk: {asset}"
         bundle_text += path.read_text(encoding="utf-8", errors="ignore")
     assert "What Changed" in bundle_text, "What Changed tab string missing from bundle"
+
+
+def test_tg_alerts_tab_exposes_factual_operator_action_buttons():
+    text = (
+        ROOT / "dashboard" / "frontend" / "components" / "TGAlertsTab.jsx"
+    ).read_text(encoding="utf-8")
+    assert "/api/tg_alerts/recent?limit=80" in text
+    assert "/operator-action" in text
+    for label in ("Acted", "Useful", "Ignored", "Bad"):
+        assert label in text
+    banned = ("buy now", "trade now", "act now", "should buy", "should sell")
+    lowered = text.lower()
+    for phrase in banned:
+        assert phrase not in lowered

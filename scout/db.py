@@ -108,6 +108,7 @@ class Database:
         # 'blocked_dedup_24h'. MUST run AFTER the m1_5c widening so it
         # operates on the already-widened CHECK and preserves all values.
         await self._migrate_tg_alert_log_dedup_outcome()
+        await self._migrate_tg_alert_operator_actions_v1()
         await self._migrate_narrative_scanner_v1()
         await self._migrate_minara_alert_emissions_v1()
         # BL-NEW-ACTIONABILITY-ENTRY-SNAPSHOT-FOUNDATION (2026-05-20):
@@ -3946,6 +3947,147 @@ class Database:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
 
+    async def _migrate_tg_alert_operator_actions_v1(self) -> None:
+        """BL-NEW-TG-ALERT-OPERATOR-ACTION-TELEMETRY: operator labels.
+
+        Additive table keyed one-to-one by tg_alert_log.id. The table stores
+        copied alert facts so later analysis does not have to infer context
+        through joins if the source dispatch row changes.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "bl_tg_alert_operator_actions_v1"
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                await self._assert_tg_alert_operator_actions_schema(conn)
+                return
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )""")
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version = ?",
+                (20260531,),
+            )
+            existing_version = await cur.fetchone()
+            if existing_version is not None and existing_version[0] != migration_name:
+                raise RuntimeError(
+                    "tg_alert_operator_actions_v1 schema_version collision: "
+                    f"version 20260531 owned by {existing_version[0]!r}"
+                )
+
+            await conn.execute("""CREATE TABLE IF NOT EXISTS tg_alert_operator_actions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tg_alert_log_id INTEGER NOT NULL UNIQUE,
+                    paper_trade_id INTEGER,
+                    token_id TEXT NOT NULL,
+                    signal_type TEXT NOT NULL,
+                    alerted_at TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK (
+                        action IN ('acted','useful','ignored','false_positive')
+                    ),
+                    note TEXT,
+                    source TEXT NOT NULL DEFAULT 'dashboard'
+                        CHECK (source IN ('dashboard','api','backfill')),
+                    marked_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )""")
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "idx_tg_alert_operator_actions_marked_at "
+                "ON tg_alert_operator_actions(marked_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "idx_tg_alert_operator_actions_action "
+                "ON tg_alert_operator_actions(action, marked_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260531, now_iso, migration_name),
+            )
+            await self._assert_tg_alert_operator_actions_schema(conn)
+            await conn.commit()
+            _db_log.info(
+                "tg_alert_operator_actions_v1_migration_complete",
+                table="tg_alert_operator_actions",
+            )
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _db_log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _assert_tg_alert_operator_actions_schema(self, conn) -> None:
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='tg_alert_operator_actions'"
+        )
+        if await cur.fetchone() is None:
+            raise RuntimeError("tg_alert_operator_actions table missing")
+
+        cur = await conn.execute("PRAGMA table_info(tg_alert_operator_actions)")
+        cols = {row[1] for row in await cur.fetchall()}
+        required = {
+            "id",
+            "tg_alert_log_id",
+            "paper_trade_id",
+            "token_id",
+            "signal_type",
+            "alerted_at",
+            "action",
+            "note",
+            "source",
+            "marked_at",
+            "updated_at",
+        }
+        missing = sorted(required - cols)
+        if missing:
+            raise RuntimeError(
+                "tg_alert_operator_actions schema missing columns: "
+                + ",".join(missing)
+            )
+
+        for idx in (
+            "idx_tg_alert_operator_actions_marked_at",
+            "idx_tg_alert_operator_actions_action",
+        ):
+            cur = await conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+                (idx,),
+            )
+            if await cur.fetchone() is None:
+                raise RuntimeError(f"tg_alert_operator_actions index missing: {idx}")
+        cur = await conn.execute(
+            "SELECT 1 FROM schema_version "
+            "WHERE version = 20260531 "
+            "AND description = 'bl_tg_alert_operator_actions_v1'"
+        )
+        if await cur.fetchone() is None:
+            raise RuntimeError("tg_alert_operator_actions schema_version missing")
+
     async def _migrate_narrative_scanner_v1(self) -> None:
         """BL-NEW-NARRATIVE-SCANNER (V1): create narrative_alerts_inbound table.
 
@@ -5236,6 +5378,88 @@ class Database:
         finally:
             if lock_acquired:
                 self._txn_lock.release()
+
+    async def record_tg_alert_operator_action(
+        self,
+        *,
+        tg_alert_log_id: int,
+        action: str,
+        note: str | None,
+        source: str = "dashboard",
+    ) -> dict:
+        """Record the operator's current label for a delivered TG alert."""
+        if self._conn is None or self._txn_lock is None:
+            raise RuntimeError("Database not initialized.")
+        allowed_actions = {"acted", "useful", "ignored", "false_positive"}
+        if action not in allowed_actions:
+            raise ValueError(f"invalid operator action: {action}")
+        allowed_sources = {"dashboard", "api", "backfill"}
+        if source not in allowed_sources:
+            raise ValueError(f"invalid operator action source: {source}")
+
+        clean_note = note.strip() if note else None
+        if clean_note:
+            clean_note = clean_note[:500]
+        now_iso = datetime.now(timezone.utc).isoformat()
+        txn_started = False
+
+        await self._txn_lock.acquire()
+        try:
+            cur = await self._conn.execute(
+                "SELECT id, paper_trade_id, signal_type, token_id, alerted_at "
+                "FROM tg_alert_log WHERE id = ? AND outcome = 'sent'",
+                (tg_alert_log_id,),
+            )
+            alert = await cur.fetchone()
+            if alert is None:
+                raise KeyError(f"sent tg_alert_log row not found: {tg_alert_log_id}")
+
+            await self._conn.execute("BEGIN IMMEDIATE")
+            txn_started = True
+            await self._conn.execute(
+                """INSERT INTO tg_alert_operator_actions (
+                    tg_alert_log_id, paper_trade_id, token_id, signal_type,
+                    alerted_at, action, note, source, marked_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tg_alert_log_id) DO UPDATE SET
+                    action = excluded.action,
+                    note = excluded.note,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at""",
+                (
+                    alert["id"],
+                    alert["paper_trade_id"],
+                    alert["token_id"],
+                    alert["signal_type"],
+                    alert["alerted_at"],
+                    action,
+                    clean_note,
+                    source,
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            await self._conn.commit()
+            txn_started = False
+            cur = await self._conn.execute(
+                """SELECT id, tg_alert_log_id, paper_trade_id, token_id,
+                          signal_type, alerted_at, action, note, source,
+                          marked_at, updated_at
+                   FROM tg_alert_operator_actions
+                   WHERE tg_alert_log_id = ?""",
+                (tg_alert_log_id,),
+            )
+            row = await cur.fetchone()
+            return dict(row)
+        except BaseException:
+            if txn_started:
+                try:
+                    await self._conn.rollback()
+                except Exception as rb_err:
+                    _db_log.exception("connection_rollback_failed", err=str(rb_err))
+            raise
+        finally:
+            self._txn_lock.release()
 
     async def revive_signal_with_baseline(
         self,

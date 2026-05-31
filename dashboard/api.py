@@ -9,10 +9,10 @@ from typing import Literal
 
 import aiosqlite
 import structlog
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi import Path as FPath
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from dashboard import db
 from dashboard.models import (
@@ -67,6 +67,11 @@ async def _get_scout_db(db_path: str):
         _scout_db = ScoutDatabase(db_path)
         await _scout_db.initialize()
     return _scout_db
+
+
+class TgAlertOperatorActionRequest(BaseModel):
+    action: Literal["acted", "useful", "ignored", "false_positive"]
+    note: str | None = Field(default=None, max_length=500)
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -129,6 +134,77 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/alerts/recent", response_model=list[AlertResponse])
     async def get_alerts():
         return await db.get_recent_alerts(_db_path, limit=20)
+
+    @app.get("/api/tg_alerts/recent")
+    async def get_recent_tg_dispatch_alerts(limit: int = Query(50, ge=1, le=200)):
+        """Recent sent Telegram dispatches with optional operator label.
+
+        Visibility-only substrate for TG alert qualification. It does not
+        classify, rank, or dispatch alerts.
+        """
+        sdb = await _get_scout_db(_db_path)
+        cur = await sdb._conn.execute(
+            """SELECT l.id, l.paper_trade_id, l.signal_type, l.token_id,
+                      l.alerted_at, l.detail,
+                      a.action, a.note, a.source, a.marked_at, a.updated_at
+               FROM tg_alert_log l
+               LEFT JOIN tg_alert_operator_actions a
+                 ON a.tg_alert_log_id = l.id
+               WHERE l.outcome = 'sent'
+               ORDER BY datetime(l.alerted_at) DESC, l.id DESC
+               LIMIT ?""",
+            (limit,),
+        )
+        rows = await cur.fetchall()
+        alerts = []
+        for r in rows:
+            operator_action = None
+            if r["action"] is not None:
+                operator_action = {
+                    "action": r["action"],
+                    "note": r["note"],
+                    "source": r["source"],
+                    "marked_at": r["marked_at"],
+                    "updated_at": r["updated_at"],
+                }
+            alerts.append(
+                {
+                    "id": r["id"],
+                    "paper_trade_id": r["paper_trade_id"],
+                    "signal_type": r["signal_type"],
+                    "token_id": r["token_id"],
+                    "alerted_at": r["alerted_at"],
+                    "detail": r["detail"],
+                    "operator_action": operator_action,
+                }
+            )
+        return {
+            "meta": {
+                "read_only": True,
+                "not_for_alerting": True,
+                "not_for_execution": True,
+                "not_for_sizing": True,
+                "operator_action_telemetry_available": True,
+                "rows_returned": len(alerts),
+            },
+            "alerts": alerts,
+        }
+
+    @app.post("/api/tg_alerts/{alert_id}/operator-action")
+    async def record_tg_alert_operator_action(
+        payload: TgAlertOperatorActionRequest,
+        alert_id: int = FPath(..., ge=1),
+    ):
+        sdb = await _get_scout_db(_db_path)
+        try:
+            return await sdb.record_tg_alert_operator_action(
+                tg_alert_log_id=alert_id,
+                action=payload.action,
+                note=payload.note,
+                source="dashboard",
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="sent alert not found")
 
     @app.get("/api/signals/today", response_model=list[SignalHitRate])
     async def get_signals():
