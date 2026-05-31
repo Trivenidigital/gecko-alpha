@@ -414,6 +414,7 @@ def test_what_changed_storage_exports_required_pure_helpers():
         "export function markCurrentRowsSeen",
         "export function diffClosedTrades",
         "export function diffPnlSwings",
+        "export function diffHealthStatusChanges",
     ):
         assert symbol in text, f"whatChangedStorage.js missing {symbol!r}"
     # closed-id set must be length-capped to avoid unbounded growth (Codex NIT)

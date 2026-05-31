@@ -6,6 +6,7 @@ import {
   hasBaseline,
   diffClosedTrades,
   diffPnlSwings,
+  diffHealthStatusChanges,
   buildSnapshotFromCurrent,
 } from '../whatChangedStorage.js'
 import {
@@ -16,12 +17,15 @@ import {
   closedRow,
   swingRow,
   newlyOpenedRow,
+  HEALTH_HEADLINE,
+  healthRow,
   swingsTruncationFootnote,
   historyTruncationFootnote,
   unavailableRowsFootnote,
   categoryUnavailable,
   firstVisitClosedLabel,
   firstVisitOpenLabel,
+  firstVisitHealthLabel,
   baselineAgeLabel,
 } from '../whatChangedFacts.js'
 import { formatDetectionAge } from '../todayFocusAge.js'
@@ -34,8 +38,10 @@ export default function WhatChangedPanel() {
   const [historyRows, setHistoryRows] = useState([])
   const [historyTotal, setHistoryTotal] = useState(null)
   const [positionRows, setPositionRows] = useState([])
+  const [systemHealth, setSystemHealth] = useState({})
   const [historyError, setHistoryError] = useState(null)
   const [positionsError, setPositionsError] = useState(null)
+  const [healthError, setHealthError] = useState(null)
   const [loading, setLoading] = useState(false)
   // Guard the first-visit baseline write so we never render counts for a
   // single frame before the baseline is committed (Codex NIT).
@@ -83,20 +89,44 @@ export default function WhatChangedPanel() {
     }
   }
 
+  const fetchSystemHealth = async () => {
+    try {
+      const res = await fetch('/api/system/health')
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      const health = data && typeof data === 'object' && !Array.isArray(data) ? data : {}
+      setSystemHealth(health)
+      setHealthError(null)
+      return health
+    } catch (err) {
+      setHealthError(String(err.message || err))
+      return null
+    }
+  }
+
   // commitBaseline=true on explicit engagement (mount-first-visit / Acknowledge
   // / Refresh) writes a fresh baseline; otherwise the delta stays visible.
   const loadAll = async (commitBaseline = false) => {
     setLoading(true)
     const current = loadState()
     const firstVisit = !hasBaseline(current)
-    const [hRows, pRows] = await Promise.all([fetchHistory(), fetchPositions()])
+    const [hRows, pRows, health] = await Promise.all([
+      fetchHistory(),
+      fetchPositions(),
+      fetchSystemHealth(),
+    ])
     await fetchHistoryCount()
 
     // On first visit, commit the baseline BEFORE flipping baselineReady so the
     // panel never flashes counts against an empty baseline.
     if (firstVisit || commitBaseline) {
-      const snap = buildSnapshotFromCurrent(hRows || [], pRows || [])
-      const next = markCurrentRowsSeen(current, snap.closedIds, snap.openUnrealizedById)
+      const snap = buildSnapshotFromCurrent(hRows || [], pRows || [], health || {})
+      const next = markCurrentRowsSeen(
+        current,
+        snap.closedIds,
+        snap.openUnrealizedById,
+        snap.healthStatusBySubsystem
+      )
       setState(next)
       setBaselineReady(true)
     } else {
@@ -113,8 +143,13 @@ export default function WhatChangedPanel() {
   }, [])
 
   const acknowledge = () => {
-    const snap = buildSnapshotFromCurrent(historyRows, positionRows)
-    const next = markCurrentRowsSeen(state, snap.closedIds, snap.openUnrealizedById)
+    const snap = buildSnapshotFromCurrent(historyRows, positionRows, systemHealth)
+    const next = markCurrentRowsSeen(
+      state,
+      snap.closedIds,
+      snap.openUnrealizedById,
+      snap.healthStatusBySubsystem
+    )
     setState(next)
   }
 
@@ -140,6 +175,11 @@ export default function WhatChangedPanel() {
     [state, positionRows]
   )
 
+  const healthChanges = useMemo(
+    () => diffHealthStatusChanges(state.snapshot?.health_status_by_subsystem || {}, systemHealth),
+    [state, systemHealth]
+  )
+
   // Sort happens here in RENDER logic only — by absolute delta, both
   // directions. This is a factual magnitude ordering, not an action ranking.
   const rankedMovers = useMemo(() => {
@@ -155,7 +195,8 @@ export default function WhatChangedPanel() {
     !isFirstVisit &&
     closed.count === 0 &&
     rankedMovers.length === 0 &&
-    newlyOpened.length === 0
+    newlyOpened.length === 0 &&
+    healthChanges.count === 0
 
   return (
     <div className="what-changed-panel">
@@ -179,6 +220,7 @@ export default function WhatChangedPanel() {
             <div className="what-changed-first-visit">
               <div>{firstVisitClosedLabel(historyRows.length)}</div>
               <div>{firstVisitOpenLabel(positionRows.length)}</div>
+              <div>{firstVisitHealthLabel(Object.keys(systemHealth).length)}</div>
             </div>
           )}
 
@@ -249,6 +291,32 @@ export default function WhatChangedPanel() {
                       {unavailableRowsFootnote(swings.unavailableCount)}
                     </div>
                   )}
+                </>
+              )}
+            </section>
+          )}
+
+          {/* Category 3: system-health status changes */}
+          {!isFirstVisit && (healthError || healthChanges.count > 0) && (
+            <section className="what-changed-health">
+              {healthError ? (
+                <div className="what-changed-unavailable">
+                  {categoryUnavailable(healthError)}
+                </div>
+              ) : (
+                <>
+                  <div className="what-changed-section-headline">{HEALTH_HEADLINE}</div>
+                  <ul>
+                    {healthChanges.items.map(item => (
+                      <li key={item.subsystem}>
+                        {healthRow(
+                          item.subsystem,
+                          item.previous_status,
+                          item.current_status
+                        )}
+                      </li>
+                    ))}
+                  </ul>
                 </>
               )}
             </section>

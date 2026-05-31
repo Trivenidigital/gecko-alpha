@@ -2306,7 +2306,7 @@ Recommend (a) first; (b) only if (a)'s 6-fetch fan-out is too slow.
 **Decision-by:** live decision cockpit entry-quality design plus #183 actionability evidence.
 
 ### BL-NEW-DASHBOARD-WHAT-CHANGED-SINCE-LAST-VISIT: session-aware "what's new" panel
-**Status:** PROPOSED 2026-05-19 — surfaced from the operator's "What changed since I last looked?" cockpit question.
+**Status:** SHIPPED-PARTIAL 2026-05-30 / FAST-FOLLOW-IN-PR 2026-05-31. PR #334 shipped the read-only What Changed panel for newly closed trades + open-position PnL deltas. The 2026-05-31 fast-follow branch adds the deferred health-status delta now that PR #337 exposes authoritative per-subsystem status values.
 **Tag:** `dashboard` `delta-view` `session-state` `read-only` `evidence-gated`
 **Why:** Trader returns to the dashboard hours later. The cockpit should surface: new actionable trades since last visit, newly closed trades, biggest PnL swings, new TG/X mentions on currently-open positions, health regressions that affect trading. Without this, the trader has to scan everything to find what's new.
 **Action:** ~4-6h. Frontend-only initially:
@@ -2317,12 +2317,11 @@ No schema or backend change for the MVP.
 **Decision-by:** evidence-gated.
 
 ### BL-NEW-API-SYSTEM-HEALTH-STATUS-ENUM: backend per-subsystem ok|degraded|down status for health-regression deltas
-**Status:** PROPOSED 2026-05-30 — surfaced during BL-NEW-DASHBOARD-WHAT-CHANGED-SINCE-LAST-VISIT (PR #334), where Category 3 (health regressions since last visit) was DESCOPED because no endpoint exposes an OK→degraded state transition.
+**Status:** SHIPPED 2026-05-31 - PR #337 (`4ea6d97f`) extended `/api/system/health` with additive per-subsystem `status: ok|degraded|down|unknown`. Ships with an empty operator-fillable SLO map, so readable tables honestly report `unknown` until SLOs are defined; unreadable tables report `down`.
 **Tag:** `dashboard` `health` `observability` `backend` `read-only` `what-changed-fast-follow`
-**Why:** The shipped 'What Changed' panel (PR #334) diffs newly-closed trades + open-position PnL since last visit, but cannot surface health regressions: `get_system_health` (dashboard/db.py:637) returns per-table `{count, latest}` stats with no status verdict; `/health` (dashboard/api.py:1217) is a static liveness stub; `/api/source_calls/health` (dashboard/db.py:4016) has raw counters (`writer_freshness.minutes_since_last_observed` vs `lag_threshold_minutes`, `schema_missing`) but no derived status. Deriving a regression client-side would be interpretive severity-ordering (factual-copy-firewall violation) or require an out-of-scope endpoint.
-**Proposed shape:** a read-only backend `GET /api/system/health` (or extend the existing surface) returning per-subsystem `status: ok|degraded|down` DERIVED deterministically from existing signals — pipeline heartbeat freshness, source-call writer-freshness lag vs threshold, schema-missing flags, DB reachability. No new data collection; pure derivation over signals already persisted. Once it exists, the 'What Changed' panel can add a Category-3 health-regression delta (ok→degraded transitions since last visit) as a fast-follow, with the status vocabulary enumerated authoritatively server-side rather than guessed in the browser.
-**Anti-scope:** read-only derivation only; no new schema, no new collectors, no alerting/urgency tiers, no remediation actions. Status vocabulary must be a closed enum (ok|degraded|down) so the client diff is factual, not interpretive.
-**Decision-by:** evidence-gated — build only if the operator wants the health-regression Category-3 fast-follow on the What Changed panel.
+**Why:** The shipped 'What Changed' panel (PR #334) diffs newly-closed trades + open-position PnL since last visit, but originally could not surface health regressions because no endpoint exposed a status transition vocabulary. PR #337 made the backend vocabulary authoritative so the browser can diff statuses factually rather than derive severity client-side.
+**Shipped shape:** read-only backend derivation on the existing `/api/system/health` surface. No new data collection; pure derivation over existing table stats. The 2026-05-31 What Changed fast-follow consumes the enum as Category 3.
+**Anti-scope:** read-only derivation only; no new schema, no new collectors, no alerting/urgency tiers, no remediation actions, no invented SLO thresholds.
 
 ### BL-NEW-DASHBOARD-HEALTH-TRADER-IMPACT: convert health signals into trading consequences
 **Status:** FOLDED-INTO-LIVE-DECISION-COCKPIT 2026-05-22 - remaining value should become candidate refusal/risk reasons and dashboard health captions, not a standalone health project unless cockpit design proves it needs a dedicated surface.

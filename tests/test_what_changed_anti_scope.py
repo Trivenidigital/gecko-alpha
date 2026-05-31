@@ -1,7 +1,7 @@
 """Anti-scope contract for the What Changed dashboard panel.
 
-Read-only, frontend-only. Asserts the panel + storage consume ONLY the two
-allowed trading GET endpoints, introduce no backend route / response_model /
+Read-only, frontend-only. Asserts the panel + storage consume ONLY the
+allowed read-only GET endpoints, introduce no backend route / response_model /
 DB write, and are wired into App.jsx + the layout copy-scan paths list.
 """
 
@@ -19,7 +19,11 @@ FACTS = FRONTEND / "whatChangedFacts.js"
 APP = FRONTEND / "App.jsx"
 LAYOUT_TEST = REPO_ROOT / "tests" / "test_dashboard_frontend_layout.py"
 
-ALLOWED_PATHS = ("/api/trading/history", "/api/trading/positions")
+ALLOWED_PATHS = (
+    "/api/trading/history",
+    "/api/trading/positions",
+    "/api/system/health",
+)
 # /api/trading/history/count is a sub-path of /api/trading/history and is allowed.
 
 
