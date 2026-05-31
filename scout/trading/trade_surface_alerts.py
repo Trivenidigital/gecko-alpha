@@ -424,7 +424,7 @@ async def send_trade_surface_alerts(
             now_payload,
             max_candidates=max_candidates,
         )
-        for candidate in candidates:
+        for idx, candidate in enumerate(candidates):
             outcome = await _send_claimed_alert(
                 db,
                 settings,
@@ -445,6 +445,14 @@ async def send_trade_surface_alerts(
                 counts["sent"] += 1
             elif outcome == "dispatch_failed":
                 counts["dispatch_failed"] += 1
+            if (
+                idx < len(candidates) - 1
+                and outcome in {"sent", "dispatch_failed"}
+                and settings.TRADE_SURFACE_TG_ALERTS_SEND_SPACING_SECONDS > 0
+            ):
+                await asyncio.sleep(
+                    settings.TRADE_SURFACE_TG_ALERTS_SEND_SPACING_SECONDS
+                )
         return counts
     except Exception:
         log.exception("trade_surface_alerts_unexpected_error")

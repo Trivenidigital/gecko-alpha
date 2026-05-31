@@ -444,6 +444,9 @@ class Settings(BaseSettings):
     TRADE_SURFACE_TG_ALERTS_MAX_PER_RUN: int = Field(default=5, ge=1, le=5)
     TRADE_SURFACE_TG_ALERTS_MAX_PER_DAY: int = Field(default=5, ge=1, le=5)
     TRADE_SURFACE_TG_ALERTS_DEDUP_HOURS: int = Field(default=24, ge=0, le=720)
+    TRADE_SURFACE_TG_ALERTS_SEND_SPACING_SECONDS: float = Field(
+        default=1.25, ge=0.0, le=10.0
+    )
 
     # BL-NEW-NARRATIVE-SCANNER: Hermes-driven narrative pump scanner (V1).
     # Hermes (main-vps) emits structured events to gecko-alpha via HMAC-authed
