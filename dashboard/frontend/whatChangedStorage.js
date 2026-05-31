@@ -24,6 +24,7 @@ export function blankState(nowMs = Date.now()) {
     snapshot: {
       closed_trade_ids: [], // category 1: array<string> of closed trade ids
       open_unrealized_by_id: {}, // category 2: { [tradeId]: number }
+      health_status_by_subsystem: {}, // category 3: { [subsystem]: status }
       snapshot_at: null, // ISO of when the baseline was captured
     },
     usage_counters: { sessions: 0 },
@@ -51,6 +52,19 @@ function _normalizePnlMap(input) {
     const k = String(key)
     const v = Number(value)
     if (k.length && Number.isFinite(v)) out[k] = v
+  }
+  return out
+}
+
+const HEALTH_STATUSES = new Set(['ok', 'degraded', 'down', 'unknown'])
+
+function _normalizeHealthMap(input) {
+  if (!input || typeof input !== 'object') return {}
+  const out = {}
+  for (const [key, value] of Object.entries(input)) {
+    const k = String(key)
+    const v = String(value || '')
+    if (k.length && HEALTH_STATUSES.has(v)) out[k] = v
   }
   return out
 }
@@ -111,6 +125,7 @@ export function loadState(nowMs = Date.now()) {
     snapshot: {
       closed_trade_ids: _normalizeIds(snapshot.closed_trade_ids),
       open_unrealized_by_id: _normalizePnlMap(snapshot.open_unrealized_by_id),
+      health_status_by_subsystem: _normalizeHealthMap(snapshot.health_status_by_subsystem),
       snapshot_at: snapshot.snapshot_at || null,
     },
     usage_counters: { ...fresh.usage_counters, ...counters },
@@ -148,8 +163,13 @@ export function markCurrentRowsSeen(
   state,
   closedIds,
   openUnrealizedById,
+  healthStatusBySubsystem = {},
   nowIso = new Date().toISOString()
 ) {
+  if (typeof healthStatusBySubsystem === 'string') {
+    nowIso = healthStatusBySubsystem
+    healthStatusBySubsystem = state?.snapshot?.health_status_by_subsystem || {}
+  }
   const ids = _normalizeIds(closedIds)
   // keep most-recent MAX_CLOSED_IDS (the fetched page is newest-first)
   const capped = ids.slice(0, MAX_CLOSED_IDS)
@@ -159,6 +179,7 @@ export function markCurrentRowsSeen(
     snapshot: {
       closed_trade_ids: capped,
       open_unrealized_by_id: _normalizePnlMap(openUnrealizedById),
+      health_status_by_subsystem: _normalizeHealthMap(healthStatusBySubsystem),
       snapshot_at: nowIso,
     },
   }
@@ -237,9 +258,32 @@ export function diffPnlSwings(prevMap, currentRows) {
   return { movers, newlyOpenedCount, unavailableCount }
 }
 
+// Category 3: health status changes. Only current degraded/down states are
+// shown; ok/unknown current states stay quiet. Unknown prior states may still
+// produce a factual change if the current server verdict is degraded/down.
+export function diffHealthStatusChanges(prevMap, currentHealth) {
+  const prev = _normalizeHealthMap(prevMap)
+  const current = {}
+  if (currentHealth && typeof currentHealth === 'object') {
+    for (const [subsystem, value] of Object.entries(currentHealth)) {
+      const status =
+        value && typeof value === 'object' ? String(value.status || '') : String(value || '')
+      if (HEALTH_STATUSES.has(status)) current[String(subsystem)] = status
+    }
+  }
+  const items = []
+  for (const [subsystem, currentStatus] of Object.entries(current).sort()) {
+    if (currentStatus !== 'degraded' && currentStatus !== 'down') continue
+    const previousStatus = prev[subsystem] || 'unknown'
+    if (previousStatus === currentStatus) continue
+    items.push({ subsystem, previous_status: previousStatus, current_status: currentStatus })
+  }
+  return { count: items.length, items }
+}
+
 // Build the closed-id set + unrealized map for a freshly-fetched pair of
 // payloads, used when committing a baseline.
-export function buildSnapshotFromCurrent(historyRows, positionRows) {
+export function buildSnapshotFromCurrent(historyRows, positionRows, systemHealth = null) {
   const ids = []
   for (const row of Array.isArray(historyRows) ? historyRows : []) {
     const id = tolerantId(row)
@@ -252,5 +296,13 @@ export function buildSnapshotFromCurrent(historyRows, positionRows) {
     const cur = unrealizedPnl(row)
     if (cur != null) map[id] = cur
   }
-  return { closedIds: ids, openUnrealizedById: map }
+  const healthStatusBySubsystem = {}
+  if (systemHealth && typeof systemHealth === 'object') {
+    for (const [subsystem, value] of Object.entries(systemHealth)) {
+      const status =
+        value && typeof value === 'object' ? String(value.status || '') : String(value || '')
+      if (HEALTH_STATUSES.has(status)) healthStatusBySubsystem[String(subsystem)] = status
+    }
+  }
+  return { closedIds: ids, openUnrealizedById: map, healthStatusBySubsystem }
 }

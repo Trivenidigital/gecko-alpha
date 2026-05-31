@@ -63,6 +63,14 @@ export function swingsTruncationFootnote(shown, total) {
   return `Showing ${shown} of ${total}, sorted by absolute change`
 }
 
+// ---- Category 3: system-health status changes ----
+
+export const HEALTH_HEADLINE = 'Health status changes since last visit'
+
+export function healthRow(subsystem, previousStatus, currentStatus) {
+  return `${subsystem}  ${previousStatus} -> ${currentStatus}`
+}
+
 // ---- Shared / cross-category ----
 
 export function historyTruncationFootnote(shown, total) {
@@ -84,6 +92,10 @@ export function firstVisitClosedLabel(knownCount) {
 
 export function firstVisitOpenLabel(openCount) {
   return `First visit — baseline recorded (${openCount} open positions).`
+}
+
+export function firstVisitHealthLabel(subsystemCount) {
+  return `First visit — baseline recorded (${subsystemCount} health subsystems).`
 }
 
 export const FIRST_VISIT_LABEL = 'First visit — baseline recorded.'

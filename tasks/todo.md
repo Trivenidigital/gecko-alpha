@@ -1,5 +1,35 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-31 - What Changed health status deltas
+
+**Status:** IN-PROGRESS. Goal: finish the deferred Category-3 health-status
+delta for `BL-NEW-DASHBOARD-WHAT-CHANGED-SINCE-LAST-VISIT` now that PR #337
+ships authoritative `ok|degraded|down|unknown` values on `/api/system/health`.
+
+Workflow checklist:
+- [x] Drift-check: backend status enum exists in `dashboard/health_status.py`
+  and `/api/system/health` returns additive per-table `status` fields.
+- [x] Scope decision: frontend-only/read-only consumer; no backend route, no DB
+  write, no alerting, no policy, no SLO invention.
+- [x] TDD: add pure health-diff coverage and update What Changed anti-scope
+  endpoint allowlist.
+- [x] Build: persist health status snapshot in `gecko.whatChanged.v0`, fetch
+  `/api/system/health`, and render factual health-status changes.
+- [x] Focused verification:
+  `python -m pytest -q tests/test_what_changed_storage.py
+  tests/test_what_changed_anti_scope.py tests/test_what_changed_copy_firewall.py
+  tests/test_dashboard_frontend_layout.py tests/test_system_health_status.py`
+  => `47 passed`.
+- [x] Frontend build:
+  `npm --prefix dashboard/frontend run build:codex` => passed.
+- [x] Review and commit:
+  commit `bce95c49 feat(dashboard): show health changes in what changed`;
+  `claude ultrareview origin/master --timeout 10` => no findings.
+
+Non-scope:
+- No health SLO thresholds, collectors, alerting, status reinterpretation,
+  backend schema changes, or trading-policy changes.
+
 ## Active Work: 2026-05-28 - Today's Focus Block Cause + Research Links
 
 **Status:** IN PROGRESS. Goal: make Today's Focus more useful from a trader
