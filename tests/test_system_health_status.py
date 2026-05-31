@@ -11,6 +11,7 @@ app -- so they run on Windows regardless of the documented aiohttp/OpenSSL issue
 existing tests/test_dashboard_api.py TestSystemHealth cases.
 """
 
+import itertools
 from datetime import datetime, timedelta, timezone
 
 import aiosqlite
@@ -142,6 +143,49 @@ def test_injected_now_determinism_and_no_wall_clock():
     # And the source contains no datetime.now()/utcnow() wall-clock call.
     src = inspect.getsource(health_status.derive_subsystem_status)
     assert "datetime.now" not in src and "utcnow" not in src
+
+
+def test_derive_subsystem_status_is_closed_over_fuzzed_inputs():
+    # Closedness / total-function guard (NIT fold): derive_subsystem_status must
+    # ALWAYS return one of exactly {ok, degraded, down, unknown} and must NEVER
+    # raise, across a broad cross-product of adversarial inputs. If a future edit
+    # adds a 5th branch, introduces a None fall-through, or lets an exception
+    # escape for some odd count/latest/slo_minutes shape, this test fails loudly
+    # instead of the new value leaking to the API wire.
+    allowed = {"ok", "degraded", "down", "unknown"}
+
+    # Mix valid and pathological types deliberately: negatives, the read-error
+    # sentinel, zero, floats, bool (an int subclass), None, and a missing key.
+    counts = [-1, 0, 1, 5, None, 1.5, True]
+    latests = [
+        None,
+        "2026-05-30T11:00:00",  # naive ISO (SQLite MAX shape)
+        "2026-05-30T11:00:00Z",  # Z suffix
+        "2026-05-30 11:00:00",  # space separator
+        "2026-05-30T11:00:00+00:00",  # explicit offset
+        "garbage",  # unparseable
+        "",  # empty string
+        12345,  # non-str -> _parse_latest returns None
+    ]
+    slos = [None, 0, 30, 1440]
+    fixed_now = datetime(2026, 5, 30, 12, 0, 0, tzinfo=timezone.utc)
+
+    for count, latest, slo in itertools.product(counts, latests, slos):
+        stats = {"count": count, "latest": latest}
+        try:
+            result = derive_subsystem_status(stats, slo, fixed_now)
+        except Exception as exc:  # noqa: BLE001 - the point is "never raises"
+            raise AssertionError(
+                f"derive_subsystem_status raised {exc!r} for "
+                f"stats={stats!r}, slo_minutes={slo!r}"
+            )
+        assert result in allowed, (stats, slo, result)
+
+    # A stats dict missing the "count" key entirely must also be handled
+    # gracefully (stats.get('count') -> None) -- no KeyError, valid enum value.
+    for slo in slos:
+        result = derive_subsystem_status({}, slo, fixed_now)
+        assert result in allowed, ({}, slo, result)
 
 
 # ---------------------------------------------------------------------------
