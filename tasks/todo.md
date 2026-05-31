@@ -1958,7 +1958,7 @@ Trader-feedback review converged on a sequence: ship low-risk derived-from-exist
 
 ## TG Alert Qualification roadmap (2026-05-29 — soak cleared, design phase)
 
-Tracker-promotion soak gate (PR #281) cleared 2026-05-29 with 14 mature days at 9-30 unique tracker-promoted coin_ids/day. PR #296 inputs measured per `tasks/findings_tg_alert_qualification_baseline_2026_05_29.md`. Per PR #296 item 5, alert-dispatch BLOCKED until operator-action telemetry exists.
+Tracker-promotion soak gate (PR #281) cleared 2026-05-29 with 14 mature days at 9-30 unique tracker-promoted coin_ids/day. PR #296 inputs measured per `tasks/findings_tg_alert_qualification_baseline_2026_05_29.md`. PR #344 (`a6dcd13a`) shipped the operator-action telemetry prerequisite; alert dispatch remains blocked until the operator-action baseline, scarcity compression, and corpus-scope decisions are pinned.
 
 ### BL-NEW-TG-ALERT-QUALIFICATION-DESIGN (SHIPPED 2026-05-29 — design only)
 
@@ -1967,24 +1967,22 @@ Tracker-promotion soak gate (PR #281) cleared 2026-05-29 with 14 mature days at 
 - Build PR for the alert-intent surface is gated on the prerequisites below.
 - Anti-scope (this PR): docs only, no code, no endpoints, no dispatch, no Pydantic envelope changes.
 
-### BL-NEW-TG-ALERT-OPERATOR-ACTION-TELEMETRY (PROPOSED — prerequisite for live dispatch)
+### BL-NEW-TG-ALERT-OPERATOR-ACTION-TELEMETRY (SHIPPED 2026-05-31 — PR #344)
 
-- Goal: capture operator-action data on currently-sent TG alerts (acted vs ignored) so the alert-intent surface's `would_dispatch_alert: true` rows have an evidence-based filter.
-- Why: PR #296 input 2 (operator-action/noise baseline) is currently UNKNOWN. Without it, `default_dispatch_blocked: true` is permanent and the alert-intent build PR's purpose evaporates.
-- Possible mechanisms: (a) Telegram delete/forward signal polling, (b) operator self-report widget in dashboard, (c) implicit "did paper trade fire after alert" but this is contaminated by automated dispatch.
-- Out of scope: alert dispatch itself, ranking, urgency tiers.
-- Sizing: read-write but small; 1 new table + 1 new minimal write path + dashboard surface for operator marking.
+- Shipped shape: `tg_alert_operator_actions` table, `Database.record_tg_alert_operator_action(...)`, `GET /api/tg_alerts/recent`, `POST /api/tg_alerts/{alert_id}/operator-action`, and dashboard action buttons on the TG Alerts tab.
+- Live verification 2026-05-31: srilu at `3153fe3`; `tg_alert_operator_actions` table exists; schema_version `20260531|bl_tg_alert_operator_actions_v1`; `/api/tg_alerts/recent?limit=3` returns HTTP 200 with `operator_action_telemetry_available=true`; unknown alert POST fails closed with 404.
+- Out of scope retained: no alert dispatch changes, ranking, urgency tiers, Telegram reaction polling, or inference from paper outcome.
 
 ### BL-NEW-TG-ALERT-INTENT-SURFACE-BUILD (PROPOSED — gated)
 
 - Goal: build the `/api/alert_intent` endpoint + dashboard surface per the design doc.
-- **Gated on:** (a) `BL-NEW-TG-ALERT-OPERATOR-ACTION-TELEMETRY` SHIPPED, (b) operator approval of scarcity compression algorithm, (c) per-corpus decision (paper-only vs paper+tracker).
+- **Gated on:** (a) enough operator labels from the PR #344 telemetry surface to stop treating operator-action/noise as UNKNOWN, (b) operator approval of scarcity compression algorithm, (c) per-corpus decision (paper-only vs paper+tracker).
 - Build PR's plan doc must include: contract firewall for `/api/alert_intent`, FastAPI wire-shape trace, BANNED_PATTERNS-style scarcity enforcement, no response_model, no urgency tiers.
 - Anti-scope (forward-binding): no live dispatch from `/api/alert_intent` itself; dispatch lives in a separately-gated retirement PR for the legacy `tg_alert_log` paths.
 
 ### Cross-cutting discipline
 
-- **`BL-NEW-TG-ALERT-OPERATOR-ACTION-TELEMETRY` is the hard gate on live dispatch.** Until shipped, the alert-intent surface defaults `default_dispatch_blocked: true` and every row's `would_dispatch_alert` is `false`.
+- **Operator-action telemetry is now shipped, but its baseline still needs data.** Until enough labels exist and scarcity/corpus decisions are pinned, the alert-intent surface should default `default_dispatch_blocked: true` and every row's `would_dispatch_alert` is `false`.
 - Scarcity compression of 4-6× required (current 19.3/day vs 3-5/day target).
 - Tracker corpus currently produces 0 alerts/day; build PR may default to paper-only for first iteration and defer tracker-side alert work.
 - FastAPI wire-shape memory applies to all alert-intent surface work: no `response_model` on `/api/alert_intent`; bare-dict passthrough; contract firewall as source of truth.
