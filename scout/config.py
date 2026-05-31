@@ -434,6 +434,17 @@ class Settings(BaseSettings):
     # off-by-one. See global CLAUDE.md §12b for the co-shipped audit logs.
     TG_ALERT_DEDUP_WINDOW_HOURS: int = Field(default=24, ge=0)
 
+    # BL-NEW-TRADE-SURFACE-TG-ALERTS: optional scarce Telegram alert lane
+    # sourced from the Today Focus and Now Tradable dashboard surfaces. Kept
+    # behind an env flag because it creates new operator-facing messages; the
+    # selector itself is capped + per-token deduped when enabled.
+    TRADE_SURFACE_TG_ALERTS_ENABLED: bool = False
+    TRADE_SURFACE_TG_ALERTS_INTERVAL_SECONDS: int = Field(default=900, ge=60, le=86_400)
+    TRADE_SURFACE_TG_ALERTS_WINDOW_HOURS: int = Field(default=36, ge=6, le=72)
+    TRADE_SURFACE_TG_ALERTS_MAX_PER_RUN: int = Field(default=5, ge=1, le=5)
+    TRADE_SURFACE_TG_ALERTS_MAX_PER_DAY: int = Field(default=5, ge=1, le=5)
+    TRADE_SURFACE_TG_ALERTS_DEDUP_HOURS: int = Field(default=24, ge=0, le=720)
+
     # BL-NEW-NARRATIVE-SCANNER: Hermes-driven narrative pump scanner (V1).
     # Hermes (main-vps) emits structured events to gecko-alpha via HMAC-authed
     # HTTPS. Feature gated off when secret is empty (endpoints respond 503).

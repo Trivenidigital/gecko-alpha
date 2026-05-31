@@ -1870,6 +1870,7 @@ async def main(argv: list[str] | None = None) -> int:
     last_summary_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     last_combo_refresh_date = ""  # empty so the first eligible hour fires
     last_weekly_digest_date = ""
+    last_trade_surface_alert_check = 0.0
     # BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST: init from cohort_digest_state so a
     # same-day process restart does NOT re-fire the digest. V29 MUST-FIX fold.
     try:
@@ -1904,6 +1905,7 @@ async def main(argv: list[str] | None = None) -> int:
                 nonlocal last_outcome_check, last_summary_date
                 nonlocal last_combo_refresh_date, last_weekly_digest_date
                 nonlocal last_cohort_digest_date
+                nonlocal last_trade_surface_alert_check
 
                 while not shutdown_event.is_set():
                     try:
@@ -1944,6 +1946,30 @@ async def main(argv: list[str] | None = None) -> int:
                         await update_gainers_peaks(db)
                     except Exception:
                         logger.exception("peak_update_error")
+
+                    if (
+                        not args.dry_run
+                        and settings.TRADE_SURFACE_TG_ALERTS_ENABLED
+                        and (
+                            time.monotonic() - last_trade_surface_alert_check
+                            >= settings.TRADE_SURFACE_TG_ALERTS_INTERVAL_SECONDS
+                        )
+                    ):
+                        try:
+                            from scout.trading.trade_surface_alerts import (
+                                send_trade_surface_alerts,
+                            )
+
+                            result = await send_trade_surface_alerts(
+                                db, settings, session
+                            )
+                            logger.info("trade_surface_alerts_checked", **result)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception("trade_surface_alerts_check_failed")
+                        finally:
+                            last_trade_surface_alert_check = time.monotonic()
 
                     cycle_count += 1
 
