@@ -1,5 +1,36 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-31 - Preserve candidate first_seen_at on re-ingest
+
+**Status:** IN-PROGRESS. Goal: close
+`BL-NEW-ACTIONABILITY-CANDIDATES-FIRST-SEEN-PRESERVE` by making candidate
+re-ingest preserve the earliest point-in-time sighting instead of replacing it
+with the newest model default.
+
+Workflow checklist:
+- [x] Drift-check: current `upsert_candidate` uses SQLite UPSERT and preserves
+  enrichment columns, but `first_seen_at` is still updated from
+  `excluded.first_seen_at` on conflict.
+- [x] Scope decision: code contract only; no historical DB backfill or prod
+  mutation in this PR.
+- [x] TDD: add failing tests for later re-ingest preserving earlier
+  `first_seen_at`, and earlier re-ingest moving the stored value earlier.
+- [x] Build: special-case `first_seen_at` in the UPSERT update clause.
+- [x] Focused verification:
+  `python -m pytest -q tests/test_db_candidates_upsert_preserves_enrichment.py
+  tests/test_db.py tests/test_entry_snapshot.py` => `80 passed`;
+  `black --target-version py312 --check scout/db.py
+  tests/test_db_candidates_upsert_preserves_enrichment.py` => passed;
+  `git diff --check` => clean.
+- [x] Claude review:
+  ultrareview unavailable (`Free ultrareviews used`); fallback
+  `claude -p --model sonnet` code review => no bugs found.
+- [ ] PR, CI, merge.
+
+Non-scope:
+- No backfill, schema migration, dashboard change, trading policy change, or
+  cross-chain first-seen collapse.
+
 ## Active Work: 2026-05-31 - Actionability entry-snapshot hardening
 
 **Status:** IN-PROGRESS. Goal: finish the autonomous PR #200 residuals that
