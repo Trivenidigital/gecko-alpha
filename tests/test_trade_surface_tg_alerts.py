@@ -434,6 +434,57 @@ async def test_surface_alert_claim_checks_dedup_atomically(tmp_path, monkeypatch
     await db.close()
 
 
+@pytest.mark.asyncio
+async def test_send_trade_surface_alerts_paces_multiple_send_attempts(
+    tmp_path, monkeypatch
+):
+    db = Database(tmp_path / "surface.db")
+    await db.initialize()
+    sent = []
+    sleeps = []
+
+    async def _send(*args, **kwargs):
+        sent.append(args)
+
+    async def _sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(
+        "scout.trading.trade_surface_alerts.alerter.send_telegram_message", _send
+    )
+    monkeypatch.setattr("scout.trading.trade_surface_alerts.asyncio.sleep", _sleep)
+    monkeypatch.setattr(
+        "scout.trading.trade_surface_alerts._load_today_focus_alert_payload",
+        lambda db_path, window_hours=36: {
+            "rows": [
+                _focus_row("one"),
+                _focus_row("two"),
+                _focus_row("three"),
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        "scout.trading.trade_surface_alerts.dashboard_db.get_live_candidates",
+        lambda db_path, limit=30, window_hours=36: {
+            "rows": [
+                _now_row("one"),
+                _now_row("two"),
+                _now_row("three"),
+            ]
+        },
+    )
+
+    result = await send_trade_surface_alerts(
+        db,
+        _settings(TRADE_SURFACE_TG_ALERTS_SEND_SPACING_SECONDS=1.25),
+        object(),
+    )
+
+    assert result == {"sent": 3, "blocked_dedup_24h": 0, "dispatch_failed": 0}
+    assert len(sent) == 3
+    assert sleeps == [1.25, 1.25]
+
+
 def test_pipeline_loop_wires_trade_surface_alerts_as_opt_in_non_dry_run_lane():
     main_src = (REPO_ROOT / "scout" / "main.py").read_text(encoding="utf-8")
 
