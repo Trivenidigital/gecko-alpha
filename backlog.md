@@ -2262,7 +2262,11 @@ modify the same read pattern.
 `entry_snapshot.py`.
 
 ### BL-NEW-DASHBOARD-ENTRY-SNAPSHOT-DRAWER: surface *_at_entry in TradeDetailDrawer
-**Status:** PROPOSED 2026-05-20.
+**Status:** SHIPPED 2026-05-31 - PR #341. `/api/trading/positions` now
+left-joins `paper_trade_entry_snapshots`, and `TradeDetailDrawer` renders an
+Entry snapshot group with stamped at-entry facts or an explicit
+`pre-cutover (no snapshot)` label. Dist rebuilt.
+**Original filed status:** PROPOSED 2026-05-20.
 **Tag:** `dashboard` `actionability` `entry-snapshot`
 **Why:** PR #200 ships the substrate (`paper_trade_entry_snapshots` sidecar)
 but no dashboard surface consumes it yet. The TradeDetailDrawer (PR #195)

@@ -41,6 +41,16 @@ function fmtPct(n) {
   const sign = v >= 0 ? '+' : ''
   return `${sign}${v.toFixed(1)}%`
 }
+function fmtCompactUsd(n) {
+  if (n == null) return null
+  const v = Number(n)
+  if (!Number.isFinite(v)) return null
+  const abs = Math.abs(v)
+  if (abs >= 1e9) return '$' + (v / 1e9).toFixed(1) + 'B'
+  if (abs >= 1e6) return '$' + (v / 1e6).toFixed(1) + 'M'
+  if (abs >= 1e3) return '$' + (v / 1e3).toFixed(1) + 'K'
+  return '$' + v.toFixed(0)
+}
 function fmtAge(openedIso) {
   if (!openedIso) return null
   const opened = Date.parse(openedIso)
@@ -310,6 +320,89 @@ export default function TradeDetailDrawer({ position: p, colSpan }) {
                   : JSON.stringify(p.signal_data ?? {})}
               </code>
             </Row>
+          </Group>
+
+          <Group title="Entry snapshot">
+            {p.entry_snapshot_version ? (
+              <>
+                <Row label="Snapshot">
+                  {p.entry_snapshot_complete === 1 ? (
+                    <span style={{ color: 'var(--color-accent-green)' }}>
+                      complete
+                    </span>
+                  ) : (
+                    <span style={{ color: 'var(--color-accent-amber)' }}>
+                      partial
+                    </span>
+                  )}{' '}
+                  <span style={{ color: 'var(--color-text-secondary)', fontSize: 11 }}>
+                    {p.entry_snapshot_version}
+                  </span>
+                </Row>
+                <Row label="Mcap at entry">
+                  {fmtCompactUsd(p.mcap_usd_at_entry) ?? <Dim>missing</Dim>}
+                  {p.mcap_bucket_at_entry && (
+                    <span style={{ color: 'var(--color-text-secondary)', fontSize: 11 }}>
+                      {' '}
+                      ({p.mcap_bucket_at_entry})
+                    </span>
+                  )}
+                </Row>
+                <Row label="Liq at entry">
+                  {fmtCompactUsd(p.liquidity_usd_at_entry) ?? <Dim>missing</Dim>}
+                </Row>
+                <Row label="First seen">
+                  {p.first_seen_at_at_entry ? (
+                    `${p.first_seen_at_at_entry} (${fmtAge(p.first_seen_at_at_entry) ?? '—'})`
+                  ) : (
+                    <Dim>missing</Dim>
+                  )}
+                </Row>
+                <Row label="Age at entry">
+                  {p.token_age_days_at_entry != null ? (
+                    `${Number(p.token_age_days_at_entry).toFixed(1)}d`
+                  ) : (
+                    <Dim>missing</Dim>
+                  )}
+                </Row>
+                <Row label="Confluence">
+                  {p.detected_by_combo_at_entry || <Dim>missing</Dim>}
+                  {p.source_confluence_count_at_entry != null && (
+                    <span style={{ color: 'var(--color-text-secondary)', fontSize: 11 }}>
+                      {' '}
+                      ({p.source_confluence_count_at_entry} sources)
+                    </span>
+                  )}
+                </Row>
+                <Row label="TG channel">
+                  {p.tg_channel_at_entry || <Dim>not applicable</Dim>}
+                </Row>
+                <Row label="Action at entry">
+                  {p.actionable_at_entry === 1 ? (
+                    <span style={{ color: 'var(--color-accent-green)' }}>yes</span>
+                  ) : p.actionable_at_entry === 0 ? (
+                    <span style={{ color: 'var(--color-text-secondary)' }}>no</span>
+                  ) : (
+                    <Dim>missing</Dim>
+                  )}
+                  {p.actionability_reason_at_entry && (
+                    <span style={{ color: 'var(--color-text-secondary)', fontSize: 11 }}>
+                      {' '}
+                      {formatActionabilityReason(p.actionability_reason_at_entry)}
+                    </span>
+                  )}
+                </Row>
+                <Row label="Exit params">
+                  TP {fmtPct(p.tp_pct_at_entry) ?? '—'} / SL{' '}
+                  {fmtPct(p.sl_pct_at_entry) ?? '—'} / Trail{' '}
+                  {fmtPct(p.trail_pct_at_entry) ?? '—'}
+                </Row>
+              </>
+            ) : (
+              <Row label="Snapshot">
+                <Dim>pre-cutover (no snapshot)</Dim>
+              </Row>
+            )}
           </Group>
 
           <Group title="Related mentions (linkage pending — placeholder)">

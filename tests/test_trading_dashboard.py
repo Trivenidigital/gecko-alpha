@@ -322,6 +322,76 @@ async def test_positions_and_history_include_actionability_metadata(client):
     assert hist["would_be_live"] == 1
 
 
+async def test_positions_include_entry_snapshot_sidecar_fields(client):
+    c, db = client
+    await _insert_trade(
+        db._conn,
+        "snapshot-token",
+        "SNAP",
+        "volume_spike",
+        "open",
+        actionable=1,
+        actionability_reason="v1_pass_core_signal_mcap_10_50m",
+        actionability_version="v1",
+    )
+    cur = await db._conn.execute(
+        "SELECT id FROM paper_trades WHERE token_id = 'snapshot-token'"
+    )
+    trade_id = (await cur.fetchone())[0]
+    await db._conn.execute(
+        """INSERT INTO paper_trade_entry_snapshots
+           (paper_trade_id, entry_snapshot_version, entry_snapshot_complete,
+            entry_snapshot_missing_fields, captured_at, signal_type,
+            mcap_usd_at_entry, mcap_bucket_at_entry, liquidity_usd_at_entry,
+            token_age_days_at_entry, first_seen_at_at_entry,
+            detected_by_combo_at_entry, source_confluence_count_at_entry,
+            actionability_version_at_entry, actionability_reason_at_entry,
+            actionable_at_entry, tp_pct_at_entry, sl_pct_at_entry,
+            trail_pct_at_entry, trail_pct_low_peak_at_entry)
+           VALUES (?, 'v1', 1, '[]', ?, 'volume_spike',
+                   20000000, '10_50m', 250000, 1.5, ?,
+                   'volume_spike+gainers_early', 2,
+                   'v1', 'v1_pass_core_signal_mcap_10_50m',
+                   1, 20.0, 10.0, 12.0, 8.0)""",
+        (
+            trade_id,
+            datetime.now(timezone.utc).isoformat(),
+            (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
+        ),
+    )
+    await db._conn.commit()
+
+    resp = await c.get("/api/trading/positions")
+    assert resp.status_code == 200
+    pos = {p["token_id"]: p for p in resp.json()}["snapshot-token"]
+    assert pos["entry_snapshot_version"] == "v1"
+    assert pos["entry_snapshot_complete"] == 1
+    assert pos["entry_snapshot_missing_fields"] == "[]"
+    assert pos["mcap_usd_at_entry"] == 20000000
+    assert pos["mcap_bucket_at_entry"] == "10_50m"
+    assert pos["liquidity_usd_at_entry"] == 250000
+    assert pos["token_age_days_at_entry"] == 1.5
+    assert pos["detected_by_combo_at_entry"] == "volume_spike+gainers_early"
+    assert pos["source_confluence_count_at_entry"] == 2
+    assert pos["actionability_reason_at_entry"] == "v1_pass_core_signal_mcap_10_50m"
+    assert pos["actionable_at_entry"] == 1
+    assert pos["tp_pct_at_entry"] == 20.0
+    assert pos["sl_pct_at_entry"] == 10.0
+    assert pos["trail_pct_at_entry"] == 12.0
+
+
+async def test_positions_pre_cutover_entry_snapshot_fields_are_null(client):
+    c, db = client
+    await _insert_trade(db._conn, "legacy-open", "LEG", "volume_spike", "open")
+
+    resp = await c.get("/api/trading/positions")
+    assert resp.status_code == 200
+    pos = {p["token_id"]: p for p in resp.json()}["legacy-open"]
+    assert pos["entry_snapshot_version"] is None
+    assert pos["entry_snapshot_complete"] is None
+    assert pos["mcap_usd_at_entry"] is None
+
+
 async def test_history_actionability_filter_and_count_share_semantics(client):
     """The history filter is server-side so pagination/count totals match the
     rows being displayed. Unknown means pre-cutover or unstamped rows.

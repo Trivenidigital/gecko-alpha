@@ -24,6 +24,24 @@ def test_open_positions_table_gets_compact_layout_class():
     assert 'className="candidates-table open-positions-table"' in jsx
 
 
+def test_trade_detail_drawer_surfaces_entry_snapshot_fields():
+    jsx = (
+        ROOT / "dashboard" / "frontend" / "components" / "TradeDetailDrawer.jsx"
+    ).read_text(encoding="utf-8")
+
+    assert 'title="Entry snapshot"' in jsx
+    assert "entry_snapshot_version" in jsx
+    assert "entry_snapshot_complete" in jsx
+    assert "mcap_usd_at_entry" in jsx
+    assert "liquidity_usd_at_entry" in jsx
+    assert "first_seen_at_at_entry" in jsx
+    assert "detected_by_combo_at_entry" in jsx
+    assert "source_confluence_count_at_entry" in jsx
+    assert "actionability_reason_at_entry" in jsx
+    assert "tp_pct_at_entry" in jsx
+    assert "pre-cutover (no snapshot)" in jsx
+
+
 def test_trade_inbox_tab_is_wired_to_dashboard():
     app = (ROOT / "dashboard" / "frontend" / "App.jsx").read_text(encoding="utf-8")
     tab = (
