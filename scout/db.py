@@ -4107,6 +4107,7 @@ class Database:
                 "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
             )
             if await cur.fetchone():
+                await self._assert_paper_trade_entry_snapshots_schema(conn)
                 _log.info(
                     "bl_actionability_entry_snapshot_v1_migration_skip_already_applied"
                 )
@@ -4152,6 +4153,9 @@ class Database:
                         REFERENCES paper_trades(id) ON DELETE RESTRICT
                 )
                 """)
+            await self._assert_paper_trade_entry_snapshots_schema(
+                conn, require_indexes=False
+            )
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_ptes_version "
                 "ON paper_trade_entry_snapshots(entry_snapshot_version)"
@@ -4160,6 +4164,7 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_ptes_complete "
                 "ON paper_trade_entry_snapshots(entry_snapshot_complete)"
             )
+            await self._assert_paper_trade_entry_snapshots_schema(conn)
             await conn.execute(
                 "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) VALUES (?, ?)",
                 (migration_name, now_iso),
@@ -4193,6 +4198,7 @@ class Database:
                 await conn.execute("ROLLBACK")
             except Exception as rb_err:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)
             raise
 
     async def _migrate_source_calls_v1(self) -> None:
@@ -4490,6 +4496,135 @@ class Database:
         if "WHERE TG_ALERT_LOG_ID IS NOT NULL" not in idx_sql:
             raise RuntimeError(
                 "bl_minara_alert_emissions_v1 tg_alert_log_id partial index missing"
+            )
+
+    async def _assert_paper_trade_entry_snapshots_schema(
+        self, conn, *, require_indexes: bool = True
+    ) -> None:
+        required_columns = {
+            "paper_trade_id",
+            "entry_snapshot_version",
+            "entry_snapshot_complete",
+            "entry_snapshot_missing_fields",
+            "captured_at",
+            "signal_type",
+            "mcap_usd_at_entry",
+            "mcap_bucket_at_entry",
+            "liquidity_usd_at_entry",
+            "token_age_days_at_entry",
+            "first_seen_at_at_entry",
+            "detected_by_combo_at_entry",
+            "source_confluence_count_at_entry",
+            "tg_channel_at_entry",
+            "actionability_version_at_entry",
+            "actionability_reason_at_entry",
+            "actionable_at_entry",
+            "tp_pct_at_entry",
+            "sl_pct_at_entry",
+            "trail_pct_at_entry",
+            "trail_pct_low_peak_at_entry",
+        }
+        cur = await conn.execute("PRAGMA table_info(paper_trade_entry_snapshots)")
+        col_rows = await cur.fetchall()
+        cols = {row[1] for row in col_rows}
+        missing = sorted(required_columns - cols)
+        if missing:
+            raise RuntimeError(
+                "bl_actionability_entry_snapshot_v1 schema missing columns: "
+                + ", ".join(missing)
+            )
+
+        by_name = {row[1]: row for row in col_rows}
+        expected = {
+            "paper_trade_id": ("INTEGER", False, None, 1),
+            "entry_snapshot_version": ("TEXT", True, None, 0),
+            "entry_snapshot_complete": ("INTEGER", True, None, 0),
+            "entry_snapshot_missing_fields": ("TEXT", True, None, 0),
+            "captured_at": ("TEXT", True, None, 0),
+            "signal_type": ("TEXT", False, None, 0),
+            "mcap_usd_at_entry": ("REAL", False, None, 0),
+            "mcap_bucket_at_entry": ("TEXT", False, None, 0),
+            "liquidity_usd_at_entry": ("REAL", False, None, 0),
+            "token_age_days_at_entry": ("REAL", False, None, 0),
+            "first_seen_at_at_entry": ("TEXT", False, None, 0),
+            "detected_by_combo_at_entry": ("TEXT", False, None, 0),
+            "source_confluence_count_at_entry": ("INTEGER", False, None, 0),
+            "tg_channel_at_entry": ("TEXT", False, None, 0),
+            "actionability_version_at_entry": ("TEXT", False, None, 0),
+            "actionability_reason_at_entry": ("TEXT", False, None, 0),
+            "actionable_at_entry": ("INTEGER", False, None, 0),
+            "tp_pct_at_entry": ("REAL", False, None, 0),
+            "sl_pct_at_entry": ("REAL", False, None, 0),
+            "trail_pct_at_entry": ("REAL", False, None, 0),
+            "trail_pct_low_peak_at_entry": ("REAL", False, None, 0),
+        }
+        for name, (typ, notnull, default, pk) in expected.items():
+            row = by_name[name]
+            if (row[2] or "").upper() != typ:
+                raise RuntimeError(
+                    f"bl_actionability_entry_snapshot_v1 column {name} type mismatch"
+                )
+            if bool(row[3]) != notnull:
+                raise RuntimeError(
+                    f"bl_actionability_entry_snapshot_v1 column {name} NOT NULL mismatch"
+                )
+            actual_default = row[4]
+            if default is None:
+                if actual_default is not None:
+                    raise RuntimeError(
+                        f"bl_actionability_entry_snapshot_v1 column {name} default mismatch"
+                    )
+            elif str(actual_default).strip("'\"") != default:
+                raise RuntimeError(
+                    f"bl_actionability_entry_snapshot_v1 column {name} default mismatch"
+                )
+            if int(row[5]) != pk:
+                raise RuntimeError(
+                    f"bl_actionability_entry_snapshot_v1 column {name} pk mismatch"
+                )
+
+        cur = await conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='paper_trade_entry_snapshots'"
+        )
+        create_sql_row = await cur.fetchone()
+        create_sql = (create_sql_row[0] if create_sql_row else "").upper()
+        compact_sql = "".join(create_sql.split())
+        if "CHECK(ENTRY_SNAPSHOT_COMPLETEIN(0,1))" not in compact_sql:
+            raise RuntimeError(
+                "bl_actionability_entry_snapshot_v1 entry_snapshot_complete CHECK missing"
+            )
+        if "ONDELETERESTRICT" not in compact_sql:
+            raise RuntimeError(
+                "bl_actionability_entry_snapshot_v1 paper_trade_id FK action missing"
+            )
+
+        cur = await conn.execute("PRAGMA foreign_key_list(paper_trade_entry_snapshots)")
+        fks = await cur.fetchall()
+        has_paper_trade_fk = any(
+            row[2] == "paper_trades"
+            and row[3] == "paper_trade_id"
+            and row[4] == "id"
+            and row[6].upper() == "RESTRICT"
+            for row in fks
+        )
+        if not has_paper_trade_fk:
+            raise RuntimeError(
+                "bl_actionability_entry_snapshot_v1 paper_trade_id FK missing"
+            )
+
+        if not require_indexes:
+            return
+
+        cur = await conn.execute("PRAGMA index_list(paper_trade_entry_snapshots)")
+        indexes = {row[1]: bool(row[2]) for row in await cur.fetchall()}
+        if indexes.get("idx_ptes_version") is not False:
+            raise RuntimeError(
+                "bl_actionability_entry_snapshot_v1 entry_snapshot_version index missing"
+            )
+        if indexes.get("idx_ptes_complete") is not False:
+            raise RuntimeError(
+                "bl_actionability_entry_snapshot_v1 entry_snapshot_complete index missing"
             )
 
     async def _migrate_scanned_at_index(

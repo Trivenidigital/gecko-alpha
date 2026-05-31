@@ -6,9 +6,11 @@ pre-registered acceptance criteria. Test numbers map 1:1 to that doc's §Tests.
 """
 
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from structlog.testing import capture_logs
 
 from scout.config import Settings
 from scout.db import Database
@@ -36,6 +38,7 @@ async def db(tmp_path):
 # -- Test 13 ---------------------------------------------------------------
 # Migration helper idempotency + sentinel + schema_version (Vector A I1/I2)
 
+
 async def test_13_migration_creates_table_and_sentinel(db):
     """First-run migration creates the table, the paper_migrations sentinel,
     and a schema_version row. Idempotent: a second invocation is a no-op."""
@@ -43,9 +46,9 @@ async def test_13_migration_creates_table_and_sentinel(db):
         "SELECT name FROM sqlite_master WHERE type='table' "
         "AND name='paper_trade_entry_snapshots'"
     )
-    assert await cur.fetchone() is not None, (
-        "paper_trade_entry_snapshots table missing after Database.initialize()"
-    )
+    assert (
+        await cur.fetchone() is not None
+    ), "paper_trade_entry_snapshots table missing after Database.initialize()"
 
     cur = await db._conn.execute(
         "SELECT cutover_ts FROM paper_migrations "
@@ -84,6 +87,7 @@ async def test_13b_migration_idempotent(db):
 # -- Test 14 ---------------------------------------------------------------
 # CHECK constraint on entry_snapshot_complete (Vector A I3)
 
+
 async def test_14_check_constraint_on_complete(db):
     """Direct INSERT with entry_snapshot_complete=2 must raise sqlite
     IntegrityError. Guards future writer bugs that compute the flag wrong."""
@@ -96,12 +100,16 @@ async def test_14_check_constraint_on_complete(db):
         "signal_combo, remaining_qty) "
         "VALUES (?, ?, ?, ?, ?, '{}', 1, 100, 100, 20, 10, 1.2, 0.9, "
         "'open', '2026-05-20T00:00:00+00:00', ?, 100)",
-        ("tok", "TOK", "Token", "coingecko", "narrative_prediction",
-         "narrative_prediction"),
+        (
+            "tok",
+            "TOK",
+            "Token",
+            "coingecko",
+            "narrative_prediction",
+            "narrative_prediction",
+        ),
     )
-    cur = await db._conn.execute(
-        "SELECT id FROM paper_trades WHERE token_id='tok'"
-    )
+    cur = await db._conn.execute("SELECT id FROM paper_trades WHERE token_id='tok'")
     trade_id = (await cur.fetchone())[0]
     await db._conn.commit()
 
@@ -114,11 +122,81 @@ async def test_14_check_constraint_on_complete(db):
             (trade_id, "2026-05-20T00:00:01+00:00"),
         )
         await db._conn.commit()
-    assert "CHECK constraint" in str(excinfo.value) or "constraint" in str(excinfo.value).lower()
+    assert (
+        "CHECK constraint" in str(excinfo.value)
+        or "constraint" in str(excinfo.value).lower()
+    )
+
+
+async def test_14b_migration_rejects_existing_table_missing_required_column(tmp_path):
+    """An operator-mutated table shape must fail during initialize(), not at
+    the first later INSERT."""
+    path = tmp_path / "entry_snapshot_schema_drift.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE paper_trade_entry_snapshots ("
+        "paper_trade_id INTEGER PRIMARY KEY, "
+        "entry_snapshot_version TEXT NOT NULL, "
+        "entry_snapshot_complete INTEGER NOT NULL, "
+        "entry_snapshot_missing_fields TEXT NOT NULL, "
+        "captured_at TEXT NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    d = Database(path)
+    with capture_logs() as logs:
+        with pytest.raises(RuntimeError, match="missing columns"):
+            await d.initialize()
+    await d.close()
+
+    assert any(
+        entry.get("event") == "SCHEMA_DRIFT_DETECTED"
+        and entry.get("migration") == "bl_actionability_entry_snapshot_v1"
+        for entry in logs
+    )
+
+
+async def test_14c_migration_rejects_missing_complete_check_constraint(tmp_path):
+    """The schema assert must verify the boolean CHECK, not just column names."""
+    path = tmp_path / "entry_snapshot_check_drift.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE paper_trade_entry_snapshots ("
+        "paper_trade_id INTEGER PRIMARY KEY, "
+        "entry_snapshot_version TEXT NOT NULL, "
+        "entry_snapshot_complete INTEGER NOT NULL, "
+        "entry_snapshot_missing_fields TEXT NOT NULL, "
+        "captured_at TEXT NOT NULL, "
+        "signal_type TEXT, "
+        "mcap_usd_at_entry REAL, "
+        "mcap_bucket_at_entry TEXT, "
+        "liquidity_usd_at_entry REAL, "
+        "token_age_days_at_entry REAL, "
+        "first_seen_at_at_entry TEXT, "
+        "detected_by_combo_at_entry TEXT, "
+        "source_confluence_count_at_entry INTEGER, "
+        "tg_channel_at_entry TEXT, "
+        "actionability_version_at_entry TEXT, "
+        "actionability_reason_at_entry TEXT, "
+        "actionable_at_entry INTEGER, "
+        "tp_pct_at_entry REAL, "
+        "sl_pct_at_entry REAL, "
+        "trail_pct_at_entry REAL, "
+        "trail_pct_low_peak_at_entry REAL)"
+    )
+    conn.commit()
+    conn.close()
+
+    d = Database(path)
+    with pytest.raises(RuntimeError, match="entry_snapshot_complete CHECK missing"):
+        await d.initialize()
+    await d.close()
 
 
 # -- Tests 12 + 2 ----------------------------------------------------------
 # Version literal pinned + fully-complete snapshot
+
 
 async def test_12_version_literal_is_v1():
     """ENTRY_SNAPSHOT_VERSION must equal 'v1' exactly. Any change requires
@@ -158,7 +236,7 @@ async def _ensure_candidate_row(db, *, contract_address, chain, first_seen_at):
         "INSERT OR IGNORE INTO candidates "
         "(contract_address, chain, token_name, ticker, first_seen_at) "
         "VALUES (?, ?, 'FullToken', 'FULL', ?)",
-        (contract_address.lower(), chain, first_seen_at),
+        (contract_address, chain, first_seen_at),
     )
     await db._conn.commit()
 
@@ -188,11 +266,20 @@ async def test_2_fully_complete_snapshot(db):
     row = await cur.fetchone()
     assert row is not None, "no snapshot row written"
     (
-        version, complete, missing_fields, signal_type,
-        mcap, mcap_bucket, liq,
-        first_seen, combo, conf_count,
-        ab_version, actionable_at_entry,
-        tp_at_entry, sl_at_entry,
+        version,
+        complete,
+        missing_fields,
+        signal_type,
+        mcap,
+        mcap_bucket,
+        liq,
+        first_seen,
+        combo,
+        conf_count,
+        ab_version,
+        actionable_at_entry,
+        tp_at_entry,
+        sl_at_entry,
     ) = row
     assert version == "v1"
     assert complete == 1
@@ -210,8 +297,37 @@ async def test_2_fully_complete_snapshot(db):
     assert sl_at_entry == 10.0
 
 
+async def test_2b_first_seen_lookup_handles_mixed_case_candidate_contract(db):
+    """Prod EVM candidates can carry checksummed mixed-case addresses."""
+    mixed_case_contract = "0xAbCdEf1234567890"
+    await _ensure_candidate_row(
+        db,
+        contract_address=mixed_case_contract,
+        chain="ethereum",
+        first_seen_at="2026-05-19T12:00:00+00:00",
+    )
+    trade_id = await _open_with_full_signal(
+        PaperTrader(),
+        db,
+        token_id=mixed_case_contract.lower(),
+        chain="ethereum",
+        signal_data={"mcap": 20_000_000, "liquidity_usd": 250_000},
+    )
+    assert trade_id is not None
+
+    cur = await db._conn.execute(
+        "SELECT entry_snapshot_complete, first_seen_at_at_entry "
+        "FROM paper_trade_entry_snapshots WHERE paper_trade_id=?",
+        (trade_id,),
+    )
+    complete, first_seen = await cur.fetchone()
+    assert complete == 1
+    assert first_seen == "2026-05-19T12:00:00+00:00"
+
+
 # -- Test 3 ----------------------------------------------------------------
 # Partial snapshot — missing liquidity
+
 
 async def test_3_partial_missing_liquidity(db):
     await _ensure_candidate_row(
@@ -243,6 +359,7 @@ async def test_3_partial_missing_liquidity(db):
 # -- Test 4 ----------------------------------------------------------------
 # Partial snapshot — missing first_seen (no candidates row for this token)
 
+
 async def test_4_partial_missing_first_seen(db):
     trade_id = await _open_with_full_signal(
         PaperTrader(),
@@ -267,6 +384,7 @@ async def test_4_partial_missing_first_seen(db):
 
 # -- Test 5 + 5b -----------------------------------------------------------
 # tg_social channel population (5) + temporal-bound C1 fix (5b)
+
 
 async def _seed_tg_signal(db, *, token_id, channel, created_at, msg_id=1):
     """Seed the tg_social_messages parent + tg_social_signals child rows."""
@@ -362,13 +480,14 @@ async def test_5b_tg_social_no_post_open_leakage(db):
         (trade_id,),
     )
     (chan,) = await cur.fetchone()
-    assert chan == "@pre_open", (
-        f"post-open tg_social_signals row leaked into snapshot: got {chan!r}"
-    )
+    assert (
+        chan == "@pre_open"
+    ), f"post-open tg_social_signals row leaked into snapshot: got {chan!r}"
 
 
 # -- Test 6 ----------------------------------------------------------------
 # Actionability fields copied correctly
+
 
 async def test_6_actionability_fields_copied(db):
     """For a narrative_prediction trade at mcap 10-50M, actionability classifier
@@ -389,6 +508,7 @@ async def test_6_actionability_fields_copied(db):
 
 # -- Test 7 + 7b -----------------------------------------------------------
 # Exit params (7) + trail_pct audit-replay with temporal bound (7b)
+
 
 async def test_7_exit_params_copied_fallback(db):
     """No audit history → trail_pct_at_entry falls back to signal_params seed."""
@@ -437,9 +557,7 @@ async def test_7b_trail_pct_audit_replay_temporal_bound(db):
     )
     await db._conn.commit()
 
-    trade_id = await _open_with_full_signal(
-        PaperTrader(), db, token_id="audit-tok"
-    )
+    trade_id = await _open_with_full_signal(PaperTrader(), db, token_id="audit-tok")
     cur = await db._conn.execute(
         "SELECT trail_pct_at_entry FROM paper_trade_entry_snapshots "
         "WHERE paper_trade_id=?",
@@ -459,6 +577,7 @@ async def test_7b_trail_pct_audit_replay_temporal_bound(db):
 
 # -- Test 8 ----------------------------------------------------------------
 # Pre-cutover rows distinguishable (no snapshot row exists)
+
 
 async def test_8_pre_cutover_rows_distinguishable(db):
     # Insert a paper_trade directly with NO sidecar row
@@ -486,6 +605,7 @@ async def test_8_pre_cutover_rows_distinguishable(db):
 # -- Test 9 ----------------------------------------------------------------
 # No classifier or trading-decision change — paper_trades column set unchanged
 
+
 async def test_9_no_paper_trades_behavior_change(db):
     """A fixed-input trade-open must produce paper_trades row with the same
     columns it would have before the sidecar landed. Verify by listing
@@ -495,21 +615,32 @@ async def test_9_no_paper_trades_behavior_change(db):
     cols = {row[1] for row in await cur.fetchall()}
     # None of the *_at_entry fields should appear on paper_trades.
     sidecar_only = {
-        "entry_snapshot_version", "entry_snapshot_complete",
-        "entry_snapshot_missing_fields", "captured_at",
-        "mcap_usd_at_entry", "mcap_bucket_at_entry",
-        "liquidity_usd_at_entry", "token_age_days_at_entry",
-        "first_seen_at_at_entry", "detected_by_combo_at_entry",
-        "source_confluence_count_at_entry", "tg_channel_at_entry",
-        "actionability_version_at_entry", "actionability_reason_at_entry",
-        "actionable_at_entry", "tp_pct_at_entry", "sl_pct_at_entry",
-        "trail_pct_at_entry", "trail_pct_low_peak_at_entry",
+        "entry_snapshot_version",
+        "entry_snapshot_complete",
+        "entry_snapshot_missing_fields",
+        "captured_at",
+        "mcap_usd_at_entry",
+        "mcap_bucket_at_entry",
+        "liquidity_usd_at_entry",
+        "token_age_days_at_entry",
+        "first_seen_at_at_entry",
+        "detected_by_combo_at_entry",
+        "source_confluence_count_at_entry",
+        "tg_channel_at_entry",
+        "actionability_version_at_entry",
+        "actionability_reason_at_entry",
+        "actionable_at_entry",
+        "tp_pct_at_entry",
+        "sl_pct_at_entry",
+        "trail_pct_at_entry",
+        "trail_pct_low_peak_at_entry",
     }
     assert cols.isdisjoint(sidecar_only)
 
 
 # -- Test 10 ---------------------------------------------------------------
 # Snapshot-write failure does NOT fail trade-open
+
 
 async def test_10_stamp_failure_does_not_block_trade(db, monkeypatch):
     """Monkey-patch stamp_entry_snapshot to raise. Trade still opens; no
@@ -539,6 +670,7 @@ async def test_10_stamp_failure_does_not_block_trade(db, monkeypatch):
 # -- Test 11 ---------------------------------------------------------------
 # Duplicate stamp raises (no INSERT OR IGNORE) — Vector B I1
 
+
 async def test_11_duplicate_stamp_raises(db):
     """Calling stamp_entry_snapshot twice on the same trade_id raises
     IntegrityError. We intentionally do NOT use INSERT OR IGNORE — silencing
@@ -567,7 +699,11 @@ async def test_11_duplicate_stamp_raises(db):
             chain="coingecko",
             settings=_settings(),
         )
-    assert "UNIQUE" in str(excinfo.value) or "PRIMARY KEY" in str(excinfo.value) or "constraint" in str(excinfo.value).lower()
+    assert (
+        "UNIQUE" in str(excinfo.value)
+        or "PRIMARY KEY" in str(excinfo.value)
+        or "constraint" in str(excinfo.value).lower()
+    )
 
 
 # -- Tests for Vector B I-B1 + I-B2 folds (post-impl-review) ---------------
@@ -599,9 +735,7 @@ async def test_ib1_unparseable_audit_does_not_leak_current_signal_params(db):
     )
     await db._conn.commit()
 
-    trade_id = await _open_with_full_signal(
-        PaperTrader(), db, token_id="ib1-tok"
-    )
+    trade_id = await _open_with_full_signal(PaperTrader(), db, token_id="ib1-tok")
     cur = await db._conn.execute(
         "SELECT trail_pct_at_entry, entry_snapshot_complete, "
         "entry_snapshot_missing_fields "
