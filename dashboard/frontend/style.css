@@ -1082,6 +1082,36 @@ body {
   color: var(--color-text-secondary);
 }
 
+.tg-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tg-action-btn {
+  min-width: 58px;
+  border: 1px solid var(--color-border, #2a2f3a);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--color-text-secondary);
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tg-action-btn:hover:not(:disabled),
+.tg-action-btn.active {
+  border-color: rgba(88, 166, 255, 0.8);
+  color: var(--color-text-primary);
+  background: rgba(88, 166, 255, 0.14);
+}
+
+.tg-action-btn:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
 .x-stat-row {
   grid-template-columns: repeat(6, minmax(0, 1fr));
 }

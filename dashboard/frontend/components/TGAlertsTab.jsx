@@ -62,17 +62,25 @@ function ResolutionBadge({ resolution }) {
 
 export default function TGAlertsTab() {
   const [data, setData] = useState(null)
+  const [dispatchData, setDispatchData] = useState(null)
   const [error, setError] = useState(null)
+  const [markingId, setMarkingId] = useState(null)
 
   useEffect(() => {
     let cancelled = false
     async function load() {
       try {
-        const res = await fetch('/api/tg_social/alerts?limit=80')
+        const [res, dispatchRes] = await Promise.all([
+          fetch('/api/tg_social/alerts?limit=80'),
+          fetch('/api/tg_alerts/recent?limit=80'),
+        ])
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        if (!dispatchRes.ok) throw new Error(`HTTP ${dispatchRes.status}`)
         const json = await res.json()
+        const dispatchJson = await dispatchRes.json()
         if (!cancelled) {
           setData(json)
+          setDispatchData(dispatchJson)
           setError(null)
         }
       } catch (e) {
@@ -86,6 +94,43 @@ export default function TGAlertsTab() {
       clearInterval(t)
     }
   }, [])
+
+  async function markDispatch(alertId, action) {
+    setMarkingId(alertId)
+    try {
+      const res = await fetch(`/api/tg_alerts/${alertId}/operator-action`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const updated = await res.json()
+      setDispatchData(prev => {
+        if (!prev) return prev
+        return {
+          ...prev,
+          alerts: (prev.alerts || []).map(a => (
+            a.id === alertId
+              ? {
+                  ...a,
+                  operator_action: {
+                    action: updated.action,
+                    note: updated.note,
+                    source: updated.source,
+                    marked_at: updated.marked_at,
+                    updated_at: updated.updated_at,
+                  },
+                }
+              : a
+          )),
+        }
+      })
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setMarkingId(null)
+    }
+  }
 
   if (error) {
     return (
@@ -108,6 +153,13 @@ export default function TGAlertsTab() {
   const channels = data.channels || []
   const health = data.health || {}
   const alerts = data.alerts || []
+  const dispatchAlerts = (dispatchData && dispatchData.alerts) || []
+  const actionLabels = {
+    acted: 'Acted',
+    useful: 'Useful',
+    ignored: 'Ignored',
+    false_positive: 'Bad',
+  }
 
   return (
     <div className="tg-alerts">
@@ -193,6 +245,59 @@ export default function TGAlertsTab() {
             })}
           </tbody>
         </table>
+      </div>
+
+      <div className="panel">
+        <div className="panel-header">Recent Telegram dispatches</div>
+        {dispatchAlerts.length === 0 ? (
+          <div className="empty-state">No sent dispatches in this view</div>
+        ) : (
+          <table className="tg-table">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Signal</th>
+                <th>Token</th>
+                <th>Paper trade</th>
+                <th>Label</th>
+                <th>Mark</th>
+              </tr>
+            </thead>
+            <tbody>
+              {dispatchAlerts.map(a => {
+                const current = a.operator_action && a.operator_action.action
+                return (
+                  <tr key={a.id}>
+                    <td>{fmtTime(a.alerted_at)}</td>
+                    <td>{a.signal_type}</td>
+                    <td>{a.token_id}</td>
+                    <td>{a.paper_trade_id ? `#${a.paper_trade_id}` : '-'}</td>
+                    <td>
+                      <span className={`tg-badge ${current ? 'tg-badge-info' : 'tg-badge-muted'}`}>
+                        {current ? actionLabels[current] : 'unmarked'}
+                      </span>
+                    </td>
+                    <td>
+                      <div className="tg-action-buttons">
+                        {Object.entries(actionLabels).map(([value, label]) => (
+                          <button
+                            key={value}
+                            type="button"
+                            className={`tg-action-btn ${current === value ? 'active' : ''}`}
+                            disabled={markingId === a.id}
+                            onClick={() => markDispatch(a.id, value)}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        )}
       </div>
 
       <div className="panel">
