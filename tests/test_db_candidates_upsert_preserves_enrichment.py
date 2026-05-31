@@ -31,9 +31,7 @@ from scout.db import Database
 
 
 @pytest.mark.asyncio
-async def test_first_insert_leaves_enrichment_columns_null(
-    tmp_path, token_factory
-):
+async def test_first_insert_leaves_enrichment_columns_null(tmp_path, token_factory):
     """First INSERT (no conflict) → enrichment columns NULL.
 
     The cron has not visited yet; the row is correctly unenriched.
@@ -58,9 +56,7 @@ async def test_first_insert_leaves_enrichment_columns_null(
 
 
 @pytest.mark.asyncio
-async def test_cron_written_enrichment_survives_reupsert(
-    tmp_path, token_factory
-):
+async def test_cron_written_enrichment_survives_reupsert(tmp_path, token_factory):
     """The critical round-trip test.
 
     Sequence:
@@ -132,15 +128,14 @@ async def test_cron_written_enrichment_survives_reupsert(
 
 
 @pytest.mark.asyncio
-async def test_reupsert_still_updates_non_enrichment_fields(
-    tmp_path, token_factory
-):
+async def test_reupsert_still_updates_non_enrichment_fields(tmp_path, token_factory):
     """Anti-regression: the UPSERT must still update all non-enrichment
     fields on conflict (preserving existing upsert semantics).
 
     Specifically: market_cap_usd, volume_24h_usd, token_name, ticker,
-    quote_symbol, dex_id, first_seen_at, etc. must all reflect the new
-    token's values after the re-upsert.
+    quote_symbol, dex_id, etc. must all reflect the new token's values after
+    the re-upsert. `first_seen_at` is intentionally excluded because it is an
+    earliest-sighting contract.
     """
     db = Database(tmp_path / "t.db")
     await db.initialize()
@@ -186,9 +181,59 @@ async def test_reupsert_still_updates_non_enrichment_fields(
 
 
 @pytest.mark.asyncio
-async def test_upsert_path_used_is_on_conflict_not_replace(
-    tmp_path, token_factory
-):
+async def test_reupsert_preserves_earlier_first_seen_at(tmp_path, token_factory):
+    """Re-ingest should not make an old token look newly discovered."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    addr = "0xfirstseen"
+
+    first_seen = datetime(2026, 5, 20, 10, 0, tzinfo=timezone.utc)
+    later_seen = datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc)
+    await db.upsert_candidate(
+        token_factory(contract_address=addr, first_seen_at=first_seen)
+    )
+    await db.upsert_candidate(
+        token_factory(contract_address=addr, first_seen_at=later_seen)
+    )
+
+    cur = await db._conn.execute(
+        "SELECT first_seen_at FROM candidates WHERE contract_address = ?",
+        (addr,),
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    assert row[0] == first_seen.isoformat()
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_reupsert_can_move_first_seen_at_earlier(tmp_path, token_factory):
+    """If a better earlier sighting arrives later, store the earliest value."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    addr = "0xfirstseen-earlier"
+
+    first_recorded = datetime(2026, 5, 21, 10, 0, tzinfo=timezone.utc)
+    earlier_seen = datetime(2026, 5, 20, 10, 0, tzinfo=timezone.utc)
+    await db.upsert_candidate(
+        token_factory(contract_address=addr, first_seen_at=first_recorded)
+    )
+    await db.upsert_candidate(
+        token_factory(contract_address=addr, first_seen_at=earlier_seen)
+    )
+
+    cur = await db._conn.execute(
+        "SELECT first_seen_at FROM candidates WHERE contract_address = ?",
+        (addr,),
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    assert row[0] == earlier_seen.isoformat()
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_upsert_path_used_is_on_conflict_not_replace(tmp_path, token_factory):
     """Verify the SQL shape via behavioral test:
     INSERT OR REPLACE would have DELETEd the row then re-INSERTed —
     losing any FK dependents and zeroing-out enrichment columns. The
@@ -225,9 +270,7 @@ async def test_upsert_path_used_is_on_conflict_not_replace(
 
 
 @pytest.mark.asyncio
-async def test_partial_enrichment_preserved_on_reupsert(
-    tmp_path, token_factory
-):
+async def test_partial_enrichment_preserved_on_reupsert(tmp_path, token_factory):
     """If only some of the 4 enrichment columns are populated (e.g. cron
     wrote `cg_slug_unresolvable` with NULL value), re-upsert must
     preserve BOTH the populated AND the NULL fields, not blanket-NULL

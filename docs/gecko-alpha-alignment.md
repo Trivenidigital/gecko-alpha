@@ -41,6 +41,11 @@ What `scout/`, `dashboard/`, and `tests/` provide today and how new code is expe
 
 `scout/db.py:Database` is a thin async wrapper around aiosqlite. `initialize()` opens the connection, sets `PRAGMA journal_mode=WAL` (line 67) and `PRAGMA foreign_keys=ON` (line 70), then sequentially calls `_create_tables` + each `_migrate_*` method.
 
+`candidates.first_seen_at` is an earliest-sighting field. `Database.upsert_candidate()`
+must preserve the older timestamp on conflict, while still updating mutable
+candidate facts such as market cap, volume, token name, quote symbol, and
+Dex ID. Re-ingest must not make a previously seen token look newly discovered.
+
 ### Migration pattern
 
 `BEGIN EXCLUSIVE` + per-statement `await conn.execute(stmt)` + explicit `await conn.commit()` / `ROLLBACK`. NEVER `executescript` **in migration methods** (implicit COMMIT defeats rollback semantics — see `scout/db.py:1139-1144` comment). The single exception is `_create_tables` (`scout/db.py:90`, with `executescript` call at line 93) which uses it legitimately for initial schema creation — no prior rows exist to lose, and the implicit COMMIT is acceptable for the bootstrap path.

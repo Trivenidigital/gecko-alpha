@@ -5410,10 +5410,23 @@ class Database:
         placeholders = ", ".join("?" for _ in _CANDIDATE_COLUMNS)
         cols = ", ".join(_CANDIDATE_COLUMNS)
         # DO UPDATE SET excludes contract_address (PK) and the 4 enrichment
-        # columns (preserved). Every other _CANDIDATE_COLUMNS entry is
-        # set from `excluded.<col>` so existing semantics are unchanged.
-        update_cols = [c for c in _CANDIDATE_COLUMNS if c != "contract_address"]
-        update_clause = ", ".join(f"{c}=excluded.{c}" for c in update_cols)
+        # columns (preserved). first_seen_at is an earliest-sighting contract:
+        # keep the older timestamp so re-ingest cannot make a token look new.
+        update_assignments = []
+        for col in _CANDIDATE_COLUMNS:
+            if col == "contract_address":
+                continue
+            if col == "first_seen_at":
+                update_assignments.append(
+                    "first_seen_at=CASE "
+                    "WHEN datetime(excluded.first_seen_at) "
+                    "< datetime(candidates.first_seen_at) "
+                    "THEN excluded.first_seen_at "
+                    "ELSE candidates.first_seen_at END"
+                )
+            else:
+                update_assignments.append(f"{col}=excluded.{col}")
+        update_clause = ", ".join(update_assignments)
         values = []
         for col in _CANDIDATE_COLUMNS:
             v = getattr(token, col)

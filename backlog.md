@@ -2133,7 +2133,13 @@ implementation. The two Vector B Important findings (I-B1 + I-B2) were folded
 into PR #200 (`affafec`); these are the residual Minor / out-of-scope items.
 
 ### BL-NEW-ACTIONABILITY-CANDIDATES-FIRST-SEEN-PRESERVE: stop overwriting first_seen_at on re-ingest
-**Status:** PROPOSED 2026-05-20.
+**Status:** SHIPPED 2026-05-31 - PR #340. `Database.upsert_candidate()` now
+preserves the earliest `candidates.first_seen_at` on conflict while continuing
+to update mutable candidate facts. Regression tests cover later re-ingest
+preserving the old value and a better earlier sighting moving the stored value
+earlier. Historical prod backfill deliberately not bundled; pre-fix rows remain
+lower-bound historical context.
+**Original filed status:** PROPOSED 2026-05-20.
 **Tag:** `data-integrity` `candidates` `ingestion` `actionability`
 **Why:** `_upsert_candidate` at `scout/db.py:4495` uses `INSERT OR REPLACE`,
 and `CandidateToken.first_seen_at` defaults to `now()` on construction
