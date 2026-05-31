@@ -1,5 +1,36 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-05-31 - Autonomous full code review
+
+**Status:** IN-PROGRESS. Goal: perform a repo-wide autonomous review pass,
+fix confirmed correctness/ops issues, and verify with focused + full tests.
+
+Workflow checklist:
+- [x] Fresh worktree/branch from `origin/master`.
+- [x] Baseline verification: full pytest passed locally with dummy required
+  env; dashboard build passed after `npm ci --prefer-offline`.
+- [x] Claude review sweep: structural/runtime, migrations/tests, and
+  security/ops vectors.
+- [x] TDD/focused fixes for confirmed findings:
+  What-Changed count contract, TG dedup atomic claim, tg_social entry snapshot
+  candidate lookup, idempotent migration sentinels, auto-suspend alert
+  rollback isolation, LunarCrush Markdown escaping, daily-summary plain text,
+  dashboard test schema fidelity, and backup-watchdog token-in-argv exposure.
+- [x] Focused verification:
+  `python -m pytest ...` affected suites => `193 passed, 29 skipped`.
+- [x] Full pytest regression:
+  `python -m pytest --tb=short -q` => `3246 passed, 159 skipped`.
+- [x] Dashboard production build:
+  `npm run build` => passed.
+- [x] Dry-run/end-to-end smoke:
+  `python -m scout.main --dry-run --cycles 1` => exit 0; external DNS
+  warnings handled as non-fatal and cycle completed.
+- [x] Final Claude review on settled diff:
+  3-vector review found one concrete audit-persistence concern; code already
+  had the commit and an added close/reopen test now pins it. Final rerun
+  passed.
+- [ ] PR, CI, merge.
+
 ## Active Work: 2026-05-31 - Dashboard entry snapshot drawer
 
 **Status:** IN-PROGRESS. Goal: close

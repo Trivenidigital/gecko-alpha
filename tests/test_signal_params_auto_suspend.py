@@ -553,35 +553,19 @@ async def test_hard_loss_does_not_kill_borderline_negative_with_deep_drawdown(
 
 
 def test_pnl_threshold_branch_has_alerter_import_statically():
-    """Reviewer MUST-FIX (code, conf 100): the pnl_threshold Telegram branch
-    in scout/trading/auto_suspend.py must include a local
-    ``from scout import alerter`` import. Without it, calling
-    maybe_suspend_signals(session=...) when only pnl_threshold fires raises
-    NameError because the hard_loss branch's local import never executed.
-
-    We verify this structurally by reading the source rather than running
-    it — the runtime test would require importing scout.alerter, which
-    triggers Windows OpenSSL Applink (the very reason both branches use
-    deferred local imports in the first place; see auto_suspend.py:38-40
-    + 142-148 for the rationale).
-    """
+    """pnl_threshold alerts must route through the Windows-safe local import."""
     import inspect
 
     from scout.trading import auto_suspend
 
     src = inspect.getsource(auto_suspend.maybe_suspend_signals)
-    # Split source into two halves around the pnl_threshold branch sentinel.
+    helper_src = inspect.getsource(auto_suspend._send_suspend_alert)
     sentinel = "# Threshold-based suspension"
     assert sentinel in src, f"sentinel not found; refactor needed: {sentinel!r}"
     pnl_branch_src = src[src.index(sentinel) :]
-    # The pnl_threshold branch must contain its own deferred alerter import
-    # (the hard_loss branch's import doesn't carry into this scope).
-    assert "from scout import alerter" in pnl_branch_src, (
-        "pnl_threshold branch missing local alerter import — would NameError "
-        "when only this branch fires with session != None. Add "
-        "`from scout import alerter` inside the pnl_threshold "
-        "`if session is not None:` block."
-    )
+    assert "_send_suspend_alert(" in pnl_branch_src
+    assert 'reason="pnl_threshold"' in pnl_branch_src
+    assert "from scout import alerter" in helper_src
 
 
 async def test_revive_signal_with_baseline_on_already_enabled_signal(
@@ -1051,8 +1035,7 @@ async def test_hard_loss_alert_uses_plain_text_and_traces(
     ), "hard_loss path must fire for n=20 / net=-$1000 cohort"
 
     assert len(captured_kwargs) == 1, (
-        f"expected exactly 1 send_telegram_message call; got "
-        f"{len(captured_kwargs)}"
+        f"expected exactly 1 send_telegram_message call; got " f"{len(captured_kwargs)}"
     )
     payload = captured_kwargs[0]
     assert payload.get("parse_mode") is None, (
@@ -1078,6 +1061,51 @@ async def test_hard_loss_alert_uses_plain_text_and_traces(
     assert dispatched["signal_type"] == "gainers_early"
     assert dispatched["reason"] == "hard_loss"
 
+    await db.close()
+
+
+async def test_auto_suspend_alert_failure_does_not_rollback_suspension(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The DB suspension is the primary state change; Telegram is side-effect.
+
+    A delivery exception must not roll back the auto-suspend or re-enable a
+    signal that already crossed the hard-loss gate.
+    """
+    import sys
+    import types
+    import scout
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    for _ in range(20):
+        await _insert_closed_trade(db, signal_type="gainers_early", pnl_usd=-50)
+    await db._conn.commit()
+
+    async def _raise_send(*args, **kwargs):
+        raise RuntimeError("telegram unavailable")
+
+    fake = types.ModuleType("scout.alerter")
+    fake.send_telegram_message = _raise_send
+    monkeypatch.setitem(sys.modules, "scout.alerter", fake)
+    monkeypatch.setattr(scout, "alerter", fake, raising=False)
+
+    s = settings_factory(
+        SIGNAL_PARAMS_ENABLED=True,
+        SIGNAL_SUSPEND_PNL_THRESHOLD_USD=-200.0,
+        SIGNAL_SUSPEND_HARD_LOSS_USD=-500.0,
+        SIGNAL_SUSPEND_MIN_TRADES=50,
+    )
+
+    suspended = await maybe_suspend_signals(db, s, session=object())
+    assert any(x["signal_type"] == "gainers_early" for x in suspended)
+    cur = await db._conn.execute(
+        "SELECT enabled, suspended_reason FROM signal_params "
+        "WHERE signal_type='gainers_early'"
+    )
+    enabled, reason = await cur.fetchone()
+    assert enabled == 0
+    assert reason == "hard_loss"
     await db.close()
 
 

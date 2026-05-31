@@ -81,6 +81,30 @@ async def test_eligibility_chain_completed_excluded_by_default(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_tg_alert_eligible_migration_preserves_operator_override_on_restart(
+    tmp_path,
+):
+    """tg_alert_eligible defaults are a one-time migration, not a startup reset."""
+    db_path = tmp_path / "eligible_restart.db"
+    db = Database(db_path)
+    await db.initialize()
+    await db._conn.execute(
+        "UPDATE signal_params SET tg_alert_eligible=0 "
+        "WHERE signal_type='gainers_early'"
+    )
+    await db._conn.commit()
+    await db.close()
+
+    db2 = Database(db_path)
+    await db2.initialize()
+    cur = await db2._conn.execute(
+        "SELECT tg_alert_eligible FROM signal_params WHERE signal_type='gainers_early'"
+    )
+    assert (await cur.fetchone())[0] == 0
+    await db2.close()
+
+
+@pytest.mark.asyncio
 async def test_eligibility_unknown_signal_blocked(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
@@ -822,6 +846,43 @@ async def test_dedup_suppresses_within_24h(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dedup_suppression_audit_commits_before_return(tmp_path, monkeypatch):
+    """Suppression audit rows must survive close/reopen, not only same-conn reads."""
+    db_path = tmp_path / "t.db"
+    db = Database(db_path)
+    await db.initialize()
+    settings = _settings()
+    await _insert_paper_trade(db, trade_id=42)
+    await _seed_sent(db, "bitcoin", age_hours=5)
+
+    async def _fake_send(text, session, settings, parse_mode=None, **kwargs):
+        raise AssertionError("dedup suppression must not send")
+
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
+    await notify_paper_trade_opened(
+        db,
+        settings,
+        session=None,
+        paper_trade_id=42,
+        signal_type="gainers_early",
+        token_id="bitcoin",
+        symbol="BTC",
+        entry_price=50000.0,
+        amount_usd=100.0,
+        signal_data={"price_change_24h": 30.0, "mcap": 1_000_000},
+    )
+    await db.close()
+
+    reopened = Database(db_path)
+    await reopened.initialize()
+    cur = await reopened._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE paper_trade_id=42"
+    )
+    assert (await cur.fetchone())[0] == "blocked_dedup_24h"
+    await reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_dedup_allows_after_24h(tmp_path, monkeypatch):
     """A prior 'sent' row older than 24h does NOT suppress: sends."""
     db = Database(tmp_path / "t.db")
@@ -896,6 +957,20 @@ async def test_dedup_first_alert_for_token_sends(tmp_path, monkeypatch):
     )
     assert (await cur.fetchone())[0] == "sent"
     await db.close()
+
+
+def test_dedup_send_claim_is_single_sql_statement():
+    """Cross-process dedup cannot rely on asyncio.Lock.
+
+    The send claim must be a single SQLite INSERT...WHERE NOT EXISTS...RETURNING
+    statement so separate process connections serialize on the DB write.
+    """
+    import inspect
+    import scout.trading.tg_alert_dispatch as dispatch
+
+    src = inspect.getsource(dispatch)
+    assert "WHERE NOT EXISTS" in src
+    assert "RETURNING id" in src
 
 
 @pytest.mark.asyncio

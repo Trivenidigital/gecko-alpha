@@ -20,8 +20,9 @@
 # 3. Constructing an aiohttp.ClientSession inline doubles the surface area
 #    for embedded-Python syntax errors against $age_msg interpolation.
 #
-# A direct curl-style POST checks status code in bash itself, so any HTTP
+# A direct Python urllib POST checks status code explicitly, so any HTTP
 # failure (404, 401, network) is observable and propagates exit-1 cleanly.
+# Keep the bot token out of process argv; curl URLs expose it via ps.
 #
 # UV_BIN exists for compat with earlier draft and as a testability seam:
 # pytest's _make_uv_stub overrides it with a recorder script.
@@ -141,26 +142,49 @@ if [[ -z "$PYTHON_BIN" ]]; then
     exit 6
 fi
 
-PAYLOAD="$(GECKO_TG_TEXT="$TEXT" GECKO_TG_CHAT="$TELEGRAM_CHAT_ID" "$PYTHON_BIN" -c '
-import json, os
-print(json.dumps({"chat_id": os.environ["GECKO_TG_CHAT"], "text": os.environ["GECKO_TG_TEXT"]}))
-')"
+TG_RESPONSE_FILE="/tmp/.gecko-tg-resp.$$"
+HTTP_STATUS="$(GECKO_TG_TEXT="$TEXT" GECKO_TG_CHAT="$TELEGRAM_CHAT_ID" GECKO_TG_TOKEN="$TELEGRAM_BOT_TOKEN" GECKO_TG_RESPONSE_FILE="$TG_RESPONSE_FILE" "$PYTHON_BIN" -c '
+import json
+import os
+import urllib.error
+import urllib.request
 
-HTTP_STATUS="$(curl -s -o /tmp/.gecko-tg-resp.$$ -w '%{http_code}' \
-    -X POST \
-    -H 'Content-Type: application/json' \
-    -d "$PAYLOAD" \
-    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" || echo 000)"
+response_file = os.environ["GECKO_TG_RESPONSE_FILE"]
+payload = json.dumps({
+    "chat_id": os.environ["GECKO_TG_CHAT"],
+    "text": os.environ["GECKO_TG_TEXT"],
+}).encode("utf-8")
+request = urllib.request.Request(
+    f"https://api.telegram.org/bot{os.environ['GECKO_TG_TOKEN']}/sendMessage",
+    data=payload,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=20) as response:
+        body = response.read(500)
+        if body:
+            open(response_file, "wb").write(body)
+        print(response.status)
+except urllib.error.HTTPError as exc:
+    body = exc.read(500)
+    if body:
+        open(response_file, "wb").write(body)
+    print(exc.code)
+except Exception as exc:
+    open(response_file, "w", encoding="utf-8").write(repr(exc))
+    print("000")
+')"
 
 if [[ "$HTTP_STATUS" != "200" ]]; then
     echo "ERROR: Telegram delivery failed (HTTP $HTTP_STATUS)" >&2
-    if [[ -f "/tmp/.gecko-tg-resp.$$" ]]; then
-        echo "RESPONSE: $(cat /tmp/.gecko-tg-resp.$$ | head -c 500)" >&2
-        rm -f "/tmp/.gecko-tg-resp.$$"
+    if [[ -f "$TG_RESPONSE_FILE" ]]; then
+        echo "RESPONSE: $(cat "$TG_RESPONSE_FILE" | head -c 500)" >&2
+        rm -f "$TG_RESPONSE_FILE"
     fi
     exit 7
 fi
 
-rm -f "/tmp/.gecko-tg-resp.$$"
+rm -f "$TG_RESPONSE_FILE"
 echo "ALERT DELIVERED: HTTP $HTTP_STATUS"
 exit 1

@@ -147,3 +147,13 @@ def test_count_fetch_failure_footnote_degrades_gracefully():
     assert (
         "historyTotal != null" in text
     ), "history-truncation footnote must be gated on a usable (non-null) total"
+
+
+def test_count_fetch_reads_total_field_from_endpoint_contract():
+    """The /api/trading/history/count endpoint returns {"total": N}.
+
+    Reading data.count silently disables the truncation footnote forever.
+    """
+    text = _read(PANEL)
+    assert "Number(data.total)" in text
+    assert "Number(data.count)" not in text

@@ -517,6 +517,14 @@ def test_watchdog_placeholder_chat_id_exits_5(tmp_path):
     assert "TELEGRAM_CHAT_ID" in res.stderr
 
 
+def test_watchdog_real_path_keeps_bot_token_out_of_process_argv():
+    """Regression lock: do not pass bot token in a curl URL visible via ps."""
+    source = WATCHDOG_SCRIPT.read_text(encoding="utf-8")
+    assert "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" not in source
+    assert "GECKO_TG_TOKEN" in source
+    assert "urllib.request.Request" in source
+
+
 def test_watchdog_fresh_heartbeat_skips_alert_path(tmp_path):
     hb = tmp_path / "hb"
     hb.write_text(str(int(time.time() - 3600)))

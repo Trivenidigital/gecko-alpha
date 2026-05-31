@@ -844,6 +844,64 @@ async def test_postfold_a_tg_social_mcap_at_sighting_captured(db):
     assert bucket == "10_50m"
 
 
+async def test_tg_social_dex_token_uses_raw_contract_for_candidate_first_seen(db):
+    """DexScreener tg_social trades use token_id=dex:<chain>:<address>.
+
+    candidates.contract_address stores the raw address, so the entry snapshot
+    must use signal_data.contract_address for candidate first_seen_at while
+    still using token_id for the tg_social channel lookup.
+    """
+    token_id = "dex:ethereum:0xabcdef"
+    raw_contract = "0xabcdef"
+    await _ensure_candidate_row(
+        db,
+        contract_address=raw_contract,
+        chain="ethereum",
+        first_seen_at="2026-05-19T00:00:00+00:00",
+    )
+    await _seed_tg_signal(
+        db,
+        token_id=token_id,
+        channel="@dex_calls",
+        created_at="2026-05-20T00:00:00+00:00",
+        msg_id=3101,
+    )
+
+    trade_id = await PaperTrader().execute_buy(
+        db=db,
+        token_id=token_id,
+        symbol="DEX",
+        name="Dex Token",
+        chain="ethereum",
+        signal_type="tg_social",
+        signal_data={
+            "channel_handle": "@dex_calls",
+            "contract_address": raw_contract,
+            "mcap_at_sighting": 18_000_000,
+            "liquidity_usd": 250_000,
+        },
+        current_price=1.0,
+        amount_usd=300.0,
+        tp_pct=20.0,
+        sl_pct=10.0,
+        signal_combo="tg_social",
+        settings=_settings(),
+    )
+    assert trade_id is not None
+
+    cur = await db._conn.execute(
+        "SELECT first_seen_at_at_entry, tg_channel_at_entry, "
+        "entry_snapshot_complete, entry_snapshot_missing_fields "
+        "FROM paper_trade_entry_snapshots WHERE paper_trade_id=?",
+        (trade_id,),
+    )
+    first_seen, channel, complete, missing_json = await cur.fetchone()
+    assert first_seen == "2026-05-19T00:00:00+00:00"
+    assert channel == "@dex_calls"
+    assert complete == 1
+    assert "first_seen_at_at_entry" not in missing_json
+
+
 async def test_postfold_a_alert_market_cap_key_captured(db):
     """Companion to the above: the 5th key actionability supports is
     `alert_market_cap` (used by secondwave-style paths). Snapshot must
