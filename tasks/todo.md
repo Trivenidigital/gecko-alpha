@@ -1,5 +1,36 @@
 # Backlog — gecko-alpha
 
+## Completed Work: 2026-06-01 - Social mentions denominator evidence refresh
+
+**Status:** READY-FOR-PR. Goal: make the dead `social_mentions_24h`
+denominator decision re-runnable against live srilu data before any B/C scoring
+behavior change.
+
+Workflow checklist:
+- [x] Fresh worktree/branch from current `origin/master`.
+- [x] Drift-check: `social_mentions_24h` still exists in scorer Signal 5 and
+  backlog still carries the B/C operator-decision rows.
+- [x] TDD: added focused tests for the read-only audit report, schema-drift
+  exit-2 behavior, CLI output, and read-only SQLite mode.
+- [x] Build: added `scripts/audit_social_mentions_denominator.py`.
+- [x] Live evidence read on srilu: 1,714/1,714 candidates have
+  `social_mentions_24h=0`; Variant B remains closed-form 0-flip; Variant C's
+  closed-form estimate promotes 38 score-history rows (=6 contracts) with 0
+  matching paper trades in that approximate promoted set.
+- [x] Docs/backlog: added
+  `tasks/findings_social_mentions_denominator_evidence_2026_06_01.md` and
+  refreshed the relevant backlog rows.
+- [x] Review: QA reviewer found two overclaim risks; folded by marking
+  Variant B/C as closed-form estimates and parsing TG JSON contracts.
+- [x] Full verification:
+  `python -m pytest --tb=short -q` with dummy required env => `3288 passed,
+  159 skipped`.
+- [ ] PR, CI, merge.
+
+Non-scope:
+- No scorer denominator change, gate recalibration, ingestion change, or
+  Telegram/Hermes bridge wiring in this evidence PR.
+
 ## Completed Work: 2026-05-31 - Autonomous full code review
 
 **Status:** SHIPPED 2026-05-31 - PR #342 squash `f453d5dd`. Performed a
