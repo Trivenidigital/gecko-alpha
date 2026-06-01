@@ -41,8 +41,8 @@ class Settings(BaseSettings):
     # 999 to mean "disable this gate entirely". ge=0 catches sign typos;
     # le=10_000 catches accidental "MIN_SCORE=9999999" while still
     # admitting the deliberate-disable pattern.
-    MIN_SCORE: int = Field(default=60, ge=0, le=10_000)
-    CONVICTION_THRESHOLD: int = Field(default=70, ge=0, le=10_000)
+    MIN_SCORE: int = Field(default=65, ge=0, le=10_000)
+    CONVICTION_THRESHOLD: int = Field(default=75, ge=0, le=10_000)
     QUANT_WEIGHT: float = 0.6
     NARRATIVE_WEIGHT: float = 0.4
 
@@ -386,7 +386,8 @@ class Settings(BaseSettings):
     # requires a free API token; if empty, fetch short-circuits to [] without
     # hitting the network. Scoring signal exists but is gated by
     # CRYPTOPANIC_SCORING_ENABLED (off by default); flipping it on in a future
-    # PR will require a SCORER_MAX_RAW bump from 183 to 193.
+    # A future CryptoPanic scoring PR must add its weight to SCORER_MAX_RAW and
+    # recalibrate tests before enabling this signal.
     CRYPTOPANIC_ENABLED: bool = False
     CRYPTOPANIC_API_TOKEN: str = ""
     CRYPTOPANIC_FETCH_FILTER: str = "hot"  # hot|rising|bullish|bearish|important
@@ -759,8 +760,8 @@ class Settings(BaseSettings):
     # PERP_SCORING_ENABLED gates scorer signal separately. Flipping
     # PERP_SCORING_ENABLED alone does NOT affect scoring -- the scorer
     # also requires SCORER_MAX_RAW >= _PERP_ENABLED_MAX_RAW (runtime guard
-    # in scorer.py), which after the BL-054 recalibration PR ships as 208
-    # (equal to _PERP_ENABLED_MAX_RAW=208, so the guard opens by default).
+    # in scorer.py), which after the social-denominator recalibration ships as
+    # 193 (equal to _PERP_ENABLED_MAX_RAW=193, so the guard opens by default).
     # Full design in
     # docs/superpowers/specs/2026-04-20-bl054-perp-ws-anomaly-detector-design.md.
     PERP_ENABLED: bool = False

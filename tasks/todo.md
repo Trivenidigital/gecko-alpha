@@ -35,6 +35,42 @@ Non-scope:
 - No scorer denominator change, gate recalibration, ingestion change, or
   Telegram/Hermes bridge wiring in this evidence PR.
 
+## Completed Work: 2026-06-01 - Social denominator Option B implementation
+
+**Status:** READY-FOR-PR. Goal: remove the dead `social_mentions_24h` scorer
+denominator and preserve current gate friction by recalibrating defaults from
+60/70 to 65/75.
+
+Workflow checklist:
+- [x] Fresh branch from current `origin/master`.
+- [x] Drift/evidence check: PR #352 live refresh kept `social_mentions_24h`
+  structurally dead and kept Option B as the conservative recommendation.
+- [x] Build: removed Signal 5 contribution from `scout/scorer.py`, changed
+  `SCORER_MAX_RAW` 208→193, kept the perp denominator guard open at 193, and
+  changed default `MIN_SCORE`/`CONVICTION_THRESHOLD` to 65/75.
+- [x] Tests updated for the new denominator and default gates.
+- [x] Focused verification:
+  `python -m pytest -q tests/test_scorer.py tests/test_config.py
+  tests/live/test_config.py tests/test_audit_social_mentions_denominator.py`
+  => `150 passed`.
+- [x] Review: QA reviewer found stale env/test/doc denominator locks; folded
+  `.env.example`, README, backlog D1, quote-pair expectations, max-raw pin,
+  and perp guard tests/comments to the 193/65/75 regime.
+- [x] Expanded focused verification:
+  `python -m pytest -q tests/test_scorer.py tests/test_config.py
+  tests/live/test_config.py tests/test_audit_social_mentions_denominator.py
+  tests/test_scorer_max_raw_bumped_gt.py tests/test_scorer_quote_pair.py
+  tests/test_perp_scorer.py tests/test_perp_flag_off_snapshot.py` =>
+  `182 passed`.
+- [x] Full verification:
+  `python -m pytest --tb=short -q` with dummy required env => `3288 passed,
+  159 skipped`.
+- [ ] PR, CI, merge, deploy.
+
+Non-scope:
+- No social/Hermes/TG bridge wiring, scorer replacement signal, ingestion
+  change, or live-trading change.
+
 ## Completed Work: 2026-05-31 - Autonomous full code review
 
 **Status:** SHIPPED 2026-05-31 - PR #342 squash `f453d5dd`. Performed a

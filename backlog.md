@@ -480,7 +480,7 @@ Offline read-only analysis scripts scoped during the 2026-05-29 liquidity/focus 
 
 These decisions were reviewed and approved. Reference them when implementing P1 items.
 
-**D1 — Scoring normalization (UPDATED):** MIN_SCORE lowered to 25 and CONVICTION_THRESHOLD to 22 after observing that the CoinGecko micro-cap universe produces lower raw scores than originally modelled. The 178-point normalization base compresses scores: typical top tokens score 25-35 quant. The original target of MIN_SCORE=60 would require 4+ signals firing simultaneously which rarely happens in current market conditions. Thresholds will be raised as vol_acceleration signal accumulates history (requires 3+ scan cycles) and more data sources come online.
+**D1 — Scoring normalization (SUPERSEDED 2026-06-01):** Historical note only. The earlier 25/22 threshold and 178-point denominator regime was superseded by later scorer additions and the 2026-06-01 social-denominator Option B implementation. Current defaults are `MIN_SCORE=65`, `CONVICTION_THRESHOLD=75`, and `SCORER_MAX_RAW=193` after removing the dead 15-point `social_mentions_24h` denominator.
 
 **D2 — Buy pressure fields:** Add `txns_h1_buys: int | None = None` and `txns_h1_sells: int | None = None` to CandidateToken as Optional fields. Parser populates where available (DexScreener `txns.h1.buys` / `txns.h1.sells`). Scorer treats `None` as 0 points for buy pressure — graceful degradation if the field is missing from the API response.
 
@@ -696,7 +696,9 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 ### BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT: backtest dead social signal removal/replacement
 **Status:** AUDITED 2026-05-17 (PR #152 squash-merged to master at `e174a3d` 2026-05-17T23:39:11Z) — see `tasks/findings_social_mentions_denominator_audit_2026_05_17.md`. Full Plan→2-reviewers→Design→2-reviewers→PR→3-reviewers cycle completed (plus 1 post-merge re-review fold per Reviewer 1). **Recommendation: Option B (remove + recalibrate gates 60→65 / 70→75); closed-form approximate 0-flip blast radius across 6,096,576 score_history rows** (closed-form because `score_history` stores only post-multiplier final score; exact re-score from raw points + signal list not feasible). Code change DEFERRED to explicit operator approval per scope constraint. PR ships findings doc + audit_v2_queries.sql for re-evaluation + one-line `# DEAD SIGNAL` annotation on scorer.py:121 (zero behavior change; 69/69 scorer tests pass). Hermes X bridge (0/131 resolved 7d) and TG bridge (6 distinct contracts/24h) both data-not-ready; both deferred. 5 follow-up items filed below (3 audit + 2 VARIANT-{B,C}-IMPL PENDING-OPERATOR-DECISION).
 
-**Evidence refresh 2026-06-01:** see `tasks/findings_social_mentions_denominator_evidence_2026_06_01.md` and `scripts/audit_social_mentions_denominator.py`. Live srilu read: 1,714/1,714 candidates still have `social_mentions_24h=0`; `score_history` max score is 59.0 across 3,967,523 rows; Variant B remains closed-form 0-flip at min-score and conviction boundaries; Variant C's closed-form estimate would promote 38 score-history rows (=6 distinct contracts) at min-score with 0 matching paper trades in that approximate promoted set. Recommendation remains Option B; behavior change still deferred to the B/C decision rows below.
+**Evidence refresh 2026-06-01:** see `tasks/findings_social_mentions_denominator_evidence_2026_06_01.md` and `scripts/audit_social_mentions_denominator.py`. Live srilu read: 1,714/1,714 candidates still have `social_mentions_24h=0`; `score_history` max score is 59.0 across 3,967,523 rows; Variant B remains closed-form 0-flip at min-score and conviction boundaries; Variant C's closed-form estimate would promote 38 score-history rows (=6 distinct contracts) at min-score with 0 matching paper trades in that approximate promoted set. Recommendation remains Option B.
+
+**Option B implementation 2026-06-01:** autonomous decision accepted the conservative recommendation after the 2026-06-01 live refresh: remove dead Signal 5 from the scorer denominator and recalibrate gates 60→65 / 70→75. No social/Hermes/TG bridge wiring included.
 **Tag:** `scoring` `dead-signal` `calibration` `hermes-first` `audited`
 
 **Original status (now historical):** PROPOSED 2026-05-14. Originating scope: Compare current scoring denominator against (1) remove `social_mentions_24h` from scoring/max raw, (2) replace with evidence-gated `narrative_mentions_24h` / `kol_mentions_24h` from Hermes X + TG, (3) leave as-is until X narrative rows mature.
@@ -725,28 +727,28 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 **Evidence:** `docs/gecko-alpha-alignment.md` § "Scorer dormant-signal comments"; existing examples remain `scout/scorer.py` Signal 5 social mentions and Signal 13 CryptoPanic.
 
 ### BL-NEW-SOCIAL-DENOMINATOR-OPERATOR-PREFERENCE: B vs C decision for next-cycle code change
-**Status:** PROPOSED 2026-05-17 — surfaced as Open Question 1 in audit findings.
-**Tag:** `operator-decision` `awaiting-response`
+**Status:** CLOSED 2026-06-01 — Option B selected after the 2026-06-01 live evidence refresh kept the conservative 0-flip recommendation.
+**Tag:** `operator-decision` `resolved`
 **Why:** Audit recommends Variant B (remove + recalibrate gates 60→65 / 70→75) with closed-form approximate 0-flip blast radius (caveat: `score_history` stores only post-multiplier final score; closed-form approximation not exact re-score). Variant C (remove WITHOUT recalibrating) widens MiroFish funnel by 35 historical candidates — operator may value this if recall > precision.
 **2026-06-01 refresh:** Re-runnable Python audit against live srilu DB keeps Option B as the conservative recommendation: Variant B remains closed-form 0-flip; Variant C's closed-form estimate now widens by 38 score-history rows (=6 distinct contracts) with 0 paper-trade matches in that approximate promoted set. See `tasks/findings_social_mentions_denominator_evidence_2026_06_01.md`.
-**Action:** Operator responds via PR comment OR `tasks/findings_social_mentions_denominator_operator_decision.md` follow-up commit. On response: close this entry; promote pre-filed `BL-NEW-SOCIAL-DENOMINATOR-VARIANT-B-IMPL` or `-VARIANT-C-IMPL` below from PENDING-OPERATOR-DECISION to PROPOSED for next-cycle code change.
-**Decision-by:** 4 weeks from PR merge. **If no response by then, entry remains PROPOSED until 2026-08-17 backstop run resurfaces for human triage.** (Per PR-review fold R3 #1: the prior "default action = stamp interim Option A" had no actor and was itself a silent-non-trigger — the exact failure mode this audit exists to prevent. Removed.)
+**Action:** Complete. Option B promoted below; Variant C closed.
+**Decision-by:** Resolved by autonomous operator-decision delegation on 2026-06-01 after fresh live evidence.
 
 ### BL-NEW-SOCIAL-DENOMINATOR-VARIANT-B-IMPL: implement Option B (remove + recalibrate gates)
-**Status:** PENDING-OPERATOR-DECISION 2026-05-17 — pre-filed per PR-review fold R3 #4 so operator's "approve B" comment lands on a real backlog row.
-**Tag:** `scoring` `code-change` `gate-recalibration` `pending-decision`
+**Status:** IMPLEMENTED 2026-06-01 — removes Signal 5 from scorer.py + drops SCORER_MAX_RAW 208→193 + raises MIN_SCORE 60→65 + raises CONVICTION_THRESHOLD 70→75.
+**Tag:** `scoring` `code-change` `gate-recalibration` `implemented`
 **Why:** Audit-recommended path. Removes Signal 5 from scorer.py + drops SCORER_MAX_RAW 208→193 + raises MIN_SCORE 60→65 + raises CONVICTION_THRESHOLD 70→75. Closed-form approximate 0-flip blast radius across 6M+ historical rows (audit Q3; closed-form because `score_history` stores only post-multiplier final score). Pre-implementation step: re-score against fresh srilu DB to confirm approximation still holds.
-**Action:** ~2h. Edit scorer.py:120-127 (remove Signal 5 block) + scorer.py:37 (208→193) + config.py:27-28 (60→65, 70→75). Update test_scorer.py for new max-raw. Smoke-test on srilu.
-**Promotion trigger:** Operator approves Option B in BL-NEW-SOCIAL-DENOMINATOR-OPERATOR-PREFERENCE → promote this to PROPOSED; close `-VARIANT-C-IMPL` below.
-**Decision-by:** Conditional on operator decision; not calendar-bound on its own.
+**Action:** Complete. Scorer max raw and default gates recalibrated; tests updated for the new denominator. Social/Hermes/TG bridge remains deferred until bridge readiness triggers fire.
+**Promotion trigger:** Complete — Option B selected 2026-06-01.
+**Decision-by:** Complete.
 
 ### BL-NEW-SOCIAL-DENOMINATOR-VARIANT-C-IMPL: implement Option C (remove without recalibrating)
-**Status:** PENDING-OPERATOR-DECISION 2026-05-17 — pre-filed per PR-review fold R3 #4.
-**Tag:** `scoring` `code-change` `funnel-widening` `pending-decision`
+**Status:** CLOSED-NOT-SELECTED 2026-06-01 — Option B selected.
+**Tag:** `scoring` `code-change` `funnel-widening` `not-selected`
 **Why:** Variant C path. Removes Signal 5 from scorer.py + drops SCORER_MAX_RAW 208→193 but KEEPS gates at 60/70. Widens MiroFish funnel by 35 historical candidates (audit Q4) — operator preference if recall > precision.
-**Action:** ~1h. Edit scorer.py:120-127 (remove Signal 5 block) + scorer.py:37 (208→193). Update test_scorer.py for new max-raw. NO config.py change. Smoke-test on srilu.
-**Promotion trigger:** Operator approves Option C in BL-NEW-SOCIAL-DENOMINATOR-OPERATOR-PREFERENCE → promote this to PROPOSED; close `-VARIANT-B-IMPL` above.
-**Decision-by:** Conditional on operator decision; not calendar-bound on its own.
+**Action:** None. The 2026-06-01 refresh did not justify recall widening: Variant C's closed-form estimate promoted only 38 score-history rows (=6 distinct contracts) with 0 paper-trade matches in that approximate promoted set.
+**Promotion trigger:** Closed by Option B selection.
+**Decision-by:** Complete.
 
 ### BL-033: Add heartbeat logging every 5 minutes
 **Status:** DONE — heartbeat logging implemented (PR #7)

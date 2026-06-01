@@ -16,8 +16,8 @@ def test_settings_loads_defaults():
         _env_file=None,
     )
     assert s.SCAN_INTERVAL_SECONDS == 60
-    assert s.MIN_SCORE == 60
-    assert s.CONVICTION_THRESHOLD == 70
+    assert s.MIN_SCORE == 65
+    assert s.CONVICTION_THRESHOLD == 75
     assert s.QUANT_WEIGHT == 0.6
     assert s.NARRATIVE_WEIGHT == 0.4
     assert s.MIN_MARKET_CAP == 10_000

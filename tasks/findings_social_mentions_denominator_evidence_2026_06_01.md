@@ -82,4 +82,4 @@ The script opens SQLite with `mode=ro` and `PRAGMA query_only=ON`, exits 2 on re
 
 Recommendation remains **Option B**: remove Signal 5 from the scorer denominator and recalibrate gates 60->65 / 70->75.
 
-Behavior change remains deferred to the existing B/C operator-decision rows. This refresh makes the evidence re-runnable; it does not itself change scoring.
+Follow-up behavior change: Option B was selected on 2026-06-01 after this refresh kept the conservative recommendation intact. The implementation removes dead Signal 5 from the scorer denominator and recalibrates gates 60->65 / 70->75; it does not add social/Hermes/TG bridge wiring.
