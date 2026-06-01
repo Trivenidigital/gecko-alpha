@@ -410,8 +410,14 @@ class LiveEngine:
             )
             # V1+V2+V3 PR-stage CRITICAL fix: KillSwitch.engage does not
             # exist; real API is trigger(triggered_by, reason, duration).
+            # PR-1 2026-06-01 fail-safe fix: triggered_by MUST be a
+            # kill_events.triggered_by CHECK-allowed value
+            # ('daily_loss_cap','manual','ops_maintenance'). The prior
+            # 'live_engine' violated the constraint → IntegrityError, so this
+            # venue-fatal kill NEVER engaged. The specific cause is preserved
+            # in `reason`; 'ops_maintenance' is the operational-halt bucket.
             await self._ks.trigger(
-                triggered_by="live_engine",
+                triggered_by="ops_maintenance",
                 reason="binance_auth_revoked_mid_session",
                 duration=compute_kill_duration(datetime.now(timezone.utc)),
             )
@@ -422,8 +428,10 @@ class LiveEngine:
                 paper_trade_id=paper_trade.id,
                 err=str(exc),
             )
+            # 'ops_maintenance' = CHECK-allowed operational-halt bucket; cause
+            # preserved in `reason` (see auth-revoked branch above).
             await self._ks.trigger(
-                triggered_by="live_engine",
+                triggered_by="ops_maintenance",
                 reason="binance_ip_banned",
                 duration=compute_kill_duration(datetime.now(timezone.utc)),
             )

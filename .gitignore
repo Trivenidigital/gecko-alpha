@@ -56,3 +56,23 @@ dashboard/frontend/.npm_tmp/
 # vendor-specific quirks; never commit. Sample script enforces a two-layer
 # pre-check before any call dispatches.
 tasks/vendor_samples/
+
+# --- Autonomous-session scratch artifacts (never commit; PR-1 2026-06-01) ---
+# Codex SDLC scratch, PR probes/diffs, git worktrees, deploy/smoke scripts that
+# accumulate during autonomous sessions. Previously uncovered → `git add -A`
+# footgun (the working tree carried ~350 such untracked files at session start).
+.codex_*
+.codex-worktrees/
+__codex_*
+_codex_*
+.review-pr*/
+.pr[0-9]*
+.wt*
+_deploy_*
+_smoke_*
+_restart_*
+_actionability_*
+_eligibility_*
+_mirofish_runtime_probe*
+_sandbox_build/
+GITCHK.txt

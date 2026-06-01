@@ -7,6 +7,7 @@ from aioresponses import aioresponses
 from scout.alerter import (
     _escape_md,
     send_alert,
+    send_telegram_message,
     format_alert_message,
     format_daily_summary,
 )
@@ -104,6 +105,32 @@ async def test_send_alert_telegram(mock_aiohttp, token_factory, settings_factory
 
     async with aiohttp.ClientSession() as session:
         await send_alert(token, signals, session, settings)
+
+
+async def test_send_telegram_message_logs_delivered_on_200(
+    mock_aiohttp, settings_factory
+):
+    """§12b systemic observability: a confirmed 200 emits
+    telegram_message_delivered with the callsite source. The alerter previously
+    logged ONLY on failure, so a successful send was indistinguishable from a
+    send that was never called."""
+    from structlog.testing import capture_logs
+
+    telegram_url = "https://api.telegram.org/bottest-bot-token/sendMessage"
+    mock_aiohttp.post(telegram_url, payload={"ok": True})
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-bot-token",
+        TELEGRAM_CHAT_ID="test-chat-id",
+        DISCORD_WEBHOOK_URL="",
+    )
+    async with aiohttp.ClientSession() as session:
+        with capture_logs() as logs:
+            await send_telegram_message(
+                "hello", session, settings, parse_mode=None, source="unit_test"
+            )
+    delivered = [e for e in logs if e["event"] == "telegram_message_delivered"]
+    assert len(delivered) == 1
+    assert delivered[0]["source"] == "unit_test"
 
 
 def test_alert_message_includes_momentum_flag(token_factory):

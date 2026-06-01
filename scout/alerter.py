@@ -207,14 +207,23 @@ async def send_telegram_message(
                     else ""
                 )
                 logger.warning(
-                    "Telegram daily summary failed", status=resp.status, body=body
+                    "Telegram daily summary failed",
+                    status=resp.status,
+                    body=body,
+                    source=source,
                 )
                 if raise_on_failure:
                     raise RuntimeError(
                         f"telegram send failed status={resp.status} body={body}"
                     )
+            else:
+                # §12b systemic observability: the default alerter logged ONLY on
+                # failure, making "no logs" ambiguous between delivered-cleanly and
+                # never-called. Log every confirmed 200 with the callsite source so
+                # any caller's delivery is traceable without a per-site triplet.
+                logger.info("telegram_message_delivered", source=source)
     except Exception as e:
-        logger.warning("Telegram daily summary error", error=str(e))
+        logger.warning("Telegram daily summary error", error=str(e), source=source)
         if raise_on_failure:
             raise
 

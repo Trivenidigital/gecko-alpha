@@ -368,7 +368,11 @@ async def test_dispatch_live_binance_auth_error_engages_killswitch(tmp_path):
     engine._ks.trigger.assert_awaited_once()
     call = engine._ks.trigger.call_args
     assert call.kwargs["reason"] == "binance_auth_revoked_mid_session"
-    assert call.kwargs["triggered_by"] == "live_engine"
+    # 'ops_maintenance' is the CHECK-allowed bucket (PR-1 fail-safe fix); the
+    # prior 'live_engine' violated the kill_events constraint. Constraint
+    # validity of all code-used values is guarded by
+    # test_kill_switch.test_every_code_used_triggered_by_is_constraint_valid.
+    assert call.kwargs["triggered_by"] == "ops_maintenance"
     assert "duration" in call.kwargs
     await db.close()
 
@@ -387,7 +391,11 @@ async def test_dispatch_live_ip_ban_engages_killswitch(tmp_path):
     engine._ks.trigger.assert_awaited_once()
     call = engine._ks.trigger.call_args
     assert call.kwargs["reason"] == "binance_ip_banned"
-    assert call.kwargs["triggered_by"] == "live_engine"
+    # 'ops_maintenance' is the CHECK-allowed bucket (PR-1 fail-safe fix); the
+    # prior 'live_engine' violated the kill_events constraint. Constraint
+    # validity of all code-used values is guarded by
+    # test_kill_switch.test_every_code_used_triggered_by_is_constraint_valid.
+    assert call.kwargs["triggered_by"] == "ops_maintenance"
     await db.close()
 
 
