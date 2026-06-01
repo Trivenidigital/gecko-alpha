@@ -183,7 +183,7 @@ def test_stable_paired_liq_cooccurrence_score_delta(settings_factory, token_fact
     settings = _settings(settings_factory)
 
     # 2-signal token: vol_liq + holder_growth (no age, no cap, no chain bonus,
-    # no stable). raw = 30 + 25 = 55, normalized = int(55 * 100/208) = 26.
+    # no stable). raw = 30 + 25 = 55, normalized = int(55 * 100/193) = 28.
     token_2sig = _make_token(
         token_factory,
         quote_symbol=None,  # no stable_paired_liq
@@ -193,11 +193,11 @@ def test_stable_paired_liq_cooccurrence_score_delta(settings_factory, token_fact
     )
     score_2sig, signals_2sig = score(token_2sig, settings)
     assert len(signals_2sig) == 2, f"expected 2 signals, got {signals_2sig}"
-    # raw=55, normalized=int(55*100/208)=26, no co-occurrence
-    assert score_2sig == 26
+    # raw=55, normalized=int(55*100/193)=28, no co-occurrence
+    assert score_2sig == 28
 
     # 3-signal token: same + stable_paired_liq.
-    # raw = 55 + 5 = 60, normalized = int(60*100/208) = 28, * 1.15 = int(32.2) = 32.
+    # raw = 55 + 5 = 60, normalized = int(60*100/193) = 31, * 1.15 = int(35.65) = 35.
     token_3sig = _make_token(
         token_factory,
         quote_symbol="USDC",
@@ -209,10 +209,10 @@ def test_stable_paired_liq_cooccurrence_score_delta(settings_factory, token_fact
     assert len(signals_3sig) == 3, f"expected 3 signals, got {signals_3sig}"
     assert "stable_paired_liq" in signals_3sig
     # The 1.15x multiplier MUST fire — score must exceed naive +2 normalized.
-    naive_additive_score = score_2sig + 2  # the bare-direct-bonus prediction
+    naive_additive_score = score_2sig + 3  # the bare-direct-bonus prediction
     assert score_3sig > naive_additive_score, (
         f"Co-occurrence multiplier did not fire: 2sig={score_2sig}, "
         f"3sig={score_3sig}, naive={naive_additive_score}"
     )
     # Concrete value lock to catch silent regression in normalization math.
-    assert score_3sig == 32
+    assert score_3sig == 35

@@ -1,6 +1,6 @@
 # gecko-alpha
 
-CoinGecko early pump detection pipeline with MiroFish narrative simulation. Scans DexScreener, GeckoTerminal, and CoinGecko for micro-cap tokens, scores them across 11 quantitative signals, runs narrative analysis via Claude haiku-4-5, and alerts to Telegram when conviction thresholds are met.
+CoinGecko early pump detection pipeline with MiroFish narrative simulation. Scans DexScreener, GeckoTerminal, and CoinGecko for micro-cap tokens, scores them across 12 quantitative signals, runs narrative analysis via Claude haiku-4-5, and alerts to Telegram when conviction thresholds are met.
 
 ## Quick Start
 
@@ -49,31 +49,32 @@ python scripts/check_live_candidates_contract.py --url http://localhost:8000 --j
 
 1. **Ingestion** — CoinGecko (dual query: market_cap_asc + volume_desc) + DexScreener + GeckoTerminal in parallel via `asyncio.gather()`
 2. **Aggregation** — Dedup by contract_address, preserve enrichment fields (trending rank, price changes)
-3. **Scoring** — 11 quantitative signals (normalized 178 → 100 scale, co-occurrence multiplier)
+3. **Scoring** — 12 quantitative signals (normalized 193 → 100 scale, co-occurrence multiplier)
 4. **MiroFish** — Narrative simulation with Claude haiku-4-5 fallback (calibrated rubric, quantitative context)
-5. **Gate** — Conviction score = quant × 0.6 + narrative × 0.4, threshold ≥ 22
+5. **Gate** — Conviction score = quant × 0.6 + narrative × 0.4, threshold ≥ 75
 6. **Alerter** — Telegram + Discord delivery with GoPlus safety check + duplicate suppression
 
-### Scoring Signals (11)
+### Scoring Signals (12)
 
 | Signal | Points | Source |
 |--------|--------|--------|
 | vol_liq_ratio | 30 | DexScreener/GeckoTerminal |
 | market_cap_range | 2-8 (tiered) | All sources |
 | holder_growth | 25 | Helius/Moralis |
-| token_age | 0-10 (bell curve) | DexScreener/GeckoTerminal |
-| social_mentions | 15 | (Phase 5) |
+| token_age | 0-15 (bell curve) | DexScreener/GeckoTerminal |
 | buy_pressure | 15 | DexScreener txns |
 | momentum_ratio | 20 | DexScreener/CoinGecko |
 | vol_acceleration | 25 | DB rolling 7d avg |
 | cg_trending_rank | 15 | CoinGecko trending |
+| gt_trending | 15 | GeckoTerminal trending |
 | solana_bonus | 5 | Chain detection |
 | score_velocity | 10 | DB score history |
+| perp_anomaly | 10 | Perp futures anomaly |
 
 ### Current Thresholds
 
-- `MIN_SCORE=25` — Minimum quant score to trigger narrative analysis
-- `CONVICTION_THRESHOLD=22` — Minimum conviction to fire alert
+- `MIN_SCORE=65` — Minimum quant score to trigger narrative analysis
+- `CONVICTION_THRESHOLD=75` — Minimum conviction to fire alert
 - `MIN_LIQUIDITY_USD=15000` — Hard disqualifier below this
 
 ### Dashboard

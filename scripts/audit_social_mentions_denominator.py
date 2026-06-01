@@ -20,6 +20,7 @@ from scout.scorer import SCORER_MAX_RAW
 
 SOCIAL_MENTIONS_POINTS = 15
 SOCIAL_MENTIONS_THRESHOLD = 50
+AUDITED_WITH_SOCIAL_MAX_RAW = 208
 MIN_SCORE = 60
 CONVICTION_THRESHOLD = 70
 VARIANT_B_MIN_SCORE = 65
@@ -134,7 +135,7 @@ def _score_history(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def _variant_b(conn: sqlite3.Connection) -> dict[str, Any]:
-    without_social = SCORER_MAX_RAW - SOCIAL_MENTIONS_POINTS
+    without_social = AUDITED_WITH_SOCIAL_MAX_RAW - SOCIAL_MENTIONS_POINTS
     return _one(
         conn,
         """
@@ -152,7 +153,7 @@ def _variant_b(conn: sqlite3.Connection) -> dict[str, Any]:
         FROM recalc
         """,
         (
-            float(SCORER_MAX_RAW),
+            float(AUDITED_WITH_SOCIAL_MAX_RAW),
             float(without_social),
             MIN_SCORE,
             VARIANT_B_MIN_SCORE,
@@ -167,7 +168,7 @@ def _variant_b(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def _variant_c(conn: sqlite3.Connection) -> dict[str, Any]:
-    without_social = SCORER_MAX_RAW - SOCIAL_MENTIONS_POINTS
+    without_social = AUDITED_WITH_SOCIAL_MAX_RAW - SOCIAL_MENTIONS_POINTS
     base = _one(
         conn,
         """
@@ -182,7 +183,7 @@ def _variant_c(conn: sqlite3.Connection) -> dict[str, Any]:
         FROM recalc
         """,
         (
-            float(SCORER_MAX_RAW),
+            float(AUDITED_WITH_SOCIAL_MAX_RAW),
             float(without_social),
             MIN_SCORE,
             MIN_SCORE,
@@ -205,7 +206,7 @@ def _variant_c(conn: sqlite3.Connection) -> dict[str, Any]:
         FROM recalc
         """,
         (
-            float(SCORER_MAX_RAW),
+            float(AUDITED_WITH_SOCIAL_MAX_RAW),
             float(without_social),
             MIN_SCORE,
             MIN_SCORE,
@@ -220,7 +221,7 @@ def _variant_c(conn: sqlite3.Connection) -> dict[str, Any]:
 def _paper_trade_cross_check(conn: sqlite3.Connection) -> dict[str, Any]:
     if not _table_exists(conn, "paper_trades"):
         return {"available": False, "reason": "paper_trades table missing"}
-    without_social = SCORER_MAX_RAW - SOCIAL_MENTIONS_POINTS
+    without_social = AUDITED_WITH_SOCIAL_MAX_RAW - SOCIAL_MENTIONS_POINTS
     row = _one(
         conn,
         """
@@ -242,7 +243,12 @@ def _paper_trade_cross_check(conn: sqlite3.Connection) -> dict[str, Any]:
         FROM paper_trades pt
         INNER JOIN promoted p ON pt.token_id = p.contract_address
         """,
-        (MIN_SCORE, float(SCORER_MAX_RAW), float(without_social), MIN_SCORE),
+        (
+            MIN_SCORE,
+            float(AUDITED_WITH_SOCIAL_MAX_RAW),
+            float(without_social),
+            MIN_SCORE,
+        ),
     )
     row["available"] = True
     row["n_with_paper_trades"] = row.get("n_with_paper_trades") or 0
@@ -331,9 +337,12 @@ def build_report(db_path: str, *, now: datetime | None = None) -> dict[str, Any]
             "stage": "ok",
             "audited_at": _utc_iso_z(now),
             "params": {
-                "scorer_max_raw": SCORER_MAX_RAW,
+                "current_scorer_max_raw": SCORER_MAX_RAW,
+                "audited_with_social_max_raw": AUDITED_WITH_SOCIAL_MAX_RAW,
                 "social_mentions_points": SOCIAL_MENTIONS_POINTS,
-                "max_raw_without_social": SCORER_MAX_RAW - SOCIAL_MENTIONS_POINTS,
+                "max_raw_without_social": (
+                    AUDITED_WITH_SOCIAL_MAX_RAW - SOCIAL_MENTIONS_POINTS
+                ),
                 "social_mentions_threshold": SOCIAL_MENTIONS_THRESHOLD,
                 "current_min_score": MIN_SCORE,
                 "variant_b_min_score": VARIANT_B_MIN_SCORE,

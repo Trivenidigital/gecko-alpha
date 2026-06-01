@@ -5,8 +5,6 @@ Scoring weights (must always document rationale):
 - market_cap_range (tiered: 8/5/2 pts): Pre-discovery range
 - holder_growth (>20 new/hour): 25 points -- Organic accumulation
 - token_age (bell curve, peak 12-48h): 0-15 points -- Early stage
-- social_mentions (>50 in 24h): 15 points -- CT discovery signal (optional)
-
 DexScreener signals:
 - buy_pressure (buy_ratio > BUY_PRESSURE_THRESHOLD): 15 points -- Organic buying vs wash trade
 
@@ -22,7 +20,7 @@ Velocity signal:
 Chain bonus:
 - solana_bonus (chain == solana): 5 points -- Meme premium
 
-Max raw: 30+8+25+15+15+15+20+25+15+15+5+10+10 = 208 points
+Max raw: 30+8+25+15+15+20+25+15+15+5+10+10 = 193 points
 Normalized to 0-100 scale, then co-occurrence multiplier (1.15x if 3+ signals) applied.
 """
 
@@ -34,13 +32,13 @@ from scout.models import CandidateToken
 logger = structlog.get_logger(__name__)
 
 # Theoretical maximum raw score — update if signal weights change
-SCORER_MAX_RAW = 208
+SCORER_MAX_RAW = 193
 
 # The max-raw value at which Signal 14 (perp anomaly) is included in the
 # denominator. When SCORER_MAX_RAW equals this value the denominator guard
-# opens automatically. Recalibrated in BL-054 recalibration PR: both
-# constants now 208 (198 pre-recalibration + 10 for Signal 14 perp_anomaly).
-_PERP_ENABLED_MAX_RAW = 208
+# opens automatically. Recalibrated after removing the dead 15-point
+# social_mentions denominator: both constants now 193.
+_PERP_ENABLED_MAX_RAW = 193
 
 # Runtime guard for Signal 14. See design spec §3.9.
 # The constant and flag BOTH must be true for the signal to fire, preventing
@@ -117,15 +115,7 @@ def score(
         signals.append("token_age")
     # > 7 days: 0 pts
 
-    # Signal 5: Social Mentions -- 15 points (optional)
-    # DEAD SIGNAL — pending BL-NEW-SOCIAL-MENTIONS-DENOMINATOR-AUDIT re-eval
-    # (2026-05-17 audit confirmed 0 fires across 6,096,576 score_history rows;
-    # max social_mentions_24h = 0 across 1,671 candidates; Variant B 0-flip).
-    if token.social_mentions_24h > 50:
-        points += 15
-        signals.append("social_mentions")
-
-    # Signal 6: Buy pressure ratio (DexScreener) -- 15 points
+    # Signal 5: Buy pressure ratio (DexScreener) -- 15 points
     if token.txns_h1_buys is not None and token.txns_h1_sells is not None:
         total_txns = token.txns_h1_buys + token.txns_h1_sells
         if total_txns > 0:
@@ -134,7 +124,7 @@ def score(
                 points += 15
                 signals.append("buy_pressure")
 
-    # Signal 7: Momentum ratio (CoinGecko/DexScreener) -- 20 points
+    # Signal 6: Momentum ratio (CoinGecko/DexScreener) -- 20 points
     # Requires 24h change >= MOMENTUM_MIN_24H_CHANGE_PCT so stablecoin peg
     # wobble (e.g. 0.05%/0.08% -> ratio 0.625) doesn't trigger the signal.
     if (
@@ -208,7 +198,7 @@ def score(
 
     # Signal 14 (was 12 pre-BL-053). Perp futures anomaly — 10 points
     # (GATED: PERP_SCORING_ENABLED + runtime denominator guard).
-    # Double-gate: PERP_SCORING_ENABLED + SCORER_MAX_RAW >= 208. The second
+    # Double-gate: PERP_SCORING_ENABLED + SCORER_MAX_RAW >= _PERP_ENABLED_MAX_RAW.
     # gate is the runtime guard that prevents the scoring flag from silently
     # inflating scores before the recalibration PR lands. Tests monkeypatch
     # both. See design spec docs/superpowers/specs/
