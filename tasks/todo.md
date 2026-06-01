@@ -37,7 +37,7 @@ Non-scope:
 
 ## Completed Work: 2026-06-01 - Social denominator Option B implementation
 
-**Status:** READY-FOR-PR. Goal: remove the dead `social_mentions_24h` scorer
+**Status:** SHIPPED 2026-06-01 - PR #354 squash `f2b85e49`. Goal: remove the dead `social_mentions_24h` scorer
 denominator and preserve current gate friction by recalibrating defaults from
 60/70 to 65/75.
 
@@ -65,7 +65,12 @@ Workflow checklist:
 - [x] Full verification:
   `python -m pytest --tb=short -q` with dummy required env => `3288 passed,
   159 skipped`.
-- [ ] PR, CI, merge, deploy.
+- [x] PR #354, CI green, squash-merged as `f2b85e49`.
+- [x] Deployed to srilu by fast-forward pull, `.env` gate values updated to
+  `MIN_SCORE=65` and `CONVICTION_THRESHOLD=75`, `__pycache__` cleared, and
+  services restarted. Verified srilu HEAD `f2b85e4`,
+  `SCORER_MAX_RAW=193`, `_PERP_ENABLED_MAX_RAW=193`, `gecko-pipeline` active,
+  `gecko-dashboard` active, and `NRestarts=0` for both services.
 
 Non-scope:
 - No social/Hermes/TG bridge wiring, scorer replacement signal, ingestion
