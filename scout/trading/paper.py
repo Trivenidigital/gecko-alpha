@@ -541,7 +541,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             raise RuntimeError("Database not initialized.")
 
         cursor = await conn.execute(
-            "SELECT entry_price, amount_usd, quantity FROM paper_trades WHERE id = ?",
+            "SELECT entry_price, amount_usd, quantity, remaining_qty, "
+            "realized_pnl_usd FROM paper_trades WHERE id = ?",
             (trade_id,),
         )
         row = await cursor.fetchone()
@@ -552,6 +553,20 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         entry_price = float(row[0])
         amount_usd = float(row[1])
         quantity = float(row[2])
+        # Two partial mechanisms shrink DIFFERENT columns: the BL-061 ladder
+        # (execute_partial_sell) banks leg gains into realized_pnl_usd and
+        # decrements remaining_qty (quantity stays original); the legacy
+        # pre-cutover partial-TP (evaluator.py) shrinks quantity (remaining_qty
+        # stays original). Close the RUNNER on the actually-held qty =
+        # min(remaining_qty, quantity) — correct for BOTH — and FOLD IN the banked
+        # realized_pnl_usd. Otherwise laddered winners are understated (runner-only
+        # PnL on the full original quantity) and realized_pnl_usd is silently dropped
+        # from every closed-trade consumer (combo_performance, auto-suspend,
+        # calibration, digests, dashboard PnL). Normal full close: remaining_qty ==
+        # quantity and realized == 0, so this is a no-op (pre-cutover NULLs coalesced).
+        remaining_qty = float(row[3]) if row[3] is not None else quantity
+        realized_pnl_usd = float(row[4]) if row[4] is not None else 0.0
+        held_qty = min(remaining_qty, quantity)
 
         effective_exit = current_price * (1 - slippage_bps / 10000)
         if entry_price <= 0:
@@ -559,8 +574,13 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             pnl_pct = 0.0
             pnl_usd = 0.0
         else:
-            pnl_pct = ((effective_exit - entry_price) / entry_price) * 100
-            pnl_usd = quantity * (effective_exit - entry_price)
+            runner_pnl = held_qty * (effective_exit - entry_price)
+            pnl_usd = realized_pnl_usd + runner_pnl
+            # Blend over the full original notional (quantity*entry). For the legacy
+            # partial-TP path quantity is the shrunk sold-portion, so this reduces to
+            # the pre-fix (exit-entry)/entry%; for ladder it blends over the original.
+            notional = quantity * entry_price
+            pnl_pct = (pnl_usd / notional) * 100 if notional > 0 else 0.0
         now = datetime.now(timezone.utc).isoformat()
 
         if reason == "take_profit" and pnl_usd < 0:

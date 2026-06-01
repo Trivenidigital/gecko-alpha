@@ -354,3 +354,156 @@ async def test_execute_sell_peak_fade_sets_closed_peak_fade_status(
     assert status == "closed_peak_fade"
     assert reason == "peak_fade"
     await db.close()
+
+
+async def test_execute_sell_runner_folds_in_realized_legs(tmp_path):
+    """Phase C regression: closing a BL-061 ladder runner must fold in the
+    realized leg proceeds AND use remaining_qty (not the full original quantity),
+    else laddered winners are understated/flipped and realized_pnl_usd is silently
+    dropped from every closed-trade consumer (combo_performance, auto-suspend,
+    calibration, digests, dashboard PnL)."""
+    from scout.db import Database
+    from scout.trading.paper import PaperTrader
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    trader = PaperTrader()
+    trade_id = await trader.execute_buy(
+        db=db,
+        token_id="tok-l",
+        symbol="LAD",
+        name="Ladder",
+        chain="coingecko",
+        signal_type="gainers_early",
+        signal_data={},
+        current_price=1.0,
+        amount_usd=300.0,  # 300 units at $1.0
+        tp_pct=40.0,
+        sl_pct=15.0,
+        slippage_bps=0,
+        signal_combo="gainers_early",
+    )
+    # Leg 1: sell 30% at $1.25 -> banks 300*0.30*0.25 = +$22.50, remaining 210 units.
+    await trader.execute_partial_sell(
+        db=db,
+        trade_id=trade_id,
+        leg=1,
+        sell_qty_frac=0.30,
+        current_price=1.25,
+        slippage_bps=0,
+    )
+    # Close the runner at $0.90 (runner-leg loss). CORRECT total:
+    #   realized(+22.50) + remaining_qty(210) * (0.90 - 1.0) = 22.50 - 21.0 = +1.50
+    # The BUG computed full_qty(300)*(0.90-1.0) = -30.0 and overwrote realized.
+    closed = await trader.execute_sell(
+        db=db,
+        trade_id=trade_id,
+        current_price=0.90,
+        reason="trailing_stop",
+        slippage_bps=0,
+    )
+    assert closed is True
+    cur = await db._conn.execute(
+        "SELECT pnl_usd, pnl_pct FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    pnl_usd, pnl_pct = await cur.fetchone()
+    assert pnl_usd == pytest.approx(1.50, abs=1e-6)  # NOT -30.0
+    # Blended over the full original notional (300 * $1.0): 1.50 / 300 * 100 = 0.50%
+    assert pnl_pct == pytest.approx(0.50, abs=1e-4)  # NOT -10.0
+    await db.close()
+
+
+async def test_execute_sell_non_laddered_pnl_unchanged(tmp_path):
+    """Backward-compat: a non-laddered trade (remaining_qty == quantity,
+    realized_pnl_usd == 0) must produce the same pnl as before the ladder-fold fix."""
+    from scout.db import Database
+    from scout.trading.paper import PaperTrader
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    trader = PaperTrader()
+    trade_id = await trader.execute_buy(
+        db=db,
+        token_id="tok-n",
+        symbol="NL",
+        name="NoLadder",
+        chain="coingecko",
+        signal_type="gainers_early",
+        signal_data={},
+        current_price=1.0,
+        amount_usd=100.0,  # 100 units at $1.0
+        tp_pct=20.0,
+        sl_pct=15.0,
+        slippage_bps=0,
+        signal_combo="gainers_early",
+    )
+    closed = await trader.execute_sell(
+        db=db,
+        trade_id=trade_id,
+        current_price=1.20,
+        reason="take_profit",
+        slippage_bps=0,
+    )
+    assert closed is True
+    cur = await db._conn.execute(
+        "SELECT pnl_usd, pnl_pct FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    pnl_usd, pnl_pct = await cur.fetchone()
+    # 100 units * (1.20 - 1.0) = +20.0; pct = 20%.
+    assert pnl_usd == pytest.approx(20.0, abs=1e-6)
+    assert pnl_pct == pytest.approx(20.0, abs=1e-4)
+    await db.close()
+
+
+async def test_execute_sell_legacy_partial_tp_uses_shrunk_quantity(tmp_path):
+    """Legacy pre-cutover partial-TP shrinks `quantity` (NOT remaining_qty), so the
+    held qty = min(remaining_qty, quantity) must close the shrunk quantity. Using
+    remaining_qty (still original) would overstate the close. Guards the dual-path
+    held-qty contract so a future refactor can't silently revert it."""
+    from scout.db import Database
+    from scout.trading.paper import PaperTrader
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    trader = PaperTrader()
+    trade_id = await trader.execute_buy(
+        db=db,
+        token_id="tok-lg",
+        symbol="LG",
+        name="Legacy",
+        chain="coingecko",
+        signal_type="gainers_early",
+        signal_data={},
+        current_price=1.0,
+        amount_usd=300.0,  # 300 units at $1.0
+        tp_pct=20.0,
+        sl_pct=15.0,
+        slippage_bps=0,
+        signal_combo="gainers_early",
+    )
+    # Simulate the legacy partial-TP: shrink quantity to the sold portion (90 of
+    # 300 units); remaining_qty stays at the original 300, realized stays 0.
+    await db._conn.execute(
+        "UPDATE paper_trades SET quantity = 90.0 WHERE id = ?", (trade_id,)
+    )
+    await db._conn.commit()
+    closed = await trader.execute_sell(
+        db=db,
+        trade_id=trade_id,
+        current_price=1.20,
+        reason="take_profit",
+        slippage_bps=0,
+    )
+    assert closed is True
+    cur = await db._conn.execute(
+        "SELECT pnl_usd, pnl_pct FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    pnl_usd, pnl_pct = await cur.fetchone()
+    # held_qty = min(300, 90) = 90 -> 90 * (1.20 - 1.0) = +18.0; pct = 18/90 = 20%.
+    # (Using remaining_qty=300 would WRONGLY give 60.0.)
+    assert pnl_usd == pytest.approx(18.0, abs=1e-6)
+    assert pnl_pct == pytest.approx(20.0, abs=1e-4)
+    await db.close()
