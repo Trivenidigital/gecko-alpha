@@ -1742,7 +1742,42 @@ async def main(argv: list[str] | None = None) -> int:
             negative_ttl=timedelta(seconds=60),
             db=db,
         )
-        live_kill_switch = KillSwitch(db)
+        async def _kill_switch_alert(message: str) -> None:
+            # §12b: plain-text operator alert for automated kill-switch state
+            # changes (the highest-stakes automated state reversal in the
+            # system). Kill triggers are rare, so a short-lived session per fire
+            # is fine and avoids coupling to the cycle session lifecycle.
+            # parse_mode=None is mandatory — kill reasons/actors contain
+            # underscores that MarkdownV1 would mangle (Class-3).
+            import aiohttp
+
+            from scout import alerter
+
+            # Bounded send: this hook is awaited inline on the engine hot path
+            # AND inside the 60s shadow-evaluator close loop, so an unbounded
+            # send could stall the daily-loss re-check. Cap it both ways; a
+            # timeout surfaces as kill_switch_alert_failed (visibility) via
+            # _emit_alert's handler rather than a silent stall.
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as _ks_session:
+                await asyncio.wait_for(
+                    alerter.send_telegram_message(
+                        message,
+                        _ks_session,
+                        settings,
+                        parse_mode=None,
+                        # raise_on_failure so a non-200 (bad token, 429, …) flows
+                        # to kill_switch_alert_failed instead of being logged as a
+                        # false kill_switch_alert_delivered. Truthful §12b audit on
+                        # the highest-stakes path (Codex review catch).
+                        raise_on_failure=True,
+                        source="kill_switch",
+                    ),
+                    timeout=20.0,
+                )
+
+        live_kill_switch = KillSwitch(db, alert_hook=_kill_switch_alert)
 
         # M1.5b: construct RoutingLayer when LIVE_USE_ROUTING_LAYER=True.
         # When the flag is False (default), routing=None is passed and the

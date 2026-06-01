@@ -312,6 +312,126 @@ async def test_apply_writes_signal_params_and_audit_atomically(
     await db.close()
 
 
+async def test_apply_diffs_emits_alert_triplet_on_send(
+    tmp_path, settings_factory, monkeypatch
+):
+    """§12b: applying calibration with a live session emits the
+    calibrate_alert_dispatched/delivered pair around a parse_mode=None send.
+
+    Every other apply test passes force_no_alert=True, so the alert path was
+    previously untested. A fake scout.alerter is injected (see below) so the
+    real module's top-level `import aiohttp` never runs — it crashes the
+    interpreter on Windows/OpenSSL — while the path stays fully exercised."""
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    for i in range(60):
+        await _insert_closed_trade(
+            db,
+            signal_type="gainers_early",
+            pnl_usd=1.0,
+            pnl_pct=0.5,
+            peak_pct=8.0,
+            status="closed_expired" if i < 42 else "closed_trailing_stop",
+        )
+    await db._conn.commit()
+
+    s = settings_factory(SIGNAL_PARAMS_ENABLED=True, CALIBRATION_MIN_TRADES=50)
+    diffs = await build_diffs(
+        db, s, window_days=30, min_trades=s.CALIBRATION_MIN_TRADES, step=2.0
+    )
+
+    sent: list[dict] = []
+
+    async def _fake_send(text, session, settings, *, parse_mode="Markdown", **kw):
+        sent.append({"parse_mode": parse_mode, "source": kw.get("source")})
+
+    # calibrate.apply_diffs does `from scout import alerter`. Importing the real
+    # scout.alerter runs its top-level `import aiohttp`, which hard-crashes the
+    # interpreter on Windows/OpenSSL. Inject a fake module into sys.modules (and
+    # the scout package attr) so the real import never executes; the alert path
+    # is still fully exercised (CI/Linux imports fine — this also keeps the
+    # local fast-loop alive).
+    import sys
+    import types
+
+    import scout
+
+    fake_alerter = types.ModuleType("scout.alerter")
+    fake_alerter.send_telegram_message = _fake_send
+    monkeypatch.setitem(sys.modules, "scout.alerter", fake_alerter)
+    monkeypatch.setattr(scout, "alerter", fake_alerter, raising=False)
+
+    with capture_logs() as logs:
+        n = await apply_diffs(db, diffs, s, session=object(), force_no_alert=False)
+
+    assert n >= 1
+    assert len(sent) == 1
+    assert sent[0]["parse_mode"] is None  # Class-3 safety
+    assert sent[0]["source"] == "calibrate"
+    events = [e["event"] for e in logs]
+    assert "calibrate_alert_dispatched" in events
+    assert "calibrate_alert_delivered" in events
+    await db.close()
+
+
+async def test_apply_diffs_logs_failed_and_still_commits_on_alert_error(
+    tmp_path, settings_factory, monkeypatch
+):
+    """§12b truthful triplet: if the send fails (raise_on_failure=True surfaces a
+    non-200/exception), calibrate logs calibrate_alert_failed — NOT delivered —
+    and the calibration still commits (operator alert is best-effort)."""
+    import sys
+    import types
+
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    for i in range(60):
+        await _insert_closed_trade(
+            db,
+            signal_type="gainers_early",
+            pnl_usd=1.0,
+            pnl_pct=0.5,
+            peak_pct=8.0,
+            status="closed_expired" if i < 42 else "closed_trailing_stop",
+        )
+    await db._conn.commit()
+
+    s = settings_factory(SIGNAL_PARAMS_ENABLED=True, CALIBRATION_MIN_TRADES=50)
+    diffs = await build_diffs(
+        db, s, window_days=30, min_trades=s.CALIBRATION_MIN_TRADES, step=2.0
+    )
+
+    async def _failing_send(text, session, settings, *, parse_mode="Markdown", **kw):
+        raise RuntimeError("telegram 500")
+
+    import scout
+
+    fake_alerter = types.ModuleType("scout.alerter")
+    fake_alerter.send_telegram_message = _failing_send
+    monkeypatch.setitem(sys.modules, "scout.alerter", fake_alerter)
+    monkeypatch.setattr(scout, "alerter", fake_alerter, raising=False)
+
+    with capture_logs() as logs:
+        n = await apply_diffs(db, diffs, s, session=object(), force_no_alert=False)
+
+    # Calibration committed despite the alert failure.
+    assert n >= 1
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM signal_params_audit "
+        "WHERE signal_type='gainers_early' AND applied_by='calibration'"
+    )
+    assert (await cur.fetchone())[0] >= 1
+    events = [e["event"] for e in logs]
+    assert "calibrate_alert_dispatched" in events
+    assert "calibrate_alert_failed" in events
+    assert "calibrate_alert_delivered" not in events
+    await db.close()
+
+
 async def test_apply_idempotent_zero_changes_on_rerun(tmp_path, settings_factory):
     db = Database(tmp_path / "t.db")
     await db.initialize()

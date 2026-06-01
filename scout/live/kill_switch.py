@@ -21,12 +21,16 @@ NULL and the other does not.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
 import structlog
 
 from scout.config import Settings
 from scout.db import Database
 from scout.live.types import KillState
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 log = structlog.get_logger(__name__)
 
@@ -61,8 +65,76 @@ class KillSwitch:
     ``db._conn`` is a live connection.
     """
 
-    def __init__(self, db: Database) -> None:
+    def __init__(
+        self,
+        db: Database,
+        *,
+        alert_hook: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
         self._db = db
+        # §12b: optional plain-text alert sink for automated state changes.
+        # Set ONLY at the automated construction site (main.py). The CLI builds
+        # a hookless instance, so operator-initiated triggers/clears do not
+        # self-notify (§12b exempts operator-initiated reversals). The hook MUST
+        # send plain text (parse_mode=None): kill reasons/actors contain
+        # underscores (e.g. binance_auth_revoked_mid_session, live_engine) that
+        # Telegram MarkdownV1 would silently mangle (Class-3).
+        self._alert_hook = alert_hook
+
+    async def _emit_alert(
+        self,
+        *,
+        event_type: str,
+        kill_event_id: int,
+        triggered_by: str | None = None,
+        reason: str | None = None,
+        killed_until: datetime | None = None,
+        cleared_by: str | None = None,
+    ) -> None:
+        """Emit the §12b operator alert for an automated kill-switch transition.
+
+        Wrapped in the dispatched/delivered/failed log triplet so every fire is
+        traceable in journalctl regardless of delivery outcome. NEVER raises: the
+        DB state change has already committed before this runs, so an alert
+        failure must not corrupt the kill-switch contract — it is logged loudly
+        instead (the §12b "log on failure" rule).
+        """
+        if self._alert_hook is None:
+            return
+        if event_type == "triggered":
+            until = killed_until.isoformat() if killed_until is not None else "n/a"
+            message = (
+                "LIVE KILL-SWITCH TRIGGERED\n"
+                f"event #{kill_event_id} by {triggered_by}\n"
+                f"reason: {reason}\n"
+                f"live trading halted until {until} UTC"
+            )
+        else:  # "cleared"
+            message = (
+                "LIVE KILL-SWITCH CLEARED\n"
+                f"event #{kill_event_id} cleared by {cleared_by}\n"
+                "live trading re-enabled"
+            )
+        log.info(
+            "kill_switch_alert_dispatched",
+            kill_event_id=kill_event_id,
+            event_type=event_type,
+        )
+        try:
+            await self._alert_hook(message)
+            log.info(
+                "kill_switch_alert_delivered",
+                kill_event_id=kill_event_id,
+                event_type=event_type,
+            )
+        except Exception as exc:
+            log.exception(
+                "kill_switch_alert_failed",
+                kill_event_id=kill_event_id,
+                event_type=event_type,
+                err=str(exc),
+                err_type=type(exc).__name__,
+            )
 
     async def is_active(self) -> KillState | None:
         """Return the current :class:`KillState` or ``None``.
@@ -136,33 +208,44 @@ class KillSwitch:
             )
             claimed = cur.rowcount == 1
 
-            if claimed:
-                await self._db._conn.commit()
-                log.warning(
-                    "live_kill_event_triggered",
-                    kill_event_id=new_id,
-                    triggered_by=triggered_by,
-                    reason=reason,
-                    killed_until=killed_until.isoformat(),
+            if not claimed:
+                # Lost the race — a concurrent trigger already claimed. Mark our
+                # speculative row as superseded and return the winner's id. No
+                # alert here: the winner emits it (avoids duplicate notifications).
+                await self._db._conn.execute(
+                    "DELETE FROM kill_events WHERE id = ?", (new_id,)
                 )
-                return new_id, True
+                cur = await self._db._conn.execute(
+                    "SELECT active_kill_event_id FROM live_control WHERE id = 1"
+                )
+                winner_id = (await cur.fetchone())[0]
+                await self._db._conn.commit()
+                log.info(
+                    "live_kill_event_trigger_lost_race",
+                    losing_speculative_id=new_id,
+                    winner_id=winner_id,
+                )
+                return winner_id, False
 
-            # Lost the race — a concurrent trigger already claimed. Mark our
-            # speculative row as superseded and return the winner's id.
-            await self._db._conn.execute(
-                "DELETE FROM kill_events WHERE id = ?", (new_id,)
-            )
-            cur = await self._db._conn.execute(
-                "SELECT active_kill_event_id FROM live_control WHERE id = 1"
-            )
-            winner_id = (await cur.fetchone())[0]
             await self._db._conn.commit()
-            log.info(
-                "live_kill_event_trigger_lost_race",
-                losing_speculative_id=new_id,
-                winner_id=winner_id,
+            log.warning(
+                "live_kill_event_triggered",
+                kill_event_id=new_id,
+                triggered_by=triggered_by,
+                reason=reason,
+                killed_until=killed_until.isoformat(),
             )
-            return winner_id, False
+
+        # §12b: notify the operator OUTSIDE the txn lock — the HTTP send must not
+        # hold the single DB writer. Winner-only (the loser returned above).
+        await self._emit_alert(
+            event_type="triggered",
+            kill_event_id=new_id,
+            triggered_by=triggered_by,
+            reason=reason,
+            killed_until=killed_until,
+        )
+        return new_id, True
 
     async def clear(self, *, cleared_by: str) -> None:
         """Clear the active kill, if any.
@@ -196,6 +279,15 @@ class KillSwitch:
                 kill_event_id=active_id,
                 cleared_by=cleared_by,
             )
+
+        # §12b: notify the operator of an automated clear (auto-resume of live
+        # trading) outside the txn lock. Hookless instances (CLI manual clear) do
+        # not self-notify — operator-initiated reversals are §12b-exempt.
+        await self._emit_alert(
+            event_type="cleared",
+            kill_event_id=active_id,
+            cleared_by=cleared_by,
+        )
 
     async def auto_clear_if_expired(self) -> bool:
         """If the active kill has expired, clear it with ``cleared_by='auto_expired'``.

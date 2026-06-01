@@ -351,12 +351,31 @@ async def apply_diffs(
                 + f" [{d.reason}]"
                 for d in actionable
             )
-            await alerter.send_telegram_message(
-                f"calibration applied:\n{summary}",
-                session,
-                settings,
-                parse_mode=None,
-            )
+            # §12b: truthful dispatched/delivered/failed triplet around the
+            # operator alert for this automated param change. raise_on_failure
+            # makes a non-200/exception observable HERE; we log
+            # calibrate_alert_failed and SWALLOW it so the calibration still
+            # commits (operator visibility is best-effort — a Telegram outage
+            # must not lose a valid calibration). delivered is logged ONLY on a
+            # confirmed success, so the pair never falsely claims delivery.
+            log.info("calibrate_alert_dispatched", n_signals=len(actionable))
+            try:
+                await alerter.send_telegram_message(
+                    f"calibration applied:\n{summary}",
+                    session,
+                    settings,
+                    parse_mode=None,
+                    raise_on_failure=True,
+                    source="calibrate",
+                )
+                log.info("calibrate_alert_delivered", n_signals=len(actionable))
+            except Exception as exc:
+                log.warning(
+                    "calibrate_alert_failed",
+                    n_signals=len(actionable),
+                    err=str(exc),
+                    err_type=type(exc).__name__,
+                )
 
         await conn.commit()
     except Exception:
