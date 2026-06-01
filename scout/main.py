@@ -714,12 +714,17 @@ async def run_cycle(
     _dex_module.clear_watchdog_samples()
     _gt_module.clear_watchdog_samples()
     _cg_module.clear_watchdog_samples()
+    _ingest_t0 = time.monotonic()
     dex_tokens, gecko_tokens, cg_results = await asyncio.gather(
         fetch_trending(session, settings),
         fetch_trending_pools(session, settings),
         _fetch_coingecko_lanes(session, settings, db),
         return_exceptions=True,
     )
+    # Stage-1 wall-clock: the CoinGecko lanes serialize under the live ~6/min
+    # rate limit, so this is usually the cycle's dominant cost (see
+    # findings_cg_budget_attribution). Measuring it pinpoints the bottleneck.
+    stats["ingestion_s"] = round(time.monotonic() - _ingest_t0, 2)
     if isinstance(cg_results, Exception):
         cg_movers = cg_results
         cg_trending = cg_results
@@ -1943,6 +1948,18 @@ async def main(argv: list[str] | None = None) -> int:
                 nonlocal last_trade_surface_alert_check
 
                 while not shutdown_event.is_set():
+                    # PR-2 latency observability: time run_cycle (the detection
+                    # pipeline: ingestion+scoring+gate+alert) in the caller so the
+                    # duration is logged on BOTH the success and failure paths (a
+                    # cycle that blows its latency budget then raises is exactly the
+                    # one you most want to see). run_cycle_over_interval flags when
+                    # the detection pipeline ALONE exceeds the scan interval —
+                    # CoinGecko rate-limit backpressure, the audit's #1 unmeasured
+                    # bottleneck. NOTE: this is run_cycle's duration only; per-cycle
+                    # maintenance below (paper-trade eval, schedulers) runs after and
+                    # is intentionally excluded — it is not "detection". ingestion_s
+                    # (Stage-1 wall-clock) is stamped inside run_cycle.
+                    _run_cycle_t0 = time.monotonic()
                     try:
                         stats = await run_cycle(
                             settings,
@@ -1951,7 +1968,16 @@ async def main(argv: list[str] | None = None) -> int:
                             dry_run=args.dry_run,
                             trading_engine=trading_engine,
                         )
-                        logger.info("Cycle complete", **stats)
+                        _run_cycle_s = round(time.monotonic() - _run_cycle_t0, 2)
+                        logger.info(
+                            "Cycle complete",
+                            **stats,
+                            run_cycle_s=_run_cycle_s,
+                            scan_interval_s=settings.SCAN_INTERVAL_SECONDS,
+                            run_cycle_over_interval=(
+                                _run_cycle_s > settings.SCAN_INTERVAL_SECONDS
+                            ),
+                        )
                         _heartbeat_stats["tokens_scanned"] += stats.get(
                             "tokens_scanned", 0
                         )
@@ -1960,7 +1986,11 @@ async def main(argv: list[str] | None = None) -> int:
                         )
                         _heartbeat_stats["alerts_fired"] += stats.get("alerts_fired", 0)
                     except Exception as e:
-                        logger.error("Cycle failed", error=str(e))
+                        logger.error(
+                            "Cycle failed",
+                            error=str(e),
+                            run_cycle_s=round(time.monotonic() - _run_cycle_t0, 2),
+                        )
 
                     # Evaluate paper trades EVERY cycle (TP/SL/checkpoints)
                     # Must run frequently so TP triggers within minutes, not hours.

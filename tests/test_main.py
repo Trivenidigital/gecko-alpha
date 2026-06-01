@@ -243,6 +243,10 @@ async def test_run_cycle_dry_run(mock_db, mock_session, mock_settings):
     # In dry-run, alerts should NOT be sent
     mock_alert.assert_not_called()
     assert stats["tokens_scanned"] >= 1
+    # PR-2 latency observability: run_cycle stamps stage-1 ingestion wall-clock
+    # (total cycle_duration_s is logged by the caller _pipeline_loop, not here).
+    assert "ingestion_s" in stats
+    assert isinstance(stats["ingestion_s"], float)
 
 
 async def test_run_cycle_sends_alert(mock_db, mock_session, mock_settings):
