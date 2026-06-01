@@ -2,7 +2,7 @@
 
 ## Completed Work: 2026-06-01 - Social mentions denominator evidence refresh
 
-**Status:** READY-FOR-PR. Goal: make the dead `social_mentions_24h`
+**Status:** SHIPPED 2026-06-01 - PR #352 squash `b8d1ae1c`. Goal: make the dead `social_mentions_24h`
 denominator decision re-runnable against live srilu data before any B/C scoring
 behavior change.
 
@@ -25,7 +25,11 @@ Workflow checklist:
 - [x] Full verification:
   `python -m pytest --tb=short -q` with dummy required env => `3288 passed,
   159 skipped`.
-- [ ] PR, CI, merge.
+- [x] PR #352, CI green, squash-merged as `b8d1ae1c`.
+- [x] Deployed to srilu by fast-forward pull; no service restart required
+  because this shipped only a script/docs/tests evidence artifact. Verified
+  srilu HEAD `b8d1ae1`, script present, `gecko-pipeline` active, and
+  `gecko-dashboard` active.
 
 Non-scope:
 - No scorer denominator change, gate recalibration, ingestion change, or
