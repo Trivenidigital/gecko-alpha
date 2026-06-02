@@ -31,6 +31,10 @@ last_raw_by_volume: list[dict] = []
 # and raw-market signal surfaces.
 last_raw_midcap_gainers: list[dict] = []
 _midcap_scan_cycle_counter: int = 0
+# Populated by fetch_deep_volume() (gap-fill Increment 2): the accepted
+# $500K-$10M rising-volume rows from the rotating deep volume_desc page.
+last_raw_deep_volume: list[dict] = []
+_deep_volume_page_cursor: int = 0
 _last_watchdog_samples: dict[str, IngestSourceSample] = {}
 
 
@@ -540,3 +544,130 @@ def _reset_midcap_scan_cycle_counter_for_tests() -> None:
     global _midcap_scan_cycle_counter
     _midcap_scan_cycle_counter = 0
     _last_watchdog_samples.pop("coingecko:midcap", None)
+
+
+async def fetch_deep_volume(
+    session: aiohttp.ClientSession,
+    settings: "Settings",
+) -> list[CandidateToken]:
+    """Rotating deep volume_desc page (gap-fill Increment 2, 2026-06-02).
+
+    ONE extra volume_desc page per cycle, rotating START..END (4->5->6), to reach
+    the $500K-$10M coverage hole: tokens about to pump show rising VOLUME first,
+    so they climb into volume ranks ~750-1500 BEFORE the +20%/24h move. Page-
+    neutral (funded by the disabled midcap lane) and smoother than a 3-page burst.
+
+    Accepted rows feed BOTH volume_history_cg (via the combined raw markets ->
+    record_volume -> the gainer_acceleration detector) AND candidates (the
+    tracker's pipeline-surface lead). Tight filters bound blast radius: every
+    accepted CandidateToken also reaches scoring, but CG-listed micro-caps in this
+    band score ~0. Clears its raw cache each call so stale rows can't replay.
+    """
+    global last_raw_deep_volume, _deep_volume_page_cursor
+    last_raw_deep_volume = []
+    _set_watchdog_sample(
+        IngestSourceSample(source="coingecko:deep_volume", raw_count=0, expected=False)
+    )
+
+    if getattr(settings, "COINGECKO_DEEP_VOLUME_ENABLED", False) is not True:
+        return []
+
+    start = max(1, int(settings.COINGECKO_DEEP_VOLUME_START_PAGE))
+    end = max(start, int(settings.COINGECKO_DEEP_VOLUME_END_PAGE))
+    span = end - start + 1
+    page = start + (_deep_volume_page_cursor % span)
+    _deep_volume_page_cursor += 1
+
+    logger.info("cg_fetch_attempted", endpoint="coins/markets:deep_volume", page=page)
+    _set_watchdog_sample(
+        IngestSourceSample(source="coingecko:deep_volume", raw_count=0, error="pending")
+    )
+
+    base_params = {
+        "vs_currency": "usd",
+        "order": "volume_desc",
+        "per_page": "250",
+        "sparkline": "false",
+        "price_change_percentage": "1h,24h,7d",
+    }
+    if settings.COINGECKO_API_KEY:
+        base_params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
+
+    data = await _get_with_backoff(
+        session, f"{CG_BASE}/coins/markets", {**base_params, "page": str(page)}
+    )
+    if isinstance(data, Exception) or not data or not isinstance(data, list):
+        _set_watchdog_sample(
+            IngestSourceSample(
+                source="coingecko:deep_volume",
+                raw_count=0,
+                usable_count=0,
+                error="no_raw_data",
+            )
+        )
+        logger.warning("cg_no_data", endpoint="coins/markets:deep_volume", page=page)
+        return []
+
+    min_mcap = float(settings.COINGECKO_DEEP_VOLUME_MIN_MCAP)
+    max_mcap = float(settings.COINGECKO_DEEP_VOLUME_MAX_MCAP)
+    min_volume = float(settings.COINGECKO_DEEP_VOLUME_MIN_VOLUME)
+    min_ratio = float(settings.COINGECKO_DEEP_VOLUME_MIN_VOL_MCAP_RATIO)
+    min_change = float(settings.COINGECKO_DEEP_VOLUME_MIN_24H_CHANGE)
+    max_tokens = max(1, int(settings.COINGECKO_DEEP_VOLUME_MAX_TOKENS_PER_CYCLE))
+
+    null_mcap_skipped = 0
+    accepted: list[dict] = []
+    for raw in data:
+        mcap = _float_or_zero(raw.get("market_cap"))
+        if mcap <= 0:
+            if (raw.get("current_price") or 0) > 0:
+                increment_mcap_null_with_price()
+            null_mcap_skipped += 1
+            continue
+        volume = _float_or_zero(raw.get("total_volume"))
+        change_24h = _float_or_zero(raw.get("price_change_percentage_24h"))
+        if not (min_mcap <= mcap <= max_mcap):
+            continue
+        if volume < min_volume:
+            continue
+        if (volume / mcap) < min_ratio:
+            continue
+        if change_24h < min_change:
+            continue
+        accepted.append(raw)
+
+    def _sort_key(raw: dict) -> tuple:
+        m = _float_or_zero(raw.get("market_cap")) or 1.0
+        vmr = _float_or_zero(raw.get("total_volume")) / m
+        ch1 = _float_or_zero(raw.get("price_change_percentage_1h_in_currency"))
+        ch24 = _float_or_zero(raw.get("price_change_percentage_24h"))
+        return (vmr, ch1, ch24)
+
+    accepted.sort(key=_sort_key, reverse=True)
+    accepted = accepted[:max_tokens]
+    last_raw_deep_volume = list(accepted)
+
+    tokens = [CandidateToken.from_coingecko(raw) for raw in accepted]
+    logger.info(
+        "cg_deep_volume_scan_returned",
+        count=len(tokens),
+        page=page,
+        raw_fetched=len(data),
+        null_mcap_skipped=null_mcap_skipped,
+        max_tokens=max_tokens,
+    )
+    _set_watchdog_sample(
+        IngestSourceSample(
+            source="coingecko:deep_volume",
+            raw_count=len(data),
+            usable_count=len(tokens),
+        )
+    )
+    return tokens
+
+
+def _reset_deep_volume_cursor_for_tests() -> None:
+    """Test-only helper. Production code never calls this."""
+    global _deep_volume_page_cursor
+    _deep_volume_page_cursor = 0
+    _last_watchdog_samples.pop("coingecko:deep_volume", None)

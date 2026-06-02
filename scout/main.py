@@ -34,6 +34,7 @@ from scout.ingestion.coingecko import fetch_top_movers as cg_fetch_top_movers
 from scout.ingestion.coingecko import fetch_trending as cg_fetch_trending
 from scout.ingestion.coingecko import fetch_by_volume as cg_fetch_by_volume
 from scout.ingestion.coingecko import fetch_midcap_gainers as cg_fetch_midcap_gainers
+from scout.ingestion.coingecko import fetch_deep_volume as cg_fetch_deep_volume
 from scout.ingestion import coingecko as _cg_module
 from scout.ingestion import dexscreener as _dex_module
 from scout.ingestion import geckoterminal as _gt_module
@@ -647,7 +648,7 @@ async def _fetch_coingecko_lanes(
     session: aiohttp.ClientSession,
     settings: Settings,
     db: Database,
-) -> tuple[list, list, list, list, list]:
+) -> tuple[list, list, list, list, list, list]:
     """Run CoinGecko lanes sequentially so 429 cooldown stops lower-priority fan-out.
 
     held_position runs FIRST: it is the smallest budget footprint (1 call) and
@@ -671,27 +672,53 @@ async def _fetch_coingecko_lanes(
         logger.warning(
             "coingecko_lanes_stopped_for_backoff", after="held_position_prices"
         )
-        return [], [], [], [], held_position_raw
+        return [], [], [], [], [], held_position_raw
 
     cg_movers = await _call("top_movers", cg_fetch_top_movers, session, settings)
     if coingecko_limiter.is_backing_off():
         logger.warning("coingecko_lanes_stopped_for_backoff", after="top_movers")
-        return cg_movers, [], [], [], held_position_raw
+        return cg_movers, [], [], [], [], held_position_raw
 
     cg_trending = await _call("trending", cg_fetch_trending, session, settings)
     if coingecko_limiter.is_backing_off():
         logger.warning("coingecko_lanes_stopped_for_backoff", after="trending")
-        return cg_movers, cg_trending, [], [], held_position_raw
+        return cg_movers, cg_trending, [], [], [], held_position_raw
 
     cg_by_volume = await _call("by_volume", cg_fetch_by_volume, session, settings)
     if coingecko_limiter.is_backing_off():
         logger.warning("coingecko_lanes_stopped_for_backoff", after="by_volume")
-        return cg_movers, cg_trending, cg_by_volume, [], held_position_raw
+        return cg_movers, cg_trending, cg_by_volume, [], [], held_position_raw
+
+    # Deep-volume rotating page (gap-fill Increment 2): one extra volume_desc page
+    # (rotating 4->5->6) reaching the $500K-$10M band, in the budget slot freed by
+    # the now-disabled midcap lane (page-neutral). Sets last_raw_deep_volume for
+    # the combined raw markets -> record_volume -> volume_history_cg, and its
+    # tokens flow to aggregate/candidates for the tracker pipeline-surface lead.
+    cg_deep_volume = await _call(
+        "deep_volume", cg_fetch_deep_volume, session, settings
+    )
+    if coingecko_limiter.is_backing_off():
+        logger.warning("coingecko_lanes_stopped_for_backoff", after="deep_volume")
+        return (
+            cg_movers,
+            cg_trending,
+            cg_by_volume,
+            [],
+            cg_deep_volume,
+            held_position_raw,
+        )
 
     cg_midcap_gainers = await _call(
         "midcap_gainers", cg_fetch_midcap_gainers, session, settings
     )
-    return cg_movers, cg_trending, cg_by_volume, cg_midcap_gainers, held_position_raw
+    return (
+        cg_movers,
+        cg_trending,
+        cg_by_volume,
+        cg_midcap_gainers,
+        cg_deep_volume,
+        held_position_raw,
+    )
 
 
 async def run_cycle(
@@ -731,6 +758,7 @@ async def run_cycle(
         cg_trending = cg_results
         cg_by_volume = cg_results
         cg_midcap_gainers = cg_results
+        cg_deep_volume = cg_results
         held_position_raw = cg_results
     else:
         (
@@ -738,6 +766,7 @@ async def run_cycle(
             cg_trending,
             cg_by_volume,
             cg_midcap_gainers,
+            cg_deep_volume,
             held_position_raw,
         ) = cg_results
     # Handle exceptions from gather
@@ -769,6 +798,11 @@ async def run_cycle(
             "CoinGecko midcap gainer scan failed", error=str(cg_midcap_gainers)
         )
         cg_midcap_gainers = []
+    if isinstance(cg_deep_volume, Exception):
+        logger.warning(
+            "CoinGecko deep-volume scan failed", error=str(cg_deep_volume)
+        )
+        cg_deep_volume = []
     if isinstance(held_position_raw, Exception):
         logger.warning("held_position_refresh failed", error=str(held_position_raw))
         held_position_raw = []
@@ -801,6 +835,8 @@ async def run_cycle(
         all_raw.extend(_cg_module.last_raw_by_volume)
     if _cg_module.last_raw_midcap_gainers:
         all_raw.extend(_cg_module.last_raw_midcap_gainers)
+    if _cg_module.last_raw_deep_volume:
+        all_raw.extend(_cg_module.last_raw_deep_volume)
     if held_position_raw:
         all_raw.extend(held_position_raw)
     if all_raw:
@@ -817,6 +853,7 @@ async def run_cycle(
         _cg_module.last_raw_trending,
         _cg_module.last_raw_by_volume,
         _cg_module.last_raw_midcap_gainers,
+        _cg_module.last_raw_deep_volume,
     )
 
     # Volume Spike Detection (zero extra API calls -- uses cached data)
@@ -976,6 +1013,7 @@ async def run_cycle(
         + list(cg_trending)
         + list(cg_by_volume)
         + list(cg_midcap_gainers)
+        + list(cg_deep_volume)
     )
     stats["tokens_scanned"] = len(all_candidates)
 
