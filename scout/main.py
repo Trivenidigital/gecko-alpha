@@ -57,6 +57,7 @@ from scout.spikes.detector import (
     detect_slow_burn_7d,
 )
 from scout.gainers.tracker import store_top_gainers
+from scout.gainers.acceleration import detect_acceleration
 from scout.losers.tracker import store_top_losers
 from scout.velocity.detector import alert_velocity_detections, detect_velocity
 from scout.trading.signals import (
@@ -950,6 +951,22 @@ async def run_cycle(
                 await alert_velocity_detections(velocity, session, settings)
         except Exception:
             logger.exception("velocity_alert_error")
+
+    # Gainer-Acceleration detector (gap-fill 2026-06-02). Reads the
+    # volume_history_cg rows record_volume() wrote earlier this cycle (line ~824)
+    # -- zero extra CG calls. Research-only: persists to gainer_acceleration +
+    # feeds the Top Gainers Tracker; no alert / no paper-trade.
+    if settings.ACCELERATION_ENABLED and _raw_markets_combined:
+        try:
+            accel = await detect_acceleration(db, settings)
+            if accel:
+                logger.info(
+                    "gainer_acceleration_tokens",
+                    count=len(accel),
+                    tokens=[a["symbol"] for a in accel],
+                )
+        except Exception:
+            logger.exception("gainer_acceleration_error")
 
     # Stage 2: Aggregate
     all_candidates = aggregate(

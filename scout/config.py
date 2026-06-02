@@ -112,7 +112,7 @@ class Settings(BaseSettings):
     COINGECKO_MIDCAP_SCAN_MIN_24H_CHANGE: float = 25.0
     COINGECKO_MIDCAP_SCAN_MIN_VOLUME: float = 250_000.0
     COINGECKO_MIDCAP_SCAN_MIN_MCAP: float = 10_000_000.0
-    COINGECKO_MIDCAP_SCAN_MAX_MCAP: float = 500_000_000.0
+    COINGECKO_MIDCAP_SCAN_MAX_MCAP: float = 200_000_000.0  # $200M ceiling
     COINGECKO_MIDCAP_SCAN_MAX_TOKENS_PER_CYCLE: int = 20
 
     # Held-position price-refresh lane (§12c-narrow remediation).
@@ -251,7 +251,7 @@ class Settings(BaseSettings):
     # -------- 7-Day Momentum Scanner --------
     MOMENTUM_7D_ENABLED: bool = True
     MOMENTUM_7D_MIN_CHANGE: float = 100.0  # min 7d change % to flag (100% = doubled)
-    MOMENTUM_7D_MAX_MCAP: float = 500_000_000  # filter out mega caps
+    MOMENTUM_7D_MAX_MCAP: float = 200_000_000  # $200M ceiling (operator trades <=$200M)
     MOMENTUM_7D_MIN_VOLUME: float = (
         100_000  # min $100K 24h volume — weeds out illiquid junk
     )
@@ -260,7 +260,7 @@ class Settings(BaseSettings):
     SLOW_BURN_ENABLED: bool = True
     SLOW_BURN_MIN_7D_CHANGE: float = 50.0
     SLOW_BURN_MAX_1H_CHANGE: float = 5.0
-    SLOW_BURN_MAX_MCAP: float = 500_000_000
+    SLOW_BURN_MAX_MCAP: float = 200_000_000  # $200M ceiling
     SLOW_BURN_MIN_VOLUME: float = 100_000
     # calibration era: undocumented -- see BL-NEW-CALIBRATION-ERA-DOC
     SLOW_BURN_DEDUP_DAYS: int = 7
@@ -268,7 +268,7 @@ class Settings(BaseSettings):
     # -------- Volume Spike Detector --------
     VOLUME_SPIKE_ENABLED: bool = True
     VOLUME_SPIKE_RATIO: float = 5.0
-    VOLUME_SPIKE_MAX_MCAP: float = 500_000_000
+    VOLUME_SPIKE_MAX_MCAP: float = 200_000_000  # $200M ceiling
 
     # -------- Velocity Alerter (CoinGecko 1h early-pump detection) --------
     # Research-only alerts for tokens pumping hard in the last hour.
@@ -282,10 +282,29 @@ class Settings(BaseSettings):
     VELOCITY_DEDUP_HOURS: int = 4  # re-alert cooldown per coin
     VELOCITY_TOP_N: int = 10  # max alerts per cycle
 
+    # -------- Gainer Acceleration Detector (gap-fill 2026-06-02) --------
+    # Catches $500K-$200M tokens accelerating (1h/4h price + volume) over our
+    # stored volume_history_cg BEFORE the 24h +20% gainer move completes. Zero
+    # extra CG calls (reads existing history). Research-only (writes the
+    # gainer_acceleration table + Top-Gainers-Tracker surface; NO alert/paper)
+    # until precision is measured -- vol_expansion is noisy because
+    # volume_history_cg.volume_24h is a CG 24h snapshot, not interval volume, so
+    # price acceleration is the strong leg and volume is a soft filter.
+    ACCELERATION_ENABLED: bool = True
+    ACCELERATION_MIN_1H_PCT: float = 8.0
+    ACCELERATION_MIN_4H_PCT: float = 12.0
+    ACCELERATION_MIN_VOL_EXPANSION: float = 2.0
+    ACCELERATION_MIN_SAMPLES: int = 3
+    ACCELERATION_MIN_MCAP: float = 500_000
+    ACCELERATION_MAX_MCAP: float = 200_000_000
+    ACCELERATION_DEDUP_HOURS: int = 4
+    ACCELERATION_LOOKBACK_HOURS: float = 5.0
+    ACCELERATION_TOP_N: int = 20
+
     # -------- Top Gainers Tracker --------
     GAINERS_TRACKER_ENABLED: bool = True
     GAINERS_MIN_CHANGE: float = 20.0
-    GAINERS_MAX_MCAP: float = 500_000_000
+    GAINERS_MAX_MCAP: float = 200_000_000  # $200M ceiling
 
     # -------- Top Losers Tracker --------
     LOSERS_TRACKER_ENABLED: bool = False
@@ -512,7 +531,7 @@ class Settings(BaseSettings):
     # pump fast enough to hit PAPER_TP_PCT within PAPER_MAX_DURATION_HOURS, so
     # they consume slots without producing wins. Signals/alerts still fire —
     # this knob only gates the paper-trade entry path.
-    PAPER_MAX_MCAP: float = 500_000_000
+    PAPER_MAX_MCAP: float = 200_000_000  # $200M ceiling (operator trades <=$200M)
     PAPER_MAX_MCAP_RANK: int = 1500  # skip trending coins below rank 1500 (illiquid)
     # Hard cap on concurrent open positions. Prevents restart-bursts and
     # survives env changes to PAPER_MAX_EXPOSURE_USD / PAPER_TRADE_AMOUNT_USD.
