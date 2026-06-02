@@ -723,9 +723,16 @@ DEEP_VOLUME_PAYLOAD = [
         "price_change_percentage_1h_in_currency": 1.0,
         "price_change_percentage_24h": 1.0,
     },
+    {  # null mcap -> skipped + counted (null_mcap_skipped)
+        "id": "no-mcap", "symbol": "nm", "name": "NoMcap",
+        "market_cap": None, "total_volume": 1_000_000, "current_price": 0.5,
+        "price_change_percentage_1h_in_currency": 5.0,
+        "price_change_percentage_24h": 5.0,
+    },
 ]
 
 
+@pytest.mark.asyncio
 async def test_deep_volume_filters_to_band(settings_factory):
     settings = settings_factory()
     with aioresponses() as mocked:
@@ -736,6 +743,7 @@ async def test_deep_volume_filters_to_band(settings_factory):
     assert [r["id"] for r in cg_module.last_raw_deep_volume] == ["good-band"]
 
 
+@pytest.mark.asyncio
 async def test_deep_volume_disabled_returns_empty(settings_factory):
     settings = settings_factory(COINGECKO_DEEP_VOLUME_ENABLED=False)
     with aioresponses() as mocked:
@@ -746,6 +754,7 @@ async def test_deep_volume_disabled_returns_empty(settings_factory):
     assert cg_module.last_raw_deep_volume == []
 
 
+@pytest.mark.asyncio
 async def test_deep_volume_rotation_advances_cursor(settings_factory):
     settings = settings_factory()
     with aioresponses() as mocked:

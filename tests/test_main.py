@@ -94,25 +94,31 @@ async def test_fetch_coingecko_lanes_runs_held_position_first(monkeypatch, mock_
         calls.append("midcap_gainers")
         return []
 
+    async def _deep_volume(session, settings):
+        calls.append("deep_volume")
+        return []
+
     monkeypatch.setattr("scout.main.coingecko_limiter", limiter)
     monkeypatch.setattr("scout.main.fetch_held_position_prices", _held_position)
     monkeypatch.setattr("scout.main.cg_fetch_top_movers", _top_movers)
     monkeypatch.setattr("scout.main.cg_fetch_trending", _trending)
     monkeypatch.setattr("scout.main.cg_fetch_by_volume", _by_volume)
+    monkeypatch.setattr("scout.main.cg_fetch_deep_volume", _deep_volume)
     monkeypatch.setattr("scout.main.cg_fetch_midcap_gainers", _midcap)
 
-    cg_movers, cg_trending, cg_by_volume, cg_midcap, held = (
+    cg_movers, cg_trending, cg_by_volume, cg_midcap, cg_deep, held = (
         await _fetch_coingecko_lanes(AsyncMock(), MagicMock(), mock_db)
     )
 
     # Lane order: held_position must be the first lane invoked.
     assert calls[0] == "held_position_prices"
-    # All five lanes run when no backoff.
+    # All six lanes run when no backoff (deep_volume sits in the freed midcap slot).
     assert calls == [
         "held_position_prices",
         "top_movers",
         "trending",
         "by_volume",
+        "deep_volume",
         "midcap_gainers",
     ]
     # Held result preserved.
@@ -142,11 +148,12 @@ async def test_fetch_coingecko_lanes_stops_scanners_when_held_position_triggers_
     monkeypatch.setattr("scout.main.cg_fetch_top_movers", _unexpected)
     monkeypatch.setattr("scout.main.cg_fetch_trending", _unexpected)
     monkeypatch.setattr("scout.main.cg_fetch_by_volume", _unexpected)
+    monkeypatch.setattr("scout.main.cg_fetch_deep_volume", _unexpected)
     monkeypatch.setattr("scout.main.cg_fetch_midcap_gainers", _unexpected)
 
     result = await _fetch_coingecko_lanes(AsyncMock(), MagicMock(), mock_db)
 
-    assert result == ([], [], [], [], [{"id": "held-1"}])
+    assert result == ([], [], [], [], [], [{"id": "held-1"}])
     assert calls == ["held_position_prices"]
 
 
@@ -180,9 +187,10 @@ async def test_fetch_coingecko_lanes_preserves_held_when_scanner_triggers_backof
     monkeypatch.setattr("scout.main.cg_fetch_top_movers", _top_movers)
     monkeypatch.setattr("scout.main.cg_fetch_trending", _unexpected)
     monkeypatch.setattr("scout.main.cg_fetch_by_volume", _unexpected)
+    monkeypatch.setattr("scout.main.cg_fetch_deep_volume", _unexpected)
     monkeypatch.setattr("scout.main.cg_fetch_midcap_gainers", _unexpected)
 
-    cg_movers, cg_trending, cg_by_volume, cg_midcap, held = (
+    cg_movers, cg_trending, cg_by_volume, cg_midcap, cg_deep, held = (
         await _fetch_coingecko_lanes(AsyncMock(), MagicMock(), mock_db)
     )
 

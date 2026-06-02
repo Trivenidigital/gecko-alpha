@@ -34,11 +34,13 @@ Replace the reactive midcap lane with a PROACTIVE rotating deep-volume page:
   midcap lane (`3 pages / 3 cycles = -1/cycle avg`) -> **net 0/cycle**, and SMOOTHER than a 3-page
   burst (which is what a "pages 4-6 every cycle" or "3 pages every 3rd cycle" design would do —
   rejected on Codex's budget math: pages-4-6-every-cycle is +3/cycle, not neutral).
-- Accepted rows feed BOTH `volume_history_cg` (raw rows -> `_combine_coin_market_rows`
-  (`main.py:815`) -> `record_volume` -> the gainer_acceleration detector + the gainers tracker get
-  pre-pump history) AND **candidates** (the tracker credits pipeline-surface lead via
-  `candidates.first_seen_at`, `tracker.py:215`). Tight filters bound blast radius — every accepted
-  token also reaches scoring/upsert, but CG-listed micro-caps in this band score ~0.
+- Accepted rows feed `volume_history_cg` ONLY (folded into the `record_volume` write -> the
+  gainer_acceleration detector + the gainers tracker's ACCELERATION surface get pre-pump history).
+  They are deliberately EXCLUDED from `_raw_markets_combined` (never reach `store_top_gainers` /
+  `gainers_snapshots` / `trade_gainers`) and from `aggregate` (never reach `candidates` / scoring /
+  `trade_first_signals`) -- this blocks the `gainers_early` + `first_signal` paper paths (Codex code
+  review, Finding 1). The tracker credits gap tokens via the ACCELERATION surface (Increment 1), not
+  the pipeline surface. Tight filters keep the added volume_history_cg rows quality-first.
 - **Disable the midcap lane** (`COINGECKO_MIDCAP_SCAN_ENABLED=False`) — the paired reallocation. Per
   Codex: ship both together so the gap-fill flag can default ON; if midcap is NOT disabled, the new
   flag must default OFF.
@@ -67,12 +69,22 @@ the catch. **Budget guard:** `cg_429_backoff/hour` and `ingestion_s` p95 not wor
 
 ## Risks / rollback
 Page-neutral (no budget increase; smoother burst profile). Reversible per-flag (the paired profile).
-Precision: deeper volume adds lower-quality tokens that reach scoring, but the tight band/volume/
-ratio/change filters + 75/cycle cap bound it, and CG micro-caps score ~0 (no MiroFish/alert/paper).
+Blast radius: the deep lane feeds `volume_history_cg` ONLY -- EXCLUDED from `_raw_markets_combined`
+and `aggregate` -- so the `gainers_early` (`trade_gainers` / `gainers_snapshots`) and `first_signal`
+(`candidates` / scoring) paper paths CANNOT fire on deep rows (Codex Finding 1, fixed). RESIDUAL:
+`detect_spikes` / `trade_volume_spikes` reads `volume_history_cg` (the shared store the acceleration
+detector also needs), so deep rows can marginally widen the volume-spike universe. This is a
+PRE-EXISTING pattern (`fetch_by_volume` already feeds small-caps to `volume_history_cg`, and the spike
+path has no mcap floor) bounded by the spike gates (5x ratio + junk + suppression); the soak's
+paper-trade + budget monitoring observes it. Tight band/volume/ratio/change filters + 75/cycle cap
+keep the added rows quality-first.
 **Honest ceiling:** gaps whose pre-pump volume ranks below ~1500 still need DEX new-pools / social —
 not reachable from CG within budget. The deep lane is observability-first; the budget-regression
 guard in the soak gate is the kill-switch trigger.
 
 ## Codex xhigh review: FOLDED (2026-06-02)
-Rotating-single-page (not pages-4-6-every-cycle) + candidates-feed + the filter set + the n=20 / >=6
-soak gate are all Codex dispositions, accepted. Drift + Hermes-first negative confirmed by Codex.
+Rotating-single-page (not pages-4-6-every-cycle) + the filter set + the n=20 / >=6 soak gate are
+Codex design dispositions, accepted. The Codex CODE review (Finding 1) then moved the lane to
+volume_history_cg-ONLY (no candidates / gainers_snapshots feed) to block the paper paths; Findings 2
+(test_main 6-tuple) + 3 (deep-volume watchdog error plumbing) also folded. Drift + Hermes-first
+negative confirmed.

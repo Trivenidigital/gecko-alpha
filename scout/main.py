@@ -217,6 +217,7 @@ def _ingest_watchdog_samples_from_cycle(
     cg_trending_error: Exception | None,
     cg_by_volume_error: Exception | None,
     cg_midcap_error: Exception | None,
+    cg_deep_volume_error: Exception | None = None,
 ) -> list[IngestSourceSample]:
     samples: list[IngestSourceSample] = []
     if dex_error is not None:
@@ -247,6 +248,7 @@ def _ingest_watchdog_samples_from_cycle(
         ("coingecko:trending", cg_trending_error),
         ("coingecko:volume", cg_by_volume_error),
         ("coingecko:midcap", cg_midcap_error),
+        ("coingecko:deep_volume", cg_deep_volume_error),
     ]
     error_sources = {source for source, exc in cg_errors if exc is not None}
     for source, exc in cg_errors:
@@ -778,6 +780,9 @@ async def run_cycle(
     cg_midcap_error = (
         cg_midcap_gainers if isinstance(cg_midcap_gainers, Exception) else None
     )
+    cg_deep_volume_error = (
+        cg_deep_volume if isinstance(cg_deep_volume, Exception) else None
+    )
     if isinstance(dex_tokens, Exception):
         logger.warning("DexScreener ingestion failed", error=str(dex_tokens))
         dex_tokens = []
@@ -816,6 +821,7 @@ async def run_cycle(
             cg_trending_error=cg_trending_error,
             cg_by_volume_error=cg_by_volume_error,
             cg_midcap_error=cg_midcap_error,
+            cg_deep_volume_error=cg_deep_volume_error,
         ),
         settings,
     )
@@ -848,18 +854,28 @@ async def run_cycle(
 
     # Combine raw market data from movers, hydrated trending, and volume scans.
     # Held-position rows refresh price_cache only; they should not create new signals.
+    # Deep-volume rows are intentionally EXCLUDED here so they do NOT reach
+    # store_top_gainers (gainers_snapshots -> trade_gainers) or the candidate
+    # scoring/paper path (Codex code review 2026-06-02, Finding 1). They are folded
+    # into volume_history_cg ONLY (record_volume below) so the gainer_acceleration
+    # detector + the tracker see them, with no gainers_early / first_signal paper
+    # blast radius.
     _raw_markets_combined = _combine_coin_market_rows(
         _cg_module.last_raw_markets,
         _cg_module.last_raw_trending,
         _cg_module.last_raw_by_volume,
         _cg_module.last_raw_midcap_gainers,
-        _cg_module.last_raw_deep_volume,
     )
 
-    # Volume Spike Detection (zero extra API calls -- uses cached data)
-    if settings.VOLUME_SPIKE_ENABLED and _raw_markets_combined:
+    # Volume Spike Detection (zero extra API calls -- uses cached data).
+    # Deep-volume rows join the volume_history_cg write ONLY (observability for the
+    # gainer_acceleration detector); _combine dedups overlaps with the other lanes.
+    _raw_for_history = _combine_coin_market_rows(
+        _raw_markets_combined, _cg_module.last_raw_deep_volume
+    )
+    if settings.VOLUME_SPIKE_ENABLED and _raw_for_history:
         try:
-            await record_volume(db, _raw_markets_combined)
+            await record_volume(db, _raw_for_history)
             spikes = await detect_spikes(
                 db, settings.VOLUME_SPIKE_RATIO, settings.VOLUME_SPIKE_MAX_MCAP
             )
@@ -1013,7 +1029,6 @@ async def run_cycle(
         + list(cg_trending)
         + list(cg_by_volume)
         + list(cg_midcap_gainers)
-        + list(cg_deep_volume)
     )
     stats["tokens_scanned"] = len(all_candidates)
 
