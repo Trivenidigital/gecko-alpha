@@ -1,5 +1,7 @@
 """Tests for scout.gainers.tracker -- top gainers tracking and comparison."""
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from scout.db import Database
@@ -220,3 +222,137 @@ async def test_get_gainers_stats(db):
     assert stats["caught"] == 1
     assert stats["missed"] == 1
     assert stats["hit_rate_pct"] == 50.0
+
+
+# -- isoformat-T (production format) regression + new-surface crediting --
+#
+# Production stores snapshot_at AND every detector's detected_at via Python
+# datetime.isoformat() ("...T..+00:00"). The lead-time comparison normalizes
+# both sides with datetime(); before that fix a bare `<` silently dropped
+# same-day detections because 'T' (0x54) sorts after ' ' (0x20), so an
+# isoformat-T detected_at compared greater than the space-format datetime()
+# bound. The older datetime('now') (space-format) tests above never hit this.
+
+
+def _iso(hours_ago: float = 0.0) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+
+
+async def _insert_gainer_iso(db, coin_id):
+    await db._conn.execute(
+        """INSERT INTO gainers_snapshots
+           (coin_id, symbol, name, price_change_24h, market_cap, volume_24h,
+            snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            coin_id,
+            coin_id[:4].upper(),
+            coin_id.title(),
+            40.0,
+            50_000_000,
+            1_000_000,
+            _iso(0.0),
+        ),
+    )
+
+
+async def test_compare_credits_same_day_isoformat_spike(db):
+    """Regression: a same-day spike in isoformat-T (prod format) detected 2h
+    before the gainer must be credited (timestamp-normalization fix)."""
+    await _insert_gainer_iso(db, "isofmt-coin")
+    await db._conn.execute(
+        """INSERT INTO volume_spikes
+           (coin_id, symbol, name, current_volume, avg_volume_7d,
+            spike_ratio, market_cap, price, price_change_24h, detected_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("isofmt-coin", "ISOF", "Isofmt", 2e6, 2e5, 10.0, 5e7, 1.0, 30.0, _iso(2.0)),
+    )
+    await db._conn.commit()
+
+    comps = await compare_gainers_with_signals(db)
+    assert len(comps) == 1
+    assert comps[0]["detected_by_spikes"] == 1
+    assert comps[0]["spikes_lead_minutes"] == pytest.approx(120.0, abs=1.0)
+    assert comps[0]["is_gap"] == 0
+
+
+async def test_compare_credits_acceleration_surface(db):
+    await _insert_gainer_iso(db, "accel-g")
+    await db._conn.execute(
+        """INSERT INTO gainer_acceleration
+           (coin_id, symbol, name, change_1h, change_4h, vol_expansion,
+            market_cap, current_price, detected_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("accel-g", "ACCG", "Accel", 10.0, 20.0, 3.0, 5e7, 1.1, _iso(1.0)),
+    )
+    await db._conn.commit()
+
+    comps = await compare_gainers_with_signals(db)
+    assert comps[0]["detected_by_acceleration"] == 1
+    assert comps[0]["acceleration_lead_minutes"] == pytest.approx(60.0, abs=1.0)
+    assert comps[0]["is_gap"] == 0
+
+
+async def test_compare_credits_momentum_surface(db):
+    await _insert_gainer_iso(db, "mom-g")
+    await db._conn.execute(
+        """INSERT INTO momentum_7d
+           (coin_id, symbol, name, price_change_7d, price_change_24h,
+            market_cap, current_price, volume_24h, detected_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("mom-g", "MOMG", "Mom", 50.0, 40.0, 5e7, 1.1, 1e6, _iso(3.0)),
+    )
+    await db._conn.commit()
+
+    comps = await compare_gainers_with_signals(db)
+    assert comps[0]["detected_by_momentum"] == 1
+    assert comps[0]["is_gap"] == 0
+
+
+async def test_compare_credits_slow_burn_surface(db):
+    await _insert_gainer_iso(db, "sb-g")
+    await db._conn.execute(
+        """INSERT INTO slow_burn_candidates
+           (coin_id, symbol, name, price_change_7d, price_change_1h,
+            price_change_24h, market_cap, current_price, volume_24h,
+            also_in_momentum_7d, detected_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("sb-g", "SBG", "Slow", 45.0, 2.0, 30.0, 5e7, 1.1, 1e6, 0, _iso(4.0)),
+    )
+    await db._conn.commit()
+
+    comps = await compare_gainers_with_signals(db)
+    assert comps[0]["detected_by_slow_burn"] == 1
+    assert comps[0]["is_gap"] == 0
+
+
+async def test_compare_credits_velocity_surface(db):
+    await _insert_gainer_iso(db, "vel-g")
+    await db._conn.execute(
+        """INSERT INTO velocity_alerts
+           (coin_id, symbol, name, price_change_1h, price_change_24h,
+            market_cap, volume_24h, vol_mcap_ratio, current_price, detected_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("vel-g", "VELG", "Vel", 25.0, 40.0, 5e7, 1e6, 0.5, 1.1, _iso(0.5)),
+    )
+    await db._conn.commit()
+
+    comps = await compare_gainers_with_signals(db)
+    assert comps[0]["detected_by_velocity"] == 1
+    assert comps[0]["is_gap"] == 0
+
+
+async def test_stats_union_includes_new_surfaces(db):
+    """Average lead must include the new surfaces' lead columns."""
+    await db._conn.execute(
+        """INSERT INTO gainers_comparisons
+           (coin_id, symbol, name, price_change_24h, appeared_on_gainers_at,
+            detected_by_acceleration, acceleration_lead_minutes, is_gap)
+           VALUES (?, ?, ?, ?, datetime('now'), 1, 90.0, 0)""",
+        ("accel-only", "AONL", "AccelOnly", 35.0),
+    )
+    await db._conn.commit()
+
+    stats = await get_gainers_stats(db)
+    assert stats["caught"] == 1
+    assert stats["avg_lead_minutes"] == pytest.approx(90.0, abs=0.1)
