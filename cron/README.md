@@ -44,7 +44,7 @@ The managed block is bracketed by:
 
 ## What's in scope
 
-Currently 6 entries:
+Currently 7 entries:
 - `30 3 * * 0` — `scripts/tg_burst_archive.sh` (Sunday 03:30 UTC)
 - `45 3 * * 0` — `scripts/wal_archive.sh` (Sunday 03:45 UTC)
 - `*/5 * * * *` — `scripts/source-calls-live-writer.sh` (every 5 min)
@@ -55,6 +55,9 @@ Currently 6 entries:
 - `20 9 * * *` — `scripts/audit_stop_loss_false_negatives.sh --alert`
   (daily stop-loss false-negative gate; logs every run and sends Telegram only
   when status leaves `WAIT_MORE_MATURE_DATA`)
+- `*/15 * * * *` — `scripts/acceleration-heartbeat-watchdog.sh`
+  (gainer-acceleration detector execution-heartbeat; alerts if
+  `acceleration_scan_complete` is absent from the journal > 60 min)
 
 Future high-cadence triggers should prefer `systemd/*.timer` (cycle 10 canon) over cron. The managed entries above stay as cron for simplicity (see BL-NEW-CRON-TO-SYSTEMD-TIMER decision-by 2026-06-14).
 
@@ -189,28 +192,20 @@ acceleration rows can be healthy (no token qualified this window), so it does NO
 check row-rate; it greps the journal for the `acceleration_scan_complete` line
 the detector emits every cycle it runs and alerts only when that heartbeat is
 stale (default 60 min). Inert when `ACCELERATION_ENABLED` is falsey. **Status:
-SCRIPT-SHIPPED / SCHEDULING-PENDING-OPERATOR** — Telegram-alerting watchdogs are
-opt-in here (like `revival-verdict` / `cron-drift`) so the operator controls
-alert volume. Until scheduled, a detector crash surfaces only via the
-`gainer_acceleration_error` journal line — acceptable because the detector is
-research-only (no alert, no paper-trade, no money path).
+SCHEDULED in the managed block** (`*/15`, alongside `source-calls-lag-watchdog`).
+The detector ships active (`ACCELERATION_ENABLED=True`), so per §12a its freshness
+watchdog ships active too — it is in `gecko-alpha.crontab` and goes live on the
+next `cron/deploy.sh`. (Codex + the silent-failure review both flagged shipping
+the writer active without an active watchdog; auto-scheduling resolves it. The
+opt-in convention applies to operator-judgment *verdict* watchdogs like
+`revival-verdict` / `cron-drift`, not pipeline-freshness monitors.)
 
-### Smoke test (no scheduling)
+### Smoke test
 
 ```bash
 ssh root@srilu-vps
 cd /root/gecko-alpha && git pull
 bash scripts/acceleration-heartbeat-watchdog.sh   # exit 0 if heartbeat fresh
-```
-
-### Setup (one-time, opt-in to scheduled firing)
-
-```bash
-echo "*/15 * * * * /root/gecko-alpha/scripts/acceleration-heartbeat-watchdog.sh >> /var/log/gecko-alpha-acceleration-heartbeat-watchdog.log 2>&1" \
-    >> cron/gecko-alpha.crontab
-# commit + push, then:
-bash cron/deploy.sh
-crontab -l | grep acceleration-heartbeat
 ```
 
 Cadence 15 min << the 60-min staleness threshold. The `>> … 2>&1` redirect is
