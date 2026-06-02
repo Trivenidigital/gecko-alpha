@@ -12,9 +12,11 @@ from scout.ingestion.coingecko import (
     fetch_trending,
     fetch_by_volume,
     fetch_midcap_gainers,
+    fetch_deep_volume,
     get_last_watchdog_samples,
     _get_with_backoff,
     _reset_midcap_scan_cycle_counter_for_tests,
+    _reset_deep_volume_cursor_for_tests,
 )
 from scout.ratelimit import coingecko_limiter
 
@@ -66,9 +68,11 @@ async def _clear_rate_limit():
     """Clear shared rate limiter state between tests."""
     await coingecko_limiter.reset()
     _reset_midcap_scan_cycle_counter_for_tests()
+    _reset_deep_volume_cursor_for_tests()
     yield
     await coingecko_limiter.reset()
     _reset_midcap_scan_cycle_counter_for_tests()
+    _reset_deep_volume_cursor_for_tests()
 
 
 # -- Tests --
@@ -678,3 +682,87 @@ async def test_fetch_trending_outage_returns_empty(settings_factory):
             tokens = await fetch_trending(session, settings)
 
     assert tokens == []
+
+
+# -- Deep-volume rotating page (gap-fill Increment 2) --
+
+DEEP_VOLUME_PAYLOAD = [
+    {  # in $500K-$10M band, vol>=100K, vol/mcap>=0.03, 24h>=3% -> ACCEPTED
+        "id": "good-band", "symbol": "gb", "name": "GoodBand",
+        "market_cap": 5_000_000, "total_volume": 1_000_000, "current_price": 0.5,
+        "price_change_percentage_1h_in_currency": 6.0,
+        "price_change_percentage_24h": 5.0,
+    },
+    {  # mcap > $10M target ceiling -> rejected
+        "id": "too-big", "symbol": "tb", "name": "TooBig",
+        "market_cap": 50_000_000, "total_volume": 5_000_000, "current_price": 2.0,
+        "price_change_percentage_1h_in_currency": 4.0,
+        "price_change_percentage_24h": 6.0,
+    },
+    {  # mcap < $500K -> rejected
+        "id": "too-small", "symbol": "ts", "name": "TooSmall",
+        "market_cap": 200_000, "total_volume": 300_000, "current_price": 0.1,
+        "price_change_percentage_1h_in_currency": 10.0,
+        "price_change_percentage_24h": 8.0,
+    },
+    {  # volume < $100K -> rejected
+        "id": "low-vol", "symbol": "lv", "name": "LowVol",
+        "market_cap": 5_000_000, "total_volume": 50_000, "current_price": 0.5,
+        "price_change_percentage_1h_in_currency": 4.0,
+        "price_change_percentage_24h": 5.0,
+    },
+    {  # vol/mcap = 0.024 < 0.03 -> rejected
+        "id": "low-ratio", "symbol": "lr", "name": "LowRatio",
+        "market_cap": 5_000_000, "total_volume": 120_000, "current_price": 0.5,
+        "price_change_percentage_1h_in_currency": 4.0,
+        "price_change_percentage_24h": 5.0,
+    },
+    {  # 24h change < 3% -> rejected
+        "id": "low-change", "symbol": "lc", "name": "LowChange",
+        "market_cap": 5_000_000, "total_volume": 1_000_000, "current_price": 0.5,
+        "price_change_percentage_1h_in_currency": 1.0,
+        "price_change_percentage_24h": 1.0,
+    },
+    {  # null mcap -> skipped + counted (null_mcap_skipped)
+        "id": "no-mcap", "symbol": "nm", "name": "NoMcap",
+        "market_cap": None, "total_volume": 1_000_000, "current_price": 0.5,
+        "price_change_percentage_1h_in_currency": 5.0,
+        "price_change_percentage_24h": 5.0,
+    },
+]
+
+
+@pytest.mark.asyncio
+async def test_deep_volume_filters_to_band(settings_factory):
+    settings = settings_factory()
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, payload=DEEP_VOLUME_PAYLOAD)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_deep_volume(session, settings)
+    assert len(tokens) == 1
+    assert [r["id"] for r in cg_module.last_raw_deep_volume] == ["good-band"]
+
+
+@pytest.mark.asyncio
+async def test_deep_volume_disabled_returns_empty(settings_factory):
+    settings = settings_factory(COINGECKO_DEEP_VOLUME_ENABLED=False)
+    with aioresponses() as mocked:
+        mocked.get(MARKETS_PATTERN, payload=DEEP_VOLUME_PAYLOAD)
+        async with aiohttp.ClientSession() as session:
+            tokens = await fetch_deep_volume(session, settings)
+    assert tokens == []
+    assert cg_module.last_raw_deep_volume == []
+
+
+@pytest.mark.asyncio
+async def test_deep_volume_rotation_advances_cursor(settings_factory):
+    settings = settings_factory()
+    with aioresponses() as mocked:
+        for _ in range(3):
+            mocked.get(MARKETS_PATTERN, payload=DEEP_VOLUME_PAYLOAD)
+        async with aiohttp.ClientSession() as session:
+            await fetch_deep_volume(session, settings)
+            await fetch_deep_volume(session, settings)
+            await fetch_deep_volume(session, settings)
+    # cursor advances every call (pages rotate 4 -> 5 -> 6)
+    assert cg_module._deep_volume_page_cursor == 3

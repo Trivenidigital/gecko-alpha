@@ -103,7 +103,12 @@ class Settings(BaseSettings):
     # BL-NEW-COINGECKO-MIDCAP-GAINER-SCAN: rank-band scan for CoinGecko
     # gainers that are not top-volume and not trending. Cadence and output cap
     # keep this quality-first under the free-tier limiter.
-    COINGECKO_MIDCAP_SCAN_ENABLED: bool = True
+    # Reallocated 2026-06-02 (Increment 2): disabled in favor of the proactive
+    # rotating deep-volume page below. Budget-NEUTRAL (deep page +1/cycle; midcap
+    # was 3 pages / 3 cycles = -1/cycle avg) and smoother. Midcap is reactive
+    # (24h>=25%) + starts at $10M, so it cannot cover the $500K-$10M residual gap.
+    # Revert: re-enable this + set COINGECKO_DEEP_VOLUME_ENABLED=False.
+    COINGECKO_MIDCAP_SCAN_ENABLED: bool = False
     COINGECKO_MIDCAP_SCAN_INTERVAL_CYCLES: int = 3
     COINGECKO_MIDCAP_SCAN_START_PAGE: int = 2
     COINGECKO_MIDCAP_SCAN_PAGES: int = 3
@@ -114,6 +119,26 @@ class Settings(BaseSettings):
     COINGECKO_MIDCAP_SCAN_MIN_MCAP: float = 10_000_000.0
     COINGECKO_MIDCAP_SCAN_MAX_MCAP: float = 200_000_000.0  # $200M ceiling
     COINGECKO_MIDCAP_SCAN_MAX_TOKENS_PER_CYCLE: int = 20
+
+    # -------- Deep-volume rotating page (gap-fill Increment 2, 2026-06-02) --------
+    # ONE extra volume_desc page per cycle, rotating START..END (4->5->6), funded
+    # by disabling the midcap lane above (page-neutral, smoother than a 3-page
+    # burst). Targets the $500K-$10M coverage hole: tokens about to pump show
+    # rising VOLUME first, so they climb into volume ranks ~750-1500 BEFORE the
+    # +20%/24h move -> gives the gainer_acceleration detector + the gainers tracker
+    # pre-pump volume_history_cg. Tight filters bound blast radius (every accepted
+    # token also reaches scoring/candidates; CG-listed micro-caps score ~0).
+    # Thresholds per the Codex xhigh review 2026-06-02.
+    COINGECKO_DEEP_VOLUME_ENABLED: bool = True
+    COINGECKO_DEEP_VOLUME_START_PAGE: int = 4
+    COINGECKO_DEEP_VOLUME_END_PAGE: int = 6
+    COINGECKO_DEEP_VOLUME_MIN_MCAP: float = 500_000.0
+    # gap-fill target ceiling $10M; configurable up to the $200M hard universe cap.
+    COINGECKO_DEEP_VOLUME_MAX_MCAP: float = 10_000_000.0
+    COINGECKO_DEEP_VOLUME_MIN_VOLUME: float = 100_000.0
+    COINGECKO_DEEP_VOLUME_MIN_VOL_MCAP_RATIO: float = 0.03
+    COINGECKO_DEEP_VOLUME_MIN_24H_CHANGE: float = 3.0
+    COINGECKO_DEEP_VOLUME_MAX_TOKENS_PER_CYCLE: int = 75
 
     # Held-position price-refresh lane (§12c-narrow remediation).
     # See tasks/plan_held_position_price_freshness.md and
