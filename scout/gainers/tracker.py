@@ -95,6 +95,48 @@ async def store_top_gainers(
     return count
 
 
+# CG-slug-keyed surfaces that all share the same (coin_id, detected_at) shape:
+# the gap-fill acceleration detector plus the markets-watcher detectors whose
+# detections the tracker previously did not credit. Table names are fixed
+# constants (never user input), so the f-string is injection-safe.
+_COIN_ID_SURFACES = (
+    ("acceleration", "gainer_acceleration"),
+    ("momentum", "momentum_7d"),
+    ("slow_burn", "slow_burn_candidates"),
+    ("velocity", "velocity_alerts"),
+)
+
+
+async def _coin_id_surface_lead(
+    db: "Database",
+    table: str,
+    coin_id: str,
+    first_gainer_at,
+    first_gainer_at_str: str,
+) -> "float | None":
+    """Earliest detection lead (minutes) for a coin_id-keyed surface, or None.
+
+    Mirrors the tolerance + clamp of the inline surface checks: a detection
+    strictly before ``first_gainer_at + 5min`` counts; leads inside the
+    tolerance window (detected just after) clamp to 0.
+    """
+    # Both sides wrapped in datetime() so the comparison is on normalized
+    # space-format timestamps: detectors write detected_at via Python
+    # isoformat() (`...T..+00:00`), and a bare `<` against datetime()'s
+    # space-format output would mis-compare on the 'T' (0x54 > 0x20 space).
+    cursor = await db._conn.execute(
+        f"SELECT MIN(detected_at) FROM {table} "
+        f"WHERE coin_id = ? AND datetime(detected_at) < datetime(?, '+5 minutes')",
+        (coin_id, first_gainer_at_str),
+    )
+    row = await cursor.fetchone()
+    if row and row[0]:
+        detected_at = _parse_dt(row[0])
+        lead = (first_gainer_at - detected_at).total_seconds() / 60.0
+        return max(lead, 0.0)
+    return None
+
+
 async def compare_gainers_with_signals(db: "Database") -> list[dict]:
     """For each top gainer in last 24h, check if our system detected it earlier.
 
@@ -142,6 +184,14 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
             "chains_lead_minutes": None,
             "detected_by_spikes": 0,
             "spikes_lead_minutes": None,
+            "detected_by_acceleration": 0,
+            "acceleration_lead_minutes": None,
+            "detected_by_momentum": 0,
+            "momentum_lead_minutes": None,
+            "detected_by_slow_burn": 0,
+            "slow_burn_lead_minutes": None,
+            "detected_by_velocity": 0,
+            "velocity_lead_minutes": None,
             "is_gap": 1,
         }
 
@@ -149,7 +199,7 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
         cursor = await db._conn.execute(
             """SELECT MIN(predicted_at) FROM predictions
                WHERE (coin_id = ? OR LOWER(symbol) = LOWER(?))
-                 AND predicted_at < datetime(?, '+5 minutes')""",
+                 AND datetime(predicted_at) < datetime(?, '+5 minutes')""",
             (coin_id, symbol, first_gainer_at_str),
         )
         pred_row = await cursor.fetchone()
@@ -166,7 +216,7 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
         cursor = await db._conn.execute(
             """SELECT MIN(first_seen_at) FROM candidates
                WHERE (contract_address = ? OR LOWER(ticker) = LOWER(?))
-                 AND first_seen_at < datetime(?, '+5 minutes')""",
+                 AND datetime(first_seen_at) < datetime(?, '+5 minutes')""",
             (coin_id, symbol, first_gainer_at_str),
         )
         cand_row = await cursor.fetchone()
@@ -187,14 +237,14 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
                    WHERE (token_id = ? OR LOWER(token_id) = LOWER(?)
                           OR LOWER(token_id) LIKE LOWER(? || '%')
                           OR LOWER(?) LIKE LOWER(token_id || '%'))
-                     AND created_at < datetime(?, '+5 minutes')""",
+                     AND datetime(created_at) < datetime(?, '+5 minutes')""",
                 (coin_id, symbol, symbol, coin_id, first_gainer_at_str),
             )
         else:
             cursor = await db._conn.execute(
                 """SELECT MIN(created_at) FROM signal_events
                    WHERE (token_id = ? OR LOWER(token_id) = LOWER(?))
-                     AND created_at < datetime(?, '+5 minutes')""",
+                     AND datetime(created_at) < datetime(?, '+5 minutes')""",
                 (coin_id, symbol, first_gainer_at_str),
             )
         sig_row = await cursor.fetchone()
@@ -210,7 +260,7 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
         # Check volume_spikes table
         cursor = await db._conn.execute(
             """SELECT MIN(detected_at) FROM volume_spikes
-               WHERE coin_id = ? AND detected_at < datetime(?, '+5 minutes')""",
+               WHERE coin_id = ? AND datetime(detected_at) < datetime(?, '+5 minutes')""",
             (coin_id, first_gainer_at_str),
         )
         spike_row = await cursor.fetchone()
@@ -222,6 +272,18 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
             comp["detected_by_spikes"] = 1
             comp["spikes_lead_minutes"] = round(lead, 1)
             comp["is_gap"] = 0
+
+        # Net-new CG-slug-keyed surfaces: gap-fill acceleration + the
+        # markets-watcher detectors (momentum_7d / slow_burn / velocity) whose
+        # early detections the tracker previously did not credit.
+        for surface, table in _COIN_ID_SURFACES:
+            lead = await _coin_id_surface_lead(
+                db, table, coin_id, first_gainer_at, first_gainer_at_str
+            )
+            if lead is not None:
+                comp[f"detected_by_{surface}"] = 1
+                comp[f"{surface}_lead_minutes"] = round(lead, 1)
+                comp["is_gap"] = 0
 
         comparisons.append(comp)
 
@@ -262,8 +324,13 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
                 detected_by_pipeline, pipeline_lead_minutes,
                 detected_by_chains, chains_lead_minutes,
                 detected_by_spikes, spikes_lead_minutes,
+                detected_by_acceleration, acceleration_lead_minutes,
+                detected_by_momentum, momentum_lead_minutes,
+                detected_by_slow_burn, slow_burn_lead_minutes,
+                detected_by_velocity, velocity_lead_minutes,
                 is_gap, detected_price, peak_price, peak_gain_pct)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?)""",
             (
                 comp["coin_id"],
                 comp["symbol"],
@@ -278,6 +345,14 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
                 comp["chains_lead_minutes"],
                 comp["detected_by_spikes"],
                 comp["spikes_lead_minutes"],
+                comp["detected_by_acceleration"],
+                comp["acceleration_lead_minutes"],
+                comp["detected_by_momentum"],
+                comp["momentum_lead_minutes"],
+                comp["detected_by_slow_burn"],
+                comp["slow_burn_lead_minutes"],
+                comp["detected_by_velocity"],
+                comp["velocity_lead_minutes"],
                 comp["is_gap"],
                 comp["detected_price"],
                 comp["peak_price"],
@@ -325,6 +400,10 @@ async def get_gainers_comparisons(db: "Database", limit: int = 50) -> list[dict]
                   detected_by_pipeline, pipeline_lead_minutes,
                   detected_by_chains, chains_lead_minutes,
                   detected_by_spikes, spikes_lead_minutes,
+                  detected_by_acceleration, acceleration_lead_minutes,
+                  detected_by_momentum, momentum_lead_minutes,
+                  detected_by_slow_burn, slow_burn_lead_minutes,
+                  detected_by_velocity, velocity_lead_minutes,
                   is_gap, detected_price, peak_price, peak_gain_pct, created_at
            FROM gainers_comparisons
            ORDER BY appeared_on_gainers_at DESC
@@ -363,6 +442,19 @@ async def get_gainers_stats(db: "Database") -> dict:
              UNION ALL
              SELECT spikes_lead_minutes FROM gainers_comparisons
                WHERE detected_by_spikes = 1 AND spikes_lead_minutes IS NOT NULL
+             UNION ALL
+             SELECT acceleration_lead_minutes FROM gainers_comparisons
+               WHERE detected_by_acceleration = 1
+                 AND acceleration_lead_minutes IS NOT NULL
+             UNION ALL
+             SELECT momentum_lead_minutes FROM gainers_comparisons
+               WHERE detected_by_momentum = 1 AND momentum_lead_minutes IS NOT NULL
+             UNION ALL
+             SELECT slow_burn_lead_minutes FROM gainers_comparisons
+               WHERE detected_by_slow_burn = 1 AND slow_burn_lead_minutes IS NOT NULL
+             UNION ALL
+             SELECT velocity_lead_minutes FROM gainers_comparisons
+               WHERE detected_by_velocity = 1 AND velocity_lead_minutes IS NOT NULL
            )""")
     lead_row = await cursor.fetchone()
     avg_lead = round(lead_row[0], 1) if lead_row and lead_row[0] is not None else None

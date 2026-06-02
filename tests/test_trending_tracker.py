@@ -259,6 +259,65 @@ async def test_compare_detects_chain_signal(db):
 
 
 @pytest.mark.asyncio
+async def test_compare_credits_same_day_isoformat_pipeline(db):
+    """Regression (_check_detector helper, line ~63): production stores
+    candidates.first_seen_at + trending snapshot_at via isoformat() ('..T..').
+    A bare `<` against datetime()'s space-format dropped same-day detections
+    ('T' 0x54 > ' ' 0x20). The space-format _sqlite_ts() tests above never hit
+    this path; this one does."""
+    now = datetime.now(timezone.utc)
+    earlier = now - timedelta(hours=2)
+    await db._conn.execute(
+        """INSERT INTO candidates (contract_address, chain, token_name, ticker, first_seen_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        ("coin-isop", "solana", "Coin IsoP", "CISOP", earlier.isoformat()),
+    )
+    await db._conn.execute(
+        "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
+        ("coin-isop", "CISOP", "Coin IsoP", now.isoformat()),
+    )
+    await db._conn.commit()
+
+    comps = await compare_with_signals(db)
+    assert len(comps) == 1
+    assert comps[0].detected_by_pipeline is True
+    assert comps[0].pipeline_lead_minutes == pytest.approx(120.0, abs=1.0)
+    assert comps[0].is_gap is False
+
+
+@pytest.mark.asyncio
+async def test_compare_credits_same_day_isoformat_chain_signal(db):
+    """Regression (inline signal_events branch, line ~266): same-day chain
+    signal in isoformat-T must be credited (symbol >= 4 chars -> LIKE branch)."""
+    now = datetime.now(timezone.utc)
+    earlier = now - timedelta(hours=2)
+    await db._conn.execute(
+        """INSERT INTO signal_events
+           (token_id, pipeline, event_type, event_data, source_module, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            "coin-isoc",
+            "memecoin",
+            "candidate_scored",
+            '{"quant_score": 75}',
+            "scorer",
+            earlier.isoformat(),
+        ),
+    )
+    await db._conn.execute(
+        "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
+        ("coin-isoc", "CISO", "Coin IsoC", now.isoformat()),
+    )
+    await db._conn.commit()
+
+    comps = await compare_with_signals(db)
+    assert len(comps) == 1
+    assert comps[0].detected_by_chains is True
+    assert comps[0].chains_lead_minutes == pytest.approx(120.0, abs=1.0)
+    assert comps[0].is_gap is False
+
+
+@pytest.mark.asyncio
 async def test_compare_multiple_detections(db):
     """A token detected by both pipeline and chains."""
     now = datetime.now(timezone.utc)

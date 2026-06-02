@@ -141,6 +141,9 @@ class Database:
         await self._migrate_gainers_comparisons_appeared_idx_v1()
         await self._migrate_trade_decision_events_v1()
         await self._migrate_predictions_coin_predicted_id_idx_v1()
+        # Gap-fill 2026-06-02: gainer_acceleration table + gainers_comparisons
+        # surface columns (acceleration/momentum/slow_burn/velocity).
+        await self._migrate_gainer_acceleration_v1()
         # BL-NEW-TODAYS-FOCUS-LIQUIDITY-VENUE-FACTS Phase 1a-i (2026-05-29):
         # 4 nullable enrichment columns on `candidates` + paper_migrations
         # marker. Read-only writer (cron) populates later in Phase 1a-ii.
@@ -885,6 +888,8 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_vol_hist_cg
                 ON volume_history_cg(coin_id, recorded_at);
+            CREATE INDEX IF NOT EXISTS idx_vol_hist_cg_recorded
+                ON volume_history_cg(recorded_at);
 
             CREATE TABLE IF NOT EXISTS volume_spikes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -949,6 +954,14 @@ class Database:
                 chains_lead_minutes REAL,
                 detected_by_spikes INTEGER DEFAULT 0,
                 spikes_lead_minutes REAL,
+                detected_by_acceleration INTEGER DEFAULT 0,
+                acceleration_lead_minutes REAL,
+                detected_by_momentum INTEGER DEFAULT 0,
+                momentum_lead_minutes REAL,
+                detected_by_slow_burn INTEGER DEFAULT 0,
+                slow_burn_lead_minutes REAL,
+                detected_by_velocity INTEGER DEFAULT 0,
+                velocity_lead_minutes REAL,
                 is_gap INTEGER DEFAULT 1,
                 detected_price REAL,
                 peak_price REAL,
@@ -957,6 +970,24 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_gainers_comp
                 ON gainers_comparisons(coin_id);
+
+            CREATE TABLE IF NOT EXISTS gainer_acceleration (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                change_1h REAL,
+                change_4h REAL,
+                vol_expansion REAL,
+                market_cap REAL,
+                current_price REAL,
+                detected_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_gainer_accel
+                ON gainer_acceleration(coin_id, detected_at);
+            CREATE INDEX IF NOT EXISTS idx_gainer_accel_detected
+                ON gainer_acceleration(detected_at);
 
             CREATE TABLE IF NOT EXISTS losers_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5105,6 +5136,61 @@ class Database:
             index_name="idx_gainers_comp_appeared_at",
             migration_name="gainers_comp_appeared_at_idx_v1",
         )
+
+    async def _migrate_gainer_acceleration_v1(self) -> None:
+        """Gap-fill 2026-06-02: create gainer_acceleration + add the
+        acceleration/momentum/slow_burn/velocity surface columns to
+        gainers_comparisons. Idempotent: CREATE TABLE IF NOT EXISTS in
+        _create_tables is a no-op for the pre-existing prod gainers_comparisons,
+        so the new columns need PRAGMA-guarded ALTERs here. Additive only."""
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        await conn.execute("""CREATE TABLE IF NOT EXISTS gainer_acceleration (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                change_1h REAL,
+                change_4h REAL,
+                vol_expansion REAL,
+                market_cap REAL,
+                current_price REAL,
+                detected_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )""")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gainer_accel "
+            "ON gainer_acceleration(coin_id, detected_at)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gainer_accel_detected "
+            "ON gainer_acceleration(detected_at)"
+        )
+        cur = await conn.execute("PRAGMA table_info(gainers_comparisons)")
+        existing = {row[1] for row in await cur.fetchall()}
+        new_cols = [
+            ("detected_by_acceleration", "INTEGER DEFAULT 0"),
+            ("acceleration_lead_minutes", "REAL"),
+            ("detected_by_momentum", "INTEGER DEFAULT 0"),
+            ("momentum_lead_minutes", "REAL"),
+            ("detected_by_slow_burn", "INTEGER DEFAULT 0"),
+            ("slow_burn_lead_minutes", "REAL"),
+            ("detected_by_velocity", "INTEGER DEFAULT 0"),
+            ("velocity_lead_minutes", "REAL"),
+        ]
+        added: list[str] = []
+        for name, decl in new_cols:
+            if name not in existing:
+                await conn.execute(
+                    f"ALTER TABLE gainers_comparisons ADD COLUMN {name} {decl}"
+                )
+                added.append(name)
+        await conn.commit()
+        _log.info("gainer_acceleration_migration_complete", columns_added=added)
 
     # --- cohort_digest state helpers (D5 fold) -------------------------------
 
