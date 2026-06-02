@@ -57,10 +57,14 @@ async def _check_detector(
         }
         timestamp_col = defaults.get(table_name, "detected_at")
 
+    # datetime() both sides: detectors write isoformat-T timestamps and
+    # datetime(?, ...) returns space-format, so a bare `<` mis-compares on the
+    # 'T' (0x54 > 0x20 space) and silently drops same-day detections. Same fix
+    # as scout/gainers/tracker.py.
     query = (
         f"SELECT MIN({timestamp_col}) FROM {table_name} "
         f"WHERE ({id_col} = ? OR LOWER({symbol_col}) = LOWER(?)) "
-        f"AND {timestamp_col} < datetime(?, '+5 minutes')"
+        f"AND datetime({timestamp_col}) < datetime(?, '+5 minutes')"
     )
     cursor = await db._conn.execute(query, (coin_id, symbol, first_trending_at))
     row = await cursor.fetchone()
@@ -263,7 +267,7 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
                    WHERE (token_id = ? OR LOWER(token_id) = LOWER(?)
                           OR LOWER(token_id) LIKE LOWER(? || '%')
                           OR LOWER(?) LIKE LOWER(token_id || '%'))
-                     AND created_at < datetime(?, '+5 minutes')""",
+                     AND datetime(created_at) < datetime(?, '+5 minutes')""",
                 (coin_id, symbol, symbol, coin_id, first_trending_at_str),
             )
             sig_row = await cursor.fetchone()

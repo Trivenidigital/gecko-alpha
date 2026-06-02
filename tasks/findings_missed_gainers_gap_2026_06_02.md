@@ -131,7 +131,11 @@ is still ~11, and its real value is **forward** early-warning, not backfill reco
 Wrap both sides of all four existing surface checks (and the new helper) with `datetime()` so the
 comparison is on normalized space-format timestamps. Empirically re-verified: the existing spikes
 check now credits a same-day isoformat-T detection (`detected_by_spikes=1`, lead 60min). Regression
-test `test_compare_credits_same_day_isoformat_spike` pins it.
+test `test_compare_credits_same_day_isoformat_spike` pins it. The full decomposition is
+reproducible from the repo via `scripts/audit_missed_gainers.py --db scout.db` (validated on srilu:
+`recoverable_existing=31, recoverable_all=45, residual=32, caught 575→620, 88.2%→95.1%`). Review
+also found the **same bug in `scout/trending/tracker.py`** (live, `TRENDING_SNAPSHOT_ENABLED=True`) —
+fixed in the same PR with two isoformat-T regression tests.
 
 ### Prod metric shift (operator-visible on next deploy + recompute)
 caught **575 → ~620** (recovers 31 false gaps + ~14 new-surface), gaps **77 → ~32**, hit-rate

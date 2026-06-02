@@ -181,6 +181,60 @@ bash cron/deploy.sh
 | 6 | `python3` not available (JSON encoding) |
 | 7 | Telegram HTTP delivery failed |
 
+## Acceleration heartbeat watchdog (gap-fill 2026-06-02)
+
+`scripts/acceleration-heartbeat-watchdog.sh` is an EXECUTION-heartbeat watchdog
+for the gainer-acceleration detector (`scout/gainers/acceleration.py`). Zero
+acceleration rows can be healthy (no token qualified this window), so it does NOT
+check row-rate; it greps the journal for the `acceleration_scan_complete` line
+the detector emits every cycle it runs and alerts only when that heartbeat is
+stale (default 60 min). Inert when `ACCELERATION_ENABLED` is falsey. **Status:
+SCRIPT-SHIPPED / SCHEDULING-PENDING-OPERATOR** — Telegram-alerting watchdogs are
+opt-in here (like `revival-verdict` / `cron-drift`) so the operator controls
+alert volume. Until scheduled, a detector crash surfaces only via the
+`gainer_acceleration_error` journal line — acceptable because the detector is
+research-only (no alert, no paper-trade, no money path).
+
+### Smoke test (no scheduling)
+
+```bash
+ssh root@srilu-vps
+cd /root/gecko-alpha && git pull
+bash scripts/acceleration-heartbeat-watchdog.sh   # exit 0 if heartbeat fresh
+```
+
+### Setup (one-time, opt-in to scheduled firing)
+
+```bash
+echo "*/15 * * * * /root/gecko-alpha/scripts/acceleration-heartbeat-watchdog.sh >> /var/log/gecko-alpha-acceleration-heartbeat-watchdog.log 2>&1" \
+    >> cron/gecko-alpha.crontab
+# commit + push, then:
+bash cron/deploy.sh
+crontab -l | grep acceleration-heartbeat
+```
+
+Cadence 15 min << the 60-min staleness threshold. The `>> … 2>&1` redirect is
+required by `tests/test_cron_stderr_redirection.py` for managed-block lines.
+
+### Disable / revert
+
+```bash
+crontab -l | grep -v acceleration-heartbeat-watchdog | crontab -
+# clean revert:
+sed -i '/acceleration-heartbeat-watchdog/d' cron/gecko-alpha.crontab && bash cron/deploy.sh
+```
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Heartbeat seen in window, OR detector disabled |
+| 1 | Stale → Telegram alert delivered (HTTP 200) |
+| 2 | Stale, `.env` missing (alert to stdout) |
+| 3 | Stale, Telegram creds missing (alert to stdout) |
+| 7 | Stale, Telegram delivery failed |
+| 64 | Unknown argument |
+
 ## Stop-loss false-negative audit gate
 
 `scripts/audit_stop_loss_false_negatives.sh` tracks the post-held-position-

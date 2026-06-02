@@ -18,9 +18,15 @@ Scope (per the Codex xhigh design review):
   history (~11-16 of 77). The dominant coverage gap (~61/77 with zero pre-pump
   history) is Increment 2's proactive-scan job, not this detector's.
 
-The structured ``acceleration_scan_complete`` log line emitted every call is the
-execution heartbeat (zero detections can be healthy) the watchdog reads -- per
-global CLAUDE.md Section 12a, watchdog = execution heartbeat, NOT row-rate.
+The structured ``acceleration_scan_complete`` log line is emitted every cycle the
+detector RUNS (i.e. CoinGecko markets ingestion was non-empty -- the call is
+gated on ``_raw_markets_combined`` in main.py, like every sibling detector) and
+is the execution heartbeat (zero detections can be healthy) the watchdog reads --
+per global CLAUDE.md Section 12a, watchdog = execution heartbeat, NOT row-rate.
+The three journald states stay distinguishable: healthy ->
+``acceleration_scan_complete``; crashed -> ``gainer_acceleration_error`` (the
+main.py try/except); ingestion dry -> no line (the watchdog's stale-heartbeat
+alert text names that cause explicitly).
 """
 
 from __future__ import annotations

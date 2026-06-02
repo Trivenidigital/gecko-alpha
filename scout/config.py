@@ -298,7 +298,9 @@ class Settings(BaseSettings):
     ACCELERATION_MIN_MCAP: float = 500_000
     ACCELERATION_MAX_MCAP: float = 200_000_000
     ACCELERATION_DEDUP_HOURS: int = 4
-    ACCELERATION_LOOKBACK_HOURS: float = 5.0
+    # >= the 4h reference window's upper bound (5.5h) + slack for a slightly
+    # aged latest sample, so the SQL recency slice doesn't clip the window.
+    ACCELERATION_LOOKBACK_HOURS: float = 6.0
     ACCELERATION_TOP_N: int = 20
 
     # -------- Top Gainers Tracker --------

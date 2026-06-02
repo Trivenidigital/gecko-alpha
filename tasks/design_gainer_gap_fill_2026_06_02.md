@@ -130,6 +130,10 @@ contaminated this doc's original attribution (momentum/velocity/slow_burn were 1
    history); still research-only, still the right additive infra for the user's "beat Highlights by
    minutes" use case.
 4. **$200M cap** + **§12a heartbeat watchdog** (`scripts/acceleration-heartbeat-watchdog.sh`,
-   execution-heartbeat via the `acceleration_scan_complete` journal line, NOT row-rate) — unchanged.
+   execution-heartbeat via the `acceleration_scan_complete` journal line, NOT row-rate).
+   Watchdog scheduling is **opt-in** per the repo's Telegram-alerting-watchdog convention
+   (`cron/README.md`); the operator enables the crontab line. The 31/45/32 decomposition is
+   reproducible via `scripts/audit_missed_gainers.py` (validated on srilu).
+   Same timestamp bug was also fixed in `scout/trending/tracker.py` (flagged by review).
 
 Increment 2 (coverage) still owns the 32 true residual gaps.

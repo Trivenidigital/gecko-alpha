@@ -972,7 +972,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
         #
         # 1. sources_count — explicit confluence count from the four
         #    `detected_by_*` booleans. Surfaces the existing "Narrative +
-        #    Pipeline" combo as a sortable integer 0..4.
+        #    Pipeline" combo as a sortable integer 0..8 (now includes the
+        #    gap-fill acceleration/momentum/slow_burn/velocity surfaces).
         # 2. paper_trade_outcome — most-recent paper_trade linked by coin_id.
         #    None if the gainer was never traded. Lets the Top Gainers view
         #    show "Unlinked — not rankable yet" vs an actionability badge.
@@ -984,6 +985,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     "detected_by_pipeline",
                     "detected_by_chains",
                     "detected_by_spikes",
+                    "detected_by_acceleration",
+                    "detected_by_momentum",
+                    "detected_by_slow_burn",
+                    "detected_by_velocity",
                 )
             )
 
