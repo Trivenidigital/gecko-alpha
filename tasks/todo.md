@@ -30,7 +30,17 @@ Workflow checklist:
   tests/test_trade_decision_board_frontend.py tests/test_dashboard_frontend_layout.py
   tests/test_trade_inbox_endpoint.py tests/test_todays_focus_endpoint.py
   tests/test_live_candidates_endpoint.py` => `62 passed`.
-- [ ] Run Claude Code review and fold any critical/important findings.
+- [x] Final local verification:
+  `C:\projects\gecko-alpha\.venv\Scripts\python.exe -m pytest --tb=short -q
+  tests/test_trade_decision_board_frontend.py tests/test_dashboard_frontend_layout.py
+  tests/test_trade_inbox_endpoint.py tests/test_todays_focus_endpoint.py
+  tests/test_live_candidates_endpoint.py tests/test_check_trade_inbox_contract.py
+  tests/test_check_live_candidates_contract.py tests/test_check_todays_focus_contract.py
+  tests/test_check_dashboard_contracts.py` => `191 passed`; fresh
+  `npm.cmd --prefix dashboard/frontend run build:codex` => passed with no
+  post-build diff.
+- [x] Run Claude Code review and fold any critical/important findings:
+  `claude ultrareview origin/master --timeout 20` => no findings.
 - [ ] Merge to `master`, deploy to srilu, restart dashboard, and smoke the
   live dashboard/API.
 
