@@ -1,10 +1,10 @@
 # Backlog — gecko-alpha
 
-## Active Work: 2026-06-05 - Trader decision cockpit
+## Completed Work: 2026-06-05 - Trader decision cockpit
 
-**Status:** IN PROGRESS. Goal: make the dashboard usable as a trader decision
-surface by compressing the current signal crowd into one scarce, read-only
-decision board.
+**Status:** SHIPPED 2026-06-05 - direct master deploy at implementation commit
+`34a3db3d`. Goal: make the dashboard usable as a trader decision surface by
+compressing the current signal crowd into one scarce, read-only decision board.
 
 Workflow checklist:
 - [x] Create isolated worktree/branch from current `origin/master`.
@@ -41,8 +41,22 @@ Workflow checklist:
   post-build diff.
 - [x] Run Claude Code review and fold any critical/important findings:
   `claude ultrareview origin/master --timeout 20` => no findings.
-- [ ] Merge to `master`, deploy to srilu, restart dashboard, and smoke the
-  live dashboard/API.
+- [x] Merge to `master`, deploy to srilu, restart dashboard, and smoke the
+  live dashboard/API:
+  - `git push origin HEAD:master` fast-forwarded `master` from `4f30fc3a` to
+    `34a3db3d`.
+  - srilu deploy pulled `34a3db3`, restarted `gecko-dashboard`, and verified
+    `gecko-dashboard` active with `NRestarts=0`.
+  - Live smoke: dashboard index HTTP OK, `/api/trade_inbox` HTTP OK,
+    `scripts/check_dashboard_contracts.py --url http://127.0.0.1:8000` =>
+    `OK: dashboard contracts clean (live_candidates=0, trade_inbox=0,
+    todays_focus=0)`, and deployed JS bundle contains `Trade Decision Board`.
+
+Review notes:
+- Claude Code ultrareview returned no findings.
+- In-app browser backend listed no available browsers in this Codex session, so
+  live UI verification used HTTP/API/contract/bundle checks instead of a visual
+  browser screenshot.
 
 Non-scope:
 - No live execution, order intents, Telegram alert routing, paper-trade
