@@ -21,9 +21,15 @@ Workflow checklist:
   without changing execution, alerting, scoring, or backend contracts.
 - [x] Add CSS/layout guardrails so the board is compact, scan-first, and
   mobile-safe.
-- [ ] Build committed frontend dist.
-- [ ] Run focused verification: helper tests, dashboard layout tests, trade
+- [x] Build committed frontend dist:
+  `npm.cmd --prefix dashboard/frontend run build:codex` => passed with Vite
+  `63 modules transformed`.
+- [x] Run focused verification: helper tests, dashboard layout tests, trade
   inbox/live candidates/today focus endpoint tests, frontend build.
+  `C:\projects\gecko-alpha\.venv\Scripts\python.exe -m pytest --tb=short -q
+  tests/test_trade_decision_board_frontend.py tests/test_dashboard_frontend_layout.py
+  tests/test_trade_inbox_endpoint.py tests/test_todays_focus_endpoint.py
+  tests/test_live_candidates_endpoint.py` => `62 passed`.
 - [ ] Run Claude Code review and fold any critical/important findings.
 - [ ] Merge to `master`, deploy to srilu, restart dashboard, and smoke the
   live dashboard/API.
