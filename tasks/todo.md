@@ -1,5 +1,39 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-06-05 - Trader decision cockpit
+
+**Status:** IN PROGRESS. Goal: make the dashboard usable as a trader decision
+surface by compressing the current signal crowd into one scarce, read-only
+decision board.
+
+Workflow checklist:
+- [x] Create isolated worktree/branch from current `origin/master`.
+- [x] Baseline focused backend/dashboard tests before edits:
+  `C:\projects\gecko-alpha\.venv\Scripts\python.exe -m pytest --tb=short -q
+  tests/test_trade_inbox_endpoint.py tests/test_todays_focus_endpoint.py
+  tests/test_live_candidates_endpoint.py tests/test_dashboard_frontend_layout.py`
+  => `57 passed`.
+- [ ] TDD red: add pure frontend decision-helper tests for scarce trader
+  selection, no-clean-trade headline, risk demotion, and late-runner
+  quarantine.
+- [ ] Implement decision helper module used by the dashboard UI.
+- [ ] Wire a compact "Trade Decision Board" into the primary trader surface
+  without changing execution, alerting, scoring, or backend contracts.
+- [ ] Add CSS/layout guardrails so the board is compact, scan-first, and
+  mobile-safe.
+- [ ] Build committed frontend dist.
+- [ ] Run focused verification: helper tests, dashboard layout tests, trade
+  inbox/live candidates/today focus endpoint tests, frontend build.
+- [ ] Run Claude Code review and fold any critical/important findings.
+- [ ] Merge to `master`, deploy to srilu, restart dashboard, and smoke the
+  live dashboard/API.
+
+Non-scope:
+- No live execution, order intents, Telegram alert routing, paper-trade
+  mutation, signal scoring change, source pruning, or new DB writer.
+- No claim that a row is investment advice; the board remains read-only
+  decision support.
+
 ## Completed Work: 2026-06-01 - Social mentions denominator evidence refresh
 
 **Status:** SHIPPED 2026-06-01 - PR #352 squash `b8d1ae1c`. Goal: make the dead `social_mentions_24h`
