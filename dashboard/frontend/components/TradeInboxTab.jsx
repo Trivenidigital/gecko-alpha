@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import TokenLink from './TokenLink'
+import { buildTradeDecisionBoard } from './tradeDecisionBoard.js'
 
 const GROUPS = [
   ['act_now', 'Review Now'],
@@ -115,6 +116,33 @@ function renderCounterRisk(row) {
   )
 }
 
+function renderDecisionRow(row, variant = '') {
+  if (!row) return null
+  const riskClass = `trade-decision-risk ${row.risk_tier || 'unknown'}`
+  return (
+    <div
+      className={`trade-decision-row ${variant}`.trim()}
+      key={`${row.source_corpus || 'paper'}:${row.token_id}:${variant}`}
+    >
+      <div className="trade-decision-token">
+        <TokenLink tokenId={row.token_id} symbol={row.symbol || row.name} chain={row.chain} />
+        {row.name ? <span>{row.name}</span> : null}
+        <span className={riskClass}>{row.risk_tier || 'unknown'} risk</span>
+      </div>
+      <div className="trade-decision-label">{row.decision_label}</div>
+      <div className="trade-decision-metrics">
+        <span>{fmtPct(row.pct_from_entry)} from entry</span>
+        <span>{fmtPct(row.price_change_24h)} 24h</span>
+        <span>{fmtUsd(row.market_cap)}</span>
+        <span>score {row.adjusted_score}</span>
+      </div>
+      <div className="trade-decision-meta">
+        {(row.decision_reasons || []).slice(0, 5).join(' | ') || 'no decision facts'}
+      </div>
+    </div>
+  )
+}
+
 export default function TradeInboxTab() {
   const [payload, setPayload] = useState(null)
   const [error, setError] = useState(null)
@@ -186,6 +214,7 @@ export default function TradeInboxTab() {
     }
     return out
   }, [payload, dismissed])
+  const decisionBoard = useMemo(() => buildTradeDecisionBoard(payload), [payload])
 
   return (
     <div>
@@ -229,6 +258,59 @@ export default function TradeInboxTab() {
           {error ? <div style={{ marginTop: 8, color: 'var(--color-accent-red)' }}>Error: {error}</div> : null}
         </div>
       </div>
+
+      {payload ? (
+        <div className="panel trade-decision-board">
+          <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <span>Trade Decision Board</span>
+            <span style={{ color: 'var(--color-text-secondary)', fontSize: 12 }}>
+              scarce read-only review surface
+            </span>
+          </div>
+          <div className="trade-decision-headline" data-status={decisionBoard.headline.status}>
+            <div>
+              <strong>{decisionBoard.headline.label}</strong>
+              <span>{decisionBoard.headline.detail}</span>
+            </div>
+            <div className="trade-decision-meta">
+              read_only={String(decisionBoard.meta.read_only)} not_trade_advice={String(decisionBoard.meta.not_trade_advice)} source_rows={decisionBoard.meta.source_rows_considered ?? '?'}
+            </div>
+          </div>
+          <div className="trade-decision-grid">
+            <section className="trade-decision-lane">
+              <div className="trade-decision-lane-title">Review first</div>
+              {decisionBoard.primary ? (
+                renderDecisionRow(decisionBoard.primary, 'primary')
+              ) : (
+                <div className="trade-decision-empty">No clean review-now rows</div>
+              )}
+            </section>
+            <section className="trade-decision-lane">
+              <div className="trade-decision-lane-title">Best watch</div>
+              {decisionBoard.watchlist.length ? (
+                decisionBoard.watchlist.map(row => renderDecisionRow(row, `watch ${row.risk_tier || ''}`))
+              ) : (
+                <div className="trade-decision-empty">No open-window watch rows</div>
+              )}
+            </section>
+            <section className="trade-decision-lane">
+              <div className="trade-decision-lane-title">Too late</div>
+              {decisionBoard.late.length ? (
+                decisionBoard.late.map(row => renderDecisionRow(row, 'late'))
+              ) : (
+                <div className="trade-decision-empty">No late runners in page</div>
+              )}
+            </section>
+            <section className="trade-decision-lane">
+              <div className="trade-decision-lane-title">Blocked diagnostics</div>
+              <div className="trade-decision-empty">
+                {decisionBoard.blocked_summary.visible} visible / {decisionBoard.blocked_summary.total} total
+                {decisionBoard.blocked_summary.hidden ? ` | ${decisionBoard.blocked_summary.hidden} hidden` : ''}
+              </div>
+            </section>
+          </div>
+        </div>
+      ) : null}
 
       {GROUPS.map(([group, title]) => {
         const rows = visibleGroups[group] || []

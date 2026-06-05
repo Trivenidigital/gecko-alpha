@@ -17,9 +17,9 @@ Workflow checklist:
   selection, no-clean-trade headline, risk demotion, and late-runner
   quarantine.
 - [x] Implement decision helper module used by the dashboard UI.
-- [ ] Wire a compact "Trade Decision Board" into the primary trader surface
+- [x] Wire a compact "Trade Decision Board" into the primary trader surface
   without changing execution, alerting, scoring, or backend contracts.
-- [ ] Add CSS/layout guardrails so the board is compact, scan-first, and
+- [x] Add CSS/layout guardrails so the board is compact, scan-first, and
   mobile-safe.
 - [ ] Build committed frontend dist.
 - [ ] Run focused verification: helper tests, dashboard layout tests, trade

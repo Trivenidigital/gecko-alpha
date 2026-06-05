@@ -112,6 +112,50 @@ def test_trade_inbox_counter_risk_block_stays_neutral():
         assert forbidden not in text
 
 
+def test_trade_inbox_decision_board_is_primary_scan_surface():
+    tab = (
+        ROOT / "dashboard" / "frontend" / "components" / "TradeInboxTab.jsx"
+    ).read_text(encoding="utf-8")
+    css = (ROOT / "dashboard" / "frontend" / "style.css").read_text(encoding="utf-8")
+
+    assert "import { buildTradeDecisionBoard } from './tradeDecisionBoard.js'" in tab
+    assert "const decisionBoard = useMemo" in tab
+    assert "buildTradeDecisionBoard(payload)" in tab
+    assert "Trade Decision Board" in tab
+    assert "No clean review-now rows" in tab
+    assert "Review first" in tab
+    assert "Best watch" in tab
+    assert "Too late" in tab
+    assert "Blocked diagnostics" in tab
+    assert "renderDecisionRow" in tab
+    assert "decisionBoard.primary" in tab
+    assert "decisionBoard.watchlist" in tab
+    assert "decisionBoard.late" in tab
+    assert "decisionBoard.blocked_summary" in tab
+    assert tab.index("Trade Decision Board") < tab.index("GROUPS.map")
+    assert "<table" not in tab[
+        tab.index("Trade Decision Board") : tab.index("GROUPS.map")
+    ].lower()
+
+    for selector in (
+        ".trade-decision-board",
+        ".trade-decision-headline",
+        ".trade-decision-grid",
+        ".trade-decision-lane",
+        ".trade-decision-row",
+        ".trade-decision-row.primary",
+        ".trade-decision-meta",
+        ".trade-decision-risk",
+        ".trade-decision-empty",
+    ):
+        assert selector in css
+
+    mobile = re.search(r"@media \(max-width: 480px\).*", css, re.S)
+    assert mobile
+    assert ".trade-decision-grid" in mobile.group(0)
+    assert "grid-template-columns: 1fr" in mobile.group(0)
+
+
 def test_todays_focus_tab_is_wired_with_local_storage_only_state():
     app = (ROOT / "dashboard" / "frontend" / "App.jsx").read_text(encoding="utf-8")
     panel_path = ROOT / "dashboard" / "frontend" / "components" / "TodayFocusPanel.jsx"
