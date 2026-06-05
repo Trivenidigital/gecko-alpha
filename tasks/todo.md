@@ -13,10 +13,10 @@ Workflow checklist:
   tests/test_trade_inbox_endpoint.py tests/test_todays_focus_endpoint.py
   tests/test_live_candidates_endpoint.py tests/test_dashboard_frontend_layout.py`
   => `57 passed`.
-- [ ] TDD red: add pure frontend decision-helper tests for scarce trader
+- [x] TDD red: add pure frontend decision-helper tests for scarce trader
   selection, no-clean-trade headline, risk demotion, and late-runner
   quarantine.
-- [ ] Implement decision helper module used by the dashboard UI.
+- [x] Implement decision helper module used by the dashboard UI.
 - [ ] Wire a compact "Trade Decision Board" into the primary trader surface
   without changing execution, alerting, scoring, or backend contracts.
 - [ ] Add CSS/layout guardrails so the board is compact, scan-first, and
