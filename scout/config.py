@@ -340,6 +340,16 @@ class Settings(BaseSettings):
     GAINERS_MIN_CHANGE: float = 20.0
     GAINERS_MAX_MCAP: float = 200_000_000  # $200M ceiling
 
+    # -------- Cross-Surface Conviction Score (BL-NEW-CROSS-SURFACE-CONVICTION-SCORE) --------
+    # Read-only ranking over gainers_comparisons: counts independent detectors
+    # that confirmed a coin >= EARLY_LEAD_MINUTES before the +20%/24h move.
+    # Validated discriminator (≥4 early surfaces → ~21% 3x-rate vs ~1% for ≤1).
+    # Observe-first: powers /api/conviction/shortlist only — no alert/paper-trade.
+    CONVICTION_SCORE_ENABLED: bool = True
+    CONVICTION_EARLY_LEAD_MINUTES: int = 1440  # 24h — the validated "early" window
+    CONVICTION_HIGH_TIER_MIN_SURFACES: int = 4  # ~21% 3x precision at this gate
+    CONVICTION_WATCH_TIER_MIN_SURFACES: int = 2
+
     # -------- Top Losers Tracker --------
     LOSERS_TRACKER_ENABLED: bool = False
     LOSERS_MIN_DROP: float = -15.0

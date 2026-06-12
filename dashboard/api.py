@@ -884,6 +884,76 @@ def create_app(db_path: str | None = None) -> FastAPI:
         sdb = await _get_scout_db(_db_path)
         return await get_recent_gainers(sdb, limit=limit)
 
+    @app.get("/api/conviction/shortlist")
+    async def conviction_shortlist(
+        limit: int = Query(50, ge=1, le=500),
+        min_tier: str = Query("low", pattern="^(low|watch|high)$"),
+    ):
+        """BL-NEW-CROSS-SURFACE-CONVICTION-SCORE: read-only winner shortlist.
+
+        Ranks recent tracked gainers by EARLY cross-surface confirmation — the
+        count of independent detectors that flagged the coin >= 24h before it
+        crossed +20%/24h. Validated discriminator: ≥4 early surfaces → ~21%
+        3x-rate vs ~1% for ≤1 (full history 2026-04-15+, srilu). Observe-first:
+        no alerts, no trades, no writes. See
+        tasks/design_cross_surface_conviction_2026_06_12.md.
+        """
+        from scout.config import get_settings
+        from scout.conviction import TIER_ORDER, cross_surface_conviction
+        from scout.gainers.tracker import get_gainers_comparisons
+
+        settings = get_settings()
+        if not getattr(settings, "CONVICTION_SCORE_ENABLED", True):
+            return {"meta": {"read_only": True, "enabled": False}, "rows": []}
+
+        sdb = await _get_scout_db(_db_path)
+        # Pull the full tracked pool (cap 500) so ranking has rows to sort; trim
+        # to `limit` after scoring + tier filtering.
+        comparisons = await get_gainers_comparisons(sdb, limit=500)
+        min_idx = TIER_ORDER.index(min_tier)
+        scored: list[dict] = []
+        for c in comparisons:
+            r = cross_surface_conviction(c, settings)
+            if TIER_ORDER.index(r.tier) < min_idx:
+                continue
+            scored.append(
+                {
+                    "coin_id": c.get("coin_id"),
+                    "symbol": c.get("symbol"),
+                    "name": c.get("name"),
+                    "early_count": r.early_count,
+                    "conviction_score": r.score,
+                    "tier": r.tier,
+                    "contributing_surfaces": list(r.contributing),
+                    "peak_gain_pct": c.get("peak_gain_pct"),
+                    "is_gap": c.get("is_gap"),
+                    "appeared_on_gainers_at": c.get("appeared_on_gainers_at"),
+                }
+            )
+        scored.sort(
+            key=lambda x: (x["conviction_score"], x["peak_gain_pct"] or 0.0),
+            reverse=True,
+        )
+        return {
+            "meta": {
+                "read_only": True,
+                "not_trade_advice": True,
+                "early_lead_minutes": getattr(
+                    settings, "CONVICTION_EARLY_LEAD_MINUTES", 1440
+                ),
+                "high_tier_min_surfaces": getattr(
+                    settings, "CONVICTION_HIGH_TIER_MIN_SURFACES", 4
+                ),
+                "watch_tier_min_surfaces": getattr(
+                    settings, "CONVICTION_WATCH_TIER_MIN_SURFACES", 2
+                ),
+                "min_tier": min_tier,
+                "scored": len(comparisons),
+                "returned": min(len(scored), limit),
+            },
+            "rows": scored[:limit],
+        }
+
     @app.get("/api/gainers/comparisons")
     async def gainers_comparisons(limit: int = Query(50, ge=1, le=500)):
         """Gainers comparisons enriched with price_cache data."""
