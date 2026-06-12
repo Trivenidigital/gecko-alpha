@@ -1050,7 +1050,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 **Revert:** `UPDATE signal_params SET conviction_lock_enabled=0` (disables BL-067 entirely incl. the widening). For narrower revert, `PAPER_CONVICTION_LOCK_ENABLED=False` in .env + restart.
 
-**D+14 evaluation:** 2026-05-25T14:03Z. Query template in memory file.
+**D+14 evaluation:** 2026-05-25T14:03Z (executed 2026-06-12). **Verdict: INCONCLUSIVE — mechanism never exercised (NOT a failure).** §9c lever-vs-data-path: of 32 qualifying closes (conviction-locked stack≥2, peak<20%, since deploy), the exit-type split is **16 `closed_sl` / 9 `closed_expired` / 6 `closed_peak_fade` (mean giveback 0.8pp — clean) / 1 `closed_floor`, and 0 `closed_trailing_stop`** — the *only* exit the `trail_pct_low_peak` widening governs. The aggregate "fail" (mean giveback 21.2pp, 24/32 >15pp) is dominated by stop-loss exits the lever never touches; the widened trail has not fired once on a qualifying trade. The pre-registered criteria mis-specified the population (all closes, not trailing-stop closes). **Action:** EXTEND with `closed_trailing_stop`-only criteria; **P1-uniform width-lock is NOT blocked** (the dependency gate keys on P2 *failure*, and this is not a failure). **Real residual surfaced:** low-peak conviction-locked trades stop out (`closed_sl`, mean 30.1pp giveback, 16/32) before the trailing stop ever arms — the open question is upstream of trail width (entry/SL placement), not the conviction-lock trail widening.
 
 ### BL-NEW-LIVE-ELIGIBLE: would_be_live writer with tier-based eligibility (BL-060 revival)
 **Status:** SHIPPED 2026-05-11 — PR #98 (`8a07662`) squash-merged + deployed VPS 2026-05-11T13:22Z. Closes the ~3-week-old BL-060 writer gap (column existed since 2026-04-23 but all 752 closed trades had NULL/0). See data analysis `tasks/findings_live_eligibility_winners_vs_losers_2026_05_11.md` + memory `project_live_eligible_writer_shipped_2026_05_11.md`.
@@ -1156,7 +1156,7 @@ Without Q2's answer, the 4-week dashboard verdict still leaves the operator with
 **Estimate:** ~3-4 hours weekly digest + cron + tests.
 
 ### BL-NEW-COHORT-DIGEST-DECISION: act on cohort-digest 4-week evidence
-**Status:** PROPOSED 2026-05-17 — filed concurrent with BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST shipping. Evidence-gated on the 4-week measurement window.
+**Status:** RESOLVED 2026-06-12 — verdict **TRACK-WIDER** (no live-review trigger). Final digest fired 2026-06-08T09:00:31Z (`cohort_digest_state.last_final_block_fired_at`). Original PROPOSED 2026-05-17 note retained below.
 **Trigger:** 2026-06-08 (anchor — first eligible Monday at or after). Per V28 SHOULD-FIX fallback: digest fires on first eligible run with `end_date >= COHORT_DIGEST_FINAL_DATE AND last_final_block_fired_at IS NULL`.
 **Pre-registered criteria** (per `tasks/plan_live_eligible_weekly_digest.md` § Decision criteria):
 - EXTEND if per-signal flip events ≥ 2 within window (instability) — file `BL-NEW-COHORT-DIGEST-DECISION-EXTENDED`
@@ -1166,8 +1166,18 @@ Without Q2's answer, the 4-week dashboard verdict still leaves the operator with
 **Decision artifact:** findings doc + backlog flip + memory checkpoint update.
 **decision-by:** 2026-06-08
 
+**Verdict (2026-06-12, recomputed from srilu `paper_trades`, window 2026-05-11..2026-06-08): TRACK-WIDER.** The eligible (`would_be_live=1`) cohort beats the full cohort on every structurally-eligible signal, but none crosses the strong-pattern bar (`STRONG_WR_GAP_PP=15` strict + sign-flip), so **no RECOMMEND-LIVE-REVIEW**:
+
+| signal | n_full | wr_full | n_elig | wr_elig | wrΔ |
+|---|---|---|---|---|---|
+| chain_completed | 153 | 54% | 29 | 62% | +8pp (moderate) |
+| volume_spike | 67 | 34% | 20 | 40% | +6pp (moderate) |
+| gainers_early | 223 | 50% | 35 | 54% | +4pp (tracking) |
+
+Structurally non-eligible (n_elig=0): narrative_prediction (n=166, 20% WR, +$568), losers_contrarian (n=146, 45%, +$1389), tg_social, trending_catch, first_signal — reinforces `BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT` (~half the firehose can never go live). Not INCONCLUSIVE (eligible n=35/29/20). **Action:** file `BL-NEW-COHORT-DIGEST-EXTEND-4w`; do NOT escalate to BL-055.
+
 ### BL-NEW-HPF-RE-EVALUATION: re-evaluate `PAPER_HIGH_PEAK_FADE_DRY_RUN` flip decision at n≥20
-**Status:** ACTIVE — D+7 review closed 2026-05-13T04:05Z (audit row id=25, `signal_params_audit.field_name='soak_verdict'`, value `dry_run_continued`). HPF dry-run produced n=7 would-fires by 2026-05-13; pre-registered criterion was ambiguous and aggregate counter-factual was −$45 vs actuals, so the flip is deferred rather than acted on. Continue accumulating toward n≥20.
+**Status:** ACTIVE — D+7 review closed 2026-05-13T04:05Z (audit row id=25, `signal_params_audit.field_name='soak_verdict'`, value `dry_run_continued`). HPF dry-run produced n=7 would-fires by 2026-05-13; pre-registered criterion was ambiguous and aggregate counter-factual was −$45 vs actuals, so the flip is deferred rather than acted on. Continue accumulating toward n≥20. **(2026-06-12 check:** `high_peak_fade_audit WHERE dry_run=1` = **n=10**, still <20 → **EXTEND**. Accumulation is ~3 fires/month (7→10 in the ~30d since 2026-05-13), so n≥20 lands ~Sept 2026. §11a flag — at this rate the soak may not converge usefully; consider re-scoping the n-gate to the moonshot_trail subset only, since that is the only subset where HPF beat the incumbent.)**
 
 **2026-05-13 closure — subset finding (structural, §9c lever-vs-data-path):**
 
@@ -1236,6 +1246,11 @@ ssh root@89.167.116.187 "journalctl -u gecko-pipeline --since '24 hours ago' | g
 ssh root@89.167.116.187 "sqlite3 /root/gecko-alpha/scout.db \"SELECT COUNT(*) FROM tg_alert_log WHERE outcome='m1_5c_announcement_sent'\""  # expect 1
 ```
 
+**D+14 kill-criterion outcome (2026-06-12): UNEVALUABLE as designed + emit-stop diagnosed.**
+- **Paste denominator was never instrumented.** `minara_alert_emissions` = **81 emitted / 0 `operator_paste_acknowledged_at`** — but the operator-facing ack UI (the BL-NEW-MINARA-DB-PERSISTENCE "future UI") was never built, so `paste_ack=0` means *unmeasured*, not *zero pastes*. The emit-vs-paste kill-criterion **cannot be computed from data**; it needs operator self-report.
+- **Emissions stopped 2026-05-30** (last emit 2026-05-30T00:17Z; 81 total over 2026-05-22..05-30, 61 distinct coins). Root cause is NOT a flag flip (`MINARA_ALERT_ENABLED=True`) nor a dead alert stream (TG `sent` rows continue ~5/day). Two compounding factors: (1) **alert volume into the dispatch path collapsed** — paper-trade alerts reaching `tg_alert_dispatch` fell from ~13.6/day to ~0.8/day (joined-to-paper) after the 24h-dedup deploy (#336, 2026-05-30) + the paper-open drop after 2026-06-04 — mostly *expected* (dedup working + quieter trading); and (2) a **genuine bug for `chain='solana'` tokens** — see `BL-NEW-MINARA-SOLANA-NATIVE-ID` below: 5 natively-Solana `sent` alerts since 2026-05-30 produced 0 emits.
+- **Decision:** kill-criterion stays OPEN pending operator self-reported paste count (the only path to the emit-vs-paste ratio). Emit side is healthy modulo the solana-native bug.
+
 **Revert:** `MINARA_ALERT_ENABLED=False` + restart. No code rollback, no DB cleanup. Migration is forward-only but idempotent.
 
 **Post-merge folds (deferred from 3-vector PR review):**
@@ -1279,6 +1294,15 @@ GROUP BY day ORDER BY day;
 **Backfill consideration:** the 10+ events already emitted since 2026-05-11 are in journalctl only. A one-time backfill script can parse the journalctl JSON lines into the new table — captures the soak window's history. Bounded by journalctl retention (~30 days max).
 
 **Estimate:** ~2-3 hours for migration + write logic + backfill script + tests + PR review + deploy. Should ship before 2026-05-22 (D+11) to leave 3-day buffer for the D+14 query to have clean data.
+
+### BL-NEW-MINARA-SOLANA-NATIVE-ID: emit for natively-Solana tokens, not just CG-slug Solana-listed
+**Status:** PROPOSED 2026-06-12 — surfaced during the M1.5C emit-stop investigation (§9c data-path trace). **5 `chain='solana'` `sent` alerts since 2026-05-30 produced 0 Minara emissions** while the CG-slug path still works (1 `chain='coingecko'` emit in the same window).
+**Tag:** `minara` `m1_5c` `solana` `bug` `silent-gap`
+**Root cause:** `scout/trading/minara_alert.py:maybe_minara_command` resolves Solana-ness *only* by calling `fetch_coin_detail(coin_id=token_id)` → CG `/coins/{id}` → `platforms.solana`. The new `chain='solana'` input class carries an **SPL contract address** as `token_id`, so `/coins/{SPL-addr}` 404s, `fetch_coin_detail` returns empty, and the function returns None — no command, no emit. The Solana-detector cannot detect tokens that are *already* Solana-native.
+**Fix sketch:** when `chain == 'solana'` (or `token_id` matches the base58 SPL shape already validated downstream, 32–44 chars), **skip the CG lookup and use `token_id` directly as the SPL address** to build the `minara swap --to <addr>` command. Keep the existing CG-platforms path for `chain='coingecko'` slugs. Reuse the base58 validation already in `maybe_minara_command` (lines ~168+). Add a unit test with a `chain='solana'` SPL-address token asserting an emit.
+**Drift verdict:** NET-NEW. No existing entry covers native-Solana id handling; BL-NEW-M1.5C (#96) shipped the CG-slug path only.
+**Hermes verdict:** project-internal; no Hermes skill applies.
+**Blast radius:** additive — only adds emits for a class currently emitting nothing. Behind `MINARA_ALERT_ENABLED`. **Estimate:** ~1-2h (logic + test + deploy).
 
 ### BL-NEW-MINARA-COOLDOWN-REVERIFY: re-verify Minara per-coin cooldown after parallel-session soak merges
 **Status:** AUDITED-NO-VIOLATION 2026-05-19 — runtime verification on srilu-vps (`journalctl -u gecko-pipeline --since 2026-05-11 | grep minara_alert_command_emitted`) returned 54 total emits across 10 distinct multi-emit coins; **0 intra-coin gaps under 6h**. Shortest observed gap was `goblincoin` at ~17.5h (2026-05-11T22:26 → 2026-05-12T15:57), well above the 6h cooldown documented in BL-NEW-M1.5C. Empirical observation of `goblincoin` double-emit referenced in the original filing was already legitimate under the current cooldown. The conditional re-verify trigger ("parallel-session cooldown PR lands on gecko-alpha master") has not fired — no Minara cooldown PR is visible in `git log -- scout/trading/minara_alert.py scout/trading/tg_alert_dispatch.py` since 2026-05-13. Closing as AUDITED-NO-VIOLATION; reopen only if a parallel-session cooldown PR later lands on master AND a new audit returns gaps under the new threshold.
@@ -1717,6 +1741,17 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 
 ### BL-075: Slow-burn miss diagnostic + watcher (RIV-shape blind spot)
 **Status:** PHASE A + PHASE B SHIPPED 2026-05-10. **Phase A** (mcap-missing telemetry) shipped 2026-05-03; 6d telemetry showed 53.5% mcap-null rate (>5% gate → Phase B unblocked). **Phase B** PR #91 (`395feab`) `detect_slow_burn_7d` + schema 20260515; PR #93 (`975c45b`) silent-skip telemetry follow-up (heartbeat counter + all-skipped WARNING + always-emit summary log). 21 first-cycle detections; 47.6% momentum overlap (under 70% gate). **14d shadow soak ends 2026-05-24** — kill criterion + promotion-to-paper-dispatch decision at that point. See memory `project_bl075_phase_b_2026_05_10.md`.
+
+**Promotion verdict (2026-06-12, shadow-PnL eval on srilu — soak ran 33d, 283 distinct coins): PROMOTE to flag-gated paper-dispatch.** Forward-peak multiple per detection (peak from `volume_history_cg` after first detection; 237/283 measurable):
+
+| cohort | measurable | 2x | 3x | 5x |
+|---|---|---|---|---|
+| slow_burn | 237 | 17 (7.2%) | 8 (3.4%) | 3 (1.3%) |
+| velocity_alerter (same method) | 153 | 11 (7.2%) | 8 (5.2%) | 2 (1.3%) |
+
+**Gate result: PASS.** Slow_burn's runner-catch rate *matches* velocity_alerter (equal at 2x and 5x; velocity marginally higher at 3x), and — the decisive complementarity test ("catches misses the existing layer doesn't") — **the two biggest runners were slow_burn-ONLY: VELVET 12.9x (det 2026-06-05) and BEAT 11.8x, both never flagged by velocity_alerter** (4 of 8 slow_burn 3x+ runners are slow_burn-only). VELVET is the same token tracked as a +1835% CAUGHT gainer — slow_burn flagged it independently and early.
+
+**Action:** promote to a real signal_type with paper dispatch behind `SLOW_BURN_DISPATCH_ENABLED=False` (default off, per the Phase-B acceptance spec), then a forward paper-PnL soak to convert "reached 5x peak" into "captured PnL" before any live-eligibility. **Caveats:** small n (3/2 five-baggers); forward-PEAK is an upper bound, not realized PnL (entry/trail/exit haircut); 46/283 coins unmeasurable (no forward price in `volume_history_cg`). File `BL-NEW-SLOW-BURN-DISPATCH-PROMOTION` for implementation.
 **Tag:** `phase-a-shipped` `phase-b-shipped` `shadow-soak-active` `detection-blind-spot`
 **Motivating evidence (2026-05-03):** RIV (`riv-coin`) ran $2M → $200M mcap over 30 days — exactly the asymmetric move the system exists to surface. SSH audit against prod `scout.db` returned **zero rows** for RIV across `gainers_snapshots`, `trending_snapshots`, `velocity_alerts`, `volume_spikes`, `momentum_7d`, `second_wave_candidates`, `predictions`, `narrative_signals`, `chain_matches`, `tg_social_signals`, `candidates`, `paper_trades`, `alerts`. Only trace: one row in `price_cache` from 2026-05-01T00:08Z with `market_cap=0.0` (CoinGecko returned null mcap, our parser writes 0). For context: gainers polling captured 90,002 rows in last 30d; trending captured 5,655. Polling is healthy. RIV simply never appeared in either.
 **Best-fit hypothesis (three compounding causes):**
