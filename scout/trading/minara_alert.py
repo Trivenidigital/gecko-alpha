@@ -132,6 +132,16 @@ async def persist_minara_alert_emission(
         )
 
 
+def _build_swap_command(settings: Settings, spl_address: str) -> str:
+    """Build the Minara swap command line for a validated SPL address."""
+    from_token = getattr(settings, "MINARA_ALERT_FROM_TOKEN", "USDC")
+    size_int = minara_alert_amount_usd(settings)
+    return (
+        f"minara swap --from {from_token} --to {spl_address} "
+        f"--amount-usd {size_int}"
+    )
+
+
 async def maybe_minara_command(
     session,
     settings: Settings,
@@ -146,6 +156,16 @@ async def maybe_minara_command(
     del amount_usd  # Paper-trade size is intentionally not used.
     if not getattr(settings, "MINARA_ALERT_ENABLED", True):
         return None
+
+    # BL-NEW-MINARA-SOLANA-NATIVE-ID: chain='solana' tokens carry the SPL
+    # contract address directly as coin_id (token_id). A CG /coins/{id} lookup
+    # on a raw address 404s — the regression that produced 0 emits for native
+    # Solana tokens — so resolve Solana-ness from the id shape and emit
+    # directly, no lookup needed. CG slugs are never 32-44 base58 chars; EVM
+    # 0x… ids contain '0' (not in the base58 alphabet) so they are excluded.
+    if _looks_like_spl_address(coin_id):
+        return _build_swap_command(settings, coin_id)
+
     if session is None:
         return None
 
@@ -176,12 +196,7 @@ async def maybe_minara_command(
             )
             return None
 
-        from_token = getattr(settings, "MINARA_ALERT_FROM_TOKEN", "USDC")
-        size_int = minara_alert_amount_usd(settings)
-        return (
-            f"minara swap --from {from_token} --to {spl_address} "
-            f"--amount-usd {size_int}"
-        )
+        return _build_swap_command(settings, spl_address)
     except Exception:
         log.exception("minara_alert_format_failed", coin_id=coin_id)
         return None
