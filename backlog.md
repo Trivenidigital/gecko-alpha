@@ -1176,6 +1176,22 @@ Without Q2's answer, the 4-week dashboard verdict still leaves the operator with
 
 Structurally non-eligible (n_elig=0): narrative_prediction (n=166, 20% WR, +$568), losers_contrarian (n=146, 45%, +$1389), tg_social, trending_catch, first_signal — reinforces `BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT` (~half the firehose can never go live). Not INCONCLUSIVE (eligible n=35/29/20). **Action:** file `BL-NEW-COHORT-DIGEST-EXTEND-4w`; do NOT escalate to BL-055.
 
+### BL-NEW-COHORT-DIGEST-EXTEND-4w: data-bound extend of the eligible-vs-full divergence read
+**Status:** PROPOSED 2026-06-12 — filed from the `BL-NEW-COHORT-DIGEST-DECISION` TRACK-WIDER verdict (above). Approach **B** (data-bound extend with a hard close-criterion), **scoped to the 3 structurally live-eligible signals only**: `gainers_early`, `chain_completed`, `volume_spike`. The other 5 (`narrative_prediction`, `losers_contrarian`, `tg_social`, `trending_catch`, `first_signal`) are structurally non-live-eligible (n_elig=0 — `BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT`) and are EXCLUDED from the divergence question entirely; they remain in the digest as informational only.
+**Tag:** `evaluation-framework` `cohort-divergence` `live-roadmap-input` `data-bound-soak` `anti-zombie-soak`
+**Why:** the 4-week digest closed TRACK-WIDER — eligible cohort beats full on all 3 live-eligible signals but modestly (gainers_early +4pp, volume_spike +6pp, chain_completed +8pp), none crossing the strong bar. Real-but-modest. Another fixed "4 weeks" of the same observation is motion without a decision-gate; §11 says extend on a DATA threshold with an explicit close, not a calendar.
+
+**Pre-registered criteria (per-signal, the 3 eligible only):**
+- **PROMOTE-TO-LIVE-REVIEW** — at any digest with n_elig ≥ 20, ANY of the 3 crosses strong-pattern (`STRONG_WR_GAP_PP=15` strict + sign-flip + both-cohort PnL > `STRONG_PNL_FLOOR_USD=200`) → file the BL-055-adjacent live-review item; stop the extend.
+- **CLOSE-AS-MODEST** — at the **n_elig ≥ 50 per-signal** checkpoint (current 2026-06-08 read: gainers_early 35 / chain_completed 29 / volume_spike 20), if all 3 remain moderate/tracking (≤15pp, no sign-flip) across the trailing 4 weekly digests → CLOSE the divergence question as "real but modest, not worth the smaller-n cost," record the decision, do NOT extend further. The definitive "is it worth the smaller-n cost" answer is `BL-NEW-Q2-SIMULATOR` (paired counterfactual), not more observation — escalate there only if certainty is wanted.
+- **EXTEND** — n_elig < 50 on any of the 3 and no strong-pattern → keep accruing; the digest cron already runs (no new infra), re-anchor `COHORT_DIGEST_FINAL_DATE`.
+
+**Calendar estimate (consequence, not target):** volume_spike is the binding signal at ~0.7 eligible closes/day (20 over 28d), so n_elig ≥ 50 on all 3 lands in ~6 weeks (~2026-07-24); gainers_early/chain_completed clear it sooner.
+**Implementation:** no code change — re-anchor `COHORT_DIGEST_FINAL_DATE` to the new checkpoint and apply the per-signal n=50 gate + 3-signal scope in the decision read. The digest (`scout/trading/cohort_digest.py`) already computes per-signal eligible-vs-full; this item is the decision wrapper around it.
+**Drift verdict:** NET-NEW — the extend-decision item; distinct from the shipped digest (`BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST`) and the closed `BL-NEW-COHORT-DIGEST-DECISION`.
+**Hermes verdict:** project-internal.
+**Decision-by:** data-bound (n_elig ≥ 50 on all 3, est. ~2026-07-24) OR earlier on a strong-pattern fire.
+
 ### BL-NEW-HPF-RE-EVALUATION: re-evaluate `PAPER_HIGH_PEAK_FADE_DRY_RUN` flip decision at n≥20
 **Status:** ACTIVE — D+7 review closed 2026-05-13T04:05Z (audit row id=25, `signal_params_audit.field_name='soak_verdict'`, value `dry_run_continued`). HPF dry-run produced n=7 would-fires by 2026-05-13; pre-registered criterion was ambiguous and aggregate counter-factual was −$45 vs actuals, so the flip is deferred rather than acted on. Continue accumulating toward n≥20. **(2026-06-12 check:** `high_peak_fade_audit WHERE dry_run=1` = **n=10**, still <20 → **EXTEND**. Accumulation is ~3 fires/month (7→10 in the ~30d since 2026-05-13), so n≥20 lands ~Sept 2026. §11a flag — at this rate the soak may not converge usefully; consider re-scoping the n-gate to the moonshot_trail subset only, since that is the only subset where HPF beat the incumbent.)**
 
