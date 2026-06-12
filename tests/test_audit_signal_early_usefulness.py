@@ -1227,15 +1227,18 @@ def test_query_time_error_surfaces_exit2(audit, db, monkeypatch, capsys):
     # A query-time sqlite error AFTER the schema precondition passes must map to
     # stage="query" exit 2, NOT a silent INSUFFICIENT_DATA / unjoinable bucket.
     path, conn = db
-    _insert_trade(
-        conn,
-        trade_id=1,
-        token_id="tok",
-        signal_type="gainers_early",
-        hours_before_now=48,
-        entry_price=100.0,
+    # main() uses the REAL datetime.now() for its lookback cutoff (not FIXED_NOW),
+    # so the trade must be anchored to real now to stay inside the default 7-day
+    # window whenever this test runs. Anchoring to FIXED_NOW (2026-05-29) made this
+    # test rot ~7 days later: the trade fell outside main()'s lookback, the cohort
+    # went empty, _load_price_path was never reached, and main() returned 0.
+    opened_at = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    conn.execute(
+        "INSERT INTO paper_trades "
+        "(id, token_id, symbol, signal_type, opened_at, chain, entry_price) "
+        "VALUES (1, 'tok', 'SYM', 'gainers_early', ?, 'coingecko', 100.0)",
+        (opened_at,),
     )
-    _insert_point(conn, "tok", 110.0, 48, 30)
     conn.commit()
 
     def _boom(*args, **kwargs):
