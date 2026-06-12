@@ -385,6 +385,68 @@ async def test_rejects_address_too_short(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_emits_for_native_solana_id_without_cg_lookup(monkeypatch):
+    """BL-NEW-MINARA-SOLANA-NATIVE-ID: chain='solana' tokens carry the SPL
+    contract address directly as token_id. A CG /coins/{id} lookup on a raw
+    address 404s, so resolve Solana-ness from the id shape and emit directly,
+    skipping the lookup. Regression: 5 native-Solana sent alerts produced 0
+    emits because every one 404'd the CG lookup."""
+    fetch_count = [0]
+
+    async def _fake_detail(*args, **kwargs):
+        fetch_count[0] += 1
+        return None  # CG 404 on a raw SPL address
+
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
+    spl = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+    cmd = await maybe_minara_command(
+        session=object(),
+        settings=_settings(MINARA_ALERT_FROM_TOKEN="USDC"),
+        coin_id=spl,
+        amount_usd=10.0,
+    )
+    assert cmd is not None
+    assert "minara swap" in cmd
+    assert spl in cmd
+    assert "--amount-usd 10" in cmd
+    assert fetch_count[0] == 0, "native SPL id must skip the CG lookup"
+
+
+@pytest.mark.asyncio
+async def test_cg_slug_still_uses_lookup(monkeypatch):
+    """A CG slug (never 32-44 base58 chars) must still go through the platforms
+    lookup — the native-id shortcut must not swallow the slug path."""
+    fetch_count = [0]
+
+    async def _fake_detail(session, coin_id, api_key=""):
+        fetch_count[0] += 1
+        return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
+
+    monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
+    cmd = await maybe_minara_command(
+        session=object(),
+        settings=_settings(),
+        coin_id="bonk",
+        amount_usd=10.0,
+    )
+    assert cmd is not None
+    assert fetch_count[0] == 1, "CG slug must still resolve via the lookup"
+
+
+@pytest.mark.asyncio
+async def test_native_solana_id_respects_disabled_flag(monkeypatch):
+    """The native-id shortcut must stay behind MINARA_ALERT_ENABLED."""
+    spl = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+    cmd = await maybe_minara_command(
+        session=object(),
+        settings=_settings(MINARA_ALERT_ENABLED=False),
+        coin_id=spl,
+        amount_usd=10.0,
+    )
+    assert cmd is None
+
+
+@pytest.mark.asyncio
 async def test_accepts_real_world_spl_address(monkeypatch):
     """Sanity: a real BONK-like SPL address passes the shape check."""
 
