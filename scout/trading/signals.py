@@ -281,6 +281,129 @@ async def trade_gainers(
         logger.exception("trading_gainers_query_error")
 
 
+async def trade_slow_burn(
+    engine,
+    db: Database,
+    min_mcap: float = 500_000,
+    max_mcap: float | None = None,
+    *,
+    settings,
+) -> None:
+    """Open paper trades for newly detected slow-burn candidates.
+
+    BL-NEW-SLOW-BURN-DISPATCH-PROMOTION: gated upstream by
+    SLOW_BURN_DISPATCH_ENABLED (default False). slow_burn_candidates is already
+    mcap-bounded at detection; here each new detection not already open is
+    admitted subject to the same junk / mcap / suppression gates gainers use.
+    Entry price is the detection-time current_price.
+    """
+    try:
+        cursor = await db._conn.execute(
+            """SELECT DISTINCT coin_id, symbol, name, current_price, market_cap,
+                               price_change_7d, price_change_24h
+               FROM slow_burn_candidates
+               WHERE datetime(detected_at) >= datetime('now', '-5 minutes')
+               AND coin_id NOT IN (
+                   SELECT token_id FROM paper_trades
+                   WHERE signal_type = 'slow_burn' AND status = 'open'
+               )"""
+        )
+        new_rows = await cursor.fetchall()
+    except Exception:
+        logger.exception("trade_slow_burn_query_error")
+        return
+
+    opened = 0
+    for r in new_rows:
+        if not _is_tradeable_candidate(r["coin_id"], r["symbol"]):
+            logger.warning(
+                "signal_skipped_junk",
+                coin_id=r["coin_id"],
+                symbol=r["symbol"],
+                signal_type="slow_burn",
+            )
+            await _emit_dispatch_decision(
+                db,
+                row=r,
+                signal_type="slow_burn",
+                decision="blocked",
+                reason="junk_candidate",
+            )
+            continue
+        if (r["market_cap"] or 0) < min_mcap:
+            await _emit_dispatch_decision(
+                db,
+                row=r,
+                signal_type="slow_burn",
+                decision="blocked",
+                reason=(
+                    "missing_market_cap"
+                    if r["market_cap"] is None
+                    else "below_min_market_cap"
+                ),
+                min_mcap=min_mcap,
+            )
+            continue
+        if max_mcap is not None and (r["market_cap"] or 0) > max_mcap:
+            await _emit_dispatch_decision(
+                db,
+                row=r,
+                signal_type="slow_burn",
+                decision="blocked",
+                reason="above_max_market_cap",
+                max_mcap=max_mcap,
+            )
+            continue
+        entry_price = r["current_price"]
+        if entry_price is None or entry_price <= 0:
+            await _emit_dispatch_decision(
+                db,
+                row=r,
+                signal_type="slow_burn",
+                decision="blocked",
+                reason="missing_entry_price",
+            )
+            continue
+        try:
+            combo_key = build_combo_key(signal_type="slow_burn", signals=None)
+            allow, reason = await should_open(db, combo_key, settings=settings)
+            if not allow:
+                logger.info(
+                    "signal_suppressed",
+                    combo_key=combo_key,
+                    reason=reason,
+                    coin_id=r["coin_id"],
+                    signal_type="slow_burn",
+                )
+                await _emit_dispatch_decision(
+                    db,
+                    row=r,
+                    signal_type="slow_burn",
+                    decision="blocked",
+                    reason="suppressed",
+                    signal_combo=combo_key,
+                    suppression_reason=reason,
+                )
+                continue
+            await engine.open_trade(
+                token_id=r["coin_id"],
+                symbol=r["symbol"],
+                name=r["name"],
+                chain="coingecko",
+                signal_type="slow_burn",
+                signal_data={
+                    "price_change_7d": r["price_change_7d"],
+                    "mcap": r["market_cap"],
+                },
+                entry_price=entry_price,
+                signal_combo=combo_key,
+            )
+            opened += 1
+        except Exception:
+            logger.exception("trade_slow_burn_error", coin_id=r["coin_id"])
+    logger.info("trade_slow_burn_filtered", new=len(new_rows), opened=opened)
+
+
 async def trade_losers(
     engine,
     db: Database,
