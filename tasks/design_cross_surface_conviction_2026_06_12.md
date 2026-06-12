@@ -25,6 +25,14 @@ The system is **not** missing winners — it ranks them poorly. Recall is high (
 
 A `≥2-early-surface` filter keeps 85/93 (91%) of 2x winners and 18/19 of 5x at 21% precision; a `≥4-early` shortlist is 131 names (~2/day), 21.4% precision, 67% recall of 3x — a **3.7× precision lift** over the firehose with no recall loss vs single-signal tightening (which would drop winners that share per-signal thresholds).
 
+### Validation (review-driven, §11b existing-data battery, 2026-06-12)
+Two decisive concerns from the multi-vector review, both resolved on existing data:
+- **mcap confound → REJECTED.** ≥4-early beats ≤1-early *within every mcap band* (at appearance-time mcap): <$10M 25% vs 0%, $10–60M 23% vs 0%, $60–200M 36% vs 0%. Confirmation-count is **orthogonal to size**, not an mcap proxy.
+- **In-sample / temporal holdout → GENERALIZES.** Split on median appearance date: ≥4-early beats base in BOTH halves (train 14% vs 2% base; **holdout 23% vs 10% base**). The ordering holds out-of-sample; the *level* varies (base rate itself shifted 2%→10%, a regime effect), so **trust the ordering, not the point estimate** — never render "21%" as a bare number (N-gate rule).
+
+### Framing — RETROSPECTIVE, not a pre-pump watchlist (review §9c)
+A `gainers_comparisons` row exists only AFTER a coin crossed +20%/24h; `appeared_on_gainers_at` is that crossing. So this surface **ranks coins that have already appeared on the tracker** by how early they were multi-confirmed — it is a conviction *ranking*, not a forward early-warning. The backtest precision is conditioned on appearing-on-gainers (a hindsight t0); the true *prospective* precision (score coins at the moment they reach N early surfaces, before any +20%) is unmeasured and is the **prospective follow-up**, not this PR. The endpoint `meta` carries `retrospective:true` + `calibration:"backtest_only_unvalidated_live"` so the operator's mental model stays correct.
+
 ## Scope (Phase 1 — this PR): pure scorer + read-only endpoint
 ### `scout/conviction/cross_surface.py`
 - `SURFACE_LEAD_COLUMNS`: maps the 8 surfaces → their `*_lead_minutes` column.
@@ -43,8 +51,10 @@ Reuses `get_gainers_comparisons()` (already returns the 8 flags + leads), scores
 Scorer: 0/1/2/4/8 early surfaces → correct count/tier; lead exactly at threshold (inclusive); null lead with `detected=1` does NOT count; missing column degrades; `dict` and `Row` inputs; weight/tier config overrides. Endpoint: shape, sort order, `min_tier` filter, empty result, contributing list.
 
 ## Deferred (separate follow-up BLs, NOT this PR)
-- **Phase 2 `BL-NEW-CONVICTION-DASHBOARD-PANEL`** — a Today's-Focus "Conviction Shortlist" panel over the endpoint (frontend; dist-commit discipline applies).
-- **Phase 3 `BL-NEW-CONVICTION-HIGH-TIER-ALERT`** — a high-tier TG alert, gated + observe-first, only after the forward-outcome measurement confirms the live precision matches the backtest.
+- **`BL-NEW-CONVICTION-PROSPECTIVE-SCORE`** (the high-value follow-up, review §9c) — score coins at the moment they reach N early surfaces, BEFORE any +20% appearance, with the denominator = all coins reaching N early surfaces (incl. those that never become gainers). This is the genuinely-forward version; its precision is the only honest Phase-3 gate.
+- **`BL-NEW-CONVICTION-FORWARD-MEASUREMENT`** (Class-1 guard, review silent-failure §3) — persist each scored snapshot (coin_id, tier, early_count, scored_at) + a §12a watchdog on **surface-input health** (alert if any `detected_by_<surface>` rate collapses or the ≥1-early-surface row-rate drops to ~0). The live score silently degrades if an upstream detector (esp. the young velocity/acceleration surfaces) dies; nothing watches it today.
+- **Phase 2 `BL-NEW-CONVICTION-DASHBOARD-PANEL`** — a Today's-Focus "Conviction Shortlist" panel over the endpoint (frontend; dist-commit discipline + N-gate/CI display, never a bare 21%).
+- **Phase 3 `BL-NEW-CONVICTION-HIGH-TIER-ALERT`** — a high-tier TG alert, gated + observe-first. **Gate = the PROSPECTIVE precision** (from `BL-NEW-CONVICTION-PROSPECTIVE-SCORE`, n≥20 prospective ≥4-surface coins, Wilson-LB > the ~6% firehose base rate), NOT the retrospective backtest number.
 
 ## Anti-scope
 No new detector; no change to any signal's thresholds (precision via ranking, NOT noise-cutting — proven to lose recall); no paper-trade/alert in this PR; no schema change; no write path. Orthogonal to the deep-volume coverage lane (#358) which addresses recall/coverage — this addresses precision/ranking.

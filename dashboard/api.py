@@ -889,27 +889,40 @@ def create_app(db_path: str | None = None) -> FastAPI:
         limit: int = Query(50, ge=1, le=500),
         min_tier: str = Query("low", pattern="^(low|watch|high)$"),
     ):
-        """BL-NEW-CROSS-SURFACE-CONVICTION-SCORE: read-only winner shortlist.
+        """BL-NEW-CROSS-SURFACE-CONVICTION-SCORE: read-only conviction ranking.
 
-        Ranks recent tracked gainers by EARLY cross-surface confirmation — the
-        count of independent detectors that flagged the coin >= 24h before it
-        crossed +20%/24h. Validated discriminator: ≥4 early surfaces → ~21%
-        3x-rate vs ~1% for ≤1 (full history 2026-04-15+, srilu). Observe-first:
-        no alerts, no trades, no writes. See
-        tasks/design_cross_surface_conviction_2026_06_12.md.
+        RETROSPECTIVE, not a pre-pump watchlist: every row is a coin that has
+        ALREADY appeared on the +20%/24h gainers tracker. It ranks those tracked
+        gainers by how many independent detectors confirmed the coin >= 24h
+        BEFORE that appearance (`early_count`). Backtest discriminator (in-sample,
+        full history 2026-04-15+, srilu; n=42 three-baggers): ≥4 early surfaces →
+        ~21% 3x-rate vs ~1% for ≤1, mcap-orthogonal, holds out-of-sample at ~23%
+        (treat the ORDERING as solid, exact rate ±). Observe-first: no alerts, no
+        trades, no writes. A live, pre-appearance (prospective) version is a
+        follow-up. See tasks/design_cross_surface_conviction_2026_06_12.md.
         """
         from scout.config import get_settings
         from scout.conviction import TIER_ORDER, cross_surface_conviction
         from scout.gainers.tracker import get_gainers_comparisons
 
-        settings = get_settings()
+        # Align with the module's settings-degradation pattern (the singleton is
+        # None on a malformed .env; fall back to the cached get_settings()).
+        settings = _DASHBOARD_SETTINGS or get_settings()
         if not getattr(settings, "CONVICTION_SCORE_ENABLED", True):
             return {"meta": {"read_only": True, "enabled": False}, "rows": []}
 
         sdb = await _get_scout_db(_db_path)
-        # Pull the full tracked pool (cap 500) so ranking has rows to sort; trim
-        # to `limit` after scoring + tier filtering.
-        comparisons = await get_gainers_comparisons(sdb, limit=500)
+        # Pool generously so the ranking covers the whole tracker (currently
+        # ~700 rows); expose total_tracked + truncated so a capped pool is never
+        # a SILENT recall hole.
+        pool_cap = 2000
+        total_tracked = 0
+        try:
+            cur = await sdb._conn.execute("SELECT COUNT(*) FROM gainers_comparisons")
+            total_tracked = (await cur.fetchone())[0]
+        except Exception:
+            total_tracked = -1  # unknown; surfaced honestly in meta
+        comparisons = await get_gainers_comparisons(sdb, limit=pool_cap)
         min_idx = TIER_ORDER.index(min_tier)
         scored: list[dict] = []
         for c in comparisons:
@@ -930,14 +943,21 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     "appeared_on_gainers_at": c.get("appeared_on_gainers_at"),
                 }
             )
+        # Deterministic order: score, then realized peak, then recency tiebreak.
         scored.sort(
-            key=lambda x: (x["conviction_score"], x["peak_gain_pct"] or 0.0),
+            key=lambda x: (
+                x["conviction_score"],
+                x["peak_gain_pct"] or 0.0,
+                x["appeared_on_gainers_at"] or "",
+            ),
             reverse=True,
         )
         return {
             "meta": {
                 "read_only": True,
                 "not_trade_advice": True,
+                "retrospective": True,  # rows already appeared on gainers, not pre-pump
+                "calibration": "backtest_only_unvalidated_live",
                 "early_lead_minutes": getattr(
                     settings, "CONVICTION_EARLY_LEAD_MINUTES", 1440
                 ),
@@ -948,7 +968,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     settings, "CONVICTION_WATCH_TIER_MIN_SURFACES", 2
                 ),
                 "min_tier": min_tier,
-                "scored": len(comparisons),
+                "total_tracked": total_tracked,
+                "pool_considered": len(comparisons),
+                "pool_cap": pool_cap,
+                "truncated": total_tracked > len(comparisons),
                 "returned": min(len(scored), limit),
             },
             "rows": scored[:limit],

@@ -78,6 +78,10 @@ async def test_shortlist_ranks_high_conviction_first(client):
     body = resp.json()
     assert body["meta"]["read_only"] is True
     assert body["meta"]["not_trade_advice"] is True
+    # honest-framing contract: retrospective + non-silent truncation disclosure
+    assert body["meta"]["retrospective"] is True
+    assert body["meta"]["total_tracked"] == 2
+    assert body["meta"]["truncated"] is False
     rows = body["rows"]
     assert rows[0]["coin_id"] == "high1"
     assert rows[0]["tier"] == "high"
