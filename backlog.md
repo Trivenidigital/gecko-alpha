@@ -1246,6 +1246,11 @@ ssh root@89.167.116.187 "journalctl -u gecko-pipeline --since '24 hours ago' | g
 ssh root@89.167.116.187 "sqlite3 /root/gecko-alpha/scout.db \"SELECT COUNT(*) FROM tg_alert_log WHERE outcome='m1_5c_announcement_sent'\""  # expect 1
 ```
 
+**D+14 kill-criterion outcome (2026-06-12): UNEVALUABLE as designed + emit-stop diagnosed.**
+- **Paste denominator was never instrumented.** `minara_alert_emissions` = **81 emitted / 0 `operator_paste_acknowledged_at`** — but the operator-facing ack UI (the BL-NEW-MINARA-DB-PERSISTENCE "future UI") was never built, so `paste_ack=0` means *unmeasured*, not *zero pastes*. The emit-vs-paste kill-criterion **cannot be computed from data**; it needs operator self-report.
+- **Emissions stopped 2026-05-30** (last emit 2026-05-30T00:17Z; 81 total over 2026-05-22..05-30, 61 distinct coins). Root cause is NOT a flag flip (`MINARA_ALERT_ENABLED=True`) nor a dead alert stream (TG `sent` rows continue ~5/day). Two compounding factors: (1) **alert volume into the dispatch path collapsed** — paper-trade alerts reaching `tg_alert_dispatch` fell from ~13.6/day to ~0.8/day (joined-to-paper) after the 24h-dedup deploy (#336, 2026-05-30) + the paper-open drop after 2026-06-04 — mostly *expected* (dedup working + quieter trading); and (2) a **genuine bug for `chain='solana'` tokens** — see `BL-NEW-MINARA-SOLANA-NATIVE-ID` below: 5 natively-Solana `sent` alerts since 2026-05-30 produced 0 emits.
+- **Decision:** kill-criterion stays OPEN pending operator self-reported paste count (the only path to the emit-vs-paste ratio). Emit side is healthy modulo the solana-native bug.
+
 **Revert:** `MINARA_ALERT_ENABLED=False` + restart. No code rollback, no DB cleanup. Migration is forward-only but idempotent.
 
 **Post-merge folds (deferred from 3-vector PR review):**
@@ -1289,6 +1294,15 @@ GROUP BY day ORDER BY day;
 **Backfill consideration:** the 10+ events already emitted since 2026-05-11 are in journalctl only. A one-time backfill script can parse the journalctl JSON lines into the new table — captures the soak window's history. Bounded by journalctl retention (~30 days max).
 
 **Estimate:** ~2-3 hours for migration + write logic + backfill script + tests + PR review + deploy. Should ship before 2026-05-22 (D+11) to leave 3-day buffer for the D+14 query to have clean data.
+
+### BL-NEW-MINARA-SOLANA-NATIVE-ID: emit for natively-Solana tokens, not just CG-slug Solana-listed
+**Status:** PROPOSED 2026-06-12 — surfaced during the M1.5C emit-stop investigation (§9c data-path trace). **5 `chain='solana'` `sent` alerts since 2026-05-30 produced 0 Minara emissions** while the CG-slug path still works (1 `chain='coingecko'` emit in the same window).
+**Tag:** `minara` `m1_5c` `solana` `bug` `silent-gap`
+**Root cause:** `scout/trading/minara_alert.py:maybe_minara_command` resolves Solana-ness *only* by calling `fetch_coin_detail(coin_id=token_id)` → CG `/coins/{id}` → `platforms.solana`. The new `chain='solana'` input class carries an **SPL contract address** as `token_id`, so `/coins/{SPL-addr}` 404s, `fetch_coin_detail` returns empty, and the function returns None — no command, no emit. The Solana-detector cannot detect tokens that are *already* Solana-native.
+**Fix sketch:** when `chain == 'solana'` (or `token_id` matches the base58 SPL shape already validated downstream, 32–44 chars), **skip the CG lookup and use `token_id` directly as the SPL address** to build the `minara swap --to <addr>` command. Keep the existing CG-platforms path for `chain='coingecko'` slugs. Reuse the base58 validation already in `maybe_minara_command` (lines ~168+). Add a unit test with a `chain='solana'` SPL-address token asserting an emit.
+**Drift verdict:** NET-NEW. No existing entry covers native-Solana id handling; BL-NEW-M1.5C (#96) shipped the CG-slug path only.
+**Hermes verdict:** project-internal; no Hermes skill applies.
+**Blast radius:** additive — only adds emits for a class currently emitting nothing. Behind `MINARA_ALERT_ENABLED`. **Estimate:** ~1-2h (logic + test + deploy).
 
 ### BL-NEW-MINARA-COOLDOWN-REVERIFY: re-verify Minara per-coin cooldown after parallel-session soak merges
 **Status:** AUDITED-NO-VIOLATION 2026-05-19 — runtime verification on srilu-vps (`journalctl -u gecko-pipeline --since 2026-05-11 | grep minara_alert_command_emitted`) returned 54 total emits across 10 distinct multi-emit coins; **0 intra-coin gaps under 6h**. Shortest observed gap was `goblincoin` at ~17.5h (2026-05-11T22:26 → 2026-05-12T15:57), well above the 6h cooldown documented in BL-NEW-M1.5C. Empirical observation of `goblincoin` double-emit referenced in the original filing was already legitimate under the current cooldown. The conditional re-verify trigger ("parallel-session cooldown PR lands on gecko-alpha master") has not fired — no Minara cooldown PR is visible in `git log -- scout/trading/minara_alert.py scout/trading/tg_alert_dispatch.py` since 2026-05-13. Closing as AUDITED-NO-VIOLATION; reopen only if a parallel-session cooldown PR later lands on master AND a new audit returns gaps under the new threshold.
