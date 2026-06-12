@@ -32,7 +32,9 @@ async def client(db):
     app = create_app(db_path=db_path)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c, db[0]
+        # Yield the raw aiosqlite connection (Database exposes ._conn, not
+        # .execute/.commit) so the insert helper writes directly.
+        yield c, db[0]._conn
     if api_mod._scout_db is not None:
         await api_mod._scout_db.close()
         api_mod._scout_db = None
