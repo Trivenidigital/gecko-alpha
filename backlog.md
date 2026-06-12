@@ -1741,6 +1741,17 @@ All 13 entries below were surfaced by the cycle-change audit findings doc and st
 
 ### BL-075: Slow-burn miss diagnostic + watcher (RIV-shape blind spot)
 **Status:** PHASE A + PHASE B SHIPPED 2026-05-10. **Phase A** (mcap-missing telemetry) shipped 2026-05-03; 6d telemetry showed 53.5% mcap-null rate (>5% gate → Phase B unblocked). **Phase B** PR #91 (`395feab`) `detect_slow_burn_7d` + schema 20260515; PR #93 (`975c45b`) silent-skip telemetry follow-up (heartbeat counter + all-skipped WARNING + always-emit summary log). 21 first-cycle detections; 47.6% momentum overlap (under 70% gate). **14d shadow soak ends 2026-05-24** — kill criterion + promotion-to-paper-dispatch decision at that point. See memory `project_bl075_phase_b_2026_05_10.md`.
+
+**Promotion verdict (2026-06-12, shadow-PnL eval on srilu — soak ran 33d, 283 distinct coins): PROMOTE to flag-gated paper-dispatch.** Forward-peak multiple per detection (peak from `volume_history_cg` after first detection; 237/283 measurable):
+
+| cohort | measurable | 2x | 3x | 5x |
+|---|---|---|---|---|
+| slow_burn | 237 | 17 (7.2%) | 8 (3.4%) | 3 (1.3%) |
+| velocity_alerter (same method) | 153 | 11 (7.2%) | 8 (5.2%) | 2 (1.3%) |
+
+**Gate result: PASS.** Slow_burn's runner-catch rate *matches* velocity_alerter (equal at 2x and 5x; velocity marginally higher at 3x), and — the decisive complementarity test ("catches misses the existing layer doesn't") — **the two biggest runners were slow_burn-ONLY: VELVET 12.9x (det 2026-06-05) and BEAT 11.8x, both never flagged by velocity_alerter** (4 of 8 slow_burn 3x+ runners are slow_burn-only). VELVET is the same token tracked as a +1835% CAUGHT gainer — slow_burn flagged it independently and early.
+
+**Action:** promote to a real signal_type with paper dispatch behind `SLOW_BURN_DISPATCH_ENABLED=False` (default off, per the Phase-B acceptance spec), then a forward paper-PnL soak to convert "reached 5x peak" into "captured PnL" before any live-eligibility. **Caveats:** small n (3/2 five-baggers); forward-PEAK is an upper bound, not realized PnL (entry/trail/exit haircut); 46/283 coins unmeasurable (no forward price in `volume_history_cg`). File `BL-NEW-SLOW-BURN-DISPATCH-PROMOTION` for implementation.
 **Tag:** `phase-a-shipped` `phase-b-shipped` `shadow-soak-active` `detection-blind-spot`
 **Motivating evidence (2026-05-03):** RIV (`riv-coin`) ran $2M → $200M mcap over 30 days — exactly the asymmetric move the system exists to surface. SSH audit against prod `scout.db` returned **zero rows** for RIV across `gainers_snapshots`, `trending_snapshots`, `velocity_alerts`, `volume_spikes`, `momentum_7d`, `second_wave_candidates`, `predictions`, `narrative_signals`, `chain_matches`, `tg_social_signals`, `candidates`, `paper_trades`, `alerts`. Only trace: one row in `price_cache` from 2026-05-01T00:08Z with `market_cap=0.0` (CoinGecko returned null mcap, our parser writes 0). For context: gainers polling captured 90,002 rows in last 30d; trending captured 5,655. Polling is healthy. RIV simply never appeared in either.
 **Best-fit hypothesis (three compounding causes):**
