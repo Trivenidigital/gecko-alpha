@@ -66,6 +66,7 @@ from scout.trading.signals import (
     trade_first_signals,
     trade_gainers,
     trade_losers,
+    trade_slow_burn,
     trade_trending,
     trade_volume_spikes,
 )
@@ -307,7 +308,9 @@ async def _run_feedback_schedulers(
                 _combo_refresh_streak_last_alerted = _combo_refresh_failure_streak
                 # Fire once per streak (reset when refresh succeeds).
                 try:
-                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                    async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=15)
+                    ) as session:
                         await alerter.send_telegram_message(
                             f"⚠ combo_refresh failed {_combo_refresh_failure_streak}× "
                             f"in a row — check logs.",
@@ -328,7 +331,9 @@ async def _run_feedback_schedulers(
         try:
             from scout.trading.auto_suspend import maybe_suspend_signals
 
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as session:
                 suspended = await maybe_suspend_signals(db, settings, session=session)
             if suspended:
                 logger.info("auto_suspend_pass", count=len(suspended))
@@ -696,9 +701,7 @@ async def _fetch_coingecko_lanes(
     # the now-disabled midcap lane (page-neutral). Sets last_raw_deep_volume for
     # the combined raw markets -> record_volume -> volume_history_cg, and its
     # tokens flow to aggregate/candidates for the tracker pipeline-surface lead.
-    cg_deep_volume = await _call(
-        "deep_volume", cg_fetch_deep_volume, session, settings
-    )
+    cg_deep_volume = await _call("deep_volume", cg_fetch_deep_volume, session, settings)
     if coingecko_limiter.is_backing_off():
         logger.warning("coingecko_lanes_stopped_for_backoff", after="deep_volume")
         return (
@@ -804,9 +807,7 @@ async def run_cycle(
         )
         cg_midcap_gainers = []
     if isinstance(cg_deep_volume, Exception):
-        logger.warning(
-            "CoinGecko deep-volume scan failed", error=str(cg_deep_volume)
-        )
+        logger.warning("CoinGecko deep-volume scan failed", error=str(cg_deep_volume))
         cg_deep_volume = []
     if isinstance(held_position_raw, Exception):
         logger.warning("held_position_refresh failed", error=str(held_position_raw))
@@ -995,6 +996,21 @@ async def run_cycle(
                 )
         except Exception:
             logger.exception("slow_burn_error")
+        # BL-NEW-SLOW-BURN-DISPATCH-PROMOTION: promote to paper dispatch behind
+        # a flag (default OFF). Reads the slow_burn_candidates rows
+        # detect_slow_burn_7d just wrote; opens a paper trade per new detection
+        # (signal_type='slow_burn') subject to mcap + junk + suppression gates.
+        if trading_engine and settings.SLOW_BURN_DISPATCH_ENABLED:
+            try:
+                await trade_slow_burn(
+                    trading_engine,
+                    db,
+                    min_mcap=settings.SLOW_BURN_DISPATCH_MIN_MCAP,
+                    max_mcap=settings.SLOW_BURN_MAX_MCAP,
+                    settings=settings,
+                )
+            except Exception:
+                logger.exception("slow_burn_trade_dispatch_error")
 
     # Velocity Alerter (1h extreme-pump research alert, no paper trade)
     if settings.VELOCITY_ALERTS_ENABLED and _raw_markets_combined:
@@ -1339,9 +1355,7 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
 
     # Prune old candidates if DB > 500MB
     try:
-        db_size = (
-            settings.DB_PATH.stat().st_size if settings.DB_PATH.exists() else 0
-        )
+        db_size = settings.DB_PATH.stat().st_size if settings.DB_PATH.exists() else 0
         if db_size > 500_000_000:
             pruned = await db.prune_old_candidates(keep_days=7)
             logger.info(
@@ -1353,9 +1367,7 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
         logger.warning("DB prune error", error=str(e))
 
     try:
-        await db.prune_perp_anomalies(
-            keep_days=settings.PERP_ANOMALY_RETENTION_DAYS
-        )
+        await db.prune_perp_anomalies(keep_days=settings.PERP_ANOMALY_RETENTION_DAYS)
     except Exception as e:
         logger.warning("perp_anomaly_prune_error", error=str(e))
 
@@ -1704,7 +1716,9 @@ async def main(argv: list[str] | None = None) -> int:
     # alarming) and shouldn't generate a "master kill OFF" alert.
     if getattr(settings, "LIVE_TRADING_ENABLED", False) and live_config.mode == "live":
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as _startup_session:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as _startup_session:
                 await alerter.send_telegram_message(
                     (
                         "[live-trading] master kill OFF — "
@@ -1817,6 +1831,7 @@ async def main(argv: list[str] | None = None) -> int:
             negative_ttl=timedelta(seconds=60),
             db=db,
         )
+
         async def _kill_switch_alert(message: str) -> None:
             # §12b: plain-text operator alert for automated kill-switch state
             # changes (the highest-stakes automated state reversal in the
@@ -1993,7 +2008,9 @@ async def main(argv: list[str] | None = None) -> int:
     _reset_heartbeat_stats()
 
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as session:
             # BL-NEW-TG-ALERT-ALLOWLIST (R1-I3+I5 design fold): wire the
             # session into trading_engine for TG alert dispatch. Engine was
             # constructed pre-session-context above; set_tg_session is the

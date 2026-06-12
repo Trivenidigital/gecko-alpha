@@ -22,6 +22,7 @@ from scout.trading.signals import (
     trade_gainers,
     trade_losers,
     trade_predictions,
+    trade_slow_burn,
     trade_trending,
     trade_volume_spikes,
 )
@@ -82,6 +83,31 @@ async def _insert_loser(db, coin_id, market_cap, price=1.0):
             price_at_snapshot, snapshot_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (coin_id, coin_id.upper(), coin_id, -25.0, market_cap, 100_000.0, price, now),
+    )
+    await db._conn.commit()
+
+
+async def _insert_slow_burn(db, coin_id, market_cap, price=1.0):
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        """INSERT INTO slow_burn_candidates
+           (coin_id, symbol, name, price_change_7d, price_change_1h,
+            price_change_24h, market_cap, current_price, volume_24h,
+            also_in_momentum_7d, detected_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            coin_id,
+            coin_id.upper(),
+            coin_id,
+            60.0,
+            2.0,
+            10.0,
+            market_cap,
+            price,
+            200_000.0,
+            0,
+            now,
+        ),
     )
     await db._conn.commit()
 
@@ -201,6 +227,52 @@ async def test_trade_gainers_skips_below_min_mcap(db, engine, settings):
 async def test_trade_gainers_skips_null_mcap(db, engine, settings):
     await _insert_gainer(db, "null-mcap", market_cap=None)
     await trade_gainers(engine, db, min_mcap=5_000_000, settings=settings)
+    assert await _open_count(db) == 0
+
+
+# ---------------- trade_slow_burn (BL-NEW-SLOW-BURN-DISPATCH-PROMOTION) ------
+
+
+async def test_trade_slow_burn_opens_trade_when_mcap_above_min(db, engine, settings):
+    await _insert_slow_burn(db, "burn-big", market_cap=10_000_000)
+    await trade_slow_burn(engine, db, min_mcap=500_000, settings=settings)
+    assert await _open_count(db) == 1
+
+
+async def test_trade_slow_burn_skips_below_min_mcap(db, engine, settings):
+    await _insert_slow_burn(db, "burn-micro", market_cap=100_000)
+    await trade_slow_burn(engine, db, min_mcap=500_000, settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_slow_burn_skips_null_mcap(db, engine, settings):
+    await _insert_slow_burn(db, "burn-null", market_cap=None)
+    await trade_slow_burn(engine, db, min_mcap=500_000, settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_slow_burn_skips_already_open(db, engine, settings):
+    await _insert_slow_burn(db, "burn-dup", market_cap=10_000_000)
+    await trade_slow_burn(engine, db, min_mcap=500_000, settings=settings)
+    # A second detection of the still-open token must not double-open.
+    await _insert_slow_burn(db, "burn-dup", market_cap=10_000_000)
+    await trade_slow_burn(engine, db, min_mcap=500_000, settings=settings)
+    assert await _open_count(db) == 1
+
+
+async def test_trade_slow_burn_respects_suppression(db, engine, settings):
+    # build_combo_key(signal_type='slow_burn', signals=None) == 'slow_burn'
+    await _suppress_combo(db, "slow_burn")
+    await _insert_slow_burn(db, "burn-supp", market_cap=10_000_000)
+    await trade_slow_burn(engine, db, min_mcap=500_000, settings=settings)
+    assert await _open_count(db) == 0
+
+
+async def test_trade_slow_burn_skips_above_max_mcap(db, engine, settings):
+    await _insert_slow_burn(db, "burn-mega", market_cap=300_000_000)
+    await trade_slow_burn(
+        engine, db, min_mcap=500_000, max_mcap=200_000_000, settings=settings
+    )
     assert await _open_count(db) == 0
 
 

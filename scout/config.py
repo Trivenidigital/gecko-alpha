@@ -289,6 +289,13 @@ class Settings(BaseSettings):
     SLOW_BURN_MIN_VOLUME: float = 100_000
     # calibration era: undocumented -- see BL-NEW-CALIBRATION-ERA-DOC
     SLOW_BURN_DEDUP_DAYS: int = 7
+    # BL-NEW-SLOW-BURN-DISPATCH-PROMOTION (2026-06-12): promote slow-burn from
+    # shadow-only to paper dispatch. Default OFF — flip True to start the
+    # forward paper-PnL soak. Promotion gate PASSED (BL-075): slow_burn's
+    # 5x-runner rate matched velocity_alerter and uniquely caught VELVET 12.9x
+    # + BEAT 11.8x. Revert: SLOW_BURN_DISPATCH_ENABLED=False (no DB cleanup).
+    SLOW_BURN_DISPATCH_ENABLED: bool = False
+    SLOW_BURN_DISPATCH_MIN_MCAP: float = 500_000.0
 
     # -------- Volume Spike Detector --------
     VOLUME_SPIKE_ENABLED: bool = True
