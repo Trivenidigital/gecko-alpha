@@ -40,6 +40,11 @@ DEFAULT_SIGNAL_TYPES: frozenset[str] = frozenset(
         "volume_spike",
         "chain_completed",
         "tg_social",
+        # BL-NEW-SLOW-BURN-DISPATCH-PROMOTION: registers slow_burn as a real
+        # paper-dispatch signal_type. Inherits global Settings params via the
+        # _settings_params fallback until the operator calibrates a
+        # signal_params row (slow burns are multi-day — expect longer duration).
+        "slow_burn",
     }
 )
 
