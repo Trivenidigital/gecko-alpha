@@ -1050,7 +1050,7 @@ These decisions were reviewed and approved. Reference them when implementing P1 
 
 **Revert:** `UPDATE signal_params SET conviction_lock_enabled=0` (disables BL-067 entirely incl. the widening). For narrower revert, `PAPER_CONVICTION_LOCK_ENABLED=False` in .env + restart.
 
-**D+14 evaluation:** 2026-05-25T14:03Z. Query template in memory file.
+**D+14 evaluation:** 2026-05-25T14:03Z (executed 2026-06-12). **Verdict: INCONCLUSIVE — mechanism never exercised (NOT a failure).** §9c lever-vs-data-path: of 32 qualifying closes (conviction-locked stack≥2, peak<20%, since deploy), the exit-type split is **16 `closed_sl` / 9 `closed_expired` / 6 `closed_peak_fade` (mean giveback 0.8pp — clean) / 1 `closed_floor`, and 0 `closed_trailing_stop`** — the *only* exit the `trail_pct_low_peak` widening governs. The aggregate "fail" (mean giveback 21.2pp, 24/32 >15pp) is dominated by stop-loss exits the lever never touches; the widened trail has not fired once on a qualifying trade. The pre-registered criteria mis-specified the population (all closes, not trailing-stop closes). **Action:** EXTEND with `closed_trailing_stop`-only criteria; **P1-uniform width-lock is NOT blocked** (the dependency gate keys on P2 *failure*, and this is not a failure). **Real residual surfaced:** low-peak conviction-locked trades stop out (`closed_sl`, mean 30.1pp giveback, 16/32) before the trailing stop ever arms — the open question is upstream of trail width (entry/SL placement), not the conviction-lock trail widening.
 
 ### BL-NEW-LIVE-ELIGIBLE: would_be_live writer with tier-based eligibility (BL-060 revival)
 **Status:** SHIPPED 2026-05-11 — PR #98 (`8a07662`) squash-merged + deployed VPS 2026-05-11T13:22Z. Closes the ~3-week-old BL-060 writer gap (column existed since 2026-04-23 but all 752 closed trades had NULL/0). See data analysis `tasks/findings_live_eligibility_winners_vs_losers_2026_05_11.md` + memory `project_live_eligible_writer_shipped_2026_05_11.md`.
@@ -1156,7 +1156,7 @@ Without Q2's answer, the 4-week dashboard verdict still leaves the operator with
 **Estimate:** ~3-4 hours weekly digest + cron + tests.
 
 ### BL-NEW-COHORT-DIGEST-DECISION: act on cohort-digest 4-week evidence
-**Status:** PROPOSED 2026-05-17 — filed concurrent with BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST shipping. Evidence-gated on the 4-week measurement window.
+**Status:** RESOLVED 2026-06-12 — verdict **TRACK-WIDER** (no live-review trigger). Final digest fired 2026-06-08T09:00:31Z (`cohort_digest_state.last_final_block_fired_at`). Original PROPOSED 2026-05-17 note retained below.
 **Trigger:** 2026-06-08 (anchor — first eligible Monday at or after). Per V28 SHOULD-FIX fallback: digest fires on first eligible run with `end_date >= COHORT_DIGEST_FINAL_DATE AND last_final_block_fired_at IS NULL`.
 **Pre-registered criteria** (per `tasks/plan_live_eligible_weekly_digest.md` § Decision criteria):
 - EXTEND if per-signal flip events ≥ 2 within window (instability) — file `BL-NEW-COHORT-DIGEST-DECISION-EXTENDED`
@@ -1166,8 +1166,18 @@ Without Q2's answer, the 4-week dashboard verdict still leaves the operator with
 **Decision artifact:** findings doc + backlog flip + memory checkpoint update.
 **decision-by:** 2026-06-08
 
+**Verdict (2026-06-12, recomputed from srilu `paper_trades`, window 2026-05-11..2026-06-08): TRACK-WIDER.** The eligible (`would_be_live=1`) cohort beats the full cohort on every structurally-eligible signal, but none crosses the strong-pattern bar (`STRONG_WR_GAP_PP=15` strict + sign-flip), so **no RECOMMEND-LIVE-REVIEW**:
+
+| signal | n_full | wr_full | n_elig | wr_elig | wrΔ |
+|---|---|---|---|---|---|
+| chain_completed | 153 | 54% | 29 | 62% | +8pp (moderate) |
+| volume_spike | 67 | 34% | 20 | 40% | +6pp (moderate) |
+| gainers_early | 223 | 50% | 35 | 54% | +4pp (tracking) |
+
+Structurally non-eligible (n_elig=0): narrative_prediction (n=166, 20% WR, +$568), losers_contrarian (n=146, 45%, +$1389), tg_social, trending_catch, first_signal — reinforces `BL-NEW-LIVE-EVALUABLE-SIGNAL-AUDIT` (~half the firehose can never go live). Not INCONCLUSIVE (eligible n=35/29/20). **Action:** file `BL-NEW-COHORT-DIGEST-EXTEND-4w`; do NOT escalate to BL-055.
+
 ### BL-NEW-HPF-RE-EVALUATION: re-evaluate `PAPER_HIGH_PEAK_FADE_DRY_RUN` flip decision at n≥20
-**Status:** ACTIVE — D+7 review closed 2026-05-13T04:05Z (audit row id=25, `signal_params_audit.field_name='soak_verdict'`, value `dry_run_continued`). HPF dry-run produced n=7 would-fires by 2026-05-13; pre-registered criterion was ambiguous and aggregate counter-factual was −$45 vs actuals, so the flip is deferred rather than acted on. Continue accumulating toward n≥20.
+**Status:** ACTIVE — D+7 review closed 2026-05-13T04:05Z (audit row id=25, `signal_params_audit.field_name='soak_verdict'`, value `dry_run_continued`). HPF dry-run produced n=7 would-fires by 2026-05-13; pre-registered criterion was ambiguous and aggregate counter-factual was −$45 vs actuals, so the flip is deferred rather than acted on. Continue accumulating toward n≥20. **(2026-06-12 check:** `high_peak_fade_audit WHERE dry_run=1` = **n=10**, still <20 → **EXTEND**. Accumulation is ~3 fires/month (7→10 in the ~30d since 2026-05-13), so n≥20 lands ~Sept 2026. §11a flag — at this rate the soak may not converge usefully; consider re-scoping the n-gate to the moonshot_trail subset only, since that is the only subset where HPF beat the incumbent.)**
 
 **2026-05-13 closure — subset finding (structural, §9c lever-vs-data-path):**
 
