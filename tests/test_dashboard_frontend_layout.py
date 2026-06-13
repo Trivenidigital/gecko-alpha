@@ -133,9 +133,10 @@ def test_trade_inbox_decision_board_is_primary_scan_surface():
     assert "decisionBoard.late" in tab
     assert "decisionBoard.blocked_summary" in tab
     assert tab.index("Trade Decision Board") < tab.index("GROUPS.map")
-    assert "<table" not in tab[
-        tab.index("Trade Decision Board") : tab.index("GROUPS.map")
-    ].lower()
+    assert (
+        "<table"
+        not in tab[tab.index("Trade Decision Board") : tab.index("GROUPS.map")].lower()
+    )
 
     for selector in (
         ".trade-decision-board",
@@ -527,3 +528,25 @@ def test_tg_alerts_tab_exposes_factual_operator_action_buttons():
     lowered = text.lower()
     for phrase in banned:
         assert phrase not in lowered
+
+
+def test_conviction_tab_is_wired_to_dashboard():
+    app = (ROOT / "dashboard" / "frontend" / "App.jsx").read_text(encoding="utf-8")
+    tab = (
+        ROOT / "dashboard" / "frontend" / "components" / "ConvictionTab.jsx"
+    ).read_text(encoding="utf-8")
+    # wired into App
+    assert "ConvictionTab" in app
+    assert "activeTab === 'conviction'" in app
+    assert "<ConvictionTab />" in app
+    # component content / contract
+    assert "/api/conviction/shortlist" in tab
+    assert "Conviction Shortlist" in tab
+    assert "RETROSPECTIVE" in tab  # honest framing surfaced in the UI
+    assert "Top conviction" in tab and "Newest" in tab  # the two sort views
+    assert (
+        "sort=recency" in tab or "sort: 'recency'" in tab or "setSort('recency')" in tab
+    )
+    assert "contributing_surfaces" in tab
+    assert "convictionSeen" in tab  # new-since-last-visit tracking
+    assert "NEW" in tab

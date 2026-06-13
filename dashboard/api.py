@@ -888,6 +888,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def conviction_shortlist(
         limit: int = Query(50, ge=1, le=500),
         min_tier: str = Query("low", pattern="^(low|watch|high)$"),
+        sort: str = Query("score", pattern="^(score|recency)$"),
     ):
         """BL-NEW-CROSS-SURFACE-CONVICTION-SCORE: read-only conviction ranking.
 
@@ -943,15 +944,28 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     "appeared_on_gainers_at": c.get("appeared_on_gainers_at"),
                 }
             )
-        # Deterministic order: score, then realized peak, then recency tiebreak.
-        scored.sort(
-            key=lambda x: (
-                x["conviction_score"],
-                x["peak_gain_pct"] or 0.0,
-                x["appeared_on_gainers_at"] or "",
-            ),
-            reverse=True,
-        )
+        # Two deterministic orderings:
+        #   score   — highest conviction first (default; the actionable shortlist)
+        #   recency — newest-appeared first (to spot NEW high-conviction plays),
+        #             conviction as the within-time tiebreak.
+        if sort == "recency":
+            scored.sort(
+                key=lambda x: (
+                    x["appeared_on_gainers_at"] or "",
+                    x["conviction_score"],
+                    x["peak_gain_pct"] or 0.0,
+                ),
+                reverse=True,
+            )
+        else:
+            scored.sort(
+                key=lambda x: (
+                    x["conviction_score"],
+                    x["peak_gain_pct"] or 0.0,
+                    x["appeared_on_gainers_at"] or "",
+                ),
+                reverse=True,
+            )
         return {
             "meta": {
                 "read_only": True,
@@ -968,6 +982,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     settings, "CONVICTION_WATCH_TIER_MIN_SURFACES", 2
                 ),
                 "min_tier": min_tier,
+                "sort": sort,
                 "total_tracked": total_tracked,
                 "pool_considered": len(comparisons),
                 "pool_cap": pool_cap,
