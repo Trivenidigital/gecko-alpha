@@ -26,7 +26,10 @@ function fmtIso(iso) {
 
 function loadSeen() {
   try {
-    return JSON.parse(localStorage.getItem('convictionSeen') || '{}')
+    const v = JSON.parse(localStorage.getItem('convictionSeen') || '{}')
+    // Guard against a stored literal `null`/array/scalar: JSON.parse("null")
+    // returns null (no throw), and null[coin_id] would crash the tab render.
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : {}
   } catch {
     return {}
   }
@@ -44,7 +47,10 @@ export default function ConvictionTab() {
   const [loading, setLoading] = useState(false)
   const [minTier, setMinTier] = useState('high')
   const [sort, setSort] = useState('score')
-  const [seen, setSeen] = useState(loadSeen)
+  // "Seen before this visit" — frozen at mount so NEW badges stay stable for the
+  // whole visit (computing against a live-updating set made them flash off after
+  // the first render). loadSeen() is type-guarded against corrupt stored values.
+  const [visitSnapshot] = useState(loadSeen)
 
   const fetchShortlist = useCallback(async () => {
     setLoading(true)
@@ -73,27 +79,27 @@ export default function ConvictionTab() {
   const rows = payload?.rows || []
   const meta = payload?.meta || {}
 
-  // Mark coins not seen before this device as NEW, then remember them.
+  // NEW = appeared since the last visit (relative to the frozen snapshot).
   const newFlags = useMemo(() => {
     const flags = {}
-    for (const r of rows) flags[r.coin_id] = !seen[r.coin_id]
+    for (const r of rows) flags[r.coin_id] = !visitSnapshot[r.coin_id]
     return flags
-  }, [rows, seen])
+  }, [rows, visitSnapshot])
 
+  // Persist current coins to localStorage (re-read + merge, no React state) so the
+  // NEXT visit's snapshot includes them. Does NOT touch visitSnapshot — badges
+  // stay stable this visit. Re-reading avoids any stale-state race.
   useEffect(() => {
     if (rows.length === 0) return
-    const next = { ...seen }
+    const stored = loadSeen()
     let changed = false
     for (const r of rows) {
-      if (!next[r.coin_id]) {
-        next[r.coin_id] = new Date().toISOString()
+      if (!stored[r.coin_id]) {
+        stored[r.coin_id] = new Date().toISOString()
         changed = true
       }
     }
-    if (changed) {
-      setSeen(next)
-      saveSeen(next)
-    }
+    if (changed) saveSeen(stored)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [payload])
 
@@ -108,10 +114,10 @@ export default function ConvictionTab() {
             Tracked gainers ranked by EARLY cross-surface confirmation. Read-only — not trade advice.
           </span>
           <span style={{ marginLeft: 'auto', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button className="tab-btn" onClick={() => setMinTier('high')} style={{ padding: '2px 8px', fontSize: 12, opacity: minTier === 'high' ? 1 : 0.6 }}>High</button>
-            <button className="tab-btn" onClick={() => setMinTier('watch')} style={{ padding: '2px 8px', fontSize: 12, opacity: minTier === 'watch' ? 1 : 0.6 }}>Watch+</button>
-            <button className="tab-btn" onClick={() => setSort('score')} style={{ padding: '2px 8px', fontSize: 12, opacity: sort === 'score' ? 1 : 0.6 }}>Top conviction</button>
-            <button className="tab-btn" onClick={() => setSort('recency')} style={{ padding: '2px 8px', fontSize: 12, opacity: sort === 'recency' ? 1 : 0.6 }}>Newest</button>
+            <button className="tab-btn" aria-pressed={minTier === 'high'} onClick={() => setMinTier('high')} style={{ padding: '2px 8px', fontSize: 12, opacity: minTier === 'high' ? 1 : 0.6 }}>High</button>
+            <button className="tab-btn" aria-pressed={minTier === 'watch'} onClick={() => setMinTier('watch')} style={{ padding: '2px 8px', fontSize: 12, opacity: minTier === 'watch' ? 1 : 0.6 }}>Watch+</button>
+            <button className="tab-btn" aria-pressed={sort === 'score'} onClick={() => setSort('score')} style={{ padding: '2px 8px', fontSize: 12, opacity: sort === 'score' ? 1 : 0.6 }}>Top conviction</button>
+            <button className="tab-btn" aria-pressed={sort === 'recency'} onClick={() => setSort('recency')} style={{ padding: '2px 8px', fontSize: 12, opacity: sort === 'recency' ? 1 : 0.6 }}>Newest</button>
             <button className="tab-btn" onClick={fetchShortlist} disabled={loading} style={{ padding: '2px 8px', fontSize: 12 }}>
               {loading ? 'Refreshing…' : 'Refresh'}
             </button>
@@ -137,7 +143,9 @@ export default function ConvictionTab() {
         <div className="panel-header">Ranked plays</div>
         {rows.length === 0 ? (
           <div className="empty-state" style={{ padding: 16 }}>
-            No rows at this tier (does not imply none exist — try Watch+).
+            {meta.enabled === false
+              ? 'Conviction scoring is disabled (CONVICTION_SCORE_ENABLED=False).'
+              : 'No rows at this tier (does not imply none exist — try Watch+).'}
           </div>
         ) : (
           <div style={{ overflowX: 'auto' }}>

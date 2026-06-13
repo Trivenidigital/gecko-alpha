@@ -986,7 +986,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 "total_tracked": total_tracked,
                 "pool_considered": len(comparisons),
                 "pool_cap": pool_cap,
-                "truncated": total_tracked > len(comparisons),
+                "truncated": (
+                    total_tracked > len(comparisons)
+                    if total_tracked >= 0
+                    else len(comparisons) >= pool_cap  # count failed → pool-side
+                ),
                 "returned": min(len(scored), limit),
             },
             "rows": scored[:limit],
