@@ -545,8 +545,13 @@ def test_conviction_tab_is_wired_to_dashboard():
     assert "RETROSPECTIVE" in tab  # honest framing surfaced in the UI
     assert "Top conviction" in tab and "Newest" in tab  # the two sort views
     assert (
-        "sort=recency" in tab or "sort: 'recency'" in tab or "setSort('recency')" in tab
+        "sort=recency" in tab
+        or "sort: 'recency'" in tab
+        or "setSort('recency')" in tab
+        or "setServerSort('recency')" in tab
     )
+    # switching the server order toggle resets the client column sort (Codex P2)
+    assert "resetSort" in tab
     assert "contributing_surfaces" in tab
     assert "convictionSeen" in tab  # new-since-last-visit tracking
     assert "NEW" in tab
