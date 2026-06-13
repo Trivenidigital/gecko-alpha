@@ -550,3 +550,13 @@ def test_conviction_tab_is_wired_to_dashboard():
     assert "contributing_surfaces" in tab
     assert "convictionSeen" in tab  # new-since-last-visit tracking
     assert "NEW" in tab
+    # column filtering + sorting
+    assert "import { useSort, SortHeader } from './useSort.jsx'" in tab
+    assert "<SortHeader" in tab
+    assert "Filter symbol" in tab  # symbol search box
+    assert "min surfaces" in tab  # min early_count filter
+    assert "min peak%" in tab  # min peak filter
+    assert "any surface" in tab and "surfaceFilter" in tab  # surface dropdown
+    assert "showing {sorted.length} of {rows.length}" in tab  # filtered count
+    assert "No rows match the active filters" in tab  # filtered-empty state distinct
+    assert "_tier_rank" in tab  # tier sorts by rank not text

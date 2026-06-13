@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import TokenLink from './TokenLink'
+import { useSort, SortHeader } from './useSort.jsx'
 
 // BL-NEW-CONVICTION-DASHBOARD-PANEL: read-only UI over /api/conviction/shortlist.
 // RETROSPECTIVE — rows are coins that ALREADY appeared on the +20% gainers
@@ -7,6 +8,8 @@ import TokenLink from './TokenLink'
 // Not a pre-pump buy list. Observe-first.
 
 const TIER_COLORS = { high: 'var(--color-accent-green)', watch: 'var(--color-accent-amber)', low: 'var(--color-text-secondary)' }
+const TIER_RANK = { high: 3, watch: 2, low: 1 }
+const SURFACES = ['chains', 'pipeline', 'narrative', 'spikes', 'momentum', 'slow_burn', 'acceleration', 'velocity']
 
 function fmtPct(n) {
   if (n == null) return '-'
@@ -47,6 +50,11 @@ export default function ConvictionTab() {
   const [loading, setLoading] = useState(false)
   const [minTier, setMinTier] = useState('high')
   const [sort, setSort] = useState('score')
+  // Per-column client-side filters over the fetched rows.
+  const [symbolQuery, setSymbolQuery] = useState('')
+  const [minSurfaces, setMinSurfaces] = useState('')
+  const [minPeak, setMinPeak] = useState('')
+  const [surfaceFilter, setSurfaceFilter] = useState('any')
   // "Seen before this visit" — frozen at mount so NEW badges stay stable for the
   // whole visit (computing against a live-updating set made them flash off after
   // the first render). loadSeen() is type-guarded against corrupt stored values.
@@ -105,6 +113,39 @@ export default function ConvictionTab() {
 
   const newCount = rows.filter((r) => newFlags[r.coin_id]).length
 
+  // Per-column filters (client-side over the fetched rows). Numeric inputs are
+  // tolerant: blank/NaN => no constraint.
+  const filtered = useMemo(() => {
+    const q = symbolQuery.trim().toLowerCase()
+    const minS = Number.parseFloat(minSurfaces)
+    const minP = Number.parseFloat(minPeak)
+    return rows.filter((r) => {
+      if (q) {
+        const hay = `${r.symbol || ''} ${r.name || ''} ${r.coin_id || ''}`.toLowerCase()
+        if (!hay.includes(q)) return false
+      }
+      if (Number.isFinite(minS) && (r.early_count || 0) < minS) return false
+      if (Number.isFinite(minP) && (r.peak_gain_pct || 0) < minP) return false
+      if (surfaceFilter !== 'any' && !(r.contributing_surfaces || []).includes(surfaceFilter)) return false
+      return true
+    })
+  }, [rows, symbolQuery, minSurfaces, minPeak, surfaceFilter])
+
+  // Enrich with a numeric tier rank so the Tier column sorts by rank, not text.
+  const enriched = useMemo(
+    () => filtered.map((r) => ({ ...r, _tier_rank: TIER_RANK[r.tier] || 0 })),
+    [filtered]
+  )
+  const { sorted, sortCol, sortDir, handleSort } = useSort(enriched, 'conviction_score', 'desc')
+
+  const filtersActive = symbolQuery || minSurfaces || minPeak || surfaceFilter !== 'any'
+  const clearFilters = () => {
+    setSymbolQuery('')
+    setMinSurfaces('')
+    setMinPeak('')
+    setSurfaceFilter('any')
+  }
+
   return (
     <div>
       <div className="panel" style={{ marginBottom: 16 }}>
@@ -140,28 +181,62 @@ export default function ConvictionTab() {
       </div>
 
       <div className="panel">
-        <div className="panel-header">Ranked plays</div>
+        <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <span>Ranked plays</span>
+          <input
+            type="text"
+            placeholder="Filter symbol…"
+            aria-label="Filter by symbol"
+            value={symbolQuery}
+            onChange={(e) => setSymbolQuery(e.target.value)}
+            style={{ fontSize: 12, padding: '2px 6px', width: 130 }}
+          />
+          <label style={{ fontSize: 12 }}>
+            min surfaces{' '}
+            <input type="number" min="0" max="8" aria-label="Minimum early surfaces" value={minSurfaces} onChange={(e) => setMinSurfaces(e.target.value)} style={{ width: 48, fontSize: 12 }} />
+          </label>
+          <label style={{ fontSize: 12 }}>
+            min peak%{' '}
+            <input type="number" min="0" aria-label="Minimum peak gain percent" value={minPeak} onChange={(e) => setMinPeak(e.target.value)} style={{ width: 64, fontSize: 12 }} />
+          </label>
+          <select aria-label="Filter by confirming surface" value={surfaceFilter} onChange={(e) => setSurfaceFilter(e.target.value)} style={{ fontSize: 12 }}>
+            <option value="any">any surface</option>
+            {SURFACES.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+          {filtersActive ? (
+            <button className="tab-btn" onClick={clearFilters} style={{ padding: '2px 8px', fontSize: 12 }}>Clear</button>
+          ) : null}
+          <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--color-text-secondary)' }}>
+            showing {sorted.length} of {rows.length}
+          </span>
+        </div>
         {rows.length === 0 ? (
           <div className="empty-state" style={{ padding: 16 }}>
             {meta.enabled === false
               ? 'Conviction scoring is disabled (CONVICTION_SCORE_ENABLED=False).'
               : 'No rows at this tier (does not imply none exist — try Watch+).'}
           </div>
+        ) : sorted.length === 0 ? (
+          <div className="empty-state" style={{ padding: 16 }}>
+            No rows match the active filters. <button className="tab-btn" onClick={clearFilters} style={{ padding: '2px 8px', fontSize: 12 }}>Clear filters</button>
+          </div>
         ) : (
           <div style={{ overflowX: 'auto' }}>
             <table className="candidates-table">
               <thead>
                 <tr>
-                  <th>Token</th>
-                  <th>Tier</th>
-                  <th>Early surfaces</th>
-                  <th>Peak gain</th>
+                  <SortHeader col="symbol" label="Token" sortCol={sortCol} sortDir={sortDir} onSort={handleSort} />
+                  <SortHeader col="_tier_rank" label="Tier" sortCol={sortCol} sortDir={sortDir} onSort={handleSort} />
+                  <SortHeader col="early_count" label="Early surfaces" sortCol={sortCol} sortDir={sortDir} onSort={handleSort} />
+                  <SortHeader col="peak_gain_pct" label="Peak gain" sortCol={sortCol} sortDir={sortDir} onSort={handleSort} />
                   <th>Confirming surfaces</th>
-                  <th>Appeared on gainers</th>
+                  <SortHeader col="appeared_on_gainers_at" label="Appeared on gainers" sortCol={sortCol} sortDir={sortDir} onSort={handleSort} />
                 </tr>
               </thead>
               <tbody>
-                {rows.map((r) => (
+                {sorted.map((r) => (
                   <tr key={r.coin_id}>
                     <td>
                       <TokenLink tokenId={r.coin_id} symbol={r.symbol || r.name} chain="coingecko" />
