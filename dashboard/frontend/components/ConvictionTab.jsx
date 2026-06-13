@@ -144,7 +144,14 @@ export default function ConvictionTab() {
   // Default col=null preserves the server order (Top conviction / Newest toggle)
   // until the user clicks a header to re-sort the shown rows — so the toggle is
   // never silently overridden by a default client sort.
-  const { sorted, sortCol, sortDir, handleSort } = useSort(enriched, null, 'desc')
+  const { sorted, sortCol, sortDir, handleSort, resetSort } = useSort(enriched, null, 'desc')
+  // Switching the server ordering (Top conviction / Newest) clears any active client
+  // column sort, so the new server order is actually shown instead of being silently
+  // re-ordered by a stale column click.
+  const setServerSort = (mode) => {
+    setSort(mode)
+    resetSort()
+  }
   const visibleNewCount = sorted.filter((r) => newFlags[r.coin_id]).length
 
   const filtersActive = symbolQuery || minSurfaces || minPeak || surfaceFilter !== 'any'
@@ -166,8 +173,8 @@ export default function ConvictionTab() {
           <span style={{ marginLeft: 'auto', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <button className="tab-btn" aria-pressed={minTier === 'high'} onClick={() => setMinTier('high')} style={{ padding: '2px 8px', fontSize: 12, opacity: minTier === 'high' ? 1 : 0.6 }}>High</button>
             <button className="tab-btn" aria-pressed={minTier === 'watch'} onClick={() => setMinTier('watch')} style={{ padding: '2px 8px', fontSize: 12, opacity: minTier === 'watch' ? 1 : 0.6 }}>Watch+</button>
-            <button className="tab-btn" aria-pressed={sort === 'score'} onClick={() => setSort('score')} style={{ padding: '2px 8px', fontSize: 12, opacity: sort === 'score' ? 1 : 0.6 }}>Top conviction</button>
-            <button className="tab-btn" aria-pressed={sort === 'recency'} onClick={() => setSort('recency')} style={{ padding: '2px 8px', fontSize: 12, opacity: sort === 'recency' ? 1 : 0.6 }}>Newest</button>
+            <button className="tab-btn" aria-pressed={sort === 'score'} onClick={() => setServerSort('score')} style={{ padding: '2px 8px', fontSize: 12, opacity: sort === 'score' ? 1 : 0.6 }}>Top conviction</button>
+            <button className="tab-btn" aria-pressed={sort === 'recency'} onClick={() => setServerSort('recency')} style={{ padding: '2px 8px', fontSize: 12, opacity: sort === 'recency' ? 1 : 0.6 }}>Newest</button>
             <button className="tab-btn" onClick={fetchShortlist} disabled={loading} style={{ padding: '2px 8px', fontSize: 12 }}>
               {loading ? 'Refreshing…' : 'Refresh'}
             </button>
