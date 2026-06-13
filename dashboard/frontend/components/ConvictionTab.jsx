@@ -111,8 +111,6 @@ export default function ConvictionTab() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [payload])
 
-  const newCount = rows.filter((r) => newFlags[r.coin_id]).length
-
   // Per-column filters (client-side over the fetched rows). Numeric inputs are
   // tolerant: blank/NaN => no constraint.
   const filtered = useMemo(() => {
@@ -131,12 +129,23 @@ export default function ConvictionTab() {
     })
   }, [rows, symbolQuery, minSurfaces, minPeak, surfaceFilter])
 
-  // Enrich with a numeric tier rank so the Tier column sorts by rank, not text.
+  // Enrich with numeric sort proxies: tier rank (so Tier sorts high>watch>low,
+  // not alphabetically) and an epoch ts (so the date column sorts numerically,
+  // not via locale-sensitive string compare).
   const enriched = useMemo(
-    () => filtered.map((r) => ({ ...r, _tier_rank: TIER_RANK[r.tier] || 0 })),
+    () =>
+      filtered.map((r) => ({
+        ...r,
+        _tier_rank: TIER_RANK[r.tier] || 0,
+        _appeared_ts: Date.parse(r.appeared_on_gainers_at) || 0,
+      })),
     [filtered]
   )
-  const { sorted, sortCol, sortDir, handleSort } = useSort(enriched, 'conviction_score', 'desc')
+  // Default col=null preserves the server order (Top conviction / Newest toggle)
+  // until the user clicks a header to re-sort the shown rows — so the toggle is
+  // never silently overridden by a default client sort.
+  const { sorted, sortCol, sortDir, handleSort } = useSort(enriched, null, 'desc')
+  const visibleNewCount = sorted.filter((r) => newFlags[r.coin_id]).length
 
   const filtersActive = symbolQuery || minSurfaces || minPeak || surfaceFilter !== 'any'
   const clearFilters = () => {
@@ -169,7 +178,7 @@ export default function ConvictionTab() {
             RETROSPECTIVE: these coins already appeared on the gainers tracker — a conviction ranking, NOT a pre-pump buy list.
           </div>
           <div>
-            tier≥{minTier} · sort={sort} · returned={meta.returned ?? '?'} of total_tracked={meta.total_tracked ?? '?'} · high-gate=≥{meta.high_tier_min_surfaces ?? '?'} early surfaces (≥{((meta.early_lead_minutes ?? 1440) / 60).toFixed(0)}h before +20%) · new-since-last-visit={newCount}
+            tier≥{minTier} · sort={sort} · returned={meta.returned ?? '?'} of total_tracked={meta.total_tracked ?? '?'} · high-gate=≥{meta.high_tier_min_surfaces ?? '?'} early surfaces (≥{((meta.early_lead_minutes ?? 1440) / 60).toFixed(0)}h before +20%) · new-since-last-visit={visibleNewCount}
           </div>
           {meta.truncated ? (
             <div style={{ marginTop: 6, color: 'var(--color-accent-amber)' }}>
@@ -232,7 +241,7 @@ export default function ConvictionTab() {
                   <SortHeader col="early_count" label="Early surfaces" sortCol={sortCol} sortDir={sortDir} onSort={handleSort} />
                   <SortHeader col="peak_gain_pct" label="Peak gain" sortCol={sortCol} sortDir={sortDir} onSort={handleSort} />
                   <th>Confirming surfaces</th>
-                  <SortHeader col="appeared_on_gainers_at" label="Appeared on gainers" sortCol={sortCol} sortDir={sortDir} onSort={handleSort} />
+                  <SortHeader col="_appeared_ts" label="Appeared on gainers" sortCol={sortCol} sortDir={sortDir} onSort={handleSort} />
                 </tr>
               </thead>
               <tbody>
