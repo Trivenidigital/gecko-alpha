@@ -13,6 +13,14 @@ export function useSort(data, defaultCol, defaultDir = 'desc') {
     }
   }
 
+  // Restore the initial sort (used when an external ordering control takes over,
+  // e.g. a server-side sort toggle, so a stale client column sort doesn't silently
+  // override it). Additive — existing consumers may ignore it.
+  const resetSort = () => {
+    setSortCol(defaultCol)
+    setSortDir(defaultDir)
+  }
+
   const sorted = useMemo(() => {
     if (!Array.isArray(data) || data.length === 0) return data || []
     return [...data].sort((a, b) => {
@@ -31,7 +39,7 @@ export function useSort(data, defaultCol, defaultDir = 'desc') {
     })
   }, [data, sortCol, sortDir])
 
-  return { sorted, sortCol, sortDir, handleSort }
+  return { sorted, sortCol, sortDir, handleSort, resetSort }
 }
 
 export function SortHeader({ col, label, sortCol, sortDir, onSort }) {
