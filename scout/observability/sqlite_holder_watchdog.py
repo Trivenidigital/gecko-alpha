@@ -32,6 +32,13 @@ def classify_is_expected_service(cgroup: str, expected_units: list[str]) -> bool
     return any(unit in cgroup for unit in expected_units)
 
 
+def proc_available(proc_root: str = "/proc") -> bool:
+    """Whether the /proc scan can run. Lets the caller distinguish a genuine
+    'zero holders' result from a blind watchdog (no readable /proc), which
+    otherwise both look like an empty scan."""
+    return os.path.isdir(proc_root)
+
+
 def _read_text(path: str) -> str:
     try:
         with open(path, "r") as fh:

@@ -34,7 +34,9 @@ async def test_checkpoint_busy_with_concurrent_reader(tmp_path):
     reader = await aiosqlite.connect(str(tmp_path / "t.db"))
     try:
         await reader.execute("BEGIN")
-        await (await reader.execute("SELECT COUNT(*) FROM t")).fetchall()  # pin snapshot
+        await (
+            await reader.execute("SELECT COUNT(*) FROM t")
+        ).fetchall()  # pin snapshot
         await db._conn.execute("INSERT INTO t VALUES (999)")
         await db._conn.commit()
         res = await db.checkpoint_wal_truncate()
@@ -43,6 +45,24 @@ async def test_checkpoint_busy_with_concurrent_reader(tmp_path):
         await reader.rollback()
         await reader.close()
         await db.close()
+
+
+async def test_checkpoint_requires_initialized_db(tmp_path):
+    """P1 (gate-3): guard both _conn and _txn_lock so a pre-init call raises
+    RuntimeError, not AttributeError on `async with None`."""
+    import pytest
+
+    db = Database(str(tmp_path / "noinit.db"))  # not initialized
+    with pytest.raises(RuntimeError):
+        await db.checkpoint_wal_truncate()
+
+
+async def test_incremental_vacuum_requires_initialized_db(tmp_path):
+    import pytest
+
+    db = Database(str(tmp_path / "noinit.db"))
+    with pytest.raises(RuntimeError):
+        await db.run_incremental_vacuum()
 
 
 async def _incremental_db(tmp_path, n=20000):

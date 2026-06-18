@@ -6662,7 +6662,7 @@ class Database:
         pinning frames) — callers MUST treat ``busy != 0`` as not-success
         (it is the silent-failure mode behind the 2026-06-18 WAL bloat).
         """
-        if self._conn is None:
+        if self._conn is None or self._txn_lock is None:
             raise RuntimeError("Database not initialized")
         async with self._txn_lock:
             cur = await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -6687,7 +6687,7 @@ class Database:
         ``(N)`` argument caps the page count (verified on SQLite 3.50.4).
         Returns ``{auto_vacuum, freelist_before, freelist_after, pages_reclaimed}``.
         """
-        if self._conn is None:
+        if self._conn is None or self._txn_lock is None:
             raise RuntimeError("Database not initialized")
 
         async def _pragma_int(name: str) -> int:

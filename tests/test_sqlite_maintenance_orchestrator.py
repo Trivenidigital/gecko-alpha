@@ -122,6 +122,7 @@ def _stale_holder(pid):
 async def test_stale_reader_alert_dispatched_and_delivered(
     monkeypatch, settings_factory
 ):
+    monkeypatch.setattr(m, "proc_available", lambda *a, **k: True)
     monkeypatch.setattr(m, "scan_db_holders", lambda *a, **k: [_stale_holder(999)])
     send = AsyncMock()
     _install_fake_alerter(monkeypatch, send)
@@ -143,6 +144,7 @@ async def test_stale_reader_alert_failure_not_marked_delivered(
     monkeypatch, settings_factory
 ):
     """Fold 2: a non-raising send is required before logging delivered/deduping."""
+    monkeypatch.setattr(m, "proc_available", lambda *a, **k: True)
     monkeypatch.setattr(m, "scan_db_holders", lambda *a, **k: [_stale_holder(888)])
     send = AsyncMock(side_effect=RuntimeError("telegram 500"))
     _install_fake_alerter(monkeypatch, send)
@@ -158,6 +160,7 @@ async def test_stale_reader_alert_failure_not_marked_delivered(
 
 
 async def test_stale_reader_alert_deduped_across_runs(monkeypatch, settings_factory):
+    monkeypatch.setattr(m, "proc_available", lambda *a, **k: True)
     monkeypatch.setattr(m, "scan_db_holders", lambda *a, **k: [_stale_holder(777)])
     send = AsyncMock()
     _install_fake_alerter(monkeypatch, send)
@@ -174,3 +177,85 @@ async def test_stale_reader_alert_deduped_across_runs(monkeypatch, settings_fact
         FakeDB(), object(), s, structlog.get_logger(), state=state
     )
     send.assert_awaited_once()  # second run deduped
+
+
+# ---- gate-3 P1: consecutive-busy checkpoint alert ----
+
+_BUSY_STATE = {"wal_size_bytes": 999_000_000, "freelist_count": 0}
+
+
+def _busy_db():
+    return FakeDB(ckpt={"busy": 1, "log_frames": 10, "checkpointed_frames": 0})
+
+
+async def test_consecutive_busy_alerts_after_threshold(monkeypatch, settings_factory):
+    monkeypatch.setattr(m, "scan_db_holders", lambda *a, **k: [])
+    send = AsyncMock()
+    _install_fake_alerter(monkeypatch, send)
+    s = settings_factory(
+        SQLITE_STALE_READER_WATCHDOG_ENABLED=False,
+        SQLITE_INCREMENTAL_VACUUM_ENABLED=False,
+        SQLITE_WAL_CHECKPOINT_BUSY_ALERT_THRESHOLD=2,
+    )
+    m._reset_alert_dedup_for_tests()
+    db = _busy_db()
+    ev1 = _events(await _run(db, s, _BUSY_STATE))
+    assert "sqlite_wal_checkpoint_busy" in ev1
+    assert "sqlite_wal_checkpoint_busy_alert_dispatched" not in ev1  # below threshold
+    ev2 = _events(await _run(db, s, _BUSY_STATE))
+    assert "sqlite_wal_checkpoint_busy_alert_dispatched" in ev2
+    assert "sqlite_wal_checkpoint_busy_alert_delivered" in ev2
+    send.assert_awaited_once()
+    assert send.await_args.kwargs.get("parse_mode") is None
+    assert send.await_args.kwargs.get("raise_on_failure") is True
+
+
+async def test_busy_alert_deduped_within_episode(monkeypatch, settings_factory):
+    monkeypatch.setattr(m, "scan_db_holders", lambda *a, **k: [])
+    send = AsyncMock()
+    _install_fake_alerter(monkeypatch, send)
+    s = settings_factory(
+        SQLITE_STALE_READER_WATCHDOG_ENABLED=False,
+        SQLITE_INCREMENTAL_VACUUM_ENABLED=False,
+        SQLITE_WAL_CHECKPOINT_BUSY_ALERT_THRESHOLD=1,
+    )
+    m._reset_alert_dedup_for_tests()
+    db = _busy_db()
+    for _ in range(3):
+        await m.run_sqlite_maintenance(
+            db, object(), s, structlog.get_logger(), state=_BUSY_STATE
+        )
+    send.assert_awaited_once()  # one alert for the whole busy episode
+
+
+async def test_busy_success_resets_episode(monkeypatch, settings_factory):
+    monkeypatch.setattr(m, "scan_db_holders", lambda *a, **k: [])
+    send = AsyncMock()
+    _install_fake_alerter(monkeypatch, send)
+    s = settings_factory(
+        SQLITE_STALE_READER_WATCHDOG_ENABLED=False,
+        SQLITE_INCREMENTAL_VACUUM_ENABLED=False,
+        SQLITE_WAL_CHECKPOINT_BUSY_ALERT_THRESHOLD=1,
+    )
+    m._reset_alert_dedup_for_tests()
+    busy = _busy_db()
+    ok = FakeDB(ckpt={"busy": 0, "log_frames": 0, "checkpointed_frames": 0})
+    log = structlog.get_logger()
+    await m.run_sqlite_maintenance(busy, object(), s, log, state=_BUSY_STATE)  # alert 1
+    await m.run_sqlite_maintenance(ok, object(), s, log, state=_BUSY_STATE)  # reset
+    await m.run_sqlite_maintenance(busy, object(), s, log, state=_BUSY_STATE)  # alert 2
+    assert send.await_count == 2
+
+
+async def test_blind_watchdog_logs_unavailable(monkeypatch, settings_factory):
+    monkeypatch.setattr(m, "proc_available", lambda *a, **k: False)
+    scanned = []
+    monkeypatch.setattr(m, "scan_db_holders", lambda *a, **k: scanned.append(1) or [])
+    s = settings_factory(
+        SQLITE_WAL_CHECKPOINT_ENABLED=False,
+        SQLITE_INCREMENTAL_VACUUM_ENABLED=False,
+    )
+    ev = _events(await _run(FakeDB(), s, {"wal_size_bytes": 0, "freelist_count": 0}))
+    assert "sqlite_stale_reader_scan_unavailable" in ev
+    assert "sqlite_stale_reader_scan" not in ev
+    assert scanned == []

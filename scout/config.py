@@ -421,6 +421,11 @@ class Settings(BaseSettings):
     # freelist online. See tasks/plan_sqlite_durable_maintenance_2026_06_18.md.
     SQLITE_WAL_CHECKPOINT_ENABLED: bool = True
     SQLITE_WAL_CHECKPOINT_THRESHOLD_BYTES: int = Field(default=100_000_000, ge=0)
+    # Alert the operator after N CONSECUTIVE busy checkpoints — covers the
+    # WAL-pin case where the holder is younger than the stale-reader age gate
+    # OR is an expected service (e.g. a long dashboard read), which the
+    # stale-reader watchdog alone would not surface (gate-3 failure-mode review).
+    SQLITE_WAL_CHECKPOINT_BUSY_ALERT_THRESHOLD: int = Field(default=3, ge=1)
     SQLITE_INCREMENTAL_VACUUM_ENABLED: bool = True
     SQLITE_INCREMENTAL_VACUUM_FREELIST_THRESHOLD: int = Field(default=50_000, ge=0)
     SQLITE_INCREMENTAL_VACUUM_MAX_PAGES: int = Field(default=200_000, ge=0)
