@@ -1,5 +1,17 @@
 # Backlog — gecko-alpha
 
+## Completed Work: 2026-06-18 - first_signal extend-soak verdict (P2)
+
+**Status:** CLOSED-AS-EXTEND-SOAK. Runtime-verified live on srilu-vps
+2026-06-18T21:38:59Z: `first_signal` is enabled, not suspended, not TG/live
+eligible, revival boundary `2026-05-31T12:46:51.476977+00:00`. Post-revival
+cohort is 14 trades / 12 closed / net -$439.83; positive-tail rate is 25.0%
+under the original strict status definition, or 41.7% if positive `closed_floor`
+exits are included. This maps to the pre-registered EXTEND-SOAK row, not
+RETIRE. Finding: `tasks/findings_first_signal_extend_soak_2026_06_18.md`.
+Next gate: re-check at 2026-07-02T12:46:51Z or earlier if post-revival closed
+trades reach n>=20.
+
 ## Completed Work: 2026-06-18 - slow_burn paper dispatch disabled (failed soak)
 
 **Status:** CLOSED-FAILED. slow_burn forward paper-dispatch soak failed: 39 closed
@@ -1383,7 +1395,7 @@ Last updated: 2026-05-19 (cycle 15: overnight drift-cleanup audit — closed 12 
 - BL-064 14d TG social soak (L464) — ELAPSED-OPERATIONAL-GAP; superseded by Narrative Scanner V1.1.
 - Paper-lifecycle widening duplicate (L465) — duplicate of L420 head closure.
 - narrative_prediction token_id divergence (L516) — duplicate of L521 head closure (PR #80 `eaf3523`, event-evidenced via commit SHA).
-- first_signal revival decision (L524) — DECIDED-REVIVE-AND-SOAK per `backlog.md:1791`; 14d soak ends 2026-05-31 (operator-gated, do not pre-close).
+- first_signal revival decision (L524) — DECIDED-REVIVE-AND-SOAK per prior findings; post-revival verdict filed 2026-06-18 as EXTEND-SOAK, not retire. See `tasks/findings_first_signal_extend_soak_2026_06_18.md`; next gate 2026-07-02T12:46:51Z or closed n>=20.
 
 **Runtime-verified after PR-stage R3 CRITICAL fold (1 item):**
 - PR #82 BL-NEW-MOONSHOT-OPT-OUT deploy (L426) — DEPLOY-VERIFIED 2026-05-19. srilu `signal_params` has `moonshot_enabled INTEGER NOT NULL DEFAULT 1`; `paper_migrations` has `bl_moonshot_opt_out_v1|2026-05-09T16:15:22.266116+00:00`; `schema_version` has `20260507|bl_moonshot_opt_out_v1`. The earlier audit-row example was not the actual migration shape; `scout/db.py:_migrate_moonshot_opt_out_column` stamps `paper_migrations` + `schema_version`.
@@ -1989,7 +2001,7 @@ When user asks "how is strategy tuning going" tomorrow:
 - [x] **narrative_prediction token_id divergence — UPSTREAM FIX SHIPPED 2026-05-06** (PR #80 / `eaf3523`). Original symptom (32/56 stale-young opens) resolved by PR #72 + zombie cleanup. Real upstream cause was agent.py emitting `category_heating` with `token_id=accel.category_id`, breaking chain pattern matching. Pre-fix: 2,770 anchors → 2 chain_completes. Post-fix: per-laggard emission with `token.coin_id`.
 - [x] **#5 @s1mple_s1mple verdict — DO-NOT-ADD 2026-05-06.** Esports diary, no crypto.
 - [x] **moonshot floor nullification — UPSTREAM FIX MERGED 2026-05-06** (PR #82, deploy held until 2026-05-13). Per-signal `moonshot_enabled INTEGER NOT NULL DEFAULT 1` opt-out flag.
-- [x] **first_signal revival decision** — under combined-gate rule, first_signal would NOT auto-fire (-$132 30d net is borderline). Operator decision: revive for soak, or leave suspended. Note: revival now subject to 7-day cool-off (PR #81); first revival ever bypasses cool-off cleanly. **CLOSED 2026-05-19 (audit): DECIDED-REVIVE-AND-SOAK per `backlog.md:1792-1793` (BL-NEW-FIRST-SIGNAL-RETIREMENT-DECISION SHIPPED-WITH-DECISION 2026-05-17, Option A REVIVE-AND-SOAK 14d window ending 2026-05-31). Memory checkpoint: `project_first_signal_revival_decision_2026_05_31.md`. Pre-registered verdict criteria + n≥10 trip-wire + 28d auto-extend + early-halt at n≥20 per CLAUDE.md §11. The 2026-05-31 soak-end is operator-gated per the assignment guardrail ("do NOT start... first_signal 2026-05-31 early").**
+- [x] **first_signal revival decision** — under combined-gate rule, first_signal would NOT auto-fire (-$132 30d net is borderline). Operator decision: revive for soak, or leave suspended. Note: revival now subject to 7-day cool-off (PR #81); first revival ever bypasses cool-off cleanly. **CLOSED 2026-05-19 (audit): DECIDED-REVIVE-AND-SOAK per `backlog.md:1792-1793` (BL-NEW-FIRST-SIGNAL-RETIREMENT-DECISION SHIPPED-WITH-DECISION 2026-05-17, Option A REVIVE-AND-SOAK). Post-revival verdict filed 2026-06-18: 14 trades / 12 closed / net -$439.83; positive-tail rate above 17%, so EXTEND-SOAK, not retire. See `tasks/findings_first_signal_extend_soak_2026_06_18.md`; next gate 2026-07-02T12:46:51Z or closed n>=20.**
 
 ## What shipped this session (2026-04-28 → 2026-04-29)
 
