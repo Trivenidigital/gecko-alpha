@@ -147,7 +147,9 @@ async def send_social_alert(
         # the call doesn't silently break if alerter's default parse_mode
         # is ever flipped. CLAUDE.md §12b — intentional formatting with
         # tested escape coverage.
-        await send_telegram_message(text, session, settings, parse_mode="Markdown")
+        await send_telegram_message(
+            text, session, settings, parse_mode="Markdown", source="lunarcrush_social"
+        )
         return True, None
     except Exception as exc:
         logger.exception("social_alert_send_failed", count=len(alerts))

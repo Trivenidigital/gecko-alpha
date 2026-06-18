@@ -555,7 +555,11 @@ async def narrative_agent_loop(
                                         accel, alertable, top_3_coins
                                     )
                                     await send_telegram_message(
-                                        alert_text, session, settings, parse_mode=None
+                                        alert_text,
+                                        session,
+                                        settings,
+                                        parse_mode=None,
+                                        source="narrative_agent",
                                     )
                                     logger.info(
                                         "narrative.alert_sent", category=accel.name
@@ -700,7 +704,11 @@ async def narrative_agent_loop(
                         if digest_text:
                             try:
                                 await send_telegram_message(
-                                    digest_text, session, settings, parse_mode=None
+                                    digest_text,
+                                    session,
+                                    settings,
+                                    parse_mode=None,
+                                    source="narrative_agent",
                                 )
                             except Exception:
                                 logger.exception("trading_digest_send_error")

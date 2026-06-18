@@ -314,7 +314,9 @@ async def send_weekly_digest(db: Database, settings: Settings) -> None:
     Opens a single aiohttp.ClientSession for the lifetime of this dispatch.
     Matches alerter.send_telegram_message(text, session, settings) signature."""
     corr = f"wd-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{secrets.token_hex(2)}"
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=15)
+    ) as session:
         try:
             text = await build_weekly_digest(db, date.today(), settings)
             if text is None:
@@ -333,7 +335,7 @@ async def send_weekly_digest(db: Database, settings: Settings) -> None:
 
             for chunk in chunks:
                 await alerter.send_telegram_message(
-                    chunk, session, settings, parse_mode=None
+                    chunk, session, settings, parse_mode=None, source="weekly_digest"
                 )
             log.info("weekly_digest_sent", bytes=len(text))
         except Exception as e:
@@ -344,6 +346,7 @@ async def send_weekly_digest(db: Database, settings: Settings) -> None:
                     session,
                     settings,
                     parse_mode=None,
+                    source="weekly_digest",
                 )
             except Exception:
                 log.exception("weekly_digest_fallback_dispatch_error", corr=corr)

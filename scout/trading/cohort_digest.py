@@ -84,9 +84,7 @@ def _classify_verdict(
     )
     if strongPattern:
         return "strong-pattern (exploratory)"
-    if signFlipRaw or (
-        wrDelta is not None and abs(wrDelta) > moderate_wr_gap_pp
-    ):
+    if signFlipRaw or (wrDelta is not None and abs(wrDelta) > moderate_wr_gap_pp):
         return "moderate"
     return "tracking"
 
@@ -109,8 +107,7 @@ async def _compute_all_cohorts_stats(
     placeholders = ",".join(["?"] * len(_LIVE_ELIGIBLE_ENUMERATED_TYPES))
 
     # Full cohort — mirrors dashboard/db.py:1148-1167 verbatim (status, pnl_usd, closed_at).
-    full_q = (
-        f"""SELECT signal_type, COUNT(*) AS n,
+    full_q = f"""SELECT signal_type, COUNT(*) AS n,
                   SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
                   COALESCE(SUM(pnl_usd), 0) AS pnl
              FROM paper_trades
@@ -119,14 +116,12 @@ async def _compute_all_cohorts_stats(
               AND closed_at < ?
               AND signal_type IN ({placeholders})
             GROUP BY signal_type"""
-    )
     cur = await db._conn.execute(
         full_q, (start_iso, end_iso, *_LIVE_ELIGIBLE_ENUMERATED_TYPES)
     )
     full_rows = await cur.fetchall()
 
-    eligible_q = (
-        f"""SELECT signal_type, COUNT(*) AS n,
+    eligible_q = f"""SELECT signal_type, COUNT(*) AS n,
                   SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
                   COALESCE(SUM(pnl_usd), 0) AS pnl
              FROM paper_trades
@@ -136,7 +131,6 @@ async def _compute_all_cohorts_stats(
               AND signal_type IN ({placeholders})
               AND would_be_live = 1
             GROUP BY signal_type"""
-    )
     cur = await db._conn.execute(
         eligible_q, (start_iso, end_iso, *_LIVE_ELIGIBLE_ENUMERATED_TYPES)
     )
@@ -155,9 +149,7 @@ async def _compute_all_cohorts_stats(
     result: dict[str, dict] = {}
     for signal_type in _LIVE_ELIGIBLE_ENUMERATED_TYPES:
         fN, fWins, fPnl, fWr = full_by_signal.get(signal_type, (0, 0, 0.0, 0.0))
-        eN, eWins, ePnl, eWr_raw = elig_by_signal.get(
-            signal_type, (0, 0, 0.0, 0.0)
-        )
+        eN, eWins, ePnl, eWr_raw = elig_by_signal.get(signal_type, (0, 0, 0.0, 0.0))
         eWr = eWr_raw if eN > 0 else None
         wrDelta = (eWr - fWr) if eWr is not None else None
         result[signal_type] = {
@@ -185,8 +177,15 @@ async def _compute_signal_cohort_stats(
         return all_stats[signal_type]
     # Signal not in enumerated types — synthesize empty result for tests
     return {
-        "fN": 0, "fWins": 0, "fPnl": 0.0, "fWr": 0.0,
-        "eN": 0, "eWins": 0, "ePnl": 0.0, "eWr": None, "wrDelta": None,
+        "fN": 0,
+        "fWins": 0,
+        "fPnl": 0.0,
+        "fWr": 0.0,
+        "eN": 0,
+        "eWins": 0,
+        "ePnl": 0.0,
+        "eWr": None,
+        "wrDelta": None,
     }
 
 
@@ -247,12 +246,8 @@ def _format_signal_block(signal_type: str, stats: dict, verdict: str) -> list[st
     delta_str = f"{wrDelta:+.1f}pp" if wrDelta is not None else "n/a"
     signFlip = (fPnl > 0 and ePnl < 0) or (fPnl < 0 and ePnl > 0)
     flip_str = "YES" if signFlip else "no"
-    lines.append(
-        f"  eligible: n={eN}, wr={e_wr_str}, pnl=${ePnl:+.0f}"
-    )
-    lines.append(
-        f"  full:     n={fN}, wr={fWr:.1f}%, pnl=${fPnl:+.0f}"
-    )
+    lines.append(f"  eligible: n={eN}, wr={e_wr_str}, pnl=${ePnl:+.0f}")
+    lines.append(f"  full:     n={fN}, wr={fWr:.1f}%, pnl=${fPnl:+.0f}")
     lines.append(f"  Δwr={delta_str}, signFlip={flip_str} → {verdict}")
     return lines
 
@@ -282,9 +277,7 @@ def _classify_all(
     }
 
 
-def _build_final_block(
-    current_verdicts: dict[str, dict]
-) -> list[str]:
+def _build_final_block(current_verdicts: dict[str, dict]) -> list[str]:
     """V28 SHOULD-FIX final-window decision-recommendation block.
     Softened wording — BL-055 live-trading is the gating dependency."""
     by_label: dict[str, list[str]] = {
@@ -304,25 +297,20 @@ def _build_final_block(
             "Strong-pattern signals (exploratory): "
             + ", ".join(by_label["strong-pattern (exploratory)"])
         )
-        out.append(
-            "  → Recommend operator review for live-promotion candidacy."
-        )
+        out.append("  → Recommend operator review for live-promotion candidacy.")
         out.append(
             "    (BL-055 live-trading unlock is the gating dependency; "
             "this is a pre-approval signal, not an auto-promote.)"
         )
     if by_label["moderate"]:
         out.append("Moderate signals: " + ", ".join(by_label["moderate"]))
-        out.append(
-            "  → Continue paper soak; re-evaluate at +4w."
-        )
+        out.append("  → Continue paper soak; re-evaluate at +4w.")
     if by_label["tracking"]:
         out.append("Tracking signals: " + ", ".join(by_label["tracking"]))
         out.append("  → No regime change observed. Continue as-is.")
     if by_label["near-identical"]:
         out.append(
-            "Near-identical / Excluded: "
-            + ", ".join(by_label["near-identical"])
+            "Near-identical / Excluded: " + ", ".join(by_label["near-identical"])
         )
         out.append("  → Structural — verdict not informative.")
     return out
@@ -349,9 +337,9 @@ async def build_cohort_digest(
     )
 
     # Activity check: any non-zero fN in either window?
-    activity = any(
-        s["fN"] > 0 for s in curr_stats.values()
-    ) or any(s["fN"] > 0 for s in prev_stats.values())
+    activity = any(s["fN"] > 0 for s in curr_stats.values()) or any(
+        s["fN"] > 0 for s in prev_stats.values()
+    )
     if not activity:
         log.info("cohort_digest_empty", end_date=end_date.isoformat())
         return None
@@ -380,9 +368,7 @@ async def build_cohort_digest(
         lines.append("")
 
     if flips:
-        flip_strs = [
-            f"{sig} ({prev} → {curr})" for sig, prev, curr in flips
-        ]
+        flip_strs = [f"{sig} ({prev} → {curr})" for sig, prev, curr in flips]
         lines.append("⚠ FLIPS THIS WEEK: " + ", ".join(flip_strs))
         lines.append("")
         # V28 SHOULD-FIX rolled-up event: ONE WARNING per digest.
@@ -424,7 +410,9 @@ async def send_cohort_digest(db: Database, settings: Settings) -> None:
 
     corr = f"cd-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{secrets.token_hex(2)}"
     today = date.today()
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=15)
+    ) as session:
         try:
             text = await build_cohort_digest(db, today, settings)
             if text is None:
@@ -443,7 +431,7 @@ async def send_cohort_digest(db: Database, settings: Settings) -> None:
 
             for chunk in chunks:
                 await alerter.send_telegram_message(
-                    chunk, session, settings, parse_mode=None
+                    chunk, session, settings, parse_mode=None, source="cohort_digest"
                 )
             log.info("cohort_digest_sent", bytes=len(text))
 
@@ -461,8 +449,7 @@ async def send_cohort_digest(db: Database, settings: Settings) -> None:
                     session,
                     settings,
                     parse_mode=None,
+                    source="cohort_digest",
                 )
             except Exception:
-                log.exception(
-                    "cohort_digest_fallback_dispatch_error", corr=corr
-                )
+                log.exception("cohort_digest_fallback_dispatch_error", corr=corr)

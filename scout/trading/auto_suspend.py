@@ -180,6 +180,7 @@ async def _send_suspend_alert(
             session,
             settings,
             parse_mode=None,
+            source="auto_suspend",
         )
         log.info(
             "auto_suspend_alert_delivered",

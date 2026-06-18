@@ -36,8 +36,11 @@ async def test_send_telegram_message_records_dispatch_when_enabled():
         async with aiohttp.ClientSession() as session:
             with structlog.testing.capture_logs() as logs:
                 await send_telegram_message(
-                    "hello", session, settings,
-                    parse_mode=None, source="test-suite",
+                    "hello",
+                    session,
+                    settings,
+                    parse_mode=None,
+                    source="test-suite",
                 )
 
     observed = [e for e in logs if e.get("event") == "tg_dispatch_observed"]
@@ -56,9 +59,7 @@ async def test_send_telegram_message_skips_counter_when_disabled():
         m.post(url, status=200, payload={"ok": True})
         async with aiohttp.ClientSession() as session:
             with structlog.testing.capture_logs() as logs:
-                await send_telegram_message(
-                    "hello", session, settings, parse_mode=None
-                )
+                await send_telegram_message("hello", session, settings, parse_mode=None)
 
     observed = [e for e in logs if e.get("event") == "tg_dispatch_observed"]
     assert observed == []
@@ -73,17 +74,24 @@ async def test_send_telegram_message_records_429_with_retry_after():
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
 
     with aioresponses() as m:
-        m.post(url, status=429, payload={
-            "ok": False,
-            "error_code": 429,
-            "description": "Too Many Requests",
-            "parameters": {"retry_after": 15},
-        })
+        m.post(
+            url,
+            status=429,
+            payload={
+                "ok": False,
+                "error_code": 429,
+                "description": "Too Many Requests",
+                "parameters": {"retry_after": 15},
+            },
+        )
         async with aiohttp.ClientSession() as session:
             with structlog.testing.capture_logs() as logs:
                 await send_telegram_message(
-                    "hello", session, settings,
-                    parse_mode=None, source="429-test",
+                    "hello",
+                    session,
+                    settings,
+                    parse_mode=None,
+                    source="429-test",
                 )
 
     rejected = [e for e in logs if e.get("event") == "tg_dispatch_rejected_429"]
@@ -105,13 +113,20 @@ async def test_send_telegram_message_429_with_non_json_body():
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
 
     with aioresponses() as m:
-        m.post(url, status=429, body=b"<html>cloudflare 429</html>",
-               content_type="text/html")
+        m.post(
+            url,
+            status=429,
+            body=b"<html>cloudflare 429</html>",
+            content_type="text/html",
+        )
         async with aiohttp.ClientSession() as session:
             with structlog.testing.capture_logs() as logs:
                 await send_telegram_message(
-                    "hello", session, settings,
-                    parse_mode=None, source="cloudflare-429-test",
+                    "hello",
+                    session,
+                    settings,
+                    parse_mode=None,
+                    source="cloudflare-429-test",
                 )
 
     rejected = [e for e in logs if e.get("event") == "tg_dispatch_rejected_429"]
@@ -131,17 +146,24 @@ async def test_send_telegram_message_429_missing_retry_after_in_json():
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
 
     with aioresponses() as m:
-        m.post(url, status=429, payload={
-            "ok": False,
-            "error_code": 429,
-            "description": "Too Many Requests",
-            # no "parameters" key — matches Telegram global-flood 429 shape
-        })
+        m.post(
+            url,
+            status=429,
+            payload={
+                "ok": False,
+                "error_code": 429,
+                "description": "Too Many Requests",
+                # no "parameters" key — matches Telegram global-flood 429 shape
+            },
+        )
         async with aiohttp.ClientSession() as session:
             with structlog.testing.capture_logs() as logs:
                 await send_telegram_message(
-                    "hello", session, settings,
-                    parse_mode=None, source="global-flood-test",
+                    "hello",
+                    session,
+                    settings,
+                    parse_mode=None,
+                    source="global-flood-test",
                 )
 
     rejected = [e for e in logs if e.get("event") == "tg_dispatch_rejected_429"]
@@ -164,9 +186,7 @@ async def test_send_telegram_message_source_default_unattributed():
         async with aiohttp.ClientSession() as session:
             with structlog.testing.capture_logs() as logs:
                 # Note: no source= kwarg — legacy caller pattern
-                await send_telegram_message(
-                    "hello", session, settings, parse_mode=None
-                )
+                await send_telegram_message("hello", session, settings, parse_mode=None)
 
     observed = [e for e in logs if e.get("event") == "tg_dispatch_observed"]
     assert len(observed) == 1
@@ -197,7 +217,10 @@ async def test_send_telegram_message_record_dispatch_failure_is_isolated(monkeyp
         async with aiohttp.ClientSession() as session:
             with structlog.testing.capture_logs() as logs:
                 await send_telegram_message(
-                    "hello", session, settings, parse_mode=None,
+                    "hello",
+                    session,
+                    settings,
+                    parse_mode=None,
                 )
 
     iso_failed = [e for e in logs if e.get("event") == "record_dispatch_failed"]
@@ -221,13 +244,21 @@ async def test_send_telegram_message_instrumentation_failure_is_isolated(monkeyp
     monkeypatch.setattr(alerter_mod, "record_429", _raise)
 
     with aioresponses() as m:
-        m.post(url, status=429, payload={
-            "ok": False, "parameters": {"retry_after": 5},
-        })
+        m.post(
+            url,
+            status=429,
+            payload={
+                "ok": False,
+                "parameters": {"retry_after": 5},
+            },
+        )
         async with aiohttp.ClientSession() as session:
             with structlog.testing.capture_logs() as logs:
                 await send_telegram_message(
-                    "hello", session, settings, parse_mode=None,
+                    "hello",
+                    session,
+                    settings,
+                    parse_mode=None,
                 )
 
     iso_failed = [e for e in logs if e.get("event") == "record_429_failed"]

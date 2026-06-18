@@ -194,6 +194,7 @@ async def _dispatch_ingest_watchdog_events(
                 settings,
                 parse_mode=None,
                 raise_on_failure=True,
+                source="ingest_watchdog",
             )
             logger.info(
                 "ingest_watchdog_alert_delivered",
@@ -318,6 +319,7 @@ async def _run_feedback_schedulers(
                             session,
                             settings,
                             parse_mode=None,
+                            source="price_refresh_streak",
                         )
                 except Exception:
                     logger.exception("combo_refresh_streak_alert_dispatch_error")
@@ -419,7 +421,11 @@ async def _run_feedback_schedulers(
                 timeout = aiohttp.ClientTimeout(total=10)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     await alerter.send_telegram_message(
-                        msg, session, settings, parse_mode=None
+                        msg,
+                        session,
+                        settings,
+                        parse_mode=None,
+                        source="feedback_scheduler",
                     )
                 logger.info(
                     "calibration_dryrun_pass",
@@ -520,7 +526,11 @@ async def briefing_loop(
                     if settings.BRIEFING_TELEGRAM_ENABLED:
                         for chunk in split_message(synthesis, 4096):
                             await send_telegram_message(
-                                chunk, session, settings, parse_mode=None
+                                chunk,
+                                session,
+                                settings,
+                                parse_mode=None,
+                                source="briefing",
                             )
 
                     last_briefing_at = now
@@ -607,7 +617,9 @@ async def _safe_counter_followup(token, session, settings, db=None):
                 f"{flag_lines}\n"
                 f'"{counter.counter_argument}"'
             )
-            await send_telegram_message(msg, session, settings, parse_mode=None)
+            await send_telegram_message(
+                msg, session, settings, parse_mode=None, source="counter_risk"
+            )
 
         _heartbeat_stats["counter_scores_memecoin"] += 1
         logger.info(
@@ -1509,7 +1521,9 @@ async def _maybe_announce_tg_alerts(db, session, settings) -> None:
         "tg_alert_eligible=0 WHERE signal_type='...';"
     )
     try:
-        await alerter.send_telegram_message(body, session, settings, parse_mode=None)
+        await alerter.send_telegram_message(
+            body, session, settings, parse_mode=None, source="tg_allowlist_announce"
+        )
         async with db._txn_lock:
             await db._conn.execute(
                 "INSERT INTO tg_alert_log "
@@ -1569,7 +1583,9 @@ async def _maybe_announce_m1_5c(db, session, settings) -> None:
         "Note: gecko-alpha does NOT execute — Minara prompts before swap."
     )
     try:
-        await alerter.send_telegram_message(body, session, settings, parse_mode=None)
+        await alerter.send_telegram_message(
+            body, session, settings, parse_mode=None, source="m1_5c_announce"
+        )
         async with db._txn_lock:
             await db._conn.execute(
                 "INSERT INTO tg_alert_log "
@@ -1748,6 +1764,7 @@ async def main(argv: list[str] | None = None) -> int:
                     _startup_session,
                     settings,
                     parse_mode=None,
+                    source="live_startup",
                 )
         except Exception:
             logger.exception("live_startup_notification_failed")
@@ -2160,7 +2177,11 @@ async def main(argv: list[str] | None = None) -> int:
                             summary_text = format_daily_summary(summary_data)
                             if not args.dry_run:
                                 await send_telegram_message(
-                                    summary_text, session, settings, parse_mode=None
+                                    summary_text,
+                                    session,
+                                    settings,
+                                    parse_mode=None,
+                                    source="daily_summary",
                                 )
                             logger.info(
                                 "Daily summary sent",
