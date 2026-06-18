@@ -1,5 +1,28 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-06-18 - P0 SQLite durable maintenance (Part B)
+
+**Status:** PLAN-READY (review gate 1). Branch `feat/sqlite-durable-maintenance`.
+Follows P0 Part A (one-time VACUUM done on prod 2026-06-18 — see project memory
+`project_p0_vacuum_and_orphan_reader_2026_06_18`). Full checkable plan:
+`tasks/plan_sqlite_durable_maintenance_2026_06_18.md`.
+
+Goal: make `scout.db` self-maintaining so the 2026-06-18 incident (54.7% freelist
+bloat + WAL pinned by 65-day orphaned readers) cannot silently recur.
+
+- [ ] Task 1: Settings flags (8) for checkpoint/incremental-vacuum/watchdog.
+- [ ] Task 2: `db.checkpoint_wal_truncate()` (logs busy/log/checkpointed tuple).
+- [ ] Task 3: `db.run_incremental_vacuum()` (online freelist reclaim).
+- [ ] Task 4: `/proc` stale-reader watchdog module (incident root cause).
+- [ ] Task 5: maintenance orchestrator + §12b stale-reader alert.
+- [ ] Task 6: wire into `_run_hourly_maintenance`.
+- [ ] Review gates: pre-impl plan review → post-test diff review → pre-merge
+  multi-vector (structural / prod-state / failure-mode).
+
+Non-scope: no prod mutation (flags default-on, effect only when deployed code
+runs); `scout.db.pre-vacuum` (5 GB) deletion is a separate operator-approved
+step; TG pacing (P1 #2) and slow_burn revert (P1 #3) are separate workstreams.
+
 ## Completed Work: 2026-06-05 - Trader decision cockpit
 
 **Status:** SHIPPED 2026-06-05 - direct master deploy at implementation commit
