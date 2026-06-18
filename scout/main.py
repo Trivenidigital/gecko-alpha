@@ -43,6 +43,7 @@ from scout.ingestion.geckoterminal import fetch_trending_pools
 from scout.ingestion.held_position_prices import fetch_held_position_prices
 from scout.ingestion.holder_enricher import enrich_holders
 from scout.narrative.agent import narrative_agent_loop
+from scout.observability.sqlite_maintenance import run_sqlite_maintenance
 from scout.news.cryptopanic import (
     enrich_candidates_with_news,
     fetch_cryptopanic_posts,
@@ -1455,6 +1456,14 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
                 )
         except Exception:
             logger.exception("sqlite_wal_probe_failed")
+
+    # BL-NEW-SQLITE-DURABLE-MAINTENANCE (P0 Part B): active remediation.
+    # The probe block above stays (observability); this performs the fixes
+    # (incremental_vacuum + wal_checkpoint(TRUNCATE) + stale-reader watchdog).
+    try:
+        await run_sqlite_maintenance(db, session, settings, logger)
+    except Exception:
+        logger.exception("sqlite_maintenance_failed")
 
 
 async def _maybe_announce_tg_alerts(db, session, settings) -> None:

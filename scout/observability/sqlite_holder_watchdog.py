@@ -138,7 +138,9 @@ def scan_db_holders(
                 cmdline=_cmdline(proc_root, pid),
                 cgroup=cgroup,
                 age_seconds=age,
-                is_expected_service=classify_is_expected_service(cgroup, expected_units),
+                is_expected_service=classify_is_expected_service(
+                    cgroup, expected_units
+                ),
             )
         )
     return holders
@@ -151,7 +153,5 @@ def find_stale_readers(
     return [
         h
         for h in holders
-        if (not h.is_expected_service)
-        and h.pid != own_pid
-        and h.age_seconds > cutoff
+        if (not h.is_expected_service) and h.pid != own_pid and h.age_seconds > cutoff
     ]

@@ -4097,8 +4097,7 @@ class Database:
         missing = sorted(required - cols)
         if missing:
             raise RuntimeError(
-                "tg_alert_operator_actions schema missing columns: "
-                + ",".join(missing)
+                "tg_alert_operator_actions schema missing columns: " + ",".join(missing)
             )
 
         for idx in (
