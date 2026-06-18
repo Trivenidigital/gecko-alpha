@@ -6652,6 +6652,71 @@ class Database:
         }
 
     # ------------------------------------------------------------------
+    # BL-NEW-SQLITE-DURABLE-MAINTENANCE (P0 Part B): active remediation
+    # ------------------------------------------------------------------
+
+    async def checkpoint_wal_truncate(self) -> dict:
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)``; return the result tuple.
+
+        Returns ``{busy, log_frames, checkpointed_frames}``. ``busy != 0``
+        means the WAL could NOT be fully checkpointed/truncated (a reader is
+        pinning frames) — callers MUST treat ``busy != 0`` as not-success
+        (it is the silent-failure mode behind the 2026-06-18 WAL bloat).
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        async with self._txn_lock:
+            cur = await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            row = await cur.fetchone()
+        if not row:
+            return {"busy": 1, "log_frames": 0, "checkpointed_frames": 0}
+        return {
+            "busy": int(row[0]),
+            "log_frames": int(row[1]),
+            "checkpointed_frames": int(row[2]),
+        }
+
+    async def run_incremental_vacuum(self, max_pages: int = 0) -> dict:
+        """Reclaim freelist pages via ``PRAGMA incremental_vacuum``.
+
+        Requires ``auto_vacuum=INCREMENTAL`` (else a no-op: 0 reclaimed).
+        ``max_pages=0`` reclaims all freelist pages; ``>0`` caps the work.
+
+        NOTE: ``incremental_vacuum`` returns one result row per freed page and
+        is driven by *stepping* the result, so a bare ``execute()`` frees only
+        ONE page. We ``fetchall()`` to drive the statement to completion; the
+        ``(N)`` argument caps the page count (verified on SQLite 3.50.4).
+        Returns ``{auto_vacuum, freelist_before, freelist_after, pages_reclaimed}``.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+
+        async def _pragma_int(name: str) -> int:
+            cur = await self._conn.execute(f"PRAGMA {name}")
+            row = await cur.fetchone()
+            return int(row[0]) if row else 0
+
+        async with self._txn_lock:
+            auto_vacuum = await _pragma_int("auto_vacuum")
+            before = await _pragma_int("freelist_count")
+            if auto_vacuum == 2 and before > 0:
+                if max_pages > 0:
+                    cur = await self._conn.execute(
+                        f"PRAGMA incremental_vacuum({int(max_pages)})"
+                    )
+                else:
+                    cur = await self._conn.execute("PRAGMA incremental_vacuum")
+                await cur.fetchall()  # drive the pragma (1 result row per freed page)
+                await self._conn.commit()
+            after = await _pragma_int("freelist_count")
+        return {
+            "auto_vacuum": auto_vacuum,
+            "freelist_before": before,
+            "freelist_after": after,
+            "pages_reclaimed": before - after,
+        }
+
+    # ------------------------------------------------------------------
     # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 6 prune methods
     # ------------------------------------------------------------------
 
