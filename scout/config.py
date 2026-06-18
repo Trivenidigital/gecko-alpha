@@ -405,6 +405,13 @@ class Settings(BaseSettings):
     # tasks/plan_tg_burst_profile.md for pre-registered decision criteria.
     TG_BURST_PROFILE_ENABLED: bool = True
 
+    # P1 #2 TG pacing: honor Telegram retry_after. Pre-send gate waits if the
+    # chat is currently paced; on a 429 within budget we pace + retry once.
+    # Every wait/retry sleep is capped at TG_PACING_MAX_WAIT_SECONDS so a large
+    # retry_after can't stall the pipeline (over-budget asks fall through, paced).
+    TG_PACING_ENABLED: bool = True
+    TG_PACING_MAX_WAIT_SECONDS: float = Field(default=10.0, gt=0)
+
     # BL-NEW-SQLITE-WAL-PROFILE cycle 4: hourly WAL state probe.
     # Default True for 4-week measurement; threshold default 50MB is a
     # starting point — operator runs scripts/wal_summary.sh 168 after

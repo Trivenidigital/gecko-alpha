@@ -47,3 +47,17 @@ def test_per_chat_isolation():
     register_429("c1", 5, now=0.0)
     assert pacing_wait_seconds("c2", now=0.0) == 0.0
     assert pacing_wait_seconds("c1", now=0.0) == 5.0
+
+
+def test_pacing_flag_defaults(settings_factory):
+    s = settings_factory()
+    assert s.TG_PACING_ENABLED is True
+    assert s.TG_PACING_MAX_WAIT_SECONDS == 10.0
+
+
+def test_pacing_max_wait_rejects_nonpositive(settings_factory):
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        settings_factory(TG_PACING_MAX_WAIT_SECONDS=0)
