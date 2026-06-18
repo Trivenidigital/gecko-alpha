@@ -400,6 +400,7 @@ async def notify_paper_trade_opened(
                 settings,
                 parse_mode=None,
                 raise_on_failure=True,
+                source="tg_alert_dispatch",
             )
             # §12b: emit AFTER the send returns (delivery succeeded — the
             # call raises on failure). Together with tg_alert_dispatched this

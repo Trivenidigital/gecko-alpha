@@ -281,7 +281,11 @@ async def run_once(
             continue
 
         await send_telegram_message(
-            format_secondwave_alert(sw), session, settings, parse_mode=None
+            format_secondwave_alert(sw),
+            session,
+            settings,
+            parse_mode=None,
+            source="secondwave",
         )
         alerts_fired += 1
 
