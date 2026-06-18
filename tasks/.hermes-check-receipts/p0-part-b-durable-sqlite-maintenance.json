@@ -1,0 +1,9 @@
+{
+  "topic": "p0-part-b-durable-sqlite-maintenance",
+  "task_text": "P0 Part B: durable SQLite maintenance for scout.db — (1) periodic PRAGMA wal_checkpoint(TRUNCATE) with full result-tuple logging and busy handling, (2) PRAGMA incremental_vacuum when freelist exceeds a threshold (auto_vacuum=INCREMENTAL already set), (3) a stale-reader watchdog that scans /proc for non-service processes holding scout.db open beyond N hours and alerts the operator. All in the hourly maintenance loop, behind Settings flags, TDD.",
+  "completed_at": "2026-06-18T02:45:00Z",
+  "drift_check_tag": "extends-Hermes",
+  "net_new_step_count": 11,
+  "hermes_step_count": 0,
+  "files_to_read_first": ["scout/db.py", "scout/main.py", "scout/config.py", "scout/alerter.py", "tests/test_tg_dispatch_counter.py"]
+}

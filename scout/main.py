@@ -43,6 +43,7 @@ from scout.ingestion.geckoterminal import fetch_trending_pools
 from scout.ingestion.held_position_prices import fetch_held_position_prices
 from scout.ingestion.holder_enricher import enrich_holders
 from scout.narrative.agent import narrative_agent_loop
+from scout.observability.sqlite_maintenance import run_sqlite_maintenance
 from scout.news.cryptopanic import (
     enrich_candidates_with_news,
     fetch_cryptopanic_posts,
@@ -1439,22 +1440,39 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
         except Exception:
             logger.exception(f"{event_base}_prune_failed")
 
-    # BL-NEW-SQLITE-WAL-PROFILE cycle 4: hourly WAL state probe.
-    # Runs AFTER all 12 prunes so wal_size_bytes reflects DELETE-driven
-    # peak. DEBUG level keeps default-INFO journalctl clean
-    # (cycle 3 tg_dispatch_observed parity). Bloat at WARNING.
-    if settings.SQLITE_WAL_PROFILE_ENABLED:
+    # BL-NEW-SQLITE-WAL-PROFILE cycle 4 + BL-NEW-SQLITE-DURABLE-MAINTENANCE
+    # (P0 Part B): probe the WAL/freelist state ONCE (after all 12 prunes so
+    # wal_size_bytes reflects DELETE-driven peak) and share it with both the
+    # observability block (DEBUG probe + WARNING bloat) and the active
+    # remediation (incremental_vacuum + wal_checkpoint(TRUNCATE) + stale-reader
+    # watchdog). A single probe avoids redundant work and a double-probe.
+    maintenance_enabled = (
+        settings.SQLITE_WAL_CHECKPOINT_ENABLED
+        or settings.SQLITE_INCREMENTAL_VACUUM_ENABLED
+        or settings.SQLITE_STALE_READER_WATCHDOG_ENABLED
+    )
+    state = None
+    if settings.SQLITE_WAL_PROFILE_ENABLED or maintenance_enabled:
         try:
             state = await db.probe_wal_state()
-            logger.debug("sqlite_wal_probe", **state)
-            if state.get("wal_size_bytes", 0) > settings.SQLITE_WAL_BLOAT_BYTES:
-                logger.warning(
-                    "sqlite_wal_bloat_observed",
-                    threshold_bytes=settings.SQLITE_WAL_BLOAT_BYTES,
-                    **state,
-                )
         except Exception:
             logger.exception("sqlite_wal_probe_failed")
+            state = None
+
+    if settings.SQLITE_WAL_PROFILE_ENABLED and state is not None:
+        logger.debug("sqlite_wal_probe", **state)
+        if state.get("wal_size_bytes", 0) > settings.SQLITE_WAL_BLOAT_BYTES:
+            logger.warning(
+                "sqlite_wal_bloat_observed",
+                threshold_bytes=settings.SQLITE_WAL_BLOAT_BYTES,
+                **state,
+            )
+
+    if maintenance_enabled and state is not None:
+        try:
+            await run_sqlite_maintenance(db, session, settings, logger, state=state)
+        except Exception:
+            logger.exception("sqlite_maintenance_failed")
 
 
 async def _maybe_announce_tg_alerts(db, session, settings) -> None:
