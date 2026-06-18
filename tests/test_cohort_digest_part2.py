@@ -400,7 +400,7 @@ async def test_send_cohort_digest_stamps_final_block_and_strips_sentinel(
 
     captured_messages: list[str] = []
 
-    async def _capture(chunk, session, settings, parse_mode=None):
+    async def _capture(chunk, session, settings, parse_mode=None, **kwargs):
         captured_messages.append(chunk)
 
     with patch(
@@ -430,7 +430,7 @@ async def test_send_cohort_digest_failed_build_dispatches_fallback(
 
     captured: list[str] = []
 
-    async def _capture(chunk, session, settings, parse_mode=None):
+    async def _capture(chunk, session, settings, parse_mode=None, **kwargs):
         # parse_mode=None on the fallback path too (Class-3 hygiene)
         assert parse_mode is None
         captured.append(chunk)
