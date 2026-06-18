@@ -1,0 +1,9 @@
+{
+  "topic": "p1-2-tg-pacing",
+  "task_text": "P1 #2 TG pacing: add central per-chat retry_after-aware pacing + bounded single retry to the Telegram send path in scout/alerter.py (pre-send wait if chat paced; on 429 honor retry_after, pause that chat, retry once within a budget); unify send_alert to route its Telegram send through send_telegram_message so the main candidate-alert path is also paced + instrumented; add source= labels to all send_telegram_message/send_alert callsites. Behind Settings flags, TDD.",
+  "completed_at": "2026-06-18T15:30:00Z",
+  "drift_check_tag": "extends-Hermes",
+  "net_new_step_count": 12,
+  "hermes_step_count": 0,
+  "files_to_read_first": ["scout/alerter.py", "scout/observability/tg_dispatch_counter.py", "scout/config.py", "tests/conftest.py", "tests/test_alerter_tg_burst_hook.py"]
+}
