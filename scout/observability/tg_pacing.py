@@ -4,6 +4,12 @@ Measurement lives in ``tg_dispatch_counter`` ("does NOT rate-limit or pace"); TH
 module records ``retry_after`` deadlines so ``scout.alerter`` can wait before
 re-hitting a chat Telegram just 429'd. ``threading.Lock`` (sync-in-async) mirrors
 ``tg_dispatch_counter`` so it survives any future worker-thread caller.
+
+State is intentionally in-memory and volatile: ``_paced_until`` holds
+seconds-to-tens-of-seconds backoff deadlines that are far shorter than the process
+restart cadence, and the very next 429 re-establishes a deadline. Losing it on
+restart self-heals within one request — do NOT add disk persistence (this is
+transient backoff state, distinct from the §12a audit-row persistence concern).
 """
 
 from __future__ import annotations

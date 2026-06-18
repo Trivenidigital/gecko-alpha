@@ -272,20 +272,21 @@ async def _post_telegram_once(
     """One POST to the Telegram sendMessage endpoint.
 
     Returns ``(status, body_bytes, retry_after)``. ``body_bytes`` is None on 200
-    (not read). ``retry_after`` is parsed from a 429 body's
-    ``parameters.retry_after`` (None if absent/non-JSON). V15 M3 fold: read the
-    body ONCE — ``resp.json()`` + ``resp.text()`` would double-consume the stream.
+    (not read). ``retry_after`` is coerced to ``int`` (None if absent / non-JSON /
+    non-numeric) so downstream ``retry_after > 0`` / ``float()`` / pacing never
+    TypeErrors on a malformed body — that would be mis-attributed by the caller's
+    try/except as a Telegram-side error (gate-2 failure-mode review). V15 M3 fold:
+    read the body ONCE — ``resp.json()`` + ``resp.text()`` double-consume the stream.
     """
     async with session.post(url, json=payload) as resp:
         body_bytes = await resp.read() if resp.status != 200 else None
         retry_after = None
         if resp.status == 429 and body_bytes is not None:
             try:
-                retry_after = (
-                    json.loads(body_bytes).get("parameters", {}).get("retry_after")
-                )
-            except (json.JSONDecodeError, ValueError):
-                pass
+                raw = json.loads(body_bytes).get("parameters", {}).get("retry_after")
+                retry_after = int(raw) if raw is not None else None
+            except (json.JSONDecodeError, ValueError, TypeError):
+                retry_after = None
         return resp.status, body_bytes, retry_after
 
 

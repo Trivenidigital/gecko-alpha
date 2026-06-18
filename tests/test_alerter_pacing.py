@@ -108,6 +108,27 @@ async def test_pacing_disabled_no_retry(settings_factory, patch_module_sleep):
     assert "tg_dispatch_rejected_429" in ev  # still recorded once
 
 
+async def test_non_numeric_retry_after_no_crash(settings_factory, patch_module_sleep):
+    """Gate-2 defensive: a non-numeric retry_after is coerced to None (not a
+    TypeError mis-attributed as a Telegram error). Falls to default 1s pace+retry."""
+    patch_module_sleep("scout.alerter")
+    tg_pacing.reset_for_tests()
+    s = settings_factory()
+    with aioresponses() as mocked:
+        mocked.post(
+            URL_RE,
+            status=429,
+            payload={"ok": False, "parameters": {"retry_after": "soon"}},
+        )
+        mocked.post(URL_RE, status=200, payload={"ok": True})
+        async with aiohttp.ClientSession() as sess:
+            with structlog.testing.capture_logs() as logs:
+                await send_telegram_message("hi", sess, s, parse_mode=None, source="t")
+    ev = _events(logs)
+    assert "Telegram daily summary error" not in ev  # not mis-attributed
+    assert "telegram_message_delivered" in ev
+
+
 # ---- send_alert unification (Fold 1) ----
 
 
