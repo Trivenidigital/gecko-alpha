@@ -1,5 +1,6 @@
 """Alert delivery to Telegram and Discord."""
 
+import asyncio
 import json
 import structlog
 
@@ -9,6 +10,7 @@ from scout.config import Settings
 from scout.exceptions import AlertDeliveryError
 from scout.models import CandidateToken
 from scout.observability.tg_dispatch_counter import record_dispatch, record_429
+from scout.observability.tg_pacing import pacing_wait_seconds, register_429
 
 logger = structlog.get_logger()
 
@@ -166,66 +168,136 @@ async def send_telegram_message(
     }
     if parse_mode is not None:
         payload["parse_mode"] = parse_mode
+    chat = str(settings.TELEGRAM_CHAT_ID)
+
+    # P1 #2: pre-send pacing gate — if Telegram recently 429'd this chat, wait
+    # (bounded by TG_PACING_MAX_WAIT_SECONDS) before re-hitting it.
+    if settings.TG_PACING_ENABLED:
+        wait = pacing_wait_seconds(chat)
+        if wait > 0:
+            capped = min(wait, settings.TG_PACING_MAX_WAIT_SECONDS)
+            logger.warning(
+                "tg_pacing_wait",
+                chat_id=chat,
+                source=source,
+                wait_seconds=round(capped, 3),
+                requested=round(wait, 3),
+            )
+            await asyncio.sleep(capped)
 
     # BL-NEW-TG-BURST-PROFILE cycle 3: record intent-to-dispatch BEFORE
     # the HTTP call (burst pressure is about call rate, not delivery).
     if settings.TG_BURST_PROFILE_ENABLED:
         try:
-            record_dispatch(str(settings.TELEGRAM_CHAT_ID), source=source)
+            record_dispatch(chat, source=source)
         except Exception:
             logger.exception("record_dispatch_failed")
 
     try:
-        async with session.post(url, json=payload) as resp:
-            # V15 M3 fold: read body bytes ONCE, parse for both 429
-            # retry_after AND non-200 logging. resp.json()+resp.text()
-            # would double-consume the stream.
-            body_bytes = await resp.read() if resp.status != 200 else None
-            if resp.status == 429 and body_bytes is not None:
-                retry_after = None
-                try:
-                    body_json = json.loads(body_bytes)
-                    retry_after = body_json.get("parameters", {}).get("retry_after")
-                except (json.JSONDecodeError, ValueError):
-                    pass
-                # V15 M2 fold: wrap record_429 in its own try/except so
-                # instrumentation failure can't be mis-attributed by the
-                # outer try/except as a Telegram-side error.
-                if settings.TG_BURST_PROFILE_ENABLED:
-                    try:
-                        record_429(
-                            str(settings.TELEGRAM_CHAT_ID),
-                            source=source,
-                            retry_after=retry_after,
-                        )
-                    except Exception:
-                        logger.exception("record_429_failed")
-            if resp.status != 200:
-                body = (
-                    body_bytes.decode("utf-8", errors="replace")[:200]
-                    if body_bytes
-                    else ""
-                )
-                logger.warning(
-                    "Telegram daily summary failed",
-                    status=resp.status,
-                    body=body,
-                    source=source,
-                )
-                if raise_on_failure:
-                    raise RuntimeError(
-                        f"telegram send failed status={resp.status} body={body}"
+        status, body_bytes, retry_after = await _post_telegram_once(
+            session, url, payload
+        )
+
+        if status == 429:
+            # Fold 3: record EVERY actual 429 (measurement stays visible).
+            _record_429_safe(settings, chat, source, retry_after)
+            if settings.TG_PACING_ENABLED:
+                register_429(chat, retry_after)  # pace future sends to this chat
+                ra = float(retry_after) if retry_after and retry_after > 0 else 1.0
+                if ra <= settings.TG_PACING_MAX_WAIT_SECONDS:
+                    # In-budget: pace + retry once.
+                    logger.warning(
+                        "tg_send_retry_after_429",
+                        chat_id=chat,
+                        source=source,
+                        retry_after=retry_after,
+                        sleep_seconds=ra,
                     )
-            else:
-                # §12b systemic observability: the default alerter logged ONLY on
-                # failure, making "no logs" ambiguous between delivered-cleanly and
-                # never-called. Log every confirmed 200 with the callsite source so
-                # any caller's delivery is traceable without a per-site triplet.
-                logger.info("telegram_message_delivered", source=source)
+                    await asyncio.sleep(ra)
+                    status, body_bytes, retry_after = await _post_telegram_once(
+                        session, url, payload
+                    )
+                    if status == 200:
+                        logger.info(
+                            "tg_send_retry_succeeded", chat_id=chat, source=source
+                        )
+                    else:
+                        logger.warning(
+                            "tg_send_retry_failed",
+                            chat_id=chat,
+                            source=source,
+                            status=status,
+                        )
+                        if status == 429:  # Fold 3: retry's 429 is real too
+                            _record_429_safe(settings, chat, source, retry_after)
+                            register_429(chat, retry_after)
+                else:
+                    # Fold 2: over budget — don't retry early; the paced deadline
+                    # is registered, the next send is pre-gated. Fall through.
+                    logger.warning(
+                        "tg_send_retry_skipped_over_budget",
+                        chat_id=chat,
+                        source=source,
+                        retry_after=ra,
+                        budget=settings.TG_PACING_MAX_WAIT_SECONDS,
+                    )
+
+        if status != 200:
+            body = (
+                body_bytes.decode("utf-8", errors="replace")[:200] if body_bytes else ""
+            )
+            logger.warning(
+                "Telegram daily summary failed",
+                status=status,
+                body=body,
+                source=source,
+            )
+            if raise_on_failure:
+                raise RuntimeError(f"telegram send failed status={status} body={body}")
+        else:
+            # §12b systemic observability: the default alerter logged ONLY on
+            # failure, making "no logs" ambiguous between delivered-cleanly and
+            # never-called. Log every confirmed 200 with the callsite source so
+            # any caller's delivery is traceable without a per-site triplet.
+            logger.info("telegram_message_delivered", source=source)
     except Exception as e:
         logger.warning("Telegram daily summary error", error=str(e), source=source)
         if raise_on_failure:
             raise
+
+
+async def _post_telegram_once(
+    session: aiohttp.ClientSession, url: str, payload: dict
+) -> tuple[int, bytes | None, int | None]:
+    """One POST to the Telegram sendMessage endpoint.
+
+    Returns ``(status, body_bytes, retry_after)``. ``body_bytes`` is None on 200
+    (not read). ``retry_after`` is parsed from a 429 body's
+    ``parameters.retry_after`` (None if absent/non-JSON). V15 M3 fold: read the
+    body ONCE — ``resp.json()`` + ``resp.text()`` would double-consume the stream.
+    """
+    async with session.post(url, json=payload) as resp:
+        body_bytes = await resp.read() if resp.status != 200 else None
+        retry_after = None
+        if resp.status == 429 and body_bytes is not None:
+            try:
+                retry_after = (
+                    json.loads(body_bytes).get("parameters", {}).get("retry_after")
+                )
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return resp.status, body_bytes, retry_after
+
+
+def _record_429_safe(settings, chat_id: str, source: str, retry_after) -> None:
+    """V15 M2 fold: wrap record_429 in its own try/except so instrumentation
+    failure can't be mis-attributed by the caller's try/except as a
+    Telegram-side error. Gated on the burst-profile flag."""
+    if settings.TG_BURST_PROFILE_ENABLED:
+        try:
+            record_429(chat_id, source=source, retry_after=retry_after)
+        except Exception:
+            logger.exception("record_429_failed")
 
 
 TELEGRAM_MAX_LENGTH = 4096
@@ -272,25 +344,23 @@ async def send_alert(
     Raises ``AlertDeliveryError`` if Telegram delivery fails.
     Discord failures are logged as warnings but do not raise.
     """
-    message = _truncate(format_alert_message(token, signals))
+    message = format_alert_message(token, signals)
 
     # --- Telegram (required) ---
-    telegram_url = (
-        f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
-    payload = {
-        "chat_id": settings.TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown",
-    }
-
+    # P1 #2: route through the shared sender so the main candidate-alert path is
+    # paced + instrumented (it previously did its own un-paced direct POST).
+    # send_telegram_message truncates, applies the pacing gate + retry, and
+    # raises RuntimeError on a hard failure (raise_on_failure=True) — re-wrapped
+    # as AlertDeliveryError to preserve this function's contract.
     try:
-        async with session.post(telegram_url, json=payload) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise AlertDeliveryError(f"Telegram returned {resp.status}: {body}")
-    except AlertDeliveryError:
-        raise
+        await send_telegram_message(
+            message,
+            session,
+            settings,
+            parse_mode="Markdown",
+            raise_on_failure=True,
+            source="candidate_alert",
+        )
     except Exception as exc:
         raise AlertDeliveryError(f"Telegram send failed: {exc}") from exc
 
@@ -299,7 +369,7 @@ async def send_alert(
         try:
             async with session.post(
                 settings.DISCORD_WEBHOOK_URL,
-                json={"content": message},
+                json={"content": _truncate(message)},
             ) as resp:
                 if resp.status not in (200, 204):
                     logger.warning("Discord webhook returned error", status=resp.status)
