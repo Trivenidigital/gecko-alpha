@@ -39,17 +39,19 @@ def _make_db_mock(score_pruned: int = 0, volume_pruned: int = 0) -> MagicMock:
     db.prune_chain_matches = AsyncMock(return_value=0)
     db.prune_holder_snapshots = AsyncMock(return_value=0)
     # BL-NEW-SQLITE-WAL-PROFILE cycle 4: probe_wal_state hook
-    db.probe_wal_state = AsyncMock(return_value={
-        "wal_size_bytes": 1024,
-        "wal_pages": 0,
-        "shm_size_bytes": 32768,
-        "db_size_bytes": 4096,
-        "page_count": 1,
-        "page_size": 4096,
-        "freelist_count": 0,
-        "journal_mode": "wal",
-        "wal_autocheckpoint": 1000,
-    })
+    db.probe_wal_state = AsyncMock(
+        return_value={
+            "wal_size_bytes": 1024,
+            "wal_pages": 0,
+            "shm_size_bytes": 32768,
+            "db_size_bytes": 4096,
+            "page_count": 1,
+            "page_size": 4096,
+            "freelist_count": 0,
+            "journal_mode": "wal",
+            "wal_autocheckpoint": 1000,
+        }
+    )
     return db
 
 
@@ -91,9 +93,7 @@ async def test_run_hourly_maintenance_logs_info_when_rows_pruned(tmp_path):
 
     await _run_hourly_maintenance(db, session, settings, logger)
 
-    info_events = [
-        call.args[0] for call in logger.info.call_args_list if call.args
-    ]
+    info_events = [call.args[0] for call in logger.info.call_args_list if call.args]
     assert "score_history_pruned" in info_events
     assert "volume_snapshots_pruned" in info_events
 
@@ -107,15 +107,11 @@ async def test_run_hourly_maintenance_silent_when_zero_rows(tmp_path):
 
     await _run_hourly_maintenance(db, session, settings, logger)
 
-    info_events = [
-        call.args[0] for call in logger.info.call_args_list if call.args
-    ]
+    info_events = [call.args[0] for call in logger.info.call_args_list if call.args]
     assert "score_history_pruned" not in info_events
     assert "volume_snapshots_pruned" not in info_events
     # No debug call either (no level filter at startup)
-    debug_events = [
-        call.args[0] for call in logger.debug.call_args_list if call.args
-    ]
+    debug_events = [call.args[0] for call in logger.debug.call_args_list if call.args]
     assert "score_history_pruned" not in debug_events
     assert "volume_snapshots_pruned" not in debug_events
 
@@ -211,9 +207,9 @@ async def test_narrative_prune_loop_fault_isolation(
     exception_events = [
         call.args[0] for call in logger.exception.call_args_list if call.args
     ]
-    assert f"{event_base}_prune_failed" in exception_events, (
-        f"Expected '{event_base}_prune_failed' in {exception_events}"
-    )
+    assert (
+        f"{event_base}_prune_failed" in exception_events
+    ), f"Expected '{event_base}_prune_failed' in {exception_events}"
 
     # (b) subsequent methods in the loop were still awaited
     for method_name in subsequent_methods:
@@ -233,9 +229,7 @@ async def test_run_hourly_maintenance_emits_sqlite_wal_probe_when_enabled(tmp_pa
 
     db.probe_wal_state.assert_awaited_once()
     debug_events = [
-        (call.args[0], call.kwargs)
-        for call in logger.debug.call_args_list
-        if call.args
+        (call.args[0], call.kwargs) for call in logger.debug.call_args_list if call.args
     ]
     probe_calls = [(evt, kw) for evt, kw in debug_events if evt == "sqlite_wal_probe"]
     assert len(probe_calls) == 1
@@ -254,17 +248,19 @@ async def test_run_hourly_maintenance_emits_bloat_above_threshold(tmp_path):
         SQLITE_WAL_BLOAT_BYTES=1000,  # tiny threshold for test
     )
     db = _make_db_mock()
-    db.probe_wal_state = AsyncMock(return_value={
-        "wal_size_bytes": 1_000_000,
-        "wal_pages": 244,
-        "shm_size_bytes": 32768,
-        "db_size_bytes": 4096,
-        "page_count": 1,
-        "page_size": 4096,
-        "freelist_count": 0,
-        "journal_mode": "wal",
-        "wal_autocheckpoint": 1000,
-    })
+    db.probe_wal_state = AsyncMock(
+        return_value={
+            "wal_size_bytes": 1_000_000,
+            "wal_pages": 244,
+            "shm_size_bytes": 32768,
+            "db_size_bytes": 4096,
+            "page_count": 1,
+            "page_size": 4096,
+            "freelist_count": 0,
+            "journal_mode": "wal",
+            "wal_autocheckpoint": 1000,
+        }
+    )
     session = MagicMock()
     logger = MagicMock()
 
@@ -284,7 +280,12 @@ async def test_run_hourly_maintenance_emits_bloat_above_threshold(tmp_path):
 
 
 async def test_run_hourly_maintenance_skips_wal_probe_when_disabled(tmp_path):
-    """SQLITE_WAL_PROFILE_ENABLED=False — probe is not called."""
+    """Probe not called when WAL profiling AND durable maintenance are both off.
+
+    The single shared probe (P0 Part B) fires when EITHER the WAL-profile
+    observability OR any durable-maintenance flag is enabled, so this test now
+    disables all of them to assert the no-probe path.
+    """
     settings = Settings(
         _env_file=None,
         TELEGRAM_BOT_TOKEN="t",
@@ -292,6 +293,9 @@ async def test_run_hourly_maintenance_skips_wal_probe_when_disabled(tmp_path):
         ANTHROPIC_API_KEY="k",
         DB_PATH=tmp_path / "scout.db",
         SQLITE_WAL_PROFILE_ENABLED=False,
+        SQLITE_WAL_CHECKPOINT_ENABLED=False,
+        SQLITE_INCREMENTAL_VACUUM_ENABLED=False,
+        SQLITE_STALE_READER_WATCHDOG_ENABLED=False,
     )
     db = _make_db_mock()
     db.probe_wal_state = AsyncMock()
@@ -300,7 +304,9 @@ async def test_run_hourly_maintenance_skips_wal_probe_when_disabled(tmp_path):
     db.probe_wal_state.assert_not_called()
 
 
-async def test_run_hourly_maintenance_wal_probe_exception_swallowed_and_logged(tmp_path):
+async def test_run_hourly_maintenance_wal_probe_exception_swallowed_and_logged(
+    tmp_path,
+):
     """V25 MUST-ADD: probe raising emits sqlite_wal_probe_failed via
     logger.exception, does NOT fire sqlite_wal_bloat_observed, and does
     NOT propagate out of the hourly helper.
@@ -339,17 +345,19 @@ async def test_run_hourly_maintenance_wal_bloat_strict_inequality_boundary(tmp_p
         SQLITE_WAL_BLOAT_BYTES=50_000_000,
     )
     db = _make_db_mock()
-    db.probe_wal_state = AsyncMock(return_value={
-        "wal_size_bytes": 50_000_000,  # exactly equal — strict `>` must NOT fire
-        "wal_pages": 12207,
-        "shm_size_bytes": 32768,
-        "db_size_bytes": 4096,
-        "page_count": 1,
-        "page_size": 4096,
-        "freelist_count": 0,
-        "journal_mode": "wal",
-        "wal_autocheckpoint": 1000,
-    })
+    db.probe_wal_state = AsyncMock(
+        return_value={
+            "wal_size_bytes": 50_000_000,  # exactly equal — strict `>` must NOT fire
+            "wal_pages": 12207,
+            "shm_size_bytes": 32768,
+            "db_size_bytes": 4096,
+            "page_count": 1,
+            "page_size": 4096,
+            "freelist_count": 0,
+            "journal_mode": "wal",
+            "wal_autocheckpoint": 1000,
+        }
+    )
     session = MagicMock()
     logger = MagicMock()
 
@@ -361,9 +369,7 @@ async def test_run_hourly_maintenance_wal_bloat_strict_inequality_boundary(tmp_p
     assert "sqlite_wal_bloat_observed" not in warning_events
 
     # Probe DEBUG event still emits
-    debug_events = [
-        call.args[0] for call in logger.debug.call_args_list if call.args
-    ]
+    debug_events = [call.args[0] for call in logger.debug.call_args_list if call.args]
     assert "sqlite_wal_probe" in debug_events
 
 

@@ -29,12 +29,10 @@ def _reset_alert_dedup_for_tests() -> None:
     _ALERTED_PIDS.clear()
 
 
-async def run_sqlite_maintenance(db, session, settings, logger) -> None:
-    try:
-        state = await db.probe_wal_state()
-    except Exception:
-        logger.exception("sqlite_maintenance_probe_failed")
-        return
+async def run_sqlite_maintenance(db, session, settings, logger, *, state) -> None:
+    """``state`` is the already-probed ``probe_wal_state()`` dict — probed ONCE
+    by the caller and shared with the WAL-profile observability block, so the
+    hourly loop never double-probes."""
     freelist = int(state.get("freelist_count", 0))
     wal_bytes = int(state.get("wal_size_bytes", 0))
 
