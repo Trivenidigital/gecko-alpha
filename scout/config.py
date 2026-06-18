@@ -413,6 +413,27 @@ class Settings(BaseSettings):
     SQLITE_WAL_PROFILE_ENABLED: bool = True
     SQLITE_WAL_BLOAT_BYTES: int = 50_000_000
 
+    # BL-NEW-SQLITE-DURABLE-MAINTENANCE (P0 Part B): active WAL/freelist
+    # remediation + stale-reader watchdog in _run_hourly_maintenance.
+    # Incident 2026-06-18: auto_vacuum=NONE (freelist 54.7%) + 2 orphaned
+    # 65-day reader processes pinning the WAL. auto_vacuum was flipped to
+    # INCREMENTAL during the one-time VACUUM, so incremental_vacuum reclaims
+    # freelist online. See tasks/plan_sqlite_durable_maintenance_2026_06_18.md.
+    SQLITE_WAL_CHECKPOINT_ENABLED: bool = True
+    SQLITE_WAL_CHECKPOINT_THRESHOLD_BYTES: int = Field(default=100_000_000, ge=0)
+    SQLITE_INCREMENTAL_VACUUM_ENABLED: bool = True
+    SQLITE_INCREMENTAL_VACUUM_FREELIST_THRESHOLD: int = Field(default=50_000, ge=0)
+    SQLITE_INCREMENTAL_VACUUM_MAX_PAGES: int = Field(default=200_000, ge=0)
+    SQLITE_STALE_READER_WATCHDOG_ENABLED: bool = True
+    SQLITE_STALE_READER_MAX_AGE_HOURS: float = Field(default=6.0, gt=0)
+    SQLITE_STALE_READER_ALERT_ENABLED: bool = True
+    SQLITE_EXPECTED_SERVICE_UNITS: list[str] = Field(
+        default_factory=lambda: [
+            "gecko-pipeline.service",
+            "gecko-dashboard.service",
+        ]
+    )
+
     # -------- LunarCrush Social-Velocity Alerter --------
     # Research-only social-velocity signals (Telegram plain-text, no paper
     # trade dispatch). Double kill-switch: either LUNARCRUSH_ENABLED=false or
