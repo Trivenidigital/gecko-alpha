@@ -56,7 +56,9 @@ def test_classify_expected_service_allowlist():
         "0::/system.slice/gecko-dashboard.service", GECKO_UNITS
     )
     # Fold 3: an unexpected systemd unit is NOT treated as expected.
-    assert not classify_is_expected_service("0::/system.slice/cron.service", GECKO_UNITS)
+    assert not classify_is_expected_service(
+        "0::/system.slice/cron.service", GECKO_UNITS
+    )
     assert not classify_is_expected_service(
         "0::/user.slice/user-0.slice/session-7.scope", GECKO_UNITS
     )
@@ -78,7 +80,9 @@ def test_find_stale_readers_filters_expected_own_and_young():
 
 def test_find_stale_readers_flags_rogue_service(tmp_path):
     """Fold 3: a long-lived holder under a non-allowlisted service is flagged."""
-    rogue = DbHolder(555, "python3 cron_job.py", "0::/system.slice/cron.service", 9 * 3600, False)
+    rogue = DbHolder(
+        555, "python3 cron_job.py", "0::/system.slice/cron.service", 9 * 3600, False
+    )
     stale = find_stale_readers([rogue], max_age_hours=6.0, own_pid=1)
     assert [h.pid for h in stale] == [555]
 
@@ -98,7 +102,10 @@ def test_start_epoch_and_btime_parse(tmp_path):
 
 
 def test_scan_missing_proc_returns_empty(tmp_path):
-    assert scan_db_holders([str(tmp_path / "scout.db")], proc_root=str(tmp_path / "nope")) == []
+    assert (
+        scan_db_holders([str(tmp_path / "scout.db")], proc_root=str(tmp_path / "nope"))
+        == []
+    )
 
 
 # ---- /proc scan integration (needs symlinks) ----
@@ -117,7 +124,12 @@ def test_scan_detects_db_holder(tmp_path):
         {4242: (db, "python3 _report.py", "0::/user.slice/session-7.scope", 50_000)},
     )
     holders = scan_db_holders(
-        [db], proc_root=proc, own_pid=1, now=now, clk_tck=100, expected_units=GECKO_UNITS
+        [db],
+        proc_root=proc,
+        own_pid=1,
+        now=now,
+        clk_tck=100,
+        expected_units=GECKO_UNITS,
     )
     assert len(holders) == 1
     h = holders[0]
@@ -139,12 +151,22 @@ def test_scan_excludes_own_pid_and_expected_service(tmp_path):
         tmp_path,
         btime,
         {
-            7: (db, "python3 -m scout.main", "0::/system.slice/gecko-pipeline.service", 10),
+            7: (
+                db,
+                "python3 -m scout.main",
+                "0::/system.slice/gecko-pipeline.service",
+                10,
+            ),
             9: (db, "python3 _report.py", "0::/user.slice/session-9.scope", 10),
         },
     )
     holders = scan_db_holders(
-        [db], proc_root=proc, own_pid=7, now=now, clk_tck=100, expected_units=GECKO_UNITS
+        [db],
+        proc_root=proc,
+        own_pid=7,
+        now=now,
+        clk_tck=100,
+        expected_units=GECKO_UNITS,
     )
     # own pid 7 excluded; pid 9 present and not expected-service
     assert [h.pid for h in holders] == [9]
