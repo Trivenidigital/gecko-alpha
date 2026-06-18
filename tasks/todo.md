@@ -1,5 +1,16 @@
 # Backlog — gecko-alpha
 
+## Completed Work: 2026-06-18 - slow_burn paper dispatch disabled (failed soak)
+
+**Status:** CLOSED-FAILED. slow_burn forward paper-dispatch soak failed: 39 closed
+/ 14 wins (35.9%) / net −$572.43 (closed_sl 19/−$961.56 dominates). Auto-suspended
+2026-06-17 (hard_loss: net −$544, drawdown −$578, n=32); operator reverted prod
+`.env SLOW_BURN_DISPATCH_ENABLED=True→False` + restarted gecko-pipeline 2026-06-18
+(verified loaded False, NRestarts=0). Now OFF on both gates (env + signal_params.
+enabled=0). Finding: `tasks/findings_slow_burn_dispatch_failure_2026_06_18.md`.
+Detector stays as shadow signal; only dispatch retired. Re-enable needs a fresh
+positive-expectancy analysis + pre-registered kill criterion (not a time-based flip).
+
 ## Active Work: 2026-06-18 - P0 SQLite durable maintenance (Part B)
 
 **Status:** PLAN-READY (review gate 1). Branch `feat/sqlite-durable-maintenance`.
