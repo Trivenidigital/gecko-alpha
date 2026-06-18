@@ -214,6 +214,13 @@ async def send_telegram_message(
                         sleep_seconds=ra,
                     )
                     await asyncio.sleep(ra)
+                    # The retry is a real HTTP dispatch — count it for burst
+                    # pressure accounting (gate-2 review #2).
+                    if settings.TG_BURST_PROFILE_ENABLED:
+                        try:
+                            record_dispatch(chat, source=source)
+                        except Exception:
+                            logger.exception("record_dispatch_failed")
                     status, body_bytes, retry_after = await _post_telegram_once(
                         session, url, payload
                     )

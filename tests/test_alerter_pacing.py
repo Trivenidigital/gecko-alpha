@@ -129,6 +129,27 @@ async def test_non_numeric_retry_after_no_crash(settings_factory, patch_module_s
     assert "telegram_message_delivered" in ev
 
 
+async def test_retry_counts_as_dispatch(settings_factory, patch_module_sleep):
+    """Gate-2 #2: the bounded retry is a real HTTP call → counted by
+    record_dispatch (two tg_dispatch_observed for a 429-then-retry send)."""
+    from scout.observability.tg_dispatch_counter import reset_for_tests as reset_counter
+
+    patch_module_sleep("scout.alerter")
+    tg_pacing.reset_for_tests()
+    reset_counter()
+    s = settings_factory()
+    with aioresponses() as mocked:
+        mocked.post(
+            URL_RE, status=429, payload={"ok": False, "parameters": {"retry_after": 2}}
+        )
+        mocked.post(URL_RE, status=200, payload={"ok": True})
+        async with aiohttp.ClientSession() as sess:
+            with structlog.testing.capture_logs() as logs:
+                await send_telegram_message("hi", sess, s, parse_mode=None, source="t")
+    observed = [e for e in _events(logs) if e == "tg_dispatch_observed"]
+    assert len(observed) == 2  # first POST + retry POST both counted
+
+
 # ---- send_alert unification (Fold 1) ----
 
 
