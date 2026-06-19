@@ -971,6 +971,30 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_gainers_comp
                 ON gainers_comparisons(coin_id);
 
+            -- BL-NEW-CONVICTION-PROSPECTIVE-SCORE (V1): per-cycle snapshot of
+            -- not-yet-pumped CG coins scored by sustained cross-surface early
+            -- confirmation. The full history is the prospective-precision event
+            -- stream; the latest snapshot_at batch is the live watchlist.
+            CREATE TABLE IF NOT EXISTS conviction_watchlist_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_at TEXT NOT NULL,
+                coin_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                early_count INTEGER NOT NULL,
+                fresh_count INTEGER NOT NULL,
+                tier TEXT NOT NULL,
+                contributing_surfaces TEXT NOT NULL,
+                market_cap REAL,
+                mcap_age_minutes REAL,
+                first_detection_ages TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_conviction_watchlist_snap
+                ON conviction_watchlist_snapshots(snapshot_at);
+            CREATE INDEX IF NOT EXISTS idx_conviction_watchlist_snap_tier
+                ON conviction_watchlist_snapshots(snapshot_at, tier);
+
             CREATE TABLE IF NOT EXISTS gainer_acceleration (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 coin_id TEXT NOT NULL,
@@ -6718,6 +6742,107 @@ class Database:
     # ------------------------------------------------------------------
     # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 6 prune methods
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # BL-NEW-CONVICTION-PROSPECTIVE-SCORE (V1): watchlist snapshot store
+    # ------------------------------------------------------------------
+
+    async def insert_conviction_watchlist_snapshot(
+        self, rows: list[dict], snapshot_at: str
+    ) -> int:
+        """Insert one snapshot batch (all rows share ``snapshot_at``). Returns count.
+        ``contributing_surfaces`` (list) + ``first_detection_ages`` (dict) are JSON-encoded.
+        """
+        if self._conn is None or self._txn_lock is None:
+            raise RuntimeError("Database not initialized")
+        if not rows:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        params = [
+            (
+                snapshot_at,
+                r["coin_id"],
+                r["symbol"],
+                r["name"],
+                int(r["early_count"]),
+                int(r["fresh_count"]),
+                r["tier"],
+                json.dumps(r.get("contributing_surfaces") or []),
+                r.get("market_cap"),
+                r.get("mcap_age_minutes"),
+                json.dumps(r.get("first_detection_ages") or {}),
+                now,
+            )
+            for r in rows
+        ]
+        async with self._txn_lock:
+            await self._conn.executemany(
+                """INSERT INTO conviction_watchlist_snapshots
+                   (snapshot_at, coin_id, symbol, name, early_count, fresh_count,
+                    tier, contributing_surfaces, market_cap, mcap_age_minutes,
+                    first_detection_ages, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                params,
+            )
+            await self._conn.commit()
+        return len(params)
+
+    async def latest_conviction_watchlist_snapshot_at(self) -> str | None:
+        """Most recent ``snapshot_at`` in the table, or None if empty."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cur = await self._conn.execute(
+            "SELECT MAX(snapshot_at) FROM conviction_watchlist_snapshots"
+        )
+        row = await cur.fetchone()
+        return row[0] if row and row[0] else None
+
+    async def get_latest_conviction_watchlist(self) -> list[dict]:
+        """Rows of the latest snapshot batch (JSON columns decoded). Empty if none."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        latest = await self.latest_conviction_watchlist_snapshot_at()
+        if latest is None:
+            return []
+        cur = await self._conn.execute(
+            """SELECT snapshot_at, coin_id, symbol, name, early_count, fresh_count,
+                      tier, contributing_surfaces, market_cap, mcap_age_minutes,
+                      first_detection_ages
+               FROM conviction_watchlist_snapshots
+               WHERE snapshot_at = ?
+               ORDER BY early_count DESC, coin_id ASC""",
+            (latest,),
+        )
+        out: list[dict] = []
+        for r in await cur.fetchall():
+            out.append(
+                {
+                    "snapshot_at": r[0],
+                    "coin_id": r[1],
+                    "symbol": r[2],
+                    "name": r[3],
+                    "early_count": r[4],
+                    "fresh_count": r[5],
+                    "tier": r[6],
+                    "contributing_surfaces": json.loads(r[7]) if r[7] else [],
+                    "market_cap": r[8],
+                    "mcap_age_minutes": r[9],
+                    "first_detection_ages": json.loads(r[10]) if r[10] else {},
+                }
+            )
+        return out
+
+    async def prune_conviction_watchlist_snapshots(self, *, keep_days: int) -> int:
+        """Delete watchlist snapshot rows older than ``keep_days``. Returns rowcount."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM conviction_watchlist_snapshots WHERE snapshot_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
 
     async def prune_volume_spikes(self, *, keep_days: int) -> int:
         """Delete ``volume_spikes`` rows older than ``keep_days``. Returns rowcount."""
