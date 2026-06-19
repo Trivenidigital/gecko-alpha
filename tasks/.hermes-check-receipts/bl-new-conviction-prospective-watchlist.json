@@ -1,0 +1,9 @@
+{
+  "topic": "bl-new-conviction-prospective-watchlist",
+  "task_text": "Prospective sub-$30M high-conviction watchlist (BL-NEW-CONVICTION-PROSPECTIVE-SCORE + FORWARD-MEASUREMENT): pipeline builder snapshots current not-yet-gainer coins scored by sustained (>=24h) cross-surface early confirmation; persist snapshots as the prospective-precision event stream; read-only dashboard tab filtered to tier=high + mcap<$30M; observe-only V1 (no TG/trades).",
+  "completed_at": "2026-06-19T00:10:00Z",
+  "drift_check_tag": "extends-Hermes",
+  "net_new_step_count": 9,
+  "hermes_step_count": 0,
+  "files_to_read_first": ["scout/conviction/cross_surface.py", "scout/gainers/tracker.py", "scout/db.py", "dashboard/api.py", "dashboard/frontend/components"]
+}

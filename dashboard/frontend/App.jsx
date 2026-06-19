@@ -16,6 +16,7 @@ import NowTradableTab from './components/NowTradableTab.jsx'
 import SignalTrustTab from './components/SignalTrustTab.jsx'
 import TradeInboxTab from './components/TradeInboxTab.jsx'
 import ConvictionTab from './components/ConvictionTab.jsx'
+import ProspectiveWatchlistTab from './components/ProspectiveWatchlistTab.jsx'
 import TodayFocusPanel from './components/TodayFocusPanel.jsx'
 import WhatChangedPanel from './components/WhatChangedPanel.jsx'
 
@@ -171,6 +172,12 @@ export default function App() {
           Conviction
         </button>
         <button
+          className={`tab-btn ${activeTab === 'prospective' ? 'active' : ''}`}
+          onClick={() => setActiveTab('prospective')}
+        >
+          Prospective Watchlist
+        </button>
+        <button
           className={`tab-btn ${activeTab === 'signal_trust' ? 'active' : ''}`}
           onClick={() => setActiveTab('signal_trust')}
         >
@@ -220,6 +227,7 @@ export default function App() {
 
       {activeTab === 'now_tradable' && <NowTradableTab />}
       {activeTab === 'conviction' && <ConvictionTab />}
+      {activeTab === 'prospective' && <ProspectiveWatchlistTab />}
 
       {activeTab === 'signal_trust' && <SignalTrustTab />}
 

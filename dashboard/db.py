@@ -688,6 +688,10 @@ async def get_system_health(db_path: str, *, now: datetime | None = None) -> dic
         ("alerts", "alerted_at"),
         ("learn_logs", "created_at"),
         ("agent_strategy", "updated_at"),
+        # BL-NEW-CONVICTION-PROSPECTIVE-SCORE: surface the watchlist builder's run
+        # heartbeat (run_at), so a stalled builder is visible on the Health panel.
+        # Freshness keying matches the watchdog (the run, not the snapshot rows).
+        ("conviction_watchlist_runs", "run_at"),
     ]
     result = {}
     async with _ro_db(db_path) as conn:
