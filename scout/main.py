@@ -1500,6 +1500,23 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
             await build_prospective_watchlist(db, settings)
         except Exception:
             logger.exception("conviction_prospective_build_failed")
+            # P1 fold: a crash before the builder's own heartbeat would otherwise
+            # look like "never ran" to the watchdog. Record a 'failed' heartbeat so
+            # the watchdog sees a real DOWN state.
+            try:
+                await db.insert_conviction_watchlist_run(
+                    {
+                        "run_at": datetime.now(timezone.utc).isoformat(),
+                        "status": "failed",
+                        "rows_written": 0,
+                        "high_tier": 0,
+                        "sub30m_high_fresh": 0,
+                        "per_surface_contrib": {},
+                        "truncated": False,
+                    }
+                )
+            except Exception:
+                logger.exception("conviction_prospective_fail_heartbeat_failed")
         try:
             await check_watchlist_freshness(db, session, settings, logger)
         except Exception:

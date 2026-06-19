@@ -105,6 +105,28 @@ async def test_run_heartbeat_roundtrip(tmp_path):
     await db.close()
 
 
+async def test_latest_run_returns_status(tmp_path):
+    """P1 fold: the watchdog needs run status (not just run_at) to flag a fresh
+    heartbeat with a failed/skipped build as DOWN."""
+    db = await _db(tmp_path)
+    assert await db.latest_conviction_watchlist_run() is None
+    await db.insert_conviction_watchlist_run(
+        {
+            "run_at": "2026-06-19T00:00:00+00:00",
+            "status": "skipped_exclusion_failed",
+            "rows_written": 0,
+            "high_tier": 0,
+            "sub30m_high_fresh": 0,
+            "per_surface_contrib": {},
+            "truncated": False,
+        }
+    )
+    run = await db.latest_conviction_watchlist_run()
+    assert run["run_at"] == "2026-06-19T00:00:00+00:00"
+    assert run["status"] == "skipped_exclusion_failed"
+    await db.close()
+
+
 async def test_prune_also_deletes_old_runs(tmp_path):
     db = await _db(tmp_path)
     await db.insert_conviction_watchlist_run(

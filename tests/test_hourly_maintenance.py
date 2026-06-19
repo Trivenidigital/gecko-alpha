@@ -327,6 +327,32 @@ async def test_run_hourly_maintenance_runs_prospective_conviction(
     )
 
 
+async def test_run_hourly_maintenance_writes_fail_heartbeat_on_build_crash(
+    monkeypatch, tmp_path
+):
+    """P1 fold: a builder crash records a 'failed' run heartbeat so the watchdog
+    sees a real DOWN, not 'never ran'."""
+    import scout.main as main_mod
+
+    settings = _make_settings(tmp_path)
+    db = _make_db_mock()
+    db.insert_conviction_watchlist_run = AsyncMock()
+    monkeypatch.setattr(
+        main_mod,
+        "build_prospective_watchlist",
+        AsyncMock(side_effect=RuntimeError("boom")),
+    )
+    monkeypatch.setattr(
+        main_mod, "check_watchlist_freshness", AsyncMock(return_value="down")
+    )
+
+    await _run_hourly_maintenance(db, MagicMock(), settings, MagicMock())
+
+    db.insert_conviction_watchlist_run.assert_awaited_once()
+    written = db.insert_conviction_watchlist_run.await_args.args[0]
+    assert written["status"] == "failed"
+
+
 async def test_run_hourly_maintenance_skips_prospective_when_disabled(
     monkeypatch, tmp_path
 ):

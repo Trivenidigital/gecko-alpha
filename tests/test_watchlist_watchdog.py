@@ -14,11 +14,11 @@ NOW = datetime(2026, 6, 19, 12, 0, 0, tzinfo=timezone.utc)
 
 
 class FakeDB:
-    def __init__(self, run_at):
-        self._run_at = run_at
+    def __init__(self, run_at, status="ok"):
+        self._run = None if run_at is None else {"run_at": run_at, "status": status}
 
-    async def latest_conviction_watchlist_run_at(self):
-        return self._run_at
+    async def latest_conviction_watchlist_run(self):
+        return self._run
 
 
 def _install_fake_alerter(monkeypatch, send_mock):
@@ -61,6 +61,24 @@ async def test_stale_run_is_down_and_alerts(monkeypatch, settings_factory):
     send.assert_awaited_once()
     assert send.await_args.kwargs.get("parse_mode") is None
     assert send.await_args.kwargs.get("raise_on_failure") is True
+
+
+async def test_fresh_but_failed_status_is_down_and_alerts(
+    monkeypatch, settings_factory
+):
+    """P1 fold: a fresh run_at with a non-ok status (builder crashed / fail-closed)
+    is a real DOWN — not healthy just because the heartbeat is recent."""
+    send = AsyncMock()
+    _install_fake_alerter(monkeypatch, send)
+    w._reset_for_tests()
+    db = FakeDB((NOW - timedelta(minutes=5)).isoformat(), status="failed")
+    with structlog.testing.capture_logs() as logs:
+        status = await w.check_watchlist_freshness(
+            db, object(), settings_factory(), structlog.get_logger(), now=NOW
+        )
+    assert status == "down"
+    assert "conviction_watchlist_alert_dispatched" in _events(logs)
+    send.assert_awaited_once()
 
 
 async def test_never_run_is_unknown_no_alert(monkeypatch, settings_factory):

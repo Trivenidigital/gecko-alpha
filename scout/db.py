@@ -6889,6 +6889,31 @@ class Database:
         row = await cur.fetchone()
         return row[0] if row and row[0] else None
 
+    async def latest_conviction_watchlist_run(self) -> dict | None:
+        """Most recent builder run (run_at + status + counts), or None if never run.
+        The watchdog keys off this: a fresh run_at with a non-'ok' status (failed /
+        skipped_exclusion_failed) is a real DOWN, not a healthy build."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cur = await self._conn.execute(
+            """SELECT run_at, status, rows_written, high_tier, sub30m_high_fresh,
+                      truncated
+               FROM conviction_watchlist_runs
+               ORDER BY run_at DESC, id DESC
+               LIMIT 1"""
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        return {
+            "run_at": row[0],
+            "status": row[1],
+            "rows_written": row[2],
+            "high_tier": row[3],
+            "sub30m_high_fresh": row[4],
+            "truncated": bool(row[5]),
+        }
+
     async def prune_conviction_watchlist_snapshots(self, *, keep_days: int) -> int:
         """Delete watchlist snapshot rows AND run heartbeats older than ``keep_days``.
         Returns the snapshot rowcount."""
