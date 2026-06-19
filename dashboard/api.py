@@ -996,6 +996,96 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "rows": scored[:limit],
         }
 
+    @app.get("/api/conviction/prospective")
+    async def conviction_prospective(
+        limit: int = Query(50, ge=1, le=500),
+        min_tier: str = Query("high", pattern="^(low|watch|high)$"),
+        max_mcap: float = Query(30_000_000, ge=0),
+    ):
+        """BL-NEW-CONVICTION-PROSPECTIVE-SCORE (V1, observe-only): FORWARD watchlist
+        of not-yet-pumped sub-$30M coins with sustained (>=24h) cross-surface early
+        confirmation. Reads the latest builder RUN (run-keyed) so a healthy 0-row run
+        does NOT leak the prior batch. Prospective precision is UNVALIDATED — observe
+        only, NOT trade advice, no alerts/trades. Null/stale mcap is surfaced in
+        `mcap_unknown`, NEVER counted as sub-$30M.
+        """
+        from datetime import datetime, timezone
+
+        from scout.config import get_settings
+        from scout.conviction import TIER_ORDER
+
+        settings = _DASHBOARD_SETTINGS or get_settings()
+        base_meta = {
+            "read_only": True,
+            "not_trade_advice": True,
+            "observe_only": True,
+            "prospective": True,
+            "calibration": "prospective_unvalidated",
+            "min_tier": min_tier,
+            "max_mcap": max_mcap,
+            "mcap_max_age_minutes": settings.CONVICTION_WATCHLIST_MCAP_MAX_AGE_MINUTES,
+        }
+        if not getattr(settings, "CONVICTION_PROSPECTIVE_ENABLED", True):
+            return {
+                "meta": {**base_meta, "enabled": False, "snapshot_at": None},
+                "rows": [],
+                "mcap_unknown": [],
+            }
+
+        sdb = await _get_scout_db(_db_path)
+        # Run-keyed: freshness + current batch both come from the latest RUN, so a
+        # healthy 0-row run reports fresh + empty (never the prior batch's rows).
+        run_at = await sdb.latest_conviction_watchlist_run_at()
+        if run_at is None:
+            return {
+                "meta": {
+                    **base_meta,
+                    "snapshot_at": None,
+                    "snapshot_age_minutes": None,
+                    "total_in_batch": 0,
+                    "returned": 0,
+                },
+                "rows": [],
+                "mcap_unknown": [],
+            }
+
+        batch = await sdb.get_conviction_watchlist_rows(run_at)
+        min_idx = TIER_ORDER.index(min_tier)
+        tiered = [r for r in batch if TIER_ORDER.index(r["tier"]) >= min_idx]
+        max_age = settings.CONVICTION_WATCHLIST_MCAP_MAX_AGE_MINUTES
+        rows: list = []
+        mcap_unknown: list = []
+        for r in tiered:
+            mc = r.get("market_cap")
+            age = r.get("mcap_age_minutes")
+            fresh = mc is not None and age is not None and age <= max_age
+            if not fresh:
+                mcap_unknown.append(r)  # null/stale mcap — never rendered sub-$30M
+            elif mc < max_mcap:
+                rows.append(r)
+            # else: fresh but >= max_mcap (known large) → excluded from the sub-$30M tab
+
+        try:
+            run_dt = datetime.fromisoformat(run_at.replace("Z", "+00:00"))
+            if run_dt.tzinfo is None:
+                run_dt = run_dt.replace(tzinfo=timezone.utc)
+            age_min = round(
+                (datetime.now(timezone.utc) - run_dt).total_seconds() / 60.0, 1
+            )
+        except Exception:
+            age_min = None
+        return {
+            "meta": {
+                **base_meta,
+                "snapshot_at": run_at,
+                "snapshot_age_minutes": age_min,
+                "total_in_batch": len(batch),
+                "returned": min(len(rows), limit),
+            },
+            "rows": rows[:limit],
+            "mcap_unknown": mcap_unknown[:limit],
+        }
+
     @app.get("/api/gainers/comparisons")
     async def gainers_comparisons(limit: int = Query(50, ge=1, le=500)):
         """Gainers comparisons enriched with price_cache data."""
