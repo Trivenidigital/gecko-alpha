@@ -19,12 +19,16 @@ import structlog
 
 logger = structlog.get_logger()
 
-_alerted = False  # in-memory per-episode dedup; resets on a healthy run / restart
+# In-memory per-episode dedup. Tracks the last-alerted REASON (not a bare bool)
+# so a transition between distinct failure modes (stale → failed →
+# degraded_surface_failed) re-alerts instead of being coalesced into one. Resets
+# to None on a healthy run / restart.
+_last_alert_reason: str | None = None
 
 
 def _reset_for_tests() -> None:
-    global _alerted
-    _alerted = False
+    global _last_alert_reason
+    _last_alert_reason = None
 
 
 def _parse_dt(value: str) -> datetime:
@@ -39,7 +43,7 @@ async def check_watchlist_freshness(
     db, session, settings, logger=logger, *, now: datetime | None = None
 ) -> str:
     """Return ``ok|down|unknown`` for the prospective-watchlist build freshness."""
-    global _alerted
+    global _last_alert_reason
     if not getattr(settings, "CONVICTION_PROSPECTIVE_ENABLED", True):
         return "ok"
     now = now or datetime.now(timezone.utc)
@@ -63,7 +67,7 @@ async def check_watchlist_freshness(
         # (failed / skipped_exclusion_failed) — that IS a down state (P1 fold).
         reason = run.get("status") or "unknown_status"
     else:
-        _alerted = False  # healthy → re-arm
+        _last_alert_reason = None  # healthy → re-arm
         logger.info(
             "conviction_watchlist_freshness",
             status="ok",
@@ -79,13 +83,15 @@ async def check_watchlist_freshness(
         slo_minutes=slo,
         run_at=run_at,
     )
-    if not _alerted:
+    # Re-alert when the failure REASON changes (a new failure mode is new
+    # information), but dedup repeats of the same reason.
+    if _last_alert_reason != reason:
         await _alert_stale(run_at, age_min, slo, reason, session, settings, logger)
     return "down"
 
 
 async def _alert_stale(run_at, age_min, slo, reason, session, settings, logger) -> None:
-    global _alerted
+    global _last_alert_reason
     from scout import alerter  # lazy: keep aiohttp out of the import path
 
     if reason == "stale":
@@ -109,5 +115,5 @@ async def _alert_stale(run_at, age_min, slo, reason, session, settings, logger) 
     except Exception:
         logger.exception("conviction_watchlist_alert_failed")
         return
-    _alerted = True
-    logger.info("conviction_watchlist_alert_delivered", run_at=run_at)
+    _last_alert_reason = reason
+    logger.info("conviction_watchlist_alert_delivered", run_at=run_at, reason=reason)

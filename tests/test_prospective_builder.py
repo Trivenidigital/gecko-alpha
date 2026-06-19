@@ -143,6 +143,30 @@ async def test_exclusion_failure_fails_closed(tmp_path):
     await db.close()
 
 
+async def test_surface_query_failure_marks_run_degraded(tmp_path):
+    """P1 fold (silent recall hole): a per-surface query failure (-1 sentinel)
+    under-counts the cohort, so the run is flagged non-ok (degraded_surface_failed)
+    — letting the watchdog's status!=ok branch alert — while the surviving
+    true-positive rows are still written (better degraded data than a silent hole)."""
+    db = await _db(tmp_path)
+    await _accel(db, "pepe", T30H)
+    await _momentum(db, "pepe", T30H)
+    await _spike(db, "pepe", T30H)
+    await _chain(db, "pepe", T30H)  # 4 surviving surfaces -> still high
+    await db._conn.execute("DROP TABLE velocity_alerts")  # one surface query raises
+    await db._conn.commit()
+    summary = await build_prospective_watchlist(db, _make_settings(), now=NOW)
+    assert summary["status"] == "degraded_surface_failed"
+    assert summary["per_surface_contrib"]["velocity"] == -1
+    assert summary["rows_written"] == 1  # pepe still written (true positive)
+    rows = await db.get_latest_conviction_watchlist()
+    assert [r["coin_id"] for r in rows] == ["pepe"]
+    # heartbeat recorded with the degraded status (watchdog reads this)
+    run = await db.latest_conviction_watchlist_run()
+    assert run["status"] == "degraded_surface_failed"
+    await db.close()
+
+
 def _make_settings():
     from scout.config import Settings
 

@@ -202,6 +202,11 @@ export default function ProspectiveWatchlistTab() {
               Prospective watchlist is disabled (CONVICTION_PROSPECTIVE_ENABLED=False).
             </div>
           ) : null}
+          {meta.run_status && meta.run_status !== 'ok' ? (
+            <div style={{ marginTop: 6, color: 'var(--color-accent-red)' }}>
+              Last build status: {meta.run_status} — this batch may be incomplete (operator has been alerted). Rows shown are still valid.
+            </div>
+          ) : null}
           {error ? <div style={{ marginTop: 8, color: 'var(--color-accent-red)' }}>Error: {error}</div> : null}
         </div>
       </div>

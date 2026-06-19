@@ -1024,6 +1024,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "min_tier": min_tier,
             "max_mcap": max_mcap,
             "mcap_max_age_minutes": settings.CONVICTION_WATCHLIST_MCAP_MAX_AGE_MINUTES,
+            # UI-contract fold: surface the live gate/lead config so the tab's
+            # subtitle reflects the real thresholds, not hardcoded UI fallbacks.
+            "early_lead_minutes": getattr(
+                settings, "CONVICTION_EARLY_LEAD_MINUTES", 1440
+            ),
+            "high_tier_min_surfaces": getattr(
+                settings, "CONVICTION_HIGH_TIER_MIN_SURFACES", 4
+            ),
         }
         if not getattr(settings, "CONVICTION_PROSPECTIVE_ENABLED", True):
             return {
@@ -1035,13 +1043,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
         sdb = await _get_scout_db(_db_path)
         # Run-keyed: freshness + current batch both come from the latest RUN, so a
         # healthy 0-row run reports fresh + empty (never the prior batch's rows).
-        run_at = await sdb.latest_conviction_watchlist_run_at()
-        if run_at is None:
+        # The full run dict carries `status` so the UI can distinguish a healthy
+        # 0-row run from a failed / fail-closed / degraded one (Codex P2 fold).
+        run = await sdb.latest_conviction_watchlist_run()
+        if run is None:
             return {
                 "meta": {
                     **base_meta,
                     "snapshot_at": None,
                     "snapshot_age_minutes": None,
+                    "run_status": None,
                     "total_in_batch": 0,
                     "returned": 0,
                 },
@@ -1049,6 +1060,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 "mcap_unknown": [],
             }
 
+        run_at = run["run_at"]
+        run_status = run.get("status")
         batch = await sdb.get_conviction_watchlist_rows(run_at)
         min_idx = TIER_ORDER.index(min_tier)
         tiered = [r for r in batch if TIER_ORDER.index(r["tier"]) >= min_idx]
@@ -1079,6 +1092,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 **base_meta,
                 "snapshot_at": run_at,
                 "snapshot_age_minutes": age_min,
+                "run_status": run_status,
                 "total_in_batch": len(batch),
                 "returned": min(len(rows), limit),
             },

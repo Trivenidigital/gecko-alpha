@@ -205,6 +205,14 @@ async def build_prospective_watchlist(
         and r["mcap_age_minutes"] is not None
         and r["mcap_age_minutes"] <= max_age
     )
+    # P1 (silent recall hole): a per-surface query failure (-1 sentinel) means
+    # the cohort is under-counted — a genuine `high` coin can silently drop a
+    # tier or fall below the watch denominator and vanish. The snapshot's present
+    # rows are still true positives (they met tier on the surviving surfaces), so
+    # we keep them; but the run is NOT healthy. Flag it non-`ok` so the watchdog's
+    # existing `status != "ok"` branch turns it into an operator alert, and the
+    # dashboard (which now reads run status) can mark the batch degraded.
+    degraded = any(v == -1 for v in per_surface_contrib.values())
     summary = {
         "rows_written": len(rows),
         "high_tier": sum(1 for r in rows if r["tier"] == "high"),
@@ -212,7 +220,7 @@ async def build_prospective_watchlist(
         "per_surface_contrib": per_surface_contrib,
         "truncated": truncated,
         "snapshot_at": now_iso,
-        "status": "ok",
+        "status": "degraded_surface_failed" if degraded else "ok",
     }
     # Fold A: always record a run heartbeat (even a 0-row run) keyed off run_at.
     await db.insert_conviction_watchlist_run({**summary, "run_at": now_iso})

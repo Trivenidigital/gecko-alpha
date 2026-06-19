@@ -69,9 +69,28 @@ async def _seed_run(d, snapshot_at, rows, status="ok"):
 async def test_empty_when_never_run(client):
     body = (await client.get("/api/conviction/prospective")).json()
     assert body["meta"]["snapshot_at"] is None
+    assert body["meta"]["run_status"] is None
     assert body["meta"]["observe_only"] is True
     assert body["meta"]["calibration"] == "prospective_unvalidated"
+    # UI-contract fold: live gate/lead config surfaced (no hardcoded UI fallback)
+    assert body["meta"]["high_tier_min_surfaces"] == 4
+    assert body["meta"]["early_lead_minutes"] == 1440
     assert body["rows"] == [] and body["mcap_unknown"] == []
+
+
+async def test_run_status_surfaced_in_meta(client, db):
+    """P2 fold: a degraded / failed build's status is surfaced in meta so the UI
+    can mark the batch incomplete instead of rendering it as healthy-but-empty."""
+    d, _ = db
+    await _seed_run(
+        d,
+        "2026-06-19T00:00:00+00:00",
+        [_row("pepe", 12_000_000.0, 10.0)],
+        status="degraded_surface_failed",
+    )
+    body = (await client.get("/api/conviction/prospective")).json()
+    assert body["meta"]["run_status"] == "degraded_surface_failed"
+    assert [r["coin_id"] for r in body["rows"]] == ["pepe"]  # rows still surfaced
 
 
 async def test_high_tier_sub30m_in_rows(client, db):
