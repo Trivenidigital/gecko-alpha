@@ -350,6 +350,17 @@ class Settings(BaseSettings):
     CONVICTION_HIGH_TIER_MIN_SURFACES: int = 4  # ~21% 3x precision at this gate
     CONVICTION_WATCH_TIER_MIN_SURFACES: int = 2
 
+    # BL-NEW-CONVICTION-PROSPECTIVE-SCORE (V1, observe-only): forward watchlist of
+    # not-yet-pumped sub-$30M coins with sustained (>=24h) cross-surface early
+    # confirmation. Snapshots = the prospective-precision event stream. No alerts/
+    # trades. See tasks/design_prospective_conviction_watchlist_2026_06_19.md.
+    CONVICTION_PROSPECTIVE_ENABLED: bool = True
+    CONVICTION_WATCHLIST_MAX_MCAP: float = Field(default=30_000_000, ge=0)
+    CONVICTION_WATCHLIST_MCAP_MAX_AGE_MINUTES: int = Field(default=1440, ge=0)
+    CONVICTION_PROSPECTIVE_LOOKBACK_DAYS: int = Field(default=14, ge=1, le=120)
+    CONVICTION_WATCHLIST_SNAPSHOT_RETENTION_DAYS: int = Field(default=90, ge=1)
+    CONVICTION_WATCHLIST_SNAPSHOT_SLO_MINUTES: int = Field(default=180, ge=1)
+
     # -------- Top Losers Tracker --------
     LOSERS_TRACKER_ENABLED: bool = False
     LOSERS_MIN_DROP: float = -15.0
