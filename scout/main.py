@@ -43,6 +43,8 @@ from scout.ingestion.geckoterminal import fetch_trending_pools
 from scout.ingestion.held_position_prices import fetch_held_position_prices
 from scout.ingestion.holder_enricher import enrich_holders
 from scout.narrative.agent import narrative_agent_loop
+from scout.conviction.prospective import build_prospective_watchlist
+from scout.conviction.watchlist_watchdog import check_watchlist_freshness
 from scout.observability.sqlite_maintenance import run_sqlite_maintenance
 from scout.news.cryptopanic import (
     enrich_candidates_with_news,
@@ -1438,6 +1440,10 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
         ("prune_learn_logs", "LEARN_LOGS_RETENTION_DAYS"),
         ("prune_chain_matches", "CHAIN_MATCHES_RETENTION_DAYS"),
         ("prune_holder_snapshots", "HOLDER_SNAPSHOTS_RETENTION_DAYS"),
+        (
+            "prune_conviction_watchlist_snapshots",
+            "CONVICTION_WATCHLIST_SNAPSHOT_RETENTION_DAYS",
+        ),
     ]:
         event_base = prune_name.removeprefix("prune_")
         try:
@@ -1485,6 +1491,19 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
             await run_sqlite_maintenance(db, session, settings, logger, state=state)
         except Exception:
             logger.exception("sqlite_maintenance_failed")
+
+    # BL-NEW-CONVICTION-PROSPECTIVE-SCORE (V1): build the prospective sub-$30M
+    # watchlist snapshot, then run its freshness watchdog. Observe-only; guarded
+    # so a failure can't crash the cycle.
+    if settings.CONVICTION_PROSPECTIVE_ENABLED:
+        try:
+            await build_prospective_watchlist(db, settings)
+        except Exception:
+            logger.exception("conviction_prospective_build_failed")
+        try:
+            await check_watchlist_freshness(db, session, settings, logger)
+        except Exception:
+            logger.exception("conviction_watchlist_watchdog_failed")
 
 
 async def _maybe_announce_tg_alerts(db, session, settings) -> None:

@@ -38,6 +38,7 @@ def _make_db_mock(score_pruned: int = 0, volume_pruned: int = 0) -> MagicMock:
     db.prune_learn_logs = AsyncMock(return_value=0)
     db.prune_chain_matches = AsyncMock(return_value=0)
     db.prune_holder_snapshots = AsyncMock(return_value=0)
+    db.prune_conviction_watchlist_snapshots = AsyncMock(return_value=0)
     # BL-NEW-SQLITE-WAL-PROFILE cycle 4: probe_wal_state hook
     db.probe_wal_state = AsyncMock(
         return_value={
@@ -302,6 +303,53 @@ async def test_run_hourly_maintenance_skips_wal_probe_when_disabled(tmp_path):
     session = MagicMock()
     await _run_hourly_maintenance(db, session, settings, MagicMock())
     db.probe_wal_state.assert_not_called()
+
+
+async def test_run_hourly_maintenance_runs_prospective_conviction(
+    monkeypatch, tmp_path
+):
+    """Task 6: prospective builder + freshness watchdog + prune are wired."""
+    import scout.main as main_mod
+
+    settings = _make_settings(tmp_path)  # CONVICTION_PROSPECTIVE_ENABLED default True
+    db = _make_db_mock()
+    build = AsyncMock(return_value={"rows_written": 0})
+    watchdog = AsyncMock(return_value="ok")
+    monkeypatch.setattr(main_mod, "build_prospective_watchlist", build)
+    monkeypatch.setattr(main_mod, "check_watchlist_freshness", watchdog)
+
+    await _run_hourly_maintenance(db, MagicMock(), settings, MagicMock())
+
+    build.assert_awaited_once()
+    watchdog.assert_awaited_once()
+    db.prune_conviction_watchlist_snapshots.assert_awaited_once_with(
+        keep_days=settings.CONVICTION_WATCHLIST_SNAPSHOT_RETENTION_DAYS
+    )
+
+
+async def test_run_hourly_maintenance_skips_prospective_when_disabled(
+    monkeypatch, tmp_path
+):
+    import scout.main as main_mod
+
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        DB_PATH=tmp_path / "scout.db",
+        CONVICTION_PROSPECTIVE_ENABLED=False,
+    )
+    db = _make_db_mock()
+    build = AsyncMock()
+    watchdog = AsyncMock()
+    monkeypatch.setattr(main_mod, "build_prospective_watchlist", build)
+    monkeypatch.setattr(main_mod, "check_watchlist_freshness", watchdog)
+
+    await _run_hourly_maintenance(db, MagicMock(), settings, MagicMock())
+
+    build.assert_not_awaited()
+    watchdog.assert_not_awaited()
 
 
 async def test_run_hourly_maintenance_wal_probe_exception_swallowed_and_logged(
