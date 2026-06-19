@@ -82,3 +82,42 @@ async def test_prune_by_retention(tmp_path):
     assert deleted == 1
     assert await db.latest_conviction_watchlist_snapshot_at() is None
     await db.close()
+
+
+async def test_run_heartbeat_roundtrip(tmp_path):
+    """Fold A: a run is recorded even with zero rows; freshness keys off run_at."""
+    db = await _db(tmp_path)
+    assert await db.latest_conviction_watchlist_run_at() is None
+    await db.insert_conviction_watchlist_run(
+        {
+            "run_at": "2026-06-19T00:00:00+00:00",
+            "status": "ok",
+            "rows_written": 0,
+            "high_tier": 0,
+            "sub30m_high_fresh": 0,
+            "per_surface_contrib": {"chains": 5},
+            "truncated": False,
+        }
+    )
+    assert await db.latest_conviction_watchlist_run_at() == "2026-06-19T00:00:00+00:00"
+    # zero-row run leaves snapshot rows empty but the run is recorded (not "never ran")
+    assert await db.get_latest_conviction_watchlist() == []
+    await db.close()
+
+
+async def test_prune_also_deletes_old_runs(tmp_path):
+    db = await _db(tmp_path)
+    await db.insert_conviction_watchlist_run(
+        {
+            "run_at": "2026-01-01T00:00:00+00:00",
+            "status": "ok",
+            "rows_written": 0,
+            "high_tier": 0,
+            "sub30m_high_fresh": 0,
+            "per_surface_contrib": {},
+            "truncated": False,
+        }
+    )
+    await db.prune_conviction_watchlist_snapshots(keep_days=30)
+    assert await db.latest_conviction_watchlist_run_at() is None
+    await db.close()

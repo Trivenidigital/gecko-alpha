@@ -995,6 +995,23 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_conviction_watchlist_snap_tier
                 ON conviction_watchlist_snapshots(snapshot_at, tier);
 
+            -- Run heartbeat: one row PER builder run (even a 0-row run), so the
+            -- freshness watchdog distinguishes "builder ran, found 0" from
+            -- "builder never ran". Freshness keys off run_at, NOT the latest row.
+            CREATE TABLE IF NOT EXISTS conviction_watchlist_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                rows_written INTEGER NOT NULL,
+                high_tier INTEGER NOT NULL,
+                sub30m_high_fresh INTEGER NOT NULL,
+                per_surface_contrib TEXT NOT NULL,
+                truncated INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_conviction_watchlist_runs_at
+                ON conviction_watchlist_runs(run_at);
+
             CREATE TABLE IF NOT EXISTS gainer_acceleration (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 coin_id TEXT NOT NULL,
@@ -6797,13 +6814,10 @@ class Database:
         row = await cur.fetchone()
         return row[0] if row and row[0] else None
 
-    async def get_latest_conviction_watchlist(self) -> list[dict]:
-        """Rows of the latest snapshot batch (JSON columns decoded). Empty if none."""
+    async def get_conviction_watchlist_rows(self, snapshot_at: str) -> list[dict]:
+        """Decoded rows for a specific snapshot batch (empty if none)."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
-        latest = await self.latest_conviction_watchlist_snapshot_at()
-        if latest is None:
-            return []
         cur = await self._conn.execute(
             """SELECT snapshot_at, coin_id, symbol, name, early_count, fresh_count,
                       tier, contributing_surfaces, market_cap, mcap_age_minutes,
@@ -6811,7 +6825,7 @@ class Database:
                FROM conviction_watchlist_snapshots
                WHERE snapshot_at = ?
                ORDER BY early_count DESC, coin_id ASC""",
-            (latest,),
+            (snapshot_at,),
         )
         out: list[dict] = []
         for r in await cur.fetchall():
@@ -6832,8 +6846,52 @@ class Database:
             )
         return out
 
+    async def get_latest_conviction_watchlist(self) -> list[dict]:
+        """Rows of the latest snapshot batch (by max ``snapshot_at``). Empty if none."""
+        latest = await self.latest_conviction_watchlist_snapshot_at()
+        if latest is None:
+            return []
+        return await self.get_conviction_watchlist_rows(latest)
+
+    # ---- run heartbeat (Fold A: distinguish "ran, 0 rows" from "never ran") ----
+
+    async def insert_conviction_watchlist_run(self, run: dict) -> None:
+        """Record one builder run. Written EVERY run (incl. 0-row + fail-closed),
+        so freshness keys off run_at, not the latest snapshot row."""
+        if self._conn is None or self._txn_lock is None:
+            raise RuntimeError("Database not initialized")
+        async with self._txn_lock:
+            await self._conn.execute(
+                """INSERT INTO conviction_watchlist_runs
+                   (run_at, status, rows_written, high_tier, sub30m_high_fresh,
+                    per_surface_contrib, truncated, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run["run_at"],
+                    run.get("status", "ok"),
+                    int(run.get("rows_written", 0)),
+                    int(run.get("high_tier", 0)),
+                    int(run.get("sub30m_high_fresh", 0)),
+                    json.dumps(run.get("per_surface_contrib") or {}),
+                    1 if run.get("truncated") else 0,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            await self._conn.commit()
+
+    async def latest_conviction_watchlist_run_at(self) -> str | None:
+        """Most recent builder ``run_at`` (the freshness key), or None if never run."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cur = await self._conn.execute(
+            "SELECT MAX(run_at) FROM conviction_watchlist_runs"
+        )
+        row = await cur.fetchone()
+        return row[0] if row and row[0] else None
+
     async def prune_conviction_watchlist_snapshots(self, *, keep_days: int) -> int:
-        """Delete watchlist snapshot rows older than ``keep_days``. Returns rowcount."""
+        """Delete watchlist snapshot rows AND run heartbeats older than ``keep_days``.
+        Returns the snapshot rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
@@ -6841,8 +6899,13 @@ class Database:
             "DELETE FROM conviction_watchlist_snapshots WHERE snapshot_at <= ?",
             (cutoff,),
         )
+        deleted = cur.rowcount or 0
+        await self._conn.execute(
+            "DELETE FROM conviction_watchlist_runs WHERE run_at <= ?",
+            (cutoff,),
+        )
         await self._conn.commit()
-        return cur.rowcount or 0
+        return deleted
 
     async def prune_volume_spikes(self, *, keep_days: int) -> int:
         """Delete ``volume_spikes`` rows older than ``keep_days``. Returns rowcount."""

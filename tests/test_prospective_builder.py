@@ -114,6 +114,35 @@ async def test_builder_core_fold1_fold2_and_mcap(tmp_path):
     await db.close()
 
 
+async def test_empty_universe_writes_run_heartbeat(tmp_path):
+    """Fold A: a 0-row run still records a heartbeat (ran, found nothing)."""
+    db = await _db(tmp_path)
+    summary = await build_prospective_watchlist(db, _make_settings(), now=NOW)
+    assert summary["rows_written"] == 0
+    assert summary["status"] == "ok"
+    assert await db.latest_conviction_watchlist_run_at() == NOW.isoformat()
+    assert await db.get_latest_conviction_watchlist() == []
+    await db.close()
+
+
+async def test_exclusion_failure_fails_closed(tmp_path):
+    """Fold B: if the pumped-exclusion query fails, do NOT write the snapshot
+    (already-pumped coins must not leak), but DO record a run heartbeat."""
+    db = await _db(tmp_path)
+    await _accel(db, "pepe", T30H)
+    await _momentum(db, "pepe", T30H)
+    await _spike(db, "pepe", T30H)
+    await _chain(db, "pepe", T30H)
+    await db._conn.execute("DROP TABLE gainers_snapshots")  # exclusion query will raise
+    await db._conn.commit()
+    summary = await build_prospective_watchlist(db, _make_settings(), now=NOW)
+    assert summary["status"] == "skipped_exclusion_failed"
+    assert summary["rows_written"] == 0
+    assert await db.get_latest_conviction_watchlist() == []  # no snapshot written
+    assert await db.latest_conviction_watchlist_run_at() == NOW.isoformat()  # heartbeat
+    await db.close()
+
+
 def _make_settings():
     from scout.config import Settings
 

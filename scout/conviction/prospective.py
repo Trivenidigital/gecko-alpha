@@ -94,12 +94,31 @@ async def build_prospective_watchlist(
 
     # Fold 1: exclude coins already on the gainers tracker (snapshots OR comparisons).
     excluded: set[str] = set()
+    exclusion_ok = True
     for tbl in ("gainers_snapshots", "gainers_comparisons"):
         try:
             cur = await conn.execute(f"SELECT DISTINCT coin_id FROM {tbl}")
             excluded.update(r[0] for r in await cur.fetchall() if r[0])
         except Exception:
+            exclusion_ok = False
             logger.exception("conviction_prospective_exclusion_query_failed", table=tbl)
+
+    # Fold B: FAIL CLOSED. Without a reliable exclusion set, an already-pumped coin
+    # could leak into the FORWARD watchlist — so skip writing the snapshot entirely,
+    # but STILL write a run heartbeat so the freshness watchdog sees the builder ran.
+    if not exclusion_ok:
+        run = {
+            "run_at": now_iso,
+            "status": "skipped_exclusion_failed",
+            "rows_written": 0,
+            "high_tier": 0,
+            "sub30m_high_fresh": 0,
+            "per_surface_contrib": {},
+            "truncated": False,
+        }
+        await db.insert_conviction_watchlist_run(run)
+        logger.warning("conviction_prospective_skipped_exclusion_failed", **run)
+        return run
 
     # Per-surface MIN(detection) grouped by CG coin_id within the lookback window.
     ages: dict[str, dict[str, float]] = defaultdict(dict)
@@ -193,6 +212,9 @@ async def build_prospective_watchlist(
         "per_surface_contrib": per_surface_contrib,
         "truncated": truncated,
         "snapshot_at": now_iso,
+        "status": "ok",
     }
+    # Fold A: always record a run heartbeat (even a 0-row run) keyed off run_at.
+    await db.insert_conviction_watchlist_run({**summary, "run_at": now_iso})
     logger.info("conviction_prospective_snapshot_written", **summary)
     return summary
