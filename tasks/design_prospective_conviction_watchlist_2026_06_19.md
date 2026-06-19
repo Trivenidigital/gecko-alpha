@@ -30,6 +30,51 @@ design_cross_surface_conviction_2026_06_12.md:54). The shipped conviction surfac
 exists. `cross_surface_conviction()` (the pure scorer) and the gainers tracker's per-surface
 lookback (tracker.py:198-286) are directly reusable. Net-new confirmed.
 
+## Codex spec-review folds (2026-06-19) — AUTHORITATIVE (supersede where in conflict)
+
+**Fold 1 — exclude pumped by BOTH gainers tables.** `gainers_snapshots` is written FIRST
+when a coin crosses the +20% tracker; `gainers_comparisons` (the scored row) can lag. The
+"not yet pumped" exclusion = coin absent from **`gainers_snapshots` AND `gainers_comparisons`**
+(not comparisons only). Test: a coin with a `gainers_snapshots` row but no comparison row is
+EXCLUDED.
+
+**Fold 2 — canonical identity = CoinGecko `coin_id`; exact-match aggregation only (NO symbol
+merge).** Retrospective anchors on a known gainer coin_id; prospective has no anchor, and
+`candidates.contract_address` (CG slug ONLY for `chain='coingecko'`; a raw contract
+otherwise) + `signal_events.token_id` are NOT guaranteed CG ids. V1 policy:
+- Canonical key for the universe + all aggregation is the **CG `coin_id` (slug)**.
+- A surface counts for a coin ONLY when its row's id EXACTLY equals that coin_id:
+  CG-slug surfaces (acceleration/momentum/slow_burn/velocity), `predictions.coin_id`,
+  `price_cache.coin_id`, gainers tables → count directly; `candidates` → count ONLY
+  `chain='coingecko'` rows; `signal_events` → count ONLY rows whose `token_id` exactly
+  equals coin_id (NO `LOWER(symbol)`/LIKE — the retrospective builder's symbol-merge is
+  REJECTED here; it would falsely co-count distinct coins sharing a ticker).
+- Unresolved/non-CG rows are NOT merged by symbol — they simply don't count in V1.
+  Consequence: prospective `early_count` is a CONSERVATIVE LOWER BOUND vs the symbol-merged
+  retrospective count (acknowledged). CG-resolution of contract/symbol surfaces (via the
+  existing `coin_id_resolves` / `lookup_symbol_name_by_coin_id` / `/coins/{id}.platforms`
+  hop) is a deferred follow-up. ≥4 is a STARTING gate; the snapshots measure the real
+  prospective distribution — do NOT assume the retrospective rate.
+- Test: a `chain='base'` candidate sharing a symbol with a CG coin does NOT contribute to
+  that coin's `early_count`.
+
+**Fold 3 — §12a freshness watchdog ships in V1 (NOT deferred to V1.1).** Per CLAUDE.md §12a
+a new pipeline table ships WITH its freshness SLO + watchdog. `conviction_watchlist_snapshots`
+gets: expected write cadence (hourly), AND a watchdog that (a) surfaces snapshot staleness on
+the dashboard **system-health** status (#337 `ok|degraded|down|unknown` SLO map) AND (b) fires
+a §12b operator alert (`parse_mode=None`, `*_dispatched`/`*_delivered` logs, via the now-paced
+alerter, `source="conviction_watchlist_watchdog"`) when latest-snapshot age exceeds the SLO.
+Logging the write is necessary but NOT sufficient. Test: stale/empty snapshot → health
+degraded/down + alert path exercised.
+
+**Fold 4 — mcap rules.** SNAPSHOT the full `tier≥watch` denominator (with `market_cap` +
+`mcap_age_minutes`, nullable). The dashboard TAB shows only `tier=high AND market_cap IS NOT
+NULL AND mcap_age_minutes <= CONVICTION_WATCHLIST_MCAP_MAX_AGE_MINUTES AND market_cap <
+CONVICTION_WATCHLIST_MAX_MCAP`. **Null or stale mcap is NEVER treated as sub-$30M** — those
+coins are EXCLUDED from the main tab and shown in a separate "mcap unknown/stale" sub-list,
+so a missing price is never silently rendered as a small-cap hit. New config:
+`CONVICTION_WATCHLIST_MCAP_MAX_AGE_MINUTES` (default 1440).
+
 ## Goal
 
 A forward-looking watchlist: surface coins that — RIGHT NOW, before any +20%/24h appearance —
