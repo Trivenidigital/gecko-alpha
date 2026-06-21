@@ -50,7 +50,11 @@ def make_signer(settings) -> Signer | None:
     secret = getattr(settings, "SOLANA_WALLET_SECRET", None)
     if secret is None:
         return None
-    raw = secret.get_secret_value() if hasattr(secret, "get_secret_value") else str(secret)
+    raw = (
+        secret.get_secret_value()
+        if hasattr(secret, "get_secret_value")
+        else str(secret)
+    )
     if not raw:
         return None
     return LocalEncryptedSigner(raw)

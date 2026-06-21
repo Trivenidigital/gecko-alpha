@@ -48,7 +48,10 @@ class SolanaRpc:
     async def send_raw_transaction(self, signed_b64: str) -> str:
         return await self._call(
             "sendTransaction",
-            [signed_b64, {"encoding": "base64", "skipPreflight": False, "maxRetries": 2}],
+            [
+                signed_b64,
+                {"encoding": "base64", "skipPreflight": False, "maxRetries": 2},
+            ],
         )
 
     async def confirm_signature(self, signature: str) -> str:

@@ -94,7 +94,6 @@ class SolanaSwapAdapter(ExchangeAdapter):
         # Jupiter priceImpactPct is a fraction string (0.0042 == 0.42%).
         price_impact_pct = float(quote.get("priceImpactPct") or 0.0) * 100.0
         mid = Decimal(amount) / Decimal(out_amount) if out_amount else Decimal("0")
-        self._last_quote = quote
         return {
             "out_amount": out_amount,
             "price_impact_pct": price_impact_pct,
