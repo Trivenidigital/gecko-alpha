@@ -1895,6 +1895,14 @@ async def main(argv: list[str] | None = None) -> int:
             await smoke_adapter.close()
         live_adapter = BinanceSpotAdapter(settings, db=db)
         _live_owned.append(live_adapter)
+        # BL-NEW-SOLANA: optional on-chain venue. None when no wallet secret.
+        from scout.live.solana_factory import build_solana_adapter
+
+        solana_adapter = build_solana_adapter(
+            settings=settings, session=live_adapter._session, db=db
+        )
+        if solana_adapter is not None:
+            _live_owned.append(solana_adapter)
         resolver = VenueResolver(
             binance_adapter=live_adapter,
             override_store=OverrideStore(db),
@@ -1964,6 +1972,7 @@ async def main(argv: list[str] | None = None) -> int:
             db=db,
             kill_switch=live_kill_switch,
             routing=live_routing,
+            onchain_adapter=solana_adapter,
         )
         # Boot-time drift reconciliation + startup status (Task 16).
         await reconcile_open_shadow_trades(
@@ -1973,6 +1982,12 @@ async def main(argv: list[str] | None = None) -> int:
             ks=live_kill_switch,
             settings=settings,
         )
+        if solana_adapter is not None:
+            from scout.live.solana_reconciliation import reconcile_open_solana_trades
+
+            await reconcile_open_solana_trades(
+                db=db, rpc=solana_adapter._rpc, settings=settings
+            )
         await emit_live_startup_status(
             db=db,
             adapter=live_adapter,
