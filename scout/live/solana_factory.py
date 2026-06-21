@@ -1,4 +1,11 @@
-"""Construct the SolanaSwapAdapter and its sub-modules from settings."""
+"""Construct the SolanaSwapAdapter and its sub-modules from settings.
+
+DEFERRED (spec §8 / §11): no **wallet-drain tripwire** is wired into the
+adapter or its sub-modules. An unexpected hot-wallet balance drop beyond
+tolerance does NOT currently engage the kill switch or alert. The hot wallet is
+bounded only by the static SOLANA_FLOAT_CAP_USD exposure gate and the daily
+sweep decision (scripts/solana_sweep.py) — there is no active drain detector.
+"""
 
 from __future__ import annotations
 

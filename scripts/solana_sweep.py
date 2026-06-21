@@ -3,6 +3,14 @@
 This module implements and tests the sweep DECISION. The actual cold-wallet
 transfer is gated behind SOLANA_SWEEP_COLD_WALLET and logged as not-yet-
 implemented until the transfer-instruction design lands (spec open items).
+
+DEFERRED (spec §8 / §11): the **wallet-drain tripwire** — an unexpected balance
+drop beyond tolerance that should engage the kill switch + fire a Telegram alert
+— is NOT implemented. This sweep job only computes/decides the periodic
+excess-over-cap transfer; it does NOT watch for anomalous drains between runs.
+Hot-wallet risk is currently bounded only by the static SOLANA_FLOAT_CAP_USD
+exposure gate (Gates.evaluate_onchain) plus this sweep decision. Do not assume a
+drain detector is protecting the hot wallet.
 """
 
 from __future__ import annotations

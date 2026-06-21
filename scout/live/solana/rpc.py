@@ -46,6 +46,13 @@ class SolanaRpc:
         return lamports / LAMPORTS_PER_SOL
 
     async def send_raw_transaction(self, signed_b64: str) -> str:
+        # DEFERRED (spec §7 / §11): the bounded "retry with a fresh blockhash"
+        # loop for transient sends (RPC 5xx, blockhash expired, send timeout)
+        # is NOT implemented here. A dropped or expired send surfaces as an
+        # error; any tx that nonetheless landed is recovered on the next boot
+        # by solana_reconciliation.reconcile_open_solana_trades, which re-checks
+        # every open `solana` row by its persisted signature against the chain.
+        # Idempotency is preserved: a confirmed signature is never re-sent.
         return await self._call(
             "sendTransaction",
             [

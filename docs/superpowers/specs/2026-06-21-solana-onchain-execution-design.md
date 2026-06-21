@@ -271,6 +271,25 @@ signal eligibility review, wallet funding, and operator sign-off.
 - `wallet_snapshots` / `venue_health` row shapes for the `solana` venue.
 - Confirmation level (`confirmed` vs `finalized`) and timeout tuning.
 
+### Deferred (described above but NOT yet implemented)
+
+These two safety features are specified (§7, §8) but are **not** implemented in
+the first rollout. They are listed here explicitly so no reviewer or operator
+assumes they are active:
+
+- **Transient blockhash retry (§7).** The bounded "retry with a fresh blockhash"
+  loop is NOT implemented. A dropped / blockhash-expired send currently surfaces
+  as an error and the tx (if it ever landed) is recovered on the next boot by
+  reconciliation (`solana_reconciliation.py`), which re-checks every open
+  `solana` row by its persisted signature against the chain. Code marker:
+  `scout/live/solana/rpc.py`.
+- **Wallet-drain tripwire (§8).** The "unexpected balance drop beyond tolerance
+  → engage kill switch + Telegram alert" tripwire is NOT implemented. The hot
+  wallet is currently bounded only by the static `SOLANA_FLOAT_CAP_USD` exposure
+  gate (Gates.`evaluate_onchain`) and the daily sweep decision
+  (`scripts/solana_sweep.py`); there is no active drain detector. Code markers:
+  `scripts/solana_sweep.py`, `scout/live/solana_factory.py`.
+
 ## 12. Pre-Implementation Review Addendum (2026-06-21)
 
 A code-grounded + live-API review before execution surfaced four items that
