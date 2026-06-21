@@ -536,7 +536,11 @@ class LiveEngine:
             size_usd=size_usd,
         )
         if not result.passed and result.reject_reason is None:
-            log.info("onchain_handoff_skipped", paper_trade_id=trade_id, reason="not_allowlisted")
+            log.info(
+                "onchain_handoff_skipped",
+                paper_trade_id=trade_id,
+                reason="not_allowlisted",
+            )
             return
         if not result.passed and result.reject_reason == "kill_switch":
             log.info("onchain_handoff_skipped_killed", paper_trade_id=trade_id)
@@ -549,12 +553,24 @@ class LiveEngine:
                     "(paper_trade_id, coin_id, symbol, venue, pair, signal_type, "
                     " size_usd, status, reject_reason, created_at) "
                     "VALUES (?, ?, ?, 'solana', ?, ?, ?, 'rejected', ?, ?)",
-                    (trade_id, paper_trade.coin_id, paper_trade.symbol, mint,
-                     paper_trade.signal_type, str(size_usd), result.reject_reason, now_iso),
+                    (
+                        trade_id,
+                        paper_trade.coin_id,
+                        paper_trade.symbol,
+                        mint,
+                        paper_trade.signal_type,
+                        str(size_usd),
+                        result.reject_reason,
+                        now_iso,
+                    ),
                 )
                 await self._db._conn.commit()
-            log.info("onchain_pretrade_gate_failed", paper_trade_id=trade_id,
-                     reject_reason=result.reject_reason, detail=result.detail)
+            log.info(
+                "onchain_pretrade_gate_failed",
+                paper_trade_id=trade_id,
+                reject_reason=result.reject_reason,
+                detail=result.detail,
+            )
             return
 
         # Passed gates. Shadow → record intent, NO broadcast.
@@ -569,30 +585,66 @@ class LiveEngine:
                     "(paper_trade_id, coin_id, symbol, venue, pair, signal_type, "
                     " size_usd, mid_at_entry, status, created_at) "
                     "VALUES (?, ?, ?, 'solana', ?, ?, ?, ?, 'open', ?)",
-                    (trade_id, paper_trade.coin_id, paper_trade.symbol, mint,
-                     paper_trade.signal_type, str(size_usd), str(quote["mid"]), now_iso),
+                    (
+                        trade_id,
+                        paper_trade.coin_id,
+                        paper_trade.symbol,
+                        mint,
+                        paper_trade.signal_type,
+                        str(size_usd),
+                        str(quote["mid"]),
+                        now_iso,
+                    ),
                 )
                 await self._db._conn.commit()
-            log.info("onchain_shadow_order_opened", paper_trade_id=trade_id,
-                     pair=mint, mid=str(quote["mid"]), size_usd=str(size_usd))
+            log.info(
+                "onchain_shadow_order_opened",
+                paper_trade_id=trade_id,
+                pair=mint,
+                mid=str(quote["mid"]),
+                size_usd=str(size_usd),
+            )
             return
 
-        # Live → record pending row, place swap, await fill, record terminal.
+        # Live → two-phase place so the tx signature is persisted to the
+        # live_trades row BEFORE any network broadcast (crash-recovery
+        # invariant). The signature is deterministic from the SIGNED tx, so:
+        #   prepare_order (quote→build→sign→derive sig, NO send)
+        #   → record_pending_order with entry_order_id=signature already set
+        #   → broadcast_prepared (the only network send)
+        # If broadcast raises after the tx may have landed, the row already
+        # carries the signature and status='open', so boot reconciliation
+        # (which filters entry_order_id IS NOT NULL) WILL recover it. The
+        # prepare step (no broadcast) failing is safe to mark manual-review.
         intent_uuid = str(uuid4())
         cid = make_client_order_id(trade_id, intent_uuid)
-        live_id = await record_pending_order(
-            self._db, client_order_id=cid, paper_trade_id=trade_id,
-            coin_id=paper_trade.coin_id, symbol=paper_trade.symbol, venue="solana",
-            pair=mint, signal_type=paper_trade.signal_type, size_usd=str(size_usd),
-        )
         request = OrderRequest(
-            paper_trade_id=trade_id, canonical=mint, venue_pair=mint,
-            side="buy", size_usd=float(size_usd), intent_uuid=intent_uuid,
+            paper_trade_id=trade_id,
+            canonical=mint,
+            venue_pair=mint,
+            side="buy",
+            size_usd=float(size_usd),
+            intent_uuid=intent_uuid,
         )
         try:
-            signature = await self._onchain_adapter.place_order_request(request)
+            signature, signed_tx_b64 = await self._onchain_adapter.prepare_order(
+                request
+            )
         except Exception:
-            log.exception("onchain_dispatch_place_failed", paper_trade_id=trade_id)
+            # No broadcast happened — nothing landed on-chain. Record the
+            # intent as needs_manual_review (no signature exists to recover).
+            log.exception("onchain_dispatch_prepare_failed", paper_trade_id=trade_id)
+            live_id = await record_pending_order(
+                self._db,
+                client_order_id=cid,
+                paper_trade_id=trade_id,
+                coin_id=paper_trade.coin_id,
+                symbol=paper_trade.symbol,
+                venue="solana",
+                pair=mint,
+                signal_type=paper_trade.signal_type,
+                size_usd=str(size_usd),
+            )
             async with self._db._txn_lock:
                 await self._db._conn.execute(
                     "UPDATE live_trades SET status='needs_manual_review' WHERE id=?",
@@ -600,17 +652,46 @@ class LiveEngine:
                 )
                 await self._db._conn.commit()
             return
-        async with self._db._txn_lock:
-            await self._db._conn.execute(
-                "UPDATE live_trades SET entry_order_id=? WHERE id=?", (signature, live_id)
+
+        # Persist the signature BEFORE broadcasting.
+        live_id = await record_pending_order(
+            self._db,
+            client_order_id=cid,
+            paper_trade_id=trade_id,
+            coin_id=paper_trade.coin_id,
+            symbol=paper_trade.symbol,
+            venue="solana",
+            pair=mint,
+            signal_type=paper_trade.signal_type,
+            size_usd=str(size_usd),
+            entry_order_id=signature,
+        )
+        try:
+            await self._onchain_adapter.broadcast_prepared(signed_tx_b64)
+        except Exception:
+            # The send raised — but the tx MAY have landed on-chain. The row
+            # already carries entry_order_id=signature and status='open', so
+            # leave it untouched: boot reconciliation re-checks it against the
+            # chain. Do NOT mark needs_manual_review (would NULL the recovery
+            # path) and do NOT broadcast again (idempotency: never re-send a
+            # signed tx whose signature we already persisted).
+            log.exception(
+                "onchain_dispatch_broadcast_failed",
+                paper_trade_id=trade_id,
+                signature=signature,
             )
-            await self._db._conn.commit()
-        log.info("live_dispatch_entered", paper_trade_id=trade_id,
-                 venue="solana", signature=signature)
+            return
+        log.info(
+            "live_dispatch_entered",
+            paper_trade_id=trade_id,
+            venue="solana",
+            signature=signature,
+        )
 
         try:
             confirmation = await self._onchain_adapter.await_fill_confirmation(
-                venue_order_id=signature, client_order_id=cid,
+                venue_order_id=signature,
+                client_order_id=cid,
                 timeout_sec=self._config._s.SOLANA_CONFIRM_TIMEOUT_SEC,
             )
         except Exception:
@@ -626,7 +707,11 @@ class LiveEngine:
                 await self._db._conn.execute(
                     "UPDATE live_trades SET entry_fill_price=?, entry_fill_qty=? "
                     "WHERE id=?",
-                    (str(confirmation.fill_price), str(confirmation.filled_qty), live_id),
+                    (
+                        str(confirmation.fill_price),
+                        str(confirmation.filled_qty),
+                        live_id,
+                    ),
                 )
             elif confirmation.status == "rejected":
                 await self._db._conn.execute(
@@ -634,8 +719,13 @@ class LiveEngine:
                 )
             # timeout → leave 'open'; Task 12 boot reconciliation resolves it.
             await self._db._conn.commit()
-        log.info("live_dispatch_terminal", paper_trade_id=trade_id, venue="solana",
-                 signature=signature, status=confirmation.status)
+        log.info(
+            "live_dispatch_terminal",
+            paper_trade_id=trade_id,
+            venue="solana",
+            signature=signature,
+            status=confirmation.status,
+        )
         if confirmation.status == "filled":
             await increment_consecutive(
                 self._db, paper_trade.signal_type, "solana", paper_trade_id=trade_id

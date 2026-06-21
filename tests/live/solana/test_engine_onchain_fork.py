@@ -131,3 +131,75 @@ async def test_onchain_gate_reject_writes_rejected_shadow_row(tmp_path):
     assert row[1] is not None, "reject_reason must be non-null"
     assert row[1] == "insufficient_depth"
     await db.close()
+
+
+# --- C2: signature persisted BEFORE broadcast (crash recovery) -----------
+
+
+class _LiveAdapter(_Adapter):
+    """Two-phase live adapter where broadcast raises AFTER prepare. The signed
+    tx (and its signature) is known pre-broadcast, so the engine must persist
+    the signature to live_trades before calling broadcast_prepared."""
+
+    PREPARED_SIG = "PREPARED_SIG_XYZ"
+
+    async def prepare_order(self, request):
+        return self.PREPARED_SIG, "SIGNED_TX_B64"
+
+    async def broadcast_prepared(self, signed_tx_b64):
+        raise RuntimeError("network send blew up after the tx may have landed")
+
+    async def place_order_request(self, request):
+        raise AssertionError("live two-phase path must NOT call place_order_request")
+
+
+def _live_settings(**o):
+    return Settings(
+        _env_file=None,
+        **_REQUIRED,
+        LIVE_MODE="live",
+        LIVE_SIGNAL_ALLOWLIST="first_signal",
+        **o,
+    )
+
+
+@pytest.mark.asyncio
+async def test_broadcast_failure_leaves_recoverable_row_with_signature(tmp_path):
+    """If broadcast_prepared raises, the live_trades row must already carry
+    entry_order_id (the signature) and stay status='open' so boot
+    reconciliation can re-check it against the chain. It must NOT be
+    needs_manual_review with a NULL signature (unrecoverable)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = _live_settings()
+    ptid = await _seed_paper(db, MINT)
+    engine = LiveEngine(
+        config=LiveConfig(s),
+        resolver=None,
+        adapter=_Adapter(),
+        db=db,
+        kill_switch=_KS(),
+        routing=None,
+        onchain_adapter=_LiveAdapter(),
+    )
+    paper = SimpleNamespace(
+        id=ptid,
+        coin_id=MINT,
+        symbol="WSOL",
+        signal_type="first_signal",
+        chain="solana",
+    )
+    await engine.on_paper_trade_opened(paper)
+
+    cur = await db._conn.execute(
+        "SELECT status, entry_order_id FROM live_trades WHERE paper_trade_id=?",
+        (ptid,),
+    )
+    row = await cur.fetchone()
+    assert row is not None, "expected a live_trades row"
+    status, entry_order_id = row
+    assert (
+        entry_order_id == _LiveAdapter.PREPARED_SIG
+    ), "signature must be persisted BEFORE broadcast for recovery"
+    assert status == "open", "row must stay 'open' (recoverable), not manual-review"
+    await db.close()

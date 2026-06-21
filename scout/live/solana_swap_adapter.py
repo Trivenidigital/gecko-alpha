@@ -8,11 +8,13 @@ token mint string. Buy = USDC->mint; Sell = mint->USDC.
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
 import structlog
+from solders.transaction import VersionedTransaction
 
 from scout.live.adapter_base import (
     ExchangeAdapter,
@@ -156,8 +158,25 @@ class SolanaSwapAdapter(ExchangeAdapter):
             log.info("solana_sellability_check_failed", venue_pair=venue_pair)
             return False
 
-    # ---- order placement ----
-    async def place_order_request(self, request: OrderRequest) -> str:
+    # ---- order placement (two-phase: prepare then broadcast) ----
+    @staticmethod
+    def _signature_of_signed_tx(signed_tx_b64: str) -> str:
+        """Derive the tx signature (base58 of the signed VersionedTransaction's
+        first signature). Deterministic pre-broadcast — equals the signature
+        the RPC will report once the tx lands."""
+        raw = base64.b64decode(signed_tx_b64)
+        tx = VersionedTransaction.from_bytes(raw)
+        return str(tx.signatures[0])
+
+    async def prepare_order(self, request: OrderRequest) -> tuple[str, str]:
+        """Quote → build → sign → derive signature. Does NOT broadcast.
+
+        Returns ``(signature, signed_tx_b64)``. The signature is computed from
+        the SIGNED transaction's first signature and is identical to what the
+        RPC reports after send, so the engine can persist it to live_trades
+        BEFORE broadcasting (crash-recovery invariant — a tx that lands but
+        whose send-call raises is still recoverable by boot reconciliation).
+        """
         if self._signer is None:
             raise RuntimeError("no signer")
         owner = self._signer.pubkey()
@@ -175,19 +194,33 @@ class SolanaSwapAdapter(ExchangeAdapter):
             priority_fee_lamports=self._settings.SOLANA_PRIORITY_FEE_LAMPORTS,
         )
         signed = self._signer.sign(unsigned)
-        signature = await self._rpc.send_raw_transaction(signed)
+        signature = self._signature_of_signed_tx(signed)
         self._pending[signature] = {
             "out_amount": int(quote["outAmount"]),
             "size_usd": request.size_usd,
             "side": request.side,
+            "signed_tx_b64": signed,
         }
         log.info(
-            "solana_order_sent",
+            "solana_order_prepared",
             signature=signature,
             side=request.side,
             size_usd=request.size_usd,
         )
+        return signature, signed
+
+    async def broadcast_prepared(self, signed_tx_b64: str) -> str:
+        """Broadcast a previously-prepared signed transaction. Returns the
+        signature the RPC reports (equal to the prepared signature)."""
+        signature = await self._rpc.send_raw_transaction(signed_tx_b64)
+        log.info("solana_order_sent", signature=signature)
         return signature
+
+    async def place_order_request(self, request: OrderRequest) -> str:
+        """Back-compat single-call place: prepare then broadcast. Returns the
+        broadcast signature."""
+        _, signed = await self.prepare_order(request)
+        return await self.broadcast_prepared(signed)
 
     # ---- fill confirmation ----
     async def await_fill_confirmation(
