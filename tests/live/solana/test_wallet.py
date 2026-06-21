@@ -11,7 +11,7 @@ from solders.pubkey import Pubkey
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 
-from scout.live.solana.wallet import LocalEncryptedSigner, Signer
+from scout.live.solana.wallet import LocalKeypairSigner, Signer
 
 
 def _unsigned_tx_b64(payer: Keypair) -> str:
@@ -26,21 +26,21 @@ def _unsigned_tx_b64(payer: Keypair) -> str:
 
 def test_pubkey_matches_keypair():
     kp = Keypair()
-    signer = LocalEncryptedSigner(str(kp))
+    signer = LocalKeypairSigner(str(kp))
     assert signer.pubkey() == str(kp.pubkey())
 
 
 def test_repr_does_not_leak_secret():
     kp = Keypair()
     secret = str(kp)
-    signer = LocalEncryptedSigner(secret)
+    signer = LocalKeypairSigner(secret)
     assert secret not in repr(signer)
     assert secret not in str(signer)
 
 
 def test_sign_returns_base64_signed_tx():
     kp = Keypair()
-    signer = LocalEncryptedSigner(str(kp))
+    signer = LocalKeypairSigner(str(kp))
     signed_b64 = signer.sign(_unsigned_tx_b64(kp))
     raw = base64.b64decode(signed_b64)
     signed = VersionedTransaction.from_bytes(raw)
@@ -49,4 +49,4 @@ def test_sign_returns_base64_signed_tx():
 
 
 def test_protocol_is_satisfied():
-    assert isinstance(LocalEncryptedSigner(str(Keypair())), Signer)
+    assert isinstance(LocalKeypairSigner(str(Keypair())), Signer)

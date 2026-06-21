@@ -1,4 +1,7 @@
-"""Jupiter v6 aggregator HTTP client. Pure HTTP — holds no keys, signs nothing.
+"""Jupiter swap/v1 aggregator HTTP client. Pure HTTP — holds no keys, signs nothing.
+
+Targets the current swap/v1 API (base URL from SOLANA_JUPITER_URL, default
+https://api.jup.ag/swap/v1). The deprecated quote-api/v6 host is NOT used.
 
 Quote → swap-transaction flow:
   get_quote()       -> GET  /quote  (routing + priceImpactPct)

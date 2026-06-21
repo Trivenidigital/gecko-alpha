@@ -361,13 +361,23 @@ class Gates:
         Kill-switch and allowlist are checked first, mirroring evaluate()."""
         kill = await self._ks.is_active()
         if kill is not None:
-            return GateResult(passed=False, reject_reason="kill_switch", detail=None)
+            # Preserve the forensic link to the kill event, mirroring evaluate().
+            return GateResult(
+                passed=False,
+                reject_reason="kill_switch",
+                detail=f"kill_event_id={kill.kill_event_id}",
+            )
         if not self._config.is_signal_enabled(signal_type):
             return GateResult(
                 passed=False, reject_reason=None, detail="not_allowlisted"
             )
 
         s = self._config._s
+        # NOTE: this gate verdict is computed on THIS quote. The adapter's
+        # prepare_order fetches a FRESH quote to sign, so the executed tx may
+        # differ slightly from the gated impact. Execution is still bounded by
+        # SOLANA_SLIPPAGE_BPS_CAP on the signing quote; this gate is the
+        # pre-trade screen, not a guarantee the signed tx matches it.
         quote = await self._adapter.quote_at_size(
             venue_pair=venue_pair, side="buy", size_usd=float(size_usd)
         )
@@ -404,6 +414,12 @@ class Gates:
         # stored as TEXT in live_trades → CAST as REAL like the CEX gate.
         # Unit tests construct Gates(..., db=None); the real engine always
         # passes a live db. When db is None, treat open exposure as zero.
+        # KNOWN LIMITATION (TOCTOU): this SUM is read BEFORE _dispatch_onchain
+        # inserts the new row, so two Solana intents dispatched concurrently
+        # could both pass and jointly exceed the cap. Today on_paper_trade_opened
+        # dispatches sequentially (single await chain) so the window is closed in
+        # practice; a reserved-intent row / lock-held check-and-insert is the
+        # durable fix — tracked in the on-chain follow-up plan.
         sum_open_dec = Decimal("0")
         if self._db is not None and self._db._conn is not None:
             cur = await self._db._conn.execute(

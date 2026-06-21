@@ -142,6 +142,9 @@ class SolanaSwapAdapter(ExchangeAdapter):
             return 0.0
         if asset.upper() == "SOL":
             return await self._rpc.get_sol_balance(owner=owner)
+        # NOTE: any non-SOL asset (incl. the CEX-default "USDT") maps to the
+        # wallet's USDC balance — USDC is this venue's quote currency. This is a
+        # deliberate symbol mapping, not a real USDT lookup.
         return await self._rpc.get_token_balance(owner=owner, mint=c.USDC_MINT)
 
     async def is_sellable(self, *, venue_pair: str, expected_out_amount: int) -> bool:
@@ -252,6 +255,9 @@ class SolanaSwapAdapter(ExchangeAdapter):
             if status in ("success", "failed"):
                 break
             await sleep(poll_interval_sec)
+        # Every path below is terminal for this signature; release the stash so
+        # _pending does not grow unbounded for the process lifetime.
+        self._pending.pop(venue_order_id, None)
         if status == "success":
             # I1: fill_price is WHOLE USDC per output-token BASE unit
             # (size_usd / out_amount), the canonical scale shared with

@@ -704,14 +704,23 @@ class LiveEngine:
         async with self._db._txn_lock:
             if confirmation.status == "filled":
                 # Filled buy IS an open position → keep status='open', record fill.
+                # Guard the str() casts: if the adapter could not compute a fill
+                # price/qty (e.g. the _pending stash was lost across a restart),
+                # persist SQL NULL rather than the literal string "None".
+                fill_price = (
+                    str(confirmation.fill_price)
+                    if confirmation.fill_price is not None
+                    else None
+                )
+                fill_qty = (
+                    str(confirmation.filled_qty)
+                    if confirmation.filled_qty is not None
+                    else None
+                )
                 await self._db._conn.execute(
                     "UPDATE live_trades SET entry_fill_price=?, entry_fill_qty=? "
                     "WHERE id=?",
-                    (
-                        str(confirmation.fill_price),
-                        str(confirmation.filled_qty),
-                        live_id,
-                    ),
+                    (fill_price, fill_qty, live_id),
                 )
             elif confirmation.status == "rejected":
                 await self._db._conn.execute(

@@ -1,9 +1,11 @@
 """Signer seam — the ONLY module that holds Solana private key material.
 
-Phase 1: LocalEncryptedSigner loads the key in-process from the
-SOLANA_WALLET_SECRET secret (base58). A future RemoteSigner can implement
-the same Signer Protocol (pubkey/sign) to move signing into an isolated
-service with zero adapter changes.
+Phase 1: LocalKeypairSigner loads the key in-process from the
+SOLANA_WALLET_SECRET secret (base58). NOTE: this class does NOT encrypt the
+key — it holds an in-memory Keypair. "At rest" protection comes from how the
+secret is supplied (Pydantic SecretStr, kept out of .env.example/git), not
+from this class. A future RemoteSigner can implement the same Signer Protocol
+(pubkey/sign) to move signing into an isolated service with zero adapter changes.
 """
 
 from __future__ import annotations
@@ -24,8 +26,9 @@ class Signer(Protocol):
     def sign(self, tx_b64: str) -> str: ...
 
 
-class LocalEncryptedSigner:
-    """In-process signer. Never logs, reprs, or persists key bytes."""
+class LocalKeypairSigner:
+    """In-process signer holding a plaintext Keypair in memory. Never logs,
+    reprs, or persists key bytes. (Not encrypted — see module docstring.)"""
 
     def __init__(self, secret_base58: str) -> None:
         self._kp = Keypair.from_base58_string(secret_base58)
@@ -41,7 +44,7 @@ class LocalEncryptedSigner:
         return base64.b64encode(bytes(signed)).decode()
 
     def __repr__(self) -> str:  # never expose key
-        return f"<LocalEncryptedSigner pubkey={self._pubkey}>"
+        return f"<LocalKeypairSigner pubkey={self._pubkey}>"
 
     __str__ = __repr__
 
@@ -57,4 +60,4 @@ def make_signer(settings) -> Signer | None:
     )
     if not raw:
         return None
-    return LocalEncryptedSigner(raw)
+    return LocalKeypairSigner(raw)

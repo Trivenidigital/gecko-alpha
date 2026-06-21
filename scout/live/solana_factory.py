@@ -25,6 +25,10 @@ log = structlog.get_logger(__name__)
 def build_solana_adapter(
     *, settings, session: aiohttp.ClientSession, db: Any | None
 ) -> SolanaSwapAdapter | None:
+    # NOTE: `session` is OWNED by the caller (the Binance adapter's
+    # ClientSession in main.py). The Solana adapter borrows it and must NOT
+    # close it — SolanaSwapAdapter deliberately has no close(). If the Binance
+    # teardown order ever changes, revisit this shared-session lifecycle.
     signer = make_signer(settings)
     if signer is None:
         log.info("solana_adapter_skipped_no_secret")
