@@ -359,10 +359,10 @@ class Gates:
         """On-chain gate chain (Solana). Replaces the CEX order-book walk with
         Jupiter price-impact, and adds sellability (honeypot) + SOL gas gates.
         Kill-switch and allowlist are checked first, mirroring evaluate()."""
-        if self._ks is not None and self._ks.is_active() is not None:
+        kill = await self._ks.is_active()
+        if kill is not None:
             return GateResult(passed=False, reject_reason="kill_switch", detail=None)
-        allowlist = self._config._s.LIVE_SIGNAL_ALLOWLIST
-        if allowlist and not self._config.is_signal_enabled(signal_type):
+        if not self._config.is_signal_enabled(signal_type):
             return GateResult(passed=False, reject_reason=None, detail="not_allowlisted")
 
         s = self._config._s

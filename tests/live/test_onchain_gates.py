@@ -34,12 +34,12 @@ class _Adapter:
 
 
 class _KS:
-    def is_active(self):
+    async def is_active(self):
         return None
 
 
 def _gates(adapter, **so):
-    s = _settings(**so)
+    s = _settings(LIVE_SIGNAL_ALLOWLIST="x", **so)
     return Gates(config=LiveConfig(s), db=None, resolver=None, adapter=adapter, kill_switch=_KS())
 
 
