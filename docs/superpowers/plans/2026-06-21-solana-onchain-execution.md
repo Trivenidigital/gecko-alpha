@@ -39,7 +39,7 @@ In `pyproject.toml`, append to the `dependencies` array (after the `"ccxt==4.5.5
 ```toml
     # Solana on-chain execution (BL-NEW-SOLANA). solders = typed keypair/tx;
     # base58 for raw key decode. Jupiter + JSON-RPC go over aiohttp (already present).
-    "solders>=0.21,<0.24",
+    "solders>=0.21,<0.28",
     "base58>=2.1,<3",
 ```
 
@@ -146,13 +146,13 @@ from aioresponses import aioresponses
 
 from scout.live.solana.jupiter_client import JupiterClient, JupiterError
 
-_QUOTE_RE = re.compile(r"https://quote-api\.jup\.ag/v6/quote.*")
+_QUOTE_RE = re.compile(r"https://api\.jup\.ag/swap/v1/quote.*")
 
 
 @pytest.mark.asyncio
 async def test_get_quote_returns_payload():
     async with aiohttp.ClientSession() as session:
-        client = JupiterClient(session, base_url="https://quote-api.jup.ag/v6")
+        client = JupiterClient(session, base_url="https://api.jup.ag/swap/v1")
         with aioresponses() as m:
             m.get(
                 _QUOTE_RE,
@@ -173,7 +173,7 @@ async def test_get_quote_returns_payload():
 @pytest.mark.asyncio
 async def test_get_quote_raises_on_http_error():
     async with aiohttp.ClientSession() as session:
-        client = JupiterClient(session, base_url="https://quote-api.jup.ag/v6")
+        client = JupiterClient(session, base_url="https://api.jup.ag/swap/v1")
         with aioresponses() as m:
             m.get(_QUOTE_RE, status=400, payload={"error": "no route"})
             with pytest.raises(JupiterError):
@@ -214,9 +214,13 @@ class JupiterError(RuntimeError):
 
 
 class JupiterClient:
-    def __init__(self, session: aiohttp.ClientSession, base_url: str) -> None:
+    def __init__(
+        self, session: aiohttp.ClientSession, base_url: str, api_key: str | None = None
+    ) -> None:
         self._session = session
         self._base = base_url.rstrip("/")
+        # api.jup.ag requires a free key via x-api-key; lite-api.jup.ag is keyless.
+        self._headers = {"x-api-key": api_key} if api_key else {}
 
     async def get_quote(
         self, *, input_mint: str, output_mint: str, amount: int, slippage_bps: int
@@ -227,7 +231,9 @@ class JupiterClient:
             "amount": str(amount),
             "slippageBps": str(slippage_bps),
         }
-        async with self._session.get(f"{self._base}/quote", params=params) as resp:
+        async with self._session.get(
+            f"{self._base}/quote", params=params, headers=self._headers
+        ) as resp:
             body = await resp.json()
             if resp.status != 200:
                 raise JupiterError(f"quote http {resp.status}: {body}")
@@ -264,13 +270,13 @@ git commit -m "feat(solana): Jupiter quote client"
 Append to `tests/live/solana/test_jupiter_client.py`:
 
 ```python
-_SWAP_RE = re.compile(r"https://quote-api\.jup\.ag/v6/swap.*")
+_SWAP_RE = re.compile(r"https://api\.jup\.ag/swap/v1/swap.*")
 
 
 @pytest.mark.asyncio
 async def test_build_swap_tx_returns_base64():
     async with aiohttp.ClientSession() as session:
-        client = JupiterClient(session, base_url="https://quote-api.jup.ag/v6")
+        client = JupiterClient(session, base_url="https://api.jup.ag/swap/v1")
         with aioresponses() as m:
             m.post(_SWAP_RE, payload={"swapTransaction": "QUJDRA=="})
             tx = await client.build_swap_tx(
@@ -282,7 +288,7 @@ async def test_build_swap_tx_returns_base64():
 @pytest.mark.asyncio
 async def test_build_swap_tx_raises_when_missing():
     async with aiohttp.ClientSession() as session:
-        client = JupiterClient(session, base_url="https://quote-api.jup.ag/v6")
+        client = JupiterClient(session, base_url="https://api.jup.ag/swap/v1")
         with aioresponses() as m:
             m.post(_SWAP_RE, payload={})
             with pytest.raises(JupiterError):
@@ -310,7 +316,9 @@ Append to the `JupiterClient` class in `scout/live/solana/jupiter_client.py`:
             "wrapAndUnwrapSol": True,
             "prioritizationFeeLamports": priority_fee_lamports,
         }
-        async with self._session.post(f"{self._base}/swap", json=payload) as resp:
+        async with self._session.post(
+            f"{self._base}/swap", json=payload, headers=self._headers
+        ) as resp:
             body = await resp.json()
             if resp.status != 200:
                 raise JupiterError(f"swap http {resp.status}: {body}")
@@ -358,17 +366,24 @@ from __future__ import annotations
 import base64
 
 import pytest
+from solders.hash import Hash
+from solders.instruction import Instruction
 from solders.keypair import Keypair
-from solders.message import Message
+from solders.message import MessageV0
+from solders.pubkey import Pubkey
+from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 
 from scout.live.solana.wallet import LocalEncryptedSigner, Signer
 
 
 def _unsigned_tx_b64(payer: Keypair) -> str:
-    # Minimal valid versioned tx (no instructions) with payer as signer slot.
-    msg = Message.new_with_blockhash([], payer.pubkey(), Keypair().pubkey().to_bytes())
-    tx = VersionedTransaction.populate(msg, [])
+    # Minimal well-formed versioned tx (one no-op ix), blockhash is a Hash
+    # (NOT bytes), default signature slot so the adapter can sign it. Verified
+    # against solders 0.27 API: MessageV0.try_compile + VersionedTransaction.populate.
+    ix = Instruction(Pubkey.default(), bytes([1]), [])
+    msg = MessageV0.try_compile(payer.pubkey(), [ix], [], Hash.default())
+    tx = VersionedTransaction.populate(msg, [Signature.default()])
     return base64.b64encode(bytes(tx)).decode()
 
 
@@ -715,7 +730,8 @@ _REQUIRED = dict(TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY
 def test_solana_defaults():
     s = Settings(_env_file=None, **_REQUIRED)
     assert s.SOLANA_RPC_URL.startswith("https://")
-    assert s.SOLANA_JUPITER_URL == "https://quote-api.jup.ag/v6"
+    assert s.SOLANA_JUPITER_URL == "https://api.jup.ag/swap/v1"
+    assert s.SOLANA_JUPITER_API_KEY is None
     assert s.SOLANA_WALLET_SECRET is None
     assert s.SOLANA_SLIPPAGE_BPS_CAP == 100
     assert s.SOLANA_MAX_PRICE_IMPACT_PCT == 3.0
@@ -744,7 +760,10 @@ In `scout/config.py`, immediately AFTER the `BINANCE_API_SECRET: SecretStr | Non
     # Jupiter aggregator venue. Keys live ONLY in scout/live/solana/wallet.py.
     # SOLANA_WALLET_SECRET is base58 keypair secret; NEVER add to .env.example.
     SOLANA_RPC_URL: str = "https://api.mainnet-beta.solana.com"
-    SOLANA_JUPITER_URL: str = "https://quote-api.jup.ag/v6"
+    # Jupiter v6 quote-api was deprecated 2025-10. Use swap/v1; api.jup.ag
+    # needs a free key (x-api-key header), lite-api.jup.ag is keyless+throttled.
+    SOLANA_JUPITER_URL: str = "https://api.jup.ag/swap/v1"
+    SOLANA_JUPITER_API_KEY: SecretStr | None = None
     SOLANA_WALLET_SECRET: SecretStr | None = None
     # Execution quality (memecoin pools are thin → wider caps than CEX defaults)
     SOLANA_SLIPPAGE_BPS_CAP: int = 100
@@ -1454,7 +1473,7 @@ git commit -m "feat(solana): adapter await_fill_confirmation (poll -> terminal s
 
 **Interfaces:**
 - Consumes: adapter attribute `is_onchain: bool`, adapter methods `quote_at_size`, `is_sellable`, `fetch_account_balance("SOL")`; settings `SOLANA_MAX_PRICE_IMPACT_PCT`, `SOLANA_SLIPPAGE_BPS_CAP` (reuse `LIVE_SLIPPAGE_BPS_CAP` semantics via existing slippage gate is bypassed on-chain), `SOLANA_MIN_SOL_GAS_RESERVE`.
-- Produces: a new method `async def evaluate_onchain(self, *, signal_type, symbol, venue_pair, size_usd) -> GateResult` returning `GateResult` with reject_reasons in `{'insufficient_depth','not_sellable','insufficient_balance', None}`. The engine calls this branch when `adapter.is_onchain` (wired in Task 13). Keeps the CEX `evaluate()` untouched.
+- Produces: a new method `async def evaluate_onchain(self, *, signal_type, symbol, venue_pair, size_usd) -> GateResult` returning `GateResult` with reject_reasons in `{'insufficient_depth','not_sellable','insufficient_balance', None}`. The engine's on-chain fork invokes this via a SECOND `Gates` instance bound to the Solana adapter (`self._onchain_gates`, built in Task 14). Keeps the CEX `evaluate()` and the Binance-bound `Gates` instance untouched.
 
 **Why a separate method:** the CEX `evaluate()` walks an order book; on-chain replaces that with price-impact and adds sellability/gas. A dedicated method avoids destabilizing the heavily-tested CEX path while reusing `GateResult` and the kill-switch/allowlist/exposure checks.
 
@@ -1620,7 +1639,7 @@ git commit -m "feat(solana): on-chain gates (price-impact, sellability, gas)"
 
 **Interfaces:**
 - Consumes: `Database`, the adapter's `rpc.confirm_signature`.
-- Produces: `async def reconcile_open_solana_trades(*, db: Database, rpc, settings) -> None`. Scans `live_trades` rows with `venue='solana'` and `status='open'` whose `entry_order_id` (the tx signature) is set; re-checks each signature on-chain. `success` → mark row `status='filled'`; `failed` → `status='rejected'`; `pending` → leave open. Always logs `solana_reconciliation_done` with counts. Never raises.
+- Produces: `async def reconcile_open_solana_trades(*, db: Database, rpc, settings) -> dict[str, int]`. Scans `live_trades` rows with `venue='solana'`, `status='open'`, `entry_order_id` (the tx signature) set, AND `entry_fill_price IS NULL` (sent-but-unconfirmed — a confirmed open position has its fill price recorded by the live dispatch path in Task 14, so it is NOT re-checked). Re-checks each signature on-chain. **`success` → the entry landed; the position is genuinely OPEN, so leave `status='open'`** (do NOT write `'filled'` — that value is forbidden by the `live_trades.status` CHECK constraint, and a filled buy IS an open position until it exits). **`failed` → the swap reverted, no position → `status='rejected'`.** **`pending` → leave open** for the next boot. Returns `{'confirmed': n, 'failed': n, 'pending': n}`. Always logs `solana_reconciliation_done`. Never raises.
 
 **Note on schema:** `live_trades` already has `entry_order_id`, `status`, `venue` columns (used by Binance path). No migration needed; we reuse `entry_order_id` to hold the tx signature for the solana venue.
 
@@ -1671,7 +1690,7 @@ async def _status_of(db, row_id):
 
 
 @pytest.mark.asyncio
-async def test_reconcile_marks_filled_failed_and_leaves_pending(tmp_path):
+async def test_reconcile_confirms_fails_and_leaves_pending(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
     ok = await _seed_open_solana_trade(db, sig="SIG_OK", ptid=1)
@@ -1679,11 +1698,15 @@ async def test_reconcile_marks_filled_failed_and_leaves_pending(tmp_path):
     wait = await _seed_open_solana_trade(db, sig="SIG_WAIT", ptid=3)
     rpc = _SeqRpc({"SIG_OK": "success", "SIG_BAD": "failed", "SIG_WAIT": "pending"})
 
-    await reconcile_open_solana_trades(db=db, rpc=rpc, settings=_settings())
+    summary = await reconcile_open_solana_trades(db=db, rpc=rpc, settings=_settings())
 
-    assert await _status_of(db, ok) == "filled"
+    # success => position is genuinely open (NOT 'filled', which the CHECK forbids)
+    assert await _status_of(db, ok) == "open"
+    # failed swap => no position
     assert await _status_of(db, bad) == "rejected"
+    # not yet landed => leave open for next boot
     assert await _status_of(db, wait) == "open"
+    assert summary == {"confirmed": 1, "failed": 1, "pending": 1}
     await db.close()
 
 
@@ -1720,41 +1743,44 @@ from scout.db import Database
 log = structlog.get_logger(__name__)
 
 
-async def reconcile_open_solana_trades(*, db: Database, rpc, settings) -> None:
+async def reconcile_open_solana_trades(*, db: Database, rpc, settings) -> dict[str, int]:
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
+    # Only sent-but-unconfirmed rows: a confirmed open position has its
+    # entry_fill_price set by the live dispatch path, so it is excluded here.
     cur = await db._conn.execute(
         "SELECT id, entry_order_id FROM live_trades "
-        "WHERE venue='solana' AND status='open' AND entry_order_id IS NOT NULL"
+        "WHERE venue='solana' AND status='open' AND entry_order_id IS NOT NULL "
+        "AND entry_fill_price IS NULL"
     )
     rows = await cur.fetchall()
 
-    filled = failed = still_open = 0
+    confirmed = failed = pending = 0
     for row_id, signature in rows:
         try:
             state = await rpc.confirm_signature(signature)
         except Exception:
             log.warning("solana_reconciliation_row_err", row_id=row_id, signature=signature)
-            still_open += 1
+            pending += 1
             continue
         if state == "success":
-            await db._conn.execute(
-                "UPDATE live_trades SET status='filled' WHERE id=?", (row_id,)
-            )
-            filled += 1
+            # Entry landed → genuinely an OPEN position. Do NOT write 'filled'
+            # (forbidden by the live_trades.status CHECK, and a filled buy is
+            # open until it exits). Leave status='open'.
+            confirmed += 1
         elif state == "failed":
+            # Swap reverted on-chain → no position exists.
             await db._conn.execute(
                 "UPDATE live_trades SET status='rejected' WHERE id=?", (row_id,)
             )
             failed += 1
         else:
-            still_open += 1
+            pending += 1
     await db._conn.commit()
 
-    log.info(
-        "solana_reconciliation_done",
-        rows_inspected=len(rows), filled=filled, failed=failed, still_open=still_open,
-    )
+    summary = {"confirmed": confirmed, "failed": failed, "pending": pending}
+    log.info("solana_reconciliation_done", rows_inspected=len(rows), **summary)
+    return summary
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -1771,18 +1797,394 @@ git commit -m "feat(solana): boot reconciliation by tx signature"
 
 ---
 
-### Task 13: Wire the adapter + on-chain gate into the engine boot
+### Task 13: Solana mint resolver
+
+**Files:**
+- Create: `scout/live/solana/mint_resolver.py`
+- Test: `tests/live/solana/test_mint_resolver.py`
+
+**Interfaces:**
+- Produces: `def resolve_solana_mint(*, coin_id: str, contract_address: str | None = None) -> str | None`. Reuses `scout.trading.minara_alert._looks_like_spl_address`. Returns the SPL mint when `contract_address` is a valid SPL address, else when `coin_id` itself is a valid SPL address (native Solana tokens carry the mint AS their coin_id — confirmed in `minara_alert.maybe_minara_command`), else `None`.
+
+**Why:** the engine works in symbols/coin_ids; Jupiter needs the mint. This mirrors the exact resolution the existing Minara alert path uses. The non-native case (a CoinGecko slug whose `platforms.solana` holds the mint) needs a network `fetch_coin_detail` lookup and is a flagged follow-up — the first rollout snipes native Solana tokens where `coin_id` IS the mint.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/live/solana/test_mint_resolver.py`:
+
+```python
+from __future__ import annotations
+
+from scout.live.solana.mint_resolver import resolve_solana_mint
+
+MINT = "So11111111111111111111111111111111111111112"
+
+
+def test_native_coin_id_is_the_mint():
+    assert resolve_solana_mint(coin_id=MINT) == MINT
+
+
+def test_explicit_contract_address_wins():
+    assert resolve_solana_mint(coin_id="some-cg-slug", contract_address=MINT) == MINT
+
+
+def test_non_solana_slug_returns_none():
+    assert resolve_solana_mint(coin_id="bitcoin") is None
+    assert resolve_solana_mint(coin_id="0xabc123") is None  # EVM-shaped, has '0'
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/live/solana/test_mint_resolver.py -v`
+Expected: FAIL — `ModuleNotFoundError: scout.live.solana.mint_resolver`
+
+- [ ] **Step 3: Implement the resolver**
+
+Create `scout/live/solana/mint_resolver.py`:
+
+```python
+"""Resolve a Solana SPL mint for a paper trade, mirroring the Minara alert path.
+
+Native Solana tokens carry the SPL mint directly as their coin_id (CG slugs are
+never 32-44 base58 chars; EVM 0x… ids contain '0', not in the base58 alphabet).
+"""
+
+from __future__ import annotations
+
+from scout.trading.minara_alert import _looks_like_spl_address
+
+
+def resolve_solana_mint(
+    *, coin_id: str, contract_address: str | None = None
+) -> str | None:
+    if contract_address and _looks_like_spl_address(contract_address):
+        return contract_address
+    if _looks_like_spl_address(coin_id):
+        return coin_id
+    return None
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/live/solana/test_mint_resolver.py -v`
+Expected: PASS (3 tests)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add scout/live/solana/mint_resolver.py tests/live/solana/test_mint_resolver.py
+git commit -m "feat(solana): SPL mint resolver (mirrors Minara path)"
+```
+
+---
+
+### Task 14: Engine on-chain fork (`_dispatch_onchain`)
+
+**Files:**
+- Modify: `scout/live/engine.py` (`__init__`, add early branch to `on_paper_trade_opened`, add `_dispatch_onchain` + `_is_solana_signal`)
+- Test: `tests/live/solana/test_engine_onchain_fork.py`
+
+**Interfaces:**
+- Consumes: `SolanaSwapAdapter` (via the `ExchangeAdapter` contract + `quote_at_size`), `Gates.evaluate_onchain` (Task 11), `resolve_solana_mint` (Task 13), `make_client_order_id`/`record_pending_order` (existing `idempotency.py`).
+- Produces: `LiveEngine.__init__` gains `onchain_adapter: "ExchangeAdapter | None" = None`. When provided, the engine builds a SECOND `Gates` instance bound to that adapter (`self._onchain_gates`) and `on_paper_trade_opened` forks to `_dispatch_onchain` for Solana signals. **When `onchain_adapter is None` (every existing Binance test), `on_paper_trade_opened` is byte-for-byte unchanged — the Binance path and its tests are untouched.**
+
+**Lifecycle inside `_dispatch_onchain`:** resolve mint → `evaluate_onchain` gate → not-allowlisted/kill: no row → other reject: `shadow_trades` rejected row → pass + `mode != 'live'`: `shadow_trades` open row (quote only, NO broadcast) → pass + `mode == 'live'`: `record_pending_order` → `place_order_request` → store signature in `entry_order_id` → `await_fill_confirmation` → `filled`: record `entry_fill_price`/`entry_fill_qty` (status stays `'open'` — it is an open position) + bump correction counter; `rejected`: status `'rejected'`; `timeout`: leave `'open'` for boot reconciliation (Task 12).
+
+- [ ] **Step 1: Write the failing test (shadow fork opens a row, never broadcasts)**
+
+Create `tests/live/solana/test_engine_onchain_fork.py`:
+
+```python
+from __future__ import annotations
+
+from decimal import Decimal
+from types import SimpleNamespace
+
+import pytest
+
+from scout.config import Settings
+from scout.db import Database
+from scout.live.config import LiveConfig
+from scout.live.engine import LiveEngine
+
+_REQUIRED = dict(TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k")
+MINT = "So11111111111111111111111111111111111111112"
+
+
+def _settings(**o):
+    return Settings(
+        _env_file=None, **_REQUIRED, LIVE_MODE="shadow",
+        LIVE_SIGNAL_ALLOWLIST="first_signal", **o,
+    )
+
+
+class _Adapter:
+    is_onchain = True
+    venue_name = "solana"
+
+    async def quote_at_size(self, *, venue_pair, side, size_usd):
+        return {"out_amount": 1000, "price_impact_pct": 0.5, "mid": Decimal("1")}
+
+    async def is_sellable(self, *, venue_pair, expected_out_amount):
+        return True
+
+    async def fetch_account_balance(self, asset="USDT"):
+        return 0.5 if asset == "SOL" else 1000.0
+
+    async def place_order_request(self, request):
+        raise AssertionError("shadow mode must NOT place an order")
+
+
+class _KS:
+    def is_active(self):
+        return None
+
+
+async def _seed_paper(db, coin_id):
+    cur = await db._conn.execute(
+        """INSERT INTO paper_trades
+           (token_id, symbol, name, chain, signal_type, signal_data,
+            entry_price, amount_usd, quantity, tp_price, sl_price,
+            status, opened_at)
+           VALUES (?, 'WSOL', 'wsol', 'solana', 'first_signal', '{}',
+                   1, 10, 10, 1.2, 0.8, 'open', '2026-06-21T00:00:00+00:00')""",
+        (coin_id,),
+    )
+    await db._conn.commit()
+    return cur.lastrowid
+
+
+@pytest.mark.asyncio
+async def test_solana_signal_forks_to_shadow_without_broadcast(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = _settings()
+    ptid = await _seed_paper(db, MINT)
+    engine = LiveEngine(
+        config=LiveConfig(s), resolver=None, adapter=_Adapter(), db=db,
+        kill_switch=_KS(), routing=None, onchain_adapter=_Adapter(),
+    )
+    paper = SimpleNamespace(
+        id=ptid, coin_id=MINT, symbol="WSOL", signal_type="first_signal", chain="solana"
+    )
+    await engine.on_paper_trade_opened(paper)
+
+    cur = await db._conn.execute(
+        "SELECT venue, status FROM shadow_trades WHERE paper_trade_id=?", (ptid,)
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    assert row[0] == "solana"
+    assert row[1] == "open"
+    await db.close()
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/live/solana/test_engine_onchain_fork.py -v`
+Expected: FAIL — `TypeError: __init__() got an unexpected keyword argument 'onchain_adapter'`
+
+- [ ] **Step 3: Add the `onchain_adapter` param + second Gates instance**
+
+In `scout/live/engine.py`, modify `LiveEngine.__init__`. Add the parameter at the end of the signature:
+
+```python
+        routing: "RoutingLayer | None" = None,
+        onchain_adapter: "ExchangeAdapter | None" = None,
+```
+
+And after the existing `self._gates = Gates(...)` block, add:
+
+```python
+        self._onchain_adapter = onchain_adapter
+        self._onchain_gates = (
+            Gates(
+                config=config,
+                db=db,
+                resolver=resolver,
+                adapter=onchain_adapter,
+                kill_switch=kill_switch,
+            )
+            if onchain_adapter is not None
+            else None
+        )
+```
+
+- [ ] **Step 4: Add the early fork branch + helper**
+
+At the VERY START of `on_paper_trade_opened` (immediately after the docstring, before `trade_id = paper_trade.id`), insert:
+
+```python
+        if self._onchain_adapter is not None and _is_solana_signal(paper_trade):
+            await self._dispatch_onchain(paper_trade)
+            return
+```
+
+Add this module-level helper near the top of `engine.py` (after imports):
+
+```python
+def _is_solana_signal(paper_trade) -> bool:
+    return getattr(paper_trade, "chain", None) == "solana"
+```
+
+- [ ] **Step 5: Add `_dispatch_onchain`**
+
+Add this method to `LiveEngine` (mirrors the structure of `_dispatch_live`, but uses the on-chain adapter + gates and writes valid status values):
+
+```python
+    async def _dispatch_onchain(self, paper_trade) -> None:
+        from uuid import uuid4
+
+        from scout.live.adapter_base import OrderRequest
+        from scout.live.correction_counter import increment_consecutive
+        from scout.live.idempotency import (
+            make_client_order_id,
+            record_pending_order,
+        )
+        from scout.live.solana.mint_resolver import resolve_solana_mint
+
+        trade_id = paper_trade.id
+        size_usd = self._config.resolve_size_usd(paper_trade.signal_type)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        mint = resolve_solana_mint(
+            coin_id=paper_trade.coin_id,
+            contract_address=getattr(paper_trade, "contract_address", None),
+        )
+        if mint is None:
+            log.info("onchain_handoff_skipped_no_mint", paper_trade_id=trade_id)
+            return
+
+        result = await self._onchain_gates.evaluate_onchain(
+            signal_type=paper_trade.signal_type,
+            symbol=paper_trade.symbol,
+            venue_pair=mint,
+            size_usd=size_usd,
+        )
+        if not result.passed and result.reject_reason is None:
+            log.info("onchain_handoff_skipped", paper_trade_id=trade_id, reason="not_allowlisted")
+            return
+        if not result.passed and result.reject_reason == "kill_switch":
+            log.info("onchain_handoff_skipped_killed", paper_trade_id=trade_id)
+            return
+        if not result.passed:
+            assert self._db._conn is not None
+            async with self._db._txn_lock:
+                await self._db._conn.execute(
+                    "INSERT INTO shadow_trades "
+                    "(paper_trade_id, coin_id, symbol, venue, pair, signal_type, "
+                    " size_usd, status, reject_reason, created_at) "
+                    "VALUES (?, ?, ?, 'solana', ?, ?, ?, 'rejected', ?, ?)",
+                    (trade_id, paper_trade.coin_id, paper_trade.symbol, mint,
+                     paper_trade.signal_type, str(size_usd), result.reject_reason, now_iso),
+                )
+                await self._db._conn.commit()
+            log.info("onchain_pretrade_gate_failed", paper_trade_id=trade_id,
+                     reject_reason=result.reject_reason, detail=result.detail)
+            return
+
+        # Passed gates. Shadow → record intent, NO broadcast.
+        if self._config.mode != "live":
+            quote = await self._onchain_adapter.quote_at_size(
+                venue_pair=mint, side="buy", size_usd=float(size_usd)
+            )
+            assert self._db._conn is not None
+            async with self._db._txn_lock:
+                await self._db._conn.execute(
+                    "INSERT INTO shadow_trades "
+                    "(paper_trade_id, coin_id, symbol, venue, pair, signal_type, "
+                    " size_usd, mid_at_entry, status, created_at) "
+                    "VALUES (?, ?, ?, 'solana', ?, ?, ?, ?, 'open', ?)",
+                    (trade_id, paper_trade.coin_id, paper_trade.symbol, mint,
+                     paper_trade.signal_type, str(size_usd), str(quote["mid"]), now_iso),
+                )
+                await self._db._conn.commit()
+            log.info("onchain_shadow_order_opened", paper_trade_id=trade_id,
+                     pair=mint, mid=str(quote["mid"]), size_usd=str(size_usd))
+            return
+
+        # Live → record pending row, place swap, await fill, record terminal.
+        intent_uuid = str(uuid4())
+        cid = make_client_order_id(trade_id, intent_uuid)
+        live_id = await record_pending_order(
+            self._db, client_order_id=cid, paper_trade_id=trade_id,
+            coin_id=paper_trade.coin_id, symbol=paper_trade.symbol, venue="solana",
+            pair=mint, signal_type=paper_trade.signal_type, size_usd=str(size_usd),
+        )
+        request = OrderRequest(
+            paper_trade_id=trade_id, canonical=mint, venue_pair=mint,
+            side="buy", size_usd=float(size_usd), intent_uuid=intent_uuid,
+        )
+        try:
+            signature = await self._onchain_adapter.place_order_request(request)
+        except Exception:
+            log.exception("onchain_dispatch_place_failed", paper_trade_id=trade_id)
+            async with self._db._txn_lock:
+                await self._db._conn.execute(
+                    "UPDATE live_trades SET status='needs_manual_review' WHERE id=?",
+                    (live_id,),
+                )
+                await self._db._conn.commit()
+            return
+        async with self._db._txn_lock:
+            await self._db._conn.execute(
+                "UPDATE live_trades SET entry_order_id=? WHERE id=?", (signature, live_id)
+            )
+            await self._db._conn.commit()
+        log.info("live_dispatch_entered", paper_trade_id=trade_id,
+                 venue="solana", signature=signature)
+
+        confirmation = await self._onchain_adapter.await_fill_confirmation(
+            venue_order_id=signature, client_order_id=cid,
+            timeout_sec=self._config._s.SOLANA_CONFIRM_TIMEOUT_SEC,
+        )
+        async with self._db._txn_lock:
+            if confirmation.status == "filled":
+                # Filled buy IS an open position → keep status='open', record fill.
+                await self._db._conn.execute(
+                    "UPDATE live_trades SET entry_fill_price=?, entry_fill_qty=? "
+                    "WHERE id=?",
+                    (str(confirmation.fill_price), str(confirmation.filled_qty), live_id),
+                )
+            elif confirmation.status == "rejected":
+                await self._db._conn.execute(
+                    "UPDATE live_trades SET status='rejected' WHERE id=?", (live_id,)
+                )
+            # timeout → leave 'open'; Task 12 boot reconciliation resolves it.
+            await self._db._conn.commit()
+        log.info("live_dispatch_terminal", paper_trade_id=trade_id, venue="solana",
+                 signature=signature, status=confirmation.status)
+        if confirmation.status == "filled":
+            await increment_consecutive(
+                self._db, paper_trade.signal_type, "solana", paper_trade_id=trade_id
+            )
+```
+
+- [ ] **Step 6: Run the fork test + confirm the Binance engine suite is unchanged**
+
+Run: `uv run pytest tests/live/solana/test_engine_onchain_fork.py tests/live/test_live_engine.py tests/live/test_live_engine_dispatch.py -q`
+Expected: the new fork test PASSES; all existing engine tests PASS unchanged (they construct `LiveEngine` without `onchain_adapter`, so the new branch is never entered).
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add scout/live/engine.py tests/live/solana/test_engine_onchain_fork.py
+git commit -m "feat(solana): isolated on-chain engine fork (_dispatch_onchain)"
+```
+
+---
+
+### Task 15: Factory + engine boot wiring + reconciliation hook
 
 **Files:**
 - Create: `scout/live/solana_factory.py`
-- Modify: `scout/main.py` (in the live-engine boot block, ~lines 1896–1967)
+- Modify: `scout/main.py` (live-engine boot block, ~lines 1896–1975)
 - Test: `tests/live/solana/test_solana_factory.py`
 
 **Interfaces:**
-- Produces: `def build_solana_adapter(*, settings, session, db) -> SolanaSwapAdapter | None`. Returns `None` when `SOLANA_WALLET_SECRET` is unset (so paper/shadow without keys still boots). Otherwise constructs `JupiterClient`, `SolanaRpc`, signer via `make_signer`, and the adapter.
-- Modifies `scout/main.py` to: build the solana adapter, add it to the routing `adapters` dict as `"solana"` when present, and call `reconcile_open_solana_trades` during the boot reconciliation block.
+- Produces: `def build_solana_adapter(*, settings, session, db) -> SolanaSwapAdapter | None`. Returns `None` when `SOLANA_WALLET_SECRET` is unset (so paper/shadow without keys still boots). Otherwise constructs `JupiterClient` (passing the optional `SOLANA_JUPITER_API_KEY`), `SolanaRpc`, signer via `make_signer`, and the adapter.
+- Modifies `scout/main.py` to: build the solana adapter, pass it as `onchain_adapter=` to `LiveEngine` (NOT into the routing dict — the fork bypasses routing), and call `reconcile_open_solana_trades` in the boot reconciliation block.
 
-- [ ] **Step 1: Write the failing test (factory only — main.py wiring is covered by Task 14 integration)**
+- [ ] **Step 1: Write the failing test**
 
 Create `tests/live/solana/test_solana_factory.py`:
 
@@ -1851,7 +2253,12 @@ def build_solana_adapter(
     if signer is None:
         log.info("solana_adapter_skipped_no_secret")
         return None
-    jupiter = JupiterClient(session, base_url=settings.SOLANA_JUPITER_URL)
+    api_key = (
+        settings.SOLANA_JUPITER_API_KEY.get_secret_value()
+        if settings.SOLANA_JUPITER_API_KEY is not None
+        else None
+    )
+    jupiter = JupiterClient(session, base_url=settings.SOLANA_JUPITER_URL, api_key=api_key)
     rpc = SolanaRpc(session, settings.SOLANA_RPC_URL)
     log.info("solana_adapter_built", pubkey=signer.pubkey())
     return SolanaSwapAdapter(
@@ -1866,7 +2273,7 @@ Expected: PASS (2 tests)
 
 - [ ] **Step 5: Wire into main.py**
 
-In `scout/main.py`, locate the live-engine boot block (the `live_adapter = BinanceSpotAdapter(settings, db=db)` region, ~line 1896). Add AFTER `_live_owned.append(live_adapter)`:
+In `scout/main.py`, after `_live_owned.append(live_adapter)` (~line 1897), add:
 
 ```python
         # BL-NEW-SOLANA: optional on-chain venue. None when no wallet secret.
@@ -1879,17 +2286,21 @@ In `scout/main.py`, locate the live-engine boot block (the `live_adapter = Binan
             _live_owned.append(solana_adapter)
 ```
 
-Then, where the `RoutingLayer(... adapters={"binance": live_adapter})` dict is built (~line 1957), replace that dict literal with a built mapping:
+Then add `onchain_adapter=solana_adapter` to the `LiveEngine(...)` construction (the routing dict stays Binance-only — the fork does not use routing):
 
 ```python
-            _adapters = {"binance": live_adapter}
-            if solana_adapter is not None:
-                _adapters["solana"] = solana_adapter
-            live_routing = RoutingLayer(db=db, settings=settings, adapters=_adapters)
-            logger.info("routing_layer_constructed", venues=list(_adapters))
+        live_engine = LiveEngine(
+            config=live_config,
+            resolver=resolver,
+            adapter=live_adapter,
+            db=db,
+            kill_switch=live_kill_switch,
+            routing=live_routing,
+            onchain_adapter=solana_adapter,
+        )
 ```
 
-Finally, in the boot reconciliation block (search for `reconcile_open_shadow_trades` call in `scout/main.py`), add immediately after it:
+Finally, immediately AFTER the `reconcile_open_shadow_trades(...)` call, add:
 
 ```python
         if solana_adapter is not None:
@@ -1909,12 +2320,12 @@ Expected: exits cleanly (no import errors); with no `SOLANA_WALLET_SECRET`, logs
 
 ```bash
 git add scout/live/solana_factory.py scout/main.py tests/live/solana/test_solana_factory.py
-git commit -m "feat(solana): factory + engine boot wiring + reconciliation hook"
+git commit -m "feat(solana): factory + onchain_adapter wiring + reconciliation hook"
 ```
 
 ---
 
-### Task 14: Shadow-mode integration test (quote + simulate, no broadcast)
+### Task 16: Shadow-mode integration test (quote + simulate, no broadcast)
 
 **Files:**
 - Create: `tests/live/solana/test_solana_shadow_integration.py`
@@ -2025,7 +2436,7 @@ git commit -m "test(solana): shadow-mode integration asserts no broadcast"
 
 ---
 
-### Task 15: Daily float sweep + freshness watchdog + systemd units + .env docs
+### Task 17: Daily float sweep + freshness watchdog + systemd units + .env docs
 
 **Files:**
 - Create: `scripts/solana_sweep.py`
@@ -2229,7 +2640,7 @@ Append to `.env.example` (NEVER add `SOLANA_WALLET_SECRET`):
 # SOLANA_WALLET_SECRET is a SECRET (base58 keypair) — set it ONLY in the real
 # .env on the host, never here and never in git.
 SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
-SOLANA_JUPITER_URL=https://quote-api.jup.ag/v6
+SOLANA_JUPITER_URL=https://api.jup.ag/swap/v1
 SOLANA_SLIPPAGE_BPS_CAP=100
 SOLANA_PRIORITY_FEE_LAMPORTS=50000
 SOLANA_MAX_PRICE_IMPACT_PCT=3.0
@@ -2259,32 +2670,41 @@ After all tasks merge, the live rollout is gated and manual, per the handoff:
 
 1. **Fund a fresh hot wallet** with a tiny float (e.g. $50 USDC + ~0.05 SOL gas). Put its base58 secret in the host `.env` as `SOLANA_WALLET_SECRET` (never committed).
 2. **Shadow first:** `LIVE_MODE=shadow`, `LIVE_SIGNAL_ALLOWLIST=<one signal>`. Confirm `shadow_trades` rows open via quote+simulate, sellability gate behaves, and no broadcast occurs. Watch `journalctl -u gecko-pipeline -f` for `solana_order_sent` absence and gate logs.
-3. **Tiny live:** `LIVE_MODE=live`, `LIVE_TRADING_ENABLED=true`, `LIVE_USE_REAL_SIGNED_REQUESTS=true`, `LIVE_USE_ROUTING_LAYER=true`, `LIVE_TRADE_AMOUNT_USD=10`, `SOLANA_FLOAT_CAP_USD=50`, one signal only. Watch a full route: paper open → `solana_order_sent` → fill → `live_trades` row → sell/reconcile.
+3. **Tiny live:** `LIVE_MODE=live`, `LIVE_TRADING_ENABLED=true`, `LIVE_TRADE_AMOUNT_USD=10`, `SOLANA_FLOAT_CAP_USD=50`, one signal only. (The on-chain fork does NOT use `LIVE_USE_ROUTING_LAYER` / `LIVE_USE_REAL_SIGNED_REQUESTS` — those gate the Binance routing path; the Solana fork is reached purely via `onchain_adapter` being present + a Solana-chain signal.) Watch a full route: paper open → `live_dispatch_entered` (venue=solana) → `live_dispatch_terminal` status=filled → `live_trades` row with `entry_fill_price` → sell/reconcile.
 4. **Verify** the daily sweep timer and execution watchdog are enabled (`systemctl --user enable --now solana-sweep.timer solana-execution-watchdog.timer` per `systemd/README.md` workflow).
 5. **Only then** widen signals/size. Do not enable by flag alone.
 
 ## Spec Coverage Self-Review
 
-- Spec §3 architecture (one adapter + 3 sub-modules, reuse rest) → Tasks 2–13. ✓
+- Spec §3 architecture (one adapter + 3 sub-modules, reuse rest) → Tasks 2–15. ✓
 - Spec §4.1 the 8 contract methods → Tasks 7–10 (read-only, balance, place, await). ✓
 - Spec §4.2 sub-modules jupiter/wallet/rpc → Tasks 2–5. ✓
 - Spec §4.3 buy AND sell via one adapter (`side`) → Task 9 (`_mints_for_side`) + Task 7. ✓
 - Spec §4.4 SOLANA_* config → Task 6. ✓
-- Spec §5 modes (paper/shadow/live) + lifecycle → Task 14 shadow; Tasks 9–10 live path. ✓
-- Spec §5.4 on-chain states mapped to enums → Task 10 (filled/rejected/timeout). ✓
-- Spec §5.4 boot reconciliation by signature → Task 12 + Task 13 hook. ✓
-- Spec §5.5 daily sweep → Task 15. ✓
-- Spec §6 on-chain gates (price-impact, sellability, gas, float) → Task 11 (+ exposure reuse). ✓
+- Spec §5 modes (paper/shadow/live) + lifecycle → engine fork Task 14; shadow integration Task 16; live path Tasks 9–10+14. ✓
+- Spec §5.4 on-chain states mapped to enums → adapter Task 10 (filled/rejected/timeout); DB write of valid live_trades.status in Task 14 (filled⇒stays 'open', rejected, timeout⇒open). ✓
+- Spec §5.4 boot reconciliation by signature → Task 12 + Task 15 hook. ✓
+- Spec §5.5 daily sweep → Task 17. ✓
+- Spec §6 on-chain gates (price-impact, sellability, gas, float) → Task 11, invoked via the fork's second Gates instance in Task 14 (+ exposure reuse). ✓
+- **Engine multi-venue integration (review finding): the live engine is single-adapter and does NOT select by routed venue → isolated on-chain fork (`onchain_adapter` + `_onchain_gates` + `_dispatch_onchain`) → Tasks 13 (mint resolver), 14 (fork), 15 (wiring). Binance path byte-unchanged when `onchain_adapter is None`. ✓**
 - Spec §7 error handling taxonomy → Tasks 5 (`RpcError`), 10 (timeout/rejected). Transient-retry-with-fresh-blockhash is flagged below. ⚠
-- Spec §8 safety (kill switch inherited, idempotency, secrets, watchdog, Telegram) → kill/allowlist in Task 11; secrets in Tasks 4/6; watchdog in Task 15. Wallet-drain tripwire flagged below. ⚠
-- Spec §9 testing → every task is TDD; Task 14 integration. ✓
+- Spec §8 safety (kill switch inherited, idempotency, secrets, watchdog, Telegram) → kill/allowlist in Task 11; idempotency (record_pending_order + client_order_id) in Task 14; secrets in Tasks 4/6; watchdog in Task 17. Wallet-drain tripwire flagged below. ⚠
+- Spec §9 testing → every task is TDD; shadow integration Task 16. ✓
 - Spec §10 rollout ladder → Post-Implementation runbook. ✓
+
+### Review corrections applied (pre-execution, against real code + live APIs)
+
+- **`live_trades.status` CHECK constraint** allows only `open / closed_tp / closed_sl / closed_duration / closed_via_reconciliation / rejected / needs_manual_review`. Tasks 12 & 14 corrected: a filled buy stays `'open'` (never the invalid `'filled'`); failed→`'rejected'`; timeout→stays `'open'`.
+- **Jupiter v6 `quote-api.jup.ag` deprecated (Oct 2025)** → default `https://api.jup.ag/swap/v1` + optional `SOLANA_JUPITER_API_KEY` (`x-api-key`); Tasks 2/6/15.
+- **solders test helper** fixed to `MessageV0.try_compile(..., Hash.default())` (blockhash is a `Hash`, not bytes); Task 4. Signing idiom `VersionedTransaction(message, [keypair])` confirmed current.
+- **`solders` pin** widened to `<0.28` (current is 0.27.x); Task 1.
 
 ### Deliberately deferred (carried from spec §11 open items — not gaps, scoped out with a flag)
 
 - **Transient retry with fresh blockhash** (spec §7): Task 5 surfaces `RpcError`; a bounded resend-with-new-blockhash loop that never re-sends a confirmed signature is a follow-up hardening task. Until then, a dropped tx is resolved by Task 12 boot reconciliation (safe, just slower).
-- **Wallet-drain tripwire** (spec §8): the balance snapshot → kill-switch trigger is a follow-up; the daily sweep (Task 15) bounds exposure in the interim.
-- **Cold-wallet transfer instruction-building** (spec §11): Task 15 implements/tests the sweep *decision* and logs the transfer as not-yet-implemented; the signed transfer lands with the transfer design.
+- **Wallet-drain tripwire** (spec §8): the balance snapshot → kill-switch trigger is a follow-up; the daily sweep (Task 17) bounds exposure in the interim.
+- **Cold-wallet transfer instruction-building** (spec §11): Task 17 implements/tests the sweep *decision* and logs the transfer as not-yet-implemented; the signed transfer lands with the transfer design.
+- **Non-native mint resolution** (review finding): Task 13 resolves native Solana tokens where `coin_id` IS the mint. CoinGecko-slug tokens whose mint lives in `platforms.solana` need a `fetch_coin_detail` network lookup — a follow-up. First rollout snipes native tokens, so this does not block shadow/tiny-live.
 - **Jupiter `priceImpactPct` unit assumption** (fraction → ×100): encoded in Task 7; verify against a live quote during shadow before tiny-live.
 
-These four are intentionally separate, testable follow-up tasks rather than blockers for reaching a working shadow mode.
+These are intentionally separate, testable follow-up tasks rather than blockers for reaching a working shadow mode.

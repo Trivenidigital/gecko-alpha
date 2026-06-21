@@ -270,3 +270,38 @@ signal eligibility review, wallet funding, and operator sign-off.
 - Cold-wallet address + sweep mechanics (also a signed swap/transfer).
 - `wallet_snapshots` / `venue_health` row shapes for the `solana` venue.
 - Confirmation level (`confirmed` vs `finalized`) and timeout tuning.
+
+## 12. Pre-Implementation Review Addendum (2026-06-21)
+
+A code-grounded + live-API review before execution surfaced four items that
+amend this design. The implementation plan
+(`docs/superpowers/plans/2026-06-21-solana-onchain-execution.md`) reflects all of
+them:
+
+1. **Engine is single-adapter → isolated on-chain fork.** The live engine's
+   `_dispatch_live` ignores the routed `venue` and always calls one adapter; `Gates`
+   is bound to one adapter too. So "reuse the engine" (Approach A) is implemented as
+   an **isolated fork**: `LiveEngine` gains an optional `onchain_adapter`; when present
+   it builds a second `Gates` instance and `on_paper_trade_opened` forks Solana-chain
+   signals to a new `_dispatch_onchain`. When `onchain_adapter is None`, the Binance
+   path and its tests are byte-for-byte unchanged. (Chosen over generalizing the engine
+   to multi-adapter, to minimize blast radius on the tested live path.)
+
+2. **`live_trades.status` is CHECK-constrained.** Allowed: `open / closed_tp /
+   closed_sl / closed_duration / closed_via_reconciliation / rejected /
+   needs_manual_review`. A filled buy is an **open position** → status stays `'open'`
+   (record `entry_fill_price`); `'filled'`/`'timeout'` are never written. Failed
+   swap → `'rejected'`; dropped/timeout → stays `'open'` for boot reconciliation.
+
+3. **Jupiter v6 endpoints deprecated (Oct 2025).** Use `https://api.jup.ag/swap/v1`
+   with a free `x-api-key` (config `SOLANA_JUPITER_API_KEY`), or keyless
+   `lite-api.jup.ag`. `priceImpactPct` confirmed a fraction (×100 for percent).
+
+4. **solders idioms verified.** `VersionedTransaction(message, [keypair])` signs
+   (current, not deprecated). Test fixtures must build messages with
+   `MessageV0.try_compile(payer, ixs, [], Hash.default())` — blockhash is a `Hash`,
+   not bytes.
+
+New flagged follow-up (non-blocking): non-native mint resolution (CoinGecko-slug
+tokens whose mint is in `platforms.solana`) needs a network lookup; first rollout
+snipes native Solana tokens where `coin_id` IS the mint.
