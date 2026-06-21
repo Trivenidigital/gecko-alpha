@@ -24,7 +24,11 @@ class _Adapter:
         self.venue_name = "solana"
 
     async def quote_at_size(self, *, venue_pair, side, size_usd):
-        return {"out_amount": 1000, "price_impact_pct": self._impact, "mid": Decimal("1")}
+        return {
+            "out_amount": 1000,
+            "price_impact_pct": self._impact,
+            "mid": Decimal("1"),
+        }
 
     async def is_sellable(self, *, venue_pair, expected_out_amount):
         return self._sellable
@@ -40,7 +44,9 @@ class _KS:
 
 def _gates(adapter, **so):
     s = _settings(LIVE_SIGNAL_ALLOWLIST="x", **so)
-    return Gates(config=LiveConfig(s), db=None, resolver=None, adapter=adapter, kill_switch=_KS())
+    return Gates(
+        config=LiveConfig(s), db=None, resolver=None, adapter=adapter, kill_switch=_KS()
+    )
 
 
 def test_not_sellable_is_a_valid_reject_reason():
@@ -50,14 +56,18 @@ def test_not_sellable_is_a_valid_reject_reason():
 @pytest.mark.asyncio
 async def test_onchain_pass():
     g = _gates(_Adapter(impact=0.5, sellable=True, sol=0.5))
-    res = await g.evaluate_onchain(signal_type="x", symbol="X", venue_pair=MINT, size_usd=Decimal("10"))
+    res = await g.evaluate_onchain(
+        signal_type="x", symbol="X", venue_pair=MINT, size_usd=Decimal("10")
+    )
     assert res.passed is True
 
 
 @pytest.mark.asyncio
 async def test_onchain_price_impact_reject():
     g = _gates(_Adapter(impact=9.0, sellable=True, sol=0.5))  # > 3.0 default
-    res = await g.evaluate_onchain(signal_type="x", symbol="X", venue_pair=MINT, size_usd=Decimal("10"))
+    res = await g.evaluate_onchain(
+        signal_type="x", symbol="X", venue_pair=MINT, size_usd=Decimal("10")
+    )
     assert res.passed is False
     assert res.reject_reason == "insufficient_depth"
 
@@ -65,7 +75,9 @@ async def test_onchain_price_impact_reject():
 @pytest.mark.asyncio
 async def test_onchain_not_sellable_reject():
     g = _gates(_Adapter(impact=0.5, sellable=False, sol=0.5))
-    res = await g.evaluate_onchain(signal_type="x", symbol="X", venue_pair=MINT, size_usd=Decimal("10"))
+    res = await g.evaluate_onchain(
+        signal_type="x", symbol="X", venue_pair=MINT, size_usd=Decimal("10")
+    )
     assert res.passed is False
     assert res.reject_reason == "not_sellable"
 
@@ -73,6 +85,8 @@ async def test_onchain_not_sellable_reject():
 @pytest.mark.asyncio
 async def test_onchain_gas_reserve_reject():
     g = _gates(_Adapter(impact=0.5, sellable=True, sol=0.0))  # < 0.02 default
-    res = await g.evaluate_onchain(signal_type="x", symbol="X", venue_pair=MINT, size_usd=Decimal("10"))
+    res = await g.evaluate_onchain(
+        signal_type="x", symbol="X", venue_pair=MINT, size_usd=Decimal("10")
+    )
     assert res.passed is False
     assert res.reject_reason == "insufficient_balance"

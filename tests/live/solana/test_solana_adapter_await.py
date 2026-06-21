@@ -36,8 +36,11 @@ def _adapter(rpc):
 async def test_await_filled_after_pending():
     a = _adapter(_SeqRpc(["pending", "success"]))
     conf = await a.await_fill_confirmation(
-        venue_order_id="SIG", client_order_id="cid", timeout_sec=10,
-        poll_interval_sec=0.5, _sleep=_noop_sleep,
+        venue_order_id="SIG",
+        client_order_id="cid",
+        timeout_sec=10,
+        poll_interval_sec=0.5,
+        _sleep=_noop_sleep,
     )
     assert conf.status == "filled"
     assert conf.venue_order_id == "SIG"
@@ -49,8 +52,11 @@ async def test_await_filled_after_pending():
 async def test_await_rejected_on_chain_failure():
     a = _adapter(_SeqRpc(["failed"]))
     conf = await a.await_fill_confirmation(
-        venue_order_id="SIG", client_order_id="cid", timeout_sec=10,
-        poll_interval_sec=0.5, _sleep=_noop_sleep,
+        venue_order_id="SIG",
+        client_order_id="cid",
+        timeout_sec=10,
+        poll_interval_sec=0.5,
+        _sleep=_noop_sleep,
     )
     assert conf.status == "rejected"
 
@@ -59,7 +65,10 @@ async def test_await_rejected_on_chain_failure():
 async def test_await_timeout_when_never_lands():
     a = _adapter(_SeqRpc(["pending", "pending"]))
     conf = await a.await_fill_confirmation(
-        venue_order_id="SIG", client_order_id="cid", timeout_sec=1,
-        poll_interval_sec=0.5, _sleep=_noop_sleep,
+        venue_order_id="SIG",
+        client_order_id="cid",
+        timeout_sec=1,
+        poll_interval_sec=0.5,
+        _sleep=_noop_sleep,
     )
     assert conf.status == "timeout"

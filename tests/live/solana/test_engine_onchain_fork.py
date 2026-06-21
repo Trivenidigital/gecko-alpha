@@ -16,8 +16,11 @@ MINT = "So11111111111111111111111111111111111111112"
 
 def _settings(**o):
     return Settings(
-        _env_file=None, **_REQUIRED, LIVE_MODE="shadow",
-        LIVE_SIGNAL_ALLOWLIST="first_signal", **o,
+        _env_file=None,
+        **_REQUIRED,
+        LIVE_MODE="shadow",
+        LIVE_SIGNAL_ALLOWLIST="first_signal",
+        **o,
     )
 
 
@@ -64,8 +67,13 @@ async def test_solana_signal_forks_to_shadow_without_broadcast(tmp_path):
     s = _settings()
     ptid = await _seed_paper(db, MINT)
     engine = LiveEngine(
-        config=LiveConfig(s), resolver=None, adapter=_Adapter(), db=db,
-        kill_switch=_KS(), routing=None, onchain_adapter=_Adapter(),
+        config=LiveConfig(s),
+        resolver=None,
+        adapter=_Adapter(),
+        db=db,
+        kill_switch=_KS(),
+        routing=None,
+        onchain_adapter=_Adapter(),
     )
     paper = SimpleNamespace(
         id=ptid, coin_id=MINT, symbol="WSOL", signal_type="first_signal", chain="solana"
@@ -100,8 +108,13 @@ async def test_onchain_gate_reject_writes_rejected_shadow_row(tmp_path):
     s = _settings()
     ptid = await _seed_paper(db, MINT)
     engine = LiveEngine(
-        config=LiveConfig(s), resolver=None, adapter=_Adapter(), db=db,
-        kill_switch=_KS(), routing=None, onchain_adapter=_HighImpactAdapter(),
+        config=LiveConfig(s),
+        resolver=None,
+        adapter=_Adapter(),
+        db=db,
+        kill_switch=_KS(),
+        routing=None,
+        onchain_adapter=_HighImpactAdapter(),
     )
     paper = SimpleNamespace(
         id=ptid, coin_id=MINT, symbol="WSOL", signal_type="first_signal", chain="solana"
@@ -109,7 +122,8 @@ async def test_onchain_gate_reject_writes_rejected_shadow_row(tmp_path):
     await engine.on_paper_trade_opened(paper)
 
     cur = await db._conn.execute(
-        "SELECT status, reject_reason FROM shadow_trades WHERE paper_trade_id=?", (ptid,)
+        "SELECT status, reject_reason FROM shadow_trades WHERE paper_trade_id=?",
+        (ptid,),
     )
     row = await cur.fetchone()
     assert row is not None, "expected a shadow_trades row for the rejected signal"

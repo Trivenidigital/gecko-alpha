@@ -15,8 +15,11 @@ MINT = "So11111111111111111111111111111111111111112"
 
 def _settings(**o):
     return Settings(
-        _env_file=None, **_REQUIRED, LIVE_MODE="shadow",
-        LIVE_SIGNAL_ALLOWLIST="first_signal", **o,
+        _env_file=None,
+        **_REQUIRED,
+        LIVE_MODE="shadow",
+        LIVE_SIGNAL_ALLOWLIST="first_signal",
+        **o,
     )
 
 
@@ -63,13 +66,17 @@ class _KS:
 async def test_shadow_runs_gate_without_broadcast():
     s = _settings()
     rpc = _Rpc()
-    adapter = SolanaSwapAdapter(settings=s, jupiter=_Jupiter(), rpc=rpc, signer=_Signer())
-    gates = Gates(config=LiveConfig(s), db=None, resolver=None, adapter=adapter, kill_switch=_KS())
+    adapter = SolanaSwapAdapter(
+        settings=s, jupiter=_Jupiter(), rpc=rpc, signer=_Signer()
+    )
+    gates = Gates(
+        config=LiveConfig(s), db=None, resolver=None, adapter=adapter, kill_switch=_KS()
+    )
 
     res = await gates.evaluate_onchain(
         signal_type="first_signal", symbol="X", venue_pair=MINT, size_usd=Decimal("10")
     )
 
-    assert res.passed is True          # 0.5% impact < 3% cap, sellable, gas ok
-    assert rpc.simulated is True        # sellability simulation ran
+    assert res.passed is True  # 0.5% impact < 3% cap, sellable, gas ok
+    assert rpc.simulated is True  # sellability simulation ran
     # no broadcast happened (would have raised). Reaching here proves it.

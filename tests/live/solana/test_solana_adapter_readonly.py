@@ -52,7 +52,9 @@ async def test_fetch_venue_metadata_shape():
 @pytest.mark.asyncio
 async def test_quote_at_size_buy_uses_usdc_input_and_converts_impact():
     # priceImpactPct "0.0042" (fraction) -> 0.42 percent
-    a = _adapter({"outAmount": "123456789", "priceImpactPct": "0.0042", "routePlan": [{}]})
+    a = _adapter(
+        {"outAmount": "123456789", "priceImpactPct": "0.0042", "routePlan": [{}]}
+    )
     out = await a.quote_at_size(venue_pair=MINT, side="buy", size_usd=10.0)
     assert out["out_amount"] == 123456789
     assert round(out["price_impact_pct"], 4) == 0.42

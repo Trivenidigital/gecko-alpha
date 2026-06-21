@@ -14,12 +14,26 @@ async def test_get_token_balance_parses_ui_amount():
     async with aiohttp.ClientSession() as session:
         rpc = SolanaRpc(session, URL)
         with aioresponses() as m:
-            m.post(URL, payload={
-                "jsonrpc": "2.0", "id": 1,
-                "result": {"value": [
-                    {"account": {"data": {"parsed": {"info": {"tokenAmount": {"uiAmount": 42.5}}}}}}
-                ]},
-            })
+            m.post(
+                URL,
+                payload={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "value": [
+                            {
+                                "account": {
+                                    "data": {
+                                        "parsed": {
+                                            "info": {"tokenAmount": {"uiAmount": 42.5}}
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    },
+                },
+            )
             bal = await rpc.get_token_balance(owner="OWNER", mint="USDC")
         assert bal == 42.5
 
@@ -49,8 +63,14 @@ async def test_send_raw_transaction_raises_on_error():
     async with aiohttp.ClientSession() as session:
         rpc = SolanaRpc(session, URL)
         with aioresponses() as m:
-            m.post(URL, payload={"jsonrpc": "2.0", "id": 1,
-                                 "error": {"code": -32002, "message": "blockhash not found"}})
+            m.post(
+                URL,
+                payload={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32002, "message": "blockhash not found"},
+                },
+            )
             with pytest.raises(RpcError):
                 await rpc.send_raw_transaction("QUJD")
 
@@ -61,17 +81,35 @@ async def test_confirm_signature_states():
         rpc = SolanaRpc(session, URL)
         # success
         with aioresponses() as m:
-            m.post(URL, payload={"jsonrpc": "2.0", "id": 1,
-                                 "result": {"value": [{"confirmationStatus": "confirmed", "err": None}]}})
+            m.post(
+                URL,
+                payload={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "value": [{"confirmationStatus": "confirmed", "err": None}]
+                    },
+                },
+            )
             assert await rpc.confirm_signature("SIG") == "success"
         # on-chain failure
         with aioresponses() as m:
-            m.post(URL, payload={"jsonrpc": "2.0", "id": 1,
-                                 "result": {"value": [{"confirmationStatus": "confirmed", "err": {"x": 1}}]}})
+            m.post(
+                URL,
+                payload={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "value": [{"confirmationStatus": "confirmed", "err": {"x": 1}}]
+                    },
+                },
+            )
             assert await rpc.confirm_signature("SIG") == "failed"
         # not yet landed
         with aioresponses() as m:
-            m.post(URL, payload={"jsonrpc": "2.0", "id": 1, "result": {"value": [None]}})
+            m.post(
+                URL, payload={"jsonrpc": "2.0", "id": 1, "result": {"value": [None]}}
+            )
             assert await rpc.confirm_signature("SIG") == "pending"
 
 
@@ -80,8 +118,18 @@ async def test_simulate_transaction_success_and_failure():
     async with aiohttp.ClientSession() as session:
         rpc = SolanaRpc(session, URL)
         with aioresponses() as m:
-            m.post(URL, payload={"jsonrpc": "2.0", "id": 1, "result": {"value": {"err": None}}})
+            m.post(
+                URL,
+                payload={"jsonrpc": "2.0", "id": 1, "result": {"value": {"err": None}}},
+            )
             assert await rpc.simulate_transaction("QUJD") is True
         with aioresponses() as m:
-            m.post(URL, payload={"jsonrpc": "2.0", "id": 1, "result": {"value": {"err": {"e": 1}}}})
+            m.post(
+                URL,
+                payload={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"value": {"err": {"e": 1}}},
+                },
+            )
             assert await rpc.simulate_transaction("QUJD") is False

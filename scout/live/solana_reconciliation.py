@@ -13,7 +13,9 @@ from scout.db import Database
 log = structlog.get_logger(__name__)
 
 
-async def reconcile_open_solana_trades(*, db: Database, rpc, settings) -> dict[str, int]:
+async def reconcile_open_solana_trades(
+    *, db: Database, rpc, settings
+) -> dict[str, int]:
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
     # Only sent-but-unconfirmed rows: a confirmed open position has its
@@ -30,7 +32,9 @@ async def reconcile_open_solana_trades(*, db: Database, rpc, settings) -> dict[s
         try:
             state = await rpc.confirm_signature(signature)
         except Exception:
-            log.warning("solana_reconciliation_row_err", row_id=row_id, signature=signature)
+            log.warning(
+                "solana_reconciliation_row_err", row_id=row_id, signature=signature
+            )
             pending += 1
             continue
         if state == "success":

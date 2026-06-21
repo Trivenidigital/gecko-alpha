@@ -27,7 +27,10 @@ async def test_get_quote_returns_payload():
                 },
             )
             q = await client.get_quote(
-                input_mint="USDC", output_mint="MINT", amount=10_000_000, slippage_bps=50
+                input_mint="USDC",
+                output_mint="MINT",
+                amount=10_000_000,
+                slippage_bps=50,
             )
         assert q["outAmount"] == "123456789"
         assert q["priceImpactPct"] == "0.0042"
@@ -52,7 +55,9 @@ async def test_build_swap_tx_returns_base64():
         with aioresponses() as m:
             m.post(_SWAP_RE, payload={"swapTransaction": "QUJDRA=="})
             tx = await client.build_swap_tx(
-                quote={"outAmount": "1"}, user_pubkey="PUBKEY", priority_fee_lamports=5000
+                quote={"outAmount": "1"},
+                user_pubkey="PUBKEY",
+                priority_fee_lamports=5000,
             )
         assert tx == "QUJDRA=="
 

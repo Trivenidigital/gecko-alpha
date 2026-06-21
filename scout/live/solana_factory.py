@@ -27,7 +27,9 @@ def build_solana_adapter(
         if settings.SOLANA_JUPITER_API_KEY is not None
         else None
     )
-    jupiter = JupiterClient(session, base_url=settings.SOLANA_JUPITER_URL, api_key=api_key)
+    jupiter = JupiterClient(
+        session, base_url=settings.SOLANA_JUPITER_URL, api_key=api_key
+    )
     rpc = SolanaRpc(session, settings.SOLANA_RPC_URL)
     log.info("solana_adapter_built", pubkey=signer.pubkey())
     return SolanaSwapAdapter(
