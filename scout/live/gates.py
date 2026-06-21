@@ -363,7 +363,9 @@ class Gates:
         if kill is not None:
             return GateResult(passed=False, reject_reason="kill_switch", detail=None)
         if not self._config.is_signal_enabled(signal_type):
-            return GateResult(passed=False, reject_reason=None, detail="not_allowlisted")
+            return GateResult(
+                passed=False, reject_reason=None, detail="not_allowlisted"
+            )
 
         s = self._config._s
         quote = await self._adapter.quote_at_size(
@@ -371,9 +373,10 @@ class Gates:
         )
         if quote["price_impact_pct"] > s.SOLANA_MAX_PRICE_IMPACT_PCT:
             return GateResult(
-                passed=False, reject_reason="insufficient_depth",
+                passed=False,
+                reject_reason="insufficient_depth",
                 detail=f"price_impact_pct={quote['price_impact_pct']:.3f} "
-                       f"cap={s.SOLANA_MAX_PRICE_IMPACT_PCT}",
+                f"cap={s.SOLANA_MAX_PRICE_IMPACT_PCT}",
             )
 
         sellable = await self._adapter.is_sellable(
@@ -381,14 +384,41 @@ class Gates:
         )
         if not sellable:
             return GateResult(
-                passed=False, reject_reason="not_sellable",
+                passed=False,
+                reject_reason="not_sellable",
                 detail=f"sell simulation failed for {venue_pair}",
             )
 
         sol = await self._adapter.fetch_account_balance("SOL")
         if sol < s.SOLANA_MIN_SOL_GAS_RESERVE:
             return GateResult(
-                passed=False, reject_reason="insufficient_balance",
+                passed=False,
+                reject_reason="insufficient_balance",
                 detail=f"sol={sol} reserve={s.SOLANA_MIN_SOL_GAS_RESERVE}",
             )
+
+        # Float / exposure gate (spec §6): bound aggregate open Solana
+        # notional to the swept float ceiling SOLANA_FLOAT_CAP_USD. Mirrors
+        # the CEX evaluate() exposure gate (sum of open size_usd) but scoped
+        # to venue='solana' and compared against the Solana cap. size_usd is
+        # stored as TEXT in live_trades → CAST as REAL like the CEX gate.
+        # Unit tests construct Gates(..., db=None); the real engine always
+        # passes a live db. When db is None, treat open exposure as zero.
+        sum_open_dec = Decimal("0")
+        if self._db is not None and self._db._conn is not None:
+            cur = await self._db._conn.execute(
+                "SELECT COALESCE(SUM(CAST(size_usd AS REAL)), 0) "
+                "FROM live_trades WHERE status = 'open' AND venue = 'solana'"
+            )
+            row = await cur.fetchone()
+            sum_open = float(row[0]) if row is not None else 0.0
+            sum_open_dec = Decimal(str(sum_open))
+        float_cap = s.SOLANA_FLOAT_CAP_USD
+        if sum_open_dec + size_usd > float_cap:
+            return GateResult(
+                passed=False,
+                reject_reason="exposure_cap",
+                detail=f"sum={sum_open_dec}+{size_usd} cap={float_cap}",
+            )
+
         return GateResult(passed=True, reject_reason=None, detail=None)
