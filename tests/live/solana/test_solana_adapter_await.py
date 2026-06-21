@@ -45,7 +45,9 @@ async def test_await_filled_after_pending():
     assert conf.status == "filled"
     assert conf.venue_order_id == "SIG"
     assert conf.filled_qty == 1_000_000
-    assert conf.fill_price is not None
+    # I1: fill_price is WHOLE USDC per output-token base unit
+    # (size_usd / out_amount), the same canonical scale as quote_at_size mid.
+    assert conf.fill_price == 10.0 / 1_000_000
 
 
 @pytest.mark.asyncio

@@ -61,6 +61,10 @@ async def test_quote_at_size_buy_uses_usdc_input_and_converts_impact():
     # input mint was USDC, amount = 10 * 1e6 base units
     assert a._jupiter.calls[0][0].endswith("Dt1v")  # USDC mint
     assert a._jupiter.calls[0][2] == 10_000_000
+    # I1: mid is WHOLE USDC per output-token base unit (size_usd / out_amount),
+    # matching await_fill_confirmation's fill_price scale — NOT USDC base units
+    # over out_amount (which would be 10^6 larger).
+    assert out["mid"] == Decimal("10") / Decimal(123456789)
 
 
 @pytest.mark.asyncio

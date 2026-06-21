@@ -95,7 +95,15 @@ class SolanaSwapAdapter(ExchangeAdapter):
         out_amount = int(quote["outAmount"])
         # Jupiter priceImpactPct is a fraction string (0.0042 == 0.42%).
         price_impact_pct = float(quote.get("priceImpactPct") or 0.0) * 100.0
-        mid = Decimal(amount) / Decimal(out_amount) if out_amount else Decimal("0")
+        # I1: mid is WHOLE USDC per output-token BASE unit (size_usd /
+        # out_amount), matching await_fill_confirmation's fill_price scale so
+        # shadow mid_at_entry and live entry_fill_price are directly
+        # comparable. NOTE: this is NOT normalized by the output token's
+        # decimals — both shadow and live agree on this raw scale; decimals
+        # normalization is a deferred follow-up (see await_fill_confirmation).
+        mid = (
+            Decimal(str(size_usd)) / Decimal(out_amount) if out_amount else Decimal("0")
+        )
         return {
             "out_amount": out_amount,
             "price_impact_pct": price_impact_pct,
@@ -103,7 +111,8 @@ class SolanaSwapAdapter(ExchangeAdapter):
         }
 
     async def fetch_price(self, pair: str) -> Decimal:
-        # tiny-notional buy quote → mid (USDC per token base unit, normalized)
+        # tiny-notional buy quote → mid (whole USDC per output-token base
+        # unit; NOT decimals-normalized — see quote_at_size I1 note)
         q = await self.quote_at_size(venue_pair=pair, side="buy", size_usd=1.0)
         return q["mid"]
 
@@ -244,6 +253,11 @@ class SolanaSwapAdapter(ExchangeAdapter):
                 break
             await sleep(poll_interval_sec)
         if status == "success":
+            # I1: fill_price is WHOLE USDC per output-token BASE unit
+            # (size_usd / out_amount), the canonical scale shared with
+            # quote_at_size's mid. NOT normalized by the output token's
+            # decimals — deferred follow-up; shadow and live agree on this
+            # raw scale so there is no cross-path landmine in the meantime.
             fill_price = (size_usd / out_amount) if (out_amount and size_usd) else None
             return OrderConfirmation(
                 venue="solana",
