@@ -80,3 +80,40 @@ async def test_solana_signal_forks_to_shadow_without_broadcast(tmp_path):
     assert row[0] == "solana"
     assert row[1] == "open"
     await db.close()
+
+
+class _HighImpactAdapter(_Adapter):
+    """Adapter that returns price_impact_pct above the cap to force gate rejection."""
+
+    async def quote_at_size(self, *, venue_pair, side, size_usd):
+        return {"out_amount": 1000, "price_impact_pct": 9.0, "mid": Decimal("1")}
+
+    async def place_order_request(self, request):
+        raise AssertionError("gate-rejected signal must NOT broadcast")
+
+
+@pytest.mark.asyncio
+async def test_onchain_gate_reject_writes_rejected_shadow_row(tmp_path):
+    """Price impact above cap → shadow_trades row status='rejected', no broadcast."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = _settings()
+    ptid = await _seed_paper(db, MINT)
+    engine = LiveEngine(
+        config=LiveConfig(s), resolver=None, adapter=_Adapter(), db=db,
+        kill_switch=_KS(), routing=None, onchain_adapter=_HighImpactAdapter(),
+    )
+    paper = SimpleNamespace(
+        id=ptid, coin_id=MINT, symbol="WSOL", signal_type="first_signal", chain="solana"
+    )
+    await engine.on_paper_trade_opened(paper)
+
+    cur = await db._conn.execute(
+        "SELECT status, reject_reason FROM shadow_trades WHERE paper_trade_id=?", (ptid,)
+    )
+    row = await cur.fetchone()
+    assert row is not None, "expected a shadow_trades row for the rejected signal"
+    assert row[0] == "rejected"
+    assert row[1] is not None, "reject_reason must be non-null"
+    assert row[1] == "insufficient_depth"
+    await db.close()

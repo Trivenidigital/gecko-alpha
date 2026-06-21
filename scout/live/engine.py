@@ -608,10 +608,18 @@ class LiveEngine:
         log.info("live_dispatch_entered", paper_trade_id=trade_id,
                  venue="solana", signature=signature)
 
-        confirmation = await self._onchain_adapter.await_fill_confirmation(
-            venue_order_id=signature, client_order_id=cid,
-            timeout_sec=self._config._s.SOLANA_CONFIRM_TIMEOUT_SEC,
-        )
+        try:
+            confirmation = await self._onchain_adapter.await_fill_confirmation(
+                venue_order_id=signature, client_order_id=cid,
+                timeout_sec=self._config._s.SOLANA_CONFIRM_TIMEOUT_SEC,
+            )
+        except Exception:
+            log.exception(
+                "onchain_dispatch_await_fill_failed",
+                paper_trade_id=trade_id,
+                venue_order_id=signature,
+            )
+            return
         async with self._db._txn_lock:
             if confirmation.status == "filled":
                 # Filled buy IS an open position → keep status='open', record fill.
