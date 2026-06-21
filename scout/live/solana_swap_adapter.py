@@ -30,7 +30,9 @@ class SolanaSwapAdapter(ExchangeAdapter):
     venue_name: str = "solana"
     is_onchain: bool = True
 
-    def __init__(self, *, settings, jupiter, rpc, signer, db: Any | None = None) -> None:
+    def __init__(
+        self, *, settings, jupiter, rpc, signer, db: Any | None = None
+    ) -> None:
         self._settings = settings
         self._jupiter = jupiter
         self._rpc = rpc
@@ -93,7 +95,11 @@ class SolanaSwapAdapter(ExchangeAdapter):
         price_impact_pct = float(quote.get("priceImpactPct") or 0.0) * 100.0
         mid = Decimal(amount) / Decimal(out_amount) if out_amount else Decimal("0")
         self._last_quote = quote
-        return {"out_amount": out_amount, "price_impact_pct": price_impact_pct, "mid": mid}
+        return {
+            "out_amount": out_amount,
+            "price_impact_pct": price_impact_pct,
+            "mid": mid,
+        }
 
     async def fetch_price(self, pair: str) -> Decimal:
         # tiny-notional buy quote → mid (USDC per token base unit, normalized)
@@ -105,7 +111,9 @@ class SolanaSwapAdapter(ExchangeAdapter):
         # at-size quote so generic callers still get a usable mid; the
         # on-chain gate uses price-impact directly (Task 11), not this walk.
         q = await self.quote_at_size(
-            venue_pair=pair, side="buy", size_usd=float(self._settings.LIVE_TRADE_AMOUNT_USD)
+            venue_pair=pair,
+            side="buy",
+            size_usd=float(self._settings.LIVE_TRADE_AMOUNT_USD),
         )
         mid = q["mid"] or Decimal("0")
         level = DepthLevel(price=mid, qty=Decimal("0"))
@@ -204,9 +212,7 @@ class SolanaSwapAdapter(ExchangeAdapter):
                 break
             await sleep(poll_interval_sec)
         if status == "success":
-            fill_price = (
-                (size_usd / out_amount) if (out_amount and size_usd) else None
-            )
+            fill_price = (size_usd / out_amount) if (out_amount and size_usd) else None
             return OrderConfirmation(
                 venue="solana",
                 venue_order_id=venue_order_id,
@@ -224,7 +230,10 @@ class SolanaSwapAdapter(ExchangeAdapter):
                 status="rejected",
                 filled_qty=None,
                 fill_price=None,
-                raw_response={"signature": venue_order_id, "reason": "on_chain_failure"},
+                raw_response={
+                    "signature": venue_order_id,
+                    "reason": "on_chain_failure",
+                },
             )
         return OrderConfirmation(
             venue="solana",
