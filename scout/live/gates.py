@@ -67,6 +67,8 @@ VALID_REJECT_REASONS: frozenset[str] = frozenset(
         # M1.5a (design-stage R1-I1 + R2-I3) — Gate 10 disambiguation:
         "live_signed_disabled",
         "api_key_lacks_trade_scope",
+        # Solana on-chain gates (Task 11):
+        "not_sellable",
     }
 )
 
@@ -350,3 +352,43 @@ class Gates:
                 )
 
         return GateResult(passed=True), venue
+
+    async def evaluate_onchain(
+        self, *, signal_type: str, symbol: str, venue_pair: str, size_usd: Decimal
+    ) -> GateResult:
+        """On-chain gate chain (Solana). Replaces the CEX order-book walk with
+        Jupiter price-impact, and adds sellability (honeypot) + SOL gas gates.
+        Kill-switch and allowlist are checked first, mirroring evaluate()."""
+        if self._ks is not None and self._ks.is_active() is not None:
+            return GateResult(passed=False, reject_reason="kill_switch", detail=None)
+        allowlist = self._config._s.LIVE_SIGNAL_ALLOWLIST
+        if allowlist and not self._config.is_signal_enabled(signal_type):
+            return GateResult(passed=False, reject_reason=None, detail="not_allowlisted")
+
+        s = self._config._s
+        quote = await self._adapter.quote_at_size(
+            venue_pair=venue_pair, side="buy", size_usd=float(size_usd)
+        )
+        if quote["price_impact_pct"] > s.SOLANA_MAX_PRICE_IMPACT_PCT:
+            return GateResult(
+                passed=False, reject_reason="insufficient_depth",
+                detail=f"price_impact_pct={quote['price_impact_pct']:.3f} "
+                       f"cap={s.SOLANA_MAX_PRICE_IMPACT_PCT}",
+            )
+
+        sellable = await self._adapter.is_sellable(
+            venue_pair=venue_pair, expected_out_amount=quote["out_amount"]
+        )
+        if not sellable:
+            return GateResult(
+                passed=False, reject_reason="not_sellable",
+                detail=f"sell simulation failed for {venue_pair}",
+            )
+
+        sol = await self._adapter.fetch_account_balance("SOL")
+        if sol < s.SOLANA_MIN_SOL_GAS_RESERVE:
+            return GateResult(
+                passed=False, reject_reason="insufficient_balance",
+                detail=f"sol={sol} reserve={s.SOLANA_MIN_SOL_GAS_RESERVE}",
+            )
+        return GateResult(passed=True, reject_reason=None, detail=None)
