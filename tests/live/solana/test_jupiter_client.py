@@ -9,6 +9,7 @@ from aioresponses import aioresponses
 from scout.live.solana.jupiter_client import JupiterClient, JupiterError
 
 _QUOTE_RE = re.compile(r"https://api\.jup\.ag/swap/v1/quote.*")
+_SWAP_RE = re.compile(r"https://api\.jup\.ag/swap/v1/swap.*")
 
 
 @pytest.mark.asyncio
@@ -41,4 +42,28 @@ async def test_get_quote_raises_on_http_error():
             with pytest.raises(JupiterError):
                 await client.get_quote(
                     input_mint="USDC", output_mint="MINT", amount=1, slippage_bps=50
+                )
+
+
+@pytest.mark.asyncio
+async def test_build_swap_tx_returns_base64():
+    async with aiohttp.ClientSession() as session:
+        client = JupiterClient(session, base_url="https://api.jup.ag/swap/v1")
+        with aioresponses() as m:
+            m.post(_SWAP_RE, payload={"swapTransaction": "QUJDRA=="})
+            tx = await client.build_swap_tx(
+                quote={"outAmount": "1"}, user_pubkey="PUBKEY", priority_fee_lamports=5000
+            )
+        assert tx == "QUJDRA=="
+
+
+@pytest.mark.asyncio
+async def test_build_swap_tx_raises_when_missing():
+    async with aiohttp.ClientSession() as session:
+        client = JupiterClient(session, base_url="https://api.jup.ag/swap/v1")
+        with aioresponses() as m:
+            m.post(_SWAP_RE, payload={})
+            with pytest.raises(JupiterError):
+                await client.build_swap_tx(
+                    quote={}, user_pubkey="PUBKEY", priority_fee_lamports=5000
                 )

@@ -46,3 +46,23 @@ class JupiterClient:
             if not body.get("outAmount") or not body.get("routePlan"):
                 raise JupiterError(f"quote no route: {body}")
             return body
+
+    async def build_swap_tx(
+        self, *, quote: dict[str, Any], user_pubkey: str, priority_fee_lamports: int
+    ) -> str:
+        payload = {
+            "quoteResponse": quote,
+            "userPublicKey": user_pubkey,
+            "wrapAndUnwrapSol": True,
+            "prioritizationFeeLamports": priority_fee_lamports,
+        }
+        async with self._session.post(
+            f"{self._base}/swap", json=payload, headers=self._headers
+        ) as resp:
+            body = await resp.json()
+            if resp.status != 200:
+                raise JupiterError(f"swap http {resp.status}: {body}")
+            tx = body.get("swapTransaction")
+            if not tx:
+                raise JupiterError(f"swap missing swapTransaction: {body}")
+            return tx
