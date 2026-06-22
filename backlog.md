@@ -4,6 +4,21 @@
 
 Operator close-development block 2026-05-22 explicitly parks the following items. **All entries listed below are PARKED — NOT FORGOTTEN.** They remain individually tracked in their existing locations; this section is the consolidated index so future sessions don't accidentally re-scope them.
 
+## Active Work: 2026-06-22 - Live-readiness audit report
+
+**Status:** FINDINGS-DRAFTED / NOT-READY-FOR-LIVE. Read-only Phase 1 report:
+`tasks/findings_live_readiness_audit_2026_06_22.md`. Runtime evidence shows
+`LIVE_MODE=shadow`, Binance credentials unset, `live_eligible=0` for every
+signal, negative 30-day paper cohorts, no open shadow/live rows,
+`venue_listings=0`, no venue/wallet freshness evidence printed,
+watchdog/timer health unproven, and a stale `live_control.active_kill_event_id`
+pointer despite 0 active unexpired kill events.
+
+Next gate: do not enable live trading. Operator should first repair/verify
+watchdog timer evidence + venue freshness, then explicitly authorize a separate
+secret-safe Binance permission/IP-whitelist verification run if live-mode work
+should continue.
+
 **Parked until price-coverage / probe decision:**
 - `BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-PRO` — gated on operator picking Path 2 (CG Pro paid)
 - `BL-NEW-SOURCE-CALL-FORWARD-ONLY-COVERAGE` — gated on operator picking Path 3 (GT-free forward-only)
