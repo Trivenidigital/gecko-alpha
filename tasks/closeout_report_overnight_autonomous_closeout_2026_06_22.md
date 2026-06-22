@@ -16,6 +16,8 @@ capability replaces this repo-local, no-network status report.
 
 ## Done
 
+- PR #377 merged to master as dc8f70ae after GitHub Actions passed.
+
 - Refreshed from `origin/master` at `b0df1720`.
 - Drift-checked requested artifacts:
   - template pack exists under `docs/superpowers/templates/`;
@@ -63,7 +65,7 @@ capability replaces this repo-local, no-network status report.
 
 ## Next operator action
 
-Review the PR for this read-only reporter refresh. If you want this closeout
+PR #377 is merged. If you want this closeout
 to run unattended later, choose the runner home; default recommendation remains
 Hermes-owned scheduling with Codex as the repo-grounded worker.
 
