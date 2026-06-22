@@ -1262,3 +1262,42 @@ async def test_revive_leaves_unsuppressed_base_combo_untouched(
     assert parole_at is None
     assert remaining is None
     await db.close()
+
+
+async def test_revive_does_not_touch_multi_signal_combos(tmp_path, settings_factory):
+    """Combo parole is scoped to the base combo (combo_key == signal_type). A
+    multi-signal combo that merely CONTAINS the revived signal (e.g.
+    'narrative_prediction+volume_spike') must be left untouched — it re-proves
+    on its own merits. Pins the scoping claim against a future loosening of the
+    UPDATE's WHERE clause (e.g. to a LIKE/contains match)."""
+    settings = settings_factory()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 WHERE signal_type='volume_spike'",
+    )
+    await db._conn.commit()
+    future = (datetime.now(timezone.utc) + timedelta(days=14)).isoformat()
+    # build_combo_key sorts parts; 'narrative_prediction' < 'volume_spike'.
+    await _seed_combo_row(
+        db,
+        "narrative_prediction+volume_spike",
+        suppressed=1,
+        parole_at=future,
+        parole_remaining=0,
+    )
+
+    await db.revive_signal_with_baseline(
+        "volume_spike", reason="operator: revival", settings=settings
+    )
+
+    cur = await db._conn.execute(
+        "SELECT suppressed, parole_at, parole_trades_remaining "
+        "FROM combo_performance "
+        "WHERE combo_key='narrative_prediction+volume_spike' AND window='30d'"
+    )
+    suppressed, parole_at, remaining = await cur.fetchone()
+    assert suppressed == 1
+    assert parole_at == future, "multi-signal combo parole window must be unchanged"
+    assert remaining == 0, "multi-signal combo allowance must be unchanged"
+    await db.close()
