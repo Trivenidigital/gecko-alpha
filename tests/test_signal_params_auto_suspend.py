@@ -1155,3 +1155,149 @@ async def test_pnl_threshold_alert_uses_plain_text_and_traces(
     assert "auto_suspend_alert_delivered" in events
 
     await db.close()
+
+
+async def _seed_combo_row(
+    db,
+    combo_key: str,
+    *,
+    suppressed: int,
+    parole_at: str | None,
+    parole_remaining: int | None,
+    win_rate_pct: float = 28.3,
+    trades: int = 46,
+) -> None:
+    """Seed one combo_performance 30d row (mirrors test_trading_suppression)."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        "INSERT OR REPLACE INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, avg_pnl_pct, "
+        " win_rate_pct, suppressed, suppressed_at, parole_at, "
+        " parole_trades_remaining, refresh_failures, last_refreshed) "
+        "VALUES (?, '30d', ?, 13, ?, 0, 0, ?, ?, ?, ?, ?, 0, ?)",
+        (
+            combo_key,
+            trades,
+            max(trades - 13, 0),
+            win_rate_pct,
+            suppressed,
+            "2026-05-04T01:01:02Z" if suppressed else None,
+            parole_at,
+            parole_remaining,
+            now_iso,
+        ),
+    )
+    await db._conn.commit()
+
+
+async def test_revive_opens_parole_on_suppressed_base_combo(tmp_path, settings_factory):
+    """Reviving a signal opens parole on its suppressed base combo so the
+    combo-level entry gate doesn't silently keep the revived signal
+    un-tradeable. Mirrors the signal-level baseline reset at the combo level:
+    bounded retest (suppressed stays 1, parole window opens now), not full
+    exoneration."""
+    settings = settings_factory()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0, suspended_at=?, "
+        "suspended_reason='auto_suspend' WHERE signal_type='volume_spike'",
+        ("2026-05-04T01:01:02Z",),
+    )
+    await db._conn.commit()
+    # Base combo suppressed with parole 14 days out and allowance exhausted.
+    future = (datetime.now(timezone.utc) + timedelta(days=14)).isoformat()
+    await _seed_combo_row(
+        db, "volume_spike", suppressed=1, parole_at=future, parole_remaining=0
+    )
+
+    await db.revive_signal_with_baseline(
+        "volume_spike", reason="operator: soak revival", settings=settings
+    )
+
+    cur = await db._conn.execute(
+        "SELECT suppressed, parole_at, parole_trades_remaining "
+        "FROM combo_performance WHERE combo_key='volume_spike' AND window='30d'"
+    )
+    suppressed, parole_at, remaining = await cur.fetchone()
+    assert suppressed == 1, "bounded retest, not full exoneration"
+    assert parole_at is not None
+    parole_dt = datetime.fromisoformat(parole_at)
+    assert parole_dt <= datetime.now(timezone.utc), "parole window must be open now"
+    assert remaining == settings.FEEDBACK_PAROLE_RETEST_TRADES
+    await db.close()
+
+
+async def test_revive_leaves_unsuppressed_base_combo_untouched(
+    tmp_path, settings_factory
+):
+    """A non-suppressed base combo must not be altered by revival (no
+    spurious parole stamp / allowance reset on a healthy combo)."""
+    settings = settings_factory()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 WHERE signal_type='volume_spike'",
+    )
+    await db._conn.commit()
+    await _seed_combo_row(
+        db,
+        "volume_spike",
+        suppressed=0,
+        parole_at=None,
+        parole_remaining=None,
+        win_rate_pct=72.0,
+    )
+
+    await db.revive_signal_with_baseline(
+        "volume_spike", reason="operator: revival", settings=settings
+    )
+
+    cur = await db._conn.execute(
+        "SELECT suppressed, parole_at, parole_trades_remaining "
+        "FROM combo_performance WHERE combo_key='volume_spike' AND window='30d'"
+    )
+    suppressed, parole_at, remaining = await cur.fetchone()
+    assert suppressed == 0
+    assert parole_at is None
+    assert remaining is None
+    await db.close()
+
+
+async def test_revive_does_not_touch_multi_signal_combos(tmp_path, settings_factory):
+    """Combo parole is scoped to the base combo (combo_key == signal_type). A
+    multi-signal combo that merely CONTAINS the revived signal (e.g.
+    'narrative_prediction+volume_spike') must be left untouched — it re-proves
+    on its own merits. Pins the scoping claim against a future loosening of the
+    UPDATE's WHERE clause (e.g. to a LIKE/contains match)."""
+    settings = settings_factory()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await db._conn.execute(
+        "UPDATE signal_params SET enabled=0 WHERE signal_type='volume_spike'",
+    )
+    await db._conn.commit()
+    future = (datetime.now(timezone.utc) + timedelta(days=14)).isoformat()
+    # build_combo_key sorts parts; 'narrative_prediction' < 'volume_spike'.
+    await _seed_combo_row(
+        db,
+        "narrative_prediction+volume_spike",
+        suppressed=1,
+        parole_at=future,
+        parole_remaining=0,
+    )
+
+    await db.revive_signal_with_baseline(
+        "volume_spike", reason="operator: revival", settings=settings
+    )
+
+    cur = await db._conn.execute(
+        "SELECT suppressed, parole_at, parole_trades_remaining "
+        "FROM combo_performance "
+        "WHERE combo_key='narrative_prediction+volume_spike' AND window='30d'"
+    )
+    suppressed, parole_at, remaining = await cur.fetchone()
+    assert suppressed == 1
+    assert parole_at == future, "multi-signal combo parole window must be unchanged"
+    assert remaining == 0, "multi-signal combo allowance must be unchanged"
+    await db.close()
