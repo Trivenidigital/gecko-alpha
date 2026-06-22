@@ -374,12 +374,24 @@ def test_writer_branch_disabled_by_default(tmp_path):
     assert "--writer-threshold-minutes" not in captured
 
 
-def test_alert_body_does_not_leak_raw_json_braces_in_writer_stale_text(tmp_path):
-    """Reviewer-A I3 regression guard: when alert text quotes detail=,
-    the operator sees the JSON appended for diagnosis, but the leading
-    text must be human-prose, not the JSON itself."""
+def _extract_alert_text(payload: str) -> str:
+    """Isolate the Telegram alert body (the --data-urlencode text= value) from
+    the flat curl-args marker line, bounded by the trailing ` -d parse_mode=`
+    arg so the curl `-w "%{http_code}"` brace can't be mistaken for alert
+    content."""
+    start = payload.index("text=") + len("text=")
+    end = payload.index(" -d parse_mode=", start)
+    return payload[start:end]
+
+
+def test_alert_body_does_not_leak_raw_json_in_writer_stale_text(tmp_path):
+    """The operator-facing alert must be human prose only — NO raw JSON blob
+    appended (supersedes the earlier 'JSON appended for diagnosis' behavior;
+    the full JSON still lands in the journal via the wrapper's stdout). Guards
+    against re-introducing the `detail=${result}` dump."""
     body = (
-        '{"ok":false,"status":"writer_stale","detail":{"age_minutes":47.2}}'
+        '{"ok":false,"status":"writer_stale","detail":{"age_minutes":47.2,'
+        '"last_writer_success_at":"2026-05-21T00:00:00+00:00"}}'
     )
     python_stub = _make_python_stub(tmp_path, exit_code=5, stdout_body=body)
     env_file = _write_env_file(tmp_path, token="tok", chat_id="chat")
@@ -388,19 +400,35 @@ def test_alert_body_does_not_leak_raw_json_braces_in_writer_stale_text(tmp_path)
     res = _run(python_stub, env_file=env_file, curl_stub=curl_stub)
 
     assert res.returncode == 1
-    payload = marker.read_text()
-    # The alert body must START with human prose, not JSON
-    # Extract the "text=" arg value
-    import urllib.parse
-    # curl-args dump contains: --data-urlencode text=<the alert>
-    # Parse out the alert body
-    text_marker = "text="
-    text_idx = payload.find(text_marker)
-    assert text_idx != -1
-    alert_body = payload[text_idx + len(text_marker):].split("'")[0].split('"')[0]
-    # First 80 chars should be prose, not a brace
-    head = alert_body.strip()[:80]
-    assert "source-calls-lag-watchdog" in head
-    assert not head.startswith("{"), (
-        f"Alert body must lead with prose, not raw JSON. Got: {head!r}"
+    alert_text = _extract_alert_text(marker.read_text())
+    assert "source-calls-lag-watchdog" in alert_text
+    assert "{" not in alert_text and "}" not in alert_text, (
+        f"Alert body must not contain raw JSON braces. Got: {alert_text!r}"
+    )
+    assert '"ok":' not in alert_text and "detail=" not in alert_text
+
+
+def test_writer_stale_alert_shows_readable_age_and_last_success(tmp_path):
+    """Instead of dumping raw JSON, the writer_stale alert surfaces the two
+    actionable diagnostic fields (age in minutes + last success timestamp) as
+    readable prose."""
+    body = (
+        '{"ok":false,"status":"writer_stale","detail":{"age_minutes":135.0,'
+        '"threshold_minutes":20,"path":"/var/lib/heartbeat",'
+        '"last_writer_success_at":"2026-06-22T15:45:03+00:00"}}'
+    )
+    python_stub = _make_python_stub(tmp_path, exit_code=5, stdout_body=body)
+    env_file = _write_env_file(tmp_path, token="tok", chat_id="chat")
+    curl_stub, marker = _make_curl_stub(tmp_path)
+
+    res = _run(python_stub, env_file=env_file, curl_stub=curl_stub)
+
+    assert res.returncode == 1
+    alert_text = _extract_alert_text(marker.read_text())
+    # Specific prose phrasing the extraction produces — these strings do NOT
+    # appear in the raw JSON (`"age_minutes":135.0`), so this fails if the
+    # fields are merely dumped rather than formatted.
+    assert "(135.0 min ago)" in alert_text, "must surface age_minutes as prose"
+    assert "Last success: 2026-06-22T15:45:03+00:00" in alert_text, (
+        "must surface last_writer_success_at as prose"
     )
