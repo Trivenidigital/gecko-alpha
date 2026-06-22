@@ -5772,6 +5772,43 @@ class Database:
                     now_iso,
                 ),
             )
+            # Combo-level revival: signal_params.enabled is only the FIRST
+            # entry gate. The base combo (combo_key == signal_type) carries an
+            # INDEPENDENT suppression in combo_performance that survives a
+            # signal-level revival, silently keeping the revived signal
+            # un-tradeable until parole_at (up to FEEDBACK_PAROLE_DAYS out).
+            # Mirror the signal-level baseline reset here: open the parole
+            # window NOW and refresh the retest allowance, keeping
+            # suppressed=1 (bounded retest, not full exoneration — combo_refresh
+            # re-evaluates on the fresh trades). Only the base combo is touched;
+            # multi-signal combos must re-prove on their own merits.
+            cur = await conn.execute(
+                "SELECT 1 FROM combo_performance "
+                "WHERE combo_key = ? AND window = '30d' AND suppressed = 1",
+                (signal_type,),
+            )
+            if await cur.fetchone() is not None:
+                # Resolve settings lazily — only when there is actually a
+                # suppressed base combo to parole (mirrors the cool-off
+                # branch above), so callers reviving a signal with no
+                # suppressed combo need not provide / construct Settings.
+                if settings is None:
+                    from scout.config import get_settings
+
+                    settings = get_settings()
+                retest = settings.FEEDBACK_PAROLE_RETEST_TRADES
+                await conn.execute(
+                    "UPDATE combo_performance "
+                    "SET parole_at = ?, parole_trades_remaining = ? "
+                    "WHERE combo_key = ? AND window = '30d' AND suppressed = 1",
+                    (now_iso, retest, signal_type),
+                )
+                _db_log.info(
+                    "revive_signal_combo_paroled",
+                    signal_type=signal_type,
+                    parole_at=now_iso,
+                    parole_trades_remaining=retest,
+                )
             await conn.commit()
         except ValueError:
             raise
