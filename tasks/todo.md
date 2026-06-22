@@ -57,6 +57,33 @@ Non-scope:
   DB writes, migrations, production secret changes, or deploy.
 - No new dashboard write affordance or production runtime probe.
 
+## Active Work: 2026-06-22 - Live-readiness audit report
+
+**Status:** FINDINGS-DRAFTED. Goal: advance the offshore live-trading handoff Phase 1 by
+filing a read-only production readiness report for the Binance-first live path.
+
+- [x] Refresh to current `origin/master` and verify no in-tree live-readiness
+  report already closes the handoff Phase 1 deliverable.
+- [x] Run Hermes-first analysis for live-readiness/reporting domains using the
+  standard domain table, Hermes skill hub, and awesome-hermes-agent ecosystem
+  check; record why this remains repo/runtime evidence work, not a Hermes
+  replacement.
+- [x] Query production runtime state read-only: branch/commit for pipeline and
+  dashboard, `LIVE_*`, secret-safe exchange/Minara/Telegram posture (presence,
+  shape, permission/whitelist evidence only; never raw secret values), signal
+  eligibility, paper performance by signal/cohort (`would_be_live` and
+  actionability where present), live/shadow ledger state, kill switch,
+  `venue_health`, `venue_listings`, `wallet_snapshots`,
+  `cross_venue_exposure`, watchdog health, systemd hardening/`OnFailure`,
+  Telegram 429 pacing attribution, path-reaches-the-lever checks, and forward
+  fire-rate sanity.
+- [x] Write findings report with an evidence-only readiness verdict, blockers,
+  and next operator action. Boundary: no live enablement, no order placement,
+  no credential activation, no config mutation, and final live-trading approval
+  remains operator-only. Include rollback command and approver requirement for
+  any future live-mode change.
+- [ ] Run focused verification for docs/report consistency and open a PR.
+
 ## Completed Work: 2026-06-18 - first_signal extend-soak verdict (P2)
 
 **Status:** CLOSED-AS-EXTEND-SOAK. Runtime-verified live on srilu-vps
