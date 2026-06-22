@@ -37,9 +37,10 @@ Safety note: `--out` only allows writing to `tasks/*.md` and refuses to overwrit
 
 ## Interpreting the report
 
-- If “templates missing” appears: create/ship template pack first.
-- If “work loop runner not found” appears: treat overnight closeout as a **manual** process until a scheduler integration is explicitly designed and operator-approved.
-- If backlog anchors show “SHIPPED-MERGED” but UI work is missing: treat as a follow-up item; do not re-implement the shipped primitive.
+- If `templates missing` appears: create/ship template pack first.
+- If `Runner candidates` is empty: treat overnight closeout as a **manual** process until a scheduler integration is explicitly designed and operator-approved.
+- `Reference-only mentions` are docs/history/status-surface hits. They prove the closeout was discussed or reported, not that an executable runner exists.
+- If backlog anchors show `SHIPPED-MERGED` but UI work is missing: treat as a follow-up item; do not re-implement the shipped primitive.
 
 ## Safety constraints (hard gates)
 
