@@ -1,8 +1,8 @@
 # Backlog — gecko-alpha
 
-## Active Work: 2026-06-22 - Overnight autonomous closeout reporter refresh
+## Completed Work: 2026-06-22 - Overnight autonomous closeout reporter refresh
 
-**Status:** IN-PROGRESS. Goal: run the Gecko overnight autonomous closeout in
+**Status:** SHIPPED 2026-06-22 - PR #377 squash `dc8f70ae`. Goal: run the Gecko overnight autonomous closeout in
 production-push mode without crossing operator-only gates. Current-base
 drift-check shows the requested template pack, operating-model runbook, local
 status reporter, Signal Trust surfaces, and Trade Decision surfaces already
@@ -47,9 +47,9 @@ Design:
 - Add focused tests for classification, cron/systemd inclusion, self-reporter
   exclusion, and `--out` write guardrails.
 - [x] Build: update reporter/tests/docs so first-run/work-loop behavior is explicit and docs references are not over-classified as runner artifacts.
-- [x] Verify with focused tests, direct script run, and `git diff --check`: reporter tests 5 passed; node syntax check passed; direct status report generated; diff check passed with only tasks/todo.md LF-normalization warning.
-- [x] PR review by two parallel agents and fold critical/important issues: safety approved; structural cron-doc false-positive blocker folded with negative regression and crontab-syntax requirement; targeted re-review approved after Markdown and non-Markdown cron docs regressions.
-- [ ] Open PR if verification/review pass; otherwise file a no-build/finding.
+- [x] Verify with focused tests, direct script run, and `git diff --check`: reporter tests 6 passed; node syntax check passed; direct status report generated; diff check passed with only tasks/todo.md LF-normalization warning.
+- [x] PR review by two parallel agents and fold critical/important issues: safety approved; structural cron-doc false-positive blocker folded with negative regression and crontab-syntax requirement; targeted re-review approved after Markdown and non-Markdown cron docs regressions; CI passed.
+- [x] Open PR if verification/review pass; otherwise file a no-build/finding: PR #377 opened, CI passed, labels `codex` and `codex-automation` applied, and PR squash-merged to `master` as `dc8f70ae`.
 
 Non-scope:
 - No paid API calls, live execution, sizing/capital allocation, source/KOL
