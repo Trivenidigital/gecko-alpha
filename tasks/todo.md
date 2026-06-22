@@ -1,5 +1,62 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-06-22 - Overnight autonomous closeout reporter refresh
+
+**Status:** IN-PROGRESS. Goal: run the Gecko overnight autonomous closeout in
+production-push mode without crossing operator-only gates. Current-base
+drift-check shows the requested template pack, operating-model runbook, local
+status reporter, Signal Trust surfaces, and Trade Decision surfaces already
+exist. Residual safe work is to tighten the read-only autonomous status surface
+so it cleanly distinguishes executable work-loop runners from docs/history
+references, then file a closeout report.
+
+Workflow checklist:
+- [x] Refresh from current `origin/master` and create branch
+  `feat/overnight-closeout-20260622`.
+- [x] Read automation memory, `tasks/lessons.md`, `tasks/todo.md`, and the top
+  Current Final Backlog Snapshot in `backlog.md`; repo `AGENTS.md` is absent in
+  this worktree, so use prompt-provided instructions as the active agent rules.
+- [x] Drift-check requested artifacts and backlog anchors:
+  - templates present under `docs/superpowers/templates/`;
+  - role map present in `docs/runbooks/gecko-autonomous-operating-model.md`;
+  - read-only status surface present in `scripts/report_autonomous_status.mjs`;
+  - Live Decision Cockpit parent archived / shipped-partial;
+  - Signal Trust registry/tab and scorecards partially shipped.
+- [x] Hermes-first check: Skills Hub loaded but catalog content is client-side
+  at browse time; awesome-hermes-agent is active. Verdict for this residual:
+  no Hermes skill should replace a repo-local read-only status reporter; Hermes
+  remains the scheduler/memory layer.
+- [x] Plan review by two parallel agents (status-surface clarity + safety/gates): both approved; fold final closeout wording so the report says manual unless a real runner exists.
+- [x] Design review by two parallel agents: safety approved; classification blocked on self-reporter false positive and missing cron/systemd artifacts, folded below.
+
+Design:
+- Output two buckets: `Runner candidates` and `Reference-only mentions`.
+- Classify a mention as `Runner candidate` only when it has scheduler/launcher
+  semantics, not merely because it is executable and mentions the closeout id.
+  Eligible evidence includes cron files, systemd `.service`/`.timer` files,
+  GitHub workflow YAML, automation JSON, and scripts whose path/name or nearby
+  content clearly launch/schedule the closeout loop. Exclude
+  `scripts/report_autonomous_status.mjs` from runner candidacy; it is the
+  read-only status surface.
+- Plain Markdown docs, findings, plans, templates, historical reports, and the
+  reporter itself are `Reference-only mentions` unless they point to a concrete
+  launcher artifact. If no runner candidates exist, state first-run behavior as
+  manual/no in-tree runner.
+- Keep the reporter local/read-only: git metadata + tracked text files only;
+  no network, no DB, no `.env`, no SSH, optional `--out` unchanged.
+- Add focused tests for classification, cron/systemd inclusion, self-reporter
+  exclusion, and `--out` write guardrails.
+- [x] Build: update reporter/tests/docs so first-run/work-loop behavior is explicit and docs references are not over-classified as runner artifacts.
+- [x] Verify with focused tests, direct script run, and `git diff --check`: reporter tests 5 passed; node syntax check passed; direct status report generated; diff check passed with only tasks/todo.md LF-normalization warning.
+- [x] PR review by two parallel agents and fold critical/important issues: safety approved; structural cron-doc false-positive blocker folded with negative regression and crontab-syntax requirement; targeted re-review approved after Markdown and non-Markdown cron docs regressions.
+- [ ] Open PR if verification/review pass; otherwise file a no-build/finding.
+
+Non-scope:
+- No paid API calls, live execution, sizing/capital allocation, source/KOL
+  pruning or suppression, signal enable/disable/threshold changes, destructive
+  DB writes, migrations, production secret changes, or deploy.
+- No new dashboard write affordance or production runtime probe.
+
 ## Completed Work: 2026-06-18 - first_signal extend-soak verdict (P2)
 
 **Status:** CLOSED-AS-EXTEND-SOAK. Runtime-verified live on srilu-vps

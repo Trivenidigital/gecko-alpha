@@ -133,6 +133,9 @@ function checkTemplates() {
 function searchLoopRunnerHints() {
   const candidates = [
     "scripts",
+    "cron",
+    "systemd",
+    ".github",
     "docs",
     "tasks"
   ];
@@ -142,19 +145,67 @@ function searchLoopRunnerHints() {
     "autonomous closeout loop"
   ];
 
-  // Cheap check: only scan a small number of known text files in those dirs.
-  const hitFiles = [];
-  for (const base of candidates) {
-    if (!existsSync(base)) continue;
-    const list = execFileSync(
+  function trackedTextFiles(base) {
+    const output = execFileSync(
       "git",
       ["ls-files", base],
       { encoding: "utf8" }
-    )
-      .trim()
+    ).trim();
+    if (!output) return [];
+    return output
       .split("\n")
       .filter(Boolean)
-      .filter((f) => f.endsWith(".md") || f.endsWith(".txt") || f.endsWith(".yml") || f.endsWith(".yaml") || f.endsWith(".json") || f.endsWith(".sh") || f.endsWith(".py") || f.endsWith(".mjs") || f.endsWith(".js"));
+      .filter((filePath) => {
+        if (filePath === "scripts/report_autonomous_status.mjs") return true;
+        if (filePath.startsWith("cron/")) return true;
+        if (filePath.endsWith(".service") || filePath.endsWith(".timer")) return true;
+        return filePath.endsWith(".md") ||
+          filePath.endsWith(".txt") ||
+          filePath.endsWith(".yml") ||
+          filePath.endsWith(".yaml") ||
+          filePath.endsWith(".json") ||
+          filePath.endsWith(".sh") ||
+          filePath.endsWith(".ps1") ||
+          filePath.endsWith(".py") ||
+          filePath.endsWith(".mjs") ||
+          filePath.endsWith(".js");
+      });
+  }
+
+  function hasLauncherSemantics(filePath, text) {
+    if (filePath === "scripts/report_autonomous_status.mjs") return false;
+    if (filePath.startsWith("tasks/") && filePath.endsWith(".md")) return false;
+    if (filePath.startsWith("docs/") && filePath.endsWith(".md")) return false;
+
+    if (filePath.startsWith("cron/")) {
+      const name = path.basename(filePath);
+      const maybeCronFile = filePath.endsWith(".crontab") || !name.includes(".");
+      const cronScheduleLine = /(^|\n)\s*(?:@\w+|(?:[*0-9,\-/]+\s+){5})\S+/m.test(text);
+      return maybeCronFile &&
+        text.includes("gecko-overnight-autonomous-closeout") &&
+        cronScheduleLine;
+    }
+    if (filePath.startsWith("systemd/") && (filePath.endsWith(".service") || filePath.endsWith(".timer"))) {
+      return text.includes("gecko-overnight-autonomous-closeout");
+    }
+    if (filePath.startsWith(".github/workflows/") && (filePath.endsWith(".yml") || filePath.endsWith(".yaml"))) {
+      return text.includes("gecko-overnight-autonomous-closeout");
+    }
+    if (filePath.endsWith(".json")) {
+      return text.includes("gecko-overnight-autonomous-closeout") && /schedule|cron|automation|runner|command/i.test(text);
+    }
+    if (filePath.endsWith(".sh") || filePath.endsWith(".ps1") || filePath.endsWith(".py") || filePath.endsWith(".mjs") || filePath.endsWith(".js")) {
+      return /closeout|overnight|automation|runner|schedule/i.test(filePath) && /spawn|exec|Start-Process|subprocess|node |python |bash |git /i.test(text);
+    }
+    return false;
+  }
+
+  // Cheap check: only scan known text files in likely repo-local locations.
+  const runnerCandidates = [];
+  const referenceMentions = [];
+  for (const base of candidates) {
+    if (!existsSync(base)) continue;
+    const list = trackedTextFiles(base);
 
     for (const filePath of list.slice(0, 1200)) {
       // Bound scan time: skip large files.
@@ -162,19 +213,29 @@ function searchLoopRunnerHints() {
         const text = safeReadText(filePath);
         for (const needle of needles) {
           if (text.includes(needle)) {
-            hitFiles.push({ file: filePath, needle });
+            const hit = {
+              file: filePath,
+              needle,
+              kind: filePath === "scripts/report_autonomous_status.mjs"
+                ? "reporter-self-reference"
+                : hasLauncherSemantics(filePath, text)
+                  ? "runner-candidate"
+                  : "reference-only"
+            };
+            if (hit.kind === "runner-candidate") runnerCandidates.push(hit);
+            else referenceMentions.push(hit);
             break;
           }
         }
       } catch {
         // ignore unreadable files
       }
-      if (hitFiles.length >= 20) break;
+      if (runnerCandidates.length + referenceMentions.length >= 40) break;
     }
-    if (hitFiles.length >= 20) break;
+    if (runnerCandidates.length + referenceMentions.length >= 40) break;
   }
 
-  return hitFiles;
+  return { runnerCandidates, referenceMentions };
 }
 
 function bestEffortChangesSince(sinceIso) {
@@ -255,7 +316,7 @@ if (!backlogExists) {
 } else {
   for (const anchor of anchors) {
     if (!anchor) continue;
-    lines.push(`- \`${anchor.id}\` @ backlog.md:${anchor.found_at_line} — ${anchor.status_line}`);
+    lines.push(`- \`${anchor.id}\` @ backlog.md:${anchor.found_at_line} - ${anchor.status_line}`);
   }
 }
 lines.push("");
@@ -272,11 +333,25 @@ lines.push("");
 
 lines.push("## Closeout work-loop runner (drift-check)");
 lines.push("");
-if (loopRunnerHits.length === 0) {
-  lines.push("- No obvious in-tree runner artifacts found for `gecko-overnight-autonomous-closeout` (cheap scan). Treat this closeout loop as manual unless a scheduler integration is explicitly designed and operator-approved.");
+lines.push("### Runner candidates");
+lines.push("");
+if (loopRunnerHits.runnerCandidates.length === 0) {
+  lines.push("- No in-tree runner candidates found for `gecko-overnight-autonomous-closeout`.");
+  lines.push("- First-run behavior: manual/runbook-driven until a concrete scheduler or launcher artifact is designed, reviewed, and operator-approved.");
 } else {
-  lines.push("- Potential references found (review manually; references do not imply a runner exists):");
-  for (const hit of loopRunnerHits) lines.push(`  - \`${hit.file}\` (matched: ${hit.needle})`);
+  for (const hit of loopRunnerHits.runnerCandidates) {
+    lines.push(`- \`${hit.file}\` (matched: ${hit.needle}; ${hit.kind})`);
+  }
+}
+lines.push("");
+lines.push("### Reference-only mentions");
+lines.push("");
+if (loopRunnerHits.referenceMentions.length === 0) {
+  lines.push("- No reference-only mentions found.");
+} else {
+  for (const hit of loopRunnerHits.referenceMentions) {
+    lines.push(`- \`${hit.file}\` (matched: ${hit.needle}; ${hit.kind})`);
+  }
 }
 lines.push("");
 
