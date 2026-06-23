@@ -69,6 +69,8 @@ COLUMN_ORDER: tuple[str, ...] = (
     "sl_pct_at_entry",
     "trail_pct_at_entry",
     "trail_pct_low_peak_at_entry",
+    "liquidity_source_at_entry",
+    "liquidity_confidence_at_entry",
 )
 
 
@@ -113,6 +115,44 @@ def _extract_liquidity(signal_data: dict[str, Any]) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+async def _read_enriched_liquidity(
+    db, *, contract_address: str | None, chain: str | None
+) -> tuple[float | None, str | None, str | None]:
+    """Read at-entry liquidity from the candidates enrichment columns written
+    by the DexScreener backfill cron (scripts/backfill_dexscreener_liquidity.py).
+
+    The CG cohort never carries `liquidity_usd` in signal_data — CoinGecko's
+    feed doesn't surface pool liquidity (scout/models.py hardcodes 0.0) — so
+    this enrichment read is the only source for those trades.
+
+    Returns (liquidity_usd, source, confidence):
+      - no candidates row, or never visited by the writer → (None, None, None)
+        (a genuine gap → counts toward entry_snapshot_complete=0)
+      - writer visited, no DEX match → (None, source, 'dex_no_match') etc.
+        (known-absent → NOT a gap)
+      - writer found liquidity → (value, source, 'definite'/'multi_chain')
+    """
+    if not contract_address or not chain:
+        return (None, None, None)
+    cur = await db._conn.execute(
+        "SELECT liquidity_usd_enriched, liquidity_enriched_source, "
+        "liquidity_enriched_confidence FROM candidates "
+        "WHERE LOWER(contract_address)=LOWER(?) AND chain=? "
+        "LIMIT 1",
+        (contract_address, chain),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return (None, None, None)
+    raw_value, source, confidence = row[0], row[1], row[2]
+    value: float | None
+    try:
+        value = float(raw_value) if raw_value is not None else None
+    except (TypeError, ValueError):
+        value = None
+    return (value, source, confidence)
 
 
 def _source_confluence_count(signal_combo: str | None) -> int | None:
@@ -269,12 +309,29 @@ async def build_entry_snapshot(
     snapshot (Vector B C1 + C2 fixes).
     """
     mcap = _extract_mcap(signal_data)
-    liquidity = _extract_liquidity(signal_data)
     candidate_contract_address = contract_address
     if signal_type == "tg_social":
         raw_contract = signal_data.get("contract_address")
         if isinstance(raw_contract, str) and raw_contract.strip():
             candidate_contract_address = raw_contract.strip()
+
+    # Liquidity: prefer a value carried in signal_data (DEX-sourced trades
+    # measure it at signal time); otherwise fall back to the candidates
+    # enrichment columns (the CG cohort's only source). Provenance is recorded
+    # so a NULL can be told apart: 'definite' value vs 'dex_no_match'
+    # known-absent vs writer-never-ran gap (None confidence).
+    liquidity = _extract_liquidity(signal_data)
+    if liquidity is not None:
+        liquidity_source: str | None = "signal_data"
+        liquidity_confidence: str | None = "definite"
+    else:
+        (
+            liquidity,
+            liquidity_source,
+            liquidity_confidence,
+        ) = await _read_enriched_liquidity(
+            db, contract_address=candidate_contract_address, chain=chain
+        )
     first_seen = await _read_first_seen_at(
         db, contract_address=candidate_contract_address, chain=chain
     )
@@ -305,6 +362,8 @@ async def build_entry_snapshot(
         "mcap_usd_at_entry": mcap,
         "mcap_bucket_at_entry": _mcap_bucket(mcap),
         "liquidity_usd_at_entry": liquidity,
+        "liquidity_source_at_entry": liquidity_source,
+        "liquidity_confidence_at_entry": liquidity_confidence,
         "token_age_days_at_entry": token_age,
         "first_seen_at_at_entry": first_seen,
         "detected_by_combo_at_entry": signal_combo,
@@ -379,7 +438,20 @@ async def stamp_entry_snapshot(
     )
 
     applicable = _applicable_optional_fields(signal_type)
-    missing = [k for k in applicable if snapshot.get(k) is None]
+    missing = []
+    for k in applicable:
+        if snapshot.get(k) is not None:
+            continue
+        # A NULL liquidity is only a real gap when we have no provenance at
+        # all (writer never visited). When the enrichment writer DID run but
+        # found no DEX pair, liquidity_confidence_at_entry is set (e.g.
+        # 'dex_no_match') — that's a known-absent fact, not a missing field.
+        if (
+            k == "liquidity_usd_at_entry"
+            and snapshot.get("liquidity_confidence_at_entry") is not None
+        ):
+            continue
+        missing.append(k)
     snapshot["paper_trade_id"] = trade_id
     snapshot["entry_snapshot_version"] = ENTRY_SNAPSHOT_VERSION
     snapshot["captured_at"] = datetime.now(timezone.utc).isoformat()
