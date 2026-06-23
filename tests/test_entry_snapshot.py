@@ -952,6 +952,224 @@ async def test_postfold_a_alert_market_cap_key_captured(db):
     assert bucket == "10_50m"
 
 
+# -- Liquidity enrichment fallback + provenance ---------------------------
+# Root cause: snapshot read signal_data["liquidity_usd"], a key NO producer
+# emits for the CG cohort, so liquidity_usd_at_entry was 100% NULL. Fix:
+# fall back to candidates.liquidity_usd_enriched (written by the DexScreener
+# enrichment cron) and record provenance (source + confidence).
+
+
+async def _ensure_candidate_row_enriched(
+    db,
+    *,
+    contract_address,
+    chain,
+    first_seen_at,
+    liq_enriched=None,
+    enriched_source=None,
+    enriched_confidence=None,
+):
+    """Seed a candidates row, optionally with the enrichment columns set."""
+    await db._conn.execute(
+        "INSERT OR IGNORE INTO candidates "
+        "(contract_address, chain, token_name, ticker, first_seen_at, "
+        "liquidity_usd_enriched, liquidity_enriched_source, "
+        "liquidity_enriched_confidence) "
+        "VALUES (?, ?, 'EnrTok', 'ENR', ?, ?, ?, ?)",
+        (
+            contract_address,
+            chain,
+            first_seen_at,
+            liq_enriched,
+            enriched_source,
+            enriched_confidence,
+        ),
+    )
+    await db._conn.commit()
+
+
+async def test_liq_enrichment_fallback_definite(db):
+    """signal_data lacks liquidity_usd; candidates has an enriched value with
+    confidence='definite' → snapshot captures the value + provenance, and the
+    field is NOT counted missing (complete=1)."""
+    await _ensure_candidate_row_enriched(
+        db,
+        contract_address="enr-tok",
+        chain="coingecko",
+        first_seen_at="2026-05-19T12:00:00+00:00",
+        liq_enriched=120000.0,
+        enriched_source="dexscreener:base",
+        enriched_confidence="definite",
+    )
+    trade_id = await _open_with_full_signal(
+        PaperTrader(),
+        db,
+        token_id="enr-tok",
+        signal_data={"mcap": 20_000_000},  # NO liquidity_usd
+    )
+    cur = await db._conn.execute(
+        "SELECT liquidity_usd_at_entry, liquidity_source_at_entry, "
+        "liquidity_confidence_at_entry, entry_snapshot_complete, "
+        "entry_snapshot_missing_fields "
+        "FROM paper_trade_entry_snapshots WHERE paper_trade_id=?",
+        (trade_id,),
+    )
+    liq, source, confidence, complete, missing_json = await cur.fetchone()
+    assert liq == 120000.0
+    assert source == "dexscreener:base"
+    assert confidence == "definite"
+    assert complete == 1
+    assert "liquidity_usd_at_entry" not in missing_json
+
+
+async def test_liq_signal_data_wins_over_enrichment(db):
+    """signal_data.liquidity_usd present → used directly with
+    source='signal_data', confidence='definite'; enrichment is ignored."""
+    await _ensure_candidate_row_enriched(
+        db,
+        contract_address="enr-tok2",
+        chain="coingecko",
+        first_seen_at="2026-05-19T12:00:00+00:00",
+        liq_enriched=999.0,
+        enriched_source="dexscreener:base",
+        enriched_confidence="definite",
+    )
+    trade_id = await _open_with_full_signal(
+        PaperTrader(),
+        db,
+        token_id="enr-tok2",
+        signal_data={"mcap": 20_000_000, "liquidity_usd": 250_000},
+    )
+    cur = await db._conn.execute(
+        "SELECT liquidity_usd_at_entry, liquidity_source_at_entry, "
+        "liquidity_confidence_at_entry "
+        "FROM paper_trade_entry_snapshots WHERE paper_trade_id=?",
+        (trade_id,),
+    )
+    liq, source, confidence = await cur.fetchone()
+    assert liq == 250_000
+    assert source == "signal_data"
+    assert confidence == "definite"
+
+
+async def test_liq_enrichment_visited_no_match_not_missing(db):
+    """Writer visited but DexScreener returned no pair (value NULL,
+    confidence='dex_no_match') → liquidity None, confidence recorded, and the
+    field is treated as known-absent, NOT a data gap (complete=1)."""
+    await _ensure_candidate_row_enriched(
+        db,
+        contract_address="enr-tok3",
+        chain="coingecko",
+        first_seen_at="2026-05-19T12:00:00+00:00",
+        liq_enriched=None,
+        enriched_source=None,
+        enriched_confidence="dex_no_match",
+    )
+    trade_id = await _open_with_full_signal(
+        PaperTrader(),
+        db,
+        token_id="enr-tok3",
+        signal_data={"mcap": 20_000_000},
+    )
+    cur = await db._conn.execute(
+        "SELECT liquidity_usd_at_entry, liquidity_confidence_at_entry, "
+        "entry_snapshot_complete, entry_snapshot_missing_fields "
+        "FROM paper_trade_entry_snapshots WHERE paper_trade_id=?",
+        (trade_id,),
+    )
+    liq, confidence, complete, missing_json = await cur.fetchone()
+    assert liq is None
+    assert confidence == "dex_no_match"
+    assert "liquidity_usd_at_entry" not in missing_json
+    assert complete == 1
+
+
+async def test_liq_never_enriched_is_missing(db):
+    """candidates row exists but writer never visited (confidence NULL) and
+    signal_data lacks liquidity → genuine gap: liquidity None, confidence None,
+    counted as missing (complete=0)."""
+    await _ensure_candidate_row_enriched(
+        db,
+        contract_address="enr-tok4",
+        chain="coingecko",
+        first_seen_at="2026-05-19T12:00:00+00:00",
+    )  # no enrichment columns set
+    trade_id = await _open_with_full_signal(
+        PaperTrader(),
+        db,
+        token_id="enr-tok4",
+        signal_data={"mcap": 20_000_000},
+    )
+    cur = await db._conn.execute(
+        "SELECT liquidity_usd_at_entry, liquidity_confidence_at_entry, "
+        "entry_snapshot_complete, entry_snapshot_missing_fields "
+        "FROM paper_trade_entry_snapshots WHERE paper_trade_id=?",
+        (trade_id,),
+    )
+    liq, confidence, complete, missing_json = await cur.fetchone()
+    assert liq is None
+    assert confidence is None
+    assert "liquidity_usd_at_entry" in missing_json
+    assert complete == 0
+
+
+async def test_provenance_migration_columns_and_sentinel(db):
+    """The v2 provenance migration adds the 2 columns and records its
+    sentinel + schema_version rows."""
+    cur = await db._conn.execute("PRAGMA table_info(paper_trade_entry_snapshots)")
+    cols = {row[1] for row in await cur.fetchall()}
+    assert "liquidity_source_at_entry" in cols
+    assert "liquidity_confidence_at_entry" in cols
+
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM paper_migrations "
+        "WHERE name='bl_entry_snapshot_liquidity_provenance_v1'"
+    )
+    assert (await cur.fetchone())[0] == 1
+
+
+async def test_provenance_migration_upgrades_existing_v1_db(tmp_path):
+    """Prod path: a DB that already has the v1 snapshot table but WITHOUT the
+    provenance columns gets them added on the next initialize(), idempotently
+    and without tripping the strict v1 schema assert (early-return branch)."""
+    path = tmp_path / "upgrade.db"
+    d = Database(path)
+    await d.initialize()
+    # Simulate the pre-provenance prod shape: drop the v2 columns + sentinel.
+    await d._conn.execute(
+        "ALTER TABLE paper_trade_entry_snapshots "
+        "DROP COLUMN liquidity_source_at_entry"
+    )
+    await d._conn.execute(
+        "ALTER TABLE paper_trade_entry_snapshots "
+        "DROP COLUMN liquidity_confidence_at_entry"
+    )
+    await d._conn.execute(
+        "DELETE FROM paper_migrations "
+        "WHERE name='bl_entry_snapshot_liquidity_provenance_v1'"
+    )
+    await d._conn.commit()
+    cur = await d._conn.execute("PRAGMA table_info(paper_trade_entry_snapshots)")
+    pre_cols = {row[1] for row in await cur.fetchall()}
+    assert "liquidity_source_at_entry" not in pre_cols  # sanity: drop worked
+    await d.close()
+
+    # Re-open: the v1 assert must still pass (extra-column-tolerant), and the
+    # v2 migration must re-add the provenance columns + sentinel.
+    d2 = Database(path)
+    await d2.initialize()
+    cur = await d2._conn.execute("PRAGMA table_info(paper_trade_entry_snapshots)")
+    cols = {row[1] for row in await cur.fetchall()}
+    assert "liquidity_source_at_entry" in cols
+    assert "liquidity_confidence_at_entry" in cols
+    cur = await d2._conn.execute(
+        "SELECT COUNT(*) FROM paper_migrations "
+        "WHERE name='bl_entry_snapshot_liquidity_provenance_v1'"
+    )
+    assert (await cur.fetchone())[0] == 1
+    await d2.close()
+
+
 async def test_ib2_enriched_mcap_landed_in_snapshot(db):
     """Vector B I-B2 fold: for a chain_completed trade where signal_data
     lacks mcap but chain_matches has mcap_at_completion, the snapshot must

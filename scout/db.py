@@ -182,6 +182,10 @@ class Database:
         # Phase 6 slices 2+3: price_source at open + exit_provenance at close
         # + stale-onset mark-provenance columns on paper_trades.
         await self._migrate_price_provenance_v1()
+        # Entry-snapshot liquidity provenance (PR #381): 2 nullable columns on
+        # paper_trade_entry_snapshots. Runs AFTER the actionability snapshot
+        # migration (its ALTER target table) — additive, idempotent.
+        await self._migrate_entry_snapshot_liquidity_provenance_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -4888,6 +4892,104 @@ class Database:
             except Exception as rb_err:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             _log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)
+            raise
+
+    async def _migrate_entry_snapshot_liquidity_provenance_v1(self) -> None:
+        """Add liquidity provenance columns to paper_trade_entry_snapshots:
+        ``liquidity_source_at_entry`` + ``liquidity_confidence_at_entry``.
+
+        Kept SEPARATE from ``_migrate_actionability_entry_snapshot_v1`` (whose
+        early-return path runs a strict full-schema assert): a fresh,
+        idempotent ALTER migration means prod DBs that already ran v1 add the
+        2 columns here without tripping the v1 assert. Mirrors the column-add
+        pattern of ``_migrate_liquidity_enrichment_v1``. Both columns nullable
+        with NO DEFAULT (absence-vs-empty semantics).
+
+        Anti-scope: NO change to the v1 snapshot table assert, NO backfill of
+        existing snapshot rows (the source value wasn't recorded at the time).
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "bl_entry_snapshot_liquidity_provenance_v1"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            expected_cols = {
+                "liquidity_source_at_entry": "TEXT",
+                "liquidity_confidence_at_entry": "TEXT",
+            }
+            cur_pragma = await conn.execute(
+                "PRAGMA table_info(paper_trade_entry_snapshots)"
+            )
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            for col, coltype in expected_cols.items():
+                if col in existing_cols:
+                    _log.info(
+                        "schema_migration_column_action",
+                        migration=migration_name,
+                        col=col,
+                        action="skip_exists",
+                    )
+                    continue
+                await conn.execute(
+                    f"ALTER TABLE paper_trade_entry_snapshots "
+                    f"ADD COLUMN {col} {coltype}"
+                )
+                _log.info(
+                    "schema_migration_column_action",
+                    migration=migration_name,
+                    col=col,
+                    action="added",
+                )
+            # Verify presence — fail loud on drift rather than at first INSERT.
+            cur_pragma = await conn.execute(
+                "PRAGMA table_info(paper_trade_entry_snapshots)"
+            )
+            post_cols = {row[1] for row in await cur_pragma.fetchall()}
+            missing = sorted(set(expected_cols) - post_cols)
+            if missing:
+                raise RuntimeError(
+                    f"{migration_name} schema missing columns: " + ", ".join(missing)
+                )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260623, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "bl_entry_snapshot_liquidity_provenance_v1_migration_complete",
+                table="paper_trade_entry_snapshots",
+            )
+        except BaseException as e:
+            _log.exception(
+                "bl_entry_snapshot_liquidity_provenance_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                pass
             raise
 
     async def _migrate_actionability_entry_snapshot_v1(self) -> None:
