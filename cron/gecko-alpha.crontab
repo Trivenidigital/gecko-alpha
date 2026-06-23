@@ -19,4 +19,11 @@
 # confirm >=1 fresh paper_daily_summary row exists BEFORE activating, else the
 # first digest pages are for a known-broken-being-fixed writer. ***
 50 * * * * ALERT_CHANNEL_WATCHDOG_ENABLED=true /root/gecko-alpha/scripts/alert-channel-watchdog.sh >> /var/log/gecko-alpha-alert-channel-watchdog.log 2>&1
+# Liquidity enrichment (b2 Phase 1a-ii). Writer is a NO-OP unless
+# LIQUIDITY_ENRICHMENT_ENABLED=true in .env (killswitch). See
+# tasks/runbook_enable_liquidity_enrichment_2026_06_23.md for the enable
+# sequence — flip the .env flag and verify a manual run BEFORE deploying
+# this block, or the watchdog will (correctly) alert writer-heartbeat staleness.
+*/5 * * * * cd /root/gecko-alpha && .venv/bin/python scripts/backfill_dexscreener_liquidity.py --db /root/gecko-alpha/scout.db --heartbeat-file /var/lib/gecko-alpha/liquidity-enrichment/heartbeat >> /var/log/gecko-alpha-liquidity-enrichment-writer.log 2>&1
+*/10 * * * * cd /root/gecko-alpha && .venv/bin/python scripts/check_liquidity_enrichment_lag.py --db /root/gecko-alpha/scout.db --writer-heartbeat-file /var/lib/gecko-alpha/liquidity-enrichment/heartbeat >> /var/log/gecko-alpha-liquidity-enrichment-watchdog.log 2>&1
 # === END gecko-alpha managed block ===
