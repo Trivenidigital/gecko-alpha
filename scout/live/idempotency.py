@@ -79,6 +79,7 @@ async def record_pending_order(
     signal_type: str,
     size_usd: str,
     mid_at_entry: str | None = None,
+    entry_order_id: str | None = None,
 ) -> int:
     """Insert a `live_trades` row in 'open' status before venue submit.
 
@@ -86,6 +87,13 @@ async def record_pending_order(
     at the DB layer — concurrent retries that race past the application-
     level dedup query will still fail with IntegrityError on the
     constraint.
+
+    ``entry_order_id`` may be supplied up-front by the on-chain (Solana)
+    path: the tx signature is known pre-broadcast (deterministic from the
+    SIGNED transaction), so persisting it BEFORE the network send makes a
+    post-broadcast crash recoverable — boot reconciliation re-checks any
+    open row carrying a signature against the chain. The CEX path leaves it
+    None (the venue order id is only known after the place call returns).
 
     Returns the inserted live_trades.id.
     """
@@ -97,8 +105,9 @@ async def record_pending_order(
     cur = await db._conn.execute(
         """INSERT INTO live_trades
            (paper_trade_id, coin_id, symbol, venue, pair, signal_type,
-            size_usd, mid_at_entry, status, client_order_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+            size_usd, mid_at_entry, entry_order_id, status, client_order_id,
+            created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
         (
             paper_trade_id,
             coin_id,
@@ -108,6 +117,7 @@ async def record_pending_order(
             signal_type,
             size_usd,
             mid_at_entry,
+            entry_order_id,
             client_order_id,
             now_iso,
         ),
