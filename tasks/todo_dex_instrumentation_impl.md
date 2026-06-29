@@ -39,7 +39,7 @@ is green. TDD red-green is observed via CI per pushed increment.
 - [x] **C4 — I3 writer + GT parse.** DONE — `log_txns_snapshot` + GT h1 parse, 5 tests green locally (GT ingestion test = CI). `txns_h1_buys_snapshots` raw per-cycle capture + `source`; add GT
   `transactions.h1.buys/sellers` to `from_geckoterminal` (models.py:171); no-source → no row. Wire in
   the volume-snapshot loop (main.py:1093). Tests: raw capture + source, GT parse, no-row-when-missing.
-- [ ] **C5 — metrics.** `dex_resolution_health` + `dex_measurable_cohort_size` query methods + rollup
+- [x] **C5 — metrics.** DONE — `compute_dex_coverage_metrics`, 3 tests green locally. `dex_resolution_health` + `dex_measurable_cohort_size` query methods + rollup
   emit. Tests: health excludes never-listed; cohort-size counts fully-joinable only.
 - [ ] **C6 — watchdogs.** Freshness (Tier-1) + data-quality (Tier-2: resolution-rate, non-zero mcap,
   non-null txns, coverage-trend, fresh-but-empty) in hourly maintenance (main.py:1357); add optional

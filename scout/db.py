@@ -362,6 +362,52 @@ class Database:
         )
         await self._conn.commit()
 
+    async def compute_dex_coverage_metrics(self) -> dict:
+        """C5: substrate-health + analysis-readiness coverage metrics (B1/B2).
+
+        Computed over CG-listed DEX tokens only (never-listing fizzles are
+        invisible — see the survivorship caveat in the spec):
+
+          listed_dex                 = DEX contracts (classifier) with a resolved coin_id
+          covered                    = listed_dex with an entry-mcap row AND >=1
+                                       coin_id-keyed outcome-surface match
+          dex_resolution_health      = covered / listed_dex   (0.0 if none listed)
+          dex_measurable_cohort_size = covered
+
+        Observe-only; reads existing tables, writes nothing.
+        """
+        from scout.instrumentation.classify import is_dex
+
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cur = await self._conn.execute(
+            "SELECT m.contract_address AS contract_address, "
+            "(SELECT 1 FROM entry_mcap_snapshots e "
+            " WHERE e.contract_address = m.contract_address LIMIT 1) AS has_entry, "
+            "(CASE WHEN m.coin_id IN ("
+            "   SELECT coin_id FROM gainers_snapshots "
+            "   UNION SELECT coin_id FROM momentum_7d "
+            "   UNION SELECT coin_id FROM conviction_watchlist_snapshots"
+            " ) THEN 1 ELSE 0 END) AS has_outcome "
+            "FROM contract_coin_map m WHERE m.coin_id IS NOT NULL"
+        )
+        rows = await cur.fetchall()
+        listed = 0
+        covered = 0
+        for r in rows:
+            if not is_dex(r["contract_address"]):
+                continue
+            listed += 1
+            if r["has_entry"] and r["has_outcome"]:
+                covered += 1
+        health = (covered / listed) if listed else 0.0
+        return {
+            "listed_dex": listed,
+            "covered": covered,
+            "dex_resolution_health": health,
+            "dex_measurable_cohort_size": covered,
+        }
+
     async def _migrate_predictions_coin_predicted_id_idx_v1(self) -> None:
         """Index latest-prediction lookups used by Trade Inbox context."""
         if self._conn is None:
