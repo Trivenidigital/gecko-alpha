@@ -408,6 +408,58 @@ class Database:
             "dex_measurable_cohort_size": covered,
         }
 
+    async def record_contract_coin_map(
+        self,
+        contract_address: str,
+        chain: str,
+        coin_id: str | None,
+        source: str,
+        confidence: str | None,
+    ) -> None:
+        """I1: upsert a contract<->coin_id mapping (observe-only).
+
+        ``coin_id`` may be NULL to mark a resolution as *attempted* (negative
+        result), which the resolver's TTL uses to avoid re-hammering the API.
+        A later positive resolution upserts over it. Never feeds scorer/gate.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            "INSERT INTO contract_coin_map "
+            "(contract_address, chain, coin_id, resolved_at, source, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(contract_address, chain) DO UPDATE SET "
+            "coin_id = excluded.coin_id, resolved_at = excluded.resolved_at, "
+            "source = excluded.source, confidence = excluded.confidence",
+            (contract_address, chain, coin_id, now, source, confidence),
+        )
+        await self._conn.commit()
+
+    async def contract_coin_map_has(self, contract_address: str) -> bool:
+        """True if any resolution row (incl. attempted/NULL) exists — TTL guard."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cur = await self._conn.execute(
+            "SELECT 1 FROM contract_coin_map WHERE contract_address = ? LIMIT 1",
+            (contract_address,),
+        )
+        return (await cur.fetchone()) is not None
+
+    async def coin_id_resolved(self, coin_id: str) -> bool:
+        """True if a coin_id already has >=1 resolved (non-NULL) mapping.
+
+        Lets the resolver skip re-resolving the same coin_id, honoring the
+        per-cycle call budget across cycles.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cur = await self._conn.execute(
+            "SELECT 1 FROM contract_coin_map WHERE coin_id = ? LIMIT 1",
+            (coin_id,),
+        )
+        return (await cur.fetchone()) is not None
+
     async def _migrate_predictions_coin_predicted_id_idx_v1(self) -> None:
         """Index latest-prediction lookups used by Trade Inbox context."""
         if self._conn is None:
