@@ -408,6 +408,46 @@ class Database:
             "dex_measurable_cohort_size": covered,
         }
 
+    async def dex_quality_stats(self) -> dict:
+        """C6: data-quality rates for the instrumentation tables (observe-only).
+
+        Rates are ``None`` when their table is empty (no data yet -> no alarm).
+        A non-None rate that is near zero while the table has rows is the
+        fresh-but-empty silent-failure signature the watchdog escalates.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        conn = self._conn
+        cur = await conn.execute(
+            "SELECT count(*), "
+            "SUM(CASE WHEN mcap_usd_at_entry > 0 THEN 1 ELSE 0 END) "
+            "FROM entry_mcap_snapshots"
+        )
+        e_total, e_finalized = await cur.fetchone()
+        e_total = e_total or 0
+        cur = await conn.execute(
+            "SELECT count(*), "
+            "SUM(CASE WHEN txns_h1_buys IS NOT NULL THEN 1 ELSE 0 END) "
+            "FROM txns_h1_buys_snapshots"
+        )
+        t_total, t_nonnull = await cur.fetchone()
+        t_total = t_total or 0
+        cur = await conn.execute(
+            "SELECT count(*), "
+            "SUM(CASE WHEN coin_id IS NOT NULL THEN 1 ELSE 0 END) "
+            "FROM contract_coin_map"
+        )
+        m_total, m_resolved = await cur.fetchone()
+        m_total = m_total or 0
+        return {
+            "entry_total": e_total,
+            "entry_nonzero_rate": ((e_finalized or 0) / e_total) if e_total else None,
+            "txns_total": t_total,
+            "txns_nonnull_rate": ((t_nonnull or 0) / t_total) if t_total else None,
+            "map_total": m_total,
+            "map_resolved": m_resolved or 0,
+        }
+
     async def record_contract_coin_map(
         self,
         contract_address: str,

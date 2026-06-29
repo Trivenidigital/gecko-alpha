@@ -84,3 +84,24 @@ async def test_empty_db_is_zero_not_crash(db):
     assert m["listed_dex"] == 0
     assert m["dex_resolution_health"] == 0.0
     assert m["dex_measurable_cohort_size"] == 0
+
+
+async def test_dex_quality_stats_empty_rates_are_none(db):
+    s = await db.dex_quality_stats()
+    assert s["entry_total"] == 0
+    assert s["entry_nonzero_rate"] is None
+    assert s["txns_nonnull_rate"] is None
+
+
+async def test_dex_quality_stats_rates(db):
+    # entry: one finalized (>0), one held-open (placeholder/0)
+    await db.record_entry_mcap(SOL, "solana", "2026-06-24T00:00:00+00:00", 1000.0, 1.0, 1.0)
+    await db.record_entry_mcap(SOL2, "solana", "2026-06-24T00:00:00+00:00", 0.0, 0.0, 1.0)
+    # txns: one with buys present, one with buys NULL (only sells)
+    await db.log_txns_snapshot(SOL, 100, 20, "dexscreener")
+    await db.log_txns_snapshot(SOL, None, 5, "geckoterminal")
+    s = await db.dex_quality_stats()
+    assert s["entry_total"] == 2
+    assert s["entry_nonzero_rate"] == 0.5
+    assert s["txns_total"] == 2
+    assert s["txns_nonnull_rate"] == 0.5
