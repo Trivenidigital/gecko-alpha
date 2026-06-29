@@ -24,7 +24,7 @@ is green. TDD red-green is observed via CI per pushed increment.
 
 ## Components (TDD-ordered; each = test-first → implement → CI-green → commit)
 
-- [ ] **C1 — schema + classifier.** Add 3 tables to `_create_tables` (db.py:532) AND
+- [x] **C1 — schema + classifier.** DONE — 12 tests green locally (9e53f666). Add 3 tables to `_create_tables` (db.py:532) AND
   `_migrate_dex_instrumentation_v1` (BEGIN EXCLUSIVE template db.py:3510; schema_version row;
   post-commit assert); register in `initialize()` (db.py:81). Pure `classify_contract()` helper
   (CG-slug / evm / solana) in a no-aiohttp module so it unit-tests cleanly.
@@ -33,10 +33,10 @@ is green. TDD red-green is observed via CI per pushed increment.
   (minara_alert.py:185) → upsert `contract_coin_map`; ≤N/cycle budget (Settings); negative-result TTL;
   backfill seed from CG-native candidates. Tests (aioresponses): platforms parse, budget cap,
   best-effort never raises, backfill source tag.
-- [ ] **C3 — I2 writer.** `entry_mcap_snapshots` write-once earliest, DEX-mcap-preferred, hold-open on
+- [x] **C3 — I2 writer.** DONE — `record_entry_mcap`, 5 tests green locally. `entry_mcap_snapshots` write-once earliest, DEX-mcap-preferred, hold-open on
   zero/placeholder; excluded from prune. Wire after `log_score` (main.py:1159). Tests: earliest wins,
   zero held open then filled, DEX preferred over CG-0, survives prune.
-- [ ] **C4 — I3 writer + GT parse.** `txns_h1_buys_snapshots` raw per-cycle capture + `source`; add GT
+- [x] **C4 — I3 writer + GT parse.** DONE — `log_txns_snapshot` + GT h1 parse, 5 tests green locally (GT ingestion test = CI). `txns_h1_buys_snapshots` raw per-cycle capture + `source`; add GT
   `transactions.h1.buys/sellers` to `from_geckoterminal` (models.py:171); no-source → no row. Wire in
   the volume-snapshot loop (main.py:1093). Tests: raw capture + source, GT parse, no-row-when-missing.
 - [ ] **C5 — metrics.** `dex_resolution_health` + `dex_measurable_cohort_size` query methods + rollup

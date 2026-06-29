@@ -195,6 +195,17 @@ class CandidateToken(BaseModel):
 
         volume_data = attrs.get("volume_usd", {})
 
+        # I3 proxy: GeckoTerminal h1 transaction counts (parallel to DexScreener
+        # txns.h1.buys/sells). Captured for the buy-pressure proxy; not scored.
+        gt_txns = attrs.get("transactions", {})
+        gt_h1 = gt_txns.get("h1", {}) if isinstance(gt_txns, dict) else {}
+        txns_h1_buys = (
+            int(gt_h1["buys"]) if gt_h1.get("buys") is not None else None
+        )
+        txns_h1_sells = (
+            int(gt_h1["sells"]) if gt_h1.get("sells") is not None else None
+        )
+
         return cls(
             contract_address=contract_address,
             chain=chain,
@@ -208,6 +219,8 @@ class CandidateToken(BaseModel):
                 else 0
             ),
             token_age_days=token_age_days,
+            txns_h1_buys=txns_h1_buys,
+            txns_h1_sells=txns_h1_sells,
             holder_count=0,
             holder_growth_1h=0,
         )

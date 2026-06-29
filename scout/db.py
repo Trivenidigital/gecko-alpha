@@ -261,6 +261,107 @@ class Database:
                 "dex_instrumentation_v1 schema_version row missing after migration"
             )
 
+    async def record_entry_mcap(
+        self,
+        contract_address: str,
+        chain: str,
+        first_seen_at: str,
+        mcap_usd: float | None,
+        liquidity_usd: float | None,
+        token_age_days: float | None,
+    ) -> None:
+        """I2: persist the earliest DEX-side entry mcap (observe-only).
+
+        Write-once: a row is *finalized* (``captured_at`` set) only when a
+        positive mcap is observed — DEX-mcap is preferred over CG-side zero
+        placeholders, so a zero/placeholder first sighting only holds the slot
+        open until a non-zero mcap arrives. CG-native slugs are skipped (they
+        have no DEX-stage entry). Never pruned. Does not feed the scorer/gate.
+        """
+        from scout.instrumentation.classify import is_dex
+
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not is_dex(contract_address):
+            return
+        conn = self._conn
+        cur = await conn.execute(
+            "SELECT captured_at FROM entry_mcap_snapshots WHERE contract_address = ?",
+            (contract_address,),
+        )
+        existing = await cur.fetchone()
+        if existing is not None and existing[0] is not None:
+            return  # already finalized -> write-once
+
+        earliest_merge = (
+            "first_seen_at = CASE "
+            "WHEN datetime(excluded.first_seen_at) "
+            "< datetime(entry_mcap_snapshots.first_seen_at) "
+            "THEN excluded.first_seen_at "
+            "ELSE entry_mcap_snapshots.first_seen_at END"
+        )
+        if mcap_usd and mcap_usd > 0:
+            now = datetime.now(timezone.utc).isoformat()
+            await conn.execute(
+                "INSERT INTO entry_mcap_snapshots "
+                "(contract_address, chain, first_seen_at, mcap_usd_at_entry, "
+                "liquidity_usd_at_entry, token_age_days_at_entry, captured_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(contract_address) DO UPDATE SET "
+                f"{earliest_merge}, "
+                "mcap_usd_at_entry = excluded.mcap_usd_at_entry, "
+                "liquidity_usd_at_entry = excluded.liquidity_usd_at_entry, "
+                "token_age_days_at_entry = excluded.token_age_days_at_entry, "
+                "captured_at = excluded.captured_at",
+                (
+                    contract_address,
+                    chain,
+                    first_seen_at,
+                    mcap_usd,
+                    liquidity_usd,
+                    token_age_days,
+                    now,
+                ),
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO entry_mcap_snapshots "
+                "(contract_address, chain, first_seen_at, mcap_usd_at_entry, "
+                "liquidity_usd_at_entry, token_age_days_at_entry, captured_at) "
+                "VALUES (?, ?, ?, NULL, NULL, NULL, NULL) "
+                "ON CONFLICT(contract_address) DO UPDATE SET "
+                f"{earliest_merge}",
+                (contract_address, chain, first_seen_at),
+            )
+        await conn.commit()
+
+    async def log_txns_snapshot(
+        self,
+        contract_address: str,
+        txns_h1_buys: int | None,
+        txns_h1_sells: int | None,
+        source: str,
+    ) -> None:
+        """I3: append a raw buy/sell-count snapshot (observe-only).
+
+        Stores absolute values + source + timestamp; deltas are computed in
+        analysis, never here. If neither count is available (no source provided
+        the data), no row is written — so the gap is visible to the non-null
+        watchdog instead of being masked by a zero. Captured-not-scored.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if txns_h1_buys is None and txns_h1_sells is None:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            "INSERT INTO txns_h1_buys_snapshots "
+            "(contract_address, txns_h1_buys, txns_h1_sells, source, scanned_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (contract_address, txns_h1_buys, txns_h1_sells, source, now),
+        )
+        await self._conn.commit()
+
     async def _migrate_predictions_coin_predicted_id_idx_v1(self) -> None:
         """Index latest-prediction lookups used by Trade Inbox context."""
         if self._conn is None:
