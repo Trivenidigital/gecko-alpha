@@ -151,6 +151,8 @@ class Database:
         # dashboard read path can distinguish "never written" from "written
         # but resolved to no-match".
         await self._migrate_liquidity_enrichment_v1()
+        # DEX-outcome instrumentation substrate (observe-only; I1/I2/I3).
+        await self._migrate_dex_instrumentation_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -161,6 +163,397 @@ class Database:
         if self._conn:
             await self._conn.close()
             self._conn = None
+
+    async def _migrate_dex_instrumentation_v1(self) -> None:
+        """Migration dex_instrumentation_v1, schema_version 20260629.
+
+        Observe-only substrate for measuring DEX-stage outcomes (I1/I2/I3). None
+        of these tables feed the scorer or gate; they capture linkage, entry mcap,
+        and a raw buy/sell proxy so the under-gate cohort can be re-measured.
+        See tasks/spec_dex_outcome_instrumentation_i1_i2_i3_2026_06_28.md.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )
+            """)
+            # I1 — durable contract<->coin_id linkage (retroactive; B1).
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS contract_coin_map (
+                    contract_address TEXT NOT NULL,
+                    chain            TEXT NOT NULL,
+                    coin_id          TEXT,
+                    resolved_at      TEXT NOT NULL,
+                    source           TEXT NOT NULL,
+                    confidence       TEXT,
+                    address_type     TEXT,
+                    PRIMARY KEY (contract_address, chain)
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_contract_coin_map_coin "
+                "ON contract_coin_map(coin_id)"
+            )
+            # I2 — non-pruned earliest DEX-side entry mcap (write-once).
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS entry_mcap_snapshots (
+                    contract_address        TEXT PRIMARY KEY,
+                    chain                   TEXT NOT NULL,
+                    first_seen_at           TEXT NOT NULL,
+                    mcap_usd_at_entry       REAL,
+                    liquidity_usd_at_entry  REAL,
+                    token_age_days_at_entry REAL,
+                    captured_at             TEXT
+                )
+            """)
+            # I3 — raw buy/sell proxy snapshots (captured-not-scored; B4).
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS txns_h1_buys_snapshots (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_address TEXT NOT NULL,
+                    txns_h1_buys     INTEGER,
+                    txns_h1_sells    INTEGER,
+                    source           TEXT NOT NULL,
+                    scanned_at       TEXT NOT NULL
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_txns_h1_buys_contract_scanned "
+                "ON txns_h1_buys_snapshots(contract_address, scanned_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260629, now_iso, "dex_instrumentation_v1"),
+            )
+            await conn.commit()
+        except Exception:
+            _log.exception(
+                "schema_migration_failed", migration="dex_instrumentation_v1"
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                _log.exception(
+                    "schema_migration_rollback_failed",
+                    migration="dex_instrumentation_v1",
+                )
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="dex_instrumentation_v1")
+            raise
+
+        cur = await conn.execute(
+            "SELECT description FROM schema_version WHERE version = ?", (20260629,)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "dex_instrumentation_v1 schema_version row missing after migration"
+            )
+
+    async def record_entry_mcap(
+        self,
+        contract_address: str,
+        chain: str,
+        first_seen_at: str,
+        mcap_usd: float | None,
+        liquidity_usd: float | None,
+        token_age_days: float | None,
+    ) -> None:
+        """I2: persist the earliest DEX-side entry mcap (observe-only).
+
+        Write-once: a row is *finalized* (``captured_at`` set) only when a
+        positive mcap is observed — DEX-mcap is preferred over CG-side zero
+        placeholders, so a zero/placeholder first sighting only holds the slot
+        open until a non-zero mcap arrives. CG-native slugs are skipped (they
+        have no DEX-stage entry). Never pruned. Does not feed the scorer/gate.
+        """
+        from scout.instrumentation.classify import is_dex
+
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if not is_dex(contract_address):
+            return
+        conn = self._conn
+        cur = await conn.execute(
+            "SELECT captured_at FROM entry_mcap_snapshots WHERE contract_address = ?",
+            (contract_address,),
+        )
+        existing = await cur.fetchone()
+        if existing is not None and existing[0] is not None:
+            return  # already finalized -> write-once
+
+        earliest_merge = (
+            "first_seen_at = CASE "
+            "WHEN datetime(excluded.first_seen_at) "
+            "< datetime(entry_mcap_snapshots.first_seen_at) "
+            "THEN excluded.first_seen_at "
+            "ELSE entry_mcap_snapshots.first_seen_at END"
+        )
+        if mcap_usd and mcap_usd > 0:
+            now = datetime.now(timezone.utc).isoformat()
+            await conn.execute(
+                "INSERT INTO entry_mcap_snapshots "
+                "(contract_address, chain, first_seen_at, mcap_usd_at_entry, "
+                "liquidity_usd_at_entry, token_age_days_at_entry, captured_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(contract_address) DO UPDATE SET "
+                f"{earliest_merge}, "
+                "mcap_usd_at_entry = excluded.mcap_usd_at_entry, "
+                "liquidity_usd_at_entry = excluded.liquidity_usd_at_entry, "
+                "token_age_days_at_entry = excluded.token_age_days_at_entry, "
+                "captured_at = excluded.captured_at",
+                (
+                    contract_address,
+                    chain,
+                    first_seen_at,
+                    mcap_usd,
+                    liquidity_usd,
+                    token_age_days,
+                    now,
+                ),
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO entry_mcap_snapshots "
+                "(contract_address, chain, first_seen_at, mcap_usd_at_entry, "
+                "liquidity_usd_at_entry, token_age_days_at_entry, captured_at) "
+                "VALUES (?, ?, ?, NULL, NULL, NULL, NULL) "
+                "ON CONFLICT(contract_address) DO UPDATE SET "
+                f"{earliest_merge}",
+                (contract_address, chain, first_seen_at),
+            )
+        await conn.commit()
+
+    async def log_txns_snapshot(
+        self,
+        contract_address: str,
+        txns_h1_buys: int | None,
+        txns_h1_sells: int | None,
+        source: str,
+    ) -> None:
+        """I3: append a raw buy/sell-count snapshot (observe-only).
+
+        Stores absolute values + source + timestamp; deltas are computed in
+        analysis, never here. If neither count is available (no source provided
+        the data), no row is written — so the gap is visible to the non-null
+        watchdog instead of being masked by a zero. Captured-not-scored.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        if txns_h1_buys is None and txns_h1_sells is None:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            "INSERT INTO txns_h1_buys_snapshots "
+            "(contract_address, txns_h1_buys, txns_h1_sells, source, scanned_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (contract_address, txns_h1_buys, txns_h1_sells, source, now),
+        )
+        await self._conn.commit()
+
+    async def prune_txns_snapshots(self, *, keep_days: int) -> int:
+        """Prune raw proxy snapshots older than keep_days. Returns rows deleted."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=keep_days)
+        ).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM txns_h1_buys_snapshots WHERE scanned_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def compute_dex_coverage_metrics(self) -> dict:
+        """C5: substrate-health + analysis-readiness coverage metrics (B1/B2).
+
+        Computed over CG-listed DEX tokens only (never-listing fizzles are
+        invisible — see the survivorship caveat in the spec):
+
+          listed_dex                 = DEX contracts (classifier) with a resolved coin_id
+          covered                    = listed_dex with an entry-mcap row AND >=1
+                                       coin_id-keyed outcome-surface match
+          dex_resolution_health      = covered / listed_dex   (0.0 if none listed)
+          dex_measurable_cohort_size = covered
+
+        Observe-only; reads existing tables, writes nothing.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        # Filter on the PERSISTED address_type column (B2) — not query-time
+        # inference and not the pruned candidates.chain.
+        cur = await self._conn.execute(
+            "SELECT "
+            "(SELECT 1 FROM entry_mcap_snapshots e "
+            " WHERE e.contract_address = m.contract_address LIMIT 1) AS has_entry, "
+            "(CASE WHEN m.coin_id IN ("
+            "   SELECT coin_id FROM gainers_snapshots "
+            "   UNION SELECT coin_id FROM momentum_7d "
+            "   UNION SELECT coin_id FROM conviction_watchlist_snapshots"
+            " ) THEN 1 ELSE 0 END) AS has_outcome "
+            "FROM contract_coin_map m "
+            "WHERE m.coin_id IS NOT NULL AND m.address_type IN ('evm', 'solana')"
+        )
+        rows = await cur.fetchall()
+        listed = len(rows)
+        covered = sum(1 for r in rows if r["has_entry"] and r["has_outcome"])
+        health = (covered / listed) if listed else 0.0
+        return {
+            "listed_dex": listed,
+            "covered": covered,
+            "dex_resolution_health": health,
+            "dex_measurable_cohort_size": covered,
+        }
+
+    async def dex_quality_stats(self) -> dict:
+        """C6: data-quality rates for the instrumentation tables (observe-only).
+
+        Rates are ``None`` when their table is empty (no data yet -> no alarm).
+        A non-None rate that is near zero while the table has rows is the
+        fresh-but-empty silent-failure signature the watchdog escalates.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        conn = self._conn
+        cur = await conn.execute(
+            "SELECT count(*), "
+            "SUM(CASE WHEN mcap_usd_at_entry > 0 THEN 1 ELSE 0 END) "
+            "FROM entry_mcap_snapshots"
+        )
+        e_total, e_finalized = await cur.fetchone()
+        e_total = e_total or 0
+        cur = await conn.execute(
+            "SELECT count(*), "
+            "SUM(CASE WHEN txns_h1_buys IS NOT NULL THEN 1 ELSE 0 END) "
+            "FROM txns_h1_buys_snapshots"
+        )
+        t_total, t_nonnull = await cur.fetchone()
+        t_total = t_total or 0
+        cur = await conn.execute(
+            "SELECT count(*), "
+            "SUM(CASE WHEN coin_id IS NOT NULL THEN 1 ELSE 0 END) "
+            "FROM contract_coin_map"
+        )
+        m_total, m_resolved = await cur.fetchone()
+        m_total = m_total or 0
+        return {
+            "entry_total": e_total,
+            "entry_nonzero_rate": ((e_finalized or 0) / e_total) if e_total else None,
+            "txns_total": t_total,
+            "txns_nonnull_rate": ((t_nonnull or 0) / t_total) if t_total else None,
+            "map_total": m_total,
+            "map_resolved": m_resolved or 0,
+        }
+
+    async def record_contract_coin_map(
+        self,
+        contract_address: str,
+        chain: str,
+        coin_id: str | None,
+        source: str,
+        confidence: str | None,
+    ) -> None:
+        """I1: upsert a contract<->coin_id mapping (observe-only).
+
+        ``coin_id`` may be NULL to mark a resolution as *attempted* (negative
+        result), which the resolver's TTL uses to avoid re-hammering the API.
+        A later positive resolution upserts over it. Never feeds scorer/gate.
+        """
+        from scout.instrumentation.classify import classify_contract
+
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        now = datetime.now(timezone.utc).isoformat()
+        # Persist the DEX-vs-CG classification at write time (B2) so metrics
+        # filter on a durable column, not query-time inference or the pruned
+        # candidates.chain.
+        address_type = classify_contract(contract_address)
+        await self._conn.execute(
+            "INSERT INTO contract_coin_map "
+            "(contract_address, chain, coin_id, resolved_at, source, confidence, "
+            "address_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(contract_address, chain) DO UPDATE SET "
+            "coin_id = excluded.coin_id, resolved_at = excluded.resolved_at, "
+            "source = excluded.source, confidence = excluded.confidence, "
+            "address_type = excluded.address_type",
+            (contract_address, chain, coin_id, now, source, confidence, address_type),
+        )
+        await self._conn.commit()
+
+    async def contract_coin_map_has(self, contract_address: str) -> bool:
+        """True if any resolution row (incl. attempted/NULL) exists — TTL guard."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cur = await self._conn.execute(
+            "SELECT 1 FROM contract_coin_map WHERE contract_address = ? LIMIT 1",
+            (contract_address,),
+        )
+        return (await cur.fetchone()) is not None
+
+    async def coin_id_resolved(self, coin_id: str) -> bool:
+        """True if a coin_id already has >=1 resolved (non-NULL) mapping.
+
+        Lets the resolver skip re-resolving the same coin_id, honoring the
+        per-cycle call budget across cycles.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cur = await self._conn.execute(
+            "SELECT 1 FROM contract_coin_map WHERE coin_id = ? LIMIT 1",
+            (coin_id,),
+        )
+        return (await cur.fetchone()) is not None
+
+    async def record_resolver_attempt(self, coin_id: str) -> None:
+        """Record a failed/unknown resolution attempt (negative-result TTL marker).
+
+        Lets the resolver skip a coin_id that just failed (404/429/parse) for a
+        TTL window instead of re-spending budget on it every cycle, while still
+        retrying after the TTL (handles transient failures). Stored as a sentinel
+        row (coin_id NULL, address_type 'attempt') so it is excluded from metrics.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            "INSERT INTO contract_coin_map "
+            "(contract_address, chain, coin_id, resolved_at, source, confidence, "
+            "address_type) "
+            "VALUES (?, '__attempt__', NULL, ?, 'attempted', NULL, 'attempt') "
+            "ON CONFLICT(contract_address, chain) DO UPDATE SET "
+            "resolved_at = excluded.resolved_at",
+            (f"__attempt__:{coin_id}", now),
+        )
+        await self._conn.commit()
+
+    async def coin_id_attempt_fresh(self, coin_id: str, ttl_seconds: int) -> bool:
+        """True if coin_id had a failed attempt within ttl_seconds (TTL guard)."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds)
+        ).isoformat()
+        cur = await self._conn.execute(
+            "SELECT 1 FROM contract_coin_map "
+            "WHERE contract_address = ? AND chain = '__attempt__' "
+            "AND resolved_at > ? LIMIT 1",
+            (f"__attempt__:{coin_id}", cutoff),
+        )
+        return (await cur.fetchone()) is not None
 
     async def _migrate_predictions_coin_predicted_id_idx_v1(self) -> None:
         """Index latest-prediction lookups used by Trade Inbox context."""

@@ -145,6 +145,7 @@ async def send_telegram_message(
     parse_mode: str | None = "Markdown",
     raise_on_failure: bool = False,
     source: str = "unattributed",
+    chat_id: str | None = None,
 ) -> None:
     """Send a Telegram message.
 
@@ -161,14 +162,18 @@ async def send_telegram_message(
     top-K analysis.
     """
     text = _truncate(text)
+    # chat_id override (default None -> main TELEGRAM_CHAT_ID, unchanged for all
+    # existing callers). Used only to route system-health/watchdog alerts to a
+    # separate operator/health channel; never trading alerts.
+    target_chat = chat_id or settings.TELEGRAM_CHAT_ID
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
     payload: dict = {
-        "chat_id": settings.TELEGRAM_CHAT_ID,
+        "chat_id": target_chat,
         "text": text,
     }
     if parse_mode is not None:
         payload["parse_mode"] = parse_mode
-    chat = str(settings.TELEGRAM_CHAT_ID)
+    chat = str(target_chat)
 
     # P1 #2: pre-send pacing gate — if Telegram recently 429'd this chat, wait
     # (bounded by TG_PACING_MAX_WAIT_SECONDS) before re-hitting it.
