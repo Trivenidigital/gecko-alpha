@@ -151,6 +151,8 @@ class Database:
         # dashboard read path can distinguish "never written" from "written
         # but resolved to no-match".
         await self._migrate_liquidity_enrichment_v1()
+        # DEX-outcome instrumentation substrate (observe-only; I1/I2/I3).
+        await self._migrate_dex_instrumentation_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -161,6 +163,103 @@ class Database:
         if self._conn:
             await self._conn.close()
             self._conn = None
+
+    async def _migrate_dex_instrumentation_v1(self) -> None:
+        """Migration dex_instrumentation_v1, schema_version 20260629.
+
+        Observe-only substrate for measuring DEX-stage outcomes (I1/I2/I3). None
+        of these tables feed the scorer or gate; they capture linkage, entry mcap,
+        and a raw buy/sell proxy so the under-gate cohort can be re-measured.
+        See tasks/spec_dex_outcome_instrumentation_i1_i2_i3_2026_06_28.md.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )
+            """)
+            # I1 — durable contract<->coin_id linkage (retroactive; B1).
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS contract_coin_map (
+                    contract_address TEXT NOT NULL,
+                    chain            TEXT NOT NULL,
+                    coin_id          TEXT,
+                    resolved_at      TEXT NOT NULL,
+                    source           TEXT NOT NULL,
+                    confidence       TEXT,
+                    PRIMARY KEY (contract_address, chain)
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_contract_coin_map_coin "
+                "ON contract_coin_map(coin_id)"
+            )
+            # I2 — non-pruned earliest DEX-side entry mcap (write-once).
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS entry_mcap_snapshots (
+                    contract_address        TEXT PRIMARY KEY,
+                    chain                   TEXT NOT NULL,
+                    first_seen_at           TEXT NOT NULL,
+                    mcap_usd_at_entry       REAL,
+                    liquidity_usd_at_entry  REAL,
+                    token_age_days_at_entry REAL,
+                    captured_at             TEXT
+                )
+            """)
+            # I3 — raw buy/sell proxy snapshots (captured-not-scored; B4).
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS txns_h1_buys_snapshots (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_address TEXT NOT NULL,
+                    txns_h1_buys     INTEGER,
+                    txns_h1_sells    INTEGER,
+                    source           TEXT NOT NULL,
+                    scanned_at       TEXT NOT NULL
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_txns_h1_buys_contract_scanned "
+                "ON txns_h1_buys_snapshots(contract_address, scanned_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260629, now_iso, "dex_instrumentation_v1"),
+            )
+            await conn.commit()
+        except Exception:
+            _log.exception(
+                "schema_migration_failed", migration="dex_instrumentation_v1"
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                _log.exception(
+                    "schema_migration_rollback_failed",
+                    migration="dex_instrumentation_v1",
+                )
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="dex_instrumentation_v1")
+            raise
+
+        cur = await conn.execute(
+            "SELECT description FROM schema_version WHERE version = ?", (20260629,)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "dex_instrumentation_v1 schema_version row missing after migration"
+            )
 
     async def _migrate_predictions_coin_predicted_id_idx_v1(self) -> None:
         """Index latest-prediction lookups used by Trade Inbox context."""
