@@ -48,8 +48,14 @@ is green. TDD red-green is observed via CI per pushed increment.
 - [x] **C7 — settings + no-regression proof.** DONE — gated flag (default off), scorer-independence test green. New Settings (budget N, thresholds, retention, health
   chat). Guard test: scorer/gate output byte-identical pre/post for a fixture token; AST/grep guard
   that no new `send_telegram_message` callsite targets the trading path. Diff audit in PR body.
-- [ ] **Final** — CI green on full suite; open **draft** PR with the 9-point acceptance mapping;
-  collection-count guard (CI step) accounts for new tests.
+- [x] **Final** — CI GREEN on full suite (7m45s incl. test-count baseline guard); draft PR #385 open with the 9-point mapping.
 
-## Review section (filled at end)
-_(pending)_
+## Review section
+
+All 7 components shipped TDD-first across 6 commits on `feat/dex-outcome-instrumentation`.
+40 instrumentation tests green locally (pure/DB); aiohttp paths (resolver, watchdog routing,
+main.py wiring, GT ingestion) **CI-verified GREEN** on PR #385. `scorer.py`+`gate.py` untouched;
+all capture gated behind `DEX_INSTRUMENTATION_ENABLED` (default off) -> byte-identical deploy.
+Minor: CI surfaced 9 'Event loop is closed' asyncio-teardown annotations (warnings, not failures;
+same db-fixture pattern as existing tests). Next: operator review of #385, then enable the flag
+and soak 2-4 weeks watching dex_resolution_health + dex_measurable_cohort_size before recalibration.
