@@ -1,7 +1,7 @@
 # Runbook — DEX-outcome instrumentation enablement (observe-only)
 
 **Date:** 2026-06-29
-**Feature:** PRs #383/#384/#385 (merged to `master` @ `8fa1cb92`)
+**Feature:** PRs #383/#384/#385 (implementation merged to `master`; #386 runbook + #387 `LOOPS.md` are docs-only on top)
 **Status:** NOT DEPLOYED, NOT ENABLED. This is the operator runbook only — no live execution here.
 **Spec:** `spec_dex_outcome_instrumentation_i1_i2_i3_2026_06_28.md`
 
@@ -11,7 +11,10 @@ trading-alert behavior change · the `txns_h1_buys` proxy is **captured-not-scor
 evidence-backed PR.
 
 ## Targets / current state (probed read-only 2026-06-29)
-- Deploy target commit: **`8fa1cb92`** (master). srilu runtime currently `c1ac43fc` (lags master).
+- Deploy target: **the current operator-approved `master` HEAD** (the approved SHA at deploy time —
+  do not hardcode). Behavior baseline = the #385 implementation merge; every master commit since
+  (#386 runbook, #387 `LOOPS.md`) is **docs-only**, so runtime behavior is identical regardless of which
+  of those SHAs is current. srilu runtime lags master (was `c1ac43fc` at last probe).
 - VPS: `ssh srilu-vps` → `/root/gecko-alpha`. Units: `gecko-pipeline` (cycles/migrations/watchers),
   `gecko-dashboard` (:8000) — both `active`.
 - The 3 instrumentation tables do **not** exist yet (created by `_migrate_dex_instrumentation_v1` on
@@ -24,21 +27,25 @@ evidence-backed PR.
 
 ---
 
-## 1. Flag-OFF deploy verification (deploy `8fa1cb92`, flag stays False)
+## 1. Flag-OFF deploy verification (deploy current approved `master`, flag stays False)
 
 **Deploy (flag remains False — `.env` unchanged):**
 ```bash
 ssh srilu-vps
 cd /root/gecko-alpha
-git fetch origin && git checkout 8fa1cb92        # or: git pull origin master
+git fetch origin && git checkout master && git pull --ff-only origin master   # current approved master SHA
 find . -name __pycache__ -type d -prune -exec rm -rf {} +   # mandatory after Python pull
 sudo systemctl restart gecko-pipeline             # migration runs on startup
 ```
 
-**1a. Runtime commit = 8fa1cb92**
+**1a. Runtime commit = current approved master SHA**
 ```bash
-cd /root/gecko-alpha && git rev-parse HEAD        # expect 8fa1cb92...
+cd /root/gecko-alpha && git rev-parse HEAD        # must equal the operator-approved master SHA
+git rev-parse origin/master                        # sanity: same SHA
 ```
+The check is **"runtime commit equals the approved `master` SHA"**, not a hardcoded commit. Code
+behavior is identical to the #385 implementation merge; all later master commits (#386 runbook, #387
+`LOOPS.md`) are docs-only.
 
 **1b. Flag is False**
 ```bash
@@ -112,7 +119,8 @@ sudo systemctl is-active gecko-pipeline    # expect active
 sudo systemctl restart gecko-pipeline
 # capture stops immediately; existing rows are harmless/observe-only. No data is fed to scorer/gate.
 ```
-Code rollback (only if needed): `git checkout c1ac43fc` + restart. Tables persist (additive, never read
+Code rollback (only if needed): check out the last pre-feature `master` SHA (the commit before the #385
+implementation merge — `c1ac43fc` at time of writing) + restart. Tables persist (additive, never read
 by scorer/gate).
 
 **2e. Expected first-hour behavior (flag on)**
