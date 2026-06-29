@@ -27,13 +27,8 @@ async def db(tmp_path):
 
 
 async def _map(db, addr, chain, coin_id):
-    await db._conn.execute(
-        "INSERT INTO contract_coin_map "
-        "(contract_address, chain, coin_id, resolved_at, source, confidence) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (addr, chain, coin_id, "2026-06-29T00:00:00+00:00", "platforms", "high"),
-    )
-    await db._conn.commit()
+    # use the real writer so address_type is persisted (B2)
+    await db.record_contract_coin_map(addr, chain, coin_id, "platforms", "high")
 
 
 async def _gainer(db, coin_id):

@@ -198,6 +198,7 @@ class Database:
                     resolved_at      TEXT NOT NULL,
                     source           TEXT NOT NULL,
                     confidence       TEXT,
+                    address_type     TEXT,
                     PRIMARY KEY (contract_address, chain)
                 )
             """)
@@ -390,12 +391,12 @@ class Database:
 
         Observe-only; reads existing tables, writes nothing.
         """
-        from scout.instrumentation.classify import is_dex
-
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
+        # Filter on the PERSISTED address_type column (B2) — not query-time
+        # inference and not the pruned candidates.chain.
         cur = await self._conn.execute(
-            "SELECT m.contract_address AS contract_address, "
+            "SELECT "
             "(SELECT 1 FROM entry_mcap_snapshots e "
             " WHERE e.contract_address = m.contract_address LIMIT 1) AS has_entry, "
             "(CASE WHEN m.coin_id IN ("
@@ -403,17 +404,12 @@ class Database:
             "   UNION SELECT coin_id FROM momentum_7d "
             "   UNION SELECT coin_id FROM conviction_watchlist_snapshots"
             " ) THEN 1 ELSE 0 END) AS has_outcome "
-            "FROM contract_coin_map m WHERE m.coin_id IS NOT NULL"
+            "FROM contract_coin_map m "
+            "WHERE m.coin_id IS NOT NULL AND m.address_type IN ('evm', 'solana')"
         )
         rows = await cur.fetchall()
-        listed = 0
-        covered = 0
-        for r in rows:
-            if not is_dex(r["contract_address"]):
-                continue
-            listed += 1
-            if r["has_entry"] and r["has_outcome"]:
-                covered += 1
+        listed = len(rows)
+        covered = sum(1 for r in rows if r["has_entry"] and r["has_outcome"])
         health = (covered / listed) if listed else 0.0
         return {
             "listed_dex": listed,
@@ -476,17 +472,25 @@ class Database:
         result), which the resolver's TTL uses to avoid re-hammering the API.
         A later positive resolution upserts over it. Never feeds scorer/gate.
         """
+        from scout.instrumentation.classify import classify_contract
+
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         now = datetime.now(timezone.utc).isoformat()
+        # Persist the DEX-vs-CG classification at write time (B2) so metrics
+        # filter on a durable column, not query-time inference or the pruned
+        # candidates.chain.
+        address_type = classify_contract(contract_address)
         await self._conn.execute(
             "INSERT INTO contract_coin_map "
-            "(contract_address, chain, coin_id, resolved_at, source, confidence) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
+            "(contract_address, chain, coin_id, resolved_at, source, confidence, "
+            "address_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(contract_address, chain) DO UPDATE SET "
             "coin_id = excluded.coin_id, resolved_at = excluded.resolved_at, "
-            "source = excluded.source, confidence = excluded.confidence",
-            (contract_address, chain, coin_id, now, source, confidence),
+            "source = excluded.source, confidence = excluded.confidence, "
+            "address_type = excluded.address_type",
+            (contract_address, chain, coin_id, now, source, confidence, address_type),
         )
         await self._conn.commit()
 
@@ -511,6 +515,43 @@ class Database:
         cur = await self._conn.execute(
             "SELECT 1 FROM contract_coin_map WHERE coin_id = ? LIMIT 1",
             (coin_id,),
+        )
+        return (await cur.fetchone()) is not None
+
+    async def record_resolver_attempt(self, coin_id: str) -> None:
+        """Record a failed/unknown resolution attempt (negative-result TTL marker).
+
+        Lets the resolver skip a coin_id that just failed (404/429/parse) for a
+        TTL window instead of re-spending budget on it every cycle, while still
+        retrying after the TTL (handles transient failures). Stored as a sentinel
+        row (coin_id NULL, address_type 'attempt') so it is excluded from metrics.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            "INSERT INTO contract_coin_map "
+            "(contract_address, chain, coin_id, resolved_at, source, confidence, "
+            "address_type) "
+            "VALUES (?, '__attempt__', NULL, ?, 'attempted', NULL, 'attempt') "
+            "ON CONFLICT(contract_address, chain) DO UPDATE SET "
+            "resolved_at = excluded.resolved_at",
+            (f"__attempt__:{coin_id}", now),
+        )
+        await self._conn.commit()
+
+    async def coin_id_attempt_fresh(self, coin_id: str, ttl_seconds: int) -> bool:
+        """True if coin_id had a failed attempt within ttl_seconds (TTL guard)."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds)
+        ).isoformat()
+        cur = await self._conn.execute(
+            "SELECT 1 FROM contract_coin_map "
+            "WHERE contract_address = ? AND chain = '__attempt__' "
+            "AND resolved_at > ? LIMIT 1",
+            (f"__attempt__:{coin_id}", cutoff),
         )
         return (await cur.fetchone()) is not None
 

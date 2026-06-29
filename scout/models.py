@@ -35,9 +35,17 @@ class CandidateToken(BaseModel):
     holder_growth_1h: int = 0
     social_mentions_24h: int = 0
 
-    # DexScreener transaction fields
+    # DexScreener transaction fields (read by the scorer's buy_pressure signal).
     txns_h1_buys: int | None = None
     txns_h1_sells: int | None = None
+
+    # GeckoTerminal h1 transaction counts — INSTRUMENTATION ONLY. Kept separate
+    # from txns_h1_buys/sells precisely so the scorer's buy_pressure signal stays
+    # DexScreener-only and byte-identical (GT populating txns_h1_buys would let
+    # buy_pressure fire for GT tokens — a silent scoring change). Consumed only by
+    # the I3 proxy capture (observe-only); the scorer never reads these.
+    gt_txns_h1_buys: int | None = None
+    gt_txns_h1_sells: int | None = None
 
     # Quote-currency awareness (BL-NEW-QUOTE-PAIR).
     # quote_symbol: DexScreener `quoteToken.symbol` (e.g., "USDC", "WSOL").
@@ -195,14 +203,15 @@ class CandidateToken(BaseModel):
 
         volume_data = attrs.get("volume_usd", {})
 
-        # I3 proxy: GeckoTerminal h1 transaction counts (parallel to DexScreener
-        # txns.h1.buys/sells). Captured for the buy-pressure proxy; not scored.
+        # I3 proxy: GeckoTerminal h1 transaction counts -> INSTRUMENTATION-ONLY
+        # fields (gt_txns_*), never the scorer-read txns_h1_* fields, so
+        # buy_pressure stays DexScreener-only (byte-identical scoring).
         gt_txns = attrs.get("transactions", {})
         gt_h1 = gt_txns.get("h1", {}) if isinstance(gt_txns, dict) else {}
-        txns_h1_buys = (
+        gt_txns_h1_buys = (
             int(gt_h1["buys"]) if gt_h1.get("buys") is not None else None
         )
-        txns_h1_sells = (
+        gt_txns_h1_sells = (
             int(gt_h1["sells"]) if gt_h1.get("sells") is not None else None
         )
 
@@ -219,8 +228,8 @@ class CandidateToken(BaseModel):
                 else 0
             ),
             token_age_days=token_age_days,
-            txns_h1_buys=txns_h1_buys,
-            txns_h1_sells=txns_h1_sells,
+            gt_txns_h1_buys=gt_txns_h1_buys,
+            gt_txns_h1_sells=gt_txns_h1_sells,
             holder_count=0,
             holder_growth_1h=0,
         )

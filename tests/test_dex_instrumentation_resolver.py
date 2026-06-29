@@ -80,3 +80,20 @@ async def test_resolver_pass_skips_already_resolved(db, settings_factory):
         async with aiohttp.ClientSession() as s:
             result = await run_resolver_pass(["coin-one", "coin-two"], s, db, settings)
     assert result["attempted"] == 1  # coin-one skipped (already resolved)
+
+
+async def test_resolver_failure_records_attempt_and_ttl_skips_next_pass(db, settings_factory):
+    settings = settings_factory(
+        DEX_RESOLVER_BUDGET_PER_CYCLE=5, DEX_RESOLVER_NEGATIVE_TTL_SEC=3600
+    )
+    with aioresponses() as m:
+        m.get(_url("ghost-coin"), status=404)
+        async with aiohttp.ClientSession() as s:
+            r1 = await run_resolver_pass(["ghost-coin"], s, db, settings)
+    assert r1["failed"] == 1
+    assert await db.coin_id_attempt_fresh("ghost-coin", 3600) is True
+    # next pass: TTL skips it -> no budget consumed, no fetch needed
+    with aioresponses():
+        async with aiohttp.ClientSession() as s:
+            r2 = await run_resolver_pass(["ghost-coin"], s, db, settings)
+    assert r2["attempted"] == 0

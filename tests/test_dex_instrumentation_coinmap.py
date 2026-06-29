@@ -37,6 +37,21 @@ async def test_record_contract_coin_map_inserts(db):
     assert row["confidence"] == "high"
 
 
+async def test_record_contract_coin_map_persists_address_type(db):
+    # B2: classification persisted at write time
+    await db.record_contract_coin_map(SOL, "solana", "the-black-bull", "platforms", "high")
+    cur = await db._conn.execute(
+        "SELECT address_type FROM contract_coin_map WHERE contract_address = ?", (SOL,)
+    )
+    assert (await cur.fetchone())["address_type"] == "solana"
+    evm = "0x" + "a" * 40
+    await db.record_contract_coin_map(evm, "ethereum", "some-coin", "platforms", "high")
+    cur = await db._conn.execute(
+        "SELECT address_type FROM contract_coin_map WHERE contract_address = ?", (evm,)
+    )
+    assert (await cur.fetchone())["address_type"] == "evm"
+
+
 async def test_record_contract_coin_map_allows_null_coin_id_for_attempted(db):
     # negative result marker (resolution attempted, nothing found yet)
     await db.record_contract_coin_map(SOL, "solana", None, "attempted", None)
@@ -60,3 +75,13 @@ async def test_coin_id_resolved_guard(db):
     # attempted (NULL coin_id) does not count as resolved
     await db.record_contract_coin_map("0x" + "a" * 40, "base", None, "attempted", None)
     assert await db.coin_id_resolved("nonexistent") is False
+
+
+async def test_resolver_attempt_marker_and_ttl(db):
+    assert await db.coin_id_attempt_fresh("ghost", 3600) is False
+    await db.record_resolver_attempt("ghost")
+    assert await db.coin_id_attempt_fresh("ghost", 3600) is True
+    # ttl=0 -> nothing counts as fresh (forces retry)
+    assert await db.coin_id_attempt_fresh("ghost", 0) is False
+    # the attempt marker (NULL coin_id) is NOT a resolution
+    assert await db.coin_id_resolved("ghost") is False

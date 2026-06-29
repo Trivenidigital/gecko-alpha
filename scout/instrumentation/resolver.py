@@ -69,8 +69,10 @@ async def run_resolver_pass(
     Observe-only; returns a summary for logging.
     """
     budget = int(getattr(settings, "DEX_RESOLVER_BUDGET_PER_CYCLE", 5))
+    ttl = int(getattr(settings, "DEX_RESOLVER_NEGATIVE_TTL_SEC", 3600))
     attempted = 0
     recorded = 0
+    failed = 0
     seen: set[str] = set()
     for coin_id in coin_ids:
         if attempted >= budget:
@@ -79,14 +81,30 @@ async def run_resolver_pass(
             continue
         seen.add(coin_id)
         try:
-            if await db.coin_id_resolved(coin_id):
+            # Skip already-resolved coin_ids AND ones that failed within the
+            # negative-result TTL (so persistent 404s don't drain budget).
+            if await db.coin_id_resolved(coin_id) or await db.coin_id_attempt_fresh(
+                coin_id, ttl
+            ):
                 continue
         except Exception:
             logger.exception("dex_resolver_ttl_check_failed", coin_id=coin_id)
             continue
         n = await resolve_coin_platforms(coin_id, session, db, settings)
         attempted += 1
-        if n:
+        if n is None:
+            # Failed/unknown fetch -> record a negative-result marker so the TTL
+            # skips it next cycle; failure is observable via this row + the log.
+            failed += 1
+            try:
+                await db.record_resolver_attempt(coin_id)
+            except Exception:
+                logger.exception(
+                    "dex_resolver_attempt_record_failed", coin_id=coin_id
+                )
+        elif n:
             recorded += n
-    logger.info("dex_resolver_pass", attempted=attempted, recorded=recorded)
-    return {"attempted": attempted, "recorded": recorded}
+    logger.info(
+        "dex_resolver_pass", attempted=attempted, recorded=recorded, failed=failed
+    )
+    return {"attempted": attempted, "recorded": recorded, "failed": failed}

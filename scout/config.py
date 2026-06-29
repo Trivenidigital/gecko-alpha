@@ -208,6 +208,9 @@ class Settings(BaseSettings):
     # I1 resolver: max /coins/{id} calls per cycle. 5/cycle at 60 cyc/hr =
     # <=5/min, leaving >=25/min of the shared 30 req/min budget for ingestion.
     DEX_RESOLVER_BUDGET_PER_CYCLE: int = Field(default=5, ge=0, le=1000)
+    # Negative-result TTL: skip a coin_id whose resolution failed within this
+    # window (avoids re-spending budget on persistent 404s; still retries after).
+    DEX_RESOLVER_NEGATIVE_TTL_SEC: int = Field(default=3600, ge=0, le=86_400)
     # Raw proxy snapshot retention (txns_h1_buys_snapshots).
     DEX_TXNS_RETENTION_DAYS: int = Field(default=30, ge=1, le=365)
     # Tier-2 data-quality watchdog floors (fractions); alarm when measured below.

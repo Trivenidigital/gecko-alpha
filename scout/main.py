@@ -45,6 +45,7 @@ from scout.ingestion.holder_enricher import enrich_holders
 from scout.narrative.agent import narrative_agent_loop
 from scout.conviction.prospective import build_prospective_watchlist
 from scout.conviction.watchlist_watchdog import check_watchlist_freshness
+from scout.instrumentation.capture import capture_entry_mcap, capture_txns
 from scout.observability.sqlite_maintenance import run_sqlite_maintenance
 from scout.news.cryptopanic import (
     enrich_candidates_with_news,
@@ -1099,18 +1100,8 @@ async def run_cycle(
                 await db.log_volume_snapshot(
                     token.contract_address, token.volume_24h_usd
                 )
-            # I3 (observe-only, gated): raw buy/sell proxy snapshot for any token
-            # that has counts, regardless of volume. Captured-not-scored.
-            if settings.DEX_INSTRUMENTATION_ENABLED and (
-                token.txns_h1_buys is not None or token.txns_h1_sells is not None
-            ):
-                src = "dexscreener" if token.dex_id else "geckoterminal"
-                await db.log_txns_snapshot(
-                    token.contract_address,
-                    token.txns_h1_buys,
-                    token.txns_h1_sells,
-                    src,
-                )
+            # I3 (observe-only, gated): raw buy/sell proxy snapshot, any volume.
+            await capture_txns(db, token, settings)
 
         # Stage 2.5: Perp enrichment (OI/funding anomalies from perp watcher)
         enriched = await _maybe_enrich_perp(enriched, db=db, settings=settings)
@@ -1170,16 +1161,7 @@ async def run_cycle(
             await db.upsert_candidate(updated)
             await db.log_score(token.contract_address, points)
             # I2 (observe-only, gated): earliest DEX-side entry mcap (write-once).
-            if settings.DEX_INSTRUMENTATION_ENABLED:
-                _fsa = updated.first_seen_at
-                await db.record_entry_mcap(
-                    updated.contract_address,
-                    updated.chain,
-                    _fsa.isoformat() if hasattr(_fsa, "isoformat") else str(_fsa),
-                    updated.market_cap_usd,
-                    updated.liquidity_usd,
-                    updated.token_age_days,
-                )
+            await capture_entry_mcap(db, updated, settings)
             await safe_emit(
                 db,
                 token_id=token.contract_address,

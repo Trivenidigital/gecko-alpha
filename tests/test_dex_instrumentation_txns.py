@@ -27,16 +27,21 @@ def _gt_pool(with_txns: bool):
     }
 
 
-def test_from_geckoterminal_parses_h1_txns():
+def test_from_geckoterminal_parses_h1_txns_into_instrumentation_fields():
     t = CandidateToken.from_geckoterminal(_gt_pool(with_txns=True), "solana")
-    assert t.txns_h1_buys == 120
-    assert t.txns_h1_sells == 30
+    # GT counts go to instrumentation-only fields...
+    assert t.gt_txns_h1_buys == 120
+    assert t.gt_txns_h1_sells == 30
+    # ...and NEVER the scorer-read fields (keeps buy_pressure DexScreener-only).
+    assert t.txns_h1_buys is None
+    assert t.txns_h1_sells is None
 
 
 def test_from_geckoterminal_missing_txns_is_none():
     t = CandidateToken.from_geckoterminal(_gt_pool(with_txns=False), "solana")
+    assert t.gt_txns_h1_buys is None
+    assert t.gt_txns_h1_sells is None
     assert t.txns_h1_buys is None
-    assert t.txns_h1_sells is None
 
 
 @pytest.fixture
