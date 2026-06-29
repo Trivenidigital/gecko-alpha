@@ -362,6 +362,20 @@ class Database:
         )
         await self._conn.commit()
 
+    async def prune_txns_snapshots(self, *, keep_days: int) -> int:
+        """Prune raw proxy snapshots older than keep_days. Returns rows deleted."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=keep_days)
+        ).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM txns_h1_buys_snapshots WHERE scanned_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
     async def compute_dex_coverage_metrics(self) -> dict:
         """C5: substrate-health + analysis-readiness coverage metrics (B1/B2).
 

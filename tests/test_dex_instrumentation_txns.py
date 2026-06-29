@@ -77,3 +77,18 @@ async def test_log_txns_snapshot_is_append_only_timeseries(db):
     rows = await _rows(db, SOL)
     assert len(rows) == 2
     assert [r["source"] for r in rows] == ["dexscreener", "geckoterminal"]
+
+
+async def test_prune_txns_snapshots_removes_old(db):
+    await db._conn.execute(
+        "INSERT INTO txns_h1_buys_snapshots "
+        "(contract_address, txns_h1_buys, txns_h1_sells, source, scanned_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (SOL, 1, 1, "dexscreener", "2020-01-01T00:00:00+00:00"),
+    )
+    await db._conn.commit()
+    await db.log_txns_snapshot(SOL, 100, 20, "dexscreener")  # fresh
+    deleted = await db.prune_txns_snapshots(keep_days=30)
+    assert deleted == 1
+    rows = await _rows(db, SOL)
+    assert len(rows) == 1

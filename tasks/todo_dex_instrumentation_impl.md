@@ -29,7 +29,7 @@ is green. TDD red-green is observed via CI per pushed increment.
   post-commit assert); register in `initialize()` (db.py:81). Pure `classify_contract()` helper
   (CG-slug / evm / solana) in a no-aiohttp module so it unit-tests cleanly.
   Tests: tables exist, migration idempotent, classifier cases.
-- [ ] **C2 — I1 resolver.** Reuse `fetch_coin_detail` (counter/detail.py:23) + `platforms`
+- [x] **C2 — I1 resolver.** DONE — resolver.py + DB layer; CI tests via aioresponses. Reuse `fetch_coin_detail` (counter/detail.py:23) + `platforms`
   (minara_alert.py:185) → upsert `contract_coin_map`; ≤N/cycle budget (Settings); negative-result TTL;
   backfill seed from CG-native candidates. Tests (aioresponses): platforms parse, budget cap,
   best-effort never raises, backfill source tag.
@@ -41,11 +41,11 @@ is green. TDD red-green is observed via CI per pushed increment.
   the volume-snapshot loop (main.py:1093). Tests: raw capture + source, GT parse, no-row-when-missing.
 - [x] **C5 — metrics.** DONE — `compute_dex_coverage_metrics`, 3 tests green locally. `dex_resolution_health` + `dex_measurable_cohort_size` query methods + rollup
   emit. Tests: health excludes never-listed; cohort-size counts fully-joinable only.
-- [ ] **C6 — watchdogs.** Freshness (Tier-1) + data-quality (Tier-2: resolution-rate, non-zero mcap,
+- [x] **C6 — watchdogs.** DONE — freshness+quality (_compute_alarms fresh-but-empty), health-channel routing; 6 logic tests local + routing CI. Freshness (Tier-1) + data-quality (Tier-2: resolution-rate, non-zero mcap,
   non-null txns, coverage-trend, fresh-but-empty) in hourly maintenance (main.py:1357); add optional
   `TELEGRAM_HEALTH_CHAT_ID` routing (falls back to main chat; alerts `parse_mode=None` + dispatched/
   delivered logs). Tests: **fresh-but-empty fires**, freshness fires, routing uses health chat.
-- [ ] **C7 — settings + no-regression proof.** New Settings (budget N, thresholds, retention, health
+- [x] **C7 — settings + no-regression proof.** DONE — gated flag (default off), scorer-independence test green. New Settings (budget N, thresholds, retention, health
   chat). Guard test: scorer/gate output byte-identical pre/post for a fixture token; AST/grep guard
   that no new `send_telegram_message` callsite targets the trading path. Diff audit in PR body.
 - [ ] **Final** — CI green on full suite; open **draft** PR with the 9-point acceptance mapping;

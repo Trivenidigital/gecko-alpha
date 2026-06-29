@@ -1099,6 +1099,18 @@ async def run_cycle(
                 await db.log_volume_snapshot(
                     token.contract_address, token.volume_24h_usd
                 )
+            # I3 (observe-only, gated): raw buy/sell proxy snapshot for any token
+            # that has counts, regardless of volume. Captured-not-scored.
+            if settings.DEX_INSTRUMENTATION_ENABLED and (
+                token.txns_h1_buys is not None or token.txns_h1_sells is not None
+            ):
+                src = "dexscreener" if token.dex_id else "geckoterminal"
+                await db.log_txns_snapshot(
+                    token.contract_address,
+                    token.txns_h1_buys,
+                    token.txns_h1_sells,
+                    src,
+                )
 
         # Stage 2.5: Perp enrichment (OI/funding anomalies from perp watcher)
         enriched = await _maybe_enrich_perp(enriched, db=db, settings=settings)
@@ -1157,6 +1169,17 @@ async def run_cycle(
             all_scored_tokens.append(updated)
             await db.upsert_candidate(updated)
             await db.log_score(token.contract_address, points)
+            # I2 (observe-only, gated): earliest DEX-side entry mcap (write-once).
+            if settings.DEX_INSTRUMENTATION_ENABLED:
+                _fsa = updated.first_seen_at
+                await db.record_entry_mcap(
+                    updated.contract_address,
+                    updated.chain,
+                    _fsa.isoformat() if hasattr(_fsa, "isoformat") else str(_fsa),
+                    updated.market_cap_usd,
+                    updated.liquidity_usd,
+                    updated.token_age_days,
+                )
             await safe_emit(
                 db,
                 token_id=token.contract_address,
@@ -1193,6 +1216,21 @@ async def run_cycle(
                 max_mcap=settings.PAPER_MAX_MCAP,
                 settings=settings,
             )
+
+    # I1 (observe-only, gated): retroactively map CG-native coin_ids -> their
+    # platform contracts. Best-effort, budget-capped; never blocks the gate.
+    if settings.DEX_INSTRUMENTATION_ENABLED:
+        try:
+            from scout.instrumentation.resolver import run_resolver_pass
+
+            cg_coin_ids = [
+                t.contract_address
+                for t in all_scored_tokens
+                if t.chain == "coingecko"
+            ]
+            await run_resolver_pass(cg_coin_ids, session, db, settings)
+        except Exception:
+            logger.exception("dex_resolver_pass_failed")
 
     # Stages 4-5: Gate (MiroFish + conviction)
     for token, signals in scored:
@@ -1521,6 +1559,26 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
             await check_watchlist_freshness(db, session, settings, logger)
         except Exception:
             logger.exception("conviction_watchlist_watchdog_failed")
+
+    # DEX-outcome instrumentation (observe-only, gated): emit coverage metrics,
+    # run data-quality watchdogs (operator/health channel only), prune raw proxy.
+    if settings.DEX_INSTRUMENTATION_ENABLED:
+        try:
+            from scout.instrumentation.watchdog import (
+                check_dex_instrumentation_health,
+            )
+
+            await check_dex_instrumentation_health(db, session, settings, logger)
+        except Exception:
+            logger.exception("dex_instrumentation_watchdog_failed")
+        try:
+            rows = await db.prune_txns_snapshots(
+                keep_days=settings.DEX_TXNS_RETENTION_DAYS
+            )
+            if rows:
+                logger.info("dex_txns_snapshots_pruned", rows_deleted=rows)
+        except Exception:
+            logger.exception("dex_txns_prune_failed")
 
 
 async def _maybe_announce_tg_alerts(db, session, settings) -> None:
