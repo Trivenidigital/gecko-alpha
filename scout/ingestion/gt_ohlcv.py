@@ -168,13 +168,18 @@ async def resolve_pool_address(
     if not isinstance(pools, list):
         raise PriceProviderError("geckoterminal", "malformed_pools", url)
 
+    # Only pools with an extractable address can be priced. Filter first so a
+    # malformed address-less entry can never shadow a valid pool — selection
+    # stays deterministic and independent of API order/content.
+    addressable = [p for p in pools if _pool_address(p)]
+    if not addressable:
+        raise PriceProviderError("geckoterminal", "malformed_pools", url)
+
     best = sorted(
-        pools,
+        addressable,
         key=lambda p: (-_reserve_usd(p), _pool_address(p) or ""),
     )[0]
     pool_address = _pool_address(best)
-    if not pool_address:
-        raise PriceProviderError("geckoterminal", "malformed_pools", url)
 
     base_rel = (best.get("relationships") or {}).get("base_token") or {}
     base_token = (base_rel.get("data") or {}).get("id")
