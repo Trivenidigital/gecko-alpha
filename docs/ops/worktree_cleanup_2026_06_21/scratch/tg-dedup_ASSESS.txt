@@ -1,0 +1,14 @@
+=== HEAD log ===
+72fbdfd2 fix(tg-alert): include dedup_window_hours in tg_alert_suppressed audit log (Codex NIT)
+abfb74bb test(tg-alert): fold review findings — window=0 kill-path, anti-scope trade-open invariant, migration idempotency tests + design notes
+7356f205 feat(tg-alert): 24h per-token strict dedup + suppressed/dispatched/delivered audit log (BL-NEW-TG-ALERT-NOISE-DEDUP)
+686d0651 docs(backlog): record Kraken audit verdict on autotrade-prep + file BL-NEW-API-SYSTEM-HEALTH-STATUS-ENUM follow-up (#335)
+=== branch tracking ===
+## feat/tg-alert-24h-dedup...origin/feat/tg-alert-24h-dedup [ahead 1, behind 1]
+=== remote vs local ===
+72fbdfd24046edcf648e82547b7df33f66005a40
+b8ab530a0ff1b51b6552cd486c54ca4c47abb534
+=== abfb74bb present in history? ===
+* feat/tg-alert-24h-dedup
+=== tracked working-tree changes (scout/tests/tasks) ===
+=== END ===
