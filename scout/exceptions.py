@@ -33,6 +33,23 @@ class SafetyCheckError(ScoutError):
     """Error checking token safety."""
 
 
+class PriceProviderError(ScoutError):
+    """A price provider (DEX/CEX) failed to return usable price data.
+
+    Raised — never swallowed into a fake or zero price — so callers can record
+    an explicit ``price_provider_error`` reason (design #392). Distinct from
+    "missing pool / no data", which is a normal empty return (``None`` / ``[]``),
+    not an error.
+    """
+
+    def __init__(self, source: str, reason: str, url: str | None = None) -> None:
+        self.source = source
+        self.reason = reason
+        self.url = url
+        suffix = f" ({url})" if url else ""
+        super().__init__(f"[{source}] price provider error: {reason}{suffix}")
+
+
 class MoonshotArmFailed(ScoutError):
     """Atomic moonshot arm UPDATE returned rowcount=0 unexpectedly.
 
