@@ -21,6 +21,58 @@ import structlog
 _log = structlog.get_logger()
 
 
+def classify_resolution_status(
+    *, extracted_ca: str | None, resolved_coin_id: str | None
+) -> str:
+    """Classify a narrative inbound row's resolution outcome (observability).
+
+    - ``cashtag_only`` — no contract address. This is *composition*, not a
+      failure: the CA-only resolver cannot resolve a bare cashtag (no
+      symbol->coin_id primitive). ~97% of inbound rows are this.
+    - ``ca_resolved`` — a contract address was present AND resolved to a coin_id.
+    - ``ca_unresolved`` — a contract address was present but no coin_id was found
+      (resolver gap / genuinely-unknown CA).
+
+    ``resolver_error`` is intentionally NOT a value here: an inbound row cannot
+    observe whether Hermes's lookup hit a DB error vs genuinely-not-found, so
+    resolver errors are tracked separately at the ``/api/coin/lookup`` endpoint.
+    """
+    ca = (extracted_ca or "").strip()
+    if not ca:
+        return "cashtag_only"
+    coin = (resolved_coin_id or "").strip()
+    return "ca_resolved" if coin else "ca_unresolved"
+
+
+def narrative_resolution_alarms(
+    stats: dict,
+    *,
+    resolver_error_count: int = 0,
+    resolver_error_threshold: int = 5,
+) -> list[str]:
+    """Composition-aware narrative resolution alarms.
+
+    Deliberately does NOT alarm on overall-resolved-rate-near-zero — with ~97%
+    cashtag-only inbound that is *expected composition*, not a failure. Alarms
+    only on genuine problems:
+      - CA-bearing rows exist but none resolved (the CA resolver path is broken),
+      - rows with no resolution classification (the status writer regressed),
+      - a spike in resolver_error (the lookup endpoint is failing).
+    """
+    alarms: list[str] = []
+    if stats.get("unclassified", 0) > 0:
+        alarms.append(
+            f"unclassified narrative rows (no resolution_status): {stats['unclassified']}"
+        )
+    if stats.get("ca_bearing", 0) > 0 and stats.get("ca_resolved", 0) == 0:
+        alarms.append(
+            f"CA-bearing rows exist ({stats['ca_bearing']}) but ca_resolved=0 — CA resolver gap"
+        )
+    if resolver_error_count >= resolver_error_threshold:
+        alarms.append(f"resolver_error spike: {resolver_error_count}")
+    return alarms
+
+
 async def resolve_ca(db_path: str, *, ca: str, chain: str) -> dict[str, Any] | None:
     """Resolve a contract address to canonical CG/DexScreener data.
 
@@ -55,6 +107,25 @@ async def resolve_ca(db_path: str, *, ca: str, chain: str) -> dict[str, Any] | N
         async with conn_ctx as db:
             db.row_factory = aiosqlite.Row
 
+            # CA -> coin_id via the contract_coin_map (I1) map. This is the bug
+            # fix: previously coin_id was hardcoded None even on a match. Reuse
+            # of the existing map, not a new primitive. Best-effort — the table
+            # may be absent on a pre-DEX-instrumentation DB, which is "no coin_id
+            # found" (not a resolver error).
+            coin_id: str | None = None
+            try:
+                cur = await db.execute(
+                    "SELECT coin_id FROM contract_coin_map "
+                    "WHERE LOWER(contract_address) = LOWER(?) "
+                    "AND coin_id IS NOT NULL LIMIT 1",
+                    (query_ca,),
+                )
+                m = await cur.fetchone()
+                if m is not None:
+                    coin_id = m["coin_id"]
+            except aiosqlite.OperationalError:
+                pass  # map not present yet; fall through to candidates
+
             try:
                 cur = await db.execute(
                     """SELECT contract_address, chain, token_name, ticker,
@@ -67,7 +138,7 @@ async def resolve_ca(db_path: str, *, ca: str, chain: str) -> dict[str, Any] | N
                 row = await cur.fetchone()
                 if row is not None:
                     return {
-                        "coin_id": None,
+                        "coin_id": coin_id,
                         "symbol": row["ticker"],
                         "name": row["token_name"],
                         "market_cap_usd": row["market_cap_usd"],
@@ -86,6 +157,18 @@ async def resolve_ca(db_path: str, *, ca: str, chain: str) -> dict[str, Any] | N
                 )
                 return {"_resolver_error": True}
 
+            # Candidates miss, but the map resolved a coin_id -> still resolved.
+            if coin_id is not None:
+                return {
+                    "coin_id": coin_id,
+                    "symbol": None,
+                    "name": None,
+                    "market_cap_usd": None,
+                    "liquidity_usd": None,
+                    "price_usd": None,
+                    "source": "contract_coin_map",
+                }
+
             return None
     except aiosqlite.OperationalError as e:
         _log.warning("narrative_resolver_ctx_oe", err=str(e))
@@ -101,6 +184,12 @@ async def insert_narrative_alert(db_path: str, payload: Any) -> dict[str, Any]:
 
     Errors propagate as exceptions; the FastAPI layer converts to 500.
     """
+    # Derive the resolution outcome at insert so 'fresh inbound but zero
+    # resolved' is never a silent mystery (composition vs failure).
+    resolution_status = classify_resolution_status(
+        extracted_ca=payload.extracted_ca,
+        resolved_coin_id=payload.resolved_coin_id,
+    )
     async with aiosqlite.connect(db_path) as db:
         try:
             cur = await db.execute(
@@ -108,8 +197,8 @@ async def insert_narrative_alert(db_path: str, payload: Any) -> dict[str, Any]:
                     event_id, tweet_id, tweet_author, tweet_ts, tweet_text,
                     tweet_text_hash, extracted_cashtag, extracted_ca, extracted_chain,
                     resolved_coin_id, narrative_theme, urgency_signal,
-                    classifier_confidence, classifier_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    classifier_confidence, classifier_version, resolution_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     payload.event_id,
                     payload.tweet_id,
@@ -125,6 +214,7 @@ async def insert_narrative_alert(db_path: str, payload: Any) -> dict[str, Any]:
                     payload.urgency_signal,
                     payload.classifier_confidence,
                     payload.classifier_version,
+                    resolution_status,
                 ),
             )
             await db.commit()

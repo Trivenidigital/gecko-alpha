@@ -153,6 +153,8 @@ class Database:
         await self._migrate_liquidity_enrichment_v1()
         # DEX-outcome instrumentation substrate (observe-only; I1/I2/I3).
         await self._migrate_dex_instrumentation_v1()
+        # Narrative resolution observability: resolution_status column + backfill.
+        await self._migrate_narrative_resolution_status_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -554,6 +556,124 @@ class Database:
             (f"__attempt__:{coin_id}", cutoff),
         )
         return (await cur.fetchone()) is not None
+
+    async def _migrate_narrative_resolution_status_v1(self) -> None:
+        """Add narrative_alerts_inbound.resolution_status + backfill (observability).
+
+        Makes 'fresh inbound but zero resolved' legible: classifies every row as
+        cashtag_only / ca_resolved / ca_unresolved, and retro-resolves CA rows
+        that the contract_coin_map (I1) can now map to a coin_id. Additive +
+        idempotent. Does NOT change scorer/gate/trading behavior.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # narrative_alerts_inbound only exists after the narrative-scanner migration;
+        # if absent, nothing to do (idempotent no-op).
+        cur = await conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='narrative_alerts_inbound'"
+        )
+        if await cur.fetchone() is None:
+            return
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            cur = await conn.execute("PRAGMA table_info(narrative_alerts_inbound)")
+            cols = {row[1] for row in await cur.fetchall()}
+            if "resolution_status" not in cols:
+                await conn.execute(
+                    "ALTER TABLE narrative_alerts_inbound ADD COLUMN resolution_status TEXT"
+                )
+            # Backfill classification for any unclassified rows.
+            await conn.execute(
+                "UPDATE narrative_alerts_inbound SET resolution_status = CASE "
+                "WHEN extracted_ca IS NULL OR trim(extracted_ca) = '' THEN 'cashtag_only' "
+                "WHEN resolved_coin_id IS NOT NULL AND trim(resolved_coin_id) <> '' "
+                "THEN 'ca_resolved' ELSE 'ca_unresolved' END "
+                "WHERE resolution_status IS NULL"
+            )
+            # Retro-resolve CA rows the contract_coin_map can now map (idempotent:
+            # only touches ca_unresolved rows). Guarded if contract_coin_map absent.
+            has_map = await conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='contract_coin_map'"
+            )
+            if await has_map.fetchone() is not None:
+                await conn.execute(
+                    "UPDATE narrative_alerts_inbound SET "
+                    "resolved_coin_id = (SELECT m.coin_id FROM contract_coin_map m "
+                    "  WHERE LOWER(m.contract_address) = LOWER(narrative_alerts_inbound.extracted_ca) "
+                    "  AND m.coin_id IS NOT NULL LIMIT 1), "
+                    "resolution_status = 'ca_resolved' "
+                    "WHERE resolution_status = 'ca_unresolved' "
+                    "AND extracted_ca IS NOT NULL AND EXISTS ("
+                    "  SELECT 1 FROM contract_coin_map m "
+                    "  WHERE LOWER(m.contract_address) = LOWER(narrative_alerts_inbound.extracted_ca) "
+                    "  AND m.coin_id IS NOT NULL)"
+                )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version "
+                "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, description TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at, description) "
+                "VALUES (?, ?, ?)",
+                (20260630, now_iso, "narrative_resolution_status_v1"),
+            )
+            await conn.commit()
+        except Exception:
+            _log.exception(
+                "schema_migration_failed", migration="narrative_resolution_status_v1"
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                _log.exception(
+                    "schema_migration_rollback_failed",
+                    migration="narrative_resolution_status_v1",
+                )
+            raise
+
+    async def narrative_resolution_stats(self) -> dict:
+        """Composition-aware narrative resolution metrics (observe-only).
+
+        Splits the corpus so 'zero resolved' is explainable: cashtag-only
+        (expected-unresolvable) vs ca_resolved vs ca_unresolved. ``resolver_error``
+        is tracked separately at the lookup endpoint, not here.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cur = await self._conn.execute(
+            "SELECT count(*), "
+            "SUM(resolution_status = 'cashtag_only'), "
+            "SUM(resolution_status = 'ca_resolved'), "
+            "SUM(resolution_status = 'ca_unresolved'), "
+            "SUM(resolution_status IS NULL) "
+            "FROM narrative_alerts_inbound"
+        )
+        total, cashtag, resolved, unresolved, unclassified = await cur.fetchone()
+        total = total or 0
+        cashtag = cashtag or 0
+        resolved = resolved or 0
+        unresolved = unresolved or 0
+        unclassified = unclassified or 0
+        ca_bearing = resolved + unresolved
+        return {
+            "total": total,
+            "cashtag_only": cashtag,
+            "ca_bearing": ca_bearing,
+            "ca_resolved": resolved,
+            "ca_unresolved": unresolved,
+            "unclassified": unclassified,
+            "cashtag_only_rate": (cashtag / total) if total else None,
+            "ca_resolve_rate": (resolved / ca_bearing) if ca_bearing else None,
+        }
 
     async def _migrate_predictions_coin_predicted_id_idx_v1(self) -> None:
         """Index latest-prediction lookups used by Trade Inbox context."""
