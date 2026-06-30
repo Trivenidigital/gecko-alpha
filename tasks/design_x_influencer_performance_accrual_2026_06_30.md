@@ -4,7 +4,7 @@
 
 - **Date:** 2026-06-30
 - **Branch:** `design/x-influencer-performance-accrual`
-- **Status:** DESIGN / SPEC — **not for deployment** (see §7 deploy gate)
+- **Status:** DESIGN / SPEC — **DRAFT for formal review**; operator open-questions **locked 2026-06-30** (§9); **not for deployment** (see §7 deploy gate)
 - **Origin:** operator steer 2026-06-30 — "based on performance so far, show top-10 influencer accounts; asset performance must be the parameter, not volume of alerts." Investigation found there is **no asset-performance data** to rank on. This spec builds the forward-accrual path so the ranking becomes possible. Operator chose Path 2 (fix forward + accrue data).
 
 ---
@@ -66,14 +66,16 @@ Pipeline (per new/immature X call): **resolve identity → snapshot price_at_cal
 ### §4.1 Token-identity resolution loop (new primitive)
 A cyclic internal job (runs alongside the existing source-calls writer) that, for `source_calls` rows with `source_type='x'` AND `resolved_state='unresolved'` AND call age < 24h (only freshly-resolvable calls matter; stale ones can't get a call-time price):
 1. **CA path (preferred, unambiguous):** if `contract_address` + `chain` present → resolve via `contract_coin_map` (I1) → `coin_id`; reuse `scout/api/narrative_resolver.py:resolve_ca` logic. Even with no CG `coin_id`, a (contract, chain) pair is directly priceable on DEX (§4.2), so identity = the CA itself.
-2. **Cashtag path (ambiguous, low-confidence):** symbol→coin_id is the harder BL-NEW-NARRATIVE-SYMBOL-RESOLVER problem; attempt confidence-gated resolution, tag `linkage_confidence`, and keep these in a **separate cohort** (§4.6). Cashtag-only with no CA that cannot be resolved stays unresolved — surfaced honestly as a coverage limit, never guessed.
+2. **Cashtag path — NOT resolved in the first implementation (operator decision 2026-06-30).** symbol→coin_id is a separate primitive (BL-NEW-NARRATIVE-SYMBOL-RESOLVER) with ticker collisions, chain ambiguity, and false-join risk; it is explicitly **out of scope for the first accrual PR**. Cashtag-only calls remain: (a) parsed inventory, (b) `unresolved_*` with an explicit reason in coverage (§4.3/§4.4), and (c) a future symbol-resolver design/backlog item. No fuzzy resolution — never guessed.
 3. Write back `resolved_coin_id` (on `narrative_alerts_inbound`, so PR #390 observability stays coherent) and `token_id`/`resolved_state`/reason on `source_calls`. **PR #390 is a prerequisite** — it classifies/repairs CA resolution — but it does NOT itself create performance data.
 
 ### §4.2 `source_call_price_snapshots` + forward-only snapshot writer (new primitive)
 - New table `source_call_price_snapshots(id, identity_key, identity_kind {coin_id|contract}, chain, price, snapshot_at, source {gt|dex|cg}, created_at)`.
 - A writer cycle selects **active** X source_calls (resolved identity, outcome_status ∈ {pending, partial}, call age < 25h) and fetches current price by identity:
-  - **DEX-by-CA primary** (GeckoTerminal pool / DexScreener) — covers arbitrary memecoins, which is the whole point.
+  - **GeckoTerminal (pool OHLCV by CA) is the PRIMARY forward-return price source** (operator decision 2026-06-30) — covers arbitrary memecoins by (contract, chain), which is the whole point.
+  - **DexScreener is fallback / cross-check** (and liquidity context) — used only when GT lacks the pool; never silently blended with GT inside one price series.
   - CG snapshot fallback when identity is a listed `coin_id`.
+  - **Every snapshot stores its `source`** (gt|dex|cg) so rankings can separate GT-derived from fallback-derived outcomes — no silent source mixing.
 - The first snapshot for a call (taken at ingest, `call_ts` typically ≤ ~1h old) serves as `price_at_call` — within the existing 1h staleness tolerance (`_compute_outcome` :230). Subsequent snapshots accrue across the +30m/+1h/+6h/+24h horizons.
 - Extend `_fetch_snapshot_rows` (:142) to also read `source_call_price_snapshots` for the identity. **`_compute_outcome` is reused unchanged** — it just gets a populated `price_rows`.
 
@@ -90,9 +92,9 @@ Extend `compute_source_quality_summary` + add a read-only endpoint/report exposi
 
 ### §4.6 Ranking design (DEFERRED — do not publish until §8 gate met)
 When data exists, rank influencers by **realized forward performance**, not volume:
-- Minimum N calls per influencer (n-gate) with `INSUFFICIENT_DATA` shown otherwise.
+- **N-gate (operator decision 2026-06-30):** **≥10 complete calls** per influencer to display a row; rows with **10–29** complete calls carry a **low-confidence label**; only **≥30** complete calls earns the **trusted-ranking** label. If too few influencers clear the ≥10 minimum, show **INSUFFICIENT_SAMPLE** — never publish a thin top-10.
 - Report **median** forward return and **hit-rate** (fraction with positive forward_24h / ≥+50% peak), not just max winners — avoids one moonshot dominating.
-- **Separate CA-resolved vs symbol-resolved cohorts** — never mix unambiguous CA performance with low-confidence cashtag joins (name-join contamination, ref ANSEM backtest lesson).
+- **Separate CA-resolved vs cashtag cohorts** — never mix unambiguous CA performance with cashtag joins (name-join contamination, ref ANSEM backtest lesson). The first ranking is **CA-resolved-only** by construction (§4.1).
 - Show sample size / confidence on every row. De-weight spam volume (rank-1 per duplicate cluster, reusing existing `duplicate_cluster_key`).
 
 ---
@@ -103,6 +105,8 @@ When data exists, rank influencers by **realized forward performance**, not volu
 2. **No backfill** of cashtag-only May–Jun calls as reliable performance data — not safely reconstructible.
 3. **Path 1 (CA-anchored retro sample) is forensic-only** if ever run — must be labeled "CA-anchored historical sample, not representative, small-n, not a leaderboard." Not part of this build.
 4. **No deploy during the DEX soak** without separate operator approval (§7). Dev/spec/PR work only.
+5. **No fuzzy symbol resolver in the first implementation** — cashtag→coin_id is deferred to a separate primitive (§4.1).
+6. **Standing boundaries (unchanged):** no gate recalibration, no threshold change, no scoring change, no trading-alert behavior change, no proxy scoring, no paid feed, no DEX-soak logic change. DEX observe-only soak unchanged; next checkpoint remains the 7-day report.
 
 ---
 
@@ -130,8 +134,20 @@ C1 depends on PR #390 (resolution prerequisite) being deployed. C5 stays unbuilt
 
 Publish the influencer ranking only when, per CLAUDE.md §11a: each ranked influencer has ≥ N forward-complete calls (N TBD, suggest ≥10 CA-resolved), AND coverage metrics (§4.4) show price-at-call + forward-24h coverage above a floor. At current X volume (~50 calls/day across 17 active KOLs, but only ~2 CA-calls/day), CA-resolved cohorts will accrue slowly — expect ~3–4 weeks for the higher-CA posters, longer for cashtag-only. Halt-and-publish the moment the data threshold is met; do not wait for a fixed calendar date.
 
-## §9 Open questions for operator
+## §9 Operator decisions (locked 2026-06-30)
 
-1. **Cashtag-only scope:** invest in symbol→coin_id resolution (BL-NEW-NARRATIVE-SYMBOL-RESOLVER) to cover the 97% cashtag-only majority, or ship CA-resolved-only first (smaller, unambiguous) and treat cashtag coverage as phase 2?
-2. **Ranking N-gate:** minimum complete-calls per influencer before a row is shown (proposed ≥10)?
-3. **Price source priority:** GeckoTerminal vs DexScreener as primary DEX price for CA snapshots (latency / coverage / rate-limit trade-off)?
+1. **Cashtag-only scope → CA-resolved-only ships first.** symbol→coin_id is a separate primitive (collisions / chain ambiguity / false-join); not bundled. Cashtag-only stays parsed inventory + unresolved-by-reason + future backlog (§4.1).
+2. **Ranking N-gate → ≥10 complete calls to display; low-confidence label 10–29; trusted ≥30; INSUFFICIENT_SAMPLE if too few clear ≥10** (§4.6).
+3. **Price source → GeckoTerminal primary (CA/pool OHLCV); DexScreener fallback/cross-check; `source` stored per snapshot; no silent mixing** (§4.2).
+
+## §10 Spec-review checklist for #392 (operator-stated)
+
+- [ ] no volume-as-performance anywhere
+- [ ] no historical cashtag backfill
+- [ ] no fuzzy symbol resolver in the first implementation
+- [ ] forward-only snapshotting
+- [ ] unresolved-by-reason coverage present
+- [ ] watchdog for "fresh calls but zero price snapshots"
+- [ ] n-gated rankings only
+- [ ] CA and cashtag cohorts separated
+- [ ] no deploy during DEX soak without separate operator approval
