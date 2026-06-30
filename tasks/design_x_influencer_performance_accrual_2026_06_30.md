@@ -63,6 +63,11 @@ Citations into `scout/source_quality/ledger.py` (verified 2026-06-30):
 
 Pipeline (per new/immature X call): **resolve identity → snapshot price_at_call → snapshot forward horizons → compute (reuse) → persist outcome + reason → observe → watchdog**.
 
+### §4.0 Design rationale — contract identity is authoritative
+> **Contract identity is authoritative for first-pass performance accrual. Cashtags are inventory / unresolved metadata until a separately evaluated symbol resolver exists.**
+
+Empirical basis (`findings_x_assets_called_inventory_2026_06_30.md` §5): the same Solana contract `5UUH9…BhgH2` appears across 5 influencers labeled inconsistently (`$TROLL` for most, `$SOL` for `gem_insider`). The cashtag extractor is unreliable even on CA-bearing tweets, so **the first accrual PR must key on `(contract_address, chain)`, never on ticker identity.** Cashtag-only calls remain inventory + unresolved-by-reason until a separate symbol resolver is built and evaluated on its own merits.
+
 ### §4.1 Token-identity resolution loop (new primitive)
 A cyclic internal job (runs alongside the existing source-calls writer) that, for `source_calls` rows with `source_type='x'` AND `resolved_state='unresolved'` AND call age < 24h (only freshly-resolvable calls matter; stale ones can't get a call-time price):
 1. **CA path (preferred, unambiguous):** if `contract_address` + `chain` present → resolve via `contract_coin_map` (I1) → `coin_id`; reuse `scout/api/narrative_resolver.py:resolve_ca` logic. Even with no CG `coin_id`, a (contract, chain) pair is directly priceable on DEX (§4.2), so identity = the CA itself.
