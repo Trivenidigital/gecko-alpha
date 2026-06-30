@@ -445,6 +445,18 @@ Offline read-only analysis scripts scoped during the 2026-05-29 liquidity/focus 
 **First design questions:** disambiguation policy + a precision floor (resolve only at high confidence, else stay `cashtag_only`); reuse `symbol_aliases` / `resolver_cache` where possible; **offline-eval the policy against the existing 2,085-row corpus before any live write**; mandatory Hermes-first check before build.
 **Out of scope here:** building it. Separate primitive, deliberately NOT in the observability PR.
 
+### BL-NEW-NARRATIVE-RESOLVER-ERROR-RATE-ALARM: persistent resolver-error counter + rate-spike alarm
+**Status:** PROPOSED 2026-06-30 — surfaced by the #390 (`d76fb7fb`) 3-vector review; both the migration/silent-failure and the semantics reviewers flagged it independently. `narrative_resolution_alarms` (`scout/api/narrative_resolver.py`) accepts `resolver_error_count` but `scout/main.py:1574` calls it WITHOUT that arg, so the resolver-error-*spike* alarm branch is **dormant in production** (always fed 0). Resolver errors remain observable individually — 3 `_log.warning` sites in `resolve_ca` (`narrative_resolver.py:102/153/174`) + a `reason="resolver_error"` HTTP response (`scout/api/narrative.py:357`) — but no *rate* watchdog reads them. A §12a-style "visible in logs, nobody watching the rate" gap.
+**Tag:** `narrative` `resolver` `watchdog` `silent-failure` `§12a`
+**Scope:**
+- persistent resolver-error counter (small counter table or structured-log aggregation; the events to count are `resolve_ca`'s `{"_resolver_error": True}` returns / the `reason="resolver_error"` endpoint responses),
+- wire `resolver_error_count` into the `narrative_resolution_alarms(...)` call in `_run_hourly_maintenance` (`scout/main.py`),
+- alert ONLY on genuine resolver-error-*rate* spikes (threshold/rate, not a single transient DB blip),
+- do NOT conflate resolver errors with expected `cashtag_only` or normal `ca_unresolved` — they are distinct states; `_resolver_error` is never persisted to the inbound row today, keep it that way,
+- NO symbol->coin_id resolver in this item (that is `BL-NEW-NARRATIVE-SYMBOL-RESOLVER`).
+**Why:** completes area-4 of the #390 review — the watchdog is specified to alert on resolver-error spikes but currently structurally cannot. Small, self-contained; pairs with the resolution-status observability shipped in #390.
+**Out of scope:** any gate/threshold/scoring/trading-alert change; the symbol resolver; paid feeds; DEX soak logic.
+
 ### BL-NEW-SCANNER-DATETIME-UTCNOW-DEPRECATION
 **Status:** SHIPPED 2026-05-27 via `tasks/findings_scanner_hygiene_2026_05_27.md`; deployed to `/home/gecko-agent/run-scanner-cycle.py` with backup `/home/gecko-agent/backups/run-scanner-cycle.py.20260527T010403Z`.
 **Why:** `/home/gecko-agent/run-scanner-cycle.py` uses `datetime.utcnow()` which emits a DeprecationWarning under Python 3.12+. The warning text leaks into the cycle-report log via the `2>&1` redirect, occasionally interleaving mid-line with stdout content (per Vector A M2 + Vector B M1 at PR #204 review). Not a security issue (warning text is constant); cosmetic log hygiene.
