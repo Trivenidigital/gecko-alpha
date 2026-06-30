@@ -47,6 +47,10 @@ if TYPE_CHECKING:
 log = structlog.get_logger(__name__)
 
 
+def _is_solana_signal(paper_trade) -> bool:
+    return getattr(paper_trade, "chain", None) == "solana"
+
+
 class _PaperTradeLike(Protocol):
     id: int
     coin_id: str
@@ -70,6 +74,7 @@ class LiveEngine:
         db: Database,
         kill_switch: KillSwitch,
         routing: "RoutingLayer | None" = None,
+        onchain_adapter: "ExchangeAdapter | None" = None,
     ) -> None:
         self._config = config
         self._resolver = resolver
@@ -83,6 +88,18 @@ class LiveEngine:
             resolver=resolver,
             adapter=adapter,
             kill_switch=kill_switch,
+        )
+        self._onchain_adapter = onchain_adapter
+        self._onchain_gates = (
+            Gates(
+                config=config,
+                db=db,
+                resolver=resolver,
+                adapter=onchain_adapter,
+                kill_switch=kill_switch,
+            )
+            if onchain_adapter is not None
+            else None
         )
 
         # M1.5b R2-C1 + R2-I3 + R1-M2 fold: fail-closed CRASH on misconfig.
@@ -132,6 +149,9 @@ class LiveEngine:
         """
         # M1.5b: assert removed. main.py boot guards + engine __init__
         # misconfig CRASH provide the safety contract.
+        if self._onchain_adapter is not None and _is_solana_signal(paper_trade):
+            await self._dispatch_onchain(paper_trade)
+            return
         trade_id = paper_trade.id
         size_usd = self._config.resolve_size_usd(paper_trade.signal_type)
 
@@ -478,4 +498,244 @@ class LiveEngine:
                 paper_trade.signal_type,
                 top.venue,
                 paper_trade_id=paper_trade.id,
+            )
+
+    async def _dispatch_onchain(self, paper_trade) -> None:
+        """Isolated on-chain execution fork for Solana signals.
+
+        Mirrors the structure of _dispatch_live but uses the on-chain adapter
+        + gates. In shadow/paper mode: records intent in shadow_trades (NO
+        broadcast). In live mode: record_pending_order → place_order_request
+        → await_fill_confirmation → record terminal.
+        """
+        from uuid import uuid4
+
+        from scout.live.adapter_base import OrderRequest
+        from scout.live.correction_counter import increment_consecutive
+        from scout.live.idempotency import (
+            make_client_order_id,
+            record_pending_order,
+        )
+        from scout.live.solana.mint_resolver import resolve_solana_mint
+
+        trade_id = paper_trade.id
+        size_usd = self._config.resolve_size_usd(paper_trade.signal_type)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        mint = resolve_solana_mint(
+            coin_id=paper_trade.coin_id,
+            contract_address=getattr(paper_trade, "contract_address", None),
+        )
+        if mint is None:
+            log.info("onchain_handoff_skipped_no_mint", paper_trade_id=trade_id)
+            return
+
+        result = await self._onchain_gates.evaluate_onchain(
+            signal_type=paper_trade.signal_type,
+            symbol=paper_trade.symbol,
+            venue_pair=mint,
+            size_usd=size_usd,
+        )
+        if not result.passed and result.reject_reason is None:
+            log.info(
+                "onchain_handoff_skipped",
+                paper_trade_id=trade_id,
+                reason="not_allowlisted",
+            )
+            return
+        if not result.passed and result.reject_reason == "kill_switch":
+            log.info("onchain_handoff_skipped_killed", paper_trade_id=trade_id)
+            return
+        if not result.passed:
+            assert self._db._conn is not None
+            async with self._db._txn_lock:
+                await self._db._conn.execute(
+                    "INSERT INTO shadow_trades "
+                    "(paper_trade_id, coin_id, symbol, venue, pair, signal_type, "
+                    " size_usd, status, reject_reason, created_at) "
+                    "VALUES (?, ?, ?, 'solana', ?, ?, ?, 'rejected', ?, ?)",
+                    (
+                        trade_id,
+                        paper_trade.coin_id,
+                        paper_trade.symbol,
+                        mint,
+                        paper_trade.signal_type,
+                        str(size_usd),
+                        result.reject_reason,
+                        now_iso,
+                    ),
+                )
+                await self._db._conn.commit()
+            log.info(
+                "onchain_pretrade_gate_failed",
+                paper_trade_id=trade_id,
+                reject_reason=result.reject_reason,
+                detail=result.detail,
+            )
+            return
+
+        # Passed gates. Shadow → record intent, NO broadcast.
+        if self._config.mode != "live":
+            quote = await self._onchain_adapter.quote_at_size(
+                venue_pair=mint, side="buy", size_usd=float(size_usd)
+            )
+            assert self._db._conn is not None
+            async with self._db._txn_lock:
+                await self._db._conn.execute(
+                    "INSERT INTO shadow_trades "
+                    "(paper_trade_id, coin_id, symbol, venue, pair, signal_type, "
+                    " size_usd, mid_at_entry, status, created_at) "
+                    "VALUES (?, ?, ?, 'solana', ?, ?, ?, ?, 'open', ?)",
+                    (
+                        trade_id,
+                        paper_trade.coin_id,
+                        paper_trade.symbol,
+                        mint,
+                        paper_trade.signal_type,
+                        str(size_usd),
+                        str(quote["mid"]),
+                        now_iso,
+                    ),
+                )
+                await self._db._conn.commit()
+            log.info(
+                "onchain_shadow_order_opened",
+                paper_trade_id=trade_id,
+                pair=mint,
+                mid=str(quote["mid"]),
+                size_usd=str(size_usd),
+            )
+            return
+
+        # Live → two-phase place so the tx signature is persisted to the
+        # live_trades row BEFORE any network broadcast (crash-recovery
+        # invariant). The signature is deterministic from the SIGNED tx, so:
+        #   prepare_order (quote→build→sign→derive sig, NO send)
+        #   → record_pending_order with entry_order_id=signature already set
+        #   → broadcast_prepared (the only network send)
+        # If broadcast raises after the tx may have landed, the row already
+        # carries the signature and status='open', so boot reconciliation
+        # (which filters entry_order_id IS NOT NULL) WILL recover it. The
+        # prepare step (no broadcast) failing is safe to mark manual-review.
+        intent_uuid = str(uuid4())
+        cid = make_client_order_id(trade_id, intent_uuid)
+        request = OrderRequest(
+            paper_trade_id=trade_id,
+            canonical=mint,
+            venue_pair=mint,
+            side="buy",
+            size_usd=float(size_usd),
+            intent_uuid=intent_uuid,
+        )
+        try:
+            signature, signed_tx_b64 = await self._onchain_adapter.prepare_order(
+                request
+            )
+        except Exception:
+            # No broadcast happened — nothing landed on-chain. Record the
+            # intent as needs_manual_review (no signature exists to recover).
+            log.exception("onchain_dispatch_prepare_failed", paper_trade_id=trade_id)
+            live_id = await record_pending_order(
+                self._db,
+                client_order_id=cid,
+                paper_trade_id=trade_id,
+                coin_id=paper_trade.coin_id,
+                symbol=paper_trade.symbol,
+                venue="solana",
+                pair=mint,
+                signal_type=paper_trade.signal_type,
+                size_usd=str(size_usd),
+            )
+            async with self._db._txn_lock:
+                await self._db._conn.execute(
+                    "UPDATE live_trades SET status='needs_manual_review' WHERE id=?",
+                    (live_id,),
+                )
+                await self._db._conn.commit()
+            return
+
+        # Persist the signature BEFORE broadcasting.
+        live_id = await record_pending_order(
+            self._db,
+            client_order_id=cid,
+            paper_trade_id=trade_id,
+            coin_id=paper_trade.coin_id,
+            symbol=paper_trade.symbol,
+            venue="solana",
+            pair=mint,
+            signal_type=paper_trade.signal_type,
+            size_usd=str(size_usd),
+            entry_order_id=signature,
+        )
+        try:
+            await self._onchain_adapter.broadcast_prepared(signed_tx_b64)
+        except Exception:
+            # The send raised — but the tx MAY have landed on-chain. The row
+            # already carries entry_order_id=signature and status='open', so
+            # leave it untouched: boot reconciliation re-checks it against the
+            # chain. Do NOT mark needs_manual_review (would NULL the recovery
+            # path) and do NOT broadcast again (idempotency: never re-send a
+            # signed tx whose signature we already persisted).
+            log.exception(
+                "onchain_dispatch_broadcast_failed",
+                paper_trade_id=trade_id,
+                signature=signature,
+            )
+            return
+        log.info(
+            "live_dispatch_entered",
+            paper_trade_id=trade_id,
+            venue="solana",
+            signature=signature,
+        )
+
+        try:
+            confirmation = await self._onchain_adapter.await_fill_confirmation(
+                venue_order_id=signature,
+                client_order_id=cid,
+                timeout_sec=self._config._s.SOLANA_CONFIRM_TIMEOUT_SEC,
+            )
+        except Exception:
+            log.exception(
+                "onchain_dispatch_await_fill_failed",
+                paper_trade_id=trade_id,
+                venue_order_id=signature,
+            )
+            return
+        async with self._db._txn_lock:
+            if confirmation.status == "filled":
+                # Filled buy IS an open position → keep status='open', record fill.
+                # Guard the str() casts: if the adapter could not compute a fill
+                # price/qty (e.g. the _pending stash was lost across a restart),
+                # persist SQL NULL rather than the literal string "None".
+                fill_price = (
+                    str(confirmation.fill_price)
+                    if confirmation.fill_price is not None
+                    else None
+                )
+                fill_qty = (
+                    str(confirmation.filled_qty)
+                    if confirmation.filled_qty is not None
+                    else None
+                )
+                await self._db._conn.execute(
+                    "UPDATE live_trades SET entry_fill_price=?, entry_fill_qty=? "
+                    "WHERE id=?",
+                    (fill_price, fill_qty, live_id),
+                )
+            elif confirmation.status == "rejected":
+                await self._db._conn.execute(
+                    "UPDATE live_trades SET status='rejected' WHERE id=?", (live_id,)
+                )
+            # timeout → leave 'open'; Task 12 boot reconciliation resolves it.
+            await self._db._conn.commit()
+        log.info(
+            "live_dispatch_terminal",
+            paper_trade_id=trade_id,
+            venue="solana",
+            signature=signature,
+            status=confirmation.status,
+        )
+        if confirmation.status == "filled":
+            await increment_consecutive(
+                self._db, paper_trade.signal_type, "solana", paper_trade_id=trade_id
             )

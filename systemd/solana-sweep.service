@@ -1,0 +1,9 @@
+[Unit]
+Description=gecko-alpha Solana float sweep
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/gecko-alpha
+EnvironmentFile=/opt/gecko-alpha/.env
+ExecStart=/opt/gecko-alpha/.venv/bin/python -m scripts.solana_sweep
