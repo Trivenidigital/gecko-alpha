@@ -1562,6 +1562,21 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
         except Exception:
             logger.exception("dex_txns_prune_failed")
 
+    # Narrative resolution observability (gated): emit composition-aware metrics
+    # + a structured watchdog so 'fresh inbound but zero resolved' is never a
+    # silent mystery. Read-only; does not change scorer/gate/trading behavior.
+    if getattr(settings, "NARRATIVE_ENABLED", False):
+        try:
+            from scout.api.narrative_resolver import narrative_resolution_alarms
+
+            n_stats = await db.narrative_resolution_stats()
+            logger.info("narrative_resolution_metrics", **n_stats)
+            n_alarms = narrative_resolution_alarms(n_stats)
+            if n_alarms:
+                logger.warning("narrative_resolution_alarm", alarms=n_alarms)
+        except Exception:
+            logger.exception("narrative_resolution_metrics_failed")
+
 
 async def _maybe_announce_tg_alerts(db, session, settings) -> None:
     """BL-NEW-TG-ALERT-ALLOWLIST: first-deploy operator announcement.
