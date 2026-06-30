@@ -120,6 +120,25 @@ async def test_resolve_pool_address_malformed_raises(mock_aiohttp):
             await resolve_pool_address(session, chain="solana", contract_address=CA)
 
 
+async def test_resolve_pool_address_skips_addressless_pool_when_valid_exists(
+    mock_aiohttp,
+):
+    # A malformed (address-less) entry with HIGHER reserve must not shadow a
+    # valid pool: resolution returns the valid pool, it does not raise.
+    mock_aiohttp.get(
+        _pools_url("solana", CA),
+        payload={
+            "data": [
+                {"attributes": {"reserve_in_usd": "99999"}},  # no id, no address
+                _pool("POOL_V", "1000"),
+            ]
+        },
+    )
+    async with aiohttp.ClientSession() as session:
+        ref = await resolve_pool_address(session, chain="solana", contract_address=CA)
+    assert ref.pool_address == "POOL_V"
+
+
 async def test_resolve_pool_address_eth_chain_maps_network(mock_aiohttp):
     # ethereum -> eth network mapping is reused from geckoterminal.
     mock_aiohttp.get(
