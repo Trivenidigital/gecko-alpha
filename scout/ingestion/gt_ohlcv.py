@@ -113,9 +113,13 @@ async def _gt_get_json(
                         )
                         await asyncio.sleep(wait)
                         continue
-                    raise PriceProviderError("geckoterminal", f"http_{resp.status}", url)
+                    raise PriceProviderError(
+                        "geckoterminal", f"http_{resp.status}", url
+                    )
                 if resp.status != 200:
-                    raise PriceProviderError("geckoterminal", f"http_{resp.status}", url)
+                    raise PriceProviderError(
+                        "geckoterminal", f"http_{resp.status}", url
+                    )
                 try:
                     return await resp.json()
                 except (aiohttp.ContentTypeError, ValueError) as exc:
@@ -135,9 +139,7 @@ async def _gt_get_json(
                 )
                 await asyncio.sleep(wait)
                 continue
-            raise PriceProviderError(
-                "geckoterminal", type(exc).__name__, url
-            ) from exc
+            raise PriceProviderError("geckoterminal", type(exc).__name__, url) from exc
     raise PriceProviderError("geckoterminal", "retries_exhausted", url)
 
 
