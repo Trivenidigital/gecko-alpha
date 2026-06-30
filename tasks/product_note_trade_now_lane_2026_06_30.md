@@ -1,13 +1,20 @@
-# Product note — High-Precision Trade-Now Lane (conceptual; BLOCKED on DEX soak)
+# Product note — High-Precision Trade-Now **Candidate** Lane (conceptual; BLOCKED on DEX soak)
 
 **Date:** 2026-06-30
 **Status:** CONCEPTUAL / DOCS-ONLY. **Do NOT implement.** Implementation is gated on the DEX-instrumentation
-soak evidence (see "Unlock gate"). Captured at operator direction during the observe-only soak.
+soak evidence (see "Unlock gate") — the gate is **non-negotiable**. Captured at operator direction during
+the observe-only soak.
 **Home backlog item:** `BL-NEW-TG-ALERT-QUALIFICATION-DESIGN` (this note resolves its open
 "scarcity algorithm / daily budget / corpus scope" gates).
 
+**Framing (use throughout): "Trade-Now Candidate Lane."** It is a **high-priority manual-review alert** —
+a candidate worth opening and reviewing *immediately* — **not** a "trade-now signal," "buy signal," or any
+instruction to trade. The lane raises a candidate to the top of the operator's attention; the trade decision
+stays fully manual.
+
 ## The gap (why this lane is needed)
-The operator wants **a few important TG pings they can trade on sight**. Today neither surface delivers that:
+The operator wants **a few important TG pings — high-priority candidates worth opening and reviewing
+immediately** (manual review, never an instruction to trade). Today neither surface delivers that:
 - **TG alert path is silent.** Alerts fire only at conviction ≥ 75 (needs quant ≥ 65); the ANSEM/under-gate
   work proved **nothing reaches 65** → zero TG "trade-now" pings. ANSEM (477×) and CATWIFHAT were *recorded
   but never alerted*.
@@ -41,19 +48,19 @@ send very few pings and make each one worth attention. This honors the existing 
    evidence and decides dispatch; it does not alter how tokens are scored or gated.
 
 ## Precision target
-- Conceptual bar: **a strong majority of pings should be "worth having opened."** The concrete hit-rate floor
-  **cannot be set until the soak gives the false-positive cost** — a precision-capped lane needs a known FP
-  rate to place its bar. Placeholder for planning only: ≥ ~50–60% "actionable / worth-it" rate, to be
-  **finalized from the F1 cohort precision** once measurable.
+- The precision floor is **chosen from evidence — the measured F1-cohort precision — NOT placeholder
+  intuition.** **No numeric floor is asserted here**; asserting one pre-evidence would defeat the purpose of
+  the unlock gate. The bar is set only once the soak yields the false-positive cost.
+- Conceptual intent (not a number): **a strong majority of pings should be "worth having opened."**
 - Recall is explicitly **not** a target for V1.
 
-## Required evidence from the DEX soak (the Unlock gate)
-Implementation stays BLOCKED until ALL hold:
+## Required evidence from the DEX soak (the Unlock gate — NON-NEGOTIABLE)
+Implementation stays BLOCKED until **ALL** hold — no partial unlock, no exceptions:
 1. DEX **measurable cohort `n ≥ 30`**,
 2. **≥ 1 ran-≥10× candidate** in that cohort,
-3. **F1 cohort re-run** with the never-listing **survivorship bound** reported,
-4. **candidate volume and false-positive cost known** (so the daily cap + precision floor can be set on
-   evidence, not guesswork).
+3. **F1 cohort re-run completed** with the never-listing **survivorship bound** reported,
+4. **candidate volume and false-positive cost known**,
+5. **precision floor chosen from that evidence — not placeholder intuition.**
 
 Rationale: the whole reason the gate is currently unreachable-and-silent is that we lack the denominator to
 recalibrate safely. The DEX instrumentation soak exists to earn exactly that denominator. See
