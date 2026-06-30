@@ -1,0 +1,18 @@
+{
+  "topic": "x-influencer-performance-accrual",
+  "task_text": "X influencer performance accrual: resolve X source_calls to token identity at call time, snapshot price_at_call + forward 24h price, compute forward_24h_pct / max_favorable_pct_24h / time_to_peak_min, with coverage observability + silent-failure watchdogs. Price-truth/forward-return computation over crypto tokens.",
+  "completed_at": "2026-06-30T19:36:00Z",
+  "drift_check_tag": "extends-Hermes",
+  "net_new_step_count": 9,
+  "hermes_step_count": 1,
+  "files_to_read_first": [
+    "scout/source_quality/ledger.py",
+    "scout/api/narrative_resolver.py",
+    "scout/db.py",
+    "scripts/source_calls_live_writer.py",
+    "scripts/check_source_calls_lag.py",
+    "scout/ingestion/geckoterminal.py",
+    "scout/ingestion/dexscreener.py",
+    "tasks/design_source_call_outcome_ledger_2026_05_20.md"
+  ]
+}
