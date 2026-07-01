@@ -72,6 +72,23 @@ class SourceQualityRow:
     per_horizon_eligible_counts: dict[str, int]
 
 
+@dataclass(frozen=True)
+class XPriceCoverage:
+    """X-wide price/forward coverage snapshot (design #392 C4 §4.4)."""
+
+    total_x_calls: int
+    resolved_token_id: int
+    eligible_contract: int
+    unresolved: int
+    with_price_at_call: int
+    with_forward_24h: int
+    with_max_favorable_24h: int
+    matured_all_null: int
+    outcome_status_counts: dict[str, int]
+    call_kind_counts: dict[str, int]
+    unresolved_reason_counts: dict[str, int]
+
+
 def parse_utc(value: str | datetime | None) -> datetime | None:
     if value is None:
         return None
@@ -732,6 +749,76 @@ async def compute_source_quality_summary(
             )
         )
     return summaries
+
+
+async def compute_x_price_coverage(
+    conn: aiosqlite.Connection, *, now: datetime | None = None
+) -> XPriceCoverage:
+    """X-wide price/forward coverage + unresolved-by-reason (design #392 C4).
+
+    Read-only aggregate over EXISTING source_calls fields — introduces no new
+    column. ``matured_all_null`` flags resolved-identity X calls past the 24h
+    window end (call+28h) that still carry no price and no forward return — the
+    coverage gap the C4 watchdogs alarm on.
+    """
+    now_dt = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    matured_cutoff = now_dt - timedelta(hours=28)
+    cur = await conn.execute(
+        "SELECT resolved_state, outcome_status, call_kind, call_ts, "
+        "price_at_call, forward_24h_pct, max_favorable_pct_24h, missing_fields "
+        "FROM source_calls WHERE source_type='x'"
+    )
+    rows = await cur.fetchall()
+    resolved_token_id = eligible_contract = unresolved = 0
+    with_price = with_fwd24 = with_maxfav = matured_all_null = 0
+    outcome_counts: dict[str, int] = {}
+    kind_counts: dict[str, int] = {}
+    reason_counts: dict[str, int] = {}
+    for row in rows:
+        rs = row["resolved_state"]
+        if rs == "resolved":
+            resolved_token_id += 1
+        elif rs == RESOLVED_STATE_CONTRACT:
+            eligible_contract += 1
+        else:
+            unresolved += 1
+        if row["price_at_call"] is not None:
+            with_price += 1
+        if row["forward_24h_pct"] is not None:
+            with_fwd24 += 1
+        if row["max_favorable_pct_24h"] is not None:
+            with_maxfav += 1
+        call_ts = parse_utc(row["call_ts"])
+        if (
+            rs in ("resolved", RESOLVED_STATE_CONTRACT)
+            and call_ts is not None
+            and call_ts <= matured_cutoff
+            and row["price_at_call"] is None
+            and row["forward_24h_pct"] is None
+        ):
+            matured_all_null += 1
+        status = row["outcome_status"]
+        if status:
+            outcome_counts[status] = outcome_counts.get(status, 0) + 1
+        kind = row["call_kind"]
+        if kind:
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        for item in _loads_missing(row["missing_fields"]):
+            reason = str(item.get("reason", "unknown"))
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    return XPriceCoverage(
+        total_x_calls=len(rows),
+        resolved_token_id=resolved_token_id,
+        eligible_contract=eligible_contract,
+        unresolved=unresolved,
+        with_price_at_call=with_price,
+        with_forward_24h=with_fwd24,
+        with_max_favorable_24h=with_maxfav,
+        matured_all_null=matured_all_null,
+        outcome_status_counts=outcome_counts,
+        call_kind_counts=kind_counts,
+        unresolved_reason_counts=reason_counts,
+    )
 
 
 def _loads_missing(value: str | None) -> list[dict[str, Any]]:
