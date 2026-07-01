@@ -140,6 +140,19 @@ class Settings(BaseSettings):
     COINGECKO_DEEP_VOLUME_MIN_24H_CHANGE: float = 3.0
     COINGECKO_DEEP_VOLUME_MAX_TOKENS_PER_CYCLE: int = 75
 
+    # -------- Source-call price snapshots (X perf accrual C2, #392) --------
+    # Forward-only GeckoTerminal-by-CA snapshot writer
+    # (scripts/source_call_price_snapshots_writer.py, cron <=15 min). DEFAULT
+    # OFF (deploy-without-activate): the merged writer is inert until the
+    # operator sets SOURCE_CALL_SNAPSHOT_WRITER_ENABLED=true in .env — no
+    # deploy/activation during the DEX soak without separate approval. These
+    # knobs are consumed by the .sh wrapper (via .env); declared here so .env
+    # stays valid under extra="forbid".
+    # HORIZON = widest forward-window end (the 24h window closes at call+28h);
+    # a call older than this can gain no new in-window snapshot.
+    SOURCE_CALL_SNAPSHOT_WRITER_ENABLED: bool = False
+    SOURCE_CALL_SNAPSHOT_HORIZON_HOURS: int = Field(default=28, ge=1, le=168)
+
     # Held-position price-refresh lane (§12c-narrow remediation).
     # See tasks/plan_held_position_price_freshness.md and
     # tasks/findings_open_position_price_freshness_2026_05_12.md.
