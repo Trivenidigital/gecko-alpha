@@ -159,6 +159,8 @@ class Database:
         # Additive table; the snapshot-writer cron populates it. No source_calls
         # columns are added. The (separate) C3 pricing hookup reads it.
         await self._migrate_source_call_price_snapshots_v1()
+        # C4 (#392): per-cycle snapshot-writer run stats (§12a watchdog substrate).
+        await self._migrate_source_call_price_snapshot_runs_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -5236,6 +5238,107 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "source_call_price_snapshots_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_source_call_price_snapshot_runs_v1(self) -> None:
+        """C4 (#392): per-cycle snapshot-writer run stats (§12a watchdog substrate).
+
+        Additive + idempotent. Records each snapshot-writer cycle's counters so
+        the coverage watchdogs can read OUTPUT rows (freshness, provider-error
+        rate) rather than a heartbeat — distinguishing "writer down" from "writer
+        ran but nothing priceable".
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "source_call_price_snapshot_runs_v1"
+        schema_version = 20260702
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info(
+                    "source_call_price_snapshot_runs_v1_migration_skip_already_applied"
+                )
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if (
+                existing_version is not None
+                and existing_version["description"] != migration_name
+            ):
+                raise RuntimeError(
+                    "schema_version collision for source_call_price_snapshot_runs_v1: "
+                    f"version={schema_version} "
+                    f"description={existing_version['description']}"
+                )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS source_call_price_snapshot_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ran_at TEXT NOT NULL,
+                    identities_seen INTEGER NOT NULL,
+                    snapshots_written INTEGER NOT NULL,
+                    provider_errors INTEGER NOT NULL,
+                    pools_unresolved INTEGER NOT NULL,
+                    empty_ohlcv INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scps_runs_ran_at "
+                "ON source_call_price_snapshot_runs(ran_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "source_call_price_snapshot_runs_v1_migration_complete",
+                table="source_call_price_snapshot_runs",
+            )
+        except BaseException as e:
+            _log.exception(
+                "source_call_price_snapshot_runs_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,
