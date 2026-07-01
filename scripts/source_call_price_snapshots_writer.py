@@ -41,7 +41,10 @@ structlog.configure(
     logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
 )
 
-from scout.source_quality.snapshot_writer import write_price_snapshots
+from scout.source_quality.snapshot_writer import (
+    record_snapshot_run,
+    write_price_snapshots,
+)
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -81,6 +84,13 @@ async def _run(db_path: str, *, horizon_hours: int) -> dict:
                 resolve_pool=resolve_pool,
                 fetch_ohlcv=fetch_ohlcv,
                 horizon_hours=horizon_hours,
+            )
+            # C4: persist this cycle's counters so the coverage watchdogs can
+            # read output rows (writer freshness + provider-error rate).
+            await record_snapshot_run(
+                conn,
+                ran_at=datetime.now(timezone.utc).isoformat(),
+                stats=stats,
             )
     finished = datetime.now(timezone.utc)
     return {
