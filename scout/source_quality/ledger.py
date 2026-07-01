@@ -31,6 +31,13 @@ WINDOWS: dict[str, tuple[timedelta, timedelta, int]] = {
     "forward_24h_pct": (timedelta(hours=24), timedelta(hours=28), 60 * 60),
 }
 
+# Priceable-identity classification for source calls (design #392 C1). A row is
+# priceable by a coin_id ('resolved') or a (contract, chain) pair
+# ('eligible_contract', awaiting the C2 snapshot writer); a cashtag/symbol alone
+# is not priceable ('unresolved').
+RESOLVED_STATE_CONTRACT = "eligible_contract"
+RESOLVED_STATE_UNRESOLVED = "unresolved"
+
 
 @dataclass(frozen=True)
 class LagCheckResult:
@@ -103,6 +110,25 @@ def _identity(row: Any) -> tuple[str, str]:
     if symbol:
         return symbol, "symbol"
     return str(_row_get(row, "source_event_id")), "source_event"
+
+
+def _priceable_identity(row: Any) -> tuple[str, str] | None:
+    """The identity a source call can be PRICED by, as ``(kind, key)``, or None.
+
+    Contract identity is authoritative for the first-pass X cohort (design #392
+    §4.0): a coin_id (``token_id``) or a ``(contract_address, chain)`` pair is
+    priceable; a cashtag/symbol alone is NOT (that needs a separate symbol
+    resolver) and returns None. Distinct from :func:`_identity`, which also
+    returns symbol / source_event kinds for clustering.
+    """
+    token_id = _row_get(row, "token_id")
+    if token_id:
+        return "token_id", str(token_id)
+    contract = _row_get(row, "contract_address")
+    if contract:
+        chain = _row_get(row, "chain")
+        return "contract", f"{chain or ''}|{str(contract).lower()}"
+    return None
 
 
 def _cluster_key(
@@ -494,24 +520,63 @@ async def _recompute_duplicate_ranks(conn: aiosqlite.Connection) -> None:
             )
 
 
+async def _set_resolved_state(
+    conn: aiosqlite.Connection, source_call_id: int, state: str
+) -> None:
+    await conn.execute(
+        "UPDATE source_calls SET resolved_state=?, updated_at=datetime('now') "
+        "WHERE id=?",
+        (state, source_call_id),
+    )
+
+
 async def refresh_source_call_outcomes(
     conn: aiosqlite.Connection, *, now: datetime | None = None
 ) -> dict[str, int]:
+    """Refresh outcomes, routing by priceable identity (design #392 C1).
+
+    - **coin_id** (``token_id``): priced via the existing gainers/losers
+      snapshots — unchanged behavior.
+    - **contract** (CA + chain): eligible for pricing once the C2 forward-only
+      snapshot writer exists; C1 records identity eligibility only
+      (``resolved_state='eligible_contract'``) and writes no performance field.
+    - **neither** (cashtag-only / no identity): explicit ``'unresolved'`` — never
+      priced, never mislabeled as a price failure, not silently skipped.
+    """
     now_dt = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    cur = await conn.execute("SELECT id, token_id, call_ts FROM source_calls")
+    cur = await conn.execute(
+        "SELECT id, token_id, call_ts, contract_address, chain FROM source_calls"
+    )
     rows = await cur.fetchall()
     updated = 0
+    eligible_contract = 0
+    unresolved_identity = 0
     for row in rows:
         call_ts = parse_utc(row["call_ts"])
-        token_id = row["token_id"]
         if call_ts is None:
             continue
-        price_rows = await _fetch_snapshot_rows(conn, token_id) if token_id else []
-        outcome = _compute_outcome(call_ts=call_ts, now=now_dt, price_rows=price_rows)
-        await _update_outcome(conn, row["id"], outcome)
-        updated += 1
+        identity = _priceable_identity(row)
+        if identity is None:
+            await _set_resolved_state(conn, row["id"], RESOLVED_STATE_UNRESOLVED)
+            unresolved_identity += 1
+            continue
+        kind, key = identity
+        if kind == "token_id":
+            price_rows = await _fetch_snapshot_rows(conn, key)
+            outcome = _compute_outcome(
+                call_ts=call_ts, now=now_dt, price_rows=price_rows
+            )
+            await _update_outcome(conn, row["id"], outcome)
+            updated += 1
+        else:  # contract — eligible for later pricing, identity metadata only
+            await _set_resolved_state(conn, row["id"], RESOLVED_STATE_CONTRACT)
+            eligible_contract += 1
     await conn.commit()
-    return {"updated": updated}
+    return {
+        "updated": updated,
+        "eligible_contract": eligible_contract,
+        "unresolved_identity": unresolved_identity,
+    }
 
 
 async def _update_outcome(

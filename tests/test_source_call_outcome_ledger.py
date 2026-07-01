@@ -389,6 +389,107 @@ async def test_stale_at_call_price_suppresses_24h_extrema(db):
     assert {"field": "max_favorable_pct_24h", "reason": "stale_at_call"} in missing
 
 
+async def _insert_inbound(
+    conn, *, event_id, cashtag=None, ca=None, chain=None, coin_id=None
+):
+    await conn.execute(
+        "INSERT INTO narrative_alerts_inbound "
+        "(event_id, tweet_id, tweet_author, tweet_ts, tweet_text, tweet_text_hash, "
+        "extracted_cashtag, extracted_ca, extracted_chain, resolved_coin_id, "
+        "narrative_theme, urgency_signal, classifier_version, received_at) "
+        "VALUES (?, ?, 'kol_x', '2026-05-20T00:00:00Z', 'tweet', ?, ?, ?, ?, ?, "
+        "'ai', 'high', 'v1', '2026-05-20T00:01:00+00:00')",
+        (event_id, f"tw-{event_id}", f"hash-{event_id}", cashtag, ca, chain, coin_id),
+    )
+
+
+async def test_c1_priceable_identity_classification():
+    # coin_id wins; else contract; cashtag-only is NOT priceable (design #392 §4.0).
+    from scout.source_quality.ledger import _priceable_identity
+
+    assert _priceable_identity({"token_id": "coin-x"}) == ("token_id", "coin-x")
+    assert _priceable_identity(
+        {"token_id": None, "contract_address": "0xAbC", "chain": "base"}
+    ) == ("contract", "base|0xabc")
+    assert (
+        _priceable_identity(
+            {"token_id": None, "contract_address": None, "symbol": "MEME"}
+        )
+        is None
+    )
+
+
+async def test_c1_ca_only_call_marked_eligible_not_skipped(db):
+    # Prior bug: a falsy token_id short-circuited CA-only calls to unresolvable.
+    # C1: CA identity is eligible for later pricing, not silently skipped, and no
+    # performance field is written (C2 does the pricing).
+    await _insert_inbound(
+        db._conn, event_id="evt-ca", ca="0xDEADbeef", chain="base", coin_id=None
+    )
+    await db._conn.commit()
+    await backfill_source_calls(db._conn)
+    stats = await refresh_source_call_outcomes(
+        db._conn, now=datetime(2026, 5, 22, tzinfo=timezone.utc)
+    )
+
+    row = await _fetchone(
+        db._conn,
+        "SELECT token_id, contract_address, resolved_state, price_at_call, "
+        "forward_24h_pct, max_favorable_pct_24h FROM source_calls "
+        "WHERE source_event_id='evt-ca'",
+    )
+    assert row["token_id"] is None
+    assert row["contract_address"] == "0xDEADbeef"
+    assert row["resolved_state"] == "eligible_contract"
+    assert row["price_at_call"] is None
+    assert row["forward_24h_pct"] is None
+    assert row["max_favorable_pct_24h"] is None
+    assert stats["eligible_contract"] == 1
+    assert stats["updated"] == 0
+
+
+async def test_c1_cashtag_only_call_unresolved_not_priceable(db):
+    await _insert_inbound(db._conn, event_id="evt-cash", cashtag="MEME", coin_id=None)
+    await db._conn.commit()
+    await backfill_source_calls(db._conn)
+    stats = await refresh_source_call_outcomes(
+        db._conn, now=datetime(2026, 5, 22, tzinfo=timezone.utc)
+    )
+
+    row = await _fetchone(
+        db._conn,
+        "SELECT resolved_state, price_at_call FROM source_calls "
+        "WHERE source_event_id='evt-cash'",
+    )
+    assert row["resolved_state"] == "unresolved"
+    assert row["price_at_call"] is None
+    assert stats["unresolved_identity"] == 1
+    assert stats["eligible_contract"] == 0
+
+
+async def test_c1_token_id_call_still_priced_not_regressed(db):
+    await _insert_inbound(
+        db._conn, event_id="evt-coin", cashtag="TOK", coin_id="coin-tok"
+    )
+    await _insert_gainer_price(db._conn, "coin-tok", 1.0, "2026-05-19 23:59:00")
+    await _insert_gainer_price(db._conn, "coin-tok", 1.5, "2026-05-20T00:35:00+00:00")
+    await db._conn.commit()
+    await backfill_source_calls(db._conn)
+    stats = await refresh_source_call_outcomes(
+        db._conn, now=datetime(2026, 5, 22, tzinfo=timezone.utc)
+    )
+
+    row = await _fetchone(
+        db._conn,
+        "SELECT token_id, price_at_call, forward_30m_pct FROM source_calls "
+        "WHERE source_event_id='evt-coin'",
+    )
+    assert row["token_id"] == "coin-tok"
+    assert row["price_at_call"] == 1.0
+    assert row["forward_30m_pct"] == 50.0
+    assert stats["updated"] == 1
+
+
 async def test_summary_uses_distinct_eligible_clusters_and_coverage_gate(db):
     call_ts = datetime(2026, 5, 20, tzinfo=timezone.utc)
     for idx in range(12):
