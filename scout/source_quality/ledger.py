@@ -31,6 +31,14 @@ WINDOWS: dict[str, tuple[timedelta, timedelta, int]] = {
     "forward_24h_pct": (timedelta(hours=24), timedelta(hours=28), 60 * 60),
 }
 
+# Just-after-call anchor window (design #392 C3): for a forward-only price series
+# (e.g. C2 contract snapshots captured at/after the call) with no at-or-before
+# snapshot, _compute_outcome accepts the earliest snapshot within
+# [call_ts, call_ts + this] as price_at_call. token_id rows have gainers/losers
+# snapshots straddling call_ts, so this fallback never fires for them.
+PRICE_AT_CALL_TOLERANCE_SEC = 900
+
+
 # Priceable-identity classification for source calls (design #392 C1). A row is
 # priceable by a coin_id ('resolved') or a (contract, chain) pair
 # ('eligible_contract', awaiting the C2 snapshot writer); a cashtag/symbol alone
@@ -166,14 +174,41 @@ def _status_from_missing(
 
 
 async def _fetch_snapshot_rows(
-    conn: aiosqlite.Connection, token_id: str
+    conn: aiosqlite.Connection,
+    identity_key: str,
+    identity_kind: str = "token_id",
 ) -> list[dict[str, Any]]:
+    """Price series for a priceable identity, ascending by snapshot_at.
+
+    - ``token_id`` (default): the existing gainers/losers CG snapshots keyed by
+      coin_id — behavior UNCHANGED.
+    - ``contract``: the C2 forward-only ``source_call_price_snapshots`` keyed by
+      ``(identity_kind, identity_key)`` (design #392 C3).
+    """
     rows: list[dict[str, Any]] = []
-    for table in ("gainers_snapshots", "losers_snapshots"):
+    if identity_kind == "token_id":
+        for table in ("gainers_snapshots", "losers_snapshots"):
+            cur = await conn.execute(
+                f"SELECT coin_id, price_at_snapshot, snapshot_at, '{table}' AS source "
+                f"FROM {table} WHERE coin_id = ? AND price_at_snapshot IS NOT NULL",
+                (identity_key,),
+            )
+            for row in await cur.fetchall():
+                snapshot_at = parse_utc(row["snapshot_at"])
+                if snapshot_at is None:
+                    continue
+                rows.append(
+                    {
+                        "price": row["price_at_snapshot"],
+                        "snapshot_at": snapshot_at,
+                        "source": table,
+                    }
+                )
+    else:
         cur = await conn.execute(
-            f"SELECT coin_id, price_at_snapshot, snapshot_at, '{table}' AS source "
-            f"FROM {table} WHERE coin_id = ? AND price_at_snapshot IS NOT NULL",
-            (token_id,),
+            "SELECT price, snapshot_at, source FROM source_call_price_snapshots "
+            "WHERE identity_kind = ? AND identity_key = ? AND price IS NOT NULL",
+            (identity_kind, identity_key),
         )
         for row in await cur.fetchall():
             snapshot_at = parse_utc(row["snapshot_at"])
@@ -181,9 +216,9 @@ async def _fetch_snapshot_rows(
                 continue
             rows.append(
                 {
-                    "price": row["price_at_snapshot"],
+                    "price": row["price"],
                     "snapshot_at": snapshot_at,
-                    "source": table,
+                    "source": row["source"],
                 }
             )
     rows.sort(key=lambda r: r["snapshot_at"])
@@ -195,6 +230,7 @@ def _compute_outcome(
     call_ts: datetime,
     now: datetime,
     price_rows: list[dict[str, Any]],
+    at_call_tolerance_sec: int = PRICE_AT_CALL_TOLERANCE_SEC,
 ) -> dict[str, Any]:
     missing: list[dict[str, str]] = []
     values: dict[str, float | None] = {field: None for field in FORWARD_FIELDS}
@@ -206,10 +242,25 @@ def _compute_outcome(
     }
 
     at_or_before = [row for row in price_rows if row["snapshot_at"] <= call_ts]
-    at_call = at_or_before[-1] if at_or_before else None
+    if at_or_before:
+        at_call = at_or_before[-1]
+    else:
+        # Forward-only series (design #392 C3): no snapshot at/before the call
+        # (e.g. C2 contract snapshots captured just after it). Anchor on the
+        # EARLIEST snapshot within [call_ts, call_ts + tolerance]. token_id rows
+        # always have an at-or-before snapshot, so this never fires for them.
+        anchor_deadline = call_ts + timedelta(seconds=at_call_tolerance_sec)
+        just_after = [
+            row
+            for row in price_rows
+            if call_ts <= row["snapshot_at"] <= anchor_deadline
+        ]
+        at_call = just_after[0] if just_after else None
     price_at_call = at_call["price"] if at_call else None
     price_age_sec = (
-        int((call_ts - at_call["snapshot_at"]).total_seconds()) if at_call else None
+        int(abs((at_call["snapshot_at"] - call_ts).total_seconds()))
+        if at_call
+        else None
     )
     price_source = at_call["source"] if at_call else None
     price_snapshot_at = _iso(at_call["snapshot_at"]) if at_call else None
@@ -568,8 +619,13 @@ async def refresh_source_call_outcomes(
             )
             await _update_outcome(conn, row["id"], outcome)
             updated += 1
-        else:  # contract — eligible for later pricing, identity metadata only
+        else:  # contract — price from C2 forward-only snapshots (design #392 C3)
             await _set_resolved_state(conn, row["id"], RESOLVED_STATE_CONTRACT)
+            price_rows = await _fetch_snapshot_rows(conn, key, "contract")
+            outcome = _compute_outcome(
+                call_ts=call_ts, now=now_dt, price_rows=price_rows
+            )
+            await _update_outcome(conn, row["id"], outcome)
             eligible_contract += 1
     await conn.commit()
     return {
