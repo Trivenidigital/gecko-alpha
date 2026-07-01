@@ -153,7 +153,9 @@ async def test_writer_writes_gt_snapshot_for_eligible_contract(db):
     assert len(rows) == 1
     snap = rows[0]
     assert snap["identity_kind"] == "contract"
-    assert snap["identity_key"] == "solana|so1address"  # lowercased per _priceable_identity
+    assert (
+        snap["identity_key"] == "solana|so1address"
+    )  # lowercased per _priceable_identity
     assert snap["chain"] == "solana"
     assert snap["price"] == 1.23
     assert snap["source"] == "gt"
