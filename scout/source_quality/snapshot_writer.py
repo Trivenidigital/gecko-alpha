@@ -139,3 +139,29 @@ async def write_price_snapshots(
     await conn.commit()
     _log.info("scps_writer_cycle", **stats)
     return stats
+
+
+async def record_snapshot_run(
+    conn: aiosqlite.Connection, *, ran_at: str, stats: dict[str, int]
+) -> None:
+    """Persist one writer cycle's counters (design #392 C4, §12a substrate).
+
+    Read by the coverage watchdogs to distinguish "writer down" from "writer ran
+    but nothing priceable", and to compute the provider-error rate over recent
+    runs. Append-only; kept separate from ``write_price_snapshots`` so the pure
+    pricing function stays side-effect-focused and the cron owns persistence.
+    """
+    await conn.execute(
+        "INSERT INTO source_call_price_snapshot_runs "
+        "(ran_at, identities_seen, snapshots_written, provider_errors, "
+        " pools_unresolved, empty_ohlcv) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            ran_at,
+            int(stats.get("identities_seen", 0)),
+            int(stats.get("snapshots_written", 0)),
+            int(stats.get("provider_errors", 0)),
+            int(stats.get("pools_unresolved", 0)),
+            int(stats.get("empty_ohlcv", 0)),
+        ),
+    )
+    await conn.commit()
