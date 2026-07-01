@@ -215,7 +215,10 @@ def test_writer_picks_up_new_upstream_row(tmp_path):
     assert res2.returncode == 0
     assert body2["backfill"]["inserted"] == 1
     assert body2["backfill"]["tg_seen"] == 1
-    assert body2["refresh"]["updated"] == 1
+    # No token_id/contract on this upstream row -> no priceable identity, so the
+    # refresh classifies it as unresolved-identity (design #392 C1) rather than
+    # pricing it. The row is still picked up and processed (asserted below).
+    assert body2["refresh"]["unresolved_identity"] == 1
 
     # Verify the row landed in source_calls.
     conn = sqlite3.connect(str(db))
