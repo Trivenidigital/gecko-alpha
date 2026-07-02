@@ -2909,3 +2909,15 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 - Narrative predictions with explicit weak/unsafe reasoning are not treated as equally tradable.
 - TG/X remains context-only until price-coverage rankability unlocks source measurement.
 - Hermes explanations are present only as enrichment, never as price/PnL/identity/execution truth.
+
+---
+
+## 2026-07-02 — Fable-review follow-ups (PROPOSED)
+
+1. **BL-NEW-CANDIDATE-ALERT-AT-MOST-ONCE** — PROPOSED 2026-07-02. Candidate alert path is at-least-once by design after #401 (record-after-confirmed-delivery; a crash between Telegram 200 and `log_alert` re-sends on restart). If strict at-most-once is wanted, port the claim-then-demote pattern from `scout/trading/tg_alert_dispatch.py:414-448` to the candidate path. Small slice; operator accepted the current trade-off at #401 merge (see `tasks/gecko-alpha-fable-review_2026_07.md` Phase 1).
+
+2. **BL-NEW-MIGRATION-VERSION-SCHEME** — PROPOSED 2026-07-02. Date-based `schema_version` integers collide: two migrations on master both chose dates as versions and PR #400 reused `20260702` (already taken by `source_call_price_snapshot_runs_v1`, db.py:5266). Evaluate monotonic sequence numbers (MAX(version)+1 at authoring time) or `date+2-digit-suffix` convention + a CI check asserting uniqueness of `schema_version = N` literals in scout/db.py. The CI uniqueness check is the load-bearing part whichever scheme wins.
+
+3. **BL-NEW-PR400-MIGRATION-RENUMBER** — PROPOSED 2026-07-02, BLOCKS #400. `_migrate_live_trades_venue_column` in PR #400 uses `schema_version = 20260702` (collides with merged C2 migration) and lacks the description-collision guard other migrations carry — on upgrade it would silently misattribute or fail. Renumber (20260704+ or per BL-NEW-MIGRATION-VERSION-SCHEME) and add the guard before #400 merges.
+
+4. **BL-NEW-ONE-WORKTREE-PER-SESSION** — PROPOSED 2026-07-02. The shared checkout's HEAD moved mid-session to a PR #400 review line (2dbc777a) while another session had uncommitted files there — the documented parallel-session divergence failure mode (memory: feedback_parallel_session_branch_coordination). Establish: every session (human or agent) claims its own `git worktree` before any git state change; the root checkout stays on master, read-only. Enforce via session-start convention in CLAUDE.md before Phase 6 implementation slices.
