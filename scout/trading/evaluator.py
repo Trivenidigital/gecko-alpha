@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 import structlog
 
 from scout.db import Database
+from scout.price_sources import resolve_price_source
 from scout.trading.paper import PaperTrader
 from scout.trading.params import params_for_signal
 
@@ -88,6 +89,8 @@ async def _send_expiry_anomaly_alert(
     signal_type: str,
     exit_reason: str,
     days_held: float,
+    headline: str | None = None,
+    detail: str | None = None,
 ) -> None:
     """GA-01 §12b operator alert for force-closes without a usable price.
 
@@ -98,6 +101,10 @@ async def _send_expiry_anomaly_alert(
     rows diluting auto-suspend stats. Mirrors the auto_suspend
     dispatched/delivered trace pattern; alert failure NEVER breaks the
     close (the DB write already committed before this is called).
+
+    Phase 6 slice 3 generalization: *headline*/*detail* let non-expiry
+    forced closes (stale-onset exits) reuse this machinery with accurate
+    wording. Defaults preserve the GA-01 expiry-close message verbatim.
     """
     if session is None:
         log.info(
@@ -114,13 +121,17 @@ async def _send_expiry_anomaly_alert(
     from scout import alerter
 
     body = (
-        "WARNING: paper trade force-closed without a usable market price\n"
+        (headline or "WARNING: paper trade force-closed without a usable market price")
+        + "\n"
         f"trade_id: {trade_id}\n"
         f"token_id: {token_id}\n"
         f"signal_type: {signal_type}\n"
         f"exit_reason: {exit_reason}\n"
         f"days_held: {days_held:.1f}\n"
-        "Recorded PnL is UNRELIABLE (bookkeeping close, not a market exit)."
+        + (
+            detail
+            or "Recorded PnL is UNRELIABLE (bookkeeping close, not a market exit)."
+        )
     )
     try:
         log.info(
@@ -156,6 +167,32 @@ async def _send_expiry_anomaly_alert(
             err=str(exc),
             err_type=type(exc).__name__,
         )
+
+
+async def _last_observed_liquidity(conn, token_id: str) -> float | None:
+    """Last observed liquidity for a token, or None if never observed.
+
+    Phase 6 slice 3 mark provenance: a stale-onset exit records
+    ``liquidity_at_exit`` so the ledger can distinguish "exited at onset
+    at a plausible mark" from "could not have exited at all" — leaving
+    the tracked universe often MEANS liquidity death. NULL is the honest
+    answer when the token has no candidates row: exitability could not
+    be verified. Prefers the enrichment cron's value
+    (``liquidity_usd_enriched``) over the ingest-time snapshot.
+    """
+    try:
+        cur = await conn.execute(
+            "SELECT COALESCE(liquidity_usd_enriched, liquidity_usd) "
+            "FROM candidates WHERE LOWER(contract_address) = LOWER(?) LIMIT 1",
+            (token_id,),
+        )
+        row = await cur.fetchone()
+    except Exception:
+        log.exception("stale_onset_liquidity_lookup_failed", token_id=token_id)
+        return None
+    if row is None or row[0] is None:
+        return None
+    return float(row[0])
 
 
 async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None:
@@ -382,6 +419,8 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                         reason="expired_stale_no_price",
                         slippage_bps=0,
                         status_override="closed_expired",
+                        # Bookkeeping close at entry_price — no market data.
+                        price_provenance="entry_fallback",
                     )
                     log.info(
                         "trade_eval_expired_no_price_forced_close",
@@ -425,6 +464,8 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                         reason="expired_stale_price",
                         slippage_bps=0,
                         status_override="closed_expired",
+                        # Best-effort stale snapshot, not a live fill.
+                        price_provenance="stale_snapshot",
                     )
                     log.info(
                         "trade_eval_expired_stale_price_forced_close",
@@ -445,6 +486,79 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                         days_held=elapsed.total_seconds() / 86400,
                     )
                     continue
+
+                # Phase 6 slice 3 (operator-approved policy A): stale-onset
+                # exit. The price feed for this token has been dead for more
+                # than STALE_ONSET_EXIT_HOURS and the trade has NOT reached
+                # max_duration. Holding changes nothing — the evaluator
+                # skips stale rows, so the only future outcomes are "feed
+                # resumes" (rare: leaving the tracked universe usually means
+                # liquidity death) or a later fabricated close at the SAME
+                # stale mark. Exit NOW at the last-good cached price and
+                # record mark provenance so the ledger distinguishes
+                # "exited at onset" (liquidity_at_exit observed) from
+                # "could not have exited at all" (liquidity_at_exit NULL).
+                if price_age_seconds > settings.STALE_ONSET_EXIT_HOURS * 3600:
+                    liquidity_at_exit = await _last_observed_liquidity(conn, token_id)
+                    closed = await _trader.execute_sell(
+                        db=db,
+                        trade_id=trade_id,
+                        current_price=current_price,
+                        reason="stale_onset_exit",
+                        # No real fill is happening at a dead feed —
+                        # slippage on the stale mark would be fiction.
+                        slippage_bps=0,
+                        status_override="closed_stale_onset",
+                        price_provenance="stale_snapshot",
+                    )
+                    if closed:
+                        await conn.execute(
+                            "UPDATE paper_trades SET "
+                            "stale_age_seconds_at_exit = ?, "
+                            "last_good_price_at = ?, "
+                            "liquidity_at_exit = ? "
+                            "WHERE id = ?",
+                            (
+                                round(price_age_seconds, 1),
+                                updated_at_str,
+                                liquidity_at_exit,
+                                trade_id,
+                            ),
+                        )
+                        await conn.commit()
+                        log.info(
+                            "trade_eval_stale_onset_exit",
+                            trade_id=trade_id,
+                            token_id=token_id,
+                            price_age_seconds=round(price_age_seconds, 1),
+                            last_good_price=current_price,
+                            last_good_price_at=updated_at_str,
+                            liquidity_at_exit=liquidity_at_exit,
+                            hours_open=round(elapsed.total_seconds() / 3600, 1),
+                        )
+                        # §12b: automated close at a non-market mark — the
+                        # operator must see it at write time. Never raises.
+                        await _send_expiry_anomaly_alert(
+                            session,
+                            settings,
+                            trade_id=trade_id,
+                            token_id=token_id,
+                            signal_type=signal_type_row,
+                            exit_reason="stale_onset_exit",
+                            days_held=elapsed.total_seconds() / 86400,
+                            headline=(
+                                "WARNING: paper trade stale-onset exit "
+                                "(price feed stopped updating)"
+                            ),
+                            detail=(
+                                "Exited at the last-good cached price "
+                                f"(age {price_age_seconds / 3600:.1f}h; "
+                                f"liquidity_at_exit={liquidity_at_exit}). "
+                                "Mark is a stale snapshot, not a live fill."
+                            ),
+                        )
+                    continue
+
                 log.info(
                     "trade_eval_stale_price",
                     trade_id=trade_id,
@@ -625,6 +739,7 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                         sell_qty_frac=sp.leg_1_qty_frac,
                         current_price=current_price,
                         slippage_bps=slippage_bps,
+                        price_provenance="market",
                     )
                     continue
                 # Leg 2
@@ -640,6 +755,7 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                         sell_qty_frac=sp.leg_2_qty_frac,
                         current_price=current_price,
                         slippage_bps=slippage_bps,
+                        price_provenance="market",
                     )
                     continue
                 # Floor exit — once armed, don't let the runner slice close below entry
@@ -802,6 +918,8 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                         reason=close_reason,
                         slippage_bps=slippage_bps,
                         status_override=close_status,
+                        # Fresh price (age <= 3600 enforced above).
+                        price_provenance="market",
                     )
                     if closed:
                         log.info(
@@ -881,6 +999,7 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                         current_price=current_price,
                         reason=close_reason,
                         slippage_bps=slippage_bps,
+                        price_provenance="market",
                     )
                     if not sold:
                         log.warning("partial_tp_sell_failed", trade_id=trade_id)
@@ -910,6 +1029,10 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                             sl_pct=0.0,
                             slippage_bps=0,
                             signal_combo="long_hold",
+                            # This branch is only reachable with a FRESH
+                            # price_map hit for token_id, so a price_cache
+                            # row demonstrably exists right now.
+                            price_source=resolve_price_source(token_id, True),
                         )
                         if new_id is None:
                             log.warning(
@@ -933,6 +1056,7 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                         current_price=current_price,
                         reason=close_reason,
                         slippage_bps=slippage_bps,
+                        price_provenance="market",
                     )
 
                 if closed:

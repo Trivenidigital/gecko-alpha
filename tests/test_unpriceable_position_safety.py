@@ -169,8 +169,15 @@ async def test_dex_token_open_blocked_when_flag_on(db, engine_settings):
     assert row[1] == "unpriceable_token_id"
 
 
-async def test_dex_token_open_allowed_when_flag_off(db, settings_factory, monkeypatch):
-    """Kill switch: flag off restores pre-GA-01 behavior (open proceeds)."""
+async def test_dex_token_open_still_blocked_when_flag_off(
+    db, settings_factory, monkeypatch
+):
+    """Phase 6 slice 2 supersedes the GA-01 kill switch for unpriceable
+    opens: with the gate flag OFF the engine gate stands down, but the
+    PaperTradeOpen boundary model in execute_buy still refuses to open
+    without a registered price source. The unpriceable-open state is
+    unrepresentable, not merely gated. (Pre-slice-2, flag-off restored
+    the pre-GA-01 open-proceeds behavior.)"""
     _install_fake_alerter(monkeypatch, [])
     settings = settings_factory(
         PAPER_STARTUP_WARMUP_SECONDS=0,
@@ -189,7 +196,11 @@ async def test_dex_token_open_allowed_when_flag_off(db, settings_factory, monkey
         entry_price=0.5,
         signal_combo="volume_spike",
     )
-    assert trade_id is not None
+    assert trade_id is None
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM paper_trades WHERE token_id = ?", (DEX_TOKEN,)
+    )
+    assert (await cur.fetchone())[0] == 0
 
 
 async def test_dex_token_with_price_cache_row_is_refreshable(
@@ -253,6 +264,12 @@ async def test_cg_token_open_unaffected_by_gate(db, engine_settings, monkeypatch
 
 
 async def _open_backdated_trade(db, *, token_id: str, opened_hours_ago: float) -> int:
+    # Phase 6 slice 2: opens now require a registered price source, so the
+    # zombie state must be constructed the way prod produced it — a writer
+    # that served the token at open time and then stopped. Seed a
+    # price_cache row for the open, then delete it (token drops from the
+    # tracked universe entirely).
+    await _seed_price_cache(db, token_id, 0.5, age_seconds=60)
     trader = PaperTrader()
     trade_id = await trader.execute_buy(
         db=db,
@@ -269,6 +286,8 @@ async def _open_backdated_trade(db, *, token_id: str, opened_hours_ago: float) -
         slippage_bps=0,
         signal_combo="volume_spike",
     )
+    assert trade_id is not None
+    await db._conn.execute("DELETE FROM price_cache WHERE coin_id = ?", (token_id,))
     backdated = (
         datetime.now(timezone.utc) - timedelta(hours=opened_hours_ago)
     ).isoformat()

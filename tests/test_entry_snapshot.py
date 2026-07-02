@@ -241,6 +241,19 @@ async def _ensure_candidate_row(db, *, contract_address, chain, first_seen_at):
     await db._conn.commit()
 
 
+async def _seed_price_cache_row(db, coin_id, price=1.0):
+    """Phase 6 slice 2: non-CG-shaped token_ids can only open when a
+    price_cache row exists (price_source='price_cache_row')."""
+    from datetime import datetime, timezone
+
+    await db._conn.execute(
+        "INSERT OR REPLACE INTO price_cache (coin_id, current_price, updated_at) "
+        "VALUES (?, ?, ?)",
+        (coin_id, price, datetime.now(timezone.utc).isoformat()),
+    )
+    await db._conn.commit()
+
+
 async def test_2_fully_complete_snapshot(db):
     """All optional fields resolvable → complete=1 + missing_fields='[]'."""
     await _ensure_candidate_row(
@@ -306,6 +319,9 @@ async def test_2b_first_seen_lookup_handles_mixed_case_candidate_contract(db):
         chain="ethereum",
         first_seen_at="2026-05-19T12:00:00+00:00",
     )
+    # Phase 6 slice 2: non-CG-shaped token_ids need a price_cache row to
+    # satisfy the open-boundary invariant (price_source='price_cache_row').
+    await _seed_price_cache_row(db, mixed_case_contract.lower())
     trade_id = await _open_with_full_signal(
         PaperTrader(),
         db,
@@ -866,6 +882,9 @@ async def test_tg_social_dex_token_uses_raw_contract_for_candidate_first_seen(db
         created_at="2026-05-20T00:00:00+00:00",
         msg_id=3101,
     )
+    # Phase 6 slice 2: dex: token_ids need a price_cache row to satisfy the
+    # open-boundary invariant (price_source='price_cache_row').
+    await _seed_price_cache_row(db, token_id)
 
     trade_id = await PaperTrader().execute_buy(
         db=db,

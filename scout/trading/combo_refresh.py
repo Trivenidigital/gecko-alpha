@@ -50,9 +50,13 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                    FROM paper_trades
                    WHERE signal_combo = ?
                      AND status IN ({status_placeholders})
-                     -- GA-01: exclude fabricated $0 closes (unpriceable
-                     -- token_id force-closed at entry_price) from combo
-                     -- rollups — they dilute total/avg PnL toward zero.
+                     -- GA-01 / Phase 6 slice 2: exclude fabricated $0
+                     -- closes (unpriceable token_id force-closed at
+                     -- entry_price) from combo rollups — they dilute
+                     -- total/avg PnL toward zero. Keyed on
+                     -- exit_provenance (durable label); the GA-01
+                     -- exit_reason predicate stays as OR-fallback.
+                     AND COALESCE(exit_provenance, '') != 'entry_fallback'
                      AND COALESCE(exit_reason, '') != 'expired_stale_no_price'
                      AND closed_at >= ?""",
                 (
