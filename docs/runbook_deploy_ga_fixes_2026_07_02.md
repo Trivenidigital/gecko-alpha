@@ -92,7 +92,11 @@ sed -i '/held-position-price-watchdog/d;/revival-verdict-watchdog/d' cron/gecko-
   systemctl stop gecko-pipeline gecko-dashboard
   # 1. PRE-DEPLOY SNAPSHOT (abort-reference for the assertion below)
   sqlite3 scout.db "SELECT COALESCE(exit_reason,'(null)'), COUNT(*) FROM paper_trades WHERE status LIKE 'closed_%' GROUP BY 1;" | tee /root/pre_deploy2_exit_reasons.txt
-  git fetch && git checkout <deploy-2 pin SHA>   # pin discipline per appendix note; NOT git pull
+  git fetch && git checkout <deploy-2 pin SHA>   # pin discipline; NOT git pull
+  # PIN SOURCE OF TRUTH: the #408 merge report entry in
+  # tasks/gecko-alpha-fable-review_2026_07.md (approvals log) states the exact
+  # SHA, minted as post-#408-squash master (the last deploy-#2 code gate).
+  # Never substitute "current master" — that is git pull with extra steps.
   uv sync && find . -name __pycache__ -type d -exec rm -rf {} +
   systemctl start gecko-pipeline        # boot runs 20260704 + 20260705 (<2s)
   # POST-MIGRATION ASSERTION — abort deploy on mismatch:
