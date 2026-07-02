@@ -6,4 +6,6 @@
 */10 * * * * cd /root/gecko-alpha && .venv/bin/python scripts/check_trade_decision_events.py --db /root/gecko-alpha/scout.db >> /var/log/gecko-alpha-trade-decision-events-watchdog.log 2>&1
 20 9 * * * /root/gecko-alpha/scripts/audit_stop_loss_false_negatives.sh --alert /root/gecko-alpha/scout.db >> /var/log/gecko-alpha-stop-loss-fn-audit.log 2>&1
 */15 * * * * /root/gecko-alpha/scripts/acceleration-heartbeat-watchdog.sh >> /var/log/gecko-alpha-acceleration-heartbeat-watchdog.log 2>&1
+*/5 * * * * /root/gecko-alpha/scripts/held-position-price-watchdog.sh >> /var/log/gecko-alpha-held-position-price-watchdog.log 2>&1
+30 9 * * * /root/gecko-alpha/scripts/revival-verdict-watchdog.sh >> /var/log/gecko-alpha-revival-verdict-watchdog.log 2>&1
 # === END gecko-alpha managed block ===
