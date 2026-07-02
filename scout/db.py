@@ -69,8 +69,12 @@ _CANDIDATE_COLUMNS = [
 class Database:
     """Thin async wrapper around an aiosqlite connection."""
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, busy_timeout_ms: int = 90_000) -> None:
+        # GA-22: canonical source is Settings.SQLITE_BUSY_TIMEOUT_MS (wired
+        # by scout/main.py); the keyword default mirrors it so short-lived
+        # CLI/script constructors keep the same behavior without plumbing.
         self._db_path = str(db_path)
+        self._busy_timeout_ms = int(busy_timeout_ms)
         self._conn: aiosqlite.Connection | None = None
         self._txn_lock: asyncio.Lock | None = None
 
@@ -84,6 +88,13 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         self._txn_lock = asyncio.Lock()
         await self._conn.execute("PRAGMA journal_mode=WAL")
+        # GA-22: explicit connection-level busy_timeout at bootstrap. Before
+        # this, the 90s timeout existed only as an incidental side-effect of
+        # four migration-site PRAGMAs — a connection whose migrations were
+        # all no-ops ran with timeout 0. The migration-site PRAGMAs are kept
+        # (re-asserting is harmless) but now source the same configured value
+        # so they can't clobber an operator override.
+        await self._conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
         # BL-055 spec §3.2: foreign_keys=ON is REQUIRED on every connection.
         # Default is OFF in SQLite; without it, ON DELETE RESTRICT is a no-op.
         await self._conn.execute("PRAGMA foreign_keys=ON")
@@ -689,7 +700,7 @@ class Database:
         migration_name = "predictions_coin_predicted_id_idx_v1"
 
         try:
-            await conn.execute("PRAGMA busy_timeout = 90000")
+            await conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
             await conn.execute("BEGIN EXCLUSIVE")
             await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
                     name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
@@ -5635,8 +5646,9 @@ class Database:
 
         Each table gets its own paper_migrations entry (V4#3 fold) so disk
         failure on one doesn't roll back the others. V4#2 fold: PRAGMA
-        busy_timeout=90000 covers concurrent readers waiting on the
-        EXCLUSIVE write lock during index build.
+        busy_timeout (Settings.SQLITE_BUSY_TIMEOUT_MS, default 90s) covers
+        concurrent readers waiting on the EXCLUSIVE write lock during
+        index build.
 
         D8 plan-review fold (cycle 2): `column` kwarg parameterizes the
         index target; log events become 'index_migrated' /
@@ -5656,7 +5668,7 @@ class Database:
         conn = self._conn
 
         try:
-            await conn.execute("PRAGMA busy_timeout = 90000")
+            await conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
             await conn.execute("BEGIN EXCLUSIVE")
             await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
                     name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
@@ -5750,7 +5762,7 @@ class Database:
         migration_name = "cohort_digest_state_v1"
 
         try:
-            await conn.execute("PRAGMA busy_timeout = 90000")
+            await conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
             await conn.execute("BEGIN EXCLUSIVE")
             await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
                     name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
@@ -5819,8 +5831,8 @@ class Database:
         Both tables get separate paper_migrations entries so disk failure
         on one doesn't roll back the other. Single EXCLUSIVE transaction
         per index (held during the build itself — ~1-5s on 2.5M rows in
-        WAL mode); ``busy_timeout=90000`` covers concurrent writer/reader
-        wait.
+        WAL mode); ``busy_timeout`` (Settings.SQLITE_BUSY_TIMEOUT_MS,
+        default 90s) covers concurrent writer/reader wait.
         """
         if self._conn is None:
             raise RuntimeError("Database not initialized.")
@@ -5841,7 +5853,7 @@ class Database:
 
         for table, index_name, migration_name in targets:
             try:
-                await conn.execute("PRAGMA busy_timeout = 90000")
+                await conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
                 await conn.execute("BEGIN EXCLUSIVE")
                 await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
                         name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")

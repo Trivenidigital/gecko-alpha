@@ -1821,7 +1821,7 @@ async def main(argv: list[str] | None = None) -> int:
 
     _cg_ratelimit_configure(settings)
 
-    db = Database(settings.DB_PATH)
+    db = Database(settings.DB_PATH, busy_timeout_ms=settings.SQLITE_BUSY_TIMEOUT_MS)
     await db.initialize()
 
     # --- BL-055 live-trading wiring (spec §10) --------------------------------
@@ -2051,10 +2051,12 @@ async def main(argv: list[str] | None = None) -> int:
             "trading_engine_initialized",
             mode=settings.TRADING_MODE,
         )
-        # Audit log of resolved paper-trading knobs. Settings uses extra="ignore"
-        # so an env-var typo (e.g. PAPER_TRAILING_ACTIVATION_PC missing the T)
-        # silently falls back to the default. Logging the resolved values once
-        # at boot lets the operator spot typos by diffing expected vs. actual.
+        # Audit log of resolved paper-trading knobs. Settings uses
+        # extra="forbid" (config.py), so an unknown key in .env (e.g.
+        # PAPER_TRAILING_ACTIVATION_PC missing the T) fails fast at startup
+        # rather than silently falling back to the default. Logging the
+        # resolved values once at boot still lets the operator confirm the
+        # effective config at a glance.
         logger.info(
             "paper_trading_config_resolved",
             trade_amount_usd=settings.PAPER_TRADE_AMOUNT_USD,
@@ -2203,6 +2205,7 @@ async def main(argv: list[str] | None = None) -> int:
                             "Cycle failed",
                             error=str(e),
                             run_cycle_s=round(time.monotonic() - _run_cycle_t0, 2),
+                            exc_info=True,
                         )
 
                     # Evaluate paper trades EVERY cycle (TP/SL/checkpoints)

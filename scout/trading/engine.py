@@ -19,6 +19,22 @@ from scout.trading.decision_events import emit_trade_decision
 
 log = structlog.get_logger()
 
+
+def _log_tg_alert_task_exception(task: asyncio.Task) -> None:
+    """GA-11 done-callback: surface fire-and-forget TG alert task failures.
+
+    Mirrors the ``_counter_followup_tasks`` pattern in scout/main.py —
+    ``task.exception()`` must be retrieved (else asyncio warns about a
+    never-retrieved exception) and, unlike the discard-only callback this
+    supplements, the failure is logged so it is operator-visible.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error("paper_open_alert_task_failed", error=str(exc), exc_info=exc)
+
+
 # Maximum age (seconds) for a price_cache entry to be considered fresh.
 # Paper trading uses a generous window since signals fire infrequently
 # and laggard tokens may only be cached once per narrative cycle (30 min+).
@@ -512,6 +528,9 @@ class TradingEngine:
         )
         self._tg_alert_tasks.add(task)
         task.add_done_callback(self._tg_alert_tasks.discard)
+        # GA-11: retrieve + log the exception; a discard-only callback left
+        # task failures completely invisible (never awaited, never logged).
+        task.add_done_callback(_log_tg_alert_task_exception)
 
     async def close_trade(self, trade_id: int, reason: str = "manual") -> None:
         """Force-close a trade."""

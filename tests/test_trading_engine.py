@@ -505,3 +505,52 @@ async def test_uses_custom_amount(engine, db):
     )
     row = await cursor.fetchone()
     assert row[0] == pytest.approx(2000.0)
+
+
+# ---------------------------------------------------------------------------
+# GA-11: fire-and-forget TG alert tasks must log exceptions, not swallow them
+# ---------------------------------------------------------------------------
+
+
+async def test_tg_alert_task_exception_is_logged():
+    """A failing _tg_alert_tasks task must emit paper_open_alert_task_failed."""
+    import asyncio
+
+    import structlog
+
+    from scout.trading.engine import _log_tg_alert_task_exception
+
+    async def _boom():
+        raise RuntimeError("tg dispatch kaput")
+
+    task = asyncio.get_event_loop().create_task(_boom())
+    with pytest.raises(RuntimeError):
+        await task
+
+    with structlog.testing.capture_logs() as logs:
+        _log_tg_alert_task_exception(task)
+
+    events = [e for e in logs if e["event"] == "paper_open_alert_task_failed"]
+    assert len(events) == 1
+    assert "tg dispatch kaput" in events[0]["error"]
+
+
+async def test_tg_alert_task_cancelled_does_not_log_or_raise():
+    """Cancelled tasks are not exceptions — callback must be a no-op."""
+    import asyncio
+
+    import structlog
+
+    from scout.trading.engine import _log_tg_alert_task_exception
+
+    task = asyncio.get_event_loop().create_task(asyncio.sleep(30))
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    with structlog.testing.capture_logs() as logs:
+        _log_tg_alert_task_exception(task)  # must not raise CancelledError
+
+    assert not [e for e in logs if e["event"] == "paper_open_alert_task_failed"]
