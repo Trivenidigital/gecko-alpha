@@ -8,4 +8,5 @@
 */15 * * * * /root/gecko-alpha/scripts/acceleration-heartbeat-watchdog.sh >> /var/log/gecko-alpha-acceleration-heartbeat-watchdog.log 2>&1
 */5 * * * * /root/gecko-alpha/scripts/held-position-price-watchdog.sh >> /var/log/gecko-alpha-held-position-price-watchdog.log 2>&1
 30 9 * * * /root/gecko-alpha/scripts/revival-verdict-watchdog.sh >> /var/log/gecko-alpha-revival-verdict-watchdog.log 2>&1
+15 4 * * 1 /root/gecko-alpha/scripts/ledger-eviction-export.sh >> /var/log/gecko-alpha-ledger-eviction-export.log 2>&1
 # === END gecko-alpha managed block ===
