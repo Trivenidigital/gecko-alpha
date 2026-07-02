@@ -45,6 +45,12 @@ from scout.ingestion.geckoterminal import fetch_trending_pools
 from scout.ingestion.held_position_prices import fetch_held_position_prices
 from scout.ingestion.holder_enricher import enrich_holders
 from scout.narrative.agent import narrative_agent_loop
+from scout.outcome_ledger import (
+    label_pending,
+    poll_enrollments,
+    price_and_age_from_cache,
+    record_emission,
+)
 from scout.conviction.prospective import build_prospective_watchlist
 from scout.conviction.watchlist_watchdog import check_watchlist_freshness
 from scout.instrumentation.capture import capture_entry_mcap, capture_txns
@@ -1304,6 +1310,44 @@ async def run_cycle(
         )
         stats["alerts_fired"] += 1
         logger.info("alert_delivered", token=gated_token.token_name, status="success")
+        # P0 edge-audit: self-labeling emission record — placed AFTER the
+        # GA-05 confirmed-delivery claim (log_alert) so only delivered alerts
+        # enter the ledger. CandidateToken carries no price field (the exact
+        # Phase 3 gap: 33 alerts, no usable price), so the anchor comes from
+        # price_cache; CG-sourced rows key on the CG slug, which IS the
+        # price_cache coin_id. record_emission is fail-soft; the try is
+        # belt-and-braces so a ledger bug can never break the alert path.
+        try:
+            _ledger_liq = float(getattr(gated_token, "liquidity_usd", 0) or 0)
+            # c1: alert anchors come from price_cache, so the anchor's cache
+            # age at emission rides along (NULL when there is no anchor).
+            _anchor_price, _anchor_age = await price_and_age_from_cache(
+                db, gated_token.contract_address
+            )
+            await record_emission(
+                db,
+                settings,
+                kind="alert",
+                token_id=gated_token.contract_address,
+                surface="candidate_alert",
+                price=_anchor_price,
+                anchor_cache_age_seconds=_anchor_age,
+                liquidity=_ledger_liq if _ledger_liq > 0 else None,
+                liquidity_source="candidate" if _ledger_liq > 0 else "none",
+                gate_verdicts={
+                    "conviction_score": float(conviction),
+                    "conviction_threshold": settings.CONVICTION_THRESHOLD,
+                    "quant_score": getattr(gated_token, "quant_score", None),
+                    "signals": signals,
+                },
+            )
+        except Exception as ledger_exc:
+            logger.warning(
+                "ledger_record_failed",
+                site="candidate_alert",
+                token=gated_token.token_name,
+                error=str(ledger_exc),
+            )
         await safe_emit(
             db,
             token_id=gated_token.contract_address,
@@ -1406,6 +1450,17 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
             logger.info("Outcomes checked", recorded=outcomes_recorded)
     except Exception as e:
         logger.warning("Outcome check error", error=str(e))
+
+    # P0 edge-audit: signal-outcome-ledger labeling pass. Hourly granularity
+    # is acceptable even for the 15m horizon: labels resolve from HISTORICAL
+    # volume_history_cg rows recorded at/after each horizon deadline (never
+    # the now-price), so late labeling does not skew returns. label_pending
+    # is fail-soft and always emits a `ledger_label_pass` structured log —
+    # part of the table's §12a freshness surface.
+    try:
+        await label_pending(db, settings)
+    except Exception:
+        logger.exception("ledger_label_pass_failed")
 
     # Prune old candidates if DB > 500MB
     try:
@@ -2281,6 +2336,19 @@ async def main(argv: list[str] | None = None) -> int:
                             last_trade_surface_alert_check = time.monotonic()
 
                     cycle_count += 1
+
+                    # P0 edge-audit: forward-poll enrolled ledger tokens
+                    # (at most ONE extra CG /simple/price call per cycle
+                    # ~= 3% of the 30/min Demo budget, plus DexScreener
+                    # token batches on a separate budget). Fail-soft +
+                    # kill-switch-gated inside; belt-and-braces here so a
+                    # poller bug can never break the cycle loop.
+                    try:
+                        await poll_enrollments(db, session, settings)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("ledger_enrollment_poll_failed")
 
                     # BL-033: periodic heartbeat summary
                     _maybe_emit_heartbeat(settings)
