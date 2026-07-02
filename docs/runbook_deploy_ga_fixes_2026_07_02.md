@@ -66,6 +66,17 @@ sqlite3 scout.db "SELECT COUNT(*), ROUND(SUM(pnl_usd),2) FROM paper_trades WHERE
 #    → 9|-488.93 (real rows only; 12 fabricated rows excluded)
 ```
 
+## The "fallback window" (NAMED operational state)
+Between deploy-#1 and deploy-#2 the cockpit dashboard runs its
+without-exit_provenance FALLBACK BRANCH intentionally — deploy-#1 ships #407's
+dashboard against a prod DB that gains the column only at deploy-#2
+(migration 20260705). This is by design, transitional-defensive, and covered
+by `tests/test_dashboard_cockpit_slice1.py::test_history_outcome_integrity_fallback_when_column_absent`
+(tombstoned to be deleted with the branch once no pre-20260705 DB can exist).
+**Deploy-#1 post-verify gains this check:** dashboard loads; Closed Trades
+renders integrity chips via the exit_reason fallback (no provenance column);
+zero errors in gecko-dashboard journal referencing exit_provenance.
+
 ## Rollback
 ```bash
 cd /root/gecko-alpha && git checkout 2e28fbaf && find . -name __pycache__ -type d -exec rm -rf {} + && systemctl restart gecko-pipeline
@@ -125,6 +136,23 @@ sqlite3 scout.db "SELECT exit_provenance, COUNT(*) FROM paper_trades WHERE statu
 sqlite3 scout.db "SELECT COUNT(*) FROM paper_trades WHERE price_source IS NULL;"   # 0 (all backfilled 'legacy' or stamped)
 sqlite3 scout.db "SELECT kind, COUNT(*) FROM signal_outcome_ledger GROUP BY kind;" # dispatch/gated_out_sample rows within minutes; alert rows only when funnel reopens
 journalctl -u gecko-pipeline --since '-2 hour' | grep -cE "ledger_label_pass|ledger_enrollment_poll"   # >=1 each after an hourly pass
+# WEEKLY after deploy-#2 (journal-head-age check — #413 deadline governor):
+journalctl -u gecko-pipeline --no-pager 2>/dev/null | head -1   # note the oldest-entry date
+#   If oldest-entry age starts DROPPING week-over-week, rotation is accelerating
+#   under the new write volume and the BL-NEW-LEDGER-EVICTION-DB-MARKER deadline
+#   tightens accordingly (the ~24d window was measured at pre-deploy rates).
+
+# WEEKLY after deploy-#2 (eviction-record export — interim durability until the
+# DB-marker slice lands; the journal is the lossy store, this is the idempotent copy):
+mkdir -p /var/lib/gecko-alpha && journalctl -u gecko-pipeline --since '-8 days' -o json 2>/dev/null | grep ledger_enrollment_evicted >> /var/lib/gecko-alpha/ledger_eviction_export.jsonl
+#   -o json = journald envelope per line (guaranteed JSONL even if an emitter
+#   ever logs non-JSON; the structlog event sits in .MESSAGE). Append-only; the
+#   1-day overlap can duplicate lines — dedup at read time on the STRUCTLOG
+#   fields inside the envelope: jq '.MESSAGE | fromjson | [.timestamp,
+#   .evicted_token_ids]' — event-time keys, stable across export runs (do NOT
+#   key on journald arrival fields). Cron automation of this line is a separate
+#   small ops PR if wanted; manual-weekly keeps this docs-only.
+
 # Event to expect: trade 2613 force-closes ~2026-07-04T12:50Z -> trade_expiry_anomaly_alert_dispatched/_delivered pair + plain-text TG message; its row gets exit_provenance='entry_fallback'.
 ```
 
