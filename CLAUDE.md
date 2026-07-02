@@ -91,6 +91,11 @@ moving a shared checkout's HEAD mid-session is a documented failure mode
 (2026-07-02: HEAD moved to a PR-#400 review line under another session's
 uncommitted files).
 
+**License precedence.** The most recent, most specific authorization governs
+its named activity and no other (e.g., an append-only license governs branch-
+conflict resolution; a fixture-only pre-authorization governs fix application).
+Perceived overlaps between licenses resolve to ASK, not to the broader grant.
+
 **Condition-enumeration on conditional approvals.** Every
 conditionally-approved PR's merge report enumerates each condition and where
 it was satisfied — including documentation and design-artifact conditions.
