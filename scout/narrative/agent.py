@@ -604,7 +604,8 @@ async def narrative_agent_loop(
                     try:
                         from scout.trading.evaluator import evaluate_paper_trades
 
-                        await evaluate_paper_trades(db, settings)
+                        # session: GA-01 expiry-anomaly operator alert
+                        await evaluate_paper_trades(db, settings, session=session)
                         logger.info("trading.eval_complete")
                     except Exception:
                         logger.exception("trading.eval_error")

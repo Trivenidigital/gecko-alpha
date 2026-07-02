@@ -101,6 +101,10 @@ async def _stats_for_signal(
            FROM paper_trades
            WHERE signal_type = ?
              AND status LIKE 'closed_%'
+             -- GA-01: fabricated $0 closes (no price source ever served
+             -- the token_id) would depress win_rate and inflate
+             -- expired_pct — exclude from calibration inputs.
+             AND COALESCE(exit_reason, '') != 'expired_stale_no_price'
              AND datetime(closed_at) >= datetime(?)""",
         (signal_type, since_iso),
     )
@@ -565,7 +569,9 @@ async def _main_async(args: argparse.Namespace) -> int:
 
     import aiohttp  # local — avoids OpenSSL Applink at module-import time
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=15)
+    ) as session:
         n_writes = await apply_diffs(
             db,
             diffs,

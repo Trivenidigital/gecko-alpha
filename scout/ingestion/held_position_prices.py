@@ -30,6 +30,12 @@ import structlog
 
 from scout.ingestion.coingecko import CG_BASE, _get_with_backoff
 
+# GA-01: heuristic extracted to scout.token_ids so the trading engine's
+# unpriceable-token dispatch gate shares the SAME predicate (no forked
+# copy to drift). Aliased to the historical private name so existing
+# callers/tests keep working.
+from scout.token_ids import is_cg_coin_id as _is_cg_coin_id
+
 if TYPE_CHECKING:
     from scout.config import Settings
     from scout.db import Database
@@ -56,34 +62,6 @@ _WARNED_PRUNE_AGE = timedelta(days=7)
 # is ~150 held positions, well within one batch. If the cohort grows past
 # 250, batching logic below splits into multiple sequential calls.
 SIMPLE_PRICE_BATCH_SIZE = 250
-
-
-def _is_cg_coin_id(token_id: str | None) -> bool:
-    """Heuristic: skip obvious contract addresses; pass everything else.
-
-    CG coin_ids are lowercase alphanumeric + hyphens/underscores.
-    Contract addresses look different:
-      - EVM: starts with '0x', 40+ hex chars
-      - Solana base58 mints: mixed case, 32-44 chars (e.g.,
-        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" — too short to be
-        caught by a length>60 check; the mixed-case check catches it).
-
-    Permissive on the CG side, strict on the obvious-contract side —
-    false-negatives at CG just produce `not_found_in_cg` log entries and
-    skip, not data corruption.
-    """
-    if not token_id:
-        return False
-    if token_id.startswith("0x"):
-        return False
-    if len(token_id) > 60:
-        return False
-    # CG coin_ids are lowercase; mixed-case is a strong signal of base58
-    # (Solana mints, etc.). The triage script that produced the empirical
-    # held cohort confirmed 0 false-skips of real CG ids under this rule.
-    if token_id != token_id.lower():
-        return False
-    return all(c.isalnum() or c in "-_" for c in token_id)
 
 
 async def _get_held_token_ids(db: "Database") -> list[str]:
@@ -148,7 +126,9 @@ async def _get_cached_price_ages(
     if db._conn is None or not coin_ids:
         return {}
     placeholders = ",".join("?" * len(coin_ids))
-    sql = f"SELECT coin_id, updated_at FROM price_cache WHERE coin_id IN ({placeholders})"
+    sql = (
+        f"SELECT coin_id, updated_at FROM price_cache WHERE coin_id IN ({placeholders})"
+    )
     cur = await db._conn.execute(sql, coin_ids)
     rows = await cur.fetchall()
     out: dict[str, datetime] = {}
@@ -405,7 +385,9 @@ async def fetch_held_position_prices(
                     paper_trade_id=meta[0],
                     symbol=meta[1],
                     cache_age_hours=(
-                        round(cache_age_hours, 1) if cache_age_hours is not None else None
+                        round(cache_age_hours, 1)
+                        if cache_age_hours is not None
+                        else None
                     ),
                     cache_last=age.isoformat() if age is not None else None,
                     warn_threshold_hours=threshold_hours,
