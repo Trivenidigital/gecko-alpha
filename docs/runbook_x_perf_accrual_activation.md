@@ -141,6 +141,10 @@ Within the first 1–2 cycles (~30 min):
   `_alert_delivered` structured logs (journalctl-traceable). A send failure logs
   `_alert_failed`, prints `{"ok": false, "error": "alert_dispatch_failed"}`, and
   exits 1 — it is surfaced, not swallowed.
+- **Exit codes:** `0` = ok (no alerts), `5` = one or more alerts fired (and
+  dispatched), `1` = DB missing / runtime / alert-dispatch failure. Cron may
+  treat non-zero as the alert signal; findings are also in the stdout JSON and
+  journalctl regardless.
 - **Optional routing to a health channel:** `send_telegram_message` accepts a
   `chat_id=` override; the watchdog script does not set one today. If a separate
   ops/health channel is wanted, thread a `--chat-id` arg through the script (a
