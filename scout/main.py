@@ -97,6 +97,10 @@ from scout.live.reconciliation import (
     reconcile_open_shadow_trades,
 )
 from scout.live.resolver import OverrideStore, VenueResolver
+from scout.live.services.runner import ServiceRunner
+from scout.live.services.health_probe import HealthProbe
+from scout.live.services.balance_snapshot import BalanceSnapshot
+from scout.live.services.rate_limit_stub import RateLimitAccountantStub
 
 logger = structlog.get_logger()
 
@@ -1206,9 +1210,7 @@ async def run_cycle(
             from scout.instrumentation.resolver import run_resolver_pass
 
             cg_coin_ids = [
-                t.contract_address
-                for t in all_scored_tokens
-                if t.chain == "coingecko"
+                t.contract_address for t in all_scored_tokens if t.chain == "coingecko"
             ]
             await run_resolver_pass(cg_coin_ids, session, db, settings)
         except Exception:
@@ -2388,6 +2390,20 @@ async def main(argv: list[str] | None = None) -> int:
                     )
                 )
 
+                # M1 v2.1 Task 14: register service-runner harness
+                # (HealthProbe, BalanceSnapshot, RateLimitAccountantStub for Binance)
+                service_runner = ServiceRunner(
+                    db=db,
+                    adapters={"binance": live_adapter},
+                    services=[
+                        HealthProbe(),
+                        BalanceSnapshot(),
+                        RateLimitAccountantStub(),
+                    ],
+                )
+                await service_runner.start()
+                _live_owned.append(service_runner)
+
             # LunarCrush social-velocity loop runs OUTSIDE asyncio.gather --
             # a social crash must never take down the main pipeline. The
             # done-callback re-creates the task with a 30s back-off.
@@ -2556,11 +2572,16 @@ async def main(argv: list[str] | None = None) -> int:
                 await _drain_pending_live_tasks(trading_engine._paper_trader)
             except Exception:
                 logger.exception("live_shutdown_drain_error")
-        # Close any live adapters we own (Binance HTTP session, etc.).
-        for adapter in _live_owned:
-            if hasattr(adapter, "close"):
+        # Shutdown live subsystem: stop service runner first, then close adapters.
+        for owned in _live_owned:
+            if isinstance(owned, ServiceRunner):
                 try:
-                    await adapter.close()
+                    await owned.stop()
+                except Exception:
+                    logger.exception("service_runner_stop_error")
+            elif hasattr(owned, "close"):
+                try:
+                    await owned.close()
                 except Exception:
                     logger.exception("live_adapter_close_error")
         await db.close()
