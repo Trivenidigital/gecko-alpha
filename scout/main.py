@@ -2203,6 +2203,7 @@ async def main(argv: list[str] | None = None) -> int:
                             "Cycle failed",
                             error=str(e),
                             run_cycle_s=round(time.monotonic() - _run_cycle_t0, 2),
+                            exc_info=True,
                         )
 
                     # Evaluate paper trades EVERY cycle (TP/SL/checkpoints)
