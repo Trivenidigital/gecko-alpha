@@ -133,9 +133,11 @@ journalctl -u gecko-pipeline --no-pager 2>/dev/null | head -1   # note the oldes
 
 # WEEKLY after deploy-#2 (eviction-record export — interim durability until the
 # DB-marker slice lands; the journal is the lossy store, this is the idempotent copy):
-mkdir -p /var/lib/gecko-alpha && journalctl -u gecko-pipeline --since '-8 days' -o cat 2>/dev/null | grep ledger_enrollment_evicted >> /var/lib/gecko-alpha/ledger_eviction_export.jsonl
-#   Append-only; the 1-day overlap can duplicate lines — dedup at read time on
-#   (timestamp, evicted_token_ids). Cron automation of this line is a separate
+mkdir -p /var/lib/gecko-alpha && journalctl -u gecko-pipeline --since '-8 days' -o json 2>/dev/null | grep ledger_enrollment_evicted >> /var/lib/gecko-alpha/ledger_eviction_export.jsonl
+#   -o json = journald envelope per line (guaranteed JSONL even if an emitter
+#   ever logs non-JSON; the structlog event sits in .MESSAGE). Append-only; the
+#   1-day overlap can duplicate lines — dedup at read time on
+#   (.__REALTIME_TIMESTAMP, .MESSAGE). Cron automation of this line is a separate
 #   small ops PR if wanted; manual-weekly keeps this docs-only.
 
 # Event to expect: trade 2613 force-closes ~2026-07-04T12:50Z -> trade_expiry_anomaly_alert_dispatched/_delivered pair + plain-text TG message; its row gets exit_provenance='entry_fallback'.
