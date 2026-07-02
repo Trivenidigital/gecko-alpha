@@ -1043,7 +1043,9 @@ async def run_cycle(
         try:
             velocity = await detect_velocity(db, _raw_markets_combined, settings)
             if velocity:
-                await alert_velocity_detections(velocity, session, settings)
+                # GA-21: pass db so a failed send demotes the dedup claim
+                # detect_velocity just wrote (claim-then-demote).
+                await alert_velocity_detections(velocity, session, settings, db=db)
         except Exception:
             logger.exception("velocity_alert_error")
 
@@ -1275,25 +1277,22 @@ async def run_cycle(
         )
         try:
             await send_alert(gated_token, signals, session, settings)
-            logger.info(
-                "alert_delivered", token=gated_token.token_name, status="success"
-            )
-            await safe_emit(
-                db,
-                token_id=gated_token.contract_address,
-                pipeline="memecoin",
-                event_type="alert_fired",
-                event_data={
-                    "conviction_score": float(gated_token.conviction_score or 0),
-                    "alert_type": "telegram",
-                },
-                source_module="alerter",
-            )
         except Exception as e:
+            # GA-05: a FAILED delivery must NOT claim the 4h dedup window
+            # (alerts row, which also feeds outcome tracking) or count as
+            # fired. With no alerts row, was_recently_alerted stays False and
+            # the next cycle retries naturally.
             logger.error(
-                "alert_delivery_failed", token=gated_token.token_name, error=str(e)
+                "alert_delivery_failed",
+                token=gated_token.token_name,
+                error=str(e),
+                retry_eligible=True,
             )
+            continue
 
+        # GA-05 claim ordering: write the dedup/outcome row IMMEDIATELY after
+        # confirmed delivery — before any other bookkeeping — so a post-send
+        # failure can never turn a delivered alert into an endless resend.
         await db.log_alert(
             contract_address=gated_token.contract_address,
             chain=gated_token.chain,
@@ -1304,6 +1303,18 @@ async def run_cycle(
             ticker=getattr(gated_token, "ticker", None),
         )
         stats["alerts_fired"] += 1
+        logger.info("alert_delivered", token=gated_token.token_name, status="success")
+        await safe_emit(
+            db,
+            token_id=gated_token.contract_address,
+            pipeline="memecoin",
+            event_type="alert_fired",
+            event_data={
+                "conviction_score": float(gated_token.conviction_score or 0),
+                "alert_type": "telegram",
+            },
+            source_module="alerter",
+        )
 
         # Counter-score follow-up (async, non-blocking)
         if settings.COUNTER_ENABLED:

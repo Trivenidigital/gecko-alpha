@@ -307,6 +307,122 @@ async def test_run_cycle_sends_alert(mock_db, mock_session, mock_settings):
     assert stats["alerts_fired"] == 1
 
 
+async def test_run_cycle_failed_send_does_not_claim_dedup(
+    mock_db, mock_session, mock_settings
+):
+    """GA-05: a FAILED Telegram delivery must NOT write the alerts row (the 4h
+    dedup key, which also feeds outcome tracking) and must NOT count as fired.
+    With no alerts row, was_recently_alerted stays False next cycle -> natural
+    retry."""
+    from scout.exceptions import AlertDeliveryError
+    from scout.models import CandidateToken
+
+    token = CandidateToken(
+        contract_address="0xtest",
+        chain="solana",
+        token_name="Test",
+        ticker="TST",
+        token_age_days=1,
+        market_cap_usd=50000,
+        liquidity_usd=10000,
+        volume_24h_usd=80000,
+        holder_count=100,
+        holder_growth_1h=25,
+    )
+
+    with (
+        patch(
+            "scout.main.fetch_trending", new_callable=AsyncMock, return_value=[token]
+        ),
+        patch(
+            "scout.main.fetch_trending_pools", new_callable=AsyncMock, return_value=[]
+        ),
+        patch(
+            "scout.main.cg_fetch_top_movers", new_callable=AsyncMock, return_value=[]
+        ),
+        patch("scout.main.cg_fetch_trending", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "scout.main.enrich_holders",
+            new_callable=AsyncMock,
+            side_effect=lambda t, s, st: t,
+        ),
+        patch("scout.main.aggregate", return_value=[token]),
+        patch("scout.main.score", return_value=(75, ["vol_liq_ratio"])),
+        patch(
+            "scout.main.evaluate",
+            new_callable=AsyncMock,
+            return_value=(True, 78.0, token),
+        ),
+        patch("scout.main.is_safe", new_callable=AsyncMock, return_value=True),
+        patch(
+            "scout.main.send_alert",
+            new_callable=AsyncMock,
+            side_effect=AlertDeliveryError("Telegram send failed: 502"),
+        ) as mock_alert,
+    ):
+
+        stats = await run_cycle(mock_settings, mock_db, mock_session, dry_run=False)
+
+    mock_alert.assert_called_once()
+    # Failed delivery: no dedup/outcome row, no fired counter.
+    mock_db.log_alert.assert_not_called()
+    assert stats["alerts_fired"] == 0
+
+
+async def test_run_cycle_successful_send_claims_dedup_exactly_once(
+    mock_db, mock_session, mock_settings
+):
+    """GA-05: a successful delivery writes exactly one alerts row (the dedup
+    claim) and increments alerts_fired exactly once."""
+    from scout.models import CandidateToken
+
+    token = CandidateToken(
+        contract_address="0xtest",
+        chain="solana",
+        token_name="Test",
+        ticker="TST",
+        token_age_days=1,
+        market_cap_usd=50000,
+        liquidity_usd=10000,
+        volume_24h_usd=80000,
+        holder_count=100,
+        holder_growth_1h=25,
+    )
+
+    with (
+        patch(
+            "scout.main.fetch_trending", new_callable=AsyncMock, return_value=[token]
+        ),
+        patch(
+            "scout.main.fetch_trending_pools", new_callable=AsyncMock, return_value=[]
+        ),
+        patch(
+            "scout.main.cg_fetch_top_movers", new_callable=AsyncMock, return_value=[]
+        ),
+        patch("scout.main.cg_fetch_trending", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "scout.main.enrich_holders",
+            new_callable=AsyncMock,
+            side_effect=lambda t, s, st: t,
+        ),
+        patch("scout.main.aggregate", return_value=[token]),
+        patch("scout.main.score", return_value=(75, ["vol_liq_ratio"])),
+        patch(
+            "scout.main.evaluate",
+            new_callable=AsyncMock,
+            return_value=(True, 78.0, token),
+        ),
+        patch("scout.main.is_safe", new_callable=AsyncMock, return_value=True),
+        patch("scout.main.send_alert", new_callable=AsyncMock) as mock_alert,
+    ):
+
+        stats = await run_cycle(mock_settings, mock_db, mock_session, dry_run=False)
+
+    mock_alert.assert_called_once()
+    mock_db.log_alert.assert_called_once()
+    assert stats["alerts_fired"] == 1
+
+
 async def test_run_cycle_skips_unsafe_token(mock_db, mock_session, mock_settings):
     """Unsafe token (GoPlus check fails) -> no alert."""
     from scout.models import CandidateToken

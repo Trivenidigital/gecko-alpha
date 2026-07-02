@@ -1,11 +1,13 @@
 """Tests for scout.velocity.detector -- CoinGecko 1h-velocity alerter."""
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from scout.db import Database
 from scout.velocity.detector import (
+    alert_velocity_detections,
     detect_velocity,
     format_velocity_alert,
 )
@@ -149,6 +151,97 @@ async def test_detect_velocity_allows_after_dedup_window(db):
     detections = await detect_velocity(db, coins, _Settings())
     assert len(detections) == 1
     assert detections[0]["coin_id"] == "old-alert"
+
+
+# -- GA-21 claim-then-demote: send failure must not hold the dedup claim --
+
+
+async def test_alert_velocity_failed_send_demotes_claim(db):
+    """A failed Telegram send deletes the just-claimed velocity_alerts row so
+    the detection is re-alertable next cycle (mirrors tg_alert_dispatch
+    claim-then-demote)."""
+    detections = await detect_velocity(db, [_coin("failme")], _Settings())
+    assert len(detections) == 1
+
+    with patch(
+        "scout.alerter.send_telegram_message",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("telegram send failed status=502"),
+    ) as mock_send:
+        ok = await alert_velocity_detections(
+            detections, AsyncMock(), _Settings(), db=db
+        )
+
+    assert ok is False
+    # Failure must be observable: the shared sender swallows errors unless
+    # raise_on_failure=True is threaded through.
+    assert mock_send.call_args.kwargs.get("raise_on_failure") is True
+    # Claim demoted -> same coin re-detectable within the dedup window.
+    again = await detect_velocity(db, [_coin("failme")], _Settings())
+    assert len(again) == 1
+    assert again[0]["coin_id"] == "failme"
+
+
+async def test_alert_velocity_successful_send_keeps_dedup(db):
+    """A successful send keeps the velocity_alerts row: dedup enforced for
+    VELOCITY_DEDUP_HOURS."""
+    detections = await detect_velocity(db, [_coin("winner")], _Settings())
+    assert len(detections) == 1
+
+    with patch(
+        "scout.alerter.send_telegram_message", new_callable=AsyncMock
+    ) as mock_send:
+        ok = await alert_velocity_detections(
+            detections, AsyncMock(), _Settings(), db=db
+        )
+
+    assert ok is True
+    mock_send.assert_awaited_once()
+    again = await detect_velocity(db, [_coin("winner")], _Settings())
+    assert again == []
+
+
+async def test_alert_velocity_demote_only_removes_failed_batch(db):
+    """Demote deletes only the failed batch's rows -- an earlier successfully
+    delivered coin stays deduped."""
+    kept = await detect_velocity(db, [_coin("keeper")], _Settings())
+    with patch("scout.alerter.send_telegram_message", new_callable=AsyncMock):
+        assert await alert_velocity_detections(kept, AsyncMock(), _Settings(), db=db)
+
+    failed = await detect_velocity(db, [_coin("loser")], _Settings())
+    with patch(
+        "scout.alerter.send_telegram_message",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("boom"),
+    ):
+        ok = await alert_velocity_detections(failed, AsyncMock(), _Settings(), db=db)
+    assert ok is False
+
+    # keeper still deduped; loser re-alertable.
+    again = await detect_velocity(db, [_coin("keeper"), _coin("loser")], _Settings())
+    assert {d["coin_id"] for d in again} == {"loser"}
+
+
+async def test_alert_velocity_failed_send_without_db_does_not_crash(db):
+    """Back-compat: callers that don't pass db still get the failure signal;
+    demote is skipped (claim stays, same as pre-fix behavior)."""
+    detections = await detect_velocity(db, [_coin("nodb")], _Settings())
+    with patch(
+        "scout.alerter.send_telegram_message",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("boom"),
+    ):
+        ok = await alert_velocity_detections(detections, AsyncMock(), _Settings())
+    assert ok is False
+
+
+async def test_alert_velocity_empty_detections_is_noop():
+    with patch(
+        "scout.alerter.send_telegram_message", new_callable=AsyncMock
+    ) as mock_send:
+        ok = await alert_velocity_detections([], AsyncMock(), _Settings())
+    assert ok is True
+    mock_send.assert_not_awaited()
 
 
 # -- Formatting --

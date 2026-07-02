@@ -108,6 +108,9 @@ async def detect_velocity(
 
     now = datetime.now(timezone.utc).isoformat()
     for det in fresh:
+        # GA-21: thread the claim timestamp into the detection dict so a
+        # failed send can demote (delete) exactly this claimed row.
+        det["detected_at"] = now
         await db._conn.execute(
             """INSERT INTO velocity_alerts
                (coin_id, symbol, name, price_change_1h, price_change_24h,
@@ -188,21 +191,75 @@ def format_velocity_alert(detections: list[dict]) -> str:
     return "\n".join(lines)
 
 
+async def demote_failed_velocity_detections(
+    db: "Database", detections: list[dict]
+) -> None:
+    """Delete the velocity_alerts claim rows for a batch whose send FAILED.
+
+    GA-21 claim-then-demote (mirrors scout/trading/tg_alert_dispatch.py):
+    ``detect_velocity`` claims the dedup rows BEFORE the send; if the send
+    fails, demoting the claim makes the detection re-alertable next cycle
+    instead of silently suppressed for VELOCITY_DEDUP_HOURS. Deletes are
+    keyed on (coin_id, detected_at) so only this batch's rows are removed.
+    A demote failure fails safe toward suppression (no alert spam) and is
+    logged loudly.
+    """
+    if db._conn is None:
+        return
+    keys = [
+        (det["coin_id"], det["detected_at"])
+        for det in detections
+        if det.get("coin_id") and det.get("detected_at")
+    ]
+    if not keys:
+        return
+    try:
+        await db._conn.executemany(
+            "DELETE FROM velocity_alerts WHERE coin_id = ? AND detected_at = ?",
+            keys,
+        )
+        await db._conn.commit()
+        log.info(
+            "velocity_alert_claim_demoted",
+            count=len(keys),
+            ids=[k[0] for k in keys],
+        )
+    except Exception:
+        log.exception("velocity_alert_demote_failed", count=len(keys))
+
+
 async def alert_velocity_detections(
     detections: list[dict],
     session: aiohttp.ClientSession,
     settings: "Settings",
-) -> None:
-    """Send a single batched Telegram message for the detections."""
+    db: "Database | None" = None,
+) -> bool:
+    """Send a single batched Telegram message for the detections.
+
+    Returns True on confirmed delivery (or nothing to send). On a failed
+    send, demotes the just-claimed ``velocity_alerts`` dedup rows (when
+    ``db`` is provided) so the detections are re-alertable next cycle, and
+    returns False. Uses ``raise_on_failure=True`` because the shared sender
+    otherwise swallows delivery failures internally (GA-21).
+    """
     if not detections:
-        return
+        return True
     # Deferred import to avoid an import cycle at module load time.
     from scout.alerter import send_telegram_message
 
     text = format_velocity_alert(detections)
     try:
         await send_telegram_message(
-            text, session, settings, parse_mode="Markdown", source="velocity_alert"
+            text,
+            session,
+            settings,
+            parse_mode="Markdown",
+            raise_on_failure=True,
+            source="velocity_alert",
         )
     except Exception:
         log.exception("velocity_alert_send_failed", count=len(detections))
+        if db is not None:
+            await demote_failed_velocity_detections(db, detections)
+        return False
+    return True
