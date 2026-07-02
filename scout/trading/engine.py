@@ -16,6 +16,7 @@ from scout.trading.params import (
     get_params,
 )
 from scout.trading.decision_events import emit_trade_decision
+from scout.token_ids import is_cg_coin_id
 
 log = structlog.get_logger()
 
@@ -295,6 +296,40 @@ class TradingEngine:
                 signal_params_source=signal_params.source,
             )
             return None
+
+        # 0c. GA-01 unpriceable-token gate (fail closed). A trade is only
+        # admissible if its token_id can be RE-priced after open: either a
+        # CG-shaped coin id (served by the CG markets/trending writers and
+        # the held-position refresh lane) or a token_id that already has a
+        # price_cache row (some writer demonstrably serves it). Anything
+        # else — notably the TG-social resolver's DexScreener-fallback
+        # `dex:{chain}:{address}` namespace — has NO price_cache writer:
+        # a caller-supplied entry_price gets the trade OPEN, but the
+        # evaluator can never resolve a price again, so every price-based
+        # exit is bypassed and the only terminal state is expiry at
+        # entry_price with fabricated $0 PnL (12/12 historical `dex:`
+        # closes). Gate placement: BEFORE the entry_price shortcut in
+        # step 1, because that shortcut is exactly the bypass that let
+        # unpriceable trades through.
+        if getattr(self.settings, "PAPER_REQUIRE_PRICEABLE_TOKEN_ID", True) and (
+            not is_cg_coin_id(token_id)
+        ):
+            cursor = await conn.execute(
+                "SELECT 1 FROM price_cache WHERE coin_id = ? LIMIT 1",
+                (token_id,),
+            )
+            if await cursor.fetchone() is None:
+                log.warning(
+                    "trade_skipped_unpriceable_token_id",
+                    token_id=token_id,
+                    signal_type=signal_type,
+                    hint=(
+                        "no price_cache writer serves this token_id namespace; "
+                        "trade would be un-evaluatable (expiry-only exit)"
+                    ),
+                )
+                await _emit_decision("blocked", "unpriceable_token_id")
+                return None
 
         # 1. Resolve current price -- prefer caller-supplied entry_price
         if entry_price is not None and entry_price > 0:

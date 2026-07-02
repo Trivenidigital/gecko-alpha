@@ -668,6 +668,17 @@ class Settings(BaseSettings):
     # candidate as a fresh signal. A live trader doesn't bulk-enter on reboot.
     # calibration era: undocumented -- see BL-NEW-CALIBRATION-ERA-DOC
     PAPER_STARTUP_WARMUP_SECONDS: int = 180
+    # GA-01 fail-closed dispatch gate: refuse to open a paper trade whose
+    # token_id has no refreshable price source — i.e., NOT CG-id-shaped
+    # (scout.token_ids.is_cg_coin_id) AND no price_cache row. Without this,
+    # DexScreener-fallback ids (`dex:{chain}:{address}` from the TG-social
+    # resolver) open at a caller-supplied entry_price, are never re-priced
+    # by ANY price_cache writer, and can only exit via expiry at
+    # entry_price → fabricated $0-PnL rows that dilute auto-suspend /
+    # calibration / combo stats. Prod evidence: 12/12 historical `dex:`
+    # closes were $0 at exactly max_duration (2026-07). Flip to False only
+    # if a dex:-namespace price writer ships.
+    PAPER_REQUIRE_PRICEABLE_TOKEN_ID: bool = True
     # Trailing stop (legacy — still used for pre-BL-061 rows; BL-061 ladder
     # uses PAPER_LADDER_TRAIL_PCT on the runner slice).
     PAPER_TRAILING_ENABLED: bool = True

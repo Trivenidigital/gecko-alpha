@@ -79,11 +79,94 @@ def _parse_ts(s: str | None) -> datetime | None:
         return None
 
 
-async def evaluate_paper_trades(db: Database, settings) -> None:
+async def _send_expiry_anomaly_alert(
+    session,
+    settings,
+    *,
+    trade_id: int,
+    token_id: str,
+    signal_type: str,
+    exit_reason: str,
+    days_held: float,
+) -> None:
+    """GA-01 §12b operator alert for force-closes without a usable price.
+
+    A no-price/stale-price expiry close fabricates the recorded PnL
+    (entry-price close → exactly $0, or a best-effort stale snapshot).
+    The operator must learn the row is unreliable AT WRITE TIME, not via
+    a later audit — 12/12 historical `dex:` closes sat unnoticed as $0
+    rows diluting auto-suspend stats. Mirrors the auto_suspend
+    dispatched/delivered trace pattern; alert failure NEVER breaks the
+    close (the DB write already committed before this is called).
+    """
+    if session is None:
+        log.info(
+            "trade_expiry_anomaly_alert_skipped_no_session",
+            trade_id=trade_id,
+            token_id=token_id,
+            signal_type=signal_type,
+            exit_reason=exit_reason,
+        )
+        return
+
+    # Deferred import: scout.alerter pulls aiohttp at module level
+    # (Windows OpenSSL Applink) — same pattern as auto_suspend.
+    from scout import alerter
+
+    body = (
+        "WARNING: paper trade force-closed without a usable market price\n"
+        f"trade_id: {trade_id}\n"
+        f"token_id: {token_id}\n"
+        f"signal_type: {signal_type}\n"
+        f"exit_reason: {exit_reason}\n"
+        f"days_held: {days_held:.1f}\n"
+        "Recorded PnL is UNRELIABLE (bookkeeping close, not a market exit)."
+    )
+    try:
+        log.info(
+            "trade_expiry_anomaly_alert_dispatched",
+            trade_id=trade_id,
+            token_id=token_id,
+            signal_type=signal_type,
+            exit_reason=exit_reason,
+        )
+        await alerter.send_telegram_message(
+            body,
+            session,
+            settings,
+            # parse_mode=None: token_ids and signal names contain `_` / `:`
+            # which Telegram MarkdownV1 silently mangles (§12b Class-3).
+            parse_mode=None,
+            source="trade_expiry_anomaly",
+        )
+        log.info(
+            "trade_expiry_anomaly_alert_delivered",
+            trade_id=trade_id,
+            token_id=token_id,
+            signal_type=signal_type,
+            exit_reason=exit_reason,
+        )
+    except Exception as exc:
+        log.exception(
+            "trade_expiry_anomaly_alert_failed",
+            trade_id=trade_id,
+            token_id=token_id,
+            signal_type=signal_type,
+            exit_reason=exit_reason,
+            err=str(exc),
+            err_type=type(exc).__name__,
+        )
+
+
+async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None:
     """Check all open paper trades: update checkpoints, check TP/SL, expire old.
 
     Uses a single batch query to fetch prices for all open trades.
     Logs price_age_seconds alongside the price for each trade.
+
+    *session* (aiohttp.ClientSession | None) powers the GA-01 expiry-anomaly
+    operator alert on fabricated force-closes. None (back-compat default)
+    skips the alert with a structured log; the close itself is unaffected.
     """
     conn = db._conn
     if conn is None:
@@ -306,6 +389,17 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                         token_id=token_id,
                         hours_open=round(elapsed.total_seconds() / 3600, 1),
                     )
+                    # GA-01 §12b: the $0 PnL just recorded is fabricated —
+                    # tell the operator at write time. Never raises.
+                    await _send_expiry_anomaly_alert(
+                        session,
+                        settings,
+                        trade_id=trade_id,
+                        token_id=token_id,
+                        signal_type=signal_type_row,
+                        exit_reason="expired_stale_no_price",
+                        days_held=elapsed.total_seconds() / 86400,
+                    )
                     continue
                 log.info("trade_eval_no_price", trade_id=trade_id, token_id=token_id)
                 continue
@@ -338,6 +432,17 @@ async def evaluate_paper_trades(db: Database, settings) -> None:
                         token_id=token_id,
                         price_age_seconds=round(price_age_seconds, 1),
                         hours_open=round(elapsed.total_seconds() / 3600, 1),
+                    )
+                    # GA-01 §12b: exit price is a stale best-effort snapshot,
+                    # not a market fill — recorded PnL is unreliable.
+                    await _send_expiry_anomaly_alert(
+                        session,
+                        settings,
+                        trade_id=trade_id,
+                        token_id=token_id,
+                        signal_type=signal_type_row,
+                        exit_reason="expired_stale_price",
+                        days_held=elapsed.total_seconds() / 86400,
                     )
                     continue
                 log.info(

@@ -1216,9 +1216,7 @@ async def run_cycle(
             from scout.instrumentation.resolver import run_resolver_pass
 
             cg_coin_ids = [
-                t.contract_address
-                for t in all_scored_tokens
-                if t.chain == "coingecko"
+                t.contract_address for t in all_scored_tokens if t.chain == "coingecko"
             ]
             await run_resolver_pass(cg_coin_ids, session, db, settings)
         except Exception:
@@ -2232,7 +2230,8 @@ async def main(argv: list[str] | None = None) -> int:
                         try:
                             from scout.trading.evaluator import evaluate_paper_trades
 
-                            await evaluate_paper_trades(db, settings)
+                            # session: GA-01 expiry-anomaly operator alert
+                            await evaluate_paper_trades(db, settings, session=session)
                         except Exception:
                             logger.exception("trading.pipeline_eval_error")
 
