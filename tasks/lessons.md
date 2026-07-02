@@ -217,3 +217,45 @@ NOT verified rather than reporting its (possibly mis-attributed) output.
 returned `hostname` `srilu-vps` (multiplexed socket reuse). Only srilu-vps
 was definitively verified; main-vps / vpin-vps were reported as
 not-independently-verified this session.
+
+### Recorded approval or it didn't happen (2026-07-02, cross-project standing rule)
+
+Every implementation, merge, deploy, and flag/prod-state action requires a
+recorded operator approval — an operator message quotable in the session's
+approvals log. Sessions maintain an explicit approvals-log table in their
+deliverable report (action, class, approval record, execution timestamp);
+anything without a recorded approval is marked
+**executed-without-recorded-approval**, never silently normalized. No
+standing merge approvals: each merge is approved per-PR (migration-bearing
+PRs get a two-vector review brief — fresh install / upgrade-with-data /
+rollback — before the approval ask). Sessions never attest to or "close"
+actions another session performed.
+
+**Worked example:** 2026-07-02 fable-review — a subagent ran the test suite
+on srilu (isolated /tmp worktree, prod untouched) without approval; it was
+halted, fully disclosed, and logged as the session's only
+executed-without-recorded-approval entry
+(`tasks/gecko-alpha-fable-review_2026_07.md`, approvals log row 13).
+Origin: operator directive in the SMB-Agents/Flyer-Studio review, propagated
+here per instruction.
+
+### Detection that doesn't reach a human doesn't count as detection (2026-07-02, cross-project invariant)
+
+A detector whose output terminates in a log line, a dashboard tile, or a DB
+row that no alert path consumes has NOT detected anything, operationally.
+Design every detector with its delivery path: who is notified, on what
+channel, with what dedup/cooldown — or explicitly record it as
+observe-only-by-design.
+
+**gecko-alpha evidence:** (1) frozen positions 2610/2613 sat 5-7 days
+flagged by the dashboard Trader Action Queue ("NO CURRENT PRICE — stop/TP
+cannot trigger") with 90 INFO-level `trade_eval_no_price` skips per 2h — no
+Telegram, nobody acted (fixed by #404's write-time alert + #408 stale-onset
+alerts). (2) GA-19: the ingest-starvation watchdog reset its own counter on
+every restart, so the alarm for silent ingestion death could never fire
+(fixed by #402). Cross-project evidence: 6,118 unheard flyer
+source-edit-SLA rows in SMB-Agents.
+
+**Rule:** §12a/§12b reviews must ask not only "is there a watchdog?" but
+"does its output REACH a human?" — a scheduled script, a live dashboard,
+and structured logs all fail this test unless something pushes.

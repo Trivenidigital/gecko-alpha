@@ -73,6 +73,17 @@ see `docs/gecko-alpha-alignment.md`.
 validate that the listed primitives are TRUTHFUL or COMPLETE. Human PR
 review verifies accuracy.
 
+## Approvals Discipline (standing rule, 2026-07-02)
+
+**Recorded approval or it didn't happen.** Implementation / merge / deploy /
+flag-or-prod-state actions each require a recorded operator approval; keep an
+approvals-log table (action, class, approval record, timestamp) in the
+session's deliverable report; unrecorded actions are flagged
+`executed-without-recorded-approval`. No standing merge approvals — per-PR
+only; migration-bearing PRs need a two-vector review brief (fresh install /
+upgrade-with-data / rollback) before the approval ask. Sessions never attest
+to another session's actions. See tasks/lessons.md for the worked example.
+
 ## What NOT To Do
 
 - No global aiohttp sessions (pass session as parameter)
