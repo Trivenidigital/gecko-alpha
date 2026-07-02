@@ -507,3 +507,52 @@ async def test_execute_sell_legacy_partial_tp_uses_shrunk_quantity(tmp_path):
     assert pnl_usd == pytest.approx(18.0, abs=1e-6)
     assert pnl_pct == pytest.approx(20.0, abs=1e-4)
     await db.close()
+
+
+# ---------------------------------------------------------------------------
+# GA-11: fire-and-forget live-handoff tasks must log exceptions
+# ---------------------------------------------------------------------------
+
+
+async def test_live_handoff_task_exception_is_logged():
+    """A failing _pending_live_tasks task must emit live_handoff_task_failed."""
+    import asyncio
+
+    import structlog
+
+    from scout.trading.paper import _log_live_handoff_task_exception
+
+    async def _boom():
+        raise ValueError("handoff kaput")
+
+    task = asyncio.get_event_loop().create_task(_boom())
+    with pytest.raises(ValueError):
+        await task
+
+    with structlog.testing.capture_logs() as logs:
+        _log_live_handoff_task_exception(task)
+
+    events = [e for e in logs if e["event"] == "live_handoff_task_failed"]
+    assert len(events) == 1
+    assert "handoff kaput" in events[0]["error"]
+
+
+async def test_live_handoff_task_cancelled_does_not_log_or_raise():
+    """Cancelled tasks must not be reported as failures."""
+    import asyncio
+
+    import structlog
+
+    from scout.trading.paper import _log_live_handoff_task_exception
+
+    task = asyncio.get_event_loop().create_task(asyncio.sleep(30))
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    with structlog.testing.capture_logs() as logs:
+        _log_live_handoff_task_exception(task)
+
+    assert not [e for e in logs if e["event"] == "live_handoff_task_failed"]
