@@ -179,6 +179,9 @@ class Database:
         # (candidate alert / paper-trade dispatch / sampled gate-block)
         # self-labels with forward returns from in-DB price sources.
         await self._migrate_signal_outcome_ledger_v1()
+        # Phase 6 slices 2+3: price_source at open + exit_provenance at close
+        # + stale-onset mark-provenance columns on paper_trades.
+        await self._migrate_price_provenance_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -5612,6 +5615,146 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "signal_outcome_ledger_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_price_provenance_v1(self) -> None:
+        """Phase 6 slices 2+3: price-source invariant + exit provenance.
+
+        Adds five nullable columns to ``paper_trades``:
+
+        - ``price_source`` — stamped at open ('cg_lane' | 'price_cache_row');
+          backfilled to 'legacy' for every pre-existing row (open or closed)
+          so post-migration NULL means "writer bug", never "old row".
+        - ``exit_provenance`` — stamped at close ('market' |
+          'stale_snapshot' | 'entry_fallback'); backfilled for closed rows
+          from exit_reason (the GA-01 #404 fabricated-close reasons map to
+          their provenance; every other closed row was a market fill).
+          Open rows stay NULL until their close stamps it.
+        - ``stale_age_seconds_at_exit`` / ``last_good_price_at`` /
+          ``liquidity_at_exit`` — stale-onset mark provenance, written only
+          by the evaluator's stale-onset exit. ``liquidity_at_exit`` NULL
+          means "could not verify exitability" (token had no observed
+          liquidity when the price feed died).
+
+        Additive + idempotent, mirroring
+        :meth:`_migrate_ingest_watchdog_state_v1`.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "price_provenance_v1"
+        schema_version = 20260705
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("price_provenance_v1_migration_skip_already_applied")
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if (
+                existing_version is not None
+                and existing_version["description"] != migration_name
+            ):
+                raise RuntimeError(
+                    "schema_version collision for price_provenance_v1: "
+                    f"version={schema_version} "
+                    f"description={existing_version['description']}"
+                )
+
+            cur = await conn.execute("PRAGMA table_info(paper_trades)")
+            cols = {row[1] for row in await cur.fetchall()}
+            for col, decl in (
+                ("price_source", "TEXT"),
+                ("exit_provenance", "TEXT"),
+                ("stale_age_seconds_at_exit", "REAL"),
+                ("last_good_price_at", "TEXT"),
+                ("liquidity_at_exit", "REAL"),
+            ):
+                if col not in cols:
+                    await conn.execute(
+                        f"ALTER TABLE paper_trades ADD COLUMN {col} {decl}"
+                    )
+
+            # Backfill 1: every pre-invariant row is 'legacy' — including
+            # still-open rows (they were opened before the stamp existed).
+            await conn.execute(
+                "UPDATE paper_trades SET price_source = 'legacy' "
+                "WHERE price_source IS NULL"
+            )
+            # Backfill 2: closed rows get provenance from exit_reason. The
+            # two GA-01 fabricated-close reasons carry their provenance in
+            # the reason string; everything else closed was a market fill.
+            # Guarded on exit_reason existing: ancient pre-feedback-loop
+            # table shapes (tests/test_trading_db_migration.py) lack it —
+            # such DBs also cannot contain GA-01 fabricated rows, so the
+            # 'market' fallback below is the correct label for their closes.
+            if "exit_reason" in cols:
+                await conn.execute(
+                    "UPDATE paper_trades SET exit_provenance = 'entry_fallback' "
+                    "WHERE exit_provenance IS NULL "
+                    "  AND exit_reason = 'expired_stale_no_price'"
+                )
+                await conn.execute(
+                    "UPDATE paper_trades SET exit_provenance = 'stale_snapshot' "
+                    "WHERE exit_provenance IS NULL "
+                    "  AND exit_reason = 'expired_stale_price'"
+                )
+            await conn.execute(
+                "UPDATE paper_trades SET exit_provenance = 'market' "
+                "WHERE exit_provenance IS NULL AND status != 'open'"
+            )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "price_provenance_v1_migration_complete",
+                table="paper_trades",
+            )
+        except BaseException as e:
+            _log.exception(
+                "price_provenance_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,

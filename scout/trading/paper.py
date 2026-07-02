@@ -9,10 +9,17 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import structlog
+from pydantic import ValidationError
 
 from scout.config import Settings
 from scout.db import Database
 from scout.exceptions import MoonshotArmFailed
+from scout.price_sources import (
+    EXIT_PROVENANCE_MARKET,
+    EXIT_PROVENANCES,
+    resolve_price_source,
+)
+from scout.trading.models import PaperTradeOpen
 from scout.trading.actionability import (
     ActionabilityDecision,
     evaluate_actionability_v1,
@@ -46,6 +53,10 @@ CLOSED_COUNTABLE_STATUSES: tuple[str, ...] = (
     "closed_expired",
     "closed_trailing_stop",
     "closed_moonshot_trail",
+    # Phase 6 slice 3: stale-onset exits carry a real-ish mark (last-good
+    # cached price) — excluded from NOTHING by default. Consumers that want
+    # to discount them can key on exit_provenance='stale_snapshot'.
+    "closed_stale_onset",
 )
 
 
@@ -148,15 +159,56 @@ class PaperTrader:
         lead_time_vs_trending_min: float | None = None,
         lead_time_vs_trending_status: str | None = None,
         settings: Settings | None = None,
+        price_source: str | None = None,
     ) -> int | None:
         """Record a paper buy. Returns trade ID, or None if rejected by guards.
 
         Applies slippage to entry price: effective_entry = price * (1 + bps/10000).
         sl_pct is positive: sl_price = entry * (1 - sl_pct/100).
+
+        *price_source* (Phase 6 slice 2): the registered price source that
+        will re-price this position after open. Callers that already
+        resolved it (TradingEngine gate 0c) pass it through; when None it
+        is resolved here from the registry. Either way the
+        :class:`~scout.trading.models.PaperTradeOpen` boundary model
+        REFUSES to open without a registered value — this is the hard
+        invariant, independent of the engine's (flag-gated) dispatch gate.
         """
         conn = db._conn
         if conn is None:
             raise RuntimeError("Database not initialized.")
+
+        # Phase 6 slice 2 — open-boundary invariant. Resolve when the
+        # caller didn't, then validate via the app-boundary model.
+        if price_source is None:
+            cur = await conn.execute(
+                "SELECT 1 FROM price_cache WHERE coin_id = ? LIMIT 1",
+                (token_id,),
+            )
+            price_source = resolve_price_source(
+                token_id, (await cur.fetchone()) is not None
+            )
+        try:
+            PaperTradeOpen(
+                token_id=token_id,
+                signal_type=signal_type,
+                signal_combo=signal_combo,
+                price_source=price_source,
+            )
+        except ValidationError as exc:
+            log.warning(
+                "paper_trade_rejected_unregistered_price_source",
+                token_id=token_id,
+                signal_type=signal_type,
+                signal_combo=signal_combo,
+                price_source=price_source,
+                err=str(exc),
+                hint=(
+                    "no registered price source can re-price this token_id; "
+                    "opening would recreate the GA-01 unpriceable-position class"
+                ),
+            )
+            return None
 
         effective_entry = current_price * (1 + slippage_bps / 10000)
         if effective_entry <= 0:
@@ -257,9 +309,9 @@ INSERT INTO paper_trades
    status, opened_at,
    signal_combo, lead_time_vs_trending_min, lead_time_vs_trending_status,
    remaining_qty, floor_armed, realized_pnl_usd, would_be_live,
-   actionable, actionability_reason, actionability_version)
+   actionable, actionability_reason, actionability_version, price_source)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
-        ?, 0, 0.0, ?, ?, ?, ?)
+        ?, 0, 0.0, ?, ?, ?, ?, ?)
 """
         cursor = await conn.execute(
             INSERT_SQL,
@@ -286,6 +338,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
                 actionable_value,
                 actionability_reason,
                 actionability_version,
+                price_source,
             ),
         )
         trade_id = cursor.lastrowid
@@ -339,6 +392,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             actionable=actionable_value,
             actionability_reason=actionability_reason,
             actionability_version=actionability_version,
+            price_source=price_source,
         )
 
         # BL-055 chokepoint: fire-and-forget handoff to LiveEngine when injected
@@ -458,6 +512,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         sell_qty_frac: float,
         current_price: float,
         slippage_bps: int = 0,
+        price_provenance: str = EXIT_PROVENANCE_MARKET,
     ) -> bool:
         """Sell a fraction of original quantity for a ladder leg fill.
 
@@ -466,9 +521,22 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
 
         Idempotent: re-calling for the same leg is a no-op when leg_N_filled_at
         is already set (guard against concurrent evaluator ticks).
+
+        *price_provenance* (Phase 6 slice 2): where *current_price* came
+        from — one of :data:`scout.price_sources.EXIT_PROVENANCES`. Leg
+        fills only fire on fresh prices today, so 'market' is the only
+        value the evaluator passes; the kwarg exists so no future caller
+        can record a fill without saying what its price was. Logged on
+        the ``ladder_leg_fired`` event (the trade stays open — the
+        ``exit_provenance`` column is stamped by the final close).
         """
         if leg not in (1, 2):
             raise ValueError(f"leg must be 1 or 2, got {leg}")
+        if price_provenance not in EXIT_PROVENANCES:
+            raise ValueError(
+                f"price_provenance {price_provenance!r} is not registered "
+                f"(registered: {sorted(EXIT_PROVENANCES)})"
+            )
         leg = int(leg)
         conn = db._conn
         if conn is None:
@@ -524,6 +592,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             "ladder_leg_fired",
             trade_id=trade_id,
             leg=leg,
+            price_provenance=price_provenance,
             fill_price=effective_exit,
             leg_qty=leg_qty,
             leg_realized_usd=leg_realized,
@@ -548,11 +617,25 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         slippage_bps: int = 0,
         *,
         status_override: str | None = None,
+        price_provenance: str = EXIT_PROVENANCE_MARKET,
     ) -> bool:
         """Close a paper trade. Applies exit slippage. Returns True if closed.
 
         effective_exit = price * (1 - bps/10000).
+
+        *price_provenance* (Phase 6 slice 2): where *current_price* came
+        from — one of :data:`scout.price_sources.EXIT_PROVENANCES`
+        ('market' | 'stale_snapshot' | 'entry_fallback'). Persisted to
+        ``paper_trades.exit_provenance`` so a close can never be recorded
+        without saying what its price was. Defaults to 'market' (the
+        normal fresh-price exit); the evaluator's forced-close paths pass
+        their true provenance explicitly.
         """
+        if price_provenance not in EXIT_PROVENANCES:
+            raise ValueError(
+                f"price_provenance {price_provenance!r} is not registered "
+                f"(registered: {sorted(EXIT_PROVENANCES)})"
+            )
         conn = db._conn
         if conn is None:
             raise RuntimeError("Database not initialized.")
@@ -626,9 +709,18 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         cursor_upd = await conn.execute(
             """UPDATE paper_trades
                SET status = ?, exit_price = ?, exit_reason = ?,
-                   pnl_usd = ?, pnl_pct = ?, closed_at = ?
+                   exit_provenance = ?, pnl_usd = ?, pnl_pct = ?, closed_at = ?
                WHERE id = ? AND status = 'open'""",
-            (status, effective_exit, reason, pnl_usd, round(pnl_pct, 4), now, trade_id),
+            (
+                status,
+                effective_exit,
+                reason,
+                price_provenance,
+                pnl_usd,
+                round(pnl_pct, 4),
+                now,
+                trade_id,
+            ),
         )
         if cursor_upd.rowcount == 0:
             log.warning("trade_already_closed", trade_id=trade_id)
@@ -639,6 +731,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             "paper_trade_closed",
             trade_id=trade_id,
             reason=reason,
+            price_provenance=price_provenance,
             exit_price=effective_exit,
             pnl_usd=round(pnl_usd, 2),
             pnl_pct=round(pnl_pct, 2),

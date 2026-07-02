@@ -101,9 +101,12 @@ async def _stats_for_signal(
            FROM paper_trades
            WHERE signal_type = ?
              AND status LIKE 'closed_%'
-             -- GA-01: fabricated $0 closes (no price source ever served
-             -- the token_id) would depress win_rate and inflate
-             -- expired_pct — exclude from calibration inputs.
+             -- GA-01 / Phase 6 slice 2: fabricated $0 closes (no price
+             -- source ever served the token_id) would depress win_rate
+             -- and inflate expired_pct — exclude from calibration inputs.
+             -- Keyed on exit_provenance (durable label); the GA-01
+             -- exit_reason predicate stays as OR-fallback for safety.
+             AND COALESCE(exit_provenance, '') != 'entry_fallback'
              AND COALESCE(exit_reason, '') != 'expired_stale_no_price'
              AND datetime(closed_at) >= datetime(?)""",
         (signal_type, since_iso),

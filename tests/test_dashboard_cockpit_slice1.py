@@ -121,10 +121,17 @@ async def test_history_outcome_integrity_derived_from_exit_reason(client):
     assert by_token["fab"]["exit_reason"] == "expired_stale_no_price"
 
 
-async def test_history_outcome_integrity_without_provenance_column(client):
-    """Schema without exit_provenance (parallel branch not merged): the
-    endpoint still serves rows with exit_provenance=None."""
+async def test_history_outcome_integrity_fallback_when_column_absent(client):
+    """Transitional-defensive coverage: the dashboard's missing-column fallback
+    is LOAD-BEARING during the deploy-#1 -> deploy-#2 gap (dashboard ships
+    before the price_provenance_v1 migration reaches the prod DB). Post-#408
+    the shared fixture's initialize() creates the column, so we DROP it to
+    reconstruct the pre-migration schema. TOMBSTONE: delete this test and the
+    fallback branch together once no deployment can run a pre-20260705 DB.
+    """
     c, d = client
+    await d._conn.execute("ALTER TABLE paper_trades DROP COLUMN exit_provenance")
+    await d._conn.commit()
     await _insert_closed_trade(d._conn, "clean", exit_reason="tp")
     resp = await c.get("/api/trading/history")
     assert resp.status_code == 200
@@ -134,11 +141,9 @@ async def test_history_outcome_integrity_without_provenance_column(client):
 
 
 async def test_history_outcome_integrity_prefers_exit_provenance_when_present(client):
-    """Defensive support for the parallel-branch exit_provenance column: when
-    the column exists and is populated, it wins over exit_reason mapping."""
+    """When exit_provenance (added by the price_provenance_v1 migration) is
+    populated, it wins over exit_reason mapping."""
     c, d = client
-    await d._conn.execute("ALTER TABLE paper_trades ADD COLUMN exit_provenance TEXT")
-    await d._conn.commit()
     await _insert_closed_trade(d._conn, "prov", exit_reason="expired")
     await d._conn.execute(
         "UPDATE paper_trades SET exit_provenance = 'entry_fallback' WHERE token_id = 'prov'"

@@ -145,13 +145,19 @@ async def test_no_price_within_duration_still_skipped(tmp_path, settings_factory
 
 @pytest.mark.asyncio
 async def test_stale_price_within_duration_still_skipped(tmp_path, settings_factory):
-    """Regression: trade with stale price + opened recently → still skipped."""
+    """Regression: trade with stale price + opened recently → still skipped.
+
+    Staleness is 2h: past the evaluator's 1h freshness window (so the
+    stale branch is exercised) but below STALE_ONSET_EXIT_HOURS (default
+    6h) — Phase 6 slice 3 added a stale-onset exit ABOVE that threshold,
+    covered by tests/test_price_provenance_invariant.py. This test locks
+    in the skip behavior for the mild-staleness window."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     trader = PaperTrader()
     settings = settings_factory(PAPER_MAX_DURATION_HOURS=168)
     trade_id = await _open_trade(db, trader, token_id="fresh_stale", opened_hours_ago=2)
-    stale_ts = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+    stale_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     await db._conn.execute(
         "INSERT INTO price_cache (coin_id, current_price, updated_at) VALUES (?, ?, ?)",
         ("fresh_stale", 0.95, stale_ts),

@@ -707,6 +707,16 @@ class Settings(BaseSettings):
     # closes were $0 at exactly max_duration (2026-07). Flip to False only
     # if a dex:-namespace price writer ships.
     PAPER_REQUIRE_PRICEABLE_TOKEN_ID: bool = True
+    # Phase 6 slice 3 (operator-approved policy A): stale-onset exit. When an
+    # open trade's price_cache row goes stale for more than this many hours
+    # (and the trade has NOT reached max_duration), the evaluator exits NOW at
+    # the last-good cached price (provenance 'stale_snapshot', status
+    # 'closed_stale_onset') instead of holding a position it can no longer
+    # mark. Rationale: a token leaving the tracked universe usually means
+    # liquidity death — waiting for expiry just fabricates a later close at
+    # the same stale mark. ge=1: the evaluator's own freshness window is 1h;
+    # a sub-hour onset threshold would fight it.
+    STALE_ONSET_EXIT_HOURS: float = Field(default=6.0, ge=1)
     # Trailing stop (legacy — still used for pre-BL-061 rows; BL-061 ladder
     # uses PAPER_LADDER_TRAIL_PCT on the runner slice).
     PAPER_TRAILING_ENABLED: bool = True

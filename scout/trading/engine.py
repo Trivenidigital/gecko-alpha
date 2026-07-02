@@ -22,6 +22,7 @@ from scout.outcome_ledger import (
     liquidity_from_signal_data,
     record_emission as _ledger_record_emission,
 )
+from scout.price_sources import resolve_price_source
 
 log = structlog.get_logger()
 
@@ -360,25 +361,38 @@ class TradingEngine:
         # closes). Gate placement: BEFORE the entry_price shortcut in
         # step 1, because that shortcut is exactly the bypass that let
         # unpriceable trades through.
-        if getattr(self.settings, "PAPER_REQUIRE_PRICEABLE_TOKEN_ID", True) and (
-            not is_cg_coin_id(token_id)
-        ):
+        # Phase 6 slice 2: the same resolution now also YIELDS the
+        # price_source stamped onto the row at open (single query, no
+        # duplication). CG-shaped ids resolve without a DB hit; everything
+        # else is admissible only via an existing price_cache row.
+        if is_cg_coin_id(token_id):
+            price_source: str | None = resolve_price_source(token_id, False)
+        else:
             cursor = await conn.execute(
                 "SELECT 1 FROM price_cache WHERE coin_id = ? LIMIT 1",
                 (token_id,),
             )
-            if await cursor.fetchone() is None:
-                log.warning(
-                    "trade_skipped_unpriceable_token_id",
-                    token_id=token_id,
-                    signal_type=signal_type,
-                    hint=(
-                        "no price_cache writer serves this token_id namespace; "
-                        "trade would be un-evaluatable (expiry-only exit)"
-                    ),
-                )
-                await _emit_decision("blocked", "unpriceable_token_id")
-                return None
+            price_source = resolve_price_source(
+                token_id, await cursor.fetchone() is not None
+            )
+        if price_source is None and getattr(
+            self.settings, "PAPER_REQUIRE_PRICEABLE_TOKEN_ID", True
+        ):
+            log.warning(
+                "trade_skipped_unpriceable_token_id",
+                token_id=token_id,
+                signal_type=signal_type,
+                hint=(
+                    "no price_cache writer serves this token_id namespace; "
+                    "trade would be un-evaluatable (expiry-only exit)"
+                ),
+            )
+            await _emit_decision("blocked", "unpriceable_token_id")
+            return None
+        # NB: with the flag OFF an unresolvable source still cannot open —
+        # PaperTrader.execute_buy's PaperTradeOpen boundary model refuses
+        # price_source=None (belt and suspenders; the flag only controls
+        # this gate's blocked-event telemetry path).
 
         # 1. Resolve current price -- prefer caller-supplied entry_price
         if entry_price is not None and entry_price > 0:
@@ -522,6 +536,7 @@ class TradingEngine:
                 lead_time_vs_trending_min=lead_time_min,
                 lead_time_vs_trending_status=lead_time_status,
                 settings=self.settings,
+                price_source=price_source,
             )
             # BL-NEW-TG-ALERT-ALLOWLIST: post-open Telegram alert hook.
             # Fire-and-forget; never blocks paper-trade success path.
@@ -678,6 +693,8 @@ class TradingEngine:
             current_price=current_price,
             reason=reason,
             slippage_bps=self.settings.PAPER_SLIPPAGE_BPS,
+            # Fresh price enforced above (age <= 3600) — a true market exit.
+            price_provenance="market",
         )
 
     async def get_open_positions(self) -> list[dict]:

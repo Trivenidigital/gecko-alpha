@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
+
+from scout.price_sources import REGISTERED_PRICE_SOURCES
 
 # Canonical set of trade status strings accepted by the evaluator + dashboard.
 # Mirrors `scout.trading.paper.CLOSED_COUNTABLE_STATUSES` for the closed set
@@ -21,7 +23,39 @@ TradeStatus = Literal[
     "closed_floor",
     "closed_peak_fade",
     "closed_manual",
+    "closed_stale_onset",  # Phase 6 slice 3 — stale-onset exit at last-good mark
 ]
+
+
+class PaperTradeOpen(BaseModel):
+    """App-boundary contract for opening a paper trade (Phase 6 slice 2).
+
+    Validated at the top of ``PaperTrader.execute_buy`` — the ONE funnel
+    every open passes through — so the invariant "a position cannot be
+    opened without a registered price source" holds even for callers
+    that bypass the TradingEngine gate (belt and suspenders with the
+    GA-01 dispatch gate in scout/trading/engine.py step 0c).
+
+    ``price_source`` must be one of
+    :data:`scout.price_sources.REGISTERED_PRICE_SOURCES`. ``'legacy'``
+    is a migration-only backfill label and is rejected here by design.
+    """
+
+    token_id: str
+    signal_type: str
+    signal_combo: str
+    price_source: str | None = None
+
+    @model_validator(mode="after")
+    def _require_registered_price_source(self) -> "PaperTradeOpen":
+        if self.price_source not in REGISTERED_PRICE_SOURCES:
+            raise ValueError(
+                f"price_source {self.price_source!r} is not a registered price "
+                f"source (registered: {sorted(REGISTERED_PRICE_SOURCES)}). "
+                "A paper trade cannot open without a resolvable price source "
+                "— see scout.price_sources.resolve_price_source."
+            )
+        return self
 
 
 class PaperTrade(BaseModel):
