@@ -718,3 +718,37 @@ async def test_score_history(db):
     # Unknown contract returns empty
     empty = await db.get_recent_scores("0xunknown")
     assert empty == []
+
+
+# ---------------------------------------------------------------------------
+# GA-22: busy_timeout set explicitly at bootstrap (not just at migration sites)
+# ---------------------------------------------------------------------------
+
+
+async def test_initialize_sets_busy_timeout_default(tmp_path):
+    """initialize() must apply PRAGMA busy_timeout on the connection.
+
+    Before GA-22 the 90s timeout existed only as an incidental side-effect
+    of four migration-site PRAGMAs; a fresh connection had busy_timeout=0
+    until (and unless) those migrations ran.
+    """
+    database = Database(str(tmp_path / "bt_default.db"))
+    await database.initialize()
+    try:
+        cur = await database._conn.execute("PRAGMA busy_timeout")
+        (value,) = await cur.fetchone()
+        assert value == 90_000
+    finally:
+        await database.close()
+
+
+async def test_initialize_sets_busy_timeout_custom(tmp_path):
+    """Operator-configured value (Settings.SQLITE_BUSY_TIMEOUT_MS) is applied."""
+    database = Database(str(tmp_path / "bt_custom.db"), busy_timeout_ms=12_345)
+    await database.initialize()
+    try:
+        cur = await database._conn.execute("PRAGMA busy_timeout")
+        (value,) = await cur.fetchone()
+        assert value == 12_345
+    finally:
+        await database.close()

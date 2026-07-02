@@ -236,6 +236,11 @@ class Settings(BaseSettings):
 
     # Database
     DB_PATH: Path = Path("scout.db")
+    # GA-22: connection-level PRAGMA busy_timeout applied at
+    # Database.initialize(). ge=0 (0 = fail immediately on lock, valid for
+    # tests); le=600_000 (10 min ceiling — anything larger is almost
+    # certainly a misconfig that should fail-fast at startup).
+    SQLITE_BUSY_TIMEOUT_MS: int = Field(default=90_000, ge=0, le=600_000)
 
     # Anthropic fallback
     ANTHROPIC_API_KEY: str

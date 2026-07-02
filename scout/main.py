@@ -1821,7 +1821,7 @@ async def main(argv: list[str] | None = None) -> int:
 
     _cg_ratelimit_configure(settings)
 
-    db = Database(settings.DB_PATH)
+    db = Database(settings.DB_PATH, busy_timeout_ms=settings.SQLITE_BUSY_TIMEOUT_MS)
     await db.initialize()
 
     # --- BL-055 live-trading wiring (spec §10) --------------------------------
