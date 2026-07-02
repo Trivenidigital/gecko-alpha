@@ -73,6 +73,28 @@ see `docs/gecko-alpha-alignment.md`.
 validate that the listed primitives are TRUTHFUL or COMPLETE. Human PR
 review verifies accuracy.
 
+## Approvals Discipline (standing rule, 2026-07-02)
+
+**Recorded approval or it didn't happen.** Implementation / merge / deploy /
+flag-or-prod-state actions each require a recorded operator approval; keep an
+approvals-log table (action, class, approval record, timestamp) in the
+session's deliverable report; unrecorded actions are flagged
+`executed-without-recorded-approval`. No standing merge approvals — per-PR
+only; migration-bearing PRs need a two-vector review brief (fresh install /
+upgrade-with-data / rollback) before the approval ask. Sessions never attest
+to another session's actions. See tasks/lessons.md for the worked example.
+
+**Worktree-first, one worktree per session.** Every session (human-driven or
+agent) claims its own `git worktree` before any git state change; the root
+checkout stays on master, effectively read-only. Rationale: parallel sessions
+moving a shared checkout's HEAD mid-session is a documented failure mode
+(2026-07-02: HEAD moved to a PR-#400 review line under another session's
+uncommitted files).
+
+**Condition-enumeration on conditional approvals.** Every
+conditionally-approved PR's merge report enumerates each condition and where
+it was satisfied — including documentation and design-artifact conditions.
+
 ## What NOT To Do
 
 - No global aiohttp sessions (pass session as parameter)

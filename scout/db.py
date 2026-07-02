@@ -175,6 +175,10 @@ class Database:
         # GA-19: durable per-source consecutive-miss counters so the
         # ingest-starvation watchdog survives gecko-pipeline restarts.
         await self._migrate_ingest_watchdog_state_v1()
+        # P0 edge-audit 2026-07-02: signal_outcome_ledger — every emission
+        # (candidate alert / paper-trade dispatch / sampled gate-block)
+        # self-labels with forward returns from in-DB price sources.
+        await self._migrate_signal_outcome_ledger_v1()
         # Phase 6 slices 2+3: price_source at open + exit_provenance at close
         # + stale-onset mark-provenance columns on paper_trades.
         await self._migrate_price_provenance_v1()
@@ -5450,6 +5454,167 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "ingest_watchdog_state_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_signal_outcome_ledger_v1(self) -> None:
+        """P0 edge-audit 2026-07-02: self-labeling forward-return ledger.
+
+        The 2026-07-02 edge audit (tasks/gecko-alpha-fable-review_2026_07.md
+        Phase 3) found historical forward-returns uncomputable — the alerts
+        table has 33 lifetime rows with no usable price, so gate
+        counterfactuals are impossible. ``signal_outcome_ledger`` records
+        every future emission (candidate alert, paper-trade dispatch, sampled
+        gate-block) WITH its price + liquidity at emission, and an in-DB
+        labeler (scout/outcome_ledger.py) fills r15m/r1h/r4h/r24h/r7d/peak7d
+        from volume_history_cg history + price_cache — zero external API
+        budget. This is the measurement precondition for the exit-lifecycle
+        flagship and funnel reopening.
+
+        §12a freshness surface: the table is registered in the dashboard
+        system-health query path (dashboard/db.py get_system_health, keyed on
+        emitted_at) and the hourly labeler pass emits a ``ledger_label_pass``
+        structured log every run.
+
+        Additive + idempotent, mirroring :meth:`_migrate_ingest_watchdog_state_v1`.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "signal_outcome_ledger_v1"
+        schema_version = 20260704
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("signal_outcome_ledger_v1_migration_skip_already_applied")
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if (
+                existing_version is not None
+                and existing_version["description"] != migration_name
+            ):
+                raise RuntimeError(
+                    "schema_version collision for signal_outcome_ledger_v1: "
+                    f"version={schema_version} "
+                    f"description={existing_version['description']}"
+                )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS signal_outcome_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL
+                        CHECK(kind IN ('alert','dispatch','gated_out_sample')),
+                    token_id TEXT NOT NULL,
+                    surface TEXT NOT NULL,
+                    price_at_emission REAL,
+                    -- Age (seconds) of the anchor price at emission: 0.0 for
+                    -- live caller-supplied prices (dispatch / gated_out),
+                    -- now - price_cache.updated_at for cache-resolved alert
+                    -- anchors, NULL when price_at_emission is NULL.
+                    anchor_cache_age_seconds REAL,
+                    liquidity_at_emission REAL,
+                    liquidity_source TEXT,
+                    gate_verdicts TEXT,
+                    -- Forward-polling enrollment outcome at emission:
+                    -- 'not_needed' (token has in-DB price coverage),
+                    -- 'enrolled' (enrollment row written; may later be
+                    -- cap-evicted — see the ledger_enrollment_evicted log),
+                    -- 'skipped_cap' (reserved; unreachable under the current
+                    -- evict-oldest-to-make-room semantics).
+                    enrollment_status TEXT
+                        CHECK(enrollment_status IN
+                              ('not_needed','enrolled','skipped_cap')),
+                    emitted_at TEXT NOT NULL,
+                    r15m REAL,
+                    r1h REAL,
+                    r4h REAL,
+                    r24h REAL,
+                    r7d REAL,
+                    peak7d REAL,
+                    label_status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(label_status IN
+                              ('pending','partial','complete','unlabelable')),
+                    labeled_at TEXT
+                )
+                """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sol_status_emitted "
+                "ON signal_outcome_ledger(label_status, emitted_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sol_token_emitted "
+                "ON signal_outcome_ledger(token_id, emitted_at)"
+            )
+            # Enrollment-at-emission (operator design fold): tokens with no
+            # in-DB price coverage (gated-out micro-caps, dex:-namespace ids)
+            # would make their ledger rows structurally unlabelable — the
+            # missed-winner recall lane would be unmeasurable. Emissions
+            # enroll such tokens into a TTL'd, capped forward-polling set;
+            # a per-cycle poller prices them through price_cache so labeling
+            # stays in-DB. See scout/outcome_ledger.py poll_enrollments.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS ledger_enrollments (
+                    token_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    enrolled_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                )
+                """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ledger_enroll_expires "
+                "ON ledger_enrollments(expires_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "signal_outcome_ledger_v1_migration_complete",
+                table="signal_outcome_ledger",
+            )
+        except BaseException as e:
+            _log.exception(
+                "signal_outcome_ledger_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,

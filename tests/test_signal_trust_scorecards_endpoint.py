@@ -52,7 +52,7 @@ async def test_scorecards_returns_200_with_invariants(client):
     assert meta["experimental"] is True
     assert meta["visibility_only"] is True
     assert meta["not_live_eligibility_verdict"] is True
-    assert meta["cohort_policy"] == "full_closed_paper_trades"
+    assert meta["cohort_policy"] == "closed_paper_trades_excl_fabricated"
     assert meta["sort_policy"] == "signal_type_asc_not_ranked"
     assert meta["generated_at"]
     assert meta["windows_days"] == [7, 14, 30]
@@ -147,7 +147,7 @@ async def test_scorecards_returns_503_when_paper_trades_missing(tmp_path):
     assert payload["meta"]["not_for_source_ranking"] is True
     assert payload["meta"]["visibility_only"] is True
     assert payload["meta"]["not_live_eligibility_verdict"] is True
-    assert payload["meta"]["cohort_policy"] == "full_closed_paper_trades"
+    assert payload["meta"]["cohort_policy"] == "closed_paper_trades_excl_fabricated"
     assert payload["meta"]["sort_policy"] == "signal_type_asc_not_ranked"
     assert payload["meta"]["data_missing_reason"] == "paper_trades_missing"
     assert payload["rows"] == []

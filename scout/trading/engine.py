@@ -17,6 +17,11 @@ from scout.trading.params import (
 )
 from scout.trading.decision_events import emit_trade_decision
 from scout.token_ids import is_cg_coin_id
+from scout.outcome_ledger import (
+    GatedOutSampler,
+    liquidity_from_signal_data,
+    record_emission as _ledger_record_emission,
+)
 from scout.price_sources import resolve_price_source
 
 log = structlog.get_logger()
@@ -133,6 +138,10 @@ class TradingEngine:
         # pattern). Mid-flight loss on shutdown is acceptable — paper
         # trade row is committed; only the alert + log row is lost.
         self._tg_alert_tasks: set[asyncio.Task] = set()
+        # P0 edge-audit: deterministic 1-in-N sampler for blocked-dispatch
+        # ledger rows (LEDGER_GATED_OUT_SAMPLE_RATE; 0 = off). Per-engine
+        # counter — resets on restart, which only shifts the sample phase.
+        self._ledger_gated_out_sampler = GatedOutSampler()
 
     def set_tg_session(self, session) -> None:
         """Wire the aiohttp.ClientSession used for TG alert dispatch.
@@ -240,6 +249,46 @@ class TradingEngine:
                 paper_trade_id=paper_trade_id,
                 event_data=event_data,
             )
+            # P0 edge-audit: sample 1-in-N blocked dispatches into the
+            # signal-outcome ledger so the under-gate cohort's forward
+            # returns become measurable (gate counterfactuals). Single
+            # insertion point — covers every 'blocked' reason above/below.
+            # record_emission is fail-soft; the try is belt-and-braces so a
+            # ledger bug can NEVER break the dispatch decision path.
+            if decision == "blocked":
+                try:
+                    rate = int(
+                        getattr(self.settings, "LEDGER_GATED_OUT_SAMPLE_RATE", 0) or 0
+                    )
+                    if self._ledger_gated_out_sampler.should_record(rate):
+                        liq, liq_src = liquidity_from_signal_data(signal_data)
+                        await _ledger_record_emission(
+                            self.db,
+                            self.settings,
+                            kind="gated_out_sample",
+                            token_id=token_id,
+                            surface=signal_type,
+                            price=(
+                                entry_price
+                                if entry_price is not None and entry_price > 0
+                                else None
+                            ),
+                            liquidity=liq,
+                            liquidity_source=liq_src,
+                            gate_verdicts={
+                                "reason": reason,
+                                "sample_rate": rate,
+                                **extra,
+                            },
+                        )
+                except Exception as exc:
+                    log.warning(
+                        "ledger_record_failed",
+                        site="gated_out_sample",
+                        token_id=token_id,
+                        signal_type=signal_type,
+                        error=str(exc),
+                    )
 
         # 0a. Startup warmup — coarsest gate (no DB, no allocations).
         # Runs before signal_params lookup so we don't hit the DB for
@@ -510,6 +559,38 @@ class TradingEngine:
                     amount_usd=trade_amount,
                     signal_data=signal_data,
                 )
+                # P0 edge-audit: self-labeling dispatch record. Anchor is the
+                # market price at dispatch (current_price, pre-slippage) —
+                # forward returns measure the SIGNAL, not fill quality.
+                # record_emission is fail-soft; try is belt-and-braces so a
+                # ledger bug can never break a successful trade open.
+                try:
+                    liq, liq_src = liquidity_from_signal_data(signal_data)
+                    await _ledger_record_emission(
+                        self.db,
+                        self.settings,
+                        kind="dispatch",
+                        token_id=token_id,
+                        surface=signal_type,
+                        price=current_price,
+                        liquidity=liq,
+                        liquidity_source=liq_src,
+                        gate_verdicts={
+                            "signal_combo": signal_combo,
+                            "paper_trade_id": trade_id,
+                            "trade_amount_usd": trade_amount,
+                            "lead_time_vs_trending_min": lead_time_min,
+                        },
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "ledger_record_failed",
+                        site="dispatch",
+                        token_id=token_id,
+                        signal_type=signal_type,
+                        paper_trade_id=trade_id,
+                        error=str(exc),
+                    )
             return trade_id
 
         log.warning("trade_mode_not_supported", mode=self.mode)

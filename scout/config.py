@@ -36,6 +36,34 @@ class Settings(BaseSettings):
     )  # BL-033: periodic heartbeat summary
     INGEST_WATCHDOG_ENABLED: bool = True
     INGEST_STARVATION_THRESHOLD_CYCLES: int = Field(default=5, ge=1, le=100)
+
+    # --- Signal outcome ledger (P0, edge-audit 2026-07-02) -----------------
+    # Observe-only writer + in-DB labeler: every emission (candidate alert,
+    # paper-trade dispatch, sampled gate-block) self-labels with forward
+    # returns resolved from volume_history_cg + price_cache ONLY — no sends,
+    # no external API calls, zero rate-limit budget. Default-on approved by
+    # operator ("start now"); LEDGER_ENABLED=False is the kill switch,
+    # respected at all three write sites and the hourly labeler.
+    LEDGER_ENABLED: bool = True
+    # 1-in-N sampling of blocked trade_decision emissions (0 = off). le=1e5
+    # admits "effectively off" without the 0 sentinel.
+    LEDGER_GATED_OUT_SAMPLE_RATE: int = Field(default=25, ge=0, le=100_000)
+    # Max pending/partial rows examined per hourly labeling pass — bounds the
+    # per-pass read/write load on the hot-loop DB connection.
+    LEDGER_LABEL_BATCH_MAX: int = Field(default=500, ge=1, le=100_000)
+    # price_cache fallback freshness: a cache row may stand in for a horizon
+    # price only if observed within this many minutes AFTER the horizon
+    # deadline (volume_history_cg rows are preferred and un-bounded — they are
+    # true historical observations). 120 min covers the hourly pass + margin;
+    # le = 7 days (the longest horizon).
+    LEDGER_PRICE_CACHE_MAX_LATENESS_MINUTES: int = Field(default=120, ge=1, le=10_080)
+    # Enrollment-at-emission: emissions whose token has no in-DB price
+    # coverage (all gated_out_samples + priceless alerts) enroll the token
+    # into a forward-polling set so the labeler can price it. TTL matches
+    # the 7d labeling window; cap bounds the per-cycle polling cost
+    # (oldest-expire-first eviction).
+    LEDGER_ENROLLMENT_TTL_DAYS: int = Field(default=7, ge=1, le=90)
+    LEDGER_ENROLLMENT_MAX_ACTIVE: int = Field(default=200, ge=1, le=10_000)
     # MIN_SCORE / CONVICTION_THRESHOLD are 0..100 scores in normal use,
     # but tests + operator circuit-breakers use sentinel values like
     # 999 to mean "disable this gate entirely". ge=0 catches sign typos;
