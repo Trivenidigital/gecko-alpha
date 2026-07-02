@@ -44,7 +44,7 @@ The managed block is bracketed by:
 
 ## What's in scope
 
-Currently 7 entries:
+Currently 9 entries:
 - `30 3 * * 0` — `scripts/tg_burst_archive.sh` (Sunday 03:30 UTC)
 - `45 3 * * 0` — `scripts/wal_archive.sh` (Sunday 03:45 UTC)
 - `*/5 * * * *` — `scripts/source-calls-live-writer.sh` (every 5 min)
@@ -58,6 +58,12 @@ Currently 7 entries:
 - `*/15 * * * *` — `scripts/acceleration-heartbeat-watchdog.sh`
   (gainer-acceleration detector execution-heartbeat; alerts if
   `acceleration_scan_complete` is absent from the journal > 60 min)
+- `*/5 * * * *` — `scripts/held-position-price-watchdog.sh`
+  (held-position price-refresh lane freshness; alerts when open paper
+  trades have `price_cache` rows stale > 30 min for 3 consecutive runs)
+- `30 9 * * *` — `scripts/revival-verdict-watchdog.sh`
+  (daily; alerts when a `keep_on_provisional_until_<iso>` soak verdict has
+  passed its embedded expiry without a fresh operator verdict)
 
 Future high-cadence triggers should prefer `systemd/*.timer` (cycle 10 canon) over cron. The managed entries above stay as cron for simplicity (see BL-NEW-CRON-TO-SYSTEMD-TIMER decision-by 2026-06-14).
 
@@ -132,34 +138,31 @@ find /var/lib/gecko-alpha/cron-drift-watchdog/heartbeat -mmin +1500 -type f \
 `scripts/revival-verdict-watchdog.sh` alerts when a
 `signal_params_audit` row of the form
 `keep_on_provisional_until_<iso>` has passed its embedded expiry
-without a fresh operator verdict. **Status: SCRIPT-SHIPPED /
-SCHEDULING-PENDING-OPERATOR.** The script lives in the repo; the
-cron entry is NOT installed by default.
+without a fresh operator verdict. **Status: SCHEDULED in the managed
+block** (`30 9 * * *`, daily — 10 min after the stop-loss FN audit so
+the two daily jobs don't overlap).
+
+Historical note: from PR #186 (2026-05-19) through 2026-07-02 this
+watchdog was SCRIPT-SHIPPED / SCHEDULING-PENDING-OPERATOR — the script
+lived in the repo but the cron entry was intentionally NOT installed,
+per the opt-in convention for operator-judgment *verdict* watchdogs.
+The 2026-07-02 production review (`tasks/prod_review_2026_07_02.md`
+GA-03) found it dark on prod alongside `held-position-price-watchdog`
+and is the decision record for scheduling both. Daily cadence is ample:
+provisional verdicts carry 30-day expiry horizons, and per-signal
+idempotency state re-alerts at most weekly (`REALERT_HOURS=168`).
 
 Design: `tasks/plan_revival_verdict_watchdog_2026_05_19.md` (PR #185).
 
-### Smoke test (no scheduling)
+### Smoke test
 
 ```bash
 ssh root@srilu-vps
 cd /root/gecko-alpha
 git pull
 bash scripts/revival-verdict-watchdog.sh
-# Expected on prod today (0 provisional rows): exit 0,
+# Expected when no provisional verdicts are expired: exit 0,
 # stdout "revival_verdict_watchdog_run expired_count=0".
-```
-
-### Setup (one-time, opt-in to scheduled firing — operator approval required)
-
-```bash
-# 1. Add to cron managed block
-echo "30 9 * * * /root/gecko-alpha/scripts/revival-verdict-watchdog.sh >> /var/log/revival-verdict-watchdog.log 2>&1" \
-    >> cron/gecko-alpha.crontab
-# 2. Commit + push the change
-# 3. Deploy
-bash cron/deploy.sh
-# 4. Verify
-crontab -l | grep revival-verdict-watchdog
 ```
 
 ### Disable / revert
@@ -198,7 +201,9 @@ watchdog ships active too — it is in `gecko-alpha.crontab` and goes live on th
 next `cron/deploy.sh`. (Codex + the silent-failure review both flagged shipping
 the writer active without an active watchdog; auto-scheduling resolves it. The
 opt-in convention applies to operator-judgment *verdict* watchdogs like
-`revival-verdict` / `cron-drift`, not pipeline-freshness monitors.)
+`cron-drift`, not pipeline-freshness monitors. `revival-verdict` started under
+the opt-in convention and was later scheduled per
+`tasks/prod_review_2026_07_02.md` GA-03.)
 
 ### Smoke test
 
@@ -229,6 +234,72 @@ sed -i '/acceleration-heartbeat-watchdog/d' cron/gecko-alpha.crontab && bash cro
 | 3 | Stale, Telegram creds missing (alert to stdout) |
 | 7 | Stale, Telegram delivery failed |
 | 64 | Unknown argument |
+
+## Held-position price watchdog (GA-03, 2026-07-02)
+
+`scripts/held-position-price-watchdog.sh` is the ONLY alarm for the
+held-position price-refresh lane silently breaking. The lane
+(`tasks/plan_held_position_price_freshness.md`, Alt A) is itself the
+mitigation for a live S1 — open paper trades whose `price_cache` rows go
+stale skip ALL exit evaluation (trailing stops / stop-losses can't fire on
+frozen prices; see `tasks/prod_review_2026_07_02.md` GA-01/GA-02). The
+script shipped with the lane per §12a but was never scheduled anywhere
+(neither crontab nor `systemd/`) — a dark watchdog. **Status: SCHEDULED
+in the managed block** (`*/5`, per the design doc's stated cadence).
+Decision record: `tasks/prod_review_2026_07_02.md` GA-03.
+
+Cadence rationale: the script alerts when open `paper_trades` have
+`price_cache` rows missing or stale > 30 min (`HELD_POSITION_STALE_AFTER_MIN`)
+for 3 consecutive runs (`HELD_POSITION_WATCHDOG_HYSTERESIS`, anti-blip).
+At `*/5` that means detection ~45 min after the lane breaks (30 min
+staleness threshold + 3×5 min hysteresis), matching the design doc's
+"runs every 5 min ... 3 consecutive cycles" spec. A slower cadence would
+stretch the hysteresis window proportionally (e.g. `*/15` → 30+45 min).
+
+### Prerequisites (all already satisfied on srilu)
+
+- `/root/gecko-alpha/scout.db` (override: `GECKO_DB_PATH`) — missing DB
+  fails loudly: stderr + exit 4 into the per-job log.
+- `/root/gecko-alpha/.env` with real `TELEGRAM_BOT_TOKEN` +
+  `TELEGRAM_CHAT_ID` (override: `GECKO_ENV_FILE`) — needed only at alert
+  time; missing/placeholder creds fail loudly (stderr + exit 4/5), never
+  a silent exit-0.
+- `sqlite3` and `python3` CLI binaries (python is for JSON-encoding the
+  Telegram payload; missing → exit 6).
+- Hysteresis state dir `/var/lib/gecko-alpha/held-position-watchdog/`
+  is auto-created (`mkdir -p`) — no manual setup.
+
+No heartbeat-file wiring is required: unlike the acceleration watchdog,
+this script queries DB output directly (rows + timestamps), per the
+"watchdog reads OUTPUT not heartbeats" discipline.
+
+### Smoke test
+
+```bash
+ssh root@srilu-vps
+cd /root/gecko-alpha && git pull
+bash scripts/held-position-price-watchdog.sh
+# Healthy: exit 0, stdout "stale_count=0 ... OK: 0 held positions with stale price_cache"
+```
+
+### Disable / revert
+
+```bash
+crontab -l | grep -v held-position-price-watchdog | crontab -
+# clean revert:
+sed -i '/held-position-price-watchdog/d' cron/gecko-alpha.crontab && bash cron/deploy.sh
+```
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | No stale held positions, OR stale but below 3-consecutive-runs hysteresis |
+| 1 | Alert delivered (HTTP 200) |
+| 4 | DB not found / SQL error / `.env` missing at alert time |
+| 5 | Telegram token / chat_id missing or placeholder |
+| 6 | `python` not available (JSON encoding) |
+| 7 | Telegram HTTP delivery failed |
 
 ## Stop-loss false-negative audit gate
 
