@@ -213,9 +213,23 @@ class SignalTrustScorecardsWindow(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class SignalTrustScorecardsLive(BaseModel):
+    """Live signal_params state (cockpit slice 1, GA-35/GA-36).
+
+    OPERATOR INVARIANT: trust surfaces read from the live store the engine
+    writes (signal_params) — never static registry snapshots.
+    """
+
+    enabled: int | None = None
+    suspended_at: str | None = None
+    suspended_reason: str | None = None
+    last_calibration_at: str | None = None
+
+
 class SignalTrustScorecardsRow(BaseModel):
     signal_type: str
     registry: SignalTrustScorecardsRegistry | None = None
+    live: SignalTrustScorecardsLive | None = None
     open: SignalTrustScorecardsOpen = Field(default_factory=SignalTrustScorecardsOpen)
     windows: list[SignalTrustScorecardsWindow] = Field(default_factory=list)
 
@@ -233,11 +247,17 @@ class SignalTrustScorecardsMeta(BaseModel):
     experimental: bool = True
     visibility_only: bool = True
     not_live_eligibility_verdict: bool = True
-    cohort_policy: str = "full_closed_paper_trades"
+    # Cockpit slice 1: fabricated closes (exit_reason='expired_stale_no_price',
+    # plus exit_provenance='entry_fallback' when the column exists) are
+    # excluded from closed n/win-rate evidence — same predicate as
+    # scout/trading/auto_suspend.py:_rolling_stats.
+    cohort_policy: str = "closed_paper_trades_excl_fabricated"
     sort_policy: str = "signal_type_asc_not_ranked"
     generated_at: str
     windows_days: list[int] = Field(default_factory=list)
     data_missing_reason: str | None = None
+    # True when the live signal_params join succeeded (GA-35/GA-36).
+    signal_params_joined: bool = False
 
 
 class ApiError(BaseModel):

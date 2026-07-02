@@ -50,6 +50,12 @@ except Exception as _e:  # pragma: no cover — paranoia for misconfigured .env
 # BL-066' fallback constant — keep aligned with scout/config.py default.
 _CAP_PER_DAY_FALLBACK = 5
 
+# Cockpit slice 1 (fable-review Phase 2 finding 3): registry files older than
+# this render a staleness warning on the Signal Trust tab. Display-only
+# threshold (does not gate any behavior), so a module constant is fine —
+# same precedent as the frontend's WARMING_WINDOW_DAYS.
+REGISTRY_STALE_AFTER_DAYS = 7
+
 # Default DB path — can be overridden via create_app()
 # Note: _db_path is closure-captured via create_app() and safe for single-process use (L5).
 _db_path: str = "scout.db"
@@ -230,6 +236,17 @@ def create_app(db_path: str | None = None) -> FastAPI:
         docs/superpowers/registries/signal_trust_registry.v1.json.
         It must remain visibility-only and must not be consumed for pruning,
         auto-disable, sizing, or execution decisions.
+
+        Cockpit slice 1 (fable-review Phase 2 findings 2-3 / GA-35, GA-36):
+        every registry entry is joined with its live signal_params row
+        (``entry["live"]``), and meta carries ``registry_stale`` /
+        ``registry_stale_warning`` when the registry file's mtime exceeds
+        REGISTRY_STALE_AFTER_DAYS.
+
+        OPERATOR INVARIANT: trust surfaces read from the live store the
+        engine writes (signal_params) — never static snapshots. The static
+        registry provides maturity labels only; suspension state comes from
+        the live join and wins regardless of registry maturity.
         """
         from fastapi.responses import JSONResponse
 
@@ -238,6 +255,44 @@ def create_app(db_path: str | None = None) -> FastAPI:
         status_code, payload, retry_after = load_signal_trust_registry_payload(
             repo_root, generated_at
         )
+        if status_code == 200:
+            meta = payload.setdefault("meta", {})
+            # Live signal_params join — degrade (never 503) if the DB or
+            # table is unavailable: the registry file itself is still
+            # renderable, and this surface is visibility-only.
+            live_params = None
+            try:
+                live_params = await db.get_signal_params_live(_db_path)
+            except Exception as e:
+                _log.warning("signal_trust_registry_live_join_unavailable", err=str(e))
+            entries = (payload.get("registry") or {}).get("entries") or []
+            if live_params is not None:
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        entry["live"] = live_params.get(entry.get("signal_type"))
+                meta["signal_params_joined"] = True
+            else:
+                meta["signal_params_joined"] = False
+
+            # Registry staleness (finding 3): mtime older than the threshold
+            # means maturity labels may lag live state — warn, don't hide.
+            stale = False
+            mtime_iso = meta.get("registry_mtime")
+            if mtime_iso:
+                try:
+                    mtime_dt = datetime.fromisoformat(
+                        str(mtime_iso).replace("Z", "+00:00")
+                    )
+                    stale = datetime.now(timezone.utc) - mtime_dt > timedelta(
+                        days=REGISTRY_STALE_AFTER_DAYS
+                    )
+                except ValueError:
+                    stale = False
+            meta["registry_stale"] = stale
+            if stale:
+                meta["registry_stale_warning"] = (
+                    "registry stale — maturity labels may not reflect " "current state"
+                )
         if retry_after is not None:
             headers = {**headers, "Retry-After": str(retry_after)}
         return JSONResponse(
@@ -266,11 +321,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 "experimental": True,
                 "visibility_only": True,
                 "not_live_eligibility_verdict": True,
-                "cohort_policy": "full_closed_paper_trades",
+                "cohort_policy": "closed_paper_trades_excl_fabricated",
                 "sort_policy": "signal_type_asc_not_ranked",
                 "generated_at": _now_iso_utc(),
                 "windows_days": [7, 14, 30],
                 "data_missing_reason": reason,
+                "signal_params_joined": False,
             }
 
         headers = {"Cache-Control": "no-store"}
