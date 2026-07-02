@@ -48,8 +48,6 @@ from scout.token_ids import is_cg_coin_id
 
 log = structlog.get_logger(__name__)
 
-_VALID_KINDS = ("alert", "dispatch", "gated_out_sample")
-
 # Forward-return horizons. These are SCHEMA-BOUND constants (each maps to a
 # fixed column of signal_outcome_ledger), not tunables — changing one requires
 # a schema migration, so they intentionally do not live in Settings.
