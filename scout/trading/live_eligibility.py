@@ -36,7 +36,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import structlog
+
 from scout.config import Settings
+
+log = structlog.get_logger(__name__)
 
 
 def matches_tier_1_or_2(
@@ -108,7 +112,10 @@ async def compute_would_be_live(
         if open_live_count >= cap:
             return 0
         return 1
-    except Exception:
+    except Exception as exc:
         # Fail-closed: any query failure → not live-eligible. Paper trade
-        # still opens; just no eligibility stamp.
+        # still opens; just no eligibility stamp. GA-23: log the swallow —
+        # a persistent failure here silently zeroes the entire
+        # would_be_live cohort, which must be operator-visible.
+        log.warning("would_be_live_compute_failed", error=str(exc), exc_info=True)
         return 0

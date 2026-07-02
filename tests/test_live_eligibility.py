@@ -296,3 +296,35 @@ async def test_execute_buy_without_settings_stamps_zero(db, trader):
         "SELECT would_be_live FROM paper_trades WHERE id = ?", (trade_id,)
     )
     assert (await cur.fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_compute_db_error_still_fails_closed_but_logs():
+    """GA-23: the fail-closed except must log would_be_live_compute_failed.
+
+    Previously `except Exception: return 0` swallowed silently — a broken
+    query (e.g. dropped column) would zero the entire would_be_live cohort
+    with no operator-visible trace.
+    """
+    import structlog
+
+    class _ExplodingConn:
+        async def execute(self, *args, **kwargs):
+            raise RuntimeError("disk I/O error")
+
+    class _FakeDb:
+        _conn = _ExplodingConn()
+
+    with structlog.testing.capture_logs() as logs:
+        result = await compute_would_be_live(
+            _FakeDb(),
+            signal_type="chain_completed",
+            signal_data={},
+            conviction_stack=0,
+            settings=_settings(),
+        )
+
+    assert result == 0
+    events = [e for e in logs if e["event"] == "would_be_live_compute_failed"]
+    assert len(events) == 1
+    assert "disk I/O error" in events[0]["error"]
