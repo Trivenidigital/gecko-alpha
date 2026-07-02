@@ -692,6 +692,10 @@ async def get_system_health(db_path: str, *, now: datetime | None = None) -> dic
         # heartbeat (run_at), so a stalled builder is visible on the Health panel.
         # Freshness keying matches the watchdog (the run, not the snapshot rows).
         ("conviction_watchlist_runs", "run_at"),
+        # P0 edge-audit: signal-outcome ledger §12a freshness surface — a
+        # disconnected writer shows up as a stale emitted_at here (plus the
+        # hourly `ledger_label_pass` structured log on the labeling side).
+        ("signal_outcome_ledger", "emitted_at"),
     ]
     result = {}
     async with _ro_db(db_path) as conn:
