@@ -2692,15 +2692,52 @@ async def get_live_candidates(
     return _envelope(sliced, len(open_rows))
 
 
+def _outcome_integrity(exit_reason, exit_provenance) -> str:
+    """Classify a closed trade's outcome integrity for display.
+
+    Cockpit slice 1 (fable-review Phase 2 finding 1): fabricated closes were
+    rendered as plain "Expired" — indistinguishable from real market-priced
+    expiries. Derivation (same vocabulary as auto_suspend GA-01):
+
+      - ``expired_stale_no_price`` → ``force-closed-unpriced`` — no price
+        source ever served the token; close is fabricated at entry price.
+      - ``expired_stale_price``    → ``stale-priced`` — exit price is
+        market-derived but stale.
+      - anything else              → ``priced``.
+
+    ``exit_provenance`` (parallel-branch column; may not exist yet) takes
+    precedence when present: entry_fallback → force-closed-unpriced,
+    stale_snapshot → stale-priced, market → priced.
+    """
+    if exit_provenance == "entry_fallback":
+        return "force-closed-unpriced"
+    if exit_provenance == "stale_snapshot":
+        return "stale-priced"
+    if exit_provenance == "market":
+        return "priced"
+    if exit_reason == "expired_stale_no_price":
+        return "force-closed-unpriced"
+    if exit_reason == "expired_stale_price":
+        return "stale-priced"
+    return "priced"
+
+
 async def get_trading_history(
     db_path: str, limit: int = 50, offset: int = 0, actionability: str = "all"
 ) -> list[dict]:
-    """Closed paper trades, paginated."""
+    """Closed paper trades, paginated.
+
+    OPERATOR INVARIANT: rows (incl. outcome_integrity) are derived live from
+    the paper_trades store the engine writes — never from static snapshots.
+    """
     async with _ro_db(db_path) as db:
         try:
             filter_sql, filter_params = _actionability_filter_sql(actionability)
-            cursor = await db.execute(
-                f"""SELECT id, token_id, symbol, name, chain, signal_type, signal_data,
+            # exit_provenance is added by a parallel branch; query defensively
+            # so this endpoint works on both schemas (do NOT add the column
+            # here). First SELECT includes it; on "no such column" retry
+            # without and default the field to None.
+            base_query = """SELECT id, token_id, symbol, name, chain, signal_type, signal_data,
                           entry_price, exit_price, amount_usd, quantity,
                           pnl_usd, pnl_pct, exit_reason, status,
                           peak_price, peak_pct,
@@ -2710,16 +2747,38 @@ async def get_trading_history(
                           would_be_live,
                           actionable,
                           actionability_reason,
-                          actionability_version
+                          actionability_version{provenance_col}
                    FROM paper_trades
                    WHERE status != 'open'
                      {filter_sql}
                    ORDER BY closed_at DESC
-                   LIMIT ? OFFSET ?""",
-                (*filter_params, limit, offset),
-            )
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+                   LIMIT ? OFFSET ?"""
+            try:
+                cursor = await db.execute(
+                    base_query.format(
+                        provenance_col=",\n                          exit_provenance",
+                        filter_sql=filter_sql,
+                    ),
+                    (*filter_params, limit, offset),
+                )
+                rows = await cursor.fetchall()
+            except aiosqlite.OperationalError as e:
+                if not _is_missing_column(e, ("exit_provenance",)):
+                    raise
+                cursor = await db.execute(
+                    base_query.format(provenance_col="", filter_sql=filter_sql),
+                    (*filter_params, limit, offset),
+                )
+                rows = await cursor.fetchall()
+            out = []
+            for row in rows:
+                d = dict(row)
+                d.setdefault("exit_provenance", None)
+                d["outcome_integrity"] = _outcome_integrity(
+                    d.get("exit_reason"), d.get("exit_provenance")
+                )
+                out.append(d)
+            return out
         except Exception:
             return []  # table doesn't exist yet
 
@@ -2946,7 +3005,16 @@ async def get_trading_actionability_summary(db_path: str, days: int = 7) -> dict
 
 
 async def get_trading_stats(db_path: str, days: int = 7) -> dict:
-    """Aggregate paper trading PnL stats."""
+    """Aggregate paper trading PnL stats.
+
+    Top-level figures are windowed on ``days`` (default 7); ``window_days``
+    makes that explicit so the UI can label the tiles (fable-review Phase 2
+    finding 4: headline tiles were silently 7d-windowed). ``all_time`` holds
+    the same aggregates unwindowed, from the same live queries.
+
+    OPERATOR INVARIANT: stats are computed live from the paper_trades store
+    the engine writes — never from static snapshots.
+    """
     _empty_stats = {
         "total_trades": 0,
         "wins": 0,
@@ -2958,6 +3026,15 @@ async def get_trading_stats(db_path: str, days: int = 7) -> dict:
         "win_rate_pct": 0,
         "open_positions": 0,
         "open_exposure": 0,
+        "window_days": days,
+        "all_time": {
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pnl_usd": 0,
+            "avg_pnl_pct": 0,
+            "win_rate_pct": 0,
+        },
     }
     async with _ro_db(db_path) as db:
         try:
@@ -2981,6 +3058,19 @@ async def get_trading_stats(db_path: str, days: int = 7) -> dict:
         total = row[0] or 0
         wins = row[1] or 0
 
+        # All-time aggregates — identical live query, unwindowed (finding 4).
+        cursor_at = await db.execute("""SELECT
+                 COUNT(*) as total_trades,
+                 SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins,
+                 SUM(CASE WHEN pnl_usd <= 0 THEN 1 ELSE 0 END) as losses,
+                 COALESCE(SUM(pnl_usd), 0) as total_pnl_usd,
+                 COALESCE(AVG(pnl_pct), 0) as avg_pnl_pct
+                FROM paper_trades
+                WHERE status != 'open'""")
+        at_row = await cursor_at.fetchone()
+        at_total = at_row[0] or 0
+        at_wins = at_row[1] or 0
+
         # Open positions count
         cursor2 = await db.execute(
             "SELECT COUNT(*), COALESCE(SUM(amount_usd), 0) FROM paper_trades WHERE status = 'open'"
@@ -2998,6 +3088,17 @@ async def get_trading_stats(db_path: str, days: int = 7) -> dict:
             "win_rate_pct": round((wins / total) * 100, 1) if total > 0 else 0,
             "open_positions": open_row[0] or 0,
             "open_exposure": round(open_row[1] or 0, 2),
+            "window_days": days,
+            "all_time": {
+                "total_trades": at_total,
+                "wins": at_wins,
+                "losses": at_row[2] or 0,
+                "total_pnl_usd": round(at_row[3] or 0, 2),
+                "avg_pnl_pct": round(at_row[4] or 0, 2),
+                "win_rate_pct": (
+                    round((at_wins / at_total) * 100, 1) if at_total > 0 else 0
+                ),
+            },
         }
 
 
@@ -3034,6 +3135,41 @@ async def get_trading_stats_by_signal(db_path: str, days: int = 7) -> dict:
 # --- Signal trust scorecards (read-only) ---
 
 
+async def get_signal_params_live(db_path: str) -> dict[str, dict]:
+    """Live signal_params state keyed by signal_type (read-only).
+
+    Cockpit slice 1 (fable-review Phase 2 findings 2-3 / GA-35, GA-36): the
+    static trust registry contradicted live signal_params (chain_completed
+    rendered trusted_experimental while auto-suspended). This helper is the
+    live-store join surface for the Signal Trust tab.
+
+    OPERATOR INVARIANT: trust surfaces read from the live store the engine
+    writes (signal_params) — never static snapshots. Registry maturity labels
+    are decoration; suspension state here is authoritative.
+
+    Raises on missing table / column so callers decide degradation policy
+    (the registry endpoint degrades to signal_params_joined=false rather
+    than 503ing a visibility-only surface).
+    """
+    async with _ro_db(db_path) as db:
+        cursor = await db.execute("""SELECT signal_type, enabled, suspended_at,
+                      suspended_reason, last_calibration_at
+                 FROM signal_params""")
+        rows = await cursor.fetchall()
+    out: dict[str, dict] = {}
+    for r in rows:
+        st = r["signal_type"]
+        if not st:
+            continue
+        out[st] = {
+            "enabled": int(r["enabled"]) if r["enabled"] is not None else None,
+            "suspended_at": r["suspended_at"],
+            "suspended_reason": r["suspended_reason"],
+            "last_calibration_at": r["last_calibration_at"],
+        }
+    return out
+
+
 def _safe_rate(numer: int, denom: int) -> float | None:
     if denom <= 0:
         return None
@@ -3056,9 +3192,21 @@ async def get_signal_trust_scorecards(
 
     V1 contract:
       - fixed windows_days = [7, 14, 30]
-      - closed-trade stats anchored on closed_at window (via existing helper)
+      - closed-trade stats anchored on closed_at window
       - open stats are current-state status='open' (not windowed)
       - stamp/confusion metrics are additive and must not treat NULL as false
+
+    Cockpit slice 1 (fable-review Phase 2 findings 2-3):
+      - closed n/win-rate evidence EXCLUDES fabricated closes using the same
+        predicate as scout/trading/auto_suspend.py:_rolling_stats
+        (exit_reason != 'expired_stale_no_price'; plus
+        exit_provenance != 'entry_fallback' defensively when that
+        parallel-branch column exists) — cohort_policy reflects this.
+      - each row carries ``live`` joined from signal_params (enabled,
+        suspended_at, suspended_reason, last_calibration_at).
+
+    OPERATOR INVARIANT: trust/stats surfaces read from the live store the
+    engine writes (paper_trades, signal_params) — never static snapshots.
     """
     windows_days = [7, 14, 30]
     generated_at = _now_utc_iso()
@@ -3111,11 +3259,12 @@ async def get_signal_trust_scorecards(
                         "experimental": True,
                         "visibility_only": True,
                         "not_live_eligibility_verdict": True,
-                        "cohort_policy": "full_closed_paper_trades",
+                        "cohort_policy": "closed_paper_trades_excl_fabricated",
                         "sort_policy": "signal_type_asc_not_ranked",
                         "generated_at": generated_at,
                         "windows_days": windows_days,
                         "data_missing_reason": "paper_trades_missing",
+                        "signal_params_joined": False,
                     },
                     "rows": [],
                     "error": {
@@ -3221,25 +3370,93 @@ async def get_signal_trust_scorecards(
                 }
             stamp_by_window[days] = by_signal
 
-    # Closed-trade stats: reuse existing helper (avoid metric drift).
-    closed_stats_by_window: dict[int, dict[str, dict]] = {}
-    for days in windows_days:
-        cohort = await get_trading_stats_by_signal_cohort(db_path, days=days)
-        full_rows = cohort.get("full_cohort") or []
-        by_signal: dict[str, dict] = {}
-        for r in full_rows:
-            st = r.get("signal_type")
-            if not st:
-                continue
-            db_signal_types.add(st)
-            by_signal[st] = {
-                "closed_n": int(r.get("trades") or 0),
-                "wins": int(r.get("wins") or 0),
-                "win_rate_pct": float(r.get("win_rate_pct") or 0.0),
-                "total_pnl_usd": float(r.get("total_pnl_usd") or 0.0),
-                "avg_pnl_pct": float(r.get("avg_pnl_pct") or 0.0),
-            }
-        closed_stats_by_window[days] = by_signal
+        # Closed-trade evidence stats — fabricated closes excluded (same
+        # predicate family as auto_suspend._rolling_stats / GA-01). Fallback
+        # ladder handles schemas that predate exit_provenance (parallel
+        # branch) or exit_reason (minimal legacy test schemas): each step
+        # drops the predicate whose column is missing. We never widen the
+        # exclusion beyond what the schema can express.
+        exclusion_ladder = [
+            (
+                "AND COALESCE(exit_reason, '') != 'expired_stale_no_price' "
+                "AND COALESCE(exit_provenance, '') != 'entry_fallback'"
+            ),
+            "AND COALESCE(exit_reason, '') != 'expired_stale_no_price'",
+            "",
+        ]
+        closed_stats_by_window: dict[int, dict[str, dict]] = {}
+        for days in windows_days:
+            closed_rows = None
+            for exclusion_sql in exclusion_ladder:
+                try:
+                    cursor4 = await db.execute(
+                        f"""SELECT signal_type,
+                                  COUNT(*) AS closed_n,
+                                  SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
+                                  COALESCE(SUM(pnl_usd), 0) AS pnl,
+                                  COALESCE(AVG(pnl_pct), 0) AS avg_pct
+                             FROM paper_trades
+                            WHERE closed_at IS NOT NULL
+                              AND status != 'open'
+                              {exclusion_sql}
+                              AND julianday(closed_at) >= julianday('now', ?)
+                            GROUP BY signal_type""",
+                        (f"-{days} days",),
+                    )
+                    closed_rows = await cursor4.fetchall()
+                    break
+                except aiosqlite.OperationalError as e:
+                    if _is_missing_column(e, ("exit_reason", "exit_provenance")):
+                        continue
+                    log.warning(
+                        "signal_trust_scorecards_closed_query_failed", err=str(e)
+                    )
+                    raise
+            by_signal_closed: dict[str, dict] = {}
+            for r in closed_rows or []:
+                st = r["signal_type"]
+                if not st:
+                    continue
+                db_signal_types.add(st)
+                trades = int(r["closed_n"] or 0)
+                wins = int(r["wins"] or 0)
+                by_signal_closed[st] = {
+                    "closed_n": trades,
+                    "wins": wins,
+                    "win_rate_pct": (
+                        round((wins / trades) * 100, 1) if trades > 0 else 0.0
+                    ),
+                    "total_pnl_usd": round(float(r["pnl"] or 0.0), 2),
+                    "avg_pnl_pct": round(float(r["avg_pct"] or 0.0), 2),
+                }
+            closed_stats_by_window[days] = by_signal_closed
+
+        # Live signal_params join (GA-35/GA-36). OPERATOR INVARIANT: trust
+        # surfaces read from the live store the engine writes — a suspended
+        # signal must surface SUSPENDED regardless of registry maturity.
+        # Degrades to signal_params_joined=false (never 503) when the table
+        # is absent (minimal legacy schemas).
+        live_by_signal: dict[str, dict] = {}
+        signal_params_joined = False
+        try:
+            cursor5 = await db.execute("""SELECT signal_type, enabled, suspended_at,
+                          suspended_reason, last_calibration_at
+                     FROM signal_params""")
+            for r in await cursor5.fetchall():
+                st = r["signal_type"]
+                if not st:
+                    continue
+                live_by_signal[st] = {
+                    "enabled": (
+                        int(r["enabled"]) if r["enabled"] is not None else None
+                    ),
+                    "suspended_at": r["suspended_at"],
+                    "suspended_reason": r["suspended_reason"],
+                    "last_calibration_at": r["last_calibration_at"],
+                }
+            signal_params_joined = True
+        except aiosqlite.OperationalError as e:
+            log.warning("signal_trust_scorecards_live_join_unavailable", err=str(e))
 
     registry_by_signal: dict[str, dict] = {}
     for e in registry_entries or []:
@@ -3265,6 +3482,7 @@ async def get_signal_trust_scorecards(
         row = {
             "signal_type": st,
             "registry": registry_by_signal.get(st),
+            "live": live_by_signal.get(st),
             "open": open_by_signal.get(st, {"open_count": 0, "open_exposure_usd": 0.0}),
             "windows": [],
         }
@@ -3314,11 +3532,12 @@ async def get_signal_trust_scorecards(
         "experimental": True,
         "visibility_only": True,
         "not_live_eligibility_verdict": True,
-        "cohort_policy": "full_closed_paper_trades",
+        "cohort_policy": "closed_paper_trades_excl_fabricated",
         "sort_policy": "signal_type_asc_not_ranked",
         "generated_at": generated_at,
         "windows_days": windows_days,
         "data_missing_reason": None if stamps_available else stamps_reason,
+        "signal_params_joined": signal_params_joined,
     }
     return {"meta": meta, "rows": rows}
 
