@@ -150,6 +150,68 @@ function reasonBadge(reason) {
   return <span className="outcome-badge">{reason}</span>
 }
 
+// Outcome-integrity chip (cockpit slice 1, fable-review Phase 2 finding 1).
+// A fabricated close (no price source ever served the token; closed at entry
+// price, PnL exactly $0) previously rendered as plain "Expired" —
+// indistinguishable from a real market-priced expiry.
+//
+// OPERATOR INVARIANT: derived live from the paper_trades row the engine
+// writes (exit_reason / exit_provenance) — never from a static snapshot.
+// Backend sends outcome_integrity; the client-side derivation below is a
+// fallback for older backends only and mirrors dashboard/db.py exactly.
+function outcomeIntegrity(h) {
+  if (h.outcome_integrity) return h.outcome_integrity
+  const p = h.exit_provenance
+  if (p === 'entry_fallback') return 'force-closed-unpriced'
+  if (p === 'stale_snapshot') return 'stale-priced'
+  if (p === 'market') return 'priced'
+  const r = h.exit_reason || ''
+  if (r === 'expired_stale_no_price') return 'force-closed-unpriced'
+  if (r === 'expired_stale_price') return 'stale-priced'
+  return 'priced'
+}
+
+const INTEGRITY_CHIP_STYLES = {
+  'priced': {
+    background: 'rgba(76, 175, 80, 0.12)',
+    color: 'var(--color-accent-green)',
+    title: 'Priced close: exit price is market-derived.',
+  },
+  'stale-priced': {
+    background: 'rgba(255, 183, 77, 0.15)',
+    color: 'var(--color-accent-amber)',
+    title: 'Stale-priced close: exit price is market-derived but stale (last known price, not close-time).',
+  },
+  'force-closed-unpriced': {
+    background: 'rgba(239, 83, 80, 0.15)',
+    color: 'var(--color-accent-red, #ef5350)',
+    title: 'Force-closed unpriced: fabricated close — no price source ever served this token; closed at entry price, so PnL $0 is an artifact, not an outcome. Excluded from auto-suspend rolling stats (GA-01).',
+  },
+}
+
+function IntegrityChip({ trade }) {
+  const v = outcomeIntegrity(trade)
+  const s = INTEGRITY_CHIP_STYLES[v] || INTEGRITY_CHIP_STYLES['priced']
+  return (
+    <span
+      title={s.title}
+      data-testid="outcome-integrity-chip"
+      style={{
+        display: 'inline-block',
+        padding: '2px 7px',
+        borderRadius: 4,
+        fontSize: 10,
+        fontWeight: 700,
+        whiteSpace: 'nowrap',
+        background: s.background,
+        color: s.color,
+      }}
+    >
+      {v}
+    </span>
+  )
+}
+
 // actionabilityState, formatActionabilityReason, reasonWhy, cohortLabel,
 // cohortColor, cohortBg, cohortSubtitle are imported from ./actionability.js
 // at the top of this file. v1 reason codes now resolve to human-readable
@@ -1184,6 +1246,12 @@ export default function TradingTab() {
 
   const totalPnl = stats?.total_pnl_usd ?? stats?.total_pnl ?? 0
   const winRate = stats?.win_rate_pct ?? 0
+  // Window labeling (cockpit slice 1, fable-review Phase 2 finding 4): the
+  // headline tiles are windowed — say so explicitly, and show all-time
+  // figures as a secondary line. Both come from the same live queries
+  // (/api/trading/stats), just windowed vs unwindowed — never snapshots.
+  const windowDays = stats?.window_days ?? 7
+  const allTime = stats?.all_time ?? null
   const openCount = positions.length
   const totalExposure = positions.reduce((sum, p) => sum + (p.amount_usd ?? 0), 0)
   // Sum of total_pnl_usd across open trades (realized-on-closed-legs +
@@ -1202,10 +1270,15 @@ export default function TradingTab() {
         marginBottom: 16,
       }}>
         <div className="panel" style={{ padding: '16px 20px', textAlign: 'center' }}>
-          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Realized PnL</div>
+          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Realized PnL ({windowDays}d)</div>
           <div style={{ fontSize: 28, fontWeight: 700, color: pnlColor(totalPnl) }}>
             {fmtUsd(totalPnl)}
           </div>
+          {allTime && (
+            <div style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
+              all-time {fmtUsd(allTime.total_pnl_usd ?? 0)}
+            </div>
+          )}
         </div>
         <div className="panel" style={{ padding: '16px 20px', textAlign: 'center' }}>
           <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Open PnL</div>
@@ -1214,10 +1287,15 @@ export default function TradingTab() {
           </div>
         </div>
         <div className="panel" style={{ padding: '16px 20px', textAlign: 'center' }}>
-          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Win Rate</div>
+          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Win Rate ({windowDays}d)</div>
           <div style={{ fontSize: 28, fontWeight: 700, color: winRate >= 50 ? 'var(--color-accent-green)' : 'var(--color-accent-amber)' }}>
             {Number(winRate).toFixed(1)}%
           </div>
+          {allTime && (
+            <div style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
+              all-time {Number(allTime.win_rate_pct ?? 0).toFixed(1)}%
+            </div>
+          )}
         </div>
         <div className="panel" style={{ padding: '16px 20px', textAlign: 'center' }}>
           <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Open Positions</div>
@@ -1225,8 +1303,13 @@ export default function TradingTab() {
           <div style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>{fmtUsd(totalExposure)} exposure</div>
         </div>
         <div className="panel" style={{ padding: '16px 20px', textAlign: 'center' }}>
-          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Total Trades</div>
+          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4 }}>Total Trades ({windowDays}d)</div>
           <div style={{ fontSize: 28, fontWeight: 700 }}>{totalTrades}</div>
+          {allTime && (
+            <div style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
+              all-time {allTime.total_trades ?? 0}
+            </div>
+          )}
         </div>
       </div>
 
@@ -1623,6 +1706,7 @@ export default function TradingTab() {
                   <SharedSortHeader col="_pnl" label="PnL $" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
                   <SharedSortHeader col="_pnl_pct" label="PnL %" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
                   <SharedSortHeader col="exit_reason" label="Reason" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
+                  <th title="Outcome integrity: priced = market-derived exit; stale-priced = stale market price; force-closed-unpriced = fabricated close at entry price (no price source). Derived live from exit_reason / exit_provenance.">Integrity</th>
                   <SharedSortHeader col="closed_at" label="Duration" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
                 </tr>
               </thead>
@@ -1674,6 +1758,7 @@ export default function TradingTab() {
                         {pnlPct != null ? (pnlPct > 0 ? '+' : '') + Number(pnlPct).toFixed(2) + '%' : '-'}
                       </td>
                       <td>{reasonBadge(h.exit_reason || h.close_reason || h.reason)}</td>
+                      <td><IntegrityChip trade={h} /></td>
                       <td style={{ fontSize: 12, color: 'var(--color-text-secondary)', whiteSpace: 'nowrap' }}>
                         {fmtDuration(h.opened_at || h.created_at, h.closed_at)}
                       </td>

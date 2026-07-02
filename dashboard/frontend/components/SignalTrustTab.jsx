@@ -1,5 +1,88 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 
+// Live signal_params status badge (cockpit slice 1, fable-review Phase 2
+// findings 2-3 / GA-35, GA-36). The static registry contradicted live state
+// (chain_completed rendered trusted_experimental while auto-suspended since
+// 2026-06-06).
+//
+// OPERATOR INVARIANT: trust surfaces read from the live store the engine
+// writes (signal_params, joined server-side into each row's `live` field) —
+// never static snapshots. A suspended signal shows SUSPENDED regardless of
+// registry maturity.
+function LiveStatusBadge({ live }) {
+  if (!live) {
+    return (
+      <span
+        title="No live signal_params row for this signal (or live join unavailable)."
+        style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}
+      >
+        no live row
+      </span>
+    )
+  }
+  const suspended = live.suspended_at != null || live.enabled === 0
+  if (suspended) {
+    const tooltip = [
+      live.suspended_reason ? `reason: ${live.suspended_reason}` : null,
+      live.suspended_at ? `suspended_at: ${live.suspended_at}` : null,
+      live.enabled === 0 && live.suspended_at == null ? 'enabled=0 in signal_params' : null,
+      live.last_calibration_at ? `last_calibration_at: ${live.last_calibration_at}` : null,
+    ].filter(Boolean).join('\n')
+    return (
+      <span
+        title={tooltip || 'suspended in live signal_params'}
+        data-testid="live-status-suspended"
+        style={{
+          display: 'inline-block',
+          padding: '2px 7px',
+          borderRadius: 4,
+          fontSize: 11,
+          fontWeight: 700,
+          background: 'rgba(239, 83, 80, 0.15)',
+          color: 'var(--color-accent-red, #ef5350)',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        SUSPENDED
+      </span>
+    )
+  }
+  return (
+    <span
+      title={live.last_calibration_at ? `last_calibration_at: ${live.last_calibration_at}` : 'enabled in live signal_params'}
+      style={{
+        display: 'inline-block',
+        padding: '2px 7px',
+        borderRadius: 4,
+        fontSize: 11,
+        fontWeight: 700,
+        background: 'rgba(76, 175, 80, 0.12)',
+        color: 'var(--color-accent-green)',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      enabled
+    </span>
+  )
+}
+
+// Finding 8: raw `key=value` meta debug strings collapse into a small
+// expander instead of rendering as bare text on the tab.
+function ProvenanceExpander({ lines }) {
+  return (
+    <details style={{ marginTop: 4 }}>
+      <summary style={{ cursor: 'pointer', fontSize: 11, color: 'var(--color-text-secondary)' }}>
+        provenance
+      </summary>
+      <div style={{ marginTop: 4, fontSize: 11, color: 'var(--color-text-secondary)', whiteSpace: 'pre-wrap' }}>
+        {lines.filter(Boolean).map((l, i) => (
+          <div key={i}>{l}</div>
+        ))}
+      </div>
+    </details>
+  )
+}
+
 function gateBadge(text) {
   return (
     <span
@@ -82,14 +165,18 @@ export default function SignalTrustTab() {
   const scRows = Array.isArray(scorecards?.rows) ? scorecards.rows : []
   const scMeta = scorecards?.meta || {}
 
-  const banner = useMemo(() => {
-    const parts = [
-      'V1 trust registry — visibility-only.',
-      meta.generated_at ? `generated_at=${meta.generated_at}` : null,
-      meta.registry_mtime ? `registry_mtime=${meta.registry_mtime}` : null,
-    ].filter(Boolean)
-    return parts.join(' ')
-  }, [meta.generated_at, meta.registry_mtime])
+  const bannerLines = useMemo(() => [
+    meta.generated_at ? `generated_at=${meta.generated_at}` : null,
+    meta.registry_mtime ? `registry_mtime=${meta.registry_mtime}` : null,
+    `signal_params_joined=${String(meta.signal_params_joined ?? '?')}`,
+  ], [meta.generated_at, meta.registry_mtime, meta.signal_params_joined])
+
+  // Finding 3: warn when the static registry file is stale. Maturity labels
+  // come from the file; suspension state comes from the live join and is
+  // always current regardless of this warning.
+  const staleWarning = meta.registry_stale
+    ? (meta.registry_stale_warning || 'registry stale — maturity labels may not reflect current state')
+    : null
 
   return (
     <div>
@@ -112,7 +199,24 @@ export default function SignalTrustTab() {
             {gateBadge('not_for_alerting')}
             {gateBadge('not_for_auto_disable')}
           </div>
-          <div>{banner}</div>
+          <div>V1 trust registry — visibility-only. Live status column reads signal_params (the store the engine writes), not this file.</div>
+          {staleWarning ? (
+            <div
+              data-testid="registry-stale-warning"
+              style={{
+                marginTop: 8,
+                padding: '6px 10px',
+                background: 'rgba(255, 183, 77, 0.10)',
+                borderLeft: '2px solid var(--color-accent-amber)',
+                borderRadius: 2,
+                color: 'var(--color-accent-amber)',
+                fontWeight: 600,
+              }}
+            >
+              {staleWarning}
+            </div>
+          ) : null}
+          <ProvenanceExpander lines={bannerLines} />
           {error ? (
             <div style={{ marginTop: 8, color: 'var(--color-accent-amber)' }}>
               Error: {error}
@@ -140,7 +244,8 @@ export default function SignalTrustTab() {
               <thead>
                 <tr>
                   <th>Signal</th>
-                  <th>Maturity</th>
+                  <th>Maturity (registry)</th>
+                  <th title="Live signal_params state — the store the engine writes. Authoritative over registry maturity.">Live</th>
                   <th>Warning</th>
                   <th>Next gate</th>
                 </tr>
@@ -150,6 +255,7 @@ export default function SignalTrustTab() {
                   <tr key={`${e.signal_type || 'unknown'}:${idx}`}>
                     <td style={{ fontWeight: 700 }}>{e.signal_type || '-'}</td>
                     <td style={{ fontSize: 12 }}>{e.maturity_state || '-'}</td>
+                    <td><LiveStatusBadge live={e.live} /></td>
                     <td style={{ fontSize: 12, color: 'var(--color-text-secondary)', maxWidth: 520 }}>
                       {e.data_quality && typeof e.data_quality.warning === 'string' ? e.data_quality.warning : '-'}
                     </td>
@@ -168,11 +274,15 @@ export default function SignalTrustTab() {
         <div className="panel-header">Closed paper-trade evidence (read-only)</div>
         <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', fontSize: 12 }}>
           <div>
-            read_only={String(scMeta.read_only ?? '?')} not_for_pruning={String(scMeta.not_for_pruning ?? '?')} not_for_auto_disable={String(scMeta.not_for_auto_disable ?? '?')} not_live_eligibility_verdict={String(scMeta.not_live_eligibility_verdict ?? '?')}
+            Fabricated closes (force-closed-unpriced) are excluded from n / win-rate below — same predicate as auto-suspend rolling stats.
           </div>
-          <div style={{ marginTop: 4 }}>
-            cohort={scMeta.cohort_policy || 'full_closed_paper_trades'} sort={scMeta.sort_policy || 'signal_type_asc_not_ranked'} windows_days={Array.isArray(scMeta.windows_days) ? scMeta.windows_days.join(',') : '?'} {scMeta.generated_at ? `generated_at=${scMeta.generated_at}` : ''}
-          </div>
+          <ProvenanceExpander
+            lines={[
+              `read_only=${String(scMeta.read_only ?? '?')} not_for_pruning=${String(scMeta.not_for_pruning ?? '?')} not_for_auto_disable=${String(scMeta.not_for_auto_disable ?? '?')} not_live_eligibility_verdict=${String(scMeta.not_live_eligibility_verdict ?? '?')}`,
+              `cohort=${scMeta.cohort_policy || 'closed_paper_trades_excl_fabricated'} sort=${scMeta.sort_policy || 'signal_type_asc_not_ranked'} windows_days=${Array.isArray(scMeta.windows_days) ? scMeta.windows_days.join(',') : '?'}${scMeta.generated_at ? ` generated_at=${scMeta.generated_at}` : ''}`,
+              `signal_params_joined=${String(scMeta.signal_params_joined ?? '?')}`,
+            ]}
+          />
           {scorecardsError ? (
             <div style={{ marginTop: 8, color: 'var(--color-accent-amber)' }}>
               Scorecards error: {scorecardsError}
@@ -193,7 +303,8 @@ export default function SignalTrustTab() {
               <thead>
                 <tr>
                   <th>Signal</th>
-                  <th>Maturity</th>
+                  <th>Maturity (registry)</th>
+                  <th title="Live signal_params state — the store the engine writes. Authoritative over registry maturity.">Live</th>
                   <th>Open</th>
                   <th>7d closed paper</th>
                   <th>14d closed paper</th>
@@ -225,6 +336,7 @@ export default function SignalTrustTab() {
                     <tr key={r.signal_type}>
                       <td style={{ fontWeight: 700 }}>{r.signal_type}</td>
                       <td style={{ fontSize: 12 }}>{maturity}</td>
+                      <td><LiveStatusBadge live={r.live} /></td>
                       <td style={{ fontSize: 12 }}>{`n=${openCount} ${openExpTxt}`}</td>
                       <td style={{ fontSize: 12 }}>{fmt(w7)}</td>
                       <td style={{ fontSize: 12 }}>{fmt(w14)}</td>
