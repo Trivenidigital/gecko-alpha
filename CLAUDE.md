@@ -92,9 +92,10 @@ moving a shared checkout's HEAD mid-session is a documented failure mode
 uncommitted files).
 
 **Post-approval amendments may narrow, never widen, without re-approval.**
-A disclosed amendment to an already-approved artifact is permitted only when
-it tightens conditions (adds a check, closes a gap, pins a value); anything
-that loosens scope, relaxes a gate, or adds capability needs fresh approval.
+A post-approval amendment to an already-approved artifact is permitted only
+when it tightens conditions (adds a check, closes a gap, pins a value) AND is
+disclosed in the same message that reports the change; anything that loosens
+scope, relaxes a gate, or adds capability requires fresh approval.
 (Precedent: #410 rule-ii addition, #411 pin source-of-truth comment — both
 narrowing, both disclosed, both ratified 2026-07-02.)
 
