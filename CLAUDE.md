@@ -91,6 +91,13 @@ moving a shared checkout's HEAD mid-session is a documented failure mode
 (2026-07-02: HEAD moved to a PR-#400 review line under another session's
 uncommitted files).
 
+**Post-approval amendments may narrow, never widen, without re-approval.**
+A disclosed amendment to an already-approved artifact is permitted only when
+it tightens conditions (adds a check, closes a gap, pins a value); anything
+that loosens scope, relaxes a gate, or adds capability needs fresh approval.
+(Precedent: #410 rule-ii addition, #411 pin source-of-truth comment — both
+narrowing, both disclosed, both ratified 2026-07-02.)
+
 **Condition-enumeration on conditional approvals.** Every
 conditionally-approved PR's merge report enumerates each condition and where
 it was satisfied — including documentation and design-artifact conditions.
