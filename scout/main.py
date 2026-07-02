@@ -28,7 +28,9 @@ from scout.heartbeat import (
     _heartbeat_stats,
     _maybe_emit_heartbeat,
     _reset_heartbeat_stats,
+    hydrate_ingest_watchdog_state,
     observe_ingest_sources,
+    persist_ingest_watchdog_state,
 )
 from scout.ingestion.coingecko import fetch_top_movers as cg_fetch_top_movers
 from scout.ingestion.coingecko import fetch_trending as cg_fetch_trending
@@ -842,6 +844,14 @@ async def run_cycle(
         ),
         settings,
     )
+    # GA-19: write-through the per-source consecutive-miss counters so they
+    # survive gecko-pipeline restarts (deploys, Restart=always crash-bounces).
+    # Persist BEFORE dispatch: counter durability must not depend on alert
+    # delivery. A persistence failure is logged, never fatal to the cycle.
+    try:
+        await persist_ingest_watchdog_state(db)
+    except Exception:
+        logger.exception("ingest_watchdog_state_persist_failed")
     if ingest_watchdog_events:
         await _dispatch_ingest_watchdog_events(
             ingest_watchdog_events,
@@ -2134,6 +2144,14 @@ async def main(argv: list[str] | None = None) -> int:
         last_cohort_digest_date = ""
     outcome_check_interval = 3600  # 1 hour
     _reset_heartbeat_stats()
+    # GA-19: rehydrate ingest-starvation counters AFTER the reset so a
+    # persistently-dead source keeps accumulating misses across restarts
+    # instead of silently restarting from zero (the watchdog otherwise
+    # silences itself on every deploy/crash-bounce).
+    try:
+        await hydrate_ingest_watchdog_state(db, settings)
+    except Exception:
+        logger.exception("ingest_watchdog_state_hydrate_failed")
 
     try:
         async with aiohttp.ClientSession(

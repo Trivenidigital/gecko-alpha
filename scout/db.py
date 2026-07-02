@@ -172,6 +172,9 @@ class Database:
         await self._migrate_source_call_price_snapshots_v1()
         # C4 (#392): per-cycle snapshot-writer run stats (§12a watchdog substrate).
         await self._migrate_source_call_price_snapshot_runs_v1()
+        # GA-19: durable per-source consecutive-miss counters so the
+        # ingest-starvation watchdog survives gecko-pipeline restarts.
+        await self._migrate_ingest_watchdog_state_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -5359,6 +5362,134 @@ class Database:
             except Exception as rb_err:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
+
+    async def _migrate_ingest_watchdog_state_v1(self) -> None:
+        """GA-19: durable ingest-starvation watchdog state.
+
+        The per-source consecutive-miss counter previously lived only in a
+        module-level dict (scout/heartbeat.py) cleared on every boot, so
+        gecko-pipeline restarts (deploys, Restart=always crash-bounces)
+        reset the counter and `ingest_source_starved` never fired for a
+        persistently-dead source. This table makes the counter
+        restart-durable; scout/heartbeat.py hydrates from it at startup
+        and writes through each cycle.
+
+        Additive + idempotent, mirroring
+        :meth:`_migrate_source_call_price_snapshot_runs_v1`.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "ingest_watchdog_state_v1"
+        schema_version = 20260703
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("ingest_watchdog_state_v1_migration_skip_already_applied")
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if (
+                existing_version is not None
+                and existing_version["description"] != migration_name
+            ):
+                raise RuntimeError(
+                    "schema_version collision for ingest_watchdog_state_v1: "
+                    f"version={schema_version} "
+                    f"description={existing_version['description']}"
+                )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS ingest_watchdog_state (
+                    source TEXT PRIMARY KEY,
+                    consecutive_misses INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """)
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "ingest_watchdog_state_v1_migration_complete",
+                table="ingest_watchdog_state",
+            )
+        except BaseException as e:
+            _log.exception(
+                "ingest_watchdog_state_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def load_ingest_watchdog_state(self) -> dict[str, int]:
+        """GA-19: read all persisted per-source consecutive-miss counters."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cur = await self._conn.execute(
+            "SELECT source, consecutive_misses FROM ingest_watchdog_state"
+        )
+        rows = await cur.fetchall()
+        return {row["source"]: int(row["consecutive_misses"]) for row in rows}
+
+    async def upsert_ingest_watchdog_state(
+        self, source: str, consecutive_misses: int
+    ) -> None:
+        """GA-19: write-through one source's consecutive-miss counter.
+
+        Deliberately ON CONFLICT DO UPDATE (never INSERT OR REPLACE) so any
+        future decoupled columns on this table are not clobbered — see the
+        UPSERT-clobber lesson from PR #325.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            "INSERT INTO ingest_watchdog_state "
+            "(source, consecutive_misses, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(source) DO UPDATE SET "
+            "consecutive_misses=excluded.consecutive_misses, "
+            "updated_at=excluded.updated_at",
+            (source, consecutive_misses, now_iso),
+        )
+        await self._conn.commit()
 
     async def _assert_minara_alert_emissions_schema(
         self, conn, *, require_indexes: bool = True

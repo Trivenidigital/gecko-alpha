@@ -79,6 +79,60 @@ def _reset_heartbeat_stats() -> None:
     _ingest_watchdog_state.clear()
 
 
+def _starvation_threshold(settings) -> int:
+    """Resolve INGEST_STARVATION_THRESHOLD_CYCLES with the watchdog's defaults."""
+    try:
+        threshold = int(getattr(settings, "INGEST_STARVATION_THRESHOLD_CYCLES", 5))
+    except (TypeError, ValueError):
+        threshold = 5
+    return max(1, threshold)
+
+
+async def hydrate_ingest_watchdog_state(db, settings) -> None:
+    """GA-19: restore per-source consecutive-miss counters from the DB at boot.
+
+    The counters previously lived only in ``_ingest_watchdog_state`` and were
+    cleared on every restart (``_reset_heartbeat_stats`` in main()), so a
+    persistently-dead source never accumulated
+    INGEST_STARVATION_THRESHOLD_CYCLES misses across deploys/crash-bounces
+    and ``ingest_source_starved`` never fired.
+
+    ``alerted`` is rehydrated as ``misses >= threshold``: at persist time a
+    counter at/above threshold implies the starved alert already fired for
+    this episode (observe fires the alert on the same cycle the counter
+    crosses), so this preserves alert-once-per-episode semantics across
+    restarts instead of re-alerting on every boot of a crash-bounce loop.
+    ``last_success_at`` is not persisted; it re-seeds on the next success.
+    """
+    threshold = _starvation_threshold(settings)
+    persisted = await db.load_ingest_watchdog_state()
+    for source, misses in persisted.items():
+        _ingest_watchdog_state[source] = {
+            "consecutive_empty": misses,
+            "alerted": misses >= threshold,
+            "last_success_at": None,
+        }
+    logger.info(
+        "ingest_watchdog_state_hydrated",
+        sources=len(persisted),
+        threshold=threshold,
+        starved_sources=[
+            source for source, misses in persisted.items() if misses >= threshold
+        ],
+    )
+
+
+async def persist_ingest_watchdog_state(db) -> None:
+    """GA-19: write-through every tracked source's consecutive-miss counter.
+
+    Called once per cycle after :func:`observe_ingest_sources` so the
+    counters survive restarts. Recovery (counter reset to 0) is persisted
+    the same way — the row is UPSERTed to 0, never deleted.
+    """
+    for source, state in _ingest_watchdog_state.items():
+        await db.upsert_ingest_watchdog_state(source, state["consecutive_empty"])
+
+
 def observe_ingest_sources(
     samples: list[IngestSourceSample],
     settings,
@@ -89,11 +143,7 @@ def observe_ingest_sources(
     if getattr(settings, "INGEST_WATCHDOG_ENABLED", True) is False:
         return []
 
-    try:
-        threshold = int(getattr(settings, "INGEST_STARVATION_THRESHOLD_CYCLES", 5))
-    except (TypeError, ValueError):
-        threshold = 5
-    threshold = max(1, threshold)
+    threshold = _starvation_threshold(settings)
     observed_at = now or datetime.now(timezone.utc)
     events: list[IngestWatchdogEvent] = []
 

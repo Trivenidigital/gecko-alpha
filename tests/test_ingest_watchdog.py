@@ -202,6 +202,110 @@ async def test_run_cycle_observes_source_samples_and_dispatches_events(monkeypat
     dispatch.assert_awaited_once_with([event], session, settings, dry_run=True)
 
 
+@pytest.mark.asyncio
+async def test_run_cycle_persists_watchdog_state_after_observe(monkeypatch):
+    """GA-19: run_cycle must write-through the per-source miss counters to
+    the DB every cycle so they survive gecko-pipeline restarts."""
+    db = _mk_db()
+    settings = _mk_settings(
+        VOLUME_SPIKE_ENABLED=False,
+        GAINERS_TRACKER_ENABLED=False,
+        LOSERS_TRACKER_ENABLED=False,
+        MOMENTUM_7D_ENABLED=False,
+        VELOCITY_ALERTS_ENABLED=False,
+        COUNTER_ENABLED=False,
+    )
+    session = MagicMock()
+    call_order: list[str] = []
+
+    def _fake_observe(samples, passed_settings):
+        call_order.append("observe")
+        return []
+
+    async def _fake_persist(passed_db):
+        call_order.append("persist")
+        assert passed_db is db
+
+    monkeypatch.setattr("scout.main.observe_ingest_sources", _fake_observe)
+    monkeypatch.setattr("scout.main.persist_ingest_watchdog_state", _fake_persist)
+
+    with (
+        patch("scout.main.fetch_trending", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "scout.main.fetch_trending_pools", new_callable=AsyncMock, return_value=[]
+        ),
+        patch(
+            "scout.main.cg_fetch_top_movers", new_callable=AsyncMock, return_value=[]
+        ),
+        patch("scout.main.cg_fetch_trending", new_callable=AsyncMock, return_value=[]),
+        patch("scout.main.cg_fetch_by_volume", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "scout.main.cg_fetch_midcap_gainers",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
+        patch(
+            "scout.main.fetch_held_position_prices",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
+        patch("scout.main.aggregate", return_value=[]),
+    ):
+        await run_cycle(settings, db, session, dry_run=True)
+
+    assert call_order == ["observe", "persist"]
+
+
+@pytest.mark.asyncio
+async def test_run_cycle_persist_failure_does_not_crash_cycle(monkeypatch):
+    """GA-19: a persistence failure must be logged, never kill the cycle."""
+    from scout import main as main_module
+
+    db = _mk_db()
+    settings = _mk_settings(
+        VOLUME_SPIKE_ENABLED=False,
+        GAINERS_TRACKER_ENABLED=False,
+        LOSERS_TRACKER_ENABLED=False,
+        MOMENTUM_7D_ENABLED=False,
+        VELOCITY_ALERTS_ENABLED=False,
+        COUNTER_ENABLED=False,
+    )
+    session = MagicMock()
+    captured = _capture_main_logs(monkeypatch)
+
+    async def _boom(passed_db):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(main_module, "observe_ingest_sources", lambda s, st: [])
+    monkeypatch.setattr(main_module, "persist_ingest_watchdog_state", _boom)
+
+    with (
+        patch("scout.main.fetch_trending", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "scout.main.fetch_trending_pools", new_callable=AsyncMock, return_value=[]
+        ),
+        patch(
+            "scout.main.cg_fetch_top_movers", new_callable=AsyncMock, return_value=[]
+        ),
+        patch("scout.main.cg_fetch_trending", new_callable=AsyncMock, return_value=[]),
+        patch("scout.main.cg_fetch_by_volume", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "scout.main.cg_fetch_midcap_gainers",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
+        patch(
+            "scout.main.fetch_held_position_prices",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
+        patch("scout.main.aggregate", return_value=[]),
+    ):
+        await run_cycle(settings, db, session, dry_run=True)
+
+    assert any(event == "ingest_watchdog_state_persist_failed" for event, _ in captured)
+
+
 def test_cycle_geckoterminal_exception_uses_chain_source_keys():
     from scout.main import _ingest_watchdog_samples_from_cycle
 
