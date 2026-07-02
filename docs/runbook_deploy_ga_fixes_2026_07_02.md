@@ -1,3 +1,11 @@
+> **PROCEDURE: read at master HEAD. CODE: deploy at the pins. Never execute
+> procedure from a pinned checkout** — `0372a699` (deploy-#1 pin) predates this
+> runbook entirely, and `b23ef0a2` (deploy-#2 pin) lacks the #413 amendments
+> (engine-stopped ordering, fallback-window post-verify, export steps). The
+> pins freeze the CODE under review; the procedure keeps absorbing reviewer
+> rulings until executed. Read this file from origin/master immediately before
+> any deploy.
+
 # Runbook — Deploy GA-fix batch to srilu (merges of 2026-07-02)
 
 **Scope:** master `0372a699` — five squash merges: #403 (hygiene: busy_timeout bootstrap, task-exception logging), #402 (GA-19 ingest-watchdog persistence, **adds table `ingest_watchdog_state`, schema_version 20260703**), #399 (GA-03 schedules held-position-price + revival-verdict watchdogs), #404 (GA-01 unpriceable-position safety: dispatch gate + expiry-anomaly alert + stats exclusion), #401 (GA-05 delivery-claim ordering).
