@@ -79,15 +79,33 @@ sed -i '/held-position-price-watchdog/d;/revival-verdict-watchdog/d' cron/gecko-
 # Deploy #2 — Phase 6 batch (ledger 20260704 + provenance/stale-onset 20260705 + cockpit slice 1)
 
 **Scope:** #406 `signal_outcome_ledger` + `ledger_enrollments` (migration 20260704, module scout/outcome_ledger.py, default-ON writers/labeler/poller); #408 five nullable `paper_trades` columns + backfills (migration 20260705), price-source open invariant, exit provenance, stale-onset exit (STALE_ONSET_EXIT_HOURS default 6); #407 dashboard cockpit slice 1 (no schema).
+**Ordering (operator-executed, both):** deploy-#1 (runbook above, pre-#406 snapshot `0372a699`) PRECEDES deploy-#2. Deploy-#2 ships only after PRs #406/#408 merge.
 **Staged-deploy compatibility:** deploy-#1 and deploy-#2 may be applied together or separately in either staging — `initialize()` orders migrations 20260703 → 20260704 → 20260705; each is independently guarded/idempotent/additive. A combined single deploy applies all three in sequence.
 
 ## Upgrade vectors (two-vector review summary, both migrations)
 - **Fresh install:** both CREATE IF NOT EXISTS + sentinel; clean.
-- **Upgrade with existing data (srilu, 2.33GB):** 20260704 creates two empty tables + indexes (<1s). 20260705 adds five nullable columns via guarded ALTERs + three backfill UPDATEs over closed rows (single pass, ~2,270 rows; expected counts on current data: `exit_provenance`: 12 entry_fallback / 128 stale_snapshot / remainder market on `closed_%` rows; `price_source='legacy'` on ALL pre-existing rows). Runs inside BEGIN EXCLUSIVE; sub-second at current table size.
+- **Upgrade with existing data (srilu, 2.33GB) — ENGINE-STOPPED WINDOW REQUIRED:** perform deploy-#2 with BOTH units stopped so the 20260705 EXCLUSIVE backfill cannot contend with live readers/writers:
+  ```bash
+  # 0. PRE-DEPLOY SNAPSHOT (abort-reference for the assertion below)
+  sqlite3 scout.db "SELECT COALESCE(exit_reason,'(null)'), COUNT(*) FROM paper_trades WHERE status LIKE 'closed_%' GROUP BY 1;" | tee /root/pre_deploy2_exit_reasons.txt
+  systemctl stop gecko-pipeline gecko-dashboard
+  git pull && uv sync && find . -name __pycache__ -type d -exec rm -rf {} +
+  systemctl start gecko-pipeline        # boot runs 20260704 + 20260705 (<2s)
+  # POST-MIGRATION ASSERTION — abort deploy on mismatch:
+  sqlite3 scout.db "SELECT exit_provenance, COUNT(*) FROM paper_trades WHERE status LIKE 'closed_%' GROUP BY 1;"
+  #   REQUIRED: entry_fallback count == pre-snapshot expired_stale_no_price count
+  #             (12 as of 2026-07-02 13:20Z; +1 per additional such close before deploy, e.g. trade 2610)
+  #             stale_snapshot count == pre-snapshot expired_stale_price count (128 baseline)
+  #             market == all remaining closed rows; NULL only on OPEN rows
+  #   plus: sqlite3 scout.db "SELECT COUNT(*) FROM paper_trades WHERE price_source IS NULL;"  # MUST be 0
+  # MISMATCH => ABORT: systemctl stop gecko-pipeline; git checkout <pre-deploy SHA>; restart; investigate before retry.
+  systemctl start gecko-dashboard       # only after the assertion passes
+  ```
+  20260704 creates two empty tables + indexes (<1s); 20260705 backfills ~2,270 closed rows in one EXCLUSIVE pass (sub-second at current size).
 - **Rollback:** git checkout previous SHA + restart. All additions are nullable columns / new tables the old code never reads — do NOT drop. Ledger rows written before rollback are inert. Re-deploy re-skips via sentinels.
 
 ## Behavior armed at restart (no .env edits required)
-- **Ledger default-ON** (`LEDGER_ENABLED=True`): records delivered alerts, paper-trade opens, 1-in-25 sampled gate blocks; hourly labeling pass; per-cycle enrollment poller = at most ONE extra CG /simple/price batch per cycle (~3% of the 30/min Demo budget) + DexScreener batches (separate budget). Kill switch: `LEDGER_ENABLED=False` + restart.
+- **Ledger default-ON** (`LEDGER_ENABLED=True`): records delivered alerts, paper-trade opens, 1-in-25 sampled gate blocks (each row carries anchor cache-age + enrollment_status per operator condition (c)); hourly labeling pass; per-cycle enrollment poller = at most ONE extra CG /simple/price batch per cycle (~3% of the 30/min Demo budget) + DexScreener batches (separate budget). Kill switch: `LEDGER_ENABLED=False` + restart.
 - **Stale-onset exit ON** (STALE_ONSET_EXIT_HOURS=6): open positions whose price_cache mark goes >6h stale exit at last-good price with `closed_stale_onset`, mark provenance recorded, operator TG alert (parse_mode=None). NOTE: no-price positions (no cache row at all, e.g. trade 2613) still freeze by design — they exit only at max_duration with `entry_fallback` provenance + alert.
 - **Open invariant:** paper opens now stamp `price_source`; unpriceable token_ids blocked (was #404's gate, now also model+column-enforced).
 - **Dashboard:** integrity chips / 7d window labels / live-joined Signal Trust appear after `systemctl restart gecko-dashboard` + pycache clear (this batch DOES touch dashboard — restart both units).
