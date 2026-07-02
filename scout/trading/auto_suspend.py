@@ -68,12 +68,21 @@ async def _rolling_stats(
     -$999. The earlier ``min(running, 0)`` formulation missed this case
     entirely (it never went negative). Comparison ``<= hard_loss``
     (e.g. -500.0) fires when the trough is at least that deep.
+
+    GA-01: rows with ``exit_reason='expired_stale_no_price'`` are EXCLUDED
+    — those closes are fabricated (entry-price close, slippage 0, pnl_usd
+    exactly $0 because no price source ever served the token_id). Counting
+    them dilutes net_pnl/drawdown toward zero and makes a bleeding signal
+    look healthier — i.e., un-suspendable for its REAL losses. 12/12
+    historical `dex:` closes were this shape. ``expired_stale_price``
+    stays counted: its exit price is stale but market-derived.
     """
     cur = await conn.execute(
         """SELECT COALESCE(pnl_usd, 0) AS pnl
            FROM paper_trades
            WHERE signal_type = ?
              AND status LIKE 'closed_%'
+             AND COALESCE(exit_reason, '') != 'expired_stale_no_price'
              AND datetime(closed_at) >= datetime(?)
            ORDER BY closed_at ASC""",
         (signal_type, since_iso),
