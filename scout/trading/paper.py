@@ -26,6 +26,20 @@ if TYPE_CHECKING:
 log = structlog.get_logger()
 
 
+def _log_live_handoff_task_exception(task: asyncio.Task) -> None:
+    """GA-11 done-callback: surface fire-and-forget live-handoff failures.
+
+    Retrieves ``task.exception()`` and logs it — the prior discard-only
+    callback made a crashing ``LiveEngine.on_paper_trade_opened`` handoff
+    completely invisible (never awaited, never logged).
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error("live_handoff_task_failed", error=str(exc), exc_info=exc)
+
+
 CLOSED_COUNTABLE_STATUSES: tuple[str, ...] = (
     "closed_tp",
     "closed_sl",
@@ -353,6 +367,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             )
             self._pending_live_tasks.add(task)
             task.add_done_callback(self._pending_live_tasks.discard)
+            # GA-11: retrieve + log the exception; a discard-only callback
+            # left live-handoff failures completely invisible.
+            task.add_done_callback(_log_live_handoff_task_exception)
 
         return trade_id
 
