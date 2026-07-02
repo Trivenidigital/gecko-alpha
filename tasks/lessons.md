@@ -259,3 +259,12 @@ source-edit-SLA rows in SMB-Agents.
 **Rule:** §12a/§12b reviews must ask not only "is there a watchdog?" but
 "does its output REACH a human?" — a scheduled script, a live dashboard,
 and structured logs all fail this test unless something pushes.
+
+### Worktree-first, one worktree per session (2026-07-02)
+
+Claim an isolated `git worktree` before any git state change; never operate
+on the shared root checkout. Evidence: 2026-07-02, a parallel session moved
+the shared checkout's detached HEAD onto a PR-#400 review line while another
+session had uncommitted report files there — the exact divergence class in
+[[feedback_parallel_session_branch_coordination]]. The root checkout is
+master-pinned and read-only by convention.

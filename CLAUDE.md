@@ -84,6 +84,17 @@ only; migration-bearing PRs need a two-vector review brief (fresh install /
 upgrade-with-data / rollback) before the approval ask. Sessions never attest
 to another session's actions. See tasks/lessons.md for the worked example.
 
+**Worktree-first, one worktree per session.** Every session (human-driven or
+agent) claims its own `git worktree` before any git state change; the root
+checkout stays on master, effectively read-only. Rationale: parallel sessions
+moving a shared checkout's HEAD mid-session is a documented failure mode
+(2026-07-02: HEAD moved to a PR-#400 review line under another session's
+uncommitted files).
+
+**Condition-enumeration on conditional approvals.** Every
+conditionally-approved PR's merge report enumerates each condition and where
+it was satisfied — including documentation and design-artifact conditions.
+
 ## What NOT To Do
 
 - No global aiohttp sessions (pass session as parameter)
