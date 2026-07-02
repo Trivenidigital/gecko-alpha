@@ -103,6 +103,21 @@ narrowing, both disclosed, both ratified 2026-07-02.)
 conditionally-approved PR's merge report enumerates each condition and where
 it was satisfied — including documentation and design-artifact conditions.
 
+## Model-Tier Provenance (operator-scoped definitions, drift-detectable from here)
+
+Subagent tiering for this repo is defined at USER level (deliberately not in
+any repo). Pointer block — refresh these hashes as a standing step in any PR
+that cites §2a:
+
+| Artifact | Purpose | sha256/16 (2026-07-02) |
+|---|---|---|
+| `~/.claude/CLAUDE.md` §2a Model-Tiered Orchestration | delegation rules: Fable orchestrates; reasoning → deep-reasoner; mechanical → fast-worker; high-stakes → multi-vector per §8 | `399434eeb46afbb7` |
+| `~/.claude/agents/deep-reasoner.md` (opus) | reasoning-heavy subagent incl. mandatory delivery contract | `0cba76166499a04a` |
+| `~/.claude/agents/fast-worker.md` (sonnet) | mechanical subagent incl. mandatory delivery contract | `92f5cbd4e2588eaf` |
+
+Verify: hash the §2a section (from `## 2a.` to `## 3.`) and each full agent
+file; mismatch = tier definitions drifted since this repo last looked.
+
 ## What NOT To Do
 
 - No global aiohttp sessions (pass session as parameter)
