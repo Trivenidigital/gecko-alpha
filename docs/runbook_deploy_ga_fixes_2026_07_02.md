@@ -86,10 +86,18 @@ sed -i '/held-position-price-watchdog/d;/revival-verdict-watchdog/d' cron/gecko-
 - **Fresh install:** both CREATE IF NOT EXISTS + sentinel; clean.
 - **Upgrade with existing data (srilu, 2.33GB) — ENGINE-STOPPED WINDOW REQUIRED:** perform deploy-#2 with BOTH units stopped so the 20260705 EXCLUSIVE backfill cannot contend with live readers/writers:
   ```bash
-  # 0. PRE-DEPLOY SNAPSHOT (abort-reference for the assertion below)
-  sqlite3 scout.db "SELECT COALESCE(exit_reason,'(null)'), COUNT(*) FROM paper_trades WHERE status LIKE 'closed_%' GROUP BY 1;" | tee /root/pre_deploy2_exit_reasons.txt
+  # 0. STOP FIRST — the snapshot must be taken with the engine quiescent:
+  #    a close landing between snapshot and stop would shift a count and
+  #    false-abort the assertion (reviewer catch, 2026-07-02).
   systemctl stop gecko-pipeline gecko-dashboard
-  git pull && uv sync && find . -name __pycache__ -type d -exec rm -rf {} +
+  # 1. PRE-DEPLOY SNAPSHOT (abort-reference for the assertion below)
+  sqlite3 scout.db "SELECT COALESCE(exit_reason,'(null)'), COUNT(*) FROM paper_trades WHERE status LIKE 'closed_%' GROUP BY 1;" | tee /root/pre_deploy2_exit_reasons.txt
+  git fetch && git checkout <deploy-2 pin SHA>   # pin discipline; NOT git pull
+  # PIN SOURCE OF TRUTH: the #408 merge report entry in
+  # tasks/gecko-alpha-fable-review_2026_07.md (approvals log) states the exact
+  # SHA, minted as post-#408-squash master (the last deploy-#2 code gate).
+  # Never substitute "current master" — that is git pull with extra steps.
+  uv sync && find . -name __pycache__ -type d -exec rm -rf {} +
   systemctl start gecko-pipeline        # boot runs 20260704 + 20260705 (<2s)
   # POST-MIGRATION ASSERTION — abort deploy on mismatch:
   sqlite3 scout.db "SELECT exit_provenance, COUNT(*) FROM paper_trades WHERE status LIKE 'closed_%' GROUP BY 1;"
