@@ -48,7 +48,7 @@ from scout.narrative.agent import narrative_agent_loop
 from scout.outcome_ledger import (
     label_pending,
     poll_enrollments,
-    price_from_cache,
+    price_and_age_from_cache,
     record_emission,
 )
 from scout.conviction.prospective import build_prospective_watchlist
@@ -1319,13 +1319,19 @@ async def run_cycle(
         # belt-and-braces so a ledger bug can never break the alert path.
         try:
             _ledger_liq = float(getattr(gated_token, "liquidity_usd", 0) or 0)
+            # c1: alert anchors come from price_cache, so the anchor's cache
+            # age at emission rides along (NULL when there is no anchor).
+            _anchor_price, _anchor_age = await price_and_age_from_cache(
+                db, gated_token.contract_address
+            )
             await record_emission(
                 db,
                 settings,
                 kind="alert",
                 token_id=gated_token.contract_address,
                 surface="candidate_alert",
-                price=await price_from_cache(db, gated_token.contract_address),
+                price=_anchor_price,
+                anchor_cache_age_seconds=_anchor_age,
                 liquidity=_ledger_liq if _ledger_liq > 0 else None,
                 liquidity_source="candidate" if _ledger_liq > 0 else "none",
                 gate_verdicts={

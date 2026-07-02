@@ -117,9 +117,9 @@ async def test_delivered_alert_records_ledger_emission(
         )
         stack.enter_context(
             patch(
-                "scout.main.price_from_cache",
+                "scout.main.price_and_age_from_cache",
                 new_callable=AsyncMock,
-                return_value=0.5,
+                return_value=(0.5, 42.0),
             )
         )
         stats = await run_cycle(mock_settings, mock_db, mock_session, dry_run=False)
@@ -131,6 +131,8 @@ async def test_delivered_alert_records_ledger_emission(
     assert kwargs["token_id"] == "0xtest"
     assert kwargs["surface"] == "candidate_alert"
     assert kwargs["price"] == 0.5
+    # c1: the cache-resolved anchor's age at emission rides along.
+    assert kwargs["anchor_cache_age_seconds"] == pytest.approx(42.0)
     assert kwargs["liquidity"] == pytest.approx(10000.0)
     assert kwargs["liquidity_source"] == "candidate"
     assert kwargs["gate_verdicts"]["conviction_score"] == pytest.approx(78.0)
@@ -180,9 +182,9 @@ async def test_ledger_failure_does_not_break_alert_path(
         )
         stack.enter_context(
             patch(
-                "scout.main.price_from_cache",
+                "scout.main.price_and_age_from_cache",
                 new_callable=AsyncMock,
-                return_value=None,
+                return_value=(None, None),
             )
         )
         stats = await run_cycle(mock_settings, mock_db, mock_session, dry_run=False)

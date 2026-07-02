@@ -35,6 +35,7 @@ from scout.db import Database
 from scout.outcome_ledger import (
     GatedOutSampler,
     label_pending,
+    price_and_age_from_cache,
     price_from_cache,
     record_emission,
 )
@@ -113,9 +114,11 @@ async def test_migration_creates_table_and_indexes(db):
         "token_id",
         "surface",
         "price_at_emission",
+        "anchor_cache_age_seconds",
         "liquidity_at_emission",
         "liquidity_source",
         "gate_verdicts",
+        "enrollment_status",
         "emitted_at",
         "r15m",
         "r1h",
@@ -204,6 +207,10 @@ async def test_record_emission_inserts_full_row(db):
     assert json.loads(row["gate_verdicts"]) == verdicts
     assert row["label_status"] == "pending"
     assert row["labeled_at"] is None
+    # c1: caller-supplied (live) anchor without explicit cache age -> 0.0.
+    assert row["anchor_cache_age_seconds"] == pytest.approx(0.0)
+    # c2: priced non-gated emission -> in-DB coverage -> no enrollment.
+    assert row["enrollment_status"] == "not_needed"
     # emitted_at defaults to now (UTC ISO)
     emitted = datetime.fromisoformat(row["emitted_at"])
     assert abs((_now() - emitted).total_seconds()) < 60
@@ -226,6 +233,39 @@ async def test_record_emission_accepts_explicit_emitted_at(db):
     rows = await _fetch_rows(db)
     assert rows[0]["emitted_at"] == _iso(ts)
     assert rows[0]["price_at_emission"] is None
+    # c1: no anchor -> age is NULL, never 0.0.
+    assert rows[0]["anchor_cache_age_seconds"] is None
+
+
+async def test_record_emission_alert_kind_stores_cache_age(db):
+    """c1: an alert whose anchor came from an AGED price_cache row records
+    the age alongside the price (price_and_age_from_cache round-trip)."""
+    aged_at = _now() - timedelta(seconds=300)
+    await _insert_price_cache(db, "tok", 1.5, aged_at)
+
+    price, age = await price_and_age_from_cache(db, "tok")
+    assert price == pytest.approx(1.5)
+    assert age is not None and 295 <= age <= 360  # ~300s, small runtime slack
+
+    await record_emission(
+        db,
+        _ledger_settings(),
+        kind="alert",
+        token_id="tok",
+        surface="candidate_alert",
+        price=price,
+        anchor_cache_age_seconds=age,
+        liquidity=None,
+        liquidity_source="none",
+        gate_verdicts=None,
+    )
+    row = (await _fetch_rows(db))[0]
+    assert row["anchor_cache_age_seconds"] == pytest.approx(age)
+    assert row["anchor_cache_age_seconds"] > 0
+
+
+async def test_price_and_age_from_cache_missing_row(db):
+    assert await price_and_age_from_cache(db, "ghost") == (None, None)
 
 
 async def test_record_emission_kill_switch_blocks_write(db):
@@ -601,6 +641,8 @@ async def test_engine_open_trade_records_dispatch(db, settings_factory, _quiet_t
     assert row["surface"] == "gainers_early"
     # Market price at dispatch (pre-slippage), the forward-return anchor.
     assert row["price_at_emission"] == pytest.approx(1.0)
+    # c1: dispatch anchor is live at emission -> age 0.0.
+    assert row["anchor_cache_age_seconds"] == pytest.approx(0.0)
     assert row["liquidity_at_emission"] == pytest.approx(42_000.0)
     assert row["liquidity_source"] == "signal_data"
     verdicts = json.loads(row["gate_verdicts"])
@@ -639,6 +681,10 @@ async def test_engine_blocked_path_samples_gated_out(db, settings_factory):
         verdicts = json.loads(row["gate_verdicts"])
         assert verdicts["reason"] == "warmup"
         assert verdicts["sample_rate"] == 3
+        # c1: no anchor price for this blocked path -> age NULL.
+        assert row["anchor_cache_age_seconds"] is None
+        # c2: gated_out samples always enroll.
+        assert row["enrollment_status"] == "enrolled"
 
 
 async def test_engine_blocked_sampler_rate_zero_records_nothing(db, settings_factory):
@@ -759,6 +805,9 @@ async def test_gated_out_sample_enrolls_token(db):
     expires = datetime.fromisoformat(row["expires_at"])
     enrolled = datetime.fromisoformat(row["enrolled_at"])
     assert abs((expires - enrolled) - timedelta(days=7)).total_seconds() < 60
+    # c2: enrollment outcome stamped on the ledger row itself.
+    ledger_row = (await _fetch_rows(db))[0]
+    assert ledger_row["enrollment_status"] == "enrolled"
 
 
 async def test_dex_namespace_classified(db):
@@ -803,6 +852,10 @@ async def test_priceless_alert_enrolls_priced_alert_does_not(db):
     rows = await _fetch_enrollments(db)
     assert [r["token_id"] for r in rows] == ["0xdeadbeef"]
     assert rows[0]["namespace"] == "other"
+    # c2: stamps distinguish "enrolled" from "coverage already exists."
+    ledger_rows = await _fetch_rows(db)
+    by_token = {r["token_id"]: r["enrollment_status"] for r in ledger_rows}
+    assert by_token == {"0xdeadbeef": "enrolled", "tracked-coin": "not_needed"}
 
 
 async def test_priced_dispatch_does_not_enroll(db):
@@ -818,6 +871,7 @@ async def test_priced_dispatch_does_not_enroll(db):
         gate_verdicts=None,
     )
     assert await _fetch_enrollments(db) == []
+    assert (await _fetch_rows(db))[0]["enrollment_status"] == "not_needed"
 
 
 async def test_reenrollment_refreshes_ttl_preserves_enrolled_at(db):
@@ -862,6 +916,49 @@ async def test_enrollment_cap_evicts_oldest_expiring_first(db):
     assert len(rows) == 3
     # tok0 enrolled first -> earliest expires_at -> evicted first.
     assert [r["token_id"] for r in rows] == ["tok1", "tok2", "tok3"]
+    # c2: the new enrollment always lands, so 'skipped_cap' is unreachable —
+    # every row (including the evicted token's) is stamped 'enrolled'; the
+    # ledger_enrollment_evicted log (asserted separately) is the censoring
+    # record. No retroactive re-stamping.
+    statuses = {r["enrollment_status"] for r in await _fetch_rows(db)}
+    assert statuses == {"enrolled"}
+
+
+async def test_enrollment_cap_eviction_emits_named_log(db, monkeypatch):
+    """c2: every cap eviction fires a ledger_enrollment_evicted structured
+    log NAMING the evicted token_id, so cap-censoring is never silent."""
+    import scout.outcome_ledger as ol
+    from unittest.mock import MagicMock
+
+    capture = MagicMock()
+    monkeypatch.setattr(ol, "log", capture)
+
+    settings = _ledger_settings(LEDGER_ENROLLMENT_MAX_ACTIVE=1)
+    for token in ("tok-a", "tok-b"):
+        await record_emission(
+            db,
+            settings,
+            kind="gated_out_sample",
+            token_id=token,
+            surface="s",
+            price=None,
+            liquidity=None,
+            liquidity_source="none",
+            gate_verdicts=None,
+        )
+
+    evict_calls = [
+        c
+        for c in capture.info.call_args_list
+        if c.args and c.args[0] == "ledger_enrollment_evicted"
+    ]
+    assert len(evict_calls) == 1
+    kwargs = evict_calls[0].kwargs
+    assert kwargs["evicted_token_ids"] == ["tok-a"]
+    assert kwargs["n_evicted"] == 1
+    assert kwargs["evicted_for"] == "tok-b"
+    # Only tok-b remains enrolled.
+    assert [r["token_id"] for r in await _fetch_enrollments(db)] == ["tok-b"]
 
 
 async def test_purge_expired_enrollments_ttl(db):

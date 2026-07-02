@@ -5537,9 +5537,23 @@ class Database:
                     token_id TEXT NOT NULL,
                     surface TEXT NOT NULL,
                     price_at_emission REAL,
+                    -- Age (seconds) of the anchor price at emission: 0.0 for
+                    -- live caller-supplied prices (dispatch / gated_out),
+                    -- now - price_cache.updated_at for cache-resolved alert
+                    -- anchors, NULL when price_at_emission is NULL.
+                    anchor_cache_age_seconds REAL,
                     liquidity_at_emission REAL,
                     liquidity_source TEXT,
                     gate_verdicts TEXT,
+                    -- Forward-polling enrollment outcome at emission:
+                    -- 'not_needed' (token has in-DB price coverage),
+                    -- 'enrolled' (enrollment row written; may later be
+                    -- cap-evicted — see the ledger_enrollment_evicted log),
+                    -- 'skipped_cap' (reserved; unreachable under the current
+                    -- evict-oldest-to-make-room semantics).
+                    enrollment_status TEXT
+                        CHECK(enrollment_status IN
+                              ('not_needed','enrolled','skipped_cap')),
                     emitted_at TEXT NOT NULL,
                     r15m REAL,
                     r1h REAL,

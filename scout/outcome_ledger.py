@@ -32,6 +32,17 @@ Everything here is observability, not control flow: failures are logged
 (``ledger_record_failed`` / ``ledger_label_pass_failed``) and swallowed so
 host paths (alert delivery, trade open) keep their exact prior behavior.
 
+Trading interaction — MEASUREMENT-AFFECTING-TRADING (operator condition on
+PR #406): the enrollment poller writes ``price_cache`` rows for
+``dex:{chain}:{address}`` ids. The trading engine's GA-01
+unpriceable-dispatch gate admits non-CG token_ids whenever a price_cache row
+EXISTS, so poller-written rows can satisfy that row-exists branch while a
+token is enrolled (7d TTL) — i.e. this measurement lane can open the trading
+gate for dex tokens it polls. Gate tightening is a NAMED backlog slice:
+**BL-NEW-LEDGER-GATE-TIGHTENING** (added to backlog.md via PR #409).
+Acceptance of this module is conditional on NO tg_social / dex-producing
+signal re-enable until that slice is merged AND deployed.
+
 NOT related to scout/source_quality/ledger.py (source-call quality ledger).
 """
 
@@ -112,6 +123,14 @@ async def _enroll_token_locked(
     expires_at but preserves the original enrolled_at. After the write, the
     active set is capped at LEDGER_ENROLLMENT_MAX_ACTIVE by evicting the
     rows closest to expiry (oldest-expire-first).
+
+    Cap semantics (operator condition c2 on PR #406): the NEW enrollment
+    always lands ('skipped_cap' is unreachable — eviction makes room), and
+    every eviction is named in a ``ledger_enrollment_evicted`` structured
+    log so the analyst can distinguish "unlabelable: liquidity death" from
+    "unlabelable: coverage lost to cap eviction." Ledger rows of evicted
+    tokens are NOT retroactively re-stamped; their enrollment_status stays
+    'enrolled' and the eviction log is the censoring record.
     """
     ttl_days = int(getattr(settings, "LEDGER_ENROLLMENT_TTL_DAYS", 7))
     max_active = int(getattr(settings, "LEDGER_ENROLLMENT_MAX_ACTIVE", 200))
@@ -127,35 +146,66 @@ async def _enroll_token_locked(
     cur = await conn.execute("SELECT COUNT(*) FROM ledger_enrollments")
     count = int((await cur.fetchone())[0])
     if count > max_active:
-        await conn.execute(
-            "DELETE FROM ledger_enrollments WHERE token_id IN ("
+        n_evict = count - max_active
+        cur = await conn.execute(
             "SELECT token_id FROM ledger_enrollments "
-            "ORDER BY expires_at ASC LIMIT ?)",
-            (count - max_active,),
+            "ORDER BY expires_at ASC LIMIT ?",
+            (n_evict,),
+        )
+        evicted_ids = [r[0] for r in await cur.fetchall()]
+        placeholders = ",".join("?" * len(evicted_ids))
+        await conn.execute(
+            f"DELETE FROM ledger_enrollments WHERE token_id IN ({placeholders})",
+            evicted_ids,
         )
         log.info(
-            "ledger_enrollment_cap_evicted",
-            evicted=count - max_active,
+            "ledger_enrollment_evicted",
+            evicted_token_ids=evicted_ids,
+            n_evicted=len(evicted_ids),
             max_active=max_active,
+            evicted_for=token_id,
         )
 
 
-async def price_from_cache(db: Database, token_id: str) -> float | None:
-    """Best-effort current price for *token_id* from price_cache. Fail-soft."""
+async def price_and_age_from_cache(
+    db: Database, token_id: str
+) -> tuple[float | None, float | None]:
+    """(price, age_seconds) for *token_id*'s price_cache row. Fail-soft.
+
+    ``age_seconds`` = now - price_cache.updated_at — how stale the anchor was
+    at the moment it was captured (operator condition c1 on PR #406: alerts
+    resolve their anchor from the cache, so the age must ride along or the
+    forward-return baseline silently degrades with cache staleness).
+    Returns ``(None, None)`` when no usable row exists or on any error;
+    ``(price, None)`` when the row exists but updated_at is unparseable.
+    """
     try:
         conn = db._conn
         if conn is None:
-            return None
+            return None, None
         cur = await conn.execute(
-            "SELECT current_price FROM price_cache "
+            "SELECT current_price, updated_at FROM price_cache "
             "WHERE coin_id = ? AND current_price IS NOT NULL AND current_price > 0",
             (token_id,),
         )
         row = await cur.fetchone()
-        return float(row[0]) if row else None
+        if not row:
+            return None, None
+        price = float(row[0])
+        observed = _parse_ts(row[1])
+        if observed is None:
+            return price, None
+        age = (datetime.now(timezone.utc) - observed).total_seconds()
+        return price, max(age, 0.0)
     except Exception as exc:
         log.warning("ledger_price_lookup_failed", token_id=token_id, error=str(exc))
-        return None
+        return None, None
+
+
+async def price_from_cache(db: Database, token_id: str) -> float | None:
+    """Best-effort current price for *token_id* from price_cache. Fail-soft."""
+    price, _age = await price_and_age_from_cache(db, token_id)
+    return price
 
 
 async def record_emission(
@@ -166,6 +216,7 @@ async def record_emission(
     token_id: str,
     surface: str,
     price: float | None = None,
+    anchor_cache_age_seconds: float | None = None,
     liquidity: float | None = None,
     liquidity_source: str = "none",
     gate_verdicts: dict[str, Any] | None = None,
@@ -187,6 +238,13 @@ async def record_emission(
         surface: signal_type, or 'candidate_alert' for the alert pipeline.
         price: price at emission (forward-return anchor). NULL when the
             emitting site had none.
+        anchor_cache_age_seconds: staleness of the anchor at emission
+            (operator condition c1). Pass the cache age when *price* was
+            resolved from price_cache (the alert site does, via
+            :func:`price_and_age_from_cache`). When omitted, a non-NULL
+            *price* is treated as LIVE at emission (0.0) — the
+            dispatch/gated_out caller-supplied entry_price case. Stored NULL
+            whenever *price* is NULL.
         liquidity: liquidity USD the emitting site had in hand, or None.
         liquidity_source: provenance label ('candidate', 'signal_data',
             'none', ...).
@@ -208,21 +266,39 @@ async def record_emission(
             if gate_verdicts is not None
             else None
         )
+        # c1: anchor age semantics — NULL without an anchor; explicit cache
+        # age when the caller resolved from price_cache; else 0.0 (live).
+        if price is None:
+            anchor_age: float | None = None
+        elif anchor_cache_age_seconds is not None:
+            anchor_age = float(anchor_cache_age_seconds)
+        else:
+            anchor_age = 0.0
+        # c2: enrollment outcome is stamped ON the ledger row so unrecorded
+        # skips can never silently censor the missed-winner lane. Under the
+        # evict-oldest-to-make-room semantics the new enrollment always
+        # lands, so the stamp is binary here ('skipped_cap' stays reserved
+        # in the CHECK for a future no-eviction policy).
+        enroll_needed = kind == "gated_out_sample" or price is None
+        enrollment_status = "enrolled" if enroll_needed else "not_needed"
         async with db._txn_lock:
             cur = await conn.execute(
                 """INSERT INTO signal_outcome_ledger
                    (kind, token_id, surface, price_at_emission,
-                    liquidity_at_emission, liquidity_source, gate_verdicts,
+                    anchor_cache_age_seconds, liquidity_at_emission,
+                    liquidity_source, gate_verdicts, enrollment_status,
                     emitted_at, label_status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
                 (
                     kind,
                     token_id,
                     surface,
                     price,
+                    anchor_age,
                     liquidity,
                     liquidity_source,
                     verdicts_json,
+                    enrollment_status,
                     emitted,
                 ),
             )
@@ -234,7 +310,7 @@ async def record_emission(
             # samples always enroll (their tokens are the untracked cohort
             # by construction); other kinds enroll only when the emitting
             # site had no price (= no in-DB coverage signal).
-            if kind == "gated_out_sample" or price is None:
+            if enroll_needed:
                 await _enroll_token_locked(
                     conn, token_id, settings, datetime.now(timezone.utc)
                 )
@@ -521,9 +597,12 @@ async def _poll_dex_enrollments(db: Database, session: Any, dex_ids: list[str]) 
     generous). Writes through :meth:`Database.cache_prices` keyed by the
     FULL dex token_id, so the labeler's price_cache fallback resolves it.
 
-    This is the dex: namespace's first price writer — for LABELING purposes
-    only (GA-01's trading-side unpriceable gate is a separate concern; see
-    the PR body).
+    This is the dex: namespace's first price writer — MEASUREMENT-AFFECTING-
+    TRADING: while a token is enrolled, its poller-written price_cache row
+    can satisfy the GA-01 unpriceable-dispatch gate's row-exists branch.
+    Gate tightening = backlog slice BL-NEW-LEDGER-GATE-TIGHTENING (PR #409);
+    no tg_social / dex-producing signal re-enable until it is merged +
+    deployed. See the module docstring and PR #406 body.
     """
     # Lazy import: aiohttp's import aborts on Windows dev boxes
     # (OPENSSL_Applink); this function only runs inside the Linux pipeline.
