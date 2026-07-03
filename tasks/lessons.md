@@ -296,3 +296,26 @@ mode 100644; cron failed every run with `Permission denied` (acceleration
 script the way cron does (`./script.sh` or the exact cron command), and
 scripts destined for direct cron invocation are committed +x
 (`git update-index --chmod=+x`) so the bit survives every checkout.
+
+### Routing headers on cross-session payloads; verify-against-tree before delivering (2026-07-03)
+
+Multi-session relay can MISROUTE, not just lose/duplicate: a foreign-project
+payload can arrive in the wrong session, plausibly (in-format IDs, adjacent PR
+numbers, overlapping vocabulary). Two rules:
+
+1. **Routing header, both directions:** every cross-hop payload opens with
+   `TO: <session> | FROM: <origin> | RE: <topic>`. A payload whose header names
+   another session is returned UNPROCESSED. (Generalizes the per-part ID-line
+   that got a 6-part relay through a hop that ate 4 messages.)
+2. **Verify against THIS tree before producing any deliverable:** if a request
+   names projects/paths/PRs, grep the tree first. Zero matches on independent
+   markers → refuse and surface the refusal (route home), never fabricate a
+   plausible-looking answer. Confabulation-refusal at a project boundary is
+   evidence-first.
+
+**Worked example (2026-07-03, gecko-alpha session):** a Flyer Studio payload
+(WS2b / F0201 / projects #40–#43 / final_asset_ids / letterbox) requested a
+reachability table for projects absent from gecko-alpha. Grep returned 0/5
+marker matches; the deliverable was refused, the refusal surfaced and routed
+to the owning session. A pattern-matching agent would have produced a
+confident table for projects that don't exist.
