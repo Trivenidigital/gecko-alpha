@@ -945,6 +945,15 @@ class Settings(BaseSettings):
     FEEDBACK_WEEKLY_DIGEST_WEEKDAY: int = 6
     FEEDBACK_WEEKLY_DIGEST_HOUR: int = 9
     FEEDBACK_COMBO_REFRESH_HOUR: int = 3
+    # Refresh-eligibility window (days). combo_refresh.refresh_all refreshes
+    # every combo that had a trade opened within this window. It ALSO refreshes
+    # currently-suppressed combos with no trade in the window (fix/frozen-
+    # suppression-lock) so a suppressed signal cannot silently fall out of the
+    # refresh set and latch at parole_exhausted forever. The same threshold
+    # defines "older than the refresh window" for the permanent-suppression
+    # §12b operator alert. Kept as a Setting so no hardcoded 30 leaks into the
+    # query (What NOT To Do: no hardcoded thresholds).
+    FEEDBACK_REFRESH_WINDOW_DAYS: int = 30
 
     # BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST (cycle 5). Weekly cohort-comparison
     # digest paralleling weekly_digest.py — would_be_live=1 cohort vs full

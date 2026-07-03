@@ -620,3 +620,342 @@ async def test_refresh_counts_tg_social_signal_type_in_rollup(
     assert row["wins"] == 3
     assert row["losses"] == 2
     await db.close()
+
+
+# ---------------------------------------------------------------------------
+# fix/frozen-suppression-lock — refresh suppressed zero-trade combos so a
+# suppressed signal cannot latch at parole_exhausted forever, silently, only
+# because it fell out of the trade-only 30d refresh window (funnel iv). Plus a
+# §12b operator alert on entry into that permanent-suppression state.
+# ---------------------------------------------------------------------------
+
+
+class _StubSender:
+    """Records permanent-suppression alert sends without importing aiohttp.
+
+    A module-level `import aiohttp` aborts the interpreter on Windows dev boxes
+    (OpenSSL Applink); the real `_send_permanent_suppression_alert` defers that
+    import, and tests monkeypatch this stub in its place so it never runs.
+    """
+
+    def __init__(self):
+        self.calls = 0
+        self.messages: list[str] = []
+
+    async def __call__(self, settings, message):
+        self.calls += 1
+        self.messages.append(message)
+
+
+async def _seed_suppressed_combo(
+    db,
+    combo_key,
+    *,
+    remaining=0,
+    parole_at=None,
+    suppressed_at=None,
+    last_refreshed=None,
+    trades=25,
+    wins=4,
+    perm_alerted_at=None,
+):
+    """Insert a `combo_performance` 30d row already suppressed=1."""
+    now = datetime.now(timezone.utc)
+    suppressed_at = suppressed_at or (now - timedelta(days=20)).isoformat()
+    parole_at = (
+        parole_at if parole_at is not None else (now - timedelta(days=6)).isoformat()
+    )
+    last_refreshed = last_refreshed or (now - timedelta(days=1)).isoformat()
+    losses = trades - wins
+    wr = (100.0 * wins / trades) if trades else 0.0
+    await db._conn.execute(
+        "INSERT INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, avg_pnl_pct, "
+        " win_rate_pct, suppressed, suppressed_at, parole_at, "
+        " parole_trades_remaining, refresh_failures, last_refreshed, "
+        " perm_suppression_alerted_at) "
+        "VALUES (?, '30d', ?, ?, ?, -100.0, -2.0, ?, 1, ?, ?, ?, 0, ?, ?)",
+        (
+            combo_key,
+            trades,
+            wins,
+            losses,
+            wr,
+            suppressed_at,
+            parole_at,
+            remaining,
+            last_refreshed,
+            perm_alerted_at,
+        ),
+    )
+    await db._conn.commit()
+
+
+async def _scalar(db, sql, params=()):
+    cur = await db._conn.execute(sql, params)
+    row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def test_widened_refresh_refreshes_suppressed_zero_trade_combo(
+    tmp_path, settings_factory, monkeypatch
+):
+    """(i) A suppressed combo with no trade in the 30d window IS now refreshed
+    (was silently skipped by the trade-only selection before this fix)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    monkeypatch.setattr(
+        combo_refresh, "_send_permanent_suppression_alert", _StubSender()
+    )
+    old_refreshed = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+    # Seed with sentinel trades=25 + stale last_refreshed, and NO paper_trades.
+    await _seed_suppressed_combo(
+        db, "gainers_early", remaining=0, last_refreshed=old_refreshed, trades=25
+    )
+    await combo_refresh.refresh_all(db, s)
+
+    # Recomputed → sentinel trades=25 collapsed to 0-in-window and
+    # last_refreshed advanced. Under the OLD query neither would change.
+    new_refreshed = await _scalar(
+        db,
+        "SELECT last_refreshed FROM combo_performance "
+        "WHERE combo_key='gainers_early' AND window='30d'",
+    )
+    assert new_refreshed != old_refreshed, "suppressed zero-trade combo was skipped"
+    row = await _get_combo_row(db, "gainers_early", "30d")
+    assert row["trades"] == 0
+    await db.close()
+
+
+async def test_widened_refresh_keeps_suppressed_no_auto_unlatch(
+    tmp_path, settings_factory, monkeypatch
+):
+    """(ii) constraint (a): a suppressed losing combo STAYS suppressed after the
+    widened refresh — no auto-unlatch and no parole reset (no auto-revival)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    monkeypatch.setattr(
+        combo_refresh, "_send_permanent_suppression_alert", _StubSender()
+    )
+    original_parole = (datetime.now(timezone.utc) - timedelta(days=6)).isoformat()
+    # parole_exhausted (remaining=0) — the exact frozen state of the two combos
+    # already permanently locked (gainers_early, losers_contrarian).
+    await _seed_suppressed_combo(
+        db, "losers_contrarian", remaining=0, parole_at=original_parole
+    )
+    await combo_refresh.refresh_all(db, s)
+
+    row = await _get_combo_row(db, "losers_contrarian", "30d")
+    assert row["suppressed"] == 1, "must stay suppressed"
+    # NOT reset to FEEDBACK_PAROLE_RETEST_TRADES (5) — that would be auto-revival.
+    assert row["parole_trades_remaining"] == 0
+    assert row["parole_at"] == original_parole, "parole_at must not be reset"
+    await db.close()
+
+
+async def test_permanent_suppression_alert_fires_once_deduped(
+    tmp_path, settings_factory, monkeypatch
+):
+    """(iii) The §12b permanent-suppression alert fires once and is deduped on
+    the second run (marker set, no re-alert)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    stub = _StubSender()
+    monkeypatch.setattr(combo_refresh, "_send_permanent_suppression_alert", stub)
+    await _seed_suppressed_combo(db, "losers_contrarian", remaining=0)
+
+    summary1 = await combo_refresh.refresh_all(db, s)
+    assert stub.calls == 1
+    assert "losers_contrarian" in summary1["permanent_suppression"]
+    assert "permanent-suppression state" in stub.messages[0]
+    assert "revive_signal_with_baseline" in stub.messages[0]
+    marker = await _scalar(
+        db,
+        "SELECT perm_suppression_alerted_at FROM combo_performance "
+        "WHERE combo_key='losers_contrarian' AND window='30d'",
+    )
+    assert marker is not None, "dedup marker must be set after a confirmed send"
+
+    # Second run — still in state, marker set → deduped, no re-alert.
+    summary2 = await combo_refresh.refresh_all(db, s)
+    assert stub.calls == 1, "must NOT re-alert on the second run"
+    assert summary2["permanent_suppression"] == []
+    await db.close()
+
+
+async def test_permanent_suppression_alert_rearms_after_leaving_state(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Dedup marker re-arms: if a combo leaves the permanent-suppression state
+    (here: a fresh in-window trade) the marker clears so a future re-entry
+    alerts again."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    stub = _StubSender()
+    monkeypatch.setattr(combo_refresh, "_send_permanent_suppression_alert", stub)
+    await _seed_suppressed_combo(db, "gainers_early", remaining=0)
+
+    await combo_refresh.refresh_all(db, s)
+    assert stub.calls == 1
+
+    # Combo trades again inside the window → leaves permanent-suppression state.
+    now = datetime.now(timezone.utc)
+    await _insert_trade(db, "gainers_early", -5, -3.0, now - timedelta(days=1))
+    await combo_refresh.refresh_all(db, s)
+    marker = await _scalar(
+        db,
+        "SELECT perm_suppression_alerted_at FROM combo_performance "
+        "WHERE combo_key='gainers_early' AND window='30d'",
+    )
+    assert marker is None, "marker must re-arm once the combo leaves the state"
+    await db.close()
+
+
+async def test_permanent_suppression_alert_failure_does_not_break_refresh(
+    tmp_path, settings_factory, monkeypatch
+):
+    """(iv) An alert delivery failure never breaks refresh, and leaves the dedup
+    marker NULL so the next run re-attempts (operator MUST eventually be told)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+
+    async def _boom(settings, message):
+        raise RuntimeError("telegram down")
+
+    monkeypatch.setattr(combo_refresh, "_send_permanent_suppression_alert", _boom)
+    await _seed_suppressed_combo(db, "gainers_early", remaining=0)
+
+    summary = await combo_refresh.refresh_all(db, s)  # must NOT raise
+    assert summary["failed"] == 0
+    # Combo still refreshed + suppressed despite the alert failure.
+    row = await _get_combo_row(db, "gainers_early", "30d")
+    assert row["suppressed"] == 1
+    # Marker NOT set → retried next run.
+    marker = await _scalar(
+        db,
+        "SELECT perm_suppression_alerted_at FROM combo_performance "
+        "WHERE combo_key='gainers_early' AND window='30d'",
+    )
+    assert marker is None
+    # Not counted as newly-alerted this run.
+    assert summary["permanent_suppression"] == []
+    await db.close()
+
+
+async def test_normal_traded_combo_refresh_unchanged(
+    tmp_path, settings_factory, monkeypatch
+):
+    """(v) A normal combo that traded inside the window refreshes exactly as
+    before and is never flagged as permanent-suppression."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    monkeypatch.setattr(
+        combo_refresh, "_send_permanent_suppression_alert", _StubSender()
+    )
+    now = datetime.now(timezone.utc)
+    for pnl in [10, 20, 30]:
+        await _insert_trade(db, "healthy", pnl, 5.0, now - timedelta(days=1))
+
+    summary = await combo_refresh.refresh_all(db, s)
+    row = await _get_combo_row(db, "healthy", "30d")
+    assert row["trades"] == 3
+    assert row["suppressed"] == 0
+    assert row["parole_at"] is None
+    assert "healthy" not in summary["permanent_suppression"]
+    await db.close()
+
+
+async def test_unsuppressed_zero_trade_combo_not_force_refreshed(
+    tmp_path, settings_factory, monkeypatch
+):
+    """(vi) An UNSUPPRESSED combo with no recent trade is NOT force-refreshed —
+    only suppressed combos get the widening."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    monkeypatch.setattr(
+        combo_refresh, "_send_permanent_suppression_alert", _StubSender()
+    )
+    old_refreshed = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+    # Unsuppressed sentinel row (trades=7), no paper_trades in window.
+    await db._conn.execute(
+        "INSERT INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, avg_pnl_pct, "
+        " win_rate_pct, suppressed, refresh_failures, last_refreshed) "
+        "VALUES ('quiet', '30d', 7, 5, 2, 50, 5, 71.4, 0, 0, ?)",
+        (old_refreshed,),
+    )
+    await db._conn.commit()
+
+    summary = await combo_refresh.refresh_all(db, s)
+    # Untouched: sentinel trades=7 and last_refreshed both unchanged.
+    row = await _get_combo_row(db, "quiet", "30d")
+    assert row["trades"] == 7
+    new_refreshed = await _scalar(
+        db,
+        "SELECT last_refreshed FROM combo_performance "
+        "WHERE combo_key='quiet' AND window='30d'",
+    )
+    assert new_refreshed == old_refreshed
+    assert "quiet" not in summary["permanent_suppression"]
+    await db.close()
+
+
+async def test_chain_completed_frozen_lock_regression(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Real-world regression fixture: chain_completed frozen-lock snapshot
+    captured 2026-07-03 — see
+    tests/fixtures/frozen_lock_chain_completed_snapshot.md.
+
+    chain_completed was suppressed 2026-06-19, last_open 2026-06-04,
+    parole_trades_remaining 5, 63 trades / 4 wins (6.35% WR). At the 2026-07-04
+    03:00Z refresh its last_open drops outside the 30d window; under the OLD
+    trade-only refresh set it would fall out of refresh and latch silently at
+    parole_exhausted forever. This test simulates the post-latch state (last
+    trade outside the window) and asserts the fix keeps it live + suppressed
+    with NO auto-revival (constraint a) and alerts the operator once (§12b)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    stub = _StubSender()
+    monkeypatch.setattr(combo_refresh, "_send_permanent_suppression_alert", stub)
+    now = datetime.now(timezone.utc)
+
+    # One historical trade opened + closed just OUTSIDE the 30d window.
+    await _insert_trade(
+        db,
+        "chain_completed",
+        -10.0,
+        -8.0,
+        now - timedelta(days=31),
+        status="closed_sl",
+        opened_at=now - timedelta(days=31, hours=1),
+    )
+    # Fixture snapshot row: suppressed, remaining=5, 63 trades / 4 wins.
+    await _seed_suppressed_combo(
+        db,
+        "chain_completed",
+        remaining=5,
+        trades=63,
+        wins=4,
+        parole_at=now.isoformat(),
+    )
+
+    summary = await combo_refresh.refresh_all(db, s)
+    row = await _get_combo_row(db, "chain_completed", "30d")
+    # Kept live: refreshed → trades recomputed to 0-in-window.
+    assert row["trades"] == 0
+    # constraint (a): STAYS suppressed, parole allowance NOT reset.
+    assert row["suppressed"] == 1
+    assert row["parole_trades_remaining"] == 5
+    # §12b: operator alerted exactly once.
+    assert stub.calls == 1
+    assert "chain_completed" in summary["permanent_suppression"]
+    await db.close()
