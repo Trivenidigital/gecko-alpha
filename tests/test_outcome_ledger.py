@@ -30,6 +30,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import structlog
 
 from scout.db import Database
 from scout.outcome_ledger import (
@@ -39,6 +40,11 @@ from scout.outcome_ledger import (
     price_from_cache,
     record_emission,
 )
+
+
+def _events(logs) -> list[str]:
+    """Event names from a structlog.testing.capture_logs() capture."""
+    return [entry["event"] for entry in logs]
 
 
 def _iso(dt: datetime) -> str:
@@ -584,6 +590,51 @@ async def test_label_pending_fails_soft_on_broken_db(db, monkeypatch):
     monkeypatch.setattr(db._conn, "execute", _boom)
     stats = await label_pending(db, _ledger_settings())
     assert stats["n_examined"] == 0  # no exception escaped
+
+
+# ---------------------------------------------------------------------------
+# Liveness heartbeat — alive-empty must be distinguishable from dead labeler.
+# A pass with nothing pending must still emit exactly one ledger_label_heartbeat
+# so "ran but empty" (heartbeat present) diverges from "never ran" (silence).
+# ---------------------------------------------------------------------------
+
+
+async def test_label_pending_empty_still_emits_heartbeat(db):
+    """Divergence proof: an enabled pass over an EMPTY ledger still emits one
+    ledger_label_heartbeat — silence now means dead, not merely idle."""
+    with structlog.testing.capture_logs() as logs:
+        stats = await label_pending(db, _ledger_settings())
+    assert stats["n_examined"] == 0
+    beats = [e for e in logs if e["event"] == "ledger_label_heartbeat"]
+    assert len(beats) == 1
+    beat = beats[0]
+    assert beat["enabled"] is True
+    assert beat["n_labeled"] == 0
+    assert beat["n_pending"] == 0
+    assert beat["n_unlabelable"] == 0
+
+
+async def test_label_pending_disabled_emits_heartbeat_enabled_false(db):
+    """Kill-switched pass still emits exactly one heartbeat with enabled=False —
+    the disabled path is alive, not dead."""
+    with structlog.testing.capture_logs() as logs:
+        await label_pending(db, _ledger_settings(LEDGER_ENABLED=False))
+    beats = [e for e in logs if e["event"] == "ledger_label_heartbeat"]
+    assert len(beats) == 1
+    assert beats[0]["enabled"] is False
+
+
+async def test_label_pending_emits_exactly_one_heartbeat_when_working(db):
+    """Even on the working path (rows labeled) exactly one heartbeat fires —
+    one line per pass, no per-item spam."""
+    emitted = _now() - timedelta(hours=2)
+    await _seed_ledger_row(db, emitted_at=emitted, price=1.0)
+    await _insert_vhc(db, "tok", 1.10, emitted + timedelta(minutes=16))
+
+    with structlog.testing.capture_logs() as logs:
+        stats = await label_pending(db, _ledger_settings())
+    assert stats["n_labeled"] == 1
+    assert _events(logs).count("ledger_label_heartbeat") == 1
 
 
 # ---------------------------------------------------------------------------

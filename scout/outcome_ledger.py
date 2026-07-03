@@ -422,6 +422,12 @@ async def label_pending(db: Database, settings: Any) -> dict[str, Any]:
     the table's registration in the dashboard system-health path is the §12a
     freshness surface for this pipeline table.
 
+    Liveness: ALSO emits exactly one ``ledger_label_heartbeat`` at completion on
+    EVERY path (disabled / db-closed / empty / worked / failed), so silence of
+    the heartbeat means a dead labeler rather than merely an idle one. The
+    db-closed early return previously logged only ``ledger_label_skipped_db_closed``
+    (a warning, not a per-pass heartbeat); the heartbeat now covers that path too.
+
     Fail-soft: never raises; a failed pass logs ``ledger_label_pass_failed``
     and returns zeroed stats.
     """
@@ -433,11 +439,11 @@ async def label_pending(db: Database, settings: Any) -> dict[str, Any]:
         "n_unlabelable": 0,
         "n_complete": 0,
     }
-    if not stats["enabled"]:
-        log.info("ledger_label_pass", **stats)
-        return stats
-
     try:
+        if not stats["enabled"]:
+            log.info("ledger_label_pass", **stats)
+            return stats
+
         conn = db._conn
         if conn is None or db._txn_lock is None:
             log.warning("ledger_label_skipped_db_closed")
@@ -546,6 +552,17 @@ async def label_pending(db: Database, settings: Any) -> dict[str, Any]:
         except Exception as rb_exc:
             log.warning("ledger_label_rollback_failed", error=str(rb_exc))
         return stats
+    finally:
+        # Liveness heartbeat — exactly once per pass, every path (finally runs
+        # even after each early `return stats`). Silence of THIS event == dead
+        # labeler; enabled=False marks the kill-switched-but-alive path.
+        log.info(
+            "ledger_label_heartbeat",
+            enabled=stats["enabled"],
+            n_labeled=stats["n_labeled"],
+            n_pending=stats["n_pending"],
+            n_unlabelable=stats["n_unlabelable"],
+        )
 
 
 # /simple/price accepts up to ~250 ids per call; the poller spends AT MOST
@@ -683,6 +700,16 @@ async def poll_enrollments(db: Database, session: Any, settings: Any) -> dict[st
 
     Fail-soft: never raises; a failed pass logs and returns partial stats.
     Respects the LEDGER_ENABLED kill switch.
+
+    Liveness: ALWAYS emits exactly one ``ledger_poll_heartbeat`` structured log
+    at completion — on EVERY path (disabled / db-closed / empty / worked /
+    failed). Prod on 2026-07-03 had zero ``ledger_enrollment_poll`` events,
+    which is indistinguishable from an unwired (dead) poller because that log
+    only fires when there is work to do. The heartbeat makes "alive but nothing
+    to poll" (heartbeat present, n_active=0) diverge from "dead" (silence), per
+    the detection-must-reach-a-human rule (tasks/lessons.md). The work-done
+    ``ledger_enrollment_poll`` log is unchanged and still fires only when
+    tokens were polled.
     """
     stats: dict[str, Any] = {
         "enabled": _ledger_enabled(settings),
@@ -693,9 +720,9 @@ async def poll_enrollments(db: Database, session: Any, settings: Any) -> dict[st
         "n_priced": 0,
         "n_expired_purged": 0,
     }
-    if not stats["enabled"]:
-        return stats
     try:
+        if not stats["enabled"]:
+            return stats
         if db._conn is None:
             return stats
         stats["n_expired_purged"] = await purge_expired_enrollments(db)
@@ -733,6 +760,18 @@ async def poll_enrollments(db: Database, session: Any, settings: Any) -> dict[st
     except Exception as exc:
         log.warning("ledger_enrollment_poll_failed", error=str(exc))
         return stats
+    finally:
+        # Liveness heartbeat — exactly once per pass, every path (finally runs
+        # even after the early `return stats` above). One line, no per-item
+        # spam. Silence of THIS event == dead poller; enabled=False marks the
+        # kill-switched-but-alive path.
+        log.info(
+            "ledger_poll_heartbeat",
+            enabled=stats["enabled"],
+            n_active=stats["n_active"],
+            n_priced=stats["n_priced"],
+            n_expired_purged=stats["n_expired_purged"],
+        )
 
 
 def liquidity_from_signal_data(
