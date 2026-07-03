@@ -278,3 +278,21 @@ or carry a tombstone naming the PR whose landing deletes it. #407's unguarded
 moment the real migration landed — the duplicate-column failure itself proving
 the migration worked. With three-plus parallel worktrees this class is
 recurrent, not exotic.
+
+### Watchdog verification must exercise the CRON path, not bash-invocation (2026-07-03)
+
+A cron entry `* * * * * /path/script.sh >> log 2>&1` invokes the script
+DIRECTLY — it requires the executable bit. Verifying with `bash script.sh`
+bypasses that bit and passes even when the script is mode 0644 and cron
+cannot run it. Result: a "PASS" that certifies the logic while the real
+scheduled invocation fails `Permission denied` every tick, silently (cron
+logs it; nobody reads cron logs — the whole reason the watchdog exists).
+
+**Worked example (2026-07-03 deploy):** the #399 held-position + revival
+watchdogs and the pre-existing acceleration-heartbeat watchdog were all git
+mode 100644; cron failed every run with `Permission denied` (acceleration
+~31 days / 2,959 consecutive failures). The deploy's §A-5 smoke used
+`bash scripts/X.sh` → false PASS. Rule: watchdog/cron verification runs the
+script the way cron does (`./script.sh` or the exact cron command), and
+scripts destined for direct cron invocation are committed +x
+(`git update-index --chmod=+x`) so the bit survives every checkout.
