@@ -21,6 +21,7 @@ from yarl import URL
 
 from scout.db import Database
 from scout.outcome_ledger import (
+    active_enrollments,
     label_pending,
     poll_enrollments,
     price_from_cache,
@@ -58,12 +59,13 @@ def _ledger_settings(settings_factory, **overrides):
 async def _enroll_via_gated_out(
     db, settings, token_id: str, *, price=None, emitted_at: str | None = None
 ) -> None:
-    """Record a gated_out_sample. NOTE (coverage-gated enrollment,
-    fix/ledger-coverage-gated-enrollment): this only ENROLLS *token_id* when it
-    is UNTRACKED (not a CG-slug id and no existing price_cache row) — e.g. a
-    dex: id. CG-slug tokens are in-DB-covered and no longer enroll; tests that
-    need a CG-namespace enrollment in the poll set seed it via
-    :func:`_seed_enrollment`."""
+    """Record a gated_out_sample. NOTE (LIVENESS coverage,
+    fix/ledger-coverage-gated-enrollment): this ENROLLS *token_id* whenever it
+    has NO FRESH price observation (stale/missing price_cache AND stale/missing
+    volume_history_cg) — regardless of shape. So an untracked dex: id AND a
+    dead/untracked CG-slug both enroll. Only tokens with a fresh in-DB price are
+    'covered' and skip enrollment; tests that need a CG-namespace enrollment for
+    a token that WOULD be fresh-covered seed it via :func:`_seed_enrollment`."""
     row_id = await record_emission(
         db,
         settings,
@@ -167,17 +169,21 @@ async def test_poller_then_labeler_labels_enrolled_only_token(db, settings_facto
     """End-to-end: an enrolled token is priced by the poller and labeled by
     the hourly pass — the missed-winner recall lane becomes measurable.
 
-    The ledger row is recorded via record_emission; the CG enrollment is
-    seeded directly because coverage-gated enrollment
-    (fix/ledger-coverage-gated-enrollment) no longer auto-enrolls CG-slug
-    tokens. Labeling is independent of enrollment either way — label_pending
-    resolves prices for any pending row keyed on its token_id."""
+    LIVENESS coverage (fix/ledger-coverage-gated-enrollment): 'orphan-coin' is
+    an UNTRACKED CG-slug (no fresh price_cache / volume_history_cg observation),
+    so the gated_out emission AUTO-ENROLLS it into the 'cg' poll namespace — no
+    direct seed needed (and seeding it too would double-insert). This exercises
+    the real auto-enroll path for a dead-but-CG-shaped token. Labeling is
+    independent of enrollment either way — label_pending resolves prices for any
+    pending row keyed on its token_id."""
     settings = _ledger_settings(settings_factory)
     emitted = datetime.now(timezone.utc) - timedelta(minutes=20)
     await _enroll_via_gated_out(
         db, settings, "orphan-coin", price=1.0, emitted_at=emitted.isoformat()
     )
-    await _seed_enrollment(db, "orphan-coin", "cg")
+    # Auto-enrolled by the emission above (untracked -> no fresh price ->
+    # enrolled, namespace 'cg'); confirm before poll/label.
+    assert [t for t, _ in await active_enrollments(db)] == ["orphan-coin"]
 
     async with aiohttp.ClientSession() as session:
         with aioresponses() as m:
