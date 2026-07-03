@@ -91,32 +91,14 @@ moving a shared checkout's HEAD mid-session is a documented failure mode
 (2026-07-02: HEAD moved to a PR-#400 review line under another session's
 uncommitted files).
 
-**Post-approval amendments may narrow, never widen, without re-approval.**
-A post-approval amendment to an already-approved artifact is permitted only
-when it tightens conditions (adds a check, closes a gap, pins a value) AND is
-disclosed in the same message that reports the change; anything that loosens
-scope, relaxes a gate, or adds capability requires fresh approval.
-(Precedent: #410 rule-ii addition, #411 pin source-of-truth comment — both
-narrowing, both disclosed, both ratified 2026-07-02.)
+**License precedence.** The most recent, most specific authorization governs
+its named activity and no other (e.g., an append-only license governs branch-
+conflict resolution; a fixture-only pre-authorization governs fix application).
+Perceived overlaps between licenses resolve to ASK, not to the broader grant.
 
 **Condition-enumeration on conditional approvals.** Every
 conditionally-approved PR's merge report enumerates each condition and where
 it was satisfied — including documentation and design-artifact conditions.
-
-## Model-Tier Provenance (operator-scoped definitions, drift-detectable from here)
-
-Subagent tiering for this repo is defined at USER level (deliberately not in
-any repo). Pointer block — refresh these hashes as a standing step in any PR
-that cites §2a:
-
-| Artifact | Purpose | sha256/16 (2026-07-02) |
-|---|---|---|
-| `~/.claude/CLAUDE.md` §2a Model-Tiered Orchestration | delegation rules: Fable orchestrates; reasoning → deep-reasoner; mechanical → fast-worker; high-stakes → multi-vector per §8 | `399434eeb46afbb7` |
-| `~/.claude/agents/deep-reasoner.md` (opus) | reasoning-heavy subagent incl. mandatory delivery contract | `0cba76166499a04a` |
-| `~/.claude/agents/fast-worker.md` (sonnet) | mechanical subagent incl. mandatory delivery contract | `92f5cbd4e2588eaf` |
-
-Verify: hash the §2a section (from `## 2a.` to `## 3.`) and each full agent
-file; mismatch = tier definitions drifted since this repo last looked.
 
 ## What NOT To Do
 

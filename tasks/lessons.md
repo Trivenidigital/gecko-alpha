@@ -268,3 +268,13 @@ the shared checkout's detached HEAD onto a PR-#400 review line while another
 session had uncommitted report files there — the exact divergence class in
 [[feedback_parallel_session_branch_coordination]]. The root checkout is
 master-pinned and read-only by convention.
+
+### Sibling-branch schema simulations must survive the sibling landing (2026-07-02)
+
+A test that simulates a parallel branch's schema change must either be written
+to survive that branch's merge (guarded ALTER / IF-NOT-EXISTS / PRAGMA check)
+or carry a tombstone naming the PR whose landing deletes it. #407's unguarded
+`ALTER TABLE paper_trades ADD COLUMN exit_provenance` broke #408's CI the
+moment the real migration landed — the duplicate-column failure itself proving
+the migration worked. With three-plus parallel worktrees this class is
+recurrent, not exotic.
