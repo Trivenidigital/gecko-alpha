@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import pytest
+import structlog
 from aioresponses import aioresponses
 from yarl import URL
 
@@ -217,3 +218,58 @@ async def test_poll_enrollments_http_failure_never_raises(db, settings_factory):
             stats = await poll_enrollments(db, session, settings)  # no raise
 
     assert stats["n_priced"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Liveness heartbeat — alive-empty must be distinguishable from dead poller.
+# Prod (2026-07-03) had ZERO ledger_enrollment_poll events, indistinguishable
+# from an unwired poller: an empty pass and a dead pass looked identical. The
+# heartbeat fires exactly once on EVERY path so silence now means dead.
+# ---------------------------------------------------------------------------
+
+
+async def test_poll_enrollments_empty_still_emits_heartbeat(db, settings_factory):
+    """Divergence proof: an enabled pass with ZERO enrollments still emits one
+    ledger_poll_heartbeat (session untouched on the empty path)."""
+    settings = _ledger_settings(settings_factory)
+    with structlog.testing.capture_logs() as logs:
+        stats = await poll_enrollments(db, object(), settings)
+    assert stats["n_active"] == 0
+    beats = [e for e in logs if e["event"] == "ledger_poll_heartbeat"]
+    assert len(beats) == 1
+    beat = beats[0]
+    assert beat["enabled"] is True
+    assert beat["n_active"] == 0
+    assert beat["n_priced"] == 0
+    assert beat["n_expired_purged"] == 0
+
+
+async def test_poll_enrollments_disabled_emits_heartbeat_enabled_false(
+    db, settings_factory
+):
+    """Kill-switched pass still emits exactly one heartbeat with enabled=False."""
+    disabled = _ledger_settings(settings_factory, LEDGER_ENABLED=False)
+    with structlog.testing.capture_logs() as logs:
+        await poll_enrollments(db, object(), disabled)
+    beats = [e for e in logs if e["event"] == "ledger_poll_heartbeat"]
+    assert len(beats) == 1
+    assert beats[0]["enabled"] is False
+
+
+async def test_poll_enrollments_emits_exactly_one_heartbeat_when_working(
+    db, settings_factory
+):
+    """Even on the working path (tokens priced) exactly one heartbeat fires —
+    one line per pass, no per-item spam."""
+    settings = _ledger_settings(settings_factory)
+    await _enroll_via_gated_out(db, settings, "micro-alpha")
+
+    async with aiohttp.ClientSession() as session:
+        with aioresponses() as m:
+            m.get(SIMPLE_PRICE_PATTERN, payload={"micro-alpha": {"usd": 0.5}})
+            with structlog.testing.capture_logs() as logs:
+                stats = await poll_enrollments(db, session, settings)
+
+    assert stats["n_priced"] == 1
+    events = [e["event"] for e in logs]
+    assert events.count("ledger_poll_heartbeat") == 1
