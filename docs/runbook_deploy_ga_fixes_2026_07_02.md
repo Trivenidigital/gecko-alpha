@@ -109,6 +109,21 @@ sed -i '/held-position-price-watchdog/d;/revival-verdict-watchdog/d' cron/gecko-
   #    a close landing between snapshot and stop would shift a count and
   #    false-abort the assertion (reviewer catch, 2026-07-02).
   systemctl stop gecko-pipeline gecko-dashboard
+  # --- HUNK: dashboard-unit-stop-hardening (added 2026-07-03, fix/dashboard-unit-stop-hardening) ---
+  # 0a. VERIFY STOPPED before proceeding. `systemctl stop` returns when the stop
+  #     JOB is enqueued, not when the unit is actually down; on 2026-07-03 deploy-#2
+  #     gecko-dashboard's uvicorn tree took ~90s to reap ("Failed to kill control
+  #     group, Invalid argument" -> 'timeout' result), and Restart=always then
+  #     auto-restarted it 11s BEFORE the migration finished, briefly serving
+  #     pre-migration (NULL-provenance) schema. Ship-side this is now bounded by
+  #     KillMode=mixed + TimeoutStopSec=20 in systemd/gecko-dashboard.service, but
+  #     still verify at runtime — do NOT assume stop == stopped (global CLAUDE.md §9a).
+  #     If the deployed unit file predates this fix, run `systemctl daemon-reload` first.
+  for u in gecko-pipeline gecko-dashboard; do
+    for _ in $(seq 1 30); do systemctl is-active --quiet "$u" || break; sleep 1; done
+    systemctl is-active --quiet "$u" && { echo "ABORT: $u still active after 30s stop-wait"; exit 1; }
+  done
+  # --- END HUNK ---
   # 1. PRE-DEPLOY SNAPSHOT (abort-reference for the assertion below)
   sqlite3 scout.db "SELECT COALESCE(exit_reason,'(null)'), COUNT(*) FROM paper_trades WHERE status LIKE 'closed_%' GROUP BY 1;" | tee /root/pre_deploy2_exit_reasons.txt
   git fetch && git checkout <deploy-2 pin SHA>   # pin discipline; NOT git pull
