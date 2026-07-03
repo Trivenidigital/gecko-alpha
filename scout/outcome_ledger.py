@@ -114,43 +114,81 @@ def _namespace_for(token_id: str) -> str:
     return "other"
 
 
-async def _has_indb_price_coverage(db: Database, token_id: str) -> bool:
-    """True iff *token_id* is already priceable from IN-DB sources WITHOUT
-    enrollment — so the forward-polling set (the enrollment lane) should skip
-    it.
+async def _has_fresh_price_observation(
+    db: Database, token_id: str, settings: Any
+) -> bool:
+    """True iff a FRESH (live) price observation exists for *token_id* — i.e.
+    the token is being actively served by the existing price lanes and will be
+    labelable from in-DB data WITHOUT enrollment, so the forward-polling set
+    (the enrollment lane) should skip it.
 
-    A token is in-DB-covered iff:
-    - ``is_cg_coin_id(token_id)`` — a CG-slug id served by the CG ingestion
-      lanes; its price history flows into volume_history_cg without any
-      poller, OR
-    - a ``price_cache`` row already exists for it — another writer already
-      covers it.
+    Coverage is LIVENESS, not SHAPE (2026-07-03 operator condition (b) on the
+    #423->#421 pair). The prior gate treated ``is_cg_coin_id(token_id)`` OR any
+    ``price_cache`` row (no freshness filter) as "covered." Both are wrong for
+    the recall lane:
 
-    Rationale (coverage-gated enrollment, 2026-07-03 operator finding on
-    PR #421): the enrollment set is capped at LEDGER_ENROLLMENT_MAX_ACTIVE
-    (200, evict-oldest). Prod measured 153,113 dispatcher-suppressed blocks
-    over 14d across 300 DISTINCT token_ids (~150 per 7d TTL window); most are
-    CG-slug (chain_completed / gainers_early / losers_contrarian /
-    volume_spike are CG-sourced) and ALREADY labelable from volume_history_cg.
-    Enrolling them consumed ~75% of the cap and EVICTED the untracked
-    micro-cap / dex cohort the recall lane exists to measure. Gating
-    enrollment on "no in-DB coverage" targets the poller at exactly the
-    untracked cohort, for ALL gated_out samples (not just PR #421's).
+    - ``is_cg_coin_id`` is a SHAPE heuristic: a DEAD-but-valid CG slug
+      (delisted, or dropped from the tracked top-N) still passes it, so a dead
+      token read "covered" and was never enrolled / re-priced.
+    - the ``price_cache`` existence check had NO freshness filter: a STALE row
+      (the feed died hours/days ago) read "covered" too.
 
-    Fail-soft: never raises. On any error returns False (= "no coverage" ->
-    enroll), preserving the prior conservative behavior of not silently
-    dropping a possibly-untracked token from the measurement lane.
+    Either way a dead token read covered -> not enrolled -> never re-priced ->
+    unlabelable-but-UNFLAGGED. That undercounts the dead suppressed tokens and
+    biases the suppressed cohort's measured returns UPWARD — a directional lean
+    toward reopening in the experiment this lane feeds.
+
+    Coverage is therefore a fresh price observation within
+    ``LEDGER_COVERAGE_FRESHNESS_MIN`` minutes of now, in EITHER lane:
+
+    - ``price_cache.updated_at`` for this token_id, OR
+    - the latest ``volume_history_cg.recorded_at`` for this coin_id.
+
+    NO ``is_cg_coin_id`` shape check participates in coverage. Rationale for the
+    window: it ties to the pipeline / poller cadence — a token with a price
+    observation inside the last hour is actively served by the existing lanes
+    and labelable from in-DB data without enrollment; anything older is treated
+    as feed-dead and enrolled so the poller keeps a live price.
+
+    Fail-soft: never raises. On any error returns False (= "not fresh" ->
+    enroll), the conservative choice — enroll the untracked-or-unknown so the
+    poller keeps a live price rather than silently dropping a possibly-dead
+    token from the measurement lane.
     """
-    if is_cg_coin_id(token_id):
-        return True
     try:
         conn = db._conn
         if conn is None:
             return False
-        cur = await conn.execute(
-            "SELECT 1 FROM price_cache WHERE coin_id = ? LIMIT 1", (token_id,)
+        window = timedelta(
+            minutes=int(getattr(settings, "LEDGER_COVERAGE_FRESHNESS_MIN", 60))
         )
-        return (await cur.fetchone()) is not None
+        threshold = datetime.now(timezone.utc) - window
+
+        # Lane 1: price_cache — the current-observation writer. Fresh iff its
+        # updated_at is within the window (existence alone is NOT coverage).
+        cur = await conn.execute(
+            "SELECT updated_at FROM price_cache WHERE coin_id = ?", (token_id,)
+        )
+        row = await cur.fetchone()
+        if row is not None:
+            observed = _parse_ts(row[0])
+            if observed is not None and observed >= threshold:
+                return True
+
+        # Lane 2: volume_history_cg — CoinGecko telemetry. Fresh iff the LATEST
+        # recorded_at for this coin_id is within the window (a historical row
+        # from days ago is not coverage).
+        cur = await conn.execute(
+            "SELECT MAX(recorded_at) FROM volume_history_cg WHERE coin_id = ?",
+            (token_id,),
+        )
+        row = await cur.fetchone()
+        if row is not None and row[0] is not None:
+            observed = _parse_ts(row[0])
+            if observed is not None and observed >= threshold:
+                return True
+
+        return False
     except Exception as exc:
         log.warning("ledger_coverage_check_failed", token_id=token_id, error=str(exc))
         return False
@@ -322,20 +360,31 @@ async def record_emission(
         # lands, so the stamp is binary here ('skipped_cap' stays reserved
         # in the CHECK for a future no-eviction policy).
         #
-        # Coverage-gated enrollment (2026-07-03, PR #421 finding): enroll ONLY
-        # tokens with NO in-DB price coverage. A CG-slug token (is_cg_coin_id)
-        # or one that already has a price_cache row is labelable WITHOUT the
-        # poller, so enrolling it just churns the LEDGER_ENROLLMENT_MAX_ACTIVE
-        # cap and evicts the untracked cohort the recall lane measures. A
-        # covered gated_out_sample therefore stamps 'not_needed' (per #406
-        # semantics: "token has in-DB coverage"); only genuinely-untracked
-        # ones stamp 'enrolled'. Analysis still separates covered-suppressed
+        # Coverage-gated enrollment (2026-07-03, condition (b) on #423->#421):
+        # enroll ONLY tokens with NO LIVE in-DB price coverage. Coverage is
+        # LIVENESS, not shape/existence: a token is covered iff a FRESH price
+        # observation exists (price_cache.updated_at OR latest
+        # volume_history_cg.recorded_at within LEDGER_COVERAGE_FRESHNESS_MIN);
+        # see _has_fresh_price_observation. A DEAD-but-valid CG slug or a STALE
+        # price_cache row is NOT covered and enrolls, so its price is refreshed
+        # and it stays labelable instead of reading covered-but-dead (which
+        # undercounts dead suppressed tokens and biases the suppressed cohort's
+        # returns upward). A liveness-covered gated_out_sample stamps
+        # 'not_needed' (per #406 semantics: "token has in-DB coverage"); every
+        # row that is enrolled stamps 'enrolled'. enroll_base gates on the row
+        # KIND (gated_out / priceless), so a priced dispatch/alert — which
+        # carries its own anchor and needs no forward poll — stays 'not_needed'
+        # without a coverage query. Analysis still separates covered-suppressed
         # (kind=gated_out_sample, status=not_needed) from untracked-suppressed
-        # (status=enrolled) on the stamp, and can further split covered rows
-        # via is_cg_coin_id at read time. Applies to ALL gated_out samples and
-        # priceless emissions, not just PR #421's dispatcher-suppressed blocks.
+        # (status=enrolled) on the stamp. Residual stale-covered class
+        # (condition f): a row stamped 'not_needed' whose price goes stale AFTER
+        # emission keeps its not_needed stamp; it is identified at label time by
+        # not_needed + no fresh observation, and is the stale-covered class named
+        # in truncation-rate reporting.
         enroll_base = kind == "gated_out_sample" or price is None
-        enroll_needed = enroll_base and not await _has_indb_price_coverage(db, token_id)
+        enroll_needed = enroll_base and not await _has_fresh_price_observation(
+            db, token_id, settings
+        )
         enrollment_status = "enrolled" if enroll_needed else "not_needed"
         async with db._txn_lock:
             cur = await conn.execute(
@@ -361,14 +410,15 @@ async def record_emission(
             # Enrollment-at-emission: in-DB-only labeling cannot price
             # tokens the tracked lanes never carry (below-min-mcap
             # micro-caps, dex:/bare-address ids in gated_out samples,
-            # priceless alerts). Without forward polling those rows are
-            # STRUCTURALLY unlabelable and the missed-winner recall lane is
-            # unmeasurable. Enrollment is now coverage-gated (see the
-            # enroll_needed derivation above): a gated_out sample or
-            # priceless emission enrolls ONLY when the token has no in-DB
-            # price coverage (not a CG-slug id and no existing price_cache
-            # row); CG-covered tokens label from volume_history_cg without
-            # the poller and must not churn the enrollment cap.
+            # priceless alerts) OR tokens whose feed has gone dead. Without
+            # forward polling those rows are STRUCTURALLY unlabelable and the
+            # missed-winner recall lane is unmeasurable. Enrollment is
+            # coverage-gated on LIVENESS (see the enroll_needed derivation
+            # above): a gated_out sample or priceless emission enrolls ONLY
+            # when NO fresh price observation exists for the token (stale/
+            # missing price_cache AND stale/missing volume_history_cg).
+            # Liveness-covered tokens label from that fresh in-DB price
+            # without the poller and must not churn the enrollment cap.
             if enroll_needed:
                 await _enroll_token_locked(
                     conn, token_id, settings, datetime.now(timezone.utc)

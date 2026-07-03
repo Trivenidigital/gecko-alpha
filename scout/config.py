@@ -57,13 +57,27 @@ class Settings(BaseSettings):
     # true historical observations). 120 min covers the hourly pass + margin;
     # le = 7 days (the longest horizon).
     LEDGER_PRICE_CACHE_MAX_LATENESS_MINUTES: int = Field(default=120, ge=1, le=10_080)
-    # Enrollment-at-emission: emissions whose token has no in-DB price
+    # Enrollment-at-emission: emissions whose token has no LIVE in-DB price
     # coverage (all gated_out_samples + priceless alerts) enroll the token
     # into a forward-polling set so the labeler can price it. TTL matches
     # the 7d labeling window; cap bounds the per-cycle polling cost
     # (oldest-expire-first eviction).
     LEDGER_ENROLLMENT_TTL_DAYS: int = Field(default=7, ge=1, le=90)
     LEDGER_ENROLLMENT_MAX_ACTIVE: int = Field(default=200, ge=1, le=10_000)
+    # Coverage = LIVENESS, not shape (2026-07-03 operator condition (b) on the
+    # #423->#421 pair). A gated_out / priceless emission is treated as
+    # already-covered (no enrollment) ONLY when a FRESH price observation
+    # exists within this many minutes of now — in price_cache.updated_at OR the
+    # latest volume_history_cg.recorded_at. Rationale: this window ties to the
+    # pipeline / poller cadence — a token with a price observation inside the
+    # last hour is being actively served by the existing lanes and will be
+    # labelable from in-DB data WITHOUT enrollment; anything older is treated
+    # as feed-dead and enrolled so the poller keeps a live price. A DEAD-but-
+    # valid CG slug or a STALE price_cache row therefore no longer reads as
+    # "covered" (the shape/existence heuristic did, undercounting dead
+    # suppressed tokens and biasing the suppressed cohort's returns upward).
+    # le = 7 days (the longest labeling horizon).
+    LEDGER_COVERAGE_FRESHNESS_MIN: int = Field(default=60, ge=1, le=10_080)
     # MIN_SCORE / CONVICTION_THRESHOLD are 0..100 scores in normal use,
     # but tests + operator circuit-breakers use sentinel values like
     # 999 to mean "disable this gate entirely". ge=0 catches sign typos;

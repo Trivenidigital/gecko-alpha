@@ -57,6 +57,7 @@ def _ledger_settings(**overrides) -> SimpleNamespace:
         LEDGER_PRICE_CACHE_MAX_LATENESS_MINUTES=120,
         LEDGER_ENROLLMENT_TTL_DAYS=7,
         LEDGER_ENROLLMENT_MAX_ACTIVE=200,
+        LEDGER_COVERAGE_FRESHNESS_MIN=60,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -660,6 +661,11 @@ async def test_engine_blocked_path_samples_gated_out(db, settings_factory):
         PAPER_STARTUP_WARMUP_SECONDS=9_999,
         LEDGER_GATED_OUT_SAMPLE_RATE=3,
     )
+    # Mirror prod: a CG-sourced dispatch signal suppresses a token the CG lanes
+    # are ACTIVELY tracking -> a FRESH in-DB price exists. Under liveness
+    # coverage that makes the row 'not_needed' (no 200-cap churn). Without this
+    # seed the token would be feed-dead and correctly ENROLL.
+    await _insert_price_cache(db, "tok", 1.0, _now())
     engine = TradingEngine(mode="paper", db=db, settings=settings)
 
     for _ in range(6):
@@ -683,13 +689,16 @@ async def test_engine_blocked_path_samples_gated_out(db, settings_factory):
         assert verdicts["sample_rate"] == 3
         # c1: no anchor price for this blocked path -> age NULL.
         assert row["anchor_cache_age_seconds"] is None
-        # coverage-gated enrollment (fix/ledger-coverage-gated-enrollment):
-        # the engine dispatches token_id="tok" (CG-slug shape -> is_cg_coin_id
-        # True -> in-DB-covered), so it records the gated_out row but does NOT
-        # enroll and stamps 'not_needed'. This mirrors prod: the CG-sourced
-        # dispatch signals (chain_completed/gainers_early/losers_contrarian/
-        # volume_spike) suppress CG-slug tokens that are already labelable
-        # from volume_history_cg, so they must not churn the 200-cap.
+        # coverage = LIVENESS (fix/ledger-coverage-gated-enrollment): token_id
+        # "tok" has a FRESH price_cache row (seeded above), so it is actively
+        # served by the CG lanes and labelable WITHOUT the poller -> records
+        # the gated_out row but does NOT enroll and stamps 'not_needed'. This
+        # mirrors prod: the CG-sourced dispatch signals (chain_completed/
+        # gainers_early/losers_contrarian/volume_spike) suppress tokens the CG
+        # lanes actively price, so they must not churn the 200-cap. NOTE: shape
+        # (is_cg_coin_id) alone no longer implies coverage — a DEAD slug with no
+        # fresh price would ENROLL (see
+        # test_gated_out_cg_slug_no_price_data_enrolls).
         assert row["enrollment_status"] == "not_needed"
 
 
@@ -822,35 +831,45 @@ async def test_gated_out_untracked_enrolls_token(db):
     assert ledger_row["enrollment_status"] == "enrolled"
 
 
-async def test_gated_out_cg_slug_covered_does_not_enroll(db):
-    """Negative-regression (fix/ledger-coverage-gated-enrollment): a
-    gated_out_sample for a CG-slug token is in-DB-covered (is_cg_coin_id) —
-    it records the ledger row but does NOT enroll (no 200-cap churn), and the
-    ledger row stamps 'not_needed', not 'enrolled'. Analysis distinguishes
-    covered-suppressed (kind=gated_out_sample, status=not_needed) from
-    untracked-suppressed (status=enrolled) directly on the stamp."""
+async def test_gated_out_cg_slug_no_price_data_enrolls(db):
+    """CORE of the liveness fix (fix/ledger-coverage-gated-enrollment): coverage
+    is LIVENESS, not SHAPE. A valid CG-slug token with NO in-DB price data (a
+    DEAD/delisted slug, or one dropped from the tracked top-N) no longer reads
+    as "covered" just because is_cg_coin_id passes — it has no fresh price
+    observation, so it ENROLLS and stamps 'enrolled'.
+
+    This inverts the prior #423 assertion for the SAME token ('micro-cap-coin'
+    stamped 'not_needed' under the shape heuristic). Enrolling the dead-slug
+    cohort is exactly the point: otherwise it reads covered -> never re-priced
+    -> unlabelable-but-unflagged, undercounting dead suppressed tokens and
+    biasing the suppressed cohort's returns upward."""
     await record_emission(
         db,
         _ledger_settings(),
         kind="gated_out_sample",
-        token_id="micro-cap-coin",  # CG-slug shape -> in-DB-covered
+        token_id="micro-cap-coin",  # CG-slug shape, but NO fresh price -> not covered
         surface="gainers_early",
         price=None,
         liquidity=None,
         liquidity_source="none",
         gate_verdicts={"reason": "below_min_mcap"},
     )
-    assert await _fetch_enrollments(db) == []  # cap untouched
+    rows = await _fetch_enrollments(db)
+    assert [r["token_id"] for r in rows] == ["micro-cap-coin"]
+    assert rows[0]["namespace"] == "cg"  # CG-shaped id still polls via the CG lane
     ledger_row = (await _fetch_rows(db))[0]
     assert ledger_row["kind"] == "gated_out_sample"
-    assert ledger_row["enrollment_status"] == "not_needed"
+    assert ledger_row["enrollment_status"] == "enrolled"
 
 
-async def test_gated_out_price_cache_covered_does_not_enroll(db):
-    """A token that is NOT a CG-slug but already has a price_cache row is
-    in-DB-covered too -> no enrollment, stamp 'not_needed'."""
+async def test_gated_out_fresh_price_cache_does_not_enroll(db):
+    """Liveness-covered (test 1): a FRESH price_cache row (updated_at = now)
+    means the token is actively served -> no enrollment, stamp 'not_needed'.
+    Adjusted from the prior #423 test_gated_out_price_cache_covered_does_not_
+    enroll: 'covered' now requires FRESHNESS, so the freshness of the seeded
+    row (not merely its existence) is what makes this pass."""
     token_id = "dex:base:0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-    await _insert_price_cache(db, token_id, 0.42, _now())
+    await _insert_price_cache(db, token_id, 0.42, _now())  # FRESH
     await record_emission(
         db,
         _ledger_settings(),
@@ -866,18 +885,96 @@ async def test_gated_out_price_cache_covered_does_not_enroll(db):
     assert (await _fetch_rows(db))[0]["enrollment_status"] == "not_needed"
 
 
-async def test_labeler_labels_covered_cg_slug_row_without_enrollment(db):
-    """Operator condition (fix/ledger-coverage-gated-enrollment): a covered
-    (non-enrolled) CG-slug gated_out row is STILL labeled — label_pending
-    resolves prices from volume_history_cg for any pending row keyed on its
-    token_id, independent of ledger_enrollments. Enrollment only drives the
-    poller for the untracked cohort; it is never a precondition for labeling."""
-    emitted = _now() - timedelta(hours=2)
+async def test_gated_out_stale_price_cache_enrolls(db):
+    """CORE of the liveness fix (test 2): a STALE price_cache row (updated_at 3h
+    ago, older than LEDGER_COVERAGE_FRESHNESS_MIN=60) is FEED-DEAD -> NOT
+    covered -> the token ENROLLS. Under the prior existence-only check this row
+    read as 'covered' (no freshness filter) and the token was never re-priced.
+    Stale != covered is the whole fix."""
+    token_id = "dex:base:0xstalestalestalestalestalestalestalestal"
+    await _insert_price_cache(db, token_id, 0.42, _now() - timedelta(hours=3))  # STALE
     await record_emission(
         db,
         _ledger_settings(),
         kind="gated_out_sample",
-        token_id="covered-coin",  # CG-slug -> not enrolled
+        token_id=token_id,
+        surface="tg_social",
+        price=None,
+        liquidity=None,
+        liquidity_source="none",
+        gate_verdicts={"reason": "below_min_mcap"},
+    )
+    rows = await _fetch_enrollments(db)
+    assert [r["token_id"] for r in rows] == [token_id]
+    assert (await _fetch_rows(db))[0]["enrollment_status"] == "enrolled"
+
+
+async def test_gated_out_fresh_volume_history_does_not_enroll(db):
+    """Liveness-covered via the OTHER lane (test 3): a fresh volume_history_cg
+    row (latest recorded_at within the window) also counts as coverage -> no
+    enrollment, stamp 'not_needed'. Exercises the volume_history_cg branch of
+    _has_fresh_price_observation independently of price_cache."""
+    token_id = "fresh-vhc-coin"
+    await _insert_vhc(db, token_id, 1.0, _now() - timedelta(minutes=10))  # FRESH
+    await record_emission(
+        db,
+        _ledger_settings(),
+        kind="gated_out_sample",
+        token_id=token_id,
+        surface="gainers_early",
+        price=None,
+        liquidity=None,
+        liquidity_source="none",
+        gate_verdicts={"reason": "below_min_mcap"},
+    )
+    assert await _fetch_enrollments(db) == []
+    assert (await _fetch_rows(db))[0]["enrollment_status"] == "not_needed"
+
+
+async def test_gated_out_stale_volume_history_enrolls(db):
+    """Symmetric to the stale-price_cache case: a volume_history_cg row whose
+    latest recorded_at is older than the window is feed-dead -> NOT covered ->
+    the token ENROLLS. Guards against a MAX(recorded_at) regression that would
+    treat any historical row as coverage regardless of age."""
+    token_id = "stale-vhc-coin"
+    await _insert_vhc(db, token_id, 1.0, _now() - timedelta(hours=5))  # STALE
+    await record_emission(
+        db,
+        _ledger_settings(),
+        kind="gated_out_sample",
+        token_id=token_id,
+        surface="gainers_early",
+        price=None,
+        liquidity=None,
+        liquidity_source="none",
+        gate_verdicts={"reason": "below_min_mcap"},
+    )
+    rows = await _fetch_enrollments(db)
+    assert [r["token_id"] for r in rows] == [token_id]
+    assert (await _fetch_rows(db))[0]["enrollment_status"] == "enrolled"
+
+
+async def test_labeler_labels_fresh_covered_row_without_enrollment(db):
+    """Operator condition (fix/ledger-coverage-gated-enrollment): a LIVENESS-
+    covered (non-enrolled) gated_out row is STILL labeled — label_pending
+    resolves prices from volume_history_cg for any pending row keyed on its
+    token_id, independent of ledger_enrollments. A liveness-covered token by
+    definition HAS a fresh in-DB price, so it labels trivially from that same
+    in-DB history. Enrollment only drives the poller for the untracked cohort;
+    it is never a precondition for labeling.
+
+    Adjusted from the prior CG-slug variant: coverage now requires a fresh
+    price row, so we seed one at emission time to make the row 'not_needed'."""
+    emitted = _now() - timedelta(hours=2)
+    # Fresh observation (updated_at = real now) -> liveness-covered at the
+    # moment record_emission runs its coverage check (which always uses
+    # wall-clock now, independent of the backdated emitted_at) -> not enrolled.
+    await _insert_price_cache(db, "covered-coin", 1.0, _now())
+    await record_emission(
+        db,
+        _ledger_settings(),
+        kind="gated_out_sample",
+        token_id="covered-coin",
         surface="gainers_early",
         price=1.0,
         liquidity=None,
@@ -885,7 +982,7 @@ async def test_labeler_labels_covered_cg_slug_row_without_enrollment(db):
         gate_verdicts={"reason": "below_min_mcap"},
         emitted_at=_iso(emitted),
     )
-    # Not enrolled (covered), yet labelable from in-DB history.
+    # Not enrolled (liveness-covered), yet labelable from in-DB history.
     assert await _fetch_enrollments(db) == []
     await _insert_vhc(db, "covered-coin", 1.30, emitted + timedelta(minutes=16))
     await _insert_vhc(db, "covered-coin", 1.50, emitted + timedelta(minutes=61))
@@ -1147,3 +1244,4 @@ def test_settings_ledger_defaults(settings_factory):
     assert settings.LEDGER_PRICE_CACHE_MAX_LATENESS_MINUTES == 120
     assert settings.LEDGER_ENROLLMENT_TTL_DAYS == 7
     assert settings.LEDGER_ENROLLMENT_MAX_ACTIVE == 200
+    assert settings.LEDGER_COVERAGE_FRESHNESS_MIN == 60
