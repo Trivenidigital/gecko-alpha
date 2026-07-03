@@ -8,6 +8,19 @@ WorkingDirectory=/root/gecko-alpha
 ExecStart=/root/.local/bin/uv run uvicorn dashboard.main:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=10
+# Deterministic stop (deploy-#2 window race fix, 2026-07-03). uvicorn runs a
+# child worker tree under `uv run`; the systemd defaults (KillMode=control-group
+# + DefaultTimeoutStopSec=90s) let a stuck stop hang ~90s
+# ("Failed to kill control group, Invalid argument") and finish with a 'timeout'
+# result -- which Restart=always then treats as an unexpected termination and
+# auto-restarts, defeating the engine-stopped migration window.
+#   KillMode=mixed    -> SIGTERM to the main process, SIGKILL to the whole cgroup
+#                        on timeout, so the uvicorn workers are actually reaped.
+#   TimeoutStopSec=20 -> bound the escalation to SIGKILL at 20s so a stuck stop
+#                        fails fast as a CLEAN stop (which does NOT re-trigger
+#                        Restart=always) instead of a 90s 'timeout' failure.
+KillMode=mixed
+TimeoutStopSec=20
 Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
