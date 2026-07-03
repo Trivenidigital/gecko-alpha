@@ -30,6 +30,10 @@ uv sync && find . -name __pycache__ -type d -exec rm -rf {} +
 systemctl daemon-reload                             # for #422 unit change
 systemctl restart gecko-pipeline                    # boot runs the #424 column-add (live-safe, <1s)
 systemctl restart gecko-dashboard                   # picks up #422 KillMode=mixed/TimeoutStopSec=20 + recall-lane dashboard reads
+# --- export-script exec-bit closure (the untracked-copy trap, condition b) ---
+ls -l scripts/ledger-eviction-export.sh             # MUST show -rwxr-xr-x (tracked +x via #419 lands on checkout)
+bash scripts/ledger-eviction-export.sh              # one manual run — expect: ledger_eviction_export_run status=ok appended=0
+#   (OR quote the next Monday-04:15 tick log line from /var/log/gecko-alpha-ledger-eviction-export.log)
 ```
 
 ## Post-deploy verification
@@ -43,8 +47,8 @@ systemctl show gecko-dashboard -p KillMode -p TimeoutStopSec   # KillMode=mixed,
 # 3. Recall lane (#421) live: dispatcher-suppressed rows begin appearing in the ledger
 sqlite3 scout.db "SELECT COUNT(*) FROM signal_outcome_ledger WHERE json_extract(gate_verdicts,'$.source_layer')='dispatcher';"   # >0 within a cycle or two
 
-# 4. Liveness coverage (#423): enrollment stays bounded (measured 48/7d dead-suppressed enroll)
-sqlite3 scout.db "SELECT COUNT(*) FROM ledger_enrollments;"    # << 200 cap
+# 4. Liveness coverage (#423): a FRESH-covered token stamps not_needed (not enrolled) — one such row
+sqlite3 scout.db "SELECT COUNT(*) FROM signal_outcome_ledger WHERE enrollment_status='not_needed';"   # >0 = liveness gate working (fresh-covered tokens skip enrollment); enrollments stay << 200 cap
 
 # 5. Heartbeat (#420): poll/label heartbeat every pass even when empty
 journalctl -u gecko-pipeline --since '-15 min' | grep -cE "ledger_poll_heartbeat|ledger_label_heartbeat"   # >=1
@@ -57,6 +61,9 @@ sqlite3 -header scout.db "SELECT combo_key, suppressed, perm_suppression_alerted
 journalctl -u gecko-pipeline --since '-1 day' | grep permanent_suppression_alert_delivered
 #    Each alert fires ONCE (deduped). These convert silent artifact-latch → visible operator decision.
 ```
+
+# 7. Exec-bit spot-check (#419 guard, post-checkout): every cron-invoked script executable
+for f in held-position-price-watchdog revival-verdict-watchdog acceleration-heartbeat-watchdog ledger-eviction-export; do ls -l scripts/$f.sh | cut -c1-11; done   # all -rwxr-xr-x
 
 ## Rollback
 `git checkout <prior pin>` + pycache clear + `daemon-reload` + restart both. The perm_suppression_alerted_at column is additive/nullable — leave it. Ledger tables/columns from #406 are already live (deploy-#2) and unaffected.
