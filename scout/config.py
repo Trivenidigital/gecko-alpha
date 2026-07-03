@@ -48,6 +48,17 @@ class Settings(BaseSettings):
     # 1-in-N sampling of blocked trade_decision emissions (0 = off). le=1e5
     # admits "effectively off" without the 0 sentinel.
     LEDGER_GATED_OUT_SAMPLE_RATE: int = Field(default=25, ge=0, le=100_000)
+    # Dispatcher-layer suppressed-block recording (edge audit Phase 3). The
+    # engine's GatedOutSampler covers only engine-level blocks; dispatcher
+    # suppression (scout/trading/signals.py should_open -> reason='suppressed')
+    # is a DIFFERENT path that never reaches that sampler, yet it is the
+    # dominant winner-killer (12 of 24 >=5x winners). Recorded AT EMISSION,
+    # NOT 1-in-N sampled — every suppressed block is the priority cohort, so
+    # the gate-counterfactual / recall lane sees the exact block class that
+    # killed those winners before the reopening experiment measures recall.
+    # Gated by this flag AND LEDGER_ENABLED (global kill switch); flag lets
+    # the lane be disabled without touching the rest of the ledger.
+    LEDGER_SAMPLE_SUPPRESSED: bool = True
     # Max pending/partial rows examined per hourly labeling pass — bounds the
     # per-pass read/write load on the hot-loop DB connection.
     LEDGER_LABEL_BATCH_MAX: int = Field(default=500, ge=1, le=100_000)
