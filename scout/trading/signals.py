@@ -12,12 +12,85 @@ one-off signal queries would add complexity without benefit.
 import structlog
 
 from scout.db import Database
+from scout.outcome_ledger import (
+    liquidity_from_signal_data,
+    record_emission as _ledger_record_emission,
+)
 from scout.spikes.models import VolumeSpike
 from scout.trading.combo_key import build_combo_key
 from scout.trading.decision_events import emit_trade_decision
 from scout.trading.suppression import should_open
 
 logger = structlog.get_logger()
+
+
+async def _record_suppressed_ledger_emission(
+    db: Database,
+    settings,
+    *,
+    signal_type: str,
+    token_id: str | None,
+    combo_key: str,
+    suppression_reason: str,
+    price: float | None = None,
+    signal_data: dict | None = None,
+) -> None:
+    """Record a dispatcher-layer suppressed block into signal_outcome_ledger.
+
+    Why this exists (edge audit 2026-07-02, Phase 3 — tasks/
+    gecko-alpha-fable-review_2026_07.md): the engine's GatedOutSampler lane
+    (scout/trading/engine.py :func:`_emit_decision`) samples ONLY engine-level
+    blocked decisions. Dispatcher-layer suppression — ``should_open`` returning
+    ``allow=False`` here in signals.py, surfaced as ``reason='suppressed'`` — is
+    a DIFFERENT path that never reaches the engine's sampler. That block class
+    is the DOMINANT winner-killer (12 of 24 >=5x winners), so the
+    gate-counterfactual / recall lane was blind to exactly the population that
+    matters. This makes those blocks visible to the ledger BEFORE the reopening
+    experiment measures recall.
+
+    Record-AT-EMISSION, not 1-in-N sampled: every suppressed block is the
+    priority cohort, so ALL of them are recorded when the lane is on. The flag
+    lets the whole lane be disabled without disturbing the rest of the ledger.
+
+    ``gate_verdicts`` carries ``reason='suppressed'`` + ``source_layer=
+    'dispatcher'`` so analysis can cleanly separate this population from
+    engine-level blocks (which keep their own ``reason``), plus the ``combo_key``
+    and the underlying ``should_open`` verdict for per-combo attribution.
+
+    Observability, not control flow: NEVER raises. ``record_emission`` is
+    already fail-soft; the try/except is belt-and-braces so a ledger bug can
+    NEVER break the suppression / dispatch path. Respects
+    ``LEDGER_SAMPLE_SUPPRESSED`` (this lane) AND ``LEDGER_ENABLED`` (global kill
+    switch, enforced inside ``record_emission``).
+    """
+    if not getattr(settings, "LEDGER_SAMPLE_SUPPRESSED", True):
+        return
+    try:
+        liq, liq_src = liquidity_from_signal_data(signal_data)
+        await _ledger_record_emission(
+            db,
+            settings,
+            kind="gated_out_sample",
+            token_id=token_id,
+            surface=signal_type,
+            price=price if price is not None and price > 0 else None,
+            liquidity=liq,
+            liquidity_source=liq_src,
+            gate_verdicts={
+                "reason": "suppressed",
+                "source_layer": "dispatcher",
+                "combo_key": combo_key,
+                "suppression_reason": suppression_reason,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "ledger_record_failed",
+            site="dispatcher_suppressed",
+            token_id=token_id,
+            signal_type=signal_type,
+            error=str(exc),
+        )
 
 
 def _row_get(row, key: str):
@@ -88,6 +161,19 @@ async def trade_volume_spikes(
                     reason=reason,
                     coin_id=spike.coin_id,
                     signal_type="volume_spike",
+                )
+                await _record_suppressed_ledger_emission(
+                    db,
+                    settings,
+                    signal_type="volume_spike",
+                    token_id=spike.coin_id,
+                    combo_key=combo_key,
+                    suppression_reason=reason,
+                    price=spike.price,
+                    signal_data={
+                        "spike_ratio": spike.spike_ratio,
+                        "mcap": spike.market_cap,
+                    },
                 )
                 continue
             await engine.open_trade(
@@ -249,6 +335,19 @@ async def trade_gainers(
                         signal_combo=combo_key,
                         suppression_reason=reason,
                     )
+                    await _record_suppressed_ledger_emission(
+                        db,
+                        settings,
+                        signal_type="gainers_early",
+                        token_id=g["coin_id"],
+                        combo_key=combo_key,
+                        suppression_reason=reason,
+                        price=g["price_at_snapshot"],
+                        signal_data={
+                            "price_change_24h": g["price_change_24h"],
+                            "mcap": g["market_cap"],
+                        },
+                    )
                     continue
                 await engine.open_trade(
                     token_id=g["coin_id"],
@@ -384,6 +483,19 @@ async def trade_slow_burn(
                     signal_combo=combo_key,
                     suppression_reason=reason,
                 )
+                await _record_suppressed_ledger_emission(
+                    db,
+                    settings,
+                    signal_type="slow_burn",
+                    token_id=r["coin_id"],
+                    combo_key=combo_key,
+                    suppression_reason=reason,
+                    price=entry_price,
+                    signal_data={
+                        "price_change_7d": r["price_change_7d"],
+                        "mcap": r["market_cap"],
+                    },
+                )
                 continue
             await engine.open_trade(
                 token_id=r["coin_id"],
@@ -507,6 +619,19 @@ async def trade_losers(
                         signal_combo=combo_key,
                         suppression_reason=reason,
                     )
+                    await _record_suppressed_ledger_emission(
+                        db,
+                        settings,
+                        signal_type="losers_contrarian",
+                        token_id=l["coin_id"],
+                        combo_key=combo_key,
+                        suppression_reason=reason,
+                        price=l["price_at_snapshot"],
+                        signal_data={
+                            "price_change_24h": l["price_change_24h"],
+                            "mcap": l["market_cap"],
+                        },
+                    )
                     continue
                 loser_price = l["price_at_snapshot"]
                 if not loser_price:
@@ -602,6 +727,19 @@ async def trade_first_signals(
                     reason=reason,
                     coin_id=token.contract_address,
                     signal_type="first_signal",
+                )
+                await _record_suppressed_ledger_emission(
+                    db,
+                    settings,
+                    signal_type="first_signal",
+                    token_id=token.contract_address,
+                    combo_key=combo_key,
+                    suppression_reason=reason,
+                    price=None,
+                    signal_data={
+                        "quant_score": quant_score,
+                        "signals": signals_fired,
+                    },
                 )
                 continue
             pc = await db._conn.execute(
@@ -765,6 +903,19 @@ async def trade_trending(
                         reason="suppressed",
                         signal_combo=combo_key,
                         suppression_reason=reason,
+                    )
+                    await _record_suppressed_ledger_emission(
+                        db,
+                        settings,
+                        signal_type="trending_catch",
+                        token_id=t["coin_id"],
+                        combo_key=combo_key,
+                        suppression_reason=reason,
+                        price=t["current_price"],
+                        signal_data={
+                            "source": "trending_snapshot",
+                            "mcap_rank": rank,
+                        },
                     )
                     continue
                 trending_price = t["current_price"]
@@ -1039,6 +1190,20 @@ async def trade_predictions(
                     coin_id=pred.coin_id,
                     signal_type="narrative_prediction",
                 )
+                await _record_suppressed_ledger_emission(
+                    db,
+                    settings,
+                    signal_type="narrative_prediction",
+                    token_id=pred.coin_id,
+                    combo_key=combo_key,
+                    suppression_reason=reason,
+                    price=None,
+                    signal_data={
+                        "fit": pred.narrative_fit_score,
+                        "category": pred.category_name,
+                        "mcap": pred.market_cap_at_prediction,
+                    },
+                )
                 continue
             pc = await db._conn.execute(
                 "SELECT current_price FROM price_cache WHERE coin_id = ?",
@@ -1113,6 +1278,19 @@ async def trade_chain_completions(engine, db: Database, *, settings) -> None:
                         reason=reason,
                         coin_id=c["token_id"],
                         signal_type="chain_completed",
+                    )
+                    await _record_suppressed_ledger_emission(
+                        db,
+                        settings,
+                        signal_type="chain_completed",
+                        token_id=c["token_id"],
+                        combo_key=combo_key,
+                        suppression_reason=reason,
+                        price=None,
+                        signal_data={
+                            "pattern": c["pattern_name"],
+                            "boost": c["conviction_boost"],
+                        },
                     )
                     continue
                 pc = await db._conn.execute(
