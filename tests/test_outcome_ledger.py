@@ -683,8 +683,14 @@ async def test_engine_blocked_path_samples_gated_out(db, settings_factory):
         assert verdicts["sample_rate"] == 3
         # c1: no anchor price for this blocked path -> age NULL.
         assert row["anchor_cache_age_seconds"] is None
-        # c2: gated_out samples always enroll.
-        assert row["enrollment_status"] == "enrolled"
+        # coverage-gated enrollment (fix/ledger-coverage-gated-enrollment):
+        # the engine dispatches token_id="tok" (CG-slug shape -> is_cg_coin_id
+        # True -> in-DB-covered), so it records the gated_out row but does NOT
+        # enroll and stamps 'not_needed'. This mirrors prod: the CG-sourced
+        # dispatch signals (chain_completed/gainers_early/losers_contrarian/
+        # volume_spike) suppress CG-slug tokens that are already labelable
+        # from volume_history_cg, so they must not churn the 200-cap.
+        assert row["enrollment_status"] == "not_needed"
 
 
 async def test_engine_blocked_sampler_rate_zero_records_nothing(db, settings_factory):
@@ -785,13 +791,19 @@ async def test_migration_creates_ledger_enrollments(db):
         assert col in row["sql"], col
 
 
-async def test_gated_out_sample_enrolls_token(db):
+async def test_gated_out_untracked_enrolls_token(db):
+    """coverage-gated enrollment (fix/ledger-coverage-gated-enrollment):
+    an UNTRACKED token (no in-DB coverage — here a dex: id) still enrolls at
+    TTL and stamps 'enrolled'. CG-slug tokens no longer enroll (they are
+    in-DB-covered); the CG-slug negative case is
+    test_gated_out_cg_slug_covered_does_not_enroll below."""
+    token_id = "dex:ethereum:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
     await record_emission(
         db,
         _ledger_settings(),
         kind="gated_out_sample",
-        token_id="micro-cap-coin",
-        surface="gainers_early",
+        token_id=token_id,
+        surface="tg_social",
         price=None,
         liquidity=None,
         liquidity_source="none",
@@ -800,14 +812,91 @@ async def test_gated_out_sample_enrolls_token(db):
     rows = await _fetch_enrollments(db)
     assert len(rows) == 1
     row = rows[0]
-    assert row["token_id"] == "micro-cap-coin"
-    assert row["namespace"] == "cg"
+    assert row["token_id"] == token_id
+    assert row["namespace"] == "dex"
     expires = datetime.fromisoformat(row["expires_at"])
     enrolled = datetime.fromisoformat(row["enrolled_at"])
     assert abs((expires - enrolled) - timedelta(days=7)).total_seconds() < 60
     # c2: enrollment outcome stamped on the ledger row itself.
     ledger_row = (await _fetch_rows(db))[0]
     assert ledger_row["enrollment_status"] == "enrolled"
+
+
+async def test_gated_out_cg_slug_covered_does_not_enroll(db):
+    """Negative-regression (fix/ledger-coverage-gated-enrollment): a
+    gated_out_sample for a CG-slug token is in-DB-covered (is_cg_coin_id) —
+    it records the ledger row but does NOT enroll (no 200-cap churn), and the
+    ledger row stamps 'not_needed', not 'enrolled'. Analysis distinguishes
+    covered-suppressed (kind=gated_out_sample, status=not_needed) from
+    untracked-suppressed (status=enrolled) directly on the stamp."""
+    await record_emission(
+        db,
+        _ledger_settings(),
+        kind="gated_out_sample",
+        token_id="micro-cap-coin",  # CG-slug shape -> in-DB-covered
+        surface="gainers_early",
+        price=None,
+        liquidity=None,
+        liquidity_source="none",
+        gate_verdicts={"reason": "below_min_mcap"},
+    )
+    assert await _fetch_enrollments(db) == []  # cap untouched
+    ledger_row = (await _fetch_rows(db))[0]
+    assert ledger_row["kind"] == "gated_out_sample"
+    assert ledger_row["enrollment_status"] == "not_needed"
+
+
+async def test_gated_out_price_cache_covered_does_not_enroll(db):
+    """A token that is NOT a CG-slug but already has a price_cache row is
+    in-DB-covered too -> no enrollment, stamp 'not_needed'."""
+    token_id = "dex:base:0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    await _insert_price_cache(db, token_id, 0.42, _now())
+    await record_emission(
+        db,
+        _ledger_settings(),
+        kind="gated_out_sample",
+        token_id=token_id,
+        surface="tg_social",
+        price=None,
+        liquidity=None,
+        liquidity_source="none",
+        gate_verdicts={"reason": "below_min_mcap"},
+    )
+    assert await _fetch_enrollments(db) == []
+    assert (await _fetch_rows(db))[0]["enrollment_status"] == "not_needed"
+
+
+async def test_labeler_labels_covered_cg_slug_row_without_enrollment(db):
+    """Operator condition (fix/ledger-coverage-gated-enrollment): a covered
+    (non-enrolled) CG-slug gated_out row is STILL labeled — label_pending
+    resolves prices from volume_history_cg for any pending row keyed on its
+    token_id, independent of ledger_enrollments. Enrollment only drives the
+    poller for the untracked cohort; it is never a precondition for labeling."""
+    emitted = _now() - timedelta(hours=2)
+    await record_emission(
+        db,
+        _ledger_settings(),
+        kind="gated_out_sample",
+        token_id="covered-coin",  # CG-slug -> not enrolled
+        surface="gainers_early",
+        price=1.0,
+        liquidity=None,
+        liquidity_source="none",
+        gate_verdicts={"reason": "below_min_mcap"},
+        emitted_at=_iso(emitted),
+    )
+    # Not enrolled (covered), yet labelable from in-DB history.
+    assert await _fetch_enrollments(db) == []
+    await _insert_vhc(db, "covered-coin", 1.30, emitted + timedelta(minutes=16))
+    await _insert_vhc(db, "covered-coin", 1.50, emitted + timedelta(minutes=61))
+
+    stats = await label_pending(db, _ledger_settings())
+    assert stats["n_labeled"] == 1
+    row = (await _fetch_rows(db))[0]
+    assert row["enrollment_status"] == "not_needed"
+    assert row["r15m"] == pytest.approx(0.30)
+    assert row["r1h"] == pytest.approx(0.50)
+    assert row["label_status"] == "partial"
 
 
 async def test_dex_namespace_classified(db):
@@ -875,14 +964,17 @@ async def test_priced_dispatch_does_not_enroll(db):
 
 
 async def test_reenrollment_refreshes_ttl_preserves_enrolled_at(db):
-    """UPSERT (not REPLACE, #325): re-emission extends expires_at only."""
+    """UPSERT (not REPLACE, #325): re-emission extends expires_at only.
+
+    Uses an untracked (dex:) token — coverage-gated enrollment means CG-slug
+    tokens no longer enroll (fix/ledger-coverage-gated-enrollment)."""
     settings = _ledger_settings(LEDGER_ENROLLMENT_TTL_DAYS=1)
     for _ in range(2):
         await record_emission(
             db,
             settings,
             kind="gated_out_sample",
-            token_id="tok",
+            token_id="dex:ethereum:0xreenroll",
             surface="s",
             price=None,
             liquidity=None,
@@ -899,13 +991,16 @@ async def test_reenrollment_refreshes_ttl_preserves_enrolled_at(db):
 
 
 async def test_enrollment_cap_evicts_oldest_expiring_first(db):
+    # Untracked (dex:) tokens — coverage-gated enrollment means CG-slug tokens
+    # no longer enroll (fix/ledger-coverage-gated-enrollment).
     settings = _ledger_settings(LEDGER_ENROLLMENT_MAX_ACTIVE=3)
-    for i in range(4):
+    ids = [f"dex:ethereum:0xtok{i}" for i in range(4)]
+    for tid in ids:
         await record_emission(
             db,
             settings,
             kind="gated_out_sample",
-            token_id=f"tok{i}",
+            token_id=tid,
             surface="s",
             price=None,
             liquidity=None,
@@ -915,7 +1010,7 @@ async def test_enrollment_cap_evicts_oldest_expiring_first(db):
     rows = await _fetch_enrollments(db)
     assert len(rows) == 3
     # tok0 enrolled first -> earliest expires_at -> evicted first.
-    assert [r["token_id"] for r in rows] == ["tok1", "tok2", "tok3"]
+    assert [r["token_id"] for r in rows] == ids[1:]
     # c2: the new enrollment always lands, so 'skipped_cap' is unreachable —
     # every row (including the evicted token's) is stamped 'enrolled'; the
     # ledger_enrollment_evicted log (asserted separately) is the censoring
@@ -934,7 +1029,10 @@ async def test_enrollment_cap_eviction_emits_named_log(db, monkeypatch):
     monkeypatch.setattr(ol, "log", capture)
 
     settings = _ledger_settings(LEDGER_ENROLLMENT_MAX_ACTIVE=1)
-    for token in ("tok-a", "tok-b"):
+    # Untracked (dex:) tokens — coverage-gated enrollment means CG-slug tokens
+    # no longer enroll (fix/ledger-coverage-gated-enrollment).
+    tok_a, tok_b = "dex:ethereum:0xtoka", "dex:ethereum:0xtokb"
+    for token in (tok_a, tok_b):
         await record_emission(
             db,
             settings,
@@ -954,11 +1052,11 @@ async def test_enrollment_cap_eviction_emits_named_log(db, monkeypatch):
     ]
     assert len(evict_calls) == 1
     kwargs = evict_calls[0].kwargs
-    assert kwargs["evicted_token_ids"] == ["tok-a"]
+    assert kwargs["evicted_token_ids"] == [tok_a]
     assert kwargs["n_evicted"] == 1
-    assert kwargs["evicted_for"] == "tok-b"
+    assert kwargs["evicted_for"] == tok_b
     # Only tok-b remains enrolled.
-    assert [r["token_id"] for r in await _fetch_enrollments(db)] == ["tok-b"]
+    assert [r["token_id"] for r in await _fetch_enrollments(db)] == [tok_b]
 
 
 async def test_purge_expired_enrollments_ttl(db):
@@ -1003,29 +1101,32 @@ async def test_enrollment_respects_kill_switch(db):
 
 
 async def test_labeler_labels_enrolled_only_token_via_price_cache(db):
-    """End-to-end (minus HTTP): a gated-out token with NO volume_history_cg
-    coverage gets enrolled, the poller's write lands in price_cache (written
-    directly here — HTTP shape covered in tests/test_outcome_ledger_poller.py),
-    and the labeler prices the horizon from that write."""
+    """End-to-end (minus HTTP): an UNTRACKED gated-out token (dex: id, no
+    in-DB coverage) gets enrolled, the poller's write lands in price_cache
+    (written directly here — HTTP shape covered in
+    tests/test_outcome_ledger_poller.py), and the labeler prices the horizon
+    from that write. Coverage-gated enrollment
+    (fix/ledger-coverage-gated-enrollment): only untracked tokens enroll, so
+    the enrollment poller lane exists precisely for this cohort."""
+    token_id = "dex:solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
     emitted = _now() - timedelta(minutes=20)
     await record_emission(
         db,
         _ledger_settings(),
         kind="gated_out_sample",
-        token_id="enrolled-only",
-        surface="gainers_early",
+        token_id=token_id,
+        surface="tg_social",
         price=1.0,
         liquidity=None,
         liquidity_source="none",
-        gate_verdicts={"reason": "below_min_mcap"},
+        gate_verdicts={"reason": "unpriceable_token_id"},
         emitted_at=_iso(emitted),
     )
-    # price=1.0 given -> not enrolled by the price rule; force via kind: it IS
-    # a gated_out_sample so it enrolled regardless.
-    assert [r["token_id"] for r in await _fetch_enrollments(db)] == ["enrolled-only"]
+    # Untracked -> enrolled even though a price was supplied (kind rule).
+    assert [r["token_id"] for r in await _fetch_enrollments(db)] == [token_id]
 
     # Simulate the per-cycle poller write (db.cache_prices path).
-    await db.cache_prices([{"id": "enrolled-only", "current_price": 1.4}])
+    await db.cache_prices([{"id": token_id, "current_price": 1.4}])
 
     await label_pending(db, _ledger_settings())
     row = (await _fetch_rows(db))[0]

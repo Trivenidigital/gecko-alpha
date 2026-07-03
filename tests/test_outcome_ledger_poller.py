@@ -58,6 +58,12 @@ def _ledger_settings(settings_factory, **overrides):
 async def _enroll_via_gated_out(
     db, settings, token_id: str, *, price=None, emitted_at: str | None = None
 ) -> None:
+    """Record a gated_out_sample. NOTE (coverage-gated enrollment,
+    fix/ledger-coverage-gated-enrollment): this only ENROLLS *token_id* when it
+    is UNTRACKED (not a CG-slug id and no existing price_cache row) — e.g. a
+    dex: id. CG-slug tokens are in-DB-covered and no longer enroll; tests that
+    need a CG-namespace enrollment in the poll set seed it via
+    :func:`_seed_enrollment`."""
     row_id = await record_emission(
         db,
         settings,
@@ -73,11 +79,29 @@ async def _enroll_via_gated_out(
     assert row_id is not None
 
 
+async def _seed_enrollment(db, token_id: str, namespace: str = "cg") -> None:
+    """Insert a ledger_enrollments row directly (bypassing the coverage-gated
+    record_emission decision) so the poller mechanism can be exercised for the
+    CG namespace, which no longer auto-enrolls under coverage-gated
+    enrollment."""
+    now = datetime.now(timezone.utc)
+    await db._conn.execute(
+        "INSERT INTO ledger_enrollments (token_id, namespace, enrolled_at, expires_at) "
+        "VALUES (?, ?, ?, ?)",
+        (token_id, namespace, now.isoformat(), (now + timedelta(days=7)).isoformat()),
+    )
+    await db._conn.commit()
+
+
 async def test_poll_enrollments_cg_batch_call_shape(db, settings_factory):
-    """All enrolled CG ids ride ONE batched /simple/price call per cycle."""
+    """All enrolled CG ids ride ONE batched /simple/price call per cycle.
+
+    Coverage-gated enrollment (fix/ledger-coverage-gated-enrollment) stops
+    CG-slug tokens from auto-enrolling, so seed the CG poll set directly to
+    exercise the (unchanged) batched /simple/price poller mechanism."""
     settings = _ledger_settings(settings_factory)
-    await _enroll_via_gated_out(db, settings, "micro-alpha")
-    await _enroll_via_gated_out(db, settings, "micro-beta")
+    await _seed_enrollment(db, "micro-alpha", "cg")
+    await _seed_enrollment(db, "micro-beta", "cg")
 
     async with aiohttp.ClientSession() as session:
         with aioresponses() as m:
@@ -140,14 +164,20 @@ async def test_poll_dex_enrollment_writes_readable_price(db, settings_factory):
 
 
 async def test_poller_then_labeler_labels_enrolled_only_token(db, settings_factory):
-    """End-to-end: a gated-out token with NO tracked-lane coverage is
-    enrolled at emission, priced by the poller, and labeled by the hourly
-    pass — the missed-winner recall lane becomes measurable."""
+    """End-to-end: an enrolled token is priced by the poller and labeled by
+    the hourly pass — the missed-winner recall lane becomes measurable.
+
+    The ledger row is recorded via record_emission; the CG enrollment is
+    seeded directly because coverage-gated enrollment
+    (fix/ledger-coverage-gated-enrollment) no longer auto-enrolls CG-slug
+    tokens. Labeling is independent of enrollment either way — label_pending
+    resolves prices for any pending row keyed on its token_id."""
     settings = _ledger_settings(settings_factory)
     emitted = datetime.now(timezone.utc) - timedelta(minutes=20)
     await _enroll_via_gated_out(
         db, settings, "orphan-coin", price=1.0, emitted_at=emitted.isoformat()
     )
+    await _seed_enrollment(db, "orphan-coin", "cg")
 
     async with aiohttp.ClientSession() as session:
         with aioresponses() as m:
@@ -165,7 +195,7 @@ async def test_poller_then_labeler_labels_enrolled_only_token(db, settings_facto
 
 async def test_poll_enrollments_kill_switch_no_http(db, settings_factory):
     settings = _ledger_settings(settings_factory)
-    await _enroll_via_gated_out(db, settings, "micro-alpha")
+    await _seed_enrollment(db, "micro-alpha", "cg")  # coverage-gated: seed directly
 
     disabled = _ledger_settings(settings_factory, LEDGER_ENABLED=False)
     async with aiohttp.ClientSession() as session:
@@ -203,7 +233,7 @@ async def test_poll_enrollments_purges_expired_rows(db, settings_factory):
 
 async def test_poll_enrollments_http_failure_never_raises(db, settings_factory):
     settings = _ledger_settings(settings_factory)
-    await _enroll_via_gated_out(db, settings, "micro-alpha")
+    await _seed_enrollment(db, "micro-alpha", "cg")  # coverage-gated: seed directly
     addr = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
     await _enroll_via_gated_out(db, settings, f"dex:solana:{addr}")
 

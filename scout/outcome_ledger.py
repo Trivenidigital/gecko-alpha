@@ -114,6 +114,48 @@ def _namespace_for(token_id: str) -> str:
     return "other"
 
 
+async def _has_indb_price_coverage(db: Database, token_id: str) -> bool:
+    """True iff *token_id* is already priceable from IN-DB sources WITHOUT
+    enrollment — so the forward-polling set (the enrollment lane) should skip
+    it.
+
+    A token is in-DB-covered iff:
+    - ``is_cg_coin_id(token_id)`` — a CG-slug id served by the CG ingestion
+      lanes; its price history flows into volume_history_cg without any
+      poller, OR
+    - a ``price_cache`` row already exists for it — another writer already
+      covers it.
+
+    Rationale (coverage-gated enrollment, 2026-07-03 operator finding on
+    PR #421): the enrollment set is capped at LEDGER_ENROLLMENT_MAX_ACTIVE
+    (200, evict-oldest). Prod measured 153,113 dispatcher-suppressed blocks
+    over 14d across 300 DISTINCT token_ids (~150 per 7d TTL window); most are
+    CG-slug (chain_completed / gainers_early / losers_contrarian /
+    volume_spike are CG-sourced) and ALREADY labelable from volume_history_cg.
+    Enrolling them consumed ~75% of the cap and EVICTED the untracked
+    micro-cap / dex cohort the recall lane exists to measure. Gating
+    enrollment on "no in-DB coverage" targets the poller at exactly the
+    untracked cohort, for ALL gated_out samples (not just PR #421's).
+
+    Fail-soft: never raises. On any error returns False (= "no coverage" ->
+    enroll), preserving the prior conservative behavior of not silently
+    dropping a possibly-untracked token from the measurement lane.
+    """
+    if is_cg_coin_id(token_id):
+        return True
+    try:
+        conn = db._conn
+        if conn is None:
+            return False
+        cur = await conn.execute(
+            "SELECT 1 FROM price_cache WHERE coin_id = ? LIMIT 1", (token_id,)
+        )
+        return (await cur.fetchone()) is not None
+    except Exception as exc:
+        log.warning("ledger_coverage_check_failed", token_id=token_id, error=str(exc))
+        return False
+
+
 async def _enroll_token_locked(
     conn: Any, token_id: str, settings: Any, now: datetime
 ) -> None:
@@ -279,7 +321,21 @@ async def record_emission(
         # evict-oldest-to-make-room semantics the new enrollment always
         # lands, so the stamp is binary here ('skipped_cap' stays reserved
         # in the CHECK for a future no-eviction policy).
-        enroll_needed = kind == "gated_out_sample" or price is None
+        #
+        # Coverage-gated enrollment (2026-07-03, PR #421 finding): enroll ONLY
+        # tokens with NO in-DB price coverage. A CG-slug token (is_cg_coin_id)
+        # or one that already has a price_cache row is labelable WITHOUT the
+        # poller, so enrolling it just churns the LEDGER_ENROLLMENT_MAX_ACTIVE
+        # cap and evicts the untracked cohort the recall lane measures. A
+        # covered gated_out_sample therefore stamps 'not_needed' (per #406
+        # semantics: "token has in-DB coverage"); only genuinely-untracked
+        # ones stamp 'enrolled'. Analysis still separates covered-suppressed
+        # (kind=gated_out_sample, status=not_needed) from untracked-suppressed
+        # (status=enrolled) on the stamp, and can further split covered rows
+        # via is_cg_coin_id at read time. Applies to ALL gated_out samples and
+        # priceless emissions, not just PR #421's dispatcher-suppressed blocks.
+        enroll_base = kind == "gated_out_sample" or price is None
+        enroll_needed = enroll_base and not await _has_indb_price_coverage(db, token_id)
         enrollment_status = "enrolled" if enroll_needed else "not_needed"
         async with db._txn_lock:
             cur = await conn.execute(
@@ -304,12 +360,15 @@ async def record_emission(
             )
             # Enrollment-at-emission: in-DB-only labeling cannot price
             # tokens the tracked lanes never carry (below-min-mcap
-            # micro-caps in gated_out samples, priceless alerts). Without
-            # forward polling those rows are STRUCTURALLY unlabelable and
-            # the missed-winner recall lane is unmeasurable. gated_out
-            # samples always enroll (their tokens are the untracked cohort
-            # by construction); other kinds enroll only when the emitting
-            # site had no price (= no in-DB coverage signal).
+            # micro-caps, dex:/bare-address ids in gated_out samples,
+            # priceless alerts). Without forward polling those rows are
+            # STRUCTURALLY unlabelable and the missed-winner recall lane is
+            # unmeasurable. Enrollment is now coverage-gated (see the
+            # enroll_needed derivation above): a gated_out sample or
+            # priceless emission enrolls ONLY when the token has no in-DB
+            # price coverage (not a CG-slug id and no existing price_cache
+            # row); CG-covered tokens label from volume_history_cg without
+            # the poller and must not churn the enrollment cap.
             if enroll_needed:
                 await _enroll_token_locked(
                     conn, token_id, settings, datetime.now(timezone.utc)
