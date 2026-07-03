@@ -1918,9 +1918,24 @@ class Database:
                     parole_trades_remaining INTEGER,
                     refresh_failures INTEGER NOT NULL DEFAULT 0,
                     last_refreshed TEXT NOT NULL,
+                    -- fix/frozen-suppression-lock: dedup marker for the §12b
+                    -- permanent-suppression alert. Set once when a suppressed
+                    -- combo with no trade in the refresh window is alerted;
+                    -- cleared (re-armed) when the combo leaves that state.
+                    perm_suppression_alerted_at TEXT,
                     PRIMARY KEY (combo_key, window)
                 )
             """)
+            # Additive migration for existing DBs — CREATE TABLE IF NOT EXISTS
+            # above is a no-op when combo_performance already exists, so the new
+            # perm_suppression_alerted_at column must be ALTER-ed in explicitly.
+            cur_cp = await conn.execute("PRAGMA table_info(combo_performance)")
+            cp_cols = {row[1] for row in await cur_cp.fetchall()}
+            if "perm_suppression_alerted_at" not in cp_cols:
+                await conn.execute(
+                    "ALTER TABLE combo_performance "
+                    "ADD COLUMN perm_suppression_alerted_at TEXT"
+                )
 
             expected_cols = {
                 "signal_combo": "TEXT",
