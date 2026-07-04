@@ -319,3 +319,28 @@ reachability table for projects absent from gecko-alpha. Grep returned 0/5
 marker matches; the deliverable was refused, the refusal surfaced and routed
 to the owning session. A pattern-matching agent would have produced a
 confident table for projects that don't exist.
+
+### String-compared datetimes must share a format — off-by-one #4 (2026-07-04)
+
+A comparison operator does exactly what it's told, on representations nobody
+checked were comparable. `refresh_all` used
+`opened_at >= datetime('now','-30 days')` intending a strict timestamp `>=`.
+But SQLite compares these as TEXT, and the two sides use MISMATCHED formats:
+the stored column is ISO with a `T` separator + `+00:00` timezone
+(`"2026-06-04T02:31:52.497424+00:00"`); `datetime('now',...)` yields a
+space-separated, tz-less string (`"2026-06-04 03:04:08"`). At character 10,
+`'T'` (0x54) > `' '` (0x20), so on the boundary DAY the comparison keeps the
+row in-window regardless of time-of-day — the predicate behaves as `DATE() >=`
+by accident, an off-by-one of one whole day.
+
+This is off-by-one #4 in this engagement, and the purest of the species: the
+first three were design-level (a threshold above a documented ceiling; two
+mcap bands that never intersected; a refresh window that excludes its own
+parolees); this one is SUB-SEMANTIC — correct operator, incomparable operands.
+
+**Rule (cousin to the exec-bit CI guard — enforced, not remembered):**
+datetimes that will be string-compared must share a serialization format,
+normalized WHERE THEY ARE WRITTEN, not remembered where they are compared.
+Prefer comparing on `julianday()`/epoch, or normalize both sides to identical
+`strftime` output. Any `datetime('now',...)` compared against a stored ISO
+column is suspect until audited — tracked as BL-DATETIME-NORMALIZATION.

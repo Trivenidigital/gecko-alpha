@@ -54,12 +54,24 @@ sqlite3 scout.db "SELECT COUNT(*) FROM signal_outcome_ledger WHERE enrollment_st
 journalctl -u gecko-pipeline --since '-15 min' | grep -cE "ledger_poll_heartbeat|ledger_label_heartbeat"   # >=1
 
 # 6. FROZEN-LOCK RETROACTIVE VISIBILITY (#424, condition a): the first nightly refresh_all
-#    (03:00Z) after deploy alerts the pre-existing latched set. Expect §12b Telegram alerts +
-#    journal permanent_suppression_alert_delivered for gainers_early, losers_contrarian
-#    (latched since mid-May), and chain_completed once it latches (~07-04 03:00Z).
+#    (03:00Z) after deploy alerts the pre-existing latched set. COUNT IS DEPLOY-TIME-DEPENDENT
+#    (do NOT hardcode 3 — that false-fails): confirmed latched as of 2026-07-04 =
+#    gainers_early + losers_contrarian (=2); chain_completed joins ONLY after it exits the
+#    window at the 2026-07-05 ~03:00Z refresh (the T-vs-space boundary artifact keeps it
+#    in-window through all of 07-04 — see BL-DATETIME-NORMALIZATION). So the EXPECTED alert
+#    count = (number of combos with last_refreshed older than the refresh window at deploy
+#    time): 2 if deployed before 2026-07-05 03:00Z, 3 if after.
 sqlite3 -header scout.db "SELECT combo_key, suppressed, perm_suppression_alerted_at FROM combo_performance WHERE suppressed=1 AND perm_suppression_alerted_at IS NOT NULL;"
+#    Cross-check the expected count using the EXACT predicate #424's _process_permanent_suppression
+#    ships (shared predicate, so runbook and fix can't disagree about what counts as latched; both
+#    inherit the same T-vs-space boundary artifact — consistent-together — until
+#    BL-DATETIME-NORMALIZATION). Pre-deploy the perm_suppression_alerted_at column does not exist
+#    yet (added by #424's migration), so the predictive count omits that dedup clause (all rows are
+#    un-alerted pre-deploy anyway):
+sqlite3 scout.db "SELECT COUNT(*) AS expected_alerts FROM combo_performance cp WHERE cp.window='30d' AND cp.suppressed=1 AND NOT EXISTS (SELECT 1 FROM paper_trades pt WHERE pt.signal_combo=cp.combo_key AND pt.opened_at >= datetime('now','-30 days'));"
 journalctl -u gecko-pipeline --since '-1 day' | grep permanent_suppression_alert_delivered
-#    Each alert fires ONCE (deduped). These convert silent artifact-latch → visible operator decision.
+#    Assert the delivered count MATCHES that number (not a fixed 3). Each fires ONCE (deduped);
+#    converts silent artifact-latch → visible operator decision.
 ```
 
 # 7. Exec-bit spot-check (#419 guard, post-checkout): every cron-invoked script executable
