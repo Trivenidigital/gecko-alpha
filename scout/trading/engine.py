@@ -461,28 +461,73 @@ class TradingEngine:
             await _emit_decision("blocked", "cooldown", cooldown_count=row[0])
             return None
 
-        # 2c. Hard cap on concurrent open positions — prevents restart-bursts.
-        max_open = getattr(self.settings, "PAPER_MAX_OPEN_TRADES", 0) or 0
-        if max_open > 0:
-            cursor = await conn.execute(
-                "SELECT COUNT(*) FROM paper_trades WHERE status = 'open'"
-            )
-            row = await cursor.fetchone()
-            if row[0] >= max_open:
-                log.info(
-                    "trade_skipped_max_open_trades",
-                    token_id=token_id,
-                    signal_type=signal_type,
-                    open_count=row[0],
-                    max_open=max_open,
+        # 2c. Per-signal-type cap on concurrent open positions.
+        # First, check if per-signal-type caps are defined (new behavior).
+        # If any are non-zero, use them. Otherwise, fall back to global PAPER_MAX_OPEN_TRADES.
+        signal_type_cap_attr = f"PAPER_MAX_OPEN_{signal_type.upper()}"
+        signal_type_cap = getattr(self.settings, signal_type_cap_attr, 0) or 0
+
+        # Check if ANY per-signal-type cap is configured (non-zero).
+        # If so, apply per-signal-type logic. Otherwise, use global cap.
+        per_signal_enabled = any(
+            getattr(self.settings, f"PAPER_MAX_OPEN_{st.upper()}", 0)
+            for st in [
+                "TRENDING_CATCH",
+                "FIRST_SIGNAL",
+                "GAINERS_EARLY",
+                "NARRATIVE_PREDICTION",
+                "LOSERS_CONTRARIAN",
+            ]
+        )
+
+        if per_signal_enabled:
+            # Use per-signal-type cap
+            if signal_type_cap > 0:
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM paper_trades WHERE signal_type = ? AND status = 'open'",
+                    (signal_type,),
                 )
-                await _emit_decision(
-                    "blocked",
-                    "max_open_trades",
-                    open_count=row[0],
-                    max_open=max_open,
+                row = await cursor.fetchone()
+                open_count_by_signal = row[0]
+                if open_count_by_signal >= signal_type_cap:
+                    log.info(
+                        "trade_skipped_max_open_signal_type",
+                        token_id=token_id,
+                        signal_type=signal_type,
+                        open_count=open_count_by_signal,
+                        max_open=signal_type_cap,
+                    )
+                    await _emit_decision(
+                        "blocked",
+                        "max_open_signal_type",
+                        open_count=open_count_by_signal,
+                        max_open=signal_type_cap,
+                        signal_type=signal_type,
+                    )
+                    return None
+        else:
+            # Fallback: use global cap (legacy behavior)
+            max_open = getattr(self.settings, "PAPER_MAX_OPEN_TRADES", 0) or 0
+            if max_open > 0:
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM paper_trades WHERE status = 'open'"
                 )
-                return None
+                row = await cursor.fetchone()
+                if row[0] >= max_open:
+                    log.info(
+                        "trade_skipped_max_open_trades",
+                        token_id=token_id,
+                        signal_type=signal_type,
+                        open_count=row[0],
+                        max_open=max_open,
+                    )
+                    await _emit_decision(
+                        "blocked",
+                        "max_open_trades",
+                        open_count=row[0],
+                        max_open=max_open,
+                    )
+                    return None
 
         # 3. Check max exposure
         trade_amount = amount_usd or self.settings.PAPER_TRADE_AMOUNT_USD

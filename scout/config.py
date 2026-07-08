@@ -716,6 +716,13 @@ class Settings(BaseSettings):
     # Hard cap on concurrent open positions. Prevents restart-bursts and
     # survives env changes to PAPER_MAX_EXPOSURE_USD / PAPER_TRADE_AMOUNT_USD.
     PAPER_MAX_OPEN_TRADES: int = 10
+    # Per-signal-type caps: prevent any one signal type from dominating slot allocation.
+    # If set to 0, the per-signal caps are disabled and only PAPER_MAX_OPEN_TRADES applies.
+    PAPER_MAX_OPEN_TRENDING_CATCH: int = 20
+    PAPER_MAX_OPEN_FIRST_SIGNAL: int = 20
+    PAPER_MAX_OPEN_GAINERS_EARLY: int = 12
+    PAPER_MAX_OPEN_NARRATIVE_PREDICTION: int = 7
+    PAPER_MAX_OPEN_LOSERS_CONTRARIAN: int = 3
     # Cooldown after service start: refuse to open new paper trades during
     # this window so a restart doesn't replay every currently-qualifying
     # candidate as a fresh signal. A live trader doesn't bulk-enter on reboot.
