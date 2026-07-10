@@ -99,6 +99,16 @@ class Settings(BaseSettings):
     CONVICTION_THRESHOLD: int = Field(default=75, ge=0, le=10_000)
     QUANT_WEIGHT: float = 0.6
     NARRATIVE_WEIGHT: float = 0.4
+    # Conviction gate RETIRED 2026-07-10 (backlog SIG-01 / NAR-01 / ALR-05).
+    # Root cause: the 2026-06-02 social-denominator renormalization dropped the
+    # max realized quant score to ~54, below MIN_SCORE=65 -> 0/1,995 candidates
+    # scored in 6 weeks, MiroFish unreached (0 jobs since 06-01), and the legacy
+    # conviction alert path fired 10x headlining "Conviction Score: N/A".
+    # When False (default) run_cycle skips gate.evaluate + MiroFish enqueue +
+    # send_alert entirely and emits one `conviction_gate_retired` log per cycle.
+    # Reversal path: recalibrate MIN_SCORE to the realized score distribution
+    # (see SIG-02 scorer-divisor cleanup), then flip this flag back to True.
+    CONVICTION_GATE_ENABLED: bool = False
 
     # Token filters
     MIN_MARKET_CAP: float = 10_000
