@@ -290,6 +290,38 @@ class TradingEngine:
                         error=str(exc),
                     )
 
+        # ---------------------------------------------------------------
+        # SIG-03 dispatch-quarantine — SINGLE SOURCE OF TRUTH for paper-trade
+        # tradability. Any signal_type in SIGNAL_DISPATCH_QUARANTINE is blocked
+        # HERE, at the one choke point every open path converges on: the
+        # signals.py dispatchers AND scout/social/telegram/dispatcher.py both
+        # call open_trade. Runs first so a quarantined lane pays no DB cost and
+        # its block is always recorded regardless of downstream gate state.
+        #
+        # Future tradability changes (add/remove a lane, tighten admission)
+        # belong HERE — do NOT re-scatter them across should_open /
+        # actionability.py / params.py. Consolidating those three disagreeing
+        # layers into this gate is the SIG-03 follow-up; this slice leaves them
+        # as-is and only stops the OPENS.
+        #
+        # Spec-premise correction: SIG-03 spec placed this in should_open(),
+        # but tg_social dispatches via scout/social/telegram/dispatcher.py and
+        # never calls should_open — open_trade is the true single authority
+        # reaching BOTH quarantined lanes (narrative_prediction + tg_social).
+        # Detection / tracker / research surfaces are unaffected: only the
+        # paper-trade OPEN is blocked. Empty list disables the feature.
+        # ---------------------------------------------------------------
+        quarantine = getattr(self.settings, "SIGNAL_DISPATCH_QUARANTINE", None) or ()
+        if signal_type in quarantine:
+            log.info(
+                "trade_skipped_quarantined",
+                token_id=token_id,
+                signal_type=signal_type,
+                signal_combo=signal_combo,
+            )
+            await _emit_decision("blocked", "quarantined")
+            return None
+
         # 0a. Startup warmup — coarsest gate (no DB, no allocations).
         # Runs before signal_params lookup so we don't hit the DB for
         # every rejected-by-warmup call in the first N seconds after boot.
