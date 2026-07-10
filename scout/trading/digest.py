@@ -18,8 +18,9 @@ async def build_paper_digest(db: Database, date_str: str) -> str:
     stores into paper_daily_summary, and returns a formatted message.
 
     On a quiet day (no trades opened or closed) it still writes a zeros row
-    to paper_daily_summary — a downstream freshness watchdog monitors that
-    table's write-rate, so quiet days must produce a heartbeat — and returns
+    to paper_daily_summary — so a freshness watchdog CAN monitor the
+    table's write-rate (§12a; wired by scripts/alert_channel_watchdog.py,
+    PR #431 — quiet days must produce a heartbeat) — and returns
     a short plain-text one-liner. It never returns None: silence must never
     be ambiguous.
     """

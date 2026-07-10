@@ -375,7 +375,7 @@ a message nor a table row — nothing to notice).
 
 2. **Quiet periods must emit explicitly — never `return None`.** A zero-
    activity period is a fact worth recording, not an absence to swallow. Write
-   the summary row (zeros) so the freshness watchdog sees a heartbeat (§12a),
+   the summary row (zeros) so a freshness watchdog can see a heartbeat (§12a; wired by PR #431),
    and return an explicit one-liner so silence is never ambiguous between "no
    activity" and "the job didn't run" (cousin to §12b's silent-success
    problem).
