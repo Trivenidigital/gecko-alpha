@@ -4989,7 +4989,10 @@ class Database:
             try:
                 await conn.execute("ROLLBACK")
             except Exception:
-                pass
+                _log.exception(
+                    "schema_migration_rollback_failed",
+                    migration=migration_name,
+                )
             raise
 
     async def _migrate_actionability_entry_snapshot_v1(self) -> None:
