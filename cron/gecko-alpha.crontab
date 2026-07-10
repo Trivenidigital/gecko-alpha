@@ -9,4 +9,14 @@
 */5 * * * * /root/gecko-alpha/scripts/held-position-price-watchdog.sh >> /var/log/gecko-alpha-held-position-price-watchdog.log 2>&1
 30 9 * * * /root/gecko-alpha/scripts/revival-verdict-watchdog.sh >> /var/log/gecko-alpha-revival-verdict-watchdog.log 2>&1
 15 4 * * 1 /root/gecko-alpha/scripts/ledger-eviction-export.sh >> /var/log/gecko-alpha-ledger-eviction-export.log 2>&1
+# alert-channel + digest freshness watchdog (§12a): hourly, monitors tg_alert_log
+# ('sent' freshness) + paper_daily_summary (daily digest) in one script. The
+# inline ALERT_CHANNEL_WATCHDOG_ENABLED=true is the deploy-without-activate flag
+# (safe no-op if unset); ACTIVATION occurs when the operator runs cron/deploy.sh
+# to install this managed block, per operator approval. Per-table 24h send
+# cooldown bounds a standing breach to one page/table/day (not ~24).
+# *** ACTIVATION PREREQUISITE: deploy PR #429 (daily-digest yesterday-fix) and
+# confirm >=1 fresh paper_daily_summary row exists BEFORE activating, else the
+# first digest pages are for a known-broken-being-fixed writer. ***
+50 * * * * ALERT_CHANNEL_WATCHDOG_ENABLED=true /root/gecko-alpha/scripts/alert-channel-watchdog.sh >> /var/log/gecko-alpha-alert-channel-watchdog.log 2>&1
 # === END gecko-alpha managed block ===
