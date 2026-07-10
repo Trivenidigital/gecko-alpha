@@ -1035,10 +1035,32 @@ def create_app(db_path: str | None = None) -> FastAPI:
         # Align with the module's settings-degradation pattern (the singleton is
         # None on a malformed .env; fall back to the cached get_settings()).
         settings = _DASHBOARD_SETTINGS or get_settings()
-        if not getattr(settings, "CONVICTION_SCORE_ENABLED", True):
-            return {"meta": {"read_only": True, "enabled": False}, "rows": []}
-
         sdb = await _get_scout_db(_db_path)
+
+        # DASH-10: conviction-gate honesty coverage. Surfaced regardless of the
+        # CONVICTION_SCORE_ENABLED (cross-surface shortlist) flag — it describes
+        # the SEPARATE quant*narrative gate metric this surface leads with. On a
+        # missing/malformed candidates table, fall back to -1 sentinels so the
+        # frontend never shows a misleading "dead" banner on unknown coverage.
+        try:
+            conviction_coverage = await db.get_conviction_coverage(sdb._conn)
+        except Exception:
+            conviction_coverage = {
+                "window_days": 7,
+                "scored_count": -1,
+                "candidate_count": -1,
+                "last_scored_at": None,
+            }
+
+        if not getattr(settings, "CONVICTION_SCORE_ENABLED", True):
+            return {
+                "meta": {
+                    "read_only": True,
+                    "enabled": False,
+                    "conviction_coverage": conviction_coverage,
+                },
+                "rows": [],
+            }
         # Pool generously so the ranking covers the whole tracker (currently
         # ~700 rows); expose total_tracked + truncated so a capped pool is never
         # a SILENT recall hole.
@@ -1109,6 +1131,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 ),
                 "min_tier": min_tier,
                 "sort": sort,
+                "conviction_coverage": conviction_coverage,
                 "total_tracked": total_tracked,
                 "pool_considered": len(comparisons),
                 "pool_cap": pool_cap,

@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import TokenLink from './TokenLink'
-import { buildTradeDecisionBoard } from './tradeDecisionBoard.js'
+import ProvenanceExpander from './ProvenanceExpander'
+import { buildTradeDecisionBoard, canonicalScore } from './tradeDecisionBoard.js'
+import { formatDecisionReason } from './actionability.js'
 
 const GROUPS = [
   ['act_now', 'Review Now'],
@@ -26,6 +28,22 @@ function fmtPct(n) {
   const v = Number(n)
   if (!Number.isFinite(v)) return '-'
   return v.toFixed(2) + '%'
+}
+
+// DASH-02: the ONE surfaced score per row is the canonical (adjusted) score.
+// '—' when the row has no scoring basis — never a bare 0 that reads as worst.
+function fmtScore(row) {
+  const s = canonicalScore(row)
+  return s == null ? '—' : s
+}
+
+// DASH-03: plain-words decision reasons for a row (decision-board cards).
+function plainReasons(row) {
+  return (row.decision_reasons || [])
+    .map(formatDecisionReason)
+    .filter(Boolean)
+    .slice(0, 5)
+    .join(' · ')
 }
 
 function rowKey(row) {
@@ -134,11 +152,18 @@ function renderDecisionRow(row, variant = '') {
         <span>{fmtPct(row.pct_from_entry)} from entry</span>
         <span>{fmtPct(row.price_change_24h)} 24h</span>
         <span>{fmtUsd(row.market_cap)}</span>
-        <span>score {row.adjusted_score}</span>
+        <span title="canonical score (risk/entry/window-adjusted); '—' = no data">score {fmtScore(row)}</span>
       </div>
       <div className="trade-decision-meta">
-        {(row.decision_reasons || []).slice(0, 5).join(' | ') || 'no decision facts'}
+        {plainReasons(row) || 'no decision facts'}
       </div>
+      <ProvenanceExpander
+        lines={[
+          `adjusted_score=${row.adjusted_score}`,
+          `trade_score(raw)=${row.trade_score ?? '—'}`,
+          (row.decision_reasons || []).length ? `reasons=${row.decision_reasons.join(',')}` : null,
+        ]}
+      />
     </div>
   )
 }
@@ -340,7 +365,7 @@ export default function TradeInboxTab() {
                       <th>Token</th>
                       <th>Action</th>
                       <th>Window</th>
-                      <th>Score</th>
+                      <th title="canonical score (risk/entry/window-adjusted); '—' = no data">Score</th>
                       <th>From Entry</th>
                       <th>24h</th>
                       <th>MCap</th>
@@ -365,13 +390,15 @@ export default function TradeInboxTab() {
                           </td>
                           <td style={{ fontWeight: 700 }}>{row.action_label}</td>
                           <td>{row.window_state}</td>
-                          <td>{row.trade_score}</td>
+                          <td>{fmtScore(row)}</td>
                           <td style={{ color: row.pct_from_entry != null && row.pct_from_entry >= 0 ? 'var(--color-accent-green)' : 'var(--color-accent-red)' }}>{fmtPct(row.pct_from_entry)}</td>
                           <td>{fmtPct(row.price_change_24h)}</td>
                           <td>{fmtUsd(row.market_cap)}</td>
                           <td style={{ color: 'var(--color-text-secondary)', fontSize: 12 }}>
                             {reasonText}
-                            {renderCounterRisk(row)}
+                            <ProvenanceExpander lines={[`trade_score(raw)=${row.trade_score ?? '—'}`]}>
+                              {renderCounterRisk(row)}
+                            </ProvenanceExpander>
                           </td>
                           <td>
                             <button className="tab-btn" onClick={() => setDismissed(d => ({ ...d, [dKey]: true }))} style={{ padding: '2px 8px', fontSize: 12 }}>

@@ -76,6 +76,67 @@ async def _insert_gc(
     await conn.commit()
 
 
+async def _insert_candidate(
+    conn, addr, *, conviction_score=None, alerted_at=None, first_seen_at=None
+):
+    """Insert a candidates row (DASH-10 conviction-coverage tests)."""
+    now = datetime.now(timezone.utc).isoformat()
+    await conn.execute(
+        """INSERT INTO candidates
+               (contract_address, chain, token_name, ticker,
+                conviction_score, alerted_at, first_seen_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            addr,
+            "coingecko",
+            addr.upper(),
+            addr.upper(),
+            conviction_score,
+            alerted_at,
+            first_seen_at or now,
+        ),
+    )
+    await conn.commit()
+
+
+async def test_conviction_coverage_zero_when_gate_dead(client):
+    # DASH-10: no conviction_score computed inside the window -> scored_count 0
+    # (the banner driver), with last_scored_at pinned to the all-time last fire.
+    c, conn = client
+    old = "2026-06-13T09:00:00+00:00"
+    await _insert_candidate(
+        conn, "dead1", conviction_score=71.0, alerted_at=old, first_seen_at=old
+    )
+    await _insert_candidate(conn, "live1", conviction_score=None)
+    await _insert_candidate(conn, "live2", conviction_score=None)
+    body = (await c.get("/api/conviction/shortlist")).json()
+    cov = body["meta"]["conviction_coverage"]
+    assert cov["window_days"] == 7
+    assert cov["scored_count"] == 0
+    assert cov["candidate_count"] == 2  # live1/live2 inside window; dead1 outside
+    assert cov["last_scored_at"] == old
+
+
+async def test_conviction_coverage_live_when_scored(client):
+    # A conviction_score computed inside the window -> scored_count > 0 (no banner).
+    c, conn = client
+    await _insert_candidate(conn, "scored1", conviction_score=68.0)
+    body = (await c.get("/api/conviction/shortlist")).json()
+    cov = body["meta"]["conviction_coverage"]
+    assert cov["scored_count"] == 1
+    assert cov["candidate_count"] == 1
+    assert cov["last_scored_at"] is None  # scored but never alerted
+
+
+async def test_conviction_coverage_empty_db(client):
+    c, _ = client
+    body = (await c.get("/api/conviction/shortlist")).json()
+    cov = body["meta"]["conviction_coverage"]
+    assert cov["scored_count"] == 0
+    assert cov["candidate_count"] == 0
+    assert cov["last_scored_at"] is None
+
+
 async def test_shortlist_ranks_high_conviction_first(client):
     c, conn = client
     await _insert_gc(conn, "low1", early=("chains",), peak_gain_pct=10)

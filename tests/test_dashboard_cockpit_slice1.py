@@ -402,7 +402,10 @@ def test_signal_trust_tab_renders_live_badge_stale_warning_and_provenance():
     assert "LiveStatusBadge" in jsx
     assert "registry stale — maturity labels may not reflect current state" in jsx
     assert "ProvenanceExpander" in jsx
-    assert "provenance" in jsx
+    # DASH-02/03 extracted the expander to a shared component; the lowercase
+    # 'provenance' label now lives there as the default label prop.
+    shared = _read_component("ProvenanceExpander.jsx")
+    assert "label = 'provenance'" in shared
     # finding 8: the raw meta debug strings must not render as bare text —
     # they live inside the provenance expander now.
     assert "read_only=${String(scMeta.read_only" in jsx

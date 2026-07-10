@@ -67,6 +67,36 @@ export const REASON_INFO = {
   },
 }
 
+// DASH-03: plain-words map for the trade-decision reason codes emitted by
+// tradeDecisionBoard.js reasonList(). Same shape as REASON_INFO above (label +
+// why) so the decision board renders human copy instead of debug tokens
+// (window=open|fresh_entry|risk_demoted…). Raw codes stay available in the
+// row's ProvenanceExpander; this is presentation-only.
+export const DECISION_REASON_INFO = {
+  window_open: { label: 'Window open', why: 'The trade’s action window is currently open.' },
+  window_closing: { label: 'Window closing', why: 'The action window is near its end.' },
+  window_late: { label: 'Window late', why: 'The move has already run; past the action window.' },
+  window_closed: { label: 'Window closed', why: 'The action window has closed.' },
+  fresh_entry: { label: 'Fresh entry', why: 'Price is near the detection entry — not yet run.' },
+  acceptable_pullback: { label: 'Acceptable pullback', why: 'Price pulled back to a still-usable entry.' },
+  already_ran: { label: 'Already ran', why: 'Price has already moved well past entry.' },
+  already_faded: { label: 'Already faded', why: 'Price ran and has since faded back.' },
+  too_stale: { label: 'Price stale', why: 'The reference price is too old to evaluate entry.' },
+  price_fresh: { label: 'Price fresh', why: 'The reference price is recent (< 60 min old).' },
+  momentum_24h_positive: { label: '24h momentum positive', why: '24-hour price change is positive.' },
+  risk_demoted: { label: 'Risk-demoted', why: 'High counter-risk demoted this row below cleaner ones.' },
+  tracker_only: { label: 'Tracker-only', why: 'From the gainers tracker, not an open paper trade.' },
+}
+
+// Human-readable label for a decision reason code. Falls back to a sanitized
+// form so future codes don't render as raw tokens or crash the UI.
+export function formatDecisionReason(code) {
+  if (!code) return ''
+  const info = DECISION_REASON_INFO[code]
+  if (info) return info.label
+  return String(code).replaceAll('_', ' ')
+}
+
 // Three-state classification used everywhere a cohort badge is rendered.
 // 1 → actionable (green), 0 → exploratory (amber), NULL → unknown (gray).
 export function actionabilityState(value) {

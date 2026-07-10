@@ -87,6 +87,14 @@ export default function ConvictionTab() {
   const rows = payload?.rows || []
   const meta = payload?.meta || {}
 
+  // DASH-10: honesty banner. The quant×0.6+narrative×0.4 conviction GATE metric
+  // has been structurally uncomputable since the 2026-06-02 recalibration (0 of
+  // ~1,995 candidates scored). When the API reports zero conviction coverage in
+  // the window, say so plainly instead of letting a "Conviction"-titled surface
+  // imply a live metric. scored_count === -1 = coverage unknown (no banner).
+  const coverage = meta.conviction_coverage || null
+  const convictionDead = coverage != null && coverage.scored_count === 0
+
   // NEW = appeared since the last visit (relative to the frozen snapshot).
   const newFlags = useMemo(() => {
     const flags = {}
@@ -181,6 +189,24 @@ export default function ConvictionTab() {
           </span>
         </div>
         <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', fontSize: 12 }}>
+          {convictionDead ? (
+            <div
+              data-testid="conviction-honesty-banner"
+              style={{
+                marginBottom: 8,
+                padding: '6px 10px',
+                background: 'rgba(239, 83, 80, 0.12)',
+                borderLeft: '2px solid var(--color-accent-red, #ef5350)',
+                borderRadius: 2,
+                color: 'var(--color-accent-red, #ef5350)',
+                fontWeight: 600,
+              }}
+            >
+              {coverage.last_scored_at
+                ? `Conviction not computed since ${String(coverage.last_scored_at).slice(0, 10)} — gate retired 2026-07-10, see backlog SIG-01.`
+                : 'Conviction has never been computed — gate retired 2026-07-10, see backlog SIG-01.'}
+            </div>
+          ) : null}
           <div style={{ marginBottom: 6, color: 'var(--color-accent-amber)' }}>
             RETROSPECTIVE: these coins already appeared on the gainers tracker — a conviction ranking, NOT a pre-pump buy list.
           </div>
