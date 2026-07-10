@@ -108,46 +108,82 @@ if [[ "$status" -eq 0 ]]; then
     exit 0
 fi
 
+# Alert path: preserve the full JSON in the journal (stderr) for debugging.
+# The operator-facing Telegram body below carries readable prose only.
+echo "check_source_calls_lag raw: $result" >&2
+
 # Extract structured status + detail.path from JSON's body (last non-empty
 # line is parsed defensively). The path is used in remediation hints so
 # the operator sees the actual configured path, not a fallback default.
 # Falls through to "unknown" / empty path -> ledger_lag text.
+# Tab-separated: status, detail.path, detail.age_minutes, detail.last_writer_success_at.
+# The two diagnostic fields are surfaced as readable prose in the alert body
+# (replacing the old raw-JSON `detail=${result}` dump — the full JSON is
+# preserved in the journal via the stderr echo above).
+# Fields are joined by US (\x1f), NOT tab: tab is an IFS-whitespace char so
+# `read` would collapse the consecutive empty fields of the ledger-lag case
+# (empty path/age/last) and mis-assign the trailing counts. US is non-
+# whitespace and never appears in paths/timestamps/numbers, so empty fields
+# are preserved positionally.
 parse_output="$(echo "$result" | python3 -c '
 import json, sys
+def emit(status="unknown", path="", age="", last="", tg="", x=""):
+    print("\x1f".join([status, path, age, last, tg, x]))
 lines = [l for l in sys.stdin.read().splitlines() if l.strip()]
 if not lines:
-    print("unknown\t")
-    sys.exit(0)
+    emit(); sys.exit(0)
 try:
     d = json.loads(lines[-1])
     status = d.get("status", "unknown")
-    path = ""
+    path = age = last = ""
     detail = d.get("detail")
     if isinstance(detail, dict):
         path = detail.get("path", "") or ""
-    print(f"{status}\t{path}")
+        a = detail.get("age_minutes")
+        if a is not None:
+            age = str(a)
+        last = detail.get("last_writer_success_at", "") or ""
+    def num(v):
+        return "" if v is None else str(v)
+    emit(status, path, age, last, num(d.get("unledgered_tg")), num(d.get("unledgered_x")))
 except Exception:
-    print("unknown\t")
-' 2>/dev/null || echo "unknown	")"
+    emit()
+' 2>/dev/null || printf 'unknown\x1f\x1f\x1f\x1f\x1f')"
 
-parsed_status="${parse_output%%	*}"
-parsed_path="${parse_output#*	}"
+IFS=$'\x1f' read -r parsed_status parsed_path parsed_age parsed_last parsed_tg parsed_x <<<"$parse_output"
 remediation_path="${parsed_path:-${WRITER_HEARTBEAT_FILE:-/var/lib/gecko-alpha/source-calls/writer-heartbeat}}"
+
+# Readable diagnostic suffix (writer_stale only carries these fields). Replaces
+# the raw-JSON dump so the operator-facing alert stays human prose.
+diag=""
+if [[ -n "$parsed_last" ]]; then
+    if [[ -n "$parsed_age" ]]; then
+        diag=" Last success: ${parsed_last} (${parsed_age} min ago)."
+    else
+        diag=" Last success: ${parsed_last}."
+    fi
+fi
+
+# Readable unledgered counts for the ledger-lag path (top-level JSON fields).
+lag_counts=""
+if [[ -n "$parsed_tg" || -n "$parsed_x" ]]; then
+    lag_counts=" unledgered_tg=${parsed_tg:-0} unledgered_x=${parsed_x:-0}"
+fi
 
 # Build operator-facing alert text — plain prose with extracted fields.
 # Body is bounded to 3500 chars to stay under Telegram's 4096 limit.
 case "$parsed_status" in
     writer_stale)
-        text="source-calls-lag-watchdog: writer cron stale — last SUCCEEDED >${WRITER_THRESHOLD_MINUTES}min ago (threshold ${WRITER_THRESHOLD_MINUTES}min). path=${remediation_path}. Likely cause: source-calls-live-writer cron stopped or writer is failing on every tick. Check: systemctl status cron && journalctl --since '1h ago' | grep source_calls_live_writer | tail -20. status=${status} detail=${result}"
+        text="source-calls-lag-watchdog: writer cron stale — last SUCCEEDED >${WRITER_THRESHOLD_MINUTES}min ago (threshold ${WRITER_THRESHOLD_MINUTES}min). path=${remediation_path}. Likely cause: source-calls-live-writer cron stopped or writer is failing on every tick. Check: systemctl status cron && journalctl --since '1h ago' | grep source_calls_live_writer | tail -20.${diag}"
         ;;
     writer_heartbeat_missing)
-        text="source-calls-lag-watchdog: writer heartbeat missing — ledger has rows but heartbeat file is gone. path=${remediation_path}. Likely cause: state-dir wiped, permission change, or WRITER_HEARTBEAT_FILE env var dropped. Check: ls -la \$(dirname ${remediation_path}). status=${status} detail=${result}"
+        text="source-calls-lag-watchdog: writer heartbeat missing — ledger has rows but heartbeat file is gone. path=${remediation_path}. Likely cause: state-dir wiped, permission change, or WRITER_HEARTBEAT_FILE env var dropped. Check: ls -la \$(dirname ${remediation_path})."
         ;;
     writer_never_fired)
-        text="source-calls-lag-watchdog: writer never fired — heartbeat absent + ledger empty for >6h. path=${remediation_path}. Likely cause: writer cron line missing, .env unset, or wrapper exit on every run. Check: crontab -l | grep source-calls-live-writer && tail -50 /var/log/syslog | grep source_calls. status=${status} detail=${result}"
+        text="source-calls-lag-watchdog: writer never fired — heartbeat absent + ledger empty for >6h. path=${remediation_path}. Likely cause: writer cron line missing, .env unset, or wrapper exit on every run. Check: crontab -l | grep source-calls-live-writer && tail -50 /var/log/syslog | grep source_calls."
         ;;
     *)
-        text="source-calls-lag-watchdog: source_calls ledger lagging or unreachable. status=${status} result=${result}"
+        text="source-calls-lag-watchdog: source_calls ledger lagging or unreachable. status=${status}${lag_counts}"
         ;;
 esac
 
