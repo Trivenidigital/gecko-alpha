@@ -26,4 +26,8 @@
 # this block, or the watchdog will (correctly) alert writer-heartbeat staleness.
 */5 * * * * cd /root/gecko-alpha && .venv/bin/python scripts/backfill_dexscreener_liquidity.py --db /root/gecko-alpha/scout.db --heartbeat-file /var/lib/gecko-alpha/liquidity-enrichment/heartbeat >> /var/log/gecko-alpha-liquidity-enrichment-writer.log 2>&1
 */10 * * * * cd /root/gecko-alpha && .venv/bin/python scripts/check_liquidity_enrichment_lag.py --db /root/gecko-alpha/scout.db --writer-heartbeat-file /var/lib/gecko-alpha/liquidity-enrichment/heartbeat >> /var/log/gecko-alpha-liquidity-enrichment-watchdog.log 2>&1
+# weekly suppression-cost rollup (#432): Monday 09:30, reads the #421 recall lane
+# (deployed 2026-07-10). n-gated: prints INSUFFICIENT_DATA until >=10 distinct
+# matured tokens (~2026-07-17+); never emits a dollar figure under the gate.
+30 9 * * 1 cd /root/gecko-alpha && .venv/bin/python scripts/suppression_cost_rollup.py --db /root/gecko-alpha/scout.db --send >> /var/log/gecko-alpha-suppression-cost-rollup.log 2>&1
 # === END gecko-alpha managed block ===
