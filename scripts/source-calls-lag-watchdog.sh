@@ -108,14 +108,18 @@ if [[ "$status" -eq 0 ]]; then
     exit 0
 fi
 
+# Alert path: preserve the full JSON in the journal (stderr) for debugging.
+# The operator-facing Telegram body below carries readable prose only.
+echo "check_source_calls_lag raw: $result" >&2
+
 # Extract structured status + detail.path from JSON's body (last non-empty
 # line is parsed defensively). The path is used in remediation hints so
 # the operator sees the actual configured path, not a fallback default.
 # Falls through to "unknown" / empty path -> ledger_lag text.
 # Tab-separated: status, detail.path, detail.age_minutes, detail.last_writer_success_at.
 # The two diagnostic fields are surfaced as readable prose in the alert body
-# (replacing the old raw-JSON `detail=${result}` dump — the full JSON still
-# reaches the journal via this wrapper's stdout).
+# (replacing the old raw-JSON `detail=${result}` dump — the full JSON is
+# preserved in the journal via the stderr echo above).
 # Fields are joined by US (\x1f), NOT tab: tab is an IFS-whitespace char so
 # `read` would collapse the consecutive empty fields of the ledger-lag case
 # (empty path/age/last) and mis-assign the trailing counts. US is non-
