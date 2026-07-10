@@ -2,18 +2,25 @@
 
 Mirrors tests/test_source_call_coverage_watchdog_script.py: the disabled path
 and the enabled/dry-run evaluation paths are aiohttp-free by design, so they
-run on Windows via subprocess. The real Telegram send (aiohttp + alerter) is
-exercised only on CI/VPS; here every breach case uses --dry-run so the
-composed message is returned in stdout without touching the network.
+run on Windows via subprocess. The real Telegram SEND path (aiohttp + alerter)
+cannot import aiohttp on Windows, so it is exercised IN-PROCESS with the
+module-level send primitive (`_SEND`) monkeypatched — this covers the §12b
+dispatched/delivered/failed logging + exit codes (S2-1) and the per-table
+cooldown dedup (S2-2) without touching the network. A focused unit test also
+stubs aiohttp + the alerter in sys.modules to assert `_send_via_alerter`
+passes `raise_on_failure=True`.
 
 The tmp_path DB is created with a MINIMAL schema — only tg_alert_log and
 paper_daily_summary, with the CREATE statements copied from scout/db.py.
 """
 
+import asyncio
+import importlib.util
 import json
 import sqlite3
 import subprocess
 import sys
+import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -283,3 +290,267 @@ def test_dry_run_suppresses_send(tmp_path):
     assert body["sent"] is False
     # No aiohttp/network noise should appear on stderr for the dry-run path.
     assert "alert_channel_watchdog_alert_dispatched" not in res.stderr
+
+
+# ---------------------------------------------------------------------------
+# In-process real-send path (S2-1 §12b truthfulness + S2-2 cooldown dedup).
+# The send primitive `_SEND` is monkeypatched so aiohttp is never imported.
+# ---------------------------------------------------------------------------
+
+
+def _load_module():
+    """Fresh import of the watchdog script as a module (per-test isolation)."""
+    spec = importlib.util.spec_from_file_location("_acw_mod", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _Recorder:
+    """Stand-in for the module `_log`; records every structured log call."""
+
+    def __init__(self):
+        self.events = []  # list[(level, event, kwargs)]
+
+    def info(self, event, **kw):
+        self.events.append(("info", event, kw))
+
+    def warning(self, event, **kw):
+        self.events.append(("warning", event, kw))
+
+    def names(self):
+        return [ev for _, ev, _ in self.events]
+
+    def kwargs_for(self, event):
+        return [kw for _, ev, kw in self.events if ev == event]
+
+
+def _fake_send(sink, *, raise_exc=None):
+    async def _send(text):
+        if raise_exc is not None:
+            raise raise_exc
+        sink.append(text)
+
+    return _send
+
+
+def _breach_db(tmp_path):
+    """Both checks stale -> two breaches."""
+    return _make_db(
+        tmp_path,
+        alert_rows=[(_iso(100), "sent")],
+        digest_rows=[_day(10)],
+    )
+
+
+def _main(mod, dbp, state_dir, *extra):
+    return mod.main(
+        [
+            "--db",
+            str(dbp),
+            "--enabled",
+            "true",
+            "--state-dir",
+            str(state_dir),
+            *extra,
+        ]
+    )
+
+
+# --- S2-1: §12b truthfulness ----------------------------------------------
+
+
+def test_real_send_success_logs_delivered_and_exits_5(tmp_path):
+    mod = _load_module()
+    rec = _Recorder()
+    sink = []
+    mod._log = rec
+    mod._SEND = _fake_send(sink)
+
+    rc = _main(mod, _breach_db(tmp_path), tmp_path / "state")
+
+    assert rc == 5
+    assert len(sink) == 1  # exactly one page dispatched
+    names = rec.names()
+    assert "alert_channel_watchdog_alert_dispatched" in names
+    assert "alert_channel_watchdog_alert_delivered" in names
+    assert "alert_channel_watchdog_alert_failed" not in names
+
+
+def test_real_send_failure_logs_failed_no_delivered_and_exits_1(tmp_path):
+    mod = _load_module()
+    rec = _Recorder()
+    sink = []
+    mod._log = rec
+    mod._SEND = _fake_send(
+        sink, raise_exc=RuntimeError("telegram send failed status=403")
+    )
+
+    rc = _main(mod, _breach_db(tmp_path), tmp_path / "state")
+
+    assert rc == 1
+    names = rec.names()
+    assert "alert_channel_watchdog_alert_dispatched" in names
+    assert "alert_channel_watchdog_alert_failed" in names
+    # The whole point of S2-1: NEVER report delivered on a rejected page.
+    assert "alert_channel_watchdog_alert_delivered" not in names
+    # A failed send must NOT persist cooldown state (next run re-alerts).
+    assert not (tmp_path / "state" / "last_alert_tg_alert_log").exists()
+
+
+def test_send_via_alerter_passes_raise_on_failure(monkeypatch):
+    """The real send must pass raise_on_failure=True + parse_mode=None, else the
+    alerter swallows non-200s and _alert_delivered lies (scout/alerter.py)."""
+    mod = _load_module()
+    captured = {}
+
+    async def fake_send(
+        text,
+        session,
+        settings,
+        *,
+        parse_mode="Markdown",
+        raise_on_failure=False,
+        source="unattributed",
+        chat_id=None,
+    ):
+        captured.update(
+            text=text,
+            parse_mode=parse_mode,
+            raise_on_failure=raise_on_failure,
+            source=source,
+        )
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    fake_aiohttp = types.ModuleType("aiohttp")
+    fake_aiohttp.ClientSession = lambda *a, **k: _FakeSession()
+    fake_alerter = types.ModuleType("scout.alerter")
+    fake_alerter.send_telegram_message = fake_send
+    fake_config = types.ModuleType("scout.config")
+    fake_config.Settings = lambda: object()
+
+    monkeypatch.setitem(sys.modules, "aiohttp", fake_aiohttp)
+    monkeypatch.setitem(sys.modules, "scout.alerter", fake_alerter)
+    monkeypatch.setitem(sys.modules, "scout.config", fake_config)
+
+    asyncio.run(mod._send_via_alerter("body-text"))
+
+    assert captured["raise_on_failure"] is True
+    assert captured["parse_mode"] is None
+    assert captured["source"] == "alert_channel_watchdog"
+    assert captured["text"] == "body-text"
+
+
+# --- S2-2: per-table cooldown dedup ---------------------------------------
+
+
+def test_cooldown_first_breach_dispatches_and_writes_state(tmp_path):
+    mod = _load_module()
+    rec = _Recorder()
+    sink = []
+    mod._log = rec
+    mod._SEND = _fake_send(sink)
+    sd = tmp_path / "state"
+
+    rc = _main(mod, _breach_db(tmp_path), sd)
+
+    assert rc == 5
+    assert len(sink) == 1
+    assert (sd / "last_alert_tg_alert_log").exists()
+    assert (sd / "last_alert_paper_daily_summary").exists()
+
+
+def test_cooldown_second_run_suppressed_still_exit_5(tmp_path):
+    dbp = _breach_db(tmp_path)
+    sd = tmp_path / "state"
+
+    # First run dispatches and writes state.
+    mod1 = _load_module()
+    sink1 = []
+    mod1._log = _Recorder()
+    mod1._SEND = _fake_send(sink1)
+    assert _main(mod1, dbp, sd) == 5
+    assert len(sink1) == 1
+
+    # Immediate second run: still a breach, but cooldown suppresses the SEND.
+    mod2 = _load_module()
+    rec2 = _Recorder()
+    sink2 = []
+    mod2._log = rec2
+    mod2._SEND = _fake_send(sink2)
+    rc = _main(mod2, dbp, sd)
+
+    assert rc == 5  # detection is NEVER suppressed
+    assert len(sink2) == 0  # but the page is
+    assert "alert_channel_watchdog_alert_suppressed_by_cooldown" in rec2.names()
+    assert "alert_channel_watchdog_alert_dispatched" not in rec2.names()
+
+
+def test_cooldown_expired_redispatches(tmp_path):
+    dbp = _breach_db(tmp_path)
+    sd = tmp_path / "state"
+    sd.mkdir(parents=True)
+    # Pre-seed both state files with an OLD timestamp (> default 24h cooldown).
+    old = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+    (sd / "last_alert_tg_alert_log").write_text(old)
+    (sd / "last_alert_paper_daily_summary").write_text(old)
+
+    mod = _load_module()
+    sink = []
+    mod._log = _Recorder()
+    mod._SEND = _fake_send(sink)
+
+    assert _main(mod, dbp, sd) == 5
+    assert len(sink) == 1  # cooldown expired -> re-dispatched
+
+
+def test_cooldown_per_table_independence(tmp_path):
+    # Only the digest table is inside its cooldown window; tg_alert_log is a
+    # NEW breach with no prior state -> the page must cover tg_alert_log alone.
+    dbp = _breach_db(tmp_path)
+    sd = tmp_path / "state"
+    sd.mkdir(parents=True)
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    (sd / "last_alert_paper_daily_summary").write_text(fresh)
+
+    mod = _load_module()
+    rec = _Recorder()
+    sink = []
+    mod._log = rec
+    mod._SEND = _fake_send(sink)
+
+    rc = _main(mod, dbp, sd)
+
+    assert rc == 5
+    assert len(sink) == 1
+    body = sink[0]
+    assert "tg_alert_log" in body
+    assert "paper_daily_summary" not in body  # in cooldown -> excluded from page
+    suppressed = rec.kwargs_for("alert_channel_watchdog_alert_suppressed_by_cooldown")
+    assert any(kw.get("table") == "paper_daily_summary" for kw in suppressed)
+
+
+def test_cooldown_hours_flag_respected(tmp_path):
+    # With --cooldown-hours 0 an immediate re-run re-dispatches (window elapsed).
+    dbp = _breach_db(tmp_path)
+    sd = tmp_path / "state"
+
+    mod1 = _load_module()
+    sink1 = []
+    mod1._log = _Recorder()
+    mod1._SEND = _fake_send(sink1)
+    assert _main(mod1, dbp, sd, "--cooldown-hours", "0") == 5
+    assert len(sink1) == 1
+
+    mod2 = _load_module()
+    sink2 = []
+    mod2._log = _Recorder()
+    mod2._SEND = _fake_send(sink2)
+    assert _main(mod2, dbp, sd, "--cooldown-hours", "0") == 5
+    assert len(sink2) == 1  # zero-hour cooldown never suppresses

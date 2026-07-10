@@ -326,6 +326,78 @@ Residual §12a surface: the daily cron writes a heartbeat at
 watchdog is wired yet. Because this gate has a 2026-08-26 backstop, that is
 accepted as low-priority unless this pattern becomes a longer-lived monitor.
 
+## Alert-channel + digest freshness watchdog (§12a)
+
+`scripts/alert-channel-watchdog.sh` (wrapping `scripts/alert_channel_watchdog.py`)
+is the ONLY alarm for two pipeline tables that went silently stale and were
+noticed only weeks later: the Telegram alert channel (`tg_alert_log`) had zero
+`outcome='sent'` rows for 14 days (2026-06-25 → 07-08), and the daily digest
+(`paper_daily_summary`) stopped writing after 2026-06-26. Per the operator
+amendment, ONE script monitors BOTH tables:
+
+- **Check 1 — `tg_alert_log`**: latest `outcome='sent'` row must be newer than
+  `ALERT_SENT_SLO_HOURS` (default 48).
+- **Check 2 — `paper_daily_summary`**: `MAX(date)` must be within
+  `DIGEST_SUMMARY_SLO_DAYS` (default 2; yesterday's row lands ~02:00 UTC daily).
+
+A missing OR empty table is itself a breach (silence is never ambiguous). On any
+breach the script sends ONE plain-text Telegram page (`parse_mode=None`, §12b —
+the table names contain `_`) naming each breached table, its last-seen
+timestamp, and its SLO, with `alert_channel_watchdog_alert_dispatched` /
+`_alert_delivered` / `_alert_failed` structured logs around the send. The send
+passes `raise_on_failure=True` so a rejected page raises (→ `_alert_failed` +
+exit 1) instead of the alerter's default swallow-and-return — the watchdog must
+never report its own page delivered when Telegram rejected it.
+
+**Per-table SEND cooldown** (`ALERT_CHANNEL_WATCHDOG_COOLDOWN_HOURS`, default 24;
+state files `last_alert_<table>` under `ALERT_CHANNEL_WATCHDOG_STATE_DIR`,
+default `/var/lib/gecko-alpha/alert-channel-watchdog`, auto-`mkdir -p`): at most
+one page per breached table per window, so the hourly cron does not emit ~24
+identical pages/day on a standing breach. The cooldown suppresses the SEND only
+— a breach **always** exits 5 (logged `_alert_suppressed_by_cooldown` with the
+next-eligible time); detection is never suppressed. State is written only after
+a successful send, so a failed send re-alerts next run.
+
+**Status: SCHEDULED in the managed block** (`50 * * * *`, hourly at :50), gated
+on `ALERT_CHANNEL_WATCHDOG_ENABLED=true` (set inline in the cron line — the
+deploy-without-activate flag; a manual run without it is a safe no-op).
+Activation occurs when the operator runs `cron/deploy.sh`, per operator
+approval. Cadence rationale: hourly is far inside both SLOs (48h / 2d); the
+cooldown makes cadence choice mostly about detection latency, not spam.
+
+> **⚠️ ACTIVATION PREREQUISITE (deploy ordering):** activate this watchdog only
+> AFTER PR #429 (daily-digest yesterday-fix) is deployed AND has written **≥1
+> fresh `paper_daily_summary` row** — otherwise the first digest pages fire for a
+> known-broken-being-fixed writer. The per-table cooldown bounds the blast
+> radius to one page/table/window, but the ordering is still the correct
+> sequence.
+
+### Smoke test
+
+```bash
+ssh root@srilu-vps
+cd /root/gecko-alpha && git pull
+# Preview WITHOUT sending or touching cooldown state:
+.venv/bin/python scripts/alert_channel_watchdog.py --db scout.db --enabled true --dry-run
+```
+
+### Disable / revert
+
+```bash
+crontab -l | grep -v alert-channel-watchdog | crontab -
+# clean revert:
+sed -i '/alert-channel-watchdog/d' cron/gecko-alpha.crontab && bash cron/deploy.sh
+```
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Both fresh, OR watchdog disabled (no-op) |
+| 5 | One or more freshness breaches (page dispatched and/or cooldown-suppressed, or `--dry-run` preview) |
+| 1 | DB missing / runtime error / alert-dispatch failure (send raised) |
+| 64 | Unknown argument (wrapper) |
+
 ## Alert-channel + digest freshness watchdog (§12a, 2026-07-10)
 
 `scripts/alert-channel-watchdog.sh` (wrapper for
