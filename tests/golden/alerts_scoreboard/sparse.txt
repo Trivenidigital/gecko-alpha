@@ -1,0 +1,6 @@
+Weekly Alerts Scoreboard - 2026-07-03 to 2026-07-10
+sent alerts -> paper-trade outcomes (last 7d)
+
+Sent 3  |  Linked 2  |  Unlinked 1
+
+INSUFFICIENT_DATA - 2 linked < MIN 5; alert->outcome stats withheld.

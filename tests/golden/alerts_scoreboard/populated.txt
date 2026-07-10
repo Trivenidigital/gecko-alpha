@@ -1,0 +1,15 @@
+Weekly Alerts Scoreboard - 2026-07-03 to 2026-07-10
+sent alerts -> paper-trade outcomes (last 7d)
+
+Sent 8  |  Linked 6  |  Unlinked 2
+
+Per-signal (sent / linked / linked-PnL / W-L-O):
+  volume_spike               4 /   3       $+870.00   1-1-1
+  first_signal               2 /   2        $-13.00   1-1-0
+  narrative_prediction       1 /   0         $+0.00   0-0-0
+  tg_social                  1 /   1         $+8.00   1-0-0
+
+Totals (linked)
+  Closed: 5   PnL: $+865.00
+  Best hit:       WIF peak +342%
+  Worst giveback: MOON peak +180% -> exit +12% (168pp given back)

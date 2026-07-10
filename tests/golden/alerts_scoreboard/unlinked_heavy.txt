@@ -1,0 +1,14 @@
+Weekly Alerts Scoreboard - 2026-07-03 to 2026-07-10
+sent alerts -> paper-trade outcomes (last 7d)
+
+Sent 21  |  Linked 6  |  Unlinked 15
+
+Per-signal (sent / linked / linked-PnL / W-L-O):
+  volume_spike              14 /   4        $+45.00   2-1-1
+  narrative_prediction       5 /   0         $+0.00   0-0-0
+  first_signal               2 /   2        $-35.00   1-1-0
+
+Totals (linked)
+  Closed: 5   PnL: $+10.00
+  Best hit:       SYMF peak +90%
+  Worst giveback: SYMF peak +90% -> exit +4% (86pp given back)
