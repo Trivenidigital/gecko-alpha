@@ -263,6 +263,12 @@ class Settings(BaseSettings):
     TELEGRAM_CHAT_ID: str
     DISCORD_WEBHOOK_URL: str = ""
 
+    # ALR-09: base URL for dashboard deep links appended to paper-trade-open
+    # TG alerts (e.g. http://HOST:8000/#/trade/{paper_trade_id}). The alert
+    # body's final line is a one-tap page→row link into the Trading tab.
+    # Operator-overridable via .env; empty disables the deep-link line.
+    DASHBOARD_BASE_URL: str = "http://89.167.116.187:8000"
+
     # Holder enrichment (optional)
     HELIUS_API_KEY: str = ""
     MORALIS_API_KEY: str = ""
@@ -1159,6 +1165,22 @@ class Settings(BaseSettings):
         if not v.startswith("https://"):
             raise ValueError(
                 "DISCORD_WEBHOOK_URL must be empty or an https:// URL; " f"got={v!r}"
+            )
+        return v
+
+    @field_validator("DASHBOARD_BASE_URL")
+    @classmethod
+    def _validate_dashboard_base_url(cls, v: str) -> str:
+        """Empty string is allowed (deep-link line disabled). Non-empty
+        values must be `http(s)://` URLs so a schemeless misconfig produces
+        a broken link fail-fast at construction rather than in every alert.
+        """
+        if v == "":
+            return v
+        if not v.startswith("http://") and not v.startswith("https://"):
+            raise ValueError(
+                "DASHBOARD_BASE_URL must be empty or start with http:// or "
+                f"https://; got={v!r}"
             )
         return v
 

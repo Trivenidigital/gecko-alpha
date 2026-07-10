@@ -982,7 +982,13 @@ function checkpointBadges(p) {
   )
 }
 
-export default function TradingTab() {
+// ALR-09 deep-link highlight for the row the alert points at.
+const DEEP_LINK_ROW_STYLE = {
+  background: 'rgba(74, 144, 226, 0.18)',
+  outline: '2px solid var(--color-accent-blue, #4a90e2)',
+}
+
+export default function TradingTab({ deepLinkTradeId = null }) {
   const [stats, setStats] = useState(null)
   const [bySignal, setBySignal] = useState([])
   // Cohort-toggle view (BL-NEW-LIVE-ELIGIBLE follow-up). Default 'full' —
@@ -1104,6 +1110,15 @@ export default function TradingTab() {
     const poll = setInterval(() => fetchAllRef.current(), 30000)
     return () => clearInterval(poll)
   }, [])
+
+  // ALR-09 deep-link: once positions/history load, scroll the target row
+  // (id=`trade-${id}`) into view. The row highlight is applied inline where
+  // the row renders. Best-effort — the row may live on another closed-page.
+  useEffect(() => {
+    if (deepLinkTradeId == null) return
+    const el = document.getElementById(`trade-${deepLinkTradeId}`)
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }, [deepLinkTradeId, positions, history])
 
   // R1-I2 + R2-I2 fold: auto-clamp on closedTotal decrease.
   useEffect(() => {
@@ -1484,7 +1499,11 @@ export default function TradingTab() {
                   const isExpanded = expandedPositionId != null && expandedPositionId === p.id
                   return (
                     <React.Fragment key={p.id || i}>
-                    <tr data-testid={`open-position-row-${p.id}`}>
+                    <tr
+                      id={`trade-${p.id}`}
+                      data-testid={`open-position-row-${p.id}`}
+                      style={p.id === deepLinkTradeId ? DEEP_LINK_ROW_STYLE : undefined}
+                    >
                       <td className="rank-cell" style={{ whiteSpace: 'nowrap', textAlign: 'center', fontWeight: 600, fontSize: 13 }}>
                         {p.total_pnl_pct == null ? '—' : (pnlRankMap.get(p.id) ?? '—')}
                       </td>
@@ -1720,7 +1739,15 @@ export default function TradingTab() {
                       ? 'rgba(239, 83, 80, 0.05)'
                       : 'transparent'
                   return (
-                    <tr key={h.id || i} style={{ background: rowBg }}>
+                    <tr
+                      key={h.id || i}
+                      id={`trade-${h.id}`}
+                      style={
+                        h.id === deepLinkTradeId
+                          ? { ...DEEP_LINK_ROW_STYLE }
+                          : { background: rowBg }
+                      }
+                    >
                       <td>
                         <TokenLink
                           tokenId={h.coin_id || h.token_id}

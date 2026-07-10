@@ -35,13 +35,34 @@ const DEFAULT_FUNNEL = {
   safety_passed: 0, mirofish_run: 0, alerted: 0,
 }
 
+// ALR-09 deep link. TG alerts append a stable hash route
+// `#/trade/{paper_trade_id}`; landing here selects the Trading tab and
+// scrolls/highlights the matching row. No router dependency — a tiny
+// hashchange listener keeps App.jsx's activeTab string-switch intact. The
+// prefix is a preserved string literal so a stale bundle is caught by the
+// bundle smoke test.
+const HASH_ROUTE_TRADE_PREFIX = '#/trade/'
+
+function parseDeepLink(hash) {
+  if (typeof hash === 'string' && hash.startsWith(HASH_ROUTE_TRADE_PREFIX)) {
+    const id = parseInt(hash.slice(HASH_ROUTE_TRADE_PREFIX.length), 10)
+    if (Number.isFinite(id) && id > 0) return { tab: 'trading', tradeId: id }
+  }
+  return null
+}
+
 export default function App() {
   const [status, setStatus] = useState(DEFAULT_STATUS)
   const [candidates, setCandidates] = useState([])
   const [funnel, setFunnel] = useState(DEFAULT_FUNNEL)
   const [signals, setSignals] = useState([])
   const [alerts, setAlerts] = useState([])
-  const [activeTab, setActiveTab] = useState('signals')
+  const [activeTab, setActiveTab] = useState(
+    () => parseDeepLink(window.location.hash)?.tab || 'signals'
+  )
+  const [deepLinkTradeId, setDeepLinkTradeId] = useState(
+    () => parseDeepLink(window.location.hash)?.tradeId ?? null
+  )
   const [connected, setConnected] = useState(false)
   const wsRef = useRef(null)
   const reconnectTimer = useRef(null)
@@ -103,6 +124,20 @@ export default function App() {
     }
 
     wsRef.current = ws
+  }, [])
+
+  // ALR-09: react to hash changes after mount (operator clicks a second
+  // alert link while the dashboard is already open).
+  useEffect(() => {
+    const applyHash = () => {
+      const dl = parseDeepLink(window.location.hash)
+      if (dl) {
+        setActiveTab(dl.tab)
+        setDeepLinkTradeId(dl.tradeId)
+      }
+    }
+    window.addEventListener('hashchange', applyHash)
+    return () => window.removeEventListener('hashchange', applyHash)
   }, [])
 
   useEffect(() => {
@@ -217,7 +252,7 @@ export default function App() {
 
       {activeTab === 'signals' && <SignalsTab />}
 
-      {activeTab === 'trading' && <TradingTab />}
+      {activeTab === 'trading' && <TradingTab deepLinkTradeId={deepLinkTradeId} />}
 
       {activeTab === 'todays_focus' && <TodayFocusPanel />}
 
