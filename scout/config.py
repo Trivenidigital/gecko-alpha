@@ -737,6 +737,30 @@ class Settings(BaseSettings):
     # slippage. Operator overrides via .env if they want larger sizes.
     MINARA_ALERT_AMOUNT_USD: float = 10.0
 
+    # SIG-03 dispatch-quarantine: signal_types whose paper-trade OPENS are
+    # blocked at the single dispatch authority (scout/trading/engine.py
+    # :meth:`TradingEngine.open_trade`). Detection / tracker / research surfaces
+    # are UNAFFECTED — this only stops the paper-trade admission. Blocked opens
+    # are recorded to trade_decision_events with reason='quarantined'. Removes
+    # standing negative-EV lanes (narrative_prediction 16% win / −$1,542/6w;
+    # tg_social 21% win / −$324) without deleting their detection telemetry.
+    # Empty list disables the feature (clean revert). Operator-extensible via
+    # .env (comma-separated). NOTE: tg_social dispatches through
+    # scout/social/telegram/dispatcher.py (NOT should_open), and
+    # narrative_prediction through should_open — engine.open_trade is the ONE
+    # place BOTH lanes converge, so the gate lives there (single source).
+    #
+    # NoDecode (pydantic-settings): `list[str]` is a "complex" field, so
+    # EnvSettingsSource would json.loads() the raw env value BEFORE the
+    # field_validator runs — turning a comma-separated .env value into a
+    # SettingsError at construction (boot crash-loop). NoDecode suppresses that
+    # eager JSON decode so the raw string reaches
+    # parse_signal_dispatch_quarantine below.
+    SIGNAL_DISPATCH_QUARANTINE: Annotated[list[str], NoDecode] = [
+        "narrative_prediction",
+        "tg_social",
+    ]
+
     PAPER_MIN_MCAP: float = 5_000_000  # min $5M mcap to paper trade (filters junk)
     # Upper mcap cap for paper trades. Large caps (BTC, ETH, SOL, AAVE...) rarely
     # pump fast enough to hit PAPER_TP_PCT within PAPER_MAX_DURATION_HOURS, so
@@ -1446,6 +1470,26 @@ class Settings(BaseSettings):
         # decode, so the RAW env/init string reaches here. Accept three shapes:
         #   * comma-separated string ("-a,-b")  — the documented .env form
         #   * JSON array string ('["-a","-b"]') — back-compat with JSON envs
+        #   * native list                       — test / programmatic construction
+        if isinstance(v, str):
+            s = v.strip()
+            if s.startswith("["):
+                try:
+                    parsed = json.loads(s)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(p).strip() for p in parsed if str(p).strip()]
+            return [p.strip() for p in s.split(",") if p.strip()]
+        return v
+
+    @field_validator("SIGNAL_DISPATCH_QUARANTINE", mode="before")
+    @classmethod
+    def parse_signal_dispatch_quarantine(cls, v: str | list[str]) -> list[str]:
+        # NoDecode (see field decl) suppresses pydantic-settings' eager JSON
+        # decode, so the RAW env/init string reaches here. Accept three shapes:
+        #   * comma-separated string ("a,b")    — the documented .env form
+        #   * JSON array string ('["a","b"]')   — back-compat with JSON envs
         #   * native list                       — test / programmatic construction
         if isinstance(v, str):
             s = v.strip()
