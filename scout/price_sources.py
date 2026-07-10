@@ -69,11 +69,19 @@ EXIT_PROVENANCE_STALE_SNAPSHOT = "stale_snapshot"
 #: No price available at all — bookkeeping close at entry_price
 #: (pnl exactly $0, fabricated).
 EXIT_PROVENANCE_ENTRY_FALLBACK = "entry_fallback"
+#: SIG-05 stop-fill slippage model: a stop close whose observed price gapped
+#: below the bounded gap floor, so the fill was clamped to
+#: sl_price*(1 - PAPER_STOP_GAP_BPS/10000) rather than the deep crash
+#: snapshot. A real-ish modeled fill (counts like a market exit downstream);
+#: the raw observed price is recorded in a stop_fill_slippage_model decision
+#: event so realized-vs-modeled stays auditable.
+EXIT_PROVENANCE_STOP_GAP_MODEL = "stop_gap_model"
 
 EXIT_PROVENANCES: frozenset[str] = frozenset(
     {
         EXIT_PROVENANCE_MARKET,
         EXIT_PROVENANCE_STALE_SNAPSHOT,
         EXIT_PROVENANCE_ENTRY_FALLBACK,
+        EXIT_PROVENANCE_STOP_GAP_MODEL,
     }
 )

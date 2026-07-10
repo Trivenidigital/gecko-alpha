@@ -169,7 +169,12 @@ def test_registered_price_sources_exclude_legacy():
 def test_exit_provenances_registry():
     from scout.price_sources import EXIT_PROVENANCES
 
-    assert EXIT_PROVENANCES == {"market", "stale_snapshot", "entry_fallback"}
+    assert EXIT_PROVENANCES == {
+        "market",
+        "stale_snapshot",
+        "entry_fallback",
+        "stop_gap_model",
+    }
 
 
 # ---------------------------------------------------------------------------

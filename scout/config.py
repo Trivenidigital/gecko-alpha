@@ -877,6 +877,33 @@ class Settings(BaseSettings):
     PAPER_HIGH_PEAK_FADE_PER_SIGNAL_OPT_IN: bool = (
         True  # require signal_params.high_peak_fade_enabled=1
     )
+    # SIG-05 stop-loss fill realism (live-gate integrity). When ENABLED, a
+    # stop-triggered close books at max(current_price, sl_price*(1 - gap))
+    # instead of an arbitrarily-deep crash snapshot that gapped far through
+    # the stop between 30-min eval cycles (measured drain: stops filled
+    # -28.1% avg on a -10% config). Models a real stop order filling NEAR the
+    # stop with a bounded gap allowance (PAPER_STOP_GAP_BPS). The raw observed
+    # price is recorded in the exit provenance detail (exit_provenance=
+    # 'stop_gap_model' + a stop_fill_slippage_model decision event) so
+    # realized-vs-modeled stays auditable. Fail-closed: default off leaves the
+    # exact pre-existing fill (book at current_price, provenance 'market').
+    PAPER_STOP_FILL_SLIPPAGE_MODEL: bool = False
+    PAPER_STOP_GAP_BPS: int = 300  # max 3% gap through the stop on a modeled fill
+    # SIG-05 part 2 (near-stop priority refresh) — DEFERRED, follow-up.
+    # Intent: when an open trade's unrealized pct is within
+    # PAPER_NEAR_STOP_REFRESH_BAND_PCT (~5pp) of its stop, mark it for a
+    # priority price refresh so the stop check runs against fresher data.
+    # Deferred because (a) a clean integration exceeds ~40 LOC — it needs a
+    # near-stop query joining paper_trades×price_cache plus a restructure of
+    # fetch_held_position_prices()'s cadence gate, which interacts with the
+    # existing in-flight-skip + stale-visibility folds; and (b) it adds no
+    # marginal freshness under the current prod config
+    # (HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES=1 already refreshes every
+    # held position each pipeline cycle) — it only pays off once the operator
+    # throttles that interval > 1. Part 1 (the fill model above) is the
+    # structural live-gate fix and caps the fill damage regardless of refresh
+    # cadence. Revive with a PAPER_NEAR_STOP_REFRESH_BAND_PCT setting when the
+    # refresh interval is throttled.
     TRADING_DIGEST_HOUR_UTC: int = 0  # midnight digest
     TRADING_EVAL_INTERVAL: int = 1800  # 30 min eval cycle
 

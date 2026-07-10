@@ -12,7 +12,11 @@ from datetime import datetime, timedelta, timezone
 import structlog
 
 from scout.db import Database
-from scout.price_sources import resolve_price_source
+from scout.price_sources import (
+    EXIT_PROVENANCE_MARKET,
+    EXIT_PROVENANCE_STOP_GAP_MODEL,
+    resolve_price_source,
+)
 from scout.trading.decision_events import emit_trade_decision
 from scout.trading.paper import PaperTrader
 from scout.trading.params import params_for_signal
@@ -1004,15 +1008,65 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                     close_status = "closed_expired"
 
                 if close_reason is not None:
+                    # SIG-05 stop-fill realism. A fresh price (age <= 3600) can
+                    # still be an arbitrarily-deep crash snapshot: between 30-min
+                    # eval cycles a token gaps far below the stop, so booking the
+                    # "fill" at current_price records the crash, not the stop
+                    # (measured: -28.1% avg on a -10% config). When the model is
+                    # on, a stop close books at max(current_price, sl_price*(1 -
+                    # gap)) — near the stop with a bounded gap allowance. Only
+                    # 'stop_loss' is re-priced; every other close path keeps the
+                    # observed price + 'market' provenance. Fail-closed: default
+                    # off preserves the exact pre-existing fill.
+                    fill_price = current_price
+                    fill_provenance = EXIT_PROVENANCE_MARKET
+                    if (
+                        close_reason == "stop_loss"
+                        and settings.PAPER_STOP_FILL_SLIPPAGE_MODEL
+                        and sl_price > 0
+                    ):
+                        gap_floor = sl_price * (
+                            1 - settings.PAPER_STOP_GAP_BPS / 10000.0
+                        )
+                        modeled_fill = max(current_price, gap_floor)
+                        if modeled_fill > current_price:
+                            # The observed price gapped below the bounded gap
+                            # floor — clamp the fill and record the raw observed
+                            # price so realized-vs-modeled stays auditable.
+                            fill_price = modeled_fill
+                            fill_provenance = EXIT_PROVENANCE_STOP_GAP_MODEL
+                            log.info(
+                                "stop_fill_modeled",
+                                trade_id=trade_id,
+                                token_id=token_id,
+                                raw_observed_price=current_price,
+                                modeled_fill_price=modeled_fill,
+                                sl_price=sl_price,
+                                gap_bps=settings.PAPER_STOP_GAP_BPS,
+                            )
+                            await emit_trade_decision(
+                                db,
+                                token_id=token_id,
+                                signal_type=signal_type_row or "",
+                                decision="stop_fill_modeled",
+                                reason="stop_fill_slippage_model",
+                                source_module="scout.trading.evaluator",
+                                paper_trade_id=trade_id,
+                                event_data={
+                                    "raw_observed_price": current_price,
+                                    "modeled_fill_price": modeled_fill,
+                                    "sl_price": sl_price,
+                                    "gap_bps": settings.PAPER_STOP_GAP_BPS,
+                                },
+                            )
                     closed = await _trader.execute_sell(
                         db=db,
                         trade_id=trade_id,
-                        current_price=current_price,
+                        current_price=fill_price,
                         reason=close_reason,
                         slippage_bps=slippage_bps,
                         status_override=close_status,
-                        # Fresh price (age <= 3600 enforced above).
-                        price_provenance="market",
+                        price_provenance=fill_provenance,
                     )
                     if closed:
                         log.info(
