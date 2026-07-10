@@ -66,10 +66,7 @@ def test_check_universe_flag_off_returns_none():
 def test_check_universe_flag_on_matches_first_pattern():
     """First matching pattern (list order) is returned."""
     settings = _settings(ALERT_UNIVERSE_FILTER_ENABLED=True)
-    assert (
-        _check_universe(settings, "spy-bstocks-tokenized-stock")
-        == "-bstocks-tokenized-stock"
-    )
+    assert _check_universe(settings, "spy-bstocks-tokenized-stock") == "-tokenized-"
 
 
 def test_check_universe_flag_on_normal_id_returns_none():
@@ -79,9 +76,14 @@ def test_check_universe_flag_on_normal_id_returns_none():
 
 def test_check_universe_is_case_insensitive():
     settings = _settings(ALERT_UNIVERSE_FILTER_ENABLED=True)
+    assert _check_universe(settings, "SPY-BSTOCKS-TOKENIZED-STOCK") == "-tokenized-"
+
+
+def test_check_universe_matches_tokenized_etf_offender():
+    """S2-2: the prod ETF offender ending `-tokenized-etf` is now caught."""
+    settings = _settings(ALERT_UNIVERSE_FILTER_ENABLED=True)
     assert (
-        _check_universe(settings, "SPY-BSTOCKS-TOKENIZED-STOCK")
-        == "-bstocks-tokenized-stock"
+        _check_universe(settings, "invesco-qqq-etf-ondo-tokenized-etf") == "-tokenized-"
     )
 
 
@@ -137,7 +139,7 @@ async def test_universe_flag_off_lets_tokenized_stock_pass(tmp_path, monkeypatch
 @pytest.mark.asyncio
 async def test_universe_flag_on_blocks_tokenized_stock(tmp_path, monkeypatch):
     """Flag ON: spy-bstocks-tokenized-stock is blocked, NOT sent, and audited
-    as outcome='blocked_eligibility' detail='universe_filter:-bstocks-tokenized-stock'.
+    as outcome='blocked_eligibility' detail='universe_filter:-tokenized-'.
     """
     db = Database(tmp_path / "t.db")
     await db.initialize()
@@ -165,7 +167,7 @@ async def test_universe_flag_on_blocks_tokenized_stock(tmp_path, monkeypatch):
     )
     outcome, detail = await cur.fetchone()
     assert outcome == "blocked_eligibility"
-    assert detail == "universe_filter:-bstocks-tokenized-stock"
+    assert detail == "universe_filter:-tokenized-"
     await db.close()
 
 
@@ -276,7 +278,7 @@ async def test_universe_block_emits_structlog(tmp_path, monkeypatch):
     ev = blocked[0]
     assert ev["token_id"] == "qualcomm-bstocks-tokenized-stock"
     assert ev["signal_type"] == "volume_spike"
-    assert ev["pattern"] == "-bstocks-tokenized-stock"
+    assert ev["pattern"] == "-tokenized-"
     await db.close()
 
 
@@ -314,10 +316,10 @@ async def test_log_outcome_with_detail_stores_string(tmp_path):
         signal_type="volume_spike",
         token_id="spy-bstocks-tokenized-stock",
         outcome="blocked_eligibility",
-        detail="universe_filter:-bstocks-tokenized-stock",
+        detail="universe_filter:-tokenized-",
     )
     cur = await db._conn.execute(
         "SELECT detail FROM tg_alert_log WHERE token_id='spy-bstocks-tokenized-stock'"
     )
-    assert (await cur.fetchone())[0] == "universe_filter:-bstocks-tokenized-stock"
+    assert (await cur.fetchone())[0] == "universe_filter:-tokenized-"
     await db.close()
