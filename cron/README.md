@@ -325,3 +325,56 @@ Residual §12a surface: the daily cron writes a heartbeat at
 `/var/lib/gecko-alpha/stop-loss-fn-audit/heartbeat`, but no stale-heartbeat
 watchdog is wired yet. Because this gate has a 2026-08-26 backstop, that is
 accepted as low-priority unless this pattern becomes a longer-lived monitor.
+
+## Alert-channel + digest freshness watchdog (§12a, 2026-07-10)
+
+`scripts/alert-channel-watchdog.sh` (wrapper for
+`scripts/alert_channel_watchdog.py`) is the ONLY alarm for the two
+operator-facing silent channels found in the 2026-07-10 product review:
+the Telegram alert path went dark 2026-06-25 → 07-08 (14 days, zero
+`sent` rows in `tg_alert_log`) and the daily digest stopped writing
+`paper_daily_summary` after 06-26 — neither was noticed because no
+watchdog read either table. One script monitors BOTH (operator
+amendment):
+
+- `tg_alert_log`: latest `outcome='sent'` row within
+  `ALERT_SENT_SLO_HOURS` (default 48).
+- `paper_daily_summary`: `MAX(date)` within `DIGEST_SUMMARY_SLO_DAYS`
+  (default 2; yesterday's row lands by ~02:00 UTC once PR #429 deploys).
+
+Missing or empty table is itself a breach with a distinct message. On
+breach: ONE plain-text Telegram alert (`parse_mode=None`, §12b) with
+`alert_channel_watchdog_alert_dispatched` / `_alert_delivered` logs
+around the send. Read-only on the DB; queries OUTPUT (rows/timestamps),
+not heartbeats.
+
+Deploy-without-activate: inert unless `ALERT_CHANNEL_WATCHDOG_ENABLED`
+is truthy — the managed-block entry sets it inline, so ACTIVATION occurs
+when the operator runs `cron/deploy.sh`, per operator approval. Cadence
+`50 * * * *` (hourly, offset from minute-0 pile-up; well inside the
+48h/2d SLOs).
+
+### Smoke test
+
+```bash
+ssh root@srilu-vps
+cd /root/gecko-alpha && git pull
+ALERT_CHANNEL_WATCHDOG_ENABLED=true bash scripts/alert-channel-watchdog.sh --dry-run
+# prints composed message (if any breach) without sending; exit 0 fresh / 5 breach
+```
+
+### Disable / revert
+
+```bash
+crontab -l | grep -v alert-channel-watchdog | crontab -
+# clean revert:
+sed -i '/alert-channel-watchdog/d' cron/gecko-alpha.crontab && bash cron/deploy.sh
+```
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Both tables fresh, or disabled no-op |
+| 5 | One or more freshness breaches (alert dispatched, or dry-run) |
+| 1 | DB missing / runtime error / alert-dispatch failure |
