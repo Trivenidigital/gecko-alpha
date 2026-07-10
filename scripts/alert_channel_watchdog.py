@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Alert-channel + daily-digest freshness watchdog (CLAUDE.md §12a).
+"""Alert-channel + digest + narrative + tg-channel freshness watchdog (CLAUDE.md §12a).
 
-Monitors TWO pipeline tables in ONE script (operator amendment):
+Monitors FOUR pipeline surfaces in ONE script (operator amendment):
 
   1. ``tg_alert_log`` — the latest ``outcome='sent'`` row must be newer than
      ``ALERT_SENT_SLO_HOURS`` (default 48). The Telegram alert channel went
@@ -10,6 +10,19 @@ Monitors TWO pipeline tables in ONE script (operator amendment):
   2. ``paper_daily_summary`` — ``MAX(date)`` must be within
      ``DIGEST_SUMMARY_SLO_DAYS`` (default 2; yesterday's row should land by
      ~02:00 UTC daily). The daily digest stopped writing after 2026-06-26.
+  3. ``narrative_alerts_inbound`` — ``MAX(received_at)`` must be within
+     ``NARRATIVE_INBOUND_SLO_HOURS`` (default 72; the X/narrative inbound feed
+     historically flowed daily). The feed went silently dead 2026-06-24 for
+     16 days — invisible to the two-table lag-watchdog above because a
+     both-sides-quiet feed produces no lag signal, only absence (NAR-02).
+  4. ``tg_social_health`` — any configured tg_social channel (``component
+     LIKE 'channel:%'``) whose ``last_message_at`` is older than
+     ``TG_CHANNEL_STALE_DAYS`` (default 14) is flagged in ONE aggregated line.
+     Of ~9 configured channels only 2-3 are active; @alohcooks went silent 72d
+     with no cross-cutting alarm (NAR-07). This check is a set-scan, not a
+     freshness gate: an absent/empty table is NOT a breach (tg_social is a
+     default-off feature; paging while it is off would only train the operator
+     to ignore the watchdog).
 
 On ANY breach the watchdog sends ONE plain-text Telegram message covering
 every breached check that is not inside its send cooldown (``parse_mode=None``
@@ -18,8 +31,8 @@ every breached check that is not inside its send cooldown (``parse_mode=None``
 logs around the send. The send passes ``raise_on_failure=True`` so a rejected
 page raises (logged ``_alert_failed`` + exit 1) instead of the alerter's
 default swallow-and-return — otherwise this watchdog's own page could die
-silently. A missing OR empty table is itself a breach with a distinct message
-(silence is never ambiguous). Read-only on the DB.
+silently. For the freshness checks (1-3) a missing OR empty table is itself a
+breach with a distinct message (silence is never ambiguous). Read-only on the DB.
 
 Per-table SEND cooldown (``ALERT_CHANNEL_WATCHDOG_COOLDOWN_HOURS``, default 24;
 state files under ``--state-dir``): at most one page per breached table per
@@ -41,8 +54,8 @@ known-broken-being-fixed writer. The cooldown bounds the blast radius to one
 page/table/window, but the ordering is still the correct sequence.
 
 Exit codes:
-  0 — ok (both fresh, or disabled no-op)
-  5 — one or more freshness breaches (page dispatched and/or cooldown-suppressed,
+  0 — ok (all checks fresh, or disabled no-op)
+  5 — one or more breaches (page dispatched and/or cooldown-suppressed,
       or dry-run preview)
   1 — DB missing, runtime error, or alert-dispatch failure
 """
@@ -178,14 +191,128 @@ async def _check_digest_write_rate(
     }
 
 
+async def _check_narrative_inbound_rate(
+    conn: aiosqlite.Connection, slo_hours: int, now: datetime
+) -> dict:
+    """MAX(received_at) in narrative_alerts_inbound must be within the SLO (NAR-02).
+
+    The X/narrative inbound feed historically flowed daily; a both-sides-quiet
+    feed (Hermes X scanner cron dead) produces no lag signal, so absence is the
+    only symptom. A missing OR empty table is a breach (silence is never
+    ambiguous), matching the other freshness checks."""
+    table = "narrative_alerts_inbound"
+    try:
+        cur = await conn.execute(
+            "SELECT MAX(received_at) FROM narrative_alerts_inbound"
+        )
+        row = await cur.fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return {
+                "table": table,
+                "status": "breach",
+                "reason": "table_absent",
+                "last_seen": None,
+                "age_hours": None,
+                "slo_hours": slo_hours,
+            }
+        raise
+    last_seen = row[0] if row else None
+    if last_seen is None:
+        return {
+            "table": table,
+            "status": "breach",
+            "reason": "no_inbound_rows",
+            "last_seen": None,
+            "age_hours": None,
+            "slo_hours": slo_hours,
+        }
+    age_hours = (now - _parse_ts(last_seen)).total_seconds() / 3600.0
+    breached = age_hours > slo_hours
+    return {
+        "table": table,
+        "status": "breach" if breached else "ok",
+        "reason": "stale" if breached else "fresh",
+        "last_seen": last_seen,
+        "age_hours": round(age_hours, 2),
+        "slo_hours": slo_hours,
+    }
+
+
+async def _check_tg_channel_staleness(
+    conn: aiosqlite.Connection, stale_days: int, now: datetime
+) -> dict:
+    """Per-channel tg_social staleness (NAR-07).
+
+    Scans tg_social_health for configured channels (``component LIKE 'channel:%'``,
+    the format the listener writes) and flags any whose ``last_message_at`` is
+    older than ``stale_days`` in ONE aggregated breach line (@handle + age). This
+    is a SET-SCAN, not a freshness gate: an absent/empty table or all-fresh
+    channels is ``ok`` — tg_social is a default-off feature, and paging on its
+    absence would only produce false pages that erode watchdog credibility."""
+    table = "tg_social_health"
+    try:
+        cur = await conn.execute(
+            "SELECT component, last_message_at FROM tg_social_health "
+            "WHERE component LIKE 'channel:%'"
+        )
+        rows = await cur.fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return {
+                "table": table,
+                "status": "ok",
+                "reason": "table_absent",
+                "stale_channels": [],
+                "stale_days": stale_days,
+            }
+        raise
+    stale: list[dict] = []
+    for component, last_at in rows:
+        if last_at is None:
+            continue
+        try:
+            age_days = (now - _parse_ts(last_at)).total_seconds() / 86400.0
+        except (ValueError, TypeError):
+            continue
+        if age_days > stale_days:
+            stale.append(
+                {
+                    "handle": component.removeprefix("channel:"),
+                    "age_days": round(age_days, 1),
+                }
+            )
+    stale.sort(key=lambda c: c["age_days"], reverse=True)
+    return {
+        "table": table,
+        "status": "breach" if stale else "ok",
+        "reason": "channels_stale" if stale else "all_fresh",
+        "stale_channels": stale,
+        "stale_days": stale_days,
+    }
+
+
 async def _evaluate(
-    db_path: str, *, sent_slo_hours: int, digest_slo_days: int, now: datetime
+    db_path: str,
+    *,
+    sent_slo_hours: int,
+    digest_slo_days: int,
+    narrative_slo_hours: int,
+    tg_channel_stale_days: int,
+    now: datetime,
 ) -> dict:
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
         alert = await _check_alert_sent_rate(conn, sent_slo_hours, now)
         digest = await _check_digest_write_rate(conn, digest_slo_days, now)
-    return {"alert_sent_rate": alert, "digest_write_rate": digest}
+        narrative = await _check_narrative_inbound_rate(conn, narrative_slo_hours, now)
+        tg_channel = await _check_tg_channel_staleness(conn, tg_channel_stale_days, now)
+    return {
+        "alert_sent_rate": alert,
+        "digest_write_rate": digest,
+        "narrative_inbound_rate": narrative,
+        "tg_channel_staleness": tg_channel,
+    }
 
 
 def _compose_message(checks: dict, include: list[str]) -> str:
@@ -231,6 +358,35 @@ def _compose_message(checks: dict, include: list[str]) -> str:
                 f"({d['age_days']}d ago) exceeds SLO {d['slo_days']}d — the daily "
                 "digest writer has stalled"
             )
+
+    n = checks["narrative_inbound_rate"]
+    if "narrative_inbound_rate" in include and n["status"] == "breach":
+        if n["reason"] == "table_absent":
+            lines.append(
+                "- narrative_alerts_inbound: table missing/absent — no X/narrative "
+                f"inbound audit trail exists (SLO {n['slo_hours']}h)"
+            )
+        elif n["reason"] == "no_inbound_rows":
+            lines.append(
+                "- narrative_alerts_inbound: NO rows in table — the X/narrative "
+                f"inbound feed has never delivered or is fully dark (SLO {n['slo_hours']}h)"
+            )
+        else:
+            lines.append(
+                f"- narrative_alerts_inbound: last inbound row at {n['last_seen']} "
+                f"({n['age_hours']}h ago) exceeds SLO {n['slo_hours']}h — the "
+                "X/narrative inbound feed (Hermes X scanner) is likely dead"
+            )
+
+    t = checks["tg_channel_staleness"]
+    if "tg_channel_staleness" in include and t["status"] == "breach":
+        listing = ", ".join(
+            f"{c['handle']} ({c['age_days']}d)" for c in t["stale_channels"]
+        )
+        lines.append(
+            f"- tg_social_health: {len(t['stale_channels'])} channel(s) silent "
+            f"> {t['stale_days']}d — {listing}"
+        )
 
     lines.append("Check the pipeline/digest cron and the Telegram delivery path.")
     return "\n".join(lines)
@@ -311,6 +467,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--sent-slo-hours", type=int, default=48)
     parser.add_argument("--digest-slo-days", type=int, default=2)
+    parser.add_argument("--narrative-inbound-slo-hours", type=int, default=72)
+    parser.add_argument("--tg-channel-stale-days", type=int, default=14)
     parser.add_argument("--cooldown-hours", type=int, default=24)
     parser.add_argument(
         "--state-dir", default="/var/lib/gecko-alpha/alert-channel-watchdog"
@@ -342,6 +500,8 @@ def main(argv: list[str] | None = None) -> int:
                 str(db_path),
                 sent_slo_hours=args.sent_slo_hours,
                 digest_slo_days=args.digest_slo_days,
+                narrative_slo_hours=args.narrative_inbound_slo_hours,
+                tg_channel_stale_days=args.tg_channel_stale_days,
                 now=now,
             )
         )
@@ -357,13 +517,18 @@ def main(argv: list[str] | None = None) -> int:
     breaches = [k for k, v in checks.items() if v["status"] == "breach"]
 
     if not breaches:
-        # Healthy: one-line OK log carrying both freshness ages.
+        # Healthy: one-line OK log carrying every check's freshness age.
         _log.info(
             "alert_channel_watchdog_ok",
             alert_last_seen=checks["alert_sent_rate"]["last_seen"],
             alert_age_hours=checks["alert_sent_rate"]["age_hours"],
             digest_last_seen=checks["digest_write_rate"]["last_seen"],
             digest_age_days=checks["digest_write_rate"]["age_days"],
+            narrative_last_seen=checks["narrative_inbound_rate"]["last_seen"],
+            narrative_age_hours=checks["narrative_inbound_rate"]["age_hours"],
+            tg_channel_stale_count=len(
+                checks["tg_channel_staleness"]["stale_channels"]
+            ),
         )
         print(
             json.dumps(
