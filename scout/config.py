@@ -507,6 +507,21 @@ class Settings(BaseSettings):
     CHAIN_MATCHES_RETENTION_DAYS: int = 45
     HOLDER_SNAPSHOTS_RETENTION_DAYS: int = 14
 
+    # -------- Hygiene-lane table retention (INF-02 / INF-06) --------
+    # Independent hourly prunes via main._run_hourly_maintenance.
+    # INF-02: trade_decision_events was the fastest-growing unpruned table
+    # (~16.5K rows/day, absent from every prune list). ge floor = largest
+    # consumer lookback (suppression_cost_rollup --window-days default 7d;
+    # check_trade_decision_events uses 15min; evaluator's per-trade dedup is
+    # bounded by PAPER_MAX_DURATION_HOURS=48h). 45d default clears them all.
+    TRADE_DECISION_EVENTS_RETENTION_DAYS: int = Field(default=45, ge=7)
+    # INF-06: volume_history_cg's other prune lives in the spike detector
+    # (scout/spikes/detector.py) and runs ONLY when VOLUME_SPIKE_ENABLED is on.
+    # This decouples retention from the flag. 7d matches the detector cutoff
+    # AND the longest reader horizon (ledger r7d labeling + spike 7d average) —
+    # harmless duplication when the flag is on.
+    VOLUME_HISTORY_CG_RETENTION_DAYS: int = Field(default=7, ge=7)
+
     # BL-NEW-TG-BURST-PROFILE: per-call instrumentation for TG dispatch
     # frequency. Default True for the 4-week measurement window; toggle
     # False via .env to disable if instrumentation overhead surfaces.

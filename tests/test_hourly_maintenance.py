@@ -39,6 +39,9 @@ def _make_db_mock(score_pruned: int = 0, volume_pruned: int = 0) -> MagicMock:
     db.prune_chain_matches = AsyncMock(return_value=0)
     db.prune_holder_snapshots = AsyncMock(return_value=0)
     db.prune_conviction_watchlist_snapshots = AsyncMock(return_value=0)
+    # INF-02 + INF-06: two new independent hourly prunes
+    db.prune_trade_decision_events = AsyncMock(return_value=0)
+    db.prune_volume_history_cg = AsyncMock(return_value=0)
     # BL-NEW-SQLITE-WAL-PROFILE cycle 4: probe_wal_state hook
     db.probe_wal_state = AsyncMock(
         return_value={
@@ -82,6 +85,42 @@ async def test_run_hourly_maintenance_calls_volume_snapshots_prune(tmp_path):
 
     db.prune_volume_snapshots.assert_awaited_once_with(
         keep_days=settings.VOLUME_SNAPSHOTS_RETENTION_DAYS
+    )
+
+
+async def test_run_hourly_maintenance_calls_trade_decision_events_prune(tmp_path):
+    """INF-02: _run_hourly_maintenance must prune trade_decision_events with the
+    configured retention (fastest-growing previously-unpruned table)."""
+    settings = _make_settings(tmp_path)
+    db = _make_db_mock()
+
+    await _run_hourly_maintenance(db, MagicMock(), settings, MagicMock())
+
+    db.prune_trade_decision_events.assert_awaited_once_with(
+        keep_days=settings.TRADE_DECISION_EVENTS_RETENTION_DAYS
+    )
+
+
+async def test_run_hourly_maintenance_prunes_volume_history_cg_when_spike_disabled(
+    tmp_path,
+):
+    """INF-06: the volume_history_cg prune is decoupled from VOLUME_SPIKE_ENABLED.
+    The detector carries the ONLY other prune and runs only when the spike flag
+    is on; this independent prune must still fire with the flag OFF."""
+    settings = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        DB_PATH=tmp_path / "scout.db",
+        VOLUME_SPIKE_ENABLED=False,
+    )
+    db = _make_db_mock()
+
+    await _run_hourly_maintenance(db, MagicMock(), settings, MagicMock())
+
+    db.prune_volume_history_cg.assert_awaited_once_with(
+        keep_days=settings.VOLUME_HISTORY_CG_RETENTION_DAYS
     )
 
 

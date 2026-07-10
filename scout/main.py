@@ -1521,6 +1521,39 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
     except Exception:
         logger.exception("volume_snapshots_prune_failed")
 
+    # INF-02: trade_decision_events is the fastest-growing previously-unpruned
+    # table (~16.5K rows/day). Independent hourly prune; the retention floor
+    # covers every consumer lookback (see TRADE_DECISION_EVENTS_RETENTION_DAYS).
+    try:
+        pruned_tde = await db.prune_trade_decision_events(
+            keep_days=settings.TRADE_DECISION_EVENTS_RETENTION_DAYS
+        )
+        if pruned_tde:
+            logger.info(
+                "trade_decision_events_pruned",
+                rows_deleted=pruned_tde,
+                keep_days=settings.TRADE_DECISION_EVENTS_RETENTION_DAYS,
+            )
+    except Exception:
+        logger.exception("trade_decision_events_prune_failed")
+
+    # INF-06: volume_history_cg's only other prune lives in the spike detector
+    # (scout/spikes/detector.py) and runs ONLY when VOLUME_SPIKE_ENABLED is on.
+    # This independent hourly prune decouples retention from the feature flag;
+    # the 7d cutoff duplicates the detector's own — harmless when the flag is on.
+    try:
+        pruned_vh = await db.prune_volume_history_cg(
+            keep_days=settings.VOLUME_HISTORY_CG_RETENTION_DAYS
+        )
+        if pruned_vh:
+            logger.info(
+                "volume_history_cg_pruned",
+                rows_deleted=pruned_vh,
+                keep_days=settings.VOLUME_HISTORY_CG_RETENTION_DAYS,
+            )
+    except Exception:
+        logger.exception("volume_history_cg_prune_failed")
+
     # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 6 narrative-owned
     # tables parameterized + decoupled from narrative daily loop.
     # NOTE: cycle 1's score_history + volume_snapshots prunes above are

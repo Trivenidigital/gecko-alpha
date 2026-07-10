@@ -7932,6 +7932,41 @@ class Database:
         await self._conn.commit()
         return cur.rowcount or 0
 
+    async def prune_trade_decision_events(self, *, keep_days: int) -> int:
+        """Delete ``trade_decision_events`` rows older than ``keep_days`` (INF-02).
+
+        ``created_at`` is written via ``datetime.now(timezone.utc).isoformat()``
+        (scout/trading/decision_events.py), so the isoformat cutoff compares
+        order-correctly. Returns rowcount.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM trade_decision_events WHERE created_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_volume_history_cg(self, *, keep_days: int) -> int:
+        """Delete ``volume_history_cg`` rows older than ``keep_days`` (INF-06).
+
+        Independent of VOLUME_SPIKE_ENABLED (which gates the detector's own 7d
+        prune). ``recorded_at`` is written via ``.isoformat()``
+        (scout/spikes/detector.py), so the isoformat cutoff compares
+        order-correctly. Returns rowcount.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM volume_history_cg WHERE recorded_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
     # ------------------------------------------------------------------
     # Observability — measurement-only methods (no DB mutations)
     # BL-NEW-SQLITE-WAL-PROFILE (cycle 4)
