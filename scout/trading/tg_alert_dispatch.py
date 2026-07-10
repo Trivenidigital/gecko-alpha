@@ -91,6 +91,72 @@ async def _check_eligibility(db: Database, signal_type: str) -> bool:
     return bool(row and row[0])
 
 
+async def _fetch_signal_sl_pct(db: Database, signal_type: str) -> float | None:
+    """Per-signal configured stop-loss percent (signal_params.sl_pct).
+
+    Reused for the ALR-01 SL-in-price line. Fail-soft — a read error must
+    never break the alert; the risk block is simply omitted.
+    """
+    if db._conn is None:
+        return None
+    try:
+        cur = await db._conn.execute(
+            "SELECT sl_pct FROM signal_params WHERE signal_type = ?",
+            (signal_type,),
+        )
+        row = await cur.fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+    except Exception:
+        log.exception("tg_alert_sl_pct_fetch_failed", signal_type=signal_type)
+        return None
+
+
+async def _fetch_trade_lead_time(
+    db: Database, paper_trade_id: int | None
+) -> tuple[float | None, str | None]:
+    """Lead-time-vs-trending (minutes, status) for the ALR-01 earliness line.
+
+    Read from the just-opened paper_trades row. Fail-soft.
+    """
+    if db._conn is None or paper_trade_id is None:
+        return (None, None)
+    try:
+        cur = await db._conn.execute(
+            "SELECT lead_time_vs_trending_min, lead_time_vs_trending_status "
+            "FROM paper_trades WHERE id = ?",
+            (paper_trade_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return (None, None)
+        mins = float(row[0]) if row[0] is not None else None
+        return (mins, row[1])
+    except Exception:
+        log.exception("tg_alert_lead_time_fetch_failed", paper_trade_id=paper_trade_id)
+        return (None, None)
+
+
+async def _fetch_liquidity_enriched(db: Database, token_id: str) -> float | None:
+    """Enriched liquidity for the token (candidates.liquidity_usd_enriched).
+
+    Populated by the #382 enrichment cron; NULL until then, in which case
+    the ALR-01 Liq line is skipped silently. Fail-soft.
+    """
+    if db._conn is None:
+        return None
+    try:
+        cur = await db._conn.execute(
+            "SELECT liquidity_usd_enriched FROM candidates "
+            "WHERE contract_address = ?",
+            (token_id,),
+        )
+        row = await cur.fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+    except Exception:
+        log.exception("tg_alert_liquidity_fetch_failed", token_id=token_id)
+        return None
+
+
 async def _check_cooldown(db: Database, settings: Settings, token_id: str) -> bool:
     """Returns True if cooldown is in effect (block the alert).
 
@@ -159,6 +225,35 @@ def _fmt_price(p):
     return f"${p:.8f}"
 
 
+def _fmt_earliness(lead_time_min: float | None, lead_time_status: str | None) -> str:
+    """ALR-01 earliness line — honest lead-time vs CoinGecko trending.
+
+    Sign convention matches _compute_lead_time_vs_trending (engine.py):
+    NEGATIVE lead_time = opened BEFORE the coin trended (beat CG);
+    POSITIVE = opened AFTER (late). Any non-'ok' status (no trending
+    snapshot for the token, or a compute error) renders as
+    'no trending reference' rather than a fabricated number.
+    """
+    if lead_time_status == "ok" and lead_time_min is not None:
+        mins = abs(int(round(lead_time_min)))
+        direction = "before" if lead_time_min < 0 else "after"
+        return f"{mins} min {direction} CG trending"
+    return "no trending reference"
+
+
+def _build_deep_link(
+    dashboard_base_url: str | None, paper_trade_id: int | None
+) -> str | None:
+    """ALR-09 dashboard deep link: stable hash route to the trade's row.
+
+    Returns None (line omitted) when the base URL is empty (operator
+    off-switch) or the trade id is missing.
+    """
+    if not dashboard_base_url or paper_trade_id is None:
+        return None
+    return f"{dashboard_base_url.rstrip('/')}/#/trade/{paper_trade_id}"
+
+
 def format_paper_trade_alert(
     *,
     signal_type: str,
@@ -168,8 +263,14 @@ def format_paper_trade_alert(
     amount_usd: float,
     signal_data: dict | None,
     minara_command: str | None = None,
+    sl_pct: float | None = None,
+    lead_time_min: float | None = None,
+    lead_time_status: str | None = None,
+    paper_trade_id: int | None = None,
+    dashboard_base_url: str | None = None,
+    liquidity_usd_enriched: float | None = None,
 ) -> str:
-    """Concise single-line + extras Telegram body for a paper-trade open.
+    """Telegram body for a paper-trade open — ALR-01 actionable card.
 
     R1-C1 fold: caller MUST dispatch with parse_mode=None — signal_type
     contains underscores that Markdown parses as italic delimiters,
@@ -178,11 +279,19 @@ def format_paper_trade_alert(
     R2-C1 fold: per-signal field maps verified against actual emissions
     in scout/trading/signals.py.
 
-    R2-format fold: header line is single-line glanceable; per-signal
-    detail follows; CoinGecko link last for one-tap research.
+    ALR-01 alert-body-v2 adds (all opt-in via the new kwargs, so legacy
+    callers that pass none get the pre-v2 body verbatim):
+      - Entry / SL-in-price / invalidation risk block, derived from the
+        per-signal `sl_pct` (SL price = entry × (1 − sl_pct/100)). The SL
+        line states the level is PRE-slippage: configured stops fill worse
+        than −sl_pct in practice, so the card must never imply the fill.
+      - a Liquidity slot, rendered ONLY when candidates.liquidity_usd_enriched
+        is populated for the token (#382 fills it later — skip silently now).
+      - an earliness line vs CG trending (from lead_time_vs_trending_min).
+      - the ALR-09 dashboard deep link as the final one-tap page→row CTA.
 
     BL-NEW-M1.5C: when `minara_command` is supplied (Solana-listed token),
-    appends a `Run: <cmd>` line BEFORE the coingecko link for operator
+    a `Run: <cmd>` line is inserted BEFORE the coingecko link for operator
     copy-paste into their local Minara CLI.
     """
     sd = signal_data or {}
@@ -209,14 +318,40 @@ def format_paper_trade_alert(
             extras.append(f"mcap {_fmt_mcap(sd['mcap'])}")
     detail = " · ".join(extras) if extras else None
     link = f"coingecko.com/en/coins/{coin_id}"
+
     parts = [header]
     if detail:
         parts.append(detail)
+
+    # ALR-01 risk block: explicit entry, stop-in-price, invalidation. The
+    # SL level is the CONFIGURED stop before slippage — realized fills have
+    # averaged worse, so the wording never implies the actual fill.
+    if sl_pct is not None:
+        sl_price = entry_price * (1.0 - sl_pct / 100.0)
+        parts.append(f"Entry: {_fmt_price(entry_price)}")
+        parts.append(f"SL: {_fmt_price(sl_price)} (-{sl_pct:.1f}% before slippage)")
+        parts.append(f"Invalid below {_fmt_price(sl_price)}")
+
+    # ALR-01 liquidity slot: only when #382 enrichment has populated it.
+    if liquidity_usd_enriched is not None:
+        parts.append(f"Liq: {_fmt_mcap(liquidity_usd_enriched)}")
+
+    # ALR-01 earliness line: rendered whenever the caller supplies a
+    # lead-time status (populated → before/after; else no-reference).
+    if lead_time_status is not None:
+        parts.append(_fmt_earliness(lead_time_min, lead_time_status))
+
     if minara_command:
         # M1.5c: copy-paste shell command for Solana DEX-eligible tokens.
         # Inserted BEFORE the coingecko link so it's prominent.
         parts.append(f"Run: {minara_command}")
     parts.append(link)
+
+    # ALR-09 deep link appended last — the primary one-tap page→row CTA.
+    deep_link = _build_deep_link(dashboard_base_url, paper_trade_id)
+    if deep_link is not None:
+        parts.append(f"Dashboard: {deep_link}")
+
     return "\n".join(parts)
 
 
@@ -419,6 +554,15 @@ async def notify_paper_trade_opened(
         # If format raises (string mcap, list signal_data), the
         # pre-emptive 'sent' row would otherwise persist -> cooldown
         # query suppresses next legitimate alert for 6h.
+        # ALR-01 v2 card inputs (all fail-soft reads — a missing value just
+        # omits its line): per-signal stop, lead-time-vs-trending, enriched
+        # liquidity. Combined with the ALR-09 deep link from settings.
+        sl_pct = await _fetch_signal_sl_pct(db, signal_type)
+        lead_time_min, lead_time_status = await _fetch_trade_lead_time(
+            db, paper_trade_id
+        )
+        liquidity_usd_enriched = await _fetch_liquidity_enriched(db, token_id)
+
         try:
             body = format_paper_trade_alert(
                 signal_type=signal_type,
@@ -428,6 +572,12 @@ async def notify_paper_trade_opened(
                 amount_usd=amount_usd,
                 signal_data=signal_data,
                 minara_command=minara_cmd,
+                sl_pct=sl_pct,
+                lead_time_min=lead_time_min,
+                lead_time_status=lead_time_status,
+                paper_trade_id=paper_trade_id,
+                dashboard_base_url=settings.DASHBOARD_BASE_URL,
+                liquidity_usd_enriched=liquidity_usd_enriched,
             )
             # §12b: emit a structured log BEFORE the send so every dispatch
             # is traceable in journalctl regardless of delivery outcome (the
