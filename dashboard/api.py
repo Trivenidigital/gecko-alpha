@@ -80,6 +80,32 @@ class TgAlertOperatorActionRequest(BaseModel):
     note: str | None = Field(default=None, max_length=500)
 
 
+def _build_alert_outcome(row) -> dict:
+    """Shape the linked-paper-trade outcome for one sent TG alert (DASH-06).
+
+    ``row`` is the LEFT JOIN result over paper_trades. It distinguishes:
+      - unlinked : no paper_trade_id FK (the ~19% that never opened a trade)
+      - missing  : FK set but the paper_trades row is gone (ON DELETE SET
+                   NULL race / manual delete) — surfaced, never silently blank
+      - open     : trade open, no realized pnl yet (peak_pct may be running)
+      - closed   : realized pnl present (pnl_usd not NULL)
+    """
+    if row["paper_trade_id"] is None:
+        return {"linked": False, "state": "unlinked"}
+    if row["pt_status"] is None:
+        return {"linked": True, "state": "missing"}
+    closed = row["pt_pnl_usd"] is not None
+    return {
+        "linked": True,
+        "state": "closed" if closed else "open",
+        "status": row["pt_status"],
+        "pnl_usd": row["pt_pnl_usd"],
+        "pnl_pct": row["pt_pnl_pct"],
+        "exit_reason": row["pt_exit_reason"],
+        "peak_pct": row["pt_peak_pct"],
+    }
+
+
 def create_app(db_path: str | None = None) -> FastAPI:
     """Create the FastAPI application with the given DB path."""
     global _db_path
@@ -149,13 +175,25 @@ def create_app(db_path: str | None = None) -> FastAPI:
         classify, rank, or dispatch alerts.
         """
         sdb = await _get_scout_db(_db_path)
+        # DASH-06: join the linked paper_trade outcome (pnl/exit/peak) onto
+        # each sent alert. 81% of sent rows carry a paper_trade_id FK; the
+        # LEFT JOIN keeps the unlinked 19% visible (rendered as an explicit
+        # 'unlinked' tag, never dropped). pnl_usd is NULL until a trade
+        # closes, so it distinguishes open vs closed outcomes.
         cur = await sdb._conn.execute(
             """SELECT l.id, l.paper_trade_id, l.signal_type, l.token_id,
                       l.alerted_at, l.detail,
-                      a.action, a.note, a.source, a.marked_at, a.updated_at
+                      a.action, a.note, a.source, a.marked_at, a.updated_at,
+                      p.status     AS pt_status,
+                      p.pnl_usd    AS pt_pnl_usd,
+                      p.pnl_pct    AS pt_pnl_pct,
+                      p.exit_reason AS pt_exit_reason,
+                      p.peak_pct   AS pt_peak_pct
                FROM tg_alert_log l
                LEFT JOIN tg_alert_operator_actions a
                  ON a.tg_alert_log_id = l.id
+               LEFT JOIN paper_trades p
+                 ON p.id = l.paper_trade_id
                WHERE l.outcome = 'sent'
                ORDER BY datetime(l.alerted_at) DESC, l.id DESC
                LIMIT ?""",
@@ -163,6 +201,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         )
         rows = await cur.fetchall()
         alerts = []
+        linked_count = 0
         for r in rows:
             operator_action = None
             if r["action"] is not None:
@@ -173,6 +212,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     "marked_at": r["marked_at"],
                     "updated_at": r["updated_at"],
                 }
+            outcome = _build_alert_outcome(r)
+            if outcome["linked"]:
+                linked_count += 1
             alerts.append(
                 {
                     "id": r["id"],
@@ -182,6 +224,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     "alerted_at": r["alerted_at"],
                     "detail": r["detail"],
                     "operator_action": operator_action,
+                    "outcome": outcome,
                 }
             )
         return {
@@ -191,7 +234,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 "not_for_execution": True,
                 "not_for_sizing": True,
                 "operator_action_telemetry_available": True,
+                "outcome_linkage_available": True,
                 "rows_returned": len(alerts),
+                "rows_linked": linked_count,
             },
             "alerts": alerts,
         }
@@ -223,6 +268,21 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/funnel/latest", response_model=FunnelResponse)
     async def get_funnel():
         return await db.get_funnel(_db_path)
+
+    @app.get("/api/dispatch_funnel")
+    async def get_dispatch_funnel(days: int = Query(1, ge=1, le=90)):
+        """Why-nothing-fired reason breakdown over trade_decision_events.
+
+        Read-only visibility surface. It reports the block-reason split the
+        dispatcher already recorded (suppressed / signal_disabled /
+        below_min_market_cap / late_pump / ...) plus the opened count for the
+        last ``days`` days. It does not classify, rank, alert, or dispatch.
+
+        No ``response_model``: the reason vocabulary is data-driven (whatever
+        the engine wrote), so the shape is returned as a plain dict — same
+        precedent as ``/api/tg_alerts/recent``.
+        """
+        return await db.get_dispatch_funnel(_db_path, days=days)
 
     @app.get("/api/win-rate", response_model=WinRateResponse)
     async def get_win_rate():

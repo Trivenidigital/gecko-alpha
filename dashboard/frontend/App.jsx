@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import StatBar from './components/StatBar.jsx'
 import PipelineFunnel from './components/PipelineFunnel.jsx'
+import DispatchFunnelPanel from './components/DispatchFunnelPanel.jsx'
 import CandidatesTable from './components/CandidatesTable.jsx'
 import SignalHitRate from './components/SignalHitRate.jsx'
 import AlertFeed from './components/AlertFeed.jsx'
@@ -270,6 +271,8 @@ export default function App() {
         <>
           <StatBar status={status} />
           <PipelineFunnel funnel={funnel} />
+
+          <DispatchFunnelPanel />
 
           <div className="main-grid">
             <CandidatesTable candidates={candidates} />

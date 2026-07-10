@@ -36,6 +36,39 @@ function parseList(raw) {
   }
 }
 
+function fmtPct(v) {
+  if (v == null || !Number.isFinite(v)) return '–'
+  const sign = v >= 0 ? '+' : ''
+  return `${sign}${v.toFixed(1)}%`
+}
+
+function fmtUsd(v) {
+  if (v == null || !Number.isFinite(v)) return '–'
+  const sign = v >= 0 ? '+' : '-'
+  return `${sign}$${Math.abs(v).toFixed(2)}`
+}
+
+// DASH-06: linked paper-trade outcome for a sent alert. 81% of sent rows
+// carry a paper_trade_id; unlinked rows (and the defensive 'missing' case
+// for a dangling historical FK) show an explicit 'unlinked' tag, never blank.
+function OutcomeCell({ outcome }) {
+  if (!outcome || !outcome.linked || outcome.state === 'missing') {
+    return <span className="tg-badge tg-badge-muted">unlinked</span>
+  }
+  if (outcome.state === 'open') {
+    const peak = outcome.peak_pct != null ? ` · peak ${fmtPct(outcome.peak_pct)}` : ''
+    return <span className="tg-badge tg-badge-info">open{peak}</span>
+  }
+  // closed — realized PnL present
+  const positive = (outcome.pnl_usd ?? 0) >= 0
+  return (
+    <span className={`tg-badge ${positive ? 'tg-badge-ok' : 'tg-badge-warn'}`}>
+      {fmtUsd(outcome.pnl_usd)} / {fmtPct(outcome.pnl_pct)}
+      {outcome.exit_reason ? ` · ${outcome.exit_reason}` : ''}
+    </span>
+  )
+}
+
 function ResolutionBadge({ resolution }) {
   if (!resolution || !resolution.state) {
     return <span className="tg-badge tg-badge-muted">no signal</span>
@@ -259,6 +292,7 @@ export default function TGAlertsTab() {
                 <th>Signal</th>
                 <th>Token</th>
                 <th>Paper trade</th>
+                <th>Outcome</th>
                 <th>Label</th>
                 <th>Mark</th>
               </tr>
@@ -272,6 +306,7 @@ export default function TGAlertsTab() {
                     <td>{a.signal_type}</td>
                     <td>{a.token_id}</td>
                     <td>{a.paper_trade_id ? `#${a.paper_trade_id}` : '-'}</td>
+                    <td><OutcomeCell outcome={a.outcome} /></td>
                     <td>
                       <span className={`tg-badge ${current ? 'tg-badge-info' : 'tg-badge-muted'}`}>
                         {current ? actionLabels[current] : 'unmarked'}

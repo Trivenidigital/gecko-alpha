@@ -749,6 +749,62 @@ async def get_funnel(db_path: str) -> dict:
     }
 
 
+async def get_dispatch_funnel(db_path: str, days: int = 1) -> dict:
+    """Reason-count breakdown of dispatch decisions over a rolling window.
+
+    Answers the trader's "why is nothing firing" question directly from
+    ``trade_decision_events``: groups every blocked dispatch decision by its
+    reason with a count, plus the opened count, over the last ``days`` days.
+
+    Read-only visibility surface — it classifies nothing, ranks nothing, and
+    drives no control flow. ``created_at`` is written as
+    ``datetime.now(timezone.utc).isoformat()`` (tz-aware ``+00:00``); the
+    lower bound is produced the same way so the string comparison stays a
+    like-for-like ISO-8601 compare (no ``datetime()``-vs-raw mismatch).
+    """
+    days = max(1, int(days))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    async with _ro_db(db_path) as conn:
+        cursor = await conn.execute(
+            """SELECT decision, reason, COUNT(*) AS n
+               FROM trade_decision_events
+               WHERE created_at >= ?
+               GROUP BY decision, reason
+               ORDER BY n DESC, reason ASC""",
+            (since,),
+        )
+        rows = await cursor.fetchall()
+
+    reasons: list[dict] = []
+    opened = 0
+    blocked = 0
+    total = 0
+    for row in rows:
+        d = dict(row)
+        n = int(d["n"] or 0)
+        total += n
+        if d["decision"] == "opened":
+            opened += n
+        elif d["decision"] == "blocked":
+            blocked += n
+        reasons.append({"decision": d["decision"], "reason": d["reason"], "count": n})
+
+    return {
+        "meta": {
+            "read_only": True,
+            "not_for_alerting": True,
+            "not_for_execution": True,
+            "not_for_sizing": True,
+        },
+        "window_days": days,
+        "since": since,
+        "total_events": total,
+        "opened": opened,
+        "blocked": blocked,
+        "reasons": reasons,
+    }
+
+
 async def get_quality_signals(
     db_path: str, max_mcap: float = 500_000_000, limit: int = 30
 ) -> list[dict]:
