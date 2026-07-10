@@ -116,6 +116,25 @@ async def _check_cooldown(db: Database, settings: Settings, token_id: str) -> bo
     return (await cur.fetchone()) is not None
 
 
+def _check_universe(settings: Settings, token_id: str) -> str | None:
+    """Return the first exclude-pattern matching token_id, else None.
+
+    BL-NEW-ALERT-UNIVERSE-FILTER: keeps out-of-universe CoinGecko ids
+    (tokenized equities / ETFs such as `spy-bstocks-tokenized-stock`) off
+    the operator-facing alert path. Matching is a case-insensitive substring
+    of token_id (the CoinGecko slug) against ALERT_UNIVERSE_EXCLUDE_ID_PATTERNS,
+    first-match-wins in list order. Returns None (no block) when the flag is
+    OFF. The paper ENGINE is unaffected — only the TG send is suppressed.
+    """
+    if not settings.ALERT_UNIVERSE_FILTER_ENABLED:
+        return None
+    lowered = token_id.lower()
+    for pattern in settings.ALERT_UNIVERSE_EXCLUDE_ID_PATTERNS:
+        if pattern.lower() in lowered:
+            return pattern
+    return None
+
+
 def _fmt_mcap(mcap):
     if mcap is None:
         return "?"
@@ -218,7 +237,9 @@ async def notify_paper_trade_opened(
 
     Never raises. Always writes a tg_alert_log row recording the outcome
     (sent / blocked_eligibility / blocked_cooldown / dispatch_failed) for
-    audit.
+    audit. The BL-NEW-ALERT-UNIVERSE-FILTER guard reuses the
+    'blocked_eligibility' outcome with detail='universe_filter:<pattern>' when
+    an out-of-universe token_id (e.g. a tokenized equity) is suppressed.
 
     R2-C2 design-stage fold: atomic check-then-write under db._txn_lock.
     Cooldown check + pre-emptive 'sent' row INSERT happen under a single
@@ -235,6 +256,30 @@ async def notify_paper_trade_opened(
                 signal_type=signal_type,
                 token_id=token_id,
                 outcome="blocked_eligibility",
+            )
+            return
+
+        # BL-NEW-ALERT-UNIVERSE-FILTER: suppress out-of-universe ids
+        # (tokenized equities / ETFs) on the operator-facing path. Reuses the
+        # 'blocked_eligibility' outcome (deliberate operator amendment — no new
+        # CHECK-constraint value / migration) with a universe_filter:<pattern>
+        # detail so the contamination is quantifiable for a later dispatch-layer
+        # decision. Runs AFTER eligibility, BEFORE the atomic dedup claim.
+        universe_pattern = _check_universe(settings, token_id)
+        if universe_pattern is not None:
+            await _log_outcome(
+                db,
+                paper_trade_id=paper_trade_id,
+                signal_type=signal_type,
+                token_id=token_id,
+                outcome="blocked_eligibility",
+                detail=f"universe_filter:{universe_pattern}",
+            )
+            log.info(
+                "tg_alert_blocked_universe",
+                token_id=token_id,
+                signal_type=signal_type,
+                pattern=universe_pattern,
             )
             return
 

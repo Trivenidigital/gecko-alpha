@@ -634,6 +634,23 @@ class Settings(BaseSettings):
     # off-by-one. See global CLAUDE.md §12b for the co-shipped audit logs.
     TG_ALERT_DEDUP_WINDOW_HOURS: int = Field(default=24, ge=0)
 
+    # BL-NEW-ALERT-UNIVERSE-FILTER: operator-facing universe guard on the
+    # paper-trade-open Telegram alert path. Some CoinGecko-sourced ids are
+    # tokenized equities / ETFs (e.g. `spy-bstocks-tokenized-stock`) that fall
+    # outside this product's early micro-cap crypto universe — alerting on them
+    # is a trader-trust killer. When enabled, any alert whose token_id (the
+    # CoinGecko slug) contains one of EXCLUDE_ID_PATTERNS (case-insensitive
+    # substring) is suppressed and audited as outcome='blocked_eligibility'
+    # detail='universe_filter:<pattern>'. Default OFF (observe-first); the
+    # pattern list is operator-extensible via .env (comma-separated). NOTE: the
+    # paper ENGINE still opens trades on these tokens — this filter only stops
+    # the operator-facing send.
+    ALERT_UNIVERSE_FILTER_ENABLED: bool = False
+    ALERT_UNIVERSE_EXCLUDE_ID_PATTERNS: list[str] = [
+        "-bstocks-tokenized-stock",
+        "-tokenized-stock",
+    ]
+
     # BL-NEW-TRADE-SURFACE-TG-ALERTS: optional scarce Telegram alert lane
     # sourced from the Today Focus and Now Tradable dashboard surfaces. Kept
     # behind an env flag because it creates new operator-facing messages; the
@@ -1373,6 +1390,15 @@ class Settings(BaseSettings):
         if len(v) > 200:
             # Binance URL-length + subscription-rate safety (design spec §3.4).
             raise ValueError("PERP_SYMBOLS exceeds max length 200")
+        return v
+
+    @field_validator("ALERT_UNIVERSE_EXCLUDE_ID_PATTERNS", mode="before")
+    @classmethod
+    def parse_alert_universe_exclude_id_patterns(cls, v: str | list[str]) -> list[str]:
+        # Operator-extensible via .env as a comma-separated string; also
+        # accepts a native list (test overrides / programmatic construction).
+        if isinstance(v, str):
+            return [p.strip() for p in v.split(",") if p.strip()]
         return v
 
     @field_validator("SECONDWAVE_ALERT_THRESHOLD")
