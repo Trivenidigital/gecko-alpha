@@ -211,6 +211,15 @@ async def _enroll_token_locked(
     "unlabelable: coverage lost to cap eviction." Ledger rows of evicted
     tokens are NOT retroactively re-stamped; their enrollment_status stays
     'enrolled' and the eviction log is the censoring record.
+
+    Durable DB marker (BL-NEW-LEDGER-EVICTION-DB-MARKER, #406 ruling): the
+    journal log is size-rotated (~3wk clock on srilu), so each eviction ALSO
+    writes a per-token ``ledger_enrollment_evictions`` row IN THE SAME
+    transaction as the DELETE (the caller commits after this returns). The DB
+    marker — not the rotating journal — is the durable censoring record;
+    ``evicted_at`` on the marker equals the same field on the log line so the
+    one-time journal backfill dedups against live rows. INSERT OR IGNORE on
+    the UNIQUE(token_id, evicted_at) key makes the write self-idempotent.
     """
     ttl_days = int(getattr(settings, "LEDGER_ENROLLMENT_TTL_DAYS", 7))
     max_active = int(getattr(settings, "LEDGER_ENROLLMENT_MAX_ACTIVE", 200))
@@ -238,12 +247,25 @@ async def _enroll_token_locked(
             f"DELETE FROM ledger_enrollments WHERE token_id IN ({placeholders})",
             evicted_ids,
         )
+        # Durable per-token censoring record (same txn as the DELETE — the
+        # caller commits after we return). evicted_at is shared with the log
+        # line below and is the backfill dedup key. INSERT OR IGNORE keeps the
+        # write self-idempotent against the UNIQUE(token_id, evicted_at) key.
+        evicted_at = now.isoformat()
+        for evicted_id in evicted_ids:
+            await conn.execute(
+                "INSERT OR IGNORE INTO ledger_enrollment_evictions "
+                "(token_id, evicted_at, evicted_for, max_active, n_evicted, source) "
+                "VALUES (?, ?, ?, ?, ?, 'live')",
+                (evicted_id, evicted_at, token_id, max_active, len(evicted_ids)),
+            )
         log.info(
             "ledger_enrollment_evicted",
             evicted_token_ids=evicted_ids,
             n_evicted=len(evicted_ids),
             max_active=max_active,
             evicted_for=token_id,
+            evicted_at=evicted_at,
         )
 
 

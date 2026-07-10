@@ -186,6 +186,11 @@ class Database:
         # paper_trade_entry_snapshots. Runs AFTER the actionability snapshot
         # migration (its ALTER target table) — additive, idempotent.
         await self._migrate_entry_snapshot_liquidity_provenance_v1()
+        # BL-NEW-LEDGER-EVICTION-DB-MARKER (#406 ruling): durable per-token
+        # record of cap evictions from ledger_enrollments, so evicted-truncated
+        # vs liquidity-death separates via DB state alone (surviving journald
+        # rotation). New table only — additive, idempotent.
+        await self._migrate_ledger_enrollment_evictions_v1()
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -5735,6 +5740,130 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "signal_outcome_ledger_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_ledger_enrollment_evictions_v1(self) -> None:
+        """BL-NEW-LEDGER-EVICTION-DB-MARKER: durable cap-eviction record.
+
+        REQUIRED 2026-07-02 (operator ruling on #406; the evict-oldest
+        enrollment cap was ACCEPTED conditional on this). Cap eviction from
+        ``ledger_enrollments`` previously left ONLY a ``ledger_enrollment_evicted``
+        structured log, scraped weekly into an interim JSONL by
+        ``scripts/ledger-eviction-export.sh`` — lossy once journald rotates
+        (~3wk size-based clock). This table makes each eviction a durable,
+        per-token DB row so ``unlabelable: cap-eviction`` (censored) separates
+        from ``unlabelable: liquidity-death`` via DB state alone.
+
+        One row per evicted token per eviction event. UNIQUE(token_id,
+        evicted_at) is the idempotency key: the live writer and the one-time
+        journal backfill (scripts/backfill_ledger_eviction_markers.py) share it,
+        so a backfilled journal record of a live eviction dedups against the
+        live row instead of double-counting.
+
+        New table only — additive + idempotent, mirroring
+        :meth:`_migrate_ingest_watchdog_state_v1`.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "ledger_enrollment_evictions_v1"
+        schema_version = 20260710
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info(
+                    "ledger_enrollment_evictions_v1_migration_skip_already_applied"
+                )
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if (
+                existing_version is not None
+                and existing_version["description"] != migration_name
+            ):
+                raise RuntimeError(
+                    "schema_version collision for ledger_enrollment_evictions_v1: "
+                    f"version={schema_version} "
+                    f"description={existing_version['description']}"
+                )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS ledger_enrollment_evictions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    -- The evicted token (removed from ledger_enrollments).
+                    token_id TEXT NOT NULL,
+                    -- ISO timestamp of the eviction event; matches the
+                    -- ledger_enrollment_evicted log's evicted_at field.
+                    evicted_at TEXT NOT NULL,
+                    -- The incoming token whose enrollment triggered the cap
+                    -- eviction (evict-oldest-to-make-room).
+                    evicted_for TEXT,
+                    -- LEDGER_ENROLLMENT_MAX_ACTIVE at eviction time.
+                    max_active INTEGER,
+                    -- Batch size of the eviction event this row belongs to.
+                    n_evicted INTEGER,
+                    -- Provenance: 'live' (written atomically with the DELETE)
+                    -- or 'journal_backfill' (one-time import from the JSONL).
+                    source TEXT NOT NULL DEFAULT 'live',
+                    -- Idempotency key shared by live writer + backfill.
+                    UNIQUE(token_id, evicted_at)
+                )
+                """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ledger_evictions_evicted_at "
+                "ON ledger_enrollment_evictions(evicted_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "ledger_enrollment_evictions_v1_migration_complete",
+                table="ledger_enrollment_evictions",
+            )
+        except BaseException as e:
+            _log.exception(
+                "ledger_enrollment_evictions_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,
