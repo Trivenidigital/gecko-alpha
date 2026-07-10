@@ -11,6 +11,26 @@ SINCE="${MINARA_EMISSION_WATCHDOG_SINCE:-24 hours ago}"
 SERVICE="${MINARA_EMISSION_WATCHDOG_SERVICE:-gecko-pipeline}"
 TOLERANCE="${MINARA_EMISSION_WATCHDOG_TOLERANCE:-0}"
 
+# MIN-03: skip while the Minara emission feature is disabled. The feature is
+# default-on in code (MINARA_ALERT_ENABLED, config.py) but explicitly set
+# `false` in prod .env, so the emitter is dark — this hourly parity watchdog
+# can then only ever report journal_count=0 (24 no-op runs/day on a dead
+# surface). The flag lives in .env, which systemd `ConditionEnvironment=`
+# cannot read (that directive checks only the service-manager environment, not
+# a sourced env file), so the gate lives here in the wrapper — matching how the
+# alert path below sources .env for its config. Skip ONLY on an explicit falsy
+# value; an unset flag means the config default (enabled) and the watchdog runs.
+if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    _minara_enabled="$(source "$ENV_FILE" >/dev/null 2>&1; printf '%s' "${MINARA_ALERT_ENABLED:-}")"
+    case "$(printf '%s' "$_minara_enabled" | tr '[:upper:]' '[:lower:]')" in
+        0 | false | no | off)
+            echo "SKIP: MINARA_ALERT_ENABLED=${_minara_enabled} in .env; minara-emission-persistence-watchdog is a no-op while the feature is disabled"
+            exit 0
+            ;;
+    esac
+fi
+
 tmp_all="$(mktemp)"
 tmp_journal="$(mktemp)"
 tmp_err="$(mktemp)"

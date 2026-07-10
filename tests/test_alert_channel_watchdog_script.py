@@ -10,8 +10,9 @@ cooldown dedup (S2-2) without touching the network. A focused unit test also
 stubs aiohttp + the alerter in sys.modules to assert `_send_via_alerter`
 passes `raise_on_failure=True`.
 
-The tmp_path DB is created with a MINIMAL schema — only tg_alert_log and
-paper_daily_summary, with the CREATE statements copied from scout/db.py.
+The tmp_path DB is created with a MINIMAL schema — tg_alert_log,
+paper_daily_summary, narrative_alerts_inbound (NAR-02), and tg_social_health
+(NAR-07), with the CREATE statements copied from scout/db.py.
 """
 
 import asyncio
@@ -84,21 +85,66 @@ CREATE TABLE paper_daily_summary (
 )
 """
 
+# narrative_alerts_inbound: db.py:4756 (NAR-02). The watchdog only reads
+# received_at; the other NOT NULL columns are carried for schema fidelity.
+_CREATE_NARRATIVE_INBOUND = """
+CREATE TABLE narrative_alerts_inbound (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    tweet_id TEXT NOT NULL,
+    tweet_author TEXT NOT NULL,
+    tweet_ts TEXT NOT NULL,
+    tweet_text TEXT NOT NULL,
+    tweet_text_hash TEXT NOT NULL,
+    extracted_cashtag TEXT,
+    extracted_ca TEXT,
+    extracted_chain TEXT,
+    resolved_coin_id TEXT,
+    narrative_theme TEXT,
+    urgency_signal TEXT,
+    classifier_confidence REAL,
+    classifier_version TEXT NOT NULL,
+    received_at TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
+# tg_social_health: db.py:2077 (NAR-07). Per-channel rows use component
+# 'channel:<@handle>' — the format scout/social/telegram/listener.py writes.
+_CREATE_TG_SOCIAL_HEALTH = """
+CREATE TABLE tg_social_health (
+    component        TEXT PRIMARY KEY,
+    listener_state   TEXT NOT NULL,
+    last_message_at  TEXT,
+    updated_at       TEXT NOT NULL,
+    detail           TEXT
+)
+"""
+
 
 def _make_db(
     tmp_path,
     *,
     alert_rows=None,
     digest_rows=None,
+    narrative_rows=None,
+    channel_rows=None,
     create_alert=True,
     create_digest=True,
+    create_narrative=True,
 ):
     """Build a minimal SQLite DB and return its path.
 
     alert_rows: list of (alerted_at_iso, outcome) tuples.
     digest_rows: list of date-strings ('YYYY-MM-DD').
-    create_alert / create_digest: when False, that table is not created at all
-    (exercises the missing-table breach path).
+    narrative_rows: list of received_at ISO strings. ``None`` (the default)
+      seeds ONE fresh row so the NAR-02 check stays green for the pre-existing
+      tests; ``[]`` creates an empty table (no-rows breach).
+    channel_rows: list of (handle, last_message_at_iso) tuples for
+      tg_social_health. ``None`` (the default) does NOT create the table — an
+      absent tg_social_health is ``ok`` (NAR-07 is a set-scan, not a freshness
+      gate), so the pre-existing tests are unaffected.
+    create_alert / create_digest / create_narrative: when False, that table is
+    not created at all (exercises the missing-table breach path).
     """
     dbp = tmp_path / "wd.db"
     conn = sqlite3.connect(dbp)
@@ -116,8 +162,31 @@ def _make_db(
             conn.execute(_CREATE_PAPER_DAILY_SUMMARY)
             for d in digest_rows or []:
                 conn.execute("INSERT INTO paper_daily_summary (date) VALUES (?)", (d,))
+        if create_narrative:
+            conn.execute(_CREATE_NARRATIVE_INBOUND)
+            rows = narrative_rows
+            if rows is None:  # default: one fresh row (keeps NAR-02 check green)
+                rows = [(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()]
+            for i, received_at in enumerate(rows):
+                conn.execute(
+                    "INSERT INTO narrative_alerts_inbound "
+                    "(event_id, tweet_id, tweet_author, tweet_ts, tweet_text, "
+                    " tweet_text_hash, classifier_version, received_at) "
+                    "VALUES (?, 't', 'a', 't', 'x', 'h', 'v1', ?)",
+                    (f"evt-{i}", received_at),
+                )
+        if channel_rows is not None:
+            conn.execute(_CREATE_TG_SOCIAL_HEALTH)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            for handle, last_message_at in channel_rows:
+                conn.execute(
+                    "INSERT INTO tg_social_health "
+                    "(component, listener_state, last_message_at, updated_at) "
+                    "VALUES (?, 'running', ?, ?)",
+                    (f"channel:{handle}", last_message_at, now_iso),
+                )
         # Guarantee at least one table exists so the DB file is non-trivial.
-        if not create_alert and not create_digest:
+        if not create_alert and not create_digest and not create_narrative:
             conn.execute("CREATE TABLE _placeholder (x INTEGER)")
         conn.commit()
     finally:
@@ -139,6 +208,10 @@ def _iso(hours_ago):
 
 def _day(days_ago):
     return (datetime.now(timezone.utc) - timedelta(days=days_ago)).date().isoformat()
+
+
+def _iso_days(days_ago):
+    return (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
 
 
 # --- disabled no-op --------------------------------------------------------
@@ -291,6 +364,135 @@ def test_missing_tables_are_breach(tmp_path):
     assert "tg_alert_log" in msg
     assert "paper_daily_summary" in msg
     assert "missing/absent" in msg
+
+
+# --- NAR-02: narrative_alerts_inbound freshness ---------------------------
+
+
+def test_narrative_inbound_fresh_no_breach(tmp_path):
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        narrative_rows=[_iso(1)],  # < 72h SLO
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 0, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 0
+    assert body["checks"]["narrative_inbound_rate"]["status"] == "ok"
+
+
+def test_narrative_inbound_stale_is_breach(tmp_path):
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        narrative_rows=[_iso(100)],  # > 72h SLO
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 1
+    assert body["checks"]["narrative_inbound_rate"]["status"] == "breach"
+    assert body["checks"]["narrative_inbound_rate"]["reason"] == "stale"
+    assert body["checks"]["alert_sent_rate"]["status"] == "ok"
+    msg = body["message"]
+    assert "narrative_alerts_inbound" in msg
+    assert "72h" in msg  # SLO named
+    assert "*" not in msg  # plain text, no Markdown bold
+
+
+def test_narrative_inbound_empty_is_breach(tmp_path):
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        narrative_rows=[],  # table created, no rows
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 1
+    assert body["checks"]["narrative_inbound_rate"]["reason"] == "no_inbound_rows"
+    assert "NO rows" in body["message"]
+
+
+def test_narrative_inbound_missing_table_is_breach(tmp_path):
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        create_narrative=False,  # table absent
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 1
+    assert body["checks"]["narrative_inbound_rate"]["reason"] == "table_absent"
+    msg = body["message"]
+    assert "narrative_alerts_inbound" in msg
+    assert "missing/absent" in msg
+
+
+# --- NAR-07: per-channel tg_social staleness ------------------------------
+
+
+def test_tg_channel_stale_is_breach(tmp_path):
+    # One dead channel (30d) + one healthy (2d): only the dead one is flagged.
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        channel_rows=[
+            ("@alohcooks", _iso_days(30)),  # > 14d stale
+            ("@lowcaphunt", _iso_days(2)),  # fresh
+        ],
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 1
+    tg = body["checks"]["tg_channel_staleness"]
+    assert tg["status"] == "breach"
+    assert tg["reason"] == "channels_stale"
+    assert [c["handle"] for c in tg["stale_channels"]] == ["@alohcooks"]
+    msg = body["message"]
+    assert "tg_social_health" in msg
+    assert "@alohcooks" in msg
+    assert "@lowcaphunt" not in msg  # fresh channel excluded
+    assert "14d" in msg  # stale-days threshold named
+    assert "*" not in msg  # plain text
+
+
+def test_tg_channel_all_fresh_no_breach(tmp_path):
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        channel_rows=[("@alohcooks", _iso_days(2)), ("@lowcaphunt", _iso_days(1))],
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 0, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 0
+    assert body["checks"]["tg_channel_staleness"]["status"] == "ok"
+
+
+def test_tg_channel_absent_table_is_not_breach(tmp_path):
+    # tg_social is default-off: an absent tg_social_health must NOT page.
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        channel_rows=None,  # table not created
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 0, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 0
+    assert body["checks"]["tg_channel_staleness"]["status"] == "ok"
+    assert body["checks"]["tg_channel_staleness"]["reason"] == "table_absent"
 
 
 # --- dry-run suppresses the send ------------------------------------------

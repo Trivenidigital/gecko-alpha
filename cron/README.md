@@ -326,24 +326,39 @@ Residual §12a surface: the daily cron writes a heartbeat at
 watchdog is wired yet. Because this gate has a 2026-08-26 backstop, that is
 accepted as low-priority unless this pattern becomes a longer-lived monitor.
 
-## Alert-channel + digest freshness watchdog (§12a)
+## Alert-channel + digest + narrative + tg-channel freshness watchdog (§12a)
 
 `scripts/alert-channel-watchdog.sh` (wrapping `scripts/alert_channel_watchdog.py`)
-is the ONLY alarm for two pipeline tables that went silently stale and were
+is the ONLY alarm for four pipeline surfaces that went silently stale and were
 noticed only weeks later: the Telegram alert channel (`tg_alert_log`) had zero
-`outcome='sent'` rows for 14 days (2026-06-25 → 07-08), and the daily digest
-(`paper_daily_summary`) stopped writing after 2026-06-26. Per the operator
-amendment, ONE script monitors BOTH tables:
+`outcome='sent'` rows for 14 days (2026-06-25 → 07-08), the daily digest
+(`paper_daily_summary`) stopped writing after 2026-06-26, the X/narrative
+inbound feed (`narrative_alerts_inbound`) went dead 2026-06-24 for 16 days
+(NAR-02), and configured tg_social channels (`tg_social_health`) drift silent
+one-by-one (@alohcooks 72d, NAR-07). Per the operator amendment, ONE script
+monitors ALL FOUR:
 
 - **Check 1 — `tg_alert_log`**: latest `outcome='sent'` row must be newer than
   `ALERT_SENT_SLO_HOURS` (default 48).
 - **Check 2 — `paper_daily_summary`**: `MAX(date)` must be within
   `DIGEST_SUMMARY_SLO_DAYS` (default 2; yesterday's row lands ~02:00 UTC daily).
+- **Check 3 — `narrative_alerts_inbound`** (NAR-02): `MAX(received_at)` must be
+  within `NARRATIVE_INBOUND_SLO_HOURS` (default 72; the feed historically flowed
+  daily). The two-table lag-watchdog was structurally blind to this feed dying
+  because a both-sides-quiet feed emits no lag signal, only absence.
+- **Check 4 — `tg_social_health`** (NAR-07): any configured channel
+  (`component LIKE 'channel:%'`) whose `last_message_at` is older than
+  `TG_CHANNEL_STALE_DAYS` (default 14) is flagged in ONE aggregated line listing
+  each stale `@handle` and its age in days.
 
-A missing OR empty table is itself a breach (silence is never ambiguous). On any
-breach the script sends ONE plain-text Telegram page (`parse_mode=None`, §12b —
-the table names contain `_`) naming each breached table, its last-seen
-timestamp, and its SLO, with `alert_channel_watchdog_alert_dispatched` /
+For the freshness checks (1-3) a missing OR empty table is itself a breach
+(silence is never ambiguous). Check 4 is a SET-SCAN, not a freshness gate: an
+absent/empty `tg_social_health` (or all channels fresh) is NOT a breach —
+tg_social is a default-off feature and paging on its absence would only train
+the operator to ignore the watchdog. On any breach the script sends ONE
+plain-text Telegram page (`parse_mode=None`, §12b — the table names contain
+`_`) naming each breached table, its last-seen timestamp, and its SLO, with
+`alert_channel_watchdog_alert_dispatched` /
 `_alert_delivered` / `_alert_failed` structured logs around the send. The send
 passes `raise_on_failure=True` so a rejected page raises (→ `_alert_failed` +
 exit 1) instead of the alerter's default swallow-and-return — the watchdog must
@@ -363,8 +378,8 @@ a successful send, so a failed send re-alerts next run.
 on `ALERT_CHANNEL_WATCHDOG_ENABLED=true` (set inline in the cron line — the
 deploy-without-activate flag; a manual run without it is a safe no-op).
 Activation occurs when the operator runs `cron/deploy.sh`, per operator
-approval. Cadence rationale: hourly is far inside both SLOs (48h / 2d); the
-cooldown makes cadence choice mostly about detection latency, not spam.
+approval. Cadence rationale: hourly is far inside every SLO (48h / 2d / 72h /
+14d); the cooldown makes cadence choice mostly about detection latency, not spam.
 
 > **⚠️ ACTIVATION PREREQUISITE (deploy ordering):** activate this watchdog only
 > AFTER PR #429 (daily-digest yesterday-fix) is deployed AND has written **≥1
@@ -394,7 +409,7 @@ sed -i '/alert-channel-watchdog/d' cron/gecko-alpha.crontab && bash cron/deploy.
 
 | Code | Meaning |
 |---|---|
-| 0 | Both fresh, OR watchdog disabled (no-op) |
-| 5 | One or more freshness breaches (page dispatched and/or cooldown-suppressed, or `--dry-run` preview) |
+| 0 | All checks fresh, OR watchdog disabled (no-op) |
+| 5 | One or more breaches (page dispatched and/or cooldown-suppressed, or `--dry-run` preview) |
 | 1 | DB missing / runtime error / alert-dispatch failure (send raised) |
 | 64 | Unknown argument (wrapper) |

@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
-# Alert-channel + daily-digest freshness watchdog cron entry (CLAUDE.md §12a).
-# Runs scripts/alert_channel_watchdog.py, which monitors BOTH tg_alert_log
-# ('sent'-row freshness) and paper_daily_summary (daily-digest write-rate) in
-# ONE script per the operator amendment, and alerts on any breach.
+# Alert-channel + digest + narrative + tg-channel freshness watchdog cron entry
+# (CLAUDE.md §12a). Runs scripts/alert_channel_watchdog.py, which monitors FOUR
+# surfaces in ONE script per the operator amendment, and alerts on any breach:
+#   1. tg_alert_log            — 'sent'-row freshness (ALERT_SENT_SLO_HOURS)
+#   2. paper_daily_summary     — daily-digest write-rate (DIGEST_SUMMARY_SLO_DAYS)
+#   3. narrative_alerts_inbound — X/narrative inbound freshness (NARRATIVE_INBOUND_SLO_HOURS)
+#   4. tg_social_health        — per-channel staleness scan (TG_CHANNEL_STALE_DAYS)
 #
 # Context: the Telegram alert channel went silent 2026-06-25 -> 07-08 (14
 # days, zero 'sent' rows) AND the daily digest stopped writing after
-# 2026-06-26 — neither was noticed because no watchdog read either table.
+# 2026-06-26 — neither was noticed because no watchdog read either table. The
+# X/narrative inbound feed then went silently dead 2026-06-24 for 16 days
+# (NAR-02) and tg_social channels drift silent one-by-one (@alohcooks 72d,
+# NAR-07); a both-sides-quiet feed / a dead channel emits no lag signal, only
+# absence — so these are set/freshness checks, not lag checks.
 #
 # ACTIVATION AT DEPLOY: gated on ALERT_CHANNEL_WATCHDOG_ENABLED read from the
 # CRON ENVIRONMENT (default false) — NOT a Settings/.env field, so this adds
@@ -54,6 +61,8 @@ DB_PATH="${REPO_ROOT}/scout.db"
 ENABLED="${ALERT_CHANNEL_WATCHDOG_ENABLED:-false}"
 SENT_SLO_HOURS="${ALERT_SENT_SLO_HOURS:-48}"
 DIGEST_SLO_DAYS="${DIGEST_SUMMARY_SLO_DAYS:-2}"
+NARRATIVE_INBOUND_SLO_HOURS="${NARRATIVE_INBOUND_SLO_HOURS:-72}"
+TG_CHANNEL_STALE_DAYS="${TG_CHANNEL_STALE_DAYS:-14}"
 COOLDOWN_HOURS="${ALERT_CHANNEL_WATCHDOG_COOLDOWN_HOURS:-24}"
 STATE_DIR="${ALERT_CHANNEL_WATCHDOG_STATE_DIR:-/var/lib/gecko-alpha/alert-channel-watchdog}"
 
@@ -77,4 +86,6 @@ cd "$REPO_ROOT"
 exec "${PYTHON}" "${SCRIPT_DIR}/alert_channel_watchdog.py" \
     --db "${DB_PATH}" --enabled "${ENABLED}" \
     --sent-slo-hours "${SENT_SLO_HOURS}" --digest-slo-days "${DIGEST_SLO_DAYS}" \
+    --narrative-inbound-slo-hours "${NARRATIVE_INBOUND_SLO_HOURS}" \
+    --tg-channel-stale-days "${TG_CHANNEL_STALE_DAYS}" \
     --cooldown-hours "${COOLDOWN_HOURS}" --state-dir "${STATE_DIR}"
