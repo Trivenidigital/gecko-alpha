@@ -82,7 +82,10 @@ function adjustedScore(row) {
 
 function reasonList(row, riskTier) {
   const reasons = []
-  if (row?.window_state) reasons.push(`window=${row.window_state}`)
+  // Stable reason CODES (not display copy) — actionability.js
+  // formatDecisionReason() maps these to plain words at render time; the raw
+  // codes stay available in each row's ProvenanceExpander (DASH-03).
+  if (row?.window_state) reasons.push(`window_${row.window_state}`)
   if (row?.entry_quality) reasons.push(row.entry_quality)
   if (isFreshEnough(row)) reasons.push('price_fresh')
   if (numeric(row?.price_change_24h) != null && numeric(row.price_change_24h) > 0) {
@@ -91,6 +94,18 @@ function reasonList(row, riskTier) {
   if (riskTier === 'high') reasons.push('risk_demoted')
   if (row?.source_corpus === 'tracker') reasons.push('tracker_only')
   return reasons.slice(0, 6)
+}
+
+// DASH-02: the single canonical score surfaced per row. Returns the
+// risk/entry/window-adjusted score, or null when the row has no scoring basis
+// (no raw trade_score, or a raw score of 0). Mirrors the fmt() n-gate pattern
+// (SignalTrustTab: n===0 renders '—', not a misleading worst-rank 0) so tracker
+// rows with no score read as '—' instead of dead-last. A row that WAS scored
+// but penalized to 0 keeps a real 0 (raw > 0 → number).
+export function canonicalScore(row) {
+  const raw = numeric(row?.trade_score)
+  if (raw == null || raw === 0) return null
+  return adjustedScore(row)
 }
 
 function decorate(row, decisionLabel) {

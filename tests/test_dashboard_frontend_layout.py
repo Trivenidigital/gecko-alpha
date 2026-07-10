@@ -118,7 +118,10 @@ def test_trade_inbox_decision_board_is_primary_scan_surface():
     ).read_text(encoding="utf-8")
     css = (ROOT / "dashboard" / "frontend" / "style.css").read_text(encoding="utf-8")
 
-    assert "import { buildTradeDecisionBoard } from './tradeDecisionBoard.js'" in tab
+    assert (
+        "import { buildTradeDecisionBoard, canonicalScore } from './tradeDecisionBoard.js'"
+        in tab
+    )
     assert "const decisionBoard = useMemo" in tab
     assert "buildTradeDecisionBoard(payload)" in tab
     assert "Trade Decision Board" in tab

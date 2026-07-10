@@ -70,6 +70,48 @@ async def get_candidates(db_path: str, limit: int = 20) -> list[dict]:
         return results
 
 
+async def get_conviction_coverage(conn, window_days: int = 7) -> dict:
+    """DASH-10: conviction-gate honesty coverage (read-only).
+
+    The quant*0.6 + narrative*0.4 conviction score has been structurally
+    uncomputable since the 2026-06-02 social-denominator recalibration (max
+    quant ~54 < MIN_SCORE 65): 0 of ~1,995 candidates scored, gate retired
+    2026-07-10 (backlog SIG-01). Returns, over the trailing ``window_days``:
+
+      scored_count    -- candidates in the window with a non-null conviction_score
+      candidate_count -- all candidates in the window (denominator)
+      last_scored_at  -- MAX(alerted_at) over conviction-scored candidates,
+                         all-time (the date conviction was LAST computed)
+
+    Takes an already-open aiosqlite connection (the cached ScoutDatabase conn)
+    so it shares the request's connection rather than opening a second reader.
+    ConvictionTab renders an honesty banner when ``scored_count == 0`` instead
+    of leading with a dead metric. datetime() wraps both sides of the window
+    predicate so the stored 'T'-separated isoformat compares correctly against
+    the bound (avoids the 'T' > ' ' lexicographic day-boundary class).
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
+    cursor = await conn.execute(
+        """SELECT
+               SUM(CASE WHEN conviction_score IS NOT NULL THEN 1 ELSE 0 END),
+               COUNT(*)
+           FROM candidates
+           WHERE datetime(first_seen_at) >= datetime(?)""",
+        (cutoff,),
+    )
+    scored_row = await cursor.fetchone()
+    cursor = await conn.execute(
+        "SELECT MAX(alerted_at) FROM candidates WHERE conviction_score IS NOT NULL"
+    )
+    last_scored_at = (await cursor.fetchone())[0]
+    return {
+        "window_days": window_days,
+        "scored_count": int(scored_row[0] or 0),
+        "candidate_count": int(scored_row[1] or 0),
+        "last_scored_at": last_scored_at,
+    }
+
+
 async def get_recent_alerts(db_path: str, limit: int = 20) -> list[dict]:
     """Recent alerts ordered by alerted_at DESC, with outcome data if available."""
     async with _ro_db(db_path) as db:

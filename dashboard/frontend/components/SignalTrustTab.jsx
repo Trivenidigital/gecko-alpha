@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import ProvenanceExpander from './ProvenanceExpander'
 
 // Live signal_params status badge (cockpit slice 1, fable-review Phase 2
 // findings 2-3 / GA-35, GA-36). The static registry contradicted live state
@@ -63,23 +64,6 @@ function LiveStatusBadge({ live }) {
     >
       enabled
     </span>
-  )
-}
-
-// Finding 8: raw `key=value` meta debug strings collapse into a small
-// expander instead of rendering as bare text on the tab.
-function ProvenanceExpander({ lines }) {
-  return (
-    <details style={{ marginTop: 4 }}>
-      <summary style={{ cursor: 'pointer', fontSize: 11, color: 'var(--color-text-secondary)' }}>
-        provenance
-      </summary>
-      <div style={{ marginTop: 4, fontSize: 11, color: 'var(--color-text-secondary)', whiteSpace: 'pre-wrap' }}>
-        {lines.filter(Boolean).map((l, i) => (
-          <div key={i}>{l}</div>
-        ))}
-      </div>
-    </details>
   )
 }
 

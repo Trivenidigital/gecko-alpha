@@ -3,6 +3,7 @@ import TokenLink from './TokenLink'
 import Sparkline from './Sparkline'
 import BtcSolBenchmarkStrip from './BtcSolBenchmarkStrip'
 import RegimeStrip from './RegimeStrip'
+import ProvenanceExpander from './ProvenanceExpander'
 import { researchLinks } from '../todayFocusLinks.js'
 import { buildFocusDetailRows, primaryBlockFacts } from '../todayFocusFacts.js'
 import { formatDetectionAge } from '../todayFocusAge.js'
@@ -170,7 +171,15 @@ export default function TodayFocusPanel() {
           </div>
         </div>
         <div className="todays-focus-status">
-          read_only={String(meta.read_only ?? '?')} visibility_only={String(meta.visibility_only ?? '?')} not_for_execution={String(meta.not_for_execution ?? '?')}
+          {/* DASH-03: raw governance flags collapse into the provenance
+              expander instead of leading with bare key=value debug copy. */}
+          <ProvenanceExpander
+            lines={[
+              `read_only=${String(meta.read_only ?? '?')}`,
+              `visibility_only=${String(meta.visibility_only ?? '?')}`,
+              `not_for_execution=${String(meta.not_for_execution ?? '?')}`,
+            ]}
+          />
           {error ? <span className="todays-focus-error"> last fetch error={error}</span> : null}
         </div>
 
