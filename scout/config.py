@@ -130,7 +130,13 @@ class Settings(BaseSettings):
     )
     STABLE_PAIRED_LIQ_THRESHOLD_USD: float = 50_000.0
     STABLE_PAIRED_BONUS: int = 5
-    CHAINS: list[str] = ["solana", "base", "ethereum"]
+    # NoDecode: `list[str]` is a pydantic-settings "complex" field, so
+    # EnvSettingsSource would json.loads() the raw env value BEFORE
+    # parse_chains runs — turning the documented comma form
+    # (`CHAINS=solana,base,ethereum`, .env.example) into a SettingsError at
+    # construction (boot crash-loop). NoDecode suppresses that eager decode so
+    # the raw string reaches parse_chains. (INF-01; mirrors #430 ALERT_UNIVERSE.)
+    CHAINS: Annotated[list[str], NoDecode] = ["solana", "base", "ethereum"]
 
     # CoinGecko
     # Fraction-domain (0..1). 0 fires for any positive 1h move; >1 never fires.
@@ -1043,7 +1049,10 @@ class Settings(BaseSettings):
     PERP_BINANCE_ENABLED: bool = True
     PERP_BYBIT_ENABLED: bool = True
     PERP_BINANCE_WS_URL: str = "wss://fstream.binance.com/stream"
-    PERP_SYMBOLS: list[str] = []
+    # NoDecode: see CHAINS above. Without it, the perp-spec documented comma
+    # form (`PERP_SYMBOLS=BTCUSDT,ETHUSDT`) json.loads-crashes at construction
+    # before parse_perp_symbols runs. (INF-01.)
+    PERP_SYMBOLS: Annotated[list[str], NoDecode] = []
     PERP_FUNDING_FLIP_MIN_PCT: float = 0.05
     PERP_OI_SPIKE_RATIO: float = 3.0
     PERP_BASELINE_ALPHA: float = 0.1
@@ -1423,15 +1432,43 @@ class Settings(BaseSettings):
     @field_validator("CHAINS", mode="before")
     @classmethod
     def parse_chains(cls, v: str | list[str]) -> list[str]:
+        # NoDecode (see field decl) suppresses pydantic-settings' eager JSON
+        # decode, so the RAW env/init string reaches here. Mirrors
+        # parse_alert_universe_exclude_id_patterns — accept three shapes:
+        #   * comma-separated string ("solana,base") — the documented .env form
+        #   * JSON array string ('["solana","base"]') — back-compat with JSON envs
+        #   * native list                            — test / programmatic construction
         if isinstance(v, str):
-            return [c.strip() for c in v.split(",") if c.strip()]
+            s = v.strip()
+            if s.startswith("["):
+                try:
+                    parsed = json.loads(s)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(c).strip() for c in parsed if str(c).strip()]
+            return [c.strip() for c in s.split(",") if c.strip()]
         return v
 
     @field_validator("PERP_SYMBOLS", mode="before")
     @classmethod
     def parse_perp_symbols(cls, v: str | list[str]) -> list[str]:
+        # NoDecode (see field decl) delivers the RAW env/init string here.
+        # Mirrors parse_alert_universe_exclude_id_patterns — accept comma-
+        # separated, JSON-array-string, and native-list shapes; symbols
+        # normalize to upper-case.
         if isinstance(v, str):
-            v = [s.strip().upper() for s in v.split(",") if s.strip()]
+            s = v.strip()
+            parsed = None
+            if s.startswith("["):
+                try:
+                    parsed = json.loads(s)
+                except json.JSONDecodeError:
+                    parsed = None
+            if isinstance(parsed, list):
+                v = [str(sym).strip().upper() for sym in parsed if str(sym).strip()]
+            else:
+                v = [sym.strip().upper() for sym in s.split(",") if sym.strip()]
         elif isinstance(v, list):
             v = [str(s).strip().upper() for s in v if str(s).strip()]
         if len(v) > 200:
