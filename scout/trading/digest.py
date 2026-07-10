@@ -11,12 +11,17 @@ from scout.db import Database
 log = structlog.get_logger()
 
 
-async def build_paper_digest(db: Database, date_str: str) -> str | None:
+async def build_paper_digest(db: Database, date_str: str) -> str:
     """Build daily paper trading summary for Telegram.
 
     Queries paper_trades for the given date, computes stats,
     stores into paper_daily_summary, and returns a formatted message.
-    Returns None if no trades were opened or closed on the date.
+
+    On a quiet day (no trades opened or closed) it still writes a zeros row
+    to paper_daily_summary — a downstream freshness watchdog monitors that
+    table's write-rate, so quiet days must produce a heartbeat — and returns
+    a short plain-text one-liner. It never returns None: silence must never
+    be ambiguous.
     """
     conn = db._conn
     if conn is None:
@@ -41,7 +46,27 @@ async def build_paper_digest(db: Database, date_str: str) -> str | None:
     trades_closed = len(closed_rows)
 
     if trades_opened == 0 and trades_closed == 0:
-        return None
+        # Quiet day: still write a zeros summary row so the downstream
+        # freshness watchdog sees a heartbeat, and emit an explicit one-liner
+        # so silence is never ambiguous (datetime off-by-one #5 — see
+        # tasks/lessons.md).
+        await conn.execute(
+            """INSERT OR REPLACE INTO paper_daily_summary
+               (date, trades_opened, trades_closed, wins, losses,
+                total_pnl_usd, best_trade_pnl, worst_trade_pnl,
+                avg_pnl_pct, win_rate_pct, by_signal_type)
+               VALUES (?, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, NULL)""",
+            (date_str,),
+        )
+        await conn.commit()
+        log.info(
+            "paper_digest_built",
+            date=date_str,
+            trades_opened=0,
+            trades_closed=0,
+            total_pnl=0,
+        )
+        return f"Paper digest {date_str}: no trades opened or closed."
 
     # Win/loss
     wins = sum(1 for r in closed_rows if r[2] is not None and r[2] > 0)

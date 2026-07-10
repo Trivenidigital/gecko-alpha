@@ -700,8 +700,14 @@ async def narrative_agent_loop(
                     try:
                         from scout.trading.digest import build_paper_digest
 
-                        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                        digest_text = await build_paper_digest(db, today)
+                        # Summarize the CLOSED period (yesterday). This tick
+                        # fires at ~01:00 UTC; "today" would be a partial one
+                        # hour and usually no-op (datetime off-by-one #5 — see
+                        # tasks/lessons.md).
+                        yesterday = (
+                            datetime.now(timezone.utc) - timedelta(days=1)
+                        ).strftime("%Y-%m-%d")
+                        digest_text = await build_paper_digest(db, yesterday)
                         if digest_text:
                             try:
                                 await send_telegram_message(
@@ -713,7 +719,7 @@ async def narrative_agent_loop(
                                 )
                             except Exception:
                                 logger.exception("trading_digest_send_error")
-                        logger.info("trading.digest_complete", date=today)
+                        logger.info("trading.digest_complete", date=yesterday)
                     except Exception:
                         logger.exception("trading_digest_error")
 
