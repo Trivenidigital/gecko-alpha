@@ -36,6 +36,7 @@ import structlog
 from scout import alerter
 from scout.config import Settings
 from scout.db import Database
+from scout.token_ids import match_universe_exclude
 
 log = structlog.get_logger(__name__)
 
@@ -194,11 +195,7 @@ def _check_universe(settings: Settings, token_id: str) -> str | None:
     """
     if not settings.ALERT_UNIVERSE_FILTER_ENABLED:
         return None
-    lowered = token_id.lower()
-    for pattern in settings.ALERT_UNIVERSE_EXCLUDE_ID_PATTERNS:
-        if pattern.lower() in lowered:
-            return pattern
-    return None
+    return match_universe_exclude(settings.ALERT_UNIVERSE_EXCLUDE_ID_PATTERNS, token_id)
 
 
 def _fmt_mcap(mcap):
