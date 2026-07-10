@@ -81,6 +81,53 @@ def test_format_alert_message_without_narrative(token_factory):
     assert "MoonCoin" in msg
 
 
+def test_format_alert_message_omits_conviction_line_when_score_none(token_factory):
+    """SIG-01 / ALR-05: the conviction gate is retired; a token with no
+    conviction score must NOT lead with the "Conviction Score: N/A"
+    shrug-headline. The whole conviction breakdown is dropped instead."""
+    token = token_factory(
+        contract_address="0xabc123",
+        chain="solana",
+        token_name="MoonCoin",
+        ticker="MOON",
+        market_cap_usd=75000,
+        quant_score=54,
+        narrative_score=None,
+        conviction_score=None,
+        virality_class=None,
+        mirofish_report=None,
+    )
+    msg = format_alert_message(token, ["vol_liq_ratio"])
+
+    assert "Conviction Score" not in msg
+    assert "N/A" not in msg
+    # Body still renders identity + signals — only the null-score line is gone.
+    assert "MoonCoin" in msg
+    assert r"vol\_liq\_ratio" in msg
+
+
+def test_format_alert_message_includes_conviction_line_when_score_present(
+    token_factory,
+):
+    """A real conviction score is still rendered (regression pin for the
+    re-enabled path)."""
+    token = token_factory(
+        contract_address="0xabc123",
+        chain="solana",
+        token_name="MoonCoin",
+        ticker="MOON",
+        market_cap_usd=75000,
+        quant_score=80,
+        narrative_score=75,
+        conviction_score=78,
+    )
+    msg = format_alert_message(token, ["vol_liq_ratio"])
+
+    assert "Conviction Score: 78.0" in msg
+    assert "Quant: 80" in msg
+    assert "Narrative: 75" in msg
+
+
 async def test_send_alert_telegram(mock_aiohttp, token_factory, settings_factory):
     telegram_url = "https://api.telegram.org/bottest-bot-token/sendMessage"
     mock_aiohttp.post(telegram_url, payload={"ok": True})

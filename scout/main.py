@@ -1230,7 +1230,40 @@ async def run_cycle(
         except Exception:
             logger.exception("dex_resolver_pass_failed")
 
-    # Stages 4-5: Gate (MiroFish + conviction)
+    # Stages 4-5: Gate (MiroFish + conviction) -> alert. The helper no-ops
+    # (logging a single `conviction_gate_retired` marker per cycle) when the
+    # gate is retired; see _run_conviction_gate_and_alert / CONVICTION_GATE_ENABLED.
+    await _run_conviction_gate_and_alert(scored, db, session, settings, dry_run, stats)
+
+    return stats
+
+
+async def _run_conviction_gate_and_alert(
+    scored: list[tuple],
+    db: Database,
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    dry_run: bool,
+    stats: dict,
+) -> None:
+    """Stages 4-5 conviction gate -> MiroFish -> alert loop.
+
+    RETIRED 2026-07-10 (backlog SIG-01 / NAR-01 / ALR-05). Root cause: the
+    2026-06-02 renormalization put MIN_SCORE=65 out of reach (max realized
+    ~54), so 0/1,995 candidates scored, MiroFish went unreached, and the
+    legacy alert path headlined "Conviction Score: N/A". When
+    ``Settings.CONVICTION_GATE_ENABLED`` is False (default) this skips
+    gate.evaluate + MiroFish enqueue + send_alert entirely and emits ONE
+    ``conviction_gate_retired`` info log per cycle (not per candidate).
+
+    Nothing is deleted so re-enabling is a pure flag flip once MIN_SCORE is
+    recalibrated to the realized score distribution. Mutates
+    ``stats["alerts_fired"]`` in place.
+    """
+    if not settings.CONVICTION_GATE_ENABLED:
+        logger.info("conviction_gate_retired", candidates_skipped=len(scored))
+        return
+
     for token, signals in scored:
         should_alert, conviction, gated_token = await evaluate(
             token,
@@ -1374,8 +1407,6 @@ async def run_cycle(
             task.add_done_callback(
                 lambda t: t.exception() if not t.cancelled() else None
             )
-
-    return stats
 
 
 async def check_outcomes(

@@ -37,19 +37,22 @@ def format_alert_message(token: CandidateToken, signals: list[str]) -> str:
     lines.append(f"Market Cap: ${token.market_cap_usd:,.0f}")
     lines.append("")
 
-    # Conviction breakdown
-    conviction_display = (
-        f"{token.conviction_score:.1f}" if token.conviction_score is not None else "N/A"
-    )
-    quant_display = str(token.quant_score) if token.quant_score is not None else "N/A"
-    narrative_display = (
-        str(token.narrative_score) if token.narrative_score is not None else "N/A"
-    )
-
-    lines.append(f"Conviction Score: {conviction_display}")
-    lines.append(f"  Quant: {quant_display}")
-    if token.narrative_score is not None:
-        lines.append(f"  Narrative: {narrative_display}")
+    # Conviction breakdown -- rendered ONLY when a real conviction score exists.
+    # The conviction gate is RETIRED by default (Settings.CONVICTION_GATE_ENABLED
+    # = False; backlog SIG-01 / ALR-05). Guarding this block drops the
+    # misleading "Conviction Score: N/A" shrug-headline so that IF the gate is
+    # ever re-enabled the alert never leads with a null score.
+    if token.conviction_score is not None:
+        quant_display = (
+            str(token.quant_score) if token.quant_score is not None else "N/A"
+        )
+        narrative_display = (
+            str(token.narrative_score) if token.narrative_score is not None else "N/A"
+        )
+        lines.append(f"Conviction Score: {token.conviction_score:.1f}")
+        lines.append(f"  Quant: {quant_display}")
+        if token.narrative_score is not None:
+            lines.append(f"  Narrative: {narrative_display}")
 
     # Signals -- each signal_type contains underscores; escape per-element
     lines.append("")

@@ -89,6 +89,36 @@ The comment should name the backlog ticket and, when known, the re-eval trigger 
 
 `scout/chains/patterns.py:run_pattern_lifecycle` retires patterns when `total_evaluated >= CHAIN_MIN_TRIGGERS_FOR_STATS=10` AND `hit_rate < _RETIREMENT_HIT_RATE=0.20`. **BL-071 systemic-zero-hits guard** at lines 308-315: if ALL patterns show 0 hits across the trigger floor, short-circuit before retirement (the cause is upstream telemetry failure, not pattern quality). Guard verified by 2 unit tests in `tests/test_chains_learn.py`.
 
+### Conviction gate — RETIRED (2026-07-10, backlog SIG-01 / NAR-01 / ALR-05)
+
+The `quant*0.6 + narrative*0.4` conviction gate (`scout/gate.py:evaluate`) and its
+Telegram alert callsite are **retired at the flag level — no code deleted, fully
+reversible.**
+
+**Root cause:** the 2026-06-02 social-denominator renormalization dropped the max
+realized quant score to ~54, below `MIN_SCORE=65`. Consequence over the following
+6 weeks: **0/1,995 candidates scored**, `gate.evaluate` never reached MiroFish
+(`mirofish_jobs` 50/day → 0 since 06-01), yet the legacy alert path
+(`scout/alerter.py:format_alert_message`, sole prod callsite in
+`scout/main.py:run_cycle`) still fired 10× headlining a meaningless
+`Conviction Score: N/A`.
+
+**What the retirement does:**
+- `Settings.CONVICTION_GATE_ENABLED` (new, default `False`).
+- `run_cycle` always calls the extracted `_run_conviction_gate_and_alert(...)`
+  helper; when the flag is off the helper no-ops, skipping `gate.evaluate` +
+  MiroFish enqueue + `send_alert` and emitting **one** `conviction_gate_retired`
+  info log per cycle (not per candidate).
+- `format_alert_message` now drops the whole conviction breakdown when
+  `conviction_score is None` (the `Conviction Score: N/A` shrug-headline is gone),
+  so the bug is fixed even if the gate is ever re-enabled.
+
+**Reversal recipe:** recalibrate `MIN_SCORE` to the realized score distribution
+(coordinate with SIG-02 scorer-divisor cleanup — remove phantom signals such as
+`holder_growth` from the normalization divisor so real scores can clear the
+threshold), then flip `CONVICTION_GATE_ENABLED=True`. No code needs to be
+restored; the gate and MiroFish blend are intact.
+
 ### Test pattern
 
 pytest-asyncio auto mode (`asyncio_mode = "auto"` in `pyproject.toml`). `tmp_path` for DB fixtures. `tests/conftest.py` ships `settings_factory(**overrides)` and `token_factory(**overrides)`. HTTP mocks via `aioresponses`. Every public function gets a corresponding test; existing scaffold tests must never regress.
