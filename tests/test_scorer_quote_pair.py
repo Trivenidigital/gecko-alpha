@@ -23,7 +23,12 @@ from scout.scorer import score
 
 
 def _settings(settings_factory, **overrides):
-    return settings_factory(**overrides)
+    # SIG-02: pin the capability-ON regime (holder_growth in the divisor,
+    # SCORER_MAX_RAW=193). The co-occurrence delta test relies on holder_growth
+    # firing, which requires MORALIS enrichment configured.
+    defaults = {"MORALIS_API_KEY": "test-moralis-key"}
+    defaults.update(overrides)
+    return settings_factory(**defaults)
 
 
 def _make_token(token_factory, **overrides):
