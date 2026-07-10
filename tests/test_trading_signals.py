@@ -821,6 +821,9 @@ async def test_trade_predictions_allows_legit_coinid_with_bridge_substring(
     db, engine, settings
 ):
     """Coin IDs that merely contain 'bridge' but aren't bridged/wrapped assets pass."""
+    # Intent is the coinid-bridge filter, not tradability: lift the default
+    # dispatch quarantine (narrative_prediction) so the open path is reachable.
+    settings.SIGNAL_DISPATCH_QUARANTINE = []
     await _seed_price(db, "bridgelink", price=1.0)
     pred = _make_pred("bridgelink", category_name="AI")
     await trade_predictions(

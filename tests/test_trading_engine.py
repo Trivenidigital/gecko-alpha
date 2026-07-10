@@ -273,9 +273,9 @@ async def test_open_position_blocks_other_signal_types(engine, db):
         token_id="bitcoin",
         symbol="BTC",
         chain="coingecko",
-        signal_type="narrative_prediction",
+        signal_type="chain_completed",
         signal_data={},
-        signal_combo="narrative_prediction",
+        signal_combo="chain_completed",
     )
     assert trade_id_2 is None
 
@@ -300,9 +300,9 @@ async def test_closed_trade_allows_different_signal_type(engine, db):
         token_id="bitcoin",
         symbol="BTC",
         chain="coingecko",
-        signal_type="narrative_prediction",
+        signal_type="chain_completed",
         signal_data={},
-        signal_combo="narrative_prediction",
+        signal_combo="chain_completed",
     )
     assert trade_id_2 is not None
 
@@ -372,9 +372,9 @@ async def test_get_open_positions(engine, db):
         symbol="ETH",
         name="Ethereum",
         chain="coingecko",
-        signal_type="narrative_prediction",
+        signal_type="chain_completed",
         signal_data={},
-        signal_combo="narrative_prediction",
+        signal_combo="chain_completed",
     )
     positions = await engine.get_open_positions()
     assert len(positions) == 2
