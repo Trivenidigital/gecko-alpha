@@ -1041,6 +1041,14 @@ class Settings(BaseSettings):
     FEEDBACK_WEEKLY_DIGEST_WEEKDAY: int = 6
     FEEDBACK_WEEKLY_DIGEST_HOUR: int = 9
     FEEDBACK_COMBO_REFRESH_HOUR: int = 3
+    # ALR-04 weekly alerts scoreboard (sent-alert -> paper-trade outcome loop).
+    # Read-only; sent on the same weekly tick as the digest (WEEKDAY/_HOUR above).
+    # Default OFF — operator opts in via .env once they want the weekly send.
+    WEEKLY_ALERTS_SCOREBOARD_ENABLED: bool = False
+    WEEKLY_ALERTS_SCOREBOARD_WINDOW_DAYS: int = 7
+    # n-gate: below this many sent alerts resolving to a paper trade, the derived
+    # stats are withheld behind an INSUFFICIENT_DATA line.
+    WEEKLY_ALERTS_SCOREBOARD_MIN_LINKED: int = 5
     # Refresh-eligibility window (days). combo_refresh.refresh_all refreshes
     # every combo that had a trade opened within this window. It ALSO refreshes
     # currently-suppressed combos with no trade in the window (fix/frozen-

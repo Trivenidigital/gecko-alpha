@@ -89,6 +89,7 @@ from scout.perp.enrichment import enrich_candidates_with_perp_anomalies
 from scout.perp.watcher import run_perp_watcher
 from scout.trading import combo_refresh as _combo_refresh
 from scout.trading import weekly_digest as _weekly_digest
+from scout.trading import alerts_scoreboard as _alerts_scoreboard
 
 # BL-055 live-trading subsystem — wired into scout/main.py per spec §10.
 from scout.live.binance_adapter import BinanceSpotAdapter
@@ -363,6 +364,16 @@ async def _run_feedback_schedulers(
     ):
         try:
             await _weekly_digest.send_weekly_digest(db, settings)
+            # ALR-04: weekly alerts scoreboard on the same weekly tick, gated by
+            # its own flag + its own try/except so a scoreboard failure can't
+            # block the digest sentinel from advancing (no double-send next
+            # cycle). send_weekly_digest self-handles its own errors, so the
+            # scoreboard runs once the digest attempt completes.
+            if settings.WEEKLY_ALERTS_SCOREBOARD_ENABLED:
+                try:
+                    await _alerts_scoreboard.send_alerts_scoreboard(db, settings)
+                except Exception:
+                    logger.exception("alerts_scoreboard_loop_error")
             last_digest_date = today_iso
         except Exception:
             logger.exception("weekly_digest_loop_error")
