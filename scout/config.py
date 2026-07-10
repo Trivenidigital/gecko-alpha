@@ -1,12 +1,13 @@
 """Application configuration via Pydantic BaseSettings."""
 
+import json
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, SecretStr, computed_field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Repo root, derived once at import time. Anchors TG_SOCIAL_SESSION_PATH /
 # CHANNELS_FILE defaults so they don't depend on CWD ("./tg_social.session"
@@ -633,6 +634,36 @@ class Settings(BaseSettings):
     # decision. 0 disables dedup entirely (clean revert), with no
     # off-by-one. See global CLAUDE.md §12b for the co-shipped audit logs.
     TG_ALERT_DEDUP_WINDOW_HOURS: int = Field(default=24, ge=0)
+
+    # BL-NEW-ALERT-UNIVERSE-FILTER: operator-facing universe guard on the
+    # paper-trade-open Telegram alert path. Some CoinGecko-sourced ids are
+    # tokenized equities / ETFs (e.g. `spy-bstocks-tokenized-stock`,
+    # `invesco-qqq-etf-ondo-tokenized-etf`) that fall outside this product's
+    # early micro-cap crypto universe — alerting on them is a trader-trust
+    # killer. When enabled, any alert whose token_id (the CoinGecko slug)
+    # contains one of EXCLUDE_ID_PATTERNS (case-insensitive substring) is
+    # suppressed and audited as outcome='blocked_eligibility'
+    # detail='universe_filter:<pattern>'. Default OFF (observe-first); the
+    # pattern list is operator-extensible via .env (comma-separated). NOTE: the
+    # paper ENGINE still opens trades on these tokens — this filter only stops
+    # the operator-facing send.
+    #
+    # The single default `-tokenized-` covers every observed prod offender
+    # (tokenized stocks AND ETFs); no legitimate major/large-cap slug contains
+    # "tokenized". CAUTION: patterns are RAW case-insensitive substrings, so
+    # keep them specific — a short pattern like `spy` would suppress legit
+    # alerts for any slug containing those letters (e.g. `spy`-thing).
+    #
+    # NoDecode (pydantic-settings): `list[str]` is a "complex" field, so
+    # EnvSettingsSource would json.loads() the raw env value BEFORE the
+    # field_validator runs — turning a comma-separated .env value into a
+    # SettingsError at construction (boot crash-loop). NoDecode suppresses that
+    # eager JSON decode so the raw string reaches
+    # parse_alert_universe_exclude_id_patterns below.
+    ALERT_UNIVERSE_FILTER_ENABLED: bool = False
+    ALERT_UNIVERSE_EXCLUDE_ID_PATTERNS: Annotated[list[str], NoDecode] = [
+        "-tokenized-",
+    ]
 
     # BL-NEW-TRADE-SURFACE-TG-ALERTS: optional scarce Telegram alert lane
     # sourced from the Today Focus and Now Tradable dashboard surfaces. Kept
@@ -1373,6 +1404,26 @@ class Settings(BaseSettings):
         if len(v) > 200:
             # Binance URL-length + subscription-rate safety (design spec §3.4).
             raise ValueError("PERP_SYMBOLS exceeds max length 200")
+        return v
+
+    @field_validator("ALERT_UNIVERSE_EXCLUDE_ID_PATTERNS", mode="before")
+    @classmethod
+    def parse_alert_universe_exclude_id_patterns(cls, v: str | list[str]) -> list[str]:
+        # NoDecode (see field decl) suppresses pydantic-settings' eager JSON
+        # decode, so the RAW env/init string reaches here. Accept three shapes:
+        #   * comma-separated string ("-a,-b")  — the documented .env form
+        #   * JSON array string ('["-a","-b"]') — back-compat with JSON envs
+        #   * native list                       — test / programmatic construction
+        if isinstance(v, str):
+            s = v.strip()
+            if s.startswith("["):
+                try:
+                    parsed = json.loads(s)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(p).strip() for p in parsed if str(p).strip()]
+            return [p.strip() for p in s.split(",") if p.strip()]
         return v
 
     @field_validator("SECONDWAVE_ALERT_THRESHOLD")
