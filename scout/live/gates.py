@@ -67,6 +67,8 @@ VALID_REJECT_REASONS: frozenset[str] = frozenset(
         # M1.5a (design-stage R1-I1 + R2-I3) — Gate 10 disambiguation:
         "live_signed_disabled",
         "api_key_lacks_trade_scope",
+        # Solana on-chain gates (Task 11):
+        "not_sellable",
     }
 )
 
@@ -350,3 +352,89 @@ class Gates:
                 )
 
         return GateResult(passed=True), venue
+
+    async def evaluate_onchain(
+        self, *, signal_type: str, symbol: str, venue_pair: str, size_usd: Decimal
+    ) -> GateResult:
+        """On-chain gate chain (Solana). Replaces the CEX order-book walk with
+        Jupiter price-impact, and adds sellability (honeypot) + SOL gas gates.
+        Kill-switch and allowlist are checked first, mirroring evaluate()."""
+        kill = await self._ks.is_active()
+        if kill is not None:
+            # Preserve the forensic link to the kill event, mirroring evaluate().
+            return GateResult(
+                passed=False,
+                reject_reason="kill_switch",
+                detail=f"kill_event_id={kill.kill_event_id}",
+            )
+        if not self._config.is_signal_enabled(signal_type):
+            return GateResult(
+                passed=False, reject_reason=None, detail="not_allowlisted"
+            )
+
+        s = self._config._s
+        # NOTE: this gate verdict is computed on THIS quote. The adapter's
+        # prepare_order fetches a FRESH quote to sign, so the executed tx may
+        # differ slightly from the gated impact. Execution is still bounded by
+        # SOLANA_SLIPPAGE_BPS_CAP on the signing quote; this gate is the
+        # pre-trade screen, not a guarantee the signed tx matches it.
+        quote = await self._adapter.quote_at_size(
+            venue_pair=venue_pair, side="buy", size_usd=float(size_usd)
+        )
+        if quote["price_impact_pct"] > s.SOLANA_MAX_PRICE_IMPACT_PCT:
+            return GateResult(
+                passed=False,
+                reject_reason="insufficient_depth",
+                detail=f"price_impact_pct={quote['price_impact_pct']:.3f} "
+                f"cap={s.SOLANA_MAX_PRICE_IMPACT_PCT}",
+            )
+
+        sellable = await self._adapter.is_sellable(
+            venue_pair=venue_pair, expected_out_amount=quote["out_amount"]
+        )
+        if not sellable:
+            return GateResult(
+                passed=False,
+                reject_reason="not_sellable",
+                detail=f"sell simulation failed for {venue_pair}",
+            )
+
+        sol = await self._adapter.fetch_account_balance("SOL")
+        if sol < s.SOLANA_MIN_SOL_GAS_RESERVE:
+            return GateResult(
+                passed=False,
+                reject_reason="insufficient_balance",
+                detail=f"sol={sol} reserve={s.SOLANA_MIN_SOL_GAS_RESERVE}",
+            )
+
+        # Float / exposure gate (spec §6): bound aggregate open Solana
+        # notional to the swept float ceiling SOLANA_FLOAT_CAP_USD. Mirrors
+        # the CEX evaluate() exposure gate (sum of open size_usd) but scoped
+        # to venue='solana' and compared against the Solana cap. size_usd is
+        # stored as TEXT in live_trades → CAST as REAL like the CEX gate.
+        # Unit tests construct Gates(..., db=None); the real engine always
+        # passes a live db. When db is None, treat open exposure as zero.
+        # KNOWN LIMITATION (TOCTOU): this SUM is read BEFORE _dispatch_onchain
+        # inserts the new row, so two Solana intents dispatched concurrently
+        # could both pass and jointly exceed the cap. Today on_paper_trade_opened
+        # dispatches sequentially (single await chain) so the window is closed in
+        # practice; a reserved-intent row / lock-held check-and-insert is the
+        # durable fix — tracked in the on-chain follow-up plan.
+        sum_open_dec = Decimal("0")
+        if self._db is not None and self._db._conn is not None:
+            cur = await self._db._conn.execute(
+                "SELECT COALESCE(SUM(CAST(size_usd AS REAL)), 0) "
+                "FROM live_trades WHERE status = 'open' AND venue = 'solana'"
+            )
+            row = await cur.fetchone()
+            sum_open = float(row[0]) if row is not None else 0.0
+            sum_open_dec = Decimal(str(sum_open))
+        float_cap = s.SOLANA_FLOAT_CAP_USD
+        if sum_open_dec + size_usd > float_cap:
+            return GateResult(
+                passed=False,
+                reject_reason="exposure_cap",
+                detail=f"sum={sum_open_dec}+{size_usd} cap={float_cap}",
+            )
+
+        return GateResult(passed=True, reject_reason=None, detail=None)

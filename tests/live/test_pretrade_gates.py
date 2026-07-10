@@ -165,6 +165,8 @@ def test_param_lists_cover_check_constraint():
         # M1.5a (design-stage R1-I1 + R2-I3) additions:
         "live_signed_disabled",
         "api_key_lacks_trade_scope",
+        # Solana on-chain gates (Task 11):
+        "not_sellable",
     }
     assert VALID_REJECT_REASONS == expected
 

@@ -931,6 +931,25 @@ class Settings(BaseSettings):
     BINANCE_API_KEY: SecretStr | None = None
     BINANCE_API_SECRET: SecretStr | None = None
 
+    # -------- Solana on-chain execution (BL-NEW-SOLANA) --------
+    # Jupiter aggregator venue. Keys live ONLY in scout/live/solana/wallet.py.
+    # SOLANA_WALLET_SECRET is base58 keypair secret; NEVER add to .env.example.
+    SOLANA_RPC_URL: str = "https://api.mainnet-beta.solana.com"
+    # Jupiter v6 quote-api was deprecated 2025-10. Use swap/v1; api.jup.ag
+    # needs a free key (x-api-key header), lite-api.jup.ag is keyless+throttled.
+    SOLANA_JUPITER_URL: str = "https://api.jup.ag/swap/v1"
+    SOLANA_JUPITER_API_KEY: SecretStr | None = None
+    SOLANA_WALLET_SECRET: SecretStr | None = None
+    # Execution quality (memecoin pools are thin → wider caps than CEX defaults)
+    SOLANA_SLIPPAGE_BPS_CAP: int = 100
+    SOLANA_PRIORITY_FEE_LAMPORTS: int = 50_000
+    SOLANA_MAX_PRICE_IMPACT_PCT: float = 3.0
+    SOLANA_MIN_SOL_GAS_RESERVE: float = 0.02  # SOL kept for fees
+    # Risk: live USDC float ceiling; daily sweep returns excess to cold wallet.
+    SOLANA_FLOAT_CAP_USD: Decimal = Decimal("100")
+    SOLANA_CONFIRM_TIMEOUT_SEC: float = 60.0
+    SOLANA_SWEEP_COLD_WALLET: str | None = None
+
     # Feedback-loop (Sprint 1, spec 2026-04-18)
     FEEDBACK_SUPPRESSION_MIN_TRADES: int = 20
     FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT: float = 30.0
