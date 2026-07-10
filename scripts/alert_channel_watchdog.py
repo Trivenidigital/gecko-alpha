@@ -62,10 +62,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import aiosqlite
 import structlog
 
-structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
-
 _TRUTHY = {"1", "true", "yes", "on"}
 _log = structlog.get_logger()
+
+
+def _configure_logging() -> None:
+    """Route structlog to stderr so stdout stays clean for the JSON result.
+
+    Called ONLY from the ``__main__`` / cron entrypoint — NOT at import time.
+    Configuring structlog at module scope is a GLOBAL, process-wide mutation:
+    importing this module in-process (e.g. from a unit test) would reconfigure
+    every other test's logger and silently empty their captured log output.
+    Keeping it here makes the import side-effect-free; the subprocess/cron path
+    still gets stderr logging because it calls this first.
+    """
+    structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
 
 
 def _is_enabled(value: str) -> bool:
@@ -445,4 +456,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    _configure_logging()
     sys.exit(main())

@@ -24,8 +24,27 @@ import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+import structlog
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "alert_channel_watchdog.py"
+
+
+@pytest.fixture(autouse=True)
+def _preserve_structlog_config():
+    """Belt-and-suspenders: snapshot structlog's global config before each test
+    and restore it after. Importing the watchdog module in-process must not
+    leak logging config into the rest of the pytest session (the module-level
+    `structlog.configure` bug that emptied other tests' captured logs). Fix #1
+    makes import side-effect-free; this fixture guarantees it even if a future
+    change reintroduces a mutation."""
+    saved = structlog.get_config()
+    try:
+        yield
+    finally:
+        structlog.configure(**saved)
+
 
 # --- CREATE statements copied from scout/db.py -----------------------------
 # tg_alert_log: db.py:4214 (FK to paper_trades dropped for the minimal schema;
@@ -554,3 +573,31 @@ def test_cooldown_hours_flag_respected(tmp_path):
     mod2._SEND = _fake_send(sink2)
     assert _main(mod2, dbp, sd, "--cooldown-hours", "0") == 5
     assert len(sink2) == 1  # zero-hour cooldown never suppresses
+
+
+# --- structlog global-config leak regression (CI-found) --------------------
+
+
+def test_importing_module_does_not_reconfigure_structlog():
+    """Deterministic guard for the module-level `structlog.configure` leak that
+    CI surfaced: importing this module (as the 8 in-process tests do) must NOT
+    mutate structlog's global config, else every later test in the session that
+    captures log events via the default config gets ''. Compares the configured
+    logger_factory identity across a fresh import — `configure()` would swap it.
+
+    The real-victim proof is running this test file in ONE pytest invocation
+    with tests/test_trading_combo_key.py (green after fix; the other two victim
+    files can't collect on Windows due to the aiohttp import crash — CI is the
+    final validator there).
+    """
+    before = structlog.get_config()["logger_factory"]
+    sys.modules.pop("_acw_leakcheck", None)
+    spec = importlib.util.spec_from_file_location("_acw_leakcheck", SCRIPT)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)  # re-runs module top-level (import side effects)
+    after = structlog.get_config()["logger_factory"]
+    assert after is before, (
+        "importing scripts/alert_channel_watchdog.py reconfigured structlog's "
+        "logger_factory at import time — a global side effect that empties other "
+        "tests' captured logs (move the configure into __main__)"
+    )
