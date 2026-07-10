@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import structlog
 
 from scout.db import Database
 from scout.live.kill_switch import KillSwitch, compute_kill_duration
@@ -238,4 +239,100 @@ async def test_trigger_loser_does_not_alert(tmp_path):
         ),
     )
     assert len(sent) == 1
+    await db.close()
+
+
+# --------------------------------------------------------------------------
+# LIVE-01: an expired-but-uncleared kill must NOT latch (belt-and-braces in
+# is_active), and a latched auto-clear must alert the operator that the shadow
+# soak was frozen (§12b). kill_events #1 latched 33 days in prod because
+# auto_clear_if_expired had zero callers and is_active ignored killed_until.
+# --------------------------------------------------------------------------
+
+
+async def test_is_active_false_for_expired_uncleared_kill(tmp_path):
+    """A kill whose killed_until is in the past reads as INACTIVE even when
+    cleared_at is still NULL, so a missed auto_clear tick cannot latch it
+    forever. The guard logs kill_switch_expired_uncleared (§12b visibility)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    # Negative duration → killed_until already in the past; never cleared.
+    await ks.trigger(
+        triggered_by="daily_loss_cap", reason="x", duration=timedelta(hours=-2)
+    )
+    with structlog.testing.capture_logs() as logs:
+        state = await ks.is_active()
+    assert state is None
+    assert "kill_switch_expired_uncleared" in [le.get("event") for le in logs]
+    # is_active is a pure read — the row stays uncleared (only clear/auto_clear
+    # stamp cleared_at).
+    cur = await db._conn.execute(
+        "SELECT cleared_at FROM kill_events ORDER BY id DESC LIMIT 1"
+    )
+    assert (await cur.fetchone())[0] is None
+    await db.close()
+
+
+async def test_fresh_kill_still_blocks(tmp_path):
+    """A not-yet-expired kill still reports active; auto_clear leaves it."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    kid, _ = await ks.trigger(
+        triggered_by="daily_loss_cap", reason="x", duration=timedelta(hours=4)
+    )
+    assert (await ks.is_active()).kill_event_id == kid
+    assert await ks.auto_clear_if_expired() is False
+    assert (await ks.is_active()).kill_event_id == kid
+    await db.close()
+
+
+async def test_latched_auto_clear_emits_frozen_alert(tmp_path):
+    """A kill latched >1h past expiry, when auto-cleared, sends the §12b
+    plain-text 'soak was frozen' operator alert with dispatched/delivered
+    logs (distinct from the standard CLEARED notification)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    sent: list[str] = []
+
+    async def hook(message: str) -> None:
+        sent.append(message)
+
+    ks = KillSwitch(db, alert_hook=hook)
+    kid, _ = await ks.trigger(
+        triggered_by="daily_loss_cap", reason="x", duration=timedelta(hours=-5)
+    )
+    with structlog.testing.capture_logs() as logs:
+        did_clear = await ks.auto_clear_if_expired()
+    assert did_clear is True
+    latched = [m for m in sent if "soak was frozen" in m]
+    assert len(latched) == 1
+    assert f"#{kid}" in latched[0]
+    assert "auto-cleared" in latched[0]
+    assert "latched" in latched[0]
+    events = [le.get("event") for le in logs]
+    assert "kill_switch_latched_auto_cleared" in events
+    # §12b dispatched/delivered pair fired (traceable in journalctl).
+    assert "kill_switch_alert_dispatched" in events
+    assert "kill_switch_alert_delivered" in events
+    await db.close()
+
+
+async def test_recent_expiry_auto_clear_no_frozen_alert(tmp_path):
+    """A kill that expired <1h ago (normal 4h kill picked up next tick) auto-
+    clears WITHOUT the latched 'soak was frozen' alert."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    sent: list[str] = []
+
+    async def hook(message: str) -> None:
+        sent.append(message)
+
+    ks = KillSwitch(db, alert_hook=hook)
+    await ks.trigger(
+        triggered_by="daily_loss_cap", reason="x", duration=timedelta(seconds=-1)
+    )
+    assert await ks.auto_clear_if_expired() is True
+    assert not any("soak was frozen" in m for m in sent)
     await db.close()

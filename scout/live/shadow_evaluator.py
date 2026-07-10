@@ -38,6 +38,59 @@ log = structlog.get_logger(__name__)
 REVIEW_BACKOFF = timedelta(hours=24)
 MAX_REVIEW_RETRIES = 3
 
+# §12a (LIVE-01): a shadow soak is "frozen" if the newest shadow_trades row is
+# older than this AND no kill is active to explain the silence. 24h matches the
+# LIVE-01 validate criterion ("new shadow rows <24h"). This is the thin,
+# in-evaluator detection slice; a full freshness watchdog with its own alert
+# cadence is a follow-up.
+SHADOW_SOAK_FROZEN_HOURS = 24.0
+
+# Once/day dedup for the shadow_soak_frozen warning. Module-level: resets on
+# process restart, which is acceptable — worst case one extra warning per
+# restart/day (the persistent watchdog is the follow-up). Reset in tests.
+_last_shadow_frozen_warn_date: str | None = None
+
+
+async def _maybe_warn_shadow_soak_frozen(
+    db: Database, ks: KillSwitch, settings: "Settings"
+) -> None:
+    """§12a: warn (once/day) when the shadow soak has silently frozen.
+
+    Fires only in shadow mode when the newest ``shadow_trades`` row is older
+    than :data:`SHADOW_SOAK_FROZEN_HOURS` AND no kill is active to explain the
+    silence — the exact LIVE-01 failure class (a latched kill froze the soak),
+    caught even if the per-tick auto-clear guard were to regress. Structlog
+    only; never raises out (callers wrap defensively).
+    """
+    global _last_shadow_frozen_warn_date
+    if getattr(settings, "LIVE_MODE", "paper") != "shadow":
+        return
+    assert db._conn is not None
+    cur = await db._conn.execute("SELECT MAX(created_at) FROM shadow_trades")
+    row = await cur.fetchone()
+    latest = row[0] if row is not None else None
+    if latest is None:
+        return  # no shadow trades yet — nothing to be frozen about
+    latest_dt = datetime.fromisoformat(latest)
+    if latest_dt.tzinfo is None:
+        latest_dt = latest_dt.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    if now - latest_dt < timedelta(hours=SHADOW_SOAK_FROZEN_HOURS):
+        return  # fresh enough
+    if await ks.is_active() is not None:
+        return  # a kill explains the silence — expected, not frozen
+    today = now.strftime("%Y-%m-%d")
+    if _last_shadow_frozen_warn_date == today:
+        return  # already warned today
+    _last_shadow_frozen_warn_date = today
+    log.warning(
+        "shadow_soak_frozen",
+        newest_shadow_trade_at=latest_dt.isoformat(),
+        hours_since=round((now - latest_dt).total_seconds() / 3600.0, 1),
+        threshold_hours=SHADOW_SOAK_FROZEN_HOURS,
+        kill_active=False,
+    )
+
 
 async def _close_shadow_trade(
     db: Database,
@@ -108,6 +161,20 @@ async def evaluate_open_shadow_trades(
 ) -> int:
     """Scan + evaluate one pass. Returns the number of rows closed."""
     assert db._conn is not None
+    # LIVE-01: clear any expired-but-latched kill BEFORE evaluating, so a
+    # daily-loss kill that outlived its killed_until cannot keep Gate 1
+    # rejecting every open and freeze the soak. No-op when nothing is
+    # active/expired; defensive-wrapped so a clear failure never blocks the
+    # evaluation pass.
+    try:
+        await ks.auto_clear_if_expired()
+    except Exception as exc:  # pragma: no cover — defensive
+        log.error("shadow_kill_auto_clear_failed", error=str(exc))
+    # §12a: once/day warning if the soak has silently frozen.
+    try:
+        await _maybe_warn_shadow_soak_frozen(db, ks, settings)
+    except Exception as exc:  # pragma: no cover — defensive
+        log.error("shadow_soak_frozen_check_failed", error=str(exc))
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
     cur = await db._conn.execute(
