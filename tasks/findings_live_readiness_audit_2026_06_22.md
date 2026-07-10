@@ -1,5 +1,13 @@
 # Findings - Live-readiness audit report - 2026-06-22
 
+## Status (2026-07-10)
+
+Superseded by `tasks/findings_live_trading_m1_audit_2026_07_06.md` (4 S1
+blockers; NOT prod-ready) and the standing LIVE-ENABLE GATE
+(`LIVE_TRADING_ENABLED` + `LIVE_USE_ROUTING_LAYER` stay OFF until all 4 S1s
+land). This document is a dated historical record and is filed retroactively
+as closed/superseded — the body below is unaltered.
+
 ## Evidence-only verdict
 
 **Not ready for live enablement.** This is a read-only readiness finding, not

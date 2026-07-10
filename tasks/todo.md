@@ -57,7 +57,7 @@ Non-scope:
   DB writes, migrations, production secret changes, or deploy.
 - No new dashboard write affordance or production runtime probe.
 
-## Active Work: 2026-06-22 - Live-readiness audit report
+## Superseded/Closed: 2026-06-22 live-readiness audit (filed retroactively)
 
 **Status:** FINDINGS-DRAFTED. Goal: advance the offshore live-trading handoff Phase 1 by
 filing a read-only production readiness report for the Binance-first live path.
@@ -83,6 +83,8 @@ filing a read-only production readiness report for the Binance-first live path.
   remains operator-only. Include rollback command and approver requirement for
   any future live-mode change.
 - [ ] Run focused verification for docs/report consistency and open a PR.
+
+Superseded by tasks/findings_live_trading_m1_audit_2026_07_06.md (4 S1 blockers; NOT prod-ready) and the standing LIVE-ENABLE GATE (LIVE_TRADING_ENABLED + LIVE_USE_ROUTING_LAYER stay OFF until all 4 S1s land).
 
 ## Completed Work: 2026-06-18 - first_signal extend-soak verdict (P2)
 
