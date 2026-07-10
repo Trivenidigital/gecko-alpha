@@ -45,9 +45,93 @@ async def _insert_trade(db, **overrides):
     await conn.commit()
 
 
-async def test_digest_no_trades_returns_none(db):
+async def test_digest_no_trades_returns_quiet_line_and_writes_row(db):
+    """Quiet day: no opens/closes still writes a zeros summary row (so the
+    downstream freshness watchdog sees a heartbeat) and returns an explicit
+    one-liner, never None (datetime off-by-one #5 — see tasks/lessons.md)."""
     result = await build_paper_digest(db, "2026-04-09")
-    assert result is None
+    assert result == "Paper digest 2026-04-09: no trades opened or closed."
+
+    conn = db._conn
+    cursor = await conn.execute(
+        "SELECT date, trades_opened, trades_closed, wins, losses, "
+        "total_pnl_usd, win_rate_pct FROM paper_daily_summary WHERE date = ?",
+        ("2026-04-09",),
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    assert row[0] == "2026-04-09"  # date
+    assert row[1] == 0  # trades_opened
+    assert row[2] == 0  # trades_closed
+    assert row[3] == 0  # wins
+    assert row[4] == 0  # losses
+    assert row[5] == 0  # total_pnl_usd
+    assert row[6] == 0  # win_rate_pct
+
+
+async def test_digest_date_semantics_includes_yesterday_excludes_today(db):
+    """Date-boundary pin (datetime off-by-one #5): a trade closed yesterday at
+    23:50 UTC is in yesterday's digest; a trade closed today (00:05 UTC) is not.
+    Both directions are asserted so the closed-date filter can't drift."""
+    # Closed yesterday (2026-04-09) at 23:50 UTC — belongs in yesterday's digest.
+    await _insert_trade(
+        db,
+        token_id="late_yday",
+        symbol="LATE",
+        signal_type="volume_spike",
+        status="closed_tp",
+        pnl_usd=100.0,
+        pnl_pct=10.0,
+        opened_at="2026-04-08T20:00:00+00:00",
+        closed_at="2026-04-09T23:50:00+00:00",
+        exit_price=55000.0,
+        exit_reason="take_profit",
+    )
+    # Closed today (2026-04-10) at 00:05 UTC — must NOT leak into yesterday.
+    await _insert_trade(
+        db,
+        token_id="early_today",
+        symbol="EARLY",
+        signal_type="volume_spike",
+        status="closed_tp",
+        pnl_usd=999.0,
+        pnl_pct=99.0,
+        opened_at="2026-04-08T21:00:00+00:00",
+        closed_at="2026-04-10T00:05:00+00:00",
+        exit_price=99999.0,
+        exit_reason="take_profit",
+    )
+
+    yday = await build_paper_digest(db, "2026-04-09")
+    assert yday is not None
+    assert "0 opened, 1 closed" in yday
+    assert "PnL: +$100.00" in yday
+    assert "999" not in yday  # today's trade must not appear in yesterday's digest
+
+    # And building for today captures the 00:05 trade, not yesterday's.
+    today = await build_paper_digest(db, "2026-04-10")
+    assert "0 opened, 1 closed" in today
+    assert "EARLY" in today
+    assert "LATE" not in today
+
+
+def test_agent_daily_digest_passes_yesterday_not_today():
+    """Wiring pin (datetime off-by-one #5): the daily-learn digest tick fires at
+    ~01:00 UTC and must summarize the CLOSED period (yesterday), not the partial
+    current day. Source-inspection guard in the style of
+    test_narrative_agent_prune.py — a run-loop harness isn't warranted for a
+    one-line wiring fix."""
+    import inspect
+
+    import scout.narrative.agent as narrative_agent
+
+    src = inspect.getsource(narrative_agent)
+    assert (
+        "build_paper_digest(db, yesterday)" in src
+    ), "daily digest must be built for yesterday (the closed day), not today"
+    assert (
+        "build_paper_digest(db, today)" not in src
+    ), "digest must no longer be built for the partial current day"
 
 
 async def test_digest_opened_only(db):

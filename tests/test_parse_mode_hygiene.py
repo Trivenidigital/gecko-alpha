@@ -526,7 +526,11 @@ def test_paper_digest_call_passes_parse_mode_none():
 
     source = inspect.getsource(agent)
     idx = source.index("build_paper_digest")
-    tail = source[idx : idx + 800]
+    # 1200-char window: the yesterday-semantics comment block (datetime
+    # off-by-one #5) pushed parse_mode= to offset ~847 from the first
+    # build_paper_digest occurrence; the window size is incidental to the
+    # guard's intent (the digest send must pass parse_mode=None).
+    tail = source[idx : idx + 1200]
     assert "send_telegram_message(" in tail
     assert "parse_mode=None" in tail
 

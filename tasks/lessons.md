@@ -344,3 +344,38 @@ normalized WHERE THEY ARE WRITTEN, not remembered where they are compared.
 Prefer comparing on `julianday()`/epoch, or normalize both sides to identical
 `strftime` output. Any `datetime('now',...)` compared against a stored ISO
 column is suspect until audited — tracked as BL-DATETIME-NORMALIZATION.
+
+### Date-boundary jobs summarize the CLOSED period, and quiet periods must speak — off-by-one #5 (2026-07-10)
+
+The daily paper-trading digest fired at the ~01:00 UTC daily-learn tick and
+computed `today = datetime.now(timezone.utc).strftime("%Y-%m-%d")`, then
+`build_paper_digest(db, today)`. At 1 AM, "today" is one hour old: the digest
+summarized only the first hour of the current day — and `digest.py` then
+`return None` whenever that hour had zero opens and closes, so no Telegram
+went out and no `paper_daily_summary` row was written. Prod effect: trades
+open/close nearly every day, yet the latest summary row was stuck at
+2026-06-26, and every digest ever sent had been a partial-hour summary. The
+ORIGINAL design (`docs/superpowers/plans/2026-04-19-paper-trading-engine.md`)
+passed **yesterday** (`now - timedelta(days=1)`); the implementation quietly
+diverged to `now`.
+
+This is off-by-one #5, and it braids two of the earlier species together: a
+date-boundary WINDOW bug (like #1–#3, summarizing the wrong period) AND a
+silent no-op (the quiet-day `return None` meant the failure produced neither
+a message nor a table row — nothing to notice).
+
+**Two rules, both cheap, both enforced by the tests in this PR:**
+
+1. **A job that runs at time T to summarize a period must summarize the
+   CLOSED period, not the one still in progress.** A daily digest at 01:00
+   summarizes YESTERDAY. Compute the boundary as `now - timedelta(days=1)`
+   (or the closed window's explicit bounds), never `now`. Pin it with a
+   date-semantics test: a row on the last second of the target day is IN, a
+   row one second into the next day is OUT.
+
+2. **Quiet periods must emit explicitly — never `return None`.** A zero-
+   activity period is a fact worth recording, not an absence to swallow. Write
+   the summary row (zeros) so a freshness watchdog can see a heartbeat (§12a; wired by PR #431),
+   and return an explicit one-liner so silence is never ambiguous between "no
+   activity" and "the job didn't run" (cousin to §12b's silent-success
+   problem).
