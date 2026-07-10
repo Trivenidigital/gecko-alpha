@@ -111,7 +111,7 @@ positive-expectancy analysis + pre-registered kill criterion (not a time-based f
 
 ## Active Work: 2026-06-18 - P0 SQLite durable maintenance (Part B)
 
-**Status:** PLAN-READY (review gate 1). Branch `feat/sqlite-durable-maintenance`.
+**Status:** PLAN-READY (review gate 1). → **[RECON 2026-07-10: CLOSED-EARLIER-BUT-UNMARKED — shipped as PR #368 (`1d82b0f1`) + deployed; this PLAN-READY status is stale. See backlog.md Reconciliation 2026-07-10.]** Branch `feat/sqlite-durable-maintenance`.
 Follows P0 Part A (one-time VACUUM done on prod 2026-06-18 — see project memory
 `project_p0_vacuum_and_orphan_reader_2026_06_18`). Full checkable plan:
 `tasks/plan_sqlite_durable_maintenance_2026_06_18.md`.
@@ -306,7 +306,7 @@ Workflow checklist:
 
 ## Active Work: 2026-05-31 - Dashboard entry snapshot drawer
 
-**Status:** IN-PROGRESS. Goal: close
+**Status:** IN-PROGRESS. → **[RECON 2026-07-10: CLOSED-EARLIER-BUT-UNMARKED — shipped as PR #341 (`f138c95c`); status is stale.]** Goal: close
 `BL-NEW-DASHBOARD-ENTRY-SNAPSHOT-DRAWER` by surfacing the already-shipped
 `paper_trade_entry_snapshots` sidecar in the existing Trade Detail drawer.
 
@@ -423,7 +423,7 @@ Non-scope:
 
 ## Active Work: 2026-05-28 - Today's Focus Block Cause + Research Links
 
-**Status:** IN PROGRESS. Goal: make Today's Focus more useful from a trader
+**Status:** IN PROGRESS. → **[RECON 2026-07-10: CLOSED-EARLIER-BUT-UNMARKED — merged+deployed as PR #304 (`31f11a4`); status is stale.]** Goal: make Today's Focus more useful from a trader
 seat by exposing direct research links and factual blocked-row cause
 without adding ranking, urgency tiers, advice, Telegram alerts, execution, or
 sizing.
@@ -498,7 +498,7 @@ Non-scope:
 
 ## Active Work: 2026-05-27 - Today's Focus Trader UX Pass
 
-**Status:** PR-READY. Goal: fix the screenshot-visible Today's Focus usability
+**Status:** PR-READY. → **[RECON 2026-07-10: CLOSED-EARLIER-BUT-UNMARKED — Today's Focus surface shipped+deployed (PR #297 `87f56207` + follow-ups); status is stale.]** Goal: fix the screenshot-visible Today's Focus usability
 gap where usage evidence dominated the first screen, rows did not lead with
 token identity, and the page felt visually broken below the first row.
 
@@ -602,7 +602,7 @@ Non-scope:
 
 ## Active Work: 2026-05-27 - Today's Focus Residual Closure
 
-**Status:** PR-READY. Goal: close PR #297 residuals that are eligible now:
+**Status:** PR-READY. → **[RECON 2026-07-10: CLOSED-EARLIER-BUT-UNMARKED — PR #297 (`87f56207`) merged+deployed; status is stale.]** Goal: close PR #297 residuals that are eligible now:
 confirm the action-language firewall, audit prod `actionability_reason` values,
 make usage-read evidence exportable from localStorage, and land the related
 memory hygiene.
@@ -645,7 +645,7 @@ Workflow checklist:
 
 ## Active Work: 2026-05-27 - Today's Focus V0
 
-**Status:** PLANNING. Goal: add a scarce, factual, dashboard-only review queue
+**Status:** PLANNING. → **[RECON 2026-07-10: CLOSED-EARLIER-BUT-UNMARKED — Today's Focus V0 shipped as PR #297 (`87f56207`); the surface is live. Status is stale.]** Goal: add a scarce, factual, dashboard-only review queue
 that helps the trader inspect the highest-attention current rows without
 introducing urgency tiers, advice copy, alerting, ranking, execution, sizing, or
 server-side personal trade state.
@@ -1186,7 +1186,7 @@ Review:
 
 ## Active Work: 2026-05-23 — Codex/Hermes systemd auto-remediation
 
-**Status:** IN-PROGRESS. Goal: convert Codex/Hermes systemd failure handling from alert-only to alert + guarded deterministic repair, with Telegram outcome updates.
+**Status:** IN-PROGRESS. → **[RECON 2026-07-10: CLOSED-EARLIER-BUT-UNMARKED — PR #236 (`7e0292a4`) merged, CI-green, deployed to all 3 VPSes (body already states this); status is stale.]** Goal: convert Codex/Hermes systemd failure handling from alert-only to alert + guarded deterministic repair, with Telegram outcome updates.
 
 Workflow checklist:
 - [x] Root cause identified: alert template used `%I`, causing `hermes-gateway.service` to appear as invalid `hermes/gateway.service`.
@@ -2306,3 +2306,28 @@ Priority list items #1/#2/#4/#5/#6 already SHIPPED (PRs #290/#289/#329/#328/#326
   - security/ops and alerting review
 - [ ] Fix every confirmed issue autonomously with focused tests.
 - [ ] Re-run end-to-end verification, request final Claude review, and merge only if green.
+
+---
+
+## Reconciliation 2026-07-10 — legacy tracker wind-down
+
+This `todo.md` and root `backlog.md` are LEGACY. The forward tracker is
+**`tasks/backlog_fable_analysis_2026_07_10.md`** (68 items across 7 lanes:
+MIN / ALR / LIVE / DASH / SIG / INF / NAR). A full drift audit against prod master
+`bb31c18f`, today's shipped PRs, and the new backlog was performed 2026-07-10; the
+authoritative reconciliation index (every open legacy item classified CLOSED-TODAY /
+CLOSED-EARLIER / SUPERSEDED / STILL-OPEN-VALID / STALE-KILL, with evidence) lives at
+the top of `backlog.md` under **"## Reconciliation 2026-07-10"**.
+
+Stale headers inside this file (multiple "Active Work" / IN-PROGRESS / PR-READY /
+PLANNING / PLAN-READY sections whose work actually merged+deployed) have been
+annotated inline with `[RECON 2026-07-10: ...]` tags — the checkbox bodies are left
+intact for history (no restructure).
+
+**STILL-OPEN-VALID items not yet in the Fable backlog (candidates to add):**
+BL-NEW-LEDGER-EVICTION-DB-MARKER (HIGH, operator-deadline), BL-DATETIME-NORMALIZATION
+(HIGH, latent tree-wide bug), BL-NEW-NARRATIVE-RESOLVER-ERROR-RATE-ALARM (MED, confirmed
+dormant), BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-PRO (MED, operator vendor decision),
+BL-NEW-CG-DEMO-API-KEY (MED, operator action, runbook ready), BL-NEW-DEPLOY-FILEMODE-CRLF-HYGIENE
+(LOW-MED), plus the low-priority tail enumerated in backlog.md. See backlog.md for full
+evidence and the SUPERSEDED→new-ID mapping.
