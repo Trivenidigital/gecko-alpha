@@ -850,6 +850,20 @@ class Settings(BaseSettings):
     PEAK_FADE_ENABLED: bool = True
     PEAK_FADE_MIN_PEAK_PCT: float = 10.0
     PEAK_FADE_RETRACE_RATIO: float = 0.7
+    # BL-NEW-MOMENTUM-DEATH — dry-run-only sub-peak-fade exit lane. The
+    # expired-lane backtest (tasks/findings_expired_lane_backtest_2026_07_10.md)
+    # found 92/93 expired paper trades peaked BELOW the 10% PEAK_FADE arming
+    # floor, so peak_fade was structurally unreachable for them (§9c: the lever
+    # exists but the data path never reaches it). This lane catches the
+    # [MIN_PEAK_PCT, PEAK_FADE_MIN_PEAK_PCT) band peak_fade cannot reach, reusing
+    # the same sustained-fade shape (6h AND 24h checkpoints < RETRACE_RATIO*peak).
+    # Ships DRY_RUN first: the backtest's running-peak is checkpoint-proxied, so
+    # the dry-run must observe the LIVE running peak before the flip. Soak gate:
+    # n>=15 would-fire events + confirm no live runner clipped, then a separate
+    # PAPER_MOMENTUM_DEATH_DRY_RUN=False flip PR. Fail-closed: ENABLED default off.
+    PAPER_MOMENTUM_DEATH_ENABLED: bool = False
+    PAPER_MOMENTUM_DEATH_MIN_PEAK_PCT: float = 5.0
+    PAPER_MOMENTUM_DEATH_DRY_RUN: bool = True
     # BL-NEW-HPF high-peak fade — single-pass tighter exit on confirmed runners.
     # Fires when peak_pct >= MIN_PEAK_PCT AND current price has retraced
     # >= RETRACE_PCT from peak. Tighter than moonshot trail (30%) because
@@ -1107,6 +1121,16 @@ class Settings(BaseSettings):
     def _validate_paper_sl_pct(cls, v: float) -> float:
         if v < 0:
             raise ValueError("sl_pct must be positive, e.g. 10.0 for 10% stop loss")
+        return v
+
+    @field_validator("PAPER_MOMENTUM_DEATH_MIN_PEAK_PCT")
+    @classmethod
+    def _validate_momentum_death_min_peak_pct(cls, v: float) -> float:
+        # >0 only — intentionally NOT hard-coupled to PEAK_FADE_MIN_PEAK_PCT so
+        # operators can sweep the floor during the dry-run soak. The band guard
+        # (peak_pct < PEAK_FADE_MIN_PEAK_PCT) lives in the evaluator, not here.
+        if v <= 0:
+            raise ValueError(f"PAPER_MOMENTUM_DEATH_MIN_PEAK_PCT must be > 0; got={v}")
         return v
 
     @field_validator("MIROFISH_URL")

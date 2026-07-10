@@ -13,6 +13,7 @@ import structlog
 
 from scout.db import Database
 from scout.price_sources import resolve_price_source
+from scout.trading.decision_events import emit_trade_decision
 from scout.trading.paper import PaperTrader
 from scout.trading.params import params_for_signal
 
@@ -271,6 +272,7 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
             cp_48h = row[11]
             peak_price = float(row[12]) if row[12] is not None else None
             peak_pct = float(row[13]) if row[13] is not None else None
+            symbol_row = row[15]
             signal_type_row = row[20]
 
             # Per-signal params (Tier 1a). Cached for 5 min so this is cheap.
@@ -905,6 +907,97 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                         "UPDATE paper_trades SET peak_fade_fired_at = ? WHERE id = ?",
                         (datetime.now(timezone.utc).isoformat(), trade_id),
                     )
+                # BL-NEW-MOMENTUM-DEATH — dry-run-only sub-peak-fade exit lane.
+                # Catches the [MIN_PEAK_PCT, PEAK_FADE_MIN_PEAK_PCT) band that
+                # peak_fade structurally cannot reach — its arming floor sits
+                # ABOVE where these trades ever traded (§9c: lever exists, data
+                # path never reaches it; findings_expired_lane_backtest_2026_07_10.md).
+                # Reuses peak_fade's sustained-fade shape (6h AND 24h checkpoints
+                # both < RETRACE_RATIO*peak). The `peak_pct < PEAK_FADE_MIN_PEAK_PCT`
+                # band guard makes this mutually exclusive with the peak_fade block
+                # above, so the two lanes can never double-fire on one trade.
+                # DRY_RUN=True (default): NEVER closes — records a would-fire
+                # observation only (structured log + trade_decision_events row) so
+                # the soak is queryable. The real-close path below is unreachable
+                # until a future flip PR sets PAPER_MOMENTUM_DEATH_DRY_RUN=False,
+                # mirroring PAPER_HIGH_PEAK_FADE_DRY_RUN above.
+                if (
+                    close_reason is None
+                    and settings.PAPER_MOMENTUM_DEATH_ENABLED
+                    and peak_pct is not None
+                    and peak_pct >= settings.PAPER_MOMENTUM_DEATH_MIN_PEAK_PCT
+                    and peak_pct < settings.PEAK_FADE_MIN_PEAK_PCT
+                    and cp_6h_pct is not None
+                    and cp_24h_pct is not None
+                    and cp_6h_pct < peak_pct * settings.PEAK_FADE_RETRACE_RATIO
+                    and cp_24h_pct < peak_pct * settings.PEAK_FADE_RETRACE_RATIO
+                    and remaining_qty is not None
+                    and remaining_qty > 0
+                ):
+                    if settings.PAPER_MOMENTUM_DEATH_DRY_RUN:
+                        # Fire at most once per trade. The sustained-fade
+                        # condition persists on every 30-min eval until expiry,
+                        # so an unguarded emit would inflate the soak count by
+                        # ~1 row/cycle. Cheapest correct dedup for a dry-run
+                        # observation is a table existence check: no schema
+                        # change to paper_trades, survives evaluator restarts
+                        # (unlike an in-memory set), and only runs when the band
+                        # condition is already met (~1 eligible trade/day).
+                        cur = await conn.execute(
+                            "SELECT 1 FROM trade_decision_events "
+                            "WHERE paper_trade_id = ? "
+                            "AND reason = 'momentum_death_would_fire' LIMIT 1",
+                            (trade_id,),
+                        )
+                        if await cur.fetchone() is None:
+                            log.info(
+                                "momentum_death_would_fire",
+                                trade_id=trade_id,
+                                symbol=symbol_row,
+                                signal_type=signal_type_row,
+                                peak_pct=round(float(peak_pct), 2),
+                                current_pct=round(float(change_pct), 2),
+                                dry_run_band=[
+                                    settings.PAPER_MOMENTUM_DEATH_MIN_PEAK_PCT,
+                                    settings.PEAK_FADE_MIN_PEAK_PCT,
+                                ],
+                            )
+                            # Observability, not control flow — emit_trade_decision
+                            # is fail-soft, so a write error never blocks the trade.
+                            await emit_trade_decision(
+                                db,
+                                token_id=token_id,
+                                signal_type=signal_type_row or "",
+                                decision="observed",
+                                reason="momentum_death_would_fire",
+                                source_module="scout.trading.evaluator",
+                                paper_trade_id=trade_id,
+                                event_data={
+                                    "peak_pct": round(float(peak_pct), 4),
+                                    "current_pct": round(float(change_pct), 4),
+                                    "cp_6h_pct": round(float(cp_6h_pct), 4),
+                                    "cp_24h_pct": round(float(cp_24h_pct), 4),
+                                    "retrace_ratio": settings.PEAK_FADE_RETRACE_RATIO,
+                                    "momentum_death_min_peak_pct": (
+                                        settings.PAPER_MOMENTUM_DEATH_MIN_PEAK_PCT
+                                    ),
+                                    "peak_fade_min_peak_pct": (
+                                        settings.PEAK_FADE_MIN_PEAK_PCT
+                                    ),
+                                },
+                            )
+                    else:
+                        close_reason = "momentum_death"
+                        close_status = "closed_momentum_death"
+                        log.info(
+                            "momentum_death_fired",
+                            trade_id=trade_id,
+                            token_id=token_id,
+                            symbol=symbol_row,
+                            signal_type=signal_type_row,
+                            peak_pct=round(float(peak_pct), 2),
+                            current_pct=round(float(change_pct), 2),
+                        )
                 # Expiry — last resort
                 if close_reason is None and elapsed >= max_duration:
                     close_reason = "expired"
