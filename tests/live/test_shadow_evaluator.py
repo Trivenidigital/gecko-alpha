@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock
 
 import structlog
 
+import scout.live.shadow_evaluator as shadow_evaluator_mod
 from scout.config import Settings
 from scout.db import Database
 from scout.live.config import LiveConfig
@@ -396,5 +397,159 @@ async def test_no_entry_vwap_skipped_gracefully(tmp_path):
 
         events = [le.get("event") for le in logs]
         assert "live_shadow_entry_vwap_null_skipped" in events
+    finally:
+        await db.close()
+
+
+# ---------- LIVE-01: per-tick auto-clear + §12a shadow-soak-frozen ------------
+
+
+async def test_evaluate_calls_auto_clear_per_tick(tmp_path):
+    """Every evaluator tick clears an expired-but-latched kill FIRST, so a stale
+    daily-loss kill cannot silently freeze the shadow soak (Gate 1)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        settings = _settings()
+        adapter = _make_adapter()
+        ks = AsyncMock(spec=KillSwitch)
+        ks.is_active = AsyncMock(return_value=None)
+        await evaluate_open_shadow_trades(
+            db=db,
+            adapter=adapter,
+            config=LiveConfig(settings),
+            ks=ks,
+            settings=settings,
+        )
+        ks.auto_clear_if_expired.assert_awaited()
+    finally:
+        await db.close()
+
+
+async def test_shadow_soak_frozen_warns_when_stale_and_no_kill(tmp_path, monkeypatch):
+    """§12a: stale shadow_trades (newest > threshold) with no active kill emits a
+    shadow_soak_frozen warning."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        monkeypatch.setattr(
+            shadow_evaluator_mod, "_last_shadow_frozen_warn_date", None, raising=False
+        )
+        pt_id = await _seed_paper_trade(db)
+        stale = (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat()
+        # Closed row so evaluate does not reprocess it; MAX(created_at) is stale.
+        await _seed_open_shadow(
+            db, paper_trade_id=pt_id, created_at=stale, status="closed_tp"
+        )
+        settings = _settings()
+        adapter = _make_adapter()
+        with structlog.testing.capture_logs() as logs:
+            await evaluate_open_shadow_trades(
+                db=db,
+                adapter=adapter,
+                config=LiveConfig(settings),
+                ks=KillSwitch(db),
+                settings=settings,
+            )
+        assert "shadow_soak_frozen" in [le.get("event") for le in logs]
+    finally:
+        await db.close()
+
+
+async def test_shadow_soak_frozen_silent_when_kill_active(tmp_path, monkeypatch):
+    """A stale soak is EXPECTED when a fresh kill is active — no frozen warning."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        monkeypatch.setattr(
+            shadow_evaluator_mod, "_last_shadow_frozen_warn_date", None, raising=False
+        )
+        pt_id = await _seed_paper_trade(db)
+        stale = (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat()
+        await _seed_open_shadow(
+            db, paper_trade_id=pt_id, created_at=stale, status="closed_tp"
+        )
+        settings = _settings()
+        adapter = _make_adapter()
+        ks = KillSwitch(db)
+        await ks.trigger(
+            triggered_by="daily_loss_cap", reason="x", duration=timedelta(hours=4)
+        )
+        with structlog.testing.capture_logs() as logs:
+            await evaluate_open_shadow_trades(
+                db=db,
+                adapter=adapter,
+                config=LiveConfig(settings),
+                ks=ks,
+                settings=settings,
+            )
+        assert "shadow_soak_frozen" not in [le.get("event") for le in logs]
+    finally:
+        await db.close()
+
+
+async def test_shadow_soak_frozen_silent_when_fresh(tmp_path, monkeypatch):
+    """A recent shadow_trade (within threshold) is not frozen."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        monkeypatch.setattr(
+            shadow_evaluator_mod, "_last_shadow_frozen_warn_date", None, raising=False
+        )
+        pt_id = await _seed_paper_trade(db)
+        fresh = datetime.now(timezone.utc).isoformat()
+        await _seed_open_shadow(
+            db, paper_trade_id=pt_id, created_at=fresh, status="closed_tp"
+        )
+        settings = _settings()
+        adapter = _make_adapter()
+        with structlog.testing.capture_logs() as logs:
+            await evaluate_open_shadow_trades(
+                db=db,
+                adapter=adapter,
+                config=LiveConfig(settings),
+                ks=KillSwitch(db),
+                settings=settings,
+            )
+        assert "shadow_soak_frozen" not in [le.get("event") for le in logs]
+    finally:
+        await db.close()
+
+
+async def test_shadow_soak_frozen_warns_once_per_day(tmp_path, monkeypatch):
+    """§12a dedup: two ticks in the same UTC day emit the warning once."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        monkeypatch.setattr(
+            shadow_evaluator_mod, "_last_shadow_frozen_warn_date", None, raising=False
+        )
+        pt_id = await _seed_paper_trade(db)
+        stale = (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat()
+        await _seed_open_shadow(
+            db, paper_trade_id=pt_id, created_at=stale, status="closed_tp"
+        )
+        settings = _settings()
+        adapter = _make_adapter()
+        ks = KillSwitch(db)
+        with structlog.testing.capture_logs() as logs:
+            await evaluate_open_shadow_trades(
+                db=db,
+                adapter=adapter,
+                config=LiveConfig(settings),
+                ks=ks,
+                settings=settings,
+            )
+            await evaluate_open_shadow_trades(
+                db=db,
+                adapter=adapter,
+                config=LiveConfig(settings),
+                ks=ks,
+                settings=settings,
+            )
+        frozen = [
+            e for e in (le.get("event") for le in logs) if e == "shadow_soak_frozen"
+        ]
+        assert len(frozen) == 1
     finally:
         await db.close()

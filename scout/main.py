@@ -2069,6 +2069,16 @@ async def main(argv: list[str] | None = None) -> int:
 
         live_kill_switch = KillSwitch(db, alert_hook=_kill_switch_alert)
 
+        # LIVE-01: clear any expired-but-latched kill at boot so a daily-loss
+        # kill that outlived its killed_until (e.g. across a restart) does not
+        # keep Gate 1 rejecting every shadow open. Emits the §12b latched alert
+        # if it had been frozen >1h. Idempotent no-op when nothing is expired.
+        try:
+            if await live_kill_switch.auto_clear_if_expired():
+                logger.info("boot_shadow_kill_auto_cleared")
+        except Exception as exc:
+            logger.error("boot_shadow_kill_auto_clear_failed", error=str(exc))
+
         # M1.5b: construct RoutingLayer when LIVE_USE_ROUTING_LAYER=True.
         # When the flag is False (default), routing=None is passed and the
         # engine's _dispatch_live branch is bypassed (M1.5a single-venue

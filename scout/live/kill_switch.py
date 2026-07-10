@@ -34,6 +34,14 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
+# §12b (LIVE-01): auto-clearing a kill that expired more than this long ago
+# means the kill was LATCHED — Gate 1 rejected every shadow open for the whole
+# window and silently froze the soak. Such a clear gets an extra operator alert
+# beyond the standard CLEARED notification. A normal ≤4h kill picked up on the
+# next 60s tick expires only seconds-to-minutes past killed_until (below this),
+# so steady-state auto-clears do not trip the latched alert.
+_LATCHED_ALERT_THRESHOLD = timedelta(hours=1)
+
 
 def compute_kill_duration(trigger_time: datetime) -> timedelta:
     """Returns ``max(4h, time until next UTC midnight)``.
@@ -90,6 +98,7 @@ class KillSwitch:
         reason: str | None = None,
         killed_until: datetime | None = None,
         cleared_by: str | None = None,
+        latched_hours: float | None = None,
     ) -> None:
         """Emit the §12b operator alert for an automated kill-switch transition.
 
@@ -108,6 +117,13 @@ class KillSwitch:
                 f"event #{kill_event_id} by {triggered_by}\n"
                 f"reason: {reason}\n"
                 f"live trading halted until {until} UTC"
+            )
+        elif event_type == "latched_auto_clear":
+            # LIVE-01: the kill outlived killed_until and froze the shadow soak.
+            hours = latched_hours if latched_hours is not None else 0.0
+            message = (
+                f"shadow kill #{kill_event_id} auto-cleared; "
+                f"was latched {hours:.0f}h past expiry — soak was frozen"
             )
         else:  # "cleared"
             message = (
@@ -136,13 +152,13 @@ class KillSwitch:
                 err_type=type(exc).__name__,
             )
 
-    async def is_active(self) -> KillState | None:
-        """Return the current :class:`KillState` or ``None``.
+    async def _active_kill_state(self) -> KillState | None:
+        """Return the active (``cleared_at IS NULL``) kill **regardless of
+        expiry**, or ``None`` if nothing is active.
 
-        Active = ``live_control.active_kill_event_id`` is non-NULL AND the
-        referenced ``kill_events.cleared_at IS NULL``. The NULL-on-cleared_at
-        guard is belt-and-braces: :meth:`clear` always nulls both, but we
-        re-check here so a partial/hand-edited row does not look active.
+        Unlike :meth:`is_active`, this does NOT treat a past-``killed_until``
+        kill as inactive — :meth:`auto_clear_if_expired` needs the raw active
+        row so it can still stamp ``cleared_at`` and alert on a latched kill.
         """
         assert self._db._conn is not None
         cur = await self._db._conn.execute("""
@@ -155,13 +171,42 @@ class KillSwitch:
         row = await cur.fetchone()
         if row is None:
             return None
-        killed_until = datetime.fromisoformat(row[1])
         return KillState(
             kill_event_id=row[0],
-            killed_until=killed_until,
+            killed_until=datetime.fromisoformat(row[1]),
             reason=row[2],
             triggered_by=row[3],
         )
+
+    async def is_active(self) -> KillState | None:
+        """Return the current :class:`KillState` or ``None``.
+
+        Active = ``live_control.active_kill_event_id`` is non-NULL AND the
+        referenced ``kill_events.cleared_at IS NULL`` AND ``killed_until`` is
+        still in the future. The ``cleared_at`` guard is belt-and-braces
+        against a partial/hand-edited row.
+
+        Belt-and-braces (LIVE-01): a kill whose ``killed_until`` is already in
+        the past reads as INACTIVE even when ``cleared_at`` is still NULL, so a
+        missed :meth:`auto_clear_if_expired` tick cannot latch the kill forever
+        and freeze the shadow soak (kill_events #1 latched ~33 days in prod).
+        When this guard fires it logs ``kill_switch_expired_uncleared`` at
+        WARNING (§12b visibility) — steady state it should never appear, because
+        the per-tick / boot auto-clear stamps ``cleared_at`` first.
+        """
+        state = await self._active_kill_state()
+        if state is None:
+            return None
+        now = datetime.now(timezone.utc)
+        if state.killed_until < now:
+            log.warning(
+                "kill_switch_expired_uncleared",
+                kill_event_id=state.kill_event_id,
+                killed_until=state.killed_until.isoformat(),
+                triggered_by=state.triggered_by,
+            )
+            return None
+        return state
 
     async def trigger(
         self,
@@ -292,16 +337,37 @@ class KillSwitch:
     async def auto_clear_if_expired(self) -> bool:
         """If the active kill has expired, clear it with ``cleared_by='auto_expired'``.
 
-        Returns ``True`` if a clear was performed, ``False`` otherwise. Safe
-        to call on every scheduler tick.
+        Returns ``True`` if a clear was performed, ``False`` otherwise. Safe to
+        call on every scheduler tick and at boot. Uses :meth:`_active_kill_state`
+        (not :meth:`is_active`) so it still stamps ``cleared_at`` on a kill that
+        :meth:`is_active`'s belt-and-braces guard already treats as inactive.
+
+        §12b (LIVE-01): if the kill had been latched more than
+        ``_LATCHED_ALERT_THRESHOLD`` past expiry, the shadow soak was frozen the
+        whole time — emit an extra operator alert naming the freeze duration.
+        The generic CLEARED alert (from :meth:`clear`) does not convey a silent
+        freeze, so the latched alert is additive, not a replacement.
         """
-        state = await self.is_active()
+        state = await self._active_kill_state()
         if state is None:
             return False
         now = datetime.now(timezone.utc)
         if state.killed_until >= now:
             return False
+        latched = now - state.killed_until
         await self.clear(cleared_by="auto_expired")
+        if latched > _LATCHED_ALERT_THRESHOLD:
+            latched_hours = latched.total_seconds() / 3600.0
+            log.warning(
+                "kill_switch_latched_auto_cleared",
+                kill_event_id=state.kill_event_id,
+                latched_hours=round(latched_hours, 1),
+            )
+            await self._emit_alert(
+                event_type="latched_auto_clear",
+                kill_event_id=state.kill_event_id,
+                latched_hours=latched_hours,
+            )
         return True
 
 
