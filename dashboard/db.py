@@ -2023,6 +2023,104 @@ INFINITY_GUARD_MAX = 1e308
 BENCHMARK_LOOKBACK_HOURS = 4
 BENCHMARK_COIN_IDS = ("bitcoin", "solana")
 
+# DASH-07 / SIG-09 (trailing-7d per-trade paper PnL + hostile display cue) and
+# SIG-08 (detection-earliness truth surface). Both are read-only display
+# context on the Today's Focus header; neither gates any behaviour.
+TRAILING_PNL_WINDOW_DAYS = 7
+TRAILING_PNL_N_GATE = 5
+EARLINESS_WINDOW_DAYS = 30
+# Fallback aligned with scout/config.py REGIME_HOSTILE_PER_TRADE_USD default —
+# used only when the API layer does not pass an explicit threshold.
+REGIME_HOSTILE_PER_TRADE_USD_DEFAULT = -10.0
+
+
+async def _fetch_trailing_paper_pnl(
+    db: "aiosqlite.Connection", *, window_days: int
+) -> tuple[int, float]:
+    """Trailing per-trade paper PnL over closed trades in the window.
+
+    "Closed" is ``status != 'open'`` (covers closed_tp/closed_sl/expired — the
+    documented cohort convention; NOT literal ``status='closed'``). Only rows
+    with a realised ``pnl_usd`` count toward the per-trade mean. The window is
+    applied on ``closed_at`` via ``julianday()`` on both sides so the
+    predicate is immune to the 'T'-vs-space datetime normalization class.
+    Returns ``(closed_trades, total_pnl_usd)`` with ``(0, 0.0)`` when empty or
+    on error (read-only; never raises to the caller).
+    """
+    try:
+        cur = await db.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(pnl_usd), 0.0) AS total "
+            "FROM paper_trades "
+            "WHERE status != 'open' "
+            "AND closed_at IS NOT NULL "
+            "AND pnl_usd IS NOT NULL "
+            "AND julianday(closed_at) >= julianday('now', ?)",
+            (f"-{int(window_days)} days",),
+        )
+        row = await cur.fetchone()
+    except Exception:
+        return (0, 0.0)
+    if row is None:
+        return (0, 0.0)
+    try:
+        n = int(row["n"] if "n" in row.keys() else row[0])
+        total = float(row["total"] if "total" in row.keys() else row[1])
+    except (TypeError, ValueError):
+        return (0, 0.0)
+    return (n, total)
+
+
+async def _fetch_earliness_vs_trending(
+    db: "aiosqlite.Connection", *, window_days: int
+) -> dict | None:
+    """Detection-earliness distribution over trades OPENED in the window.
+
+    Reads ``paper_trades.lead_time_vs_trending_min`` / ``_status``. The median
+    of the ``ok`` values is computed in Python via ``values[n // 2]`` — the
+    same convention as ``scout.trading.analytics.lead_time_breakdown`` so the
+    two surfaces agree. Sign convention (see engine._compute_lead_time_vs_
+    trending): negative == opened BEFORE the coin trended (early); positive ==
+    opened AFTER (late). Returns ``None`` when zero trades opened in the
+    window (presence-iff-data) or on error.
+    """
+    try:
+        cur = await db.execute(
+            "SELECT lead_time_vs_trending_min AS m, "
+            "lead_time_vs_trending_status AS s "
+            "FROM paper_trades "
+            "WHERE julianday(opened_at) >= julianday('now', ?)",
+            (f"-{int(window_days)} days",),
+        )
+        rows = await cur.fetchall()
+    except Exception:
+        return None
+    total = len(rows)
+    if total == 0:
+        return None
+    ok_values: list[float] = []
+    no_reference = 0
+    for r in rows:
+        status = r["s"] if "s" in r.keys() else r[1]
+        minutes = r["m"] if "m" in r.keys() else r[0]
+        if status == "ok" and minutes is not None:
+            try:
+                ok_values.append(float(minutes))
+            except (TypeError, ValueError):
+                continue
+        elif status == "no_reference":
+            no_reference += 1
+    ok_values.sort()
+    n_ok = len(ok_values)
+    median = ok_values[n_ok // 2] if n_ok else None
+    return {
+        "median_lead_time_min": round(median, 2) if median is not None else None,
+        "count_ok": n_ok,
+        "count_no_reference": no_reference,
+        "count_total": total,
+        "no_reference_pct": round(no_reference / total * 100.0, 1),
+        "window_days": int(window_days),
+    }
+
 
 async def _fetch_benchmark_delta_pct(
     db: "aiosqlite.Connection", coin_id: str, cutoff_iso: str
@@ -2234,7 +2332,12 @@ def _take_rows(
         seen.add(key)
 
 
-async def get_todays_focus(db_path: str, *, window_hours: int = 36) -> dict:
+async def get_todays_focus(
+    db_path: str,
+    *,
+    window_hours: int = 36,
+    hostile_per_trade_threshold_usd: float | None = None,
+) -> dict:
     """Read-only scarce factual review queue over Trade Inbox rows."""
     window_hours = max(6, min(int(window_hours), 72))
     max_rows = 5
@@ -2275,6 +2378,9 @@ async def get_todays_focus(db_path: str, *, window_hours: int = 36) -> dict:
     benchmark_cutoff_iso = (now - timedelta(hours=BENCHMARK_LOOKBACK_HOURS)).isoformat()
     points_by_token: dict[str, list] = {}
     benchmarks: dict[str, float] = {}
+    trailing_closed = 0
+    trailing_total = 0.0
+    earliness: dict | None = None
     try:
         async with _ro_db(db_path) as conn:
             for selected_row in selected[:max_rows]:
@@ -2293,11 +2399,21 @@ async def get_todays_focus(db_path: str, *, window_hours: int = 36) -> dict:
                     # enforces allowed-keys subset {btc_4h_pct, sol_4h_pct}.
                     key = "btc_4h_pct" if benchmark_coin == "bitcoin" else "sol_4h_pct"
                     benchmarks[key] = delta
+            # DASH-07 / SIG-09 + SIG-08: portfolio-level display context.
+            trailing_closed, trailing_total = await _fetch_trailing_paper_pnl(
+                conn, window_days=TRAILING_PNL_WINDOW_DAYS
+            )
+            earliness = await _fetch_earliness_vs_trending(
+                conn, window_days=EARLINESS_WINDOW_DAYS
+            )
     except Exception:
         # Read-only fetch failure must not break the endpoint; sparkline
         # rows omit their data, benchmarks omitted entirely.
         points_by_token = {}
         benchmarks = {}
+        trailing_closed = 0
+        trailing_total = 0.0
+        earliness = None
 
     rows = [
         _today_focus_row(
@@ -2348,6 +2464,34 @@ async def get_todays_focus(db_path: str, *, window_hours: int = 36) -> dict:
     if benchmarks:
         meta["market_benchmarks"] = benchmarks
         meta["market_benchmarks_is_visual_context_only"] = True
+    # DASH-07 / SIG-09: trailing-7d per-trade paper PnL + hostile display cue.
+    # Present iff >= 1 closed (realised-PnL) trade in the window. The n-gate
+    # ('—' below TRAILING_PNL_N_GATE) is applied client-side; the field always
+    # carries closed_trades so the frontend can gate. `hostile` is only ever
+    # True at/above the gate (display-only; gates no behaviour).
+    if trailing_closed >= 1:
+        threshold = (
+            float(hostile_per_trade_threshold_usd)
+            if hostile_per_trade_threshold_usd is not None
+            else REGIME_HOSTILE_PER_TRADE_USD_DEFAULT
+        )
+        per_trade = round(trailing_total / trailing_closed, 2)
+        meta["trailing_7d_paper_pnl"] = {
+            "closed_trades": trailing_closed,
+            "per_trade_usd": per_trade,
+            "total_pnl_usd": round(trailing_total, 2),
+            "display_threshold_usd": round(threshold, 2),
+            "n_gate": TRAILING_PNL_N_GATE,
+            "hostile": bool(
+                trailing_closed >= TRAILING_PNL_N_GATE and per_trade < threshold
+            ),
+            "window_days": TRAILING_PNL_WINDOW_DAYS,
+        }
+        meta["trailing_7d_paper_pnl_is_visual_context_only"] = True
+    # SIG-08: detection-earliness truth over last-30d opened trades.
+    if earliness is not None:
+        meta["earliness_vs_trending"] = earliness
+        meta["earliness_vs_trending_is_visual_context_only"] = True
     return {"meta": meta, "rows": rows}
 
 

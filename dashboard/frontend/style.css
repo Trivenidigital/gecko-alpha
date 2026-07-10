@@ -661,6 +661,26 @@ body {
   white-space: nowrap;
 }
 
+/* DASH-07 / SIG-09 + SIG-08: trailing-7d per-trade PnL + earliness strip.
+   Distinct from the uniform-color benchmark chips: the hostile modifier
+   below is a deliberate value-conditioned red tint (display-only cue), which
+   is why it lives on its own class rather than .todays-focus-benchmark. */
+.todays-focus-regime-group {
+  display: inline-flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.todays-focus-regime {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.todays-focus-regime-hostile {
+  color: var(--color-accent-red);
+}
+
 @media (max-width: 480px) {
   .dashboard {
     max-width: 100vw;
@@ -725,7 +745,8 @@ body {
   .todays-focus-detected,
   .todays-focus-new-marker,
   .todays-focus-sparkline-unavailable,
-  .todays-focus-benchmark {
+  .todays-focus-benchmark,
+  .todays-focus-regime {
     font-size: 11px;
   }
 }

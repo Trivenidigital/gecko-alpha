@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import TokenLink from './TokenLink'
 import Sparkline from './Sparkline'
 import BtcSolBenchmarkStrip from './BtcSolBenchmarkStrip'
+import RegimeStrip from './RegimeStrip'
 import { researchLinks } from '../todayFocusLinks.js'
 import { buildFocusDetailRows, primaryBlockFacts } from '../todayFocusFacts.js'
 import { formatDetectionAge } from '../todayFocusAge.js'
@@ -152,6 +153,10 @@ export default function TodayFocusPanel() {
               </span>
             ) : null}
             <BtcSolBenchmarkStrip benchmarks={meta.market_benchmarks} />
+            <RegimeStrip
+              trailingPnl={meta.trailing_7d_paper_pnl}
+              earliness={meta.earliness_vs_trending}
+            />
           </div>
           <div className="todays-focus-header-actions">
             {dismissedCount ? (
