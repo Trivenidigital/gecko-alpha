@@ -35,12 +35,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import aiosqlite
 import structlog
 
-# Route structlog to stderr so this CLI's stdout stays JSON-only for journal
-# capture (mirrors scripts/source_calls_live_writer.py).
-structlog.configure(
-    logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
-)
-
 from scout.source_quality.snapshot_writer import (
     record_snapshot_run,
     write_price_snapshots,
@@ -120,6 +114,18 @@ def _touch_heartbeat(path: Path) -> None:
         )
 
 
+def _configure_logging() -> None:
+    """Route structlog to stderr so this CLI's stdout stays JSON-only for journal
+    capture. Called ONLY from the ``__main__`` / cron entrypoint — NOT at import
+    time (INF-03). Configuring structlog at module scope is a GLOBAL, process-wide
+    mutation: importing this module in a unit test would reconfigure every other
+    test's logger and silently empty their captured output. Keeping it here makes
+    the import side-effect-free."""
+    structlog.configure(
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default="scout.db")
@@ -175,4 +181,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    _configure_logging()
     sys.exit(main())

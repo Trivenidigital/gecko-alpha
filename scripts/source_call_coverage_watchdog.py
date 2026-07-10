@@ -35,8 +35,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import aiosqlite
 import structlog
 
-structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
-
 from scout.source_quality.watchdogs import evaluate_snapshot_watchdogs
 
 _TRUTHY = {"1", "true", "yes", "on"}
@@ -74,6 +72,16 @@ async def _dispatch_alert(text: str) -> None:
             source="source_call_coverage_watchdog",
         )
     _log.info("source_call_coverage_watchdog_alert_delivered")
+
+
+def _configure_logging() -> None:
+    """Route structlog to stderr so this CLI's stdout stays JSON-only. Called
+    ONLY from the ``__main__`` / cron entrypoint — NOT at import time (INF-03).
+    Configuring structlog at module scope is a GLOBAL, process-wide mutation:
+    importing this module in a unit test would reconfigure every other test's
+    logger and silently empty their captured output. Keeping it here makes the
+    import side-effect-free."""
+    structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
 
 
 def main() -> int:
@@ -154,4 +162,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    _configure_logging()
     sys.exit(main())

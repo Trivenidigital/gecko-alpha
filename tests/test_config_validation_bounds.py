@@ -67,9 +67,7 @@ class TestScoreBounds:
         s = Settings()
         assert s.MIN_SCORE == 999
 
-    def test_conviction_threshold_obscenely_large_rejected(
-        self, _min_env, monkeypatch
-    ):
+    def test_conviction_threshold_obscenely_large_rejected(self, _min_env, monkeypatch):
         monkeypatch.setenv("CONVICTION_THRESHOLD", "99999999")
         with pytest.raises(ValidationError, match="CONVICTION_THRESHOLD"):
             Settings()
@@ -120,3 +118,34 @@ class TestLunarcrushBounds:
         monkeypatch.setenv("LUNARCRUSH_CREDIT_HARD_PCT", "1.5")
         with pytest.raises(ValidationError, match="LUNARCRUSH_CREDIT_HARD_PCT"):
             Settings()
+
+
+class TestHygieneRetentionBounds:
+    """INF-02 / INF-06: retention fields for the two newly-pruned tables."""
+
+    def test_trade_decision_events_retention_default(self, _min_env):
+        # INF-02: 45d default clears the largest consumer lookback (7d).
+        s = Settings()
+        assert s.TRADE_DECISION_EVENTS_RETENTION_DAYS == 45
+
+    def test_trade_decision_events_retention_below_floor_rejected(
+        self, _min_env, monkeypatch
+    ):
+        # ge floor = largest consumer lookback (suppression_cost_rollup 7d).
+        monkeypatch.setenv("TRADE_DECISION_EVENTS_RETENTION_DAYS", "6")
+        with pytest.raises(
+            ValidationError, match="TRADE_DECISION_EVENTS_RETENTION_DAYS"
+        ):
+            Settings()
+
+    def test_trade_decision_events_retention_at_floor_passes(
+        self, _min_env, monkeypatch
+    ):
+        monkeypatch.setenv("TRADE_DECISION_EVENTS_RETENTION_DAYS", "7")
+        s = Settings()
+        assert s.TRADE_DECISION_EVENTS_RETENTION_DAYS == 7
+
+    def test_volume_history_cg_retention_default(self, _min_env):
+        # INF-06: matches the spike detector's own 7d cutoff (harmless dup).
+        s = Settings()
+        assert s.VOLUME_HISTORY_CG_RETENTION_DAYS == 7

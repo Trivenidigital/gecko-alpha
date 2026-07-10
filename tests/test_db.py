@@ -173,6 +173,96 @@ async def test_prune_score_history_future_dated_rows_survive_keep_days_zero(db):
     assert [r[0] for r in rows] == ["0xFUTURE"]
 
 
+# ---------------------------------------------------------------------------
+# INF-02: trade_decision_events retention prune (created_at cutoff)
+# ---------------------------------------------------------------------------
+
+
+async def _insert_tde(db, *, token_id, created_at):
+    """Insert one trade_decision_events row (created_at is the prune column)."""
+    await db._conn.execute(
+        "INSERT INTO trade_decision_events "
+        "(token_id, signal_type, decision, reason, source_module, "
+        "event_data, created_at) "
+        "VALUES (?, 'volume_spike', 'suppressed', 'suppressed', "
+        "'dispatcher', '{}', ?)",
+        (token_id, created_at),
+    )
+
+
+async def test_prune_trade_decision_events_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    await _insert_tde(
+        db, token_id="recent", created_at=(now - timedelta(days=5)).isoformat()
+    )
+    await _insert_tde(
+        db, token_id="old", created_at=(now - timedelta(days=60)).isoformat()
+    )
+    await db._conn.commit()
+
+    deleted = await db.prune_trade_decision_events(keep_days=45)
+
+    assert deleted == 1
+    cur = await db._conn.execute("SELECT token_id FROM trade_decision_events")
+    rows = await cur.fetchall()
+    assert [r[0] for r in rows] == ["recent"]
+
+
+async def test_prune_trade_decision_events_empty_table_returns_zero(db):
+    deleted = await db.prune_trade_decision_events(keep_days=45)
+    assert deleted == 0
+
+
+async def test_prune_trade_decision_events_tie_on_cutoff_deletes(db):
+    """Row at/just-before the cutoff (created_at <= cutoff) is deleted."""
+    now = datetime.now(timezone.utc)
+    await _insert_tde(
+        db, token_id="atcutoff", created_at=(now - timedelta(seconds=1)).isoformat()
+    )
+    await db._conn.commit()
+
+    deleted = await db.prune_trade_decision_events(keep_days=0)
+    assert deleted == 1
+
+
+# ---------------------------------------------------------------------------
+# INF-06: volume_history_cg retention prune (recorded_at cutoff)
+# ---------------------------------------------------------------------------
+
+
+async def _insert_vh(db, *, coin_id, recorded_at):
+    """Insert one volume_history_cg row (recorded_at is the prune column)."""
+    await db._conn.execute(
+        "INSERT INTO volume_history_cg "
+        "(coin_id, symbol, name, volume_24h, recorded_at) "
+        "VALUES (?, 'SYM', 'Name', 1000.0, ?)",
+        (coin_id, recorded_at),
+    )
+
+
+async def test_prune_volume_history_cg_keeps_recent(db):
+    now = datetime.now(timezone.utc)
+    await _insert_vh(
+        db, coin_id="recent", recorded_at=(now - timedelta(days=2)).isoformat()
+    )
+    await _insert_vh(
+        db, coin_id="old", recorded_at=(now - timedelta(days=10)).isoformat()
+    )
+    await db._conn.commit()
+
+    deleted = await db.prune_volume_history_cg(keep_days=7)
+
+    assert deleted == 1
+    cur = await db._conn.execute("SELECT coin_id FROM volume_history_cg")
+    rows = await cur.fetchall()
+    assert [r[0] for r in rows] == ["recent"]
+
+
+async def test_prune_volume_history_cg_empty_table_returns_zero(db):
+    deleted = await db.prune_volume_history_cg(keep_days=7)
+    assert deleted == 0
+
+
 @pytest.mark.parametrize(
     "prune_method,table,column,fk_seed_sql,fk_seed_params,insert_sql,insert_extra_cols",
     [
