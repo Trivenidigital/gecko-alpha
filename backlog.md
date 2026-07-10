@@ -28,6 +28,23 @@ Operator close-development block 2026-05-22 explicitly parks the following items
 - `print`/log consistency
 - Deploy CRLF / filemode hygiene (BL-NEW-DEPLOY-FILEMODE-CRLF-HYGIENE re-evaluated at next deploy per its own trigger gate)
 
+## Superseded/Closed: 2026-06-22 live-readiness audit (filed retroactively)
+
+**Status:** FINDINGS-DRAFTED / NOT-READY-FOR-LIVE. Read-only Phase 1 report:
+`tasks/findings_live_readiness_audit_2026_06_22.md`. Runtime evidence shows
+`LIVE_MODE=shadow`, Binance credentials unset, `live_eligible=0` for every
+signal, negative 30-day paper cohorts, no open shadow/live rows,
+`venue_listings=0`, no venue/wallet freshness evidence printed,
+watchdog/timer health unproven, and a stale `live_control.active_kill_event_id`
+pointer despite 0 active unexpired kill events.
+
+Next gate: do not enable live trading. Operator should first repair/verify
+watchdog timer evidence + venue freshness, then explicitly authorize a separate
+secret-safe Binance permission/IP-whitelist verification run if live-mode work
+should continue.
+
+Superseded by tasks/findings_live_trading_m1_audit_2026_07_06.md (4 S1 blockers; NOT prod-ready) and the standing LIVE-ENABLE GATE (LIVE_TRADING_ENABLED + LIVE_USE_ROUTING_LAYER stay OFF until all 4 S1s land).
+
 ---
 
 ## Open PRs Held for Design Review
